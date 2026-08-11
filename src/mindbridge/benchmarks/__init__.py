@@ -6,6 +6,13 @@ from mindbridge.benchmarks.egolife_qa import (
     EgoLifeQuestion,
     load_egolife_qa,
 )
+from mindbridge.benchmarks.egolife_runner import (
+    EgoLifePreparedClip,
+    EgoLifePreparedStream,
+    EgoLifeQuestionResult,
+    load_prepared_egolife,
+    run_egolife_qa,
+)
 from mindbridge.benchmarks.locomo import (
     LOCOMO_ADAPTER_VERSION,
     LoCoMoConversation,
@@ -58,7 +65,10 @@ __all__ = [
     "SUPERMEMORY_UNANSWERABLE_CHOICE",
     "SUPERMEMORY_VQA_ADAPTER_VERSION",
     "EgoLifeOption",
+    "EgoLifePreparedClip",
+    "EgoLifePreparedStream",
     "EgoLifeQuestion",
+    "EgoLifeQuestionResult",
     "LoCoMoConversation",
     "LoCoMoOfficialConversationResult",
     "LoCoMoOfficialQuestionResult",
@@ -73,10 +83,12 @@ __all__ = [
     "load_egolife_qa",
     "load_locomo",
     "load_m3_bench",
+    "load_prepared_egolife",
     "load_prepared_m3",
     "load_supermemory_vqa",
     "multiple_choice_query",
     "parse_option_ranking",
+    "run_egolife_qa",
     "run_locomo_conversation",
     "run_m3_video",
     "wait_for_observation_job",
