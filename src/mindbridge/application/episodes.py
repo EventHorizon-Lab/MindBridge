@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from datetime import datetime
+from itertools import pairwise
 
 from mindbridge.application.ports import TextDocumentEmbedder
 from mindbridge.application.recall import RETRIEVAL_DOCUMENT_EMBEDDING_TASK
@@ -71,6 +72,7 @@ class EpisodeWrite:
 
     episode: Event
     child_event_ids: tuple[EventId, ...]
+    temporal_event_pairs: tuple[tuple[EventId, EventId], ...]
     memory: MemoryRecord
     relations: tuple[Relation, ...]
     embedding: EmbeddingRecord
@@ -88,6 +90,13 @@ class EpisodeWrite:
             raise DomainInvariantError("episode write requires 2 to 32 unique child events")
         if self.episode.event_id in self.child_event_ids:
             raise DomainInvariantError("episode cannot contain itself")
+        if len(set(self.temporal_event_pairs)) != len(self.temporal_event_pairs) or any(
+            before_id == after_id
+            or before_id not in self.child_event_ids
+            or after_id not in self.child_event_ids
+            for before_id, after_id in self.temporal_event_pairs
+        ):
+            raise DomainInvariantError("Episode temporal pairs must link distinct child Events")
         if (
             self.memory.tenant_id != self.episode.tenant_id
             or self.embedding.tenant_id != self.episode.tenant_id
@@ -135,16 +144,25 @@ async def derive_episode_writes(
     if not consolidation.episodes:
         return ()
     candidate_by_id = {event.event_id: event for event in candidates}
+    child_groups = tuple(
+        tuple(
+            sorted(
+                (candidate_by_id[event_id] for event_id in proposal.event_ids),
+                key=lambda event: (event.occurred_at, event.event_id),
+            )
+        )
+        for proposal in consolidation.episodes
+    )
     episodes = tuple(
         _episode_event(
             tenant_id,
             proposal,
-            candidate_by_id,
+            children,
             consolidation.model_reference,
             consolidation.prompt_version,
             created_at,
         )
-        for proposal in consolidation.episodes
+        for proposal, children in zip(consolidation.episodes, child_groups, strict=True)
     )
     vectors = await text_embedder.encode_documents(
         tuple(episode.description for episode in episodes)
@@ -152,10 +170,10 @@ async def derive_episode_writes(
     if len(vectors) != len(episodes):
         raise MemoryIntegrityError("text embedder returned the wrong Episode vector count")
     return tuple(
-        _episode_write(episode, proposal.event_ids, vector, text_embedder, created_at)
-        for episode, proposal, vector in zip(
+        _episode_write(episode, children, vector, text_embedder, created_at)
+        for episode, children, vector in zip(
             episodes,
-            consolidation.episodes,
+            child_groups,
             vectors,
             strict=True,
         )
@@ -165,17 +183,11 @@ async def derive_episode_writes(
 def _episode_event(
     tenant_id: TenantId,
     proposal: EpisodeProposal,
-    candidate_by_id: dict[EventId, Event],
+    children: tuple[Event, ...],
     model_reference: ModelReference,
     prompt_version: str,
     created_at: datetime,
 ) -> Event:
-    children = tuple(
-        sorted(
-            (candidate_by_id[event_id] for event_id in proposal.event_ids),
-            key=lambda event: (event.occurred_at, event.event_id),
-        )
-    )
     return Event(
         event_id=EventId(
             derive_stable_id(
@@ -210,11 +222,17 @@ def _episode_event(
 
 def _episode_write(
     episode: Event,
-    child_event_ids: tuple[EventId, ...],
+    children: tuple[Event, ...],
     vector: tuple[float, ...],
     text_embedder: TextDocumentEmbedder,
     created_at: datetime,
 ) -> EpisodeWrite:
+    child_event_ids = tuple(child.event_id for child in children)
+    temporal_event_pairs = tuple(
+        (before.event_id, after.event_id)
+        for before, after in pairwise(children)
+        if before.ended_at <= after.occurred_at
+    )
     memory = MemoryRecord(
         memory_id=MemoryId(derive_stable_id("memory", episode.event_id)),
         tenant_id=episode.tenant_id,
@@ -263,10 +281,35 @@ def _episode_write(
                 ),
             )
         ),
+        *(
+            relation
+            for before_event_id, after_event_id in temporal_event_pairs
+            for relation in (
+                derive_relation(
+                    episode.tenant_id,
+                    RelationNodeType.EVENT,
+                    before_event_id,
+                    RelationType.BEFORE,
+                    RelationNodeType.EVENT,
+                    after_event_id,
+                    created_at,
+                ),
+                derive_relation(
+                    episode.tenant_id,
+                    RelationNodeType.EVENT,
+                    after_event_id,
+                    RelationType.AFTER,
+                    RelationNodeType.EVENT,
+                    before_event_id,
+                    created_at,
+                ),
+            )
+        ),
     )
     return EpisodeWrite(
         episode=episode,
         child_event_ids=child_event_ids,
+        temporal_event_pairs=temporal_event_pairs,
         memory=memory,
         relations=relations,
         embedding=EmbeddingRecord(
@@ -340,5 +383,25 @@ def _expected_episode_edges(
                 write.episode.event_id,
             )
             for child_event_id in write.child_event_ids
+        ),
+        *(
+            (
+                RelationNodeType.EVENT,
+                before_event_id,
+                RelationType.BEFORE,
+                RelationNodeType.EVENT,
+                after_event_id,
+            )
+            for before_event_id, after_event_id in write.temporal_event_pairs
+        ),
+        *(
+            (
+                RelationNodeType.EVENT,
+                after_event_id,
+                RelationType.AFTER,
+                RelationNodeType.EVENT,
+                before_event_id,
+            )
+            for before_event_id, after_event_id in write.temporal_event_pairs
         ),
     }

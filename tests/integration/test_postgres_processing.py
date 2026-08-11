@@ -590,7 +590,7 @@ async def test_episode_consolidation_is_atomic_recallable_and_retry_safe(
             media_url_signer=DeterministicSigner(),
         ).run(request)
 
-    assert await _episode_counts(database_url, tenant_id) == (0, 0, 0, 0, 0, 0)
+    assert await _episode_counts(database_url, tenant_id) == (0, 0, 0, 0, 0, 0, 0)
 
     coordinated = CoordinatedEpisodeConsolidator()
     results = await asyncio.gather(
@@ -617,7 +617,7 @@ async def test_episode_consolidation_is_atomic_recallable_and_retry_safe(
     assert replay.committed_count == 0
     assert coordinated.calls == 2
     assert replay_consolidator.calls == 0
-    assert await _episode_counts(database_url, tenant_id) == (1, 2, 2, 2, 5, 1)
+    assert await _episode_counts(database_url, tenant_id) == (1, 2, 2, 2, 5, 1, 2)
 
     expanded_memories = await store.search_memories_by_graph_objects(
         RecallRequest(tenant_id=tenant_id, query=RecallQuery(text="repair episode")),
@@ -1002,7 +1002,7 @@ async def _derived_counts(database_url: str, tenant_id: TenantId) -> DerivedCoun
 async def _episode_counts(
     database_url: str,
     tenant_id: TenantId,
-) -> tuple[int, int, int, int, int, int]:
+) -> tuple[int, int, int, int, int, int, int]:
     connection = await AsyncConnection.connect(database_url)
     async with connection:
         row = await (
@@ -1035,12 +1035,20 @@ async def _episode_counts(
                     (SELECT count(*) FROM embeddings AS embedding
                      WHERE embedding.tenant_id = %s
                        AND embedding.object_type = 'event'
-                       AND embedding.object_id IN (SELECT event_id FROM episode))
+                       AND embedding.object_id IN (SELECT event_id FROM episode)),
+                    (SELECT count(*) FROM relations AS relation
+                     WHERE relation.tenant_id = %s
+                       AND relation.relation_type IN ('before', 'after')
+                       AND relation.source_id IN (
+                           SELECT child.event_id FROM events AS child
+                           WHERE child.tenant_id = %s
+                             AND child.parent_event_id IN (SELECT event_id FROM episode)
+                       ))
                 """,
-                (tenant_id,) * 6,
+                (tenant_id,) * 8,
             )
         ).fetchone()
-    return cast(tuple[int, int, int, int, int, int], row)
+    return cast(tuple[int, int, int, int, int, int, int], row)
 
 
 async def _semantic_claim_counts(

@@ -544,7 +544,9 @@ Event 向量相似度扩展最多 64 个候选。Omni/VLM 必须直接读取候�
 EvidenceSpan，并通过严格 schema 返回互不重叠的 Event 分组；摘要相似本身不能触发合并。
 
 应用层随后确定性派生 Episode、联合 Observation/Evidence 来源、verified Episodic
-MemoryRecord、`contains`/`same_episode`/`represented_by` 关系以及 Text Small Event 向量。一次
+MemoryRecord、`contains`/`same_episode`/`represented_by` 关系以及 Text Small Event 向量。
+Episode 内按发生时间排序且互不重叠的相邻 Event 还会写成对的 `before`/`after` 边；重叠 Event
+不强行排序，只连接相邻项以保持线性边数。一次
 PostgreSQL 事务按稳定顺序锁定全部子 Event，只有仍为 active、基础层且未被占用的完整分组才能
 提交；Episode、来源链接、MemoryRecord、关系、向量和子节点父指针要么全部成功，要么全部回滚。
 并发 Consolidator、重试和显式遗忘发生竞争时，已经提交或删除的一方优先，过期提案不会覆盖新

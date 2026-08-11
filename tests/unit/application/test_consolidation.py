@@ -1,5 +1,6 @@
 """Vertical checks for evidence-verified Episode consolidation."""
 
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -187,6 +188,9 @@ async def test_consolidation_builds_one_complete_episode_aggregate() -> None:
     assert [relation.relation_type for relation in write.relations].count(
         RelationType.SAME_EPISODE
     ) == 2
+    assert write.temporal_event_pairs == ((events[0].event_id, events[1].event_id),)
+    assert [relation.relation_type for relation in write.relations].count(RelationType.BEFORE) == 1
+    assert [relation.relation_type for relation in write.relations].count(RelationType.AFTER) == 1
 
 
 async def test_consolidation_rejects_an_unknown_candidate_before_embedding() -> None:
@@ -204,6 +208,29 @@ async def test_consolidation_rejects_an_unknown_candidate_before_embedding() -> 
 
     assert embedder.documents == ()
     assert store.writes == ()
+
+
+async def test_consolidation_does_not_order_overlapping_events() -> None:
+    first = _event(1)
+    second = replace(
+        _event(2),
+        occurred_at=first.occurred_at + timedelta(seconds=1),
+        ended_at=first.ended_at + timedelta(seconds=1),
+    )
+    store = RecordingEpisodeStore((first, second))
+
+    await ConsolidateEpisodes(
+        store,
+        RecordingConsolidator((first.event_id, second.event_id)),
+        RecordingTextEmbedder(),
+        media_url_signer=DeterministicSigner(),
+    ).run(EpisodeCandidateRequest(tenant_id=TENANT_ID, evaluated_at=NOW + timedelta(hours=1)))
+
+    assert store.writes[0].temporal_event_pairs == ()
+    assert all(
+        relation.relation_type not in {RelationType.BEFORE, RelationType.AFTER}
+        for relation in store.writes[0].relations
+    )
 
 
 def _event(index: int) -> Event:
