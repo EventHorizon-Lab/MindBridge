@@ -148,6 +148,14 @@ class MemoryRecord:
     verification_status: VerificationStatus
     state: MemoryState = MemoryState.ACTIVE
     model_reference: ModelReference | None = None
+    salience: float = 0.5
+    strength: float = 0.5
+    useful_access_count: int = 0
+    positive_feedback_count: int = 0
+    negative_feedback_count: int = 0
+    last_accessed_at: datetime | None = None
+    supersedes_memory_id: MemoryId | None = None
+    superseded_at: datetime | None = None
 
     def __post_init__(self) -> None:
         require_non_empty(self.memory_id, "memory_id")
@@ -162,6 +170,24 @@ class MemoryRecord:
             _require_identifiers(self.evidence_ids, "evidence_ids")
         elif self.verification_status is VerificationStatus.VERIFIED:
             raise DomainInvariantError("a verified memory must reference evidence")
+        _require_probability(self.salience, "salience")
+        if not math.isfinite(self.strength):
+            raise DomainInvariantError("strength must be finite")
+        if (
+            min(
+                self.useful_access_count,
+                self.positive_feedback_count,
+                self.negative_feedback_count,
+            )
+            < 0
+        ):
+            raise DomainInvariantError("memory lifecycle counters must be non-negative")
+        if self.last_accessed_at is not None:
+            require_aware_datetime(self.last_accessed_at, "last_accessed_at")
+        if self.superseded_at is not None:
+            require_aware_datetime(self.superseded_at, "superseded_at")
+        if self.supersedes_memory_id == self.memory_id:
+            raise DomainInvariantError("memory cannot supersede itself")
 
 
 @dataclass(frozen=True, slots=True)

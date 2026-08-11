@@ -155,6 +155,8 @@ def _event_memory(event: Event) -> MemoryRecord:
         created_at=event.created_at,
         verification_status=VerificationStatus.VERIFIED,
         model_reference=event.model_reference,
+        salience=event.salience,
+        strength=event.salience,
     )
 
 

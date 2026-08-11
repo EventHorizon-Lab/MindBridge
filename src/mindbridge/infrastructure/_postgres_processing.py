@@ -246,6 +246,8 @@ def _memory_digest(memory: MemoryRecord) -> str:
             "created_at": memory.created_at.isoformat(),
             "verification_status": memory.verification_status.value,
             "state": memory.state.value,
+            "salience": memory.salience,
+            "supersedes_memory_id": memory.supersedes_memory_id,
             "model_id": (
                 memory.model_reference.model_id if memory.model_reference is not None else None
             ),

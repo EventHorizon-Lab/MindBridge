@@ -33,6 +33,12 @@ from mindbridge.core.identifiers import (
     derive_stable_id,
 )
 from mindbridge.core.jobs import JobState, ObservationJobClaim, ObservationProcessingJob
+from mindbridge.core.lifecycle import (
+    DEFAULT_MEMORY_STRENGTH_POLICY,
+    MemoryStrengthPolicy,
+    calculate_memory_strength,
+    evolve_memory_strength,
+)
 from mindbridge.core.memory import (
     Claim,
     EmbeddedObjectType,
@@ -46,6 +52,7 @@ from mindbridge.core.memory import (
 )
 
 __all__ = [
+    "DEFAULT_MEMORY_STRENGTH_POLICY",
     "Claim",
     "ClaimId",
     "DeviceId",
@@ -69,6 +76,7 @@ __all__ = [
     "MemoryNotFoundError",
     "MemoryRecord",
     "MemoryState",
+    "MemoryStrengthPolicy",
     "MemoryType",
     "ModelOutputError",
     "ModelReference",
@@ -83,5 +91,7 @@ __all__ = [
     "TaskBrokerError",
     "TenantId",
     "VerificationStatus",
+    "calculate_memory_strength",
     "derive_stable_id",
+    "evolve_memory_strength",
 ]

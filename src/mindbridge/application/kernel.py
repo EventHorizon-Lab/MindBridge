@@ -400,6 +400,14 @@ def _memory_view(memory: MemoryRecord) -> MemoryView:
         created_at=memory.created_at,
         verification_status=memory.verification_status,
         state=memory.state,
+        salience=memory.salience,
+        strength=memory.strength,
+        useful_access_count=memory.useful_access_count,
+        positive_feedback_count=memory.positive_feedback_count,
+        negative_feedback_count=memory.negative_feedback_count,
+        last_accessed_at=memory.last_accessed_at,
+        supersedes_memory_id=memory.supersedes_memory_id,
+        superseded_at=memory.superseded_at,
     )
 
 

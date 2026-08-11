@@ -178,6 +178,14 @@ class MemoryView(ContractModel):
     created_at: AwareDatetime
     verification_status: VerificationStatus
     state: MemoryState
+    salience: Annotated[float, Field(ge=0.0, le=1.0)] = 0.5
+    strength: float = Field(default=0.5, allow_inf_nan=False)
+    useful_access_count: Annotated[int, Field(ge=0)] = 0
+    positive_feedback_count: Annotated[int, Field(ge=0)] = 0
+    negative_feedback_count: Annotated[int, Field(ge=0)] = 0
+    last_accessed_at: AwareDatetime | None = None
+    supersedes_memory_id: Identifier | None = None
+    superseded_at: AwareDatetime | None = None
 
 
 class EvidenceView(ContractModel):

@@ -36,6 +36,14 @@ MemoryRow: TypeAlias = tuple[
     datetime,
     str | None,
     str | None,
+    float,
+    float,
+    int,
+    int,
+    int,
+    datetime | None,
+    str | None,
+    datetime | None,
     list[str],
 ]
 
@@ -186,9 +194,14 @@ async def _insert_memory(
         """
         INSERT INTO memory_records (
             tenant_id, memory_id, memory_type, summary, verification_status, state,
-            occurred_at, ended_at, model_id, model_revision, content_digest, created_at
+            occurred_at, ended_at, model_id, model_revision, content_digest, created_at,
+            salience, strength, useful_access_count, positive_feedback_count,
+            negative_feedback_count, last_accessed_at, supersedes_memory_id, superseded_at
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        VALUES (
+            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+            %s, %s, %s, %s, %s, %s, %s, %s
+        )
         ON CONFLICT DO NOTHING
         RETURNING memory_id
         """,
@@ -205,6 +218,14 @@ async def _insert_memory(
             memory.model_reference.revision if memory.model_reference is not None else None,
             content_digest,
             memory.created_at,
+            memory.salience,
+            memory.strength,
+            memory.useful_access_count,
+            memory.positive_feedback_count,
+            memory.negative_feedback_count,
+            memory.last_accessed_at,
+            memory.supersedes_memory_id,
+            memory.superseded_at,
         ),
     )
     return await cursor.fetchone() is not None
@@ -252,6 +273,14 @@ def _memory_from_row(row: MemoryRow) -> MemoryRecord:
         created_at,
         model_id,
         model_revision,
+        salience,
+        strength,
+        useful_access_count,
+        positive_feedback_count,
+        negative_feedback_count,
+        last_accessed_at,
+        supersedes_memory_id,
+        superseded_at,
         evidence_ids,
     ) = row
     model_reference = (
@@ -271,6 +300,16 @@ def _memory_from_row(row: MemoryRow) -> MemoryRecord:
         verification_status=VerificationStatus(verification_status),
         state=MemoryState(state),
         model_reference=model_reference,
+        salience=salience,
+        strength=strength,
+        useful_access_count=useful_access_count,
+        positive_feedback_count=positive_feedback_count,
+        negative_feedback_count=negative_feedback_count,
+        last_accessed_at=last_accessed_at,
+        supersedes_memory_id=(
+            MemoryId(supersedes_memory_id) if supersedes_memory_id is not None else None
+        ),
+        superseded_at=superseded_at,
     )
 
 
@@ -286,6 +325,14 @@ SELECT memory.memory_id,
        memory.created_at,
        memory.model_id,
        memory.model_revision,
+       memory.salience,
+       memory.strength,
+       memory.useful_access_count,
+       memory.positive_feedback_count,
+       memory.negative_feedback_count,
+       memory.last_accessed_at,
+       memory.supersedes_memory_id,
+       memory.superseded_at,
        ARRAY(
            SELECT link.evidence_id
            FROM memory_evidence AS link
@@ -296,6 +343,7 @@ FROM memory_records AS memory
 """
 
 _STRUCTURED_RECALL_FILTER_SQL = """
+  AND memory.superseded_at IS NULL
   AND (
       cardinality(%(memory_types)s::text[]) = 0
       OR memory.memory_type = ANY(%(memory_types)s::text[])
@@ -350,6 +398,7 @@ ORDER BY
             websearch_to_tsquery('simple', %(query)s)
         )
     END DESC,
+    memory.strength DESC,
     memory.occurred_at DESC,
     memory.memory_id
 LIMIT %(limit)s
@@ -372,7 +421,7 @@ JOIN ranked_memories AS dense
   ON dense.tenant_id = memory.tenant_id AND dense.memory_id = memory.memory_id
 WHERE memory.tenant_id = %(tenant_id)s
 {_STRUCTURED_RECALL_FILTER_SQL}
-ORDER BY dense.dense_rank, memory.occurred_at DESC, memory.memory_id
+ORDER BY dense.dense_rank, memory.strength DESC, memory.occurred_at DESC, memory.memory_id
 LIMIT %(limit)s
 """
 
@@ -385,6 +434,6 @@ WITH ranked_memories AS (
 JOIN ranked_memories AS dense ON dense.memory_id = memory.memory_id
 WHERE memory.tenant_id = %(tenant_id)s
 {_STRUCTURED_RECALL_FILTER_SQL}
-ORDER BY dense.rank, memory.occurred_at DESC, memory.memory_id
+ORDER BY dense.rank, memory.strength DESC, memory.occurred_at DESC, memory.memory_id
 LIMIT %(limit)s
 """
