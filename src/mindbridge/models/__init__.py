@@ -10,6 +10,10 @@ from mindbridge.models.jina import (
     JinaModality,
     JinaOmniEmbedder,
 )
+from mindbridge.models.openai_claim_consolidation import (
+    CONSOLIDATE_CLAIMS_PROMPT_VERSION,
+    OpenAIOmniClaimConsolidator,
+)
 from mindbridge.models.openai_consolidation import (
     CONSOLIDATE_EPISODES_PROMPT_VERSION,
     OpenAIOmniEpisodeConsolidator,
@@ -28,6 +32,7 @@ from mindbridge.models.openai_perception import (
 
 __all__ = [
     "ANSWER_FROM_EVIDENCE_PROMPT_VERSION",
+    "CONSOLIDATE_CLAIMS_PROMPT_VERSION",
     "CONSOLIDATE_EPISODES_PROMPT_VERSION",
     "DEFAULT_JINA_OMNI_DIMENSION",
     "DEFAULT_JINA_OMNI_MODEL_ID",
@@ -42,6 +47,7 @@ __all__ = [
     "OpenAIJinaEmbedder",
     "OpenAIJinaTextEmbedder",
     "OpenAIOmniAnswerer",
+    "OpenAIOmniClaimConsolidator",
     "OpenAIOmniEpisodeConsolidator",
     "OpenAIOmniEventPerceiver",
     "normalize_openai_base_url",

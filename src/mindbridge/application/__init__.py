@@ -5,6 +5,10 @@ from mindbridge.application.claim_consolidation import (
     ClaimCandidatePage,
     ClaimCandidateRequest,
     ClaimCandidateStore,
+    ClaimConsolidation,
+    ClaimConsolidator,
+    ClaimRelationshipProposal,
+    SemanticClaimProposal,
 )
 from mindbridge.application.consolidation import (
     ConsolidateEpisodes,
@@ -86,6 +90,9 @@ __all__ = [
     "ClaimCandidatePage",
     "ClaimCandidateRequest",
     "ClaimCandidateStore",
+    "ClaimConsolidation",
+    "ClaimConsolidator",
+    "ClaimRelationshipProposal",
     "ConsolidateEpisodes",
     "EmbeddingIndex",
     "EmbeddingInput",
@@ -133,6 +140,7 @@ __all__ = [
     "RecallMemories",
     "ResolvedEvidence",
     "ResolvedQueryMedia",
+    "SemanticClaimProposal",
     "TextDocumentEmbedder",
     "fuse_memory_rankings",
     "resolve_evidence_media",

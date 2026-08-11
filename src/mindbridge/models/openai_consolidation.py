@@ -23,7 +23,7 @@ from mindbridge.application import (
 )
 from mindbridge.core import DomainInvariantError, Event, EventId, ModelOutputError, ModelReference
 from mindbridge.models.openai_chat import stream_text_completion
-from mindbridge.models.openai_media import OpenAIContentPart, media_content_part
+from mindbridge.models.openai_media import OpenAIContentPart, evidence_media_content_parts
 from mindbridge.models.openai_omni import (
     DEFAULT_OMNI_MODEL_ID,
     DEFAULT_VIDEO_FRAMES_PER_SECOND,
@@ -217,20 +217,13 @@ def _messages(
     content: list[OpenAIContentPart] = [
         {"type": "text", "text": f"Candidate context:\n{_context(events, evidence)}"}
     ]
-    seen_media_ids: set[str] = set()
-    for item in evidence:
-        media_id = item.media_object.media_object_id
-        if media_id in seen_media_ids:
-            continue
-        seen_media_ids.add(media_id)
-        content.append({"type": "text", "text": f"Source media_object_id={media_id} follows."})
-        content.append(
-            media_content_part(
-                item,
-                video_frames_per_second=video_frames_per_second,
-                video_max_pixels=video_max_pixels,
-            )
+    content.extend(
+        evidence_media_content_parts(
+            evidence,
+            video_frames_per_second=video_frames_per_second,
+            video_max_pixels=video_max_pixels,
         )
+    )
     return [
         {"role": "system", "content": _CONSOLIDATE_EPISODES_PROMPT},
         {"role": "user", "content": content},

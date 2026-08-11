@@ -7,11 +7,14 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Protocol
 
+from mindbridge.application.perception import ResolvedEvidence
 from mindbridge.core import (
     Claim,
     ClaimId,
     DomainInvariantError,
     EntityId,
+    ModelReference,
+    RelationType,
     TenantId,
 )
 
@@ -81,3 +84,79 @@ class ClaimCandidateStore(Protocol):
         self,
         request: ClaimCandidateRequest,
     ) -> ClaimCandidatePage: ...
+
+
+@dataclass(frozen=True, slots=True)
+class SemanticClaimProposal:
+    """One stronger Claim grounded in two or more mutually supporting Claims."""
+
+    source_claim_ids: tuple[ClaimId, ...]
+    statement: str
+    confidence: float
+
+    def __post_init__(self) -> None:
+        if not 2 <= len(self.source_claim_ids) <= 32 or len(set(self.source_claim_ids)) != len(
+            self.source_claim_ids
+        ):
+            raise DomainInvariantError("semantic Claim requires 2 to 32 unique source Claims")
+        if not self.statement.strip():
+            raise DomainInvariantError("semantic Claim statement must not be empty")
+        if not math.isfinite(self.confidence) or not 0.0 <= self.confidence <= 1.0:
+            raise DomainInvariantError("semantic Claim confidence must be between 0 and 1")
+
+
+@dataclass(frozen=True, slots=True)
+class ClaimRelationshipProposal:
+    """One evidence-verified contradiction or temporal replacement between Claims."""
+
+    source_claim_id: ClaimId
+    relation_type: RelationType
+    target_claim_id: ClaimId
+
+    def __post_init__(self) -> None:
+        if self.source_claim_id == self.target_claim_id:
+            raise DomainInvariantError("Claim relationship cannot point to itself")
+        if self.relation_type not in {RelationType.CONTRADICTS, RelationType.SUPERSEDES}:
+            raise DomainInvariantError("Claim relationship must contradict or supersede")
+
+
+@dataclass(frozen=True, slots=True)
+class ClaimConsolidation:
+    """Validated Claim proposals and frozen Omni provenance."""
+
+    semantic_claims: tuple[SemanticClaimProposal, ...]
+    relationships: tuple[ClaimRelationshipProposal, ...]
+    model_reference: ModelReference
+    prompt_version: str
+
+    def __post_init__(self) -> None:
+        if not self.prompt_version.strip():
+            raise DomainInvariantError("Claim consolidation prompt version must not be empty")
+        support_ids = [
+            claim_id for proposal in self.semantic_claims for claim_id in proposal.source_claim_ids
+        ]
+        if len(set(support_ids)) != len(support_ids):
+            raise DomainInvariantError("one Claim cannot support multiple semantic proposals")
+        relationship_pairs = [
+            frozenset((proposal.source_claim_id, proposal.target_claim_id))
+            for proposal in self.relationships
+        ]
+        if len(set(relationship_pairs)) != len(relationship_pairs):
+            raise DomainInvariantError("a Claim pair can have only one semantic relationship")
+        support_groups = [set(proposal.source_claim_ids) for proposal in self.semantic_claims]
+        if any(
+            {relationship.source_claim_id, relationship.target_claim_id} <= group
+            for relationship in self.relationships
+            for group in support_groups
+        ):
+            raise DomainInvariantError("supporting Claims cannot also contradict each other")
+
+
+class ClaimConsolidator(Protocol):
+    """Frozen Omni boundary that verifies semantic relationships against evidence."""
+
+    async def propose_claims(
+        self,
+        candidates: tuple[ClaimCandidate, ...],
+        evidence: tuple[ResolvedEvidence, ...],
+    ) -> ClaimConsolidation: ...

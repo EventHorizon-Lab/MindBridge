@@ -23,7 +23,7 @@ from mindbridge.core import MemoryId, MemoryRecord, ModelOutputError
 from mindbridge.models.openai_chat import stream_text_completion
 from mindbridge.models.openai_media import (
     OpenAIContentPart,
-    media_content_part,
+    evidence_media_content_parts,
     media_url_content_part,
 )
 from mindbridge.telemetry import set_current_span_attributes, trace_operation
@@ -291,21 +291,14 @@ def _messages(
                 video_max_pixels=video_max_pixels,
             )
         )
-    for evidence_item in evidence:
-        media_object_id = evidence_item.media_object.media_object_id
-        if media_object_id in seen_media_object_ids:
-            continue
-        seen_media_object_ids.add(media_object_id)
-        content.append(
-            {"type": "text", "text": f"Source media_object_id={media_object_id} follows."}
+    content.extend(
+        evidence_media_content_parts(
+            evidence,
+            excluded_media_object_ids=seen_media_object_ids,
+            video_frames_per_second=video_frames_per_second,
+            video_max_pixels=video_max_pixels,
         )
-        content.append(
-            media_content_part(
-                evidence_item,
-                video_frames_per_second=video_frames_per_second,
-                video_max_pixels=video_max_pixels,
-            )
-        )
+    )
     return [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": content},

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Collection
 from pathlib import PurePosixPath
 from typing import Literal, TypedDict
 from urllib.parse import urlsplit
@@ -42,6 +43,32 @@ class AudioPart(TypedDict):
 
 
 OpenAIContentPart = TextPart | ImagePart | VideoPart | AudioPart
+
+
+def evidence_media_content_parts(
+    evidence: tuple[ResolvedEvidence, ...],
+    *,
+    video_frames_per_second: float,
+    video_max_pixels: int,
+    excluded_media_object_ids: Collection[str] = (),
+) -> list[OpenAIContentPart]:
+    """Label and attach each distinct source media object exactly once."""
+    parts: list[OpenAIContentPart] = []
+    seen_media_object_ids = set(excluded_media_object_ids)
+    for item in evidence:
+        media_object_id = item.media_object.media_object_id
+        if media_object_id in seen_media_object_ids:
+            continue
+        seen_media_object_ids.add(media_object_id)
+        parts.append({"type": "text", "text": f"Source media_object_id={media_object_id} follows."})
+        parts.append(
+            media_content_part(
+                item,
+                video_frames_per_second=video_frames_per_second,
+                video_max_pixels=video_max_pixels,
+            )
+        )
+    return parts
 
 
 def media_content_part(
