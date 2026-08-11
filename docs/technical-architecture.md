@@ -1,8 +1,8 @@
 # MindBridge 技术实现架构
 
 > 状态：基线方案（Baseline）
-> 版本：0.1
-> 更新日期：2026-08-11
+> 版本：0.2
+> 更新日期：2026-08-12
 
 ## 1. 文档目的
 
@@ -386,6 +386,32 @@ vLLM pooling 进程。
 - 更新记忆、实体 prototype、索引、阈值、Top-K 和生命周期状态；
 - 根据反馈统计调整召回预算，但所有策略可追踪、可回滚；
 - 使用原始证据对新模型重新编码。
+
+### 6.6 端侧匿名身份实现
+
+端侧不自研人脸或声纹网络。人脸首选 InsightFace 官方 `FaceAnalysis`/SCRFD/ArcFace
+预训练模型包（初始基线 `buffalo_l`）；声纹首选 3D-Speaker/SpeakerLab 官方
+ERes2NetV2 `iic/speech_eres2netv2_sv_zh-cn_16k-common` revision `v1.0.1`，并优先采用
+其 ONNX/TensorRT 导出路径。模型只负责检测、切轨和产生 embedding，MindBridge 不复制
+其推理实现，也不微调权重。
+
+MindBridge 只维护一个设备本地身份记忆边界：
+
+1. 每个模板绑定 `tenant_id`、`device_id`、模态、来源 Observation、模型 ID/revision 和维度；
+2. embedding 归一化后使用 cosine similarity 与可校准阈值匹配，不跨模型空间比较；
+3. 每个匿名身份默认最多保留 32 个样本，持续观察只更新有界 prototype 样本集；
+4. embedding 使用设备注入的 256-bit key 进行 AES-256-GCM 加密，SQLite 主文件权限为
+   `0600`；密钥来自 TPM/设备 Secret Manager，不写入数据库、配置或日志；
+5. 首版在单设备有界样本集上做线性扫描；只有 trace 证明它成为瓶颈时才引入 FAISS；
+6. 云端 `ObserveRequest.identity_observations` 只包含匿名 `identity_id`、`face|voice`、
+   时间区间、置信度和模型版本，Schema 明确禁止额外 embedding 字段；
+7. Worker 按时间重叠把匿名身份写成 `person` Entity 和 EvidenceSpan 级
+   `entity_mentions`，因此 `RecallFilters.person_ids` 走生产检索路径；
+8. Observation tombstone 在端侧同一事务中删除由它学习的加密样本，防止遗忘后重新识别。
+
+参考上游：[InsightFace](https://github.com/deepinsight/insightface)、
+[3D-Speaker](https://github.com/modelscope/3D-Speaker)。阈值必须按设备摄像头、麦克风、距离与
+环境噪声校准并写入部署配置，不能把某个 Benchmark 的最佳值硬编码进代码。
 
 ## 7. 召回、追问与回答
 
@@ -928,7 +954,8 @@ tests/
 
 ## 13. 安全与隐私边界
 
-1. 人脸和声纹模板默认仅存在于设备加密存储中，云端只接收设备域匿名 `person_id` / `speaker_id` 和置信度。
+1. 人脸和声纹模板默认仅存在于设备加密存储中；云端只接收设备域匿名 `identity_id`、模态、
+   时间区间、模型版本和置信度，不接收生物 embedding。
 2. 跨设备身份合并必须是显式策略，不能通过通用 Omni 相似度自动完成。
 3. 原始媒体上传前执行设备/租户的隐私策略；可选择裁剪、模糊、静音或仅上传事件摘要。
 4. 端云通信使用 TLS，媒体对象和数据库使用静态加密；密钥不写入配置文件或日志。

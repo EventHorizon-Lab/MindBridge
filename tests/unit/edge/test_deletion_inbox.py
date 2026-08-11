@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from mindbridge.contracts import (
     DeletionPage,
@@ -14,12 +15,20 @@ from mindbridge.contracts import (
 from mindbridge.core import (
     DeletionPropagationState,
     ForgetTargetType,
+    IdentityKind,
     MediaKind,
     MemoryDeletedError,
+    ModelReference,
     SensorKind,
     derive_observation_id,
 )
-from mindbridge.edge import EdgeMediaFile, SQLiteDeletionInbox, SQLiteObservationOutbox
+from mindbridge.edge import (
+    EdgeMediaFile,
+    LocalIdentitySample,
+    SQLiteDeletionInbox,
+    SQLiteIdentityMemory,
+    SQLiteObservationOutbox,
+)
 
 NOW = datetime(2026, 8, 12, 8, 0, tzinfo=timezone.utc)
 
@@ -33,6 +42,29 @@ def test_tombstone_erasure_rolls_back_until_local_media_can_be_deleted(
     outbox = SQLiteObservationOutbox(database_path, clock=lambda: NOW)
     inbox = SQLiteDeletionInbox(database_path, clock=lambda: NOW)
     request = _request()
+    observation_id = derive_observation_id(
+        request.tenant_id,
+        request.device_id,
+        request.boot_id,
+        request.sequence,
+    )
+    identity_memory = SQLiteIdentityMemory(
+        database_path,
+        device_id=request.device_id,
+        encryption_key=AESGCM.generate_key(bit_length=256),
+        clock=lambda: NOW,
+    )
+    identity = identity_memory.recognize_and_remember(
+        LocalIdentitySample(
+            tenant_id=request.tenant_id,
+            kind=IdentityKind.FACE,
+            source_observation_id=observation_id,
+            sample_id="face_track_01",
+            embedding=(1.0, 0.0),
+            model_reference=ModelReference(model_id="insightface/buffalo_l", revision="1.0.1"),
+        ),
+        minimum_similarity=0.8,
+    )
     media_files = (
         EdgeMediaFile(
             media_object_id="media_01",
@@ -56,6 +88,7 @@ def test_tombstone_erasure_rolls_back_until_local_media_can_be_deleted(
     assert inbox.apply_page(request.tenant_id, page) == 1
     assert inbox.read_cursor(request.tenant_id) == "tombstone_01"
     assert outbox.pending_count() == 0
+    assert identity_memory.forget_identity(request.tenant_id, identity.identity_id) == 0
     assert not media_path.exists()
     with pytest.raises(MemoryDeletedError):
         outbox.enqueue(request, media_files)

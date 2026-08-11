@@ -18,6 +18,7 @@ from mindbridge.core.identifiers import (
     ObservationId,
     TenantId,
 )
+from mindbridge.core.identity import AnonymousIdentityObservation
 
 _SHA256_HEX_LENGTH = 64
 
@@ -97,6 +98,7 @@ class Observation:
     ended_at: datetime
     observed_at: datetime
     clock_offset_ms: int = 0
+    identity_observations: tuple[AnonymousIdentityObservation, ...] = ()
 
     def __post_init__(self) -> None:
         require_non_empty(self.observation_id, "observation_id")
@@ -114,6 +116,21 @@ class Observation:
             raise DomainInvariantError("media_object_ids must not contain duplicates")
         if self.ended_at < self.occurred_at:
             raise DomainInvariantError("ended_at must not precede occurred_at")
+        duration_ms = round((self.ended_at - self.occurred_at).total_seconds() * 1_000)
+        if any(identity.end_ms > duration_ms for identity in self.identity_observations):
+            raise DomainInvariantError("identity observation exceeds its source observation")
+        identity_keys = [
+            (
+                identity.kind,
+                identity.identity_id,
+                identity.start_ms,
+                identity.end_ms,
+                identity.model_reference,
+            )
+            for identity in self.identity_observations
+        ]
+        if len(set(identity_keys)) != len(identity_keys):
+            raise DomainInvariantError("identity observations must not contain duplicates")
 
     @property
     def idempotency_key(self) -> str:

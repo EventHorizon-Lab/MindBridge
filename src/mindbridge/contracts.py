@@ -18,6 +18,7 @@ from mindbridge.core import (
     DeletionPropagationState,
     FeedbackType,
     ForgetTargetType,
+    IdentityKind,
     JobState,
     MediaKind,
     MemoryState,
@@ -55,6 +56,24 @@ class MediaObjectInput(ContractModel):
     duration_ms: Annotated[int, Field(ge=0)] | None = None
 
 
+class IdentityObservationInput(ContractModel):
+    """Anonymous edge identity metadata with no face or voice embedding."""
+
+    identity_id: Identifier
+    kind: IdentityKind
+    start_ms: Annotated[int, Field(ge=0)]
+    end_ms: Annotated[int, Field(ge=0)]
+    confidence: Annotated[float, Field(ge=0.0, le=1.0, allow_inf_nan=False)]
+    model_id: Identifier
+    model_revision: Identifier
+
+    @model_validator(mode="after")
+    def require_ordered_time_range(self) -> IdentityObservationInput:
+        if self.end_ms < self.start_ms:
+            raise ValueError("identity end_ms must not precede start_ms")
+        return self
+
+
 class ObserveRequest(ContractModel):
     """Submit one timestamped device observation and its media metadata."""
 
@@ -68,7 +87,28 @@ class ObserveRequest(ContractModel):
     ended_at: AwareDatetime
     observed_at: AwareDatetime
     clock_offset_ms: int = 0
+    identity_observations: tuple[IdentityObservationInput, ...] = ()
     idempotency_key: Identifier | None = None
+
+    @model_validator(mode="after")
+    def require_bounded_identities(self) -> ObserveRequest:
+        duration_ms = round((self.ended_at - self.occurred_at).total_seconds() * 1_000)
+        if any(identity.end_ms > duration_ms for identity in self.identity_observations):
+            raise ValueError("identity observation exceeds source duration")
+        keys = [
+            (
+                identity.kind,
+                identity.identity_id,
+                identity.start_ms,
+                identity.end_ms,
+                identity.model_id,
+                identity.model_revision,
+            )
+            for identity in self.identity_observations
+        ]
+        if len(set(keys)) != len(keys):
+            raise ValueError("identity observations must not contain duplicates")
+        return self
 
 
 class ObservationStatus(str, Enum):

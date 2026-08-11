@@ -20,10 +20,12 @@ from mindbridge.application import (
 )
 from mindbridge.contracts import RecallFilters, RecallQuery, RecallRequest
 from mindbridge.core import (
+    AnonymousIdentityObservation,
     DeviceId,
     DomainInvariantError,
     EvidenceId,
     EvidenceSpan,
+    IdentityKind,
     JobId,
     JobState,
     MediaKind,
@@ -44,7 +46,7 @@ EMBEDDING_MODEL = ModelReference(
     model_id="jinaai/jina-embeddings-v5-omni-small-retrieval",
     revision="12949877f0092093f366c6450340011320152a05",
 )
-DerivedCounts: TypeAlias = tuple[int, int, int, int, int, int, int]
+DerivedCounts: TypeAlias = tuple[int, int, int, int, int, int, int, int, int]
 
 pytestmark = pytest.mark.integration
 
@@ -140,7 +142,7 @@ async def test_processing_commits_provenance_once(
     assert duplicate.state is JobState.SUCCEEDED
     assert perceiver.calls == 1
     assert embedder.documents == ("https://objects.example.test/media_01.mp4",)
-    assert await _derived_counts(database_url, tenant_id) == (1,) * 7
+    assert await _derived_counts(database_url, tenant_id) == (1,) * 9
     assert await _job_state(database_url, tenant_id, job_id) == ("succeeded", 1, None)
     assert await _event_provenance(database_url, tenant_id) == (
         "A person places a red tool beside a blue toolbox.",
@@ -170,9 +172,19 @@ async def test_processing_commits_provenance_once(
         (evidence_id,),
         limit=20,
     )
+    person_candidates = await store.search_memories_by_evidence(
+        RecallRequest(
+            tenant_id=tenant_id,
+            query=RecallQuery(text="irrelevant"),
+            filters=RecallFilters(person_ids=("person_robot_01",)),
+        ),
+        (evidence_id,),
+        limit=20,
+    )
 
     assert dense_candidates[0].summary == "A person places a red tool beside a blue toolbox."
     assert filtered_candidates == ()
+    assert person_candidates[0].memory_id == dense_candidates[0].memory_id
 
 
 async def test_processing_rolls_back_derived_records_before_retry(
@@ -193,7 +205,7 @@ async def test_processing_rolls_back_derived_records_before_retry(
     with pytest.raises(DomainInvariantError, match="cloud embedding dimension"):
         await failing.run(tenant_id, observation_id, job_id)
 
-    assert await _derived_counts(database_url, tenant_id) == (0,) * 7
+    assert await _derived_counts(database_url, tenant_id) == (0,) * 9
     assert await _job_state(database_url, tenant_id, job_id) == (
         "failed",
         1,
@@ -209,7 +221,7 @@ async def test_processing_rolls_back_derived_records_before_retry(
 
     assert succeeded.state is JobState.SUCCEEDED
     assert succeeded.attempt == 2
-    assert await _derived_counts(database_url, tenant_id) == (1,) * 7
+    assert await _derived_counts(database_url, tenant_id) == (1,) * 9
 
 
 async def test_superseded_attempt_cannot_commit(
@@ -263,6 +275,19 @@ async def _write_source_observation(
         ended_at=NOW + timedelta(seconds=4),
         observed_at=NOW,
         clock_offset_ms=0,
+        identity_observations=(
+            AnonymousIdentityObservation(
+                identity_id="person_robot_01",
+                kind=IdentityKind.FACE,
+                start_ms=250,
+                end_ms=2_000,
+                confidence=0.97,
+                model_reference=ModelReference(
+                    model_id="insightface/buffalo_l",
+                    revision="1.0.1",
+                ),
+            ),
+        ),
     )
     result = await store.write_observation(
         ObservationBatch(
@@ -310,9 +335,11 @@ async def _derived_counts(database_url: str, tenant_id: TenantId) -> DerivedCoun
                     (SELECT count(*) FROM memory_records WHERE tenant_id = %s),
                     (SELECT count(*) FROM memory_evidence WHERE tenant_id = %s),
                     (SELECT count(*) FROM relations WHERE tenant_id = %s),
-                    (SELECT count(*) FROM embeddings WHERE tenant_id = %s)
+                    (SELECT count(*) FROM embeddings WHERE tenant_id = %s),
+                    (SELECT count(*) FROM entities WHERE tenant_id = %s),
+                    (SELECT count(*) FROM entity_mentions WHERE tenant_id = %s)
                 """,
-                (tenant_id,) * 7,
+                (tenant_id,) * 9,
             )
         ).fetchone()
     return cast(DerivedCounts, row)

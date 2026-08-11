@@ -51,6 +51,7 @@ from mindbridge.contracts import (
     RememberRequest,
 )
 from mindbridge.core import (
+    AnonymousIdentityObservation,
     DeletionPropagationState,
     DeletionTombstone,
     DeviceId,
@@ -68,6 +69,7 @@ from mindbridge.core import (
     MemoryId,
     MemoryIntegrityError,
     MemoryRecord,
+    ModelReference,
     ObjectStorageError,
     Observation,
     TenantId,
@@ -502,6 +504,20 @@ def _build_observation(request: ObserveRequest) -> Observation:
         ended_at=request.ended_at,
         observed_at=request.observed_at,
         clock_offset_ms=request.clock_offset_ms,
+        identity_observations=tuple(
+            AnonymousIdentityObservation(
+                identity_id=item.identity_id,
+                kind=item.kind,
+                start_ms=item.start_ms,
+                end_ms=item.end_ms,
+                confidence=item.confidence,
+                model_reference=ModelReference(
+                    model_id=item.model_id,
+                    revision=item.model_revision,
+                ),
+            )
+            for item in request.identity_observations
+        ),
     )
 
 

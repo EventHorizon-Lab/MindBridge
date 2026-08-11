@@ -9,6 +9,7 @@ from pathlib import Path
 
 from mindbridge.contracts import DeletionPage, DeletionTombstoneView, ObserveRequest
 from mindbridge.core import ForgetTargetType, MemoryIntegrityError, derive_observation_id
+from mindbridge.edge.identity_schema import initialize_identity_tables
 
 
 class SQLiteDeletionInbox:
@@ -24,6 +25,7 @@ class SQLiteDeletionInbox:
         self._clock = clock or _utc_now
         with self._connect() as connection:
             initialize_deletion_tables(connection)
+            initialize_identity_tables(connection)
 
     def apply_page(self, tenant_id: str, page: DeletionPage) -> int:
         """Erase local targets and advance the cursor in one recoverable transaction."""
@@ -63,6 +65,7 @@ class SQLiteDeletionInbox:
                 UNION SELECT tenant_id FROM edge_sync_watermarks
                 UNION SELECT tenant_id FROM edge_observation_media
                 UNION SELECT tenant_id FROM edge_deletion_cursors
+                UNION SELECT tenant_id FROM edge_identity_templates
                 ORDER BY tenant_id
                 """
             ).fetchall()
@@ -156,6 +159,13 @@ class SQLiteDeletionInbox:
             """
             DELETE FROM edge_observation_media
             WHERE tenant_id = ? AND observation_id = ?
+            """,
+            (tenant_id, observation_id),
+        )
+        connection.execute(
+            """
+            DELETE FROM edge_identity_templates
+            WHERE tenant_id = ? AND source_observation_id = ?
             """,
             (tenant_id, observation_id),
         )

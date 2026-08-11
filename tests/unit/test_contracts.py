@@ -7,13 +7,14 @@ from pydantic import ValidationError
 
 from mindbridge.contracts import (
     FeedbackRequest,
+    IdentityObservationInput,
     MediaObjectInput,
     ObserveRequest,
     RecallFilters,
     RecallQuery,
     RecallRequest,
 )
-from mindbridge.core import FeedbackType, MediaKind, SensorKind
+from mindbridge.core import FeedbackType, IdentityKind, MediaKind, SensorKind
 
 NOW = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
 
@@ -84,7 +85,31 @@ def test_observe_requires_timezone_aware_timestamps() -> None:
         _observe_request(observed_at=datetime(2026, 8, 11, 12, 0))  # noqa: DTZ001
 
 
-def _observe_request(*, observed_at: datetime = NOW) -> ObserveRequest:
+def test_observe_accepts_only_bounded_anonymous_identity_metadata() -> None:
+    identity = IdentityObservationInput(
+        identity_id="person_device_01",
+        kind=IdentityKind.FACE,
+        start_ms=0,
+        end_ms=1,
+        confidence=0.9,
+        model_id="insightface/buffalo_l",
+        model_revision="1.0.1",
+    )
+
+    with pytest.raises(ValidationError, match="exceeds source duration"):
+        _observe_request(identity_observations=(identity,))
+    with pytest.raises(ValidationError, match="extra_forbidden"):
+        IdentityObservationInput(
+            **identity.model_dump(),
+            embedding=[1.0, 0.0],  # type: ignore[call-arg]
+        )
+
+
+def _observe_request(
+    *,
+    observed_at: datetime = NOW,
+    identity_observations: tuple[IdentityObservationInput, ...] = (),
+) -> ObserveRequest:
     return ObserveRequest(
         tenant_id="tenant_01",
         device_id="device_01",
@@ -104,4 +129,5 @@ def _observe_request(*, observed_at: datetime = NOW) -> ObserveRequest:
         occurred_at=NOW,
         ended_at=NOW,
         observed_at=observed_at,
+        identity_observations=identity_observations,
     )

@@ -43,6 +43,7 @@ from mindbridge.core.identifiers import (
     derive_observation_id,
     derive_stable_id,
 )
+from mindbridge.core.identity import AnonymousIdentityObservation, IdentityKind, IdentityMention
 from mindbridge.core.jobs import JobState, ObservationJobClaim, ObservationProcessingJob
 from mindbridge.core.lifecycle import (
     DEFAULT_MEMORY_STRENGTH_POLICY,
@@ -65,6 +66,7 @@ from mindbridge.core.memory import (
 
 __all__ = [
     "DEFAULT_MEMORY_STRENGTH_POLICY",
+    "AnonymousIdentityObservation",
     "Claim",
     "ClaimId",
     "DeletionPropagationState",
@@ -83,6 +85,8 @@ __all__ = [
     "ForgetTargetNotFoundError",
     "ForgetTargetType",
     "IdempotencyConflictError",
+    "IdentityKind",
+    "IdentityMention",
     "JobId",
     "JobNotFoundError",
     "JobState",

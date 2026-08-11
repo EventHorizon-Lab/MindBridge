@@ -18,6 +18,7 @@ from mindbridge.application import (
 )
 from mindbridge.contracts import (
     FeedbackRequest,
+    IdentityObservationInput,
     MediaObjectInput,
     ObservationStatus,
     ObserveRequest,
@@ -29,6 +30,7 @@ from mindbridge.contracts import (
 from mindbridge.core import (
     FeedbackType,
     IdempotencyConflictError,
+    IdentityKind,
     JobId,
     JobNotFoundError,
     JobState,
@@ -183,7 +185,7 @@ async def test_migration_installs_complete_phase_zero_schema(database_url: str) 
         versions = await (
             await connection.execute("SELECT version FROM schema_migrations ORDER BY version")
         ).fetchall()
-    assert [cast(tuple[int], row)[0] for row in versions] == [1, 2, 3, 4, 5]
+    assert [cast(tuple[int], row)[0] for row in versions] == [1, 2, 3, 4, 5, 6]
 
 
 async def test_postgres_vertical_path_is_idempotent_and_evidence_first(
@@ -224,6 +226,8 @@ async def test_postgres_vertical_path_is_idempotent_and_evidence_first(
     assert stored_batch.observation.observation_id == first.observation_id
     assert stored_batch.media_objects[0].media_object_id == "media_01"
     assert stored_batch.evidence_spans[0].end_ms == 4_000
+    assert stored_batch.observation.identity_observations[0].identity_id == "person_device_01"
+    assert stored_batch.observation.identity_observations[0].model_reference.revision == "1.0.1"
     assert await _processing_job_count(database_url, "tenant_roundtrip") == 1
     assert memory.verification_status is VerificationStatus.VERIFIED
     assert result.answer == "The robot put the red screwdriver beside the blue toolbox."
@@ -521,6 +525,17 @@ def _observe_request(
         occurred_at=NOW + timedelta(seconds=sequence),
         ended_at=NOW + timedelta(seconds=sequence + 4),
         observed_at=NOW,
+        identity_observations=(
+            IdentityObservationInput(
+                identity_id="person_device_01",
+                kind=IdentityKind.FACE,
+                start_ms=500,
+                end_ms=3_500,
+                confidence=0.91,
+                model_id="insightface/buffalo_l",
+                model_revision="1.0.1",
+            ),
+        ),
         idempotency_key=idempotency_key,
     )
 

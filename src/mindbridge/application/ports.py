@@ -18,6 +18,7 @@ from mindbridge.core import (
     EvidenceSpan,
     FeedbackId,
     FeedbackType,
+    IdentityMention,
     JobId,
     MediaObject,
     MediaObjectId,
@@ -95,6 +96,7 @@ class ObservationProcessingOutput:
     events: tuple[Event, ...]
     memories: tuple[MemoryRecord, ...]
     embeddings: tuple[EmbeddingRecord, ...]
+    identity_mentions: tuple[IdentityMention, ...] = ()
 
     def __post_init__(self) -> None:
         if len(self.events) != len(self.memories):
@@ -109,6 +111,9 @@ class ObservationProcessingOutput:
         embedding_ids = [embedding.embedding_id for embedding in self.embeddings]
         if len(set(embedding_ids)) != len(embedding_ids):
             raise DomainInvariantError("derived embedding IDs must be unique")
+        mention_ids = [mention.mention_id for mention in self.identity_mentions]
+        if len(set(mention_ids)) != len(mention_ids):
+            raise DomainInvariantError("derived identity mention IDs must be unique")
 
 
 @dataclass(frozen=True, slots=True)

@@ -6,7 +6,7 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote
 
-from mindbridge.contracts import MediaObjectInput, ObserveRequest
+from mindbridge.contracts import IdentityObservationInput, MediaObjectInput, ObserveRequest
 from mindbridge.core import MediaKind, SensorKind, derive_stable_id
 from mindbridge.edge.outbox import EdgeMediaFile, SQLiteObservationOutbox
 from mindbridge.file_integrity import sha256_file
@@ -26,6 +26,7 @@ def enqueue_captured_video(
     ended_at: datetime,
     observed_at: datetime,
     clock_offset_ms: int = 0,
+    identity_observations: tuple[IdentityObservationInput, ...] = (),
     content_type: str = "video/mp4",
 ) -> ObserveRequest:
     """Validate and queue one immutable video segment produced by the native capture stack."""
@@ -73,6 +74,7 @@ def enqueue_captured_video(
         ended_at=ended_at,
         observed_at=observed_at,
         clock_offset_ms=clock_offset_ms,
+        identity_observations=identity_observations,
         idempotency_key=derive_stable_id(
             "edge_observation",
             tenant_id,

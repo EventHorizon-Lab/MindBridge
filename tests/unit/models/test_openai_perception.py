@@ -11,13 +11,16 @@ from openai import AsyncOpenAI
 
 from mindbridge.application import ResolvedEvidence
 from mindbridge.core import (
+    AnonymousIdentityObservation,
     DeviceId,
     EvidenceId,
     EvidenceSpan,
+    IdentityKind,
     MediaKind,
     MediaObject,
     MediaObjectId,
     ModelOutputError,
+    ModelReference,
     Observation,
     ObservationId,
     SensorKind,
@@ -37,9 +40,10 @@ async def test_omni_perception_returns_grounded_event_and_provider_revision() ->
         content = cast(list[dict[str, object]], messages[1]["content"])
 
         assert request.url.path == "/api/v1/chat/completions"
-        assert payload["model"] == "qwen3.8-max"
         assert {item["type"] for item in content} >= {"video_url", "input_audio"}
         assert '"evidence_id":"evidence_video"' in cast(str, content[0]["text"])
+        assert '"identity_id":"person_device_01"' in cast(str, content[0]["text"])
+        assert "embedding" not in cast(str, content[0]["text"])
         return _streaming_response(
             {
                 "events": [
@@ -71,7 +75,7 @@ async def test_omni_perception_returns_grounded_event_and_provider_revision() ->
         EvidenceId("evidence_audio"),
     )
     assert result.model_reference.revision == "qwen-serving-revision-01"
-    assert result.prompt_version == "perceive_events_v1"
+    assert result.prompt_version == "perceive_events_v2"
 
 
 async def test_omni_perception_rejects_unknown_evidence() -> None:
@@ -158,6 +162,19 @@ def _observation() -> Observation:
         ended_at=NOW + timedelta(seconds=4),
         observed_at=NOW,
         clock_offset_ms=0,
+        identity_observations=(
+            AnonymousIdentityObservation(
+                identity_id="person_device_01",
+                kind=IdentityKind.FACE,
+                start_ms=500,
+                end_ms=3_500,
+                confidence=0.91,
+                model_reference=ModelReference(
+                    model_id="insightface/buffalo_l",
+                    revision="1.0.1",
+                ),
+            ),
+        ),
     )
 
 

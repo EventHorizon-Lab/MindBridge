@@ -2,6 +2,11 @@
 
 from mindbridge.edge.capture import enqueue_captured_video
 from mindbridge.edge.deletion_inbox import SQLiteDeletionInbox
+from mindbridge.edge.identity import (
+    LocalIdentityMatch,
+    LocalIdentitySample,
+    SQLiteIdentityMemory,
+)
 from mindbridge.edge.outbox import (
     EdgeMediaFile,
     EdgeObservationOutboxItem,
@@ -15,8 +20,11 @@ __all__ = [
     "EdgeObservationOutboxItem",
     "EdgeObservationSynchronizer",
     "EdgeSyncWatermark",
+    "LocalIdentityMatch",
+    "LocalIdentitySample",
     "S3EdgeMediaUploader",
     "SQLiteDeletionInbox",
+    "SQLiteIdentityMemory",
     "SQLiteObservationOutbox",
     "enqueue_captured_video",
 ]

@@ -3,13 +3,18 @@
 from datetime import datetime
 from typing import TypeAlias, cast
 
+from pydantic import TypeAdapter, ValidationError
+
 from mindbridge.application import ObservationBatch
+from mindbridge.contracts import IdentityObservationInput
 from mindbridge.core import (
+    AnonymousIdentityObservation,
     DeviceId,
     ForgetTargetType,
     MediaObject,
     MediaObjectId,
     MemoryIntegrityError,
+    ModelReference,
     Observation,
     ObservationId,
     SensorKind,
@@ -35,7 +40,10 @@ ObservationRow: TypeAlias = tuple[
     datetime,
     datetime,
     int,
+    object,
 ]
+
+_IDENTITY_OBSERVATIONS = TypeAdapter(tuple[IdentityObservationInput, ...])
 
 
 async def read_observation_batch(
@@ -88,7 +96,7 @@ async def read_observation(
     cursor = await connection.execute(
         """
         SELECT observation_id, tenant_id, device_id, boot_id, sequence, sensor,
-               occurred_at, ended_at, observed_at, clock_offset_ms
+               occurred_at, ended_at, observed_at, clock_offset_ms, identity_observations
         FROM observations
         WHERE tenant_id = %s AND observation_id = %s
         """,
@@ -124,6 +132,7 @@ def _observation_from_row(
         ended_at,
         observed_at,
         clock_offset_ms,
+        identity_observations,
     ) = row
     return Observation(
         observation_id=ObservationId(observation_id),
@@ -137,4 +146,26 @@ def _observation_from_row(
         ended_at=ended_at,
         observed_at=observed_at,
         clock_offset_ms=clock_offset_ms,
+        identity_observations=_identity_observations_from_json(identity_observations),
+    )
+
+
+def _identity_observations_from_json(value: object) -> tuple[AnonymousIdentityObservation, ...]:
+    try:
+        inputs = _IDENTITY_OBSERVATIONS.validate_python(value)
+    except ValidationError as error:
+        raise MemoryIntegrityError("stored identity observations are invalid") from error
+    return tuple(
+        AnonymousIdentityObservation(
+            identity_id=item.identity_id,
+            kind=item.kind,
+            start_ms=item.start_ms,
+            end_ms=item.end_ms,
+            confidence=item.confidence,
+            model_reference=ModelReference(
+                model_id=item.model_id,
+                revision=item.model_revision,
+            ),
+        )
+        for item in inputs
     )

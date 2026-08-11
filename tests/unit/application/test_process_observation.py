@@ -14,10 +14,12 @@ from mindbridge.application import (
     ResolvedEvidence,
 )
 from mindbridge.core import (
+    AnonymousIdentityObservation,
     DeviceId,
     EmbeddedObjectType,
     EvidenceId,
     EvidenceSpan,
+    IdentityKind,
     JobId,
     JobState,
     MediaKind,
@@ -177,6 +179,11 @@ async def test_processor_builds_event_memory_and_raw_media_embedding_once() -> N
     assert store.output.memories[0].summary == store.output.events[0].description
     assert store.output.embeddings[0].object_type is EmbeddedObjectType.EVIDENCE_SPAN
     assert store.output.embeddings[0].object_id == "evidence_01"
+    assert len(store.output.identity_mentions) == 1
+    mention = store.output.identity_mentions[0]
+    assert mention.identity_id == "person_robot_01"
+    assert mention.event_id == store.output.events[0].event_id
+    assert mention.evidence_id == "evidence_01"
 
 
 async def test_processor_records_sanitized_failure_state() -> None:
@@ -222,6 +229,19 @@ def _batch() -> ObservationBatch:
         ended_at=NOW + timedelta(seconds=4),
         observed_at=NOW,
         clock_offset_ms=0,
+        identity_observations=(
+            AnonymousIdentityObservation(
+                identity_id="person_robot_01",
+                kind=IdentityKind.FACE,
+                start_ms=250,
+                end_ms=2_000,
+                confidence=0.97,
+                model_reference=ModelReference(
+                    model_id="insightface/buffalo_l",
+                    revision="1.0.1",
+                ),
+            ),
+        ),
     )
     return ObservationBatch(
         media_objects=(

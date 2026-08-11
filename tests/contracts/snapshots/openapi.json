@@ -491,6 +491,69 @@
         "title": "HealthResponse",
         "type": "object"
       },
+      "IdentityKind": {
+        "description": "Biometric modality used only to create a device-domain anonymous identity.",
+        "enum": [
+          "face",
+          "voice"
+        ],
+        "title": "IdentityKind",
+        "type": "string"
+      },
+      "IdentityObservationInput": {
+        "additionalProperties": false,
+        "description": "Anonymous edge identity metadata with no face or voice embedding.",
+        "properties": {
+          "confidence": {
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Confidence",
+            "type": "number"
+          },
+          "end_ms": {
+            "minimum": 0.0,
+            "title": "End Ms",
+            "type": "integer"
+          },
+          "identity_id": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Identity Id",
+            "type": "string"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/IdentityKind"
+          },
+          "model_id": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Model Id",
+            "type": "string"
+          },
+          "model_revision": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Model Revision",
+            "type": "string"
+          },
+          "start_ms": {
+            "minimum": 0.0,
+            "title": "Start Ms",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "identity_id",
+          "kind",
+          "start_ms",
+          "end_ms",
+          "confidence",
+          "model_id",
+          "model_revision"
+        ],
+        "title": "IdentityObservationInput",
+        "type": "object"
+      },
       "JobState": {
         "description": "Persisted observation processing states.",
         "enum": [
@@ -881,6 +944,14 @@
               }
             ],
             "title": "Idempotency Key"
+          },
+          "identity_observations": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/IdentityObservationInput"
+            },
+            "title": "Identity Observations",
+            "type": "array"
           },
           "media_objects": {
             "items": {

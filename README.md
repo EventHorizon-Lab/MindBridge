@@ -390,9 +390,37 @@ capture supervisor closes a segment, hand that completed file to the small durab
 ```python
 from pathlib import Path
 
-from mindbridge.edge import SQLiteObservationOutbox, enqueue_captured_video
+from mindbridge.core import IdentityKind, ModelReference, derive_observation_id
+from mindbridge.edge import (
+    LocalIdentitySample,
+    SQLiteIdentityMemory,
+    SQLiteObservationOutbox,
+    enqueue_captured_video,
+)
 
 outbox = SQLiteObservationOutbox(Path("/var/lib/mindbridge/edge.db"))
+observation_id = derive_observation_id(
+    "tenant_01", "front_camera", "robot-boot-20260811T120000Z", 7
+)
+identities = SQLiteIdentityMemory(
+    Path("/var/lib/mindbridge/edge.db"),
+    device_id="front_camera",
+    encryption_key=device_identity_key,
+)
+face = identities.recognize_and_remember(
+    LocalIdentitySample(
+        tenant_id="tenant_01",
+        kind=IdentityKind.FACE,
+        source_observation_id=observation_id,
+        sample_id="face-track-7-1",
+        embedding=insightface_embedding,
+        model_reference=ModelReference(
+            model_id="insightface/buffalo_l",
+            revision="1.0.1",
+        ),
+    ),
+    minimum_similarity=calibrated_face_threshold,
+)
 request = enqueue_captured_video(
     outbox,
     Path("/var/lib/mindbridge/media/segment-000007.mp4"),
@@ -405,6 +433,7 @@ request = enqueue_captured_video(
     ended_at=segment_ended_at,
     observed_at=capture_completed_at,
     clock_offset_ms=estimated_clock_offset_ms,
+    identity_observations=(face.to_observation_input(start_ms=120, end_ms=2810),),
 )
 ```
 
@@ -412,6 +441,14 @@ The handoff computes the SHA-256 and size, generates a deterministic tenant-scop
 idempotency key, then commits the request and absolute local path to a mode-`0600`, WAL-enabled
 SQLite Outbox. GStreamer/DeepStream remains responsible for camera decoding, encoding, frame rate,
 resolution, VAD/motion/scene gates, and hardware calibration.
+
+InsightFace or 3D-Speaker/SpeakerLab remains responsible for producing face or voice embeddings;
+MindBridge does not reimplement those models. `device_identity_key` is exactly 32 bytes loaded from
+the device TPM or secret manager. The local store normalizes and AES-256-GCM encrypts every bounded
+sample, matches only equal model/revision/dimension spaces, and sends only anonymous IDs and time
+ranges in `ObserveRequest`. The raw embedding and encryption key never enter the Outbox or cloud.
+Forgetting an Observation also removes identity samples learned from that source before the edge
+deletion cursor advances.
 
 Drain a bounded batch with the standard Boto3 credential chain and the typed MindBridge SDK:
 

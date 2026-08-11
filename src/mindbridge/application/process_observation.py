@@ -23,6 +23,8 @@ from mindbridge.core import (
     EmbeddingRecord,
     Event,
     EventId,
+    EvidenceSpan,
+    IdentityMention,
     JobId,
     JobState,
     MemoryId,
@@ -93,6 +95,12 @@ class ProcessObservation:
                     self._embedder,
                     claim.job.created_at,
                 ),
+                identity_mentions=_identity_mentions(
+                    batch.observation,
+                    batch.evidence_spans,
+                    events,
+                    claim.job.created_at,
+                ),
             )
             return await self._store.commit_observation_processing(
                 tenant_id,
@@ -158,6 +166,65 @@ def _event_memory(event: Event) -> MemoryRecord:
         salience=event.salience,
         strength=event.salience,
     )
+
+
+def _identity_mentions(
+    observation: Observation,
+    evidence_spans: tuple[EvidenceSpan, ...],
+    events: tuple[Event, ...],
+    created_at: datetime,
+) -> tuple[IdentityMention, ...]:
+    evidence_by_id = {evidence.evidence_id: evidence for evidence in evidence_spans}
+    mentions: list[IdentityMention] = []
+    for event in events:
+        event_start_ms = round(
+            (event.occurred_at - observation.occurred_at).total_seconds() * 1_000
+        )
+        event_end_ms = round((event.ended_at - observation.occurred_at).total_seconds() * 1_000)
+        for identity in observation.identity_observations:
+            if not _time_ranges_overlap(
+                identity.start_ms,
+                identity.end_ms,
+                event_start_ms,
+                event_end_ms,
+            ):
+                continue
+            for evidence_id in event.evidence_ids:
+                evidence = evidence_by_id[evidence_id]
+                if not _time_ranges_overlap(
+                    identity.start_ms,
+                    identity.end_ms,
+                    evidence.start_ms,
+                    evidence.end_ms,
+                ):
+                    continue
+                mentions.append(
+                    IdentityMention(
+                        mention_id=derive_stable_id(
+                            "mention",
+                            event.tenant_id,
+                            identity.identity_id,
+                            event.event_id,
+                            evidence_id,
+                        ),
+                        tenant_id=event.tenant_id,
+                        identity_id=identity.identity_id,
+                        event_id=event.event_id,
+                        evidence_id=evidence_id,
+                        confidence=identity.confidence,
+                        created_at=created_at,
+                    )
+                )
+    return tuple(mentions)
+
+
+def _time_ranges_overlap(
+    left_start_ms: int,
+    left_end_ms: int,
+    right_start_ms: int,
+    right_end_ms: int,
+) -> bool:
+    return left_end_ms >= right_start_ms and right_end_ms >= left_start_ms
 
 
 async def _evidence_embeddings(

@@ -22,6 +22,7 @@ from mindbridge.application import (
 )
 from mindbridge.contracts import (
     FeedbackRequest,
+    IdentityObservationInput,
     MediaObjectInput,
     ObservationStatus,
     ObserveRequest,
@@ -38,6 +39,7 @@ from mindbridge.core import (
     EvidenceSpan,
     FeedbackType,
     IdempotencyConflictError,
+    IdentityKind,
     JobId,
     JobNotFoundError,
     JobState,
@@ -448,6 +450,29 @@ async def test_observe_is_retry_safe() -> None:
     ]
 
 
+async def test_observe_keeps_only_anonymous_edge_identity_metadata() -> None:
+    store = InMemoryStore()
+    request = _observe_request(
+        identity_observations=(
+            IdentityObservationInput(
+                identity_id="person_device_01",
+                kind=IdentityKind.FACE,
+                start_ms=500,
+                end_ms=3_500,
+                confidence=0.91,
+                model_id="insightface/buffalo_l",
+                model_revision="1.0.1",
+            ),
+        )
+    )
+
+    await _kernel(store, RecordingAnswerer()).observe(request)
+
+    observation = next(iter(store.observations.values()))[1]
+    assert observation.identity_observations[0].identity_id == "person_device_01"
+    assert observation.identity_observations[0].model_reference.revision == "1.0.1"
+
+
 async def test_observation_job_status_is_tenant_scoped() -> None:
     store = InMemoryStore()
     kernel = _kernel(store, RecordingAnswerer())
@@ -800,6 +825,7 @@ def _observe_request(
     *,
     sequence: int = 1,
     idempotency_key: str | None = None,
+    identity_observations: tuple[IdentityObservationInput, ...] = (),
 ) -> ObserveRequest:
     return ObserveRequest(
         tenant_id="tenant_01",
@@ -821,6 +847,7 @@ def _observe_request(
         occurred_at=NOW,
         ended_at=NOW + timedelta(seconds=4),
         observed_at=NOW,
+        identity_observations=identity_observations,
         idempotency_key=idempotency_key,
     )
 

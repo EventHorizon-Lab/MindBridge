@@ -2,6 +2,8 @@
 
 from typing import cast
 
+from psycopg.types.json import Jsonb
+
 from mindbridge.application import ObservationBatch, ObservationWriteResult
 from mindbridge.core import (
     DomainInvariantError,
@@ -103,9 +105,10 @@ async def _insert_observation(
         """
         INSERT INTO observations (
             tenant_id, observation_id, device_id, boot_id, sequence, sensor,
-            occurred_at, ended_at, observed_at, clock_offset_ms, content_digest
+            occurred_at, ended_at, observed_at, clock_offset_ms,
+            identity_observations, content_digest
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT DO NOTHING
         RETURNING observation_id
         """,
@@ -120,6 +123,20 @@ async def _insert_observation(
             observation.ended_at,
             observation.observed_at,
             observation.clock_offset_ms,
+            Jsonb(
+                [
+                    {
+                        "identity_id": identity.identity_id,
+                        "kind": identity.kind.value,
+                        "start_ms": identity.start_ms,
+                        "end_ms": identity.end_ms,
+                        "confidence": identity.confidence,
+                        "model_id": identity.model_reference.model_id,
+                        "model_revision": identity.model_reference.revision,
+                    }
+                    for identity in observation.identity_observations
+                ]
+            ),
             content_digest,
         ),
     )

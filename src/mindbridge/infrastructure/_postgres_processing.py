@@ -14,6 +14,7 @@ from mindbridge.core import (
     EmbeddedObjectType,
     Event,
     ForgetTargetType,
+    IdentityMention,
     JobId,
     MemoryIntegrityError,
     MemoryRecord,
@@ -65,6 +66,7 @@ async def commit_observation_processing(
                 await _write_event_memory_relation(connection, event, memory)
             for embedding in output.embeddings:
                 await write_embedding_on_connection(connection, embedding)
+            await _write_identity_mentions(connection, output.identity_mentions)
             return await mark_observation_processing_succeeded_on_connection(
                 connection,
                 tenant_id,
@@ -93,6 +95,17 @@ def _require_output_identity(
         for embedding in output.embeddings
     ):
         raise DomainInvariantError("observation processing only accepts evidence embeddings")
+    event_evidence = {
+        (event.event_id, evidence_id)
+        for event in output.events
+        for evidence_id in event.evidence_ids
+    }
+    if any(
+        mention.tenant_id != tenant_id
+        or (mention.event_id, mention.evidence_id) not in event_evidence
+        for mention in output.identity_mentions
+    ):
+        raise DomainInvariantError("identity mentions must remain grounded in derived evidence")
 
 
 async def _require_source_evidence(
@@ -109,9 +122,11 @@ async def _require_source_evidence(
         (tenant_id, observation_id),
     )
     source_evidence_ids = {cast(tuple[str], row)[0] async for row in cursor}
-    referenced_evidence_ids = {
-        str(evidence_id) for event in output.events for evidence_id in event.evidence_ids
-    } | {embedding.object_id for embedding in output.embeddings}
+    referenced_evidence_ids = (
+        {str(evidence_id) for event in output.events for evidence_id in event.evidence_ids}
+        | {embedding.object_id for embedding in output.embeddings}
+        | {str(mention.evidence_id) for mention in output.identity_mentions}
+    )
     if not referenced_evidence_ids <= source_evidence_ids:
         raise DomainInvariantError("derived records reference evidence outside the observation")
 
@@ -224,6 +239,71 @@ async def _write_event_memory_relation(
     row = await cursor.fetchone()
     if row is None or tuple(row) != values:
         raise MemoryIntegrityError("event-memory relation has conflicting identity")
+
+
+async def _write_identity_mentions(
+    connection: DatabaseConnection,
+    mentions: tuple[IdentityMention, ...],
+) -> None:
+    for mention in mentions:
+        await _write_person_entity(connection, mention)
+        values = (
+            mention.tenant_id,
+            mention.mention_id,
+            mention.identity_id,
+            mention.event_id,
+            mention.evidence_id,
+            mention.confidence,
+            mention.created_at,
+        )
+        cursor = await connection.execute(
+            """
+            INSERT INTO entity_mentions (
+                tenant_id, mention_id, entity_id, event_id,
+                evidence_id, confidence, created_at
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT DO NOTHING
+            RETURNING mention_id
+            """,
+            values,
+        )
+        if await cursor.fetchone() is not None:
+            continue
+        cursor = await connection.execute(
+            """
+            SELECT tenant_id, mention_id, entity_id, event_id,
+                   evidence_id, confidence, created_at
+            FROM entity_mentions WHERE tenant_id = %s AND mention_id = %s
+            """,
+            (mention.tenant_id, mention.mention_id),
+        )
+        row = await cursor.fetchone()
+        if row is None or tuple(row) != values:
+            raise MemoryIntegrityError("identity mention has conflicting identity")
+
+
+async def _write_person_entity(
+    connection: DatabaseConnection,
+    mention: IdentityMention,
+) -> None:
+    await connection.execute(
+        """
+        INSERT INTO entities (tenant_id, entity_id, entity_type, canonical_name, created_at)
+        VALUES (%s, %s, 'person', NULL, %s)
+        ON CONFLICT DO NOTHING
+        """,
+        (mention.tenant_id, mention.identity_id, mention.created_at),
+    )
+    cursor = await connection.execute(
+        """
+        SELECT entity_type FROM entities
+        WHERE tenant_id = %s AND entity_id = %s
+        """,
+        (mention.tenant_id, mention.identity_id),
+    )
+    row = await cursor.fetchone()
+    if row is None or tuple(row) != ("person",):
+        raise MemoryIntegrityError("anonymous identity conflicts with an existing entity")
 
 
 def _event_digest(event: Event) -> str:
