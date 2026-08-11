@@ -2,8 +2,10 @@
 
 from mindbridge.core.errors import (
     DomainInvariantError,
+    ForgetTargetNotFoundError,
     IdempotencyConflictError,
     JobNotFoundError,
+    MemoryDeletedError,
     MemoryIntegrityError,
     MemoryNotFoundError,
     ModelOutputError,
@@ -20,6 +22,11 @@ from mindbridge.core.evidence import (
     SensorKind,
 )
 from mindbridge.core.feedback import FeedbackType, MemoryFeedback
+from mindbridge.core.forget import (
+    DeletionPropagationState,
+    DeletionTombstone,
+    ForgetTargetType,
+)
 from mindbridge.core.identifiers import (
     ClaimId,
     DeviceId,
@@ -32,6 +39,7 @@ from mindbridge.core.identifiers import (
     MemoryId,
     ObservationId,
     TenantId,
+    TombstoneId,
     derive_stable_id,
 )
 from mindbridge.core.jobs import JobState, ObservationJobClaim, ObservationProcessingJob
@@ -58,6 +66,8 @@ __all__ = [
     "DEFAULT_MEMORY_STRENGTH_POLICY",
     "Claim",
     "ClaimId",
+    "DeletionPropagationState",
+    "DeletionTombstone",
     "DeviceId",
     "DomainInvariantError",
     "EmbeddedObjectType",
@@ -69,6 +79,8 @@ __all__ = [
     "EvidenceSpan",
     "FeedbackId",
     "FeedbackType",
+    "ForgetTargetNotFoundError",
+    "ForgetTargetType",
     "IdempotencyConflictError",
     "JobId",
     "JobNotFoundError",
@@ -76,6 +88,7 @@ __all__ = [
     "MediaKind",
     "MediaObject",
     "MediaObjectId",
+    "MemoryDeletedError",
     "MemoryFeedback",
     "MemoryId",
     "MemoryIntegrityError",
@@ -96,6 +109,7 @@ __all__ = [
     "SensorKind",
     "TaskBrokerError",
     "TenantId",
+    "TombstoneId",
     "VerificationStatus",
     "apply_memory_feedback",
     "calculate_memory_strength",

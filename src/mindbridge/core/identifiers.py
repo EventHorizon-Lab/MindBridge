@@ -5,6 +5,7 @@ import json
 from typing import NewType
 
 TenantId = NewType("TenantId", str)
+TombstoneId = NewType("TombstoneId", str)
 DeviceId = NewType("DeviceId", str)
 MediaObjectId = NewType("MediaObjectId", str)
 ObservationId = NewType("ObservationId", str)

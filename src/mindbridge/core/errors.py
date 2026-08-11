@@ -21,6 +21,14 @@ class MemoryNotFoundError(LookupError):
     """Raised when a caller requests an unknown tenant-owned memory."""
 
 
+class ForgetTargetNotFoundError(LookupError):
+    """Raised when an explicit forget target never existed in the tenant."""
+
+
+class MemoryDeletedError(RuntimeError):
+    """Raised when a tombstone prevents forgotten content from being resurrected."""
+
+
 class ObjectStorageError(RuntimeError):
     """Raised when immutable evidence media cannot be accessed."""
 

@@ -9,6 +9,7 @@ from typing import Protocol, TypeAlias
 
 from mindbridge.contracts import RecallRequest
 from mindbridge.core import (
+    DeletionTombstone,
     DomainInvariantError,
     EmbeddedObjectType,
     EmbeddingRecord,
@@ -68,6 +69,14 @@ class FeedbackWriteResult:
     def __post_init__(self) -> None:
         if (self.resulting_state is None) != (self.resulting_strength is None):
             raise DomainInvariantError("feedback lifecycle state and strength must be paired")
+
+
+@dataclass(frozen=True, slots=True)
+class ForgetPlan:
+    """Durable tombstone plus immutable objects that still require S3 deletion."""
+
+    tombstone: DeletionTombstone
+    media_objects: tuple[MediaObject, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -268,6 +277,34 @@ class MemoryStore(Protocol):
         content_digest: str,
     ) -> FeedbackWriteResult: ...
 
+    async def prepare_forget(
+        self,
+        tombstone: DeletionTombstone,
+        *,
+        idempotency_key: str,
+        content_digest: str,
+    ) -> ForgetPlan: ...
+
+    async def complete_forget(
+        self,
+        tombstone: DeletionTombstone,
+        *,
+        completed_at: datetime,
+    ) -> DeletionTombstone: ...
+
+    async def mark_forget_failed(
+        self,
+        tombstone: DeletionTombstone,
+        *,
+        error_code: str,
+    ) -> DeletionTombstone: ...
+
+    async def read_deletion_tombstone(
+        self,
+        tenant_id: TenantId,
+        tombstone_id: str,
+    ) -> DeletionTombstone: ...
+
     async def search_memories(self, request: RecallRequest) -> tuple[MemoryRecord, ...]: ...
 
     async def search_memories_by_evidence(
@@ -370,6 +407,10 @@ class MediaUrlSigner(Protocol):
         self,
         media_object: MediaObject,
     ) -> PresignedMediaDownload: ...
+
+    async def delete_media(self, media_object: MediaObject) -> None:
+        """Idempotently delete one tenant-validated immutable object."""
+        ...
 
 
 class ObservationJobPublisher(Protocol):

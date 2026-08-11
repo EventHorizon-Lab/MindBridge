@@ -15,7 +15,9 @@ from pydantic import (
 )
 
 from mindbridge.core import (
+    DeletionPropagationState,
     FeedbackType,
+    ForgetTargetType,
     JobState,
     MediaKind,
     MemoryState,
@@ -157,6 +159,28 @@ class FeedbackReceipt(ContractModel):
         if (self.resulting_state is None) != (self.resulting_strength is None):
             raise ValueError("resulting_state and resulting_strength must be provided together")
         return self
+
+
+class ForgetRequest(ContractModel):
+    """Explicitly delete one exact memory or its complete source observation."""
+
+    tenant_id: Identifier
+    target_type: ForgetTargetType
+    target_id: Identifier
+    idempotency_key: Identifier | None = None
+
+
+class ForgetReceipt(ContractModel):
+    """Content-free deletion progress safe to retain after physical erasure."""
+
+    tombstone_id: Identifier
+    target_type: ForgetTargetType
+    target_id: Identifier
+    propagation_state: DeletionPropagationState
+    requested_at: AwareDatetime
+    completed_at: AwareDatetime | None
+    error_code: Identifier | None
+    trace_id: Identifier
 
 
 class RecallQuery(ContractModel):
