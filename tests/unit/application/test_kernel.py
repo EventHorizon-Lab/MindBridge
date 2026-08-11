@@ -84,6 +84,7 @@ class InMemoryStore:
         self.embedding_matches: tuple[EmbeddingMatch, ...] = ()
         self.embedding_searches: list[EmbeddingSearch] = []
         self.graph_memories: dict[tuple[EmbeddedObjectType, str], MemoryId] = {}
+        self.summary_children: dict[MemoryId, tuple[MemoryId, ...]] = {}
         self.embeddings: dict[str, EmbeddingRecord] = {}
         self.feedback: dict[str, tuple[str, FeedbackWriteResult]] = {}
 
@@ -249,6 +250,20 @@ class InMemoryStore:
             if memory_id in memory_by_id
             and _matches_recall_filters(memory_by_id[memory_id], request)
         )[:limit]
+
+    async def search_memories_by_hierarchy(
+        self,
+        request: RecallRequest,
+        ranked_memory_ids: tuple[MemoryId, ...],
+        *,
+        limit: int,
+    ) -> tuple[MemoryRecord, ...]:
+        expanded_ids = list(dict.fromkeys(ranked_memory_ids))
+        for memory_id in expanded_ids:
+            for child_id in self.summary_children.get(memory_id, ()):
+                if child_id not in expanded_ids:
+                    expanded_ids.append(child_id)
+        return await self.search_memories_by_ids(request, tuple(expanded_ids), limit=limit)
 
     async def search_memories_by_graph_objects(
         self,
@@ -878,6 +893,45 @@ async def test_semantic_memory_finds_attested_text_without_matching_words() -> N
 
     assert [item.memory_id for item in result.memories] == [memory.memory_id]
     assert result.answer == memory.summary
+
+
+async def test_semantic_summary_hit_descends_to_attested_source_for_answering() -> None:
+    store = InMemoryStore()
+    answerer = RecordingAnswerer()
+    child = await _kernel(store, answerer).remember(_remember_request())
+    parent = MemoryRecord(
+        memory_id=MemoryId("summary_parent"),
+        tenant_id=TenantId("tenant_01"),
+        memory_type=MemoryType.SEMANTIC,
+        summary="A generated navigation summary.",
+        evidence_ids=(),
+        occurred_at=child.occurred_at,
+        ended_at=child.ended_at,
+        created_at=NOW,
+        verification_status=VerificationStatus.UNVERIFIED,
+        model_reference=ModelReference(model_id="omni", revision="summary-revision"),
+    )
+    store.memories["summary"] = ("a" * 64, parent)
+    store.summary_children[parent.memory_id] = (MemoryId(child.memory_id),)
+    store.embedding_matches = (
+        EmbeddingMatch(
+            embedding_id="embedding_summary",
+            object_type=EmbeddedObjectType.MEMORY_RECORD,
+            object_id=parent.memory_id,
+            similarity=0.9,
+        ),
+    )
+
+    result = await _kernel(store, answerer).recall(
+        RecallRequest(tenant_id="tenant_01", query=RecallQuery(text="a semantic paraphrase"))
+    )
+
+    assert [memory.memory_id for memory in result.memories] == [
+        parent.memory_id,
+        child.memory_id,
+    ]
+    assert [memory.memory_id for memory in answerer.last_memories] == [child.memory_id]
+    assert result.answer == child.summary
 
 
 async def test_recall_scopes_followup_to_explicit_memory_ids() -> None:

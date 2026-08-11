@@ -280,6 +280,14 @@ class MemoryStore(Protocol):
         limit: int,
     ) -> tuple[MemoryRecord, ...]: ...
 
+    async def search_memories_by_hierarchy(
+        self,
+        request: RecallRequest,
+        ranked_memory_ids: tuple[MemoryId, ...],
+        *,
+        limit: int,
+    ) -> tuple[MemoryRecord, ...]: ...
+
     async def search_memories_by_graph_objects(
         self,
         request: RecallRequest,

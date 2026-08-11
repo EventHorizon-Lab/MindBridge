@@ -989,14 +989,25 @@ async def test_summary_consolidation_is_atomic_recallable_and_retry_safe(
             limit=20,
         )
     )
-    memories = await store.search_memories_by_ids(
+    strict_memories = await store.search_memories_by_ids(
         RecallRequest(tenant_id=tenant_id, query=RecallQuery(text="repair session")),
         tuple(MemoryId(match.object_id) for match in matches),
         limit=20,
     )
-    assert [memory.summary for memory in memories] == [
+    assert [memory.summary for memory in strict_memories] == [
         "Across the session, a person kept a red tool beside a blue toolbox."
     ]
+    expanded_memories = await store.search_memories_by_hierarchy(
+        RecallRequest(tenant_id=tenant_id, query=RecallQuery(text="repair session")),
+        tuple(MemoryId(match.object_id) for match in matches),
+        limit=20,
+    )
+    assert expanded_memories[0].memory_id == strict_memories[0].memory_id
+    assert len(expanded_memories) == 5
+    assert {memory.summary for memory in expanded_memories[1:]} == {
+        "A person places a red tool beside a blue toolbox.",
+        "The red tool is beside the blue toolbox.",
+    }
 
 
 async def test_superseded_attempt_cannot_commit(

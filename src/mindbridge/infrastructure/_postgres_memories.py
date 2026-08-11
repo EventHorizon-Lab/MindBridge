@@ -187,6 +187,25 @@ async def search_memories_by_ids(
         return tuple([memory_from_row(cast(MemoryRow, row)) async for row in cursor])
 
 
+async def search_memories_by_hierarchy(
+    pool: DatabasePool,
+    request: RecallRequest,
+    ranked_memory_ids: tuple[MemoryId, ...],
+    *,
+    limit: int,
+) -> tuple[MemoryRecord, ...]:
+    """Expand semantic Memory hits through bounded Summary descendants."""
+    if not ranked_memory_ids:
+        return ()
+    if limit <= 0:
+        raise DomainInvariantError("hierarchical memory candidate limit must be positive")
+    parameters = _recall_parameters(request)
+    parameters.update(memory_ids=list(ranked_memory_ids), limit=limit)
+    async with tenant_connection(pool, request.tenant_id) as connection:
+        cursor = await connection.execute(_SEARCH_MEMORIES_BY_HIERARCHY_SQL, parameters)
+        return tuple([memory_from_row(cast(MemoryRow, row)) async for row in cursor])
+
+
 async def search_memories_by_graph_objects(
     pool: DatabasePool,
     request: RecallRequest,
@@ -420,6 +439,43 @@ JOIN ranked_memories AS dense ON dense.memory_id = memory.memory_id
 WHERE memory.tenant_id = %(tenant_id)s
 {_STRUCTURED_RECALL_FILTER_SQL}
 ORDER BY dense.rank, memory.strength DESC, memory.occurred_at DESC, memory.memory_id
+LIMIT %(limit)s
+"""
+
+_SEARCH_MEMORIES_BY_HIERARCHY_SQL = f"""
+WITH RECURSIVE ranked_roots AS (
+    SELECT memory_id, rank
+    FROM unnest(%(memory_ids)s::text[]) WITH ORDINALITY AS hit(memory_id, rank)
+),
+hierarchy AS (
+    SELECT memory_id, rank AS root_rank, 0 AS depth, ARRAY[memory_id] AS path
+    FROM ranked_roots
+    UNION ALL
+    SELECT relation.target_id,
+           parent.root_rank,
+           parent.depth + 1,
+           parent.path || relation.target_id
+    FROM hierarchy AS parent
+    JOIN relations AS relation
+      ON relation.tenant_id = %(tenant_id)s
+     AND relation.source_type = 'memory_record'
+     AND relation.source_id = parent.memory_id
+     AND relation.relation_type = 'contains'
+     AND relation.target_type = 'memory_record'
+    WHERE parent.depth < 16
+      AND NOT relation.target_id = ANY(parent.path)
+),
+ranked_memories AS (
+    SELECT memory_id, min(root_rank) AS root_rank, min(depth) AS depth
+    FROM hierarchy
+    GROUP BY memory_id
+)
+{MEMORY_SELECT_SQL}
+JOIN ranked_memories AS dense ON dense.memory_id = memory.memory_id
+WHERE memory.tenant_id = %(tenant_id)s
+{_STRUCTURED_RECALL_FILTER_SQL}
+ORDER BY dense.root_rank, dense.depth, memory.strength DESC,
+         memory.occurred_at DESC, memory.memory_id
 LIMIT %(limit)s
 """
 

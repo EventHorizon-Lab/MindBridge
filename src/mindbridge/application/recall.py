@@ -291,7 +291,7 @@ class RecallMemories:
         memory_ids = tuple(dict.fromkeys(MemoryId(match.object_id) for match in memory_matches))
         evidence_memories, direct_memories, graph_memories = await asyncio.gather(
             self._store.search_memories_by_evidence(request, evidence_ids, limit=limit),
-            self._store.search_memories_by_ids(request, memory_ids, limit=limit),
+            self._store.search_memories_by_hierarchy(request, memory_ids, limit=limit),
             self._store.search_memories_by_graph_objects(
                 request,
                 graph_matches,

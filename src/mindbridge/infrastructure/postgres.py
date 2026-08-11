@@ -81,6 +81,7 @@ from mindbridge.infrastructure._postgres_memories import (
     search_memories,
     search_memories_by_evidence,
     search_memories_by_graph_objects,
+    search_memories_by_hierarchy,
     search_memories_by_ids,
     write_memory,
 )
@@ -349,6 +350,21 @@ class PostgresMemoryStore:
     ) -> tuple[MemoryRecord, ...]:
         """Resolve ranked memory-vector hits with exact recall filters."""
         return await search_memories_by_ids(
+            self._pool,
+            request,
+            ranked_memory_ids,
+            limit=limit,
+        )
+
+    async def search_memories_by_hierarchy(
+        self,
+        request: RecallRequest,
+        ranked_memory_ids: tuple[MemoryId, ...],
+        *,
+        limit: int,
+    ) -> tuple[MemoryRecord, ...]:
+        """Expand semantic Memory hits through their Summary descendants."""
+        return await search_memories_by_hierarchy(
             self._pool,
             request,
             ranked_memory_ids,
