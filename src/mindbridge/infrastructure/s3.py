@@ -124,21 +124,7 @@ class S3MediaAccess:
             raise ObjectStorageError(f"could not sign S3 {http_method} request") from error
 
     def _tenant_object_key(self, media_object: MediaObject) -> str:
-        location = urlsplit(media_object.uri)
-        object_key = location.path.removeprefix("/")
-        tenant_prefix = f"tenants/{quote(media_object.tenant_id, safe='')}/"
-        if (
-            location.scheme != "s3"
-            or location.netloc != self._bucket
-            or location.query
-            or location.fragment
-            or not object_key.startswith(tenant_prefix)
-            or object_key.endswith("/")
-        ):
-            raise InvalidMediaLocationError(
-                "media URI must identify an object in the configured bucket and tenant prefix"
-            )
-        return object_key
+        return tenant_s3_object_key(self._bucket, media_object.tenant_id, media_object.uri)
 
     def _expires_at(self) -> datetime:
         now = self._clock()
@@ -149,3 +135,22 @@ class S3MediaAccess:
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def tenant_s3_object_key(bucket: str, tenant_id: str, uri: str) -> str:
+    """Resolve an S3 URI only when it stays inside one configured tenant prefix."""
+    location = urlsplit(uri)
+    object_key = location.path.removeprefix("/")
+    tenant_prefix = f"tenants/{quote(tenant_id, safe='')}/"
+    if (
+        location.scheme != "s3"
+        or location.netloc != bucket
+        or location.query
+        or location.fragment
+        or not object_key.startswith(tenant_prefix)
+        or object_key.endswith("/")
+    ):
+        raise InvalidMediaLocationError(
+            "media URI must identify an object in the configured bucket and tenant prefix"
+        )
+    return object_key

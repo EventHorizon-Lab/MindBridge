@@ -4,6 +4,7 @@ from mindbridge.infrastructure.postgres import PostgresMemoryStore
 from mindbridge.infrastructure.s3 import (
     InvalidMediaLocationError,
     S3MediaAccess,
+    tenant_s3_object_key,
 )
 from mindbridge.infrastructure.task_queue import (
     CeleryObservationJobPublisher,
@@ -18,4 +19,5 @@ __all__ = [
     "PostgresMemoryStore",
     "S3MediaAccess",
     "create_task_queue",
+    "tenant_s3_object_key",
 ]

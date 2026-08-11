@@ -1,0 +1,146 @@
+"""Upload queued edge media with Boto3, then submit observations through the SDK."""
+
+from __future__ import annotations
+
+import asyncio
+from collections.abc import Awaitable, Callable
+from typing import TYPE_CHECKING
+
+import boto3
+from boto3.exceptions import S3UploadFailedError
+from botocore.config import Config
+from botocore.exceptions import BotoCoreError
+
+from mindbridge.contracts import MediaObjectInput, ObservationReceipt, ObserveRequest
+from mindbridge.core import ObjectStorageError
+from mindbridge.edge.outbox import EdgeMediaFile, SQLiteObservationOutbox
+from mindbridge.file_integrity import sha256_file
+from mindbridge.infrastructure import tenant_s3_object_key
+from mindbridge.sdk import AsyncMindBridge, MindBridgeClientError
+
+if TYPE_CHECKING:
+    from mypy_boto3_s3 import S3Client
+
+UploadEdgeMedia = Callable[[ObserveRequest, EdgeMediaFile], Awaitable[None]]
+
+
+class S3EdgeMediaUploader:
+    """Upload immutable edge files through Boto3's standard credential chain."""
+
+    def __init__(
+        self,
+        bucket: str,
+        *,
+        endpoint_url: str | None = None,
+        region_name: str = "us-east-1",
+        client: S3Client | None = None,
+    ) -> None:
+        if not bucket.strip():
+            raise ValueError("bucket must not be empty")
+        self._bucket = bucket
+        self._client: S3Client = client or boto3.client(
+            "s3",
+            endpoint_url=endpoint_url,
+            region_name=region_name,
+            config=Config(
+                signature_version="s3v4",
+                connect_timeout=5,
+                read_timeout=60,
+                retries={"max_attempts": 3, "mode": "standard"},
+            ),
+        )
+
+    async def upload(self, request: ObserveRequest, media_file: EdgeMediaFile) -> None:
+        """Verify declared bytes locally and upload them to the tenant-scoped object key."""
+        media = next(
+            (
+                candidate
+                for candidate in request.media_objects
+                if candidate.media_object_id == media_file.media_object_id
+            ),
+            None,
+        )
+        if media is None:
+            raise ValueError("edge media file is not present in its observation request")
+        object_key = tenant_s3_object_key(self._bucket, request.tenant_id, media.uri)
+        try:
+            await asyncio.to_thread(self._upload_verified, media, media_file, object_key)
+        except ObjectStorageError:
+            raise
+        except (BotoCoreError, S3UploadFailedError, OSError) as error:
+            raise ObjectStorageError("could not upload edge evidence media") from error
+
+    def _upload_verified(
+        self,
+        media: MediaObjectInput,
+        media_file: EdgeMediaFile,
+        object_key: str,
+    ) -> None:
+        if media_file.local_path.stat().st_size != media.size_bytes:
+            raise ObjectStorageError("edge media size does not match observation metadata")
+        if sha256_file(media_file.local_path).lower() != media.sha256.lower():
+            raise ObjectStorageError("edge media checksum does not match observation metadata")
+        self._client.upload_file(
+            str(media_file.local_path),
+            self._bucket,
+            object_key,
+            ExtraArgs={
+                "ContentType": media_file.content_type,
+                "ChecksumAlgorithm": "SHA256",
+            },
+        )
+
+
+class EdgeObservationSynchronizer:
+    """Drain the durable outbox in order with at-least-once network delivery."""
+
+    def __init__(
+        self,
+        outbox: SQLiteObservationOutbox,
+        memory: AsyncMindBridge,
+        upload_media: UploadEdgeMedia,
+    ) -> None:
+        self._outbox = outbox
+        self._memory = memory
+        self._upload_media = upload_media
+
+    async def sync_next(self) -> ObservationReceipt | None:
+        """Synchronize the oldest item, leaving it durable after any network failure."""
+        item = self._outbox.next_pending()
+        if item is None:
+            return None
+        if not item.media_uploaded:
+            try:
+                for media_file in item.media_files:
+                    await self._upload_media(item.request, media_file)
+            except Exception as error:
+                self._outbox.record_failure(item.outbox_id, _network_error_code(error))
+                raise
+            self._outbox.mark_media_uploaded(item.outbox_id)
+        try:
+            receipt = await self._memory.observe(item.request)
+        except Exception as error:
+            self._outbox.record_failure(item.outbox_id, _network_error_code(error))
+            raise
+        self._outbox.acknowledge(item, receipt)
+        return receipt
+
+    async def sync_pending(self, *, limit: int = 100) -> tuple[ObservationReceipt, ...]:
+        """Synchronize at most `limit` items so the caller controls scheduling and backoff."""
+        if limit <= 0:
+            raise ValueError("edge sync limit must be positive")
+        receipts: list[ObservationReceipt] = []
+        for _ in range(limit):
+            receipt = await self.sync_next()
+            if receipt is None:
+                break
+            receipts.append(receipt)
+        return tuple(receipts)
+
+
+def _network_error_code(error: Exception) -> str:
+    if isinstance(error, MindBridgeClientError):
+        return error.code
+    if isinstance(error, ObjectStorageError):
+        return "object_storage_error"
+    return type(error).__name__[:255]
