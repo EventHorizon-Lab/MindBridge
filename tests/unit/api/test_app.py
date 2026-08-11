@@ -37,6 +37,7 @@ class StubKernel:
     async def observe(self, request: ObserveRequest) -> ObservationReceipt:
         return ObservationReceipt(
             observation_id="observation_01",
+            processing_job_id="job_process_observation_01",
             idempotency_key=request.idempotency_key or "derived-key",
             status=ObservationStatus.ACCEPTED,
             trace_id="trace_observe",

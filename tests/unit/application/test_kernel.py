@@ -27,6 +27,7 @@ from mindbridge.core import (
     EvidenceId,
     EvidenceSpan,
     IdempotencyConflictError,
+    JobId,
     MediaKind,
     MediaObject,
     MediaObjectId,
@@ -61,11 +62,19 @@ class InMemoryStore:
         existing = self.observations.get(key)
         if existing is not None:
             _require_same_content(existing[0], content_digest)
-            return ObservationWriteResult(observation=existing[1], created=False)
+            return ObservationWriteResult(
+                observation=existing[1],
+                processing_job_id=JobId(f"job_process_{existing[1].observation_id}"),
+                created=False,
+            )
         self.observations[key] = (content_digest, batch.observation)
         self.evidence.update((item.evidence_id, item) for item in batch.evidence_spans)
         self.media_objects.update((item.media_object_id, item) for item in batch.media_objects)
-        return ObservationWriteResult(observation=batch.observation, created=True)
+        return ObservationWriteResult(
+            observation=batch.observation,
+            processing_job_id=JobId(f"job_process_{batch.observation.observation_id}"),
+            created=True,
+        )
 
     async def write_memory(
         self,
@@ -171,6 +180,7 @@ async def test_observe_is_retry_safe() -> None:
     retry = await kernel.observe(_observe_request())
 
     assert first.observation_id == retry.observation_id
+    assert first.processing_job_id == retry.processing_job_id
     assert first.status is ObservationStatus.ACCEPTED
     assert retry.status is ObservationStatus.DUPLICATE
     assert len(store.observations) == 1

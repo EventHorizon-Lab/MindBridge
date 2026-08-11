@@ -298,9 +298,9 @@ CREATE TABLE deletion_tombstones (
 CREATE TABLE jobs (
     tenant_id text NOT NULL,
     job_id text NOT NULL,
-    job_type text NOT NULL,
+    job_type text NOT NULL CHECK (job_type IN ('process_observation')),
     state text NOT NULL CHECK (state IN ('pending', 'running', 'succeeded', 'failed')),
-    payload jsonb NOT NULL DEFAULT '{}'::jsonb,
+    payload jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(payload) = 'object'),
     attempt integer NOT NULL DEFAULT 0 CHECK (attempt >= 0),
     error_code text,
     created_at timestamptz NOT NULL,

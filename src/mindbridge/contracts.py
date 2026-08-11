@@ -78,6 +78,7 @@ class ObservationReceipt(ContractModel):
     """Retry-safe acknowledgement for an observation."""
 
     observation_id: Identifier
+    processing_job_id: Identifier
     idempotency_key: Identifier
     status: ObservationStatus
     trace_id: Identifier

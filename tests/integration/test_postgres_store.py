@@ -159,6 +159,8 @@ async def test_postgres_vertical_path_is_idempotent_and_evidence_first(
 
     assert first.status is ObservationStatus.ACCEPTED
     assert retry.status is ObservationStatus.DUPLICATE
+    assert first.processing_job_id == retry.processing_job_id
+    assert await _processing_job_count(database_url, "tenant_roundtrip") == 1
     assert memory.verification_status is VerificationStatus.VERIFIED
     assert result.answer == "The robot put the red screwdriver beside the blue toolbox."
     assert result.evidence[0].evidence_id == evidence_id
@@ -287,6 +289,21 @@ async def _first_evidence_id(database_url: str, tenant_id: str) -> str:
             )
         ).fetchone()
     return cast(tuple[str], row)[0]
+
+
+async def _processing_job_count(database_url: str, tenant_id: str) -> int:
+    connection = await AsyncConnection.connect(database_url)
+    async with connection:
+        row = await (
+            await connection.execute(
+                """
+                SELECT count(*) FROM jobs
+                WHERE tenant_id = %s AND job_type = 'process_observation'
+                """,
+                (tenant_id,),
+            )
+        ).fetchone()
+    return cast(tuple[int], row)[0]
 
 
 def _observe_request(

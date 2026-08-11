@@ -14,6 +14,7 @@ from mindbridge.core import (
     EmbeddingRecord,
     EvidenceId,
     EvidenceSpan,
+    JobId,
     MediaObject,
     MediaObjectId,
     MemoryRecord,
@@ -30,6 +31,7 @@ class ObservationWriteResult:
     """Stored observation and whether this call created it."""
 
     observation: Observation
+    processing_job_id: JobId
     created: bool
 
 

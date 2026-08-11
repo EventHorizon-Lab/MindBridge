@@ -19,6 +19,7 @@ from mindbridge.core import (
     TenantId,
 )
 from mindbridge.infrastructure._postgres_idempotency import claim_idempotency_key
+from mindbridge.infrastructure._postgres_jobs import ensure_observation_processing_job
 from mindbridge.infrastructure._postgres_types import DatabaseConnection, DatabasePool
 
 ObservationRow: TypeAlias = tuple[
@@ -69,7 +70,12 @@ async def write_observation(
                 observation.tenant_id,
                 ObservationId(existing_id),
             )
-            return ObservationWriteResult(observation=existing, created=False)
+            job_id = await ensure_observation_processing_job(connection, existing)
+            return ObservationWriteResult(
+                observation=existing,
+                processing_job_id=job_id,
+                created=False,
+            )
 
         created = await _insert_observation(connection, observation, content_digest)
         if not created:
@@ -82,12 +88,22 @@ async def write_observation(
                 raise IdempotencyConflictError(
                     "device sequence already stores different observation content"
                 )
-            return ObservationWriteResult(observation=existing, created=False)
+            job_id = await ensure_observation_processing_job(connection, existing)
+            return ObservationWriteResult(
+                observation=existing,
+                processing_job_id=job_id,
+                created=False,
+            )
 
         canonical_media_ids = await _write_media_objects(connection, batch.media_objects)
         await _write_observation_media(connection, observation, canonical_media_ids)
         await _write_evidence_spans(connection, batch.evidence_spans, canonical_media_ids)
-        return ObservationWriteResult(observation=observation, created=True)
+        job_id = await ensure_observation_processing_job(connection, observation)
+        return ObservationWriteResult(
+            observation=observation,
+            processing_job_id=job_id,
+            created=True,
+        )
 
 
 async def read_media_objects(
