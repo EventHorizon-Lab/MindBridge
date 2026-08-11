@@ -118,6 +118,27 @@ class InMemoryStore:
             : request.limit
         ]
 
+    async def search_memories_by_evidence(
+        self,
+        request: RecallRequest,
+        ranked_evidence_ids: tuple[EvidenceId, ...],
+        *,
+        limit: int,
+    ) -> tuple[MemoryRecord, ...]:
+        rank = {evidence_id: index for index, evidence_id in enumerate(ranked_evidence_ids)}
+        candidates = (
+            memory
+            for _, memory in self.memories.values()
+            if memory.tenant_id == request.tenant_id
+            and any(evidence_id in rank for evidence_id in memory.evidence_ids)
+        )
+        return tuple(
+            sorted(
+                candidates,
+                key=lambda memory: min(rank[item] for item in memory.evidence_ids if item in rank),
+            )
+        )[:limit]
+
     async def read_evidence(
         self,
         tenant_id: TenantId,

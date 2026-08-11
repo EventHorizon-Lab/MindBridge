@@ -103,7 +103,32 @@ async def search_memories(
     request: RecallRequest,
 ) -> tuple[MemoryRecord, ...]:
     """Apply exact filters and PostgreSQL full-text candidate retrieval."""
-    parameters: dict[str, Any] = {
+    async with pool.connection() as connection:
+        cursor = await connection.execute(_SEARCH_MEMORIES_SQL, _recall_parameters(request))
+        return tuple([_memory_from_row(cast(MemoryRow, row)) async for row in cursor])
+
+
+async def search_memories_by_evidence(
+    pool: DatabasePool,
+    request: RecallRequest,
+    ranked_evidence_ids: tuple[EvidenceId, ...],
+    *,
+    limit: int,
+) -> tuple[MemoryRecord, ...]:
+    """Map semantic evidence rank to memories while retaining exact recall filters."""
+    if not ranked_evidence_ids:
+        return ()
+    if limit <= 0:
+        raise DomainInvariantError("semantic memory candidate limit must be positive")
+    parameters = _recall_parameters(request)
+    parameters.update(evidence_ids=list(ranked_evidence_ids), limit=limit)
+    async with pool.connection() as connection:
+        cursor = await connection.execute(_SEARCH_MEMORIES_BY_EVIDENCE_SQL, parameters)
+        return tuple([_memory_from_row(cast(MemoryRow, row)) async for row in cursor])
+
+
+def _recall_parameters(request: RecallRequest) -> dict[str, Any]:
+    return {
         "tenant_id": request.tenant_id,
         "query": request.query.text,
         "media_object_ids": list(request.query.media_object_ids),
@@ -114,9 +139,6 @@ async def search_memories(
         "occurred_before": request.filters.occurred_before,
         "limit": request.limit,
     }
-    async with pool.connection() as connection:
-        cursor = await connection.execute(_SEARCH_MEMORIES_SQL, parameters)
-        return tuple([_memory_from_row(cast(MemoryRow, row)) async for row in cursor])
 
 
 async def _insert_memory(
@@ -237,33 +259,13 @@ SELECT memory.memory_id,
 FROM memory_records AS memory
 """
 
-_SEARCH_MEMORIES_SQL = f"""
-{_MEMORY_SELECT_SQL}
-WHERE memory.tenant_id = %(tenant_id)s
-  AND (
-      %(query)s::text IS NULL
-      OR to_tsvector('simple', memory.summary) @@ websearch_to_tsquery('simple', %(query)s)
-      OR memory.summary ILIKE '%%' || %(query)s || '%%'
-  )
+_STRUCTURED_RECALL_FILTER_SQL = """
   AND (
       cardinality(%(memory_types)s::text[]) = 0
       OR memory.memory_type = ANY(%(memory_types)s::text[])
   )
   AND (%(occurred_after)s::timestamptz IS NULL OR memory.occurred_at >= %(occurred_after)s)
   AND (%(occurred_before)s::timestamptz IS NULL OR memory.occurred_at <= %(occurred_before)s)
-  AND (
-      cardinality(%(media_object_ids)s::text[]) = 0
-      OR EXISTS (
-          SELECT 1
-          FROM memory_evidence AS media_link
-          JOIN evidence_spans AS media_evidence
-            ON media_evidence.tenant_id = media_link.tenant_id
-           AND media_evidence.evidence_id = media_link.evidence_id
-          WHERE media_link.tenant_id = memory.tenant_id
-            AND media_link.memory_id = memory.memory_id
-            AND media_evidence.media_object_id = ANY(%(media_object_ids)s::text[])
-      )
-  )
   AND (
       cardinality(%(device_ids)s::text[]) = 0
       OR EXISTS (
@@ -293,6 +295,30 @@ WHERE memory.tenant_id = %(tenant_id)s
             AND mention.entity_id = ANY(%(person_ids)s::text[])
       )
   )
+"""
+
+_SEARCH_MEMORIES_SQL = f"""
+{_MEMORY_SELECT_SQL}
+WHERE memory.tenant_id = %(tenant_id)s
+  AND (
+      %(query)s::text IS NULL
+      OR to_tsvector('simple', memory.summary) @@ websearch_to_tsquery('simple', %(query)s)
+      OR memory.summary ILIKE '%%' || %(query)s || '%%'
+  )
+{_STRUCTURED_RECALL_FILTER_SQL}
+  AND (
+      cardinality(%(media_object_ids)s::text[]) = 0
+      OR EXISTS (
+          SELECT 1
+          FROM memory_evidence AS media_link
+          JOIN evidence_spans AS media_evidence
+            ON media_evidence.tenant_id = media_link.tenant_id
+           AND media_evidence.evidence_id = media_link.evidence_id
+          WHERE media_link.tenant_id = memory.tenant_id
+            AND media_link.memory_id = memory.memory_id
+            AND media_evidence.media_object_id = ANY(%(media_object_ids)s::text[])
+      )
+  )
 ORDER BY
     CASE
         WHEN %(query)s::text IS NULL THEN 0
@@ -303,5 +329,26 @@ ORDER BY
     END DESC,
     memory.occurred_at DESC,
     memory.memory_id
+LIMIT %(limit)s
+"""
+
+_SEARCH_MEMORIES_BY_EVIDENCE_SQL = f"""
+WITH ranked_evidence AS (
+    SELECT evidence_id, rank
+    FROM unnest(%(evidence_ids)s::text[]) WITH ORDINALITY AS hit(evidence_id, rank)
+),
+ranked_memories AS (
+    SELECT link.tenant_id, link.memory_id, min(hit.rank) AS dense_rank
+    FROM memory_evidence AS link
+    JOIN ranked_evidence AS hit ON hit.evidence_id = link.evidence_id
+    WHERE link.tenant_id = %(tenant_id)s
+    GROUP BY link.tenant_id, link.memory_id
+)
+{_MEMORY_SELECT_SQL}
+JOIN ranked_memories AS dense
+  ON dense.tenant_id = memory.tenant_id AND dense.memory_id = memory.memory_id
+WHERE memory.tenant_id = %(tenant_id)s
+{_STRUCTURED_RECALL_FILTER_SQL}
+ORDER BY dense.dense_rank, memory.occurred_at DESC, memory.memory_id
 LIMIT %(limit)s
 """

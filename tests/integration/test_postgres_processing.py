@@ -18,6 +18,7 @@ from mindbridge.application import (
     ProcessObservation,
     ResolvedEvidence,
 )
+from mindbridge.contracts import RecallFilters, RecallQuery, RecallRequest
 from mindbridge.core import (
     DeviceId,
     DomainInvariantError,
@@ -147,6 +148,31 @@ async def test_processing_commits_provenance_once(
         "serving-revision-01",
         "perceive_events_v1",
     )
+    evidence_id = (
+        (await store.read_observation_batch(tenant_id, observation_id))
+        .evidence_spans[0]
+        .evidence_id
+    )
+    dense_candidates = await store.search_memories_by_evidence(
+        RecallRequest(
+            tenant_id=tenant_id,
+            query=RecallQuery(text="words absent from the memory summary"),
+        ),
+        (evidence_id,),
+        limit=20,
+    )
+    filtered_candidates = await store.search_memories_by_evidence(
+        RecallRequest(
+            tenant_id=tenant_id,
+            query=RecallQuery(text="irrelevant"),
+            filters=RecallFilters(device_ids=("other_device",)),
+        ),
+        (evidence_id,),
+        limit=20,
+    )
+
+    assert dense_candidates[0].summary == "A person places a red tool beside a blue toolbox."
+    assert filtered_candidates == ()
 
 
 async def test_processing_rolls_back_derived_records_before_retry(

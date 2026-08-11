@@ -38,6 +38,7 @@ from mindbridge.infrastructure._postgres_jobs import (
 )
 from mindbridge.infrastructure._postgres_memories import (
     search_memories,
+    search_memories_by_evidence,
     write_memory,
 )
 from mindbridge.infrastructure._postgres_observation_reads import (
@@ -116,6 +117,21 @@ class PostgresMemoryStore:
     async def search_memories(self, request: RecallRequest) -> tuple[MemoryRecord, ...]:
         """Apply exact filters and PostgreSQL full-text candidate retrieval."""
         return await search_memories(self._pool, request)
+
+    async def search_memories_by_evidence(
+        self,
+        request: RecallRequest,
+        ranked_evidence_ids: tuple[EvidenceId, ...],
+        *,
+        limit: int,
+    ) -> tuple[MemoryRecord, ...]:
+        """Map ranked semantic evidence hits to filtered memory candidates."""
+        return await search_memories_by_evidence(
+            self._pool,
+            request,
+            ranked_evidence_ids,
+            limit=limit,
+        )
 
     async def read_evidence(
         self,
