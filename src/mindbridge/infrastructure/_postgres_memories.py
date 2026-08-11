@@ -10,6 +10,7 @@ from mindbridge.contracts import RecallRequest
 from mindbridge.core import (
     DomainInvariantError,
     EvidenceId,
+    ForgetTargetType,
     IdempotencyConflictError,
     MemoryId,
     MemoryIntegrityError,
@@ -20,6 +21,10 @@ from mindbridge.core import (
     ModelReference,
     TenantId,
     VerificationStatus,
+)
+from mindbridge.infrastructure._postgres_forget import (
+    ensure_memory_not_tombstoned,
+    ensure_target_not_tombstoned,
 )
 from mindbridge.infrastructure._postgres_idempotency import claim_idempotency_key
 from mindbridge.infrastructure._postgres_types import DatabaseConnection, DatabasePool
@@ -89,6 +94,7 @@ async def read_memory(
 ) -> MemoryRecord:
     """Read one memory without revealing whether its ID exists in another tenant."""
     async with pool.connection() as connection:
+        await ensure_memory_not_tombstoned(connection, tenant_id, memory_id)
         memory = await find_memory_on_connection(connection, tenant_id, memory_id)
     if memory is None:
         raise MemoryNotFoundError("memory does not exist")
@@ -101,6 +107,12 @@ async def write_memory_on_connection(
     content_digest: str,
 ) -> bool:
     """Write one memory and evidence links inside a caller-owned transaction."""
+    await ensure_target_not_tombstoned(
+        connection,
+        memory.tenant_id,
+        ForgetTargetType.MEMORY_RECORD,
+        memory.memory_id,
+    )
     created = await _insert_memory(connection, memory, content_digest)
     if not created and await _memory_digest(connection, memory) != content_digest:
         raise IdempotencyConflictError("memory identifier already stores different content")
@@ -355,6 +367,27 @@ FROM memory_records AS memory
 
 _STRUCTURED_RECALL_FILTER_SQL = """
   AND memory.superseded_at IS NULL
+  AND NOT EXISTS (
+      SELECT 1
+      FROM deletion_tombstones AS tombstone
+      WHERE tombstone.tenant_id = memory.tenant_id
+        AND (
+            (tombstone.target_type = 'memory_record' AND tombstone.target_id = memory.memory_id)
+            OR (
+                tombstone.target_type = 'observation'
+                AND EXISTS (
+                    SELECT 1
+                    FROM memory_evidence AS deleted_link
+                    JOIN evidence_spans AS deleted_evidence
+                      ON deleted_evidence.tenant_id = deleted_link.tenant_id
+                     AND deleted_evidence.evidence_id = deleted_link.evidence_id
+                    WHERE deleted_link.tenant_id = memory.tenant_id
+                      AND deleted_link.memory_id = memory.memory_id
+                      AND deleted_evidence.observation_id = tombstone.target_id
+                )
+            )
+        )
+  )
   AND (
       cardinality(%(memory_types)s::text[]) = 0
       OR memory.memory_type = ANY(%(memory_types)s::text[])

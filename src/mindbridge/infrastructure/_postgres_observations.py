@@ -6,12 +6,17 @@ from mindbridge.application import ObservationBatch, ObservationWriteResult
 from mindbridge.core import (
     DomainInvariantError,
     EvidenceSpan,
+    ForgetTargetType,
     IdempotencyConflictError,
     MediaObject,
     MediaObjectId,
     MemoryIntegrityError,
     Observation,
     ObservationId,
+)
+from mindbridge.infrastructure._postgres_forget import (
+    ensure_media_not_scheduled_for_deletion,
+    ensure_target_not_tombstoned,
 )
 from mindbridge.infrastructure._postgres_idempotency import claim_idempotency_key
 from mindbridge.infrastructure._postgres_jobs import ensure_observation_processing_job
@@ -29,6 +34,12 @@ async def write_observation(
     """Write an observation atomically or return its idempotent predecessor."""
     observation = batch.observation
     async with pool.connection() as connection:
+        await ensure_target_not_tombstoned(
+            connection,
+            observation.tenant_id,
+            ForgetTargetType.OBSERVATION,
+            observation.observation_id,
+        )
         existing_id = await claim_idempotency_key(
             connection,
             tenant_id=observation.tenant_id,
@@ -174,6 +185,11 @@ async def _write_media_object(
     if existing is None:
         raise MemoryIntegrityError("media object conflict could not be resolved")
     existing_id, kind, sha256, size_bytes, duration_ms = existing
+    await ensure_media_not_scheduled_for_deletion(
+        connection,
+        media_object.tenant_id,
+        existing_id,
+    )
     if (
         kind != media_object.kind.value
         or sha256 != media_object.sha256
@@ -194,9 +210,11 @@ async def _find_media_object(
     field_value = media_object.sha256 if by_content_hash else media_object.media_object_id
     cursor = await connection.execute(
         f"""
-        SELECT media_object_id, kind, sha256, size_bytes, duration_ms
-        FROM media_objects
-        WHERE tenant_id = %s AND {field_name} = %s
+        SELECT media.media_object_id, media.kind, media.sha256,
+               media.size_bytes, media.duration_ms
+        FROM media_objects AS media
+        WHERE media.tenant_id = %s AND media.{field_name} = %s
+        FOR KEY SHARE OF media
         """,
         (media_object.tenant_id, field_value),
     )

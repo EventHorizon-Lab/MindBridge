@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+from datetime import datetime
+
 from pgvector.psycopg import register_vector_async
 
 from mindbridge.application import (
     EmbeddingMatch,
     EmbeddingSearch,
     FeedbackWriteResult,
+    ForgetPlan,
     MemoryWriteResult,
     ObservationBatch,
     ObservationProcessingOutput,
@@ -15,6 +18,7 @@ from mindbridge.application import (
 )
 from mindbridge.contracts import RecallRequest
 from mindbridge.core import (
+    DeletionTombstone,
     EmbeddingRecord,
     EvidenceId,
     EvidenceSpan,
@@ -28,6 +32,7 @@ from mindbridge.core import (
     ObservationJobClaim,
     ObservationProcessingJob,
     TenantId,
+    TombstoneId,
 )
 from mindbridge.infrastructure._postgres_embeddings import (
     search_embeddings,
@@ -35,6 +40,12 @@ from mindbridge.infrastructure._postgres_embeddings import (
 )
 from mindbridge.infrastructure._postgres_evidence import read_evidence
 from mindbridge.infrastructure._postgres_feedback import record_feedback
+from mindbridge.infrastructure._postgres_forget import (
+    complete_forget,
+    mark_forget_failed,
+    prepare_forget,
+    read_deletion_tombstone,
+)
 from mindbridge.infrastructure._postgres_jobs import (
     claim_observation_processing_job,
     mark_observation_processing_failed,
@@ -145,6 +156,47 @@ class PostgresMemoryStore:
             idempotency_key=idempotency_key,
             content_digest=content_digest,
         )
+
+    async def prepare_forget(
+        self,
+        tombstone: DeletionTombstone,
+        *,
+        idempotency_key: str,
+        content_digest: str,
+    ) -> ForgetPlan:
+        """Persist the deletion barrier and return external media work."""
+        return await prepare_forget(
+            self._pool,
+            tombstone,
+            idempotency_key=idempotency_key,
+            content_digest=content_digest,
+        )
+
+    async def complete_forget(
+        self,
+        tombstone: DeletionTombstone,
+        *,
+        completed_at: datetime,
+    ) -> DeletionTombstone:
+        """Erase database derivatives after external media deletion."""
+        return await complete_forget(self._pool, tombstone, completed_at=completed_at)
+
+    async def mark_forget_failed(
+        self,
+        tombstone: DeletionTombstone,
+        *,
+        error_code: str,
+    ) -> DeletionTombstone:
+        """Keep a recoverable sanitized deletion failure."""
+        return await mark_forget_failed(self._pool, tombstone, error_code=error_code)
+
+    async def read_deletion_tombstone(
+        self,
+        tenant_id: TenantId,
+        tombstone_id: str,
+    ) -> DeletionTombstone:
+        """Read one tenant-owned deletion propagation state."""
+        return await read_deletion_tombstone(self._pool, tenant_id, TombstoneId(tombstone_id))
 
     async def search_memories(self, request: RecallRequest) -> tuple[MemoryRecord, ...]:
         """Apply exact filters and PostgreSQL full-text candidate retrieval."""

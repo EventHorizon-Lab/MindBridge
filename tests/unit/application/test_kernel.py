@@ -50,6 +50,7 @@ from mindbridge.core import (
     MemoryType,
     ModelReference,
     ModelUnavailableError,
+    ObjectStorageError,
     Observation,
     ObservationId,
     ObservationProcessingJob,
@@ -307,6 +308,10 @@ class InMemoryStore:
 class DeterministicMediaUrlSigner:
     """Returns openable-looking URLs without an object-storage dependency."""
 
+    def __init__(self, *, deletion_failures: int = 0) -> None:
+        self.deletion_failures = deletion_failures
+        self.deleted_media_ids: list[MediaObjectId] = []
+
     async def create_presigned_download(
         self,
         media_object: MediaObject,
@@ -315,6 +320,12 @@ class DeterministicMediaUrlSigner:
             download_url=f"https://objects.example.test/{media_object.media_object_id}",
             expires_at=NOW + timedelta(minutes=5),
         )
+
+    async def delete_media(self, media_object: MediaObject) -> None:
+        if self.deletion_failures:
+            self.deletion_failures -= 1
+            raise ObjectStorageError("temporary object-store failure")
+        self.deleted_media_ids.append(media_object.media_object_id)
 
 
 class RecordingAnswerer:

@@ -19,6 +19,7 @@ from mindbridge.core import (
     TenantId,
     apply_memory_feedback,
 )
+from mindbridge.infrastructure._postgres_forget import ensure_memory_not_tombstoned
 from mindbridge.infrastructure._postgres_idempotency import claim_idempotency_key
 from mindbridge.infrastructure._postgres_memories import (
     find_memory_on_connection,
@@ -113,6 +114,7 @@ async def _evolve_target_memory(
 ) -> MemoryRecord | None:
     if feedback.memory_id is None:
         return None
+    await ensure_memory_not_tombstoned(connection, feedback.tenant_id, feedback.memory_id)
     memory = await find_memory_on_connection(
         connection,
         feedback.tenant_id,

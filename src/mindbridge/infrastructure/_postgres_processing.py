@@ -13,6 +13,7 @@ from mindbridge.core import (
     DomainInvariantError,
     EmbeddedObjectType,
     Event,
+    ForgetTargetType,
     JobId,
     MemoryIntegrityError,
     MemoryRecord,
@@ -22,6 +23,7 @@ from mindbridge.core import (
     derive_stable_id,
 )
 from mindbridge.infrastructure._postgres_embeddings import write_embedding_on_connection
+from mindbridge.infrastructure._postgres_forget import ensure_target_not_tombstoned
 from mindbridge.infrastructure._postgres_jobs import (
     mark_observation_processing_succeeded_on_connection,
 )
@@ -42,6 +44,12 @@ async def commit_observation_processing(
     _require_output_identity(tenant_id, observation_id, output)
     try:
         async with pool.connection() as connection:
+            await ensure_target_not_tombstoned(
+                connection,
+                tenant_id,
+                ForgetTargetType.OBSERVATION,
+                observation_id,
+            )
             await _require_source_evidence(connection, tenant_id, observation_id, output)
             for event, memory in zip(output.events, output.memories, strict=True):
                 await _write_event(connection, event)

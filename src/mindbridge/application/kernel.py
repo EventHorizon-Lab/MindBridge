@@ -32,6 +32,8 @@ from mindbridge.contracts import (
     EvidenceView,
     FeedbackReceipt,
     FeedbackRequest,
+    ForgetReceipt,
+    ForgetRequest,
     MediaObjectInput,
     MemoryView,
     ObservationProcessingJobView,
@@ -44,6 +46,8 @@ from mindbridge.contracts import (
     RememberRequest,
 )
 from mindbridge.core import (
+    DeletionPropagationState,
+    DeletionTombstone,
     DeviceId,
     DomainInvariantError,
     EmbeddedObjectType,
@@ -59,9 +63,11 @@ from mindbridge.core import (
     MemoryId,
     MemoryIntegrityError,
     MemoryRecord,
+    ObjectStorageError,
     Observation,
     ObservationId,
     TenantId,
+    TombstoneId,
     VerificationStatus,
     derive_stable_id,
 )
@@ -185,6 +191,56 @@ class MemoryKernel:
             created_at=result.created_at,
             trace_id=_new_id("trace"),
         )
+
+    async def forget(self, request: ForgetRequest) -> ForgetReceipt:
+        """Explicitly erase one scope through a durable, retry-safe tombstone."""
+        content_digest = _request_digest(request)
+        idempotency_key = request.idempotency_key or f"forget_{content_digest}"
+        tombstone = DeletionTombstone(
+            tombstone_id=TombstoneId(
+                derive_stable_id(
+                    "tombstone",
+                    request.tenant_id,
+                    request.target_type.value,
+                    request.target_id,
+                )
+            ),
+            tenant_id=TenantId(request.tenant_id),
+            target_type=request.target_type,
+            target_id=request.target_id,
+            propagation_state=DeletionPropagationState.PENDING,
+            requested_at=self._clock(),
+        )
+        plan = await self._store.prepare_forget(
+            tombstone,
+            idempotency_key=idempotency_key,
+            content_digest=content_digest,
+        )
+        if plan.tombstone.propagation_state is not DeletionPropagationState.COMPLETE:
+            try:
+                for media_object in plan.media_objects:
+                    await self._media_url_signer.delete_media(media_object)
+            except ObjectStorageError:
+                await self._store.mark_forget_failed(
+                    plan.tombstone,
+                    error_code="object_storage_unavailable",
+                )
+                raise
+            completed = await self._store.complete_forget(
+                plan.tombstone,
+                completed_at=self._clock(),
+            )
+        else:
+            completed = plan.tombstone
+        return _forget_receipt(completed)
+
+    async def get_forget_status(self, tenant_id: str, tombstone_id: str) -> ForgetReceipt:
+        """Return content-free deletion progress for one tenant-owned tombstone."""
+        tombstone = await self._store.read_deletion_tombstone(
+            TenantId(tenant_id),
+            tombstone_id,
+        )
+        return _forget_receipt(tombstone)
 
     async def get_observation_job(
         self,
@@ -487,6 +543,19 @@ def _evidence_view(evidence: ResolvedEvidence) -> EvidenceView:
         end_ms=evidence.evidence_span.end_ms,
         media_url=evidence.media_url,
         media_url_expires_at=evidence.media_url_expires_at,
+    )
+
+
+def _forget_receipt(tombstone: DeletionTombstone) -> ForgetReceipt:
+    return ForgetReceipt(
+        tombstone_id=tombstone.tombstone_id,
+        target_type=tombstone.target_type,
+        target_id=tombstone.target_id,
+        propagation_state=tombstone.propagation_state,
+        requested_at=tombstone.requested_at,
+        completed_at=tombstone.completed_at,
+        error_code=tombstone.error_code,
+        trace_id=_new_id("trace"),
     )
 
 

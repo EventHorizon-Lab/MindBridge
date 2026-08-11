@@ -106,6 +106,18 @@ class S3MediaAccess:
             expires_at=expires_at,
         )
 
+    async def delete_media(self, media_object: MediaObject) -> None:
+        """Delete one tenant-scoped object; repeated S3 deletes remain successful."""
+        object_key = self._tenant_object_key(media_object)
+        try:
+            await asyncio.to_thread(
+                self._client.delete_object,
+                Bucket=self._bucket,
+                Key=object_key,
+            )
+        except BotoCoreError as error:
+            raise ObjectStorageError("could not delete S3 evidence media") from error
+
     async def _presign(
         self,
         operation: str,
