@@ -31,6 +31,7 @@ from mindbridge.core import (
     RelationType,
     TenantId,
     VerificationStatus,
+    derive_relation,
     derive_stable_id,
 )
 
@@ -62,8 +63,8 @@ def derive_observation_graph(
     relations: dict[RelationId, Relation] = {}
 
     for event, memory in zip(events, event_memories, strict=True):
-        relation = _relation(
-            observation,
+        relation = derive_relation(
+            observation.tenant_id,
             RelationNodeType.EVENT,
             event.event_id,
             RelationType.REPRESENTED_BY,
@@ -86,8 +87,8 @@ def derive_observation_graph(
             entities[entity.entity_id] = entity
             event_entities.append(entity)
             mentions.extend(_entity_mentions(event, entity, perceived_entity, created_at))
-            relation = _relation(
-                observation,
+            relation = derive_relation(
+                observation.tenant_id,
                 RelationNodeType.EVENT,
                 event.event_id,
                 RelationType.MENTIONS,
@@ -110,8 +111,8 @@ def derive_observation_graph(
             claims.append(claim)
             claim_memories.append(memory)
             for relation in (
-                _relation(
-                    observation,
+                derive_relation(
+                    observation.tenant_id,
                     RelationNodeType.EVENT,
                     event.event_id,
                     RelationType.ASSERTS,
@@ -119,8 +120,8 @@ def derive_observation_graph(
                     claim.claim_id,
                     created_at,
                 ),
-                _relation(
-                    observation,
+                derive_relation(
+                    observation.tenant_id,
                     RelationNodeType.CLAIM,
                     claim.claim_id,
                     RelationType.REPRESENTED_BY,
@@ -131,8 +132,8 @@ def derive_observation_graph(
             ):
                 relations[relation.relation_id] = relation
             for entity_index in perceived_claim.entity_indices:
-                relation = _relation(
-                    observation,
+                relation = derive_relation(
+                    observation.tenant_id,
                     RelationNodeType.CLAIM,
                     claim.claim_id,
                     RelationType.ABOUT,
@@ -151,8 +152,8 @@ def derive_observation_graph(
     entities.update((entity.entity_id, entity) for entity in identity_entities)
     mentions.extend(identity_mentions)
     for mention in identity_mentions:
-        relation = _relation(
-            observation,
+        relation = derive_relation(
+            observation.tenant_id,
             RelationNodeType.EVENT,
             mention.event_id,
             RelationType.MENTIONS,
@@ -393,37 +394,6 @@ def _identity_graph(
                     )
                 )
     return tuple(entities.values()), tuple(mentions)
-
-
-def _relation(
-    observation: Observation,
-    source_type: RelationNodeType,
-    source_id: str,
-    relation_type: RelationType,
-    target_type: RelationNodeType,
-    target_id: str,
-    created_at: datetime,
-) -> Relation:
-    return Relation(
-        relation_id=RelationId(
-            derive_stable_id(
-                "relation",
-                observation.tenant_id,
-                source_type.value,
-                source_id,
-                relation_type.value,
-                target_type.value,
-                target_id,
-            )
-        ),
-        tenant_id=observation.tenant_id,
-        source_type=source_type,
-        source_id=source_id,
-        relation_type=relation_type,
-        target_type=target_type,
-        target_id=target_id,
-        created_at=created_at,
-    )
 
 
 def _time_ranges_overlap(

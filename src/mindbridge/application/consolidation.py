@@ -7,16 +7,25 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Protocol
 
+from mindbridge.application.episodes import (
+    EpisodeConsolidation,
+    EpisodeProposal,
+    EpisodeWrite,
+    derive_episode_writes,
+)
+from mindbridge.application.evidence import EvidenceReader, read_resolved_evidence
 from mindbridge.application.perception import ResolvedEvidence
+from mindbridge.application.ports import MediaUrlSigner, TextDocumentEmbedder
 from mindbridge.core import (
     DomainInvariantError,
     Event,
     EventHierarchyLevel,
     EventId,
     EventStatus,
-    ModelReference,
+    MemoryIntegrityError,
     TenantId,
 )
+from mindbridge.telemetry import set_current_span_attributes, trace_operation
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,36 +81,14 @@ class EpisodeCandidatePage:
 
 
 @dataclass(frozen=True, slots=True)
-class EpisodeProposal:
-    """One Omni-verified group of existing events that form a coherent episode."""
+class EpisodeConsolidationResult:
+    """Content-free progress and outcome for one bounded candidate page."""
 
-    event_ids: tuple[EventId, ...]
-    description: str
-    salience: float
-
-    def __post_init__(self) -> None:
-        if not 2 <= len(self.event_ids) <= 32 or len(set(self.event_ids)) != len(self.event_ids):
-            raise DomainInvariantError("episode proposal requires 2 to 32 unique event IDs")
-        if not self.description.strip():
-            raise DomainInvariantError("episode proposal description must not be empty")
-        if not math.isfinite(self.salience) or not 0.0 <= self.salience <= 1.0:
-            raise DomainInvariantError("episode proposal salience must be between 0 and 1")
-
-
-@dataclass(frozen=True, slots=True)
-class EpisodeConsolidation:
-    """Validated episode proposals and the frozen model provenance that produced them."""
-
-    episodes: tuple[EpisodeProposal, ...]
-    model_reference: ModelReference
-    prompt_version: str
-
-    def __post_init__(self) -> None:
-        if not self.prompt_version.strip():
-            raise DomainInvariantError("episode consolidation prompt version must not be empty")
-        event_ids = [event_id for episode in self.episodes for event_id in episode.event_ids]
-        if len(set(event_ids)) != len(event_ids):
-            raise DomainInvariantError("one event cannot belong to multiple episode proposals")
+    scanned_count: int
+    candidate_count: int
+    proposed_count: int
+    committed_count: int
+    next_cursor: EventId | None
 
 
 class EpisodeCandidateStore(Protocol):
@@ -121,3 +108,107 @@ class EpisodeConsolidator(Protocol):
         events: tuple[Event, ...],
         evidence: tuple[ResolvedEvidence, ...],
     ) -> EpisodeConsolidation: ...
+
+
+class EpisodeConsolidationStore(EpisodeCandidateStore, EvidenceReader, Protocol):
+    """Narrow transactional boundary needed by the Episode use case."""
+
+    async def commit_episode_consolidation(
+        self,
+        tenant_id: TenantId,
+        writes: tuple[EpisodeWrite, ...],
+    ) -> int: ...
+
+
+class ConsolidateEpisodes:
+    """Verify and persist one bounded page without training or hidden state."""
+
+    def __init__(
+        self,
+        store: EpisodeConsolidationStore,
+        consolidator: EpisodeConsolidator,
+        text_embedder: TextDocumentEmbedder,
+        *,
+        media_url_signer: MediaUrlSigner,
+    ) -> None:
+        self._store = store
+        self._consolidator = consolidator
+        self._text_embedder = text_embedder
+        self._media_url_signer = media_url_signer
+
+    @trace_operation("mindbridge.consolidation.episodes")
+    async def run(self, request: EpisodeCandidateRequest) -> EpisodeConsolidationResult:
+        """Discover, inspect, and atomically commit one stable candidate page."""
+        page = await self._store.list_episode_candidates(request)
+        if any(event.tenant_id != request.tenant_id for event in page.events):
+            raise MemoryIntegrityError("episode candidates crossed the requested tenant")
+        if len(page.events) < 2:
+            return _result(page)
+        set_current_span_attributes(
+            {
+                "mindbridge.tenant.id": request.tenant_id,
+                "mindbridge.consolidation.candidate_count": len(page.events),
+            }
+        )
+        evidence_ids = tuple(
+            dict.fromkeys(
+                evidence_id for event in page.events for evidence_id in event.evidence_ids
+            )
+        )
+        evidence = await read_resolved_evidence(
+            self._store,
+            self._media_url_signer,
+            request.tenant_id,
+            evidence_ids,
+        )
+        consolidation = await self._consolidator.propose_episodes(page.events, evidence)
+        _require_candidate_proposals(page.events, consolidation.episodes)
+        writes = await derive_episode_writes(
+            request.tenant_id,
+            page.events,
+            consolidation,
+            self._text_embedder,
+            request.evaluated_at,
+        )
+        committed_count = (
+            await self._store.commit_episode_consolidation(request.tenant_id, writes)
+            if writes
+            else 0
+        )
+        set_current_span_attributes(
+            {
+                "mindbridge.consolidation.proposed_count": len(writes),
+                "mindbridge.consolidation.committed_count": committed_count,
+            }
+        )
+        return _result(
+            page,
+            proposed_count=len(writes),
+            committed_count=committed_count,
+        )
+
+
+def _require_candidate_proposals(
+    candidates: tuple[Event, ...],
+    proposals: tuple[EpisodeProposal, ...],
+) -> None:
+    candidate_ids = {event.event_id for event in candidates}
+    if any(
+        event_id not in candidate_ids for proposal in proposals for event_id in proposal.event_ids
+    ):
+        raise MemoryIntegrityError("episode consolidator returned an unknown candidate event")
+
+
+def _result(
+    page: EpisodeCandidatePage,
+    *,
+    proposed_count: int = 0,
+    committed_count: int = 0,
+) -> EpisodeConsolidationResult:
+    return EpisodeConsolidationResult(
+        scanned_count=page.scanned_count,
+        candidate_count=len(page.events),
+        proposed_count=proposed_count,
+        committed_count=committed_count,
+        next_cursor=page.next_cursor,
+    )

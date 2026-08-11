@@ -15,7 +15,7 @@ from mindbridge.application import (
     LifecycleSweepRequest,
     MemoryLifecycleStore,
 )
-from mindbridge.configuration import require_environment_value
+from mindbridge.configuration import parse_aware_datetime, require_environment_value
 from mindbridge.core import (
     DEFAULT_MEMORY_STRENGTH_POLICY,
     MemoryId,
@@ -137,7 +137,7 @@ def _parser() -> argparse.ArgumentParser:
     policy = DEFAULT_MEMORY_STRENGTH_POLICY
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tenant-id", required=True)
-    parser.add_argument("--evaluated-at", type=_aware_datetime, default=_utc_now())
+    parser.add_argument("--evaluated-at", type=parse_aware_datetime, default=_utc_now())
     parser.add_argument("--page-size", type=int, default=100)
     parser.add_argument("--access-weight", type=float, default=policy.access_weight)
     parser.add_argument(
@@ -150,16 +150,6 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--strengthen-at", type=float, default=policy.strengthen_at)
     parser.add_argument("--cold-below", type=float, default=policy.cold_below)
     return parser
-
-
-def _aware_datetime(value: str) -> datetime:
-    try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError as error:
-        raise argparse.ArgumentTypeError("must be an ISO-8601 datetime") from error
-    if parsed.utcoffset() is None:
-        raise argparse.ArgumentTypeError("must include a timezone offset")
-    return parsed
 
 
 def _utc_now() -> datetime:

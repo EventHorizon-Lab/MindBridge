@@ -1,12 +1,18 @@
 """MindBridge application use cases and external boundaries."""
 
 from mindbridge.application.consolidation import (
+    ConsolidateEpisodes,
     EpisodeCandidatePage,
     EpisodeCandidateRequest,
     EpisodeCandidateStore,
-    EpisodeConsolidation,
+    EpisodeConsolidationResult,
+    EpisodeConsolidationStore,
     EpisodeConsolidator,
+)
+from mindbridge.application.episodes import (
+    EpisodeConsolidation,
     EpisodeProposal,
+    EpisodeWrite,
 )
 from mindbridge.application.evidence import resolve_evidence_media
 from mindbridge.application.kernel import MemoryKernel
@@ -70,6 +76,7 @@ __all__ = [
     "MAX_PERCEPTION_CLAIMS",
     "MAX_PERCEPTION_ENTITIES",
     "MAX_PERCEPTION_EVENTS",
+    "ConsolidateEpisodes",
     "EmbeddingIndex",
     "EmbeddingInput",
     "EmbeddingMatch",
@@ -78,8 +85,11 @@ __all__ = [
     "EpisodeCandidateRequest",
     "EpisodeCandidateStore",
     "EpisodeConsolidation",
+    "EpisodeConsolidationResult",
+    "EpisodeConsolidationStore",
     "EpisodeConsolidator",
     "EpisodeProposal",
+    "EpisodeWrite",
     "EventPerception",
     "EvolveMemoryLifecycle",
     "FeedbackWriteResult",

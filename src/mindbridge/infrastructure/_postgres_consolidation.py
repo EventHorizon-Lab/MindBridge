@@ -5,17 +5,28 @@ from __future__ import annotations
 from datetime import datetime
 from typing import TypeAlias, cast
 
-from mindbridge.application import EpisodeCandidatePage, EpisodeCandidateRequest
+from psycopg.errors import ForeignKeyViolation
+
+from mindbridge.application import EpisodeCandidatePage, EpisodeCandidateRequest, EpisodeWrite
 from mindbridge.core import (
+    DomainInvariantError,
     Event,
     EventHierarchyLevel,
     EventId,
     EventStatus,
     EvidenceId,
+    MemoryIntegrityError,
     ModelReference,
     ObservationId,
     TenantId,
 )
+from mindbridge.infrastructure._postgres_derived_records import (
+    derived_memory_content_digest,
+    write_event,
+)
+from mindbridge.infrastructure._postgres_embeddings import write_embedding_on_connection
+from mindbridge.infrastructure._postgres_graph import write_relations
+from mindbridge.infrastructure._postgres_memories import write_memory_on_connection
 from mindbridge.infrastructure._postgres_types import (
     DatabaseConnection,
     DatabasePool,
@@ -39,6 +50,60 @@ EventRow: TypeAlias = tuple[
     str,
     str,
 ]
+ChildEventState: TypeAlias = tuple[str | None, str, str]
+
+
+async def commit_episode_consolidation(
+    pool: DatabasePool,
+    tenant_id: TenantId,
+    writes: tuple[EpisodeWrite, ...],
+) -> int:
+    """Claim child Events and persist complete Episode aggregates atomically."""
+    child_event_ids = [event_id for write in writes for event_id in write.child_event_ids]
+    if any(write.episode.tenant_id != tenant_id for write in writes):
+        raise DomainInvariantError("episode writes must remain in the requested tenant")
+    if len(set(child_event_ids)) != len(child_event_ids):
+        raise DomainInvariantError("episode writes cannot share child events")
+    if not writes:
+        return 0
+
+    try:
+        async with tenant_connection(pool, tenant_id) as connection:
+            child_states = await _lock_child_events(connection, tenant_id, child_event_ids)
+            committed_count = 0
+            for write in writes:
+                states = tuple(child_states.get(event_id) for event_id in write.child_event_ids)
+                if any(state is None for state in states):
+                    continue
+                known_states = cast(tuple[ChildEventState, ...], states)
+                if all(state[0] == write.episode.event_id for state in known_states):
+                    await _write_episode_aggregate(connection, write)
+                    continue
+                if any(
+                    parent_id is not None
+                    or hierarchy_level != EventHierarchyLevel.EVENT.value
+                    or status != EventStatus.ACTIVE.value
+                    for parent_id, hierarchy_level, status in known_states
+                ):
+                    continue
+                await _write_episode_aggregate(connection, write)
+                cursor = await connection.execute(
+                    """
+                    UPDATE events SET parent_event_id = %s
+                    WHERE tenant_id = %s
+                      AND event_id = ANY(%s)
+                      AND parent_event_id IS NULL
+                      AND hierarchy_level = 'event'
+                      AND status = 'active'
+                    """,
+                    (write.episode.event_id, tenant_id, list(write.child_event_ids)),
+                )
+                if cursor.rowcount != len(write.child_event_ids):
+                    raise MemoryIntegrityError("locked Episode children changed unexpectedly")
+                committed_count += 1
+            return committed_count
+    except ForeignKeyViolation as error:
+        raise DomainInvariantError("episode references missing source data") from error
 
 
 async def list_episode_candidates(
@@ -79,6 +144,44 @@ async def list_episode_candidates(
         scanned_count=len(page_seed_ids),
         next_cursor=(page_seed_ids[-1] if len(seed_ids) > request.limit else None),
     )
+
+
+async def _lock_child_events(
+    connection: DatabaseConnection,
+    tenant_id: TenantId,
+    child_event_ids: list[EventId],
+) -> dict[EventId, ChildEventState]:
+    cursor = await connection.execute(
+        """
+        SELECT event_id, parent_event_id, hierarchy_level, status
+        FROM events
+        WHERE tenant_id = %s AND event_id = ANY(%s)
+        ORDER BY event_id
+        FOR UPDATE
+        """,
+        (tenant_id, list(child_event_ids)),
+    )
+    return {
+        EventId(event_id): (parent_event_id, hierarchy_level, status)
+        async for row in cursor
+        for event_id, parent_event_id, hierarchy_level, status in (
+            cast(tuple[str, str | None, str, str], row),
+        )
+    }
+
+
+async def _write_episode_aggregate(
+    connection: DatabaseConnection,
+    write: EpisodeWrite,
+) -> None:
+    await write_event(connection, write.episode)
+    await write_memory_on_connection(
+        connection,
+        write.memory,
+        derived_memory_content_digest(write.memory),
+    )
+    await write_relations(connection, write.relations)
+    await write_embedding_on_connection(connection, write.embedding)
 
 
 async def _read_events(

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 from typing import TypeAlias, cast
 
@@ -9,9 +10,12 @@ import pytest
 from psycopg import AsyncConnection
 
 from mindbridge.application import (
+    ConsolidateEpisodes,
     EmbeddingInput,
     EmbeddingSearch,
     EpisodeCandidateRequest,
+    EpisodeConsolidation,
+    EpisodeProposal,
     EventPerception,
     ObservationBatch,
     ObservationProcessingOutput,
@@ -31,6 +35,7 @@ from mindbridge.core import (
     EmbeddedObjectType,
     EmbeddingSpaceReference,
     EntityType,
+    Event,
     EventHierarchyLevel,
     EventStatus,
     EvidenceId,
@@ -147,9 +152,9 @@ class FixedTextEmbedder:
         revision="6856e76bb72982e58de0620458a4e8b3614da340",
     )
     space_reference = EmbeddingSpaceReference(space_id="jina-v5", revision="space-v1")
-    dimension = 1_024
 
-    def __init__(self) -> None:
+    def __init__(self, dimension: int = 1_024) -> None:
+        self.dimension = dimension
         self.documents: tuple[str, ...] = ()
 
     async def encode_documents(
@@ -159,6 +164,42 @@ class FixedTextEmbedder:
         self.documents = texts
         vector = (1.0,) + (0.0,) * (self.dimension - 1)
         return (vector,) * len(texts)
+
+
+class RecordingEpisodeConsolidator:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def propose_episodes(
+        self,
+        events: tuple[Event, ...],
+        evidence: tuple[ResolvedEvidence, ...],
+    ) -> EpisodeConsolidation:
+        self.calls += 1
+        assert {item.evidence_span.evidence_id for item in evidence} == {
+            evidence_id for event in events for evidence_id in event.evidence_ids
+        }
+        return _episode_consolidation(events)
+
+
+class CoordinatedEpisodeConsolidator:
+    """Hold two stale proposals until both workers are ready to commit."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self._ready = asyncio.Event()
+
+    async def propose_episodes(
+        self,
+        events: tuple[Event, ...],
+        evidence: tuple[ResolvedEvidence, ...],
+    ) -> EpisodeConsolidation:
+        assert len(evidence) == 2
+        self.calls += 1
+        if self.calls == 2:
+            self._ready.set()
+        await asyncio.wait_for(self._ready.wait(), timeout=2)
+        return _episode_consolidation(events)
 
 
 class DeterministicSigner:
@@ -396,6 +437,102 @@ async def test_episode_candidates_expand_a_stable_seed_by_event_vector(
     assert all(event.parent_event_id is None for event in page.events)
 
 
+async def test_episode_consolidation_is_atomic_recallable_and_retry_safe(
+    store: PostgresMemoryStore,
+    database_url: str,
+) -> None:
+    tenant_id, first_observation_id, first_job_id = await _write_source_observation(
+        store,
+        "tenant_episode_commit",
+        include_identity=False,
+    )
+    _, second_observation_id, second_job_id = await _write_source_observation(
+        store,
+        "tenant_episode_commit",
+        ordinal=2,
+        occurred_at=NOW + timedelta(seconds=5),
+        include_identity=False,
+    )
+    for observation_id, job_id in (
+        (first_observation_id, first_job_id),
+        (second_observation_id, second_job_id),
+    ):
+        await ProcessObservation(
+            store,
+            RecordingPerceiver(),
+            FixedEmbedder(),
+            FixedTextEmbedder(),
+            media_url_signer=DeterministicSigner(),
+        ).run(tenant_id, observation_id, job_id)
+
+    request = EpisodeCandidateRequest(
+        tenant_id=tenant_id,
+        evaluated_at=NOW + timedelta(days=2),
+        maximum_gap_seconds=10,
+        minimum_similarity=0.99,
+    )
+    consolidator = RecordingEpisodeConsolidator()
+    with pytest.raises(DomainInvariantError, match="cloud embedding dimension"):
+        await ConsolidateEpisodes(
+            store,
+            consolidator,
+            FixedTextEmbedder(dimension=2),
+            media_url_signer=DeterministicSigner(),
+        ).run(request)
+
+    assert await _episode_counts(database_url, tenant_id) == (0, 0, 0, 0, 0, 0)
+
+    coordinated = CoordinatedEpisodeConsolidator()
+    results = await asyncio.gather(
+        *(
+            ConsolidateEpisodes(
+                store,
+                coordinated,
+                FixedTextEmbedder(),
+                media_url_signer=DeterministicSigner(),
+            ).run(request)
+            for _ in range(2)
+        )
+    )
+    replay_consolidator = RecordingEpisodeConsolidator()
+    replay = await ConsolidateEpisodes(
+        store,
+        replay_consolidator,
+        FixedTextEmbedder(),
+        media_url_signer=DeterministicSigner(),
+    ).run(request)
+
+    assert sorted(result.committed_count for result in results) == [0, 1]
+    assert replay.candidate_count == 0
+    assert replay.committed_count == 0
+    assert coordinated.calls == 2
+    assert replay_consolidator.calls == 0
+    assert await _episode_counts(database_url, tenant_id) == (1, 2, 2, 2, 5, 1)
+
+    graph_matches = await store.search_embeddings(
+        EmbeddingSearch(
+            tenant_id=tenant_id,
+            values=(1.0,) + (0.0,) * 1_023,
+            space_reference=EmbeddingSpaceReference(space_id="jina-v5", revision="space-v1"),
+            document_task="retrieval_document",
+            object_types=(EmbeddedObjectType.EVENT,),
+            limit=20,
+        )
+    )
+    memories = await store.search_memories_by_graph_objects(
+        RecallRequest(
+            tenant_id=tenant_id,
+            query=RecallQuery(text="repair episode"),
+        ),
+        graph_matches,
+        limit=20,
+    )
+    assert any(
+        memory.summary == "A person retrieves a tool and explains the repair."
+        for memory in memories
+    )
+
+
 async def test_superseded_attempt_cannot_commit(
     store: PostgresMemoryStore,
     database_url: str,
@@ -511,6 +648,23 @@ async def _write_source_observation(
     return tenant_id, observation_id, result.processing_job_id
 
 
+def _episode_consolidation(events: tuple[Event, ...]) -> EpisodeConsolidation:
+    return EpisodeConsolidation(
+        episodes=(
+            EpisodeProposal(
+                event_ids=tuple(event.event_id for event in events),
+                description="A person retrieves a tool and explains the repair.",
+                salience=0.9,
+            ),
+        ),
+        model_reference=ModelReference(
+            model_id="qwen3.8-max",
+            revision="episode-serving-revision-01",
+        ),
+        prompt_version="consolidate_episodes_v1",
+    )
+
+
 async def _derived_counts(database_url: str, tenant_id: TenantId) -> DerivedCounts:
     connection = await AsyncConnection.connect(database_url)
     async with connection:
@@ -534,6 +688,50 @@ async def _derived_counts(database_url: str, tenant_id: TenantId) -> DerivedCoun
             )
         ).fetchone()
     return cast(DerivedCounts, row)
+
+
+async def _episode_counts(
+    database_url: str,
+    tenant_id: TenantId,
+) -> tuple[int, int, int, int, int, int]:
+    connection = await AsyncConnection.connect(database_url)
+    async with connection:
+        row = await (
+            await connection.execute(
+                """
+                WITH episode AS (
+                    SELECT event_id FROM events
+                    WHERE tenant_id = %s AND hierarchy_level = 'episode'
+                )
+                SELECT
+                    (SELECT count(*) FROM episode),
+                    (SELECT count(*) FROM events AS child
+                     WHERE child.tenant_id = %s
+                       AND child.parent_event_id IN (SELECT event_id FROM episode)),
+                    (SELECT count(*) FROM event_observations AS link
+                     WHERE link.tenant_id = %s
+                       AND link.event_id IN (SELECT event_id FROM episode)),
+                    (SELECT count(*) FROM event_evidence AS link
+                     WHERE link.tenant_id = %s
+                       AND link.event_id IN (SELECT event_id FROM episode)),
+                    (SELECT count(*) FROM relations AS relation
+                     WHERE relation.tenant_id = %s
+                       AND (
+                           (relation.source_type = 'event'
+                            AND relation.source_id IN (SELECT event_id FROM episode))
+                           OR
+                           (relation.target_type = 'event'
+                            AND relation.target_id IN (SELECT event_id FROM episode))
+                       )),
+                    (SELECT count(*) FROM embeddings AS embedding
+                     WHERE embedding.tenant_id = %s
+                       AND embedding.object_type = 'event'
+                       AND embedding.object_id IN (SELECT event_id FROM episode))
+                """,
+                (tenant_id,) * 6,
+            )
+        ).fetchone()
+    return cast(tuple[int, int, int, int, int, int], row)
 
 
 async def _age_running_job(

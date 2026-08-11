@@ -11,6 +11,7 @@ from mindbridge.application import (
     EmbeddingSearch,
     EpisodeCandidatePage,
     EpisodeCandidateRequest,
+    EpisodeWrite,
     FeedbackWriteResult,
     ForgetPlan,
     MemoryLifecycleChange,
@@ -37,7 +38,10 @@ from mindbridge.core import (
     TenantId,
     TombstoneId,
 )
-from mindbridge.infrastructure._postgres_consolidation import list_episode_candidates
+from mindbridge.infrastructure._postgres_consolidation import (
+    commit_episode_consolidation,
+    list_episode_candidates,
+)
 from mindbridge.infrastructure._postgres_embeddings import (
     search_embeddings,
     write_embedding,
@@ -165,6 +169,14 @@ class PostgresMemoryStore:
     ) -> EpisodeCandidatePage:
         """Discover a stable bounded page for Omni episode verification."""
         return await list_episode_candidates(self._pool, request)
+
+    async def commit_episode_consolidation(
+        self,
+        tenant_id: TenantId,
+        writes: tuple[EpisodeWrite, ...],
+    ) -> int:
+        """Atomically claim child Events and persist verified Episodes."""
+        return await commit_episode_consolidation(self._pool, tenant_id, writes)
 
     async def update_memory_lifecycles(
         self,

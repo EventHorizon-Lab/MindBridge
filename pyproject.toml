@@ -32,6 +32,7 @@ dependencies = [
 ]
 
 [project.scripts]
+mindbridge-consolidate = "mindbridge.consolidation_cli:main"
 mindbridge-lifecycle = "mindbridge.lifecycle_cli:main"
 mindbridge-mcp = "mindbridge.api.runtime:run_production_mcp"
 

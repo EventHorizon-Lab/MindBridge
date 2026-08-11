@@ -14,6 +14,7 @@ from mindbridge.core.identifiers import (
     MentionId,
     RelationId,
     TenantId,
+    derive_stable_id,
 )
 
 
@@ -121,3 +122,35 @@ class Relation:
         require_aware_datetime(self.created_at, "created_at")
         if self.source_type is self.target_type and self.source_id == self.target_id:
             raise DomainInvariantError("relation cannot point a record to itself")
+
+
+def derive_relation(
+    tenant_id: TenantId,
+    source_type: RelationNodeType,
+    source_id: str,
+    relation_type: RelationType,
+    target_type: RelationNodeType,
+    target_id: str,
+    created_at: datetime,
+) -> Relation:
+    """Build one retry-stable typed relation from its complete edge identity."""
+    return Relation(
+        relation_id=RelationId(
+            derive_stable_id(
+                "relation",
+                tenant_id,
+                source_type.value,
+                source_id,
+                relation_type.value,
+                target_type.value,
+                target_id,
+            )
+        ),
+        tenant_id=tenant_id,
+        source_type=source_type,
+        source_id=source_id,
+        relation_type=relation_type,
+        target_type=target_type,
+        target_id=target_id,
+        created_at=created_at,
+    )

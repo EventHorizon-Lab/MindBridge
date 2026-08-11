@@ -35,6 +35,7 @@ from mindbridge.core.graph import (
     Relation,
     RelationNodeType,
     RelationType,
+    derive_relation,
 )
 from mindbridge.core.identifiers import (
     ClaimId,
@@ -148,6 +149,7 @@ __all__ = [
     "apply_memory_feedback",
     "calculate_memory_strength",
     "derive_observation_id",
+    "derive_relation",
     "derive_stable_id",
     "evolve_memory_strength",
 ]

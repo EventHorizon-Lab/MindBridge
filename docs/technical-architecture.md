@@ -529,6 +529,22 @@ MindBridge 的学习对象是记忆状态：
 
 不允许仅因向量相似就自动合并身份或互相矛盾的事件。
 
+当前 Episode 路径已经实现为 `mindbridge-consolidate` 租户级计划任务。PostgreSQL 只枚举
+`active`、尚无父节点的基础 Event，并用可校准的时间邻近、实体重叠或同一 Jina 兼容空间中的
+Event 向量相似度扩展最多 64 个候选。Omni/VLM 必须直接读取候选引用的全部原始 AV
+EvidenceSpan，并通过严格 schema 返回互不重叠的 Event 分组；摘要相似本身不能触发合并。
+
+应用层随后确定性派生 Episode、联合 Observation/Evidence 来源、verified Episodic
+MemoryRecord、`contains`/`same_episode`/`represented_by` 关系以及 Text Small Event 向量。一次
+PostgreSQL 事务按稳定顺序锁定全部子 Event，只有仍为 active、基础层且未被占用的完整分组才能
+提交；Episode、来源链接、MemoryRecord、关系、向量和子节点父指针要么全部成功，要么全部回滚。
+并发 Consolidator、重试和显式遗忘发生竞争时，已经提交或删除的一方优先，过期提案不会覆盖新
+状态。稳定 ID 包含子 Event、模型 revision、Prompt version 和固定 `evaluated_at`，同一次扫描可
+安全重放。计划频率交给既有 CronJob、systemd 或 Celery beat，不在框架内再造调度器。
+
+重复 Claim 的支持/冲突/替代验证和日/人物/地点/主题 Summary 仍按 Benchmark 失败案例逐项加入；
+它们复用同一候选—原始证据核验—原子版本写入模式，不提前建设通用工作流引擎。
+
 ### 8.3 记忆强度
 
 首版使用透明、可配置的统计分数，不训练遗忘模型：
@@ -1105,7 +1121,8 @@ observe receipt
 
 运行时只读取标准 `OTEL_*` 环境变量；设置 common 或 signal-specific
 `OTEL_EXPORTER_OTLP_*_ENDPOINT` 才启用，否则保持 no-op。API、MCP、Worker、Edge Sync 和
-Lifecycle 使用不同的默认 `service.name`。FastAPI server context 通过 HTTPX 传播到模型/API，
+Lifecycle 与 Episode Consolidator 使用不同的默认 `service.name`。FastAPI server context 通过
+HTTPX 传播到模型/API，
 并通过 Celery header 传播到 prefork Worker；Worker 的 SDK 与 BatchSpanProcessor 必须在
 `worker_process_init` 后初始化，不能在父进程启动后台线程。
 

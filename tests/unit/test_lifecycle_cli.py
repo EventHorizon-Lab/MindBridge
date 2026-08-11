@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from mindbridge.application import MemoryLifecycleChange
+from mindbridge.configuration import parse_aware_datetime
 from mindbridge.core import (
     MemoryId,
     MemoryRecord,
@@ -15,7 +16,7 @@ from mindbridge.core import (
     TenantId,
     VerificationStatus,
 )
-from mindbridge.lifecycle_cli import _aware_datetime, sweep_tenant_lifecycle
+from mindbridge.lifecycle_cli import sweep_tenant_lifecycle
 
 NOW = datetime(2026, 8, 12, 12, 0, tzinfo=timezone.utc)
 
@@ -63,9 +64,9 @@ async def test_sweep_tenant_lifecycle_accumulates_bounded_pages() -> None:
 
 
 def test_lifecycle_datetime_requires_an_explicit_timezone() -> None:
-    assert _aware_datetime("2026-08-12T12:00:00Z") == NOW
+    assert parse_aware_datetime("2026-08-12T12:00:00Z") == NOW
     with pytest.raises(argparse.ArgumentTypeError, match="timezone"):
-        _aware_datetime("2026-08-12T12:00:00")
+        parse_aware_datetime("2026-08-12T12:00:00")
 
 
 def _memory(memory_id: str, created_at: datetime) -> MemoryRecord:

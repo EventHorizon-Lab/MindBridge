@@ -3,14 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+from typing import Protocol
 
 from mindbridge.application.perception import ResolvedEvidence
 from mindbridge.application.ports import (
     MediaUrlSigner,
-    MemoryStore,
     PresignedMediaDownload,
 )
 from mindbridge.core import (
+    EvidenceId,
     EvidenceSpan,
     MediaObject,
     MediaObjectId,
@@ -20,8 +21,24 @@ from mindbridge.core import (
 )
 
 
+class EvidenceReader(Protocol):
+    """Narrow persistence boundary needed to resolve exact evidence media."""
+
+    async def read_evidence(
+        self,
+        tenant_id: TenantId,
+        evidence_ids: tuple[EvidenceId, ...],
+    ) -> tuple[EvidenceSpan, ...]: ...
+
+    async def read_media_objects(
+        self,
+        tenant_id: TenantId,
+        media_object_ids: tuple[MediaObjectId, ...],
+    ) -> tuple[MediaObject, ...]: ...
+
+
 async def read_resolved_memory_evidence(
-    store: MemoryStore,
+    store: EvidenceReader,
     signer: MediaUrlSigner,
     tenant_id: TenantId,
     memories: tuple[MemoryRecord, ...],
@@ -30,14 +47,29 @@ async def read_resolved_memory_evidence(
     evidence_ids = tuple(
         dict.fromkeys(evidence_id for memory in memories for evidence_id in memory.evidence_ids)
     )
+    return await read_resolved_evidence(store, signer, tenant_id, evidence_ids)
+
+
+async def read_resolved_evidence(
+    store: EvidenceReader,
+    signer: MediaUrlSigner,
+    tenant_id: TenantId,
+    evidence_ids: tuple[EvidenceId, ...],
+) -> tuple[ResolvedEvidence, ...]:
+    """Read, validate, and sign a unique ordered set of exact evidence IDs."""
+    evidence_ids = tuple(dict.fromkeys(evidence_ids))
     if not evidence_ids:
         return ()
     evidence_spans = await store.read_evidence(tenant_id, evidence_ids)
-    if len(evidence_spans) != len(evidence_ids):
-        raise MemoryIntegrityError("memory references missing evidence")
+    if tuple(evidence.evidence_id for evidence in evidence_spans) != evidence_ids or any(
+        evidence.tenant_id != tenant_id for evidence in evidence_spans
+    ):
+        raise MemoryIntegrityError("derived record references missing or cross-tenant evidence")
     media_object_ids = tuple(dict.fromkeys(evidence.media_object_id for evidence in evidence_spans))
     media_objects = await store.read_media_objects(tenant_id, media_object_ids)
-    if len(media_objects) != len(media_object_ids):
+    if tuple(media.media_object_id for media in media_objects) != media_object_ids or any(
+        media.tenant_id != tenant_id for media in media_objects
+    ):
         raise MemoryIntegrityError("evidence references missing media")
     return await resolve_evidence_media(evidence_spans, media_objects, signer)
 

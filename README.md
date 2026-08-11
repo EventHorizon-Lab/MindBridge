@@ -312,9 +312,10 @@ uv run uvicorn mindbridge.api:create_production_app --factory
 ```
 
 OpenTelemetry is activated only when a standard common or signal-specific OTLP endpoint is set;
-without one it remains a no-op. The API, MCP process, Worker, edge sync, and lifecycle command use
-distinct default `service.name` values. Override them per process with `OTEL_SERVICE_NAME` when the
-deployment needs a namespace. The official FastAPI, HTTPX, Psycopg, Celery, and Botocore
+without one it remains a no-op. The API, MCP process, Worker, edge sync, consolidation, and lifecycle
+commands use distinct default `service.name` values. Override them per process with
+`OTEL_SERVICE_NAME` when the deployment needs a namespace. The official FastAPI, HTTPX, Psycopg,
+Celery, and Botocore
 instrumentations propagate W3C context through REST, model calls, PostgreSQL, S3, and queued jobs.
 MindBridge does not capture authorization headers, request bodies, prompts, memory text, or media in
 telemetry. Response `trace_id` values use `trace_<32-hex W3C trace ID>` so the suffix maps directly
@@ -401,6 +402,21 @@ uv run --extra cloud-models celery -A mindbridge.celery_app:app worker --logleve
 
 One prefork child is the safe default because each child owns a full embedding model. Scale with one
 Worker process per assigned GPU instead of increasing concurrency inside a process.
+
+Run evidence-verified Episode consolidation as a tenant-scoped scheduled job. It reuses the database,
+object-storage, VLM, Text Small, and shared embedding-space variables above; no task broker or local
+Jina Omni model is required:
+
+```bash
+uv run mindbridge-consolidate --tenant-id tenant_01
+```
+
+Each sweep fixes one `evaluated_at`, scans bounded candidate pages, lets the Omni/VLM inspect exact
+source AV, and atomically claims child Events before writing the Episode, its MemoryRecord, graph
+relations, and Text Small vector. `--page-size`, `--maximum-gap-seconds`, and
+`--minimum-similarity` are calibration knobs. Schedule the command with the deployment's existing
+CronJob/systemd/Celery beat control plane; concurrent runs are safe and only one can claim a child
+Event.
 
 Run automatic decay as a tenant-scoped scheduled job. A complete run uses stable bounded pages and
 one fixed evaluation instant; concurrent feedback or deletion wins through optimistic guards:
