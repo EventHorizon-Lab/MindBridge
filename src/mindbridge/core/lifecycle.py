@@ -8,6 +8,7 @@ from datetime import datetime
 
 from mindbridge.core._validation import require_aware_datetime
 from mindbridge.core.errors import DomainInvariantError
+from mindbridge.core.feedback import FeedbackType
 from mindbridge.core.memory import MemoryRecord, MemoryState
 
 
@@ -86,3 +87,27 @@ def evolve_memory_strength(
     else:
         state = MemoryState.ACTIVE
     return replace(memory, strength=strength, state=state)
+
+
+def apply_memory_feedback(
+    memory: MemoryRecord,
+    feedback_type: FeedbackType,
+    recorded_at: datetime,
+    policy: MemoryStrengthPolicy = DEFAULT_MEMORY_STRENGTH_POLICY,
+) -> MemoryRecord:
+    """Increment the explicit feedback signal and recalculate lifecycle state."""
+    if feedback_type is FeedbackType.MISSING:
+        raise DomainInvariantError("missing feedback has no target memory to evolve")
+    if memory.superseded_at is not None:
+        raise DomainInvariantError("cannot evolve a superseded memory")
+    if feedback_type is FeedbackType.USEFUL:
+        memory = replace(
+            memory,
+            positive_feedback_count=memory.positive_feedback_count + 1,
+        )
+    else:
+        memory = replace(
+            memory,
+            negative_feedback_count=memory.negative_feedback_count + 1,
+        )
+    return evolve_memory_strength(memory, recorded_at, policy)

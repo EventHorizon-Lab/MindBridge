@@ -12,6 +12,8 @@ from starlette.types import Lifespan
 from mindbridge.application import MemoryKernel
 from mindbridge.contracts import (
     ErrorResponse,
+    FeedbackReceipt,
+    FeedbackRequest,
     HealthResponse,
     Identifier,
     MemoryView,
@@ -67,6 +69,15 @@ def create_app(
     )
     async def remember(request: RememberRequest) -> MemoryView:
         return await kernel.remember(request)
+
+    @app.post(
+        "/v1/feedback",
+        response_model=FeedbackReceipt,
+        status_code=status.HTTP_201_CREATED,
+        operation_id="recordFeedback",
+    )
+    async def record_feedback(request: FeedbackRequest) -> FeedbackReceipt:
+        return await kernel.record_feedback(request)
 
     @app.post(
         "/v1/recall",

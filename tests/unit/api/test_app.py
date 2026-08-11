@@ -9,6 +9,8 @@ from fastapi.testclient import TestClient
 from mindbridge.api import create_app
 from mindbridge.application import MemoryKernel
 from mindbridge.contracts import (
+    FeedbackReceipt,
+    FeedbackRequest,
     MemoryView,
     ObservationProcessingJobView,
     ObservationReceipt,
@@ -20,6 +22,7 @@ from mindbridge.contracts import (
 )
 from mindbridge.core import (
     DomainInvariantError,
+    FeedbackType,
     JobNotFoundError,
     JobState,
     MemoryIntegrityError,
@@ -61,6 +64,18 @@ class StubKernel:
             created_at=NOW,
             verification_status=VerificationStatus.UNVERIFIED,
             state=MemoryState.ACTIVE,
+        )
+
+    async def record_feedback(self, request: FeedbackRequest) -> FeedbackReceipt:
+        return FeedbackReceipt(
+            feedback_id="feedback_01",
+            feedback_type=request.feedback_type,
+            memory_id=request.memory_id,
+            corrected_memory_id=None,
+            resulting_state=(MemoryState.STRENGTHENED if request.memory_id is not None else None),
+            resulting_strength=1.5 if request.memory_id is not None else None,
+            created_at=NOW,
+            trace_id="trace_feedback",
         )
 
     async def recall(self, request: RecallRequest) -> RecallResult:
@@ -117,6 +132,21 @@ def test_recall_route_uses_shared_contract() -> None:
 
     assert response.status_code == 200
     assert response.json()["trace_id"] == "trace_recall"
+
+
+def test_feedback_route_uses_shared_contract() -> None:
+    response = _client().post(
+        "/v1/feedback",
+        json={
+            "tenant_id": "tenant_01",
+            "feedback_type": FeedbackType.USEFUL,
+            "memory_id": "memory_01",
+        },
+    )
+
+    assert response.status_code == 201
+    assert response.json()["resulting_state"] == "strengthened"
+    assert response.json()["trace_id"] == "trace_feedback"
 
 
 def test_job_route_is_tenant_scoped_and_returns_not_found() -> None:
@@ -179,6 +209,7 @@ def test_openapi_exposes_stable_operation_ids() -> None:
     assert paths["/v1/observations"]["post"]["operationId"] == "observe"
     assert paths["/v1/memories"]["post"]["operationId"] == "remember"
     assert paths["/v1/memories/{memory_id}"]["get"]["operationId"] == "getMemory"
+    assert paths["/v1/feedback"]["post"]["operationId"] == "recordFeedback"
     assert paths["/v1/recall"]["post"]["operationId"] == "recall"
     assert paths["/v1/jobs/{job_id}"]["get"]["operationId"] == "getObservationJob"
 

@@ -7,7 +7,8 @@ import httpx
 import pytest
 
 from mindbridge import AsyncMindBridge, MindBridgeClientError
-from mindbridge.contracts import RecallQuery, RecallRequest
+from mindbridge.contracts import FeedbackRequest, RecallQuery, RecallRequest
+from mindbridge.core import FeedbackType
 
 
 async def test_recall_uses_shared_request_and_response_contracts() -> None:
@@ -137,6 +138,41 @@ async def test_get_memory_uses_tenant_scoped_route() -> None:
         await client.close()
 
     assert memory.memory_id == "memory_01"
+
+
+async def test_feedback_uses_shared_contracts() -> None:
+    async def respond(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        assert request.url.path == "/v1/feedback"
+        assert json.loads(request.content)["feedback_type"] == "useful"
+        return httpx.Response(
+            201,
+            json={
+                "feedback_id": "feedback_01",
+                "feedback_type": "useful",
+                "memory_id": "memory_01",
+                "corrected_memory_id": None,
+                "resulting_state": "strengthened",
+                "resulting_strength": 1.5,
+                "created_at": "2026-08-11T12:00:00Z",
+                "trace_id": "trace_feedback",
+            },
+        )
+
+    client = _client(respond)
+    try:
+        receipt = await client.record_feedback(
+            FeedbackRequest(
+                tenant_id="tenant_01",
+                feedback_type=FeedbackType.USEFUL,
+                memory_id="memory_01",
+            )
+        )
+    finally:
+        await client.close()
+
+    assert receipt.resulting_state is not None
+    assert receipt.resulting_strength == 1.5
 
 
 def _client(

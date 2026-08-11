@@ -12,6 +12,8 @@ from pydantic import ValidationError
 from mindbridge.contracts import (
     ContractModel,
     ErrorResponse,
+    FeedbackReceipt,
+    FeedbackRequest,
     MemoryView,
     ObservationProcessingJobView,
     ObservationReceipt,
@@ -78,6 +80,10 @@ class AsyncMindBridge:
     async def remember(self, request: RememberRequest) -> MemoryView:
         """Retain one explicit memory through the production API."""
         return await self._post("v1/memories", request, MemoryView)
+
+    async def record_feedback(self, request: FeedbackRequest) -> FeedbackReceipt:
+        """Record one useful, wrong, missing, or correction signal."""
+        return await self._post("v1/feedback", request, FeedbackReceipt)
 
     async def recall(self, request: RecallRequest) -> RecallResult:
         """Recall memories and grounded evidence through the production API."""

@@ -17,6 +17,7 @@ from mindbridge.application import (
     ResolvedEvidence,
 )
 from mindbridge.contracts import (
+    FeedbackRequest,
     MediaObjectInput,
     ObservationStatus,
     ObserveRequest,
@@ -26,6 +27,7 @@ from mindbridge.contracts import (
     RememberRequest,
 )
 from mindbridge.core import (
+    FeedbackType,
     IdempotencyConflictError,
     JobId,
     JobNotFoundError,
@@ -36,6 +38,7 @@ from mindbridge.core import (
     MemoryIntegrityError,
     MemoryNotFoundError,
     MemoryRecord,
+    MemoryState,
     MemoryType,
     ModelReference,
     ObservationId,
@@ -250,6 +253,82 @@ async def test_postgres_rejects_idempotency_key_reuse(store: PostgresMemoryStore
                 tenant_id="tenant_conflict",
                 sequence=2,
                 idempotency_key="request_01",
+            )
+        )
+
+
+async def test_postgres_feedback_evolves_and_versions_memory_atomically(
+    store: PostgresMemoryStore,
+    database_url: str,
+) -> None:
+    kernel = _kernel(store)
+    original = await kernel.remember(
+        RememberRequest(
+            tenant_id="tenant_feedback",
+            summary="The screwdriver is on the blue toolbox.",
+            memory_type=MemoryType.EPISODIC,
+            occurred_at=NOW,
+            idempotency_key="remember_original",
+        )
+    )
+    useful_request = FeedbackRequest(
+        tenant_id="tenant_feedback",
+        feedback_type=FeedbackType.USEFUL,
+        memory_id=original.memory_id,
+        idempotency_key="feedback_useful",
+    )
+    useful = await kernel.record_feedback(useful_request)
+    useful_retry = await kernel.record_feedback(useful_request)
+    correction_request = FeedbackRequest(
+        tenant_id="tenant_feedback",
+        feedback_type=FeedbackType.CORRECTION,
+        memory_id=original.memory_id,
+        correction_summary="The screwdriver is inside the green drawer.",
+        idempotency_key="feedback_correction",
+    )
+    correction = await kernel.record_feedback(correction_request)
+    correction_retry = await kernel.record_feedback(correction_request)
+
+    old = await kernel.get_memory("tenant_feedback", original.memory_id)
+    corrected = await kernel.get_memory(
+        "tenant_feedback", cast(str, correction.corrected_memory_id)
+    )
+    recalled = await kernel.recall(
+        RecallRequest(
+            tenant_id="tenant_feedback",
+            query=RecallQuery(text="green drawer"),
+        )
+    )
+
+    assert useful.feedback_id == useful_retry.feedback_id
+    assert useful.resulting_state is MemoryState.STRENGTHENED
+    assert correction.corrected_memory_id == correction_retry.corrected_memory_id
+    assert old.superseded_at == NOW
+    assert old.positive_feedback_count == 1
+    assert old.negative_feedback_count == 1
+    assert corrected.supersedes_memory_id == original.memory_id
+    assert corrected.verification_status is VerificationStatus.ATTESTED
+    assert [memory.memory_id for memory in recalled.memories] == [corrected.memory_id]
+
+    connection = await AsyncConnection.connect(database_url)
+    async with connection:
+        row = await (
+            await connection.execute(
+                """
+                SELECT count(*) FROM memory_feedback
+                WHERE tenant_id = 'tenant_feedback'
+                """
+            )
+        ).fetchone()
+    assert cast(tuple[int], row)[0] == 2
+
+    with pytest.raises(IdempotencyConflictError):
+        await kernel.record_feedback(
+            FeedbackRequest(
+                tenant_id="tenant_feedback",
+                feedback_type=FeedbackType.WRONG,
+                memory_id=corrected.memory_id,
+                idempotency_key="feedback_useful",
             )
         )
 

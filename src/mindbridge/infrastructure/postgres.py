@@ -7,6 +7,7 @@ from pgvector.psycopg import register_vector_async
 from mindbridge.application import (
     EmbeddingMatch,
     EmbeddingSearch,
+    FeedbackWriteResult,
     MemoryWriteResult,
     ObservationBatch,
     ObservationProcessingOutput,
@@ -20,6 +21,7 @@ from mindbridge.core import (
     JobId,
     MediaObject,
     MediaObjectId,
+    MemoryFeedback,
     MemoryId,
     MemoryRecord,
     ObservationId,
@@ -32,6 +34,7 @@ from mindbridge.infrastructure._postgres_embeddings import (
     write_embedding,
 )
 from mindbridge.infrastructure._postgres_evidence import read_evidence
+from mindbridge.infrastructure._postgres_feedback import record_feedback
 from mindbridge.infrastructure._postgres_jobs import (
     claim_observation_processing_job,
     mark_observation_processing_failed,
@@ -125,6 +128,23 @@ class PostgresMemoryStore:
     ) -> MemoryRecord:
         """Read one tenant-owned memory or raise the stable not-found error."""
         return await read_memory(self._pool, tenant_id, memory_id)
+
+    async def record_feedback(
+        self,
+        feedback: MemoryFeedback,
+        corrected_memory: MemoryRecord | None,
+        *,
+        idempotency_key: str,
+        content_digest: str,
+    ) -> FeedbackWriteResult:
+        """Atomically retain feedback and evolve its target memory."""
+        return await record_feedback(
+            self._pool,
+            feedback,
+            corrected_memory,
+            idempotency_key=idempotency_key,
+            content_digest=content_digest,
+        )
 
     async def search_memories(self, request: RecallRequest) -> tuple[MemoryRecord, ...]:
         """Apply exact filters and PostgreSQL full-text candidate retrieval."""

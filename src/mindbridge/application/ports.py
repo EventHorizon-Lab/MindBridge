@@ -15,11 +15,15 @@ from mindbridge.core import (
     Event,
     EvidenceId,
     EvidenceSpan,
+    FeedbackId,
+    FeedbackType,
     JobId,
     MediaObject,
     MediaObjectId,
+    MemoryFeedback,
     MemoryId,
     MemoryRecord,
+    MemoryState,
     ModelReference,
     Observation,
     ObservationId,
@@ -46,6 +50,24 @@ class MemoryWriteResult:
 
     memory: MemoryRecord
     created: bool
+
+
+@dataclass(frozen=True, slots=True)
+class FeedbackWriteResult:
+    """Stored feedback and the lifecycle snapshot produced by that event."""
+
+    feedback_id: FeedbackId
+    feedback_type: FeedbackType
+    memory_id: MemoryId | None
+    created_at: datetime
+    resulting_state: MemoryState | None
+    resulting_strength: float | None
+    corrected_memory: MemoryRecord | None
+    created: bool
+
+    def __post_init__(self) -> None:
+        if (self.resulting_state is None) != (self.resulting_strength is None):
+            raise DomainInvariantError("feedback lifecycle state and strength must be paired")
 
 
 @dataclass(frozen=True, slots=True)
@@ -236,6 +258,15 @@ class MemoryStore(Protocol):
         tenant_id: TenantId,
         memory_id: MemoryId,
     ) -> MemoryRecord: ...
+
+    async def record_feedback(
+        self,
+        feedback: MemoryFeedback,
+        corrected_memory: MemoryRecord | None,
+        *,
+        idempotency_key: str,
+        content_digest: str,
+    ) -> FeedbackWriteResult: ...
 
     async def search_memories(self, request: RecallRequest) -> tuple[MemoryRecord, ...]: ...
 

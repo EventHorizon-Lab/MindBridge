@@ -28,7 +28,10 @@ from mindbridge.application.recall import (
     ResolvedQueryMedia,
 )
 from mindbridge.contracts import (
+    ContractModel,
     EvidenceView,
+    FeedbackReceipt,
+    FeedbackRequest,
     MediaObjectInput,
     MemoryView,
     ObservationProcessingJobView,
@@ -48,9 +51,11 @@ from mindbridge.core import (
     EmbeddingRecord,
     EvidenceId,
     EvidenceSpan,
+    FeedbackId,
     JobId,
     MediaObject,
     MediaObjectId,
+    MemoryFeedback,
     MemoryId,
     MemoryIntegrityError,
     MemoryRecord,
@@ -137,31 +142,49 @@ class MemoryKernel:
             content_digest=_request_digest(request),
         )
         stored_memory = result.memory
-        values = await self._recall_embedder.encode_memory_document(stored_memory.summary)
-        await self._embedding_index.write_embedding(
-            EmbeddingRecord(
-                embedding_id=EmbeddingId(
-                    derive_stable_id(
-                        "embedding",
-                        stored_memory.tenant_id,
-                        stored_memory.memory_id,
-                        self._recall_embedder.model_reference.model_id,
-                        self._recall_embedder.model_reference.revision,
-                        RETRIEVAL_DOCUMENT_EMBEDDING_TASK,
-                    )
-                ),
-                tenant_id=stored_memory.tenant_id,
-                object_type=EmbeddedObjectType.MEMORY_RECORD,
-                object_id=stored_memory.memory_id,
-                values=values,
-                model_reference=self._recall_embedder.model_reference,
-                task=RETRIEVAL_DOCUMENT_EMBEDDING_TASK,
-                dimension=self._recall_embedder.dimension,
-                normalized=True,
-                created_at=stored_memory.created_at,
-            )
-        )
+        await self._index_memory(stored_memory)
         return _memory_view(stored_memory)
+
+    async def record_feedback(self, request: FeedbackRequest) -> FeedbackReceipt:
+        """Record an explainable learning signal and create a correction version when needed."""
+        content_digest = _request_digest(request)
+        idempotency_key = request.idempotency_key or f"feedback_{content_digest}"
+        feedback = MemoryFeedback(
+            feedback_id=FeedbackId(
+                derive_stable_id("feedback", request.tenant_id, idempotency_key)
+            ),
+            tenant_id=TenantId(request.tenant_id),
+            feedback_type=request.feedback_type,
+            memory_id=MemoryId(request.memory_id) if request.memory_id is not None else None,
+            recall_trace_id=request.recall_trace_id,
+            correction_summary=request.correction_summary,
+            created_at=self._clock(),
+        )
+        corrected_memory = (
+            await self._build_corrected_memory(feedback)
+            if feedback.correction_summary is not None
+            else None
+        )
+        result = await self._store.record_feedback(
+            feedback,
+            corrected_memory,
+            idempotency_key=idempotency_key,
+            content_digest=content_digest,
+        )
+        if result.corrected_memory is not None:
+            await self._index_memory(result.corrected_memory)
+        return FeedbackReceipt(
+            feedback_id=result.feedback_id,
+            feedback_type=result.feedback_type,
+            memory_id=result.memory_id,
+            corrected_memory_id=(
+                result.corrected_memory.memory_id if result.corrected_memory is not None else None
+            ),
+            resulting_state=result.resulting_state,
+            resulting_strength=result.resulting_strength,
+            created_at=result.created_at,
+            trace_id=_new_id("trace"),
+        )
 
     async def get_observation_job(
         self,
@@ -270,6 +293,51 @@ class MemoryKernel:
         return fuse_memory_rankings(
             (evidence_memories, direct_memories),
             limit=limit,
+        )
+
+    async def _build_corrected_memory(self, feedback: MemoryFeedback) -> MemoryRecord:
+        assert feedback.memory_id is not None
+        assert feedback.correction_summary is not None
+        original = await self._store.read_memory(feedback.tenant_id, feedback.memory_id)
+        return MemoryRecord(
+            memory_id=MemoryId(derive_stable_id("memory_correction", feedback.feedback_id)),
+            tenant_id=feedback.tenant_id,
+            memory_type=original.memory_type,
+            summary=feedback.correction_summary,
+            evidence_ids=original.evidence_ids,
+            occurred_at=original.occurred_at,
+            ended_at=original.ended_at,
+            created_at=feedback.created_at,
+            verification_status=VerificationStatus.ATTESTED,
+            salience=original.salience,
+            strength=original.salience,
+            supersedes_memory_id=original.memory_id,
+        )
+
+    async def _index_memory(self, memory: MemoryRecord) -> None:
+        values = await self._recall_embedder.encode_memory_document(memory.summary)
+        await self._embedding_index.write_embedding(
+            EmbeddingRecord(
+                embedding_id=EmbeddingId(
+                    derive_stable_id(
+                        "embedding",
+                        memory.tenant_id,
+                        memory.memory_id,
+                        self._recall_embedder.model_reference.model_id,
+                        self._recall_embedder.model_reference.revision,
+                        RETRIEVAL_DOCUMENT_EMBEDDING_TASK,
+                    )
+                ),
+                tenant_id=memory.tenant_id,
+                object_type=EmbeddedObjectType.MEMORY_RECORD,
+                object_id=memory.memory_id,
+                values=values,
+                model_reference=self._recall_embedder.model_reference,
+                task=RETRIEVAL_DOCUMENT_EMBEDDING_TASK,
+                dimension=self._recall_embedder.dimension,
+                normalized=True,
+                created_at=memory.created_at,
+            )
         )
 
     async def _resolve_query_media(
@@ -422,7 +490,7 @@ def _evidence_view(evidence: ResolvedEvidence) -> EvidenceView:
     )
 
 
-def _request_digest(request: ObserveRequest | RememberRequest) -> str:
+def _request_digest(request: ContractModel) -> str:
     payload = request.model_dump(mode="json", exclude={"idempotency_key"})
     canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()

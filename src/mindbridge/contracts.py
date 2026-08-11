@@ -15,6 +15,7 @@ from pydantic import (
 )
 
 from mindbridge.core import (
+    FeedbackType,
     JobState,
     MediaKind,
     MemoryState,
@@ -108,6 +109,54 @@ class RememberRequest(ContractModel):
     ended_at: AwareDatetime | None = None
     evidence_ids: tuple[Identifier, ...] = ()
     idempotency_key: Identifier | None = None
+
+
+class FeedbackRequest(ContractModel):
+    """Record useful, wrong, missing, or corrected recall feedback."""
+
+    tenant_id: Identifier
+    feedback_type: FeedbackType
+    memory_id: Identifier | None = None
+    recall_trace_id: Identifier | None = None
+    correction_summary: NonEmptyString | None = None
+    idempotency_key: Identifier | None = None
+
+    @model_validator(mode="after")
+    def require_feedback_target(self) -> FeedbackRequest:
+        """Make each feedback kind actionable without an untyped details bag."""
+        if self.feedback_type is FeedbackType.MISSING:
+            if self.recall_trace_id is None:
+                raise ValueError("missing feedback requires recall_trace_id")
+            if self.memory_id is not None:
+                raise ValueError("missing feedback must not provide memory_id")
+        elif self.memory_id is None:
+            raise ValueError("memory feedback requires memory_id")
+        if self.feedback_type is FeedbackType.CORRECTION:
+            if self.correction_summary is None:
+                raise ValueError("correction feedback requires correction_summary")
+        elif self.correction_summary is not None:
+            raise ValueError("correction_summary is only valid for correction feedback")
+        return self
+
+
+class FeedbackReceipt(ContractModel):
+    """Durable feedback result and resulting transparent lifecycle state."""
+
+    feedback_id: Identifier
+    feedback_type: FeedbackType
+    memory_id: Identifier | None
+    corrected_memory_id: Identifier | None
+    resulting_state: MemoryState | None
+    resulting_strength: float | None = Field(allow_inf_nan=False)
+    created_at: AwareDatetime
+    trace_id: Identifier
+
+    @model_validator(mode="after")
+    def require_result_pair(self) -> FeedbackReceipt:
+        """Keep lifecycle state and its score from drifting apart."""
+        if (self.resulting_state is None) != (self.resulting_strength is None):
+            raise ValueError("resulting_state and resulting_strength must be provided together")
+        return self
 
 
 class RecallQuery(ContractModel):

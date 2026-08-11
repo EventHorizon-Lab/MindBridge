@@ -1,6 +1,7 @@
 """Vertical tests for the shared observe, remember, and recall path."""
 
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -8,6 +9,7 @@ import pytest
 from mindbridge.application import (
     EmbeddingMatch,
     EmbeddingSearch,
+    FeedbackWriteResult,
     GeneratedAnswer,
     MemoryKernel,
     MemoryWriteResult,
@@ -18,6 +20,7 @@ from mindbridge.application import (
     ResolvedEvidence,
 )
 from mindbridge.contracts import (
+    FeedbackRequest,
     MediaObjectInput,
     ObservationStatus,
     ObserveRequest,
@@ -31,6 +34,7 @@ from mindbridge.core import (
     EmbeddingRecord,
     EvidenceId,
     EvidenceSpan,
+    FeedbackType,
     IdempotencyConflictError,
     JobId,
     JobNotFoundError,
@@ -38,9 +42,11 @@ from mindbridge.core import (
     MediaKind,
     MediaObject,
     MediaObjectId,
+    MemoryFeedback,
     MemoryId,
     MemoryNotFoundError,
     MemoryRecord,
+    MemoryState,
     MemoryType,
     ModelReference,
     ModelUnavailableError,
@@ -50,6 +56,7 @@ from mindbridge.core import (
     SensorKind,
     TenantId,
     VerificationStatus,
+    apply_memory_feedback,
 )
 
 NOW = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
@@ -66,6 +73,7 @@ class InMemoryStore:
         self.embedding_matches: tuple[EmbeddingMatch, ...] = ()
         self.embedding_searches: list[EmbeddingSearch] = []
         self.embeddings: dict[str, EmbeddingRecord] = {}
+        self.feedback: dict[str, tuple[str, FeedbackWriteResult]] = {}
 
     async def write_observation(
         self,
@@ -119,12 +127,54 @@ class InMemoryStore:
                 return memory
         raise MemoryNotFoundError("memory does not exist")
 
+    async def record_feedback(
+        self,
+        feedback: MemoryFeedback,
+        corrected_memory: MemoryRecord | None,
+        *,
+        idempotency_key: str,
+        content_digest: str,
+    ) -> FeedbackWriteResult:
+        key = f"{feedback.tenant_id}:{idempotency_key}"
+        existing = self.feedback.get(key)
+        if existing is not None:
+            _require_same_content(existing[0], content_digest)
+            return replace(existing[1], created=False)
+        evolved = None
+        if feedback.memory_id is not None:
+            original = await self.read_memory(feedback.tenant_id, feedback.memory_id)
+            evolved = apply_memory_feedback(original, feedback.feedback_type, feedback.created_at)
+            if corrected_memory is not None:
+                evolved = replace(evolved, superseded_at=feedback.created_at)
+            for memory_key, value in self.memories.items():
+                if value[1].memory_id == original.memory_id:
+                    self.memories[memory_key] = (value[0], evolved)
+                    break
+        if corrected_memory is not None:
+            self.memories[f"correction:{corrected_memory.memory_id}"] = (
+                content_digest,
+                corrected_memory,
+            )
+        result = FeedbackWriteResult(
+            feedback_id=feedback.feedback_id,
+            feedback_type=feedback.feedback_type,
+            memory_id=feedback.memory_id,
+            created_at=feedback.created_at,
+            resulting_state=evolved.state if evolved is not None else None,
+            resulting_strength=evolved.strength if evolved is not None else None,
+            corrected_memory=corrected_memory,
+            created=True,
+        )
+        self.feedback[key] = (content_digest, result)
+        return result
+
     async def search_memories(self, request: RecallRequest) -> tuple[MemoryRecord, ...]:
         query = request.query.text.casefold() if request.query.text is not None else None
         candidates = (
             memory
             for _, memory in self.memories.values()
             if memory.tenant_id == request.tenant_id
+            and memory.superseded_at is None
             and (query is None or query in memory.summary.casefold())
             and (
                 not request.filters.memory_types
@@ -155,6 +205,7 @@ class InMemoryStore:
             memory
             for _, memory in self.memories.values()
             if memory.tenant_id == request.tenant_id
+            and memory.superseded_at is None
             and any(evidence_id in rank for evidence_id in memory.evidence_ids)
         )
         return tuple(
@@ -177,6 +228,7 @@ class InMemoryStore:
             for memory_id in ranked_memory_ids
             if memory_id in memory_by_id
             and memory_by_id[memory_id].tenant_id == request.tenant_id
+            and memory_by_id[memory_id].superseded_at is None
             and (
                 not request.filters.memory_types
                 or memory_by_id[memory_id].memory_type in request.filters.memory_types
@@ -366,6 +418,66 @@ async def test_get_memory_is_tenant_scoped() -> None:
     assert found == remembered
     with pytest.raises(MemoryNotFoundError):
         await kernel.get_memory("other_tenant", remembered.memory_id)
+
+
+async def test_feedback_strengthens_and_correction_supersedes_without_model_training() -> None:
+    store = InMemoryStore()
+    embedder = RecordingRecallEmbedder()
+    kernel = _kernel(store, RecordingAnswerer(), recall_embedder=embedder)
+    original = await kernel.remember(_remember_request(idempotency_key="original"))
+
+    useful = await kernel.record_feedback(
+        FeedbackRequest(
+            tenant_id="tenant_01",
+            feedback_type=FeedbackType.USEFUL,
+            memory_id=original.memory_id,
+            idempotency_key="useful_01",
+        )
+    )
+    correction_request = FeedbackRequest(
+        tenant_id="tenant_01",
+        feedback_type=FeedbackType.CORRECTION,
+        memory_id=original.memory_id,
+        correction_summary="The robot put the red screwdriver in the green drawer.",
+        idempotency_key="correction_01",
+    )
+    correction = await kernel.record_feedback(correction_request)
+    retry = await kernel.record_feedback(correction_request)
+    old = await kernel.get_memory("tenant_01", original.memory_id)
+    recalled = await kernel.recall(
+        RecallRequest(
+            tenant_id="tenant_01",
+            query=RecallQuery(text="green drawer"),
+        )
+    )
+
+    assert useful.resulting_state is MemoryState.STRENGTHENED
+    assert useful.resulting_strength == 1.5
+    assert correction.corrected_memory_id == retry.corrected_memory_id
+    assert old.superseded_at == NOW
+    assert old.negative_feedback_count == 1
+    assert recalled.answer == "The robot put the red screwdriver in the green drawer."
+    assert [item.memory_id for item in recalled.memories] == [correction.corrected_memory_id]
+    assert (
+        embedder.memory_documents.count("The robot put the red screwdriver in the green drawer.")
+        == 2
+    )
+
+
+async def test_missing_feedback_records_trace_without_inventing_a_memory() -> None:
+    kernel = _kernel(InMemoryStore(), RecordingAnswerer())
+
+    receipt = await kernel.record_feedback(
+        FeedbackRequest(
+            tenant_id="tenant_01",
+            feedback_type=FeedbackType.MISSING,
+            recall_trace_id="trace_missing",
+        )
+    )
+
+    assert receipt.memory_id is None
+    assert receipt.resulting_state is None
+    assert receipt.resulting_strength is None
 
 
 async def test_idempotency_key_rejects_different_observation() -> None:

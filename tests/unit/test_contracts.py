@@ -6,13 +6,14 @@ import pytest
 from pydantic import ValidationError
 
 from mindbridge.contracts import (
+    FeedbackRequest,
     MediaObjectInput,
     ObserveRequest,
     RecallFilters,
     RecallQuery,
     RecallRequest,
 )
-from mindbridge.core import MediaKind, SensorKind
+from mindbridge.core import FeedbackType, MediaKind, SensorKind
 
 NOW = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
 
@@ -34,6 +35,19 @@ def test_recall_query_requires_one_modality() -> None:
     """An empty query cannot trigger an unbounded search."""
     with pytest.raises(ValidationError, match="requires text or media_object_ids"):
         RecallQuery()
+
+
+def test_feedback_contract_requires_typed_targets_and_corrections() -> None:
+    with pytest.raises(ValidationError, match="memory_id"):
+        FeedbackRequest(tenant_id="tenant_01", feedback_type=FeedbackType.WRONG)
+    with pytest.raises(ValidationError, match="correction_summary"):
+        FeedbackRequest(
+            tenant_id="tenant_01",
+            feedback_type=FeedbackType.CORRECTION,
+            memory_id="memory_01",
+        )
+    with pytest.raises(ValidationError, match="recall_trace_id"):
+        FeedbackRequest(tenant_id="tenant_01", feedback_type=FeedbackType.MISSING)
 
 
 def test_recall_query_rejects_whitespace_text() -> None:

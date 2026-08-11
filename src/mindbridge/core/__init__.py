@@ -19,12 +19,14 @@ from mindbridge.core.evidence import (
     PixelRegion,
     SensorKind,
 )
+from mindbridge.core.feedback import FeedbackType, MemoryFeedback
 from mindbridge.core.identifiers import (
     ClaimId,
     DeviceId,
     EmbeddingId,
     EventId,
     EvidenceId,
+    FeedbackId,
     JobId,
     MediaObjectId,
     MemoryId,
@@ -36,6 +38,7 @@ from mindbridge.core.jobs import JobState, ObservationJobClaim, ObservationProce
 from mindbridge.core.lifecycle import (
     DEFAULT_MEMORY_STRENGTH_POLICY,
     MemoryStrengthPolicy,
+    apply_memory_feedback,
     calculate_memory_strength,
     evolve_memory_strength,
 )
@@ -64,6 +67,8 @@ __all__ = [
     "EventId",
     "EvidenceId",
     "EvidenceSpan",
+    "FeedbackId",
+    "FeedbackType",
     "IdempotencyConflictError",
     "JobId",
     "JobNotFoundError",
@@ -71,6 +76,7 @@ __all__ = [
     "MediaKind",
     "MediaObject",
     "MediaObjectId",
+    "MemoryFeedback",
     "MemoryId",
     "MemoryIntegrityError",
     "MemoryNotFoundError",
@@ -91,6 +97,7 @@ __all__ = [
     "TaskBrokerError",
     "TenantId",
     "VerificationStatus",
+    "apply_memory_feedback",
     "calculate_memory_strength",
     "derive_stable_id",
     "evolve_memory_strength",

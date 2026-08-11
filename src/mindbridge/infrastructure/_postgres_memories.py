@@ -66,7 +66,7 @@ async def write_memory(
             resource_id=memory.memory_id,
         )
         if existing_id is not None:
-            existing = await _read_memory(
+            existing = await _require_memory_on_connection(
                 connection,
                 memory.tenant_id,
                 MemoryId(existing_id),
@@ -75,7 +75,9 @@ async def write_memory(
 
         created = await write_memory_on_connection(connection, memory, content_digest)
         if not created:
-            existing = await _read_memory(connection, memory.tenant_id, memory.memory_id)
+            existing = await _require_memory_on_connection(
+                connection, memory.tenant_id, memory.memory_id
+            )
             return MemoryWriteResult(memory=existing, created=False)
         return MemoryWriteResult(memory=memory, created=True)
 
@@ -87,14 +89,10 @@ async def read_memory(
 ) -> MemoryRecord:
     """Read one memory without revealing whether its ID exists in another tenant."""
     async with pool.connection() as connection:
-        cursor = await connection.execute(
-            f"{_MEMORY_SELECT_SQL} WHERE memory.tenant_id = %s AND memory.memory_id = %s",
-            (tenant_id, memory_id),
-        )
-        row = await cursor.fetchone()
-    if row is None:
+        memory = await find_memory_on_connection(connection, tenant_id, memory_id)
+    if memory is None:
         raise MemoryNotFoundError("memory does not exist")
-    return _memory_from_row(cast(MemoryRow, row))
+    return memory
 
 
 async def write_memory_on_connection(
@@ -245,19 +243,32 @@ async def _memory_digest(connection: DatabaseConnection, memory: MemoryRecord) -
     return cast(tuple[str], row)[0]
 
 
-async def _read_memory(
+async def find_memory_on_connection(
+    connection: DatabaseConnection,
+    tenant_id: TenantId,
+    memory_id: MemoryId,
+    *,
+    for_update: bool = False,
+) -> MemoryRecord | None:
+    """Find one memory inside a caller transaction, optionally locking its lifecycle row."""
+    lock = " FOR UPDATE OF memory" if for_update else ""
+    cursor = await connection.execute(
+        f"{_MEMORY_SELECT_SQL} WHERE memory.tenant_id = %s AND memory.memory_id = %s{lock}",
+        (tenant_id, memory_id),
+    )
+    row = await cursor.fetchone()
+    return _memory_from_row(cast(MemoryRow, row)) if row is not None else None
+
+
+async def _require_memory_on_connection(
     connection: DatabaseConnection,
     tenant_id: TenantId,
     memory_id: MemoryId,
 ) -> MemoryRecord:
-    cursor = await connection.execute(
-        f"{_MEMORY_SELECT_SQL} WHERE memory.tenant_id = %s AND memory.memory_id = %s",
-        (tenant_id, memory_id),
-    )
-    row = await cursor.fetchone()
-    if row is None:
+    memory = await find_memory_on_connection(connection, tenant_id, memory_id)
+    if memory is None:
         raise MemoryIntegrityError("idempotency key references a missing memory")
-    return _memory_from_row(cast(MemoryRow, row))
+    return memory
 
 
 def _memory_from_row(row: MemoryRow) -> MemoryRecord:
