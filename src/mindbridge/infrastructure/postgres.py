@@ -12,7 +12,15 @@ from mindbridge.application import (
     ObservationWriteResult,
 )
 from mindbridge.contracts import RecallRequest
-from mindbridge.core import EmbeddingRecord, EvidenceId, EvidenceSpan, MemoryRecord, TenantId
+from mindbridge.core import (
+    EmbeddingRecord,
+    EvidenceId,
+    EvidenceSpan,
+    MediaObject,
+    MediaObjectId,
+    MemoryRecord,
+    TenantId,
+)
 from mindbridge.infrastructure._postgres_embeddings import (
     search_embeddings,
     write_embedding,
@@ -22,7 +30,7 @@ from mindbridge.infrastructure._postgres_memories import (
     search_memories,
     write_memory,
 )
-from mindbridge.infrastructure._postgres_observations import write_observation
+from mindbridge.infrastructure._postgres_observations import read_media_objects, write_observation
 from mindbridge.infrastructure._postgres_types import DatabaseConnection, DatabasePool
 
 
@@ -101,6 +109,14 @@ class PostgresMemoryStore:
     ) -> tuple[EvidenceSpan, ...]:
         """Read exact evidence spans while preserving caller order."""
         return await read_evidence(self._pool, tenant_id, evidence_ids)
+
+    async def read_media_objects(
+        self,
+        tenant_id: TenantId,
+        media_object_ids: tuple[MediaObjectId, ...],
+    ) -> tuple[MediaObject, ...]:
+        """Read media metadata for evidence resolution in caller order."""
+        return await read_media_objects(self._pool, tenant_id, media_object_ids)
 
     async def write_embedding(self, embedding: EmbeddingRecord) -> bool:
         """Persist one immutable vector version."""

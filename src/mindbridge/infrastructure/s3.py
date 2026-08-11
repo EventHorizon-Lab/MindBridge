@@ -6,7 +6,6 @@ import asyncio
 import base64
 import re
 from collections.abc import Callable
-from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
 from urllib.parse import quote, urlsplit
@@ -15,6 +14,7 @@ import boto3
 from botocore.config import Config
 from botocore.exceptions import BotoCoreError
 
+from mindbridge.application import PresignedMediaDownload, PresignedMediaUpload
 from mindbridge.core import MediaObject
 
 if TYPE_CHECKING:
@@ -31,32 +31,6 @@ class InvalidMediaLocationError(ValueError):
 
 class ObjectStorageError(RuntimeError):
     """Raised when the S3 SDK cannot create a media access URL."""
-
-
-@dataclass(frozen=True, slots=True)
-class PresignedMediaUpload:
-    """A constrained PUT request for one immutable media object."""
-
-    upload_url: str
-    expires_at: datetime
-    content_type: str
-    checksum_sha256_base64: str
-
-    @property
-    def required_headers(self) -> dict[str, str]:
-        """Return headers covered by the S3 signature."""
-        return {
-            "Content-Type": self.content_type,
-            "x-amz-checksum-sha256": self.checksum_sha256_base64,
-        }
-
-
-@dataclass(frozen=True, slots=True)
-class PresignedMediaDownload:
-    """A short-lived GET URL for one tenant-owned media object."""
-
-    download_url: str
-    expires_at: datetime
 
 
 class S3MediaAccess:

@@ -170,7 +170,8 @@ class EvidenceView(ContractModel):
     media_object_id: Identifier
     start_ms: Annotated[int, Field(ge=0)]
     end_ms: Annotated[int, Field(ge=0)]
-    thumbnail_url: NonEmptyString | None = None
+    media_url: NonEmptyString
+    media_url_expires_at: AwareDatetime
 
 
 class RecallResult(ContractModel):

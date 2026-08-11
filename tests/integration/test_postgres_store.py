@@ -12,7 +12,13 @@ import pytest
 import pytest_asyncio
 from psycopg import AsyncConnection
 
-from mindbridge.application import EmbeddingSearch, GeneratedAnswer, MemoryKernel
+from mindbridge.application import (
+    EmbeddingSearch,
+    GeneratedAnswer,
+    MemoryKernel,
+    PresignedMediaDownload,
+    ResolvedEvidence,
+)
 from mindbridge.contracts import (
     MediaObjectInput,
     ObservationStatus,
@@ -27,9 +33,9 @@ from mindbridge.core import (
     EmbeddedObjectType,
     EmbeddingId,
     EmbeddingRecord,
-    EvidenceSpan,
     IdempotencyConflictError,
     MediaKind,
+    MediaObject,
     MemoryRecord,
     MemoryType,
     ModelReference,
@@ -58,9 +64,22 @@ class FirstMemoryAnswerer:
         self,
         request: RecallRequest,
         memories: tuple[MemoryRecord, ...],
-        evidence: tuple[EvidenceSpan, ...],
+        evidence: tuple[ResolvedEvidence, ...],
     ) -> GeneratedAnswer:
         return GeneratedAnswer(answer=memories[0].summary, confidence=0.9)
+
+
+class DeterministicMediaUrlSigner:
+    """Keeps database integration independent from object storage."""
+
+    async def create_presigned_download(
+        self,
+        media_object: MediaObject,
+    ) -> PresignedMediaDownload:
+        return PresignedMediaDownload(
+            download_url=f"https://objects.example.test/{media_object.media_object_id}",
+            expires_at=NOW + timedelta(minutes=5),
+        )
 
 
 @pytest_asyncio.fixture(scope="session", loop_scope="session")
@@ -121,7 +140,7 @@ async def test_postgres_vertical_path_is_idempotent_and_evidence_first(
     database_url: str,
 ) -> None:
     """The production store runs observe, remember, and recall without a side path."""
-    kernel = MemoryKernel(store, FirstMemoryAnswerer(), clock=lambda: NOW)
+    kernel = _kernel(store)
     request = _observe_request(tenant_id="tenant_roundtrip")
 
     first = await kernel.observe(request)
@@ -144,11 +163,12 @@ async def test_postgres_vertical_path_is_idempotent_and_evidence_first(
     assert result.answer == "The robot put the red screwdriver beside the blue toolbox."
     assert result.evidence[0].evidence_id == evidence_id
     assert result.evidence[0].end_ms == 4_000
+    assert result.evidence[0].media_url.startswith("https://objects.example.test/media_")
 
 
 async def test_postgres_rejects_idempotency_key_reuse(store: PostgresMemoryStore) -> None:
     """Conflicting retries roll back rather than aliasing two observations."""
-    kernel = MemoryKernel(store, FirstMemoryAnswerer(), clock=lambda: NOW)
+    kernel = _kernel(store)
     await kernel.observe(
         _observe_request(tenant_id="tenant_conflict", idempotency_key="request_01")
     )
@@ -168,7 +188,7 @@ async def test_postgres_deduplicates_media_by_content_hash(
     database_url: str,
 ) -> None:
     """Different device aliases for identical bytes share one media row."""
-    kernel = MemoryKernel(store, FirstMemoryAnswerer(), clock=lambda: NOW)
+    kernel = _kernel(store)
     await kernel.observe(
         _observe_request(
             tenant_id="tenant_dedup",
@@ -328,4 +348,13 @@ def _embedding_record(
         dimension=1_024,
         normalized=True,
         created_at=NOW,
+    )
+
+
+def _kernel(store: PostgresMemoryStore) -> MemoryKernel:
+    return MemoryKernel(
+        store,
+        FirstMemoryAnswerer(),
+        media_url_signer=DeterministicMediaUrlSigner(),
+        clock=lambda: NOW,
     )

@@ -1,5 +1,6 @@
 """Vertical tests for the shared observe, remember, and recall path."""
 
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -10,6 +11,8 @@ from mindbridge.application import (
     MemoryWriteResult,
     ObservationBatch,
     ObservationWriteResult,
+    PresignedMediaDownload,
+    ResolvedEvidence,
 )
 from mindbridge.contracts import (
     MediaObjectInput,
@@ -25,6 +28,8 @@ from mindbridge.core import (
     EvidenceSpan,
     IdempotencyConflictError,
     MediaKind,
+    MediaObject,
+    MediaObjectId,
     MemoryRecord,
     MemoryType,
     Observation,
@@ -43,6 +48,7 @@ class InMemoryStore:
         self.observations: dict[str, tuple[str, Observation]] = {}
         self.memories: dict[str, tuple[str, MemoryRecord]] = {}
         self.evidence: dict[EvidenceId, EvidenceSpan] = {}
+        self.media_objects: dict[MediaObjectId, MediaObject] = {}
 
     async def write_observation(
         self,
@@ -58,6 +64,7 @@ class InMemoryStore:
             return ObservationWriteResult(observation=existing[1], created=False)
         self.observations[key] = (content_digest, batch.observation)
         self.evidence.update((item.evidence_id, item) for item in batch.evidence_spans)
+        self.media_objects.update((item.media_object_id, item) for item in batch.media_objects)
         return ObservationWriteResult(observation=batch.observation, created=True)
 
     async def write_memory(
@@ -112,19 +119,43 @@ class InMemoryStore:
             if self.evidence[evidence_id].tenant_id == tenant_id
         )
 
+    async def read_media_objects(
+        self,
+        tenant_id: TenantId,
+        media_object_ids: tuple[MediaObjectId, ...],
+    ) -> tuple[MediaObject, ...]:
+        return tuple(
+            self.media_objects[media_object_id]
+            for media_object_id in media_object_ids
+            if self.media_objects[media_object_id].tenant_id == tenant_id
+        )
+
+
+class DeterministicMediaUrlSigner:
+    """Returns openable-looking URLs without an object-storage dependency."""
+
+    async def create_presigned_download(
+        self,
+        media_object: MediaObject,
+    ) -> PresignedMediaDownload:
+        return PresignedMediaDownload(
+            download_url=f"https://objects.example.test/{media_object.media_object_id}",
+            expires_at=NOW + timedelta(minutes=5),
+        )
+
 
 class RecordingAnswerer:
     """Deterministic answerer proving when the model boundary is invoked."""
 
     def __init__(self) -> None:
         self.calls = 0
-        self.last_evidence: tuple[EvidenceSpan, ...] = ()
+        self.last_evidence: tuple[ResolvedEvidence, ...] = ()
 
     async def answer(
         self,
         request: RecallRequest,
         memories: tuple[MemoryRecord, ...],
-        evidence: tuple[EvidenceSpan, ...],
+        evidence: tuple[ResolvedEvidence, ...],
     ) -> GeneratedAnswer:
         self.calls += 1
         self.last_evidence = evidence
@@ -134,7 +165,7 @@ class RecordingAnswerer:
 async def test_observe_is_retry_safe() -> None:
     """Retrying one edge sequence stores one observation and returns duplicate status."""
     store = InMemoryStore()
-    kernel = MemoryKernel(store, RecordingAnswerer(), clock=lambda: NOW)
+    kernel = _kernel(store, RecordingAnswerer())
 
     first = await kernel.observe(_observe_request())
     retry = await kernel.observe(_observe_request())
@@ -149,7 +180,7 @@ async def test_observe_is_retry_safe() -> None:
 async def test_idempotency_key_rejects_different_observation() -> None:
     """A client key cannot silently alias two physical observations."""
     store = InMemoryStore()
-    kernel = MemoryKernel(store, RecordingAnswerer(), clock=lambda: NOW)
+    kernel = _kernel(store, RecordingAnswerer())
     await kernel.observe(_observe_request(idempotency_key="edge-request-01"))
 
     with pytest.raises(IdempotencyConflictError):
@@ -160,7 +191,7 @@ async def test_observe_remember_recall_returns_openable_evidence() -> None:
     """The first full path answers from a memory and its exact media span."""
     store = InMemoryStore()
     answerer = RecordingAnswerer()
-    kernel = MemoryKernel(store, answerer, clock=lambda: NOW)
+    kernel = _kernel(store, answerer)
     await kernel.observe(_observe_request())
     evidence_id = next(iter(store.evidence))
     memory = await kernel.remember(_remember_request(evidence_ids=(evidence_id,)))
@@ -176,6 +207,8 @@ async def test_observe_remember_recall_returns_openable_evidence() -> None:
     assert result.answer == "The robot put the red screwdriver beside the blue toolbox."
     assert result.evidence[0].evidence_id == evidence_id
     assert result.evidence[0].end_ms == 4_000
+    assert result.evidence[0].media_url == "https://objects.example.test/media_01"
+    assert answerer.last_evidence[0].media_object.kind is MediaKind.VIDEO
     assert answerer.calls == 1
 
 
@@ -183,12 +216,8 @@ async def test_remember_retry_returns_original_record() -> None:
     """A retry cannot replace the system creation time of an existing memory."""
     store = InMemoryStore()
     request = _remember_request(idempotency_key="remember-01")
-    first_kernel = MemoryKernel(store, RecordingAnswerer(), clock=lambda: NOW)
-    later_kernel = MemoryKernel(
-        store,
-        RecordingAnswerer(),
-        clock=lambda: NOW + timedelta(minutes=5),
-    )
+    first_kernel = _kernel(store, RecordingAnswerer())
+    later_kernel = _kernel(store, RecordingAnswerer(), clock=lambda: NOW + timedelta(minutes=5))
 
     first = await first_kernel.remember(request)
     retry = await later_kernel.remember(request)
@@ -201,7 +230,7 @@ async def test_hidden_evidence_is_still_used_for_answering() -> None:
     """Response shaping cannot bypass evidence inspection by the answer model."""
     store = InMemoryStore()
     answerer = RecordingAnswerer()
-    kernel = MemoryKernel(store, answerer, clock=lambda: NOW)
+    kernel = _kernel(store, answerer)
     await kernel.observe(_observe_request())
     evidence_id = next(iter(store.evidence))
     await kernel.remember(_remember_request(evidence_ids=(evidence_id,)))
@@ -215,18 +244,35 @@ async def test_hidden_evidence_is_still_used_for_answering() -> None:
     )
 
     assert result.evidence == ()
-    assert answerer.last_evidence[0].evidence_id == evidence_id
+    assert answerer.last_evidence[0].evidence_span.evidence_id == evidence_id
 
 
 async def test_recall_without_candidates_abstains_without_model_call() -> None:
     """No evidence means no guessed answer and no unnecessary model cost."""
     answerer = RecordingAnswerer()
-    kernel = MemoryKernel(InMemoryStore(), answerer, clock=lambda: NOW)
+    kernel = _kernel(InMemoryStore(), answerer)
 
     result = await kernel.recall(
         RecallRequest(tenant_id="tenant_01", query=RecallQuery(text="missing"))
     )
 
+    assert result.answer is None
+    assert result.confidence == 0.0
+    assert answerer.calls == 0
+
+
+async def test_recall_abstains_when_candidate_has_no_evidence() -> None:
+    """An unverified summary may be returned by search but cannot ground an answer."""
+    store = InMemoryStore()
+    answerer = RecordingAnswerer()
+    kernel = _kernel(store, answerer)
+    await kernel.remember(_remember_request())
+
+    result = await kernel.recall(
+        RecallRequest(tenant_id="tenant_01", query=RecallQuery(text="red screwdriver"))
+    )
+
+    assert len(result.memories) == 1
     assert result.answer is None
     assert result.confidence == 0.0
     assert answerer.calls == 0
@@ -279,6 +325,20 @@ def _remember_request(
         occurred_at=NOW,
         evidence_ids=evidence_ids,
         idempotency_key=idempotency_key,
+    )
+
+
+def _kernel(
+    store: InMemoryStore,
+    answerer: RecordingAnswerer,
+    *,
+    clock: Callable[[], datetime] = lambda: NOW,
+) -> MemoryKernel:
+    return MemoryKernel(
+        store,
+        answerer,
+        media_url_signer=DeterministicMediaUrlSigner(),
+        clock=clock,
     )
 
 

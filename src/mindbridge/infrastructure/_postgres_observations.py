@@ -9,6 +9,7 @@ from mindbridge.core import (
     DomainInvariantError,
     EvidenceSpan,
     IdempotencyConflictError,
+    MediaKind,
     MediaObject,
     MediaObjectId,
     MemoryIntegrityError,
@@ -31,6 +32,16 @@ ObservationRow: TypeAlias = tuple[
     datetime,
     datetime,
     int,
+]
+MediaObjectRow: TypeAlias = tuple[
+    str,
+    str,
+    str,
+    str,
+    str,
+    int,
+    datetime,
+    int | None,
 ]
 
 
@@ -77,6 +88,36 @@ async def write_observation(
         await _write_observation_media(connection, observation, canonical_media_ids)
         await _write_evidence_spans(connection, batch.evidence_spans, canonical_media_ids)
         return ObservationWriteResult(observation=observation, created=True)
+
+
+async def read_media_objects(
+    pool: DatabasePool,
+    tenant_id: TenantId,
+    media_object_ids: tuple[MediaObjectId, ...],
+) -> tuple[MediaObject, ...]:
+    """Read immutable media metadata in caller order without crossing tenants."""
+    if not media_object_ids:
+        return ()
+    async with pool.connection() as connection:
+        cursor = await connection.execute(
+            """
+            SELECT media_object_id, tenant_id, kind, uri, sha256,
+                   size_bytes, created_at, duration_ms
+            FROM media_objects
+            WHERE tenant_id = %s AND media_object_id = ANY(%s)
+            """,
+            (tenant_id, list(media_object_ids)),
+        )
+        media_by_id = {
+            media_object.media_object_id: media_object
+            async for row in cursor
+            for media_object in (_media_object_from_row(cast(MediaObjectRow, row)),)
+        }
+    return tuple(
+        media_by_id[media_object_id]
+        for media_object_id in media_object_ids
+        if media_object_id in media_by_id
+    )
 
 
 async def _insert_observation(
@@ -323,4 +364,27 @@ def _observation_from_row(
         ended_at=ended_at,
         observed_at=observed_at,
         clock_offset_ms=clock_offset_ms,
+    )
+
+
+def _media_object_from_row(row: MediaObjectRow) -> MediaObject:
+    (
+        media_object_id,
+        tenant_id,
+        kind,
+        uri,
+        sha256,
+        size_bytes,
+        created_at,
+        duration_ms,
+    ) = row
+    return MediaObject(
+        media_object_id=MediaObjectId(media_object_id),
+        tenant_id=TenantId(tenant_id),
+        kind=MediaKind(kind),
+        uri=uri,
+        sha256=sha256,
+        size_bytes=size_bytes,
+        created_at=created_at,
+        duration_ms=duration_ms,
     )

@@ -8,7 +8,13 @@ from collections.abc import Callable
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from mindbridge.application.ports import MemoryAnswerer, MemoryStore, ObservationBatch
+from mindbridge.application.ports import (
+    MediaUrlSigner,
+    MemoryAnswerer,
+    MemoryStore,
+    ObservationBatch,
+    ResolvedEvidence,
+)
 from mindbridge.contracts import (
     EvidenceView,
     MediaObjectInput,
@@ -28,6 +34,7 @@ from mindbridge.core import (
     MediaObject,
     MediaObjectId,
     MemoryId,
+    MemoryIntegrityError,
     MemoryRecord,
     Observation,
     ObservationId,
@@ -44,10 +51,12 @@ class MemoryKernel:
         store: MemoryStore,
         answerer: MemoryAnswerer,
         *,
+        media_url_signer: MediaUrlSigner,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._store = store
         self._answerer = answerer
+        self._media_url_signer = media_url_signer
         self._clock = clock or _utc_now
 
     async def observe(self, request: ObserveRequest) -> ObservationReceipt:
@@ -109,8 +118,9 @@ class MemoryKernel:
         )
         answer = None
         confidence = 0.0
-        if memories and request.mode is not RecallMode.SEARCH:
-            generated = await self._answerer.answer(request, memories, evidence)
+        supported_memories = tuple(memory for memory in memories if memory.evidence_ids)
+        if supported_memories and evidence and request.mode is not RecallMode.SEARCH:
+            generated = await self._answerer.answer(request, supported_memories, evidence)
             answer = generated.answer
             confidence = generated.confidence
         return RecallResult(
@@ -127,13 +137,36 @@ class MemoryKernel:
         self,
         request: RecallRequest,
         memories: tuple[MemoryRecord, ...],
-    ) -> tuple[EvidenceSpan, ...]:
+    ) -> tuple[ResolvedEvidence, ...]:
         evidence_ids = tuple(
             dict.fromkeys(evidence_id for memory in memories for evidence_id in memory.evidence_ids)
         )
         if not evidence_ids:
             return ()
-        return await self._store.read_evidence(TenantId(request.tenant_id), evidence_ids)
+        tenant_id = TenantId(request.tenant_id)
+        evidence_spans = await self._store.read_evidence(tenant_id, evidence_ids)
+        if len(evidence_spans) != len(evidence_ids):
+            raise MemoryIntegrityError("memory references missing evidence")
+        media_object_ids = tuple(
+            dict.fromkeys(evidence.media_object_id for evidence in evidence_spans)
+        )
+        media_objects = await self._store.read_media_objects(tenant_id, media_object_ids)
+        if len(media_objects) != len(media_object_ids):
+            raise MemoryIntegrityError("evidence references missing media")
+        media_by_id = {item.media_object_id: item for item in media_objects}
+        downloads = {
+            item.media_object_id: await self._media_url_signer.create_presigned_download(item)
+            for item in media_objects
+        }
+        return tuple(
+            ResolvedEvidence(
+                evidence_span=evidence,
+                media_object=media_by_id[evidence.media_object_id],
+                media_url=downloads[evidence.media_object_id].download_url,
+                media_url_expires_at=downloads[evidence.media_object_id].expires_at,
+            )
+            for evidence in evidence_spans
+        )
 
 
 def _build_observation(request: ObserveRequest) -> Observation:
@@ -211,12 +244,14 @@ def _memory_view(memory: MemoryRecord) -> MemoryView:
     )
 
 
-def _evidence_view(evidence: EvidenceSpan) -> EvidenceView:
+def _evidence_view(evidence: ResolvedEvidence) -> EvidenceView:
     return EvidenceView(
-        evidence_id=evidence.evidence_id,
-        media_object_id=evidence.media_object_id,
-        start_ms=evidence.start_ms,
-        end_ms=evidence.end_ms,
+        evidence_id=evidence.evidence_span.evidence_id,
+        media_object_id=evidence.media_object.media_object_id,
+        start_ms=evidence.evidence_span.start_ms,
+        end_ms=evidence.evidence_span.end_ms,
+        media_url=evidence.media_url,
+        media_url_expires_at=evidence.media_url_expires_at,
     )
 
 

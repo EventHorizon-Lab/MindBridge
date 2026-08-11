@@ -7,12 +7,16 @@ from mindbridge.application.ports import (
     EmbeddingMatch,
     EmbeddingSearch,
     GeneratedAnswer,
+    MediaUrlSigner,
     MemoryAnswerer,
     MemoryStore,
     MemoryWriteResult,
     ObservationBatch,
     ObservationWriteResult,
     OmniEmbedder,
+    PresignedMediaDownload,
+    PresignedMediaUpload,
+    ResolvedEvidence,
 )
 
 __all__ = [
@@ -21,6 +25,7 @@ __all__ = [
     "EmbeddingMatch",
     "EmbeddingSearch",
     "GeneratedAnswer",
+    "MediaUrlSigner",
     "MemoryAnswerer",
     "MemoryKernel",
     "MemoryStore",
@@ -28,4 +33,7 @@ __all__ = [
     "ObservationBatch",
     "ObservationWriteResult",
     "OmniEmbedder",
+    "PresignedMediaDownload",
+    "PresignedMediaUpload",
+    "ResolvedEvidence",
 ]

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Protocol, TypeAlias
 
 from mindbridge.contracts import RecallRequest
@@ -14,6 +15,7 @@ from mindbridge.core import (
     EvidenceId,
     EvidenceSpan,
     MediaObject,
+    MediaObjectId,
     MemoryRecord,
     ModelReference,
     Observation,
@@ -46,6 +48,52 @@ class ObservationBatch:
     media_objects: tuple[MediaObject, ...]
     observation: Observation
     evidence_spans: tuple[EvidenceSpan, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class PresignedMediaUpload:
+    """A constrained PUT request for one immutable media object."""
+
+    upload_url: str
+    expires_at: datetime
+    content_type: str
+    checksum_sha256_base64: str
+
+    @property
+    def required_headers(self) -> dict[str, str]:
+        """Return headers covered by the object-store signature."""
+        return {
+            "Content-Type": self.content_type,
+            "x-amz-checksum-sha256": self.checksum_sha256_base64,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class PresignedMediaDownload:
+    """A short-lived GET URL for one tenant-owned media object."""
+
+    download_url: str
+    expires_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedEvidence:
+    """An exact evidence span joined to openable source media."""
+
+    evidence_span: EvidenceSpan
+    media_object: MediaObject
+    media_url: str
+    media_url_expires_at: datetime
+
+    def __post_init__(self) -> None:
+        if self.evidence_span.tenant_id != self.media_object.tenant_id:
+            raise DomainInvariantError("evidence and media tenants must match")
+        if self.evidence_span.media_object_id != self.media_object.media_object_id:
+            raise DomainInvariantError("evidence must resolve to its referenced media object")
+        if not self.media_url.strip():
+            raise DomainInvariantError("media_url must not be empty")
+        if self.media_url_expires_at.utcoffset() is None:
+            raise DomainInvariantError("media_url_expires_at must be timezone-aware")
 
 
 @dataclass(frozen=True, slots=True)
@@ -127,6 +175,12 @@ class MemoryStore(Protocol):
         evidence_ids: tuple[EvidenceId, ...],
     ) -> tuple[EvidenceSpan, ...]: ...
 
+    async def read_media_objects(
+        self,
+        tenant_id: TenantId,
+        media_object_ids: tuple[MediaObjectId, ...],
+    ) -> tuple[MediaObject, ...]: ...
+
 
 class MemoryAnswerer(Protocol):
     """Frozen model boundary used only after candidate retrieval."""
@@ -135,8 +189,17 @@ class MemoryAnswerer(Protocol):
         self,
         request: RecallRequest,
         memories: tuple[MemoryRecord, ...],
-        evidence: tuple[EvidenceSpan, ...],
+        evidence: tuple[ResolvedEvidence, ...],
     ) -> GeneratedAnswer: ...
+
+
+class MediaUrlSigner(Protocol):
+    """Short-lived access to immutable media without proxying its bytes."""
+
+    async def create_presigned_download(
+        self,
+        media_object: MediaObject,
+    ) -> PresignedMediaDownload: ...
 
 
 class EmbeddingIndex(Protocol):
