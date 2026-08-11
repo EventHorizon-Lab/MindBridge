@@ -6,10 +6,20 @@ from mindbridge.models.jina import (
     JinaModality,
     JinaOmniEmbedder,
 )
+from mindbridge.models.openai_omni import (
+    ANSWER_FROM_EVIDENCE_PROMPT_VERSION,
+    DEFAULT_OMNI_MODEL_ID,
+    OpenAIOmniAnswerer,
+    normalize_openai_base_url,
+)
 
 __all__ = [
+    "ANSWER_FROM_EVIDENCE_PROMPT_VERSION",
     "DEFAULT_JINA_OMNI_DIMENSION",
     "DEFAULT_JINA_OMNI_MODEL_ID",
+    "DEFAULT_OMNI_MODEL_ID",
     "JinaModality",
     "JinaOmniEmbedder",
+    "OpenAIOmniAnswerer",
+    "normalize_openai_base_url",
 ]
