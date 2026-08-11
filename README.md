@@ -233,3 +233,52 @@ uv run --extra cloud-models celery -A mindbridge.celery_app:app worker --logleve
 
 One prefork child is the safe default because each child owns a full embedding model. Scale with one
 Worker process per assigned GPU instead of increasing concurrency inside a process.
+
+## Run the Jetson/robot edge path
+
+Capture and encode with the installed NVIDIA/GStreamer stack. When `splitmuxsink` or the robot
+capture supervisor closes a segment, hand that completed file to the small durable boundary:
+
+```python
+from pathlib import Path
+
+from mindbridge.edge import SQLiteObservationOutbox, enqueue_captured_video
+
+outbox = SQLiteObservationOutbox(Path("/var/lib/mindbridge/edge.db"))
+request = enqueue_captured_video(
+    outbox,
+    Path("/var/lib/mindbridge/media/segment-000007.mp4"),
+    tenant_id="tenant_01",
+    device_id="front_camera",
+    boot_id="robot-boot-20260811T120000Z",
+    sequence=7,
+    bucket="mindbridge-media",
+    occurred_at=segment_started_at,
+    ended_at=segment_ended_at,
+    observed_at=capture_completed_at,
+    clock_offset_ms=estimated_clock_offset_ms,
+)
+```
+
+The handoff computes the SHA-256 and size, generates a deterministic tenant-scoped object key and
+idempotency key, then commits the request and absolute local path to a mode-`0600`, WAL-enabled
+SQLite Outbox. GStreamer/DeepStream remains responsible for camera decoding, encoding, frame rate,
+resolution, VAD/motion/scene gates, and hardware calibration.
+
+Drain a bounded batch with the standard Boto3 credential chain and the typed MindBridge SDK:
+
+```bash
+export MINDBRIDGE_API_KEY=replace-with-a-runtime-secret
+uv run python -m mindbridge.edge.sync_cli \
+  --database /var/lib/mindbridge/edge.db \
+  --api-base-url https://memory.example.com \
+  --bucket mindbridge-media \
+  --region us-east-1 \
+  --limit 100
+```
+
+Use the robot service manager or a systemd timer for retry scheduling and backoff. A failed run keeps
+the row, its sanitized error code, and attempt count. Once media has uploaded, later retries send
+only the idempotent observation metadata. A cloud receipt advances the per-boot sync watermark and
+removes the Outbox row atomically; local media deletion remains an explicit rolling-cache policy.
+AWS/S3 credentials and the MindBridge API key are never stored in SQLite.

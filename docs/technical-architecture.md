@@ -284,6 +284,16 @@ ASR、OCR 和 caption 是可检索视图，不是原始经历的替代品。遇�
 - 设备同时记录单调时钟和墙上时钟，上传时附带估计时钟偏差；
 - 云端确认 watermark 后，端侧才可按保留策略释放滚动缓存。
 
+首版 `mindbridge.edge` 已把这一恢复语义落实为文件型 SQLite Outbox：数据库启用 WAL 与
+`synchronous=FULL`，文件权限收紧为 `0600`；`tenant_id + device_id + boot_id + sequence` 同时受
+稳定 ID 和唯一约束保护，同一序列异内容立即冲突。GStreamer/DeepStream 关闭片段后，薄 capture
+handoff 只计算 size/SHA-256、稳定对象键、时钟区间和幂等键并入队，不接管 NVIDIA 的解码、编码
+或门控。同步器先用 Boto3 标准凭证链上传 tenant-scoped S3 对象，再通过异步 Python SDK 调用
+`observe`。媒体上传成功会单独落盘，因此 API 暂时离线不会重复传大文件；receipt、水位推进和
+Outbox 删除在一个 SQLite 事务中完成，进程在任意网络步骤崩溃都可安全重放。失败仅保存错误码和
+次数，不保存异常正文或凭证；重试节奏交给机器人 supervisor/systemd，避免框架内再造守护进程。
+本地媒体不会被同步器擅自删除，滚动缓存只能在读取 watermark 后按设备策略释放。
+
 ## 6. 模型与 Embedding 架构
 
 ### 6.1 初始模型配置
