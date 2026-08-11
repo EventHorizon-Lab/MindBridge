@@ -2,18 +2,22 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta
 
+from mindbridge.application.derive_observation_graph import (
+    derive_observation_graph,
+    embed_observation_graph,
+)
 from mindbridge.application.evidence import resolve_evidence_media
+from mindbridge.application.observation_processing import ObservationProcessingOutput
+from mindbridge.application.perception import EventPerception, PerceivedEvent, ResolvedEvidence
 from mindbridge.application.ports import (
-    EventPerception,
     MediaUrlSigner,
     ObservationPerceiver,
-    ObservationProcessingOutput,
     ObservationProcessingStore,
     OmniEmbedder,
-    PerceivedEvent,
-    ResolvedEvidence,
+    TextDocumentEmbedder,
 )
 from mindbridge.application.recall import RETRIEVAL_DOCUMENT_EMBEDDING_TASK
 from mindbridge.core import (
@@ -23,14 +27,9 @@ from mindbridge.core import (
     EmbeddingRecord,
     Event,
     EventId,
-    EvidenceSpan,
-    IdentityMention,
     JobId,
     JobState,
-    MemoryId,
     MemoryIntegrityError,
-    MemoryRecord,
-    MemoryType,
     ModelOutputError,
     ModelUnavailableError,
     ObjectStorageError,
@@ -38,7 +37,6 @@ from mindbridge.core import (
     ObservationId,
     ObservationProcessingJob,
     TenantId,
-    VerificationStatus,
     derive_stable_id,
 )
 from mindbridge.telemetry import set_current_span_attributes, trace_operation
@@ -52,12 +50,14 @@ class ProcessObservation:
         store: ObservationProcessingStore,
         perceiver: ObservationPerceiver,
         embedder: OmniEmbedder,
+        text_embedder: TextDocumentEmbedder,
         *,
         media_url_signer: MediaUrlSigner,
     ) -> None:
         self._store = store
         self._perceiver = perceiver
         self._embedder = embedder
+        self._text_embedder = text_embedder
         self._media_url_signer = media_url_signer
 
     @trace_operation("mindbridge.process_observation")
@@ -95,6 +95,13 @@ class ProcessObservation:
             perception = await self._perceiver.perceive_events(batch.observation, evidence)
             _require_grounded_perception(batch.observation, evidence, perception.events)
             events = _events(batch.observation, perception, claim.job.created_at)
+            graph = derive_observation_graph(
+                batch.observation,
+                perception,
+                events,
+                batch.evidence_spans,
+                claim.job.created_at,
+            )
             set_current_span_attributes(
                 {
                     "mindbridge.event.count": len(events),
@@ -103,21 +110,29 @@ class ProcessObservation:
                     "mindbridge.prompt.version": perception.prompt_version,
                 }
             )
-            output = ObservationProcessingOutput(
-                events=events,
-                memories=tuple(_event_memory(event) for event in events),
-                embeddings=await _evidence_embeddings(
+            evidence_embeddings, graph_embeddings = await asyncio.gather(
+                _evidence_embeddings(
                     tenant_id,
                     evidence,
                     self._embedder,
                     claim.job.created_at,
                 ),
-                identity_mentions=_identity_mentions(
-                    batch.observation,
-                    batch.evidence_spans,
+                embed_observation_graph(
+                    tenant_id,
                     events,
+                    graph.claims,
+                    self._text_embedder,
                     claim.job.created_at,
                 ),
+            )
+            output = ObservationProcessingOutput(
+                events=events,
+                entities=graph.entities,
+                entity_mentions=graph.entity_mentions,
+                claims=graph.claims,
+                memories=graph.memories,
+                relations=graph.relations,
+                embeddings=evidence_embeddings + graph_embeddings,
             )
             return await self._store.commit_observation_processing(
                 tenant_id,
@@ -166,82 +181,6 @@ def _events(
         )
         for ordinal, event in enumerate(perception.events)
     )
-
-
-def _event_memory(event: Event) -> MemoryRecord:
-    return MemoryRecord(
-        memory_id=MemoryId(derive_stable_id("memory", event.event_id)),
-        tenant_id=event.tenant_id,
-        memory_type=MemoryType.EPISODIC,
-        summary=event.description,
-        evidence_ids=event.evidence_ids,
-        occurred_at=event.occurred_at,
-        ended_at=event.ended_at,
-        created_at=event.created_at,
-        verification_status=VerificationStatus.VERIFIED,
-        model_reference=event.model_reference,
-        salience=event.salience,
-        strength=event.salience,
-    )
-
-
-def _identity_mentions(
-    observation: Observation,
-    evidence_spans: tuple[EvidenceSpan, ...],
-    events: tuple[Event, ...],
-    created_at: datetime,
-) -> tuple[IdentityMention, ...]:
-    evidence_by_id = {evidence.evidence_id: evidence for evidence in evidence_spans}
-    mentions: list[IdentityMention] = []
-    for event in events:
-        event_start_ms = round(
-            (event.occurred_at - observation.occurred_at).total_seconds() * 1_000
-        )
-        event_end_ms = round((event.ended_at - observation.occurred_at).total_seconds() * 1_000)
-        for identity in observation.identity_observations:
-            if not _time_ranges_overlap(
-                identity.start_ms,
-                identity.end_ms,
-                event_start_ms,
-                event_end_ms,
-            ):
-                continue
-            for evidence_id in event.evidence_ids:
-                evidence = evidence_by_id[evidence_id]
-                if not _time_ranges_overlap(
-                    identity.start_ms,
-                    identity.end_ms,
-                    evidence.start_ms,
-                    evidence.end_ms,
-                ):
-                    continue
-                mentions.append(
-                    IdentityMention(
-                        mention_id=derive_stable_id(
-                            "mention",
-                            event.tenant_id,
-                            identity.identity_id,
-                            event.event_id,
-                            evidence_id,
-                        ),
-                        tenant_id=event.tenant_id,
-                        identity_id=identity.identity_id,
-                        event_id=event.event_id,
-                        evidence_id=evidence_id,
-                        confidence=identity.confidence,
-                        created_at=created_at,
-                    )
-                )
-    return tuple(mentions)
-
-
-def _time_ranges_overlap(
-    left_start_ms: int,
-    left_end_ms: int,
-    right_start_ms: int,
-    right_end_ms: int,
-) -> bool:
-    return left_end_ms >= right_start_ms and right_end_ms >= left_start_ms
 
 
 async def _evidence_embeddings(

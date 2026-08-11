@@ -10,13 +10,13 @@ from typing import Protocol
 
 from mindbridge.application.enumeration import EnumerateMemories
 from mindbridge.application.evidence import read_resolved_memory_evidence
+from mindbridge.application.perception import ResolvedEvidence
 from mindbridge.application.ports import (
     EmbeddingIndex,
     EmbeddingSearch,
     MediaUrlSigner,
     MemoryAnswerer,
     MemoryStore,
-    ResolvedEvidence,
     ResolvedQueryMedia,
 )
 from mindbridge.application.ranking import fuse_memory_rankings

@@ -17,6 +17,11 @@ from pydantic import (
 )
 
 from mindbridge.application import (
+    MAX_PERCEIVED_CLAIMS_PER_EVENT,
+    MAX_PERCEIVED_ENTITIES_PER_EVENT,
+    MAX_PERCEPTION_CLAIMS,
+    MAX_PERCEPTION_ENTITIES,
+    MAX_PERCEPTION_EVENTS,
     EventPerception,
     PerceivedClaim,
     PerceivedEntity,
@@ -111,8 +116,12 @@ class _PerceivedEventOutput(BaseModel):
     description: _Description
     salience: Annotated[float, Field(ge=0.0, le=1.0)]
     evidence_ids: Annotated[tuple[_EvidenceIdentifier, ...], Field(min_length=1)]
-    entities: Annotated[tuple[_PerceivedEntityOutput, ...], Field(max_length=64)] = ()
-    claims: Annotated[tuple[_PerceivedClaimOutput, ...], Field(max_length=64)] = ()
+    entities: Annotated[
+        tuple[_PerceivedEntityOutput, ...], Field(max_length=MAX_PERCEIVED_ENTITIES_PER_EVENT)
+    ] = ()
+    claims: Annotated[
+        tuple[_PerceivedClaimOutput, ...], Field(max_length=MAX_PERCEIVED_CLAIMS_PER_EVENT)
+    ] = ()
 
     @model_validator(mode="after")
     def require_ordered_range(self) -> _PerceivedEventOutput:
@@ -126,7 +135,15 @@ class _PerceivedEventOutput(BaseModel):
 class _PerceptionOutput(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    events: Annotated[tuple[_PerceivedEventOutput, ...], Field(max_length=64)]
+    events: Annotated[tuple[_PerceivedEventOutput, ...], Field(max_length=MAX_PERCEPTION_EVENTS)]
+
+    @model_validator(mode="after")
+    def require_bounded_details(self) -> _PerceptionOutput:
+        if sum(len(event.entities) for event in self.events) > MAX_PERCEPTION_ENTITIES:
+            raise ValueError("total perception entity count exceeds the processing limit")
+        if sum(len(event.claims) for event in self.events) > MAX_PERCEPTION_CLAIMS:
+            raise ValueError("total perception claim count exceeds the processing limit")
+        return self
 
 
 class _SystemMessage(TypedDict):

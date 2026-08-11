@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import asyncio
 
+from mindbridge.application.perception import ResolvedEvidence
 from mindbridge.application.ports import (
     MediaUrlSigner,
     MemoryStore,
     PresignedMediaDownload,
-    ResolvedEvidence,
 )
 from mindbridge.core import (
     EvidenceSpan,

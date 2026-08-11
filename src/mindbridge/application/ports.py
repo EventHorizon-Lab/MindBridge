@@ -7,21 +7,22 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Protocol, TypeAlias
 
+from mindbridge.application.observation_processing import (
+    ObservationBatch,
+    ObservationProcessingOutput,
+)
+from mindbridge.application.perception import EventPerception, ResolvedEvidence
 from mindbridge.contracts import RecallRequest
 from mindbridge.core import (
-    ClaimType,
     DeletionTombstone,
     DomainInvariantError,
     EmbeddedObjectType,
     EmbeddingRecord,
     EmbeddingSpaceReference,
-    EntityType,
-    Event,
     EvidenceId,
     EvidenceSpan,
     FeedbackId,
     FeedbackType,
-    IdentityMention,
     JobId,
     MediaObject,
     MediaObjectId,
@@ -84,42 +85,6 @@ class ForgetPlan:
 
 
 @dataclass(frozen=True, slots=True)
-class ObservationBatch:
-    """Atomic evidence payload persisted for one observation."""
-
-    media_objects: tuple[MediaObject, ...]
-    observation: Observation
-    evidence_spans: tuple[EvidenceSpan, ...]
-
-
-@dataclass(frozen=True, slots=True)
-class ObservationProcessingOutput:
-    """Derived records committed together with successful job state."""
-
-    events: tuple[Event, ...]
-    memories: tuple[MemoryRecord, ...]
-    embeddings: tuple[EmbeddingRecord, ...]
-    identity_mentions: tuple[IdentityMention, ...] = ()
-
-    def __post_init__(self) -> None:
-        if len(self.events) != len(self.memories):
-            raise DomainInvariantError("each derived event must have one episodic memory")
-        for event, memory in zip(self.events, self.memories, strict=True):
-            if (
-                event.tenant_id != memory.tenant_id
-                or event.description != memory.summary
-                or event.evidence_ids != memory.evidence_ids
-            ):
-                raise DomainInvariantError("derived event and memory provenance must match")
-        embedding_ids = [embedding.embedding_id for embedding in self.embeddings]
-        if len(set(embedding_ids)) != len(embedding_ids):
-            raise DomainInvariantError("derived embedding IDs must be unique")
-        mention_ids = [mention.mention_id for mention in self.identity_mentions]
-        if len(set(mention_ids)) != len(mention_ids):
-            raise DomainInvariantError("derived identity mention IDs must be unique")
-
-
-@dataclass(frozen=True, slots=True)
 class PresignedMediaUpload:
     """A constrained PUT request for one immutable media object."""
 
@@ -143,26 +108,6 @@ class PresignedMediaDownload:
 
     download_url: str
     expires_at: datetime
-
-
-@dataclass(frozen=True, slots=True)
-class ResolvedEvidence:
-    """An exact evidence span joined to openable source media."""
-
-    evidence_span: EvidenceSpan
-    media_object: MediaObject
-    media_url: str
-    media_url_expires_at: datetime
-
-    def __post_init__(self) -> None:
-        if self.evidence_span.tenant_id != self.media_object.tenant_id:
-            raise DomainInvariantError("evidence and media tenants must match")
-        if self.evidence_span.media_object_id != self.media_object.media_object_id:
-            raise DomainInvariantError("evidence must resolve to its referenced media object")
-        if not self.media_url.strip():
-            raise DomainInvariantError("media_url must not be empty")
-        if self.media_url_expires_at.utcoffset() is None:
-            raise DomainInvariantError("media_url_expires_at must be timezone-aware")
 
 
 @dataclass(frozen=True, slots=True)
@@ -194,100 +139,6 @@ class GeneratedAnswer:
             raise DomainInvariantError("confidence must be between 0 and 1")
         if self.answer is None and self.confidence != 0.0:
             raise DomainInvariantError("confidence must be zero when no answer is present")
-
-
-@dataclass(frozen=True, slots=True)
-class PerceivedEvent:
-    """One schema-validated semantic interval proposed by an Omni model."""
-
-    start_ms: int
-    end_ms: int
-    description: str
-    salience: float
-    evidence_ids: tuple[EvidenceId, ...]
-    entities: tuple[PerceivedEntity, ...] = ()
-    claims: tuple[PerceivedClaim, ...] = ()
-
-    def __post_init__(self) -> None:
-        if self.start_ms < 0 or self.end_ms < self.start_ms:
-            raise DomainInvariantError("perceived event time range is invalid")
-        if not self.description.strip():
-            raise DomainInvariantError("perceived event description must not be empty")
-        if not math.isfinite(self.salience) or not 0.0 <= self.salience <= 1.0:
-            raise DomainInvariantError("perceived event salience must be between 0 and 1")
-        if not self.evidence_ids or len(set(self.evidence_ids)) != len(self.evidence_ids):
-            raise DomainInvariantError("perceived event evidence IDs must be non-empty and unique")
-        evidence_ids = set(self.evidence_ids)
-        if any(not set(entity.evidence_ids) <= evidence_ids for entity in self.entities):
-            raise DomainInvariantError("perceived entity evidence must belong to its event")
-        if any(not set(claim.evidence_ids) <= evidence_ids for claim in self.claims):
-            raise DomainInvariantError("perceived claim evidence must belong to its event")
-        if any(
-            index >= len(self.entities) for claim in self.claims for index in claim.entity_indices
-        ):
-            raise DomainInvariantError("perceived claim references an unknown event entity")
-
-
-@dataclass(frozen=True, slots=True)
-class PerceivedEntity:
-    """One named or anonymous semantic entity grounded by Omni evidence."""
-
-    entity_type: EntityType
-    canonical_name: str
-    confidence: float
-    evidence_ids: tuple[EvidenceId, ...]
-
-    def __post_init__(self) -> None:
-        if not self.canonical_name.strip():
-            raise DomainInvariantError("perceived entity name must not be empty")
-        if not math.isfinite(self.confidence) or not 0.0 <= self.confidence <= 1.0:
-            raise DomainInvariantError("perceived entity confidence must be between 0 and 1")
-        if not self.evidence_ids or len(set(self.evidence_ids)) != len(self.evidence_ids):
-            raise DomainInvariantError("perceived entity evidence IDs must be non-empty and unique")
-
-
-@dataclass(frozen=True, slots=True)
-class PerceivedClaim:
-    """One evidence-grounded fact, state, intent, or relation proposed by Omni."""
-
-    claim_type: ClaimType
-    statement: str
-    confidence: float
-    evidence_ids: tuple[EvidenceId, ...]
-    valid_from_ms: int
-    valid_to_ms: int | None
-    entity_indices: tuple[int, ...] = ()
-
-    def __post_init__(self) -> None:
-        if not self.statement.strip():
-            raise DomainInvariantError("perceived claim statement must not be empty")
-        if not math.isfinite(self.confidence) or not 0.0 <= self.confidence <= 1.0:
-            raise DomainInvariantError("perceived claim confidence must be between 0 and 1")
-        if not self.evidence_ids or len(set(self.evidence_ids)) != len(self.evidence_ids):
-            raise DomainInvariantError("perceived claim evidence IDs must be non-empty and unique")
-        if self.valid_from_ms < 0 or (
-            self.valid_to_ms is not None and self.valid_to_ms < self.valid_from_ms
-        ):
-            raise DomainInvariantError("perceived claim validity range is invalid")
-        if any(index < 0 for index in self.entity_indices) or len(set(self.entity_indices)) != len(
-            self.entity_indices
-        ):
-            raise DomainInvariantError(
-                "perceived claim entity indices must be unique and non-negative"
-            )
-
-
-@dataclass(frozen=True, slots=True)
-class EventPerception:
-    """Reproducible event proposals and the frozen model that produced them."""
-
-    events: tuple[PerceivedEvent, ...]
-    model_reference: ModelReference
-    prompt_version: str
-
-    def __post_init__(self) -> None:
-        if not self.prompt_version.strip():
-            raise DomainInvariantError("perception prompt version must not be empty")
 
 
 @dataclass(frozen=True, slots=True)

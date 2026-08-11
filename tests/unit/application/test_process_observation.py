@@ -1,5 +1,6 @@
 """Vertical unit checks for retry-safe observation processing."""
 
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -8,6 +9,8 @@ from mindbridge.application import (
     EventPerception,
     ObservationBatch,
     ObservationProcessingOutput,
+    PerceivedClaim,
+    PerceivedEntity,
     PerceivedEvent,
     PresignedMediaDownload,
     ProcessObservation,
@@ -15,9 +18,12 @@ from mindbridge.application import (
 )
 from mindbridge.core import (
     AnonymousIdentityObservation,
+    ClaimType,
     DeviceId,
+    DomainInvariantError,
     EmbeddedObjectType,
     EmbeddingSpaceReference,
+    EntityType,
     EvidenceId,
     EvidenceSpan,
     IdentityKind,
@@ -32,6 +38,7 @@ from mindbridge.core import (
     ObservationId,
     ObservationJobClaim,
     ObservationProcessingJob,
+    RelationType,
     SensorKind,
     TenantId,
 )
@@ -117,6 +124,31 @@ class RecordingPerceiver:
                     description="A person places a red tool beside a blue toolbox.",
                     salience=0.8,
                     evidence_ids=(EvidenceId("evidence_01"),),
+                    entities=(
+                        PerceivedEntity(
+                            entity_type=EntityType.OBJECT,
+                            canonical_name="red tool",
+                            confidence=0.94,
+                            evidence_ids=(EvidenceId("evidence_01"),),
+                        ),
+                        PerceivedEntity(
+                            entity_type=EntityType.OBJECT,
+                            canonical_name="blue toolbox",
+                            confidence=0.91,
+                            evidence_ids=(EvidenceId("evidence_01"),),
+                        ),
+                    ),
+                    claims=(
+                        PerceivedClaim(
+                            claim_type=ClaimType.RELATION,
+                            statement="The red tool is beside the blue toolbox.",
+                            confidence=0.88,
+                            evidence_ids=(EvidenceId("evidence_01"),),
+                            valid_from_ms=500,
+                            valid_to_ms=3_500,
+                            entity_indices=(0, 1),
+                        ),
+                    ),
                 ),
             ),
             model_reference=ModelReference(
@@ -151,6 +183,22 @@ class RecordingEmbedder:
         return ((1.0, 0.0),) * len(inputs)
 
 
+class RecordingTextEmbedder:
+    model_reference = ModelReference(model_id="jina-text", revision="text-revision-01")
+    space_reference = EmbeddingSpaceReference(space_id="jina-v5", revision="space-v1")
+    dimension = 2
+
+    def __init__(self) -> None:
+        self.documents: tuple[str, ...] = ()
+
+    async def encode_documents(
+        self,
+        texts: tuple[str, ...],
+    ) -> tuple[tuple[float, ...], ...]:
+        self.documents = texts
+        return ((1.0, 0.0),) * len(texts)
+
+
 class DeterministicSigner:
     async def create_presigned_download(
         self,
@@ -167,7 +215,8 @@ async def test_processor_builds_event_memory_and_raw_media_embedding_once() -> N
     store = RecordingProcessingStore()
     perceiver = RecordingPerceiver()
     embedder = RecordingEmbedder()
-    processor = _processor(store, perceiver, embedder)
+    text_embedder = RecordingTextEmbedder()
+    processor = _processor(store, perceiver, embedder, text_embedder)
 
     first = await processor.run(TENANT_ID, OBSERVATION_ID, JOB_ID)
     duplicate = await processor.run(TENANT_ID, OBSERVATION_ID, JOB_ID)
@@ -181,11 +230,78 @@ async def test_processor_builds_event_memory_and_raw_media_embedding_once() -> N
     assert store.output.memories[0].summary == store.output.events[0].description
     assert store.output.embeddings[0].object_type is EmbeddedObjectType.EVIDENCE_SPAN
     assert store.output.embeddings[0].object_id == "evidence_01"
-    assert len(store.output.identity_mentions) == 1
-    mention = store.output.identity_mentions[0]
-    assert mention.identity_id == "person_robot_01"
-    assert mention.event_id == store.output.events[0].event_id
-    assert mention.evidence_id == "evidence_01"
+    assert tuple(
+        embedding.object_id
+        for embedding in store.output.embeddings
+        if embedding.object_type is EmbeddedObjectType.EVIDENCE_SPAN
+    ) == ("evidence_01", "evidence_unused")
+    assert text_embedder.documents == (
+        "A person places a red tool beside a blue toolbox.",
+        "The red tool is beside the blue toolbox.",
+    )
+    assert {embedding.object_type for embedding in store.output.embeddings} == {
+        EmbeddedObjectType.EVIDENCE_SPAN,
+        EmbeddedObjectType.EVENT,
+        EmbeddedObjectType.CLAIM,
+    }
+    assert len(store.output.entities) == 3
+    assert len(store.output.entity_mentions) == 3
+    assert len(store.output.claims) == 1
+    assert len(store.output.memories) == 2
+    assert len(store.output.relations) == 8
+    identity_mention = next(
+        mention
+        for mention in store.output.entity_mentions
+        if mention.entity_id == "person_robot_01"
+    )
+    assert identity_mention.event_id == store.output.events[0].event_id
+    assert identity_mention.evidence_id == "evidence_01"
+
+
+async def test_processing_output_rejects_a_graph_without_event_memory_link() -> None:
+    store = RecordingProcessingStore()
+    await _processor(
+        store,
+        RecordingPerceiver(),
+        RecordingEmbedder(),
+        RecordingTextEmbedder(),
+    ).run(TENANT_ID, OBSERVATION_ID, JOB_ID)
+    assert store.output is not None
+    relations = tuple(
+        relation
+        for relation in store.output.relations
+        if not (
+            relation.relation_type is RelationType.REPRESENTED_BY
+            and relation.source_id == store.output.events[0].event_id
+        )
+    )
+
+    with pytest.raises(DomainInvariantError, match="one-to-one"):
+        replace(store.output, relations=relations)
+
+
+def test_event_perception_rejects_an_unbounded_detail_fanout() -> None:
+    entity = PerceivedEntity(
+        entity_type=EntityType.OBJECT,
+        canonical_name="tool",
+        confidence=0.9,
+        evidence_ids=(EvidenceId("evidence_01"),),
+    )
+    event = PerceivedEvent(
+        start_ms=0,
+        end_ms=1_000,
+        description="A bounded event",
+        salience=0.5,
+        evidence_ids=(EvidenceId("evidence_01"),),
+        entities=(entity,) * 64,
+    )
+
+    with pytest.raises(DomainInvariantError, match="entity count"):
+        EventPerception(
+            events=(event,) * 5,
+            model_reference=ModelReference(model_id="omni", revision="revision-01"),
+            prompt_version="perceive_events_v3",
+        )
 
 
 async def test_processor_records_sanitized_failure_state() -> None:
@@ -195,6 +311,7 @@ async def test_processor_records_sanitized_failure_state() -> None:
         store,
         RecordingPerceiver(ModelUnavailableError("secret provider detail")),
         RecordingEmbedder(),
+        RecordingTextEmbedder(),
     )
 
     with pytest.raises(ModelUnavailableError, match="secret provider detail"):
@@ -208,11 +325,13 @@ def _processor(
     store: RecordingProcessingStore,
     perceiver: RecordingPerceiver,
     embedder: RecordingEmbedder,
+    text_embedder: RecordingTextEmbedder,
 ) -> ProcessObservation:
     return ProcessObservation(
         store,
         perceiver,
         embedder,
+        text_embedder,
         media_url_signer=DeterministicSigner(),
     )
 
@@ -262,6 +381,15 @@ def _batch() -> ObservationBatch:
         evidence_spans=(
             EvidenceSpan(
                 evidence_id=EvidenceId("evidence_01"),
+                tenant_id=TENANT_ID,
+                observation_id=OBSERVATION_ID,
+                media_object_id=media_id,
+                start_ms=0,
+                end_ms=4_000,
+                created_at=NOW,
+            ),
+            EvidenceSpan(
+                evidence_id=EvidenceId("evidence_unused"),
                 tenant_id=TENANT_ID,
                 observation_id=OBSERVATION_ID,
                 media_object_id=media_id,

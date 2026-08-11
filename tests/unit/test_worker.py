@@ -26,6 +26,7 @@ def test_worker_settings_pin_models_and_redact_credentials() -> None:
     assert "database-secret" not in repr(settings)
     assert "broker-secret" not in repr(settings)
     assert "vlm-secret" not in repr(settings)
+    assert "text-embedding-secret" not in repr(settings)
 
 
 def test_worker_settings_require_explicit_vlm_revision() -> None:
@@ -99,6 +100,8 @@ def _environment() -> Mapping[str, str]:
         "MINDBRIDGE_VLM_API_KEY": "vlm-secret",
         "MINDBRIDGE_VLM_ENDPOINT": "https://vlm.example.test/api/v1/chat/completions",
         "MINDBRIDGE_VLM_MODEL_REVISION": "deployment-2026-08-11",
+        "MINDBRIDGE_TEXT_EMBEDDING_API_KEY": "text-embedding-secret",
+        "MINDBRIDGE_TEXT_EMBEDDING_ENDPOINT": "https://text.example.test/api/v1/embeddings",
     }
 
 

@@ -275,6 +275,14 @@ M3-Agent 的 30 秒切片可作为首个 Benchmark 基线，但最终边界由�
 
 ASR、OCR 和 caption 是可检索视图，不是原始经历的替代品。遇到召回问题时，系统应回看媒体，而不是仅让文本 LLM 阅读 caption。
 
+当前在线构建路径在一次冻结 Omni 调用中同时提取 Event、Entity 和 Claim；EntityMention 与
+Claim 必须引用 Event 内的 EvidenceSpan，Claim 的有效时间必须落在 Event 内。Worker 随后用
+Jina Omni Small 编码原始 EvidenceSpan，用同一兼容空间的 Jina Text Small 批量编码 Event 描述
+和 Claim 陈述，并在一个 PostgreSQL 事务中写入 Event、Entity、EntityMention、Claim、
+MemoryRecord、类型关系、向量和成功 Job 状态。任何模型输出越界、关系悬空、版本冲突或向量错误
+都会回滚整批派生数据；重试使用稳定 ID 且不会合并不同的证据集合。跨 Event 实体消歧、Episode
+合并和多次经历归纳属于后续 Consolidation，不在在线写入路径中凭名称猜测。
+
 ### 5.4 幂等和可恢复性
 
 - 每个 Observation 使用 `tenant_id + device_id + boot_id + sequence` 构造稳定幂等键；
@@ -335,9 +343,10 @@ MindBridge 采用“明确默认、保存版本、允许重建”的策略。模
 - 切换模型时创建新向量版本并后台重建，不原地混用不同空间。
 
 生产实现将编码器放在不同进程中，但严格声明同一冻结兼容空间：Memory Worker 通过 Hugging Face
-`sentence-transformers` 的 `encode_document()` 生成 EvidenceSpan 向量；API 通过独立 vLLM
-OpenAI-compatible endpoint 使用 Omni Small 生成 query 向量，并使用 Text Small 生成显式记忆
-document 向量。Omni 固定 revision `12949877f0092093f366c6450340011320152a05`，Text Small
+`sentence-transformers` 的 `encode_document()` 生成 EvidenceSpan 向量，并通过独立 vLLM
+OpenAI-compatible endpoint 用 Text Small 批量生成 Event/Claim document 向量；API 通过 Omni
+Small endpoint 生成 query 向量，并用同一个 Text Small 服务编码显式记忆。Omni 固定 revision
+`12949877f0092093f366c6450340011320152a05`，Text Small
 固定 revision `6856e76bb72982e58de0620458a4e8b3614da340`。文本请求使用 OpenAI SDK 的
 `embeddings.create()`；SDK 尚未声明类型的多模态 `messages` 也只通过同一 SDK 的低层
 `post()` 发送，不另写 HTTP 客户端。数据库按 `space_id/space_revision` 检索、按
@@ -931,9 +940,9 @@ Worker 通过 `mindbridge.celery_app:app` 启动，Redis 消息只传
 `tenant_id`、`observation_id`、`job_id`。原始媒体、Evidence 和任务状态均以 PostgreSQL/S3
 为事实来源。每个 prefork child 只加载一个固定 revision 的 Jina v5 Omni；默认并发为 1，
 多 GPU 通过每张卡一个 Worker 进程扩展，避免一个模型被 CPU 核数意外复制。API 进程不导入
-或加载 Jina，而是用 OpenAI SDK 调用 Omni-query 与 Text-document 两个独立的兼容端点。VLM、
-两个 Jina revision 和共享空间 revision 必须由部署配置固定并写入派生记录；凭证只从进程环境或
-基础设施 secret 注入。
+或加载 Jina；API 与 Worker 都用 OpenAI SDK 调用所需的 Omni-query 或 Text-document 兼容端点，
+不自行拼装 HTTP 请求。VLM、两个 Jina revision 和共享空间 revision 必须由部署配置固定并写入
+派生记录；凭证只从进程环境或基础设施 secret 注入。
 
 ### 12.2 推荐代码边界
 

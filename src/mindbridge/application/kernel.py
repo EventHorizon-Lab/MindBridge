@@ -8,13 +8,13 @@ import math
 from collections.abc import Callable
 from datetime import datetime, timezone
 
+from mindbridge.application.observation_processing import ObservationBatch
 from mindbridge.application.ports import (
     EmbeddingIndex,
     MediaDeleter,
     MediaUrlSigner,
     MemoryAnswerer,
     MemoryStore,
-    ObservationBatch,
     ObservationJobPublisher,
 )
 from mindbridge.application.recall import (

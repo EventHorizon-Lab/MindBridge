@@ -40,8 +40,11 @@ from mindbridge.models import (
     DEFAULT_JINA_OMNI_MODEL_ID,
     DEFAULT_JINA_OMNI_REVISION,
     DEFAULT_JINA_RETRIEVAL_SPACE,
+    DEFAULT_JINA_TEXT_MODEL_ID,
+    DEFAULT_JINA_TEXT_REVISION,
     DEFAULT_OMNI_MODEL_ID,
     JinaOmniEmbedder,
+    OpenAIJinaTextEmbedder,
     OpenAIOmniEventPerceiver,
 )
 from mindbridge.telemetry import configure_telemetry
@@ -71,11 +74,15 @@ class WorkerSettings:
     vlm_api_key: str = field(repr=False)
     vlm_endpoint: str
     vlm_model_revision: str
+    text_embedding_api_key: str = field(repr=False)
+    text_embedding_endpoint: str
     object_storage_endpoint_url: str | None = None
     object_storage_region: str = "us-east-1"
     vlm_model_id: str = DEFAULT_OMNI_MODEL_ID
     jina_model_id: str = DEFAULT_JINA_OMNI_MODEL_ID
     jina_model_revision: str = DEFAULT_JINA_OMNI_REVISION
+    text_embedding_model_id: str = DEFAULT_JINA_TEXT_MODEL_ID
+    text_embedding_model_revision: str = DEFAULT_JINA_TEXT_REVISION
     embedding_space_id: str = DEFAULT_JINA_RETRIEVAL_SPACE.space_id
     embedding_space_revision: str = DEFAULT_JINA_RETRIEVAL_SPACE.revision
     jina_device: str | None = None
@@ -90,6 +97,10 @@ class WorkerSettings:
             ("vlm_endpoint", self.vlm_endpoint),
             ("vlm_model_id", self.vlm_model_id),
             ("vlm_model_revision", self.vlm_model_revision),
+            ("text_embedding_api_key", self.text_embedding_api_key),
+            ("text_embedding_endpoint", self.text_embedding_endpoint),
+            ("text_embedding_model_id", self.text_embedding_model_id),
+            ("text_embedding_model_revision", self.text_embedding_model_revision),
             ("jina_model_id", self.jina_model_id),
             ("jina_model_revision", self.jina_model_revision),
             ("embedding_space_id", self.embedding_space_id),
@@ -122,6 +133,18 @@ class WorkerSettings:
             vlm_endpoint=require_environment_value(source, "MINDBRIDGE_VLM_ENDPOINT"),
             vlm_model_id=source.get("MINDBRIDGE_VLM_MODEL_ID", DEFAULT_OMNI_MODEL_ID),
             vlm_model_revision=require_environment_value(source, "MINDBRIDGE_VLM_MODEL_REVISION"),
+            text_embedding_api_key=require_environment_value(
+                source, "MINDBRIDGE_TEXT_EMBEDDING_API_KEY"
+            ),
+            text_embedding_endpoint=require_environment_value(
+                source, "MINDBRIDGE_TEXT_EMBEDDING_ENDPOINT"
+            ),
+            text_embedding_model_id=source.get(
+                "MINDBRIDGE_TEXT_EMBEDDING_MODEL_ID", DEFAULT_JINA_TEXT_MODEL_ID
+            ),
+            text_embedding_model_revision=source.get(
+                "MINDBRIDGE_TEXT_EMBEDDING_MODEL_REVISION", DEFAULT_JINA_TEXT_REVISION
+            ),
             jina_model_id=source.get("MINDBRIDGE_JINA_MODEL_ID", DEFAULT_JINA_OMNI_MODEL_ID),
             jina_model_revision=source.get(
                 "MINDBRIDGE_JINA_MODEL_REVISION", DEFAULT_JINA_OMNI_REVISION
@@ -210,14 +233,27 @@ async def _process_observation_once(
         model_revision=settings.vlm_model_revision,
         request_timeout_seconds=_MODEL_REQUEST_TIMEOUT_SECONDS,
     )
+    text_embedder = OpenAIJinaTextEmbedder.connect(
+        api_key=settings.text_embedding_api_key,
+        endpoint=settings.text_embedding_endpoint,
+        model_id=settings.text_embedding_model_id,
+        model_revision=settings.text_embedding_model_revision,
+        space_reference=EmbeddingSpaceReference(
+            space_id=settings.embedding_space_id,
+            revision=settings.embedding_space_revision,
+        ),
+        request_timeout_seconds=_MODEL_REQUEST_TIMEOUT_SECONDS,
+    )
     async with AsyncExitStack() as resources:
         resources.push_async_callback(perceiver.close)
+        resources.push_async_callback(text_embedder.close)
         await store.open()
         resources.push_async_callback(store.close)
         job = await ProcessObservation(
             store,
             perceiver,
             embedder,
+            text_embedder,
             media_url_signer=media_access,
         ).run(tenant_id, observation_id, job_id)
     return job.state

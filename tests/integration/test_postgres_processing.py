@@ -13,6 +13,8 @@ from mindbridge.application import (
     EventPerception,
     ObservationBatch,
     ObservationProcessingOutput,
+    PerceivedClaim,
+    PerceivedEntity,
     PerceivedEvent,
     PresignedMediaDownload,
     ProcessObservation,
@@ -21,9 +23,11 @@ from mindbridge.application import (
 from mindbridge.contracts import RecallFilters, RecallQuery, RecallRequest
 from mindbridge.core import (
     AnonymousIdentityObservation,
+    ClaimType,
     DeviceId,
     DomainInvariantError,
     EmbeddingSpaceReference,
+    EntityType,
     EvidenceId,
     EvidenceSpan,
     IdentityKind,
@@ -47,7 +51,7 @@ EMBEDDING_MODEL = ModelReference(
     model_id="jinaai/jina-embeddings-v5-omni-small-retrieval",
     revision="12949877f0092093f366c6450340011320152a05",
 )
-DerivedCounts: TypeAlias = tuple[int, int, int, int, int, int, int, int, int]
+DerivedCounts: TypeAlias = tuple[int, int, int, int, int, int, int, int, int, int, int]
 
 pytestmark = pytest.mark.integration
 
@@ -72,10 +76,35 @@ class RecordingPerceiver:
                     description="A person places a red tool beside a blue toolbox.",
                     salience=0.8,
                     evidence_ids=(evidence[0].evidence_span.evidence_id,),
+                    entities=(
+                        PerceivedEntity(
+                            entity_type=EntityType.OBJECT,
+                            canonical_name="red tool",
+                            confidence=0.94,
+                            evidence_ids=(evidence[0].evidence_span.evidence_id,),
+                        ),
+                        PerceivedEntity(
+                            entity_type=EntityType.OBJECT,
+                            canonical_name="blue toolbox",
+                            confidence=0.91,
+                            evidence_ids=(evidence[0].evidence_span.evidence_id,),
+                        ),
+                    ),
+                    claims=(
+                        PerceivedClaim(
+                            claim_type=ClaimType.RELATION,
+                            statement="The red tool is beside the blue toolbox.",
+                            confidence=0.88,
+                            evidence_ids=(evidence[0].evidence_span.evidence_id,),
+                            valid_from_ms=500,
+                            valid_to_ms=3_500,
+                            entity_indices=(0, 1),
+                        ),
+                    ),
                 ),
             ),
             model_reference=MODEL,
-            prompt_version="perceive_events_v1",
+            prompt_version="perceive_events_v3",
         )
 
 
@@ -107,6 +136,26 @@ class FixedEmbedder:
         return (vector,) * count
 
 
+class FixedTextEmbedder:
+    model_reference = ModelReference(
+        model_id="jinaai/jina-embeddings-v5-text-small-retrieval",
+        revision="6856e76bb72982e58de0620458a4e8b3614da340",
+    )
+    space_reference = EmbeddingSpaceReference(space_id="jina-v5", revision="space-v1")
+    dimension = 1_024
+
+    def __init__(self) -> None:
+        self.documents: tuple[str, ...] = ()
+
+    async def encode_documents(
+        self,
+        texts: tuple[str, ...],
+    ) -> tuple[tuple[float, ...], ...]:
+        self.documents = texts
+        vector = (1.0,) + (0.0,) * (self.dimension - 1)
+        return (vector,) * len(texts)
+
+
 class DeterministicSigner:
     """Keep processing integration independent from an S3 service."""
 
@@ -130,10 +179,12 @@ async def test_processing_commits_provenance_once(
     )
     perceiver = RecordingPerceiver()
     embedder = FixedEmbedder()
+    text_embedder = FixedTextEmbedder()
     processor = ProcessObservation(
         store,
         perceiver,
         embedder,
+        text_embedder,
         media_url_signer=DeterministicSigner(),
     )
 
@@ -144,13 +195,42 @@ async def test_processing_commits_provenance_once(
     assert duplicate.state is JobState.SUCCEEDED
     assert perceiver.calls == 1
     assert embedder.documents == ("https://objects.example.test/media_01.mp4",)
-    assert await _derived_counts(database_url, tenant_id) == (1,) * 9
+    assert text_embedder.documents == (
+        "A person places a red tool beside a blue toolbox.",
+        "The red tool is beside the blue toolbox.",
+    )
+    assert await _derived_counts(database_url, tenant_id) == (
+        1,
+        1,
+        1,
+        2,
+        2,
+        8,
+        3,
+        3,
+        3,
+        1,
+        1,
+    )
     assert await _job_state(database_url, tenant_id, job_id) == ("succeeded", 1, None)
     assert await _event_provenance(database_url, tenant_id) == (
         "A person places a red tool beside a blue toolbox.",
         "qwen3.8-max",
         "serving-revision-01",
-        "perceive_events_v1",
+        "perceive_events_v3",
+    )
+    assert await _claim_provenance(database_url, tenant_id) == (
+        "relation",
+        "The red tool is beside the blue toolbox.",
+        "qwen3.8-max",
+        "serving-revision-01",
+        "perceive_events_v3",
+    )
+    assert await _relation_counts(database_url, tenant_id) == (
+        ("about", 2),
+        ("asserts", 1),
+        ("mentions", 3),
+        ("represented_by", 2),
     )
     evidence_id = (
         (await store.read_observation_batch(tenant_id, observation_id))
@@ -184,9 +264,15 @@ async def test_processing_commits_provenance_once(
         limit=20,
     )
 
-    assert dense_candidates[0].summary == "A person places a red tool beside a blue toolbox."
+    assert {memory.summary for memory in dense_candidates} == {
+        "A person places a red tool beside a blue toolbox.",
+        "The red tool is beside the blue toolbox.",
+    }
     assert filtered_candidates == ()
-    assert person_candidates[0].memory_id == dense_candidates[0].memory_id
+    assert any(
+        memory.summary == "A person places a red tool beside a blue toolbox."
+        for memory in person_candidates
+    )
 
 
 async def test_processing_rolls_back_derived_records_before_retry(
@@ -201,13 +287,14 @@ async def test_processing_rolls_back_derived_records_before_retry(
         store,
         RecordingPerceiver(),
         FixedEmbedder(dimension=2),
+        FixedTextEmbedder(),
         media_url_signer=DeterministicSigner(),
     )
 
     with pytest.raises(DomainInvariantError, match="cloud embedding dimension"):
         await failing.run(tenant_id, observation_id, job_id)
 
-    assert await _derived_counts(database_url, tenant_id) == (0,) * 9
+    assert await _derived_counts(database_url, tenant_id) == (0,) * 11
     assert await _job_state(database_url, tenant_id, job_id) == (
         "failed",
         1,
@@ -218,12 +305,25 @@ async def test_processing_rolls_back_derived_records_before_retry(
         store,
         RecordingPerceiver(),
         FixedEmbedder(),
+        FixedTextEmbedder(),
         media_url_signer=DeterministicSigner(),
     ).run(tenant_id, observation_id, job_id)
 
     assert succeeded.state is JobState.SUCCEEDED
     assert succeeded.attempt == 2
-    assert await _derived_counts(database_url, tenant_id) == (1,) * 9
+    assert await _derived_counts(database_url, tenant_id) == (
+        1,
+        1,
+        1,
+        2,
+        2,
+        8,
+        3,
+        3,
+        3,
+        1,
+        1,
+    )
 
 
 async def test_superseded_attempt_cannot_commit(
@@ -250,7 +350,15 @@ async def test_superseded_attempt_cannot_commit(
             observation_id,
             job_id,
             attempt=first.job.attempt,
-            output=ObservationProcessingOutput(events=(), memories=(), embeddings=()),
+            output=ObservationProcessingOutput(
+                events=(),
+                entities=(),
+                entity_mentions=(),
+                claims=(),
+                memories=(),
+                relations=(),
+                embeddings=(),
+            ),
         )
 
     assert first.job.attempt == 1
@@ -339,9 +447,11 @@ async def _derived_counts(database_url: str, tenant_id: TenantId) -> DerivedCoun
                     (SELECT count(*) FROM relations WHERE tenant_id = %s),
                     (SELECT count(*) FROM embeddings WHERE tenant_id = %s),
                     (SELECT count(*) FROM entities WHERE tenant_id = %s),
-                    (SELECT count(*) FROM entity_mentions WHERE tenant_id = %s)
+                    (SELECT count(*) FROM entity_mentions WHERE tenant_id = %s),
+                    (SELECT count(*) FROM claims WHERE tenant_id = %s),
+                    (SELECT count(*) FROM claim_evidence WHERE tenant_id = %s)
                 """,
-                (tenant_id,) * 9,
+                (tenant_id,) * 11,
             )
         ).fetchone()
     return cast(DerivedCounts, row)
@@ -398,3 +508,39 @@ async def _event_provenance(
             )
         ).fetchone()
     return cast(tuple[str, str, str, str], row)
+
+
+async def _claim_provenance(
+    database_url: str,
+    tenant_id: TenantId,
+) -> tuple[str, str, str, str, str]:
+    connection = await AsyncConnection.connect(database_url)
+    async with connection:
+        row = await (
+            await connection.execute(
+                """
+                SELECT claim_type, statement, model_id, model_revision, prompt_version
+                FROM claims WHERE tenant_id = %s
+                """,
+                (tenant_id,),
+            )
+        ).fetchone()
+    return cast(tuple[str, str, str, str, str], row)
+
+
+async def _relation_counts(
+    database_url: str,
+    tenant_id: TenantId,
+) -> tuple[tuple[str, int], ...]:
+    connection = await AsyncConnection.connect(database_url)
+    async with connection:
+        cursor = await connection.execute(
+            """
+            SELECT relation_type, count(*)
+            FROM relations WHERE tenant_id = %s
+            GROUP BY relation_type ORDER BY relation_type
+            """,
+            (tenant_id,),
+        )
+        rows = tuple([cast(tuple[str, int], row) async for row in cursor])
+    return rows

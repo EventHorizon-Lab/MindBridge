@@ -8,11 +8,11 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from mindbridge.application.evidence import read_resolved_memory_evidence
+from mindbridge.application.perception import ResolvedEvidence
 from mindbridge.application.ports import (
     MediaUrlSigner,
     MemoryAnswerer,
     MemoryStore,
-    ResolvedEvidence,
     ResolvedQueryMedia,
 )
 from mindbridge.contracts import RecallRequest

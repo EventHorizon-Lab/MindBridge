@@ -387,9 +387,10 @@ vllm serve jinaai/jina-embeddings-v5-text-small-retrieval \
 
 ## Run the memory Worker
 
-The Worker shares the storage variables above and additionally pins the fallback VLM revision. Jina
-v5 Omni Small is pinned by default; set `MINDBRIDGE_JINA_DEVICE` only when automatic device selection
-is unsuitable:
+The Worker shares the storage, VLM, and Text Small endpoint variables above. It inspects original AV
+once, writes evidence-grounded Event/Entity/Claim graph records atomically, encodes raw evidence with
+the pinned local Jina v5 Omni Small model, and batches Event/Claim text through the OpenAI-compatible
+Text Small endpoint. Set `MINDBRIDGE_JINA_DEVICE` only when automatic device selection is unsuitable:
 
 ```bash
 export MINDBRIDGE_VLM_MODEL_REVISION=deployment-2026-08-11
