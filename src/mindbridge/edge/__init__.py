@@ -1,6 +1,7 @@
 """Durable capture and synchronization primitives for Jetson and robot hosts."""
 
 from mindbridge.edge.capture import enqueue_captured_video
+from mindbridge.edge.deletion_inbox import SQLiteDeletionInbox
 from mindbridge.edge.outbox import (
     EdgeMediaFile,
     EdgeObservationOutboxItem,
@@ -15,6 +16,7 @@ __all__ = [
     "EdgeObservationSynchronizer",
     "EdgeSyncWatermark",
     "S3EdgeMediaUploader",
+    "SQLiteDeletionInbox",
     "SQLiteObservationOutbox",
     "enqueue_captured_video",
 ]

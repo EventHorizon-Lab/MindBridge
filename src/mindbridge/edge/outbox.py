@@ -13,9 +13,16 @@ from typing import Annotated
 from pydantic import StringConstraints, TypeAdapter, model_validator
 
 from mindbridge.contracts import ContractModel, Identifier, ObservationReceipt, ObserveRequest
-from mindbridge.core import IdempotencyConflictError, MemoryIntegrityError, derive_stable_id
+from mindbridge.core import (
+    IdempotencyConflictError,
+    MemoryDeletedError,
+    MemoryIntegrityError,
+    derive_observation_id,
+    derive_stable_id,
+)
+from mindbridge.edge.deletion_inbox import initialize_deletion_tables
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 
 
 class EdgeMediaFile(ContractModel):
@@ -102,10 +109,25 @@ class SQLiteObservationOutbox:
             request.boot_id,
             str(request.sequence),
         )
+        observation_id = derive_observation_id(
+            request.tenant_id,
+            request.device_id,
+            request.boot_id,
+            request.sequence,
+        )
         request_json = request.model_dump_json()
         media_files_json = _MEDIA_FILES.dump_json(media_files).decode("utf-8")
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            tombstone = connection.execute(
+                """
+                SELECT 1 FROM edge_deletion_tombstones
+                WHERE tenant_id = ? AND target_type = 'observation' AND target_id = ?
+                """,
+                (request.tenant_id, observation_id),
+            ).fetchone()
+            if tombstone is not None:
+                raise MemoryDeletedError("edge observation was explicitly forgotten")
             watermark = connection.execute(
                 """
                 SELECT sequence
@@ -161,6 +183,23 @@ class SQLiteObservationOutbox:
                     request_json,
                     media_files_json,
                     self._now().isoformat(),
+                ),
+            )
+            connection.executemany(
+                """
+                INSERT INTO edge_observation_media (
+                    tenant_id, observation_id, media_object_id, local_path
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT DO NOTHING
+                """,
+                (
+                    (
+                        request.tenant_id,
+                        observation_id,
+                        media_file.media_object_id,
+                        str(media_file.local_path),
+                    )
+                    for media_file in media_files
                 ),
             )
         return True
@@ -312,7 +351,7 @@ class SQLiteObservationOutbox:
     def _initialize(self) -> None:
         with self._connect() as connection:
             version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-            if version not in {0, _SCHEMA_VERSION}:
+            if version not in {0, 1, _SCHEMA_VERSION}:
                 raise RuntimeError(f"unsupported edge outbox schema version {version}")
             connection.executescript(
                 """
@@ -343,6 +382,8 @@ class SQLiteObservationOutbox:
                 );
                 """
             )
+            initialize_deletion_tables(connection)
+            self._backfill_observation_media(connection)
             connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
         os.chmod(self._database_path, 0o600)
 
@@ -352,6 +393,38 @@ class SQLiteObservationOutbox:
         connection.execute("PRAGMA journal_mode = WAL")
         connection.execute("PRAGMA synchronous = FULL")
         return connection
+
+    @staticmethod
+    def _backfill_observation_media(connection: sqlite3.Connection) -> None:
+        rows = connection.execute(
+            "SELECT request_json, media_files_json FROM edge_observation_outbox"
+        ).fetchall()
+        for row in rows:
+            request = ObserveRequest.model_validate_json(row["request_json"])
+            media_files = _MEDIA_FILES.validate_json(row["media_files_json"])
+            observation_id = derive_observation_id(
+                request.tenant_id,
+                request.device_id,
+                request.boot_id,
+                request.sequence,
+            )
+            connection.executemany(
+                """
+                INSERT INTO edge_observation_media (
+                    tenant_id, observation_id, media_object_id, local_path
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT DO NOTHING
+                """,
+                (
+                    (
+                        request.tenant_id,
+                        observation_id,
+                        media_file.media_object_id,
+                        str(media_file.local_path),
+                    )
+                    for media_file in media_files
+                ),
+            )
 
     def _now(self) -> datetime:
         now = self._clock()
