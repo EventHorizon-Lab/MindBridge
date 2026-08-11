@@ -26,6 +26,10 @@ uv run pytest -W error
 git diff --check
 ```
 
+`tests/benchmarks/golden_recall.json` is the deterministic retrieval gate. It exercises dense
+evidence recall, exact text recall, temporal exclusion, and unsupported-query abstention through
+the production kernel and PostgreSQL/pgvector path; the normal integration test command runs it.
+
 ## Local PostgreSQL
 
 The production store uses PostgreSQL 18 with pgvector. Start the pinned development database and
