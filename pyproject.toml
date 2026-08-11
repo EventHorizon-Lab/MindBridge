@@ -1,0 +1,45 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mindbridge"
+version = "0.1.0"
+description = "Agentic-native embodied memory as a service"
+readme = "README.md"
+requires-python = ">=3.10,<3.12"
+license = "Apache-2.0"
+dependencies = [
+    "pydantic>=2.10,<3",
+]
+
+[dependency-groups]
+dev = [
+    "mypy>=1.15,<3",
+    "pytest>=8,<10",
+    "pytest-asyncio>=0.24,<2",
+    "ruff>=0.11,<1",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mindbridge"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["ANN", "ASYNC", "B", "C4", "C90", "DTZ", "E4", "E7", "E9", "F", "I", "RUF", "SIM", "UP"]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 10
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+files = ["src", "tests"]
+
+[tool.pytest.ini_options]
+addopts = ["--strict-config", "--strict-markers", "-ra"]
+testpaths = ["tests"]
+asyncio_mode = "auto"
