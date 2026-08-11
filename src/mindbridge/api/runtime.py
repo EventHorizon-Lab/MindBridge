@@ -17,7 +17,13 @@ from mindbridge.infrastructure import (
     S3MediaAccess,
     create_task_queue,
 )
-from mindbridge.models import DEFAULT_OMNI_MODEL_ID, OpenAIOmniAnswerer
+from mindbridge.models import (
+    DEFAULT_JINA_OMNI_MODEL_ID,
+    DEFAULT_JINA_OMNI_REVISION,
+    DEFAULT_OMNI_MODEL_ID,
+    OpenAIJinaQueryEmbedder,
+    OpenAIOmniAnswerer,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -28,10 +34,14 @@ class RuntimeSettings:
     object_storage_bucket: str
     vlm_api_key: str = field(repr=False)
     vlm_endpoint: str
+    embedding_api_key: str = field(repr=False)
+    embedding_endpoint: str
     task_broker_url: str = field(repr=False)
     object_storage_endpoint_url: str | None = None
     object_storage_region: str = "us-east-1"
     vlm_model_id: str = DEFAULT_OMNI_MODEL_ID
+    embedding_model_id: str = DEFAULT_JINA_OMNI_MODEL_ID
+    embedding_model_revision: str = DEFAULT_JINA_OMNI_REVISION
 
     def __post_init__(self) -> None:
         for name, value in (
@@ -42,6 +52,10 @@ class RuntimeSettings:
             ("vlm_api_key", self.vlm_api_key),
             ("vlm_endpoint", self.vlm_endpoint),
             ("vlm_model_id", self.vlm_model_id),
+            ("embedding_api_key", self.embedding_api_key),
+            ("embedding_endpoint", self.embedding_endpoint),
+            ("embedding_model_id", self.embedding_model_id),
+            ("embedding_model_revision", self.embedding_model_revision),
         ):
             if not value.strip():
                 raise ValueError(f"{name} must not be empty")
@@ -67,6 +81,14 @@ class RuntimeSettings:
             vlm_api_key=_required(source, "MINDBRIDGE_VLM_API_KEY"),
             vlm_endpoint=_required(source, "MINDBRIDGE_VLM_ENDPOINT"),
             vlm_model_id=source.get("MINDBRIDGE_VLM_MODEL_ID", DEFAULT_OMNI_MODEL_ID),
+            embedding_api_key=_required(source, "MINDBRIDGE_EMBEDDING_API_KEY"),
+            embedding_endpoint=_required(source, "MINDBRIDGE_EMBEDDING_ENDPOINT"),
+            embedding_model_id=source.get(
+                "MINDBRIDGE_EMBEDDING_MODEL_ID", DEFAULT_JINA_OMNI_MODEL_ID
+            ),
+            embedding_model_revision=source.get(
+                "MINDBRIDGE_EMBEDDING_MODEL_REVISION", DEFAULT_JINA_OMNI_REVISION
+            ),
         )
 
 
@@ -84,12 +106,20 @@ def create_production_app(settings: RuntimeSettings | None = None) -> FastAPI:
         endpoint=runtime.vlm_endpoint,
         model_id=runtime.vlm_model_id,
     )
+    query_embedder = OpenAIJinaQueryEmbedder.connect(
+        api_key=runtime.embedding_api_key,
+        endpoint=runtime.embedding_endpoint,
+        model_id=runtime.embedding_model_id,
+        model_revision=runtime.embedding_model_revision,
+    )
     job_publisher = CeleryObservationJobPublisher(create_task_queue(runtime.task_broker_url))
     kernel = MemoryKernel(
         store,
         answerer,
+        embedding_index=store,
         media_url_signer=media_access,
         observation_job_publisher=job_publisher,
+        query_embedder=query_embedder,
     )
 
     @asynccontextmanager
@@ -98,6 +128,7 @@ def create_production_app(settings: RuntimeSettings | None = None) -> FastAPI:
             await store.open()
             resources.push_async_callback(store.close)
             resources.push_async_callback(answerer.close)
+            resources.push_async_callback(query_embedder.close)
             yield
 
     return create_app(kernel, lifespan=lifespan)

@@ -6,12 +6,15 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from mindbridge.application import (
+    EmbeddingMatch,
+    EmbeddingSearch,
     GeneratedAnswer,
     MemoryKernel,
     MemoryWriteResult,
     ObservationBatch,
     ObservationWriteResult,
     PresignedMediaDownload,
+    RecallEmbeddingQuery,
     ResolvedEvidence,
 )
 from mindbridge.contracts import (
@@ -24,6 +27,8 @@ from mindbridge.contracts import (
 )
 from mindbridge.core import (
     DomainInvariantError,
+    EmbeddedObjectType,
+    EmbeddingRecord,
     EvidenceId,
     EvidenceSpan,
     IdempotencyConflictError,
@@ -33,6 +38,7 @@ from mindbridge.core import (
     MediaObjectId,
     MemoryRecord,
     MemoryType,
+    ModelReference,
     Observation,
     ObservationId,
     SensorKind,
@@ -51,6 +57,8 @@ class InMemoryStore:
         self.memories: dict[str, tuple[str, MemoryRecord]] = {}
         self.evidence: dict[EvidenceId, EvidenceSpan] = {}
         self.media_objects: dict[MediaObjectId, MediaObject] = {}
+        self.embedding_matches: tuple[EmbeddingMatch, ...] = ()
+        self.embedding_searches: list[EmbeddingSearch] = []
 
     async def write_observation(
         self,
@@ -158,8 +166,16 @@ class InMemoryStore:
         return tuple(
             self.media_objects[media_object_id]
             for media_object_id in media_object_ids
-            if self.media_objects[media_object_id].tenant_id == tenant_id
+            if media_object_id in self.media_objects
+            and self.media_objects[media_object_id].tenant_id == tenant_id
         )
+
+    async def write_embedding(self, embedding: EmbeddingRecord) -> bool:
+        return True
+
+    async def search_embeddings(self, search: EmbeddingSearch) -> tuple[EmbeddingMatch, ...]:
+        self.embedding_searches.append(search)
+        return self.embedding_matches[: search.limit]
 
 
 class DeterministicMediaUrlSigner:
@@ -191,6 +207,20 @@ class RecordingAnswerer:
         self.calls += 1
         self.last_evidence = evidence
         return GeneratedAnswer(answer=memories[0].summary, confidence=0.9)
+
+
+class RecordingQueryEmbedder:
+    """Returns one valid vector while retaining the fused multimodal query."""
+
+    model_reference = ModelReference(model_id="jina-omni", revision="pinned-revision")
+    dimension = 1_024
+
+    def __init__(self) -> None:
+        self.queries: list[RecallEmbeddingQuery] = []
+
+    async def encode_query(self, query: RecallEmbeddingQuery) -> tuple[float, ...]:
+        self.queries.append(query)
+        return (1.0,) + (0.0,) * 1_023
 
 
 class RecordingObservationJobPublisher:
@@ -330,6 +360,78 @@ async def test_recall_abstains_when_candidate_has_no_evidence() -> None:
     assert answerer.calls == 0
 
 
+async def test_semantic_evidence_finds_memory_without_matching_summary_text() -> None:
+    """Jina evidence rank reaches grounded memories that sparse text cannot see."""
+    store = InMemoryStore()
+    query_embedder = RecordingQueryEmbedder()
+    kernel = _kernel(store, RecordingAnswerer(), query_embedder=query_embedder)
+    await kernel.observe(_observe_request())
+    evidence_id = next(iter(store.evidence))
+    await kernel.remember(_remember_request(evidence_ids=(evidence_id,)))
+    store.embedding_matches = (
+        EmbeddingMatch(
+            embedding_id="embedding_01",
+            object_type=EmbeddedObjectType.EVIDENCE_SPAN,
+            object_id=evidence_id,
+            similarity=0.8,
+        ),
+    )
+
+    result = await kernel.recall(
+        RecallRequest(tenant_id="tenant_01", query=RecallQuery(text="a hand moves an object"))
+    )
+
+    assert result.memories[0].summary.startswith("The robot put")
+    assert query_embedder.queries[0].text == "a hand moves an object"
+    assert store.embedding_searches[0].document_task == "retrieval_document"
+
+
+async def test_media_query_is_signed_for_embedding_instead_of_used_as_a_filter() -> None:
+    """Original AV reaches Jina through a short-lived tenant-owned URL."""
+    store = InMemoryStore()
+    query_embedder = RecordingQueryEmbedder()
+    kernel = _kernel(store, RecordingAnswerer(), query_embedder=query_embedder)
+    await kernel.observe(_observe_request())
+    evidence_id = next(iter(store.evidence))
+    await kernel.remember(_remember_request(evidence_ids=(evidence_id,)))
+    store.embedding_matches = (
+        EmbeddingMatch(
+            embedding_id="embedding_01",
+            object_type=EmbeddedObjectType.EVIDENCE_SPAN,
+            object_id=evidence_id,
+            similarity=0.9,
+        ),
+    )
+
+    result = await kernel.recall(
+        RecallRequest(
+            tenant_id="tenant_01",
+            query=RecallQuery(media_object_ids=("media_01",)),
+        )
+    )
+
+    resolved = query_embedder.queries[0].media[0]
+    assert resolved.media_object.kind is MediaKind.VIDEO
+    assert resolved.media_url == "https://objects.example.test/media_01"
+    assert result.memories[0].evidence_ids == (evidence_id,)
+
+
+async def test_media_query_rejects_unknown_tenant_object() -> None:
+    """A query cannot turn another tenant's object ID into a signed URL."""
+    query_embedder = RecordingQueryEmbedder()
+    kernel = _kernel(InMemoryStore(), RecordingAnswerer(), query_embedder=query_embedder)
+
+    with pytest.raises(DomainInvariantError, match="unknown media"):
+        await kernel.recall(
+            RecallRequest(
+                tenant_id="tenant_01",
+                query=RecallQuery(media_object_ids=("media_missing",)),
+            )
+        )
+
+    assert query_embedder.queries == []
+
+
 def test_generated_answer_rejects_confidence_without_answer() -> None:
     """Abstention cannot report misleading answer confidence."""
     with pytest.raises(DomainInvariantError, match="zero"):
@@ -385,13 +487,16 @@ def _kernel(
     answerer: RecordingAnswerer,
     *,
     job_publisher: RecordingObservationJobPublisher | None = None,
+    query_embedder: RecordingQueryEmbedder | None = None,
     clock: Callable[[], datetime] = lambda: NOW,
 ) -> MemoryKernel:
     return MemoryKernel(
         store,
         answerer,
+        embedding_index=store,
         media_url_signer=DeterministicMediaUrlSigner(),
         observation_job_publisher=job_publisher or RecordingObservationJobPublisher(),
+        query_embedder=query_embedder or RecordingQueryEmbedder(),
         clock=clock,
     )
 

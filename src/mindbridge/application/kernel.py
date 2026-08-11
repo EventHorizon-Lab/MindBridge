@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 from collections.abc import Callable
@@ -10,12 +11,21 @@ from uuid import uuid4
 
 from mindbridge.application.evidence import resolve_evidence_media
 from mindbridge.application.ports import (
+    EmbeddingIndex,
+    EmbeddingSearch,
     MediaUrlSigner,
     MemoryAnswerer,
     MemoryStore,
     ObservationBatch,
     ObservationJobPublisher,
     ResolvedEvidence,
+)
+from mindbridge.application.ranking import fuse_memory_rankings
+from mindbridge.application.recall import (
+    EVIDENCE_DOCUMENT_EMBEDDING_TASK,
+    RecallEmbeddingQuery,
+    RecallQueryEmbedder,
+    ResolvedQueryMedia,
 )
 from mindbridge.contracts import (
     EvidenceView,
@@ -31,6 +41,8 @@ from mindbridge.contracts import (
 )
 from mindbridge.core import (
     DeviceId,
+    DomainInvariantError,
+    EmbeddedObjectType,
     EvidenceId,
     EvidenceSpan,
     MediaObject,
@@ -54,14 +66,18 @@ class MemoryKernel:
         store: MemoryStore,
         answerer: MemoryAnswerer,
         *,
+        embedding_index: EmbeddingIndex,
         media_url_signer: MediaUrlSigner,
         observation_job_publisher: ObservationJobPublisher,
+        query_embedder: RecallQueryEmbedder,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._store = store
         self._answerer = answerer
+        self._embedding_index = embedding_index
         self._media_url_signer = media_url_signer
         self._observation_job_publisher = observation_job_publisher
+        self._query_embedder = query_embedder
         self._clock = clock or _utc_now
 
     async def observe(self, request: ObserveRequest) -> ObservationReceipt:
@@ -122,7 +138,20 @@ class MemoryKernel:
 
     async def recall(self, request: RecallRequest) -> RecallResult:
         """Retrieve memories, inspect evidence, and answer only when supported."""
-        memories = await self._store.search_memories(request)
+        candidate_limit = min(request.limit * 4, 100)
+        semantic_search = self._search_semantic_memories(request, limit=candidate_limit)
+        if request.query.text is None:
+            memories = (await semantic_search)[: request.limit]
+        else:
+            sparse_request = request.model_copy(update={"limit": candidate_limit})
+            sparse, semantic = await asyncio.gather(
+                self._store.search_memories(sparse_request),
+                semantic_search,
+            )
+            memories = fuse_memory_rankings(
+                (semantic, sparse),
+                limit=request.limit,
+            )
         should_read_evidence = request.include_evidence or request.mode is not RecallMode.SEARCH
         evidence = (
             await self._read_recall_evidence(request, memories) if should_read_evidence else ()
@@ -142,6 +171,63 @@ class MemoryKernel:
                 tuple(_evidence_view(item) for item in evidence) if request.include_evidence else ()
             ),
             trace_id=_new_id("trace"),
+        )
+
+    async def _search_semantic_memories(
+        self,
+        request: RecallRequest,
+        *,
+        limit: int,
+    ) -> tuple[MemoryRecord, ...]:
+        query = RecallEmbeddingQuery(
+            text=request.query.text,
+            media=await self._resolve_query_media(request),
+        )
+        values = await self._query_embedder.encode_query(query)
+        matches = await self._embedding_index.search_embeddings(
+            EmbeddingSearch(
+                tenant_id=TenantId(request.tenant_id),
+                values=values,
+                model_reference=self._query_embedder.model_reference,
+                document_task=EVIDENCE_DOCUMENT_EMBEDDING_TASK,
+                object_types=(EmbeddedObjectType.EVIDENCE_SPAN,),
+                limit=limit,
+            )
+        )
+        evidence_ids = tuple(dict.fromkeys(EvidenceId(match.object_id) for match in matches))
+        return await self._store.search_memories_by_evidence(
+            request,
+            evidence_ids,
+            limit=limit,
+        )
+
+    async def _resolve_query_media(
+        self,
+        request: RecallRequest,
+    ) -> tuple[ResolvedQueryMedia, ...]:
+        requested_ids = tuple(MediaObjectId(value) for value in request.query.media_object_ids)
+        if not requested_ids:
+            return ()
+        tenant_id = TenantId(request.tenant_id)
+        media_objects = await self._store.read_media_objects(tenant_id, requested_ids)
+        if any(item.tenant_id != tenant_id for item in media_objects):
+            raise MemoryIntegrityError("media store returned a cross-tenant query object")
+        media_by_id = {item.media_object_id: item for item in media_objects}
+        if len(media_by_id) != len(requested_ids) or set(media_by_id) != set(requested_ids):
+            raise DomainInvariantError("recall query references unknown media")
+        downloads = await asyncio.gather(
+            *(
+                self._media_url_signer.create_presigned_download(media_by_id[media_object_id])
+                for media_object_id in requested_ids
+            )
+        )
+        return tuple(
+            ResolvedQueryMedia(
+                media_object=media_by_id[media_object_id],
+                media_url=download.download_url,
+                media_url_expires_at=download.expires_at,
+            )
+            for media_object_id, download in zip(requested_ids, downloads, strict=True)
         )
 
     async def _read_recall_evidence(

@@ -13,6 +13,7 @@ from mindbridge.application import (
     GeneratedAnswer,
     MemoryKernel,
     PresignedMediaDownload,
+    RecallEmbeddingQuery,
     ResolvedEvidence,
 )
 from mindbridge.contracts import (
@@ -33,6 +34,7 @@ from mindbridge.core import (
     MemoryIntegrityError,
     MemoryRecord,
     MemoryType,
+    ModelReference,
     ObservationId,
     SensorKind,
     TenantId,
@@ -80,6 +82,16 @@ class DiscardingObservationJobPublisher:
         job_id: JobId,
     ) -> None:
         return None
+
+
+class FixedQueryEmbedder:
+    """Keeps persistence integration independent from the embedding service."""
+
+    model_reference = ModelReference(model_id="jina-omni", revision="pinned-revision")
+    dimension = 1_024
+
+    async def encode_query(self, query: RecallEmbeddingQuery) -> tuple[float, ...]:
+        return (1.0,) + (0.0,) * 1_023
 
 
 async def test_migration_installs_complete_phase_zero_schema(database_url: str) -> None:
@@ -324,7 +336,9 @@ def _kernel(store: PostgresMemoryStore) -> MemoryKernel:
     return MemoryKernel(
         store,
         FirstMemoryAnswerer(),
+        embedding_index=store,
         media_url_signer=DeterministicMediaUrlSigner(),
         observation_job_publisher=DiscardingObservationJobPublisher(),
+        query_embedder=FixedQueryEmbedder(),
         clock=lambda: NOW,
     )

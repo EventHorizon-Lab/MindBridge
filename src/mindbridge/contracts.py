@@ -100,13 +100,15 @@ class RecallQuery(ContractModel):
     """Text, media, or both used to find relevant experience."""
 
     text: NonEmptyString | None = None
-    media_object_ids: tuple[Identifier, ...] = ()
+    media_object_ids: Annotated[tuple[Identifier, ...], Field(max_length=8)] = ()
 
     @model_validator(mode="after")
     def require_content(self) -> RecallQuery:
         """Require at least one modality without privileging text."""
         if self.text is None and not self.media_object_ids:
             raise ValueError("recall query requires text or media_object_ids")
+        if len(set(self.media_object_ids)) != len(self.media_object_ids):
+            raise ValueError("recall query media_object_ids must be unique")
         return self
 
 

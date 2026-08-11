@@ -36,6 +36,8 @@ def test_production_app_opens_and_closes_runtime_resources(
         task_broker_url="memory://",
         vlm_api_key="unit-test-vlm-key",
         vlm_endpoint="https://vlm.example.test/api/v1/chat/completions",
+        embedding_api_key="unit-test-embedding-key",
+        embedding_endpoint="https://embedding.example.test/api/v1/embeddings",
     )
 
     with TestClient(create_production_app(settings)) as client:

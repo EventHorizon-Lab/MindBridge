@@ -42,6 +42,12 @@ def test_recall_query_rejects_whitespace_text() -> None:
         RecallQuery(text=" ")
 
 
+def test_recall_query_rejects_duplicate_media() -> None:
+    """One physical query object is encoded at most once."""
+    with pytest.raises(ValidationError, match="must be unique"):
+        RecallQuery(media_object_ids=("media_01", "media_01"))
+
+
 def test_recall_defaults_to_returning_evidence() -> None:
     """Evidence is the default product behavior, not an opt-in debug field."""
     request = RecallRequest(tenant_id="tenant_01", query=RecallQuery(text="toolbox"))

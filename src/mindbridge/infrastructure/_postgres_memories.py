@@ -131,7 +131,6 @@ def _recall_parameters(request: RecallRequest) -> dict[str, Any]:
     return {
         "tenant_id": request.tenant_id,
         "query": request.query.text,
-        "media_object_ids": list(request.query.media_object_ids),
         "person_ids": list(request.filters.person_ids),
         "device_ids": list(request.filters.device_ids),
         "memory_types": [memory_type.value for memory_type in request.filters.memory_types],
@@ -306,19 +305,6 @@ WHERE memory.tenant_id = %(tenant_id)s
       OR memory.summary ILIKE '%%' || %(query)s || '%%'
   )
 {_STRUCTURED_RECALL_FILTER_SQL}
-  AND (
-      cardinality(%(media_object_ids)s::text[]) = 0
-      OR EXISTS (
-          SELECT 1
-          FROM memory_evidence AS media_link
-          JOIN evidence_spans AS media_evidence
-            ON media_evidence.tenant_id = media_link.tenant_id
-           AND media_evidence.evidence_id = media_link.evidence_id
-          WHERE media_link.tenant_id = memory.tenant_id
-            AND media_link.memory_id = memory.memory_id
-            AND media_evidence.media_object_id = ANY(%(media_object_ids)s::text[])
-      )
-  )
 ORDER BY
     CASE
         WHEN %(query)s::text IS NULL THEN 0

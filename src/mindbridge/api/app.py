@@ -126,7 +126,7 @@ def _register_runtime_error_handlers(app: FastAPI) -> None:
         return _error_response(
             status.HTTP_503_SERVICE_UNAVAILABLE,
             code="model_unavailable",
-            message="answer model is unavailable",
+            message="memory model is unavailable",
         )
 
     @app.exception_handler(ModelOutputError)
@@ -137,7 +137,7 @@ def _register_runtime_error_handlers(app: FastAPI) -> None:
         return _error_response(
             status.HTTP_502_BAD_GATEWAY,
             code="model_output_invalid",
-            message="answer model returned invalid output",
+            message="memory model returned invalid output",
         )
 
     @app.exception_handler(ObjectStorageError)
