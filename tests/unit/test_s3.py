@@ -1,0 +1,89 @@
+"""Tests for tenant-safe S3 media access."""
+
+from datetime import datetime, timezone
+from urllib.parse import parse_qs, urlsplit
+
+import pytest
+
+from mindbridge.core import MediaKind, MediaObject, MediaObjectId, TenantId
+from mindbridge.infrastructure import InvalidMediaLocationError, S3MediaAccess
+
+NOW = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
+SHA256 = "00" * 32
+
+
+@pytest.fixture(autouse=True)
+def aws_test_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep Boto3 on its local signing path during unit tests."""
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "test-access-key")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "test-secret-key")
+    monkeypatch.setenv("AWS_EC2_METADATA_DISABLED", "true")
+
+
+def media_object(*, tenant_id: str = "tenant_01", uri: str | None = None) -> MediaObject:
+    """Build one valid immutable media reference."""
+    return MediaObject(
+        media_object_id=MediaObjectId("media_01"),
+        tenant_id=TenantId(tenant_id),
+        kind=MediaKind.VIDEO,
+        uri=uri or f"s3://memory/tenants/{tenant_id}/media_01.mp4",
+        sha256=SHA256,
+        size_bytes=42,
+        created_at=NOW,
+        duration_ms=1_000,
+    )
+
+
+async def test_presigned_upload_binds_type_checksum_and_expiration() -> None:
+    """A caller cannot alter signed integrity headers without invalidating the URL."""
+    access = S3MediaAccess(
+        "memory",
+        endpoint_url="https://objects.example.test",
+        url_lifetime_seconds=60,
+        clock=lambda: NOW,
+    )
+
+    upload = await access.create_presigned_upload(media_object(), content_type="video/mp4")
+    query = parse_qs(urlsplit(upload.upload_url).query)
+
+    assert upload.expires_at.isoformat() == "2026-08-11T12:01:00+00:00"
+    assert upload.required_headers == {
+        "Content-Type": "video/mp4",
+        "x-amz-checksum-sha256": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+    }
+    assert query["X-Amz-Expires"] == ["60"]
+    assert "content-type" in query["X-Amz-SignedHeaders"][0]
+    assert "x-amz-checksum-sha256" in query["X-Amz-SignedHeaders"][0]
+    assert query["X-Amz-Signature"][0]
+
+
+async def test_presigned_download_rejects_cross_tenant_location() -> None:
+    """A valid media identifier cannot be used to sign another tenant's key."""
+    access = S3MediaAccess(
+        "memory",
+        endpoint_url="https://objects.example.test",
+        clock=lambda: NOW,
+    )
+    foreign_location = media_object(uri="s3://memory/tenants/tenant_02/media_01.mp4")
+
+    with pytest.raises(InvalidMediaLocationError, match="tenant prefix"):
+        await access.create_presigned_download(foreign_location)
+
+
+async def test_presigned_download_uses_get_and_configured_bucket() -> None:
+    """Evidence access stays read-only and scoped to the configured object store."""
+    access = S3MediaAccess(
+        "memory",
+        endpoint_url="https://objects.example.test",
+        url_lifetime_seconds=120,
+        clock=lambda: NOW,
+    )
+
+    download = await access.create_presigned_download(media_object())
+    query = parse_qs(urlsplit(download.download_url).query)
+
+    assert download.download_url.startswith(
+        "https://objects.example.test/memory/tenants/tenant_01/media_01.mp4?"
+    )
+    assert download.expires_at.isoformat() == "2026-08-11T12:02:00+00:00"
+    assert query["X-Amz-Expires"] == ["120"]
