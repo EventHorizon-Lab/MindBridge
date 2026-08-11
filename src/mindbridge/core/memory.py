@@ -1,0 +1,158 @@
+"""Derived memory records that remain traceable to captured evidence."""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+from datetime import datetime
+from enum import Enum
+
+from mindbridge.core._validation import require_aware_datetime, require_non_empty
+from mindbridge.core.errors import DomainInvariantError
+from mindbridge.core.identifiers import (
+    ClaimId,
+    EmbeddingId,
+    EventId,
+    EvidenceId,
+    ObservationId,
+    TenantId,
+)
+
+
+class VerificationStatus(str, Enum):
+    """Whether evidence is sufficient to present a derived record as fact."""
+
+    VERIFIED = "verified"
+    UNVERIFIED = "unverified"
+
+
+class EmbeddedObjectType(str, Enum):
+    """Domain records admitted to the primary semantic index."""
+
+    EVIDENCE_SPAN = "evidence_span"
+    EVENT = "event"
+    CLAIM = "claim"
+
+
+@dataclass(frozen=True, slots=True)
+class ModelReference:
+    """Exact frozen model version that produced a derived record."""
+
+    model_id: str
+    revision: str
+
+    def __post_init__(self) -> None:
+        require_non_empty(self.model_id, "model_id")
+        require_non_empty(self.revision, "revision")
+
+
+@dataclass(frozen=True, slots=True)
+class Event:
+    """A semantic event derived from one or more observations."""
+
+    event_id: EventId
+    tenant_id: TenantId
+    observation_ids: tuple[ObservationId, ...]
+    evidence_ids: tuple[EvidenceId, ...]
+    occurred_at: datetime
+    ended_at: datetime
+    description: str
+    salience: float
+    created_at: datetime
+    model_reference: ModelReference
+
+    def __post_init__(self) -> None:
+        require_non_empty(self.event_id, "event_id")
+        require_non_empty(self.tenant_id, "tenant_id")
+        require_non_empty(self.description, "description")
+        require_aware_datetime(self.occurred_at, "occurred_at")
+        require_aware_datetime(self.ended_at, "ended_at")
+        require_aware_datetime(self.created_at, "created_at")
+        _require_identifiers(self.observation_ids, "observation_ids")
+        _require_identifiers(self.evidence_ids, "evidence_ids")
+        if self.ended_at < self.occurred_at:
+            raise DomainInvariantError("ended_at must not precede occurred_at")
+        _require_probability(self.salience, "salience")
+
+
+@dataclass(frozen=True, slots=True)
+class Claim:
+    """A versioned assertion derived from evidence or marked unverified."""
+
+    claim_id: ClaimId
+    tenant_id: TenantId
+    statement: str
+    evidence_ids: tuple[EvidenceId, ...]
+    confidence: float
+    verification_status: VerificationStatus
+    valid_from: datetime
+    valid_to: datetime | None
+    created_at: datetime
+    model_reference: ModelReference
+    supersedes_claim_id: ClaimId | None = None
+
+    def __post_init__(self) -> None:
+        require_non_empty(self.claim_id, "claim_id")
+        require_non_empty(self.tenant_id, "tenant_id")
+        require_non_empty(self.statement, "statement")
+        require_aware_datetime(self.valid_from, "valid_from")
+        require_aware_datetime(self.created_at, "created_at")
+        if self.valid_to is not None:
+            require_aware_datetime(self.valid_to, "valid_to")
+            if self.valid_to < self.valid_from:
+                raise DomainInvariantError("valid_to must not precede valid_from")
+        if self.evidence_ids:
+            _require_identifiers(self.evidence_ids, "evidence_ids")
+        elif self.verification_status is VerificationStatus.VERIFIED:
+            raise DomainInvariantError("a verified claim must reference evidence")
+        _require_probability(self.confidence, "confidence")
+
+
+@dataclass(frozen=True, slots=True)
+class EmbeddingRecord:
+    """A versioned semantic vector that never mixes incompatible spaces."""
+
+    embedding_id: EmbeddingId
+    tenant_id: TenantId
+    object_type: EmbeddedObjectType
+    object_id: str
+    values: tuple[float, ...]
+    model_reference: ModelReference
+    task: str
+    dimension: int
+    normalized: bool
+    created_at: datetime
+
+    def __post_init__(self) -> None:
+        require_non_empty(self.embedding_id, "embedding_id")
+        require_non_empty(self.tenant_id, "tenant_id")
+        require_non_empty(self.object_id, "object_id")
+        require_non_empty(self.task, "task")
+        require_aware_datetime(self.created_at, "created_at")
+        if self.dimension <= 0:
+            raise DomainInvariantError("dimension must be positive")
+        if len(self.values) != self.dimension:
+            raise DomainInvariantError("dimension must match the number of vector values")
+        if not all(math.isfinite(value) for value in self.values):
+            raise DomainInvariantError("embedding values must be finite")
+        if self.normalized and not math.isclose(
+            math.sqrt(sum(value * value for value in self.values)),
+            1.0,
+            rel_tol=1e-4,
+            abs_tol=1e-6,
+        ):
+            raise DomainInvariantError("normalized embedding must have unit length")
+
+
+def _require_identifiers(identifiers: tuple[str, ...], field_name: str) -> None:
+    if not identifiers:
+        raise DomainInvariantError(f"{field_name} must not be empty")
+    if any(not identifier.strip() for identifier in identifiers):
+        raise DomainInvariantError(f"{field_name} must not contain blank identifiers")
+    if len(set(identifiers)) != len(identifiers):
+        raise DomainInvariantError(f"{field_name} must not contain duplicates")
+
+
+def _require_probability(value: float, field_name: str) -> None:
+    if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+        raise DomainInvariantError(f"{field_name} must be between 0 and 1")

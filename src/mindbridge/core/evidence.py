@@ -8,15 +8,16 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 from string import hexdigits
-from typing import NewType
 
+from mindbridge.core._validation import require_aware_datetime, require_non_empty
 from mindbridge.core.errors import DomainInvariantError
-
-TenantId = NewType("TenantId", str)
-DeviceId = NewType("DeviceId", str)
-MediaObjectId = NewType("MediaObjectId", str)
-ObservationId = NewType("ObservationId", str)
-EvidenceId = NewType("EvidenceId", str)
+from mindbridge.core.identifiers import (
+    DeviceId,
+    EvidenceId,
+    MediaObjectId,
+    ObservationId,
+    TenantId,
+)
 
 _SHA256_HEX_LENGTH = 64
 
@@ -69,10 +70,10 @@ class MediaObject:
     duration_ms: int | None = None
 
     def __post_init__(self) -> None:
-        _require_non_empty(self.media_object_id, "media_object_id")
-        _require_non_empty(self.tenant_id, "tenant_id")
-        _require_non_empty(self.uri, "uri")
-        _require_aware_datetime(self.created_at, "created_at")
+        require_non_empty(self.media_object_id, "media_object_id")
+        require_non_empty(self.tenant_id, "tenant_id")
+        require_non_empty(self.uri, "uri")
+        require_aware_datetime(self.created_at, "created_at")
         if not _is_sha256(self.sha256):
             raise DomainInvariantError("sha256 must contain exactly 64 hexadecimal characters")
         if self.size_bytes < 0:
@@ -98,13 +99,13 @@ class Observation:
     clock_offset_ms: int = 0
 
     def __post_init__(self) -> None:
-        _require_non_empty(self.observation_id, "observation_id")
-        _require_non_empty(self.tenant_id, "tenant_id")
-        _require_non_empty(self.device_id, "device_id")
-        _require_non_empty(self.boot_id, "boot_id")
-        _require_aware_datetime(self.occurred_at, "occurred_at")
-        _require_aware_datetime(self.ended_at, "ended_at")
-        _require_aware_datetime(self.observed_at, "observed_at")
+        require_non_empty(self.observation_id, "observation_id")
+        require_non_empty(self.tenant_id, "tenant_id")
+        require_non_empty(self.device_id, "device_id")
+        require_non_empty(self.boot_id, "boot_id")
+        require_aware_datetime(self.occurred_at, "occurred_at")
+        require_aware_datetime(self.ended_at, "ended_at")
+        require_aware_datetime(self.observed_at, "observed_at")
         if self.sequence < 0:
             raise DomainInvariantError("sequence must be non-negative")
         if not self.media_object_ids:
@@ -140,11 +141,11 @@ class EvidenceSpan:
     audio_track: int | None = None
 
     def __post_init__(self) -> None:
-        _require_non_empty(self.evidence_id, "evidence_id")
-        _require_non_empty(self.tenant_id, "tenant_id")
-        _require_non_empty(self.observation_id, "observation_id")
-        _require_non_empty(self.media_object_id, "media_object_id")
-        _require_aware_datetime(self.created_at, "created_at")
+        require_non_empty(self.evidence_id, "evidence_id")
+        require_non_empty(self.tenant_id, "tenant_id")
+        require_non_empty(self.observation_id, "observation_id")
+        require_non_empty(self.media_object_id, "media_object_id")
+        require_aware_datetime(self.created_at, "created_at")
         if self.start_ms < 0:
             raise DomainInvariantError("start_ms must be non-negative")
         if self.end_ms < self.start_ms:
@@ -168,13 +169,3 @@ class EvidenceSpan:
 
 def _is_sha256(value: str) -> bool:
     return len(value) == _SHA256_HEX_LENGTH and all(char in hexdigits for char in value)
-
-
-def _require_aware_datetime(value: datetime, field_name: str) -> None:
-    if value.tzinfo is None or value.utcoffset() is None:
-        raise DomainInvariantError(f"{field_name} must include timezone information")
-
-
-def _require_non_empty(value: str, field_name: str) -> None:
-    if not value.strip():
-        raise DomainInvariantError(f"{field_name} must not be empty")
