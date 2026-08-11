@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import time
 from collections import defaultdict
 from datetime import timedelta
 from pathlib import Path
@@ -15,17 +14,17 @@ from mindbridge.benchmarks.m3_bench import (
     M3BenchQuestion,
     M3BenchVideo,
 )
+from mindbridge.benchmarks.runtime import wait_for_observation_job
 from mindbridge.contracts import (
     ContractModel,
     Identifier,
     MediaObjectInput,
     NonEmptyString,
-    ObservationProcessingJobView,
     ObserveRequest,
     RecallQuery,
     RecallRequest,
 )
-from mindbridge.core import JobState, MediaKind, SensorKind
+from mindbridge.core import MediaKind, SensorKind
 from mindbridge.sdk import AsyncMindBridge
 
 M3_CLIP_DURATION_SECONDS = 30
@@ -161,30 +160,6 @@ async def run_m3_video(
         )
     )
     return tuple(answers[question.question_id] for question in annotation.questions)
-
-
-async def wait_for_observation_job(
-    memory: AsyncMindBridge,
-    tenant_id: str,
-    job_id: str,
-    *,
-    poll_interval_seconds: float = 1.0,
-    timeout_seconds: float = 1_800.0,
-) -> ObservationProcessingJobView:
-    """Wait for durable success while allowing failed attempts to be retried."""
-    if poll_interval_seconds <= 0 or timeout_seconds <= 0:
-        raise ValueError("poll interval and timeout must be positive")
-    deadline = time.monotonic() + timeout_seconds
-    while True:
-        job = await memory.get_observation_job(tenant_id, job_id)
-        if job.state is JobState.SUCCEEDED:
-            return job
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise TimeoutError(
-                f"observation job {job_id} did not succeed; last state was {job.state.value}"
-            )
-        await asyncio.sleep(min(poll_interval_seconds, remaining))
 
 
 def _observe_request(

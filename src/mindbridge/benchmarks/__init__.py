@@ -33,6 +33,11 @@ from mindbridge.benchmarks.m3_runner import (
     M3PreparedVideo,
     load_prepared_m3,
     run_m3_video,
+)
+from mindbridge.benchmarks.runtime import (
+    OPTION_LABELS,
+    multiple_choice_query,
+    parse_option_ranking,
     wait_for_observation_job,
 )
 from mindbridge.benchmarks.supermemory_vqa import (
@@ -49,6 +54,7 @@ __all__ = [
     "LOCOMO_PREDICTION_KEY",
     "M3_BENCH_ADAPTER_VERSION",
     "M3_CLIP_DURATION_SECONDS",
+    "OPTION_LABELS",
     "SUPERMEMORY_UNANSWERABLE_CHOICE",
     "SUPERMEMORY_VQA_ADAPTER_VERSION",
     "EgoLifeOption",
@@ -69,6 +75,8 @@ __all__ = [
     "load_m3_bench",
     "load_prepared_m3",
     "load_supermemory_vqa",
+    "multiple_choice_query",
+    "parse_option_ranking",
     "run_locomo_conversation",
     "run_m3_video",
     "wait_for_observation_job",
