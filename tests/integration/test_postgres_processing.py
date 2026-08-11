@@ -11,6 +11,7 @@ from psycopg import AsyncConnection
 from mindbridge.application import (
     EmbeddingInput,
     EmbeddingSearch,
+    EpisodeCandidateRequest,
     EventPerception,
     ObservationBatch,
     ObservationProcessingOutput,
@@ -30,6 +31,8 @@ from mindbridge.core import (
     EmbeddedObjectType,
     EmbeddingSpaceReference,
     EntityType,
+    EventHierarchyLevel,
+    EventStatus,
     EvidenceId,
     EvidenceSpan,
     IdentityKind,
@@ -348,6 +351,51 @@ async def test_processing_rolls_back_derived_records_before_retry(
     )
 
 
+async def test_episode_candidates_expand_a_stable_seed_by_event_vector(
+    store: PostgresMemoryStore,
+) -> None:
+    tenant_id, first_observation_id, first_job_id = await _write_source_observation(
+        store,
+        "tenant_episode_candidates",
+        include_identity=False,
+    )
+    _, second_observation_id, second_job_id = await _write_source_observation(
+        store,
+        "tenant_episode_candidates",
+        ordinal=2,
+        occurred_at=NOW + timedelta(seconds=5),
+        include_identity=False,
+    )
+    for observation_id, job_id in (
+        (first_observation_id, first_job_id),
+        (second_observation_id, second_job_id),
+    ):
+        await ProcessObservation(
+            store,
+            RecordingPerceiver(),
+            FixedEmbedder(),
+            FixedTextEmbedder(),
+            media_url_signer=DeterministicSigner(),
+        ).run(tenant_id, observation_id, job_id)
+
+    page = await store.list_episode_candidates(
+        EpisodeCandidateRequest(
+            tenant_id=tenant_id,
+            evaluated_at=NOW + timedelta(days=2),
+            limit=1,
+            maximum_gap_seconds=10,
+            minimum_similarity=0.99,
+        )
+    )
+
+    assert page.scanned_count == 1
+    assert page.next_cursor is not None
+    assert len(page.events) == 2
+    assert {event.hierarchy_level for event in page.events} == {EventHierarchyLevel.EVENT}
+    assert {event.status for event in page.events} == {EventStatus.ACTIVE}
+    assert all(event.parent_event_id is None for event in page.events)
+
+
 async def test_superseded_attempt_cannot_commit(
     store: PostgresMemoryStore,
     database_url: str,
@@ -391,34 +439,43 @@ async def test_superseded_attempt_cannot_commit(
 async def _write_source_observation(
     store: PostgresMemoryStore,
     tenant: str,
+    *,
+    ordinal: int = 1,
+    occurred_at: datetime = NOW,
+    include_identity: bool = True,
 ) -> tuple[TenantId, ObservationId, JobId]:
     tenant_id = TenantId(tenant)
-    observation_id = ObservationId("observation_01")
-    media_object_id = MediaObjectId("media_01")
+    suffix = f"{ordinal:02d}"
+    observation_id = ObservationId(f"observation_{suffix}")
+    media_object_id = MediaObjectId(f"media_{suffix}")
     observation = Observation(
         observation_id=observation_id,
         tenant_id=tenant_id,
         device_id=DeviceId("device_01"),
         boot_id="boot_01",
-        sequence=1,
+        sequence=ordinal,
         sensor=SensorKind.CAMERA,
         media_object_ids=(media_object_id,),
-        occurred_at=NOW,
-        ended_at=NOW + timedelta(seconds=4),
-        observed_at=NOW,
+        occurred_at=occurred_at,
+        ended_at=occurred_at + timedelta(seconds=4),
+        observed_at=occurred_at,
         clock_offset_ms=0,
         identity_observations=(
-            AnonymousIdentityObservation(
-                identity_id="person_robot_01",
-                kind=IdentityKind.FACE,
-                start_ms=250,
-                end_ms=2_000,
-                confidence=0.97,
-                model_reference=ModelReference(
-                    model_id="insightface/buffalo_l",
-                    revision="1.0.1",
+            (
+                AnonymousIdentityObservation(
+                    identity_id="person_robot_01",
+                    kind=IdentityKind.FACE,
+                    start_ms=250,
+                    end_ms=2_000,
+                    confidence=0.97,
+                    model_reference=ModelReference(
+                        model_id="insightface/buffalo_l",
+                        revision="1.0.1",
+                    ),
                 ),
-            ),
+            )
+            if include_identity
+            else ()
         ),
     )
     result = await store.write_observation(
@@ -428,8 +485,8 @@ async def _write_source_observation(
                     media_object_id=media_object_id,
                     tenant_id=tenant_id,
                     kind=MediaKind.VIDEO,
-                    uri=f"s3://memory/{tenant}/clip.mp4",
-                    sha256="a" * 64,
+                    uri=f"s3://memory/{tenant}/clip_{suffix}.mp4",
+                    sha256=f"{ordinal:064x}",
                     size_bytes=100,
                     created_at=NOW,
                     duration_ms=4_000,
@@ -438,7 +495,7 @@ async def _write_source_observation(
             observation=observation,
             evidence_spans=(
                 EvidenceSpan(
-                    evidence_id=EvidenceId("evidence_01"),
+                    evidence_id=EvidenceId(f"evidence_{suffix}"),
                     tenant_id=tenant_id,
                     observation_id=observation_id,
                     media_object_id=media_object_id,
@@ -448,8 +505,8 @@ async def _write_source_observation(
                 ),
             ),
         ),
-        idempotency_key="observe_01",
-        content_digest="b" * 64,
+        idempotency_key=f"observe_{suffix}",
+        content_digest=f"{ordinal + 100:064x}",
     )
     return tenant_id, observation_id, result.processing_job_id
 

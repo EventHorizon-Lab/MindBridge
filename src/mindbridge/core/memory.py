@@ -66,6 +66,21 @@ class MemoryState(str, Enum):
     COMPRESSED = "compressed"
 
 
+class EventHierarchyLevel(str, Enum):
+    """Whether an event is a directly perceived event or a consolidated episode."""
+
+    EVENT = "event"
+    EPISODE = "episode"
+
+
+class EventStatus(str, Enum):
+    """Lifecycle of one derived event hierarchy node."""
+
+    CANDIDATE = "candidate"
+    ACTIVE = "active"
+    SUPERSEDED = "superseded"
+
+
 @dataclass(frozen=True, slots=True)
 class ModelReference:
     """Exact frozen model version that produced a derived record."""
@@ -105,6 +120,9 @@ class Event:
     created_at: datetime
     model_reference: ModelReference
     prompt_version: str
+    parent_event_id: EventId | None = None
+    hierarchy_level: EventHierarchyLevel = EventHierarchyLevel.EVENT
+    status: EventStatus = EventStatus.ACTIVE
 
     def __post_init__(self) -> None:
         require_non_empty(self.event_id, "event_id")
@@ -118,6 +136,8 @@ class Event:
         _require_identifiers(self.evidence_ids, "evidence_ids")
         if self.ended_at < self.occurred_at:
             raise DomainInvariantError("ended_at must not precede occurred_at")
+        if self.parent_event_id == self.event_id:
+            raise DomainInvariantError("event cannot be its own parent")
         _require_probability(self.salience, "salience")
 
 

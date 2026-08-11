@@ -1,5 +1,10 @@
 """MindBridge application use cases and external boundaries."""
 
+from mindbridge.application.consolidation import (
+    EpisodeCandidatePage,
+    EpisodeCandidateRequest,
+    EpisodeCandidateStore,
+)
 from mindbridge.application.evidence import resolve_evidence_media
 from mindbridge.application.kernel import MemoryKernel
 from mindbridge.application.lifecycle import (
@@ -66,6 +71,9 @@ __all__ = [
     "EmbeddingInput",
     "EmbeddingMatch",
     "EmbeddingSearch",
+    "EpisodeCandidatePage",
+    "EpisodeCandidateRequest",
+    "EpisodeCandidateStore",
     "EventPerception",
     "EvolveMemoryLifecycle",
     "FeedbackWriteResult",

@@ -152,18 +152,22 @@ async def _write_event(connection: DatabaseConnection, event: Event) -> None:
     cursor = await connection.execute(
         """
         INSERT INTO events (
-            tenant_id, event_id, description, salience, occurred_at, ended_at,
-            model_id, model_revision, prompt_version, content_digest, created_at
+            tenant_id, event_id, parent_event_id, hierarchy_level, description, salience,
+            status, occurred_at, ended_at, model_id, model_revision, prompt_version,
+            content_digest, created_at
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT DO NOTHING
         RETURNING event_id
         """,
         (
             event.tenant_id,
             event.event_id,
+            event.parent_event_id,
+            event.hierarchy_level.value,
             event.description,
             event.salience,
+            event.status.value,
             event.occurred_at,
             event.ended_at,
             event.model_reference.model_id,
@@ -176,13 +180,16 @@ async def _write_event(connection: DatabaseConnection, event: Event) -> None:
     if await cursor.fetchone() is None:
         cursor = await connection.execute(
             """
-            SELECT content_digest FROM events
+            SELECT content_digest, hierarchy_level FROM events
             WHERE tenant_id = %s AND event_id = %s
             """,
             (event.tenant_id, event.event_id),
         )
         row = await cursor.fetchone()
-        if row is None or cast(tuple[str], row)[0] != content_digest:
+        if row is None or cast(tuple[str, str], row) != (
+            content_digest,
+            event.hierarchy_level.value,
+        ):
             raise DomainInvariantError("event identifier already stores different content")
     await _write_event_links(connection, event)
 

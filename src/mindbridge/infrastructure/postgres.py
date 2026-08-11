@@ -9,6 +9,8 @@ from pgvector.psycopg import register_vector_async
 from mindbridge.application import (
     EmbeddingMatch,
     EmbeddingSearch,
+    EpisodeCandidatePage,
+    EpisodeCandidateRequest,
     FeedbackWriteResult,
     ForgetPlan,
     MemoryLifecycleChange,
@@ -35,6 +37,7 @@ from mindbridge.core import (
     TenantId,
     TombstoneId,
 )
+from mindbridge.infrastructure._postgres_consolidation import list_episode_candidates
 from mindbridge.infrastructure._postgres_embeddings import (
     search_embeddings,
     write_embedding,
@@ -155,6 +158,13 @@ class PostgresMemoryStore:
             after_memory_id=after_memory_id,
             limit=limit,
         )
+
+    async def list_episode_candidates(
+        self,
+        request: EpisodeCandidateRequest,
+    ) -> EpisodeCandidatePage:
+        """Discover a stable bounded page for Omni episode verification."""
+        return await list_episode_candidates(self._pool, request)
 
     async def update_memory_lifecycles(
         self,
