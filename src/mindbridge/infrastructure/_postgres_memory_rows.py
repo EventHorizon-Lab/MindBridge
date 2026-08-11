@@ -66,6 +66,28 @@ SELECT memory.memory_id,
 FROM memory_records AS memory
 """
 
+MEMORY_NOT_TOMBSTONED_SQL = """NOT EXISTS (
+      SELECT 1
+      FROM deletion_tombstones AS tombstone
+      WHERE tombstone.tenant_id = memory.tenant_id
+        AND (
+            (tombstone.target_type = 'memory_record' AND tombstone.target_id = memory.memory_id)
+            OR (
+                tombstone.target_type = 'observation'
+                AND EXISTS (
+                    SELECT 1
+                    FROM memory_evidence AS deleted_link
+                    JOIN evidence_spans AS deleted_evidence
+                      ON deleted_evidence.tenant_id = deleted_link.tenant_id
+                     AND deleted_evidence.evidence_id = deleted_link.evidence_id
+                    WHERE deleted_link.tenant_id = memory.tenant_id
+                      AND deleted_link.memory_id = memory.memory_id
+                      AND deleted_evidence.observation_id = tombstone.target_id
+                )
+            )
+        )
+  )"""
+
 
 def memory_from_row(row: MemoryRow) -> MemoryRecord:
     """Convert one validated SQL projection into its domain record."""

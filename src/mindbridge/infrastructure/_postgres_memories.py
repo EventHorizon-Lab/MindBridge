@@ -23,6 +23,7 @@ from mindbridge.infrastructure._postgres_forget import (
 )
 from mindbridge.infrastructure._postgres_idempotency import claim_idempotency_key
 from mindbridge.infrastructure._postgres_memory_rows import (
+    MEMORY_NOT_TOMBSTONED_SQL,
     MEMORY_SELECT_SQL,
     MemoryRow,
     memory_from_row,
@@ -260,29 +261,9 @@ async def _require_memory_on_connection(
     return memory
 
 
-_STRUCTURED_RECALL_FILTER_SQL = """
+_STRUCTURED_RECALL_FILTER_SQL = f"""
   AND memory.superseded_at IS NULL
-  AND NOT EXISTS (
-      SELECT 1
-      FROM deletion_tombstones AS tombstone
-      WHERE tombstone.tenant_id = memory.tenant_id
-        AND (
-            (tombstone.target_type = 'memory_record' AND tombstone.target_id = memory.memory_id)
-            OR (
-                tombstone.target_type = 'observation'
-                AND EXISTS (
-                    SELECT 1
-                    FROM memory_evidence AS deleted_link
-                    JOIN evidence_spans AS deleted_evidence
-                      ON deleted_evidence.tenant_id = deleted_link.tenant_id
-                     AND deleted_evidence.evidence_id = deleted_link.evidence_id
-                    WHERE deleted_link.tenant_id = memory.tenant_id
-                      AND deleted_link.memory_id = memory.memory_id
-                      AND deleted_evidence.observation_id = tombstone.target_id
-                )
-            )
-        )
-  )
+  AND {MEMORY_NOT_TOMBSTONED_SQL}
   AND (
       cardinality(%(memory_types)s::text[]) = 0
       OR memory.memory_type = ANY(%(memory_types)s::text[])

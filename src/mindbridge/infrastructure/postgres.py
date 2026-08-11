@@ -11,6 +11,7 @@ from mindbridge.application import (
     EmbeddingSearch,
     FeedbackWriteResult,
     ForgetPlan,
+    MemoryLifecycleChange,
     MemoryWriteResult,
     ObservationBatch,
     ObservationProcessingOutput,
@@ -52,6 +53,10 @@ from mindbridge.infrastructure._postgres_jobs import (
     mark_observation_processing_failed,
     mark_observation_processing_succeeded,
     read_observation_processing_job,
+)
+from mindbridge.infrastructure._postgres_lifecycle import (
+    list_memories_for_lifecycle,
+    update_memory_lifecycles,
 )
 from mindbridge.infrastructure._postgres_memories import (
     read_memory,
@@ -132,6 +137,28 @@ class PostgresMemoryStore:
             idempotency_key=idempotency_key,
             content_digest=content_digest,
         )
+
+    async def list_memories_for_lifecycle(
+        self,
+        tenant_id: TenantId,
+        *,
+        after_memory_id: MemoryId | None,
+        limit: int,
+    ) -> tuple[MemoryRecord, ...]:
+        """Read one stable page eligible for automatic state evolution."""
+        return await list_memories_for_lifecycle(
+            self._pool,
+            tenant_id,
+            after_memory_id=after_memory_id,
+            limit=limit,
+        )
+
+    async def update_memory_lifecycles(
+        self,
+        changes: tuple[MemoryLifecycleChange, ...],
+    ) -> int:
+        """Optimistically persist automatic score and state changes."""
+        return await update_memory_lifecycles(self._pool, changes)
 
     async def read_memory(
         self,
