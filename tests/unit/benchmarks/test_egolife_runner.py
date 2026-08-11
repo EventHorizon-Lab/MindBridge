@@ -8,9 +8,12 @@ from pydantic import ValidationError
 
 from mindbridge import AsyncMindBridge
 from mindbridge.benchmarks import (
+    EgoLifeOption,
     EgoLifePreparedClip,
     EgoLifePreparedStream,
     EgoLifeQuestion,
+    EgoLifeQuestionResult,
+    evaluate_egolife_qa,
     run_egolife_qa,
 )
 from mindbridge.contracts import (
@@ -113,6 +116,19 @@ def test_prepared_egolife_rejects_overlapping_clips() -> None:
         )
 
 
+def test_egolife_metrics_use_exact_option_match() -> None:
+    results = (
+        _result("q_1", answer="B", prediction="B"),
+        _result("q_2", answer="A", prediction=None),
+    )
+
+    metrics = evaluate_egolife_qa(results)
+
+    assert metrics.question_count == 2
+    assert metrics.correct_count == 1
+    assert metrics.accuracy == 0.5
+
+
 def _question(question_id: str, timecode: str) -> EgoLifeQuestion:
     hours, minutes, seconds, centiseconds = map(
         int,
@@ -157,4 +173,26 @@ def _clip(timecode: str, media_id: str, *, duration_ms: int) -> EgoLifePreparedC
             created_at=ORIGIN,
             duration_ms=duration_ms,
         ),
+    )
+
+
+def _result(
+    question_id: str,
+    *,
+    answer: str,
+    prediction: str | None,
+) -> EgoLifeQuestionResult:
+    return EgoLifeQuestionResult(
+        id=question_id,
+        question="Who used it?",
+        answer=cast(EgoLifeOption, answer),
+        model_option=cast(EgoLifeOption | None, prediction),
+        model_answer=prediction or "",
+        question_type="EntityLog",
+        query_day=1,
+        query_timecode="10001500",
+        mindbridge_confidence=0.8,
+        mindbridge_memory_ids=(),
+        mindbridge_evidence_ids=(),
+        mindbridge_trace_id=f"trace_{question_id}",
     )

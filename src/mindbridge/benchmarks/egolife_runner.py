@@ -96,9 +96,31 @@ class EgoLifeQuestionResult(ContractModel):
     mindbridge_trace_id: Identifier
 
 
+class EgoLifeMetrics(ContractModel):
+    """Official exact-choice accuracy for one EgoLifeQA run."""
+
+    question_count: int = Field(gt=0)
+    correct_count: int = Field(ge=0)
+    accuracy: float = Field(ge=0.0, le=1.0)
+
+
 def load_prepared_egolife(path: Path) -> EgoLifePreparedStream:
     """Load already uploaded media metadata without owning download or storage."""
     return EgoLifePreparedStream.model_validate_json(path.read_bytes())
+
+
+def evaluate_egolife_qa(results: tuple[EgoLifeQuestionResult, ...]) -> EgoLifeMetrics:
+    """Compute the exact option accuracy used by the official EgoRAG code."""
+    if not results:
+        raise ValueError("EgoLifeQA results must not be empty")
+    if len({result.id for result in results}) != len(results):
+        raise ValueError("EgoLifeQA results must have unique IDs")
+    correct = sum(result.model_option == result.answer for result in results)
+    return EgoLifeMetrics(
+        question_count=len(results),
+        correct_count=correct,
+        accuracy=correct / len(results),
+    )
 
 
 async def run_egolife_qa(

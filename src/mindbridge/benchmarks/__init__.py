@@ -7,9 +7,11 @@ from mindbridge.benchmarks.egolife_qa import (
     load_egolife_qa,
 )
 from mindbridge.benchmarks.egolife_runner import (
+    EgoLifeMetrics,
     EgoLifePreparedClip,
     EgoLifePreparedStream,
     EgoLifeQuestionResult,
+    evaluate_egolife_qa,
     load_prepared_egolife,
     run_egolife_qa,
 )
@@ -75,6 +77,7 @@ __all__ = [
     "OPTION_LABELS",
     "SUPERMEMORY_UNANSWERABLE_CHOICE",
     "SUPERMEMORY_VQA_ADAPTER_VERSION",
+    "EgoLifeMetrics",
     "EgoLifeOption",
     "EgoLifePreparedClip",
     "EgoLifePreparedStream",
@@ -97,6 +100,7 @@ __all__ = [
     "SuperMemoryQuestion",
     "SuperMemoryQuestionResult",
     "benchmark_tenant_id",
+    "evaluate_egolife_qa",
     "evaluate_supermemory_vqa",
     "load_egolife_qa",
     "load_locomo",
