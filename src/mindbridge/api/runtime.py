@@ -12,6 +12,7 @@ from fastapi import FastAPI
 from mcp.server import MCPServer
 
 from mindbridge.api.app import create_app
+from mindbridge.api.auth import TenantApiKeyAuthenticator
 from mindbridge.api.mcp import create_mcp_server
 from mindbridge.application import MemoryKernel
 from mindbridge.configuration import optional_environment_value, require_environment_value
@@ -47,6 +48,7 @@ class RuntimeSettings:
     embedding_model_id: str = DEFAULT_JINA_OMNI_MODEL_ID
     embedding_model_revision: str = DEFAULT_JINA_OMNI_REVISION
     minimum_embedding_similarity: float = 0.0
+    tenant_api_keys_json: str | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         for name, value in (
@@ -69,6 +71,8 @@ class RuntimeSettings:
             and not self.object_storage_endpoint_url.strip()
         ):
             raise ValueError("object_storage_endpoint_url must not be empty when provided")
+        if self.tenant_api_keys_json is not None and not self.tenant_api_keys_json.strip():
+            raise ValueError("tenant_api_keys_json must not be empty when provided")
         if (
             not math.isfinite(self.minimum_embedding_similarity)
             or not -1.0 <= self.minimum_embedding_similarity <= 1.0
@@ -106,6 +110,9 @@ class RuntimeSettings:
             minimum_embedding_similarity=float(
                 source.get("MINDBRIDGE_MINIMUM_EMBEDDING_SIMILARITY", "0.0")
             ),
+            tenant_api_keys_json=optional_environment_value(
+                source, "MINDBRIDGE_TENANT_API_KEYS_JSON"
+            ),
         )
 
 
@@ -129,14 +136,18 @@ class _ProductionRuntime:
 
 def create_production_app(settings: RuntimeSettings | None = None) -> FastAPI:
     """Wire PostgreSQL, S3-compatible media, and Omni into one API process."""
-    runtime = _build_runtime(settings or RuntimeSettings.from_environment())
+    resolved_settings = settings or RuntimeSettings.from_environment()
+    if resolved_settings.tenant_api_keys_json is None:
+        raise ValueError("MINDBRIDGE_TENANT_API_KEYS_JSON must be configured for the REST API")
+    authenticator = TenantApiKeyAuthenticator.from_json(resolved_settings.tenant_api_keys_json)
+    runtime = _build_runtime(resolved_settings)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         async with runtime.open():
             yield
 
-    return create_app(runtime.kernel, lifespan=lifespan)
+    return create_app(runtime.kernel, authenticator=authenticator, lifespan=lifespan)
 
 
 def create_production_mcp_server(

@@ -6,7 +6,7 @@ from typing import cast
 import pytest
 from fastapi.testclient import TestClient
 
-from mindbridge.api import create_app
+from mindbridge.api import TenantApiKeyAuthenticator, create_app
 from mindbridge.application import MemoryKernel
 from mindbridge.contracts import (
     DeletionListRequest,
@@ -45,6 +45,8 @@ from mindbridge.core import (
 )
 
 NOW = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
+TENANT_API_KEY = "tenant-01-test-key-00000000000000"
+OTHER_TENANT_API_KEY = "other-tenant-test-key-00000000000"
 
 
 class StubKernel:
@@ -143,7 +145,7 @@ class StubKernel:
         tenant_id: str,
         job_id: str,
     ) -> ObservationProcessingJobView:
-        if tenant_id != "tenant_01":
+        if job_id != "job_01":
             raise JobNotFoundError("missing")
         return ObservationProcessingJobView(
             job_id=job_id,
@@ -157,7 +159,7 @@ class StubKernel:
         )
 
     async def get_memory(self, tenant_id: str, memory_id: str) -> MemoryView:
-        if tenant_id != "tenant_01":
+        if memory_id != "memory_01":
             raise MemoryNotFoundError("missing")
         return MemoryView(
             memory_id=memory_id,
@@ -226,7 +228,7 @@ def test_job_route_is_tenant_scoped_and_returns_not_found() -> None:
     client = _client()
 
     found = client.get("/v1/jobs/job_01", params={"tenant_id": "tenant_01"})
-    missing = client.get("/v1/jobs/job_01", params={"tenant_id": "other_tenant"})
+    missing = client.get("/v1/jobs/missing", params={"tenant_id": "tenant_01"})
 
     assert found.status_code == 200
     assert found.json()["state"] == "succeeded"
@@ -238,7 +240,7 @@ def test_memory_route_is_tenant_scoped_and_returns_not_found() -> None:
     client = _client()
 
     found = client.get("/v1/memories/memory_01", params={"tenant_id": "tenant_01"})
-    missing = client.get("/v1/memories/memory_01", params={"tenant_id": "other_tenant"})
+    missing = client.get("/v1/memories/missing", params={"tenant_id": "tenant_01"})
 
     assert found.status_code == 200
     assert found.json()["memory_id"] == "memory_01"
@@ -257,6 +259,44 @@ def test_validation_errors_have_trace_and_field_location() -> None:
     assert response.status_code == 422
     assert body["trace_id"].startswith("trace_")
     assert {issue["location"][-1] for issue in body["issues"]} == {"query", "unknown"}
+
+
+def test_api_requires_a_valid_bearer_key() -> None:
+    app = create_app(cast(MemoryKernel, StubKernel()), authenticator=_authenticator())
+    client = TestClient(app)
+
+    missing = client.post(
+        "/v1/recall",
+        json={"tenant_id": "tenant_01", "query": {"text": "question"}},
+    )
+    invalid = client.post(
+        "/v1/recall",
+        headers={"Authorization": "Bearer invalid"},
+        json={"tenant_id": "tenant_01", "query": {"text": "question"}},
+    )
+
+    assert missing.status_code == 401
+    assert missing.headers["WWW-Authenticate"] == "Bearer"
+    assert missing.json()["code"] == "authentication_required"
+    assert invalid.status_code == 401
+    assert invalid.json()["code"] == "authentication_failed"
+    assert "Bearer invalid" not in invalid.text
+
+
+def test_api_rejects_cross_tenant_requests() -> None:
+    client = _client()
+    body_response = client.post(
+        "/v1/recall",
+        json={"tenant_id": "other_tenant", "query": {"text": "question"}},
+    )
+    query_response = client.get(
+        "/v1/memories/memory_01",
+        params={"tenant_id": "other_tenant"},
+    )
+
+    assert body_response.status_code == 403
+    assert query_response.status_code == 403
+    assert body_response.json()["code"] == "tenant_access_denied"
 
 
 def test_domain_errors_use_stable_envelope() -> None:
@@ -328,4 +368,16 @@ class FailingKernel(StubKernel):
 
 def _client(stub: StubKernel | None = None) -> TestClient:
     kernel = cast(MemoryKernel, stub or StubKernel())
-    return TestClient(create_app(kernel))
+    return TestClient(
+        create_app(kernel, authenticator=_authenticator()),
+        headers={"Authorization": f"Bearer {TENANT_API_KEY}"},
+    )
+
+
+def _authenticator() -> TenantApiKeyAuthenticator:
+    return TenantApiKeyAuthenticator(
+        {
+            "tenant_01": (TENANT_API_KEY,),
+            "other_tenant": (OTHER_TENANT_API_KEY,),
+        }
+    )

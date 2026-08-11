@@ -43,6 +43,7 @@ def test_production_app_opens_and_closes_runtime_resources(
         vlm_endpoint="https://vlm.example.test/api/v1/chat/completions",
         embedding_api_key="unit-test-embedding-key",
         embedding_endpoint="https://embedding.example.test/api/v1/embeddings",
+        tenant_api_keys_json=('{"tenant_01":["tenant-api-key-000000000000000000"]}'),
     )
 
     with TestClient(create_production_app(settings)) as client:

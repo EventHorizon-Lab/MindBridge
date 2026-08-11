@@ -114,8 +114,8 @@ The resulting annotation identity and counts are recorded in
 
 Run LoCoMo against the deployed production API. The command writes the official conversation-level
 prediction shape and a sidecar manifest containing source, code, model, Prompt, retrieval, and output
-identities. `MINDBRIDGE_API_KEY` is optional for an unauthenticated local deployment and is never
-written to the manifest.
+identities. `MINDBRIDGE_API_KEY` identifies the exact benchmark tenant and is never written to the
+manifest.
 
 ```bash
 export MINDBRIDGE_API_KEY=replace-with-a-runtime-secret
@@ -290,6 +290,7 @@ export MINDBRIDGE_EMBEDDING_ENDPOINT=https://embeddings.example.com/v1/embedding
 export MINDBRIDGE_EMBEDDING_MODEL_ID=jinaai/jina-embeddings-v5-omni-small-retrieval
 export MINDBRIDGE_EMBEDDING_MODEL_REVISION=12949877f0092093f366c6450340011320152a05
 export MINDBRIDGE_MINIMUM_EMBEDDING_SIMILARITY=0.0
+export MINDBRIDGE_TENANT_API_KEYS_JSON='{"tenant_01":["replace-with-at-least-32-random-characters"]}'
 
 uv run uvicorn mindbridge.api:create_production_app --factory
 ```
@@ -313,7 +314,10 @@ Python SDK:
 from mindbridge import AsyncMindBridge
 from mindbridge.contracts import RecallQuery, RecallRequest
 
-memory = AsyncMindBridge.connect(base_url="http://localhost:8000")
+memory = AsyncMindBridge.connect(
+    base_url="http://localhost:8000",
+    api_key="replace-with-at-least-32-random-characters",
+)
 try:
     result = await memory.recall(
         RecallRequest(tenant_id="tenant_01", query=RecallQuery(text="Where is my tool?"))
@@ -321,6 +325,12 @@ try:
 finally:
     await memory.close()
 ```
+
+Every REST API key is bound to an explicit tenant allowlist. The JSON value maps each tenant ID to
+one or more keys, so a key can be rotated without downtime and one isolated benchmark deployment can
+authorize its generated tenants with the same key. Blank or short keys fail startup. All `/v1`
+operations reject a body or query `tenant_id` outside the authenticated allowlist. Only `/healthz`
+is public; benchmark runs must add every generated tenant ID to the mapping before starting the API.
 
 `MINDBRIDGE_OBJECT_STORAGE_ENDPOINT_URL` is optional for AWS S3. Media URIs must use the tenant-safe
 shape `s3://<bucket>/tenants/<tenant_id>/<object>`.

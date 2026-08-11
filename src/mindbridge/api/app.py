@@ -5,11 +5,17 @@ from __future__ import annotations
 from typing import Annotated
 from uuid import uuid4
 
-from fastapi import FastAPI, Query, Request, status
+from fastapi import Depends, FastAPI, Query, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.types import Lifespan
 
+from mindbridge.api.auth import (
+    AuthenticationError,
+    TenantApiKeyAuthenticator,
+    TenantPrincipal,
+    require_tenant,
+)
 from mindbridge.application import MemoryKernel
 from mindbridge.contracts import (
     DeletionListRequest,
@@ -48,13 +54,15 @@ from mindbridge.core import (
 def create_app(
     kernel: MemoryKernel,
     *,
+    authenticator: TenantApiKeyAuthenticator,
     lifespan: Lifespan[FastAPI] | None = None,
 ) -> FastAPI:
     """Create a side-effect-free REST adapter around one memory kernel."""
     app = FastAPI(title="MindBridge", version="0.1.0", lifespan=lifespan)
+    tenant_authentication = Depends(authenticator)
     _register_request_error_handlers(app)
     _register_runtime_error_handlers(app)
-    _register_deletion_routes(app, kernel)
+    _register_deletion_routes(app, kernel, authenticator)
 
     @app.get("/healthz", response_model=HealthResponse, operation_id="health")
     async def health() -> HealthResponse:
@@ -66,7 +74,11 @@ def create_app(
         status_code=status.HTTP_202_ACCEPTED,
         operation_id="observe",
     )
-    async def observe(request: ObserveRequest) -> ObservationReceipt:
+    async def observe(
+        request: ObserveRequest,
+        principal: TenantPrincipal = tenant_authentication,
+    ) -> ObservationReceipt:
+        require_tenant(principal, request.tenant_id)
         return await kernel.observe(request)
 
     @app.post(
@@ -75,7 +87,11 @@ def create_app(
         status_code=status.HTTP_201_CREATED,
         operation_id="remember",
     )
-    async def remember(request: RememberRequest) -> MemoryView:
+    async def remember(
+        request: RememberRequest,
+        principal: TenantPrincipal = tenant_authentication,
+    ) -> MemoryView:
+        require_tenant(principal, request.tenant_id)
         return await kernel.remember(request)
 
     @app.post(
@@ -84,7 +100,11 @@ def create_app(
         status_code=status.HTTP_201_CREATED,
         operation_id="recordFeedback",
     )
-    async def record_feedback(request: FeedbackRequest) -> FeedbackReceipt:
+    async def record_feedback(
+        request: FeedbackRequest,
+        principal: TenantPrincipal = tenant_authentication,
+    ) -> FeedbackReceipt:
+        require_tenant(principal, request.tenant_id)
         return await kernel.record_feedback(request)
 
     @app.post(
@@ -92,7 +112,11 @@ def create_app(
         response_model=RecallResult,
         operation_id="recall",
     )
-    async def recall(request: RecallRequest) -> RecallResult:
+    async def recall(
+        request: RecallRequest,
+        principal: TenantPrincipal = tenant_authentication,
+    ) -> RecallResult:
+        require_tenant(principal, request.tenant_id)
         return await kernel.recall(request)
 
     @app.get(
@@ -100,7 +124,12 @@ def create_app(
         response_model=MemoryView,
         operation_id="getMemory",
     )
-    async def get_memory(memory_id: Identifier, tenant_id: Identifier) -> MemoryView:
+    async def get_memory(
+        memory_id: Identifier,
+        tenant_id: Identifier,
+        principal: TenantPrincipal = tenant_authentication,
+    ) -> MemoryView:
+        require_tenant(principal, tenant_id)
         return await kernel.get_memory(tenant_id, memory_id)
 
     @app.get(
@@ -111,21 +140,32 @@ def create_app(
     async def get_observation_job(
         job_id: Identifier,
         tenant_id: Identifier,
+        principal: TenantPrincipal = tenant_authentication,
     ) -> ObservationProcessingJobView:
+        require_tenant(principal, tenant_id)
         return await kernel.get_observation_job(tenant_id, job_id)
 
     return app
 
 
-def _register_deletion_routes(app: FastAPI, kernel: MemoryKernel) -> None:
+def _register_deletion_routes(
+    app: FastAPI,
+    kernel: MemoryKernel,
+    authenticator: TenantApiKeyAuthenticator,
+) -> None:
     """Expose command, status, and edge propagation over one shared use case."""
+    tenant_authentication = Depends(authenticator)
 
     @app.post(
         "/v1/forget",
         response_model=ForgetReceipt,
         operation_id="forget",
     )
-    async def forget(request: ForgetRequest) -> ForgetReceipt:
+    async def forget(
+        request: ForgetRequest,
+        principal: TenantPrincipal = tenant_authentication,
+    ) -> ForgetReceipt:
+        require_tenant(principal, request.tenant_id)
         return await kernel.forget(request)
 
     @app.get(
@@ -137,7 +177,9 @@ def _register_deletion_routes(app: FastAPI, kernel: MemoryKernel) -> None:
         tenant_id: Identifier,
         cursor: Identifier | None = None,
         limit: Annotated[int, Query(ge=1, le=100)] = 100,
+        principal: TenantPrincipal = tenant_authentication,
     ) -> DeletionPage:
+        require_tenant(principal, tenant_id)
         return await kernel.list_deletions(
             DeletionListRequest(tenant_id=tenant_id, cursor=cursor, limit=limit)
         )
@@ -150,11 +192,23 @@ def _register_deletion_routes(app: FastAPI, kernel: MemoryKernel) -> None:
     async def get_forget_status(
         tombstone_id: Identifier,
         tenant_id: Identifier,
+        principal: TenantPrincipal = tenant_authentication,
     ) -> ForgetReceipt:
+        require_tenant(principal, tenant_id)
         return await kernel.get_forget_status(tenant_id, tombstone_id)
 
 
 def _register_request_error_handlers(app: FastAPI) -> None:
+    @app.exception_handler(AuthenticationError)
+    async def handle_authentication_error(
+        _request: Request,
+        error: AuthenticationError,
+    ) -> JSONResponse:
+        response = _error_response(error.status_code, code=error.code, message=error.message)
+        if error.status_code == status.HTTP_401_UNAUTHORIZED:
+            response.headers["WWW-Authenticate"] = "Bearer"
+        return response
+
     @app.exception_handler(RequestValidationError)
     async def handle_request_validation(
         _request: Request,
