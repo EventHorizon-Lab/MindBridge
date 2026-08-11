@@ -28,11 +28,14 @@ git diff --check
 
 ## Local PostgreSQL
 
-The production store uses PostgreSQL 18 with pgvector. Start the pinned development database with Docker Compose and apply the initial migration once:
+The production store uses PostgreSQL 18 with pgvector. Start the pinned development database and
+apply every migration in order to a fresh database:
 
 ```bash
 docker compose up -d postgres redis
-docker compose exec -T postgres psql -v ON_ERROR_STOP=1 -U mindbridge -d mindbridge < migrations/0001_initial.sql
+for migration in migrations/*.sql; do
+  docker compose exec -T postgres psql -v ON_ERROR_STOP=1 -U mindbridge -d mindbridge < "$migration"
+done
 ```
 
 Run the PostgreSQL contract tests against a disposable database whose name ends in `_test`:

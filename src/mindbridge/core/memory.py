@@ -21,9 +21,10 @@ from mindbridge.core.identifiers import (
 
 
 class VerificationStatus(str, Enum):
-    """Whether evidence is sufficient to present a derived record as fact."""
+    """How a record is supported without conflating reports and observations."""
 
     VERIFIED = "verified"
+    ATTESTED = "attested"
     UNVERIFIED = "unverified"
 
 

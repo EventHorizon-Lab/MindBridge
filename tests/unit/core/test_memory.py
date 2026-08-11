@@ -66,6 +66,23 @@ def test_unverified_claim_may_record_unsupported_input() -> None:
     assert claim.evidence_ids == ()
 
 
+def test_attested_memory_preserves_source_statement_without_claiming_observation() -> None:
+    """Caller-provided text stays usable while distinct from verified sensor evidence."""
+    memory = MemoryRecord(
+        memory_id=MemoryId("memory_attested"),
+        tenant_id=TENANT_ID,
+        memory_type=MemoryType.SEMANTIC,
+        summary="Caroline said she plans to become a counselor.",
+        evidence_ids=(),
+        occurred_at=NOW,
+        ended_at=NOW,
+        created_at=NOW,
+        verification_status=VerificationStatus.ATTESTED,
+    )
+
+    assert memory.verification_status is VerificationStatus.ATTESTED
+
+
 def test_verified_memory_requires_evidence() -> None:
     """The unified memory view cannot turn an unsupported summary into fact."""
     with pytest.raises(DomainInvariantError, match="verified memory"):

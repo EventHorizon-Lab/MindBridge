@@ -124,9 +124,7 @@ class MemoryKernel:
             ended_at=request.ended_at or request.occurred_at,
             created_at=self._clock(),
             verification_status=(
-                VerificationStatus.VERIFIED
-                if request.evidence_ids
-                else VerificationStatus.UNVERIFIED
+                VerificationStatus.VERIFIED if request.evidence_ids else VerificationStatus.ATTESTED
             ),
         )
         result = await self._store.write_memory(
@@ -158,8 +156,12 @@ class MemoryKernel:
         )
         answer = None
         confidence = 0.0
-        supported_memories = tuple(memory for memory in memories if memory.evidence_ids)
-        if supported_memories and evidence and request.mode is not RecallMode.SEARCH:
+        supported_memories = tuple(
+            memory
+            for memory in memories
+            if memory.evidence_ids or memory.verification_status is VerificationStatus.ATTESTED
+        )
+        if supported_memories and request.mode is not RecallMode.SEARCH:
             generated = await self._answerer.answer(request, supported_memories, evidence)
             answer = generated.answer
             confidence = generated.confidence

@@ -28,8 +28,9 @@ async def database_url() -> AsyncIterator[str]:
         if not database_name.endswith("_test"):
             raise RuntimeError("integration database name must end with _test")
         await connection.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public", prepare=False)
-        migration = Path(__file__).parents[2] / "migrations" / "0001_initial.sql"
-        await connection.execute(migration.read_text(encoding="utf-8"), prepare=False)
+        migration_directory = Path(__file__).parents[2] / "migrations"
+        for migration in sorted(migration_directory.glob("[0-9][0-9][0-9][0-9]_*.sql")):
+            await connection.execute(migration.read_text(encoding="utf-8"), prepare=False)
     yield DATABASE_URL
 
 

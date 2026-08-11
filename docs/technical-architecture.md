@@ -141,7 +141,9 @@ flowchart LR
 | `Summary` | 对 Event、Episode、日或主题的压缩表示 | 否 |
 | `MemoryRecord` | 对外统一返回的 Episode、Claim、Summary 或显式记忆 | 否 |
 
-任何派生内容都必须带 `evidence_ids`、模型版本和生成时间。缺少证据的内容只能标记为 `unverified`，不能伪装成观察事实。
+任何派生内容都必须带 `evidence_ids`、模型版本和生成时间。缺少证据的派生内容只能标记为
+`unverified`，不能伪装成观察事实。通过 `remember` 原样提交的来源陈述标记为 `attested`：它可
+作为“某调用者曾这样陈述”的依据，但不等同于传感器证据支持的 `verified` 事实。
 
 ### 4.2 分层记忆
 

@@ -107,6 +107,38 @@ async def test_omni_rejects_invalid_structured_output() -> None:
         await answerer.close()
 
 
+async def test_omni_uses_attested_source_statement_without_media() -> None:
+    """Explicit text is labeled as a report and never promoted to observed evidence."""
+
+    async def respond(request: httpx.Request) -> httpx.Response:
+        payload: dict[str, object] = json.loads(request.content)
+        messages = cast(list[dict[str, object]], payload["messages"])
+        assert 'marked "attested"' in cast(str, messages[0]["content"])
+        user_content = cast(list[dict[str, object]], messages[1]["content"])
+        assert '"verification_status":"attested"' in cast(str, user_content[0]["text"])
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=_completion_stream(
+                '{"answer":"Caroline plans to become a counselor",', '"confidence":0.8}'
+            ),
+        )
+
+    answerer = _answerer(respond)
+    memory = _memory((), verification_status=VerificationStatus.ATTESTED)
+    try:
+        answer = await answerer.answer(
+            RecallRequest(tenant_id="tenant_01", query=RecallQuery(text="What is her plan?")),
+            (memory,),
+            (),
+        )
+    finally:
+        await answerer.close()
+
+    assert answer.answer == "Caroline plans to become a counselor"
+    assert answer.confidence == 0.8
+
+
 @pytest.mark.parametrize(
     ("endpoint", "expected"),
     [
@@ -168,7 +200,11 @@ def _resolved_evidence(
     )
 
 
-def _memory(evidence_ids: tuple[EvidenceId, ...]) -> MemoryRecord:
+def _memory(
+    evidence_ids: tuple[EvidenceId, ...],
+    *,
+    verification_status: VerificationStatus = VerificationStatus.VERIFIED,
+) -> MemoryRecord:
     return MemoryRecord(
         memory_id=MemoryId("memory_01"),
         tenant_id=TenantId("tenant_01"),
@@ -178,7 +214,7 @@ def _memory(evidence_ids: tuple[EvidenceId, ...]) -> MemoryRecord:
         occurred_at=NOW,
         ended_at=NOW,
         created_at=NOW,
-        verification_status=VerificationStatus.VERIFIED,
+        verification_status=verification_status,
     )
 
 

@@ -36,6 +36,7 @@ from mindbridge.core import (
     MediaKind,
     MediaObject,
     MediaObjectId,
+    MemoryId,
     MemoryRecord,
     MemoryType,
     ModelReference,
@@ -343,8 +344,8 @@ async def test_recall_without_candidates_abstains_without_model_call() -> None:
     assert answerer.calls == 0
 
 
-async def test_recall_abstains_when_candidate_has_no_evidence() -> None:
-    """An unverified summary may be returned by search but cannot ground an answer."""
+async def test_recall_answers_from_attested_source_memory() -> None:
+    """Explicit remembered text is usable without being labeled as sensor-verified."""
     store = InMemoryStore()
     answerer = RecordingAnswerer()
     kernel = _kernel(store, answerer)
@@ -355,8 +356,35 @@ async def test_recall_abstains_when_candidate_has_no_evidence() -> None:
     )
 
     assert len(result.memories) == 1
+    assert result.memories[0].verification_status is VerificationStatus.ATTESTED
+    assert result.answer == "The robot put the red screwdriver beside the blue toolbox."
+    assert result.confidence == 0.9
+    assert answerer.calls == 1
+
+
+async def test_recall_abstains_from_unverified_derived_summary() -> None:
+    """Unsupported derived content remains searchable but cannot ground an answer."""
+    store = InMemoryStore()
+    answerer = RecordingAnswerer()
+    memory = MemoryRecord(
+        memory_id=MemoryId("memory_unverified"),
+        tenant_id=TenantId("tenant_01"),
+        memory_type=MemoryType.SEMANTIC,
+        summary="An unsupported derived summary.",
+        evidence_ids=(),
+        occurred_at=NOW,
+        ended_at=NOW,
+        created_at=NOW,
+        verification_status=VerificationStatus.UNVERIFIED,
+    )
+    await store.write_memory(memory, idempotency_key="unverified", content_digest="a" * 64)
+
+    result = await _kernel(store, answerer).recall(
+        RecallRequest(tenant_id="tenant_01", query=RecallQuery(text="unsupported derived"))
+    )
+
+    assert len(result.memories) == 1
     assert result.answer is None
-    assert result.confidence == 0.0
     assert answerer.calls == 0
 
 

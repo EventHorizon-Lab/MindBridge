@@ -120,6 +120,12 @@ async def test_migration_installs_complete_phase_zero_schema(database_url: str) 
         "memory_records",
         "observations",
     } <= {cast(tuple[str], row)[0] for row in tables}
+    connection = await AsyncConnection.connect(database_url)
+    async with connection:
+        versions = await (
+            await connection.execute("SELECT version FROM schema_migrations ORDER BY version")
+        ).fetchall()
+    assert [cast(tuple[int], row)[0] for row in versions] == [1, 2]
 
 
 async def test_postgres_vertical_path_is_idempotent_and_evidence_first(
@@ -160,6 +166,30 @@ async def test_postgres_vertical_path_is_idempotent_and_evidence_first(
     assert result.evidence[0].evidence_id == evidence_id
     assert result.evidence[0].end_ms == 4_000
     assert result.evidence[0].media_url.startswith("https://objects.example.test/media_")
+
+
+async def test_postgres_round_trips_attested_source_memory(store: PostgresMemoryStore) -> None:
+    """Explicit source text survives persistence and can ground a reported answer."""
+    kernel = _kernel(store)
+    memory = await kernel.remember(
+        RememberRequest(
+            tenant_id="tenant_attested",
+            summary="Caroline said she plans to become a counselor.",
+            memory_type=MemoryType.SEMANTIC,
+            occurred_at=NOW,
+        )
+    )
+
+    result = await kernel.recall(
+        RecallRequest(
+            tenant_id="tenant_attested",
+            query=RecallQuery(text="plans to become a counselor"),
+        )
+    )
+
+    assert memory.verification_status is VerificationStatus.ATTESTED
+    assert result.answer == "Caroline said she plans to become a counselor."
+    assert result.evidence == ()
 
 
 async def test_postgres_rejects_idempotency_key_reuse(store: PostgresMemoryStore) -> None:
