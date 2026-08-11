@@ -26,6 +26,7 @@ from mindbridge.application.ports import (
     ResolvedEvidence,
 )
 from mindbridge.application.process_observation import ProcessObservation
+from mindbridge.application.ranking import fuse_memory_rankings
 
 __all__ = [
     "EmbeddingIndex",
@@ -51,5 +52,6 @@ __all__ = [
     "PresignedMediaUpload",
     "ProcessObservation",
     "ResolvedEvidence",
+    "fuse_memory_rankings",
     "resolve_evidence_media",
 ]
