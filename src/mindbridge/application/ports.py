@@ -18,6 +18,7 @@ from mindbridge.core import (
     JobId,
     MediaObject,
     MediaObjectId,
+    MemoryId,
     MemoryRecord,
     ModelReference,
     Observation,
@@ -236,6 +237,14 @@ class MemoryStore(Protocol):
         self,
         request: RecallRequest,
         ranked_evidence_ids: tuple[EvidenceId, ...],
+        *,
+        limit: int,
+    ) -> tuple[MemoryRecord, ...]: ...
+
+    async def search_memories_by_ids(
+        self,
+        request: RecallRequest,
+        ranked_memory_ids: tuple[MemoryId, ...],
         *,
         limit: int,
     ) -> tuple[MemoryRecord, ...]: ...

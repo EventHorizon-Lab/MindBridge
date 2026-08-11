@@ -31,6 +31,7 @@ from mindbridge.core import (
     JobState,
     MediaKind,
     MediaObject,
+    MemoryId,
     MemoryIntegrityError,
     MemoryRecord,
     MemoryType,
@@ -193,6 +194,28 @@ async def test_postgres_round_trips_attested_source_memory(store: PostgresMemory
     assert memory.verification_status is VerificationStatus.ATTESTED
     assert result.answer == "Caroline said she plans to become a counselor."
     assert result.evidence == ()
+
+    ranked_memory_ids = (MemoryId(memory.memory_id),)
+    matched = await store.search_memories_by_ids(
+        RecallRequest(
+            tenant_id="tenant_attested",
+            query=RecallQuery(text="words do not constrain dense candidates"),
+            filters=RecallFilters(memory_types=(MemoryType.SEMANTIC,)),
+        ),
+        ranked_memory_ids,
+        limit=10,
+    )
+    filtered = await store.search_memories_by_ids(
+        RecallRequest(
+            tenant_id="tenant_attested",
+            query=RecallQuery(text="words do not constrain dense candidates"),
+            filters=RecallFilters(memory_types=(MemoryType.EPISODIC,)),
+        ),
+        ranked_memory_ids,
+        limit=10,
+    )
+    assert [item.memory_id for item in matched] == [memory.memory_id]
+    assert filtered == ()
 
 
 async def test_postgres_rejects_idempotency_key_reuse(store: PostgresMemoryStore) -> None:

@@ -213,20 +213,34 @@ class MemoryKernel:
             media=await self._resolve_query_media(request),
         )
         values = await self._recall_embedder.encode_query(query)
-        matches = await self._embedding_index.search_embeddings(
-            EmbeddingSearch(
+        searches = {
+            object_type: EmbeddingSearch(
                 tenant_id=TenantId(request.tenant_id),
                 values=values,
                 model_reference=self._recall_embedder.model_reference,
                 document_task=RETRIEVAL_DOCUMENT_EMBEDDING_TASK,
-                object_types=(EmbeddedObjectType.EVIDENCE_SPAN,),
+                object_types=(object_type,),
                 limit=limit,
             )
+            for object_type in (
+                EmbeddedObjectType.EVIDENCE_SPAN,
+                EmbeddedObjectType.MEMORY_RECORD,
+            )
+        }
+        evidence_matches, memory_matches = await asyncio.gather(
+            self._embedding_index.search_embeddings(searches[EmbeddedObjectType.EVIDENCE_SPAN]),
+            self._embedding_index.search_embeddings(searches[EmbeddedObjectType.MEMORY_RECORD]),
         )
-        evidence_ids = tuple(dict.fromkeys(EvidenceId(match.object_id) for match in matches))
-        return await self._store.search_memories_by_evidence(
-            request,
-            evidence_ids,
+        evidence_ids = tuple(
+            dict.fromkeys(EvidenceId(match.object_id) for match in evidence_matches)
+        )
+        memory_ids = tuple(dict.fromkeys(MemoryId(match.object_id) for match in memory_matches))
+        evidence_memories, direct_memories = await asyncio.gather(
+            self._store.search_memories_by_evidence(request, evidence_ids, limit=limit),
+            self._store.search_memories_by_ids(request, memory_ids, limit=limit),
+        )
+        return fuse_memory_rankings(
+            (evidence_memories, direct_memories),
             limit=limit,
         )
 

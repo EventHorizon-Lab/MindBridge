@@ -20,6 +20,7 @@ from mindbridge.core import (
     JobId,
     MediaObject,
     MediaObjectId,
+    MemoryId,
     MemoryRecord,
     ObservationId,
     ObservationJobClaim,
@@ -39,6 +40,7 @@ from mindbridge.infrastructure._postgres_jobs import (
 from mindbridge.infrastructure._postgres_memories import (
     search_memories,
     search_memories_by_evidence,
+    search_memories_by_ids,
     write_memory,
 )
 from mindbridge.infrastructure._postgres_observation_reads import (
@@ -130,6 +132,21 @@ class PostgresMemoryStore:
             self._pool,
             request,
             ranked_evidence_ids,
+            limit=limit,
+        )
+
+    async def search_memories_by_ids(
+        self,
+        request: RecallRequest,
+        ranked_memory_ids: tuple[MemoryId, ...],
+        *,
+        limit: int,
+    ) -> tuple[MemoryRecord, ...]:
+        """Resolve ranked memory-vector hits with exact recall filters."""
+        return await search_memories_by_ids(
+            self._pool,
+            request,
+            ranked_memory_ids,
             limit=limit,
         )
 

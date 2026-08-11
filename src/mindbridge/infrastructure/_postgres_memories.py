@@ -127,6 +127,25 @@ async def search_memories_by_evidence(
         return tuple([_memory_from_row(cast(MemoryRow, row)) async for row in cursor])
 
 
+async def search_memories_by_ids(
+    pool: DatabasePool,
+    request: RecallRequest,
+    ranked_memory_ids: tuple[MemoryId, ...],
+    *,
+    limit: int,
+) -> tuple[MemoryRecord, ...]:
+    """Resolve semantic memory hits while retaining exact recall filters."""
+    if not ranked_memory_ids:
+        return ()
+    if limit <= 0:
+        raise DomainInvariantError("semantic memory candidate limit must be positive")
+    parameters = _recall_parameters(request)
+    parameters.update(memory_ids=list(ranked_memory_ids), limit=limit)
+    async with pool.connection() as connection:
+        cursor = await connection.execute(_SEARCH_MEMORIES_BY_IDS_SQL, parameters)
+        return tuple([_memory_from_row(cast(MemoryRow, row)) async for row in cursor])
+
+
 def _recall_parameters(request: RecallRequest) -> dict[str, Any]:
     return {
         "tenant_id": request.tenant_id,
@@ -336,5 +355,18 @@ JOIN ranked_memories AS dense
 WHERE memory.tenant_id = %(tenant_id)s
 {_STRUCTURED_RECALL_FILTER_SQL}
 ORDER BY dense.dense_rank, memory.occurred_at DESC, memory.memory_id
+LIMIT %(limit)s
+"""
+
+_SEARCH_MEMORIES_BY_IDS_SQL = f"""
+WITH ranked_memories AS (
+    SELECT memory_id, rank
+    FROM unnest(%(memory_ids)s::text[]) WITH ORDINALITY AS hit(memory_id, rank)
+)
+{_MEMORY_SELECT_SQL}
+JOIN ranked_memories AS dense ON dense.memory_id = memory.memory_id
+WHERE memory.tenant_id = %(tenant_id)s
+{_STRUCTURED_RECALL_FILTER_SQL}
+ORDER BY dense.rank, memory.occurred_at DESC, memory.memory_id
 LIMIT %(limit)s
 """

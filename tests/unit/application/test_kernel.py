@@ -150,6 +150,33 @@ class InMemoryStore:
             )
         )[:limit]
 
+    async def search_memories_by_ids(
+        self,
+        request: RecallRequest,
+        ranked_memory_ids: tuple[MemoryId, ...],
+        *,
+        limit: int,
+    ) -> tuple[MemoryRecord, ...]:
+        memory_by_id = {memory.memory_id: memory for _, memory in self.memories.values()}
+        return tuple(
+            memory_by_id[memory_id]
+            for memory_id in ranked_memory_ids
+            if memory_id in memory_by_id
+            and memory_by_id[memory_id].tenant_id == request.tenant_id
+            and (
+                not request.filters.memory_types
+                or memory_by_id[memory_id].memory_type in request.filters.memory_types
+            )
+            and (
+                request.filters.occurred_after is None
+                or memory_by_id[memory_id].occurred_at >= request.filters.occurred_after
+            )
+            and (
+                request.filters.occurred_before is None
+                or memory_by_id[memory_id].occurred_at <= request.filters.occurred_before
+            )
+        )[:limit]
+
     async def read_evidence(
         self,
         tenant_id: TenantId,
@@ -184,7 +211,9 @@ class InMemoryStore:
 
     async def search_embeddings(self, search: EmbeddingSearch) -> tuple[EmbeddingMatch, ...]:
         self.embedding_searches.append(search)
-        return self.embedding_matches[: search.limit]
+        return tuple(
+            match for match in self.embedding_matches if match.object_type in search.object_types
+        )[: search.limit]
 
 
 class DeterministicMediaUrlSigner:
@@ -464,6 +493,27 @@ async def test_semantic_evidence_finds_memory_without_matching_summary_text() ->
     assert result.memories[0].summary.startswith("The robot put")
     assert recall_embedder.queries[0].text == "a hand moves an object"
     assert store.embedding_searches[0].document_task == "retrieval_document"
+
+
+async def test_semantic_memory_finds_attested_text_without_matching_words() -> None:
+    store = InMemoryStore()
+    kernel = _kernel(store, RecordingAnswerer())
+    memory = await kernel.remember(_remember_request())
+    store.embedding_matches = (
+        EmbeddingMatch(
+            embedding_id="embedding_memory_01",
+            object_type=EmbeddedObjectType.MEMORY_RECORD,
+            object_id=memory.memory_id,
+            similarity=0.8,
+        ),
+    )
+
+    result = await kernel.recall(
+        RecallRequest(tenant_id="tenant_01", query=RecallQuery(text="where is the hand tool?"))
+    )
+
+    assert [item.memory_id for item in result.memories] == [memory.memory_id]
+    assert result.answer == memory.summary
 
 
 async def test_media_query_is_signed_for_embedding_instead_of_used_as_a_filter() -> None:
