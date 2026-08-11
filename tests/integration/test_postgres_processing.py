@@ -10,7 +10,11 @@ import pytest
 from psycopg import AsyncConnection
 
 from mindbridge.application import (
+    ClaimCandidate,
     ClaimCandidateRequest,
+    ClaimConsolidation,
+    ClaimRelationshipProposal,
+    ConsolidateClaims,
     ConsolidateEpisodes,
     EmbeddingInput,
     EmbeddingSearch,
@@ -26,11 +30,15 @@ from mindbridge.application import (
     PresignedMediaDownload,
     ProcessObservation,
     ResolvedEvidence,
+    SemanticClaimProposal,
 )
 from mindbridge.contracts import RecallFilters, RecallQuery, RecallRequest
 from mindbridge.core import (
     AnonymousIdentityObservation,
+    ClaimId,
     ClaimType,
+    DeletionPropagationState,
+    DeletionTombstone,
     DeviceId,
     DomainInvariantError,
     EmbeddedObjectType,
@@ -41,6 +49,7 @@ from mindbridge.core import (
     EventStatus,
     EvidenceId,
     EvidenceSpan,
+    ForgetTargetType,
     IdentityKind,
     JobId,
     JobState,
@@ -51,8 +60,11 @@ from mindbridge.core import (
     ModelReference,
     Observation,
     ObservationId,
+    RelationType,
     SensorKind,
     TenantId,
+    TombstoneId,
+    derive_stable_id,
 )
 from mindbridge.infrastructure import PostgresMemoryStore
 
@@ -201,6 +213,41 @@ class CoordinatedEpisodeConsolidator:
             self._ready.set()
         await asyncio.wait_for(self._ready.wait(), timeout=2)
         return _episode_consolidation(events)
+
+
+class RecordingClaimConsolidator:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def propose_claims(
+        self,
+        candidates: tuple[ClaimCandidate, ...],
+        evidence: tuple[ResolvedEvidence, ...],
+    ) -> ClaimConsolidation:
+        self.calls += 1
+        assert {item.evidence_span.evidence_id for item in evidence} == {
+            evidence_id for candidate in candidates for evidence_id in candidate.claim.evidence_ids
+        }
+        return _claim_consolidation(candidates)
+
+
+class CoordinatedClaimConsolidator(RecordingClaimConsolidator):
+    """Hold two stale semantic proposals until both workers are ready to commit."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._ready = asyncio.Event()
+
+    async def propose_claims(
+        self,
+        candidates: tuple[ClaimCandidate, ...],
+        evidence: tuple[ResolvedEvidence, ...],
+    ) -> ClaimConsolidation:
+        consolidation = await super().propose_claims(candidates, evidence)
+        if self.calls == 2:
+            self._ready.set()
+        await asyncio.wait_for(self._ready.wait(), timeout=2)
+        return consolidation
 
 
 class DeterministicSigner:
@@ -580,6 +627,141 @@ async def test_episode_consolidation_is_atomic_recallable_and_retry_safe(
     )
 
 
+async def test_claim_consolidation_is_atomic_versioned_and_forget_safe(
+    store: PostgresMemoryStore,
+    database_url: str,
+) -> None:
+    tenant_id = TenantId("tenant_claim_commit")
+    sources: tuple[tuple[TenantId, ObservationId, JobId], ...] = tuple(
+        [
+            await _write_source_observation(
+                store,
+                tenant_id,
+                ordinal=ordinal,
+                occurred_at=NOW + timedelta(seconds=5 * (ordinal - 1)),
+                include_identity=False,
+            )
+            for ordinal in range(1, 5)
+        ]
+    )
+    for _, observation_id, job_id in sources:
+        await ProcessObservation(
+            store,
+            RecordingPerceiver(),
+            FixedEmbedder(),
+            FixedTextEmbedder(),
+            media_url_signer=DeterministicSigner(),
+        ).run(tenant_id, observation_id, job_id)
+
+    request = ClaimCandidateRequest(
+        tenant_id=tenant_id,
+        evaluated_at=NOW + timedelta(days=2),
+        maximum_gap_seconds=30,
+        minimum_similarity=0.99,
+    )
+    candidates = (await store.list_claim_candidates(request)).candidates
+    ordered = tuple(sorted(candidates, key=lambda candidate: candidate.claim.valid_from))
+    source_claim_id = ordered[3].claim.claim_id
+    target_claim_id = ordered[2].claim.claim_id
+    with pytest.raises(DomainInvariantError, match="cloud embedding dimension"):
+        await ConsolidateClaims(
+            store,
+            RecordingClaimConsolidator(),
+            FixedTextEmbedder(dimension=2),
+            media_url_signer=DeterministicSigner(),
+        ).run(request)
+
+    assert await _semantic_claim_counts(database_url, tenant_id) == (0,) * 5
+    assert await _claim_version_state(
+        database_url,
+        tenant_id,
+        source_claim_id,
+        target_claim_id,
+    ) == (None, None, None)
+
+    coordinated = CoordinatedClaimConsolidator()
+    results = await asyncio.gather(
+        *(
+            ConsolidateClaims(
+                store,
+                coordinated,
+                FixedTextEmbedder(),
+                media_url_signer=DeterministicSigner(),
+            ).run(request)
+            for _ in range(2)
+        )
+    )
+    assert sorted(
+        (result.committed_semantic_claim_count, result.committed_relationship_count)
+        for result in results
+    ) == [(0, 0), (1, 1)]
+    assert await _semantic_claim_counts(database_url, tenant_id) == (1, 1, 2, 2, 1)
+    source_target, target_superseded_at, memory_superseded_at = await _claim_version_state(
+        database_url,
+        tenant_id,
+        source_claim_id,
+        target_claim_id,
+    )
+    assert source_target == target_claim_id
+    assert target_superseded_at == request.evaluated_at
+    assert memory_superseded_at == request.evaluated_at
+    next_candidate_ids = {
+        candidate.claim.claim_id
+        for candidate in (await store.list_claim_candidates(request)).candidates
+    }
+    assert next_candidate_ids == set()
+
+    graph_matches = await store.search_embeddings(
+        EmbeddingSearch(
+            tenant_id=tenant_id,
+            values=(1.0,) + (0.0,) * 1_023,
+            space_reference=EmbeddingSpaceReference(space_id="jina-v5", revision="space-v1"),
+            document_task="retrieval_document",
+            object_types=(EmbeddedObjectType.CLAIM,),
+            limit=20,
+        )
+    )
+    memories = await store.search_memories_by_graph_objects(
+        RecallRequest(tenant_id=tenant_id, query=RecallQuery(text="red tool")),
+        graph_matches,
+        limit=20,
+    )
+    assert any(memory.summary == _SEMANTIC_CLAIM_STATEMENT for memory in memories)
+
+    forgotten_observation_id = sources[3][1]
+    tombstone = DeletionTombstone(
+        tombstone_id=TombstoneId(
+            derive_stable_id(
+                "tombstone",
+                tenant_id,
+                ForgetTargetType.OBSERVATION.value,
+                forgotten_observation_id,
+            )
+        ),
+        tenant_id=tenant_id,
+        target_type=ForgetTargetType.OBSERVATION,
+        target_id=forgotten_observation_id,
+        propagation_state=DeletionPropagationState.PENDING,
+        requested_at=request.evaluated_at,
+    )
+    plan = await store.prepare_forget(
+        tombstone,
+        idempotency_key="forget_superseding_claim",
+        content_digest="f" * 64,
+    )
+    await store.complete_forget(
+        plan.tombstone,
+        completed_at=request.evaluated_at + timedelta(seconds=1),
+    )
+
+    assert await _claim_version_state(
+        database_url,
+        tenant_id,
+        source_claim_id,
+        target_claim_id,
+    ) == (None, None, None)
+
+
 async def test_superseded_attempt_cannot_commit(
     store: PostgresMemoryStore,
     database_url: str,
@@ -712,6 +894,35 @@ def _episode_consolidation(events: tuple[Event, ...]) -> EpisodeConsolidation:
     )
 
 
+_SEMANTIC_CLAIM_STATEMENT = "Across two observations, the red tool remained beside the toolbox."
+
+
+def _claim_consolidation(candidates: tuple[ClaimCandidate, ...]) -> ClaimConsolidation:
+    ordered = tuple(sorted(candidates, key=lambda candidate: candidate.claim.valid_from))
+    assert len(ordered) == 4
+    return ClaimConsolidation(
+        semantic_claims=(
+            SemanticClaimProposal(
+                source_claim_ids=(ordered[0].claim.claim_id, ordered[1].claim.claim_id),
+                statement=_SEMANTIC_CLAIM_STATEMENT,
+                confidence=0.94,
+            ),
+        ),
+        relationships=(
+            ClaimRelationshipProposal(
+                source_claim_id=ordered[3].claim.claim_id,
+                relation_type=RelationType.SUPERSEDES,
+                target_claim_id=ordered[2].claim.claim_id,
+            ),
+        ),
+        model_reference=ModelReference(
+            model_id="qwen3.8-max",
+            revision="claim-serving-revision-01",
+        ),
+        prompt_version="consolidate_claims_v1",
+    )
+
+
 async def _derived_counts(database_url: str, tenant_id: TenantId) -> DerivedCounts:
     connection = await AsyncConnection.connect(database_url)
     async with connection:
@@ -779,6 +990,75 @@ async def _episode_counts(
             )
         ).fetchone()
     return cast(tuple[int, int, int, int, int, int], row)
+
+
+async def _semantic_claim_counts(
+    database_url: str,
+    tenant_id: TenantId,
+) -> tuple[int, int, int, int, int]:
+    connection = await AsyncConnection.connect(database_url)
+    async with connection:
+        row = await (
+            await connection.execute(
+                """
+                WITH semantic_claim AS (
+                    SELECT claim_id FROM claims
+                    WHERE tenant_id = %s AND prompt_version = 'consolidate_claims_v1'
+                )
+                SELECT
+                    (SELECT count(*) FROM semantic_claim),
+                    (SELECT count(*) FROM memory_records AS memory
+                     WHERE memory.tenant_id = %s
+                       AND memory.model_revision = 'claim-serving-revision-01'),
+                    (SELECT count(*) FROM claim_evidence AS link
+                     WHERE link.tenant_id = %s
+                       AND link.claim_id IN (SELECT claim_id FROM semantic_claim)),
+                    (SELECT count(*) FROM relations AS relation
+                     WHERE relation.tenant_id = %s
+                       AND relation.relation_type = 'supports'
+                       AND relation.target_id IN (SELECT claim_id FROM semantic_claim)),
+                    (SELECT count(*) FROM relations AS relation
+                     WHERE relation.tenant_id = %s
+                       AND relation.relation_type = 'supersedes')
+                """,
+                (tenant_id,) * 5,
+            )
+        ).fetchone()
+    return cast(tuple[int, int, int, int, int], row)
+
+
+async def _claim_version_state(
+    database_url: str,
+    tenant_id: TenantId,
+    source_claim_id: ClaimId,
+    target_claim_id: ClaimId,
+) -> tuple[str | None, datetime | None, datetime | None]:
+    connection = await AsyncConnection.connect(database_url)
+    async with connection:
+        row = await (
+            await connection.execute(
+                """
+                SELECT source.supersedes_claim_id,
+                       target.superseded_at,
+                       memory.superseded_at
+                FROM claims AS target
+                LEFT JOIN claims AS source
+                  ON source.tenant_id = target.tenant_id AND source.claim_id = %s
+                JOIN relations AS representation
+                  ON representation.tenant_id = target.tenant_id
+                 AND representation.source_type = 'claim'
+                 AND representation.source_id = target.claim_id
+                 AND representation.relation_type = 'represented_by'
+                 AND representation.target_type = 'memory_record'
+                JOIN memory_records AS memory
+                  ON memory.tenant_id = representation.tenant_id
+                 AND memory.memory_id = representation.target_id
+                WHERE target.tenant_id = %s AND target.claim_id = %s
+                """,
+                (source_claim_id, tenant_id, target_claim_id),
+            )
+        ).fetchone()
+    return cast(tuple[str | None, datetime | None, datetime | None], row)
 
 
 async def _age_running_job(

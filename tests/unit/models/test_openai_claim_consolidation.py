@@ -38,7 +38,7 @@ async def test_claim_consolidator_inspects_native_evidence_and_preserves_revisio
         messages = cast(list[dict[str, object]], payload["messages"])
         content = cast(list[dict[str, object]], messages[1]["content"])
         assert {part["type"] for part in content} >= {"video_url", "input_audio"}
-        assert "claim_03" in cast(str, content[0]["text"])
+        assert "claim_04" in cast(str, content[0]["text"])
         return _streaming_response(
             {
                 "semantic_claims": [
@@ -50,9 +50,9 @@ async def test_claim_consolidator_inspects_native_evidence_and_preserves_revisio
                 ],
                 "relationships": [
                     {
-                        "source_claim_id": "claim_03",
+                        "source_claim_id": "claim_04",
                         "relation_type": "contradicts",
-                        "target_claim_id": "claim_01",
+                        "target_claim_id": "claim_03",
                     }
                 ],
             },
@@ -94,7 +94,7 @@ async def test_claim_consolidator_rejects_unknown_and_reversed_relationships() -
                     {
                         "source_claim_id": "claim_01",
                         "relation_type": "supersedes",
-                        "target_claim_id": "claim_03",
+                        "target_claim_id": "claim_04",
                     }
                 ],
             },
@@ -153,6 +153,7 @@ def _candidates() -> tuple[tuple[ClaimCandidate, ...], tuple[ResolvedEvidence, .
                 "The red tool is beside the blue toolbox.",
                 "The red tool remains beside the blue toolbox.",
                 "The red tool is no longer beside the blue toolbox.",
+                "The red tool remains away from the blue toolbox.",
             ),
             start=1,
         )
@@ -160,7 +161,7 @@ def _candidates() -> tuple[tuple[ClaimCandidate, ...], tuple[ResolvedEvidence, .
     evidence = tuple(
         _evidence(index, kind)
         for index, kind in enumerate(
-            (MediaKind.VIDEO, MediaKind.AUDIO, MediaKind.IMAGE),
+            (MediaKind.VIDEO, MediaKind.AUDIO, MediaKind.IMAGE, MediaKind.VIDEO),
             start=1,
         )
     )

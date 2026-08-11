@@ -529,7 +529,9 @@ MindBridge 的学习对象是记忆状态：
 
 不允许仅因向量相似就自动合并身份或互相矛盾的事件。
 
-当前 Episode 路径已经实现为 `mindbridge-consolidate` 租户级计划任务。PostgreSQL 只枚举
+当前 Episode 与 Claim 路径已经实现为同一个 `mindbridge-consolidate` 租户级计划任务。每轮以
+严格早于固定 `evaluated_at` 的记录作为稳定快照，新生成的聚合只会在下一轮继续演化。
+PostgreSQL 只枚举
 `active`、尚无父节点的基础 Event，并用可校准的时间邻近、实体重叠或同一 Jina 兼容空间中的
 Event 向量相似度扩展最多 64 个候选。Omni/VLM 必须直接读取候选引用的全部原始 AV
 EvidenceSpan，并通过严格 schema 返回互不重叠的 Event 分组；摘要相似本身不能触发合并。
@@ -542,8 +544,23 @@ PostgreSQL 事务按稳定顺序锁定全部子 Event，只有仍为 active、�
 状态。稳定 ID 包含子 Event、模型 revision、Prompt version 和固定 `evaluated_at`，同一次扫描可
 安全重放。计划频率交给既有 CronJob、systemd 或 Celery beat，不在框架内再造调度器。
 
-重复 Claim 的支持/冲突/替代验证和日/人物/地点/主题 Summary 仍按 Benchmark 失败案例逐项加入；
-它们复用同一候选—原始证据核验—原子版本写入模式，不提前建设通用工作流引擎。
+Claim 路径只枚举当前、未被吸收的 verified Claim，以共享 Entity 或同一 Jina v5 空间中的 Claim
+向量发现候选，并排除已有 `supports`、`contradicts` 或 `supersedes` 决策的 Claim 对。冻结的
+Omni/VLM 直接检查每条 Claim 对应的原始图像、视频和音频，通过严格 schema 产生两类互斥结果：
+
+- 两条及以上独立证据支持同一持久事实时，生成一个联合全部 EvidenceSpan 和 Entity 的 verified
+  Semantic Claim、Semantic MemoryRecord、Text Small Claim 向量，以及来源 Claim 指向新 Claim
+  的 `supports` 边；
+- 证据不兼容时只生成显式有向 `contradicts` 或 `supersedes` 边；`supersedes` 的来源必须是时间上
+  更晚的 Claim，并同时关闭旧 Claim 及其所代表的 MemoryRecord。
+
+一次 PostgreSQL 事务按 Claim ID 排序加行锁，完整写入新 Claim、Evidence、MemoryRecord、关系和
+Embedding；并发过期提案只能成为幂等重放或被跳过。显式遗忘替代来源时，若不存在其他替代边或
+用户纠正，旧 Claim 与其 MemoryRecord 会在同一删除事务中恢复为当前版本。整个过程不微调任何
+模型，也不依赖通用工作流引擎。
+
+日、人物、地点和主题级 Summary 继续按 Benchmark 失败案例逐项加入，并复用相同的候选—原始
+证据核验—原子版本写入模式。
 
 ### 8.3 记忆强度
 

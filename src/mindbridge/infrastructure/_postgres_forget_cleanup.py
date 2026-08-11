@@ -148,6 +148,19 @@ async def delete_observation_scope(
         """,
         (tenant_id, list(evidence_ids)),
     )
+    restorable_claim_ids = await _select_ids(
+        connection,
+        """
+        SELECT target_id FROM relations
+        WHERE tenant_id = %s
+          AND source_type = 'claim'
+          AND source_id = ANY(%s)
+          AND relation_type = 'supersedes'
+          AND target_type = 'claim'
+          AND NOT (target_id = ANY(%s))
+        """,
+        (tenant_id, list(claim_ids), list(claim_ids)),
+    )
     entity_ids = await _select_ids(
         connection,
         """
@@ -171,6 +184,7 @@ async def delete_observation_scope(
             "DELETE FROM claims WHERE tenant_id = %s AND claim_id = ANY(%s)",
             (tenant_id, list(claim_ids)),
         )
+    await _restore_claim_versions(connection, tenant_id, restorable_claim_ids)
     if event_ids:
         await connection.execute(
             "DELETE FROM events WHERE tenant_id = %s AND event_id = ANY(%s)",
@@ -242,6 +256,50 @@ async def _delete_typed_derivatives(
         (tenant_id, object_type, list(object_ids)),
     )
     await _delete_relations(connection, tenant_id, object_type, object_ids)
+
+
+async def _restore_claim_versions(
+    connection: DatabaseConnection,
+    tenant_id: TenantId,
+    claim_ids: tuple[str, ...],
+) -> None:
+    if not claim_ids:
+        return
+    await connection.execute(
+        """
+        WITH restored AS (
+            UPDATE claims AS claim SET superseded_at = NULL
+            WHERE claim.tenant_id = %s
+              AND claim.claim_id = ANY(%s)
+              AND NOT EXISTS (
+                  SELECT 1 FROM relations AS replacement
+                  WHERE replacement.tenant_id = claim.tenant_id
+                    AND replacement.source_type = 'claim'
+                    AND replacement.relation_type = 'supersedes'
+                    AND replacement.target_type = 'claim'
+                    AND replacement.target_id = claim.claim_id
+              )
+            RETURNING claim.claim_id
+        )
+        UPDATE memory_records AS memory SET superseded_at = NULL
+        FROM restored
+        JOIN relations AS representation
+          ON representation.tenant_id = %s
+         AND representation.source_type = 'claim'
+         AND representation.source_id = restored.claim_id
+         AND representation.relation_type = 'represented_by'
+         AND representation.target_type = 'memory_record'
+        WHERE memory.tenant_id = representation.tenant_id
+          AND memory.memory_id = representation.target_id
+          AND NOT EXISTS (
+              SELECT 1 FROM memory_feedback AS feedback
+              WHERE feedback.tenant_id = memory.tenant_id
+                AND feedback.memory_id = memory.memory_id
+                AND feedback.corrected_memory_id IS NOT NULL
+          )
+        """,
+        (tenant_id, list(claim_ids), tenant_id),
+    )
 
 
 async def _delete_relations(

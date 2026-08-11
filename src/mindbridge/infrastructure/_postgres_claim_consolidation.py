@@ -129,7 +129,7 @@ def _claim_candidate_from_row(row: ClaimCandidateRow) -> ClaimCandidate:
 
 _CURRENT_CLAIM_SQL = """
 claim.superseded_at IS NULL
-AND claim.created_at <= %(evaluated_at)s
+AND claim.created_at < %(evaluated_at)s
 AND NOT EXISTS (
     SELECT 1 FROM relations AS absorbed
     WHERE absorbed.tenant_id = claim.tenant_id

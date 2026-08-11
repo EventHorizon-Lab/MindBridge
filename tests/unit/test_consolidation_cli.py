@@ -4,15 +4,19 @@ from datetime import datetime, timezone
 from typing import cast
 
 from mindbridge.application import (
+    ClaimCandidateRequest,
+    ClaimConsolidationResult,
+    ConsolidateClaims,
     ConsolidateEpisodes,
     EpisodeCandidateRequest,
     EpisodeConsolidationResult,
 )
 from mindbridge.consolidation_cli import (
     ConsolidationSettings,
+    consolidate_tenant_claims,
     consolidate_tenant_episodes,
 )
-from mindbridge.core import EventId, TenantId
+from mindbridge.core import ClaimId, EventId, TenantId
 
 NOW = datetime(2026, 8, 12, 12, 0, tzinfo=timezone.utc)
 
@@ -40,6 +44,33 @@ class ScriptedConsolidation:
         )
 
 
+class ScriptedClaimConsolidation:
+    def __init__(self) -> None:
+        self.requests: list[ClaimCandidateRequest] = []
+
+    async def run(self, request: ClaimCandidateRequest) -> ClaimConsolidationResult:
+        self.requests.append(request)
+        if request.after_claim_id is None:
+            return ClaimConsolidationResult(
+                scanned_count=2,
+                candidate_count=4,
+                proposed_semantic_claim_count=1,
+                proposed_relationship_count=1,
+                committed_semantic_claim_count=1,
+                committed_relationship_count=1,
+                next_cursor=ClaimId("claim_02"),
+            )
+        return ClaimConsolidationResult(
+            scanned_count=1,
+            candidate_count=0,
+            proposed_semantic_claim_count=0,
+            proposed_relationship_count=0,
+            committed_semantic_claim_count=0,
+            committed_relationship_count=0,
+            next_cursor=None,
+        )
+
+
 async def test_episode_sweep_accumulates_stable_pages() -> None:
     scripted = ScriptedConsolidation()
 
@@ -54,6 +85,24 @@ async def test_episode_sweep_accumulates_stable_pages() -> None:
 
     assert (summary.page_count, summary.scanned_count, summary.committed_count) == (2, 3, 1)
     assert scripted.requests[1].after_event_id == "event_02"
+    assert all(request.evaluated_at == NOW for request in scripted.requests)
+
+
+async def test_claim_sweep_accumulates_semantic_and_relationship_counts() -> None:
+    scripted = ScriptedClaimConsolidation()
+
+    summary = await consolidate_tenant_claims(
+        cast(ConsolidateClaims, scripted),
+        TenantId("tenant_01"),
+        NOW,
+        page_size=8,
+        maximum_gap_seconds=2_592_000,
+        minimum_similarity=0.8,
+    )
+
+    assert (summary.page_count, summary.scanned_count, summary.candidate_count) == (2, 3, 4)
+    assert (summary.committed_semantic_claim_count, summary.committed_relationship_count) == (1, 1)
+    assert scripted.requests[1].after_claim_id == "claim_02"
     assert all(request.evaluated_at == NOW for request in scripted.requests)
 
 

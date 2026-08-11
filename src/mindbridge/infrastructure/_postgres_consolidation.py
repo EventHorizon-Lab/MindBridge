@@ -238,7 +238,7 @@ WHERE tenant_id = %(tenant_id)s
   AND hierarchy_level = 'event'
   AND status = 'active'
   AND parent_event_id IS NULL
-  AND created_at <= %(evaluated_at)s
+  AND created_at < %(evaluated_at)s
   AND (%(after_event_id)s::text IS NULL OR event_id > %(after_event_id)s)
 ORDER BY event_id
 LIMIT %(limit)s
@@ -259,7 +259,7 @@ related_pairs AS (
      AND peer.hierarchy_level = 'event'
      AND peer.status = 'active'
      AND peer.parent_event_id IS NULL
-     AND peer.created_at <= %(evaluated_at)s
+     AND peer.created_at < %(evaluated_at)s
      AND peer.occurred_at <= seed.ended_at + make_interval(secs => %(maximum_gap_seconds)s)
      AND seed.occurred_at <= peer.ended_at + make_interval(secs => %(maximum_gap_seconds)s)
     WHERE (

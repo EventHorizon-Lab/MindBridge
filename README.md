@@ -403,20 +403,21 @@ uv run --extra cloud-models celery -A mindbridge.celery_app:app worker --logleve
 One prefork child is the safe default because each child owns a full embedding model. Scale with one
 Worker process per assigned GPU instead of increasing concurrency inside a process.
 
-Run evidence-verified Episode consolidation as a tenant-scoped scheduled job. It reuses the database,
-object-storage, VLM, Text Small, and shared embedding-space variables above; no task broker or local
-Jina Omni model is required:
+Run evidence-verified Episode and semantic Claim consolidation as one tenant-scoped scheduled job.
+It reuses the database, object-storage, VLM, Text Small, and shared embedding-space variables above;
+no task broker or local Jina Omni model is required:
 
 ```bash
 uv run mindbridge-consolidate --tenant-id tenant_01
 ```
 
-Each sweep fixes one `evaluated_at`, scans bounded candidate pages, lets the Omni/VLM inspect exact
-source AV, and atomically claims child Events before writing the Episode, its MemoryRecord, graph
-relations, and Text Small vector. `--page-size`, `--maximum-gap-seconds`, and
-`--minimum-similarity` are calibration knobs. Schedule the command with the deployment's existing
-CronJob/systemd/Celery beat control plane; concurrent runs are safe and only one can claim a child
-Event.
+Each sweep fixes one `evaluated_at`, scans bounded candidate pages, and lets the Omni/VLM inspect
+exact source AV. Episode writes atomically claim child Events. Claim writes atomically create
+evidence-unioned semantic Claims or durable `contradicts`/`supersedes` edges; supersession also
+versions the represented MemoryRecord. `--page-size`, `--maximum-gap-seconds`, and
+`--minimum-similarity` calibrate Episodes; the corresponding `--claim-*` options calibrate Claims.
+Schedule the command with the deployment's existing CronJob/systemd/Celery beat control plane;
+concurrent runs are idempotent.
 
 Run automatic decay as a tenant-scoped scheduled job. A complete run uses stable bounded pages and
 one fixed evaluation instant; concurrent feedback or deletion wins through optimistic guards:

@@ -5,10 +5,12 @@ from mindbridge.application.claim_consolidation import (
     ClaimCandidatePage,
     ClaimCandidateRequest,
     ClaimCandidateStore,
-    ClaimConsolidation,
+)
+from mindbridge.application.consolidate_claims import (
+    ClaimConsolidationResult,
+    ClaimConsolidationStore,
     ClaimConsolidator,
-    ClaimRelationshipProposal,
-    SemanticClaimProposal,
+    ConsolidateClaims,
 )
 from mindbridge.application.consolidation import (
     ConsolidateEpisodes,
@@ -79,6 +81,14 @@ from mindbridge.application.recall import (
     RecallEmbeddingQuery,
     RecallMemories,
 )
+from mindbridge.application.semantic_claims import (
+    ClaimConsolidation,
+    ClaimConsolidationCommit,
+    ClaimConsolidationWrite,
+    ClaimRelationshipProposal,
+    SemanticClaimProposal,
+    SemanticClaimWrite,
+)
 
 __all__ = [
     "MAX_PERCEIVED_CLAIMS_PER_EVENT",
@@ -91,8 +101,13 @@ __all__ = [
     "ClaimCandidateRequest",
     "ClaimCandidateStore",
     "ClaimConsolidation",
+    "ClaimConsolidationCommit",
+    "ClaimConsolidationResult",
+    "ClaimConsolidationStore",
+    "ClaimConsolidationWrite",
     "ClaimConsolidator",
     "ClaimRelationshipProposal",
+    "ConsolidateClaims",
     "ConsolidateEpisodes",
     "EmbeddingIndex",
     "EmbeddingInput",
@@ -141,6 +156,7 @@ __all__ = [
     "ResolvedEvidence",
     "ResolvedQueryMedia",
     "SemanticClaimProposal",
+    "SemanticClaimWrite",
     "TextDocumentEmbedder",
     "fuse_memory_rankings",
     "resolve_evidence_media",

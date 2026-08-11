@@ -9,6 +9,8 @@ from pgvector.psycopg import register_vector_async
 from mindbridge.application import (
     ClaimCandidatePage,
     ClaimCandidateRequest,
+    ClaimConsolidationCommit,
+    ClaimConsolidationWrite,
     EmbeddingMatch,
     EmbeddingSearch,
     EpisodeCandidatePage,
@@ -41,6 +43,7 @@ from mindbridge.core import (
     TombstoneId,
 )
 from mindbridge.infrastructure._postgres_claim_consolidation import list_claim_candidates
+from mindbridge.infrastructure._postgres_claim_writes import commit_claim_consolidation
 from mindbridge.infrastructure._postgres_consolidation import (
     commit_episode_consolidation,
     list_episode_candidates,
@@ -179,6 +182,14 @@ class PostgresMemoryStore:
     ) -> ClaimCandidatePage:
         """Discover a stable bounded page for semantic Claim verification."""
         return await list_claim_candidates(self._pool, request)
+
+    async def commit_claim_consolidation(
+        self,
+        tenant_id: TenantId,
+        write: ClaimConsolidationWrite,
+    ) -> ClaimConsolidationCommit:
+        """Atomically persist verified Semantic Claims and version decisions."""
+        return await commit_claim_consolidation(self._pool, tenant_id, write)
 
     async def commit_episode_consolidation(
         self,

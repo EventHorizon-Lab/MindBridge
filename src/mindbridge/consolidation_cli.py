@@ -1,4 +1,4 @@
-"""Scheduled evidence-verified Episode consolidation for one tenant."""
+"""Scheduled evidence-verified Episode and Claim consolidation for one tenant."""
 
 from __future__ import annotations
 
@@ -12,6 +12,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from mindbridge.application import (
+    ClaimCandidateRequest,
+    ConsolidateClaims,
     ConsolidateEpisodes,
     EpisodeCandidateRequest,
 )
@@ -20,7 +22,13 @@ from mindbridge.configuration import (
     parse_aware_datetime,
     require_environment_value,
 )
-from mindbridge.core import EmbeddingSpaceReference, EventId, MemoryIntegrityError, TenantId
+from mindbridge.core import (
+    ClaimId,
+    EmbeddingSpaceReference,
+    EventId,
+    MemoryIntegrityError,
+    TenantId,
+)
 from mindbridge.infrastructure import PostgresMemoryStore, S3MediaAccess
 from mindbridge.models import (
     DEFAULT_JINA_RETRIEVAL_SPACE,
@@ -28,6 +36,7 @@ from mindbridge.models import (
     DEFAULT_JINA_TEXT_REVISION,
     DEFAULT_OMNI_MODEL_ID,
     OpenAIJinaTextEmbedder,
+    OpenAIOmniClaimConsolidator,
     OpenAIOmniEpisodeConsolidator,
 )
 from mindbridge.telemetry import configure_telemetry
@@ -35,7 +44,7 @@ from mindbridge.telemetry import configure_telemetry
 
 @dataclass(frozen=True, slots=True)
 class ConsolidationSettings:
-    """Validated Episode process configuration with redacted credentials."""
+    """Validated consolidation process configuration with redacted credentials."""
 
     database_url: str = field(repr=False)
     object_storage_bucket: str
@@ -131,6 +140,29 @@ class EpisodeSweepSummary:
     committed_count: int
 
 
+@dataclass(frozen=True, slots=True)
+class ClaimSweepSummary:
+    """Content-free operational totals for one complete semantic Claim sweep."""
+
+    tenant_id: TenantId
+    evaluated_at: datetime
+    page_count: int
+    scanned_count: int
+    candidate_count: int
+    proposed_semantic_claim_count: int
+    proposed_relationship_count: int
+    committed_semantic_claim_count: int
+    committed_relationship_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class ConsolidationSweepSummary:
+    """Episode and Claim outcomes from one scheduled tenant run."""
+
+    episodes: EpisodeSweepSummary
+    claims: ClaimSweepSummary
+
+
 async def consolidate_tenant_episodes(
     use_case: ConsolidateEpisodes,
     tenant_id: TenantId,
@@ -175,6 +207,56 @@ async def consolidate_tenant_episodes(
     )
 
 
+async def consolidate_tenant_claims(
+    use_case: ConsolidateClaims,
+    tenant_id: TenantId,
+    evaluated_at: datetime,
+    *,
+    page_size: int,
+    maximum_gap_seconds: int,
+    minimum_similarity: float,
+) -> ClaimSweepSummary:
+    """Consolidate stable Claim pages at one fixed evaluation instant."""
+    cursor: ClaimId | None = None
+    page_count = scanned_count = candidate_count = 0
+    proposed_semantic_count = proposed_relationship_count = 0
+    committed_semantic_count = committed_relationship_count = 0
+    while True:
+        result = await use_case.run(
+            ClaimCandidateRequest(
+                tenant_id=tenant_id,
+                evaluated_at=evaluated_at,
+                after_claim_id=cursor,
+                limit=page_size,
+                maximum_gap_seconds=maximum_gap_seconds,
+                minimum_similarity=minimum_similarity,
+            )
+        )
+        page_count += 1
+        scanned_count += result.scanned_count
+        candidate_count += result.candidate_count
+        proposed_semantic_count += result.proposed_semantic_claim_count
+        proposed_relationship_count += result.proposed_relationship_count
+        committed_semantic_count += result.committed_semantic_claim_count
+        committed_relationship_count += result.committed_relationship_count
+        if result.next_cursor is None:
+            break
+        if result.next_cursor == cursor:
+            raise MemoryIntegrityError("Claim consolidation cursor did not advance")
+        cursor = result.next_cursor
+    return ClaimSweepSummary(
+        tenant_id=tenant_id,
+        evaluated_at=evaluated_at,
+        page_count=page_count,
+        scanned_count=scanned_count,
+        candidate_count=candidate_count,
+        proposed_semantic_claim_count=proposed_semantic_count,
+        proposed_relationship_count=proposed_relationship_count,
+        committed_semantic_claim_count=committed_semantic_count,
+        committed_relationship_count=committed_relationship_count,
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     """Run one tenant sweep using only explicit process configuration."""
     configure_telemetry("mindbridge-consolidation")
@@ -187,6 +269,9 @@ def main(argv: Sequence[str] | None = None) -> None:
             page_size=options.page_size,
             maximum_gap_seconds=options.maximum_gap_seconds,
             minimum_similarity=options.minimum_similarity,
+            claim_page_size=options.claim_page_size,
+            claim_maximum_gap_seconds=options.claim_maximum_gap_seconds,
+            claim_minimum_similarity=options.claim_minimum_similarity,
         )
     )
     print(json.dumps(_summary_dict(summary), sort_keys=True))
@@ -200,7 +285,10 @@ async def _run_postgres_sweep(
     page_size: int,
     maximum_gap_seconds: int,
     minimum_similarity: float,
-) -> EpisodeSweepSummary:
+    claim_page_size: int,
+    claim_maximum_gap_seconds: int,
+    claim_minimum_similarity: float,
+) -> ConsolidationSweepSummary:
     store = PostgresMemoryStore(settings.database_url)
     media_access = S3MediaAccess(
         settings.object_storage_bucket,
@@ -208,6 +296,12 @@ async def _run_postgres_sweep(
         region_name=settings.object_storage_region,
     )
     consolidator = OpenAIOmniEpisodeConsolidator.connect(
+        api_key=settings.vlm_api_key,
+        endpoint=settings.vlm_endpoint,
+        model_id=settings.vlm_model_id,
+        model_revision=settings.vlm_model_revision,
+    )
+    claim_consolidator = OpenAIOmniClaimConsolidator.connect(
         api_key=settings.vlm_api_key,
         endpoint=settings.vlm_endpoint,
         model_id=settings.vlm_model_id,
@@ -225,10 +319,11 @@ async def _run_postgres_sweep(
     )
     async with AsyncExitStack() as resources:
         resources.push_async_callback(consolidator.close)
+        resources.push_async_callback(claim_consolidator.close)
         resources.push_async_callback(text_embedder.close)
         await store.open()
         resources.push_async_callback(store.close)
-        return await consolidate_tenant_episodes(
+        episodes = await consolidate_tenant_episodes(
             ConsolidateEpisodes(
                 store,
                 consolidator,
@@ -241,6 +336,20 @@ async def _run_postgres_sweep(
             maximum_gap_seconds=maximum_gap_seconds,
             minimum_similarity=minimum_similarity,
         )
+        claims = await consolidate_tenant_claims(
+            ConsolidateClaims(
+                store,
+                claim_consolidator,
+                text_embedder,
+                media_url_signer=media_access,
+            ),
+            tenant_id,
+            evaluated_at,
+            page_size=claim_page_size,
+            maximum_gap_seconds=claim_maximum_gap_seconds,
+            minimum_similarity=claim_minimum_similarity,
+        )
+        return ConsolidationSweepSummary(episodes=episodes, claims=claims)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -250,18 +359,32 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--page-size", type=int, default=16)
     parser.add_argument("--maximum-gap-seconds", type=int, default=900)
     parser.add_argument("--minimum-similarity", type=float, default=0.7)
+    parser.add_argument("--claim-page-size", type=int, default=16)
+    parser.add_argument("--claim-maximum-gap-seconds", type=int, default=2_592_000)
+    parser.add_argument("--claim-minimum-similarity", type=float, default=0.8)
     return parser
 
 
-def _summary_dict(summary: EpisodeSweepSummary) -> dict[str, object]:
+def _summary_dict(summary: ConsolidationSweepSummary) -> dict[str, object]:
     return {
-        "candidate_count": summary.candidate_count,
-        "committed_count": summary.committed_count,
-        "evaluated_at": summary.evaluated_at.isoformat(),
-        "page_count": summary.page_count,
-        "proposed_count": summary.proposed_count,
-        "scanned_count": summary.scanned_count,
-        "tenant_id": summary.tenant_id,
+        "claims": {
+            "candidate_count": summary.claims.candidate_count,
+            "committed_relationship_count": summary.claims.committed_relationship_count,
+            "committed_semantic_claim_count": summary.claims.committed_semantic_claim_count,
+            "page_count": summary.claims.page_count,
+            "proposed_relationship_count": summary.claims.proposed_relationship_count,
+            "proposed_semantic_claim_count": summary.claims.proposed_semantic_claim_count,
+            "scanned_count": summary.claims.scanned_count,
+        },
+        "episodes": {
+            "candidate_count": summary.episodes.candidate_count,
+            "committed_count": summary.episodes.committed_count,
+            "page_count": summary.episodes.page_count,
+            "proposed_count": summary.episodes.proposed_count,
+            "scanned_count": summary.episodes.scanned_count,
+        },
+        "evaluated_at": summary.episodes.evaluated_at.isoformat(),
+        "tenant_id": summary.episodes.tenant_id,
     }
 
 
