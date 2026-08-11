@@ -14,6 +14,9 @@ from mindbridge.core import (
     Event,
     EventId,
     EvidenceId,
+    MemoryId,
+    MemoryRecord,
+    MemoryType,
     ModelReference,
     ObservationId,
     TenantId,
@@ -61,6 +64,22 @@ def test_unverified_claim_may_record_unsupported_input() -> None:
     claim = _claim(evidence_ids=(), verification_status=VerificationStatus.UNVERIFIED)
 
     assert claim.evidence_ids == ()
+
+
+def test_verified_memory_requires_evidence() -> None:
+    """The unified memory view cannot turn an unsupported summary into fact."""
+    with pytest.raises(DomainInvariantError, match="verified memory"):
+        MemoryRecord(
+            memory_id=MemoryId("memory_01"),
+            tenant_id=TENANT_ID,
+            memory_type=MemoryType.SEMANTIC,
+            summary="The screwdriver is in the toolbox.",
+            evidence_ids=(),
+            occurred_at=NOW,
+            ended_at=NOW,
+            created_at=NOW,
+            verification_status=VerificationStatus.VERIFIED,
+        )
 
 
 def test_claim_rejects_reversed_validity() -> None:

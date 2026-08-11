@@ -16,6 +16,7 @@ from mindbridge.core.identifiers import (
     EventId,
     EvidenceId,
     MediaObjectId,
+    MemoryId,
     ObservationId,
     TenantId,
 )
@@ -24,6 +25,9 @@ from mindbridge.core.memory import (
     EmbeddedObjectType,
     EmbeddingRecord,
     Event,
+    MemoryRecord,
+    MemoryState,
+    MemoryType,
     ModelReference,
     VerificationStatus,
 )
@@ -43,6 +47,10 @@ __all__ = [
     "MediaKind",
     "MediaObject",
     "MediaObjectId",
+    "MemoryId",
+    "MemoryRecord",
+    "MemoryState",
+    "MemoryType",
     "ModelReference",
     "Observation",
     "ObservationId",

@@ -14,6 +14,7 @@ from mindbridge.core.identifiers import (
     EmbeddingId,
     EventId,
     EvidenceId,
+    MemoryId,
     ObservationId,
     TenantId,
 )
@@ -32,6 +33,27 @@ class EmbeddedObjectType(str, Enum):
     EVIDENCE_SPAN = "evidence_span"
     EVENT = "event"
     CLAIM = "claim"
+    MEMORY_RECORD = "memory_record"
+
+
+class MemoryType(str, Enum):
+    """Long-term role a memory serves."""
+
+    PERCEPTUAL = "perceptual"
+    WORKING = "working"
+    EPISODIC = "episodic"
+    SEMANTIC = "semantic"
+    PROCEDURAL = "procedural"
+    PROSPECTIVE = "prospective"
+
+
+class MemoryState(str, Enum):
+    """Retained states; explicit deletion is represented by a tombstone."""
+
+    ACTIVE = "active"
+    STRENGTHENED = "strengthened"
+    COLD = "cold"
+    COMPRESSED = "compressed"
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,6 +128,37 @@ class Claim:
         elif self.verification_status is VerificationStatus.VERIFIED:
             raise DomainInvariantError("a verified claim must reference evidence")
         _require_probability(self.confidence, "confidence")
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryRecord:
+    """Stable external view of an explicit or derived memory."""
+
+    memory_id: MemoryId
+    tenant_id: TenantId
+    memory_type: MemoryType
+    summary: str
+    evidence_ids: tuple[EvidenceId, ...]
+    occurred_at: datetime
+    ended_at: datetime
+    created_at: datetime
+    verification_status: VerificationStatus
+    state: MemoryState = MemoryState.ACTIVE
+    model_reference: ModelReference | None = None
+
+    def __post_init__(self) -> None:
+        require_non_empty(self.memory_id, "memory_id")
+        require_non_empty(self.tenant_id, "tenant_id")
+        require_non_empty(self.summary, "summary")
+        require_aware_datetime(self.occurred_at, "occurred_at")
+        require_aware_datetime(self.ended_at, "ended_at")
+        require_aware_datetime(self.created_at, "created_at")
+        if self.ended_at < self.occurred_at:
+            raise DomainInvariantError("ended_at must not precede occurred_at")
+        if self.evidence_ids:
+            _require_identifiers(self.evidence_ids, "evidence_ids")
+        elif self.verification_status is VerificationStatus.VERIFIED:
+            raise DomainInvariantError("a verified memory must reference evidence")
 
 
 @dataclass(frozen=True, slots=True)
