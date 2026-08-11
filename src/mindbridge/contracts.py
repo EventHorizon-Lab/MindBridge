@@ -282,6 +282,13 @@ class MemoryView(ContractModel):
     superseded_at: AwareDatetime | None = None
 
 
+class GetMemoryRequest(ContractModel):
+    """Identify one tenant-owned memory without relying on ambient tenancy."""
+
+    tenant_id: Identifier
+    memory_id: Identifier
+
+
 class EvidenceView(ContractModel):
     """Precise evidence location safe to expose to a caller."""
 
