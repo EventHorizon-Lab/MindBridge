@@ -9,11 +9,13 @@ from typing import Protocol, TypeAlias
 
 from mindbridge.contracts import RecallRequest
 from mindbridge.core import (
+    ClaimType,
     DeletionTombstone,
     DomainInvariantError,
     EmbeddedObjectType,
     EmbeddingRecord,
     EmbeddingSpaceReference,
+    EntityType,
     Event,
     EvidenceId,
     EvidenceSpan,
@@ -203,6 +205,8 @@ class PerceivedEvent:
     description: str
     salience: float
     evidence_ids: tuple[EvidenceId, ...]
+    entities: tuple[PerceivedEntity, ...] = ()
+    claims: tuple[PerceivedClaim, ...] = ()
 
     def __post_init__(self) -> None:
         if self.start_ms < 0 or self.end_ms < self.start_ms:
@@ -213,6 +217,64 @@ class PerceivedEvent:
             raise DomainInvariantError("perceived event salience must be between 0 and 1")
         if not self.evidence_ids or len(set(self.evidence_ids)) != len(self.evidence_ids):
             raise DomainInvariantError("perceived event evidence IDs must be non-empty and unique")
+        evidence_ids = set(self.evidence_ids)
+        if any(not set(entity.evidence_ids) <= evidence_ids for entity in self.entities):
+            raise DomainInvariantError("perceived entity evidence must belong to its event")
+        if any(not set(claim.evidence_ids) <= evidence_ids for claim in self.claims):
+            raise DomainInvariantError("perceived claim evidence must belong to its event")
+        if any(
+            index >= len(self.entities) for claim in self.claims for index in claim.entity_indices
+        ):
+            raise DomainInvariantError("perceived claim references an unknown event entity")
+
+
+@dataclass(frozen=True, slots=True)
+class PerceivedEntity:
+    """One named or anonymous semantic entity grounded by Omni evidence."""
+
+    entity_type: EntityType
+    canonical_name: str
+    confidence: float
+    evidence_ids: tuple[EvidenceId, ...]
+
+    def __post_init__(self) -> None:
+        if not self.canonical_name.strip():
+            raise DomainInvariantError("perceived entity name must not be empty")
+        if not math.isfinite(self.confidence) or not 0.0 <= self.confidence <= 1.0:
+            raise DomainInvariantError("perceived entity confidence must be between 0 and 1")
+        if not self.evidence_ids or len(set(self.evidence_ids)) != len(self.evidence_ids):
+            raise DomainInvariantError("perceived entity evidence IDs must be non-empty and unique")
+
+
+@dataclass(frozen=True, slots=True)
+class PerceivedClaim:
+    """One evidence-grounded fact, state, intent, or relation proposed by Omni."""
+
+    claim_type: ClaimType
+    statement: str
+    confidence: float
+    evidence_ids: tuple[EvidenceId, ...]
+    valid_from_ms: int
+    valid_to_ms: int | None
+    entity_indices: tuple[int, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.statement.strip():
+            raise DomainInvariantError("perceived claim statement must not be empty")
+        if not math.isfinite(self.confidence) or not 0.0 <= self.confidence <= 1.0:
+            raise DomainInvariantError("perceived claim confidence must be between 0 and 1")
+        if not self.evidence_ids or len(set(self.evidence_ids)) != len(self.evidence_ids):
+            raise DomainInvariantError("perceived claim evidence IDs must be non-empty and unique")
+        if self.valid_from_ms < 0 or (
+            self.valid_to_ms is not None and self.valid_to_ms < self.valid_from_ms
+        ):
+            raise DomainInvariantError("perceived claim validity range is invalid")
+        if any(index < 0 for index in self.entity_indices) or len(set(self.entity_indices)) != len(
+            self.entity_indices
+        ):
+            raise DomainInvariantError(
+                "perceived claim entity indices must be unique and non-negative"
+            )
 
 
 @dataclass(frozen=True, slots=True)

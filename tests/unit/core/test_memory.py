@@ -7,6 +7,7 @@ import pytest
 from mindbridge.core import (
     Claim,
     ClaimId,
+    ClaimType,
     DomainInvariantError,
     EmbeddedObjectType,
     EmbeddingId,
@@ -147,6 +148,7 @@ def _claim(
     return Claim(
         claim_id=ClaimId("claim_01"),
         tenant_id=TENANT_ID,
+        claim_type=ClaimType.RELATION,
         statement="The red screwdriver is beside the blue toolbox.",
         evidence_ids=evidence_ids,
         confidence=0.91,
@@ -155,6 +157,7 @@ def _claim(
         valid_to=valid_to,
         created_at=NOW,
         model_reference=MODEL,
+        prompt_version="extract_claims_v1",
     )
 
 

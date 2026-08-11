@@ -53,6 +53,31 @@ async def test_omni_perception_returns_grounded_event_and_provider_revision() ->
                         "description": "A person places a red tool beside a toolbox while speaking.",
                         "salience": 0.82,
                         "evidence_ids": ["evidence_video", "evidence_audio"],
+                        "entities": [
+                            {
+                                "entity_type": "object",
+                                "canonical_name": "red tool",
+                                "confidence": 0.94,
+                                "evidence_ids": ["evidence_video"],
+                            },
+                            {
+                                "entity_type": "object",
+                                "canonical_name": "toolbox",
+                                "confidence": 0.9,
+                                "evidence_ids": ["evidence_video"],
+                            },
+                        ],
+                        "claims": [
+                            {
+                                "claim_type": "relation",
+                                "statement": "The red tool is beside the toolbox.",
+                                "confidence": 0.88,
+                                "evidence_ids": ["evidence_video"],
+                                "valid_from_ms": 500,
+                                "valid_to_ms": 3_500,
+                                "entity_indices": [0, 1],
+                            }
+                        ],
                     }
                 ]
             },
@@ -75,7 +100,50 @@ async def test_omni_perception_returns_grounded_event_and_provider_revision() ->
         EvidenceId("evidence_audio"),
     )
     assert result.model_reference.revision == "qwen-serving-revision-01"
-    assert result.prompt_version == "perceive_events_v2"
+    assert result.prompt_version == "perceive_events_v3"
+    assert [entity.canonical_name for entity in result.events[0].entities] == [
+        "red tool",
+        "toolbox",
+    ]
+    assert result.events[0].claims[0].entity_indices == (0, 1)
+
+
+async def test_omni_perception_rejects_detail_evidence_outside_its_event() -> None:
+    async def respond(_request: httpx.Request) -> httpx.Response:
+        return _streaming_response(
+            {
+                "events": [
+                    {
+                        "start_ms": 0,
+                        "end_ms": 1_000,
+                        "description": "One visible event",
+                        "salience": 0.5,
+                        "evidence_ids": ["evidence_video"],
+                        "entities": [
+                            {
+                                "entity_type": "topic",
+                                "canonical_name": "unsupported detail",
+                                "confidence": 0.5,
+                                "evidence_ids": ["evidence_audio"],
+                            }
+                        ],
+                    }
+                ]
+            }
+        )
+
+    perceiver = _perceiver(respond)
+    try:
+        with pytest.raises(ModelOutputError, match="outside its event"):
+            await perceiver.perceive_events(
+                _observation(),
+                (
+                    _evidence(MediaKind.VIDEO, "clip.mp4", "video"),
+                    _evidence(MediaKind.AUDIO, "clip.wav", "audio"),
+                ),
+            )
+    finally:
+        await perceiver.close()
 
 
 async def test_omni_perception_rejects_unknown_evidence() -> None:

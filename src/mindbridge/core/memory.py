@@ -28,6 +28,15 @@ class VerificationStatus(str, Enum):
     UNVERIFIED = "unverified"
 
 
+class ClaimType(str, Enum):
+    """Semantic role of a versioned assertion."""
+
+    FACT = "fact"
+    STATE = "state"
+    INTENT = "intent"
+    RELATION = "relation"
+
+
 class EmbeddedObjectType(str, Enum):
     """Domain records admitted to the primary semantic index."""
 
@@ -118,6 +127,7 @@ class Claim:
 
     claim_id: ClaimId
     tenant_id: TenantId
+    claim_type: ClaimType
     statement: str
     evidence_ids: tuple[EvidenceId, ...]
     confidence: float
@@ -126,12 +136,14 @@ class Claim:
     valid_to: datetime | None
     created_at: datetime
     model_reference: ModelReference
+    prompt_version: str
     supersedes_claim_id: ClaimId | None = None
 
     def __post_init__(self) -> None:
         require_non_empty(self.claim_id, "claim_id")
         require_non_empty(self.tenant_id, "tenant_id")
         require_non_empty(self.statement, "statement")
+        require_non_empty(self.prompt_version, "prompt_version")
         require_aware_datetime(self.valid_from, "valid_from")
         require_aware_datetime(self.created_at, "created_at")
         if self.valid_to is not None:
