@@ -23,6 +23,7 @@ dependencies = [
 ]
 
 [project.scripts]
+mindbridge-lifecycle = "mindbridge.lifecycle_cli:main"
 mindbridge-mcp = "mindbridge.api.runtime:run_production_mcp"
 
 [project.optional-dependencies]

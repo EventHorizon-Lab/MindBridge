@@ -246,6 +246,17 @@ uv run --extra cloud-models celery -A mindbridge.celery_app:app worker --logleve
 One prefork child is the safe default because each child owns a full embedding model. Scale with one
 Worker process per assigned GPU instead of increasing concurrency inside a process.
 
+Run automatic decay as a tenant-scoped scheduled job. A complete run uses stable bounded pages and
+one fixed evaluation instant; concurrent feedback or deletion wins through optimistic guards:
+
+```bash
+uv run mindbridge-lifecycle --tenant-id tenant_01
+```
+
+Schedule this command with the deployment's existing CronJob/systemd/Celery beat control plane.
+The strength coefficients and hot/cold thresholds are explicit CLI options so hardware cadence and
+retention policy can be calibrated without changing model weights or code.
+
 ## Run the Jetson/robot edge path
 
 Capture and encode with the installed NVIDIA/GStreamer stack. When `splitmuxsink` or the robot
