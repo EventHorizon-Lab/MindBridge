@@ -202,7 +202,19 @@ async def test_migration_installs_complete_phase_zero_schema(database_url: str) 
         versions = await (
             await connection.execute("SELECT version FROM schema_migrations ORDER BY version")
         ).fetchall()
-    assert [cast(tuple[int], row)[0] for row in versions] == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    assert [cast(tuple[int], row)[0] for row in versions] == [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+    ]
 
 
 async def test_postgres_vertical_path_is_idempotent_and_evidence_first(

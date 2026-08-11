@@ -23,6 +23,8 @@ from mindbridge.application import (
     ObservationBatch,
     ObservationProcessingOutput,
     ObservationWriteResult,
+    SummaryCandidatePage,
+    SummaryCandidateRequest,
 )
 from mindbridge.contracts import RecallRequest
 from mindbridge.core import (
@@ -87,6 +89,7 @@ from mindbridge.infrastructure._postgres_observation_reads import (
 )
 from mindbridge.infrastructure._postgres_observations import write_observation
 from mindbridge.infrastructure._postgres_processing import commit_observation_processing
+from mindbridge.infrastructure._postgres_summary_consolidation import list_summary_candidates
 from mindbridge.infrastructure._postgres_types import DatabaseConnection, DatabasePool
 
 
@@ -182,6 +185,13 @@ class PostgresMemoryStore:
     ) -> ClaimCandidatePage:
         """Discover a stable bounded page for semantic Claim verification."""
         return await list_claim_candidates(self._pool, request)
+
+    async def list_summary_candidates(
+        self,
+        request: SummaryCandidateRequest,
+    ) -> SummaryCandidatePage:
+        """Discover a stable bounded page for hierarchical Summary verification."""
+        return await list_summary_candidates(self._pool, request)
 
     async def commit_claim_consolidation(
         self,

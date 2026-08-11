@@ -32,6 +32,7 @@ from mindbridge.application import (
     ProcessObservation,
     ResolvedEvidence,
     SemanticClaimProposal,
+    SummaryCandidateRequest,
 )
 from mindbridge.contracts import RecallFilters, RecallQuery, RecallRequest
 from mindbridge.core import (
@@ -58,6 +59,7 @@ from mindbridge.core import (
     MediaObject,
     MediaObjectId,
     MemoryIntegrityError,
+    MemoryType,
     ModelReference,
     Observation,
     ObservationId,
@@ -528,6 +530,53 @@ async def test_claim_candidates_expand_a_stable_seed_by_aligned_vector(
     assert len(page.candidates) == 2
     assert {candidate.claim.statement for candidate in page.candidates} == {
         "The red tool is beside the blue toolbox."
+    }
+    assert all(len(candidate.entity_ids) == 2 for candidate in page.candidates)
+
+
+async def test_summary_candidates_expand_a_stable_seed_across_memory_representations(
+    store: PostgresMemoryStore,
+) -> None:
+    tenant_id, first_observation_id, first_job_id = await _write_source_observation(
+        store,
+        "tenant_summary_candidates",
+        include_identity=False,
+    )
+    _, second_observation_id, second_job_id = await _write_source_observation(
+        store,
+        "tenant_summary_candidates",
+        ordinal=2,
+        occurred_at=NOW + timedelta(days=2),
+        include_identity=False,
+    )
+    for observation_id, job_id in (
+        (first_observation_id, first_job_id),
+        (second_observation_id, second_job_id),
+    ):
+        await ProcessObservation(
+            store,
+            RecordingPerceiver(),
+            FixedEmbedder(),
+            FixedTextEmbedder(),
+            media_url_signer=DeterministicSigner(),
+        ).run(tenant_id, observation_id, job_id)
+
+    page = await store.list_summary_candidates(
+        SummaryCandidateRequest(
+            tenant_id=tenant_id,
+            evaluated_at=NOW + timedelta(days=3),
+            limit=1,
+            maximum_gap_seconds=0,
+            minimum_similarity=0.99,
+        )
+    )
+
+    assert page.scanned_count == 1
+    assert page.next_cursor is not None
+    assert len(page.candidates) == 4
+    assert {candidate.memory.memory_type for candidate in page.candidates} == {
+        MemoryType.EPISODIC,
+        MemoryType.SEMANTIC,
     }
     assert all(len(candidate.entity_ids) == 2 for candidate in page.candidates)
 

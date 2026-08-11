@@ -89,6 +89,11 @@ from mindbridge.application.semantic_claims import (
     SemanticClaimProposal,
     SemanticClaimWrite,
 )
+from mindbridge.application.summary_consolidation import (
+    SummaryCandidate,
+    SummaryCandidatePage,
+    SummaryCandidateRequest,
+)
 
 __all__ = [
     "MAX_PERCEIVED_CLAIMS_PER_EVENT",
@@ -157,6 +162,9 @@ __all__ = [
     "ResolvedQueryMedia",
     "SemanticClaimProposal",
     "SemanticClaimWrite",
+    "SummaryCandidate",
+    "SummaryCandidatePage",
+    "SummaryCandidateRequest",
     "TextDocumentEmbedder",
     "fuse_memory_rankings",
     "resolve_evidence_media",
