@@ -26,6 +26,7 @@ def test_runtime_settings_use_documented_defaults_and_redact_key() -> None:
     assert settings.vlm_model_id == "qwen3.8-max"
     assert settings.embedding_model_id == "jinaai/jina-embeddings-v5-omni-small-retrieval"
     assert settings.embedding_model_revision == "12949877f0092093f366c6450340011320152a05"
+    assert settings.minimum_embedding_similarity == 0.0
     assert "secret-unit-test-key" not in repr(settings)
     assert "secret-embedding-key" not in repr(settings)
     assert "broker-secret" not in repr(settings)
@@ -49,4 +50,18 @@ def test_runtime_settings_reject_empty_direct_configuration() -> None:
             vlm_endpoint="https://vlm.example.test/v1",
             embedding_api_key="unit-test-embedding-key",
             embedding_endpoint="https://embedding.example.test/v1",
+        )
+
+
+def test_runtime_settings_reject_invalid_embedding_similarity() -> None:
+    with pytest.raises(ValueError, match="minimum_embedding_similarity"):
+        RuntimeSettings(
+            database_url="postgresql://mindbridge@postgres/mindbridge",
+            object_storage_bucket="memory",
+            task_broker_url="redis://redis:6379/0",
+            vlm_api_key="unit-test-key",
+            vlm_endpoint="https://vlm.example.test/v1",
+            embedding_api_key="unit-test-embedding-key",
+            embedding_endpoint="https://embedding.example.test/v1",
+            minimum_embedding_similarity=float("nan"),
         )

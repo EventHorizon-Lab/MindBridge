@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 from collections.abc import AsyncIterator, Mapping
 from contextlib import AsyncExitStack, asynccontextmanager
@@ -45,6 +46,7 @@ class RuntimeSettings:
     vlm_model_id: str = DEFAULT_OMNI_MODEL_ID
     embedding_model_id: str = DEFAULT_JINA_OMNI_MODEL_ID
     embedding_model_revision: str = DEFAULT_JINA_OMNI_REVISION
+    minimum_embedding_similarity: float = 0.0
 
     def __post_init__(self) -> None:
         for name, value in (
@@ -67,6 +69,11 @@ class RuntimeSettings:
             and not self.object_storage_endpoint_url.strip()
         ):
             raise ValueError("object_storage_endpoint_url must not be empty when provided")
+        if (
+            not math.isfinite(self.minimum_embedding_similarity)
+            or not -1.0 <= self.minimum_embedding_similarity <= 1.0
+        ):
+            raise ValueError("minimum_embedding_similarity must be between -1 and 1")
 
     @classmethod
     def from_environment(
@@ -95,6 +102,9 @@ class RuntimeSettings:
             ),
             embedding_model_revision=source.get(
                 "MINDBRIDGE_EMBEDDING_MODEL_REVISION", DEFAULT_JINA_OMNI_REVISION
+            ),
+            minimum_embedding_similarity=float(
+                source.get("MINDBRIDGE_MINIMUM_EMBEDDING_SIMILARITY", "0.0")
             ),
         )
 
@@ -175,5 +185,6 @@ def _build_runtime(settings: RuntimeSettings) -> _ProductionRuntime:
         media_url_signer=media_access,
         observation_job_publisher=job_publisher,
         recall_embedder=recall_embedder,
+        minimum_embedding_similarity=settings.minimum_embedding_similarity,
     )
     return _ProductionRuntime(kernel, store, answerer, recall_embedder)

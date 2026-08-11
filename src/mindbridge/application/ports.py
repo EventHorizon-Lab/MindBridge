@@ -217,6 +217,7 @@ class EmbeddingSearch:
     document_task: str
     object_types: tuple[EmbeddedObjectType, ...]
     limit: int
+    minimum_similarity: float = 0.0
 
     def __post_init__(self) -> None:
         if not self.values or not all(math.isfinite(value) for value in self.values):
@@ -227,6 +228,8 @@ class EmbeddingSearch:
             raise DomainInvariantError("object_types must be non-empty and unique")
         if not 1 <= self.limit <= 1_000:
             raise DomainInvariantError("embedding search limit must be between 1 and 1000")
+        if not math.isfinite(self.minimum_similarity) or not -1.0 <= self.minimum_similarity <= 1.0:
+            raise DomainInvariantError("minimum_similarity must be between -1 and 1")
 
 
 @dataclass(frozen=True, slots=True)

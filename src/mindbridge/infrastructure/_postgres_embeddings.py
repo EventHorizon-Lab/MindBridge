@@ -106,6 +106,7 @@ async def search_embeddings(
               AND model_revision = %s
               AND task = %s
               AND object_type = ANY(%s)
+              AND 1 - (embedding <=> %s) >= %s
             ORDER BY embedding <=> %s, embedding_id
             LIMIT %s
             """,
@@ -116,6 +117,8 @@ async def search_embeddings(
                 search.model_reference.revision,
                 search.document_task,
                 [object_type.value for object_type in search.object_types],
+                vector,
+                search.minimum_similarity,
                 vector,
                 search.limit,
             ),

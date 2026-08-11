@@ -181,6 +181,7 @@ export MINDBRIDGE_EMBEDDING_API_KEY=replace-with-a-runtime-secret
 export MINDBRIDGE_EMBEDDING_ENDPOINT=https://embeddings.example.com/v1/embeddings
 export MINDBRIDGE_EMBEDDING_MODEL_ID=jinaai/jina-embeddings-v5-omni-small-retrieval
 export MINDBRIDGE_EMBEDDING_MODEL_REVISION=12949877f0092093f366c6450340011320152a05
+export MINDBRIDGE_MINIMUM_EMBEDDING_SIMILARITY=0.0
 
 uv run uvicorn mindbridge.api:create_production_app --factory
 ```

@@ -73,9 +73,21 @@ async def test_pgvector_keeps_model_spaces_separate_and_ranks_by_cosine(
             limit=2,
         )
     )
+    thresholded = await store.search_embeddings(
+        EmbeddingSearch(
+            tenant_id=TenantId("tenant_vectors"),
+            values=first.values,
+            model_reference=model,
+            document_task="retrieval_document",
+            object_types=(EmbeddedObjectType.MEMORY_RECORD,),
+            limit=2,
+            minimum_similarity=0.5,
+        )
+    )
 
     assert [match.object_id for match in matches] == ["memory_near", "memory_far"]
     assert matches[0].similarity == pytest.approx(1.0)
+    assert [match.object_id for match in thresholded] == ["memory_near"]
     assert other_revision == ()
 
 

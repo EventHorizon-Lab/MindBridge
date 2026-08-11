@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
 from collections.abc import Callable
 from datetime import datetime, timezone
 from uuid import uuid4
@@ -90,8 +91,14 @@ class MemoryKernel:
         media_url_signer: MediaUrlSigner,
         observation_job_publisher: ObservationJobPublisher,
         recall_embedder: RecallEmbedder,
+        minimum_embedding_similarity: float = 0.0,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
+        if (
+            not math.isfinite(minimum_embedding_similarity)
+            or not -1.0 <= minimum_embedding_similarity <= 1.0
+        ):
+            raise ValueError("minimum_embedding_similarity must be between -1 and 1")
         self._store = store
         self._answerer = answerer
         self._embedding_index = embedding_index
@@ -99,6 +106,7 @@ class MemoryKernel:
         self._media_url_signer = media_url_signer
         self._observation_job_publisher = observation_job_publisher
         self._recall_embedder = recall_embedder
+        self._minimum_embedding_similarity = minimum_embedding_similarity
         self._clock = clock or _utc_now
 
     async def observe(self, request: ObserveRequest) -> ObservationReceipt:
@@ -348,6 +356,7 @@ class MemoryKernel:
                 document_task=RETRIEVAL_DOCUMENT_EMBEDDING_TASK,
                 object_types=(object_type,),
                 limit=limit,
+                minimum_similarity=self._minimum_embedding_similarity,
             )
             for object_type in (
                 EmbeddedObjectType.EVIDENCE_SPAN,
