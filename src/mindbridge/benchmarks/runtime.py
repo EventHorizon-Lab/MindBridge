@@ -6,7 +6,9 @@ import asyncio
 import re
 import time
 
-from mindbridge.contracts import NonEmptyString, ObservationProcessingJobView
+from pydantic import TypeAdapter
+
+from mindbridge.contracts import Identifier, NonEmptyString, ObservationProcessingJobView
 from mindbridge.core import JobState
 from mindbridge.sdk import AsyncMindBridge
 
@@ -15,6 +17,13 @@ _ALLOWED_RESPONSE_WORDS = re.compile(
     r"\b(?:answer|best|choice|choices|from|is|option|options|order|rank|ranking|to|worst)\b",
     re.IGNORECASE,
 )
+
+
+def benchmark_tenant_id(tenant_prefix: str, unit_id: str, run_id: str) -> str:
+    """Build an isolated tenant so earlier queries cannot see a prior run's future."""
+    if not run_id.strip():
+        raise ValueError("run_id must not be empty")
+    return TypeAdapter(Identifier).validate_python(f"{tenant_prefix}_{unit_id}_{run_id}")
 
 
 async def wait_for_observation_job(

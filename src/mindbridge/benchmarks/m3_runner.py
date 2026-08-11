@@ -14,7 +14,7 @@ from mindbridge.benchmarks.m3_bench import (
     M3BenchQuestion,
     M3BenchVideo,
 )
-from mindbridge.benchmarks.runtime import wait_for_observation_job
+from mindbridge.benchmarks.runtime import benchmark_tenant_id, wait_for_observation_job
 from mindbridge.contracts import (
     ContractModel,
     Identifier,
@@ -97,6 +97,7 @@ async def run_m3_video(
     annotation: M3BenchVideo,
     prepared: M3PreparedVideo,
     *,
+    run_id: str,
     tenant_prefix: str = "benchmark_m3",
     device_id: str = "m3_bench_camera",
     recall_limit: int = 20,
@@ -122,7 +123,7 @@ async def run_m3_video(
     ):
         raise ValueError("M3-Bench question boundary exceeds prepared clips")
 
-    tenant_id = f"{tenant_prefix}_{annotation.video_id}"
+    tenant_id = benchmark_tenant_id(tenant_prefix, annotation.video_id, run_id)
     questions_by_boundary: dict[int | None, list[M3BenchQuestion]] = defaultdict(list)
     for question in annotation.questions:
         questions_by_boundary[question.before_clip_index].append(question)

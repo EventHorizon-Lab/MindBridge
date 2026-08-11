@@ -8,7 +8,7 @@ from itertools import groupby
 from pathlib import Path
 from typing import cast
 
-from pydantic import AwareDatetime, Field, TypeAdapter, model_validator
+from pydantic import AwareDatetime, Field, model_validator
 
 from mindbridge.benchmarks.egolife_qa import (
     EGOLIFE_QA_ADAPTER_VERSION,
@@ -17,6 +17,7 @@ from mindbridge.benchmarks.egolife_qa import (
 )
 from mindbridge.benchmarks.runtime import (
     OPTION_LABELS,
+    benchmark_tenant_id,
     multiple_choice_query,
     parse_option_ranking,
     wait_for_observation_job,
@@ -123,11 +124,7 @@ async def run_egolife_qa(
     if poll_interval_seconds <= 0 or processing_timeout_seconds <= 0:
         raise ValueError("poll interval and processing timeout must be positive")
 
-    if not run_id.strip():
-        raise ValueError("run_id must not be empty")
-    tenant_id = TypeAdapter(Identifier).validate_python(
-        f"{tenant_prefix}_{prepared.subject_id}_{run_id}"
-    )
+    tenant_id = benchmark_tenant_id(tenant_prefix, prepared.subject_id, run_id)
     ordered = sorted(questions, key=lambda question: question.query_offset_ms)
     answers: dict[str, EgoLifeQuestionResult] = {}
     next_clip = 0

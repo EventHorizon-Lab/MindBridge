@@ -81,6 +81,7 @@ async def test_m3_answers_at_clip_boundaries_without_future_ingestion() -> None:
         cast(AsyncMindBridge, api),
         _annotation(),
         _prepared_video(),
+        run_id="run_01",
         poll_interval_seconds=0.001,
     )
 
@@ -115,7 +116,9 @@ async def test_m3_rejects_out_of_range_boundary_before_api_calls() -> None:
     )
 
     with pytest.raises(ValueError, match="boundary"):
-        await run_m3_video(cast(AsyncMindBridge, api), annotation, _prepared_video())
+        await run_m3_video(
+            cast(AsyncMindBridge, api), annotation, _prepared_video(), run_id="run_01"
+        )
 
     assert api.calls == []
 

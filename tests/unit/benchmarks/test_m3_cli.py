@@ -67,6 +67,7 @@ def test_m3_artifacts_pin_media_models_code_and_jsonl_output(tmp_path: Path) -> 
     assert manifest.media_revision == "official-media-revision"
     assert manifest.perception_model_revision == "perception-serving-fingerprint"
     assert manifest.answer_model_revision == "answer-serving-fingerprint"
+    assert manifest.run_id == "run_01"
     assert manifest.clip_count == 1
     assert manifest.question_count == 1
     assert manifest.predictions_sha256 == hashlib.sha256(output_path.read_bytes()).hexdigest()
@@ -112,6 +113,7 @@ def _arguments(dataset_path: Path, prepared_path: Path, output_path: Path) -> _A
         answer_model_revision="answer-serving-fingerprint",
         embedding_model_id=DEFAULT_JINA_OMNI_MODEL_ID,
         embedding_model_revision=DEFAULT_JINA_OMNI_REVISION,
+        run_id="run_01",
         tenant_prefix="benchmark_m3",
         device_id="m3_bench_camera",
         recall_limit=20,

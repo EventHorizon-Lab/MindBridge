@@ -43,6 +43,7 @@ from mindbridge.benchmarks.m3_runner import (
 )
 from mindbridge.benchmarks.runtime import (
     OPTION_LABELS,
+    benchmark_tenant_id,
     multiple_choice_query,
     parse_option_ranking,
     wait_for_observation_job,
@@ -95,6 +96,7 @@ __all__ = [
     "SuperMemoryPreparedVideo",
     "SuperMemoryQuestion",
     "SuperMemoryQuestionResult",
+    "benchmark_tenant_id",
     "evaluate_supermemory_vqa",
     "load_egolife_qa",
     "load_locomo",

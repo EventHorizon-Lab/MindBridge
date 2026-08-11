@@ -1,6 +1,18 @@
 """Checks for shared production benchmark runtime behavior."""
 
-from mindbridge.benchmarks import multiple_choice_query, parse_option_ranking
+import pytest
+
+from mindbridge.benchmarks import (
+    benchmark_tenant_id,
+    multiple_choice_query,
+    parse_option_ranking,
+)
+
+
+def test_benchmark_tenant_requires_an_isolated_run_id() -> None:
+    assert benchmark_tenant_id("benchmark", "subject_1", "run_01") == ("benchmark_subject_1_run_01")
+    with pytest.raises(ValueError, match="run_id"):
+        benchmark_tenant_id("benchmark", "subject_1", " ")
 
 
 def test_multiple_choice_query_contains_only_inference_inputs() -> None:

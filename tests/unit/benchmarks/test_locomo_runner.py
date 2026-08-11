@@ -81,7 +81,9 @@ async def test_locomo_uses_only_source_turns_and_questions_in_api_requests() -> 
         ),
     )
 
-    result = await run_locomo_conversation(cast(AsyncMindBridge, api), conversation)
+    result = await run_locomo_conversation(
+        cast(AsyncMindBridge, api), conversation, run_id="run_01"
+    )
 
     assert api.remember_requests[0].summary == (
         'Caroline said: "I started a new course."\n'
@@ -102,6 +104,7 @@ async def test_locomo_rejects_unbounded_or_empty_request_pool() -> None:
         await run_locomo_conversation(
             cast(AsyncMindBridge, RecordingMemoryApi()),
             _conversation(),
+            run_id="run_01",
             request_concurrency=0,
         )
 

@@ -58,6 +58,7 @@ class LoCoMoRunManifest(ContractModel):
     retrieval_task: NonEmptyString
     prediction_key: NonEmptyString
     abstention_text: NonEmptyString
+    run_id: Identifier
     tenant_prefix: Identifier
     recall_limit: int = Field(gt=0, le=100)
     request_concurrency: int = Field(gt=0)
@@ -79,6 +80,7 @@ class _Arguments:
     answer_model_revision: str
     embedding_model_id: str
     embedding_model_revision: str
+    run_id: str
     tenant_prefix: str
     recall_limit: int
     request_concurrency: int
@@ -110,6 +112,7 @@ async def _run_conversations(
                 await run_locomo_conversation(
                     memory,
                     conversation,
+                    run_id=arguments.run_id,
                     tenant_prefix=arguments.tenant_prefix,
                     recall_limit=arguments.recall_limit,
                     request_concurrency=arguments.request_concurrency,
@@ -148,6 +151,7 @@ def _write_artifacts(
         retrieval_task=RETRIEVAL_DOCUMENT_EMBEDDING_TASK,
         prediction_key=LOCOMO_PREDICTION_KEY,
         abstention_text=LOCOMO_ABSTENTION,
+        run_id=arguments.run_id,
         tenant_prefix=arguments.tenant_prefix,
         recall_limit=arguments.recall_limit,
         request_concurrency=arguments.request_concurrency,
@@ -191,6 +195,7 @@ def _parse_arguments() -> _Arguments:
     parser.add_argument("--answer-model-revision", required=True)
     parser.add_argument("--embedding-model-id", default=DEFAULT_JINA_OMNI_MODEL_ID)
     parser.add_argument("--embedding-model-revision", default=DEFAULT_JINA_OMNI_REVISION)
+    parser.add_argument("--run-id", required=True)
     parser.add_argument("--tenant-prefix", default="benchmark_locomo")
     parser.add_argument("--recall-limit", type=int, default=20)
     parser.add_argument("--request-concurrency", type=int, default=4)
@@ -207,6 +212,7 @@ def _parse_arguments() -> _Arguments:
         answer_model_revision=parsed.answer_model_revision,
         embedding_model_id=parsed.embedding_model_id,
         embedding_model_revision=parsed.embedding_model_revision,
+        run_id=parsed.run_id,
         tenant_prefix=parsed.tenant_prefix,
         recall_limit=parsed.recall_limit,
         request_concurrency=parsed.request_concurrency,

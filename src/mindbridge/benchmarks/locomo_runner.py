@@ -12,6 +12,7 @@ from mindbridge.benchmarks.locomo import (
     LoCoMoQuestion,
     LoCoMoTurn,
 )
+from mindbridge.benchmarks.runtime import benchmark_tenant_id
 from mindbridge.contracts import (
     ContractModel,
     Identifier,
@@ -51,6 +52,7 @@ async def run_locomo_conversation(
     memory: AsyncMindBridge,
     conversation: LoCoMoConversation,
     *,
+    run_id: str,
     tenant_prefix: str = "benchmark_locomo",
     recall_limit: int = 20,
     request_concurrency: int = 4,
@@ -58,7 +60,7 @@ async def run_locomo_conversation(
     """Ingest one conversation, then answer its questions without label leakage."""
     if recall_limit <= 0 or request_concurrency <= 0:
         raise ValueError("recall_limit and request_concurrency must be positive")
-    tenant_id = f"{tenant_prefix}_{conversation.sample_id}"
+    tenant_id = benchmark_tenant_id(tenant_prefix, conversation.sample_id, run_id)
     semaphore = asyncio.Semaphore(request_concurrency)
     remembered = await asyncio.gather(
         *(

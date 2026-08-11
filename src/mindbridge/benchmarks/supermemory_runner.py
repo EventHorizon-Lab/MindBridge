@@ -7,9 +7,10 @@ from datetime import timedelta
 from itertools import groupby, pairwise
 from pathlib import Path
 
-from pydantic import AwareDatetime, Field, TypeAdapter, model_validator
+from pydantic import AwareDatetime, Field, model_validator
 
 from mindbridge.benchmarks.runtime import (
+    benchmark_tenant_id,
     multiple_choice_query,
     parse_option_ranking,
     wait_for_observation_job,
@@ -173,12 +174,7 @@ async def run_supermemory_vqa(
         raise ValueError("recall_limit and request_concurrency must be positive")
     if poll_interval_seconds <= 0 or processing_timeout_seconds <= 0:
         raise ValueError("poll interval and processing timeout must be positive")
-    if not run_id.strip():
-        raise ValueError("run_id must not be empty")
-
-    tenant_id = TypeAdapter(Identifier).validate_python(
-        f"{tenant_prefix}_{prepared.subject}_{run_id}"
-    )
+    tenant_id = benchmark_tenant_id(tenant_prefix, str(prepared.subject), run_id)
     segments = sorted(
         (
             (*_segment_bounds(video, segment), video.video_id, segment)
