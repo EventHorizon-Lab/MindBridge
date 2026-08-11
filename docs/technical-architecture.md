@@ -951,6 +951,14 @@ tests/
 不保存数据副本或自研下载器。`dataset-adapters-smoke.json` 同时记录源文件 SHA-256、适配器
 版本和完整样本计数，使上游静默 schema 变化在运行模型前就失败。
 
+M3-Bench 的生产 runner 沿用官方 30 秒、零起点连续切片约定。媒体由 FFmpeg 和标准 S3
+工具在运行前准备，MindBridge 只读取包含 URI、SHA-256、时长和绝对时间原点的强类型 manifest。
+官方 `before_clip=N` 按包含边界解释；执行顺序固定为“写入第 N 个片段 → 轮询持久化 Job 至
+`succeeded` → 回答该边界的问题”，未来片段不会提前进入该租户记忆。没有 `before_clip` 的问题
+在整段视频完成后回答。输出采用官方 JSONL 字段，并附带记忆、证据和 trace 诊断；sidecar run
+manifest 同时固定标注与媒体 revision/hash、代码、感知模型与 Prompt、回答模型与 Prompt、Jina
+revision、召回参数和最终输出 hash。基准路径不使用固定 sleep、标签提示或 Benchmark 专用存储。
+
 ### 14.3 分层指标
 
 只看最终答案分数无法定位问题，必须同时报告：

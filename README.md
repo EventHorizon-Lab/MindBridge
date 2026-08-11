@@ -113,6 +113,57 @@ Use `--sample-id` for a smoke subset. Existing results are preserved unless `--o
 explicitly supplied. The prediction field is `mindbridge_prediction`, ready for the official
 LoCoMo evaluation functions.
 
+Run M3-Bench through the same deployed API after the official videos have been split into
+30-second clips with FFmpeg and uploaded with the standard S3 tooling. MindBridge does not contain
+a second media downloader, clipper, or uploader. `--prepared-media` is a JSON array that records
+the already-addressable objects:
+
+```json
+[
+  {
+    "video_id": "bedroom_01",
+    "timeline_origin": "2000-01-01T00:00:00Z",
+    "clips": [
+      {
+        "clip_index": 0,
+        "media_object": {
+          "media_object_id": "m3_bedroom_01_0",
+          "kind": "video",
+          "uri": "s3://mindbridge-media/tenants/benchmark_m3_bedroom_01/0.mp4",
+          "sha256": "<64 lowercase hexadecimal characters>",
+          "size_bytes": 12345678,
+          "created_at": "2026-08-11T00:00:00Z",
+          "duration_ms": 30000
+        }
+      }
+    ]
+  }
+]
+```
+
+Clip indices must be contiguous and zero-based. The runner ingests and waits for each durable job
+before answering questions whose official `before_clip` equals that index, so a question cannot see
+future video. Questions without `before_clip` run after the complete video.
+
+```bash
+uv run python -m mindbridge.benchmarks.m3_cli \
+  --dataset .benchmarks/m3-agent/data/annotations/robot.json \
+  --prepared-media .benchmarks/m3-prepared-robot.json \
+  --output .benchmarks/results/m3-robot-mindbridge.jsonl \
+  --api-base-url http://localhost:8000 \
+  --subset robot \
+  --source-revision 0e3e41939bd8a0b66d756e7b7eb8d5fe9992da5c \
+  --media-revision 2672152eee36b25ccb38fdbc3b72135347adbb63 \
+  --code-revision "$(git rev-parse HEAD)" \
+  --perception-model-revision serving-fingerprint \
+  --answer-model-revision serving-fingerprint
+```
+
+Use `--video-id` for a smoke subset. The JSONL uses the official `id`, `question`, `answer`, `type`,
+`before_clip`, and `response` fields and adds MindBridge retrieval diagnostics. Its sidecar manifest
+pins annotation/media hashes and revisions, code, both Omni calls, Jina, Prompt versions, retrieval
+settings, and output hash.
+
 ## Run the MaaS API
 
 The production factory reads secrets from the process environment. S3 credentials use Boto3's
