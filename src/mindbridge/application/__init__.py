@@ -1,5 +1,11 @@
 """MindBridge application use cases and external boundaries."""
 
+from mindbridge.application.claim_consolidation import (
+    ClaimCandidate,
+    ClaimCandidatePage,
+    ClaimCandidateRequest,
+    ClaimCandidateStore,
+)
 from mindbridge.application.consolidation import (
     ConsolidateEpisodes,
     EpisodeCandidatePage,
@@ -76,6 +82,10 @@ __all__ = [
     "MAX_PERCEPTION_CLAIMS",
     "MAX_PERCEPTION_ENTITIES",
     "MAX_PERCEPTION_EVENTS",
+    "ClaimCandidate",
+    "ClaimCandidatePage",
+    "ClaimCandidateRequest",
+    "ClaimCandidateStore",
     "ConsolidateEpisodes",
     "EmbeddingIndex",
     "EmbeddingInput",

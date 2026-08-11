@@ -7,6 +7,8 @@ from datetime import datetime
 from pgvector.psycopg import register_vector_async
 
 from mindbridge.application import (
+    ClaimCandidatePage,
+    ClaimCandidateRequest,
     EmbeddingMatch,
     EmbeddingSearch,
     EpisodeCandidatePage,
@@ -38,6 +40,7 @@ from mindbridge.core import (
     TenantId,
     TombstoneId,
 )
+from mindbridge.infrastructure._postgres_claim_consolidation import list_claim_candidates
 from mindbridge.infrastructure._postgres_consolidation import (
     commit_episode_consolidation,
     list_episode_candidates,
@@ -169,6 +172,13 @@ class PostgresMemoryStore:
     ) -> EpisodeCandidatePage:
         """Discover a stable bounded page for Omni episode verification."""
         return await list_episode_candidates(self._pool, request)
+
+    async def list_claim_candidates(
+        self,
+        request: ClaimCandidateRequest,
+    ) -> ClaimCandidatePage:
+        """Discover a stable bounded page for semantic Claim verification."""
+        return await list_claim_candidates(self._pool, request)
 
     async def commit_episode_consolidation(
         self,

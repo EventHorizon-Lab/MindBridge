@@ -10,6 +10,7 @@ import pytest
 from psycopg import AsyncConnection
 
 from mindbridge.application import (
+    ClaimCandidateRequest,
     ConsolidateEpisodes,
     EmbeddingInput,
     EmbeddingSearch,
@@ -435,6 +436,52 @@ async def test_episode_candidates_expand_a_stable_seed_by_event_vector(
     assert {event.hierarchy_level for event in page.events} == {EventHierarchyLevel.EVENT}
     assert {event.status for event in page.events} == {EventStatus.ACTIVE}
     assert all(event.parent_event_id is None for event in page.events)
+
+
+async def test_claim_candidates_expand_a_stable_seed_by_aligned_vector(
+    store: PostgresMemoryStore,
+) -> None:
+    tenant_id, first_observation_id, first_job_id = await _write_source_observation(
+        store,
+        "tenant_claim_candidates",
+        include_identity=False,
+    )
+    _, second_observation_id, second_job_id = await _write_source_observation(
+        store,
+        "tenant_claim_candidates",
+        ordinal=2,
+        occurred_at=NOW + timedelta(seconds=5),
+        include_identity=False,
+    )
+    for observation_id, job_id in (
+        (first_observation_id, first_job_id),
+        (second_observation_id, second_job_id),
+    ):
+        await ProcessObservation(
+            store,
+            RecordingPerceiver(),
+            FixedEmbedder(),
+            FixedTextEmbedder(),
+            media_url_signer=DeterministicSigner(),
+        ).run(tenant_id, observation_id, job_id)
+
+    page = await store.list_claim_candidates(
+        ClaimCandidateRequest(
+            tenant_id=tenant_id,
+            evaluated_at=NOW + timedelta(days=2),
+            limit=1,
+            maximum_gap_seconds=10,
+            minimum_similarity=0.99,
+        )
+    )
+
+    assert page.scanned_count == 1
+    assert page.next_cursor is not None
+    assert len(page.candidates) == 2
+    assert {candidate.claim.statement for candidate in page.candidates} == {
+        "The red tool is beside the blue toolbox."
+    }
+    assert all(len(candidate.entity_ids) == 2 for candidate in page.candidates)
 
 
 async def test_episode_consolidation_is_atomic_recallable_and_retry_safe(
