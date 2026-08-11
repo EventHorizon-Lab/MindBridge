@@ -76,3 +76,19 @@ uv run uvicorn mindbridge.api:create_production_app --factory
 
 `MINDBRIDGE_OBJECT_STORAGE_ENDPOINT_URL` is optional for AWS S3. Media URIs must use the tenant-safe
 shape `s3://<bucket>/tenants/<tenant_id>/<object>`.
+
+## Run the memory Worker
+
+The Worker shares the storage variables above and additionally pins the fallback VLM revision. Jina
+v5 Omni Small is pinned by default; set `MINDBRIDGE_JINA_DEVICE` only when automatic device selection
+is unsuitable:
+
+```bash
+export MINDBRIDGE_VLM_MODEL_REVISION=deployment-2026-08-11
+export MINDBRIDGE_JINA_DEVICE=cuda
+
+uv run --extra cloud-models celery -A mindbridge.celery_app:app worker --loglevel=INFO
+```
+
+One prefork child is the safe default because each child owns a full embedding model. Scale with one
+Worker process per assigned GPU instead of increasing concurrency inside a process.

@@ -854,6 +854,13 @@ Cloud
 
 API 和 Worker 可以使用同一个 Python package、两个进程部署。只有当吞吐、故障域或团队边界证明需要时，才将 ingestion、recall、lifecycle 或 model serving 拆成独立服务。
 
+Worker 通过 `mindbridge.celery_app:app` 启动，Redis 消息只传
+`tenant_id`、`observation_id`、`job_id`。原始媒体、Evidence 和任务状态均以 PostgreSQL/S3
+为事实来源。每个 prefork child 只加载一个固定 revision 的 Jina v5 Omni；默认并发为 1，
+多 GPU 通过每张卡一个 Worker 进程扩展，避免一个模型被 CPU 核数意外复制。API 进程不导入
+或加载 Jina。VLM 与 Jina revision 必须由部署配置固定并写入派生记录；凭证只从进程环境或
+基础设施 secret 注入。
+
 ### 12.2 推荐代码边界
 
 未来实现代码时保持最少的稳定模块：

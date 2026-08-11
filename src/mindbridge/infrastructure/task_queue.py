@@ -3,15 +3,28 @@
 from __future__ import annotations
 
 import asyncio
+from typing import Annotated
 
 from celery import Celery  # type: ignore[import-untyped]  # Upstream lacks PEP 561 metadata.
 from kombu.exceptions import (  # type: ignore[import-untyped]  # Upstream lacks PEP 561 metadata.
     OperationalError,
 )
+from pydantic import BaseModel, ConfigDict, StringConstraints
 
 from mindbridge.core import JobId, ObservationId, TaskBrokerError, TenantId
 
 PROCESS_OBSERVATION_TASK = "mindbridge.process_observation"
+_Identifier = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=255)]
+
+
+class ObservationProcessingTaskMessage(BaseModel):
+    """Strict ID-only schema accepted at the Celery trust boundary."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    tenant_id: _Identifier
+    observation_id: _Identifier
+    job_id: _Identifier
 
 
 def create_task_queue(broker_url: str) -> Celery:
@@ -59,14 +72,15 @@ class CeleryObservationJobPublisher:
     ) -> None:
         """Publish without blocking the API event loop or leaking broker details."""
         try:
+            message = ObservationProcessingTaskMessage(
+                tenant_id=tenant_id,
+                observation_id=observation_id,
+                job_id=job_id,
+            )
             await asyncio.to_thread(
                 self._task_queue.send_task,
                 PROCESS_OBSERVATION_TASK,
-                kwargs={
-                    "tenant_id": tenant_id,
-                    "observation_id": observation_id,
-                    "job_id": job_id,
-                },
+                kwargs={"message": message.model_dump(mode="json")},
                 task_id=job_id,
             )
         except OperationalError as error:

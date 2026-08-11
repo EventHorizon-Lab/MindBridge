@@ -46,9 +46,11 @@ async def test_publisher_sends_only_stable_tenant_and_job_identity(
     send_task.assert_called_once_with(
         PROCESS_OBSERVATION_TASK,
         kwargs={
-            "tenant_id": "tenant_01",
-            "observation_id": "observation_01",
-            "job_id": "job_process_observation_01",
+            "message": {
+                "tenant_id": "tenant_01",
+                "observation_id": "observation_01",
+                "job_id": "job_process_observation_01",
+            }
         },
         task_id="job_process_observation_01",
     )
