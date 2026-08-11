@@ -10,16 +10,27 @@ from mypy_boto3_s3 import S3Client
 
 from mindbridge import AsyncMindBridge, MindBridgeClientError
 from mindbridge.contracts import (
+    DeletionListRequest,
+    DeletionPage,
+    DeletionTombstoneView,
     MediaObjectInput,
     ObservationReceipt,
     ObservationStatus,
     ObserveRequest,
 )
-from mindbridge.core import MediaKind, ObjectStorageError, SensorKind
+from mindbridge.core import (
+    DeletionPropagationState,
+    ForgetTargetType,
+    MediaKind,
+    ObjectStorageError,
+    SensorKind,
+    derive_observation_id,
+)
 from mindbridge.edge import (
     EdgeMediaFile,
     EdgeObservationSynchronizer,
     S3EdgeMediaUploader,
+    SQLiteDeletionInbox,
     SQLiteObservationOutbox,
 )
 
@@ -42,6 +53,9 @@ class FailOnceMemoryApi:
             trace_id="trace_01",
         )
 
+    async def list_deletions(self, request: DeletionListRequest) -> DeletionPage:
+        return DeletionPage(items=(), next_cursor=None, trace_id="trace_deletions")
+
 
 class RecordingS3Client:
     def __init__(self) -> None:
@@ -58,6 +72,39 @@ class RecordingS3Client:
         self.calls.append((filename, bucket, key, ExtraArgs))
 
 
+class DeletingMemoryApi:
+    def __init__(self, request: ObserveRequest) -> None:
+        self.request = request
+        self.observe_calls = 0
+
+    async def observe(self, request: ObserveRequest) -> ObservationReceipt:
+        self.observe_calls += 1
+        raise AssertionError("a tombstoned observation must not be uploaded")
+
+    async def list_deletions(self, request: DeletionListRequest) -> DeletionPage:
+        observation_id = derive_observation_id(
+            self.request.tenant_id,
+            self.request.device_id,
+            self.request.boot_id,
+            self.request.sequence,
+        )
+        return DeletionPage(
+            items=(
+                DeletionTombstoneView(
+                    tombstone_id="tombstone_01",
+                    target_type=ForgetTargetType.OBSERVATION,
+                    target_id=observation_id,
+                    propagation_state=DeletionPropagationState.COMPLETE,
+                    requested_at=NOW,
+                    completed_at=NOW,
+                    error_code=None,
+                ),
+            ),
+            next_cursor=None,
+            trace_id="trace_deletion_page",
+        )
+
+
 async def test_sync_retries_only_metadata_after_media_upload(tmp_path: Path) -> None:
     request, media_file = _capture(tmp_path)
     outbox = SQLiteObservationOutbox(tmp_path / "edge.db", clock=lambda: NOW)
@@ -70,6 +117,7 @@ async def test_sync_retries_only_metadata_after_media_upload(tmp_path: Path) -> 
 
     synchronizer = EdgeObservationSynchronizer(
         outbox,
+        SQLiteDeletionInbox(tmp_path / "edge.db", clock=lambda: NOW),
         cast(AsyncMindBridge, api),
         upload,
     )
@@ -87,6 +135,32 @@ async def test_sync_retries_only_metadata_after_media_upload(tmp_path: Path) -> 
     assert receipt.status is ObservationStatus.DUPLICATE
     assert upload_calls == ["media_01"]
     assert outbox.pending_count() == 0
+
+
+async def test_sync_applies_tombstone_before_media_upload(tmp_path: Path) -> None:
+    request, media_file = _capture(tmp_path)
+    database_path = tmp_path / "edge.db"
+    outbox = SQLiteObservationOutbox(database_path, clock=lambda: NOW)
+    outbox.enqueue(request, (media_file,))
+    deletion_inbox = SQLiteDeletionInbox(database_path, clock=lambda: NOW)
+    api = DeletingMemoryApi(request)
+    upload_calls: list[str] = []
+
+    async def upload(_request: ObserveRequest, file: EdgeMediaFile) -> None:
+        upload_calls.append(file.media_object_id)
+
+    receipt = await EdgeObservationSynchronizer(
+        outbox,
+        deletion_inbox,
+        cast(AsyncMindBridge, api),
+        upload,
+    ).sync_next()
+
+    assert receipt is None
+    assert api.observe_calls == 0
+    assert upload_calls == []
+    assert outbox.pending_count() == 0
+    assert not media_file.local_path.exists()
 
 
 async def test_s3_uploader_checks_bytes_and_tenant_before_upload(tmp_path: Path) -> None:

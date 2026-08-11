@@ -11,8 +11,14 @@ from boto3.exceptions import S3UploadFailedError
 from botocore.config import Config
 from botocore.exceptions import BotoCoreError
 
-from mindbridge.contracts import MediaObjectInput, ObservationReceipt, ObserveRequest
+from mindbridge.contracts import (
+    DeletionListRequest,
+    MediaObjectInput,
+    ObservationReceipt,
+    ObserveRequest,
+)
 from mindbridge.core import ObjectStorageError
+from mindbridge.edge.deletion_inbox import SQLiteDeletionInbox
 from mindbridge.edge.outbox import EdgeMediaFile, SQLiteObservationOutbox
 from mindbridge.file_integrity import sha256_file
 from mindbridge.infrastructure import tenant_s3_object_key
@@ -97,16 +103,23 @@ class EdgeObservationSynchronizer:
     def __init__(
         self,
         outbox: SQLiteObservationOutbox,
+        deletion_inbox: SQLiteDeletionInbox,
         memory: AsyncMindBridge,
         upload_media: UploadEdgeMedia,
     ) -> None:
         self._outbox = outbox
+        self._deletion_inbox = deletion_inbox
         self._memory = memory
         self._upload_media = upload_media
 
     async def sync_next(self) -> ObservationReceipt | None:
         """Synchronize the oldest item, leaving it durable after any network failure."""
         item = self._outbox.next_pending()
+        polled_tenant_ids: set[str] = set()
+        while item is not None and item.request.tenant_id not in polled_tenant_ids:
+            await self.sync_deletions(item.request.tenant_id)
+            polled_tenant_ids.add(item.request.tenant_id)
+            item = self._outbox.next_pending()
         if item is None:
             return None
         if not item.media_uploaded:
@@ -125,10 +138,38 @@ class EdgeObservationSynchronizer:
         self._outbox.acknowledge(item, receipt)
         return receipt
 
+    async def sync_deletions(
+        self,
+        tenant_id: str,
+        *,
+        page_limit: int = 100,
+        max_pages: int = 10,
+    ) -> int:
+        """Apply a bounded ordered batch of cloud tombstones before any upload."""
+        if not 1 <= page_limit <= 100 or max_pages <= 0:
+            raise ValueError("deletion page_limit must be 1..100 and max_pages must be positive")
+        cursor = self._deletion_inbox.read_cursor(tenant_id)
+        applied = 0
+        for _ in range(max_pages):
+            page = await self._memory.list_deletions(
+                DeletionListRequest(
+                    tenant_id=tenant_id,
+                    cursor=cursor,
+                    limit=page_limit,
+                )
+            )
+            applied += self._deletion_inbox.apply_page(tenant_id, page)
+            if page.next_cursor is None:
+                break
+            cursor = page.next_cursor
+        return applied
+
     async def sync_pending(self, *, limit: int = 100) -> tuple[ObservationReceipt, ...]:
         """Synchronize at most `limit` items so the caller controls scheduling and backoff."""
         if limit <= 0:
             raise ValueError("edge sync limit must be positive")
+        for tenant_id in self._deletion_inbox.tenant_ids():
+            await self.sync_deletions(tenant_id)
         receipts: list[ObservationReceipt] = []
         for _ in range(limit):
             receipt = await self.sync_next()
