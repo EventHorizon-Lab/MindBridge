@@ -305,6 +305,14 @@ class MemoryStore(Protocol):
         tombstone_id: str,
     ) -> DeletionTombstone: ...
 
+    async def list_deletion_tombstones(
+        self,
+        tenant_id: TenantId,
+        *,
+        after_tombstone_id: str | None,
+        limit: int,
+    ) -> tuple[DeletionTombstone, ...]: ...
+
     async def search_memories(self, request: RecallRequest) -> tuple[MemoryRecord, ...]: ...
 
     async def search_memories_by_evidence(

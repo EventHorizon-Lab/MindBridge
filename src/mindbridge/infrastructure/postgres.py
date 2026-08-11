@@ -42,6 +42,7 @@ from mindbridge.infrastructure._postgres_evidence import read_evidence
 from mindbridge.infrastructure._postgres_feedback import record_feedback
 from mindbridge.infrastructure._postgres_forget import (
     complete_forget,
+    list_deletion_tombstones,
     mark_forget_failed,
     prepare_forget,
     read_deletion_tombstone,
@@ -197,6 +198,21 @@ class PostgresMemoryStore:
     ) -> DeletionTombstone:
         """Read one tenant-owned deletion propagation state."""
         return await read_deletion_tombstone(self._pool, tenant_id, TombstoneId(tombstone_id))
+
+    async def list_deletion_tombstones(
+        self,
+        tenant_id: TenantId,
+        *,
+        after_tombstone_id: str | None,
+        limit: int,
+    ) -> tuple[DeletionTombstone, ...]:
+        """List deletion barriers in stable propagation order."""
+        return await list_deletion_tombstones(
+            self._pool,
+            tenant_id,
+            after_tombstone_id=after_tombstone_id,
+            limit=limit,
+        )
 
     async def search_memories(self, request: RecallRequest) -> tuple[MemoryRecord, ...]:
         """Apply exact filters and PostgreSQL full-text candidate retrieval."""

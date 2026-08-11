@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+from typing import Annotated
 from uuid import uuid4
 
-from fastapi import FastAPI, Request, status
+from fastapi import FastAPI, Query, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.types import Lifespan
 
 from mindbridge.application import MemoryKernel
 from mindbridge.contracts import (
+    DeletionListRequest,
+    DeletionPage,
     ErrorResponse,
     FeedbackReceipt,
     FeedbackRequest,
@@ -51,6 +54,7 @@ def create_app(
     app = FastAPI(title="MindBridge", version="0.1.0", lifespan=lifespan)
     _register_request_error_handlers(app)
     _register_runtime_error_handlers(app)
+    _register_deletion_routes(app, kernel)
 
     @app.get("/healthz", response_model=HealthResponse, operation_id="health")
     async def health() -> HealthResponse:
@@ -84,14 +88,6 @@ def create_app(
         return await kernel.record_feedback(request)
 
     @app.post(
-        "/v1/forget",
-        response_model=ForgetReceipt,
-        operation_id="forget",
-    )
-    async def forget(request: ForgetRequest) -> ForgetReceipt:
-        return await kernel.forget(request)
-
-    @app.post(
         "/v1/recall",
         response_model=RecallResult,
         operation_id="recall",
@@ -108,17 +104,6 @@ def create_app(
         return await kernel.get_memory(tenant_id, memory_id)
 
     @app.get(
-        "/v1/deletions/{tombstone_id}",
-        response_model=ForgetReceipt,
-        operation_id="getForgetStatus",
-    )
-    async def get_forget_status(
-        tombstone_id: Identifier,
-        tenant_id: Identifier,
-    ) -> ForgetReceipt:
-        return await kernel.get_forget_status(tenant_id, tombstone_id)
-
-    @app.get(
         "/v1/jobs/{job_id}",
         response_model=ObservationProcessingJobView,
         operation_id="getObservationJob",
@@ -130,6 +115,43 @@ def create_app(
         return await kernel.get_observation_job(tenant_id, job_id)
 
     return app
+
+
+def _register_deletion_routes(app: FastAPI, kernel: MemoryKernel) -> None:
+    """Expose command, status, and edge propagation over one shared use case."""
+
+    @app.post(
+        "/v1/forget",
+        response_model=ForgetReceipt,
+        operation_id="forget",
+    )
+    async def forget(request: ForgetRequest) -> ForgetReceipt:
+        return await kernel.forget(request)
+
+    @app.get(
+        "/v1/deletions",
+        response_model=DeletionPage,
+        operation_id="listDeletions",
+    )
+    async def list_deletions(
+        tenant_id: Identifier,
+        cursor: Identifier | None = None,
+        limit: Annotated[int, Query(ge=1, le=100)] = 100,
+    ) -> DeletionPage:
+        return await kernel.list_deletions(
+            DeletionListRequest(tenant_id=tenant_id, cursor=cursor, limit=limit)
+        )
+
+    @app.get(
+        "/v1/deletions/{tombstone_id}",
+        response_model=ForgetReceipt,
+        operation_id="getForgetStatus",
+    )
+    async def get_forget_status(
+        tombstone_id: Identifier,
+        tenant_id: Identifier,
+    ) -> ForgetReceipt:
+        return await kernel.get_forget_status(tenant_id, tombstone_id)
 
 
 def _register_request_error_handlers(app: FastAPI) -> None:

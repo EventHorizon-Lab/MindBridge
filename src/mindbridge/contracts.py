@@ -170,8 +170,8 @@ class ForgetRequest(ContractModel):
     idempotency_key: Identifier | None = None
 
 
-class ForgetReceipt(ContractModel):
-    """Content-free deletion progress safe to retain after physical erasure."""
+class DeletionTombstoneView(ContractModel):
+    """Content-free deletion state safe to retain after physical erasure."""
 
     tombstone_id: Identifier
     target_type: ForgetTargetType
@@ -180,6 +180,27 @@ class ForgetReceipt(ContractModel):
     requested_at: AwareDatetime
     completed_at: AwareDatetime | None
     error_code: Identifier | None
+
+
+class ForgetReceipt(DeletionTombstoneView):
+    """Deletion result returned by one command or status lookup."""
+
+    trace_id: Identifier
+
+
+class DeletionListRequest(ContractModel):
+    """Tenant-scoped cursor request used by reconnecting edge devices."""
+
+    tenant_id: Identifier
+    cursor: Identifier | None = None
+    limit: Annotated[int, Field(ge=1, le=100)] = 100
+
+
+class DeletionPage(ContractModel):
+    """Stable ordered tombstones and the next cursor when another page exists."""
+
+    items: tuple[DeletionTombstoneView, ...]
+    next_cursor: Identifier | None
     trace_id: Identifier
 
 

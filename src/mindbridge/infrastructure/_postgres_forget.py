@@ -100,6 +100,37 @@ async def read_deletion_tombstone(
     return tombstone
 
 
+async def list_deletion_tombstones(
+    pool: DatabasePool,
+    tenant_id: TenantId,
+    *,
+    after_tombstone_id: str | None,
+    limit: int,
+) -> tuple[DeletionTombstone, ...]:
+    """List one stable tenant page after an optional tombstone cursor."""
+    async with pool.connection() as connection:
+        cursor = await connection.execute(
+            """
+            SELECT tombstone_id, tenant_id, target_type, target_id,
+                   propagation_state, requested_at, completed_at, error_code
+            FROM deletion_tombstones AS tombstone
+            WHERE tombstone.tenant_id = %s
+              AND (
+                  %s::text IS NULL
+                  OR (tombstone.requested_at, tombstone.tombstone_id) > (
+                      SELECT boundary.requested_at, boundary.tombstone_id
+                      FROM deletion_tombstones AS boundary
+                      WHERE boundary.tenant_id = %s AND boundary.tombstone_id = %s
+                  )
+              )
+            ORDER BY tombstone.requested_at, tombstone.tombstone_id
+            LIMIT %s
+            """,
+            (tenant_id, after_tombstone_id, tenant_id, after_tombstone_id, limit),
+        )
+        return tuple([_tombstone_from_row(cast(TombstoneRow, row)) async for row in cursor])
+
+
 async def complete_forget(
     pool: DatabasePool,
     tombstone: DeletionTombstone,

@@ -7,7 +7,13 @@ import httpx
 import pytest
 
 from mindbridge import AsyncMindBridge, MindBridgeClientError
-from mindbridge.contracts import FeedbackRequest, ForgetRequest, RecallQuery, RecallRequest
+from mindbridge.contracts import (
+    DeletionListRequest,
+    FeedbackRequest,
+    ForgetRequest,
+    RecallQuery,
+    RecallRequest,
+)
 from mindbridge.core import FeedbackType, ForgetTargetType
 
 
@@ -181,10 +187,31 @@ async def test_forget_and_status_use_shared_contracts() -> None:
             assert request.url.path == "/v1/forget"
             assert json.loads(request.content)["target_type"] == "memory_record"
             trace_id = "trace_forget"
-        else:
+        elif request.url.path.endswith("tombstone_01"):
             assert request.url.path == "/v1/deletions/tombstone_01"
             assert request.url.params["tenant_id"] == "tenant_01"
             trace_id = "trace_status"
+        else:
+            assert request.url.path == "/v1/deletions"
+            assert request.url.params["limit"] == "1"
+            return httpx.Response(
+                200,
+                json={
+                    "items": [
+                        {
+                            "tombstone_id": "tombstone_01",
+                            "target_type": "memory_record",
+                            "target_id": "memory_01",
+                            "propagation_state": "complete",
+                            "requested_at": "2026-08-12T08:00:00Z",
+                            "completed_at": "2026-08-12T08:00:00Z",
+                            "error_code": None,
+                        }
+                    ],
+                    "next_cursor": None,
+                    "trace_id": "trace_page",
+                },
+            )
         return httpx.Response(
             200,
             json={
@@ -209,11 +236,13 @@ async def test_forget_and_status_use_shared_contracts() -> None:
             )
         )
         status = await client.get_forget_status("tenant_01", forgotten.tombstone_id)
+        page = await client.list_deletions(DeletionListRequest(tenant_id="tenant_01", limit=1))
     finally:
         await client.close()
 
     assert forgotten.trace_id == "trace_forget"
     assert status.trace_id == "trace_status"
+    assert page.items[0].tombstone_id == "tombstone_01"
 
 
 def _client(

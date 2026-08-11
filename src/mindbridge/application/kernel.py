@@ -30,6 +30,9 @@ from mindbridge.application.recall import (
 )
 from mindbridge.contracts import (
     ContractModel,
+    DeletionListRequest,
+    DeletionPage,
+    DeletionTombstoneView,
     EvidenceView,
     FeedbackReceipt,
     FeedbackRequest,
@@ -244,6 +247,20 @@ class MemoryKernel:
             tombstone_id,
         )
         return _forget_receipt(tombstone)
+
+    async def list_deletions(self, request: DeletionListRequest) -> DeletionPage:
+        """List stable deletion barriers for reconnecting edge devices."""
+        tombstones = await self._store.list_deletion_tombstones(
+            TenantId(request.tenant_id),
+            after_tombstone_id=request.cursor,
+            limit=request.limit + 1,
+        )
+        page = tombstones[: request.limit]
+        return DeletionPage(
+            items=tuple(_deletion_view(tombstone) for tombstone in page),
+            next_cursor=(page[-1].tombstone_id if len(tombstones) > request.limit else None),
+            trace_id=_new_id("trace"),
+        )
 
     async def get_observation_job(
         self,
@@ -551,6 +568,13 @@ def _evidence_view(evidence: ResolvedEvidence) -> EvidenceView:
 
 def _forget_receipt(tombstone: DeletionTombstone) -> ForgetReceipt:
     return ForgetReceipt(
+        **_deletion_view(tombstone).model_dump(),
+        trace_id=_new_id("trace"),
+    )
+
+
+def _deletion_view(tombstone: DeletionTombstone) -> DeletionTombstoneView:
+    return DeletionTombstoneView(
         tombstone_id=tombstone.tombstone_id,
         target_type=tombstone.target_type,
         target_id=tombstone.target_id,
@@ -558,7 +582,6 @@ def _forget_receipt(tombstone: DeletionTombstone) -> ForgetReceipt:
         requested_at=tombstone.requested_at,
         completed_at=tombstone.completed_at,
         error_code=tombstone.error_code,
-        trace_id=_new_id("trace"),
     )
 
 

@@ -16,6 +16,7 @@ from mindbridge.application import (
     ResolvedEvidence,
 )
 from mindbridge.contracts import (
+    DeletionListRequest,
     ForgetRequest,
     MediaObjectInput,
     ObserveRequest,
@@ -115,6 +116,14 @@ async def test_memory_forget_is_idempotent_and_blocks_resurrection(
         idempotency_key="remember_01",
     )
     memory = await kernel.remember(remember_request)
+    second_memory = await kernel.remember(
+        remember_request.model_copy(
+            update={
+                "summary": "The green tool is in the drawer.",
+                "idempotency_key": "remember_02",
+            }
+        )
+    )
     request = ForgetRequest(
         tenant_id=tenant_id,
         target_type=ForgetTargetType.MEMORY_RECORD,
@@ -124,12 +133,29 @@ async def test_memory_forget_is_idempotent_and_blocks_resurrection(
 
     first = await kernel.forget(request)
     retry = await kernel.forget(request)
+    second = await kernel.forget(
+        ForgetRequest(
+            tenant_id=tenant_id,
+            target_type=ForgetTargetType.MEMORY_RECORD,
+            target_id=second_memory.memory_id,
+        )
+    )
     status = await kernel.get_forget_status(tenant_id, first.tombstone_id)
+    first_page = await kernel.list_deletions(DeletionListRequest(tenant_id=tenant_id, limit=1))
+    second_page = await kernel.list_deletions(
+        DeletionListRequest(tenant_id=tenant_id, cursor=first_page.next_cursor, limit=1)
+    )
 
     assert first.tombstone_id == retry.tombstone_id
     assert retry.propagation_state is DeletionPropagationState.COMPLETE
     assert status.propagation_state is DeletionPropagationState.COMPLETE
-    assert await _counts(database_url, tenant_id) == (0, 0, 0, 0, 0, 0, 1)
+    assert first_page.next_cursor is not None
+    assert second_page.next_cursor is None
+    assert {first_page.items[0].tombstone_id, second_page.items[0].tombstone_id} == {
+        first.tombstone_id,
+        second.tombstone_id,
+    }
+    assert await _counts(database_url, tenant_id) == (0, 0, 0, 0, 0, 0, 2)
     with pytest.raises(MemoryDeletedError):
         await kernel.get_memory(tenant_id, memory.memory_id)
     with pytest.raises(MemoryDeletedError):

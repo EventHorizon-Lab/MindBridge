@@ -9,6 +9,9 @@ from fastapi.testclient import TestClient
 from mindbridge.api import create_app
 from mindbridge.application import MemoryKernel
 from mindbridge.contracts import (
+    DeletionListRequest,
+    DeletionPage,
+    DeletionTombstoneView,
     FeedbackReceipt,
     FeedbackRequest,
     ForgetReceipt,
@@ -109,6 +112,23 @@ class StubKernel:
             trace_id="trace_forget_status",
         )
 
+    async def list_deletions(self, request: DeletionListRequest) -> DeletionPage:
+        return DeletionPage(
+            items=(
+                DeletionTombstoneView(
+                    tombstone_id="tombstone_01",
+                    target_type=ForgetTargetType.MEMORY_RECORD,
+                    target_id="memory_01",
+                    propagation_state=DeletionPropagationState.COMPLETE,
+                    requested_at=NOW,
+                    completed_at=NOW,
+                    error_code=None,
+                ),
+            ),
+            next_cursor=None,
+            trace_id="trace_deletion_page",
+        )
+
     async def recall(self, request: RecallRequest) -> RecallResult:
         return RecallResult(
             answer=None,
@@ -194,10 +214,12 @@ def test_forget_routes_share_typed_progress_contract() -> None:
         "/v1/deletions/tombstone_01",
         params={"tenant_id": "tenant_01"},
     )
+    page = client.get("/v1/deletions", params={"tenant_id": "tenant_01"})
 
     assert forgotten.status_code == 200
     assert forgotten.json()["propagation_state"] == "complete"
     assert status_response.json()["trace_id"] == "trace_forget_status"
+    assert page.json()["items"][0]["tombstone_id"] == "tombstone_01"
 
 
 def test_job_route_is_tenant_scoped_and_returns_not_found() -> None:
@@ -263,6 +285,7 @@ def test_openapi_exposes_stable_operation_ids() -> None:
     assert paths["/v1/feedback"]["post"]["operationId"] == "recordFeedback"
     assert paths["/v1/forget"]["post"]["operationId"] == "forget"
     assert paths["/v1/deletions/{tombstone_id}"]["get"]["operationId"] == "getForgetStatus"
+    assert paths["/v1/deletions"]["get"]["operationId"] == "listDeletions"
     assert paths["/v1/recall"]["post"]["operationId"] == "recall"
     assert paths["/v1/jobs/{job_id}"]["get"]["operationId"] == "getObservationJob"
 

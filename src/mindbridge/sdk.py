@@ -11,6 +11,8 @@ from pydantic import ValidationError
 
 from mindbridge.contracts import (
     ContractModel,
+    DeletionListRequest,
+    DeletionPage,
     ErrorResponse,
     FeedbackReceipt,
     FeedbackRequest,
@@ -115,6 +117,18 @@ class AsyncMindBridge:
             f"v1/deletions/{quote(tombstone_id, safe='')}",
             ForgetReceipt,
             params={"tenant_id": tenant_id},
+        )
+
+    async def list_deletions(self, request: DeletionListRequest) -> DeletionPage:
+        """List one stable page of tenant deletion barriers."""
+        parameters = {"tenant_id": request.tenant_id, "limit": str(request.limit)}
+        if request.cursor is not None:
+            parameters["cursor"] = request.cursor
+        return await self._request(
+            "GET",
+            "v1/deletions",
+            DeletionPage,
+            params=parameters,
         )
 
     async def get_observation_job(
