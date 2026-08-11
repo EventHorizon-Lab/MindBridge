@@ -11,6 +11,8 @@ from mindbridge.application import MemoryKernel
 from mindbridge.contracts import (
     FeedbackReceipt,
     FeedbackRequest,
+    ForgetReceipt,
+    ForgetRequest,
     MemoryView,
     ObservationProcessingJobView,
     ObservationReceipt,
@@ -21,8 +23,11 @@ from mindbridge.contracts import (
     RememberRequest,
 )
 from mindbridge.core import (
+    DeletionPropagationState,
     DomainInvariantError,
     FeedbackType,
+    ForgetTargetNotFoundError,
+    ForgetTargetType,
     JobNotFoundError,
     JobState,
     MemoryIntegrityError,
@@ -76,6 +81,32 @@ class StubKernel:
             resulting_strength=1.5 if request.memory_id is not None else None,
             created_at=NOW,
             trace_id="trace_feedback",
+        )
+
+    async def forget(self, request: ForgetRequest) -> ForgetReceipt:
+        return ForgetReceipt(
+            tombstone_id="tombstone_01",
+            target_type=request.target_type,
+            target_id=request.target_id,
+            propagation_state=DeletionPropagationState.COMPLETE,
+            requested_at=NOW,
+            completed_at=NOW,
+            error_code=None,
+            trace_id="trace_forget",
+        )
+
+    async def get_forget_status(self, tenant_id: str, tombstone_id: str) -> ForgetReceipt:
+        if tenant_id != "tenant_01":
+            raise ForgetTargetNotFoundError("missing")
+        return ForgetReceipt(
+            tombstone_id=tombstone_id,
+            target_type=ForgetTargetType.MEMORY_RECORD,
+            target_id="memory_01",
+            propagation_state=DeletionPropagationState.COMPLETE,
+            requested_at=NOW,
+            completed_at=NOW,
+            error_code=None,
+            trace_id="trace_forget_status",
         )
 
     async def recall(self, request: RecallRequest) -> RecallResult:
@@ -149,6 +180,26 @@ def test_feedback_route_uses_shared_contract() -> None:
     assert response.json()["trace_id"] == "trace_feedback"
 
 
+def test_forget_routes_share_typed_progress_contract() -> None:
+    client = _client()
+    forgotten = client.post(
+        "/v1/forget",
+        json={
+            "tenant_id": "tenant_01",
+            "target_type": "memory_record",
+            "target_id": "memory_01",
+        },
+    )
+    status_response = client.get(
+        "/v1/deletions/tombstone_01",
+        params={"tenant_id": "tenant_01"},
+    )
+
+    assert forgotten.status_code == 200
+    assert forgotten.json()["propagation_state"] == "complete"
+    assert status_response.json()["trace_id"] == "trace_forget_status"
+
+
 def test_job_route_is_tenant_scoped_and_returns_not_found() -> None:
     client = _client()
 
@@ -210,6 +261,8 @@ def test_openapi_exposes_stable_operation_ids() -> None:
     assert paths["/v1/memories"]["post"]["operationId"] == "remember"
     assert paths["/v1/memories/{memory_id}"]["get"]["operationId"] == "getMemory"
     assert paths["/v1/feedback"]["post"]["operationId"] == "recordFeedback"
+    assert paths["/v1/forget"]["post"]["operationId"] == "forget"
+    assert paths["/v1/deletions/{tombstone_id}"]["get"]["operationId"] == "getForgetStatus"
     assert paths["/v1/recall"]["post"]["operationId"] == "recall"
     assert paths["/v1/jobs/{job_id}"]["get"]["operationId"] == "getObservationJob"
 

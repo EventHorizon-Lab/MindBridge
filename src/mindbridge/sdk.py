@@ -14,6 +14,8 @@ from mindbridge.contracts import (
     ErrorResponse,
     FeedbackReceipt,
     FeedbackRequest,
+    ForgetReceipt,
+    ForgetRequest,
     MemoryView,
     ObservationProcessingJobView,
     ObservationReceipt,
@@ -85,6 +87,10 @@ class AsyncMindBridge:
         """Record one useful, wrong, missing, or correction signal."""
         return await self._post("v1/feedback", request, FeedbackReceipt)
 
+    async def forget(self, request: ForgetRequest) -> ForgetReceipt:
+        """Explicitly erase one exact memory or source observation."""
+        return await self._post("v1/forget", request, ForgetReceipt)
+
     async def recall(self, request: RecallRequest) -> RecallResult:
         """Recall memories and grounded evidence through the production API."""
         return await self._post("v1/recall", request, RecallResult)
@@ -95,6 +101,19 @@ class AsyncMindBridge:
             "GET",
             f"v1/memories/{quote(memory_id, safe='')}",
             MemoryView,
+            params={"tenant_id": tenant_id},
+        )
+
+    async def get_forget_status(
+        self,
+        tenant_id: str,
+        tombstone_id: str,
+    ) -> ForgetReceipt:
+        """Read durable deletion propagation state."""
+        return await self._request(
+            "GET",
+            f"v1/deletions/{quote(tombstone_id, safe='')}",
+            ForgetReceipt,
             params={"tenant_id": tenant_id},
         )
 

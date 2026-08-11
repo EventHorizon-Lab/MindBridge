@@ -7,8 +7,8 @@ import httpx
 import pytest
 
 from mindbridge import AsyncMindBridge, MindBridgeClientError
-from mindbridge.contracts import FeedbackRequest, RecallQuery, RecallRequest
-from mindbridge.core import FeedbackType
+from mindbridge.contracts import FeedbackRequest, ForgetRequest, RecallQuery, RecallRequest
+from mindbridge.core import FeedbackType, ForgetTargetType
 
 
 async def test_recall_uses_shared_request_and_response_contracts() -> None:
@@ -173,6 +173,47 @@ async def test_feedback_uses_shared_contracts() -> None:
 
     assert receipt.resulting_state is not None
     assert receipt.resulting_strength == 1.5
+
+
+async def test_forget_and_status_use_shared_contracts() -> None:
+    async def respond(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            assert request.url.path == "/v1/forget"
+            assert json.loads(request.content)["target_type"] == "memory_record"
+            trace_id = "trace_forget"
+        else:
+            assert request.url.path == "/v1/deletions/tombstone_01"
+            assert request.url.params["tenant_id"] == "tenant_01"
+            trace_id = "trace_status"
+        return httpx.Response(
+            200,
+            json={
+                "tombstone_id": "tombstone_01",
+                "target_type": "memory_record",
+                "target_id": "memory_01",
+                "propagation_state": "complete",
+                "requested_at": "2026-08-12T08:00:00Z",
+                "completed_at": "2026-08-12T08:00:00Z",
+                "error_code": None,
+                "trace_id": trace_id,
+            },
+        )
+
+    client = _client(respond)
+    try:
+        forgotten = await client.forget(
+            ForgetRequest(
+                tenant_id="tenant_01",
+                target_type=ForgetTargetType.MEMORY_RECORD,
+                target_id="memory_01",
+            )
+        )
+        status = await client.get_forget_status("tenant_01", forgotten.tombstone_id)
+    finally:
+        await client.close()
+
+    assert forgotten.trace_id == "trace_forget"
+    assert status.trace_id == "trace_status"
 
 
 def _client(

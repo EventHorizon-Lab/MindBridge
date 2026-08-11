@@ -14,6 +14,8 @@ from mindbridge.contracts import (
     ErrorResponse,
     FeedbackReceipt,
     FeedbackRequest,
+    ForgetReceipt,
+    ForgetRequest,
     HealthResponse,
     Identifier,
     MemoryView,
@@ -27,8 +29,10 @@ from mindbridge.contracts import (
 )
 from mindbridge.core import (
     DomainInvariantError,
+    ForgetTargetNotFoundError,
     IdempotencyConflictError,
     JobNotFoundError,
+    MemoryDeletedError,
     MemoryIntegrityError,
     MemoryNotFoundError,
     ModelOutputError,
@@ -80,6 +84,14 @@ def create_app(
         return await kernel.record_feedback(request)
 
     @app.post(
+        "/v1/forget",
+        response_model=ForgetReceipt,
+        operation_id="forget",
+    )
+    async def forget(request: ForgetRequest) -> ForgetReceipt:
+        return await kernel.forget(request)
+
+    @app.post(
         "/v1/recall",
         response_model=RecallResult,
         operation_id="recall",
@@ -94,6 +106,17 @@ def create_app(
     )
     async def get_memory(memory_id: Identifier, tenant_id: Identifier) -> MemoryView:
         return await kernel.get_memory(tenant_id, memory_id)
+
+    @app.get(
+        "/v1/deletions/{tombstone_id}",
+        response_model=ForgetReceipt,
+        operation_id="getForgetStatus",
+    )
+    async def get_forget_status(
+        tombstone_id: Identifier,
+        tenant_id: Identifier,
+    ) -> ForgetReceipt:
+        return await kernel.get_forget_status(tenant_id, tombstone_id)
 
     @app.get(
         "/v1/jobs/{job_id}",
@@ -152,6 +175,28 @@ def _register_request_error_handlers(app: FastAPI) -> None:
 
 
 def _register_runtime_error_handlers(app: FastAPI) -> None:
+    @app.exception_handler(ForgetTargetNotFoundError)
+    async def handle_forget_target_not_found(
+        _request: Request,
+        _error: ForgetTargetNotFoundError,
+    ) -> JSONResponse:
+        return _error_response(
+            status.HTTP_404_NOT_FOUND,
+            code="forget_target_not_found",
+            message="forget target or deletion tombstone does not exist",
+        )
+
+    @app.exception_handler(MemoryDeletedError)
+    async def handle_memory_deleted(
+        _request: Request,
+        _error: MemoryDeletedError,
+    ) -> JSONResponse:
+        return _error_response(
+            status.HTTP_410_GONE,
+            code="memory_deleted",
+            message="memory content was explicitly deleted",
+        )
+
     @app.exception_handler(MemoryNotFoundError)
     async def handle_memory_not_found(
         _request: Request,
