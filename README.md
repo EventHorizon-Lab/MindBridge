@@ -93,6 +93,26 @@ uvx --from huggingface-hub hf download ByteDance-Seed/M3-Bench \
 The resulting annotation identity and counts are recorded in
 [benchmarks/manifests/dataset-adapters-smoke.json](benchmarks/manifests/dataset-adapters-smoke.json).
 
+Run LoCoMo against the deployed production API. The command writes the official conversation-level
+prediction shape and a sidecar manifest containing source, code, model, Prompt, retrieval, and output
+identities. `MINDBRIDGE_API_KEY` is optional for an unauthenticated local deployment and is never
+written to the manifest.
+
+```bash
+export MINDBRIDGE_API_KEY=replace-with-a-runtime-secret
+uv run python -m mindbridge.benchmarks.locomo_cli \
+  --dataset .benchmarks/locomo/data/locomo10.json \
+  --output .benchmarks/results/locomo-mindbridge.json \
+  --api-base-url http://localhost:8000 \
+  --source-revision 3eb6f2c585f5e1699204e3c3bdf7adc5c28cb376 \
+  --code-revision "$(git rev-parse HEAD)" \
+  --answer-model-revision serving-fingerprint
+```
+
+Use `--sample-id` for a smoke subset. Existing results are preserved unless `--overwrite` is
+explicitly supplied. The prediction field is `mindbridge_prediction`, ready for the official
+LoCoMo evaluation functions.
+
 ## Run the MaaS API
 
 The production factory reads secrets from the process environment. S3 credentials use Boto3's
