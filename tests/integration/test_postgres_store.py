@@ -84,13 +84,16 @@ class DiscardingObservationJobPublisher:
         return None
 
 
-class FixedQueryEmbedder:
+class FixedRecallEmbedder:
     """Keeps persistence integration independent from the embedding service."""
 
     model_reference = ModelReference(model_id="jina-omni", revision="pinned-revision")
     dimension = 1_024
 
     async def encode_query(self, query: RecallEmbeddingQuery) -> tuple[float, ...]:
+        return (1.0,) + (0.0,) * 1_023
+
+    async def encode_memory_document(self, text: str) -> tuple[float, ...]:
         return (1.0,) + (0.0,) * 1_023
 
 
@@ -369,6 +372,6 @@ def _kernel(store: PostgresMemoryStore) -> MemoryKernel:
         embedding_index=store,
         media_url_signer=DeterministicMediaUrlSigner(),
         observation_job_publisher=DiscardingObservationJobPublisher(),
-        query_embedder=FixedQueryEmbedder(),
+        recall_embedder=FixedRecallEmbedder(),
         clock=lambda: NOW,
     )

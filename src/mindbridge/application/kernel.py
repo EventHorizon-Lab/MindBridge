@@ -23,8 +23,8 @@ from mindbridge.application.ports import (
 from mindbridge.application.ranking import fuse_memory_rankings
 from mindbridge.application.recall import (
     EVIDENCE_DOCUMENT_EMBEDDING_TASK,
+    RecallEmbedder,
     RecallEmbeddingQuery,
-    RecallQueryEmbedder,
     ResolvedQueryMedia,
 )
 from mindbridge.contracts import (
@@ -69,7 +69,7 @@ class MemoryKernel:
         embedding_index: EmbeddingIndex,
         media_url_signer: MediaUrlSigner,
         observation_job_publisher: ObservationJobPublisher,
-        query_embedder: RecallQueryEmbedder,
+        recall_embedder: RecallEmbedder,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._store = store
@@ -77,7 +77,7 @@ class MemoryKernel:
         self._embedding_index = embedding_index
         self._media_url_signer = media_url_signer
         self._observation_job_publisher = observation_job_publisher
-        self._query_embedder = query_embedder
+        self._recall_embedder = recall_embedder
         self._clock = clock or _utc_now
 
     async def observe(self, request: ObserveRequest) -> ObservationReceipt:
@@ -185,12 +185,12 @@ class MemoryKernel:
             text=request.query.text,
             media=await self._resolve_query_media(request),
         )
-        values = await self._query_embedder.encode_query(query)
+        values = await self._recall_embedder.encode_query(query)
         matches = await self._embedding_index.search_embeddings(
             EmbeddingSearch(
                 tenant_id=TenantId(request.tenant_id),
                 values=values,
-                model_reference=self._query_embedder.model_reference,
+                model_reference=self._recall_embedder.model_reference,
                 document_task=EVIDENCE_DOCUMENT_EMBEDDING_TASK,
                 object_types=(EmbeddedObjectType.EVIDENCE_SPAN,),
                 limit=limit,

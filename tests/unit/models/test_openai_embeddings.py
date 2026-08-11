@@ -1,4 +1,4 @@
-"""Contract tests for OpenAI-compatible Jina query embeddings."""
+"""Contract tests for OpenAI-compatible Jina recall embeddings."""
 
 import json
 from collections.abc import Callable, Coroutine
@@ -18,7 +18,7 @@ from mindbridge.core import (
     ModelReference,
     TenantId,
 )
-from mindbridge.models import OpenAIJinaQueryEmbedder, normalize_openai_base_url
+from mindbridge.models import OpenAIJinaEmbedder, normalize_openai_base_url
 
 NOW = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
 MODEL_ID = "jinaai/jina-embeddings-v5-omni-small-retrieval"
@@ -41,6 +41,26 @@ async def test_text_query_uses_typed_embedding_sdk() -> None:
         vector = await embedder.encode_query(
             RecallEmbeddingQuery(text="where is the tool?", media=())
         )
+    finally:
+        await embedder.close()
+
+    assert vector == (1.0,) + (0.0,) * 1_023
+
+
+async def test_memory_document_uses_jina_document_prompt() -> None:
+    async def respond(request: httpx.Request) -> httpx.Response:
+        payload: dict[str, object] = json.loads(request.content)
+        assert payload == {
+            "input": ["Document: Caroline plans to become a counselor."],
+            "model": MODEL_ID,
+            "dimensions": 1_024,
+            "encoding_format": "float",
+        }
+        return _embedding_response()
+
+    embedder = _embedder(respond)
+    try:
+        vector = await embedder.encode_memory_document("Caroline plans to become a counselor.")
     finally:
         await embedder.close()
 
@@ -108,14 +128,14 @@ async def test_invalid_embedding_output_is_rejected(
 
 def _embedder(
     handler: Callable[[httpx.Request], Coroutine[None, None, httpx.Response]],
-) -> OpenAIJinaQueryEmbedder:
+) -> OpenAIJinaEmbedder:
     client = AsyncOpenAI(
         api_key="unit-test-key",
         base_url=normalize_openai_base_url("https://embedding.example.test/api/v1/embeddings"),
         http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
         max_retries=0,
     )
-    return OpenAIJinaQueryEmbedder(
+    return OpenAIJinaEmbedder(
         client,
         ModelReference(model_id=MODEL_ID, revision="pinned-revision"),
     )

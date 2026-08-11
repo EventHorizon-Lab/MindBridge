@@ -1,4 +1,4 @@
-"""Jina recall-query embeddings through an OpenAI-compatible vLLM endpoint."""
+"""Jina recall embeddings through an OpenAI-compatible vLLM endpoint."""
 
 from __future__ import annotations
 
@@ -9,7 +9,12 @@ from openai import AsyncOpenAI
 from openai.types.create_embedding_response import CreateEmbeddingResponse
 
 from mindbridge.application import RecallEmbeddingQuery
-from mindbridge.core import ModelOutputError, ModelReference, ModelUnavailableError
+from mindbridge.core import (
+    DomainInvariantError,
+    ModelOutputError,
+    ModelReference,
+    ModelUnavailableError,
+)
 from mindbridge.models.jina import DEFAULT_JINA_OMNI_DIMENSION, validate_jina_embedding
 from mindbridge.models.openai_media import OpenAIContentPart, media_url_content_part
 from mindbridge.models.openai_omni import (
@@ -24,8 +29,8 @@ class _UserMessage(TypedDict):
     content: list[OpenAIContentPart]
 
 
-class OpenAIJinaQueryEmbedder:
-    """Encode fused text and AV retrieval queries without loading Jina in the API."""
+class OpenAIJinaEmbedder:
+    """Encode queries and memory documents without loading Jina in the API."""
 
     def __init__(
         self,
@@ -61,7 +66,7 @@ class OpenAIJinaQueryEmbedder:
         dimension: int = DEFAULT_JINA_OMNI_DIMENSION,
         request_timeout_seconds: float = 120.0,
         max_retries: int = 2,
-    ) -> OpenAIJinaQueryEmbedder:
+    ) -> OpenAIJinaEmbedder:
         """Create the official SDK client for a pinned vLLM deployment."""
         if not api_key.strip() or not model_id.strip() or not model_revision.strip():
             raise ValueError("embedding API key, model ID, and revision must not be empty")
@@ -104,16 +109,23 @@ class OpenAIJinaQueryEmbedder:
         except openai.APIError as error:
             raise ModelUnavailableError("Jina embedding request failed") from error
 
-        if response.model != self._model_reference.model_id:
-            raise ModelOutputError("embedding response model does not match the request")
-        if len(response.data) != 1 or response.data[0].index != 0:
-            raise ModelOutputError("embedding response must contain one indexed vector")
-        values = response.data[0].embedding
-        if not isinstance(values, list):
-            raise ModelOutputError("embedding response must use float encoding")
-        vector = tuple(float(value) for value in values)
-        validate_jina_embedding(vector, self._dimension)
-        return vector
+        return self._embedding_vector(response)
+
+    async def encode_memory_document(self, text: str) -> tuple[float, ...]:
+        """Encode one explicit memory with Jina's document-side prompt semantics."""
+        if not text.strip():
+            raise DomainInvariantError("memory document text must not be blank")
+        try:
+            response = await self._client.embeddings.create(
+                input=[f"Document: {text}"],
+                model=self._model_reference.model_id,
+                dimensions=self._dimension,
+                encoding_format="float",
+                timeout=self._request_timeout_seconds,
+            )
+        except openai.APIError as error:
+            raise ModelUnavailableError("Jina embedding request failed") from error
+        return self._embedding_vector(response)
 
     async def close(self) -> None:
         """Release connections owned by the OpenAI SDK client."""
@@ -148,6 +160,18 @@ class OpenAIJinaQueryEmbedder:
             },
             options={"timeout": self._request_timeout_seconds},
         )
+
+    def _embedding_vector(self, response: CreateEmbeddingResponse) -> tuple[float, ...]:
+        if response.model != self._model_reference.model_id:
+            raise ModelOutputError("embedding response model does not match the request")
+        if len(response.data) != 1 or response.data[0].index != 0:
+            raise ModelOutputError("embedding response must contain one indexed vector")
+        values = response.data[0].embedding
+        if not isinstance(values, list):
+            raise ModelOutputError("embedding response must use float encoding")
+        vector = tuple(float(value) for value in values)
+        validate_jina_embedding(vector, self._dimension)
+        return vector
 
 
 def _query_prompt(text: str) -> str:

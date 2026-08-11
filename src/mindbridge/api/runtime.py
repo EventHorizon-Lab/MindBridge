@@ -21,7 +21,7 @@ from mindbridge.models import (
     DEFAULT_JINA_OMNI_MODEL_ID,
     DEFAULT_JINA_OMNI_REVISION,
     DEFAULT_OMNI_MODEL_ID,
-    OpenAIJinaQueryEmbedder,
+    OpenAIJinaEmbedder,
     OpenAIOmniAnswerer,
 )
 
@@ -106,7 +106,7 @@ def create_production_app(settings: RuntimeSettings | None = None) -> FastAPI:
         endpoint=runtime.vlm_endpoint,
         model_id=runtime.vlm_model_id,
     )
-    query_embedder = OpenAIJinaQueryEmbedder.connect(
+    recall_embedder = OpenAIJinaEmbedder.connect(
         api_key=runtime.embedding_api_key,
         endpoint=runtime.embedding_endpoint,
         model_id=runtime.embedding_model_id,
@@ -119,7 +119,7 @@ def create_production_app(settings: RuntimeSettings | None = None) -> FastAPI:
         embedding_index=store,
         media_url_signer=media_access,
         observation_job_publisher=job_publisher,
-        query_embedder=query_embedder,
+        recall_embedder=recall_embedder,
     )
 
     @asynccontextmanager
@@ -128,7 +128,7 @@ def create_production_app(settings: RuntimeSettings | None = None) -> FastAPI:
             await store.open()
             resources.push_async_callback(store.close)
             resources.push_async_callback(answerer.close)
-            resources.push_async_callback(query_embedder.close)
+            resources.push_async_callback(recall_embedder.close)
             yield
 
     return create_app(kernel, lifespan=lifespan)

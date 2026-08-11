@@ -45,8 +45,8 @@ class RecallEmbeddingQuery:
             raise DomainInvariantError("embedding query media must belong to one tenant")
 
 
-class RecallQueryEmbedder(Protocol):
-    """Frozen retrieval-side encoder used before semantic evidence search."""
+class RecallEmbedder(Protocol):
+    """Frozen encoder shared by recall queries and explicit memory documents."""
 
     @property
     def model_reference(self) -> ModelReference: ...
@@ -55,3 +55,5 @@ class RecallQueryEmbedder(Protocol):
     def dimension(self) -> int: ...
 
     async def encode_query(self, query: RecallEmbeddingQuery) -> tuple[float, ...]: ...
+
+    async def encode_memory_document(self, text: str) -> tuple[float, ...]: ...
