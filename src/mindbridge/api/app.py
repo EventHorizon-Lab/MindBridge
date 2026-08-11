@@ -1,0 +1,104 @@
+"""FastAPI adapter for the shared MindBridge use cases."""
+
+from __future__ import annotations
+
+from uuid import uuid4
+
+from fastapi import FastAPI, Request, status
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+
+from mindbridge.application import MemoryKernel
+from mindbridge.contracts import (
+    ErrorResponse,
+    HealthResponse,
+    MemoryView,
+    ObservationReceipt,
+    ObserveRequest,
+    RecallRequest,
+    RecallResult,
+    RememberRequest,
+    ValidationIssue,
+)
+from mindbridge.core import DomainInvariantError, IdempotencyConflictError
+
+
+def create_app(kernel: MemoryKernel) -> FastAPI:
+    """Create a side-effect-free REST adapter around one memory kernel."""
+    app = FastAPI(title="MindBridge", version="0.1.0")
+
+    @app.exception_handler(RequestValidationError)
+    async def handle_request_validation(
+        _request: Request,
+        error: RequestValidationError,
+    ) -> JSONResponse:
+        response = ErrorResponse(
+            code="request_validation_failed",
+            message="request validation failed",
+            trace_id=_new_trace_id(),
+            issues=tuple(
+                ValidationIssue(
+                    location=tuple(str(part) for part in issue["loc"]),
+                    message=issue["msg"],
+                    code=issue["type"],
+                )
+                for issue in error.errors()
+            ),
+        )
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, content=response.model_dump()
+        )
+
+    @app.exception_handler(DomainInvariantError)
+    async def handle_domain_error(
+        _request: Request,
+        error: DomainInvariantError,
+    ) -> JSONResponse:
+        is_conflict = isinstance(error, IdempotencyConflictError)
+        response = ErrorResponse(
+            code="idempotency_conflict" if is_conflict else "domain_invariant_failed",
+            message=str(error),
+            trace_id=_new_trace_id(),
+        )
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT
+            if is_conflict
+            else status.HTTP_422_UNPROCESSABLE_CONTENT,
+            content=response.model_dump(),
+        )
+
+    @app.get("/healthz", response_model=HealthResponse, operation_id="health")
+    async def health() -> HealthResponse:
+        return HealthResponse(trace_id=_new_trace_id())
+
+    @app.post(
+        "/v1/observations",
+        response_model=ObservationReceipt,
+        status_code=status.HTTP_202_ACCEPTED,
+        operation_id="observe",
+    )
+    async def observe(request: ObserveRequest) -> ObservationReceipt:
+        return await kernel.observe(request)
+
+    @app.post(
+        "/v1/memories",
+        response_model=MemoryView,
+        status_code=status.HTTP_201_CREATED,
+        operation_id="remember",
+    )
+    async def remember(request: RememberRequest) -> MemoryView:
+        return await kernel.remember(request)
+
+    @app.post(
+        "/v1/recall",
+        response_model=RecallResult,
+        operation_id="recall",
+    )
+    async def recall(request: RecallRequest) -> RecallResult:
+        return await kernel.recall(request)
+
+    return app
+
+
+def _new_trace_id() -> str:
+    return f"trace_{uuid4().hex}"

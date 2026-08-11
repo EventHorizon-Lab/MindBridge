@@ -181,3 +181,27 @@ class RecallResult(ContractModel):
     memories: tuple[MemoryView, ...]
     evidence: tuple[EvidenceView, ...]
     trace_id: Identifier
+
+
+class ValidationIssue(ContractModel):
+    """One sanitized request validation failure."""
+
+    location: tuple[str, ...]
+    message: NonEmptyString
+    code: Identifier
+
+
+class ErrorResponse(ContractModel):
+    """Stable error envelope with a reproducible trace identifier."""
+
+    code: Identifier
+    message: NonEmptyString
+    trace_id: Identifier
+    issues: tuple[ValidationIssue, ...] = ()
+
+
+class HealthResponse(ContractModel):
+    """Liveness response that does not claim dependency readiness."""
+
+    status: str = "ok"
+    trace_id: Identifier
