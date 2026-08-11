@@ -6,8 +6,9 @@ import asyncio
 import time
 from collections import defaultdict
 from datetime import timedelta
+from pathlib import Path
 
-from pydantic import AwareDatetime, Field, model_validator
+from pydantic import AwareDatetime, Field, TypeAdapter, model_validator
 
 from mindbridge.benchmarks.m3_bench import (
     M3_BENCH_ADAPTER_VERSION,
@@ -71,7 +72,7 @@ class M3OfficialQuestionResult(ContractModel):
     id: Identifier
     question: NonEmptyString
     answer: NonEmptyString
-    type: tuple[NonEmptyString, ...]
+    type: tuple[NonEmptyString, ...] = Field(min_length=1)
     timestamp_seconds: int | None = Field(default=None, ge=0)
     before_clip: int | None = Field(default=None, ge=0)
     response: str
@@ -79,6 +80,17 @@ class M3OfficialQuestionResult(ContractModel):
     mindbridge_memory_ids: tuple[Identifier, ...]
     mindbridge_evidence_ids: tuple[Identifier, ...]
     mindbridge_trace_id: Identifier
+
+
+def load_prepared_m3(path: Path) -> tuple[M3PreparedVideo, ...]:
+    """Load uploaded media metadata without adding a benchmark-specific downloader."""
+    videos = TypeAdapter(tuple[M3PreparedVideo, ...]).validate_json(path.read_bytes())
+    video_ids = tuple(video.video_id for video in videos)
+    if not videos:
+        raise ValueError("M3-Bench prepared media manifest must not be empty")
+    if len(set(video_ids)) != len(video_ids):
+        raise ValueError("M3-Bench prepared media manifest contains duplicate video IDs")
+    return videos
 
 
 async def run_m3_video(

@@ -25,6 +25,7 @@ from mindbridge.benchmarks.m3_runner import (
     M3OfficialQuestionResult,
     M3PreparedClip,
     M3PreparedVideo,
+    load_prepared_m3,
     run_m3_video,
     wait_for_observation_job,
 )
@@ -47,6 +48,7 @@ __all__ = [
     "M3PreparedVideo",
     "load_locomo",
     "load_m3_bench",
+    "load_prepared_m3",
     "run_locomo_conversation",
     "run_m3_video",
     "wait_for_observation_job",

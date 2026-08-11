@@ -54,6 +54,8 @@ def load_m3_bench(annotation_path: Path) -> tuple[M3BenchVideo, ...]:
     """Load `robot.json` or `web.json` while preserving official source paths."""
     records = TypeAdapter(dict[str, _RawVideo]).validate_json(annotation_path.read_bytes())
     videos = tuple(_video(video_id, record) for video_id, record in sorted(records.items()))
+    if not videos:
+        raise ValueError("M3-Bench annotations must not be empty")
     question_ids = [question.question_id for video in videos for question in video.questions]
     if len(set(question_ids)) != len(question_ids):
         raise ValueError("M3-Bench annotations contain duplicate question IDs")

@@ -3,6 +3,8 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from mindbridge.benchmarks import load_locomo, load_m3_bench
 
 
@@ -94,3 +96,11 @@ def test_m3_bench_adapter_preserves_multimodal_question_metadata(tmp_path: Path)
     )
     assert video.questions[0].timestamp_seconds == 970
     assert video.questions[0].before_clip_index == 31
+
+
+def test_m3_bench_adapter_rejects_empty_annotations(tmp_path: Path) -> None:
+    annotation_path = tmp_path / "robot.json"
+    annotation_path.write_text("{}", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="must not be empty"):
+        load_m3_bench(annotation_path)
