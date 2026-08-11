@@ -1,5 +1,11 @@
 """Production-path benchmark and component smoke entry points."""
 
+from mindbridge.benchmarks.egolife_qa import (
+    EGOLIFE_QA_ADAPTER_VERSION,
+    EgoLifeOption,
+    EgoLifeQuestion,
+    load_egolife_qa,
+)
 from mindbridge.benchmarks.locomo import (
     LOCOMO_ADAPTER_VERSION,
     LoCoMoConversation,
@@ -29,13 +35,24 @@ from mindbridge.benchmarks.m3_runner import (
     run_m3_video,
     wait_for_observation_job,
 )
+from mindbridge.benchmarks.supermemory_vqa import (
+    SUPERMEMORY_UNANSWERABLE_CHOICE,
+    SUPERMEMORY_VQA_ADAPTER_VERSION,
+    SuperMemoryQuestion,
+    load_supermemory_vqa,
+)
 
 __all__ = [
+    "EGOLIFE_QA_ADAPTER_VERSION",
     "LOCOMO_ABSTENTION",
     "LOCOMO_ADAPTER_VERSION",
     "LOCOMO_PREDICTION_KEY",
     "M3_BENCH_ADAPTER_VERSION",
     "M3_CLIP_DURATION_SECONDS",
+    "SUPERMEMORY_UNANSWERABLE_CHOICE",
+    "SUPERMEMORY_VQA_ADAPTER_VERSION",
+    "EgoLifeOption",
+    "EgoLifeQuestion",
     "LoCoMoConversation",
     "LoCoMoOfficialConversationResult",
     "LoCoMoOfficialQuestionResult",
@@ -46,9 +63,12 @@ __all__ = [
     "M3OfficialQuestionResult",
     "M3PreparedClip",
     "M3PreparedVideo",
+    "SuperMemoryQuestion",
+    "load_egolife_qa",
     "load_locomo",
     "load_m3_bench",
     "load_prepared_m3",
+    "load_supermemory_vqa",
     "run_locomo_conversation",
     "run_m3_video",
     "wait_for_observation_job",

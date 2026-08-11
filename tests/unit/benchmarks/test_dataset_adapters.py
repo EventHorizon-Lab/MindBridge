@@ -5,7 +5,12 @@ from pathlib import Path
 
 import pytest
 
-from mindbridge.benchmarks import load_locomo, load_m3_bench
+from mindbridge.benchmarks import (
+    load_egolife_qa,
+    load_locomo,
+    load_m3_bench,
+    load_supermemory_vqa,
+)
 
 
 def test_locomo_adapter_orders_sessions_and_normalizes_adversarial_qa(tmp_path: Path) -> None:
@@ -104,3 +109,157 @@ def test_m3_bench_adapter_rejects_empty_annotations(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="must not be empty"):
         load_m3_bench(annotation_path)
+
+
+def test_egolife_adapter_keeps_queries_but_discards_retrieval_hints(tmp_path: Path) -> None:
+    annotation_path = tmp_path / "EgoLifeQA_A1_JAKE.json"
+    annotation_path.write_text(
+        json.dumps(
+            [
+                {
+                    "ID": "1",
+                    "query_time": {"date": "DAY2", "time": "11210217"},
+                    "type": "EntityLog",
+                    "need_audio": True,
+                    "need_name": True,
+                    "last_time": False,
+                    "question": "Who used the screwdriver first?",
+                    "choice_a": "Tasha",
+                    "choice_b": "Alice",
+                    "choice_c": "Shure",
+                    "choice_d": "Lucia",
+                    "answer": "B",
+                    "target_time": {"date": "DAY1", "time": "11152408"},
+                    "keywords": "SECRET RETRIEVAL HINT",
+                    "reason": "SECRET ANSWER EVIDENCE",
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    question = load_egolife_qa(annotation_path)[0]
+
+    assert question.query_offset_ms == 127_262_170
+    assert question.correct_option == "B"
+    assert question.choices == ("Tasha", "Alice", "Shure", "Lucia")
+    assert "SECRET" not in question.model_dump_json()
+
+
+def test_egolife_adapter_rejects_invalid_query_clock(tmp_path: Path) -> None:
+    annotation_path = tmp_path / "bad.json"
+    annotation_path.write_text(
+        json.dumps(
+            [
+                {
+                    "ID": "1",
+                    "query_time": {"date": "DAY1", "time": "11600200"},
+                    "type": "EventRecall",
+                    "need_audio": False,
+                    "need_name": False,
+                    "last_time": False,
+                    "question": "What happened?",
+                    "choice_a": "A",
+                    "choice_b": "B",
+                    "choice_c": "C",
+                    "choice_d": "D",
+                    "answer": "A",
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="invalid EgoLifeQA query time"):
+        load_egolife_qa(annotation_path)
+
+
+def test_supermemory_adapter_supports_current_and_legacy_question_times(
+    tmp_path: Path,
+) -> None:
+    annotation_path = tmp_path / "all_qa.json"
+    annotation_path.write_text(
+        json.dumps(
+            [
+                _supermemory_question(
+                    1,
+                    {
+                        "time_spans": [
+                            {
+                                "start_time": 600,
+                                "end_time": 636,
+                                "video_id": "Person_1_session_8",
+                                "video_start_time_unix": 1_773_180_268,
+                            }
+                        ]
+                    },
+                ),
+                _supermemory_question(
+                    2,
+                    {
+                        "time_span": {"start_time": "01:29:28", "end_time": "01:30:54"},
+                        "video_id": "Person_1_session_8",
+                        "start_time": 1_773_180_268,
+                    },
+                ),
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    questions = load_supermemory_vqa(annotation_path)
+
+    assert questions[0].question_at.timestamp() == 1_773_180_868
+    assert questions[1].question_at.timestamp() == 1_773_185_636
+    assert questions[0].unanswerable_option_index == 0
+    assert "SECRET ANSWER EVIDENCE" not in questions[0].model_dump_json()
+
+
+def test_supermemory_adapter_rejects_inconsistent_answerability(tmp_path: Path) -> None:
+    annotation_path = tmp_path / "bad.json"
+    row = _supermemory_question(
+        1,
+        {
+            "time_spans": [
+                {
+                    "start_time": 0,
+                    "end_time": 1,
+                    "video_id": "Person_1_session_8",
+                    "video_start_time_unix": 1_773_180_268,
+                }
+            ]
+        },
+    )
+    row["is_answerable"] = False
+    annotation_path.write_text(json.dumps([row]), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="inconsistent answerability"):
+        load_supermemory_vqa(annotation_path)
+
+
+def _supermemory_question(
+    question_id: int, question_evidence: dict[str, object]
+) -> dict[str, object]:
+    return {
+        "question_id": question_id,
+        "question": "What did B say he cooks?",
+        "choices": [
+            "This question can not be answered.",
+            "Beef",
+            "Chicken",
+            "Meat",
+        ],
+        "correct_answer": "Beef",
+        "correct_option_index": 1,
+        "choice_types": ["incorrect", "correct", "incorrect", "vague"],
+        "subject": 1,
+        "metadata": {
+            "skill": "conversational_memory",
+            "primary_video_id": "Person_1_session_8",
+        },
+        "video_ids": ["Person_1_session_8"],
+        "start_time": 1_773_180_268,
+        "question_evidence": question_evidence,
+        "is_answerable": True,
+        "answer_evidence": {"text": "SECRET ANSWER EVIDENCE"},
+    }
