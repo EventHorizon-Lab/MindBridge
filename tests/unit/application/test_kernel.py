@@ -10,6 +10,7 @@ from mindbridge.application import (
     EmbeddingMatch,
     EmbeddingSearch,
     FeedbackWriteResult,
+    ForgetPlan,
     GeneratedAnswer,
     MemoryKernel,
     MemoryWriteResult,
@@ -29,6 +30,7 @@ from mindbridge.contracts import (
     RememberRequest,
 )
 from mindbridge.core import (
+    DeletionTombstone,
     DomainInvariantError,
     EmbeddedObjectType,
     EmbeddingRecord,
@@ -288,6 +290,38 @@ class InMemoryStore:
                     updated_at=NOW,
                 )
         raise JobNotFoundError("observation processing job does not exist")
+
+    async def prepare_forget(
+        self,
+        tombstone: DeletionTombstone,
+        *,
+        idempotency_key: str,
+        content_digest: str,
+    ) -> ForgetPlan:
+        raise AssertionError("forget is covered by the PostgreSQL integration store")
+
+    async def complete_forget(
+        self,
+        tombstone: DeletionTombstone,
+        *,
+        completed_at: datetime,
+    ) -> DeletionTombstone:
+        raise AssertionError("forget is covered by the PostgreSQL integration store")
+
+    async def mark_forget_failed(
+        self,
+        tombstone: DeletionTombstone,
+        *,
+        error_code: str,
+    ) -> DeletionTombstone:
+        raise AssertionError("forget is covered by the PostgreSQL integration store")
+
+    async def read_deletion_tombstone(
+        self,
+        tenant_id: TenantId,
+        tombstone_id: str,
+    ) -> DeletionTombstone:
+        raise AssertionError("forget is covered by the PostgreSQL integration store")
 
     async def write_embedding(self, embedding: EmbeddingRecord) -> bool:
         existing = self.embeddings.get(embedding.embedding_id)
@@ -805,11 +839,13 @@ def _kernel(
     recall_embedder: RecordingRecallEmbedder | None = None,
     clock: Callable[[], datetime] = lambda: NOW,
 ) -> MemoryKernel:
+    media_access = DeterministicMediaUrlSigner()
     return MemoryKernel(
         store,
         answerer,
         embedding_index=store,
-        media_url_signer=DeterministicMediaUrlSigner(),
+        media_deleter=media_access,
+        media_url_signer=media_access,
         observation_job_publisher=job_publisher or RecordingObservationJobPublisher(),
         recall_embedder=recall_embedder or RecordingRecallEmbedder(),
         clock=clock,

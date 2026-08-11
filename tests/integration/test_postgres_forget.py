@@ -206,6 +206,7 @@ def _kernel(store: PostgresMemoryStore, media_access: RecordingMediaAccess) -> M
         store,
         FirstMemoryAnswerer(),
         embedding_index=store,
+        media_deleter=media_access,
         media_url_signer=media_access,
         observation_job_publisher=DiscardingJobPublisher(),
         recall_embedder=FixedRecallEmbedder(),

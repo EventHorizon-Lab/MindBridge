@@ -408,8 +408,12 @@ class MediaUrlSigner(Protocol):
         media_object: MediaObject,
     ) -> PresignedMediaDownload: ...
 
+
+class MediaDeleter(Protocol):
+    """Idempotent physical deletion for tenant-validated immutable media."""
+
     async def delete_media(self, media_object: MediaObject) -> None:
-        """Idempotently delete one tenant-validated immutable object."""
+        """Delete one object; repeated calls must remain successful."""
         ...
 
 

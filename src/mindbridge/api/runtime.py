@@ -117,6 +117,7 @@ def create_production_app(settings: RuntimeSettings | None = None) -> FastAPI:
         store,
         answerer,
         embedding_index=store,
+        media_deleter=media_access,
         media_url_signer=media_access,
         observation_job_publisher=job_publisher,
         recall_embedder=recall_embedder,

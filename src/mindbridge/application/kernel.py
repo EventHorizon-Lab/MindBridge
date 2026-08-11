@@ -13,6 +13,7 @@ from mindbridge.application.evidence import resolve_evidence_media
 from mindbridge.application.ports import (
     EmbeddingIndex,
     EmbeddingSearch,
+    MediaDeleter,
     MediaUrlSigner,
     MemoryAnswerer,
     MemoryStore,
@@ -82,6 +83,7 @@ class MemoryKernel:
         answerer: MemoryAnswerer,
         *,
         embedding_index: EmbeddingIndex,
+        media_deleter: MediaDeleter,
         media_url_signer: MediaUrlSigner,
         observation_job_publisher: ObservationJobPublisher,
         recall_embedder: RecallEmbedder,
@@ -90,6 +92,7 @@ class MemoryKernel:
         self._store = store
         self._answerer = answerer
         self._embedding_index = embedding_index
+        self._media_deleter = media_deleter
         self._media_url_signer = media_url_signer
         self._observation_job_publisher = observation_job_publisher
         self._recall_embedder = recall_embedder
@@ -219,7 +222,7 @@ class MemoryKernel:
         if plan.tombstone.propagation_state is not DeletionPropagationState.COMPLETE:
             try:
                 for media_object in plan.media_objects:
-                    await self._media_url_signer.delete_media(media_object)
+                    await self._media_deleter.delete_media(media_object)
             except ObjectStorageError:
                 await self._store.mark_forget_failed(
                     plan.tombstone,

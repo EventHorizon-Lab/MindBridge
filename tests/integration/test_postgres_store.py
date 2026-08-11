@@ -77,6 +77,9 @@ class DeterministicMediaUrlSigner:
             expires_at=NOW + timedelta(minutes=5),
         )
 
+    async def delete_media(self, media_object: MediaObject) -> None:
+        return None
+
 
 class DiscardingObservationJobPublisher:
     """Keeps store integration independent from the Redis delivery adapter."""
@@ -487,11 +490,13 @@ def _remember_request(*, tenant_id: str, evidence_id: str) -> RememberRequest:
 
 
 def _kernel(store: PostgresMemoryStore) -> MemoryKernel:
+    media_access = DeterministicMediaUrlSigner()
     return MemoryKernel(
         store,
         FirstMemoryAnswerer(),
         embedding_index=store,
-        media_url_signer=DeterministicMediaUrlSigner(),
+        media_deleter=media_access,
+        media_url_signer=media_access,
         observation_job_publisher=DiscardingObservationJobPublisher(),
         recall_embedder=FixedRecallEmbedder(),
         clock=lambda: NOW,
