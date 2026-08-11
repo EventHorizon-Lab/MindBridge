@@ -94,6 +94,33 @@ async def test_postgres_lifecycle_does_not_overwrite_concurrent_feedback(
     assert stored.state is MemoryState.STRENGTHENED
 
 
+async def test_postgres_recall_access_reactivates_cold_memory_without_rewinding_time(
+    store: PostgresMemoryStore,
+) -> None:
+    tenant_id = TenantId("tenant_lifecycle_access")
+    memory = _memory(tenant_id, "memory_access", NOW - timedelta(days=30))
+    await _write_memory(store, memory)
+    await EvolveMemoryLifecycle(store, POLICY).run(
+        LifecycleSweepRequest(tenant_id=tenant_id, evaluated_at=NOW, limit=10)
+    )
+
+    first = await store.record_memory_accesses(
+        tenant_id,
+        (memory.memory_id,),
+        accessed_at=NOW + timedelta(minutes=1),
+    )
+    second = await store.record_memory_accesses(
+        tenant_id,
+        (memory.memory_id,),
+        accessed_at=NOW,
+    )
+
+    assert first[0].state is MemoryState.ACTIVE
+    assert first[0].useful_access_count == 1
+    assert second[0].useful_access_count == 2
+    assert second[0].last_accessed_at == NOW + timedelta(minutes=1)
+
+
 async def test_postgres_runtime_role_enforces_tenant_row_security(
     store: PostgresMemoryStore,
     database_url: str,

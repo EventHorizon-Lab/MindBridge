@@ -529,6 +529,10 @@ strength = salience
 发生反馈、纠错或删除，则并发操作优先，本次过期结果不会覆盖新状态；下一轮计划任务重新评估。
 系数和冷热阈值均为显式参数，部署在完成 Benchmark 与真实机器人回放校准后再锁定。
 
+生产 Recall 用例只在结构化过滤、融合和 tombstone 检查完成后，对实际参与本轮结果的 Memory
+原子增加 `useful_access_count` 并推进 `last_accessed_at`；较旧或重放的请求不能把访问时间倒拨。
+Cold Memory 被真实召回时在同一事务恢复为 Active，后续计划扫描再按完整强度公式重新评分。
+
 ### 8.4 遗忘状态机
 
 ```mermaid

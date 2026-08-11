@@ -56,6 +56,7 @@ from mindbridge.infrastructure._postgres_jobs import (
 )
 from mindbridge.infrastructure._postgres_lifecycle import (
     list_memories_for_lifecycle,
+    record_memory_accesses,
     update_memory_lifecycles,
 )
 from mindbridge.infrastructure._postgres_memories import (
@@ -241,9 +242,14 @@ class PostgresMemoryStore:
             limit=limit,
         )
 
-    async def search_memories(self, request: RecallRequest) -> tuple[MemoryRecord, ...]:
+    async def search_memories(
+        self,
+        request: RecallRequest,
+        *,
+        limit: int,
+    ) -> tuple[MemoryRecord, ...]:
         """Apply exact filters and PostgreSQL full-text candidate retrieval."""
-        return await search_memories(self._pool, request)
+        return await search_memories(self._pool, request, limit=limit)
 
     async def search_memories_by_evidence(
         self,
@@ -273,6 +279,21 @@ class PostgresMemoryStore:
             request,
             ranked_memory_ids,
             limit=limit,
+        )
+
+    async def record_memory_accesses(
+        self,
+        tenant_id: TenantId,
+        memory_ids: tuple[MemoryId, ...],
+        *,
+        accessed_at: datetime,
+    ) -> tuple[MemoryRecord, ...]:
+        """Record selected recall results and return their current rows in input order."""
+        return await record_memory_accesses(
+            self._pool,
+            tenant_id,
+            memory_ids,
+            accessed_at=accessed_at,
         )
 
     async def read_evidence(

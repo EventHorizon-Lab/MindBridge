@@ -119,10 +119,16 @@ async def write_memory_on_connection(
 async def search_memories(
     pool: DatabasePool,
     request: RecallRequest,
+    *,
+    limit: int,
 ) -> tuple[MemoryRecord, ...]:
     """Apply exact filters and PostgreSQL full-text candidate retrieval."""
+    if not 1 <= limit <= 1_000:
+        raise DomainInvariantError("memory candidate limit must be between 1 and 1000")
     async with tenant_connection(pool, request.tenant_id) as connection:
-        cursor = await connection.execute(_SEARCH_MEMORIES_SQL, _recall_parameters(request))
+        parameters = _recall_parameters(request)
+        parameters["limit"] = limit
+        cursor = await connection.execute(_SEARCH_MEMORIES_SQL, parameters)
         return tuple([memory_from_row(cast(MemoryRow, row)) async for row in cursor])
 
 

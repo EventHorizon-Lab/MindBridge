@@ -40,6 +40,7 @@ from mindbridge.application.ranking import fuse_memory_rankings
 from mindbridge.application.recall import (
     RecallEmbedder,
     RecallEmbeddingQuery,
+    RecallMemories,
     ResolvedQueryMedia,
 )
 
@@ -76,6 +77,7 @@ __all__ = [
     "ProcessObservation",
     "RecallEmbedder",
     "RecallEmbeddingQuery",
+    "RecallMemories",
     "ResolvedEvidence",
     "ResolvedQueryMedia",
     "fuse_memory_rankings",

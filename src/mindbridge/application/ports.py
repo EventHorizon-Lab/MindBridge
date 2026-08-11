@@ -322,7 +322,12 @@ class MemoryStore(Protocol):
         limit: int,
     ) -> tuple[DeletionTombstone, ...]: ...
 
-    async def search_memories(self, request: RecallRequest) -> tuple[MemoryRecord, ...]: ...
+    async def search_memories(
+        self,
+        request: RecallRequest,
+        *,
+        limit: int,
+    ) -> tuple[MemoryRecord, ...]: ...
 
     async def search_memories_by_evidence(
         self,
@@ -338,6 +343,14 @@ class MemoryStore(Protocol):
         ranked_memory_ids: tuple[MemoryId, ...],
         *,
         limit: int,
+    ) -> tuple[MemoryRecord, ...]: ...
+
+    async def record_memory_accesses(
+        self,
+        tenant_id: TenantId,
+        memory_ids: tuple[MemoryId, ...],
+        *,
+        accessed_at: datetime,
     ) -> tuple[MemoryRecord, ...]: ...
 
     async def read_evidence(

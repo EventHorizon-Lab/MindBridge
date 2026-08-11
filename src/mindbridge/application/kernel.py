@@ -2,38 +2,32 @@
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import json
 import math
 from collections.abc import Callable
 from datetime import datetime, timezone
 
-from mindbridge.application.evidence import resolve_evidence_media
 from mindbridge.application.ports import (
     EmbeddingIndex,
-    EmbeddingSearch,
     MediaDeleter,
     MediaUrlSigner,
     MemoryAnswerer,
     MemoryStore,
     ObservationBatch,
     ObservationJobPublisher,
-    ResolvedEvidence,
 )
-from mindbridge.application.ranking import fuse_memory_rankings
 from mindbridge.application.recall import (
     RETRIEVAL_DOCUMENT_EMBEDDING_TASK,
     RecallEmbedder,
-    RecallEmbeddingQuery,
-    ResolvedQueryMedia,
+    RecallMemories,
+    memory_view,
 )
 from mindbridge.contracts import (
     ContractModel,
     DeletionListRequest,
     DeletionPage,
     DeletionTombstoneView,
-    EvidenceView,
     FeedbackReceipt,
     FeedbackRequest,
     ForgetReceipt,
@@ -44,7 +38,6 @@ from mindbridge.contracts import (
     ObservationReceipt,
     ObservationStatus,
     ObserveRequest,
-    RecallMode,
     RecallRequest,
     RecallResult,
     RememberRequest,
@@ -54,7 +47,6 @@ from mindbridge.core import (
     DeletionPropagationState,
     DeletionTombstone,
     DeviceId,
-    DomainInvariantError,
     EmbeddedObjectType,
     EmbeddingId,
     EmbeddingRecord,
@@ -66,7 +58,6 @@ from mindbridge.core import (
     MediaObjectId,
     MemoryFeedback,
     MemoryId,
-    MemoryIntegrityError,
     MemoryRecord,
     ModelReference,
     ObjectStorageError,
@@ -106,14 +97,20 @@ class MemoryKernel:
         ):
             raise ValueError("minimum_embedding_similarity must be between -1 and 1")
         self._store = store
-        self._answerer = answerer
         self._embedding_index = embedding_index
         self._media_deleter = media_deleter
-        self._media_url_signer = media_url_signer
         self._observation_job_publisher = observation_job_publisher
         self._recall_embedder = recall_embedder
-        self._minimum_embedding_similarity = minimum_embedding_similarity
         self._clock = clock or _utc_now
+        self._recall = RecallMemories(
+            store,
+            answerer,
+            embedding_index=embedding_index,
+            media_url_signer=media_url_signer,
+            recall_embedder=recall_embedder,
+            minimum_embedding_similarity=minimum_embedding_similarity,
+            clock=self._clock,
+        )
 
     @trace_operation("mindbridge.observe")
     async def observe(self, request: ObserveRequest) -> ObservationReceipt:
@@ -187,7 +184,7 @@ class MemoryKernel:
         )
         stored_memory = result.memory
         await self._index_memory(stored_memory)
-        return _memory_view(stored_memory)
+        return memory_view(stored_memory)
 
     @trace_operation("mindbridge.record_feedback")
     async def record_feedback(self, request: FeedbackRequest) -> FeedbackReceipt:
@@ -362,115 +359,11 @@ class MemoryKernel:
             }
         )
         memory = await self._store.read_memory(TenantId(tenant_id), MemoryId(memory_id))
-        return _memory_view(memory)
+        return memory_view(memory)
 
-    @trace_operation("mindbridge.recall")
     async def recall(self, request: RecallRequest) -> RecallResult:
-        """Retrieve memories, inspect evidence, and answer only when supported."""
-        set_current_span_attributes(
-            {
-                "mindbridge.tenant.id": request.tenant_id,
-                "mindbridge.recall.mode": request.mode.value,
-                "mindbridge.recall.limit": request.limit,
-                "mindbridge.query.has_text": request.query.text is not None,
-                "mindbridge.query.media_count": len(request.query.media_object_ids),
-            }
-        )
-        candidate_limit = min(request.limit * 4, 100)
-        semantic_search = self._search_semantic_memories(request, limit=candidate_limit)
-        if request.query.text is None:
-            memories = (await semantic_search)[: request.limit]
-        else:
-            sparse_request = request.model_copy(update={"limit": candidate_limit})
-            sparse, semantic = await asyncio.gather(
-                self._store.search_memories(sparse_request),
-                semantic_search,
-            )
-            memories = fuse_memory_rankings(
-                (semantic, sparse),
-                limit=request.limit,
-            )
-        should_read_evidence = request.include_evidence or request.mode is not RecallMode.SEARCH
-        evidence = (
-            await self._read_recall_evidence(request, memories) if should_read_evidence else ()
-        )
-        answer = None
-        confidence = 0.0
-        supported_memories = tuple(
-            memory
-            for memory in memories
-            if memory.evidence_ids or memory.verification_status is VerificationStatus.ATTESTED
-        )
-        if supported_memories and request.mode is not RecallMode.SEARCH:
-            generated = await self._answerer.answer(request, supported_memories, evidence)
-            answer = generated.answer
-            confidence = generated.confidence
-        set_current_span_attributes(
-            {
-                "mindbridge.recall.memory_count": len(memories),
-                "mindbridge.recall.evidence_count": len(evidence),
-                "mindbridge.recall.answered": answer is not None,
-            }
-        )
-        return RecallResult(
-            answer=answer,
-            confidence=confidence,
-            memories=tuple(_memory_view(memory) for memory in memories),
-            evidence=(
-                tuple(_evidence_view(item) for item in evidence) if request.include_evidence else ()
-            ),
-            trace_id=current_trace_id(),
-        )
-
-    @trace_operation("mindbridge.recall.semantic_search")
-    async def _search_semantic_memories(
-        self,
-        request: RecallRequest,
-        *,
-        limit: int,
-    ) -> tuple[MemoryRecord, ...]:
-        query = RecallEmbeddingQuery(
-            text=request.query.text,
-            media=await self._resolve_query_media(request),
-        )
-        values = await self._recall_embedder.encode_query(query)
-        searches = {
-            object_type: EmbeddingSearch(
-                tenant_id=TenantId(request.tenant_id),
-                values=values,
-                space_reference=self._recall_embedder.space_reference,
-                document_task=RETRIEVAL_DOCUMENT_EMBEDDING_TASK,
-                object_types=(object_type,),
-                limit=limit,
-                minimum_similarity=self._minimum_embedding_similarity,
-            )
-            for object_type in (
-                EmbeddedObjectType.EVIDENCE_SPAN,
-                EmbeddedObjectType.MEMORY_RECORD,
-            )
-        }
-        evidence_matches, memory_matches = await asyncio.gather(
-            self._embedding_index.search_embeddings(searches[EmbeddedObjectType.EVIDENCE_SPAN]),
-            self._embedding_index.search_embeddings(searches[EmbeddedObjectType.MEMORY_RECORD]),
-        )
-        evidence_ids = tuple(
-            dict.fromkeys(EvidenceId(match.object_id) for match in evidence_matches)
-        )
-        memory_ids = tuple(dict.fromkeys(MemoryId(match.object_id) for match in memory_matches))
-        evidence_memories, direct_memories = await asyncio.gather(
-            self._store.search_memories_by_evidence(request, evidence_ids, limit=limit),
-            self._store.search_memories_by_ids(request, memory_ids, limit=limit),
-        )
-        set_current_span_attributes(
-            {
-                "mindbridge.recall.evidence_match_count": len(evidence_matches),
-                "mindbridge.recall.memory_match_count": len(memory_matches),
-            }
-        )
-        return fuse_memory_rankings(
-            (evidence_memories, direct_memories),
-            limit=limit,
-        )
+        """Delegate recall to its focused application use case."""
+        return await self._recall.run(request)
 
     async def _build_corrected_memory(self, feedback: MemoryFeedback) -> MemoryRecord:
         assert feedback.memory_id is not None
@@ -527,63 +420,6 @@ class MemoryKernel:
                 normalized=True,
                 created_at=memory.created_at,
             )
-        )
-
-    @trace_operation("mindbridge.recall.resolve_query_media")
-    async def _resolve_query_media(
-        self,
-        request: RecallRequest,
-    ) -> tuple[ResolvedQueryMedia, ...]:
-        requested_ids = tuple(MediaObjectId(value) for value in request.query.media_object_ids)
-        if not requested_ids:
-            return ()
-        tenant_id = TenantId(request.tenant_id)
-        media_objects = await self._store.read_media_objects(tenant_id, requested_ids)
-        if any(item.tenant_id != tenant_id for item in media_objects):
-            raise MemoryIntegrityError("media store returned a cross-tenant query object")
-        media_by_id = {item.media_object_id: item for item in media_objects}
-        if len(media_by_id) != len(requested_ids) or set(media_by_id) != set(requested_ids):
-            raise DomainInvariantError("recall query references unknown media")
-        downloads = await asyncio.gather(
-            *(
-                self._media_url_signer.create_presigned_download(media_by_id[media_object_id])
-                for media_object_id in requested_ids
-            )
-        )
-        return tuple(
-            ResolvedQueryMedia(
-                media_object=media_by_id[media_object_id],
-                media_url=download.download_url,
-                media_url_expires_at=download.expires_at,
-            )
-            for media_object_id, download in zip(requested_ids, downloads, strict=True)
-        )
-
-    @trace_operation("mindbridge.recall.resolve_evidence")
-    async def _read_recall_evidence(
-        self,
-        request: RecallRequest,
-        memories: tuple[MemoryRecord, ...],
-    ) -> tuple[ResolvedEvidence, ...]:
-        evidence_ids = tuple(
-            dict.fromkeys(evidence_id for memory in memories for evidence_id in memory.evidence_ids)
-        )
-        if not evidence_ids:
-            return ()
-        tenant_id = TenantId(request.tenant_id)
-        evidence_spans = await self._store.read_evidence(tenant_id, evidence_ids)
-        if len(evidence_spans) != len(evidence_ids):
-            raise MemoryIntegrityError("memory references missing evidence")
-        media_object_ids = tuple(
-            dict.fromkeys(evidence.media_object_id for evidence in evidence_spans)
-        )
-        media_objects = await self._store.read_media_objects(tenant_id, media_object_ids)
-        if len(media_objects) != len(media_object_ids):
-            raise MemoryIntegrityError("evidence references missing media")
-        return await resolve_evidence_media(
-            evidence_spans,
-            media_objects,
-            self._media_url_signer,
         )
 
 
@@ -656,39 +492,6 @@ def _build_evidence_span(item: MediaObjectInput, observation: Observation) -> Ev
         start_ms=0,
         end_ms=end_ms,
         created_at=observation.observed_at,
-    )
-
-
-def _memory_view(memory: MemoryRecord) -> MemoryView:
-    return MemoryView(
-        memory_id=memory.memory_id,
-        memory_type=memory.memory_type,
-        summary=memory.summary,
-        evidence_ids=memory.evidence_ids,
-        occurred_at=memory.occurred_at,
-        ended_at=memory.ended_at,
-        created_at=memory.created_at,
-        verification_status=memory.verification_status,
-        state=memory.state,
-        salience=memory.salience,
-        strength=memory.strength,
-        useful_access_count=memory.useful_access_count,
-        positive_feedback_count=memory.positive_feedback_count,
-        negative_feedback_count=memory.negative_feedback_count,
-        last_accessed_at=memory.last_accessed_at,
-        supersedes_memory_id=memory.supersedes_memory_id,
-        superseded_at=memory.superseded_at,
-    )
-
-
-def _evidence_view(evidence: ResolvedEvidence) -> EvidenceView:
-    return EvidenceView(
-        evidence_id=evidence.evidence_span.evidence_id,
-        media_object_id=evidence.media_object.media_object_id,
-        start_ms=evidence.evidence_span.start_ms,
-        end_ms=evidence.evidence_span.end_ms,
-        media_url=evidence.media_url,
-        media_url_expires_at=evidence.media_url_expires_at,
     )
 
 

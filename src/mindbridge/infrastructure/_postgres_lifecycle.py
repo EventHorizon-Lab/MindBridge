@@ -1,5 +1,6 @@
-"""Concurrent-safe PostgreSQL pages for automatic memory evolution."""
+"""Concurrent-safe PostgreSQL access and automatic memory evolution."""
 
+from datetime import datetime
 from typing import cast
 
 from mindbridge.application import MemoryLifecycleChange
@@ -11,6 +12,56 @@ from mindbridge.infrastructure._postgres_memory_rows import (
     memory_from_row,
 )
 from mindbridge.infrastructure._postgres_types import DatabasePool, tenant_connection
+
+
+async def record_memory_accesses(
+    pool: DatabasePool,
+    tenant_id: TenantId,
+    memory_ids: tuple[MemoryId, ...],
+    *,
+    accessed_at: datetime,
+) -> tuple[MemoryRecord, ...]:
+    """Record one recall per selected memory and reactivate cold rows atomically."""
+    if not memory_ids:
+        return ()
+    if len(set(memory_ids)) != len(memory_ids):
+        raise DomainInvariantError("accessed memory IDs must be unique")
+    if accessed_at.utcoffset() is None:
+        raise DomainInvariantError("accessed_at must be timezone-aware")
+    async with tenant_connection(pool, tenant_id) as connection:
+        await connection.execute(
+            f"""
+            UPDATE memory_records AS memory
+            SET useful_access_count = memory.useful_access_count + 1,
+                last_accessed_at = GREATEST(memory.last_accessed_at, %(accessed_at)s),
+                state = CASE WHEN memory.state = 'cold' THEN 'active' ELSE memory.state END
+            WHERE memory.tenant_id = %(tenant_id)s
+              AND memory.memory_id = ANY(%(memory_ids)s::text[])
+              AND memory.superseded_at IS NULL
+              AND {MEMORY_NOT_TOMBSTONED_SQL}
+            """,
+            {
+                "accessed_at": accessed_at,
+                "memory_ids": list(memory_ids),
+                "tenant_id": tenant_id,
+            },
+        )
+        cursor = await connection.execute(
+            f"""
+            WITH requested AS (
+                SELECT memory_id, rank
+                FROM unnest(%(memory_ids)s::text[]) WITH ORDINALITY AS item(memory_id, rank)
+            )
+            {MEMORY_SELECT_SQL}
+            JOIN requested ON requested.memory_id = memory.memory_id
+            WHERE memory.tenant_id = %(tenant_id)s
+              AND memory.superseded_at IS NULL
+              AND {MEMORY_NOT_TOMBSTONED_SQL}
+            ORDER BY requested.rank
+            """,
+            {"memory_ids": list(memory_ids), "tenant_id": tenant_id},
+        )
+        return tuple([memory_from_row(cast(MemoryRow, row)) async for row in cursor])
 
 
 async def list_memories_for_lifecycle(

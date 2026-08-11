@@ -291,7 +291,9 @@ async def test_postgres_round_trips_attested_source_memory(store: PostgresMemory
     assert filtered == ()
 
     found = await kernel.get_memory("tenant_attested", memory.memory_id)
-    assert found == memory
+    assert found.model_copy(update={"useful_access_count": 0, "last_accessed_at": None}) == memory
+    assert found.useful_access_count == 1
+    assert found.last_accessed_at == NOW
     with pytest.raises(MemoryNotFoundError):
         await kernel.get_memory("other_tenant", memory.memory_id)
 

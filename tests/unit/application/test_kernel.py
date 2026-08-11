@@ -174,7 +174,12 @@ class InMemoryStore:
         self.feedback[key] = (content_digest, result)
         return result
 
-    async def search_memories(self, request: RecallRequest) -> tuple[MemoryRecord, ...]:
+    async def search_memories(
+        self,
+        request: RecallRequest,
+        *,
+        limit: int,
+    ) -> tuple[MemoryRecord, ...]:
         query = request.query.text.casefold() if request.query.text is not None else None
         candidates = (
             memory
@@ -196,7 +201,7 @@ class InMemoryStore:
             )
         )
         return tuple(sorted(candidates, key=lambda memory: memory.occurred_at, reverse=True))[
-            : request.limit
+            :limit
         ]
 
     async def search_memories_by_evidence(
@@ -248,6 +253,34 @@ class InMemoryStore:
                 or memory_by_id[memory_id].occurred_at <= request.filters.occurred_before
             )
         )[:limit]
+
+    async def record_memory_accesses(
+        self,
+        tenant_id: TenantId,
+        memory_ids: tuple[MemoryId, ...],
+        *,
+        accessed_at: datetime,
+    ) -> tuple[MemoryRecord, ...]:
+        accessed: list[MemoryRecord] = []
+        for memory_id in memory_ids:
+            for key, (digest, memory) in self.memories.items():
+                if memory.tenant_id != tenant_id or memory.memory_id != memory_id:
+                    continue
+                updated = replace(
+                    memory,
+                    useful_access_count=memory.useful_access_count + 1,
+                    last_accessed_at=max(
+                        accessed_at,
+                        memory.last_accessed_at or accessed_at,
+                    ),
+                    state=(
+                        MemoryState.ACTIVE if memory.state is MemoryState.COLD else memory.state
+                    ),
+                )
+                self.memories[key] = (digest, updated)
+                accessed.append(updated)
+                break
+        return tuple(accessed)
 
     async def read_evidence(
         self,
@@ -380,6 +413,7 @@ class RecordingAnswerer:
     def __init__(self) -> None:
         self.calls = 0
         self.last_evidence: tuple[ResolvedEvidence, ...] = ()
+        self.last_memories: tuple[MemoryRecord, ...] = ()
 
     async def answer(
         self,
@@ -389,6 +423,7 @@ class RecordingAnswerer:
     ) -> GeneratedAnswer:
         self.calls += 1
         self.last_evidence = evidence
+        self.last_memories = memories
         return GeneratedAnswer(answer=memories[0].summary, confidence=0.9)
 
 
@@ -698,6 +733,26 @@ async def test_recall_answers_from_attested_source_memory() -> None:
     assert result.answer == "The robot put the red screwdriver beside the blue toolbox."
     assert result.confidence == 0.9
     assert answerer.calls == 1
+
+
+async def test_recall_records_access_and_reactivates_cold_memory() -> None:
+    store = InMemoryStore()
+    memory = await _kernel(store, RecordingAnswerer()).remember(_remember_request())
+    key = next(iter(store.memories))
+    digest, stored = store.memories[key]
+    store.memories[key] = (digest, replace(stored, state=MemoryState.COLD))
+    accessed_at = NOW + timedelta(minutes=1)
+
+    result = await _kernel(
+        store,
+        RecordingAnswerer(),
+        clock=lambda: accessed_at,
+    ).recall(RecallRequest(tenant_id="tenant_01", query=RecallQuery(text="red screwdriver")))
+
+    assert result.memories[0].memory_id == memory.memory_id
+    assert result.memories[0].useful_access_count == 1
+    assert result.memories[0].last_accessed_at == accessed_at
+    assert result.memories[0].state is MemoryState.ACTIVE
 
 
 async def test_recall_abstains_from_unverified_derived_summary() -> None:
