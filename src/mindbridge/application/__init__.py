@@ -2,6 +2,13 @@
 
 from mindbridge.application.evidence import resolve_evidence_media
 from mindbridge.application.kernel import MemoryKernel
+from mindbridge.application.lifecycle import (
+    EvolveMemoryLifecycle,
+    LifecycleSweepRequest,
+    LifecycleSweepResult,
+    MemoryLifecycleChange,
+    MemoryLifecycleStore,
+)
 from mindbridge.application.ports import (
     EmbeddingIndex,
     EmbeddingInput,
@@ -42,13 +49,18 @@ __all__ = [
     "EmbeddingMatch",
     "EmbeddingSearch",
     "EventPerception",
+    "EvolveMemoryLifecycle",
     "FeedbackWriteResult",
     "ForgetPlan",
     "GeneratedAnswer",
+    "LifecycleSweepRequest",
+    "LifecycleSweepResult",
     "MediaDeleter",
     "MediaUrlSigner",
     "MemoryAnswerer",
     "MemoryKernel",
+    "MemoryLifecycleChange",
+    "MemoryLifecycleStore",
     "MemoryStore",
     "MemoryWriteResult",
     "ObservationBatch",
