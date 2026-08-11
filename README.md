@@ -351,6 +351,11 @@ finally:
     await memory.close()
 ```
 
+Set `mode="enumerate"` for exhaustive count/timeline queries. This path scans the complete
+structured-filter scope, verifies candidates against original media in bounded Omni batches, and
+returns every occurrence chronologically; scopes above 1,000 candidates fail explicitly instead of
+silently truncating.
+
 Every REST API key is bound to an explicit tenant allowlist. The JSON value maps each tenant ID to
 one or more keys, so a key can be rotated without downtime and one isolated benchmark deployment can
 authorize its generated tenants with the same key. Blank or short keys fail startup. All `/v1`

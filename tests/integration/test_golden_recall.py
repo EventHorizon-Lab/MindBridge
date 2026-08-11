@@ -120,6 +120,16 @@ class FirstMemoryAnswerer:
     ) -> GeneratedAnswer:
         return GeneratedAnswer(answer=memories[0].summary, confidence=1.0)
 
+    async def select_occurrences(
+        self,
+        request: RecallRequest,
+        memories: tuple[MemoryRecord, ...],
+        evidence: tuple[ResolvedEvidence, ...],
+        *,
+        query_media: tuple[ResolvedQueryMedia, ...],
+    ) -> tuple[MemoryId, ...]:
+        return tuple(memory.memory_id for memory in memories)
+
 
 class DeterministicMediaAccess:
     async def create_presigned_download(

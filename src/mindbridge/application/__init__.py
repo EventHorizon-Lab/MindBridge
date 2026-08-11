@@ -34,6 +34,7 @@ from mindbridge.application.ports import (
     PresignedMediaDownload,
     PresignedMediaUpload,
     ResolvedEvidence,
+    ResolvedQueryMedia,
 )
 from mindbridge.application.process_observation import ProcessObservation
 from mindbridge.application.ranking import fuse_memory_rankings
@@ -41,7 +42,6 @@ from mindbridge.application.recall import (
     RecallEmbedder,
     RecallEmbeddingQuery,
     RecallMemories,
-    ResolvedQueryMedia,
 )
 
 __all__ = [

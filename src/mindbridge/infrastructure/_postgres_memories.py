@@ -132,6 +132,22 @@ async def search_memories(
         return tuple([memory_from_row(cast(MemoryRow, row)) async for row in cursor])
 
 
+async def list_memories_for_enumeration(
+    pool: DatabasePool,
+    request: RecallRequest,
+    *,
+    limit: int,
+) -> tuple[MemoryRecord, ...]:
+    """Scan the complete structured-filter scope in chronological order."""
+    if not 1 <= limit <= 1_001:
+        raise DomainInvariantError("enumeration candidate limit must be between 1 and 1001")
+    async with tenant_connection(pool, request.tenant_id) as connection:
+        parameters = _recall_parameters(request)
+        parameters["limit"] = limit
+        cursor = await connection.execute(_LIST_MEMORIES_FOR_ENUMERATION_SQL, parameters)
+        return tuple([memory_from_row(cast(MemoryRow, row)) async for row in cursor])
+
+
 async def search_memories_by_evidence(
     pool: DatabasePool,
     request: RecallRequest,
@@ -331,6 +347,15 @@ ORDER BY
     memory.strength DESC,
     memory.occurred_at DESC,
     memory.memory_id
+LIMIT %(limit)s
+"""
+
+_LIST_MEMORIES_FOR_ENUMERATION_SQL = f"""
+{MEMORY_SELECT_SQL}
+WHERE memory.tenant_id = %(tenant_id)s
+  AND memory.memory_type = 'episodic'
+{_STRUCTURED_RECALL_FILTER_SQL}
+ORDER BY memory.occurred_at, memory.memory_id
 LIMIT %(limit)s
 """
 

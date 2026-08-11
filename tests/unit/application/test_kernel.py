@@ -1,5 +1,6 @@
 """Vertical tests for the shared observe, remember, and recall path."""
 
+import asyncio
 from collections.abc import Callable
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -27,6 +28,7 @@ from mindbridge.contracts import (
     MediaObjectInput,
     ObservationStatus,
     ObserveRequest,
+    RecallMode,
     RecallQuery,
     RecallRequest,
     RememberRequest,
@@ -37,6 +39,7 @@ from mindbridge.core import (
     EmbeddedObjectType,
     EmbeddingRecord,
     EmbeddingSpaceReference,
+    EnumerationLimitExceededError,
     EvidenceId,
     EvidenceSpan,
     FeedbackType,
@@ -54,6 +57,7 @@ from mindbridge.core import (
     MemoryRecord,
     MemoryState,
     MemoryType,
+    ModelOutputError,
     ModelReference,
     ModelUnavailableError,
     ObjectStorageError,
@@ -185,23 +189,26 @@ class InMemoryStore:
         candidates = (
             memory
             for _, memory in self.memories.values()
-            if memory.tenant_id == request.tenant_id
-            and memory.superseded_at is None
+            if _matches_recall_filters(memory, request)
             and (query is None or query in memory.summary.casefold())
-            and (
-                not request.filters.memory_types
-                or memory.memory_type in request.filters.memory_types
-            )
-            and (
-                request.filters.occurred_after is None
-                or memory.occurred_at >= request.filters.occurred_after
-            )
-            and (
-                request.filters.occurred_before is None
-                or memory.occurred_at <= request.filters.occurred_before
-            )
         )
         return tuple(sorted(candidates, key=lambda memory: memory.occurred_at, reverse=True))[
+            :limit
+        ]
+
+    async def list_memories_for_enumeration(
+        self,
+        request: RecallRequest,
+        *,
+        limit: int,
+    ) -> tuple[MemoryRecord, ...]:
+        candidates = (
+            memory
+            for _, memory in self.memories.values()
+            if memory.memory_type is MemoryType.EPISODIC
+            and _matches_recall_filters(memory, request)
+        )
+        return tuple(sorted(candidates, key=lambda memory: (memory.occurred_at, memory.memory_id)))[
             :limit
         ]
 
@@ -239,20 +246,7 @@ class InMemoryStore:
             memory_by_id[memory_id]
             for memory_id in ranked_memory_ids
             if memory_id in memory_by_id
-            and memory_by_id[memory_id].tenant_id == request.tenant_id
-            and memory_by_id[memory_id].superseded_at is None
-            and (
-                not request.filters.memory_types
-                or memory_by_id[memory_id].memory_type in request.filters.memory_types
-            )
-            and (
-                request.filters.occurred_after is None
-                or memory_by_id[memory_id].occurred_at >= request.filters.occurred_after
-            )
-            and (
-                request.filters.occurred_before is None
-                or memory_by_id[memory_id].occurred_at <= request.filters.occurred_before
-            )
+            and _matches_recall_filters(memory_by_id[memory_id], request)
         )[:limit]
 
     async def record_memory_accesses(
@@ -411,11 +405,19 @@ class DeterministicMediaUrlSigner:
 class RecordingAnswerer:
     """Deterministic answerer proving when the model boundary is invoked."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        selected_occurrence_ids: tuple[MemoryId, ...] | None = None,
+    ) -> None:
         self.calls = 0
         self.last_evidence: tuple[ResolvedEvidence, ...] = ()
         self.last_memories: tuple[MemoryRecord, ...] = ()
         self.last_query_media: tuple[ResolvedQueryMedia, ...] = ()
+        self.selected_occurrence_ids = selected_occurrence_ids
+        self.occurrence_batches: list[tuple[MemoryRecord, ...]] = []
+        self.active_occurrence_calls = 0
+        self.maximum_occurrence_concurrency = 0
 
     async def answer(
         self,
@@ -430,6 +432,28 @@ class RecordingAnswerer:
         self.last_memories = memories
         self.last_query_media = query_media
         return GeneratedAnswer(answer=memories[0].summary, confidence=0.9)
+
+    async def select_occurrences(
+        self,
+        request: RecallRequest,
+        memories: tuple[MemoryRecord, ...],
+        evidence: tuple[ResolvedEvidence, ...],
+        *,
+        query_media: tuple[ResolvedQueryMedia, ...],
+    ) -> tuple[MemoryId, ...]:
+        self.occurrence_batches.append(memories)
+        self.active_occurrence_calls += 1
+        self.maximum_occurrence_concurrency = max(
+            self.maximum_occurrence_concurrency,
+            self.active_occurrence_calls,
+        )
+        try:
+            await asyncio.sleep(0)
+            if self.selected_occurrence_ids is not None:
+                return self.selected_occurrence_ids
+            return tuple(memory.memory_id for memory in memories)
+        finally:
+            self.active_occurrence_calls -= 1
 
 
 class RecordingRecallEmbedder:
@@ -881,6 +905,64 @@ async def test_media_query_rejects_unknown_tenant_object() -> None:
     assert recall_embedder.queries == []
 
 
+async def test_enumerate_verifies_all_filtered_memories_in_bounded_batches() -> None:
+    store = InMemoryStore()
+    await _write_attested_memories(store, 125)
+    answerer = RecordingAnswerer()
+
+    result = await _kernel(store, answerer).recall(
+        RecallRequest(
+            tenant_id="tenant_01",
+            query=RecallQuery(text="words absent from every summary"),
+            mode=RecallMode.ENUMERATE,
+            limit=1,
+        )
+    )
+
+    assert result.answer == "125"
+    assert len(result.memories) == 125
+    assert [memory.occurred_at for memory in result.memories] == sorted(
+        memory.occurred_at for memory in result.memories
+    )
+    assert len(answerer.occurrence_batches) == 8
+    assert max(map(len, answerer.occurrence_batches)) == 16
+    assert answerer.maximum_occurrence_concurrency == 4
+    assert answerer.calls == 0
+    assert all(memory.useful_access_count == 1 for memory in result.memories)
+
+
+async def test_enumerate_rejects_model_ids_outside_the_candidate_batch() -> None:
+    store = InMemoryStore()
+    await _write_attested_memories(store, 1)
+    answerer = RecordingAnswerer(selected_occurrence_ids=(MemoryId("memory_not_a_candidate"),))
+
+    with pytest.raises(ModelOutputError, match="invalid memory IDs"):
+        await _kernel(store, answerer).recall(
+            RecallRequest(
+                tenant_id="tenant_01",
+                query=RecallQuery(text="count the events"),
+                mode=RecallMode.ENUMERATE,
+            )
+        )
+
+
+async def test_enumerate_refuses_to_silently_truncate_a_broad_scope() -> None:
+    store = InMemoryStore()
+    await _write_attested_memories(store, 1_001)
+    answerer = RecordingAnswerer()
+
+    with pytest.raises(EnumerationLimitExceededError, match="narrow"):
+        await _kernel(store, answerer).recall(
+            RecallRequest(
+                tenant_id="tenant_01",
+                query=RecallQuery(text="count every event"),
+                mode=RecallMode.ENUMERATE,
+            )
+        )
+
+    assert answerer.occurrence_batches == []
+
+
 def test_generated_answer_rejects_confidence_without_answer() -> None:
     """Abstention cannot report misleading answer confidence."""
     with pytest.raises(DomainInvariantError, match="zero"):
@@ -916,6 +998,27 @@ def _observe_request(
         identity_observations=identity_observations,
         idempotency_key=idempotency_key,
     )
+
+
+async def _write_attested_memories(store: InMemoryStore, count: int) -> None:
+    for ordinal in reversed(range(count)):
+        occurred_at = NOW + timedelta(seconds=ordinal)
+        memory = MemoryRecord(
+            memory_id=MemoryId(f"memory_{ordinal:04d}"),
+            tenant_id=TenantId("tenant_01"),
+            memory_type=MemoryType.EPISODIC,
+            summary=f"Unrelated attested occurrence {ordinal}",
+            evidence_ids=(),
+            occurred_at=occurred_at,
+            ended_at=occurred_at,
+            created_at=occurred_at,
+            verification_status=VerificationStatus.ATTESTED,
+        )
+        await store.write_memory(
+            memory,
+            idempotency_key=f"enumeration_{ordinal}",
+            content_digest="e" * 64,
+        )
 
 
 def _remember_request(
@@ -957,3 +1060,19 @@ def _kernel(
 def _require_same_content(stored_digest: str, requested_digest: str) -> None:
     if stored_digest != requested_digest:
         raise IdempotencyConflictError("idempotency key already stores different content")
+
+
+def _matches_recall_filters(memory: MemoryRecord, request: RecallRequest) -> bool:
+    return (
+        memory.tenant_id == request.tenant_id
+        and memory.superseded_at is None
+        and (not request.filters.memory_types or memory.memory_type in request.filters.memory_types)
+        and (
+            request.filters.occurred_after is None
+            or memory.occurred_at >= request.filters.occurred_after
+        )
+        and (
+            request.filters.occurred_before is None
+            or memory.occurred_at <= request.filters.occurred_before
+        )
+    )

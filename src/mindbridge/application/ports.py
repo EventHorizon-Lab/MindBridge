@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from datetime import datetime
-from typing import TYPE_CHECKING, Protocol, TypeAlias
+from typing import Protocol, TypeAlias
 
 from mindbridge.contracts import RecallRequest
 from mindbridge.core import (
@@ -34,9 +34,6 @@ from mindbridge.core import (
     ObservationProcessingJob,
     TenantId,
 )
-
-if TYPE_CHECKING:
-    from mindbridge.application.recall import ResolvedQueryMedia
 
 EmbeddingInput: TypeAlias = str | bytes | tuple[str | bytes, ...]
 
@@ -164,6 +161,21 @@ class ResolvedEvidence:
             raise DomainInvariantError("media_url must not be empty")
         if self.media_url_expires_at.utcoffset() is None:
             raise DomainInvariantError("media_url_expires_at must be timezone-aware")
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedQueryMedia:
+    """One tenant-owned query object with short-lived model access."""
+
+    media_object: MediaObject
+    media_url: str
+    media_url_expires_at: datetime
+
+    def __post_init__(self) -> None:
+        if not self.media_url.strip():
+            raise DomainInvariantError("query media URL must not be empty")
+        if self.media_url_expires_at.utcoffset() is None:
+            raise DomainInvariantError("query media URL expiry must be timezone-aware")
 
 
 @dataclass(frozen=True, slots=True)
@@ -332,6 +344,13 @@ class MemoryStore(Protocol):
         limit: int,
     ) -> tuple[MemoryRecord, ...]: ...
 
+    async def list_memories_for_enumeration(
+        self,
+        request: RecallRequest,
+        *,
+        limit: int,
+    ) -> tuple[MemoryRecord, ...]: ...
+
     async def search_memories_by_evidence(
         self,
         request: RecallRequest,
@@ -386,6 +405,15 @@ class MemoryAnswerer(Protocol):
         *,
         query_media: tuple[ResolvedQueryMedia, ...],
     ) -> GeneratedAnswer: ...
+
+    async def select_occurrences(
+        self,
+        request: RecallRequest,
+        memories: tuple[MemoryRecord, ...],
+        evidence: tuple[ResolvedEvidence, ...],
+        *,
+        query_media: tuple[ResolvedQueryMedia, ...],
+    ) -> tuple[MemoryId, ...]: ...
 
 
 class ObservationPerceiver(Protocol):

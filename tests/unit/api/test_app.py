@@ -28,6 +28,7 @@ from mindbridge.contracts import (
 from mindbridge.core import (
     DeletionPropagationState,
     DomainInvariantError,
+    EnumerationLimitExceededError,
     FeedbackType,
     ForgetTargetNotFoundError,
     ForgetTargetType,
@@ -315,6 +316,22 @@ def test_domain_errors_use_stable_envelope() -> None:
     assert response.json()["code"] == "domain_invariant_failed"
 
 
+def test_enumeration_limit_has_an_actionable_stable_error_code() -> None:
+    response = _client(
+        FailingKernel(
+            EnumerationLimitExceededError(
+                "exact enumeration exceeds 1000 candidates; narrow the recall filters"
+            )
+        )
+    ).post(
+        "/v1/recall",
+        json={"tenant_id": "tenant_01", "query": {"text": "count everything"}},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["code"] == "enumeration_limit_exceeded"
+
+
 def test_openapi_exposes_stable_operation_ids() -> None:
     """Agent tooling can derive deterministic operations from OpenAPI."""
     paths = _client().get("/openapi.json").json()["paths"]
@@ -359,7 +376,7 @@ def test_runtime_errors_use_sanitized_stable_envelopes(
 class FailingKernel(StubKernel):
     """Raises one sanitized runtime category from the shared recall route."""
 
-    def __init__(self, error: RuntimeError) -> None:
+    def __init__(self, error: Exception) -> None:
         self._error = error
 
     async def recall(self, request: RecallRequest) -> RecallResult:

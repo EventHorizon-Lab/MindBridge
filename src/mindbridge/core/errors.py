@@ -43,3 +43,7 @@ class ModelUnavailableError(RuntimeError):
 
 class ModelOutputError(RuntimeError):
     """Raised when model output violates its declared contract."""
+
+
+class EnumerationLimitExceededError(DomainInvariantError):
+    """Raised when an exact enumeration would be silently truncated."""

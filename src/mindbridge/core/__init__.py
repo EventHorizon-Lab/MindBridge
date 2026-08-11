@@ -2,6 +2,7 @@
 
 from mindbridge.core.errors import (
     DomainInvariantError,
+    EnumerationLimitExceededError,
     ForgetTargetNotFoundError,
     IdempotencyConflictError,
     JobNotFoundError,
@@ -78,6 +79,7 @@ __all__ = [
     "EmbeddingId",
     "EmbeddingRecord",
     "EmbeddingSpaceReference",
+    "EnumerationLimitExceededError",
     "Event",
     "EventId",
     "EvidenceId",

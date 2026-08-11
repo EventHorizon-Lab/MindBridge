@@ -34,6 +34,7 @@ from mindbridge.core import (
     MediaKind,
     MediaObject,
     MemoryDeletedError,
+    MemoryId,
     MemoryNotFoundError,
     MemoryRecord,
     MemoryType,
@@ -62,6 +63,16 @@ class FirstMemoryAnswerer:
         query_media: tuple[ResolvedQueryMedia, ...],
     ) -> GeneratedAnswer:
         return GeneratedAnswer(answer=memories[0].summary, confidence=0.9)
+
+    async def select_occurrences(
+        self,
+        request: RecallRequest,
+        memories: tuple[MemoryRecord, ...],
+        evidence: tuple[ResolvedEvidence, ...],
+        *,
+        query_media: tuple[ResolvedQueryMedia, ...],
+    ) -> tuple[MemoryId, ...]:
+        return tuple(memory.memory_id for memory in memories)
 
 
 class FixedRecallEmbedder:

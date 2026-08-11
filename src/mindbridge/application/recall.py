@@ -8,7 +8,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Protocol
 
-from mindbridge.application.evidence import resolve_evidence_media
+from mindbridge.application.enumeration import EnumerateMemories
+from mindbridge.application.evidence import read_resolved_memory_evidence
 from mindbridge.application.ports import (
     EmbeddingIndex,
     EmbeddingSearch,
@@ -16,6 +17,7 @@ from mindbridge.application.ports import (
     MemoryAnswerer,
     MemoryStore,
     ResolvedEvidence,
+    ResolvedQueryMedia,
 )
 from mindbridge.application.ranking import fuse_memory_rankings
 from mindbridge.contracts import (
@@ -30,7 +32,6 @@ from mindbridge.core import (
     EmbeddedObjectType,
     EmbeddingSpaceReference,
     EvidenceId,
-    MediaObject,
     MediaObjectId,
     MemoryId,
     MemoryIntegrityError,
@@ -42,21 +43,6 @@ from mindbridge.core import (
 from mindbridge.telemetry import current_trace_id, set_current_span_attributes, trace_operation
 
 RETRIEVAL_DOCUMENT_EMBEDDING_TASK = "retrieval_document"
-
-
-@dataclass(frozen=True, slots=True)
-class ResolvedQueryMedia:
-    """One tenant-owned query object with short-lived model access."""
-
-    media_object: MediaObject
-    media_url: str
-    media_url_expires_at: datetime
-
-    def __post_init__(self) -> None:
-        if not self.media_url.strip():
-            raise DomainInvariantError("query media URL must not be empty")
-        if self.media_url_expires_at.utcoffset() is None:
-            raise DomainInvariantError("query media URL expiry must be timezone-aware")
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,6 +105,12 @@ class RecallMemories:
         self._recall_embedder = recall_embedder
         self._minimum_embedding_similarity = minimum_embedding_similarity
         self._clock = clock or _utc_now
+        self._enumerate = EnumerateMemories(
+            store,
+            answerer,
+            media_url_signer,
+            clock=self._clock,
+        )
 
     @trace_operation("mindbridge.recall")
     async def run(self, request: RecallRequest) -> RecallResult:
@@ -133,6 +125,8 @@ class RecallMemories:
             }
         )
         query_media = await self._resolve_query_media(request)
+        if request.mode is RecallMode.ENUMERATE:
+            return await self._enumerate_result(request, query_media)
         candidate_limit = min(request.limit * 4, 100)
         memories = await self._retrieve_candidates(
             request,
@@ -188,6 +182,32 @@ class RecallMemories:
                     for item in evidence
                     if item.evidence_span.evidence_id in visible_evidence_ids
                 )
+                if request.include_evidence
+                else ()
+            ),
+            trace_id=current_trace_id(),
+        )
+
+    async def _enumerate_result(
+        self,
+        request: RecallRequest,
+        query_media: tuple[ResolvedQueryMedia, ...],
+    ) -> RecallResult:
+        enumeration = await self._enumerate.run(request, query_media)
+        set_current_span_attributes(
+            {
+                "mindbridge.recall.candidate_count": len(enumeration.memories),
+                "mindbridge.recall.memory_count": len(enumeration.memories),
+                "mindbridge.recall.evidence_count": len(enumeration.evidence),
+                "mindbridge.recall.answered": True,
+            }
+        )
+        return RecallResult(
+            answer=str(len(enumeration.memories)),
+            confidence=1.0,
+            memories=tuple(memory_view(memory) for memory in enumeration.memories),
+            evidence=(
+                tuple(evidence_view(item) for item in enumeration.evidence)
                 if request.include_evidence
                 else ()
             ),
@@ -300,22 +320,12 @@ class RecallMemories:
         request: RecallRequest,
         memories: tuple[MemoryRecord, ...],
     ) -> tuple[ResolvedEvidence, ...]:
-        evidence_ids = tuple(
-            dict.fromkeys(evidence_id for memory in memories for evidence_id in memory.evidence_ids)
+        return await read_resolved_memory_evidence(
+            self._store,
+            self._media_url_signer,
+            TenantId(request.tenant_id),
+            memories,
         )
-        if not evidence_ids:
-            return ()
-        tenant_id = TenantId(request.tenant_id)
-        evidence_spans = await self._store.read_evidence(tenant_id, evidence_ids)
-        if len(evidence_spans) != len(evidence_ids):
-            raise MemoryIntegrityError("memory references missing evidence")
-        media_object_ids = tuple(
-            dict.fromkeys(evidence.media_object_id for evidence in evidence_spans)
-        )
-        media_objects = await self._store.read_media_objects(tenant_id, media_object_ids)
-        if len(media_objects) != len(media_object_ids):
-            raise MemoryIntegrityError("evidence references missing media")
-        return await resolve_evidence_media(evidence_spans, media_objects, self._media_url_signer)
 
 
 def memory_view(memory: MemoryRecord) -> MemoryView:

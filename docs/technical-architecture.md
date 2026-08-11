@@ -479,6 +479,14 @@ flowchart LR
 
 该路径借鉴 Qwen Video Memory 的 `enumerate_events` 和 `search_by_time` 能力。
 
+生产实现中，`enumerate` 不受普通召回 `limit` 的 Top-K 截断：PostgreSQL 先按租户、人物、
+设备、记忆类型和时间范围完整扫描，并按 `occurred_at` 排序；文本仅作为 Omni 的判定问题，
+不作为 FTS 预过滤条件。候选以 16 条为一批、最多 4 批并行，Omni 直接查看原始视听证据或
+明确标记的 `attested` 文本，只能返回当前批次内且不重复的 Memory ID。最终 `answer` 是十进制
+occurrence 数量，`memories` 与 `evidence` 返回全部命中项。单次扫描硬上限为 1000 条；查询第
+1001 条作为截断哨兵，命中时返回 `enumeration_limit_exceeded`，要求调用方缩小时间或实体范围，
+而不是静默给出错误计数。
+
 ## 8. 自学习、自进化与自遗忘
 
 ### 8.1 模型冻结，记忆演化

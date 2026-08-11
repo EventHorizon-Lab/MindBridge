@@ -141,6 +141,60 @@ async def test_omni_inspects_native_query_media_before_candidate_evidence() -> N
     assert answer.answer == "matching moment"
 
 
+async def test_omni_selects_occurrences_with_schema_validated_candidate_ids() -> None:
+    async def respond(request: httpx.Request) -> httpx.Response:
+        payload: dict[str, object] = json.loads(request.content)
+        messages = cast(list[dict[str, object]], payload["messages"])
+        assert "exhaustive occurrence-verification" in cast(str, messages[0]["content"])
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=_completion_stream('{"memory_ids":["memory_01"]}'),
+        )
+
+    answerer = _answerer(respond)
+    memory = _memory((), verification_status=VerificationStatus.ATTESTED)
+    try:
+        selected = await answerer.select_occurrences(
+            RecallRequest(tenant_id="tenant_01", query=RecallQuery(text="count the tools")),
+            (memory,),
+            (),
+            query_media=(),
+        )
+    finally:
+        await answerer.close()
+
+    assert selected == (memory.memory_id,)
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        '{"memory_ids":["memory_01","memory_01"]}',
+        '{"memory_ids":["memory_unknown"]}',
+    ],
+)
+async def test_omni_rejects_invalid_occurrence_selection(content: str) -> None:
+    async def respond(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=_completion_stream(content),
+        )
+
+    answerer = _answerer(respond)
+    try:
+        with pytest.raises(ModelOutputError, match="occurrence model"):
+            await answerer.select_occurrences(
+                RecallRequest(tenant_id="tenant_01", query=RecallQuery(text="count the tools")),
+                (_memory((), verification_status=VerificationStatus.ATTESTED),),
+                (),
+                query_media=(),
+            )
+    finally:
+        await answerer.close()
+
+
 async def test_omni_rejects_invalid_structured_output() -> None:
     """Provider JSON cannot bypass the answer confidence invariant."""
 

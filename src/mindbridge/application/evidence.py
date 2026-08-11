@@ -6,10 +6,40 @@ import asyncio
 
 from mindbridge.application.ports import (
     MediaUrlSigner,
+    MemoryStore,
     PresignedMediaDownload,
     ResolvedEvidence,
 )
-from mindbridge.core import EvidenceSpan, MediaObject, MediaObjectId, MemoryIntegrityError
+from mindbridge.core import (
+    EvidenceSpan,
+    MediaObject,
+    MediaObjectId,
+    MemoryIntegrityError,
+    MemoryRecord,
+    TenantId,
+)
+
+
+async def read_resolved_memory_evidence(
+    store: MemoryStore,
+    signer: MediaUrlSigner,
+    tenant_id: TenantId,
+    memories: tuple[MemoryRecord, ...],
+) -> tuple[ResolvedEvidence, ...]:
+    """Read and sign every distinct evidence span referenced by memories."""
+    evidence_ids = tuple(
+        dict.fromkeys(evidence_id for memory in memories for evidence_id in memory.evidence_ids)
+    )
+    if not evidence_ids:
+        return ()
+    evidence_spans = await store.read_evidence(tenant_id, evidence_ids)
+    if len(evidence_spans) != len(evidence_ids):
+        raise MemoryIntegrityError("memory references missing evidence")
+    media_object_ids = tuple(dict.fromkeys(evidence.media_object_id for evidence in evidence_spans))
+    media_objects = await store.read_media_objects(tenant_id, media_object_ids)
+    if len(media_objects) != len(media_object_ids):
+        raise MemoryIntegrityError("evidence references missing media")
+    return await resolve_evidence_media(evidence_spans, media_objects, signer)
 
 
 async def resolve_evidence_media(

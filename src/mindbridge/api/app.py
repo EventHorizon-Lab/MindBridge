@@ -37,6 +37,7 @@ from mindbridge.contracts import (
 )
 from mindbridge.core import (
     DomainInvariantError,
+    EnumerationLimitExceededError,
     ForgetTargetNotFoundError,
     IdempotencyConflictError,
     JobNotFoundError,
@@ -236,16 +237,22 @@ def _register_request_error_handlers(app: FastAPI) -> None:
         _request: Request,
         error: DomainInvariantError,
     ) -> JSONResponse:
-        is_conflict = isinstance(error, IdempotencyConflictError)
+        if isinstance(error, IdempotencyConflictError):
+            code = "idempotency_conflict"
+            status_code = status.HTTP_409_CONFLICT
+        elif isinstance(error, EnumerationLimitExceededError):
+            code = "enumeration_limit_exceeded"
+            status_code = status.HTTP_422_UNPROCESSABLE_CONTENT
+        else:
+            code = "domain_invariant_failed"
+            status_code = status.HTTP_422_UNPROCESSABLE_CONTENT
         response = ErrorResponse(
-            code="idempotency_conflict" if is_conflict else "domain_invariant_failed",
+            code=code,
             message=str(error),
             trace_id=current_trace_id(),
         )
         return JSONResponse(
-            status_code=status.HTTP_409_CONFLICT
-            if is_conflict
-            else status.HTTP_422_UNPROCESSABLE_CONTENT,
+            status_code=status_code,
             content=response.model_dump(),
         )
 

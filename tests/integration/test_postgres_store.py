@@ -24,6 +24,7 @@ from mindbridge.contracts import (
     ObservationStatus,
     ObserveRequest,
     RecallFilters,
+    RecallMode,
     RecallQuery,
     RecallRequest,
     RememberRequest,
@@ -69,6 +70,16 @@ class FirstMemoryAnswerer:
         query_media: tuple[ResolvedQueryMedia, ...],
     ) -> GeneratedAnswer:
         return GeneratedAnswer(answer=memories[0].summary, confidence=0.9)
+
+    async def select_occurrences(
+        self,
+        request: RecallRequest,
+        memories: tuple[MemoryRecord, ...],
+        evidence: tuple[ResolvedEvidence, ...],
+        *,
+        query_media: tuple[ResolvedQueryMedia, ...],
+    ) -> tuple[MemoryId, ...]:
+        return tuple(memory.memory_id for memory in memories)
 
 
 class DeterministicMediaUrlSigner:
@@ -246,6 +257,39 @@ async def test_postgres_vertical_path_is_idempotent_and_evidence_first(
             TenantId("other_tenant"),
             JobId(first.processing_job_id),
         )
+
+
+async def test_postgres_enumeration_scans_filters_without_full_text_truncation(
+    store: PostgresMemoryStore,
+) -> None:
+    kernel = _kernel(store)
+    tenant_id = "tenant_enumeration"
+    for ordinal in reversed(range(3)):
+        await kernel.remember(
+            RememberRequest(
+                tenant_id=tenant_id,
+                summary=f"Attested occurrence {ordinal}",
+                memory_type=MemoryType.EPISODIC,
+                occurred_at=NOW + timedelta(minutes=ordinal),
+                idempotency_key=f"enumeration_{ordinal}",
+            )
+        )
+
+    result = await kernel.recall(
+        RecallRequest(
+            tenant_id=tenant_id,
+            query=RecallQuery(text="text absent from every stored summary"),
+            filters=RecallFilters(occurred_after=NOW + timedelta(minutes=1)),
+            mode=RecallMode.ENUMERATE,
+            include_evidence=False,
+        )
+    )
+
+    assert result.answer == "2"
+    assert [memory.summary for memory in result.memories] == [
+        "Attested occurrence 1",
+        "Attested occurrence 2",
+    ]
 
 
 async def test_postgres_round_trips_attested_source_memory(store: PostgresMemoryStore) -> None:

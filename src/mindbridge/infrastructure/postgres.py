@@ -60,6 +60,7 @@ from mindbridge.infrastructure._postgres_lifecycle import (
     update_memory_lifecycles,
 )
 from mindbridge.infrastructure._postgres_memories import (
+    list_memories_for_enumeration,
     read_memory,
     search_memories,
     search_memories_by_evidence,
@@ -250,6 +251,15 @@ class PostgresMemoryStore:
     ) -> tuple[MemoryRecord, ...]:
         """Apply exact filters and PostgreSQL full-text candidate retrieval."""
         return await search_memories(self._pool, request, limit=limit)
+
+    async def list_memories_for_enumeration(
+        self,
+        request: RecallRequest,
+        *,
+        limit: int,
+    ) -> tuple[MemoryRecord, ...]:
+        """Scan an exact structured-filter scope in chronological order."""
+        return await list_memories_for_enumeration(self._pool, request, limit=limit)
 
     async def search_memories_by_evidence(
         self,
