@@ -39,6 +39,7 @@ from mindbridge.core import (
     MediaObject,
     MediaObjectId,
     MemoryId,
+    MemoryNotFoundError,
     MemoryRecord,
     MemoryType,
     ModelReference,
@@ -107,6 +108,16 @@ class InMemoryStore:
             raise DomainInvariantError("memory references unknown evidence")
         self.memories[key] = (content_digest, memory)
         return MemoryWriteResult(memory=memory, created=True)
+
+    async def read_memory(
+        self,
+        tenant_id: TenantId,
+        memory_id: MemoryId,
+    ) -> MemoryRecord:
+        for _, memory in self.memories.values():
+            if memory.tenant_id == tenant_id and memory.memory_id == memory_id:
+                return memory
+        raise MemoryNotFoundError("memory does not exist")
 
     async def search_memories(self, request: RecallRequest) -> tuple[MemoryRecord, ...]:
         query = request.query.text.casefold() if request.query.text is not None else None
@@ -343,6 +354,18 @@ async def test_observation_job_status_is_tenant_scoped() -> None:
     assert job.attempt == 0
     with pytest.raises(JobNotFoundError):
         await kernel.get_observation_job("other_tenant", receipt.processing_job_id)
+
+
+async def test_get_memory_is_tenant_scoped() -> None:
+    store = InMemoryStore()
+    kernel = _kernel(store, RecordingAnswerer())
+    remembered = await kernel.remember(_remember_request())
+
+    found = await kernel.get_memory("tenant_01", remembered.memory_id)
+
+    assert found == remembered
+    with pytest.raises(MemoryNotFoundError):
+        await kernel.get_memory("other_tenant", remembered.memory_id)
 
 
 async def test_idempotency_key_rejects_different_observation() -> None:

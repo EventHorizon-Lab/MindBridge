@@ -39,6 +39,7 @@ from mindbridge.infrastructure._postgres_jobs import (
     read_observation_processing_job,
 )
 from mindbridge.infrastructure._postgres_memories import (
+    read_memory,
     search_memories,
     search_memories_by_evidence,
     search_memories_by_ids,
@@ -116,6 +117,14 @@ class PostgresMemoryStore:
             idempotency_key=idempotency_key,
             content_digest=content_digest,
         )
+
+    async def read_memory(
+        self,
+        tenant_id: TenantId,
+        memory_id: MemoryId,
+    ) -> MemoryRecord:
+        """Read one tenant-owned memory or raise the stable not-found error."""
+        return await read_memory(self._pool, tenant_id, memory_id)
 
     async def search_memories(self, request: RecallRequest) -> tuple[MemoryRecord, ...]:
         """Apply exact filters and PostgreSQL full-text candidate retrieval."""

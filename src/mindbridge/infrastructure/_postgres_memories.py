@@ -13,6 +13,7 @@ from mindbridge.core import (
     IdempotencyConflictError,
     MemoryId,
     MemoryIntegrityError,
+    MemoryNotFoundError,
     MemoryRecord,
     MemoryState,
     MemoryType,
@@ -69,6 +70,23 @@ async def write_memory(
             existing = await _read_memory(connection, memory.tenant_id, memory.memory_id)
             return MemoryWriteResult(memory=existing, created=False)
         return MemoryWriteResult(memory=memory, created=True)
+
+
+async def read_memory(
+    pool: DatabasePool,
+    tenant_id: TenantId,
+    memory_id: MemoryId,
+) -> MemoryRecord:
+    """Read one memory without revealing whether its ID exists in another tenant."""
+    async with pool.connection() as connection:
+        cursor = await connection.execute(
+            f"{_MEMORY_SELECT_SQL} WHERE memory.tenant_id = %s AND memory.memory_id = %s",
+            (tenant_id, memory_id),
+        )
+        row = await cursor.fetchone()
+    if row is None:
+        raise MemoryNotFoundError("memory does not exist")
+    return _memory_from_row(cast(MemoryRow, row))
 
 
 async def write_memory_on_connection(

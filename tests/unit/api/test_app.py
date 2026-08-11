@@ -23,6 +23,7 @@ from mindbridge.core import (
     JobNotFoundError,
     JobState,
     MemoryIntegrityError,
+    MemoryNotFoundError,
     MemoryState,
     MemoryType,
     ModelOutputError,
@@ -89,6 +90,21 @@ class StubKernel:
             trace_id="trace_job",
         )
 
+    async def get_memory(self, tenant_id: str, memory_id: str) -> MemoryView:
+        if tenant_id != "tenant_01":
+            raise MemoryNotFoundError("missing")
+        return MemoryView(
+            memory_id=memory_id,
+            memory_type=MemoryType.EPISODIC,
+            summary="remembered event",
+            evidence_ids=(),
+            occurred_at=NOW,
+            ended_at=NOW,
+            created_at=NOW,
+            verification_status=VerificationStatus.ATTESTED,
+            state=MemoryState.ACTIVE,
+        )
+
 
 def test_recall_route_uses_shared_contract() -> None:
     """REST request and response shapes are the same Pydantic contracts."""
@@ -113,6 +129,18 @@ def test_job_route_is_tenant_scoped_and_returns_not_found() -> None:
     assert found.json()["state"] == "succeeded"
     assert missing.status_code == 404
     assert missing.json()["code"] == "job_not_found"
+
+
+def test_memory_route_is_tenant_scoped_and_returns_not_found() -> None:
+    client = _client()
+
+    found = client.get("/v1/memories/memory_01", params={"tenant_id": "tenant_01"})
+    missing = client.get("/v1/memories/memory_01", params={"tenant_id": "other_tenant"})
+
+    assert found.status_code == 200
+    assert found.json()["memory_id"] == "memory_01"
+    assert missing.status_code == 404
+    assert missing.json()["code"] == "memory_not_found"
 
 
 def test_validation_errors_have_trace_and_field_location() -> None:
@@ -150,6 +178,7 @@ def test_openapi_exposes_stable_operation_ids() -> None:
 
     assert paths["/v1/observations"]["post"]["operationId"] == "observe"
     assert paths["/v1/memories"]["post"]["operationId"] == "remember"
+    assert paths["/v1/memories/{memory_id}"]["get"]["operationId"] == "getMemory"
     assert paths["/v1/recall"]["post"]["operationId"] == "recall"
     assert paths["/v1/jobs/{job_id}"]["get"]["operationId"] == "getObservationJob"
 

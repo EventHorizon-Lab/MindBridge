@@ -110,6 +110,35 @@ async def test_get_observation_job_uses_tenant_scoped_route() -> None:
     assert job.attempt == 1
 
 
+async def test_get_memory_uses_tenant_scoped_route() -> None:
+    async def respond(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert request.url.path == "/v1/memories/memory_01"
+        assert request.url.params["tenant_id"] == "tenant_01"
+        return httpx.Response(
+            200,
+            json={
+                "memory_id": "memory_01",
+                "memory_type": "episodic",
+                "summary": "remembered event",
+                "evidence_ids": [],
+                "occurred_at": "2026-08-11T12:00:00Z",
+                "ended_at": "2026-08-11T12:00:00Z",
+                "created_at": "2026-08-11T12:00:00Z",
+                "verification_status": "attested",
+                "state": "active",
+            },
+        )
+
+    client = _client(respond)
+    try:
+        memory = await client.get_memory("tenant_01", "memory_01")
+    finally:
+        await client.close()
+
+    assert memory.memory_id == "memory_01"
+
+
 def _client(
     handler: Callable[[httpx.Request], Coroutine[None, None, httpx.Response]],
 ) -> AsyncMindBridge:

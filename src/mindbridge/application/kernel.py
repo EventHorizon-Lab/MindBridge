@@ -184,6 +184,11 @@ class MemoryKernel:
             trace_id=_new_id("trace"),
         )
 
+    async def get_memory(self, tenant_id: str, memory_id: str) -> MemoryView:
+        """Return one tenant-owned memory through the shared stable view."""
+        memory = await self._store.read_memory(TenantId(tenant_id), MemoryId(memory_id))
+        return _memory_view(memory)
+
     async def recall(self, request: RecallRequest) -> RecallResult:
         """Retrieve memories, inspect evidence, and answer only when supported."""
         candidate_limit = min(request.limit * 4, 100)

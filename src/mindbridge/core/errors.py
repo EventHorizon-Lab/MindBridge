@@ -17,6 +17,10 @@ class JobNotFoundError(LookupError):
     """Raised when a caller requests an unknown tenant-owned job."""
 
 
+class MemoryNotFoundError(LookupError):
+    """Raised when a caller requests an unknown tenant-owned memory."""
+
+
 class ObjectStorageError(RuntimeError):
     """Raised when immutable evidence media cannot be accessed."""
 

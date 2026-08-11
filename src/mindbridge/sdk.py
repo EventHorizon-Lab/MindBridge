@@ -83,6 +83,15 @@ class AsyncMindBridge:
         """Recall memories and grounded evidence through the production API."""
         return await self._post("v1/recall", request, RecallResult)
 
+    async def get_memory(self, tenant_id: str, memory_id: str) -> MemoryView:
+        """Read one tenant-owned memory."""
+        return await self._request(
+            "GET",
+            f"v1/memories/{quote(memory_id, safe='')}",
+            MemoryView,
+            params={"tenant_id": tenant_id},
+        )
+
     async def get_observation_job(
         self,
         tenant_id: str,

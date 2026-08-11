@@ -34,6 +34,7 @@ from mindbridge.core import (
     MediaObject,
     MemoryId,
     MemoryIntegrityError,
+    MemoryNotFoundError,
     MemoryRecord,
     MemoryType,
     ModelReference,
@@ -229,6 +230,11 @@ async def test_postgres_round_trips_attested_source_memory(store: PostgresMemory
     )
     assert [item.memory_id for item in matched] == [memory.memory_id]
     assert filtered == ()
+
+    found = await kernel.get_memory("tenant_attested", memory.memory_id)
+    assert found == memory
+    with pytest.raises(MemoryNotFoundError):
+        await kernel.get_memory("other_tenant", memory.memory_id)
 
 
 async def test_postgres_rejects_idempotency_key_reuse(store: PostgresMemoryStore) -> None:

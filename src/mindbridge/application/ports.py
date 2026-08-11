@@ -231,6 +231,12 @@ class MemoryStore(Protocol):
         content_digest: str,
     ) -> MemoryWriteResult: ...
 
+    async def read_memory(
+        self,
+        tenant_id: TenantId,
+        memory_id: MemoryId,
+    ) -> MemoryRecord: ...
+
     async def search_memories(self, request: RecallRequest) -> tuple[MemoryRecord, ...]: ...
 
     async def search_memories_by_evidence(

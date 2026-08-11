@@ -28,6 +28,7 @@ from mindbridge.core import (
     IdempotencyConflictError,
     JobNotFoundError,
     MemoryIntegrityError,
+    MemoryNotFoundError,
     ModelOutputError,
     ModelUnavailableError,
     ObjectStorageError,
@@ -74,6 +75,14 @@ def create_app(
     )
     async def recall(request: RecallRequest) -> RecallResult:
         return await kernel.recall(request)
+
+    @app.get(
+        "/v1/memories/{memory_id}",
+        response_model=MemoryView,
+        operation_id="getMemory",
+    )
+    async def get_memory(memory_id: Identifier, tenant_id: Identifier) -> MemoryView:
+        return await kernel.get_memory(tenant_id, memory_id)
 
     @app.get(
         "/v1/jobs/{job_id}",
@@ -132,6 +141,17 @@ def _register_request_error_handlers(app: FastAPI) -> None:
 
 
 def _register_runtime_error_handlers(app: FastAPI) -> None:
+    @app.exception_handler(MemoryNotFoundError)
+    async def handle_memory_not_found(
+        _request: Request,
+        _error: MemoryNotFoundError,
+    ) -> JSONResponse:
+        return _error_response(
+            status.HTTP_404_NOT_FOUND,
+            code="memory_not_found",
+            message="memory does not exist",
+        )
+
     @app.exception_handler(JobNotFoundError)
     async def handle_job_not_found(
         _request: Request,
