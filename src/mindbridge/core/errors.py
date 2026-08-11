@@ -17,6 +17,10 @@ class ObjectStorageError(RuntimeError):
     """Raised when immutable evidence media cannot be accessed."""
 
 
+class TaskBrokerError(RuntimeError):
+    """Raised when a durable processing job cannot be delivered."""
+
+
 class ModelUnavailableError(RuntimeError):
     """Raised when a configured frozen model cannot be loaded or called."""
 

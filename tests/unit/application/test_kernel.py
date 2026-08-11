@@ -34,6 +34,7 @@ from mindbridge.core import (
     MemoryRecord,
     MemoryType,
     Observation,
+    ObservationId,
     SensorKind,
     TenantId,
     VerificationStatus,
@@ -171,10 +172,26 @@ class RecordingAnswerer:
         return GeneratedAnswer(answer=memories[0].summary, confidence=0.9)
 
 
+class RecordingObservationJobPublisher:
+    """Records durable job delivery without a test broker."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[TenantId, ObservationId, JobId]] = []
+
+    async def publish_observation_processing_job(
+        self,
+        tenant_id: TenantId,
+        observation_id: ObservationId,
+        job_id: JobId,
+    ) -> None:
+        self.calls.append((tenant_id, observation_id, job_id))
+
+
 async def test_observe_is_retry_safe() -> None:
     """Retrying one edge sequence stores one observation and returns duplicate status."""
     store = InMemoryStore()
-    kernel = _kernel(store, RecordingAnswerer())
+    publisher = RecordingObservationJobPublisher()
+    kernel = _kernel(store, RecordingAnswerer(), job_publisher=publisher)
 
     first = await kernel.observe(_observe_request())
     retry = await kernel.observe(_observe_request())
@@ -185,6 +202,10 @@ async def test_observe_is_retry_safe() -> None:
     assert retry.status is ObservationStatus.DUPLICATE
     assert len(store.observations) == 1
     assert len(store.evidence) == 1
+    assert publisher.calls == [
+        (TenantId("tenant_01"), first.observation_id, first.processing_job_id),
+        (TenantId("tenant_01"), retry.observation_id, retry.processing_job_id),
+    ]
 
 
 async def test_idempotency_key_rejects_different_observation() -> None:
@@ -342,12 +363,14 @@ def _kernel(
     store: InMemoryStore,
     answerer: RecordingAnswerer,
     *,
+    job_publisher: RecordingObservationJobPublisher | None = None,
     clock: Callable[[], datetime] = lambda: NOW,
 ) -> MemoryKernel:
     return MemoryKernel(
         store,
         answerer,
         media_url_signer=DeterministicMediaUrlSigner(),
+        observation_job_publisher=job_publisher or RecordingObservationJobPublisher(),
         clock=clock,
     )
 

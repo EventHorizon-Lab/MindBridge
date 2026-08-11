@@ -7,6 +7,7 @@ from mindbridge.core.errors import (
     ModelOutputError,
     ModelUnavailableError,
     ObjectStorageError,
+    TaskBrokerError,
 )
 from mindbridge.core.evidence import (
     EvidenceSpan,
@@ -70,6 +71,7 @@ __all__ = [
     "ObservationId",
     "PixelRegion",
     "SensorKind",
+    "TaskBrokerError",
     "TenantId",
     "VerificationStatus",
 ]

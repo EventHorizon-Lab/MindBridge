@@ -31,7 +31,7 @@ git diff --check
 The production store uses PostgreSQL 18 with pgvector. Start the pinned development database with Docker Compose and apply the initial migration once:
 
 ```bash
-docker compose up -d postgres
+docker compose up -d postgres redis
 docker compose exec -T postgres psql -v ON_ERROR_STOP=1 -U mindbridge -d mindbridge < migrations/0001_initial.sql
 ```
 
@@ -66,6 +66,7 @@ standard AWS credential chain and are not copied into MindBridge configuration:
 export MINDBRIDGE_DATABASE_URL=postgresql://mindbridge:password@localhost:5432/mindbridge
 export MINDBRIDGE_OBJECT_STORAGE_BUCKET=mindbridge-media
 export MINDBRIDGE_OBJECT_STORAGE_ENDPOINT_URL=https://objects.example.com
+export MINDBRIDGE_TASK_BROKER_URL=redis://localhost:6379/0
 export MINDBRIDGE_VLM_API_KEY=replace-with-a-runtime-secret
 export MINDBRIDGE_VLM_ENDPOINT=https://vlm.example.com/api/v1/chat/completions
 export MINDBRIDGE_VLM_MODEL_ID=qwen3.8-max

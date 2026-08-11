@@ -33,6 +33,7 @@ def test_production_app_opens_and_closes_runtime_resources(
         database_url=DATABASE_URL,
         object_storage_bucket="memory",
         object_storage_endpoint_url="https://objects.example.test",
+        task_broker_url="memory://",
         vlm_api_key="unit-test-vlm-key",
         vlm_endpoint="https://vlm.example.test/api/v1/chat/completions",
     )

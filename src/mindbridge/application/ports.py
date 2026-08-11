@@ -20,6 +20,7 @@ from mindbridge.core import (
     MemoryRecord,
     ModelReference,
     Observation,
+    ObservationId,
     TenantId,
 )
 
@@ -202,6 +203,17 @@ class MediaUrlSigner(Protocol):
         self,
         media_object: MediaObject,
     ) -> PresignedMediaDownload: ...
+
+
+class ObservationJobPublisher(Protocol):
+    """At-least-once delivery for one already durable observation job."""
+
+    async def publish_observation_processing_job(
+        self,
+        tenant_id: TenantId,
+        observation_id: ObservationId,
+        job_id: JobId,
+    ) -> None: ...
 
 
 class EmbeddingIndex(Protocol):

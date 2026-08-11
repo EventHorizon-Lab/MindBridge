@@ -28,6 +28,7 @@ from mindbridge.core import (
     ModelOutputError,
     ModelUnavailableError,
     ObjectStorageError,
+    TaskBrokerError,
 )
 
 
@@ -148,6 +149,17 @@ def _register_runtime_error_handlers(app: FastAPI) -> None:
             status.HTTP_503_SERVICE_UNAVAILABLE,
             code="object_storage_unavailable",
             message="evidence media is unavailable",
+        )
+
+    @app.exception_handler(TaskBrokerError)
+    async def handle_task_broker_error(
+        _request: Request,
+        _error: TaskBrokerError,
+    ) -> JSONResponse:
+        return _error_response(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            code="task_broker_unavailable",
+            message="observation processing is temporarily unavailable",
         )
 
     @app.exception_handler(MemoryIntegrityError)

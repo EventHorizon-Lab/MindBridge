@@ -13,6 +13,7 @@ from mindbridge.application.ports import (
     MemoryAnswerer,
     MemoryStore,
     ObservationBatch,
+    ObservationJobPublisher,
     ResolvedEvidence,
 )
 from mindbridge.contracts import (
@@ -52,11 +53,13 @@ class MemoryKernel:
         answerer: MemoryAnswerer,
         *,
         media_url_signer: MediaUrlSigner,
+        observation_job_publisher: ObservationJobPublisher,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._store = store
         self._answerer = answerer
         self._media_url_signer = media_url_signer
+        self._observation_job_publisher = observation_job_publisher
         self._clock = clock or _utc_now
 
     async def observe(self, request: ObserveRequest) -> ObservationReceipt:
@@ -76,6 +79,11 @@ class MemoryKernel:
             batch,
             idempotency_key=idempotency_key,
             content_digest=_request_digest(request),
+        )
+        await self._observation_job_publisher.publish_observation_processing_job(
+            result.observation.tenant_id,
+            result.observation.observation_id,
+            result.processing_job_id,
         )
         return ObservationReceipt(
             observation_id=result.observation.observation_id,

@@ -11,18 +11,24 @@ from fastapi import FastAPI
 
 from mindbridge.api.app import create_app
 from mindbridge.application import MemoryKernel
-from mindbridge.infrastructure import PostgresMemoryStore, S3MediaAccess
+from mindbridge.infrastructure import (
+    CeleryObservationJobPublisher,
+    PostgresMemoryStore,
+    S3MediaAccess,
+    create_task_queue,
+)
 from mindbridge.models import DEFAULT_OMNI_MODEL_ID, OpenAIOmniAnswerer
 
 
 @dataclass(frozen=True, slots=True)
 class RuntimeSettings:
-    """Validated process configuration with a redacted VLM credential."""
+    """Validated process configuration with redacted credentials."""
 
-    database_url: str
+    database_url: str = field(repr=False)
     object_storage_bucket: str
     vlm_api_key: str = field(repr=False)
     vlm_endpoint: str
+    task_broker_url: str = field(repr=False)
     object_storage_endpoint_url: str | None = None
     object_storage_region: str = "us-east-1"
     vlm_model_id: str = DEFAULT_OMNI_MODEL_ID
@@ -32,6 +38,7 @@ class RuntimeSettings:
             ("database_url", self.database_url),
             ("object_storage_bucket", self.object_storage_bucket),
             ("object_storage_region", self.object_storage_region),
+            ("task_broker_url", self.task_broker_url),
             ("vlm_api_key", self.vlm_api_key),
             ("vlm_endpoint", self.vlm_endpoint),
             ("vlm_model_id", self.vlm_model_id),
@@ -56,6 +63,7 @@ class RuntimeSettings:
             object_storage_bucket=_required(source, "MINDBRIDGE_OBJECT_STORAGE_BUCKET"),
             object_storage_endpoint_url=_optional(source, "MINDBRIDGE_OBJECT_STORAGE_ENDPOINT_URL"),
             object_storage_region=source.get("MINDBRIDGE_OBJECT_STORAGE_REGION", "us-east-1"),
+            task_broker_url=_required(source, "MINDBRIDGE_TASK_BROKER_URL"),
             vlm_api_key=_required(source, "MINDBRIDGE_VLM_API_KEY"),
             vlm_endpoint=_required(source, "MINDBRIDGE_VLM_ENDPOINT"),
             vlm_model_id=source.get("MINDBRIDGE_VLM_MODEL_ID", DEFAULT_OMNI_MODEL_ID),
@@ -76,7 +84,13 @@ def create_production_app(settings: RuntimeSettings | None = None) -> FastAPI:
         endpoint=runtime.vlm_endpoint,
         model_id=runtime.vlm_model_id,
     )
-    kernel = MemoryKernel(store, answerer, media_url_signer=media_access)
+    job_publisher = CeleryObservationJobPublisher(create_task_queue(runtime.task_broker_url))
+    kernel = MemoryKernel(
+        store,
+        answerer,
+        media_url_signer=media_access,
+        observation_job_publisher=job_publisher,
+    )
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:

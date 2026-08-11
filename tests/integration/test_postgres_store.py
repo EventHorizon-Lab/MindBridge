@@ -34,11 +34,13 @@ from mindbridge.core import (
     EmbeddingId,
     EmbeddingRecord,
     IdempotencyConflictError,
+    JobId,
     MediaKind,
     MediaObject,
     MemoryRecord,
     MemoryType,
     ModelReference,
+    ObservationId,
     SensorKind,
     TenantId,
     VerificationStatus,
@@ -80,6 +82,18 @@ class DeterministicMediaUrlSigner:
             download_url=f"https://objects.example.test/{media_object.media_object_id}",
             expires_at=NOW + timedelta(minutes=5),
         )
+
+
+class DiscardingObservationJobPublisher:
+    """Keeps store integration independent from the Redis delivery adapter."""
+
+    async def publish_observation_processing_job(
+        self,
+        tenant_id: TenantId,
+        observation_id: ObservationId,
+        job_id: JobId,
+    ) -> None:
+        return None
 
 
 @pytest_asyncio.fixture(scope="session", loop_scope="session")
@@ -373,5 +387,6 @@ def _kernel(store: PostgresMemoryStore) -> MemoryKernel:
         store,
         FirstMemoryAnswerer(),
         media_url_signer=DeterministicMediaUrlSigner(),
+        observation_job_publisher=DiscardingObservationJobPublisher(),
         clock=lambda: NOW,
     )
