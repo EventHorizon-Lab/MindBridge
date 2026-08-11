@@ -16,6 +16,7 @@ from mindbridge.application import (
     ClaimRelationshipProposal,
     ConsolidateClaims,
     ConsolidateEpisodes,
+    ConsolidateSummaries,
     EmbeddingInput,
     EmbeddingMatch,
     EmbeddingSearch,
@@ -32,7 +33,11 @@ from mindbridge.application import (
     ProcessObservation,
     ResolvedEvidence,
     SemanticClaimProposal,
+    SummaryCandidate,
     SummaryCandidateRequest,
+    SummaryConsolidation,
+    SummaryProposal,
+    SummaryScope,
 )
 from mindbridge.contracts import RecallFilters, RecallQuery, RecallRequest
 from mindbridge.core import (
@@ -58,6 +63,7 @@ from mindbridge.core import (
     MediaKind,
     MediaObject,
     MediaObjectId,
+    MemoryId,
     MemoryIntegrityError,
     MemoryType,
     ModelReference,
@@ -251,6 +257,46 @@ class CoordinatedClaimConsolidator(RecordingClaimConsolidator):
             self._ready.set()
         await asyncio.wait_for(self._ready.wait(), timeout=2)
         return consolidation
+
+
+class RecordingSummaryConsolidator:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def propose_summaries(
+        self,
+        candidates: tuple[SummaryCandidate, ...],
+        evidence: tuple[ResolvedEvidence, ...],
+    ) -> SummaryConsolidation:
+        self.calls += 1
+        assert {item.evidence_span.evidence_id for item in evidence} == {
+            evidence_id for candidate in candidates for evidence_id in candidate.memory.evidence_ids
+        }
+        return _summary_consolidation(candidates)
+
+
+class CoordinatedSummaryConsolidator(RecordingSummaryConsolidator):
+    """Hold two stale Summary proposals until both workers are ready to commit."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._ready = asyncio.Event()
+
+    async def propose_summaries(
+        self,
+        candidates: tuple[SummaryCandidate, ...],
+        evidence: tuple[ResolvedEvidence, ...],
+    ) -> SummaryConsolidation:
+        consolidation = await super().propose_summaries(candidates, evidence)
+        revision = f"summary-serving-revision-{self.calls:02d}"
+        if self.calls == 2:
+            self._ready.set()
+        await asyncio.wait_for(self._ready.wait(), timeout=2)
+        return SummaryConsolidation(
+            summaries=consolidation.summaries,
+            model_reference=ModelReference(model_id="qwen3.8-max", revision=revision),
+            prompt_version=consolidation.prompt_version,
+        )
 
 
 class DeterministicSigner:
@@ -862,6 +908,97 @@ async def test_claim_consolidation_is_atomic_versioned_and_forget_safe(
     ) == (None, None, None)
 
 
+async def test_summary_consolidation_is_atomic_recallable_and_retry_safe(
+    store: PostgresMemoryStore,
+    database_url: str,
+) -> None:
+    tenant_id, first_observation_id, first_job_id = await _write_source_observation(
+        store,
+        "tenant_summary_commit",
+        include_identity=False,
+    )
+    _, second_observation_id, second_job_id = await _write_source_observation(
+        store,
+        "tenant_summary_commit",
+        ordinal=2,
+        occurred_at=NOW + timedelta(seconds=5),
+        include_identity=False,
+    )
+    for observation_id, job_id in (
+        (first_observation_id, first_job_id),
+        (second_observation_id, second_job_id),
+    ):
+        await ProcessObservation(
+            store,
+            RecordingPerceiver(),
+            FixedEmbedder(),
+            FixedTextEmbedder(),
+            media_url_signer=DeterministicSigner(),
+        ).run(tenant_id, observation_id, job_id)
+
+    request = SummaryCandidateRequest(
+        tenant_id=tenant_id,
+        evaluated_at=NOW + timedelta(days=2),
+        maximum_gap_seconds=10,
+        minimum_similarity=0.99,
+    )
+    with pytest.raises(DomainInvariantError, match="cloud embedding dimension"):
+        await ConsolidateSummaries(
+            store,
+            RecordingSummaryConsolidator(),
+            FixedTextEmbedder(dimension=2),
+            media_url_signer=DeterministicSigner(),
+        ).run(request)
+
+    assert await _summary_counts(database_url, tenant_id) == (0, 0, 0, 0)
+
+    coordinated = CoordinatedSummaryConsolidator()
+    results = await asyncio.gather(
+        *(
+            ConsolidateSummaries(
+                store,
+                coordinated,
+                FixedTextEmbedder(),
+                media_url_signer=DeterministicSigner(),
+            ).run(request)
+            for _ in range(2)
+        )
+    )
+    replay_consolidator = RecordingSummaryConsolidator()
+    replay = await ConsolidateSummaries(
+        store,
+        replay_consolidator,
+        FixedTextEmbedder(),
+        media_url_signer=DeterministicSigner(),
+    ).run(request)
+
+    assert sorted(result.committed_count for result in results) == [0, 1]
+    assert replay.candidate_count == 0
+    assert replay.committed_count == 0
+    assert coordinated.calls == 2
+    assert replay_consolidator.calls == 0
+    assert await _summary_counts(database_url, tenant_id) == (1, 2, 4, 1)
+
+    matches = await store.search_embeddings(
+        EmbeddingSearch(
+            tenant_id=tenant_id,
+            values=(1.0,) + (0.0,) * 1_023,
+            space_reference=EmbeddingSpaceReference(space_id="jina-v5", revision="space-v1"),
+            document_task="retrieval_document",
+            object_types=(EmbeddedObjectType.MEMORY_RECORD,),
+            limit=20,
+        )
+    )
+    memories = await store.search_memories_by_ids(
+        RecallRequest(tenant_id=tenant_id, query=RecallQuery(text="repair session")),
+        tuple(MemoryId(match.object_id) for match in matches),
+        limit=20,
+    )
+    assert [memory.summary for memory in memories] == [
+        "Across the session, a person kept a red tool beside a blue toolbox."
+    ]
+
+
 async def test_superseded_attempt_cannot_commit(
     store: PostgresMemoryStore,
     database_url: str,
@@ -1023,6 +1160,27 @@ def _claim_consolidation(candidates: tuple[ClaimCandidate, ...]) -> ClaimConsoli
     )
 
 
+def _summary_consolidation(
+    candidates: tuple[SummaryCandidate, ...],
+) -> SummaryConsolidation:
+    assert len(candidates) == 4
+    return SummaryConsolidation(
+        summaries=(
+            SummaryProposal(
+                source_memory_ids=tuple(candidate.memory.memory_id for candidate in candidates),
+                scope=SummaryScope.SESSION,
+                summary="Across the session, a person kept a red tool beside a blue toolbox.",
+                salience=0.9,
+            ),
+        ),
+        model_reference=ModelReference(
+            model_id="qwen3.8-max",
+            revision="summary-serving-revision-01",
+        ),
+        prompt_version="consolidate_summaries_v1",
+    )
+
+
 async def _derived_counts(database_url: str, tenant_id: TenantId) -> DerivedCounts:
     connection = await AsyncConnection.connect(database_url)
     async with connection:
@@ -1133,6 +1291,42 @@ async def _semantic_claim_counts(
             )
         ).fetchone()
     return cast(tuple[int, int, int, int, int], row)
+
+
+async def _summary_counts(
+    database_url: str,
+    tenant_id: TenantId,
+) -> tuple[int, int, int, int]:
+    connection = await AsyncConnection.connect(database_url)
+    async with connection:
+        row = await (
+            await connection.execute(
+                """
+                WITH summary AS (
+                    SELECT memory_id FROM memory_records
+                    WHERE tenant_id = %s
+                      AND model_revision LIKE 'summary-serving-revision-%%'
+                )
+                SELECT
+                    (SELECT count(*) FROM summary),
+                    (SELECT count(*) FROM memory_evidence AS link
+                     WHERE link.tenant_id = %s
+                       AND link.memory_id IN (SELECT memory_id FROM summary)),
+                    (SELECT count(*) FROM relations AS relation
+                     WHERE relation.tenant_id = %s
+                       AND relation.source_type = 'memory_record'
+                       AND relation.source_id IN (SELECT memory_id FROM summary)
+                       AND relation.relation_type = 'contains'
+                       AND relation.target_type = 'memory_record'),
+                    (SELECT count(*) FROM embeddings AS embedding
+                     WHERE embedding.tenant_id = %s
+                       AND embedding.object_type = 'memory_record'
+                       AND embedding.object_id IN (SELECT memory_id FROM summary))
+                """,
+                (tenant_id,) * 4,
+            )
+        ).fetchone()
+    return cast(tuple[int, int, int, int], row)
 
 
 async def _claim_version_state(

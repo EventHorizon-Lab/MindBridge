@@ -25,6 +25,7 @@ from mindbridge.application import (
     ObservationWriteResult,
     SummaryCandidatePage,
     SummaryCandidateRequest,
+    SummaryWrite,
 )
 from mindbridge.contracts import RecallRequest
 from mindbridge.core import (
@@ -90,6 +91,7 @@ from mindbridge.infrastructure._postgres_observation_reads import (
 from mindbridge.infrastructure._postgres_observations import write_observation
 from mindbridge.infrastructure._postgres_processing import commit_observation_processing
 from mindbridge.infrastructure._postgres_summary_consolidation import list_summary_candidates
+from mindbridge.infrastructure._postgres_summary_writes import commit_summary_consolidation
 from mindbridge.infrastructure._postgres_types import DatabaseConnection, DatabasePool
 
 
@@ -192,6 +194,14 @@ class PostgresMemoryStore:
     ) -> SummaryCandidatePage:
         """Discover a stable bounded page for hierarchical Summary verification."""
         return await list_summary_candidates(self._pool, request)
+
+    async def commit_summary_consolidation(
+        self,
+        tenant_id: TenantId,
+        writes: tuple[SummaryWrite, ...],
+    ) -> int:
+        """Atomically persist disjoint Summary parents and their aligned vectors."""
+        return await commit_summary_consolidation(self._pool, tenant_id, writes)
 
     async def commit_claim_consolidation(
         self,
