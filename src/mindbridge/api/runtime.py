@@ -13,6 +13,7 @@ from mcp.server import MCPServer
 from mindbridge.api.app import create_app
 from mindbridge.api.mcp import create_mcp_server
 from mindbridge.application import MemoryKernel
+from mindbridge.configuration import optional_environment_value, require_environment_value
 from mindbridge.infrastructure import (
     CeleryObservationJobPublisher,
     PostgresMemoryStore,
@@ -75,16 +76,20 @@ class RuntimeSettings:
         """Read only documented variables and fail before starting on omissions."""
         source = os.environ if environ is None else environ
         return cls(
-            database_url=_required(source, "MINDBRIDGE_DATABASE_URL"),
-            object_storage_bucket=_required(source, "MINDBRIDGE_OBJECT_STORAGE_BUCKET"),
-            object_storage_endpoint_url=_optional(source, "MINDBRIDGE_OBJECT_STORAGE_ENDPOINT_URL"),
+            database_url=require_environment_value(source, "MINDBRIDGE_DATABASE_URL"),
+            object_storage_bucket=require_environment_value(
+                source, "MINDBRIDGE_OBJECT_STORAGE_BUCKET"
+            ),
+            object_storage_endpoint_url=optional_environment_value(
+                source, "MINDBRIDGE_OBJECT_STORAGE_ENDPOINT_URL"
+            ),
             object_storage_region=source.get("MINDBRIDGE_OBJECT_STORAGE_REGION", "us-east-1"),
-            task_broker_url=_required(source, "MINDBRIDGE_TASK_BROKER_URL"),
-            vlm_api_key=_required(source, "MINDBRIDGE_VLM_API_KEY"),
-            vlm_endpoint=_required(source, "MINDBRIDGE_VLM_ENDPOINT"),
+            task_broker_url=require_environment_value(source, "MINDBRIDGE_TASK_BROKER_URL"),
+            vlm_api_key=require_environment_value(source, "MINDBRIDGE_VLM_API_KEY"),
+            vlm_endpoint=require_environment_value(source, "MINDBRIDGE_VLM_ENDPOINT"),
             vlm_model_id=source.get("MINDBRIDGE_VLM_MODEL_ID", DEFAULT_OMNI_MODEL_ID),
-            embedding_api_key=_required(source, "MINDBRIDGE_EMBEDDING_API_KEY"),
-            embedding_endpoint=_required(source, "MINDBRIDGE_EMBEDDING_ENDPOINT"),
+            embedding_api_key=require_environment_value(source, "MINDBRIDGE_EMBEDDING_API_KEY"),
+            embedding_endpoint=require_environment_value(source, "MINDBRIDGE_EMBEDDING_ENDPOINT"),
             embedding_model_id=source.get(
                 "MINDBRIDGE_EMBEDDING_MODEL_ID", DEFAULT_JINA_OMNI_MODEL_ID
             ),
@@ -172,15 +177,3 @@ def _build_runtime(settings: RuntimeSettings) -> _ProductionRuntime:
         recall_embedder=recall_embedder,
     )
     return _ProductionRuntime(kernel, store, answerer, recall_embedder)
-
-
-def _required(environ: Mapping[str, str], name: str) -> str:
-    value = environ.get(name)
-    if value is None or not value.strip():
-        raise ValueError(f"{name} must be configured")
-    return value
-
-
-def _optional(environ: Mapping[str, str], name: str) -> str | None:
-    value = environ.get(name)
-    return value if value is not None and value.strip() else None
