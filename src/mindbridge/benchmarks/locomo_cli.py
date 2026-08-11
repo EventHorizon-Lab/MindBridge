@@ -15,6 +15,12 @@ from typing import Literal
 from pydantic import AwareDatetime, Field
 
 from mindbridge.application.recall import RETRIEVAL_DOCUMENT_EMBEDDING_TASK
+from mindbridge.benchmarks.artifacts import (
+    require_writable_output_pair,
+    sha256_file,
+    sidecar_manifest_path,
+    write_text_atomically,
+)
 from mindbridge.benchmarks.locomo import LOCOMO_ADAPTER_VERSION, LoCoMoConversation, load_locomo
 from mindbridge.benchmarks.locomo_runner import (
     LOCOMO_ABSTENTION,
@@ -84,7 +90,7 @@ def main() -> None:
     """Run selected official conversations and emit predictions plus a manifest."""
     arguments = _parse_arguments()
     conversations = _select_conversations(load_locomo(arguments.dataset_path), arguments.sample_ids)
-    _require_writable_outputs(arguments.output_path, overwrite=arguments.overwrite)
+    require_writable_output_pair(arguments.output_path, overwrite=arguments.overwrite)
     results = asyncio.run(_run_conversations(arguments, conversations))
     _write_artifacts(arguments, conversations, results)
 
@@ -132,7 +138,7 @@ def _write_artifacts(
         adapter_version=LOCOMO_ADAPTER_VERSION,
         source_repository="snap-research/locomo",
         source_revision=arguments.source_revision,
-        source_sha256=_sha256(arguments.dataset_path),
+        source_sha256=sha256_file(arguments.dataset_path),
         code_revision=arguments.code_revision,
         answer_model_id=arguments.answer_model_id,
         answer_model_revision=arguments.answer_model_revision,
@@ -151,11 +157,11 @@ def _write_artifacts(
         predictions_sha256=hashlib.sha256(predictions.encode("utf-8")).hexdigest(),
         completed_at=datetime.now(timezone.utc),
     )
-    _write_text_atomically(arguments.output_path, predictions)
-    manifest_path = arguments.output_path.with_suffix(
-        arguments.output_path.suffix + ".manifest.json"
+    write_text_atomically(arguments.output_path, predictions)
+    write_text_atomically(
+        sidecar_manifest_path(arguments.output_path),
+        manifest.model_dump_json(indent=2) + "\n",
     )
-    _write_text_atomically(manifest_path, manifest.model_dump_json(indent=2) + "\n")
 
 
 def _select_conversations(
@@ -172,28 +178,6 @@ def _select_conversations(
     if missing:
         raise ValueError(f"unknown LoCoMo sample IDs: {', '.join(sorted(missing))}")
     return selected
-
-
-def _require_writable_outputs(output_path: Path, *, overwrite: bool) -> None:
-    manifest_path = output_path.with_suffix(output_path.suffix + ".manifest.json")
-    existing = [path for path in (output_path, manifest_path) if path.exists()]
-    if existing and not overwrite:
-        raise FileExistsError(f"output already exists: {existing[0]}")
-
-
-def _write_text_atomically(path: Path, content: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary_path = path.with_suffix(path.suffix + ".tmp")
-    temporary_path.write_text(content, encoding="utf-8")
-    temporary_path.replace(path)
-
-
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as source:
-        for chunk in iter(lambda: source.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def _parse_arguments() -> _Arguments:

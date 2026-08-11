@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
 
 from pydantic import AwareDatetime, Field
 
+from mindbridge.benchmarks.artifacts import sha256_file
 from mindbridge.benchmarks.locomo import LOCOMO_ADAPTER_VERSION, load_locomo
 from mindbridge.benchmarks.m3_bench import (
     M3_BENCH_ADAPTER_VERSION,
@@ -60,7 +60,7 @@ def run_dataset_adapter_smoke(
                 source_repository="snap-research/locomo",
                 source_revision=locomo_revision,
                 source_file=locomo_path.name,
-                source_sha256=_sha256(locomo_path),
+                source_sha256=sha256_file(locomo_path),
                 adapter_version=LOCOMO_ADAPTER_VERSION,
                 context_count=len(locomo),
                 memory_item_count=sum(len(item.turns) for item in locomo),
@@ -103,20 +103,12 @@ def _m3_summary(
         source_repository="ByteDance-Seed/m3-agent",
         source_revision=source_revision,
         source_file=source_path.name,
-        source_sha256=_sha256(source_path),
+        source_sha256=sha256_file(source_path),
         adapter_version=M3_BENCH_ADAPTER_VERSION,
         context_count=len(videos),
         memory_item_count=len(videos),
         question_count=sum(len(video.questions) for video in videos),
     )
-
-
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as source:
-        for chunk in iter(lambda: source.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 if __name__ == "__main__":

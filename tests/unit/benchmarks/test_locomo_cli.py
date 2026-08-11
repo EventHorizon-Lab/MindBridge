@@ -7,11 +7,11 @@ from pathlib import Path
 
 import pytest
 
+from mindbridge.benchmarks.artifacts import require_writable_output_pair
 from mindbridge.benchmarks.locomo import LoCoMoConversation, LoCoMoQuestion, LoCoMoTurn
 from mindbridge.benchmarks.locomo_cli import (
     LoCoMoRunManifest,
     _Arguments,
-    _require_writable_outputs,
     _select_conversations,
     _write_artifacts,
 )
@@ -59,7 +59,7 @@ def test_locomo_artifacts_pin_source_system_code_and_output(tmp_path: Path) -> N
     assert manifest.question_count == 1
     assert manifest.predictions_sha256 == hashlib.sha256(output_path.read_bytes()).hexdigest()
     with pytest.raises(FileExistsError):
-        _require_writable_outputs(output_path, overwrite=False)
+        require_writable_output_pair(output_path, overwrite=False)
 
 
 def test_locomo_subset_selection_rejects_unknown_samples() -> None:
