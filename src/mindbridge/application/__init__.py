@@ -4,6 +4,9 @@ from mindbridge.application.consolidation import (
     EpisodeCandidatePage,
     EpisodeCandidateRequest,
     EpisodeCandidateStore,
+    EpisodeConsolidation,
+    EpisodeConsolidator,
+    EpisodeProposal,
 )
 from mindbridge.application.evidence import resolve_evidence_media
 from mindbridge.application.kernel import MemoryKernel
@@ -74,6 +77,9 @@ __all__ = [
     "EpisodeCandidatePage",
     "EpisodeCandidateRequest",
     "EpisodeCandidateStore",
+    "EpisodeConsolidation",
+    "EpisodeConsolidator",
+    "EpisodeProposal",
     "EventPerception",
     "EvolveMemoryLifecycle",
     "FeedbackWriteResult",
