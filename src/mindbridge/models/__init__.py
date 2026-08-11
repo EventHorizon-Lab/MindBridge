@@ -12,14 +12,20 @@ from mindbridge.models.openai_omni import (
     OpenAIOmniAnswerer,
     normalize_openai_base_url,
 )
+from mindbridge.models.openai_perception import (
+    PERCEIVE_EVENTS_PROMPT_VERSION,
+    OpenAIOmniEventPerceiver,
+)
 
 __all__ = [
     "ANSWER_FROM_EVIDENCE_PROMPT_VERSION",
     "DEFAULT_JINA_OMNI_DIMENSION",
     "DEFAULT_JINA_OMNI_MODEL_ID",
     "DEFAULT_OMNI_MODEL_ID",
+    "PERCEIVE_EVENTS_PROMPT_VERSION",
     "JinaModality",
     "JinaOmniEmbedder",
     "OpenAIOmniAnswerer",
+    "OpenAIOmniEventPerceiver",
     "normalize_openai_base_url",
 ]

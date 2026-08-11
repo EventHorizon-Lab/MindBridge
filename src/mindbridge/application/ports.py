@@ -116,6 +116,40 @@ class GeneratedAnswer:
 
 
 @dataclass(frozen=True, slots=True)
+class PerceivedEvent:
+    """One schema-validated semantic interval proposed by an Omni model."""
+
+    start_ms: int
+    end_ms: int
+    description: str
+    salience: float
+    evidence_ids: tuple[EvidenceId, ...]
+
+    def __post_init__(self) -> None:
+        if self.start_ms < 0 or self.end_ms < self.start_ms:
+            raise DomainInvariantError("perceived event time range is invalid")
+        if not self.description.strip():
+            raise DomainInvariantError("perceived event description must not be empty")
+        if not math.isfinite(self.salience) or not 0.0 <= self.salience <= 1.0:
+            raise DomainInvariantError("perceived event salience must be between 0 and 1")
+        if not self.evidence_ids or len(set(self.evidence_ids)) != len(self.evidence_ids):
+            raise DomainInvariantError("perceived event evidence IDs must be non-empty and unique")
+
+
+@dataclass(frozen=True, slots=True)
+class EventPerception:
+    """Reproducible event proposals and the frozen model that produced them."""
+
+    events: tuple[PerceivedEvent, ...]
+    model_reference: ModelReference
+    prompt_version: str
+
+    def __post_init__(self) -> None:
+        if not self.prompt_version.strip():
+            raise DomainInvariantError("perception prompt version must not be empty")
+
+
+@dataclass(frozen=True, slots=True)
 class EmbeddingSearch:
     """One normalized query against a single frozen embedding space."""
 
@@ -194,6 +228,16 @@ class MemoryAnswerer(Protocol):
         memories: tuple[MemoryRecord, ...],
         evidence: tuple[ResolvedEvidence, ...],
     ) -> GeneratedAnswer: ...
+
+
+class ObservationPerceiver(Protocol):
+    """Frozen Omni boundary that inspects original observation evidence."""
+
+    async def perceive_events(
+        self,
+        observation: Observation,
+        evidence: tuple[ResolvedEvidence, ...],
+    ) -> EventPerception: ...
 
 
 class MediaUrlSigner(Protocol):
