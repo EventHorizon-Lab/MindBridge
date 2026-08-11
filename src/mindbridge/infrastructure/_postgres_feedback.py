@@ -25,7 +25,11 @@ from mindbridge.infrastructure._postgres_memories import (
     find_memory_on_connection,
     write_memory_on_connection,
 )
-from mindbridge.infrastructure._postgres_types import DatabaseConnection, DatabasePool
+from mindbridge.infrastructure._postgres_types import (
+    DatabaseConnection,
+    DatabasePool,
+    tenant_connection,
+)
 
 FeedbackRow: TypeAlias = tuple[
     str,
@@ -47,7 +51,7 @@ async def record_feedback(
     content_digest: str,
 ) -> FeedbackWriteResult:
     """Atomically record feedback, lifecycle counters, and any correction version."""
-    async with pool.connection() as connection:
+    async with tenant_connection(pool, feedback.tenant_id) as connection:
         existing_id = await claim_idempotency_key(
             connection,
             tenant_id=feedback.tenant_id,

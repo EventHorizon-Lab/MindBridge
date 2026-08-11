@@ -19,7 +19,11 @@ from mindbridge.core import (
     ObservationProcessingJob,
     TenantId,
 )
-from mindbridge.infrastructure._postgres_types import DatabaseConnection, DatabasePool
+from mindbridge.infrastructure._postgres_types import (
+    DatabaseConnection,
+    DatabasePool,
+    tenant_connection,
+)
 
 PROCESS_OBSERVATION_JOB_TYPE = "process_observation"
 OBSERVATION_JOB_STALE_AFTER_SECONDS = 960
@@ -86,7 +90,7 @@ async def claim_observation_processing_job(
 ) -> ObservationJobClaim:
     """Atomically claim a ready or stale job without concurrent ownership."""
     _require_expected_job_id(observation_id, job_id)
-    async with pool.connection() as connection:
+    async with tenant_connection(pool, tenant_id) as connection:
         cursor = await connection.execute(
             """
             UPDATE jobs
@@ -125,7 +129,7 @@ async def read_observation_processing_job(
     job_id: JobId,
 ) -> ObservationProcessingJob:
     """Read one tenant-owned processing job without exposing its payload."""
-    async with pool.connection() as connection:
+    async with tenant_connection(pool, tenant_id) as connection:
         job = await _find_observation_processing_job(connection, tenant_id, job_id)
     if job is None:
         raise JobNotFoundError("observation processing job does not exist")
@@ -208,7 +212,7 @@ async def _finish_observation_processing_job(
     state: JobState,
     error_code: str | None,
 ) -> ObservationProcessingJob:
-    async with pool.connection() as connection:
+    async with tenant_connection(pool, tenant_id) as connection:
         return await _finish_observation_processing_job_on_connection(
             connection,
             tenant_id,

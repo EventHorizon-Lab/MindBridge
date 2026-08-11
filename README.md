@@ -42,6 +42,11 @@ for migration in migrations/*.sql; do
 done
 ```
 
+Migration `0005` creates a non-login `mindbridge_runtime` role, grants the migration user
+membership, and enables forced tenant RLS on every table containing `tenant_id`. Each store
+transaction sets one tenant locally. When migrations and the API use different database users,
+grant `mindbridge_runtime` to the API login; never give that login `SUPERUSER` or `BYPASSRLS`.
+
 Run the PostgreSQL contract tests against a disposable database whose name ends in `_test`:
 
 ```bash
@@ -274,8 +279,9 @@ by a previous run.
 
 ## Run the MaaS API
 
-The production factory reads secrets from the process environment. S3 credentials use Boto3's
-standard AWS credential chain and are not copied into MindBridge configuration:
+The production factory reads secrets from the process environment. The database login must be able
+to `SET ROLE mindbridge_runtime`. S3 credentials use Boto3's standard AWS credential chain and are
+not copied into MindBridge configuration:
 
 ```bash
 export MINDBRIDGE_DATABASE_URL=postgresql://mindbridge:password@localhost:5432/mindbridge

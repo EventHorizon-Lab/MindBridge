@@ -28,7 +28,11 @@ from mindbridge.infrastructure._postgres_jobs import (
     mark_observation_processing_succeeded_on_connection,
 )
 from mindbridge.infrastructure._postgres_memories import write_memory_on_connection
-from mindbridge.infrastructure._postgres_types import DatabaseConnection, DatabasePool
+from mindbridge.infrastructure._postgres_types import (
+    DatabaseConnection,
+    DatabasePool,
+    tenant_connection,
+)
 
 
 async def commit_observation_processing(
@@ -43,7 +47,7 @@ async def commit_observation_processing(
     """Commit all derived records and successful job state in one transaction."""
     _require_output_identity(tenant_id, observation_id, output)
     try:
-        async with pool.connection() as connection:
+        async with tenant_connection(pool, tenant_id) as connection:
             await ensure_target_not_tombstoned(
                 connection,
                 tenant_id,

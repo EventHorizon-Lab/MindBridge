@@ -121,6 +121,29 @@ async def test_migration_installs_complete_phase_zero_schema(database_url: str) 
                 """
             )
         ).fetchall()
+        row_secured_tables = await (
+            await connection.execute(
+                """
+                SELECT column_info.table_name
+                FROM information_schema.columns AS column_info
+                JOIN pg_class AS relation ON relation.relname = column_info.table_name
+                JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+                WHERE column_info.table_schema = 'public'
+                  AND column_info.column_name = 'tenant_id'
+                  AND namespace.nspname = 'public'
+                  AND relation.relrowsecurity
+                  AND relation.relforcerowsecurity
+                """
+            )
+        ).fetchall()
+        policy_tables = await (
+            await connection.execute(
+                """
+                SELECT tablename FROM pg_policies
+                WHERE schemaname = 'public' AND policyname = 'tenant_isolation'
+                """
+            )
+        ).fetchall()
 
     assert cast(tuple[str], extension)[0] == "0.8.2"
     assert {
@@ -132,12 +155,35 @@ async def test_migration_installs_complete_phase_zero_schema(database_url: str) 
         "memory_records",
         "observations",
     } <= {cast(tuple[str], row)[0] for row in tables}
+    tenant_tables = {
+        "claim_evidence",
+        "claims",
+        "deletion_tombstones",
+        "embeddings",
+        "entities",
+        "entity_mentions",
+        "event_evidence",
+        "event_observations",
+        "events",
+        "evidence_spans",
+        "idempotency_keys",
+        "jobs",
+        "media_objects",
+        "memory_evidence",
+        "memory_feedback",
+        "memory_records",
+        "observation_media",
+        "observations",
+        "relations",
+    }
+    assert {cast(tuple[str], row)[0] for row in row_secured_tables} == tenant_tables
+    assert {cast(tuple[str], row)[0] for row in policy_tables} == tenant_tables
     connection = await AsyncConnection.connect(database_url)
     async with connection:
         versions = await (
             await connection.execute("SELECT version FROM schema_migrations ORDER BY version")
         ).fetchall()
-    assert [cast(tuple[int], row)[0] for row in versions] == [1, 2, 3, 4]
+    assert [cast(tuple[int], row)[0] for row in versions] == [1, 2, 3, 4, 5]
 
 
 async def test_postgres_vertical_path_is_idempotent_and_evidence_first(

@@ -11,7 +11,11 @@ from mindbridge.core import (
     PixelRegion,
     TenantId,
 )
-from mindbridge.infrastructure._postgres_types import DatabaseConnection, DatabasePool
+from mindbridge.infrastructure._postgres_types import (
+    DatabaseConnection,
+    DatabasePool,
+    tenant_connection,
+)
 
 EvidenceRow: TypeAlias = tuple[
     str,
@@ -46,7 +50,7 @@ async def read_evidence(
     """Read evidence spans in caller order without crossing tenants."""
     if not evidence_ids:
         return ()
-    async with pool.connection() as connection:
+    async with tenant_connection(pool, tenant_id) as connection:
         cursor = await connection.execute(
             f"{EVIDENCE_SELECT_SQL} WHERE tenant_id = %s AND evidence_id = ANY(%s)",
             (tenant_id, list(evidence_ids)),

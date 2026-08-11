@@ -21,7 +21,11 @@ from mindbridge.infrastructure._postgres_forget import (
 from mindbridge.infrastructure._postgres_idempotency import claim_idempotency_key
 from mindbridge.infrastructure._postgres_jobs import ensure_observation_processing_job
 from mindbridge.infrastructure._postgres_observation_reads import read_observation
-from mindbridge.infrastructure._postgres_types import DatabaseConnection, DatabasePool
+from mindbridge.infrastructure._postgres_types import (
+    DatabaseConnection,
+    DatabasePool,
+    tenant_connection,
+)
 
 
 async def write_observation(
@@ -33,7 +37,7 @@ async def write_observation(
 ) -> ObservationWriteResult:
     """Write an observation atomically or return its idempotent predecessor."""
     observation = batch.observation
-    async with pool.connection() as connection:
+    async with tenant_connection(pool, observation.tenant_id) as connection:
         await ensure_target_not_tombstoned(
             connection,
             observation.tenant_id,

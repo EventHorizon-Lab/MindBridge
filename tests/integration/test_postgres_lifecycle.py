@@ -3,6 +3,8 @@
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from psycopg import AsyncConnection
+from psycopg.errors import InsufficientPrivilege
 
 from mindbridge.application import (
     EvolveMemoryLifecycle,
@@ -90,6 +92,38 @@ async def test_postgres_lifecycle_does_not_overwrite_concurrent_feedback(
     assert updated_count == 0
     assert stored.positive_feedback_count == 1
     assert stored.state is MemoryState.STRENGTHENED
+
+
+async def test_postgres_runtime_role_enforces_tenant_row_security(
+    store: PostgresMemoryStore,
+    database_url: str,
+) -> None:
+    tenant_a = TenantId("tenant_rls_a")
+    tenant_b = TenantId("tenant_rls_b")
+    memory_a = _memory(tenant_a, "memory_rls_a", NOW)
+    memory_b = _memory(tenant_b, "memory_rls_b", NOW)
+    await _write_memory(store, memory_a)
+    await _write_memory(store, memory_b)
+
+    connection = await AsyncConnection.connect(database_url)
+    async with connection:
+        await connection.execute("SET ROLE mindbridge_runtime")
+        await connection.execute(
+            "SELECT set_config('mindbridge.tenant_id', %s, true)",
+            (tenant_a,),
+        )
+        rows = await (
+            await connection.execute(
+                "SELECT tenant_id FROM memory_records ORDER BY tenant_id, memory_id"
+            )
+        ).fetchall()
+
+        assert {row[0] for row in rows} == {tenant_a}
+        with pytest.raises(InsufficientPrivilege):
+            await connection.execute(
+                "UPDATE memory_records SET tenant_id = %s WHERE tenant_id = %s AND memory_id = %s",
+                (tenant_b, tenant_a, memory_a.memory_id),
+            )
 
 
 async def _write_memory(store: PostgresMemoryStore, memory: MemoryRecord) -> None:

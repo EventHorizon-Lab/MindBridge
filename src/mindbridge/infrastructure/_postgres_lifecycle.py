@@ -10,7 +10,7 @@ from mindbridge.infrastructure._postgres_memory_rows import (
     MemoryRow,
     memory_from_row,
 )
-from mindbridge.infrastructure._postgres_types import DatabasePool
+from mindbridge.infrastructure._postgres_types import DatabasePool, tenant_connection
 
 
 async def list_memories_for_lifecycle(
@@ -23,7 +23,7 @@ async def list_memories_for_lifecycle(
     """Read one stable ID-ordered page without deleted or superseded records."""
     if not 1 <= limit <= 1_001:
         raise DomainInvariantError("lifecycle storage limit must be between 1 and 1001")
-    async with pool.connection() as connection:
+    async with tenant_connection(pool, tenant_id) as connection:
         cursor = await connection.execute(
             f"""
             {MEMORY_SELECT_SQL}
@@ -44,8 +44,13 @@ async def update_memory_lifecycles(
     changes: tuple[MemoryLifecycleChange, ...],
 ) -> int:
     """Apply score/state changes only while every scoring input remains unchanged."""
+    if not changes:
+        return 0
+    tenant_id = changes[0].previous.tenant_id
+    if any(change.previous.tenant_id != tenant_id for change in changes):
+        raise DomainInvariantError("one lifecycle update batch cannot cross tenants")
     updated_count = 0
-    async with pool.connection() as connection:
+    async with tenant_connection(pool, tenant_id) as connection:
         for change in changes:
             previous = change.previous
             cursor = await connection.execute(

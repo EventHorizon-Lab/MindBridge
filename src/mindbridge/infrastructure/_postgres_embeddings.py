@@ -11,14 +11,18 @@ from mindbridge.core import (
     EmbeddingRecord,
     MemoryIntegrityError,
 )
-from mindbridge.infrastructure._postgres_types import DatabaseConnection, DatabasePool
+from mindbridge.infrastructure._postgres_types import (
+    DatabaseConnection,
+    DatabasePool,
+    tenant_connection,
+)
 
 CLOUD_EMBEDDING_DIMENSION = 1_024
 
 
 async def write_embedding(pool: DatabasePool, embedding: EmbeddingRecord) -> bool:
     """Insert one immutable model-versioned vector; return false for a retry."""
-    async with pool.connection() as connection:
+    async with tenant_connection(pool, embedding.tenant_id) as connection:
         return await write_embedding_on_connection(connection, embedding)
 
 
@@ -93,7 +97,7 @@ async def search_embeddings(
     """Return nearest objects only from the requested model version and task."""
     _require_cloud_dimension(len(search.values))
     vector = Vector(list(search.values))
-    async with pool.connection() as connection:
+    async with tenant_connection(pool, search.tenant_id) as connection:
         cursor = await connection.execute(
             """
             SELECT embedding_id,

@@ -22,7 +22,11 @@ from mindbridge.infrastructure._postgres_forget_cleanup import (
     lock_exclusive_observation_media,
 )
 from mindbridge.infrastructure._postgres_idempotency import claim_idempotency_key
-from mindbridge.infrastructure._postgres_types import DatabaseConnection, DatabasePool
+from mindbridge.infrastructure._postgres_types import (
+    DatabaseConnection,
+    DatabasePool,
+    tenant_connection,
+)
 
 TombstoneRow: TypeAlias = tuple[
     str,
@@ -44,7 +48,7 @@ async def prepare_forget(
     content_digest: str,
 ) -> ForgetPlan:
     """Persist the deletion barrier and plan remaining object-store erasure."""
-    async with pool.connection() as connection:
+    async with tenant_connection(pool, tombstone.tenant_id) as connection:
         existing_id = await claim_idempotency_key(
             connection,
             tenant_id=tombstone.tenant_id,
@@ -93,7 +97,7 @@ async def read_deletion_tombstone(
     tombstone_id: TombstoneId,
 ) -> DeletionTombstone:
     """Read content-free deletion progress without crossing tenants."""
-    async with pool.connection() as connection:
+    async with tenant_connection(pool, tenant_id) as connection:
         tombstone = await _find_tombstone(connection, tenant_id, tombstone_id)
     if tombstone is None:
         raise ForgetTargetNotFoundError("deletion tombstone does not exist")
@@ -108,7 +112,7 @@ async def list_deletion_tombstones(
     limit: int,
 ) -> tuple[DeletionTombstone, ...]:
     """List one stable tenant page after an optional tombstone cursor."""
-    async with pool.connection() as connection:
+    async with tenant_connection(pool, tenant_id) as connection:
         cursor = await connection.execute(
             """
             SELECT tombstone_id, tenant_id, target_type, target_id,
@@ -138,7 +142,7 @@ async def complete_forget(
     completed_at: datetime,
 ) -> DeletionTombstone:
     """Erase database derivatives and atomically mark propagation complete."""
-    async with pool.connection() as connection:
+    async with tenant_connection(pool, tombstone.tenant_id) as connection:
         stored = await _require_matching_tombstone(connection, tombstone)
         if stored.propagation_state is DeletionPropagationState.COMPLETE:
             return stored
@@ -158,7 +162,7 @@ async def mark_forget_failed(
     error_code: str,
 ) -> DeletionTombstone:
     """Retain a sanitized recoverable failure while the barrier stays active."""
-    async with pool.connection() as connection:
+    async with tenant_connection(pool, tombstone.tenant_id) as connection:
         stored = await _require_matching_tombstone(connection, tombstone)
         if stored.propagation_state is DeletionPropagationState.COMPLETE:
             return stored

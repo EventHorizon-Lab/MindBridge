@@ -18,7 +18,11 @@ from mindbridge.core import (
 from mindbridge.infrastructure._postgres_evidence import read_observation_evidence
 from mindbridge.infrastructure._postgres_forget import ensure_target_not_tombstoned
 from mindbridge.infrastructure._postgres_media import read_media_objects_on_connection
-from mindbridge.infrastructure._postgres_types import DatabaseConnection, DatabasePool
+from mindbridge.infrastructure._postgres_types import (
+    DatabaseConnection,
+    DatabasePool,
+    tenant_connection,
+)
 
 ObservationRow: TypeAlias = tuple[
     str,
@@ -40,7 +44,7 @@ async def read_observation_batch(
     observation_id: ObservationId,
 ) -> ObservationBatch:
     """Read an immutable observation, media, and evidence from one snapshot."""
-    async with pool.connection() as connection:
+    async with tenant_connection(pool, tenant_id) as connection:
         observation = await read_observation(connection, tenant_id, observation_id)
         media_objects = await read_media_objects_on_connection(
             connection,
@@ -65,7 +69,7 @@ async def read_media_objects(
     media_object_ids: tuple[MediaObjectId, ...],
 ) -> tuple[MediaObject, ...]:
     """Read immutable media metadata in caller order without crossing tenants."""
-    async with pool.connection() as connection:
+    async with tenant_connection(pool, tenant_id) as connection:
         return await read_media_objects_on_connection(connection, tenant_id, media_object_ids)
 
 

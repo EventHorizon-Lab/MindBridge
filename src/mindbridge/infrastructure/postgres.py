@@ -378,4 +378,5 @@ class PostgresMemoryStore:
 
 async def _configure_connection(connection: DatabaseConnection) -> None:
     await register_vector_async(connection)
+    await connection.execute("SET ROLE mindbridge_runtime")
     await connection.commit()

@@ -28,7 +28,11 @@ from mindbridge.infrastructure._postgres_memory_rows import (
     MemoryRow,
     memory_from_row,
 )
-from mindbridge.infrastructure._postgres_types import DatabaseConnection, DatabasePool
+from mindbridge.infrastructure._postgres_types import (
+    DatabaseConnection,
+    DatabasePool,
+    tenant_connection,
+)
 
 
 async def write_memory(
@@ -39,7 +43,7 @@ async def write_memory(
     content_digest: str,
 ) -> MemoryWriteResult:
     """Write a memory atomically or return its idempotent predecessor."""
-    async with pool.connection() as connection:
+    async with tenant_connection(pool, memory.tenant_id) as connection:
         existing_id = await claim_idempotency_key(
             connection,
             tenant_id=memory.tenant_id,
@@ -71,7 +75,7 @@ async def read_memory(
     memory_id: MemoryId,
 ) -> MemoryRecord:
     """Read one memory without revealing whether its ID exists in another tenant."""
-    async with pool.connection() as connection:
+    async with tenant_connection(pool, tenant_id) as connection:
         await ensure_memory_not_tombstoned(connection, tenant_id, memory_id)
         memory = await find_memory_on_connection(connection, tenant_id, memory_id)
     if memory is None:
@@ -117,7 +121,7 @@ async def search_memories(
     request: RecallRequest,
 ) -> tuple[MemoryRecord, ...]:
     """Apply exact filters and PostgreSQL full-text candidate retrieval."""
-    async with pool.connection() as connection:
+    async with tenant_connection(pool, request.tenant_id) as connection:
         cursor = await connection.execute(_SEARCH_MEMORIES_SQL, _recall_parameters(request))
         return tuple([memory_from_row(cast(MemoryRow, row)) async for row in cursor])
 
@@ -136,7 +140,7 @@ async def search_memories_by_evidence(
         raise DomainInvariantError("semantic memory candidate limit must be positive")
     parameters = _recall_parameters(request)
     parameters.update(evidence_ids=list(ranked_evidence_ids), limit=limit)
-    async with pool.connection() as connection:
+    async with tenant_connection(pool, request.tenant_id) as connection:
         cursor = await connection.execute(_SEARCH_MEMORIES_BY_EVIDENCE_SQL, parameters)
         return tuple([memory_from_row(cast(MemoryRow, row)) async for row in cursor])
 
@@ -155,7 +159,7 @@ async def search_memories_by_ids(
         raise DomainInvariantError("semantic memory candidate limit must be positive")
     parameters = _recall_parameters(request)
     parameters.update(memory_ids=list(ranked_memory_ids), limit=limit)
-    async with pool.connection() as connection:
+    async with tenant_connection(pool, request.tenant_id) as connection:
         cursor = await connection.execute(_SEARCH_MEMORIES_BY_IDS_SQL, parameters)
         return tuple([memory_from_row(cast(MemoryRow, row)) async for row in cursor])
 
