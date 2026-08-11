@@ -8,15 +8,17 @@ from mindbridge.application import (
     ClaimConsolidationResult,
     ConsolidateClaims,
     ConsolidateEpisodes,
+    ConsolidateSummaries,
     EpisodeCandidateRequest,
     EpisodeConsolidationResult,
-)
-from mindbridge.consolidation_cli import (
-    ConsolidationSettings,
+    SummaryCandidateRequest,
+    SummaryConsolidationResult,
     consolidate_tenant_claims,
     consolidate_tenant_episodes,
+    consolidate_tenant_summaries,
 )
-from mindbridge.core import ClaimId, EventId, TenantId
+from mindbridge.consolidation_cli import ConsolidationSettings
+from mindbridge.core import ClaimId, EventId, MemoryId, TenantId
 
 NOW = datetime(2026, 8, 12, 12, 0, tzinfo=timezone.utc)
 
@@ -71,6 +73,29 @@ class ScriptedClaimConsolidation:
         )
 
 
+class ScriptedSummaryConsolidation:
+    def __init__(self) -> None:
+        self.requests: list[SummaryCandidateRequest] = []
+
+    async def run(self, request: SummaryCandidateRequest) -> SummaryConsolidationResult:
+        self.requests.append(request)
+        if request.after_memory_id is None:
+            return SummaryConsolidationResult(
+                scanned_count=2,
+                candidate_count=4,
+                proposed_count=1,
+                committed_count=1,
+                next_cursor=MemoryId("memory_02"),
+            )
+        return SummaryConsolidationResult(
+            scanned_count=1,
+            candidate_count=0,
+            proposed_count=0,
+            committed_count=0,
+            next_cursor=None,
+        )
+
+
 async def test_episode_sweep_accumulates_stable_pages() -> None:
     scripted = ScriptedConsolidation()
 
@@ -103,6 +128,23 @@ async def test_claim_sweep_accumulates_semantic_and_relationship_counts() -> Non
     assert (summary.page_count, summary.scanned_count, summary.candidate_count) == (2, 3, 4)
     assert (summary.committed_semantic_claim_count, summary.committed_relationship_count) == (1, 1)
     assert scripted.requests[1].after_claim_id == "claim_02"
+    assert all(request.evaluated_at == NOW for request in scripted.requests)
+
+
+async def test_summary_sweep_accumulates_stable_memory_pages() -> None:
+    scripted = ScriptedSummaryConsolidation()
+
+    summary = await consolidate_tenant_summaries(
+        cast(ConsolidateSummaries, scripted),
+        TenantId("tenant_01"),
+        NOW,
+        page_size=8,
+        maximum_gap_seconds=2_592_000,
+        minimum_similarity=0.8,
+    )
+
+    assert (summary.page_count, summary.scanned_count, summary.committed_count) == (2, 3, 1)
+    assert scripted.requests[1].after_memory_id == "memory_02"
     assert all(request.evaluated_at == NOW for request in scripted.requests)
 
 

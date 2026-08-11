@@ -1,4 +1,4 @@
-"""Scheduled evidence-verified Episode and Claim consolidation for one tenant."""
+"""Scheduled evidence-verified Episode, Claim, and Summary consolidation."""
 
 from __future__ import annotations
 
@@ -12,23 +12,20 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from mindbridge.application import (
-    ClaimCandidateRequest,
     ConsolidateClaims,
     ConsolidateEpisodes,
-    EpisodeCandidateRequest,
+    ConsolidateSummaries,
+    ConsolidationSweepSummary,
+    consolidate_tenant_claims,
+    consolidate_tenant_episodes,
+    consolidate_tenant_summaries,
 )
 from mindbridge.configuration import (
     optional_environment_value,
     parse_aware_datetime,
     require_environment_value,
 )
-from mindbridge.core import (
-    ClaimId,
-    EmbeddingSpaceReference,
-    EventId,
-    MemoryIntegrityError,
-    TenantId,
-)
+from mindbridge.core import EmbeddingSpaceReference, TenantId
 from mindbridge.infrastructure import PostgresMemoryStore, S3MediaAccess
 from mindbridge.models import (
     DEFAULT_JINA_RETRIEVAL_SPACE,
@@ -38,6 +35,7 @@ from mindbridge.models import (
     OpenAIJinaTextEmbedder,
     OpenAIOmniClaimConsolidator,
     OpenAIOmniEpisodeConsolidator,
+    OpenAIOmniSummaryConsolidator,
 )
 from mindbridge.telemetry import configure_telemetry
 
@@ -127,136 +125,6 @@ class ConsolidationSettings:
         )
 
 
-@dataclass(frozen=True, slots=True)
-class EpisodeSweepSummary:
-    """Content-free operational totals for one complete tenant sweep."""
-
-    tenant_id: TenantId
-    evaluated_at: datetime
-    page_count: int
-    scanned_count: int
-    candidate_count: int
-    proposed_count: int
-    committed_count: int
-
-
-@dataclass(frozen=True, slots=True)
-class ClaimSweepSummary:
-    """Content-free operational totals for one complete semantic Claim sweep."""
-
-    tenant_id: TenantId
-    evaluated_at: datetime
-    page_count: int
-    scanned_count: int
-    candidate_count: int
-    proposed_semantic_claim_count: int
-    proposed_relationship_count: int
-    committed_semantic_claim_count: int
-    committed_relationship_count: int
-
-
-@dataclass(frozen=True, slots=True)
-class ConsolidationSweepSummary:
-    """Episode and Claim outcomes from one scheduled tenant run."""
-
-    episodes: EpisodeSweepSummary
-    claims: ClaimSweepSummary
-
-
-async def consolidate_tenant_episodes(
-    use_case: ConsolidateEpisodes,
-    tenant_id: TenantId,
-    evaluated_at: datetime,
-    *,
-    page_size: int,
-    maximum_gap_seconds: int,
-    minimum_similarity: float,
-) -> EpisodeSweepSummary:
-    """Consolidate stable candidate pages at one fixed evaluation instant."""
-    cursor: EventId | None = None
-    page_count = scanned_count = candidate_count = proposed_count = committed_count = 0
-    while True:
-        result = await use_case.run(
-            EpisodeCandidateRequest(
-                tenant_id=tenant_id,
-                evaluated_at=evaluated_at,
-                after_event_id=cursor,
-                limit=page_size,
-                maximum_gap_seconds=maximum_gap_seconds,
-                minimum_similarity=minimum_similarity,
-            )
-        )
-        page_count += 1
-        scanned_count += result.scanned_count
-        candidate_count += result.candidate_count
-        proposed_count += result.proposed_count
-        committed_count += result.committed_count
-        if result.next_cursor is None:
-            break
-        if result.next_cursor == cursor:
-            raise MemoryIntegrityError("Episode consolidation cursor did not advance")
-        cursor = result.next_cursor
-    return EpisodeSweepSummary(
-        tenant_id=tenant_id,
-        evaluated_at=evaluated_at,
-        page_count=page_count,
-        scanned_count=scanned_count,
-        candidate_count=candidate_count,
-        proposed_count=proposed_count,
-        committed_count=committed_count,
-    )
-
-
-async def consolidate_tenant_claims(
-    use_case: ConsolidateClaims,
-    tenant_id: TenantId,
-    evaluated_at: datetime,
-    *,
-    page_size: int,
-    maximum_gap_seconds: int,
-    minimum_similarity: float,
-) -> ClaimSweepSummary:
-    """Consolidate stable Claim pages at one fixed evaluation instant."""
-    cursor: ClaimId | None = None
-    page_count = scanned_count = candidate_count = 0
-    proposed_semantic_count = proposed_relationship_count = 0
-    committed_semantic_count = committed_relationship_count = 0
-    while True:
-        result = await use_case.run(
-            ClaimCandidateRequest(
-                tenant_id=tenant_id,
-                evaluated_at=evaluated_at,
-                after_claim_id=cursor,
-                limit=page_size,
-                maximum_gap_seconds=maximum_gap_seconds,
-                minimum_similarity=minimum_similarity,
-            )
-        )
-        page_count += 1
-        scanned_count += result.scanned_count
-        candidate_count += result.candidate_count
-        proposed_semantic_count += result.proposed_semantic_claim_count
-        proposed_relationship_count += result.proposed_relationship_count
-        committed_semantic_count += result.committed_semantic_claim_count
-        committed_relationship_count += result.committed_relationship_count
-        if result.next_cursor is None:
-            break
-        if result.next_cursor == cursor:
-            raise MemoryIntegrityError("Claim consolidation cursor did not advance")
-        cursor = result.next_cursor
-    return ClaimSweepSummary(
-        tenant_id=tenant_id,
-        evaluated_at=evaluated_at,
-        page_count=page_count,
-        scanned_count=scanned_count,
-        candidate_count=candidate_count,
-        proposed_semantic_claim_count=proposed_semantic_count,
-        proposed_relationship_count=proposed_relationship_count,
-        committed_semantic_claim_count=committed_semantic_count,
-        committed_relationship_count=committed_relationship_count,
-    )
-
-
 def main(argv: Sequence[str] | None = None) -> None:
     """Run one tenant sweep using only explicit process configuration."""
     configure_telemetry("mindbridge-consolidation")
@@ -272,6 +140,9 @@ def main(argv: Sequence[str] | None = None) -> None:
             claim_page_size=options.claim_page_size,
             claim_maximum_gap_seconds=options.claim_maximum_gap_seconds,
             claim_minimum_similarity=options.claim_minimum_similarity,
+            summary_page_size=options.summary_page_size,
+            summary_maximum_gap_seconds=options.summary_maximum_gap_seconds,
+            summary_minimum_similarity=options.summary_minimum_similarity,
         )
     )
     print(json.dumps(_summary_dict(summary), sort_keys=True))
@@ -288,6 +159,9 @@ async def _run_postgres_sweep(
     claim_page_size: int,
     claim_maximum_gap_seconds: int,
     claim_minimum_similarity: float,
+    summary_page_size: int,
+    summary_maximum_gap_seconds: int,
+    summary_minimum_similarity: float,
 ) -> ConsolidationSweepSummary:
     store = PostgresMemoryStore(settings.database_url)
     media_access = S3MediaAccess(
@@ -307,6 +181,12 @@ async def _run_postgres_sweep(
         model_id=settings.vlm_model_id,
         model_revision=settings.vlm_model_revision,
     )
+    summary_consolidator = OpenAIOmniSummaryConsolidator.connect(
+        api_key=settings.vlm_api_key,
+        endpoint=settings.vlm_endpoint,
+        model_id=settings.vlm_model_id,
+        model_revision=settings.vlm_model_revision,
+    )
     text_embedder = OpenAIJinaTextEmbedder.connect(
         api_key=settings.text_embedding_api_key,
         endpoint=settings.text_embedding_endpoint,
@@ -320,6 +200,7 @@ async def _run_postgres_sweep(
     async with AsyncExitStack() as resources:
         resources.push_async_callback(consolidator.close)
         resources.push_async_callback(claim_consolidator.close)
+        resources.push_async_callback(summary_consolidator.close)
         resources.push_async_callback(text_embedder.close)
         await store.open()
         resources.push_async_callback(store.close)
@@ -349,7 +230,24 @@ async def _run_postgres_sweep(
             maximum_gap_seconds=claim_maximum_gap_seconds,
             minimum_similarity=claim_minimum_similarity,
         )
-        return ConsolidationSweepSummary(episodes=episodes, claims=claims)
+        summaries = await consolidate_tenant_summaries(
+            ConsolidateSummaries(
+                store,
+                summary_consolidator,
+                text_embedder,
+                media_url_signer=media_access,
+            ),
+            tenant_id,
+            evaluated_at,
+            page_size=summary_page_size,
+            maximum_gap_seconds=summary_maximum_gap_seconds,
+            minimum_similarity=summary_minimum_similarity,
+        )
+        return ConsolidationSweepSummary(
+            episodes=episodes,
+            claims=claims,
+            summaries=summaries,
+        )
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -362,6 +260,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--claim-page-size", type=int, default=16)
     parser.add_argument("--claim-maximum-gap-seconds", type=int, default=2_592_000)
     parser.add_argument("--claim-minimum-similarity", type=float, default=0.8)
+    parser.add_argument("--summary-page-size", type=int, default=16)
+    parser.add_argument("--summary-maximum-gap-seconds", type=int, default=2_592_000)
+    parser.add_argument("--summary-minimum-similarity", type=float, default=0.8)
     return parser
 
 
@@ -382,6 +283,13 @@ def _summary_dict(summary: ConsolidationSweepSummary) -> dict[str, object]:
             "page_count": summary.episodes.page_count,
             "proposed_count": summary.episodes.proposed_count,
             "scanned_count": summary.episodes.scanned_count,
+        },
+        "summaries": {
+            "candidate_count": summary.summaries.candidate_count,
+            "committed_count": summary.summaries.committed_count,
+            "page_count": summary.summaries.page_count,
+            "proposed_count": summary.summaries.proposed_count,
+            "scanned_count": summary.summaries.scanned_count,
         },
         "evaluated_at": summary.episodes.evaluated_at.isoformat(),
         "tenant_id": summary.episodes.tenant_id,
