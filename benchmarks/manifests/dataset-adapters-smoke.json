@@ -1,0 +1,39 @@
+{
+  "created_at": "2026-08-11T14:26:45.114847Z",
+  "datasets": [
+    {
+      "benchmark": "LoCoMo",
+      "source_repository": "snap-research/locomo",
+      "source_revision": "3eb6f2c585f5e1699204e3c3bdf7adc5c28cb376",
+      "source_file": "locomo10.json",
+      "source_sha256": "79fa87e90f04081343b8c8debecb80a9a6842b76a7aa537dc9fdf651ea698ff4",
+      "adapter_version": "locomo_official_v1",
+      "context_count": 10,
+      "memory_item_count": 5882,
+      "question_count": 1986
+    },
+    {
+      "benchmark": "M3-Bench-robot",
+      "source_repository": "ByteDance-Seed/m3-agent",
+      "source_revision": "0e3e41939bd8a0b66d756e7b7eb8d5fe9992da5c",
+      "source_file": "robot.json",
+      "source_sha256": "f43031bf0216a2ef2e7909f20ecd534e0098da17b63cdf94325a07f1bea372c1",
+      "adapter_version": "m3_bench_official_v1",
+      "context_count": 100,
+      "memory_item_count": 100,
+      "question_count": 1276
+    },
+    {
+      "benchmark": "M3-Bench-web",
+      "source_repository": "ByteDance-Seed/m3-agent",
+      "source_revision": "0e3e41939bd8a0b66d756e7b7eb8d5fe9992da5c",
+      "source_file": "web.json",
+      "source_sha256": "9af953751203471e00c360dbf4b6c072d5b0782ae89e26a60ea366f4d8f14e02",
+      "adapter_version": "m3_bench_official_v1",
+      "context_count": 920,
+      "memory_item_count": 920,
+      "question_count": 3214
+    }
+  ],
+  "passed": true
+}

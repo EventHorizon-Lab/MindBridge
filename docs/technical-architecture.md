@@ -940,6 +940,13 @@ tests/
 5. 不允许 Benchmark 专用存储、隐藏答案、专用模型或绕过召回的长上下文直塞；
 6. 模型、Prompt、索引参数和代码 commit 固定进 run manifest。
 
+首个可执行适配基线固定 LoCoMo 官方 revision
+`3eb6f2c585f5e1699204e3c3bdf7adc5c28cb376` 和 M3-Agent 官方 revision
+`0e3e41939bd8a0b66d756e7b7eb8d5fe9992da5c`。适配器只把动态 session、时间、问题、答案和
+证据引用转换为强类型契约；M3 视频通过 Hugging Face Hub 官方客户端按 revision 获取，仓库
+不保存数据副本或自研下载器。`dataset-adapters-smoke.json` 同时记录源文件 SHA-256、适配器
+版本和完整样本计数，使上游静默 schema 变化在运行模型前就失败。
+
 ### 14.3 分层指标
 
 只看最终答案分数无法定位问题，必须同时报告：

@@ -11,3 +11,4 @@ build/
 dist/
 .env
 .env.local
+.benchmarks/

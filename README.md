@@ -57,6 +57,39 @@ uv run --extra cloud-models python -m mindbridge.benchmarks.jina_smoke \
 
 The checked-in result is [benchmarks/manifests/jina-omni-small-smoke.json](benchmarks/manifests/jina-omni-small-smoke.json).
 
+## Benchmark dataset smoke
+
+LoCoMo and M3-Bench annotations are consumed from their official repositories by thin schema
+adapters. Pin both repositories before producing the checked-in manifest:
+
+```bash
+git clone https://github.com/snap-research/locomo.git .benchmarks/locomo
+git -C .benchmarks/locomo checkout 3eb6f2c585f5e1699204e3c3bdf7adc5c28cb376
+git clone https://github.com/ByteDance-Seed/m3-agent.git .benchmarks/m3-agent
+git -C .benchmarks/m3-agent checkout 0e3e41939bd8a0b66d756e7b7eb8d5fe9992da5c
+
+uv run python -m mindbridge.benchmarks.dataset_smoke \
+  --locomo .benchmarks/locomo/data/locomo10.json \
+  --locomo-revision 3eb6f2c585f5e1699204e3c3bdf7adc5c28cb376 \
+  --m3-robot .benchmarks/m3-agent/data/annotations/robot.json \
+  --m3-web .benchmarks/m3-agent/data/annotations/web.json \
+  --m3-revision 0e3e41939bd8a0b66d756e7b7eb8d5fe9992da5c
+```
+
+Large M3-Bench media stays outside Git. Acquire it through the official Hugging Face client rather
+than a MindBridge downloader:
+
+```bash
+uvx --from huggingface-hub hf download ByteDance-Seed/M3-Bench \
+  --repo-type dataset \
+  --revision 2672152eee36b25ccb38fdbc3b72135347adbb63 \
+  --include 'videos/robot/*' \
+  --local-dir .benchmarks/m3-bench
+```
+
+The resulting annotation identity and counts are recorded in
+[benchmarks/manifests/dataset-adapters-smoke.json](benchmarks/manifests/dataset-adapters-smoke.json).
+
 ## Run the MaaS API
 
 The production factory reads secrets from the process environment. S3 credentials use Boto3's
