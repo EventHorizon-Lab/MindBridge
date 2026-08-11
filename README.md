@@ -114,6 +114,22 @@ export MINDBRIDGE_EMBEDDING_MODEL_REVISION=12949877f0092093f366c6450340011320152
 uv run uvicorn mindbridge.api:create_production_app --factory
 ```
 
+Applications and Benchmark runners use the same typed REST contract through the asynchronous
+Python SDK:
+
+```python
+from mindbridge import AsyncMindBridge
+from mindbridge.contracts import RecallQuery, RecallRequest
+
+memory = AsyncMindBridge.connect(base_url="http://localhost:8000")
+try:
+    result = await memory.recall(
+        RecallRequest(tenant_id="tenant_01", query=RecallQuery(text="Where is my tool?"))
+    )
+finally:
+    await memory.close()
+```
+
 `MINDBRIDGE_OBJECT_STORAGE_ENDPOINT_URL` is optional for AWS S3. Media URIs must use the tenant-safe
 shape `s3://<bucket>/tenants/<tenant_id>/<object>`.
 
