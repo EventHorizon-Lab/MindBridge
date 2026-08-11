@@ -7,6 +7,7 @@ from uuid import uuid4
 from fastapi import FastAPI, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from starlette.types import Lifespan
 
 from mindbridge.application import MemoryKernel
 from mindbridge.contracts import (
@@ -23,9 +24,13 @@ from mindbridge.contracts import (
 from mindbridge.core import DomainInvariantError, IdempotencyConflictError
 
 
-def create_app(kernel: MemoryKernel) -> FastAPI:
+def create_app(
+    kernel: MemoryKernel,
+    *,
+    lifespan: Lifespan[FastAPI] | None = None,
+) -> FastAPI:
     """Create a side-effect-free REST adapter around one memory kernel."""
-    app = FastAPI(title="MindBridge", version="0.1.0")
+    app = FastAPI(title="MindBridge", version="0.1.0", lifespan=lifespan)
 
     @app.exception_handler(RequestValidationError)
     async def handle_request_validation(

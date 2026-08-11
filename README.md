@@ -56,3 +56,22 @@ uv run --extra cloud-models python -m mindbridge.benchmarks.jina_smoke \
 ```
 
 The checked-in result is [benchmarks/manifests/jina-omni-small-smoke.json](benchmarks/manifests/jina-omni-small-smoke.json).
+
+## Run the MaaS API
+
+The production factory reads secrets from the process environment. S3 credentials use Boto3's
+standard AWS credential chain and are not copied into MindBridge configuration:
+
+```bash
+export MINDBRIDGE_DATABASE_URL=postgresql://mindbridge:password@localhost:5432/mindbridge
+export MINDBRIDGE_OBJECT_STORAGE_BUCKET=mindbridge-media
+export MINDBRIDGE_OBJECT_STORAGE_ENDPOINT_URL=https://objects.example.com
+export MINDBRIDGE_VLM_API_KEY=replace-with-a-runtime-secret
+export MINDBRIDGE_VLM_ENDPOINT=https://vlm.example.com/api/v1/chat/completions
+export MINDBRIDGE_VLM_MODEL_ID=qwen3.8-max
+
+uv run uvicorn mindbridge.api:create_production_app --factory
+```
+
+`MINDBRIDGE_OBJECT_STORAGE_ENDPOINT_URL` is optional for AWS S3. Media URIs must use the tenant-safe
+shape `s3://<bucket>/tenants/<tenant_id>/<object>`.
