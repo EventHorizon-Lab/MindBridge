@@ -16,6 +16,22 @@ jobs:
   quality:
     name: Python ${{ matrix.python-version }}
     runs-on: ubuntu-latest
+    env:
+      MINDBRIDGE_TEST_DATABASE_URL: postgresql://mindbridge:mindbridge_test@localhost:5432/mindbridge_test
+    services:
+      postgres:
+        image: pgvector/pgvector:0.8.2-pg18-trixie
+        env:
+          POSTGRES_DB: mindbridge_test
+          POSTGRES_USER: mindbridge
+          POSTGRES_PASSWORD: mindbridge_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U mindbridge -d mindbridge_test"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 20
     strategy:
       fail-fast: false
       matrix:
@@ -44,7 +60,7 @@ jobs:
         run: uv run --frozen mypy
 
       - name: Test
-        run: uv run --frozen pytest
+        run: uv run --frozen pytest -W error
 
       - name: Check whitespace
         run: git diff --check

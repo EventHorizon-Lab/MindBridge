@@ -7,3 +7,7 @@ class DomainInvariantError(ValueError):
 
 class IdempotencyConflictError(DomainInvariantError):
     """Raised when one idempotency key is reused for different content."""
+
+
+class MemoryIntegrityError(RuntimeError):
+    """Raised when persisted references violate an internal invariant."""
