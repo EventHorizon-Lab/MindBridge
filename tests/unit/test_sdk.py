@@ -81,6 +81,35 @@ async def test_typed_api_error_preserves_retry_information() -> None:
     assert failure.value.trace_id == "trace_failure"
 
 
+async def test_get_observation_job_uses_tenant_scoped_route() -> None:
+    async def respond(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert request.url.path == "/v1/jobs/job_01"
+        assert request.url.params["tenant_id"] == "tenant_01"
+        return httpx.Response(
+            200,
+            json={
+                "job_id": "job_01",
+                "observation_id": "observation_01",
+                "state": "succeeded",
+                "attempt": 1,
+                "error_code": None,
+                "created_at": "2026-08-11T12:00:00Z",
+                "updated_at": "2026-08-11T12:01:00Z",
+                "trace_id": "trace_job",
+            },
+        )
+
+    client = _client(respond)
+    try:
+        job = await client.get_observation_job("tenant_01", "job_01")
+    finally:
+        await client.close()
+
+    assert job.state.value == "succeeded"
+    assert job.attempt == 1
+
+
 def _client(
     handler: Callable[[httpx.Request], Coroutine[None, None, httpx.Response]],
 ) -> AsyncMindBridge:

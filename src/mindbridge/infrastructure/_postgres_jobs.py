@@ -10,6 +10,7 @@ from psycopg.types.json import Jsonb
 
 from mindbridge.core import (
     JobId,
+    JobNotFoundError,
     JobState,
     MemoryIntegrityError,
     Observation,
@@ -116,6 +117,19 @@ async def claim_observation_processing_job(
             return ObservationJobClaim(job=_job_from_row(cast(JobRow, row)), acquired=True)
         job = await _read_expected_job(connection, tenant_id, observation_id, job_id)
         return ObservationJobClaim(job=job, acquired=False)
+
+
+async def read_observation_processing_job(
+    pool: DatabasePool,
+    tenant_id: TenantId,
+    job_id: JobId,
+) -> ObservationProcessingJob:
+    """Read one tenant-owned processing job without exposing its payload."""
+    async with pool.connection() as connection:
+        job = await _find_observation_processing_job(connection, tenant_id, job_id)
+    if job is None:
+        raise JobNotFoundError("observation processing job does not exist")
+    return job
 
 
 async def mark_observation_processing_succeeded(
@@ -252,6 +266,19 @@ async def _read_expected_job(
     observation_id: ObservationId,
     job_id: JobId,
 ) -> ObservationProcessingJob:
+    job = await _find_observation_processing_job(connection, tenant_id, job_id)
+    if job is None:
+        raise MemoryIntegrityError("observation processing job does not exist")
+    if job.observation_id != observation_id:
+        raise MemoryIntegrityError("observation processing job payload conflicts with task")
+    return job
+
+
+async def _find_observation_processing_job(
+    connection: DatabaseConnection,
+    tenant_id: TenantId,
+    job_id: JobId,
+) -> ObservationProcessingJob | None:
     cursor = await connection.execute(
         """
         SELECT job_id, tenant_id, state, attempt, error_code,
@@ -263,11 +290,8 @@ async def _read_expected_job(
     )
     row = await cursor.fetchone()
     if row is None:
-        raise MemoryIntegrityError("observation processing job does not exist")
-    job = _job_from_row(cast(JobRow, row))
-    if job.observation_id != observation_id:
-        raise MemoryIntegrityError("observation processing job payload conflicts with task")
-    return job
+        return None
+    return _job_from_row(cast(JobRow, row))
 
 
 def _job_from_row(row: JobRow) -> ObservationProcessingJob:

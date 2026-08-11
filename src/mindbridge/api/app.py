@@ -13,7 +13,9 @@ from mindbridge.application import MemoryKernel
 from mindbridge.contracts import (
     ErrorResponse,
     HealthResponse,
+    Identifier,
     MemoryView,
+    ObservationProcessingJobView,
     ObservationReceipt,
     ObserveRequest,
     RecallRequest,
@@ -24,6 +26,7 @@ from mindbridge.contracts import (
 from mindbridge.core import (
     DomainInvariantError,
     IdempotencyConflictError,
+    JobNotFoundError,
     MemoryIntegrityError,
     ModelOutputError,
     ModelUnavailableError,
@@ -72,6 +75,17 @@ def create_app(
     async def recall(request: RecallRequest) -> RecallResult:
         return await kernel.recall(request)
 
+    @app.get(
+        "/v1/jobs/{job_id}",
+        response_model=ObservationProcessingJobView,
+        operation_id="getObservationJob",
+    )
+    async def get_observation_job(
+        job_id: Identifier,
+        tenant_id: Identifier,
+    ) -> ObservationProcessingJobView:
+        return await kernel.get_observation_job(tenant_id, job_id)
+
     return app
 
 
@@ -118,6 +132,17 @@ def _register_request_error_handlers(app: FastAPI) -> None:
 
 
 def _register_runtime_error_handlers(app: FastAPI) -> None:
+    @app.exception_handler(JobNotFoundError)
+    async def handle_job_not_found(
+        _request: Request,
+        _error: JobNotFoundError,
+    ) -> JSONResponse:
+        return _error_response(
+            status.HTTP_404_NOT_FOUND,
+            code="job_not_found",
+            message="observation processing job does not exist",
+        )
+
     @app.exception_handler(ModelUnavailableError)
     async def handle_model_unavailable(
         _request: Request,

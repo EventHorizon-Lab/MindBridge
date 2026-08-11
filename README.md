@@ -153,6 +153,10 @@ finally:
 `MINDBRIDGE_OBJECT_STORAGE_ENDPOINT_URL` is optional for AWS S3. Media URIs must use the tenant-safe
 shape `s3://<bucket>/tenants/<tenant_id>/<object>`.
 
+`POST /v1/observations` returns a durable processing job. Poll
+`GET /v1/jobs/{job_id}?tenant_id=<tenant_id>` until it reaches `succeeded` before issuing a recall
+that depends on its derived events.
+
 The API sends recall queries to an OpenAI-compatible Jina v5 Omni pooling endpoint; it never loads
 the 1.56B-parameter model itself. A self-hosted endpoint can be started with the upstream validated
 vLLM path:

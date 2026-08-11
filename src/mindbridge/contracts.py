@@ -15,6 +15,7 @@ from pydantic import (
 )
 
 from mindbridge.core import (
+    JobState,
     MediaKind,
     MemoryState,
     MemoryType,
@@ -81,6 +82,19 @@ class ObservationReceipt(ContractModel):
     processing_job_id: Identifier
     idempotency_key: Identifier
     status: ObservationStatus
+    trace_id: Identifier
+
+
+class ObservationProcessingJobView(ContractModel):
+    """Public state of one durable observation processing job."""
+
+    job_id: Identifier
+    observation_id: Identifier
+    state: JobState
+    attempt: Annotated[int, Field(ge=0)]
+    error_code: Identifier | None
+    created_at: AwareDatetime
+    updated_at: AwareDatetime
     trace_id: Identifier
 
 

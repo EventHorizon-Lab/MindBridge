@@ -33,6 +33,8 @@ from mindbridge.core import (
     EvidenceSpan,
     IdempotencyConflictError,
     JobId,
+    JobNotFoundError,
+    JobState,
     MediaKind,
     MediaObject,
     MediaObjectId,
@@ -43,6 +45,7 @@ from mindbridge.core import (
     ModelUnavailableError,
     Observation,
     ObservationId,
+    ObservationProcessingJob,
     SensorKind,
     TenantId,
     VerificationStatus,
@@ -200,6 +203,28 @@ class InMemoryStore:
             and self.media_objects[media_object_id].tenant_id == tenant_id
         )
 
+    async def read_observation_processing_job(
+        self,
+        tenant_id: TenantId,
+        job_id: JobId,
+    ) -> ObservationProcessingJob:
+        for _, observation in self.observations.values():
+            if (
+                observation.tenant_id == tenant_id
+                and job_id == f"job_process_{observation.observation_id}"
+            ):
+                return ObservationProcessingJob(
+                    job_id=job_id,
+                    tenant_id=tenant_id,
+                    observation_id=observation.observation_id,
+                    state=JobState.PENDING,
+                    attempt=0,
+                    error_code=None,
+                    created_at=NOW,
+                    updated_at=NOW,
+                )
+        raise JobNotFoundError("observation processing job does not exist")
+
     async def write_embedding(self, embedding: EmbeddingRecord) -> bool:
         existing = self.embeddings.get(embedding.embedding_id)
         if existing is not None:
@@ -304,6 +329,20 @@ async def test_observe_is_retry_safe() -> None:
         (TenantId("tenant_01"), first.observation_id, first.processing_job_id),
         (TenantId("tenant_01"), retry.observation_id, retry.processing_job_id),
     ]
+
+
+async def test_observation_job_status_is_tenant_scoped() -> None:
+    store = InMemoryStore()
+    kernel = _kernel(store, RecordingAnswerer())
+    receipt = await kernel.observe(_observe_request())
+
+    job = await kernel.get_observation_job("tenant_01", receipt.processing_job_id)
+
+    assert job.observation_id == receipt.observation_id
+    assert job.state is JobState.PENDING
+    assert job.attempt == 0
+    with pytest.raises(JobNotFoundError):
+        await kernel.get_observation_job("other_tenant", receipt.processing_job_id)
 
 
 async def test_idempotency_key_rejects_different_observation() -> None:

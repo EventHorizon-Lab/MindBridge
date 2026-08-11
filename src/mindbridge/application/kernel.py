@@ -31,6 +31,7 @@ from mindbridge.contracts import (
     EvidenceView,
     MediaObjectInput,
     MemoryView,
+    ObservationProcessingJobView,
     ObservationReceipt,
     ObservationStatus,
     ObserveRequest,
@@ -47,6 +48,7 @@ from mindbridge.core import (
     EmbeddingRecord,
     EvidenceId,
     EvidenceSpan,
+    JobId,
     MediaObject,
     MediaObjectId,
     MemoryId,
@@ -160,6 +162,27 @@ class MemoryKernel:
             )
         )
         return _memory_view(stored_memory)
+
+    async def get_observation_job(
+        self,
+        tenant_id: str,
+        job_id: str,
+    ) -> ObservationProcessingJobView:
+        """Return one tenant-owned observation processing state."""
+        job = await self._store.read_observation_processing_job(
+            TenantId(tenant_id),
+            JobId(job_id),
+        )
+        return ObservationProcessingJobView(
+            job_id=job.job_id,
+            observation_id=job.observation_id,
+            state=job.state,
+            attempt=job.attempt,
+            error_code=job.error_code,
+            created_at=job.created_at,
+            updated_at=job.updated_at,
+            trace_id=_new_id("trace"),
+        )
 
     async def recall(self, request: RecallRequest) -> RecallResult:
         """Retrieve memories, inspect evidence, and answer only when supported."""

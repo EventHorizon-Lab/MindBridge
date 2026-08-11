@@ -36,6 +36,7 @@ from mindbridge.infrastructure._postgres_jobs import (
     claim_observation_processing_job,
     mark_observation_processing_failed,
     mark_observation_processing_succeeded,
+    read_observation_processing_job,
 )
 from mindbridge.infrastructure._postgres_memories import (
     search_memories,
@@ -165,6 +166,14 @@ class PostgresMemoryStore:
     ) -> tuple[MediaObject, ...]:
         """Read media metadata for evidence resolution in caller order."""
         return await read_media_objects(self._pool, tenant_id, media_object_ids)
+
+    async def read_observation_processing_job(
+        self,
+        tenant_id: TenantId,
+        job_id: JobId,
+    ) -> ObservationProcessingJob:
+        """Read one tenant-owned observation processing state."""
+        return await read_observation_processing_job(self._pool, tenant_id, job_id)
 
     async def read_observation_batch(
         self,

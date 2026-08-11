@@ -261,6 +261,12 @@ class MemoryStore(Protocol):
         media_object_ids: tuple[MediaObjectId, ...],
     ) -> tuple[MediaObject, ...]: ...
 
+    async def read_observation_processing_job(
+        self,
+        tenant_id: TenantId,
+        job_id: JobId,
+    ) -> ObservationProcessingJob: ...
+
 
 class MemoryAnswerer(Protocol):
     """Frozen model boundary used only after candidate retrieval."""

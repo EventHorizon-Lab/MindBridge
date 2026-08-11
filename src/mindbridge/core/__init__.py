@@ -3,6 +3,7 @@
 from mindbridge.core.errors import (
     DomainInvariantError,
     IdempotencyConflictError,
+    JobNotFoundError,
     MemoryIntegrityError,
     ModelOutputError,
     ModelUnavailableError,
@@ -57,6 +58,7 @@ __all__ = [
     "EvidenceSpan",
     "IdempotencyConflictError",
     "JobId",
+    "JobNotFoundError",
     "JobState",
     "MediaKind",
     "MediaObject",

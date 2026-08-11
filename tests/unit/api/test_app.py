@@ -10,6 +10,7 @@ from mindbridge.api import create_app
 from mindbridge.application import MemoryKernel
 from mindbridge.contracts import (
     MemoryView,
+    ObservationProcessingJobView,
     ObservationReceipt,
     ObservationStatus,
     ObserveRequest,
@@ -19,6 +20,8 @@ from mindbridge.contracts import (
 )
 from mindbridge.core import (
     DomainInvariantError,
+    JobNotFoundError,
+    JobState,
     MemoryIntegrityError,
     MemoryState,
     MemoryType,
@@ -68,6 +71,24 @@ class StubKernel:
             trace_id="trace_recall",
         )
 
+    async def get_observation_job(
+        self,
+        tenant_id: str,
+        job_id: str,
+    ) -> ObservationProcessingJobView:
+        if tenant_id != "tenant_01":
+            raise JobNotFoundError("missing")
+        return ObservationProcessingJobView(
+            job_id=job_id,
+            observation_id="observation_01",
+            state=JobState.SUCCEEDED,
+            attempt=1,
+            error_code=None,
+            created_at=NOW,
+            updated_at=NOW,
+            trace_id="trace_job",
+        )
+
 
 def test_recall_route_uses_shared_contract() -> None:
     """REST request and response shapes are the same Pydantic contracts."""
@@ -80,6 +101,18 @@ def test_recall_route_uses_shared_contract() -> None:
 
     assert response.status_code == 200
     assert response.json()["trace_id"] == "trace_recall"
+
+
+def test_job_route_is_tenant_scoped_and_returns_not_found() -> None:
+    client = _client()
+
+    found = client.get("/v1/jobs/job_01", params={"tenant_id": "tenant_01"})
+    missing = client.get("/v1/jobs/job_01", params={"tenant_id": "other_tenant"})
+
+    assert found.status_code == 200
+    assert found.json()["state"] == "succeeded"
+    assert missing.status_code == 404
+    assert missing.json()["code"] == "job_not_found"
 
 
 def test_validation_errors_have_trace_and_field_location() -> None:
@@ -118,6 +151,7 @@ def test_openapi_exposes_stable_operation_ids() -> None:
     assert paths["/v1/observations"]["post"]["operationId"] == "observe"
     assert paths["/v1/memories"]["post"]["operationId"] == "remember"
     assert paths["/v1/recall"]["post"]["operationId"] == "recall"
+    assert paths["/v1/jobs/{job_id}"]["get"]["operationId"] == "getObservationJob"
 
 
 @pytest.mark.parametrize(

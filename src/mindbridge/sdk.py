@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from typing import TypeVar
+from collections.abc import Mapping
+from typing import Literal, TypeVar
+from urllib.parse import quote
 
 import httpx
 from pydantic import ValidationError
@@ -11,6 +13,7 @@ from mindbridge.contracts import (
     ContractModel,
     ErrorResponse,
     MemoryView,
+    ObservationProcessingJobView,
     ObservationReceipt,
     ObserveRequest,
     RecallRequest,
@@ -80,6 +83,19 @@ class AsyncMindBridge:
         """Recall memories and grounded evidence through the production API."""
         return await self._post("v1/recall", request, RecallResult)
 
+    async def get_observation_job(
+        self,
+        tenant_id: str,
+        job_id: str,
+    ) -> ObservationProcessingJobView:
+        """Read one durable observation processing state."""
+        return await self._request(
+            "GET",
+            f"v1/jobs/{quote(job_id, safe='')}",
+            ObservationProcessingJobView,
+            params={"tenant_id": tenant_id},
+        )
+
     async def close(self) -> None:
         """Release the underlying HTTP connection pool."""
         await self._client.aclose()
@@ -90,8 +106,24 @@ class AsyncMindBridge:
         request: ContractModel,
         response_type: type[_Response],
     ) -> _Response:
+        return await self._request("POST", path, response_type, request=request)
+
+    async def _request(
+        self,
+        method: Literal["GET", "POST"],
+        path: str,
+        response_type: type[_Response],
+        *,
+        request: ContractModel | None = None,
+        params: Mapping[str, str] | None = None,
+    ) -> _Response:
         try:
-            response = await self._client.post(path, json=request.model_dump(mode="json"))
+            response = await self._client.request(
+                method,
+                path,
+                json=request.model_dump(mode="json") if request is not None else None,
+                params=params,
+            )
         except httpx.HTTPError as error:
             raise MindBridgeClientError(
                 "MindBridge request failed",

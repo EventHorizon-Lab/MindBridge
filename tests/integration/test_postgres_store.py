@@ -28,6 +28,7 @@ from mindbridge.contracts import (
 from mindbridge.core import (
     IdempotencyConflictError,
     JobId,
+    JobNotFoundError,
     JobState,
     MediaKind,
     MediaObject,
@@ -142,6 +143,10 @@ async def test_postgres_vertical_path_is_idempotent_and_evidence_first(
 
     first = await kernel.observe(request)
     retry = await kernel.observe(request)
+    job = await store.read_observation_processing_job(
+        TenantId("tenant_roundtrip"),
+        JobId(first.processing_job_id),
+    )
     stored_batch = await store.read_observation_batch(
         TenantId("tenant_roundtrip"),
         ObservationId(first.observation_id),
@@ -161,6 +166,8 @@ async def test_postgres_vertical_path_is_idempotent_and_evidence_first(
     assert first.status is ObservationStatus.ACCEPTED
     assert retry.status is ObservationStatus.DUPLICATE
     assert first.processing_job_id == retry.processing_job_id
+    assert job.state is JobState.PENDING
+    assert job.observation_id == first.observation_id
     assert stored_batch.observation.observation_id == first.observation_id
     assert stored_batch.media_objects[0].media_object_id == "media_01"
     assert stored_batch.evidence_spans[0].end_ms == 4_000
@@ -170,6 +177,12 @@ async def test_postgres_vertical_path_is_idempotent_and_evidence_first(
     assert result.evidence[0].evidence_id == evidence_id
     assert result.evidence[0].end_ms == 4_000
     assert result.evidence[0].media_url.startswith("https://objects.example.test/media_")
+
+    with pytest.raises(JobNotFoundError):
+        await store.read_observation_processing_job(
+            TenantId("other_tenant"),
+            JobId(first.processing_job_id),
+        )
 
 
 async def test_postgres_round_trips_attested_source_memory(store: PostgresMemoryStore) -> None:
