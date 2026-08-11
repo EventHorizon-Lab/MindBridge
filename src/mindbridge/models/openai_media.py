@@ -51,21 +51,38 @@ def media_content_part(
     video_max_pixels: int,
 ) -> ImagePart | VideoPart | AudioPart:
     """Convert openable evidence to the provider's native AV content shape."""
-    media_kind = evidence.media_object.kind
+    return media_url_content_part(
+        evidence.media_object.kind,
+        evidence.media_url,
+        source_uri=evidence.media_object.uri,
+        video_frames_per_second=video_frames_per_second,
+        video_max_pixels=video_max_pixels,
+    )
+
+
+def media_url_content_part(
+    media_kind: MediaKind,
+    media_url: str,
+    *,
+    source_uri: str,
+    video_frames_per_second: float,
+    video_max_pixels: int,
+) -> ImagePart | VideoPart | AudioPart:
+    """Build one native AV part from a validated short-lived media URL."""
     if media_kind is MediaKind.IMAGE:
-        return {"type": "image_url", "image_url": {"url": evidence.media_url}}
+        return {"type": "image_url", "image_url": {"url": media_url}}
     if media_kind is MediaKind.VIDEO:
         return {
             "type": "video_url",
-            "video_url": {"url": evidence.media_url},
+            "video_url": {"url": media_url},
             "fps": video_frames_per_second,
             "max_pixels": video_max_pixels,
         }
-    suffix = PurePosixPath(urlsplit(evidence.media_object.uri).path).suffix
+    suffix = PurePosixPath(urlsplit(source_uri).path).suffix
     return {
         "type": "input_audio",
         "input_audio": {
-            "data": evidence.media_url,
+            "data": media_url,
             "format": suffix.removeprefix(".").lower() or "wav",
         },
     }

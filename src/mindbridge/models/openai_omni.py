@@ -158,7 +158,7 @@ class OpenAIOmniAnswerer:
 
 
 def normalize_openai_base_url(endpoint: str) -> str:
-    """Accept either a compatible API root or its full chat-completions URL."""
+    """Accept an API root or a full compatible chat/embedding endpoint."""
     location = urlsplit(endpoint.strip())
     if (
         location.scheme not in {"http", "https"}
@@ -170,9 +170,10 @@ def normalize_openai_base_url(endpoint: str) -> str:
     ):
         raise ValueError("endpoint must be an HTTP(S) URL without credentials, query, or fragment")
     path = location.path.rstrip("/")
-    chat_completions_suffix = "/chat/completions"
-    if path.endswith(chat_completions_suffix):
-        path = path[: -len(chat_completions_suffix)]
+    for suffix in ("/chat/completions", "/embeddings"):
+        if path.endswith(suffix):
+            path = path[: -len(suffix)]
+            break
     return urlunsplit((location.scheme, location.netloc, path, "", ""))
 
 

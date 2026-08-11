@@ -27,6 +27,11 @@ from mindbridge.application.ports import (
 )
 from mindbridge.application.process_observation import ProcessObservation
 from mindbridge.application.ranking import fuse_memory_rankings
+from mindbridge.application.recall import (
+    RecallEmbeddingQuery,
+    RecallQueryEmbedder,
+    ResolvedQueryMedia,
+)
 
 __all__ = [
     "EmbeddingIndex",
@@ -51,7 +56,10 @@ __all__ = [
     "PresignedMediaDownload",
     "PresignedMediaUpload",
     "ProcessObservation",
+    "RecallEmbeddingQuery",
+    "RecallQueryEmbedder",
     "ResolvedEvidence",
+    "ResolvedQueryMedia",
     "fuse_memory_rankings",
     "resolve_evidence_media",
 ]

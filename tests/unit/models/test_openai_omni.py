@@ -111,6 +111,7 @@ async def test_omni_rejects_invalid_structured_output() -> None:
     ("endpoint", "expected"),
     [
         ("https://vlm.example.test/api/v1/chat/completions", "https://vlm.example.test/api/v1"),
+        ("https://vlm.example.test/api/v1/embeddings", "https://vlm.example.test/api/v1"),
         ("https://vlm.example.test/api/v1/", "https://vlm.example.test/api/v1"),
     ],
 )

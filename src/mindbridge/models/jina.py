@@ -13,6 +13,7 @@ from mindbridge.application import EmbeddingInput
 from mindbridge.core import ModelOutputError, ModelReference, ModelUnavailableError
 
 DEFAULT_JINA_OMNI_MODEL_ID = "jinaai/jina-embeddings-v5-omni-small-retrieval"
+DEFAULT_JINA_OMNI_REVISION = "12949877f0092093f366c6450340011320152a05"
 DEFAULT_JINA_OMNI_DIMENSION = 1_024
 
 
@@ -160,11 +161,12 @@ class JinaOmniEmbedder:
         if len(vectors) != len(inputs):
             raise ModelOutputError("embedding batch size does not match its inputs")
         for vector in vectors:
-            _validate_vector(vector, self._dimension)
+            validate_jina_embedding(vector, self._dimension)
         return vectors
 
 
-def _validate_vector(values: tuple[float, ...], dimension: int) -> None:
+def validate_jina_embedding(values: tuple[float, ...], dimension: int) -> None:
+    """Reject malformed vectors before they cross into a versioned index."""
     if len(values) != dimension or not all(math.isfinite(value) for value in values):
         raise ModelOutputError("embedding vector has invalid dimension or values")
     norm = math.sqrt(sum(value * value for value in values))

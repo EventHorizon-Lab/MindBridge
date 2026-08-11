@@ -33,12 +33,12 @@ from mindbridge.infrastructure import (
 from mindbridge.infrastructure.task_queue import PROCESS_OBSERVATION_TASK
 from mindbridge.models import (
     DEFAULT_JINA_OMNI_MODEL_ID,
+    DEFAULT_JINA_OMNI_REVISION,
     DEFAULT_OMNI_MODEL_ID,
     JinaOmniEmbedder,
     OpenAIOmniEventPerceiver,
 )
 
-DEFAULT_JINA_OMNI_REVISION = "12949877f0092093f366c6450340011320152a05"
 _MODEL_REQUEST_TIMEOUT_SECONDS = 780.0
 _RUNNING_RETRY_SECONDS = 30
 _RUNNING_MAX_RETRIES = 40
