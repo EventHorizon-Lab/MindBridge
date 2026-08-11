@@ -82,11 +82,13 @@ class Event:
     salience: float
     created_at: datetime
     model_reference: ModelReference
+    prompt_version: str
 
     def __post_init__(self) -> None:
         require_non_empty(self.event_id, "event_id")
         require_non_empty(self.tenant_id, "tenant_id")
         require_non_empty(self.description, "description")
+        require_non_empty(self.prompt_version, "prompt_version")
         require_aware_datetime(self.occurred_at, "occurred_at")
         require_aware_datetime(self.ended_at, "ended_at")
         require_aware_datetime(self.created_at, "created_at")

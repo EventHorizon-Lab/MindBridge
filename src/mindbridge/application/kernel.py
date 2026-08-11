@@ -42,6 +42,7 @@ from mindbridge.core import (
     ObservationId,
     TenantId,
     VerificationStatus,
+    derive_stable_id,
 )
 
 
@@ -98,7 +99,7 @@ class MemoryKernel:
         """Persist explicit content without pretending unsupported input is fact."""
         idempotency_key = request.idempotency_key or f"remember_{_request_digest(request)}"
         memory = MemoryRecord(
-            memory_id=MemoryId(_stable_id("memory", request.tenant_id, idempotency_key)),
+            memory_id=MemoryId(derive_stable_id("memory", request.tenant_id, idempotency_key)),
             tenant_id=TenantId(request.tenant_id),
             memory_type=request.memory_type,
             summary=request.summary,
@@ -172,7 +173,7 @@ class MemoryKernel:
 
 def _build_observation(request: ObserveRequest) -> Observation:
     observation_id = ObservationId(
-        _stable_id(
+        derive_stable_id(
             "observation",
             request.tenant_id,
             request.device_id,
@@ -214,7 +215,7 @@ def _build_evidence_span(item: MediaObjectInput, observation: Observation) -> Ev
     end_ms = item.duration_ms or 0
     return EvidenceSpan(
         evidence_id=EvidenceId(
-            _stable_id(
+            derive_stable_id(
                 "evidence",
                 observation.observation_id,
                 item.media_object_id,
@@ -260,12 +261,6 @@ def _request_digest(request: ObserveRequest | RememberRequest) -> str:
     payload = request.model_dump(mode="json", exclude={"idempotency_key"})
     canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-
-
-def _stable_id(prefix: str, *components: object) -> str:
-    canonical = json.dumps(components, ensure_ascii=False, separators=(",", ":"))
-    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:26]
-    return f"{prefix}_{digest}"
 
 
 def _new_id(prefix: str) -> str:

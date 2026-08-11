@@ -113,6 +113,8 @@ CREATE TABLE events (
     ended_at timestamptz NOT NULL CHECK (ended_at >= occurred_at),
     model_id text NOT NULL CHECK (model_id <> ''),
     model_revision text NOT NULL CHECK (model_revision <> ''),
+    prompt_version text NOT NULL CHECK (prompt_version <> ''),
+    content_digest char(64) NOT NULL CHECK (content_digest ~ '^[0-9a-f]{64}$'),
     created_at timestamptz NOT NULL,
     PRIMARY KEY (tenant_id, event_id),
     FOREIGN KEY (tenant_id, parent_event_id)

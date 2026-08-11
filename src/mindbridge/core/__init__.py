@@ -28,6 +28,7 @@ from mindbridge.core.identifiers import (
     MemoryId,
     ObservationId,
     TenantId,
+    derive_stable_id,
 )
 from mindbridge.core.jobs import JobState, ObservationJobClaim, ObservationProcessingJob
 from mindbridge.core.memory import (
@@ -78,4 +79,5 @@ __all__ = [
     "TaskBrokerError",
     "TenantId",
     "VerificationStatus",
+    "derive_stable_id",
 ]

@@ -116,6 +116,7 @@ def _event(
         salience=0.8,
         created_at=NOW,
         model_reference=MODEL,
+        prompt_version="perceive_events_v1",
     )
 
 
