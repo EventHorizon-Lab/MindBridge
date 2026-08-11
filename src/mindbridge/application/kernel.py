@@ -22,7 +22,7 @@ from mindbridge.application.ports import (
 )
 from mindbridge.application.ranking import fuse_memory_rankings
 from mindbridge.application.recall import (
-    EVIDENCE_DOCUMENT_EMBEDDING_TASK,
+    RETRIEVAL_DOCUMENT_EMBEDDING_TASK,
     RecallEmbedder,
     RecallEmbeddingQuery,
     ResolvedQueryMedia,
@@ -43,6 +43,8 @@ from mindbridge.core import (
     DeviceId,
     DomainInvariantError,
     EmbeddedObjectType,
+    EmbeddingId,
+    EmbeddingRecord,
     EvidenceId,
     EvidenceSpan,
     MediaObject,
@@ -132,7 +134,32 @@ class MemoryKernel:
             idempotency_key=idempotency_key,
             content_digest=_request_digest(request),
         )
-        return _memory_view(result.memory)
+        stored_memory = result.memory
+        values = await self._recall_embedder.encode_memory_document(stored_memory.summary)
+        await self._embedding_index.write_embedding(
+            EmbeddingRecord(
+                embedding_id=EmbeddingId(
+                    derive_stable_id(
+                        "embedding",
+                        stored_memory.tenant_id,
+                        stored_memory.memory_id,
+                        self._recall_embedder.model_reference.model_id,
+                        self._recall_embedder.model_reference.revision,
+                        RETRIEVAL_DOCUMENT_EMBEDDING_TASK,
+                    )
+                ),
+                tenant_id=stored_memory.tenant_id,
+                object_type=EmbeddedObjectType.MEMORY_RECORD,
+                object_id=stored_memory.memory_id,
+                values=values,
+                model_reference=self._recall_embedder.model_reference,
+                task=RETRIEVAL_DOCUMENT_EMBEDDING_TASK,
+                dimension=self._recall_embedder.dimension,
+                normalized=True,
+                created_at=stored_memory.created_at,
+            )
+        )
+        return _memory_view(stored_memory)
 
     async def recall(self, request: RecallRequest) -> RecallResult:
         """Retrieve memories, inspect evidence, and answer only when supported."""
@@ -191,7 +218,7 @@ class MemoryKernel:
                 tenant_id=TenantId(request.tenant_id),
                 values=values,
                 model_reference=self._recall_embedder.model_reference,
-                document_task=EVIDENCE_DOCUMENT_EMBEDDING_TASK,
+                document_task=RETRIEVAL_DOCUMENT_EMBEDDING_TASK,
                 object_types=(EmbeddedObjectType.EVIDENCE_SPAN,),
                 limit=limit,
             )

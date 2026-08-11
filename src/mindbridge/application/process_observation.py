@@ -15,7 +15,7 @@ from mindbridge.application.ports import (
     PerceivedEvent,
     ResolvedEvidence,
 )
-from mindbridge.application.recall import EVIDENCE_DOCUMENT_EMBEDDING_TASK
+from mindbridge.application.recall import RETRIEVAL_DOCUMENT_EMBEDDING_TASK
 from mindbridge.core import (
     DomainInvariantError,
     EmbeddedObjectType,
@@ -176,7 +176,7 @@ async def _evidence_embeddings(
                     item.evidence_span.evidence_id,
                     embedder.model_reference.model_id,
                     embedder.model_reference.revision,
-                    EVIDENCE_DOCUMENT_EMBEDDING_TASK,
+                    RETRIEVAL_DOCUMENT_EMBEDDING_TASK,
                 )
             ),
             tenant_id=tenant_id,
@@ -184,7 +184,7 @@ async def _evidence_embeddings(
             object_id=item.evidence_span.evidence_id,
             values=vector_by_url[item.media_url],
             model_reference=embedder.model_reference,
-            task=EVIDENCE_DOCUMENT_EMBEDDING_TASK,
+            task=RETRIEVAL_DOCUMENT_EMBEDDING_TASK,
             dimension=embedder.dimension,
             normalized=True,
             created_at=created_at,

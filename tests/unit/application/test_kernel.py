@@ -40,6 +40,7 @@ from mindbridge.core import (
     MemoryRecord,
     MemoryType,
     ModelReference,
+    ModelUnavailableError,
     Observation,
     ObservationId,
     SensorKind,
@@ -60,6 +61,7 @@ class InMemoryStore:
         self.media_objects: dict[MediaObjectId, MediaObject] = {}
         self.embedding_matches: tuple[EmbeddingMatch, ...] = ()
         self.embedding_searches: list[EmbeddingSearch] = []
+        self.embeddings: dict[str, EmbeddingRecord] = {}
 
     async def write_observation(
         self,
@@ -172,6 +174,12 @@ class InMemoryStore:
         )
 
     async def write_embedding(self, embedding: EmbeddingRecord) -> bool:
+        existing = self.embeddings.get(embedding.embedding_id)
+        if existing is not None:
+            if existing != embedding:
+                raise DomainInvariantError("embedding ID stores different content")
+            return False
+        self.embeddings[embedding.embedding_id] = embedding
         return True
 
     async def search_embeddings(self, search: EmbeddingSearch) -> tuple[EmbeddingMatch, ...]:
@@ -216,9 +224,10 @@ class RecordingRecallEmbedder:
     model_reference = ModelReference(model_id="jina-omni", revision="pinned-revision")
     dimension = 1_024
 
-    def __init__(self) -> None:
+    def __init__(self, *, memory_document_failures: int = 0) -> None:
         self.queries: list[RecallEmbeddingQuery] = []
         self.memory_documents: list[str] = []
+        self.memory_document_failures = memory_document_failures
 
     async def encode_query(self, query: RecallEmbeddingQuery) -> tuple[float, ...]:
         self.queries.append(query)
@@ -226,6 +235,9 @@ class RecordingRecallEmbedder:
 
     async def encode_memory_document(self, text: str) -> tuple[float, ...]:
         self.memory_documents.append(text)
+        if self.memory_document_failures:
+            self.memory_document_failures -= 1
+            raise ModelUnavailableError("temporary embedding failure")
         return (1.0,) + (0.0,) * 1_023
 
 
@@ -312,6 +324,41 @@ async def test_remember_retry_returns_original_record() -> None:
 
     assert retry.memory_id == first.memory_id
     assert retry.created_at == NOW
+
+
+async def test_remember_indexes_one_pinned_memory_document() -> None:
+    store = InMemoryStore()
+    recall_embedder = RecordingRecallEmbedder()
+    memory = await _kernel(
+        store,
+        RecordingAnswerer(),
+        recall_embedder=recall_embedder,
+    ).remember(_remember_request(idempotency_key="remember-index-01"))
+
+    embedding = next(iter(store.embeddings.values()))
+    assert recall_embedder.memory_documents == [memory.summary]
+    assert embedding.object_type is EmbeddedObjectType.MEMORY_RECORD
+    assert embedding.object_id == memory.memory_id
+    assert embedding.model_reference == recall_embedder.model_reference
+    assert embedding.task == "retrieval_document"
+    assert embedding.dimension == 1_024
+    assert embedding.normalized is True
+    assert embedding.created_at == memory.created_at
+
+
+async def test_remember_retry_repairs_embedding_after_model_failure() -> None:
+    store = InMemoryStore()
+    recall_embedder = RecordingRecallEmbedder(memory_document_failures=1)
+    kernel = _kernel(store, RecordingAnswerer(), recall_embedder=recall_embedder)
+    request = _remember_request(idempotency_key="remember-repair-01")
+
+    with pytest.raises(ModelUnavailableError, match="temporary embedding failure"):
+        await kernel.remember(request)
+    repaired = await kernel.remember(request)
+
+    assert len(store.memories) == 1
+    assert len(store.embeddings) == 1
+    assert next(iter(store.embeddings.values())).object_id == repaired.memory_id
 
 
 async def test_hidden_evidence_is_still_used_for_answering() -> None:

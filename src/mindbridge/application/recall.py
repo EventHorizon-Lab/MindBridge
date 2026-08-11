@@ -8,7 +8,7 @@ from typing import Protocol
 
 from mindbridge.core import DomainInvariantError, MediaObject, ModelReference
 
-EVIDENCE_DOCUMENT_EMBEDDING_TASK = "retrieval_document"
+RETRIEVAL_DOCUMENT_EMBEDDING_TASK = "retrieval_document"
 
 
 @dataclass(frozen=True, slots=True)
