@@ -321,6 +321,14 @@ MindBridge 采用“明确默认、保存版本、允许重建”的策略。模
 - 每条向量保存 `model_id`、`revision`、`task`、`dimension`、`normalized` 和 `created_at`；
 - 切换模型时创建新向量版本并后台重建，不原地混用不同空间。
 
+生产实现将两侧放在不同进程中，但严格使用同一冻结空间：Memory Worker 通过 Hugging Face
+`sentence-transformers` 的 `encode_document()` 生成 EvidenceSpan 向量；API 通过 vLLM 的
+OpenAI-compatible `/embeddings` 端点生成 `encode_query` 语义的查询向量。两条路径默认固定到
+revision `12949877f0092093f366c6450340011320152a05`。文本请求使用 OpenAI SDK 的
+`embeddings.create()`；SDK 尚未声明类型的多模态 `messages` 也只通过同一 SDK 的低层
+`post()` 发送，不另写 HTTP 客户端。API 因此不加载 Jina 权重，模型只存在于 Worker 或独立
+vLLM pooling 进程。
+
 ### 6.3 为什么必须保留多种索引
 
 一个通用 Omni 向量不能同时解决全部问题：
@@ -409,6 +417,11 @@ flowchart LR
 6. 对计数、先后、多跳和细节问题定向重读原始片段。
 7. 返回答案、MemoryRecord、EvidenceSpan、置信度和推理追踪 ID。
 8. 证据不足时明确拒答或请求补充，而不是从相似摘要中猜测。
+
+当前可运行基线已经实现 EvidenceSpan 稠密检索、PostgreSQL FTS、结构化过滤、RRF 和原始
+视听证据重看。纯媒体查询只使用跨模态稠密候选，避免把“最近记忆”伪装成相关结果；文本查询
+并行运行稠密与稀疏召回。关系展开、专用 reranker 和多轮定向重读按 Benchmark 失败案例加入，
+不预先建设空框架。
 
 ### 7.3 追问
 
@@ -858,8 +871,8 @@ Worker 通过 `mindbridge.celery_app:app` 启动，Redis 消息只传
 `tenant_id`、`observation_id`、`job_id`。原始媒体、Evidence 和任务状态均以 PostgreSQL/S3
 为事实来源。每个 prefork child 只加载一个固定 revision 的 Jina v5 Omni；默认并发为 1，
 多 GPU 通过每张卡一个 Worker 进程扩展，避免一个模型被 CPU 核数意外复制。API 进程不导入
-或加载 Jina。VLM 与 Jina revision 必须由部署配置固定并写入派生记录；凭证只从进程环境或
-基础设施 secret 注入。
+或加载 Jina，而是用 OpenAI SDK 调用独立 vLLM pooling 端点。VLM 与 Jina revision 必须由
+部署配置固定并写入派生记录；凭证只从进程环境或基础设施 secret 注入。
 
 ### 12.2 推荐代码边界
 

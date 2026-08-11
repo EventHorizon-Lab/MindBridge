@@ -70,12 +70,26 @@ export MINDBRIDGE_TASK_BROKER_URL=redis://localhost:6379/0
 export MINDBRIDGE_VLM_API_KEY=replace-with-a-runtime-secret
 export MINDBRIDGE_VLM_ENDPOINT=https://vlm.example.com/api/v1/chat/completions
 export MINDBRIDGE_VLM_MODEL_ID=qwen3.8-max
+export MINDBRIDGE_EMBEDDING_API_KEY=replace-with-a-runtime-secret
+export MINDBRIDGE_EMBEDDING_ENDPOINT=https://embeddings.example.com/v1/embeddings
+export MINDBRIDGE_EMBEDDING_MODEL_ID=jinaai/jina-embeddings-v5-omni-small-retrieval
+export MINDBRIDGE_EMBEDDING_MODEL_REVISION=12949877f0092093f366c6450340011320152a05
 
 uv run uvicorn mindbridge.api:create_production_app --factory
 ```
 
 `MINDBRIDGE_OBJECT_STORAGE_ENDPOINT_URL` is optional for AWS S3. Media URIs must use the tenant-safe
 shape `s3://<bucket>/tenants/<tenant_id>/<object>`.
+
+The API sends recall queries to an OpenAI-compatible Jina v5 Omni pooling endpoint; it never loads
+the 1.56B-parameter model itself. A self-hosted endpoint can be started with the upstream validated
+vLLM path:
+
+```bash
+vllm serve jinaai/jina-embeddings-v5-omni-small-retrieval \
+  --revision 12949877f0092093f366c6450340011320152a05 \
+  --trust-remote-code
+```
 
 ## Run the memory Worker
 
