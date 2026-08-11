@@ -66,21 +66,36 @@ The checked-in result is [benchmarks/manifests/jina-omni-small-smoke.json](bench
 
 ## Benchmark dataset smoke
 
-LoCoMo and M3-Bench annotations are consumed from their official repositories by thin schema
-adapters. Pin both repositories before producing the checked-in manifest:
+LoCoMo, M3-Bench, EgoLifeQA, and SuperMemory-VQA are consumed through thin adapters over pinned
+official files. Use Git for code releases and the Hugging Face CLI for Hub datasets; MindBridge does
+not ship another downloader:
 
 ```bash
 git clone https://github.com/snap-research/locomo.git .benchmarks/locomo
 git -C .benchmarks/locomo checkout 3eb6f2c585f5e1699204e3c3bdf7adc5c28cb376
 git clone https://github.com/ByteDance-Seed/m3-agent.git .benchmarks/m3-agent
 git -C .benchmarks/m3-agent checkout 0e3e41939bd8a0b66d756e7b7eb8d5fe9992da5c
+uvx --from huggingface-hub hf download lmms-lab/EgoLife \
+  EgoLifeQA/EgoLifeQA_A1_JAKE.json \
+  --repo-type dataset \
+  --revision 143fb319be7aa5ae210c936bf4f0f3a86092afb0 \
+  --local-dir .benchmarks/egolife
+uvx --from huggingface-hub hf download OSU-AIoT-MLSys-Lab/SuperMemory-VQA \
+  data/json/all_qa.json \
+  --repo-type dataset \
+  --revision 1d228e0f10049a8a84c458dded2aa25b1e21ce8f \
+  --local-dir .benchmarks/supermemory-vqa
 
 uv run python -m mindbridge.benchmarks.dataset_smoke \
   --locomo .benchmarks/locomo/data/locomo10.json \
   --locomo-revision 3eb6f2c585f5e1699204e3c3bdf7adc5c28cb376 \
   --m3-robot .benchmarks/m3-agent/data/annotations/robot.json \
   --m3-web .benchmarks/m3-agent/data/annotations/web.json \
-  --m3-revision 0e3e41939bd8a0b66d756e7b7eb8d5fe9992da5c
+  --m3-revision 0e3e41939bd8a0b66d756e7b7eb8d5fe9992da5c \
+  --egolife .benchmarks/egolife/EgoLifeQA/EgoLifeQA_A1_JAKE.json \
+  --egolife-revision 143fb319be7aa5ae210c936bf4f0f3a86092afb0 \
+  --supermemory .benchmarks/supermemory-vqa/data/json/all_qa.json \
+  --supermemory-revision 1d228e0f10049a8a84c458dded2aa25b1e21ce8f
 ```
 
 Large M3-Bench media stays outside Git. Acquire it through the official Hugging Face client rather
@@ -109,6 +124,7 @@ uv run python -m mindbridge.benchmarks.locomo_cli \
   --output .benchmarks/results/locomo-mindbridge.json \
   --api-base-url http://localhost:8000 \
   --source-revision 3eb6f2c585f5e1699204e3c3bdf7adc5c28cb376 \
+  --run-id locomo-001 \
   --code-revision "$(git rev-parse HEAD)" \
   --answer-model-revision serving-fingerprint
 ```
@@ -158,6 +174,7 @@ uv run python -m mindbridge.benchmarks.m3_cli \
   --subset robot \
   --source-revision 0e3e41939bd8a0b66d756e7b7eb8d5fe9992da5c \
   --media-revision 2672152eee36b25ccb38fdbc3b72135347adbb63 \
+  --run-id m3-robot-001 \
   --code-revision "$(git rev-parse HEAD)" \
   --perception-model-revision serving-fingerprint \
   --answer-model-revision serving-fingerprint
@@ -167,6 +184,93 @@ Use `--video-id` for a smoke subset. The JSONL uses the official `id`, `question
 `before_clip`, and `response` fields and adds MindBridge retrieval diagnostics. Its sidecar manifest
 pins annotation/media hashes and revisions, code, both Omni calls, Jina, Prompt versions, retrieval
 settings, and output hash.
+
+EgoLifeQA uses its official `DAYn` plus `HHMMSSFF` clock, whose final two digits are hundredths of
+a second in the released annotations. Its prepared manifest contains one subject, a `DAY1 00:00`
+timeline origin, and chronological non-overlapping video clips. A clip whose end crosses a question
+time is withheld until a later question, so no future frames or audio enter memory:
+
+```json
+{
+  "subject_id": "A1_JAKE",
+  "timeline_origin": "2000-01-01T00:00:00Z",
+  "clips": [
+    {
+      "day": 1,
+      "start_timecode": "11100000",
+      "media_object": {
+        "media_object_id": "egolife_a1_day1_11100000",
+        "kind": "video",
+        "uri": "s3://mindbridge-media/egolife/day1/11100000.mp4",
+        "sha256": "<64 hexadecimal characters>",
+        "size_bytes": 14379440,
+        "created_at": "2026-08-12T00:00:00Z",
+        "duration_ms": 30000
+      }
+    }
+  ]
+}
+```
+
+```bash
+uv run python -m mindbridge.benchmarks.egolife_cli \
+  --dataset .benchmarks/egolife/EgoLifeQA/EgoLifeQA_A1_JAKE.json \
+  --prepared-media .benchmarks/egolife-prepared-a1.json \
+  --output .benchmarks/results/egolife-a1.json \
+  --api-base-url http://localhost:8000 \
+  --dataset-revision 143fb319be7aa5ae210c936bf4f0f3a86092afb0 \
+  --evaluator-revision 7a97157908757cc898c26835b718653055ecc5f5 \
+  --run-id egolife-a1-001 \
+  --code-revision "$(git rev-parse HEAD)" \
+  --perception-model-revision serving-fingerprint \
+  --answer-model-revision serving-fingerprint
+```
+
+SuperMemory-VQA runs one participant per invocation. Each prepared video records its official Unix
+start and chronological segments. `media_objects` are sent to `observe`; an optional aligned
+`transcript` is sent to `remember` because the public release intentionally withholds raw audio.
+Either field may be omitted, but every segment must contain at least one. Only segments that end no
+later than the earliest official question span are ingested. The output reports Ans-F1, QA-Acc, and
+QA-MRR and contains no ground-truth fields:
+
+```json
+{
+  "subject": 1,
+  "videos": [
+    {
+      "video_id": "Person_1_session_8_03102026_glasses_1264",
+      "started_at": "2026-03-10T22:04:28Z",
+      "segments": [
+        {
+          "start_seconds": 0,
+          "duration_ms": 30000,
+          "media_objects": [],
+          "transcript": "User: Okay, it started."
+        }
+      ]
+    }
+  ]
+}
+```
+
+```bash
+uv run python -m mindbridge.benchmarks.supermemory_cli \
+  --dataset .benchmarks/supermemory-vqa/data/json/all_qa.json \
+  --prepared-media .benchmarks/supermemory-prepared-person-1.json \
+  --output .benchmarks/results/supermemory-person-1.json \
+  --api-base-url http://localhost:8000 \
+  --subject 1 \
+  --dataset-revision 1d228e0f10049a8a84c458dded2aa25b1e21ce8f \
+  --source-revision 8123980820ffa23a3452faa6bd8ce5dff0f03164 \
+  --run-id supermemory-person-1-001 \
+  --code-revision "$(git rev-parse HEAD)" \
+  --perception-model-revision serving-fingerprint \
+  --answer-model-revision serving-fingerprint
+```
+
+Every benchmark `run_id` must be unique for that deployment. It is included in the tenant ID and
+sidecar manifest, preventing a rerun from exposing an earlier question to future memories retained
+by a previous run.
 
 ## Run the MaaS API
 

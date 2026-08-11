@@ -952,19 +952,21 @@ tests/
 
 每个 Benchmark 只实现薄数据适配器：
 
-1. 官方数据通过 Hugging Face `datasets` 或官方仓库加载；
+1. 官方数据通过 Hugging Face 官方 CLI/Hub 库或官方 Git 仓库按 revision 获取；
 2. 视频、音频、图像和对话统一通过生产 `observe`/`remember` 接口写入；
 3. 问题统一通过生产 `recall` 接口执行；
 4. 结果转换为官方评测格式；
 5. 不允许 Benchmark 专用存储、隐藏答案、专用模型或绕过召回的长上下文直塞；
 6. 模型、Prompt、索引参数和代码 commit 固定进 run manifest。
 
-首个可执行适配基线固定 LoCoMo 官方 revision
-`3eb6f2c585f5e1699204e3c3bdf7adc5c28cb376` 和 M3-Agent 官方 revision
-`0e3e41939bd8a0b66d756e7b7eb8d5fe9992da5c`。适配器只把动态 session、时间、问题、答案和
-证据引用转换为强类型契约；M3 视频通过 Hugging Face Hub 官方客户端按 revision 获取，仓库
-不保存数据副本或自研下载器。`dataset-adapters-smoke.json` 同时记录源文件 SHA-256、适配器
-版本和完整样本计数，使上游静默 schema 变化在运行模型前就失败。
+可执行适配基线固定 LoCoMo revision `3eb6f2c585f5e1699204e3c3bdf7adc5c28cb376`、M3-Agent
+revision `0e3e41939bd8a0b66d756e7b7eb8d5fe9992da5c`、EgoLife 数据 revision
+`143fb319be7aa5ae210c936bf4f0f3a86092afb0` 和 SuperMemory-VQA 数据 revision
+`1d228e0f10049a8a84c458dded2aa25b1e21ce8f`。适配器只转换推理所需字段；EgoLife 的
+`target_time`、`keywords`、`reason` 与 SuperMemory 的 `answer_evidence` 不进入运行契约。
+媒体通过 Hugging Face Hub 官方客户端按 revision 获取，仓库不保存数据副本或自研下载器。
+`dataset-adapters-smoke.json` 记录源文件 SHA-256、适配器版本和完整样本计数；当前门禁覆盖
+LoCoMo 1,986 题、M3 两个 split 共 4,490 题、EgoLifeQA 500 题和 SuperMemory-VQA 4,853 题。
 
 M3-Bench 的生产 runner 沿用官方 30 秒、零起点连续切片约定。媒体由 FFmpeg 和标准 S3
 工具在运行前准备，MindBridge 只读取包含 URI、SHA-256、时长和绝对时间原点的强类型 manifest。
@@ -973,6 +975,23 @@ M3-Bench 的生产 runner 沿用官方 30 秒、零起点连续切片约定。�
 在整段视频完成后回答。输出采用官方 JSONL 字段，并附带记忆、证据和 trace 诊断；sidecar run
 manifest 同时固定标注与媒体 revision/hash、代码、感知模型与 Prompt、回答模型与 Prompt、Jina
 revision、召回参数和最终输出 hash。基准路径不使用固定 sleep、标签提示或 Benchmark 专用存储。
+
+EgoLifeQA runner 将官方 `DAYn/HHMMSSFF` 映射到单调时间轴，其中 `FF` 按 release 的百分之一秒
+处理。prepared manifest 只接受按时间排序、互不重叠且带 SHA-256/时长的 addressable 视频。
+问题按时间排序执行；只有 `clip.end <= query_time` 的片段才依次 `observe` 并等待 Job 成功，跨越
+提问时刻的片段整体延后。召回问题仅包含原问题和四个候选项，答案按官方 A/B/C/D 精确准确率
+计算；无法从受约束输出中无歧义解析时记为未作答。
+
+SuperMemory-VQA runner 以 participant 为隔离单元，将各 session 的 Unix 起点和局部 segment
+时间合成绝对时间。问题截止点取官方 `question_evidence` 最早 span 的开始；同时兼容 release 中
+6 条旧版单 `time_span` 记录。视频/音频通过 `observe`，官方因隐私只发布而不提供原始音频的
+对齐 transcript 通过生产 `remember` 接口写入；答案标签、choice type 和 answer evidence 均不
+进入 API 请求。回答模型返回四个候选项的完整排序，生产 abstention 映射到数据集显式的
+“This question can not be answered.” 选项，输出计算 Ans-F1、QA-Acc 与 QA-MRR。
+
+所有 runner 强制接收 `run_id`，并将其写入 tenant ID 与 sidecar manifest。每次运行使用新的
+`run_id`，从结构上阻断上一次完整摄入留下的未来记忆污染本次较早问题；输出还固定数据、prepared
+media、代码、模型、Prompt、检索参数和预测文件哈希。
 
 ### 14.3 分层指标
 
