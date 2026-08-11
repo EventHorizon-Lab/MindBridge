@@ -10,13 +10,16 @@ async def write_entities(
     connection: DatabaseConnection,
     entities: tuple[Entity, ...],
 ) -> None:
-    """Insert deterministic entities and reject identity collisions."""
+    """Insert entities once and reject collisions in their stable identity fields."""
     for entity in entities:
-        values = (
+        identity = (
             entity.tenant_id,
             entity.entity_id,
             entity.entity_type.value,
             entity.canonical_name,
+        )
+        values = (
+            *identity,
             entity.created_at,
         )
         cursor = await connection.execute(
@@ -34,13 +37,13 @@ async def write_entities(
         row = await (
             await connection.execute(
                 """
-                SELECT tenant_id, entity_id, entity_type, canonical_name, created_at
+                SELECT tenant_id, entity_id, entity_type, canonical_name
                 FROM entities WHERE tenant_id = %s AND entity_id = %s
                 """,
                 (entity.tenant_id, entity.entity_id),
             )
         ).fetchone()
-        if row is None or tuple(row) != values:
+        if row is None or tuple(row) != identity:
             raise MemoryIntegrityError("entity has conflicting deterministic identity")
 
 

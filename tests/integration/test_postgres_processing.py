@@ -17,6 +17,7 @@ from mindbridge.application import (
     ConsolidateClaims,
     ConsolidateEpisodes,
     EmbeddingInput,
+    EmbeddingMatch,
     EmbeddingSearch,
     EpisodeCandidateRequest,
     EpisodeConsolidation,
@@ -538,14 +539,12 @@ async def test_episode_consolidation_is_atomic_recallable_and_retry_safe(
     tenant_id, first_observation_id, first_job_id = await _write_source_observation(
         store,
         "tenant_episode_commit",
-        include_identity=False,
     )
     _, second_observation_id, second_job_id = await _write_source_observation(
         store,
         "tenant_episode_commit",
         ordinal=2,
         occurred_at=NOW + timedelta(seconds=5),
-        include_identity=False,
     )
     for observation_id, job_id in (
         (first_observation_id, first_job_id),
@@ -565,6 +564,23 @@ async def test_episode_consolidation_is_atomic_recallable_and_retry_safe(
         maximum_gap_seconds=10,
         minimum_similarity=0.99,
     )
+    candidate_events = (await store.list_episode_candidates(request)).events
+    child_event_id = candidate_events[0].event_id
+    identity_expanded_memories = await store.search_memories_by_graph_objects(
+        RecallRequest(tenant_id=tenant_id, query=RecallQuery(text="same person")),
+        (
+            EmbeddingMatch(
+                embedding_id="isolated_identity_hit",
+                object_type=EmbeddedObjectType.EVENT,
+                object_id=child_event_id,
+                similarity=1.0,
+            ),
+        ),
+        limit=20,
+    )
+    assert {memory.memory_id for memory in identity_expanded_memories} >= {
+        derive_stable_id("memory", event.event_id) for event in candidate_events
+    }
     consolidator = RecordingEpisodeConsolidator()
     with pytest.raises(DomainInvariantError, match="cloud embedding dimension"):
         await ConsolidateEpisodes(
@@ -602,6 +618,23 @@ async def test_episode_consolidation_is_atomic_recallable_and_retry_safe(
     assert coordinated.calls == 2
     assert replay_consolidator.calls == 0
     assert await _episode_counts(database_url, tenant_id) == (1, 2, 2, 2, 5, 1)
+
+    expanded_memories = await store.search_memories_by_graph_objects(
+        RecallRequest(tenant_id=tenant_id, query=RecallQuery(text="repair episode")),
+        (
+            EmbeddingMatch(
+                embedding_id="isolated_child_hit",
+                object_type=EmbeddedObjectType.EVENT,
+                object_id=child_event_id,
+                similarity=1.0,
+            ),
+        ),
+        limit=20,
+    )
+    assert {memory.summary for memory in expanded_memories} >= {
+        "A person places a red tool beside a blue toolbox.",
+        "A person retrieves a tool and explains the repair.",
+    }
 
     graph_matches = await store.search_embeddings(
         EmbeddingSearch(
@@ -661,6 +694,7 @@ async def test_claim_consolidation_is_atomic_versioned_and_forget_safe(
     )
     candidates = (await store.list_claim_candidates(request)).candidates
     ordered = tuple(sorted(candidates, key=lambda candidate: candidate.claim.valid_from))
+    supporting_claim_id = ordered[0].claim.claim_id
     source_claim_id = ordered[3].claim.claim_id
     target_claim_id = ordered[2].claim.claim_id
     with pytest.raises(DomainInvariantError, match="cloud embedding dimension"):
@@ -710,6 +744,23 @@ async def test_claim_consolidation_is_atomic_versioned_and_forget_safe(
         for candidate in (await store.list_claim_candidates(request)).candidates
     }
     assert next_candidate_ids == set()
+
+    expanded_memories = await store.search_memories_by_graph_objects(
+        RecallRequest(tenant_id=tenant_id, query=RecallQuery(text="red tool")),
+        (
+            EmbeddingMatch(
+                embedding_id="isolated_support_hit",
+                object_type=EmbeddedObjectType.CLAIM,
+                object_id=supporting_claim_id,
+                similarity=1.0,
+            ),
+        ),
+        limit=20,
+    )
+    assert {memory.summary for memory in expanded_memories} >= {
+        "The red tool is beside the blue toolbox.",
+        _SEMANTIC_CLAIM_STATEMENT,
+    }
 
     graph_matches = await store.search_embeddings(
         EmbeddingSearch(

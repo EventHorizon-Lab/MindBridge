@@ -208,6 +208,7 @@ async def search_memories_by_graph_objects(
     parameters.update(
         object_types=[match.object_type.value for match in ranked_objects],
         object_ids=[match.object_id for match in ranked_objects],
+        graph_neighbor_limit=min(limit, 16),
         limit=limit,
     )
     async with tenant_connection(pool, request.tenant_id) as connection:
@@ -429,10 +430,61 @@ WITH ranked_objects AS (
         %(object_types)s::text[], %(object_ids)s::text[]
     ) WITH ORDINALITY AS hit(object_type, object_id, rank)
 ),
+related_objects AS (
+    SELECT hit.object_type, hit.object_id, hit.rank, 0 AS hop
+    FROM ranked_objects AS hit
+    UNION ALL
+    SELECT relation.target_type, relation.target_id, hit.rank, 1 AS hop
+    FROM ranked_objects AS hit
+    JOIN relations AS relation
+      ON relation.tenant_id = %(tenant_id)s
+     AND relation.source_type = hit.object_type
+     AND relation.source_id = hit.object_id
+    WHERE relation.target_type IN ('event', 'claim')
+      AND relation.relation_type IN (
+          'asserts', 'contains', 'same_episode', 'supports',
+          'contradicts', 'supersedes', 'before', 'after'
+      )
+    UNION ALL
+    SELECT relation.source_type, relation.source_id, hit.rank, 1 AS hop
+    FROM ranked_objects AS hit
+    JOIN relations AS relation
+      ON relation.tenant_id = %(tenant_id)s
+     AND relation.target_type = hit.object_type
+     AND relation.target_id = hit.object_id
+    WHERE relation.source_type IN ('event', 'claim')
+      AND relation.relation_type IN (
+          'asserts', 'contains', 'same_episode', 'supports',
+          'contradicts', 'supersedes', 'before', 'after'
+      )
+    UNION ALL
+    SELECT neighbor.object_type, neighbor.object_id, hit.rank, 2 AS hop
+    FROM ranked_objects AS hit
+    JOIN LATERAL (
+        SELECT peer.source_type AS object_type, peer.source_id AS object_id
+        FROM relations AS anchor
+        JOIN relations AS peer
+          ON peer.tenant_id = anchor.tenant_id
+         AND peer.target_type = 'entity'
+         AND peer.target_id = anchor.target_id
+         AND peer.relation_type IN ('mentions', 'about')
+         AND peer.source_type IN ('event', 'claim')
+        WHERE anchor.tenant_id = %(tenant_id)s
+          AND anchor.source_type = hit.object_type
+          AND anchor.source_id = hit.object_id
+          AND anchor.relation_type IN ('mentions', 'about')
+          AND anchor.target_type = 'entity'
+          AND (peer.source_type, peer.source_id) <> (hit.object_type, hit.object_id)
+        ORDER BY peer.created_at DESC, peer.source_type, peer.source_id
+        LIMIT %(graph_neighbor_limit)s
+    ) AS neighbor ON true
+),
 ranked_memories AS (
-    SELECT relation.tenant_id, relation.target_id AS memory_id, min(hit.rank) AS dense_rank
+    SELECT relation.tenant_id,
+           relation.target_id AS memory_id,
+           min(hit.rank + hit.hop * cardinality(%(object_ids)s::text[])) AS graph_rank
     FROM relations AS relation
-    JOIN ranked_objects AS hit
+    JOIN related_objects AS hit
       ON hit.object_type = relation.source_type
      AND hit.object_id = relation.source_id
     WHERE relation.tenant_id = %(tenant_id)s
@@ -445,6 +497,6 @@ JOIN ranked_memories AS dense
   ON dense.tenant_id = memory.tenant_id AND dense.memory_id = memory.memory_id
 WHERE memory.tenant_id = %(tenant_id)s
 {_STRUCTURED_RECALL_FILTER_SQL}
-ORDER BY dense.dense_rank, memory.strength DESC, memory.occurred_at DESC, memory.memory_id
+ORDER BY dense.graph_rank, memory.strength DESC, memory.occurred_at DESC, memory.memory_id
 LIMIT %(limit)s
 """

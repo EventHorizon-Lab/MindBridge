@@ -473,8 +473,11 @@ PostgreSQL FTS、结构化过滤、RRF 和原始视听证据重看。Event/Claim
 `represented_by` 关系映射回 MemoryRecord，映射后再次应用租户、时间、人物、设备和记忆类型
 过滤。纯媒体查询只使用跨模态稠密候选，避免把“最近记忆”伪装成相关结果；文本查询并行运行
 稠密与稀疏召回。pgvector HNSW 查询在事务内启用 `strict_order` iterative scan，避免过滤条件
-导致候选不足，因此部署要求 pgvector 0.8+。`before/after` 等多跳邻居展开、专用 reranker 和
-多轮定向重读按 Benchmark 失败案例加入，不预先建设通用图遍历框架。
+导致候选不足，因此部署要求 pgvector 0.8+。稠密命中的 Event/Claim 会在 PostgreSQL 内做一次
+有界关系展开：直接覆盖 `asserts`、`contains`、`same_episode`、`supports`、`contradicts`、
+`supersedes`、`before` 和 `after` 的双向邻居；经 `mentions/about` 共享 Entity 的邻居，每个命中
+最多取 16 个。直接表示始终先于关系邻居排序，所有展开结果在映射为 MemoryRecord 后再次执行
+完整结构化过滤。更深的通用图遍历、专用 reranker 和多轮定向重读只按 Benchmark 失败案例加入。
 
 ### 7.3 追问
 
