@@ -9,7 +9,7 @@ import httpx
 import pytest
 from openai import AsyncOpenAI
 
-from mindbridge.application import ResolvedEvidence
+from mindbridge.application import ResolvedEvidence, ResolvedQueryMedia
 from mindbridge.contracts import RecallQuery, RecallRequest
 from mindbridge.core import (
     EvidenceId,
@@ -75,12 +75,70 @@ async def test_omni_streams_raw_av_and_validates_answer() -> None:
             RecallRequest(tenant_id="tenant_01", query=RecallQuery(text="Where is the tool?")),
             (memory,),
             evidence,
+            query_media=(),
         )
     finally:
         await answerer.close()
 
     assert answer.answer == "The screwdriver is beside the blue toolbox"
     assert answer.confidence == 0.87
+
+
+async def test_omni_inspects_native_query_media_before_candidate_evidence() -> None:
+    async def respond(request: httpx.Request) -> httpx.Response:
+        payload: dict[str, object] = json.loads(request.content)
+        messages = cast(list[dict[str, object]], payload["messages"])
+        content = cast(list[dict[str, object]], messages[1]["content"])
+
+        labels = [item["text"] for item in content if item["type"] == "text"]
+        media_parts = [item for item in content if item["type"] != "text"]
+        assert labels[1:] == [
+            "Query media_object_id=query_image follows.",
+            "Query media_object_id=query_video follows.",
+            "Query media_object_id=query_audio follows.",
+        ]
+        assert [item["type"] for item in media_parts] == [
+            "image_url",
+            "video_url",
+            "input_audio",
+        ]
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=_completion_stream('{"answer":"matching moment","confidence":0.9}'),
+        )
+
+    query_sources = (
+        _resolved_evidence(MediaKind.IMAGE, "query.jpg", "query_image", 0),
+        _resolved_evidence(MediaKind.VIDEO, "query.mp4", "query_video", 0),
+        _resolved_evidence(MediaKind.AUDIO, "query.wav", "query_audio", 0),
+    )
+    query_media = tuple(
+        ResolvedQueryMedia(
+            media_object=item.media_object,
+            media_url=item.media_url,
+            media_url_expires_at=item.media_url_expires_at,
+        )
+        for item in query_sources
+    )
+    answerer = _answerer(respond)
+    try:
+        answer = await answerer.answer(
+            RecallRequest(
+                tenant_id="tenant_01",
+                query=RecallQuery(
+                    text="Find a matching moment",
+                    media_object_ids=("query_image", "query_video", "query_audio"),
+                ),
+            ),
+            (_memory((), verification_status=VerificationStatus.ATTESTED),),
+            (),
+            query_media=query_media,
+        )
+    finally:
+        await answerer.close()
+
+    assert answer.answer == "matching moment"
 
 
 async def test_omni_rejects_invalid_structured_output() -> None:
@@ -102,6 +160,7 @@ async def test_omni_rejects_invalid_structured_output() -> None:
                 RecallRequest(tenant_id="tenant_01", query=RecallQuery(text="What happened?")),
                 (_memory((evidence[0].evidence_span.evidence_id,)),),
                 evidence,
+                query_media=(),
             )
     finally:
         await answerer.close()
@@ -131,6 +190,7 @@ async def test_omni_uses_attested_source_statement_without_media() -> None:
             RecallRequest(tenant_id="tenant_01", query=RecallQuery(text="What is her plan?")),
             (memory,),
             (),
+            query_media=(),
         )
     finally:
         await answerer.close()

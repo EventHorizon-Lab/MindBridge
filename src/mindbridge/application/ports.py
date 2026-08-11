@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Protocol, TypeAlias
+from typing import TYPE_CHECKING, Protocol, TypeAlias
 
 from mindbridge.contracts import RecallRequest
 from mindbridge.core import (
@@ -34,6 +34,9 @@ from mindbridge.core import (
     ObservationProcessingJob,
     TenantId,
 )
+
+if TYPE_CHECKING:
+    from mindbridge.application.recall import ResolvedQueryMedia
 
 EmbeddingInput: TypeAlias = str | bytes | tuple[str | bytes, ...]
 
@@ -380,6 +383,8 @@ class MemoryAnswerer(Protocol):
         request: RecallRequest,
         memories: tuple[MemoryRecord, ...],
         evidence: tuple[ResolvedEvidence, ...],
+        *,
+        query_media: tuple[ResolvedQueryMedia, ...],
     ) -> GeneratedAnswer: ...
 
 

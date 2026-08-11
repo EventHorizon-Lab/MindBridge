@@ -19,6 +19,7 @@ from mindbridge.application import (
     PresignedMediaDownload,
     RecallEmbeddingQuery,
     ResolvedEvidence,
+    ResolvedQueryMedia,
 )
 from mindbridge.contracts import (
     FeedbackRequest,
@@ -414,16 +415,20 @@ class RecordingAnswerer:
         self.calls = 0
         self.last_evidence: tuple[ResolvedEvidence, ...] = ()
         self.last_memories: tuple[MemoryRecord, ...] = ()
+        self.last_query_media: tuple[ResolvedQueryMedia, ...] = ()
 
     async def answer(
         self,
         request: RecallRequest,
         memories: tuple[MemoryRecord, ...],
         evidence: tuple[ResolvedEvidence, ...],
+        *,
+        query_media: tuple[ResolvedQueryMedia, ...],
     ) -> GeneratedAnswer:
         self.calls += 1
         self.last_evidence = evidence
         self.last_memories = memories
+        self.last_query_media = query_media
         return GeneratedAnswer(answer=memories[0].summary, confidence=0.9)
 
 
@@ -829,10 +834,11 @@ async def test_semantic_memory_finds_attested_text_without_matching_words() -> N
 
 
 async def test_media_query_is_signed_for_embedding_instead_of_used_as_a_filter() -> None:
-    """Original AV reaches Jina through a short-lived tenant-owned URL."""
+    """One resolved AV query reaches both Jina retrieval and Omni inspection."""
     store = InMemoryStore()
     recall_embedder = RecordingRecallEmbedder()
-    kernel = _kernel(store, RecordingAnswerer(), recall_embedder=recall_embedder)
+    answerer = RecordingAnswerer()
+    kernel = _kernel(store, answerer, recall_embedder=recall_embedder)
     await kernel.observe(_observe_request())
     evidence_id = next(iter(store.evidence))
     await kernel.remember(_remember_request(evidence_ids=(evidence_id,)))
@@ -855,6 +861,7 @@ async def test_media_query_is_signed_for_embedding_instead_of_used_as_a_filter()
     resolved = recall_embedder.queries[0].media[0]
     assert resolved.media_object.kind is MediaKind.VIDEO
     assert resolved.media_url == "https://objects.example.test/media_01"
+    assert answerer.last_query_media == (resolved,)
     assert result.memories[0].evidence_ids == (evidence_id,)
 
 

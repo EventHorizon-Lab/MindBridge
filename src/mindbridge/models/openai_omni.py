@@ -17,11 +17,15 @@ from pydantic import (
     model_validator,
 )
 
-from mindbridge.application import GeneratedAnswer, ResolvedEvidence
+from mindbridge.application import GeneratedAnswer, ResolvedEvidence, ResolvedQueryMedia
 from mindbridge.contracts import RecallRequest
 from mindbridge.core import MemoryRecord, ModelOutputError
 from mindbridge.models.openai_chat import stream_text_completion
-from mindbridge.models.openai_media import OpenAIContentPart, media_content_part
+from mindbridge.models.openai_media import (
+    OpenAIContentPart,
+    media_content_part,
+    media_url_content_part,
+)
 from mindbridge.telemetry import set_current_span_attributes, trace_operation
 
 DEFAULT_OMNI_MODEL_ID = "qwen3.8-max"
@@ -138,6 +142,8 @@ class OpenAIOmniAnswerer:
         request: RecallRequest,
         memories: tuple[MemoryRecord, ...],
         evidence: tuple[ResolvedEvidence, ...],
+        *,
+        query_media: tuple[ResolvedQueryMedia, ...],
     ) -> GeneratedAnswer:
         """Stream one grounded completion and reject malformed provider output."""
         set_current_span_attributes(
@@ -146,12 +152,14 @@ class OpenAIOmniAnswerer:
                 "mindbridge.prompt.version": ANSWER_FROM_EVIDENCE_PROMPT_VERSION,
                 "mindbridge.memory.count": len(memories),
                 "mindbridge.evidence.count": len(evidence),
+                "mindbridge.query.media_count": len(query_media),
             }
         )
         messages = _messages(
             request,
             memories,
             evidence,
+            query_media=query_media,
             video_frames_per_second=self._video_frames_per_second,
             video_max_pixels=self._video_max_pixels,
         )
@@ -194,6 +202,7 @@ def _messages(
     memories: tuple[MemoryRecord, ...],
     evidence: tuple[ResolvedEvidence, ...],
     *,
+    query_media: tuple[ResolvedQueryMedia, ...],
     video_frames_per_second: float,
     video_max_pixels: int,
 ) -> list[_Message]:
@@ -201,8 +210,23 @@ def _messages(
         {"type": "text", "text": f"Recall context:\n{_recall_context(request, memories, evidence)}"}
     ]
     seen_media_object_ids: set[str] = set()
-    for item in evidence:
-        media_object_id = item.media_object.media_object_id
+    for query_item in query_media:
+        media_object_id = query_item.media_object.media_object_id
+        seen_media_object_ids.add(media_object_id)
+        content.append(
+            {"type": "text", "text": f"Query media_object_id={media_object_id} follows."}
+        )
+        content.append(
+            media_url_content_part(
+                query_item.media_object.kind,
+                query_item.media_url,
+                source_uri=query_item.media_object.uri,
+                video_frames_per_second=video_frames_per_second,
+                video_max_pixels=video_max_pixels,
+            )
+        )
+    for evidence_item in evidence:
+        media_object_id = evidence_item.media_object.media_object_id
         if media_object_id in seen_media_object_ids:
             continue
         seen_media_object_ids.add(media_object_id)
@@ -211,7 +235,7 @@ def _messages(
         )
         content.append(
             media_content_part(
-                item,
+                evidence_item,
                 video_frames_per_second=video_frames_per_second,
                 video_max_pixels=video_max_pixels,
             )

@@ -14,6 +14,7 @@ from mindbridge.application import (
     PresignedMediaDownload,
     RecallEmbeddingQuery,
     ResolvedEvidence,
+    ResolvedQueryMedia,
 )
 from mindbridge.contracts import (
     MediaObjectInput,
@@ -114,6 +115,8 @@ class FirstMemoryAnswerer:
         request: RecallRequest,
         memories: tuple[MemoryRecord, ...],
         evidence: tuple[ResolvedEvidence, ...],
+        *,
+        query_media: tuple[ResolvedQueryMedia, ...],
     ) -> GeneratedAnswer:
         return GeneratedAnswer(answer=memories[0].summary, confidence=1.0)
 

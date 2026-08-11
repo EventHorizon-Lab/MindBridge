@@ -132,8 +132,13 @@ class RecallMemories:
                 "mindbridge.query.media_count": len(request.query.media_object_ids),
             }
         )
+        query_media = await self._resolve_query_media(request)
         candidate_limit = min(request.limit * 4, 100)
-        memories = await self._retrieve_candidates(request, limit=candidate_limit)
+        memories = await self._retrieve_candidates(
+            request,
+            query_media,
+            limit=candidate_limit,
+        )
         memories = await self._store.record_memory_accesses(
             TenantId(request.tenant_id),
             tuple(memory.memory_id for memory in memories),
@@ -154,7 +159,12 @@ class RecallMemories:
         answer = None
         confidence = 0.0
         if should_answer:
-            generated = await self._answerer.answer(request, answer_memories, evidence)
+            generated = await self._answerer.answer(
+                request,
+                answer_memories,
+                evidence,
+                query_media=query_media,
+            )
             answer = generated.answer
             confidence = generated.confidence
         set_current_span_attributes(
@@ -187,10 +197,15 @@ class RecallMemories:
     async def _retrieve_candidates(
         self,
         request: RecallRequest,
+        query_media: tuple[ResolvedQueryMedia, ...],
         *,
         limit: int,
     ) -> tuple[MemoryRecord, ...]:
-        semantic_search = self._search_semantic_memories(request, limit=limit)
+        semantic_search = self._search_semantic_memories(
+            request,
+            query_media,
+            limit=limit,
+        )
         if request.query.text is None:
             memories = await semantic_search
         else:
@@ -205,12 +220,13 @@ class RecallMemories:
     async def _search_semantic_memories(
         self,
         request: RecallRequest,
+        query_media: tuple[ResolvedQueryMedia, ...],
         *,
         limit: int,
     ) -> tuple[MemoryRecord, ...]:
         query = RecallEmbeddingQuery(
             text=request.query.text,
-            media=await self._resolve_query_media(request),
+            media=query_media,
         )
         values = await self._recall_embedder.encode_query(query)
         searches = {
