@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from typing import Annotated
-from uuid import uuid4
 
 from fastapi import Depends, FastAPI, Query, Request, status
 from fastapi.exceptions import RequestValidationError
@@ -49,6 +48,7 @@ from mindbridge.core import (
     ObjectStorageError,
     TaskBrokerError,
 )
+from mindbridge.telemetry import current_trace_id
 
 
 def create_app(
@@ -66,7 +66,7 @@ def create_app(
 
     @app.get("/healthz", response_model=HealthResponse, operation_id="health")
     async def health() -> HealthResponse:
-        return HealthResponse(trace_id=_new_trace_id())
+        return HealthResponse(trace_id=current_trace_id())
 
     @app.post(
         "/v1/observations",
@@ -217,7 +217,7 @@ def _register_request_error_handlers(app: FastAPI) -> None:
         response = ErrorResponse(
             code="request_validation_failed",
             message="request validation failed",
-            trace_id=_new_trace_id(),
+            trace_id=current_trace_id(),
             issues=tuple(
                 ValidationIssue(
                     location=tuple(str(part) for part in issue["loc"]),
@@ -240,7 +240,7 @@ def _register_request_error_handlers(app: FastAPI) -> None:
         response = ErrorResponse(
             code="idempotency_conflict" if is_conflict else "domain_invariant_failed",
             message=str(error),
-            trace_id=_new_trace_id(),
+            trace_id=current_trace_id(),
         )
         return JSONResponse(
             status_code=status.HTTP_409_CONFLICT
@@ -351,10 +351,6 @@ def _register_runtime_error_handlers(app: FastAPI) -> None:
         )
 
 
-def _new_trace_id() -> str:
-    return f"trace_{uuid4().hex}"
-
-
 def _error_response(status_code: int, *, code: str, message: str) -> JSONResponse:
-    response = ErrorResponse(code=code, message=message, trace_id=_new_trace_id())
+    response = ErrorResponse(code=code, message=message, trace_id=current_trace_id())
     return JSONResponse(status_code=status_code, content=response.model_dump())

@@ -29,6 +29,7 @@ from mindbridge.models import (
     OpenAIJinaEmbedder,
     OpenAIOmniAnswerer,
 )
+from mindbridge.telemetry import configure_telemetry, instrument_fastapi
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,13 +142,16 @@ def create_production_app(settings: RuntimeSettings | None = None) -> FastAPI:
         raise ValueError("MINDBRIDGE_TENANT_API_KEYS_JSON must be configured for the REST API")
     authenticator = TenantApiKeyAuthenticator.from_json(resolved_settings.tenant_api_keys_json)
     runtime = _build_runtime(resolved_settings)
+    telemetry = configure_telemetry("mindbridge-api")
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         async with runtime.open():
             yield
 
-    return create_app(runtime.kernel, authenticator=authenticator, lifespan=lifespan)
+    app = create_app(runtime.kernel, authenticator=authenticator, lifespan=lifespan)
+    instrument_fastapi(app, telemetry)
+    return app
 
 
 def create_production_mcp_server(
@@ -155,6 +159,7 @@ def create_production_mcp_server(
 ) -> MCPServer[None]:
     """Wire the production kernel into the official MCP server."""
     runtime = _build_runtime(settings or RuntimeSettings.from_environment())
+    configure_telemetry("mindbridge-mcp")
 
     @asynccontextmanager
     async def lifespan(_server: MCPServer[None]) -> AsyncIterator[None]:

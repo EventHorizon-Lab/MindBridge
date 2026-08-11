@@ -14,6 +14,9 @@ from billiard.exceptions import (  # type: ignore[import-untyped]  # Celery depe
     SoftTimeLimitExceeded,
 )
 from celery import Celery  # type: ignore[import-untyped]  # Upstream lacks PEP 561 metadata.
+from celery.signals import (  # type: ignore[import-untyped]  # Upstream lacks PEP 561 metadata.
+    worker_process_init,
+)
 
 from mindbridge.application import ProcessObservation
 from mindbridge.configuration import optional_environment_value, require_environment_value
@@ -39,10 +42,17 @@ from mindbridge.models import (
     JinaOmniEmbedder,
     OpenAIOmniEventPerceiver,
 )
+from mindbridge.telemetry import configure_telemetry
 
 _MODEL_REQUEST_TIMEOUT_SECONDS = 780.0
 _RUNNING_RETRY_SECONDS = 30
 _RUNNING_MAX_RETRIES = 40
+
+
+@worker_process_init.connect(weak=False)  # type: ignore[untyped-decorator]
+def _configure_worker_telemetry(**_kwargs: object) -> None:
+    """Initialize exporters after Celery forks its process-safe worker child."""
+    configure_telemetry("mindbridge-worker")
 
 
 class _RetryingTask(Protocol):

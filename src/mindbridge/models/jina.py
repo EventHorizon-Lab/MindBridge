@@ -11,6 +11,7 @@ from typing import Protocol, cast
 
 from mindbridge.application import EmbeddingInput
 from mindbridge.core import ModelOutputError, ModelReference, ModelUnavailableError
+from mindbridge.telemetry import set_current_span_attributes, trace_operation
 
 DEFAULT_JINA_OMNI_MODEL_ID = "jinaai/jina-embeddings-v5-omni-small-retrieval"
 DEFAULT_JINA_OMNI_REVISION = "12949877f0092093f366c6450340011320152a05"
@@ -128,6 +129,7 @@ class JinaOmniEmbedder:
         """Return the configured Matryoshka output dimension."""
         return self._dimension
 
+    @trace_operation("mindbridge.model.encode_queries")
     async def encode_queries(
         self,
         inputs: tuple[EmbeddingInput, ...],
@@ -135,6 +137,7 @@ class JinaOmniEmbedder:
         """Encode retrieval queries with the upstream query prompt semantics."""
         return await self._encode(inputs, self._encoder.encode_query)
 
+    @trace_operation("mindbridge.model.encode_documents")
     async def encode_documents(
         self,
         inputs: tuple[EmbeddingInput, ...],
@@ -149,6 +152,14 @@ class JinaOmniEmbedder:
     ) -> tuple[tuple[float, ...], ...]:
         if not inputs:
             return ()
+        set_current_span_attributes(
+            {
+                "mindbridge.model.id": self._model_reference.model_id,
+                "mindbridge.model.revision": self._model_reference.revision,
+                "mindbridge.embedding.dimension": self._dimension,
+                "mindbridge.embedding.input_count": len(inputs),
+            }
+        )
         async with self._semaphore:
             matrix = await asyncio.to_thread(
                 encode,

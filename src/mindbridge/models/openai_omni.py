@@ -22,6 +22,7 @@ from mindbridge.contracts import RecallRequest
 from mindbridge.core import MemoryRecord, ModelOutputError
 from mindbridge.models.openai_chat import stream_text_completion
 from mindbridge.models.openai_media import OpenAIContentPart, media_content_part
+from mindbridge.telemetry import set_current_span_attributes, trace_operation
 
 DEFAULT_OMNI_MODEL_ID = "qwen3.8-max"
 ANSWER_FROM_EVIDENCE_PROMPT_VERSION = "answer_from_evidence_v2"
@@ -131,6 +132,7 @@ class OpenAIOmniAnswerer:
         """Return the fixed prompt identity used in run manifests."""
         return ANSWER_FROM_EVIDENCE_PROMPT_VERSION
 
+    @trace_operation("mindbridge.model.answer")
     async def answer(
         self,
         request: RecallRequest,
@@ -138,6 +140,14 @@ class OpenAIOmniAnswerer:
         evidence: tuple[ResolvedEvidence, ...],
     ) -> GeneratedAnswer:
         """Stream one grounded completion and reject malformed provider output."""
+        set_current_span_attributes(
+            {
+                "mindbridge.model.id": self._model_id,
+                "mindbridge.prompt.version": ANSWER_FROM_EVIDENCE_PROMPT_VERSION,
+                "mindbridge.memory.count": len(memories),
+                "mindbridge.evidence.count": len(evidence),
+            }
+        )
         messages = _messages(
             request,
             memories,

@@ -23,6 +23,7 @@ from mindbridge.edge.outbox import EdgeMediaFile, SQLiteObservationOutbox
 from mindbridge.file_integrity import sha256_file
 from mindbridge.infrastructure import tenant_s3_object_key
 from mindbridge.sdk import AsyncMindBridge, MindBridgeClientError
+from mindbridge.telemetry import set_current_span_attributes, trace_operation
 
 if TYPE_CHECKING:
     from mypy_boto3_s3 import S3Client
@@ -112,6 +113,7 @@ class EdgeObservationSynchronizer:
         self._memory = memory
         self._upload_media = upload_media
 
+    @trace_operation("mindbridge.edge.sync_observation")
     async def sync_next(self) -> ObservationReceipt | None:
         """Synchronize the oldest item, leaving it durable after any network failure."""
         item = self._outbox.next_pending()
@@ -122,6 +124,14 @@ class EdgeObservationSynchronizer:
             item = self._outbox.next_pending()
         if item is None:
             return None
+        set_current_span_attributes(
+            {
+                "mindbridge.tenant.id": item.request.tenant_id,
+                "mindbridge.device.id": item.request.device_id,
+                "mindbridge.outbox.attempt": item.attempts,
+                "mindbridge.media.count": len(item.media_files),
+            }
+        )
         if not item.media_uploaded:
             try:
                 for media_file in item.media_files:
@@ -138,6 +148,7 @@ class EdgeObservationSynchronizer:
         self._outbox.acknowledge(item, receipt)
         return receipt
 
+    @trace_operation("mindbridge.edge.sync_deletions")
     async def sync_deletions(
         self,
         tenant_id: str,
@@ -164,6 +175,7 @@ class EdgeObservationSynchronizer:
             cursor = page.next_cursor
         return applied
 
+    @trace_operation("mindbridge.edge.sync_pending")
     async def sync_pending(self, *, limit: int = 100) -> tuple[ObservationReceipt, ...]:
         """Synchronize at most `limit` items so the caller controls scheduling and backoff."""
         if limit <= 0:

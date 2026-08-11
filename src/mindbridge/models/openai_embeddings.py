@@ -22,6 +22,7 @@ from mindbridge.models.openai_omni import (
     DEFAULT_VIDEO_MAX_PIXELS,
     normalize_openai_base_url,
 )
+from mindbridge.telemetry import set_current_span_attributes, trace_operation
 
 
 class _UserMessage(TypedDict):
@@ -93,8 +94,18 @@ class OpenAIJinaEmbedder:
     def dimension(self) -> int:
         return self._dimension
 
+    @trace_operation("mindbridge.model.encode_query")
     async def encode_query(self, query: RecallEmbeddingQuery) -> tuple[float, ...]:
         """Encode one retrieval query with Jina's query-side prompt semantics."""
+        set_current_span_attributes(
+            {
+                "mindbridge.model.id": self._model_reference.model_id,
+                "mindbridge.model.revision": self._model_reference.revision,
+                "mindbridge.embedding.dimension": self._dimension,
+                "mindbridge.query.media_count": len(query.media),
+                "mindbridge.query.has_text": query.text is not None,
+            }
+        )
         try:
             if query.media:
                 response = await self._encode_multimodal(query)
@@ -111,8 +122,16 @@ class OpenAIJinaEmbedder:
 
         return self._embedding_vector(response)
 
+    @trace_operation("mindbridge.model.encode_memory_document")
     async def encode_memory_document(self, text: str) -> tuple[float, ...]:
         """Encode one explicit memory with Jina's document-side prompt semantics."""
+        set_current_span_attributes(
+            {
+                "mindbridge.model.id": self._model_reference.model_id,
+                "mindbridge.model.revision": self._model_reference.revision,
+                "mindbridge.embedding.dimension": self._dimension,
+            }
+        )
         if not text.strip():
             raise DomainInvariantError("memory document text must not be blank")
         try:

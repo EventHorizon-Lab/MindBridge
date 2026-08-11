@@ -8,7 +8,6 @@ import json
 import math
 from collections.abc import Callable
 from datetime import datetime, timezone
-from uuid import uuid4
 
 from mindbridge.application.evidence import resolve_evidence_media
 from mindbridge.application.ports import (
@@ -78,6 +77,11 @@ from mindbridge.core import (
     derive_observation_id,
     derive_stable_id,
 )
+from mindbridge.telemetry import (
+    current_trace_id,
+    set_current_span_attributes,
+    trace_operation,
+)
 
 
 class MemoryKernel:
@@ -111,8 +115,18 @@ class MemoryKernel:
         self._minimum_embedding_similarity = minimum_embedding_similarity
         self._clock = clock or _utc_now
 
+    @trace_operation("mindbridge.observe")
     async def observe(self, request: ObserveRequest) -> ObservationReceipt:
         """Persist one observation atomically and acknowledge retries."""
+        set_current_span_attributes(
+            {
+                "mindbridge.tenant.id": request.tenant_id,
+                "mindbridge.device.id": request.device_id,
+                "mindbridge.observation.sequence": request.sequence,
+                "mindbridge.media.count": len(request.media_objects),
+                "mindbridge.identity.count": len(request.identity_observations),
+            }
+        )
         observation = _build_observation(request)
         batch = ObservationBatch(
             media_objects=tuple(
@@ -139,11 +153,19 @@ class MemoryKernel:
             processing_job_id=result.processing_job_id,
             idempotency_key=idempotency_key,
             status=(ObservationStatus.ACCEPTED if result.created else ObservationStatus.DUPLICATE),
-            trace_id=_new_id("trace"),
+            trace_id=current_trace_id(),
         )
 
+    @trace_operation("mindbridge.remember")
     async def remember(self, request: RememberRequest) -> MemoryView:
         """Persist explicit content without pretending unsupported input is fact."""
+        set_current_span_attributes(
+            {
+                "mindbridge.tenant.id": request.tenant_id,
+                "mindbridge.memory.type": request.memory_type.value,
+                "mindbridge.evidence.count": len(request.evidence_ids),
+            }
+        )
         idempotency_key = request.idempotency_key or f"remember_{_request_digest(request)}"
         memory = MemoryRecord(
             memory_id=MemoryId(derive_stable_id("memory", request.tenant_id, idempotency_key)),
@@ -167,8 +189,16 @@ class MemoryKernel:
         await self._index_memory(stored_memory)
         return _memory_view(stored_memory)
 
+    @trace_operation("mindbridge.record_feedback")
     async def record_feedback(self, request: FeedbackRequest) -> FeedbackReceipt:
         """Record an explainable learning signal and create a correction version when needed."""
+        set_current_span_attributes(
+            {
+                "mindbridge.tenant.id": request.tenant_id,
+                "mindbridge.feedback.type": request.feedback_type.value,
+                "mindbridge.feedback.has_correction": request.correction_summary is not None,
+            }
+        )
         content_digest = _request_digest(request)
         idempotency_key = request.idempotency_key or f"feedback_{content_digest}"
         feedback = MemoryFeedback(
@@ -205,11 +235,19 @@ class MemoryKernel:
             resulting_state=result.resulting_state,
             resulting_strength=result.resulting_strength,
             created_at=result.created_at,
-            trace_id=_new_id("trace"),
+            trace_id=current_trace_id(),
         )
 
+    @trace_operation("mindbridge.forget")
     async def forget(self, request: ForgetRequest) -> ForgetReceipt:
         """Explicitly erase one scope through a durable, retry-safe tombstone."""
+        set_current_span_attributes(
+            {
+                "mindbridge.tenant.id": request.tenant_id,
+                "mindbridge.forget.target_type": request.target_type.value,
+                "mindbridge.forget.target_id": request.target_id,
+            }
+        )
         content_digest = _request_digest(request)
         idempotency_key = request.idempotency_key or f"forget_{content_digest}"
         tombstone = DeletionTombstone(
@@ -250,16 +288,30 @@ class MemoryKernel:
             completed = plan.tombstone
         return _forget_receipt(completed)
 
+    @trace_operation("mindbridge.get_forget_status")
     async def get_forget_status(self, tenant_id: str, tombstone_id: str) -> ForgetReceipt:
         """Return content-free deletion progress for one tenant-owned tombstone."""
+        set_current_span_attributes(
+            {
+                "mindbridge.tenant.id": tenant_id,
+                "mindbridge.tombstone.id": tombstone_id,
+            }
+        )
         tombstone = await self._store.read_deletion_tombstone(
             TenantId(tenant_id),
             tombstone_id,
         )
         return _forget_receipt(tombstone)
 
+    @trace_operation("mindbridge.list_deletions")
     async def list_deletions(self, request: DeletionListRequest) -> DeletionPage:
         """List stable deletion barriers for reconnecting edge devices."""
+        set_current_span_attributes(
+            {
+                "mindbridge.tenant.id": request.tenant_id,
+                "mindbridge.page.limit": request.limit,
+            }
+        )
         tombstones = await self._store.list_deletion_tombstones(
             TenantId(request.tenant_id),
             after_tombstone_id=request.cursor,
@@ -269,15 +321,22 @@ class MemoryKernel:
         return DeletionPage(
             items=tuple(_deletion_view(tombstone) for tombstone in page),
             next_cursor=(page[-1].tombstone_id if len(tombstones) > request.limit else None),
-            trace_id=_new_id("trace"),
+            trace_id=current_trace_id(),
         )
 
+    @trace_operation("mindbridge.get_observation_job")
     async def get_observation_job(
         self,
         tenant_id: str,
         job_id: str,
     ) -> ObservationProcessingJobView:
         """Return one tenant-owned observation processing state."""
+        set_current_span_attributes(
+            {
+                "mindbridge.tenant.id": tenant_id,
+                "mindbridge.job.id": job_id,
+            }
+        )
         job = await self._store.read_observation_processing_job(
             TenantId(tenant_id),
             JobId(job_id),
@@ -290,16 +349,33 @@ class MemoryKernel:
             error_code=job.error_code,
             created_at=job.created_at,
             updated_at=job.updated_at,
-            trace_id=_new_id("trace"),
+            trace_id=current_trace_id(),
         )
 
+    @trace_operation("mindbridge.get_memory")
     async def get_memory(self, tenant_id: str, memory_id: str) -> MemoryView:
         """Return one tenant-owned memory through the shared stable view."""
+        set_current_span_attributes(
+            {
+                "mindbridge.tenant.id": tenant_id,
+                "mindbridge.memory.id": memory_id,
+            }
+        )
         memory = await self._store.read_memory(TenantId(tenant_id), MemoryId(memory_id))
         return _memory_view(memory)
 
+    @trace_operation("mindbridge.recall")
     async def recall(self, request: RecallRequest) -> RecallResult:
         """Retrieve memories, inspect evidence, and answer only when supported."""
+        set_current_span_attributes(
+            {
+                "mindbridge.tenant.id": request.tenant_id,
+                "mindbridge.recall.mode": request.mode.value,
+                "mindbridge.recall.limit": request.limit,
+                "mindbridge.query.has_text": request.query.text is not None,
+                "mindbridge.query.media_count": len(request.query.media_object_ids),
+            }
+        )
         candidate_limit = min(request.limit * 4, 100)
         semantic_search = self._search_semantic_memories(request, limit=candidate_limit)
         if request.query.text is None:
@@ -329,6 +405,13 @@ class MemoryKernel:
             generated = await self._answerer.answer(request, supported_memories, evidence)
             answer = generated.answer
             confidence = generated.confidence
+        set_current_span_attributes(
+            {
+                "mindbridge.recall.memory_count": len(memories),
+                "mindbridge.recall.evidence_count": len(evidence),
+                "mindbridge.recall.answered": answer is not None,
+            }
+        )
         return RecallResult(
             answer=answer,
             confidence=confidence,
@@ -336,9 +419,10 @@ class MemoryKernel:
             evidence=(
                 tuple(_evidence_view(item) for item in evidence) if request.include_evidence else ()
             ),
-            trace_id=_new_id("trace"),
+            trace_id=current_trace_id(),
         )
 
+    @trace_operation("mindbridge.recall.semantic_search")
     async def _search_semantic_memories(
         self,
         request: RecallRequest,
@@ -377,6 +461,12 @@ class MemoryKernel:
             self._store.search_memories_by_evidence(request, evidence_ids, limit=limit),
             self._store.search_memories_by_ids(request, memory_ids, limit=limit),
         )
+        set_current_span_attributes(
+            {
+                "mindbridge.recall.evidence_match_count": len(evidence_matches),
+                "mindbridge.recall.memory_match_count": len(memory_matches),
+            }
+        )
         return fuse_memory_rankings(
             (evidence_memories, direct_memories),
             limit=limit,
@@ -401,7 +491,16 @@ class MemoryKernel:
             supersedes_memory_id=original.memory_id,
         )
 
+    @trace_operation("mindbridge.index_memory")
     async def _index_memory(self, memory: MemoryRecord) -> None:
+        set_current_span_attributes(
+            {
+                "mindbridge.tenant.id": memory.tenant_id,
+                "mindbridge.memory.id": memory.memory_id,
+                "mindbridge.model.id": self._recall_embedder.model_reference.model_id,
+                "mindbridge.embedding.dimension": self._recall_embedder.dimension,
+            }
+        )
         values = await self._recall_embedder.encode_memory_document(memory.summary)
         await self._embedding_index.write_embedding(
             EmbeddingRecord(
@@ -427,6 +526,7 @@ class MemoryKernel:
             )
         )
 
+    @trace_operation("mindbridge.recall.resolve_query_media")
     async def _resolve_query_media(
         self,
         request: RecallRequest,
@@ -456,6 +556,7 @@ class MemoryKernel:
             for media_object_id, download in zip(requested_ids, downloads, strict=True)
         )
 
+    @trace_operation("mindbridge.recall.resolve_evidence")
     async def _read_recall_evidence(
         self,
         request: RecallRequest,
@@ -591,7 +692,7 @@ def _evidence_view(evidence: ResolvedEvidence) -> EvidenceView:
 def _forget_receipt(tombstone: DeletionTombstone) -> ForgetReceipt:
     return ForgetReceipt(
         **_deletion_view(tombstone).model_dump(),
-        trace_id=_new_id("trace"),
+        trace_id=current_trace_id(),
     )
 
 
@@ -611,10 +712,6 @@ def _request_digest(request: ContractModel) -> str:
     payload = request.model_dump(mode="json", exclude={"idempotency_key"})
     canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-
-
-def _new_id(prefix: str) -> str:
-    return f"{prefix}_{uuid4().hex}"
 
 
 def _utc_now() -> datetime:

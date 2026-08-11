@@ -297,9 +297,21 @@ export MINDBRIDGE_EMBEDDING_MODEL_ID=jinaai/jina-embeddings-v5-omni-small-retrie
 export MINDBRIDGE_EMBEDDING_MODEL_REVISION=12949877f0092093f366c6450340011320152a05
 export MINDBRIDGE_MINIMUM_EMBEDDING_SIMILARITY=0.0
 export MINDBRIDGE_TENANT_API_KEYS_JSON='{"tenant_01":["replace-with-at-least-32-random-characters"]}'
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318
+export OTEL_TRACES_SAMPLER=parentbased_traceidratio
+export OTEL_TRACES_SAMPLER_ARG=0.1
 
 uv run uvicorn mindbridge.api:create_production_app --factory
 ```
+
+OpenTelemetry is activated only when a standard common or signal-specific OTLP endpoint is set;
+without one it remains a no-op. The API, MCP process, Worker, edge sync, and lifecycle command use
+distinct default `service.name` values. Override them per process with `OTEL_SERVICE_NAME` when the
+deployment needs a namespace. The official FastAPI, HTTPX, Psycopg, Celery, and Botocore
+instrumentations propagate W3C context through REST, model calls, PostgreSQL, S3, and queued jobs.
+MindBridge does not capture authorization headers, request bodies, prompts, memory text, or media in
+telemetry. Response `trace_id` values use `trace_<32-hex W3C trace ID>` so the suffix maps directly
+to the configured backend. Set `OTEL_SDK_DISABLED=true` for an explicit process-level opt-out.
 
 Agents can start the same production kernel over the official MCP stdio transport. Tool input and
 structured output schemas are generated from the same Pydantic contracts used by REST and Python:

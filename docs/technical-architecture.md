@@ -1061,7 +1061,8 @@ Jina v5 Omni Small 是默认实现，但每次替换前使用同一证据集比�
 
 ### 15.2 可观测性
 
-使用 OpenTelemetry 贯穿：
+使用官方 OpenTelemetry Python SDK、OTLP/HTTP exporter 和 FastAPI、HTTPX、Psycopg、Celery、
+Botocore instrumentation 贯穿：
 
 ```text
 observe receipt
@@ -1074,7 +1075,21 @@ observe receipt
 → answer/evidence
 ```
 
-日志只记录 ID、耗时、模型版本、token/frame/audio 秒数和错误；默认不写原始人脸、音频内容、完整 Prompt 或用户记忆正文。
+运行时只读取标准 `OTEL_*` 环境变量；设置 common 或 signal-specific
+`OTEL_EXPORTER_OTLP_*_ENDPOINT` 才启用，否则保持 no-op。API、MCP、Worker、Edge Sync 和
+Lifecycle 使用不同的默认 `service.name`。FastAPI server context 通过 HTTPX 传播到模型/API，
+并通过 Celery header 传播到 prefork Worker；Worker 的 SDK 与 BatchSpanProcessor 必须在
+`worker_process_init` 后初始化，不能在父进程启动后台线程。
+
+`observe`、`process_observation`、perception、embedding、recall candidate、evidence resolve、
+answer、forget 和 lifecycle 使用命名领域 span。span 只包含 tenant/device/object ID、数量、
+状态、模型/revision、Prompt version 和性能数据；不采集 Authorization、请求/响应 body、查询
+正文、完整 Prompt、生物 embedding 或原始媒体。API/MCP 返回的 `trace_id` 使用当前 W3C trace
+ID；无 SDK 的嵌入式调用才生成独立 fallback ID。
+
+日志同样只记录 ID、耗时、模型版本、token/frame/audio 秒数和错误；默认不写原始人脸、音频
+内容、完整 Prompt 或用户记忆正文。生产导出先进入 OpenTelemetry Collector，再由 Collector
+负责采样、批处理、脱敏和后端路由。
 
 ## 16. 实施阶段
 

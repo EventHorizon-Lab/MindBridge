@@ -32,6 +32,7 @@ from mindbridge.models.openai_omni import (
     DEFAULT_VIDEO_MAX_PIXELS,
     normalize_openai_base_url,
 )
+from mindbridge.telemetry import set_current_span_attributes, trace_operation
 
 PERCEIVE_EVENTS_PROMPT_VERSION = "perceive_events_v2"
 
@@ -145,12 +146,20 @@ class OpenAIOmniEventPerceiver:
             request_timeout_seconds=request_timeout_seconds,
         )
 
+    @trace_operation("mindbridge.model.perceive_events")
     async def perceive_events(
         self,
         observation: Observation,
         evidence: tuple[ResolvedEvidence, ...],
     ) -> EventPerception:
         """Stream one perception result and validate it against source evidence."""
+        set_current_span_attributes(
+            {
+                "mindbridge.model.id": self._model_id,
+                "mindbridge.prompt.version": PERCEIVE_EVENTS_PROMPT_VERSION,
+                "mindbridge.evidence.count": len(evidence),
+            }
+        )
         _require_observation_evidence(observation, evidence)
         messages = _messages(
             observation,

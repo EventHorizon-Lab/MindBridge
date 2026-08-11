@@ -41,6 +41,7 @@ from mindbridge.core import (
     VerificationStatus,
     derive_stable_id,
 )
+from mindbridge.telemetry import set_current_span_attributes, trace_operation
 
 
 class ProcessObservation:
@@ -59,6 +60,7 @@ class ProcessObservation:
         self._embedder = embedder
         self._media_url_signer = media_url_signer
 
+    @trace_operation("mindbridge.process_observation")
     async def run(
         self,
         tenant_id: TenantId,
@@ -66,6 +68,13 @@ class ProcessObservation:
         job_id: JobId,
     ) -> ObservationProcessingJob:
         """Process one claimed attempt or return its existing durable state."""
+        set_current_span_attributes(
+            {
+                "mindbridge.tenant.id": tenant_id,
+                "mindbridge.observation.id": observation_id,
+                "mindbridge.job.id": job_id,
+            }
+        )
         claim = await self._store.claim_observation_processing_job(
             tenant_id,
             observation_id,
@@ -86,6 +95,14 @@ class ProcessObservation:
             perception = await self._perceiver.perceive_events(batch.observation, evidence)
             _require_grounded_perception(batch.observation, evidence, perception.events)
             events = _events(batch.observation, perception, claim.job.created_at)
+            set_current_span_attributes(
+                {
+                    "mindbridge.event.count": len(events),
+                    "mindbridge.evidence.count": len(evidence),
+                    "mindbridge.model.id": perception.model_reference.model_id,
+                    "mindbridge.prompt.version": perception.prompt_version,
+                }
+            )
             output = ObservationProcessingOutput(
                 events=events,
                 memories=tuple(_event_memory(event) for event in events),

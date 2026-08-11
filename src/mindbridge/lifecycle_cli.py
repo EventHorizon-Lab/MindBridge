@@ -24,6 +24,7 @@ from mindbridge.core import (
     TenantId,
 )
 from mindbridge.infrastructure import PostgresMemoryStore
+from mindbridge.telemetry import configure_telemetry
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,6 +78,7 @@ async def sweep_tenant_lifecycle(
 
 def main(argv: Sequence[str] | None = None) -> None:
     """Run one tenant sweep using PostgreSQL configured by the process environment."""
+    configure_telemetry("mindbridge-lifecycle")
     options = _parser().parse_args(argv)
     policy = MemoryStrengthPolicy(
         access_weight=options.access_weight,

@@ -12,10 +12,12 @@ from mindbridge.edge.deletion_inbox import SQLiteDeletionInbox
 from mindbridge.edge.outbox import SQLiteObservationOutbox
 from mindbridge.edge.sync import EdgeObservationSynchronizer, S3EdgeMediaUploader
 from mindbridge.sdk import AsyncMindBridge
+from mindbridge.telemetry import configure_telemetry
 
 
 def main() -> None:
     """Upload and submit a bounded batch, leaving failures durable for the next run."""
+    configure_telemetry("mindbridge-edge")
     parser = argparse.ArgumentParser()
     parser.add_argument("--database", type=Path, required=True)
     parser.add_argument("--api-base-url", required=True)

@@ -15,6 +15,7 @@ from mindbridge.core import (
     TenantId,
     evolve_memory_strength,
 )
+from mindbridge.telemetry import set_current_span_attributes, trace_operation
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,8 +92,15 @@ class EvolveMemoryLifecycle:
         self._store = store
         self._policy = policy
 
+    @trace_operation("mindbridge.lifecycle.evolve_page")
     async def run(self, request: LifecycleSweepRequest) -> LifecycleSweepResult:
         """Evaluate one page and return the cursor needed for the next page."""
+        set_current_span_attributes(
+            {
+                "mindbridge.tenant.id": request.tenant_id,
+                "mindbridge.page.limit": request.limit,
+            }
+        )
         candidates = await self._store.list_memories_for_lifecycle(
             request.tenant_id,
             after_memory_id=request.after_memory_id,
@@ -111,6 +119,12 @@ class EvolveMemoryLifecycle:
                 )
             )
         updated_count = await self._store.update_memory_lifecycles(tuple(changes)) if changes else 0
+        set_current_span_attributes(
+            {
+                "mindbridge.lifecycle.evaluated_count": len(page),
+                "mindbridge.lifecycle.updated_count": updated_count,
+            }
+        )
         return LifecycleSweepResult(
             evaluated_count=len(page),
             updated_count=updated_count,
