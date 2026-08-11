@@ -8,6 +8,7 @@ from collections.abc import Callable
 from datetime import datetime, timezone
 from uuid import uuid4
 
+from mindbridge.application.evidence import resolve_evidence_media
 from mindbridge.application.ports import (
     MediaUrlSigner,
     MemoryAnswerer,
@@ -162,19 +163,10 @@ class MemoryKernel:
         media_objects = await self._store.read_media_objects(tenant_id, media_object_ids)
         if len(media_objects) != len(media_object_ids):
             raise MemoryIntegrityError("evidence references missing media")
-        media_by_id = {item.media_object_id: item for item in media_objects}
-        downloads = {
-            item.media_object_id: await self._media_url_signer.create_presigned_download(item)
-            for item in media_objects
-        }
-        return tuple(
-            ResolvedEvidence(
-                evidence_span=evidence,
-                media_object=media_by_id[evidence.media_object_id],
-                media_url=downloads[evidence.media_object_id].download_url,
-                media_url_expires_at=downloads[evidence.media_object_id].expires_at,
-            )
-            for evidence in evidence_spans
+        return await resolve_evidence_media(
+            evidence_spans,
+            media_objects,
+            self._media_url_signer,
         )
 
 
