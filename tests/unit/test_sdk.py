@@ -23,6 +23,7 @@ async def test_recall_uses_shared_request_and_response_contracts() -> None:
         assert json.loads(request.content) == {
             "tenant_id": "tenant_01",
             "query": {"text": "Where is the tool?", "media_object_ids": []},
+            "memory_ids": [],
             "filters": {
                 "person_ids": [],
                 "device_ids": [],

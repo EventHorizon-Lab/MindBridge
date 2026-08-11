@@ -122,6 +122,7 @@ class RecallMemories:
                 "mindbridge.recall.limit": request.limit,
                 "mindbridge.query.has_text": request.query.text is not None,
                 "mindbridge.query.media_count": len(request.query.media_object_ids),
+                "mindbridge.query.memory_count": len(request.memory_ids),
             }
         )
         query_media = await self._resolve_query_media(request)
@@ -221,6 +222,12 @@ class RecallMemories:
         *,
         limit: int,
     ) -> tuple[MemoryRecord, ...]:
+        if request.memory_ids:
+            return await self._store.search_memories_by_ids(
+                request,
+                tuple(MemoryId(memory_id) for memory_id in request.memory_ids),
+                limit=limit,
+            )
         semantic_search = self._search_semantic_memories(
             request,
             query_media,

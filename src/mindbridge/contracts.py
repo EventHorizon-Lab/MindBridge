@@ -294,10 +294,18 @@ class RecallRequest(ContractModel):
 
     tenant_id: Identifier
     query: RecallQuery
+    memory_ids: Annotated[tuple[Identifier, ...], Field(max_length=100)] = ()
     filters: RecallFilters = Field(default_factory=RecallFilters)
     mode: RecallMode = RecallMode.ANSWER
     limit: Annotated[int, Field(ge=1, le=100)] = 20
     include_evidence: bool = True
+
+    @model_validator(mode="after")
+    def require_unique_memory_scope(self) -> RecallRequest:
+        """Keep explicit follow-up context ordered and unambiguous."""
+        if len(set(self.memory_ids)) != len(self.memory_ids):
+            raise ValueError("recall memory_ids must be unique")
+        return self
 
 
 class MemoryView(ContractModel):

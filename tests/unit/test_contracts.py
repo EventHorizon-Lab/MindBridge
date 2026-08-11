@@ -70,6 +70,15 @@ def test_recall_defaults_to_returning_evidence() -> None:
     assert request.include_evidence is True
 
 
+def test_recall_rejects_duplicate_explicit_memory_context() -> None:
+    with pytest.raises(ValidationError, match="memory_ids must be unique"):
+        RecallRequest(
+            tenant_id="tenant_01",
+            query=RecallQuery(text="What happened next?"),
+            memory_ids=("memory_01", "memory_01"),
+        )
+
+
 def test_recall_filters_reject_reversed_time_range() -> None:
     """Structured time filtering rejects impossible intervals."""
     with pytest.raises(ValidationError, match="occurred_before"):

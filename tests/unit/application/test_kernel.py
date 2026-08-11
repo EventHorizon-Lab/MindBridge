@@ -880,6 +880,30 @@ async def test_semantic_memory_finds_attested_text_without_matching_words() -> N
     assert result.answer == memory.summary
 
 
+async def test_recall_scopes_followup_to_explicit_memory_ids() -> None:
+    store = InMemoryStore()
+    recall_embedder = RecordingRecallEmbedder()
+    kernel = _kernel(store, RecordingAnswerer(), recall_embedder=recall_embedder)
+    await kernel.remember(_remember_request(idempotency_key="first"))
+    scoped = await kernel.remember(
+        _remember_request(idempotency_key="second").model_copy(
+            update={"summary": "The robot later closed the green drawer."}
+        )
+    )
+
+    result = await kernel.recall(
+        RecallRequest(
+            tenant_id="tenant_01",
+            query=RecallQuery(text="What happened next?"),
+            memory_ids=(scoped.memory_id,),
+        )
+    )
+
+    assert [memory.memory_id for memory in result.memories] == [scoped.memory_id]
+    assert result.answer == scoped.summary
+    assert recall_embedder.queries == []
+
+
 async def test_semantic_event_follows_its_memory_representation() -> None:
     store = InMemoryStore()
     kernel = _kernel(store, RecordingAnswerer())
@@ -1009,6 +1033,26 @@ async def test_enumerate_refuses_to_silently_truncate_a_broad_scope() -> None:
         )
 
     assert answerer.occurrence_batches == []
+
+
+async def test_enumerate_respects_explicit_memory_scope() -> None:
+    store = InMemoryStore()
+    await _write_attested_memories(store, 3)
+
+    result = await _kernel(store, RecordingAnswerer()).recall(
+        RecallRequest(
+            tenant_id="tenant_01",
+            query=RecallQuery(text="count this context"),
+            memory_ids=("memory_0002", "memory_0000"),
+            mode=RecallMode.ENUMERATE,
+        )
+    )
+
+    assert result.answer == "2"
+    assert [memory.memory_id for memory in result.memories] == [
+        "memory_0000",
+        "memory_0002",
+    ]
 
 
 def test_generated_answer_rejects_confidence_without_answer() -> None:

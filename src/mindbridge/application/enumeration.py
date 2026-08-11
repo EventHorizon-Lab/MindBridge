@@ -18,7 +18,9 @@ from mindbridge.application.ports import (
 from mindbridge.contracts import RecallRequest
 from mindbridge.core import (
     EnumerationLimitExceededError,
+    MemoryId,
     MemoryRecord,
+    MemoryType,
     ModelOutputError,
     TenantId,
     VerificationStatus,
@@ -66,9 +68,23 @@ class EnumerateMemories:
         request: RecallRequest,
         query_media: tuple[ResolvedQueryMedia, ...],
     ) -> EnumerationResult:
-        candidates = await self._store.list_memories_for_enumeration(
-            request,
-            limit=ENUMERATION_CANDIDATE_LIMIT + 1,
+        candidates = (
+            await self._store.search_memories_by_ids(
+                request,
+                tuple(MemoryId(memory_id) for memory_id in request.memory_ids),
+                limit=len(request.memory_ids),
+            )
+            if request.memory_ids
+            else await self._store.list_memories_for_enumeration(
+                request,
+                limit=ENUMERATION_CANDIDATE_LIMIT + 1,
+            )
+        )
+        candidates = tuple(
+            sorted(
+                (memory for memory in candidates if memory.memory_type is MemoryType.EPISODIC),
+                key=lambda memory: (memory.occurred_at, memory.memory_id),
+            )
         )
         if len(candidates) > ENUMERATION_CANDIDATE_LIMIT:
             raise EnumerationLimitExceededError(

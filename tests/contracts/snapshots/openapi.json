@@ -1121,6 +1121,17 @@
             "title": "Limit",
             "type": "integer"
           },
+          "memory_ids": {
+            "default": [],
+            "items": {
+              "maxLength": 255,
+              "minLength": 1,
+              "type": "string"
+            },
+            "maxItems": 100,
+            "title": "Memory Ids",
+            "type": "array"
+          },
           "mode": {
             "$ref": "#/components/schemas/RecallMode",
             "default": "answer"

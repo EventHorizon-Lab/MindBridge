@@ -352,6 +352,10 @@ finally:
     await memory.close()
 ```
 
+For a grounded follow-up, pass selected IDs from the previous result in
+`RecallRequest.memory_ids`. Those IDs become the strict candidate scope; MindBridge still applies
+tenant, lifecycle, deletion, and evidence checks, but does not search unrelated memory.
+
 Set `mode="enumerate"` for exhaustive count/timeline queries. This path scans the complete
 structured-filter scope, verifies candidates against original media in bounded Omni batches, and
 returns every occurrence chronologically; scopes above 1,000 candidates fail explicitly instead of

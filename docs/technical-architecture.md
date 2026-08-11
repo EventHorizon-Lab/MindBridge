@@ -481,7 +481,11 @@ PostgreSQL FTS、结构化过滤、RRF 和原始视听证据重看。Event/Claim
 
 ### 7.3 追问
 
-`recall` 返回的每条记忆都带稳定 ID 和证据。后续追问通过 `conversation_id`、`previous_recall_id` 或显式 `memory_ids` 限定上下文；服务端不把整段历史无限拼接，而是保留本轮使用过的证据集合和查询约束。
+`recall` 返回的每条记忆都带稳定 ID 和证据。当前生产契约通过请求顶层显式 `memory_ids`
+完成后续追问：调用方回传上一轮需要继续追问的 Memory ID，服务端将其作为严格候选范围，跳过
+新的全库语义检索，但仍执行租户、版本、删除状态、结构化过滤和原始证据核验。最多可限定 100 条
+且 ID 不得重复；`enumerate` 同样只在该范围内按时间验证。服务端不保存或无限拼接整段会话历史。
+只有产品需要服务端托管会话时，再增加 `conversation_id` 或 `previous_recall_id` 状态。
 
 ### 7.4 计数和时间问题
 
@@ -635,8 +639,9 @@ HTTP、Python 和 MCP 共享同一层 use case，不各自复制业务逻辑。
 {
   "query": {
     "text": "我最后一次把红色螺丝刀放在哪里？",
-    "media": []
+    "media_object_ids": []
   },
+  "memory_ids": [],
   "filters": {
     "person_ids": [],
     "device_ids": [],
