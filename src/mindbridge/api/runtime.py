@@ -16,6 +16,7 @@ from mindbridge.api.auth import TenantApiKeyAuthenticator
 from mindbridge.api.mcp import create_mcp_server
 from mindbridge.application import MemoryKernel
 from mindbridge.configuration import optional_environment_value, require_environment_value
+from mindbridge.core import EmbeddingSpaceReference
 from mindbridge.infrastructure import (
     CeleryObservationJobPublisher,
     PostgresMemoryStore,
@@ -25,6 +26,9 @@ from mindbridge.infrastructure import (
 from mindbridge.models import (
     DEFAULT_JINA_OMNI_MODEL_ID,
     DEFAULT_JINA_OMNI_REVISION,
+    DEFAULT_JINA_RETRIEVAL_SPACE,
+    DEFAULT_JINA_TEXT_MODEL_ID,
+    DEFAULT_JINA_TEXT_REVISION,
     DEFAULT_OMNI_MODEL_ID,
     OpenAIJinaEmbedder,
     OpenAIOmniAnswerer,
@@ -42,12 +46,18 @@ class RuntimeSettings:
     vlm_endpoint: str
     embedding_api_key: str = field(repr=False)
     embedding_endpoint: str
+    text_embedding_api_key: str = field(repr=False)
+    text_embedding_endpoint: str
     task_broker_url: str = field(repr=False)
     object_storage_endpoint_url: str | None = None
     object_storage_region: str = "us-east-1"
     vlm_model_id: str = DEFAULT_OMNI_MODEL_ID
     embedding_model_id: str = DEFAULT_JINA_OMNI_MODEL_ID
     embedding_model_revision: str = DEFAULT_JINA_OMNI_REVISION
+    text_embedding_model_id: str = DEFAULT_JINA_TEXT_MODEL_ID
+    text_embedding_model_revision: str = DEFAULT_JINA_TEXT_REVISION
+    embedding_space_id: str = DEFAULT_JINA_RETRIEVAL_SPACE.space_id
+    embedding_space_revision: str = DEFAULT_JINA_RETRIEVAL_SPACE.revision
     minimum_embedding_similarity: float = 0.0
     tenant_api_keys_json: str | None = field(default=None, repr=False)
 
@@ -64,6 +74,12 @@ class RuntimeSettings:
             ("embedding_endpoint", self.embedding_endpoint),
             ("embedding_model_id", self.embedding_model_id),
             ("embedding_model_revision", self.embedding_model_revision),
+            ("text_embedding_api_key", self.text_embedding_api_key),
+            ("text_embedding_endpoint", self.text_embedding_endpoint),
+            ("text_embedding_model_id", self.text_embedding_model_id),
+            ("text_embedding_model_revision", self.text_embedding_model_revision),
+            ("embedding_space_id", self.embedding_space_id),
+            ("embedding_space_revision", self.embedding_space_revision),
         ):
             if not value.strip():
                 raise ValueError(f"{name} must not be empty")
@@ -107,6 +123,24 @@ class RuntimeSettings:
             ),
             embedding_model_revision=source.get(
                 "MINDBRIDGE_EMBEDDING_MODEL_REVISION", DEFAULT_JINA_OMNI_REVISION
+            ),
+            text_embedding_api_key=require_environment_value(
+                source, "MINDBRIDGE_TEXT_EMBEDDING_API_KEY"
+            ),
+            text_embedding_endpoint=require_environment_value(
+                source, "MINDBRIDGE_TEXT_EMBEDDING_ENDPOINT"
+            ),
+            text_embedding_model_id=source.get(
+                "MINDBRIDGE_TEXT_EMBEDDING_MODEL_ID", DEFAULT_JINA_TEXT_MODEL_ID
+            ),
+            text_embedding_model_revision=source.get(
+                "MINDBRIDGE_TEXT_EMBEDDING_MODEL_REVISION", DEFAULT_JINA_TEXT_REVISION
+            ),
+            embedding_space_id=source.get(
+                "MINDBRIDGE_EMBEDDING_SPACE_ID", DEFAULT_JINA_RETRIEVAL_SPACE.space_id
+            ),
+            embedding_space_revision=source.get(
+                "MINDBRIDGE_EMBEDDING_SPACE_REVISION", DEFAULT_JINA_RETRIEVAL_SPACE.revision
             ),
             minimum_embedding_similarity=float(
                 source.get("MINDBRIDGE_MINIMUM_EMBEDDING_SIMILARITY", "0.0")
@@ -191,6 +225,14 @@ def _build_runtime(settings: RuntimeSettings) -> _ProductionRuntime:
         endpoint=settings.embedding_endpoint,
         model_id=settings.embedding_model_id,
         model_revision=settings.embedding_model_revision,
+        document_api_key=settings.text_embedding_api_key,
+        document_endpoint=settings.text_embedding_endpoint,
+        document_model_id=settings.text_embedding_model_id,
+        document_model_revision=settings.text_embedding_model_revision,
+        space_reference=EmbeddingSpaceReference(
+            space_id=settings.embedding_space_id,
+            revision=settings.embedding_space_revision,
+        ),
     )
     job_publisher = CeleryObservationJobPublisher(create_task_queue(settings.task_broker_url))
     kernel = MemoryKernel(

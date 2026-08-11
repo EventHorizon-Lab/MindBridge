@@ -26,6 +26,7 @@ from mindbridge.contracts import (
 )
 from mindbridge.core import (
     DeletionPropagationState,
+    EmbeddingSpaceReference,
     ForgetTargetNotFoundError,
     ForgetTargetType,
     JobId,
@@ -61,7 +62,9 @@ class FirstMemoryAnswerer:
 
 
 class FixedRecallEmbedder:
-    model_reference = ModelReference(model_id="jina-omni", revision="pinned-revision")
+    query_model_reference = ModelReference(model_id="jina-omni", revision="pinned-revision")
+    document_model_reference = ModelReference(model_id="jina-text", revision="pinned-revision")
+    space_reference = EmbeddingSpaceReference(space_id="jina-v5", revision="space-v1")
     dimension = 1_024
 
     async def encode_query(self, query: RecallEmbeddingQuery) -> tuple[float, ...]:

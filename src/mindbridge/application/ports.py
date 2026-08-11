@@ -13,6 +13,7 @@ from mindbridge.core import (
     DomainInvariantError,
     EmbeddedObjectType,
     EmbeddingRecord,
+    EmbeddingSpaceReference,
     Event,
     EvidenceId,
     EvidenceSpan,
@@ -218,7 +219,7 @@ class EmbeddingSearch:
 
     tenant_id: TenantId
     values: tuple[float, ...]
-    model_reference: ModelReference
+    space_reference: EmbeddingSpaceReference
     document_task: str
     object_types: tuple[EmbeddedObjectType, ...]
     limit: int
@@ -457,6 +458,9 @@ class OmniEmbedder(Protocol):
 
     @property
     def model_reference(self) -> ModelReference: ...
+
+    @property
+    def space_reference(self) -> EmbeddingSpaceReference: ...
 
     @property
     def dimension(self) -> int: ...

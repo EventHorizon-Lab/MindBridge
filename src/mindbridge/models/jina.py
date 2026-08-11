@@ -10,12 +10,26 @@ from importlib import import_module
 from typing import Protocol, cast
 
 from mindbridge.application import EmbeddingInput
-from mindbridge.core import ModelOutputError, ModelReference, ModelUnavailableError
+from mindbridge.core import (
+    EmbeddingSpaceReference,
+    ModelOutputError,
+    ModelReference,
+    ModelUnavailableError,
+)
 from mindbridge.telemetry import set_current_span_attributes, trace_operation
 
 DEFAULT_JINA_OMNI_MODEL_ID = "jinaai/jina-embeddings-v5-omni-small-retrieval"
 DEFAULT_JINA_OMNI_REVISION = "12949877f0092093f366c6450340011320152a05"
+DEFAULT_JINA_TEXT_MODEL_ID = "jinaai/jina-embeddings-v5-text-small-retrieval"
+DEFAULT_JINA_TEXT_REVISION = "6856e76bb72982e58de0620458a4e8b3614da340"
 DEFAULT_JINA_OMNI_DIMENSION = 1_024
+DEFAULT_JINA_RETRIEVAL_SPACE = EmbeddingSpaceReference(
+    space_id="jinaai/jina-embeddings-v5-small-retrieval-1024",
+    revision=(
+        "omni@12949877f0092093f366c6450340011320152a05+"
+        "text@6856e76bb72982e58de0620458a4e8b3614da340"
+    ),
+)
 
 
 class JinaModality(str, Enum):
@@ -71,6 +85,7 @@ class JinaOmniEmbedder:
         encoder: _SentenceEncoder,
         model_reference: ModelReference,
         *,
+        space_reference: EmbeddingSpaceReference = DEFAULT_JINA_RETRIEVAL_SPACE,
         dimension: int = DEFAULT_JINA_OMNI_DIMENSION,
         max_concurrency: int = 1,
     ) -> None:
@@ -80,6 +95,7 @@ class JinaOmniEmbedder:
             raise ValueError("max_concurrency must be positive")
         self._encoder = encoder
         self._model_reference = model_reference
+        self._space_reference = space_reference
         self._dimension = dimension
         self._semaphore = asyncio.Semaphore(max_concurrency)
 
@@ -91,6 +107,7 @@ class JinaOmniEmbedder:
         model_id: str = DEFAULT_JINA_OMNI_MODEL_ID,
         device: str | None = None,
         modality: JinaModality = JinaModality.OMNI,
+        space_reference: EmbeddingSpaceReference = DEFAULT_JINA_RETRIEVAL_SPACE,
         dimension: int = DEFAULT_JINA_OMNI_DIMENSION,
         max_concurrency: int = 1,
     ) -> JinaOmniEmbedder:
@@ -115,6 +132,7 @@ class JinaOmniEmbedder:
         return cls(
             encoder,
             ModelReference(model_id=model_id, revision=revision),
+            space_reference=space_reference,
             dimension=dimension,
             max_concurrency=max_concurrency,
         )
@@ -128,6 +146,11 @@ class JinaOmniEmbedder:
     def dimension(self) -> int:
         """Return the configured Matryoshka output dimension."""
         return self._dimension
+
+    @property
+    def space_reference(self) -> EmbeddingSpaceReference:
+        """Return the exact aligned space used for cross-model search."""
+        return self._space_reference
 
     @trace_operation("mindbridge.model.encode_queries")
     async def encode_queries(

@@ -43,6 +43,8 @@ def test_production_app_opens_and_closes_runtime_resources(
         vlm_endpoint="https://vlm.example.test/api/v1/chat/completions",
         embedding_api_key="unit-test-embedding-key",
         embedding_endpoint="https://embedding.example.test/api/v1/embeddings",
+        text_embedding_api_key="unit-test-text-key",
+        text_embedding_endpoint="https://text.example.test/api/v1/embeddings",
         tenant_api_keys_json=('{"tenant_01":["tenant-api-key-000000000000000000"]}'),
     )
 
@@ -70,6 +72,8 @@ async def test_production_mcp_opens_and_closes_runtime_resources(
         vlm_endpoint="https://vlm.example.test/api/v1/chat/completions",
         embedding_api_key="unit-test-embedding-key",
         embedding_endpoint="https://embedding.example.test/api/v1/embeddings",
+        text_embedding_api_key="unit-test-text-key",
+        text_embedding_endpoint="https://text.example.test/api/v1/embeddings",
     )
 
     async with Client(create_production_mcp_server(settings)) as client:

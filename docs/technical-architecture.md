@@ -201,7 +201,7 @@ Timeline / Person
 | `claims` | 带时态、置信度和版本的事实/意图/关系 |
 | `claim_evidence` | Claim 与证据的多对多映射 |
 | `relations` | Event、Entity、Claim 之间的有类型边 |
-| `embeddings` | 对象类型、对象 ID、模型、版本、任务、维度和向量 |
+| `embeddings` | 对象类型、对象 ID、编码模型/版本、兼容空间/版本、任务、维度和向量 |
 | `memory_feedback` | 召回结果的有用、错误、遗漏和纠正反馈 |
 | `deletion_tombstones` | 跨端云传播的显式删除状态，不保留被删内容 |
 | `jobs` | 可追踪的导入、编码、重建和删除工作状态 |
@@ -305,7 +305,7 @@ MindBridge 采用“明确默认、保存版本、允许重建”的策略。模
 | AV 理解、caption、时间定位、计数 | Qwen Omni，通过 OpenAI-compatible API；以当前可用最强版本为默认 | 云端 |
 | 视觉 OCR、grounding、补充检查 | Qwen VL/VLM 或对应成熟专用模型 | 云端，必要时端侧 |
 | 跨模态主召回 | `jina-embeddings-v5-omni-small-retrieval` | 云端 |
-| 文本派生表示 | `jina-embeddings-v5-text-small`，与 Omni Small 对齐 | 云端 |
+| 文本派生表示 | `jina-embeddings-v5-text-small-retrieval`，与 Omni Small 对齐 | 云端 |
 | 端侧跨模态近期召回 | `jina-embeddings-v5-omni-nano-retrieval` | 强 Jetson/机器人主机，可选 |
 | 人脸检测与身份向量 | InsightFace/SCRFD/ArcFace 生态中的预训练实现 | 端侧 |
 | 说话人分离与声纹 | SpeakerLab/ERes2NetV2 等预训练实现 | 端侧 |
@@ -320,7 +320,7 @@ MindBridge 采用“明确默认、保存版本、允许重建”的策略。模
 采用它的原因：
 
 - 文本、图像、视频和音频进入统一语义空间；
-- 与 `jina-embeddings-v5-text-small` 对齐，派生文本可以使用更便宜的文本塔编码；
+- 与 `jina-embeddings-v5-text-small-retrieval` 对齐，派生文本可以使用更便宜的文本塔编码；
 - 支持 retrieval 专用的 query/document 编码；
 - 支持 Matryoshka 截断维度，便于端侧或低成本索引试验；
 - 可以通过 Hugging Face 和 vLLM 生态直接使用，不需要自研加载和 serving。
@@ -330,16 +330,19 @@ MindBridge 采用“明确默认、保存版本、允许重建”的策略。模
 - 云端主索引保存 Small 的完整 1024 维归一化向量；
 - Nano 的 768 维向量只进入独立端侧近期索引，不和云端 Small 向量混查；
 - 对查询调用 `encode_query()`，对记忆对象调用 `encode_document()`；
-- 每条向量保存 `model_id`、`revision`、`task`、`dimension`、`normalized` 和 `created_at`；
+- 每条向量分别保存真实编码器的 `model_id/revision` 与可混查的
+  `space_id/space_revision`，同时保存 `task`、`dimension`、`normalized` 和 `created_at`；
 - 切换模型时创建新向量版本并后台重建，不原地混用不同空间。
 
-生产实现将两侧放在不同进程中，但严格使用同一冻结空间：Memory Worker 通过 Hugging Face
-`sentence-transformers` 的 `encode_document()` 生成 EvidenceSpan 向量；API 通过 vLLM 的
-OpenAI-compatible `/embeddings` 端点生成 `encode_query` 语义的查询向量。两条路径默认固定到
-revision `12949877f0092093f366c6450340011320152a05`。文本请求使用 OpenAI SDK 的
+生产实现将编码器放在不同进程中，但严格声明同一冻结兼容空间：Memory Worker 通过 Hugging Face
+`sentence-transformers` 的 `encode_document()` 生成 EvidenceSpan 向量；API 通过独立 vLLM
+OpenAI-compatible endpoint 使用 Omni Small 生成 query 向量，并使用 Text Small 生成显式记忆
+document 向量。Omni 固定 revision `12949877f0092093f366c6450340011320152a05`，Text Small
+固定 revision `6856e76bb72982e58de0620458a4e8b3614da340`。文本请求使用 OpenAI SDK 的
 `embeddings.create()`；SDK 尚未声明类型的多模态 `messages` 也只通过同一 SDK 的低层
-`post()` 发送，不另写 HTTP 客户端。API 因此不加载 Jina 权重，模型只存在于 Worker 或独立
-vLLM pooling 进程。
+`post()` 发送，不另写 HTTP 客户端。数据库按 `space_id/space_revision` 检索、按
+`model_id/revision` 保留真实生产者；升级任一编码器都创建新空间并重建，不把未经验证的版本混查。
+API 因此不加载 Jina 权重，模型只存在于 Worker 或独立 serving 进程。
 
 ### 6.3 为什么必须保留多种索引
 
@@ -916,8 +919,9 @@ Worker 通过 `mindbridge.celery_app:app` 启动，Redis 消息只传
 `tenant_id`、`observation_id`、`job_id`。原始媒体、Evidence 和任务状态均以 PostgreSQL/S3
 为事实来源。每个 prefork child 只加载一个固定 revision 的 Jina v5 Omni；默认并发为 1，
 多 GPU 通过每张卡一个 Worker 进程扩展，避免一个模型被 CPU 核数意外复制。API 进程不导入
-或加载 Jina，而是用 OpenAI SDK 调用独立 vLLM pooling 端点。VLM 与 Jina revision 必须由
-部署配置固定并写入派生记录；凭证只从进程环境或基础设施 secret 注入。
+或加载 Jina，而是用 OpenAI SDK 调用 Omni-query 与 Text-document 两个独立的兼容端点。VLM、
+两个 Jina revision 和共享空间 revision 必须由部署配置固定并写入派生记录；凭证只从进程环境或
+基础设施 secret 注入。
 
 ### 12.2 推荐代码边界
 
@@ -1173,6 +1177,7 @@ ID；无 SDK 的嵌入式调用才生成独立 fallback ID。
 
 - [jina-embeddings-v5-omni paper](https://arxiv.org/abs/2605.08384)
 - [jina-embeddings-v5-omni-small](https://huggingface.co/jinaai/jina-embeddings-v5-omni-small)
+- [jina-embeddings-v5-text-small-retrieval](https://huggingface.co/jinaai/jina-embeddings-v5-text-small-retrieval)
 - [jina-embeddings-v5-omni-nano](https://huggingface.co/jinaai/jina-embeddings-v5-omni-nano)
 
 ### 19.3 Benchmark

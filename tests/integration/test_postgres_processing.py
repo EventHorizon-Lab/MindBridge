@@ -23,6 +23,7 @@ from mindbridge.core import (
     AnonymousIdentityObservation,
     DeviceId,
     DomainInvariantError,
+    EmbeddingSpaceReference,
     EvidenceId,
     EvidenceSpan,
     IdentityKind,
@@ -82,6 +83,7 @@ class FixedEmbedder:
     """Emit a deterministic unit vector in a configured model dimension."""
 
     model_reference = EMBEDDING_MODEL
+    space_reference = EmbeddingSpaceReference(space_id="jina-v5", revision="space-v1")
 
     def __init__(self, dimension: int = 1_024) -> None:
         self.dimension = dimension

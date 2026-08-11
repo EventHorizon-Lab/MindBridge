@@ -10,6 +10,7 @@ from mindbridge.core import (
     EmbeddedObjectType,
     EmbeddingId,
     EmbeddingRecord,
+    EmbeddingSpaceReference,
     ModelReference,
     TenantId,
 )
@@ -20,7 +21,7 @@ NOW = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
 pytestmark = pytest.mark.integration
 
 
-async def test_pgvector_keeps_model_spaces_separate_and_ranks_by_cosine(
+async def test_pgvector_mix_aligned_encoders_but_separates_space_revisions(
     store: PostgresMemoryStore,
 ) -> None:
     """The cloud index retrieves only the requested frozen model version."""
@@ -28,17 +29,23 @@ async def test_pgvector_keeps_model_spaces_separate_and_ranks_by_cosine(
         model_id="jinaai/jina-embeddings-v5-omni-small-retrieval",
         revision="abcdef0",
     )
+    space = EmbeddingSpaceReference(space_id="jina-v5", revision="space-v1")
     first = _embedding_record(
         embedding_id="embedding_01",
         object_id="memory_near",
         values=(1.0,) + (0.0,) * 1_023,
         model=model,
+        space=space,
     )
     second = _embedding_record(
         embedding_id="embedding_02",
         object_id="memory_far",
         values=(0.0, 1.0) + (0.0,) * 1_022,
-        model=model,
+        model=ModelReference(
+            model_id="jinaai/jina-embeddings-v5-text-small-retrieval",
+            revision="text-revision",
+        ),
+        space=space,
     )
 
     assert await store.write_embedding(first) is True
@@ -51,13 +58,14 @@ async def test_pgvector_keeps_model_spaces_separate_and_ranks_by_cosine(
                 object_id="memory_near",
                 values=second.values,
                 model=model,
+                space=space,
             )
         )
     matches = await store.search_embeddings(
         EmbeddingSearch(
             tenant_id=TenantId("tenant_vectors"),
             values=first.values,
-            model_reference=model,
+            space_reference=space,
             document_task="retrieval_document",
             object_types=(EmbeddedObjectType.MEMORY_RECORD,),
             limit=2,
@@ -67,7 +75,7 @@ async def test_pgvector_keeps_model_spaces_separate_and_ranks_by_cosine(
         EmbeddingSearch(
             tenant_id=TenantId("tenant_vectors"),
             values=first.values,
-            model_reference=ModelReference(model_id=model.model_id, revision="different"),
+            space_reference=EmbeddingSpaceReference(space_id=space.space_id, revision="different"),
             document_task="retrieval_document",
             object_types=(EmbeddedObjectType.MEMORY_RECORD,),
             limit=2,
@@ -77,7 +85,7 @@ async def test_pgvector_keeps_model_spaces_separate_and_ranks_by_cosine(
         EmbeddingSearch(
             tenant_id=TenantId("tenant_vectors"),
             values=first.values,
-            model_reference=model,
+            space_reference=space,
             document_task="retrieval_document",
             object_types=(EmbeddedObjectType.MEMORY_RECORD,),
             limit=2,
@@ -97,6 +105,7 @@ def _embedding_record(
     object_id: str,
     values: tuple[float, ...],
     model: ModelReference,
+    space: EmbeddingSpaceReference,
 ) -> EmbeddingRecord:
     return EmbeddingRecord(
         embedding_id=EmbeddingId(embedding_id),
@@ -105,6 +114,7 @@ def _embedding_record(
         object_id=object_id,
         values=values,
         model_reference=model,
+        space_reference=space,
         task="retrieval_document",
         dimension=1_024,
         normalized=True,

@@ -270,6 +270,7 @@ async def _evidence_embeddings(
             object_id=item.evidence_span.evidence_id,
             values=vector_by_url[item.media_url],
             model_reference=embedder.model_reference,
+            space_reference=embedder.space_reference,
             task=RETRIEVAL_DOCUMENT_EMBEDDING_TASK,
             dimension=embedder.dimension,
             normalized=True,

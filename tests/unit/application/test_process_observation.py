@@ -17,6 +17,7 @@ from mindbridge.core import (
     AnonymousIdentityObservation,
     DeviceId,
     EmbeddedObjectType,
+    EmbeddingSpaceReference,
     EvidenceId,
     EvidenceSpan,
     IdentityKind,
@@ -130,6 +131,7 @@ class RecordingEmbedder:
     """Proves raw signed media, not a caption, reaches Jina document encoding."""
 
     model_reference = ModelReference(model_id="jina-omni", revision="revision-01")
+    space_reference = EmbeddingSpaceReference(space_id="jina-v5", revision="space-v1")
     dimension = 2
 
     def __init__(self) -> None:

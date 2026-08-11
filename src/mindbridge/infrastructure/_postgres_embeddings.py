@@ -37,10 +37,10 @@ async def write_embedding_on_connection(
         """
         INSERT INTO embeddings (
             tenant_id, embedding_id, object_type, object_id,
-            model_id, model_revision, task, dimension, normalized,
-            embedding, created_at
+            model_id, model_revision, space_id, space_revision, task,
+            dimension, normalized, embedding, created_at
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT DO NOTHING
         RETURNING embedding_id
         """,
@@ -51,6 +51,8 @@ async def write_embedding_on_connection(
             embedding.object_id,
             embedding.model_reference.model_id,
             embedding.model_reference.revision,
+            embedding.space_reference.space_id,
+            embedding.space_reference.revision,
             embedding.task,
             embedding.dimension,
             embedding.normalized,
@@ -69,6 +71,8 @@ async def write_embedding_on_connection(
           AND object_id = %s
           AND model_id = %s
           AND model_revision = %s
+          AND space_id = %s
+          AND space_revision = %s
           AND task = %s
         """,
         (
@@ -78,6 +82,8 @@ async def write_embedding_on_connection(
             embedding.object_id,
             embedding.model_reference.model_id,
             embedding.model_reference.revision,
+            embedding.space_reference.space_id,
+            embedding.space_reference.revision,
             embedding.task,
         ),
     )
@@ -94,7 +100,7 @@ async def search_embeddings(
     pool: DatabasePool,
     search: EmbeddingSearch,
 ) -> tuple[EmbeddingMatch, ...]:
-    """Return nearest objects only from the requested model version and task."""
+    """Return nearest objects only from the requested compatible space and task."""
     _require_cloud_dimension(len(search.values))
     vector = Vector(list(search.values))
     async with tenant_connection(pool, search.tenant_id) as connection:
@@ -106,8 +112,8 @@ async def search_embeddings(
                    1 - (embedding <=> %s) AS similarity
             FROM embeddings
             WHERE tenant_id = %s
-              AND model_id = %s
-              AND model_revision = %s
+              AND space_id = %s
+              AND space_revision = %s
               AND task = %s
               AND object_type = ANY(%s)
               AND 1 - (embedding <=> %s) >= %s
@@ -117,8 +123,8 @@ async def search_embeddings(
             (
                 vector,
                 search.tenant_id,
-                search.model_reference.model_id,
-                search.model_reference.revision,
+                search.space_reference.space_id,
+                search.space_reference.revision,
                 search.document_task,
                 [object_type.value for object_type in search.object_types],
                 vector,

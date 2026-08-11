@@ -438,7 +438,7 @@ class MemoryKernel:
             object_type: EmbeddingSearch(
                 tenant_id=TenantId(request.tenant_id),
                 values=values,
-                model_reference=self._recall_embedder.model_reference,
+                space_reference=self._recall_embedder.space_reference,
                 document_task=RETRIEVAL_DOCUMENT_EMBEDDING_TASK,
                 object_types=(object_type,),
                 limit=limit,
@@ -497,7 +497,7 @@ class MemoryKernel:
             {
                 "mindbridge.tenant.id": memory.tenant_id,
                 "mindbridge.memory.id": memory.memory_id,
-                "mindbridge.model.id": self._recall_embedder.model_reference.model_id,
+                "mindbridge.model.id": self._recall_embedder.document_model_reference.model_id,
                 "mindbridge.embedding.dimension": self._recall_embedder.dimension,
             }
         )
@@ -509,8 +509,10 @@ class MemoryKernel:
                         "embedding",
                         memory.tenant_id,
                         memory.memory_id,
-                        self._recall_embedder.model_reference.model_id,
-                        self._recall_embedder.model_reference.revision,
+                        self._recall_embedder.document_model_reference.model_id,
+                        self._recall_embedder.document_model_reference.revision,
+                        self._recall_embedder.space_reference.space_id,
+                        self._recall_embedder.space_reference.revision,
                         RETRIEVAL_DOCUMENT_EMBEDDING_TASK,
                     )
                 ),
@@ -518,7 +520,8 @@ class MemoryKernel:
                 object_type=EmbeddedObjectType.MEMORY_RECORD,
                 object_id=memory.memory_id,
                 values=values,
-                model_reference=self._recall_embedder.model_reference,
+                model_reference=self._recall_embedder.document_model_reference,
+                space_reference=self._recall_embedder.space_reference,
                 task=RETRIEVAL_DOCUMENT_EMBEDDING_TASK,
                 dimension=self._recall_embedder.dimension,
                 normalized=True,

@@ -35,6 +35,7 @@ from mindbridge.core import (
     DomainInvariantError,
     EmbeddedObjectType,
     EmbeddingRecord,
+    EmbeddingSpaceReference,
     EvidenceId,
     EvidenceSpan,
     FeedbackType,
@@ -394,7 +395,9 @@ class RecordingAnswerer:
 class RecordingRecallEmbedder:
     """Returns one valid vector while retaining the fused multimodal query."""
 
-    model_reference = ModelReference(model_id="jina-omni", revision="pinned-revision")
+    query_model_reference = ModelReference(model_id="jina-omni", revision="pinned-revision")
+    document_model_reference = ModelReference(model_id="jina-text", revision="pinned-revision")
+    space_reference = EmbeddingSpaceReference(space_id="jina-v5", revision="space-v1")
     dimension = 1_024
 
     def __init__(self, *, memory_document_failures: int = 0) -> None:
@@ -621,7 +624,8 @@ async def test_remember_indexes_one_pinned_memory_document() -> None:
     assert recall_embedder.memory_documents == [memory.summary]
     assert embedding.object_type is EmbeddedObjectType.MEMORY_RECORD
     assert embedding.object_id == memory.memory_id
-    assert embedding.model_reference == recall_embedder.model_reference
+    assert embedding.model_reference == recall_embedder.document_model_reference
+    assert embedding.space_reference == recall_embedder.space_reference
     assert embedding.task == "retrieval_document"
     assert embedding.dimension == 1_024
     assert embedding.normalized is True

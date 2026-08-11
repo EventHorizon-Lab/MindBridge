@@ -70,6 +70,18 @@ class ModelReference:
 
 
 @dataclass(frozen=True, slots=True)
+class EmbeddingSpaceReference:
+    """Versioned compatibility space shared by independently served encoders."""
+
+    space_id: str
+    revision: str
+
+    def __post_init__(self) -> None:
+        require_non_empty(self.space_id, "space_id")
+        require_non_empty(self.revision, "revision")
+
+
+@dataclass(frozen=True, slots=True)
 class Event:
     """A semantic event derived from one or more observations."""
 
@@ -200,6 +212,7 @@ class EmbeddingRecord:
     object_id: str
     values: tuple[float, ...]
     model_reference: ModelReference
+    space_reference: EmbeddingSpaceReference
     task: str
     dimension: int
     normalized: bool

@@ -21,6 +21,7 @@ from celery.signals import (  # type: ignore[import-untyped]  # Upstream lacks P
 from mindbridge.application import ProcessObservation
 from mindbridge.configuration import optional_environment_value, require_environment_value
 from mindbridge.core import (
+    EmbeddingSpaceReference,
     JobId,
     JobState,
     ModelUnavailableError,
@@ -38,6 +39,7 @@ from mindbridge.infrastructure.task_queue import PROCESS_OBSERVATION_TASK
 from mindbridge.models import (
     DEFAULT_JINA_OMNI_MODEL_ID,
     DEFAULT_JINA_OMNI_REVISION,
+    DEFAULT_JINA_RETRIEVAL_SPACE,
     DEFAULT_OMNI_MODEL_ID,
     JinaOmniEmbedder,
     OpenAIOmniEventPerceiver,
@@ -74,6 +76,8 @@ class WorkerSettings:
     vlm_model_id: str = DEFAULT_OMNI_MODEL_ID
     jina_model_id: str = DEFAULT_JINA_OMNI_MODEL_ID
     jina_model_revision: str = DEFAULT_JINA_OMNI_REVISION
+    embedding_space_id: str = DEFAULT_JINA_RETRIEVAL_SPACE.space_id
+    embedding_space_revision: str = DEFAULT_JINA_RETRIEVAL_SPACE.revision
     jina_device: str | None = None
 
     def __post_init__(self) -> None:
@@ -88,6 +92,8 @@ class WorkerSettings:
             ("vlm_model_revision", self.vlm_model_revision),
             ("jina_model_id", self.jina_model_id),
             ("jina_model_revision", self.jina_model_revision),
+            ("embedding_space_id", self.embedding_space_id),
+            ("embedding_space_revision", self.embedding_space_revision),
         ):
             if not value.strip():
                 raise ValueError(f"{name} must not be empty")
@@ -119,6 +125,12 @@ class WorkerSettings:
             jina_model_id=source.get("MINDBRIDGE_JINA_MODEL_ID", DEFAULT_JINA_OMNI_MODEL_ID),
             jina_model_revision=source.get(
                 "MINDBRIDGE_JINA_MODEL_REVISION", DEFAULT_JINA_OMNI_REVISION
+            ),
+            embedding_space_id=source.get(
+                "MINDBRIDGE_EMBEDDING_SPACE_ID", DEFAULT_JINA_RETRIEVAL_SPACE.space_id
+            ),
+            embedding_space_revision=source.get(
+                "MINDBRIDGE_EMBEDDING_SPACE_REVISION", DEFAULT_JINA_RETRIEVAL_SPACE.revision
             ),
             jina_device=optional_environment_value(source, "MINDBRIDGE_JINA_DEVICE"),
         )
@@ -164,6 +176,8 @@ def run_observation_processing(
         settings.jina_model_id,
         settings.jina_model_revision,
         settings.jina_device,
+        settings.embedding_space_id,
+        settings.embedding_space_revision,
     )
     return asyncio.run(
         _process_observation_once(
@@ -214,10 +228,16 @@ def _load_embedder(
     model_id: str,
     model_revision: str,
     device: str | None,
+    embedding_space_id: str,
+    embedding_space_revision: str,
 ) -> JinaOmniEmbedder:
     # ponytail: one frozen model per worker process; split queues when multiple models are needed.
     return JinaOmniEmbedder.load(
         model_id=model_id,
         revision=model_revision,
         device=device,
+        space_reference=EmbeddingSpaceReference(
+            space_id=embedding_space_id,
+            revision=embedding_space_revision,
+        ),
     )

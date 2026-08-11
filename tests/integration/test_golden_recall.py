@@ -26,6 +26,7 @@ from mindbridge.core import (
     EmbeddedObjectType,
     EmbeddingId,
     EmbeddingRecord,
+    EmbeddingSpaceReference,
     EvidenceId,
     JobId,
     MediaKind,
@@ -44,6 +45,7 @@ from mindbridge.infrastructure import PostgresMemoryStore
 TENANT_ID = TenantId("tenant_golden_recall")
 NOW = datetime(2026, 8, 12, 12, 0, tzinfo=timezone.utc)
 MODEL_REFERENCE = ModelReference(model_id="golden-jina", revision="v1")
+SPACE_REFERENCE = EmbeddingSpaceReference(space_id="golden-space", revision="v1")
 VECTOR_DIMENSION = 1_024
 GOLDEN_SET_PATH = Path(__file__).parents[1] / "benchmarks" / "golden_recall.json"
 
@@ -83,8 +85,16 @@ class GoldenRecallEmbedder:
         self._query_axes = query_axes
 
     @property
-    def model_reference(self) -> ModelReference:
+    def query_model_reference(self) -> ModelReference:
         return MODEL_REFERENCE
+
+    @property
+    def document_model_reference(self) -> ModelReference:
+        return MODEL_REFERENCE
+
+    @property
+    def space_reference(self) -> EmbeddingSpaceReference:
+        return SPACE_REFERENCE
 
     @property
     def dimension(self) -> int:
@@ -193,6 +203,7 @@ async def _seed_golden_memories(
                     object_id=evidence_id,
                     values=_axis_vector(0),
                     model_reference=MODEL_REFERENCE,
+                    space_reference=SPACE_REFERENCE,
                     task="retrieval_document",
                     dimension=VECTOR_DIMENSION,
                     normalized=True,

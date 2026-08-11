@@ -6,7 +6,12 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Protocol
 
-from mindbridge.core import DomainInvariantError, MediaObject, ModelReference
+from mindbridge.core import (
+    DomainInvariantError,
+    EmbeddingSpaceReference,
+    MediaObject,
+    ModelReference,
+)
 
 RETRIEVAL_DOCUMENT_EMBEDDING_TASK = "retrieval_document"
 
@@ -49,7 +54,13 @@ class RecallEmbedder(Protocol):
     """Frozen encoder shared by recall queries and explicit memory documents."""
 
     @property
-    def model_reference(self) -> ModelReference: ...
+    def query_model_reference(self) -> ModelReference: ...
+
+    @property
+    def document_model_reference(self) -> ModelReference: ...
+
+    @property
+    def space_reference(self) -> EmbeddingSpaceReference: ...
 
     @property
     def dimension(self) -> int: ...

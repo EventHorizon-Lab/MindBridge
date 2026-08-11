@@ -46,6 +46,9 @@ Migration `0005` creates a non-login `mindbridge_runtime` role, grants the migra
 membership, and enables forced tenant RLS on every table containing `tenant_id`. Each store
 transaction sets one tenant locally. When migrations and the API use different database users,
 grant `mindbridge_runtime` to the API login; never give that login `SUPERUSER` or `BYPASSRLS`.
+Migration `0007` separates the encoder identity from its compatible search-space identity. Existing
+vectors remain isolated under their former model space and must be rebuilt before serving the new
+aligned Omni/Text space.
 
 Run the PostgreSQL contract tests against a disposable database whose name ends in `_test`:
 
@@ -295,6 +298,10 @@ export MINDBRIDGE_EMBEDDING_API_KEY=replace-with-a-runtime-secret
 export MINDBRIDGE_EMBEDDING_ENDPOINT=https://embeddings.example.com/v1/embeddings
 export MINDBRIDGE_EMBEDDING_MODEL_ID=jinaai/jina-embeddings-v5-omni-small-retrieval
 export MINDBRIDGE_EMBEDDING_MODEL_REVISION=12949877f0092093f366c6450340011320152a05
+export MINDBRIDGE_TEXT_EMBEDDING_API_KEY=replace-with-a-runtime-secret
+export MINDBRIDGE_TEXT_EMBEDDING_ENDPOINT=https://text-embeddings.example.com/v1/embeddings
+export MINDBRIDGE_TEXT_EMBEDDING_MODEL_ID=jinaai/jina-embeddings-v5-text-small-retrieval
+export MINDBRIDGE_TEXT_EMBEDDING_MODEL_REVISION=6856e76bb72982e58de0620458a4e8b3614da340
 export MINDBRIDGE_MINIMUM_EMBEDDING_SIMILARITY=0.0
 export MINDBRIDGE_TENANT_API_KEYS_JSON='{"tenant_01":["replace-with-at-least-32-random-characters"]}'
 export OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318
@@ -357,14 +364,20 @@ shape `s3://<bucket>/tenants/<tenant_id>/<object>`.
 `GET /v1/jobs/{job_id}?tenant_id=<tenant_id>` until it reaches `succeeded` before issuing a recall
 that depends on its derived events.
 
-The API sends recall queries to an OpenAI-compatible Jina v5 Omni pooling endpoint; it never loads
-the 1.56B-parameter model itself. A self-hosted endpoint can be started with the upstream validated
-vLLM path:
+The API sends multimodal recall queries to an OpenAI-compatible Jina v5 Omni pooling endpoint and
+explicit memory text to a separate Jina v5 Text Small retrieval endpoint. Both are pinned to one
+declared 1024-dimensional compatibility space, while every vector still records the encoder that
+actually produced it. The API loads neither model. Self-hosted endpoints can use the upstream
+validated vLLM path:
 
 ```bash
 vllm serve jinaai/jina-embeddings-v5-omni-small-retrieval \
   --revision 12949877f0092093f366c6450340011320152a05 \
   --trust-remote-code
+
+vllm serve jinaai/jina-embeddings-v5-text-small-retrieval \
+  --revision 6856e76bb72982e58de0620458a4e8b3614da340 \
+  --port 8001
 ```
 
 ## Run the memory Worker
