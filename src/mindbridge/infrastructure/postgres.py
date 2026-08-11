@@ -29,17 +29,21 @@ from mindbridge.infrastructure._postgres_embeddings import (
     search_embeddings,
     write_embedding,
 )
+from mindbridge.infrastructure._postgres_evidence import read_evidence
 from mindbridge.infrastructure._postgres_jobs import (
     claim_observation_processing_job,
     mark_observation_processing_failed,
     mark_observation_processing_succeeded,
 )
 from mindbridge.infrastructure._postgres_memories import (
-    read_evidence,
     search_memories,
     write_memory,
 )
-from mindbridge.infrastructure._postgres_observations import read_media_objects, write_observation
+from mindbridge.infrastructure._postgres_observation_reads import (
+    read_media_objects,
+    read_observation_batch,
+)
+from mindbridge.infrastructure._postgres_observations import write_observation
 from mindbridge.infrastructure._postgres_types import DatabaseConnection, DatabasePool
 
 
@@ -126,6 +130,14 @@ class PostgresMemoryStore:
     ) -> tuple[MediaObject, ...]:
         """Read media metadata for evidence resolution in caller order."""
         return await read_media_objects(self._pool, tenant_id, media_object_ids)
+
+    async def read_observation_batch(
+        self,
+        tenant_id: TenantId,
+        observation_id: ObservationId,
+    ) -> ObservationBatch:
+        """Read one immutable observation with its complete source evidence."""
+        return await read_observation_batch(self._pool, tenant_id, observation_id)
 
     async def write_embedding(self, embedding: EmbeddingRecord) -> bool:
         """Persist one immutable vector version."""

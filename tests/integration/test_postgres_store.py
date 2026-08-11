@@ -162,6 +162,10 @@ async def test_postgres_vertical_path_is_idempotent_and_evidence_first(
 
     first = await kernel.observe(request)
     retry = await kernel.observe(request)
+    stored_batch = await store.read_observation_batch(
+        TenantId("tenant_roundtrip"),
+        ObservationId(first.observation_id),
+    )
     evidence_id = await _first_evidence_id(database_url, "tenant_roundtrip")
     memory = await kernel.remember(
         _remember_request(tenant_id="tenant_roundtrip", evidence_id=evidence_id)
@@ -177,6 +181,9 @@ async def test_postgres_vertical_path_is_idempotent_and_evidence_first(
     assert first.status is ObservationStatus.ACCEPTED
     assert retry.status is ObservationStatus.DUPLICATE
     assert first.processing_job_id == retry.processing_job_id
+    assert stored_batch.observation.observation_id == first.observation_id
+    assert stored_batch.media_objects[0].media_object_id == "media_01"
+    assert stored_batch.evidence_spans[0].end_ms == 4_000
     assert await _processing_job_count(database_url, "tenant_roundtrip") == 1
     assert memory.verification_status is VerificationStatus.VERIFIED
     assert result.answer == "The robot put the red screwdriver beside the blue toolbox."

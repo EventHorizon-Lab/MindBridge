@@ -10,17 +10,13 @@ from mindbridge.contracts import RecallRequest
 from mindbridge.core import (
     DomainInvariantError,
     EvidenceId,
-    EvidenceSpan,
     IdempotencyConflictError,
-    MediaObjectId,
     MemoryId,
     MemoryIntegrityError,
     MemoryRecord,
     MemoryState,
     MemoryType,
     ModelReference,
-    ObservationId,
-    PixelRegion,
     TenantId,
     VerificationStatus,
 )
@@ -40,22 +36,6 @@ MemoryRow: TypeAlias = tuple[
     str | None,
     str | None,
     list[str],
-]
-EvidenceRow: TypeAlias = tuple[
-    str,
-    str,
-    str,
-    str,
-    int,
-    int,
-    datetime,
-    int | None,
-    int | None,
-    int | None,
-    int | None,
-    int | None,
-    int | None,
-    int | None,
 ]
 
 
@@ -126,29 +106,6 @@ async def search_memories(
     async with pool.connection() as connection:
         cursor = await connection.execute(_SEARCH_MEMORIES_SQL, parameters)
         return tuple([_memory_from_row(cast(MemoryRow, row)) async for row in cursor])
-
-
-async def read_evidence(
-    pool: DatabasePool,
-    tenant_id: TenantId,
-    evidence_ids: tuple[EvidenceId, ...],
-) -> tuple[EvidenceSpan, ...]:
-    """Read evidence spans in caller order without crossing tenants."""
-    if not evidence_ids:
-        return ()
-    async with pool.connection() as connection:
-        cursor = await connection.execute(
-            f"{_EVIDENCE_SELECT_SQL} WHERE tenant_id = %s AND evidence_id = ANY(%s)",
-            (tenant_id, list(evidence_ids)),
-        )
-        evidence_by_id = {
-            evidence.evidence_id: evidence
-            async for row in cursor
-            for evidence in (_evidence_from_row(cast(EvidenceRow, row)),)
-        }
-    return tuple(
-        evidence_by_id[evidence_id] for evidence_id in evidence_ids if evidence_id in evidence_by_id
-    )
 
 
 async def _insert_memory(
@@ -248,48 +205,6 @@ def _memory_from_row(row: MemoryRow) -> MemoryRecord:
     )
 
 
-def _evidence_from_row(row: EvidenceRow) -> EvidenceSpan:
-    (
-        evidence_id,
-        tenant_id,
-        observation_id,
-        media_object_id,
-        start_ms,
-        end_ms,
-        created_at,
-        frame_start,
-        frame_end,
-        x_min,
-        y_min,
-        x_max,
-        y_max,
-        audio_track,
-    ) = row
-    region = (
-        PixelRegion(
-            x_min=x_min,
-            y_min=cast(int, y_min),
-            x_max=cast(int, x_max),
-            y_max=cast(int, y_max),
-        )
-        if x_min is not None
-        else None
-    )
-    return EvidenceSpan(
-        evidence_id=EvidenceId(evidence_id),
-        tenant_id=TenantId(tenant_id),
-        observation_id=ObservationId(observation_id),
-        media_object_id=MediaObjectId(media_object_id),
-        start_ms=start_ms,
-        end_ms=end_ms,
-        created_at=created_at,
-        frame_start=frame_start,
-        frame_end=frame_end,
-        region=region,
-        audio_track=audio_track,
-    )
-
-
 _MEMORY_SELECT_SQL = """
 SELECT memory.memory_id,
        memory.tenant_id,
@@ -309,13 +224,6 @@ SELECT memory.memory_id,
            ORDER BY link.evidence_id
        ) AS evidence_ids
 FROM memory_records AS memory
-"""
-
-_EVIDENCE_SELECT_SQL = """
-SELECT evidence_id, tenant_id, observation_id, media_object_id,
-       start_ms, end_ms, created_at, frame_start, frame_end,
-       x_min, y_min, x_max, y_max, audio_track
-FROM evidence_spans
 """
 
 _SEARCH_MEMORIES_SQL = f"""
