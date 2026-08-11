@@ -69,10 +69,10 @@ from mindbridge.core import (
     MemoryRecord,
     ObjectStorageError,
     Observation,
-    ObservationId,
     TenantId,
     TombstoneId,
     VerificationStatus,
+    derive_observation_id,
     derive_stable_id,
 )
 
@@ -473,14 +473,11 @@ class MemoryKernel:
 
 
 def _build_observation(request: ObserveRequest) -> Observation:
-    observation_id = ObservationId(
-        derive_stable_id(
-            "observation",
-            request.tenant_id,
-            request.device_id,
-            request.boot_id,
-            request.sequence,
-        )
+    observation_id = derive_observation_id(
+        request.tenant_id,
+        request.device_id,
+        request.boot_id,
+        request.sequence,
     )
     return Observation(
         observation_id=observation_id,

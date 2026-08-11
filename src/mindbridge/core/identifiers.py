@@ -25,3 +25,13 @@ def derive_stable_id(prefix: str, *components: object) -> str:
     canonical = json.dumps(components, ensure_ascii=False, separators=(",", ":"))
     digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:26]
     return f"{prefix}_{digest}"
+
+
+def derive_observation_id(
+    tenant_id: str,
+    device_id: str,
+    boot_id: str,
+    sequence: int,
+) -> ObservationId:
+    """Derive the one cloud/edge identity for a captured device sequence."""
+    return ObservationId(derive_stable_id("observation", tenant_id, device_id, boot_id, sequence))

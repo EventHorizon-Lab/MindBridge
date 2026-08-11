@@ -40,6 +40,7 @@ from mindbridge.core.identifiers import (
     ObservationId,
     TenantId,
     TombstoneId,
+    derive_observation_id,
     derive_stable_id,
 )
 from mindbridge.core.jobs import JobState, ObservationJobClaim, ObservationProcessingJob
@@ -113,6 +114,7 @@ __all__ = [
     "VerificationStatus",
     "apply_memory_feedback",
     "calculate_memory_strength",
+    "derive_observation_id",
     "derive_stable_id",
     "evolve_memory_strength",
 ]
