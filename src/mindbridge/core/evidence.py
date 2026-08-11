@@ -59,7 +59,7 @@ class PixelRegion:
 class MediaObject:
     """Immutable reference to raw or derived media content."""
 
-    id: MediaObjectId
+    media_object_id: MediaObjectId
     tenant_id: TenantId
     kind: MediaKind
     uri: str
@@ -69,7 +69,7 @@ class MediaObject:
     duration_ms: int | None = None
 
     def __post_init__(self) -> None:
-        _require_non_empty(self.id, "id")
+        _require_non_empty(self.media_object_id, "media_object_id")
         _require_non_empty(self.tenant_id, "tenant_id")
         _require_non_empty(self.uri, "uri")
         _require_aware_datetime(self.created_at, "created_at")
@@ -85,7 +85,7 @@ class MediaObject:
 class Observation:
     """A timestamped sensor observation produced by one device."""
 
-    id: ObservationId
+    observation_id: ObservationId
     tenant_id: TenantId
     device_id: DeviceId
     boot_id: str
@@ -98,7 +98,7 @@ class Observation:
     clock_offset_ms: int = 0
 
     def __post_init__(self) -> None:
-        _require_non_empty(self.id, "id")
+        _require_non_empty(self.observation_id, "observation_id")
         _require_non_empty(self.tenant_id, "tenant_id")
         _require_non_empty(self.device_id, "device_id")
         _require_non_empty(self.boot_id, "boot_id")
@@ -127,7 +127,7 @@ class Observation:
 class EvidenceSpan:
     """Precise time, frame, and optional image region within captured media."""
 
-    id: EvidenceId
+    evidence_id: EvidenceId
     tenant_id: TenantId
     observation_id: ObservationId
     media_object_id: MediaObjectId
@@ -140,7 +140,7 @@ class EvidenceSpan:
     audio_track: int | None = None
 
     def __post_init__(self) -> None:
-        _require_non_empty(self.id, "id")
+        _require_non_empty(self.evidence_id, "evidence_id")
         _require_non_empty(self.tenant_id, "tenant_id")
         _require_non_empty(self.observation_id, "observation_id")
         _require_non_empty(self.media_object_id, "media_object_id")

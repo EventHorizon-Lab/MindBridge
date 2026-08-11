@@ -27,7 +27,7 @@ def test_media_object_rejects_naive_created_at() -> None:
     """Media timestamps must be timezone-aware at the domain boundary."""
     with pytest.raises(DomainInvariantError, match="created_at"):
         MediaObject(
-            id=MEDIA_ID,
+            media_object_id=MEDIA_ID,
             tenant_id=TenantId("tenant_01"),
             kind=MediaKind.VIDEO,
             uri="s3://memories/video.mp4",
@@ -41,7 +41,7 @@ def test_media_object_rejects_invalid_content_hash() -> None:
     """Evidence cannot be stored without a valid content digest."""
     with pytest.raises(DomainInvariantError, match="sha256"):
         MediaObject(
-            id=MEDIA_ID,
+            media_object_id=MEDIA_ID,
             tenant_id=TenantId("tenant_01"),
             kind=MediaKind.VIDEO,
             uri="s3://memories/video.mp4",
@@ -109,7 +109,7 @@ def _observation(
     ended_at: datetime = NOW,
 ) -> Observation:
     return Observation(
-        id=ObservationId("observation_01"),
+        observation_id=ObservationId("observation_01"),
         tenant_id=TenantId("tenant_01"),
         device_id=DeviceId("device_01"),
         boot_id="boot_01",
@@ -130,7 +130,7 @@ def _evidence_span(
     frame_end: int | None = None,
 ) -> EvidenceSpan:
     return EvidenceSpan(
-        id=EvidenceId("evidence_01"),
+        evidence_id=EvidenceId("evidence_01"),
         tenant_id=TenantId("tenant_01"),
         observation_id=ObservationId("observation_01"),
         media_object_id=MEDIA_ID,
