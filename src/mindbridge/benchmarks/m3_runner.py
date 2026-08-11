@@ -1,0 +1,248 @@
+"""Run M3-Bench through the public MindBridge observe and recall contract."""
+
+from __future__ import annotations
+
+import asyncio
+import time
+from collections import defaultdict
+from datetime import timedelta
+
+from pydantic import AwareDatetime, Field, model_validator
+
+from mindbridge.benchmarks.m3_bench import (
+    M3_BENCH_ADAPTER_VERSION,
+    M3BenchQuestion,
+    M3BenchVideo,
+)
+from mindbridge.contracts import (
+    ContractModel,
+    Identifier,
+    MediaObjectInput,
+    NonEmptyString,
+    ObservationProcessingJobView,
+    ObserveRequest,
+    RecallQuery,
+    RecallRequest,
+)
+from mindbridge.core import JobState, MediaKind, SensorKind
+from mindbridge.sdk import AsyncMindBridge
+
+M3_CLIP_DURATION_SECONDS = 30
+
+
+class M3PreparedClip(ContractModel):
+    """One uploaded, addressable clip from the official 30-second split."""
+
+    clip_index: int = Field(ge=0)
+    media_object: MediaObjectInput
+
+    @model_validator(mode="after")
+    def require_video_with_duration(self) -> M3PreparedClip:
+        """Reject media that cannot define a video observation interval."""
+        if self.media_object.kind is not MediaKind.VIDEO:
+            raise ValueError("M3-Bench clips must be video media objects")
+        if not self.media_object.duration_ms:
+            raise ValueError("M3-Bench clips must have a positive duration_ms")
+        return self
+
+
+class M3PreparedVideo(ContractModel):
+    """Uploaded clip manifest aligned to one official M3-Bench video."""
+
+    video_id: Identifier
+    timeline_origin: AwareDatetime
+    clips: tuple[M3PreparedClip, ...] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def require_contiguous_unique_clips(self) -> M3PreparedVideo:
+        """Keep official zero-based clip boundaries unambiguous."""
+        indices = tuple(clip.clip_index for clip in self.clips)
+        if indices != tuple(range(len(self.clips))):
+            raise ValueError("M3-Bench clip indices must be contiguous and start at zero")
+        media_ids = tuple(clip.media_object.media_object_id for clip in self.clips)
+        if len(set(media_ids)) != len(media_ids):
+            raise ValueError("M3-Bench clip media_object_ids must be unique")
+        return self
+
+
+class M3OfficialQuestionResult(ContractModel):
+    """One official M3-Bench prediction plus retrieval diagnostics."""
+
+    id: Identifier
+    question: NonEmptyString
+    answer: NonEmptyString
+    type: tuple[NonEmptyString, ...]
+    timestamp_seconds: int | None = Field(default=None, ge=0)
+    before_clip: int | None = Field(default=None, ge=0)
+    response: str
+    mindbridge_confidence: float = Field(ge=0.0, le=1.0)
+    mindbridge_memory_ids: tuple[Identifier, ...]
+    mindbridge_evidence_ids: tuple[Identifier, ...]
+    mindbridge_trace_id: Identifier
+
+
+async def run_m3_video(
+    memory: AsyncMindBridge,
+    annotation: M3BenchVideo,
+    prepared: M3PreparedVideo,
+    *,
+    tenant_prefix: str = "benchmark_m3",
+    device_id: str = "m3_bench_camera",
+    recall_limit: int = 20,
+    request_concurrency: int = 4,
+    poll_interval_seconds: float = 1.0,
+    processing_timeout_seconds: float = 1_800.0,
+) -> tuple[M3OfficialQuestionResult, ...]:
+    """Stream one video and answer each question before future clips are ingested."""
+    if annotation.video_id != prepared.video_id:
+        raise ValueError("M3-Bench annotation and prepared video IDs must match")
+    if recall_limit <= 0 or request_concurrency <= 0:
+        raise ValueError("recall_limit and request_concurrency must be positive")
+    if poll_interval_seconds <= 0 or processing_timeout_seconds <= 0:
+        raise ValueError("poll interval and processing timeout must be positive")
+    if len({question.question_id for question in annotation.questions}) != len(
+        annotation.questions
+    ):
+        raise ValueError("M3-Bench questions must have unique IDs")
+    maximum_clip_index = len(prepared.clips) - 1
+    if any(
+        question.before_clip_index is not None and question.before_clip_index > maximum_clip_index
+        for question in annotation.questions
+    ):
+        raise ValueError("M3-Bench question boundary exceeds prepared clips")
+
+    tenant_id = f"{tenant_prefix}_{annotation.video_id}"
+    questions_by_boundary: dict[int | None, list[M3BenchQuestion]] = defaultdict(list)
+    for question in annotation.questions:
+        questions_by_boundary[question.before_clip_index].append(question)
+
+    answers: dict[str, M3OfficialQuestionResult] = {}
+    semaphore = asyncio.Semaphore(request_concurrency)
+    for clip in prepared.clips:
+        receipt = await memory.observe(
+            _observe_request(tenant_id, device_id, annotation.video_id, prepared, clip)
+        )
+        await wait_for_observation_job(
+            memory,
+            tenant_id,
+            receipt.processing_job_id,
+            poll_interval_seconds=poll_interval_seconds,
+            timeout_seconds=processing_timeout_seconds,
+        )
+        answers.update(
+            await _answer_questions(
+                memory,
+                tenant_id,
+                questions_by_boundary[clip.clip_index],
+                recall_limit,
+                semaphore,
+            )
+        )
+
+    answers.update(
+        await _answer_questions(
+            memory,
+            tenant_id,
+            questions_by_boundary[None],
+            recall_limit,
+            semaphore,
+        )
+    )
+    return tuple(answers[question.question_id] for question in annotation.questions)
+
+
+async def wait_for_observation_job(
+    memory: AsyncMindBridge,
+    tenant_id: str,
+    job_id: str,
+    *,
+    poll_interval_seconds: float = 1.0,
+    timeout_seconds: float = 1_800.0,
+) -> ObservationProcessingJobView:
+    """Wait for durable success while allowing failed attempts to be retried."""
+    if poll_interval_seconds <= 0 or timeout_seconds <= 0:
+        raise ValueError("poll interval and timeout must be positive")
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        job = await memory.get_observation_job(tenant_id, job_id)
+        if job.state is JobState.SUCCEEDED:
+            return job
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(
+                f"observation job {job_id} did not succeed; last state was {job.state.value}"
+            )
+        await asyncio.sleep(min(poll_interval_seconds, remaining))
+
+
+def _observe_request(
+    tenant_id: str,
+    device_id: str,
+    video_id: str,
+    prepared: M3PreparedVideo,
+    clip: M3PreparedClip,
+) -> ObserveRequest:
+    occurred_at = prepared.timeline_origin + timedelta(
+        seconds=M3_CLIP_DURATION_SECONDS * clip.clip_index
+    )
+    duration_ms = clip.media_object.duration_ms
+    assert duration_ms is not None
+    ended_at = occurred_at + timedelta(milliseconds=duration_ms)
+    return ObserveRequest(
+        tenant_id=tenant_id,
+        device_id=device_id,
+        boot_id=M3_BENCH_ADAPTER_VERSION,
+        sequence=clip.clip_index,
+        sensor=SensorKind.CAMERA,
+        media_objects=(clip.media_object,),
+        occurred_at=occurred_at,
+        ended_at=ended_at,
+        observed_at=ended_at,
+        idempotency_key=(f"{M3_BENCH_ADAPTER_VERSION}:{video_id}:clip:{clip.clip_index}"),
+    )
+
+
+async def _answer_questions(
+    memory: AsyncMindBridge,
+    tenant_id: str,
+    questions: list[M3BenchQuestion],
+    recall_limit: int,
+    semaphore: asyncio.Semaphore,
+) -> dict[str, M3OfficialQuestionResult]:
+    results = await asyncio.gather(
+        *(
+            _answer_question(memory, tenant_id, question, recall_limit, semaphore)
+            for question in questions
+        )
+    )
+    return {result.id: result for result in results}
+
+
+async def _answer_question(
+    memory: AsyncMindBridge,
+    tenant_id: str,
+    question: M3BenchQuestion,
+    recall_limit: int,
+    semaphore: asyncio.Semaphore,
+) -> M3OfficialQuestionResult:
+    async with semaphore:
+        result = await memory.recall(
+            RecallRequest(
+                tenant_id=tenant_id,
+                query=RecallQuery(text=question.question),
+                limit=recall_limit,
+            )
+        )
+    return M3OfficialQuestionResult(
+        id=question.question_id,
+        question=question.question,
+        answer=question.reference_answer,
+        type=question.question_types,
+        timestamp_seconds=question.timestamp_seconds,
+        before_clip=question.before_clip_index,
+        response=result.answer or "",
+        mindbridge_confidence=result.confidence,
+        mindbridge_memory_ids=tuple(memory.memory_id for memory in result.memories),
+        mindbridge_evidence_ids=tuple(evidence.evidence_id for evidence in result.evidence),
+        mindbridge_trace_id=result.trace_id,
+    )
