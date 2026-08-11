@@ -9,6 +9,7 @@ from mindbridge.application import (
     EmbeddingSearch,
     MemoryWriteResult,
     ObservationBatch,
+    ObservationProcessingOutput,
     ObservationWriteResult,
 )
 from mindbridge.contracts import RecallRequest
@@ -44,6 +45,7 @@ from mindbridge.infrastructure._postgres_observation_reads import (
     read_observation_batch,
 )
 from mindbridge.infrastructure._postgres_observations import write_observation
+from mindbridge.infrastructure._postgres_processing import commit_observation_processing
 from mindbridge.infrastructure._postgres_types import DatabaseConnection, DatabasePool
 
 
@@ -186,6 +188,25 @@ class PostgresMemoryStore:
             job_id,
             attempt=attempt,
             error_code=error_code,
+        )
+
+    async def commit_observation_processing(
+        self,
+        tenant_id: TenantId,
+        observation_id: ObservationId,
+        job_id: JobId,
+        *,
+        attempt: int,
+        output: ObservationProcessingOutput,
+    ) -> ObservationProcessingJob:
+        """Atomically persist derived memory and successful job state."""
+        return await commit_observation_processing(
+            self._pool,
+            tenant_id,
+            observation_id,
+            job_id,
+            attempt=attempt,
+            output=output,
         )
 
 

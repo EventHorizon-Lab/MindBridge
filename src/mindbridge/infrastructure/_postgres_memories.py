@@ -64,27 +64,38 @@ async def write_memory(
             )
             return MemoryWriteResult(memory=existing, created=False)
 
-        created = await _insert_memory(connection, memory, content_digest)
+        created = await write_memory_on_connection(connection, memory, content_digest)
         if not created:
             existing = await _read_memory(connection, memory.tenant_id, memory.memory_id)
-            if await _memory_digest(connection, memory) != content_digest:
-                raise IdempotencyConflictError("memory identifier already stores different content")
             return MemoryWriteResult(memory=existing, created=False)
-        try:
-            async with connection.cursor() as cursor:
-                await cursor.executemany(
-                    """
-                    INSERT INTO memory_evidence (tenant_id, memory_id, evidence_id)
-                    VALUES (%s, %s, %s)
-                    """,
-                    (
-                        (memory.tenant_id, memory.memory_id, evidence_id)
-                        for evidence_id in memory.evidence_ids
-                    ),
-                )
-        except ForeignKeyViolation as error:
-            raise DomainInvariantError("memory references unknown evidence") from error
         return MemoryWriteResult(memory=memory, created=True)
+
+
+async def write_memory_on_connection(
+    connection: DatabaseConnection,
+    memory: MemoryRecord,
+    content_digest: str,
+) -> bool:
+    """Write one memory and evidence links inside a caller-owned transaction."""
+    created = await _insert_memory(connection, memory, content_digest)
+    if not created and await _memory_digest(connection, memory) != content_digest:
+        raise IdempotencyConflictError("memory identifier already stores different content")
+    try:
+        async with connection.cursor() as cursor:
+            await cursor.executemany(
+                """
+                INSERT INTO memory_evidence (tenant_id, memory_id, evidence_id)
+                VALUES (%s, %s, %s)
+                ON CONFLICT DO NOTHING
+                """,
+                (
+                    (memory.tenant_id, memory.memory_id, evidence_id)
+                    for evidence_id in memory.evidence_ids
+                ),
+            )
+    except ForeignKeyViolation as error:
+        raise DomainInvariantError("memory references unknown evidence") from error
+    return created
 
 
 async def search_memories(

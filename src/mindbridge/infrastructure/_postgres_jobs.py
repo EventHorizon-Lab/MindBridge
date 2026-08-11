@@ -138,6 +138,29 @@ async def mark_observation_processing_succeeded(
     )
 
 
+async def mark_observation_processing_succeeded_on_connection(
+    connection: DatabaseConnection,
+    tenant_id: TenantId,
+    observation_id: ObservationId,
+    job_id: JobId,
+    *,
+    attempt: int,
+) -> ObservationProcessingJob:
+    """Complete a job inside the caller's derived-record transaction."""
+    completed = await _finish_observation_processing_job_on_connection(
+        connection,
+        tenant_id,
+        observation_id,
+        job_id,
+        attempt=attempt,
+        state=JobState.SUCCEEDED,
+        error_code=None,
+    )
+    if completed.attempt != attempt:
+        raise MemoryIntegrityError("observation processing attempt was superseded")
+    return completed
+
+
 async def mark_observation_processing_failed(
     pool: DatabasePool,
     tenant_id: TenantId,
@@ -171,35 +194,56 @@ async def _finish_observation_processing_job(
     state: JobState,
     error_code: str | None,
 ) -> ObservationProcessingJob:
-    _require_expected_job_id(observation_id, job_id)
     async with pool.connection() as connection:
-        cursor = await connection.execute(
-            """
-            UPDATE jobs
-            SET state = %s, error_code = %s, updated_at = now()
-            WHERE tenant_id = %s AND job_id = %s
-              AND state = 'running' AND attempt = %s
-              AND job_type = %s AND payload ->> 'observation_id' = %s
-            RETURNING job_id, tenant_id, state, attempt, error_code,
-                      created_at, updated_at, payload ->> 'observation_id'
-            """,
-            (
-                state.value,
-                error_code,
-                tenant_id,
-                job_id,
-                attempt,
-                PROCESS_OBSERVATION_JOB_TYPE,
-                observation_id,
-            ),
+        return await _finish_observation_processing_job_on_connection(
+            connection,
+            tenant_id,
+            observation_id,
+            job_id,
+            attempt=attempt,
+            state=state,
+            error_code=error_code,
         )
-        row = await cursor.fetchone()
-        if row is not None:
-            return _job_from_row(cast(JobRow, row))
-        existing = await _read_expected_job(connection, tenant_id, observation_id, job_id)
-        if existing.state in {state, JobState.SUCCEEDED}:
-            return existing
-        raise MemoryIntegrityError("observation processing job is not running")
+
+
+async def _finish_observation_processing_job_on_connection(
+    connection: DatabaseConnection,
+    tenant_id: TenantId,
+    observation_id: ObservationId,
+    job_id: JobId,
+    *,
+    attempt: int,
+    state: JobState,
+    error_code: str | None,
+) -> ObservationProcessingJob:
+    _require_expected_job_id(observation_id, job_id)
+    cursor = await connection.execute(
+        """
+        UPDATE jobs
+        SET state = %s, error_code = %s, updated_at = now()
+        WHERE tenant_id = %s AND job_id = %s
+          AND state = 'running' AND attempt = %s
+          AND job_type = %s AND payload ->> 'observation_id' = %s
+        RETURNING job_id, tenant_id, state, attempt, error_code,
+                  created_at, updated_at, payload ->> 'observation_id'
+        """,
+        (
+            state.value,
+            error_code,
+            tenant_id,
+            job_id,
+            attempt,
+            PROCESS_OBSERVATION_JOB_TYPE,
+            observation_id,
+        ),
+    )
+    row = await cursor.fetchone()
+    if row is not None:
+        return _job_from_row(cast(JobRow, row))
+    existing = await _read_expected_job(connection, tenant_id, observation_id, job_id)
+    if existing.state in {state, JobState.SUCCEEDED}:
+        return existing
+    raise MemoryIntegrityError("observation processing job is not running")
 
 
 async def _read_expected_job(
