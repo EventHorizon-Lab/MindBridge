@@ -22,6 +22,9 @@ dependencies = [
     "uvicorn>=0.35,<1",
 ]
 
+[project.scripts]
+mindbridge-mcp = "mindbridge.api.runtime:run_production_mcp"
+
 [project.optional-dependencies]
 cloud-models = [
     "av>=16,<17",

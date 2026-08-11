@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from contextlib import AbstractAsyncContextManager
+
 from mcp.server import MCPServer
 from mcp_types import ToolAnnotations
 
@@ -33,15 +36,21 @@ _DESTRUCTIVE_WRITE = ToolAnnotations(
     idempotent_hint=True,
     open_world_hint=False,
 )
+_McpLifespan = Callable[[MCPServer[None]], AbstractAsyncContextManager[None]]
 
 
-def create_mcp_server(kernel: MemoryKernel) -> MCPServer[None]:
+def create_mcp_server(
+    kernel: MemoryKernel,
+    *,
+    lifespan: _McpLifespan | None = None,
+) -> MCPServer[None]:
     """Expose one memory kernel through typed, agent-friendly MCP tools."""
     server: MCPServer[None] = MCPServer(
         "mindbridge",
         title="MindBridge Memory",
         description="Evidence-grounded embodied Memory as a Service.",
         version="0.1.0",
+        lifespan=lifespan,
     )
 
     @server.tool(annotations=_IDEMPOTENT_WRITE)

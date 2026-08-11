@@ -4,9 +4,14 @@ import os
 
 import pytest
 from fastapi.testclient import TestClient
+from mcp import Client
 from psycopg import connect
 
-from mindbridge.api import RuntimeSettings, create_production_app
+from mindbridge.api import (
+    RuntimeSettings,
+    create_production_app,
+    create_production_mcp_server,
+)
 
 DATABASE_URL = os.getenv("MINDBRIDGE_TEST_DATABASE_URL")
 
@@ -45,3 +50,28 @@ def test_production_app_opens_and_closes_runtime_resources(
 
     assert response.status_code == 200
     assert response.json()["status"] == "ok"
+
+
+async def test_production_mcp_opens_and_closes_runtime_resources(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The documented stdio server uses the same complete production lifespan."""
+    assert DATABASE_URL is not None
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "test-access-key")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "test-secret-key")
+    monkeypatch.setenv("AWS_EC2_METADATA_DISABLED", "true")
+    settings = RuntimeSettings(
+        database_url=DATABASE_URL,
+        object_storage_bucket="memory",
+        object_storage_endpoint_url="https://objects.example.test",
+        task_broker_url="memory://",
+        vlm_api_key="unit-test-vlm-key",
+        vlm_endpoint="https://vlm.example.test/api/v1/chat/completions",
+        embedding_api_key="unit-test-embedding-key",
+        embedding_endpoint="https://embedding.example.test/api/v1/embeddings",
+    )
+
+    async with Client(create_production_mcp_server(settings)) as client:
+        tools = await client.list_tools()
+
+    assert {tool.name for tool in tools.tools} >= {"memory_observe", "memory_recall"}

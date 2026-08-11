@@ -8,8 +8,10 @@ from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass, field
 
 from fastapi import FastAPI
+from mcp.server import MCPServer
 
 from mindbridge.api.app import create_app
+from mindbridge.api.mcp import create_mcp_server
 from mindbridge.application import MemoryKernel
 from mindbridge.infrastructure import (
     CeleryObservationJobPublisher,
@@ -92,27 +94,74 @@ class RuntimeSettings:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class _ProductionRuntime:
+    kernel: MemoryKernel
+    store: PostgresMemoryStore
+    answerer: OpenAIOmniAnswerer
+    recall_embedder: OpenAIJinaEmbedder
+
+    @asynccontextmanager
+    async def open(self) -> AsyncIterator[None]:
+        """Open and close every process-owned network resource exactly once."""
+        async with AsyncExitStack() as resources:
+            await self.store.open()
+            resources.push_async_callback(self.store.close)
+            resources.push_async_callback(self.answerer.close)
+            resources.push_async_callback(self.recall_embedder.close)
+            yield
+
+
 def create_production_app(settings: RuntimeSettings | None = None) -> FastAPI:
     """Wire PostgreSQL, S3-compatible media, and Omni into one API process."""
-    runtime = settings or RuntimeSettings.from_environment()
-    store = PostgresMemoryStore(runtime.database_url)
+    runtime = _build_runtime(settings or RuntimeSettings.from_environment())
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        async with runtime.open():
+            yield
+
+    return create_app(runtime.kernel, lifespan=lifespan)
+
+
+def create_production_mcp_server(
+    settings: RuntimeSettings | None = None,
+) -> MCPServer[None]:
+    """Wire the production kernel into the official MCP server."""
+    runtime = _build_runtime(settings or RuntimeSettings.from_environment())
+
+    @asynccontextmanager
+    async def lifespan(_server: MCPServer[None]) -> AsyncIterator[None]:
+        async with runtime.open():
+            yield
+
+    return create_mcp_server(runtime.kernel, lifespan=lifespan)
+
+
+def run_production_mcp() -> None:
+    """Run the production MCP server over the official stdio transport."""
+    create_production_mcp_server().run(transport="stdio")
+
+
+def _build_runtime(settings: RuntimeSettings) -> _ProductionRuntime:
+    store = PostgresMemoryStore(settings.database_url)
     media_access = S3MediaAccess(
-        runtime.object_storage_bucket,
-        endpoint_url=runtime.object_storage_endpoint_url,
-        region_name=runtime.object_storage_region,
+        settings.object_storage_bucket,
+        endpoint_url=settings.object_storage_endpoint_url,
+        region_name=settings.object_storage_region,
     )
     answerer = OpenAIOmniAnswerer.connect(
-        api_key=runtime.vlm_api_key,
-        endpoint=runtime.vlm_endpoint,
-        model_id=runtime.vlm_model_id,
+        api_key=settings.vlm_api_key,
+        endpoint=settings.vlm_endpoint,
+        model_id=settings.vlm_model_id,
     )
     recall_embedder = OpenAIJinaEmbedder.connect(
-        api_key=runtime.embedding_api_key,
-        endpoint=runtime.embedding_endpoint,
-        model_id=runtime.embedding_model_id,
-        model_revision=runtime.embedding_model_revision,
+        api_key=settings.embedding_api_key,
+        endpoint=settings.embedding_endpoint,
+        model_id=settings.embedding_model_id,
+        model_revision=settings.embedding_model_revision,
     )
-    job_publisher = CeleryObservationJobPublisher(create_task_queue(runtime.task_broker_url))
+    job_publisher = CeleryObservationJobPublisher(create_task_queue(settings.task_broker_url))
     kernel = MemoryKernel(
         store,
         answerer,
@@ -122,17 +171,7 @@ def create_production_app(settings: RuntimeSettings | None = None) -> FastAPI:
         observation_job_publisher=job_publisher,
         recall_embedder=recall_embedder,
     )
-
-    @asynccontextmanager
-    async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
-        async with AsyncExitStack() as resources:
-            await store.open()
-            resources.push_async_callback(store.close)
-            resources.push_async_callback(answerer.close)
-            resources.push_async_callback(recall_embedder.close)
-            yield
-
-    return create_app(kernel, lifespan=lifespan)
+    return _ProductionRuntime(kernel, store, answerer, recall_embedder)
 
 
 def _required(environ: Mapping[str, str], name: str) -> str:

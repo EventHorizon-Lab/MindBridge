@@ -185,6 +185,18 @@ export MINDBRIDGE_EMBEDDING_MODEL_REVISION=12949877f0092093f366c6450340011320152
 uv run uvicorn mindbridge.api:create_production_app --factory
 ```
 
+Agents can start the same production kernel over the official MCP stdio transport. Tool input and
+structured output schemas are generated from the same Pydantic contracts used by REST and Python:
+
+```bash
+uv run mindbridge-mcp
+```
+
+The stable tools are `memory_observe`, `memory_remember`, `memory_recall`, `memory_get`,
+`memory_feedback`, and `memory_forget`. Deploy remote MCP only behind authenticated process or
+gateway isolation; the initial command intentionally exposes stdio rather than an unauthenticated
+HTTP listener.
+
 Applications and Benchmark runners use the same typed REST contract through the asynchronous
 Python SDK:
 
