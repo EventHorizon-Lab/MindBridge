@@ -83,6 +83,7 @@ class InMemoryStore:
         self.media_objects: dict[MediaObjectId, MediaObject] = {}
         self.embedding_matches: tuple[EmbeddingMatch, ...] = ()
         self.embedding_searches: list[EmbeddingSearch] = []
+        self.graph_memories: dict[tuple[EmbeddedObjectType, str], MemoryId] = {}
         self.embeddings: dict[str, EmbeddingRecord] = {}
         self.feedback: dict[str, tuple[str, FeedbackWriteResult]] = {}
 
@@ -242,6 +243,28 @@ class InMemoryStore:
         limit: int,
     ) -> tuple[MemoryRecord, ...]:
         memory_by_id = {memory.memory_id: memory for _, memory in self.memories.values()}
+        return tuple(
+            memory_by_id[memory_id]
+            for memory_id in ranked_memory_ids
+            if memory_id in memory_by_id
+            and _matches_recall_filters(memory_by_id[memory_id], request)
+        )[:limit]
+
+    async def search_memories_by_graph_objects(
+        self,
+        request: RecallRequest,
+        ranked_objects: tuple[EmbeddingMatch, ...],
+        *,
+        limit: int,
+    ) -> tuple[MemoryRecord, ...]:
+        memory_by_id = {memory.memory_id: memory for _, memory in self.memories.values()}
+        ranked_memory_ids = tuple(
+            dict.fromkeys(
+                self.graph_memories[(match.object_type, match.object_id)]
+                for match in ranked_objects
+                if (match.object_type, match.object_id) in self.graph_memories
+            )
+        )
         return tuple(
             memory_by_id[memory_id]
             for memory_id in ranked_memory_ids
@@ -855,6 +878,31 @@ async def test_semantic_memory_finds_attested_text_without_matching_words() -> N
 
     assert [item.memory_id for item in result.memories] == [memory.memory_id]
     assert result.answer == memory.summary
+
+
+async def test_semantic_event_follows_its_memory_representation() -> None:
+    store = InMemoryStore()
+    kernel = _kernel(store, RecordingAnswerer())
+    memory = await kernel.remember(_remember_request())
+    store.embedding_matches = (
+        EmbeddingMatch(
+            embedding_id="embedding_event_01",
+            object_type=EmbeddedObjectType.EVENT,
+            object_id="event_01",
+            similarity=0.82,
+        ),
+    )
+    store.graph_memories[(EmbeddedObjectType.EVENT, "event_01")] = MemoryId(memory.memory_id)
+
+    result = await kernel.recall(
+        RecallRequest(tenant_id="tenant_01", query=RecallQuery(text="an unrelated paraphrase"))
+    )
+
+    assert [item.memory_id for item in result.memories] == [memory.memory_id]
+    assert any(
+        search.object_types == (EmbeddedObjectType.EVENT, EmbeddedObjectType.CLAIM)
+        for search in store.embedding_searches
+    )
 
 
 async def test_media_query_is_signed_for_embedding_instead_of_used_as_a_filter() -> None:

@@ -280,6 +280,14 @@ class MemoryStore(Protocol):
         limit: int,
     ) -> tuple[MemoryRecord, ...]: ...
 
+    async def search_memories_by_graph_objects(
+        self,
+        request: RecallRequest,
+        ranked_objects: tuple[EmbeddingMatch, ...],
+        *,
+        limit: int,
+    ) -> tuple[MemoryRecord, ...]: ...
+
     async def record_memory_accesses(
         self,
         tenant_id: TenantId,

@@ -104,6 +104,7 @@ async def search_embeddings(
     _require_cloud_dimension(len(search.values))
     vector = Vector(list(search.values))
     async with tenant_connection(pool, search.tenant_id) as connection:
+        await connection.execute("SET LOCAL hnsw.iterative_scan = strict_order")
         cursor = await connection.execute(
             """
             SELECT embedding_id,

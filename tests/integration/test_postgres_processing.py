@@ -10,6 +10,7 @@ from psycopg import AsyncConnection
 
 from mindbridge.application import (
     EmbeddingInput,
+    EmbeddingSearch,
     EventPerception,
     ObservationBatch,
     ObservationProcessingOutput,
@@ -26,6 +27,7 @@ from mindbridge.core import (
     ClaimType,
     DeviceId,
     DomainInvariantError,
+    EmbeddedObjectType,
     EmbeddingSpaceReference,
     EntityType,
     EvidenceId,
@@ -237,12 +239,28 @@ async def test_processing_commits_provenance_once(
         .evidence_spans[0]
         .evidence_id
     )
+    request = RecallRequest(
+        tenant_id=tenant_id,
+        query=RecallQuery(text="words absent from the memory summary"),
+    )
     dense_candidates = await store.search_memories_by_evidence(
-        RecallRequest(
-            tenant_id=tenant_id,
-            query=RecallQuery(text="words absent from the memory summary"),
-        ),
+        request,
         (evidence_id,),
+        limit=20,
+    )
+    graph_matches = await store.search_embeddings(
+        EmbeddingSearch(
+            tenant_id=tenant_id,
+            values=(1.0,) + (0.0,) * 1_023,
+            space_reference=EmbeddingSpaceReference(space_id="jina-v5", revision="space-v1"),
+            document_task="retrieval_document",
+            object_types=(EmbeddedObjectType.EVENT, EmbeddedObjectType.CLAIM),
+            limit=20,
+        )
+    )
+    graph_candidates = await store.search_memories_by_graph_objects(
+        request,
+        graph_matches,
         limit=20,
     )
     filtered_candidates = await store.search_memories_by_evidence(
@@ -265,6 +283,10 @@ async def test_processing_commits_provenance_once(
     )
 
     assert {memory.summary for memory in dense_candidates} == {
+        "A person places a red tool beside a blue toolbox.",
+        "The red tool is beside the blue toolbox.",
+    }
+    assert {memory.summary for memory in graph_candidates} == {
         "A person places a red tool beside a blue toolbox.",
         "The red tool is beside the blue toolbox.",
     }

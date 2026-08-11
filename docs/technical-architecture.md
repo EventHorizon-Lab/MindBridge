@@ -468,10 +468,13 @@ flowchart LR
 7. 返回答案、MemoryRecord、EvidenceSpan、置信度和推理追踪 ID。
 8. 证据不足时明确拒答或请求补充，而不是从相似摘要中猜测。
 
-当前可运行基线已经实现 EvidenceSpan 稠密检索、PostgreSQL FTS、结构化过滤、RRF 和原始
-视听证据重看。纯媒体查询只使用跨模态稠密候选，避免把“最近记忆”伪装成相关结果；文本查询
-并行运行稠密与稀疏召回。关系展开、专用 reranker 和多轮定向重读按 Benchmark 失败案例加入，
-不预先建设空框架。
+当前可运行基线已经实现 EvidenceSpan、Event、Claim 和显式 MemoryRecord 的稠密检索、
+PostgreSQL FTS、结构化过滤、RRF 和原始视听证据重看。Event/Claim 命中通过有类型的
+`represented_by` 关系映射回 MemoryRecord，映射后再次应用租户、时间、人物、设备和记忆类型
+过滤。纯媒体查询只使用跨模态稠密候选，避免把“最近记忆”伪装成相关结果；文本查询并行运行
+稠密与稀疏召回。pgvector HNSW 查询在事务内启用 `strict_order` iterative scan，避免过滤条件
+导致候选不足，因此部署要求 pgvector 0.8+。`before/after` 等多跳邻居展开、专用 reranker 和
+多轮定向重读按 Benchmark 失败案例加入，不预先建设通用图遍历框架。
 
 ### 7.3 追问
 

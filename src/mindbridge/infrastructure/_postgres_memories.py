@@ -4,10 +4,11 @@ from typing import Any, cast
 
 from psycopg.errors import ForeignKeyViolation
 
-from mindbridge.application import MemoryWriteResult
+from mindbridge.application import EmbeddingMatch, MemoryWriteResult
 from mindbridge.contracts import RecallRequest
 from mindbridge.core import (
     DomainInvariantError,
+    EmbeddedObjectType,
     EvidenceId,
     ForgetTargetType,
     IdempotencyConflictError,
@@ -183,6 +184,34 @@ async def search_memories_by_ids(
     parameters.update(memory_ids=list(ranked_memory_ids), limit=limit)
     async with tenant_connection(pool, request.tenant_id) as connection:
         cursor = await connection.execute(_SEARCH_MEMORIES_BY_IDS_SQL, parameters)
+        return tuple([memory_from_row(cast(MemoryRow, row)) async for row in cursor])
+
+
+async def search_memories_by_graph_objects(
+    pool: DatabasePool,
+    request: RecallRequest,
+    ranked_objects: tuple[EmbeddingMatch, ...],
+    *,
+    limit: int,
+) -> tuple[MemoryRecord, ...]:
+    """Follow ranked Event/Claim representation edges to filtered memories."""
+    if not ranked_objects:
+        return ()
+    if limit <= 0:
+        raise DomainInvariantError("semantic graph candidate limit must be positive")
+    if any(
+        match.object_type not in {EmbeddedObjectType.EVENT, EmbeddedObjectType.CLAIM}
+        for match in ranked_objects
+    ):
+        raise DomainInvariantError("semantic graph candidates must be events or claims")
+    parameters = _recall_parameters(request)
+    parameters.update(
+        object_types=[match.object_type.value for match in ranked_objects],
+        object_ids=[match.object_id for match in ranked_objects],
+        limit=limit,
+    )
+    async with tenant_connection(pool, request.tenant_id) as connection:
+        cursor = await connection.execute(_SEARCH_MEMORIES_BY_GRAPH_OBJECTS_SQL, parameters)
         return tuple([memory_from_row(cast(MemoryRow, row)) async for row in cursor])
 
 
@@ -390,5 +419,32 @@ JOIN ranked_memories AS dense ON dense.memory_id = memory.memory_id
 WHERE memory.tenant_id = %(tenant_id)s
 {_STRUCTURED_RECALL_FILTER_SQL}
 ORDER BY dense.rank, memory.strength DESC, memory.occurred_at DESC, memory.memory_id
+LIMIT %(limit)s
+"""
+
+_SEARCH_MEMORIES_BY_GRAPH_OBJECTS_SQL = f"""
+WITH ranked_objects AS (
+    SELECT object_type, object_id, rank
+    FROM unnest(
+        %(object_types)s::text[], %(object_ids)s::text[]
+    ) WITH ORDINALITY AS hit(object_type, object_id, rank)
+),
+ranked_memories AS (
+    SELECT relation.tenant_id, relation.target_id AS memory_id, min(hit.rank) AS dense_rank
+    FROM relations AS relation
+    JOIN ranked_objects AS hit
+      ON hit.object_type = relation.source_type
+     AND hit.object_id = relation.source_id
+    WHERE relation.tenant_id = %(tenant_id)s
+      AND relation.relation_type = 'represented_by'
+      AND relation.target_type = 'memory_record'
+    GROUP BY relation.tenant_id, relation.target_id
+)
+{MEMORY_SELECT_SQL}
+JOIN ranked_memories AS dense
+  ON dense.tenant_id = memory.tenant_id AND dense.memory_id = memory.memory_id
+WHERE memory.tenant_id = %(tenant_id)s
+{_STRUCTURED_RECALL_FILTER_SQL}
+ORDER BY dense.dense_rank, memory.strength DESC, memory.occurred_at DESC, memory.memory_id
 LIMIT %(limit)s
 """

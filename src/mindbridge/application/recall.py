@@ -264,25 +264,44 @@ class RecallMemories:
                 EmbeddedObjectType.MEMORY_RECORD,
             )
         }
-        evidence_matches, memory_matches = await asyncio.gather(
+        graph_search = EmbeddingSearch(
+            tenant_id=TenantId(request.tenant_id),
+            values=values,
+            space_reference=self._recall_embedder.space_reference,
+            document_task=RETRIEVAL_DOCUMENT_EMBEDDING_TASK,
+            object_types=(EmbeddedObjectType.EVENT, EmbeddedObjectType.CLAIM),
+            limit=limit,
+            minimum_similarity=self._minimum_embedding_similarity,
+        )
+        evidence_matches, memory_matches, graph_matches = await asyncio.gather(
             self._embedding_index.search_embeddings(searches[EmbeddedObjectType.EVIDENCE_SPAN]),
             self._embedding_index.search_embeddings(searches[EmbeddedObjectType.MEMORY_RECORD]),
+            self._embedding_index.search_embeddings(graph_search),
         )
         evidence_ids = tuple(
             dict.fromkeys(EvidenceId(match.object_id) for match in evidence_matches)
         )
         memory_ids = tuple(dict.fromkeys(MemoryId(match.object_id) for match in memory_matches))
-        evidence_memories, direct_memories = await asyncio.gather(
+        evidence_memories, direct_memories, graph_memories = await asyncio.gather(
             self._store.search_memories_by_evidence(request, evidence_ids, limit=limit),
             self._store.search_memories_by_ids(request, memory_ids, limit=limit),
+            self._store.search_memories_by_graph_objects(
+                request,
+                graph_matches,
+                limit=limit,
+            ),
         )
         set_current_span_attributes(
             {
                 "mindbridge.recall.evidence_match_count": len(evidence_matches),
                 "mindbridge.recall.memory_match_count": len(memory_matches),
+                "mindbridge.recall.graph_match_count": len(graph_matches),
             }
         )
-        return fuse_memory_rankings((evidence_memories, direct_memories), limit=limit)
+        return fuse_memory_rankings(
+            (evidence_memories, graph_memories, direct_memories),
+            limit=limit,
+        )
 
     @trace_operation("mindbridge.recall.resolve_query_media")
     async def _resolve_query_media(

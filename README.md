@@ -32,8 +32,8 @@ the production kernel and PostgreSQL/pgvector path; the normal integration test 
 
 ## Local PostgreSQL
 
-The production store uses PostgreSQL 18 with pgvector. Start the pinned development database and
-apply every migration in order to a fresh database:
+The production store uses PostgreSQL 18 with pgvector 0.8+; filtered HNSW recall relies on iterative
+scans. Start the pinned development database and apply every migration in order to a fresh database:
 
 ```bash
 docker compose up -d postgres redis

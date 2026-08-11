@@ -64,6 +64,7 @@ from mindbridge.infrastructure._postgres_memories import (
     read_memory,
     search_memories,
     search_memories_by_evidence,
+    search_memories_by_graph_objects,
     search_memories_by_ids,
     write_memory,
 )
@@ -288,6 +289,21 @@ class PostgresMemoryStore:
             self._pool,
             request,
             ranked_memory_ids,
+            limit=limit,
+        )
+
+    async def search_memories_by_graph_objects(
+        self,
+        request: RecallRequest,
+        ranked_objects: tuple[EmbeddingMatch, ...],
+        *,
+        limit: int,
+    ) -> tuple[MemoryRecord, ...]:
+        """Follow ranked Event/Claim representation edges with exact filters."""
+        return await search_memories_by_graph_objects(
+            self._pool,
+            request,
+            ranked_objects,
             limit=limit,
         )
 
