@@ -33,6 +33,28 @@
       "context_count": 920,
       "memory_item_count": 920,
       "question_count": 3214
+    },
+    {
+      "benchmark": "EgoLifeQA",
+      "source_repository": "lmms-lab/EgoLife",
+      "source_revision": "143fb319be7aa5ae210c936bf4f0f3a86092afb0",
+      "source_file": "EgoLifeQA_A1_JAKE.json",
+      "source_sha256": "688ae079f458132f13150711b7e099fbe4fdedd97f19f5a33bdebb7bfde74a52",
+      "adapter_version": "egolife_qa_official_v1",
+      "context_count": 1,
+      "memory_item_count": 7,
+      "question_count": 500
+    },
+    {
+      "benchmark": "SuperMemory-VQA",
+      "source_repository": "OSU-AIoT-MLSys-Lab/SuperMemory-VQA",
+      "source_revision": "1d228e0f10049a8a84c458dded2aa25b1e21ce8f",
+      "source_file": "all_qa.json",
+      "source_sha256": "fbb3f234d8ce79e5cfbe31482d735038035ee13f59a6468a3f3a078c2aa15663",
+      "adapter_version": "supermemory_vqa_official_v1",
+      "context_count": 10,
+      "memory_item_count": 83,
+      "question_count": 4853
     }
   ],
   "passed": true

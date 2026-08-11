@@ -33,4 +33,6 @@ def test_dataset_adapter_manifest_matches_current_schema() -> None:
         "LoCoMo": 1_986,
         "M3-Bench-robot": 1_276,
         "M3-Bench-web": 3_214,
+        "EgoLifeQA": 500,
+        "SuperMemory-VQA": 4_853,
     }
