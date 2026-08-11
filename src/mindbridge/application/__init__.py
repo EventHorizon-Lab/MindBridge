@@ -35,6 +35,7 @@ from mindbridge.application.ports import (
     PresignedMediaUpload,
     ResolvedEvidence,
     ResolvedQueryMedia,
+    TextDocumentEmbedder,
 )
 from mindbridge.application.process_observation import ProcessObservation
 from mindbridge.application.ranking import fuse_memory_rankings
@@ -80,6 +81,7 @@ __all__ = [
     "RecallMemories",
     "ResolvedEvidence",
     "ResolvedQueryMedia",
+    "TextDocumentEmbedder",
     "fuse_memory_rankings",
     "resolve_evidence_media",
 ]

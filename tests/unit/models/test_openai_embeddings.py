@@ -18,7 +18,7 @@ from mindbridge.core import (
     ModelReference,
     TenantId,
 )
-from mindbridge.models import OpenAIJinaEmbedder, normalize_openai_base_url
+from mindbridge.models import OpenAIJinaEmbedder, OpenAIJinaTextEmbedder, normalize_openai_base_url
 
 NOW = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
 QUERY_MODEL_ID = "jinaai/jina-embeddings-v5-omni-small-retrieval"
@@ -66,6 +66,38 @@ async def test_memory_document_uses_jina_document_prompt() -> None:
         await embedder.close()
 
     assert vector == (1.0,) + (0.0,) * 1_023
+
+
+async def test_text_document_embedder_batches_and_restores_index_order() -> None:
+    second = [0.0, 1.0] + [0.0] * 1_022
+
+    async def respond(request: httpx.Request) -> httpx.Response:
+        payload: dict[str, object] = json.loads(request.content)
+        assert payload["input"] == ["Document: first event", "Document: second claim"]
+        return httpx.Response(
+            200,
+            json={
+                "object": "list",
+                "data": [
+                    {"object": "embedding", "index": 1, "embedding": second},
+                    {
+                        "object": "embedding",
+                        "index": 0,
+                        "embedding": [1.0] + [0.0] * 1_023,
+                    },
+                ],
+                "model": DOCUMENT_MODEL_ID,
+                "usage": {"prompt_tokens": 2, "total_tokens": 2},
+            },
+        )
+
+    embedder = _text_embedder(respond)
+    try:
+        vectors = await embedder.encode_documents(("first event", "second claim"))
+    finally:
+        await embedder.close()
+
+    assert vectors == ((1.0,) + (0.0,) * 1_023, tuple(second))
 
 
 async def test_multimodal_query_preserves_native_av_parts() -> None:
@@ -150,6 +182,20 @@ def _embedder(
             model_id=DOCUMENT_MODEL_ID,
             revision="pinned-document-revision",
         ),
+    )
+
+
+def _text_embedder(
+    handler: Callable[[httpx.Request], Coroutine[None, None, httpx.Response]],
+) -> OpenAIJinaTextEmbedder:
+    return OpenAIJinaTextEmbedder(
+        AsyncOpenAI(
+            api_key="unit-test-key",
+            base_url=normalize_openai_base_url("https://text.example.test/api/v1/embeddings"),
+            http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+            max_retries=0,
+        ),
+        ModelReference(model_id=DOCUMENT_MODEL_ID, revision="pinned-document-revision"),
     )
 
 

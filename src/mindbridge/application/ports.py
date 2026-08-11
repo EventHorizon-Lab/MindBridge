@@ -520,3 +520,21 @@ class OmniEmbedder(Protocol):
         self,
         inputs: tuple[EmbeddingInput, ...],
     ) -> tuple[tuple[float, ...], ...]: ...
+
+
+class TextDocumentEmbedder(Protocol):
+    """Frozen text document encoder aligned with the primary retrieval space."""
+
+    @property
+    def model_reference(self) -> ModelReference: ...
+
+    @property
+    def space_reference(self) -> EmbeddingSpaceReference: ...
+
+    @property
+    def dimension(self) -> int: ...
+
+    async def encode_documents(
+        self,
+        texts: tuple[str, ...],
+    ) -> tuple[tuple[float, ...], ...]: ...
