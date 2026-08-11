@@ -4,6 +4,8 @@ from mindbridge.core.errors import (
     DomainInvariantError,
     IdempotencyConflictError,
     MemoryIntegrityError,
+    ModelOutputError,
+    ModelUnavailableError,
 )
 from mindbridge.core.evidence import (
     EvidenceSpan,
@@ -57,7 +59,9 @@ __all__ = [
     "MemoryRecord",
     "MemoryState",
     "MemoryType",
+    "ModelOutputError",
     "ModelReference",
+    "ModelUnavailableError",
     "Observation",
     "ObservationId",
     "PixelRegion",

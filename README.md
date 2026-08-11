@@ -44,3 +44,15 @@ uv run pytest -W error tests/integration/test_postgres_store.py
 ```
 
 The integration fixture refuses to rebuild a database without the `_test` suffix.
+
+## Cloud embedding smoke
+
+Cloud multimodal embedding dependencies are optional so the API and edge packages stay light:
+
+```bash
+uv sync --extra cloud-models
+uv run --extra cloud-models python -m mindbridge.benchmarks.jina_smoke \
+  --revision 12949877f0092093f366c6450340011320152a05
+```
+
+The checked-in result is [benchmarks/manifests/jina-omni-small-smoke.json](benchmarks/manifests/jina-omni-small-smoke.json).

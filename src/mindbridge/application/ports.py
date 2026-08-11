@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Protocol, TypeAlias
 
 from mindbridge.contracts import RecallRequest
 from mindbridge.core import (
@@ -19,6 +19,8 @@ from mindbridge.core import (
     Observation,
     TenantId,
 )
+
+EmbeddingInput: TypeAlias = str | bytes | tuple[str | bytes, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -143,3 +145,23 @@ class EmbeddingIndex(Protocol):
     async def write_embedding(self, embedding: EmbeddingRecord) -> bool: ...
 
     async def search_embeddings(self, search: EmbeddingSearch) -> tuple[EmbeddingMatch, ...]: ...
+
+
+class OmniEmbedder(Protocol):
+    """Query/document-aware frozen multimodal encoder."""
+
+    @property
+    def model_reference(self) -> ModelReference: ...
+
+    @property
+    def dimension(self) -> int: ...
+
+    async def encode_queries(
+        self,
+        inputs: tuple[EmbeddingInput, ...],
+    ) -> tuple[tuple[float, ...], ...]: ...
+
+    async def encode_documents(
+        self,
+        inputs: tuple[EmbeddingInput, ...],
+    ) -> tuple[tuple[float, ...], ...]: ...

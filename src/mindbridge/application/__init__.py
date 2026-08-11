@@ -3,6 +3,7 @@
 from mindbridge.application.kernel import MemoryKernel
 from mindbridge.application.ports import (
     EmbeddingIndex,
+    EmbeddingInput,
     EmbeddingMatch,
     EmbeddingSearch,
     GeneratedAnswer,
@@ -11,10 +12,12 @@ from mindbridge.application.ports import (
     MemoryWriteResult,
     ObservationBatch,
     ObservationWriteResult,
+    OmniEmbedder,
 )
 
 __all__ = [
     "EmbeddingIndex",
+    "EmbeddingInput",
     "EmbeddingMatch",
     "EmbeddingSearch",
     "GeneratedAnswer",
@@ -24,4 +27,5 @@ __all__ = [
     "MemoryWriteResult",
     "ObservationBatch",
     "ObservationWriteResult",
+    "OmniEmbedder",
 ]

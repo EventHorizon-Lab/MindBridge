@@ -11,3 +11,11 @@ class IdempotencyConflictError(DomainInvariantError):
 
 class MemoryIntegrityError(RuntimeError):
     """Raised when persisted references violate an internal invariant."""
+
+
+class ModelUnavailableError(RuntimeError):
+    """Raised when a configured frozen model cannot be loaded or called."""
+
+
+class ModelOutputError(RuntimeError):
+    """Raised when model output violates its declared contract."""
