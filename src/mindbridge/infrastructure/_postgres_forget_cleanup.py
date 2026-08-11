@@ -56,13 +56,32 @@ async def delete_memory_scope(
 ) -> None:
     if not memory_ids:
         return
+    scoped_memory_ids = await _select_ids(
+        connection,
+        """
+        WITH RECURSIVE memory_scope(memory_id) AS (
+            SELECT memory_id FROM unnest(%s::text[]) AS initial(memory_id)
+            UNION
+            SELECT relation.source_id
+            FROM memory_scope AS child
+            JOIN relations AS relation
+              ON relation.tenant_id = %s
+             AND relation.source_type = 'memory_record'
+             AND relation.relation_type = 'contains'
+             AND relation.target_type = 'memory_record'
+             AND relation.target_id = child.memory_id
+        )
+        SELECT memory_id FROM memory_scope
+        """,
+        (list(memory_ids), tenant_id),
+    )
     feedback_cursor = await connection.execute(
         """
         SELECT feedback_id FROM memory_feedback
         WHERE tenant_id = %s
           AND (memory_id = ANY(%s) OR corrected_memory_id = ANY(%s))
         """,
-        (tenant_id, list(memory_ids), list(memory_ids)),
+        (tenant_id, list(scoped_memory_ids), list(scoped_memory_ids)),
     )
     feedback_ids = tuple([cast(tuple[str], row)[0] async for row in feedback_cursor])
     await connection.execute(
@@ -70,7 +89,7 @@ async def delete_memory_scope(
         DELETE FROM embeddings
         WHERE tenant_id = %s AND object_type = 'memory_record' AND object_id = ANY(%s)
         """,
-        (tenant_id, list(memory_ids)),
+        (tenant_id, list(scoped_memory_ids)),
     )
     await connection.execute(
         """
@@ -79,7 +98,7 @@ async def delete_memory_scope(
           AND ((source_type = 'memory_record' AND source_id = ANY(%s))
             OR (target_type = 'memory_record' AND target_id = ANY(%s)))
         """,
-        (tenant_id, list(memory_ids), list(memory_ids)),
+        (tenant_id, list(scoped_memory_ids), list(scoped_memory_ids)),
     )
     if feedback_ids:
         await connection.execute(
@@ -98,11 +117,11 @@ async def delete_memory_scope(
         DELETE FROM idempotency_keys
         WHERE tenant_id = %s AND operation = 'remember' AND resource_id = ANY(%s)
         """,
-        (tenant_id, list(memory_ids)),
+        (tenant_id, list(scoped_memory_ids)),
     )
     await connection.execute(
         "DELETE FROM memory_records WHERE tenant_id = %s AND memory_id = ANY(%s)",
-        (tenant_id, list(memory_ids)),
+        (tenant_id, list(scoped_memory_ids)),
     )
 
 

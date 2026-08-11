@@ -63,8 +63,10 @@ from mindbridge.core import (
     MediaKind,
     MediaObject,
     MediaObjectId,
+    MemoryDeletedError,
     MemoryId,
     MemoryIntegrityError,
+    MemoryNotFoundError,
     MemoryType,
     ModelReference,
     Observation,
@@ -1009,6 +1011,62 @@ async def test_summary_consolidation_is_atomic_recallable_and_retry_safe(
         "The red tool is beside the blue toolbox.",
     }
 
+    first_summary_id = strict_memories[0].memory_id
+    source_memory_ids = tuple(memory.memory_id for memory in expanded_memories[1:])
+    await _forget_memory(
+        store,
+        tenant_id,
+        first_summary_id,
+        requested_at=request.evaluated_at + timedelta(seconds=1),
+        ordinal=1,
+    )
+    with pytest.raises(MemoryDeletedError):
+        await store.read_memory(tenant_id, first_summary_id)
+    for source_memory_id in source_memory_ids:
+        await store.read_memory(tenant_id, source_memory_id)
+    assert await _summary_counts(database_url, tenant_id) == (0, 0, 0, 0)
+
+    rebuilt_request = SummaryCandidateRequest(
+        tenant_id=tenant_id,
+        evaluated_at=request.evaluated_at + timedelta(days=1),
+        maximum_gap_seconds=10,
+        minimum_similarity=0.99,
+    )
+    rebuilt = await ConsolidateSummaries(
+        store,
+        RecordingSummaryConsolidator(),
+        FixedTextEmbedder(),
+        media_url_signer=DeterministicSigner(),
+    ).run(rebuilt_request)
+    assert rebuilt.committed_count == 1
+    rebuilt_matches = await store.search_embeddings(
+        EmbeddingSearch(
+            tenant_id=tenant_id,
+            values=(1.0,) + (0.0,) * 1_023,
+            space_reference=EmbeddingSpaceReference(space_id="jina-v5", revision="space-v1"),
+            document_task="retrieval_document",
+            object_types=(EmbeddedObjectType.MEMORY_RECORD,),
+            limit=20,
+        )
+    )
+    assert len(rebuilt_matches) == 1
+    rebuilt_summary_id = MemoryId(rebuilt_matches[0].object_id)
+
+    await _forget_memory(
+        store,
+        tenant_id,
+        source_memory_ids[0],
+        requested_at=rebuilt_request.evaluated_at + timedelta(seconds=1),
+        ordinal=2,
+    )
+    with pytest.raises(MemoryDeletedError):
+        await store.read_memory(tenant_id, source_memory_ids[0])
+    with pytest.raises(MemoryNotFoundError):
+        await store.read_memory(tenant_id, rebuilt_summary_id)
+    for source_memory_id in source_memory_ids[1:]:
+        await store.read_memory(tenant_id, source_memory_id)
+    assert await _summary_counts(database_url, tenant_id) == (0, 0, 0, 0)
+
 
 async def test_superseded_attempt_cannot_commit(
     store: PostgresMemoryStore,
@@ -1189,6 +1247,40 @@ def _summary_consolidation(
             revision="summary-serving-revision-01",
         ),
         prompt_version="consolidate_summaries_v1",
+    )
+
+
+async def _forget_memory(
+    store: PostgresMemoryStore,
+    tenant_id: TenantId,
+    memory_id: MemoryId,
+    *,
+    requested_at: datetime,
+    ordinal: int,
+) -> None:
+    tombstone = DeletionTombstone(
+        tombstone_id=TombstoneId(
+            derive_stable_id(
+                "tombstone",
+                tenant_id,
+                ForgetTargetType.MEMORY_RECORD.value,
+                memory_id,
+            )
+        ),
+        tenant_id=tenant_id,
+        target_type=ForgetTargetType.MEMORY_RECORD,
+        target_id=memory_id,
+        propagation_state=DeletionPropagationState.PENDING,
+        requested_at=requested_at,
+    )
+    plan = await store.prepare_forget(
+        tombstone,
+        idempotency_key=f"forget_summary_scope_{ordinal}",
+        content_digest=f"{ordinal:x}" * 64,
+    )
+    await store.complete_forget(
+        plan.tombstone,
+        completed_at=requested_at + timedelta(seconds=1),
     )
 
 
