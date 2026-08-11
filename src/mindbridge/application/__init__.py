@@ -12,6 +12,12 @@ from mindbridge.application.consolidate_claims import (
     ClaimConsolidator,
     ConsolidateClaims,
 )
+from mindbridge.application.consolidate_summaries import (
+    ConsolidateSummaries,
+    SummaryConsolidationResult,
+    SummaryConsolidationStore,
+    SummaryConsolidator,
+)
 from mindbridge.application.consolidation import (
     ConsolidateEpisodes,
     EpisodeCandidatePage,
@@ -93,6 +99,12 @@ from mindbridge.application.summary_consolidation import (
     SummaryCandidate,
     SummaryCandidatePage,
     SummaryCandidateRequest,
+    SummaryCandidateStore,
+    SummaryConsolidation,
+    SummaryProposal,
+    SummaryScope,
+    SummaryWrite,
+    derive_summary_writes,
 )
 
 __all__ = [
@@ -114,6 +126,7 @@ __all__ = [
     "ClaimRelationshipProposal",
     "ConsolidateClaims",
     "ConsolidateEpisodes",
+    "ConsolidateSummaries",
     "EmbeddingIndex",
     "EmbeddingInput",
     "EmbeddingMatch",
@@ -165,7 +178,16 @@ __all__ = [
     "SummaryCandidate",
     "SummaryCandidatePage",
     "SummaryCandidateRequest",
+    "SummaryCandidateStore",
+    "SummaryConsolidation",
+    "SummaryConsolidationResult",
+    "SummaryConsolidationStore",
+    "SummaryConsolidator",
+    "SummaryProposal",
+    "SummaryScope",
+    "SummaryWrite",
     "TextDocumentEmbedder",
+    "derive_summary_writes",
     "fuse_memory_rankings",
     "resolve_evidence_media",
 ]
