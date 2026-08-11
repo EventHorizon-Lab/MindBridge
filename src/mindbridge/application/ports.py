@@ -12,6 +12,7 @@ from mindbridge.core import (
     DomainInvariantError,
     EmbeddedObjectType,
     EmbeddingRecord,
+    Event,
     EvidenceId,
     EvidenceSpan,
     JobId,
@@ -21,6 +22,8 @@ from mindbridge.core import (
     ModelReference,
     Observation,
     ObservationId,
+    ObservationJobClaim,
+    ObservationProcessingJob,
     TenantId,
 )
 
@@ -51,6 +54,29 @@ class ObservationBatch:
     media_objects: tuple[MediaObject, ...]
     observation: Observation
     evidence_spans: tuple[EvidenceSpan, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ObservationProcessingOutput:
+    """Derived records committed together with successful job state."""
+
+    events: tuple[Event, ...]
+    memories: tuple[MemoryRecord, ...]
+    embeddings: tuple[EmbeddingRecord, ...]
+
+    def __post_init__(self) -> None:
+        if len(self.events) != len(self.memories):
+            raise DomainInvariantError("each derived event must have one episodic memory")
+        for event, memory in zip(self.events, self.memories, strict=True):
+            if (
+                event.tenant_id != memory.tenant_id
+                or event.description != memory.summary
+                or event.evidence_ids != memory.evidence_ids
+            ):
+                raise DomainInvariantError("derived event and memory provenance must match")
+        embedding_ids = [embedding.embedding_id for embedding in self.embeddings]
+        if len(set(embedding_ids)) != len(embedding_ids):
+            raise DomainInvariantError("derived embedding IDs must be unique")
 
 
 @dataclass(frozen=True, slots=True)
@@ -238,6 +264,43 @@ class ObservationPerceiver(Protocol):
         observation: Observation,
         evidence: tuple[ResolvedEvidence, ...],
     ) -> EventPerception: ...
+
+
+class ObservationProcessingStore(Protocol):
+    """Transactional persistence needed by the shared processing use case."""
+
+    async def claim_observation_processing_job(
+        self,
+        tenant_id: TenantId,
+        observation_id: ObservationId,
+        job_id: JobId,
+    ) -> ObservationJobClaim: ...
+
+    async def read_observation_batch(
+        self,
+        tenant_id: TenantId,
+        observation_id: ObservationId,
+    ) -> ObservationBatch: ...
+
+    async def commit_observation_processing(
+        self,
+        tenant_id: TenantId,
+        observation_id: ObservationId,
+        job_id: JobId,
+        *,
+        attempt: int,
+        output: ObservationProcessingOutput,
+    ) -> ObservationProcessingJob: ...
+
+    async def mark_observation_processing_failed(
+        self,
+        tenant_id: TenantId,
+        observation_id: ObservationId,
+        job_id: JobId,
+        *,
+        attempt: int,
+        error_code: str,
+    ) -> ObservationProcessingJob: ...
 
 
 class MediaUrlSigner(Protocol):

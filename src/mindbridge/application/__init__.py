@@ -16,6 +16,8 @@ from mindbridge.application.ports import (
     ObservationBatch,
     ObservationJobPublisher,
     ObservationPerceiver,
+    ObservationProcessingOutput,
+    ObservationProcessingStore,
     ObservationWriteResult,
     OmniEmbedder,
     PerceivedEvent,
@@ -23,6 +25,7 @@ from mindbridge.application.ports import (
     PresignedMediaUpload,
     ResolvedEvidence,
 )
+from mindbridge.application.process_observation import ProcessObservation
 
 __all__ = [
     "EmbeddingIndex",
@@ -39,11 +42,14 @@ __all__ = [
     "ObservationBatch",
     "ObservationJobPublisher",
     "ObservationPerceiver",
+    "ObservationProcessingOutput",
+    "ObservationProcessingStore",
     "ObservationWriteResult",
     "OmniEmbedder",
     "PerceivedEvent",
     "PresignedMediaDownload",
     "PresignedMediaUpload",
+    "ProcessObservation",
     "ResolvedEvidence",
     "resolve_evidence_media",
 ]
