@@ -2,20 +2,28 @@
 
 from __future__ import annotations
 
+from pgvector.psycopg import register_vector_async
+
 from mindbridge.application import (
+    EmbeddingMatch,
+    EmbeddingSearch,
     MemoryWriteResult,
     ObservationBatch,
     ObservationWriteResult,
 )
 from mindbridge.contracts import RecallRequest
-from mindbridge.core import EvidenceId, EvidenceSpan, MemoryRecord, TenantId
+from mindbridge.core import EmbeddingRecord, EvidenceId, EvidenceSpan, MemoryRecord, TenantId
+from mindbridge.infrastructure._postgres_embeddings import (
+    search_embeddings,
+    write_embedding,
+)
 from mindbridge.infrastructure._postgres_memories import (
     read_evidence,
     search_memories,
     write_memory,
 )
 from mindbridge.infrastructure._postgres_observations import write_observation
-from mindbridge.infrastructure._postgres_types import DatabasePool
+from mindbridge.infrastructure._postgres_types import DatabaseConnection, DatabasePool
 
 
 class PostgresMemoryStore:
@@ -41,6 +49,7 @@ class PostgresMemoryStore:
             kwargs={
                 "options": f"-c timezone=UTC -c statement_timeout={statement_timeout_ms}",
             },
+            configure=_configure_connection,
         )
 
     async def open(self) -> None:
@@ -92,3 +101,16 @@ class PostgresMemoryStore:
     ) -> tuple[EvidenceSpan, ...]:
         """Read exact evidence spans while preserving caller order."""
         return await read_evidence(self._pool, tenant_id, evidence_ids)
+
+    async def write_embedding(self, embedding: EmbeddingRecord) -> bool:
+        """Persist one immutable vector version."""
+        return await write_embedding(self._pool, embedding)
+
+    async def search_embeddings(self, search: EmbeddingSearch) -> tuple[EmbeddingMatch, ...]:
+        """Search one explicit frozen embedding space by cosine similarity."""
+        return await search_embeddings(self._pool, search)
+
+
+async def _configure_connection(connection: DatabaseConnection) -> None:
+    await register_vector_async(connection)
+    await connection.commit()

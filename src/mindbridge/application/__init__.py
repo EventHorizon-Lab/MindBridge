@@ -2,6 +2,9 @@
 
 from mindbridge.application.kernel import MemoryKernel
 from mindbridge.application.ports import (
+    EmbeddingIndex,
+    EmbeddingMatch,
+    EmbeddingSearch,
     GeneratedAnswer,
     MemoryAnswerer,
     MemoryStore,
@@ -11,6 +14,9 @@ from mindbridge.application.ports import (
 )
 
 __all__ = [
+    "EmbeddingIndex",
+    "EmbeddingMatch",
+    "EmbeddingSearch",
     "GeneratedAnswer",
     "MemoryAnswerer",
     "MemoryKernel",

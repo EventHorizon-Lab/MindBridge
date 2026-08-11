@@ -12,7 +12,7 @@ import pytest
 import pytest_asyncio
 from psycopg import AsyncConnection
 
-from mindbridge.application import GeneratedAnswer, MemoryKernel
+from mindbridge.application import EmbeddingSearch, GeneratedAnswer, MemoryKernel
 from mindbridge.contracts import (
     MediaObjectInput,
     ObservationStatus,
@@ -23,12 +23,18 @@ from mindbridge.contracts import (
     RememberRequest,
 )
 from mindbridge.core import (
+    DomainInvariantError,
+    EmbeddedObjectType,
+    EmbeddingId,
+    EmbeddingRecord,
     EvidenceSpan,
     IdempotencyConflictError,
     MediaKind,
     MemoryRecord,
     MemoryType,
+    ModelReference,
     SensorKind,
+    TenantId,
     VerificationStatus,
 )
 from mindbridge.infrastructure import PostgresMemoryStore
@@ -189,6 +195,65 @@ async def test_postgres_deduplicates_media_by_content_hash(
     assert cast(tuple[int], row)[0] == 1
 
 
+async def test_pgvector_keeps_model_spaces_separate_and_ranks_by_cosine(
+    store: PostgresMemoryStore,
+) -> None:
+    """The cloud index retrieves only the requested frozen model version."""
+    model = ModelReference(
+        model_id="jinaai/jina-embeddings-v5-omni-small-retrieval",
+        revision="abcdef0",
+    )
+    first = _embedding_record(
+        embedding_id="embedding_01",
+        object_id="memory_near",
+        values=(1.0,) + (0.0,) * 1_023,
+        model=model,
+    )
+    second = _embedding_record(
+        embedding_id="embedding_02",
+        object_id="memory_far",
+        values=(0.0, 1.0) + (0.0,) * 1_022,
+        model=model,
+    )
+
+    assert await store.write_embedding(first) is True
+    assert await store.write_embedding(first) is False
+    assert await store.write_embedding(second) is True
+    with pytest.raises(DomainInvariantError, match="different vector content"):
+        await store.write_embedding(
+            _embedding_record(
+                embedding_id="embedding_01",
+                object_id="memory_near",
+                values=second.values,
+                model=model,
+            )
+        )
+    matches = await store.search_embeddings(
+        EmbeddingSearch(
+            tenant_id=TenantId("tenant_vectors"),
+            values=first.values,
+            model_reference=model,
+            document_task="retrieval_document",
+            object_types=(EmbeddedObjectType.MEMORY_RECORD,),
+            limit=2,
+        )
+    )
+    other_revision = await store.search_embeddings(
+        EmbeddingSearch(
+            tenant_id=TenantId("tenant_vectors"),
+            values=first.values,
+            model_reference=ModelReference(model_id=model.model_id, revision="different"),
+            document_task="retrieval_document",
+            object_types=(EmbeddedObjectType.MEMORY_RECORD,),
+            limit=2,
+        )
+    )
+
+    assert [match.object_id for match in matches] == ["memory_near", "memory_far"]
+    assert matches[0].similarity == pytest.approx(1.0)
+    assert other_revision == ()
+
+
 async def _first_evidence_id(database_url: str, tenant_id: str) -> str:
     connection = await AsyncConnection.connect(database_url)
     async with connection:
@@ -242,4 +307,25 @@ def _remember_request(*, tenant_id: str, evidence_id: str) -> RememberRequest:
         memory_type=MemoryType.EPISODIC,
         occurred_at=NOW,
         evidence_ids=(evidence_id,),
+    )
+
+
+def _embedding_record(
+    *,
+    embedding_id: str,
+    object_id: str,
+    values: tuple[float, ...],
+    model: ModelReference,
+) -> EmbeddingRecord:
+    return EmbeddingRecord(
+        embedding_id=EmbeddingId(embedding_id),
+        tenant_id=TenantId("tenant_vectors"),
+        object_type=EmbeddedObjectType.MEMORY_RECORD,
+        object_id=object_id,
+        values=values,
+        model_reference=model,
+        task="retrieval_document",
+        dimension=1_024,
+        normalized=True,
+        created_at=NOW,
     )

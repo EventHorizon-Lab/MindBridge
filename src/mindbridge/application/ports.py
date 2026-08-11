@@ -9,10 +9,13 @@ from typing import Protocol
 from mindbridge.contracts import RecallRequest
 from mindbridge.core import (
     DomainInvariantError,
+    EmbeddedObjectType,
+    EmbeddingRecord,
     EvidenceId,
     EvidenceSpan,
     MediaObject,
     MemoryRecord,
+    ModelReference,
     Observation,
     TenantId,
 )
@@ -59,6 +62,42 @@ class GeneratedAnswer:
             raise DomainInvariantError("confidence must be zero when no answer is present")
 
 
+@dataclass(frozen=True, slots=True)
+class EmbeddingSearch:
+    """One normalized query against a single frozen embedding space."""
+
+    tenant_id: TenantId
+    values: tuple[float, ...]
+    model_reference: ModelReference
+    document_task: str
+    object_types: tuple[EmbeddedObjectType, ...]
+    limit: int
+
+    def __post_init__(self) -> None:
+        if not self.values or not all(math.isfinite(value) for value in self.values):
+            raise DomainInvariantError("embedding search values must be finite and non-empty")
+        if not self.document_task.strip():
+            raise DomainInvariantError("document_task must not be empty")
+        if not self.object_types or len(set(self.object_types)) != len(self.object_types):
+            raise DomainInvariantError("object_types must be non-empty and unique")
+        if not 1 <= self.limit <= 1_000:
+            raise DomainInvariantError("embedding search limit must be between 1 and 1000")
+
+
+@dataclass(frozen=True, slots=True)
+class EmbeddingMatch:
+    """Cosine-ranked object returned by the semantic index."""
+
+    embedding_id: str
+    object_type: EmbeddedObjectType
+    object_id: str
+    similarity: float
+
+    def __post_init__(self) -> None:
+        if not math.isfinite(self.similarity):
+            raise DomainInvariantError("embedding similarity must be finite")
+
+
 class MemoryStore(Protocol):
     """Persistence operations required by the stable use cases."""
 
@@ -96,3 +135,11 @@ class MemoryAnswerer(Protocol):
         memories: tuple[MemoryRecord, ...],
         evidence: tuple[EvidenceSpan, ...],
     ) -> GeneratedAnswer: ...
+
+
+class EmbeddingIndex(Protocol):
+    """Version-aware semantic vector persistence and retrieval."""
+
+    async def write_embedding(self, embedding: EmbeddingRecord) -> bool: ...
+
+    async def search_embeddings(self, search: EmbeddingSearch) -> tuple[EmbeddingMatch, ...]: ...
