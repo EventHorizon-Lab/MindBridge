@@ -305,7 +305,9 @@ CREATE TABLE jobs (
     error_code text,
     created_at timestamptz NOT NULL,
     updated_at timestamptz NOT NULL,
-    PRIMARY KEY (tenant_id, job_id)
+    PRIMARY KEY (tenant_id, job_id),
+    CHECK ((state = 'pending' AND attempt = 0) OR (state <> 'pending' AND attempt > 0)),
+    CHECK ((state = 'failed') = (error_code IS NOT NULL))
 );
 
 CREATE TABLE idempotency_keys (

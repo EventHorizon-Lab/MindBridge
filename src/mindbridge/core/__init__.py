@@ -29,6 +29,7 @@ from mindbridge.core.identifiers import (
     ObservationId,
     TenantId,
 )
+from mindbridge.core.jobs import JobState, ObservationJobClaim, ObservationProcessingJob
 from mindbridge.core.memory import (
     Claim,
     EmbeddedObjectType,
@@ -55,6 +56,7 @@ __all__ = [
     "EvidenceSpan",
     "IdempotencyConflictError",
     "JobId",
+    "JobState",
     "MediaKind",
     "MediaObject",
     "MediaObjectId",
@@ -69,6 +71,8 @@ __all__ = [
     "ObjectStorageError",
     "Observation",
     "ObservationId",
+    "ObservationJobClaim",
+    "ObservationProcessingJob",
     "PixelRegion",
     "SensorKind",
     "TaskBrokerError",

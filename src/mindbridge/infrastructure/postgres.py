@@ -16,14 +16,23 @@ from mindbridge.core import (
     EmbeddingRecord,
     EvidenceId,
     EvidenceSpan,
+    JobId,
     MediaObject,
     MediaObjectId,
     MemoryRecord,
+    ObservationId,
+    ObservationJobClaim,
+    ObservationProcessingJob,
     TenantId,
 )
 from mindbridge.infrastructure._postgres_embeddings import (
     search_embeddings,
     write_embedding,
+)
+from mindbridge.infrastructure._postgres_jobs import (
+    claim_observation_processing_job,
+    mark_observation_processing_failed,
+    mark_observation_processing_succeeded,
 )
 from mindbridge.infrastructure._postgres_memories import (
     read_evidence,
@@ -125,6 +134,47 @@ class PostgresMemoryStore:
     async def search_embeddings(self, search: EmbeddingSearch) -> tuple[EmbeddingMatch, ...]:
         """Search one explicit frozen embedding space by cosine similarity."""
         return await search_embeddings(self._pool, search)
+
+    async def claim_observation_processing_job(
+        self,
+        tenant_id: TenantId,
+        observation_id: ObservationId,
+        job_id: JobId,
+    ) -> ObservationJobClaim:
+        """Claim one ready job or report its current durable state."""
+        return await claim_observation_processing_job(self._pool, tenant_id, observation_id, job_id)
+
+    async def mark_observation_processing_succeeded(
+        self,
+        tenant_id: TenantId,
+        observation_id: ObservationId,
+        job_id: JobId,
+        *,
+        attempt: int,
+    ) -> ObservationProcessingJob:
+        """Commit successful observation processing state."""
+        return await mark_observation_processing_succeeded(
+            self._pool, tenant_id, observation_id, job_id, attempt=attempt
+        )
+
+    async def mark_observation_processing_failed(
+        self,
+        tenant_id: TenantId,
+        observation_id: ObservationId,
+        job_id: JobId,
+        *,
+        attempt: int,
+        error_code: str,
+    ) -> ObservationProcessingJob:
+        """Record a sanitized failure that remains eligible for retry."""
+        return await mark_observation_processing_failed(
+            self._pool,
+            tenant_id,
+            observation_id,
+            job_id,
+            attempt=attempt,
+            error_code=error_code,
+        )
 
 
 async def _configure_connection(connection: DatabaseConnection) -> None:

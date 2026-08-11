@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 from collections.abc import AsyncIterator
 from datetime import datetime, timedelta, timezone
@@ -35,8 +36,10 @@ from mindbridge.core import (
     EmbeddingRecord,
     IdempotencyConflictError,
     JobId,
+    JobState,
     MediaKind,
     MediaObject,
+    MemoryIntegrityError,
     MemoryRecord,
     MemoryType,
     ModelReference,
@@ -229,6 +232,56 @@ async def test_postgres_deduplicates_media_by_content_hash(
         ).fetchone()
 
     assert cast(tuple[int], row)[0] == 1
+
+
+async def test_observation_job_state_is_atomic_and_retryable(
+    store: PostgresMemoryStore,
+) -> None:
+    """Concurrent deliveries own one attempt and a failed job can later succeed."""
+    receipt = await _kernel(store).observe(_observe_request(tenant_id="tenant_job_state"))
+    tenant_id = TenantId("tenant_job_state")
+    observation_id = ObservationId(receipt.observation_id)
+    job_id = JobId(receipt.processing_job_id)
+
+    claims = await asyncio.gather(
+        *(
+            store.claim_observation_processing_job(tenant_id, observation_id, job_id)
+            for _ in range(5)
+        )
+    )
+
+    assert sum(claim.acquired for claim in claims) == 1
+    assert {claim.job.state for claim in claims} == {JobState.RUNNING}
+    assert {claim.job.attempt for claim in claims} == {1}
+    failed = await store.mark_observation_processing_failed(
+        tenant_id,
+        observation_id,
+        job_id,
+        attempt=1,
+        error_code="model_unavailable",
+    )
+    retry = await store.claim_observation_processing_job(tenant_id, observation_id, job_id)
+    with pytest.raises(MemoryIntegrityError, match="not running"):
+        await store.mark_observation_processing_failed(
+            tenant_id,
+            observation_id,
+            job_id,
+            attempt=1,
+            error_code="stale_attempt",
+        )
+    succeeded = await store.mark_observation_processing_succeeded(
+        tenant_id, observation_id, job_id, attempt=2
+    )
+    duplicate = await store.claim_observation_processing_job(tenant_id, observation_id, job_id)
+
+    assert failed.state is JobState.FAILED
+    assert failed.error_code == "model_unavailable"
+    assert retry.acquired is True
+    assert retry.job.attempt == 2
+    assert retry.job.error_code is None
+    assert succeeded.state is JobState.SUCCEEDED
+    assert duplicate.acquired is False
+    assert duplicate.job.state is JobState.SUCCEEDED
 
 
 async def test_pgvector_keeps_model_spaces_separate_and_ranks_by_cosine(
