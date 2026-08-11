@@ -3,11 +3,9 @@
 from __future__ import annotations
 
 import json
-from pathlib import PurePosixPath
 from typing import Annotated, Literal, TypedDict, cast
 from urllib.parse import urlsplit, urlunsplit
 
-import openai
 from openai import AsyncOpenAI
 from openai.types.chat import ChatCompletionMessageParam
 from pydantic import (
@@ -21,7 +19,9 @@ from pydantic import (
 
 from mindbridge.application import GeneratedAnswer, ResolvedEvidence
 from mindbridge.contracts import RecallRequest
-from mindbridge.core import MediaKind, MemoryRecord, ModelOutputError, ModelUnavailableError
+from mindbridge.core import MemoryRecord, ModelOutputError
+from mindbridge.models.openai_chat import stream_text_completion
+from mindbridge.models.openai_media import OpenAIContentPart, media_content_part
 
 DEFAULT_OMNI_MODEL_ID = "qwen3.8-max"
 ANSWER_FROM_EVIDENCE_PROMPT_VERSION = "answer_from_evidence_v1"
@@ -51,40 +51,6 @@ class _OmniAnswerOutput(BaseModel):
         return self
 
 
-class _UrlValue(TypedDict):
-    url: str
-
-
-class _AudioValue(TypedDict):
-    data: str
-    format: str
-
-
-class _TextPart(TypedDict):
-    type: Literal["text"]
-    text: str
-
-
-class _ImagePart(TypedDict):
-    type: Literal["image_url"]
-    image_url: _UrlValue
-
-
-class _VideoPart(TypedDict):
-    type: Literal["video_url"]
-    video_url: _UrlValue
-    fps: float
-    max_pixels: int
-
-
-class _AudioPart(TypedDict):
-    type: Literal["input_audio"]
-    input_audio: _AudioValue
-
-
-_ContentPart = _TextPart | _ImagePart | _VideoPart | _AudioPart
-
-
 class _SystemMessage(TypedDict):
     role: Literal["system"]
     content: str
@@ -92,7 +58,7 @@ class _SystemMessage(TypedDict):
 
 class _UserMessage(TypedDict):
     role: Literal["user"]
-    content: list[_ContentPart]
+    content: list[OpenAIContentPart]
 
 
 _Message = _SystemMessage | _UserMessage
@@ -177,32 +143,14 @@ class OpenAIOmniAnswerer:
             video_frames_per_second=self._video_frames_per_second,
             video_max_pixels=self._video_max_pixels,
         )
-        parts: list[str] = []
-        finish_reason: str | None = None
-        try:
-            stream = await self._client.chat.completions.create(
-                model=self._model_id,
-                messages=cast(list[ChatCompletionMessageParam], messages),
-                modalities=["text"],
-                max_tokens=self._max_output_tokens,
-                temperature=0.0,
-                stream=True,
-                stream_options={"include_usage": True},
-                timeout=self._request_timeout_seconds,
-            )
-            async for chunk in stream:
-                for choice in chunk.choices:
-                    if choice.index != 0:
-                        continue
-                    if choice.delta.content:
-                        parts.append(choice.delta.content)
-                    finish_reason = finish_reason or choice.finish_reason
-        except openai.APIError as error:
-            raise ModelUnavailableError("Omni answer model request failed") from error
-
-        if finish_reason in {"length", "content_filter"}:
-            raise ModelOutputError(f"Omni answer ended with finish reason {finish_reason}")
-        return _generated_answer("".join(parts))
+        completion = await stream_text_completion(
+            self._client,
+            model_id=self._model_id,
+            messages=cast(list[ChatCompletionMessageParam], messages),
+            max_output_tokens=self._max_output_tokens,
+            request_timeout_seconds=self._request_timeout_seconds,
+        )
+        return _generated_answer(completion.content)
 
     async def close(self) -> None:
         """Release connections owned by the OpenAI SDK client."""
@@ -236,7 +184,7 @@ def _messages(
     video_frames_per_second: float,
     video_max_pixels: int,
 ) -> list[_Message]:
-    content: list[_ContentPart] = [
+    content: list[OpenAIContentPart] = [
         {"type": "text", "text": f"Recall context:\n{_recall_context(request, memories, evidence)}"}
     ]
     seen_media_object_ids: set[str] = set()
@@ -249,7 +197,7 @@ def _messages(
             {"type": "text", "text": f"Source media_object_id={media_object_id} follows."}
         )
         content.append(
-            _media_part(
+            media_content_part(
                 item,
                 video_frames_per_second=video_frames_per_second,
                 video_max_pixels=video_max_pixels,
@@ -293,32 +241,6 @@ def _recall_context(
         ensure_ascii=False,
         separators=(",", ":"),
     )
-
-
-def _media_part(
-    evidence: ResolvedEvidence,
-    *,
-    video_frames_per_second: float,
-    video_max_pixels: int,
-) -> _ImagePart | _VideoPart | _AudioPart:
-    media_kind = evidence.media_object.kind
-    if media_kind is MediaKind.IMAGE:
-        return {"type": "image_url", "image_url": {"url": evidence.media_url}}
-    if media_kind is MediaKind.VIDEO:
-        return {
-            "type": "video_url",
-            "video_url": {"url": evidence.media_url},
-            "fps": video_frames_per_second,
-            "max_pixels": video_max_pixels,
-        }
-    suffix = PurePosixPath(urlsplit(evidence.media_object.uri).path).suffix
-    return {
-        "type": "input_audio",
-        "input_audio": {
-            "data": evidence.media_url,
-            "format": suffix.removeprefix(".").lower() or "wav",
-        },
-    }
 
 
 def _generated_answer(content: str) -> GeneratedAnswer:
