@@ -11,75 +11,79 @@ from mindbridge.core import (
     EmbeddingRecord,
     MemoryIntegrityError,
 )
-from mindbridge.infrastructure._postgres_types import DatabasePool
+from mindbridge.infrastructure._postgres_types import DatabaseConnection, DatabasePool
 
 CLOUD_EMBEDDING_DIMENSION = 1_024
 
 
 async def write_embedding(pool: DatabasePool, embedding: EmbeddingRecord) -> bool:
     """Insert one immutable model-versioned vector; return false for a retry."""
+    async with pool.connection() as connection:
+        return await write_embedding_on_connection(connection, embedding)
+
+
+async def write_embedding_on_connection(
+    connection: DatabaseConnection,
+    embedding: EmbeddingRecord,
+) -> bool:
+    """Write a vector inside a caller-owned transaction."""
     _require_cloud_dimension(embedding.dimension)
     vector = Vector(list(embedding.values))
-    async with pool.connection() as connection:
-        cursor = await connection.execute(
-            """
-            INSERT INTO embeddings (
-                tenant_id, embedding_id, object_type, object_id,
-                model_id, model_revision, task, dimension, normalized,
-                embedding, created_at
-            )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT DO NOTHING
-            RETURNING embedding_id
-            """,
-            (
-                embedding.tenant_id,
-                embedding.embedding_id,
-                embedding.object_type.value,
-                embedding.object_id,
-                embedding.model_reference.model_id,
-                embedding.model_reference.revision,
-                embedding.task,
-                embedding.dimension,
-                embedding.normalized,
-                vector,
-                embedding.created_at,
-            ),
+    cursor = await connection.execute(
+        """
+        INSERT INTO embeddings (
+            tenant_id, embedding_id, object_type, object_id,
+            model_id, model_revision, task, dimension, normalized,
+            embedding, created_at
         )
-        if await cursor.fetchone() is not None:
-            return True
-        cursor = await connection.execute(
-            """
-            SELECT embedding_id, normalized, embedding = %s
-            FROM embeddings
-            WHERE tenant_id = %s
-              AND object_type = %s
-              AND object_id = %s
-              AND model_id = %s
-              AND model_revision = %s
-              AND task = %s
-            """,
-            (
-                vector,
-                embedding.tenant_id,
-                embedding.object_type.value,
-                embedding.object_id,
-                embedding.model_reference.model_id,
-                embedding.model_reference.revision,
-                embedding.task,
-            ),
-        )
-        row = await cursor.fetchone()
-        if row is None:
-            raise MemoryIntegrityError("embedding conflict could not be resolved")
-        existing_id, normalized, same_values = cast(tuple[str, bool, bool], row)
-        if (
-            existing_id == embedding.embedding_id
-            and normalized == embedding.normalized
-            and same_values
-        ):
-            return False
-        raise DomainInvariantError("embedding version already stores different vector content")
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT DO NOTHING
+        RETURNING embedding_id
+        """,
+        (
+            embedding.tenant_id,
+            embedding.embedding_id,
+            embedding.object_type.value,
+            embedding.object_id,
+            embedding.model_reference.model_id,
+            embedding.model_reference.revision,
+            embedding.task,
+            embedding.dimension,
+            embedding.normalized,
+            vector,
+            embedding.created_at,
+        ),
+    )
+    if await cursor.fetchone() is not None:
+        return True
+    cursor = await connection.execute(
+        """
+        SELECT embedding_id, normalized, embedding = %s
+        FROM embeddings
+        WHERE tenant_id = %s
+          AND object_type = %s
+          AND object_id = %s
+          AND model_id = %s
+          AND model_revision = %s
+          AND task = %s
+        """,
+        (
+            vector,
+            embedding.tenant_id,
+            embedding.object_type.value,
+            embedding.object_id,
+            embedding.model_reference.model_id,
+            embedding.model_reference.revision,
+            embedding.task,
+        ),
+    )
+    row = await cursor.fetchone()
+    if row is None:
+        raise MemoryIntegrityError("embedding conflict could not be resolved")
+    existing_id, normalized, same_values = cast(tuple[str, bool, bool], row)
+    if existing_id == embedding.embedding_id and normalized == embedding.normalized and same_values:
+        return False
+    raise DomainInvariantError("embedding version already stores different vector content")
 
 
 async def search_embeddings(
