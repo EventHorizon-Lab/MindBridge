@@ -29,11 +29,16 @@ from mindbridge.models.openai_perception import (
     PERCEIVE_EVENTS_PROMPT_VERSION,
     OpenAIOmniEventPerceiver,
 )
+from mindbridge.models.openai_summary_consolidation import (
+    CONSOLIDATE_SUMMARIES_PROMPT_VERSION,
+    OpenAIOmniSummaryConsolidator,
+)
 
 __all__ = [
     "ANSWER_FROM_EVIDENCE_PROMPT_VERSION",
     "CONSOLIDATE_CLAIMS_PROMPT_VERSION",
     "CONSOLIDATE_EPISODES_PROMPT_VERSION",
+    "CONSOLIDATE_SUMMARIES_PROMPT_VERSION",
     "DEFAULT_JINA_OMNI_DIMENSION",
     "DEFAULT_JINA_OMNI_MODEL_ID",
     "DEFAULT_JINA_OMNI_REVISION",
@@ -50,5 +55,6 @@ __all__ = [
     "OpenAIOmniClaimConsolidator",
     "OpenAIOmniEpisodeConsolidator",
     "OpenAIOmniEventPerceiver",
+    "OpenAIOmniSummaryConsolidator",
     "normalize_openai_base_url",
 ]
