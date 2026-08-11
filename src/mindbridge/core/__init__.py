@@ -1,6 +1,6 @@
 """Stable domain vocabulary for MindBridge memory."""
 
-from mindbridge.core.errors import DomainInvariantError
+from mindbridge.core.errors import DomainInvariantError, IdempotencyConflictError
 from mindbridge.core.evidence import (
     EvidenceSpan,
     MediaKind,
@@ -44,6 +44,7 @@ __all__ = [
     "EventId",
     "EvidenceId",
     "EvidenceSpan",
+    "IdempotencyConflictError",
     "MediaKind",
     "MediaObject",
     "MediaObjectId",
