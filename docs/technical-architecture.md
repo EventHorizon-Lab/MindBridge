@@ -1,7 +1,7 @@
 # MindBridge 技术实现架构
 
 > 状态：基线方案（Baseline）
-> 版本：0.2
+> 版本：0.3
 > 更新日期：2026-08-12
 
 ## 1. 文档目的
@@ -138,7 +138,7 @@ flowchart LR
 | `Episode` | 一组具有连续目标、地点、人物或叙事关系的 Event | 否 |
 | `Entity` | 人、物体、地点、设备、组织或抽象主题 | 否 |
 | `Claim` | 从证据推导出的可追踪事实、状态、意图或关系 | 否 |
-| `Summary` | 对 Event、Episode、日或主题的压缩表示 | 否 |
+| `Summary` | 对 Session、日、人物、地点或主题的树形压缩表示 | 否 |
 | `MemoryRecord` | 对外统一返回的 Episode、Claim、Summary 或显式记忆 | 否 |
 
 任何派生内容都必须带 `evidence_ids`、模型版本和生成时间。缺少证据的派生内容只能标记为
@@ -344,7 +344,7 @@ MindBridge 采用“明确默认、保存版本、允许重建”的策略。模
 
 生产实现将编码器放在不同进程中，但严格声明同一冻结兼容空间：Memory Worker 通过 Hugging Face
 `sentence-transformers` 的 `encode_document()` 生成 EvidenceSpan 向量，并通过独立 vLLM
-OpenAI-compatible endpoint 用 Text Small 批量生成 Event/Claim document 向量；API 通过 Omni
+OpenAI-compatible endpoint 用 Text Small 批量生成 Event/Claim/Summary document 向量；API 通过 Omni
 Small endpoint 生成 query 向量，并用同一个 Text Small 服务编码显式记忆。Omni 固定 revision
 `12949877f0092093f366c6450340011320152a05`，Text Small
 固定 revision `6856e76bb72982e58de0620458a4e8b3614da340`。文本请求使用 OpenAI SDK 的
@@ -370,7 +370,7 @@ API 因此不加载 Jina 权重，模型只存在于 Worker 或独立 serving �
 3. PostgreSQL Full Text Search；
 4. 时间、设备、人物、地点和类型索引；
 5. 端侧隔离的人脸/声纹身份向量；
-6. Event、Entity 和 Claim 的关系边。
+6. Event、Entity、Claim 和 Summary Memory 的关系边。
 
 ### 6.4 Jetson 模型分级
 
@@ -479,6 +479,12 @@ PostgreSQL FTS、结构化过滤、RRF 和原始视听证据重看。Event/Claim
 最多取 16 个。直接表示始终先于关系邻居排序，所有展开结果在映射为 MemoryRecord 后再次执行
 完整结构化过滤。更深的通用图遍历、专用 reranker 和多轮定向重读只按 Benchmark 失败案例加入。
 
+Memory 向量命中上层 Summary 时走独立的树形下钻查询：PostgreSQL 沿 MemoryRecord
+`contains` 边递归返回父节点和来源子节点，深度上限为 16，并对每个结果重新应用完整结构化过滤。
+这让无证据的 `unverified` 导航摘要不能直接支撑回答，而其下方原样保存的 `attested` 来源仍可被
+Omni 引用。该展开只用于全库语义检索；调用方显式传入的 `memory_ids` 始终保持严格范围，不隐式
+加入父子节点。
+
 ### 7.3 追问
 
 `recall` 返回的每条记忆都带稳定 ID 和证据。当前生产契约通过请求顶层显式 `memory_ids`
@@ -530,13 +536,13 @@ MindBridge 的学习对象是记忆状态：
 2. 由 Omni/VLM 对候选证据进行合并验证；
 3. 将相邻 Event 组织为 Episode；
 4. 从多个证据形成 Claim，并保留每个支持/冲突证据；
-5. 生成日、人物、地点和主题级 Summary；
+5. 生成 Session、日、人物、地点和主题级 Summary；
 6. 对已替代的派生摘要降级，但不覆盖历史事实；
 7. 更新访问频次、有效反馈、关联价值和最后使用时间。
 
 不允许仅因向量相似就自动合并身份或互相矛盾的事件。
 
-当前 Episode 与 Claim 路径已经实现为同一个 `mindbridge-consolidate` 租户级计划任务。每轮以
+当前 Episode、Claim 与 Summary 路径已经实现为同一个 `mindbridge-consolidate` 租户级计划任务。每轮以
 严格早于固定 `evaluated_at` 的记录作为稳定快照，新生成的聚合只会在下一轮继续演化。
 PostgreSQL 只枚举
 `active`、尚无父节点的基础 Event，并用可校准的时间邻近、实体重叠或同一 Jina 兼容空间中的
@@ -568,8 +574,27 @@ Embedding；并发过期提案只能成为幂等重放或被跳过。显式遗�
 用户纠正，旧 Claim 与其 MemoryRecord 会在同一删除事务中恢复为当前版本。整个过程不微调任何
 模型，也不依赖通用工作流引擎。
 
-日、人物、地点和主题级 Summary 继续按 Benchmark 失败案例逐项加入，并复用相同的候选—原始
-证据核验—原子版本写入模式。
+Summary 路径不为日、人物、地点和主题各复制一套平行记忆。它建立单父树：一个当前 MemoryRecord
+最多被一个上层 Summary 通过 `contains` 吸收，而 Summary 自身可在后续 sweep 成为更高层来源。
+PostgreSQL 只枚举严格早于 `evaluated_at`、未删除、未 supersede、尚无 Summary 父节点的 verified
+或 attested Episodic/Semantic Memory；候选由可校准的时间邻近、Evidence 对应的共享 Entity，或
+同一 Jina 兼容空间的向量相似度扩展，单页最多交给 Omni 64 条。Event/Claim 所代表的 Memory
+直接复用 `represented_by` 来源对象的现有向量，显式 Memory 和 Summary 使用自己的 Memory 向量，
+不重复保存等价 embedding。
+
+冻结 Omni/VLM 直接检查候选引用的原始图像、视频和音频，并通过严格 schema 返回互不重叠的
+Memory 分组、`session/day/person/place/topic` scope、摘要和 salience。只有全部来源均为 verified
+且联合 EvidenceSpan 非空时，新 Summary 才是 verified；只要含 attested 来源就生成 unverified
+导航摘要，绝不把调用者陈述升级为传感器事实。Text Small 为每个新 Summary 生成对齐的 1024 维
+Memory document 向量；稳定 ID 包含来源 Memory、scope、Omni revision、Prompt version 和固定
+`evaluated_at`。
+
+提交事务按 Memory ID 排序锁定全部来源，再次检查当前版本、删除屏障和既有父节点，一次写入
+Summary Memory、联合 Evidence、`contains` 边和向量。数据库唯一索引从根本上保证一个 Memory
+只有一个 Summary 父节点；不同模型 revision 的并发提案也只能有一个成功。删除 Summary 本身保留
+其子 Memory；删除任一子 Memory 或其 Observation 时，则递归删除依赖它的 Summary 祖先，避免
+遗忘后残留派生内容。三个阶段共享同一固定快照，因此本轮 Episode/Claim 新写入只会在下一轮进入
+Summary，计划任务不会读到自己的写入。
 
 ### 8.3 记忆强度
 
@@ -617,6 +642,8 @@ stateDiagram-v2
 - **Deleted**：显式遗忘；删除原始证据、派生媒体、向量、缓存和相关身份映射，并向端侧传播 tombstone。
 
 显式 `forget` 优先级高于自动保留策略。删除审计只记录对象 ID、范围、执行状态和时间，不保存被删除内容。
+树形 Summary 的遗忘沿依赖方向向上级联而不向下误删：删除叶子会删除所有依赖该叶子的祖先
+Summary，删除 Summary 则保留可独立存在的原始子 Memory。
 
 ## 9. Agent 与开发者接口
 
