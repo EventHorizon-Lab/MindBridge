@@ -1,7 +1,6 @@
 """PostgreSQL persistence and candidate search for memory records."""
 
-from datetime import datetime
-from typing import Any, TypeAlias, cast
+from typing import Any, cast
 
 from psycopg.errors import ForeignKeyViolation
 
@@ -16,41 +15,19 @@ from mindbridge.core import (
     MemoryIntegrityError,
     MemoryNotFoundError,
     MemoryRecord,
-    MemoryState,
-    MemoryType,
-    ModelReference,
     TenantId,
-    VerificationStatus,
 )
 from mindbridge.infrastructure._postgres_forget import (
     ensure_memory_not_tombstoned,
     ensure_target_not_tombstoned,
 )
 from mindbridge.infrastructure._postgres_idempotency import claim_idempotency_key
+from mindbridge.infrastructure._postgres_memory_rows import (
+    MEMORY_SELECT_SQL,
+    MemoryRow,
+    memory_from_row,
+)
 from mindbridge.infrastructure._postgres_types import DatabaseConnection, DatabasePool
-
-MemoryRow: TypeAlias = tuple[
-    str,
-    str,
-    str,
-    str,
-    str,
-    str,
-    datetime,
-    datetime,
-    datetime,
-    str | None,
-    str | None,
-    float,
-    float,
-    int,
-    int,
-    int,
-    datetime | None,
-    str | None,
-    datetime | None,
-    list[str],
-]
 
 
 async def write_memory(
@@ -141,7 +118,7 @@ async def search_memories(
     """Apply exact filters and PostgreSQL full-text candidate retrieval."""
     async with pool.connection() as connection:
         cursor = await connection.execute(_SEARCH_MEMORIES_SQL, _recall_parameters(request))
-        return tuple([_memory_from_row(cast(MemoryRow, row)) async for row in cursor])
+        return tuple([memory_from_row(cast(MemoryRow, row)) async for row in cursor])
 
 
 async def search_memories_by_evidence(
@@ -160,7 +137,7 @@ async def search_memories_by_evidence(
     parameters.update(evidence_ids=list(ranked_evidence_ids), limit=limit)
     async with pool.connection() as connection:
         cursor = await connection.execute(_SEARCH_MEMORIES_BY_EVIDENCE_SQL, parameters)
-        return tuple([_memory_from_row(cast(MemoryRow, row)) async for row in cursor])
+        return tuple([memory_from_row(cast(MemoryRow, row)) async for row in cursor])
 
 
 async def search_memories_by_ids(
@@ -179,7 +156,7 @@ async def search_memories_by_ids(
     parameters.update(memory_ids=list(ranked_memory_ids), limit=limit)
     async with pool.connection() as connection:
         cursor = await connection.execute(_SEARCH_MEMORIES_BY_IDS_SQL, parameters)
-        return tuple([_memory_from_row(cast(MemoryRow, row)) async for row in cursor])
+        return tuple([memory_from_row(cast(MemoryRow, row)) async for row in cursor])
 
 
 def _recall_parameters(request: RecallRequest) -> dict[str, Any]:
@@ -265,11 +242,11 @@ async def find_memory_on_connection(
     """Find one memory inside a caller transaction, optionally locking its lifecycle row."""
     lock = " FOR UPDATE OF memory" if for_update else ""
     cursor = await connection.execute(
-        f"{_MEMORY_SELECT_SQL} WHERE memory.tenant_id = %s AND memory.memory_id = %s{lock}",
+        f"{MEMORY_SELECT_SQL} WHERE memory.tenant_id = %s AND memory.memory_id = %s{lock}",
         (tenant_id, memory_id),
     )
     row = await cursor.fetchone()
-    return _memory_from_row(cast(MemoryRow, row)) if row is not None else None
+    return memory_from_row(cast(MemoryRow, row)) if row is not None else None
 
 
 async def _require_memory_on_connection(
@@ -282,88 +259,6 @@ async def _require_memory_on_connection(
         raise MemoryIntegrityError("idempotency key references a missing memory")
     return memory
 
-
-def _memory_from_row(row: MemoryRow) -> MemoryRecord:
-    (
-        memory_id,
-        tenant_id,
-        memory_type,
-        summary,
-        verification_status,
-        state,
-        occurred_at,
-        ended_at,
-        created_at,
-        model_id,
-        model_revision,
-        salience,
-        strength,
-        useful_access_count,
-        positive_feedback_count,
-        negative_feedback_count,
-        last_accessed_at,
-        supersedes_memory_id,
-        superseded_at,
-        evidence_ids,
-    ) = row
-    model_reference = (
-        ModelReference(model_id=model_id, revision=cast(str, model_revision))
-        if model_id is not None
-        else None
-    )
-    return MemoryRecord(
-        memory_id=MemoryId(memory_id),
-        tenant_id=TenantId(tenant_id),
-        memory_type=MemoryType(memory_type),
-        summary=summary,
-        evidence_ids=tuple(EvidenceId(value) for value in evidence_ids),
-        occurred_at=occurred_at,
-        ended_at=ended_at,
-        created_at=created_at,
-        verification_status=VerificationStatus(verification_status),
-        state=MemoryState(state),
-        model_reference=model_reference,
-        salience=salience,
-        strength=strength,
-        useful_access_count=useful_access_count,
-        positive_feedback_count=positive_feedback_count,
-        negative_feedback_count=negative_feedback_count,
-        last_accessed_at=last_accessed_at,
-        supersedes_memory_id=(
-            MemoryId(supersedes_memory_id) if supersedes_memory_id is not None else None
-        ),
-        superseded_at=superseded_at,
-    )
-
-
-_MEMORY_SELECT_SQL = """
-SELECT memory.memory_id,
-       memory.tenant_id,
-       memory.memory_type,
-       memory.summary,
-       memory.verification_status,
-       memory.state,
-       memory.occurred_at,
-       memory.ended_at,
-       memory.created_at,
-       memory.model_id,
-       memory.model_revision,
-       memory.salience,
-       memory.strength,
-       memory.useful_access_count,
-       memory.positive_feedback_count,
-       memory.negative_feedback_count,
-       memory.last_accessed_at,
-       memory.supersedes_memory_id,
-       memory.superseded_at,
-       ARRAY(
-           SELECT link.evidence_id
-           FROM memory_evidence AS link
-           WHERE link.tenant_id = memory.tenant_id AND link.memory_id = memory.memory_id
-           ORDER BY link.evidence_id
-       ) AS evidence_ids
-FROM memory_records AS memory
-"""
 
 _STRUCTURED_RECALL_FILTER_SQL = """
   AND memory.superseded_at IS NULL
@@ -426,7 +321,7 @@ _STRUCTURED_RECALL_FILTER_SQL = """
 """
 
 _SEARCH_MEMORIES_SQL = f"""
-{_MEMORY_SELECT_SQL}
+{MEMORY_SELECT_SQL}
 WHERE memory.tenant_id = %(tenant_id)s
   AND (
       %(query)s::text IS NULL
@@ -460,7 +355,7 @@ ranked_memories AS (
     WHERE link.tenant_id = %(tenant_id)s
     GROUP BY link.tenant_id, link.memory_id
 )
-{_MEMORY_SELECT_SQL}
+{MEMORY_SELECT_SQL}
 JOIN ranked_memories AS dense
   ON dense.tenant_id = memory.tenant_id AND dense.memory_id = memory.memory_id
 WHERE memory.tenant_id = %(tenant_id)s
@@ -474,7 +369,7 @@ WITH ranked_memories AS (
     SELECT memory_id, rank
     FROM unnest(%(memory_ids)s::text[]) WITH ORDINALITY AS hit(memory_id, rank)
 )
-{_MEMORY_SELECT_SQL}
+{MEMORY_SELECT_SQL}
 JOIN ranked_memories AS dense ON dense.memory_id = memory.memory_id
 WHERE memory.tenant_id = %(tenant_id)s
 {_STRUCTURED_RECALL_FILTER_SQL}
