@@ -17,7 +17,6 @@ from pydantic import AwareDatetime, Field
 from mindbridge.application.recall import RETRIEVAL_DOCUMENT_EMBEDDING_TASK
 from mindbridge.benchmarks.artifacts import (
     require_writable_output_pair,
-    sha256_file,
     sidecar_manifest_path,
     write_text_atomically,
 )
@@ -29,6 +28,7 @@ from mindbridge.benchmarks.locomo_runner import (
     run_locomo_conversation,
 )
 from mindbridge.contracts import ContractModel, Identifier, NonEmptyString, Sha256Hex
+from mindbridge.file_integrity import sha256_file
 from mindbridge.models import (
     ANSWER_FROM_EVIDENCE_PROMPT_VERSION,
     DEFAULT_JINA_OMNI_MODEL_ID,

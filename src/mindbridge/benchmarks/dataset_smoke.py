@@ -8,7 +8,6 @@ from pathlib import Path
 
 from pydantic import AwareDatetime, Field
 
-from mindbridge.benchmarks.artifacts import sha256_file
 from mindbridge.benchmarks.locomo import LOCOMO_ADAPTER_VERSION, load_locomo
 from mindbridge.benchmarks.m3_bench import (
     M3_BENCH_ADAPTER_VERSION,
@@ -16,6 +15,7 @@ from mindbridge.benchmarks.m3_bench import (
     load_m3_bench,
 )
 from mindbridge.contracts import ContractModel, NonEmptyString, Sha256Hex
+from mindbridge.file_integrity import sha256_file
 
 
 class BenchmarkDatasetSummary(ContractModel):
