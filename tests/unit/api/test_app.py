@@ -3,6 +3,7 @@
 from datetime import datetime, timezone
 from typing import cast
 
+import pytest
 from fastapi.testclient import TestClient
 
 from mindbridge.api import create_app
@@ -18,8 +19,12 @@ from mindbridge.contracts import (
 )
 from mindbridge.core import (
     DomainInvariantError,
+    MemoryIntegrityError,
     MemoryState,
     MemoryType,
+    ModelOutputError,
+    ModelUnavailableError,
+    ObjectStorageError,
     VerificationStatus,
 )
 
@@ -113,6 +118,41 @@ def test_openapi_exposes_stable_operation_ids() -> None:
     assert paths["/v1/recall"]["post"]["operationId"] == "recall"
 
 
-def _client() -> TestClient:
-    kernel = cast(MemoryKernel, StubKernel())
+@pytest.mark.parametrize(
+    ("error", "expected_status", "expected_code"),
+    [
+        (ModelUnavailableError("provider detail"), 503, "model_unavailable"),
+        (ModelOutputError("raw output"), 502, "model_output_invalid"),
+        (ObjectStorageError("bucket detail"), 503, "object_storage_unavailable"),
+        (MemoryIntegrityError("row detail"), 500, "memory_integrity_failed"),
+    ],
+)
+def test_runtime_errors_use_sanitized_stable_envelopes(
+    error: RuntimeError,
+    expected_status: int,
+    expected_code: str,
+) -> None:
+    """Dependency details cannot leak through the public Agent contract."""
+    response = _client(FailingKernel(error)).post(
+        "/v1/recall",
+        json={"tenant_id": "tenant_01", "query": {"text": "question"}},
+    )
+
+    assert response.status_code == expected_status
+    assert response.json()["code"] == expected_code
+    assert str(error) not in response.text
+
+
+class FailingKernel(StubKernel):
+    """Raises one sanitized runtime category from the shared recall route."""
+
+    def __init__(self, error: RuntimeError) -> None:
+        self._error = error
+
+    async def recall(self, request: RecallRequest) -> RecallResult:
+        raise self._error
+
+
+def _client(stub: StubKernel | None = None) -> TestClient:
+    kernel = cast(MemoryKernel, stub or StubKernel())
     return TestClient(create_app(kernel))

@@ -6,6 +6,7 @@ from mindbridge.core.errors import (
     MemoryIntegrityError,
     ModelOutputError,
     ModelUnavailableError,
+    ObjectStorageError,
 )
 from mindbridge.core.evidence import (
     EvidenceSpan,
@@ -62,6 +63,7 @@ __all__ = [
     "ModelOutputError",
     "ModelReference",
     "ModelUnavailableError",
+    "ObjectStorageError",
     "Observation",
     "ObservationId",
     "PixelRegion",

@@ -13,6 +13,10 @@ class MemoryIntegrityError(RuntimeError):
     """Raised when persisted references violate an internal invariant."""
 
 
+class ObjectStorageError(RuntimeError):
+    """Raised when immutable evidence media cannot be accessed."""
+
+
 class ModelUnavailableError(RuntimeError):
     """Raised when a configured frozen model cannot be loaded or called."""
 

@@ -15,7 +15,7 @@ from botocore.config import Config
 from botocore.exceptions import BotoCoreError
 
 from mindbridge.application import PresignedMediaDownload, PresignedMediaUpload
-from mindbridge.core import MediaObject
+from mindbridge.core import MediaObject, ObjectStorageError
 
 if TYPE_CHECKING:
     from mypy_boto3_s3 import S3Client
@@ -27,10 +27,6 @@ _CONTENT_TYPE_PATTERN = re.compile(r"^[!#$&^_.+\-\w]+/[!#$&^_.+\-\w]+$")
 
 class InvalidMediaLocationError(ValueError):
     """Raised when a media URI escapes its configured tenant storage prefix."""
-
-
-class ObjectStorageError(RuntimeError):
-    """Raised when the S3 SDK cannot create a media access URL."""
 
 
 class S3MediaAccess:
