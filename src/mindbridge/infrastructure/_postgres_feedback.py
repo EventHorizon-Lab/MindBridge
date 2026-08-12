@@ -79,7 +79,11 @@ async def record_feedback(
             raise DomainInvariantError("only correction feedback may create a memory version")
 
         if evolved_memory is not None:
-            await _update_memory_lifecycle(connection, evolved_memory)
+            await _update_memory_lifecycle(
+                connection,
+                evolved_memory,
+                changed_at=feedback.created_at,
+            )
         await connection.execute(
             """
             INSERT INTO memory_feedback (
@@ -148,6 +152,8 @@ def _require_corrected_memory(
 async def _update_memory_lifecycle(
     connection: DatabaseConnection,
     memory: MemoryRecord,
+    *,
+    changed_at: datetime,
 ) -> None:
     await connection.execute(
         """
@@ -158,6 +164,7 @@ async def _update_memory_lifecycle(
             positive_feedback_count = %s,
             negative_feedback_count = %s,
             last_accessed_at = %s,
+            lifecycle_changed_at = GREATEST(lifecycle_changed_at, %s),
             superseded_at = %s
         WHERE tenant_id = %s AND memory_id = %s
         """,
@@ -168,6 +175,7 @@ async def _update_memory_lifecycle(
             memory.positive_feedback_count,
             memory.negative_feedback_count,
             memory.last_accessed_at,
+            changed_at,
             memory.superseded_at,
             memory.tenant_id,
             memory.memory_id,

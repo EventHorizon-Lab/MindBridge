@@ -158,7 +158,11 @@ async def complete_forget(
         if stored.target_type is ForgetTargetType.MEMORY_RECORD:
             await delete_memory_scope(connection, stored.tenant_id, (stored.target_id,))
         else:
-            await delete_observation_scope(connection, stored)
+            await delete_observation_scope(
+                connection,
+                stored,
+                completed_at=completed_at,
+            )
         return await _set_tombstone_complete(connection, stored, completed_at)
 
 

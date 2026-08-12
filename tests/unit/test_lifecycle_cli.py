@@ -32,10 +32,12 @@ class InMemoryLifecycleStore:
         self,
         tenant_id: TenantId,
         *,
+        evaluated_at: datetime,
         after_memory_id: MemoryId | None,
         limit: int,
     ) -> tuple[MemoryRecord, ...]:
         assert tenant_id == "tenant_01"
+        assert evaluated_at == NOW
         return tuple(
             memory
             for memory in self.memories
@@ -45,7 +47,10 @@ class InMemoryLifecycleStore:
     async def update_memory_lifecycles(
         self,
         changes: tuple[MemoryLifecycleChange, ...],
+        *,
+        evaluated_at: datetime,
     ) -> int:
+        assert evaluated_at == NOW
         return len(changes)
 
 

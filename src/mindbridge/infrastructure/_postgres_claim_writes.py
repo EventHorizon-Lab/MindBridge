@@ -311,10 +311,17 @@ async def _supersede_claim(
     )
     memory_cursor = await connection.execute(
         """
-        UPDATE memory_records SET superseded_at = %s
+        UPDATE memory_records
+        SET superseded_at = %s,
+            lifecycle_changed_at = GREATEST(lifecycle_changed_at, %s)
         WHERE tenant_id = %s AND memory_id = %s AND superseded_at IS NULL
         """,
-        (relationship.created_at, relationship.tenant_id, target_memory_id),
+        (
+            relationship.created_at,
+            relationship.created_at,
+            relationship.tenant_id,
+            target_memory_id,
+        ),
     )
     if source_cursor.rowcount != 1 or target_cursor.rowcount != 1 or memory_cursor.rowcount != 1:
         raise MemoryIntegrityError("Claim supersession did not update one complete version pair")

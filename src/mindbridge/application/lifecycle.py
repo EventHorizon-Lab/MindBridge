@@ -71,6 +71,7 @@ class MemoryLifecycleStore(Protocol):
         self,
         tenant_id: TenantId,
         *,
+        evaluated_at: datetime,
         after_memory_id: MemoryId | None,
         limit: int,
     ) -> tuple[MemoryRecord, ...]: ...
@@ -78,6 +79,8 @@ class MemoryLifecycleStore(Protocol):
     async def update_memory_lifecycles(
         self,
         changes: tuple[MemoryLifecycleChange, ...],
+        *,
+        evaluated_at: datetime,
     ) -> int: ...
 
 
@@ -103,6 +106,7 @@ class EvolveMemoryLifecycle:
         )
         candidates = await self._store.list_memories_for_lifecycle(
             request.tenant_id,
+            evaluated_at=request.evaluated_at,
             after_memory_id=request.after_memory_id,
             limit=request.limit + 1,
         )
@@ -118,7 +122,14 @@ class EvolveMemoryLifecycle:
                     evolved=evolved,
                 )
             )
-        updated_count = await self._store.update_memory_lifecycles(tuple(changes)) if changes else 0
+        updated_count = (
+            await self._store.update_memory_lifecycles(
+                tuple(changes),
+                evaluated_at=request.evaluated_at,
+            )
+            if changes
+            else 0
+        )
         set_current_span_attributes(
             {
                 "mindbridge.lifecycle.evaluated_count": len(page),

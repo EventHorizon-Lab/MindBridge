@@ -259,11 +259,12 @@ async def _insert_memory(
             tenant_id, memory_id, memory_type, summary, verification_status, state,
             occurred_at, ended_at, model_id, model_revision, content_digest, created_at,
             salience, strength, useful_access_count, positive_feedback_count,
-            negative_feedback_count, last_accessed_at, supersedes_memory_id, superseded_at
+            negative_feedback_count, last_accessed_at, lifecycle_changed_at,
+            supersedes_memory_id, superseded_at
         )
         VALUES (
             %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-            %s, %s, %s, %s, %s, %s, %s, %s
+            %s, %s, %s, %s, %s, %s, %s, %s, %s
         )
         ON CONFLICT DO NOTHING
         RETURNING memory_id
@@ -287,6 +288,7 @@ async def _insert_memory(
             memory.positive_feedback_count,
             memory.negative_feedback_count,
             memory.last_accessed_at,
+            memory.last_accessed_at or memory.created_at,
             memory.supersedes_memory_id,
             memory.superseded_at,
         ),

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import cast
 
 from mindbridge.core import DeletionTombstone, MediaObject, MediaObjectId, TenantId
@@ -128,6 +129,8 @@ async def delete_memory_scope(
 async def delete_observation_scope(
     connection: DatabaseConnection,
     tombstone: DeletionTombstone,
+    *,
+    completed_at: datetime,
 ) -> None:
     tenant_id = tombstone.tenant_id
     observation_id = tombstone.target_id
@@ -203,7 +206,12 @@ async def delete_observation_scope(
             "DELETE FROM claims WHERE tenant_id = %s AND claim_id = ANY(%s)",
             (tenant_id, list(claim_ids)),
         )
-    await _restore_claim_versions(connection, tenant_id, restorable_claim_ids)
+    await _restore_claim_versions(
+        connection,
+        tenant_id,
+        restorable_claim_ids,
+        restored_at=completed_at,
+    )
     if event_ids:
         await connection.execute(
             "DELETE FROM events WHERE tenant_id = %s AND event_id = ANY(%s)",
@@ -281,6 +289,8 @@ async def _restore_claim_versions(
     connection: DatabaseConnection,
     tenant_id: TenantId,
     claim_ids: tuple[str, ...],
+    *,
+    restored_at: datetime,
 ) -> None:
     if not claim_ids:
         return
@@ -300,7 +310,9 @@ async def _restore_claim_versions(
               )
             RETURNING claim.claim_id
         )
-        UPDATE memory_records AS memory SET superseded_at = NULL
+        UPDATE memory_records AS memory
+        SET superseded_at = NULL,
+            lifecycle_changed_at = GREATEST(memory.lifecycle_changed_at, %s)
         FROM restored
         JOIN relations AS representation
           ON representation.tenant_id = %s
@@ -317,7 +329,7 @@ async def _restore_claim_versions(
                 AND feedback.corrected_memory_id IS NOT NULL
           )
         """,
-        (tenant_id, list(claim_ids), tenant_id),
+        (tenant_id, list(claim_ids), restored_at, tenant_id),
     )
 
 

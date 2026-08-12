@@ -31,10 +31,12 @@ class RecordingLifecycleStore:
         self,
         tenant_id: TenantId,
         *,
+        evaluated_at: datetime,
         after_memory_id: MemoryId | None,
         limit: int,
     ) -> tuple[MemoryRecord, ...]:
         assert tenant_id == "tenant_01"
+        assert evaluated_at == NOW
         return tuple(
             memory
             for memory in self.memories
@@ -44,7 +46,10 @@ class RecordingLifecycleStore:
     async def update_memory_lifecycles(
         self,
         changes: tuple[MemoryLifecycleChange, ...],
+        *,
+        evaluated_at: datetime,
     ) -> int:
+        assert evaluated_at == NOW
         self.update_calls += 1
         self.changes = changes
         return len(changes) - int(self.reject_first and bool(changes))

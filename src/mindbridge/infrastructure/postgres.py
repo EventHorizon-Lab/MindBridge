@@ -175,6 +175,7 @@ class PostgresMemoryStore:
         self,
         tenant_id: TenantId,
         *,
+        evaluated_at: datetime,
         after_memory_id: MemoryId | None,
         limit: int,
     ) -> tuple[MemoryRecord, ...]:
@@ -182,6 +183,7 @@ class PostgresMemoryStore:
         return await list_memories_for_lifecycle(
             self._pool,
             tenant_id,
+            evaluated_at=evaluated_at,
             after_memory_id=after_memory_id,
             limit=limit,
         )
@@ -234,9 +236,15 @@ class PostgresMemoryStore:
     async def update_memory_lifecycles(
         self,
         changes: tuple[MemoryLifecycleChange, ...],
+        *,
+        evaluated_at: datetime,
     ) -> int:
         """Optimistically persist automatic score and state changes."""
-        return await update_memory_lifecycles(self._pool, changes)
+        return await update_memory_lifecycles(
+            self._pool,
+            changes,
+            evaluated_at=evaluated_at,
+        )
 
     async def read_memory(
         self,
