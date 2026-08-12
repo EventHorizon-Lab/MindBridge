@@ -46,6 +46,7 @@ class RuntimeSettings:
     object_storage_bucket: str
     vlm_api_key: str = field(repr=False)
     vlm_endpoint: str
+    vlm_model_revision: str
     embedding_api_key: str = field(repr=False)
     embedding_endpoint: str
     text_embedding_api_key: str = field(repr=False)
@@ -72,6 +73,7 @@ class RuntimeSettings:
             ("vlm_api_key", self.vlm_api_key),
             ("vlm_endpoint", self.vlm_endpoint),
             ("vlm_model_id", self.vlm_model_id),
+            ("vlm_model_revision", self.vlm_model_revision),
             ("embedding_api_key", self.embedding_api_key),
             ("embedding_endpoint", self.embedding_endpoint),
             ("embedding_model_id", self.embedding_model_id),
@@ -118,6 +120,7 @@ class RuntimeSettings:
             vlm_api_key=require_environment_value(source, "MINDBRIDGE_VLM_API_KEY"),
             vlm_endpoint=require_environment_value(source, "MINDBRIDGE_VLM_ENDPOINT"),
             vlm_model_id=source.get("MINDBRIDGE_VLM_MODEL_ID", DEFAULT_OMNI_MODEL_ID),
+            vlm_model_revision=require_environment_value(source, "MINDBRIDGE_VLM_MODEL_REVISION"),
             embedding_api_key=require_environment_value(source, "MINDBRIDGE_EMBEDDING_API_KEY"),
             embedding_endpoint=require_environment_value(source, "MINDBRIDGE_EMBEDDING_ENDPOINT"),
             embedding_model_id=source.get(
@@ -221,6 +224,7 @@ def _build_runtime(settings: RuntimeSettings) -> _ProductionRuntime:
         api_key=settings.vlm_api_key,
         endpoint=settings.vlm_endpoint,
         model_id=settings.vlm_model_id,
+        model_revision=settings.vlm_model_revision,
     )
     recall_embedder = OpenAIJinaEmbedder.connect(
         api_key=settings.embedding_api_key,

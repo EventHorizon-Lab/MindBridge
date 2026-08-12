@@ -20,7 +20,7 @@ from pydantic import (
 from mindbridge.application.perception import ResolvedEvidence
 from mindbridge.application.ports import GeneratedAnswer, ResolvedQueryMedia
 from mindbridge.contracts import RecallRequest
-from mindbridge.core import MemoryId, MemoryRecord, ModelOutputError
+from mindbridge.core import MemoryId, MemoryRecord, ModelOutputError, ModelReference
 from mindbridge.models.openai_chat import stream_text_completion
 from mindbridge.models.openai_media import (
     OpenAIContentPart,
@@ -102,13 +102,14 @@ class OpenAIOmniAnswerer:
         client: AsyncOpenAI,
         *,
         model_id: str = DEFAULT_OMNI_MODEL_ID,
+        model_revision: str,
         request_timeout_seconds: float = 1_800,
         max_output_tokens: int = 2_048,
         video_frames_per_second: float = DEFAULT_VIDEO_FRAMES_PER_SECOND,
         video_max_pixels: int = DEFAULT_VIDEO_MAX_PIXELS,
     ) -> None:
-        if not model_id.strip():
-            raise ValueError("model_id must not be empty")
+        if not model_id.strip() or not model_revision.strip():
+            raise ValueError("model_id and model_revision must not be empty")
         if request_timeout_seconds <= 0:
             raise ValueError("request_timeout_seconds must be positive")
         if max_output_tokens <= 0:
@@ -116,7 +117,7 @@ class OpenAIOmniAnswerer:
         if video_frames_per_second <= 0 or video_max_pixels <= 0:
             raise ValueError("video sampling values must be positive")
         self._client = client
-        self._model_id = model_id
+        self._model_reference = ModelReference(model_id=model_id, revision=model_revision)
         self._request_timeout_seconds = request_timeout_seconds
         self._max_output_tokens = max_output_tokens
         self._video_frames_per_second = video_frames_per_second
@@ -129,6 +130,7 @@ class OpenAIOmniAnswerer:
         api_key: str,
         endpoint: str,
         model_id: str = DEFAULT_OMNI_MODEL_ID,
+        model_revision: str,
         request_timeout_seconds: float = 1_800,
         max_retries: int = 2,
     ) -> OpenAIOmniAnswerer:
@@ -146,13 +148,14 @@ class OpenAIOmniAnswerer:
         return cls(
             client,
             model_id=model_id,
+            model_revision=model_revision,
             request_timeout_seconds=request_timeout_seconds,
         )
 
     @property
-    def model_id(self) -> str:
-        """Return the configured provider model identifier."""
-        return self._model_id
+    def model_reference(self) -> ModelReference:
+        """Return the pinned answer model identity."""
+        return self._model_reference
 
     @property
     def prompt_version(self) -> str:
@@ -176,7 +179,8 @@ class OpenAIOmniAnswerer:
         """Stream one grounded completion and reject malformed provider output."""
         set_current_span_attributes(
             {
-                "mindbridge.model.id": self._model_id,
+                "mindbridge.model.id": self._model_reference.model_id,
+                "mindbridge.model.revision": self._model_reference.revision,
                 "mindbridge.prompt.version": ANSWER_FROM_EVIDENCE_PROMPT_VERSION,
                 "mindbridge.memory.count": len(memories),
                 "mindbridge.evidence.count": len(evidence),
@@ -194,7 +198,7 @@ class OpenAIOmniAnswerer:
         )
         completion = await stream_text_completion(
             self._client,
-            model_id=self._model_id,
+            model_id=self._model_reference.model_id,
             messages=cast(list[ChatCompletionMessageParam], messages),
             max_output_tokens=self._max_output_tokens,
             request_timeout_seconds=self._request_timeout_seconds,
@@ -213,7 +217,8 @@ class OpenAIOmniAnswerer:
         """Verify one bounded candidate batch and reject invented IDs."""
         set_current_span_attributes(
             {
-                "mindbridge.model.id": self._model_id,
+                "mindbridge.model.id": self._model_reference.model_id,
+                "mindbridge.model.revision": self._model_reference.revision,
                 "mindbridge.prompt.version": SELECT_OCCURRENCES_PROMPT_VERSION,
                 "mindbridge.memory.count": len(memories),
                 "mindbridge.evidence.count": len(evidence),
@@ -231,7 +236,7 @@ class OpenAIOmniAnswerer:
         )
         completion = await stream_text_completion(
             self._client,
-            model_id=self._model_id,
+            model_id=self._model_reference.model_id,
             messages=cast(list[ChatCompletionMessageParam], messages),
             max_output_tokens=self._max_output_tokens,
             request_timeout_seconds=self._request_timeout_seconds,

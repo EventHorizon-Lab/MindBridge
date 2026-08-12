@@ -303,6 +303,7 @@ export MINDBRIDGE_TASK_BROKER_URL=redis://localhost:6379/0
 export MINDBRIDGE_VLM_API_KEY=replace-with-a-runtime-secret
 export MINDBRIDGE_VLM_ENDPOINT=https://vlm.example.com/api/v1/chat/completions
 export MINDBRIDGE_VLM_MODEL_ID=qwen3.8-max
+export MINDBRIDGE_VLM_MODEL_REVISION=deployment-2026-08-11
 export MINDBRIDGE_EMBEDDING_API_KEY=replace-with-a-runtime-secret
 export MINDBRIDGE_EMBEDDING_ENDPOINT=https://embeddings.example.com/v1/embeddings
 export MINDBRIDGE_EMBEDDING_MODEL_ID=jinaai/jina-embeddings-v5-omni-small-retrieval
@@ -407,7 +408,6 @@ the pinned local Jina v5 Omni Small model, and batches Event/Claim text through 
 Text Small endpoint. Set `MINDBRIDGE_JINA_DEVICE` only when automatic device selection is unsuitable:
 
 ```bash
-export MINDBRIDGE_VLM_MODEL_REVISION=deployment-2026-08-11
 export MINDBRIDGE_JINA_DEVICE=cuda
 
 uv run --extra server --extra cloud-models \
