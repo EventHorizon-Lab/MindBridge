@@ -42,7 +42,7 @@ from mindbridge.models.openai_perception import (
 )
 from mindbridge.sdk import AsyncMindBridge
 
-M3_RUNNER_VERSION = "m3_production_api_v1"
+M3_RUNNER_VERSION = "m3_production_api_v2"
 
 
 class M3RunManifest(ContractModel):
@@ -114,6 +114,7 @@ def main() -> None:
     """Run selected official videos and emit JSONL predictions plus a manifest."""
     arguments = _parse_arguments()
     videos = _select_videos(load_m3_bench(arguments.dataset_path), arguments.video_ids)
+    _validate_subset(videos, arguments.subset)
     prepared = _prepared_by_video(videos, load_prepared_m3(arguments.prepared_media_path))
     require_writable_output_pair(arguments.output_path, overwrite=arguments.overwrite)
     results = asyncio.run(_run_videos(arguments, videos, prepared))
@@ -227,6 +228,17 @@ def _prepared_by_video(
     if missing:
         raise ValueError(f"missing prepared M3-Bench videos: {', '.join(sorted(missing))}")
     return by_id
+
+
+def _validate_subset(videos: tuple[M3BenchVideo, ...], subset: Literal["robot", "web"]) -> None:
+    expected = (True, True) if subset == "robot" else (False, False)
+    profiles = {
+        (question.timestamp_seconds is not None, question.before_clip_index is not None)
+        for video in videos
+        for question in video.questions
+    }
+    if profiles != {expected}:
+        raise ValueError(f"M3-Bench annotations do not match the {subset} subset")
 
 
 def _parse_arguments() -> _Arguments:

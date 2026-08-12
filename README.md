@@ -208,10 +208,11 @@ uv run python -m mindbridge.benchmarks.m3_cli \
   --answer-model-revision serving-fingerprint
 ```
 
-Use `--video-id` for a smoke subset. The JSONL uses the official `id`, `question`, `answer`, `type`,
-`before_clip`, and `response` fields and adds MindBridge retrieval diagnostics. Its sidecar manifest
-pins annotation/media hashes and revisions, code, both Omni calls, Jina, Prompt versions, retrieval
-settings, and output hash.
+Use `--video-id` for a smoke subset. The runner rejects a `--subset` that does not match the
+official Robot timing fields or their absence from Web. The JSONL uses the official `id`,
+`question`, `answer`, `type`, `before_clip`, and `response` fields and adds MindBridge retrieval
+diagnostics. Its sidecar manifest pins annotation/media hashes and revisions, code, both Omni calls,
+Jina, Prompt versions, retrieval settings, and output hash.
 
 EgoLifeQA uses its official `DAYn` plus `HHMMSSFF` clock, whose final two digits are frame counts at
 the release videos' 20 FPS. Frame counts are carried into later seconds, matching the official
