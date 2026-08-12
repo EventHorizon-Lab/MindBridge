@@ -76,7 +76,7 @@ async def test_locomo_uses_only_source_turns_and_questions_in_api_requests() -> 
                 question="What did Caroline start?",
                 reference_answers=("SECRET REFERENCE ANSWER",),
                 evidence_dialog_ids=("D1:1",),
-                category=1,
+                category=2,
             ),
         ),
     )
@@ -90,12 +90,14 @@ async def test_locomo_uses_only_source_turns_and_questions_in_api_requests() -> 
         'Caroline shared an image described as: "a classroom at sunrise"'
     )
     assert api.remember_requests[0].idempotency_key == "locomo_official_v1:conv-01:D1:1"
-    assert api.recall_requests[0].query.text == "What did Caroline start?"
+    assert api.recall_requests[0].query.text == (
+        "What did Caroline start? Use DATE of CONVERSATION to answer with an approximate date."
+    )
     assert "SECRET REFERENCE ANSWER" not in api.remember_requests[0].model_dump_json()
     assert "SECRET REFERENCE ANSWER" not in api.recall_requests[0].model_dump_json()
     assert result.qa[0].answer == "SECRET REFERENCE ANSWER"
     assert result.qa[0].mindbridge_prediction == LOCOMO_ABSTENTION
-    assert result.qa[0].mindbridge_retrieved_dialog_ids == ("D1:1",)
+    assert result.qa[0].mindbridge_prediction_context == ("D1:1",)
     assert result.qa[0].mindbridge_trace_id == "trace_locomo"
 
 

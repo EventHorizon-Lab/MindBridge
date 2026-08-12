@@ -157,7 +157,8 @@ uv run python -m mindbridge.benchmarks.locomo_cli \
 
 Use `--sample-id` for a smoke subset. Existing results are preserved unless `--overwrite` is
 explicitly supplied. The prediction field is `mindbridge_prediction`, ready for the official
-LoCoMo evaluation functions.
+LoCoMo evaluation functions; retrieved dialogue IDs use its matching
+`mindbridge_prediction_context` field.
 
 Run M3-Bench through the same deployed API after the official videos have been split into
 30-second clips with FFmpeg and uploaded with the standard S3 tooling. MindBridge does not contain

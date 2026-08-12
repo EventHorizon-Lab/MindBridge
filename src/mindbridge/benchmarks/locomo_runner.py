@@ -37,7 +37,7 @@ class LoCoMoOfficialQuestionResult(ContractModel):
     category: int = Field(ge=1, le=5)
     mindbridge_prediction: NonEmptyString
     mindbridge_confidence: float = Field(ge=0.0, le=1.0)
-    mindbridge_retrieved_dialog_ids: tuple[Identifier, ...]
+    mindbridge_prediction_context: tuple[Identifier, ...]
     mindbridge_trace_id: Identifier
 
 
@@ -117,7 +117,14 @@ async def _answer_question(
         result = await memory.recall(
             RecallRequest(
                 tenant_id=tenant_id,
-                query=RecallQuery(text=question.question),
+                query=RecallQuery(
+                    text=(
+                        f"{question.question} Use DATE of CONVERSATION to answer with an "
+                        "approximate date."
+                        if question.category == 2
+                        else question.question
+                    )
+                ),
                 limit=recall_limit,
                 include_evidence=False,
             )
@@ -138,7 +145,7 @@ async def _answer_question(
         category=question.category,
         mindbridge_prediction=result.answer or LOCOMO_ABSTENTION,
         mindbridge_confidence=result.confidence,
-        mindbridge_retrieved_dialog_ids=retrieved_dialog_ids,
+        mindbridge_prediction_context=retrieved_dialog_ids,
         mindbridge_trace_id=result.trace_id,
     )
 

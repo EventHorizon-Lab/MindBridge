@@ -39,7 +39,7 @@ def test_locomo_artifacts_pin_source_system_code_and_output(tmp_path: Path) -> N
                 category=1,
                 mindbridge_prediction="Hello",
                 mindbridge_confidence=0.9,
-                mindbridge_retrieved_dialog_ids=("D1:1",),
+                mindbridge_prediction_context=("D1:1",),
                 mindbridge_trace_id="trace_01",
             ),
         ),
@@ -52,6 +52,7 @@ def test_locomo_artifacts_pin_source_system_code_and_output(tmp_path: Path) -> N
     manifest_path = output_path.with_suffix(".json.manifest.json")
     manifest = LoCoMoRunManifest.model_validate_json(manifest_path.read_text(encoding="utf-8"))
     assert predictions[0]["qa"][0]["mindbridge_prediction"] == "Hello"
+    assert predictions[0]["qa"][0]["mindbridge_prediction_context"] == ["D1:1"]
     assert manifest.source_revision == "official-revision"
     assert manifest.code_revision == "mindbridge-commit"
     assert manifest.answer_model_revision == "serving-fingerprint"

@@ -39,7 +39,7 @@ from mindbridge.models.openai_omni import (
 )
 from mindbridge.sdk import AsyncMindBridge
 
-LOCOMO_RUNNER_VERSION = "locomo_production_api_v1"
+LOCOMO_RUNNER_VERSION = "locomo_production_api_v2"
 
 
 class LoCoMoRunManifest(ContractModel):
