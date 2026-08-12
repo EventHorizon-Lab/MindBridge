@@ -1,6 +1,6 @@
 """Tests for contracts shared by Python, REST, and MCP entry points."""
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from pydantic import ValidationError
@@ -13,8 +13,9 @@ from mindbridge.contracts import (
     RecallFilters,
     RecallQuery,
     RecallRequest,
+    RememberRequest,
 )
-from mindbridge.core import FeedbackType, IdentityKind, MediaKind, SensorKind
+from mindbridge.core import FeedbackType, IdentityKind, MediaKind, MemoryType, SensorKind
 
 NOW = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
 
@@ -94,6 +95,30 @@ def test_observe_requires_timezone_aware_timestamps() -> None:
         _observe_request(observed_at=datetime(2026, 8, 11, 12, 0))  # noqa: DTZ001
 
 
+def test_write_contracts_reject_inconsistent_ranges_and_references() -> None:
+    media = _observe_request().media_objects[0]
+    with pytest.raises(ValidationError, match="ended_at must not precede occurred_at"):
+        _observe_request(ended_at=NOW - timedelta(milliseconds=1))
+    with pytest.raises(ValidationError, match="duplicate IDs"):
+        _observe_request(media_objects=(media, media))
+    with pytest.raises(ValidationError, match="ended_at must not precede occurred_at"):
+        RememberRequest(
+            tenant_id="tenant_01",
+            summary="Remember this",
+            memory_type=MemoryType.SEMANTIC,
+            occurred_at=NOW,
+            ended_at=NOW - timedelta(milliseconds=1),
+        )
+    with pytest.raises(ValidationError, match="evidence_ids must not contain duplicates"):
+        RememberRequest(
+            tenant_id="tenant_01",
+            summary="Remember this",
+            memory_type=MemoryType.SEMANTIC,
+            occurred_at=NOW,
+            evidence_ids=("evidence_01", "evidence_01"),
+        )
+
+
 def test_observe_accepts_only_bounded_anonymous_identity_metadata() -> None:
     identity = IdentityObservationInput(
         identity_id="person_device_01",
@@ -117,6 +142,8 @@ def test_observe_accepts_only_bounded_anonymous_identity_metadata() -> None:
 def _observe_request(
     *,
     observed_at: datetime = NOW,
+    ended_at: datetime = NOW,
+    media_objects: tuple[MediaObjectInput, ...] | None = None,
     identity_observations: tuple[IdentityObservationInput, ...] = (),
 ) -> ObserveRequest:
     return ObserveRequest(
@@ -125,7 +152,8 @@ def _observe_request(
         boot_id="boot_01",
         sequence=1,
         sensor=SensorKind.CAMERA,
-        media_objects=(
+        media_objects=media_objects
+        or (
             MediaObjectInput(
                 media_object_id="media_01",
                 kind=MediaKind.VIDEO,
@@ -136,7 +164,7 @@ def _observe_request(
             ),
         ),
         occurred_at=NOW,
-        ended_at=NOW,
+        ended_at=ended_at,
         observed_at=observed_at,
         identity_observations=identity_observations,
     )

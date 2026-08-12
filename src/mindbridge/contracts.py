@@ -91,7 +91,12 @@ class ObserveRequest(ContractModel):
     idempotency_key: Identifier | None = None
 
     @model_validator(mode="after")
-    def require_bounded_identities(self) -> ObserveRequest:
+    def require_consistent_observation(self) -> ObserveRequest:
+        if self.ended_at < self.occurred_at:
+            raise ValueError("ended_at must not precede occurred_at")
+        media_object_ids = [media.media_object_id for media in self.media_objects]
+        if len(set(media_object_ids)) != len(media_object_ids):
+            raise ValueError("media_objects must not contain duplicate IDs")
         duration_ms = round((self.ended_at - self.occurred_at).total_seconds() * 1_000)
         if any(identity.end_ms > duration_ms for identity in self.identity_observations):
             raise ValueError("identity observation exceeds source duration")
@@ -151,6 +156,14 @@ class RememberRequest(ContractModel):
     ended_at: AwareDatetime | None = None
     evidence_ids: tuple[Identifier, ...] = ()
     idempotency_key: Identifier | None = None
+
+    @model_validator(mode="after")
+    def require_consistent_memory(self) -> RememberRequest:
+        if self.ended_at is not None and self.ended_at < self.occurred_at:
+            raise ValueError("ended_at must not precede occurred_at")
+        if len(set(self.evidence_ids)) != len(self.evidence_ids):
+            raise ValueError("evidence_ids must not contain duplicates")
+        return self
 
 
 class FeedbackRequest(ContractModel):
