@@ -350,16 +350,13 @@ Python SDK:
 from mindbridge import AsyncMindBridge
 from mindbridge.contracts import RecallQuery, RecallRequest
 
-memory = AsyncMindBridge.connect(
+async with AsyncMindBridge.connect(
     base_url="http://localhost:8000",
     api_key="replace-with-at-least-32-random-characters",
-)
-try:
+) as memory:
     result = await memory.recall(
         RecallRequest(tenant_id="tenant_01", query=RecallQuery(text="Where is my tool?"))
     )
-finally:
-    await memory.close()
 ```
 
 For a grounded follow-up, pass selected IDs from the previous result in

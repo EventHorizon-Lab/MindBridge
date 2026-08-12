@@ -53,6 +53,12 @@ class AsyncMindBridge:
     def __init__(self, client: httpx.AsyncClient) -> None:
         self._client = client
 
+    async def __aenter__(self) -> AsyncMindBridge:
+        return self
+
+    async def __aexit__(self, *_error: object) -> None:
+        await self.close()
+
     @classmethod
     def connect(
         cls,
@@ -61,7 +67,7 @@ class AsyncMindBridge:
         api_key: str | None = None,
         timeout_seconds: float = 120.0,
     ) -> AsyncMindBridge:
-        """Create a client that owns its connection pool until `close()` is called."""
+        """Create a client for use with `async with` or an explicit `close()`."""
         if not base_url.strip():
             raise ValueError("base_url must not be empty")
         if api_key is not None and not api_key.strip():

@@ -17,6 +17,17 @@ from mindbridge.contracts import (
 from mindbridge.core import FeedbackType, ForgetTargetType
 
 
+async def test_context_manager_closes_the_connection_pool() -> None:
+    http_client = httpx.AsyncClient(base_url="https://memory.example.test/")
+    memory = AsyncMindBridge(http_client)
+
+    async with memory as opened:
+        assert opened is memory
+        assert not http_client.is_closed
+
+    assert http_client.is_closed
+
+
 async def test_recall_uses_shared_request_and_response_contracts() -> None:
     async def respond(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/v1/recall"
