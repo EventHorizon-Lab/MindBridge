@@ -115,7 +115,7 @@ flowchart LR
 端侧离传感器最近，适合承担低延迟、隐私敏感和网络不稳定时仍必须执行的任务；云端适合承担跨设备、跨时间的全局记忆和重型多模态推理。
 
 | 端侧负责 | 云端负责 |
-|---|---|
+| --- | --- |
 | 连续采集、硬件时间戳和滚动缓存 | 原始证据的长期对象存储 |
 | VAD、场景变化、运动、注视等事件门控 | 重型 Omni/VLM 理解与证据重看 |
 | 人脸、说话人分离和声纹身份 | 全局实体消歧与跨时间关系构建 |
@@ -130,7 +130,7 @@ flowchart LR
 ### 4.1 核心概念
 
 | 概念 | 定义 | 是否可作为最终证据 |
-|---|---|---|
+| --- | --- | --- |
 | `MediaObject` | 原始或派生的图像、视频、音频对象 | 是 |
 | `Observation` | 某设备在某时刻记录到的一段传感器观察 | 是 |
 | `EvidenceSpan` | 指向媒体对象中精确时间、帧、区域或音频区间的引用 | 是 |
@@ -191,7 +191,7 @@ Timeline / Person
 首版使用 PostgreSQL + pgvector，关系图通过普通关系表表达：
 
 | 表 | 主要职责 |
-|---|---|
+| --- | --- |
 | `media_objects` | 对象存储地址、哈希、编解码信息、保留策略 |
 | `observations` | 设备、传感器、时间范围、同步偏差和上传状态 |
 | `evidence_spans` | 精确媒体时间段、帧区间、ROI、音轨和 Observation 引用 |
@@ -309,7 +309,7 @@ Outbox 删除在一个 SQLite 事务中完成，进程在任意网络步骤崩�
 MindBridge 采用“明确默认、保存版本、允许重建”的策略。模型不微调。
 
 | 能力 | 初始实现 | 运行位置 |
-|---|---|---|
+| --- | --- | --- |
 | AV 理解、caption、时间定位、计数 | Qwen Omni，通过 OpenAI-compatible API；以当前可用最强版本为默认 | 云端 |
 | 视觉 OCR、grounding、补充检查 | Qwen VL/VLM 或对应成熟专用模型 | 云端，必要时端侧 |
 | 跨模态主召回 | `jina-embeddings-v5-omni-small-retrieval` | 云端 |
@@ -375,7 +375,7 @@ API 因此不加载 Jina 权重，模型只存在于 Worker 或独立 serving �
 ### 6.4 Jetson 模型分级
 
 | 设备档位 | 默认行为 |
-|---|---|
+| --- | --- |
 | Orin Nano/NX 等资源受限设备 | 事件门控、人脸/声纹、滚动缓存和上传；通用 Omni Embedding 交给云端 |
 | AGX Orin 或高配机器人主机 | 在不影响主感知任务时运行 Jina Omni Nano，建立端侧近期索引 |
 | 带独立 GPU 的机器人主机 | 可运行完整本地近期召回和部分 Omni 理解；云端仍负责全局长期记忆 |
@@ -599,6 +599,7 @@ Summary，计划任务不会读到自己的写入。
 ### 8.3 记忆强度
 
 首版使用透明、可配置的统计分数，不训练遗忘模型：
+
 ```text
 strength = salience
          + log(1 + useful_access_count)
@@ -652,7 +653,7 @@ Summary，删除 Summary 则保留可独立存在的原始子 Memory。
 MindBridge 对外只暴露少量稳定语义：
 
 | 语义 | Python/领域函数 | REST | MCP Tool |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 提交连续或离散观察 | `observe(...)` | `POST /v1/observations` | `memory_observe` |
 | 显式写入需要长期保留的内容 | `remember(...)` | `POST /v1/memories` | `memory_remember` |
 | 多模态召回和回答 | `recall(...)` | `POST /v1/recall` | `memory_recall` |
@@ -738,7 +739,7 @@ HTTP、Python 和 MCP 共享同一层 use case，不各自复制业务逻辑。
 ### 10.2 首选生态
 
 | 能力 | 首选实现 | 禁止重复实现的内容 |
-|---|---|---|
+| --- | --- | --- |
 | 模型加载 | `transformers`、`sentence-transformers` | tokenizer、processor、pooling、批处理 |
 | 模型和数据下载 | `huggingface_hub` | 自写下载器、缓存和断点逻辑 |
 | Benchmark 数据 | `datasets`，优先官方 loader | 手工抓取和私有数据格式 |
@@ -786,7 +787,7 @@ client = AsyncOpenAI(api_key=api_key, base_url=base_url)
 代码、数据库、API、MCP 和文档必须使用同一套领域词汇：`Observation`、`EvidenceSpan`、`Event`、`Episode`、`Entity`、`Claim`、`MemoryRecord`。同一概念不得在不同模块中分别叫 `item`、`record`、`node` 或 `data`。
 
 | 对象 | 规则 | 推荐示例 | 拒绝示例 |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 命令函数 | 动词 + 明确对象 | `build_event`、`link_evidence`、`forget_memory` | `process`、`handle_data`、`do_task` |
 | 查询函数 | 使用 `get/list/find/search/recall` 区分语义 | `get_event`、`find_candidate_events` | `query_data`、`fetch_stuff` |
 | 布尔函数 | 使用 `is/has/can/should` | `is_evidence_sufficient` | `check_evidence`、`evidence_flag` |
@@ -852,7 +853,7 @@ async def forget(request: ForgetRequest) -> ForgetReceipt: ...
 ### 11.4 模块边界与依赖方向
 
 | 层 | 可以做 | 不可以做 |
-|---|---|---|
+| --- | --- | --- |
 | `api` | 协议转换、鉴权、输入验证、调用 use case | SQL、Prompt、Embedding、记忆合并规则 |
 | `core` | 领域类型、规则、用例和领域错误 | 导入 FastAPI、OpenAI、Transformers、数据库驱动 |
 | `ingest/recall/lifecycle` | 编排领域操作和声明事务边界 | 复制领域规则、直接处理 HTTP |
@@ -940,7 +941,7 @@ Schema 变更必须向后兼容或带显式迁移；不得在 Worker 和 API 不
 引入首批 Python 代码时，在 `pyproject.toml` 和 CI 中一次性配置成熟工具，不自研检查器：
 
 | 门禁 | 建议工具/命令 | 要求 |
-|---|---|---|
+| --- | --- | --- |
 | 格式化 | `ruff format --check .` | 必须通过 |
 | Lint 与复杂度 | `ruff check .`，启用明确规则和 `C901` | 必须通过；禁止全局忽略 |
 | 类型 | `mypy src` | `core`、API schema 和公共函数严格；第三方边界局部豁免 |
@@ -1047,7 +1048,7 @@ tests/
 ### 12.3 扩展触发条件
 
 | 当前选择 | 只有出现以下证据才升级 |
-|---|---|
+| --- | --- |
 | PostgreSQL + pgvector | 单机/集群召回延迟、容量或写放大不达标 |
 | 关系表 | 真实查询需要高深度、大规模图遍历且递归 CTE 成为瓶颈 |
 | PostgreSQL 时间索引 | 时序聚合和保留操作成为主要负载 |
@@ -1073,7 +1074,7 @@ tests/
 ### 14.1 Benchmark 能力映射
 
 | Benchmark | 主要验证能力 | MindBridge 对应机制 |
-|---|---|---|
+| --- | --- | --- |
 | LoCoMo | 长期对话、单跳、多跳、时间和开放域记忆 | Claim 版本、全文+稠密召回、时间关系、证据回答 |
 | EgoLifeQA | 跨小时/天的第一视角视听、身份和生活事件 | 端侧身份、分层 Episode、AV 证据和跨日关联 |
 | SuperMemory-VQA | 多证据、自然提问、物体位置、意图、时间线和拒答 | evidence coverage、关系展开、枚举、证据充分性判断 |
@@ -1129,7 +1130,7 @@ media、代码、模型、Prompt、检索参数和预测文件哈希。
 只看最终答案分数无法定位问题，必须同时报告：
 
 | 层级 | 指标 |
-|---|---|
+| --- | --- |
 | 事件构建 | 边界覆盖、人物/说话人准确率、时间定位、Claim groundedness |
 | 检索 | Evidence Recall@K、MRR/nDCG、时间范围命中、多证据覆盖率 |
 | 回答 | 官方 Accuracy/F1/LLM Judge、证据一致性、拒答准确率 |
@@ -1238,7 +1239,7 @@ ID；无 SDK 的嵌入式调用才生成独立 fallback ID。
 ## 17. 关键架构决策记录
 
 | ADR | 决策 | 接受的代价 | 重审触发条件 |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | ADR-001 | 原始视听证据优先，文本是派生视图 | 存储与重看成本更高 | 只有法规或硬件禁止保留原始媒体 |
 | ADR-002 | Jetson 做身份/门控/近期记忆，云端做全局重型记忆 | 依赖网络，端侧能力不完全 | 明确提出完全离线产品需求 |
 | ADR-003 | 模型全部冻结，学习发生在记忆和策略层 | 放弃任务微调可能带来的单榜收益 | 用户明确取消“不微调”约束 |

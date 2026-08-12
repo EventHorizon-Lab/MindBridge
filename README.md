@@ -35,6 +35,15 @@ uv run pytest -W error
 git diff --check
 ```
 
+Validate Markdown structure and links with the same tool versions used by CI:
+
+```bash
+docker run --rm -v "$PWD:/workdir:ro" davidanson/markdownlint-cli2:v0.23.0 \
+  "**/*.md" "!.git/**" "!.venv/**" "!.pytest_cache/**"
+docker run --rm -v "$PWD:/input:ro" -w /input lycheeverse/lychee:0.23.0 \
+  --no-progress --root-dir /input './*.md' './docs/**/*.md'
+```
+
 `tests/benchmarks/golden_recall.json` is the deterministic retrieval gate. It exercises dense
 evidence recall, exact text recall, temporal exclusion, and unsupported-query abstention through
 the production kernel and PostgreSQL/pgvector path; the normal integration test command runs it.

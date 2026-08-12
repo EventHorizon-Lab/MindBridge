@@ -22,7 +22,9 @@ uv run pytest -W error
 git diff --check
 ```
 
-Deployment-specific installation commands and PostgreSQL integration setup are documented in `README.md`.
+Markdown changes must also pass the pinned Markdown and link-check commands documented in
+`README.md`. Deployment-specific installation commands and PostgreSQL integration setup are
+documented there as well.
 
 ## Coding Style & Naming Conventions
 
