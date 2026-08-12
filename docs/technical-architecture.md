@@ -253,6 +253,9 @@ sequenceDiagram
     M-->>E: sync watermark and optional recent-memory delta
 ```
 
+媒体未声明 `duration_ms` 时，首个 EvidenceSpan 使用 Observation 的完整时间区间；显式的媒体
+时长仍作为更精确的证据终点，避免可选元数据把整段经历退化为零长度证据。
+
 ### 5.2 事件切分
 
 固定长度切片只能作为推理输入上限，不能直接等同于记忆边界。首版采用：

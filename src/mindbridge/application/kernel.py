@@ -485,7 +485,9 @@ def _build_media_object(item: MediaObjectInput, tenant_id: str) -> MediaObject:
 
 
 def _build_evidence_span(item: MediaObjectInput, observation: Observation) -> EvidenceSpan:
-    end_ms = item.duration_ms or 0
+    end_ms = item.duration_ms
+    if end_ms is None:
+        end_ms = round((observation.ended_at - observation.occurred_at).total_seconds() * 1_000)
     return EvidenceSpan(
         evidence_id=EvidenceId(
             derive_stable_id(

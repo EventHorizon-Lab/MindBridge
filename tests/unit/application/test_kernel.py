@@ -574,6 +574,7 @@ async def test_observe_is_retry_safe() -> None:
     assert retry.status is ObservationStatus.DUPLICATE
     assert len(store.observations) == 1
     assert len(store.evidence) == 1
+    assert next(iter(store.evidence.values())).end_ms == 4_000
     assert publisher.calls == [
         (TenantId("tenant_01"), first.observation_id, first.processing_job_id),
         (TenantId("tenant_01"), retry.observation_id, retry.processing_job_id),
@@ -1254,7 +1255,6 @@ def _observe_request(
                 sha256="a" * 64,
                 size_bytes=100,
                 created_at=NOW,
-                duration_ms=4_000,
             ),
         ),
         occurred_at=NOW,
