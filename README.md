@@ -532,11 +532,17 @@ uv run --extra edge python -m mindbridge.edge.sync_cli \
   --api-base-url https://memory.example.com \
   --bucket mindbridge-media \
   --region us-east-1 \
+  --recent-retention-hours 24 \
   --limit 100
 ```
 
 Use the robot service manager or a systemd timer for retry scheduling and backoff. A failed run keeps
 the row, its sanitized error code, and attempt count. Once media has uploaded, later retries send
-only the idempotent observation metadata. A cloud receipt advances the per-boot sync watermark and
-removes the Outbox row atomically; local media deletion remains an explicit rolling-cache policy.
-AWS/S3 credentials and the MindBridge API key are never stored in SQLite.
+only the idempotent observation metadata. A cloud receipt advances the per-boot sync watermark,
+records its processing job, and removes the Outbox row atomically. Later runs cache successful job
+memories for the configured TTL; evidence still present on the device uses an offline `file://`
+reference. Read them without network access through
+`SQLiteRecentMemory(Path("/var/lib/mindbridge/edge.db")).list_memories("tenant_01")`. Tombstones
+remove matching cache rows before the deletion cursor advances. Local media deletion remains an
+explicit rolling-cache policy. AWS/S3 credentials and the MindBridge API key are never stored in
+SQLite.

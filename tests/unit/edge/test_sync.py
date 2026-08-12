@@ -14,6 +14,8 @@ from mindbridge.contracts import (
     DeletionPage,
     DeletionTombstoneView,
     MediaObjectInput,
+    MemoryResult,
+    ObservationProcessingJobView,
     ObservationReceipt,
     ObservationStatus,
     ObserveRequest,
@@ -21,9 +23,13 @@ from mindbridge.contracts import (
 from mindbridge.core import (
     DeletionPropagationState,
     ForgetTargetType,
+    JobState,
     MediaKind,
+    MemoryState,
+    MemoryType,
     ObjectStorageError,
     SensorKind,
+    VerificationStatus,
     derive_observation_id,
 )
 from mindbridge.edge import (
@@ -32,6 +38,7 @@ from mindbridge.edge import (
     S3EdgeMediaUploader,
     SQLiteDeletionInbox,
     SQLiteObservationOutbox,
+    SQLiteRecentMemory,
 )
 
 NOW = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
@@ -110,6 +117,51 @@ class DeletingMemoryApi:
         )
 
 
+class CompletedMemoryApi:
+    def __init__(
+        self,
+        receipt: ObservationReceipt,
+        memory: MemoryResult,
+    ) -> None:
+        self.receipt = receipt
+        self.memory = memory
+        self.job_calls = 0
+
+    async def observe(self, request: ObserveRequest) -> ObservationReceipt:
+        raise AssertionError("the acknowledged observation must not be uploaded again")
+
+    async def list_deletions(self, request: DeletionListRequest) -> DeletionPage:
+        return DeletionPage(items=(), next_cursor=None, trace_id="trace_deletions")
+
+    async def get_observation_job(
+        self,
+        tenant_id: str,
+        job_id: str,
+    ) -> ObservationProcessingJobView:
+        self.job_calls += 1
+        return ObservationProcessingJobView(
+            job_id=job_id,
+            observation_id=self.receipt.observation_id,
+            state=JobState.SUCCEEDED,
+            attempt=1,
+            error_code=None,
+            memory_ids=("memory_deleted", self.memory.memory_id),
+            created_at=NOW,
+            updated_at=NOW,
+            trace_id="trace_job",
+        )
+
+    async def get_memory(self, tenant_id: str, memory_id: str) -> MemoryResult:
+        if memory_id == "memory_deleted":
+            raise MindBridgeClientError(
+                "memory was deleted",
+                code="memory_deleted",
+                status_code=410,
+            )
+        assert memory_id == self.memory.memory_id
+        return self.memory
+
+
 async def test_sync_retries_only_metadata_after_media_upload(tmp_path: Path) -> None:
     request, media_file = _capture(tmp_path)
     outbox = SQLiteObservationOutbox(tmp_path / "edge.db", clock=lambda: NOW)
@@ -125,6 +177,7 @@ async def test_sync_retries_only_metadata_after_media_upload(tmp_path: Path) -> 
         SQLiteDeletionInbox(tmp_path / "edge.db", clock=lambda: NOW),
         cast(AsyncMindBridge, api),
         upload,
+        recent_memory=SQLiteRecentMemory(tmp_path / "edge.db", clock=lambda: NOW),
     )
     with pytest.raises(MindBridgeClientError, match="offline"):
         await synchronizer.sync_next()
@@ -159,6 +212,7 @@ async def test_sync_applies_tombstone_before_media_upload(tmp_path: Path) -> Non
         deletion_inbox,
         cast(AsyncMindBridge, api),
         upload,
+        recent_memory=SQLiteRecentMemory(database_path, clock=lambda: NOW),
     ).sync_next()
 
     assert receipt is None
@@ -190,6 +244,62 @@ async def test_s3_uploader_checks_bytes_and_tenant_before_upload(tmp_path: Path)
     )
     with pytest.raises(ObjectStorageError, match="checksum"):
         await uploader.upload(changed, media_file)
+
+
+async def test_sync_pending_caches_completed_cloud_memory(tmp_path: Path) -> None:
+    request, media_file = _capture(tmp_path)
+    database_path = tmp_path / "edge.db"
+    outbox = SQLiteObservationOutbox(database_path, clock=lambda: NOW)
+    outbox.enqueue(request, (media_file,))
+    item = outbox.next_pending()
+    assert item is not None
+    observation_id = derive_observation_id(
+        request.tenant_id,
+        request.device_id,
+        request.boot_id,
+        request.sequence,
+    )
+    receipt = ObservationReceipt(
+        observation_id=observation_id,
+        processing_job_id=f"job_process_{observation_id}",
+        idempotency_key=request.idempotency_key or "unexpected",
+        status=ObservationStatus.ACCEPTED,
+        trace_id="trace_observe",
+    )
+    outbox.acknowledge(item, receipt)
+    memory = MemoryResult(
+        memory_id="memory_01",
+        memory_type=MemoryType.EPISODIC,
+        summary="A person placed a tool beside the toolbox.",
+        evidence_ids=(),
+        occurred_at=NOW,
+        ended_at=NOW + timedelta(seconds=30),
+        created_at=NOW,
+        verification_status=VerificationStatus.VERIFIED,
+        state=MemoryState.ACTIVE,
+        trace_id="trace_memory",
+    )
+    api = CompletedMemoryApi(receipt, memory)
+    recent = SQLiteRecentMemory(database_path, clock=lambda: NOW)
+
+    async def unexpected_upload(_request: ObserveRequest, _file: EdgeMediaFile) -> None:
+        raise AssertionError("no media upload is expected")
+
+    receipts = await EdgeObservationSynchronizer(
+        outbox,
+        SQLiteDeletionInbox(database_path, clock=lambda: NOW),
+        cast(AsyncMindBridge, api),
+        unexpected_upload,
+        recent_memory=recent,
+    ).sync_pending()
+
+    assert receipts == ()
+    assert api.job_calls == 1
+    assert outbox.pending_processing_jobs() == ()
+    cached = recent.get_memory("tenant_01", "memory_01")
+    assert cached is not None
+    assert cached.memory_id == memory.memory_id
+    assert recent.get_memory("tenant_01", "memory_deleted") is None
 
 
 def _capture(tmp_path: Path) -> tuple[ObserveRequest, EdgeMediaFile]:

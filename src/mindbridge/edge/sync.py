@@ -14,12 +14,14 @@ from botocore.exceptions import BotoCoreError
 from mindbridge.contracts import (
     DeletionListRequest,
     MediaObjectInput,
+    MemoryResult,
     ObservationReceipt,
     ObserveRequest,
 )
-from mindbridge.core import ObjectStorageError
+from mindbridge.core import JobState, MemoryIntegrityError, ObjectStorageError
 from mindbridge.edge.deletion_inbox import SQLiteDeletionInbox
 from mindbridge.edge.outbox import EdgeMediaFile, SQLiteObservationOutbox
+from mindbridge.edge.recent_memory import SQLiteRecentMemory
 from mindbridge.file_integrity import sha256_file
 from mindbridge.infrastructure.s3 import tenant_s3_object_key
 from mindbridge.sdk import AsyncMindBridge, MindBridgeClientError
@@ -107,11 +109,14 @@ class EdgeObservationSynchronizer:
         deletion_inbox: SQLiteDeletionInbox,
         memory: AsyncMindBridge,
         upload_media: UploadEdgeMedia,
+        *,
+        recent_memory: SQLiteRecentMemory,
     ) -> None:
         self._outbox = outbox
         self._deletion_inbox = deletion_inbox
         self._memory = memory
         self._upload_media = upload_media
+        self._recent_memory = recent_memory
 
     @trace_operation("mindbridge.edge.sync_observation")
     async def sync_next(self) -> ObservationReceipt | None:
@@ -175,6 +180,45 @@ class EdgeObservationSynchronizer:
             cursor = page.next_cursor
         return applied
 
+    @trace_operation("mindbridge.edge.sync_recent_memories")
+    async def sync_recent_memories(self, *, limit: int = 100) -> int:
+        """Cache completed cloud jobs without blocking on jobs still in progress."""
+        cached = 0
+        for pending in self._outbox.pending_processing_jobs(limit=limit):
+            job = await self._memory.get_observation_job(
+                pending.tenant_id,
+                pending.processing_job_id,
+            )
+            if (
+                job.job_id != pending.processing_job_id
+                or job.observation_id != pending.observation_id
+            ):
+                raise MemoryIntegrityError("cloud processing job identity changed")
+            if job.state is not JobState.SUCCEEDED:
+                continue
+            fetched: list[MemoryResult] = []
+            fetched_ids: list[str] = []
+            for memory_id in job.memory_ids:
+                try:
+                    memory = await self._memory.get_memory(pending.tenant_id, memory_id)
+                except MindBridgeClientError as error:
+                    if error.code == "memory_deleted":
+                        continue
+                    raise
+                if memory.memory_id != memory_id:
+                    raise MemoryIntegrityError("cloud memory identity changed")
+                fetched.append(memory)
+                fetched_ids.append(memory_id)
+            self._recent_memory.cache_job_memories(
+                pending.tenant_id,
+                pending.observation_id,
+                pending.processing_job_id,
+                tuple(fetched_ids),
+                tuple(fetched),
+            )
+            cached += len(fetched)
+        return cached
+
     @trace_operation("mindbridge.edge.sync_pending")
     async def sync_pending(self, *, limit: int = 100) -> tuple[ObservationReceipt, ...]:
         """Synchronize at most `limit` items so the caller controls scheduling and backoff."""
@@ -182,6 +226,7 @@ class EdgeObservationSynchronizer:
             raise ValueError("edge sync limit must be positive")
         for tenant_id in self._deletion_inbox.tenant_ids():
             await self.sync_deletions(tenant_id)
+        await self.sync_recent_memories(limit=limit)
         receipts: list[ObservationReceipt] = []
         for _ in range(limit):
             receipt = await self.sync_next()
