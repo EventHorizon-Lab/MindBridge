@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Annotated
 
 from pydantic import (
+    AfterValidator,
     AwareDatetime,
     BaseModel,
     ConfigDict,
@@ -41,6 +43,13 @@ Sha256Hex = Annotated[
 ]
 
 
+def _as_utc(value: datetime) -> datetime:
+    return value.astimezone(timezone.utc)
+
+
+UtcDatetime = Annotated[AwareDatetime, AfterValidator(_as_utc)]
+
+
 class ContractModel(BaseModel):
     """Strict immutable base shared by every external contract."""
 
@@ -55,7 +64,7 @@ class MediaObjectInput(ContractModel):
     uri: NonEmptyString
     sha256: Sha256Hex
     size_bytes: Annotated[int, Field(ge=0)]
-    created_at: AwareDatetime
+    created_at: UtcDatetime
     duration_ms: Annotated[int, Field(ge=0)] | None = None
 
 
@@ -86,9 +95,9 @@ class ObserveRequest(ContractModel):
     sequence: Annotated[int, Field(ge=0)]
     sensor: SensorKind
     media_objects: Annotated[tuple[MediaObjectInput, ...], Field(min_length=1)]
-    occurred_at: AwareDatetime
-    ended_at: AwareDatetime
-    observed_at: AwareDatetime
+    occurred_at: UtcDatetime
+    ended_at: UtcDatetime
+    observed_at: UtcDatetime
     clock_offset_ms: int = 0
     identity_observations: tuple[IdentityObservationInput, ...] = ()
     idempotency_key: Identifier | None = None
@@ -145,8 +154,8 @@ class ObservationProcessingJobView(ContractModel):
     attempt: Annotated[int, Field(ge=0)]
     error_code: Identifier | None
     memory_ids: tuple[Identifier, ...] = ()
-    created_at: AwareDatetime
-    updated_at: AwareDatetime
+    created_at: UtcDatetime
+    updated_at: UtcDatetime
     trace_id: Identifier
 
     @model_validator(mode="after")
@@ -164,8 +173,8 @@ class RememberRequest(ContractModel):
     tenant_id: Identifier
     summary: NonEmptyString
     memory_type: MemoryType
-    occurred_at: AwareDatetime
-    ended_at: AwareDatetime | None = None
+    occurred_at: UtcDatetime
+    ended_at: UtcDatetime | None = None
     evidence_ids: tuple[Identifier, ...] = ()
     idempotency_key: Identifier | None = None
 
@@ -215,7 +224,7 @@ class FeedbackReceipt(ContractModel):
     corrected_memory_id: Identifier | None
     resulting_state: MemoryState | None
     resulting_strength: float | None = Field(allow_inf_nan=False)
-    created_at: AwareDatetime
+    created_at: UtcDatetime
     trace_id: Identifier
 
     @model_validator(mode="after")
@@ -242,8 +251,8 @@ class DeletionTombstoneView(ContractModel):
     target_type: ForgetTargetType
     target_id: Identifier
     propagation_state: DeletionPropagationState
-    requested_at: AwareDatetime
-    completed_at: AwareDatetime | None
+    requested_at: UtcDatetime
+    completed_at: UtcDatetime | None
     error_code: Identifier | None
 
 
@@ -291,8 +300,8 @@ class RecallFilters(ContractModel):
     person_ids: tuple[Identifier, ...] = ()
     device_ids: tuple[Identifier, ...] = ()
     memory_types: tuple[MemoryType, ...] = ()
-    occurred_after: AwareDatetime | None = None
-    occurred_before: AwareDatetime | None = None
+    occurred_after: UtcDatetime | None = None
+    occurred_before: UtcDatetime | None = None
 
     @model_validator(mode="after")
     def require_ordered_time_range(self) -> RecallFilters:
@@ -340,9 +349,9 @@ class MemoryView(ContractModel):
     memory_type: MemoryType
     summary: NonEmptyString
     evidence_ids: tuple[Identifier, ...]
-    occurred_at: AwareDatetime
-    ended_at: AwareDatetime
-    created_at: AwareDatetime
+    occurred_at: UtcDatetime
+    ended_at: UtcDatetime
+    created_at: UtcDatetime
     verification_status: VerificationStatus
     state: MemoryState
     salience: Annotated[float, Field(ge=0.0, le=1.0)] = 0.5
@@ -350,9 +359,9 @@ class MemoryView(ContractModel):
     useful_access_count: Annotated[int, Field(ge=0)] = 0
     positive_feedback_count: Annotated[int, Field(ge=0)] = 0
     negative_feedback_count: Annotated[int, Field(ge=0)] = 0
-    last_accessed_at: AwareDatetime | None = None
+    last_accessed_at: UtcDatetime | None = None
     supersedes_memory_id: Identifier | None = None
-    superseded_at: AwareDatetime | None = None
+    superseded_at: UtcDatetime | None = None
 
 
 class GetMemoryRequest(ContractModel):
@@ -370,7 +379,7 @@ class EvidenceView(ContractModel):
     start_ms: Annotated[int, Field(ge=0)]
     end_ms: Annotated[int, Field(ge=0)]
     media_url: NonEmptyString
-    media_url_expires_at: AwareDatetime
+    media_url_expires_at: UtcDatetime
 
 
 class MemoryResult(MemoryView):

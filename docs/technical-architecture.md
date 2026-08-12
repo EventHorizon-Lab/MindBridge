@@ -892,7 +892,7 @@ async def forget(request: ForgetRequest) -> ForgetReceipt: ...
 - 所有外部输入在信任边界立即使用 Pydantic 校验；数据库结果和 SDK 响应在 Adapter 内转换为内部类型；
 - 核心模块不得用裸 `dict[str, Any]` 传递 Event、Claim、RecallResult 等领域数据；
 - 禁止无范围的 `Any`。第三方 SDK 类型不完整时，只允许在最窄 Adapter 中使用带错误码的 `type: ignore`；
-- 时间必须是带时区的 `datetime`，持久化统一使用 UTC，展示时再转换；
+- 时间必须是带时区的 `datetime`，在公共契约边界归一为 UTC 后再做幂等比较和持久化，展示时再转换；
 - duration、offset、size、confidence 等值必须有明确单位和合法范围；
 - 枚举状态使用 Enum/Literal，不用散落的字符串；
 - ID、幂等键、模型版本和 EvidenceSpan 是公共契约的一部分，不得隐式生成后丢失；

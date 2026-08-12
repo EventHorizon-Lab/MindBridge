@@ -677,6 +677,22 @@ async def test_idempotency_key_rejects_different_observation() -> None:
         await kernel.observe(_observe_request(sequence=2, idempotency_key="edge-request-01"))
 
 
+async def test_idempotency_accepts_timezone_equivalent_retry() -> None:
+    store = InMemoryStore()
+    kernel = _kernel(store, RecordingAnswerer())
+    key = "remember-timezone-retry"
+
+    first = await kernel.remember(_remember_request(idempotency_key=key))
+    retry = await kernel.remember(
+        _remember_request(
+            idempotency_key=key,
+            occurred_at=NOW.astimezone(timezone(timedelta(hours=8))),
+        )
+    )
+
+    assert retry.memory_id == first.memory_id
+
+
 async def test_observe_remember_recall_returns_openable_evidence() -> None:
     """The first full path answers from a memory and its exact media span."""
     store = InMemoryStore()
@@ -1204,12 +1220,13 @@ def _remember_request(
     *,
     evidence_ids: tuple[str, ...] = (),
     idempotency_key: str | None = None,
+    occurred_at: datetime = NOW,
 ) -> RememberRequest:
     return RememberRequest(
         tenant_id="tenant_01",
         summary="The robot put the red screwdriver beside the blue toolbox.",
         memory_type=MemoryType.EPISODIC,
-        occurred_at=NOW,
+        occurred_at=occurred_at,
         evidence_ids=evidence_ids,
         idempotency_key=idempotency_key,
     )
