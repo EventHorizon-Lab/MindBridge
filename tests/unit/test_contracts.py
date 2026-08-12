@@ -137,6 +137,8 @@ def test_write_contracts_reject_inconsistent_ranges_and_references() -> None:
         _observe_request(ended_at=NOW - timedelta(milliseconds=1))
     with pytest.raises(ValidationError, match="duplicate IDs"):
         _observe_request(media_objects=(media, media))
+    with pytest.raises(ValidationError, match="media duration exceeds source observation"):
+        _observe_request(media_objects=(media.model_copy(update={"duration_ms": 1}),))
     with pytest.raises(ValidationError, match="ended_at must not precede occurred_at"):
         RememberRequest(
             tenant_id="tenant_01",

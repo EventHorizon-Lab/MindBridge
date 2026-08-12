@@ -112,6 +112,11 @@ class ObserveRequest(ContractModel):
         if len(set(media_object_ids)) != len(media_object_ids):
             raise ValueError("media_objects must not contain duplicate IDs")
         duration_ms = round((self.ended_at - self.occurred_at).total_seconds() * 1_000)
+        if any(
+            media.duration_ms is not None and media.duration_ms > duration_ms
+            for media in self.media_objects
+        ):
+            raise ValueError("media duration exceeds source observation")
         if any(identity.end_ms > duration_ms for identity in self.identity_observations):
             raise ValueError("identity observation exceeds source duration")
         keys = [

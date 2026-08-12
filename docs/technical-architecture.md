@@ -257,7 +257,8 @@ sequenceDiagram
 ```
 
 媒体未声明 `duration_ms` 时，首个 EvidenceSpan 使用 Observation 的完整时间区间；显式的媒体
-时长仍作为更精确的证据终点，避免可选元数据把整段经历退化为零长度证据。
+时长仍作为更精确的证据终点，但不得超过 Observation 时间窗，避免可选元数据把整段经历退化为
+零长度证据或把未来媒体带入当前 Observation。
 
 ### 5.2 事件切分
 
