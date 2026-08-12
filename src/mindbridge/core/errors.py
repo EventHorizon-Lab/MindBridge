@@ -37,6 +37,10 @@ class TaskBrokerError(RuntimeError):
     """Raised when a durable processing job cannot be delivered."""
 
 
+class DatabaseUnavailableError(RuntimeError):
+    """Raised when a transient database failure makes an operation retryable."""
+
+
 class ModelUnavailableError(RuntimeError):
     """Raised when a configured frozen model cannot be loaded or called."""
 

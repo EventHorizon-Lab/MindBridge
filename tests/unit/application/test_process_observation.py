@@ -21,6 +21,7 @@ from mindbridge.application.process_observation import ProcessObservation
 from mindbridge.core import (
     AnonymousIdentityObservation,
     ClaimType,
+    DatabaseUnavailableError,
     DeviceId,
     DomainInvariantError,
     EmbeddedObjectType,
@@ -316,6 +317,7 @@ def test_event_perception_rejects_an_unbounded_detail_fanout() -> None:
 @pytest.mark.parametrize(
     ("error", "error_code"),
     [
+        (DatabaseUnavailableError("database detail"), "database_unavailable"),
         (ModelUnavailableError("secret provider detail"), "model_unavailable"),
         (ModelRequestError("secret provider detail"), "model_request_failed"),
     ],
@@ -324,7 +326,7 @@ async def test_processor_records_sanitized_failure_state(
     error: RuntimeError,
     error_code: str,
 ) -> None:
-    """A model failure leaves a durable category, never provider details."""
+    """A dependency failure leaves a durable category, never provider details."""
     store = RecordingProcessingStore()
     processor = _processor(
         store,
@@ -333,7 +335,7 @@ async def test_processor_records_sanitized_failure_state(
         RecordingTextEmbedder(),
     )
 
-    with pytest.raises(type(error), match="secret provider detail"):
+    with pytest.raises(type(error), match="detail"):
         await processor.run(TENANT_ID, OBSERVATION_ID, JOB_ID)
 
     assert store.job.state is JobState.FAILED

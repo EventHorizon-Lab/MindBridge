@@ -21,6 +21,7 @@ from celery.signals import (  # type: ignore[import-untyped]  # Upstream lacks P
 from mindbridge.application.process_observation import ProcessObservation
 from mindbridge.configuration import optional_environment_value, require_environment_value
 from mindbridge.core import (
+    DatabaseUnavailableError,
     EmbeddingSpaceReference,
     JobId,
     JobState,
@@ -169,7 +170,12 @@ def create_worker_app(settings: WorkerSettings) -> Celery:
     @task_queue.task(  # type: ignore[untyped-decorator]
         name=PROCESS_OBSERVATION_TASK,
         bind=True,
-        autoretry_for=(ModelUnavailableError, ObjectStorageError, SoftTimeLimitExceeded),
+        autoretry_for=(
+            DatabaseUnavailableError,
+            ModelUnavailableError,
+            ObjectStorageError,
+            SoftTimeLimitExceeded,
+        ),
         max_retries=5,
         retry_backoff=True,
         retry_backoff_max=300,

@@ -10,7 +10,7 @@ from celery.exceptions import Retry  # type: ignore[import-untyped]  # Upstream 
 from pydantic import ValidationError
 
 import mindbridge.worker as worker_module
-from mindbridge.core import JobState
+from mindbridge.core import DatabaseUnavailableError, JobState
 from mindbridge.infrastructure.task_queue import (
     PROCESS_OBSERVATION_TASK,
     ObservationProcessingTaskMessage,
@@ -63,6 +63,7 @@ def test_worker_task_calls_shared_use_case_with_ids_only(
     assert calls == [("tenant_01", "observation_01", "job_process_observation_01")]
     assert app.conf.worker_concurrency == 1
     assert app.conf.worker_pool == "prefork"
+    assert DatabaseUnavailableError in task.autoretry_for
 
 
 def test_worker_retries_an_observation_owned_by_another_delivery(

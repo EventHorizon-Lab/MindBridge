@@ -36,6 +36,7 @@ from mindbridge.contracts import (
     ValidationIssue,
 )
 from mindbridge.core import (
+    DatabaseUnavailableError,
     DomainInvariantError,
     EnumerationLimitExceededError,
     ForgetTargetNotFoundError,
@@ -303,17 +304,6 @@ def _register_runtime_error_handlers(app: FastAPI) -> None:
             message="observation processing job does not exist",
         )
 
-    @app.exception_handler(ModelUnavailableError)
-    async def handle_model_unavailable(
-        _request: Request,
-        _error: ModelUnavailableError,
-    ) -> JSONResponse:
-        return _error_response(
-            status.HTTP_503_SERVICE_UNAVAILABLE,
-            code="model_unavailable",
-            message="memory model is unavailable",
-        )
-
     @app.exception_handler(ModelRequestError)
     @app.exception_handler(ModelOutputError)
     async def handle_model_protocol_error(
@@ -336,26 +326,36 @@ def _register_runtime_error_handlers(app: FastAPI) -> None:
             message=message,
         )
 
+    @app.exception_handler(DatabaseUnavailableError)
+    @app.exception_handler(ModelUnavailableError)
     @app.exception_handler(ObjectStorageError)
-    async def handle_object_storage_error(
-        _request: Request,
-        _error: ObjectStorageError,
-    ) -> JSONResponse:
-        return _error_response(
-            status.HTTP_503_SERVICE_UNAVAILABLE,
-            code="object_storage_unavailable",
-            message="evidence media is unavailable",
-        )
-
     @app.exception_handler(TaskBrokerError)
-    async def handle_task_broker_error(
+    async def handle_dependency_unavailable(
         _request: Request,
-        _error: TaskBrokerError,
+        error: DatabaseUnavailableError
+        | ModelUnavailableError
+        | ObjectStorageError
+        | TaskBrokerError,
     ) -> JSONResponse:
+        code, message = {
+            DatabaseUnavailableError: (
+                "database_unavailable",
+                "memory storage is temporarily unavailable",
+            ),
+            ModelUnavailableError: ("model_unavailable", "memory model is unavailable"),
+            ObjectStorageError: (
+                "object_storage_unavailable",
+                "evidence media is unavailable",
+            ),
+            TaskBrokerError: (
+                "task_broker_unavailable",
+                "observation processing is temporarily unavailable",
+            ),
+        }[type(error)]
         return _error_response(
             status.HTTP_503_SERVICE_UNAVAILABLE,
-            code="task_broker_unavailable",
-            message="observation processing is temporarily unavailable",
+            code=code,
+            message=message,
         )
 
     @app.exception_handler(MemoryIntegrityError)

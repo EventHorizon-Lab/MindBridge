@@ -26,6 +26,7 @@ from mindbridge.contracts import (
     RememberRequest,
 )
 from mindbridge.core import (
+    DatabaseUnavailableError,
     DeletionPropagationState,
     DomainInvariantError,
     EnumerationLimitExceededError,
@@ -367,6 +368,7 @@ def test_openapi_exposes_stable_operation_ids() -> None:
 @pytest.mark.parametrize(
     ("error", "expected_status", "expected_code"),
     [
+        (DatabaseUnavailableError("database detail"), 503, "database_unavailable"),
         (ModelUnavailableError("provider detail"), 503, "model_unavailable"),
         (ModelRequestError("provider detail"), 502, "model_request_failed"),
         (ModelOutputError("raw output"), 502, "model_output_invalid"),

@@ -99,7 +99,11 @@ from mindbridge.infrastructure._postgres_observations import write_observation
 from mindbridge.infrastructure._postgres_processing import commit_observation_processing
 from mindbridge.infrastructure._postgres_summary_consolidation import list_summary_candidates
 from mindbridge.infrastructure._postgres_summary_writes import commit_summary_consolidation
-from mindbridge.infrastructure._postgres_types import DatabaseConnection, DatabasePool
+from mindbridge.infrastructure._postgres_types import (
+    DatabaseConnection,
+    DatabasePool,
+    translate_transient_database_errors,
+)
 
 
 class PostgresMemoryStore:
@@ -130,7 +134,8 @@ class PostgresMemoryStore:
 
     async def open(self) -> None:
         """Open the pool explicitly, as required by current Psycopg."""
-        await self._pool.open(wait=True)
+        with translate_transient_database_errors():
+            await self._pool.open(wait=True)
 
     async def close(self) -> None:
         """Close pooled connections cleanly during application shutdown."""

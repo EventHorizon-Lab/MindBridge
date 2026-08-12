@@ -21,6 +21,7 @@ from mindbridge.application.ports import (
 )
 from mindbridge.application.recall import RETRIEVAL_DOCUMENT_EMBEDDING_TASK
 from mindbridge.core import (
+    DatabaseUnavailableError,
     DomainInvariantError,
     EmbeddedObjectType,
     EmbeddingId,
@@ -240,6 +241,8 @@ def _require_grounded_perception(
 
 
 def _processing_error_code(error: Exception) -> str:
+    if isinstance(error, DatabaseUnavailableError):
+        return "database_unavailable"
     if isinstance(error, ModelUnavailableError):
         return "model_unavailable"
     if isinstance(error, ModelOutputError):

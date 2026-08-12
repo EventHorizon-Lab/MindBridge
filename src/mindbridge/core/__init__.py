@@ -1,6 +1,7 @@
 """Stable domain vocabulary for MindBridge memory."""
 
 from mindbridge.core.errors import (
+    DatabaseUnavailableError,
     DomainInvariantError,
     EnumerationLimitExceededError,
     ForgetTargetNotFoundError,
@@ -88,6 +89,7 @@ __all__ = [
     "Claim",
     "ClaimId",
     "ClaimType",
+    "DatabaseUnavailableError",
     "DeletionPropagationState",
     "DeletionTombstone",
     "DeviceId",
