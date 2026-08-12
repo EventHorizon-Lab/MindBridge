@@ -9,7 +9,6 @@ from mindbridge.application.claim_consolidation import (
     ClaimCandidate,
     ClaimCandidatePage,
     ClaimCandidateRequest,
-    ClaimCandidateStore,
 )
 from mindbridge.application.evidence import EvidenceReader, read_resolved_evidence
 from mindbridge.application.perception import ResolvedEvidence
@@ -47,8 +46,13 @@ class ClaimConsolidator(Protocol):
     ) -> ClaimConsolidation: ...
 
 
-class ClaimConsolidationStore(ClaimCandidateStore, EvidenceReader, Protocol):
+class ClaimConsolidationStore(EvidenceReader, Protocol):
     """Narrow transactional boundary needed by the semantic Claim use case."""
+
+    async def list_claim_candidates(
+        self,
+        request: ClaimCandidateRequest,
+    ) -> ClaimCandidatePage: ...
 
     async def commit_claim_consolidation(
         self,

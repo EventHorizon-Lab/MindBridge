@@ -7,7 +7,6 @@ from mindbridge.models.jina import (
     DEFAULT_JINA_RETRIEVAL_SPACE,
     DEFAULT_JINA_TEXT_MODEL_ID,
     DEFAULT_JINA_TEXT_REVISION,
-    JinaModality,
     JinaOmniEmbedder,
 )
 from mindbridge.models.openai_claim_consolidation import (
@@ -47,7 +46,6 @@ __all__ = [
     "DEFAULT_JINA_TEXT_REVISION",
     "DEFAULT_OMNI_MODEL_ID",
     "PERCEIVE_EVENTS_PROMPT_VERSION",
-    "JinaModality",
     "JinaOmniEmbedder",
     "OpenAIJinaEmbedder",
     "OpenAIJinaTextEmbedder",

@@ -85,24 +85,6 @@ class ForgetPlan:
 
 
 @dataclass(frozen=True, slots=True)
-class PresignedMediaUpload:
-    """A constrained PUT request for one immutable media object."""
-
-    upload_url: str
-    expires_at: datetime
-    content_type: str
-    checksum_sha256_base64: str
-
-    @property
-    def required_headers(self) -> dict[str, str]:
-        """Return headers covered by the object-store signature."""
-        return {
-            "Content-Type": self.content_type,
-            "x-amz-checksum-sha256": self.checksum_sha256_base64,
-        }
-
-
-@dataclass(frozen=True, slots=True)
 class PresignedMediaDownload:
     """A short-lived GET URL for one tenant-owned media object."""
 

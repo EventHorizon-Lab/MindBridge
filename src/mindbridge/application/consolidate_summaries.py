@@ -12,7 +12,6 @@ from mindbridge.application.summary_consolidation import (
     SummaryCandidate,
     SummaryCandidatePage,
     SummaryCandidateRequest,
-    SummaryCandidateStore,
     SummaryConsolidation,
     SummaryWrite,
     derive_summary_writes,
@@ -42,8 +41,13 @@ class SummaryConsolidator(Protocol):
     ) -> SummaryConsolidation: ...
 
 
-class SummaryConsolidationStore(SummaryCandidateStore, EvidenceReader, Protocol):
+class SummaryConsolidationStore(EvidenceReader, Protocol):
     """Narrow transactional boundary needed by the Summary use case."""
+
+    async def list_summary_candidates(
+        self,
+        request: SummaryCandidateRequest,
+    ) -> SummaryCandidatePage: ...
 
     async def commit_summary_consolidation(
         self,

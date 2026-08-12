@@ -6,7 +6,6 @@ import math
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
-from typing import Protocol
 
 from mindbridge.application.ports import TextDocumentEmbedder
 from mindbridge.application.recall import RETRIEVAL_DOCUMENT_EMBEDDING_TASK
@@ -104,15 +103,6 @@ class SummaryCandidatePage:
             raise DomainInvariantError("Summary candidate Memory IDs must be unique")
         if len({memory.tenant_id for memory in memories}) > 1:
             raise DomainInvariantError("Summary candidates must belong to one tenant")
-
-
-class SummaryCandidateStore(Protocol):
-    """Persistence boundary for one stable Summary candidate page."""
-
-    async def list_summary_candidates(
-        self,
-        request: SummaryCandidateRequest,
-    ) -> SummaryCandidatePage: ...
 
 
 @dataclass(frozen=True, slots=True)

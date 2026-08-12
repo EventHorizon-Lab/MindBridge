@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import math
 from collections.abc import Callable
-from enum import Enum
 from importlib import import_module
 from typing import Protocol, cast
 
@@ -30,15 +29,6 @@ DEFAULT_JINA_RETRIEVAL_SPACE = EmbeddingSpaceReference(
         "text@6856e76bb72982e58de0620458a4e8b3614da340"
     ),
 )
-
-
-class JinaModality(str, Enum):
-    """Selective towers supported by the upstream Jina model."""
-
-    OMNI = "omni"
-    VISION = "vision"
-    AUDIO = "audio"
-    TEXT = "text"
 
 
 class _EmbeddingMatrix(Protocol):
@@ -106,7 +96,6 @@ class JinaOmniEmbedder:
         revision: str,
         model_id: str = DEFAULT_JINA_OMNI_MODEL_ID,
         device: str | None = None,
-        modality: JinaModality = JinaModality.OMNI,
         space_reference: EmbeddingSpaceReference = DEFAULT_JINA_RETRIEVAL_SPACE,
         dimension: int = DEFAULT_JINA_OMNI_DIMENSION,
         max_concurrency: int = 1,
@@ -127,7 +116,7 @@ class JinaOmniEmbedder:
             revision=revision,
             trust_remote_code=True,
             device=device,
-            model_kwargs={"modality": modality.value},
+            model_kwargs={"modality": "omni"},
         )
         return cls(
             encoder,

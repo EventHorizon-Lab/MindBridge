@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import base64
-import re
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
@@ -14,7 +12,7 @@ import boto3
 from botocore.config import Config
 from botocore.exceptions import BotoCoreError
 
-from mindbridge.application import PresignedMediaDownload, PresignedMediaUpload
+from mindbridge.application import PresignedMediaDownload
 from mindbridge.core import MediaObject, ObjectStorageError
 
 if TYPE_CHECKING:
@@ -22,7 +20,6 @@ if TYPE_CHECKING:
 
 _DEFAULT_URL_LIFETIME_SECONDS = 300
 _MAX_URL_LIFETIME_SECONDS = 3_600
-_CONTENT_TYPE_PATTERN = re.compile(r"^[!#$&^_.+\-\w]+/[!#$&^_.+\-\w]+$")
 
 
 class InvalidMediaLocationError(ValueError):
@@ -30,7 +27,7 @@ class InvalidMediaLocationError(ValueError):
 
 
 class S3MediaAccess:
-    """Create tenant-scoped upload and download URLs without proxying media."""
+    """Create tenant-scoped download URLs and delete immutable media."""
 
     def __init__(
         self,
@@ -58,35 +55,6 @@ class S3MediaAccess:
                 read_timeout=30,
                 retries={"max_attempts": 3, "mode": "standard"},
             ),
-        )
-
-    async def create_presigned_upload(
-        self,
-        media_object: MediaObject,
-        *,
-        content_type: str,
-    ) -> PresignedMediaUpload:
-        """Sign a PUT that must match the declared type and content checksum."""
-        if _CONTENT_TYPE_PATTERN.fullmatch(content_type) is None:
-            raise ValueError("content_type must be a valid type/subtype without parameters")
-        object_key = self._tenant_object_key(media_object)
-        checksum = base64.b64encode(bytes.fromhex(media_object.sha256)).decode("ascii")
-        expires_at = self._expires_at()
-        upload_url = await self._presign(
-            "put_object",
-            {
-                "Bucket": self._bucket,
-                "Key": object_key,
-                "ContentType": content_type,
-                "ChecksumSHA256": checksum,
-            },
-            "PUT",
-        )
-        return PresignedMediaUpload(
-            upload_url=upload_url,
-            expires_at=expires_at,
-            content_type=content_type,
-            checksum_sha256_base64=checksum,
         )
 
     async def create_presigned_download(

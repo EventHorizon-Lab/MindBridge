@@ -136,26 +136,6 @@ async def read_observation_processing_job(
     return job
 
 
-async def mark_observation_processing_succeeded(
-    pool: DatabasePool,
-    tenant_id: TenantId,
-    observation_id: ObservationId,
-    job_id: JobId,
-    *,
-    attempt: int,
-) -> ObservationProcessingJob:
-    """Complete a running job; duplicate completion remains a no-op."""
-    return await _finish_observation_processing_job(
-        pool,
-        tenant_id,
-        observation_id,
-        job_id,
-        attempt=attempt,
-        state=JobState.SUCCEEDED,
-        error_code=None,
-    )
-
-
 async def mark_observation_processing_succeeded_on_connection(
     connection: DatabaseConnection,
     tenant_id: TenantId,

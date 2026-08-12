@@ -5,7 +5,6 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Protocol
 
 from mindbridge.core import (
     Claim,
@@ -72,12 +71,3 @@ class ClaimCandidatePage:
             raise DomainInvariantError("Claim candidate IDs must be unique")
         if len({claim.tenant_id for claim in claims}) > 1:
             raise DomainInvariantError("Claim candidates must belong to one tenant")
-
-
-class ClaimCandidateStore(Protocol):
-    """Persistence boundary for one stable semantic consolidation page."""
-
-    async def list_claim_candidates(
-        self,
-        request: ClaimCandidateRequest,
-    ) -> ClaimCandidatePage: ...

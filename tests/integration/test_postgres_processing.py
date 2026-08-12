@@ -1079,11 +1079,20 @@ async def test_superseded_attempt_cannot_commit(
     first = await store.claim_observation_processing_job(tenant_id, observation_id, job_id)
     await _age_running_job(database_url, tenant_id, job_id)
     second = await store.claim_observation_processing_job(tenant_id, observation_id, job_id)
-    await store.mark_observation_processing_succeeded(
+    await store.commit_observation_processing(
         tenant_id,
         observation_id,
         job_id,
         attempt=second.job.attempt,
+        output=ObservationProcessingOutput(
+            events=(),
+            entities=(),
+            entity_mentions=(),
+            claims=(),
+            memories=(),
+            relations=(),
+            embeddings=(),
+        ),
     )
 
     with pytest.raises(MemoryIntegrityError, match="attempt was superseded"):

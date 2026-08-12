@@ -971,7 +971,6 @@ cloud-models = [
 [package.dev-dependencies]
 dev = [
     { name = "boto3-stubs", extra = ["s3"] },
-    { name = "httpx2" },
     { name = "mypy" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
@@ -1012,7 +1011,6 @@ provides-extras = ["cloud-models"]
 [package.metadata.requires-dev]
 dev = [
     { name = "boto3-stubs", extras = ["s3"], specifier = ">=1.40,<2" },
-    { name = "httpx2", specifier = ">=2,<3" },
     { name = "mypy", specifier = ">=1.15,<3" },
     { name = "pytest", specifier = ">=8,<10" },
     { name = "pytest-asyncio", specifier = ">=0.24,<2" },

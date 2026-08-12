@@ -58,7 +58,6 @@ torch = { index = "pytorch-cu128" }
 [dependency-groups]
 dev = [
     "boto3-stubs[s3]>=1.40,<2",
-    "httpx2>=2,<3",
     "mypy>=1.15,<3",
     "pytest>=8,<10",
     "pytest-asyncio>=0.24,<2",

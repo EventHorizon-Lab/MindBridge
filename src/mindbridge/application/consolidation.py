@@ -91,15 +91,6 @@ class EpisodeConsolidationResult:
     next_cursor: EventId | None
 
 
-class EpisodeCandidateStore(Protocol):
-    """Persistence boundary for one stable consolidation candidate page."""
-
-    async def list_episode_candidates(
-        self,
-        request: EpisodeCandidateRequest,
-    ) -> EpisodeCandidatePage: ...
-
-
 class EpisodeConsolidator(Protocol):
     """Frozen Omni boundary that verifies candidate events against original evidence."""
 
@@ -110,8 +101,13 @@ class EpisodeConsolidator(Protocol):
     ) -> EpisodeConsolidation: ...
 
 
-class EpisodeConsolidationStore(EpisodeCandidateStore, EvidenceReader, Protocol):
+class EpisodeConsolidationStore(EvidenceReader, Protocol):
     """Narrow transactional boundary needed by the Episode use case."""
+
+    async def list_episode_candidates(
+        self,
+        request: EpisodeCandidateRequest,
+    ) -> EpisodeCandidatePage: ...
 
     async def commit_episode_consolidation(
         self,

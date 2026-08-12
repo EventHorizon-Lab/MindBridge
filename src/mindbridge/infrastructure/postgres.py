@@ -67,7 +67,6 @@ from mindbridge.infrastructure._postgres_forget import (
 from mindbridge.infrastructure._postgres_jobs import (
     claim_observation_processing_job,
     mark_observation_processing_failed,
-    mark_observation_processing_succeeded,
     read_observation_processing_job,
 )
 from mindbridge.infrastructure._postgres_lifecycle import (
@@ -449,19 +448,6 @@ class PostgresMemoryStore:
     ) -> ObservationJobClaim:
         """Claim one ready job or report its current durable state."""
         return await claim_observation_processing_job(self._pool, tenant_id, observation_id, job_id)
-
-    async def mark_observation_processing_succeeded(
-        self,
-        tenant_id: TenantId,
-        observation_id: ObservationId,
-        job_id: JobId,
-        *,
-        attempt: int,
-    ) -> ObservationProcessingJob:
-        """Commit successful observation processing state."""
-        return await mark_observation_processing_succeeded(
-            self._pool, tenant_id, observation_id, job_id, attempt=attempt
-        )
 
     async def mark_observation_processing_failed(
         self,

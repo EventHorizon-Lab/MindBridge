@@ -34,29 +34,6 @@ def media_object(*, tenant_id: str = "tenant_01", uri: str | None = None) -> Med
     )
 
 
-async def test_presigned_upload_binds_type_checksum_and_expiration() -> None:
-    """A caller cannot alter signed integrity headers without invalidating the URL."""
-    access = S3MediaAccess(
-        "memory",
-        endpoint_url="https://objects.example.test",
-        url_lifetime_seconds=60,
-        clock=lambda: NOW,
-    )
-
-    upload = await access.create_presigned_upload(media_object(), content_type="video/mp4")
-    query = parse_qs(urlsplit(upload.upload_url).query)
-
-    assert upload.expires_at.isoformat() == "2026-08-11T12:01:00+00:00"
-    assert upload.required_headers == {
-        "Content-Type": "video/mp4",
-        "x-amz-checksum-sha256": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
-    }
-    assert query["X-Amz-Expires"] == ["60"]
-    assert "content-type" in query["X-Amz-SignedHeaders"][0]
-    assert "x-amz-checksum-sha256" in query["X-Amz-SignedHeaders"][0]
-    assert query["X-Amz-Signature"][0]
-
-
 async def test_presigned_download_rejects_cross_tenant_location() -> None:
     """A valid media identifier cannot be used to sign another tenant's key."""
     access = S3MediaAccess(

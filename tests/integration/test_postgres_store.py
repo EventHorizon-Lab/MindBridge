@@ -12,6 +12,7 @@ from psycopg import AsyncConnection
 from mindbridge.application import (
     GeneratedAnswer,
     MemoryKernel,
+    ObservationProcessingOutput,
     PresignedMediaDownload,
     RecallEmbeddingQuery,
     ResolvedEvidence,
@@ -517,8 +518,20 @@ async def test_observation_job_state_is_atomic_and_retryable(
             attempt=1,
             error_code="stale_attempt",
         )
-    succeeded = await store.mark_observation_processing_succeeded(
-        tenant_id, observation_id, job_id, attempt=2
+    succeeded = await store.commit_observation_processing(
+        tenant_id,
+        observation_id,
+        job_id,
+        attempt=2,
+        output=ObservationProcessingOutput(
+            events=(),
+            entities=(),
+            entity_mentions=(),
+            claims=(),
+            memories=(),
+            relations=(),
+            embeddings=(),
+        ),
     )
     duplicate = await store.claim_observation_processing_job(tenant_id, observation_id, job_id)
 
