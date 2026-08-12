@@ -10,7 +10,7 @@ from urllib.parse import quote, urlsplit
 
 import boto3
 from botocore.config import Config
-from botocore.exceptions import BotoCoreError
+from botocore.exceptions import BotoCoreError, ClientError
 
 from mindbridge.application.ports import PresignedMediaDownload
 from mindbridge.core import MediaObject, ObjectStorageError
@@ -83,7 +83,7 @@ class S3MediaAccess:
                 Bucket=self._bucket,
                 Key=object_key,
             )
-        except BotoCoreError as error:
+        except (BotoCoreError, ClientError) as error:
             raise ObjectStorageError("could not delete S3 evidence media") from error
 
     async def _presign(
@@ -100,7 +100,7 @@ class S3MediaAccess:
                 ExpiresIn=self._url_lifetime_seconds,
                 HttpMethod=http_method,
             )
-        except BotoCoreError as error:
+        except (BotoCoreError, ClientError) as error:
             raise ObjectStorageError(f"could not sign S3 {http_method} request") from error
 
     def _tenant_object_key(self, media_object: MediaObject) -> str:

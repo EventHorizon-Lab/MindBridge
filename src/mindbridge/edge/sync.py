@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING
 import boto3
 from boto3.exceptions import S3UploadFailedError
 from botocore.config import Config
-from botocore.exceptions import BotoCoreError
+from botocore.exceptions import BotoCoreError, ClientError
 
 from mindbridge.contracts import (
     DeletionListRequest,
@@ -76,7 +76,7 @@ class S3EdgeMediaUploader:
             await asyncio.to_thread(self._upload_verified, media, media_file, object_key)
         except ObjectStorageError:
             raise
-        except (BotoCoreError, S3UploadFailedError, OSError) as error:
+        except (BotoCoreError, ClientError, S3UploadFailedError, OSError) as error:
             raise ObjectStorageError("could not upload edge evidence media") from error
 
     def _upload_verified(

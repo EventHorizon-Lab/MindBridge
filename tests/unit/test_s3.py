@@ -4,8 +4,9 @@ from datetime import datetime, timezone
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
+from botocore.exceptions import ClientError
 
-from mindbridge.core import MediaKind, MediaObject, MediaObjectId, TenantId
+from mindbridge.core import MediaKind, MediaObject, MediaObjectId, ObjectStorageError, TenantId
 from mindbridge.infrastructure.s3 import InvalidMediaLocationError, S3MediaAccess
 
 NOW = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
@@ -64,3 +65,18 @@ async def test_presigned_download_uses_get_and_configured_bucket() -> None:
     )
     assert download.expires_at.isoformat() == "2026-08-11T12:02:00+00:00"
     assert query["X-Amz-Expires"] == ["120"]
+
+
+async def test_delete_normalizes_s3_service_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    access = S3MediaAccess("memory", endpoint_url="https://objects.example.test")
+
+    def deny_delete(**_kwargs: object) -> None:
+        raise ClientError(
+            {"Error": {"Code": "AccessDenied", "Message": "provider detail"}},
+            "DeleteObject",
+        )
+
+    monkeypatch.setattr(access._client, "delete_object", deny_delete)
+
+    with pytest.raises(ObjectStorageError, match="could not delete S3 evidence media"):
+        await access.delete_media(media_object())
