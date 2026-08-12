@@ -14,6 +14,7 @@ from mindbridge.edge.outbox import (
     EdgeSyncWatermark,
     SQLiteObservationOutbox,
 )
+from mindbridge.edge.recent_memory import SQLiteRecentMemory
 from mindbridge.edge.sync import EdgeObservationSynchronizer, S3EdgeMediaUploader
 
 __all__ = [
@@ -28,5 +29,6 @@ __all__ = [
     "SQLiteDeletionInbox",
     "SQLiteIdentityMemory",
     "SQLiteObservationOutbox",
+    "SQLiteRecentMemory",
     "enqueue_captured_video",
 ]

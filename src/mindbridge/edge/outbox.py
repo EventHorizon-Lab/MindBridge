@@ -21,6 +21,7 @@ from mindbridge.core import (
     derive_stable_id,
 )
 from mindbridge.edge.deletion_inbox import initialize_deletion_tables
+from mindbridge.edge.recent_memory import initialize_recent_memory_tables
 
 _SCHEMA_VERSION = 3
 
@@ -357,8 +358,8 @@ class SQLiteObservationOutbox:
 
     def pending_processing_jobs(self, *, limit: int = 100) -> tuple[EdgeProcessingJob, ...]:
         """Return a bounded oldest-first snapshot of acknowledged cloud work."""
-        if not 1 <= limit <= 100:
-            raise ValueError("edge processing job limit must be 1..100")
+        if limit <= 0:
+            raise ValueError("edge processing job limit must be positive")
         with self._connect() as connection:
             rows = connection.execute(
                 """
@@ -449,17 +450,10 @@ class SQLiteObservationOutbox:
                     PRIMARY KEY (tenant_id, device_id, boot_id)
                 );
 
-                CREATE TABLE IF NOT EXISTS edge_processing_jobs (
-                    tenant_id TEXT NOT NULL,
-                    observation_id TEXT NOT NULL,
-                    processing_job_id TEXT NOT NULL,
-                    queued_at TEXT NOT NULL,
-                    PRIMARY KEY (tenant_id, processing_job_id),
-                    UNIQUE (tenant_id, observation_id)
-                );
                 """
             )
             initialize_deletion_tables(connection)
+            initialize_recent_memory_tables(connection)
             self._backfill_observation_media(connection)
             connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
         os.chmod(self._database_path, 0o600)

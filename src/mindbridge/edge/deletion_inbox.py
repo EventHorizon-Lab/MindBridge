@@ -11,6 +11,7 @@ from pathlib import Path
 from mindbridge.contracts import DeletionPage, DeletionTombstoneView, ObserveRequest
 from mindbridge.core import ForgetTargetType, MemoryIntegrityError, derive_observation_id
 from mindbridge.edge.identity_schema import initialize_identity_tables
+from mindbridge.edge.recent_memory import initialize_recent_memory_tables
 
 
 class SQLiteDeletionInbox:
@@ -30,6 +31,7 @@ class SQLiteDeletionInbox:
         with self._connect() as connection:
             initialize_deletion_tables(connection)
             initialize_identity_tables(connection)
+            initialize_recent_memory_tables(connection)
         os.chmod(database_path, 0o600)
 
     def apply_page(self, tenant_id: str, page: DeletionPage) -> int:
@@ -71,6 +73,8 @@ class SQLiteDeletionInbox:
                 UNION SELECT tenant_id FROM edge_observation_media
                 UNION SELECT tenant_id FROM edge_deletion_cursors
                 UNION SELECT tenant_id FROM edge_identity_templates
+                UNION SELECT tenant_id FROM edge_processing_jobs
+                UNION SELECT tenant_id FROM edge_recent_memories
                 ORDER BY tenant_id
                 """
             ).fetchall()
@@ -86,6 +90,14 @@ class SQLiteDeletionInbox:
         self._require_consistent_identity(connection, tenant_id, tombstone)
         if tombstone.target_type is ForgetTargetType.OBSERVATION:
             self._erase_observation(connection, tenant_id, tombstone.target_id)
+        else:
+            connection.execute(
+                """
+                DELETE FROM edge_recent_memories
+                WHERE tenant_id = ? AND memory_id = ?
+                """,
+                (tenant_id, tombstone.target_id),
+            )
         try:
             connection.execute(
                 """
@@ -170,6 +182,20 @@ class SQLiteDeletionInbox:
         connection.execute(
             """
             DELETE FROM edge_identity_templates
+            WHERE tenant_id = ? AND source_observation_id = ?
+            """,
+            (tenant_id, observation_id),
+        )
+        connection.execute(
+            """
+            DELETE FROM edge_processing_jobs
+            WHERE tenant_id = ? AND observation_id = ?
+            """,
+            (tenant_id, observation_id),
+        )
+        connection.execute(
+            """
+            DELETE FROM edge_recent_memories
             WHERE tenant_id = ? AND source_observation_id = ?
             """,
             (tenant_id, observation_id),

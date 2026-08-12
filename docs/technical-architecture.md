@@ -219,9 +219,9 @@ Timeline / Person
 SQLite 只保存继续采集和近期召回必需的信息：
 
 - 媒体滚动缓存的 manifest 和校验和；
-- 待同步 Observation/Event Outbox；
+- 待同步 Observation Outbox 与已确认但尚未完成的云端 processing job；
 - 设备域人脸和声纹 prototype；
-- 近期 Event、可选本地向量及其过期时间；
+- 云端确认的近期 Event/Claim MemoryResult、本地 Evidence 引用、可选本地向量及可配置过期时间；
 - 云端确认的同步 watermark 和删除 tombstone。
 
 ## 5. 写入与记忆构建
