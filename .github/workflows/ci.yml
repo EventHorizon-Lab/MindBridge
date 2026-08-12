@@ -48,7 +48,7 @@ jobs:
           enable-cache: true
 
       - name: Install locked dependencies
-        run: uv sync --frozen --all-groups
+        run: uv sync --frozen --all-groups --extra edge --extra server
 
       - name: Check formatting
         run: uv run --frozen ruff format --check .

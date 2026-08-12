@@ -13,7 +13,16 @@ MindBridge supports Python 3.10 and 3.11. Python 3.10 is kept as the compatibili
 Install the project and development tools with [uv](https://docs.astral.sh/uv/):
 
 ```bash
-uv sync --all-groups
+uv sync --all-groups --extra edge --extra server
+```
+
+Deployment installs only the process it runs:
+
+```bash
+uv sync                                      # Core types and Python SDK
+uv sync --extra edge                         # Jetson / robot host
+uv sync --extra server                       # API, MCP, PostgreSQL jobs
+uv sync --extra server --extra cloud-models  # GPU memory Worker
 ```
 
 Run the required local quality gates:
@@ -308,7 +317,7 @@ export OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318
 export OTEL_TRACES_SAMPLER=parentbased_traceidratio
 export OTEL_TRACES_SAMPLER_ARG=0.1
 
-uv run uvicorn mindbridge.api:create_production_app --factory
+uv run --extra server uvicorn mindbridge.api:create_production_app --factory
 ```
 
 OpenTelemetry is activated only when a standard common or signal-specific OTLP endpoint is set;
@@ -325,7 +334,7 @@ Agents can start the same production kernel over the official MCP stdio transpor
 structured output schemas are generated from the same Pydantic contracts used by REST and Python:
 
 ```bash
-uv run mindbridge-mcp
+uv run --extra server mindbridge-mcp
 ```
 
 The stable tools are `memory_observe`, `memory_remember`, `memory_recall`, `memory_get`,
@@ -401,7 +410,8 @@ Text Small endpoint. Set `MINDBRIDGE_JINA_DEVICE` only when automatic device sel
 export MINDBRIDGE_VLM_MODEL_REVISION=deployment-2026-08-11
 export MINDBRIDGE_JINA_DEVICE=cuda
 
-uv run --extra cloud-models celery -A mindbridge.celery_app:app worker --loglevel=INFO
+uv run --extra server --extra cloud-models \
+  celery -A mindbridge.celery_app:app worker --loglevel=INFO
 ```
 
 One prefork child is the safe default because each child owns a full embedding model. Scale with one
@@ -413,7 +423,7 @@ It reuses the database, object-storage, VLM, Text Small, and shared embedding-sp
 no task broker or local Jina Omni model is required:
 
 ```bash
-uv run mindbridge-consolidate --tenant-id tenant_01
+uv run --extra server mindbridge-consolidate --tenant-id tenant_01
 ```
 
 Each sweep fixes one `evaluated_at`, scans bounded candidate pages, and lets the Omni/VLM inspect
@@ -431,7 +441,7 @@ Run automatic decay as a tenant-scoped scheduled job. A complete run uses stable
 one fixed evaluation instant; concurrent feedback or deletion wins through optimistic guards:
 
 ```bash
-uv run mindbridge-lifecycle --tenant-id tenant_01
+uv run --extra server mindbridge-lifecycle --tenant-id tenant_01
 ```
 
 Schedule this command with the deployment's existing CronJob/systemd/Celery beat control plane.
@@ -510,7 +520,7 @@ Drain a bounded batch with the standard Boto3 credential chain and the typed Min
 
 ```bash
 export MINDBRIDGE_API_KEY=replace-with-a-runtime-secret
-uv run python -m mindbridge.edge.sync_cli \
+uv run --extra edge python -m mindbridge.edge.sync_cli \
   --database /var/lib/mindbridge/edge.db \
   --api-base-url https://memory.example.com \
   --bucket mindbridge-media \

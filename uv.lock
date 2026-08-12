@@ -936,11 +936,34 @@ name = "mindbridge"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "httpx" },
+    { name = "pydantic" },
+]
+
+[package.optional-dependencies]
+cloud-models = [
+    { name = "av" },
+    { name = "librosa" },
+    { name = "opentelemetry-api" },
+    { name = "pillow" },
+    { name = "sentence-transformers" },
+    { name = "soundfile" },
+    { name = "torch" },
+    { name = "transformers" },
+]
+edge = [
+    { name = "boto3" },
+    { name = "cryptography" },
+    { name = "opentelemetry-api" },
+    { name = "opentelemetry-exporter-otlp-proto-http" },
+    { name = "opentelemetry-instrumentation-botocore" },
+    { name = "opentelemetry-instrumentation-httpx" },
+    { name = "opentelemetry-sdk" },
+]
+server = [
     { name = "boto3" },
     { name = "celery", extra = ["redis"] },
-    { name = "cryptography" },
     { name = "fastapi" },
-    { name = "httpx" },
     { name = "mcp" },
     { name = "openai" },
     { name = "opentelemetry-api" },
@@ -953,19 +976,7 @@ dependencies = [
     { name = "opentelemetry-sdk" },
     { name = "pgvector" },
     { name = "psycopg", extra = ["binary", "pool"] },
-    { name = "pydantic" },
     { name = "uvicorn" },
-]
-
-[package.optional-dependencies]
-cloud-models = [
-    { name = "av" },
-    { name = "librosa" },
-    { name = "pillow" },
-    { name = "sentence-transformers" },
-    { name = "soundfile" },
-    { name = "torch" },
-    { name = "transformers" },
 ]
 
 [package.dev-dependencies]
@@ -980,33 +991,40 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "av", marker = "extra == 'cloud-models'", specifier = ">=16,<17" },
-    { name = "boto3", specifier = ">=1.40,<2" },
-    { name = "celery", extras = ["redis"], specifier = ">=5.6,<6" },
-    { name = "cryptography", specifier = ">=45,<51" },
-    { name = "fastapi", specifier = ">=0.116,<1" },
+    { name = "boto3", marker = "extra == 'edge'", specifier = ">=1.40,<2" },
+    { name = "boto3", marker = "extra == 'server'", specifier = ">=1.40,<2" },
+    { name = "celery", extras = ["redis"], marker = "extra == 'server'", specifier = ">=5.6,<6" },
+    { name = "cryptography", marker = "extra == 'edge'", specifier = ">=45,<51" },
+    { name = "fastapi", marker = "extra == 'server'", specifier = ">=0.116,<1" },
     { name = "httpx", specifier = ">=0.28,<1" },
     { name = "librosa", marker = "extra == 'cloud-models'", specifier = ">=0.11,<1" },
-    { name = "mcp", specifier = ">=2,<3" },
-    { name = "openai", specifier = ">=2,<3" },
-    { name = "opentelemetry-api", specifier = ">=1.44,<2" },
-    { name = "opentelemetry-exporter-otlp-proto-http", specifier = ">=1.44,<2" },
-    { name = "opentelemetry-instrumentation-botocore", specifier = ">=0.65b0,<1" },
-    { name = "opentelemetry-instrumentation-celery", specifier = ">=0.65b0,<1" },
-    { name = "opentelemetry-instrumentation-fastapi", specifier = ">=0.65b0,<1" },
-    { name = "opentelemetry-instrumentation-httpx", specifier = ">=0.65b0,<1" },
-    { name = "opentelemetry-instrumentation-psycopg", specifier = ">=0.65b0,<1" },
-    { name = "opentelemetry-sdk", specifier = ">=1.44,<2" },
-    { name = "pgvector", specifier = ">=0.4,<1" },
+    { name = "mcp", marker = "extra == 'server'", specifier = ">=2,<3" },
+    { name = "openai", marker = "extra == 'server'", specifier = ">=2,<3" },
+    { name = "opentelemetry-api", marker = "extra == 'cloud-models'", specifier = ">=1.44,<2" },
+    { name = "opentelemetry-api", marker = "extra == 'edge'", specifier = ">=1.44,<2" },
+    { name = "opentelemetry-api", marker = "extra == 'server'", specifier = ">=1.44,<2" },
+    { name = "opentelemetry-exporter-otlp-proto-http", marker = "extra == 'edge'", specifier = ">=1.44,<2" },
+    { name = "opentelemetry-exporter-otlp-proto-http", marker = "extra == 'server'", specifier = ">=1.44,<2" },
+    { name = "opentelemetry-instrumentation-botocore", marker = "extra == 'edge'", specifier = ">=0.65b0,<1" },
+    { name = "opentelemetry-instrumentation-botocore", marker = "extra == 'server'", specifier = ">=0.65b0,<1" },
+    { name = "opentelemetry-instrumentation-celery", marker = "extra == 'server'", specifier = ">=0.65b0,<1" },
+    { name = "opentelemetry-instrumentation-fastapi", marker = "extra == 'server'", specifier = ">=0.65b0,<1" },
+    { name = "opentelemetry-instrumentation-httpx", marker = "extra == 'edge'", specifier = ">=0.65b0,<1" },
+    { name = "opentelemetry-instrumentation-httpx", marker = "extra == 'server'", specifier = ">=0.65b0,<1" },
+    { name = "opentelemetry-instrumentation-psycopg", marker = "extra == 'server'", specifier = ">=0.65b0,<1" },
+    { name = "opentelemetry-sdk", marker = "extra == 'edge'", specifier = ">=1.44,<2" },
+    { name = "opentelemetry-sdk", marker = "extra == 'server'", specifier = ">=1.44,<2" },
+    { name = "pgvector", marker = "extra == 'server'", specifier = ">=0.4,<1" },
     { name = "pillow", marker = "extra == 'cloud-models'", specifier = ">=12,<13" },
-    { name = "psycopg", extras = ["binary", "pool"], specifier = ">=3.2,<4" },
+    { name = "psycopg", extras = ["binary", "pool"], marker = "extra == 'server'", specifier = ">=3.2,<4" },
     { name = "pydantic", specifier = ">=2.10,<3" },
     { name = "sentence-transformers", marker = "extra == 'cloud-models'", specifier = ">=5.2,<6" },
     { name = "soundfile", marker = "extra == 'cloud-models'", specifier = ">=0.13,<1" },
     { name = "torch", marker = "extra == 'cloud-models'", specifier = "==2.9.1", index = "https://download.pytorch.org/whl/cu128" },
     { name = "transformers", marker = "extra == 'cloud-models'", specifier = ">=5.1,<6" },
-    { name = "uvicorn", specifier = ">=0.35,<1" },
+    { name = "uvicorn", marker = "extra == 'server'", specifier = ">=0.35,<1" },
 ]
-provides-extras = ["cloud-models"]
+provides-extras = ["edge", "server", "cloud-models"]
 
 [package.metadata.requires-dev]
 dev = [
