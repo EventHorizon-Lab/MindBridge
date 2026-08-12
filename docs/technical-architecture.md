@@ -1170,9 +1170,10 @@ EgoLifeQA runner 将官方 `DAYn/HHMMSSFF` 映射到单调时间轴，其中 `FF
 
 SuperMemory-VQA runner 以 participant 为隔离单元，将各 session 的 Unix 起点和局部 segment
 时间合成绝对时间。问题截止点按官方协议取 `question_evidence` span 的结束；同时兼容 release 中
-6 条旧版单 `time_span` 记录。视频/音频通过 `observe`，官方因隐私只发布而不提供原始音频的
-对齐 transcript 通过生产 `remember` 接口写入；答案标签、choice type 和 answer evidence 均不
-进入 API 请求。回答模型返回四个候选项的完整排序，生产 abstention 映射到数据集显式的
+6 条旧版单 `time_span` 记录。prepared media 必须在每个所选问题的结束点切段，runner 在写入前
+拒绝缺失边界的 manifest，从而包含当前视觉且不读到未来。视频/音频通过 `observe`，官方因隐私
+只发布而不提供原始音频的对齐 transcript 通过生产 `remember` 接口写入；答案标签、choice type
+和 answer evidence 均不进入 API 请求。回答模型返回四个候选项的完整排序，生产 abstention 映射到数据集显式的
 “This question can not be answered.” 选项，输出计算 Ans-F1、QA-Acc 与 QA-MRR。
 
 所有 runner 强制接收 `run_id`，并将其写入 tenant ID 与 sidecar manifest。每次运行使用新的

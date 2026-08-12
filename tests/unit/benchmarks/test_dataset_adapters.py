@@ -211,6 +211,7 @@ def test_supermemory_adapter_supports_current_and_legacy_question_end_times(
 
     assert questions[0].question_ended_at.timestamp() == 1_773_180_904
     assert questions[1].question_ended_at.timestamp() == 1_773_185_722
+    assert questions[0].question_video_id == "Person_1_session_8"
     assert questions[0].unanswerable_option_index == 0
     assert "SECRET ANSWER EVIDENCE" not in questions[0].model_dump_json()
 

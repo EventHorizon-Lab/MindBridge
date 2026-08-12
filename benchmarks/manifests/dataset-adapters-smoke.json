@@ -1,5 +1,5 @@
 {
-  "created_at": "2026-08-12T07:29:41.738425Z",
+  "created_at": "2026-08-12T07:33:56.016090Z",
   "datasets": [
     {
       "benchmark": "LoCoMo",
@@ -51,7 +51,7 @@
       "source_revision": "1d228e0f10049a8a84c458dded2aa25b1e21ce8f",
       "source_file": "all_qa.json",
       "source_sha256": "fbb3f234d8ce79e5cfbe31482d735038035ee13f59a6468a3f3a078c2aa15663",
-      "adapter_version": "supermemory_vqa_official_v2",
+      "adapter_version": "supermemory_vqa_official_v3",
       "context_count": 10,
       "memory_item_count": 83,
       "question_count": 4853

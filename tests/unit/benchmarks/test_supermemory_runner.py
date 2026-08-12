@@ -89,7 +89,7 @@ class RecordingMemoryApi:
         )
 
 
-async def test_supermemory_withholds_crossing_segment_and_ingests_released_transcript() -> None:
+async def test_supermemory_ingests_through_question_boundary_without_future_segment() -> None:
     api = RecordingMemoryApi()
 
     result = await run_supermemory_vqa(
@@ -104,6 +104,8 @@ async def test_supermemory_withholds_crossing_segment_and_ingests_released_trans
         "observe:0",
         "job:job_0",
         "remember:B said the mug was in the sink.",
+        "observe:1",
+        "job:job_1",
         "recall",
     ]
     assert result[0].ranked_option_indices == (2, 0, 3, 1)
@@ -126,6 +128,29 @@ async def test_supermemory_maps_production_abstention_to_explicit_choice() -> No
 
     assert result[0].predicted_option_index == 0
     assert result[0].ranked_option_indices == (0,)
+
+
+async def test_supermemory_rejects_missing_question_boundary_before_api_calls() -> None:
+    api = RecordingMemoryApi()
+
+    with pytest.raises(ValueError, match="question boundary"):
+        await run_supermemory_vqa(
+            cast(AsyncMindBridge, api),
+            (_question(1, question_ended_at=ORIGIN + timedelta(seconds=45)),),
+            SuperMemoryPreparedSubject(
+                subject=1,
+                videos=(
+                    _video(
+                        "Person_1_session_1",
+                        ORIGIN,
+                        (_segment(0, "media_0"), _segment(30, "media_1")),
+                    ),
+                ),
+            ),
+            run_id="run_03",
+        )
+
+    assert api.calls == []
 
 
 def test_supermemory_metrics_use_answerability_and_full_ranking() -> None:
@@ -183,6 +208,7 @@ def _question(
         is_answerable=is_answerable,
         skill="object_location_memory",
         source_video_ids=("Person_1_session_1",),
+        question_video_id="Person_1_session_1",
         question_ended_at=question_ended_at,
     )
 
@@ -196,7 +222,8 @@ def _prepared_subject() -> SuperMemoryPreparedSubject:
                 ORIGIN,
                 (
                     _segment(0, "media_0", transcript="B said the mug was in the sink."),
-                    _segment(30, "media_1"),
+                    _segment(30, "media_1", duration_ms=15_000),
+                    _segment(45, "media_2"),
                 ),
             ),
         ),
@@ -219,11 +246,12 @@ def _segment(
     start_seconds: float,
     media_id: str,
     *,
+    duration_ms: int = 30_000,
     transcript: str | None = None,
 ) -> SuperMemoryPreparedSegment:
     return SuperMemoryPreparedSegment(
         start_seconds=start_seconds,
-        duration_ms=30_000,
+        duration_ms=duration_ms,
         media_objects=(
             MediaObjectInput(
                 media_object_id=media_id,
@@ -232,7 +260,7 @@ def _segment(
                 sha256="a" * 64,
                 size_bytes=1_024,
                 created_at=ORIGIN,
-                duration_ms=30_000,
+                duration_ms=duration_ms,
             ),
         ),
         transcript=transcript,

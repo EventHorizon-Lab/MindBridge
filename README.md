@@ -261,8 +261,9 @@ SuperMemory-VQA runs one participant per invocation. Each prepared video records
 start and chronological segments. `media_objects` are sent to `observe`; an optional aligned
 `transcript` is sent to `remember` because the public release intentionally withholds raw audio.
 Either field may be omitted, but every segment must contain at least one. Following the official
-protocol, only segments that end no later than the question span's end are ingested. The output
-reports Ans-F1, QA-Acc, and QA-MRR and contains no ground-truth fields:
+protocol, prepared media must split at every selected question span's end; the runner rejects a
+missing boundary before ingestion. It then includes that completed segment and no later media. The
+output reports Ans-F1, QA-Acc, and QA-MRR and contains no ground-truth fields:
 
 ```json
 {

@@ -174,6 +174,16 @@ async def run_supermemory_vqa(
         raise ValueError("recall_limit and request_concurrency must be positive")
     if poll_interval_seconds <= 0 or processing_timeout_seconds <= 0:
         raise ValueError("poll interval and processing timeout must be positive")
+    segment_ends = {
+        (video.video_id, _segment_bounds(video, segment)[1])
+        for video in prepared.videos
+        for segment in video.segments
+    }
+    if any(
+        (question.question_video_id, question.question_ended_at) not in segment_ends
+        for question in questions
+    ):
+        raise ValueError("SuperMemory-VQA prepared segments must end at every question boundary")
     tenant_id = benchmark_tenant_id(tenant_prefix, str(prepared.subject), run_id)
     segments = sorted(
         (
