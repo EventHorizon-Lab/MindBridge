@@ -55,6 +55,8 @@ from mindbridge.telemetry import configure_telemetry
 _MODEL_REQUEST_TIMEOUT_SECONDS = 780.0
 _RUNNING_RETRY_SECONDS = 30
 _RUNNING_MAX_RETRIES = 40
+_TRANSIENT_MAX_RETRIES = 5
+_RUNNING_RETRIES_HEADER = "mindbridge_running_retries"
 
 
 @worker_process_init.connect(weak=False)  # type: ignore[untyped-decorator]
@@ -63,8 +65,22 @@ def _configure_worker_telemetry(**_kwargs: object) -> None:
     configure_telemetry("mindbridge-worker")
 
 
+class _TaskRequest(Protocol):
+    retries: int
+    headers: Mapping[str, object] | None
+
+
 class _RetryingTask(Protocol):
-    def retry(self, *, countdown: int, max_retries: int) -> NoReturn: ...
+    request: _TaskRequest
+    override_max_retries: int
+
+    def retry(
+        self,
+        *,
+        countdown: int,
+        max_retries: int,
+        headers: Mapping[str, object],
+    ) -> NoReturn: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -176,7 +192,7 @@ def create_worker_app(settings: WorkerSettings) -> Celery:
             ObjectStorageError,
             SoftTimeLimitExceeded,
         ),
-        max_retries=5,
+        max_retries=_TRANSIENT_MAX_RETRIES,
         retry_backoff=True,
         retry_backoff_max=300,
         retry_jitter=True,
@@ -187,15 +203,31 @@ def create_worker_app(settings: WorkerSettings) -> Celery:
         task: _RetryingTask,
         message: ObservationProcessingTaskMessage,
     ) -> str:
+        running_retries = _running_retries(task)
+        task.override_max_retries = running_retries + _TRANSIENT_MAX_RETRIES
         state = run_observation_processing(settings, message)
         if state is JobState.RUNNING:
+            headers = dict(task.request.headers or {})
+            headers[_RUNNING_RETRIES_HEADER] = running_retries + 1
             task.retry(
                 countdown=_RUNNING_RETRY_SECONDS,
-                max_retries=_RUNNING_MAX_RETRIES,
+                max_retries=(task.request.retries - running_retries + _RUNNING_MAX_RETRIES),
+                headers=headers,
             )
         return str(state.value)
 
     return task_queue
+
+
+def _running_retries(task: _RetryingTask) -> int:
+    value = (task.request.headers or {}).get(_RUNNING_RETRIES_HEADER, 0)
+    if (
+        type(value) is not int
+        or not 0 <= value <= _RUNNING_MAX_RETRIES
+        or value > task.request.retries
+    ):
+        raise ValueError("invalid running retry metadata")
+    return value
 
 
 def run_observation_processing(

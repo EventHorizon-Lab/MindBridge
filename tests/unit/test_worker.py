@@ -64,6 +64,7 @@ def test_worker_task_calls_shared_use_case_with_ids_only(
     assert app.conf.worker_concurrency == 1
     assert app.conf.worker_pool == "prefork"
     assert DatabaseUnavailableError in task.autoretry_for
+    assert task.max_retries == 5
 
 
 def test_worker_retries_an_observation_owned_by_another_delivery(
@@ -83,7 +84,40 @@ def test_worker_retries_an_observation_owned_by_another_delivery(
     with pytest.raises(Retry, match="still running"):
         task.run(_task_message())
 
-    retry.assert_called_once_with(countdown=30, max_retries=40)
+    retry.assert_called_once_with(
+        countdown=30,
+        max_retries=40,
+        headers={"mindbridge_running_retries": 1},
+    )
+
+
+def test_worker_preserves_transient_retry_after_running_waits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Claim polling must not exhaust the task's later transient-failure budget."""
+
+    def run(*_arguments: object) -> JobState:
+        raise DatabaseUnavailableError("database unavailable")
+
+    monkeypatch.setattr(worker_module, "run_observation_processing", run)
+    app = create_worker_app(WorkerSettings.from_environment(_environment()))
+    task = cast(Task, app.tasks[PROCESS_OBSERVATION_TASK])
+    message = _task_message()
+
+    task.push_request(
+        id="delivery_01",
+        retries=40,
+        headers={"mindbridge_running_retries": 40},
+        called_directly=False,
+        is_eager=True,
+        args=(message,),
+        kwargs={},
+    )
+    try:
+        with pytest.raises(Retry):
+            task.run(message)
+    finally:
+        task.pop_request()
 
 
 def test_worker_rejects_invalid_task_identity() -> None:
