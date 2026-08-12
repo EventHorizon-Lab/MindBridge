@@ -195,6 +195,7 @@ class OpenAIOmniClaimConsolidator:
         set_current_span_attributes(
             {
                 "mindbridge.model.id": self._model_id,
+                "mindbridge.model.revision": self._model_revision,
                 "mindbridge.prompt.version": CONSOLIDATE_CLAIMS_PROMPT_VERSION,
                 "mindbridge.claim.count": len(candidates),
                 "mindbridge.evidence.count": len(evidence),

@@ -172,6 +172,7 @@ class OpenAIOmniSummaryConsolidator:
         set_current_span_attributes(
             {
                 "mindbridge.model.id": self._model_id,
+                "mindbridge.model.revision": self._model_revision,
                 "mindbridge.prompt.version": CONSOLIDATE_SUMMARIES_PROMPT_VERSION,
                 "mindbridge.memory.count": len(candidates),
                 "mindbridge.evidence.count": len(evidence),

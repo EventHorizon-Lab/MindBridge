@@ -158,6 +158,7 @@ class OpenAIOmniEpisodeConsolidator:
         set_current_span_attributes(
             {
                 "mindbridge.model.id": self._model_id,
+                "mindbridge.model.revision": self._model_revision,
                 "mindbridge.prompt.version": CONSOLIDATE_EPISODES_PROMPT_VERSION,
                 "mindbridge.event.count": len(events),
                 "mindbridge.evidence.count": len(evidence),

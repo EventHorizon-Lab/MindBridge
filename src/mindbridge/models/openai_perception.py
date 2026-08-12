@@ -223,6 +223,7 @@ class OpenAIOmniEventPerceiver:
         set_current_span_attributes(
             {
                 "mindbridge.model.id": self._model_id,
+                "mindbridge.model.revision": self._model_revision,
                 "mindbridge.prompt.version": PERCEIVE_EVENTS_PROMPT_VERSION,
                 "mindbridge.evidence.count": len(evidence),
             }
