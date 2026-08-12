@@ -822,6 +822,33 @@ async def test_recall_records_access_and_reactivates_cold_memory() -> None:
     assert result.memories[0].state is MemoryState.ACTIVE
 
 
+async def test_recall_answers_and_records_access_only_for_returned_memories() -> None:
+    """Hidden fusion candidates cannot support an unverifiable answer or lifecycle signal."""
+    store = InMemoryStore()
+    answerer = RecordingAnswerer()
+    kernel = _kernel(store, answerer)
+    hidden = await kernel.remember(_remember_request(idempotency_key="hidden"))
+    visible = await kernel.remember(
+        _remember_request(idempotency_key="visible").model_copy(
+            update={"occurred_at": NOW + timedelta(seconds=1)}
+        )
+    )
+
+    result = await kernel.recall(
+        RecallRequest(
+            tenant_id="tenant_01",
+            query=RecallQuery(text="red screwdriver"),
+            limit=1,
+        )
+    )
+
+    assert [memory.memory_id for memory in result.memories] == [visible.memory_id]
+    assert [memory.memory_id for memory in answerer.last_memories] == [visible.memory_id]
+    assert (
+        await store.read_memory(TenantId("tenant_01"), MemoryId(hidden.memory_id))
+    ).useful_access_count == 0
+
+
 async def test_recall_abstains_from_unverified_derived_summary() -> None:
     """Unsupported derived content remains searchable but cannot ground an answer."""
     store = InMemoryStore()

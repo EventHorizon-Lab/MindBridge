@@ -134,15 +134,15 @@ class RecallMemories:
             query_media,
             limit=candidate_limit,
         )
-        memories = await self._store.record_memory_accesses(
+        visible_candidates = memories[: request.limit]
+        visible_memories = await self._store.record_memory_accesses(
             TenantId(request.tenant_id),
-            tuple(memory.memory_id for memory in memories),
+            tuple(memory.memory_id for memory in visible_candidates),
             accessed_at=self._clock(),
         )
-        visible_memories = memories[: request.limit]
         answer_memories = tuple(
             memory
-            for memory in memories
+            for memory in visible_memories
             if memory.evidence_ids or memory.verification_status is VerificationStatus.ATTESTED
         )
         should_answer = bool(answer_memories) and request.mode is not RecallMode.SEARCH
