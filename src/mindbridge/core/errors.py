@@ -41,6 +41,10 @@ class ModelUnavailableError(RuntimeError):
     """Raised when a configured frozen model cannot be loaded or called."""
 
 
+class ModelRequestError(RuntimeError):
+    """Raised when retrying an unchanged model request cannot succeed."""
+
+
 class ModelOutputError(RuntimeError):
     """Raised when model output violates its declared contract."""
 

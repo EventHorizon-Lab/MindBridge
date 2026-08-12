@@ -905,6 +905,8 @@ Schema 变更必须向后兼容或带显式迁移；不得在 Worker 和 API 不
 1. 使用有意义的领域错误，例如 `EvidenceNotFound`、`ModelUnavailable`、`MemoryAlreadyDeleted`；不向上抛出含供应商细节的裸异常。
 2. 不吞异常、不用空 `except`、不以 `None` 同时表达“未找到”和“处理失败”。
 3. 仅对幂等且瞬时失败的 I/O 重试；使用有上限的指数退避和 jitter。
+   OpenAI SDK 连接错误及 408、409、429、5xx 归一为可重试 `ModelUnavailable`；其余 SDK
+   请求错误归一为不可重试且脱敏的 `ModelRequestError`。
 4. 每次外部调用必须有 timeout；批处理必须有并发上限、取消和部分失败语义。
 5. 数据写入先确定事务边界；媒体、数据库和任务状态无法原子提交时使用可恢复状态，而不是假装原子。
 6. `forget`、身份模板、同步 watermark 等数据安全路径必须优先保证正确性，不能以“代码更短”为由删除校验。

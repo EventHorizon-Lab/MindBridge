@@ -39,6 +39,7 @@ from mindbridge.core import (
     MemoryState,
     MemoryType,
     ModelOutputError,
+    ModelRequestError,
     ModelUnavailableError,
     ObjectStorageError,
     TaskBrokerError,
@@ -367,6 +368,7 @@ def test_openapi_exposes_stable_operation_ids() -> None:
     ("error", "expected_status", "expected_code"),
     [
         (ModelUnavailableError("provider detail"), 503, "model_unavailable"),
+        (ModelRequestError("provider detail"), 502, "model_request_failed"),
         (ModelOutputError("raw output"), 502, "model_output_invalid"),
         (ObjectStorageError("bucket detail"), 503, "object_storage_unavailable"),
         (TaskBrokerError("redis detail"), 503, "task_broker_unavailable"),

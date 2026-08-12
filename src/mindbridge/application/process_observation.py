@@ -31,6 +31,7 @@ from mindbridge.core import (
     JobState,
     MemoryIntegrityError,
     ModelOutputError,
+    ModelRequestError,
     ModelUnavailableError,
     ObjectStorageError,
     Observation,
@@ -243,6 +244,8 @@ def _processing_error_code(error: Exception) -> str:
         return "model_unavailable"
     if isinstance(error, ModelOutputError):
         return "model_output_invalid"
+    if isinstance(error, ModelRequestError):
+        return "model_request_failed"
     if isinstance(error, ObjectStorageError):
         return "object_storage_unavailable"
     if isinstance(error, MemoryIntegrityError):

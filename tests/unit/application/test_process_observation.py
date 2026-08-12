@@ -36,6 +36,7 @@ from mindbridge.core import (
     MediaObjectId,
     MemoryId,
     ModelReference,
+    ModelRequestError,
     ModelUnavailableError,
     Observation,
     ObservationId,
@@ -312,21 +313,31 @@ def test_event_perception_rejects_an_unbounded_detail_fanout() -> None:
         )
 
 
-async def test_processor_records_sanitized_failure_state() -> None:
-    """A retryable model outage leaves a durable error category, never provider details."""
+@pytest.mark.parametrize(
+    ("error", "error_code"),
+    [
+        (ModelUnavailableError("secret provider detail"), "model_unavailable"),
+        (ModelRequestError("secret provider detail"), "model_request_failed"),
+    ],
+)
+async def test_processor_records_sanitized_failure_state(
+    error: RuntimeError,
+    error_code: str,
+) -> None:
+    """A model failure leaves a durable category, never provider details."""
     store = RecordingProcessingStore()
     processor = _processor(
         store,
-        RecordingPerceiver(ModelUnavailableError("secret provider detail")),
+        RecordingPerceiver(error),
         RecordingEmbedder(),
         RecordingTextEmbedder(),
     )
 
-    with pytest.raises(ModelUnavailableError, match="secret provider detail"):
+    with pytest.raises(type(error), match="secret provider detail"):
         await processor.run(TENANT_ID, OBSERVATION_ID, JOB_ID)
 
     assert store.job.state is JobState.FAILED
-    assert store.job.error_code == "model_unavailable"
+    assert store.job.error_code == error_code
 
 
 def _processor(

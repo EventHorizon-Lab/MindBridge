@@ -14,7 +14,6 @@ from mindbridge.core import (
     EmbeddingSpaceReference,
     ModelOutputError,
     ModelReference,
-    ModelUnavailableError,
 )
 from mindbridge.models.jina import (
     DEFAULT_JINA_OMNI_DIMENSION,
@@ -23,6 +22,7 @@ from mindbridge.models.jina import (
     DEFAULT_JINA_TEXT_REVISION,
     validate_jina_embedding,
 )
+from mindbridge.models.openai_errors import raise_openai_model_error
 from mindbridge.models.openai_media import OpenAIContentPart, vllm_media_url_content_part
 from mindbridge.models.openai_omni import (
     DEFAULT_VIDEO_FRAMES_PER_SECOND,
@@ -129,7 +129,7 @@ class OpenAIJinaTextEmbedder:
                 timeout=self._request_timeout_seconds,
             )
         except openai.APIError as error:
-            raise ModelUnavailableError("Jina embedding request failed") from error
+            raise_openai_model_error(error, "Jina embedding request failed")
         return _embedding_vectors(
             response,
             self._model_reference,
@@ -277,7 +277,7 @@ class OpenAIJinaEmbedder:
                     timeout=self._request_timeout_seconds,
                 )
         except openai.APIError as error:
-            raise ModelUnavailableError("Jina embedding request failed") from error
+            raise_openai_model_error(error, "Jina embedding request failed")
 
         return _embedding_vectors(
             response,

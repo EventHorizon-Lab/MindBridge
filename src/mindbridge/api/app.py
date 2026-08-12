@@ -45,6 +45,7 @@ from mindbridge.core import (
     MemoryIntegrityError,
     MemoryNotFoundError,
     ModelOutputError,
+    ModelRequestError,
     ModelUnavailableError,
     ObjectStorageError,
     TaskBrokerError,
@@ -313,15 +314,26 @@ def _register_runtime_error_handlers(app: FastAPI) -> None:
             message="memory model is unavailable",
         )
 
+    @app.exception_handler(ModelRequestError)
     @app.exception_handler(ModelOutputError)
-    async def handle_model_output_error(
+    async def handle_model_protocol_error(
         _request: Request,
-        _error: ModelOutputError,
+        error: ModelOutputError | ModelRequestError,
     ) -> JSONResponse:
+        code, message = {
+            ModelOutputError: (
+                "model_output_invalid",
+                "memory model returned invalid output",
+            ),
+            ModelRequestError: (
+                "model_request_failed",
+                "memory model rejected its configured request",
+            ),
+        }[type(error)]
         return _error_response(
             status.HTTP_502_BAD_GATEWAY,
-            code="model_output_invalid",
-            message="memory model returned invalid output",
+            code=code,
+            message=message,
         )
 
     @app.exception_handler(ObjectStorageError)

@@ -17,6 +17,8 @@ from mindbridge.core import (
     MediaObjectId,
     ModelOutputError,
     ModelReference,
+    ModelRequestError,
+    ModelUnavailableError,
     TenantId,
 )
 from mindbridge.models.openai_embeddings import OpenAIJinaEmbedder, OpenAIJinaTextEmbedder
@@ -158,6 +160,34 @@ async def test_invalid_embedding_output_is_rejected(
     embedder = _embedder(respond)
     try:
         with pytest.raises(ModelOutputError, match=match):
+            await embedder.encode_query(RecallEmbeddingQuery(text="find it", media=()))
+    finally:
+        await embedder.close()
+
+
+@pytest.mark.parametrize(
+    ("status_code", "error_type"),
+    [
+        (400, ModelRequestError),
+        (408, ModelUnavailableError),
+        (409, ModelUnavailableError),
+        (429, ModelUnavailableError),
+        (500, ModelUnavailableError),
+    ],
+)
+async def test_only_transient_provider_failures_are_retryable(
+    status_code: int,
+    error_type: type[RuntimeError],
+) -> None:
+    async def respond(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            status_code,
+            json={"error": {"message": "provider detail", "type": "request_error"}},
+        )
+
+    embedder = _embedder(respond)
+    try:
+        with pytest.raises(error_type, match="Jina embedding request failed"):
             await embedder.encode_query(RecallEmbeddingQuery(text="find it", media=()))
     finally:
         await embedder.close()

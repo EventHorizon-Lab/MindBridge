@@ -8,7 +8,8 @@ import openai
 from openai import AsyncOpenAI
 from openai.types.chat import ChatCompletionMessageParam
 
-from mindbridge.core import ModelOutputError, ModelUnavailableError
+from mindbridge.core import ModelOutputError
+from mindbridge.models.openai_errors import raise_openai_model_error
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,7 +52,7 @@ async def stream_text_completion(
                     parts.append(choice.delta.content)
                 finish_reason = finish_reason or choice.finish_reason
     except openai.APIError as error:
-        raise ModelUnavailableError("Omni model request failed") from error
+        raise_openai_model_error(error, "Omni model request failed")
 
     if finish_reason in {"length", "content_filter"}:
         raise ModelOutputError(f"Omni model ended with finish reason {finish_reason}")
