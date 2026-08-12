@@ -115,8 +115,10 @@ async def test_multimodal_query_preserves_native_av_parts() -> None:
             "text",
             "image_url",
             "video_url",
-            "input_audio",
+            "audio_url",
         }
+        audio = next(item for item in content if item["type"] == "audio_url")
+        assert cast(dict[str, str], audio["audio_url"])["url"].endswith("/media_audio")
         return _embedding_response()
 
     embedder = _embedder(respond)

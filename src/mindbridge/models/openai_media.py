@@ -42,7 +42,12 @@ class AudioPart(TypedDict):
     input_audio: AudioValue
 
 
-OpenAIContentPart = TextPart | ImagePart | VideoPart | AudioPart
+class AudioUrlPart(TypedDict):
+    type: Literal["audio_url"]
+    audio_url: UrlValue
+
+
+OpenAIContentPart = TextPart | ImagePart | VideoPart | AudioPart | AudioUrlPart
 
 
 def evidence_media_content_parts(
@@ -78,7 +83,7 @@ def media_content_part(
     video_max_pixels: int,
 ) -> ImagePart | VideoPart | AudioPart:
     """Convert openable evidence to the provider's native AV content shape."""
-    return media_url_content_part(
+    return qwen_media_url_content_part(
         evidence.media_object.kind,
         evidence.media_url,
         source_uri=evidence.media_object.uri,
@@ -87,7 +92,7 @@ def media_content_part(
     )
 
 
-def media_url_content_part(
+def qwen_media_url_content_part(
     media_kind: MediaKind,
     media_url: str,
     *,
@@ -95,7 +100,7 @@ def media_url_content_part(
     video_frames_per_second: float,
     video_max_pixels: int,
 ) -> ImagePart | VideoPart | AudioPart:
-    """Build one native AV part from a validated short-lived media URL."""
+    """Build one Qwen AV part from a validated short-lived media URL."""
     if media_kind is MediaKind.IMAGE:
         return {"type": "image_url", "image_url": {"url": media_url}}
     if media_kind is MediaKind.VIDEO:
@@ -113,3 +118,23 @@ def media_url_content_part(
             "format": suffix.removeprefix(".").lower() or "wav",
         },
     }
+
+
+def vllm_media_url_content_part(
+    media_kind: MediaKind,
+    media_url: str,
+    *,
+    source_uri: str,
+    video_frames_per_second: float,
+    video_max_pixels: int,
+) -> OpenAIContentPart:
+    """Build one vLLM pooling content part without Qwen's audio extension."""
+    if media_kind is MediaKind.AUDIO:
+        return {"type": "audio_url", "audio_url": {"url": media_url}}
+    return qwen_media_url_content_part(
+        media_kind,
+        media_url,
+        source_uri=source_uri,
+        video_frames_per_second=video_frames_per_second,
+        video_max_pixels=video_max_pixels,
+    )

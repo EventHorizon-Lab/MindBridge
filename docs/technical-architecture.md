@@ -777,6 +777,10 @@ client = AsyncOpenAI(api_key=api_key, base_url=base_url)
 
 供应商差异收敛到模型名、`base_url` 和必要请求字段；不为每个供应商新增一套 HTTP client。仅当服务不兼容且没有官方 SDK 时，才允许一个局部、可删除的薄适配器。
 
+音频内容块保留服务端的真实兼容契约：Qwen Chat 使用 URL 型 `input_audio`，vLLM 多模态
+Embedding 使用 `audio_url`。两者共享 OpenAI SDK 和图像/视频构造，但不把这两个不同的音频
+schema 伪装成一个通用格式。
+
 ## 11. 工程实现规范（强制）
 
 本章不是风格建议，而是代码进入主分支的 Definition of Done。MindBridge 的工程目标是：一个首次接触模块的工程师能够从名称、类型和测试理解行为，而不必先解读框架、隐式状态和历史包袱。

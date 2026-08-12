@@ -23,7 +23,7 @@ from mindbridge.models.jina import (
     DEFAULT_JINA_TEXT_REVISION,
     validate_jina_embedding,
 )
-from mindbridge.models.openai_media import OpenAIContentPart, media_url_content_part
+from mindbridge.models.openai_media import OpenAIContentPart, vllm_media_url_content_part
 from mindbridge.models.openai_omni import (
     DEFAULT_VIDEO_FRAMES_PER_SECOND,
     DEFAULT_VIDEO_MAX_PIXELS,
@@ -304,7 +304,7 @@ class OpenAIJinaEmbedder:
             {"type": "text", "text": _query_prompt(query.text or "")}
         ]
         content.extend(
-            media_url_content_part(
+            vllm_media_url_content_part(
                 item.media_object.kind,
                 item.media_url,
                 source_uri=item.media_object.uri,

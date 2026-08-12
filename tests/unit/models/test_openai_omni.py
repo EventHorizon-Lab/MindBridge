@@ -39,6 +39,7 @@ async def test_omni_streams_raw_av_and_validates_answer() -> None:
         messages = cast(list[dict[str, object]], payload["messages"])
         user_content = cast(list[dict[str, object]], messages[1]["content"])
         video = next(item for item in user_content if item["type"] == "video_url")
+        audio = next(item for item in user_content if item["type"] == "input_audio")
 
         assert request.url.path == "/api/v1/chat/completions"
         assert request.headers["authorization"] == "Bearer unit-test-key"
@@ -53,6 +54,10 @@ async def test_omni_streams_raw_av_and_validates_answer() -> None:
         assert cast(dict[str, str], video["video_url"])["url"].endswith("media_video")
         assert video["fps"] == 1.0
         assert video["max_pixels"] == 200_704
+        assert cast(dict[str, str], audio["input_audio"]) == {
+            "data": "https://objects.example.test/media_audio",
+            "format": "wav",
+        }
         assert '"start_ms":1000' in cast(str, user_content[0]["text"])
         return httpx.Response(
             200,

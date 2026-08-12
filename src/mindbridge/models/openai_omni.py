@@ -25,7 +25,7 @@ from mindbridge.models.openai_chat import stream_text_completion
 from mindbridge.models.openai_media import (
     OpenAIContentPart,
     evidence_media_content_parts,
-    media_url_content_part,
+    qwen_media_url_content_part,
 )
 from mindbridge.telemetry import set_current_span_attributes, trace_operation
 
@@ -289,7 +289,7 @@ def _messages(
             {"type": "text", "text": f"Query media_object_id={media_object_id} follows."}
         )
         content.append(
-            media_url_content_part(
+            qwen_media_url_content_part(
                 query_item.media_object.kind,
                 query_item.media_url,
                 source_uri=query_item.media_object.uri,
