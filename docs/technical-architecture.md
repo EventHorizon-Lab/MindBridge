@@ -662,6 +662,9 @@ MindBridge 对外只暴露少量稳定语义：
 | 显式遗忘某段内容或范围 | `forget(...)` | `POST /v1/forget` | `memory_forget` |
 
 HTTP、Python 和 MCP 共享同一层 use case，不各自复制业务逻辑。
+顶层 `remember` 与 `get_memory` 返回扁平的 `MemoryResult`：它保留 `MemoryView` 字段、请求
+`trace_id`，并直接附带短期签名的 `EvidenceView`；Recall 内嵌的记忆仍使用不重复 Trace 和 URL 的
+`MemoryView`。
 
 ### 9.2 `recall` 最小请求
 

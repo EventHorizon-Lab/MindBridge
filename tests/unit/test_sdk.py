@@ -146,6 +146,16 @@ async def test_get_memory_uses_tenant_scoped_route() -> None:
                 "created_at": "2026-08-11T12:00:00Z",
                 "verification_status": "attested",
                 "state": "active",
+                "evidence": [
+                    {
+                        "evidence_id": "evidence_01",
+                        "media_object_id": "media_01",
+                        "start_ms": 0,
+                        "end_ms": 4_000,
+                        "media_url": "https://objects.example.test/media_01",
+                        "media_url_expires_at": "2026-08-11T12:05:00Z",
+                    }
+                ],
                 "trace_id": "trace_memory",
             },
         )
@@ -157,6 +167,7 @@ async def test_get_memory_uses_tenant_scoped_route() -> None:
         await client.close()
 
     assert memory.memory_id == "memory_01"
+    assert memory.evidence[0].evidence_id == "evidence_01"
     assert memory.trace_id == "trace_memory"
 
 

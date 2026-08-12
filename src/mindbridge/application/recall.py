@@ -378,10 +378,17 @@ def memory_view(memory: MemoryRecord) -> MemoryView:
     )
 
 
-def memory_result(memory: MemoryRecord) -> MemoryResult:
-    """Add the active request trace to one top-level memory response."""
+def memory_result(
+    memory: MemoryRecord,
+    evidence: tuple[ResolvedEvidence, ...] = (),
+) -> MemoryResult:
+    """Expose one top-level memory with its inspectable evidence and request trace."""
     return MemoryResult.model_validate(
-        memory_view(memory).model_dump() | {"trace_id": current_trace_id()}
+        memory_view(memory).model_dump()
+        | {
+            "evidence": tuple(evidence_view(item) for item in evidence),
+            "trace_id": current_trace_id(),
+        }
     )
 
 

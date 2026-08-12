@@ -684,6 +684,7 @@ async def test_observe_remember_recall_returns_openable_evidence() -> None:
     await kernel.observe(_observe_request())
     evidence_id = next(iter(store.evidence))
     memory = await kernel.remember(_remember_request(evidence_ids=(evidence_id,)))
+    fetched = await kernel.get_memory("tenant_01", memory.memory_id)
 
     result = await kernel.recall(
         RecallRequest(
@@ -693,6 +694,8 @@ async def test_observe_remember_recall_returns_openable_evidence() -> None:
     )
 
     assert memory.verification_status is VerificationStatus.ATTESTED
+    assert memory.evidence[0].evidence_id == evidence_id
+    assert fetched.evidence == memory.evidence
     assert result.answer == "The robot put the red screwdriver beside the blue toolbox."
     assert result.evidence[0].evidence_id == evidence_id
     assert result.evidence[0].end_ms == 4_000

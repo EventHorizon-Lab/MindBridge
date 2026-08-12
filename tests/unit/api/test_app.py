@@ -258,6 +258,7 @@ def test_memory_routes_are_tenant_scoped_and_traced() -> None:
     assert created.json()["trace_id"] == "trace_remember"
     assert found.status_code == 200
     assert found.json()["memory_id"] == "memory_01"
+    assert found.json()["evidence"] == []
     assert found.json()["trace_id"] == "trace_get_memory"
     assert missing.status_code == 404
     assert missing.json()["code"] == "memory_not_found"

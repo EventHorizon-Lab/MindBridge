@@ -436,6 +436,55 @@
     "name": "memory_get",
     "outputSchema": {
       "$defs": {
+        "EvidenceView": {
+          "additionalProperties": false,
+          "description": "Precise evidence location safe to expose to a caller.",
+          "properties": {
+            "end_ms": {
+              "minimum": 0,
+              "title": "End Ms",
+              "type": "integer"
+            },
+            "evidence_id": {
+              "maxLength": 255,
+              "minLength": 1,
+              "title": "Evidence Id",
+              "type": "string"
+            },
+            "media_object_id": {
+              "maxLength": 255,
+              "minLength": 1,
+              "title": "Media Object Id",
+              "type": "string"
+            },
+            "media_url": {
+              "maxLength": 2048,
+              "minLength": 1,
+              "title": "Media Url",
+              "type": "string"
+            },
+            "media_url_expires_at": {
+              "format": "date-time",
+              "title": "Media Url Expires At",
+              "type": "string"
+            },
+            "start_ms": {
+              "minimum": 0,
+              "title": "Start Ms",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "evidence_id",
+            "media_object_id",
+            "start_ms",
+            "end_ms",
+            "media_url",
+            "media_url_expires_at"
+          ],
+          "title": "EvidenceView",
+          "type": "object"
+        },
         "MemoryState": {
           "description": "Retained states; explicit deletion is represented by a tombstone.",
           "enum": [
@@ -472,7 +521,7 @@
         }
       },
       "additionalProperties": false,
-      "description": "Top-level memory response with its request trace identity.",
+      "description": "Top-level memory response with directly inspectable evidence.",
       "properties": {
         "created_at": {
           "format": "date-time",
@@ -483,6 +532,14 @@
           "format": "date-time",
           "title": "Ended At",
           "type": "string"
+        },
+        "evidence": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/EvidenceView"
+          },
+          "title": "Evidence",
+          "type": "array"
         },
         "evidence_ids": {
           "items": {
@@ -1499,6 +1556,55 @@
     "name": "memory_remember",
     "outputSchema": {
       "$defs": {
+        "EvidenceView": {
+          "additionalProperties": false,
+          "description": "Precise evidence location safe to expose to a caller.",
+          "properties": {
+            "end_ms": {
+              "minimum": 0,
+              "title": "End Ms",
+              "type": "integer"
+            },
+            "evidence_id": {
+              "maxLength": 255,
+              "minLength": 1,
+              "title": "Evidence Id",
+              "type": "string"
+            },
+            "media_object_id": {
+              "maxLength": 255,
+              "minLength": 1,
+              "title": "Media Object Id",
+              "type": "string"
+            },
+            "media_url": {
+              "maxLength": 2048,
+              "minLength": 1,
+              "title": "Media Url",
+              "type": "string"
+            },
+            "media_url_expires_at": {
+              "format": "date-time",
+              "title": "Media Url Expires At",
+              "type": "string"
+            },
+            "start_ms": {
+              "minimum": 0,
+              "title": "Start Ms",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "evidence_id",
+            "media_object_id",
+            "start_ms",
+            "end_ms",
+            "media_url",
+            "media_url_expires_at"
+          ],
+          "title": "EvidenceView",
+          "type": "object"
+        },
         "MemoryState": {
           "description": "Retained states; explicit deletion is represented by a tombstone.",
           "enum": [
@@ -1535,7 +1641,7 @@
         }
       },
       "additionalProperties": false,
-      "description": "Top-level memory response with its request trace identity.",
+      "description": "Top-level memory response with directly inspectable evidence.",
       "properties": {
         "created_at": {
           "format": "date-time",
@@ -1546,6 +1652,14 @@
           "format": "date-time",
           "title": "Ended At",
           "type": "string"
+        },
+        "evidence": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/EvidenceView"
+          },
+          "title": "Evidence",
+          "type": "array"
         },
         "evidence_ids": {
           "items": {

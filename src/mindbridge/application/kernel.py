@@ -8,6 +8,7 @@ import math
 from collections.abc import Callable
 from datetime import datetime, timezone
 
+from mindbridge.application.evidence import read_resolved_memory_evidence
 from mindbridge.application.observation_processing import ObservationBatch
 from mindbridge.application.ports import (
     EmbeddingIndex,
@@ -99,6 +100,7 @@ class MemoryKernel:
         self._store = store
         self._embedding_index = embedding_index
         self._media_deleter = media_deleter
+        self._media_url_signer = media_url_signer
         self._observation_job_publisher = observation_job_publisher
         self._recall_embedder = recall_embedder
         self._clock = clock or _utc_now
@@ -182,7 +184,7 @@ class MemoryKernel:
         )
         stored_memory = result.memory
         await self._index_memory(stored_memory)
-        return memory_result(stored_memory)
+        return await self._memory_result(stored_memory)
 
     @trace_operation("mindbridge.record_feedback")
     async def record_feedback(self, request: FeedbackRequest) -> FeedbackReceipt:
@@ -357,7 +359,7 @@ class MemoryKernel:
             }
         )
         memory = await self._store.read_memory(TenantId(tenant_id), MemoryId(memory_id))
-        return memory_result(memory)
+        return await self._memory_result(memory)
 
     async def recall(self, request: RecallRequest) -> RecallResult:
         """Delegate recall to its focused application use case."""
@@ -381,6 +383,15 @@ class MemoryKernel:
             strength=original.salience,
             supersedes_memory_id=original.memory_id,
         )
+
+    async def _memory_result(self, memory: MemoryRecord) -> MemoryResult:
+        evidence = await read_resolved_memory_evidence(
+            self._store,
+            self._media_url_signer,
+            memory.tenant_id,
+            (memory,),
+        )
+        return memory_result(memory, evidence)
 
     @trace_operation("mindbridge.index_memory")
     async def _index_memory(self, memory: MemoryRecord) -> None:

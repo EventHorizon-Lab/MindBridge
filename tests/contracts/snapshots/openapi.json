@@ -635,7 +635,7 @@
       },
       "MemoryResult": {
         "additionalProperties": false,
-        "description": "Top-level memory response with its request trace identity.",
+        "description": "Top-level memory response with directly inspectable evidence.",
         "properties": {
           "created_at": {
             "format": "date-time",
@@ -646,6 +646,14 @@
             "format": "date-time",
             "title": "Ended At",
             "type": "string"
+          },
+          "evidence": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/EvidenceView"
+            },
+            "title": "Evidence",
+            "type": "array"
           },
           "evidence_ids": {
             "items": {

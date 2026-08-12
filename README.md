@@ -350,7 +350,8 @@ uv run --extra server mindbridge-mcp
 The stable tools are `memory_observe`, `memory_remember`, `memory_recall`, `memory_get`,
 `memory_feedback`, and `memory_forget`. Deploy remote MCP only behind authenticated process or
 gateway isolation; the initial command intentionally exposes stdio rather than an unauthenticated
-HTTP listener.
+HTTP listener. `memory_get` and the matching Python/REST operation return short-lived signed
+EvidenceSpan URLs with the memory, so an Agent does not need a second private storage call.
 
 Applications and Benchmark runners use the same typed REST contract through the asynchronous
 Python SDK:

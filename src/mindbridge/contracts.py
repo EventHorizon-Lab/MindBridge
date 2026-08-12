@@ -343,12 +343,6 @@ class MemoryView(ContractModel):
     superseded_at: AwareDatetime | None = None
 
 
-class MemoryResult(MemoryView):
-    """Top-level memory response with its request trace identity."""
-
-    trace_id: Identifier
-
-
 class GetMemoryRequest(ContractModel):
     """Identify one tenant-owned memory without relying on ambient tenancy."""
 
@@ -365,6 +359,13 @@ class EvidenceView(ContractModel):
     end_ms: Annotated[int, Field(ge=0)]
     media_url: NonEmptyString
     media_url_expires_at: AwareDatetime
+
+
+class MemoryResult(MemoryView):
+    """Top-level memory response with directly inspectable evidence."""
+
+    evidence: tuple[EvidenceView, ...] = ()
+    trace_id: Identifier
 
 
 class RecallResult(ContractModel):
