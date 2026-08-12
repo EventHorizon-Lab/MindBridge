@@ -1139,8 +1139,9 @@ M3-Bench 的生产 runner 沿用官方 30 秒、零起点连续切片约定。�
 manifest 同时固定标注与媒体 revision/hash、代码、感知模型与 Prompt、回答模型与 Prompt、Jina
 revision、召回参数和最终输出 hash。基准路径不使用固定 sleep、标签提示或 Benchmark 专用存储。
 
-EgoLifeQA runner 将官方 `DAYn/HHMMSSFF` 映射到单调时间轴，其中 `FF` 按 release 的百分之一秒
-处理。prepared manifest 只接受按时间排序、互不重叠且带 SHA-256/时长的 addressable 视频。
+EgoLifeQA runner 将官方 `DAYn/HHMMSSFF` 映射到单调时间轴，其中 `FF` 按 release 视频的 20 FPS
+帧计数处理；少量大于单秒帧数的非归一化标注沿用官方 frame-index 转换并进位。prepared manifest
+只接受按时间排序、互不重叠且带 SHA-256/时长的 addressable 视频。
 问题按时间排序执行；只有 `clip.end <= query_time` 的片段才依次 `observe` 并等待 Job 成功，跨越
 提问时刻的片段整体延后。召回问题仅包含原问题和四个候选项，答案按官方 A/B/C/D 精确准确率
 计算；无法从受约束输出中无歧义解析时记为未作答。

@@ -10,7 +10,8 @@ from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
 from mindbridge.contracts import ContractModel, Identifier, NonEmptyString
 
-EGOLIFE_QA_ADAPTER_VERSION = "egolife_qa_official_v1"
+EGOLIFE_QA_ADAPTER_VERSION = "egolife_qa_official_v2"
+EGOLIFE_VIDEO_FPS = 20
 EgoLifeOption = Literal["A", "B", "C", "D"]
 _DAY_PATTERN = re.compile(r"DAY([1-9][0-9]*)", re.IGNORECASE)
 _TIMECODE_PATTERN = re.compile(r"[0-9]{8}")
@@ -86,16 +87,27 @@ def _question(raw: _RawQuestion) -> EgoLifeQuestion:
 
 def _moment_offset_ms(moment: _RawMoment) -> tuple[int, int]:
     day_match = _DAY_PATTERN.fullmatch(moment.date)
-    if day_match is None or _TIMECODE_PATTERN.fullmatch(moment.time) is None:
+    if day_match is None:
         raise ValueError(f"invalid EgoLifeQA query time: {moment.date} {moment.time}")
     day = int(day_match.group(1))
-    hours, minutes, seconds, centiseconds = (
-        int(moment.time[0:2]),
-        int(moment.time[2:4]),
-        int(moment.time[4:6]),
-        int(moment.time[6:8]),
+    try:
+        offset_ms = egolife_timecode_offset_ms(day, moment.time)
+    except ValueError as error:
+        raise ValueError(f"invalid EgoLifeQA query time: {moment.date} {moment.time}") from error
+    return day, offset_ms
+
+
+def egolife_timecode_offset_ms(day: int, timecode: str) -> int:
+    """Convert the release's 20 FPS ``HHMMSSFF`` clock to milliseconds."""
+    if _TIMECODE_PATTERN.fullmatch(timecode) is None:
+        raise ValueError(f"invalid EgoLife timecode: {timecode}")
+    hours, minutes, seconds, frames = (
+        int(timecode[0:2]),
+        int(timecode[2:4]),
+        int(timecode[4:6]),
+        int(timecode[6:8]),
     )
-    if hours >= 24 or minutes >= 60 or seconds >= 60:
-        raise ValueError(f"invalid EgoLifeQA query time: {moment.date} {moment.time}")
+    if day < 1 or hours >= 24 or minutes >= 60 or seconds >= 60:
+        raise ValueError(f"invalid EgoLife timecode: {timecode}")
     seconds_since_day_one = (day - 1) * 86_400 + hours * 3_600 + minutes * 60 + seconds
-    return day, seconds_since_day_one * 1_000 + centiseconds * 10
+    return seconds_since_day_one * 1_000 + frames * 1_000 // EGOLIFE_VIDEO_FPS

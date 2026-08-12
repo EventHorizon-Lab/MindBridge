@@ -130,7 +130,7 @@ def test_egolife_metrics_use_exact_option_match() -> None:
 
 
 def _question(question_id: str, timecode: str) -> EgoLifeQuestion:
-    hours, minutes, seconds, centiseconds = map(
+    hours, minutes, seconds, frames = map(
         int,
         (timecode[0:2], timecode[2:4], timecode[4:6], timecode[6:8]),
     )
@@ -141,7 +141,7 @@ def _question(question_id: str, timecode: str) -> EgoLifeQuestion:
         correct_option="B",
         query_day=1,
         query_timecode=timecode,
-        query_offset_ms=(hours * 3_600 + minutes * 60 + seconds) * 1_000 + centiseconds * 10,
+        query_offset_ms=(hours * 3_600 + minutes * 60 + seconds) * 1_000 + frames * 50,
         question_type="EntityLog",
         needs_audio=False,
         needs_name=True,

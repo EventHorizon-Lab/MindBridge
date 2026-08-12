@@ -14,6 +14,7 @@ from mindbridge.benchmarks.egolife_qa import (
     EGOLIFE_QA_ADAPTER_VERSION,
     EgoLifeOption,
     EgoLifeQuestion,
+    egolife_timecode_offset_ms,
 )
 from mindbridge.benchmarks.runtime import (
     OPTION_LABELS,
@@ -50,7 +51,7 @@ class EgoLifePreparedClip(ContractModel):
             raise ValueError("EgoLifeQA clips must be video media objects")
         if not self.media_object.duration_ms:
             raise ValueError("EgoLifeQA clips must have a positive duration_ms")
-        _timecode_offset_ms(self.day, self.start_timecode)
+        egolife_timecode_offset_ms(self.day, self.start_timecode)
         return self
 
 
@@ -243,23 +244,9 @@ async def _answer_question(
 
 
 def _clip_start_ms(clip: EgoLifePreparedClip) -> int:
-    return _timecode_offset_ms(clip.day, clip.start_timecode)
+    return egolife_timecode_offset_ms(clip.day, clip.start_timecode)
 
 
 def _clip_end_ms(clip: EgoLifePreparedClip) -> int:
     assert clip.media_object.duration_ms is not None
     return _clip_start_ms(clip) + clip.media_object.duration_ms
-
-
-def _timecode_offset_ms(day: int, timecode: str) -> int:
-    if len(timecode) != 8 or not timecode.isdigit():
-        raise ValueError(f"invalid EgoLife timecode: {timecode}")
-    hours, minutes, seconds, centiseconds = (
-        int(timecode[0:2]),
-        int(timecode[2:4]),
-        int(timecode[4:6]),
-        int(timecode[6:8]),
-    )
-    if day < 1 or hours >= 24 or minutes >= 60 or seconds >= 60:
-        raise ValueError(f"invalid EgoLife timecode: {timecode}")
-    return ((day - 1) * 86_400 + hours * 3_600 + minutes * 60 + seconds) * 1_000 + centiseconds * 10

@@ -40,7 +40,7 @@
       "source_revision": "143fb319be7aa5ae210c936bf4f0f3a86092afb0",
       "source_file": "EgoLifeQA_A1_JAKE.json",
       "source_sha256": "688ae079f458132f13150711b7e099fbe4fdedd97f19f5a33bdebb7bfde74a52",
-      "adapter_version": "egolife_qa_official_v1",
+      "adapter_version": "egolife_qa_official_v2",
       "context_count": 1,
       "memory_item_count": 7,
       "question_count": 500

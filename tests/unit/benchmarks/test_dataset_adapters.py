@@ -118,7 +118,7 @@ def test_egolife_adapter_keeps_queries_but_discards_retrieval_hints(tmp_path: Pa
             [
                 {
                     "ID": "1",
-                    "query_time": {"date": "DAY2", "time": "11210217"},
+                    "query_time": {"date": "DAY2", "time": "11210250"},
                     "type": "EntityLog",
                     "need_audio": True,
                     "need_name": True,
@@ -140,7 +140,7 @@ def test_egolife_adapter_keeps_queries_but_discards_retrieval_hints(tmp_path: Pa
 
     question = load_egolife_qa(annotation_path)[0]
 
-    assert question.query_offset_ms == 127_262_170
+    assert question.query_offset_ms == 127_264_500
     assert question.correct_option == "B"
     assert question.choices == ("Tasha", "Alice", "Shure", "Lucia")
     assert "SECRET" not in question.model_dump_json()

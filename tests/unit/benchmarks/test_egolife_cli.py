@@ -98,7 +98,7 @@ def _question() -> EgoLifeQuestion:
         correct_option="B",
         query_day=1,
         query_timecode="11210217",
-        query_offset_ms=40_862_170,
+        query_offset_ms=40_862_850,
         question_type="EntityLog",
         needs_audio=False,
         needs_name=True,

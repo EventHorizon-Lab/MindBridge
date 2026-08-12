@@ -211,10 +211,12 @@ Use `--video-id` for a smoke subset. The JSONL uses the official `id`, `question
 pins annotation/media hashes and revisions, code, both Omni calls, Jina, Prompt versions, retrieval
 settings, and output hash.
 
-EgoLifeQA uses its official `DAYn` plus `HHMMSSFF` clock, whose final two digits are hundredths of
-a second in the released annotations. Its prepared manifest contains one subject, a `DAY1 00:00`
-timeline origin, and chronological non-overlapping video clips. A clip whose end crosses a question
-time is withheld until a later question, so no future frames or audio enter memory:
+EgoLifeQA uses its official `DAYn` plus `HHMMSSFF` clock, whose final two digits are frame counts at
+the release videos' 20 FPS. Frame counts are carried into later seconds, matching the official
+frame-index conversion and its few non-normalized annotations. Its prepared manifest contains one
+subject, a `DAY1 00:00` timeline origin, and chronological non-overlapping video clips. A clip whose
+end crosses a question time is withheld until a later question, so no future frames or audio enter
+memory:
 
 ```json
 {
