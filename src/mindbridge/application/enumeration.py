@@ -7,7 +7,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 
-from mindbridge.application.evidence import read_resolved_memory_evidence
+from mindbridge.application.evidence import read_resolved_memory_evidence, sign_query_media
 from mindbridge.application.perception import ResolvedEvidence
 from mindbridge.application.ports import (
     MediaUrlSigner,
@@ -43,7 +43,6 @@ class EnumerationResult:
 @dataclass(frozen=True, slots=True)
 class _VerifiedBatch:
     memories: tuple[MemoryRecord, ...]
-    evidence: tuple[ResolvedEvidence, ...]
 
 
 class EnumerateMemories:
@@ -102,15 +101,16 @@ class EnumerateMemories:
             tuple(memory.memory_id for memory in selected),
             accessed_at=self._clock(),
         )
-        returned_evidence_ids = {
-            evidence_id for memory in accessed for evidence_id in memory.evidence_ids
-        }
-        evidence_by_id = {
-            item.evidence_span.evidence_id: item
-            for batch in verified_batches
-            for item in batch.evidence
-            if item.evidence_span.evidence_id in returned_evidence_ids
-        }
+        evidence = (
+            await read_resolved_memory_evidence(
+                self._store,
+                self._media_url_signer,
+                TenantId(request.tenant_id),
+                accessed,
+            )
+            if request.include_evidence
+            else ()
+        )
         set_current_span_attributes(
             {
                 "mindbridge.enumeration.candidate_count": len(candidates),
@@ -120,7 +120,7 @@ class EnumerateMemories:
         )
         return EnumerationResult(
             memories=accessed,
-            evidence=tuple(evidence_by_id.values()),
+            evidence=evidence,
         )
 
     async def _verify_batches(
@@ -135,10 +135,14 @@ class EnumerateMemories:
         )
         verified: list[_VerifiedBatch] = []
         for offset in range(0, len(batches), ENUMERATION_MAX_CONCURRENCY):
+            batch_query_media = await sign_query_media(
+                tuple(item.media_object for item in query_media),
+                self._media_url_signer,
+            )
             verified.extend(
                 await asyncio.gather(
                     *(
-                        self._verify_batch(request, query_media, batch)
+                        self._verify_batch(request, batch_query_media, batch)
                         for batch in batches[offset : offset + ENUMERATION_MAX_CONCURRENCY]
                     )
                 )
@@ -168,12 +172,4 @@ class EnumerateMemories:
             raise ModelOutputError("Omni occurrence selection returned invalid memory IDs")
         selected_set = set(selected_ids)
         selected = tuple(memory for memory in memories if memory.memory_id in selected_set)
-        selected_evidence_ids = {
-            evidence_id for memory in selected for evidence_id in memory.evidence_ids
-        }
-        return _VerifiedBatch(
-            memories=selected,
-            evidence=tuple(
-                item for item in evidence if item.evidence_span.evidence_id in selected_evidence_ids
-            ),
-        )
+        return _VerifiedBatch(memories=selected)

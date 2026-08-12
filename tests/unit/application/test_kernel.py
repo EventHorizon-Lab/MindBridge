@@ -440,6 +440,27 @@ class DeterministicMediaUrlSigner:
         self.deleted_media_ids.append(media_object.media_object_id)
 
 
+class SequencedMediaUrlSigner(DeterministicMediaUrlSigner):
+    """Makes each model-stage and response signature distinguishable."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls = 0
+
+    async def create_presigned_download(
+        self,
+        media_object: MediaObject,
+    ) -> PresignedMediaDownload:
+        self.calls += 1
+        return PresignedMediaDownload(
+            download_url=(
+                f"https://objects.example.test/{media_object.media_object_id}"
+                f"?signature={self.calls}"
+            ),
+            expires_at=NOW + timedelta(minutes=5),
+        )
+
+
 class RecordingAnswerer:
     """Deterministic answerer proving when the model boundary is invoked."""
 
@@ -454,6 +475,8 @@ class RecordingAnswerer:
         self.last_query_media: tuple[ResolvedQueryMedia, ...] = ()
         self.selected_occurrence_ids = selected_occurrence_ids
         self.occurrence_batches: list[tuple[MemoryRecord, ...]] = []
+        self.occurrence_evidence: list[tuple[ResolvedEvidence, ...]] = []
+        self.occurrence_query_media: list[tuple[ResolvedQueryMedia, ...]] = []
         self.active_occurrence_calls = 0
         self.maximum_occurrence_concurrency = 0
 
@@ -480,6 +503,8 @@ class RecordingAnswerer:
         query_media: tuple[ResolvedQueryMedia, ...],
     ) -> tuple[MemoryId, ...]:
         self.occurrence_batches.append(memories)
+        self.occurrence_evidence.append(evidence)
+        self.occurrence_query_media.append(query_media)
         self.active_occurrence_calls += 1
         self.maximum_occurrence_concurrency = max(
             self.maximum_occurrence_concurrency,
@@ -1037,10 +1062,17 @@ async def test_media_query_is_signed_for_embedding_instead_of_used_as_a_filter()
     store = InMemoryStore()
     recall_embedder = RecordingRecallEmbedder()
     answerer = RecordingAnswerer()
-    kernel = _kernel(store, answerer, recall_embedder=recall_embedder)
+    signer = SequencedMediaUrlSigner()
+    kernel = _kernel(
+        store,
+        answerer,
+        recall_embedder=recall_embedder,
+        media_access=signer,
+    )
     await kernel.observe(_observe_request())
     evidence_id = next(iter(store.evidence))
     await kernel.remember(_remember_request(evidence_ids=(evidence_id,)))
+    signer.calls = 0
     store.embedding_matches = (
         EmbeddingMatch(
             embedding_id="embedding_01",
@@ -1059,8 +1091,11 @@ async def test_media_query_is_signed_for_embedding_instead_of_used_as_a_filter()
 
     resolved = recall_embedder.queries[0].media[0]
     assert resolved.media_object.kind is MediaKind.VIDEO
-    assert resolved.media_url == "https://objects.example.test/media_01"
-    assert answerer.last_query_media == (resolved,)
+    assert resolved.media_url.endswith("?signature=1")
+    assert answerer.last_evidence[0].media_url.endswith("?signature=2")
+    assert answerer.last_query_media[0].media_url.endswith("?signature=3")
+    assert result.evidence[0].media_url.endswith("?signature=4")
+    assert signer.calls == 4
     assert result.memories[0].evidence_ids == (evidence_id,)
 
 
@@ -1082,13 +1117,19 @@ async def test_media_query_rejects_unknown_tenant_object() -> None:
 
 async def test_enumerate_verifies_all_filtered_memories_in_bounded_batches() -> None:
     store = InMemoryStore()
-    await _write_attested_memories(store, 125)
+    signer = SequencedMediaUrlSigner()
     answerer = RecordingAnswerer()
+    kernel = _kernel(store, answerer, media_access=signer)
+    await kernel.observe(_observe_request())
+    await _write_attested_memories(store, 125)
 
-    result = await _kernel(store, answerer).recall(
+    result = await kernel.recall(
         RecallRequest(
             tenant_id="tenant_01",
-            query=RecallQuery(text="words absent from every summary"),
+            query=RecallQuery(
+                text="words absent from every summary",
+                media_object_ids=("media_01",),
+            ),
             mode=RecallMode.ENUMERATE,
             limit=1,
         )
@@ -1102,8 +1143,37 @@ async def test_enumerate_verifies_all_filtered_memories_in_bounded_batches() -> 
     assert len(answerer.occurrence_batches) == 8
     assert max(map(len, answerer.occurrence_batches)) == 16
     assert answerer.maximum_occurrence_concurrency == 4
+    assert signer.calls == 3
+    assert all(
+        item[0].media_url.endswith("?signature=2") for item in answerer.occurrence_query_media[:4]
+    )
+    assert all(
+        item[0].media_url.endswith("?signature=3") for item in answerer.occurrence_query_media[4:]
+    )
     assert answerer.calls == 0
     assert all(memory.useful_access_count == 1 for memory in result.memories)
+
+
+async def test_enumerate_resigns_returned_evidence_after_verification() -> None:
+    store = InMemoryStore()
+    signer = SequencedMediaUrlSigner()
+    answerer = RecordingAnswerer()
+    kernel = _kernel(store, answerer, media_access=signer)
+    await kernel.observe(_observe_request())
+    evidence_id = next(iter(store.evidence))
+    await kernel.remember(_remember_request(evidence_ids=(evidence_id,)))
+    signer.calls = 0
+
+    result = await kernel.recall(
+        RecallRequest(
+            tenant_id="tenant_01",
+            query=RecallQuery(text="red screwdriver"),
+            mode=RecallMode.ENUMERATE,
+        )
+    )
+
+    assert answerer.occurrence_evidence[0][0].media_url.endswith("?signature=1")
+    assert result.evidence[0].media_url.endswith("?signature=2")
 
 
 async def test_enumerate_rejects_model_ids_outside_the_candidate_batch() -> None:
@@ -1238,15 +1308,16 @@ def _kernel(
     *,
     job_publisher: RecordingObservationJobPublisher | None = None,
     recall_embedder: RecordingRecallEmbedder | None = None,
+    media_access: DeterministicMediaUrlSigner | None = None,
     clock: Callable[[], datetime] = lambda: NOW,
 ) -> MemoryKernel:
-    media_access = DeterministicMediaUrlSigner()
+    resolved_media_access = media_access or DeterministicMediaUrlSigner()
     return MemoryKernel(
         store,
         answerer,
         embedding_index=store,
-        media_deleter=media_access,
-        media_url_signer=media_access,
+        media_deleter=resolved_media_access,
+        media_url_signer=resolved_media_access,
         observation_job_publisher=job_publisher or RecordingObservationJobPublisher(),
         recall_embedder=recall_embedder or RecordingRecallEmbedder(),
         clock=clock,

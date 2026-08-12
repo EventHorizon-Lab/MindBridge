@@ -483,6 +483,8 @@ PostgreSQL FTS、结构化过滤、RRF 和原始视听证据重看。Event/Claim
 `supersedes`、`before` 和 `after` 的双向邻居；经 `mentions/about` 共享 Entity 的邻居，每个命中
 最多取 16 个。直接表示始终先于关系邻居排序，所有展开结果在映射为 MemoryRecord 后再次执行
 完整结构化过滤。更深的通用图遍历、专用 reranker 和多轮定向重读只按 Benchmark 失败案例加入。
+每个 Omni 回答或枚举波次使用当时新签的查询媒体 URL；模型完成后再为响应 Evidence 签名，Agent
+收到的链接不能因为模型推理耗时而已经过期。
 
 Memory 向量命中上层 Summary 时走独立的树形下钻查询：PostgreSQL 沿 MemoryRecord
 `contains` 边递归返回父节点和来源子节点，深度上限为 16，并对每个结果重新应用完整结构化过滤。

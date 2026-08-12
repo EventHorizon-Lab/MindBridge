@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from typing import Protocol
 
 from mindbridge.application.enumeration import EnumerateMemories
-from mindbridge.application.evidence import read_resolved_memory_evidence
+from mindbridge.application.evidence import read_resolved_memory_evidence, sign_query_media
 from mindbridge.application.perception import ResolvedEvidence
 from mindbridge.application.ports import (
     EmbeddingIndex,
@@ -152,17 +152,24 @@ class RecallMemories:
         evidence = (
             await self._read_evidence(request, evidence_memories) if should_read_evidence else ()
         )
+        response_evidence = evidence
         answer = None
         confidence = 0.0
         if should_answer:
+            answer_query_media = await sign_query_media(
+                tuple(item.media_object for item in query_media),
+                self._media_url_signer,
+            )
             generated = await self._answerer.answer(
                 request,
                 answer_memories,
                 evidence,
-                query_media=query_media,
+                query_media=answer_query_media,
             )
             answer = generated.answer
             confidence = generated.confidence
+            if request.include_evidence:
+                response_evidence = await self._read_evidence(request, answer_memories)
         set_current_span_attributes(
             {
                 "mindbridge.recall.candidate_count": len(memories),
@@ -181,7 +188,7 @@ class RecallMemories:
             evidence=(
                 tuple(
                     evidence_view(item)
-                    for item in evidence
+                    for item in response_evidence
                     if item.evidence_span.evidence_id in visible_evidence_ids
                 )
                 if request.include_evidence
@@ -326,19 +333,9 @@ class RecallMemories:
         media_by_id = {item.media_object_id: item for item in media_objects}
         if len(media_by_id) != len(requested_ids) or set(media_by_id) != set(requested_ids):
             raise DomainInvariantError("recall query references unknown media")
-        downloads = await asyncio.gather(
-            *(
-                self._media_url_signer.create_presigned_download(media_by_id[media_object_id])
-                for media_object_id in requested_ids
-            )
-        )
-        return tuple(
-            ResolvedQueryMedia(
-                media_object=media_by_id[media_object_id],
-                media_url=download.download_url,
-                media_url_expires_at=download.expires_at,
-            )
-            for media_object_id, download in zip(requested_ids, downloads, strict=True)
+        return await sign_query_media(
+            tuple(media_by_id[media_object_id] for media_object_id in requested_ids),
+            self._media_url_signer,
         )
 
     @trace_operation("mindbridge.recall.resolve_evidence")

@@ -9,6 +9,7 @@ from mindbridge.application.perception import ResolvedEvidence
 from mindbridge.application.ports import (
     MediaUrlSigner,
     PresignedMediaDownload,
+    ResolvedQueryMedia,
 )
 from mindbridge.core import (
     EvidenceId,
@@ -72,6 +73,24 @@ async def read_resolved_evidence(
     ):
         raise MemoryIntegrityError("evidence references missing media")
     return await resolve_evidence_media(evidence_spans, media_objects, signer)
+
+
+async def sign_query_media(
+    media_objects: tuple[MediaObject, ...],
+    signer: MediaUrlSigner,
+) -> tuple[ResolvedQueryMedia, ...]:
+    """Give one model stage fresh access to already tenant-validated query media."""
+    downloads = await asyncio.gather(
+        *(signer.create_presigned_download(media_object) for media_object in media_objects)
+    )
+    return tuple(
+        ResolvedQueryMedia(
+            media_object=media_object,
+            media_url=download.download_url,
+            media_url_expires_at=download.expires_at,
+        )
+        for media_object, download in zip(media_objects, downloads, strict=True)
+    )
 
 
 async def resolve_evidence_media(
