@@ -551,6 +551,7 @@ async def test_observation_job_state_is_atomic_and_retryable(
     assert retry.job.attempt == 2
     assert retry.job.error_code is None
     assert succeeded.state is JobState.SUCCEEDED
+    assert succeeded.memory_ids == ()
     assert duplicate.acquired is False
     assert duplicate.job.state is JobState.SUCCEEDED
 

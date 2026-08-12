@@ -719,8 +719,8 @@ HTTP、Python 和 MCP 共享同一层 use case，不各自复制业务逻辑。
 
 - 所有写接口支持 `idempotency_key`；
 - 长任务立即返回 receipt/job ID，不占用同步请求；
-- Observation 处理状态通过 `GET /v1/jobs/{job_id}?tenant_id=...` 查询，调用方在状态为
-  `succeeded` 后再发起依赖派生记忆的 Recall；
+- Observation 处理状态通过 `GET /v1/jobs/{job_id}?tenant_id=...` 查询；成功状态原子携带本次
+  生成的 `memory_ids`，调用方可直接 `get_memory` 获取证据完整的近期记忆，也可再发起 Recall；
 - 所有列表使用 cursor 分页；
 - Recall 默认返回证据，不只返回自然语言答案；
 - `forget` 是幂等操作，并能查询端云传播状态；

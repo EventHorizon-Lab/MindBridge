@@ -113,6 +113,7 @@ async def test_get_observation_job_uses_tenant_scoped_route() -> None:
                 "state": "succeeded",
                 "attempt": 1,
                 "error_code": None,
+                "memory_ids": ["memory_01"],
                 "created_at": "2026-08-11T12:00:00Z",
                 "updated_at": "2026-08-11T12:01:00Z",
                 "trace_id": "trace_job",
@@ -127,6 +128,7 @@ async def test_get_observation_job_uses_tenant_scoped_route() -> None:
 
     assert job.state.value == "succeeded"
     assert job.attempt == 1
+    assert job.memory_ids == ("memory_01",)
 
 
 async def test_get_memory_uses_tenant_scoped_route() -> None:

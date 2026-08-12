@@ -12,6 +12,7 @@ from mindbridge.core import (
     JobId,
     JobNotFoundError,
     JobState,
+    MemoryId,
     MemoryIntegrityError,
     Observation,
     ObservationId,
@@ -37,6 +38,7 @@ JobRow: TypeAlias = tuple[
     datetime,
     datetime,
     str,
+    list[str],
 ]
 
 
@@ -76,8 +78,11 @@ async def ensure_observation_processing_job(
     row = await cursor.fetchone()
     if row is None:
         raise MemoryIntegrityError("observation processing job disappeared during transaction")
-    job_type, stored_payload = cast(tuple[str, dict[str, str]], row)
-    if job_type != PROCESS_OBSERVATION_JOB_TYPE or stored_payload != payload:
+    job_type, stored_payload = cast(tuple[str, dict[str, object]], row)
+    if (
+        job_type != PROCESS_OBSERVATION_JOB_TYPE
+        or stored_payload.get("observation_id") != observation.observation_id
+    ):
         raise MemoryIntegrityError("observation processing job has conflicting identity")
     return job_id
 
@@ -106,7 +111,8 @@ async def claim_observation_processing_job(
                   )
               )
             RETURNING job_id, tenant_id, state, attempt, error_code,
-                      created_at, updated_at, payload ->> 'observation_id'
+                      created_at, updated_at, payload ->> 'observation_id',
+                      COALESCE(payload -> 'memory_ids', '[]'::jsonb)
             """,
             (
                 tenant_id,
@@ -143,6 +149,7 @@ async def mark_observation_processing_succeeded_on_connection(
     job_id: JobId,
     *,
     attempt: int,
+    memory_ids: tuple[MemoryId, ...],
 ) -> ObservationProcessingJob:
     """Complete a job inside the caller's derived-record transaction."""
     completed = await _finish_observation_processing_job_on_connection(
@@ -153,6 +160,7 @@ async def mark_observation_processing_succeeded_on_connection(
         attempt=attempt,
         state=JobState.SUCCEEDED,
         error_code=None,
+        memory_ids=memory_ids,
     )
     if completed.attempt != attempt:
         raise MemoryIntegrityError("observation processing attempt was superseded")
@@ -213,21 +221,29 @@ async def _finish_observation_processing_job_on_connection(
     attempt: int,
     state: JobState,
     error_code: str | None,
+    memory_ids: tuple[MemoryId, ...] | None = None,
 ) -> ObservationProcessingJob:
     _require_expected_job_id(observation_id, job_id)
     cursor = await connection.execute(
         """
         UPDATE jobs
-        SET state = %s, error_code = %s, updated_at = now()
+        SET state = %s, error_code = %s,
+            payload = COALESCE(
+                jsonb_set(payload, '{memory_ids}', %s::jsonb),
+                payload
+            ),
+            updated_at = now()
         WHERE tenant_id = %s AND job_id = %s
           AND state = 'running' AND attempt = %s
           AND job_type = %s AND payload ->> 'observation_id' = %s
         RETURNING job_id, tenant_id, state, attempt, error_code,
-                  created_at, updated_at, payload ->> 'observation_id'
+                  created_at, updated_at, payload ->> 'observation_id',
+                  COALESCE(payload -> 'memory_ids', '[]'::jsonb)
         """,
         (
             state.value,
             error_code,
+            Jsonb(list(memory_ids)) if memory_ids is not None else None,
             tenant_id,
             job_id,
             attempt,
@@ -266,7 +282,8 @@ async def _find_observation_processing_job(
     cursor = await connection.execute(
         """
         SELECT job_id, tenant_id, state, attempt, error_code,
-               created_at, updated_at, payload ->> 'observation_id'
+               created_at, updated_at, payload ->> 'observation_id',
+               COALESCE(payload -> 'memory_ids', '[]'::jsonb)
         FROM jobs
         WHERE tenant_id = %s AND job_id = %s AND job_type = %s
         """,
@@ -279,7 +296,17 @@ async def _find_observation_processing_job(
 
 
 def _job_from_row(row: JobRow) -> ObservationProcessingJob:
-    job_id, tenant_id, state, attempt, error_code, created_at, updated_at, observation_id = row
+    (
+        job_id,
+        tenant_id,
+        state,
+        attempt,
+        error_code,
+        created_at,
+        updated_at,
+        observation_id,
+        memory_ids,
+    ) = row
     return ObservationProcessingJob(
         job_id=JobId(job_id),
         tenant_id=TenantId(tenant_id),
@@ -289,6 +316,7 @@ def _job_from_row(row: JobRow) -> ObservationProcessingJob:
         error_code=error_code,
         created_at=created_at,
         updated_at=updated_at,
+        memory_ids=tuple(MemoryId(memory_id) for memory_id in memory_ids),
     )
 
 

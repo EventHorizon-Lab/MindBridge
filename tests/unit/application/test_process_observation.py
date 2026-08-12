@@ -34,6 +34,7 @@ from mindbridge.core import (
     MediaKind,
     MediaObject,
     MediaObjectId,
+    MemoryId,
     ModelReference,
     ModelUnavailableError,
     Observation,
@@ -87,7 +88,11 @@ class RecordingProcessingStore:
     ) -> ObservationProcessingJob:
         assert attempt == self.job.attempt
         self.output = output
-        self.job = _job(JobState.SUCCEEDED, attempt=attempt)
+        self.job = _job(
+            JobState.SUCCEEDED,
+            attempt=attempt,
+            memory_ids=tuple(memory.memory_id for memory in output.memories),
+        )
         return self.job
 
     async def mark_observation_processing_failed(
@@ -228,6 +233,7 @@ async def test_processor_builds_event_memory_and_raw_media_embedding_once() -> N
     assert perceiver.calls == 1
     assert embedder.documents == ("https://objects.example.test/clip.mp4?signature=test",)
     assert store.output is not None
+    assert first.memory_ids == tuple(memory.memory_id for memory in store.output.memories)
     assert store.output.events[0].prompt_version == "perceive_events_v1"
     assert store.output.memories[0].summary == store.output.events[0].description
     assert store.output.embeddings[0].object_type is EmbeddedObjectType.EVIDENCE_SPAN
@@ -408,6 +414,7 @@ def _job(
     *,
     attempt: int,
     error_code: str | None = None,
+    memory_ids: tuple[MemoryId, ...] = (),
 ) -> ObservationProcessingJob:
     return ObservationProcessingJob(
         job_id=JOB_ID,
@@ -418,4 +425,5 @@ def _job(
         error_code=error_code,
         created_at=NOW,
         updated_at=NOW,
+        memory_ids=memory_ids,
     )

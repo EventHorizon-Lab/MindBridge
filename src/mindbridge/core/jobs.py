@@ -8,7 +8,7 @@ from enum import Enum
 
 from mindbridge.core._validation import require_aware_datetime, require_non_empty
 from mindbridge.core.errors import DomainInvariantError
-from mindbridge.core.identifiers import JobId, ObservationId, TenantId
+from mindbridge.core.identifiers import JobId, MemoryId, ObservationId, TenantId
 
 
 class JobState(str, Enum):
@@ -32,6 +32,7 @@ class ObservationProcessingJob:
     error_code: str | None
     created_at: datetime
     updated_at: datetime
+    memory_ids: tuple[MemoryId, ...] = ()
 
     def __post_init__(self) -> None:
         require_non_empty(self.job_id, "job_id")
@@ -47,6 +48,10 @@ class ObservationProcessingJob:
             raise DomainInvariantError("job updated_at must not precede created_at")
         if (self.state is JobState.FAILED) != (self.error_code is not None):
             raise DomainInvariantError("only failed jobs must carry an error code")
+        if len(set(self.memory_ids)) != len(self.memory_ids):
+            raise DomainInvariantError("job memory IDs must be unique")
+        if self.state is not JobState.SUCCEEDED and self.memory_ids:
+            raise DomainInvariantError("only succeeded jobs may carry memory IDs")
 
 
 @dataclass(frozen=True, slots=True)

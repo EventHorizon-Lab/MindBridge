@@ -141,9 +141,18 @@ class ObservationProcessingJobView(ContractModel):
     state: JobState
     attempt: Annotated[int, Field(ge=0)]
     error_code: Identifier | None
+    memory_ids: tuple[Identifier, ...] = ()
     created_at: AwareDatetime
     updated_at: AwareDatetime
     trace_id: Identifier
+
+    @model_validator(mode="after")
+    def require_consistent_memory_ids(self) -> ObservationProcessingJobView:
+        if len(set(self.memory_ids)) != len(self.memory_ids):
+            raise ValueError("job memory_ids must be unique")
+        if self.state is not JobState.SUCCEEDED and self.memory_ids:
+            raise ValueError("only succeeded jobs may carry memory_ids")
+        return self
 
 
 class RememberRequest(ContractModel):

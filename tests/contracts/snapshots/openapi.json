@@ -967,6 +967,16 @@
             "title": "Job Id",
             "type": "string"
           },
+          "memory_ids": {
+            "default": [],
+            "items": {
+              "maxLength": 255,
+              "minLength": 1,
+              "type": "string"
+            },
+            "title": "Memory Ids",
+            "type": "array"
+          },
           "observation_id": {
             "maxLength": 255,
             "minLength": 1,

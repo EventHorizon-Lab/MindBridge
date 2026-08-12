@@ -79,6 +79,7 @@ async def commit_observation_processing(
                 observation_id,
                 job_id,
                 attempt=attempt,
+                memory_ids=tuple(memory.memory_id for memory in output.memories),
             )
     except ForeignKeyViolation as error:
         raise DomainInvariantError("derived observation references missing source data") from error

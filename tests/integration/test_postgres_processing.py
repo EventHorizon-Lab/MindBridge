@@ -349,9 +349,18 @@ async def test_processing_commits_provenance_once(
 
     first = await processor.run(tenant_id, observation_id, job_id)
     duplicate = await processor.run(tenant_id, observation_id, job_id)
+    repeated_observation = await store.write_observation(
+        await store.read_observation_batch(tenant_id, observation_id),
+        idempotency_key="observe_01",
+        content_digest=f"{101:064x}",
+    )
 
     assert first.state is JobState.SUCCEEDED
     assert duplicate.state is JobState.SUCCEEDED
+    assert len(first.memory_ids) == 2
+    assert duplicate.memory_ids == first.memory_ids
+    assert repeated_observation.created is False
+    assert repeated_observation.processing_job_id == job_id
     assert perceiver.calls == 1
     assert embedder.documents == ("https://objects.example.test/media_01.mp4",)
     assert text_embedder.documents == (

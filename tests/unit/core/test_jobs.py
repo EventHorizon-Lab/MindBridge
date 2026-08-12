@@ -8,6 +8,7 @@ from mindbridge.core import (
     DomainInvariantError,
     JobId,
     JobState,
+    MemoryId,
     ObservationId,
     ObservationProcessingJob,
     TenantId,
@@ -32,12 +33,24 @@ def test_job_timestamps_and_attempts_are_monotonic() -> None:
         _job(state=JobState.RUNNING)
 
 
+def test_only_succeeded_jobs_carry_unique_memory_results() -> None:
+    with pytest.raises(DomainInvariantError, match="only succeeded"):
+        _job(memory_ids=(MemoryId("memory_01"),))
+    with pytest.raises(DomainInvariantError, match="unique"):
+        _job(
+            state=JobState.SUCCEEDED,
+            attempt=1,
+            memory_ids=(MemoryId("memory_01"), MemoryId("memory_01")),
+        )
+
+
 def _job(
     *,
     state: JobState = JobState.PENDING,
     attempt: int = 0,
     error_code: str | None = None,
     updated_at: datetime = NOW,
+    memory_ids: tuple[MemoryId, ...] = (),
 ) -> ObservationProcessingJob:
     return ObservationProcessingJob(
         job_id=JobId("job_process_observation_01"),
@@ -48,4 +61,5 @@ def _job(
         error_code=error_code,
         created_at=NOW,
         updated_at=updated_at,
+        memory_ids=memory_ids,
     )

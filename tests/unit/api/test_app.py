@@ -155,6 +155,7 @@ class StubKernel:
             state=JobState.SUCCEEDED,
             attempt=1,
             error_code=None,
+            memory_ids=("memory_01",),
             created_at=NOW,
             updated_at=NOW,
             trace_id="trace_job",

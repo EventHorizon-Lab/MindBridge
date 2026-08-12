@@ -344,6 +344,7 @@ class MemoryKernel:
             state=job.state,
             attempt=job.attempt,
             error_code=job.error_code,
+            memory_ids=job.memory_ids,
             created_at=job.created_at,
             updated_at=job.updated_at,
             trace_id=current_trace_id(),

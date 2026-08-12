@@ -588,6 +588,7 @@ async def test_observation_job_status_is_tenant_scoped() -> None:
     assert job.observation_id == receipt.observation_id
     assert job.state is JobState.PENDING
     assert job.attempt == 0
+    assert job.memory_ids == ()
     with pytest.raises(JobNotFoundError):
         await kernel.get_observation_job("other_tenant", receipt.processing_job_id)
 
