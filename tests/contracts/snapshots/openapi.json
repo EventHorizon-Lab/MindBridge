@@ -1106,6 +1106,7 @@
             "items": {
               "$ref": "#/components/schemas/IdentityObservationInput"
             },
+            "maxItems": 256,
             "title": "Identity Observations",
             "type": "array"
           },
@@ -1113,6 +1114,7 @@
             "items": {
               "$ref": "#/components/schemas/MediaObjectInput"
             },
+            "maxItems": 8,
             "minItems": 1,
             "title": "Media Objects",
             "type": "array"
@@ -1167,6 +1169,7 @@
               "minLength": 1,
               "type": "string"
             },
+            "maxItems": 100,
             "title": "Device Ids",
             "type": "array"
           },
@@ -1175,6 +1178,7 @@
             "items": {
               "$ref": "#/components/schemas/MemoryType"
             },
+            "maxItems": 6,
             "title": "Memory Types",
             "type": "array"
           },
@@ -1209,6 +1213,7 @@
               "minLength": 1,
               "type": "string"
             },
+            "maxItems": 100,
             "title": "Person Ids",
             "type": "array"
           }
@@ -1384,6 +1389,7 @@
               "minLength": 1,
               "type": "string"
             },
+            "maxItems": 100,
             "title": "Evidence Ids",
             "type": "array"
           },

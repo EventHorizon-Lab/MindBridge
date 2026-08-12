@@ -94,12 +94,14 @@ class ObserveRequest(ContractModel):
     boot_id: Identifier
     sequence: Annotated[int, Field(ge=0)]
     sensor: SensorKind
-    media_objects: Annotated[tuple[MediaObjectInput, ...], Field(min_length=1)]
+    media_objects: Annotated[tuple[MediaObjectInput, ...], Field(min_length=1, max_length=8)]
     occurred_at: UtcDatetime
     ended_at: UtcDatetime
     observed_at: UtcDatetime
     clock_offset_ms: int = 0
-    identity_observations: tuple[IdentityObservationInput, ...] = ()
+    identity_observations: Annotated[
+        tuple[IdentityObservationInput, ...], Field(max_length=256)
+    ] = ()
     idempotency_key: Identifier | None = None
 
     @model_validator(mode="after")
@@ -175,7 +177,7 @@ class RememberRequest(ContractModel):
     memory_type: MemoryType
     occurred_at: UtcDatetime
     ended_at: UtcDatetime | None = None
-    evidence_ids: tuple[Identifier, ...] = ()
+    evidence_ids: Annotated[tuple[Identifier, ...], Field(max_length=100)] = ()
     idempotency_key: Identifier | None = None
 
     @model_validator(mode="after")
@@ -297,9 +299,9 @@ class RecallQuery(ContractModel):
 class RecallFilters(ContractModel):
     """Structured constraints applied before semantic ranking."""
 
-    person_ids: tuple[Identifier, ...] = ()
-    device_ids: tuple[Identifier, ...] = ()
-    memory_types: tuple[MemoryType, ...] = ()
+    person_ids: Annotated[tuple[Identifier, ...], Field(max_length=100)] = ()
+    device_ids: Annotated[tuple[Identifier, ...], Field(max_length=100)] = ()
+    memory_types: Annotated[tuple[MemoryType, ...], Field(max_length=len(MemoryType))] = ()
     occurred_after: UtcDatetime | None = None
     occurred_before: UtcDatetime | None = None
 

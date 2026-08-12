@@ -147,6 +147,38 @@ def test_observe_accepts_only_bounded_anonymous_identity_metadata() -> None:
         )
 
 
+def test_request_collections_reject_unbounded_fanout() -> None:
+    media = _observe_request().media_objects[0]
+    identity = IdentityObservationInput(
+        identity_id="person_device_01",
+        kind=IdentityKind.FACE,
+        start_ms=0,
+        end_ms=0,
+        confidence=0.9,
+        model_id="insightface/buffalo_l",
+        model_revision="1.0.1",
+    )
+
+    with pytest.raises(ValidationError, match="at most 8 items"):
+        _observe_request(
+            media_objects=tuple(
+                media.model_copy(update={"media_object_id": f"media_{index}"}) for index in range(9)
+            )
+        )
+    with pytest.raises(ValidationError, match="at most 256 items"):
+        _observe_request(identity_observations=(identity,) * 257)
+    with pytest.raises(ValidationError, match="at most 100 items"):
+        RememberRequest(
+            tenant_id="tenant_01",
+            summary="Remember this",
+            memory_type=MemoryType.SEMANTIC,
+            occurred_at=NOW,
+            evidence_ids=tuple(f"evidence_{index}" for index in range(101)),
+        )
+    with pytest.raises(ValidationError, match="at most 100 items"):
+        RecallFilters(person_ids=tuple(f"person_{index}" for index in range(101)))
+
+
 def _observe_request(
     *,
     observed_at: datetime = NOW,
