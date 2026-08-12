@@ -173,9 +173,7 @@ class MemoryKernel:
             occurred_at=request.occurred_at,
             ended_at=request.ended_at or request.occurred_at,
             created_at=self._clock(),
-            verification_status=(
-                VerificationStatus.VERIFIED if request.evidence_ids else VerificationStatus.ATTESTED
-            ),
+            verification_status=VerificationStatus.ATTESTED,
         )
         result = await self._store.write_memory(
             memory,

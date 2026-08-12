@@ -690,7 +690,7 @@ async def test_observe_remember_recall_returns_openable_evidence() -> None:
         )
     )
 
-    assert memory.verification_status is VerificationStatus.VERIFIED
+    assert memory.verification_status is VerificationStatus.ATTESTED
     assert result.answer == "The robot put the red screwdriver beside the blue toolbox."
     assert result.evidence[0].evidence_id == evidence_id
     assert result.evidence[0].end_ms == 4_000

@@ -259,7 +259,7 @@ async def test_postgres_vertical_path_is_idempotent_and_evidence_first(
     assert stored_batch.observation.identity_observations[0].identity_id == "person_device_01"
     assert stored_batch.observation.identity_observations[0].model_reference.revision == "1.0.1"
     assert await _processing_job_count(database_url, "tenant_roundtrip") == 1
-    assert memory.verification_status is VerificationStatus.VERIFIED
+    assert memory.verification_status is VerificationStatus.ATTESTED
     assert result.answer == "The robot put the red screwdriver beside the blue toolbox."
     assert result.evidence[0].evidence_id == evidence_id
     assert result.evidence[0].end_ms == 4_000
