@@ -12,16 +12,17 @@ def test_package_can_be_imported() -> None:
     assert mindbridge.__name__ == "mindbridge"
 
 
-def test_edge_identity_import_does_not_load_server_stack() -> None:
-    """An edge-only import must stay independent from server dependencies."""
+def test_edge_identity_import_does_not_load_network_or_server_stack() -> None:
+    """SQLite identity must stay independent from network and server adapters."""
     result = subprocess.run(
         [
             sys.executable,
             "-c",
             (
                 "import json, sys; import mindbridge.edge.identity; "
-                "server = {'celery', 'fastapi', 'mcp', 'openai', 'pgvector', 'psycopg'}; "
-                "print(json.dumps(sorted(server.intersection(sys.modules))))"
+                "excluded = {'boto3', 'botocore', 'celery', 'fastapi', 'mcp', "
+                "'openai', 'pgvector', 'psycopg'}; "
+                "print(json.dumps(sorted(excluded.intersection(sys.modules))))"
             ),
         ],
         check=True,

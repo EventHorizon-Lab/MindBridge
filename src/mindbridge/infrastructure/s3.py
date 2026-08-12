@@ -8,10 +8,6 @@ from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
 from urllib.parse import quote, urlsplit
 
-import boto3
-from botocore.config import Config
-from botocore.exceptions import BotoCoreError, ClientError
-
 from mindbridge.application.ports import PresignedMediaDownload
 from mindbridge.core import MediaObject, ObjectStorageError
 
@@ -42,6 +38,9 @@ class S3MediaAccess:
             raise ValueError("bucket must not be empty")
         if not 1 <= url_lifetime_seconds <= _MAX_URL_LIFETIME_SECONDS:
             raise ValueError("url_lifetime_seconds must be between 1 and 3600")
+        import boto3
+        from botocore.config import Config
+
         self._bucket = bucket
         self._url_lifetime_seconds = url_lifetime_seconds
         self._clock = clock or _utc_now
@@ -76,6 +75,8 @@ class S3MediaAccess:
 
     async def delete_media(self, media_object: MediaObject) -> None:
         """Delete one tenant-scoped object; repeated S3 deletes remain successful."""
+        from botocore.exceptions import BotoCoreError, ClientError
+
         object_key = self._tenant_object_key(media_object)
         try:
             await asyncio.to_thread(
@@ -92,6 +93,8 @@ class S3MediaAccess:
         parameters: dict[str, object],
         http_method: str,
     ) -> str:
+        from botocore.exceptions import BotoCoreError, ClientError
+
         try:
             return await asyncio.to_thread(
                 self._client.generate_presigned_url,
