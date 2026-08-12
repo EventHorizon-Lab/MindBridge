@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 from psycopg import AsyncConnection
-from psycopg.errors import InsufficientPrivilege
+from psycopg.errors import CheckViolation, InsufficientPrivilege
 
 from mindbridge.application.lifecycle import (
     EvolveMemoryLifecycle,
@@ -119,6 +119,27 @@ async def test_postgres_recall_access_reactivates_cold_memory_without_rewinding_
     assert first[0].useful_access_count == 1
     assert second[0].useful_access_count == 2
     assert second[0].last_accessed_at == NOW + timedelta(minutes=1)
+
+
+async def test_postgres_rejects_access_before_memory_creation(
+    store: PostgresMemoryStore,
+    database_url: str,
+) -> None:
+    tenant_id = TenantId("tenant_lifecycle_access_time")
+    memory = _memory(tenant_id, "memory_access_time", NOW)
+    await _write_memory(store, memory)
+    connection = await AsyncConnection.connect(database_url, autocommit=True)
+
+    async with connection:
+        with pytest.raises(CheckViolation):
+            await connection.execute(
+                """
+                UPDATE memory_records
+                SET last_accessed_at = created_at - interval '1 second'
+                WHERE tenant_id = %s AND memory_id = %s
+                """,
+                (tenant_id, memory.memory_id),
+            )
 
 
 async def test_postgres_runtime_role_enforces_tenant_row_security(

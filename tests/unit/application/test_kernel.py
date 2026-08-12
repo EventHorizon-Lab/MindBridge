@@ -1181,7 +1181,7 @@ def _observe_request(
 
 async def _write_attested_memories(store: InMemoryStore, count: int) -> None:
     for ordinal in reversed(range(count)):
-        occurred_at = NOW + timedelta(seconds=ordinal)
+        occurred_at = NOW - timedelta(seconds=count - ordinal)
         memory = MemoryRecord(
             memory_id=MemoryId(f"memory_{ordinal:04d}"),
             tenant_id=TenantId("tenant_01"),

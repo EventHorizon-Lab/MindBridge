@@ -115,6 +115,7 @@ async def update_memory_lifecycles(
                   AND memory.useful_access_count = %s
                   AND memory.positive_feedback_count = %s
                   AND memory.negative_feedback_count = %s
+                  AND memory.last_accessed_at IS NOT DISTINCT FROM %s
                   AND memory.superseded_at IS NULL
                   AND {MEMORY_NOT_TOMBSTONED_SQL}
                 RETURNING memory.memory_id
@@ -129,6 +130,7 @@ async def update_memory_lifecycles(
                     previous.useful_access_count,
                     previous.positive_feedback_count,
                     previous.negative_feedback_count,
+                    previous.last_accessed_at,
                 ),
             )
             updated_count += int(await cursor.fetchone() is not None)

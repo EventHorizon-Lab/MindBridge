@@ -58,9 +58,10 @@ def calculate_memory_strength(
 ) -> float:
     """Calculate one explainable score from retained counters and logarithmic age decay."""
     require_aware_datetime(evaluated_at, "evaluated_at")
-    if evaluated_at < memory.created_at:
-        raise DomainInvariantError("memory strength cannot be evaluated before creation")
-    age_days = (evaluated_at - memory.created_at).total_seconds() / 86_400
+    last_activity_at = memory.last_accessed_at or memory.created_at
+    if evaluated_at < last_activity_at:
+        raise DomainInvariantError("memory strength cannot be evaluated before its latest activity")
+    age_days = (evaluated_at - last_activity_at).total_seconds() / 86_400
     return (
         memory.salience
         + policy.access_weight * math.log1p(memory.useful_access_count)

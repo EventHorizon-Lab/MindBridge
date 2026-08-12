@@ -228,6 +228,8 @@ class MemoryRecord:
             raise DomainInvariantError("memory lifecycle counters must be non-negative")
         if self.last_accessed_at is not None:
             require_aware_datetime(self.last_accessed_at, "last_accessed_at")
+            if self.last_accessed_at < self.created_at:
+                raise DomainInvariantError("last_accessed_at must not precede created_at")
         if self.superseded_at is not None:
             require_aware_datetime(self.superseded_at, "superseded_at")
         if self.supersedes_memory_id == self.memory_id:

@@ -41,6 +41,16 @@ def test_feedback_and_access_signals_drive_explicit_lifecycle_states() -> None:
     assert calculate_memory_strength(memory, NOW + timedelta(days=365)) < memory.salience
 
 
+def test_recent_access_resets_age_decay() -> None:
+    old_memory = replace(
+        _memory(),
+        created_at=NOW - timedelta(days=365),
+        last_accessed_at=NOW,
+    )
+
+    assert calculate_memory_strength(old_memory, NOW) == old_memory.salience
+
+
 def _memory() -> MemoryRecord:
     return MemoryRecord(
         memory_id=MemoryId("memory_01"),

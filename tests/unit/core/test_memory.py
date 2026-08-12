@@ -101,6 +101,22 @@ def test_verified_memory_requires_evidence() -> None:
         )
 
 
+def test_memory_access_cannot_precede_creation() -> None:
+    with pytest.raises(DomainInvariantError, match="last_accessed_at"):
+        MemoryRecord(
+            memory_id=MemoryId("memory_01"),
+            tenant_id=TENANT_ID,
+            memory_type=MemoryType.EPISODIC,
+            summary="The screwdriver is in the toolbox.",
+            evidence_ids=(),
+            occurred_at=NOW,
+            ended_at=NOW,
+            created_at=NOW,
+            verification_status=VerificationStatus.ATTESTED,
+            last_accessed_at=NOW.replace(hour=11),
+        )
+
+
 def test_claim_rejects_reversed_validity() -> None:
     """World-valid time cannot end before it starts."""
     with pytest.raises(DomainInvariantError, match="valid_to"):

@@ -215,6 +215,7 @@ async def test_migration_installs_complete_phase_zero_schema(database_url: str) 
         9,
         10,
         11,
+        12,
     ]
 
 
