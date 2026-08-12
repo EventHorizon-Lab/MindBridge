@@ -33,6 +33,16 @@ from mindbridge.edge import (
 NOW = datetime(2026, 8, 12, 8, 0, tzinfo=timezone.utc)
 
 
+def test_deletion_inbox_requires_private_file_backed_storage(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="file-backed"):
+        SQLiteDeletionInbox(Path(":memory:"))
+
+    database_path = tmp_path / "nested" / "edge.db"
+    SQLiteDeletionInbox(database_path)
+
+    assert database_path.stat().st_mode & 0o777 == 0o600
+
+
 def test_tombstone_erasure_rolls_back_until_local_media_can_be_deleted(
     tmp_path: Path,
 ) -> None:

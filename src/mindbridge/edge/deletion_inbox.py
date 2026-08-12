@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sqlite3
 from collections.abc import Callable
 from datetime import datetime, timezone
@@ -21,11 +22,15 @@ class SQLiteDeletionInbox:
         *,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
+        if str(database_path) == ":memory:":
+            raise ValueError("edge deletion inbox must use a file-backed SQLite database")
+        database_path.parent.mkdir(parents=True, exist_ok=True)
         self._database_path = database_path
         self._clock = clock or _utc_now
         with self._connect() as connection:
             initialize_deletion_tables(connection)
             initialize_identity_tables(connection)
+        os.chmod(database_path, 0o600)
 
     def apply_page(self, tenant_id: str, page: DeletionPage) -> int:
         """Erase local targets and advance the cursor in one recoverable transaction."""
