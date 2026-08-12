@@ -687,6 +687,7 @@ HTTP、Python 和 MCP 共享同一层 use case，不各自复制业务逻辑。
 
 ```json
 {
+  "tenant_id": "tenant_...",
   "query": {
     "text": "我最后一次把红色螺丝刀放在哪里？",
     "media_object_ids": []
@@ -712,20 +713,33 @@ HTTP、Python 和 MCP 共享同一层 use case，不各自复制业务逻辑。
   "confidence": 0.91,
   "memories": [
     {
-      "id": "mem_...",
-      "type": "episodic",
-      "occurred_at": "2026-08-11T09:42:13+08:00",
+      "memory_id": "mem_...",
+      "memory_type": "episodic",
+      "occurred_at": "2026-08-11T01:42:13Z",
+      "ended_at": "2026-08-11T01:42:18Z",
+      "created_at": "2026-08-11T01:42:20Z",
       "summary": "用户将红色螺丝刀放在蓝色工具盒旁。",
-      "evidence_ids": ["evd_..."]
+      "evidence_ids": ["evd_..."],
+      "verification_status": "verified",
+      "state": "active",
+      "salience": 0.8,
+      "strength": 0.9,
+      "useful_access_count": 1,
+      "positive_feedback_count": 0,
+      "negative_feedback_count": 0,
+      "last_accessed_at": "2026-08-11T02:00:00Z",
+      "supersedes_memory_id": null,
+      "superseded_at": null
     }
   ],
   "evidence": [
     {
-      "id": "evd_...",
-      "media_id": "media_...",
+      "evidence_id": "evd_...",
+      "media_object_id": "media_...",
       "start_ms": 184200,
       "end_ms": 188900,
-      "thumbnail_url": "..."
+      "media_url": "https://objects.example.test/signed-media",
+      "media_url_expires_at": "2026-08-11T02:05:00Z"
     }
   ],
   "trace_id": "trace_..."
