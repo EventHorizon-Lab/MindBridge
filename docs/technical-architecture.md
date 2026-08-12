@@ -1154,6 +1154,7 @@ LoCoMo runner 将原始对话逐 turn 通过 `remember` 写入，并且不向生
 
 M3-Bench 的生产 runner 沿用官方 30 秒、零起点连续切片约定。媒体由 FFmpeg 和标准 S3
 工具在运行前准备，MindBridge 只读取包含 URI、SHA-256、时长和绝对时间原点的强类型 manifest。
+除末片外每片必须恰好 30 秒，末片不得超过 30 秒，防止边界题读到未来画面或漏掉时间段。
 官方 `before_clip=N` 按包含边界解释；执行顺序固定为“写入第 N 个片段 → 轮询持久化 Job 至
 `succeeded` → 回答该边界的问题”，未来片段不会提前进入该租户记忆。没有 `before_clip` 的问题
 在整段视频完成后回答。输出采用官方 JSONL 字段，并附带记忆、证据和 trace 诊断；sidecar run

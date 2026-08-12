@@ -188,9 +188,10 @@ the already-addressable objects:
 ]
 ```
 
-Clip indices must be contiguous and zero-based. The runner ingests and waits for each durable job
-before answering questions whose official `before_clip` equals that index, so a question cannot see
-future video. Questions without `before_clip` run after the complete video.
+Clip indices must be contiguous and zero-based. Every clip before the final clip must be exactly 30
+seconds, and the final clip must not exceed 30 seconds. The runner ingests and waits for each durable
+job before answering questions whose official `before_clip` equals that index, so a question cannot
+see future video. Questions without `before_clip` run after the complete video.
 
 ```bash
 uv run python -m mindbridge.benchmarks.m3_cli \

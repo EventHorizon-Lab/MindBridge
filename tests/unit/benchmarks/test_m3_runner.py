@@ -145,6 +145,23 @@ def test_prepared_video_requires_contiguous_video_clips() -> None:
             clip_index=0,
             media_object=_media("media_image", MediaKind.IMAGE),
         )
+    with pytest.raises(ValidationError, match="must not exceed 30 seconds"):
+        M3PreparedClip(
+            clip_index=0,
+            media_object=_media("media_long", MediaKind.VIDEO, duration_ms=30_001),
+        )
+    with pytest.raises(ValidationError, match="before the final clip"):
+        M3PreparedVideo(
+            video_id="video_01",
+            timeline_origin=NOW,
+            clips=(
+                M3PreparedClip(
+                    clip_index=0,
+                    media_object=_media("media_short", MediaKind.VIDEO, duration_ms=29_999),
+                ),
+                _clip(1),
+            ),
+        )
 
 
 def _annotation(*, questions: tuple[M3BenchQuestion, ...] | None = None) -> M3BenchVideo:
@@ -186,7 +203,12 @@ def _clip(index: int) -> M3PreparedClip:
     )
 
 
-def _media(media_object_id: str, kind: MediaKind) -> MediaObjectInput:
+def _media(
+    media_object_id: str,
+    kind: MediaKind,
+    *,
+    duration_ms: int = 30_000,
+) -> MediaObjectInput:
     return MediaObjectInput(
         media_object_id=media_object_id,
         kind=kind,
@@ -194,5 +216,5 @@ def _media(media_object_id: str, kind: MediaKind) -> MediaObjectInput:
         sha256="a" * 64,
         size_bytes=1_024,
         created_at=NOW,
-        duration_ms=30_000,
+        duration_ms=duration_ms,
     )

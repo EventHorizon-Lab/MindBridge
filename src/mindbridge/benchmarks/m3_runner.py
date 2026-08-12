@@ -43,6 +43,8 @@ class M3PreparedClip(ContractModel):
             raise ValueError("M3-Bench clips must be video media objects")
         if not self.media_object.duration_ms:
             raise ValueError("M3-Bench clips must have a positive duration_ms")
+        if self.media_object.duration_ms > M3_CLIP_DURATION_SECONDS * 1_000:
+            raise ValueError("M3-Bench clips must not exceed 30 seconds")
         return self
 
 
@@ -62,6 +64,11 @@ class M3PreparedVideo(ContractModel):
         media_ids = tuple(clip.media_object.media_object_id for clip in self.clips)
         if len(set(media_ids)) != len(media_ids):
             raise ValueError("M3-Bench clip media_object_ids must be unique")
+        if any(
+            clip.media_object.duration_ms != M3_CLIP_DURATION_SECONDS * 1_000
+            for clip in self.clips[:-1]
+        ):
+            raise ValueError("M3-Bench clips before the final clip must be exactly 30 seconds")
         return self
 
 
