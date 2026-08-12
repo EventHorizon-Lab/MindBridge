@@ -4,10 +4,10 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from mindbridge.application import (
-    ConsolidateSummaries,
-    PresignedMediaDownload,
-    ResolvedEvidence,
+from mindbridge.application.consolidate_summaries import ConsolidateSummaries
+from mindbridge.application.perception import ResolvedEvidence
+from mindbridge.application.ports import PresignedMediaDownload
+from mindbridge.application.summary_consolidation import (
     SummaryCandidate,
     SummaryCandidatePage,
     SummaryCandidateRequest,

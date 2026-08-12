@@ -7,7 +7,7 @@ from pathlib import PurePosixPath
 from typing import Literal, TypedDict
 from urllib.parse import urlsplit
 
-from mindbridge.application import ResolvedEvidence
+from mindbridge.application.perception import ResolvedEvidence
 from mindbridge.core import MediaKind
 
 

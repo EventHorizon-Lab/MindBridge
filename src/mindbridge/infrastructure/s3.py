@@ -12,7 +12,7 @@ import boto3
 from botocore.config import Config
 from botocore.exceptions import BotoCoreError
 
-from mindbridge.application import PresignedMediaDownload
+from mindbridge.application.ports import PresignedMediaDownload
 from mindbridge.core import MediaObject, ObjectStorageError
 
 if TYPE_CHECKING:

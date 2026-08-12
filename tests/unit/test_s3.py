@@ -6,7 +6,7 @@ from urllib.parse import parse_qs, urlsplit
 import pytest
 
 from mindbridge.core import MediaKind, MediaObject, MediaObjectId, TenantId
-from mindbridge.infrastructure import InvalidMediaLocationError, S3MediaAccess
+from mindbridge.infrastructure.s3 import InvalidMediaLocationError, S3MediaAccess
 
 NOW = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
 SHA256 = "00" * 32

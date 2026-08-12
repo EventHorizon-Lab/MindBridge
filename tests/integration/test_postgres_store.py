@@ -9,15 +9,15 @@ from typing import cast
 import pytest
 from psycopg import AsyncConnection
 
-from mindbridge.application import (
+from mindbridge.application.kernel import MemoryKernel
+from mindbridge.application.observation_processing import ObservationProcessingOutput
+from mindbridge.application.perception import ResolvedEvidence
+from mindbridge.application.ports import (
     GeneratedAnswer,
-    MemoryKernel,
-    ObservationProcessingOutput,
     PresignedMediaDownload,
-    RecallEmbeddingQuery,
-    ResolvedEvidence,
     ResolvedQueryMedia,
 )
+from mindbridge.application.recall import RecallEmbeddingQuery
 from mindbridge.contracts import (
     FeedbackRequest,
     IdentityObservationInput,
@@ -52,7 +52,7 @@ from mindbridge.core import (
     TenantId,
     VerificationStatus,
 )
-from mindbridge.infrastructure import PostgresMemoryStore
+from mindbridge.infrastructure.postgres import PostgresMemoryStore
 
 NOW = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
 

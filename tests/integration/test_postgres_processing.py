@@ -9,30 +9,44 @@ from typing import TypeAlias, cast
 import pytest
 from psycopg import AsyncConnection
 
-from mindbridge.application import (
+from mindbridge.application.claim_consolidation import (
     ClaimCandidate,
     ClaimCandidateRequest,
-    ClaimConsolidation,
-    ClaimRelationshipProposal,
-    ConsolidateClaims,
+)
+from mindbridge.application.consolidate_claims import ConsolidateClaims
+from mindbridge.application.consolidate_summaries import ConsolidateSummaries
+from mindbridge.application.consolidation import (
     ConsolidateEpisodes,
-    ConsolidateSummaries,
-    EmbeddingInput,
-    EmbeddingMatch,
-    EmbeddingSearch,
     EpisodeCandidateRequest,
+)
+from mindbridge.application.episodes import (
     EpisodeConsolidation,
     EpisodeProposal,
-    EventPerception,
+)
+from mindbridge.application.observation_processing import (
     ObservationBatch,
     ObservationProcessingOutput,
+)
+from mindbridge.application.perception import (
+    EventPerception,
     PerceivedClaim,
     PerceivedEntity,
     PerceivedEvent,
-    PresignedMediaDownload,
-    ProcessObservation,
     ResolvedEvidence,
+)
+from mindbridge.application.ports import (
+    EmbeddingInput,
+    EmbeddingMatch,
+    EmbeddingSearch,
+    PresignedMediaDownload,
+)
+from mindbridge.application.process_observation import ProcessObservation
+from mindbridge.application.semantic_claims import (
+    ClaimConsolidation,
+    ClaimRelationshipProposal,
     SemanticClaimProposal,
+)
+from mindbridge.application.summary_consolidation import (
     SummaryCandidate,
     SummaryCandidateRequest,
     SummaryConsolidation,
@@ -77,7 +91,7 @@ from mindbridge.core import (
     TombstoneId,
     derive_stable_id,
 )
-from mindbridge.infrastructure import PostgresMemoryStore
+from mindbridge.infrastructure.postgres import PostgresMemoryStore
 
 NOW = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
 MODEL = ModelReference(model_id="qwen3.8-max", revision="serving-revision-01")

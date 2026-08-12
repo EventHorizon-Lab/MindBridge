@@ -4,7 +4,7 @@ from typing import Any, cast
 
 from psycopg.errors import ForeignKeyViolation
 
-from mindbridge.application import EmbeddingMatch, MemoryWriteResult
+from mindbridge.application.ports import EmbeddingMatch, MemoryWriteResult
 from mindbridge.contracts import RecallRequest
 from mindbridge.core import (
     DomainInvariantError,

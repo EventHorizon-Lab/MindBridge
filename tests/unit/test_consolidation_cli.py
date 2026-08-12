@@ -3,20 +3,26 @@
 from datetime import datetime, timezone
 from typing import cast
 
-from mindbridge.application import (
-    ClaimCandidateRequest,
+from mindbridge.application.claim_consolidation import ClaimCandidateRequest
+from mindbridge.application.consolidate_claims import (
     ClaimConsolidationResult,
     ConsolidateClaims,
-    ConsolidateEpisodes,
+)
+from mindbridge.application.consolidate_summaries import (
     ConsolidateSummaries,
+    SummaryConsolidationResult,
+)
+from mindbridge.application.consolidation import (
+    ConsolidateEpisodes,
     EpisodeCandidateRequest,
     EpisodeConsolidationResult,
-    SummaryCandidateRequest,
-    SummaryConsolidationResult,
+)
+from mindbridge.application.consolidation_sweep import (
     consolidate_tenant_claims,
     consolidate_tenant_episodes,
     consolidate_tenant_summaries,
 )
+from mindbridge.application.summary_consolidation import SummaryCandidateRequest
 from mindbridge.consolidation_cli import ConsolidationSettings
 from mindbridge.core import ClaimId, EventId, MemoryId, TenantId
 

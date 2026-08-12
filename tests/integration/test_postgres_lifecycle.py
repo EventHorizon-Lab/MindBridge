@@ -6,7 +6,7 @@ import pytest
 from psycopg import AsyncConnection
 from psycopg.errors import InsufficientPrivilege
 
-from mindbridge.application import (
+from mindbridge.application.lifecycle import (
     EvolveMemoryLifecycle,
     LifecycleSweepRequest,
     MemoryLifecycleChange,
@@ -24,7 +24,7 @@ from mindbridge.core import (
     VerificationStatus,
     evolve_memory_strength,
 )
-from mindbridge.infrastructure import PostgresMemoryStore
+from mindbridge.infrastructure.postgres import PostgresMemoryStore
 
 NOW = datetime(2026, 8, 12, 12, 0, tzinfo=timezone.utc)
 POLICY = MemoryStrengthPolicy(age_decay_weight=1.0, cold_below=0.0)

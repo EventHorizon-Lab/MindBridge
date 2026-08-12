@@ -6,7 +6,7 @@ from typing import cast
 
 from psycopg.errors import ForeignKeyViolation
 
-from mindbridge.application import ObservationProcessingOutput
+from mindbridge.application.observation_processing import ObservationProcessingOutput
 from mindbridge.core import (
     DomainInvariantError,
     EmbeddedObjectType,

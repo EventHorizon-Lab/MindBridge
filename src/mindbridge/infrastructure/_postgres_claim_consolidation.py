@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import TypeAlias, cast
 
-from mindbridge.application import (
+from mindbridge.application.claim_consolidation import (
     ClaimCandidate,
     ClaimCandidatePage,
     ClaimCandidateRequest,

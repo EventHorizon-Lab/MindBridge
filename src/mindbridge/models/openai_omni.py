@@ -17,7 +17,8 @@ from pydantic import (
     model_validator,
 )
 
-from mindbridge.application import GeneratedAnswer, ResolvedEvidence, ResolvedQueryMedia
+from mindbridge.application.perception import ResolvedEvidence
+from mindbridge.application.ports import GeneratedAnswer, ResolvedQueryMedia
 from mindbridge.contracts import RecallRequest
 from mindbridge.core import MemoryId, MemoryRecord, ModelOutputError
 from mindbridge.models.openai_chat import stream_text_completion

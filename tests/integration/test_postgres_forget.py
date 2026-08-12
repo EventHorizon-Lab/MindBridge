@@ -8,14 +8,14 @@ from typing import TypeAlias, cast
 import pytest
 from psycopg import AsyncConnection
 
-from mindbridge.application import (
+from mindbridge.application.kernel import MemoryKernel
+from mindbridge.application.perception import ResolvedEvidence
+from mindbridge.application.ports import (
     GeneratedAnswer,
-    MemoryKernel,
     PresignedMediaDownload,
-    RecallEmbeddingQuery,
-    ResolvedEvidence,
     ResolvedQueryMedia,
 )
+from mindbridge.application.recall import RecallEmbeddingQuery
 from mindbridge.contracts import (
     DeletionListRequest,
     ForgetRequest,
@@ -45,7 +45,7 @@ from mindbridge.core import (
     TenantId,
     derive_stable_id,
 )
-from mindbridge.infrastructure import PostgresMemoryStore
+from mindbridge.infrastructure.postgres import PostgresMemoryStore
 
 NOW = datetime(2026, 8, 12, 8, 0, tzinfo=timezone.utc)
 Counts: TypeAlias = tuple[int, int, int, int, int, int, int]

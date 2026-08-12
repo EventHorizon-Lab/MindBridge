@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import cast
 
-from mindbridge.application import (
+from mindbridge.application.summary_consolidation import (
     SummaryCandidate,
     SummaryCandidatePage,
     SummaryCandidateRequest,

@@ -18,7 +18,7 @@ from celery.signals import (  # type: ignore[import-untyped]  # Upstream lacks P
     worker_process_init,
 )
 
-from mindbridge.application import ProcessObservation
+from mindbridge.application.process_observation import ProcessObservation
 from mindbridge.configuration import optional_environment_value, require_environment_value
 from mindbridge.core import (
     EmbeddingSpaceReference,
@@ -29,22 +29,24 @@ from mindbridge.core import (
     ObservationId,
     TenantId,
 )
-from mindbridge.infrastructure import (
+from mindbridge.infrastructure.postgres import PostgresMemoryStore
+from mindbridge.infrastructure.s3 import S3MediaAccess
+from mindbridge.infrastructure.task_queue import (
+    PROCESS_OBSERVATION_TASK,
     ObservationProcessingTaskMessage,
-    PostgresMemoryStore,
-    S3MediaAccess,
     create_task_queue,
 )
-from mindbridge.infrastructure.task_queue import PROCESS_OBSERVATION_TASK
-from mindbridge.models import (
+from mindbridge.models.jina import (
     DEFAULT_JINA_OMNI_MODEL_ID,
     DEFAULT_JINA_OMNI_REVISION,
     DEFAULT_JINA_RETRIEVAL_SPACE,
     DEFAULT_JINA_TEXT_MODEL_ID,
     DEFAULT_JINA_TEXT_REVISION,
-    DEFAULT_OMNI_MODEL_ID,
     JinaOmniEmbedder,
-    OpenAIJinaTextEmbedder,
+)
+from mindbridge.models.openai_embeddings import OpenAIJinaTextEmbedder
+from mindbridge.models.openai_omni import DEFAULT_OMNI_MODEL_ID
+from mindbridge.models.openai_perception import (
     OpenAIOmniEventPerceiver,
 )
 from mindbridge.telemetry import configure_telemetry

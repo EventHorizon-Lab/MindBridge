@@ -9,7 +9,8 @@ import httpx
 import pytest
 from openai import AsyncOpenAI
 
-from mindbridge.application import ResolvedEvidence, ResolvedQueryMedia
+from mindbridge.application.perception import ResolvedEvidence
+from mindbridge.application.ports import ResolvedQueryMedia
 from mindbridge.contracts import RecallQuery, RecallRequest
 from mindbridge.core import (
     EvidenceId,
@@ -25,7 +26,7 @@ from mindbridge.core import (
     TenantId,
     VerificationStatus,
 )
-from mindbridge.models import OpenAIOmniAnswerer, normalize_openai_base_url
+from mindbridge.models.openai_omni import OpenAIOmniAnswerer, normalize_openai_base_url
 
 NOW = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
 

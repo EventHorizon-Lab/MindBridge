@@ -5,7 +5,7 @@ from typing import TypeAlias, cast
 
 from pydantic import TypeAdapter, ValidationError
 
-from mindbridge.application import ObservationBatch
+from mindbridge.application.observation_processing import ObservationBatch
 from mindbridge.contracts import IdentityObservationInput
 from mindbridge.core import (
     AnonymousIdentityObservation,

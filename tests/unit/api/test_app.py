@@ -7,7 +7,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from mindbridge.api import TenantApiKeyAuthenticator, create_app
-from mindbridge.application import MemoryKernel
+from mindbridge.application.kernel import MemoryKernel
 from mindbridge.contracts import (
     DeletionListRequest,
     DeletionPage,

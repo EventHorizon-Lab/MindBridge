@@ -14,23 +14,25 @@ from mcp.server import MCPServer
 from mindbridge.api.app import create_app
 from mindbridge.api.auth import TenantApiKeyAuthenticator
 from mindbridge.api.mcp import create_mcp_server
-from mindbridge.application import MemoryKernel
+from mindbridge.application.kernel import MemoryKernel
 from mindbridge.configuration import optional_environment_value, require_environment_value
 from mindbridge.core import EmbeddingSpaceReference
-from mindbridge.infrastructure import (
+from mindbridge.infrastructure.postgres import PostgresMemoryStore
+from mindbridge.infrastructure.s3 import S3MediaAccess
+from mindbridge.infrastructure.task_queue import (
     CeleryObservationJobPublisher,
-    PostgresMemoryStore,
-    S3MediaAccess,
     create_task_queue,
 )
-from mindbridge.models import (
+from mindbridge.models.jina import (
     DEFAULT_JINA_OMNI_MODEL_ID,
     DEFAULT_JINA_OMNI_REVISION,
     DEFAULT_JINA_RETRIEVAL_SPACE,
     DEFAULT_JINA_TEXT_MODEL_ID,
     DEFAULT_JINA_TEXT_REVISION,
+)
+from mindbridge.models.openai_embeddings import OpenAIJinaEmbedder
+from mindbridge.models.openai_omni import (
     DEFAULT_OMNI_MODEL_ID,
-    OpenAIJinaEmbedder,
     OpenAIOmniAnswerer,
 )
 from mindbridge.telemetry import configure_telemetry, instrument_fastapi

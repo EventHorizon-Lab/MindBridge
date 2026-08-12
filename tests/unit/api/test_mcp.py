@@ -6,7 +6,7 @@ from typing import cast
 from mcp import Client
 
 from mindbridge.api import create_mcp_server
-from mindbridge.application import MemoryKernel
+from mindbridge.application.kernel import MemoryKernel
 from mindbridge.contracts import (
     FeedbackReceipt,
     FeedbackRequest,

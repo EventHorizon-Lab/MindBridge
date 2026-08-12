@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from mindbridge.application import MemoryLifecycleChange
+from mindbridge.application.lifecycle import MemoryLifecycleChange
 from mindbridge.configuration import parse_aware_datetime
 from mindbridge.core import (
     MemoryId,

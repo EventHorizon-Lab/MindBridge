@@ -3,7 +3,8 @@
 import asyncio
 from datetime import datetime, timedelta, timezone
 
-from mindbridge.application import PresignedMediaDownload, resolve_evidence_media
+from mindbridge.application.evidence import resolve_evidence_media
+from mindbridge.application.ports import PresignedMediaDownload
 from mindbridge.core import (
     EvidenceId,
     EvidenceSpan,

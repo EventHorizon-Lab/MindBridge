@@ -7,7 +7,7 @@ from typing import TypeAlias, cast
 
 from psycopg.errors import ForeignKeyViolation
 
-from mindbridge.application import (
+from mindbridge.application.semantic_claims import (
     ClaimConsolidationCommit,
     ClaimConsolidationWrite,
     SemanticClaimWrite,

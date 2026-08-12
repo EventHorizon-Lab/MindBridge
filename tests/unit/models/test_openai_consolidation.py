@@ -9,7 +9,7 @@ import httpx
 import pytest
 from openai import AsyncOpenAI
 
-from mindbridge.application import ResolvedEvidence
+from mindbridge.application.perception import ResolvedEvidence
 from mindbridge.core import (
     DomainInvariantError,
     Event,
@@ -24,7 +24,8 @@ from mindbridge.core import (
     ObservationId,
     TenantId,
 )
-from mindbridge.models import OpenAIOmniEpisodeConsolidator, normalize_openai_base_url
+from mindbridge.models.openai_consolidation import OpenAIOmniEpisodeConsolidator
+from mindbridge.models.openai_omni import normalize_openai_base_url
 
 NOW = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
 

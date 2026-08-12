@@ -16,11 +16,11 @@ from pydantic import (
     model_validator,
 )
 
-from mindbridge.application import (
-    ClaimCandidate,
+from mindbridge.application.claim_consolidation import ClaimCandidate
+from mindbridge.application.perception import ResolvedEvidence
+from mindbridge.application.semantic_claims import (
     ClaimConsolidation,
     ClaimRelationshipProposal,
-    ResolvedEvidence,
     SemanticClaimProposal,
 )
 from mindbridge.core import (

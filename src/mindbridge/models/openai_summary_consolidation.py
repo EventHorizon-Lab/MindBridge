@@ -16,8 +16,8 @@ from pydantic import (
     model_validator,
 )
 
-from mindbridge.application import (
-    ResolvedEvidence,
+from mindbridge.application.perception import ResolvedEvidence
+from mindbridge.application.summary_consolidation import (
     SummaryCandidate,
     SummaryConsolidation,
     SummaryProposal,

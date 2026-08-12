@@ -8,14 +8,14 @@ from typing import Annotated, Literal
 import pytest
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
 
-from mindbridge.application import (
+from mindbridge.application.kernel import MemoryKernel
+from mindbridge.application.perception import ResolvedEvidence
+from mindbridge.application.ports import (
     GeneratedAnswer,
-    MemoryKernel,
     PresignedMediaDownload,
-    RecallEmbeddingQuery,
-    ResolvedEvidence,
     ResolvedQueryMedia,
 )
+from mindbridge.application.recall import RecallEmbeddingQuery
 from mindbridge.contracts import (
     MediaObjectInput,
     ObserveRequest,
@@ -41,7 +41,7 @@ from mindbridge.core import (
     TenantId,
     VerificationStatus,
 )
-from mindbridge.infrastructure import PostgresMemoryStore
+from mindbridge.infrastructure.postgres import PostgresMemoryStore
 
 TENANT_ID = TenantId("tenant_golden_recall")
 NOW = datetime(2026, 8, 12, 12, 0, tzinfo=timezone.utc)

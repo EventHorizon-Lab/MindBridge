@@ -11,8 +11,10 @@ from pydantic import ValidationError
 
 import mindbridge.worker as worker_module
 from mindbridge.core import JobState
-from mindbridge.infrastructure import ObservationProcessingTaskMessage
-from mindbridge.infrastructure.task_queue import PROCESS_OBSERVATION_TASK
+from mindbridge.infrastructure.task_queue import (
+    PROCESS_OBSERVATION_TASK,
+    ObservationProcessingTaskMessage,
+)
 from mindbridge.worker import WorkerSettings, create_worker_app
 
 

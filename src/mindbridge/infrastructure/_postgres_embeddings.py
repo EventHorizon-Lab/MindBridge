@@ -4,7 +4,7 @@ from typing import cast
 
 from pgvector import Vector
 
-from mindbridge.application import EmbeddingMatch, EmbeddingSearch
+from mindbridge.application.ports import EmbeddingMatch, EmbeddingSearch
 from mindbridge.core import (
     DomainInvariantError,
     EmbeddedObjectType,

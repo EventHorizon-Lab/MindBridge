@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from mindbridge.application import EmbeddingSearch
+from mindbridge.application.ports import EmbeddingSearch
 from mindbridge.core import (
     DomainInvariantError,
     EmbeddedObjectType,
@@ -14,7 +14,7 @@ from mindbridge.core import (
     ModelReference,
     TenantId,
 )
-from mindbridge.infrastructure import PostgresMemoryStore
+from mindbridge.infrastructure.postgres import PostgresMemoryStore
 
 NOW = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
 

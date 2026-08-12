@@ -2,7 +2,7 @@
 
 from datetime import datetime, timedelta, timezone
 
-from mindbridge.application import (
+from mindbridge.application.lifecycle import (
     EvolveMemoryLifecycle,
     LifecycleSweepRequest,
     MemoryLifecycleChange,

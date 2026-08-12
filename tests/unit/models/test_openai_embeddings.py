@@ -9,7 +9,8 @@ import httpx
 import pytest
 from openai import AsyncOpenAI
 
-from mindbridge.application import RecallEmbeddingQuery, ResolvedQueryMedia
+from mindbridge.application.ports import ResolvedQueryMedia
+from mindbridge.application.recall import RecallEmbeddingQuery
 from mindbridge.core import (
     MediaKind,
     MediaObject,
@@ -18,7 +19,8 @@ from mindbridge.core import (
     ModelReference,
     TenantId,
 )
-from mindbridge.models import OpenAIJinaEmbedder, OpenAIJinaTextEmbedder, normalize_openai_base_url
+from mindbridge.models.openai_embeddings import OpenAIJinaEmbedder, OpenAIJinaTextEmbedder
+from mindbridge.models.openai_omni import normalize_openai_base_url
 
 NOW = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
 QUERY_MODEL_ID = "jinaai/jina-embeddings-v5-omni-small-retrieval"

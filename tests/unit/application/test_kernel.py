@@ -7,21 +7,21 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from mindbridge.application import (
+from mindbridge.application.kernel import MemoryKernel
+from mindbridge.application.observation_processing import ObservationBatch
+from mindbridge.application.perception import ResolvedEvidence
+from mindbridge.application.ports import (
     EmbeddingMatch,
     EmbeddingSearch,
     FeedbackWriteResult,
     ForgetPlan,
     GeneratedAnswer,
-    MemoryKernel,
     MemoryWriteResult,
-    ObservationBatch,
     ObservationWriteResult,
     PresignedMediaDownload,
-    RecallEmbeddingQuery,
-    ResolvedEvidence,
     ResolvedQueryMedia,
 )
+from mindbridge.application.recall import RecallEmbeddingQuery
 from mindbridge.contracts import (
     FeedbackRequest,
     IdentityObservationInput,

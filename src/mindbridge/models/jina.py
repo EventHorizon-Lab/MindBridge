@@ -8,7 +8,7 @@ from collections.abc import Callable
 from importlib import import_module
 from typing import Protocol, cast
 
-from mindbridge.application import EmbeddingInput
+from mindbridge.application.ports import EmbeddingInput
 from mindbridge.core import (
     EmbeddingSpaceReference,
     ModelOutputError,

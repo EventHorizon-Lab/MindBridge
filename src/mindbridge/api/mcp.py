@@ -8,7 +8,7 @@ from contextlib import AbstractAsyncContextManager
 from mcp.server import MCPServer
 from mcp_types import ToolAnnotations
 
-from mindbridge.application import MemoryKernel
+from mindbridge.application.kernel import MemoryKernel
 from mindbridge.contracts import (
     FeedbackReceipt,
     FeedbackRequest,

@@ -15,7 +15,7 @@ from mindbridge.api.auth import (
     TenantPrincipal,
     require_tenant,
 )
-from mindbridge.application import MemoryKernel
+from mindbridge.application.kernel import MemoryKernel
 from mindbridge.contracts import (
     DeletionListRequest,
     DeletionPage,

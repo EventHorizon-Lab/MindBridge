@@ -7,7 +7,8 @@ from typing import TypeAlias, cast
 
 from psycopg.errors import ForeignKeyViolation
 
-from mindbridge.application import EpisodeCandidatePage, EpisodeCandidateRequest, EpisodeWrite
+from mindbridge.application.consolidation import EpisodeCandidatePage, EpisodeCandidateRequest
+from mindbridge.application.episodes import EpisodeWrite
 from mindbridge.core import (
     DomainInvariantError,
     Event,

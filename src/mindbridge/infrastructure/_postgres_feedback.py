@@ -6,7 +6,7 @@ from dataclasses import replace
 from datetime import datetime
 from typing import TypeAlias, cast
 
-from mindbridge.application import FeedbackWriteResult
+from mindbridge.application.ports import FeedbackWriteResult
 from mindbridge.core import (
     DomainInvariantError,
     FeedbackId,

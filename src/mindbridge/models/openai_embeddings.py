@@ -8,7 +8,7 @@ import openai
 from openai import AsyncOpenAI
 from openai.types.create_embedding_response import CreateEmbeddingResponse
 
-from mindbridge.application import RecallEmbeddingQuery
+from mindbridge.application.recall import RecallEmbeddingQuery
 from mindbridge.core import (
     DomainInvariantError,
     EmbeddingSpaceReference,

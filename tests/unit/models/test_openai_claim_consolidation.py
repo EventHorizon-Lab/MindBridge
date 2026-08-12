@@ -9,7 +9,8 @@ import httpx
 import pytest
 from openai import AsyncOpenAI
 
-from mindbridge.application import ClaimCandidate, ResolvedEvidence
+from mindbridge.application.claim_consolidation import ClaimCandidate
+from mindbridge.application.perception import ResolvedEvidence
 from mindbridge.core import (
     Claim,
     ClaimId,
@@ -27,7 +28,8 @@ from mindbridge.core import (
     TenantId,
     VerificationStatus,
 )
-from mindbridge.models import OpenAIOmniClaimConsolidator, normalize_openai_base_url
+from mindbridge.models.openai_claim_consolidation import OpenAIOmniClaimConsolidator
+from mindbridge.models.openai_omni import normalize_openai_base_url
 
 NOW = datetime(2026, 8, 12, 12, 0, tzinfo=timezone.utc)
 

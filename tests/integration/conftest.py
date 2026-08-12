@@ -11,7 +11,7 @@ import pytest
 import pytest_asyncio
 from psycopg import AsyncConnection
 
-from mindbridge.infrastructure import PostgresMemoryStore
+from mindbridge.infrastructure.postgres import PostgresMemoryStore
 
 DATABASE_URL = os.getenv("MINDBRIDGE_TEST_DATABASE_URL")
 

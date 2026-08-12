@@ -19,7 +19,7 @@ from mindbridge.benchmarks.locomo_runner import (
     LoCoMoOfficialConversationResult,
     LoCoMoOfficialQuestionResult,
 )
-from mindbridge.models import DEFAULT_JINA_OMNI_MODEL_ID, DEFAULT_JINA_OMNI_REVISION
+from mindbridge.models.jina import DEFAULT_JINA_OMNI_MODEL_ID, DEFAULT_JINA_OMNI_REVISION
 
 NOW = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
 

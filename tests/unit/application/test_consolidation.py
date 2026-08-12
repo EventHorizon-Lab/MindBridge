@@ -5,16 +5,18 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from mindbridge.application import (
+from mindbridge.application.consolidation import (
     ConsolidateEpisodes,
     EpisodeCandidatePage,
     EpisodeCandidateRequest,
+)
+from mindbridge.application.episodes import (
     EpisodeConsolidation,
     EpisodeProposal,
     EpisodeWrite,
-    PresignedMediaDownload,
-    ResolvedEvidence,
 )
+from mindbridge.application.perception import ResolvedEvidence
+from mindbridge.application.ports import PresignedMediaDownload
 from mindbridge.core import (
     EmbeddedObjectType,
     EmbeddingSpaceReference,

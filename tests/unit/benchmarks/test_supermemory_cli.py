@@ -22,7 +22,7 @@ from mindbridge.benchmarks.supermemory_runner import (
 from mindbridge.benchmarks.supermemory_vqa import SuperMemoryQuestion
 from mindbridge.contracts import MediaObjectInput
 from mindbridge.core import MediaKind
-from mindbridge.models import DEFAULT_JINA_OMNI_MODEL_ID, DEFAULT_JINA_OMNI_REVISION
+from mindbridge.models.jina import DEFAULT_JINA_OMNI_MODEL_ID, DEFAULT_JINA_OMNI_REVISION
 
 NOW = datetime(2026, 3, 10, tzinfo=timezone.utc)
 

@@ -6,23 +6,30 @@ from datetime import datetime
 
 from pgvector.psycopg import register_vector_async
 
-from mindbridge.application import (
+from mindbridge.application.claim_consolidation import (
     ClaimCandidatePage,
     ClaimCandidateRequest,
-    ClaimConsolidationCommit,
-    ClaimConsolidationWrite,
-    EmbeddingMatch,
-    EmbeddingSearch,
-    EpisodeCandidatePage,
-    EpisodeCandidateRequest,
-    EpisodeWrite,
-    FeedbackWriteResult,
-    ForgetPlan,
-    MemoryLifecycleChange,
-    MemoryWriteResult,
+)
+from mindbridge.application.consolidation import EpisodeCandidatePage, EpisodeCandidateRequest
+from mindbridge.application.episodes import EpisodeWrite
+from mindbridge.application.lifecycle import MemoryLifecycleChange
+from mindbridge.application.observation_processing import (
     ObservationBatch,
     ObservationProcessingOutput,
+)
+from mindbridge.application.ports import (
+    EmbeddingMatch,
+    EmbeddingSearch,
+    FeedbackWriteResult,
+    ForgetPlan,
+    MemoryWriteResult,
     ObservationWriteResult,
+)
+from mindbridge.application.semantic_claims import (
+    ClaimConsolidationCommit,
+    ClaimConsolidationWrite,
+)
+from mindbridge.application.summary_consolidation import (
     SummaryCandidatePage,
     SummaryCandidateRequest,
     SummaryWrite,

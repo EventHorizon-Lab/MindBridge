@@ -9,7 +9,7 @@ import httpx
 import pytest
 from openai import AsyncOpenAI
 
-from mindbridge.application import ResolvedEvidence
+from mindbridge.application.perception import ResolvedEvidence
 from mindbridge.core import (
     AnonymousIdentityObservation,
     DeviceId,
@@ -26,7 +26,8 @@ from mindbridge.core import (
     SensorKind,
     TenantId,
 )
-from mindbridge.models import OpenAIOmniEventPerceiver, normalize_openai_base_url
+from mindbridge.models.openai_omni import normalize_openai_base_url
+from mindbridge.models.openai_perception import OpenAIOmniEventPerceiver
 
 NOW = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
 

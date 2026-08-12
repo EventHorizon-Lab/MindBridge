@@ -12,7 +12,7 @@ from importlib.metadata import version
 from pydantic import AwareDatetime
 
 from mindbridge.contracts import ContractModel
-from mindbridge.models import JinaOmniEmbedder
+from mindbridge.models.jina import JinaOmniEmbedder
 
 QUERY = "Where did the robot put the red screwdriver?"
 RELEVANT_DOCUMENT = "The robot put the red screwdriver beside the blue toolbox."

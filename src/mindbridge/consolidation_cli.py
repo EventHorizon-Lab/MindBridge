@@ -11,10 +11,10 @@ from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
-from mindbridge.application import (
-    ConsolidateClaims,
-    ConsolidateEpisodes,
-    ConsolidateSummaries,
+from mindbridge.application.consolidate_claims import ConsolidateClaims
+from mindbridge.application.consolidate_summaries import ConsolidateSummaries
+from mindbridge.application.consolidation import ConsolidateEpisodes
+from mindbridge.application.consolidation_sweep import (
     ConsolidationSweepSummary,
     consolidate_tenant_claims,
     consolidate_tenant_episodes,
@@ -26,15 +26,18 @@ from mindbridge.configuration import (
     require_environment_value,
 )
 from mindbridge.core import EmbeddingSpaceReference, TenantId
-from mindbridge.infrastructure import PostgresMemoryStore, S3MediaAccess
-from mindbridge.models import (
+from mindbridge.infrastructure.postgres import PostgresMemoryStore
+from mindbridge.infrastructure.s3 import S3MediaAccess
+from mindbridge.models.jina import (
     DEFAULT_JINA_RETRIEVAL_SPACE,
     DEFAULT_JINA_TEXT_MODEL_ID,
     DEFAULT_JINA_TEXT_REVISION,
-    DEFAULT_OMNI_MODEL_ID,
-    OpenAIJinaTextEmbedder,
-    OpenAIOmniClaimConsolidator,
-    OpenAIOmniEpisodeConsolidator,
+)
+from mindbridge.models.openai_claim_consolidation import OpenAIOmniClaimConsolidator
+from mindbridge.models.openai_consolidation import OpenAIOmniEpisodeConsolidator
+from mindbridge.models.openai_embeddings import OpenAIJinaTextEmbedder
+from mindbridge.models.openai_omni import DEFAULT_OMNI_MODEL_ID
+from mindbridge.models.openai_summary_consolidation import (
     OpenAIOmniSummaryConsolidator,
 )
 from mindbridge.telemetry import configure_telemetry

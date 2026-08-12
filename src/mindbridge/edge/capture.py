@@ -10,7 +10,7 @@ from mindbridge.contracts import IdentityObservationInput, MediaObjectInput, Obs
 from mindbridge.core import MediaKind, SensorKind, derive_stable_id
 from mindbridge.edge.outbox import EdgeMediaFile, SQLiteObservationOutbox
 from mindbridge.file_integrity import sha256_file
-from mindbridge.infrastructure import tenant_s3_object_key
+from mindbridge.infrastructure.s3 import tenant_s3_object_key
 
 
 def enqueue_captured_video(

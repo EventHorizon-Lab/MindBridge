@@ -12,7 +12,7 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanE
 from opentelemetry.trace import NonRecordingSpan, SpanContext, SpanKind, TraceFlags, use_span
 
 from mindbridge.api import TenantApiKeyAuthenticator, create_app
-from mindbridge.application import MemoryKernel
+from mindbridge.application.kernel import MemoryKernel
 from mindbridge.telemetry import (
     TelemetryProviders,
     current_trace_id,

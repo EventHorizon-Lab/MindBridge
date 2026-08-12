@@ -3,28 +3,22 @@
 from __future__ import annotations
 
 import os
+import sys
 from collections.abc import Callable, Coroutine, Mapping
 from dataclasses import dataclass
 from functools import wraps
 from importlib.metadata import version
 from threading import Lock
-from typing import ParamSpec, TypeVar
+from typing import TYPE_CHECKING, ParamSpec, TypeVar
 from uuid import uuid4
 
-from fastapi import FastAPI
 from opentelemetry import metrics, trace
-from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
-from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
-from opentelemetry.instrumentation.botocore import BotocoreInstrumentor
-from opentelemetry.instrumentation.celery import CeleryInstrumentor
-from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
-from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
-from opentelemetry.instrumentation.psycopg import PsycopgInstrumentor
-from opentelemetry.sdk.metrics import MeterProvider
-from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
-from opentelemetry.sdk.resources import Resource
-from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.trace.export import BatchSpanProcessor
+
+if TYPE_CHECKING:
+    from fastapi import FastAPI
+    from opentelemetry.sdk.metrics import MeterProvider
+    from opentelemetry.sdk.resources import Resource
+    from opentelemetry.sdk.trace import TracerProvider
 
 _Parameters = ParamSpec("_Parameters")
 _Result = TypeVar("_Result")
@@ -106,6 +100,8 @@ def configure_telemetry(default_service_name: str) -> TelemetryProviders:
                 raise RuntimeError("OpenTelemetry service name changed inside one process")
             return _configured_process[2]
 
+        from opentelemetry.sdk.resources import Resource
+
         resource = Resource.create(
             {
                 "service.name": service_name,
@@ -124,6 +120,8 @@ def instrument_fastapi(app: FastAPI, providers: TelemetryProviders) -> None:
     """Instrument one FastAPI app without collecting headers or body content."""
     if not providers.enabled:
         return
+    from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+
     FastAPIInstrumentor.instrument_app(
         app,
         tracer_provider=providers.tracer,
@@ -137,6 +135,10 @@ def _configure_traces(
     resource: Resource,
     meter_provider: MeterProvider | None,
 ) -> TracerProvider:
+    from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import BatchSpanProcessor
+
     existing = trace.get_tracer_provider()
     if isinstance(existing, TracerProvider):
         return existing
@@ -147,6 +149,10 @@ def _configure_traces(
 
 
 def _configure_metrics(resource: Resource) -> MeterProvider:
+    from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
+    from opentelemetry.sdk.metrics import MeterProvider
+    from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
+
     existing = metrics.get_meter_provider()
     if isinstance(existing, MeterProvider):
         return existing
@@ -161,10 +167,22 @@ def _instrument_clients(providers: TelemetryProviders) -> None:
         "tracer_provider": providers.tracer,
         "meter_provider": providers.meter,
     }
-    BotocoreInstrumentor().instrument(**keywords)  # type: ignore[no-untyped-call]
-    CeleryInstrumentor().instrument(**keywords)  # type: ignore[no-untyped-call]
-    HTTPXClientInstrumentor().instrument(**keywords)
-    PsycopgInstrumentor().instrument(**keywords)
+    if "botocore" in sys.modules:
+        from opentelemetry.instrumentation.botocore import BotocoreInstrumentor
+
+        BotocoreInstrumentor().instrument(**keywords)  # type: ignore[no-untyped-call]
+    if "celery" in sys.modules:
+        from opentelemetry.instrumentation.celery import CeleryInstrumentor
+
+        CeleryInstrumentor().instrument(**keywords)  # type: ignore[no-untyped-call]
+    if "httpx" in sys.modules:
+        from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
+
+        HTTPXClientInstrumentor().instrument(**keywords)
+    if "psycopg" in sys.modules:
+        from opentelemetry.instrumentation.psycopg import PsycopgInstrumentor
+
+        PsycopgInstrumentor().instrument(**keywords)
 
 
 def _sdk_disabled(environ: Mapping[str, str]) -> bool:

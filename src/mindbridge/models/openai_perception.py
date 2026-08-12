@@ -16,7 +16,7 @@ from pydantic import (
     model_validator,
 )
 
-from mindbridge.application import (
+from mindbridge.application.perception import (
     MAX_PERCEIVED_CLAIMS_PER_EVENT,
     MAX_PERCEIVED_ENTITIES_PER_EVENT,
     MAX_PERCEPTION_CLAIMS,

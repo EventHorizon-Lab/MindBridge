@@ -3,7 +3,7 @@
 from datetime import datetime
 from typing import cast
 
-from mindbridge.application import MemoryLifecycleChange
+from mindbridge.application.lifecycle import MemoryLifecycleChange
 from mindbridge.core import DomainInvariantError, MemoryId, MemoryRecord, TenantId
 from mindbridge.infrastructure._postgres_memory_rows import (
     MEMORY_NOT_TOMBSTONED_SQL,

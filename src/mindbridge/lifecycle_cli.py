@@ -10,7 +10,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from mindbridge.application import (
+from mindbridge.application.lifecycle import (
     EvolveMemoryLifecycle,
     LifecycleSweepRequest,
     MemoryLifecycleStore,
@@ -23,7 +23,7 @@ from mindbridge.core import (
     MemoryStrengthPolicy,
     TenantId,
 )
-from mindbridge.infrastructure import PostgresMemoryStore
+from mindbridge.infrastructure.postgres import PostgresMemoryStore
 from mindbridge.telemetry import configure_telemetry
 
 

@@ -5,17 +5,19 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from mindbridge.application import (
-    EventPerception,
+from mindbridge.application.observation_processing import (
     ObservationBatch,
     ObservationProcessingOutput,
+)
+from mindbridge.application.perception import (
+    EventPerception,
     PerceivedClaim,
     PerceivedEntity,
     PerceivedEvent,
-    PresignedMediaDownload,
-    ProcessObservation,
     ResolvedEvidence,
 )
+from mindbridge.application.ports import PresignedMediaDownload
+from mindbridge.application.process_observation import ProcessObservation
 from mindbridge.core import (
     AnonymousIdentityObservation,
     ClaimType,

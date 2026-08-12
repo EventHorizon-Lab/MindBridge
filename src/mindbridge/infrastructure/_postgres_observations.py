@@ -4,7 +4,8 @@ from typing import cast
 
 from psycopg.types.json import Jsonb
 
-from mindbridge.application import ObservationBatch, ObservationWriteResult
+from mindbridge.application.observation_processing import ObservationBatch
+from mindbridge.application.ports import ObservationWriteResult
 from mindbridge.core import (
     DomainInvariantError,
     EvidenceSpan,

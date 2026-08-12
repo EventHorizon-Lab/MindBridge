@@ -21,7 +21,7 @@ from mindbridge.core import ObjectStorageError
 from mindbridge.edge.deletion_inbox import SQLiteDeletionInbox
 from mindbridge.edge.outbox import EdgeMediaFile, SQLiteObservationOutbox
 from mindbridge.file_integrity import sha256_file
-from mindbridge.infrastructure import tenant_s3_object_key
+from mindbridge.infrastructure.s3 import tenant_s3_object_key
 from mindbridge.sdk import AsyncMindBridge, MindBridgeClientError
 from mindbridge.telemetry import set_current_span_attributes, trace_operation
 

@@ -3,7 +3,7 @@
 import pytest
 
 from mindbridge.core import ModelOutputError, ModelReference
-from mindbridge.models import JinaOmniEmbedder
+from mindbridge.models.jina import JinaOmniEmbedder
 
 
 class Matrix:

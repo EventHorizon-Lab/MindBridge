@@ -6,7 +6,7 @@ from typing import cast
 
 from psycopg.errors import ForeignKeyViolation
 
-from mindbridge.application import SummaryWrite
+from mindbridge.application.summary_consolidation import SummaryWrite
 from mindbridge.core import DomainInvariantError, MemoryId, MemoryIntegrityError, TenantId
 from mindbridge.infrastructure._postgres_derived_records import derived_memory_content_digest
 from mindbridge.infrastructure._postgres_embeddings import write_embedding_on_connection

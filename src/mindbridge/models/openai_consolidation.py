@@ -16,11 +16,11 @@ from pydantic import (
     model_validator,
 )
 
-from mindbridge.application import (
+from mindbridge.application.episodes import (
     EpisodeConsolidation,
     EpisodeProposal,
-    ResolvedEvidence,
 )
+from mindbridge.application.perception import ResolvedEvidence
 from mindbridge.core import DomainInvariantError, Event, EventId, ModelOutputError, ModelReference
 from mindbridge.models.openai_chat import stream_text_completion
 from mindbridge.models.openai_media import OpenAIContentPart, evidence_media_content_parts

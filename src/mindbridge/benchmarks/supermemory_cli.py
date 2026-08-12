@@ -35,11 +35,15 @@ from mindbridge.benchmarks.supermemory_vqa import (
 )
 from mindbridge.contracts import ContractModel, Identifier, NonEmptyString, Sha256Hex
 from mindbridge.file_integrity import sha256_file
-from mindbridge.models import (
-    ANSWER_FROM_EVIDENCE_PROMPT_VERSION,
+from mindbridge.models.jina import (
     DEFAULT_JINA_OMNI_MODEL_ID,
     DEFAULT_JINA_OMNI_REVISION,
+)
+from mindbridge.models.openai_omni import (
+    ANSWER_FROM_EVIDENCE_PROMPT_VERSION,
     DEFAULT_OMNI_MODEL_ID,
+)
+from mindbridge.models.openai_perception import (
     PERCEIVE_EVENTS_PROMPT_VERSION,
 )
 from mindbridge.sdk import AsyncMindBridge

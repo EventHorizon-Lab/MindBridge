@@ -4,17 +4,19 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from mindbridge.application import (
+from mindbridge.application.claim_consolidation import (
     ClaimCandidate,
     ClaimCandidatePage,
     ClaimCandidateRequest,
+)
+from mindbridge.application.consolidate_claims import ConsolidateClaims
+from mindbridge.application.perception import ResolvedEvidence
+from mindbridge.application.ports import PresignedMediaDownload
+from mindbridge.application.semantic_claims import (
     ClaimConsolidation,
     ClaimConsolidationCommit,
     ClaimConsolidationWrite,
     ClaimRelationshipProposal,
-    ConsolidateClaims,
-    PresignedMediaDownload,
-    ResolvedEvidence,
     SemanticClaimProposal,
 )
 from mindbridge.core import (

@@ -23,7 +23,7 @@ from mindbridge.benchmarks.m3_runner import (
 )
 from mindbridge.contracts import MediaObjectInput
 from mindbridge.core import MediaKind
-from mindbridge.models import DEFAULT_JINA_OMNI_MODEL_ID, DEFAULT_JINA_OMNI_REVISION
+from mindbridge.models.jina import DEFAULT_JINA_OMNI_MODEL_ID, DEFAULT_JINA_OMNI_REVISION
 
 NOW = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
 

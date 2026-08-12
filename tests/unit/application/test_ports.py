@@ -2,7 +2,7 @@
 
 import pytest
 
-from mindbridge.application import EmbeddingSearch
+from mindbridge.application.ports import EmbeddingSearch
 from mindbridge.core import (
     DomainInvariantError,
     EmbeddedObjectType,

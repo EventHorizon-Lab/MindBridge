@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import TypeAlias, cast
 
-from mindbridge.application import ForgetPlan
+from mindbridge.application.ports import ForgetPlan
 from mindbridge.core import (
     DeletionPropagationState,
     DeletionTombstone,

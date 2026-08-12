@@ -7,7 +7,7 @@ from typing import cast
 from mcp import Client
 
 from mindbridge.api import TenantApiKeyAuthenticator, create_app, create_mcp_server
-from mindbridge.application import MemoryKernel
+from mindbridge.application.kernel import MemoryKernel
 
 SNAPSHOT_DIRECTORY = Path(__file__).with_name("snapshots")
 
