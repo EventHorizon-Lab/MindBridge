@@ -33,7 +33,9 @@ async def record_memory_accesses(
             f"""
             UPDATE memory_records AS memory
             SET useful_access_count = memory.useful_access_count + 1,
-                last_accessed_at = GREATEST(memory.last_accessed_at, %(accessed_at)s),
+                last_accessed_at = GREATEST(
+                    memory.created_at, memory.last_accessed_at, %(accessed_at)s
+                ),
                 lifecycle_changed_at = GREATEST(
                     memory.lifecycle_changed_at, now(), %(accessed_at)s
                 ),

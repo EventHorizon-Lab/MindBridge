@@ -197,10 +197,17 @@ class EdgeObservationSynchronizer:
         return applied, False
 
     @trace_operation("mindbridge.edge.sync_recent_memories")
-    async def sync_recent_memories(self, *, limit: int = 100) -> int:
+    async def _sync_recent_memories(
+        self,
+        caught_up_tenant_ids: frozenset[str],
+        *,
+        limit: int = 100,
+    ) -> int:
         """Cache completed cloud jobs without blocking on jobs still in progress."""
         cached = 0
         for pending in self._outbox.pending_processing_jobs(limit=limit):
+            if pending.tenant_id not in caught_up_tenant_ids:
+                continue
             self._outbox.mark_processing_job_polled(pending)
             job = await self._memory.get_observation_job(
                 pending.tenant_id,
@@ -241,9 +248,12 @@ class EdgeObservationSynchronizer:
         """Synchronize at most `limit` items so the caller controls scheduling and backoff."""
         if limit <= 0:
             raise ValueError("edge sync limit must be positive")
+        caught_up_tenant_ids: set[str] = set()
         for tenant_id in self._deletion_inbox.tenant_ids():
-            await self.sync_deletions(tenant_id)
-        await self.sync_recent_memories(limit=limit)
+            _, caught_up = await self._sync_deletion_pages(tenant_id)
+            if caught_up:
+                caught_up_tenant_ids.add(tenant_id)
+        await self._sync_recent_memories(frozenset(caught_up_tenant_ids), limit=limit)
         receipts: list[ObservationReceipt] = []
         for _ in range(limit):
             receipt = await self.sync_next()

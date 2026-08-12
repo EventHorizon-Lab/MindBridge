@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import cast
 
 import pytest
@@ -219,6 +220,38 @@ async def test_migration_installs_complete_phase_zero_schema(database_url: str) 
         13,
         14,
     ]
+
+
+async def test_access_time_migration_repairs_legacy_clock_rollback(database_url: str) -> None:
+    migration = Path(__file__).parents[2] / "migrations/0012_memory_activity_time.sql"
+    connection = await AsyncConnection.connect(database_url, autocommit=True)
+    async with connection:
+        await connection.execute("DROP SCHEMA IF EXISTS migration_0012_legacy CASCADE")
+        await connection.execute("CREATE SCHEMA migration_0012_legacy")
+        await connection.execute("SET search_path TO migration_0012_legacy")
+        await connection.execute(
+            """
+            CREATE TABLE memory_records (
+                created_at timestamptz NOT NULL,
+                last_accessed_at timestamptz
+            );
+            CREATE TABLE schema_migrations (version integer PRIMARY KEY);
+            INSERT INTO memory_records VALUES (
+                '2026-08-12 12:00:00+00',
+                '2026-08-12 11:59:59+00'
+            );
+            """,
+            prepare=False,
+        )
+        await connection.execute(migration.read_text(encoding="utf-8"), prepare=False)
+        repaired = await (
+            await connection.execute("SELECT created_at, last_accessed_at FROM memory_records")
+        ).fetchone()
+        await connection.execute("RESET search_path")
+        await connection.execute("DROP SCHEMA migration_0012_legacy CASCADE")
+
+    assert repaired is not None
+    assert repaired[1] == repaired[0]
 
 
 async def test_postgres_vertical_path_is_idempotent_and_evidence_first(

@@ -41,6 +41,7 @@ async def test_tenant_connection_rejects_an_empty_identity() -> None:
         OperationalError("socket secret"),
         ConnectionFailure("socket secret"),
         PoolTimeout("secret"),
+        QueryCanceled("statement timeout secret"),
         SerializationFailure("secret"),
     ],
 )
@@ -57,13 +58,8 @@ async def test_tenant_connection_sanitizes_transient_failures(error: Operational
     assert "secret" not in str(raised.value)
 
 
-@pytest.mark.parametrize(
-    "error",
-    [InvalidPassword("permanent secret"), QueryCanceled("permanent secret")],
-)
-async def test_tenant_connection_does_not_retry_permanent_errors(
-    error: OperationalError,
-) -> None:
+async def test_tenant_connection_does_not_retry_permanent_errors() -> None:
+    error = InvalidPassword("permanent secret")
     checkout = MagicMock()
     checkout.__aenter__ = AsyncMock(side_effect=error)
     pool = MagicMock()

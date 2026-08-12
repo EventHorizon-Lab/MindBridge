@@ -13,7 +13,7 @@ from mindbridge.core import DatabaseUnavailableError
 DatabaseConnection: TypeAlias = AsyncConnection[TupleRow]
 DatabasePool: TypeAlias = AsyncConnectionPool[DatabaseConnection]
 _TRANSIENT_SQLSTATES = frozenset(
-    {"40000", "40001", "40003", "40P01", "53300", "57P01", "57P02", "57P03"}
+    {"40000", "40001", "40003", "40P01", "53300", "57014", "57P01", "57P02", "57P03"}
 )
 
 

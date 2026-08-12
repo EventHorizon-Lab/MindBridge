@@ -121,6 +121,7 @@ class DeletionBacklogApi:
     def __init__(self) -> None:
         self.list_calls = 0
         self.observe_calls = 0
+        self.job_calls = 0
 
     async def observe(self, request: ObserveRequest) -> ObservationReceipt:
         self.observe_calls += 1
@@ -150,6 +151,14 @@ class DeletionBacklogApi:
             next_cursor=items[-1].tombstone_id,
             trace_id="trace_deletion_backlog",
         )
+
+    async def get_observation_job(
+        self,
+        _tenant_id: str,
+        _job_id: str,
+    ) -> ObservationProcessingJobView:
+        self.job_calls += 1
+        raise AssertionError("an unsynchronized deletion backlog must block job polling")
 
 
 class CompletedMemoryApi:
@@ -283,6 +292,50 @@ async def test_sync_blocks_upload_while_deletion_backlog_remains(tmp_path: Path)
     assert upload_calls == []
     assert outbox.pending_count() == 1
     assert deletion_inbox.read_cursor(request.tenant_id) == "tombstone_0999"
+
+
+async def test_sync_blocks_memory_cache_while_deletion_backlog_remains(tmp_path: Path) -> None:
+    request, media_file = _capture(tmp_path)
+    database_path = tmp_path / "edge.db"
+    outbox = SQLiteObservationOutbox(database_path, clock=lambda: NOW)
+    outbox.enqueue(request, (media_file,))
+    item = outbox.next_pending()
+    assert item is not None
+    observation_id = derive_observation_id(
+        request.tenant_id,
+        request.device_id,
+        request.boot_id,
+        request.sequence,
+    )
+    outbox.acknowledge(
+        item,
+        ObservationReceipt(
+            observation_id=observation_id,
+            processing_job_id=f"job_process_{observation_id}",
+            idempotency_key=request.idempotency_key or "unexpected",
+            status=ObservationStatus.ACCEPTED,
+            trace_id="trace_observe",
+        ),
+    )
+    api = DeletionBacklogApi()
+    recent = SQLiteRecentMemory(database_path, clock=lambda: NOW)
+
+    async def unexpected_upload(_request: ObserveRequest, _file: EdgeMediaFile) -> None:
+        raise AssertionError("the acknowledged observation must not be uploaded again")
+
+    receipts = await EdgeObservationSynchronizer(
+        outbox,
+        SQLiteDeletionInbox(database_path, clock=lambda: NOW),
+        cast(AsyncMindBridge, api),
+        unexpected_upload,
+        recent_memory=recent,
+    ).sync_pending()
+
+    assert receipts == ()
+    assert api.list_calls == 10
+    assert api.job_calls == 0
+    assert len(outbox.pending_processing_jobs()) == 1
+    assert recent.list_memories(request.tenant_id) == ()
 
 
 async def test_s3_uploader_checks_bytes_and_tenant_before_upload(tmp_path: Path) -> None:

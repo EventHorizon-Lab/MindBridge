@@ -171,13 +171,22 @@ async def test_postgres_recall_access_reactivates_cold_memory_without_rewinding_
     assert second[0].last_accessed_at == NOW + timedelta(minutes=1)
 
 
-async def test_postgres_rejects_access_before_memory_creation(
+async def test_postgres_clamps_access_before_memory_creation(
     store: PostgresMemoryStore,
     database_url: str,
 ) -> None:
     tenant_id = TenantId("tenant_lifecycle_access_time")
     memory = _memory(tenant_id, "memory_access_time", NOW)
     await _write_memory(store, memory)
+    accessed = await store.record_memory_accesses(
+        tenant_id,
+        (memory.memory_id,),
+        accessed_at=NOW - timedelta(seconds=1),
+    )
+
+    assert accessed[0].useful_access_count == 1
+    assert accessed[0].last_accessed_at == memory.created_at
+
     connection = await AsyncConnection.connect(database_url, autocommit=True)
 
     async with connection:
