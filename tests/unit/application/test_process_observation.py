@@ -209,12 +209,16 @@ class RecordingTextEmbedder:
 
 
 class DeterministicSigner:
+    def __init__(self) -> None:
+        self.calls = 0
+
     async def create_presigned_download(
         self,
         media_object: MediaObject,
     ) -> PresignedMediaDownload:
+        self.calls += 1
         return PresignedMediaDownload(
-            download_url="https://objects.example.test/clip.mp4?signature=test",
+            download_url=f"https://objects.example.test/clip.mp4?signature={self.calls}",
             expires_at=NOW + timedelta(minutes=5),
         )
 
@@ -225,7 +229,8 @@ async def test_processor_builds_event_memory_and_raw_media_embedding_once() -> N
     perceiver = RecordingPerceiver()
     embedder = RecordingEmbedder()
     text_embedder = RecordingTextEmbedder()
-    processor = _processor(store, perceiver, embedder, text_embedder)
+    signer = DeterministicSigner()
+    processor = _processor(store, perceiver, embedder, text_embedder, signer=signer)
 
     first = await processor.run(TENANT_ID, OBSERVATION_ID, JOB_ID)
     duplicate = await processor.run(TENANT_ID, OBSERVATION_ID, JOB_ID)
@@ -233,7 +238,8 @@ async def test_processor_builds_event_memory_and_raw_media_embedding_once() -> N
     assert first.state is JobState.SUCCEEDED
     assert duplicate.state is JobState.SUCCEEDED
     assert perceiver.calls == 1
-    assert embedder.documents == ("https://objects.example.test/clip.mp4?signature=test",)
+    assert signer.calls == 2
+    assert embedder.documents == ("https://objects.example.test/clip.mp4?signature=2",)
     assert store.output is not None
     assert first.memory_ids == tuple(memory.memory_id for memory in store.output.memories)
     assert store.output.events[0].prompt_version == "perceive_events_v1"
@@ -347,13 +353,15 @@ def _processor(
     perceiver: RecordingPerceiver,
     embedder: RecordingEmbedder,
     text_embedder: RecordingTextEmbedder,
+    *,
+    signer: DeterministicSigner | None = None,
 ) -> ProcessObservation:
     return ProcessObservation(
         store,
         perceiver,
         embedder,
         text_embedder,
-        media_url_signer=DeterministicSigner(),
+        media_url_signer=signer or DeterministicSigner(),
     )
 
 

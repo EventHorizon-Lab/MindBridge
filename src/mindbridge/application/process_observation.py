@@ -112,10 +112,15 @@ class ProcessObservation:
                     "mindbridge.prompt.version": perception.prompt_version,
                 }
             )
+            embedding_evidence = await resolve_evidence_media(
+                batch.evidence_spans,
+                batch.media_objects,
+                self._media_url_signer,
+            )
             evidence_embeddings, graph_embeddings = await asyncio.gather(
                 _evidence_embeddings(
                     tenant_id,
-                    evidence,
+                    embedding_evidence,
                     self._embedder,
                     claim.job.created_at,
                 ),

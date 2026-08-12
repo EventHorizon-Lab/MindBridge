@@ -283,7 +283,8 @@ Claim 必须引用 Event 内的 EvidenceSpan，Claim 的有效时间必须落在
 Jina Omni Small 编码原始 EvidenceSpan，用同一兼容空间的 Jina Text Small 批量编码 Event 描述
 和 Claim 陈述，并在一个 PostgreSQL 事务中写入 Event、Entity、EntityMention、Claim、
 MemoryRecord、类型关系、向量和成功 Job 状态。任何模型输出越界、关系悬空、版本冲突或向量错误
-都会回滚整批派生数据；重试使用稳定 ID 且不会合并不同的证据集合。跨 Event 实体消歧、Episode
+都会回滚整批派生数据。VLM 与后续 Jina 阶段分别获取新的短期签名 URL，禁止跨越长模型调用复用
+可能过期的地址；重试使用稳定 ID 且不会合并不同的证据集合。跨 Event 实体消歧、Episode
 合并和多次经历归纳属于后续 Consolidation，不在在线写入路径中凭名称猜测。
 
 ### 5.4 幂等和可恢复性
