@@ -48,8 +48,7 @@ def enqueue_captured_video(
         checksum,
     )
     object_key = (
-        f"tenants/{quote(tenant_id, safe='')}/devices/{quote(device_id, safe='')}/"
-        f"{quote(boot_id, safe='')}/{sequence:020d}-{checksum}{resolved_path.suffix.lower()}"
+        f"tenants/{quote(tenant_id, safe='')}/media/{checksum}{resolved_path.suffix.lower()}"
     )
     uri = f"s3://{bucket}/{object_key}"
     tenant_s3_object_key(bucket, tenant_id, uri)

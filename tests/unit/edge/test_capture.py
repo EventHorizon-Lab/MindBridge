@@ -60,10 +60,7 @@ def test_completed_video_becomes_one_retry_safe_outbox_item(tmp_path: Path) -> N
     assert first == duplicate
     assert first.media_objects[0].sha256 == checksum
     assert first.media_objects[0].duration_ms == 30_000
-    assert first.media_objects[0].uri == (
-        "s3://memory/tenants/tenant_01/devices/camera_01/boot_01/"
-        f"00000000000000000007-{checksum}.mp4"
-    )
+    assert first.media_objects[0].uri == f"s3://memory/tenants/tenant_01/media/{checksum}.mp4"
     assert first.idempotency_key is not None
     assert first.identity_observations == identities
     assert outbox.pending_count() == 1
