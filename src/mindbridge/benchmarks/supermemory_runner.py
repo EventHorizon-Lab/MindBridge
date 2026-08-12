@@ -163,7 +163,7 @@ async def run_supermemory_vqa(
     poll_interval_seconds: float = 1.0,
     processing_timeout_seconds: float = 1_800.0,
 ) -> tuple[SuperMemoryQuestionResult, ...]:
-    """Ingest completed segments and answer at each official question timestamp."""
+    """Ingest completed segments and answer at each official question end time."""
     if not questions:
         raise ValueError("SuperMemory-VQA questions must not be empty")
     if len({question.question_id for question in questions}) != len(questions):
@@ -183,12 +183,14 @@ async def run_supermemory_vqa(
         ),
         key=lambda item: item[0],
     )
-    ordered = sorted(questions, key=lambda question: question.question_at)
+    ordered = sorted(questions, key=lambda question: question.question_ended_at)
     answers: dict[int, SuperMemoryQuestionResult] = {}
     next_segment = 0
     semaphore = asyncio.Semaphore(request_concurrency)
-    for question_at, group in groupby(ordered, key=lambda question: question.question_at):
-        while next_segment < len(segments) and segments[next_segment][1] <= question_at:
+    for question_ended_at, group in groupby(
+        ordered, key=lambda question: question.question_ended_at
+    ):
+        while next_segment < len(segments) and segments[next_segment][1] <= question_ended_at:
             occurred_at, ended_at, video_id, segment = segments[next_segment]
             await _ingest_segment(
                 memory,
@@ -321,7 +323,7 @@ async def _answer_question(
                 query=RecallQuery(
                     text=multiple_choice_query(question.question, question.choices, rank_all=True)
                 ),
-                filters=RecallFilters(occurred_before=question.question_at),
+                filters=RecallFilters(occurred_before=question.question_ended_at),
                 limit=recall_limit,
             )
         )

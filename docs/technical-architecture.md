@@ -1169,7 +1169,7 @@ EgoLifeQA runner 将官方 `DAYn/HHMMSSFF` 映射到单调时间轴，其中 `FF
 计算；无法从受约束输出中无歧义解析时记为未作答。
 
 SuperMemory-VQA runner 以 participant 为隔离单元，将各 session 的 Unix 起点和局部 segment
-时间合成绝对时间。问题截止点取官方 `question_evidence` 最早 span 的开始；同时兼容 release 中
+时间合成绝对时间。问题截止点按官方协议取 `question_evidence` span 的结束；同时兼容 release 中
 6 条旧版单 `time_span` 记录。视频/音频通过 `observe`，官方因隐私只发布而不提供原始音频的
 对齐 transcript 通过生产 `remember` 接口写入；答案标签、choice type 和 answer evidence 均不
 进入 API 请求。回答模型返回四个候选项的完整排序，生产 abstention 映射到数据集显式的

@@ -48,7 +48,7 @@ from mindbridge.models.openai_perception import (
 )
 from mindbridge.sdk import AsyncMindBridge
 
-SUPERMEMORY_RUNNER_VERSION = "supermemory_production_api_v1"
+SUPERMEMORY_RUNNER_VERSION = "supermemory_production_api_v2"
 
 
 class SuperMemoryRunManifest(ContractModel):

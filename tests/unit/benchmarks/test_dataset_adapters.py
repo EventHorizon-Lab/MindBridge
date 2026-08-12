@@ -174,7 +174,7 @@ def test_egolife_adapter_rejects_invalid_query_clock(tmp_path: Path) -> None:
         load_egolife_qa(annotation_path)
 
 
-def test_supermemory_adapter_supports_current_and_legacy_question_times(
+def test_supermemory_adapter_supports_current_and_legacy_question_end_times(
     tmp_path: Path,
 ) -> None:
     annotation_path = tmp_path / "all_qa.json"
@@ -209,8 +209,8 @@ def test_supermemory_adapter_supports_current_and_legacy_question_times(
 
     questions = load_supermemory_vqa(annotation_path)
 
-    assert questions[0].question_at.timestamp() == 1_773_180_868
-    assert questions[1].question_at.timestamp() == 1_773_185_636
+    assert questions[0].question_ended_at.timestamp() == 1_773_180_904
+    assert questions[1].question_ended_at.timestamp() == 1_773_185_722
     assert questions[0].unanswerable_option_index == 0
     assert "SECRET ANSWER EVIDENCE" not in questions[0].model_dump_json()
 

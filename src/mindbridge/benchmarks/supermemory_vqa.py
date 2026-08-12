@@ -9,7 +9,7 @@ from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, TypeAdapter
 
 from mindbridge.contracts import ContractModel, Identifier, NonEmptyString
 
-SUPERMEMORY_VQA_ADAPTER_VERSION = "supermemory_vqa_official_v1"
+SUPERMEMORY_VQA_ADAPTER_VERSION = "supermemory_vqa_official_v2"
 SUPERMEMORY_UNANSWERABLE_CHOICE = "This question can not be answered."
 
 
@@ -25,7 +25,7 @@ class SuperMemoryQuestion(ContractModel):
     is_answerable: bool
     skill: Identifier
     source_video_ids: tuple[Identifier, ...] = Field(min_length=1)
-    question_at: AwareDatetime
+    question_ended_at: AwareDatetime
 
 
 class _RawMetadata(BaseModel):
@@ -125,28 +125,28 @@ def _question(raw: _RawQuestion) -> SuperMemoryQuestion:
         is_answerable=raw.is_answerable,
         skill=raw.metadata.skill,
         source_video_ids=tuple(raw.video_ids),
-        question_at=datetime.fromtimestamp(_question_time(raw), tz=timezone.utc),
+        question_ended_at=datetime.fromtimestamp(_question_end_time(raw), tz=timezone.utc),
     )
 
 
-def _question_time(raw: _RawQuestion) -> float:
+def _question_end_time(raw: _RawQuestion) -> float:
     evidence = raw.question_evidence
     if evidence.time_spans:
-        starts: list[float] = []
+        ends: list[float] = []
         for span in evidence.time_spans:
             if span.start_time < 0 or span.end_time < span.start_time:
                 raise ValueError(
                     f"SuperMemory-VQA question {raw.question_id} has an invalid time span"
                 )
-            starts.append(float(span.video_start_time_unix) + float(span.start_time))
-        return min(starts)
+            ends.append(float(span.video_start_time_unix) + float(span.end_time))
+        return max(ends)
     if evidence.time_span is None or evidence.start_time is None or evidence.video_id is None:
         raise ValueError(f"SuperMemory-VQA question {raw.question_id} has no question time")
     start = _seconds(evidence.time_span.start_time)
     end = _seconds(evidence.time_span.end_time)
     if start < 0 or end < start:
         raise ValueError(f"SuperMemory-VQA question {raw.question_id} has an invalid time span")
-    return float(evidence.start_time) + start
+    return float(evidence.start_time) + end
 
 
 def _seconds(value: str | int | float) -> float:

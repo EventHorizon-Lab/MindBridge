@@ -108,7 +108,7 @@ def _question(question_id: int, *, subject: int = 1) -> SuperMemoryQuestion:
         is_answerable=True,
         skill="object_location_memory",
         source_video_ids=(f"Person_{subject}_session_1",),
-        question_at=NOW,
+        question_ended_at=NOW,
     )
 
 

@@ -94,7 +94,7 @@ async def test_supermemory_withholds_crossing_segment_and_ingests_released_trans
 
     result = await run_supermemory_vqa(
         cast(AsyncMindBridge, api),
-        (_question(1, question_at=ORIGIN + timedelta(seconds=45)),),
+        (_question(1, question_ended_at=ORIGIN + timedelta(seconds=45)),),
         _prepared_subject(),
         run_id="run_01",
         poll_interval_seconds=0.001,
@@ -118,7 +118,7 @@ async def test_supermemory_maps_production_abstention_to_explicit_choice() -> No
 
     result = await run_supermemory_vqa(
         cast(AsyncMindBridge, api),
-        (_question(1, question_at=ORIGIN + timedelta(seconds=45)),),
+        (_question(1, question_ended_at=ORIGIN + timedelta(seconds=45)),),
         _prepared_subject(),
         run_id="run_02",
         poll_interval_seconds=0.001,
@@ -130,10 +130,10 @@ async def test_supermemory_maps_production_abstention_to_explicit_choice() -> No
 
 def test_supermemory_metrics_use_answerability_and_full_ranking() -> None:
     questions = (
-        _question(1, question_at=ORIGIN + timedelta(seconds=45)),
+        _question(1, question_ended_at=ORIGIN + timedelta(seconds=45)),
         _question(
             2,
-            question_at=ORIGIN + timedelta(seconds=46),
+            question_ended_at=ORIGIN + timedelta(seconds=46),
             correct_option_index=0,
             is_answerable=False,
         ),
@@ -164,7 +164,7 @@ def test_prepared_supermemory_rejects_globally_overlapping_segments() -> None:
 def _question(
     question_id: int,
     *,
-    question_at: datetime,
+    question_ended_at: datetime,
     correct_option_index: int = 2,
     is_answerable: bool = True,
 ) -> SuperMemoryQuestion:
@@ -183,7 +183,7 @@ def _question(
         is_answerable=is_answerable,
         skill="object_location_memory",
         source_video_ids=("Person_1_session_1",),
-        question_at=question_at,
+        question_ended_at=question_ended_at,
     )
 
 
