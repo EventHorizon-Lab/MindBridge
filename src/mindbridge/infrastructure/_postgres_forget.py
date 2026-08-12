@@ -9,6 +9,7 @@ from mindbridge.application.ports import ForgetPlan
 from mindbridge.core import (
     DeletionPropagationState,
     DeletionTombstone,
+    DomainInvariantError,
     ForgetTargetNotFoundError,
     ForgetTargetType,
     MemoryDeletedError,
@@ -113,6 +114,16 @@ async def list_deletion_tombstones(
 ) -> tuple[DeletionTombstone, ...]:
     """List one stable tenant page after an optional tombstone cursor."""
     async with tenant_connection(pool, tenant_id) as connection:
+        if after_tombstone_id is not None:
+            boundary = await connection.execute(
+                """
+                SELECT 1 FROM deletion_tombstones
+                WHERE tenant_id = %s AND tombstone_id = %s
+                """,
+                (tenant_id, after_tombstone_id),
+            )
+            if await boundary.fetchone() is None:
+                raise DomainInvariantError("deletion cursor does not exist")
         cursor = await connection.execute(
             """
             SELECT tombstone_id, tenant_id, target_type, target_id,

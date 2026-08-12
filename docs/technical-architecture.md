@@ -728,6 +728,7 @@ HTTP、Python 和 MCP 共享同一层 use case，不各自复制业务逻辑。
 - 所有列表使用 cursor 分页；
 - Recall 默认返回证据，不只返回自然语言答案；
 - `forget` 是幂等操作，并能查询端云传播状态；
+- 删除列表的 cursor 必须属于同一租户且仍然存在；无效 cursor 明确报错，不能用空页伪装同步完成；
 - 每个响应带 `trace_id`，便于 Benchmark 和线上问题复现；
 - OpenAPI 是 REST 契约的唯一事实来源，MCP Tool schema 从同一 Pydantic 模型生成。
 

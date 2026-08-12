@@ -27,6 +27,7 @@ from mindbridge.contracts import (
 )
 from mindbridge.core import (
     DeletionPropagationState,
+    DomainInvariantError,
     EmbeddingSpaceReference,
     ForgetTargetNotFoundError,
     ForgetTargetType,
@@ -172,6 +173,10 @@ async def test_memory_forget_is_idempotent_and_blocks_resurrection(
         first.tombstone_id,
         second.tombstone_id,
     }
+    with pytest.raises(DomainInvariantError, match="deletion cursor"):
+        await kernel.list_deletions(
+            DeletionListRequest(tenant_id=tenant_id, cursor="tombstone_missing")
+        )
     assert await _counts(database_url, tenant_id) == (0, 0, 0, 0, 0, 0, 2)
     with pytest.raises(MemoryDeletedError):
         await kernel.get_memory(tenant_id, memory.memory_id)
