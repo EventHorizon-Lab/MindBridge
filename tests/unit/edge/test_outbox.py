@@ -1,5 +1,6 @@
 """Durability and idempotency checks for the Jetson SQLite outbox."""
 
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -93,6 +94,65 @@ def test_acknowledgement_advances_watermark_and_prevents_requeue(tmp_path: Path)
     assert jobs[0].processing_job_id == "job_01"
     assert outbox.pending_count() == 0
     assert outbox.enqueue(request, files) is False
+
+
+def test_outbox_upgrades_existing_processing_jobs_for_fair_polling(tmp_path: Path) -> None:
+    database_path = tmp_path / "edge.db"
+    with sqlite3.connect(database_path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE edge_processing_jobs (
+                tenant_id TEXT NOT NULL,
+                observation_id TEXT NOT NULL,
+                processing_job_id TEXT NOT NULL,
+                queued_at TEXT NOT NULL,
+                PRIMARY KEY (tenant_id, processing_job_id),
+                UNIQUE (tenant_id, observation_id)
+            );
+            PRAGMA user_version = 3;
+            """
+        )
+
+    SQLiteObservationOutbox(database_path, clock=lambda: NOW)
+
+    with sqlite3.connect(database_path) as connection:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(edge_processing_jobs)")}
+        version = connection.execute("PRAGMA user_version").fetchone()
+    assert "last_polled_at" in columns
+    assert version == (4,)
+
+
+def test_polled_processing_job_yields_to_unpolled_work(tmp_path: Path) -> None:
+    media_path = tmp_path / "clip.mp4"
+    media_path.write_bytes(b"video")
+    outbox = SQLiteObservationOutbox(tmp_path / "edge.db", clock=lambda: NOW)
+    request = _request()
+    for sequence, job_id in ((7, "job_01"), (8, "job_02")):
+        queued = request.model_copy(update={"sequence": sequence})
+        outbox.enqueue(queued, (_file(media_path),))
+        item = outbox.next_pending()
+        assert item is not None
+        outbox.acknowledge(
+            item,
+            ObservationReceipt(
+                observation_id=derive_observation_id(
+                    queued.tenant_id,
+                    queued.device_id,
+                    queued.boot_id,
+                    queued.sequence,
+                ),
+                processing_job_id=job_id,
+                idempotency_key=f"edge_observation_{sequence}",
+                status=ObservationStatus.ACCEPTED,
+                trace_id=f"trace_{job_id}",
+            ),
+        )
+
+    first = outbox.pending_processing_jobs(limit=1)[0]
+    outbox.mark_processing_job_polled(first)
+
+    assert first.processing_job_id == "job_01"
+    assert outbox.pending_processing_jobs(limit=1)[0].processing_job_id == "job_02"
 
 
 def _request() -> ObserveRequest:

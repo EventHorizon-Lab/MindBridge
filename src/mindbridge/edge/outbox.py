@@ -23,7 +23,7 @@ from mindbridge.core import (
 from mindbridge.edge.deletion_inbox import initialize_deletion_tables
 from mindbridge.edge.recent_memory import initialize_recent_memory_tables
 
-_SCHEMA_VERSION = 3
+_SCHEMA_VERSION = 4
 
 
 class EdgeMediaFile(ContractModel):
@@ -365,7 +365,10 @@ class SQLiteObservationOutbox:
                 """
                 SELECT tenant_id, observation_id, processing_job_id, queued_at
                 FROM edge_processing_jobs
-                ORDER BY queued_at, processing_job_id
+                ORDER BY last_polled_at IS NOT NULL,
+                         COALESCE(last_polled_at, queued_at),
+                         queued_at,
+                         processing_job_id
                 LIMIT ?
                 """,
                 (limit,),
@@ -379,6 +382,23 @@ class SQLiteObservationOutbox:
             )
             for row in rows
         )
+
+    def mark_processing_job_polled(self, job: EdgeProcessingJob) -> None:
+        """Move unfinished cloud work behind jobs that have not been checked yet."""
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE edge_processing_jobs
+                SET last_polled_at = ?
+                WHERE tenant_id = ? AND observation_id = ? AND processing_job_id = ?
+                """,
+                (
+                    self._now().isoformat(),
+                    job.tenant_id,
+                    job.observation_id,
+                    job.processing_job_id,
+                ),
+            )
 
     def read_watermark(
         self,

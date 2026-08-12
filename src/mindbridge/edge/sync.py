@@ -185,6 +185,7 @@ class EdgeObservationSynchronizer:
         """Cache completed cloud jobs without blocking on jobs still in progress."""
         cached = 0
         for pending in self._outbox.pending_processing_jobs(limit=limit):
+            self._outbox.mark_processing_job_polled(pending)
             job = await self._memory.get_observation_job(
                 pending.tenant_id,
                 pending.processing_job_id,

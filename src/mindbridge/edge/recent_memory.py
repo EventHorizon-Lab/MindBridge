@@ -166,6 +166,7 @@ def initialize_recent_memory_tables(connection: sqlite3.Connection) -> None:
             observation_id TEXT NOT NULL,
             processing_job_id TEXT NOT NULL,
             queued_at TEXT NOT NULL,
+            last_polled_at TEXT,
             PRIMARY KEY (tenant_id, processing_job_id),
             UNIQUE (tenant_id, observation_id)
         );
@@ -184,6 +185,9 @@ def initialize_recent_memory_tables(connection: sqlite3.Connection) -> None:
             ON edge_recent_memories (tenant_id, occurred_at DESC, memory_id);
         """
     )
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(edge_processing_jobs)")}
+    if "last_polled_at" not in columns:
+        connection.execute("ALTER TABLE edge_processing_jobs ADD COLUMN last_polled_at TEXT")
 
 
 def _with_local_evidence(
