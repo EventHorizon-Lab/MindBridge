@@ -22,7 +22,7 @@ from mindbridge.core import (
 )
 from mindbridge.edge.deletion_inbox import initialize_deletion_tables
 
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 
 
 class EdgeMediaFile(ContractModel):
@@ -74,6 +74,16 @@ class EdgeSyncWatermark:
     observation_id: str
     processing_job_id: str
     synced_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class EdgeProcessingJob:
+    """One acknowledged observation whose cloud memory result is not cached yet."""
+
+    tenant_id: str
+    observation_id: str
+    processing_job_id: str
+    queued_at: datetime
 
 
 class SQLiteObservationOutbox:
@@ -253,6 +263,14 @@ class SQLiteObservationOutbox:
         expected_key = item.request.idempotency_key
         if expected_key is not None and receipt.idempotency_key != expected_key:
             raise MemoryIntegrityError("cloud receipt returned an unexpected idempotency key")
+        expected_observation_id = derive_observation_id(
+            item.request.tenant_id,
+            item.request.device_id,
+            item.request.boot_id,
+            item.request.sequence,
+        )
+        if receipt.observation_id != expected_observation_id:
+            raise MemoryIntegrityError("cloud receipt returned an unexpected observation ID")
         synced_at = self._now()
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -278,6 +296,32 @@ class SQLiteObservationOutbox:
                 raise MemoryIntegrityError("edge outbox item disappeared before acknowledgement")
             if stored["request_json"] != item.request.model_dump_json():
                 raise MemoryIntegrityError("edge outbox item changed before acknowledgement")
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO edge_processing_jobs (
+                        tenant_id, observation_id, processing_job_id, queued_at
+                    ) VALUES (?, ?, ?, ?)
+                    ON CONFLICT (tenant_id, processing_job_id) DO NOTHING
+                    """,
+                    (
+                        item.request.tenant_id,
+                        receipt.observation_id,
+                        receipt.processing_job_id,
+                        synced_at.isoformat(),
+                    ),
+                )
+            except sqlite3.IntegrityError as error:
+                raise MemoryIntegrityError("edge processing job identity conflicts") from error
+            job = connection.execute(
+                """
+                SELECT observation_id FROM edge_processing_jobs
+                WHERE tenant_id = ? AND processing_job_id = ?
+                """,
+                (item.request.tenant_id, receipt.processing_job_id),
+            ).fetchone()
+            if job is None or job["observation_id"] != receipt.observation_id:
+                raise MemoryIntegrityError("edge processing job identity conflicts")
             connection.execute(
                 """
                 INSERT INTO edge_sync_watermarks (
@@ -310,6 +354,30 @@ class SQLiteObservationOutbox:
                 "DELETE FROM edge_observation_outbox WHERE outbox_id = ?",
                 (item.outbox_id,),
             )
+
+    def pending_processing_jobs(self, *, limit: int = 100) -> tuple[EdgeProcessingJob, ...]:
+        """Return a bounded oldest-first snapshot of acknowledged cloud work."""
+        if not 1 <= limit <= 100:
+            raise ValueError("edge processing job limit must be 1..100")
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT tenant_id, observation_id, processing_job_id, queued_at
+                FROM edge_processing_jobs
+                ORDER BY queued_at, processing_job_id
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return tuple(
+            EdgeProcessingJob(
+                tenant_id=row["tenant_id"],
+                observation_id=row["observation_id"],
+                processing_job_id=row["processing_job_id"],
+                queued_at=datetime.fromisoformat(row["queued_at"]),
+            )
+            for row in rows
+        )
 
     def read_watermark(
         self,
@@ -351,7 +419,7 @@ class SQLiteObservationOutbox:
     def _initialize(self) -> None:
         with self._connect() as connection:
             version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-            if version not in {0, 1, _SCHEMA_VERSION}:
+            if not 0 <= version <= _SCHEMA_VERSION:
                 raise RuntimeError(f"unsupported edge outbox schema version {version}")
             connection.executescript(
                 """
@@ -379,6 +447,15 @@ class SQLiteObservationOutbox:
                     processing_job_id TEXT NOT NULL,
                     synced_at TEXT NOT NULL,
                     PRIMARY KEY (tenant_id, device_id, boot_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS edge_processing_jobs (
+                    tenant_id TEXT NOT NULL,
+                    observation_id TEXT NOT NULL,
+                    processing_job_id TEXT NOT NULL,
+                    queued_at TEXT NOT NULL,
+                    PRIMARY KEY (tenant_id, processing_job_id),
+                    UNIQUE (tenant_id, observation_id)
                 );
                 """
             )

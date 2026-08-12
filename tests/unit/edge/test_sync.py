@@ -46,7 +46,12 @@ class FailOnceMemoryApi:
         if self.calls == 1:
             raise MindBridgeClientError("offline", code="transport_error")
         return ObservationReceipt(
-            observation_id="observation_01",
+            observation_id=derive_observation_id(
+                request.tenant_id,
+                request.device_id,
+                request.boot_id,
+                request.sequence,
+            ),
             processing_job_id="job_01",
             idempotency_key=request.idempotency_key or "server_derived_key",
             status=ObservationStatus.DUPLICATE,

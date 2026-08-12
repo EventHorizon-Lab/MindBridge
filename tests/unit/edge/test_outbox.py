@@ -11,7 +11,13 @@ from mindbridge.contracts import (
     ObservationStatus,
     ObserveRequest,
 )
-from mindbridge.core import IdempotencyConflictError, MediaKind, SensorKind
+from mindbridge.core import (
+    IdempotencyConflictError,
+    MediaKind,
+    MemoryIntegrityError,
+    SensorKind,
+    derive_observation_id,
+)
 from mindbridge.edge import EdgeMediaFile, SQLiteObservationOutbox
 
 NOW = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
@@ -60,19 +66,31 @@ def test_acknowledgement_advances_watermark_and_prevents_requeue(tmp_path: Path)
     assert failed.last_error_code == "transport_error"
 
     receipt = ObservationReceipt(
-        observation_id="observation_01",
+        observation_id=derive_observation_id("tenant_01", "camera_01", "boot_01", 7),
         processing_job_id="job_01",
         idempotency_key="edge_observation_01",
         status=ObservationStatus.ACCEPTED,
         trace_id="trace_01",
     )
+    with pytest.raises(MemoryIntegrityError, match="observation ID"):
+        outbox.acknowledge(
+            failed,
+            receipt.model_copy(update={"observation_id": "unexpected_observation"}),
+        )
     outbox.acknowledge(failed, receipt)
     outbox.acknowledge(failed, receipt)
 
     watermark = outbox.read_watermark("tenant_01", "camera_01", "boot_01")
     assert watermark is not None
     assert watermark.sequence == 7
-    assert watermark.observation_id == "observation_01"
+    assert watermark.observation_id == receipt.observation_id
+    jobs = SQLiteObservationOutbox(
+        tmp_path / "edge.db", clock=lambda: NOW
+    ).pending_processing_jobs()
+    assert len(jobs) == 1
+    assert jobs[0].tenant_id == "tenant_01"
+    assert jobs[0].observation_id == receipt.observation_id
+    assert jobs[0].processing_job_id == "job_01"
     assert outbox.pending_count() == 0
     assert outbox.enqueue(request, files) is False
 

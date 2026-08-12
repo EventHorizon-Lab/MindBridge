@@ -10,6 +10,7 @@ from mindbridge.edge.identity import (
 from mindbridge.edge.outbox import (
     EdgeMediaFile,
     EdgeObservationOutboxItem,
+    EdgeProcessingJob,
     EdgeSyncWatermark,
     SQLiteObservationOutbox,
 )
@@ -19,6 +20,7 @@ __all__ = [
     "EdgeMediaFile",
     "EdgeObservationOutboxItem",
     "EdgeObservationSynchronizer",
+    "EdgeProcessingJob",
     "EdgeSyncWatermark",
     "LocalIdentityMatch",
     "LocalIdentitySample",
