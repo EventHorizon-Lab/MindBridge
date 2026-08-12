@@ -671,12 +671,12 @@ MindBridge 对外只暴露少量稳定语义：
 
 | 语义 | Python/领域函数 | REST | MCP Tool |
 | --- | --- | --- | --- |
-| 提交连续或离散观察 | `observe(...)` | `POST /v1/observations` | `memory_observe` |
-| 显式写入需要长期保留的内容 | `remember(...)` | `POST /v1/memories` | `memory_remember` |
-| 多模态召回和回答 | `recall(...)` | `POST /v1/recall` | `memory_recall` |
-| 获取记忆及其证据 | `get(memory_id)` | `GET /v1/memories/{id}` | `memory_get` |
-| 提交有用、错误、遗漏或纠正 | `feedback(...)` | `POST /v1/feedback` | `memory_feedback` |
-| 显式遗忘某段内容或范围 | `forget(...)` | `POST /v1/forget` | `memory_forget` |
+| 提交连续或离散观察 | `observe(request)` | `POST /v1/observations` | `memory_observe` |
+| 显式写入需要长期保留的内容 | `remember(request)` | `POST /v1/memories` | `memory_remember` |
+| 多模态召回和回答 | `recall(request)` | `POST /v1/recall` | `memory_recall` |
+| 获取记忆及其证据 | `get_memory(tenant_id, memory_id)` | `GET /v1/memories/{memory_id}` | `memory_get` |
+| 提交有用、错误、遗漏或纠正 | `record_feedback(request)` | `POST /v1/feedback` | `memory_feedback` |
+| 显式遗忘某段内容或范围 | `forget(request)` | `POST /v1/forget` | `memory_forget` |
 
 HTTP、Python 和 MCP 共享同一层 use case，不各自复制业务逻辑。
 顶层 `remember` 与 `get_memory` 返回扁平的 `MemoryResult`：它保留 `MemoryView` 字段、请求
