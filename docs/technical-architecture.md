@@ -1,7 +1,7 @@
 # MindBridge 技术实现架构
 
-> 状态：基线方案（Baseline）
-> 版本：0.3
+> 状态：实现基线（Phase 3 进行中）
+> 版本：0.4
 > 更新日期：2026-08-12
 
 ## 1. 文档目的
@@ -1277,6 +1277,12 @@ answer、forget 和 lifecycle 使用命名领域 span。span 只包含 tenant/de
 正文、完整 Prompt、生物 embedding 或原始媒体。API/MCP 返回的 `trace_id` 使用当前 W3C trace
 ID；无 SDK 的嵌入式调用才生成独立 fallback ID。
 
+所有使用 `trace_operation` 的领域操作同时产生 `mindbridge.operation.calls` Counter 和
+`mindbridge.operation.duration` Histogram。指标维度固定为有限集合的 `operation` 与
+`outcome=success|error|cancelled`，不携带租户、对象 ID、正文或异常内容，既能计算吞吐、错误率和
+P50/P95/P99，也不会制造高基数或隐私泄漏。SLO 阈值由部署的 Collector/监控规则基于真实负载
+配置，不硬编码进业务代码。
+
 日志同样只记录 ID、耗时、模型版本、token/frame/audio 秒数和错误；默认不写原始人脸、音频
 内容、完整 Prompt 或用户记忆正文。生产导出先进入 OpenTelemetry Collector，再由 Collector
 负责采样、批处理、脱敏和后端路由。
@@ -1320,6 +1326,22 @@ ID；无 SDK 的嵌入式调用才生成独立 fallback ID。
 - Python SDK、MCP 和完整 OpenAPI 文档。
 
 验收：目标 Benchmark 达到可复现 SOTA；质量配置可以直接部署为 MaaS，而不是另起一套演示系统。
+
+### 16.1 当前实施状态
+
+| 阶段 | 当前状态 | 已落地证据 | 剩余验收 |
+| --- | --- | --- | --- |
+| Phase 0 | 完成 | 严格领域契约、锁定依赖、CI、Jina smoke、官方数据适配器和可追溯 LoCoMo 切片 | 继续将每次公开结果固化为 run manifest |
+| Phase 1 | 软件垂直路径完成 | 原生采集 handoff、加密身份 prototype、SQLite Outbox/近期记忆、S3 同步、durable Job、Event/pgvector 与 REST API | 在目标 Jetson 上完成真实摄像头、VAD/场景/运动门控、断网和功耗验收 |
+| Phase 2 | 功能路径完成 | Episode/Claim/Summary consolidation、RRF/图展开/媒体重看、反馈纠错、生命周期、显式删除，以及四套 Benchmark 的生产 API runner | 跑完官方 split，并提交分层检索与回答结果，而不只保留 smoke 或单会话分数 |
+| Phase 3 | 进行中 | RLS 多租户、Bearer allowlist、Python SDK、MCP/OpenAPI、OpenTelemetry trace 与领域 SLO 指标 | 模型 bake-off、失败案例回放、Jetson/Nano 实测、配额策略、持久审计、备份删除演练和完整 SOTA 复现 |
+
+“软件路径完成”不等于硬件或榜单验收完成。以下项目不能由单元测试替代：
+
+1. Jetson 的 FPS、显存、功耗、温度、丢帧与断网缓存增长必须在目标 SKU 和真实传感器上记录；
+2. Jina Nano 是否常驻、事件门控阈值和媒体保留期必须由同一真实机器人回放集校准；
+3. SOTA 只接受官方完整 split、固定代码/模型 revision、公开 run manifest 和可重放输出；
+4. 每租户配额、审计保留期、备份擦除窗口和 P95 SLO 必须先获得负载模型与运营约束，再进入配置和门禁。
 
 ## 17. 关键架构决策记录
 

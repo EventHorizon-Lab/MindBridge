@@ -3,14 +3,17 @@
 import os
 import subprocess
 import sys
+from collections.abc import Mapping
 from typing import cast
 
+import pytest
 from fastapi.testclient import TestClient
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from opentelemetry.trace import NonRecordingSpan, SpanContext, SpanKind, TraceFlags, use_span
 
+from mindbridge import telemetry
 from mindbridge.api import TenantApiKeyAuthenticator, create_app
 from mindbridge.application.kernel import MemoryKernel
 from mindbridge.telemetry import (
@@ -19,6 +22,17 @@ from mindbridge.telemetry import (
     instrument_fastapi,
     trace_operation,
 )
+
+
+class RecordingMetric:
+    def __init__(self) -> None:
+        self.measurements: list[tuple[float, dict[str, str]]] = []
+
+    def add(self, value: int, attributes: Mapping[str, str] | None = None) -> None:
+        self.measurements.append((value, dict(attributes or {})))
+
+    def record(self, value: float, attributes: Mapping[str, str] | None = None) -> None:
+        self.measurements.append((value, dict(attributes or {})))
 
 
 async def test_domain_operation_returns_the_active_w3c_trace_identity() -> None:
@@ -37,6 +51,35 @@ async def test_domain_operation_returns_the_active_w3c_trace_identity() -> None:
         result = await operation()
 
     assert result == "trace_00000000000000000000000000001234"
+
+
+async def test_domain_operation_records_content_free_slo_metrics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = RecordingMetric()
+    durations = RecordingMetric()
+    monkeypatch.setattr(telemetry, "_OPERATION_CALLS", calls)
+    monkeypatch.setattr(telemetry, "_OPERATION_DURATION", durations)
+
+    @trace_operation("mindbridge.test.metrics")
+    async def succeed() -> str:
+        return "private-memory-content"
+
+    @trace_operation("mindbridge.test.metrics")
+    async def fail() -> None:
+        raise RuntimeError("private-error-content")
+
+    assert await succeed() == "private-memory-content"
+    with pytest.raises(RuntimeError, match="private-error-content"):
+        await fail()
+
+    assert [attributes for _, attributes in calls.measurements] == [
+        {"operation": "mindbridge.test.metrics", "outcome": "success"},
+        {"operation": "mindbridge.test.metrics", "outcome": "error"},
+    ]
+    assert len(durations.measurements) == 2
+    assert all(value >= 0 for value, _ in durations.measurements)
+    assert "private" not in repr(calls.measurements + durations.measurements)
 
 
 def test_fastapi_returns_trace_identity_without_capturing_secret_content() -> None:

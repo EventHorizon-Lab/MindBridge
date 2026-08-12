@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import sys
 from collections.abc import Callable, Coroutine, Mapping
@@ -9,6 +10,7 @@ from dataclasses import dataclass
 from functools import wraps
 from importlib.metadata import version
 from threading import Lock
+from time import perf_counter
 from typing import TYPE_CHECKING, ParamSpec, TypeVar
 from uuid import uuid4
 
@@ -22,7 +24,19 @@ if TYPE_CHECKING:
 
 _Parameters = ParamSpec("_Parameters")
 _Result = TypeVar("_Result")
-_TRACER = trace.get_tracer("mindbridge", version("mindbridge"))
+_INSTRUMENTATION_VERSION = version("mindbridge")
+_TRACER = trace.get_tracer("mindbridge", _INSTRUMENTATION_VERSION)
+_METER = metrics.get_meter("mindbridge", _INSTRUMENTATION_VERSION)
+_OPERATION_CALLS = _METER.create_counter(
+    "mindbridge.operation.calls",
+    unit="{call}",
+    description="Completed MindBridge domain operations.",
+)
+_OPERATION_DURATION = _METER.create_histogram(
+    "mindbridge.operation.duration",
+    unit="s",
+    description="MindBridge domain operation duration.",
+)
 _CONFIGURATION_LOCK = Lock()
 _configured_process: tuple[int, str, TelemetryProviders] | None = None
 
@@ -55,8 +69,23 @@ def trace_operation(
             *args: _Parameters.args,
             **kwargs: _Parameters.kwargs,
         ) -> _Result:
-            with _TRACER.start_as_current_span(name):
-                return await operation(*args, **kwargs)
+            started_at = perf_counter()
+            outcome = "error"
+            try:
+                with _TRACER.start_as_current_span(name):
+                    result = await operation(*args, **kwargs)
+                outcome = "success"
+                return result
+            except asyncio.CancelledError:
+                outcome = "cancelled"
+                raise
+            finally:
+                attributes = {"operation": name, "outcome": outcome}
+                _OPERATION_CALLS.add(1, attributes)
+                _OPERATION_DURATION.record(
+                    max(0.0, perf_counter() - started_at),
+                    attributes,
+                )
 
         return traced
 
