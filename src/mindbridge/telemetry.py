@@ -167,10 +167,9 @@ def _instrument_clients(providers: TelemetryProviders) -> None:
         "tracer_provider": providers.tracer,
         "meter_provider": providers.meter,
     }
-    if "botocore" in sys.modules:
-        from opentelemetry.instrumentation.botocore import BotocoreInstrumentor
+    from opentelemetry.instrumentation.botocore import BotocoreInstrumentor
 
-        BotocoreInstrumentor().instrument(**keywords)  # type: ignore[no-untyped-call]
+    BotocoreInstrumentor().instrument(**keywords)  # type: ignore[no-untyped-call]
     if "celery" in sys.modules:
         from opentelemetry.instrumentation.celery import CeleryInstrumentor
 

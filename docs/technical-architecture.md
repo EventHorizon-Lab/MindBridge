@@ -1223,6 +1223,9 @@ HTTPX 传播到模型/API，
 并通过 Celery header 传播到 prefork Worker；Worker 的 SDK 与 BatchSpanProcessor 必须在
 `worker_process_init` 后初始化，不能在父进程启动后台线程。
 
+统一 telemetry 配置会在创建首个 S3 client 前直接安装 Botocore instrumentation；无需为追踪
+提前加载完整 Boto3，也不会让只使用 SQLite identity 的端侧进程加载网络栈。
+
 `observe`、`process_observation`、perception、embedding、recall candidate、evidence resolve、
 answer、forget 和 lifecycle 使用命名领域 span。span 只包含 tenant/device/object ID、数量、
 状态、模型/revision、Prompt version 和性能数据；不采集 Authorization、请求/响应 body、查询

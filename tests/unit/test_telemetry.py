@@ -83,9 +83,12 @@ def test_otlp_runtime_configures_in_an_isolated_process() -> None:
             sys.executable,
             "-c",
             (
+                "import mindbridge.worker; "
+                "from opentelemetry.instrumentation.botocore import BotocoreInstrumentor; "
                 "from mindbridge.telemetry import configure_telemetry; "
                 "providers = configure_telemetry('mindbridge-test'); "
-                "assert providers.tracer is not None and providers.meter is None"
+                "assert providers.tracer is not None and providers.meter is None; "
+                "assert BotocoreInstrumentor().is_instrumented_by_opentelemetry"
             ),
         ],
         check=False,
