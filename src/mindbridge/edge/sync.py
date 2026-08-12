@@ -124,7 +124,9 @@ class EdgeObservationSynchronizer:
         item = self._outbox.next_pending()
         polled_tenant_ids: set[str] = set()
         while item is not None and item.request.tenant_id not in polled_tenant_ids:
-            await self.sync_deletions(item.request.tenant_id)
+            _, caught_up = await self._sync_deletion_pages(item.request.tenant_id)
+            if not caught_up:
+                return None
             polled_tenant_ids.add(item.request.tenant_id)
             item = self._outbox.next_pending()
         if item is None:
@@ -162,6 +164,20 @@ class EdgeObservationSynchronizer:
         max_pages: int = 10,
     ) -> int:
         """Apply a bounded ordered batch of cloud tombstones before any upload."""
+        applied, _ = await self._sync_deletion_pages(
+            tenant_id,
+            page_limit=page_limit,
+            max_pages=max_pages,
+        )
+        return applied
+
+    async def _sync_deletion_pages(
+        self,
+        tenant_id: str,
+        *,
+        page_limit: int = 100,
+        max_pages: int = 10,
+    ) -> tuple[int, bool]:
         if not 1 <= page_limit <= 100 or max_pages <= 0:
             raise ValueError("deletion page_limit must be 1..100 and max_pages must be positive")
         cursor = self._deletion_inbox.read_cursor(tenant_id)
@@ -176,9 +192,9 @@ class EdgeObservationSynchronizer:
             )
             applied += self._deletion_inbox.apply_page(tenant_id, page)
             if page.next_cursor is None:
-                break
+                return applied, True
             cursor = page.next_cursor
-        return applied
+        return applied, False
 
     @trace_operation("mindbridge.edge.sync_recent_memories")
     async def sync_recent_memories(self, *, limit: int = 100) -> int:

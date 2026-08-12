@@ -117,6 +117,41 @@ class DeletingMemoryApi:
         )
 
 
+class DeletionBacklogApi:
+    def __init__(self) -> None:
+        self.list_calls = 0
+        self.observe_calls = 0
+
+    async def observe(self, request: ObserveRequest) -> ObservationReceipt:
+        self.observe_calls += 1
+        raise AssertionError("an unsynchronized deletion backlog must block uploads")
+
+    async def list_deletions(self, request: DeletionListRequest) -> DeletionPage:
+        expected_cursor = (
+            None if self.list_calls == 0 else f"tombstone_{self.list_calls * request.limit - 1:04d}"
+        )
+        assert request.cursor == expected_cursor
+        start = self.list_calls * request.limit
+        self.list_calls += 1
+        items = tuple(
+            DeletionTombstoneView(
+                tombstone_id=f"tombstone_{index:04d}",
+                target_type=ForgetTargetType.MEMORY_RECORD,
+                target_id=f"memory_{index:04d}",
+                propagation_state=DeletionPropagationState.COMPLETE,
+                requested_at=NOW,
+                completed_at=NOW,
+                error_code=None,
+            )
+            for index in range(start, start + request.limit)
+        )
+        return DeletionPage(
+            items=items,
+            next_cursor=items[-1].tombstone_id,
+            trace_id="trace_deletion_backlog",
+        )
+
+
 class CompletedMemoryApi:
     def __init__(
         self,
@@ -220,6 +255,34 @@ async def test_sync_applies_tombstone_before_media_upload(tmp_path: Path) -> Non
     assert upload_calls == []
     assert outbox.pending_count() == 0
     assert not media_file.local_path.exists()
+
+
+async def test_sync_blocks_upload_while_deletion_backlog_remains(tmp_path: Path) -> None:
+    request, media_file = _capture(tmp_path)
+    database_path = tmp_path / "edge.db"
+    outbox = SQLiteObservationOutbox(database_path, clock=lambda: NOW)
+    outbox.enqueue(request, (media_file,))
+    deletion_inbox = SQLiteDeletionInbox(database_path, clock=lambda: NOW)
+    api = DeletionBacklogApi()
+    upload_calls: list[str] = []
+
+    async def upload(_request: ObserveRequest, file: EdgeMediaFile) -> None:
+        upload_calls.append(file.media_object_id)
+
+    receipt = await EdgeObservationSynchronizer(
+        outbox,
+        deletion_inbox,
+        cast(AsyncMindBridge, api),
+        upload,
+        recent_memory=SQLiteRecentMemory(database_path, clock=lambda: NOW),
+    ).sync_next()
+
+    assert receipt is None
+    assert api.list_calls == 10
+    assert api.observe_calls == 0
+    assert upload_calls == []
+    assert outbox.pending_count() == 1
+    assert deletion_inbox.read_cursor(request.tenant_id) == "tombstone_0999"
 
 
 async def test_s3_uploader_checks_bytes_and_tenant_before_upload(tmp_path: Path) -> None:
