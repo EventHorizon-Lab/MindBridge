@@ -48,11 +48,13 @@ def test_outbox_survives_restart_and_rejects_sequence_content_conflicts(
         restarted.enqueue(changed, files)
 
 
-def test_acknowledgement_advances_watermark_and_prevents_requeue(tmp_path: Path) -> None:
+def test_acknowledgement_keeps_watermark_without_dropping_late_work(
+    tmp_path: Path,
+) -> None:
     media_path = tmp_path / "clip.mp4"
     media_path.write_bytes(b"video")
     outbox = SQLiteObservationOutbox(tmp_path / "edge.db", clock=lambda: NOW)
-    request = _request()
+    request = _request().model_copy(update={"sequence": 8})
     files = (_file(media_path),)
     outbox.enqueue(request, files)
     item = outbox.next_pending()
@@ -67,7 +69,7 @@ def test_acknowledgement_advances_watermark_and_prevents_requeue(tmp_path: Path)
     assert failed.last_error_code == "transport_error"
 
     receipt = ObservationReceipt(
-        observation_id=derive_observation_id("tenant_01", "camera_01", "boot_01", 7),
+        observation_id=derive_observation_id("tenant_01", "camera_01", "boot_01", 8),
         processing_job_id="job_01",
         idempotency_key="edge_observation_01",
         status=ObservationStatus.ACCEPTED,
@@ -83,7 +85,7 @@ def test_acknowledgement_advances_watermark_and_prevents_requeue(tmp_path: Path)
 
     watermark = outbox.read_watermark("tenant_01", "camera_01", "boot_01")
     assert watermark is not None
-    assert watermark.sequence == 7
+    assert watermark.sequence == 8
     assert watermark.observation_id == receipt.observation_id
     jobs = SQLiteObservationOutbox(
         tmp_path / "edge.db", clock=lambda: NOW
@@ -93,7 +95,10 @@ def test_acknowledgement_advances_watermark_and_prevents_requeue(tmp_path: Path)
     assert jobs[0].observation_id == receipt.observation_id
     assert jobs[0].processing_job_id == "job_01"
     assert outbox.pending_count() == 0
-    assert outbox.enqueue(request, files) is False
+    assert outbox.enqueue(_request(), files) is True
+    late = outbox.next_pending()
+    assert late is not None
+    assert late.request.sequence == 7
 
 
 def test_outbox_upgrades_existing_processing_jobs_for_fair_polling(tmp_path: Path) -> None:

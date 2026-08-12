@@ -108,7 +108,7 @@ class SQLiteObservationOutbox:
         request: ObserveRequest,
         media_files: tuple[EdgeMediaFile, ...],
     ) -> bool:
-        """Durably queue a new sequence; return false for an exact prior sequence."""
+        """Durably queue a sequence; return false if the same work is already pending."""
         request_media_ids = tuple(media.media_object_id for media in request.media_objects)
         file_media_ids = tuple(media.media_object_id for media in media_files)
         if request_media_ids != file_media_ids:
@@ -139,16 +139,6 @@ class SQLiteObservationOutbox:
             ).fetchone()
             if tombstone is not None:
                 raise MemoryDeletedError("edge observation was explicitly forgotten")
-            watermark = connection.execute(
-                """
-                SELECT sequence
-                FROM edge_sync_watermarks
-                WHERE tenant_id = ? AND device_id = ? AND boot_id = ?
-                """,
-                (request.tenant_id, request.device_id, request.boot_id),
-            ).fetchone()
-            if watermark is not None and request.sequence <= int(watermark["sequence"]):
-                return False
             existing = connection.execute(
                 """
                 SELECT request_json, media_files_json
