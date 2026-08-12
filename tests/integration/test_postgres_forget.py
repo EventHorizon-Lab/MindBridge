@@ -186,6 +186,54 @@ async def test_memory_forget_is_idempotent_and_blocks_resurrection(
         await kernel.get_forget_status("other_tenant", first.tombstone_id)
 
 
+async def test_deletion_cursor_follows_commit_order_when_clock_moves_backward(
+    store: PostgresMemoryStore,
+) -> None:
+    tenant_id = "tenant_forget_cursor_order"
+    media_access = RecordingMediaAccess()
+    kernel = _kernel(store, media_access)
+    first_memory = await kernel.remember(
+        RememberRequest(
+            tenant_id=tenant_id,
+            summary="First memory",
+            memory_type=MemoryType.SEMANTIC,
+            occurred_at=NOW,
+        )
+    )
+    second_memory = await kernel.remember(
+        RememberRequest(
+            tenant_id=tenant_id,
+            summary="Second memory",
+            memory_type=MemoryType.SEMANTIC,
+            occurred_at=NOW,
+        )
+    )
+    first = await kernel.forget(
+        ForgetRequest(
+            tenant_id=tenant_id,
+            target_type=ForgetTargetType.MEMORY_RECORD,
+            target_id=first_memory.memory_id,
+        )
+    )
+    second = await _kernel(
+        store,
+        media_access,
+        now=NOW - timedelta(seconds=1),
+    ).forget(
+        ForgetRequest(
+            tenant_id=tenant_id,
+            target_type=ForgetTargetType.MEMORY_RECORD,
+            target_id=second_memory.memory_id,
+        )
+    )
+
+    page = await kernel.list_deletions(
+        DeletionListRequest(tenant_id=tenant_id, cursor=first.tombstone_id)
+    )
+
+    assert tuple(item.tombstone_id for item in page.items) == (second.tombstone_id,)
+
+
 async def test_observation_forget_recovers_after_media_failure_and_erases_derivatives(
     store: PostgresMemoryStore,
     database_url: str,
@@ -249,7 +297,12 @@ async def test_observation_forget_recovers_after_media_failure_and_erases_deriva
         await kernel.get_memory(tenant_id, memory.memory_id)
 
 
-def _kernel(store: PostgresMemoryStore, media_access: RecordingMediaAccess) -> MemoryKernel:
+def _kernel(
+    store: PostgresMemoryStore,
+    media_access: RecordingMediaAccess,
+    *,
+    now: datetime = NOW,
+) -> MemoryKernel:
     return MemoryKernel(
         store,
         FirstMemoryAnswerer(),
@@ -258,7 +311,7 @@ def _kernel(store: PostgresMemoryStore, media_access: RecordingMediaAccess) -> M
         media_url_signer=media_access,
         observation_job_publisher=DiscardingJobPublisher(),
         recall_embedder=FixedRecallEmbedder(),
-        clock=lambda: NOW,
+        clock=lambda: now,
     )
 
 

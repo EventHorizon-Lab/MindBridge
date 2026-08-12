@@ -114,34 +114,30 @@ async def list_deletion_tombstones(
 ) -> tuple[DeletionTombstone, ...]:
     """List one stable tenant page after an optional tombstone cursor."""
     async with tenant_connection(pool, tenant_id) as connection:
+        after_sequence = 0
         if after_tombstone_id is not None:
             boundary = await connection.execute(
                 """
-                SELECT 1 FROM deletion_tombstones
+                SELECT cursor_sequence FROM deletion_tombstones
                 WHERE tenant_id = %s AND tombstone_id = %s
                 """,
                 (tenant_id, after_tombstone_id),
             )
-            if await boundary.fetchone() is None:
+            row = await boundary.fetchone()
+            if row is None:
                 raise DomainInvariantError("deletion cursor does not exist")
+            after_sequence = cast(tuple[int], row)[0]
         cursor = await connection.execute(
             """
             SELECT tombstone_id, tenant_id, target_type, target_id,
                    propagation_state, requested_at, completed_at, error_code
             FROM deletion_tombstones AS tombstone
             WHERE tombstone.tenant_id = %s
-              AND (
-                  %s::text IS NULL
-                  OR (tombstone.requested_at, tombstone.tombstone_id) > (
-                      SELECT boundary.requested_at, boundary.tombstone_id
-                      FROM deletion_tombstones AS boundary
-                      WHERE boundary.tenant_id = %s AND boundary.tombstone_id = %s
-                  )
-              )
-            ORDER BY tombstone.requested_at, tombstone.tombstone_id
+              AND tombstone.cursor_sequence > %s
+            ORDER BY tombstone.cursor_sequence
             LIMIT %s
             """,
-            (tenant_id, after_tombstone_id, tenant_id, after_tombstone_id, limit),
+            (tenant_id, after_sequence, limit),
         )
         return tuple([_tombstone_from_row(cast(TombstoneRow, row)) async for row in cursor])
 
@@ -292,6 +288,10 @@ async def _insert_tombstone(
     connection: DatabaseConnection,
     tombstone: DeletionTombstone,
 ) -> DeletionTombstone:
+    await connection.execute(
+        "SELECT pg_advisory_xact_lock(hashtextextended('mindbridge:deletion:' || %s, 0))",
+        (tombstone.tenant_id,),
+    )
     cursor = await connection.execute(
         """
         INSERT INTO deletion_tombstones (
