@@ -97,15 +97,19 @@ async def test_postgres_lifecycle_does_not_overwrite_concurrent_feedback(
     assert stored.state is MemoryState.STRENGTHENED
 
 
-async def test_postgres_lifecycle_snapshot_skips_later_feedback_and_access(
+async def test_postgres_lifecycle_snapshot_skips_later_writes(
     store: PostgresMemoryStore,
 ) -> None:
     tenant_id = TenantId("tenant_lifecycle_snapshot")
-    feedback_memory = _memory(tenant_id, "memory_feedback", NOW - timedelta(days=30))
-    access_memory = _memory(tenant_id, "memory_access", NOW - timedelta(days=30))
+    snapshot_at = datetime(2000, 1, 1, tzinfo=timezone.utc)
+    created_at = snapshot_at - timedelta(days=30)
+    feedback_memory = _memory(tenant_id, "memory_feedback", created_at)
+    access_memory = _memory(tenant_id, "memory_access", created_at)
+    delayed_memory = _memory(tenant_id, "memory_delayed", created_at)
     await _write_memory(store, feedback_memory)
     await _write_memory(store, access_memory)
-    later = NOW + timedelta(minutes=1)
+    await _write_memory(store, delayed_memory)
+    later = snapshot_at + timedelta(minutes=1)
     await store.record_feedback(
         MemoryFeedback(
             feedback_id=FeedbackId("feedback_later"),
@@ -125,19 +129,19 @@ async def test_postgres_lifecycle_snapshot_skips_later_feedback_and_access(
     )
 
     snapshot = await EvolveMemoryLifecycle(store, POLICY).run(
-        LifecycleSweepRequest(tenant_id=tenant_id, evaluated_at=NOW, limit=10)
+        LifecycleSweepRequest(tenant_id=tenant_id, evaluated_at=snapshot_at, limit=10)
     )
     next_snapshot = await EvolveMemoryLifecycle(store, POLICY).run(
         LifecycleSweepRequest(
             tenant_id=tenant_id,
-            evaluated_at=later + timedelta(minutes=1),
+            evaluated_at=datetime(2100, 1, 1, tzinfo=timezone.utc),
             limit=10,
         )
     )
 
     assert snapshot.evaluated_count == 0
     assert snapshot.updated_count == 0
-    assert next_snapshot.evaluated_count == 2
+    assert next_snapshot.evaluated_count == 3
 
 
 async def test_postgres_recall_access_reactivates_cold_memory_without_rewinding_time(

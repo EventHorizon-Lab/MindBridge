@@ -264,7 +264,7 @@ async def _insert_memory(
         )
         VALUES (
             %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-            %s, %s, %s, %s, %s, %s, %s, %s, %s
+            %s, %s, %s, %s, %s, %s, GREATEST(now(), %s), %s, %s
         )
         ON CONFLICT DO NOTHING
         RETURNING memory_id
@@ -288,7 +288,7 @@ async def _insert_memory(
             memory.positive_feedback_count,
             memory.negative_feedback_count,
             memory.last_accessed_at,
-            memory.last_accessed_at or memory.created_at,
+            memory.created_at,
             memory.supersedes_memory_id,
             memory.superseded_at,
         ),

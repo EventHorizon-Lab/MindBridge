@@ -164,7 +164,7 @@ async def _update_memory_lifecycle(
             positive_feedback_count = %s,
             negative_feedback_count = %s,
             last_accessed_at = %s,
-            lifecycle_changed_at = GREATEST(lifecycle_changed_at, %s),
+            lifecycle_changed_at = GREATEST(lifecycle_changed_at, now(), %s),
             superseded_at = %s
         WHERE tenant_id = %s AND memory_id = %s
         """,

@@ -313,7 +313,7 @@ async def _supersede_claim(
         """
         UPDATE memory_records
         SET superseded_at = %s,
-            lifecycle_changed_at = GREATEST(lifecycle_changed_at, %s)
+            lifecycle_changed_at = GREATEST(lifecycle_changed_at, now(), %s)
         WHERE tenant_id = %s AND memory_id = %s AND superseded_at IS NULL
         """,
         (

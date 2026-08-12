@@ -312,7 +312,9 @@ async def _restore_claim_versions(
         )
         UPDATE memory_records AS memory
         SET superseded_at = NULL,
-            lifecycle_changed_at = GREATEST(memory.lifecycle_changed_at, %s)
+            lifecycle_changed_at = GREATEST(
+                memory.lifecycle_changed_at, now(), %s
+            )
         FROM restored
         JOIN relations AS representation
           ON representation.tenant_id = %s

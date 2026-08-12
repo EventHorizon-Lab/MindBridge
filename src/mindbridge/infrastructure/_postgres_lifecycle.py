@@ -35,7 +35,7 @@ async def record_memory_accesses(
             SET useful_access_count = memory.useful_access_count + 1,
                 last_accessed_at = GREATEST(memory.last_accessed_at, %(accessed_at)s),
                 lifecycle_changed_at = GREATEST(
-                    memory.lifecycle_changed_at, %(accessed_at)s
+                    memory.lifecycle_changed_at, now(), %(accessed_at)s
                 ),
                 state = CASE WHEN memory.state = 'cold' THEN 'active' ELSE memory.state END
             WHERE memory.tenant_id = %(tenant_id)s
@@ -118,7 +118,10 @@ async def update_memory_lifecycles(
             cursor = await connection.execute(
                 f"""
                 UPDATE memory_records AS memory
-                SET state = %s, strength = %s, lifecycle_changed_at = %s
+                SET state = %s, strength = %s,
+                    lifecycle_changed_at = GREATEST(
+                        memory.lifecycle_changed_at, now(), %s
+                    )
                 WHERE memory.tenant_id = %s
                   AND memory.memory_id = %s
                   AND memory.state = %s

@@ -5,17 +5,15 @@ ALTER TABLE memory_records
 
 UPDATE memory_records AS memory
 SET lifecycle_changed_at = GREATEST(
+    now(),
     memory.created_at,
-    COALESCE(memory.last_accessed_at, memory.created_at),
-    COALESCE(memory.superseded_at, memory.created_at),
-    COALESCE(
-        (
-            SELECT max(feedback.created_at)
-            FROM memory_feedback AS feedback
-            WHERE feedback.tenant_id = memory.tenant_id
-              AND feedback.memory_id = memory.memory_id
-        ),
-        memory.created_at
+    memory.last_accessed_at,
+    memory.superseded_at,
+    (
+        SELECT max(feedback.created_at)
+        FROM memory_feedback AS feedback
+        WHERE feedback.tenant_id = memory.tenant_id
+          AND feedback.memory_id = memory.memory_id
     )
 );
 
