@@ -95,6 +95,25 @@ def test_observe_requires_timezone_aware_timestamps() -> None:
         _observe_request(observed_at=datetime(2026, 8, 11, 12, 0))  # noqa: DTZ001
 
 
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    (
+        ("sequence", 2**63),
+        ("clock_offset_ms", 2**31),
+        ("clock_offset_ms", -(2**31) - 1),
+    ),
+)
+def test_observe_rejects_values_outside_storage_integer_ranges(
+    field_name: str,
+    value: int,
+) -> None:
+    payload = _observe_request().model_dump()
+    payload[field_name] = value
+
+    with pytest.raises(ValidationError):
+        ObserveRequest.model_validate(payload)
+
+
 def test_media_hash_is_canonicalized_for_content_deduplication() -> None:
     media = _observe_request().media_objects[0].model_copy(update={"sha256": "A" * 64})
 

@@ -92,13 +92,13 @@ class ObserveRequest(ContractModel):
     tenant_id: Identifier
     device_id: Identifier
     boot_id: Identifier
-    sequence: Annotated[int, Field(ge=0)]
+    sequence: Annotated[int, Field(ge=0, le=9_223_372_036_854_775_807)]
     sensor: SensorKind
     media_objects: Annotated[tuple[MediaObjectInput, ...], Field(min_length=1, max_length=8)]
     occurred_at: UtcDatetime
     ended_at: UtcDatetime
     observed_at: UtcDatetime
-    clock_offset_ms: int = 0
+    clock_offset_ms: Annotated[int, Field(ge=-2_147_483_648, le=2_147_483_647)] = 0
     identity_observations: Annotated[
         tuple[IdentityObservationInput, ...], Field(max_length=256)
     ] = ()

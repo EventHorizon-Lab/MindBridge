@@ -21,6 +21,9 @@ from mindbridge.core.identifiers import (
 from mindbridge.core.identity import AnonymousIdentityObservation
 
 _SHA256_HEX_LENGTH = 64
+_SIGNED_INT64_MAX = 2**63 - 1
+_SIGNED_INT32_MIN = -(2**31)
+_SIGNED_INT32_MAX = 2**31 - 1
 
 
 class MediaKind(str, Enum):
@@ -108,8 +111,10 @@ class Observation:
         require_aware_datetime(self.occurred_at, "occurred_at")
         require_aware_datetime(self.ended_at, "ended_at")
         require_aware_datetime(self.observed_at, "observed_at")
-        if self.sequence < 0:
-            raise DomainInvariantError("sequence must be non-negative")
+        if not 0 <= self.sequence <= _SIGNED_INT64_MAX:
+            raise DomainInvariantError("sequence must fit a non-negative signed 64-bit integer")
+        if not _SIGNED_INT32_MIN <= self.clock_offset_ms <= _SIGNED_INT32_MAX:
+            raise DomainInvariantError("clock_offset_ms must fit a signed 32-bit integer")
         if not self.media_object_ids:
             raise DomainInvariantError("an observation must reference at least one media object")
         if len(set(self.media_object_ids)) != len(self.media_object_ids):

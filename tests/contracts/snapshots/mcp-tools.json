@@ -823,6 +823,8 @@
             },
             "clock_offset_ms": {
               "default": 0,
+              "maximum": 2147483647,
+              "minimum": -2147483648,
               "title": "Clock Offset Ms",
               "type": "integer"
             },
@@ -883,6 +885,7 @@
               "$ref": "#/$defs/SensorKind"
             },
             "sequence": {
+              "maximum": 9223372036854775807,
               "minimum": 0,
               "title": "Sequence",
               "type": "integer"

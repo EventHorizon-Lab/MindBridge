@@ -67,6 +67,13 @@ def test_observation_idempotency_key_changes_with_sequence() -> None:
     assert first.idempotency_key != second.idempotency_key
 
 
+def test_observation_rejects_values_outside_storage_integer_ranges() -> None:
+    with pytest.raises(DomainInvariantError, match="sequence"):
+        _observation(sequence=2**63)
+    with pytest.raises(DomainInvariantError, match="clock_offset_ms"):
+        _observation(clock_offset_ms=2**31)
+
+
 def test_observation_rejects_reversed_time_range() -> None:
     """An observation cannot end before it occurred."""
     with pytest.raises(DomainInvariantError, match="ended_at"):
@@ -107,6 +114,7 @@ def _observation(
     media_object_ids: tuple[MediaObjectId, ...] = (MEDIA_ID,),
     occurred_at: datetime = NOW,
     ended_at: datetime = NOW,
+    clock_offset_ms: int = 0,
 ) -> Observation:
     return Observation(
         observation_id=ObservationId("observation_01"),
@@ -119,6 +127,7 @@ def _observation(
         occurred_at=occurred_at,
         ended_at=ended_at,
         observed_at=NOW,
+        clock_offset_ms=clock_offset_ms,
     )
 
 
