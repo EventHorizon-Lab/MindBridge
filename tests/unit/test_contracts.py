@@ -95,6 +95,14 @@ def test_observe_requires_timezone_aware_timestamps() -> None:
         _observe_request(observed_at=datetime(2026, 8, 11, 12, 0))  # noqa: DTZ001
 
 
+def test_media_hash_is_canonicalized_for_content_deduplication() -> None:
+    media = _observe_request().media_objects[0].model_copy(update={"sha256": "A" * 64})
+
+    canonical = MediaObjectInput.model_validate(media.model_dump())
+
+    assert canonical.sha256 == "a" * 64
+
+
 def test_write_contracts_reject_inconsistent_ranges_and_references() -> None:
     media = _observe_request().media_objects[0]
     with pytest.raises(ValidationError, match="ended_at must not precede occurred_at"):

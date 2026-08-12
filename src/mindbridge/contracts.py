@@ -35,7 +35,10 @@ Identifier = Annotated[
     str,
     StringConstraints(strip_whitespace=True, min_length=1, max_length=255),
 ]
-Sha256Hex = Annotated[str, Field(pattern=r"^[0-9a-fA-F]{64}$")]
+Sha256Hex = Annotated[
+    str,
+    StringConstraints(to_lower=True, pattern=r"^[0-9a-fA-F]{64}$"),
+]
 
 
 class ContractModel(BaseModel):
