@@ -16,7 +16,7 @@ from mindbridge.contracts import (
     FeedbackRequest,
     ForgetReceipt,
     ForgetRequest,
-    MemoryView,
+    MemoryResult,
     ObservationProcessingJobView,
     ObservationReceipt,
     ObservationStatus,
@@ -62,10 +62,10 @@ class StubKernel:
             trace_id="trace_observe",
         )
 
-    async def remember(self, request: RememberRequest) -> MemoryView:
+    async def remember(self, request: RememberRequest) -> MemoryResult:
         if request.summary == "invalid":
             raise DomainInvariantError("invalid memory")
-        return MemoryView(
+        return MemoryResult(
             memory_id="memory_01",
             memory_type=request.memory_type,
             summary=request.summary,
@@ -75,6 +75,7 @@ class StubKernel:
             created_at=NOW,
             verification_status=VerificationStatus.UNVERIFIED,
             state=MemoryState.ACTIVE,
+            trace_id="trace_remember",
         )
 
     async def record_feedback(self, request: FeedbackRequest) -> FeedbackReceipt:
@@ -159,10 +160,10 @@ class StubKernel:
             trace_id="trace_job",
         )
 
-    async def get_memory(self, tenant_id: str, memory_id: str) -> MemoryView:
+    async def get_memory(self, tenant_id: str, memory_id: str) -> MemoryResult:
         if memory_id != "memory_01":
             raise MemoryNotFoundError("missing")
-        return MemoryView(
+        return MemoryResult(
             memory_id=memory_id,
             memory_type=MemoryType.EPISODIC,
             summary="remembered event",
@@ -172,6 +173,7 @@ class StubKernel:
             created_at=NOW,
             verification_status=VerificationStatus.ATTESTED,
             state=MemoryState.ACTIVE,
+            trace_id="trace_get_memory",
         )
 
 
@@ -237,14 +239,26 @@ def test_job_route_is_tenant_scoped_and_returns_not_found() -> None:
     assert missing.json()["code"] == "job_not_found"
 
 
-def test_memory_route_is_tenant_scoped_and_returns_not_found() -> None:
+def test_memory_routes_are_tenant_scoped_and_traced() -> None:
     client = _client()
 
+    created = client.post(
+        "/v1/memories",
+        json={
+            "tenant_id": "tenant_01",
+            "summary": "remembered event",
+            "memory_type": "episodic",
+            "occurred_at": NOW.isoformat(),
+        },
+    )
     found = client.get("/v1/memories/memory_01", params={"tenant_id": "tenant_01"})
     missing = client.get("/v1/memories/missing", params={"tenant_id": "tenant_01"})
 
+    assert created.status_code == 201
+    assert created.json()["trace_id"] == "trace_remember"
     assert found.status_code == 200
     assert found.json()["memory_id"] == "memory_01"
+    assert found.json()["trace_id"] == "trace_get_memory"
     assert missing.status_code == 404
     assert missing.json()["code"] == "memory_not_found"
 

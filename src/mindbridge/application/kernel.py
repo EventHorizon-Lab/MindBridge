@@ -21,7 +21,7 @@ from mindbridge.application.recall import (
     RETRIEVAL_DOCUMENT_EMBEDDING_TASK,
     RecallEmbedder,
     RecallMemories,
-    memory_view,
+    memory_result,
 )
 from mindbridge.contracts import (
     ContractModel,
@@ -33,7 +33,7 @@ from mindbridge.contracts import (
     ForgetReceipt,
     ForgetRequest,
     MediaObjectInput,
-    MemoryView,
+    MemoryResult,
     ObservationProcessingJobView,
     ObservationReceipt,
     ObservationStatus,
@@ -154,7 +154,7 @@ class MemoryKernel:
         )
 
     @trace_operation("mindbridge.remember")
-    async def remember(self, request: RememberRequest) -> MemoryView:
+    async def remember(self, request: RememberRequest) -> MemoryResult:
         """Persist explicit content without pretending unsupported input is fact."""
         set_current_span_attributes(
             {
@@ -182,7 +182,7 @@ class MemoryKernel:
         )
         stored_memory = result.memory
         await self._index_memory(stored_memory)
-        return memory_view(stored_memory)
+        return memory_result(stored_memory)
 
     @trace_operation("mindbridge.record_feedback")
     async def record_feedback(self, request: FeedbackRequest) -> FeedbackReceipt:
@@ -348,7 +348,7 @@ class MemoryKernel:
         )
 
     @trace_operation("mindbridge.get_memory")
-    async def get_memory(self, tenant_id: str, memory_id: str) -> MemoryView:
+    async def get_memory(self, tenant_id: str, memory_id: str) -> MemoryResult:
         """Return one tenant-owned memory through the shared stable view."""
         set_current_span_attributes(
             {
@@ -357,7 +357,7 @@ class MemoryKernel:
             }
         )
         memory = await self._store.read_memory(TenantId(tenant_id), MemoryId(memory_id))
-        return memory_view(memory)
+        return memory_result(memory)
 
     async def recall(self, request: RecallRequest) -> RecallResult:
         """Delegate recall to its focused application use case."""

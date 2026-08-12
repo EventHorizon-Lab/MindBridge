@@ -13,7 +13,7 @@ from mindbridge.contracts import (
     ForgetReceipt,
     ForgetRequest,
     GetMemoryRequest,
-    MemoryView,
+    MemoryResult,
     ObservationReceipt,
     ObserveRequest,
     RecallRequest,
@@ -28,7 +28,7 @@ NOW = datetime(2026, 8, 12, 12, 0, tzinfo=timezone.utc)
 class StubKernel:
     """Small protocol stub proving that MCP contains no memory business logic."""
 
-    async def remember(self, request: RememberRequest) -> MemoryView:
+    async def remember(self, request: RememberRequest) -> MemoryResult:
         return _memory_view(request.summary, request.memory_type)
 
     async def recall(self, request: RecallRequest) -> RecallResult:
@@ -40,7 +40,7 @@ class StubKernel:
             trace_id="trace_recall",
         )
 
-    async def get_memory(self, tenant_id: str, memory_id: str) -> MemoryView:
+    async def get_memory(self, tenant_id: str, memory_id: str) -> MemoryResult:
         return _memory_view(f"{tenant_id}:{memory_id}", MemoryType.EPISODIC)
 
     async def observe(self, request: ObserveRequest) -> ObservationReceipt:
@@ -97,11 +97,13 @@ async def test_mcp_calls_shared_kernel_and_returns_structured_output() -> None:
 
     assert result.is_error is False
     assert result.structured_content is not None
-    assert MemoryView.model_validate(result.structured_content).summary == request.summary
+    response = MemoryResult.model_validate(result.structured_content)
+    assert response.summary == request.summary
+    assert response.trace_id == "trace_memory"
 
 
-def _memory_view(summary: str, memory_type: MemoryType) -> MemoryView:
-    return MemoryView(
+def _memory_view(summary: str, memory_type: MemoryType) -> MemoryResult:
+    return MemoryResult(
         memory_id="memory_01",
         memory_type=memory_type,
         summary=summary,
@@ -111,4 +113,5 @@ def _memory_view(summary: str, memory_type: MemoryType) -> MemoryView:
         created_at=NOW,
         verification_status=VerificationStatus.ATTESTED,
         state=MemoryState.ACTIVE,
+        trace_id="trace_memory",
     )

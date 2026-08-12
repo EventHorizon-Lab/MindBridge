@@ -599,7 +599,9 @@ async def test_get_memory_is_tenant_scoped() -> None:
 
     found = await kernel.get_memory("tenant_01", remembered.memory_id)
 
-    assert found == remembered
+    assert found.memory_id == remembered.memory_id
+    assert found.trace_id.startswith("trace_")
+    assert remembered.trace_id.startswith("trace_")
     with pytest.raises(MemoryNotFoundError):
         await kernel.get_memory("other_tenant", remembered.memory_id)
 

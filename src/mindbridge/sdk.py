@@ -18,7 +18,7 @@ from mindbridge.contracts import (
     FeedbackRequest,
     ForgetReceipt,
     ForgetRequest,
-    MemoryView,
+    MemoryResult,
     ObservationProcessingJobView,
     ObservationReceipt,
     ObserveRequest,
@@ -87,9 +87,9 @@ class AsyncMindBridge:
         """Submit one observation through the production API."""
         return await self._post("v1/observations", request, ObservationReceipt)
 
-    async def remember(self, request: RememberRequest) -> MemoryView:
+    async def remember(self, request: RememberRequest) -> MemoryResult:
         """Retain one explicit memory through the production API."""
-        return await self._post("v1/memories", request, MemoryView)
+        return await self._post("v1/memories", request, MemoryResult)
 
     async def record_feedback(self, request: FeedbackRequest) -> FeedbackReceipt:
         """Record one useful, wrong, missing, or correction signal."""
@@ -103,12 +103,12 @@ class AsyncMindBridge:
         """Recall memories and grounded evidence through the production API."""
         return await self._post("v1/recall", request, RecallResult)
 
-    async def get_memory(self, tenant_id: str, memory_id: str) -> MemoryView:
+    async def get_memory(self, tenant_id: str, memory_id: str) -> MemoryResult:
         """Read one tenant-owned memory."""
         return await self._request(
             "GET",
             f"v1/memories/{quote(memory_id, safe='')}",
-            MemoryView,
+            MemoryResult,
             params={"tenant_id": tenant_id},
         )
 

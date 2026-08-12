@@ -22,6 +22,7 @@ from mindbridge.application.ports import (
 from mindbridge.application.ranking import fuse_memory_rankings
 from mindbridge.contracts import (
     EvidenceView,
+    MemoryResult,
     MemoryView,
     RecallMode,
     RecallRequest,
@@ -374,6 +375,13 @@ def memory_view(memory: MemoryRecord) -> MemoryView:
         last_accessed_at=memory.last_accessed_at,
         supersedes_memory_id=memory.supersedes_memory_id,
         superseded_at=memory.superseded_at,
+    )
+
+
+def memory_result(memory: MemoryRecord) -> MemoryResult:
+    """Add the active request trace to one top-level memory response."""
+    return MemoryResult.model_validate(
+        memory_view(memory).model_dump() | {"trace_id": current_trace_id()}
     )
 
 

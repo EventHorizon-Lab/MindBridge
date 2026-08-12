@@ -343,6 +343,12 @@ class MemoryView(ContractModel):
     superseded_at: AwareDatetime | None = None
 
 
+class MemoryResult(MemoryView):
+    """Top-level memory response with its request trace identity."""
+
+    trace_id: Identifier
+
+
 class GetMemoryRequest(ContractModel):
     """Identify one tenant-owned memory without relying on ambient tenancy."""
 

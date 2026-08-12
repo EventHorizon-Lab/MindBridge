@@ -633,6 +633,144 @@
         "title": "MediaObjectInput",
         "type": "object"
       },
+      "MemoryResult": {
+        "additionalProperties": false,
+        "description": "Top-level memory response with its request trace identity.",
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "ended_at": {
+            "format": "date-time",
+            "title": "Ended At",
+            "type": "string"
+          },
+          "evidence_ids": {
+            "items": {
+              "maxLength": 255,
+              "minLength": 1,
+              "type": "string"
+            },
+            "title": "Evidence Ids",
+            "type": "array"
+          },
+          "last_accessed_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Accessed At"
+          },
+          "memory_id": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Memory Id",
+            "type": "string"
+          },
+          "memory_type": {
+            "$ref": "#/components/schemas/MemoryType"
+          },
+          "negative_feedback_count": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Negative Feedback Count",
+            "type": "integer"
+          },
+          "occurred_at": {
+            "format": "date-time",
+            "title": "Occurred At",
+            "type": "string"
+          },
+          "positive_feedback_count": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Positive Feedback Count",
+            "type": "integer"
+          },
+          "salience": {
+            "default": 0.5,
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Salience",
+            "type": "number"
+          },
+          "state": {
+            "$ref": "#/components/schemas/MemoryState"
+          },
+          "strength": {
+            "default": 0.5,
+            "title": "Strength",
+            "type": "number"
+          },
+          "summary": {
+            "maxLength": 2048,
+            "minLength": 1,
+            "title": "Summary",
+            "type": "string"
+          },
+          "superseded_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Superseded At"
+          },
+          "supersedes_memory_id": {
+            "anyOf": [
+              {
+                "maxLength": 255,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Supersedes Memory Id"
+          },
+          "trace_id": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Trace Id",
+            "type": "string"
+          },
+          "useful_access_count": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Useful Access Count",
+            "type": "integer"
+          },
+          "verification_status": {
+            "$ref": "#/components/schemas/VerificationStatus"
+          }
+        },
+        "required": [
+          "memory_id",
+          "memory_type",
+          "summary",
+          "evidence_ids",
+          "occurred_at",
+          "ended_at",
+          "created_at",
+          "verification_status",
+          "state",
+          "trace_id"
+        ],
+        "title": "MemoryResult",
+        "type": "object"
+      },
       "MemoryState": {
         "description": "Retained states; explicit deletion is represented by a tombstone.",
         "enum": [
@@ -1662,7 +1800,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/MemoryView"
+                  "$ref": "#/components/schemas/MemoryResult"
                 }
               }
             },
@@ -1719,7 +1857,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/MemoryView"
+                  "$ref": "#/components/schemas/MemoryResult"
                 }
               }
             },

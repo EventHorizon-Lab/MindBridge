@@ -472,7 +472,7 @@
         }
       },
       "additionalProperties": false,
-      "description": "Serializable stable view of a retained memory.",
+      "description": "Top-level memory response with its request trace identity.",
       "properties": {
         "created_at": {
           "format": "date-time",
@@ -580,6 +580,12 @@
           "default": null,
           "title": "Supersedes Memory Id"
         },
+        "trace_id": {
+          "maxLength": 255,
+          "minLength": 1,
+          "title": "Trace Id",
+          "type": "string"
+        },
         "useful_access_count": {
           "default": 0,
           "minimum": 0,
@@ -599,9 +605,10 @@
         "ended_at",
         "created_at",
         "verification_status",
-        "state"
+        "state",
+        "trace_id"
       ],
-      "title": "MemoryView",
+      "title": "MemoryResult",
       "type": "object"
     }
   },
@@ -1528,7 +1535,7 @@
         }
       },
       "additionalProperties": false,
-      "description": "Serializable stable view of a retained memory.",
+      "description": "Top-level memory response with its request trace identity.",
       "properties": {
         "created_at": {
           "format": "date-time",
@@ -1636,6 +1643,12 @@
           "default": null,
           "title": "Supersedes Memory Id"
         },
+        "trace_id": {
+          "maxLength": 255,
+          "minLength": 1,
+          "title": "Trace Id",
+          "type": "string"
+        },
         "useful_access_count": {
           "default": 0,
           "minimum": 0,
@@ -1655,9 +1668,10 @@
         "ended_at",
         "created_at",
         "verification_status",
-        "state"
+        "state",
+        "trace_id"
       ],
-      "title": "MemoryView",
+      "title": "MemoryResult",
       "type": "object"
     }
   }

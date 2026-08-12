@@ -15,7 +15,7 @@ from mindbridge.contracts import (
     ForgetReceipt,
     ForgetRequest,
     GetMemoryRequest,
-    MemoryView,
+    MemoryResult,
     ObservationReceipt,
     ObserveRequest,
     RecallRequest,
@@ -59,7 +59,7 @@ def create_mcp_server(
         return await kernel.observe(request)
 
     @server.tool(annotations=_IDEMPOTENT_WRITE)
-    async def memory_remember(request: RememberRequest) -> MemoryView:
+    async def memory_remember(request: RememberRequest) -> MemoryResult:
         """Retain one explicit memory, preserving evidence and temporal provenance."""
         return await kernel.remember(request)
 
@@ -69,7 +69,7 @@ def create_mcp_server(
         return await kernel.recall(request)
 
     @server.tool(annotations=_READ_ONLY)
-    async def memory_get(request: GetMemoryRequest) -> MemoryView:
+    async def memory_get(request: GetMemoryRequest) -> MemoryResult:
         """Read one tenant-owned memory by its stable identifier."""
         return await kernel.get_memory(request.tenant_id, request.memory_id)
 

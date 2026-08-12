@@ -146,6 +146,7 @@ async def test_get_memory_uses_tenant_scoped_route() -> None:
                 "created_at": "2026-08-11T12:00:00Z",
                 "verification_status": "attested",
                 "state": "active",
+                "trace_id": "trace_memory",
             },
         )
 
@@ -156,6 +157,7 @@ async def test_get_memory_uses_tenant_scoped_route() -> None:
         await client.close()
 
     assert memory.memory_id == "memory_01"
+    assert memory.trace_id == "trace_memory"
 
 
 async def test_feedback_uses_shared_contracts() -> None:

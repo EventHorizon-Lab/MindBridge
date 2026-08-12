@@ -26,7 +26,7 @@ from mindbridge.contracts import (
     ForgetRequest,
     HealthResponse,
     Identifier,
-    MemoryView,
+    MemoryResult,
     ObservationProcessingJobView,
     ObservationReceipt,
     ObserveRequest,
@@ -84,14 +84,14 @@ def create_app(
 
     @app.post(
         "/v1/memories",
-        response_model=MemoryView,
+        response_model=MemoryResult,
         status_code=status.HTTP_201_CREATED,
         operation_id="remember",
     )
     async def remember(
         request: RememberRequest,
         principal: TenantPrincipal = tenant_authentication,
-    ) -> MemoryView:
+    ) -> MemoryResult:
         require_tenant(principal, request.tenant_id)
         return await kernel.remember(request)
 
@@ -122,14 +122,14 @@ def create_app(
 
     @app.get(
         "/v1/memories/{memory_id}",
-        response_model=MemoryView,
+        response_model=MemoryResult,
         operation_id="getMemory",
     )
     async def get_memory(
         memory_id: Identifier,
         tenant_id: Identifier,
         principal: TenantPrincipal = tenant_authentication,
-    ) -> MemoryView:
+    ) -> MemoryResult:
         require_tenant(principal, tenant_id)
         return await kernel.get_memory(tenant_id, memory_id)
 
