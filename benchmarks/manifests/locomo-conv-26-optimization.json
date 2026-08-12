@@ -1,0 +1,132 @@
+{
+  "benchmark": "LoCoMo",
+  "scope": {
+    "sample_ids": [
+      "conv-26"
+    ],
+    "memory_item_count": 419,
+    "question_count": 199,
+    "claim": "Single-conversation regression evidence; not a full LoCoMo or SOTA result."
+  },
+  "dataset": {
+    "repository": "snap-research/locomo",
+    "revision": "3eb6f2c585f5e1699204e3c3bdf7adc5c28cb376",
+    "source_sha256": "79fa87e90f04081343b8c8debecb80a9a6842b76a7aa537dc9fdf651ea698ff4"
+  },
+  "evaluator": {
+    "repository": "snap-research/locomo",
+    "revision": "3eb6f2c585f5e1699204e3c3bdf7adc5c28cb376",
+    "implementation_sha256": "8e3be5d57ff2ff9ec5cd05939592f468c5f3f1fd95d13e431932bdf6bf0fd6fd"
+  },
+  "runs": [
+    {
+      "name": "baseline",
+      "runner_version": "locomo_production_api_v3",
+      "adapter_version": "locomo_official_v1",
+      "code_revision": "03e2b01+worktree-0cc3cb5235eb",
+      "answer_model_id": "qwen3.8-max",
+      "answer_model_revision": "provider-managed-2026-08-12",
+      "answer_prompt_version": "answer_from_evidence_v2",
+      "reasoning_effort": "low",
+      "embedding_model_id": "jinaai/jina-embeddings-v5-text-small-retrieval",
+      "embedding_model_revision": "6856e76bb72982e58de0620458a4e8b3614da340",
+      "retrieval_task": "retrieval_document",
+      "recall_limit": 20,
+      "request_concurrency": 4,
+      "request_timeout_seconds": 1800.0,
+      "metrics": {
+        "answer_f1": 0.5459446372710516,
+        "evidence_recall": 0.7726130653266332,
+        "categories": [
+          {
+            "category": 1,
+            "question_count": 32,
+            "answer_f1": 0.37083870480010184,
+            "evidence_recall": 0.6640625
+          },
+          {
+            "category": 2,
+            "question_count": 37,
+            "answer_f1": 0.5591527476976393,
+            "evidence_recall": 0.972972972972973
+          },
+          {
+            "category": 3,
+            "question_count": 13,
+            "answer_f1": 0.24985625485625487,
+            "evidence_recall": 0.7692307692307693
+          },
+          {
+            "category": 4,
+            "question_count": 70,
+            "answer_f1": 0.5977051612198864,
+            "evidence_recall": 0.8571428571428571
+          },
+          {
+            "category": 5,
+            "question_count": 47,
+            "answer_f1": 0.6595744680851063,
+            "evidence_recall": 0.5638297872340425
+          }
+        ]
+      },
+      "predictions_sha256": "0e688ffec3ec7f73df0345054068ef6f0c997255127d7fb7ce16d3e428392b2d",
+      "completed_at": "2026-08-12T12:02:07.228142Z"
+    },
+    {
+      "name": "optimized",
+      "runner_version": "locomo_production_api_v5",
+      "adapter_version": "locomo_official_v1",
+      "code_revision": "working-tree-answer-v5-raw",
+      "answer_model_id": "qwen3.8-max",
+      "answer_model_revision": "provider-managed-2026-08-12",
+      "answer_prompt_version": "answer_from_evidence_v3",
+      "reasoning_effort": "low",
+      "embedding_model_id": "jinaai/jina-embeddings-v5-text-small-retrieval",
+      "embedding_model_revision": "6856e76bb72982e58de0620458a4e8b3614da340",
+      "retrieval_task": "retrieval_document",
+      "recall_limit": 20,
+      "inference_recall_limit": 50,
+      "request_concurrency": 4,
+      "request_timeout_seconds": 1800.0,
+      "metrics": {
+        "answer_f1": 0.6136889267575371,
+        "evidence_recall": 0.782244556113903,
+        "categories": [
+          {
+            "category": 1,
+            "question_count": 32,
+            "answer_f1": 0.42968512548232995,
+            "evidence_recall": 0.640625
+          },
+          {
+            "category": 2,
+            "question_count": 37,
+            "answer_f1": 0.5630515130515131,
+            "evidence_recall": 0.972972972972973
+          },
+          {
+            "category": 3,
+            "question_count": 13,
+            "answer_f1": 0.49773175542406306,
+            "evidence_recall": 0.8974358974358974
+          },
+          {
+            "category": 4,
+            "question_count": 70,
+            "answer_f1": 0.6581536229413785,
+            "evidence_recall": 0.8714285714285714
+          },
+          {
+            "category": 5,
+            "question_count": 47,
+            "answer_f1": 0.7446808510638298,
+            "evidence_recall": 0.5638297872340425
+          }
+        ]
+      },
+      "predictions_sha256": "2e21f598fdceef970d65928e8c8614ebe317b6cb0719c3818704f0b9d1ebae4b",
+      "completed_at": "2026-08-12T14:30:48.396037Z"
+    }
+  ]
+}

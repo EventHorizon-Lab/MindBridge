@@ -50,6 +50,18 @@ async def test_pgvector_mix_aligned_encoders_but_separates_space_revisions(
 
     assert await store.write_embedding(first) is True
     assert await store.write_embedding(first) is False
+    assert (
+        await store.write_embedding(
+            _embedding_record(
+                embedding_id="embedding_01",
+                object_id="memory_near",
+                values=(0.999_999_995, 0.000_1) + (0.0,) * 1_022,
+                model=model,
+                space=space,
+            )
+        )
+        is False
+    )
     assert await store.write_embedding(second) is True
     with pytest.raises(DomainInvariantError, match="different vector content"):
         await store.write_embedding(

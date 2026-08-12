@@ -152,6 +152,8 @@ uv run python -m mindbridge.benchmarks.locomo_cli \
   --source-revision 3eb6f2c585f5e1699204e3c3bdf7adc5c28cb376 \
   --run-id locomo-001 \
   --code-revision "$(git rev-parse HEAD)" \
+  --answer-reasoning-effort low \
+  --request-timeout-seconds 1800 \
   --answer-model-revision serving-fingerprint
 ```
 
@@ -205,6 +207,8 @@ uv run python -m mindbridge.benchmarks.m3_cli \
   --run-id m3-robot-001 \
   --code-revision "$(git rev-parse HEAD)" \
   --perception-model-revision serving-fingerprint \
+  --answer-reasoning-effort low \
+  --request-timeout-seconds 1800 \
   --answer-model-revision serving-fingerprint
 ```
 
@@ -254,6 +258,8 @@ uv run python -m mindbridge.benchmarks.egolife_cli \
   --run-id egolife-a1-001 \
   --code-revision "$(git rev-parse HEAD)" \
   --perception-model-revision serving-fingerprint \
+  --answer-reasoning-effort low \
+  --request-timeout-seconds 1800 \
   --answer-model-revision serving-fingerprint
 ```
 
@@ -297,6 +303,8 @@ uv run python -m mindbridge.benchmarks.supermemory_cli \
   --run-id supermemory-person-1-001 \
   --code-revision "$(git rev-parse HEAD)" \
   --perception-model-revision serving-fingerprint \
+  --answer-reasoning-effort low \
+  --request-timeout-seconds 1800 \
   --answer-model-revision serving-fingerprint
 ```
 
@@ -319,6 +327,7 @@ export MINDBRIDGE_VLM_API_KEY=replace-with-a-runtime-secret
 export MINDBRIDGE_VLM_ENDPOINT=https://vlm.example.com/api/v1/chat/completions
 export MINDBRIDGE_VLM_MODEL_ID=qwen3.8-max
 export MINDBRIDGE_VLM_MODEL_REVISION=deployment-2026-08-11
+export MINDBRIDGE_ANSWER_REASONING_EFFORT=low
 export MINDBRIDGE_EMBEDDING_API_KEY=replace-with-a-runtime-secret
 export MINDBRIDGE_EMBEDDING_ENDPOINT=https://embeddings.example.com/v1/embeddings
 export MINDBRIDGE_EMBEDDING_MODEL_ID=jinaai/jina-embeddings-v5-omni-small-retrieval

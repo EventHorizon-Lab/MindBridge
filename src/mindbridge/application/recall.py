@@ -297,8 +297,14 @@ class RecallMemories:
             dict.fromkeys(EvidenceId(match.object_id) for match in evidence_matches)
         )
         memory_ids = tuple(dict.fromkeys(MemoryId(match.object_id) for match in memory_matches))
-        evidence_memories, direct_memories, graph_memories = await asyncio.gather(
+        (
+            evidence_memories,
+            direct_memories,
+            hierarchy_memories,
+            graph_memories,
+        ) = await asyncio.gather(
             self._store.search_memories_by_evidence(request, evidence_ids, limit=limit),
+            self._store.search_memories_by_ids(request, memory_ids, limit=limit),
             self._store.search_memories_by_hierarchy(request, memory_ids, limit=limit),
             self._store.search_memories_by_graph_objects(
                 request,
@@ -314,7 +320,7 @@ class RecallMemories:
             }
         )
         return fuse_memory_rankings(
-            (evidence_memories, graph_memories, direct_memories),
+            (evidence_memories, graph_memories, direct_memories, hierarchy_memories),
             limit=limit,
         )
 

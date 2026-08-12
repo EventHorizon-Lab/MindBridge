@@ -9,8 +9,11 @@ from mindbridge.application.claim_consolidation import ClaimCandidateRequest
 from mindbridge.application.consolidate_claims import ConsolidateClaims
 from mindbridge.application.consolidate_summaries import ConsolidateSummaries
 from mindbridge.application.consolidation import ConsolidateEpisodes, EpisodeCandidateRequest
-from mindbridge.application.summary_consolidation import SummaryCandidateRequest
-from mindbridge.core import ClaimId, EventId, MemoryId, MemoryIntegrityError, TenantId
+from mindbridge.application.summary_consolidation import (
+    SummaryCandidateCursor,
+    SummaryCandidateRequest,
+)
+from mindbridge.core import ClaimId, EventId, MemoryIntegrityError, TenantId
 
 
 @dataclass(frozen=True, slots=True)
@@ -167,14 +170,14 @@ async def consolidate_tenant_summaries(
     minimum_similarity: float,
 ) -> SummarySweepSummary:
     """Consolidate stable Memory pages at one fixed evaluation instant."""
-    cursor: MemoryId | None = None
+    cursor: SummaryCandidateCursor | None = None
     page_count = scanned_count = candidate_count = proposed_count = committed_count = 0
     while True:
         result = await use_case.run(
             SummaryCandidateRequest(
                 tenant_id=tenant_id,
                 evaluated_at=evaluated_at,
-                after_memory_id=cursor,
+                after_cursor=cursor,
                 limit=page_size,
                 maximum_gap_seconds=maximum_gap_seconds,
                 minimum_similarity=minimum_similarity,

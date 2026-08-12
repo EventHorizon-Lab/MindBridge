@@ -1,5 +1,6 @@
 """Production-contract checks for the M3-Bench runner."""
 
+import asyncio
 from datetime import datetime, timezone
 from typing import cast
 
@@ -135,6 +136,24 @@ async def test_job_waiter_allows_failed_attempt_to_be_retried() -> None:
     )
 
     assert job.state is JobState.SUCCEEDED
+
+
+async def test_job_waiter_times_out_when_status_request_never_returns() -> None:
+    class HangingMemoryApi(RecordingMemoryApi):
+        async def get_observation_job(
+            self, tenant_id: str, job_id: str
+        ) -> ObservationProcessingJobView:
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+    with pytest.raises(TimeoutError, match="last state was unavailable"):
+        await wait_for_observation_job(
+            cast(AsyncMindBridge, HangingMemoryApi()),
+            "tenant",
+            "job_0",
+            poll_interval_seconds=0.001,
+            timeout_seconds=0.01,
+        )
 
 
 def test_prepared_video_requires_contiguous_video_clips() -> None:

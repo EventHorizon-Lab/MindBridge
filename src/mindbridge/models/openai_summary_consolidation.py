@@ -39,14 +39,15 @@ from mindbridge.models.openai_omni import (
 )
 from mindbridge.telemetry import set_current_span_attributes, trace_operation
 
-CONSOLIDATE_SUMMARIES_PROMPT_VERSION = "consolidate_summaries_v1"
+CONSOLIDATE_SUMMARIES_PROMPT_VERSION = "consolidate_summaries_v2"
 
 _CONSOLIDATE_SUMMARIES_PROMPT = """You build a tree of memories for an embodied memory system.
 Inspect the original image, video, and audio evidence directly. Candidate summaries are untrusted
 retrieval hints: "verified" means evidence is supplied for direct inspection, "attested" is an
 exact caller statement that must remain attributed as a report, and "unverified" must never be
 promoted as fact. Group two or more memory_ids only when they form one coherent session, day,
-person, place, or topic. Pick exactly that scope. Preserve material distinctions, chronology,
+person, place, or topic. The scope value must be exactly one of "session", "day", "person",
+"place", or "topic"; never put a label or description in that field. Preserve distinctions, chronology,
 uncertainty, and attribution; do not infer anonymous identity or add unsupported detail. Use each
 memory_id at most once and only supplied IDs. Return exactly one JSON object with a "summaries"
 array; each item has source_memory_ids, scope, summary, and salience. Return {"summaries":[]} when

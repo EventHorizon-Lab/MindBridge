@@ -26,7 +26,7 @@ from mindbridge.core import (
 )
 from mindbridge.infrastructure.postgres import PostgresMemoryStore
 
-NOW = datetime(2026, 8, 12, 12, 0, tzinfo=timezone.utc)
+NOW = datetime.now(timezone.utc) + timedelta(days=1)
 POLICY = MemoryStrengthPolicy(age_decay_weight=1.0, cold_below=0.0)
 pytestmark = pytest.mark.integration
 

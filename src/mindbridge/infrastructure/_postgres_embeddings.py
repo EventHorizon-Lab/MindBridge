@@ -18,6 +18,7 @@ from mindbridge.infrastructure._postgres_types import (
 )
 
 CLOUD_EMBEDDING_DIMENSION = 1_024
+_RETRY_MINIMUM_COSINE_SIMILARITY = 0.999_999
 
 
 async def write_embedding(pool: DatabasePool, embedding: EmbeddingRecord) -> bool:
@@ -64,7 +65,9 @@ async def write_embedding_on_connection(
         return True
     cursor = await connection.execute(
         """
-        SELECT embedding_id, normalized, embedding = %s
+        SELECT embedding_id,
+               normalized,
+               1 - (embedding <=> %s) >= %s
         FROM embeddings
         WHERE tenant_id = %s
           AND object_type = %s
@@ -77,6 +80,7 @@ async def write_embedding_on_connection(
         """,
         (
             vector,
+            _RETRY_MINIMUM_COSINE_SIMILARITY,
             embedding.tenant_id,
             embedding.object_type.value,
             embedding.object_id,

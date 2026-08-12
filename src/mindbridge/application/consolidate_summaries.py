@@ -10,13 +10,14 @@ from mindbridge.application.perception import ResolvedEvidence
 from mindbridge.application.ports import MediaUrlSigner, TextDocumentEmbedder
 from mindbridge.application.summary_consolidation import (
     SummaryCandidate,
+    SummaryCandidateCursor,
     SummaryCandidatePage,
     SummaryCandidateRequest,
     SummaryConsolidation,
     SummaryWrite,
     derive_summary_writes,
 )
-from mindbridge.core import MemoryId, MemoryIntegrityError, TenantId
+from mindbridge.core import MemoryIntegrityError, TenantId
 from mindbridge.telemetry import set_current_span_attributes, trace_operation
 
 
@@ -28,7 +29,7 @@ class SummaryConsolidationResult:
     candidate_count: int
     proposed_count: int
     committed_count: int
-    next_cursor: MemoryId | None
+    next_cursor: SummaryCandidateCursor | None
 
 
 class SummaryConsolidator(Protocol):

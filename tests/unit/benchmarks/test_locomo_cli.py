@@ -56,7 +56,10 @@ def test_locomo_artifacts_pin_source_system_code_and_output(tmp_path: Path) -> N
     assert manifest.source_revision == "official-revision"
     assert manifest.code_revision == "mindbridge-commit"
     assert manifest.answer_model_revision == "serving-fingerprint"
+    assert manifest.reasoning_effort == "low"
+    assert manifest.inference_recall_limit == 50
     assert manifest.run_id == "run_01"
+    assert manifest.request_timeout_seconds == 1_800.0
     assert manifest.memory_item_count == 1
     assert manifest.question_count == 1
     assert manifest.predictions_sha256 == hashlib.sha256(output_path.read_bytes()).hexdigest()
@@ -80,12 +83,14 @@ def _arguments(dataset_path: Path, output_path: Path) -> _Arguments:
         code_revision="mindbridge-commit",
         answer_model_id="qwen3.8-max",
         answer_model_revision="serving-fingerprint",
+        answer_reasoning_effort="low",
         embedding_model_id=DEFAULT_JINA_OMNI_MODEL_ID,
         embedding_model_revision=DEFAULT_JINA_OMNI_REVISION,
         run_id="run_01",
         tenant_prefix="benchmark_locomo",
         recall_limit=20,
         request_concurrency=4,
+        request_timeout_seconds=1_800.0,
         sample_ids=(),
         overwrite=False,
     )

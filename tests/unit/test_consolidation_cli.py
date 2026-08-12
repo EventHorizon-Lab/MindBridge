@@ -22,7 +22,10 @@ from mindbridge.application.consolidation_sweep import (
     consolidate_tenant_episodes,
     consolidate_tenant_summaries,
 )
-from mindbridge.application.summary_consolidation import SummaryCandidateRequest
+from mindbridge.application.summary_consolidation import (
+    SummaryCandidateCursor,
+    SummaryCandidateRequest,
+)
 from mindbridge.consolidation_cli import ConsolidationSettings
 from mindbridge.core import ClaimId, EventId, MemoryId, TenantId
 
@@ -85,13 +88,16 @@ class ScriptedSummaryConsolidation:
 
     async def run(self, request: SummaryCandidateRequest) -> SummaryConsolidationResult:
         self.requests.append(request)
-        if request.after_memory_id is None:
+        if request.after_cursor is None:
             return SummaryConsolidationResult(
                 scanned_count=2,
                 candidate_count=4,
                 proposed_count=1,
                 committed_count=1,
-                next_cursor=MemoryId("memory_02"),
+                next_cursor=SummaryCandidateCursor(
+                    occurred_at=NOW,
+                    memory_id=MemoryId("memory_02"),
+                ),
             )
         return SummaryConsolidationResult(
             scanned_count=1,
@@ -150,7 +156,10 @@ async def test_summary_sweep_accumulates_stable_memory_pages() -> None:
     )
 
     assert (summary.page_count, summary.scanned_count, summary.committed_count) == (2, 3, 1)
-    assert scripted.requests[1].after_memory_id == "memory_02"
+    assert scripted.requests[1].after_cursor == SummaryCandidateCursor(
+        occurred_at=NOW,
+        memory_id=MemoryId("memory_02"),
+    )
     assert all(request.evaluated_at == NOW for request in scripted.requests)
 
 

@@ -368,6 +368,10 @@ Small endpoint 生成 query 向量，并用同一个 Text Small 服务编码显�
 `model_id/revision` 保留真实生产者；升级任一编码器都创建新空间并重建，不把未经验证的版本混查。
 API 因此不加载 Jina 权重，模型只存在于 Worker 或独立 serving 进程。
 
+同一对象、编码器 revision、空间和 task 的向量写入保持幂等。考虑 GPU/F16 serving 对同一文本可能
+产生末位浮点抖动，重放向量的余弦相似度不低于 `0.999999` 时视为同一内容；低于阈值仍作为
+“同版本不同向量”拒绝，不能用容差掩盖模型或输入变化。
+
 ### 6.3 为什么必须保留多种索引
 
 一个通用 Omni 向量不能同时解决全部问题：
@@ -500,7 +504,8 @@ Memory 向量命中上层 Summary 时走独立的树形下钻查询：PostgreSQL
 `contains` 边递归返回父节点和来源子节点，深度上限为 16，并对每个结果重新应用完整结构化过滤。
 这让无证据的 `unverified` 导航摘要不能直接支撑回答，而其下方原样保存的 `attested` 来源仍可被
 Omni 引用。该展开只用于全库语义检索；调用方显式传入的 `memory_ids` 始终保持严格范围，不隐式
-加入父子节点。
+加入父子节点。直接 Memory 向量排名与层级展开排名作为两个独立信号进入同一个 RRF；不能让一个
+Summary 命中携带的整组子节点挤掉其他直接命中。
 
 ### 7.3 追问
 
@@ -597,7 +602,9 @@ PostgreSQL 只枚举严格早于 `evaluated_at`、未删除、未 supersede、�
 或 attested Episodic/Semantic Memory；候选由可校准的时间邻近、Evidence 对应的共享 Entity，或
 同一 Jina 兼容空间的向量相似度扩展，单页最多交给 Omni 64 条。Event/Claim 所代表的 Memory
 直接复用 `represented_by` 来源对象的现有向量，显式 Memory 和 Summary 使用自己的 Memory 向量，
-不重复保存等价 embedding。
+不重复保存等价 embedding。种子和候选按 `occurred_at, memory_id` 稳定分页，游标直接携带这两个
+值而不反查上一条记录，因此并发 `forget` 不会中断续页；时间排序也避免一页无谓混入多个相距很远的
+Session。
 
 冻结 Omni/VLM 直接检查候选引用的原始图像、视频和音频，并通过严格 schema 返回互不重叠的
 Memory 分组、`session/day/person/place/topic` scope、摘要和 salience。只有全部来源均为 verified
@@ -808,6 +815,16 @@ client = AsyncOpenAI(api_key=api_key, base_url=base_url)
 
 供应商差异收敛到模型名、`base_url` 和必要请求字段；不为每个供应商新增一套 HTTP client。仅当服务不兼容且没有官方 SDK 时，才允许一个局部、可删除的薄适配器。
 
+共享 OpenAI 调用默认省略 `reasoning_effort`，确保非推理模型和不同 OpenAI-compatible
+服务不会收到不支持的字段。只有经过部署验证的 Omni Answerer 才通过
+`MINDBRIDGE_ANSWER_REASONING_EFFORT` 显式配置档位；Benchmark CLI 必须用
+`--answer-reasoning-effort` 记录实际部署值（未发送时记为 `omitted`）。模型 revision 变化时
+重跑 `omitted`、`low` 和 `medium` bake-off，不把某一供应商的参数强加给共享调用边界。
+
+Omni Answerer 先保留供应商原生结构化生成并立即做 Pydantic 校验；只有首次答案不是合法 schema
+时，才用同一模型、同一上下文和 OpenAI SDK 的 `json_object` mode 重试一次。正常请求不承担
+JSON mode 的质量偏移，fallback 也不切换模型或无限重试。
+
 音频内容块保留服务端的真实兼容契约：Qwen Chat 使用 URL 型 `input_audio`，vLLM 多模态
 Embedding 使用 `audio_url`。两者共享 OpenAI SDK 和图像/视频构造，但不把这两个不同的音频
 schema 伪装成一个通用格式。
@@ -937,7 +954,8 @@ Schema 变更必须向后兼容或带显式迁移；不得在 Worker 和 API 不
 3. 仅对幂等且瞬时失败的 I/O 重试；使用有上限的指数退避和 jitter。
    OpenAI SDK 连接错误及 408、409、429、5xx 归一为可重试 `ModelUnavailable`；其余 SDK
    请求错误归一为不可重试且脱敏的 `ModelRequestError`。PostgreSQL 只重试连接异常、连接池超时、
-   序列化失败、死锁、连接耗尽和服务启停，不重试鉴权、SQL 或查询超时错误。
+   序列化失败、死锁、连接耗尽、服务启停和 SQLSTATE `57014` 查询取消；后者覆盖部署配置的
+   `statement_timeout`，连接边界回滚完整事务后才允许有界重试。鉴权和 SQL 错误不重试。
    Celery 分开计算等待旧 Worker claim 与瞬时 I/O 失败的重试预算，前者不能耗尽后者。
 4. 每次外部调用必须有 timeout；批处理必须有并发上限、取消和部分失败语义。
 5. 数据写入先确定事务边界；媒体、数据库和任务状态无法原子提交时使用可恢复状态，而不是假装原子。
@@ -1147,10 +1165,19 @@ revision `0e3e41939bd8a0b66d756e7b7eb8d5fe9992da5c`、EgoLife 数据 revision
 `dataset-adapters-smoke.json` 记录源文件 SHA-256、适配器版本和完整样本计数；当前门禁覆盖
 LoCoMo 1,986 题、M3 两个 split 共 4,490 题、EgoLifeQA 500 题和 SuperMemory-VQA 4,853 题。
 
-LoCoMo runner 将原始对话逐 turn 通过 `remember` 写入，并且不向生产接口传入参考答案或证据
-标签。Temporal 类别沿用官方无标签的会话日期作答指令；输出使用官方 evaluator 识别的
+LoCoMo runner 将原始对话逐 turn 通过 `remember` 写入，并且不向生产接口传入参考答案、证据
+标签或 category。Recall query 只包含原始问题，作答格式由统一的 Omni Answerer 契约负责，避免指令文本
+污染 query embedding。默认 recall limit 为 20；问题文本显式包含 `would`、`likely` 或 `might` 时提升到
+50，以补足推断所需的多条经历，该决策不读取 category 或 evidence 标签。两个 limit 都进入
+runner version/manifest；输出使用官方 evaluator 识别的
 `mindbridge_prediction` 与 `mindbridge_prediction_context`，因此答案 F1 和检索 recall 均走官方
 计算路径。
+
+固定 `conv-26` 的 199 题生产切片中，`qwen3.8-max`、Text Small F16 和官方 evaluator 下，当前
+答案契约、原始 query 与自适应召回由 F1 `0.5459` 提升到 `0.6137`，Evidence recall 由
+`0.7726` 提升到 `0.7822`。该单会话结果只作为组合优化和回归证据，不作为全量 LoCoMo、
+单变量消融或 SOTA 声明；数据、Evaluator、运行配置、输出 hash 和五类指标保存在
+[`locomo-conv-26-optimization.json`](../benchmarks/manifests/locomo-conv-26-optimization.json)。
 
 M3-Bench 的生产 runner 沿用官方 30 秒、零起点连续切片约定。媒体由 FFmpeg 和标准 S3
 工具在运行前准备，MindBridge 只读取包含 URI、SHA-256、时长和绝对时间原点的强类型 manifest。

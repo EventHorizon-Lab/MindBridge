@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 
 from pydantic import Field
 
@@ -26,6 +27,8 @@ from mindbridge.sdk import AsyncMindBridge
 
 LOCOMO_PREDICTION_KEY = "mindbridge_prediction"
 LOCOMO_ABSTENTION = "Not mentioned in the conversation"
+LOCOMO_INFERENCE_RECALL_LIMIT = 50
+_INFERENCE_QUERY = re.compile(r"\b(?:would|likely|might)\b", re.IGNORECASE)
 
 
 class LoCoMoOfficialQuestionResult(ContractModel):
@@ -58,8 +61,8 @@ async def run_locomo_conversation(
     request_concurrency: int = 4,
 ) -> LoCoMoOfficialConversationResult:
     """Ingest one conversation, then answer its questions without label leakage."""
-    if recall_limit <= 0 or request_concurrency <= 0:
-        raise ValueError("recall_limit and request_concurrency must be positive")
+    if not 1 <= recall_limit <= 100 or request_concurrency <= 0:
+        raise ValueError("recall_limit must be between 1 and 100; concurrency must be positive")
     tenant_id = benchmark_tenant_id(tenant_prefix, conversation.sample_id, run_id)
     semaphore = asyncio.Semaphore(request_concurrency)
     remembered = await asyncio.gather(
@@ -117,15 +120,12 @@ async def _answer_question(
         result = await memory.recall(
             RecallRequest(
                 tenant_id=tenant_id,
-                query=RecallQuery(
-                    text=(
-                        f"{question.question} Use DATE of CONVERSATION to answer with an "
-                        "approximate date."
-                        if question.category == 2
-                        else question.question
-                    )
+                query=RecallQuery(text=question.question),
+                limit=(
+                    max(recall_limit, LOCOMO_INFERENCE_RECALL_LIMIT)
+                    if _INFERENCE_QUERY.search(question.question)
+                    else recall_limit
                 ),
-                limit=recall_limit,
                 include_evidence=False,
             )
         )

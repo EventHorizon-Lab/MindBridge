@@ -258,11 +258,17 @@ class InMemoryStore:
         *,
         limit: int,
     ) -> tuple[MemoryRecord, ...]:
-        expanded_ids = list(dict.fromkeys(ranked_memory_ids))
-        for memory_id in expanded_ids:
+        expanded_ids: list[MemoryId] = []
+
+        def append_descendants(memory_id: MemoryId, depth: int) -> None:
+            if depth > 16 or memory_id in expanded_ids:
+                return
+            expanded_ids.append(memory_id)
             for child_id in self.summary_children.get(memory_id, ()):
-                if child_id not in expanded_ids:
-                    expanded_ids.append(child_id)
+                append_descendants(child_id, depth + 1)
+
+        for memory_id in dict.fromkeys(ranked_memory_ids):
+            append_descendants(memory_id, 0)
         return await self.search_memories_by_ids(request, tuple(expanded_ids), limit=limit)
 
     async def search_memories_by_graph_objects(
@@ -986,8 +992,22 @@ async def test_semantic_summary_hit_descends_to_attested_source_for_answering() 
         verification_status=VerificationStatus.UNVERIFIED,
         model_reference=ModelReference(model_id="omni", revision="summary-revision"),
     )
+    middle = MemoryRecord(
+        memory_id=MemoryId("summary_middle"),
+        tenant_id=TenantId("tenant_01"),
+        memory_type=MemoryType.SEMANTIC,
+        summary="A generated intermediate summary.",
+        evidence_ids=(),
+        occurred_at=child.occurred_at,
+        ended_at=child.ended_at,
+        created_at=NOW,
+        verification_status=VerificationStatus.UNVERIFIED,
+        model_reference=ModelReference(model_id="omni", revision="summary-revision"),
+    )
     store.memories["summary"] = ("a" * 64, parent)
-    store.summary_children[parent.memory_id] = (MemoryId(child.memory_id),)
+    store.memories["summary_middle"] = ("b" * 64, middle)
+    store.summary_children[parent.memory_id] = (middle.memory_id,)
+    store.summary_children[middle.memory_id] = (MemoryId(child.memory_id),)
     store.embedding_matches = (
         EmbeddingMatch(
             embedding_id="embedding_summary",
@@ -1003,10 +1023,60 @@ async def test_semantic_summary_hit_descends_to_attested_source_for_answering() 
 
     assert [memory.memory_id for memory in result.memories] == [
         parent.memory_id,
+        middle.memory_id,
         child.memory_id,
     ]
     assert [memory.memory_id for memory in answerer.last_memories] == [child.memory_id]
     assert result.answer == child.summary
+
+
+async def test_semantic_summary_expansion_does_not_displace_direct_hits() -> None:
+    store = InMemoryStore()
+    kernel = _kernel(store, RecordingAnswerer())
+    direct = await kernel.remember(_remember_request(idempotency_key="direct"))
+    children = (
+        await kernel.remember(_remember_request(idempotency_key="child-0")),
+        await kernel.remember(_remember_request(idempotency_key="child-1")),
+    )
+    parent = MemoryRecord(
+        memory_id=MemoryId("summary_parent"),
+        tenant_id=TenantId("tenant_01"),
+        memory_type=MemoryType.SEMANTIC,
+        summary="A generated session summary.",
+        evidence_ids=(),
+        occurred_at=NOW,
+        ended_at=NOW,
+        created_at=NOW,
+        verification_status=VerificationStatus.UNVERIFIED,
+    )
+    store.memories["summary"] = ("a" * 64, parent)
+    store.summary_children[parent.memory_id] = tuple(
+        MemoryId(child.memory_id) for child in children
+    )
+    store.embedding_matches = tuple(
+        EmbeddingMatch(
+            embedding_id=f"embedding_{index}",
+            object_type=EmbeddedObjectType.MEMORY_RECORD,
+            object_id=memory_id,
+            similarity=similarity,
+        )
+        for index, (memory_id, similarity) in enumerate(
+            ((parent.memory_id, 0.9), (MemoryId(direct.memory_id), 0.8))
+        )
+    )
+
+    result = await kernel.recall(
+        RecallRequest(
+            tenant_id="tenant_01",
+            query=RecallQuery(text="a semantic paraphrase"),
+            limit=3,
+        )
+    )
+
+    assert [memory.memory_id for memory in result.memories[:2]] == [
+        parent.memory_id,
+        direct.memory_id,
+    ]
 
 
 async def test_recall_scopes_followup_to_explicit_memory_ids() -> None:

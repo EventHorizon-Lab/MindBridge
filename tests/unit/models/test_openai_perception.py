@@ -41,6 +41,7 @@ async def test_omni_perception_returns_grounded_event_and_provider_revision() ->
         content = cast(list[dict[str, object]], messages[1]["content"])
 
         assert request.url.path == "/api/v1/chat/completions"
+        assert "reasoning_effort" not in payload
         assert {item["type"] for item in content} >= {"video_url", "input_audio"}
         assert '"evidence_id":"evidence_video"' in cast(str, content[0]["text"])
         assert '"identity_id":"person_device_01"' in cast(str, content[0]["text"])

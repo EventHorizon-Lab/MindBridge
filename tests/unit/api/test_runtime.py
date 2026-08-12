@@ -17,6 +17,7 @@ def test_runtime_settings_use_documented_defaults_and_redact_key() -> None:
             "MINDBRIDGE_VLM_API_KEY": "secret-unit-test-key",
             "MINDBRIDGE_VLM_ENDPOINT": "https://vlm.example.test/api/v1/chat/completions",
             "MINDBRIDGE_VLM_MODEL_REVISION": "deployment-revision",
+            "MINDBRIDGE_ANSWER_REASONING_EFFORT": "low",
             "MINDBRIDGE_EMBEDDING_API_KEY": "secret-embedding-key",
             "MINDBRIDGE_EMBEDDING_ENDPOINT": "https://embedding.example.test/v1/embeddings",
             "MINDBRIDGE_TEXT_EMBEDDING_API_KEY": "secret-text-embedding-key",
@@ -33,6 +34,7 @@ def test_runtime_settings_use_documented_defaults_and_redact_key() -> None:
     assert settings.object_storage_region == "us-east-1"
     assert settings.vlm_model_id == "qwen3.8-max"
     assert settings.vlm_model_revision == "deployment-revision"
+    assert settings.answer_reasoning_effort == "low"
     assert settings.embedding_model_id == "jinaai/jina-embeddings-v5-omni-small-retrieval"
     assert settings.embedding_model_revision == "12949877f0092093f366c6450340011320152a05"
     assert settings.text_embedding_model_id == "jinaai/jina-embeddings-v5-text-small-retrieval"
@@ -58,6 +60,23 @@ def test_runtime_settings_require_vlm_revision() -> None:
                 "MINDBRIDGE_VLM_API_KEY": "unit-test-key",
                 "MINDBRIDGE_VLM_ENDPOINT": "https://vlm.example.test/v1",
             }
+        )
+
+
+def test_runtime_settings_reject_unsupported_answer_reasoning_effort() -> None:
+    with pytest.raises(ValueError, match="answer_reasoning_effort"):
+        RuntimeSettings(
+            database_url="postgresql://mindbridge@postgres/mindbridge",
+            object_storage_bucket="memory",
+            task_broker_url="redis://redis:6379/0",
+            vlm_api_key="unit-test-key",
+            vlm_endpoint="https://vlm.example.test/v1",
+            vlm_model_revision="deployment-revision",
+            embedding_api_key="unit-test-embedding-key",
+            embedding_endpoint="https://embedding.example.test/v1",
+            text_embedding_api_key="unit-test-text-key",
+            text_embedding_endpoint="https://text.example.test/v1",
+            answer_reasoning_effort="unsupported",  # type: ignore[arg-type]
         )
 
 

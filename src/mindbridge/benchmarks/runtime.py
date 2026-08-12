@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import re
-import time
 
 from pydantic import TypeAdapter
 
@@ -37,17 +36,24 @@ async def wait_for_observation_job(
     """Wait for durable success while allowing failed attempts to be retried."""
     if poll_interval_seconds <= 0 or timeout_seconds <= 0:
         raise ValueError("poll interval and timeout must be positive")
-    deadline = time.monotonic() + timeout_seconds
-    while True:
-        job = await memory.get_observation_job(tenant_id, job_id)
-        if job.state is JobState.SUCCEEDED:
-            return job
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise TimeoutError(
-                f"observation job {job_id} did not succeed; last state was {job.state.value}"
-            )
-        await asyncio.sleep(min(poll_interval_seconds, remaining))
+    last_state: JobState | None = None
+
+    async def poll() -> ObservationProcessingJobView:
+        nonlocal last_state
+        while True:
+            job = await memory.get_observation_job(tenant_id, job_id)
+            last_state = job.state
+            if job.state is JobState.SUCCEEDED:
+                return job
+            await asyncio.sleep(poll_interval_seconds)
+
+    try:
+        return await asyncio.wait_for(poll(), timeout_seconds)
+    except asyncio.TimeoutError as error:
+        state = last_state.value if last_state is not None else "unavailable"
+        raise TimeoutError(
+            f"observation job {job_id} did not succeed; last state was {state}"
+        ) from error
 
 
 def multiple_choice_query(

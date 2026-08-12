@@ -52,6 +52,8 @@ def test_supermemory_artifacts_pin_inputs_models_metrics_and_output(tmp_path: Pa
     assert predictions["results"][0]["predicted_option_index"] == 1
     assert manifest.dataset_revision == "dataset-revision"
     assert manifest.source_revision == "source-revision"
+    assert manifest.reasoning_effort == "low"
+    assert manifest.request_timeout_seconds == 1_800.0
     assert manifest.run_id == "run_01"
     assert manifest.metrics.answerability_f1 == 1.0
     assert manifest.predictions_sha256 == hashlib.sha256(output_path.read_bytes()).hexdigest()
@@ -78,6 +80,7 @@ def _arguments(dataset_path: Path, prepared_path: Path, output_path: Path) -> _A
         perception_model_revision="perception-fingerprint",
         answer_model_id="qwen3.8-max",
         answer_model_revision="answer-fingerprint",
+        answer_reasoning_effort="low",
         embedding_model_id=DEFAULT_JINA_OMNI_MODEL_ID,
         embedding_model_revision=DEFAULT_JINA_OMNI_REVISION,
         run_id="run_01",
@@ -85,6 +88,7 @@ def _arguments(dataset_path: Path, prepared_path: Path, output_path: Path) -> _A
         device_id="supermemory_glasses",
         recall_limit=20,
         request_concurrency=4,
+        request_timeout_seconds=1_800.0,
         poll_interval_seconds=1.0,
         processing_timeout_seconds=1_800.0,
         question_ids=(),

@@ -68,6 +68,8 @@ def test_m3_artifacts_pin_media_models_code_and_jsonl_output(tmp_path: Path) -> 
     assert manifest.media_revision == "official-media-revision"
     assert manifest.perception_model_revision == "perception-serving-fingerprint"
     assert manifest.answer_model_revision == "answer-serving-fingerprint"
+    assert manifest.reasoning_effort == "low"
+    assert manifest.request_timeout_seconds == 1_800.0
     assert manifest.run_id == "run_01"
     assert manifest.clip_count == 1
     assert manifest.question_count == 1
@@ -115,6 +117,7 @@ def _arguments(dataset_path: Path, prepared_path: Path, output_path: Path) -> _A
         perception_model_revision="perception-serving-fingerprint",
         answer_model_id="qwen3.8-max",
         answer_model_revision="answer-serving-fingerprint",
+        answer_reasoning_effort="low",
         embedding_model_id=DEFAULT_JINA_OMNI_MODEL_ID,
         embedding_model_revision=DEFAULT_JINA_OMNI_REVISION,
         run_id="run_01",
@@ -122,6 +125,7 @@ def _arguments(dataset_path: Path, prepared_path: Path, output_path: Path) -> _A
         device_id="m3_bench_camera",
         recall_limit=20,
         request_concurrency=4,
+        request_timeout_seconds=1_800.0,
         poll_interval_seconds=1.0,
         processing_timeout_seconds=1_800.0,
         video_ids=(),

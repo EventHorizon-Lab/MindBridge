@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import cast
 
 from mindbridge.application.summary_consolidation import (
     SummaryCandidate,
+    SummaryCandidateCursor,
     SummaryCandidatePage,
     SummaryCandidateRequest,
 )
@@ -30,12 +32,20 @@ async def list_summary_candidates(
             {
                 "tenant_id": request.tenant_id,
                 "evaluated_at": request.evaluated_at,
-                "after_memory_id": request.after_memory_id,
+                "after_occurred_at": (
+                    request.after_cursor.occurred_at if request.after_cursor is not None else None
+                ),
+                "after_memory_id": (
+                    request.after_cursor.memory_id if request.after_cursor is not None else None
+                ),
                 "limit": request.limit + 1,
             },
         )
-        seed_ids = tuple([MemoryId(cast(tuple[str], row)[0]) async for row in cursor])
-        page_seed_ids = seed_ids[: request.limit]
+        seed_cursors = tuple(
+            [_summary_cursor_from_row(cast(tuple[object, ...], row)) async for row in cursor]
+        )
+        page_seed_cursors = seed_cursors[: request.limit]
+        page_seed_ids = tuple(cursor.memory_id for cursor in page_seed_cursors)
         if not page_seed_ids:
             return SummaryCandidatePage(candidates=(), scanned_count=0, next_cursor=None)
 
@@ -65,7 +75,14 @@ async def list_summary_candidates(
     return SummaryCandidatePage(
         candidates=candidates,
         scanned_count=len(page_seed_ids),
-        next_cursor=(page_seed_ids[-1] if len(seed_ids) > request.limit else None),
+        next_cursor=(page_seed_cursors[-1] if len(seed_cursors) > request.limit else None),
+    )
+
+
+def _summary_cursor_from_row(row: tuple[object, ...]) -> SummaryCandidateCursor:
+    return SummaryCandidateCursor(
+        memory_id=MemoryId(cast(str, row[0])),
+        occurred_at=cast(datetime, row[1]),
     )
 
 
@@ -93,12 +110,16 @@ AND NOT EXISTS (
 """
 
 _SUMMARY_SEEDS_SQL = f"""
-SELECT memory.memory_id
+SELECT memory.memory_id, memory.occurred_at
 FROM memory_records AS memory
 WHERE memory.tenant_id = %(tenant_id)s
   AND {_CURRENT_SUMMARY_SOURCE_SQL}
-  AND (%(after_memory_id)s::text IS NULL OR memory.memory_id > %(after_memory_id)s)
-ORDER BY memory.memory_id
+  AND (
+      %(after_occurred_at)s::timestamptz IS NULL
+      OR (memory.occurred_at, memory.memory_id) >
+         (%(after_occurred_at)s::timestamptz, %(after_memory_id)s::text)
+  )
+ORDER BY memory.occurred_at, memory.memory_id
 LIMIT %(limit)s
 """
 
@@ -140,7 +161,7 @@ related_pairs AS (
       ON seed.tenant_id = %(tenant_id)s AND seed.memory_id = seed_ids.memory_id
     JOIN memory_records AS peer
       ON peer.tenant_id = seed.tenant_id
-     AND peer.memory_id > seed.memory_id
+     AND (peer.occurred_at, peer.memory_id) > (seed.occurred_at, seed.memory_id)
     WHERE {_CURRENT_SUMMARY_SOURCE_SQL.replace("memory.", "peer.")}
       AND (
           (
@@ -186,7 +207,13 @@ related_ids AS (
     UNION
     SELECT peer_id AS memory_id FROM related_pairs
 )
-SELECT memory_id FROM related_ids ORDER BY memory_id LIMIT %(candidate_limit)s
+SELECT related.memory_id
+FROM related_ids AS related
+JOIN memory_records AS memory
+  ON memory.tenant_id = %(tenant_id)s
+ AND memory.memory_id = related.memory_id
+ORDER BY memory.occurred_at, memory.memory_id
+LIMIT %(candidate_limit)s
 """
 
 _READ_SUMMARY_CANDIDATES_SQL = f"""

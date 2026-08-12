@@ -37,6 +37,7 @@ async def test_omni_streams_raw_av_and_validates_answer() -> None:
     async def respond(request: httpx.Request) -> httpx.Response:
         payload: dict[str, object] = json.loads(request.content)
         messages = cast(list[dict[str, object]], payload["messages"])
+        system_prompt = cast(str, messages[0]["content"])
         user_content = cast(list[dict[str, object]], messages[1]["content"])
         video = next(item for item in user_content if item["type"] == "video_url")
         audio = next(item for item in user_content if item["type"] == "input_audio")
@@ -46,6 +47,10 @@ async def test_omni_streams_raw_av_and_validates_answer() -> None:
         assert payload["model"] == "qwen3.8-max"
         assert payload["stream"] is True
         assert payload["modalities"] == ["text"]
+        assert "response_format" not in payload
+        assert payload["reasoning_effort"] == "low"
+        assert 'For yes/no questions, answer "Yes" or "No".' in system_prompt
+        assert "different named person does not support" in system_prompt
         assert {item["type"] for item in user_content} >= {
             "image_url",
             "video_url",
@@ -71,6 +76,7 @@ async def test_omni_streams_raw_av_and_validates_answer() -> None:
     answerer = _answerer(respond)
     assert answerer.model_reference.model_id == "qwen3.8-max"
     assert answerer.model_reference.revision == "deployment-revision"
+    assert answerer.prompt_version == "answer_from_evidence_v3"
     evidence = (
         _resolved_evidence(MediaKind.IMAGE, "image.jpg", "media_image", 0),
         _resolved_evidence(MediaKind.VIDEO, "clip.mp4", "media_video", 1_000),
@@ -90,6 +96,40 @@ async def test_omni_streams_raw_av_and_validates_answer() -> None:
 
     assert answer.answer == "The screwdriver is beside the blue toolbox"
     assert answer.confidence == 0.87
+
+
+async def test_omni_retries_invalid_answer_once_in_json_mode() -> None:
+    calls = 0
+
+    async def respond(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        payload: dict[str, object] = json.loads(request.content)
+        if calls == 1:
+            assert "response_format" not in payload
+            content = "not json"
+        else:
+            assert payload["response_format"] == {"type": "json_object"}
+            content = '{"answer":"blue toolbox","confidence":0.8}'
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=_completion_stream(content),
+        )
+
+    answerer = _answerer(respond)
+    try:
+        answer = await answerer.answer(
+            RecallRequest(tenant_id="tenant_01", query=RecallQuery(text="Where is it?")),
+            (_memory((), verification_status=VerificationStatus.ATTESTED),),
+            (),
+            query_media=(),
+        )
+    finally:
+        await answerer.close()
+
+    assert calls == 2
+    assert answer.answer == "blue toolbox"
 
 
 async def test_omni_inspects_native_query_media_before_candidate_evidence() -> None:
@@ -287,7 +327,11 @@ def _answerer(
         http_client=http_client,
         max_retries=0,
     )
-    return OpenAIOmniAnswerer(client, model_revision="deployment-revision")
+    return OpenAIOmniAnswerer(
+        client,
+        model_revision="deployment-revision",
+        reasoning_effort="low",
+    )
 
 
 def _resolved_evidence(

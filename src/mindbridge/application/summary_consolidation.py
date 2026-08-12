@@ -41,12 +41,26 @@ class SummaryScope(str, Enum):
 
 
 @dataclass(frozen=True, slots=True)
+class SummaryCandidateCursor:
+    """Self-contained position that survives deletion of the prior seed."""
+
+    occurred_at: datetime
+    memory_id: MemoryId
+
+    def __post_init__(self) -> None:
+        if self.occurred_at.utcoffset() is None:
+            raise DomainInvariantError("Summary candidate cursor time must be timezone-aware")
+        if not self.memory_id.strip():
+            raise DomainInvariantError("Summary candidate cursor Memory ID must not be empty")
+
+
+@dataclass(frozen=True, slots=True)
 class SummaryCandidateRequest:
     """Stable page and calibrated affinity bounds for one tenant sweep."""
 
     tenant_id: TenantId
     evaluated_at: datetime
-    after_memory_id: MemoryId | None = None
+    after_cursor: SummaryCandidateCursor | None = None
     limit: int = 16
     maximum_gap_seconds: int = 2_592_000
     minimum_similarity: float = 0.8
@@ -56,8 +70,6 @@ class SummaryCandidateRequest:
             raise DomainInvariantError("tenant_id must not be empty")
         if self.evaluated_at.utcoffset() is None:
             raise DomainInvariantError("evaluated_at must be timezone-aware")
-        if self.after_memory_id is not None and not self.after_memory_id.strip():
-            raise DomainInvariantError("after_memory_id must not be empty")
         if not 1 <= self.limit <= 32:
             raise DomainInvariantError("Summary candidate page limit must be between 1 and 32")
         if not 0 <= self.maximum_gap_seconds <= 31_536_000:
@@ -91,14 +103,12 @@ class SummaryCandidatePage:
 
     candidates: tuple[SummaryCandidate, ...]
     scanned_count: int
-    next_cursor: MemoryId | None
+    next_cursor: SummaryCandidateCursor | None
 
     def __post_init__(self) -> None:
         memories = tuple(candidate.memory for candidate in self.candidates)
         if self.scanned_count < 0:
             raise DomainInvariantError("Summary candidate scanned_count must be non-negative")
-        if self.next_cursor is not None and not self.next_cursor.strip():
-            raise DomainInvariantError("Summary candidate cursor must not be empty")
         if len({memory.memory_id for memory in memories}) != len(memories):
             raise DomainInvariantError("Summary candidate Memory IDs must be unique")
         if len({memory.tenant_id for memory in memories}) > 1:

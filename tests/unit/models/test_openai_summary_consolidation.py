@@ -38,6 +38,9 @@ async def test_summary_consolidator_inspects_native_evidence_and_preserves_revis
     async def respond(request: httpx.Request) -> httpx.Response:
         payload: dict[str, object] = json.loads(request.content)
         messages = cast(list[dict[str, object]], payload["messages"])
+        assert 'scope value must be exactly one of "session", "day", "person"' in cast(
+            str, messages[0]["content"]
+        )
         content = cast(list[dict[str, object]], messages[1]["content"])
         assert {part["type"] for part in content} >= {"video_url"}
         context = cast(str, content[0]["text"])
@@ -69,7 +72,7 @@ async def test_summary_consolidator_inspects_native_evidence_and_preserves_revis
     )
     assert result.summaries[0].scope is SummaryScope.SESSION
     assert result.model_reference.revision == "summary-serving-revision-01"
-    assert result.prompt_version == "consolidate_summaries_v1"
+    assert result.prompt_version == "consolidate_summaries_v2"
 
 
 async def test_summary_consolidator_rejects_unknown_memory_and_missing_evidence() -> None:

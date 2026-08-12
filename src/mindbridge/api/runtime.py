@@ -7,9 +7,11 @@ import os
 from collections.abc import AsyncIterator, Mapping
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass, field
+from typing import cast
 
 from fastapi import FastAPI
 from mcp.server import MCPServer
+from openai.types.shared import ReasoningEffort
 
 from mindbridge.api.app import create_app
 from mindbridge.api.auth import TenantApiKeyAuthenticator
@@ -30,6 +32,7 @@ from mindbridge.models.jina import (
     DEFAULT_JINA_TEXT_MODEL_ID,
     DEFAULT_JINA_TEXT_REVISION,
 )
+from mindbridge.models.openai_chat import REASONING_EFFORT_VALUES
 from mindbridge.models.openai_embeddings import OpenAIJinaEmbedder
 from mindbridge.models.openai_omni import (
     DEFAULT_OMNI_MODEL_ID,
@@ -62,6 +65,7 @@ class RuntimeSettings:
     embedding_space_id: str = DEFAULT_JINA_RETRIEVAL_SPACE.space_id
     embedding_space_revision: str = DEFAULT_JINA_RETRIEVAL_SPACE.revision
     minimum_embedding_similarity: float = 0.0
+    answer_reasoning_effort: ReasoningEffort = None
     tenant_api_keys_json: str | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
@@ -94,6 +98,11 @@ class RuntimeSettings:
             raise ValueError("object_storage_endpoint_url must not be empty when provided")
         if self.tenant_api_keys_json is not None and not self.tenant_api_keys_json.strip():
             raise ValueError("tenant_api_keys_json must not be empty when provided")
+        if (
+            self.answer_reasoning_effort is not None
+            and self.answer_reasoning_effort not in REASONING_EFFORT_VALUES
+        ):
+            raise ValueError("answer_reasoning_effort is not supported")
         if (
             not math.isfinite(self.minimum_embedding_similarity)
             or not -1.0 <= self.minimum_embedding_similarity <= 1.0
@@ -149,6 +158,10 @@ class RuntimeSettings:
             ),
             minimum_embedding_similarity=float(
                 source.get("MINDBRIDGE_MINIMUM_EMBEDDING_SIMILARITY", "0.0")
+            ),
+            answer_reasoning_effort=cast(
+                ReasoningEffort,
+                optional_environment_value(source, "MINDBRIDGE_ANSWER_REASONING_EFFORT"),
             ),
             tenant_api_keys_json=optional_environment_value(
                 source, "MINDBRIDGE_TENANT_API_KEYS_JSON"
@@ -225,6 +238,7 @@ def _build_runtime(settings: RuntimeSettings) -> _ProductionRuntime:
         endpoint=settings.vlm_endpoint,
         model_id=settings.vlm_model_id,
         model_revision=settings.vlm_model_revision,
+        reasoning_effort=settings.answer_reasoning_effort,
     )
     recall_embedder = OpenAIJinaEmbedder.connect(
         api_key=settings.embedding_api_key,

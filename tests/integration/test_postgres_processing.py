@@ -81,6 +81,7 @@ from mindbridge.core import (
     MemoryId,
     MemoryIntegrityError,
     MemoryNotFoundError,
+    MemoryRecord,
     MemoryType,
     ModelReference,
     Observation,
@@ -89,6 +90,7 @@ from mindbridge.core import (
     SensorKind,
     TenantId,
     TombstoneId,
+    VerificationStatus,
     derive_stable_id,
 )
 from mindbridge.infrastructure.postgres import PostgresMemoryStore
@@ -645,11 +647,69 @@ async def test_summary_candidates_expand_a_stable_seed_across_memory_representat
     assert page.scanned_count == 1
     assert page.next_cursor is not None
     assert len(page.candidates) == 4
+    assert page.next_cursor.occurred_at == min(
+        candidate.memory.occurred_at for candidate in page.candidates
+    )
     assert {candidate.memory.memory_type for candidate in page.candidates} == {
         MemoryType.EPISODIC,
         MemoryType.SEMANTIC,
     }
     assert all(len(candidate.entity_ids) == 2 for candidate in page.candidates)
+
+
+async def test_summary_cursor_survives_forgetting_the_previous_seed(
+    store: PostgresMemoryStore,
+) -> None:
+    tenant_id = TenantId("tenant_summary_cursor_forget")
+    for ordinal in range(3):
+        occurred_at = NOW + timedelta(minutes=ordinal)
+        memory = MemoryRecord(
+            memory_id=MemoryId(f"memory_{ordinal}"),
+            tenant_id=tenant_id,
+            memory_type=MemoryType.EPISODIC,
+            summary=f"Attested event {ordinal}",
+            evidence_ids=(),
+            occurred_at=occurred_at,
+            ended_at=occurred_at,
+            created_at=occurred_at,
+            verification_status=VerificationStatus.ATTESTED,
+        )
+        await store.write_memory(
+            memory,
+            idempotency_key=f"summary_cursor_{ordinal}",
+            content_digest=f"{ordinal + 1:x}" * 64,
+        )
+
+    first = await store.list_summary_candidates(
+        SummaryCandidateRequest(
+            tenant_id=tenant_id,
+            evaluated_at=NOW + timedelta(days=1),
+            limit=1,
+            maximum_gap_seconds=0,
+        )
+    )
+    assert first.next_cursor is not None
+    await _forget_memory(
+        store,
+        tenant_id,
+        first.next_cursor.memory_id,
+        requested_at=NOW + timedelta(days=2),
+        ordinal=10,
+    )
+
+    second = await store.list_summary_candidates(
+        SummaryCandidateRequest(
+            tenant_id=tenant_id,
+            evaluated_at=NOW + timedelta(days=1),
+            after_cursor=first.next_cursor,
+            limit=1,
+            maximum_gap_seconds=0,
+        )
+    )
+
+    assert second.scanned_count == 1
+    assert second.next_cursor is not None
+    assert second.next_cursor.memory_id == "memory_1"
 
 
 async def test_episode_consolidation_is_atomic_recallable_and_retry_safe(

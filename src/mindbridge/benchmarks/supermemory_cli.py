@@ -39,6 +39,7 @@ from mindbridge.models.jina import (
     DEFAULT_JINA_OMNI_MODEL_ID,
     DEFAULT_JINA_OMNI_REVISION,
 )
+from mindbridge.models.openai_chat import REASONING_EFFORT_VALUES
 from mindbridge.models.openai_omni import (
     ANSWER_FROM_EVIDENCE_PROMPT_VERSION,
     DEFAULT_OMNI_MODEL_ID,
@@ -48,7 +49,7 @@ from mindbridge.models.openai_perception import (
 )
 from mindbridge.sdk import AsyncMindBridge
 
-SUPERMEMORY_RUNNER_VERSION = "supermemory_production_api_v3"
+SUPERMEMORY_RUNNER_VERSION = "supermemory_production_api_v5"
 
 
 class SuperMemoryRunManifest(ContractModel):
@@ -70,6 +71,7 @@ class SuperMemoryRunManifest(ContractModel):
     answer_model_id: NonEmptyString
     answer_model_revision: NonEmptyString
     answer_prompt_version: NonEmptyString
+    reasoning_effort: NonEmptyString
     embedding_model_id: NonEmptyString
     embedding_model_revision: NonEmptyString
     retrieval_task: NonEmptyString
@@ -79,6 +81,7 @@ class SuperMemoryRunManifest(ContractModel):
     subject: int = Field(gt=0)
     recall_limit: int = Field(gt=0, le=100)
     request_concurrency: int = Field(gt=0)
+    request_timeout_seconds: float = Field(gt=0)
     poll_interval_seconds: float = Field(gt=0)
     processing_timeout_seconds: float = Field(gt=0)
     question_ids: tuple[int, ...] = Field(min_length=1)
@@ -103,6 +106,7 @@ class _Arguments:
     perception_model_revision: str
     answer_model_id: str
     answer_model_revision: str
+    answer_reasoning_effort: str
     embedding_model_id: str
     embedding_model_revision: str
     run_id: str
@@ -110,6 +114,7 @@ class _Arguments:
     device_id: str
     recall_limit: int
     request_concurrency: int
+    request_timeout_seconds: float
     poll_interval_seconds: float
     processing_timeout_seconds: float
     question_ids: tuple[int, ...]
@@ -138,6 +143,7 @@ async def _run(
     memory = AsyncMindBridge.connect(
         base_url=arguments.api_base_url,
         api_key=os.environ.get("MINDBRIDGE_API_KEY"),
+        timeout_seconds=arguments.request_timeout_seconds,
     )
     try:
         return await run_supermemory_vqa(
@@ -194,6 +200,7 @@ def _write_artifacts(
         answer_model_id=arguments.answer_model_id,
         answer_model_revision=arguments.answer_model_revision,
         answer_prompt_version=ANSWER_FROM_EVIDENCE_PROMPT_VERSION,
+        reasoning_effort=arguments.answer_reasoning_effort,
         embedding_model_id=arguments.embedding_model_id,
         embedding_model_revision=arguments.embedding_model_revision,
         retrieval_task=RETRIEVAL_DOCUMENT_EMBEDDING_TASK,
@@ -203,6 +210,7 @@ def _write_artifacts(
         subject=arguments.subject,
         recall_limit=arguments.recall_limit,
         request_concurrency=arguments.request_concurrency,
+        request_timeout_seconds=arguments.request_timeout_seconds,
         poll_interval_seconds=arguments.poll_interval_seconds,
         processing_timeout_seconds=arguments.processing_timeout_seconds,
         question_ids=tuple(question.question_id for question in questions),
@@ -260,6 +268,11 @@ def _parse_arguments() -> _Arguments:
     parser.add_argument("--perception-model-revision", required=True)
     parser.add_argument("--answer-model-id", default=DEFAULT_OMNI_MODEL_ID)
     parser.add_argument("--answer-model-revision", required=True)
+    parser.add_argument(
+        "--answer-reasoning-effort",
+        choices=("omitted", *REASONING_EFFORT_VALUES),
+        required=True,
+    )
     parser.add_argument("--embedding-model-id", default=DEFAULT_JINA_OMNI_MODEL_ID)
     parser.add_argument("--embedding-model-revision", default=DEFAULT_JINA_OMNI_REVISION)
     parser.add_argument("--run-id", required=True)
@@ -267,6 +280,7 @@ def _parse_arguments() -> _Arguments:
     parser.add_argument("--device-id", default="supermemory_glasses")
     parser.add_argument("--recall-limit", type=int, default=20)
     parser.add_argument("--request-concurrency", type=int, default=4)
+    parser.add_argument("--request-timeout-seconds", type=float, default=1_800.0)
     parser.add_argument("--poll-interval-seconds", type=float, default=1.0)
     parser.add_argument("--processing-timeout-seconds", type=float, default=1_800.0)
     parser.add_argument("--question-id", type=int, action="append", default=[])
@@ -285,6 +299,7 @@ def _parse_arguments() -> _Arguments:
         perception_model_revision=parsed.perception_model_revision,
         answer_model_id=parsed.answer_model_id,
         answer_model_revision=parsed.answer_model_revision,
+        answer_reasoning_effort=parsed.answer_reasoning_effort,
         embedding_model_id=parsed.embedding_model_id,
         embedding_model_revision=parsed.embedding_model_revision,
         run_id=parsed.run_id,
@@ -292,6 +307,7 @@ def _parse_arguments() -> _Arguments:
         device_id=parsed.device_id,
         recall_limit=parsed.recall_limit,
         request_concurrency=parsed.request_concurrency,
+        request_timeout_seconds=parsed.request_timeout_seconds,
         poll_interval_seconds=parsed.poll_interval_seconds,
         processing_timeout_seconds=parsed.processing_timeout_seconds,
         question_ids=tuple(parsed.question_id),

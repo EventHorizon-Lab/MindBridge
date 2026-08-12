@@ -1,5 +1,6 @@
 """Checks for committed reproducible benchmark manifests."""
 
+import json
 from pathlib import Path
 
 from mindbridge.benchmarks.dataset_smoke import DatasetAdapterSmokeResult
@@ -36,3 +37,22 @@ def test_dataset_adapter_manifest_matches_current_schema() -> None:
         "EgoLifeQA": 500,
         "SuperMemory-VQA": 4_853,
     }
+
+
+def test_locomo_optimization_manifest_preserves_reported_category_metrics() -> None:
+    manifest_path = (
+        Path(__file__).parents[3] / "benchmarks" / "manifests" / "locomo-conv-26-optimization.json"
+    )
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    runs = {run["name"]: run for run in manifest["runs"]}
+
+    assert manifest["dataset"]["revision"] == ("3eb6f2c585f5e1699204e3c3bdf7adc5c28cb376")
+    assert runs["baseline"]["metrics"]["answer_f1"] == 0.5459446372710516
+    assert runs["optimized"]["metrics"]["answer_f1"] == 0.6136889267575371
+    assert all(
+        sum(category["question_count"] for category in run["metrics"]["categories"])
+        == manifest["scope"]["question_count"]
+        for run in runs.values()
+    )
+    assert all(len(run["predictions_sha256"]) == 64 for run in runs.values())
