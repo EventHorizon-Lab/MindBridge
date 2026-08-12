@@ -56,6 +56,8 @@ class PixelRegion:
     def __post_init__(self) -> None:
         if min(self.x_min, self.y_min) < 0:
             raise DomainInvariantError("pixel region coordinates must be non-negative")
+        if max(self.x_min, self.y_min, self.x_max, self.y_max) > _SIGNED_INT32_MAX:
+            raise DomainInvariantError("pixel region coordinates must fit signed 32-bit integers")
         if self.x_max <= self.x_min or self.y_max <= self.y_min:
             raise DomainInvariantError("pixel region maximums must exceed minimums")
 
@@ -168,10 +170,12 @@ class EvidenceSpan:
         require_non_empty(self.observation_id, "observation_id")
         require_non_empty(self.media_object_id, "media_object_id")
         require_aware_datetime(self.created_at, "created_at")
-        if self.start_ms < 0:
-            raise DomainInvariantError("start_ms must be non-negative")
+        if not 0 <= self.start_ms <= _SIGNED_INT64_MAX:
+            raise DomainInvariantError("start_ms must fit a non-negative signed 64-bit integer")
         if self.end_ms < self.start_ms:
             raise DomainInvariantError("end_ms must not precede start_ms")
+        if self.end_ms > _SIGNED_INT64_MAX:
+            raise DomainInvariantError("end_ms must fit a non-negative signed 64-bit integer")
         if (self.frame_start is None) != (self.frame_end is None):
             raise DomainInvariantError("frame_start and frame_end must be provided together")
         if (
@@ -180,8 +184,10 @@ class EvidenceSpan:
             and (self.frame_start < 0 or self.frame_end < self.frame_start)
         ):
             raise DomainInvariantError("frame range must be non-negative and ordered")
-        if self.audio_track is not None and self.audio_track < 0:
-            raise DomainInvariantError("audio_track must be non-negative")
+        if self.frame_end is not None and self.frame_end > _SIGNED_INT64_MAX:
+            raise DomainInvariantError("frame range must fit signed 64-bit integers")
+        if self.audio_track is not None and not 0 <= self.audio_track <= _SIGNED_INT32_MAX:
+            raise DomainInvariantError("audio_track must fit a non-negative signed 32-bit integer")
 
     @property
     def duration_ms(self) -> int:

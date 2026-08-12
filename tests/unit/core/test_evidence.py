@@ -122,6 +122,17 @@ def test_evidence_span_requires_complete_frame_range() -> None:
         _evidence_span(frame_start=10)
 
 
+def test_evidence_span_rejects_values_outside_storage_integer_ranges() -> None:
+    with pytest.raises(DomainInvariantError, match="signed 64-bit"):
+        _evidence_span(end_ms=2**63)
+    with pytest.raises(DomainInvariantError, match="signed 64-bit"):
+        _evidence_span(frame_start=0, frame_end=2**63)
+    with pytest.raises(DomainInvariantError, match="signed 32-bit"):
+        _evidence_span(region=PixelRegion(x_min=0, y_min=0, x_max=2**31, y_max=1))
+    with pytest.raises(DomainInvariantError, match="signed 32-bit"):
+        _evidence_span(audio_track=2**31)
+
+
 def test_evidence_span_reports_duration() -> None:
     """Evidence duration is derived from its source offsets."""
     evidence = _evidence_span(start_ms=1_000, end_ms=2_500)
@@ -158,6 +169,8 @@ def _evidence_span(
     end_ms: int = 1_000,
     frame_start: int | None = None,
     frame_end: int | None = None,
+    region: PixelRegion | None = None,
+    audio_track: int | None = None,
 ) -> EvidenceSpan:
     return EvidenceSpan(
         evidence_id=EvidenceId("evidence_01"),
@@ -169,4 +182,6 @@ def _evidence_span(
         created_at=NOW,
         frame_start=frame_start,
         frame_end=frame_end,
+        region=region,
+        audio_track=audio_track,
     )
