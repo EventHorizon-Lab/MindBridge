@@ -122,6 +122,15 @@ def test_media_hash_is_canonicalized_for_content_deduplication() -> None:
     assert canonical.sha256 == "a" * 64
 
 
+@pytest.mark.parametrize("field_name", ("size_bytes", "duration_ms"))
+def test_media_rejects_values_outside_storage_integer_range(field_name: str) -> None:
+    payload = _observe_request().media_objects[0].model_dump()
+    payload[field_name] = 2**63
+
+    with pytest.raises(ValidationError):
+        MediaObjectInput.model_validate(payload)
+
+
 def test_write_contracts_reject_inconsistent_ranges_and_references() -> None:
     media = _observe_request().media_objects[0]
     with pytest.raises(ValidationError, match="ended_at must not precede occurred_at"):

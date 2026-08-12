@@ -80,10 +80,10 @@ class MediaObject:
         require_aware_datetime(self.created_at, "created_at")
         if not _is_sha256(self.sha256):
             raise DomainInvariantError("sha256 must contain exactly 64 hexadecimal characters")
-        if self.size_bytes < 0:
-            raise DomainInvariantError("size_bytes must be non-negative")
-        if self.duration_ms is not None and self.duration_ms < 0:
-            raise DomainInvariantError("duration_ms must be non-negative")
+        if not 0 <= self.size_bytes <= _SIGNED_INT64_MAX:
+            raise DomainInvariantError("size_bytes must fit a non-negative signed 64-bit integer")
+        if self.duration_ms is not None and not 0 <= self.duration_ms <= _SIGNED_INT64_MAX:
+            raise DomainInvariantError("duration_ms must fit a non-negative signed 64-bit integer")
 
 
 @dataclass(frozen=True, slots=True)

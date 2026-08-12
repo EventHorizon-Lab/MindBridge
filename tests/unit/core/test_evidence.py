@@ -51,6 +51,27 @@ def test_media_object_rejects_invalid_content_hash() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    ("size_bytes", "duration_ms"),
+    ((2**63, None), (1, 2**63)),
+)
+def test_media_object_rejects_values_outside_storage_integer_range(
+    size_bytes: int,
+    duration_ms: int | None,
+) -> None:
+    with pytest.raises(DomainInvariantError, match="signed 64-bit"):
+        MediaObject(
+            media_object_id=MEDIA_ID,
+            tenant_id=TenantId("tenant_01"),
+            kind=MediaKind.VIDEO,
+            uri="s3://memories/video.mp4",
+            sha256="a" * 64,
+            size_bytes=size_bytes,
+            created_at=NOW,
+            duration_ms=duration_ms,
+        )
+
+
 def test_observation_builds_stable_idempotency_key() -> None:
     """Retries of the same device sequence produce the same ingestion key."""
     observation = _observation()

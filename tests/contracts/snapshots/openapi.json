@@ -587,6 +587,7 @@
           "duration_ms": {
             "anyOf": [
               {
+                "maximum": 9.223372036854776e+18,
                 "minimum": 0.0,
                 "type": "integer"
               },
@@ -611,6 +612,7 @@
             "type": "string"
           },
           "size_bytes": {
+            "maximum": 9.223372036854776e+18,
             "minimum": 0.0,
             "title": "Size Bytes",
             "type": "integer"

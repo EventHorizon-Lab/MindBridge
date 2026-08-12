@@ -63,9 +63,9 @@ class MediaObjectInput(ContractModel):
     kind: MediaKind
     uri: NonEmptyString
     sha256: Sha256Hex
-    size_bytes: Annotated[int, Field(ge=0)]
+    size_bytes: Annotated[int, Field(ge=0, le=9_223_372_036_854_775_807)]
     created_at: UtcDatetime
-    duration_ms: Annotated[int, Field(ge=0)] | None = None
+    duration_ms: Annotated[int, Field(ge=0, le=9_223_372_036_854_775_807)] | None = None
 
 
 class IdentityObservationInput(ContractModel):
