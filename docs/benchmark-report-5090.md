@@ -2,7 +2,8 @@
 
 > 运行日期：2026-08-13
 >
-> 运行编号：LoCoMo `5090-clean-006`；多模态 `5090-clean-007`
+> 运行编号：完整基线 LoCoMo `5090-clean-006`、多模态 `5090-clean-007`；当前代码诊断
+> `locomo-reflection-v8-clean-008`
 >
 > 验证边界：一台 RTX 5090 同时模拟机器人端与云端；本轮验证功能、质量和数据闭环，延迟、功耗、温度与 Jetson TensorRT 性能暂不作为验收门禁。
 >
@@ -12,7 +13,7 @@
 
 MindBridge 的 MaaS 主链路已经能够真实运行：端侧原始视频进入近期记忆与 Outbox，云端完成对象存储、视听理解、事件/实体/Claim 构建、Embedding、混合召回和证据回答；反馈能够强化或版本化纠错；生命周期能够降冷并在访问时回热；显式遗忘能够删除云端媒体、派生记录、索引、端侧近期记忆和本地身份模板；Episode、Claim 与 Summary consolidation 也已通过真实 Omni/VLM 调用完成提交。
 
-这不等于 MindBridge 的最终目标已经完成：LoCoMo 的官方 token-F1 已超过当前公开 T-Mem 结果，但 Judge 模型和重复次数不同，不能据此宣布整体 SOTA；三个多模态 Benchmark 的完整公开题集已经评估，但公开输入条件分别是发布 caption、transcript 或 memory graph，而不是完全相同的原始视听管线，因此只能用于定位记忆层差距，不能冒充与论文榜单严格可比的 SOTA 复现。真正未完成的是原始视听全量重放、迭代检索/经验记忆、目标 Jetson 标定和严格官方 Judge 复跑。
+这不等于 MindBridge 的最终目标已经完成：LoCoMo 的官方 token-F1 已超过当前公开 T-Mem 结果，但 Judge 模型和重复次数不同，不能据此宣布整体 SOTA；三个多模态 Benchmark 的完整公开题集已经评估，但公开输入条件分别是发布 caption、transcript 或 memory graph，而不是完全相同的原始视听管线，因此只能用于定位记忆层差距，不能冒充与论文榜单严格可比的 SOTA 复现。当前已加入一次有界的证据充分性反思检索；真正未完成的是原始视听全量重放、跨查询经验记忆、目标 Jetson 标定和严格官方 Judge 复跑。
 
 ## 2. 运行配置与可比性
 
@@ -69,6 +70,15 @@ MindBridge 的 MaaS 主链路已经能够真实运行：端侧原始视频进入
 完整性，而不是基于错误编号映射去专项修改时间逻辑。
 
 115 个非对抗 abstention 在 Judge 下全部错误；完整 evidence 命中的 Judge accuracy 为 `92.55%`，部分命中 `67.53%`，未命中 `35.05%`。446 个 adversarial 问题的严格拒答分数为 `80.94%`，其中 361 题明确拒答。两组结果共同支持先优化查询计划和 associative cue，并把“缺证据”与“证据存在但答案不完整”分开校准，而不是盲目增加上下文。
+
+在不读取答案或 evidence label、不增加 Benchmark 分支的前提下，当前生产 Recall 允许回答器返回最多
+两个“缺什么证据”的短查询，并发检索后只在可见 Top-K 改变时重答一次。以同一 LoCoMo conversation
+26 的 199 题作组合前后诊断，旧基线到 `reflection-v8-clean-008` 的 non-adversarial token-F1 从
+`54.26%` 升至 `60.02%`（`+5.76 pp`），全题从 `60.04%` 升至 `64.94%`（`+4.90 pp`），
+adversarial 从 `78.72%` 升至 `80.85%`（`+2.13 pp`），evidence coverage 从 `77.22%` 升至
+`77.72%`（`+0.50 pp`）。这次对比同时改变了 Answer Prompt v4→v8、Recall 反思与对应代码，
+因此只能作为整组改动的回归证据，不能把增益单独归因给反思。它不是选择最好样本后的全量成绩，
+也不替代 10 conversations、三次重复，以及固定 v8 Prompt 后只开关反思的单变量消融。
 
 ### 3.2 EgoLifeQA：需要把跨日层级与身份真正接入召回
 
@@ -134,7 +144,7 @@ Web 首轮并行批次只产出 885/920 个视频，35 个因上游结构化输�
 在生成前拒绝请求。这说明需要提高 context precision、按证据充分性补查，并对最终 evidence pack
 去除无关内容，而不是无上限增加 Top-K。
 
-RRM 的消融给出直接路线：M3-Agent 基线 Robot/Web 为 `30.5%/48.6%`；加入 Online Query Reflection 后为 `34.9%/50.2%`，再加入 Reflective Experience Memory 为 `38.0%/53.0%`，完整 lifecycle 后为 `39.6%/54.4%`。它使用跨 mini-batch 的延迟真值反馈，MindBridge 本轮没有消费任何标签，因此不是同协议竞争；但“先诊断缺失证据→生成补充 query→只把新检索事实交给 answerer”完全可以成为无标签产品能力。
+RRM 的消融给出直接路线：M3-Agent 基线 Robot/Web 为 `30.5%/48.6%`；加入 Online Query Reflection 后为 `34.9%/50.2%`，再加入 Reflective Experience Memory 为 `38.0%/53.0%`，完整 lifecycle 后为 `39.6%/54.4%`。它使用跨 mini-batch 的延迟真值反馈，MindBridge 本轮没有消费任何标签，因此不是同协议竞争。当前已把“先诊断缺失证据→生成最多两个补充 query→RRF→可见证据变化时重答一次”实现为所有 `recall` 共用的无标签能力；尚未实现的是跨查询经验复用，而不是继续扩大静态 Top-K。
 
 ## 4. MaaS 全流程实测
 
@@ -149,7 +159,7 @@ RRM 的消融给出直接路线：M3-Agent 基线 Robot/Web 为 `30.5%/48.6%`；
 | Consolidation | 首次幂等调用已提交 1 Episode；工件记录的重放新增 0 Episode、5 个 semantic Claim、4 个 Summary；最终 7 Event、1 Episode、26 verified Claim、38 Memory | 通过 |
 | 显式遗忘 | 云端 GET 返回 `410 memory_deleted`；S3、本地媒体、近期记忆、身份模板和关联证据均删除；tombstone 已应用 | 通过 |
 | 多租户与可恢复性 | Bearer allowlist + PostgreSQL 强制 RLS；重复写使用稳定 idempotency key | 通过 |
-| 并发 Recall | 修复访问计数更新的锁顺序后，8 个重叠并发访问回归测试通过；完整测试套件 316 项通过 | 通过 |
+| 并发 Recall | 修复访问计数更新的锁顺序后，8 个重叠并发访问回归测试通过；当前完整测试套件 343 项通过 | 通过 |
 
 本轮 consolidation 首次真实调用暴露了模型偶发 singleton、混合 Claim type 和非 JSON 结构。三个 adapter 现在都只进行一次受限 JSON-mode 重试；Claim 还在同一入口执行 source ID、claim type 与关系方向的语义验证。没有引入新的 provider abstraction 或自研 HTTP 层。
 
@@ -167,9 +177,33 @@ memory 会进入 `cold`，命中后可以回热；不可逆删除仍要求显式
 
 本轮不再只使用合成 embedding：
 
-- 人脸使用 InsightFace `buffalo_l`、ONNX Runtime GPU，在两段真实 EgoLife 视频中得到 14 个可用人脸、512 维 embedding。同场最近样本 cosine `0.734013`，远样本 `0.022282`；以仅供该样本功能验证的中点 `0.378147`，SQLite 加密模板能重复匹配并区分远样本。
+- 人脸使用 InsightFace `buffalo_l`、ONNX Runtime GPU，在两段真实 EgoLife 视频中得到 14 个可用人脸、512 维 embedding。同场最近样本 cosine `0.734013`，远样本 `0.022282`；以仅供该样本功能验证的中点 `0.378147`，SQLite 加密模板能重复匹配并区分远样本。另在 30 秒 M3 正例重放中真实检测 143 个带 bbox 的人脸区间；完整编排重放复用了这些原始 embedding，避免为互不兼容的 NeMo/InsightFace Python 环境伪造模型输出。
 - 声纹使用 3D-Speaker 官方 `iic/speech_eres2netv2_sv_zh-cn_16k-common@v1.0.1`、192 维 embedding。Jake/Jake cosine `0.811870`，Jake/另一说话人最大 `0.315321`；诊断阈值 `0.563595` 下，3 个模板在加密 SQLite 中正确匹配与分离。
-- face↔voice 的有界 ASD 证据、跨 Observation 累积、双向互为最佳、margin、撤销和 tombstone 已通过实现与测试；本轮没有运行真实 ASD 模型，所以不能声称完整人物一致性管线已通过真实视频验收。
+- 同一 30 秒片段真实运行 CUDA FunASR、NeMo Streaming Sortformer、ERes2NetV2、加密 SQLite 与
+  最终云端安全 handoff：Sortformer 返回 16 个 turn、3 个 speaker，原始帧概率生成 15 个不同置信度
+  （`0.500696`–`0.8`），而不是统一常数。首次实跑还暴露并修复了官方 tensor 输出的 batch 维解析问题。
+- face↔voice 的有界 ASD 证据、跨 Observation 累积、双向互为最佳、margin、撤销和 tombstone 均走
+  同一产品入口。TaskMem 的可视锚点做法被收敛为临时标注 MP4，但保留原生音轨，使 Omni 在一次
+  OpenAI SDK 请求中联合检查口型、语音起止和行为；真实重放对两个 Sortformer 设备域语音区间均产生
+  ASD 证据，置信度为 `0.6898/0.7270`。提供商对“视频 + 第二个独立 `input_audio`”拒绝 400，
+  内嵌音轨路径曾在同一片段返回 5 个时间化语音段、再次调用也曾返回空结果，因此云端 Omni diarization
+  只保留为可选复核，确定性的本地 FunASR + Sortformer 仍是生产主路径。
+
+当前代码的两次单入口完整重放耗时 `35.948s/41.199s`：143 个 face interval 聚为 2 个 face ID；16 个
+diarization turn 与 FunASR 融合后得到 18 个 voice interval，其中 2 个无法无歧义归入 speaker turn
+的 ASR 区间也以 observation scope 保留，不再静默丢失 transcript。仅 1 个 interval 同时通过时长、
+真实帧概率与融合门槛进入设备声纹，其余 17 个保留为 observation-scoped 近期语音；4 个区间带有
+transcript。Omni ASD 对同一输入分别产生 1 条和 0 条证据；前者形成 1 个 face/voice 共享匿名 ID，
+后者安全保持未绑定，证明当前 VLM 复核仍有假阴性波动。随后用同一真实模型输出处理第二个
+Observation，在不再调用 ASD 的情况下耗时 `1.273s`，相同片段内 sample ID 没有发生跨 Observation
+幂等冲突。所有本地模型实际 device/provider 都是 CUDA。为了在单片段内验收正向分支，诊断把关联
+门槛显式设为 1 个 Observation、500ms、confidence `0.65`；生产必须恢复跨 Observation 门槛并用
+真值标定，不能把这组功能阈值当成准确率结果，也不能通过反复调用 Omni 直到命中来掩盖波动。
+
+自适应计算路径也在同一 5090 上以默认参数真实运行：模型加载后的空闲显存超过 8 GiB，入口自动
+并发 ASR 与 Sortformer，并在 `1.256s` 内生成 161 个 cloud-safe identity interval；四个本地适配器
+报告的实际 device/provider 均为 CUDA。该数值复用了已由 InsightFace CUDA 真实提取的 143 个人脸
+embedding，只证明调度与本地模型链路，不替代 Jetson 延迟、功耗或持续流验收。
 
 这些阈值只证明功能可分，不是 FAR/EER、跨日身份准确率或 Jetson 阈值。下一次身份验收必须使用带真值的机器人 replay 报告 TAR@FAR、false-link、跨日 IDF1 和撤销延迟。
 
@@ -179,7 +213,8 @@ memory 会进入 `cold`，命中后可以回热；不可逆删除仍要求显式
 
 1. 把 EgoLife、SuperMemory 和 M3 的原始 video/audio、OCR、ASR、identity 与发布文本组成同一 EvidenceSpan；文本只作为派生索引，answerer 最终重看原始媒体。
 2. 为 temporal/last-time 查询增加显式时间解析、发生时间排序和相邻 Episode 扩展；依据是 EgoLife `last time` 比其余问题低 `7.22 pp`，而非 LoCoMo 的错误类别映射。
-3. 在 Recall 内加入最多两轮 Search→Evidence sufficiency→补充 query，而不是一次性扩大 Top-K。补充 query 必须可追踪、去重、限次且只影响检索。
+3. 已完成一次有界 Search→Evidence sufficiency→最多两个补充 query；下一步只在四套完整评测证明
+   仍有收益时增加 query-level experience memory，不把它扩展成无界 Agent loop。
 
 ### P1：让记忆在写入时为未来查询做好准备
 
@@ -192,7 +227,9 @@ memory 会进入 `cold`，命中后可以回热；不可逆删除仍要求显式
 
 1. 用同一机器人 replay 在 Jina v5 Omni Small、Text Small、Nano 与必要候选间做 Evidence Recall@K bake-off；没有数据证明前不增加专用向量库或 reranker 服务。
 2. 在 Orin Nano/NX/AGX 上复跑 capture、identity、outbox、断网恢复与 tombstone，记录 FPS/RTF、显存、功耗、温度、丢帧和队列增长。
-3. 补真实 LR-ASD/Sortformer 或 3D-Speaker diarization 闭环；历史跨设备 identity alias 只有产品确实要求时再加入。
+3. 已完成真实 Sortformer + ERes2NetV2 + Omni ASD segment 闭环；下一步是 LR-ASD
+   ONNX/TensorRT、持续 microphone chunk/speaker cache 和带真值 replay。历史跨设备 identity alias
+   只有产品确实要求时再加入。
 4. 用新 `run_id`、单一 `m3_production_api_v7` 和不选择性重跑的失败计分重跑 M3 Web，并按论文
    Judge 做三次重复；当前混合分片只保留为诊断基线。
 
@@ -203,7 +240,7 @@ memory 会进入 `cold`，命中后可以回热；不可逆删除仍要求显式
 | 可部署 MaaS 软件垂直链路 | 已完成 5090 功能验证 |
 | 纠错、强化、冷热、回热、显式遗忘 | 已完成真实闭环验证 |
 | 自学习、自进化 | 反馈、版本化 Claim、Consolidation 与生命周期已完成；跨任务检索经验学习尚未完成 |
-| 端侧近期记忆、身份加密与删除 | 已完成；真实人脸/声纹模型功能 smoke 通过 |
+| 端侧近期记忆、身份加密与删除 | 已完成；真实人脸/ASR/Sortformer/声纹/Omni ASD segment 编排通过，真值精度与持续流 API 未验收 |
 | 四套 Benchmark 完整公开题集 | 已完成本轮可获得输入的评估 |
 | LoCoMo SOTA | token-F1 超过公开强基线；严格 Judge SOTA 尚未确认 |
 | 三套多模态 SOTA | 未完成；本轮是 memory-layer 诊断，原始 AV 与严格同协议复现仍缺失 |

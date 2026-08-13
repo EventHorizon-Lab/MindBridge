@@ -183,7 +183,7 @@ class MemoryKernel:
             content_digest=_request_digest(request),
         )
         stored_memory = result.memory
-        await self._index_memory(stored_memory)
+        await self._index_memory(stored_memory, skip_existing=not result.created)
         return await self._memory_result(stored_memory)
 
     @trace_operation("mindbridge.record_feedback")
@@ -395,7 +395,7 @@ class MemoryKernel:
         return memory_result(memory, evidence)
 
     @trace_operation("mindbridge.index_memory")
-    async def _index_memory(self, memory: MemoryRecord) -> None:
+    async def _index_memory(self, memory: MemoryRecord, *, skip_existing: bool = False) -> None:
         set_current_span_attributes(
             {
                 "mindbridge.tenant.id": memory.tenant_id,
@@ -404,21 +404,26 @@ class MemoryKernel:
                 "mindbridge.embedding.dimension": self._recall_embedder.dimension,
             }
         )
+        embedding_id = EmbeddingId(
+            derive_stable_id(
+                "embedding",
+                memory.tenant_id,
+                memory.memory_id,
+                self._recall_embedder.document_model_reference.model_id,
+                self._recall_embedder.document_model_reference.revision,
+                self._recall_embedder.space_reference.space_id,
+                self._recall_embedder.space_reference.revision,
+                RETRIEVAL_DOCUMENT_EMBEDDING_TASK,
+            )
+        )
+        if skip_existing and await self._embedding_index.has_embedding(
+            memory.tenant_id, embedding_id
+        ):
+            return
         values = await self._recall_embedder.encode_memory_document(memory.summary)
         await self._embedding_index.write_embedding(
             EmbeddingRecord(
-                embedding_id=EmbeddingId(
-                    derive_stable_id(
-                        "embedding",
-                        memory.tenant_id,
-                        memory.memory_id,
-                        self._recall_embedder.document_model_reference.model_id,
-                        self._recall_embedder.document_model_reference.revision,
-                        self._recall_embedder.space_reference.space_id,
-                        self._recall_embedder.space_reference.revision,
-                        RETRIEVAL_DOCUMENT_EMBEDDING_TASK,
-                    )
-                ),
+                embedding_id=embedding_id,
                 tenant_id=memory.tenant_id,
                 object_type=EmbeddedObjectType.MEMORY_RECORD,
                 object_id=memory.memory_id,
@@ -465,6 +470,9 @@ def _build_observation(request: ObserveRequest) -> Observation:
                     model_id=item.model_id,
                     revision=item.model_revision,
                 ),
+                scope=item.scope,
+                transcript=item.transcript,
+                visual_bbox_xyxy=item.visual_bbox_xyxy,
             )
             for item in request.identity_observations
         ),

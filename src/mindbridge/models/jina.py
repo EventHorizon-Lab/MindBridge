@@ -15,6 +15,7 @@ from mindbridge.core import (
     ModelReference,
     ModelUnavailableError,
 )
+from mindbridge.models.compute import select_torch_device
 from mindbridge.telemetry import set_current_span_attributes, trace_operation
 
 DEFAULT_JINA_OMNI_MODEL_ID = "jinaai/jina-embeddings-v5-omni-small-retrieval"
@@ -115,11 +116,12 @@ class JinaOmniEmbedder:
         )
         snapshot_download = cast(Callable[..., str], hub_module.snapshot_download)
         model_path = snapshot_download(repo_id=model_id, revision=revision)
+        selected_device = select_torch_device(device)
         encoder = sentence_transformer(
             model_path,
             revision=revision,
             trust_remote_code=True,
-            device=device,
+            device=selected_device,
             model_kwargs={"modality": "omni", "code_revision": revision},
             config_kwargs={"code_revision": revision},
         )

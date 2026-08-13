@@ -8,8 +8,10 @@ from mindbridge.application.ports import EmbeddingMatch, EmbeddingSearch
 from mindbridge.core import (
     DomainInvariantError,
     EmbeddedObjectType,
+    EmbeddingId,
     EmbeddingRecord,
     MemoryIntegrityError,
+    TenantId,
 )
 from mindbridge.infrastructure._postgres_types import (
     DatabaseConnection,
@@ -20,6 +22,20 @@ from mindbridge.infrastructure._postgres_types import (
 CLOUD_EMBEDDING_DIMENSION = 1_024
 # Permit ~1e-4 normalized GPU jitter without masking model or input changes.
 _RETRY_MINIMUM_COSINE_SIMILARITY = 0.999_999
+
+
+async def has_embedding(
+    pool: DatabasePool,
+    tenant_id: TenantId,
+    embedding_id: EmbeddingId,
+) -> bool:
+    """Return whether one tenant already has the immutable vector."""
+    async with tenant_connection(pool, tenant_id) as connection:
+        cursor = await connection.execute(
+            "SELECT 1 FROM embeddings WHERE tenant_id = %s AND embedding_id = %s",
+            (tenant_id, embedding_id),
+        )
+        return await cursor.fetchone() is not None
 
 
 async def write_embedding(pool: DatabasePool, embedding: EmbeddingRecord) -> bool:

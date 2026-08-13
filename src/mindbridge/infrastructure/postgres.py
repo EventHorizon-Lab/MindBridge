@@ -37,6 +37,7 @@ from mindbridge.application.summary_consolidation import (
 from mindbridge.contracts import RecallRequest
 from mindbridge.core import (
     DeletionTombstone,
+    EmbeddingId,
     EmbeddingRecord,
     EvidenceId,
     EvidenceSpan,
@@ -59,6 +60,7 @@ from mindbridge.infrastructure._postgres_consolidation import (
     list_episode_candidates,
 )
 from mindbridge.infrastructure._postgres_embeddings import (
+    has_embedding,
     search_embeddings,
     write_embedding,
 )
@@ -455,6 +457,10 @@ class PostgresMemoryStore:
     async def write_embedding(self, embedding: EmbeddingRecord) -> bool:
         """Persist one immutable vector version."""
         return await write_embedding(self._pool, embedding)
+
+    async def has_embedding(self, tenant_id: TenantId, embedding_id: EmbeddingId) -> bool:
+        """Avoid recomputing an immutable vector during idempotent retries."""
+        return await has_embedding(self._pool, tenant_id, embedding_id)
 
     async def search_embeddings(self, search: EmbeddingSearch) -> tuple[EmbeddingMatch, ...]:
         """Search one explicit frozen embedding space by cosine similarity."""

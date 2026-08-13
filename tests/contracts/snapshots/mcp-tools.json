@@ -724,10 +724,64 @@
               "title": "Model Revision",
               "type": "string"
             },
+            "scope": {
+              "$ref": "#/$defs/IdentityScope",
+              "default": "device"
+            },
             "start_ms": {
               "minimum": 0,
               "title": "Start Ms",
               "type": "integer"
+            },
+            "transcript": {
+              "anyOf": [
+                {
+                  "maxLength": 2048,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Transcript"
+            },
+            "visual_bbox_xyxy": {
+              "anyOf": [
+                {
+                  "maxItems": 4,
+                  "minItems": 4,
+                  "prefixItems": [
+                    {
+                      "maximum": 1.0,
+                      "minimum": 0.0,
+                      "type": "number"
+                    },
+                    {
+                      "maximum": 1.0,
+                      "minimum": 0.0,
+                      "type": "number"
+                    },
+                    {
+                      "maximum": 1.0,
+                      "minimum": 0.0,
+                      "type": "number"
+                    },
+                    {
+                      "maximum": 1.0,
+                      "minimum": 0.0,
+                      "type": "number"
+                    }
+                  ],
+                  "type": "array"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Visual Bbox Xyxy"
             }
           },
           "required": [
@@ -741,6 +795,15 @@
           ],
           "title": "IdentityObservationInput",
           "type": "object"
+        },
+        "IdentityScope": {
+          "description": "How long an anonymous identity is safe to reuse.",
+          "enum": [
+            "device",
+            "observation"
+          ],
+          "title": "IdentityScope",
+          "type": "string"
         },
         "MediaKind": {
           "description": "Supported raw or derived media kinds.",
@@ -860,7 +923,7 @@
               "items": {
                 "$ref": "#/$defs/IdentityObservationInput"
               },
-              "maxItems": 256,
+              "maxItems": 512,
               "title": "Identity Observations",
               "type": "array"
             },

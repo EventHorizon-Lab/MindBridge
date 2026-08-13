@@ -50,6 +50,8 @@ def test_locomo_optimization_manifest_preserves_reported_category_metrics() -> N
     assert manifest["dataset"]["revision"] == ("3eb6f2c585f5e1699204e3c3bdf7adc5c28cb376")
     assert runs["baseline"]["metrics"]["answer_f1"] == 0.5459446372710516
     assert runs["optimized"]["metrics"]["answer_f1"] == 0.6136889267575371
+    assert runs["reflection_v8"]["metrics"]["answer_f1"] == 0.649383027799884
+    assert runs["reflection_v8"]["metrics"]["evidence_recall"] == 0.7772194304857621
     assert all(
         sum(category["question_count"] for category in run["metrics"]["categories"])
         == manifest["scope"]["question_count"]

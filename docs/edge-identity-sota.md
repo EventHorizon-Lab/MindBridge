@@ -49,10 +49,10 @@ M3-Agent 是重要的记忆图基线，但其公开实现不能原样成为端�
 
 | 环节 | M3-Agent 固定实现 | MindBridge 决策 |
 | --- | --- | --- |
-| 人脸 | `FaceAnalysis(name="buffalo_l")`，公开代码使用 CPU `ctx_id=-1` | 复用 SCRFD/ArcFace 模型思想，走 DeepStream/TensorRT、跟踪后稀疏提取 |
-| 说话人区间 | 把视频交给 `gemini-1.5-pro-002` 生成时间戳和 ASR | 本地 Streaming Sortformer 或级联 diarization，断网可用且时间输出可评测 |
-| 声纹 | CUDA ERes2NetV2，192 维 | 保留 ERes2NetV2，但使用官方 ONNX Runtime 路径并在 Jetson 上验证 TensorRT |
-| face↔voice | Prompt 要求模型输出 `Equivalence: <face_x>, <voice_y>` | ASD 产生可审计区间证据，跨 Observation 累积，冲突时撤销 |
+| 人脸 | InsightFace `buffalo_l`，固定 CPU `ctx_id=-1`；5 FPS 抽帧、并行检测、HDBSCAN 聚类 | 当前同样复用 `buffalo_l`，但 `auto` 实测走 CUDA ONNX provider；保留归一化 bbox、双质量门和 runner-up margin，Jetson 再 bake-off SCRFD 档位/DeepStream |
+| 说话人区间 | `gemini-1.5-pro-002` 看整段视频生成秒级 ASR 区间 | 当前 FunASR ASR+VAD 产生毫秒时间戳，可选 NeMo Streaming Sortformer 给稳定 turn 和帧概率；只在 overlap 与 margin 明确时融合 |
+| 声纹 | 自行构造 CUDA ERes2NetV2，192 维，2 秒以上区间入图 | 直接加载 3D-Speaker/ModelScope 官方 ERes2NetV2；CUDA 可用时上 GPU，固定 revision 本地缓存优先；短/低置信/重叠 turn 不入长期模板 |
+| face↔voice | Caption/Thinking Prompt 可直接输出 `Equivalence: <face_x>, <voice_y>` 并刷新图关系 | 当前把 `F0/F1/...` bbox 烧录到临时视频，VLM 只做可撤销 ASD 证据；跨 Observation、累计时长、双向互为最佳和 margin 全部过门后才解析匿名 ID |
 | 生命周期 | 图中刷新 equivalence | 本地证据受 tombstone 管理；只上传统一后的匿名 ID，不上传 embedding |
 
 依据是 M3-Agent 固定 revision `0e3e41939bd8a0b66d756e7b7eb8d5fe9992da5c` 的
@@ -60,6 +60,40 @@ M3-Agent 是重要的记忆图基线，但其公开实现不能原样成为端�
 [`voice_processing.py`](https://github.com/ByteDance-Seed/m3-agent/blob/0e3e41939bd8a0b66d756e7b7eb8d5fe9992da5c/mmagent/voice_processing.py)
 和 [`prompts.py`](https://github.com/ByteDance-Seed/m3-agent/blob/0e3e41939bd8a0b66d756e7b7eb8d5fe9992da5c/mmagent/prompts.py)。
 MindBridge 要补的是可部署、可校准、可遗忘的感知闭环，而不是复刻其 Benchmark 预处理。
+
+更细看，M3-Agent 的片段内 HDBSCAN 调用把 `distance_threshold=0.5` 传进函数，但实现没有使用
+该参数；跨片段人脸节点把新旧所有模板两两 cosine 后取均值，以固定 `0.3` 为门槛，也没有
+runner-up margin。声纹节点使用相同的全模板均值策略和固定 `0.6` 门槛。MindBridge 没有照抄
+这些易误合并的部分：每个身份只聚合最强三个有界样本形成 prototype；最佳候选未过绝对阈值，
+或没有以配置 margin 胜过第二名时，宁可创建新的匿名身份。模板仍以 AES-256-GCM 加密留在设备，
+云端只看到匿名 ID、时间、模态、模型版本和人脸空间锚点。
+
+当前可执行链路不是架构图中的未来式：`InsightFaceVideoEncoder`、`FunASRSpeechTranscriber`、
+`NemoSortformerSpeechDiarizer`、`ERes2NetV2SpeakerEncoder` 和
+`OpenAIVisualActiveSpeakerMatcher` 由 `recognize_identities_in_av_segment()` 接到同一个本地
+身份记忆和同步 video/audio segment。VLM 只接收压缩后的标注视频和
+不含 embedding 的时间元数据；标注视频保留 16kHz mono 音轨，让一次原生 AV 请求同时对齐口型与
+声音，并且只通过异步 OpenAI SDK。云端模型失败或输出波动时，本地
+ASR/声纹仍完整工作。LR-ASD、NvDCF、DeepStream 和 TensorRT 是目标 Jetson 的下一轮候选，
+没有实测前不能写成当前实现。
+
+这里的 NeMo 适配器真实运行了 Streaming Sortformer 权重和流式配置，但当前入口仍以已关闭的
+capture segment 调用官方 `diarize()`；持续 microphone chunk、speaker cache 跨 segment 和回压
+尚未接入。文档因此不能把“模型支持 streaming”写成“MindBridge 实时流 API 已验收”。
+
+M3-Agent 的 Prompt 要求每条 caption 原子化、稳定引用 face/voice ID，并覆盖外观、动作、对话、
+关系和因果；这些通用要求已经进入 MindBridge `perceive_events_v8`。没有照搬的是让 Prompt 直接写
+`Equivalence` 并刷新图：MindBridge 把 equivalence 拆成带 Observation、时间、模型版本和 tombstone
+的证据，再经过累计时长、双向互为最佳和 margin 解析。这样提升的是所有机器人经历的可追问性，
+不是 M3-Bench 专用输出格式。
+
+RTX 5090 的 30 秒正例完整编排稳定输出为：143 个 face interval/2 个 face ID、16 个
+Sortformer turn/3 个 speaker，并额外保留 2 个无法无歧义归入 turn 的 ASR 区间，避免丢失可检索语音；
+18 个 voice interval 中只有 1 个通过长期声纹门禁，其余 17 个保持 observation scope。人脸实际
+ONNX provider 为 CUDA，FunASR、Sortformer 和 ERes2NetV2 的实际 device 也均为 CUDA。同一正例的
+Omni ASD 重复运行分别返回过 1 条和 0 条证据；成功运行形成 1 个 face/voice 共享匿名 ID，空结果则
+安全保持未绑定，不重试到命中。为单片段覆盖正向分支，诊断显式使用 1 个 Observation、500ms 和
+`0.65` 关联门槛；生产阈值仍必须跨 Observation 真值标定。
 
 ## 4. 人脸链路
 
@@ -147,9 +181,11 @@ sample_rate = 16000
 comparison = L2 normalize + cosine similarity
 ```
 
-3D-Speaker 已提供官方 ONNX Runtime 与导出脚本。TensorRT 可尝试导入 ONNX，但在完成算子支持、
-数值漂移和目标 Jetson 性能验证前，不能把“存在 ONNX”写成“已有官方 TensorRT 生产包”。CAM++
-是 Nano 档的明确降级点。WeSpeaker 具有 Apache-2.0、C++ ONNX Runtime、MNN 和 Triton 生态，
+3D-Speaker 已提供 ONNX Runtime 相关 recipe 与导出路径；MindBridge 当前可执行适配器直接复用
+ModelScope 的 `SpeakerVerificationERes2NetV2` PyTorch 实现，并核对实际 CUDA device。TensorRT
+可尝试导入 ONNX，但在完成算子支持、数值漂移和目标 Jetson 性能验证前，不能把“存在 ONNX”写成
+“已有官方 TensorRT 生产包”。CAM++ 是 Nano 档的明确降级点。WeSpeaker 具有 Apache-2.0、
+C++ ONNX Runtime、MNN 和 Triton 生态，
 作为第二实现用于验证 3D-Speaker 运行时是否成为瓶颈，不在首版同时维护两套默认模型。
 
 声纹只在以下音频上学习：有效语音时长达标、非重叠或目标说话人占优、非机器人扬声器回放、SNR/质量
@@ -198,19 +234,41 @@ margin = (best_score - second_score) / best_score
 判定，将已验证 voice 的云端匿名 ID 解析为 face pseudonym。证据按 pair 有界保留，Observation 或
 identity 遗忘会同步删除证据，因此无需不可逆“合并模板”。
 
-端侧调用顺序是：
+关联证据使用显式部署 revision 作为稳定键，不使用供应商可能随请求变化的 system fingerprint。
+后续片段即使没有新的可见说话人证据，仍会在同一 revision 下重新评估历史累计证据；模型升级则
+自然进入隔离的新证据空间。
+
+高层入口按实时可用 CUDA 显存调度：空闲显存达到 8 GiB 时并发人脸、ASR 和 diarization，否则
+串行运行；显式 CUDA 失败不静默落到 CPU。8 GiB 只是当前 5090 软件验证门槛，Jetson 部署必须用
+`parallel_model_inference` 与主机器人任务共同标定。5090 在模型加载后满足该门槛，`auto` 真实选择
+并行路径，并在 `1.256s` 内完成 30 秒片段的本地编排（复用已真实提取的人脸 embedding）。
+
+当前证据生产器落在
+[`edge/identity_diarization.py`](../src/mindbridge/edge/identity_diarization.py)：它把本地人脸
+bbox 与短标签烧录进有界 MP4，将设备域声纹区间和 transcript 作为结构化上下文交给 VLM。输出
+必须引用已提供的 face/voice、与脸可见区间真实重叠，并只写
+`FaceVoiceAssociationEvidence`。这条路径是 TaskMem 可视锚点思路的可部署保守版本，不是
+LR-ASD 的替代终点；当官方 LR-ASD 权重通过 ONNX/TensorRT 和目标 Jetson 真值 replay 后，应以
+本地逐帧分数作为默认，VLM 退为疑难片段复核。
+
+端侧主入口是：
 
 ```python
-memory.record_face_voice_evidence(asd_evidence)
-cloud_safe_voice = memory.resolve_identity(
-    tenant_id,
-    voice_match,
-    association_model_reference=asd_model,
-    minimum_observations=deployment.minimum_observations,
-    minimum_duration_ms=deployment.minimum_duration_ms,
-    minimum_confidence=deployment.minimum_confidence,
-    minimum_margin=deployment.minimum_margin,
-).to_observation_input(start_ms=start_ms, end_ms=end_ms)
+identity = await recognize_identities_in_av_segment(
+    video_path,
+    audio_path=audio_path,
+    tenant_id=tenant_id,
+    observation_id=observation_id,
+    duration_ms=duration_ms,
+    memory=identity_memory,
+    face_encoder=face_encoder,
+    speech_transcriber=asr,
+    speaker_diarizer=diarizer,
+    speaker_encoder=speaker_encoder,
+    active_speaker_matcher=asd,
+    thresholds=deployment.identity_thresholds,
+)
+enqueue_captured_video(..., identity_observations=identity.identity_observations)
 ```
 
 这些门槛故意没有默认值。摄像头位置、麦克风阵列、场景人数和 Jetson 帧率会改变统计分布，必须由

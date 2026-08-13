@@ -175,6 +175,28 @@ def test_observe_accepts_only_bounded_anonymous_identity_metadata() -> None:
             **identity.model_dump(),
             embedding=[1.0, 0.0],  # type: ignore[call-arg]
         )
+    with pytest.raises(ValidationError, match="positive width"):
+        IdentityObservationInput(
+            **identity.model_dump(exclude={"visual_bbox_xyxy"}),
+            visual_bbox_xyxy=(0.5, 0.2, 0.4, 0.8),
+        )
+    with pytest.raises(ValidationError, match="only valid for face"):
+        IdentityObservationInput(
+            **identity.model_dump(exclude={"kind", "visual_bbox_xyxy"}),
+            kind=IdentityKind.VOICE,
+            visual_bbox_xyxy=(0.1, 0.2, 0.4, 0.8),
+        )
+    with pytest.raises(ValidationError, match="only valid for voice"):
+        IdentityObservationInput(
+            **identity.model_dump(exclude={"transcript"}),
+            transcript="spoken words",
+        )
+    voice = IdentityObservationInput(
+        **identity.model_dump(exclude={"kind", "transcript"}),
+        kind=IdentityKind.VOICE,
+        transcript="spoken words",
+    )
+    assert voice.transcript == "spoken words"
 
 
 def test_request_collections_reject_unbounded_fanout() -> None:
@@ -195,8 +217,27 @@ def test_request_collections_reject_unbounded_fanout() -> None:
                 media.model_copy(update={"media_object_id": f"media_{index}"}) for index in range(9)
             )
         )
-    with pytest.raises(ValidationError, match="at most 256 items"):
-        _observe_request(identity_observations=(identity,) * 257)
+    with pytest.raises(ValidationError, match="at most 512 items"):
+        _observe_request(
+            identity_observations=tuple(
+                identity.model_copy(update={"identity_id": f"person_device_{index}"})
+                for index in range(513)
+            )
+        )
+    voice = identity.model_copy(
+        update={
+            "kind": IdentityKind.VOICE,
+            "transcript": "x" * 2_048,
+            "visual_bbox_xyxy": None,
+        }
+    )
+    with pytest.raises(ValidationError, match="transcripts exceed"):
+        _observe_request(
+            identity_observations=tuple(
+                voice.model_copy(update={"identity_id": f"speaker_device_{index}"})
+                for index in range(33)
+            )
+        )
     with pytest.raises(ValidationError, match="at most 100 items"):
         RememberRequest(
             tenant_id="tenant_01",

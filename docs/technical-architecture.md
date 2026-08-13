@@ -298,6 +298,11 @@ MemoryRecord、类型关系、向量和成功 Job 状态。任何模型输出越
 可能过期的地址；重试使用稳定 ID 且不会合并不同的证据集合。跨 Event 实体消歧、Episode
 合并和多次经历归纳属于后续 Consolidation，不在在线写入路径中凭名称猜测。
 
+当前 `perceive_events_v8` 直接吸收 M3-Agent/TaskMem 已验证有效的原子事件、稳定人物 ID、外观变化、
+对话、关系和因果线索要求，但没有照搬其可直接输出 `Equivalence` 的做法：身份关联仍由端侧可撤销
+证据门禁负责。Prompt 还要求推断的意图/关系写出可见或可闻依据并降低 confidence，片段边界不得把
+未完成动作写成完成事实。这个 Prompt 服务所有 Observation，不读取 Benchmark 类型或答案。
+
 ### 5.4 幂等和可恢复性
 
 - 每个 Observation 使用 `tenant_id + device_id + boot_id + sequence` 构造稳定幂等键；
@@ -311,8 +316,10 @@ MemoryRecord、类型关系、向量和成功 Job 状态。任何模型输出越
 首版 `mindbridge.edge` 已把这一恢复语义落实为文件型 SQLite Outbox：数据库启用 WAL 与
 `synchronous=FULL`，文件权限收紧为 `0600`；`tenant_id + device_id + boot_id + sequence` 同时受
 稳定 ID 和唯一约束保护，同一序列异内容立即冲突。GStreamer/DeepStream 关闭片段后，薄 capture
-handoff 只计算 size/SHA-256、稳定对象键、时钟区间和幂等键并入队，不接管 NVIDIA 的解码、编码
-或门控。同步器先用 Boto3 标准凭证链上传 tenant-scoped S3 对象，再通过异步 Python SDK 调用
+handoff 可把封装视频和同步的 16 kHz 原生音频 sidecar 放进同一个 Observation；两条媒体共享世界
+时间区间但各自保存 SHA-256、对象 ID 和 EvidenceSpan。它只计算 size/SHA-256、稳定对象键、时钟
+区间和幂等键并入队，不接管 NVIDIA 的解码、编码或门控。同步器先用 Boto3 标准凭证链上传
+tenant-scoped S3 对象，再通过异步 Python SDK 调用
 `observe`。媒体上传成功会单独落盘，因此 API 暂时离线不会重复传大文件；receipt、水位推进和
 Outbox 删除在一个 SQLite 事务中完成，进程在任意网络步骤崩溃都可安全重放。失败仅保存错误码和
 次数，不保存异常正文或凭证；重试节奏交给机器人 supervisor/systemd，避免框架内再造守护进程。
@@ -440,9 +447,36 @@ SCRFD-2.5GF-KPS + ArcFace R50；YuNet + SFace 作为有官方 ONNX 工件的轻�
 3D-Speaker 级联管线。LR-ASD 只生成活跃说话人证据，不能直接合并身份。MindBridge 复用官方
 推理实现和工件，不复制第三方网络，也不微调权重。
 
+当前可执行适配器与目标 bake-off 必须分开表述：现有代码直接加载 InsightFace `buffalo_l`
+SCRFD/ArcFace ONNX、FunASR ASR+VAD、ModelScope 官方 ERes2NetV2，以及可选的 NeMo Streaming
+Sortformer；`recognize_identities_in_av_segment()` 将同步 video/audio sidecar 串成一个可等待的
+端侧入口。`auto` 在 CUDA 可用时选择 GPU，
+并核对模型实际 device/provider，显式要求 GPU 却
+静默回落会立即失败。CPU 只承担 SQLite、哈希、FFmpeg、调度和无加速器时的降级推理。质量合格的
+声纹区间才写入设备域模板；短于 1 秒、低置信或重叠说话区间仍保留时间与 transcript，但标为
+`scope=observation`，不得污染长期身份。FunASR 时间戳与 Sortformer turn 只在 overlap 和 margin
+都无歧义时融合；turn 置信度取该 speaker 原始帧概率均值，而不是给所有区间写同一常数，重叠区间
+再封顶为 `0.5`；中文 token 反分词后再进入记忆。活跃说话人检查复用 TaskMem 的可视锚点思路，
+由 FFmpeg 在发送给 VLM 的临时视频上绘制 `F0/F1/...` face box 并保留 16kHz mono 音轨，使模型在
+一个原生 AV 请求中联合检查口型、声音起止和可见行为；所有 VLM 请求仍只通过异步
+OpenAI SDK；模型输出仅形成可撤销关联证据，不直接合并模板。LR-ASD/DeepStream/TensorRT 仍是
+目标 Jetson 的下一轮质量/效率候选，不能写成已经上线的实现。
+
+ASR 与 diarization 无法无歧义融合的区间不会被丢弃，而是以 observation scope 保留 transcript；
+ASD 关联使用配置的模型 deployment revision 作为稳定证据键，不使用可能随请求变化的 provider
+fingerprint。后续片段没有新增 ASD 命中时，仍会用同一 revision 复核历史累计证据。
+
+Sortformer 权重和内部状态支持流式，但当前 MindBridge 适配器对 capture 已关闭的有界 segment 调用
+官方 `diarize()`；它不是持续 microphone chunk API。真正在线的 `forward_streaming_step` 与 speaker
+cache 必须复用 NeMo runtime，并在断流、回压、状态重置和 Jetson 资源测试完成后再进入采集热路径。
+入口会在当前空闲 CUDA 显存不少于 8 GiB 时并发人脸、ASR 和 diarization；不足时串行复用 GPU，
+CPU 降级也保持串行，避免模型线程争抢。该门槛是 5090 软件验证默认值，不是 Jetson 标定结果；
+调用方可以用 `parallel_model_inference` 按机器人主任务的显存预算显式覆盖。
+
 MindBridge 只维护一个设备本地身份记忆边界：
 
-1. 每个模板绑定 `tenant_id`、`device_id`、模态、来源 Observation、模型 ID/revision 和维度；
+1. 每个模板绑定 `tenant_id`、`device_id`、模态、来源 Observation、模型 ID/revision 和维度；本地
+   sample key 由 Observation 与片段内 sample ID 共同派生，避免每个视频从 `0ms` 计时造成跨片段冲突；
 2. embedding 归一化后使用 cosine similarity 与可校准阈值匹配，不跨模型空间比较；
 3. 每个匿名身份默认最多保留 32 个样本，持续观察只更新有界 prototype 样本集；
 4. embedding 使用设备注入的 256-bit key 进行 AES-256-GCM 加密，SQLite 主文件权限为
@@ -522,6 +556,13 @@ PostgreSQL FTS、结构化过滤、RRF 和原始视听证据重看。Event/Claim
 完整结构化过滤。更深的通用图遍历、专用 reranker 和多轮定向重读只按 Benchmark 失败案例加入。
 每个 Omni 回答或枚举波次使用当时新签的查询媒体 URL；模型完成后再为响应 Evidence 签名，Agent
 收到的链接不能因为模型推理耗时而已经过期。
+
+当前回答模型还可在证据不足或有实质歧义时返回最多两个独立 `retrieval_queries`。应用层并发执行
+补充查询，与原始候选做 RRF；只有返回给 Agent 的 Top-K 确实改变时才携带新证据再回答一次，显式 `memory_ids`
+追问不越过调用方范围。补充查询不会写入事实、不会读取 Benchmark 标签，也不能用另一个人物或
+实体的相关证据修正问题前提；其数量进入 trace，最终答案仍必须由 MemoryRecord/EvidenceSpan
+支撑。结构化输出允许“临时答案 + 补充查询”，用于保留已有部分证据，但最终回答 Prompt 要求
+最短、类型正确且拒绝错误实体前提。该有限反思替代无限 Agent loop，保持调用成本和尾延迟有界。
 
 Memory 向量命中上层 Summary 时走独立的树形下钻查询：PostgreSQL 沿 MemoryRecord
 `contains` 边递归返回父节点和来源子节点，深度上限为 16，并对每个结果重新应用完整结构化过滤。
@@ -788,7 +829,8 @@ HTTP、Python 和 MCP 共享同一层 use case，不各自复制业务逻辑。
 - Recall 默认返回证据，不只返回自然语言答案；
 - `forget` 是幂等操作，并能查询端云传播状态；
 - 删除列表的 cursor 必须属于同一租户且仍然存在；无效 cursor 明确报错，不能用空页伪装同步完成；
-- 单个 Observation 最多携带 8 个媒体对象和 256 个匿名身份区间；显式 Memory 最多引用 100 个
+- 单个 Observation 最多携带 8 个媒体对象和 512 个匿名身份区间，所有声纹区间的 transcript
+  合计不得超过 65,536 个字符；显式 Memory 最多引用 100 个
   EvidenceSpan，Recall 的人物或设备过滤各最多 100 个，避免公共请求制造无界签名、模型和 SQL 扇出；
 - 每个响应带 `trace_id`，便于 Benchmark 和线上问题复现；
 - OpenAPI 是 REST 契约的唯一事实来源，MCP Tool schema 从同一 Pydantic 模型生成。
@@ -999,6 +1041,8 @@ Schema 变更必须向后兼容或带显式迁移；不得在 Worker 和 API 不
 
 - 能通过 Hugging Face processor、`sentence-transformers` 或 OpenAI SDK 完成的输入构造，不手拼协议或 base64 JSON；
 - Prompt 按能力集中、命名和版本化，例如 `extract_event_v1`，不能散落在 API handler 和 Worker 中；
+- 优先复用上游经过公开任务验证的 Prompt 约束，但必须删除与本系统证据、隐私或输出 Schema 冲突的
+  部分；来源和取舍写入架构文档，不能逐 Benchmark 复制提示词；
 - 优先使用结构化输出，并在模型边界立即做 schema 校验；不靠脆弱正则从自然语言中猜 JSON；
 - 模型 ID、revision、task、采样参数和 Prompt 版本全部进入 trace/run manifest；
 - 模型供应商特例只存在于 Adapter，核心逻辑只消费领域结果；
@@ -1101,7 +1145,10 @@ API 和 Worker 可以使用同一个 Python package、两个进程部署。只�
 基础安装只包含 Core 领域类型、Pydantic 契约和 Python SDK。Jetson/机器人主机安装 `edge`
 extra；API、MCP 与云端任务安装 `server` extra；只有本地加载 Jina Omni 的 GPU Worker 再叠加
 `cloud-models`。端侧安装不得因 SQLite 身份或同步能力被迫携带 Celery、MCP、PostgreSQL、
-FastAPI 或 OpenAI SDK，子包导入隔离由独立进程测试守护。
+FastAPI 等服务端栈，子包导入隔离由独立进程测试守护。`edge` 只额外携带 OpenAI SDK 和
+SoundFile 这两个跨平台运行依赖；前者保证可选 VLM 复核不自写 HTTP，后者负责官方声纹适配器的
+波形输入。InsightFace/ONNX Runtime、FunASR/ModelScope 和 NeMo 必须使用与 JetPack/CUDA 匹配的
+设备镜像工件，不能由通用 lockfile 覆盖 NVIDIA 运行时。
 
 Worker 通过 `mindbridge.celery_app:app` 启动，Redis 消息只传
 `tenant_id`、`observation_id`、`job_id`。原始媒体、Evidence 和任务状态均以 PostgreSQL/S3
@@ -1196,9 +1243,10 @@ runner version/manifest；输出使用官方 evaluator 识别的
 `mindbridge_prediction` 与 `mindbridge_prediction_context`，因此答案 F1 和检索 recall 均走官方
 计算路径。
 
-固定 `conv-26` 的 199 题生产切片中，`qwen3.8-max`、Text Small F16 和官方 evaluator 下，当前
-答案契约、原始 query 与自适应召回由 F1 `0.5459` 提升到 `0.6137`，Evidence recall 由
-`0.7726` 提升到 `0.7822`。该单会话结果只作为组合优化和回归证据，不作为全量 LoCoMo、
+固定 `conv-26` 的 199 题生产切片中，`qwen3.8-max`、Text Small F16 和官方 evaluator 下，
+`pre_reflection_v4` 到 `reflection_v8` 的组合改动使全题 F1 从 `0.6004` 变为 `0.6494`，
+non-adversarial F1 从 `0.5426` 变为
+`0.6002`，Evidence recall 从 `0.7722` 提升到 `0.7772`。该单会话结果只作为组合优化和回归证据，不作为全量 LoCoMo、
 单变量消融或 SOTA 声明；数据、Evaluator、运行配置、输出 hash 和五类指标保存在
 [`locomo-conv-26-optimization.json`](../benchmarks/manifests/locomo-conv-26-optimization.json)。
 
@@ -1362,13 +1410,18 @@ memory-layer 评测与原始视听复现分开，禁止用前者替代多模态 
 Robot/Web 非官方 Qwen Judge `30.02%/58.18%`。M3 Web 混合了 908 个 v6 与 12 个 v7 分片，且
 包含选择性重跑，因而只是诊断值。逐运行 revision、输入表示、模型、结果 hash 和生命周期工件
 固定在 [`benchmark-5090-clean-007.json`](../benchmarks/manifests/benchmark-5090-clean-007.json)。
+当前生产 Recall 的单 conversation 组合回归中，LoCoMo non-adversarial token-F1 从 `54.26%`
+变为 `60.02%`；由于 Prompt 与反思代码同时变化，该差值不能作为反思的单变量收益。真实 30 秒 AV
+身份编排则在 CUDA 上贯通 InsightFace 检测结果、FunASR、
+Sortformer、ERes2NetV2、Omni ASD、加密 SQLite 和 cloud-safe handoff。两者都只作为当前代码
+增量证据；完整榜单和带真值身份 replay 仍按上述基线口径验收。
 
 | 阶段 | 当前状态 | 已落地证据 | 剩余验收 |
 | --- | --- | --- | --- |
 | Phase 0 | 完成 | 严格领域契约、锁定依赖、CI、Jina smoke、官方数据适配器、可追溯 LoCoMo 与 5090 全量评测 manifest | 无；后续运行继续沿用同一 manifest 门禁 |
 | Phase 1 | 软件垂直路径完成 | 原生采集 handoff、加密身份 prototype、SQLite Outbox/近期记忆、S3 同步、durable Job、Event/pgvector 与 REST API | 在目标 Jetson 上完成真实摄像头、VAD/场景/运动门控、断网和功耗验收 |
 | Phase 2 | 完成（公开发布表示） | Episode/Claim/Summary consolidation、RRF/图展开/媒体重看、反馈纠错、生命周期、显式删除，以及四套 Benchmark 完整公开题集的生产 API 分层结果 | 原始 AV 全量重放属于 Phase 3 严格 SOTA 复现，不再作为 Phase 2 软件门禁 |
-| Phase 3 | 进行中 | RLS 多租户、Bearer allowlist、Python SDK、MCP/OpenAPI、OpenTelemetry、端侧真实人脸/声纹 smoke、完整公开题集差距分析和可撤销关联证据闭环 | 原始 AV/OCR/object 检索、迭代查询与经验记忆、官方 Judge 重跑、身份真值 replay、Embedding bake-off、Jetson/Nano 实测、配额、持久审计和备份删除演练 |
+| Phase 3 | 进行中 | RLS 多租户、Bearer allowlist、Python SDK、MCP/OpenAPI、OpenTelemetry、端侧 CUDA 人脸/FunASR/Sortformer/ERes2NetV2 真实视频路径、保留原生音轨的可视锚点 Omni ASD、有限查询反思、完整公开题集差距分析和可撤销关联闭环 | 原始 AV/OCR/object 全量检索、跨任务经验记忆、官方 Judge 重跑、身份真值 replay、持续 microphone streaming、LR-ASD/TensorRT 与 Embedding bake-off、Jetson/Nano 实测、配额、持久审计和备份删除演练 |
 
 “软件路径完成”不等于硬件或榜单验收完成。以下项目不能由单元测试替代：
 

@@ -52,8 +52,13 @@ def test_identity_memory_matches_learns_and_encrypts_samples(tmp_path: Path) -> 
     assert retry.identity_id == first.identity_id
     assert not second.enrolled_new
     assert stranger.identity_id != first.identity_id
-    cloud_identity = second.to_observation_input(start_ms=100, end_ms=900)
+    cloud_identity = second.to_observation_input(
+        start_ms=100,
+        end_ms=900,
+        visual_bbox_xyxy=(0.1, 0.2, 0.4, 0.8),
+    )
     assert cloud_identity.identity_id == first.identity_id
+    assert cloud_identity.visual_bbox_xyxy == (0.1, 0.2, 0.4, 0.8)
     assert "embedding" not in cloud_identity.model_dump()
     assert database_path.stat().st_mode & 0o777 == 0o600
     with sqlite3.connect(database_path) as connection:
@@ -63,6 +68,27 @@ def test_identity_memory_matches_learns_and_encrypts_samples(tmp_path: Path) -> 
         ).fetchall()
     assert len(retained) == 2
     assert all(b"embedding" not in row[0] for row in retained)
+
+
+def test_identity_memory_refuses_an_ambiguous_biometric_merge(tmp_path: Path) -> None:
+    memory = SQLiteIdentityMemory(
+        tmp_path / "edge.sqlite3",
+        device_id="robot_01",
+        encryption_key=AESGCM.generate_key(bit_length=256),
+        clock=lambda: NOW,
+    )
+    first = memory.recognize_and_remember(_sample("first", (1.0, 0.0)), minimum_similarity=0.9)
+    second = memory.recognize_and_remember(_sample("second", (0.8, 0.6)), minimum_similarity=0.9)
+
+    ambiguous = memory.recognize_and_remember(
+        _sample("ambiguous", (0.95, 0.31)),
+        minimum_similarity=0.8,
+        minimum_margin=0.02,
+    )
+
+    assert first.identity_id != second.identity_id
+    assert ambiguous.enrolled_new
+    assert ambiguous.identity_id not in {first.identity_id, second.identity_id}
 
 
 def test_identity_samples_are_idempotent_and_bound_to_the_device_key(tmp_path: Path) -> None:

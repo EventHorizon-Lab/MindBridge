@@ -46,12 +46,17 @@ async def test_omni_perception_returns_grounded_event_and_provider_revision() ->
         assert "response_format" not in payload
         assert "atomic semantic" in system_prompt
         assert "spoken wording and visible text exactly" in system_prompt
-        assert "opaque\n  identity_id" in system_prompt
+        assert "supplied opaque identity_id" in system_prompt
+        assert "visual_bbox_xyxy" in system_prompt
+        assert "distinctive appearance" in system_prompt
+        assert "truncated sentence" in system_prompt
+        assert "cause/effect" in system_prompt
         assert {item["type"] for item in content} >= {"video_url", "input_audio"}
         assert cast(str, content[0]["text"]).startswith("<observation_context>")
         assert cast(str, content[-1]["text"]).startswith("<final_task>")
         assert '"evidence_id":"evidence_video"' in cast(str, content[0]["text"])
         assert '"identity_id":"person_device_01"' in cast(str, content[0]["text"])
+        assert '"visual_bbox_xyxy":[0.1,0.2,0.4,0.8]' in cast(str, content[0]["text"])
         assert "embedding" not in cast(str, content[0]["text"])
         return _streaming_response(
             {
@@ -109,7 +114,7 @@ async def test_omni_perception_returns_grounded_event_and_provider_revision() ->
         EvidenceId("evidence_audio"),
     )
     assert result.model_reference.revision == "qwen-serving-revision-01"
-    assert result.prompt_version == "perceive_events_v5"
+    assert result.prompt_version == "perceive_events_v8"
     assert [entity.canonical_name for entity in result.events[0].entities] == [
         "red tool",
         "toolbox",
@@ -278,6 +283,7 @@ def _observation() -> Observation:
                     model_id="insightface/buffalo_l",
                     revision="1.0.1",
                 ),
+                visual_bbox_xyxy=(0.1, 0.2, 0.4, 0.8),
             ),
         ),
     )

@@ -67,6 +67,7 @@ def test_jina_pins_remote_code_to_the_model_revision(monkeypatch: pytest.MonkeyP
             else SimpleNamespace(snapshot_download=snapshot_download)
         ),
     )
+    monkeypatch.setattr("mindbridge.models.jina.select_torch_device", lambda _device: "cuda")
 
     JinaOmniEmbedder.load(revision="pinned-revision", dimension=2)
 
@@ -83,7 +84,7 @@ def test_jina_pins_remote_code_to_the_model_revision(monkeypatch: pytest.MonkeyP
             {
                 "revision": "pinned-revision",
                 "trust_remote_code": True,
-                "device": None,
+                "device": "cuda",
                 "model_kwargs": {
                     "modality": "omni",
                     "code_revision": "pinned-revision",

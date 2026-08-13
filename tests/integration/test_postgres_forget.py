@@ -63,7 +63,11 @@ class FirstMemoryAnswerer:
         *,
         query_media: tuple[ResolvedQueryMedia, ...],
     ) -> GeneratedAnswer:
-        return GeneratedAnswer(answer=memories[0].summary, confidence=0.9)
+        return (
+            GeneratedAnswer(answer=memories[0].summary, confidence=0.9)
+            if memories
+            else GeneratedAnswer(answer=None, confidence=0.0)
+        )
 
     async def select_occurrences(
         self,

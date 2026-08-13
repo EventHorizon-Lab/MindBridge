@@ -954,11 +954,13 @@ cloud-models = [
 edge = [
     { name = "boto3" },
     { name = "cryptography" },
+    { name = "openai" },
     { name = "opentelemetry-api" },
     { name = "opentelemetry-exporter-otlp-proto-http" },
     { name = "opentelemetry-instrumentation-botocore" },
     { name = "opentelemetry-instrumentation-httpx" },
     { name = "opentelemetry-sdk" },
+    { name = "soundfile" },
 ]
 server = [
     { name = "boto3" },
@@ -999,6 +1001,7 @@ requires-dist = [
     { name = "httpx", specifier = ">=0.28,<1" },
     { name = "librosa", marker = "extra == 'cloud-models'", specifier = ">=0.11,<1" },
     { name = "mcp", marker = "extra == 'server'", specifier = ">=2,<3" },
+    { name = "openai", marker = "extra == 'edge'", specifier = ">=2,<3" },
     { name = "openai", marker = "extra == 'server'", specifier = ">=2,<3" },
     { name = "opentelemetry-api", marker = "extra == 'cloud-models'", specifier = ">=1.44,<2" },
     { name = "opentelemetry-api", marker = "extra == 'edge'", specifier = ">=1.44,<2" },
@@ -1020,6 +1023,7 @@ requires-dist = [
     { name = "pydantic", specifier = ">=2.10,<3" },
     { name = "sentence-transformers", marker = "extra == 'cloud-models'", specifier = ">=5.2,<6" },
     { name = "soundfile", marker = "extra == 'cloud-models'", specifier = ">=0.13,<1" },
+    { name = "soundfile", marker = "extra == 'edge'", specifier = ">=0.13,<1" },
     { name = "torch", marker = "extra == 'cloud-models'", specifier = "==2.9.1", index = "https://download.pytorch.org/whl/cu128" },
     { name = "transformers", marker = "extra == 'cloud-models'", specifier = ">=5.1,<6" },
     { name = "uvicorn", marker = "extra == 'server'", specifier = ">=0.35,<1" },

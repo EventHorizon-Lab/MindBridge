@@ -536,10 +536,62 @@
             "title": "Model Revision",
             "type": "string"
           },
+          "scope": {
+            "$ref": "#/components/schemas/IdentityScope",
+            "default": "device"
+          },
           "start_ms": {
             "minimum": 0.0,
             "title": "Start Ms",
             "type": "integer"
+          },
+          "transcript": {
+            "anyOf": [
+              {
+                "maxLength": 2048,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Transcript"
+          },
+          "visual_bbox_xyxy": {
+            "anyOf": [
+              {
+                "maxItems": 4,
+                "minItems": 4,
+                "prefixItems": [
+                  {
+                    "maximum": 1.0,
+                    "minimum": 0.0,
+                    "type": "number"
+                  },
+                  {
+                    "maximum": 1.0,
+                    "minimum": 0.0,
+                    "type": "number"
+                  },
+                  {
+                    "maximum": 1.0,
+                    "minimum": 0.0,
+                    "type": "number"
+                  },
+                  {
+                    "maximum": 1.0,
+                    "minimum": 0.0,
+                    "type": "number"
+                  }
+                ],
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Visual Bbox Xyxy"
           }
         },
         "required": [
@@ -553,6 +605,15 @@
         ],
         "title": "IdentityObservationInput",
         "type": "object"
+      },
+      "IdentityScope": {
+        "description": "How long an anonymous identity is safe to reuse.",
+        "enum": [
+          "device",
+          "observation"
+        ],
+        "title": "IdentityScope",
+        "type": "string"
       },
       "JobState": {
         "description": "Persisted observation processing states.",
@@ -1110,7 +1171,7 @@
             "items": {
               "$ref": "#/components/schemas/IdentityObservationInput"
             },
-            "maxItems": 256,
+            "maxItems": 512,
             "title": "Identity Observations",
             "type": "array"
           },

@@ -50,8 +50,10 @@ async def test_omni_streams_raw_av_and_validates_answer() -> None:
         assert "response_format" not in payload
         assert payload["reasoning_effort"] == "low"
         assert 'For yes/no questions, answer "Yes" or "No".' in system_prompt
+        assert "answer string is not an evidence report" in system_prompt
         assert "different named person does not support" in system_prompt
         assert "Missing evidence is not evidence of" in system_prompt
+        assert "standalone search" in system_prompt
         assert {item["type"] for item in user_content} >= {
             "image_url",
             "video_url",
@@ -78,7 +80,7 @@ async def test_omni_streams_raw_av_and_validates_answer() -> None:
     answerer = _answerer(respond)
     assert answerer.model_reference.model_id == "qwen3.8-max"
     assert answerer.model_reference.revision == "deployment-revision"
-    assert answerer.prompt_version == "answer_from_evidence_v4"
+    assert answerer.prompt_version == "answer_from_evidence_v8"
     assert answerer.occurrence_prompt_version == "select_occurrences_v2"
     evidence = (
         _resolved_evidence(MediaKind.IMAGE, "image.jpg", "media_image", 0),
@@ -99,6 +101,35 @@ async def test_omni_streams_raw_av_and_validates_answer() -> None:
 
     assert answer.answer == "The screwdriver is beside the blue toolbox"
     assert answer.confidence == 0.87
+
+
+async def test_omni_returns_bounded_retrieval_queries_when_evidence_is_missing() -> None:
+    async def respond(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=_completion_stream(
+                '{"answer":null,"confidence":0.0,',
+                '"retrieval_queries":["person_device_01 blue toolbox"]}',
+            ),
+        )
+
+    answerer = _answerer(respond)
+    try:
+        answer = await answerer.answer(
+            RecallRequest(
+                tenant_id="tenant_01",
+                query=RecallQuery(text="Where did the person put the tool?"),
+            ),
+            (),
+            (),
+            query_media=(),
+        )
+    finally:
+        await answerer.close()
+
+    assert answer.answer is None
+    assert answer.retrieval_queries == ("person_device_01 blue toolbox",)
 
 
 async def test_omni_retries_invalid_answer_once_in_json_mode() -> None:
@@ -133,6 +164,60 @@ async def test_omni_retries_invalid_answer_once_in_json_mode() -> None:
 
     assert calls == 2
     assert answer.answer == "blue toolbox"
+
+
+async def test_omni_accepts_one_provider_added_json_code_fence() -> None:
+    calls = 0
+
+    async def respond(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=_completion_stream('```json\n{"answer":"blue toolbox","confidence":0.8}\n```'),
+        )
+
+    answerer = _answerer(respond)
+    try:
+        answer = await answerer.answer(
+            RecallRequest(tenant_id="tenant_01", query=RecallQuery(text="Where is it?")),
+            (_memory((), verification_status=VerificationStatus.ATTESTED),),
+            (),
+            query_media=(),
+        )
+    finally:
+        await answerer.close()
+
+    assert calls == 1
+    assert answer.answer == "blue toolbox"
+
+
+async def test_omni_keeps_provisional_answer_with_search_queries() -> None:
+    async def respond(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=_completion_stream(
+                '{"answer":"somewhere at home","confidence":0.7,',
+                '"retrieval_queries":["blue toolbox exact location"]}',
+            ),
+        )
+
+    answerer = _answerer(respond)
+    try:
+        answer = await answerer.answer(
+            RecallRequest(tenant_id="tenant_01", query=RecallQuery(text="Where is it?")),
+            (_memory((), verification_status=VerificationStatus.ATTESTED),),
+            (),
+            query_media=(),
+        )
+    finally:
+        await answerer.close()
+
+    assert answer.answer == "somewhere at home"
+    assert answer.confidence == 0.7
+    assert answer.retrieval_queries == ("blue toolbox exact location",)
 
 
 async def test_omni_inspects_native_query_media_before_candidate_evidence() -> None:

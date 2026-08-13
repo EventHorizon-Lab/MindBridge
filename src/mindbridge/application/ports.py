@@ -17,6 +17,7 @@ from mindbridge.core import (
     DeletionTombstone,
     DomainInvariantError,
     EmbeddedObjectType,
+    EmbeddingId,
     EmbeddingRecord,
     EmbeddingSpaceReference,
     EvidenceId,
@@ -113,6 +114,7 @@ class GeneratedAnswer:
 
     answer: str | None
     confidence: float
+    retrieval_queries: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.answer is not None and not self.answer.strip():
@@ -121,6 +123,15 @@ class GeneratedAnswer:
             raise DomainInvariantError("confidence must be between 0 and 1")
         if self.answer is None and self.confidence != 0.0:
             raise DomainInvariantError("confidence must be zero when no answer is present")
+        if len(self.retrieval_queries) > 2 or any(
+            not query.strip() or query != query.strip() or len(query) > 2_048
+            for query in self.retrieval_queries
+        ):
+            raise DomainInvariantError(
+                "retrieval queries must contain at most two non-empty values"
+            )
+        if len(set(self.retrieval_queries)) != len(self.retrieval_queries):
+            raise DomainInvariantError("retrieval queries must be unique")
 
 
 @dataclass(frozen=True, slots=True)
@@ -306,7 +317,7 @@ class MemoryStore(Protocol):
 
 
 class MemoryAnswerer(Protocol):
-    """Frozen model boundary used only after candidate retrieval."""
+    """Frozen model boundary that may request one bounded retrieval refinement."""
 
     async def answer(
         self,
@@ -404,6 +415,8 @@ class ObservationJobPublisher(Protocol):
 
 class EmbeddingIndex(Protocol):
     """Version-aware semantic vector persistence and retrieval."""
+
+    async def has_embedding(self, tenant_id: TenantId, embedding_id: EmbeddingId) -> bool: ...
 
     async def write_embedding(self, embedding: EmbeddingRecord) -> bool: ...
 

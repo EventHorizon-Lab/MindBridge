@@ -14,6 +14,7 @@ from mindbridge.application.perception import ResolvedEvidence
 from mindbridge.application.ports import (
     EmbeddingIndex,
     EmbeddingSearch,
+    GeneratedAnswer,
     MediaUrlSigner,
     MemoryAnswerer,
     MemoryStore,
@@ -25,6 +26,7 @@ from mindbridge.contracts import (
     MemoryResult,
     MemoryView,
     RecallMode,
+    RecallQuery,
     RecallRequest,
     RecallResult,
 )
@@ -135,55 +137,88 @@ class RecallMemories:
             query_media,
             limit=candidate_limit,
         )
-        visible_candidates = memories[: request.limit]
+        visible_candidates = await self._refresh_visible_candidates(request, memories)
+        generated = GeneratedAnswer(answer=None, confidence=0.0)
+        answer_evidence: tuple[ResolvedEvidence, ...] = ()
+        retrieval_query_count = 0
+        if request.mode is not RecallMode.SEARCH:
+            generated, answer_evidence = await self._answer_candidates(
+                request,
+                visible_candidates,
+                query_media,
+            )
+            followup_queries = tuple(
+                query
+                for query in generated.retrieval_queries
+                if request.query.text is None or query.casefold() != request.query.text.casefold()
+            )
+            if followup_queries and not request.memory_ids:
+                retrieval_query_count = len(followup_queries)
+                query_media = await self._resign_query_media(query_media)
+                followup_rankings = await asyncio.gather(
+                    *(
+                        self._retrieve_candidates(
+                            request.model_copy(
+                                update={
+                                    "query": RecallQuery(
+                                        text=query,
+                                        media_object_ids=request.query.media_object_ids,
+                                    )
+                                }
+                            ),
+                            query_media,
+                            limit=candidate_limit,
+                        )
+                        for query in followup_queries
+                    )
+                )
+                refined = fuse_memory_rankings(
+                    (*followup_rankings, memories),
+                    limit=candidate_limit,
+                )
+                refined_candidates = await self._refresh_visible_candidates(request, refined)
+                if tuple(memory.memory_id for memory in refined_candidates) != tuple(
+                    memory.memory_id for memory in visible_candidates
+                ):
+                    memories = refined
+                    visible_candidates = refined_candidates
+                    generated, answer_evidence = await self._answer_candidates(
+                        request,
+                        visible_candidates,
+                        query_media,
+                    )
         visible_memories = await self._store.record_memory_accesses(
             TenantId(request.tenant_id),
             tuple(memory.memory_id for memory in visible_candidates),
             accessed_at=self._clock(),
         )
-        answer_memories = tuple(
-            memory
-            for memory in visible_memories
-            if memory.evidence_ids or memory.verification_status is VerificationStatus.ATTESTED
-        )
-        should_answer = bool(answer_memories) and request.mode is not RecallMode.SEARCH
-        evidence_memories = answer_memories if should_answer else visible_memories
-        should_read_evidence = request.include_evidence or should_answer
-        evidence = (
-            await self._read_evidence(request, evidence_memories) if should_read_evidence else ()
-        )
-        response_evidence = evidence
-        answer = None
-        confidence = 0.0
-        if should_answer:
-            answer_query_media = await sign_query_media(
-                tuple(item.media_object for item in query_media),
-                self._media_url_signer,
-            )
-            generated = await self._answerer.answer(
+        if tuple(memory.memory_id for memory in visible_memories) != tuple(
+            memory.memory_id for memory in visible_candidates
+        ):
+            generated = GeneratedAnswer(answer=None, confidence=0.0)
+            answer_evidence = ()
+        answer_memories = self._grounded_memories(visible_memories)
+        response_evidence = answer_evidence
+        if request.include_evidence:
+            response_evidence = await self._read_evidence(
                 request,
-                answer_memories,
-                evidence,
-                query_media=answer_query_media,
+                answer_memories if request.mode is not RecallMode.SEARCH else visible_memories,
             )
-            answer = generated.answer
-            confidence = generated.confidence
-            if request.include_evidence:
-                response_evidence = await self._read_evidence(request, answer_memories)
         set_current_span_attributes(
             {
                 "mindbridge.recall.candidate_count": len(memories),
                 "mindbridge.recall.memory_count": len(visible_memories),
-                "mindbridge.recall.evidence_count": len(evidence),
-                "mindbridge.recall.answered": answer is not None,
+                "mindbridge.recall.evidence_count": len(answer_evidence),
+                "mindbridge.recall.retrieval_query_count": retrieval_query_count,
+                "mindbridge.recall.answered": generated.answer is not None,
             }
         )
         visible_evidence_ids = {
             evidence_id for memory in visible_memories for evidence_id in memory.evidence_ids
         }
         return RecallResult(
-            answer=answer,
-            confidence=confidence,
+            answer=generated.answer,
+            confidence=generated.confidence,
             memories=tuple(memory_view(memory) for memory in visible_memories),
             evidence=(
                 tuple(
@@ -195,6 +230,66 @@ class RecallMemories:
                 else ()
             ),
             trace_id=current_trace_id(),
+        )
+
+    async def _answer_candidates(
+        self,
+        request: RecallRequest,
+        candidates: tuple[MemoryRecord, ...],
+        query_media: tuple[ResolvedQueryMedia, ...],
+    ) -> tuple[GeneratedAnswer, tuple[ResolvedEvidence, ...]]:
+        grounded = self._grounded_memories(candidates)
+        evidence = await self._read_evidence(request, grounded) if grounded else ()
+        answer_query_media = await sign_query_media(
+            tuple(item.media_object for item in query_media),
+            self._media_url_signer,
+        )
+        generated = await self._answerer.answer(
+            request,
+            grounded,
+            evidence,
+            query_media=answer_query_media,
+        )
+        if not grounded and not query_media and generated.answer is not None:
+            generated = GeneratedAnswer(
+                answer=None,
+                confidence=0.0,
+                retrieval_queries=generated.retrieval_queries,
+            )
+        return generated, evidence
+
+    async def _refresh_visible_candidates(
+        self,
+        request: RecallRequest,
+        candidates: tuple[MemoryRecord, ...],
+    ) -> tuple[MemoryRecord, ...]:
+        """Reapply deletion, supersession, and caller filters immediately before answering."""
+        return await self._store.search_memories_by_ids(
+            request,
+            tuple(memory.memory_id for memory in candidates),
+            limit=request.limit,
+        )
+
+    async def _resign_query_media(
+        self,
+        query_media: tuple[ResolvedQueryMedia, ...],
+    ) -> tuple[ResolvedQueryMedia, ...]:
+        """Refresh short-lived media URLs before a delayed retrieval wave."""
+        return (
+            await sign_query_media(
+                tuple(item.media_object for item in query_media),
+                self._media_url_signer,
+            )
+            if query_media
+            else ()
+        )
+
+    @staticmethod
+    def _grounded_memories(memories: tuple[MemoryRecord, ...]) -> tuple[MemoryRecord, ...]:
+        return tuple(
+            memory
+            for memory in memories
+            if memory.evidence_ids or memory.verification_status is VerificationStatus.ATTESTED
         )
 
     async def _enumerate_result(

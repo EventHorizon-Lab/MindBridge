@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 import openai
@@ -14,6 +15,10 @@ from mindbridge.core import ModelOutputError
 from mindbridge.models.openai_errors import raise_openai_model_error
 
 REASONING_EFFORT_VALUES = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+_JSON_CODE_FENCE = re.compile(
+    r"\A```(?:json)?[ \t]*\r?\n(?P<body>.*)\r?\n```[ \t]*\Z",
+    re.DOTALL | re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -22,6 +27,12 @@ class OpenAITextCompletion:
 
     content: str
     system_fingerprint: str | None
+
+
+def unwrap_json_code_fence(content: str) -> str:
+    """Remove one provider-added JSON fence while leaving every other shape strict."""
+    match = _JSON_CODE_FENCE.fullmatch(content.strip())
+    return match.group("body") if match is not None else content
 
 
 async def stream_text_completion(

@@ -21,6 +21,7 @@ from mindbridge.core import (
     FeedbackType,
     ForgetTargetType,
     IdentityKind,
+    IdentityScope,
     JobState,
     MediaKind,
     MemoryState,
@@ -41,6 +42,7 @@ Sha256Hex = Annotated[
     str,
     StringConstraints(to_lower=True, pattern=r"^[0-9a-fA-F]{64}$"),
 ]
+_MAXIMUM_IDENTITY_TRANSCRIPT_CHARACTERS = 65_536
 
 
 def _as_utc(value: datetime) -> datetime:
@@ -78,11 +80,30 @@ class IdentityObservationInput(ContractModel):
     confidence: Annotated[float, Field(ge=0.0, le=1.0, allow_inf_nan=False)]
     model_id: Identifier
     model_revision: Identifier
+    scope: IdentityScope = IdentityScope.DEVICE
+    transcript: NonEmptyString | None = None
+    visual_bbox_xyxy: (
+        tuple[
+            Annotated[float, Field(ge=0.0, le=1.0, allow_inf_nan=False)],
+            Annotated[float, Field(ge=0.0, le=1.0, allow_inf_nan=False)],
+            Annotated[float, Field(ge=0.0, le=1.0, allow_inf_nan=False)],
+            Annotated[float, Field(ge=0.0, le=1.0, allow_inf_nan=False)],
+        ]
+        | None
+    ) = None
 
     @model_validator(mode="after")
     def require_ordered_time_range(self) -> IdentityObservationInput:
         if self.end_ms < self.start_ms:
             raise ValueError("identity end_ms must not precede start_ms")
+        if self.visual_bbox_xyxy is not None:
+            if self.kind is not IdentityKind.FACE:
+                raise ValueError("visual_bbox_xyxy is only valid for face identities")
+            left, top, right, bottom = self.visual_bbox_xyxy
+            if right <= left or bottom <= top:
+                raise ValueError("visual_bbox_xyxy must have positive width and height")
+        if self.transcript is not None and self.kind is not IdentityKind.VOICE:
+            raise ValueError("transcript is only valid for voice identities")
         return self
 
 
@@ -100,7 +121,7 @@ class ObserveRequest(ContractModel):
     observed_at: UtcDatetime
     clock_offset_ms: Annotated[int, Field(ge=-2_147_483_648, le=2_147_483_647)] = 0
     identity_observations: Annotated[
-        tuple[IdentityObservationInput, ...], Field(max_length=256)
+        tuple[IdentityObservationInput, ...], Field(max_length=512)
     ] = ()
     idempotency_key: Identifier | None = None
 
@@ -119,6 +140,11 @@ class ObserveRequest(ContractModel):
             raise ValueError("media duration exceeds source observation")
         if any(identity.end_ms > duration_ms for identity in self.identity_observations):
             raise ValueError("identity observation exceeds source duration")
+        if (
+            sum(len(identity.transcript or "") for identity in self.identity_observations)
+            > _MAXIMUM_IDENTITY_TRANSCRIPT_CHARACTERS
+        ):
+            raise ValueError("identity transcripts exceed the per-observation character limit")
         keys = [
             (
                 identity.kind,

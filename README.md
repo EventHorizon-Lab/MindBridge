@@ -549,11 +549,24 @@ idempotency key, then commits the request and absolute local path to a mode-`060
 SQLite Outbox. GStreamer/DeepStream remains responsible for camera decoding, encoding, frame rate,
 resolution, VAD/motion/scene gates, and hardware calibration.
 
-InsightFace or 3D-Speaker/SpeakerLab remains responsible for producing face or voice embeddings;
-MindBridge does not reimplement those models. `device_identity_key` is exactly 32 bytes loaded from
+The lower-level example accepts an embedding from an existing robot vision stack. For raw replay,
+`mindbridge.edge.identity_inference` directly loads the official InsightFace `buffalo_l` and
+ModelScope ERes2NetV2 implementations, while `mindbridge.edge.identity_diarization` reuses FunASR,
+optional NeMo Sortformer, and an OpenAI-SDK audiovisual active-speaker verifier. The verifier draws
+face anchors onto a bounded MP4 while retaining its embedded audio, so one native request aligns lip
+motion and speech instead of reasoning from transcript timing alone. `device=auto` selects
+CUDA when it is actually available and explicit CUDA requests fail instead of silently using CPU.
+`recognize_identities_in_av_segment()` is the single high-level handoff for a synchronized video and
+optional audio sidecar; it returns only cloud-safe intervals ready for `enqueue_captured_video()`.
+Install the InsightFace/ONNX Runtime, FunASR/ModelScope, and optional NeMo wheels supplied by the
+JetPack-compatible device image; the generic `uv.lock` intentionally does not replace NVIDIA's
+platform runtime. MindBridge orchestrates these libraries but does not reimplement their networks.
+
+`device_identity_key` is exactly 32 bytes loaded from
 the device TPM or secret manager. The local store normalizes and AES-256-GCM encrypts every bounded
 sample, matches only equal model/revision/dimension spaces, and sends only anonymous IDs and time
-ranges in `ObserveRequest`. The raw embedding and encryption key never enter the Outbox or cloud.
+ranges, optional voice transcripts, identity scope, and face boxes in `ObserveRequest`. The raw
+embedding and encryption key never enter the Outbox or cloud.
 Forgetting an Observation also removes identity samples learned from that source before the edge
 deletion cursor advances.
 

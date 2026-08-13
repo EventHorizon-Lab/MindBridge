@@ -127,6 +127,120 @@
       },
       "predictions_sha256": "2e21f598fdceef970d65928e8c8614ebe317b6cb0719c3818704f0b9d1ebae4b",
       "completed_at": "2026-08-12T14:30:48.396037Z"
+    },
+    {
+      "name": "pre_reflection_v4",
+      "runner_version": "locomo_production_api_v6",
+      "adapter_version": "locomo_official_v1",
+      "code_revision": "2ca05794ad8b119b5ed355bbefa9ed51eb45af03+diff-9ac48979a136637c6b669304ac63c9127ca43bf9d5abc5ba6834cacc3d2acef1",
+      "answer_model_id": "qwen3.8-max",
+      "answer_model_revision": "provider-managed-2026-08-13",
+      "answer_prompt_version": "answer_from_evidence_v4",
+      "reasoning_effort": "low",
+      "embedding_model_id": "jinaai/jina-embeddings-v5-text-small-retrieval",
+      "embedding_model_revision": "6856e76bb72982e58de0620458a4e8b3614da340",
+      "retrieval_task": "retrieval_document",
+      "recall_limit": 20,
+      "inference_recall_limit": 50,
+      "request_concurrency": 8,
+      "request_timeout_seconds": 1800.0,
+      "metrics": {
+        "answer_f1": 0.6003624472799842,
+        "non_adversarial_answer_f1": 0.5425797829520846,
+        "adversarial_answer_f1": 0.7872340425531915,
+        "evidence_recall": 0.7721943048576214,
+        "categories": [
+          {
+            "category": 1,
+            "question_count": 32,
+            "answer_f1": 0.4529418568401145,
+            "evidence_recall": 0.640625
+          },
+          {
+            "category": 2,
+            "question_count": 37,
+            "answer_f1": 0.572934377934378,
+            "evidence_recall": 0.972972972972973
+          },
+          {
+            "category": 3,
+            "question_count": 13,
+            "answer_f1": 0.3914136948619707,
+            "evidence_recall": 0.8974358974358974
+          },
+          {
+            "category": 4,
+            "question_count": 70,
+            "answer_f1": 0.5955862510436509,
+            "evidence_recall": 0.8714285714285714
+          },
+          {
+            "category": 5,
+            "question_count": 47,
+            "answer_f1": 0.7872340425531915,
+            "evidence_recall": 0.5212765957446809
+          }
+        ]
+      },
+      "predictions_sha256": "0c452dcb8bdcbffed820d71cd5cc51467a6b90313abd401328f7f63fc548911b",
+      "completed_at": "2026-08-12T19:16:45.661143Z"
+    },
+    {
+      "name": "reflection_v8",
+      "runner_version": "locomo_production_api_v6",
+      "adapter_version": "locomo_official_v1",
+      "code_revision": "c3ee67038a2bce446dffbf40dac2e32fe4e2410e+diff-72bda5598c06a63e8ec4f1afc8bb22706a201f5f40a7a47304a111bc15f36a6b",
+      "answer_model_id": "qwen3.8-max",
+      "answer_model_revision": "provider-managed-2026-08-13",
+      "answer_prompt_version": "answer_from_evidence_v8",
+      "reasoning_effort": "low",
+      "embedding_model_id": "jinaai/jina-embeddings-v5-text-small-retrieval",
+      "embedding_model_revision": "6856e76bb72982e58de0620458a4e8b3614da340",
+      "retrieval_task": "retrieval_document",
+      "recall_limit": 20,
+      "inference_recall_limit": 50,
+      "request_concurrency": 8,
+      "request_timeout_seconds": 1800.0,
+      "metrics": {
+        "answer_f1": 0.649383027799884,
+        "non_adversarial_answer_f1": 0.600179095606427,
+        "adversarial_answer_f1": 0.8085106382978723,
+        "evidence_recall": 0.7772194304857621,
+        "categories": [
+          {
+            "category": 1,
+            "question_count": 32,
+            "answer_f1": 0.4809461671932191,
+            "evidence_recall": 0.625
+          },
+          {
+            "category": 2,
+            "question_count": 37,
+            "answer_f1": 0.6694456640108815,
+            "evidence_recall": 0.972972972972973
+          },
+          {
+            "category": 3,
+            "question_count": 13,
+            "answer_f1": 0.5095660749506903,
+            "evidence_recall": 0.9358974358974359
+          },
+          {
+            "category": 4,
+            "question_count": 70,
+            "answer_f1": 0.6349013805604616,
+            "evidence_recall": 0.8714285714285714
+          },
+          {
+            "category": 5,
+            "question_count": 47,
+            "answer_f1": 0.8085106382978723,
+            "evidence_recall": 0.5425531914893617
+          }
+        ]
+      },
+      "predictions_sha256": "a9db101ea342f2e70d2689744e2fd9773b98662ef9247b5e3a9e54c42c72dd27",
+      "completed_at": "2026-08-13T05:22:16.085172Z"
     }
   ]
 }

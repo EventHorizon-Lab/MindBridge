@@ -166,6 +166,9 @@ def _identity_observations_from_json(value: object) -> tuple[AnonymousIdentityOb
                 model_id=item.model_id,
                 revision=item.model_revision,
             ),
+            scope=item.scope,
+            transcript=item.transcript,
+            visual_bbox_xyxy=item.visual_bbox_xyxy,
         )
         for item in inputs
     )

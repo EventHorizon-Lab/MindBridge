@@ -29,7 +29,7 @@ from mindbridge.core import (
     ModelOutputError,
     ModelReference,
 )
-from mindbridge.models.openai_chat import stream_text_completion
+from mindbridge.models.openai_chat import stream_text_completion, unwrap_json_code_fence
 from mindbridge.models.openai_media import OpenAIContentPart, evidence_media_content_parts
 from mindbridge.models.openai_omni import (
     DEFAULT_OMNI_MODEL_ID,
@@ -323,7 +323,7 @@ def _parse_output(content: str) -> _SummaryConsolidationOutput:
     if not content.strip():
         raise ModelOutputError("Summary consolidation model returned empty content")
     try:
-        return _SummaryConsolidationOutput.model_validate_json(content)
+        return _SummaryConsolidationOutput.model_validate_json(unwrap_json_code_fence(content))
     except ValidationError as error:
         raise ModelOutputError(
             "Summary consolidation returned invalid structured output"

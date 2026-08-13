@@ -64,3 +64,35 @@ def test_completed_video_becomes_one_retry_safe_outbox_item(tmp_path: Path) -> N
     assert first.idempotency_key is not None
     assert first.identity_observations == identities
     assert outbox.pending_count() == 1
+
+
+def test_synchronized_audio_sidecar_shares_one_observation(tmp_path: Path) -> None:
+    video_path = tmp_path / "capture.mp4"
+    audio_path = tmp_path / "capture.wav"
+    video_path.write_bytes(b"same bytes")
+    audio_path.write_bytes(b"same bytes")
+    outbox = SQLiteObservationOutbox(tmp_path / "edge.db", clock=lambda: NOW)
+
+    request = enqueue_captured_video(
+        outbox,
+        video_path,
+        audio_path=audio_path,
+        tenant_id="tenant_01",
+        device_id="camera_01",
+        boot_id="boot_01",
+        sequence=8,
+        bucket="memory",
+        occurred_at=NOW,
+        ended_at=NOW + timedelta(seconds=30),
+        observed_at=NOW + timedelta(seconds=31),
+    )
+
+    assert [item.kind.value for item in request.media_objects] == ["video", "audio"]
+    assert len({item.media_object_id for item in request.media_objects}) == 2
+    assert {item.duration_ms for item in request.media_objects} == {30_000}
+    queued = outbox.next_pending()
+    assert queued is not None
+    assert [item.local_path for item in queued.media_files] == [
+        video_path.resolve(),
+        audio_path.resolve(),
+    ]

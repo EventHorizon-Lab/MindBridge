@@ -19,6 +19,7 @@ from mindbridge.contracts import IdentityObservationInput
 from mindbridge.core import (
     IdempotencyConflictError,
     IdentityKind,
+    IdentityScope,
     MemoryIntegrityError,
     ModelReference,
     derive_stable_id,
@@ -28,6 +29,7 @@ from mindbridge.edge.identity_schema import initialize_identity_tables
 _NONCE_BYTES = 12
 _AES_256_KEY_BYTES = 32
 _DEFAULT_MAXIMUM_SAMPLES = 32
+_IDENTITY_PROTOTYPE_SAMPLES = 3
 _MAXIMUM_ASSOCIATION_EVIDENCE_PER_PAIR = 64
 _TemplateRow: TypeAlias = sqlite3.Row
 
@@ -73,6 +75,8 @@ class LocalIdentityMatch:
         *,
         start_ms: int,
         end_ms: int,
+        transcript: str | None = None,
+        visual_bbox_xyxy: tuple[float, float, float, float] | None = None,
     ) -> IdentityObservationInput:
         """Create the cloud-safe interval without exposing the local embedding."""
         return IdentityObservationInput(
@@ -83,6 +87,9 @@ class LocalIdentityMatch:
             confidence=self.confidence,
             model_id=self.model_reference.model_id,
             model_revision=self.model_reference.revision,
+            scope=IdentityScope.DEVICE,
+            transcript=transcript,
+            visual_bbox_xyxy=visual_bbox_xyxy,
         )
 
 
@@ -163,10 +170,13 @@ class SQLiteIdentityMemory:
         sample: LocalIdentitySample,
         *,
         minimum_similarity: float,
+        minimum_margin: float = 0.0,
     ) -> LocalIdentityMatch:
-        """Match one sample and retain it as bounded, forgettable device learning."""
+        """Match one sample only when one bounded identity prototype clearly wins."""
         if not math.isfinite(minimum_similarity) or not 0.0 <= minimum_similarity <= 1.0:
             raise ValueError("minimum_similarity must be between 0 and 1")
+        if not math.isfinite(minimum_margin) or not 0.0 <= minimum_margin <= 1.0:
+            raise ValueError("minimum_margin must be between 0 and 1")
         sample = replace(sample, embedding=_normalized_embedding(sample.embedding))
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -183,8 +193,14 @@ class SQLiteIdentityMemory:
                 return self._match(existing, confidence=1.0, enrolled_new=False)
 
             # ponytail: device-local identities use a linear scan; add FAISS after measured need.
-            best_match = self._best_match(connection, sample)
-            if best_match is None or best_match[1] < minimum_similarity:
+            ranked_matches = self._rank_matches(connection, sample)
+            best_match = ranked_matches[0] if ranked_matches else None
+            ambiguous = (
+                len(ranked_matches) > 1
+                and best_match is not None
+                and best_match[1] - ranked_matches[1][1] < minimum_margin
+            )
+            if best_match is None or best_match[1] < minimum_similarity or ambiguous:
                 enrolled_new = True
                 identity_id = _new_identity_id(self._device_id, sample)
                 confidence = 1.0
@@ -454,12 +470,12 @@ class SQLiteIdentityMemory:
             evidence.model_reference.revision,
         )
 
-    def _best_match(
+    def _rank_matches(
         self,
         connection: sqlite3.Connection,
         sample: LocalIdentitySample,
-    ) -> tuple[str, float] | None:
-        best: tuple[str, float] | None = None
+    ) -> tuple[tuple[str, float], ...]:
+        scores_by_identity: dict[str, list[float]] = {}
         for row in connection.execute(
             """
             SELECT * FROM edge_identity_templates
@@ -470,9 +486,12 @@ class SQLiteIdentityMemory:
             (*self._sample_scope(sample), len(sample.embedding)),
         ):
             similarity = _cosine_similarity(sample.embedding, self._decrypt(row).embedding)
-            if best is None or similarity > best[1]:
-                best = (str(row["identity_id"]), similarity)
-        return best
+            scores_by_identity.setdefault(str(row["identity_id"]), []).append(similarity)
+        ranked = []
+        for identity_id, scores in scores_by_identity.items():
+            strongest = sorted(scores, reverse=True)[:_IDENTITY_PROTOTYPE_SAMPLES]
+            ranked.append((identity_id, math.fsum(strongest) / len(strongest)))
+        return tuple(sorted(ranked, key=lambda item: (-item[1], item[0])))
 
     def _find_sample(
         self,
