@@ -5,6 +5,9 @@ MindBridge is an Agentic Native Embodied Memory System: Memory-as-a-Service for 
 ## Documentation
 
 - [Technical implementation architecture](docs/technical-architecture.md)
+- [RTX 5090 benchmark and lifecycle validation](docs/benchmark-report-5090.md)
+- [RTX 5090 reproducibility manifest](benchmarks/manifests/benchmark-5090-clean-007.json)
+- [Edge identity model selection and validation](docs/edge-identity-sota.md)
 
 ## Development
 
@@ -39,7 +42,7 @@ Validate Markdown structure and links with the same tool versions used by CI:
 
 ```bash
 docker run --rm -v "$PWD:/workdir:ro" davidanson/markdownlint-cli2:v0.23.0 \
-  "**/*.md" "!.git/**" "!.venv/**" "!.pytest_cache/**"
+  "**/*.md" "!.git/**" "!.venv/**" "!.pytest_cache/**" "!.benchmarks/**"
 docker run --rm -v "$PWD:/input:ro" -w /input lycheeverse/lychee:0.23.0 \
   --no-progress --root-dir /input './*.md' './docs/**/*.md'
 ```
@@ -246,6 +249,22 @@ memory:
   ]
 }
 ```
+
+For the official memory-layer protocol, a clip may instead carry the released multimodal
+`DenseCaption`/`Transcript` text plus its duration and omit `media_object`:
+
+```json
+{
+  "day": 1,
+  "start_timecode": "11100000",
+  "duration_ms": 30000,
+  "caption": "Visual: Jake passes the phone to Alice. Audio: Jake asks everyone to mark it."
+}
+```
+
+The run manifest reports raw-media and caption clip counts separately. Use raw media for the
+end-to-end perception gate; use the pinned official captions for a reproducible comparison with
+EgoRAG-style memory results.
 
 ```bash
 uv run python -m mindbridge.benchmarks.egolife_cli \

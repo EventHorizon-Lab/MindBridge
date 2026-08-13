@@ -1,7 +1,7 @@
 """Contract tests for evidence-first semantic Claim consolidation."""
 
 import json
-from collections.abc import Callable, Coroutine
+from collections.abc import Callable, Coroutine, Iterator
 from datetime import datetime, timedelta, timezone
 from typing import cast
 
@@ -38,8 +38,12 @@ async def test_claim_consolidator_inspects_native_evidence_and_preserves_revisio
     async def respond(request: httpx.Request) -> httpx.Response:
         payload: dict[str, object] = json.loads(request.content)
         messages = cast(list[dict[str, object]], payload["messages"])
+        system_prompt = cast(str, messages[0]["content"])
         content = cast(list[dict[str, object]], messages[1]["content"])
+        assert "same proposition" in system_prompt
+        assert "compatible, complementary" in system_prompt
         assert {part["type"] for part in content} >= {"video_url", "input_audio"}
+        assert "Propose supported claim" in cast(str, content[-1]["text"])
         assert "claim_04" in cast(str, content[0]["text"])
         return _streaming_response(
             {
@@ -74,11 +78,11 @@ async def test_claim_consolidator_inspects_native_evidence_and_preserves_revisio
     )
     assert result.relationships[0].relation_type is RelationType.CONTRADICTS
     assert result.model_reference.revision == "claim-serving-revision-01"
-    assert result.prompt_version == "consolidate_claims_v1"
+    assert result.prompt_version == "consolidate_claims_v2"
 
 
 async def test_claim_consolidator_rejects_unknown_and_reversed_relationships() -> None:
-    responses = iter(
+    responses: Iterator[object] = iter(
         (
             {
                 "semantic_claims": [
@@ -89,6 +93,26 @@ async def test_claim_consolidator_rejects_unknown_and_reversed_relationships() -
                     }
                 ],
                 "relationships": [],
+            },
+            {
+                "semantic_claims": [
+                    {
+                        "source_claim_ids": ["claim_01", "claim_unknown"],
+                        "statement": "Unsupported",
+                        "confidence": 0.5,
+                    }
+                ],
+                "relationships": [],
+            },
+            {
+                "semantic_claims": [],
+                "relationships": [
+                    {
+                        "source_claim_id": "claim_01",
+                        "relation_type": "supersedes",
+                        "target_claim_id": "claim_04",
+                    }
+                ],
             },
             {
                 "semantic_claims": [],
@@ -114,6 +138,39 @@ async def test_claim_consolidator_rejects_unknown_and_reversed_relationships() -
             await consolidator.propose_claims(*_candidates())
     finally:
         await consolidator.close()
+
+
+async def test_claim_consolidator_retries_invalid_structure_in_json_mode() -> None:
+    responses: Iterator[object] = iter(
+        (
+            {
+                "semantic_claims": [
+                    {
+                        "source_claim_ids": ["claim_01"],
+                        "statement": "Singletons are not consolidation.",
+                        "confidence": 0.5,
+                    }
+                ],
+                "relationships": [],
+            },
+            {"semantic_claims": [], "relationships": []},
+        )
+    )
+    response_formats: list[object] = []
+
+    async def respond(request: httpx.Request) -> httpx.Response:
+        payload: dict[str, object] = json.loads(request.content)
+        response_formats.append(payload.get("response_format"))
+        return _streaming_response(next(responses))
+
+    consolidator = _consolidator(respond)
+    try:
+        result = await consolidator.propose_claims(*_candidates())
+    finally:
+        await consolidator.close()
+
+    assert result.semantic_claims == ()
+    assert response_formats == [None, {"type": "json_object"}]
 
 
 def _consolidator(

@@ -4,7 +4,7 @@ import sqlite3
 
 
 def initialize_identity_tables(connection: sqlite3.Connection) -> None:
-    """Install the encrypted identity sample table."""
+    """Install encrypted identity samples and face/voice association evidence."""
     connection.executescript(
         """
         CREATE TABLE IF NOT EXISTS edge_identity_templates (
@@ -32,5 +32,34 @@ def initialize_identity_tables(connection: sqlite3.Connection) -> None:
 
         CREATE INDEX IF NOT EXISTS edge_identity_observation_idx
             ON edge_identity_templates (tenant_id, source_observation_id);
+
+        CREATE TABLE IF NOT EXISTS edge_face_voice_evidence (
+            tenant_id TEXT NOT NULL,
+            device_id TEXT NOT NULL,
+            association_model_id TEXT NOT NULL,
+            association_model_revision TEXT NOT NULL,
+            evidence_id TEXT NOT NULL,
+            source_observation_id TEXT NOT NULL,
+            face_identity_id TEXT NOT NULL,
+            voice_identity_id TEXT NOT NULL,
+            start_ms INTEGER NOT NULL CHECK (start_ms >= 0),
+            end_ms INTEGER NOT NULL CHECK (end_ms > start_ms),
+            confidence REAL NOT NULL CHECK (confidence >= 0.0 AND confidence <= 1.0),
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (
+                tenant_id, device_id, association_model_id,
+                association_model_revision, evidence_id
+            )
+        );
+
+        CREATE INDEX IF NOT EXISTS edge_face_voice_pair_idx
+            ON edge_face_voice_evidence (
+                tenant_id, device_id, association_model_id,
+                association_model_revision, face_identity_id, voice_identity_id
+            );
+
+        CREATE INDEX IF NOT EXISTS edge_face_voice_observation_idx
+            ON edge_face_voice_evidence (tenant_id, device_id, source_observation_id);
+
         """
     )

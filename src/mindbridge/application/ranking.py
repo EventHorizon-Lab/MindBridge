@@ -1,5 +1,7 @@
 """Deterministic rank fusion for heterogeneous memory retrievers."""
 
+from dataclasses import replace
+
 from mindbridge.core import DomainInvariantError, MemoryIntegrityError, MemoryRecord
 
 
@@ -21,7 +23,18 @@ def fuse_memory_rankings(
             raise MemoryIntegrityError("one candidate ranking contains duplicate memory IDs")
         for rank, memory in enumerate(ranking, start=1):
             existing = memories.setdefault(memory.memory_id, memory)
-            if existing != memory:
+            if (
+                replace(
+                    existing,
+                    state=memory.state,
+                    strength=memory.strength,
+                    useful_access_count=memory.useful_access_count,
+                    positive_feedback_count=memory.positive_feedback_count,
+                    negative_feedback_count=memory.negative_feedback_count,
+                    last_accessed_at=memory.last_accessed_at,
+                )
+                != memory
+            ):
                 raise MemoryIntegrityError("one memory ID has conflicting candidate content")
             scores[memory.memory_id] = scores.get(memory.memory_id, 0.0) + 1.0 / (
                 rank_constant + rank

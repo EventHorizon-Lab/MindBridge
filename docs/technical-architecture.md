@@ -1,8 +1,8 @@
 # MindBridge 技术实现架构
 
-> 状态：实现基线（Phase 3 进行中）
-> 版本：0.4
-> 更新日期：2026-08-12
+> 状态：RTX 5090 实测基线（Phase 3 效果优化中）
+> 版本：0.6
+> 更新日期：2026-08-13
 
 ## 1. 文档目的
 
@@ -43,7 +43,7 @@ MindBridge 不是机器人、Agent 或大模型。MindBridge 是**记忆本身**
 5. **生态优先**：优先使用官方 SDK、Hugging Face、NVIDIA、OpenAI-compatible、PostgreSQL 等成熟生态，不重复实现通用能力。
 6. **轻量起步**：首版采用模块化单体、异步 Worker 和一套主数据库；只有实际指标证明不足时才拆分。
 7. **可替换但不泛化过度**：保存模型版本和原始证据以支持重新编码，但不为尚不存在的提供商设计复杂工厂层。
-8. **当前阶段效果优先**：代码和模型以实际能力为筛选标准，暂不把 License 作为技术方案过滤条件；仍需记录来源和精确版本以保证可复现。
+8. **当前阶段效果优先**：当前研究与效果验证不以 License 作为候选过滤条件，代码和模型只要有助于能力即可复用；仍记录来源、精确 revision 和工件 hash，商业发布前再单独完成合规审查。
 9. **工程质量是功能要求**：命名、可读性、复杂度、类型、错误处理和测试均是合并门禁，不接受“功能能跑但以后再整理”。
 
 ### 2.3 非目标
@@ -183,6 +183,10 @@ Timeline / Person
 - `ingested_at`：云端接收时间；
 - `valid_from` / `valid_to`：Claim 在世界中被认为有效的区间；
 - `created_at` / `superseded_at`：该版本在系统中的存续区间。
+
+时间窗口采用半开语义：片段为 `[occurred_at, ended_at)`，`occurred_before=t` 只接受
+`occurred_at < t`。因此从 `t` 恰好开始的下一片段不会泄漏给在 `t` 提问的 Recall，重复运行也
+必须保持同一边界。
 
 纠错不直接覆盖旧事实。新 Claim 通过 `supersedes`、`supports` 或 `contradicts` 关系连接旧版本，从而回答“当时我们以为什么”和“后来发现了什么”。
 
@@ -330,11 +334,15 @@ MindBridge 采用“明确默认、保存版本、允许重建”的策略。模
 | 跨模态主召回 | `jina-embeddings-v5-omni-small-retrieval` | 云端 |
 | 文本派生表示 | `jina-embeddings-v5-text-small-retrieval`，与 Omni Small 对齐 | 云端 |
 | 端侧跨模态近期召回 | `jina-embeddings-v5-omni-nano-retrieval` | 强 Jetson/机器人主机，可选 |
-| 人脸检测与身份向量 | InsightFace/SCRFD/ArcFace 生态中的预训练实现 | 端侧 |
-| 说话人分离与声纹 | SpeakerLab/ERes2NetV2 等预训练实现 | 端侧 |
+| 人脸检测、跟踪与表征 | SCRFD-2.5GF-KPS + ArcFace R50；YuNet + SFace 为轻量生态对照 | 端侧 |
+| 在线说话人分离 | Streaming Sortformer 4spk v2.1；超过四人或资源不满足时使用 3D-Speaker 级联管线 | 端侧 |
+| 声纹表征 | 3D-Speaker ERes2NetV2；资源受限时 CAM++ | 端侧 |
+| 活跃说话人与 face↔voice | LR-ASD + 多 Observation 可撤销证据；GateFusion 为质量挑战者 | 端侧 |
 | 最终回答和证据核验 | 能直接读取候选图像、视频和音频的冻结 Omni/VLM | 云端 |
 
-具体模型 ID、服务地址和版本属于部署配置；数据中必须记录精确 `model_id` 和 `revision`。
+这些是进入目标 Jetson bake-off 的首选候选，不是未经实测的 FPS 承诺。完整指标、运行时、
+分档和晋级门禁见[端侧人物一致性感知模型选型](edge-identity-sota.md)。具体模型 ID、服务地址和版本
+属于部署配置；数据中必须记录精确 `model_id` 和 `revision`。
 
 ### 6.2 Jina v5 Omni 的职责
 
@@ -395,11 +403,15 @@ API 因此不加载 Jina 权重，模型只存在于 Worker 或独立 serving �
 
 | 设备档位 | 默认行为 |
 | --- | --- |
-| Orin Nano/NX 等资源受限设备 | 事件门控、人脸/声纹、滚动缓存和上传；通用 Omni Embedding 交给云端 |
-| AGX Orin 或高配机器人主机 | 在不影响主感知任务时运行 Jina Omni Nano，建立端侧近期索引 |
+| Orin Nano | SCRFD-500MF 或 YuNet/SFace、CAM++、批处理 diarization、低频 LR-ASD；通用 Omni Embedding 交给云端 |
+| Orin NX | SCRFD-2.5GF + ArcFace、ERes2NetV2；实测通过后启用低延迟 Sortformer 与 LR-ASD FP16 |
+| AGX Orin | SCRFD-10GF、ERes2NetV2、在线 Sortformer 和 LR-ASD；有余量时运行 Jina Omni Nano 与质量挑战者 |
 | 带独立 GPU 的机器人主机 | 可运行完整本地近期召回和部分 Omni 理解；云端仍负责全局长期记忆 |
 
-是否启用 Nano 由实际吞吐、显存、功耗和主任务余量决定，不按“能够加载模型”判断。端侧使用 TensorRT/DeepStream/GStreamer 等 NVIDIA 原生生态，保留帧率、分辨率、VAD 和事件窗口等硬件校准参数。
+是否启用任一模型由完整管线的吞吐、显存、功耗、温度和主任务余量决定，不按“能够加载模型”
+判断。端侧使用 TensorRT/DeepStream/GStreamer 等 NVIDIA 原生生态，保留帧率、分辨率、VAD、
+diarization 缓冲和事件窗口等硬件校准参数。ONNX 是可移植工件；TensorRT engine 必须按 Jetson
+SKU、JetPack、TensorRT、精度和 shape profile 构建及缓存，不能跨设备镜像盲目复用。
 
 ### 6.5 冻结模型边界
 
@@ -420,11 +432,13 @@ API 因此不加载 Jina 权重，模型只存在于 Worker 或独立 serving �
 
 ### 6.6 端侧匿名身份实现
 
-端侧不自研人脸或声纹网络。人脸首选 InsightFace 官方 `FaceAnalysis`/SCRFD/ArcFace
-预训练模型包（初始基线 `buffalo_l`）；声纹首选 3D-Speaker/SpeakerLab 官方
-ERes2NetV2 `iic/speech_eres2netv2_sv_zh-cn_16k-common` revision `v1.0.1`，并优先采用
-其 ONNX/TensorRT 导出路径。模型只负责检测、切轨和产生 embedding，MindBridge 不复制
-其推理实现，也不微调权重。
+端侧不自研人脸、diarization、声纹或 ASD 网络。人脸质量路径使用
+SCRFD-2.5GF-KPS + ArcFace R50；YuNet + SFace 作为有官方 ONNX 工件的轻量对照。
+声纹使用 3D-Speaker ERes2NetV2
+`iic/speech_eres2netv2_sv_zh-cn_16k-common` revision `v1.0.1`，CAM++ 为资源降级点。
+在线 diarization 首选 NVIDIA Streaming Sortformer 4spk v2.1，超过四人或不满足资源预算时切换
+3D-Speaker 级联管线。LR-ASD 只生成活跃说话人证据，不能直接合并身份。MindBridge 复用官方
+推理实现和工件，不复制第三方网络，也不微调权重。
 
 MindBridge 只维护一个设备本地身份记忆边界：
 
@@ -434,15 +448,24 @@ MindBridge 只维护一个设备本地身份记忆边界：
 4. embedding 使用设备注入的 256-bit key 进行 AES-256-GCM 加密，SQLite 主文件权限为
    `0600`；密钥来自 TPM/设备 Secret Manager，不写入数据库、配置或日志；
 5. 首版在单设备有界样本集上做线性扫描；只有 trace 证明它成为瓶颈时才引入 FAISS；
-6. 云端 `ObserveRequest.identity_observations` 只包含匿名 `identity_id`、`face|voice`、
+6. 合格 ASD 区间保存 Observation、时间范围、face/voice 匿名 ID、置信度和关联模型版本；
+7. face↔voice 至少跨多个 Observation、满足累计时长和时长加权置信度，并在两个方向互为最佳且
+   都以足够 margin 胜过第二名；任何歧义都保持未绑定；
+8. 关联证据有界、幂等并按读取时计算；竞争证据或 tombstone 会立即撤销解析，不合并原始模板；
+9. 通过门禁的 voice 在后续上传时解析为对应 face pseudonym，同时保留 `kind=voice` 和声纹模型
+   provenance；禁止仅按时间重叠或 LLM 单次输出建立等价关系；
+10. 云端 `ObserveRequest.identity_observations` 只包含匿名 `identity_id`、`face|voice`、
    时间区间、置信度和模型版本，Schema 明确禁止额外 embedding 字段；
-7. Worker 按时间重叠把匿名身份写成 `person` Entity 和 EvidenceSpan 级
+11. Worker 按时间重叠把匿名身份写成 `person` Entity 和 EvidenceSpan 级
    `entity_mentions`，因此 `RecallFilters.person_ids` 走生产检索路径；
-8. Observation tombstone 在端侧同一事务中删除由它学习的加密样本，防止遗忘后重新识别。
+12. Observation 或 identity tombstone 在端侧同一事务中删除加密样本和关联证据，防止遗忘后
+    重新识别或重新绑定。
 
-参考上游：[InsightFace](https://github.com/deepinsight/insightface)、
-[3D-Speaker](https://github.com/modelscope/3D-Speaker)。阈值必须按设备摄像头、麦克风、距离与
-环境噪声校准并写入部署配置，不能把某个 Benchmark 的最佳值硬编码进代码。
+端侧闭环会统一后续上传的匿名 ID，但当前云端契约不会回写已经导入的历史 voice Entity。只有产品
+明确要求历史回补时，才新增模型版本化、可撤销的 cloud identity-alias 关系，不能批量覆写实体或
+让 Omni 猜测。完整依据与 bake-off 契约见[端侧人物一致性感知模型选型](edge-identity-sota.md)。
+所有阈值必须按设备摄像头、麦克风、距离、语言和环境噪声校准并写入部署配置，不能把论文最佳值
+硬编码进代码。
 
 ## 7. 召回、追问与回答
 
@@ -1320,6 +1343,7 @@ P50/P95/P99，也不会制造高基数或隐私泄漏。SLO 阈值由部署的 C
 ### Phase 3：SOTA 与产品化
 
 - Embedding/Omni 模型 bake-off；
+- 人脸、diarization、声纹、ASD 与 face↔voice 闭环 bake-off；
 - Benchmark 失败案例回放和查询策略优化；
 - Jetson 性能、功耗和端侧 Nano 评估；
 - 多租户、配额、审计、备份删除和运行 SLO；
@@ -1329,12 +1353,22 @@ P50/P95/P99，也不会制造高基数或隐私泄漏。SLO 阈值由部署的 C
 
 ### 16.1 当前实施状态
 
+RTX 5090 同机端云验证的完整协议、四套公开题集结果、生命周期证据、SOTA 可比性边界与下一步
+优先级见 [`benchmark-report-5090.md`](benchmark-report-5090.md)。该报告把 released-text
+memory-layer 评测与原始视听复现分开，禁止用前者替代多模态 SOTA 声明。
+
+当前完整公开题集基线为：LoCoMo token-F1 `53.09%`、非官方 Qwen Judge `81.43%`；EgoLifeQA
+`61.20%`；SuperMemory-VQA Ans-F1/QA-Acc/QA-MRR `67.41%/58.69%/72.65%`；M3-Bench
+Robot/Web 非官方 Qwen Judge `30.02%/58.18%`。M3 Web 混合了 908 个 v6 与 12 个 v7 分片，且
+包含选择性重跑，因而只是诊断值。逐运行 revision、输入表示、模型、结果 hash 和生命周期工件
+固定在 [`benchmark-5090-clean-007.json`](../benchmarks/manifests/benchmark-5090-clean-007.json)。
+
 | 阶段 | 当前状态 | 已落地证据 | 剩余验收 |
 | --- | --- | --- | --- |
-| Phase 0 | 完成 | 严格领域契约、锁定依赖、CI、Jina smoke、官方数据适配器和可追溯 LoCoMo 切片 | 继续将每次公开结果固化为 run manifest |
+| Phase 0 | 完成 | 严格领域契约、锁定依赖、CI、Jina smoke、官方数据适配器、可追溯 LoCoMo 与 5090 全量评测 manifest | 无；后续运行继续沿用同一 manifest 门禁 |
 | Phase 1 | 软件垂直路径完成 | 原生采集 handoff、加密身份 prototype、SQLite Outbox/近期记忆、S3 同步、durable Job、Event/pgvector 与 REST API | 在目标 Jetson 上完成真实摄像头、VAD/场景/运动门控、断网和功耗验收 |
-| Phase 2 | 功能路径完成 | Episode/Claim/Summary consolidation、RRF/图展开/媒体重看、反馈纠错、生命周期、显式删除，以及四套 Benchmark 的生产 API runner | 跑完官方 split，并提交分层检索与回答结果，而不只保留 smoke 或单会话分数 |
-| Phase 3 | 进行中 | RLS 多租户、Bearer allowlist、Python SDK、MCP/OpenAPI、OpenTelemetry trace 与领域 SLO 指标 | 模型 bake-off、失败案例回放、Jetson/Nano 实测、配额策略、持久审计、备份删除演练和完整 SOTA 复现 |
+| Phase 2 | 完成（公开发布表示） | Episode/Claim/Summary consolidation、RRF/图展开/媒体重看、反馈纠错、生命周期、显式删除，以及四套 Benchmark 完整公开题集的生产 API 分层结果 | 原始 AV 全量重放属于 Phase 3 严格 SOTA 复现，不再作为 Phase 2 软件门禁 |
+| Phase 3 | 进行中 | RLS 多租户、Bearer allowlist、Python SDK、MCP/OpenAPI、OpenTelemetry、端侧真实人脸/声纹 smoke、完整公开题集差距分析和可撤销关联证据闭环 | 原始 AV/OCR/object 检索、迭代查询与经验记忆、官方 Judge 重跑、身份真值 replay、Embedding bake-off、Jetson/Nano 实测、配额、持久审计和备份删除演练 |
 
 “软件路径完成”不等于硬件或榜单验收完成。以下项目不能由单元测试替代：
 
@@ -1342,6 +1376,8 @@ P50/P95/P99，也不会制造高基数或隐私泄漏。SLO 阈值由部署的 C
 2. Jina Nano 是否常驻、事件门控阈值和媒体保留期必须由同一真实机器人回放集校准；
 3. SOTA 只接受官方完整 split、固定代码/模型 revision、公开 run manifest 和可重放输出；
 4. 每租户配额、审计保留期、备份擦除窗口和 P95 SLO 必须先获得负载模型与运营约束，再进入配置和门禁。
+5. 人物一致性必须报告 false-link、跨日 IDF1、撤销延迟以及完整管线的 FPS/RTF、功耗、温度和
+   主任务资源余量；论文单模型指标不能替代目标 Jetson 证据。
 
 ## 17. 关键架构决策记录
 
@@ -1356,6 +1392,7 @@ P50/P95/P99，也不会制造高基数或隐私泄漏。SLO 阈值由部署的 C
 | ADR-007 | 官方 SDK/HF/NVIDIA/OpenAI-compatible 优先 | 受上游 API 和版本变化影响 | 上游无法满足必要能力且无替代实现 |
 | ADR-008 | Benchmark 走生产 API，不建旁路 | 迭代速度可能慢于特制脚本 | 不重审；这是 SOTA 可产品化的前提 |
 | ADR-009 | 可读性、简洁性、类型和测试作为合并门禁 | 首次实现需投入工具配置和评审成本 | 不重审；工程质量是产品能力的一部分 |
+| ADR-010 | face↔voice 只由可审计 ASD 证据跨 Observation 累积并可撤销解析 | 首次绑定更慢，低证据场景保持两个匿名 ID | 同条件实验证明替代方法在 false-link、撤销和部署成本上稳定更优 |
 
 ## 18. 待实测后锁定的参数
 
@@ -1363,6 +1400,8 @@ P50/P95/P99，也不会制造高基数或隐私泄漏。SLO 阈值由部署的 C
 
 - 首批 Jetson 的具体 SKU、内存和留给 MindBridge 的功耗/显存预算；
 - 事件门控阈值、最大分析窗口和片段重叠；
+- 各人脸检测档位、diarization 缓冲/人数上限、声纹分桶阈值、ASD 置信度、累计时长、Observation
+  数和双向 margin；
 - 端侧滚动缓存时长和云端原始媒体保留期；
 - 每租户设备数、媒体小时数和 Recall QPS；
 - 质量优先配置下可接受的 P95 回答延迟和单小时媒体成本；
@@ -1388,7 +1427,15 @@ P50/P95/P99，也不会制造高基数或隐私泄漏。SLO 阈值由部署的 C
 - [jina-embeddings-v5-text-small-retrieval](https://huggingface.co/jinaai/jina-embeddings-v5-text-small-retrieval)
 - [jina-embeddings-v5-omni-nano](https://huggingface.co/jinaai/jina-embeddings-v5-omni-nano)
 
-### 19.3 Benchmark
+### 19.3 端侧人物一致性感知
+
+- [MindBridge 端侧人物一致性感知模型选型](edge-identity-sota.md)
+- [InsightFace](https://github.com/deepinsight/insightface)
+- [NVIDIA Streaming Sortformer 4spk v2.1](https://huggingface.co/nvidia/diar_streaming_sortformer_4spk-v2.1)
+- [3D-Speaker](https://github.com/modelscope/3D-Speaker)
+- [LR-ASD](https://github.com/Junhua-Liao/LR-ASD)
+
+### 19.4 Benchmark
 
 - [LoCoMo](https://github.com/snap-research/locomo)
 - [EgoLifeQA](https://egolife-ai.github.io/)

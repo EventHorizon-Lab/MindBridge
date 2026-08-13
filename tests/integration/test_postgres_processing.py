@@ -154,7 +154,7 @@ class RecordingPerceiver:
                 ),
             ),
             model_reference=MODEL,
-            prompt_version="perceive_events_v3",
+            prompt_version="perceive_events_v4",
         )
 
 
@@ -387,14 +387,14 @@ async def test_processing_commits_provenance_once(
         "A person places a red tool beside a blue toolbox.",
         "qwen3.8-max",
         "serving-revision-01",
-        "perceive_events_v3",
+        "perceive_events_v4",
     )
     assert await _claim_provenance(database_url, tenant_id) == (
         "relation",
         "The red tool is beside the blue toolbox.",
         "qwen3.8-max",
         "serving-revision-01",
-        "perceive_events_v3",
+        "perceive_events_v4",
     )
     assert await _relation_counts(database_url, tenant_id) == (
         ("about", 2),

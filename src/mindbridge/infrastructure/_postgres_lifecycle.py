@@ -31,6 +31,16 @@ async def record_memory_accesses(
     async with tenant_connection(pool, tenant_id) as connection:
         await connection.execute(
             f"""
+            WITH locked AS MATERIALIZED (
+                SELECT memory.memory_id
+                FROM memory_records AS memory
+                WHERE memory.tenant_id = %(tenant_id)s
+                  AND memory.memory_id = ANY(%(memory_ids)s::text[])
+                  AND memory.superseded_at IS NULL
+                  AND {MEMORY_NOT_TOMBSTONED_SQL}
+                ORDER BY memory.memory_id
+                FOR UPDATE
+            )
             UPDATE memory_records AS memory
             SET useful_access_count = memory.useful_access_count + 1,
                 last_accessed_at = GREATEST(
@@ -40,10 +50,9 @@ async def record_memory_accesses(
                     memory.lifecycle_changed_at, now(), %(accessed_at)s
                 ),
                 state = CASE WHEN memory.state = 'cold' THEN 'active' ELSE memory.state END
+            FROM locked
             WHERE memory.tenant_id = %(tenant_id)s
-              AND memory.memory_id = ANY(%(memory_ids)s::text[])
-              AND memory.superseded_at IS NULL
-              AND {MEMORY_NOT_TOMBSTONED_SQL}
+              AND memory.memory_id = locked.memory_id
             """,
             {
                 "accessed_at": accessed_at,

@@ -100,14 +100,19 @@ async def test_supermemory_ingests_through_question_boundary_without_future_segm
         poll_interval_seconds=0.001,
     )
 
-    assert api.calls == [
+    assert set(api.calls[:-1]) == {
         "observe:0",
         "job:job_0",
         "remember:B said the mug was in the sink.",
         "observe:1",
         "job:job_1",
-        "recall",
-    ]
+    }
+    assert api.calls[-1] == "recall"
+    assert api.calls.index("observe:0") < api.calls.index("job:job_0")
+    assert api.calls.index("job:job_0") < api.calls.index(
+        "remember:B said the mug was in the sink."
+    )
+    assert api.calls.index("observe:1") < api.calls.index("job:job_1")
     assert result[0].ranked_option_indices == (2, 0, 3, 1)
     assert api.recall_requests[0].filters.occurred_before == ORIGIN + timedelta(seconds=45)
     request_json = api.recall_requests[0].model_dump_json()
@@ -151,6 +156,20 @@ async def test_supermemory_rejects_missing_question_boundary_before_api_calls() 
         )
 
     assert api.calls == []
+
+
+async def test_supermemory_accepts_question_at_video_start_without_ingesting_future() -> None:
+    api = RecordingMemoryApi()
+    prepared = _prepared_subject()
+
+    await run_supermemory_vqa(
+        cast(AsyncMindBridge, api),
+        (_question(1, question_ended_at=ORIGIN),),
+        prepared,
+        run_id="run_01",
+    )
+
+    assert api.calls == ["recall"]
 
 
 def test_supermemory_metrics_use_answerability_and_full_ranking() -> None:

@@ -1410,6 +1410,6 @@ def _matches_recall_filters(memory: MemoryRecord, request: RecallRequest) -> boo
         )
         and (
             request.filters.occurred_before is None
-            or memory.occurred_at <= request.filters.occurred_before
+            or memory.occurred_at < request.filters.occurred_before
         )
     )

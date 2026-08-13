@@ -174,13 +174,13 @@ async def run_supermemory_vqa(
         raise ValueError("recall_limit and request_concurrency must be positive")
     if poll_interval_seconds <= 0 or processing_timeout_seconds <= 0:
         raise ValueError("poll interval and processing timeout must be positive")
-    segment_ends = {
+    valid_boundaries = {(video.video_id, video.started_at) for video in prepared.videos} | {
         (video.video_id, _segment_bounds(video, segment)[1])
         for video in prepared.videos
         for segment in video.segments
     }
     if any(
-        (question.question_video_id, question.question_ended_at) not in segment_ends
+        (question.question_video_id, question.question_ended_at) not in valid_boundaries
         for question in questions
     ):
         raise ValueError("SuperMemory-VQA prepared segments must end at every question boundary")
@@ -200,22 +200,27 @@ async def run_supermemory_vqa(
     for question_ended_at, group in groupby(
         ordered, key=lambda question: question.question_ended_at
     ):
+        due_segments = []
         while next_segment < len(segments) and segments[next_segment][1] <= question_ended_at:
             occurred_at, ended_at, video_id, segment = segments[next_segment]
-            await _ingest_segment(
-                memory,
-                tenant_id,
-                device_id,
-                prepared.subject,
-                video_id,
-                segment,
-                next_segment,
-                occurred_at,
-                ended_at,
-                poll_interval_seconds,
-                processing_timeout_seconds,
+            due_segments.append(
+                _ingest_segment(
+                    memory,
+                    tenant_id,
+                    device_id,
+                    prepared.subject,
+                    video_id,
+                    segment,
+                    next_segment,
+                    occurred_at,
+                    ended_at,
+                    poll_interval_seconds,
+                    processing_timeout_seconds,
+                    semaphore,
+                )
             )
             next_segment += 1
+        await asyncio.gather(*due_segments)
         results = await asyncio.gather(
             *(
                 _answer_question(memory, tenant_id, question, recall_limit, semaphore)
@@ -278,45 +283,47 @@ async def _ingest_segment(
     ended_at: AwareDatetime,
     poll_interval_seconds: float,
     processing_timeout_seconds: float,
+    semaphore: asyncio.Semaphore,
 ) -> None:
-    source_key = f"subject:{subject}:video:{video_id}:start:{segment.start_seconds:g}"
-    if segment.media_objects:
-        receipt = await memory.observe(
-            ObserveRequest(
-                tenant_id=tenant_id,
-                device_id=device_id,
-                boot_id=SUPERMEMORY_VQA_ADAPTER_VERSION,
-                sequence=sequence,
-                sensor=(
-                    SensorKind.CAMERA
-                    if any(item.kind is not MediaKind.AUDIO for item in segment.media_objects)
-                    else SensorKind.MICROPHONE
-                ),
-                media_objects=segment.media_objects,
-                occurred_at=occurred_at,
-                ended_at=ended_at,
-                observed_at=ended_at,
-                idempotency_key=f"{SUPERMEMORY_VQA_ADAPTER_VERSION}:{source_key}:media",
+    async with semaphore:
+        source_key = f"subject:{subject}:video:{video_id}:start:{segment.start_seconds:g}"
+        if segment.media_objects:
+            receipt = await memory.observe(
+                ObserveRequest(
+                    tenant_id=tenant_id,
+                    device_id=device_id,
+                    boot_id=SUPERMEMORY_VQA_ADAPTER_VERSION,
+                    sequence=sequence,
+                    sensor=(
+                        SensorKind.CAMERA
+                        if any(item.kind is not MediaKind.AUDIO for item in segment.media_objects)
+                        else SensorKind.MICROPHONE
+                    ),
+                    media_objects=segment.media_objects,
+                    occurred_at=occurred_at,
+                    ended_at=ended_at,
+                    observed_at=ended_at,
+                    idempotency_key=f"{SUPERMEMORY_VQA_ADAPTER_VERSION}:{source_key}:media",
+                )
             )
-        )
-        await wait_for_observation_job(
-            memory,
-            tenant_id,
-            receipt.processing_job_id,
-            poll_interval_seconds=poll_interval_seconds,
-            timeout_seconds=processing_timeout_seconds,
-        )
-    if segment.transcript is not None:
-        await memory.remember(
-            RememberRequest(
-                tenant_id=tenant_id,
-                summary=segment.transcript,
-                memory_type=MemoryType.EPISODIC,
-                occurred_at=occurred_at,
-                ended_at=ended_at,
-                idempotency_key=f"{SUPERMEMORY_VQA_ADAPTER_VERSION}:{source_key}:transcript",
+            await wait_for_observation_job(
+                memory,
+                tenant_id,
+                receipt.processing_job_id,
+                poll_interval_seconds=poll_interval_seconds,
+                timeout_seconds=processing_timeout_seconds,
             )
-        )
+        if segment.transcript is not None:
+            await memory.remember(
+                RememberRequest(
+                    tenant_id=tenant_id,
+                    summary=segment.transcript,
+                    memory_type=MemoryType.EPISODIC,
+                    occurred_at=occurred_at,
+                    ended_at=ended_at,
+                    idempotency_key=(f"{SUPERMEMORY_VQA_ADAPTER_VERSION}:{source_key}:transcript"),
+                )
+            )
 
 
 async def _answer_question(

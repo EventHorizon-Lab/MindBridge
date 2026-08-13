@@ -1,7 +1,7 @@
 """Production-contract checks for the M3-Bench runner."""
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import cast
 
 import pytest
@@ -18,14 +18,17 @@ from mindbridge.benchmarks import (
 )
 from mindbridge.contracts import (
     MediaObjectInput,
+    MemoryView,
     ObservationProcessingJobView,
     ObservationReceipt,
     ObservationStatus,
     ObserveRequest,
     RecallRequest,
     RecallResult,
+    RememberRequest,
 )
-from mindbridge.core import JobState, MediaKind
+from mindbridge.core import JobState, MediaKind, MemoryState, MemoryType, VerificationStatus
+from mindbridge.sdk import MindBridgeClientError
 
 NOW = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
 
@@ -34,6 +37,7 @@ class RecordingMemoryApi:
     def __init__(self, job_states: list[JobState] | None = None) -> None:
         self.calls: list[str] = []
         self.observe_requests: list[ObserveRequest] = []
+        self.remember_requests: list[RememberRequest] = []
         self.recall_requests: list[RecallRequest] = []
         self.job_states = job_states or [JobState.SUCCEEDED]
 
@@ -75,6 +79,21 @@ class RecordingMemoryApi:
             trace_id="trace_recall",
         )
 
+    async def remember(self, request: RememberRequest) -> MemoryView:
+        self.calls.append(f"remember:{request.summary}")
+        self.remember_requests.append(request)
+        return MemoryView(
+            memory_id="memory_caption",
+            memory_type=MemoryType.EPISODIC,
+            summary=request.summary,
+            evidence_ids=(),
+            occurred_at=request.occurred_at,
+            ended_at=request.ended_at or request.occurred_at,
+            created_at=NOW,
+            verification_status=VerificationStatus.ATTESTED,
+            state=MemoryState.ACTIVE,
+        )
+
 
 async def test_m3_answers_at_clip_boundaries_without_future_ingestion() -> None:
     api = RecordingMemoryApi()
@@ -86,16 +105,24 @@ async def test_m3_answers_at_clip_boundaries_without_future_ingestion() -> None:
         poll_interval_seconds=0.001,
     )
 
-    assert api.calls == [
+    assert set(api.calls[:4]) == {
         "observe:0",
         "job:job_0:succeeded",
         "recall:What was visible first?",
         "observe:1",
+    }
+    assert api.calls.index("observe:0") < api.calls.index("job:job_0:succeeded")
+    assert api.calls.index("job:job_0:succeeded") < api.calls.index(
+        "recall:What was visible first?"
+    )
+    assert api.calls[-2:] == [
         "job:job_1:succeeded",
         "recall:What happened overall?",
     ]
     assert api.observe_requests[0].occurred_at == NOW
     assert api.observe_requests[1].occurred_at.timestamp() - NOW.timestamp() == 30
+    assert api.recall_requests[0].filters.occurred_before == NOW + timedelta(seconds=30)
+    assert api.recall_requests[1].filters.occurred_before == NOW + timedelta(seconds=60)
     assert "SECRET FIRST ANSWER" not in api.recall_requests[0].model_dump_json()
     assert results[0].answer == "SECRET FIRST ANSWER"
     assert results[0].response == "grounded prediction"
@@ -122,6 +149,51 @@ async def test_m3_rejects_out_of_range_boundary_before_api_calls() -> None:
         )
 
     assert api.calls == []
+
+
+async def test_m3_caption_protocol_uses_same_causal_boundary() -> None:
+    api = RecordingMemoryApi()
+    prepared = M3PreparedVideo(
+        video_id="video_01",
+        timeline_origin=NOW,
+        clips=(M3PreparedClip(clip_index=0, caption="A person entered.", duration_ms=30_000),),
+    )
+    annotation = _annotation(questions=(_annotation().questions[0],))
+
+    await run_m3_video(cast(AsyncMindBridge, api), annotation, prepared, run_id="run_01")
+
+    assert api.calls == [
+        "remember:A person entered.",
+        "recall:What was visible first?",
+    ]
+    assert api.remember_requests[0].ended_at == NOW.replace(second=30)
+
+
+async def test_m3_counts_bounded_model_failures_as_incorrect_and_continues() -> None:
+    class ModelFailingMemoryApi(RecordingMemoryApi):
+        async def recall(self, request: RecallRequest) -> RecallResult:
+            if not self.recall_requests:
+                self.recall_requests.append(request)
+                raise MindBridgeClientError(
+                    "invalid model output",
+                    code="model_output_invalid",
+                    status_code=502,
+                    trace_id="trace_model_error",
+                )
+            return await super().recall(request)
+
+    results = await run_m3_video(
+        cast(AsyncMindBridge, ModelFailingMemoryApi()),
+        _annotation(),
+        _prepared_video(),
+        run_id="run_01",
+        poll_interval_seconds=0.001,
+    )
+
+    assert results[0].response == ""
+    assert results[0].mindbridge_error_code == "model_output_invalid"
+    assert results[0].mindbridge_trace_id == "trace_model_error"
+    assert results[1].response == "grounded prediction"
 
 
 async def test_job_waiter_allows_failed_attempt_to_be_retried() -> None:
@@ -169,6 +241,8 @@ def test_prepared_video_requires_contiguous_video_clips() -> None:
             clip_index=0,
             media_object=_media("media_long", MediaKind.VIDEO, duration_ms=30_001),
         )
+    with pytest.raises(ValidationError, match="require video or a caption"):
+        M3PreparedClip(clip_index=0)
     with pytest.raises(ValidationError, match="before the final clip"):
         M3PreparedVideo(
             video_id="video_01",

@@ -28,6 +28,7 @@ from mindbridge.edge.identity_schema import initialize_identity_tables
 _NONCE_BYTES = 12
 _AES_256_KEY_BYTES = 32
 _DEFAULT_MAXIMUM_SAMPLES = 32
+_MAXIMUM_ASSOCIATION_EVIDENCE_PER_PAIR = 64
 _TemplateRow: TypeAlias = sqlite3.Row
 
 
@@ -83,6 +84,34 @@ class LocalIdentityMatch:
             model_id=self.model_reference.model_id,
             model_revision=self.model_reference.revision,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class FaceVoiceAssociationEvidence:
+    """One unambiguous active-speaker interval linking local face and voice IDs."""
+
+    tenant_id: str
+    source_observation_id: str
+    evidence_id: str
+    face_identity_id: str
+    voice_identity_id: str
+    start_ms: int
+    end_ms: int
+    confidence: float
+    model_reference: ModelReference
+
+    def __post_init__(self) -> None:
+        _require_non_empty(
+            tenant_id=self.tenant_id,
+            source_observation_id=self.source_observation_id,
+            evidence_id=self.evidence_id,
+            face_identity_id=self.face_identity_id,
+            voice_identity_id=self.voice_identity_id,
+        )
+        if self.start_ms < 0 or self.end_ms <= self.start_ms:
+            raise ValueError("face/voice evidence time range must have positive duration")
+        if not math.isfinite(self.confidence) or not 0.0 <= self.confidence <= 1.0:
+            raise ValueError("face/voice evidence confidence must be between 0 and 1")
 
 
 class _EncryptedSample(BaseModel):
@@ -173,10 +202,98 @@ class SQLiteIdentityMemory:
             enrolled_new=enrolled_new,
         )
 
+    def record_face_voice_evidence(self, evidence: FaceVoiceAssociationEvidence) -> None:
+        """Retain one idempotent ASD interval without prematurely merging identities."""
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._require_identity_kind(
+                connection,
+                tenant_id=evidence.tenant_id,
+                identity_id=evidence.face_identity_id,
+                kind=IdentityKind.FACE,
+            )
+            self._require_identity_kind(
+                connection,
+                tenant_id=evidence.tenant_id,
+                identity_id=evidence.voice_identity_id,
+                kind=IdentityKind.VOICE,
+            )
+            existing = self._find_association_evidence(connection, evidence)
+            if existing is not None:
+                if not _association_evidence_matches_row(evidence, existing):
+                    raise IdempotencyConflictError(
+                        "face/voice evidence ID was reused with different content"
+                    )
+            else:
+                self._insert_association_evidence(connection, evidence)
+                self._prune_association_evidence(connection, evidence)
+
+    def resolve_identity(
+        self,
+        tenant_id: str,
+        match: LocalIdentityMatch,
+        *,
+        association_model_reference: ModelReference,
+        minimum_observations: int,
+        minimum_duration_ms: int,
+        minimum_confidence: float,
+        minimum_margin: float,
+    ) -> LocalIdentityMatch:
+        """Map a voice to a face only when both are each other's clear best match."""
+        _require_non_empty(tenant_id=tenant_id)
+        _validate_association_thresholds(
+            minimum_observations=minimum_observations,
+            minimum_duration_ms=minimum_duration_ms,
+            minimum_confidence=minimum_confidence,
+            minimum_margin=minimum_margin,
+        )
+        if match.kind is IdentityKind.FACE:
+            return match
+        with self._connect() as connection:
+            # ponytail: bounded local evidence is scored on read; persist links if profiling demands it.
+            rows = connection.execute(
+                """
+                SELECT face_identity_id, voice_identity_id,
+                       SUM((end_ms - start_ms) * confidence) AS score
+                FROM edge_face_voice_evidence
+                WHERE tenant_id = ? AND device_id = ?
+                  AND association_model_id = ? AND association_model_revision = ?
+                GROUP BY face_identity_id, voice_identity_id
+                HAVING COUNT(DISTINCT source_observation_id) >= ?
+                   AND SUM(end_ms - start_ms) >= ?
+                   AND SUM((end_ms - start_ms) * confidence)
+                       / SUM(end_ms - start_ms) >= ?
+                ORDER BY score DESC, face_identity_id, voice_identity_id
+                """,
+                (
+                    tenant_id,
+                    self._device_id,
+                    association_model_reference.model_id,
+                    association_model_reference.revision,
+                    minimum_observations,
+                    minimum_duration_ms,
+                    minimum_confidence,
+                ),
+            ).fetchall()
+        voice_candidates = [row for row in rows if row["voice_identity_id"] == match.identity_id]
+        if not voice_candidates:
+            return match
+        winner = voice_candidates[0]
+        face_candidates = [
+            row for row in rows if row["face_identity_id"] == winner["face_identity_id"]
+        ]
+        if not (
+            _is_clear_winner(winner, voice_candidates, minimum_margin)
+            and _is_clear_winner(winner, face_candidates, minimum_margin)
+        ):
+            return match
+        return replace(match, identity_id=str(winner["face_identity_id"]))
+
     def forget_identity(self, tenant_id: str, identity_id: str) -> int:
         """Delete every local biometric sample for one anonymous identity."""
         _require_non_empty(tenant_id=tenant_id, identity_id=identity_id)
         with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             cursor = connection.execute(
                 """
                 DELETE FROM edge_identity_templates
@@ -184,12 +301,21 @@ class SQLiteIdentityMemory:
                 """,
                 (tenant_id, self._device_id, identity_id),
             )
+            connection.execute(
+                """
+                DELETE FROM edge_face_voice_evidence
+                WHERE tenant_id = ? AND device_id = ?
+                  AND (face_identity_id = ? OR voice_identity_id = ?)
+                """,
+                (tenant_id, self._device_id, identity_id, identity_id),
+            )
         return cursor.rowcount
 
     def forget_observation(self, tenant_id: str, observation_id: str) -> int:
         """Delete identity samples learned from one forgotten observation."""
         _require_non_empty(tenant_id=tenant_id, observation_id=observation_id)
         with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             cursor = connection.execute(
                 """
                 DELETE FROM edge_identity_templates
@@ -197,7 +323,136 @@ class SQLiteIdentityMemory:
                 """,
                 (tenant_id, self._device_id, observation_id),
             )
+            connection.execute(
+                """
+                DELETE FROM edge_face_voice_evidence
+                WHERE tenant_id = ? AND device_id = ?
+                  AND (
+                    source_observation_id = ?
+                    OR NOT EXISTS (
+                        SELECT 1 FROM edge_identity_templates AS face
+                        WHERE face.tenant_id = edge_face_voice_evidence.tenant_id
+                          AND face.device_id = edge_face_voice_evidence.device_id
+                          AND face.identity_id = edge_face_voice_evidence.face_identity_id
+                          AND face.kind = 'face'
+                    )
+                    OR NOT EXISTS (
+                        SELECT 1 FROM edge_identity_templates AS voice
+                        WHERE voice.tenant_id = edge_face_voice_evidence.tenant_id
+                          AND voice.device_id = edge_face_voice_evidence.device_id
+                          AND voice.identity_id = edge_face_voice_evidence.voice_identity_id
+                          AND voice.kind = 'voice'
+                    )
+                  )
+                """,
+                (tenant_id, self._device_id, observation_id),
+            )
         return cursor.rowcount
+
+    def _require_identity_kind(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        tenant_id: str,
+        identity_id: str,
+        kind: IdentityKind,
+    ) -> None:
+        row = connection.execute(
+            """
+            SELECT 1 FROM edge_identity_templates
+            WHERE tenant_id = ? AND device_id = ? AND identity_id = ? AND kind = ?
+            LIMIT 1
+            """,
+            (tenant_id, self._device_id, identity_id, kind.value),
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"{kind.value}_identity_id is not enrolled on this device")
+
+    def _find_association_evidence(
+        self,
+        connection: sqlite3.Connection,
+        evidence: FaceVoiceAssociationEvidence,
+    ) -> sqlite3.Row | None:
+        return cast(
+            sqlite3.Row | None,
+            connection.execute(
+                """
+                SELECT * FROM edge_face_voice_evidence
+                WHERE tenant_id = ? AND device_id = ?
+                  AND association_model_id = ? AND association_model_revision = ?
+                  AND evidence_id = ?
+                """,
+                (*self._association_scope(evidence), evidence.evidence_id),
+            ).fetchone(),
+        )
+
+    def _insert_association_evidence(
+        self,
+        connection: sqlite3.Connection,
+        evidence: FaceVoiceAssociationEvidence,
+    ) -> None:
+        connection.execute(
+            """
+            INSERT INTO edge_face_voice_evidence (
+                tenant_id, device_id, association_model_id, association_model_revision,
+                evidence_id, source_observation_id, face_identity_id, voice_identity_id,
+                start_ms, end_ms, confidence, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                *self._association_scope(evidence),
+                evidence.evidence_id,
+                evidence.source_observation_id,
+                evidence.face_identity_id,
+                evidence.voice_identity_id,
+                evidence.start_ms,
+                evidence.end_ms,
+                evidence.confidence,
+                self._now().isoformat(),
+            ),
+        )
+
+    def _prune_association_evidence(
+        self,
+        connection: sqlite3.Connection,
+        evidence: FaceVoiceAssociationEvidence,
+    ) -> None:
+        old_evidence = connection.execute(
+            """
+            SELECT evidence_id FROM edge_face_voice_evidence
+            WHERE tenant_id = ? AND device_id = ?
+              AND association_model_id = ? AND association_model_revision = ?
+              AND face_identity_id = ? AND voice_identity_id = ?
+            ORDER BY created_at DESC, evidence_id DESC
+            LIMIT -1 OFFSET ?
+            """,
+            (
+                *self._association_scope(evidence),
+                evidence.face_identity_id,
+                evidence.voice_identity_id,
+                _MAXIMUM_ASSOCIATION_EVIDENCE_PER_PAIR,
+            ),
+        ).fetchall()
+        connection.executemany(
+            """
+            DELETE FROM edge_face_voice_evidence
+            WHERE tenant_id = ? AND device_id = ?
+              AND association_model_id = ? AND association_model_revision = ?
+              AND evidence_id = ?
+            """,
+            ((*self._association_scope(evidence), row["evidence_id"]) for row in old_evidence),
+        )
+
+    def _association_scope(
+        self,
+        evidence: FaceVoiceAssociationEvidence,
+    ) -> tuple[str, str, str, str]:
+        return (
+            evidence.tenant_id,
+            self._device_id,
+            evidence.model_reference.model_id,
+            evidence.model_reference.revision,
+        )
 
     def _best_match(
         self,
@@ -353,6 +608,73 @@ class SQLiteIdentityMemory:
         if now.utcoffset() is None:
             raise ValueError("edge identity clock must return a timezone-aware datetime")
         return now
+
+
+def _validate_association_thresholds(
+    *,
+    minimum_observations: int,
+    minimum_duration_ms: int,
+    minimum_confidence: float,
+    minimum_margin: float,
+) -> None:
+    if minimum_observations <= 0:
+        raise ValueError("minimum_observations must be positive")
+    if minimum_duration_ms <= 0:
+        raise ValueError("minimum_duration_ms must be positive")
+    if not math.isfinite(minimum_confidence) or not 0.0 < minimum_confidence <= 1.0:
+        raise ValueError("minimum_confidence must be greater than 0 and at most 1")
+    if not math.isfinite(minimum_margin) or not 0.0 <= minimum_margin <= 1.0:
+        raise ValueError("minimum_margin must be between 0 and 1")
+
+
+def _association_evidence_matches_row(
+    evidence: FaceVoiceAssociationEvidence,
+    row: sqlite3.Row,
+) -> bool:
+    return (
+        evidence.tenant_id,
+        evidence.source_observation_id,
+        evidence.evidence_id,
+        evidence.face_identity_id,
+        evidence.voice_identity_id,
+        evidence.start_ms,
+        evidence.end_ms,
+        evidence.confidence,
+        evidence.model_reference.model_id,
+        evidence.model_reference.revision,
+    ) == (
+        row["tenant_id"],
+        row["source_observation_id"],
+        row["evidence_id"],
+        row["face_identity_id"],
+        row["voice_identity_id"],
+        row["start_ms"],
+        row["end_ms"],
+        row["confidence"],
+        row["association_model_id"],
+        row["association_model_revision"],
+    )
+
+
+def _is_clear_winner(
+    candidate: sqlite3.Row,
+    ranked_candidates: list[sqlite3.Row],
+    minimum_margin: float,
+) -> bool:
+    winner = ranked_candidates[0]
+    if (
+        winner["face_identity_id"],
+        winner["voice_identity_id"],
+    ) != (
+        candidate["face_identity_id"],
+        candidate["voice_identity_id"],
+    ):
+        return False
+    if len(ranked_candidates) == 1:
+        return True
+    score = float(candidate["score"])
+    runner_up_score = float(ranked_candidates[1]["score"])
+    return score > runner_up_score and (score - runner_up_score) / score >= minimum_margin
 
 
 def _normalized_embedding(embedding: tuple[float, ...]) -> tuple[float, ...]:

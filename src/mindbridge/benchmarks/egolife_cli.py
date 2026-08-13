@@ -49,7 +49,7 @@ from mindbridge.models.openai_perception import (
 )
 from mindbridge.sdk import AsyncMindBridge
 
-EGOLIFE_RUNNER_VERSION = "egolife_production_api_v3"
+EGOLIFE_RUNNER_VERSION = "egolife_production_api_v4"
 
 
 class EgoLifeRunManifest(ContractModel):
@@ -86,6 +86,8 @@ class EgoLifeRunManifest(ContractModel):
     processing_timeout_seconds: float = Field(gt=0)
     question_ids: tuple[Identifier, ...] = Field(min_length=1)
     clip_count: int = Field(gt=0)
+    media_clip_count: int = Field(ge=0)
+    caption_clip_count: int = Field(ge=0)
     metrics: EgoLifeMetrics
     predictions_sha256: Sha256Hex
     completed_at: AwareDatetime
@@ -209,6 +211,8 @@ def _write_artifacts(
         processing_timeout_seconds=arguments.processing_timeout_seconds,
         question_ids=tuple(question.question_id for question in questions),
         clip_count=len(prepared.clips),
+        media_clip_count=sum(clip.media_object is not None for clip in prepared.clips),
+        caption_clip_count=sum(clip.caption is not None for clip in prepared.clips),
         metrics=metrics,
         predictions_sha256=hashlib.sha256(predictions.encode()).hexdigest(),
         completed_at=datetime.now(timezone.utc),

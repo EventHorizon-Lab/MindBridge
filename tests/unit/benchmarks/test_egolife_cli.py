@@ -55,6 +55,8 @@ def test_egolife_artifacts_pin_inputs_models_metrics_and_output(tmp_path: Path) 
     assert manifest.request_timeout_seconds == 1_800.0
     assert manifest.run_id == "run_01"
     assert manifest.metrics.correct_count == 1
+    assert manifest.media_clip_count == 1
+    assert manifest.caption_clip_count == 0
     assert manifest.predictions_sha256 == hashlib.sha256(output_path.read_bytes()).hexdigest()
 
 

@@ -1,5 +1,6 @@
 """PostgreSQL checks for automatic lifecycle pages and concurrent feedback."""
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -169,6 +170,30 @@ async def test_postgres_recall_access_reactivates_cold_memory_without_rewinding_
     assert first[0].useful_access_count == 1
     assert second[0].useful_access_count == 2
     assert second[0].last_accessed_at == NOW + timedelta(minutes=1)
+
+
+async def test_postgres_concurrent_overlapping_accesses_do_not_deadlock(
+    store: PostgresMemoryStore,
+) -> None:
+    tenant_id = TenantId("tenant_lifecycle_overlapping_access")
+    memories = tuple(
+        _memory(tenant_id, MemoryId(f"memory_{index:02d}"), NOW) for index in range(20)
+    )
+    for memory in memories:
+        await _write_memory(store, memory)
+
+    await asyncio.gather(
+        *(
+            store.record_memory_accesses(
+                tenant_id,
+                tuple(memory.memory_id for memory in memories[offset:] + memories[:offset]),
+                accessed_at=NOW,
+            )
+            for offset in range(8)
+        )
+    )
+
+    assert (await store.read_memory(tenant_id, memories[0].memory_id)).useful_access_count == 8
 
 
 async def test_postgres_clamps_access_before_memory_creation(

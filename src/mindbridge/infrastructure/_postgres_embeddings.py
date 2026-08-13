@@ -18,6 +18,7 @@ from mindbridge.infrastructure._postgres_types import (
 )
 
 CLOUD_EMBEDDING_DIMENSION = 1_024
+# Permit ~1e-4 normalized GPU jitter without masking model or input changes.
 _RETRY_MINIMUM_COSINE_SIMILARITY = 0.999_999
 
 

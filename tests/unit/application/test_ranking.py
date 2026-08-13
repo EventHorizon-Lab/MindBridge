@@ -11,6 +11,7 @@ from mindbridge.core import (
     MemoryId,
     MemoryIntegrityError,
     MemoryRecord,
+    MemoryState,
     MemoryType,
     TenantId,
     VerificationStatus,
@@ -42,6 +43,22 @@ def test_rrf_rejects_conflicting_identity() -> None:
             ((memory,), (replace(memory, summary="different"),)),
             limit=1,
         )
+
+
+def test_rrf_accepts_concurrent_lifecycle_updates() -> None:
+    """Concurrent recalls may update lifecycle counters between candidate queries."""
+    memory = _memory("memory_01")
+    accessed = replace(
+        memory,
+        state=MemoryState.STRENGTHENED,
+        strength=1.5,
+        useful_access_count=1,
+        positive_feedback_count=1,
+        negative_feedback_count=1,
+        last_accessed_at=NOW,
+    )
+
+    assert fuse_memory_rankings(((memory,), (accessed,)), limit=1) == (memory,)
 
 
 def test_rrf_rejects_invalid_budget() -> None:

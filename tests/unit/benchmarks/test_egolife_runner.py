@@ -24,6 +24,7 @@ from mindbridge.contracts import (
     ObserveRequest,
     RecallRequest,
     RecallResult,
+    RememberRequest,
 )
 from mindbridge.core import JobState, MediaKind
 
@@ -35,6 +36,7 @@ class RecordingMemoryApi:
         self.calls: list[str] = []
         self.observe_requests: list[ObserveRequest] = []
         self.recall_requests: list[RecallRequest] = []
+        self.remember_requests: list[RememberRequest] = []
 
     async def observe(self, request: ObserveRequest) -> ObservationReceipt:
         self.calls.append(f"observe:{request.sequence}")
@@ -74,6 +76,11 @@ class RecordingMemoryApi:
             trace_id="trace_recall",
         )
 
+    async def remember(self, request: RememberRequest) -> object:
+        self.calls.append(f"remember:{request.summary}")
+        self.remember_requests.append(request)
+        return object()
+
 
 async def test_egolife_answers_before_ingesting_a_clip_that_crosses_query_time() -> None:
     api = RecordingMemoryApi()
@@ -102,6 +109,37 @@ async def test_egolife_answers_before_ingesting_a_clip_that_crosses_query_time()
         hour=10, minute=0, second=15
     )
     assert "SECRET" not in api.recall_requests[0].model_dump_json()
+
+
+async def test_egolife_ingests_official_caption_without_reprocessing_video() -> None:
+    api = RecordingMemoryApi()
+    prepared = EgoLifePreparedStream(
+        subject_id="A1_JAKE",
+        timeline_origin=ORIGIN,
+        clips=(
+            EgoLifePreparedClip(
+                day=1,
+                start_timecode="10000000",
+                caption="Jake passes the phone to Alice.",
+                duration_ms=30_000,
+            ),
+        ),
+    )
+
+    await run_egolife_qa(
+        cast(AsyncMindBridge, api),
+        (_question("q_1", "10004500"),),
+        prepared,
+        run_id="run_01",
+        poll_interval_seconds=0.001,
+    )
+
+    assert api.calls == [
+        "remember:Jake passes the phone to Alice.",
+        "recall:Who used it?",
+    ]
+    assert api.remember_requests[0].occurred_at == ORIGIN.replace(hour=10)
+    assert api.remember_requests[0].ended_at == ORIGIN.replace(hour=10, second=30)
 
 
 def test_prepared_egolife_rejects_overlapping_clips() -> None:

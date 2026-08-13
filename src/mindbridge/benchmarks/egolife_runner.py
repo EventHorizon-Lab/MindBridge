@@ -32,25 +32,34 @@ from mindbridge.contracts import (
     RecallFilters,
     RecallQuery,
     RecallRequest,
+    RememberRequest,
 )
-from mindbridge.core import MediaKind, SensorKind
+from mindbridge.core import MediaKind, MemoryType, SensorKind
 from mindbridge.sdk import AsyncMindBridge
 
 
 class EgoLifePreparedClip(ContractModel):
-    """One uploaded EgoLife source clip on its official seven-day clock."""
+    """One raw or officially captioned clip on EgoLife's seven-day clock."""
 
     day: int = Field(ge=1)
     start_timecode: str = Field(pattern=r"^[0-9]{8}$")
-    media_object: MediaObjectInput
+    media_object: MediaObjectInput | None = None
+    caption: NonEmptyString | None = None
+    duration_ms: int | None = Field(default=None, gt=0)
 
     @model_validator(mode="after")
     def require_video_with_duration(self) -> EgoLifePreparedClip:
         """Require enough metadata to derive a leak-free interval."""
-        if self.media_object.kind is not MediaKind.VIDEO:
-            raise ValueError("EgoLifeQA clips must be video media objects")
-        if not self.media_object.duration_ms:
-            raise ValueError("EgoLifeQA clips must have a positive duration_ms")
+        if self.media_object is None:
+            if self.caption is None or self.duration_ms is None:
+                raise ValueError("EgoLifeQA clips require video or a caption with duration_ms")
+        else:
+            if self.media_object.kind is not MediaKind.VIDEO:
+                raise ValueError("EgoLifeQA clips must be video media objects")
+            if not self.media_object.duration_ms:
+                raise ValueError("EgoLifeQA clips must have a positive duration_ms")
+            if self.duration_ms is not None and self.duration_ms != self.media_object.duration_ms:
+                raise ValueError("EgoLifeQA clip durations must match")
         egolife_timecode_offset_ms(self.day, self.start_timecode)
         return self
 
@@ -68,15 +77,18 @@ class EgoLifePreparedStream(ContractModel):
         starts = tuple(_clip_start_ms(clip) for clip in self.clips)
         if starts != tuple(sorted(starts)) or len(set(starts)) != len(starts):
             raise ValueError("EgoLifeQA clips must have unique chronological start times")
-        media_ids = tuple(clip.media_object.media_object_id for clip in self.clips)
+        media_ids = tuple(
+            clip.media_object.media_object_id
+            for clip in self.clips
+            if clip.media_object is not None
+        )
         if len(set(media_ids)) != len(media_ids):
             raise ValueError("EgoLifeQA clip media_object_ids must be unique")
         previous_end = -1
         for clip, start in zip(self.clips, starts, strict=True):
             if start < previous_end:
                 raise ValueError("EgoLifeQA clips must not overlap")
-            assert clip.media_object.duration_ms is not None
-            previous_end = start + clip.media_object.duration_ms
+            previous_end = start + _clip_duration_ms(clip)
         return self
 
 
@@ -153,21 +165,26 @@ async def run_egolife_qa(
     next_clip = 0
     semaphore = asyncio.Semaphore(request_concurrency)
     for query_offset_ms, group in groupby(ordered, key=lambda question: question.query_offset_ms):
+        due_clips = []
         while next_clip < len(prepared.clips):
             clip = prepared.clips[next_clip]
             if _clip_end_ms(clip) > query_offset_ms:
                 break
-            receipt = await memory.observe(
-                _observe_request(tenant_id, device_id, prepared, clip, next_clip)
-            )
-            await wait_for_observation_job(
-                memory,
-                tenant_id,
-                receipt.processing_job_id,
-                poll_interval_seconds=poll_interval_seconds,
-                timeout_seconds=processing_timeout_seconds,
+            due_clips.append(
+                _ingest_clip(
+                    memory,
+                    tenant_id,
+                    device_id,
+                    prepared,
+                    clip,
+                    next_clip,
+                    poll_interval_seconds=poll_interval_seconds,
+                    processing_timeout_seconds=processing_timeout_seconds,
+                    semaphore=semaphore,
+                )
             )
             next_clip += 1
+        await asyncio.gather(*due_clips)
         cutoff = prepared.timeline_origin + timedelta(milliseconds=query_offset_ms)
         results = await asyncio.gather(
             *(
@@ -179,31 +196,59 @@ async def run_egolife_qa(
     return tuple(answers[question.question_id] for question in questions)
 
 
-def _observe_request(
+async def _ingest_clip(
+    memory: AsyncMindBridge,
     tenant_id: str,
     device_id: str,
     prepared: EgoLifePreparedStream,
     clip: EgoLifePreparedClip,
     sequence: int,
-) -> ObserveRequest:
-    occurred_at = prepared.timeline_origin + timedelta(milliseconds=_clip_start_ms(clip))
-    assert clip.media_object.duration_ms is not None
-    ended_at = occurred_at + timedelta(milliseconds=clip.media_object.duration_ms)
-    return ObserveRequest(
-        tenant_id=tenant_id,
-        device_id=device_id,
-        boot_id=EGOLIFE_QA_ADAPTER_VERSION,
-        sequence=sequence,
-        sensor=SensorKind.CAMERA,
-        media_objects=(clip.media_object,),
-        occurred_at=occurred_at,
-        ended_at=ended_at,
-        observed_at=ended_at,
-        idempotency_key=(
-            f"{EGOLIFE_QA_ADAPTER_VERSION}:{prepared.subject_id}:"
-            f"day:{clip.day}:clip:{clip.start_timecode}"
-        ),
-    )
+    *,
+    poll_interval_seconds: float,
+    processing_timeout_seconds: float,
+    semaphore: asyncio.Semaphore,
+) -> None:
+    async with semaphore:
+        occurred_at = prepared.timeline_origin + timedelta(milliseconds=_clip_start_ms(clip))
+        ended_at = occurred_at + timedelta(milliseconds=_clip_duration_ms(clip))
+        source_key = f"day:{clip.day}:clip:{clip.start_timecode}"
+        if clip.media_object is not None:
+            receipt = await memory.observe(
+                ObserveRequest(
+                    tenant_id=tenant_id,
+                    device_id=device_id,
+                    boot_id=EGOLIFE_QA_ADAPTER_VERSION,
+                    sequence=sequence,
+                    sensor=SensorKind.CAMERA,
+                    media_objects=(clip.media_object,),
+                    occurred_at=occurred_at,
+                    ended_at=ended_at,
+                    observed_at=ended_at,
+                    idempotency_key=(
+                        f"{EGOLIFE_QA_ADAPTER_VERSION}:{prepared.subject_id}:{source_key}:media"
+                    ),
+                )
+            )
+            await wait_for_observation_job(
+                memory,
+                tenant_id,
+                receipt.processing_job_id,
+                poll_interval_seconds=poll_interval_seconds,
+                timeout_seconds=processing_timeout_seconds,
+            )
+        if clip.caption is not None:
+            await memory.remember(
+                RememberRequest(
+                    tenant_id=tenant_id,
+                    summary=clip.caption,
+                    memory_type=MemoryType.EPISODIC,
+                    occurred_at=occurred_at,
+                    ended_at=ended_at,
+                    idempotency_key=(
+                        f"{EGOLIFE_QA_ADAPTER_VERSION}:{prepared.subject_id}:{source_key}:caption"
+                    ),
+                )
+            )
 
 
 async def _answer_question(
@@ -248,5 +293,12 @@ def _clip_start_ms(clip: EgoLifePreparedClip) -> int:
 
 
 def _clip_end_ms(clip: EgoLifePreparedClip) -> int:
-    assert clip.media_object.duration_ms is not None
-    return _clip_start_ms(clip) + clip.media_object.duration_ms
+    return _clip_start_ms(clip) + _clip_duration_ms(clip)
+
+
+def _clip_duration_ms(clip: EgoLifePreparedClip) -> int:
+    duration_ms = (
+        clip.media_object.duration_ms if clip.media_object is not None else clip.duration_ms
+    )
+    assert duration_ms is not None
+    return duration_ms

@@ -13,10 +13,17 @@ from mindbridge.core import (
     MemoryIntegrityError,
     ModelReference,
 )
-from mindbridge.edge import LocalIdentitySample, SQLiteIdentityMemory
+from mindbridge.edge import (
+    FaceVoiceAssociationEvidence,
+    LocalIdentityMatch,
+    LocalIdentitySample,
+    SQLiteIdentityMemory,
+)
 
 NOW = datetime(2026, 8, 12, 12, 0, tzinfo=timezone.utc)
 MODEL = ModelReference(model_id="insightface/buffalo_l", revision="1.0.1")
+VOICE_MODEL = ModelReference(model_id="3d-speaker/eres2netv2", revision="v1.0.1")
+ASSOCIATION_MODEL = ModelReference(model_id="lr-asd", revision="ijcv-2025")
 
 
 def test_identity_memory_matches_learns_and_encrypts_samples(tmp_path: Path) -> None:
@@ -108,12 +115,151 @@ def test_identity_memory_forgets_observation_samples(tmp_path: Path) -> None:
     assert memory.forget_identity("tenant_01", match.identity_id) == 0
 
 
-def _sample(sample_id: str, embedding: tuple[float, ...]) -> LocalIdentitySample:
+def test_face_voice_association_requires_repeatable_unambiguous_evidence(tmp_path: Path) -> None:
+    memory = SQLiteIdentityMemory(
+        tmp_path / "edge.sqlite3",
+        device_id="robot_01",
+        encryption_key=AESGCM.generate_key(bit_length=256),
+        clock=lambda: NOW,
+    )
+    face = memory.recognize_and_remember(
+        _sample("face_01", (1.0, 0.0), observation_id="face_enrollment"),
+        minimum_similarity=0.8,
+    )
+    competing_face = memory.recognize_and_remember(
+        _sample("face_02", (0.0, 1.0), observation_id="other_face_enrollment"),
+        minimum_similarity=0.8,
+    )
+    voice = memory.recognize_and_remember(
+        _sample(
+            "voice_01",
+            (1.0, 0.0),
+            kind=IdentityKind.VOICE,
+            observation_id="voice_enrollment",
+            model_reference=VOICE_MODEL,
+        ),
+        minimum_similarity=0.8,
+    )
+    first = _association_evidence("asd_01", "observation_01", face.identity_id, voice.identity_id)
+
+    memory.record_face_voice_evidence(first)
+    assert _resolve(memory, voice).identity_id == voice.identity_id
+    memory.record_face_voice_evidence(first)
+    with pytest.raises(IdempotencyConflictError):
+        memory.record_face_voice_evidence(
+            _association_evidence(
+                "asd_01",
+                "observation_01",
+                face.identity_id,
+                voice.identity_id,
+                confidence=0.91,
+            ),
+        )
+
+    memory.record_face_voice_evidence(
+        _association_evidence("asd_02", "observation_02", face.identity_id, voice.identity_id),
+    )
+
+    resolved = _resolve(memory, voice)
+    assert resolved.identity_id == face.identity_id
+    assert resolved.to_observation_input(start_ms=0, end_ms=1_000).kind is IdentityKind.VOICE
+
+    memory.record_face_voice_evidence(
+        _association_evidence(
+            "asd_03",
+            "observation_03",
+            competing_face.identity_id,
+            voice.identity_id,
+            confidence=0.93,
+        ),
+    )
+    memory.record_face_voice_evidence(
+        _association_evidence(
+            "asd_04",
+            "observation_04",
+            competing_face.identity_id,
+            voice.identity_id,
+            confidence=0.93,
+        ),
+    )
+
+    assert _resolve(memory, voice).identity_id == voice.identity_id
+    memory.record_face_voice_evidence(
+        _association_evidence(
+            "asd_tie",
+            "observation_tie",
+            competing_face.identity_id,
+            voice.identity_id,
+            confidence=1.0,
+            duration_ms=40,
+        ),
+    )
+    assert _resolve(memory, voice, minimum_margin=0.0).identity_id == voice.identity_id
+    memory.forget_observation("tenant_01", "observation_03")
+    memory.forget_observation("tenant_01", "observation_04")
+    assert _resolve(memory, voice).identity_id == face.identity_id
+    memory.forget_observation("tenant_01", "observation_02")
+    assert _resolve(memory, voice).identity_id == voice.identity_id
+    memory.record_face_voice_evidence(
+        _association_evidence("asd_05", "observation_05", face.identity_id, voice.identity_id),
+    )
+    assert _resolve(memory, voice).identity_id == face.identity_id
+    assert memory.forget_observation("tenant_01", "face_enrollment") == 1
+    assert _resolve(memory, voice).identity_id == voice.identity_id
+
+
+def _sample(
+    sample_id: str,
+    embedding: tuple[float, ...],
+    *,
+    kind: IdentityKind = IdentityKind.FACE,
+    observation_id: str = "observation_01",
+    model_reference: ModelReference = MODEL,
+) -> LocalIdentitySample:
     return LocalIdentitySample(
         tenant_id="tenant_01",
-        kind=IdentityKind.FACE,
-        source_observation_id="observation_01",
+        kind=kind,
+        source_observation_id=observation_id,
         sample_id=sample_id,
         embedding=embedding,
-        model_reference=MODEL,
+        model_reference=model_reference,
+    )
+
+
+def _association_evidence(
+    evidence_id: str,
+    observation_id: str,
+    face_identity_id: str,
+    voice_identity_id: str,
+    *,
+    confidence: float = 0.95,
+    duration_ms: int = 1_000,
+) -> FaceVoiceAssociationEvidence:
+    return FaceVoiceAssociationEvidence(
+        tenant_id="tenant_01",
+        source_observation_id=observation_id,
+        evidence_id=evidence_id,
+        face_identity_id=face_identity_id,
+        voice_identity_id=voice_identity_id,
+        start_ms=0,
+        end_ms=duration_ms,
+        confidence=confidence,
+        model_reference=ASSOCIATION_MODEL,
+    )
+
+
+def _resolve(
+    memory: SQLiteIdentityMemory,
+    match: LocalIdentityMatch,
+    *,
+    minimum_margin: float = 0.1,
+) -> LocalIdentityMatch:
+    return memory.resolve_identity(
+        "tenant_01",
+        match,
+        association_model_reference=ASSOCIATION_MODEL,
+        minimum_observations=2,
+        minimum_duration_ms=1_500,
+        minimum_confidence=0.9,
+        minimum_margin=minimum_margin,
     )

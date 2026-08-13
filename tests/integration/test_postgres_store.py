@@ -341,6 +341,41 @@ async def test_postgres_enumeration_scans_filters_without_full_text_truncation(
     ]
 
 
+async def test_postgres_occurred_before_excludes_equal_boundary(
+    store: PostgresMemoryStore,
+) -> None:
+    kernel = _kernel(store)
+    tenant_id = "tenant_before_boundary"
+    before = await kernel.remember(
+        RememberRequest(
+            tenant_id=tenant_id,
+            summary="Completed before the question boundary.",
+            memory_type=MemoryType.EPISODIC,
+            occurred_at=NOW,
+        )
+    )
+    at_boundary = await kernel.remember(
+        RememberRequest(
+            tenant_id=tenant_id,
+            summary="Started exactly at the question boundary.",
+            memory_type=MemoryType.EPISODIC,
+            occurred_at=NOW + timedelta(minutes=1),
+        )
+    )
+
+    memories = await store.search_memories_by_ids(
+        RecallRequest(
+            tenant_id=tenant_id,
+            query=RecallQuery(text="boundary"),
+            filters=RecallFilters(occurred_before=NOW + timedelta(minutes=1)),
+        ),
+        (MemoryId(before.memory_id), MemoryId(at_boundary.memory_id)),
+        limit=10,
+    )
+
+    assert [memory.memory_id for memory in memories] == [before.memory_id]
+
+
 async def test_postgres_round_trips_attested_source_memory(store: PostgresMemoryStore) -> None:
     """Explicit source text survives persistence and can ground a reported answer."""
     kernel = _kernel(store)

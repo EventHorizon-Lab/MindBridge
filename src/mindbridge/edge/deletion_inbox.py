@@ -188,6 +188,30 @@ class SQLiteDeletionInbox:
         )
         connection.execute(
             """
+            DELETE FROM edge_face_voice_evidence
+            WHERE tenant_id = ?
+              AND (
+                source_observation_id = ?
+                OR NOT EXISTS (
+                    SELECT 1 FROM edge_identity_templates AS face
+                    WHERE face.tenant_id = edge_face_voice_evidence.tenant_id
+                      AND face.device_id = edge_face_voice_evidence.device_id
+                      AND face.identity_id = edge_face_voice_evidence.face_identity_id
+                      AND face.kind = 'face'
+                )
+                OR NOT EXISTS (
+                    SELECT 1 FROM edge_identity_templates AS voice
+                    WHERE voice.tenant_id = edge_face_voice_evidence.tenant_id
+                      AND voice.device_id = edge_face_voice_evidence.device_id
+                      AND voice.identity_id = edge_face_voice_evidence.voice_identity_id
+                      AND voice.kind = 'voice'
+                )
+              )
+            """,
+            (tenant_id, observation_id),
+        )
+        connection.execute(
+            """
             DELETE FROM edge_processing_jobs
             WHERE tenant_id = ? AND observation_id = ?
             """,

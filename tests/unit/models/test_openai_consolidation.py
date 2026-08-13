@@ -1,7 +1,7 @@
 """Contract tests for evidence-first episode consolidation."""
 
 import json
-from collections.abc import Callable, Coroutine
+from collections.abc import Callable, Coroutine, Iterator
 from datetime import datetime, timedelta, timezone
 from typing import cast
 
@@ -34,8 +34,12 @@ async def test_episode_consolidator_inspects_native_evidence_and_preserves_revis
     async def respond(request: httpx.Request) -> httpx.Response:
         payload: dict[str, object] = json.loads(request.content)
         messages = cast(list[dict[str, object]], payload["messages"])
+        system_prompt = cast(str, messages[0]["content"])
         content = cast(list[dict[str, object]], messages[1]["content"])
+        assert "temporal continuity and a shared goal" in system_prompt
+        assert "share only a person, place, object" in system_prompt
         assert {part["type"] for part in content} >= {"video_url", "input_audio"}
+        assert "Propose supported episode" in cast(str, content[-1]["text"])
         context = cast(str, content[0]["text"])
         assert "event_01" in context and "evidence_02" in context
         return _streaming_response(
@@ -60,7 +64,7 @@ async def test_episode_consolidator_inspects_native_evidence_and_preserves_revis
 
     assert result.episodes[0].event_ids == (EventId("event_01"), EventId("event_02"))
     assert result.model_reference.revision == "episode-serving-revision-01"
-    assert result.prompt_version == "consolidate_episodes_v1"
+    assert result.prompt_version == "consolidate_episodes_v2"
 
 
 async def test_episode_consolidator_rejects_an_unknown_event_id() -> None:
@@ -96,6 +100,38 @@ async def test_episode_consolidator_requires_every_exact_evidence_span() -> None
             await consolidator.propose_episodes(events, evidence[:1])
     finally:
         await consolidator.close()
+
+
+async def test_episode_consolidator_retries_invalid_structure_in_json_mode() -> None:
+    responses: Iterator[object] = iter(
+        (
+            {
+                "episodes": [
+                    {
+                        "event_ids": ["event_01"],
+                        "description": "A singleton is not an episode.",
+                        "salience": 0.5,
+                    }
+                ]
+            },
+            {"episodes": []},
+        )
+    )
+    response_formats: list[object] = []
+
+    async def respond(request: httpx.Request) -> httpx.Response:
+        payload: dict[str, object] = json.loads(request.content)
+        response_formats.append(payload.get("response_format"))
+        return _streaming_response(next(responses))
+
+    consolidator = _consolidator(respond)
+    try:
+        result = await consolidator.propose_episodes(*_candidates())
+    finally:
+        await consolidator.close()
+
+    assert result.episodes == ()
+    assert response_formats == [None, {"type": "json_object"}]
 
 
 def _consolidator(

@@ -38,11 +38,18 @@ async def test_omni_perception_returns_grounded_event_and_provider_revision() ->
     async def respond(request: httpx.Request) -> httpx.Response:
         payload: dict[str, object] = json.loads(request.content)
         messages = cast(list[dict[str, object]], payload["messages"])
+        system_prompt = cast(str, messages[0]["content"])
         content = cast(list[dict[str, object]], messages[1]["content"])
 
         assert request.url.path == "/api/v1/chat/completions"
         assert "reasoning_effort" not in payload
+        assert "response_format" not in payload
+        assert "atomic semantic" in system_prompt
+        assert "spoken wording and visible text exactly" in system_prompt
+        assert "opaque\n  identity_id" in system_prompt
         assert {item["type"] for item in content} >= {"video_url", "input_audio"}
+        assert cast(str, content[0]["text"]).startswith("<observation_context>")
+        assert cast(str, content[-1]["text"]).startswith("<final_task>")
         assert '"evidence_id":"evidence_video"' in cast(str, content[0]["text"])
         assert '"identity_id":"person_device_01"' in cast(str, content[0]["text"])
         assert "embedding" not in cast(str, content[0]["text"])
@@ -102,12 +109,40 @@ async def test_omni_perception_returns_grounded_event_and_provider_revision() ->
         EvidenceId("evidence_audio"),
     )
     assert result.model_reference.revision == "qwen-serving-revision-01"
-    assert result.prompt_version == "perceive_events_v3"
+    assert result.prompt_version == "perceive_events_v5"
     assert [entity.canonical_name for entity in result.events[0].entities] == [
         "red tool",
         "toolbox",
     ]
     assert result.events[0].claims[0].entity_indices == (0, 1)
+
+
+async def test_omni_perception_retries_invalid_output_once_in_json_mode() -> None:
+    calls = 0
+
+    async def respond(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        payload: dict[str, object] = json.loads(request.content)
+        if calls == 1:
+            assert "response_format" not in payload
+            content = {"events": [{"start_ms": 0}]}
+        else:
+            assert payload["response_format"] == {"type": "json_object"}
+            content = {"events": []}
+        return _streaming_response(content)
+
+    perceiver = _perceiver(respond)
+    try:
+        result = await perceiver.perceive_events(
+            _observation(),
+            (_evidence(MediaKind.VIDEO, "clip.mp4", "video"),),
+        )
+    finally:
+        await perceiver.close()
+
+    assert calls == 2
+    assert result.events == ()
 
 
 async def test_omni_perception_rejects_detail_evidence_outside_its_event() -> None:

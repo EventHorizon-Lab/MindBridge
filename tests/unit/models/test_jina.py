@@ -1,5 +1,7 @@
 """Tests for the Jina Sentence Transformers boundary."""
 
+from types import SimpleNamespace
+
 import pytest
 
 from mindbridge.core import ModelOutputError, ModelReference
@@ -44,6 +46,52 @@ class RecordingEncoder:
     ) -> Matrix:
         self.calls.append("document")
         return Matrix(self.values)
+
+
+def test_jina_pins_remote_code_to_the_model_revision(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    def sentence_transformer(model_path: str, **kwargs: object) -> RecordingEncoder:
+        calls.append((model_path, kwargs))
+        return RecordingEncoder([[1.0, 0.0]])
+
+    def snapshot_download(**kwargs: object) -> str:
+        calls.append(("snapshot_download", kwargs))
+        return "/models/pinned"
+
+    monkeypatch.setattr(
+        "mindbridge.models.jina.import_module",
+        lambda name: (
+            SimpleNamespace(SentenceTransformer=sentence_transformer)
+            if name == "sentence_transformers"
+            else SimpleNamespace(snapshot_download=snapshot_download)
+        ),
+    )
+
+    JinaOmniEmbedder.load(revision="pinned-revision", dimension=2)
+
+    assert calls == [
+        (
+            "snapshot_download",
+            {
+                "repo_id": "jinaai/jina-embeddings-v5-omni-small-retrieval",
+                "revision": "pinned-revision",
+            },
+        ),
+        (
+            "/models/pinned",
+            {
+                "revision": "pinned-revision",
+                "trust_remote_code": True,
+                "device": None,
+                "model_kwargs": {
+                    "modality": "omni",
+                    "code_revision": "pinned-revision",
+                },
+                "config_kwargs": {"code_revision": "pinned-revision"},
+            },
+        ),
+    ]
 
 
 async def test_jina_uses_distinct_query_and_document_methods() -> None:

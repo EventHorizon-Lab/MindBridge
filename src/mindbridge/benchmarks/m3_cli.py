@@ -43,7 +43,7 @@ from mindbridge.models.openai_perception import (
 )
 from mindbridge.sdk import AsyncMindBridge
 
-M3_RUNNER_VERSION = "m3_production_api_v4"
+M3_RUNNER_VERSION = "m3_production_api_v7"
 
 
 class M3RunManifest(ContractModel):
@@ -81,6 +81,8 @@ class M3RunManifest(ContractModel):
     processing_timeout_seconds: float = Field(gt=0)
     video_ids: tuple[Identifier, ...] = Field(min_length=1)
     clip_count: int = Field(gt=0)
+    media_clip_count: int = Field(ge=0)
+    caption_clip_count: int = Field(ge=0)
     question_count: int = Field(gt=0)
     predictions_sha256: Sha256Hex
     completed_at: AwareDatetime
@@ -200,6 +202,14 @@ def _write_artifacts(
         processing_timeout_seconds=arguments.processing_timeout_seconds,
         video_ids=tuple(video.video_id for video in videos),
         clip_count=sum(len(prepared[video.video_id].clips) for video in videos),
+        media_clip_count=sum(
+            clip.media_object is not None
+            for video in videos
+            for clip in prepared[video.video_id].clips
+        ),
+        caption_clip_count=sum(
+            clip.caption is not None for video in videos for clip in prepared[video.video_id].clips
+        ),
         question_count=sum(len(video.questions) for video in videos),
         predictions_sha256=hashlib.sha256(predictions.encode("utf-8")).hexdigest(),
         completed_at=datetime.now(timezone.utc),

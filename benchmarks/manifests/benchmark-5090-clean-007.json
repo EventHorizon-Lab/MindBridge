@@ -1,0 +1,213 @@
+{
+  "protocol": "mindbridge-rtx5090-four-benchmark-and-lifecycle-v1",
+  "created_at": "2026-08-13T01:35:35Z",
+  "repository_revision": "2ca05794ad8b119b5ed355bbefa9ed51eb45af03",
+  "hardware": {
+    "gpu": "NVIDIA GeForce RTX 5090",
+    "gpu_memory_mib": 32607,
+    "driver_version": "570.172.08",
+    "python_version": "3.10.12",
+    "edge_and_cloud_share_one_host": true,
+    "latency_is_acceptance_gate": false
+  },
+  "model_policy": {
+    "fine_tuning_used": false,
+    "answer_model_id": "qwen3.8-max",
+    "answer_model_revision": "provider-managed-2026-08-13",
+    "answer_api": "OpenAI Async SDK",
+    "answer_reasoning_effort": "low",
+    "text_embedding_model_id": "jinaai/jina-embeddings-v5-text-small-retrieval",
+    "text_embedding_revision": "6856e76bb72982e58de0620458a4e8b3614da340",
+    "omni_embedding_model_id": "jinaai/jina-embeddings-v5-omni-small-retrieval",
+    "omni_embedding_revision": "12949877f0092093f366c6450340011320152a05"
+  },
+  "artifact_digest_algorithm": "SHA-256 over each C-locale-sorted relative filename, NUL, file SHA-256, newline",
+  "benchmarks": [
+    {
+      "benchmark": "LoCoMo",
+      "run_id": "locomo-full-5090-clean-006",
+      "runner_version": "locomo_production_api_v6",
+      "code_revision": "2ca05794ad8b119b5ed355bbefa9ed51eb45af03+diff-9ac48979a136637c6b669304ac63c9127ca43bf9d5abc5ba6834cacc3d2acef1",
+      "dataset_revision": "3eb6f2c585f5e1699204e3c3bdf7adc5c28cb376",
+      "dataset_sha256": "79fa87e90f04081343b8c8debecb80a9a6842b76a7aa537dc9fdf651ea698ff4",
+      "representation": "official dialogue turns",
+      "conversation_count": 10,
+      "question_count": 1986,
+      "metrics": {
+        "non_adversarial_token_f1": 0.5308943227259868,
+        "all_category_score": 0.5934427275921546,
+        "evidence_coverage": 0.7440173148474722,
+        "semantic_judge_accuracy": 0.8142857142857143,
+        "semantic_judge_question_count": 1540,
+        "semantic_judge_protocol": "mem0-locomo-prompt-qwen3.8-max-nonofficial-v1"
+      },
+      "reference": {
+        "method": "T-Mem",
+        "token_f1": 0.5196,
+        "semantic_judge_accuracy": 0.8026,
+        "strictly_comparable": false,
+        "reason": "The MindBridge judge is Qwen, while T-Mem uses GPT-4o-mini and averages three runs."
+      },
+      "artifacts": {
+        "prediction_file_count": 10,
+        "predictions_aggregate_sha256": "0e86b6d4d7f8335aac077db2abbc5013bdaab0d757cb42f76e78bdacf1b1ba06",
+        "sidecars_aggregate_sha256": "a8b52ca19b35a6498563ee44d1124f6ef2ebabdabdb898e360f65677a122d083",
+        "judge_sha256": "ea1c2e5c1681d3ae8abcfdbbde2e53d578e0fe970ede2b94eeab08606e978a69"
+      }
+    },
+    {
+      "benchmark": "EgoLifeQA",
+      "run_id": "egolife-a1-5090-clean-007",
+      "runner_version": "egolife_production_api_v4",
+      "code_revision": "2ca05794ad8b119b5ed355bbefa9ed51eb45af03+diff-fb5ac5c51683d5b807d212300d29dd5a169c721d3f24e934cfe804ca7e939636",
+      "dataset_revision": "143fb319be7aa5ae210c936bf4f0f3a86092afb0",
+      "dataset_sha256": "688ae079f458132f13150711b7e099fbe4fdedd97f19f5a33bdebb7bfde74a52",
+      "evaluator_revision": "7a97157908757cc898c26835b718653055ecc5f5",
+      "representation": "6388 released DenseCaption and Transcript clips",
+      "media_clip_count": 0,
+      "question_count": 500,
+      "metrics": {
+        "accuracy": 0.612,
+        "empty_answer_count": 44,
+        "retrieval_empty_count": 0
+      },
+      "reference": {
+        "method": "Human Visual-Audio Caption plus EgoRAG oracle",
+        "accuracy": 0.455,
+        "strongest_deployable_baseline_accuracy": 0.369,
+        "strictly_comparable": false,
+        "reason": "MindBridge uses a different retrieval pipeline and answer model on released captions."
+      },
+      "artifacts": {
+        "predictions_sha256": "fa6378bcd8c63af0ba5ad4b05d261882f43056885edb3959a58bb9f38bac98cc",
+        "sidecar_sha256": "8f18ef56c9d759154f6b098f7e7ccac685bfc1e8e70d551dfbcac5dc823c556b"
+      }
+    },
+    {
+      "benchmark": "SuperMemory-VQA",
+      "run_id": "supermemory-full-5090-clean-007",
+      "runner_version": "supermemory_production_api_v5",
+      "code_revision": "2ca05794ad8b119b5ed355bbefa9ed51eb45af03+diff-fb5ac5c51683d5b807d212300d29dd5a169c721d3f24e934cfe804ca7e939636",
+      "dataset_revision": "1d228e0f10049a8a84c458dded2aa25b1e21ce8f",
+      "dataset_sha256": "fbb3f234d8ce79e5cfbe31482d735038035ee13f59a6468a3f3a078c2aa15663",
+      "source_revision": "8123980820ffa23a3452faa6bd8ce5dff0f03164",
+      "representation": "6157 released aligned transcript segments across 83 videos",
+      "media_clip_count": 0,
+      "subject_count": 10,
+      "question_count": 4853,
+      "metrics": {
+        "answerability_precision": 0.9611597374179431,
+        "answerability_recall": 0.5190546528803545,
+        "answerability_f1": 0.6740840207174371,
+        "qa_accuracy": 0.5868534926849371,
+        "qa_mean_reciprocal_rank": 0.726457861116844,
+        "retrieval_empty_count": 0,
+        "incomplete_ranking_count": 5
+      },
+      "reference": {
+        "method": "Gemini-3-Flash plus Video-RAG",
+        "answerability_f1": 0.839,
+        "qa_accuracy": 0.61,
+        "qa_mean_reciprocal_rank": 0.76,
+        "strictly_comparable": false,
+        "reason": "MindBridge uses released transcripts without the baseline's raw frames, OCR, and object evidence."
+      },
+      "artifacts": {
+        "prediction_file_count": 10,
+        "predictions_aggregate_sha256": "25e4b8fa738c24741f878571b8e801a1a32fcf66862028072c11a9145e1872bc",
+        "sidecars_aggregate_sha256": "b450afe0013cdbf5d6996d5f07e8091ccaf8a7ee8f07acf5f9495fb4f612bebd"
+      }
+    },
+    {
+      "benchmark": "M3-Bench Robot",
+      "run_id": "m3-full-5090-clean-007",
+      "runner_version": "m3_production_api_v6",
+      "code_revision": "2ca05794ad8b119b5ed355bbefa9ed51eb45af03+diff-fb5ac5c51683d5b807d212300d29dd5a169c721d3f24e934cfe804ca7e939636",
+      "dataset_revision": "0e3e41939bd8a0b66d756e7b7eb8d5fe9992da5c",
+      "dataset_sha256": "f43031bf0216a2ef2e7909f20ecd534e0098da17b63cdf94325a07f1bea372c1",
+      "media_revision": "2672152eee36b25ccb38fdbc3b72135347adbb63",
+      "representation": "6868 released memory-graph captions",
+      "media_clip_count": 0,
+      "video_count": 100,
+      "question_count": 1276,
+      "metrics": {
+        "semantic_judge_accuracy": 0.3001567398119122,
+        "empty_response_count": 552,
+        "model_error_count": 0,
+        "judge_protocol": "m3-agent-prompt-qwen3.8-max-nonofficial-v1"
+      },
+      "reference": {
+        "method": "RRM",
+        "semantic_judge_accuracy": 0.396,
+        "strictly_comparable": false,
+        "reason": "Judge, input representation, repeated-run count, and online feedback protocol differ."
+      },
+      "artifacts": {
+        "prediction_file_count": 100,
+        "predictions_aggregate_sha256": "6cc64991b76a93e275f202f24e6af66b24852b2d90d219e214baa98c2fa3d258",
+        "sidecars_aggregate_sha256": "347af7ba29002493ab1997f5f48c7673c6a64cfc1c6997ca1c9036dfb7f5dc6c",
+        "judge_sha256": "7202c121450b6b5262dd4db8057ac955bc7b52006c4a9e6d651ca62abc194fa1"
+      }
+    },
+    {
+      "benchmark": "M3-Bench Web",
+      "run_id": "m3-full-5090-clean-007",
+      "runner_versions": {
+        "m3_production_api_v6": 908,
+        "m3_production_api_v7": 12
+      },
+      "code_revisions": [
+        "2ca05794ad8b119b5ed355bbefa9ed51eb45af03+diff-fb5ac5c51683d5b807d212300d29dd5a169c721d3f24e934cfe804ca7e939636",
+        "2ca05794ad8b119b5ed355bbefa9ed51eb45af03+diff-595fc23492b4a50ea51dc798221827ea8ca1a00d9110dfc81df783b496eda533"
+      ],
+      "dataset_revision": "0e3e41939bd8a0b66d756e7b7eb8d5fe9992da5c",
+      "dataset_sha256": "9af953751203471e00c360dbf4b6c072d5b0782ae89e26a60ea366f4d8f14e02",
+      "media_revision": "2672152eee36b25ccb38fdbc3b72135347adbb63",
+      "representation": "49965 released memory-graph captions",
+      "media_clip_count": 0,
+      "video_count": 920,
+      "question_count": 3214,
+      "metrics": {
+        "semantic_judge_accuracy": 0.5818294959551961,
+        "empty_response_count": 679,
+        "model_error_count": 10,
+        "judge_protocol": "m3-agent-prompt-qwen3.8-max-nonofficial-v1",
+        "all_retried_videos_counted_wrong_sensitivity": 0.5594275047
+      },
+      "retry_integrity": {
+        "initial_completed_video_count": 885,
+        "selectively_retried_video_count": 35,
+        "selective_retry_successes_under_v6": 23,
+        "remaining_videos_counted_with_v7": 12,
+        "affected_question_count": 133,
+        "strict_single_revision_result": false
+      },
+      "reference": {
+        "method": "RRM",
+        "semantic_judge_accuracy": 0.544,
+        "strictly_comparable": false,
+        "reason": "The result mixes runner revisions and selective retries in addition to judge, representation, repeated-run, and feedback differences."
+      },
+      "artifacts": {
+        "prediction_file_count": 920,
+        "predictions_aggregate_sha256": "622c17106162383edea6fc6d68ded7e9683fbb3e6cb395810c96966ed5115fcf",
+        "sidecars_aggregate_sha256": "60d003b4c062f024f8b77c55554960690066225de7f3b3aca8679e44efe5a52e",
+        "judge_sha256": "19d6eb041bc54c1bdad22922e7fa2ed5b8ab55589b27d7aa66f67c7e466d317e"
+      }
+    }
+  ],
+  "lifecycle_validation": {
+    "correction_strengthening_cold_reactivation_forget_sha256": "48fa1d6ef14fefc6c2fd6455489745ff922172258d485695a4c421d9bfafd700",
+    "edge_recent_identity_sync_delete_sha256": "903d2fd5ad97869d213af5318371d4d1a69fc5967a5d6a41acc42642f9a880c4",
+    "episode_claim_summary_consolidation_sha256": "a8a06bdf3cf5dabacdeb00707c01b43fe1ee79bc83f4594d46fc821512a03d92",
+    "real_face_voice_model_smoke_sha256": "006cb9fab4a6cee3ddcf52f672c4a8fa3b8420bfa4f1ac1480639a11bbf9169e",
+    "all_required_flows_passed": true
+  },
+  "aggregate_summary_sha256": "63e9b3c5819a77100a030ae7b63a4c207b3bd4c24d7ec804160598db2511b19a",
+  "integrity": {
+    "all_benchmarks_complete": true,
+    "prediction_question_ids_unique": true,
+    "sidecar_prediction_hashes_verified": 1041,
+    "secrets_persisted": false
+  }
+}

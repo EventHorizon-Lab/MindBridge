@@ -24,6 +24,7 @@ from mindbridge.core import (
 )
 from mindbridge.edge import (
     EdgeMediaFile,
+    FaceVoiceAssociationEvidence,
     LocalIdentitySample,
     SQLiteDeletionInbox,
     SQLiteIdentityMemory,
@@ -75,6 +76,43 @@ def test_tombstone_erasure_rolls_back_until_local_media_can_be_deleted(
         ),
         minimum_similarity=0.8,
     )
+    voice = identity_memory.recognize_and_remember(
+        LocalIdentitySample(
+            tenant_id=request.tenant_id,
+            kind=IdentityKind.VOICE,
+            source_observation_id="voice_observation",
+            sample_id="voice_track_01",
+            embedding=(1.0, 0.0),
+            model_reference=ModelReference(model_id="3d-speaker/eres2netv2", revision="v1.0.1"),
+        ),
+        minimum_similarity=0.8,
+    )
+    association_model = ModelReference(model_id="lr-asd", revision="ijcv-2025")
+    identity_memory.record_face_voice_evidence(
+        FaceVoiceAssociationEvidence(
+            tenant_id=request.tenant_id,
+            source_observation_id="association_observation",
+            evidence_id="asd_01",
+            face_identity_id=identity.identity_id,
+            voice_identity_id=voice.identity_id,
+            start_ms=0,
+            end_ms=1_000,
+            confidence=0.95,
+            model_reference=association_model,
+        )
+    )
+    assert (
+        identity_memory.resolve_identity(
+            request.tenant_id,
+            voice,
+            association_model_reference=association_model,
+            minimum_observations=1,
+            minimum_duration_ms=500,
+            minimum_confidence=0.9,
+            minimum_margin=0.0,
+        ).identity_id
+        == identity.identity_id
+    )
     media_files = (
         EdgeMediaFile(
             media_object_id="media_01",
@@ -98,6 +136,18 @@ def test_tombstone_erasure_rolls_back_until_local_media_can_be_deleted(
     assert inbox.apply_page(request.tenant_id, page) == 1
     assert inbox.read_cursor(request.tenant_id) == "tombstone_01"
     assert outbox.pending_count() == 0
+    assert (
+        identity_memory.resolve_identity(
+            request.tenant_id,
+            voice,
+            association_model_reference=association_model,
+            minimum_observations=1,
+            minimum_duration_ms=500,
+            minimum_confidence=0.9,
+            minimum_margin=0.0,
+        ).identity_id
+        == voice.identity_id
+    )
     assert identity_memory.forget_identity(request.tenant_id, identity.identity_id) == 0
     assert not media_path.exists()
     with pytest.raises(MemoryDeletedError):

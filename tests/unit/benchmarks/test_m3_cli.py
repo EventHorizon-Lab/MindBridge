@@ -72,6 +72,8 @@ def test_m3_artifacts_pin_media_models_code_and_jsonl_output(tmp_path: Path) -> 
     assert manifest.request_timeout_seconds == 1_800.0
     assert manifest.run_id == "run_01"
     assert manifest.clip_count == 1
+    assert manifest.media_clip_count == 1
+    assert manifest.caption_clip_count == 0
     assert manifest.question_count == 1
     assert manifest.predictions_sha256 == hashlib.sha256(output_path.read_bytes()).hexdigest()
 

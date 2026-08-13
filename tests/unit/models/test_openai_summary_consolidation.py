@@ -1,7 +1,7 @@
 """Contract tests for evidence-first hierarchical Memory consolidation."""
 
 import json
-from collections.abc import Callable, Coroutine
+from collections.abc import Callable, Coroutine, Iterator
 from datetime import datetime, timedelta, timezone
 from typing import cast
 
@@ -38,11 +38,12 @@ async def test_summary_consolidator_inspects_native_evidence_and_preserves_revis
     async def respond(request: httpx.Request) -> httpx.Response:
         payload: dict[str, object] = json.loads(request.content)
         messages = cast(list[dict[str, object]], payload["messages"])
-        assert 'scope value must be exactly one of "session", "day", "person"' in cast(
-            str, messages[0]["content"]
-        )
+        system_prompt = cast(str, messages[0]["content"])
+        assert 'scope is exactly "session", "day", "person"' in system_prompt
+        assert "shared entity, time, place, or keyword alone is insufficient" in system_prompt
         content = cast(list[dict[str, object]], messages[1]["content"])
         assert {part["type"] for part in content} >= {"video_url"}
+        assert "Propose supported hierarchy" in cast(str, content[-1]["text"])
         context = cast(str, content[0]["text"])
         assert "memory_02" in context and "attested" in context
         return _streaming_response(
@@ -72,7 +73,7 @@ async def test_summary_consolidator_inspects_native_evidence_and_preserves_revis
     )
     assert result.summaries[0].scope is SummaryScope.SESSION
     assert result.model_reference.revision == "summary-serving-revision-01"
-    assert result.prompt_version == "consolidate_summaries_v2"
+    assert result.prompt_version == "consolidate_summaries_v3"
 
 
 async def test_summary_consolidator_rejects_unknown_memory_and_missing_evidence() -> None:
@@ -99,6 +100,39 @@ async def test_summary_consolidator_rejects_unknown_memory_and_missing_evidence(
             await consolidator.propose_summaries(candidates, ())
     finally:
         await consolidator.close()
+
+
+async def test_summary_consolidator_retries_invalid_structure_in_json_mode() -> None:
+    responses: Iterator[object] = iter(
+        (
+            {
+                "summaries": [
+                    {
+                        "source_memory_ids": ["memory_01"],
+                        "scope": "session",
+                        "summary": "A singleton is not a hierarchy.",
+                        "salience": 0.5,
+                    }
+                ]
+            },
+            {"summaries": []},
+        )
+    )
+    response_formats: list[object] = []
+
+    async def respond(request: httpx.Request) -> httpx.Response:
+        payload: dict[str, object] = json.loads(request.content)
+        response_formats.append(payload.get("response_format"))
+        return _streaming_response(next(responses))
+
+    consolidator = _consolidator(respond)
+    try:
+        result = await consolidator.propose_summaries(*_candidates())
+    finally:
+        await consolidator.close()
+
+    assert result.summaries == ()
+    assert response_formats == [None, {"type": "json_object"}]
 
 
 def _consolidator(

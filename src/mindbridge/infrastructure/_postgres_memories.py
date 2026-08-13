@@ -346,7 +346,7 @@ _STRUCTURED_RECALL_FILTER_SQL = f"""
       OR memory.memory_type = ANY(%(memory_types)s::text[])
   )
   AND (%(occurred_after)s::timestamptz IS NULL OR memory.occurred_at >= %(occurred_after)s)
-  AND (%(occurred_before)s::timestamptz IS NULL OR memory.occurred_at <= %(occurred_before)s)
+  AND (%(occurred_before)s::timestamptz IS NULL OR memory.occurred_at < %(occurred_before)s)
   AND (
       cardinality(%(device_ids)s::text[]) = 0
       OR EXISTS (

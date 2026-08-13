@@ -51,6 +51,7 @@ async def test_omni_streams_raw_av_and_validates_answer() -> None:
         assert payload["reasoning_effort"] == "low"
         assert 'For yes/no questions, answer "Yes" or "No".' in system_prompt
         assert "different named person does not support" in system_prompt
+        assert "Missing evidence is not evidence of" in system_prompt
         assert {item["type"] for item in user_content} >= {
             "image_url",
             "video_url",
@@ -64,6 +65,7 @@ async def test_omni_streams_raw_av_and_validates_answer() -> None:
             "format": "wav",
         }
         assert '"start_ms":1000' in cast(str, user_content[0]["text"])
+        assert "Where is the tool?" in cast(str, user_content[-1]["text"])
         return httpx.Response(
             200,
             headers={"content-type": "text/event-stream"},
@@ -76,7 +78,8 @@ async def test_omni_streams_raw_av_and_validates_answer() -> None:
     answerer = _answerer(respond)
     assert answerer.model_reference.model_id == "qwen3.8-max"
     assert answerer.model_reference.revision == "deployment-revision"
-    assert answerer.prompt_version == "answer_from_evidence_v3"
+    assert answerer.prompt_version == "answer_from_evidence_v4"
+    assert answerer.occurrence_prompt_version == "select_occurrences_v2"
     evidence = (
         _resolved_evidence(MediaKind.IMAGE, "image.jpg", "media_image", 0),
         _resolved_evidence(MediaKind.VIDEO, "clip.mp4", "media_video", 1_000),
@@ -140,11 +143,12 @@ async def test_omni_inspects_native_query_media_before_candidate_evidence() -> N
 
         labels = [item["text"] for item in content if item["type"] == "text"]
         media_parts = [item for item in content if item["type"] != "text"]
-        assert labels[1:] == [
+        assert labels[1:4] == [
             "Query media_object_id=query_image follows.",
             "Query media_object_id=query_video follows.",
             "Query media_object_id=query_audio follows.",
         ]
+        assert "Find a matching moment" in cast(str, labels[-1])
         assert [item["type"] for item in media_parts] == [
             "image_url",
             "video_url",
@@ -193,7 +197,9 @@ async def test_omni_selects_occurrences_with_schema_validated_candidate_ids() ->
     async def respond(request: httpx.Request) -> httpx.Response:
         payload: dict[str, object] = json.loads(request.content)
         messages = cast(list[dict[str, object]], payload["messages"])
-        assert "exhaustive occurrence-verification" in cast(str, messages[0]["content"])
+        system_prompt = cast(str, messages[0]["content"])
+        assert "distinct occurrences" in system_prompt
+        assert "same evidence and time represent one occurrence" in system_prompt
         return httpx.Response(
             200,
             headers={"content-type": "text/event-stream"},
@@ -274,7 +280,9 @@ async def test_omni_uses_attested_source_statement_without_media() -> None:
     async def respond(request: httpx.Request) -> httpx.Response:
         payload: dict[str, object] = json.loads(request.content)
         messages = cast(list[dict[str, object]], payload["messages"])
-        assert 'marked "attested"' in cast(str, messages[0]["content"])
+        assert 'An "attested" summary is an exact caller statement' in cast(
+            str, messages[0]["content"]
+        )
         user_content = cast(list[dict[str, object]], messages[1]["content"])
         assert '"verification_status":"attested"' in cast(str, user_content[0]["text"])
         return httpx.Response(
