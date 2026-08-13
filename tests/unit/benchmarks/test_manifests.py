@@ -52,6 +52,12 @@ def test_locomo_optimization_manifest_preserves_reported_category_metrics() -> N
     assert runs["optimized"]["metrics"]["answer_f1"] == 0.6136889267575371
     assert runs["reflection_v8"]["metrics"]["answer_f1"] == 0.649383027799884
     assert runs["reflection_v8"]["metrics"]["evidence_recall"] == 0.7772194304857621
+    assert runs["refinement_v9_uniform_l20"]["metrics"]["answer_f1"] == 0.63756575483928
+    assert runs["refinement_v9_uniform_l50"]["metrics"]["answer_f1"] == 0.6531770085437091
+    assert runs["refinement_v9_uniform_l50"]["metrics"]["evidence_recall"] == 0.855108877721943
+    assert runs["reflection_v8"]["runner_version"] == "locomo_production_api_v6"
+    assert runs["refinement_v9_uniform_l20"]["runner_version"] == "locomo_production_api_v7"
+    assert runs["refinement_v9_uniform_l50"]["runner_version"] == "locomo_production_api_v7"
     assert all(
         sum(category["question_count"] for category in run["metrics"]["categories"])
         == manifest["scope"]["question_count"]

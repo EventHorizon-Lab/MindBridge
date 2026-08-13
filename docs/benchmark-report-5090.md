@@ -3,11 +3,20 @@
 > 运行日期：2026-08-13
 >
 > 运行编号：完整基线 LoCoMo `5090-clean-006`、多模态 `5090-clean-007`；当前代码诊断
-> `locomo-reflection-v8-clean-008`
+> `locomo-reflection-v8-clean-008`、当前固定切片 `refinement-v9-uniform-l20/l50`
 >
 > 验证边界：一台 RTX 5090 同时模拟机器人端与云端；本轮验证功能、质量和数据闭环，延迟、功耗、温度与 Jetson TensorRT 性能暂不作为验收门禁。
 >
 > 可复现清单：[`benchmark-5090-clean-007.json`](../benchmarks/manifests/benchmark-5090-clean-007.json)
+>
+> 后续实现说明：本报告的榜单数字和第 5 节身份重放属于当时固定 manifest，保持不改写。当前代码已
+> 删除 NeMo/独立声纹二次推理，收敛到 FunASR 在线 ASR + Event-close 统一
+> VAD/ASR/punctuation/diarization/centroid 路径，并加入 Event 级精确 EvidenceSpan 和最多两轮通用
+> retrieval refinement。下面的完整 split 旧分数不能当作新代码成绩；当前代码只重跑了 LoCoMo
+> `conv-26` 的 419 条记忆/199 题固定回归，四套完整 split 尚未重跑，因此仍不得声明
+> 全面 SOTA。当前架构和最新 5090 功能证据见
+> [`technical-architecture.md`](technical-architecture.md) 与
+> [`edge-identity-sota.md`](edge-identity-sota.md)。
 
 ## 1. 结论
 
@@ -72,13 +81,22 @@ MindBridge 的 MaaS 主链路已经能够真实运行：端侧原始视频进入
 115 个非对抗 abstention 在 Judge 下全部错误；完整 evidence 命中的 Judge accuracy 为 `92.55%`，部分命中 `67.53%`，未命中 `35.05%`。446 个 adversarial 问题的严格拒答分数为 `80.94%`，其中 361 题明确拒答。两组结果共同支持先优化查询计划和 associative cue，并把“缺证据”与“证据存在但答案不完整”分开校准，而不是盲目增加上下文。
 
 在不读取答案或 evidence label、不增加 Benchmark 分支的前提下，当前生产 Recall 允许回答器返回最多
-两个“缺什么证据”的短查询，并发检索后只在可见 Top-K 改变时重答一次。以同一 LoCoMo conversation
+两个“缺什么证据”的短查询，每轮并发检索后只在可见 Top-K 改变时重答，最多追加两轮。以同一 LoCoMo conversation
 26 的 199 题作组合前后诊断，旧基线到 `reflection-v8-clean-008` 的 non-adversarial token-F1 从
 `54.26%` 升至 `60.02%`（`+5.76 pp`），全题从 `60.04%` 升至 `64.94%`（`+4.90 pp`），
 adversarial 从 `78.72%` 升至 `80.85%`（`+2.13 pp`），evidence coverage 从 `77.22%` 升至
 `77.72%`（`+0.50 pp`）。这次对比同时改变了 Answer Prompt v4→v8、Recall 反思与对应代码，
 因此只能作为整组改动的回归证据，不能把增益单独归因给反思。它不是选择最好样本后的全量成绩，
 也不替代 10 conversations、三次重复，以及固定 v8 Prompt 后只开关反思的单变量消融。
+
+当前 `v9` 已删除旧 runner 对 `would/likely/might` 题面使用 Top-50、其他题使用 Top-20 的特判。
+同一固定切片的真实生产 API 回归中，统一 Top-20 得到全题 F1 `63.76%`、non-adversarial F1
+`58.47%`、Evidence recall `76.38%`；统一 Top-50 得到 `65.32% / 61.17% / 85.51%`。后者相对
+统一 Top-20 分别提高 `1.56 / 2.70 / 9.13 pp`，但 adversarial F1 从 `80.85%` 降至 `78.72%`，
+结果体积也由约 173 KB 增至 288 KB。结论是云端长程文本可显式采用 Top-50 quality 配置，不能把
+它静默套到原生多媒体/边端；更大的上下文也不是后续检索精度优化的替代品。运行身份、五类指标和
+预测 SHA-256 记录在
+[`locomo-conv-26-optimization.json`](../benchmarks/manifests/locomo-conv-26-optimization.json)。
 
 ### 3.2 EgoLifeQA：需要把跨日层级与身份真正接入召回
 
@@ -173,7 +191,7 @@ memory 会进入 `cold`，命中后可以回热；不可逆删除仍要求显式
 防止离线设备复活数据。两条路径本轮都已验证。若产品目标改为自动硬删除，还需要用户同意、保留期
 和误删恢复策略，当前不能把它写成已完成能力。
 
-## 5. 端侧身份实测
+## 5. 端侧身份实测（历史 pre-convergence run）
 
 本轮不再只使用合成 embedding：
 
@@ -187,7 +205,7 @@ memory 会进入 `cold`，命中后可以回热；不可逆删除仍要求显式
   OpenAI SDK 请求中联合检查口型、语音起止和行为；真实重放对两个 Sortformer 设备域语音区间均产生
   ASD 证据，置信度为 `0.6898/0.7270`。提供商对“视频 + 第二个独立 `input_audio`”拒绝 400，
   内嵌音轨路径曾在同一片段返回 5 个时间化语音段、再次调用也曾返回空结果，因此云端 Omni diarization
-  只保留为可选复核，确定性的本地 FunASR + Sortformer 仍是生产主路径。
+  在该固定 run 中只保留为可选复核；其 FunASR + Sortformer 主路径已被后续统一 FunASR 实现替换。
 
 当前代码的两次单入口完整重放耗时 `35.948s/41.199s`：143 个 face interval 聚为 2 个 face ID；16 个
 diarization turn 与 FunASR 融合后得到 18 个 voice interval，其中 2 个无法无歧义归入 speaker turn

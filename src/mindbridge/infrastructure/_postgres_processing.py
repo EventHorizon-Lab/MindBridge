@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from typing import cast
-
 from psycopg.errors import ForeignKeyViolation
 
 from mindbridge.application.observation_processing import ObservationProcessingOutput
@@ -21,6 +19,10 @@ from mindbridge.infrastructure._postgres_derived_records import (
     write_event,
 )
 from mindbridge.infrastructure._postgres_embeddings import write_embedding_on_connection
+from mindbridge.infrastructure._postgres_evidence import (
+    read_observation_evidence,
+    write_evidence_spans,
+)
 from mindbridge.infrastructure._postgres_forget import ensure_target_not_tombstoned
 from mindbridge.infrastructure._postgres_graph import (
     write_claims,
@@ -29,6 +31,7 @@ from mindbridge.infrastructure._postgres_graph import (
     write_relations,
 )
 from mindbridge.infrastructure._postgres_jobs import (
+    lock_observation_processing_attempt,
     mark_observation_processing_succeeded_on_connection,
 )
 from mindbridge.infrastructure._postgres_memories import write_memory_on_connection
@@ -52,6 +55,13 @@ async def commit_observation_processing(
     _require_output_identity(tenant_id, observation_id, output)
     try:
         async with tenant_connection(pool, tenant_id) as connection:
+            await lock_observation_processing_attempt(
+                connection,
+                tenant_id,
+                observation_id,
+                job_id,
+                attempt=attempt,
+            )
             await ensure_target_not_tombstoned(
                 connection,
                 tenant_id,
@@ -59,6 +69,7 @@ async def commit_observation_processing(
                 observation_id,
             )
             await _require_source_evidence(connection, tenant_id, observation_id, output)
+            await write_evidence_spans(connection, output.evidence_spans)
             for event in output.events:
                 await write_event(connection, event)
             await write_entities(connection, output.entities)
@@ -98,6 +109,7 @@ def _require_output_identity(
     if any(
         item.tenant_id != tenant_id
         for items in (
+            output.evidence_spans,
             output.entities,
             output.entity_mentions,
             output.claims,
@@ -118,6 +130,8 @@ def _require_output_identity(
         for embedding in output.embeddings
     ):
         raise DomainInvariantError("derived embedding references an unknown graph record")
+    if any(span.observation_id != observation_id for span in output.evidence_spans):
+        raise DomainInvariantError("derived evidence must reference its source observation")
 
 
 async def _require_source_evidence(
@@ -126,17 +140,30 @@ async def _require_source_evidence(
     observation_id: ObservationId,
     output: ObservationProcessingOutput,
 ) -> None:
-    cursor = await connection.execute(
-        """
-        SELECT evidence_id FROM evidence_spans
-        WHERE tenant_id = %s AND observation_id = %s
-        """,
-        (tenant_id, observation_id),
-    )
-    source_evidence_ids = {cast(tuple[str], row)[0] async for row in cursor}
+    source_evidence = await read_observation_evidence(connection, tenant_id, observation_id)
+    source_evidence_ids = {str(span.evidence_id) for span in source_evidence}
+    derived_evidence_ids = {str(span.evidence_id) for span in output.evidence_spans}
+    if source_evidence_ids & derived_evidence_ids:
+        raise DomainInvariantError("derived evidence IDs must not replace source evidence")
+    if any(
+        not any(
+            span.media_object_id == source.media_object_id
+            and source.start_ms <= span.start_ms <= span.end_ms <= source.end_ms
+            and span.region == source.region
+            and span.audio_track == source.audio_track
+            and (
+                span.frame_start is None
+                or (span.frame_start == source.frame_start and span.frame_end == source.frame_end)
+            )
+            for source in source_evidence
+        )
+        for span in output.evidence_spans
+    ):
+        raise DomainInvariantError("derived evidence must remain inside source evidence")
     referenced_evidence_ids = (
         {str(evidence_id) for event in output.events for evidence_id in event.evidence_ids}
         | {str(evidence_id) for claim in output.claims for evidence_id in claim.evidence_ids}
+        | {str(evidence_id) for memory in output.memories for evidence_id in memory.evidence_ids}
         | {
             embedding.object_id
             for embedding in output.embeddings
@@ -144,5 +171,5 @@ async def _require_source_evidence(
         }
         | {str(mention.evidence_id) for mention in output.entity_mentions}
     )
-    if not referenced_evidence_ids <= source_evidence_ids:
+    if not referenced_evidence_ids <= source_evidence_ids | derived_evidence_ids:
         raise DomainInvariantError("derived records reference evidence outside the observation")

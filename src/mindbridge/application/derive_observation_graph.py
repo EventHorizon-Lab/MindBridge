@@ -5,7 +5,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
-from mindbridge.application.perception import EventPerception, PerceivedClaim, PerceivedEntity
+from mindbridge.application.perception import (
+    EventPerception,
+    PerceivedClaim,
+    PerceivedEntity,
+    time_ranges_overlap,
+)
 from mindbridge.application.ports import TextDocumentEmbedder
 from mindbridge.application.recall import RETRIEVAL_DOCUMENT_EMBEDDING_TASK
 from mindbridge.core import (
@@ -346,14 +351,14 @@ def _identity_graph(
         )
         event_end_ms = round((event.ended_at - observation.occurred_at).total_seconds() * 1_000)
         for identity in observation.identity_observations:
-            if not _time_ranges_overlap(
+            if not time_ranges_overlap(
                 identity.start_ms, identity.end_ms, event_start_ms, event_end_ms
             ):
                 continue
             matching_evidence_ids = tuple(
                 evidence_id
                 for evidence_id in event.evidence_ids
-                if _time_ranges_overlap(
+                if time_ranges_overlap(
                     identity.start_ms,
                     identity.end_ms,
                     evidence_by_id[evidence_id].start_ms,
@@ -394,12 +399,3 @@ def _identity_graph(
                     )
                 )
     return tuple(entities.values()), tuple(mentions)
-
-
-def _time_ranges_overlap(
-    left_start_ms: int,
-    left_end_ms: int,
-    right_start_ms: int,
-    right_end_ms: int,
-) -> bool:
-    return left_end_ms >= right_start_ms and right_end_ms >= left_start_ms

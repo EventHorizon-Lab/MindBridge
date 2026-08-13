@@ -1,7 +1,7 @@
 # MindBridge 技术实现架构
 
 > 状态：RTX 5090 实测基线（Phase 3 效果优化中）
-> 版本：0.6
+> 版本：0.7
 > 更新日期：2026-08-13
 
 ## 1. 文档目的
@@ -260,6 +260,20 @@ sequenceDiagram
     M-->>E: sync watermark and optional recent-memory delta
 ```
 
+采集热路径现在接受两种不落盘的原生输入：GStreamer/OpenCV appsink 的 BGR frame 直接进入
+`InsightFaceVideoEncoder.encode_frame()`，任意边界的 16 kHz mono PCM16 bytes 直接进入
+`FunASRStreamingTranscriber.push_pcm16()`。在线 Paraformer 复用官方 cache，以 600ms 模型窗口消费
+PCM，并用异步锁提供背压；frame 与音频 offset 均以当前 Observation 起点的毫秒时间对齐。这里不再
+把“模型支持 streaming”偷换成“读取已关闭 MP4”：实际 5090 测试以 60 次 100ms push 完成 6 秒
+音频，模型推理耗时 0.369 秒、峰值 CUDA allocation 872 MiB。
+
+在线 transcript 是低延迟、可丢弃的 provisional view，不直接写成长期身份或最终 Event。现有
+GStreamer/DeepStream 仍负责零拷贝采集、AEC、编码和有界 rolling fragment；VAD/场景/任务 gate
+关闭一个可解码 fragment 后，统一 FunASR 质量路径再一次完成 VAD、离线 ASR、标点、diarization
+与 speaker centroid，随后才进入加密身份和 durable Observation。这样原始流不会等待云端或模型，
+而最终记忆仍有可重放媒体。断流时 cache 和 partial result 必须一起丢弃，禁止把不完整 utterance
+伪装成已确认事实。
+
 媒体未声明 `duration_ms` 时，首个 EvidenceSpan 使用 Observation 的完整时间区间；显式的媒体
 时长仍作为更精确的证据终点，但不得超过 Observation 时间窗，避免可选元数据把整段经历退化为
 零长度证据或把未来媒体带入当前 Observation。
@@ -274,7 +288,9 @@ sequenceDiagram
 4. Omni 模型判断语义边界并将相邻片段合并为 Event/Episode；
 5. 原始时间范围保持不变，后续可以重新切分而不重新采集。
 
-M3-Agent 的 30 秒切片可作为首个 Benchmark 基线，但最终边界由真实 Jetson 负载和多模态检索效果校准。
+M3-Agent 的 30 秒切片只保留为其 Benchmark 协议；TaskMem 的 10 秒输入块和约 50 秒滚动上下文
+提供更适合连续流的初始候选。两者都不能成为产品常量，最终边界由真实 Jetson 负载、事件完整率和
+多模态检索效果校准。
 
 ### 5.3 多模态理解
 
@@ -290,18 +306,25 @@ M3-Agent 的 30 秒切片可作为首个 Benchmark 基线，但最终边界由�
 ASR、OCR 和 caption 是可检索视图，不是原始经历的替代品。遇到召回问题时，系统应回看媒体，而不是仅让文本 LLM 阅读 caption。
 
 当前在线构建路径在一次冻结 Omni 调用中同时提取 Event、Entity 和 Claim；EntityMention 与
-Claim 必须引用 Event 内的 EvidenceSpan，Claim 的有效时间必须落在 Event 内。Worker 随后用
-Jina Omni Small 编码原始 EvidenceSpan，用同一兼容空间的 Jina Text Small 批量编码 Event 描述
+Claim 必须引用 Event 内的 EvidenceSpan，Claim 的有效时间必须落在 Event 内。模型首先引用输入
+source span；应用层随后按 Event 与 source 的时间交集生成稳定、精确的 Event EvidenceSpan，并在
+同一对象图中重写 Event、EntityMention、Claim 与 Memory 引用。完整性校验要求所有派生引用恰好
+等于本批 Event spans，事务会先写这些 spans 再写图，任何越界或冲突都整批回滚。原始媒体只编码
+一次；原始 AV 向量命中时，PostgreSQL 将其映射到同 Observation、同媒体且位于该 source span 内
+的 Event spans，避免复制一个全片向量来冒充多个“精确向量”。Worker 随后用
+Jina Omni Small 编码原始 source EvidenceSpan，用同一兼容空间的 Jina Text Small 批量编码 Event 描述
 和 Claim 陈述，并在一个 PostgreSQL 事务中写入 Event、Entity、EntityMention、Claim、
 MemoryRecord、类型关系、向量和成功 Job 状态。任何模型输出越界、关系悬空、版本冲突或向量错误
 都会回滚整批派生数据。VLM 与后续 Jina 阶段分别获取新的短期签名 URL，禁止跨越长模型调用复用
 可能过期的地址；重试使用稳定 ID 且不会合并不同的证据集合。跨 Event 实体消歧、Episode
 合并和多次经历归纳属于后续 Consolidation，不在在线写入路径中凭名称猜测。
 
-当前 `perceive_events_v8` 直接吸收 M3-Agent/TaskMem 已验证有效的原子事件、稳定人物 ID、外观变化、
+当前 `perceive_events_v9` 直接吸收 M3-Agent/TaskMem 已验证有效的原子事件、稳定人物 ID、外观变化、
 对话、关系和因果线索要求，但没有照搬其可直接输出 `Equivalence` 的做法：身份关联仍由端侧可撤销
 证据门禁负责。Prompt 还要求推断的意图/关系写出可见或可闻依据并降低 confidence，片段边界不得把
-未完成动作写成完成事实。这个 Prompt 服务所有 Observation，不读取 Benchmark 类型或答案。
+未完成动作写成完成事实。它还要求先独立盘点视觉变化、语音/环境声、OCR 和身份轨迹，再做跨模态
+对齐；Event 使用能支撑该次 occurrence 的最窄可信区间，不默认整片。这个 Prompt 服务所有
+Observation，不读取 Benchmark 类型或答案。
 
 ### 5.4 幂等和可恢复性
 
@@ -342,8 +365,9 @@ MindBridge 采用“明确默认、保存版本、允许重建”的策略。模
 | 文本派生表示 | `jina-embeddings-v5-text-small-retrieval`，与 Omni Small 对齐 | 云端 |
 | 端侧跨模态近期召回 | `jina-embeddings-v5-omni-nano-retrieval` | 强 Jetson/机器人主机，可选 |
 | 人脸检测、跟踪与表征 | SCRFD-2.5GF-KPS + ArcFace R50；YuNet + SFace 为轻量生态对照 | 端侧 |
-| 在线说话人分离 | Streaming Sortformer 4spk v2.1；超过四人或资源不满足时使用 3D-Speaker 级联管线 | 端侧 |
-| 声纹表征 | 3D-Speaker ERes2NetV2；资源受限时 CAM++ | 端侧 |
+| 流式 ASR | FunASR causal Paraformer，官方 cache 与 600ms 模型窗口 | 端侧 |
+| VAD、质量 ASR、标点、diarization | 一个 FunASR `AutoModel` 组合官方 VAD、ASR、punc、speaker model | 端侧 |
+| 声纹表征 | 上述 FunASR 调用直接返回 ERes2NetV2 speaker centroid；资源受限时再 bake-off CAM++ | 端侧 |
 | 活跃说话人与 face↔voice | LR-ASD + 多 Observation 可撤销证据；GateFusion 为质量挑战者 | 端侧 |
 | 最终回答和证据核验 | 能直接读取候选图像、视频和音频的冻结 Omni/VLM | 云端 |
 
@@ -410,9 +434,9 @@ API 因此不加载 Jina 权重，模型只存在于 Worker 或独立 serving �
 
 | 设备档位 | 默认行为 |
 | --- | --- |
-| Orin Nano | SCRFD-500MF 或 YuNet/SFace、CAM++、批处理 diarization、低频 LR-ASD；通用 Omni Embedding 交给云端 |
-| Orin NX | SCRFD-2.5GF + ArcFace、ERes2NetV2；实测通过后启用低延迟 Sortformer 与 LR-ASD FP16 |
-| AGX Orin | SCRFD-10GF、ERes2NetV2、在线 Sortformer 和 LR-ASD；有余量时运行 Jina Omni Nano 与质量挑战者 |
+| Orin Nano | SCRFD-500MF 或 YuNet/SFace；FunASR/llama.cpp acoustic path 进入同条件 bake-off；通用 Omni Embedding 交给云端 |
+| Orin NX | SCRFD-2.5GF + ArcFace；FunASR 在线 Paraformer + Event-close 统一 speech pipeline；LR-ASD 通过实测后启用 |
+| AGX Orin | SCRFD-10GF；FunASR CUDA 质量路径与在线路径；有余量时运行 LR-ASD、Jina Omni Nano 与质量挑战者 |
 | 带独立 GPU 的机器人主机 | 可运行完整本地近期召回和部分 Omni 理解；云端仍负责全局长期记忆 |
 
 是否启用任一模型由完整管线的吞吐、显存、功耗、温度和主任务余量决定，不按“能够加载模型”
@@ -440,36 +464,33 @@ SKU、JetPack、TensorRT、精度和 shape profile 构建及缓存，不能跨�
 ### 6.6 端侧匿名身份实现
 
 端侧不自研人脸、diarization、声纹或 ASD 网络。人脸质量路径使用
-SCRFD-2.5GF-KPS + ArcFace R50；YuNet + SFace 作为有官方 ONNX 工件的轻量对照。
-声纹使用 3D-Speaker ERes2NetV2
-`iic/speech_eres2netv2_sv_zh-cn_16k-common` revision `v1.0.1`，CAM++ 为资源降级点。
-在线 diarization 首选 NVIDIA Streaming Sortformer 4spk v2.1，超过四人或不满足资源预算时切换
-3D-Speaker 级联管线。LR-ASD 只生成活跃说话人证据，不能直接合并身份。MindBridge 复用官方
-推理实现和工件，不复制第三方网络，也不微调权重。
+SCRFD-2.5GF-KPS + ArcFace R50；YuNet + SFace 作为有官方 ONNX 工件的轻量对照。语音默认路径已
+从 NeMo + FunASR + 单独 ERes2NetV2 三段编排收敛为一个 FunASR `AutoModel`：SeACo-Paraformer
+ASR、FSMN-VAD、CT-Transformer punctuation 和 ERes2NetV2 speaker model 在一次 `generate()` 中
+返回带毫秒边界、标点、speaker label 的 `sentence_info`，并通过 `return_spk_center` 返回每个
+speaker 的 192 维 centroid。MindBridge 删除了自维护的 NeMo turn 融合、波形二次解码和声纹模型
+二次推理；模型网络、聚类和预处理全部复用上游。
 
-当前可执行适配器与目标 bake-off 必须分开表述：现有代码直接加载 InsightFace `buffalo_l`
-SCRFD/ArcFace ONNX、FunASR ASR+VAD、ModelScope 官方 ERes2NetV2，以及可选的 NeMo Streaming
-Sortformer；`recognize_identities_in_av_segment()` 将同步 video/audio sidecar 串成一个可等待的
-端侧入口。`auto` 在 CUDA 可用时选择 GPU，
-并核对模型实际 device/provider，显式要求 GPU 却
-静默回落会立即失败。CPU 只承担 SQLite、哈希、FFmpeg、调度和无加速器时的降级推理。质量合格的
-声纹区间才写入设备域模板；短于 1 秒、低置信或重叠说话区间仍保留时间与 transcript，但标为
-`scope=observation`，不得污染长期身份。FunASR 时间戳与 Sortformer turn 只在 overlap 和 margin
-都无歧义时融合；turn 置信度取该 speaker 原始帧概率均值，而不是给所有区间写同一常数，重叠区间
-再封顶为 `0.5`；中文 token 反分词后再进入记忆。活跃说话人检查复用 TaskMem 的可视锚点思路，
+`recognize_identities_in_av_segment()` 将同步 video/audio sidecar 串成一个可等待入口；
+`auto` 在 CUDA 可用时选择 GPU，并核对模型实际 device/provider，显式要求 GPU 却静默回落会立即
+失败。CPU 只承担 SQLite、哈希、FFmpeg、调度和无加速器时的降级推理。质量合格且累计语音不少于
+1 秒的 centroid 才写入设备域模板；短、低置信或不同 speaker 重叠的区间仍保留精确时间与
+transcript，但标为 `scope=observation`，不得污染长期身份。FunASR 不提供可校准的逐 turn
+diarization probability，因此当前 confidence 是必须由真实麦克风集校准的部署门槛，不能解释成
+模型概率。活跃说话人检查复用 TaskMem 的可视锚点思路，
 由 FFmpeg 在发送给 VLM 的临时视频上绘制 `F0/F1/...` face box 并保留 16kHz mono 音轨，使模型在
 一个原生 AV 请求中联合检查口型、声音起止和可见行为；所有 VLM 请求仍只通过异步
 OpenAI SDK；模型输出仅形成可撤销关联证据，不直接合并模板。LR-ASD/DeepStream/TensorRT 仍是
 目标 Jetson 的下一轮质量/效率候选，不能写成已经上线的实现。
 
-ASR 与 diarization 无法无歧义融合的区间不会被丢弃，而是以 observation scope 保留 transcript；
+ASR 或 diarization 无法无歧义归属的区间不会被丢弃，而是以 observation scope 保留 transcript；
 ASD 关联使用配置的模型 deployment revision 作为稳定证据键，不使用可能随请求变化的 provider
 fingerprint。后续片段没有新增 ASD 命中时，仍会用同一 revision 复核历史累计证据。
 
-Sortformer 权重和内部状态支持流式，但当前 MindBridge 适配器对 capture 已关闭的有界 segment 调用
-官方 `diarize()`；它不是持续 microphone chunk API。真正在线的 `forward_streaming_step` 与 speaker
-cache 必须复用 NeMo runtime，并在断流、回压、状态重置和 Jetson 资源测试完成后再进入采集热路径。
-入口会在当前空闲 CUDA 显存不少于 8 GiB 时并发人脸、ASR 和 diarization；不足时串行复用 GPU，
+FunASR causal Paraformer 已接入持续 PCM chunk，并复用上游 cache；speaker label、标点和长期
+voiceprint 仍只在 Event/window 关闭后由统一质量路径确认，因为当前 upstream realtime diarization
+会在窗口增长时重新聚类，标签尚不稳定。入口会在当前空闲 CUDA 显存不少于 8 GiB 时并发人脸和
+统一 speech pipeline；不足时串行复用 GPU，
 CPU 降级也保持串行，避免模型线程争抢。该门槛是 5090 软件验证默认值，不是 Jetson 标定结果；
 调用方可以用 `parallel_model_inference` 按机器人主任务的显存预算显式覆盖。
 
@@ -557,12 +578,16 @@ PostgreSQL FTS、结构化过滤、RRF 和原始视听证据重看。Event/Claim
 每个 Omni 回答或枚举波次使用当时新签的查询媒体 URL；模型完成后再为响应 Evidence 签名，Agent
 收到的链接不能因为模型推理耗时而已经过期。
 
-当前回答模型还可在证据不足或有实质歧义时返回最多两个独立 `retrieval_queries`。应用层并发执行
-补充查询，与原始候选做 RRF；只有返回给 Agent 的 Top-K 确实改变时才携带新证据再回答一次，显式 `memory_ids`
+当前回答模型还可在证据不足或有实质歧义时返回最多两个独立 `retrieval_queries`。应用层每轮并发
+执行补充查询，与此前全部候选做 RRF；最多两轮 refinement（因此最多三次证据回答），只有返回给
+Agent 的 Top-K 确实改变时才携带新证据再回答，显式 `memory_ids`
 追问不越过调用方范围。补充查询不会写入事实、不会读取 Benchmark 标签，也不能用另一个人物或
 实体的相关证据修正问题前提；其数量进入 trace，最终答案仍必须由 MemoryRecord/EvidenceSpan
 支撑。结构化输出允许“临时答案 + 补充查询”，用于保留已有部分证据，但最终回答 Prompt 要求
-最短、类型正确且拒绝错误实体前提。该有限反思替代无限 Agent loop，保持调用成本和尾延迟有界。
+最短、类型正确且拒绝错误实体前提。M3-Agent 的公开配置是每步取 2 个片段、最多 5 个 retrieval
+step；Qwen Video Memory 常见路径是一次定位后再下钻 1--2 次。MindBridge 采用后者的产品预算，
+不会照搬 M3 最后一轮“必须合理猜测”的 Benchmark 策略：耗尽预算仍无证据就拒答。该有限反思
+替代无限 Agent loop，保持调用成本和尾延迟有界。
 
 Memory 向量命中上层 Summary 时走独立的树形下钻查询：PostgreSQL 沿 MemoryRecord
 `contains` 边递归返回父节点和来源子节点，深度上限为 16，并对每个结果重新应用完整结构化过滤。
@@ -1145,10 +1170,13 @@ API 和 Worker 可以使用同一个 Python package、两个进程部署。只�
 基础安装只包含 Core 领域类型、Pydantic 契约和 Python SDK。Jetson/机器人主机安装 `edge`
 extra；API、MCP 与云端任务安装 `server` extra；只有本地加载 Jina Omni 的 GPU Worker 再叠加
 `cloud-models`。端侧安装不得因 SQLite 身份或同步能力被迫携带 Celery、MCP、PostgreSQL、
-FastAPI 等服务端栈，子包导入隔离由独立进程测试守护。`edge` 只额外携带 OpenAI SDK 和
-SoundFile 这两个跨平台运行依赖；前者保证可选 VLM 复核不自写 HTTP，后者负责官方声纹适配器的
-波形输入。InsightFace/ONNX Runtime、FunASR/ModelScope 和 NeMo 必须使用与 JetPack/CUDA 匹配的
-设备镜像工件，不能由通用 lockfile 覆盖 NVIDIA 运行时。
+FastAPI 等服务端栈，子包导入隔离由独立进程测试守护。`edge` 的 Python 依赖只覆盖同步、安全、
+OpenAI SDK 和可观测性；不再为声纹二次解码携带 SoundFile，也不携带 NeMo。InsightFace/ONNX
+Runtime、FunASR/ModelScope 与设备版 Torch 必须使用与 JetPack/CUDA 匹配的设备镜像工件，不能由
+通用 lockfile 覆盖 NVIDIA 运行时。FunASR 自身仍是模型栈而非“轻依赖”，减重来自只维护一套上游
+speech runtime、且不把它拖入 Core/SDK/server。llama.cpp 的 FunASR/GGUF 支持适合作为未来
+ASR/VAD 多端运行时候选，但当前没有证据证明它完整覆盖 punctuation、diarization 和 voiceprint，
+因此不能作为这一统一身份管线的透明替换。
 
 Worker 通过 `mindbridge.celery_app:app` 启动，Redis 消息只传
 `tenant_id`、`observation_id`、`job_id`。原始媒体、Evidence 和任务状态均以 PostgreSQL/S3
@@ -1237,9 +1265,8 @@ LoCoMo 1,986 题、M3 两个 split 共 4,490 题、EgoLifeQA 500 题和 SuperMem
 
 LoCoMo runner 将原始对话逐 turn 通过 `remember` 写入，并且不向生产接口传入参考答案、证据
 标签或 category。Recall query 只包含原始问题，作答格式由统一的 Omni Answerer 契约负责，避免指令文本
-污染 query embedding。默认 recall limit 为 20；问题文本显式包含 `would`、`likely` 或 `might` 时提升到
-50，以补足推断所需的多条经历，该决策不读取 category 或 evidence 标签。两个 limit 都进入
-runner version/manifest；输出使用官方 evaluator 识别的
+污染 query embedding。所有题使用调用方显式给出的同一个 recall limit；生产代码不检查题目措辞、
+类别或答案形式来改变候选预算。参数进入 runner version/manifest；输出使用官方 evaluator 识别的
 `mindbridge_prediction` 与 `mindbridge_prediction_context`，因此答案 F1 和检索 recall 均走官方
 计算路径。
 
@@ -1249,6 +1276,15 @@ non-adversarial F1 从 `0.5426` 变为
 `0.6002`，Evidence recall 从 `0.7722` 提升到 `0.7772`。该单会话结果只作为组合优化和回归证据，不作为全量 LoCoMo、
 单变量消融或 SOTA 声明；数据、Evaluator、运行配置、输出 hash 和五类指标保存在
 [`locomo-conv-26-optimization.json`](../benchmarks/manifests/locomo-conv-26-optimization.json)。
+
+当前 `v9` 删除了旧 runner 对 `would/likely/might` 问题单独扩大候选数的题面特判，并将同一套
+最多两轮 retrieval refinement 应用于所有产品查询。真实重跑表明，统一 Top-20 时全题 F1 为
+`0.6376`、non-adversarial F1 为 `0.5847`、Evidence recall 为 `0.7638`；统一 Top-50 时分别为
+`0.6532 / 0.6117 / 0.8551`。这说明较大的候选预算确实提高长程文本记忆覆盖，但也使该切片的
+结果文件从约 173 KB 增至 288 KB，并增加模型上下文和运行时间。因而 Top-50 只作为云端长程
+文本的 quality 配置证据，调用方仍须显式选择；原生多媒体或边端请求不被静默扩容。两次运行使用
+完全相同的 419 条记忆、199 个问题、Prompt、模型和并发，仅 `recall_limit` 不同，完整指标与输出
+SHA-256 同样保存在上述 manifest 中。
 
 M3-Bench 的生产 runner 沿用官方 30 秒、零起点连续切片约定。媒体由 FFmpeg 和标准 S3
 工具在运行前准备，MindBridge 只读取包含 URI、SHA-256、时长和绝对时间原点的强类型 manifest。
@@ -1411,17 +1447,18 @@ Robot/Web 非官方 Qwen Judge `30.02%/58.18%`。M3 Web 混合了 908 个 v6 与
 包含选择性重跑，因而只是诊断值。逐运行 revision、输入表示、模型、结果 hash 和生命周期工件
 固定在 [`benchmark-5090-clean-007.json`](../benchmarks/manifests/benchmark-5090-clean-007.json)。
 当前生产 Recall 的单 conversation 组合回归中，LoCoMo non-adversarial token-F1 从 `54.26%`
-变为 `60.02%`；由于 Prompt 与反思代码同时变化，该差值不能作为反思的单变量收益。真实 30 秒 AV
-身份编排则在 CUDA 上贯通 InsightFace 检测结果、FunASR、
-Sortformer、ERes2NetV2、Omni ASD、加密 SQLite 和 cloud-safe handoff。两者都只作为当前代码
+变为 `60.02%`；由于 Prompt 与反思代码同时变化，该差值不能作为反思的单变量收益。新的真实音频
+验证在 RTX 5090 上用一次 FunASR 调用贯通 VAD、ASR、标点、diarization 与 ERes2NetV2 centroid：
+20 秒音频推理 1.283 秒、峰值 CUDA allocation 1.93 GiB；同一 centroid 跨两个 Observation 命中
+同一 AES-GCM 加密设备身份。另有 6 秒、60 次 100ms PCM push 的真实在线路径。两者都只作为当前代码
 增量证据；完整榜单和带真值身份 replay 仍按上述基线口径验收。
 
 | 阶段 | 当前状态 | 已落地证据 | 剩余验收 |
 | --- | --- | --- | --- |
 | Phase 0 | 完成 | 严格领域契约、锁定依赖、CI、Jina smoke、官方数据适配器、可追溯 LoCoMo 与 5090 全量评测 manifest | 无；后续运行继续沿用同一 manifest 门禁 |
-| Phase 1 | 软件垂直路径完成 | 原生采集 handoff、加密身份 prototype、SQLite Outbox/近期记忆、S3 同步、durable Job、Event/pgvector 与 REST API | 在目标 Jetson 上完成真实摄像头、VAD/场景/运动门控、断网和功耗验收 |
+| Phase 1 | 软件垂直路径完成 | 原生 BGR/PCM 流入口、采集 handoff、FunASR 统一语音、加密身份 prototype、SQLite Outbox/近期记忆、S3 同步、durable Job、Event 精确 EvidenceSpan/pgvector 与 REST API | 在目标 Jetson 上完成真实摄像头、VAD/场景/运动门控、断网和功耗验收 |
 | Phase 2 | 完成（公开发布表示） | Episode/Claim/Summary consolidation、RRF/图展开/媒体重看、反馈纠错、生命周期、显式删除，以及四套 Benchmark 完整公开题集的生产 API 分层结果 | 原始 AV 全量重放属于 Phase 3 严格 SOTA 复现，不再作为 Phase 2 软件门禁 |
-| Phase 3 | 进行中 | RLS 多租户、Bearer allowlist、Python SDK、MCP/OpenAPI、OpenTelemetry、端侧 CUDA 人脸/FunASR/Sortformer/ERes2NetV2 真实视频路径、保留原生音轨的可视锚点 Omni ASD、有限查询反思、完整公开题集差距分析和可撤销关联闭环 | 原始 AV/OCR/object 全量检索、跨任务经验记忆、官方 Judge 重跑、身份真值 replay、持续 microphone streaming、LR-ASD/TensorRT 与 Embedding bake-off、Jetson/Nano 实测、配额、持久审计和备份删除演练 |
+| Phase 3 | 进行中 | RLS 多租户、Bearer allowlist、Python SDK、MCP/OpenAPI、OpenTelemetry、端侧 CUDA 人脸/FunASR 统一 speech path、PCM streaming、保留原生音轨的可视锚点 Omni ASD、最多两轮通用查询 refinement、完整公开题集差距分析和可撤销关联闭环 | 原始 AV/OCR/object 全量 SOTA 重放、跨任务经验记忆、官方 Judge 重跑、身份真值 replay、LR-ASD/TensorRT 与 Embedding bake-off、Jetson/Nano 实测、配额、持久审计和备份删除演练 |
 
 “软件路径完成”不等于硬件或榜单验收完成。以下项目不能由单元测试替代：
 
@@ -1446,6 +1483,7 @@ Sortformer、ERes2NetV2、Omni ASD、加密 SQLite 和 cloud-safe handoff。两�
 | ADR-008 | Benchmark 走生产 API，不建旁路 | 迭代速度可能慢于特制脚本 | 不重审；这是 SOTA 可产品化的前提 |
 | ADR-009 | 可读性、简洁性、类型和测试作为合并门禁 | 首次实现需投入工具配置和评审成本 | 不重审；工程质量是产品能力的一部分 |
 | ADR-010 | face↔voice 只由可审计 ASD 证据跨 Observation 累积并可撤销解析 | 首次绑定更慢，低证据场景保持两个匿名 ID | 同条件实验证明替代方法在 false-link、撤销和部署成本上稳定更优 |
+| ADR-011 | 端侧语音默认收敛到 FunASR 在线 ASR + Event-close 统一质量管线，不保留 NeMo 并行栈 | 实时 partial 暂不提供稳定 speaker label | 带真值 replay 证明另一上游栈在同资源下显著降低 DER/false-link，且收益覆盖依赖和编排成本 |
 
 ## 18. 待实测后锁定的参数
 
@@ -1470,6 +1508,7 @@ Sortformer、ERes2NetV2、Omni ASD、加密 SQLite 和 cloud-safe handoff。两�
 - [Qwen-MM-Plugins API cookbook](https://github.com/QwenLM/Qwen-MM-Plugins/blob/main/cookbooks/api/usage.md)：Omni AV caption、ASR、说话人、时间定位和计数工具。原 `cookbooks/omni-av/usage.md` 内容现已并入该路径。
 - [Qwen-MM-Plugins Video Memory cookbook](https://github.com/QwenLM/Qwen-MM-Plugins/blob/main/cookbooks/video-memory/usage.md)：层级图记忆、Embedding、下钻检索、计数和时间查询。
 - [M3-Agent](https://github.com/bytedance-seed/m3-agent)：在线记忆构建、情景/语义记忆、实体中心多模态图以及 M3-Bench。
+- [TaskMem](https://github.com/ByteDance-Seed/TaskMem)：滚动视听上下文、人物一致性和任务驱动记忆研究；训练策略不进入 MindBridge 冻结模型路径。
 - [VideoRAG](https://github.com/HKUDS/VideoRAG)：图驱动索引、层级上下文、视听双通道和长视频检索。
 - [EgoLife / EgoRAG](https://github.com/EvolvingLMMs-Lab/EgoLife)：第一视角长期生活数据、身份、层级记忆和长上下文 QA。
 
@@ -1484,7 +1523,7 @@ Sortformer、ERes2NetV2、Omni ASD、加密 SQLite 和 cloud-safe handoff。两�
 
 - [MindBridge 端侧人物一致性感知模型选型](edge-identity-sota.md)
 - [InsightFace](https://github.com/deepinsight/insightface)
-- [NVIDIA Streaming Sortformer 4spk v2.1](https://huggingface.co/nvidia/diar_streaming_sortformer_4spk-v2.1)
+- [FunASR](https://github.com/modelscope/FunASR)
 - [3D-Speaker](https://github.com/modelscope/3D-Speaker)
 - [LR-ASD](https://github.com/Junhua-Liao/LR-ASD)
 

@@ -31,7 +31,7 @@ from mindbridge.models.openai_media import (
 from mindbridge.telemetry import set_current_span_attributes, trace_operation
 
 DEFAULT_OMNI_MODEL_ID = "qwen3.8-max"
-ANSWER_FROM_EVIDENCE_PROMPT_VERSION = "answer_from_evidence_v8"
+ANSWER_FROM_EVIDENCE_PROMPT_VERSION = "answer_from_evidence_v9"
 SELECT_OCCURRENCES_PROMPT_VERSION = "select_occurrences_v2"
 DEFAULT_VIDEO_FRAMES_PER_SECOND = 1.0
 DEFAULT_VIDEO_MAX_PIXELS = 200_704
@@ -40,7 +40,9 @@ _ANSWER_FROM_EVIDENCE_PROMPT = """# Role
 You answer questions from embodied memories by inspecting their original image, video, and audio.
 
 # Evidence rules
-- Inspect every supplied source. Timestamps are milliseconds from the start of each source.
+- Inspect every supplied source. Timestamps are milliseconds from the start of each source. An
+  EvidenceSpan interval is the authoritative support window: inspect that interval and its immediate
+  audiovisual context, but do not use unrelated content elsewhere in the source as support.
 - An "attested" summary is an exact caller statement and supports only an attributed report. Every
   other summary is a retrieval hint; verify it against the supplied evidence before using it.
 - Answer only from supplied evidence or attested statements. Missing evidence is not evidence of

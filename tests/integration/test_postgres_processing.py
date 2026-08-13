@@ -95,7 +95,7 @@ from mindbridge.core import (
 )
 from mindbridge.infrastructure.postgres import PostgresMemoryStore
 
-NOW = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
+NOW = datetime.now(timezone.utc).replace(microsecond=0)
 MODEL = ModelReference(model_id="qwen3.8-max", revision="serving-revision-01")
 EMBEDDING_MODEL = ModelReference(
     model_id="jinaai/jina-embeddings-v5-omni-small-retrieval",
@@ -402,18 +402,23 @@ async def test_processing_commits_provenance_once(
         ("mentions", 3),
         ("represented_by", 2),
     )
-    evidence_id = (
-        (await store.read_observation_batch(tenant_id, observation_id))
-        .evidence_spans[0]
-        .evidence_id
+    stored_evidence = (await store.read_observation_batch(tenant_id, observation_id)).evidence_spans
+    event_evidence = next(
+        span for span in stored_evidence if (span.start_ms, span.end_ms) == (500, 3_500)
     )
+    assert len(stored_evidence) == 2
     request = RecallRequest(
         tenant_id=tenant_id,
         query=RecallQuery(text="words absent from the memory summary"),
     )
     dense_candidates = await store.search_memories_by_evidence(
         request,
-        (evidence_id,),
+        (event_evidence.evidence_id,),
+        limit=20,
+    )
+    source_dense_candidates = await store.search_memories_by_evidence(
+        request,
+        (EvidenceId("evidence_01"),),
         limit=20,
     )
     graph_matches = await store.search_embeddings(
@@ -437,7 +442,7 @@ async def test_processing_commits_provenance_once(
             query=RecallQuery(text="irrelevant"),
             filters=RecallFilters(device_ids=("other_device",)),
         ),
-        (evidence_id,),
+        (event_evidence.evidence_id,),
         limit=20,
     )
     person_candidates = await store.search_memories_by_evidence(
@@ -446,11 +451,15 @@ async def test_processing_commits_provenance_once(
             query=RecallQuery(text="irrelevant"),
             filters=RecallFilters(person_ids=("person_robot_01",)),
         ),
-        (evidence_id,),
+        (event_evidence.evidence_id,),
         limit=20,
     )
 
     assert {memory.summary for memory in dense_candidates} == {
+        "A person places a red tool beside a blue toolbox.",
+        "The red tool is beside the blue toolbox.",
+    }
+    assert {memory.summary for memory in source_dense_candidates} == {
         "A person places a red tool beside a blue toolbox.",
         "The red tool is beside the blue toolbox.",
     }
@@ -1168,6 +1177,7 @@ async def test_superseded_attempt_cannot_commit(
         job_id,
         attempt=second.job.attempt,
         output=ObservationProcessingOutput(
+            evidence_spans=(),
             events=(),
             entities=(),
             entity_mentions=(),
@@ -1185,6 +1195,7 @@ async def test_superseded_attempt_cannot_commit(
             job_id,
             attempt=first.job.attempt,
             output=ObservationProcessingOutput(
+                evidence_spans=(),
                 events=(),
                 entities=(),
                 entity_mentions=(),

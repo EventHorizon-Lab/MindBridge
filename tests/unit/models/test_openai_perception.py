@@ -114,7 +114,7 @@ async def test_omni_perception_returns_grounded_event_and_provider_revision() ->
         EvidenceId("evidence_audio"),
     )
     assert result.model_reference.revision == "qwen-serving-revision-01"
-    assert result.prompt_version == "perceive_events_v8"
+    assert result.prompt_version == "perceive_events_v9"
     assert [entity.canonical_name for entity in result.events[0].entities] == [
         "red tool",
         "toolbox",

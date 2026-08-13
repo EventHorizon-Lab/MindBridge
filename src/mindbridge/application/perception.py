@@ -23,6 +23,18 @@ MAX_PERCEIVED_ENTITIES_PER_EVENT = 64
 MAX_PERCEIVED_CLAIMS_PER_EVENT = 64
 
 
+def time_ranges_overlap(
+    left_start_ms: int,
+    left_end_ms: int,
+    right_start_ms: int,
+    right_end_ms: int,
+) -> bool:
+    """Return whether intervals overlap, preserving instantaneous point evidence."""
+    if left_start_ms == left_end_ms or right_start_ms == right_end_ms:
+        return left_start_ms <= right_end_ms and right_start_ms <= left_end_ms
+    return left_start_ms < right_end_ms and right_start_ms < left_end_ms
+
+
 @dataclass(frozen=True, slots=True)
 class ResolvedEvidence:
     """An exact evidence span joined to openable source media."""

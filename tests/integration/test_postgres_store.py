@@ -605,6 +605,7 @@ async def test_observation_job_state_is_atomic_and_retryable(
         job_id,
         attempt=2,
         output=ObservationProcessingOutput(
+            evidence_spans=(),
             events=(),
             entities=(),
             entity_mentions=(),

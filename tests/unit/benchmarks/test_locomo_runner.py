@@ -109,7 +109,7 @@ async def test_locomo_rejects_unbounded_or_empty_request_pool() -> None:
         )
 
 
-async def test_locomo_deepens_recall_for_inference_words_without_using_category() -> None:
+async def test_locomo_uses_the_same_recall_budget_for_every_question_wording() -> None:
     api = RecordingMemoryApi()
     conversation = _conversation().model_copy(
         update={
@@ -132,7 +132,7 @@ async def test_locomo_deepens_recall_for_inference_words_without_using_category(
         recall_limit=20,
     )
 
-    assert api.recall_requests[0].limit == 50
+    assert api.recall_requests[0].limit == 20
 
 
 def _conversation() -> LoCoMoConversation:

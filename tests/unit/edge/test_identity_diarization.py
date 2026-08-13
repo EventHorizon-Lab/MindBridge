@@ -1,8 +1,10 @@
 """Contract check for OpenAI-SDK audiovisual speaker segmentation."""
 
+import asyncio
 import json
 import shutil
 import subprocess
+import threading
 from collections.abc import Callable, Coroutine
 from pathlib import Path
 from typing import cast
@@ -13,22 +15,22 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from openai import AsyncOpenAI
 
 from mindbridge.contracts import IdentityObservationInput
-from mindbridge.core import IdentityKind, IdentityScope, ModelReference
+from mindbridge.core import IdentityKind, IdentityScope, ModelOutputError, ModelReference
 from mindbridge.edge import identity_diarization
 from mindbridge.edge.identity import FaceVoiceAssociationEvidence, SQLiteIdentityMemory
 from mindbridge.edge.identity_diarization import (
-    FunASRSpeechTranscriber,
+    FunASRSpeechPipeline,
+    FunASRStreamingTranscriber,
     IdentityMatchingThresholds,
-    NemoSortformerSpeechDiarizer,
     OpenAIAVSpeechSegmenter,
     OpenAIVisualActiveSpeakerMatcher,
-    fuse_speech_segments,
+    SpeechAnalysis,
     recognize_identities_in_av_segment,
 )
 from mindbridge.edge.identity_inference import (
-    ERes2NetV2SpeakerEncoder,
     FaceEmbeddingSample,
     InsightFaceVideoEncoder,
+    SpeakerEmbeddingSample,
     SpeechSegment,
 )
 from mindbridge.models.openai_omni import normalize_openai_base_url
@@ -65,92 +67,138 @@ async def test_diarizer_sends_native_av_and_returns_bounded_turns(
     ] == [(100, 900, 0.8, "Hello.")]
 
 
-async def test_funasr_splits_timestamped_speech_without_blocking_the_edge_loop(
+async def test_funasr_returns_integrated_timed_speech_and_speaker_centroids(
     tmp_path: Path,
 ) -> None:
     class Pipeline:
-        def generate(self, **_kwargs: object) -> list[dict[str, object]]:
+        def generate(self, **kwargs: object) -> list[dict[str, object]]:
+            assert kwargs["return_spk_center"] is True
+            assert kwargs["return_spk_res"] is True
+            assert kwargs["sentence_timestamp"] is True
             return [
                 {
-                    "text": "你 好 hello world",
-                    "timestamp": [[0, 300], [300, 700], [1_300, 1_700], [1_700, 2_200]],
+                    "text": "你好。Hello world.",
+                    "sentence_info": [
+                        {"start": 0, "end": 700, "text": "你好。", "spk": 0},
+                        {"start": 1_300, "end": 2_200, "sentence": "Hello world.", "spk": 1},
+                    ],
+                    "spk_embedding_center": [[1.0, 0.0], [0.0, 1.0]],
                 }
             ]
 
     media = tmp_path / "clip.mp4"
     media.write_bytes(b"placeholder")
-    segments = await FunASRSpeechTranscriber(Pipeline(), device="cuda").segment_file(media)
+    analysis = await FunASRSpeechPipeline(Pipeline(), device="cuda").analyze_file(media)
 
-    assert [(item.start_ms, item.end_ms, item.transcript) for item in segments] == [
-        (0, 700, "你好"),
-        (1_300, 2_200, "hello world"),
+    assert [
+        (item.start_ms, item.end_ms, item.transcript, item.speaker_label)
+        for item in analysis.segments
+    ] == [
+        (0, 700, "你好。", "0"),
+        (1_300, 2_200, "Hello world.", "1"),
+    ]
+    assert [item.speaker_label for item in analysis.speaker_embeddings] == ["0", "1"]
+    assert [item.embedding for item in analysis.speaker_embeddings] == [
+        (1.0, 0.0),
+        (0.0, 1.0),
     ]
 
 
-async def test_sortformer_keeps_upstream_speaker_labels(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    class Probabilities:
-        def detach(self) -> object:
-            return self
+async def test_funasr_rejects_unrecoverably_untimed_speech(tmp_path: Path) -> None:
+    class Pipeline:
+        def generate(self, **_kwargs: object) -> list[dict[str, object]]:
+            return [{"text": "speech was detected", "sentence_info": []}]
 
-        def cpu(self) -> object:
-            return self
-
-        def tolist(self) -> list[list[list[float]]]:
-            return [[[0.9, 0.4]] * 20]
-
-    class Model:
-        def diarize(self, **_kwargs: object) -> tuple[list[list[str]], list[Probabilities]]:
-            return (
-                [["0.100 0.900 speaker_0", "1.200 2.000 speaker_1"]],
-                [Probabilities()],
-            )
-
-    monkeypatch.setattr(identity_diarization, "_extract_audio_wav", lambda _path: b"wav")
-    media = tmp_path / "clip.mp4"
+    media = tmp_path / "clip.wav"
     media.write_bytes(b"placeholder")
 
-    segments = await NemoSortformerSpeechDiarizer(Model(), device="cuda").segment_file(
-        media,
-        duration_ms=2_000,
+    with pytest.raises(ModelOutputError, match="without timed"):
+        await FunASRSpeechPipeline(Pipeline(), device="cuda").analyze_file(media)
+
+
+async def test_funasr_streaming_accepts_arbitrary_pcm_chunk_boundaries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Pipeline:
+        def __init__(self) -> None:
+            self.calls: list[bool] = []
+            self.cache: object | None = None
+
+        def generate(self, **kwargs: object) -> list[dict[str, object]]:
+            self.calls.append(cast(bool, kwargs["is_final"]))
+            assert kwargs["chunk_size"] == (0, 10, 5)
+            self.cache = kwargs["cache"] if self.cache is None else self.cache
+            assert kwargs["cache"] is self.cache
+            return [{"text": "你好。"}]
+
+    pipeline = Pipeline()
+    monkeypatch.setattr(identity_diarization, "_pcm16_float32", lambda _pcm16: object())
+    transcriber = FunASRStreamingTranscriber(pipeline, device="cuda")
+
+    partial = await transcriber.push_pcm16(bytes(9_600))
+    final = await transcriber.push_pcm16(bytes(9_600), is_final=True)
+
+    assert partial.text == ""
+    assert partial.audio_end_ms == 300
+    assert final == identity_diarization.StreamingTranscript("你好。", 600, True)
+    assert pipeline.calls == [True]
+    with pytest.raises(RuntimeError, match="already final"):
+        await transcriber.push_pcm16(b"")
+
+
+async def test_funasr_streaming_closes_after_model_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Pipeline:
+        def generate(self, **_kwargs: object) -> list[dict[str, object]]:
+            raise RuntimeError("device failure")
+
+    monkeypatch.setattr(identity_diarization, "_pcm16_float32", lambda _pcm16: object())
+    transcriber = FunASRStreamingTranscriber(Pipeline(), device="cuda")
+
+    with pytest.raises(RuntimeError, match="device failure"):
+        await transcriber.push_pcm16(bytes(19_200))
+    with pytest.raises(RuntimeError, match="already final"):
+        await transcriber.push_pcm16(bytes(2))
+
+
+async def test_funasr_streaming_closes_when_inference_is_cancelled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = threading.Event()
+    release = threading.Event()
+
+    class Pipeline:
+        def generate(self, **_kwargs: object) -> list[dict[str, object]]:
+            started.set()
+            release.wait(timeout=2)
+            return [{"text": "late result"}]
+
+    monkeypatch.setattr(identity_diarization, "_pcm16_float32", lambda _pcm16: object())
+    transcriber = FunASRStreamingTranscriber(Pipeline(), device="cuda")
+    task = asyncio.create_task(transcriber.push_pcm16(bytes(19_200)))
+    assert await asyncio.to_thread(started.wait, 1)
+
+    task.cancel()
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        with pytest.raises(RuntimeError, match="already final"):
+            await transcriber.push_pcm16(bytes(2))
+    finally:
+        release.set()
+
+
+def test_funasr_marks_overlapping_speakers_unsafe_for_enrollment() -> None:
+    segments = identity_diarization._funasr_segments(
+        [
+            {"start": 0, "end": 1_000, "text": "First.", "spk": 0},
+            {"start": 800, "end": 1_500, "text": "Second.", "spk": 1},
+        ],
+        confidence=0.8,
     )
 
-    assert [(item.start_ms, item.end_ms, item.speaker_label) for item in segments] == [
-        (100, 900, "speaker_0"),
-        (1_200, 2_000, "speaker_1"),
-    ]
-    assert [item.confidence for item in segments] == pytest.approx([0.8, 0.4])
-
-
-def test_speech_fusion_attaches_unambiguous_asr_and_marks_overlap_unsafe() -> None:
-    transcripts = (
-        SpeechSegment("asr_0", 100, 800, 0.9, "hello"),
-        SpeechSegment("asr_ambiguous", 800, 1_200, 0.9, "unclear"),
-        SpeechSegment("asr_1", 1_200, 1_800, 0.8, "there"),
-    )
-    turns = (
-        SpeechSegment("turn_0", 0, 1_000, 0.95, speaker_label="speaker_0"),
-        SpeechSegment("turn_1", 1_000, 2_000, 0.95, speaker_label="speaker_1"),
-    )
-
-    fused = fuse_speech_segments(transcripts, turns)
-
-    assert [(item.transcript, item.speaker_label, item.confidence) for item in fused] == [
-        ("hello", "speaker_0", 0.9),
-        ("unclear", None, 0.9),
-        ("there", "speaker_1", 0.8),
-    ]
-
-    overlapping = fuse_speech_segments(
-        (),
-        (
-            SpeechSegment("turn_0", 0, 1_100, 0.95, speaker_label="speaker_0"),
-            SpeechSegment("turn_1", 900, 2_000, 0.95, speaker_label="speaker_1"),
-        ),
-    )
-    assert [item.confidence for item in overlapping] == [0.5, 0.5]
+    assert [segment.confidence for segment in segments] == [0.5, 0.5]
 
 
 async def test_av_identity_segment_runs_the_complete_revocable_handoff(tmp_path: Path) -> None:
@@ -175,27 +223,21 @@ async def test_av_identity_segment_runs_the_complete_revocable_handoff(tmp_path:
                 ),
             )
 
-    class Transcriber:
-        async def segment_file(self, _media_path: Path) -> tuple[SpeechSegment, ...]:
-            return (SpeechSegment("asr_0", 0, 1_000, 0.9, "Pass the tool."),)
-
-    class Diarizer:
-        async def segment_file(
-            self,
-            _media_path: Path,
-            *,
-            duration_ms: int,
-        ) -> tuple[SpeechSegment, ...]:
-            assert duration_ms == 1_000
-            return (SpeechSegment("turn_0", 0, 1_000, 0.9, speaker_label="speaker_0"),)
-
-    class Speaker:
-        def encode_media_segments(
-            self,
-            _media_path: Path,
-            segments: tuple[SpeechSegment, ...],
-        ) -> tuple[tuple[float, ...], ...]:
-            return tuple((0.0, 1.0) for _ in segments)
+    class SpeechPipeline:
+        async def analyze_file(self, _media_path: Path) -> SpeechAnalysis:
+            return SpeechAnalysis(
+                segments=(
+                    SpeechSegment(
+                        "turn_0",
+                        0,
+                        1_000,
+                        0.9,
+                        "Pass the tool.",
+                        speaker_label="0",
+                    ),
+                ),
+                speaker_embeddings=(SpeakerEmbeddingSample("0", (0.0, 1.0)),),
+            )
 
     class Matcher:
         calls = 0
@@ -241,7 +283,6 @@ async def test_av_identity_segment_runs_the_complete_revocable_handoff(tmp_path:
         encryption_key=AESGCM.generate_key(bit_length=256),
     )
     faces = Faces()
-    diarizer = Diarizer()
     matcher = Matcher()
     thresholds = IdentityMatchingThresholds(
         face_similarity=0.8,
@@ -262,9 +303,7 @@ async def test_av_identity_segment_runs_the_complete_revocable_handoff(tmp_path:
         duration_ms=1_000,
         memory=memory,
         face_encoder=cast(InsightFaceVideoEncoder, faces),
-        speech_transcriber=cast(FunASRSpeechTranscriber, Transcriber()),
-        speaker_diarizer=cast(NemoSortformerSpeechDiarizer, diarizer),
-        speaker_encoder=cast(ERes2NetV2SpeakerEncoder, Speaker()),
+        speech_pipeline=cast(FunASRSpeechPipeline, SpeechPipeline()),
         active_speaker_matcher=cast(OpenAIVisualActiveSpeakerMatcher, matcher),
         thresholds=thresholds,
         parallel_model_inference=False,
@@ -285,9 +324,7 @@ async def test_av_identity_segment_runs_the_complete_revocable_handoff(tmp_path:
         duration_ms=1_000,
         memory=memory,
         face_encoder=cast(InsightFaceVideoEncoder, faces),
-        speech_transcriber=cast(FunASRSpeechTranscriber, Transcriber()),
-        speaker_diarizer=cast(NemoSortformerSpeechDiarizer, diarizer),
-        speaker_encoder=cast(ERes2NetV2SpeakerEncoder, Speaker()),
+        speech_pipeline=cast(FunASRSpeechPipeline, SpeechPipeline()),
         active_speaker_matcher=cast(OpenAIVisualActiveSpeakerMatcher, matcher),
         thresholds=thresholds,
         parallel_model_inference=False,

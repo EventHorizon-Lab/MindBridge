@@ -80,7 +80,7 @@ async def test_omni_streams_raw_av_and_validates_answer() -> None:
     answerer = _answerer(respond)
     assert answerer.model_reference.model_id == "qwen3.8-max"
     assert answerer.model_reference.revision == "deployment-revision"
-    assert answerer.prompt_version == "answer_from_evidence_v8"
+    assert answerer.prompt_version == "answer_from_evidence_v9"
     assert answerer.occurrence_prompt_version == "select_occurrences_v2"
     evidence = (
         _resolved_evidence(MediaKind.IMAGE, "image.jpg", "media_image", 0),

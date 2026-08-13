@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import re
 
 from pydantic import Field
 
@@ -27,8 +26,6 @@ from mindbridge.sdk import AsyncMindBridge
 
 LOCOMO_PREDICTION_KEY = "mindbridge_prediction"
 LOCOMO_ABSTENTION = "Not mentioned in the conversation"
-LOCOMO_INFERENCE_RECALL_LIMIT = 50
-_INFERENCE_QUERY = re.compile(r"\b(?:would|likely|might)\b", re.IGNORECASE)
 
 
 class LoCoMoOfficialQuestionResult(ContractModel):
@@ -121,11 +118,7 @@ async def _answer_question(
             RecallRequest(
                 tenant_id=tenant_id,
                 query=RecallQuery(text=question.question),
-                limit=(
-                    max(recall_limit, LOCOMO_INFERENCE_RECALL_LIMIT)
-                    if _INFERENCE_QUERY.search(question.question)
-                    else recall_limit
-                ),
+                limit=recall_limit,
                 include_evidence=False,
             )
         )

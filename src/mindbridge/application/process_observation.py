@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from datetime import datetime, timedelta
 
 from mindbridge.application.derive_observation_graph import (
@@ -11,7 +12,12 @@ from mindbridge.application.derive_observation_graph import (
 )
 from mindbridge.application.evidence import resolve_evidence_media
 from mindbridge.application.observation_processing import ObservationProcessingOutput
-from mindbridge.application.perception import EventPerception, PerceivedEvent, ResolvedEvidence
+from mindbridge.application.perception import (
+    EventPerception,
+    PerceivedEvent,
+    ResolvedEvidence,
+    time_ranges_overlap,
+)
 from mindbridge.application.ports import (
     MediaUrlSigner,
     ObservationPerceiver,
@@ -28,6 +34,8 @@ from mindbridge.core import (
     EmbeddingRecord,
     Event,
     EventId,
+    EvidenceId,
+    EvidenceSpan,
     JobId,
     JobState,
     MemoryIntegrityError,
@@ -96,18 +104,24 @@ class ProcessObservation:
             )
             perception = await self._perceiver.perceive_events(batch.observation, evidence)
             _require_grounded_perception(batch.observation, evidence, perception.events)
+            perception, event_evidence = _ground_events(
+                batch.observation,
+                perception,
+                batch.evidence_spans,
+                claim.job.created_at,
+            )
             events = _events(batch.observation, perception, claim.job.created_at)
             graph = derive_observation_graph(
                 batch.observation,
                 perception,
                 events,
-                batch.evidence_spans,
+                event_evidence,
                 claim.job.created_at,
             )
             set_current_span_attributes(
                 {
                     "mindbridge.event.count": len(events),
-                    "mindbridge.evidence.count": len(evidence),
+                    "mindbridge.evidence.count": len(event_evidence),
                     "mindbridge.model.id": perception.model_reference.model_id,
                     "mindbridge.prompt.version": perception.prompt_version,
                 }
@@ -133,6 +147,7 @@ class ProcessObservation:
                 ),
             )
             output = ObservationProcessingOutput(
+                evidence_spans=event_evidence,
                 events=events,
                 entities=graph.entities,
                 entity_mentions=graph.entity_mentions,
@@ -157,6 +172,77 @@ class ProcessObservation:
                 error_code=_processing_error_code(error),
             )
             raise
+
+
+def _ground_events(
+    observation: Observation,
+    perception: EventPerception,
+    source_evidence: tuple[EvidenceSpan, ...],
+    created_at: datetime,
+) -> tuple[EventPerception, tuple[EvidenceSpan, ...]]:
+    """Replace whole-observation references with deterministic event-time subspans."""
+    source_by_id = {span.evidence_id: span for span in source_evidence}
+    grounded_events = []
+    event_spans = []
+    for ordinal, event in enumerate(perception.events):
+        remapped: dict[EvidenceId, EvidenceId] = {}
+        for source_id in event.evidence_ids:
+            source = source_by_id[source_id]
+            start_ms = max(source.start_ms, event.start_ms)
+            end_ms = min(source.end_ms, event.end_ms)
+            evidence_id = EvidenceId(
+                derive_stable_id(
+                    "event_evidence",
+                    observation.tenant_id,
+                    observation.observation_id,
+                    perception.prompt_version,
+                    ordinal,
+                    source_id,
+                    start_ms,
+                    end_ms,
+                )
+            )
+            remapped[source_id] = evidence_id
+            unchanged_range = start_ms == source.start_ms and end_ms == source.end_ms
+            event_spans.append(
+                EvidenceSpan(
+                    evidence_id=evidence_id,
+                    tenant_id=source.tenant_id,
+                    observation_id=source.observation_id,
+                    media_object_id=source.media_object_id,
+                    start_ms=start_ms,
+                    end_ms=end_ms,
+                    created_at=created_at,
+                    frame_start=source.frame_start if unchanged_range else None,
+                    frame_end=source.frame_end if unchanged_range else None,
+                    region=source.region,
+                    audio_track=source.audio_track,
+                )
+            )
+        grounded_events.append(
+            replace(
+                event,
+                evidence_ids=tuple(remapped[item] for item in event.evidence_ids),
+                entities=tuple(
+                    replace(
+                        entity,
+                        evidence_ids=tuple(remapped[item] for item in entity.evidence_ids),
+                    )
+                    for entity in event.entities
+                ),
+                claims=tuple(
+                    replace(
+                        item,
+                        evidence_ids=tuple(remapped[value] for value in item.evidence_ids),
+                    )
+                    for item in event.claims
+                ),
+            )
+        )
+    return (
+        replace(perception, events=tuple(grounded_events)),
+        tuple(event_spans),
+    )
 
 
 def _events(
@@ -238,8 +324,12 @@ def _require_grounded_perception(
         if event.end_ms > duration_ms or not set(event.evidence_ids) <= evidence_ids:
             raise DomainInvariantError("perceived event is outside source evidence")
         if any(
-            evidence_by_id[evidence_id].end_ms < event.start_ms
-            or evidence_by_id[evidence_id].start_ms > event.end_ms
+            not time_ranges_overlap(
+                evidence_by_id[evidence_id].start_ms,
+                evidence_by_id[evidence_id].end_ms,
+                event.start_ms,
+                event.end_ms,
+            )
             for evidence_id in event.evidence_ids
         ):
             raise DomainInvariantError("perceived event does not overlap source evidence")

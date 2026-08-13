@@ -46,6 +46,7 @@ from mindbridge.core import (
 from mindbridge.telemetry import current_trace_id, set_current_span_attributes, trace_operation
 
 RETRIEVAL_DOCUMENT_EMBEDDING_TASK = "retrieval_document"
+_MAXIMUM_RETRIEVAL_REFINEMENTS = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,19 +142,27 @@ class RecallMemories:
         generated = GeneratedAnswer(answer=None, confidence=0.0)
         answer_evidence: tuple[ResolvedEvidence, ...] = ()
         retrieval_query_count = 0
+        retrieval_round_count = 0
         if request.mode is not RecallMode.SEARCH:
             generated, answer_evidence = await self._answer_candidates(
                 request,
                 visible_candidates,
                 query_media,
             )
-            followup_queries = tuple(
-                query
-                for query in generated.retrieval_queries
-                if request.query.text is None or query.casefold() != request.query.text.casefold()
+            retrieval_round_count = 1
+            seen_queries = (
+                {request.query.text.casefold()} if request.query.text is not None else set()
             )
-            if followup_queries and not request.memory_ids:
-                retrieval_query_count = len(followup_queries)
+            for _ in range(_MAXIMUM_RETRIEVAL_REFINEMENTS):
+                followup_queries = tuple(
+                    query
+                    for query in generated.retrieval_queries
+                    if query.casefold() not in seen_queries
+                )
+                if not followup_queries or request.memory_ids:
+                    break
+                seen_queries.update(query.casefold() for query in followup_queries)
+                retrieval_query_count += len(followup_queries)
                 query_media = await self._resign_query_media(query_media)
                 followup_rankings = await asyncio.gather(
                     *(
@@ -177,16 +186,18 @@ class RecallMemories:
                     limit=candidate_limit,
                 )
                 refined_candidates = await self._refresh_visible_candidates(request, refined)
-                if tuple(memory.memory_id for memory in refined_candidates) != tuple(
+                if tuple(memory.memory_id for memory in refined_candidates) == tuple(
                     memory.memory_id for memory in visible_candidates
                 ):
-                    memories = refined
-                    visible_candidates = refined_candidates
-                    generated, answer_evidence = await self._answer_candidates(
-                        request,
-                        visible_candidates,
-                        query_media,
-                    )
+                    break
+                memories = refined
+                visible_candidates = refined_candidates
+                generated, answer_evidence = await self._answer_candidates(
+                    request,
+                    visible_candidates,
+                    query_media,
+                )
+                retrieval_round_count += 1
         visible_memories = await self._store.record_memory_accesses(
             TenantId(request.tenant_id),
             tuple(memory.memory_id for memory in visible_candidates),
@@ -210,6 +221,7 @@ class RecallMemories:
                 "mindbridge.recall.memory_count": len(visible_memories),
                 "mindbridge.recall.evidence_count": len(answer_evidence),
                 "mindbridge.recall.retrieval_query_count": retrieval_query_count,
+                "mindbridge.recall.retrieval_round_count": retrieval_round_count,
                 "mindbridge.recall.answered": generated.answer is not None,
             }
         )

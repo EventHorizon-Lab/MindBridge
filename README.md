@@ -549,18 +549,38 @@ idempotency key, then commits the request and absolute local path to a mode-`060
 SQLite Outbox. GStreamer/DeepStream remains responsible for camera decoding, encoding, frame rate,
 resolution, VAD/motion/scene gates, and hardware calibration.
 
-The lower-level example accepts an embedding from an existing robot vision stack. For raw replay,
-`mindbridge.edge.identity_inference` directly loads the official InsightFace `buffalo_l` and
-ModelScope ERes2NetV2 implementations, while `mindbridge.edge.identity_diarization` reuses FunASR,
-optional NeMo Sortformer, and an OpenAI-SDK audiovisual active-speaker verifier. The verifier draws
-face anchors onto a bounded MP4 while retaining its embedded audio, so one native request aligns lip
-motion and speech instead of reasoning from transcript timing alone. `device=auto` selects
-CUDA when it is actually available and explicit CUDA requests fail instead of silently using CPU.
-`recognize_identities_in_av_segment()` is the single high-level handoff for a synchronized video and
-optional audio sidecar; it returns only cloud-safe intervals ready for `enqueue_captured_video()`.
-Install the InsightFace/ONNX Runtime, FunASR/ModelScope, and optional NeMo wheels supplied by the
-JetPack-compatible device image; the generic `uv.lock` intentionally does not replace NVIDIA's
-platform runtime. MindBridge orchestrates these libraries but does not reimplement their networks.
+The lower-level example accepts an embedding from an existing robot vision stack. Native hot paths
+do not need to reopen a completed media file: feed timestamped BGR frames to
+`InsightFaceVideoEncoder.encode_frame()` and arbitrary 16 kHz mono PCM16 chunks to the causal
+FunASR cache:
+
+```python
+import asyncio
+
+from mindbridge.edge.identity_diarization import FunASRStreamingTranscriber
+
+streaming_asr = FunASRStreamingTranscriber.load(device="auto")
+faces = await asyncio.to_thread(
+    face_encoder.encode_frame,
+    bgr_frame,
+    timestamp_ms=frame_timestamp_ms,
+    duration_ms=frame_duration_ms,
+)
+partial = await streaming_asr.push_pcm16(pcm16_chunk, is_final=is_last_audio_chunk)
+```
+
+The partial transcript is provisional. GStreamer/DeepStream still owns the bounded rolling fragment;
+when its Event gate closes, `FunASRSpeechPipeline` performs VAD, quality ASR, punctuation,
+diarization, and ERes2NetV2 centroid extraction in one upstream call.
+`recognize_identities_in_av_segment()` combines that result with InsightFace and the optional
+OpenAI-SDK audiovisual active-speaker verifier, then returns only cloud-safe intervals ready for
+`enqueue_captured_video()`. `device=auto` selects CUDA when it is available, and explicit CUDA
+requests fail instead of silently using CPU.
+
+Install InsightFace/ONNX Runtime and FunASR/ModelScope from the JetPack-compatible device image; the
+generic `uv.lock` intentionally does not replace NVIDIA's platform Torch runtime. NeMo is not part of
+the current pipeline. MindBridge orchestrates upstream libraries but does not reimplement their
+networks.
 
 `device_identity_key` is exactly 32 bytes loaded from
 the device TPM or secret manager. The local store normalizes and AES-256-GCM encrypts every bounded

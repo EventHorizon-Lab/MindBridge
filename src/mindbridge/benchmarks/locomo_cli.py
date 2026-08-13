@@ -23,7 +23,6 @@ from mindbridge.benchmarks.artifacts import (
 from mindbridge.benchmarks.locomo import LOCOMO_ADAPTER_VERSION, LoCoMoConversation, load_locomo
 from mindbridge.benchmarks.locomo_runner import (
     LOCOMO_ABSTENTION,
-    LOCOMO_INFERENCE_RECALL_LIMIT,
     LOCOMO_PREDICTION_KEY,
     LoCoMoOfficialConversationResult,
     run_locomo_conversation,
@@ -41,7 +40,7 @@ from mindbridge.models.openai_omni import (
 )
 from mindbridge.sdk import AsyncMindBridge
 
-LOCOMO_RUNNER_VERSION = "locomo_production_api_v6"
+LOCOMO_RUNNER_VERSION = "locomo_production_api_v7"
 
 
 class LoCoMoRunManifest(ContractModel):
@@ -66,7 +65,6 @@ class LoCoMoRunManifest(ContractModel):
     run_id: Identifier
     tenant_prefix: Identifier
     recall_limit: int = Field(gt=0, le=100)
-    inference_recall_limit: int = Field(gt=0, le=100)
     request_concurrency: int = Field(gt=0)
     request_timeout_seconds: float = Field(gt=0)
     sample_ids: tuple[Identifier, ...] = Field(min_length=1)
@@ -165,7 +163,6 @@ def _write_artifacts(
         run_id=arguments.run_id,
         tenant_prefix=arguments.tenant_prefix,
         recall_limit=arguments.recall_limit,
-        inference_recall_limit=LOCOMO_INFERENCE_RECALL_LIMIT,
         request_concurrency=arguments.request_concurrency,
         request_timeout_seconds=arguments.request_timeout_seconds,
         sample_ids=tuple(conversation.sample_id for conversation in conversations),

@@ -8,11 +8,10 @@ import json
 import mimetypes
 import subprocess
 import tempfile
-import unicodedata
-from dataclasses import dataclass
-from math import ceil
+from dataclasses import dataclass, replace
+from itertools import pairwise
 from pathlib import Path
-from typing import Annotated, Any, Literal, Protocol, TypedDict, cast
+from typing import Annotated, Literal, Protocol, TypedDict, cast
 
 from openai import AsyncOpenAI
 from openai.types.chat import ChatCompletionMessageParam
@@ -40,11 +39,12 @@ from mindbridge.edge.identity import (
     SQLiteIdentityMemory,
 )
 from mindbridge.edge.identity_inference import (
-    ERes2NetV2SpeakerEncoder,
+    ERES2NETV2_MODEL,
     InsightFaceVideoEncoder,
+    SpeakerEmbeddingSample,
     SpeechSegment,
     recognize_faces_in_video,
-    recognize_speakers_in_media,
+    recognize_speakers,
 )
 from mindbridge.models.compute import has_free_cuda_memory, select_torch_device
 from mindbridge.models.openai_chat import stream_text_completion, unwrap_json_code_fence
@@ -56,12 +56,14 @@ from mindbridge.models.openai_omni import (
 )
 
 FUNASR_ASR_MODEL_ID = "iic/speech_seaco_paraformer_large_asr_nat-zh-cn-16k-common-vocab8404-pytorch"
+FUNASR_STREAMING_ASR_MODEL_ID = (
+    "iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-online"
+)
 FUNASR_VAD_MODEL_ID = "iic/speech_fsmn_vad_zh-cn-16k-common-pytorch"
+FUNASR_PUNCTUATION_MODEL_ID = "iic/punc_ct-transformer_zh-cn-common-vad_realtime-vocab272727"
 FUNASR_MODEL_REVISION = "v2.0.4"
-SORTFORMER_MODEL_ID = "nvidia/diar_streaming_sortformer_4spk-v2.1"
 ACTIVE_SPEAKER_PROMPT_VERSION = "active_speaker_v2"
 _MAXIMUM_SEGMENTS = 128
-_MAXIMUM_AUDIO_BYTES = 16 * 1024 * 1024
 _PARALLEL_MODEL_MINIMUM_FREE_CUDA_BYTES = 8 * 1024 * 1024 * 1024
 _PROMPT = f"""# Role
 You perform automatic speech recognition and speaker-turn segmentation on one audiovisual clip.
@@ -205,29 +207,33 @@ class _FunASRPipeline(Protocol):
     def generate(self, **kwargs: object) -> list[dict[str, object]]: ...
 
 
-class FunASRSpeechTranscriber:
-    """Run upstream ASR/VAD locally and retain timestamped speech for memory."""
+@dataclass(frozen=True, slots=True)
+class SpeechAnalysis:
+    """One integrated FunASR result with timed speech and local speaker centroids."""
+
+    segments: tuple[SpeechSegment, ...]
+    speaker_embeddings: tuple[SpeakerEmbeddingSample, ...]
+
+
+class FunASRSpeechPipeline:
+    """Run upstream VAD, ASR, punctuation, diarization, and speaker embedding once."""
 
     def __init__(
         self,
         pipeline: _FunASRPipeline,
         *,
         device: str,
-        maximum_silence_ms: int = 400,
-        maximum_segment_ms: int = 8_000,
-        minimum_segment_ms: int = 500,
+        diarization_confidence: float = 0.8,
     ) -> None:
-        if min(maximum_silence_ms, maximum_segment_ms, minimum_segment_ms) <= 0:
-            raise ValueError("speech segmentation limits must be positive")
+        if not 0.0 <= diarization_confidence <= 1.0:
+            raise ValueError("diarization confidence must be between zero and one")
         self._pipeline = pipeline
         self.device = device
-        self._maximum_silence_ms = maximum_silence_ms
-        self._maximum_segment_ms = maximum_segment_ms
-        self._minimum_segment_ms = minimum_segment_ms
+        self._diarization_confidence = diarization_confidence
 
     @classmethod
-    def load(cls, *, device: str | None = None) -> FunASRSpeechTranscriber:
-        """Load the official FunASR models on available CUDA, otherwise CPU."""
+    def load(cls, *, device: str | None = None) -> FunASRSpeechPipeline:
+        """Load the official integrated FunASR pipeline on CUDA when available."""
         try:
             funasr = __import__("funasr")
         except ImportError as error:
@@ -238,208 +244,151 @@ class FunASRSpeechTranscriber:
             model_revision=FUNASR_MODEL_REVISION,
             vad_model=FUNASR_VAD_MODEL_ID,
             vad_model_revision=FUNASR_MODEL_REVISION,
+            punc_model=FUNASR_PUNCTUATION_MODEL_ID,
+            punc_model_revision=FUNASR_MODEL_REVISION,
+            spk_model=ERES2NETV2_MODEL.model_id,
+            spk_model_revision=ERES2NETV2_MODEL.revision,
             device=selected_device,
             disable_update=True,
             disable_pbar=True,
         )
         return cls(cast(_FunASRPipeline, pipeline), device=selected_device)
 
-    async def segment_file(self, media_path: Path) -> tuple[SpeechSegment, ...]:
+    async def analyze_file(self, media_path: Path) -> SpeechAnalysis:
         """Keep the edge loop responsive while local GPU inference runs."""
-        return await asyncio.to_thread(self._segment_file, media_path)
+        return await asyncio.to_thread(self._analyze_file, media_path)
 
-    def _segment_file(self, media_path: Path) -> tuple[SpeechSegment, ...]:
+    def _analyze_file(self, media_path: Path) -> SpeechAnalysis:
         media_path = media_path.resolve(strict=True)
         output = self._pipeline.generate(
             input=str(media_path),
             batch_size_s=300,
             return_raw_text=True,
+            sentence_timestamp=True,
+            return_spk_res=True,
+            return_spk_center=True,
             disable_pbar=True,
         )
         if len(output) != 1:
             raise ModelOutputError("FunASR returned an invalid transcription batch")
-        text = output[0].get("raw_text") or output[0].get("text")
-        timestamps = output[0].get("timestamp")
-        if not isinstance(text, str) or not text.strip():
-            return ()
-        tokens = text.split()
-        rows = _word_timestamps(timestamps)
-        if len(tokens) != len(rows):
-            raise ModelOutputError("FunASR token and timestamp counts differ")
-        return _split_timestamped_tokens(
-            tokens,
-            rows,
-            maximum_silence_ms=self._maximum_silence_ms,
-            maximum_segment_ms=self._maximum_segment_ms,
-            minimum_segment_ms=self._minimum_segment_ms,
+        result = output[0]
+        text = result.get("text")
+        if not isinstance(text, str):
+            raise ModelOutputError("FunASR returned invalid transcription text")
+        if not text.strip():
+            return SpeechAnalysis(segments=(), speaker_embeddings=())
+        segments = _funasr_segments(
+            result.get("sentence_info"),
+            confidence=self._diarization_confidence,
+        )
+        if not segments:
+            raise ModelOutputError("FunASR returned text without timed speaker sentences")
+        return SpeechAnalysis(
+            segments=segments,
+            speaker_embeddings=_funasr_speaker_embeddings(result.get("spk_embedding_center")),
         )
 
 
-class NemoSortformerSpeechDiarizer:
-    """Use NVIDIA's official streaming Sortformer for local speaker turns."""
+@dataclass(frozen=True, slots=True)
+class StreamingTranscript:
+    """One provisional streaming ASR delta at a monotonic audio offset."""
 
-    def __init__(self, model: object, *, device: str) -> None:
-        self._model = model
+    text: str
+    audio_end_ms: int
+    is_final: bool
+
+
+class FunASRStreamingTranscriber:
+    """Feed native 16 kHz mono PCM16 into FunASR's cached streaming checkpoint."""
+
+    def __init__(
+        self,
+        pipeline: _FunASRPipeline,
+        *,
+        device: str,
+        chunk_size: tuple[int, int, int] = (0, 10, 5),
+        encoder_chunk_look_back: int = 4,
+        decoder_chunk_look_back: int = 1,
+    ) -> None:
+        if (
+            len(chunk_size) != 3
+            or chunk_size[1] <= 0
+            or min(encoder_chunk_look_back, decoder_chunk_look_back) < 0
+        ):
+            raise ValueError("FunASR streaming window is invalid")
+        self._pipeline = pipeline
         self.device = device
+        self._chunk_size = chunk_size
+        self._encoder_chunk_look_back = encoder_chunk_look_back
+        self._decoder_chunk_look_back = decoder_chunk_look_back
+        self._chunk_bytes = chunk_size[1] * 960 * 2
+        self._buffer = bytearray()
+        self._cache: dict[str, object] = {}
+        self._received_sample_count = 0
+        self._closed = False
+        self._lock = asyncio.Lock()
 
     @classmethod
-    def load(cls, *, device: str | None = None) -> NemoSortformerSpeechDiarizer:
+    def load(cls, *, device: str | None = None) -> FunASRStreamingTranscriber:
+        """Load the causal Paraformer checkpoint only when live ASR is needed."""
         try:
-            models = __import__("nemo.collections.asr.models", fromlist=["SortformerEncLabelModel"])
+            funasr = __import__("funasr")
         except ImportError as error:
-            raise ModelUnavailableError(
-                "install NVIDIA NeMo ASR for Sortformer diarization"
-            ) from error
+            raise ModelUnavailableError("install FunASR for native streaming ASR") from error
         selected_device = select_torch_device(device)
-        model = models.SortformerEncLabelModel.from_pretrained(
-            SORTFORMER_MODEL_ID,
-            map_location=selected_device,
+        pipeline = funasr.AutoModel(
+            model=FUNASR_STREAMING_ASR_MODEL_ID,
+            model_revision=FUNASR_MODEL_REVISION,
+            device=selected_device,
+            disable_update=True,
+            disable_pbar=True,
         )
-        model = model.to(selected_device).eval()
-        modules = model.sortformer_modules
-        modules.chunk_len = 340
-        modules.chunk_right_context = 40
-        modules.fifo_len = 40
-        modules.spkcache_update_period = 300
-        actual_device = str(next(model.parameters()).device)
-        if selected_device.startswith("cuda") and not actual_device.startswith("cuda"):
-            raise ModelUnavailableError("Sortformer silently fell back from requested CUDA")
-        return cls(model, device=selected_device)
+        return cls(cast(_FunASRPipeline, pipeline), device=selected_device)
 
-    async def segment_file(
-        self,
-        media_path: Path,
-        *,
-        duration_ms: int,
-        confidence: float = 0.8,
-    ) -> tuple[SpeechSegment, ...]:
-        if duration_ms <= 0 or not 0.0 <= confidence <= 1.0:
-            raise ValueError("clip duration and diarization confidence are invalid")
-        return await asyncio.to_thread(
-            self._segment_file,
-            media_path,
-            duration_ms,
-            confidence,
-        )
-
-    def _segment_file(
-        self,
-        media_path: Path,
-        duration_ms: int,
-        confidence: float,
-    ) -> tuple[SpeechSegment, ...]:
-        audio_bytes = _extract_audio_wav(media_path.resolve(strict=True))
-        with tempfile.NamedTemporaryFile(suffix=".wav") as audio:
-            audio.write(audio_bytes)
-            audio.flush()
-            output = cast(Any, self._model).diarize(
-                audio=[audio.name],
-                batch_size=1,
-                include_tensor_outputs=True,
-            )
-        predictions, probabilities = _sortformer_output(output)
-        if len(predictions) != 1:
-            raise ModelOutputError("Sortformer returned an invalid diarization batch")
-        segments = []
-        for index, row in enumerate(predictions[0]):
+    async def push_pcm16(self, pcm16: bytes, *, is_final: bool = False) -> StreamingTranscript:
+        """Consume arbitrary chunk boundaries with serialized cache access and backpressure."""
+        if len(pcm16) % 2:
+            raise ValueError("PCM16 chunks must contain complete little-endian samples")
+        async with self._lock:
+            if self._closed:
+                raise RuntimeError("streaming transcription session is already final")
+            if is_final and not pcm16 and self._received_sample_count:
+                raise ValueError("set is_final on the last non-empty PCM chunk")
+            self._received_sample_count += len(pcm16) // 2
+            self._buffer.extend(pcm16)
+            texts = []
             try:
-                start, end, speaker_label = str(row).split()
-                start_ms = round(float(start) * 1_000)
-                end_ms = round(float(end) * 1_000)
-            except (TypeError, ValueError) as error:
-                raise ModelOutputError("Sortformer returned an invalid speaker turn") from error
-            if start_ms < 0 or end_ms <= start_ms or end_ms > duration_ms:
-                raise ModelOutputError("Sortformer speaker turn exceeds the clip duration")
-            segments.append(
-                SpeechSegment(
-                    sample_id=f"diar-{start_ms:012d}-{end_ms:012d}-{index:03d}",
-                    start_ms=start_ms,
-                    end_ms=end_ms,
-                    confidence=_sortformer_turn_confidence(
-                        probabilities,
-                        speaker_label,
-                        start_ms=start_ms,
-                        end_ms=end_ms,
-                        duration_ms=duration_ms,
-                        maximum_confidence=confidence,
-                    ),
-                    speaker_label=speaker_label,
-                )
+                while len(self._buffer) >= self._chunk_bytes or (is_final and self._buffer):
+                    chunk_length = min(len(self._buffer), self._chunk_bytes)
+                    chunk = bytes(self._buffer[:chunk_length])
+                    final_chunk = is_final and chunk_length == len(self._buffer)
+                    texts.append(
+                        await asyncio.to_thread(self._transcribe_chunk, chunk, final_chunk)
+                    )
+                    del self._buffer[:chunk_length]
+            except (Exception, asyncio.CancelledError):
+                self._closed = True
+                raise
+            self._closed = is_final
+            return StreamingTranscript(
+                text="".join(texts),
+                audio_end_ms=round(self._received_sample_count / 16_000 * 1_000),
+                is_final=is_final,
             )
-        if len(segments) > _MAXIMUM_SEGMENTS:
-            raise ModelOutputError("Sortformer returned too many speaker turns")
-        return tuple(segments)
 
-
-def fuse_speech_segments(
-    transcripts: tuple[SpeechSegment, ...],
-    speaker_turns: tuple[SpeechSegment, ...],
-    *,
-    minimum_overlap_ratio: float = 0.5,
-    minimum_margin: float = 0.15,
-) -> tuple[SpeechSegment, ...]:
-    """Attach ASR to unambiguous Sortformer turns and lower overlap enrollment confidence."""
-    if not 0.0 <= minimum_overlap_ratio <= 1.0 or not 0.0 <= minimum_margin <= 1.0:
-        raise ValueError("speech fusion thresholds must be between zero and one")
-    if not speaker_turns:
-        return transcripts
-    assigned: list[list[SpeechSegment]] = [[] for _ in speaker_turns]
-    assigned_transcript_indices: set[int] = set()
-    for transcript_index, transcript in enumerate(transcripts):
-        duration_ms = transcript.end_ms - transcript.start_ms
-        overlaps = sorted(
-            ((_overlap_ms(transcript, turn), index) for index, turn in enumerate(speaker_turns)),
-            reverse=True,
+    def _transcribe_chunk(self, pcm16: bytes, is_final: bool) -> str:
+        output = self._pipeline.generate(
+            input=_pcm16_float32(pcm16),
+            cache=self._cache,
+            is_final=is_final,
+            chunk_size=self._chunk_size,
+            encoder_chunk_look_back=self._encoder_chunk_look_back,
+            decoder_chunk_look_back=self._decoder_chunk_look_back,
+            disable_pbar=True,
         )
-        best_overlap, best_index = overlaps[0]
-        second_overlap = overlaps[1][0] if len(overlaps) > 1 else 0
-        if (
-            best_overlap / duration_ms >= minimum_overlap_ratio
-            and (best_overlap - second_overlap) / duration_ms >= minimum_margin
-        ):
-            assigned[best_index].append(transcript)
-            assigned_transcript_indices.add(transcript_index)
-    overlapping_turns = {
-        index
-        for index, turn in enumerate(speaker_turns)
-        if any(
-            index != other_index
-            and turn.speaker_label != other.speaker_label
-            and _overlap_ms(turn, other) > 0
-            for other_index, other in enumerate(speaker_turns)
-        )
-    }
-    turns = tuple(
-        SpeechSegment(
-            sample_id=turn.sample_id,
-            start_ms=turn.start_ms,
-            end_ms=turn.end_ms,
-            confidence=min(
-                turn.confidence,
-                *(item.confidence for item in assigned[index]),
-                0.5 if index in overlapping_turns else 1.0,
-            ),
-            transcript=(
-                " ".join(item.transcript for item in assigned[index] if item.transcript)
-                or turn.transcript
-            ),
-            speaker_label=turn.speaker_label,
-        )
-        for index, turn in enumerate(speaker_turns)
-    )
-    return tuple(
-        sorted(
-            (
-                *turns,
-                *(
-                    transcript
-                    for index, transcript in enumerate(transcripts)
-                    if index not in assigned_transcript_indices
-                ),
-            ),
-            key=lambda item: (item.start_ms, item.end_ms, item.sample_id),
-        )
-    )
+        if len(output) != 1 or not isinstance(output[0].get("text"), str):
+            raise ModelOutputError("FunASR returned an invalid streaming transcription")
+        return cast(str, output[0]["text"])
 
 
 class OpenAIVisualActiveSpeakerMatcher:
@@ -633,10 +582,8 @@ async def recognize_identities_in_av_segment(
     duration_ms: int,
     memory: SQLiteIdentityMemory,
     face_encoder: InsightFaceVideoEncoder,
-    speech_transcriber: FunASRSpeechTranscriber,
-    speaker_encoder: ERes2NetV2SpeakerEncoder,
+    speech_pipeline: FunASRSpeechPipeline,
     thresholds: IdentityMatchingThresholds,
-    speaker_diarizer: NemoSortformerSpeechDiarizer | None = None,
     active_speaker_matcher: OpenAIVisualActiveSpeakerMatcher | None = None,
     association_model_reference: ModelReference | None = None,
     face_samples_per_second: float | None = None,
@@ -673,33 +620,21 @@ async def recognize_identities_in_av_segment(
         if parallel_model_inference is None
         else parallel_model_inference
     )
-    if parallel and speaker_diarizer is None:
+    if parallel:
         faces, speech = await asyncio.gather(
             recognize_faces(),
-            speech_transcriber.segment_file(audio),
+            speech_pipeline.analyze_file(audio),
         )
-    elif parallel:
-        assert speaker_diarizer is not None
-        faces, transcripts, turns = await asyncio.gather(
-            recognize_faces(),
-            speech_transcriber.segment_file(audio),
-            speaker_diarizer.segment_file(audio, duration_ms=duration_ms),
-        )
-        speech = fuse_speech_segments(transcripts, turns)
     else:
         faces = await recognize_faces()
-        transcripts = await speech_transcriber.segment_file(audio)
-        if speaker_diarizer is None:
-            speech = transcripts
-        else:
-            turns = await speaker_diarizer.segment_file(audio, duration_ms=duration_ms)
-            speech = fuse_speech_segments(transcripts, turns)
+        speech = await speech_pipeline.analyze_file(audio)
+    if any(segment.end_ms > duration_ms for segment in speech.segments):
+        raise ModelOutputError("FunASR speech segment exceeds the clip duration")
     voices = await asyncio.to_thread(
-        recognize_speakers_in_media,
-        speaker_encoder,
+        recognize_speakers,
         memory,
-        audio,
-        speech,
+        speech.segments,
+        speech.speaker_embeddings,
         tenant_id=tenant_id,
         observation_id=observation_id,
         minimum_similarity=thresholds.voice_similarity,
@@ -895,43 +830,84 @@ def _record_and_resolve_voice_identities(
     return tuple(resolved)
 
 
-def _sortformer_output(output: object) -> tuple[list[list[str]], object | None]:
-    if isinstance(output, list):
-        return cast(list[list[str]], output), None
-    if not isinstance(output, tuple) or len(output) != 2 or not isinstance(output[0], list):
-        raise ModelOutputError("Sortformer returned an invalid diarization batch")
-    probabilities = output[1]
-    if not isinstance(probabilities, list) or len(probabilities) != 1:
-        raise ModelOutputError("Sortformer returned invalid speaker probabilities")
-    return cast(list[list[str]], output[0]), probabilities[0]
+def _funasr_segments(value: object, *, confidence: float) -> tuple[SpeechSegment, ...]:
+    if not isinstance(value, list) or len(value) > _MAXIMUM_SEGMENTS:
+        raise ModelOutputError("FunASR returned invalid sentence-level diarization")
+    segments = []
+    for index, item in enumerate(value):
+        if not isinstance(item, dict):
+            raise ModelOutputError("FunASR returned an invalid sentence")
+        start, end = item.get("start"), item.get("end")
+        transcript = item.get("text") or item.get("sentence")
+        speaker = item.get("spk")
+        if (
+            not isinstance(start, (int, float))
+            or isinstance(start, bool)
+            or not isinstance(end, (int, float))
+            or isinstance(end, bool)
+            or not isinstance(transcript, str)
+            or not transcript.strip()
+            or (speaker is not None and not isinstance(speaker, (str, int)))
+        ):
+            raise ModelOutputError("FunASR returned an invalid sentence")
+        start_ms, end_ms = round(start), round(end)
+        try:
+            segments.append(
+                SpeechSegment(
+                    sample_id=f"funasr-{start_ms:012d}-{end_ms:012d}-{index:03d}",
+                    start_ms=start_ms,
+                    end_ms=end_ms,
+                    confidence=confidence,
+                    transcript=transcript.strip(),
+                    speaker_label=str(speaker).strip() if speaker is not None else None,
+                )
+            )
+        except ValueError as error:
+            raise ModelOutputError("FunASR returned an invalid sentence range") from error
+    if any(current.start_ms < previous.start_ms for previous, current in pairwise(segments)):
+        raise ModelOutputError("FunASR sentences must be chronological")
+    return tuple(
+        replace(segment, confidence=min(segment.confidence, 0.5))
+        if any(
+            segment.speaker_label != other.speaker_label
+            and segment.start_ms < other.end_ms
+            and other.start_ms < segment.end_ms
+            for other in segments
+        )
+        else segment
+        for segment in segments
+    )
 
 
-def _sortformer_turn_confidence(
-    probabilities: object | None,
-    speaker_label: str,
-    *,
-    start_ms: int,
-    end_ms: int,
-    duration_ms: int,
-    maximum_confidence: float,
-) -> float:
-    if probabilities is None:
-        return maximum_confidence
+def _funasr_speaker_embeddings(value: object) -> tuple[SpeakerEmbeddingSample, ...]:
+    if value is None:
+        return ()
+    tolist = getattr(value, "tolist", None)
+    if callable(tolist):
+        value = tolist()
+    if not isinstance(value, list):
+        raise ModelOutputError("FunASR returned invalid speaker centroids")
+    rows = [value] if value and all(isinstance(item, (int, float)) for item in value) else value
+    if any(not isinstance(row, list) for row in rows):
+        raise ModelOutputError("FunASR returned invalid speaker centroids")
     try:
-        speaker_index = int(speaker_label.rsplit("_", 1)[1])
-        rows = cast(Any, probabilities).detach().cpu().tolist()
-        if rows and isinstance(rows[0], list) and rows[0] and isinstance(rows[0][0], list):
-            if len(rows) != 1:
-                raise ValueError("expected one Sortformer probability batch")
-            rows = rows[0]
-        start = min(len(rows) - 1, start_ms * len(rows) // duration_ms)
-        end = max(start + 1, min(len(rows), ceil(end_ms * len(rows) / duration_ms)))
-        values = [float(row[speaker_index]) for row in rows[start:end]]
-    except (AttributeError, IndexError, TypeError, ValueError, ZeroDivisionError) as error:
-        raise ModelOutputError("Sortformer returned invalid speaker probabilities") from error
-    if not values or any(not 0.0 <= value <= 1.0 for value in values):
-        raise ModelOutputError("Sortformer returned invalid speaker probabilities")
-    return min(maximum_confidence, sum(values) / len(values))
+        return tuple(
+            SpeakerEmbeddingSample(
+                speaker_label=str(index),
+                embedding=tuple(float(cast(int | float, number)) for number in row),
+            )
+            for index, row in enumerate(rows)
+        )
+    except (TypeError, ValueError) as error:
+        raise ModelOutputError("FunASR returned invalid speaker centroids") from error
+
+
+def _pcm16_float32(pcm16: bytes) -> object:
+    try:
+        numpy = __import__("numpy")
+    except ImportError as error:
+        raise ModelUnavailableError("FunASR streaming requires NumPy") from error
+    return numpy.frombuffer(pcm16, dtype="<i2").astype("float32") / 32768.0
 
 
 def _parse_output(content: str, duration_ms: int) -> _DiarizationOutput:
@@ -949,74 +925,6 @@ def _parse_active_speakers(content: str) -> _ActiveSpeakerOutput:
         return _ActiveSpeakerOutput.model_validate_json(unwrap_json_code_fence(content))
     except ValidationError as error:
         raise ModelOutputError("active-speaker model returned invalid structured output") from error
-
-
-def _word_timestamps(value: object) -> tuple[tuple[int, int], ...]:
-    if not isinstance(value, list):
-        raise ModelOutputError("FunASR returned no word timestamps")
-    rows = []
-    for item in value:
-        if (
-            not isinstance(item, (list, tuple))
-            or len(item) != 2
-            or not all(isinstance(number, (int, float)) for number in item)
-        ):
-            raise ModelOutputError("FunASR returned an invalid word timestamp")
-        start_ms, end_ms = round(item[0]), round(item[1])
-        if start_ms < 0 or end_ms <= start_ms:
-            raise ModelOutputError("FunASR returned an invalid word time range")
-        rows.append((start_ms, end_ms))
-    return tuple(rows)
-
-
-def _overlap_ms(left: SpeechSegment, right: SpeechSegment) -> int:
-    return max(0, min(left.end_ms, right.end_ms) - max(left.start_ms, right.start_ms))
-
-
-def _split_timestamped_tokens(
-    tokens: list[str],
-    timestamps: tuple[tuple[int, int], ...],
-    *,
-    maximum_silence_ms: int,
-    maximum_segment_ms: int,
-    minimum_segment_ms: int,
-) -> tuple[SpeechSegment, ...]:
-    groups: list[list[tuple[str, tuple[int, int]]]] = []
-    current: list[tuple[str, tuple[int, int]]] = []
-    for token, timestamp in zip(tokens, timestamps, strict=True):
-        if current and (
-            timestamp[0] - current[-1][1][1] >= maximum_silence_ms
-            or timestamp[1] - current[0][1][0] > maximum_segment_ms
-        ):
-            groups.append(current)
-            current = []
-        current.append((token, timestamp))
-    if current:
-        groups.append(current)
-    return tuple(
-        SpeechSegment(
-            sample_id=f"asr-{group[0][1][0]:012d}-{group[-1][1][1]:012d}-{index:03d}",
-            start_ms=group[0][1][0],
-            end_ms=group[-1][1][1],
-            confidence=min(0.95, max(0.4, (group[-1][1][1] - group[0][1][0]) / 2_000)),
-            transcript=_join_asr_tokens([token for token, _ in group]),
-        )
-        for index, group in enumerate(groups)
-        if group[-1][1][1] - group[0][1][0] >= minimum_segment_ms
-    )
-
-
-def _join_asr_tokens(tokens: list[str]) -> str:
-    text = ""
-    previous_ascii_word = False
-    for token in tokens:
-        ascii_word = token.isascii() and any(character.isalnum() for character in token)
-        punctuation = all(unicodedata.category(character).startswith("P") for character in token)
-        if text and not punctuation and (ascii_word or previous_ascii_word):
-            text += " "
-        text += token
-        previous_ascii_word = ascii_word
-    return text
 
 
 def _read_bounded_media(media_path: Path, maximum_media_bytes: int) -> tuple[Path, bytes]:
@@ -1108,36 +1016,3 @@ def _annotated_face_video(
         except (OSError, subprocess.SubprocessError) as error:
             raise ModelOutputError("FFmpeg could not annotate face anchors") from error
         return _read_bounded_media(Path(annotated.name), maximum_media_bytes)
-
-
-def _extract_audio_wav(media_path: Path) -> bytes:
-    path = media_path.resolve(strict=True)
-    try:
-        completed = subprocess.run(
-            (
-                "ffmpeg",
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-i",
-                str(path),
-                "-vn",
-                "-ac",
-                "1",
-                "-ar",
-                "16000",
-                "-c:a",
-                "pcm_s16le",
-                "-f",
-                "wav",
-                "pipe:1",
-            ),
-            check=True,
-            capture_output=True,
-            timeout=120,
-        )
-    except (OSError, subprocess.SubprocessError) as error:
-        raise ModelOutputError("FFmpeg could not extract the diarization audio") from error
-    if not completed.stdout or len(completed.stdout) > _MAXIMUM_AUDIO_BYTES:
-        raise ModelOutputError("extracted diarization audio is empty or too large")
-    return completed.stdout

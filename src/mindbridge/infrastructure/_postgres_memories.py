@@ -415,10 +415,42 @@ WITH ranked_evidence AS (
     SELECT evidence_id, rank
     FROM unnest(%(evidence_ids)s::text[]) WITH ORDINALITY AS hit(evidence_id, rank)
 ),
+ranked_ranges AS (
+    SELECT source.*, hit.rank,
+           EXISTS (
+               SELECT 1
+               FROM embeddings AS embedding
+               WHERE embedding.tenant_id = source.tenant_id
+                 AND embedding.object_type = 'evidence_span'
+                 AND embedding.object_id = source.evidence_id
+           ) AS has_embedding
+    FROM ranked_evidence AS hit
+    JOIN evidence_spans AS source
+      ON source.tenant_id = %(tenant_id)s AND source.evidence_id = hit.evidence_id
+),
 ranked_memories AS (
     SELECT link.tenant_id, link.memory_id, min(hit.rank) AS dense_rank
     FROM memory_evidence AS link
-    JOIN ranked_evidence AS hit ON hit.evidence_id = link.evidence_id
+    JOIN evidence_spans AS target
+      ON target.tenant_id = link.tenant_id AND target.evidence_id = link.evidence_id
+    JOIN ranked_ranges AS hit
+      ON hit.tenant_id = target.tenant_id
+     AND (
+         target.evidence_id = hit.evidence_id
+         OR (
+             hit.has_embedding
+             AND target.observation_id = hit.observation_id
+             AND target.media_object_id = hit.media_object_id
+             AND target.start_ms >= hit.start_ms
+             AND target.end_ms <= hit.end_ms
+             AND (hit.audio_track IS NULL OR target.audio_track = hit.audio_track)
+             AND (
+                 hit.x_min IS NULL
+                 OR (target.x_min, target.y_min, target.x_max, target.y_max)
+                    = (hit.x_min, hit.y_min, hit.x_max, hit.y_max)
+             )
+         )
+     )
     WHERE link.tenant_id = %(tenant_id)s
     GROUP BY link.tenant_id, link.memory_id
 )

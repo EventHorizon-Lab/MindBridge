@@ -29,7 +29,6 @@ edge = [
     "opentelemetry-instrumentation-botocore>=0.65b0,<1",
     "opentelemetry-instrumentation-httpx>=0.65b0,<1",
     "opentelemetry-sdk>=1.44,<2",
-    "soundfile>=0.13,<1",
 ]
 server = [
     "boto3>=1.40,<2",

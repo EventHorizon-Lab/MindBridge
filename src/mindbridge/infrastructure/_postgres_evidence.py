@@ -42,6 +42,45 @@ FROM evidence_spans
 """
 
 
+async def write_evidence_spans(
+    connection: DatabaseConnection,
+    evidence_spans: tuple[EvidenceSpan, ...],
+) -> None:
+    """Write already validated spans on the caller's transaction."""
+    if not evidence_spans:
+        return
+    async with connection.cursor() as cursor:
+        await cursor.executemany(
+            """
+            INSERT INTO evidence_spans (
+                tenant_id, evidence_id, observation_id, media_object_id,
+                start_ms, end_ms, frame_start, frame_end,
+                x_min, y_min, x_max, y_max, audio_track, created_at
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            (
+                (
+                    evidence.tenant_id,
+                    evidence.evidence_id,
+                    evidence.observation_id,
+                    evidence.media_object_id,
+                    evidence.start_ms,
+                    evidence.end_ms,
+                    evidence.frame_start,
+                    evidence.frame_end,
+                    evidence.region.x_min if evidence.region is not None else None,
+                    evidence.region.y_min if evidence.region is not None else None,
+                    evidence.region.x_max if evidence.region is not None else None,
+                    evidence.region.y_max if evidence.region is not None else None,
+                    evidence.audio_track,
+                    evidence.created_at,
+                )
+                for evidence in evidence_spans
+            ),
+        )
+
+
 async def read_evidence(
     pool: DatabasePool,
     tenant_id: TenantId,

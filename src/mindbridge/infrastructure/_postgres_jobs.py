@@ -167,6 +167,39 @@ async def mark_observation_processing_succeeded_on_connection(
     return completed
 
 
+async def lock_observation_processing_attempt(
+    connection: DatabaseConnection,
+    tenant_id: TenantId,
+    observation_id: ObservationId,
+    job_id: JobId,
+    *,
+    attempt: int,
+) -> None:
+    """Lock the active attempt before any derived record can be written."""
+    _require_expected_job_id(observation_id, job_id)
+    cursor = await connection.execute(
+        """
+        SELECT job_id, tenant_id, state, attempt, error_code,
+               created_at, updated_at, payload ->> 'observation_id',
+               COALESCE(payload -> 'memory_ids', '[]'::jsonb)
+        FROM jobs
+        WHERE tenant_id = %s AND job_id = %s
+        FOR UPDATE
+        """,
+        (tenant_id, job_id),
+    )
+    row = await cursor.fetchone()
+    if row is None:
+        raise MemoryIntegrityError("observation processing job does not exist")
+    job = _job_from_row(cast(JobRow, row))
+    if job.observation_id != observation_id:
+        raise MemoryIntegrityError("observation processing job payload conflicts with task")
+    if job.attempt != attempt:
+        raise MemoryIntegrityError("observation processing attempt was superseded")
+    if job.state is not JobState.RUNNING:
+        raise MemoryIntegrityError("observation processing job is not running")
+
+
 async def mark_observation_processing_failed(
     pool: DatabasePool,
     tenant_id: TenantId,

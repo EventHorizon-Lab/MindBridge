@@ -905,6 +905,39 @@ async def test_recall_uses_bounded_model_queries_to_reach_missing_evidence() -> 
     assert missing.memory_id in {memory.memory_id for memory in result.memories}
 
 
+async def test_recall_stops_after_two_product_wide_refinement_waves() -> None:
+    store = InMemoryStore()
+    recall_embedder = RecordingRecallEmbedder()
+    answerer = RecordingAnswerer(
+        answers=(
+            GeneratedAnswer(answer=None, confidence=0.0, retrieval_queries=("bridge one",)),
+            GeneratedAnswer(answer=None, confidence=0.0, retrieval_queries=("final detail",)),
+            GeneratedAnswer(answer="Grounded final answer.", confidence=0.9),
+        )
+    )
+    kernel = _kernel(store, answerer, recall_embedder=recall_embedder)
+    for key, summary in (
+        ("initial", "start question"),
+        ("bridge", "bridge one"),
+        ("final", "final detail"),
+    ):
+        await kernel.remember(
+            _remember_request(idempotency_key=key).model_copy(update={"summary": summary})
+        )
+
+    result = await kernel.recall(
+        RecallRequest(tenant_id="tenant_01", query=RecallQuery(text="start question"))
+    )
+
+    assert result.answer == "Grounded final answer."
+    assert answerer.calls == 3
+    assert [query.text for query in recall_embedder.queries] == [
+        "start question",
+        "bridge one",
+        "final detail",
+    ]
+
+
 async def test_recall_keeps_provisional_answer_when_reflection_finds_no_new_candidate() -> None:
     store = InMemoryStore()
     recall_embedder = RecordingRecallEmbedder()

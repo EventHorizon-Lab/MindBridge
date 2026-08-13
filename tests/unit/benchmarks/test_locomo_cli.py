@@ -10,6 +10,7 @@ import pytest
 from mindbridge.benchmarks.artifacts import require_writable_output_pair
 from mindbridge.benchmarks.locomo import LoCoMoConversation, LoCoMoQuestion, LoCoMoTurn
 from mindbridge.benchmarks.locomo_cli import (
+    LOCOMO_RUNNER_VERSION,
     LoCoMoRunManifest,
     _Arguments,
     _select_conversations,
@@ -56,8 +57,8 @@ def test_locomo_artifacts_pin_source_system_code_and_output(tmp_path: Path) -> N
     assert manifest.source_revision == "official-revision"
     assert manifest.code_revision == "mindbridge-commit"
     assert manifest.answer_model_revision == "serving-fingerprint"
+    assert manifest.runner_version == LOCOMO_RUNNER_VERSION == "locomo_production_api_v7"
     assert manifest.reasoning_effort == "low"
-    assert manifest.inference_recall_limit == 50
     assert manifest.run_id == "run_01"
     assert manifest.request_timeout_seconds == 1_800.0
     assert manifest.memory_item_count == 1

@@ -27,6 +27,7 @@ from mindbridge.application.perception import (
     PerceivedEntity,
     PerceivedEvent,
     ResolvedEvidence,
+    time_ranges_overlap,
 )
 from mindbridge.core import (
     ClaimType,
@@ -47,7 +48,7 @@ from mindbridge.models.openai_omni import (
 )
 from mindbridge.telemetry import set_current_span_attributes, trace_operation
 
-PERCEIVE_EVENTS_PROMPT_VERSION = "perceive_events_v8"
+PERCEIVE_EVENTS_PROMPT_VERSION = "perceive_events_v9"
 
 _PERCEIVE_EVENTS_PROMPT = f"""# Role
 You convert embodied image, video, and audio observations into grounded, retrievable memories.
@@ -60,9 +61,16 @@ their occurrences are temporally distinguishable, and keep one continuous action
 important spoken wording and visible text exactly in descriptions or claims. Report an exact count
 only when the media supports it.
 
+Internally inventory visual changes, speech and non-speech sounds, visible text, and identity tracks
+independently before aligning them. Do not let a transcript replace contradictory or richer visual
+evidence, and do not discard a silent visual event or an audio-only event.
+
 # Grounding rules
 - Times are integer milliseconds from observation start and must stay within duration_ms. Every
-  event must overlap each cited evidence span.
+  event must overlap each cited evidence span. Use the tightest interval that contains the evidence
+  for that occurrence: start at its first perceptible cue and end at its last, rather than defaulting
+  to the whole clip. Keep repeated occurrences separate. If a boundary is uncertain, use the
+  narrowest defensible interval and lower confidence instead of inventing precision.
 - Use only supplied evidence_ids. Entity and claim evidence_ids must belong to their event; claim
   validity must stay within its event.
 - Identity observations are trusted edge matches, not natural-language labels. A face identity may
@@ -454,7 +462,15 @@ def _require_grounded_output(
             spans = tuple(evidence_by_id[evidence_id] for evidence_id in event.evidence_ids)
         except KeyError as error:
             raise ModelOutputError("Omni perception event references unknown evidence") from error
-        if any(span.end_ms < event.start_ms or span.start_ms > event.end_ms for span in spans):
+        if any(
+            not time_ranges_overlap(
+                span.start_ms,
+                span.end_ms,
+                event.start_ms,
+                event.end_ms,
+            )
+            for span in spans
+        ):
             raise ModelOutputError("Omni perception event does not overlap its evidence")
         event_evidence_ids = set(event.evidence_ids)
         if any(

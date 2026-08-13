@@ -17,7 +17,10 @@ from mindbridge.application.perception import (
     ResolvedEvidence,
 )
 from mindbridge.application.ports import PresignedMediaDownload
-from mindbridge.application.process_observation import ProcessObservation
+from mindbridge.application.process_observation import (
+    ProcessObservation,
+    _require_grounded_perception,
+)
 from mindbridge.core import (
     AnonymousIdentityObservation,
     ClaimType,
@@ -244,6 +247,11 @@ async def test_processor_builds_event_memory_and_raw_media_embedding_once() -> N
     assert first.memory_ids == tuple(memory.memory_id for memory in store.output.memories)
     assert store.output.events[0].prompt_version == "perceive_events_v1"
     assert store.output.memories[0].summary == store.output.events[0].description
+    assert len(store.output.evidence_spans) == 1
+    event_evidence = store.output.evidence_spans[0]
+    assert (event_evidence.start_ms, event_evidence.end_ms) == (500, 3_500)
+    assert store.output.events[0].evidence_ids == (event_evidence.evidence_id,)
+    assert store.output.claims[0].evidence_ids == (event_evidence.evidence_id,)
     assert store.output.embeddings[0].object_type is EmbeddedObjectType.EVIDENCE_SPAN
     assert store.output.embeddings[0].object_id == "evidence_01"
     assert tuple(
@@ -271,7 +279,7 @@ async def test_processor_builds_event_memory_and_raw_media_embedding_once() -> N
         if mention.entity_id == "person_robot_01"
     )
     assert identity_mention.event_id == store.output.events[0].event_id
-    assert identity_mention.evidence_id == "evidence_01"
+    assert identity_mention.evidence_id == event_evidence.evidence_id
 
 
 async def test_processing_output_rejects_a_graph_without_event_memory_link() -> None:
@@ -294,6 +302,56 @@ async def test_processing_output_rejects_a_graph_without_event_memory_link() -> 
 
     with pytest.raises(DomainInvariantError, match="one-to-one"):
         replace(store.output, relations=relations)
+
+
+async def test_processing_output_rejects_memory_evidence_from_another_record() -> None:
+    store = RecordingProcessingStore()
+    await _processor(
+        store,
+        RecordingPerceiver(),
+        RecordingEmbedder(),
+        RecordingTextEmbedder(),
+    ).run(TENANT_ID, OBSERVATION_ID, JOB_ID)
+    assert store.output is not None
+    other_evidence = replace(
+        store.output.evidence_spans[0],
+        evidence_id=EvidenceId("event_evidence_other"),
+    )
+    memories = (
+        replace(store.output.memories[0], evidence_ids=(other_evidence.evidence_id,)),
+        *store.output.memories[1:],
+    )
+
+    with pytest.raises(DomainInvariantError, match="memory evidence"):
+        replace(
+            store.output,
+            evidence_spans=(*store.output.evidence_spans, other_evidence),
+            memories=memories,
+        )
+
+
+def test_grounding_requires_positive_temporal_overlap_but_accepts_point_evidence() -> None:
+    batch = _batch()
+    source = replace(batch.evidence_spans[0], end_ms=500)
+    resolved = ResolvedEvidence(
+        evidence_span=source,
+        media_object=batch.media_objects[0],
+        media_url="https://objects.example.test/clip.mp4",
+        media_url_expires_at=NOW + timedelta(minutes=5),
+    )
+    event = PerceivedEvent(
+        start_ms=500,
+        end_ms=1_000,
+        description="An event after the source interval.",
+        salience=0.5,
+        evidence_ids=(source.evidence_id,),
+    )
+
+    with pytest.raises(DomainInvariantError, match="does not overlap"):
+        _require_grounded_perception(batch.observation, (resolved,), (event,))
+
+    point = replace(resolved, evidence_span=replace(source, start_ms=500))
+    _require_grounded_perception(batch.observation, (point,), (event,))
 
 
 def test_event_perception_rejects_an_unbounded_detail_fanout() -> None:

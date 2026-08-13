@@ -50,6 +50,7 @@ class ObservationBatch:
 class ObservationProcessingOutput:
     """Derived records committed together with successful job state."""
 
+    evidence_spans: tuple[EvidenceSpan, ...]
     events: tuple[Event, ...]
     entities: tuple[Entity, ...]
     entity_mentions: tuple[EntityMention, ...]
@@ -69,6 +70,7 @@ def _output_identifiers(
     output: ObservationProcessingOutput,
 ) -> dict[str, tuple[str, ...]]:
     return {
+        "evidence span": tuple(str(item.evidence_id) for item in output.evidence_spans),
         "event": tuple(str(item.event_id) for item in output.events),
         "entity": tuple(str(item.entity_id) for item in output.entities),
         "entity mention": tuple(str(item.mention_id) for item in output.entity_mentions),
@@ -89,6 +91,7 @@ def _require_single_tenant(output: ObservationProcessingOutput) -> None:
     tenant_ids = {
         item.tenant_id
         for items in (
+            output.evidence_spans,
             output.events,
             output.entities,
             output.entity_mentions,
@@ -107,6 +110,17 @@ def _require_valid_graph(
     output: ObservationProcessingOutput,
     identifiers: dict[str, tuple[str, ...]],
 ) -> None:
+    evidence_ids = set(identifiers["evidence span"])
+    referenced_evidence_ids = (
+        {str(evidence_id) for event in output.events for evidence_id in event.evidence_ids}
+        | {str(evidence_id) for claim in output.claims for evidence_id in claim.evidence_ids}
+        | {str(evidence_id) for memory in output.memories for evidence_id in memory.evidence_ids}
+        | {str(mention.evidence_id) for mention in output.entity_mentions}
+    )
+    if referenced_evidence_ids != evidence_ids:
+        raise DomainInvariantError(
+            "derived graph evidence references must equal its exact evidence spans"
+        )
     node_ids = {
         RelationNodeType.EVENT: set(identifiers["event"]),
         RelationNodeType.ENTITY: set(identifiers["entity"]),
@@ -167,6 +181,7 @@ def _require_valid_graph(
         raise DomainInvariantError(
             "derived events and claims must map one-to-one to memory representations"
         )
+    _require_matching_memory_evidence(output, representations)
 
     asserted_claims = {
         target_id
@@ -190,3 +205,25 @@ def _require_valid_graph(
     }
     if mention_edges != expected_mentions:
         raise DomainInvariantError("entity mention rows and graph relations must agree")
+
+
+def _require_matching_memory_evidence(
+    output: ObservationProcessingOutput,
+    representations: set[tuple[RelationNodeType, str, str]],
+) -> None:
+    source_evidence = {
+        **{
+            (RelationNodeType.EVENT, str(event.event_id)): event.evidence_ids
+            for event in output.events
+        },
+        **{
+            (RelationNodeType.CLAIM, str(claim.claim_id)): claim.evidence_ids
+            for claim in output.claims
+        },
+    }
+    memory_evidence = {str(memory.memory_id): memory.evidence_ids for memory in output.memories}
+    if any(
+        memory_evidence[target_id] != source_evidence[source_type, source_id]
+        for source_type, source_id, target_id in representations
+    ):
+        raise DomainInvariantError("derived memory evidence must match its represented record")
