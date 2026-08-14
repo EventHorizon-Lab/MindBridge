@@ -22,7 +22,7 @@ from mindbridge.contracts import (
     RememberRequest,
 )
 from mindbridge.core import MemoryType
-from mindbridge.sdk import AsyncMindBridge
+from mindbridge.sdk import MindBridge
 
 LOCOMO_PREDICTION_KEY = "mindbridge_prediction"
 LOCOMO_ABSTENTION = "Not mentioned in the conversation"
@@ -49,7 +49,7 @@ class LoCoMoOfficialConversationResult(ContractModel):
 
 
 async def run_locomo_conversation(
-    memory: AsyncMindBridge,
+    memory: MindBridge,
     conversation: LoCoMoConversation,
     *,
     run_id: str,
@@ -86,7 +86,7 @@ async def run_locomo_conversation(
 
 
 async def _remember_turn(
-    memory: AsyncMindBridge,
+    memory: MindBridge,
     tenant_id: str,
     sample_id: str,
     turn: LoCoMoTurn,
@@ -106,7 +106,7 @@ async def _remember_turn(
 
 
 async def _answer_question(
-    memory: AsyncMindBridge,
+    memory: MindBridge,
     tenant_id: str,
     question: LoCoMoQuestion,
     dialog_id_by_memory_id: dict[str, str],

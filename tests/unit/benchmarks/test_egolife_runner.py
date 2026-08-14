@@ -7,7 +7,7 @@ from typing import cast
 import pytest
 from pydantic import ValidationError
 
-from mindbridge import AsyncMindBridge
+from mindbridge import MindBridge
 from mindbridge.benchmarks import (
     EgoLifeOption,
     EgoLifePreparedClip,
@@ -92,7 +92,7 @@ async def test_egolife_answers_before_ingesting_a_clip_that_crosses_query_time()
     )
 
     results = await run_egolife_qa(
-        cast(AsyncMindBridge, api),
+        cast(MindBridge, api),
         questions,
         _prepared_stream(),
         run_id="run_01",
@@ -129,7 +129,7 @@ async def test_egolife_ingests_official_caption_without_reprocessing_video() -> 
     )
 
     await run_egolife_qa(
-        cast(AsyncMindBridge, api),
+        cast(MindBridge, api),
         (_question("q_1", "10004500"),),
         prepared,
         run_id="run_01",
@@ -161,7 +161,7 @@ async def test_egolife_binds_released_caption_to_source_video() -> None:
     )
 
     await run_egolife_qa(
-        cast(AsyncMindBridge, api),
+        cast(MindBridge, api),
         (_question("q_1", "10004500"),),
         prepared,
         run_id="run_01",
@@ -201,7 +201,7 @@ async def test_egolife_keeps_released_visual_and_audio_memories_separate() -> No
     )
 
     await run_egolife_qa(
-        cast(AsyncMindBridge, api),
+        cast(MindBridge, api),
         (_question("q_1", "10004500"),),
         prepared,
         run_id="run_01",

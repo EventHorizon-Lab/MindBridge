@@ -6,14 +6,16 @@ from typing import cast
 
 from mcp import Client
 
-from mindbridge.api import TenantApiKeyAuthenticator, create_app, create_mcp_server
+from mindbridge.api.app import build_app
+from mindbridge.api.auth import TenantApiKeyAuthenticator
+from mindbridge.api.mcp import build_mcp_server
 from mindbridge.application.kernel import MemoryKernel
 
 SNAPSHOT_DIRECTORY = Path(__file__).with_name("snapshots")
 
 
 def test_openapi_schema_matches_snapshot() -> None:
-    app = create_app(
+    app = build_app(
         cast(MemoryKernel, object()),
         authenticator=TenantApiKeyAuthenticator(
             {"tenant_01": ("tenant-api-key-000000000000000000",)}
@@ -24,7 +26,7 @@ def test_openapi_schema_matches_snapshot() -> None:
 
 
 async def test_mcp_tool_schemas_match_snapshot() -> None:
-    server = create_mcp_server(cast(MemoryKernel, object()))
+    server = build_mcp_server(cast(MemoryKernel, object()))
 
     async with Client(server) as client:
         result = await client.list_tools()

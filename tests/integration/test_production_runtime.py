@@ -7,11 +7,7 @@ from fastapi.testclient import TestClient
 from mcp import Client
 from psycopg import connect
 
-from mindbridge.api import (
-    RuntimeSettings,
-    create_production_app,
-    create_production_mcp_server,
-)
+from mindbridge.server import Settings, create_app, create_mcp_server
 
 DATABASE_URL = os.getenv("MINDBRIDGE_TEST_DATABASE_URL")
 
@@ -34,22 +30,9 @@ def test_production_app_opens_and_closes_runtime_resources(
     monkeypatch.setenv("AWS_ACCESS_KEY_ID", "test-access-key")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "test-secret-key")
     monkeypatch.setenv("AWS_EC2_METADATA_DISABLED", "true")
-    settings = RuntimeSettings(
-        database_url=DATABASE_URL,
-        object_storage_bucket="memory",
-        object_storage_endpoint_url="https://objects.example.test",
-        task_broker_url="memory://",
-        vlm_api_key="unit-test-vlm-key",
-        vlm_endpoint="https://vlm.example.test/api/v1/chat/completions",
-        vlm_model_revision="deployment-revision",
-        embedding_api_key="unit-test-embedding-key",
-        embedding_endpoint="https://embedding.example.test/api/v1/embeddings",
-        text_embedding_api_key="unit-test-text-key",
-        text_embedding_endpoint="https://text.example.test/api/v1/embeddings",
-        tenant_api_keys_json=('{"tenant_01":["tenant-api-key-000000000000000000"]}'),
-    )
+    settings = _settings(tenant_api_keys_json='{"tenant_01":["tenant-api-key-000000000000000000"]}')
 
-    with TestClient(create_production_app(settings)) as client:
+    with TestClient(create_app(settings)) as client:
         response = client.get("/healthz")
 
     assert response.status_code == 200
@@ -64,21 +47,38 @@ async def test_production_mcp_opens_and_closes_runtime_resources(
     monkeypatch.setenv("AWS_ACCESS_KEY_ID", "test-access-key")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "test-secret-key")
     monkeypatch.setenv("AWS_EC2_METADATA_DISABLED", "true")
-    settings = RuntimeSettings(
+    settings = _settings()
+
+    async with Client(create_mcp_server(settings)) as client:
+        tools = await client.list_tools()
+
+    assert {tool.name for tool in tools.tools} >= {"memory_observe", "memory_recall"}
+
+
+def _settings(*, tenant_api_keys_json: str | None = None) -> Settings:
+    assert DATABASE_URL is not None
+    return Settings(
         database_url=DATABASE_URL,
         object_storage_bucket="memory",
         object_storage_endpoint_url="https://objects.example.test",
         task_broker_url="memory://",
-        vlm_api_key="unit-test-vlm-key",
-        vlm_endpoint="https://vlm.example.test/api/v1/chat/completions",
-        vlm_model_revision="deployment-revision",
-        embedding_api_key="unit-test-embedding-key",
-        embedding_endpoint="https://embedding.example.test/api/v1/embeddings",
-        text_embedding_api_key="unit-test-text-key",
-        text_embedding_endpoint="https://text.example.test/api/v1/embeddings",
+        generator_config={
+            "api_key": "unit-test-generator-key",
+            "endpoint": "https://generator.example.test/v1",
+            "model_id": "qwen3.8-max",
+            "model_revision": "deployment-revision",
+        },
+        embedder_config={
+            "api_key": "unit-test-query-key",
+            "endpoint": "https://query.example.test/v1",
+            "model_id": "jina-query",
+            "model_revision": "query-revision",
+            "document_api_key": "unit-test-document-key",
+            "document_endpoint": "https://document.example.test/v1",
+            "document_model_id": "jina-document",
+            "document_model_revision": "document-revision",
+            "space_id": "jina-v5",
+            "space_revision": "space-v1",
+        },
+        tenant_api_keys_json=tenant_api_keys_json,
     )
-
-    async with Client(create_production_mcp_server(settings)) as client:
-        tools = await client.list_tools()
-
-    assert {tool.name for tool in tools.tools} >= {"memory_observe", "memory_recall"}

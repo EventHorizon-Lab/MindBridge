@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from mindbridge.benchmarks.artifacts import load_deployment_snapshot
 from mindbridge.benchmarks.m3_bench import M3BenchQuestion, M3BenchVideo
 from mindbridge.benchmarks.m3_cli import (
     M3RunManifest,
@@ -24,7 +25,6 @@ from mindbridge.benchmarks.m3_runner import (
 )
 from mindbridge.contracts import MediaObjectInput
 from mindbridge.core import MediaKind
-from mindbridge.models.jina import DEFAULT_JINA_OMNI_MODEL_ID, DEFAULT_JINA_OMNI_REVISION
 
 NOW = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
 
@@ -51,11 +51,13 @@ def test_m3_artifacts_pin_media_models_code_and_jsonl_output(tmp_path: Path) -> 
         mindbridge_trace_id="trace_01",
     )
 
+    arguments = _arguments(dataset_path, prepared_path, output_path)
     _write_artifacts(
-        _arguments(dataset_path, prepared_path, output_path),
+        arguments,
         (video,),
         {video.video_id: prepared},
         (result,),
+        load_deployment_snapshot(arguments.deployment_config_path, require_worker=True),
     )
 
     prediction = json.loads(output_path.read_text(encoding="utf-8"))
@@ -66,9 +68,13 @@ def test_m3_artifacts_pin_media_models_code_and_jsonl_output(tmp_path: Path) -> 
     assert prediction["response"] == "A person entered"
     assert manifest.source_revision == "official-revision"
     assert manifest.media_revision == "official-media-revision"
-    assert manifest.perception_model_revision == "perception-serving-fingerprint"
-    assert manifest.answer_model_revision == "answer-serving-fingerprint"
-    assert manifest.reasoning_effort == "low"
+    assert manifest.deployment.worker_generator is not None
+    assert manifest.deployment.worker_generator.config["model_revision"] == (
+        "perception-serving-fingerprint"
+    )
+    assert manifest.deployment.server_generator.config["model_revision"] == (
+        "answer-serving-fingerprint"
+    )
     assert manifest.request_timeout_seconds == 1_800.0
     assert manifest.run_id == "run_01"
     assert manifest.clip_count == 1
@@ -96,16 +102,24 @@ def test_m3_media_manifest_and_selection_fail_closed(tmp_path: Path) -> None:
 
 
 def test_m3_artifacts_reject_missing_predictions(tmp_path: Path) -> None:
+    arguments = _arguments(
+        tmp_path / "robot.json",
+        tmp_path / "prepared.json",
+        tmp_path / "out",
+    )
     with pytest.raises(ValueError, match="question order"):
         _write_artifacts(
-            _arguments(tmp_path / "robot.json", tmp_path / "prepared.json", tmp_path / "out"),
+            arguments,
             (_video(),),
             {"video_01": _prepared()},
             (),
+            load_deployment_snapshot(arguments.deployment_config_path, require_worker=True),
         )
 
 
 def _arguments(dataset_path: Path, prepared_path: Path, output_path: Path) -> _Arguments:
+    deployment_path = dataset_path.parent / "deployment.json"
+    _write_deployment(deployment_path)
     return _Arguments(
         dataset_path=dataset_path,
         prepared_media_path=prepared_path,
@@ -115,13 +129,7 @@ def _arguments(dataset_path: Path, prepared_path: Path, output_path: Path) -> _A
         source_revision="official-revision",
         media_revision="official-media-revision",
         code_revision="mindbridge-commit",
-        perception_model_id="qwen3.8-max",
-        perception_model_revision="perception-serving-fingerprint",
-        answer_model_id="qwen3.8-max",
-        answer_model_revision="answer-serving-fingerprint",
-        answer_reasoning_effort="low",
-        embedding_model_id=DEFAULT_JINA_OMNI_MODEL_ID,
-        embedding_model_revision=DEFAULT_JINA_OMNI_REVISION,
+        deployment_config_path=deployment_path,
         run_id="run_01",
         tenant_prefix="benchmark_m3",
         device_id="m3_bench_camera",
@@ -132,6 +140,46 @@ def _arguments(dataset_path: Path, prepared_path: Path, output_path: Path) -> _A
         processing_timeout_seconds=1_800.0,
         video_ids=(),
         overwrite=False,
+    )
+
+
+def _write_deployment(path: Path) -> None:
+    path.write_text(
+        json.dumps(
+            {
+                "server_generator": {
+                    "plugin": "openai",
+                    "distribution": "mindbridge",
+                    "version": "0.1.0",
+                    "config": {"model_revision": "answer-serving-fingerprint"},
+                },
+                "server_embedder": {
+                    "plugin": "openai",
+                    "distribution": "mindbridge",
+                    "version": "0.1.0",
+                    "config": {},
+                },
+                "worker_generator": {
+                    "plugin": "openai",
+                    "distribution": "mindbridge",
+                    "version": "0.1.0",
+                    "config": {"model_revision": "perception-serving-fingerprint"},
+                },
+                "worker_media_embedder": {
+                    "plugin": "jina",
+                    "distribution": "mindbridge",
+                    "version": "0.1.0",
+                    "config": {},
+                },
+                "worker_text_embedder": {
+                    "plugin": "openai",
+                    "distribution": "mindbridge",
+                    "version": "0.1.0",
+                    "config": {},
+                },
+            }
+        ),
+        encoding="utf-8",
     )
 
 

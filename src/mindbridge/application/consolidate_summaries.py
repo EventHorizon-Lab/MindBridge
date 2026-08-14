@@ -5,9 +5,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Protocol
 
+from mindbridge.application.capabilities import Embedder
 from mindbridge.application.evidence import EvidenceReader, read_resolved_evidence
 from mindbridge.application.perception import ResolvedEvidence
-from mindbridge.application.ports import MediaUrlSigner, TextDocumentEmbedder
+from mindbridge.application.ports import MediaUrlSigner
 from mindbridge.application.summary_consolidation import (
     SummaryCandidate,
     SummaryCandidateCursor,
@@ -33,7 +34,7 @@ class SummaryConsolidationResult:
 
 
 class SummaryConsolidator(Protocol):
-    """Frozen Omni boundary that verifies hierarchy groups against source evidence."""
+    """Frozen model boundary that verifies hierarchy groups against source evidence."""
 
     async def propose_summaries(
         self,
@@ -64,7 +65,7 @@ class ConsolidateSummaries:
         self,
         store: SummaryConsolidationStore,
         consolidator: SummaryConsolidator,
-        text_embedder: TextDocumentEmbedder,
+        text_embedder: Embedder,
         *,
         media_url_signer: MediaUrlSigner,
     ) -> None:

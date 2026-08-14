@@ -1,5 +1,5 @@
 """Embodied memory as a service."""
 
-from mindbridge.sdk import AsyncMindBridge, MindBridgeClientError
+from mindbridge.sdk import MindBridge, MindBridgeError
 
-__all__ = ["AsyncMindBridge", "MindBridgeClientError"]
+__all__ = ["MindBridge", "MindBridgeError"]

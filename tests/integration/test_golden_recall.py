@@ -15,7 +15,6 @@ from mindbridge.application.ports import (
     PresignedMediaDownload,
     ResolvedQueryMedia,
 )
-from mindbridge.application.recall import RecallEmbeddingQuery
 from mindbridge.contracts import (
     MediaObjectInput,
     ObserveRequest,
@@ -42,6 +41,7 @@ from mindbridge.core import (
     VerificationStatus,
 )
 from mindbridge.infrastructure.postgres import PostgresMemoryStore
+from mindbridge.models import Embedding, EmbedRequest, EmbedResult, EmbedTask, TextPart
 
 TENANT_ID = TenantId("tenant_golden_recall")
 NOW = datetime(2026, 8, 12, 12, 0, tzinfo=timezone.utc)
@@ -81,35 +81,26 @@ class GoldenRecallSet(_GoldenModel):
     cases: tuple[GoldenCase, ...]
 
 
-class GoldenRecallEmbedder:
+class GoldenEmbedder:
     def __init__(self, query_axes: Mapping[str, int]) -> None:
         self._query_axes = query_axes
 
-    @property
-    def query_model_reference(self) -> ModelReference:
-        return MODEL_REFERENCE
-
-    @property
-    def document_model_reference(self) -> ModelReference:
-        return MODEL_REFERENCE
-
-    @property
-    def space_reference(self) -> EmbeddingSpaceReference:
-        return SPACE_REFERENCE
-
-    @property
-    def dimension(self) -> int:
-        return VECTOR_DIMENSION
-
-    async def encode_query(self, query: RecallEmbeddingQuery) -> tuple[float, ...]:
-        assert query.text is not None
-        return _axis_vector(self._query_axes[query.text])
-
-    async def encode_memory_document(self, text: str) -> tuple[float, ...]:
-        raise AssertionError(f"golden fixture writes immutable documents directly: {text}")
+    async def embed(self, request: EmbedRequest) -> EmbedResult:
+        if request.task is not EmbedTask.QUERY:
+            raise AssertionError("golden fixture writes immutable documents directly")
+        text = next(part.text for part in request.inputs[0].parts if isinstance(part, TextPart))
+        return EmbedResult(
+            (
+                Embedding(
+                    values=_axis_vector(self._query_axes[text]),
+                    model_reference=MODEL_REFERENCE,
+                    space_reference=SPACE_REFERENCE,
+                ),
+            )
+        )
 
 
-class FirstMemoryAnswerer:
+class FirstCandidateAnswerer:
     async def answer(
         self,
         request: RecallRequest,
@@ -166,14 +157,16 @@ async def test_golden_recall_preserves_retrieval_evidence_and_abstention(
     golden_set = GoldenRecallSet.model_validate_json(GOLDEN_SET_PATH.read_text(encoding="utf-8"))
     query_axes = {case.text: case.query_axis for case in golden_set.cases}
     media_access = DeterministicMediaAccess()
+    answerer = FirstCandidateAnswerer()
     kernel = MemoryKernel(
         store,
-        FirstMemoryAnswerer(),
+        answerer,
+        answerer,
         embedding_index=store,
         media_deleter=media_access,
         media_url_signer=media_access,
         observation_job_publisher=DiscardingObservationJobPublisher(),
-        recall_embedder=GoldenRecallEmbedder(query_axes),
+        embedder=GoldenEmbedder(query_axes),
         minimum_embedding_similarity=0.0,
         clock=lambda: NOW,
     )

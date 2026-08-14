@@ -17,7 +17,14 @@ dependencies = [
 [project.scripts]
 mindbridge-consolidate = "mindbridge.consolidation_cli:main"
 mindbridge-lifecycle = "mindbridge.lifecycle_cli:main"
-mindbridge-mcp = "mindbridge.api.runtime:run_production_mcp"
+mindbridge-mcp = "mindbridge.server:run_mcp"
+
+[project.entry-points."mindbridge.generators"]
+openai = "mindbridge.models.openai:create_generator"
+
+[project.entry-points."mindbridge.embedders"]
+jina = "mindbridge.models.jina:create_embedder"
+openai = "mindbridge.models.openai:create_embedder"
 
 [project.optional-dependencies]
 edge = [

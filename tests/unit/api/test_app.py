@@ -6,7 +6,8 @@ from typing import cast
 import pytest
 from fastapi.testclient import TestClient
 
-from mindbridge.api import TenantApiKeyAuthenticator, create_app
+from mindbridge.api.app import build_app
+from mindbridge.api.auth import TenantApiKeyAuthenticator
 from mindbridge.application.kernel import MemoryKernel
 from mindbridge.contracts import (
     DeletionListRequest,
@@ -281,7 +282,7 @@ def test_validation_errors_have_trace_and_field_location() -> None:
 
 
 def test_api_requires_a_valid_bearer_key() -> None:
-    app = create_app(cast(MemoryKernel, StubKernel()), authenticator=_authenticator())
+    app = build_app(cast(MemoryKernel, StubKernel()), authenticator=_authenticator())
     client = TestClient(app)
 
     missing = client.post(
@@ -406,7 +407,7 @@ class FailingKernel(StubKernel):
 def _client(stub: StubKernel | None = None) -> TestClient:
     kernel = cast(MemoryKernel, stub or StubKernel())
     return TestClient(
-        create_app(kernel, authenticator=_authenticator()),
+        build_app(kernel, authenticator=_authenticator()),
         headers={"Authorization": f"Bearer {TENANT_API_KEY}"},
     )
 

@@ -14,7 +14,8 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanE
 from opentelemetry.trace import NonRecordingSpan, SpanContext, SpanKind, TraceFlags, use_span
 
 from mindbridge import telemetry
-from mindbridge.api import TenantApiKeyAuthenticator, create_app
+from mindbridge.api.app import build_app
+from mindbridge.api.auth import TenantApiKeyAuthenticator
 from mindbridge.application.kernel import MemoryKernel
 from mindbridge.telemetry import (
     TelemetryProviders,
@@ -86,7 +87,7 @@ def test_fastapi_returns_trace_identity_without_capturing_secret_content() -> No
     exporter = InMemorySpanExporter()
     provider = TracerProvider()
     provider.add_span_processor(SimpleSpanProcessor(exporter))
-    app = create_app(
+    app = build_app(
         cast(MemoryKernel, object()),
         authenticator=TenantApiKeyAuthenticator(
             {"tenant_01": ("tenant-api-key-000000000000000000",)}

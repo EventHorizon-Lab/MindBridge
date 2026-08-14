@@ -7,7 +7,7 @@ from typing import cast
 import pytest
 from pydantic import ValidationError
 
-from mindbridge import AsyncMindBridge
+from mindbridge import MindBridge
 from mindbridge.benchmarks import (
     M3BenchQuestion,
     M3BenchVideo,
@@ -36,7 +36,7 @@ from mindbridge.core import (
     MemoryType,
     VerificationStatus,
 )
-from mindbridge.sdk import MindBridgeClientError
+from mindbridge.sdk import MindBridgeError
 
 NOW = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
 
@@ -107,7 +107,7 @@ class RecordingMemoryApi:
 async def test_m3_answers_at_clip_boundaries_without_future_ingestion() -> None:
     api = RecordingMemoryApi()
     results = await run_m3_video(
-        cast(AsyncMindBridge, api),
+        cast(MindBridge, api),
         _annotation(),
         _prepared_video(),
         run_id="run_01",
@@ -153,9 +153,7 @@ async def test_m3_rejects_out_of_range_boundary_before_api_calls() -> None:
     )
 
     with pytest.raises(ValueError, match="boundary"):
-        await run_m3_video(
-            cast(AsyncMindBridge, api), annotation, _prepared_video(), run_id="run_01"
-        )
+        await run_m3_video(cast(MindBridge, api), annotation, _prepared_video(), run_id="run_01")
 
     assert api.calls == []
 
@@ -169,7 +167,7 @@ async def test_m3_caption_protocol_uses_same_causal_boundary() -> None:
     )
     annotation = _annotation(questions=(_annotation().questions[0],))
 
-    await run_m3_video(cast(AsyncMindBridge, api), annotation, prepared, run_id="run_01")
+    await run_m3_video(cast(MindBridge, api), annotation, prepared, run_id="run_01")
 
     assert api.calls == [
         "remember:A person entered.",
@@ -195,7 +193,7 @@ async def test_m3_binds_released_caption_to_source_video() -> None:
     )
 
     await run_m3_video(
-        cast(AsyncMindBridge, api),
+        cast(MindBridge, api),
         _annotation(questions=(_annotation().questions[0],)),
         prepared,
         run_id="run_01",
@@ -235,7 +233,7 @@ async def test_m3_keeps_released_events_and_inferences_in_separate_memory_types(
     )
 
     await run_m3_video(
-        cast(AsyncMindBridge, api),
+        cast(MindBridge, api),
         _annotation(questions=(_annotation().questions[0],)),
         prepared,
         run_id="run_01",
@@ -252,7 +250,7 @@ async def test_m3_counts_bounded_model_failures_as_incorrect_and_continues() -> 
         async def recall(self, request: RecallRequest) -> RecallResult:
             if not self.recall_requests:
                 self.recall_requests.append(request)
-                raise MindBridgeClientError(
+                raise MindBridgeError(
                     "invalid model output",
                     code="model_output_invalid",
                     status_code=502,
@@ -261,7 +259,7 @@ async def test_m3_counts_bounded_model_failures_as_incorrect_and_continues() -> 
             return await super().recall(request)
 
     results = await run_m3_video(
-        cast(AsyncMindBridge, ModelFailingMemoryApi()),
+        cast(MindBridge, ModelFailingMemoryApi()),
         _annotation(),
         _prepared_video(),
         run_id="run_01",
@@ -278,7 +276,7 @@ async def test_job_waiter_allows_failed_attempt_to_be_retried() -> None:
     api = RecordingMemoryApi([JobState.FAILED, JobState.SUCCEEDED])
 
     job = await wait_for_observation_job(
-        cast(AsyncMindBridge, api),
+        cast(MindBridge, api),
         "tenant",
         "job_0",
         poll_interval_seconds=0.001,
@@ -298,7 +296,7 @@ async def test_job_waiter_times_out_when_status_request_never_returns() -> None:
 
     with pytest.raises(TimeoutError, match="last state was unavailable"):
         await wait_for_observation_job(
-            cast(AsyncMindBridge, HangingMemoryApi()),
+            cast(MindBridge, HangingMemoryApi()),
             "tenant",
             "job_0",
             poll_interval_seconds=0.001,

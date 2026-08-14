@@ -5,6 +5,7 @@ MindBridge is an Agentic Native Embodied Memory System: Memory-as-a-Service for 
 ## Documentation
 
 - [Technical implementation architecture](docs/technical-architecture.md)
+- [Model plugin architecture and author contract](docs/plugin-architecture.md)
 - [RTX 5090 benchmark and lifecycle validation](docs/benchmark-report-5090.md)
 - [RTX 5090 reproducibility manifest](benchmarks/manifests/benchmark-5090-clean-007.json)
 - [Edge identity model selection and validation](docs/edge-identity-sota.md)
@@ -166,6 +167,71 @@ prediction shape and a sidecar manifest containing source, code, model, Prompt, 
 identities. `MINDBRIDGE_API_KEY` identifies the exact benchmark tenant and is never written to the
 manifest.
 
+Every benchmark also requires a secret-free deployment snapshot. It records the actual capability
+slots, plugin distribution versions, model revisions, embedding space, and inference options used by
+the server and Worker. Before inference begins, the runner freezes the validated snapshot and the
+SHA-256 of those same bytes; credential-like keys are rejected.
+This is a run artifact, not a named Profile. For example, save the following as
+`.benchmarks/deployment.json` and replace the distribution versions and model revisions with those
+from the deployed processes:
+
+```json
+{
+  "server_generator": {
+    "plugin": "openai",
+    "distribution": "mindbridge",
+    "version": "0.1.0",
+    "config": {
+      "model_id": "qwen3.8-max",
+      "model_revision": "serving-fingerprint",
+      "reasoning_effort": "low"
+    }
+  },
+  "server_embedder": {
+    "plugin": "openai",
+    "distribution": "mindbridge",
+    "version": "0.1.0",
+    "config": {
+      "model_id": "jinaai/jina-embeddings-v5-omni-small-retrieval",
+      "model_revision": "12949877f0092093f366c6450340011320152a05",
+      "document_model_id": "jinaai/jina-embeddings-v5-text-small-retrieval",
+      "document_model_revision": "6856e76bb72982e58de0620458a4e8b3614da340",
+      "space_id": "jina-v5",
+      "space_revision": "deployment-space-v1",
+      "dimension": 1024
+    }
+  },
+  "worker_generator": {
+    "plugin": "openai",
+    "distribution": "mindbridge",
+    "version": "0.1.0",
+    "config": {
+      "model_id": "qwen3.8-max",
+      "model_revision": "serving-fingerprint"
+    }
+  },
+  "worker_media_embedder": {
+    "plugin": "jina",
+    "distribution": "mindbridge",
+    "version": "0.1.0",
+    "config": {
+      "model_id": "jinaai/jina-embeddings-v5-omni-small-retrieval",
+      "revision": "12949877f0092093f366c6450340011320152a05",
+      "device": "cuda"
+    }
+  },
+  "worker_text_embedder": {
+    "plugin": "openai",
+    "distribution": "mindbridge",
+    "version": "0.1.0",
+    "config": {
+      "model_id": "jinaai/jina-embeddings-v5-text-small-retrieval",
+      "model_revision": "6856e76bb72982e58de0620458a4e8b3614da340"
+    }
+  }
+}
+```
+
 ```bash
 export MINDBRIDGE_API_KEY=replace-with-a-runtime-secret
 uv run python -m mindbridge.benchmarks.locomo_cli \
@@ -173,16 +239,15 @@ uv run python -m mindbridge.benchmarks.locomo_cli \
   --output .benchmarks/results/locomo-mindbridge.json \
   --api-base-url http://localhost:8000 \
   --source-revision 3eb6f2c585f5e1699204e3c3bdf7adc5c28cb376 \
+  --deployment-config .benchmarks/deployment.json \
   --run-id locomo-001 \
   --code-revision "$(git rev-parse HEAD)" \
   --recall-limit 50 \
-  --answer-reasoning-effort low \
-  --request-timeout-seconds 1800 \
-  --answer-model-revision serving-fingerprint
+  --request-timeout-seconds 1800
 ```
 
-Use `--sample-id` for a smoke subset. The example explicitly selects the experimental Top-50 quality
-profile; the benchmark default remains the product-wide Top-20 budget until held-out or full-split
+Use `--sample-id` for a smoke subset. The example explicitly selects the experimental Top-50 recall
+budget; the benchmark default remains the product-wide Top-20 budget until held-out or full-split
 evidence justifies changing it. Existing results are preserved unless `--overwrite` is supplied. The
 prediction field is `mindbridge_prediction`, ready for the official LoCoMo evaluation functions;
 retrieved dialogue IDs use its matching
@@ -256,12 +321,10 @@ uv run python -m mindbridge.benchmarks.m3_cli \
   --subset robot \
   --source-revision 0e3e41939bd8a0b66d756e7b7eb8d5fe9992da5c \
   --media-revision 2672152eee36b25ccb38fdbc3b72135347adbb63 \
+  --deployment-config .benchmarks/deployment.json \
   --run-id m3-robot-001 \
   --code-revision "$(git rev-parse HEAD)" \
-  --perception-model-revision serving-fingerprint \
-  --answer-reasoning-effort low \
-  --request-timeout-seconds 1800 \
-  --answer-model-revision serving-fingerprint
+  --request-timeout-seconds 1800
 ```
 
 Use `--video-id` for a smoke subset. The runner rejects a `--subset` that does not match the
@@ -325,12 +388,10 @@ uv run python -m mindbridge.benchmarks.egolife_cli \
   --api-base-url http://localhost:8000 \
   --dataset-revision 143fb319be7aa5ae210c936bf4f0f3a86092afb0 \
   --evaluator-revision 7a97157908757cc898c26835b718653055ecc5f5 \
+  --deployment-config .benchmarks/deployment.json \
   --run-id egolife-a1-001 \
   --code-revision "$(git rev-parse HEAD)" \
-  --perception-model-revision serving-fingerprint \
-  --answer-reasoning-effort low \
-  --request-timeout-seconds 1800 \
-  --answer-model-revision serving-fingerprint
+  --request-timeout-seconds 1800
 ```
 
 SuperMemory-VQA runs one participant per invocation. Each prepared video records its official Unix
@@ -380,12 +441,10 @@ uv run python -m mindbridge.benchmarks.supermemory_cli \
   --subject 1 \
   --dataset-revision 1d228e0f10049a8a84c458dded2aa25b1e21ce8f \
   --source-revision 8123980820ffa23a3452faa6bd8ce5dff0f03164 \
+  --deployment-config .benchmarks/deployment.json \
   --run-id supermemory-person-1-001 \
   --code-revision "$(git rev-parse HEAD)" \
-  --perception-model-revision serving-fingerprint \
-  --answer-reasoning-effort low \
-  --request-timeout-seconds 1800 \
-  --answer-model-revision serving-fingerprint
+  --request-timeout-seconds 1800
 ```
 
 Every benchmark `run_id` must be unique for that deployment. It is included in the tenant ID and
@@ -403,27 +462,38 @@ export MINDBRIDGE_DATABASE_URL=postgresql://mindbridge:password@localhost:5432/m
 export MINDBRIDGE_OBJECT_STORAGE_BUCKET=mindbridge-media
 export MINDBRIDGE_OBJECT_STORAGE_ENDPOINT_URL=https://objects.example.com
 export MINDBRIDGE_TASK_BROKER_URL=redis://localhost:6379/0
-export MINDBRIDGE_VLM_API_KEY=replace-with-a-runtime-secret
-export MINDBRIDGE_VLM_ENDPOINT=https://vlm.example.com/api/v1/chat/completions
-export MINDBRIDGE_VLM_MODEL_ID=qwen3.8-max
-export MINDBRIDGE_VLM_MODEL_REVISION=deployment-2026-08-11
-export MINDBRIDGE_ANSWER_REASONING_EFFORT=low
-export MINDBRIDGE_EMBEDDING_API_KEY=replace-with-a-runtime-secret
-export MINDBRIDGE_EMBEDDING_ENDPOINT=https://embeddings.example.com/v1/embeddings
-export MINDBRIDGE_EMBEDDING_MODEL_ID=jinaai/jina-embeddings-v5-omni-small-retrieval
-export MINDBRIDGE_EMBEDDING_MODEL_REVISION=12949877f0092093f366c6450340011320152a05
-export MINDBRIDGE_TEXT_EMBEDDING_API_KEY=replace-with-a-runtime-secret
-export MINDBRIDGE_TEXT_EMBEDDING_ENDPOINT=https://text-embeddings.example.com/v1/embeddings
-export MINDBRIDGE_TEXT_EMBEDDING_MODEL_ID=jinaai/jina-embeddings-v5-text-small-retrieval
-export MINDBRIDGE_TEXT_EMBEDDING_MODEL_REVISION=6856e76bb72982e58de0620458a4e8b3614da340
+export MINDBRIDGE_GENERATOR_PLUGIN=openai
+export MINDBRIDGE_GENERATOR_API_KEY=replace-with-a-runtime-secret
+export MINDBRIDGE_GENERATOR_ENDPOINT=https://generator.example.com/v1
+export MINDBRIDGE_GENERATOR_MODEL_ID=qwen3.8-max
+export MINDBRIDGE_GENERATOR_MODEL_REVISION=deployment-2026-08-11
+export MINDBRIDGE_GENERATOR_REASONING_EFFORT=low
+export MINDBRIDGE_EMBEDDER_PLUGIN=openai
+export MINDBRIDGE_EMBEDDER_API_KEY=replace-with-a-runtime-secret
+export MINDBRIDGE_EMBEDDER_ENDPOINT=https://embeddings.example.com/v1
+export MINDBRIDGE_EMBEDDER_MODEL_ID=jinaai/jina-embeddings-v5-omni-small-retrieval
+export MINDBRIDGE_EMBEDDER_MODEL_REVISION=12949877f0092093f366c6450340011320152a05
+export MINDBRIDGE_EMBEDDER_DOCUMENT_API_KEY=replace-with-a-runtime-secret
+export MINDBRIDGE_EMBEDDER_DOCUMENT_ENDPOINT=https://text-embeddings.example.com/v1
+export MINDBRIDGE_EMBEDDER_DOCUMENT_MODEL_ID=jinaai/jina-embeddings-v5-text-small-retrieval
+export MINDBRIDGE_EMBEDDER_DOCUMENT_MODEL_REVISION=6856e76bb72982e58de0620458a4e8b3614da340
+export MINDBRIDGE_EMBEDDING_SPACE_ID=jina-v5
+export MINDBRIDGE_EMBEDDING_SPACE_REVISION=deployment-space-v1
 export MINDBRIDGE_MINIMUM_EMBEDDING_SIMILARITY=0.0
 export MINDBRIDGE_TENANT_API_KEYS_JSON='{"tenant_01":["replace-with-at-least-32-random-characters"]}'
 export OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318
 export OTEL_TRACES_SAMPLER=parentbased_traceidratio
 export OTEL_TRACES_SAMPLER_ARG=0.1
 
-uv run --extra server uvicorn mindbridge.api:create_production_app --factory
+uv run --extra server uvicorn mindbridge.server:create_app --factory
 ```
+
+These variables are the normal deployable default, not a Profile. To select any installed adapter,
+set its lowercase plugin name and provide the matching `MINDBRIDGE_GENERATOR_CONFIG_JSON`,
+`MINDBRIDGE_EMBEDDER_CONFIG_JSON`, or optional `MINDBRIDGE_RERANKER_CONFIG_JSON`. An explicit JSON
+object is authoritative, so Anthropic, Gemini, local runtimes, and experimental adapters do not need
+OpenAI-specific variables. Enabling reranking requires both `MINDBRIDGE_RERANKER_PLUGIN` and its
+configuration object. See the [plugin author contract](docs/plugin-architecture.md).
 
 OpenTelemetry is activated only when a standard common or signal-specific OTLP endpoint is set;
 without one it remains a no-op. The API, MCP process, Worker, edge sync, consolidation, and lifecycle
@@ -452,10 +522,10 @@ Applications and Benchmark runners use the same typed REST contract through the 
 Python SDK:
 
 ```python
-from mindbridge import AsyncMindBridge
+from mindbridge import MindBridge
 from mindbridge.contracts import RecallQuery, RecallRequest
 
-async with AsyncMindBridge.connect(
+async with MindBridge.connect(
     base_url="http://localhost:8000",
     api_key="replace-with-at-least-32-random-characters",
 ) as memory:
@@ -469,7 +539,7 @@ For a grounded follow-up, pass selected IDs from the previous result in
 tenant, lifecycle, deletion, and evidence checks, but does not search unrelated memory.
 
 Set `mode="enumerate"` for exhaustive count/timeline queries. This path scans the complete
-structured-filter scope, verifies candidates against original media in bounded Omni batches, and
+structured-filter scope, verifies candidates against original media in bounded Generator batches, and
 returns every occurrence chronologically; scopes above 1,000 candidates fail explicitly instead of
 silently truncating.
 
@@ -504,13 +574,19 @@ vllm serve jinaai/jina-embeddings-v5-text-small-retrieval \
 
 ## Run the memory Worker
 
-The Worker shares the storage, VLM, and Text Small endpoint variables above. It inspects original AV
-once, writes evidence-grounded Event/Entity/Claim graph records atomically, encodes raw evidence with
-the pinned local Jina v5 Omni Small model, and batches Event/Claim text through the OpenAI-compatible
-Text Small endpoint. Set `MINDBRIDGE_JINA_DEVICE` only when automatic device selection is unsuitable:
+The Worker shares storage and Generator variables with the server. It inspects original AV once,
+writes evidence-grounded Event/Entity/Claim graph records atomically, encodes raw evidence with the
+default local Jina plugin, and batches Event/Claim text through the default OpenAI-compatible
+Embedder. Select both capability slots directly:
 
 ```bash
-export MINDBRIDGE_JINA_DEVICE=cuda
+export MINDBRIDGE_MEDIA_EMBEDDER_PLUGIN=jina
+export MINDBRIDGE_MEDIA_EMBEDDER_DEVICE=cuda
+export MINDBRIDGE_TEXT_EMBEDDER_PLUGIN=openai
+export MINDBRIDGE_TEXT_EMBEDDER_API_KEY=replace-with-a-runtime-secret
+export MINDBRIDGE_TEXT_EMBEDDER_ENDPOINT=https://text-embeddings.example.com/v1
+export MINDBRIDGE_TEXT_EMBEDDER_MODEL_ID=jinaai/jina-embeddings-v5-text-small-retrieval
+export MINDBRIDGE_TEXT_EMBEDDER_MODEL_REVISION=6856e76bb72982e58de0620458a4e8b3614da340
 
 uv run --extra server --extra cloud-models \
   celery -A mindbridge.celery_app:app worker --loglevel=INFO
@@ -518,17 +594,19 @@ uv run --extra server --extra cloud-models \
 
 One prefork child is the safe default because each child owns a full embedding model. Scale with one
 Worker process per assigned GPU instead of increasing concurrency inside a process.
+Non-default Worker adapters use `MINDBRIDGE_MEDIA_EMBEDDER_CONFIG_JSON` and
+`MINDBRIDGE_TEXT_EMBEDDER_CONFIG_JSON`; explicit objects replace the bundled fallback variables.
 
 Run evidence-verified Episode, semantic Claim, and hierarchical Summary consolidation as one
 tenant-scoped scheduled job.
-It reuses the database, object-storage, VLM, Text Small, and shared embedding-space variables above;
+It reuses the database, object-storage, Generator, Embedder, and shared embedding-space variables above;
 no task broker or local Jina Omni model is required:
 
 ```bash
 uv run --extra server mindbridge-consolidate --tenant-id tenant_01
 ```
 
-Each sweep fixes one `evaluated_at`, scans bounded candidate pages, and lets the Omni/VLM inspect
+Each sweep fixes one `evaluated_at`, scans bounded candidate pages, and lets the selected Generator inspect
 exact source AV. Episode writes atomically claim child Events. Claim writes atomically create
 evidence-unioned semantic Claims or durable `contradicts`/`supersedes` edges; supersession also
 versions the represented MemoryRecord. Summary writes form a single-parent Memory tree, inspect
@@ -634,7 +712,7 @@ The partial transcript is provisional. GStreamer/DeepStream still owns the bound
 when its Event gate closes, `FunASRSpeechPipeline` performs VAD, quality ASR, punctuation,
 diarization, and CAM++ centroid extraction in one upstream call.
 `recognize_identities_in_av_segment()` combines that result with InsightFace and the optional
-OpenAI-SDK audiovisual active-speaker verifier, then returns only cloud-safe intervals ready for
+provider-neutral audiovisual active-speaker Pipeline, then returns only cloud-safe intervals ready for
 `enqueue_captured_video()`. `device=auto` selects CUDA when it is available, and explicit CUDA
 requests fail instead of silently using CPU.
 

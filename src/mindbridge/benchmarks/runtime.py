@@ -9,7 +9,7 @@ from pydantic import TypeAdapter
 
 from mindbridge.contracts import Identifier, NonEmptyString, ObservationProcessingJobView
 from mindbridge.core import JobState
-from mindbridge.sdk import AsyncMindBridge
+from mindbridge.sdk import MindBridge
 
 OPTION_LABELS = ("A", "B", "C", "D")
 _ALLOWED_RESPONSE_WORDS = re.compile(
@@ -26,7 +26,7 @@ def benchmark_tenant_id(tenant_prefix: str, unit_id: str, run_id: str) -> str:
 
 
 async def wait_for_observation_job(
-    memory: AsyncMindBridge,
+    memory: MindBridge,
     tenant_id: str,
     job_id: str,
     *,

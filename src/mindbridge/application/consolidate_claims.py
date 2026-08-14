@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Protocol
 
+from mindbridge.application.capabilities import Embedder
 from mindbridge.application.claim_consolidation import (
     ClaimCandidate,
     ClaimCandidatePage,
@@ -12,7 +13,7 @@ from mindbridge.application.claim_consolidation import (
 )
 from mindbridge.application.evidence import EvidenceReader, read_resolved_evidence
 from mindbridge.application.perception import ResolvedEvidence
-from mindbridge.application.ports import MediaUrlSigner, TextDocumentEmbedder
+from mindbridge.application.ports import MediaUrlSigner
 from mindbridge.application.semantic_claims import (
     ClaimConsolidation,
     ClaimConsolidationCommit,
@@ -37,7 +38,7 @@ class ClaimConsolidationResult:
 
 
 class ClaimConsolidator(Protocol):
-    """Frozen Omni boundary that verifies semantic relationships against evidence."""
+    """Frozen model boundary that verifies semantic relationships against evidence."""
 
     async def propose_claims(
         self,
@@ -68,7 +69,7 @@ class ConsolidateClaims:
         self,
         store: ClaimConsolidationStore,
         consolidator: ClaimConsolidator,
-        text_embedder: TextDocumentEmbedder,
+        text_embedder: Embedder,
         *,
         media_url_signer: MediaUrlSigner,
     ) -> None:

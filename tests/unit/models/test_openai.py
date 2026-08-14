@@ -1,30 +1,24 @@
-"""Contract tests for OpenAI-compatible Jina recall embeddings."""
+"""Contract tests for the bundled OpenAI-compatible adapters."""
 
 import json
 from collections.abc import Callable, Coroutine
-from datetime import datetime, timedelta, timezone
 from typing import cast
 
 import httpx
 import pytest
 from openai import AsyncOpenAI
 
-from mindbridge.application.ports import ResolvedQueryMedia
-from mindbridge.application.recall import RecallEmbeddingQuery
 from mindbridge.core import (
+    EmbeddingSpaceReference,
     MediaKind,
-    MediaObject,
-    MediaObjectId,
     ModelOutputError,
     ModelReference,
     ModelRequestError,
     ModelUnavailableError,
-    TenantId,
 )
-from mindbridge.models.openai_embeddings import OpenAIJinaEmbedder, OpenAIJinaTextEmbedder
-from mindbridge.models.openai_omni import normalize_openai_base_url
+from mindbridge.models import EmbedRequest, EmbedTask, MediaPart, ModelInput, TextPart
+from mindbridge.models.openai import OpenAIEmbedder, normalize_base_url
 
-NOW = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
 QUERY_MODEL_ID = "jinaai/jina-embeddings-v5-omni-small-retrieval"
 DOCUMENT_MODEL_ID = "jinaai/jina-embeddings-v5-text-small-retrieval"
 
@@ -43,13 +37,16 @@ async def test_text_query_uses_typed_embedding_sdk() -> None:
 
     embedder = _embedder(respond)
     try:
-        vector = await embedder.encode_query(
-            RecallEmbeddingQuery(text="where is the tool?", media=())
+        result = await embedder.embed(
+            EmbedRequest(
+                inputs=(ModelInput((TextPart("where is the tool?"),)),),
+                task=EmbedTask.QUERY,
+            )
         )
     finally:
         await embedder.close()
 
-    assert vector == (1.0,) + (0.0,) * 1_023
+    assert result.embeddings[0].values == (1.0,) + (0.0,) * 1_023
 
 
 async def test_memory_document_uses_jina_document_prompt() -> None:
@@ -65,11 +62,16 @@ async def test_memory_document_uses_jina_document_prompt() -> None:
 
     embedder = _embedder(respond)
     try:
-        vector = await embedder.encode_memory_document("Caroline plans to become a counselor.")
+        result = await embedder.embed(
+            EmbedRequest(
+                inputs=(ModelInput((TextPart("Caroline plans to become a counselor."),)),),
+                task=EmbedTask.DOCUMENT,
+            )
+        )
     finally:
         await embedder.close()
 
-    assert vector == (1.0,) + (0.0,) * 1_023
+    assert result.embeddings[0].values == (1.0,) + (0.0,) * 1_023
 
 
 async def test_text_document_embedder_batches_and_restores_index_order() -> None:
@@ -95,13 +97,24 @@ async def test_text_document_embedder_batches_and_restores_index_order() -> None
             },
         )
 
-    embedder = _text_embedder(respond)
+    embedder = _embedder(respond)
     try:
-        vectors = await embedder.encode_documents(("first event", "second claim"))
+        result = await embedder.embed(
+            EmbedRequest(
+                inputs=(
+                    ModelInput((TextPart("first event"),)),
+                    ModelInput((TextPart("second claim"),)),
+                ),
+                task=EmbedTask.DOCUMENT,
+            )
+        )
     finally:
         await embedder.close()
 
-    assert vectors == ((1.0,) + (0.0,) * 1_023, tuple(second))
+    assert tuple(item.values for item in result.embeddings) == (
+        (1.0,) + (0.0,) * 1_023,
+        tuple(second),
+    )
 
 
 async def test_multimodal_query_preserves_native_av_parts() -> None:
@@ -124,19 +137,21 @@ async def test_multimodal_query_preserves_native_av_parts() -> None:
         return _embedding_response()
 
     embedder = _embedder(respond)
-    query = RecallEmbeddingQuery(
-        text="find this moment",
-        media=tuple(
-            _resolved_media(kind, suffix)
-            for kind, suffix in (
-                (MediaKind.IMAGE, "image"),
-                (MediaKind.VIDEO, "video"),
-                (MediaKind.AUDIO, "audio"),
-            )
-        ),
+    query = ModelInput(
+        (
+            TextPart("find this moment"),
+            *(
+                _media_part(kind, suffix)
+                for kind, suffix in (
+                    (MediaKind.IMAGE, "image"),
+                    (MediaKind.VIDEO, "video"),
+                    (MediaKind.AUDIO, "audio"),
+                )
+            ),
+        )
     )
     try:
-        await embedder.encode_query(query)
+        await embedder.embed(EmbedRequest(inputs=(query,), task=EmbedTask.QUERY))
     finally:
         await embedder.close()
 
@@ -160,7 +175,12 @@ async def test_invalid_embedding_output_is_rejected(
     embedder = _embedder(respond)
     try:
         with pytest.raises(ModelOutputError, match=match):
-            await embedder.encode_query(RecallEmbeddingQuery(text="find it", media=()))
+            await embedder.embed(
+                EmbedRequest(
+                    inputs=(ModelInput((TextPart("find it"),)),),
+                    task=EmbedTask.QUERY,
+                )
+            )
     finally:
         await embedder.close()
 
@@ -187,28 +207,33 @@ async def test_only_transient_provider_failures_are_retryable(
 
     embedder = _embedder(respond)
     try:
-        with pytest.raises(error_type, match="Jina embedding request failed"):
-            await embedder.encode_query(RecallEmbeddingQuery(text="find it", media=()))
+        with pytest.raises(error_type, match="embedding request failed"):
+            await embedder.embed(
+                EmbedRequest(
+                    inputs=(ModelInput((TextPart("find it"),)),),
+                    task=EmbedTask.QUERY,
+                )
+            )
     finally:
         await embedder.close()
 
 
 def _embedder(
     handler: Callable[[httpx.Request], Coroutine[None, None, httpx.Response]],
-) -> OpenAIJinaEmbedder:
+) -> OpenAIEmbedder:
     client = AsyncOpenAI(
         api_key="unit-test-key",
-        base_url=normalize_openai_base_url("https://embedding.example.test/api/v1/embeddings"),
+        base_url=normalize_base_url("https://embedding.example.test/api/v1/embeddings"),
         http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
         max_retries=0,
     )
     document_client = AsyncOpenAI(
         api_key="unit-test-key",
-        base_url=normalize_openai_base_url("https://text.example.test/api/v1/embeddings"),
+        base_url=normalize_base_url("https://text.example.test/api/v1/embeddings"),
         http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
         max_retries=0,
     )
-    return OpenAIJinaEmbedder(
+    return OpenAIEmbedder(
         client,
         ModelReference(model_id=QUERY_MODEL_ID, revision="pinned-query-revision"),
         document_client=document_client,
@@ -216,39 +241,16 @@ def _embedder(
             model_id=DOCUMENT_MODEL_ID,
             revision="pinned-document-revision",
         ),
+        space_reference=EmbeddingSpaceReference(space_id="jina-space", revision="v1"),
     )
 
 
-def _text_embedder(
-    handler: Callable[[httpx.Request], Coroutine[None, None, httpx.Response]],
-) -> OpenAIJinaTextEmbedder:
-    return OpenAIJinaTextEmbedder(
-        AsyncOpenAI(
-            api_key="unit-test-key",
-            base_url=normalize_openai_base_url("https://text.example.test/api/v1/embeddings"),
-            http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
-            max_retries=0,
-        ),
-        ModelReference(model_id=DOCUMENT_MODEL_ID, revision="pinned-document-revision"),
-    )
-
-
-def _resolved_media(kind: MediaKind, suffix: str) -> ResolvedQueryMedia:
-    media_object_id = MediaObjectId(f"media_{suffix}")
+def _media_part(kind: MediaKind, suffix: str) -> MediaPart:
     extension = {MediaKind.IMAGE: "jpg", MediaKind.VIDEO: "mp4", MediaKind.AUDIO: "wav"}[kind]
-    return ResolvedQueryMedia(
-        media_object=MediaObject(
-            media_object_id=media_object_id,
-            tenant_id=TenantId("tenant_01"),
-            kind=kind,
-            uri=f"s3://memory/tenants/tenant_01/query.{extension}",
-            sha256="a" * 64,
-            size_bytes=100,
-            created_at=NOW,
-            duration_ms=None if kind is MediaKind.IMAGE else 1_000,
-        ),
-        media_url=f"https://objects.example.test/{media_object_id}",
-        media_url_expires_at=NOW + timedelta(minutes=5),
+    return MediaPart(
+        kind=kind,
+        url=f"https://objects.example.test/media_{suffix}",
+        source_uri=f"s3://memory/tenants/tenant_01/query.{extension}",
     )
 
 

@@ -30,7 +30,7 @@ from mindbridge.contracts import (
 _Response = TypeVar("_Response", bound=ContractModel)
 
 
-class MindBridgeClientError(RuntimeError):
+class MindBridgeError(RuntimeError):
     """A transport failure or typed error returned by MindBridge."""
 
     def __init__(
@@ -47,13 +47,13 @@ class MindBridgeClientError(RuntimeError):
         self.trace_id = trace_id
 
 
-class AsyncMindBridge:
+class MindBridge:
     """Call observe, remember, and recall through one typed asynchronous client."""
 
     def __init__(self, client: httpx.AsyncClient) -> None:
         self._client = client
 
-    async def __aenter__(self) -> AsyncMindBridge:
+    async def __aenter__(self) -> MindBridge:
         return self
 
     async def __aexit__(self, *_error: object) -> None:
@@ -66,7 +66,7 @@ class AsyncMindBridge:
         base_url: str,
         api_key: str | None = None,
         timeout_seconds: float = 120.0,
-    ) -> AsyncMindBridge:
+    ) -> MindBridge:
         """Create a client for use with `async with` or an explicit `close()`."""
         if not base_url.strip():
             raise ValueError("base_url must not be empty")
@@ -179,7 +179,7 @@ class AsyncMindBridge:
                 params=params,
             )
         except httpx.HTTPError as error:
-            raise MindBridgeClientError(
+            raise MindBridgeError(
                 "MindBridge request failed",
                 code="transport_error",
             ) from error
@@ -188,23 +188,23 @@ class AsyncMindBridge:
         try:
             return response_type.model_validate_json(response.content)
         except ValidationError as error:
-            raise MindBridgeClientError(
+            raise MindBridgeError(
                 "MindBridge returned an invalid response",
                 code="invalid_response",
                 status_code=response.status_code,
             ) from error
 
 
-def _api_error(response: httpx.Response) -> MindBridgeClientError:
+def _api_error(response: httpx.Response) -> MindBridgeError:
     try:
         error = ErrorResponse.model_validate_json(response.content)
     except ValidationError:
-        return MindBridgeClientError(
+        return MindBridgeError(
             "MindBridge request was rejected",
             code="http_error",
             status_code=response.status_code,
         )
-    return MindBridgeClientError(
+    return MindBridgeError(
         error.message,
         code=error.code,
         status_code=response.status_code,

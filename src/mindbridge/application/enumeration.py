@@ -11,8 +11,8 @@ from mindbridge.application.evidence import read_resolved_memory_evidence, sign_
 from mindbridge.application.perception import ResolvedEvidence
 from mindbridge.application.ports import (
     MediaUrlSigner,
-    MemoryAnswerer,
     MemoryStore,
+    OccurrenceVerifier,
     ResolvedQueryMedia,
 )
 from mindbridge.contracts import RecallRequest
@@ -46,18 +46,18 @@ class _VerifiedBatch:
 
 
 class EnumerateMemories:
-    """Scan a bounded filter scope and ask Omni to verify every candidate."""
+    """Scan a bounded filter scope and ask the selected model to verify every candidate."""
 
     def __init__(
         self,
         store: MemoryStore,
-        answerer: MemoryAnswerer,
+        verifier: OccurrenceVerifier,
         media_url_signer: MediaUrlSigner,
         *,
         clock: Callable[[], datetime],
     ) -> None:
         self._store = store
-        self._answerer = answerer
+        self._verifier = verifier
         self._media_url_signer = media_url_signer
         self._clock = clock
 
@@ -161,7 +161,7 @@ class EnumerateMemories:
             TenantId(request.tenant_id),
             memories,
         )
-        selected_ids = await self._answerer.select_occurrences(
+        selected_ids = await self._verifier.select_occurrences(
             request,
             memories,
             evidence,
@@ -169,7 +169,7 @@ class EnumerateMemories:
         )
         candidate_ids = {memory.memory_id for memory in memories}
         if len(set(selected_ids)) != len(selected_ids) or not set(selected_ids) <= candidate_ids:
-            raise ModelOutputError("Omni occurrence selection returned invalid memory IDs")
+            raise ModelOutputError("occurrence selection returned invalid memory IDs")
         selected_set = set(selected_ids)
         selected = tuple(memory for memory in memories if memory.memory_id in selected_set)
         return _VerifiedBatch(memories=selected)

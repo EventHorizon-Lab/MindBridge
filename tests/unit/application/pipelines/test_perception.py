@@ -1,4 +1,4 @@
-"""Contract tests for raw AV event perception."""
+"""Contract tests for the multimodal Perception pipeline."""
 
 import json
 from collections.abc import Callable, Coroutine
@@ -10,6 +10,7 @@ import pytest
 from openai import AsyncOpenAI
 
 from mindbridge.application.perception import ResolvedEvidence
+from mindbridge.application.pipelines import PerceptionPipeline
 from mindbridge.core import (
     AnonymousIdentityObservation,
     DeviceId,
@@ -26,13 +27,12 @@ from mindbridge.core import (
     SensorKind,
     TenantId,
 )
-from mindbridge.models.openai_omni import normalize_openai_base_url
-from mindbridge.models.openai_perception import OpenAIOmniEventPerceiver
+from mindbridge.models.openai import OpenAIGenerator, normalize_base_url
 
 NOW = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
 
 
-async def test_omni_perception_returns_grounded_event_and_provider_revision() -> None:
+async def test_perception_pipeline_returns_grounded_event_and_provider_revision() -> None:
     """The adapter sends original AV and preserves evidence and model provenance."""
 
     async def respond(request: httpx.Request) -> httpx.Response:
@@ -123,7 +123,7 @@ async def test_omni_perception_returns_grounded_event_and_provider_revision() ->
     assert result.events[0].claims[0].entity_indices == (0, 1)
 
 
-async def test_omni_perception_retries_invalid_output_once_in_json_mode() -> None:
+async def test_perception_pipeline_retries_invalid_output_once_in_json_mode() -> None:
     calls = 0
 
     async def respond(request: httpx.Request) -> httpx.Response:
@@ -151,7 +151,7 @@ async def test_omni_perception_retries_invalid_output_once_in_json_mode() -> Non
     assert result.events == ()
 
 
-async def test_omni_perception_rejects_detail_evidence_outside_its_event() -> None:
+async def test_perception_pipeline_rejects_detail_evidence_outside_its_event() -> None:
     async def respond(_request: httpx.Request) -> httpx.Response:
         return _streaming_response(
             {
@@ -189,7 +189,7 @@ async def test_omni_perception_rejects_detail_evidence_outside_its_event() -> No
         await perceiver.close()
 
 
-async def test_omni_perception_rejects_unknown_evidence() -> None:
+async def test_perception_pipeline_rejects_unknown_evidence() -> None:
     """A model cannot fabricate provenance IDs not present in its input."""
 
     async def respond(_request: httpx.Request) -> httpx.Response:
@@ -218,7 +218,7 @@ async def test_omni_perception_rejects_unknown_evidence() -> None:
         await perceiver.close()
 
 
-async def test_omni_perception_rejects_event_outside_observation() -> None:
+async def test_perception_pipeline_rejects_event_outside_observation() -> None:
     """Provider timestamps cannot extend a memory beyond captured time."""
 
     async def respond(_request: httpx.Request) -> httpx.Response:
@@ -249,15 +249,29 @@ async def test_omni_perception_rejects_event_outside_observation() -> None:
 
 def _perceiver(
     handler: Callable[[httpx.Request], Coroutine[None, None, httpx.Response]],
-) -> OpenAIOmniEventPerceiver:
+) -> "_PerceptionHarness":
     http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     client = AsyncOpenAI(
         api_key="unit-test-key",
-        base_url=normalize_openai_base_url("https://vlm.example.test/api/v1/chat/completions"),
+        base_url=normalize_base_url("https://vlm.example.test/api/v1/chat/completions"),
         http_client=http_client,
         max_retries=0,
     )
-    return OpenAIOmniEventPerceiver(client, model_revision="deployment-revision")
+    return _PerceptionHarness(
+        OpenAIGenerator(
+            client,
+            ModelReference(model_id="qwen3.8-max", revision="deployment-revision"),
+        )
+    )
+
+
+class _PerceptionHarness(PerceptionPipeline):
+    def __init__(self, generator: OpenAIGenerator) -> None:
+        super().__init__(generator)
+        self._owned_generator = generator
+
+    async def close(self) -> None:
+        await self._owned_generator.close()
 
 
 def _observation() -> Observation:

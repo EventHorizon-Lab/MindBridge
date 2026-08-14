@@ -35,7 +35,7 @@ from mindbridge.contracts import (
     RememberRequest,
 )
 from mindbridge.core import MediaKind, MemoryType, SensorKind
-from mindbridge.sdk import AsyncMindBridge
+from mindbridge.sdk import MindBridge
 
 
 class EgoLifePreparedClip(ContractModel):
@@ -137,7 +137,7 @@ def evaluate_egolife_qa(results: tuple[EgoLifeQuestionResult, ...]) -> EgoLifeMe
 
 
 async def run_egolife_qa(
-    memory: AsyncMindBridge,
+    memory: MindBridge,
     questions: tuple[EgoLifeQuestion, ...],
     prepared: EgoLifePreparedStream,
     *,
@@ -197,7 +197,7 @@ async def run_egolife_qa(
 
 
 async def _ingest_clip(
-    memory: AsyncMindBridge,
+    memory: MindBridge,
     tenant_id: str,
     device_id: str,
     prepared: EgoLifePreparedStream,
@@ -257,7 +257,7 @@ async def _ingest_clip(
 
 
 async def _answer_question(
-    memory: AsyncMindBridge,
+    memory: MindBridge,
     tenant_id: str,
     question: EgoLifeQuestion,
     cutoff: AwareDatetime,

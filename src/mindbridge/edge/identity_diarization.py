@@ -11,10 +11,8 @@ import tempfile
 from dataclasses import dataclass, replace
 from itertools import pairwise
 from pathlib import Path
-from typing import Annotated, Literal, Protocol, TypedDict, cast
+from typing import Annotated, Protocol, cast
 
-from openai import AsyncOpenAI
-from openai.types.chat import ChatCompletionMessageParam
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -24,10 +22,19 @@ from pydantic import (
     model_validator,
 )
 
+from mindbridge.application.capabilities import (
+    GenerateRequest,
+    Generator,
+    MediaPart,
+    ModelInput,
+    TextPart,
+)
+from mindbridge.application.pipelines.structured import generate_json, unwrap_json_code_fence
 from mindbridge.contracts import IdentityObservationInput
 from mindbridge.core import (
     IdentityKind,
     IdentityScope,
+    MediaKind,
     ModelOutputError,
     ModelReference,
     ModelUnavailableError,
@@ -47,13 +54,6 @@ from mindbridge.edge.identity_inference import (
     recognize_speakers,
 )
 from mindbridge.models.compute import has_free_cuda_memory, select_torch_device
-from mindbridge.models.openai_chat import stream_text_completion, unwrap_json_code_fence
-from mindbridge.models.openai_media import OpenAIContentPart
-from mindbridge.models.openai_omni import (
-    DEFAULT_OMNI_MODEL_ID,
-    DEFAULT_VIDEO_MAX_PIXELS,
-    normalize_openai_base_url,
-)
 from mindbridge.prompts import (
     ACTIVE_SPEAKER_PROMPT,
     MAX_SPEECH_SEGMENTS,
@@ -179,16 +179,6 @@ class ActiveSpeakerMatcher(Protocol):
         face_observations: tuple[IdentityObservationInput, ...],
         voice_observations: tuple[IdentityObservationInput, ...],
     ) -> tuple[FaceVoiceAssociationEvidence, ...]: ...
-
-
-class _SystemMessage(TypedDict):
-    role: Literal["system"]
-    content: str
-
-
-class _UserMessage(TypedDict):
-    role: Literal["user"]
-    content: list[OpenAIContentPart]
 
 
 class _FunASRPipeline(Protocol):
@@ -379,59 +369,28 @@ class FunASRStreamingTranscriber:
         return cast(str, output[0]["text"])
 
 
-class OpenAIVisualActiveSpeakerMatcher:
+class VisualActiveSpeakerPipeline:
     """Use an audiovisual VLM only as revocable face↔voice association evidence."""
 
     def __init__(
         self,
-        client: AsyncOpenAI,
+        generator: Generator,
         *,
-        model_revision: str,
-        model_id: str = DEFAULT_OMNI_MODEL_ID,
-        request_timeout_seconds: float = 1_800,
+        model_reference: ModelReference,
         max_output_tokens: int = 2_048,
         maximum_media_bytes: int = 19 * 1024 * 1024,
     ) -> None:
-        if not model_id.strip() or not model_revision.strip():
-            raise ValueError("active-speaker model identifiers must not be empty")
-        if min(request_timeout_seconds, max_output_tokens, maximum_media_bytes) <= 0:
+        if min(max_output_tokens, maximum_media_bytes) <= 0:
             raise ValueError("active-speaker model limits must be positive")
-        self._client = client
-        self._model_id = model_id
-        self._model_revision = model_revision
-        self._request_timeout_seconds = request_timeout_seconds
+        self._generator = generator
+        self._model_reference = model_reference
         self._max_output_tokens = max_output_tokens
         self._maximum_media_bytes = maximum_media_bytes
 
     @property
     def model_reference(self) -> ModelReference:
         """Return the stable deployment identity used to accumulate local evidence."""
-        return ModelReference(model_id=self._model_id, revision=self._model_revision)
-
-    @classmethod
-    def connect(
-        cls,
-        *,
-        api_key: str,
-        endpoint: str,
-        model_revision: str,
-        model_id: str = DEFAULT_OMNI_MODEL_ID,
-        request_timeout_seconds: float = 1_800,
-        max_retries: int = 2,
-    ) -> OpenAIVisualActiveSpeakerMatcher:
-        if not api_key.strip() or not 0 <= max_retries <= 10:
-            raise ValueError("active-speaker connection settings are invalid")
-        return cls(
-            AsyncOpenAI(
-                api_key=api_key,
-                base_url=normalize_openai_base_url(endpoint),
-                timeout=request_timeout_seconds,
-                max_retries=max_retries,
-            ),
-            model_id=model_id,
-            model_revision=model_revision,
-            request_timeout_seconds=request_timeout_seconds,
-        )
+        return self._model_reference
 
     async def match_file(
         self,
@@ -483,35 +442,30 @@ class OpenAIVisualActiveSpeakerMatcher:
                 for index, item in enumerate(voices)
             ],
         }
-        messages: list[_SystemMessage | _UserMessage] = [
-            {"role": "system", "content": ACTIVE_SPEAKER_PROMPT.text},
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": json.dumps(context, ensure_ascii=False)},
-                    {
-                        "type": "video_url",
-                        "video_url": {
-                            "url": (
+        output, _ = await generate_json(
+            self._generator,
+            GenerateRequest(
+                system_prompt=ACTIVE_SPEAKER_PROMPT.text,
+                input=ModelInput(
+                    (
+                        TextPart(json.dumps(context, ensure_ascii=False)),
+                        MediaPart(
+                            kind=MediaKind.VIDEO,
+                            url=(
                                 "data:video/mp4;base64,"
                                 f"{base64.b64encode(media_bytes).decode('ascii')}"
-                            )
-                        },
-                        "fps": 5.0,
-                        "max_pixels": DEFAULT_VIDEO_MAX_PIXELS,
-                    },
-                    {"type": "text", "text": "Return the visible-speaker matches JSON now."},
-                ],
-            },
-        ]
-        completion = await stream_text_completion(
-            self._client,
-            model_id=self._model_id,
-            messages=cast(list[ChatCompletionMessageParam], messages),
-            max_output_tokens=self._max_output_tokens,
-            request_timeout_seconds=self._request_timeout_seconds,
+                            ),
+                            source_uri=str(media_path),
+                            frames_per_second=5.0,
+                            max_pixels=200_704,
+                        ),
+                        TextPart("Return the visible-speaker matches JSON now."),
+                    )
+                ),
+                max_output_tokens=self._max_output_tokens,
+            ),
+            _parse_active_speakers,
         )
-        output = _parse_active_speakers(completion.content)
         face_ids = {item.identity_id for item in faces}
         evidence = []
         for match in output.matches:
@@ -552,13 +506,10 @@ class OpenAIVisualActiveSpeakerMatcher:
                         voice.confidence,
                         max(face.confidence for face in overlapping_faces),
                     ),
-                    model_reference=self.model_reference,
+                    model_reference=self._model_reference,
                 )
             )
         return tuple(evidence)
-
-    async def close(self) -> None:
-        await self._client.close()
 
 
 async def recognize_identities_in_av_segment(
@@ -573,7 +524,6 @@ async def recognize_identities_in_av_segment(
     speech_pipeline: FunASRSpeechPipeline,
     thresholds: IdentityMatchingThresholds,
     active_speaker_matcher: ActiveSpeakerMatcher | None = None,
-    association_model_reference: ModelReference | None = None,
     face_samples_per_second: float | None = None,
     parallel_model_inference: bool | None = None,
 ) -> IdentitySegmentResult:
@@ -640,7 +590,7 @@ async def recognize_identities_in_av_segment(
         if active_speaker_matcher is not None
         else ()
     )
-    reference = association_model_reference or (
+    reference = (
         active_speaker_matcher.model_reference if active_speaker_matcher is not None else None
     )
     resolved_voices = await asyncio.to_thread(
@@ -664,50 +614,23 @@ async def recognize_identities_in_av_segment(
     )
 
 
-class OpenAIAVSpeechSegmenter:
-    """Send one local AV clip through the official async OpenAI SDK."""
+class SpeechSegmentationPipeline:
+    """Turn a Generator into anonymous audiovisual speech turns."""
 
     def __init__(
         self,
-        client: AsyncOpenAI,
+        generator: Generator,
         *,
-        model_id: str = DEFAULT_OMNI_MODEL_ID,
-        request_timeout_seconds: float = 1_800,
         max_output_tokens: int = 4_096,
         maximum_media_bytes: int = 64 * 1024 * 1024,
     ) -> None:
-        if not model_id.strip() or request_timeout_seconds <= 0 or max_output_tokens <= 0:
+        if max_output_tokens <= 0:
             raise ValueError("speech segmenter model settings are invalid")
         if maximum_media_bytes <= 0:
             raise ValueError("maximum_media_bytes must be positive")
-        self._client = client
-        self._model_id = model_id
-        self._request_timeout_seconds = request_timeout_seconds
+        self._generator = generator
         self._max_output_tokens = max_output_tokens
         self._maximum_media_bytes = maximum_media_bytes
-
-    @classmethod
-    def connect(
-        cls,
-        *,
-        api_key: str,
-        endpoint: str,
-        model_id: str = DEFAULT_OMNI_MODEL_ID,
-        request_timeout_seconds: float = 1_800,
-        max_retries: int = 2,
-    ) -> OpenAIAVSpeechSegmenter:
-        if not api_key.strip() or not 0 <= max_retries <= 10:
-            raise ValueError("speech segmenter connection settings are invalid")
-        return cls(
-            AsyncOpenAI(
-                api_key=api_key,
-                base_url=normalize_openai_base_url(endpoint),
-                timeout=request_timeout_seconds,
-                max_retries=max_retries,
-            ),
-            model_id=model_id,
-            request_timeout_seconds=request_timeout_seconds,
-        )
 
     async def segment_file(
         self,
@@ -726,44 +649,27 @@ class OpenAIAVSpeechSegmenter:
         )
         media_type = mimetypes.guess_type(path.name)[0] or "video/mp4"
         media_url = f"data:{media_type};base64,{base64.b64encode(media_bytes).decode('ascii')}"
-        messages: list[_SystemMessage | _UserMessage] = [
-            {"role": "system", "content": SEGMENT_SPEECH_PROMPT.text},
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": json.dumps({"duration_ms": duration_ms}, separators=(",", ":")),
-                    },
-                    {
-                        "type": "video_url",
-                        "video_url": {"url": media_url},
-                        "fps": 1.0,
-                        "max_pixels": DEFAULT_VIDEO_MAX_PIXELS,
-                    },
-                    {"type": "text", "text": "Return the required speaker-turn JSON now."},
-                ],
-            },
-        ]
-        completion = await stream_text_completion(
-            self._client,
-            model_id=self._model_id,
-            messages=cast(list[ChatCompletionMessageParam], messages),
-            max_output_tokens=self._max_output_tokens,
-            request_timeout_seconds=self._request_timeout_seconds,
-        )
-        try:
-            output = _parse_output(completion.content, duration_ms)
-        except ModelOutputError:
-            completion = await stream_text_completion(
-                self._client,
-                model_id=self._model_id,
-                messages=cast(list[ChatCompletionMessageParam], messages),
+        output, _ = await generate_json(
+            self._generator,
+            GenerateRequest(
+                system_prompt=SEGMENT_SPEECH_PROMPT.text,
+                input=ModelInput(
+                    (
+                        TextPart(json.dumps({"duration_ms": duration_ms}, separators=(",", ":"))),
+                        MediaPart(
+                            kind=MediaKind.VIDEO,
+                            url=media_url,
+                            source_uri=str(path),
+                            frames_per_second=1.0,
+                            max_pixels=200_704,
+                        ),
+                        TextPart("Return the required speaker-turn JSON now."),
+                    )
+                ),
                 max_output_tokens=self._max_output_tokens,
-                request_timeout_seconds=self._request_timeout_seconds,
-                json_mode=True,
-            )
-            output = _parse_output(completion.content, duration_ms)
+            ),
+            lambda content: _parse_output(content, duration_ms),
+        )
         return tuple(
             SpeechSegment(
                 sample_id=f"voice-{segment.start_ms:012d}-{segment.end_ms:012d}-{index:03d}",
@@ -774,9 +680,6 @@ class OpenAIAVSpeechSegmenter:
             )
             for index, segment in enumerate(output.segments)
         )
-
-    async def close(self) -> None:
-        await self._client.close()
 
 
 def _record_and_resolve_voice_identities(

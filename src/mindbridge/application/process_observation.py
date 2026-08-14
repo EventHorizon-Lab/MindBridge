@@ -6,6 +6,13 @@ import asyncio
 from dataclasses import replace
 from datetime import datetime, timedelta
 
+from mindbridge.application.capabilities import (
+    Embedder,
+    EmbedRequest,
+    EmbedTask,
+    MediaPart,
+    ModelInput,
+)
 from mindbridge.application.derive_observation_graph import (
     derive_observation_graph,
     embed_observation_graph,
@@ -20,12 +27,9 @@ from mindbridge.application.perception import (
 )
 from mindbridge.application.ports import (
     MediaUrlSigner,
-    ObservationPerceiver,
     ObservationProcessingStore,
-    OmniEmbedder,
-    TextDocumentEmbedder,
+    Perceiver,
 )
-from mindbridge.application.recall import RETRIEVAL_DOCUMENT_EMBEDDING_TASK
 from mindbridge.core import (
     DatabaseUnavailableError,
     DomainInvariantError,
@@ -58,15 +62,15 @@ class ProcessObservation:
     def __init__(
         self,
         store: ObservationProcessingStore,
-        perceiver: ObservationPerceiver,
-        embedder: OmniEmbedder,
-        text_embedder: TextDocumentEmbedder,
+        perceiver: Perceiver,
+        media_embedder: Embedder,
+        text_embedder: Embedder,
         *,
         media_url_signer: MediaUrlSigner,
     ) -> None:
         self._store = store
         self._perceiver = perceiver
-        self._embedder = embedder
+        self._media_embedder = media_embedder
         self._text_embedder = text_embedder
         self._media_url_signer = media_url_signer
 
@@ -135,7 +139,7 @@ class ProcessObservation:
                 _evidence_embeddings(
                     tenant_id,
                     embedding_evidence,
-                    self._embedder,
+                    self._media_embedder,
                     claim.job.created_at,
                 ),
                 embed_observation_graph(
@@ -279,12 +283,31 @@ def _events(
 async def _evidence_embeddings(
     tenant_id: TenantId,
     evidence: tuple[ResolvedEvidence, ...],
-    embedder: OmniEmbedder,
+    embedder: Embedder,
     created_at: datetime,
 ) -> tuple[EmbeddingRecord, ...]:
-    media_urls = tuple(dict.fromkeys(item.media_url for item in evidence))
-    vectors = await embedder.encode_documents(media_urls)
-    vector_by_url = dict(zip(media_urls, vectors, strict=True))
+    item_by_url = {item.media_url: item for item in evidence}
+    media_urls = tuple(item_by_url)
+    result = await embedder.embed(
+        EmbedRequest(
+            inputs=tuple(
+                ModelInput(
+                    (
+                        MediaPart(
+                            kind=item_by_url[url].media_object.kind,
+                            url=url,
+                            source_uri=item_by_url[url].media_object.uri,
+                        ),
+                    )
+                )
+                for url in media_urls
+            ),
+            task=EmbedTask.DOCUMENT,
+        )
+    )
+    if len(result.embeddings) != len(media_urls):
+        raise ModelOutputError("embedder returned the wrong evidence vector count")
+    embedding_by_url = dict(zip(media_urls, result.embeddings, strict=True))
     return tuple(
         EmbeddingRecord(
             embedding_id=EmbeddingId(
@@ -292,19 +315,19 @@ async def _evidence_embeddings(
                     "embedding",
                     tenant_id,
                     item.evidence_span.evidence_id,
-                    embedder.model_reference.model_id,
-                    embedder.model_reference.revision,
-                    RETRIEVAL_DOCUMENT_EMBEDDING_TASK,
+                    embedding_by_url[item.media_url].model_reference.model_id,
+                    embedding_by_url[item.media_url].model_reference.revision,
+                    EmbedTask.DOCUMENT.value,
                 )
             ),
             tenant_id=tenant_id,
             object_type=EmbeddedObjectType.EVIDENCE_SPAN,
             object_id=item.evidence_span.evidence_id,
-            values=vector_by_url[item.media_url],
-            model_reference=embedder.model_reference,
-            space_reference=embedder.space_reference,
-            task=RETRIEVAL_DOCUMENT_EMBEDDING_TASK,
-            dimension=embedder.dimension,
+            values=embedding_by_url[item.media_url].values,
+            model_reference=embedding_by_url[item.media_url].model_reference,
+            space_reference=embedding_by_url[item.media_url].space_reference,
+            task=EmbedTask.DOCUMENT.value,
+            dimension=embedding_by_url[item.media_url].dimension,
             normalized=True,
             created_at=created_at,
         )

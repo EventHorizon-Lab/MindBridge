@@ -7,8 +7,14 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 
-from mindbridge.application.ports import TextDocumentEmbedder
-from mindbridge.application.recall import RETRIEVAL_DOCUMENT_EMBEDDING_TASK
+from mindbridge.application.capabilities import (
+    Embedder,
+    Embedding,
+    EmbedRequest,
+    EmbedTask,
+    ModelInput,
+    TextPart,
+)
 from mindbridge.core import (
     DomainInvariantError,
     EmbeddedObjectType,
@@ -31,7 +37,7 @@ from mindbridge.core import (
 
 
 class SummaryScope(str, Enum):
-    """VLM-selected coherence boundary for one hierarchy node."""
+    """Model-selected coherence boundary for one hierarchy node."""
 
     SESSION = "session"
     DAY = "day"
@@ -137,7 +143,7 @@ class SummaryProposal:
 
 @dataclass(frozen=True, slots=True)
 class SummaryConsolidation:
-    """Validated hierarchy proposals and frozen Omni provenance."""
+    """Validated hierarchy proposals and frozen model provenance."""
 
     summaries: tuple[SummaryProposal, ...]
     model_reference: ModelReference
@@ -178,7 +184,7 @@ class SummaryWrite:
         if (
             self.embedding.object_type is not EmbeddedObjectType.MEMORY_RECORD
             or self.embedding.object_id != self.memory.memory_id
-            or self.embedding.task != RETRIEVAL_DOCUMENT_EMBEDDING_TASK
+            or self.embedding.task != EmbedTask.DOCUMENT.value
             or not self.embedding.normalized
             or self.embedding.created_at != self.memory.created_at
         ):
@@ -211,7 +217,7 @@ async def derive_summary_writes(
     tenant_id: TenantId,
     candidates: tuple[SummaryCandidate, ...],
     consolidation: SummaryConsolidation,
-    text_embedder: TextDocumentEmbedder,
+    text_embedder: Embedder,
     created_at: datetime,
 ) -> tuple[SummaryWrite, ...]:
     """Build deterministic hierarchy nodes and aligned Memory vectors."""
@@ -227,18 +233,21 @@ async def derive_summary_writes(
         )
         for proposal in consolidation.summaries
     )
-    vectors = (
-        await text_embedder.encode_documents(
-            tuple(memory.summary for memory, _ in memories_and_sources)
+    result = await text_embedder.embed(
+        EmbedRequest(
+            inputs=tuple(
+                ModelInput((TextPart(memory.summary),)) for memory, _ in memories_and_sources
+            ),
+            task=EmbedTask.DOCUMENT,
         )
-        if memories_and_sources
-        else ()
     )
-    if len(vectors) != len(memories_and_sources):
-        raise MemoryIntegrityError("text embedder returned the wrong Summary vector count")
+    if len(result.embeddings) != len(memories_and_sources):
+        raise MemoryIntegrityError("embedder returned the wrong summary vector count")
     return tuple(
-        _summary_write(memory, source_ids, vector, text_embedder, created_at)
-        for (memory, source_ids), vector in zip(memories_and_sources, vectors, strict=True)
+        _summary_write(memory, source_ids, embedding, created_at)
+        for (memory, source_ids), embedding in zip(
+            memories_and_sources, result.embeddings, strict=True
+        )
     )
 
 
@@ -299,8 +308,7 @@ def _summary_memory(
 def _summary_write(
     memory: MemoryRecord,
     source_memory_ids: tuple[MemoryId, ...],
-    vector: tuple[float, ...],
-    text_embedder: TextDocumentEmbedder,
+    embedding: Embedding,
     created_at: datetime,
 ) -> SummaryWrite:
     return SummaryWrite(
@@ -325,19 +333,19 @@ def _summary_write(
                     memory.tenant_id,
                     EmbeddedObjectType.MEMORY_RECORD.value,
                     memory.memory_id,
-                    text_embedder.model_reference.model_id,
-                    text_embedder.model_reference.revision,
-                    RETRIEVAL_DOCUMENT_EMBEDDING_TASK,
+                    embedding.model_reference.model_id,
+                    embedding.model_reference.revision,
+                    EmbedTask.DOCUMENT.value,
                 )
             ),
             tenant_id=memory.tenant_id,
             object_type=EmbeddedObjectType.MEMORY_RECORD,
             object_id=memory.memory_id,
-            values=vector,
-            model_reference=text_embedder.model_reference,
-            space_reference=text_embedder.space_reference,
-            task=RETRIEVAL_DOCUMENT_EMBEDDING_TASK,
-            dimension=text_embedder.dimension,
+            values=embedding.values,
+            model_reference=embedding.model_reference,
+            space_reference=embedding.space_reference,
+            task=EmbedTask.DOCUMENT.value,
+            dimension=embedding.dimension,
             normalized=True,
             created_at=created_at,
         ),

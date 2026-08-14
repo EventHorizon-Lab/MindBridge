@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Literal, Protocol, TypeAlias
+from typing import Literal, Protocol
 
 from mindbridge.application.observation_processing import (
     ObservationBatch,
@@ -31,15 +31,12 @@ from mindbridge.core import (
     MemoryId,
     MemoryRecord,
     MemoryState,
-    ModelReference,
     Observation,
     ObservationId,
     ObservationJobClaim,
     ObservationProcessingJob,
     TenantId,
 )
-
-EmbeddingInput: TypeAlias = str | bytes | tuple[str | bytes, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -319,8 +316,8 @@ class MemoryStore(Protocol):
     ) -> ObservationProcessingJob: ...
 
 
-class MemoryAnswerer(Protocol):
-    """Frozen model boundary that may request one bounded retrieval refinement."""
+class Answerer(Protocol):
+    """Provider-neutral answer policy used by recall."""
 
     async def answer(
         self,
@@ -332,6 +329,10 @@ class MemoryAnswerer(Protocol):
         attempted_retrieval_queries: tuple[str, ...] = (),
     ) -> GeneratedAnswer: ...
 
+
+class OccurrenceVerifier(Protocol):
+    """Provider-neutral exact-occurrence policy used by enumeration."""
+
     async def select_occurrences(
         self,
         request: RecallRequest,
@@ -342,8 +343,8 @@ class MemoryAnswerer(Protocol):
     ) -> tuple[MemoryId, ...]: ...
 
 
-class ObservationPerceiver(Protocol):
-    """Frozen Omni boundary that inspects original observation evidence."""
+class Perceiver(Protocol):
+    """Provider-neutral perception policy used by observation processing."""
 
     async def perceive_events(
         self,
@@ -425,44 +426,3 @@ class EmbeddingIndex(Protocol):
     async def write_embedding(self, embedding: EmbeddingRecord) -> bool: ...
 
     async def search_embeddings(self, search: EmbeddingSearch) -> tuple[EmbeddingMatch, ...]: ...
-
-
-class OmniEmbedder(Protocol):
-    """Query/document-aware frozen multimodal encoder."""
-
-    @property
-    def model_reference(self) -> ModelReference: ...
-
-    @property
-    def space_reference(self) -> EmbeddingSpaceReference: ...
-
-    @property
-    def dimension(self) -> int: ...
-
-    async def encode_queries(
-        self,
-        inputs: tuple[EmbeddingInput, ...],
-    ) -> tuple[tuple[float, ...], ...]: ...
-
-    async def encode_documents(
-        self,
-        inputs: tuple[EmbeddingInput, ...],
-    ) -> tuple[tuple[float, ...], ...]: ...
-
-
-class TextDocumentEmbedder(Protocol):
-    """Frozen text document encoder aligned with the primary retrieval space."""
-
-    @property
-    def model_reference(self) -> ModelReference: ...
-
-    @property
-    def space_reference(self) -> EmbeddingSpaceReference: ...
-
-    @property
-    def dimension(self) -> int: ...
-
-    async def encode_documents(
-        self,
-        texts: tuple[str, ...],
-    ) -> tuple[tuple[float, ...], ...]: ...

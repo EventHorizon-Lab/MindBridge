@@ -15,7 +15,6 @@ from mindbridge.application.ports import (
     PresignedMediaDownload,
     ResolvedQueryMedia,
 )
-from mindbridge.application.recall import RecallEmbeddingQuery
 from mindbridge.contracts import (
     DeletionListRequest,
     ForgetRequest,
@@ -47,6 +46,7 @@ from mindbridge.core import (
     derive_stable_id,
 )
 from mindbridge.infrastructure.postgres import PostgresMemoryStore
+from mindbridge.models import Embedding, EmbedRequest, EmbedResult
 
 NOW = datetime(2026, 8, 12, 8, 0, tzinfo=timezone.utc)
 Counts: TypeAlias = tuple[int, int, int, int, int, int, int]
@@ -54,7 +54,7 @@ Counts: TypeAlias = tuple[int, int, int, int, int, int, int]
 pytestmark = pytest.mark.integration
 
 
-class FirstMemoryAnswerer:
+class FirstCandidateAnswerer:
     async def answer(
         self,
         request: RecallRequest,
@@ -81,17 +81,14 @@ class FirstMemoryAnswerer:
         return tuple(memory.memory_id for memory in memories)
 
 
-class FixedRecallEmbedder:
-    query_model_reference = ModelReference(model_id="jina-omni", revision="pinned-revision")
-    document_model_reference = ModelReference(model_id="jina-text", revision="pinned-revision")
+class FixedEmbedder:
+    model_reference = ModelReference(model_id="jina-omni", revision="pinned-revision")
     space_reference = EmbeddingSpaceReference(space_id="jina-v5", revision="space-v1")
-    dimension = 1_024
 
-    async def encode_query(self, query: RecallEmbeddingQuery) -> tuple[float, ...]:
-        return (1.0,) + (0.0,) * 1_023
-
-    async def encode_memory_document(self, text: str) -> tuple[float, ...]:
-        return (1.0,) + (0.0,) * 1_023
+    async def embed(self, request: EmbedRequest) -> EmbedResult:
+        vector = (1.0,) + (0.0,) * 1_023
+        embedding = Embedding(vector, self.model_reference, self.space_reference)
+        return EmbedResult((embedding,) * len(request.inputs))
 
 
 class DiscardingJobPublisher:
@@ -308,14 +305,16 @@ def _kernel(
     *,
     now: datetime = NOW,
 ) -> MemoryKernel:
+    answerer = FirstCandidateAnswerer()
     return MemoryKernel(
         store,
-        FirstMemoryAnswerer(),
+        answerer,
+        answerer,
         embedding_index=store,
         media_deleter=media_access,
         media_url_signer=media_access,
         observation_job_publisher=DiscardingJobPublisher(),
-        recall_embedder=FixedRecallEmbedder(),
+        embedder=FixedEmbedder(),
         clock=lambda: now,
     )
 

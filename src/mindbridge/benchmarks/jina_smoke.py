@@ -8,11 +8,13 @@ import math
 import platform
 from datetime import datetime, timezone
 from importlib.metadata import version
+from typing import Literal
 
 from pydantic import AwareDatetime
 
 from mindbridge.contracts import ContractModel
-from mindbridge.models.jina import JinaOmniEmbedder
+from mindbridge.models import EmbedRequest, EmbedTask, ModelInput, TextPart
+from mindbridge.models.jina import JinaEmbedder
 
 QUERY = "Where did the robot put the red screwdriver?"
 RELEVANT_DOCUMENT = "The robot put the red screwdriver beside the blue toolbox."
@@ -23,8 +25,12 @@ class JinaSmokeResult(ContractModel):
     """Versioned output needed to reproduce an embedding smoke run."""
 
     created_at: AwareDatetime
+    embedder_plugin: Literal["jina"] = "jina"
     model_id: str
     revision: str
+    space_id: str
+    space_revision: str
+    task: Literal["retrieval_query"] = "retrieval_query"
     device: str
     dimension: int
     query_norm: float
@@ -39,16 +45,37 @@ class JinaSmokeResult(ContractModel):
 
 async def run_jina_smoke(*, revision: str, device: str) -> JinaSmokeResult:
     """Load the pinned model and compare one relevant and irrelevant document."""
-    embedder = JinaOmniEmbedder.load(revision=revision, device=device)
-    query = (await embedder.encode_queries((QUERY,)))[0]
-    relevant, unrelated = await embedder.encode_documents((RELEVANT_DOCUMENT, UNRELATED_DOCUMENT))
+    embedder = JinaEmbedder.load(revision=revision, device=device)
+    query_result = await embedder.embed(
+        EmbedRequest(
+            inputs=(ModelInput((TextPart(QUERY),)),),
+            task=EmbedTask.QUERY,
+        )
+    )
+    document_result = await embedder.embed(
+        EmbedRequest(
+            inputs=(
+                ModelInput((TextPart(RELEVANT_DOCUMENT),)),
+                ModelInput((TextPart(UNRELATED_DOCUMENT),)),
+            ),
+            task=EmbedTask.DOCUMENT,
+        )
+    )
+    query_embedding = query_result.embeddings[0]
+    query = query_embedding.values
+    relevant, unrelated = (
+        document_result.embeddings[0].values,
+        document_result.embeddings[1].values,
+    )
     query_norm = math.sqrt(sum(value * value for value in query))
     relevant_similarity = _dot(query, relevant)
     unrelated_similarity = _dot(query, unrelated)
     return JinaSmokeResult(
         created_at=datetime.now(timezone.utc),
-        model_id=embedder.model_reference.model_id,
-        revision=embedder.model_reference.revision,
+        model_id=query_embedding.model_reference.model_id,
+        revision=query_embedding.model_reference.revision,
+        space_id=query_embedding.space_reference.space_id,
+        space_revision=query_embedding.space_reference.revision,
         device=device,
         dimension=len(query),
         query_norm=query_norm,
@@ -59,7 +86,7 @@ async def run_jina_smoke(*, revision: str, device: str) -> JinaSmokeResult:
         transformers_version=version("transformers"),
         sentence_transformers_version=version("sentence-transformers"),
         passed=(
-            len(query) == embedder.dimension
+            len(query) == query_embedding.dimension
             and math.isclose(query_norm, 1.0, rel_tol=1e-4, abs_tol=1e-6)
             and relevant_similarity > unrelated_similarity
         ),

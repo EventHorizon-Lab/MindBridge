@@ -1,4 +1,4 @@
-"""Contract tests for evidence-first episode consolidation."""
+"""Contract tests for the evidence-first Episode pipeline."""
 
 import json
 from collections.abc import Callable, Coroutine, Iterator
@@ -10,6 +10,7 @@ import pytest
 from openai import AsyncOpenAI
 
 from mindbridge.application.perception import ResolvedEvidence
+from mindbridge.application.pipelines import EpisodePipeline
 from mindbridge.core import (
     DomainInvariantError,
     Event,
@@ -24,8 +25,7 @@ from mindbridge.core import (
     ObservationId,
     TenantId,
 )
-from mindbridge.models.openai_consolidation import OpenAIOmniEpisodeConsolidator
-from mindbridge.models.openai_omni import normalize_openai_base_url
+from mindbridge.models.openai import OpenAIGenerator, normalize_base_url
 
 NOW = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
 
@@ -136,15 +136,29 @@ async def test_episode_consolidator_retries_invalid_structure_in_json_mode() -> 
 
 def _consolidator(
     handler: Callable[[httpx.Request], Coroutine[None, None, httpx.Response]],
-) -> OpenAIOmniEpisodeConsolidator:
+) -> "_EpisodeHarness":
     http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     client = AsyncOpenAI(
         api_key="unit-test-key",
-        base_url=normalize_openai_base_url("https://vlm.example.test/api/v1/chat/completions"),
+        base_url=normalize_base_url("https://vlm.example.test/api/v1/chat/completions"),
         http_client=http_client,
         max_retries=0,
     )
-    return OpenAIOmniEpisodeConsolidator(client, model_revision="deployment-revision")
+    return _EpisodeHarness(
+        OpenAIGenerator(
+            client,
+            ModelReference(model_id="qwen3.8-max", revision="deployment-revision"),
+        )
+    )
+
+
+class _EpisodeHarness(EpisodePipeline):
+    def __init__(self, generator: OpenAIGenerator) -> None:
+        super().__init__(generator)
+        self._owned_generator = generator
+
+    async def close(self) -> None:
+        await self._owned_generator.close()
 
 
 def _candidates() -> tuple[tuple[Event, ...], tuple[ResolvedEvidence, ...]]:

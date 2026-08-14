@@ -14,8 +14,10 @@ from typing import Literal
 
 from pydantic import AwareDatetime, Field
 
-from mindbridge.application.recall import RETRIEVAL_DOCUMENT_EMBEDDING_TASK
 from mindbridge.benchmarks.artifacts import (
+    DeploymentSnapshot,
+    LoadedDeployment,
+    load_deployment_snapshot,
     require_writable_output_pair,
     sidecar_manifest_path,
     write_text_atomically,
@@ -29,16 +31,11 @@ from mindbridge.benchmarks.locomo_runner import (
 )
 from mindbridge.contracts import ContractModel, Identifier, NonEmptyString, Sha256Hex
 from mindbridge.file_integrity import sha256_file
-from mindbridge.models.jina import (
-    DEFAULT_JINA_OMNI_MODEL_ID,
-    DEFAULT_JINA_OMNI_REVISION,
-)
-from mindbridge.models.openai_chat import REASONING_EFFORT_VALUES
-from mindbridge.models.openai_omni import DEFAULT_OMNI_MODEL_ID
+from mindbridge.models import EmbedTask
 from mindbridge.prompts import ANSWER_FROM_EVIDENCE_PROMPT
-from mindbridge.sdk import AsyncMindBridge
+from mindbridge.sdk import MindBridge
 
-LOCOMO_RUNNER_VERSION = "locomo_production_api_v8"
+LOCOMO_RUNNER_VERSION = "locomo_production_api_v9"
 
 
 class LoCoMoRunManifest(ContractModel):
@@ -51,12 +48,9 @@ class LoCoMoRunManifest(ContractModel):
     source_revision: NonEmptyString
     source_sha256: Sha256Hex
     code_revision: NonEmptyString
-    answer_model_id: NonEmptyString
-    answer_model_revision: NonEmptyString
+    deployment: DeploymentSnapshot
+    deployment_sha256: Sha256Hex
     answer_prompt_version: NonEmptyString
-    reasoning_effort: NonEmptyString
-    embedding_model_id: NonEmptyString
-    embedding_model_revision: NonEmptyString
     retrieval_task: NonEmptyString
     prediction_key: NonEmptyString
     abstention_text: NonEmptyString
@@ -79,11 +73,7 @@ class _Arguments:
     api_base_url: str
     source_revision: str
     code_revision: str
-    answer_model_id: str
-    answer_model_revision: str
-    answer_reasoning_effort: str
-    embedding_model_id: str
-    embedding_model_revision: str
+    deployment_config_path: Path
     run_id: str
     tenant_prefix: str
     recall_limit: int
@@ -98,15 +88,16 @@ def main() -> None:
     arguments = _parse_arguments()
     conversations = _select_conversations(load_locomo(arguments.dataset_path), arguments.sample_ids)
     require_writable_output_pair(arguments.output_path, overwrite=arguments.overwrite)
+    deployment = load_deployment_snapshot(arguments.deployment_config_path)
     results = asyncio.run(_run_conversations(arguments, conversations))
-    _write_artifacts(arguments, conversations, results)
+    _write_artifacts(arguments, conversations, results, deployment)
 
 
 async def _run_conversations(
     arguments: _Arguments,
     conversations: tuple[LoCoMoConversation, ...],
 ) -> tuple[LoCoMoOfficialConversationResult, ...]:
-    memory = AsyncMindBridge.connect(
+    memory = MindBridge.connect(
         base_url=arguments.api_base_url,
         api_key=os.environ.get("MINDBRIDGE_API_KEY"),
         timeout_seconds=arguments.request_timeout_seconds,
@@ -133,6 +124,7 @@ def _write_artifacts(
     arguments: _Arguments,
     conversations: tuple[LoCoMoConversation, ...],
     results: tuple[LoCoMoOfficialConversationResult, ...],
+    deployment: LoadedDeployment,
 ) -> None:
     predictions = (
         json.dumps(
@@ -149,13 +141,10 @@ def _write_artifacts(
         source_revision=arguments.source_revision,
         source_sha256=sha256_file(arguments.dataset_path),
         code_revision=arguments.code_revision,
-        answer_model_id=arguments.answer_model_id,
-        answer_model_revision=arguments.answer_model_revision,
+        deployment=deployment.snapshot,
+        deployment_sha256=deployment.sha256,
         answer_prompt_version=ANSWER_FROM_EVIDENCE_PROMPT.version,
-        reasoning_effort=arguments.answer_reasoning_effort,
-        embedding_model_id=arguments.embedding_model_id,
-        embedding_model_revision=arguments.embedding_model_revision,
-        retrieval_task=RETRIEVAL_DOCUMENT_EMBEDDING_TASK,
+        retrieval_task=EmbedTask.DOCUMENT.value,
         prediction_key=LOCOMO_PREDICTION_KEY,
         abstention_text=LOCOMO_ABSTENTION,
         run_id=arguments.run_id,
@@ -199,15 +188,7 @@ def _parse_arguments() -> _Arguments:
     parser.add_argument("--api-base-url", required=True)
     parser.add_argument("--source-revision", required=True)
     parser.add_argument("--code-revision", required=True)
-    parser.add_argument("--answer-model-id", default=DEFAULT_OMNI_MODEL_ID)
-    parser.add_argument("--answer-model-revision", required=True)
-    parser.add_argument(
-        "--answer-reasoning-effort",
-        choices=("omitted", *REASONING_EFFORT_VALUES),
-        required=True,
-    )
-    parser.add_argument("--embedding-model-id", default=DEFAULT_JINA_OMNI_MODEL_ID)
-    parser.add_argument("--embedding-model-revision", default=DEFAULT_JINA_OMNI_REVISION)
+    parser.add_argument("--deployment-config", type=Path, required=True)
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--tenant-prefix", default="benchmark_locomo")
     parser.add_argument("--recall-limit", type=int, default=20)
@@ -222,11 +203,7 @@ def _parse_arguments() -> _Arguments:
         api_base_url=parsed.api_base_url,
         source_revision=parsed.source_revision,
         code_revision=parsed.code_revision,
-        answer_model_id=parsed.answer_model_id,
-        answer_model_revision=parsed.answer_model_revision,
-        answer_reasoning_effort=parsed.answer_reasoning_effort,
-        embedding_model_id=parsed.embedding_model_id,
-        embedding_model_revision=parsed.embedding_model_revision,
+        deployment_config_path=parsed.deployment_config,
         run_id=parsed.run_id,
         tenant_prefix=parsed.tenant_prefix,
         recall_limit=parsed.recall_limit,

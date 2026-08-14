@@ -1,12 +1,10 @@
-"""Multimodal event perception through the official OpenAI SDK."""
+"""Provider-neutral multimodal event perception pipeline."""
 
 from __future__ import annotations
 
 import json
-from typing import Annotated, Literal, TypedDict, cast
+from typing import Annotated
 
-from openai import AsyncOpenAI
-from openai.types.chat import ChatCompletionMessageParam
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -16,6 +14,7 @@ from pydantic import (
     model_validator,
 )
 
+from mindbridge.application.capabilities import GenerateRequest, Generator, ModelInput, TextPart
 from mindbridge.application.perception import (
     MAX_PERCEIVED_CLAIMS_PER_EVENT,
     MAX_PERCEIVED_ENTITIES_PER_EVENT,
@@ -29,22 +28,15 @@ from mindbridge.application.perception import (
     ResolvedEvidence,
     time_ranges_overlap,
 )
+from mindbridge.application.pipelines.evidence import evidence_parts
+from mindbridge.application.pipelines.structured import generate_json, unwrap_json_code_fence
 from mindbridge.core import (
     ClaimType,
     DomainInvariantError,
     EntityType,
     EvidenceId,
     ModelOutputError,
-    ModelReference,
     Observation,
-)
-from mindbridge.models.openai_chat import stream_text_completion, unwrap_json_code_fence
-from mindbridge.models.openai_media import OpenAIContentPart, evidence_media_content_parts
-from mindbridge.models.openai_omni import (
-    DEFAULT_OMNI_MODEL_ID,
-    DEFAULT_VIDEO_FRAMES_PER_SECOND,
-    DEFAULT_VIDEO_MAX_PIXELS,
-    normalize_openai_base_url,
 )
 from mindbridge.prompts import PERCEIVE_EVENTS_PROMPT
 from mindbridge.telemetry import set_current_span_attributes, trace_operation
@@ -58,7 +50,7 @@ _EvidenceIdentifier = Annotated[
 ]
 
 
-class _PerceivedEntityOutput(BaseModel):
+class _EntityOutput(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     entity_type: EntityType
@@ -67,13 +59,13 @@ class _PerceivedEntityOutput(BaseModel):
     evidence_ids: Annotated[tuple[_EvidenceIdentifier, ...], Field(min_length=1)]
 
     @model_validator(mode="after")
-    def require_unique_evidence(self) -> _PerceivedEntityOutput:
+    def require_unique_evidence(self) -> _EntityOutput:
         if len(set(self.evidence_ids)) != len(self.evidence_ids):
             raise ValueError("entity evidence_ids must be unique")
         return self
 
 
-class _PerceivedClaimOutput(BaseModel):
+class _ClaimOutput(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     claim_type: ClaimType
@@ -85,7 +77,7 @@ class _PerceivedClaimOutput(BaseModel):
     entity_indices: Annotated[tuple[Annotated[int, Field(ge=0)], ...], Field(max_length=32)] = ()
 
     @model_validator(mode="after")
-    def require_valid_references(self) -> _PerceivedClaimOutput:
+    def require_valid_references(self) -> _ClaimOutput:
         if self.valid_to_ms is not None and self.valid_to_ms < self.valid_from_ms:
             raise ValueError("valid_to_ms must not precede valid_from_ms")
         if len(set(self.evidence_ids)) != len(self.evidence_ids):
@@ -95,7 +87,7 @@ class _PerceivedClaimOutput(BaseModel):
         return self
 
 
-class _PerceivedEventOutput(BaseModel):
+class _EventOutput(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     start_ms: Annotated[int, Field(ge=0)]
@@ -104,14 +96,14 @@ class _PerceivedEventOutput(BaseModel):
     salience: Annotated[float, Field(ge=0.0, le=1.0)]
     evidence_ids: Annotated[tuple[_EvidenceIdentifier, ...], Field(min_length=1)]
     entities: Annotated[
-        tuple[_PerceivedEntityOutput, ...], Field(max_length=MAX_PERCEIVED_ENTITIES_PER_EVENT)
+        tuple[_EntityOutput, ...], Field(max_length=MAX_PERCEIVED_ENTITIES_PER_EVENT)
     ] = ()
     claims: Annotated[
-        tuple[_PerceivedClaimOutput, ...], Field(max_length=MAX_PERCEIVED_CLAIMS_PER_EVENT)
+        tuple[_ClaimOutput, ...], Field(max_length=MAX_PERCEIVED_CLAIMS_PER_EVENT)
     ] = ()
 
     @model_validator(mode="after")
-    def require_ordered_range(self) -> _PerceivedEventOutput:
+    def require_ordered_range(self) -> _EventOutput:
         if self.end_ms < self.start_ms:
             raise ValueError("end_ms must not precede start_ms")
         if len(set(self.evidence_ids)) != len(self.evidence_ids):
@@ -122,7 +114,7 @@ class _PerceivedEventOutput(BaseModel):
 class _PerceptionOutput(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    events: Annotated[tuple[_PerceivedEventOutput, ...], Field(max_length=MAX_PERCEPTION_EVENTS)]
+    events: Annotated[tuple[_EventOutput, ...], Field(max_length=MAX_PERCEPTION_EVENTS)]
 
     @model_validator(mode="after")
     def require_bounded_details(self) -> _PerceptionOutput:
@@ -133,115 +125,51 @@ class _PerceptionOutput(BaseModel):
         return self
 
 
-class _SystemMessage(TypedDict):
-    role: Literal["system"]
-    content: str
+class PerceptionPipeline:
+    """Turn a Generator into bounded, evidence-linked semantic intervals."""
 
-
-class _UserMessage(TypedDict):
-    role: Literal["user"]
-    content: list[OpenAIContentPart]
-
-
-class OpenAIOmniEventPerceiver:
-    """Inspect raw AV and return bounded, evidence-linked semantic intervals."""
-
-    def __init__(
-        self,
-        client: AsyncOpenAI,
-        *,
-        model_revision: str,
-        model_id: str = DEFAULT_OMNI_MODEL_ID,
-        request_timeout_seconds: float = 1_800,
-        max_output_tokens: int = 8_192,
-        video_frames_per_second: float = DEFAULT_VIDEO_FRAMES_PER_SECOND,
-        video_max_pixels: int = DEFAULT_VIDEO_MAX_PIXELS,
-    ) -> None:
-        for name, value in (("model_id", model_id), ("model_revision", model_revision)):
-            if not value.strip():
-                raise ValueError(f"{name} must not be empty")
-        if request_timeout_seconds <= 0 or max_output_tokens <= 0:
-            raise ValueError("request timeout and output token limit must be positive")
-        if video_frames_per_second <= 0 or video_max_pixels <= 0:
-            raise ValueError("video sampling values must be positive")
-        self._client = client
-        self._model_id = model_id
-        self._model_revision = model_revision
-        self._request_timeout_seconds = request_timeout_seconds
+    def __init__(self, generator: Generator, *, max_output_tokens: int = 8_192) -> None:
+        if max_output_tokens <= 0:
+            raise ValueError("max_output_tokens must be positive")
+        self._generator = generator
         self._max_output_tokens = max_output_tokens
-        self._video_frames_per_second = video_frames_per_second
-        self._video_max_pixels = video_max_pixels
 
-    @classmethod
-    def connect(
-        cls,
-        *,
-        api_key: str,
-        endpoint: str,
-        model_revision: str,
-        model_id: str = DEFAULT_OMNI_MODEL_ID,
-        request_timeout_seconds: float = 1_800,
-        max_retries: int = 2,
-    ) -> OpenAIOmniEventPerceiver:
-        """Create the perception adapter from deployment-injected configuration."""
-        if not api_key.strip():
-            raise ValueError("api_key must not be empty")
-        if not 0 <= max_retries <= 10:
-            raise ValueError("max_retries must be between 0 and 10")
-        return cls(
-            AsyncOpenAI(
-                api_key=api_key,
-                base_url=normalize_openai_base_url(endpoint),
-                timeout=request_timeout_seconds,
-                max_retries=max_retries,
-            ),
-            model_id=model_id,
-            model_revision=model_revision,
-            request_timeout_seconds=request_timeout_seconds,
-        )
-
-    @trace_operation("mindbridge.model.perceive_events")
+    @trace_operation("mindbridge.pipeline.perception")
     async def perceive_events(
         self,
         observation: Observation,
         evidence: tuple[ResolvedEvidence, ...],
     ) -> EventPerception:
-        """Stream one perception result and validate it against source evidence."""
+        _require_observation_evidence(observation, evidence)
+        output, result = await generate_json(
+            self._generator,
+            GenerateRequest(
+                system_prompt=PERCEIVE_EVENTS_PROMPT.text,
+                input=ModelInput(
+                    (
+                        TextPart(
+                            f"<observation_context>\n{_context(observation, evidence)}\n"
+                            "</observation_context>"
+                        ),
+                        *evidence_parts(evidence),
+                        TextPart(
+                            "<final_task>Produce the grounded events JSON for the observation "
+                            "and media above.</final_task>"
+                        ),
+                    )
+                ),
+                max_output_tokens=self._max_output_tokens,
+            ),
+            lambda content: _parse_output(content, observation, evidence),
+        )
         set_current_span_attributes(
             {
-                "mindbridge.model.id": self._model_id,
-                "mindbridge.model.revision": self._model_revision,
+                "mindbridge.model.id": result.model_reference.model_id,
+                "mindbridge.model.revision": result.model_reference.revision,
                 "mindbridge.prompt.version": PERCEIVE_EVENTS_PROMPT.version,
                 "mindbridge.evidence.count": len(evidence),
             }
         )
-        _require_observation_evidence(observation, evidence)
-        messages = _messages(
-            observation,
-            evidence,
-            video_frames_per_second=self._video_frames_per_second,
-            video_max_pixels=self._video_max_pixels,
-        )
-        completion = await stream_text_completion(
-            self._client,
-            model_id=self._model_id,
-            messages=cast(list[ChatCompletionMessageParam], messages),
-            max_output_tokens=self._max_output_tokens,
-            request_timeout_seconds=self._request_timeout_seconds,
-        )
-        try:
-            output = _parse_perception(completion.content)
-        except ModelOutputError:
-            completion = await stream_text_completion(
-                self._client,
-                model_id=self._model_id,
-                messages=cast(list[ChatCompletionMessageParam], messages),
-                max_output_tokens=self._max_output_tokens,
-                request_timeout_seconds=self._request_timeout_seconds,
-                json_mode=True,
-            )
-            output = _parse_perception(completion.content)
-        _require_grounded_output(observation, evidence, output)
         return EventPerception(
             events=tuple(
                 PerceivedEvent(
@@ -274,53 +202,9 @@ class OpenAIOmniEventPerceiver:
                 )
                 for event in output.events
             ),
-            model_reference=ModelReference(
-                model_id=self._model_id,
-                revision=completion.system_fingerprint or self._model_revision,
-            ),
+            model_reference=result.model_reference,
             prompt_version=PERCEIVE_EVENTS_PROMPT.version,
         )
-
-    async def close(self) -> None:
-        """Release connections owned by the OpenAI SDK client."""
-        await self._client.close()
-
-
-def _messages(
-    observation: Observation,
-    evidence: tuple[ResolvedEvidence, ...],
-    *,
-    video_frames_per_second: float,
-    video_max_pixels: int,
-) -> list[_SystemMessage | _UserMessage]:
-    content: list[OpenAIContentPart] = [
-        {
-            "type": "text",
-            "text": (
-                f"<observation_context>\n{_context(observation, evidence)}\n</observation_context>"
-            ),
-        }
-    ]
-    content.extend(
-        evidence_media_content_parts(
-            evidence,
-            video_frames_per_second=video_frames_per_second,
-            video_max_pixels=video_max_pixels,
-        )
-    )
-    content.append(
-        {
-            "type": "text",
-            "text": (
-                "<final_task>Produce the grounded events JSON for the observation and media "
-                "above.</final_task>"
-            ),
-        }
-    )
-    return [
-        {"role": "system", "content": PERCEIVE_EVENTS_PROMPT.text},
-        {"role": "user", "content": content},
-    ]
 
 
 def _context(observation: Observation, evidence: tuple[ResolvedEvidence, ...]) -> str:
@@ -362,15 +246,19 @@ def _context(observation: Observation, evidence: tuple[ResolvedEvidence, ...]) -
     )
 
 
-def _parse_perception(content: str) -> _PerceptionOutput:
+def _parse_output(
+    content: str,
+    observation: Observation,
+    evidence: tuple[ResolvedEvidence, ...],
+) -> _PerceptionOutput:
     if not content.strip():
-        raise ModelOutputError("Omni perception model returned empty content")
+        raise ModelOutputError("perception pipeline returned empty content")
     try:
-        return _PerceptionOutput.model_validate_json(unwrap_json_code_fence(content))
+        output = _PerceptionOutput.model_validate_json(unwrap_json_code_fence(content))
     except ValidationError as error:
-        raise ModelOutputError(
-            "Omni perception model returned invalid structured output"
-        ) from error
+        raise ModelOutputError("perception pipeline returned invalid structured output") from error
+    _require_grounded_output(observation, evidence, output)
+    return output
 
 
 def _require_observation_evidence(
@@ -396,36 +284,31 @@ def _require_grounded_output(
     evidence_by_id = {str(item.evidence_span.evidence_id): item.evidence_span for item in evidence}
     for event in output.events:
         if event.end_ms > duration_ms:
-            raise ModelOutputError("Omni perception event exceeds observation duration")
+            raise ModelOutputError("perception event exceeds observation duration")
         try:
             spans = tuple(evidence_by_id[evidence_id] for evidence_id in event.evidence_ids)
         except KeyError as error:
-            raise ModelOutputError("Omni perception event references unknown evidence") from error
+            raise ModelOutputError("perception event references unknown evidence") from error
         if any(
-            not time_ranges_overlap(
-                span.start_ms,
-                span.end_ms,
-                event.start_ms,
-                event.end_ms,
-            )
+            not time_ranges_overlap(span.start_ms, span.end_ms, event.start_ms, event.end_ms)
             for span in spans
         ):
-            raise ModelOutputError("Omni perception event does not overlap its evidence")
+            raise ModelOutputError("perception event does not overlap its evidence")
         event_evidence_ids = set(event.evidence_ids)
         if any(
             not set(entity.evidence_ids) <= event_evidence_ids for entity in event.entities
         ) or any(not set(claim.evidence_ids) <= event_evidence_ids for claim in event.claims):
-            raise ModelOutputError("Omni perception detail references evidence outside its event")
+            raise ModelOutputError("perception detail references evidence outside its event")
         if any(
             claim.valid_from_ms < event.start_ms
             or claim.valid_from_ms > event.end_ms
             or (claim.valid_to_ms is not None and claim.valid_to_ms > event.end_ms)
             for claim in event.claims
         ):
-            raise ModelOutputError("Omni perception claim validity exceeds its event")
+            raise ModelOutputError("perception claim validity exceeds its event")
         if any(
             entity_index >= len(event.entities)
             for claim in event.claims
             for entity_index in claim.entity_indices
         ):
-            raise ModelOutputError("Omni perception claim references an unknown entity")
+            raise ModelOutputError("perception claim references an unknown entity")

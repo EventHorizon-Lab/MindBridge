@@ -5,7 +5,7 @@ from typing import cast
 
 import pytest
 
-from mindbridge import AsyncMindBridge
+from mindbridge import MindBridge
 from mindbridge.benchmarks import (
     LOCOMO_ABSTENTION,
     LoCoMoConversation,
@@ -81,9 +81,7 @@ async def test_locomo_uses_only_source_turns_and_questions_in_api_requests() -> 
         ),
     )
 
-    result = await run_locomo_conversation(
-        cast(AsyncMindBridge, api), conversation, run_id="run_01"
-    )
+    result = await run_locomo_conversation(cast(MindBridge, api), conversation, run_id="run_01")
 
     assert api.remember_requests[0].summary == (
         'Caroline said: "I started a new course."\n'
@@ -102,7 +100,7 @@ async def test_locomo_uses_only_source_turns_and_questions_in_api_requests() -> 
 async def test_locomo_rejects_unbounded_or_empty_request_pool() -> None:
     with pytest.raises(ValueError, match="positive"):
         await run_locomo_conversation(
-            cast(AsyncMindBridge, RecordingMemoryApi()),
+            cast(MindBridge, RecordingMemoryApi()),
             _conversation(),
             run_id="run_01",
             request_concurrency=0,
@@ -126,7 +124,7 @@ async def test_locomo_uses_the_same_recall_budget_for_every_question_wording() -
     )
 
     await run_locomo_conversation(
-        cast(AsyncMindBridge, api),
+        cast(MindBridge, api),
         conversation,
         run_id="run_01",
         recall_limit=20,

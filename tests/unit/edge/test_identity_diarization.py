@@ -21,12 +21,13 @@ from mindbridge.core import IdentityKind, IdentityScope, ModelOutputError, Model
 from mindbridge.edge import identity_diarization
 from mindbridge.edge.identity import FaceVoiceAssociationEvidence, SQLiteIdentityMemory
 from mindbridge.edge.identity_diarization import (
+    ActiveSpeakerMatcher,
     FunASRSpeechPipeline,
     FunASRStreamingTranscriber,
     IdentityMatchingThresholds,
-    OpenAIAVSpeechSegmenter,
-    OpenAIVisualActiveSpeakerMatcher,
     SpeechAnalysis,
+    SpeechSegmentationPipeline,
+    VisualActiveSpeakerPipeline,
     recognize_identities_in_av_segment,
 )
 from mindbridge.edge.identity_inference import (
@@ -36,7 +37,7 @@ from mindbridge.edge.identity_inference import (
     SpeakerEmbeddingSample,
     SpeechSegment,
 )
-from mindbridge.models.openai_omni import normalize_openai_base_url
+from mindbridge.models.openai import OpenAIGenerator, normalize_base_url
 
 
 async def test_diarizer_sends_native_av_and_returns_bounded_turns(
@@ -332,7 +333,7 @@ async def test_av_identity_segment_runs_the_complete_revocable_handoff(tmp_path:
         memory=memory,
         face_encoder=cast(InsightFaceVideoEncoder, faces),
         speech_pipeline=cast(FunASRSpeechPipeline, SpeechPipeline()),
-        active_speaker_matcher=cast(OpenAIVisualActiveSpeakerMatcher, matcher),
+        active_speaker_matcher=cast(ActiveSpeakerMatcher, matcher),
         thresholds=thresholds,
         parallel_model_inference=False,
     )
@@ -353,7 +354,7 @@ async def test_av_identity_segment_runs_the_complete_revocable_handoff(tmp_path:
         memory=memory,
         face_encoder=cast(InsightFaceVideoEncoder, faces),
         speech_pipeline=cast(FunASRSpeechPipeline, SpeechPipeline()),
-        active_speaker_matcher=cast(OpenAIVisualActiveSpeakerMatcher, matcher),
+        active_speaker_matcher=cast(ActiveSpeakerMatcher, matcher),
         thresholds=thresholds,
         parallel_model_inference=False,
     )
@@ -388,10 +389,7 @@ async def test_visual_active_speaker_returns_revocable_edge_evidence(
         "_annotated_face_video",
         lambda path, _faces, _maximum_bytes, _audio_path=None: (path, b"annotated"),
     )
-    matcher = OpenAIVisualActiveSpeakerMatcher(
-        _client(respond),
-        model_revision="deployment-revision",
-    )
+    matcher = _VisualHarness(_generator(respond))
     try:
         evidence = await matcher.match_file(
             media,
@@ -423,7 +421,7 @@ async def test_visual_active_speaker_skips_observation_scoped_voices(tmp_path: P
 
     media = tmp_path / "clip.mp4"
     media.write_bytes(b"real-media-placeholder")
-    matcher = OpenAIVisualActiveSpeakerMatcher(_client(fail), model_revision="revision")
+    matcher = _VisualHarness(_generator(fail, revision="revision"))
     try:
         evidence = await matcher.match_file(
             media,
@@ -527,19 +525,45 @@ def test_face_anchor_annotation_muxes_the_audio_sidecar(tmp_path: Path) -> None:
 
 def _segmenter(
     handler: Callable[[httpx.Request], Coroutine[None, None, httpx.Response]],
-) -> OpenAIAVSpeechSegmenter:
-    return OpenAIAVSpeechSegmenter(_client(handler))
+) -> "_SpeechHarness":
+    return _SpeechHarness(_generator(handler))
 
 
-def _client(
+def _generator(
     handler: Callable[[httpx.Request], Coroutine[None, None, httpx.Response]],
-) -> AsyncOpenAI:
-    return AsyncOpenAI(
-        api_key="unit-test-key",
-        base_url=normalize_openai_base_url("https://vlm.example.test/api/v1/chat/completions"),
-        http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
-        max_retries=0,
+    *,
+    revision: str = "deployment-revision",
+) -> OpenAIGenerator:
+    return OpenAIGenerator(
+        AsyncOpenAI(
+            api_key="unit-test-key",
+            base_url=normalize_base_url("https://vlm.example.test/api/v1/chat/completions"),
+            http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+            max_retries=0,
+        ),
+        ModelReference("qwen3.8-max", revision),
     )
+
+
+class _SpeechHarness(SpeechSegmentationPipeline):
+    def __init__(self, generator: OpenAIGenerator) -> None:
+        super().__init__(generator)
+        self._owned_generator = generator
+
+    async def close(self) -> None:
+        await self._owned_generator.close()
+
+
+class _VisualHarness(VisualActiveSpeakerPipeline):
+    def __init__(self, generator: OpenAIGenerator) -> None:
+        super().__init__(
+            generator,
+            model_reference=ModelReference("qwen3.8-max", "deployment-revision"),
+        )
+        self._owned_generator = generator
+
+    async def close(self) -> None:
+        await self._owned_generator.close()
 
 
 def _identity(

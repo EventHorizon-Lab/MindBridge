@@ -57,7 +57,7 @@ class ResolvedEvidence:
 
 @dataclass(frozen=True, slots=True)
 class PerceivedEntity:
-    """One named semantic entity grounded by Omni evidence."""
+    """One named semantic entity grounded by source evidence."""
 
     entity_type: EntityType
     canonical_name: str
@@ -75,7 +75,7 @@ class PerceivedEntity:
 
 @dataclass(frozen=True, slots=True)
 class PerceivedClaim:
-    """One evidence-grounded fact, state, intent, or relation proposed by Omni."""
+    """One evidence-grounded fact, state, intent, or relation proposed by a model."""
 
     claim_type: ClaimType
     statement: str
@@ -106,7 +106,7 @@ class PerceivedClaim:
 
 @dataclass(frozen=True, slots=True)
 class PerceivedEvent:
-    """One schema-validated semantic interval proposed by an Omni model."""
+    """One schema-validated semantic interval proposed by a model."""
 
     start_ms: int
     end_ms: int

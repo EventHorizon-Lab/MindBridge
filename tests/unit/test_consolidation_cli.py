@@ -167,16 +167,16 @@ def test_consolidation_settings_require_and_redact_credentials() -> None:
     environment = {
         "MINDBRIDGE_DATABASE_URL": "postgresql://user:database-secret@postgres/mindbridge",
         "MINDBRIDGE_OBJECT_STORAGE_BUCKET": "memory",
-        "MINDBRIDGE_VLM_API_KEY": "vlm-secret",
-        "MINDBRIDGE_VLM_ENDPOINT": "https://vlm.example.test/v1/chat/completions",
-        "MINDBRIDGE_VLM_MODEL_REVISION": "deployment-revision",
-        "MINDBRIDGE_TEXT_EMBEDDING_API_KEY": "embedding-secret",
-        "MINDBRIDGE_TEXT_EMBEDDING_ENDPOINT": "https://embedding.example.test/v1/embeddings",
+        "MINDBRIDGE_GENERATOR_API_KEY": "generator-secret",
+        "MINDBRIDGE_GENERATOR_ENDPOINT": "https://generator.example.test/v1",
+        "MINDBRIDGE_GENERATOR_MODEL_REVISION": "deployment-revision",
+        "MINDBRIDGE_EMBEDDER_API_KEY": "embedding-secret",
+        "MINDBRIDGE_EMBEDDER_ENDPOINT": "https://embedding.example.test/v1",
     }
 
     settings = ConsolidationSettings.from_environment(environment)
 
     assert settings.object_storage_bucket == "memory"
     assert "database-secret" not in repr(settings)
-    assert "vlm-secret" not in repr(settings)
+    assert "generator-secret" not in repr(settings)
     assert "embedding-secret" not in repr(settings)

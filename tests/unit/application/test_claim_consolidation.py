@@ -39,6 +39,7 @@ from mindbridge.core import (
     TenantId,
     VerificationStatus,
 )
+from mindbridge.models import Embedding, EmbedRequest, EmbedResult, TextPart
 
 NOW = datetime(2026, 8, 12, 12, 0, tzinfo=timezone.utc)
 TENANT_ID = TenantId("tenant_01")
@@ -113,19 +114,26 @@ class RecordingClaimConsolidator:
 
 
 class RecordingTextEmbedder:
-    model_reference = ModelReference(model_id="jina-text", revision="text-revision")
-    space_reference = EmbeddingSpaceReference(space_id="jina-v5", revision="space-v1")
-    dimension = 2
-
     def __init__(self) -> None:
         self.documents: tuple[str, ...] = ()
 
-    async def encode_documents(
-        self,
-        texts: tuple[str, ...],
-    ) -> tuple[tuple[float, ...], ...]:
-        self.documents = texts
-        return ((1.0, 0.0),) * len(texts)
+    async def embed(self, request: EmbedRequest) -> EmbedResult:
+        self.documents = tuple(
+            part.text
+            for input_value in request.inputs
+            for part in input_value.parts
+            if isinstance(part, TextPart)
+        )
+        return EmbedResult(
+            tuple(
+                Embedding(
+                    (1.0, 0.0),
+                    ModelReference(model_id="jina-text", revision="text-revision"),
+                    EmbeddingSpaceReference(space_id="jina-v5", revision="space-v1"),
+                )
+                for _ in request.inputs
+            )
+        )
 
 
 class DeterministicSigner:
