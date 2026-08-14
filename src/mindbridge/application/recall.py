@@ -20,7 +20,7 @@ from mindbridge.application.ports import (
     MemoryStore,
     ResolvedQueryMedia,
 )
-from mindbridge.application.ranking import fuse_memory_rankings
+from mindbridge.application.ranking import fuse_memory_rankings, order_memory_candidates
 from mindbridge.contracts import (
     EvidenceView,
     MemoryResult,
@@ -150,9 +150,23 @@ class RecallMemories:
                 query_media,
             )
             retrieval_round_count = 1
+            temporal_order = generated.temporal_order
+            if temporal_order != "relevance":
+                ordered_candidates = order_memory_candidates(visible_candidates, temporal_order)
+                if tuple(memory.memory_id for memory in ordered_candidates) != tuple(
+                    memory.memory_id for memory in visible_candidates
+                ):
+                    visible_candidates = ordered_candidates
+                    generated, answer_evidence = await self._answer_candidates(
+                        request,
+                        visible_candidates,
+                        query_media,
+                    )
+                    retrieval_round_count += 1
             seen_queries = (
                 {request.query.text.casefold()} if request.query.text is not None else set()
             )
+            attempted_queries: tuple[str, ...] = ()
             for _ in range(_MAXIMUM_RETRIEVAL_REFINEMENTS):
                 followup_queries = tuple(
                     query
@@ -162,6 +176,7 @@ class RecallMemories:
                 if not followup_queries or request.memory_ids:
                     break
                 seen_queries.update(query.casefold() for query in followup_queries)
+                attempted_queries += followup_queries
                 retrieval_query_count += len(followup_queries)
                 query_media = await self._resign_query_media(query_media)
                 followup_rankings = await asyncio.gather(
@@ -186,16 +201,25 @@ class RecallMemories:
                     limit=candidate_limit,
                 )
                 refined_candidates = await self._refresh_visible_candidates(request, refined)
+                refined_candidates = order_memory_candidates(refined_candidates, temporal_order)
                 if tuple(memory.memory_id for memory in refined_candidates) == tuple(
                     memory.memory_id for memory in visible_candidates
                 ):
-                    break
+                    generated, answer_evidence = await self._answer_candidates(
+                        request,
+                        visible_candidates,
+                        query_media,
+                        attempted_retrieval_queries=attempted_queries,
+                    )
+                    retrieval_round_count += 1
+                    continue
                 memories = refined
                 visible_candidates = refined_candidates
                 generated, answer_evidence = await self._answer_candidates(
                     request,
                     visible_candidates,
                     query_media,
+                    attempted_retrieval_queries=attempted_queries,
                 )
                 retrieval_round_count += 1
         visible_memories = await self._store.record_memory_accesses(
@@ -249,6 +273,8 @@ class RecallMemories:
         request: RecallRequest,
         candidates: tuple[MemoryRecord, ...],
         query_media: tuple[ResolvedQueryMedia, ...],
+        *,
+        attempted_retrieval_queries: tuple[str, ...] = (),
     ) -> tuple[GeneratedAnswer, tuple[ResolvedEvidence, ...]]:
         grounded = self._grounded_memories(candidates)
         evidence = await self._read_evidence(request, grounded) if grounded else ()
@@ -261,12 +287,14 @@ class RecallMemories:
             grounded,
             evidence,
             query_media=answer_query_media,
+            attempted_retrieval_queries=attempted_retrieval_queries,
         )
         if not grounded and not query_media and generated.answer is not None:
             generated = GeneratedAnswer(
                 answer=None,
                 confidence=0.0,
                 retrieval_queries=generated.retrieval_queries,
+                temporal_order=generated.temporal_order,
             )
         return generated, evidence
 

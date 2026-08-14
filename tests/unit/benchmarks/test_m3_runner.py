@@ -47,6 +47,7 @@ class RecordingMemoryApi:
         return ObservationReceipt(
             observation_id=f"observation_{request.sequence}",
             processing_job_id=f"job_{request.sequence}",
+            evidence_ids=(f"evidence_{request.sequence}",),
             idempotency_key=request.idempotency_key or "generated",
             status=ObservationStatus.ACCEPTED,
             trace_id=f"trace_observe_{request.sequence}",
@@ -167,6 +168,73 @@ async def test_m3_caption_protocol_uses_same_causal_boundary() -> None:
         "recall:What was visible first?",
     ]
     assert api.remember_requests[0].ended_at == NOW.replace(second=30)
+
+
+async def test_m3_binds_released_caption_to_source_video() -> None:
+    api = RecordingMemoryApi()
+    prepared = M3PreparedVideo(
+        video_id="video_01",
+        timeline_origin=NOW,
+        clips=(
+            M3PreparedClip(
+                clip_index=0,
+                media_object=_media("media_0", MediaKind.VIDEO),
+                caption="A person entered.",
+                duration_ms=30_000,
+            ),
+        ),
+    )
+
+    await run_m3_video(
+        cast(AsyncMindBridge, api),
+        _annotation(questions=(_annotation().questions[0],)),
+        prepared,
+        run_id="run_01",
+        poll_interval_seconds=0.001,
+    )
+
+    assert api.remember_requests[0].evidence_ids == ("evidence_0",)
+
+
+async def test_m3_keeps_released_events_and_inferences_in_separate_memory_types() -> None:
+    class SerialMemoryApi(RecordingMemoryApi):
+        remembering = False
+
+        async def remember(self, request: RememberRequest) -> MemoryView:
+            assert not self.remembering
+            self.remembering = True
+            await asyncio.sleep(0)
+            result = await super().remember(request)
+            self.remembering = False
+            return result
+
+    api = SerialMemoryApi()
+    prepared = M3PreparedVideo(
+        video_id="video_01",
+        timeline_origin=NOW,
+        clips=(
+            M3PreparedClip(
+                clip_index=0,
+                caption=(
+                    "[Event] A person placed a mug on the table.\n"
+                    "[Inference] The person appears to be preparing tea."
+                ),
+                duration_ms=30_000,
+            ),
+        ),
+    )
+
+    await run_m3_video(
+        cast(AsyncMindBridge, api),
+        _annotation(questions=(_annotation().questions[0],)),
+        prepared,
+        run_id="run_01",
+    )
+
+    assert [(request.memory_type, request.summary) for request in api.remember_requests] == [
+        (MemoryType.EPISODIC, "[Event] A person placed a mug on the table."),
+        (MemoryType.SEMANTIC, "[Inference] The person appears to be preparing tea."),
+    ]
 
 
 async def test_m3_counts_bounded_model_failures_as_incorrect_and_continues() -> None:

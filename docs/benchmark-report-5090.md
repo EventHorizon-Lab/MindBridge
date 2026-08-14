@@ -3,7 +3,8 @@
 > 运行日期：2026-08-13
 >
 > 运行编号：完整基线 LoCoMo `5090-clean-006`、多模态 `5090-clean-007`；当前代码诊断
-> `locomo-reflection-v8-clean-008`、当前固定切片 `refinement-v9-uniform-l20/l50`
+> `locomo-reflection-v8-clean-008`、当前固定切片 `refinement-v9-uniform-l20/l50`；当前实现
+> `answer_from_evidence_v10`
 >
 > 验证边界：一台 RTX 5090 同时模拟机器人端与云端；本轮验证功能、质量和数据闭环，延迟、功耗、温度与 Jetson TensorRT 性能暂不作为验收门禁。
 >
@@ -12,9 +13,14 @@
 > 后续实现说明：本报告的榜单数字和第 5 节身份重放属于当时固定 manifest，保持不改写。当前代码已
 > 删除 NeMo/独立声纹二次推理，收敛到 FunASR 在线 ASR + Event-close 统一
 > VAD/ASR/punctuation/diarization/centroid 路径，并加入 Event 级精确 EvidenceSpan 和最多两轮通用
-> retrieval refinement。下面的完整 split 旧分数不能当作新代码成绩；当前代码只重跑了 LoCoMo
+> retrieval refinement。当前实现还把原始媒体 Observation 的 source EvidenceSpan 回传给 runner，
+> 将 M3 `[Event]/[Inference]`、EgoLife Visual/Audio 和 SuperMemory transcript 绑定回同一媒体，
+> 并支持最终相关 Top-K 内 newest/oldest 重排、无新增结果时的检索方向切换，以及 Summary
+> 有向下钻与有界单跳父/同父展开。
+> 下面的完整 split 旧分数不能当作新代码成绩；当前代码只重跑了 LoCoMo
 > `conv-26` 的 419 条记忆/199 题固定回归，四套完整 split 尚未重跑，因此仍不得声明
-> 全面 SOTA。当前架构和最新 5090 功能证据见
+> 全面 SOTA。跨查询 experience memory 与 Entity/Bridge/Scene/Horizon cue 本轮刻意未实现，必须等
+> 同协议完整数据证明通用收益后再加入。当前架构和最新 5090 功能证据见
 > [`technical-architecture.md`](technical-architecture.md) 与
 > [`edge-identity-sota.md`](edge-identity-sota.md)。
 
@@ -23,6 +29,20 @@
 MindBridge 的 MaaS 主链路已经能够真实运行：端侧原始视频进入近期记忆与 Outbox，云端完成对象存储、视听理解、事件/实体/Claim 构建、Embedding、混合召回和证据回答；反馈能够强化或版本化纠错；生命周期能够降冷并在访问时回热；显式遗忘能够删除云端媒体、派生记录、索引、端侧近期记忆和本地身份模板；Episode、Claim 与 Summary consolidation 也已通过真实 Omni/VLM 调用完成提交。
 
 这不等于 MindBridge 的最终目标已经完成：LoCoMo 的官方 token-F1 已超过当前公开 T-Mem 结果，但 Judge 模型和重复次数不同，不能据此宣布整体 SOTA；三个多模态 Benchmark 的完整公开题集已经评估，但公开输入条件分别是发布 caption、transcript 或 memory graph，而不是完全相同的原始视听管线，因此只能用于定位记忆层差距，不能冒充与论文榜单严格可比的 SOTA 复现。当前已加入一次有界的证据充分性反思检索；真正未完成的是原始视听全量重放、跨查询经验记忆、目标 Jetson 标定和严格官方 Judge 复跑。
+
+2026-08-14 的增量真实媒体复验使用 17.63 秒 EgoLife 原始 MP4：签名 URL 完整返回
+`6,663,507` bytes，同一 `qwen3.8-max` 通过异步 OpenAI SDK 直接查看视频并识别红白格桌布。随后
+把官方发布 caption 作为唯一显式 `memory_id`，但绑定 `observe` 返回的一个 source EvidenceSpan；
+生产 Recall 返回同一 EvidenceSpan，并从视频回答 `Red and white checkered`，confidence `0.95`。
+这证明文本定位→原始媒体重看链路，不是 Benchmark 分数。常驻 Celery Worker 仍配置已停用的
+`127.0.0.1:8001` Embedding endpoint，而当前服务在 `8012`，导致 Observation 派生 Job 标记
+`model_unavailable`；完整 raw-AV 重跑前必须用同一部署配置重启 Worker，该环境问题不能记成模型
+或代码通过。
+
+新 runner 还对全部本地发布表示完成了解析门禁：M3 的 `56,833` 个 caption clip 生成
+`113,391` 条 Event/Inference memory view，EgoLife 的 `6,388` 个 caption clip 生成 `11,721` 条
+Visual/Audio view，SuperMemory 的 `6,157` 个 transcript segment 全部通过契约；最大单条长度分别为
+`2,048 / 1,806 / 1,462` 字符。该检查只证明完整输入可摄入，不是回答质量或 SOTA 结果。
 
 ## 2. 运行配置与可比性
 
@@ -229,15 +249,20 @@ embedding，只证明调度与本地模型链路，不替代 Jetson 延迟、功
 
 ### P0：先补证据可达性
 
-1. 把 EgoLife、SuperMemory 和 M3 的原始 video/audio、OCR、ASR、identity 与发布文本组成同一 EvidenceSpan；文本只作为派生索引，answerer 最终重看原始媒体。
-2. 为 temporal/last-time 查询增加显式时间解析、发生时间排序和相邻 Episode 扩展；依据是 EgoLife `last time` 比其余问题低 `7.22 pp`，而非 LoCoMo 的错误类别映射。
-3. 已完成一次有界 Search→Evidence sufficiency→最多两个补充 query；下一步只在四套完整评测证明
+1. 已完成原始 Observation source EvidenceSpan 到发布文本的绑定，并由 answerer 重看原始媒体；
+   仍需用完整可用 raw-AV 数据重跑，验证 SuperMemory 的 OCR/物体/空间定位收益。
+2. 已为 `latest/last/first` 增加最终相关 Top-K 内的发生时间排序；Summary 只做有向下钻和有界单跳
+   父/同父展开，避免一个大 Summary 挤掉其他直接命中。相邻 Episode 是否继续扩大只由 EgoLife
+   完整重跑决定。
+3. 已完成 Search→Evidence sufficiency→最多两个补充 query，并在无新增结果时切换检索方向；下一步只在四套完整评测证明
    仍有收益时增加 query-level experience memory，不把它扩展成无界 Agent loop。
 
 ### P1：让记忆在写入时为未来查询做好准备
 
-1. 复用现有 Claim/Summary/Embedding 表达，生成 T-Mem 式 Entity、Bridge、Scene、Horizon 多视图 cue；cue 只决定如何找到证据，不进入答案事实通道。
-2. 增加 query-level experience memory：记录“哪类查询缺了什么证据、哪个补充 query 成功”，按复用反馈强化、合并或衰减；不保存历史答案并且不依赖 benchmark 标签。
+1. 暂缓 T-Mem 式 Entity、Bridge、Scene、Horizon 多视图 cue；只有完整 split 的分层 Evidence Recall
+   证明现有表示无法覆盖且离线消融显示跨任务收益时再实现。
+2. 暂缓 query-level experience memory；先固定当前检索策略完成同协议全量复跑，避免把历史题目或
+   偶然成功 query 变成 Benchmark 泄漏。
 3. 将人物 persona 作为受证据支持的 ambient context，不与 Episode 竞争固定 Top-K；错误或过期属性继续走版本化 Claim。
 4. SuperMemory 将 answerability 与 option ranking 分成两个受约束输出，分别校准，不用一个 confidence 同时承担拒答和四选一排序。
 

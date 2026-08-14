@@ -31,7 +31,7 @@ from mindbridge.models.openai_media import (
 from mindbridge.telemetry import set_current_span_attributes, trace_operation
 
 DEFAULT_OMNI_MODEL_ID = "qwen3.8-max"
-ANSWER_FROM_EVIDENCE_PROMPT_VERSION = "answer_from_evidence_v9"
+ANSWER_FROM_EVIDENCE_PROMPT_VERSION = "answer_from_evidence_v10"
 SELECT_OCCURRENCES_PROMPT_VERSION = "select_occurrences_v2"
 DEFAULT_VIDEO_FRAMES_PER_SECOND = 1.0
 DEFAULT_VIDEO_MAX_PIXELS = 200_704
@@ -55,26 +55,35 @@ You answer questions from embodied memories by inspecting their original image, 
 # Answer rules
 Give the shortest complete answer in the form requested. Preserve supported names, quoted wording,
 dates, times, quantities, and option labels exactly. For yes/no questions, answer "Yes" or "No". For
-list or count questions, include every supported item or distinct occurrence. For predictive or
-hypothetical questions, make only the minimal inference supported by the memories. Omit explanation
-unless the question asks for it. The answer string is not an evidence report: do not add "based on",
-message dates, citations, caveats, or a restatement of the question. For when, how many, who, and
-where, return only the requested date, number, name, or place. Put unresolved ambiguity in
-retrieval_queries instead of making the answer verbose. Confidence reflects evidential support, not
-general plausibility.
+explicit multiple-choice questions, follow the requested label or ranking format; an offered
+"cannot be answered" choice is a task answerability option, not API abstention. For list or count
+questions, include every supported item or distinct occurrence. For "latest", "last", "most recent",
+"first", "before", or "after", compare candidate occurrence intervals rather than memory order or
+message order. For predictive or hypothetical questions, make only the minimal inference supported
+by the memories. Omit explanation unless the question asks for it.
+The answer string is not an evidence report: do not add "based on", message dates, citations, caveats,
+or a restatement of the question. For when, how many, who, and where, return only the requested date,
+number, name, or place.
+Put unresolved ambiguity in retrieval_queries instead of making the answer verbose. Confidence
+reflects evidential support, not general plausibility.
 
 # Retrieval reflection
 If the current sources are insufficient or materially ambiguous, return at most two short,
 standalone search queries that target the missing evidence. Preserve exact names and opaque identity
 IDs; include the needed action, object, time relation, speaker, visual attribute, or causal bridge.
-Each query must differ from the question and from the other query. A currently supported but
-incomplete answer may be returned as provisional together with queries; do not state a guess as
-fact. Follow-up search results may be merely related: require evidence that directly supports the
-requested relation before answering. Return no search query when the answer is fully supported or
-another memory search cannot resolve the gap.
+Use compact keyword phrases, with one missing fact per query; avoid commands and restating the full
+question. Each query must differ from the question, from the other query, and from every attempted
+retrieval query in recall_context. If an attempted query found no new direct evidence, switch entity,
+relation, temporal, visual, or causal direction. A currently supported but incomplete answer may be
+returned as provisional together with queries; do not state a guess as fact. Follow-up search results
+may be merely related: require evidence that directly supports the requested relation before
+answering. Return no search query when the answer is fully supported or another memory search cannot
+resolve the gap.
 
 # Output
-Return exactly one JSON object with keys "answer", "confidence", and "retrieval_queries". A null
+Return exactly one JSON object with keys "answer", "confidence", "retrieval_queries", and
+"temporal_order". Use "newest" for latest/last-time/most-recent questions and "oldest" for
+first/earliest questions. For before/after, dates, and all other questions use "relevance". A null
 answer requires confidence 0.0. A provisional answer may have retrieval_queries; a final supported
 answer must use []. Return only the JSON object, with no markdown or additional keys."""
 
@@ -113,6 +122,7 @@ class _OmniAnswerOutput(BaseModel):
     answer: _NonEmptyAnswer | None
     confidence: Annotated[float, Field(ge=0.0, le=1.0)]
     retrieval_queries: Annotated[tuple[_RetrievalQuery, ...], Field(max_length=2)] = ()
+    temporal_order: Literal["relevance", "newest", "oldest"] = "relevance"
 
     @model_validator(mode="after")
     def require_zero_confidence_for_abstention(self) -> _OmniAnswerOutput:
@@ -233,6 +243,7 @@ class OpenAIOmniAnswerer:
         evidence: tuple[ResolvedEvidence, ...],
         *,
         query_media: tuple[ResolvedQueryMedia, ...],
+        attempted_retrieval_queries: tuple[str, ...] = (),
     ) -> GeneratedAnswer:
         """Stream one grounded completion and reject malformed provider output."""
         set_current_span_attributes(
@@ -251,6 +262,7 @@ class OpenAIOmniAnswerer:
             memories,
             evidence,
             query_media=query_media,
+            attempted_retrieval_queries=attempted_retrieval_queries,
             video_frames_per_second=self._video_frames_per_second,
             video_max_pixels=self._video_max_pixels,
         )
@@ -302,6 +314,7 @@ class OpenAIOmniAnswerer:
             memories,
             evidence,
             query_media=query_media,
+            attempted_retrieval_queries=(),
             video_frames_per_second=self._video_frames_per_second,
             video_max_pixels=self._video_max_pixels,
         )
@@ -347,6 +360,7 @@ def _messages(
     evidence: tuple[ResolvedEvidence, ...],
     *,
     query_media: tuple[ResolvedQueryMedia, ...],
+    attempted_retrieval_queries: tuple[str, ...],
     video_frames_per_second: float,
     video_max_pixels: int,
 ) -> list[_Message]:
@@ -355,7 +369,7 @@ def _messages(
             "type": "text",
             "text": (
                 "<recall_context>\n"
-                f"{_recall_context(request, memories, evidence)}\n"
+                f"{_recall_context(request, memories, evidence, attempted_retrieval_queries)}\n"
                 "</recall_context>"
             ),
         }
@@ -411,17 +425,20 @@ def _recall_context(
     request: RecallRequest,
     memories: tuple[MemoryRecord, ...],
     evidence: tuple[ResolvedEvidence, ...],
+    attempted_retrieval_queries: tuple[str, ...],
 ) -> str:
     return json.dumps(
         {
             "question": request.query.text,
             "query_media_object_ids": request.query.media_object_ids,
+            "attempted_retrieval_queries": attempted_retrieval_queries,
             "candidate_memories": [
                 {
                     "memory_id": memory.memory_id,
                     "summary": memory.summary,
                     "verification_status": memory.verification_status.value,
                     "occurred_at": memory.occurred_at.isoformat(),
+                    "ended_at": memory.ended_at.isoformat(),
                     "evidence_ids": memory.evidence_ids,
                 }
                 for memory in memories
@@ -451,6 +468,7 @@ def _generated_answer(content: str) -> GeneratedAnswer:
             answer=output.answer,
             confidence=output.confidence,
             retrieval_queries=output.retrieval_queries,
+            temporal_order=output.temporal_order,
         )
     except ValidationError as error:
         raise ModelOutputError("Omni answer model returned invalid structured output") from error

@@ -70,6 +70,7 @@ class FirstMemoryAnswerer:
         evidence: tuple[ResolvedEvidence, ...],
         *,
         query_media: tuple[ResolvedQueryMedia, ...],
+        attempted_retrieval_queries: tuple[str, ...] = (),
     ) -> GeneratedAnswer:
         return GeneratedAnswer(answer=memories[0].summary, confidence=0.9)
 
@@ -272,7 +273,7 @@ async def test_postgres_vertical_path_is_idempotent_and_evidence_first(
         TenantId("tenant_roundtrip"),
         ObservationId(first.observation_id),
     )
-    evidence_id = await _first_evidence_id(database_url, "tenant_roundtrip")
+    evidence_id = first.evidence_ids[0]
     memory = await kernel.remember(
         _remember_request(tenant_id="tenant_roundtrip", evidence_id=evidence_id)
     )
@@ -287,6 +288,7 @@ async def test_postgres_vertical_path_is_idempotent_and_evidence_first(
     assert first.status is ObservationStatus.ACCEPTED
     assert retry.status is ObservationStatus.DUPLICATE
     assert first.processing_job_id == retry.processing_job_id
+    assert retry.evidence_ids == first.evidence_ids
     assert job.state is JobState.PENDING
     assert job.observation_id == first.observation_id
     assert stored_batch.observation.observation_id == first.observation_id
@@ -626,21 +628,6 @@ async def test_observation_job_state_is_atomic_and_retryable(
     assert succeeded.memory_ids == ()
     assert duplicate.acquired is False
     assert duplicate.job.state is JobState.SUCCEEDED
-
-
-async def _first_evidence_id(database_url: str, tenant_id: str) -> str:
-    connection = await AsyncConnection.connect(database_url)
-    async with connection:
-        row = await (
-            await connection.execute(
-                """
-                SELECT evidence_id FROM evidence_spans
-                WHERE tenant_id = %s ORDER BY evidence_id LIMIT 1
-                """,
-                (tenant_id,),
-            )
-        ).fetchone()
-    return cast(tuple[str], row)[0]
 
 
 async def _processing_job_count(database_url: str, tenant_id: str) -> int:

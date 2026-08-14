@@ -287,6 +287,7 @@ async def _ingest_segment(
 ) -> None:
     async with semaphore:
         source_key = f"subject:{subject}:video:{video_id}:start:{segment.start_seconds:g}"
+        evidence_ids: tuple[str, ...] = ()
         if segment.media_objects:
             receipt = await memory.observe(
                 ObserveRequest(
@@ -306,6 +307,7 @@ async def _ingest_segment(
                     idempotency_key=f"{SUPERMEMORY_VQA_ADAPTER_VERSION}:{source_key}:media",
                 )
             )
+            evidence_ids = receipt.evidence_ids
             await wait_for_observation_job(
                 memory,
                 tenant_id,
@@ -321,6 +323,7 @@ async def _ingest_segment(
                     memory_type=MemoryType.EPISODIC,
                     occurred_at=occurred_at,
                     ended_at=ended_at,
+                    evidence_ids=evidence_ids,
                     idempotency_key=(f"{SUPERMEMORY_VQA_ADAPTER_VERSION}:{source_key}:transcript"),
                 )
             )

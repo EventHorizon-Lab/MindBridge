@@ -194,7 +194,7 @@ async def search_memories_by_hierarchy(
     *,
     limit: int,
 ) -> tuple[MemoryRecord, ...]:
-    """Expand semantic Memory hits through bounded Summary descendants."""
+    """Expand semantic Memory hits through directed and bounded Summary relations."""
     if not ranked_memory_ids:
         return ()
     if limit <= 0:
@@ -481,7 +481,7 @@ WITH RECURSIVE ranked_roots AS (
     SELECT memory_id, rank
     FROM unnest(%(memory_ids)s::text[]) WITH ORDINALITY AS hit(memory_id, rank)
 ),
-hierarchy AS (
+descendants AS (
     SELECT memory_id, rank AS root_rank, 0 AS depth, ARRAY[memory_id] AS path
     FROM ranked_roots
     UNION ALL
@@ -489,7 +489,7 @@ hierarchy AS (
            parent.root_rank,
            parent.depth + 1,
            parent.path || relation.target_id
-    FROM hierarchy AS parent
+    FROM descendants AS parent
     JOIN relations AS relation
       ON relation.tenant_id = %(tenant_id)s
      AND relation.source_type = 'memory_record'
@@ -498,6 +498,44 @@ hierarchy AS (
      AND relation.target_type = 'memory_record'
     WHERE parent.depth < 16
       AND NOT relation.target_id = ANY(parent.path)
+),
+parents AS (
+    SELECT relation.source_id AS memory_id,
+           root.memory_id AS root_id,
+           root.rank AS root_rank,
+           1 AS depth
+    FROM ranked_roots AS root
+    JOIN relations AS relation
+      ON relation.tenant_id = %(tenant_id)s
+     AND relation.source_type = 'memory_record'
+     AND relation.relation_type = 'contains'
+     AND relation.target_type = 'memory_record'
+     AND relation.target_id = root.memory_id
+),
+siblings AS (
+    SELECT sibling.target_id AS memory_id,
+           parent.root_rank,
+           2 AS depth
+    FROM parents AS parent
+    CROSS JOIN LATERAL (
+        SELECT relation.target_id
+        FROM relations AS relation
+        WHERE relation.tenant_id = %(tenant_id)s
+          AND relation.source_type = 'memory_record'
+          AND relation.source_id = parent.memory_id
+          AND relation.relation_type = 'contains'
+          AND relation.target_type = 'memory_record'
+          AND relation.target_id <> parent.root_id
+        ORDER BY relation.target_id
+        LIMIT %(limit)s
+    ) AS sibling
+),
+hierarchy AS (
+    SELECT memory_id, root_rank, depth FROM descendants
+    UNION ALL
+    SELECT memory_id, root_rank, depth FROM parents
+    UNION ALL
+    SELECT memory_id, root_rank, depth FROM siblings
 ),
 ranked_memories AS (
     SELECT memory_id, min(root_rank) AS root_rank, min(depth) AS depth
@@ -508,7 +546,7 @@ ranked_memories AS (
 JOIN ranked_memories AS dense ON dense.memory_id = memory.memory_id
 WHERE memory.tenant_id = %(tenant_id)s
 {_STRUCTURED_RECALL_FILTER_SQL}
-ORDER BY dense.root_rank, dense.depth, memory.strength DESC,
+ORDER BY dense.depth, dense.root_rank, memory.strength DESC,
          memory.occurred_at DESC, memory.memory_id
 LIMIT %(limit)s
 """

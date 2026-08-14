@@ -150,6 +150,7 @@ class MemoryKernel:
         return ObservationReceipt(
             observation_id=result.observation.observation_id,
             processing_job_id=result.processing_job_id,
+            evidence_ids=tuple(span.evidence_id for span in batch.evidence_spans),
             idempotency_key=idempotency_key,
             status=(ObservationStatus.ACCEPTED if result.created else ObservationStatus.DUPLICATE),
             trace_id=current_trace_id(),

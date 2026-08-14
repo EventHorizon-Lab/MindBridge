@@ -62,6 +62,7 @@ class FirstMemoryAnswerer:
         evidence: tuple[ResolvedEvidence, ...],
         *,
         query_media: tuple[ResolvedQueryMedia, ...],
+        attempted_retrieval_queries: tuple[str, ...] = (),
     ) -> GeneratedAnswer:
         return (
             GeneratedAnswer(answer=memories[0].summary, confidence=0.9)

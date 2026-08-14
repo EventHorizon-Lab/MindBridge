@@ -173,6 +173,7 @@ class ObservationReceipt(ContractModel):
 
     observation_id: Identifier
     processing_job_id: Identifier
+    evidence_ids: tuple[Identifier, ...] = ()
     idempotency_key: Identifier
     status: ObservationStatus
     trace_id: Identifier

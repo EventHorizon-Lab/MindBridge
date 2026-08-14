@@ -1016,6 +1016,16 @@
       "additionalProperties": false,
       "description": "Retry-safe acknowledgement for an observation.",
       "properties": {
+        "evidence_ids": {
+          "default": [],
+          "items": {
+            "maxLength": 255,
+            "minLength": 1,
+            "type": "string"
+          },
+          "title": "Evidence Ids",
+          "type": "array"
+        },
         "idempotency_key": {
           "maxLength": 255,
           "minLength": 1,

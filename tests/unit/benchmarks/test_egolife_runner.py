@@ -1,5 +1,6 @@
 """Production-contract checks for the causal EgoLifeQA runner."""
 
+import asyncio
 from datetime import datetime, timezone
 from typing import cast
 
@@ -44,6 +45,7 @@ class RecordingMemoryApi:
         return ObservationReceipt(
             observation_id=f"observation_{request.sequence}",
             processing_job_id=f"job_{request.sequence}",
+            evidence_ids=(f"evidence_{request.sequence}",),
             idempotency_key=request.idempotency_key or "generated",
             status=ObservationStatus.ACCEPTED,
             trace_id="trace_observe",
@@ -140,6 +142,75 @@ async def test_egolife_ingests_official_caption_without_reprocessing_video() -> 
     ]
     assert api.remember_requests[0].occurred_at == ORIGIN.replace(hour=10)
     assert api.remember_requests[0].ended_at == ORIGIN.replace(hour=10, second=30)
+
+
+async def test_egolife_binds_released_caption_to_source_video() -> None:
+    api = RecordingMemoryApi()
+    prepared = EgoLifePreparedStream(
+        subject_id="A1_JAKE",
+        timeline_origin=ORIGIN,
+        clips=(
+            EgoLifePreparedClip(
+                day=1,
+                start_timecode="10000000",
+                media_object=_clip("10000000", "media_0", duration_ms=30_000).media_object,
+                caption="Jake passes the phone to Alice.",
+                duration_ms=30_000,
+            ),
+        ),
+    )
+
+    await run_egolife_qa(
+        cast(AsyncMindBridge, api),
+        (_question("q_1", "10004500"),),
+        prepared,
+        run_id="run_01",
+        poll_interval_seconds=0.001,
+    )
+
+    assert api.remember_requests[0].evidence_ids == ("evidence_0",)
+
+
+async def test_egolife_keeps_released_visual_and_audio_memories_separate() -> None:
+    class SerialMemoryApi(RecordingMemoryApi):
+        remembering = False
+
+        async def remember(self, request: RememberRequest) -> object:
+            assert not self.remembering
+            self.remembering = True
+            await asyncio.sleep(0)
+            result = await super().remember(request)
+            self.remembering = False
+            return result
+
+    api = SerialMemoryApi()
+    prepared = EgoLifePreparedStream(
+        subject_id="A1_JAKE",
+        timeline_origin=ORIGIN,
+        clips=(
+            EgoLifePreparedClip(
+                day=1,
+                start_timecode="10000000",
+                caption=(
+                    "Visual 10000100-10000200: Jake picks up the phone.\n"
+                    "Audio 10000200-10000300: Jake: I found it."
+                ),
+                duration_ms=30_000,
+            ),
+        ),
+    )
+
+    await run_egolife_qa(
+        cast(AsyncMindBridge, api),
+        (_question("q_1", "10004500"),),
+        prepared,
+        run_id="run_01",
+    )
+
+    assert [request.summary for request in api.remember_requests] == [
+        "Visual 10000100-10000200: Jake picks up the phone.",
+        "Audio 10000200-10000300: Jake: I found it.",
+    ]
 
 
 def test_prepared_egolife_rejects_overlapping_clips() -> None:

@@ -57,7 +57,7 @@ def test_locomo_artifacts_pin_source_system_code_and_output(tmp_path: Path) -> N
     assert manifest.source_revision == "official-revision"
     assert manifest.code_revision == "mindbridge-commit"
     assert manifest.answer_model_revision == "serving-fingerprint"
-    assert manifest.runner_version == LOCOMO_RUNNER_VERSION == "locomo_production_api_v7"
+    assert manifest.runner_version == LOCOMO_RUNNER_VERSION == "locomo_production_api_v8"
     assert manifest.reasoning_effort == "low"
     assert manifest.run_id == "run_01"
     assert manifest.request_timeout_seconds == 1_800.0

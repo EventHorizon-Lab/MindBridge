@@ -5,6 +5,24 @@ from dataclasses import replace
 from mindbridge.core import DomainInvariantError, MemoryIntegrityError, MemoryRecord
 
 
+def order_memory_candidates(
+    memories: tuple[MemoryRecord, ...],
+    temporal_order: str,
+) -> tuple[MemoryRecord, ...]:
+    """Apply an explicit temporal request after relevance has bounded the candidates."""
+    if temporal_order == "relevance":
+        return memories
+    if temporal_order not in {"newest", "oldest"}:
+        raise DomainInvariantError("unknown temporal candidate order")
+    return tuple(
+        sorted(
+            memories,
+            key=lambda memory: (memory.occurred_at, memory.ended_at),
+            reverse=temporal_order == "newest",
+        )
+    )
+
+
 def fuse_memory_rankings(
     rankings: tuple[tuple[MemoryRecord, ...], ...],
     *,

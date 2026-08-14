@@ -155,14 +155,17 @@ uv run python -m mindbridge.benchmarks.locomo_cli \
   --source-revision 3eb6f2c585f5e1699204e3c3bdf7adc5c28cb376 \
   --run-id locomo-001 \
   --code-revision "$(git rev-parse HEAD)" \
+  --recall-limit 50 \
   --answer-reasoning-effort low \
   --request-timeout-seconds 1800 \
   --answer-model-revision serving-fingerprint
 ```
 
-Use `--sample-id` for a smoke subset. Existing results are preserved unless `--overwrite` is
-explicitly supplied. The prediction field is `mindbridge_prediction`, ready for the official
-LoCoMo evaluation functions; retrieved dialogue IDs use its matching
+Use `--sample-id` for a smoke subset. The example explicitly selects the experimental Top-50 quality
+profile; the benchmark default remains the product-wide Top-20 budget until held-out or full-split
+evidence justifies changing it. Existing results are preserved unless `--overwrite` is supplied. The
+prediction field is `mindbridge_prediction`, ready for the official LoCoMo evaluation functions;
+retrieved dialogue IDs use its matching
 `mindbridge_prediction_context` field.
 
 Run M3-Bench through the same deployed API after the official videos have been split into
@@ -186,7 +189,8 @@ the already-addressable objects:
           "size_bytes": 12345678,
           "created_at": "2026-08-11T00:00:00Z",
           "duration_ms": 30000
-        }
+        },
+        "caption": "[Event] The person places the red cup on the left shelf."
       }
     ]
   }
@@ -194,9 +198,12 @@ the already-addressable objects:
 ```
 
 Clip indices must be contiguous and zero-based. Every clip before the final clip must be exactly 30
-seconds, and the final clip must not exceed 30 seconds. The runner ingests and waits for each durable
-job before answering questions whose official `before_clip` equals that index, so a question cannot
-see future video. Questions without `before_clip` run after the complete video.
+seconds, and the final clip must not exceed 30 seconds. A clip may carry both raw media and the
+released memory-graph caption: the observation receipt's source `evidence_ids` are attached to its
+released `[Event]` episodic view and `[Inference]` semantic view, so recall can find the text and then
+reinspect the same video. The runner ingests and waits for each durable job before answering
+questions whose official `before_clip` equals that index, so a question cannot see future video.
+Questions without `before_clip` run after the complete video.
 
 ```bash
 uv run python -m mindbridge.benchmarks.m3_cli \
@@ -244,7 +251,8 @@ memory:
         "size_bytes": 14379440,
         "created_at": "2026-08-12T00:00:00Z",
         "duration_ms": 30000
-      }
+      },
+      "caption": "Visual Jake passes the phone to Alice.\nAudio Jake asks everyone to mark it."
     }
   ]
 }
@@ -262,9 +270,10 @@ For the official memory-layer protocol, a clip may instead carry the released mu
 }
 ```
 
-The run manifest reports raw-media and caption clip counts separately. Use raw media for the
-end-to-end perception gate; use the pinned official captions for a reproducible comparison with
-EgoRAG-style memory results.
+When both forms are present, the released visual and audio lines remain separately retrievable but
+share the raw observation's `evidence_ids`; answering reopens that video. The run manifest reports
+raw-media and caption clip counts separately. Use raw media for the end-to-end perception gate; use
+the pinned official captions for a reproducible comparison with EgoRAG-style memory results.
 
 ```bash
 uv run python -m mindbridge.benchmarks.egolife_cli \
@@ -285,10 +294,12 @@ uv run python -m mindbridge.benchmarks.egolife_cli \
 SuperMemory-VQA runs one participant per invocation. Each prepared video records its official Unix
 start and chronological segments. `media_objects` are sent to `observe`; an optional aligned
 `transcript` is sent to `remember` because the public release intentionally withholds raw audio.
-Either field may be omitted, but every segment must contain at least one. Following the official
-protocol, prepared media must split at every selected question span's end; the runner rejects a
-missing boundary before ingestion. It then includes that completed segment and no later media. The
-output reports Ans-F1, QA-Acc, and QA-MRR and contains no ground-truth fields:
+Either field may be omitted, but every segment must contain at least one. If both are present, the
+transcript receives the observation's `evidence_ids`, binding searchable speech to the same raw
+video/audio rather than creating an evidence-free parallel memory. Following the official protocol,
+prepared media must split at every selected question span's end; the runner rejects a missing
+boundary before ingestion. It then includes that completed segment and no later media. The output
+reports Ans-F1, QA-Acc, and QA-MRR and contains no ground-truth fields:
 
 ```json
 {

@@ -224,10 +224,12 @@ async def _ingest_clip(
     semaphore: asyncio.Semaphore,
 ) -> None:
     async with semaphore:
+        evidence_ids: tuple[str, ...] = ()
         if clip.media_object is not None:
             receipt = await memory.observe(
                 _observe_request(tenant_id, device_id, video_id, prepared, clip)
             )
+            evidence_ids = receipt.evidence_ids
             await wait_for_observation_job(
                 memory,
                 tenant_id,
@@ -239,18 +241,20 @@ async def _ingest_clip(
             occurred_at = prepared.timeline_origin + timedelta(
                 seconds=M3_CLIP_DURATION_SECONDS * clip.clip_index
             )
-            await memory.remember(
-                RememberRequest(
-                    tenant_id=tenant_id,
-                    summary=clip.caption,
-                    memory_type=MemoryType.EPISODIC,
-                    occurred_at=occurred_at,
-                    ended_at=occurred_at + timedelta(milliseconds=_clip_duration_ms(clip)),
-                    idempotency_key=(
-                        f"{M3_BENCH_ADAPTER_VERSION}:{video_id}:clip:{clip.clip_index}:caption"
-                    ),
+            for suffix, memory_type, summary in _caption_memories(clip.caption):
+                await memory.remember(
+                    RememberRequest(
+                        tenant_id=tenant_id,
+                        summary=summary,
+                        memory_type=memory_type,
+                        occurred_at=occurred_at,
+                        ended_at=occurred_at + timedelta(milliseconds=_clip_duration_ms(clip)),
+                        evidence_ids=evidence_ids,
+                        idempotency_key=(
+                            f"{M3_BENCH_ADAPTER_VERSION}:{video_id}:clip:{clip.clip_index}:{suffix}"
+                        ),
+                    )
                 )
-            )
 
 
 def _observe_request(
@@ -287,6 +291,21 @@ def _clip_duration_ms(clip: M3PreparedClip) -> int:
     )
     assert duration_ms is not None
     return duration_ms
+
+
+def _caption_memories(caption: str) -> tuple[tuple[str, MemoryType, str], ...]:
+    """Keep released observations and inferences in their native memory channels."""
+    lines = tuple(line.strip() for line in caption.splitlines() if line.strip())
+    inferences = tuple(line for line in lines if line.startswith("[Inference]"))
+    events = tuple(line for line in lines if not line.startswith("[Inference]"))
+    if not inferences:
+        return (("caption", MemoryType.EPISODIC, caption),)
+    if not events:
+        return (("inferences", MemoryType.SEMANTIC, "\n".join(inferences)),)
+    return (
+        ("events", MemoryType.EPISODIC, "\n".join(events)),
+        ("inferences", MemoryType.SEMANTIC, "\n".join(inferences)),
+    )
 
 
 def _clip_end(prepared: M3PreparedVideo, clip: M3PreparedClip) -> AwareDatetime:

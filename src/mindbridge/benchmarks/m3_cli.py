@@ -43,7 +43,7 @@ from mindbridge.models.openai_perception import (
 )
 from mindbridge.sdk import AsyncMindBridge
 
-M3_RUNNER_VERSION = "m3_production_api_v7"
+M3_RUNNER_VERSION = "m3_production_api_v8"
 
 
 class M3RunManifest(ContractModel):

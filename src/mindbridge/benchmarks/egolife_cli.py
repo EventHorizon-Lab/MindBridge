@@ -49,7 +49,7 @@ from mindbridge.models.openai_perception import (
 )
 from mindbridge.sdk import AsyncMindBridge
 
-EGOLIFE_RUNNER_VERSION = "egolife_production_api_v4"
+EGOLIFE_RUNNER_VERSION = "egolife_production_api_v5"
 
 
 class EgoLifeRunManifest(ContractModel):

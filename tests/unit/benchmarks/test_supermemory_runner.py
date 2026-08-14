@@ -37,12 +37,14 @@ class RecordingMemoryApi:
         self.answer = answer
         self.calls: list[str] = []
         self.recall_requests: list[RecallRequest] = []
+        self.remember_requests: list[RememberRequest] = []
 
     async def observe(self, request: ObserveRequest) -> ObservationReceipt:
         self.calls.append(f"observe:{request.sequence}")
         return ObservationReceipt(
             observation_id=f"observation_{request.sequence}",
             processing_job_id=f"job_{request.sequence}",
+            evidence_ids=(f"evidence_{request.sequence}",),
             idempotency_key=request.idempotency_key or "generated",
             status=ObservationStatus.ACCEPTED,
             trace_id="trace_observe",
@@ -65,6 +67,7 @@ class RecordingMemoryApi:
 
     async def remember(self, request: RememberRequest) -> MemoryView:
         self.calls.append(f"remember:{request.summary.splitlines()[0]}")
+        self.remember_requests.append(request)
         return MemoryView(
             memory_id="memory_transcript",
             memory_type=MemoryType.EPISODIC,
@@ -113,6 +116,7 @@ async def test_supermemory_ingests_through_question_boundary_without_future_segm
         "remember:B said the mug was in the sink."
     )
     assert api.calls.index("observe:1") < api.calls.index("job:job_1")
+    assert api.remember_requests[0].evidence_ids == ("evidence_0",)
     assert result[0].ranked_option_indices == (2, 0, 3, 1)
     assert api.recall_requests[0].filters.occurred_before == ORIGIN + timedelta(seconds=45)
     request_json = api.recall_requests[0].model_dump_json()

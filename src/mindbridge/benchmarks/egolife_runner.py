@@ -212,6 +212,7 @@ async def _ingest_clip(
         occurred_at = prepared.timeline_origin + timedelta(milliseconds=_clip_start_ms(clip))
         ended_at = occurred_at + timedelta(milliseconds=_clip_duration_ms(clip))
         source_key = f"day:{clip.day}:clip:{clip.start_timecode}"
+        evidence_ids: tuple[str, ...] = ()
         if clip.media_object is not None:
             receipt = await memory.observe(
                 ObserveRequest(
@@ -229,6 +230,7 @@ async def _ingest_clip(
                     ),
                 )
             )
+            evidence_ids = receipt.evidence_ids
             await wait_for_observation_job(
                 memory,
                 tenant_id,
@@ -237,18 +239,21 @@ async def _ingest_clip(
                 timeout_seconds=processing_timeout_seconds,
             )
         if clip.caption is not None:
-            await memory.remember(
-                RememberRequest(
-                    tenant_id=tenant_id,
-                    summary=clip.caption,
-                    memory_type=MemoryType.EPISODIC,
-                    occurred_at=occurred_at,
-                    ended_at=ended_at,
-                    idempotency_key=(
-                        f"{EGOLIFE_QA_ADAPTER_VERSION}:{prepared.subject_id}:{source_key}:caption"
-                    ),
+            for suffix, summary in _caption_memories(clip.caption):
+                await memory.remember(
+                    RememberRequest(
+                        tenant_id=tenant_id,
+                        summary=summary,
+                        memory_type=MemoryType.EPISODIC,
+                        occurred_at=occurred_at,
+                        ended_at=ended_at,
+                        evidence_ids=evidence_ids,
+                        idempotency_key=(
+                            f"{EGOLIFE_QA_ADAPTER_VERSION}:{prepared.subject_id}:"
+                            f"{source_key}:{suffix}"
+                        ),
+                    )
                 )
-            )
 
 
 async def _answer_question(
@@ -302,3 +307,20 @@ def _clip_duration_ms(clip: EgoLifePreparedClip) -> int:
     )
     assert duration_ms is not None
     return duration_ms
+
+
+def _caption_memories(caption: str) -> tuple[tuple[str, str], ...]:
+    """Keep released visual and audio observations independently retrievable."""
+    lines = tuple(line.strip() for line in caption.splitlines() if line.strip())
+    visual = tuple(line for line in lines if line.startswith("Visual "))
+    audio = tuple(line for line in lines if line.startswith("Audio "))
+    other = tuple(line for line in lines if not line.startswith(("Visual ", "Audio ")))
+    if not visual or not audio:
+        return (("caption", caption),)
+    memories = [
+        ("visual", "\n".join(visual)),
+        ("audio", "\n".join(audio)),
+    ]
+    if other:
+        memories.append(("caption", "\n".join(other)))
+    return tuple(memories)

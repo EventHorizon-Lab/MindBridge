@@ -1105,6 +1105,22 @@ async def test_summary_consolidation_is_atomic_recallable_and_retry_safe(
 
     first_summary_id = strict_memories[0].memory_id
     source_memory_ids = tuple(memory.memory_id for memory in expanded_memories[1:])
+    bounded_roots = await store.search_memories_by_hierarchy(
+        RecallRequest(tenant_id=tenant_id, query=RecallQuery(text="red tool")),
+        (source_memory_ids[0], source_memory_ids[-1]),
+        limit=2,
+    )
+    assert [memory.memory_id for memory in bounded_roots] == [
+        source_memory_ids[0],
+        source_memory_ids[-1],
+    ]
+    expanded_from_source = await store.search_memories_by_hierarchy(
+        RecallRequest(tenant_id=tenant_id, query=RecallQuery(text="red tool")),
+        (source_memory_ids[0],),
+        limit=20,
+    )
+    assert first_summary_id in {memory.memory_id for memory in expanded_from_source}
+    assert set(source_memory_ids) <= {memory.memory_id for memory in expanded_from_source}
     await _forget_memory(
         store,
         tenant_id,

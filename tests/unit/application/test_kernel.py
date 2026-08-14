@@ -259,18 +259,33 @@ class InMemoryStore:
         *,
         limit: int,
     ) -> tuple[MemoryRecord, ...]:
-        expanded_ids: list[MemoryId] = []
-
-        def append_descendants(memory_id: MemoryId, depth: int) -> None:
-            if depth > 16 or memory_id in expanded_ids:
-                return
-            expanded_ids.append(memory_id)
+        roots = tuple(dict.fromkeys(ranked_memory_ids))
+        ranks = {memory_id: (0, root_rank) for root_rank, memory_id in enumerate(roots)}
+        pending = [
+            (memory_id, 0, root_rank, frozenset({memory_id}))
+            for root_rank, memory_id in enumerate(roots)
+        ]
+        while pending:
+            memory_id, depth, root_rank, path = pending.pop()
+            if depth >= 16:
+                continue
             for child_id in self.summary_children.get(memory_id, ()):
-                append_descendants(child_id, depth + 1)
-
-        for memory_id in dict.fromkeys(ranked_memory_ids):
-            append_descendants(memory_id, 0)
-        return await self.search_memories_by_ids(request, tuple(expanded_ids), limit=limit)
+                if child_id in path:
+                    continue
+                ranks[child_id] = min(ranks.get(child_id, (17, len(roots))), (depth + 1, root_rank))
+                pending.append((child_id, depth + 1, root_rank, path | {child_id}))
+        for root_rank, memory_id in enumerate(roots):
+            for parent_id, child_ids in self.summary_children.items():
+                if memory_id not in child_ids:
+                    continue
+                ranks[parent_id] = min(ranks.get(parent_id, (17, len(roots))), (1, root_rank))
+                for sibling_id in child_ids[:limit]:
+                    if sibling_id != memory_id:
+                        ranks[sibling_id] = min(
+                            ranks.get(sibling_id, (17, len(roots))), (2, root_rank)
+                        )
+        expanded_ids = tuple(sorted(ranks, key=lambda memory_id: (*ranks[memory_id], memory_id)))
+        return await self.search_memories_by_ids(request, expanded_ids, limit=limit)
 
     async def search_memories_by_graph_objects(
         self,
@@ -500,11 +515,13 @@ class RecordingAnswerer:
         evidence: tuple[ResolvedEvidence, ...],
         *,
         query_media: tuple[ResolvedQueryMedia, ...],
+        attempted_retrieval_queries: tuple[str, ...] = (),
     ) -> GeneratedAnswer:
         self.calls += 1
         self.last_evidence = evidence
         self.last_memories = memories
         self.last_query_media = query_media
+        self.attempted_retrieval_queries = attempted_retrieval_queries
         if self.answers:
             return self.answers.pop(0)
         if not memories:
@@ -741,8 +758,9 @@ async def test_observe_remember_recall_returns_openable_evidence() -> None:
     store = InMemoryStore()
     answerer = RecordingAnswerer()
     kernel = _kernel(store, answerer)
-    await kernel.observe(_observe_request())
-    evidence_id = next(iter(store.evidence))
+    receipt = await kernel.observe(_observe_request())
+    assert receipt.evidence_ids == tuple(store.evidence)
+    evidence_id = receipt.evidence_ids[0]
     memory = await kernel.remember(_remember_request(evidence_ids=(evidence_id,)))
     fetched = await kernel.get_memory("tenant_01", memory.memory_id)
 
@@ -842,7 +860,7 @@ async def test_hidden_evidence_is_still_used_for_answering() -> None:
     assert answerer.last_evidence[0].evidence_span.evidence_id == evidence_id
 
 
-async def test_recall_without_candidates_uses_one_reflection_and_abstains() -> None:
+async def test_recall_without_candidates_uses_bounded_reflection_and_abstains() -> None:
     """No evidence permits one bounded query reflection but never a guessed answer."""
     answerer = RecordingAnswerer(
         answers=(
@@ -861,7 +879,7 @@ async def test_recall_without_candidates_uses_one_reflection_and_abstains() -> N
 
     assert result.answer is None
     assert result.confidence == 0.0
-    assert answerer.calls == 1
+    assert answerer.calls == 2
 
 
 async def test_recall_uses_bounded_model_queries_to_reach_missing_evidence() -> None:
@@ -938,7 +956,7 @@ async def test_recall_stops_after_two_product_wide_refinement_waves() -> None:
     ]
 
 
-async def test_recall_keeps_provisional_answer_when_reflection_finds_no_new_candidate() -> None:
+async def test_recall_switches_query_direction_when_reflection_finds_no_new_candidate() -> None:
     store = InMemoryStore()
     recall_embedder = RecordingRecallEmbedder()
     answerer = RecordingAnswerer(
@@ -948,6 +966,12 @@ async def test_recall_keeps_provisional_answer_when_reflection_finds_no_new_cand
                 confidence=0.7,
                 retrieval_queries=("red screwdriver exact location",),
             ),
+            GeneratedAnswer(
+                answer="Beside the toolbox.",
+                confidence=0.7,
+                retrieval_queries=("person_device_01 last placement",),
+            ),
+            GeneratedAnswer(answer="Beside the toolbox.", confidence=0.7),
         )
     )
     kernel = _kernel(store, answerer, recall_embedder=recall_embedder)
@@ -958,11 +982,74 @@ async def test_recall_keeps_provisional_answer_when_reflection_finds_no_new_cand
     )
 
     assert result.answer == "Beside the toolbox."
-    assert answerer.calls == 1
+    assert answerer.calls == 3
+    assert answerer.attempted_retrieval_queries == (
+        "red screwdriver exact location",
+        "person_device_01 last placement",
+    )
     assert [query.text for query in recall_embedder.queries] == [
         "red screwdriver",
         "red screwdriver exact location",
+        "person_device_01 last placement",
     ]
+
+
+async def test_recall_reorders_only_visible_candidates_for_an_explicit_latest_question() -> None:
+    store = InMemoryStore()
+    answerer = RecordingAnswerer(
+        answers=(
+            GeneratedAnswer(
+                answer="old event",
+                confidence=0.5,
+                temporal_order="newest",
+            ),
+            GeneratedAnswer(
+                answer="new event",
+                confidence=0.9,
+                temporal_order="newest",
+            ),
+        )
+    )
+    kernel = _kernel(store, answerer)
+    old = await kernel.remember(
+        _remember_request(idempotency_key="old").model_copy(update={"summary": "old event"})
+    )
+    new = await kernel.remember(
+        _remember_request(idempotency_key="new", occurred_at=NOW + timedelta(days=1)).model_copy(
+            update={"summary": "new event"}
+        )
+    )
+    unrelated = await kernel.remember(
+        _remember_request(
+            idempotency_key="unrelated",
+            occurred_at=NOW + timedelta(days=2),
+        ).model_copy(update={"summary": "unrelated event"})
+    )
+    store.embedding_matches = tuple(
+        EmbeddingMatch(
+            embedding_id=f"embedding_{memory_id}",
+            object_type=EmbeddedObjectType.MEMORY_RECORD,
+            object_id=memory_id,
+            similarity=similarity,
+        )
+        for memory_id, similarity in (
+            (old.memory_id, 0.9),
+            (new.memory_id, 0.8),
+            (unrelated.memory_id, 0.7),
+        )
+    )
+
+    result = await kernel.recall(
+        RecallRequest(
+            tenant_id="tenant_01",
+            query=RecallQuery(text="What happened most recently?"),
+            limit=2,
+        )
+    )
+
+    assert result.answer == "new event"
+    assert [memory.memory_id for memory in result.memories] == [new.memory_id, old.memory_id]
+    assert answerer.calls == 2
 
 
 async def test_recall_discards_an_answer_when_the_final_visibility_barrier_removes_it() -> None:
@@ -994,7 +1081,7 @@ async def test_recall_discards_an_answer_when_the_final_visibility_barrier_remov
     assert result.evidence == ()
 
 
-async def test_recall_does_not_reanswer_when_reflection_only_adds_hidden_candidates() -> None:
+async def test_recall_reassesses_when_reflection_only_adds_hidden_candidates() -> None:
     store = InMemoryStore()
     recall_embedder = RecordingRecallEmbedder()
     answerer = RecordingAnswerer(
@@ -1004,6 +1091,7 @@ async def test_recall_does_not_reanswer_when_reflection_only_adds_hidden_candida
                 confidence=0.7,
                 retrieval_queries=("exact location",),
             ),
+            GeneratedAnswer(answer="Beside the toolbox.", confidence=0.7),
         )
     )
     kernel = _kernel(store, answerer, recall_embedder=recall_embedder)
@@ -1028,7 +1116,7 @@ async def test_recall_does_not_reanswer_when_reflection_only_adds_hidden_candida
     )
 
     assert [memory.memory_id for memory in result.memories] == [visible.memory_id]
-    assert answerer.calls == 1
+    assert answerer.calls == 2
 
 
 async def test_recall_answers_from_attested_source_memory() -> None:
@@ -1221,6 +1309,16 @@ async def test_semantic_summary_hit_descends_to_attested_source_for_answering() 
     ]
     assert [memory.memory_id for memory in answerer.last_memories] == [child.memory_id]
     assert result.answer == child.summary
+
+    expanded_from_child = await store.search_memories_by_hierarchy(
+        RecallRequest(tenant_id="tenant_01", query=RecallQuery(text="source detail")),
+        (MemoryId(child.memory_id),),
+        limit=3,
+    )
+    assert {memory.memory_id for memory in expanded_from_child} == {
+        child.memory_id,
+        middle.memory_id,
+    }
 
 
 async def test_semantic_summary_expansion_does_not_displace_direct_hits() -> None:
@@ -1540,6 +1638,8 @@ def test_generated_answer_rejects_confidence_without_answer() -> None:
     """Abstention cannot report misleading answer confidence."""
     with pytest.raises(DomainInvariantError, match="zero"):
         GeneratedAnswer(answer=None, confidence=0.9)
+    with pytest.raises(DomainInvariantError, match="temporal"):
+        GeneratedAnswer(answer="answer", confidence=0.9, temporal_order="sideways")  # type: ignore[arg-type]
 
 
 def _observe_request(

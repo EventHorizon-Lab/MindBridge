@@ -54,6 +54,8 @@ async def test_omni_streams_raw_av_and_validates_answer() -> None:
         assert "different named person does not support" in system_prompt
         assert "Missing evidence is not evidence of" in system_prompt
         assert "standalone search" in system_prompt
+        assert '"cannot be answered" choice is a task answerability option' in system_prompt
+        assert "compare candidate occurrence intervals" in system_prompt
         assert {item["type"] for item in user_content} >= {
             "image_url",
             "video_url",
@@ -67,6 +69,7 @@ async def test_omni_streams_raw_av_and_validates_answer() -> None:
             "format": "wav",
         }
         assert '"start_ms":1000' in cast(str, user_content[0]["text"])
+        assert '"ended_at":"2026-08-11T12:00:00+00:00"' in cast(str, user_content[0]["text"])
         assert "Where is the tool?" in cast(str, user_content[-1]["text"])
         return httpx.Response(
             200,
@@ -80,7 +83,7 @@ async def test_omni_streams_raw_av_and_validates_answer() -> None:
     answerer = _answerer(respond)
     assert answerer.model_reference.model_id == "qwen3.8-max"
     assert answerer.model_reference.revision == "deployment-revision"
-    assert answerer.prompt_version == "answer_from_evidence_v9"
+    assert answerer.prompt_version == "answer_from_evidence_v10"
     assert answerer.occurrence_prompt_version == "select_occurrences_v2"
     evidence = (
         _resolved_evidence(MediaKind.IMAGE, "image.jpg", "media_image", 0),
@@ -104,7 +107,11 @@ async def test_omni_streams_raw_av_and_validates_answer() -> None:
 
 
 async def test_omni_returns_bounded_retrieval_queries_when_evidence_is_missing() -> None:
-    async def respond(_request: httpx.Request) -> httpx.Response:
+    async def respond(request: httpx.Request) -> httpx.Response:
+        payload: dict[str, object] = json.loads(request.content)
+        messages = cast(list[dict[str, object]], payload["messages"])
+        content = cast(list[dict[str, object]], messages[1]["content"])
+        assert '"attempted_retrieval_queries":["tool location"]' in cast(str, content[0]["text"])
         return httpx.Response(
             200,
             headers={"content-type": "text/event-stream"},
@@ -124,6 +131,7 @@ async def test_omni_returns_bounded_retrieval_queries_when_evidence_is_missing()
             (),
             (),
             query_media=(),
+            attempted_retrieval_queries=("tool location",),
         )
     finally:
         await answerer.close()

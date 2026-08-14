@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Protocol, TypeAlias
+from typing import Literal, Protocol, TypeAlias
 
 from mindbridge.application.observation_processing import (
     ObservationBatch,
@@ -115,6 +115,7 @@ class GeneratedAnswer:
     answer: str | None
     confidence: float
     retrieval_queries: tuple[str, ...] = ()
+    temporal_order: Literal["relevance", "newest", "oldest"] = "relevance"
 
     def __post_init__(self) -> None:
         if self.answer is not None and not self.answer.strip():
@@ -132,6 +133,8 @@ class GeneratedAnswer:
             )
         if len(set(self.retrieval_queries)) != len(self.retrieval_queries):
             raise DomainInvariantError("retrieval queries must be unique")
+        if self.temporal_order not in {"relevance", "newest", "oldest"}:
+            raise DomainInvariantError("unknown temporal candidate order")
 
 
 @dataclass(frozen=True, slots=True)
@@ -326,6 +329,7 @@ class MemoryAnswerer(Protocol):
         evidence: tuple[ResolvedEvidence, ...],
         *,
         query_media: tuple[ResolvedQueryMedia, ...],
+        attempted_retrieval_queries: tuple[str, ...] = (),
     ) -> GeneratedAnswer: ...
 
     async def select_occurrences(

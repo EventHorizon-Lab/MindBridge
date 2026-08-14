@@ -305,6 +305,12 @@ M3-Agent 的 30 秒切片只保留为其 Benchmark 协议；TaskMem 的 10 秒�
 
 ASR、OCR 和 caption 是可检索视图，不是原始经历的替代品。遇到召回问题时，系统应回看媒体，而不是仅让文本 LLM 阅读 caption。
 
+`observe` 回执公开本次 Observation 的 source `evidence_ids`。同一时段的 OCR、物体/空间描述、
+端侧匿名身份、ASR 和数据集发布文本都复用这些 ID；VLM 派生的 Entity、Claim 与 Event 再收窄为
+Event 级子区间。这样文本命中只负责定位，回答阶段仍从 EvidenceSpan 解析并重新签名原始
+video/audio，而不是把 caption 当作最终证据。没有原始媒体的公开发布表示仍可作为 attested
+memory-layer 输入，但必须在评测报告中与原始视听复现分开。
+
 当前在线构建路径在一次冻结 Omni 调用中同时提取 Event、Entity 和 Claim；EntityMention 与
 Claim 必须引用 Event 内的 EvidenceSpan，Claim 的有效时间必须落在 Event 内。模型首先引用输入
 source span；应用层随后按 Event 与 source 的时间交集生成稳定、精确的 Event EvidenceSpan，并在
@@ -579,8 +585,9 @@ PostgreSQL FTS、结构化过滤、RRF 和原始视听证据重看。Event/Claim
 收到的链接不能因为模型推理耗时而已经过期。
 
 当前回答模型还可在证据不足或有实质歧义时返回最多两个独立 `retrieval_queries`。应用层每轮并发
-执行补充查询，与此前全部候选做 RRF；最多两轮 refinement（因此最多三次证据回答），只有返回给
-Agent 的 Top-K 确实改变时才携带新证据再回答，显式 `memory_ids`
+执行补充查询，与此前全部候选做 RRF；最多两轮 refinement。时间重排可能额外触发一次证据回答。
+当查询没有带来新的 Top-K 时，回答器会收到已尝试查询并切换实体、关系、时间、视觉或因果方向，而不是重复
+同一个无效查询。显式 `memory_ids`
 追问不越过调用方范围。补充查询不会写入事实、不会读取 Benchmark 标签，也不能用另一个人物或
 实体的相关证据修正问题前提；其数量进入 trace，最终答案仍必须由 MemoryRecord/EvidenceSpan
 支撑。结构化输出允许“临时答案 + 补充查询”，用于保留已有部分证据，但最终回答 Prompt 要求
@@ -589,8 +596,15 @@ step；Qwen Video Memory 常见路径是一次定位后再下钻 1--2 次。Mind
 不会照搬 M3 最后一轮“必须合理猜测”的 Benchmark 策略：耗尽预算仍无证据就拒答。该有限反思
 替代无限 Agent loop，保持调用成本和尾延迟有界。
 
-Memory 向量命中上层 Summary 时走独立的树形下钻查询：PostgreSQL 沿 MemoryRecord
-`contains` 边递归返回父节点和来源子节点，深度上限为 16，并对每个结果重新应用完整结构化过滤。
+对于 `latest/last/most recent` 与 `first/earliest`，回答器还返回结构化 `temporal_order`。应用层只在
+最终相关 Top-K 内按 `occurred_at/ended_at` 重排并重新回答；扩大后的候选池仍保持相关度排序，不能
+让较新的弱相关记录淘汰直接命中。`before/after` 保持相关度排序，避免把“最新”错误泛化成所有时间
+问题，也避免扫描整库来迎合题面。
+
+Memory 向量命中层级任一节点时走独立的树形展开查询：PostgreSQL 沿 MemoryRecord
+`contains` 边有向递归下钻来源子节点；向上只取单跳父节点，并对该父节点的 siblings 按请求预算
+限额。所有直接向量命中先于扩展节点排序，并对每个结果重新应用完整结构化过滤。这样既允许来源
+命中回到相邻上下文，也不会把一个大 Summary 的整个连通分量递归展开到候选集。
 这让无证据的 `unverified` 导航摘要不能直接支撑回答，而其下方原样保存的 `attested` 来源仍可被
 Omni 引用。该展开只用于全库语义检索；调用方显式传入的 `memory_ids` 始终保持严格范围，不隐式
 加入父子节点。直接 Memory 向量排名与层级展开排名作为两个独立信号进入同一个 RRF；不能让一个
@@ -1268,7 +1282,8 @@ LoCoMo runner 将原始对话逐 turn 通过 `remember` 写入，并且不向生
 污染 query embedding。所有题使用调用方显式给出的同一个 recall limit；生产代码不检查题目措辞、
 类别或答案形式来改变候选预算。参数进入 runner version/manifest；输出使用官方 evaluator 识别的
 `mindbridge_prediction` 与 `mindbridge_prediction_context`，因此答案 F1 和检索 recall 均走官方
-计算路径。
+计算路径。CLI 保持与产品一致的统一 Top-20 默认预算；Top-50 只能由调用方显式选择并记录，不能
+根据同一评测集切片静默改变默认值。
 
 固定 `conv-26` 的 199 题生产切片中，`qwen3.8-max`、Text Small F16 和官方 evaluator 下，
 `pre_reflection_v4` 到 `reflection_v8` 的组合改动使全题 F1 从 `0.6004` 变为 `0.6494`，
@@ -1277,12 +1292,12 @@ non-adversarial F1 从 `0.5426` 变为
 单变量消融或 SOTA 声明；数据、Evaluator、运行配置、输出 hash 和五类指标保存在
 [`locomo-conv-26-optimization.json`](../benchmarks/manifests/locomo-conv-26-optimization.json)。
 
-当前 `v9` 删除了旧 runner 对 `would/likely/might` 问题单独扩大候选数的题面特判，并将同一套
+当前 `v10` 删除了旧 runner 对 `would/likely/might` 问题单独扩大候选数的题面特判，并将同一套
 最多两轮 retrieval refinement 应用于所有产品查询。真实重跑表明，统一 Top-20 时全题 F1 为
 `0.6376`、non-adversarial F1 为 `0.5847`、Evidence recall 为 `0.7638`；统一 Top-50 时分别为
 `0.6532 / 0.6117 / 0.8551`。这说明较大的候选预算确实提高长程文本记忆覆盖，但也使该切片的
 结果文件从约 173 KB 增至 288 KB，并增加模型上下文和运行时间。因而 Top-50 只作为云端长程
-文本的 quality 配置证据，调用方仍须显式选择；原生多媒体或边端请求不被静默扩容。两次运行使用
+文本的实验 quality 配置证据，不作为 LoCoMo CLI 默认值；原生多媒体或边端请求也不被静默扩容。两次运行使用
 完全相同的 419 条记忆、199 个问题、Prompt、模型和并发，仅 `recall_limit` 不同，完整指标与输出
 SHA-256 同样保存在上述 manifest 中。
 
@@ -1294,21 +1309,27 @@ M3-Bench 的生产 runner 沿用官方 30 秒、零起点连续切片约定。�
 在整段视频完成后回答。输出采用官方 JSONL 字段，并附带记忆、证据和 trace 诊断；sidecar run
 manifest 同时固定标注与媒体 revision/hash、代码、感知模型与 Prompt、回答模型与 Prompt、Jina
 revision、召回参数和最终输出 hash。基准路径不使用固定 sleep、标签提示或 Benchmark 专用存储。
+原始媒体和发布 caption 同时存在时，runner 把 `[Event]` 行合为一条 episodic memory、把
+`[Inference]` 行合为一条 semantic memory，两者均引用 `observe` 回执中的 source EvidenceSpan；
+这保留 M3 的信息通道而不制造逐行写入风暴。
 
 EgoLifeQA runner 将官方 `DAYn/HHMMSSFF` 映射到单调时间轴，其中 `FF` 按 release 视频的 20 FPS
 帧计数处理；少量大于单秒帧数的非归一化标注沿用官方 frame-index 转换并进位。prepared manifest
 只接受按时间排序、互不重叠且带 SHA-256/时长的 addressable 视频。
 问题按时间排序执行；只有 `clip.end <= query_time` 的片段才依次 `observe` 并等待 Job 成功，跨越
-提问时刻的片段整体延后。召回问题仅包含原问题和四个候选项，答案按官方 A/B/C/D 精确准确率
-计算；无法从受约束输出中无歧义解析时记为未作答。
+提问时刻的片段整体延后。发布 caption 同时含 Visual/Audio 行时拆为两条可独立召回的 memory，
+存在原始媒体时共同引用 source EvidenceSpan。召回问题仅包含原问题和四个候选项，答案按官方
+A/B/C/D 精确准确率计算；无法从受约束输出中无歧义解析时记为未作答。
 
 SuperMemory-VQA runner 以 participant 为隔离单元，将各 session 的 Unix 起点和局部 segment
 时间合成绝对时间。问题截止点按官方协议取 `question_evidence` span 的结束；同时兼容 release 中
 6 条旧版单 `time_span` 记录。prepared media 必须在每个所选问题的结束点切段，runner 在写入前
 拒绝缺失边界的 manifest，从而包含当前视觉且不读到未来。视频/音频通过 `observe`，官方因隐私
 只发布而不提供原始音频的对齐 transcript 通过生产 `remember` 接口写入；答案标签、choice type
-和 answer evidence 均不进入 API 请求。回答模型返回四个候选项的完整排序，生产 abstention 映射到数据集显式的
-“This question can not be answered.” 选项，输出计算 Ans-F1、QA-Acc 与 QA-MRR。
+和 answer evidence 均不进入 API 请求。回答模型返回四个候选项的完整排序；数据集显式的
+“This question can not be answered.” 是普通 answerability 选项，不等于 API 的 `null`
+abstention。当 transcript 与媒体同时存在时，前者引用后者的 source EvidenceSpan。输出计算
+Ans-F1、QA-Acc 与 QA-MRR。
 
 所有 runner 强制接收 `run_id`，并将其写入 tenant ID 与 sidecar manifest。每次运行使用新的
 `run_id`，从结构上阻断上一次完整摄入留下的未来记忆污染本次较早问题；输出还固定数据、prepared
@@ -1453,12 +1474,17 @@ Robot/Web 非官方 Qwen Judge `30.02%/58.18%`。M3 Web 混合了 908 个 v6 与
 同一 AES-GCM 加密设备身份。另有 6 秒、60 次 100ms PCM push 的真实在线路径。两者都只作为当前代码
 增量证据；完整榜单和带真值身份 replay 仍按上述基线口径验收。
 
+当前 `answer_from_evidence_v10` 已完成发布文本↔原始媒体 EvidenceSpan 绑定、最终相关 Top-K 内
+newest/oldest 重排、无新增结果时的反思方向切换，以及 Summary 有向下钻与有界单跳父/同父展开；这些改动通过生产路径
+回归，但尚未重跑四套完整 split，因此不改写上面的基线数字。跨查询 experience memory 与
+Entity/Bridge/Scene/Horizon cue 明确推迟到完整数据证明增益之后，避免为榜单题型预埋旁路。
+
 | 阶段 | 当前状态 | 已落地证据 | 剩余验收 |
 | --- | --- | --- | --- |
 | Phase 0 | 完成 | 严格领域契约、锁定依赖、CI、Jina smoke、官方数据适配器、可追溯 LoCoMo 与 5090 全量评测 manifest | 无；后续运行继续沿用同一 manifest 门禁 |
 | Phase 1 | 软件垂直路径完成 | 原生 BGR/PCM 流入口、采集 handoff、FunASR 统一语音、加密身份 prototype、SQLite Outbox/近期记忆、S3 同步、durable Job、Event 精确 EvidenceSpan/pgvector 与 REST API | 在目标 Jetson 上完成真实摄像头、VAD/场景/运动门控、断网和功耗验收 |
 | Phase 2 | 完成（公开发布表示） | Episode/Claim/Summary consolidation、RRF/图展开/媒体重看、反馈纠错、生命周期、显式删除，以及四套 Benchmark 完整公开题集的生产 API 分层结果 | 原始 AV 全量重放属于 Phase 3 严格 SOTA 复现，不再作为 Phase 2 软件门禁 |
-| Phase 3 | 进行中 | RLS 多租户、Bearer allowlist、Python SDK、MCP/OpenAPI、OpenTelemetry、端侧 CUDA 人脸/FunASR 统一 speech path、PCM streaming、保留原生音轨的可视锚点 Omni ASD、最多两轮通用查询 refinement、完整公开题集差距分析和可撤销关联闭环 | 原始 AV/OCR/object 全量 SOTA 重放、跨任务经验记忆、官方 Judge 重跑、身份真值 replay、LR-ASD/TensorRT 与 Embedding bake-off、Jetson/Nano 实测、配额、持久审计和备份删除演练 |
+| Phase 3 | 进行中 | RLS 多租户、Bearer allowlist、Python SDK、MCP/OpenAPI、OpenTelemetry、端侧 CUDA 人脸/FunASR 统一 speech path、PCM streaming、Omni ASD、发布文本↔原始媒体证据绑定、相关 Top-K 时间重排、无结果方向切换和有界层级展开 | 原始 AV/OCR/object 全量 SOTA 重放、官方 Judge 重跑、身份真值 replay、LR-ASD/TensorRT 与 Embedding bake-off、Jetson/Nano 实测、配额、持久审计和备份删除演练；experience/cue 等完整数据证明收益后再评估 |
 
 “软件路径完成”不等于硬件或榜单验收完成。以下项目不能由单元测试替代：
 

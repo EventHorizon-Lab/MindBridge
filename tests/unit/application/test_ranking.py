@@ -1,11 +1,11 @@
 """Checks for score-independent memory rank fusion."""
 
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from mindbridge.application.ranking import fuse_memory_rankings
+from mindbridge.application.ranking import fuse_memory_rankings, order_memory_candidates
 from mindbridge.core import (
     DomainInvariantError,
     MemoryId,
@@ -65,6 +65,19 @@ def test_rrf_rejects_invalid_budget() -> None:
     """A caller must make its bounded candidate budget explicit."""
     with pytest.raises(DomainInvariantError, match="must be positive"):
         fuse_memory_rankings((), limit=0)
+
+
+def test_temporal_order_only_reorders_the_bounded_relevance_set() -> None:
+    oldest = _memory("memory_oldest")
+    newest = replace(
+        _memory("memory_newest"),
+        occurred_at=NOW + timedelta(days=1),
+        ended_at=NOW + timedelta(days=1),
+    )
+
+    assert order_memory_candidates((oldest, newest), "newest") == (newest, oldest)
+    assert order_memory_candidates((newest, oldest), "oldest") == (oldest, newest)
+    assert order_memory_candidates((oldest, newest), "relevance") == (oldest, newest)
 
 
 def _memory(memory_id: str) -> MemoryRecord:
