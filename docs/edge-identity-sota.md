@@ -2,7 +2,7 @@
 
 > 状态：Phase 3 可执行基线，目标 Jetson 真值验收前不得宣称人物一致性 SOTA
 >
-> 更新日期：2026-08-13
+> 更新日期：2026-08-14
 >
 > 范围：原生视听流、人脸、VAD/ASR/标点/diarization、声纹、face↔voice 和端侧遗忘
 
@@ -16,7 +16,7 @@ MindBridge 当前默认链路只保留一套语音生态：
 | 原生音频流 | 16 kHz mono PCM16 → FunASR causal Paraformer | 任意输入 chunk；内部使用官方 600ms 窗口和 cache |
 | Event-close 语音理解 | 一个 FunASR `AutoModel` 组合 ASR + VAD + punctuation + speaker model | 一次推理返回 transcript、毫秒 sentence、speaker label 和 centroid |
 | 人脸 | InsightFace SCRFD + ArcFace | 目标 Jetson 再比较检测器档位；模板留在设备 |
-| 声纹 | FunASR 返回的 ERes2NetV2 speaker centroid | 不再二次解码波形或重复加载 speaker encoder |
+| 声纹 | FunASR 返回的 CAM++ speaker centroid | 不再二次解码波形或重复加载 speaker encoder |
 | 活跃说话人 | 带 face anchor 且保留音轨的 Omni/VLM 复核 | 只产出可撤销证据；LR-ASD 仍是本地质量候选 |
 | 本地身份 | AES-256-GCM 加密 SQLite prototype | 绝对阈值 + runner-up margin；显式遗忘同步删除 |
 
@@ -59,7 +59,7 @@ FunASR、ModelScope 和 ONNX Runtime；`mindbridge[edge]` 只携带同步、安�
 | --- | --- | --- |
 | 人脸 | InsightFace `buffalo_l`，CPU、5 FPS、HDBSCAN 与固定阈值 | 同样复用 InsightFace，但自动选择并核验 CUDA provider；有质量门、绝对阈值和 runner-up margin |
 | 说话区间 | Gemini 看整段视频生成秒级 ASR 区间 | PCM causal ASR 给低延迟 partial；FunASR 质量路径给毫秒 VAD/ASR/punc/spk |
-| 声纹 | 自行构造 ERes2NetV2，逐区间再次推理 | 直接使用同一次 FunASR 调用返回的 speaker centroid |
+| 声纹 | 自行构造 ERes2NetV2，逐区间再次推理 | 直接使用同一次 FunASR/CAM++ 调用返回的 speaker centroid |
 | face↔voice | Prompt 可直接写 `Equivalence` 并刷新图 | Omni 只能写可撤销 ASD 证据；跨 Observation 双向互为最佳后才解析 ID |
 | 隐私/遗忘 | Benchmark 图预处理 | 生物模板只在加密设备库；Observation/identity tombstone 真实删除 |
 
@@ -127,7 +127,7 @@ online_asr = iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-onli
 quality_asr = iic/speech_seaco_paraformer_large_asr_nat-zh-cn-16k-common-vocab8404-pytorch@v2.0.4
 vad = iic/speech_fsmn_vad_zh-cn-16k-common-pytorch@v2.0.4
 punc = iic/punc_ct-transformer_zh-cn-common-vad_realtime-vocab272727@v2.0.4
-speaker = iic/speech_eres2netv2_sv_zh-cn_16k-common@v1.0.1
+speaker = iic/speech_campplus_sv_zh-cn_16k-common@v2.0.2
 ```
 
 在线模型使用官方 `(0, 10, 5)` chunk 配置，即 600ms 中间窗口，并保留 encoder/decoder look-back
@@ -148,7 +148,7 @@ FunASR 当前结果没有可解释的逐 turn diarization probability，因此�
 [llama.cpp](https://github.com/ggml-org/llama.cpp) 及其 FunASR/GGUF 生态让 ASR/VAD 在 x86、ARM、
 Apple 和非 CUDA 设备上共享一个轻运行时，未来很适合替换**在线 acoustic front-end**。当前不把它
 设计成抽象 provider：没有上游证据证明同一运行时完整返回 MindBridge 所需的 punctuation、稳定
-diarization 和 ERes2NetV2 centroid。先在 Nano/CPU 上比较 WER、RTF、内存与功耗；真正通过后再加
+diarization 和 CAM++ centroid。先在 Nano/CPU 上比较 WER、RTF、内存与功耗；真正通过后再加
 一个薄适配器，不能为了未来可能性预建 factory/registry。
 
 ## 6. face↔voice 闭环

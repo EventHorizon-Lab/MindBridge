@@ -22,9 +22,9 @@ from mindbridge.edge.identity import LocalIdentitySample, SQLiteIdentityMemory
 from mindbridge.models.compute import select_onnx_providers
 
 INSIGHTFACE_MODEL = ModelReference(model_id="insightface/buffalo_l", revision="1.0.1")
-ERES2NETV2_MODEL = ModelReference(
-    model_id="iic/speech_eres2netv2_sv_zh-cn_16k-common",
-    revision="v1.0.1",
+CAMPPLUS_MODEL = ModelReference(
+    model_id="iic/speech_campplus_sv_zh-cn_16k-common",
+    revision="v2.0.2",
 )
 OBSERVATION_SCOPED_VOICE_MODEL = ModelReference(
     model_id="mindbridge/observation-scoped-voice",
@@ -358,7 +358,7 @@ def recognize_speakers(
                 source_observation_id=observation_id,
                 sample_id=derive_stable_id("voice_sample", observation_id, speaker_label),
                 embedding=embedding,
-                model_reference=ERES2NETV2_MODEL,
+                model_reference=CAMPPLUS_MODEL,
             ),
             minimum_similarity=minimum_similarity,
             minimum_margin=minimum_margin,

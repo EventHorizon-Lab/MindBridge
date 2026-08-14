@@ -5,8 +5,8 @@ from typing import cast
 from unittest.mock import Mock
 
 import pytest
-from celery import Task  # type: ignore[import-untyped]  # Upstream lacks PEP 561 metadata.
-from celery.exceptions import Retry  # type: ignore[import-untyped]  # Upstream lacks types.
+from celery import Task
+from celery.exceptions import Retry
 from pydantic import ValidationError
 
 import mindbridge.worker as worker_module

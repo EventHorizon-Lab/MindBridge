@@ -42,6 +42,7 @@ async def test_omni_perception_returns_grounded_event_and_provider_revision() ->
         content = cast(list[dict[str, object]], messages[1]["content"])
 
         assert request.url.path == "/api/v1/chat/completions"
+        assert payload["max_tokens"] == 8_192
         assert "reasoning_effort" not in payload
         assert "response_format" not in payload
         assert "atomic semantic" in system_prompt

@@ -5,8 +5,8 @@ from __future__ import annotations
 import asyncio
 from typing import Annotated
 
-from celery import Celery  # type: ignore[import-untyped]  # Upstream lacks PEP 561 metadata.
-from kombu.exceptions import (  # type: ignore[import-untyped]  # Upstream lacks PEP 561 metadata.
+from celery import Celery
+from kombu.exceptions import (
     OperationalError,
 )
 from pydantic import BaseModel, ConfigDict, StringConstraints

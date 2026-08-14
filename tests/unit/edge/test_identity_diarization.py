@@ -4,9 +4,11 @@ import asyncio
 import json
 import shutil
 import subprocess
+import sys
 import threading
 from collections.abc import Callable, Coroutine
 from pathlib import Path
+from types import ModuleType
 from typing import cast
 
 import httpx
@@ -28,6 +30,7 @@ from mindbridge.edge.identity_diarization import (
     recognize_identities_in_av_segment,
 )
 from mindbridge.edge.identity_inference import (
+    CAMPPLUS_MODEL,
     FaceEmbeddingSample,
     InsightFaceVideoEncoder,
     SpeakerEmbeddingSample,
@@ -102,6 +105,31 @@ async def test_funasr_returns_integrated_timed_speech_and_speaker_centroids(
         (1.0, 0.0),
         (0.0, 1.0),
     ]
+
+
+def test_funasr_loads_registered_integrated_speaker_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    arguments: dict[str, object] = {}
+
+    class Pipeline:
+        def generate(self, **_kwargs: object) -> list[dict[str, object]]:
+            return []
+
+    def auto_model(**kwargs: object) -> Pipeline:
+        arguments.update(kwargs)
+        return Pipeline()
+
+    funasr = ModuleType("funasr")
+    funasr.AutoModel = auto_model  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "funasr", funasr)
+    monkeypatch.setattr(identity_diarization, "select_torch_device", lambda _device: "cuda")
+
+    pipeline = FunASRSpeechPipeline.load(device="cuda")
+
+    assert pipeline.device == "cuda"
+    assert arguments["spk_model"] == CAMPPLUS_MODEL.model_id
+    assert arguments["spk_model_revision"] == CAMPPLUS_MODEL.revision
 
 
 async def test_funasr_rejects_unrecoverably_untimed_speech(tmp_path: Path) -> None:

@@ -3,7 +3,7 @@
 from unittest.mock import Mock
 
 import pytest
-from kombu.exceptions import (  # type: ignore[import-untyped]  # Upstream lacks PEP 561 metadata.
+from kombu.exceptions import (
     OperationalError,
 )
 

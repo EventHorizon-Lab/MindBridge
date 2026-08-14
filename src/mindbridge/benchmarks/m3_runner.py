@@ -18,6 +18,7 @@ from mindbridge.benchmarks.runtime import benchmark_tenant_id, wait_for_observat
 from mindbridge.contracts import (
     ContractModel,
     Identifier,
+    IdentityObservationInput,
     MediaObjectInput,
     NonEmptyString,
     ObserveRequest,
@@ -39,6 +40,7 @@ class M3PreparedClip(ContractModel):
     media_object: MediaObjectInput | None = None
     caption: NonEmptyString | None = None
     duration_ms: int | None = Field(default=None, gt=0)
+    identity_observations: tuple[IdentityObservationInput, ...] = Field(default=(), max_length=512)
 
     @model_validator(mode="after")
     def require_video_with_duration(self) -> M3PreparedClip:
@@ -46,6 +48,8 @@ class M3PreparedClip(ContractModel):
         if self.media_object is None:
             if self.caption is None or self.duration_ms is None:
                 raise ValueError("M3-Bench clips require video or a caption with duration_ms")
+            if self.identity_observations:
+                raise ValueError("M3-Bench identity observations require source video")
         else:
             if self.media_object.kind is not MediaKind.VIDEO:
                 raise ValueError("M3-Bench clips must be video media objects")
@@ -55,6 +59,10 @@ class M3PreparedClip(ContractModel):
                 raise ValueError("M3-Bench clip durations must match")
         if _clip_duration_ms(self) > M3_CLIP_DURATION_SECONDS * 1_000:
             raise ValueError("M3-Bench clips must not exceed 30 seconds")
+        if any(
+            identity.end_ms > _clip_duration_ms(self) for identity in self.identity_observations
+        ):
+            raise ValueError("M3-Bench identity observation exceeds its clip")
         return self
 
 
@@ -281,6 +289,7 @@ def _observe_request(
         occurred_at=occurred_at,
         ended_at=ended_at,
         observed_at=ended_at,
+        identity_observations=clip.identity_observations,
         idempotency_key=(f"{M3_BENCH_ADAPTER_VERSION}:{video_id}:clip:{clip.clip_index}"),
     )
 

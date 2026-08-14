@@ -136,6 +136,26 @@ uvx --from huggingface-hub hf download ByteDance-Seed/M3-Bench \
   --revision 2672152eee36b25ccb38fdbc3b72135347adbb63 \
   --include 'videos/robot/*' \
   --local-dir .benchmarks/m3-bench
+
+uvx --from huggingface-hub hf download ByteDance-Seed/M3-Bench \
+  intermediate_outputs/robot.tar.gz.00 \
+  intermediate_outputs/robot.tar.gz.01 \
+  intermediate_outputs/robot.tar.gz.02 \
+  memory_graphs/robot.tar.gz \
+  --repo-type dataset \
+  --revision 2672152eee36b25ccb38fdbc3b72135347adbb63 \
+  --local-dir .benchmarks/m3-bench
+```
+
+Acquire the released SuperMemory-VQA RGB videos the same way; raw audio is not part of the public
+release:
+
+```bash
+uvx --from huggingface-hub hf download OSU-AIoT-MLSys-Lab/SuperMemory-VQA \
+  --repo-type dataset \
+  --revision 1d228e0f10049a8a84c458dded2aa25b1e21ce8f \
+  --include 'data/video/*' \
+  --local-dir .benchmarks/supermemory-vqa
 ```
 
 The resulting annotation identity and counts are recorded in
@@ -190,6 +210,19 @@ the already-addressable objects:
           "created_at": "2026-08-11T00:00:00Z",
           "duration_ms": 30000
         },
+        "identity_observations": [
+          {
+            "identity_id": "person_device_01",
+            "kind": "face",
+            "start_ms": 1200,
+            "end_ms": 4800,
+            "confidence": 0.91,
+            "model_id": "insightface/buffalo_l",
+            "model_revision": "1.0.1",
+            "scope": "device",
+            "visual_bbox_xyxy": [0.12, 0.08, 0.46, 0.82]
+          }
+        ],
         "caption": "[Event] The person places the red cup on the left shelf."
       }
     ]
@@ -204,6 +237,15 @@ released `[Event]` episodic view and `[Inference]` semantic view, so recall can 
 reinspect the same video. The runner ingests and waits for each durable job before answering
 questions whose official `before_clip` equals that index, so a question cannot see future video.
 Questions without `before_clip` run after the complete video.
+
+Optional `identity_observations` come from the existing Edge InsightFace/FunASR path. Only anonymous,
+timed IDs, transcripts, and face boxes enter the manifest; biometric vectors remain device-local.
+For M3-Bench Robot, a prepared-media producer may instead reuse the pinned released face/voice
+intermediates and memory-graph character mapping with the upstream matching thresholds; it must
+discard their embeddings and base64 samples after emitting the same cloud-safe contract.
+The Omni worker extracts speech, visible text, objects, actions, and relations from the raw AV into
+Event/Entity/Claim records that share the source `EvidenceSpan`. Recall therefore retrieves released
+text and structured cues together, then reopens each distinct source object before answering.
 
 ```bash
 uv run python -m mindbridge.benchmarks.m3_cli \
@@ -301,6 +343,13 @@ prepared media must split at every selected question span's end; the runner reje
 boundary before ingestion. It then includes that completed segment and no later media. The output
 reports Ans-F1, QA-Acc, and QA-MRR and contains no ground-truth fields:
 
+When an official question boundary extends past the released MP4 container, keep that segment's
+published transcript and attach only the available media duration. The resulting `EvidenceSpan`
+ends at the real container tail; media may be shorter than its segment but must never exceed it.
+At the pinned dataset revision, 82 of 83 referenced sessions have an MP4; the remaining
+`Person_1_session_2_01312026_glasses_1275` session is VRS-only and remains transcript-only unless
+the caller prepares that VRS with the upstream Project Aria tooling.
+
 ```json
 {
   "subject": 1,
@@ -313,6 +362,7 @@ reports Ans-F1, QA-Acc, and QA-MRR and contains no ground-truth fields:
           "start_seconds": 0,
           "duration_ms": 30000,
           "media_objects": [],
+          "identity_observations": [],
           "transcript": "User: Okay, it started."
         }
       ]
@@ -582,7 +632,7 @@ partial = await streaming_asr.push_pcm16(pcm16_chunk, is_final=is_last_audio_chu
 
 The partial transcript is provisional. GStreamer/DeepStream still owns the bounded rolling fragment;
 when its Event gate closes, `FunASRSpeechPipeline` performs VAD, quality ASR, punctuation,
-diarization, and ERes2NetV2 centroid extraction in one upstream call.
+diarization, and CAM++ centroid extraction in one upstream call.
 `recognize_identities_in_av_segment()` combines that result with InsightFace and the optional
 OpenAI-SDK audiovisual active-speaker verifier, then returns only cloud-safe intervals ready for
 `enqueue_captured_video()`. `device=auto` selects CUDA when it is available, and explicit CUDA

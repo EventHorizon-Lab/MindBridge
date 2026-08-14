@@ -40,13 +40,8 @@ from mindbridge.models.jina import (
     DEFAULT_JINA_OMNI_REVISION,
 )
 from mindbridge.models.openai_chat import REASONING_EFFORT_VALUES
-from mindbridge.models.openai_omni import (
-    ANSWER_FROM_EVIDENCE_PROMPT_VERSION,
-    DEFAULT_OMNI_MODEL_ID,
-)
-from mindbridge.models.openai_perception import (
-    PERCEIVE_EVENTS_PROMPT_VERSION,
-)
+from mindbridge.models.openai_omni import DEFAULT_OMNI_MODEL_ID
+from mindbridge.prompts import ANSWER_FROM_EVIDENCE_PROMPT, PERCEIVE_EVENTS_PROMPT
 from mindbridge.sdk import AsyncMindBridge
 
 EGOLIFE_RUNNER_VERSION = "egolife_production_api_v5"
@@ -192,10 +187,10 @@ def _write_artifacts(
         code_revision=arguments.code_revision,
         perception_model_id=arguments.perception_model_id,
         perception_model_revision=arguments.perception_model_revision,
-        perception_prompt_version=PERCEIVE_EVENTS_PROMPT_VERSION,
+        perception_prompt_version=PERCEIVE_EVENTS_PROMPT.version,
         answer_model_id=arguments.answer_model_id,
         answer_model_revision=arguments.answer_model_revision,
-        answer_prompt_version=ANSWER_FROM_EVIDENCE_PROMPT_VERSION,
+        answer_prompt_version=ANSWER_FROM_EVIDENCE_PROMPT.version,
         reasoning_effort=arguments.answer_reasoning_effort,
         embedding_model_id=arguments.embedding_model_id,
         embedding_model_revision=arguments.embedding_model_revision,

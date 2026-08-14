@@ -17,6 +17,7 @@ from mindbridge.benchmarks import (
     wait_for_observation_job,
 )
 from mindbridge.contracts import (
+    IdentityObservationInput,
     MediaObjectInput,
     MemoryView,
     ObservationProcessingJobView,
@@ -27,7 +28,14 @@ from mindbridge.contracts import (
     RecallResult,
     RememberRequest,
 )
-from mindbridge.core import JobState, MediaKind, MemoryState, MemoryType, VerificationStatus
+from mindbridge.core import (
+    IdentityKind,
+    JobState,
+    MediaKind,
+    MemoryState,
+    MemoryType,
+    VerificationStatus,
+)
 from mindbridge.sdk import MindBridgeClientError
 
 NOW = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
@@ -181,6 +189,7 @@ async def test_m3_binds_released_caption_to_source_video() -> None:
                 media_object=_media("media_0", MediaKind.VIDEO),
                 caption="A person entered.",
                 duration_ms=30_000,
+                identity_observations=(_identity(),),
             ),
         ),
     )
@@ -194,6 +203,7 @@ async def test_m3_binds_released_caption_to_source_video() -> None:
     )
 
     assert api.remember_requests[0].evidence_ids == ("evidence_0",)
+    assert api.observe_requests[0].identity_observations == (_identity(),)
 
 
 async def test_m3_keeps_released_events_and_inferences_in_separate_memory_types() -> None:
@@ -323,6 +333,19 @@ def test_prepared_video_requires_contiguous_video_clips() -> None:
                 _clip(1),
             ),
         )
+    with pytest.raises(ValidationError, match="identity observation exceeds"):
+        M3PreparedClip(
+            clip_index=0,
+            media_object=_media("media_identity", MediaKind.VIDEO),
+            identity_observations=(_identity(end_ms=30_001),),
+        )
+    with pytest.raises(ValidationError, match="identity observations require source video"):
+        M3PreparedClip(
+            clip_index=0,
+            caption="A person entered.",
+            duration_ms=30_000,
+            identity_observations=(_identity(),),
+        )
 
 
 def _annotation(*, questions: tuple[M3BenchQuestion, ...] | None = None) -> M3BenchVideo:
@@ -378,4 +401,17 @@ def _media(
         size_bytes=1_024,
         created_at=NOW,
         duration_ms=duration_ms,
+    )
+
+
+def _identity(*, end_ms: int = 1_000) -> IdentityObservationInput:
+    return IdentityObservationInput(
+        identity_id="person_device_01",
+        kind=IdentityKind.FACE,
+        start_ms=0,
+        end_ms=end_ms,
+        confidence=0.9,
+        model_id="insightface/buffalo_l",
+        model_revision="1.0.1",
+        visual_bbox_xyxy=(0.1, 0.1, 0.5, 0.8),
     )
