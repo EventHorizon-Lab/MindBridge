@@ -26,6 +26,7 @@ from mindbridge.models.openai_chat import stream_text_completion, unwrap_json_co
 from mindbridge.models.openai_media import (
     OpenAIContentPart,
     evidence_media_content_parts,
+    media_input_span_attributes,
     qwen_media_url_content_part,
 )
 from mindbridge.telemetry import set_current_span_attributes, trace_operation
@@ -254,6 +255,12 @@ class OpenAIOmniAnswerer:
                 "mindbridge.memory.count": len(memories),
                 "mindbridge.evidence.count": len(evidence),
                 "mindbridge.query.media_count": len(query_media),
+                "mindbridge.model.structured_retry_count": 0,
+                **media_input_span_attributes(
+                    tuple(item.media_object for item in query_media)
+                    + tuple(item.media_object for item in evidence),
+                    video_frames_per_second=self._video_frames_per_second,
+                ),
             }
         )
         messages = _messages(
@@ -272,11 +279,13 @@ class OpenAIOmniAnswerer:
             messages=cast(list[ChatCompletionMessageParam], messages),
             max_output_tokens=self._max_output_tokens,
             request_timeout_seconds=self._request_timeout_seconds,
+            ttft_stage="model.answer.ttft",
             reasoning_effort=self._reasoning_effort,
         )
         try:
             return _generated_answer(completion.content)
         except ModelOutputError:
+            set_current_span_attributes({"mindbridge.model.structured_retry_count": 1})
             completion = await stream_text_completion(
                 self._client,
                 model_id=self._model_reference.model_id,
@@ -284,6 +293,8 @@ class OpenAIOmniAnswerer:
                 max_output_tokens=self._max_output_tokens,
                 request_timeout_seconds=self._request_timeout_seconds,
                 json_mode=True,
+                attempt=2,
+                ttft_stage="model.answer.ttft",
                 reasoning_effort=self._reasoning_effort,
             )
             return _generated_answer(completion.content)
@@ -306,6 +317,11 @@ class OpenAIOmniAnswerer:
                 "mindbridge.memory.count": len(memories),
                 "mindbridge.evidence.count": len(evidence),
                 "mindbridge.query.media_count": len(query_media),
+                **media_input_span_attributes(
+                    tuple(item.media_object for item in query_media)
+                    + tuple(item.media_object for item in evidence),
+                    video_frames_per_second=self._video_frames_per_second,
+                ),
             }
         )
         messages = _messages(
@@ -324,6 +340,7 @@ class OpenAIOmniAnswerer:
             messages=cast(list[ChatCompletionMessageParam], messages),
             max_output_tokens=self._max_output_tokens,
             request_timeout_seconds=self._request_timeout_seconds,
+            ttft_stage="model.select_occurrences.ttft",
             reasoning_effort=self._reasoning_effort,
         )
         return _selected_memory_ids(completion.content, memories)

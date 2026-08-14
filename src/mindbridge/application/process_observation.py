@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import replace
 from datetime import datetime, timedelta
+from time import perf_counter
 
 from mindbridge.application.derive_observation_graph import (
     derive_observation_graph,
@@ -49,7 +50,12 @@ from mindbridge.core import (
     TenantId,
     derive_stable_id,
 )
-from mindbridge.telemetry import set_current_span_attributes, trace_operation
+from mindbridge.telemetry import (
+    operation_span,
+    record_stage_duration,
+    set_current_span_attributes,
+    trace_operation,
+)
 
 
 class ProcessObservation:
@@ -95,6 +101,19 @@ class ProcessObservation:
                 raise MemoryIntegrityError("unclaimed observation job has invalid state")
             return claim.job
 
+        processing_started_at = perf_counter()
+        job_age_at_claim_seconds = max(
+            0.0,
+            (claim.job.updated_at - claim.job.created_at).total_seconds(),
+        )
+        set_current_span_attributes({"mindbridge.job.attempt": claim.job.attempt})
+        if claim.job.attempt == 1:
+            set_current_span_attributes(
+                {"mindbridge.process_observation.queue_lag_seconds": job_age_at_claim_seconds}
+            )
+            record_stage_duration("cloud.job_to_first_claim", job_age_at_claim_seconds)
+
+        embedding_tasks: list[asyncio.Task[tuple[EmbeddingRecord, ...]]] = []
         try:
             batch = await self._store.read_observation_batch(tenant_id, observation_id)
             evidence = await resolve_evidence_media(
@@ -126,26 +145,34 @@ class ProcessObservation:
                     "mindbridge.prompt.version": perception.prompt_version,
                 }
             )
-            embedding_evidence = await resolve_evidence_media(
-                batch.evidence_spans,
-                batch.media_objects,
-                self._media_url_signer,
-            )
-            evidence_embeddings, graph_embeddings = await asyncio.gather(
-                _evidence_embeddings(
-                    tenant_id,
-                    embedding_evidence,
-                    self._embedder,
-                    claim.job.created_at,
-                ),
+            graph_embedding_task = asyncio.create_task(
                 embed_observation_graph(
                     tenant_id,
                     events,
                     graph.claims,
                     self._text_embedder,
                     claim.job.created_at,
-                ),
+                )
             )
+            embedding_tasks.append(graph_embedding_task)
+            event_media_ids = {item.media_object_id for item in event_evidence}
+            embedding_evidence = await resolve_evidence_media(
+                event_evidence,
+                tuple(
+                    item for item in batch.media_objects if item.media_object_id in event_media_ids
+                ),
+                self._media_url_signer,
+            )
+            evidence_embedding_task = asyncio.create_task(
+                _evidence_embeddings(
+                    tenant_id,
+                    embedding_evidence,
+                    self._embedder,
+                    claim.job.created_at,
+                )
+            )
+            embedding_tasks.append(evidence_embedding_task)
+            graph_embeddings, evidence_embeddings = await asyncio.gather(*embedding_tasks)
             output = ObservationProcessingOutput(
                 evidence_spans=event_evidence,
                 events=events,
@@ -156,21 +183,35 @@ class ProcessObservation:
                 relations=graph.relations,
                 embeddings=evidence_embeddings + graph_embeddings,
             )
-            return await self._store.commit_observation_processing(
-                tenant_id,
-                observation_id,
-                job_id,
-                attempt=claim.job.attempt,
-                output=output,
+            with operation_span("mindbridge.process_observation.commit"):
+                completed = await self._store.commit_observation_processing(
+                    tenant_id,
+                    observation_id,
+                    job_id,
+                    attempt=claim.job.attempt,
+                    output=output,
+                )
+            ready_seconds = job_age_at_claim_seconds + max(
+                0.0,
+                perf_counter() - processing_started_at,
             )
-        except Exception as error:
-            await self._store.mark_observation_processing_failed(
-                tenant_id,
-                observation_id,
-                job_id,
-                attempt=claim.job.attempt,
-                error_code=_processing_error_code(error),
+            set_current_span_attributes(
+                {"mindbridge.process_observation.searchable_ready_seconds": ready_seconds}
             )
+            record_stage_duration("cloud.job_to_searchable_ready", ready_seconds)
+            return completed
+        except BaseException as error:
+            for task in embedding_tasks:
+                task.cancel()
+            await asyncio.gather(*embedding_tasks, return_exceptions=True)
+            if isinstance(error, Exception):
+                await self._store.mark_observation_processing_failed(
+                    tenant_id,
+                    observation_id,
+                    job_id,
+                    attempt=claim.job.attempt,
+                    error_code=_processing_error_code(error),
+                )
             raise
 
 
@@ -276,15 +317,17 @@ def _events(
     )
 
 
+@trace_operation("mindbridge.process_observation.embed_evidence")
 async def _evidence_embeddings(
     tenant_id: TenantId,
     evidence: tuple[ResolvedEvidence, ...],
     embedder: OmniEmbedder,
     created_at: datetime,
 ) -> tuple[EmbeddingRecord, ...]:
-    media_urls = tuple(dict.fromkeys(item.media_url for item in evidence))
-    vectors = await embedder.encode_documents(media_urls)
-    vector_by_url = dict(zip(media_urls, vectors, strict=True))
+    unique_evidence = tuple(dict.fromkeys(_embedding_evidence_key(item) for item in evidence))
+    input_by_key = {_embedding_evidence_key(item): item for item in evidence}
+    vectors = await embedder.encode_documents(tuple(input_by_key[key] for key in unique_evidence))
+    vector_by_key = dict(zip(unique_evidence, vectors, strict=True))
     return tuple(
         EmbeddingRecord(
             embedding_id=EmbeddingId(
@@ -300,7 +343,7 @@ async def _evidence_embeddings(
             tenant_id=tenant_id,
             object_type=EmbeddedObjectType.EVIDENCE_SPAN,
             object_id=item.evidence_span.evidence_id,
-            values=vector_by_url[item.media_url],
+            values=vector_by_key[_embedding_evidence_key(item)],
             model_reference=embedder.model_reference,
             space_reference=embedder.space_reference,
             task=RETRIEVAL_DOCUMENT_EMBEDDING_TASK,
@@ -309,6 +352,19 @@ async def _evidence_embeddings(
             created_at=created_at,
         )
         for item in evidence
+    )
+
+
+def _embedding_evidence_key(evidence: ResolvedEvidence) -> tuple[object, ...]:
+    span = evidence.evidence_span
+    return (
+        evidence.media_url,
+        span.start_ms,
+        span.end_ms,
+        span.frame_start,
+        span.frame_end,
+        span.region,
+        span.audio_track,
     )
 
 

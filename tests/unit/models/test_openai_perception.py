@@ -26,6 +26,7 @@ from mindbridge.core import (
     SensorKind,
     TenantId,
 )
+from mindbridge.models import openai_perception
 from mindbridge.models.openai_omni import normalize_openai_base_url
 from mindbridge.models.openai_perception import OpenAIOmniEventPerceiver
 
@@ -42,7 +43,7 @@ async def test_omni_perception_returns_grounded_event_and_provider_revision() ->
         content = cast(list[dict[str, object]], messages[1]["content"])
 
         assert request.url.path == "/api/v1/chat/completions"
-        assert "reasoning_effort" not in payload
+        assert payload["reasoning_effort"] == "none"
         assert "response_format" not in payload
         assert "atomic semantic" in system_prompt
         assert "spoken wording and visible text exactly" in system_prompt
@@ -122,13 +123,18 @@ async def test_omni_perception_returns_grounded_event_and_provider_revision() ->
     assert result.events[0].claims[0].entity_indices == (0, 1)
 
 
-async def test_omni_perception_retries_invalid_output_once_in_json_mode() -> None:
+async def test_omni_perception_retries_invalid_output_once_in_json_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     calls = 0
+    span_attributes: list[dict[str, str | int | float | bool]] = []
+    monkeypatch.setattr(openai_perception, "set_current_span_attributes", span_attributes.append)
 
     async def respond(request: httpx.Request) -> httpx.Response:
         nonlocal calls
         calls += 1
         payload: dict[str, object] = json.loads(request.content)
+        assert payload["reasoning_effort"] == "none"
         if calls == 1:
             assert "response_format" not in payload
             content = {"events": [{"start_ms": 0}]}
@@ -148,6 +154,11 @@ async def test_omni_perception_retries_invalid_output_once_in_json_mode() -> Non
 
     assert calls == 2
     assert result.events == ()
+    assert [
+        attributes["mindbridge.model.structured_retry_count"]
+        for attributes in span_attributes
+        if "mindbridge.model.structured_retry_count" in attributes
+    ] == [0, 1]
 
 
 async def test_omni_perception_rejects_detail_evidence_outside_its_event() -> None:

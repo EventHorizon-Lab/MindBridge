@@ -39,7 +39,11 @@ from mindbridge.core import (
     Observation,
 )
 from mindbridge.models.openai_chat import stream_text_completion, unwrap_json_code_fence
-from mindbridge.models.openai_media import OpenAIContentPart, evidence_media_content_parts
+from mindbridge.models.openai_media import (
+    OpenAIContentPart,
+    evidence_media_content_parts,
+    media_input_span_attributes,
+)
 from mindbridge.models.openai_omni import (
     DEFAULT_OMNI_MODEL_ID,
     DEFAULT_VIDEO_FRAMES_PER_SECOND,
@@ -274,6 +278,11 @@ class OpenAIOmniEventPerceiver:
                 "mindbridge.model.revision": self._model_revision,
                 "mindbridge.prompt.version": PERCEIVE_EVENTS_PROMPT_VERSION,
                 "mindbridge.evidence.count": len(evidence),
+                "mindbridge.model.structured_retry_count": 0,
+                **media_input_span_attributes(
+                    tuple(item.media_object for item in evidence),
+                    video_frames_per_second=self._video_frames_per_second,
+                ),
             }
         )
         _require_observation_evidence(observation, evidence)
@@ -289,10 +298,13 @@ class OpenAIOmniEventPerceiver:
             messages=cast(list[ChatCompletionMessageParam], messages),
             max_output_tokens=self._max_output_tokens,
             request_timeout_seconds=self._request_timeout_seconds,
+            ttft_stage="model.perception.ttft",
+            reasoning_effort="none",
         )
         try:
             output = _parse_perception(completion.content)
         except ModelOutputError:
+            set_current_span_attributes({"mindbridge.model.structured_retry_count": 1})
             completion = await stream_text_completion(
                 self._client,
                 model_id=self._model_id,
@@ -300,6 +312,9 @@ class OpenAIOmniEventPerceiver:
                 max_output_tokens=self._max_output_tokens,
                 request_timeout_seconds=self._request_timeout_seconds,
                 json_mode=True,
+                attempt=2,
+                ttft_stage="model.perception.ttft",
+                reasoning_effort="none",
             )
             output = _parse_perception(completion.content)
         _require_grounded_output(observation, evidence, output)

@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from mindbridge.application import process_observation as process_observation_module
 from mindbridge.application.observation_processing import (
     ObservationBatch,
     ObservationProcessingOutput,
@@ -16,7 +17,7 @@ from mindbridge.application.perception import (
     PerceivedEvent,
     ResolvedEvidence,
 )
-from mindbridge.application.ports import PresignedMediaDownload
+from mindbridge.application.ports import EmbeddingInput, PresignedMediaDownload
 from mindbridge.application.process_observation import (
     ProcessObservation,
     _require_grounded_perception,
@@ -60,8 +61,22 @@ JOB_ID = JobId("job_process_observation_01")
 class RecordingProcessingStore:
     """Strict fake for one durable processing attempt."""
 
-    def __init__(self) -> None:
-        self.job = _job(JobState.PENDING, attempt=0)
+    def __init__(
+        self,
+        *,
+        created_at: datetime = NOW,
+        claimed_at: datetime = NOW,
+        completed_at: datetime = NOW,
+    ) -> None:
+        self._created_at = created_at
+        self._claimed_at = claimed_at
+        self._completed_at = completed_at
+        self.job = _job(
+            JobState.PENDING,
+            attempt=0,
+            created_at=created_at,
+            updated_at=created_at,
+        )
         self.output: ObservationProcessingOutput | None = None
 
     async def claim_observation_processing_job(
@@ -72,7 +87,12 @@ class RecordingProcessingStore:
     ) -> ObservationJobClaim:
         if self.job.state is JobState.SUCCEEDED:
             return ObservationJobClaim(job=self.job, acquired=False)
-        self.job = _job(JobState.RUNNING, attempt=self.job.attempt + 1)
+        self.job = _job(
+            JobState.RUNNING,
+            attempt=self.job.attempt + 1,
+            created_at=self._created_at,
+            updated_at=self._claimed_at,
+        )
         return ObservationJobClaim(job=self.job, acquired=True)
 
     async def read_observation_batch(
@@ -97,6 +117,8 @@ class RecordingProcessingStore:
             JobState.SUCCEEDED,
             attempt=attempt,
             memory_ids=tuple(memory.memory_id for memory in output.memories),
+            created_at=self._created_at,
+            updated_at=self._completed_at,
         )
         return self.job
 
@@ -172,24 +194,24 @@ class RecordingPerceiver:
 
 
 class RecordingEmbedder:
-    """Proves raw signed media, not a caption, reaches Jina document encoding."""
+    """Proves exact signed evidence, not a caption, reaches Jina document encoding."""
 
     model_reference = ModelReference(model_id="jina-omni", revision="revision-01")
     space_reference = EmbeddingSpaceReference(space_id="jina-v5", revision="space-v1")
     dimension = 2
 
     def __init__(self) -> None:
-        self.documents: tuple[str | bytes | tuple[str | bytes, ...], ...] = ()
+        self.documents: tuple[EmbeddingInput, ...] = ()
 
     async def encode_queries(
         self,
-        inputs: tuple[str | bytes | tuple[str | bytes, ...], ...],
+        inputs: tuple[EmbeddingInput, ...],
     ) -> tuple[tuple[float, ...], ...]:
         return ((1.0, 0.0),) * len(inputs)
 
     async def encode_documents(
         self,
-        inputs: tuple[str | bytes | tuple[str | bytes, ...], ...],
+        inputs: tuple[EmbeddingInput, ...],
     ) -> tuple[tuple[float, ...], ...]:
         self.documents = inputs
         return ((1.0, 0.0),) * len(inputs)
@@ -226,9 +248,19 @@ class DeterministicSigner:
         )
 
 
-async def test_processor_builds_event_memory_and_raw_media_embedding_once() -> None:
+async def test_processor_builds_event_memory_and_event_aligned_embedding_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """One retry-safe path derives memory while keeping AV as the primary index input."""
-    store = RecordingProcessingStore()
+    stages: list[tuple[str, float]] = []
+    monkeypatch.setattr(
+        process_observation_module,
+        "record_stage_duration",
+        lambda stage, duration: stages.append((stage, duration)),
+    )
+    processing_clock = iter((100.0, 100.5))
+    monkeypatch.setattr(process_observation_module, "perf_counter", lambda: next(processing_clock))
+    store = RecordingProcessingStore(claimed_at=NOW + timedelta(seconds=2))
     perceiver = RecordingPerceiver()
     embedder = RecordingEmbedder()
     text_embedder = RecordingTextEmbedder()
@@ -242,7 +274,6 @@ async def test_processor_builds_event_memory_and_raw_media_embedding_once() -> N
     assert duplicate.state is JobState.SUCCEEDED
     assert perceiver.calls == 1
     assert signer.calls == 2
-    assert embedder.documents == ("https://objects.example.test/clip.mp4?signature=2",)
     assert store.output is not None
     assert first.memory_ids == tuple(memory.memory_id for memory in store.output.memories)
     assert store.output.events[0].prompt_version == "perceive_events_v1"
@@ -250,15 +281,20 @@ async def test_processor_builds_event_memory_and_raw_media_embedding_once() -> N
     assert len(store.output.evidence_spans) == 1
     event_evidence = store.output.evidence_spans[0]
     assert (event_evidence.start_ms, event_evidence.end_ms) == (500, 3_500)
+    assert len(embedder.documents) == 1
+    embedded_evidence = embedder.documents[0]
+    assert isinstance(embedded_evidence, ResolvedEvidence)
+    assert embedded_evidence.evidence_span == event_evidence
+    assert embedded_evidence.media_url == "https://objects.example.test/clip.mp4?signature=2"
     assert store.output.events[0].evidence_ids == (event_evidence.evidence_id,)
     assert store.output.claims[0].evidence_ids == (event_evidence.evidence_id,)
     assert store.output.embeddings[0].object_type is EmbeddedObjectType.EVIDENCE_SPAN
-    assert store.output.embeddings[0].object_id == "evidence_01"
+    assert store.output.embeddings[0].object_id == event_evidence.evidence_id
     assert tuple(
         embedding.object_id
         for embedding in store.output.embeddings
         if embedding.object_type is EmbeddedObjectType.EVIDENCE_SPAN
-    ) == ("evidence_01", "evidence_unused")
+    ) == (event_evidence.evidence_id,)
     assert text_embedder.documents == (
         "A person places a red tool beside a blue toolbox.",
         "The red tool is beside the blue toolbox.",
@@ -273,6 +309,10 @@ async def test_processor_builds_event_memory_and_raw_media_embedding_once() -> N
     assert len(store.output.claims) == 1
     assert len(store.output.memories) == 2
     assert len(store.output.relations) == 8
+    assert stages == [
+        ("cloud.job_to_first_claim", 2.0),
+        ("cloud.job_to_searchable_ready", 2.5),
+    ]
     identity_mention = next(
         mention
         for mention in store.output.entity_mentions
@@ -494,6 +534,8 @@ def _job(
     attempt: int,
     error_code: str | None = None,
     memory_ids: tuple[MemoryId, ...] = (),
+    created_at: datetime = NOW,
+    updated_at: datetime = NOW,
 ) -> ObservationProcessingJob:
     return ObservationProcessingJob(
         job_id=JOB_ID,
@@ -502,7 +544,7 @@ def _job(
         state=state,
         attempt=attempt,
         error_code=error_code,
-        created_at=NOW,
-        updated_at=NOW,
+        created_at=created_at,
+        updated_at=updated_at,
         memory_ids=memory_ids,
     )

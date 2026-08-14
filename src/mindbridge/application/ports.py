@@ -39,7 +39,7 @@ from mindbridge.core import (
     TenantId,
 )
 
-EmbeddingInput: TypeAlias = str | bytes | tuple[str | bytes, ...]
+EmbeddingInput: TypeAlias = str | bytes | ResolvedEvidence | tuple[str | bytes, ...]
 
 
 @dataclass(frozen=True, slots=True)

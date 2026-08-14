@@ -384,6 +384,12 @@ instrumentations propagate W3C context through REST, model calls, PostgreSQL, S3
 MindBridge does not capture authorization headers, request bodies, prompts, memory text, or media in
 telemetry. Response `trace_id` values use `trace_<32-hex W3C trace ID>` so the suffix maps directly
 to the configured backend. Set `OTEL_SDK_DISABLED=true` for an explicit process-level opt-out.
+The first latency slice emits `mindbridge.stage.duration` with a single bounded `stage` dimension
+for capture-to-upload/ACK, first job claim, searchable-memory readiness, Search, first Answer, full
+Answer, and model TTFT. Active upload, Observe ACK, perception, embedding, commit, Answer round, and
+stream completion work remains visible as nested domain spans and `mindbridge.operation.duration`.
+No latency threshold is hard-coded; deployments derive percentiles and SLOs from representative
+traffic.
 
 Agents can start the same production kernel over the official MCP stdio transport. Tool input and
 structured output schemas are generated from the same Pydantic contracts used by REST and Python:
@@ -455,9 +461,10 @@ vllm serve jinaai/jina-embeddings-v5-text-small-retrieval \
 ## Run the memory Worker
 
 The Worker shares the storage, VLM, and Text Small endpoint variables above. It inspects original AV
-once, writes evidence-grounded Event/Entity/Claim graph records atomically, encodes raw evidence with
-the pinned local Jina v5 Omni Small model, and batches Event/Claim text through the OpenAI-compatible
-Text Small endpoint. Set `MINDBRIDGE_JINA_DEVICE` only when automatic device selection is unsuitable:
+once, writes evidence-grounded Event/Entity/Claim graph records atomically, encodes event-aligned raw
+evidence with the pinned local Jina v5 Omni Small model, and batches Event/Claim text through the
+OpenAI-compatible Text Small endpoint. Set `MINDBRIDGE_JINA_DEVICE` only when automatic device
+selection is unsuitable:
 
 ```bash
 export MINDBRIDGE_JINA_DEVICE=cuda

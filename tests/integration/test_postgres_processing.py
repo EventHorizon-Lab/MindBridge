@@ -364,7 +364,14 @@ async def test_processing_commits_provenance_once(
     assert repeated_observation.created is False
     assert repeated_observation.processing_job_id == job_id
     assert perceiver.calls == 1
-    assert embedder.documents == ("https://objects.example.test/media_01.mp4",)
+    assert len(embedder.documents) == 1
+    embedded_evidence = embedder.documents[0]
+    assert isinstance(embedded_evidence, ResolvedEvidence)
+    assert (embedded_evidence.evidence_span.start_ms, embedded_evidence.evidence_span.end_ms) == (
+        500,
+        3_500,
+    )
+    assert embedded_evidence.media_url == "https://objects.example.test/media_01.mp4"
     assert text_embedder.documents == (
         "A person places a red tool beside a blue toolbox.",
         "The red tool is beside the blue toolbox.",

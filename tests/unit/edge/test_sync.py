@@ -40,6 +40,8 @@ from mindbridge.edge import (
     SQLiteObservationOutbox,
     SQLiteRecentMemory,
 )
+from mindbridge.edge import sync as sync_module
+from mindbridge.edge.outbox import EdgeObservationOutboxItem
 
 NOW = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
 
@@ -206,12 +208,34 @@ class CompletedMemoryApi:
         return self.memory
 
 
-async def test_sync_retries_only_metadata_after_media_upload(tmp_path: Path) -> None:
+async def test_sync_retries_only_metadata_after_media_upload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     request, media_file = _capture(tmp_path)
     outbox = SQLiteObservationOutbox(tmp_path / "edge.db", clock=lambda: NOW)
     outbox.enqueue(request, (media_file,))
     api = FailOnceMemoryApi()
     upload_calls: list[str] = []
+    stages: list[tuple[str, float]] = []
+    span_attributes: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        sync_module,
+        "record_stage_duration",
+        lambda stage, duration: stages.append((stage, duration)),
+    )
+    monkeypatch.setattr(sync_module, "set_current_span_attributes", span_attributes.append)
+    milestone_time = [NOW + timedelta(seconds=35)]
+    acknowledge = outbox.acknowledge
+
+    def acknowledge_after_sqlite_commit(
+        item: EdgeObservationOutboxItem,
+        receipt: ObservationReceipt,
+    ) -> None:
+        acknowledge(item, receipt)
+        milestone_time[0] = NOW + timedelta(seconds=45)
+
+    monkeypatch.setattr(outbox, "acknowledge", acknowledge_after_sqlite_commit)
 
     async def upload(_request: ObserveRequest, file: EdgeMediaFile) -> None:
         upload_calls.append(file.media_object_id)
@@ -222,6 +246,7 @@ async def test_sync_retries_only_metadata_after_media_upload(tmp_path: Path) -> 
         cast(AsyncMindBridge, api),
         upload,
         recent_memory=SQLiteRecentMemory(tmp_path / "edge.db", clock=lambda: NOW),
+        clock=lambda: milestone_time[0],
     )
     with pytest.raises(MindBridgeClientError, match="offline"):
         await synchronizer.sync_next()
@@ -237,6 +262,15 @@ async def test_sync_retries_only_metadata_after_media_upload(tmp_path: Path) -> 
     assert receipt.status is ObservationStatus.DUPLICATE
     assert upload_calls == ["media_01"]
     assert outbox.pending_count() == 0
+    assert stages == [
+        ("edge.capture_to_upload_complete", 5.0),
+        ("edge.capture_to_observation_ack", 15.0),
+    ]
+    assert [
+        attributes["mindbridge.outbox.attempt"]
+        for attributes in span_attributes
+        if "mindbridge.outbox.attempt" in attributes
+    ] == [1, 2]
 
 
 async def test_sync_applies_tombstone_before_media_upload(tmp_path: Path) -> None:
@@ -439,7 +473,7 @@ def _capture(tmp_path: Path) -> tuple[ObserveRequest, EdgeMediaFile]:
         media_objects=(media,),
         occurred_at=NOW,
         ended_at=NOW + timedelta(seconds=30),
-        observed_at=NOW + timedelta(seconds=30),
+        observed_at=NOW + timedelta(seconds=31),
         idempotency_key="edge_observation_01",
     )
     return request, EdgeMediaFile(

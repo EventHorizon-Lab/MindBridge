@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from mindbridge.application import recall as recall_module
 from mindbridge.application.kernel import MemoryKernel
 from mindbridge.application.observation_processing import ObservationBatch
 from mindbridge.application.perception import ResolvedEvidence
@@ -923,7 +924,17 @@ async def test_recall_uses_bounded_model_queries_to_reach_missing_evidence() -> 
     assert missing.memory_id in {memory.memory_id for memory in result.memories}
 
 
-async def test_recall_stops_after_two_product_wide_refinement_waves() -> None:
+async def test_recall_stops_after_two_product_wide_refinement_waves(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    span_attributes: list[dict[str, str | int | float | bool]] = []
+    stages: list[tuple[str, float]] = []
+    monkeypatch.setattr(recall_module, "set_current_span_attributes", span_attributes.append)
+    monkeypatch.setattr(
+        recall_module,
+        "record_stage_duration",
+        lambda stage, duration: stages.append((stage, duration)),
+    )
     store = InMemoryStore()
     recall_embedder = RecordingRecallEmbedder()
     answerer = RecordingAnswerer(
@@ -954,6 +965,40 @@ async def test_recall_stops_after_two_product_wide_refinement_waves() -> None:
         "bridge one",
         "final detail",
     ]
+    assert [
+        (attributes["mindbridge.recall.answer.phase"], attributes["mindbridge.recall.answer.round"])
+        for attributes in span_attributes
+        if "mindbridge.recall.answer.phase" in attributes
+    ] == [("initial", 1), ("reflection", 2), ("reflection", 3)]
+    assert [stage for stage, _ in stages] == ["recall.first_answer", "recall.answer_complete"]
+    assert 0 <= stages[0][1] <= stages[1][1]
+
+
+async def test_search_records_complete_latency_without_calling_the_answerer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stages: list[tuple[str, float]] = []
+    monkeypatch.setattr(
+        recall_module,
+        "record_stage_duration",
+        lambda stage, duration: stages.append((stage, duration)),
+    )
+    store = InMemoryStore()
+    answerer = RecordingAnswerer()
+    kernel = _kernel(store, answerer)
+    remembered = await kernel.remember(_remember_request())
+
+    result = await kernel.recall(
+        RecallRequest(
+            tenant_id="tenant_01",
+            query=RecallQuery(text="red screwdriver"),
+            mode=RecallMode.SEARCH,
+        )
+    )
+
+    assert remembered.memory_id in {memory.memory_id for memory in result.memories}
+    assert answerer.calls == 0
+    assert [stage for stage, _ in stages] == ["recall.search"]
 
 
 async def test_recall_switches_query_direction_when_reflection_finds_no_new_candidate() -> None:
@@ -994,7 +1039,11 @@ async def test_recall_switches_query_direction_when_reflection_finds_no_new_cand
     ]
 
 
-async def test_recall_reorders_only_visible_candidates_for_an_explicit_latest_question() -> None:
+async def test_recall_reorders_only_visible_candidates_for_an_explicit_latest_question(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    span_attributes: list[dict[str, str | int | float | bool]] = []
+    monkeypatch.setattr(recall_module, "set_current_span_attributes", span_attributes.append)
     store = InMemoryStore()
     answerer = RecordingAnswerer(
         answers=(
@@ -1050,6 +1099,11 @@ async def test_recall_reorders_only_visible_candidates_for_an_explicit_latest_qu
     assert result.answer == "new event"
     assert [memory.memory_id for memory in result.memories] == [new.memory_id, old.memory_id]
     assert answerer.calls == 2
+    assert [
+        (attributes["mindbridge.recall.answer.phase"], attributes["mindbridge.recall.answer.round"])
+        for attributes in span_attributes
+        if "mindbridge.recall.answer.phase" in attributes
+    ] == [("initial", 1), ("temporal_reorder", 2)]
 
 
 async def test_recall_discards_an_answer_when_the_final_visibility_barrier_removes_it() -> None:

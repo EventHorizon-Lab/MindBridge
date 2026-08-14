@@ -315,11 +315,12 @@ memory-layer 输入，但必须在评测报告中与原始视听复现分开。
 Claim 必须引用 Event 内的 EvidenceSpan，Claim 的有效时间必须落在 Event 内。模型首先引用输入
 source span；应用层随后按 Event 与 source 的时间交集生成稳定、精确的 Event EvidenceSpan，并在
 同一对象图中重写 Event、EntityMention、Claim 与 Memory 引用。完整性校验要求所有派生引用恰好
-等于本批 Event spans，事务会先写这些 spans 再写图，任何越界或冲突都整批回滚。原始媒体只编码
-一次；原始 AV 向量命中时，PostgreSQL 将其映射到同 Observation、同媒体且位于该 source span 内
-的 Event spans，避免复制一个全片向量来冒充多个“精确向量”。Worker 随后用
-Jina Omni Small 编码原始 source EvidenceSpan，用同一兼容空间的 Jina Text Small 批量编码 Event 描述
-和 Claim 陈述，并在一个 PostgreSQL 事务中写入 Event、Entity、EntityMention、Claim、
+等于本批 Event spans，事务会先写这些 spans 再写图，任何越界或冲突都整批回滚。同一媒体和音轨在
+单批内只解码一次，Worker 按每个 Event EvidenceSpan 抽取精确视听窗口；视觉输入保留有效抽帧
+时基、优先裁剪 grounding ROI，并施加经消融验证的每 Event 总像素预算，再用 Jina Omni Small
+分别编码。向量直接归属于对应 Event EvidenceSpan，不用一个全片向量冒充多个“精确向量”。同一
+兼容空间的 Jina Text Small 仍批量编码 Event 描述和 Claim 陈述，并在一个 PostgreSQL 事务中写入
+Event、Entity、EntityMention、Claim、
 MemoryRecord、类型关系、向量和成功 Job 状态。任何模型输出越界、关系悬空、版本冲突或向量错误
 都会回滚整批派生数据。VLM 与后续 Jina 阶段分别获取新的短期签名 URL，禁止跨越长模型调用复用
 可能过期的地址；重试使用稳定 ID 且不会合并不同的证据集合。跨 Event 实体消歧、Episode
@@ -412,6 +413,10 @@ Small endpoint 生成 query 向量，并用同一个 Text Small 服务编码显�
 `post()` 发送，不另写 HTTP 客户端。数据库按 `space_id/space_revision` 检索、按
 `model_id/revision` 保留真实生产者；升级任一编码器都创建新空间并重建，不把未经验证的版本混查。
 API 因此不加载 Jina 权重，模型只存在于 Worker 或独立 serving 进程。
+
+Worker 加载模型时仍使用上述 Hugging Face commit；持久化 Event EvidenceSpan 向量的 producer
+revision 追加 `event-media-v1`，同时版本化抽帧、ROI 裁剪、音频重采样和像素预算。修改其中任一
+预处理语义必须提升该 revision 并重建历史 Event 向量，不能在同一 producer revision 下覆盖。
 
 同一对象、编码器 revision、空间和 task 的向量写入保持幂等。考虑 GPU/F16 serving 对同一文本可能
 产生末位浮点抖动，重放向量的余弦相似度不低于 `0.999999` 时视为同一内容；低于阈值仍作为
@@ -1410,6 +1415,34 @@ ID；无 SDK 的嵌入式调用才生成独立 fallback ID。
 `outcome=success|error|cancelled`，不携带租户、对象 ID、正文或异常内容，既能计算吞吐、错误率和
 P50/P95/P99，也不会制造高基数或隐私泄漏。SLO 阈值由部署的 Collector/监控规则基于真实负载
 配置，不硬编码进业务代码。
+
+第一个延迟观测切片另用 `mindbridge.stage.duration` Histogram 表达跨进程或跨存储边界的成功
+里程碑。它只有一个由代码定义的 `stage` 维度；两个 duration Histogram 都配置了从 10 ms 到
+7 天的显式桶，以覆盖多轮 VLM、队列积压和端侧离线后补传，并让后端估算短请求与长尾请求的
+P50/P95/P99。首版口径如下：
+
+| `stage` | 开始边界 | 完成边界 |
+| --- | --- | --- |
+| `edge.capture_to_upload_complete` | 设备 `ended_at`（segment close） | 一条 observation 的全部媒体上传完成 |
+| `edge.capture_to_observation_ack` | 设备 `ended_at` | 云端 Observe receipt 已返回且本地 Outbox ACK 成功 |
+| `cloud.job_to_first_claim` | PostgreSQL job `created_at` | 首次 claim 的数据库 `updated_at`；重试不重复计入 queue lag |
+| `cloud.job_to_searchable_ready` | PostgreSQL job `created_at` | derived records、embeddings 和 succeeded job 的事务已提交返回 |
+| `recall.search` | Recall 入口 | Search 响应已完整构建 |
+| `recall.first_answer` | Recall 入口 | 首轮 Answer 已生成；不等待时间重排或反思检索 |
+| `recall.answer_complete` | Recall 入口 | 最终 Answer、反思和响应 evidence 已完整构建 |
+| `model.perception.ttft` | perception completion 请求开始 | index 0 的首个非空文本 chunk |
+| `model.answer.ttft` | Answer completion 请求开始 | index 0 的首个非空文本 chunk |
+
+活跃阶段另有 `mindbridge.edge.upload_media`、`mindbridge.edge.observe_ack`、
+`mindbridge.process_observation.embed_evidence`、`mindbridge.process_observation.embed_graph`、
+`mindbridge.process_observation.commit`、`mindbridge.recall.answer_round` 和
+`mindbridge.model.stream_completion` 子 span。Answer round 记录有界的
+`initial|temporal_reorder|reflection` phase 与 round；completion 记录 model、JSON mode、结构化
+attempt、TTFT 和供应商返回的 input/output/total token。perception/Answer 父 span 同时记录结构化
+重试次数，并按去重后的源媒体记录 video/audio 秒数、已知 duration 数量与估算采样帧数；时长汇总
+只计入已知 duration。供应商未返回 usage 时不伪造 token。媒体 ID、URL、Prompt 和正文不进入
+这些性能属性或指标维度。Jina Event embedding span 另记录固定的媒体预处理 revision、实际帧数、
+像素数和音频秒数。
 
 日志同样只记录 ID、耗时、模型版本、token/frame/audio 秒数和错误；默认不写原始人脸、音频
 内容、完整 Prompt 或用户记忆正文。生产导出先进入 OpenTelemetry Collector，再由 Collector

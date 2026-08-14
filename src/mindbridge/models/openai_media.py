@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Collection
 from pathlib import PurePosixPath
 from typing import Literal, TypedDict
 from urllib.parse import urlsplit
 
 from mindbridge.application.perception import ResolvedEvidence
-from mindbridge.core import MediaKind
+from mindbridge.core import MediaKind, MediaObject
 
 
 class UrlValue(TypedDict):
@@ -48,6 +49,30 @@ class AudioUrlPart(TypedDict):
 
 
 OpenAIContentPart = TextPart | ImagePart | VideoPart | AudioPart | AudioUrlPart
+
+
+def media_input_span_attributes(
+    media_objects: Collection[MediaObject],
+    *,
+    video_frames_per_second: float,
+) -> dict[str, int | float]:
+    """Summarize distinct model media inputs without recording IDs, URLs, or content."""
+    if not math.isfinite(video_frames_per_second) or video_frames_per_second <= 0:
+        raise ValueError("video_frames_per_second must be finite and positive")
+    distinct = {item.media_object_id: item for item in media_objects}.values()
+    videos = tuple(item for item in distinct if item.kind is MediaKind.VIDEO)
+    audios = tuple(item for item in distinct if item.kind is MediaKind.AUDIO)
+    video_seconds = sum((item.duration_ms or 0) / 1_000 for item in videos)
+    audio_seconds = sum((item.duration_ms or 0) / 1_000 for item in audios)
+    return {
+        "mindbridge.model.input.media_count": len(distinct),
+        "mindbridge.model.input.duration_known_count": sum(
+            item.duration_ms is not None for item in distinct
+        ),
+        "mindbridge.model.input.video_seconds": video_seconds,
+        "mindbridge.model.input.audio_seconds": audio_seconds,
+        "mindbridge.model.input.estimated_video_frames": (video_seconds * video_frames_per_second),
+    }
 
 
 def evidence_media_content_parts(

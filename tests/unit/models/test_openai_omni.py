@@ -8,7 +8,11 @@ from typing import cast
 import httpx
 import pytest
 from openai import AsyncOpenAI
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
+from mindbridge import telemetry
 from mindbridge.application.perception import ResolvedEvidence
 from mindbridge.application.ports import ResolvedQueryMedia
 from mindbridge.contracts import RecallQuery, RecallRequest
@@ -26,9 +30,28 @@ from mindbridge.core import (
     TenantId,
     VerificationStatus,
 )
+from mindbridge.models import openai_chat
+from mindbridge.models.openai_media import media_input_span_attributes
 from mindbridge.models.openai_omni import OpenAIOmniAnswerer, normalize_openai_base_url
 
 NOW = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
+
+
+def test_media_input_span_attributes_deduplicate_requested_video_work() -> None:
+    video = _resolved_evidence(MediaKind.VIDEO, "clip.mp4", "video", 0).media_object
+
+    attributes = media_input_span_attributes(
+        (video, video),
+        video_frames_per_second=1.5,
+    )
+
+    assert attributes == {
+        "mindbridge.model.input.media_count": 1,
+        "mindbridge.model.input.duration_known_count": 1,
+        "mindbridge.model.input.video_seconds": 10.0,
+        "mindbridge.model.input.audio_seconds": 0,
+        "mindbridge.model.input.estimated_video_frames": 15.0,
+    }
 
 
 async def test_omni_streams_raw_av_and_validates_answer() -> None:
@@ -140,8 +163,16 @@ async def test_omni_returns_bounded_retrieval_queries_when_evidence_is_missing()
     assert answer.retrieval_queries == ("person_device_01 blue toolbox",)
 
 
-async def test_omni_retries_invalid_answer_once_in_json_mode() -> None:
+async def test_omni_retries_invalid_answer_once_in_json_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     calls = 0
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    monkeypatch.setattr(telemetry, "_TRACER", provider.get_tracer("mindbridge-test"))
+    ttft_clock = iter((10.0, 10.125, 20.0, 20.25))
+    monkeypatch.setattr(openai_chat, "perf_counter", lambda: next(ttft_clock))
 
     async def respond(request: httpx.Request) -> httpx.Response:
         nonlocal calls
@@ -156,7 +187,7 @@ async def test_omni_retries_invalid_answer_once_in_json_mode() -> None:
         return httpx.Response(
             200,
             headers={"content-type": "text/event-stream"},
-            content=_completion_stream(content),
+            content=_completion_stream(content, usage=(7, 3)),
         )
 
     answerer = _answerer(respond)
@@ -172,6 +203,26 @@ async def test_omni_retries_invalid_answer_once_in_json_mode() -> None:
 
     assert calls == 2
     assert answer.answer == "blue toolbox"
+    spans = [
+        span
+        for span in exporter.get_finished_spans()
+        if span.name == "mindbridge.model.stream_completion"
+    ]
+    attributes = [span.attributes or {} for span in spans]
+    assert [item["mindbridge.model.structured_attempt"] for item in attributes] == [1, 2]
+    assert [item["mindbridge.model.json_mode"] for item in attributes] == [False, True]
+    assert [item["mindbridge.model.input_tokens"] for item in attributes] == [7, 7]
+    assert [item["mindbridge.model.output_tokens"] for item in attributes] == [3, 3]
+    assert [item["mindbridge.model.ttft_seconds"] for item in attributes] == pytest.approx(
+        [0.125, 0.25]
+    )
+    answer_span = next(
+        span for span in exporter.get_finished_spans() if span.name == "mindbridge.model.answer"
+    )
+    assert (answer_span.attributes or {})["mindbridge.model.structured_retry_count"] == 1
+    assert all(span.parent == answer_span.context for span in spans)
+    assert "not json" not in repr(attributes)
+    provider.shutdown()
 
 
 async def test_omni_accepts_one_provider_added_json_code_fence() -> None:
@@ -485,7 +536,10 @@ def _memory(
     )
 
 
-def _completion_stream(*content_parts: str) -> str:
+def _completion_stream(
+    *content_parts: str,
+    usage: tuple[int, int] | None = None,
+) -> str:
     events = [
         {
             "id": "completion_01",
@@ -511,4 +565,20 @@ def _completion_stream(*content_parts: str) -> str:
             "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
         }
     )
+    if usage is not None:
+        input_tokens, output_tokens = usage
+        events.append(
+            {
+                "id": "completion_01",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "qwen3.8-max",
+                "choices": [],
+                "usage": {
+                    "prompt_tokens": input_tokens,
+                    "completion_tokens": output_tokens,
+                    "total_tokens": input_tokens + output_tokens,
+                },
+            }
+        )
     return "".join(f"data: {json.dumps(event)}\n\n" for event in events) + "data: [DONE]\n\n"

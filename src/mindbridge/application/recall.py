@@ -6,7 +6,8 @@ import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Protocol
+from time import perf_counter
+from typing import Literal, Protocol
 
 from mindbridge.application.enumeration import EnumerateMemories
 from mindbridge.application.evidence import read_resolved_memory_evidence, sign_query_media
@@ -43,7 +44,12 @@ from mindbridge.core import (
     TenantId,
     VerificationStatus,
 )
-from mindbridge.telemetry import current_trace_id, set_current_span_attributes, trace_operation
+from mindbridge.telemetry import (
+    current_trace_id,
+    record_stage_duration,
+    set_current_span_attributes,
+    trace_operation,
+)
 
 RETRIEVAL_DOCUMENT_EMBEDDING_TASK = "retrieval_document"
 _MAXIMUM_RETRIEVAL_REFINEMENTS = 2
@@ -119,6 +125,7 @@ class RecallMemories:
     @trace_operation("mindbridge.recall")
     async def run(self, request: RecallRequest) -> RecallResult:
         """Retrieve memories, inspect evidence, and answer only when supported."""
+        started_at = perf_counter()
         set_current_span_attributes(
             {
                 "mindbridge.tenant.id": request.tenant_id,
@@ -148,8 +155,14 @@ class RecallMemories:
                 request,
                 visible_candidates,
                 query_media,
+                phase="initial",
+                round_number=1,
             )
             retrieval_round_count = 1
+            record_stage_duration(
+                "recall.first_answer",
+                max(0.0, perf_counter() - started_at),
+            )
             temporal_order = generated.temporal_order
             if temporal_order != "relevance":
                 ordered_candidates = order_memory_candidates(visible_candidates, temporal_order)
@@ -161,6 +174,8 @@ class RecallMemories:
                         request,
                         visible_candidates,
                         query_media,
+                        phase="temporal_reorder",
+                        round_number=retrieval_round_count + 1,
                     )
                     retrieval_round_count += 1
             seen_queries = (
@@ -209,6 +224,8 @@ class RecallMemories:
                         request,
                         visible_candidates,
                         query_media,
+                        phase="reflection",
+                        round_number=retrieval_round_count + 1,
                         attempted_retrieval_queries=attempted_queries,
                     )
                     retrieval_round_count += 1
@@ -219,6 +236,8 @@ class RecallMemories:
                     request,
                     visible_candidates,
                     query_media,
+                    phase="reflection",
+                    round_number=retrieval_round_count + 1,
                     attempted_retrieval_queries=attempted_queries,
                 )
                 retrieval_round_count += 1
@@ -246,13 +265,14 @@ class RecallMemories:
                 "mindbridge.recall.evidence_count": len(answer_evidence),
                 "mindbridge.recall.retrieval_query_count": retrieval_query_count,
                 "mindbridge.recall.retrieval_round_count": retrieval_round_count,
+                "mindbridge.recall.answer_round_count": retrieval_round_count,
                 "mindbridge.recall.answered": generated.answer is not None,
             }
         )
         visible_evidence_ids = {
             evidence_id for memory in visible_memories for evidence_id in memory.evidence_ids
         }
-        return RecallResult(
+        result = RecallResult(
             answer=generated.answer,
             confidence=generated.confidence,
             memories=tuple(memory_view(memory) for memory in visible_memories),
@@ -267,15 +287,29 @@ class RecallMemories:
             ),
             trace_id=current_trace_id(),
         )
+        record_stage_duration(
+            ("recall.search" if request.mode is RecallMode.SEARCH else "recall.answer_complete"),
+            max(0.0, perf_counter() - started_at),
+        )
+        return result
 
+    @trace_operation("mindbridge.recall.answer_round")
     async def _answer_candidates(
         self,
         request: RecallRequest,
         candidates: tuple[MemoryRecord, ...],
         query_media: tuple[ResolvedQueryMedia, ...],
         *,
+        phase: Literal["initial", "temporal_reorder", "reflection"],
+        round_number: int,
         attempted_retrieval_queries: tuple[str, ...] = (),
     ) -> tuple[GeneratedAnswer, tuple[ResolvedEvidence, ...]]:
+        set_current_span_attributes(
+            {
+                "mindbridge.recall.answer.phase": phase,
+                "mindbridge.recall.answer.round": round_number,
+            }
+        )
         grounded = self._grounded_memories(candidates)
         evidence = await self._read_evidence(request, grounded) if grounded else ()
         answer_query_media = await sign_query_media(

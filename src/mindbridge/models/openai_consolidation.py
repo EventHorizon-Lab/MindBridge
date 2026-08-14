@@ -201,6 +201,7 @@ class OpenAIOmniEpisodeConsolidator:
                 max_output_tokens=self._max_output_tokens,
                 request_timeout_seconds=self._request_timeout_seconds,
                 json_mode=True,
+                attempt=2,
             )
             output = _parse_output(completion.content)
         candidate_ids = {str(event.event_id) for event in events}
