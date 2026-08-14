@@ -2,6 +2,7 @@
 
 import json
 from pathlib import Path
+from typing import ClassVar
 
 import pytest
 
@@ -9,13 +10,32 @@ from mindbridge.benchmarks import (
     MMLifelongSplit,
     load_egolife_qa,
     load_egomem_reason,
+    load_egotempo,
     load_locomo,
     load_m3_bench,
     load_memlens,
     load_memlens_agent_subset,
     load_mm_lifelong,
     load_supermemory_vqa,
+    load_video_mme,
 )
+
+
+class _FakeArrowTable:
+    def __init__(self, rows: list[dict[str, object]]) -> None:
+        self.rows = rows
+
+    def to_pylist(self) -> list[dict[str, object]]:
+        return self.rows
+
+
+class _FakeParquet:
+    rows: ClassVar[list[dict[str, object]]] = []
+
+    @classmethod
+    def read_table(cls, source: Path) -> _FakeArrowTable:
+        assert source.name == "test.parquet"
+        return _FakeArrowTable(cls.rows)
 
 
 def test_locomo_adapter_orders_sessions_and_normalizes_adversarial_qa(tmp_path: Path) -> None:
@@ -114,6 +134,64 @@ def test_m3_bench_adapter_rejects_empty_annotations(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="must not be empty"):
         load_m3_bench(annotation_path)
+
+
+def test_video_mme_adapter_loads_official_parquet_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    annotation_path = tmp_path / "test.parquet"
+    _FakeParquet.rows = [
+        {
+            "video_id": "001",
+            "duration": "short",
+            "domain": "Knowledge",
+            "sub_category": "Humanity & History",
+            "url": "https://www.youtube.com/watch?v=fFjv93ACGo8",
+            "videoID": "fFjv93ACGo8",
+            "question_id": f"001-{index}",
+            "task_type": "Counting Problem",
+            "question": "Which decoration appears most?",
+            "options": ["A. Apples.", "B. Candles.", "C. Berries.", "D. Equal."],
+            "answer": "C",
+        }
+        for index in range(1, 4)
+    ]
+    monkeypatch.setattr("mindbridge.benchmarks.video_mme.import_module", lambda name: _FakeParquet)
+
+    video = load_video_mme(annotation_path)[0]
+
+    assert video.video_id == "001"
+    assert video.source_video_id == "fFjv93ACGo8"
+    assert len(video.questions) == 3
+    assert video.questions[0].options[2] == "C. Berries."
+
+
+def test_egotempo_adapter_parses_official_clip_boundaries(tmp_path: Path) -> None:
+    annotation_path = tmp_path / "egotempo_openQA.json"
+    annotation_path.write_text(
+        json.dumps(
+            {
+                "info": {"release date": "19.03.2025", "version": "1.0"},
+                "annotations": [
+                    {
+                        "question_id": "video_-0.1_180.0_0",
+                        "clip_id": "video_-0.1_180.0",
+                        "question_type": "action-specific object",
+                        "question": "What did the person pick up?",
+                        "answer": "A spoon.",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    question = load_egotempo(annotation_path)[0]
+
+    assert question.source_video_id == "video"
+    assert question.clip_start_seconds == -0.1
+    assert question.clip_end_seconds == 180.0
+    assert question.reference_answer == "A spoon."
 
 
 def test_egolife_adapter_keeps_queries_but_discards_retrieval_hints(tmp_path: Path) -> None:

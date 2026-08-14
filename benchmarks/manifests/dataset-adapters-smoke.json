@@ -1,5 +1,5 @@
 {
-  "created_at": "2026-08-14T08:00:31.169281Z",
+  "created_at": "2026-08-14T10:23:59.856394Z",
   "datasets": [
     {
       "benchmark": "LoCoMo",
@@ -35,6 +35,17 @@
       "question_count": 3214
     },
     {
+      "benchmark": "Video-MME",
+      "source_repository": "lmms-eval/Video-MME",
+      "source_revision": "ead1408f75b618502df9a1d8e0950166bf0a2a0b",
+      "source_file": "test-00000-of-00001.parquet",
+      "source_sha256": "7fffab8ed38ecc2f9f0eca4c44d8a11636f0ee96116ede83580c8b9ae0faf986",
+      "adapter_version": "video_mme_official_v1",
+      "context_count": 900,
+      "memory_item_count": 900,
+      "question_count": 2700
+    },
+    {
       "benchmark": "EgoLifeQA",
       "source_repository": "lmms-lab/EgoLife",
       "source_revision": "143fb319be7aa5ae210c936bf4f0f3a86092afb0",
@@ -43,6 +54,17 @@
       "adapter_version": "egolife_qa_official_v2",
       "context_count": 1,
       "memory_item_count": 7,
+      "question_count": 500
+    },
+    {
+      "benchmark": "EgoTempo",
+      "source_repository": "google-research-datasets/egotempo",
+      "source_revision": "7022ba77b4d89f51cf34e499767995ccd5c90c7a",
+      "source_file": "egotempo_openQA.json",
+      "source_sha256": "adc9e7d5b1075a46e2648d4e34260b41d26b8c6e339159b3746a3fe7fdf94eaf",
+      "adapter_version": "egotempo_official_v1",
+      "context_count": 222,
+      "memory_item_count": 367,
       "question_count": 500
     },
     {

@@ -13,6 +13,10 @@ from mindbridge.benchmarks.egomem_reason import (
     EGOMEM_REASON_ADAPTER_VERSION,
     load_egomem_reason,
 )
+from mindbridge.benchmarks.egotempo import (
+    EGOTEMPO_ADAPTER_VERSION,
+    load_egotempo,
+)
 from mindbridge.benchmarks.locomo import LOCOMO_ADAPTER_VERSION, load_locomo
 from mindbridge.benchmarks.m3_bench import (
     M3_BENCH_ADAPTER_VERSION,
@@ -30,6 +34,7 @@ from mindbridge.benchmarks.supermemory_vqa import (
     SUPERMEMORY_VQA_ADAPTER_VERSION,
     load_supermemory_vqa,
 )
+from mindbridge.benchmarks.video_mme import VIDEO_MME_ADAPTER_VERSION, load_video_mme
 from mindbridge.contracts import ContractModel, NonEmptyString, Sha256Hex
 from mindbridge.file_integrity import sha256_file
 
@@ -52,7 +57,7 @@ class DatasetAdapterSmokeResult(ContractModel):
     """Machine-readable proof that pinned official annotations still parse."""
 
     created_at: AwareDatetime
-    datasets: tuple[BenchmarkDatasetSummary, ...] = Field(min_length=11)
+    datasets: tuple[BenchmarkDatasetSummary, ...] = Field(min_length=13)
     passed: bool
 
 
@@ -63,8 +68,12 @@ def run_dataset_adapter_smoke(
     m3_robot_path: Path,
     m3_web_path: Path,
     m3_revision: str,
+    video_mme_path: Path,
+    video_mme_revision: str,
     egolife_path: Path,
     egolife_revision: str,
+    egotempo_path: Path,
+    egotempo_revision: str,
     egomem_path: Path,
     egomem_revision: str,
     memlens_path: Path,
@@ -81,7 +90,9 @@ def run_dataset_adapter_smoke(
     locomo = load_locomo(locomo_path)
     m3_robot = load_m3_bench(m3_robot_path)
     m3_web = load_m3_bench(m3_web_path)
+    video_mme = load_video_mme(video_mme_path)
     egolife = load_egolife_qa(egolife_path)
+    egotempo = load_egotempo(egotempo_path)
     egomem = load_egomem_reason(egomem_path)
     memlens = load_memlens(memlens_path)
     mm_day = load_mm_lifelong(mm_day_path, "day_test")
@@ -106,6 +117,17 @@ def run_dataset_adapter_smoke(
             _m3_summary("M3-Bench-robot", m3_robot_path, m3_revision, m3_robot),
             _m3_summary("M3-Bench-web", m3_web_path, m3_revision, m3_web),
             BenchmarkDatasetSummary(
+                benchmark="Video-MME",
+                source_repository="lmms-eval/Video-MME",
+                source_revision=video_mme_revision,
+                source_file=video_mme_path.name,
+                source_sha256=sha256_file(video_mme_path),
+                adapter_version=VIDEO_MME_ADAPTER_VERSION,
+                context_count=len(video_mme),
+                memory_item_count=len(video_mme),
+                question_count=sum(len(video.questions) for video in video_mme),
+            ),
+            BenchmarkDatasetSummary(
                 benchmark="EgoLifeQA",
                 source_repository="lmms-lab/EgoLife",
                 source_revision=egolife_revision,
@@ -115,6 +137,17 @@ def run_dataset_adapter_smoke(
                 context_count=1,
                 memory_item_count=len({question.query_day for question in egolife}),
                 question_count=len(egolife),
+            ),
+            BenchmarkDatasetSummary(
+                benchmark="EgoTempo",
+                source_repository="google-research-datasets/egotempo",
+                source_revision=egotempo_revision,
+                source_file=egotempo_path.name,
+                source_sha256=sha256_file(egotempo_path),
+                adapter_version=EGOTEMPO_ADAPTER_VERSION,
+                context_count=len({question.source_video_id for question in egotempo}),
+                memory_item_count=len({question.clip_id for question in egotempo}),
+                question_count=len(egotempo),
             ),
             BenchmarkDatasetSummary(
                 benchmark="EgoMemReason",
@@ -194,8 +227,12 @@ def main() -> None:
     parser.add_argument("--m3-robot", type=Path, required=True)
     parser.add_argument("--m3-web", type=Path, required=True)
     parser.add_argument("--m3-revision", required=True)
+    parser.add_argument("--video-mme", type=Path, required=True)
+    parser.add_argument("--video-mme-revision", required=True)
     parser.add_argument("--egolife", type=Path, required=True)
     parser.add_argument("--egolife-revision", required=True)
+    parser.add_argument("--egotempo", type=Path, required=True)
+    parser.add_argument("--egotempo-revision", required=True)
     parser.add_argument("--egomem", type=Path, required=True)
     parser.add_argument("--egomem-revision", required=True)
     parser.add_argument("--memlens", type=Path, required=True)
@@ -214,8 +251,12 @@ def main() -> None:
         m3_robot_path=arguments.m3_robot,
         m3_web_path=arguments.m3_web,
         m3_revision=arguments.m3_revision,
+        video_mme_path=arguments.video_mme,
+        video_mme_revision=arguments.video_mme_revision,
         egolife_path=arguments.egolife,
         egolife_revision=arguments.egolife_revision,
+        egotempo_path=arguments.egotempo,
+        egotempo_revision=arguments.egotempo_revision,
         egomem_path=arguments.egomem,
         egomem_revision=arguments.egomem_revision,
         memlens_path=arguments.memlens,

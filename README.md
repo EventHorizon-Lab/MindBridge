@@ -95,20 +95,27 @@ The checked-in result is [benchmarks/manifests/jina-omni-small-smoke.json](bench
 
 ## Benchmark dataset smoke
 
-LoCoMo, M3-Bench, EgoLifeQA, EgoMemReason, MEMLENS, MM-Lifelong, and SuperMemory-VQA are consumed
-through thin adapters over pinned official files. Use Git for code releases and the Hugging Face CLI
-for Hub datasets; MindBridge does not ship another downloader:
+LoCoMo, M3-Bench, Video-MME, EgoLife (EgoLifeQA), EgoTempo, EgoMemReason, MEMLENS, MM-Lifelong,
+and SuperMemory-VQA are consumed through thin adapters over pinned official files. Use Git for code
+releases and the Hugging Face CLI for Hub datasets; MindBridge does not ship another downloader:
 
 ```bash
 git clone https://github.com/snap-research/locomo.git .benchmarks/locomo
 git -C .benchmarks/locomo checkout 3eb6f2c585f5e1699204e3c3bdf7adc5c28cb376
 git clone https://github.com/ByteDance-Seed/m3-agent.git .benchmarks/m3-agent
 git -C .benchmarks/m3-agent checkout 0e3e41939bd8a0b66d756e7b7eb8d5fe9992da5c
+uvx --from huggingface-hub hf download lmms-eval/Video-MME \
+  videomme/test-00000-of-00001.parquet \
+  --repo-type dataset \
+  --revision ead1408f75b618502df9a1d8e0950166bf0a2a0b \
+  --local-dir .benchmarks/video-mme
 uvx --from huggingface-hub hf download lmms-lab/EgoLife \
   EgoLifeQA/EgoLifeQA_A1_JAKE.json \
   --repo-type dataset \
   --revision 143fb319be7aa5ae210c936bf4f0f3a86092afb0 \
   --local-dir .benchmarks/egolife
+git clone https://github.com/google-research-datasets/egotempo.git .benchmarks/egotempo
+git -C .benchmarks/egotempo checkout 7022ba77b4d89f51cf34e499767995ccd5c90c7a
 uvx --from huggingface-hub hf download OSU-AIoT-MLSys-Lab/SuperMemory-VQA \
   data/json/all_qa.json \
   --repo-type dataset \
@@ -130,14 +137,18 @@ uvx --from huggingface-hub hf download MM-Lifelong/MM-Lifelong \
   --revision 248aa82039a574e63a2e524746a7cd8f32330443 \
   --local-dir .benchmarks/mm-lifelong
 
-uv run python -m mindbridge.benchmarks.dataset_smoke \
+uv run --extra benchmarks python -m mindbridge.benchmarks.dataset_smoke \
   --locomo .benchmarks/locomo/data/locomo10.json \
   --locomo-revision 3eb6f2c585f5e1699204e3c3bdf7adc5c28cb376 \
   --m3-robot .benchmarks/m3-agent/data/annotations/robot.json \
   --m3-web .benchmarks/m3-agent/data/annotations/web.json \
   --m3-revision 0e3e41939bd8a0b66d756e7b7eb8d5fe9992da5c \
+  --video-mme .benchmarks/video-mme/videomme/test-00000-of-00001.parquet \
+  --video-mme-revision ead1408f75b618502df9a1d8e0950166bf0a2a0b \
   --egolife .benchmarks/egolife/EgoLifeQA/EgoLifeQA_A1_JAKE.json \
   --egolife-revision 143fb319be7aa5ae210c936bf4f0f3a86092afb0 \
+  --egotempo .benchmarks/egotempo/egotempo_openQA.json \
+  --egotempo-revision 7022ba77b4d89f51cf34e499767995ccd5c90c7a \
   --egomem .benchmarks/egomem-reason/annotations_public.jsonl \
   --egomem-revision 7e581505b9dce0e85193a27ae689ff899d0bc507 \
   --memlens .benchmarks/memlens/dataset_32k.json \
@@ -529,6 +540,90 @@ uv run python -m mindbridge.benchmarks.mm_lifelong_cli \
   --answer-reasoning-effort low \
   --answer-model-revision serving-fingerprint
 ```
+
+### Video-MME and EgoTempo
+
+Both runners use the same prepared-video manifest. `video_id` is the official Video-MME numeric ID
+or the exact EgoTempo `clip_id`; EgoTempo segment times start at zero in the trimmed clip. Split long
+media and subtitles into ordered, non-overlapping segments. A segment may contain addressable media,
+a transcript, or both:
+
+```json
+[
+  {
+    "video_id": "001",
+    "timeline_origin": "2026-08-14T00:00:00Z",
+    "segments": [
+      {
+        "segment_id": "001-0000",
+        "start_seconds": 0,
+        "duration_ms": 30000,
+        "media_objects": [
+          {
+            "media_object_id": "video-mme-001-0000",
+            "kind": "video",
+            "uri": "s3://mindbridge-media/video-mme/001/0000.mp4",
+            "sha256": "<64 hexadecimal characters>",
+            "size_bytes": 12345678,
+            "created_at": "2026-08-14T00:00:00Z",
+            "duration_ms": 30000
+          }
+        ],
+        "transcript": "Optional subtitle text aligned to this segment."
+      }
+    ]
+  }
+]
+```
+
+Video-MME writes the released nested evaluator shape and an answered-only local accuracy matching
+the official parser. Parquet loading is isolated in the `benchmarks` extra:
+
+```bash
+uv run --extra benchmarks python -m mindbridge.benchmarks.video_mme_cli \
+  --dataset .benchmarks/video-mme/videomme/test-00000-of-00001.parquet \
+  --prepared-media .benchmarks/video-mme-prepared.json \
+  --output .benchmarks/results/video-mme.json \
+  --api-base-url http://localhost:8000 \
+  --dataset-revision ead1408f75b618502df9a1d8e0950166bf0a2a0b \
+  --evaluator-revision afd52cfe3dde5b3685e0d4f760c10c756860c758 \
+  --run-id video-mme-001 \
+  --code-revision "$(git rev-parse HEAD)" \
+  --perception-model-revision serving-fingerprint \
+  --answer-reasoning-effort low \
+  --answer-model-revision serving-fingerprint
+```
+
+EgoTempo writes the official `V`, `Q`, `QA`, `A`, `C`, and `M` fields. Run its pinned
+`gemini_eval.ipynb` for the released semantic judge rather than substituting a local metric:
+
+```bash
+uv run python -m mindbridge.benchmarks.egotempo_cli \
+  --dataset .benchmarks/egotempo/egotempo_openQA.json \
+  --prepared-media .benchmarks/egotempo-prepared.json \
+  --output .benchmarks/results/egotempo.json \
+  --api-base-url http://localhost:8000 \
+  --source-revision 7022ba77b4d89f51cf34e499767995ccd5c90c7a \
+  --evaluator-revision 7022ba77b4d89f51cf34e499767995ccd5c90c7a \
+  --run-id egotempo-001 \
+  --code-revision "$(git rev-parse HEAD)" \
+  --perception-model-revision serving-fingerprint \
+  --answer-reasoning-effort low \
+  --answer-model-revision serving-fingerprint
+```
+
+The official notebook reads every `.json` file in its configured `input_dir`. Copy only the
+prediction artifact, not its `.manifest.json` sidecar, into a run-specific directory and point the
+notebook there:
+
+```bash
+mkdir -p .benchmarks/egotempo-judge/egotempo-001
+cp .benchmarks/results/egotempo.json \
+  .benchmarks/egotempo-judge/egotempo-001/
+```
+
+The Ego-Life benchmark remains available through the existing `egolife_cli` and official
+EgoLifeQA schema; no second alias with divergent behavior is maintained.
 
 Every benchmark `run_id` must be unique for that deployment. It is included in the tenant ID and
 sidecar manifest, preventing a rerun from exposing an earlier question to future memories retained

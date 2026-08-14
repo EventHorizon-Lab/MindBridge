@@ -20,6 +20,9 @@ mindbridge-lifecycle = "mindbridge.lifecycle_cli:main"
 mindbridge-mcp = "mindbridge.api.runtime:run_production_mcp"
 
 [project.optional-dependencies]
+benchmarks = [
+    "pyarrow>=18,<26",
+]
 edge = [
     "boto3>=1.40,<2",
     "cryptography>=45,<51",
