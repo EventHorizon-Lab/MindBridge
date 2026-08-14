@@ -8,13 +8,17 @@ from itertools import groupby
 from pathlib import Path
 from typing import cast
 
-from pydantic import AwareDatetime, Field, model_validator
+from pydantic import AwareDatetime, Field, TypeAdapter, model_validator
 
 from mindbridge.benchmarks.egolife_qa import (
     EGOLIFE_QA_ADAPTER_VERSION,
     EgoLifeOption,
     EgoLifeQuestion,
     egolife_timecode_offset_ms,
+)
+from mindbridge.benchmarks.egomem_reason import (
+    EGOMEM_REASON_ADAPTER_VERSION,
+    EgoMemReasonQuestion,
 )
 from mindbridge.benchmarks.runtime import (
     OPTION_LABELS,
@@ -35,6 +39,7 @@ from mindbridge.contracts import (
     RememberRequest,
 )
 from mindbridge.core import MediaKind, MemoryType, SensorKind
+from mindbridge.prompts import EGOMEM_REASON_QUERY_PROMPT
 from mindbridge.sdk import AsyncMindBridge
 
 
@@ -117,9 +122,41 @@ class EgoLifeMetrics(ContractModel):
     accuracy: float = Field(ge=0.0, le=1.0)
 
 
+class EgoMemReasonResult(ContractModel):
+    """One leaderboard prediction plus MindBridge retrieval diagnostics."""
+
+    example_id: int = Field(gt=0)
+    question_id: Identifier
+    predicted_answer: NonEmptyString
+    model_answer: str
+    mindbridge_confidence: float = Field(ge=0.0, le=1.0)
+    mindbridge_memory_ids: tuple[Identifier, ...]
+    mindbridge_evidence_ids: tuple[Identifier, ...]
+    mindbridge_trace_id: Identifier
+
+
 def load_prepared_egolife(path: Path) -> EgoLifePreparedStream:
     """Load already uploaded media metadata without owning download or storage."""
     return EgoLifePreparedStream.model_validate_json(path.read_bytes())
+
+
+def load_prepared_egomem(path: Path) -> tuple[EgoLifePreparedStream, ...]:
+    """Load one prepared EgoLife stream per EgoMemReason identity."""
+    streams = TypeAdapter(tuple[EgoLifePreparedStream, ...]).validate_json(path.read_bytes())
+    if not streams:
+        raise ValueError("EgoMemReason prepared media manifest must not be empty")
+    subject_ids = tuple(stream.subject_id for stream in streams)
+    if len(set(subject_ids)) != len(subject_ids):
+        raise ValueError("EgoMemReason prepared media contains duplicate subject IDs")
+    media_ids = tuple(
+        clip.media_object.media_object_id
+        for stream in streams
+        for clip in stream.clips
+        if clip.media_object is not None
+    )
+    if len(set(media_ids)) != len(media_ids):
+        raise ValueError("EgoMemReason media_object_ids must be globally unique")
+    return streams
 
 
 def evaluate_egolife_qa(results: tuple[EgoLifeQuestionResult, ...]) -> EgoLifeMetrics:
@@ -178,6 +215,7 @@ async def run_egolife_qa(
                     prepared,
                     clip,
                     next_clip,
+                    adapter_version=EGOLIFE_QA_ADAPTER_VERSION,
                     poll_interval_seconds=poll_interval_seconds,
                     processing_timeout_seconds=processing_timeout_seconds,
                     semaphore=semaphore,
@@ -196,6 +234,78 @@ async def run_egolife_qa(
     return tuple(answers[question.question_id] for question in questions)
 
 
+async def run_egomem_reason(
+    memory: AsyncMindBridge,
+    questions: tuple[EgoMemReasonQuestion, ...],
+    prepared: EgoLifePreparedStream,
+    *,
+    run_id: str,
+    tenant_prefix: str = "benchmark_egomem",
+    device_id: str = "egolife_camera",
+    recall_limit: int = 20,
+    request_concurrency: int = 4,
+    poll_interval_seconds: float = 1.0,
+    processing_timeout_seconds: float = 1_800.0,
+) -> tuple[EgoMemReasonResult, ...]:
+    """Answer one wearer's questions without ingesting clips beyond each query time."""
+    if not questions:
+        raise ValueError("EgoMemReason questions must not be empty")
+    if {question.identity for question in questions} != {prepared.subject_id}:
+        raise ValueError("EgoMemReason questions and prepared subject must match")
+    if len({question.example_id for question in questions}) != len(questions):
+        raise ValueError("EgoMemReason questions must have unique example IDs")
+    if not 1 <= recall_limit <= 100 or request_concurrency <= 0:
+        raise ValueError(
+            "recall_limit must be between 1 and 100; request_concurrency must be positive"
+        )
+    if poll_interval_seconds <= 0 or processing_timeout_seconds <= 0:
+        raise ValueError("poll interval and processing timeout must be positive")
+
+    tenant_id = benchmark_tenant_id(tenant_prefix, prepared.subject_id, run_id)
+    ordered = sorted(questions, key=lambda question: question.query_offset_ms)
+    answers: dict[int, EgoMemReasonResult] = {}
+    next_clip = 0
+    semaphore = asyncio.Semaphore(request_concurrency)
+    for query_offset_ms, group in groupby(ordered, key=lambda question: question.query_offset_ms):
+        due_clips = []
+        while next_clip < len(prepared.clips):
+            clip = prepared.clips[next_clip]
+            if _clip_end_ms(clip) > query_offset_ms:
+                break
+            due_clips.append(
+                _ingest_clip(
+                    memory,
+                    tenant_id,
+                    device_id,
+                    prepared,
+                    clip,
+                    next_clip,
+                    adapter_version=EGOMEM_REASON_ADAPTER_VERSION,
+                    poll_interval_seconds=poll_interval_seconds,
+                    processing_timeout_seconds=processing_timeout_seconds,
+                    semaphore=semaphore,
+                )
+            )
+            next_clip += 1
+        await asyncio.gather(*due_clips)
+        cutoff = prepared.timeline_origin + timedelta(milliseconds=query_offset_ms)
+        results = await asyncio.gather(
+            *(
+                _answer_egomem_question(
+                    memory,
+                    tenant_id,
+                    question,
+                    cutoff,
+                    recall_limit,
+                    semaphore,
+                )
+                for question in group
+            )
+        )
+        answers.update((result.example_id, result) for result in results)
+    return tuple(answers[question.example_id] for question in questions)
+
+
 async def _ingest_clip(
     memory: AsyncMindBridge,
     tenant_id: str,
@@ -204,6 +314,7 @@ async def _ingest_clip(
     clip: EgoLifePreparedClip,
     sequence: int,
     *,
+    adapter_version: str,
     poll_interval_seconds: float,
     processing_timeout_seconds: float,
     semaphore: asyncio.Semaphore,
@@ -218,16 +329,14 @@ async def _ingest_clip(
                 ObserveRequest(
                     tenant_id=tenant_id,
                     device_id=device_id,
-                    boot_id=EGOLIFE_QA_ADAPTER_VERSION,
+                    boot_id=adapter_version,
                     sequence=sequence,
                     sensor=SensorKind.CAMERA,
                     media_objects=(clip.media_object,),
                     occurred_at=occurred_at,
                     ended_at=ended_at,
                     observed_at=ended_at,
-                    idempotency_key=(
-                        f"{EGOLIFE_QA_ADAPTER_VERSION}:{prepared.subject_id}:{source_key}:media"
-                    ),
+                    idempotency_key=(f"{adapter_version}:{prepared.subject_id}:{source_key}:media"),
                 )
             )
             evidence_ids = receipt.evidence_ids
@@ -249,8 +358,7 @@ async def _ingest_clip(
                         ended_at=ended_at,
                         evidence_ids=evidence_ids,
                         idempotency_key=(
-                            f"{EGOLIFE_QA_ADAPTER_VERSION}:{prepared.subject_id}:"
-                            f"{source_key}:{suffix}"
+                            f"{adapter_version}:{prepared.subject_id}:{source_key}:{suffix}"
                         ),
                     )
                 )
@@ -290,6 +398,51 @@ async def _answer_question(
         mindbridge_memory_ids=tuple(item.memory_id for item in result.memories),
         mindbridge_evidence_ids=tuple(item.evidence_id for item in result.evidence),
         mindbridge_trace_id=result.trace_id,
+    )
+
+
+async def _answer_egomem_question(
+    memory: AsyncMindBridge,
+    tenant_id: str,
+    question: EgoMemReasonQuestion,
+    cutoff: AwareDatetime,
+    recall_limit: int,
+    semaphore: asyncio.Semaphore,
+) -> EgoMemReasonResult:
+    async with semaphore:
+        result = await memory.recall(
+            RecallRequest(
+                tenant_id=tenant_id,
+                query=RecallQuery(text=_egomem_question_query(question)),
+                filters=RecallFilters(occurred_before=cutoff),
+                limit=recall_limit,
+            )
+        )
+    ranking = parse_option_ranking(result.answer, question.choices)
+    if not ranking:
+        raise ValueError(
+            f"EgoMemReason question {question.example_id} did not produce a valid option label"
+        )
+    return EgoMemReasonResult(
+        example_id=question.example_id,
+        question_id=question.question_id,
+        predicted_answer=OPTION_LABELS[ranking[0]],
+        model_answer=result.answer or "",
+        mindbridge_confidence=result.confidence,
+        mindbridge_memory_ids=tuple(item.memory_id for item in result.memories),
+        mindbridge_evidence_ids=tuple(item.evidence_id for item in result.evidence),
+        mindbridge_trace_id=result.trace_id,
+    )
+
+
+def _egomem_question_query(question: EgoMemReasonQuestion) -> str:
+    return EGOMEM_REASON_QUERY_PROMPT.text.format(
+        query_time=question.query_time,
+        question_with_options=multiple_choice_query(
+            question.question,
+            question.choices,
+            rank_all=False,
+        ),
     )
 
 

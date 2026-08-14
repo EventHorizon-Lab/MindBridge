@@ -35,6 +35,12 @@ def test_dataset_adapter_manifest_matches_current_schema() -> None:
         "M3-Bench-robot": 1_276,
         "M3-Bench-web": 3_214,
         "EgoLifeQA": 500,
+        "EgoMemReason": 500,
+        "MEMLENS-32K": 789,
+        "MM-Lifelong-day-test": 200,
+        "MM-Lifelong-week-test": 200,
+        "MM-Lifelong-month-train": 266,
+        "MM-Lifelong-month-val": 623,
         "SuperMemory-VQA": 4_853,
     }
 

@@ -11,7 +11,7 @@ from mindbridge.contracts import Identifier, NonEmptyString, ObservationProcessi
 from mindbridge.core import JobState
 from mindbridge.sdk import AsyncMindBridge
 
-OPTION_LABELS = ("A", "B", "C", "D")
+OPTION_LABELS = tuple("ABCDEFGHIJ")
 _ALLOWED_RESPONSE_WORDS = re.compile(
     r"\b(?:answer|best|choice|choices|from|is|option|options|order|rank|ranking|to|worst)\b",
     re.IGNORECASE,
@@ -63,13 +63,12 @@ def multiple_choice_query(
     rank_all: bool,
 ) -> str:
     """Format choices without exposing evaluation labels or evidence hints."""
-    if len(choices) != len(OPTION_LABELS):
-        raise ValueError("multiple-choice query requires exactly four choices")
-    options = "\n".join(
-        f"{label}. {choice}" for label, choice in zip(OPTION_LABELS, choices, strict=True)
-    )
+    if not 2 <= len(choices) <= len(OPTION_LABELS):
+        raise ValueError("multiple-choice query requires between two and ten choices")
+    labels = OPTION_LABELS[: len(choices)]
+    options = "\n".join(f"{label}. {choice}" for label, choice in zip(labels, choices, strict=True))
     instruction = (
-        "Return only all four option labels from best to worst, separated by commas."
+        f"Return only all {len(choices)} option labels from best to worst, separated by commas."
         if rank_all
         else "Return only the single best option label."
     )
@@ -81,6 +80,8 @@ def parse_option_ranking(
     choices: tuple[NonEmptyString, ...],
 ) -> tuple[int, ...]:
     """Parse a constrained model response, refusing ambiguous prose."""
+    if not 2 <= len(choices) <= len(OPTION_LABELS):
+        raise ValueError("multiple-choice response requires between two and ten choices")
     if answer is None:
         return ()
     normalized = " ".join(answer.split()).casefold()
@@ -92,11 +93,13 @@ def parse_option_ranking(
     if len(exact_matches) == 1:
         return exact_matches
 
-    labels = re.findall(r"\b[A-D]\b", answer.upper())
+    option_labels = OPTION_LABELS[: len(choices)]
+    label_pattern = f"[A-{option_labels[-1]}]"
+    labels = re.findall(rf"\b{label_pattern}\b", answer.upper())
     if not labels or len(set(labels)) != len(labels):
         return ()
-    residual = re.sub(r"\b[A-D]\b", "", answer, flags=re.IGNORECASE)
+    residual = re.sub(rf"\b{label_pattern}\b", "", answer, flags=re.IGNORECASE)
     residual = _ALLOWED_RESPONSE_WORDS.sub("", residual)
     if re.search(r"[A-Za-z0-9]", residual):
         return ()
-    return tuple(OPTION_LABELS.index(label) for label in labels)
+    return tuple(option_labels.index(label) for label in labels)

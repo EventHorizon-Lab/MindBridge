@@ -95,9 +95,9 @@ The checked-in result is [benchmarks/manifests/jina-omni-small-smoke.json](bench
 
 ## Benchmark dataset smoke
 
-LoCoMo, M3-Bench, EgoLifeQA, and SuperMemory-VQA are consumed through thin adapters over pinned
-official files. Use Git for code releases and the Hugging Face CLI for Hub datasets; MindBridge does
-not ship another downloader:
+LoCoMo, M3-Bench, EgoLifeQA, EgoMemReason, MEMLENS, MM-Lifelong, and SuperMemory-VQA are consumed
+through thin adapters over pinned official files. Use Git for code releases and the Hugging Face CLI
+for Hub datasets; MindBridge does not ship another downloader:
 
 ```bash
 git clone https://github.com/snap-research/locomo.git .benchmarks/locomo
@@ -114,6 +114,21 @@ uvx --from huggingface-hub hf download OSU-AIoT-MLSys-Lab/SuperMemory-VQA \
   --repo-type dataset \
   --revision 1d228e0f10049a8a84c458dded2aa25b1e21ce8f \
   --local-dir .benchmarks/supermemory-vqa
+uvx --from huggingface-hub hf download Ted412/EgoMemReason \
+  annotations_public.jsonl \
+  --repo-type dataset \
+  --revision 7e581505b9dce0e85193a27ae689ff899d0bc507 \
+  --local-dir .benchmarks/egomem-reason
+uvx --from huggingface-hub hf download xiyuRenBill/MEMLENS \
+  dataset_32k.json agent_subset_195.json \
+  --repo-type dataset \
+  --revision afa101a1907cc37db40b50d649547964387b96b7 \
+  --local-dir .benchmarks/memlens
+uvx --from huggingface-hub hf download MM-Lifelong/MM-Lifelong \
+  day/test.json week/test.json month/train.json month/val.json \
+  --repo-type dataset \
+  --revision 248aa82039a574e63a2e524746a7cd8f32330443 \
+  --local-dir .benchmarks/mm-lifelong
 
 uv run python -m mindbridge.benchmarks.dataset_smoke \
   --locomo .benchmarks/locomo/data/locomo10.json \
@@ -123,6 +138,15 @@ uv run python -m mindbridge.benchmarks.dataset_smoke \
   --m3-revision 0e3e41939bd8a0b66d756e7b7eb8d5fe9992da5c \
   --egolife .benchmarks/egolife/EgoLifeQA/EgoLifeQA_A1_JAKE.json \
   --egolife-revision 143fb319be7aa5ae210c936bf4f0f3a86092afb0 \
+  --egomem .benchmarks/egomem-reason/annotations_public.jsonl \
+  --egomem-revision 7e581505b9dce0e85193a27ae689ff899d0bc507 \
+  --memlens .benchmarks/memlens/dataset_32k.json \
+  --memlens-revision afa101a1907cc37db40b50d649547964387b96b7 \
+  --mm-day .benchmarks/mm-lifelong/day/test.json \
+  --mm-week .benchmarks/mm-lifelong/week/test.json \
+  --mm-month-train .benchmarks/mm-lifelong/month/train.json \
+  --mm-month-val .benchmarks/mm-lifelong/month/val.json \
+  --mm-lifelong-revision 248aa82039a574e63a2e524746a7cd8f32330443 \
   --supermemory .benchmarks/supermemory-vqa/data/json/all_qa.json \
   --supermemory-revision 1d228e0f10049a8a84c458dded2aa25b1e21ce8f
 ```
@@ -385,6 +409,124 @@ uv run python -m mindbridge.benchmarks.supermemory_cli \
   --perception-model-revision serving-fingerprint \
   --answer-reasoning-effort low \
   --request-timeout-seconds 1800 \
+  --answer-model-revision serving-fingerprint
+```
+
+EgoMemReason reuses the same causal EgoLife clip contract shown above. Its prepared-media file is a
+JSON array containing one `EgoLifePreparedStream` object for each selected identity. The runner
+withholds clips that cross each official `query_time`, supports the released A-J option range, and
+writes the exact answer-key-free leaderboard submission shape:
+
+```bash
+uv run python -m mindbridge.benchmarks.egomem_cli \
+  --dataset .benchmarks/egomem-reason/annotations_public.jsonl \
+  --prepared-media .benchmarks/egomem-prepared.json \
+  --output .benchmarks/results/egomem-submission.json \
+  --api-base-url http://localhost:8000 \
+  --dataset-revision 7e581505b9dce0e85193a27ae689ff899d0bc507 \
+  --evaluator-revision 2ea98f7002bfad785532b186964cd779b6cd0ed6 \
+  --run-id egomem-001 \
+  --code-revision "$(git rev-parse HEAD)" \
+  --perception-model-revision serving-fingerprint \
+  --answer-reasoning-effort low \
+  --answer-model-revision serving-fingerprint
+```
+
+MEMLENS follows the official memory-agent protocol: every question gets a fresh tenant, sessions
+are consumed in release order, and the question date is supplied only at answer time. Download
+`release_images.tar.gz` from the same pinned dataset revision for multimodal runs, upload the
+extracted images with the standard storage tooling, and map official relative paths to immutable
+image objects:
+
+```json
+{
+  "images": [
+    {
+      "source_file": "needle_images/2658faf8f6e6.jpg",
+      "media_object": {
+        "media_object_id": "memlens_2658faf8f6e6",
+        "kind": "image",
+        "uri": "s3://mindbridge-media/memlens/2658faf8f6e6.jpg",
+        "sha256": "<64 hexadecimal characters>",
+        "size_bytes": 123456,
+        "created_at": "2026-08-14T00:00:00Z"
+      }
+    }
+  ]
+}
+```
+
+Use `--agent-subset-index` for the canonical 195-question memory-agent comparison. The output
+contains the official judge fields under `data` and can be passed directly to the pinned
+`xrenaf/MEMLENS` `llm_judge.py`:
+
+```bash
+uv run python -m mindbridge.benchmarks.memlens_cli \
+  --dataset .benchmarks/memlens/dataset_32k.json \
+  --prepared-images .benchmarks/memlens-prepared-images.json \
+  --agent-subset-index .benchmarks/memlens/agent_subset_195.json \
+  --output .benchmarks/results/memlens-32k.json \
+  --api-base-url http://localhost:8000 \
+  --context-window 32k \
+  --dataset-revision afa101a1907cc37db40b50d649547964387b96b7 \
+  --evaluator-revision 77f3ab9a52fa2d6a17978e2dffe80438a4ecced2 \
+  --run-id memlens-32k-001 \
+  --code-revision "$(git rev-parse HEAD)" \
+  --perception-model-revision serving-fingerprint \
+  --answer-reasoning-effort low \
+  --answer-model-revision serving-fingerprint
+```
+
+For the official text-only ablation, add `--text-only` and omit both `--prepared-images` and
+`--perception-model-revision`; image placeholders remain `[image]` and no generated image caption
+is injected.
+
+MM-Lifelong prepared segments use the split-wide clock of the official `total_intervals` field.
+`start_seconds` must therefore be a global Day, Week, or Month offset, not a source-video-local
+timestamp. A segment can carry raw audio/video, a pinned caption, or both:
+
+```json
+{
+  "split": "month_val",
+  "timeline_origin": "2000-01-01T00:00:00Z",
+  "segments": [
+    {
+      "segment_id": "video_14_00000",
+      "start_seconds": 0,
+      "duration_ms": 30000,
+      "media_objects": [
+        {
+          "media_object_id": "mm_lifelong_14_00000",
+          "kind": "video",
+          "uri": "s3://mindbridge-media/mm-lifelong/14/00000.mp4",
+          "sha256": "<64 hexadecimal characters>",
+          "size_bytes": 12345678,
+          "created_at": "2026-08-14T00:00:00Z",
+          "duration_ms": 30000
+        }
+      ],
+      "caption": "The streamer enters the station."
+    }
+  ]
+}
+```
+
+The JSONL retains `question`, `answer`, and `pred.answer` for the released accuracy judge, adds
+`pred.intervals`, and records the official Ref@300 bucket Jaccard score per question and in the
+manifest:
+
+```bash
+uv run python -m mindbridge.benchmarks.mm_lifelong_cli \
+  --dataset .benchmarks/mm-lifelong/month/val.json \
+  --prepared-media .benchmarks/mm-lifelong-month-val-prepared.json \
+  --output .benchmarks/results/mm-lifelong-month-val.jsonl \
+  --api-base-url http://localhost:8000 \
+  --split month_val \
+  --source-revision 248aa82039a574e63a2e524746a7cd8f32330443 \
+  --run-id mm-lifelong-month-val-001 \
+  --code-revision "$(git rev-parse HEAD)" \
+  --perception-model-revision serving-fingerprint \
+  --answer-reasoning-effort low \
   --answer-model-revision serving-fingerprint
 ```
 
