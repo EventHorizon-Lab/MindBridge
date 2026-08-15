@@ -2,7 +2,7 @@
 
 import asyncio
 from collections.abc import Callable
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -21,7 +21,6 @@ from mindbridge.application.ports import (
     PresignedMediaDownload,
     ResolvedQueryMedia,
 )
-from mindbridge.application.recall import RecallEmbeddingQuery
 from mindbridge.contracts import (
     FeedbackRequest,
     IdentityObservationInput,
@@ -69,6 +68,17 @@ from mindbridge.core import (
     TenantId,
     VerificationStatus,
     apply_memory_feedback,
+)
+from mindbridge.models import (
+    Embedding,
+    EmbedRequest,
+    EmbedResult,
+    EmbedTask,
+    MediaPart,
+    Reranker,
+    RerankRequest,
+    RerankResult,
+    TextPart,
 )
 
 NOW = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
@@ -553,29 +563,82 @@ class RecordingAnswerer:
             self.active_occurrence_calls -= 1
 
 
-class RecordingRecallEmbedder:
-    """Returns one valid vector while retaining the fused multimodal query."""
+@dataclass(frozen=True, slots=True)
+class _RecordedMedia:
+    media_url: str
+    kind: MediaKind
+
+
+@dataclass(frozen=True, slots=True)
+class _RecordedQuery:
+    text: str | None
+    media: tuple[_RecordedMedia, ...]
+
+
+class RecordingEmbedder:
+    """Returns valid vectors while retaining query and document inputs."""
 
     query_model_reference = ModelReference(model_id="jina-omni", revision="pinned-revision")
     document_model_reference = ModelReference(model_id="jina-text", revision="pinned-revision")
     space_reference = EmbeddingSpaceReference(space_id="jina-v5", revision="space-v1")
-    dimension = 1_024
 
     def __init__(self, *, memory_document_failures: int = 0) -> None:
-        self.queries: list[RecallEmbeddingQuery] = []
+        self.queries: list[_RecordedQuery] = []
         self.memory_documents: list[str] = []
         self.memory_document_failures = memory_document_failures
 
-    async def encode_query(self, query: RecallEmbeddingQuery) -> tuple[float, ...]:
-        self.queries.append(query)
-        return (1.0,) + (0.0,) * 1_023
+    async def embed(self, request: EmbedRequest) -> EmbedResult:
+        if request.task is EmbedTask.QUERY:
+            for input_value in request.inputs:
+                self.queries.append(
+                    _RecordedQuery(
+                        text=next(
+                            (part.text for part in input_value.parts if isinstance(part, TextPart)),
+                            None,
+                        ),
+                        media=tuple(
+                            _RecordedMedia(part.url, part.kind)
+                            for part in input_value.parts
+                            if isinstance(part, MediaPart)
+                        ),
+                    )
+                )
+            model_reference = self.query_model_reference
+        else:
+            self.memory_documents.extend(
+                part.text
+                for input_value in request.inputs
+                for part in input_value.parts
+                if isinstance(part, TextPart)
+            )
+            if self.memory_document_failures:
+                self.memory_document_failures -= 1
+                raise ModelUnavailableError("temporary embedding failure")
+            model_reference = self.document_model_reference
+        return EmbedResult(
+            tuple(
+                Embedding(
+                    (1.0,) + (0.0,) * 1_023,
+                    model_reference,
+                    self.space_reference,
+                )
+                for _ in request.inputs
+            )
+        )
 
-    async def encode_memory_document(self, text: str) -> tuple[float, ...]:
-        self.memory_documents.append(text)
-        if self.memory_document_failures:
-            self.memory_document_failures -= 1
-            raise ModelUnavailableError("temporary embedding failure")
-        return (1.0,) + (0.0,) * 1_023
+
+class RecordingReranker:
+    def __init__(self, result_ids: tuple[str, ...] | None = None) -> None:
+        self.result_ids = result_ids
+        self.requests: list[RerankRequest] = []
+
+    async def rerank(self, request: RerankRequest) -> RerankResult:
+        self.requests.append(request)
+        return RerankResult(
+            self.result_ids
+            if self.result_ids is not None
+            else tuple(reversed([item.candidate_id for item in request.candidates]))
+        )
 
 
 class RecordingObservationJobPublisher:
@@ -669,8 +732,8 @@ async def test_get_memory_is_tenant_scoped() -> None:
 
 async def test_feedback_strengthens_and_correction_supersedes_without_model_training() -> None:
     store = InMemoryStore()
-    embedder = RecordingRecallEmbedder()
-    kernel = _kernel(store, RecordingAnswerer(), recall_embedder=embedder)
+    embedder = RecordingEmbedder()
+    kernel = _kernel(store, RecordingAnswerer(), embedder=embedder)
     original = await kernel.remember(_remember_request(idempotency_key="original"))
 
     useful = await kernel.record_feedback(
@@ -785,13 +848,13 @@ async def test_observe_remember_recall_returns_openable_evidence() -> None:
 async def test_remember_retry_returns_original_record() -> None:
     """A retry cannot replace the system creation time of an existing memory."""
     store = InMemoryStore()
-    embedder = RecordingRecallEmbedder()
+    embedder = RecordingEmbedder()
     request = _remember_request(idempotency_key="remember-01")
-    first_kernel = _kernel(store, RecordingAnswerer(), recall_embedder=embedder)
+    first_kernel = _kernel(store, RecordingAnswerer(), embedder=embedder)
     later_kernel = _kernel(
         store,
         RecordingAnswerer(),
-        recall_embedder=embedder,
+        embedder=embedder,
         clock=lambda: NOW + timedelta(minutes=5),
     )
 
@@ -800,24 +863,24 @@ async def test_remember_retry_returns_original_record() -> None:
 
     assert retry.memory_id == first.memory_id
     assert retry.created_at == NOW
-    assert embedder.memory_documents == [request.summary]
+    assert embedder.memory_documents == [request.summary, request.summary]
 
 
 async def test_remember_indexes_one_pinned_memory_document() -> None:
     store = InMemoryStore()
-    recall_embedder = RecordingRecallEmbedder()
+    embedder = RecordingEmbedder()
     memory = await _kernel(
         store,
         RecordingAnswerer(),
-        recall_embedder=recall_embedder,
+        embedder=embedder,
     ).remember(_remember_request(idempotency_key="remember-index-01"))
 
     embedding = next(iter(store.embeddings.values()))
-    assert recall_embedder.memory_documents == [memory.summary]
+    assert embedder.memory_documents == [memory.summary]
     assert embedding.object_type is EmbeddedObjectType.MEMORY_RECORD
     assert embedding.object_id == memory.memory_id
-    assert embedding.model_reference == recall_embedder.document_model_reference
-    assert embedding.space_reference == recall_embedder.space_reference
+    assert embedding.model_reference == embedder.document_model_reference
+    assert embedding.space_reference == embedder.space_reference
     assert embedding.task == "retrieval_document"
     assert embedding.dimension == 1_024
     assert embedding.normalized is True
@@ -826,8 +889,8 @@ async def test_remember_indexes_one_pinned_memory_document() -> None:
 
 async def test_remember_retry_repairs_embedding_after_model_failure() -> None:
     store = InMemoryStore()
-    recall_embedder = RecordingRecallEmbedder(memory_document_failures=1)
-    kernel = _kernel(store, RecordingAnswerer(), recall_embedder=recall_embedder)
+    embedder = RecordingEmbedder(memory_document_failures=1)
+    kernel = _kernel(store, RecordingAnswerer(), embedder=embedder)
     request = _remember_request(idempotency_key="remember-repair-01")
 
     with pytest.raises(ModelUnavailableError, match="temporary embedding failure"):
@@ -884,7 +947,7 @@ async def test_recall_without_candidates_uses_bounded_reflection_and_abstains() 
 
 async def test_recall_uses_bounded_model_queries_to_reach_missing_evidence() -> None:
     store = InMemoryStore()
-    recall_embedder = RecordingRecallEmbedder()
+    embedder = RecordingEmbedder()
     answerer = RecordingAnswerer(
         answers=(
             GeneratedAnswer(
@@ -895,7 +958,7 @@ async def test_recall_uses_bounded_model_queries_to_reach_missing_evidence() -> 
             GeneratedAnswer(answer="Beside the blue toolbox.", confidence=0.91),
         )
     )
-    kernel = _kernel(store, answerer, recall_embedder=recall_embedder)
+    kernel = _kernel(store, answerer, embedder=embedder)
     await kernel.remember(
         _remember_request(idempotency_key="initial").model_copy(
             update={"summary": "Where did person_device_01 put the red screwdriver?"}
@@ -916,7 +979,7 @@ async def test_recall_uses_bounded_model_queries_to_reach_missing_evidence() -> 
 
     assert result.answer == "Beside the blue toolbox."
     assert answerer.calls == 2
-    assert [query.text for query in recall_embedder.queries] == [
+    assert [query.text for query in embedder.queries] == [
         "Where did person_device_01 put the red screwdriver?",
         "person_device_01 blue toolbox",
     ]
@@ -925,7 +988,7 @@ async def test_recall_uses_bounded_model_queries_to_reach_missing_evidence() -> 
 
 async def test_recall_stops_after_two_product_wide_refinement_waves() -> None:
     store = InMemoryStore()
-    recall_embedder = RecordingRecallEmbedder()
+    embedder = RecordingEmbedder()
     answerer = RecordingAnswerer(
         answers=(
             GeneratedAnswer(answer=None, confidence=0.0, retrieval_queries=("bridge one",)),
@@ -933,7 +996,7 @@ async def test_recall_stops_after_two_product_wide_refinement_waves() -> None:
             GeneratedAnswer(answer="Grounded final answer.", confidence=0.9),
         )
     )
-    kernel = _kernel(store, answerer, recall_embedder=recall_embedder)
+    kernel = _kernel(store, answerer, embedder=embedder)
     for key, summary in (
         ("initial", "start question"),
         ("bridge", "bridge one"),
@@ -949,7 +1012,7 @@ async def test_recall_stops_after_two_product_wide_refinement_waves() -> None:
 
     assert result.answer == "Grounded final answer."
     assert answerer.calls == 3
-    assert [query.text for query in recall_embedder.queries] == [
+    assert [query.text for query in embedder.queries] == [
         "start question",
         "bridge one",
         "final detail",
@@ -958,7 +1021,7 @@ async def test_recall_stops_after_two_product_wide_refinement_waves() -> None:
 
 async def test_recall_switches_query_direction_when_reflection_finds_no_new_candidate() -> None:
     store = InMemoryStore()
-    recall_embedder = RecordingRecallEmbedder()
+    embedder = RecordingEmbedder()
     answerer = RecordingAnswerer(
         answers=(
             GeneratedAnswer(
@@ -974,7 +1037,7 @@ async def test_recall_switches_query_direction_when_reflection_finds_no_new_cand
             GeneratedAnswer(answer="Beside the toolbox.", confidence=0.7),
         )
     )
-    kernel = _kernel(store, answerer, recall_embedder=recall_embedder)
+    kernel = _kernel(store, answerer, embedder=embedder)
     await kernel.remember(_remember_request())
 
     result = await kernel.recall(
@@ -987,7 +1050,7 @@ async def test_recall_switches_query_direction_when_reflection_finds_no_new_cand
         "red screwdriver exact location",
         "person_device_01 last placement",
     )
-    assert [query.text for query in recall_embedder.queries] == [
+    assert [query.text for query in embedder.queries] == [
         "red screwdriver",
         "red screwdriver exact location",
         "person_device_01 last placement",
@@ -1083,7 +1146,7 @@ async def test_recall_discards_an_answer_when_the_final_visibility_barrier_remov
 
 async def test_recall_reassesses_when_reflection_only_adds_hidden_candidates() -> None:
     store = InMemoryStore()
-    recall_embedder = RecordingRecallEmbedder()
+    embedder = RecordingEmbedder()
     answerer = RecordingAnswerer(
         answers=(
             GeneratedAnswer(
@@ -1094,7 +1157,7 @@ async def test_recall_reassesses_when_reflection_only_adds_hidden_candidates() -
             GeneratedAnswer(answer="Beside the toolbox.", confidence=0.7),
         )
     )
-    kernel = _kernel(store, answerer, recall_embedder=recall_embedder)
+    kernel = _kernel(store, answerer, embedder=embedder)
     await kernel.remember(
         _remember_request(idempotency_key="hidden").model_copy(update={"summary": "exact location"})
     )
@@ -1213,8 +1276,8 @@ async def test_recall_abstains_from_unverified_derived_summary() -> None:
 async def test_semantic_evidence_finds_memory_without_matching_summary_text() -> None:
     """Jina evidence rank reaches grounded memories that sparse text cannot see."""
     store = InMemoryStore()
-    recall_embedder = RecordingRecallEmbedder()
-    kernel = _kernel(store, RecordingAnswerer(), recall_embedder=recall_embedder)
+    embedder = RecordingEmbedder()
+    kernel = _kernel(store, RecordingAnswerer(), embedder=embedder)
     await kernel.observe(_observe_request())
     evidence_id = next(iter(store.evidence))
     await kernel.remember(_remember_request(evidence_ids=(evidence_id,)))
@@ -1232,7 +1295,7 @@ async def test_semantic_evidence_finds_memory_without_matching_summary_text() ->
     )
 
     assert result.memories[0].summary.startswith("The robot put")
-    assert recall_embedder.queries[0].text == "a hand moves an object"
+    assert embedder.queries[0].text == "a hand moves an object"
     assert store.embedding_searches[0].document_task == "retrieval_document"
 
 
@@ -1255,6 +1318,64 @@ async def test_semantic_memory_finds_attested_text_without_matching_words() -> N
 
     assert [item.memory_id for item in result.memories] == [memory.memory_id]
     assert result.answer == memory.summary
+
+
+async def test_recall_uses_optional_reranker_without_changing_candidate_identity() -> None:
+    store = InMemoryStore()
+    reranker = RecordingReranker()
+    first = await _kernel(store, RecordingAnswerer()).remember(
+        _remember_request(idempotency_key="rerank-first")
+    )
+    second = await _kernel(store, RecordingAnswerer()).remember(
+        _remember_request(idempotency_key="rerank-second")
+    )
+    store.embedding_matches = tuple(
+        EmbeddingMatch(
+            embedding_id=f"embedding_{index}",
+            object_type=EmbeddedObjectType.MEMORY_RECORD,
+            object_id=memory_id,
+            similarity=1.0 - index / 10,
+        )
+        for index, memory_id in enumerate((first.memory_id, second.memory_id))
+    )
+
+    result = await _kernel(store, RecordingAnswerer(), reranker=reranker).recall(
+        RecallRequest(tenant_id="tenant_01", query=RecallQuery(text="semantic-only query"))
+    )
+
+    assert [item.memory_id for item in result.memories] == [second.memory_id, first.memory_id]
+    assert [item.candidate_id for item in reranker.requests[0].candidates] == [
+        first.memory_id,
+        second.memory_id,
+    ]
+
+
+async def test_recall_rejects_reranker_that_drops_a_candidate() -> None:
+    store = InMemoryStore()
+    first = await _kernel(store, RecordingAnswerer()).remember(
+        _remember_request(idempotency_key="rerank-invalid-first")
+    )
+    second = await _kernel(store, RecordingAnswerer()).remember(
+        _remember_request(idempotency_key="rerank-invalid-second")
+    )
+    store.embedding_matches = tuple(
+        EmbeddingMatch(
+            embedding_id=f"embedding_invalid_{index}",
+            object_type=EmbeddedObjectType.MEMORY_RECORD,
+            object_id=memory_id,
+            similarity=1.0 - index / 10,
+        )
+        for index, memory_id in enumerate((first.memory_id, second.memory_id))
+    )
+
+    with pytest.raises(ModelOutputError, match="every candidate ID"):
+        await _kernel(
+            store,
+            RecordingAnswerer(),
+            reranker=RecordingReranker((first.memory_id,)),
+        ).recall(
+            RecallRequest(tenant_id="tenant_01", query=RecallQuery(text="semantic-only query"))
+        )
 
 
 async def test_semantic_summary_hit_descends_to_attested_source_for_answering() -> None:
@@ -1372,8 +1493,8 @@ async def test_semantic_summary_expansion_does_not_displace_direct_hits() -> Non
 
 async def test_recall_scopes_followup_to_explicit_memory_ids() -> None:
     store = InMemoryStore()
-    recall_embedder = RecordingRecallEmbedder()
-    kernel = _kernel(store, RecordingAnswerer(), recall_embedder=recall_embedder)
+    embedder = RecordingEmbedder()
+    kernel = _kernel(store, RecordingAnswerer(), embedder=embedder)
     await kernel.remember(_remember_request(idempotency_key="first"))
     scoped = await kernel.remember(
         _remember_request(idempotency_key="second").model_copy(
@@ -1391,7 +1512,7 @@ async def test_recall_scopes_followup_to_explicit_memory_ids() -> None:
 
     assert [memory.memory_id for memory in result.memories] == [scoped.memory_id]
     assert result.answer == scoped.summary
-    assert recall_embedder.queries == []
+    assert embedder.queries == []
 
 
 async def test_semantic_event_follows_its_memory_representation() -> None:
@@ -1422,13 +1543,13 @@ async def test_semantic_event_follows_its_memory_representation() -> None:
 async def test_media_query_is_signed_for_embedding_instead_of_used_as_a_filter() -> None:
     """One resolved AV query reaches both Jina retrieval and Omni inspection."""
     store = InMemoryStore()
-    recall_embedder = RecordingRecallEmbedder()
+    embedder = RecordingEmbedder()
     answerer = RecordingAnswerer()
     signer = SequencedMediaUrlSigner()
     kernel = _kernel(
         store,
         answerer,
-        recall_embedder=recall_embedder,
+        embedder=embedder,
         media_access=signer,
     )
     await kernel.observe(_observe_request())
@@ -1451,8 +1572,8 @@ async def test_media_query_is_signed_for_embedding_instead_of_used_as_a_filter()
         )
     )
 
-    resolved = recall_embedder.queries[0].media[0]
-    assert resolved.media_object.kind is MediaKind.VIDEO
+    resolved = embedder.queries[0].media[0]
+    assert resolved.kind is MediaKind.VIDEO
     assert resolved.media_url.endswith("?signature=1")
     assert answerer.last_evidence[0].media_url.endswith("?signature=2")
     assert answerer.last_query_media[0].media_url.endswith("?signature=3")
@@ -1463,7 +1584,7 @@ async def test_media_query_is_signed_for_embedding_instead_of_used_as_a_filter()
 
 async def test_media_query_is_resigned_before_reflection_retrieval() -> None:
     store = InMemoryStore()
-    recall_embedder = RecordingRecallEmbedder()
+    embedder = RecordingEmbedder()
     signer = SequencedMediaUrlSigner()
     answerer = RecordingAnswerer(
         answers=(
@@ -1477,7 +1598,7 @@ async def test_media_query_is_resigned_before_reflection_retrieval() -> None:
     kernel = _kernel(
         store,
         answerer,
-        recall_embedder=recall_embedder,
+        embedder=embedder,
         media_access=signer,
     )
     await kernel.observe(_observe_request())
@@ -1500,15 +1621,15 @@ async def test_media_query_is_resigned_before_reflection_retrieval() -> None:
         )
     )
 
-    assert len(recall_embedder.queries) == 2
-    assert recall_embedder.queries[0].media[0].media_url.endswith("?signature=1")
-    assert recall_embedder.queries[1].media[0].media_url.endswith("?signature=4")
+    assert len(embedder.queries) == 2
+    assert embedder.queries[0].media[0].media_url.endswith("?signature=1")
+    assert embedder.queries[1].media[0].media_url.endswith("?signature=4")
 
 
 async def test_media_query_rejects_unknown_tenant_object() -> None:
     """A query cannot turn another tenant's object ID into a signed URL."""
-    recall_embedder = RecordingRecallEmbedder()
-    kernel = _kernel(InMemoryStore(), RecordingAnswerer(), recall_embedder=recall_embedder)
+    embedder = RecordingEmbedder()
+    kernel = _kernel(InMemoryStore(), RecordingAnswerer(), embedder=embedder)
 
     with pytest.raises(DomainInvariantError, match="unknown media"):
         await kernel.recall(
@@ -1518,7 +1639,7 @@ async def test_media_query_rejects_unknown_tenant_object() -> None:
             )
         )
 
-    assert recall_embedder.queries == []
+    assert embedder.queries == []
 
 
 async def test_enumerate_verifies_all_filtered_memories_in_bounded_batches() -> None:
@@ -1714,19 +1835,22 @@ def _kernel(
     answerer: RecordingAnswerer,
     *,
     job_publisher: RecordingObservationJobPublisher | None = None,
-    recall_embedder: RecordingRecallEmbedder | None = None,
+    embedder: RecordingEmbedder | None = None,
     media_access: DeterministicMediaUrlSigner | None = None,
+    reranker: Reranker | None = None,
     clock: Callable[[], datetime] = lambda: NOW,
 ) -> MemoryKernel:
     resolved_media_access = media_access or DeterministicMediaUrlSigner()
     return MemoryKernel(
         store,
         answerer,
+        answerer,
         embedding_index=store,
         media_deleter=resolved_media_access,
         media_url_signer=resolved_media_access,
         observation_job_publisher=job_publisher or RecordingObservationJobPublisher(),
-        recall_embedder=recall_embedder or RecordingRecallEmbedder(),
+        embedder=embedder or RecordingEmbedder(),
+        reranker=reranker,
         clock=clock,
     )
 

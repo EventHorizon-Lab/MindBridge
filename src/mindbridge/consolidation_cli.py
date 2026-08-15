@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import inspect
 import json
 import os
 from collections.abc import Mapping, Sequence
@@ -20,26 +21,26 @@ from mindbridge.application.consolidation_sweep import (
     consolidate_tenant_episodes,
     consolidate_tenant_summaries,
 )
+from mindbridge.application.pipelines import ClaimPipeline, EpisodePipeline, SummaryPipeline
 from mindbridge.configuration import (
+    copy_plugin_configuration,
     optional_environment_value,
     parse_aware_datetime,
+    plugin_configuration,
     require_environment_value,
+    validate_plugin_name,
 )
-from mindbridge.core import EmbeddingSpaceReference, TenantId
+from mindbridge.core import TenantId
 from mindbridge.infrastructure.postgres import PostgresMemoryStore
 from mindbridge.infrastructure.s3 import S3MediaAccess
-from mindbridge.models.jina import (
-    DEFAULT_JINA_RETRIEVAL_SPACE,
-    DEFAULT_JINA_TEXT_MODEL_ID,
-    DEFAULT_JINA_TEXT_REVISION,
+from mindbridge.models.defaults import (
+    DEFAULT_EMBEDDING_DIMENSION,
+    DEFAULT_EMBEDDING_SPACE,
+    DEFAULT_GENERATOR_MODEL_ID,
+    DEFAULT_TEXT_EMBEDDER_MODEL_ID,
+    DEFAULT_TEXT_EMBEDDER_REVISION,
 )
-from mindbridge.models.openai_claim_consolidation import OpenAIOmniClaimConsolidator
-from mindbridge.models.openai_consolidation import OpenAIOmniEpisodeConsolidator
-from mindbridge.models.openai_embeddings import OpenAIJinaTextEmbedder
-from mindbridge.models.openai_omni import DEFAULT_OMNI_MODEL_ID
-from mindbridge.models.openai_summary_consolidation import (
-    OpenAIOmniSummaryConsolidator,
-)
+from mindbridge.models.plugins import load_embedder, load_generator
 from mindbridge.telemetry import configure_telemetry
 
 
@@ -49,37 +50,31 @@ class ConsolidationSettings:
 
     database_url: str = field(repr=False)
     object_storage_bucket: str
-    vlm_api_key: str = field(repr=False)
-    vlm_endpoint: str
-    vlm_model_revision: str
-    text_embedding_api_key: str = field(repr=False)
-    text_embedding_endpoint: str
+    generator_config: Mapping[str, object] = field(repr=False)
+    embedder_config: Mapping[str, object] = field(repr=False)
     object_storage_endpoint_url: str | None = None
     object_storage_region: str = "us-east-1"
-    vlm_model_id: str = DEFAULT_OMNI_MODEL_ID
-    text_embedding_model_id: str = DEFAULT_JINA_TEXT_MODEL_ID
-    text_embedding_model_revision: str = DEFAULT_JINA_TEXT_REVISION
-    embedding_space_id: str = DEFAULT_JINA_RETRIEVAL_SPACE.space_id
-    embedding_space_revision: str = DEFAULT_JINA_RETRIEVAL_SPACE.revision
+    generator_plugin: str = "openai"
+    embedder_plugin: str = "openai"
 
     def __post_init__(self) -> None:
         for name, value in (
             ("database_url", self.database_url),
             ("object_storage_bucket", self.object_storage_bucket),
             ("object_storage_region", self.object_storage_region),
-            ("vlm_api_key", self.vlm_api_key),
-            ("vlm_endpoint", self.vlm_endpoint),
-            ("vlm_model_id", self.vlm_model_id),
-            ("vlm_model_revision", self.vlm_model_revision),
-            ("text_embedding_api_key", self.text_embedding_api_key),
-            ("text_embedding_endpoint", self.text_embedding_endpoint),
-            ("text_embedding_model_id", self.text_embedding_model_id),
-            ("text_embedding_model_revision", self.text_embedding_model_revision),
-            ("embedding_space_id", self.embedding_space_id),
-            ("embedding_space_revision", self.embedding_space_revision),
         ):
             if not value.strip():
                 raise ValueError(f"{name} must not be empty")
+        for name, value in (
+            ("generator_plugin", self.generator_plugin),
+            ("embedder_plugin", self.embedder_plugin),
+        ):
+            validate_plugin_name(value, name)
+        for name, config in (
+            ("generator_config", self.generator_config),
+            ("embedder_config", self.embedder_config),
+        ):
+            object.__setattr__(self, name, copy_plugin_configuration(config, name))
         if (
             self.object_storage_endpoint_url is not None
             and not self.object_storage_endpoint_url.strip()
@@ -93,6 +88,8 @@ class ConsolidationSettings:
     ) -> ConsolidationSettings:
         """Read the documented process contract without requiring API or broker settings."""
         source = os.environ if environ is None else environ
+        generator_plugin = source.get("MINDBRIDGE_GENERATOR_PLUGIN", "openai")
+        embedder_plugin = source.get("MINDBRIDGE_EMBEDDER_PLUGIN", "openai")
         return cls(
             database_url=require_environment_value(source, "MINDBRIDGE_DATABASE_URL"),
             object_storage_bucket=require_environment_value(
@@ -102,28 +99,19 @@ class ConsolidationSettings:
                 source, "MINDBRIDGE_OBJECT_STORAGE_ENDPOINT_URL"
             ),
             object_storage_region=source.get("MINDBRIDGE_OBJECT_STORAGE_REGION", "us-east-1"),
-            vlm_api_key=require_environment_value(source, "MINDBRIDGE_VLM_API_KEY"),
-            vlm_endpoint=require_environment_value(source, "MINDBRIDGE_VLM_ENDPOINT"),
-            vlm_model_id=source.get("MINDBRIDGE_VLM_MODEL_ID", DEFAULT_OMNI_MODEL_ID),
-            vlm_model_revision=require_environment_value(source, "MINDBRIDGE_VLM_MODEL_REVISION"),
-            text_embedding_api_key=require_environment_value(
-                source, "MINDBRIDGE_TEXT_EMBEDDING_API_KEY"
+            generator_plugin=generator_plugin,
+            generator_config=plugin_configuration(
+                source,
+                "MINDBRIDGE_GENERATOR_CONFIG_JSON",
+                (lambda: _generator_config(source)) if generator_plugin == "openai" else None,
             ),
-            text_embedding_endpoint=require_environment_value(
-                source, "MINDBRIDGE_TEXT_EMBEDDING_ENDPOINT"
-            ),
-            text_embedding_model_id=source.get(
-                "MINDBRIDGE_TEXT_EMBEDDING_MODEL_ID", DEFAULT_JINA_TEXT_MODEL_ID
-            ),
-            text_embedding_model_revision=source.get(
-                "MINDBRIDGE_TEXT_EMBEDDING_MODEL_REVISION", DEFAULT_JINA_TEXT_REVISION
-            ),
-            embedding_space_id=source.get(
-                "MINDBRIDGE_EMBEDDING_SPACE_ID", DEFAULT_JINA_RETRIEVAL_SPACE.space_id
-            ),
-            embedding_space_revision=source.get(
-                "MINDBRIDGE_EMBEDDING_SPACE_REVISION",
-                DEFAULT_JINA_RETRIEVAL_SPACE.revision,
+            embedder_plugin=embedder_plugin,
+            embedder_config=plugin_configuration(
+                source,
+                "MINDBRIDGE_EMBEDDER_CONFIG_JSON",
+                (lambda: _document_embedder_config(source))
+                if embedder_plugin == "openai"
+                else None,
             ),
         )
 
@@ -172,46 +160,18 @@ async def _run_postgres_sweep(
         endpoint_url=settings.object_storage_endpoint_url,
         region_name=settings.object_storage_region,
     )
-    consolidator = OpenAIOmniEpisodeConsolidator.connect(
-        api_key=settings.vlm_api_key,
-        endpoint=settings.vlm_endpoint,
-        model_id=settings.vlm_model_id,
-        model_revision=settings.vlm_model_revision,
-    )
-    claim_consolidator = OpenAIOmniClaimConsolidator.connect(
-        api_key=settings.vlm_api_key,
-        endpoint=settings.vlm_endpoint,
-        model_id=settings.vlm_model_id,
-        model_revision=settings.vlm_model_revision,
-    )
-    summary_consolidator = OpenAIOmniSummaryConsolidator.connect(
-        api_key=settings.vlm_api_key,
-        endpoint=settings.vlm_endpoint,
-        model_id=settings.vlm_model_id,
-        model_revision=settings.vlm_model_revision,
-    )
-    text_embedder = OpenAIJinaTextEmbedder.connect(
-        api_key=settings.text_embedding_api_key,
-        endpoint=settings.text_embedding_endpoint,
-        model_id=settings.text_embedding_model_id,
-        model_revision=settings.text_embedding_model_revision,
-        space_reference=EmbeddingSpaceReference(
-            space_id=settings.embedding_space_id,
-            revision=settings.embedding_space_revision,
-        ),
-    )
     async with AsyncExitStack() as resources:
-        resources.push_async_callback(consolidator.close)
-        resources.push_async_callback(claim_consolidator.close)
-        resources.push_async_callback(summary_consolidator.close)
-        resources.push_async_callback(text_embedder.close)
+        generator = load_generator(settings.generator_plugin, settings.generator_config)
+        resources.push_async_callback(_close_model, generator)
+        embedder = load_embedder(settings.embedder_plugin, settings.embedder_config)
+        resources.push_async_callback(_close_model, embedder)
         await store.open()
         resources.push_async_callback(store.close)
         episodes = await consolidate_tenant_episodes(
             ConsolidateEpisodes(
                 store,
-                consolidator,
-                text_embedder,
+                EpisodePipeline(generator),
+                embedder,
                 media_url_signer=media_access,
             ),
             tenant_id,
@@ -223,8 +183,8 @@ async def _run_postgres_sweep(
         claims = await consolidate_tenant_claims(
             ConsolidateClaims(
                 store,
-                claim_consolidator,
-                text_embedder,
+                ClaimPipeline(generator),
+                embedder,
                 media_url_signer=media_access,
             ),
             tenant_id,
@@ -236,8 +196,8 @@ async def _run_postgres_sweep(
         summaries = await consolidate_tenant_summaries(
             ConsolidateSummaries(
                 store,
-                summary_consolidator,
-                text_embedder,
+                SummaryPipeline(generator),
+                embedder,
                 media_url_signer=media_access,
             ),
             tenant_id,
@@ -301,6 +261,48 @@ def _summary_dict(summary: ConsolidationSweepSummary) -> dict[str, object]:
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _generator_config(source: Mapping[str, str]) -> Mapping[str, object]:
+    return {
+        "api_key": require_environment_value(source, "MINDBRIDGE_GENERATOR_API_KEY"),
+        "endpoint": require_environment_value(source, "MINDBRIDGE_GENERATOR_ENDPOINT"),
+        "model_id": source.get("MINDBRIDGE_GENERATOR_MODEL_ID", DEFAULT_GENERATOR_MODEL_ID),
+        "model_revision": require_environment_value(source, "MINDBRIDGE_GENERATOR_MODEL_REVISION"),
+    }
+
+
+def _document_embedder_config(source: Mapping[str, str]) -> Mapping[str, object]:
+    api_key = require_environment_value(source, "MINDBRIDGE_EMBEDDER_API_KEY")
+    endpoint = require_environment_value(source, "MINDBRIDGE_EMBEDDER_ENDPOINT")
+    model_id = source.get("MINDBRIDGE_EMBEDDER_MODEL_ID", DEFAULT_TEXT_EMBEDDER_MODEL_ID)
+    revision = source.get("MINDBRIDGE_EMBEDDER_MODEL_REVISION", DEFAULT_TEXT_EMBEDDER_REVISION)
+    return {
+        "api_key": api_key,
+        "endpoint": endpoint,
+        "model_id": model_id,
+        "model_revision": revision,
+        "document_api_key": api_key,
+        "document_endpoint": endpoint,
+        "document_model_id": model_id,
+        "document_model_revision": revision,
+        "space_id": source.get("MINDBRIDGE_EMBEDDING_SPACE_ID", DEFAULT_EMBEDDING_SPACE.space_id),
+        "space_revision": source.get(
+            "MINDBRIDGE_EMBEDDING_SPACE_REVISION", DEFAULT_EMBEDDING_SPACE.revision
+        ),
+        "dimension": int(
+            source.get("MINDBRIDGE_EMBEDDING_DIMENSION", str(DEFAULT_EMBEDDING_DIMENSION))
+        ),
+    }
+
+
+async def _close_model(model: object) -> None:
+    close = getattr(model, "close", None)
+    if close is None:
+        return
+    result = close()
+    if inspect.isawaitable(result):
+        await result
 
 
 if __name__ == "__main__":

@@ -21,7 +21,7 @@ from mindbridge.contracts import (
     RememberRequest,
 )
 from mindbridge.core import JobState, MediaKind, MemoryType, SensorKind
-from mindbridge.sdk import AsyncMindBridge
+from mindbridge.sdk import MindBridge
 
 OPTION_LABELS = tuple("ABCDEFGHIJ")
 _ALLOWED_RESPONSE_WORDS = re.compile(
@@ -110,7 +110,7 @@ def prepared_video_end(video: PreparedVideo) -> AwareDatetime:
 
 
 async def ingest_prepared_video(
-    memory: AsyncMindBridge,
+    memory: MindBridge,
     tenant_id: str,
     device_id: str,
     video: PreparedVideo,
@@ -150,7 +150,7 @@ async def ingest_prepared_video(
 
 
 async def _ingest_prepared_segment(
-    memory: AsyncMindBridge,
+    memory: MindBridge,
     tenant_id: str,
     device_id: str,
     video: PreparedVideo,
@@ -225,7 +225,7 @@ def benchmark_tenant_id(tenant_prefix: str, unit_id: str, run_id: str) -> str:
 
 
 async def wait_for_observation_job(
-    memory: AsyncMindBridge,
+    memory: MindBridge,
     tenant_id: str,
     job_id: str,
     *,

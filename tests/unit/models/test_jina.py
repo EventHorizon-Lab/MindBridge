@@ -4,8 +4,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from mindbridge.core import ModelOutputError, ModelReference
-from mindbridge.models.jina import JinaOmniEmbedder
+from mindbridge.core import MediaKind, ModelOutputError, ModelReference
+from mindbridge.models import EmbedRequest, EmbedTask, MediaPart, ModelInput, TextPart
+from mindbridge.models.jina import JinaEmbedder
 
 
 class Matrix:
@@ -69,7 +70,7 @@ def test_jina_pins_remote_code_to_the_model_revision(monkeypatch: pytest.MonkeyP
     )
     monkeypatch.setattr("mindbridge.models.jina.select_torch_device", lambda _device: "cuda")
 
-    JinaOmniEmbedder.load(revision="pinned-revision", dimension=2)
+    JinaEmbedder.load(revision="pinned-revision", dimension=2)
 
     assert calls == [
         (
@@ -98,40 +99,55 @@ def test_jina_pins_remote_code_to_the_model_revision(monkeypatch: pytest.MonkeyP
 async def test_jina_uses_distinct_query_and_document_methods() -> None:
     """Retrieval prefixes remain owned by Sentence Transformers."""
     encoder = RecordingEncoder([[1.0, 0.0]])
-    embedder = JinaOmniEmbedder(
+    embedder = JinaEmbedder(
         encoder,
         ModelReference(model_id="jina", revision="revision"),
         dimension=2,
     )
 
-    query = await embedder.encode_queries(("Where is the screwdriver?",))
-    document = await embedder.encode_documents((b"image-bytes",))
+    query = await embedder.embed(
+        EmbedRequest(
+            inputs=(ModelInput((TextPart("Where is the screwdriver?"),)),),
+            task=EmbedTask.QUERY,
+        )
+    )
+    document = await embedder.embed(
+        EmbedRequest(
+            inputs=(ModelInput((MediaPart(MediaKind.IMAGE, "file:///image.jpg"),)),),
+            task=EmbedTask.DOCUMENT,
+        )
+    )
 
-    assert query == ((1.0, 0.0),)
-    assert document == query
+    assert tuple(item.values for item in query.embeddings) == ((1.0, 0.0),)
+    assert document.embeddings == query.embeddings
     assert encoder.calls == ["query", "document"]
 
 
 async def test_jina_rejects_invalid_model_output() -> None:
     """Malformed upstream vectors cannot enter the semantic index."""
-    embedder = JinaOmniEmbedder(
+    embedder = JinaEmbedder(
         RecordingEncoder([[1.0, 1.0]]),
         ModelReference(model_id="jina", revision="revision"),
         dimension=2,
     )
 
     with pytest.raises(ModelOutputError, match="L2-normalized"):
-        await embedder.encode_queries(("query",))
+        await embedder.embed(
+            EmbedRequest(
+                inputs=(ModelInput((TextPart("query"),)),),
+                task=EmbedTask.QUERY,
+            )
+        )
 
 
 async def test_jina_skips_model_call_for_empty_batch() -> None:
     """An empty batch has no model cost or ambiguous output shape."""
     encoder = RecordingEncoder([])
-    embedder = JinaOmniEmbedder(
+    embedder = JinaEmbedder(
         encoder,
         ModelReference(model_id="jina", revision="revision"),
         dimension=2,
     )
 
-    assert await embedder.encode_documents(()) == ()
+    assert (await embedder.embed(EmbedRequest(inputs=(), task=EmbedTask.DOCUMENT))).embeddings == ()
     assert encoder.calls == []

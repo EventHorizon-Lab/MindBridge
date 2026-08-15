@@ -1,4 +1,4 @@
-"""Contract tests for the OpenAI-compatible Omni answer boundary."""
+"""Contract tests for the provider-neutral Answer and Occurrence pipelines."""
 
 import json
 from collections.abc import Callable, Coroutine
@@ -10,7 +10,8 @@ import pytest
 from openai import AsyncOpenAI
 
 from mindbridge.application.perception import ResolvedEvidence
-from mindbridge.application.ports import ResolvedQueryMedia
+from mindbridge.application.pipelines import AnswerPipeline, OccurrencePipeline
+from mindbridge.application.ports import GeneratedAnswer, ResolvedQueryMedia
 from mindbridge.contracts import RecallQuery, RecallRequest
 from mindbridge.core import (
     EvidenceId,
@@ -22,16 +23,18 @@ from mindbridge.core import (
     MemoryRecord,
     MemoryType,
     ModelOutputError,
+    ModelReference,
     ObservationId,
     TenantId,
     VerificationStatus,
 )
-from mindbridge.models.openai_omni import OpenAIOmniAnswerer, normalize_openai_base_url
+from mindbridge.models.openai import OpenAIGenerator, normalize_base_url
+from mindbridge.prompts import ANSWER_FROM_EVIDENCE_PROMPT, SELECT_OCCURRENCES_PROMPT
 
 NOW = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
 
 
-async def test_omni_streams_raw_av_and_validates_answer() -> None:
+async def test_answer_pipeline_streams_raw_av_and_validates_answer() -> None:
     """The official SDK carries original media rather than text-only captions."""
 
     async def respond(request: httpx.Request) -> httpx.Response:
@@ -106,7 +109,7 @@ async def test_omni_streams_raw_av_and_validates_answer() -> None:
     assert answer.confidence == 0.87
 
 
-async def test_omni_returns_bounded_retrieval_queries_when_evidence_is_missing() -> None:
+async def test_answer_pipeline_returns_bounded_queries_when_evidence_is_missing() -> None:
     async def respond(request: httpx.Request) -> httpx.Response:
         payload: dict[str, object] = json.loads(request.content)
         messages = cast(list[dict[str, object]], payload["messages"])
@@ -140,7 +143,7 @@ async def test_omni_returns_bounded_retrieval_queries_when_evidence_is_missing()
     assert answer.retrieval_queries == ("person_device_01 blue toolbox",)
 
 
-async def test_omni_retries_invalid_answer_once_in_json_mode() -> None:
+async def test_answer_pipeline_retries_invalid_answer_once_in_json_mode() -> None:
     calls = 0
 
     async def respond(request: httpx.Request) -> httpx.Response:
@@ -174,7 +177,7 @@ async def test_omni_retries_invalid_answer_once_in_json_mode() -> None:
     assert answer.answer == "blue toolbox"
 
 
-async def test_omni_accepts_one_provider_added_json_code_fence() -> None:
+async def test_answer_pipeline_accepts_one_provider_added_json_code_fence() -> None:
     calls = 0
 
     async def respond(_request: httpx.Request) -> httpx.Response:
@@ -201,7 +204,7 @@ async def test_omni_accepts_one_provider_added_json_code_fence() -> None:
     assert answer.answer == "blue toolbox"
 
 
-async def test_omni_keeps_provisional_answer_with_search_queries() -> None:
+async def test_answer_pipeline_keeps_provisional_answer_with_search_queries() -> None:
     async def respond(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             200,
@@ -228,7 +231,7 @@ async def test_omni_keeps_provisional_answer_with_search_queries() -> None:
     assert answer.retrieval_queries == ("blue toolbox exact location",)
 
 
-async def test_omni_inspects_native_query_media_before_candidate_evidence() -> None:
+async def test_answer_pipeline_inspects_query_media_before_candidate_evidence() -> None:
     async def respond(request: httpx.Request) -> httpx.Response:
         payload: dict[str, object] = json.loads(request.content)
         messages = cast(list[dict[str, object]], payload["messages"])
@@ -286,7 +289,7 @@ async def test_omni_inspects_native_query_media_before_candidate_evidence() -> N
     assert answer.answer == "matching moment"
 
 
-async def test_omni_selects_occurrences_with_schema_validated_candidate_ids() -> None:
+async def test_occurrence_pipeline_selects_schema_validated_candidate_ids() -> None:
     async def respond(request: httpx.Request) -> httpx.Response:
         payload: dict[str, object] = json.loads(request.content)
         messages = cast(list[dict[str, object]], payload["messages"])
@@ -321,7 +324,7 @@ async def test_omni_selects_occurrences_with_schema_validated_candidate_ids() ->
         '{"memory_ids":["memory_unknown"]}',
     ],
 )
-async def test_omni_rejects_invalid_occurrence_selection(content: str) -> None:
+async def test_occurrence_pipeline_rejects_invalid_selection(content: str) -> None:
     async def respond(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             200,
@@ -331,7 +334,7 @@ async def test_omni_rejects_invalid_occurrence_selection(content: str) -> None:
 
     answerer = _answerer(respond)
     try:
-        with pytest.raises(ModelOutputError, match="occurrence model"):
+        with pytest.raises(ModelOutputError, match="occurrence pipeline"):
             await answerer.select_occurrences(
                 RecallRequest(tenant_id="tenant_01", query=RecallQuery(text="count the tools")),
                 (_memory((), verification_status=VerificationStatus.ATTESTED),),
@@ -342,7 +345,7 @@ async def test_omni_rejects_invalid_occurrence_selection(content: str) -> None:
         await answerer.close()
 
 
-async def test_omni_rejects_invalid_structured_output() -> None:
+async def test_answer_pipeline_rejects_invalid_structured_output() -> None:
     """Provider JSON cannot bypass the answer confidence invariant."""
 
     async def respond(_request: httpx.Request) -> httpx.Response:
@@ -367,7 +370,7 @@ async def test_omni_rejects_invalid_structured_output() -> None:
         await answerer.close()
 
 
-async def test_omni_uses_attested_source_statement_without_media() -> None:
+async def test_answer_pipeline_uses_attested_source_statement_without_media() -> None:
     """Explicit text is labeled as a report and never promoted to observed evidence."""
 
     async def respond(request: httpx.Request) -> httpx.Response:
@@ -410,28 +413,84 @@ async def test_omni_uses_attested_source_statement_without_media() -> None:
         ("https://vlm.example.test/api/v1/", "https://vlm.example.test/api/v1"),
     ],
 )
-def test_normalize_openai_base_url_accepts_root_or_completion_url(
+def test_normalize_base_url_accepts_root_or_completion_url(
     endpoint: str,
     expected: str,
 ) -> None:
     """Deployment configuration may use the full endpoint supplied by an operator."""
-    assert normalize_openai_base_url(endpoint) == expected
+    assert normalize_base_url(endpoint) == expected
+
+
+class _AnswerHarness:
+    def __init__(self, generator: OpenAIGenerator) -> None:
+        self._generator = generator
+        self._answer = AnswerPipeline(generator)
+        self._occurrences = OccurrencePipeline(generator)
+
+    @property
+    def model_reference(self) -> ModelReference:
+        return ModelReference(model_id="qwen3.8-max", revision="deployment-revision")
+
+    @property
+    def prompt_version(self) -> str:
+        return ANSWER_FROM_EVIDENCE_PROMPT.version
+
+    @property
+    def occurrence_prompt_version(self) -> str:
+        return SELECT_OCCURRENCES_PROMPT.version
+
+    async def answer(
+        self,
+        request: RecallRequest,
+        memories: tuple[MemoryRecord, ...],
+        evidence: tuple[ResolvedEvidence, ...],
+        *,
+        query_media: tuple[ResolvedQueryMedia, ...],
+        attempted_retrieval_queries: tuple[str, ...] = (),
+    ) -> GeneratedAnswer:
+        return await self._answer.answer(
+            request,
+            memories,
+            evidence,
+            query_media=query_media,
+            attempted_retrieval_queries=attempted_retrieval_queries,
+        )
+
+    async def select_occurrences(
+        self,
+        request: RecallRequest,
+        memories: tuple[MemoryRecord, ...],
+        evidence: tuple[ResolvedEvidence, ...],
+        *,
+        query_media: tuple[ResolvedQueryMedia, ...],
+    ) -> tuple[MemoryId, ...]:
+        return await self._occurrences.select_occurrences(
+            request,
+            memories,
+            evidence,
+            query_media=query_media,
+        )
+
+    async def close(self) -> None:
+        await self._generator.close()
 
 
 def _answerer(
     handler: Callable[[httpx.Request], Coroutine[None, None, httpx.Response]],
-) -> OpenAIOmniAnswerer:
+) -> _AnswerHarness:
     http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     client = AsyncOpenAI(
         api_key="unit-test-key",
-        base_url=normalize_openai_base_url("https://vlm.example.test/api/v1/chat/completions"),
+        base_url=normalize_base_url("https://vlm.example.test/api/v1/chat/completions"),
         http_client=http_client,
         max_retries=0,
     )
-    return OpenAIOmniAnswerer(
-        client,
-        model_revision="deployment-revision",
-        reasoning_effort="low",
+    return _AnswerHarness(
+        OpenAIGenerator(
+            client,
+            ModelReference(model_id="qwen3.8-max", revision="deployment-revision"),
+            reasoning_effort="low",
+        )
     )
 
 

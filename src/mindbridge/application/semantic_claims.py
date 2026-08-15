@@ -6,9 +6,15 @@ import math
 from dataclasses import dataclass
 from datetime import datetime
 
+from mindbridge.application.capabilities import (
+    Embedder,
+    Embedding,
+    EmbedRequest,
+    EmbedTask,
+    ModelInput,
+    TextPart,
+)
 from mindbridge.application.claim_consolidation import ClaimCandidate
-from mindbridge.application.ports import TextDocumentEmbedder
-from mindbridge.application.recall import RETRIEVAL_DOCUMENT_EMBEDDING_TASK
 from mindbridge.core import (
     Claim,
     ClaimId,
@@ -68,7 +74,7 @@ class ClaimRelationshipProposal:
 
 @dataclass(frozen=True, slots=True)
 class ClaimConsolidation:
-    """Validated Claim proposals and frozen Omni provenance."""
+    """Validated Claim proposals and frozen model provenance."""
 
     semantic_claims: tuple[SemanticClaimProposal, ...]
     relationships: tuple[ClaimRelationshipProposal, ...]
@@ -139,7 +145,7 @@ class SemanticClaimWrite:
         if (
             self.embedding.object_type is not EmbeddedObjectType.CLAIM
             or self.embedding.object_id != self.claim.claim_id
-            or self.embedding.task != RETRIEVAL_DOCUMENT_EMBEDDING_TASK
+            or self.embedding.task != EmbedTask.DOCUMENT.value
             or not self.embedding.normalized
             or self.embedding.created_at != self.claim.created_at
         ):
@@ -189,7 +195,7 @@ async def derive_claim_consolidation_write(
     tenant_id: TenantId,
     candidates: tuple[ClaimCandidate, ...],
     consolidation: ClaimConsolidation,
-    text_embedder: TextDocumentEmbedder,
+    text_embedder: Embedder,
     created_at: datetime,
 ) -> ClaimConsolidationWrite:
     """Build deterministic Claim graph records and aligned text vectors."""
@@ -205,29 +211,29 @@ async def derive_claim_consolidation_write(
         )
         for proposal in consolidation.semantic_claims
     )
-    vectors = (
-        await text_embedder.encode_documents(
-            tuple(claim.statement for claim, _, _ in claims_and_entities)
+    result = await text_embedder.embed(
+        EmbedRequest(
+            inputs=tuple(
+                ModelInput((TextPart(claim.statement),)) for claim, _, _ in claims_and_entities
+            ),
+            task=EmbedTask.DOCUMENT,
         )
-        if claims_and_entities
-        else ()
     )
-    if len(vectors) != len(claims_and_entities):
-        raise MemoryIntegrityError("text embedder returned the wrong Semantic Claim vector count")
+    if len(result.embeddings) != len(claims_and_entities):
+        raise MemoryIntegrityError("embedder returned the wrong semantic claim vector count")
     semantic_claims = tuple(
         _semantic_claim_write(
             claim,
             proposal.source_claim_ids,
             entity_ids,
             memory_ended_at,
-            vector,
-            text_embedder,
+            embedding,
             created_at,
         )
-        for (claim, entity_ids, memory_ended_at), proposal, vector in zip(
+        for (claim, entity_ids, memory_ended_at), proposal, embedding in zip(
             claims_and_entities,
             consolidation.semantic_claims,
-            vectors,
+            result.embeddings,
             strict=True,
         )
     )
@@ -310,8 +316,7 @@ def _semantic_claim_write(
     source_claim_ids: tuple[ClaimId, ...],
     entity_ids: tuple[EntityId, ...],
     memory_ended_at: datetime,
-    vector: tuple[float, ...],
-    text_embedder: TextDocumentEmbedder,
+    embedding: Embedding,
     created_at: datetime,
 ) -> SemanticClaimWrite:
     memory = MemoryRecord(
@@ -376,19 +381,19 @@ def _semantic_claim_write(
                     claim.tenant_id,
                     EmbeddedObjectType.CLAIM.value,
                     claim.claim_id,
-                    text_embedder.model_reference.model_id,
-                    text_embedder.model_reference.revision,
-                    RETRIEVAL_DOCUMENT_EMBEDDING_TASK,
+                    embedding.model_reference.model_id,
+                    embedding.model_reference.revision,
+                    EmbedTask.DOCUMENT.value,
                 )
             ),
             tenant_id=claim.tenant_id,
             object_type=EmbeddedObjectType.CLAIM,
             object_id=claim.claim_id,
-            values=vector,
-            model_reference=text_embedder.model_reference,
-            space_reference=text_embedder.space_reference,
-            task=RETRIEVAL_DOCUMENT_EMBEDDING_TASK,
-            dimension=text_embedder.dimension,
+            values=embedding.values,
+            model_reference=embedding.model_reference,
+            space_reference=embedding.space_reference,
+            task=EmbedTask.DOCUMENT.value,
+            dimension=embedding.dimension,
             normalized=True,
             created_at=created_at,
         ),

@@ -5,7 +5,7 @@ from typing import cast
 
 import pytest
 
-from mindbridge import AsyncMindBridge
+from mindbridge import MindBridge
 from mindbridge.benchmarks import (
     EgoTempoQuestion,
     PreparedVideo,
@@ -123,7 +123,7 @@ async def test_video_mme_emits_official_nested_response() -> None:
     )
 
     result = await run_video_mme_video(
-        cast(AsyncMindBridge, api), video, _prepared("001", with_media=True), run_id="run_01"
+        cast(MindBridge, api), video, _prepared("001", with_media=True), run_id="run_01"
     )
 
     query = api.recall_requests[0].query.text
@@ -151,7 +151,7 @@ async def test_egotempo_emits_official_judge_fields_without_answer_leakage() -> 
     )
 
     results = await run_egotempo_clip(
-        cast(AsyncMindBridge, api),
+        cast(MindBridge, api),
         (question,),
         _prepared("source_0.0_2.0"),
         run_id="run_01",
@@ -195,7 +195,7 @@ async def test_new_video_runners_validate_before_ingestion() -> None:
 
     with pytest.raises(ValueError, match="between 1 and 100"):
         await run_video_mme_video(
-            cast(AsyncMindBridge, api),
+            cast(MindBridge, api),
             video,
             _prepared("001"),
             run_id="run_01",

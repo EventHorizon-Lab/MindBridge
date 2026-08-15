@@ -3,7 +3,7 @@
 import pytest
 from fastapi.security import HTTPAuthorizationCredentials
 
-from mindbridge.api import TenantApiKeyAuthenticator
+from mindbridge.api.auth import TenantApiKeyAuthenticator
 
 API_KEY = "tenant-api-key-000000000000000000"
 

@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from mindbridge.benchmarks.artifacts import require_writable_output_pair
+from mindbridge.benchmarks.artifacts import load_deployment_snapshot, require_writable_output_pair
 from mindbridge.benchmarks.locomo import LoCoMoConversation, LoCoMoQuestion, LoCoMoTurn
 from mindbridge.benchmarks.locomo_cli import (
     LOCOMO_RUNNER_VERSION,
@@ -20,7 +20,6 @@ from mindbridge.benchmarks.locomo_runner import (
     LoCoMoOfficialConversationResult,
     LoCoMoOfficialQuestionResult,
 )
-from mindbridge.models.jina import DEFAULT_JINA_OMNI_MODEL_ID, DEFAULT_JINA_OMNI_REVISION
 
 NOW = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
 
@@ -47,7 +46,12 @@ def test_locomo_artifacts_pin_source_system_code_and_output(tmp_path: Path) -> N
     )
     arguments = _arguments(dataset_path, output_path)
 
-    _write_artifacts(arguments, (conversation,), (result,))
+    _write_artifacts(
+        arguments,
+        (conversation,),
+        (result,),
+        load_deployment_snapshot(arguments.deployment_config_path),
+    )
 
     predictions = json.loads(output_path.read_text(encoding="utf-8"))
     manifest_path = output_path.with_suffix(".json.manifest.json")
@@ -56,9 +60,8 @@ def test_locomo_artifacts_pin_source_system_code_and_output(tmp_path: Path) -> N
     assert predictions[0]["qa"][0]["mindbridge_prediction_context"] == ["D1:1"]
     assert manifest.source_revision == "official-revision"
     assert manifest.code_revision == "mindbridge-commit"
-    assert manifest.answer_model_revision == "serving-fingerprint"
-    assert manifest.runner_version == LOCOMO_RUNNER_VERSION == "locomo_production_api_v8"
-    assert manifest.reasoning_effort == "low"
+    assert manifest.deployment.server_generator.config["model_revision"] == ("serving-fingerprint")
+    assert manifest.runner_version == LOCOMO_RUNNER_VERSION == "locomo_production_api_v9"
     assert manifest.run_id == "run_01"
     assert manifest.request_timeout_seconds == 1_800.0
     assert manifest.memory_item_count == 1
@@ -76,17 +79,15 @@ def test_locomo_subset_selection_rejects_unknown_samples() -> None:
 
 
 def _arguments(dataset_path: Path, output_path: Path) -> _Arguments:
+    deployment_path = dataset_path.parent / "deployment.json"
+    _write_deployment(deployment_path)
     return _Arguments(
         dataset_path=dataset_path,
         output_path=output_path,
         api_base_url="https://memory.example.test",
         source_revision="official-revision",
         code_revision="mindbridge-commit",
-        answer_model_id="qwen3.8-max",
-        answer_model_revision="serving-fingerprint",
-        answer_reasoning_effort="low",
-        embedding_model_id=DEFAULT_JINA_OMNI_MODEL_ID,
-        embedding_model_revision=DEFAULT_JINA_OMNI_REVISION,
+        deployment_config_path=deployment_path,
         run_id="run_01",
         tenant_prefix="benchmark_locomo",
         recall_limit=20,
@@ -94,6 +95,32 @@ def _arguments(dataset_path: Path, output_path: Path) -> _Arguments:
         request_timeout_seconds=1_800.0,
         sample_ids=(),
         overwrite=False,
+    )
+
+
+def _write_deployment(path: Path) -> None:
+    path.write_text(
+        json.dumps(
+            {
+                "server_generator": {
+                    "plugin": "openai",
+                    "distribution": "mindbridge",
+                    "version": "0.1.0",
+                    "config": {
+                        "model_id": "qwen3.8-max",
+                        "model_revision": "serving-fingerprint",
+                        "reasoning_effort": "low",
+                    },
+                },
+                "server_embedder": {
+                    "plugin": "openai",
+                    "distribution": "mindbridge",
+                    "version": "0.1.0",
+                    "config": {"space_id": "jina-v5", "space_revision": "space-v1"},
+                },
+            }
+        ),
+        encoding="utf-8",
     )
 
 

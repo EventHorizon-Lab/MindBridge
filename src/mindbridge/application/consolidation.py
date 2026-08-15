@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Protocol
 
+from mindbridge.application.capabilities import Embedder
 from mindbridge.application.episodes import (
     EpisodeConsolidation,
     EpisodeProposal,
@@ -15,7 +16,7 @@ from mindbridge.application.episodes import (
 )
 from mindbridge.application.evidence import EvidenceReader, read_resolved_evidence
 from mindbridge.application.perception import ResolvedEvidence
-from mindbridge.application.ports import MediaUrlSigner, TextDocumentEmbedder
+from mindbridge.application.ports import MediaUrlSigner
 from mindbridge.core import (
     DomainInvariantError,
     Event,
@@ -92,7 +93,7 @@ class EpisodeConsolidationResult:
 
 
 class EpisodeConsolidator(Protocol):
-    """Frozen Omni boundary that verifies candidate events against original evidence."""
+    """Frozen model boundary that verifies candidate events against original evidence."""
 
     async def propose_episodes(
         self,
@@ -123,7 +124,7 @@ class ConsolidateEpisodes:
         self,
         store: EpisodeConsolidationStore,
         consolidator: EpisodeConsolidator,
-        text_embedder: TextDocumentEmbedder,
+        text_embedder: Embedder,
         *,
         media_url_signer: MediaUrlSigner,
     ) -> None:

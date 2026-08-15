@@ -26,7 +26,7 @@ from mindbridge.contracts import (
 )
 from mindbridge.core import MediaKind, MemoryType, SensorKind
 from mindbridge.prompts import MEMLENS_QUERY_PROMPT
-from mindbridge.sdk import AsyncMindBridge
+from mindbridge.sdk import MindBridge
 
 
 class MemLensPreparedImage(ContractModel):
@@ -107,7 +107,7 @@ def validate_memlens_images(
 
 
 async def run_memlens_question(
-    memory: AsyncMindBridge,
+    memory: MindBridge,
     question: MemLensQuestion,
     *,
     run_id: str,
@@ -181,7 +181,7 @@ async def run_memlens_question(
 
 
 async def _ingest_turn(
-    memory: AsyncMindBridge,
+    memory: MindBridge,
     tenant_id: str,
     device_id: str,
     question_id: str,

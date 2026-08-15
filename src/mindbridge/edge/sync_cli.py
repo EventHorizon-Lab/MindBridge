@@ -13,7 +13,7 @@ from mindbridge.edge.deletion_inbox import SQLiteDeletionInbox
 from mindbridge.edge.outbox import SQLiteObservationOutbox
 from mindbridge.edge.recent_memory import SQLiteRecentMemory
 from mindbridge.edge.sync import EdgeObservationSynchronizer, S3EdgeMediaUploader
-from mindbridge.sdk import AsyncMindBridge
+from mindbridge.sdk import MindBridge
 from mindbridge.telemetry import configure_telemetry
 
 
@@ -62,7 +62,7 @@ async def _synchronize(
         database_path,
         retention=timedelta(hours=recent_retention_hours),
     )
-    memory = AsyncMindBridge.connect(
+    memory = MindBridge.connect(
         base_url=api_base_url,
         api_key=os.environ.get("MINDBRIDGE_API_KEY"),
     )

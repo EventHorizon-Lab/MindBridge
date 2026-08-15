@@ -74,7 +74,7 @@ PERCEIVE_EVENTS_PROMPT = PromptSpec(
     name="perceive_events",
     version="perceive_events_v9",
     purpose="Turn synchronized embodied media into grounded semantic events.",
-    used_by="mindbridge.models.openai_perception.OpenAIOmniEventPerceiver",
+    used_by="mindbridge.application.pipelines.perception.PerceptionPipeline",
     text=f"""# Role
 You convert embodied image, video, and audio observations into grounded, retrievable memories.
 
@@ -140,7 +140,7 @@ ANSWER_FROM_EVIDENCE_PROMPT = PromptSpec(
     name="answer_from_evidence",
     version="answer_from_evidence_v10",
     purpose="Answer recall questions from retrieved original evidence.",
-    used_by="mindbridge.models.openai_omni.OpenAIOmniAnswerer.answer",
+    used_by="mindbridge.application.pipelines.answer.AnswerPipeline",
     text="""# Role
 You answer questions from embodied memories by inspecting their original image, video, and audio.
 
@@ -197,7 +197,7 @@ SELECT_OCCURRENCES_PROMPT = PromptSpec(
     name="select_occurrences",
     version="select_occurrences_v2",
     purpose="Verify distinct matching occurrences among retrieved memories.",
-    used_by="mindbridge.models.openai_omni.OpenAIOmniAnswerer.select_occurrences",
+    used_by="mindbridge.application.pipelines.answer.OccurrencePipeline",
     text="""# Role
 You verify distinct occurrences in retrieved embodied memories.
 
@@ -225,7 +225,7 @@ CONSOLIDATE_EPISODES_PROMPT = PromptSpec(
     name="consolidate_episodes",
     version="consolidate_episodes_v2",
     purpose="Verify episode boundaries across candidate events.",
-    used_by="mindbridge.models.openai_consolidation.OpenAIOmniEpisodeConsolidator",
+    used_by="mindbridge.application.pipelines.episodes.EpisodePipeline",
     text="""# Role
 You verify episode boundaries in embodied memories by inspecting original image, video, and audio.
 
@@ -251,7 +251,7 @@ CONSOLIDATE_CLAIMS_PROMPT = PromptSpec(
     name="consolidate_claims",
     version="consolidate_claims_v2",
     purpose="Verify durable semantic claim merges and relationships.",
-    used_by="mindbridge.models.openai_claim_consolidation.OpenAIOmniClaimConsolidator",
+    used_by="mindbridge.application.pipelines.claims.ClaimPipeline",
     text="""# Role
 You verify durable semantic claims by inspecting their original image, video, and audio evidence.
 
@@ -281,7 +281,7 @@ CONSOLIDATE_SUMMARIES_PROMPT = PromptSpec(
     name="consolidate_summaries",
     version="consolidate_summaries_v3",
     purpose="Build evidence-faithful hierarchy summaries over memories.",
-    used_by="mindbridge.models.openai_summary_consolidation.OpenAIOmniSummaryConsolidator",
+    used_by="mindbridge.application.pipelines.summaries.SummaryPipeline",
     text="""# Role
 You build a faithful, retrievable hierarchy over embodied memories by inspecting original evidence.
 
@@ -311,7 +311,7 @@ SEGMENT_SPEECH_PROMPT = PromptSpec(
     name="segment_speech",
     version="segment_speech_v1",
     purpose="Transcribe and segment speaker turns in one audiovisual clip.",
-    used_by="mindbridge.edge.identity_diarization.OpenAIAVSpeechSegmenter",
+    used_by="mindbridge.edge.identity_diarization.SpeechSegmentationPipeline",
     text=f"""# Role
 You perform automatic speech recognition and speaker-turn segmentation on one audiovisual clip.
 
@@ -334,7 +334,7 @@ ACTIVE_SPEAKER_PROMPT = PromptSpec(
     name="active_speaker",
     version="active_speaker_v2",
     purpose="Associate timed speech with a visibly speaking face.",
-    used_by="mindbridge.edge.identity_diarization.OpenAIVisualActiveSpeakerMatcher",
+    used_by="mindbridge.edge.identity_diarization.VisualActiveSpeakerPipeline",
     text="""# Role
 You verify whether timed speech belongs to a visible face in one egocentric video.
 

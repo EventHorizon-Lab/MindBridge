@@ -6,7 +6,7 @@ from collections.abc import Callable, Coroutine
 import httpx
 import pytest
 
-from mindbridge import AsyncMindBridge, MindBridgeClientError
+from mindbridge import MindBridge, MindBridgeError
 from mindbridge.contracts import (
     DeletionListRequest,
     FeedbackRequest,
@@ -19,7 +19,7 @@ from mindbridge.core import FeedbackType, ForgetTargetType
 
 async def test_context_manager_closes_the_connection_pool() -> None:
     http_client = httpx.AsyncClient(base_url="https://memory.example.test/")
-    memory = AsyncMindBridge(http_client)
+    memory = MindBridge(http_client)
 
     async with memory as opened:
         assert opened is memory
@@ -85,7 +85,7 @@ async def test_typed_api_error_preserves_retry_information() -> None:
 
     client = _client(respond)
     try:
-        with pytest.raises(MindBridgeClientError) as failure:
+        with pytest.raises(MindBridgeError) as failure:
             await client.recall(
                 RecallRequest(
                     tenant_id="tenant_01",
@@ -274,8 +274,8 @@ async def test_forget_and_status_use_shared_contracts() -> None:
 
 def _client(
     handler: Callable[[httpx.Request], Coroutine[None, None, httpx.Response]],
-) -> AsyncMindBridge:
-    return AsyncMindBridge(
+) -> MindBridge:
+    return MindBridge(
         httpx.AsyncClient(
             base_url="https://memory.example.test/",
             transport=httpx.MockTransport(handler),

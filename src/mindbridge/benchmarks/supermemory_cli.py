@@ -14,8 +14,10 @@ from typing import Literal
 
 from pydantic import AwareDatetime, Field
 
-from mindbridge.application.recall import RETRIEVAL_DOCUMENT_EMBEDDING_TASK
 from mindbridge.benchmarks.artifacts import (
+    DeploymentSnapshot,
+    LoadedDeployment,
+    load_deployment_snapshot,
     require_writable_output_pair,
     sidecar_manifest_path,
     write_text_atomically,
@@ -35,16 +37,11 @@ from mindbridge.benchmarks.supermemory_vqa import (
 )
 from mindbridge.contracts import ContractModel, Identifier, NonEmptyString, Sha256Hex
 from mindbridge.file_integrity import sha256_file
-from mindbridge.models.jina import (
-    DEFAULT_JINA_OMNI_MODEL_ID,
-    DEFAULT_JINA_OMNI_REVISION,
-)
-from mindbridge.models.openai_chat import REASONING_EFFORT_VALUES
-from mindbridge.models.openai_omni import DEFAULT_OMNI_MODEL_ID
+from mindbridge.models import EmbedTask
 from mindbridge.prompts import ANSWER_FROM_EVIDENCE_PROMPT, PERCEIVE_EVENTS_PROMPT
-from mindbridge.sdk import AsyncMindBridge
+from mindbridge.sdk import MindBridge
 
-SUPERMEMORY_RUNNER_VERSION = "supermemory_production_api_v6"
+SUPERMEMORY_RUNNER_VERSION = "supermemory_production_api_v7"
 
 
 class SuperMemoryRunManifest(ContractModel):
@@ -60,15 +57,10 @@ class SuperMemoryRunManifest(ContractModel):
     source_revision: NonEmptyString
     prepared_media_manifest_sha256: Sha256Hex
     code_revision: NonEmptyString
-    perception_model_id: NonEmptyString
-    perception_model_revision: NonEmptyString
+    deployment: DeploymentSnapshot
+    deployment_sha256: Sha256Hex
     perception_prompt_version: NonEmptyString
-    answer_model_id: NonEmptyString
-    answer_model_revision: NonEmptyString
     answer_prompt_version: NonEmptyString
-    reasoning_effort: NonEmptyString
-    embedding_model_id: NonEmptyString
-    embedding_model_revision: NonEmptyString
     retrieval_task: NonEmptyString
     run_id: Identifier
     tenant_prefix: Identifier
@@ -97,13 +89,7 @@ class _Arguments:
     dataset_revision: str
     source_revision: str
     code_revision: str
-    perception_model_id: str
-    perception_model_revision: str
-    answer_model_id: str
-    answer_model_revision: str
-    answer_reasoning_effort: str
-    embedding_model_id: str
-    embedding_model_revision: str
+    deployment_config_path: Path
     run_id: str
     tenant_prefix: str
     device_id: str
@@ -126,8 +112,14 @@ def main() -> None:
     )
     prepared = load_prepared_supermemory(arguments.prepared_media_path)
     require_writable_output_pair(arguments.output_path, overwrite=arguments.overwrite)
+    deployment = load_deployment_snapshot(
+        arguments.deployment_config_path,
+        require_worker=any(
+            segment.media_objects for video in prepared.videos for segment in video.segments
+        ),
+    )
     results = asyncio.run(_run(arguments, questions, prepared))
-    _write_artifacts(arguments, questions, prepared, results)
+    _write_artifacts(arguments, questions, prepared, results, deployment)
 
 
 async def _run(
@@ -135,7 +127,7 @@ async def _run(
     questions: tuple[SuperMemoryQuestion, ...],
     prepared: SuperMemoryPreparedSubject,
 ) -> tuple[SuperMemoryQuestionResult, ...]:
-    memory = AsyncMindBridge.connect(
+    memory = MindBridge.connect(
         base_url=arguments.api_base_url,
         api_key=os.environ.get("MINDBRIDGE_API_KEY"),
         timeout_seconds=arguments.request_timeout_seconds,
@@ -162,6 +154,7 @@ def _write_artifacts(
     questions: tuple[SuperMemoryQuestion, ...],
     prepared: SuperMemoryPreparedSubject,
     results: tuple[SuperMemoryQuestionResult, ...],
+    deployment: LoadedDeployment,
 ) -> None:
     if tuple(result.question_id for result in results) != tuple(
         question.question_id for question in questions
@@ -189,16 +182,11 @@ def _write_artifacts(
         source_revision=arguments.source_revision,
         prepared_media_manifest_sha256=sha256_file(arguments.prepared_media_path),
         code_revision=arguments.code_revision,
-        perception_model_id=arguments.perception_model_id,
-        perception_model_revision=arguments.perception_model_revision,
+        deployment=deployment.snapshot,
+        deployment_sha256=deployment.sha256,
         perception_prompt_version=PERCEIVE_EVENTS_PROMPT.version,
-        answer_model_id=arguments.answer_model_id,
-        answer_model_revision=arguments.answer_model_revision,
         answer_prompt_version=ANSWER_FROM_EVIDENCE_PROMPT.version,
-        reasoning_effort=arguments.answer_reasoning_effort,
-        embedding_model_id=arguments.embedding_model_id,
-        embedding_model_revision=arguments.embedding_model_revision,
-        retrieval_task=RETRIEVAL_DOCUMENT_EMBEDDING_TASK,
+        retrieval_task=EmbedTask.DOCUMENT.value,
         run_id=arguments.run_id,
         tenant_prefix=arguments.tenant_prefix,
         device_id=arguments.device_id,
@@ -259,17 +247,7 @@ def _parse_arguments() -> _Arguments:
     parser.add_argument("--dataset-revision", required=True)
     parser.add_argument("--source-revision", required=True)
     parser.add_argument("--code-revision", required=True)
-    parser.add_argument("--perception-model-id", default=DEFAULT_OMNI_MODEL_ID)
-    parser.add_argument("--perception-model-revision", required=True)
-    parser.add_argument("--answer-model-id", default=DEFAULT_OMNI_MODEL_ID)
-    parser.add_argument("--answer-model-revision", required=True)
-    parser.add_argument(
-        "--answer-reasoning-effort",
-        choices=("omitted", *REASONING_EFFORT_VALUES),
-        required=True,
-    )
-    parser.add_argument("--embedding-model-id", default=DEFAULT_JINA_OMNI_MODEL_ID)
-    parser.add_argument("--embedding-model-revision", default=DEFAULT_JINA_OMNI_REVISION)
+    parser.add_argument("--deployment-config", type=Path, required=True)
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--tenant-prefix", default="benchmark_supermemory")
     parser.add_argument("--device-id", default="supermemory_glasses")
@@ -290,13 +268,7 @@ def _parse_arguments() -> _Arguments:
         dataset_revision=parsed.dataset_revision,
         source_revision=parsed.source_revision,
         code_revision=parsed.code_revision,
-        perception_model_id=parsed.perception_model_id,
-        perception_model_revision=parsed.perception_model_revision,
-        answer_model_id=parsed.answer_model_id,
-        answer_model_revision=parsed.answer_model_revision,
-        answer_reasoning_effort=parsed.answer_reasoning_effort,
-        embedding_model_id=parsed.embedding_model_id,
-        embedding_model_revision=parsed.embedding_model_revision,
+        deployment_config_path=parsed.deployment_config,
         run_id=parsed.run_id,
         tenant_prefix=parsed.tenant_prefix,
         device_id=parsed.device_id,

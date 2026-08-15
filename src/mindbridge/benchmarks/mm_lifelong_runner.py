@@ -26,7 +26,7 @@ from mindbridge.contracts import (
     RememberRequest,
 )
 from mindbridge.core import MediaKind, MemoryType, SensorKind
-from mindbridge.sdk import AsyncMindBridge
+from mindbridge.sdk import MindBridge
 
 
 class MMLifelongPreparedSegment(ContractModel):
@@ -112,7 +112,7 @@ def load_prepared_mm_lifelong(path: Path) -> MMLifelongPreparedTimeline:
 
 
 async def run_mm_lifelong(
-    memory: AsyncMindBridge,
+    memory: MindBridge,
     questions: tuple[MMLifelongQuestion, ...],
     prepared: MMLifelongPreparedTimeline,
     *,
@@ -187,7 +187,7 @@ async def run_mm_lifelong(
 
 
 async def _ingest_segment(
-    memory: AsyncMindBridge,
+    memory: MindBridge,
     tenant_id: str,
     device_id: str,
     prepared: MMLifelongPreparedTimeline,
@@ -248,7 +248,7 @@ async def _ingest_segment(
 
 
 async def _answer_question(
-    memory: AsyncMindBridge,
+    memory: MindBridge,
     tenant_id: str,
     question: MMLifelongQuestion,
     prepared: MMLifelongPreparedTimeline,

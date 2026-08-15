@@ -32,7 +32,7 @@ from mindbridge.contracts import (
     RememberRequest,
 )
 from mindbridge.core import MediaKind, MemoryType, SensorKind
-from mindbridge.sdk import AsyncMindBridge
+from mindbridge.sdk import MindBridge
 
 
 class SuperMemoryPreparedSegment(ContractModel):
@@ -169,7 +169,7 @@ def load_prepared_supermemory(path: Path) -> SuperMemoryPreparedSubject:
 
 
 async def run_supermemory_vqa(
-    memory: AsyncMindBridge,
+    memory: MindBridge,
     questions: tuple[SuperMemoryQuestion, ...],
     prepared: SuperMemoryPreparedSubject,
     *,
@@ -290,7 +290,7 @@ def evaluate_supermemory_vqa(
 
 
 async def _ingest_segment(
-    memory: AsyncMindBridge,
+    memory: MindBridge,
     tenant_id: str,
     device_id: str,
     subject: int,
@@ -349,7 +349,7 @@ async def _ingest_segment(
 
 
 async def _answer_question(
-    memory: AsyncMindBridge,
+    memory: MindBridge,
     tenant_id: str,
     question: SuperMemoryQuestion,
     recall_limit: int,

@@ -18,7 +18,6 @@ from mindbridge.application.ports import (
     PresignedMediaDownload,
     ResolvedQueryMedia,
 )
-from mindbridge.application.recall import RecallEmbeddingQuery
 from mindbridge.contracts import (
     FeedbackRequest,
     IdentityObservationInput,
@@ -54,13 +53,14 @@ from mindbridge.core import (
     VerificationStatus,
 )
 from mindbridge.infrastructure.postgres import PostgresMemoryStore
+from mindbridge.models import Embedding, EmbedRequest, EmbedResult
 
 NOW = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
 
 pytestmark = pytest.mark.integration
 
 
-class FirstMemoryAnswerer:
+class FirstCandidateAnswerer:
     """Deterministic answerer for persistence-path verification."""
 
     async def answer(
@@ -113,19 +113,16 @@ class DiscardingObservationJobPublisher:
         return None
 
 
-class FixedRecallEmbedder:
+class FixedEmbedder:
     """Keeps persistence integration independent from the embedding service."""
 
-    query_model_reference = ModelReference(model_id="jina-omni", revision="pinned-revision")
-    document_model_reference = ModelReference(model_id="jina-text", revision="pinned-revision")
+    model_reference = ModelReference(model_id="jina-omni", revision="pinned-revision")
     space_reference = EmbeddingSpaceReference(space_id="jina-v5", revision="space-v1")
-    dimension = 1_024
 
-    async def encode_query(self, query: RecallEmbeddingQuery) -> tuple[float, ...]:
-        return (1.0,) + (0.0,) * 1_023
-
-    async def encode_memory_document(self, text: str) -> tuple[float, ...]:
-        return (1.0,) + (0.0,) * 1_023
+    async def embed(self, request: EmbedRequest) -> EmbedResult:
+        vector = (1.0,) + (0.0,) * 1_023
+        embedding = Embedding(vector, self.model_reference, self.space_reference)
+        return EmbedResult((embedding,) * len(request.inputs))
 
 
 async def test_migration_installs_complete_phase_zero_schema(database_url: str) -> None:
@@ -699,13 +696,15 @@ def _remember_request(*, tenant_id: str, evidence_id: str) -> RememberRequest:
 
 def _kernel(store: PostgresMemoryStore) -> MemoryKernel:
     media_access = DeterministicMediaUrlSigner()
+    answerer = FirstCandidateAnswerer()
     return MemoryKernel(
         store,
-        FirstMemoryAnswerer(),
+        answerer,
+        answerer,
         embedding_index=store,
         media_deleter=media_access,
         media_url_signer=media_access,
         observation_job_publisher=DiscardingObservationJobPublisher(),
-        recall_embedder=FixedRecallEmbedder(),
+        embedder=FixedEmbedder(),
         clock=lambda: NOW,
     )

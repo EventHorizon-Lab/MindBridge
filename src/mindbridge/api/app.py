@@ -54,7 +54,7 @@ from mindbridge.core import (
 from mindbridge.telemetry import current_trace_id
 
 
-def create_app(
+def build_app(
     kernel: MemoryKernel,
     *,
     authenticator: TenantApiKeyAuthenticator,

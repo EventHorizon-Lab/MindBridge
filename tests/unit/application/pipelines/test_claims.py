@@ -1,4 +1,4 @@
-"""Contract tests for evidence-first semantic Claim consolidation."""
+"""Contract tests for the evidence-first Claim pipeline."""
 
 import json
 from collections.abc import Callable, Coroutine, Iterator
@@ -11,6 +11,7 @@ from openai import AsyncOpenAI
 
 from mindbridge.application.claim_consolidation import ClaimCandidate
 from mindbridge.application.perception import ResolvedEvidence
+from mindbridge.application.pipelines import ClaimPipeline
 from mindbridge.core import (
     Claim,
     ClaimId,
@@ -28,8 +29,7 @@ from mindbridge.core import (
     TenantId,
     VerificationStatus,
 )
-from mindbridge.models.openai_claim_consolidation import OpenAIOmniClaimConsolidator
-from mindbridge.models.openai_omni import normalize_openai_base_url
+from mindbridge.models.openai import OpenAIGenerator, normalize_base_url
 
 NOW = datetime(2026, 8, 12, 12, 0, tzinfo=timezone.utc)
 
@@ -132,9 +132,9 @@ async def test_claim_consolidator_rejects_unknown_and_reversed_relationships() -
 
     consolidator = _consolidator(respond)
     try:
-        with pytest.raises(ModelOutputError, match="unknown Claim"):
+        with pytest.raises(ModelOutputError, match="unknown claim"):
             await consolidator.propose_claims(*_candidates())
-        with pytest.raises(ModelOutputError, match="later Claim"):
+        with pytest.raises(ModelOutputError, match="later claim"):
             await consolidator.propose_claims(*_candidates())
     finally:
         await consolidator.close()
@@ -175,14 +175,28 @@ async def test_claim_consolidator_retries_invalid_structure_in_json_mode() -> No
 
 def _consolidator(
     handler: Callable[[httpx.Request], Coroutine[None, None, httpx.Response]],
-) -> OpenAIOmniClaimConsolidator:
+) -> "_ClaimHarness":
     client = AsyncOpenAI(
         api_key="unit-test-key",
-        base_url=normalize_openai_base_url("https://vlm.example.test/api/v1/chat/completions"),
+        base_url=normalize_base_url("https://vlm.example.test/api/v1/chat/completions"),
         http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
         max_retries=0,
     )
-    return OpenAIOmniClaimConsolidator(client, model_revision="deployment-revision")
+    return _ClaimHarness(
+        OpenAIGenerator(
+            client,
+            ModelReference(model_id="qwen3.8-max", revision="deployment-revision"),
+        )
+    )
+
+
+class _ClaimHarness(ClaimPipeline):
+    def __init__(self, generator: OpenAIGenerator) -> None:
+        super().__init__(generator)
+        self._owned_generator = generator
+
+    async def close(self) -> None:
+        await self._owned_generator.close()
 
 
 def _candidates() -> tuple[tuple[ClaimCandidate, ...], tuple[ResolvedEvidence, ...]]:

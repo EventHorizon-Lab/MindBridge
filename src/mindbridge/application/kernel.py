@@ -8,22 +8,26 @@ import math
 from collections.abc import Callable
 from datetime import datetime, timezone
 
+from mindbridge.application.capabilities import (
+    Embedder,
+    EmbedRequest,
+    EmbedTask,
+    ModelInput,
+    Reranker,
+    TextPart,
+)
 from mindbridge.application.evidence import read_resolved_memory_evidence
 from mindbridge.application.observation_processing import ObservationBatch
 from mindbridge.application.ports import (
+    Answerer,
     EmbeddingIndex,
     MediaDeleter,
     MediaUrlSigner,
-    MemoryAnswerer,
     MemoryStore,
     ObservationJobPublisher,
+    OccurrenceVerifier,
 )
-from mindbridge.application.recall import (
-    RETRIEVAL_DOCUMENT_EMBEDDING_TASK,
-    RecallEmbedder,
-    RecallMemories,
-    memory_result,
-)
+from mindbridge.application.recall import RecallMemories, memory_result
 from mindbridge.contracts import (
     ContractModel,
     DeletionListRequest,
@@ -60,6 +64,7 @@ from mindbridge.core import (
     MemoryFeedback,
     MemoryId,
     MemoryRecord,
+    ModelOutputError,
     ModelReference,
     ObjectStorageError,
     Observation,
@@ -82,13 +87,15 @@ class MemoryKernel:
     def __init__(
         self,
         store: MemoryStore,
-        answerer: MemoryAnswerer,
+        answerer: Answerer,
+        occurrence_verifier: OccurrenceVerifier,
         *,
         embedding_index: EmbeddingIndex,
         media_deleter: MediaDeleter,
         media_url_signer: MediaUrlSigner,
         observation_job_publisher: ObservationJobPublisher,
-        recall_embedder: RecallEmbedder,
+        embedder: Embedder,
+        reranker: Reranker | None = None,
         minimum_embedding_similarity: float = 0.0,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
@@ -102,14 +109,16 @@ class MemoryKernel:
         self._media_deleter = media_deleter
         self._media_url_signer = media_url_signer
         self._observation_job_publisher = observation_job_publisher
-        self._recall_embedder = recall_embedder
+        self._embedder = embedder
         self._clock = clock or _utc_now
         self._recall = RecallMemories(
             store,
             answerer,
+            occurrence_verifier,
             embedding_index=embedding_index,
             media_url_signer=media_url_signer,
-            recall_embedder=recall_embedder,
+            embedder=embedder,
+            reranker=reranker,
             minimum_embedding_similarity=minimum_embedding_similarity,
             clock=self._clock,
         )
@@ -397,12 +406,21 @@ class MemoryKernel:
 
     @trace_operation("mindbridge.index_memory")
     async def _index_memory(self, memory: MemoryRecord, *, skip_existing: bool = False) -> None:
+        result = await self._embedder.embed(
+            EmbedRequest(
+                inputs=(ModelInput((TextPart(memory.summary),)),),
+                task=EmbedTask.DOCUMENT,
+            )
+        )
+        if len(result.embeddings) != 1:
+            raise ModelOutputError("embedder returned the wrong memory vector count")
+        embedding = result.embeddings[0]
         set_current_span_attributes(
             {
                 "mindbridge.tenant.id": memory.tenant_id,
                 "mindbridge.memory.id": memory.memory_id,
-                "mindbridge.model.id": self._recall_embedder.document_model_reference.model_id,
-                "mindbridge.embedding.dimension": self._recall_embedder.dimension,
+                "mindbridge.model.id": embedding.model_reference.model_id,
+                "mindbridge.embedding.dimension": embedding.dimension,
             }
         )
         embedding_id = EmbeddingId(
@@ -410,29 +428,28 @@ class MemoryKernel:
                 "embedding",
                 memory.tenant_id,
                 memory.memory_id,
-                self._recall_embedder.document_model_reference.model_id,
-                self._recall_embedder.document_model_reference.revision,
-                self._recall_embedder.space_reference.space_id,
-                self._recall_embedder.space_reference.revision,
-                RETRIEVAL_DOCUMENT_EMBEDDING_TASK,
+                embedding.model_reference.model_id,
+                embedding.model_reference.revision,
+                embedding.space_reference.space_id,
+                embedding.space_reference.revision,
+                EmbedTask.DOCUMENT.value,
             )
         )
         if skip_existing and await self._embedding_index.has_embedding(
             memory.tenant_id, embedding_id
         ):
             return
-        values = await self._recall_embedder.encode_memory_document(memory.summary)
         await self._embedding_index.write_embedding(
             EmbeddingRecord(
                 embedding_id=embedding_id,
                 tenant_id=memory.tenant_id,
                 object_type=EmbeddedObjectType.MEMORY_RECORD,
                 object_id=memory.memory_id,
-                values=values,
-                model_reference=self._recall_embedder.document_model_reference,
-                space_reference=self._recall_embedder.space_reference,
-                task=RETRIEVAL_DOCUMENT_EMBEDDING_TASK,
-                dimension=self._recall_embedder.dimension,
+                values=embedding.values,
+                model_reference=embedding.model_reference,
+                space_reference=embedding.space_reference,
+                task=EmbedTask.DOCUMENT.value,
+                dimension=embedding.dimension,
                 normalized=True,
                 created_at=memory.created_at,
             )

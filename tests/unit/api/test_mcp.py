@@ -5,7 +5,7 @@ from typing import cast
 
 from mcp import Client
 
-from mindbridge.api import create_mcp_server
+from mindbridge.api.mcp import build_mcp_server
 from mindbridge.application.kernel import MemoryKernel
 from mindbridge.contracts import (
     FeedbackReceipt,
@@ -54,7 +54,7 @@ class StubKernel:
 
 
 async def test_mcp_lists_stable_tools_from_shared_contracts() -> None:
-    server = create_mcp_server(cast(MemoryKernel, StubKernel()))
+    server = build_mcp_server(cast(MemoryKernel, StubKernel()))
 
     async with Client(server) as client:
         result = await client.list_tools()
@@ -81,7 +81,7 @@ async def test_mcp_lists_stable_tools_from_shared_contracts() -> None:
 
 
 async def test_mcp_calls_shared_kernel_and_returns_structured_output() -> None:
-    server = create_mcp_server(cast(MemoryKernel, StubKernel()))
+    server = build_mcp_server(cast(MemoryKernel, StubKernel()))
     request = RememberRequest(
         tenant_id="tenant_01",
         summary="A red cup was left on the table",

@@ -24,7 +24,7 @@ from mindbridge.edge.outbox import EdgeMediaFile, SQLiteObservationOutbox
 from mindbridge.edge.recent_memory import SQLiteRecentMemory
 from mindbridge.file_integrity import sha256_file
 from mindbridge.infrastructure.s3 import tenant_s3_object_key
-from mindbridge.sdk import AsyncMindBridge, MindBridgeClientError
+from mindbridge.sdk import MindBridge, MindBridgeError
 from mindbridge.telemetry import set_current_span_attributes, trace_operation
 
 if TYPE_CHECKING:
@@ -107,7 +107,7 @@ class EdgeObservationSynchronizer:
         self,
         outbox: SQLiteObservationOutbox,
         deletion_inbox: SQLiteDeletionInbox,
-        memory: AsyncMindBridge,
+        memory: MindBridge,
         upload_media: UploadEdgeMedia,
         *,
         recent_memory: SQLiteRecentMemory,
@@ -225,7 +225,7 @@ class EdgeObservationSynchronizer:
             for memory_id in job.memory_ids:
                 try:
                     memory = await self._memory.get_memory(pending.tenant_id, memory_id)
-                except MindBridgeClientError as error:
+                except MindBridgeError as error:
                     if error.code == "memory_deleted":
                         continue
                     raise
@@ -264,7 +264,7 @@ class EdgeObservationSynchronizer:
 
 
 def _network_error_code(error: Exception) -> str:
-    if isinstance(error, MindBridgeClientError):
+    if isinstance(error, MindBridgeError):
         return error.code
     if isinstance(error, ObjectStorageError):
         return "object_storage_error"

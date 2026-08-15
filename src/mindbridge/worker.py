@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
+import json
 import os
 from collections.abc import Mapping
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
-from functools import lru_cache
 from typing import NoReturn, Protocol
 
 from billiard.exceptions import (
@@ -16,13 +17,21 @@ from billiard.exceptions import (
 from celery import Celery
 from celery.signals import (
     worker_process_init,
+    worker_process_shutdown,
 )
 
+from mindbridge.application.capabilities import Embedder
+from mindbridge.application.pipelines import PerceptionPipeline
 from mindbridge.application.process_observation import ProcessObservation
-from mindbridge.configuration import optional_environment_value, require_environment_value
+from mindbridge.configuration import (
+    copy_plugin_configuration,
+    optional_environment_value,
+    plugin_configuration,
+    require_environment_value,
+    validate_plugin_name,
+)
 from mindbridge.core import (
     DatabaseUnavailableError,
-    EmbeddingSpaceReference,
     JobId,
     JobState,
     ModelUnavailableError,
@@ -37,19 +46,16 @@ from mindbridge.infrastructure.task_queue import (
     ObservationProcessingTaskMessage,
     create_task_queue,
 )
-from mindbridge.models.jina import (
-    DEFAULT_JINA_OMNI_MODEL_ID,
-    DEFAULT_JINA_OMNI_REVISION,
-    DEFAULT_JINA_RETRIEVAL_SPACE,
-    DEFAULT_JINA_TEXT_MODEL_ID,
-    DEFAULT_JINA_TEXT_REVISION,
-    JinaOmniEmbedder,
+from mindbridge.models.defaults import (
+    DEFAULT_EMBEDDING_DIMENSION,
+    DEFAULT_EMBEDDING_SPACE,
+    DEFAULT_GENERATOR_MODEL_ID,
+    DEFAULT_MEDIA_EMBEDDER_MODEL_ID,
+    DEFAULT_MEDIA_EMBEDDER_REVISION,
+    DEFAULT_TEXT_EMBEDDER_MODEL_ID,
+    DEFAULT_TEXT_EMBEDDER_REVISION,
 )
-from mindbridge.models.openai_embeddings import OpenAIJinaTextEmbedder
-from mindbridge.models.openai_omni import DEFAULT_OMNI_MODEL_ID
-from mindbridge.models.openai_perception import (
-    OpenAIOmniEventPerceiver,
-)
+from mindbridge.models.plugins import load_embedder, load_generator
 from mindbridge.telemetry import configure_telemetry
 
 _MODEL_REQUEST_TIMEOUT_SECONDS = 780.0
@@ -62,6 +68,7 @@ _RUNNING_RETRIES_HEADER = "mindbridge_running_retries"
 @worker_process_init.connect(weak=False)  # type: ignore[untyped-decorator]
 def _configure_worker_telemetry(**_kwargs: object) -> None:
     """Initialize exporters after Celery forks its process-safe worker child."""
+    _dispose_worker_runtime()
     configure_telemetry("mindbridge-worker")
 
 
@@ -90,21 +97,14 @@ class WorkerSettings:
     database_url: str = field(repr=False)
     object_storage_bucket: str
     task_broker_url: str = field(repr=False)
-    vlm_api_key: str = field(repr=False)
-    vlm_endpoint: str
-    vlm_model_revision: str
-    text_embedding_api_key: str = field(repr=False)
-    text_embedding_endpoint: str
+    generator_config: Mapping[str, object] = field(repr=False)
+    media_embedder_config: Mapping[str, object] = field(repr=False)
+    text_embedder_config: Mapping[str, object] = field(repr=False)
     object_storage_endpoint_url: str | None = None
     object_storage_region: str = "us-east-1"
-    vlm_model_id: str = DEFAULT_OMNI_MODEL_ID
-    jina_model_id: str = DEFAULT_JINA_OMNI_MODEL_ID
-    jina_model_revision: str = DEFAULT_JINA_OMNI_REVISION
-    text_embedding_model_id: str = DEFAULT_JINA_TEXT_MODEL_ID
-    text_embedding_model_revision: str = DEFAULT_JINA_TEXT_REVISION
-    embedding_space_id: str = DEFAULT_JINA_RETRIEVAL_SPACE.space_id
-    embedding_space_revision: str = DEFAULT_JINA_RETRIEVAL_SPACE.revision
-    jina_device: str | None = None
+    generator_plugin: str = "openai"
+    media_embedder_plugin: str = "jina"
+    text_embedder_plugin: str = "openai"
 
     def __post_init__(self) -> None:
         for name, value in (
@@ -112,32 +112,34 @@ class WorkerSettings:
             ("object_storage_bucket", self.object_storage_bucket),
             ("object_storage_region", self.object_storage_region),
             ("task_broker_url", self.task_broker_url),
-            ("vlm_api_key", self.vlm_api_key),
-            ("vlm_endpoint", self.vlm_endpoint),
-            ("vlm_model_id", self.vlm_model_id),
-            ("vlm_model_revision", self.vlm_model_revision),
-            ("text_embedding_api_key", self.text_embedding_api_key),
-            ("text_embedding_endpoint", self.text_embedding_endpoint),
-            ("text_embedding_model_id", self.text_embedding_model_id),
-            ("text_embedding_model_revision", self.text_embedding_model_revision),
-            ("jina_model_id", self.jina_model_id),
-            ("jina_model_revision", self.jina_model_revision),
-            ("embedding_space_id", self.embedding_space_id),
-            ("embedding_space_revision", self.embedding_space_revision),
         ):
             if not value.strip():
                 raise ValueError(f"{name} must not be empty")
-        for name, optional_value in (
-            ("object_storage_endpoint_url", self.object_storage_endpoint_url),
-            ("jina_device", self.jina_device),
+        for name, value in (
+            ("generator_plugin", self.generator_plugin),
+            ("media_embedder_plugin", self.media_embedder_plugin),
+            ("text_embedder_plugin", self.text_embedder_plugin),
         ):
-            if optional_value is not None and not optional_value.strip():
-                raise ValueError(f"{name} must not be empty when provided")
+            validate_plugin_name(value, name)
+        for name, config in (
+            ("generator_config", self.generator_config),
+            ("media_embedder_config", self.media_embedder_config),
+            ("text_embedder_config", self.text_embedder_config),
+        ):
+            object.__setattr__(self, name, copy_plugin_configuration(config, name))
+        if (
+            self.object_storage_endpoint_url is not None
+            and not self.object_storage_endpoint_url.strip()
+        ):
+            raise ValueError("object_storage_endpoint_url must not be empty when provided")
 
     @classmethod
     def from_environment(cls, environ: Mapping[str, str] | None = None) -> WorkerSettings:
         """Read the explicit Worker contract and fail before consuming jobs."""
         source = os.environ if environ is None else environ
+        generator_plugin = source.get("MINDBRIDGE_GENERATOR_PLUGIN", "openai")
+        media_plugin = source.get("MINDBRIDGE_MEDIA_EMBEDDER_PLUGIN", "jina")
+        text_plugin = source.get("MINDBRIDGE_TEXT_EMBEDDER_PLUGIN", "openai")
         return cls(
             database_url=require_environment_value(source, "MINDBRIDGE_DATABASE_URL"),
             object_storage_bucket=require_environment_value(
@@ -148,34 +150,61 @@ class WorkerSettings:
             ),
             object_storage_region=source.get("MINDBRIDGE_OBJECT_STORAGE_REGION", "us-east-1"),
             task_broker_url=require_environment_value(source, "MINDBRIDGE_TASK_BROKER_URL"),
-            vlm_api_key=require_environment_value(source, "MINDBRIDGE_VLM_API_KEY"),
-            vlm_endpoint=require_environment_value(source, "MINDBRIDGE_VLM_ENDPOINT"),
-            vlm_model_id=source.get("MINDBRIDGE_VLM_MODEL_ID", DEFAULT_OMNI_MODEL_ID),
-            vlm_model_revision=require_environment_value(source, "MINDBRIDGE_VLM_MODEL_REVISION"),
-            text_embedding_api_key=require_environment_value(
-                source, "MINDBRIDGE_TEXT_EMBEDDING_API_KEY"
+            generator_plugin=generator_plugin,
+            generator_config=plugin_configuration(
+                source,
+                "MINDBRIDGE_GENERATOR_CONFIG_JSON",
+                (lambda: _generator_config(source)) if generator_plugin == "openai" else None,
             ),
-            text_embedding_endpoint=require_environment_value(
-                source, "MINDBRIDGE_TEXT_EMBEDDING_ENDPOINT"
+            media_embedder_plugin=media_plugin,
+            media_embedder_config=plugin_configuration(
+                source,
+                "MINDBRIDGE_MEDIA_EMBEDDER_CONFIG_JSON",
+                (lambda: _media_embedder_config(source)) if media_plugin == "jina" else None,
             ),
-            text_embedding_model_id=source.get(
-                "MINDBRIDGE_TEXT_EMBEDDING_MODEL_ID", DEFAULT_JINA_TEXT_MODEL_ID
+            text_embedder_plugin=text_plugin,
+            text_embedder_config=plugin_configuration(
+                source,
+                "MINDBRIDGE_TEXT_EMBEDDER_CONFIG_JSON",
+                (lambda: _text_embedder_config(source)) if text_plugin == "openai" else None,
             ),
-            text_embedding_model_revision=source.get(
-                "MINDBRIDGE_TEXT_EMBEDDING_MODEL_REVISION", DEFAULT_JINA_TEXT_REVISION
-            ),
-            jina_model_id=source.get("MINDBRIDGE_JINA_MODEL_ID", DEFAULT_JINA_OMNI_MODEL_ID),
-            jina_model_revision=source.get(
-                "MINDBRIDGE_JINA_MODEL_REVISION", DEFAULT_JINA_OMNI_REVISION
-            ),
-            embedding_space_id=source.get(
-                "MINDBRIDGE_EMBEDDING_SPACE_ID", DEFAULT_JINA_RETRIEVAL_SPACE.space_id
-            ),
-            embedding_space_revision=source.get(
-                "MINDBRIDGE_EMBEDDING_SPACE_REVISION", DEFAULT_JINA_RETRIEVAL_SPACE.revision
-            ),
-            jina_device=optional_environment_value(source, "MINDBRIDGE_JINA_DEVICE"),
         )
+
+
+@dataclass(slots=True)
+class _WorkerRuntime:
+    """One event loop and media model owned by a prefork Worker child."""
+
+    loop: asyncio.AbstractEventLoop
+    media_embedder: Embedder
+
+    def run(self, settings: WorkerSettings, message: ObservationProcessingTaskMessage) -> JobState:
+        task = self.loop.create_task(
+            _process_observation_once(
+                settings,
+                self.media_embedder,
+                TenantId(message.tenant_id),
+                ObservationId(message.observation_id),
+                JobId(message.job_id),
+            )
+        )
+        try:
+            return self.loop.run_until_complete(task)
+        except BaseException:
+            if not task.done():
+                task.cancel()
+                self.loop.run_until_complete(asyncio.gather(task, return_exceptions=True))
+            raise
+
+    def close(self) -> None:
+        try:
+            self.loop.run_until_complete(_close_model(self.media_embedder))
+        finally:
+            self.loop.close()
+
+
+_worker_runtime: _WorkerRuntime | None = None
+_worker_runtime_key: tuple[str, str] | None = None
 
 
 def create_worker_app(settings: WorkerSettings) -> Celery:
@@ -235,27 +264,16 @@ def run_observation_processing(
     message: ObservationProcessingTaskMessage,
 ) -> JobState:
     """Run one synchronous Celery delivery through the shared async use case."""
-    embedder = _load_embedder(
-        settings.jina_model_id,
-        settings.jina_model_revision,
-        settings.jina_device,
-        settings.embedding_space_id,
-        settings.embedding_space_revision,
+    runtime = _get_worker_runtime(
+        settings.media_embedder_plugin,
+        json.dumps(settings.media_embedder_config, sort_keys=True, separators=(",", ":")),
     )
-    return asyncio.run(
-        _process_observation_once(
-            settings,
-            embedder,
-            TenantId(message.tenant_id),
-            ObservationId(message.observation_id),
-            JobId(message.job_id),
-        )
-    )
+    return runtime.run(settings, message)
 
 
 async def _process_observation_once(
     settings: WorkerSettings,
-    embedder: JinaOmniEmbedder,
+    media_embedder: Embedder,
     tenant_id: TenantId,
     observation_id: ObservationId,
     job_id: JobId,
@@ -266,54 +284,129 @@ async def _process_observation_once(
         endpoint_url=settings.object_storage_endpoint_url,
         region_name=settings.object_storage_region,
     )
-    perceiver = OpenAIOmniEventPerceiver.connect(
-        api_key=settings.vlm_api_key,
-        endpoint=settings.vlm_endpoint,
-        model_id=settings.vlm_model_id,
-        model_revision=settings.vlm_model_revision,
-        request_timeout_seconds=_MODEL_REQUEST_TIMEOUT_SECONDS,
-    )
-    text_embedder = OpenAIJinaTextEmbedder.connect(
-        api_key=settings.text_embedding_api_key,
-        endpoint=settings.text_embedding_endpoint,
-        model_id=settings.text_embedding_model_id,
-        model_revision=settings.text_embedding_model_revision,
-        space_reference=EmbeddingSpaceReference(
-            space_id=settings.embedding_space_id,
-            revision=settings.embedding_space_revision,
-        ),
-        request_timeout_seconds=_MODEL_REQUEST_TIMEOUT_SECONDS,
-    )
     async with AsyncExitStack() as resources:
-        resources.push_async_callback(perceiver.close)
-        resources.push_async_callback(text_embedder.close)
+        generator = load_generator(settings.generator_plugin, settings.generator_config)
+        resources.push_async_callback(_close_model, generator)
+        text_embedder = load_embedder(settings.text_embedder_plugin, settings.text_embedder_config)
+        resources.push_async_callback(_close_model, text_embedder)
         await store.open()
         resources.push_async_callback(store.close)
         job = await ProcessObservation(
             store,
-            perceiver,
-            embedder,
+            PerceptionPipeline(generator),
+            media_embedder,
             text_embedder,
             media_url_signer=media_access,
         ).run(tenant_id, observation_id, job_id)
     return job.state
 
 
-@lru_cache(maxsize=1)
-def _load_embedder(
-    model_id: str,
-    model_revision: str,
-    device: str | None,
-    embedding_space_id: str,
-    embedding_space_revision: str,
-) -> JinaOmniEmbedder:
+def _get_worker_runtime(
+    plugin: str,
+    config_json: str,
+) -> _WorkerRuntime:
+    global _worker_runtime, _worker_runtime_key
     # ponytail: one frozen model per worker process; split queues when multiple models are needed.
-    return JinaOmniEmbedder.load(
-        model_id=model_id,
-        revision=model_revision,
-        device=device,
-        space_reference=EmbeddingSpaceReference(
-            space_id=embedding_space_id,
-            revision=embedding_space_revision,
+    key = (plugin, config_json)
+    if _worker_runtime is not None:
+        if _worker_runtime_key != key:
+            raise RuntimeError("worker media plugin configuration changed after initialization")
+        return _worker_runtime
+    loop = asyncio.new_event_loop()
+    try:
+        media_embedder = loop.run_until_complete(_create_media_embedder(plugin, config_json))
+    except BaseException:
+        loop.close()
+        raise
+    _worker_runtime = _WorkerRuntime(loop, media_embedder)
+    _worker_runtime_key = key
+    return _worker_runtime
+
+
+async def _create_media_embedder(plugin: str, config_json: str) -> Embedder:
+    """Construct the plugin while its owning event loop is running."""
+    config = json.loads(config_json)
+    if not isinstance(config, dict):
+        raise ValueError("cached embedder config must be a JSON object")
+    return load_embedder(plugin, config)
+
+
+def _dispose_worker_runtime() -> None:
+    global _worker_runtime, _worker_runtime_key
+    runtime = _worker_runtime
+    _worker_runtime = None
+    _worker_runtime_key = None
+    if runtime is not None:
+        runtime.close()
+
+
+@worker_process_shutdown.connect(weak=False)  # type: ignore[untyped-decorator]
+def _close_worker_runtime(**_kwargs: object) -> None:
+    """Release the process-owned plugin before the prefork child exits."""
+    _dispose_worker_runtime()
+
+
+async def _close_model(model: object) -> None:
+    close = getattr(model, "close", None)
+    if close is None:
+        return
+    result = close()
+    if inspect.isawaitable(result):
+        await result
+
+
+def _generator_config(source: Mapping[str, str]) -> Mapping[str, object]:
+    return {
+        "api_key": require_environment_value(source, "MINDBRIDGE_GENERATOR_API_KEY"),
+        "endpoint": require_environment_value(source, "MINDBRIDGE_GENERATOR_ENDPOINT"),
+        "model_id": source.get("MINDBRIDGE_GENERATOR_MODEL_ID", DEFAULT_GENERATOR_MODEL_ID),
+        "model_revision": require_environment_value(source, "MINDBRIDGE_GENERATOR_MODEL_REVISION"),
+        "request_timeout_seconds": _MODEL_REQUEST_TIMEOUT_SECONDS,
+    }
+
+
+def _media_embedder_config(source: Mapping[str, str]) -> Mapping[str, object]:
+    config: dict[str, object] = {
+        "model_id": source.get(
+            "MINDBRIDGE_MEDIA_EMBEDDER_MODEL_ID", DEFAULT_MEDIA_EMBEDDER_MODEL_ID
         ),
-    )
+        "revision": source.get(
+            "MINDBRIDGE_MEDIA_EMBEDDER_MODEL_REVISION", DEFAULT_MEDIA_EMBEDDER_REVISION
+        ),
+        "space_id": source.get("MINDBRIDGE_EMBEDDING_SPACE_ID", DEFAULT_EMBEDDING_SPACE.space_id),
+        "space_revision": source.get(
+            "MINDBRIDGE_EMBEDDING_SPACE_REVISION", DEFAULT_EMBEDDING_SPACE.revision
+        ),
+        "dimension": int(
+            source.get("MINDBRIDGE_EMBEDDING_DIMENSION", str(DEFAULT_EMBEDDING_DIMENSION))
+        ),
+    }
+    device = optional_environment_value(source, "MINDBRIDGE_MEDIA_EMBEDDER_DEVICE")
+    if device is not None:
+        config["device"] = device
+    return config
+
+
+def _text_embedder_config(source: Mapping[str, str]) -> Mapping[str, object]:
+    api_key = require_environment_value(source, "MINDBRIDGE_TEXT_EMBEDDER_API_KEY")
+    endpoint = require_environment_value(source, "MINDBRIDGE_TEXT_EMBEDDER_ENDPOINT")
+    model_id = source.get("MINDBRIDGE_TEXT_EMBEDDER_MODEL_ID", DEFAULT_TEXT_EMBEDDER_MODEL_ID)
+    revision = source.get("MINDBRIDGE_TEXT_EMBEDDER_MODEL_REVISION", DEFAULT_TEXT_EMBEDDER_REVISION)
+    return {
+        "api_key": api_key,
+        "endpoint": endpoint,
+        "model_id": model_id,
+        "model_revision": revision,
+        "document_api_key": api_key,
+        "document_endpoint": endpoint,
+        "document_model_id": model_id,
+        "document_model_revision": revision,
+        "space_id": source.get("MINDBRIDGE_EMBEDDING_SPACE_ID", DEFAULT_EMBEDDING_SPACE.space_id),
+        "space_revision": source.get(
+            "MINDBRIDGE_EMBEDDING_SPACE_REVISION", DEFAULT_EMBEDDING_SPACE.revision
+        ),
+        "dimension": int(
+            source.get("MINDBRIDGE_EMBEDDING_DIMENSION", str(DEFAULT_EMBEDDING_DIMENSION))
+        ),
+        "request_timeout_seconds": _MODEL_REQUEST_TIMEOUT_SECONDS,
+    }

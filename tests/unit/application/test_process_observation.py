@@ -50,6 +50,7 @@ from mindbridge.core import (
     SensorKind,
     TenantId,
 )
+from mindbridge.models import Embedding, EmbedRequest, EmbedResult, MediaPart, TextPart
 
 NOW = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
 TENANT_ID = TenantId("tenant_01")
@@ -174,41 +175,49 @@ class RecordingPerceiver:
 class RecordingEmbedder:
     """Proves raw signed media, not a caption, reaches Jina document encoding."""
 
-    model_reference = ModelReference(model_id="jina-omni", revision="revision-01")
-    space_reference = EmbeddingSpaceReference(space_id="jina-v5", revision="space-v1")
-    dimension = 2
-
-    def __init__(self) -> None:
-        self.documents: tuple[str | bytes | tuple[str | bytes, ...], ...] = ()
-
-    async def encode_queries(
-        self,
-        inputs: tuple[str | bytes | tuple[str | bytes, ...], ...],
-    ) -> tuple[tuple[float, ...], ...]:
-        return ((1.0, 0.0),) * len(inputs)
-
-    async def encode_documents(
-        self,
-        inputs: tuple[str | bytes | tuple[str | bytes, ...], ...],
-    ) -> tuple[tuple[float, ...], ...]:
-        self.documents = inputs
-        return ((1.0, 0.0),) * len(inputs)
-
-
-class RecordingTextEmbedder:
-    model_reference = ModelReference(model_id="jina-text", revision="text-revision-01")
-    space_reference = EmbeddingSpaceReference(space_id="jina-v5", revision="space-v1")
-    dimension = 2
-
     def __init__(self) -> None:
         self.documents: tuple[str, ...] = ()
 
-    async def encode_documents(
-        self,
-        texts: tuple[str, ...],
-    ) -> tuple[tuple[float, ...], ...]:
-        self.documents = texts
-        return ((1.0, 0.0),) * len(texts)
+    async def embed(self, request: EmbedRequest) -> EmbedResult:
+        self.documents = tuple(
+            part.url
+            for input_value in request.inputs
+            for part in input_value.parts
+            if isinstance(part, MediaPart)
+        )
+        return EmbedResult(
+            tuple(
+                Embedding(
+                    (1.0, 0.0),
+                    ModelReference(model_id="jina-omni", revision="revision-01"),
+                    EmbeddingSpaceReference(space_id="jina-v5", revision="space-v1"),
+                )
+                for _ in request.inputs
+            )
+        )
+
+
+class RecordingTextEmbedder:
+    def __init__(self) -> None:
+        self.documents: tuple[str, ...] = ()
+
+    async def embed(self, request: EmbedRequest) -> EmbedResult:
+        self.documents = tuple(
+            part.text
+            for input_value in request.inputs
+            for part in input_value.parts
+            if isinstance(part, TextPart)
+        )
+        return EmbedResult(
+            tuple(
+                Embedding(
+                    (1.0, 0.0),
+                    ModelReference(model_id="jina-text", revision="text-revision-01"),
+                    EmbeddingSpaceReference(space_id="jina-v5", revision="space-v1"),
+                )
+                for _ in request.inputs
+            )
+        )
 
 
 class DeterministicSigner:

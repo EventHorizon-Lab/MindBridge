@@ -4,20 +4,30 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
-from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Protocol
 
+from mindbridge.application.capabilities import (
+    Embedder,
+    EmbedRequest,
+    EmbedTask,
+    MediaPart,
+    ModelInput,
+    RerankCandidate,
+    Reranker,
+    RerankRequest,
+    TextPart,
+)
 from mindbridge.application.enumeration import EnumerateMemories
 from mindbridge.application.evidence import read_resolved_memory_evidence, sign_query_media
 from mindbridge.application.perception import ResolvedEvidence
 from mindbridge.application.ports import (
+    Answerer,
     EmbeddingIndex,
     EmbeddingSearch,
     GeneratedAnswer,
     MediaUrlSigner,
-    MemoryAnswerer,
     MemoryStore,
+    OccurrenceVerifier,
     ResolvedQueryMedia,
 )
 from mindbridge.application.ranking import fuse_memory_rankings, order_memory_candidates
@@ -33,59 +43,18 @@ from mindbridge.contracts import (
 from mindbridge.core import (
     DomainInvariantError,
     EmbeddedObjectType,
-    EmbeddingSpaceReference,
     EvidenceId,
     MediaObjectId,
     MemoryId,
     MemoryIntegrityError,
     MemoryRecord,
-    ModelReference,
+    ModelOutputError,
     TenantId,
     VerificationStatus,
 )
 from mindbridge.telemetry import current_trace_id, set_current_span_attributes, trace_operation
 
-RETRIEVAL_DOCUMENT_EMBEDDING_TASK = "retrieval_document"
 _MAXIMUM_RETRIEVAL_REFINEMENTS = 2
-
-
-@dataclass(frozen=True, slots=True)
-class RecallEmbeddingQuery:
-    """Text and original AV fused into one retrieval-side embedding input."""
-
-    text: str | None
-    media: tuple[ResolvedQueryMedia, ...]
-
-    def __post_init__(self) -> None:
-        if self.text is not None and not self.text.strip():
-            raise DomainInvariantError("embedding query text must not be blank")
-        if self.text is None and not self.media:
-            raise DomainInvariantError("embedding query requires text or media")
-        media_ids = [item.media_object.media_object_id for item in self.media]
-        if len(set(media_ids)) != len(media_ids):
-            raise DomainInvariantError("embedding query media IDs must be unique")
-        if len({item.media_object.tenant_id for item in self.media}) > 1:
-            raise DomainInvariantError("embedding query media must belong to one tenant")
-
-
-class RecallEmbedder(Protocol):
-    """Frozen encoder shared by recall queries and explicit memory documents."""
-
-    @property
-    def query_model_reference(self) -> ModelReference: ...
-
-    @property
-    def document_model_reference(self) -> ModelReference: ...
-
-    @property
-    def space_reference(self) -> EmbeddingSpaceReference: ...
-
-    @property
-    def dimension(self) -> int: ...
-
-    async def encode_query(self, query: RecallEmbeddingQuery) -> tuple[float, ...]: ...
-
-    async def encode_memory_document(self, text: str) -> tuple[float, ...]: ...
 
 
 class RecallMemories:
@@ -94,11 +63,13 @@ class RecallMemories:
     def __init__(
         self,
         store: MemoryStore,
-        answerer: MemoryAnswerer,
+        answerer: Answerer,
+        occurrence_verifier: OccurrenceVerifier,
         *,
         embedding_index: EmbeddingIndex,
         media_url_signer: MediaUrlSigner,
-        recall_embedder: RecallEmbedder,
+        embedder: Embedder,
+        reranker: Reranker | None,
         minimum_embedding_similarity: float,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
@@ -106,12 +77,13 @@ class RecallMemories:
         self._answerer = answerer
         self._embedding_index = embedding_index
         self._media_url_signer = media_url_signer
-        self._recall_embedder = recall_embedder
+        self._embedder = embedder
+        self._reranker = reranker
         self._minimum_embedding_similarity = minimum_embedding_similarity
         self._clock = clock or _utc_now
         self._enumerate = EnumerateMemories(
             store,
-            answerer,
+            occurrence_verifier,
             media_url_signer,
             clock=self._clock,
         )
@@ -384,6 +356,8 @@ class RecallMemories:
                 semantic_search,
             )
             memories = fuse_memory_rankings((semantic, sparse), limit=limit)
+        if self._reranker is not None and len(memories) > 1:
+            memories = await self._rerank_candidates(request, query_media, memories)
         return memories[:limit]
 
     @trace_operation("mindbridge.recall.semantic_search")
@@ -394,17 +368,21 @@ class RecallMemories:
         *,
         limit: int,
     ) -> tuple[MemoryRecord, ...]:
-        query = RecallEmbeddingQuery(
-            text=request.query.text,
-            media=query_media,
+        embedded = await self._embedder.embed(
+            EmbedRequest(
+                inputs=(_query_input(request, query_media),),
+                task=EmbedTask.QUERY,
+            )
         )
-        values = await self._recall_embedder.encode_query(query)
+        if len(embedded.embeddings) != 1:
+            raise ModelOutputError("embedder returned the wrong query vector count")
+        query_embedding = embedded.embeddings[0]
         searches = {
             object_type: EmbeddingSearch(
                 tenant_id=TenantId(request.tenant_id),
-                values=values,
-                space_reference=self._recall_embedder.space_reference,
-                document_task=RETRIEVAL_DOCUMENT_EMBEDDING_TASK,
+                values=query_embedding.values,
+                space_reference=query_embedding.space_reference,
+                document_task=EmbedTask.DOCUMENT.value,
                 object_types=(object_type,),
                 limit=limit,
                 minimum_similarity=self._minimum_embedding_similarity,
@@ -416,9 +394,9 @@ class RecallMemories:
         }
         graph_search = EmbeddingSearch(
             tenant_id=TenantId(request.tenant_id),
-            values=values,
-            space_reference=self._recall_embedder.space_reference,
-            document_task=RETRIEVAL_DOCUMENT_EMBEDDING_TASK,
+            values=query_embedding.values,
+            space_reference=query_embedding.space_reference,
+            document_task=EmbedTask.DOCUMENT.value,
             object_types=(EmbeddedObjectType.EVENT, EmbeddedObjectType.CLAIM),
             limit=limit,
             minimum_similarity=self._minimum_embedding_similarity,
@@ -459,6 +437,31 @@ class RecallMemories:
             limit=limit,
         )
 
+    async def _rerank_candidates(
+        self,
+        request: RecallRequest,
+        query_media: tuple[ResolvedQueryMedia, ...],
+        candidates: tuple[MemoryRecord, ...],
+    ) -> tuple[MemoryRecord, ...]:
+        assert self._reranker is not None
+        result = await self._reranker.rerank(
+            RerankRequest(
+                query=_query_input(request, query_media),
+                candidates=tuple(
+                    RerankCandidate(
+                        candidate_id=str(memory.memory_id),
+                        input=ModelInput((TextPart(memory.summary),)),
+                    )
+                    for memory in candidates
+                ),
+            )
+        )
+        expected_ids = {str(memory.memory_id) for memory in candidates}
+        if set(result.candidate_ids) != expected_ids:
+            raise ModelOutputError("reranker must return every candidate ID exactly once")
+        by_id = {str(memory.memory_id): memory for memory in candidates}
+        return tuple(by_id[candidate_id] for candidate_id in result.candidate_ids)
+
     @trace_operation("mindbridge.recall.resolve_query_media")
     async def _resolve_query_media(
         self,
@@ -491,6 +494,21 @@ class RecallMemories:
             TenantId(request.tenant_id),
             memories,
         )
+
+
+def _query_input(
+    request: RecallRequest,
+    query_media: tuple[ResolvedQueryMedia, ...],
+) -> ModelInput:
+    parts = ((TextPart(request.query.text),) if request.query.text is not None else ()) + tuple(
+        MediaPart(
+            kind=item.media_object.kind,
+            url=item.media_url,
+            source_uri=item.media_object.uri,
+        )
+        for item in query_media
+    )
+    return ModelInput(parts)
 
 
 def memory_view(memory: MemoryRecord) -> MemoryView:

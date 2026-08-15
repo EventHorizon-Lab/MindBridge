@@ -35,7 +35,6 @@ from mindbridge.application.perception import (
     ResolvedEvidence,
 )
 from mindbridge.application.ports import (
-    EmbeddingInput,
     EmbeddingMatch,
     EmbeddingSearch,
     PresignedMediaDownload,
@@ -94,6 +93,13 @@ from mindbridge.core import (
     derive_stable_id,
 )
 from mindbridge.infrastructure.postgres import PostgresMemoryStore
+from mindbridge.models import (
+    Embedding,
+    EmbedRequest,
+    EmbedResult,
+    MediaPart,
+    TextPart,
+)
 
 NOW = datetime.now(timezone.utc).replace(microsecond=0)
 MODEL = ModelReference(model_id="qwen3.8-max", revision="serving-revision-01")
@@ -166,24 +172,16 @@ class FixedEmbedder:
 
     def __init__(self, dimension: int = 1_024) -> None:
         self.dimension = dimension
-        self.documents: tuple[EmbeddingInput, ...] = ()
+        self.documents: tuple[str, ...] = ()
 
-    async def encode_queries(
-        self,
-        inputs: tuple[EmbeddingInput, ...],
-    ) -> tuple[tuple[float, ...], ...]:
-        return self._vectors(len(inputs))
-
-    async def encode_documents(
-        self,
-        inputs: tuple[EmbeddingInput, ...],
-    ) -> tuple[tuple[float, ...], ...]:
-        self.documents = inputs
-        return self._vectors(len(inputs))
-
-    def _vectors(self, count: int) -> tuple[tuple[float, ...], ...]:
+    async def embed(self, request: EmbedRequest) -> EmbedResult:
+        self.documents = tuple(
+            next(part.url for part in item.parts if isinstance(part, MediaPart))
+            for item in request.inputs
+        )
         vector = (1.0,) + (0.0,) * (self.dimension - 1)
-        return (vector,) * count
+        embedding = Embedding(vector, self.model_reference, self.space_reference)
+        return EmbedResult((embedding,) * len(request.inputs))
 
 
 class FixedTextEmbedder:
@@ -197,13 +195,14 @@ class FixedTextEmbedder:
         self.dimension = dimension
         self.documents: tuple[str, ...] = ()
 
-    async def encode_documents(
-        self,
-        texts: tuple[str, ...],
-    ) -> tuple[tuple[float, ...], ...]:
-        self.documents = texts
+    async def embed(self, request: EmbedRequest) -> EmbedResult:
+        self.documents = tuple(
+            next(part.text for part in item.parts if isinstance(part, TextPart))
+            for item in request.inputs
+        )
         vector = (1.0,) + (0.0,) * (self.dimension - 1)
-        return (vector,) * len(texts)
+        embedding = Embedding(vector, self.model_reference, self.space_reference)
+        return EmbedResult((embedding,) * len(request.inputs))
 
 
 class RecordingEpisodeConsolidator:

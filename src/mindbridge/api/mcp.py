@@ -39,7 +39,7 @@ _DESTRUCTIVE_WRITE = ToolAnnotations(
 _McpLifespan = Callable[[MCPServer[None]], AbstractAsyncContextManager[None]]
 
 
-def create_mcp_server(
+def build_mcp_server(
     kernel: MemoryKernel,
     *,
     lifespan: _McpLifespan | None = None,

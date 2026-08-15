@@ -5,7 +5,7 @@ from typing import cast
 
 import pytest
 
-from mindbridge import AsyncMindBridge
+from mindbridge import MindBridge
 from mindbridge.benchmarks import (
     MMLifelongPreparedSegment,
     MMLifelongPreparedTimeline,
@@ -44,7 +44,7 @@ async def test_mm_lifelong_emits_official_answer_shape_and_ref_300() -> None:
 
     with pytest.raises(ValueError, match="between 1 and 100"):
         await run_mm_lifelong(
-            cast(AsyncMindBridge, api),
+            cast(MindBridge, api),
             (_question(),),
             _prepared(),
             run_id="run_01",
@@ -53,7 +53,7 @@ async def test_mm_lifelong_emits_official_answer_shape_and_ref_300() -> None:
     assert not api.remember_requests
 
     results = await run_mm_lifelong(
-        cast(AsyncMindBridge, api),
+        cast(MindBridge, api),
         (_question(),),
         _prepared(),
         run_id="run_01",
@@ -72,7 +72,7 @@ async def test_mm_lifelong_rejects_timeline_that_cannot_cover_labels() -> None:
 
     with pytest.raises(ValueError, match="does not cover"):
         await run_mm_lifelong(
-            cast(AsyncMindBridge, api),
+            cast(MindBridge, api),
             (question,),
             _prepared(),
             run_id="run_01",

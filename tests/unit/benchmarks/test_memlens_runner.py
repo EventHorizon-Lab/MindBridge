@@ -6,7 +6,7 @@ from typing import cast
 
 import pytest
 
-from mindbridge import AsyncMindBridge
+from mindbridge import MindBridge
 from mindbridge.benchmarks import (
     MemLensImage,
     MemLensPreparedImage,
@@ -88,7 +88,7 @@ async def test_memlens_binds_turn_images_and_keeps_question_tenant_isolated() ->
 
     with pytest.raises(ValueError, match="between 1 and 100"):
         await run_memlens_question(
-            cast(AsyncMindBridge, api),
+            cast(MindBridge, api),
             _question(),
             run_id="run_01",
             prepared_images=_prepared_images(),
@@ -97,7 +97,7 @@ async def test_memlens_binds_turn_images_and_keeps_question_tenant_isolated() ->
     assert not api.calls
 
     result = await run_memlens_question(
-        cast(AsyncMindBridge, api),
+        cast(MindBridge, api),
         _question(),
         run_id="run_01",
         prepared_images=_prepared_images(),
@@ -124,13 +124,13 @@ async def test_memlens_requires_images_unless_text_only() -> None:
 
     with pytest.raises(ValueError, match="missing prepared"):
         await run_memlens_question(
-            cast(AsyncMindBridge, api),
+            cast(MindBridge, api),
             _question(),
             run_id="run_01",
         )
 
     result = await run_memlens_question(
-        cast(AsyncMindBridge, api),
+        cast(MindBridge, api),
         _question(),
         run_id="text_01",
         text_only=True,
@@ -167,7 +167,7 @@ async def test_memlens_ingests_turns_in_source_order() -> None:
     )
 
     await run_memlens_question(
-        cast(AsyncMindBridge, api),
+        cast(MindBridge, api),
         ordered,
         run_id="run_01",
         text_only=True,
@@ -226,7 +226,7 @@ async def test_memlens_splits_long_turns_without_losing_content() -> None:
     )
 
     await run_memlens_question(
-        cast(AsyncMindBridge, api),
+        cast(MindBridge, api),
         question,
         run_id="run_01",
         text_only=True,

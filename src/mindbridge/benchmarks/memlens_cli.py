@@ -14,8 +14,10 @@ from typing import Literal, cast
 
 from pydantic import AwareDatetime, Field, model_validator
 
-from mindbridge.application.recall import RETRIEVAL_DOCUMENT_EMBEDDING_TASK
 from mindbridge.benchmarks.artifacts import (
+    DeploymentSnapshot,
+    LoadedDeployment,
+    load_deployment_snapshot,
     require_writable_output_pair,
     sidecar_manifest_path,
     write_text_atomically,
@@ -35,17 +37,15 @@ from mindbridge.benchmarks.memlens_runner import (
 )
 from mindbridge.contracts import ContractModel, Identifier, NonEmptyString, Sha256Hex
 from mindbridge.file_integrity import sha256_file
-from mindbridge.models.jina import DEFAULT_JINA_OMNI_MODEL_ID, DEFAULT_JINA_OMNI_REVISION
-from mindbridge.models.openai_chat import REASONING_EFFORT_VALUES
-from mindbridge.models.openai_omni import DEFAULT_OMNI_MODEL_ID
+from mindbridge.models import EmbedTask
 from mindbridge.prompts import (
     ANSWER_FROM_EVIDENCE_PROMPT,
     MEMLENS_QUERY_PROMPT,
     PERCEIVE_EVENTS_PROMPT,
 )
-from mindbridge.sdk import AsyncMindBridge
+from mindbridge.sdk import MindBridge
 
-MEMLENS_RUNNER_VERSION = "memlens_production_api_v2"
+MEMLENS_RUNNER_VERSION = "memlens_production_api_v3"
 MemLensContextWindow = Literal["32k", "64k", "128k", "256k"]
 
 
@@ -65,16 +65,11 @@ class MemLensRunManifest(ContractModel):
     prepared_images_manifest_sha256: Sha256Hex | None = None
     text_only: bool
     code_revision: NonEmptyString
-    perception_model_id: NonEmptyString | None = None
-    perception_model_revision: NonEmptyString | None = None
+    deployment: DeploymentSnapshot
+    deployment_sha256: Sha256Hex
     perception_prompt_version: NonEmptyString | None = None
-    answer_model_id: NonEmptyString
-    answer_model_revision: NonEmptyString
     answer_prompt_version: NonEmptyString
     query_prompt_version: NonEmptyString
-    reasoning_effort: NonEmptyString
-    embedding_model_id: NonEmptyString
-    embedding_model_revision: NonEmptyString
     retrieval_task: NonEmptyString
     run_id: Identifier
     tenant_prefix: Identifier
@@ -94,8 +89,6 @@ class MemLensRunManifest(ContractModel):
     @model_validator(mode="after")
     def require_perception_identity_for_multimodal_run(self) -> MemLensRunManifest:
         perception = (
-            self.perception_model_id,
-            self.perception_model_revision,
             self.perception_prompt_version,
             self.prepared_images_manifest_sha256,
         )
@@ -118,13 +111,7 @@ class _Arguments:
     evaluator_revision: str
     code_revision: str
     text_only: bool
-    perception_model_id: str
-    perception_model_revision: str | None
-    answer_model_id: str
-    answer_model_revision: str
-    answer_reasoning_effort: str
-    embedding_model_id: str
-    embedding_model_revision: str
+    deployment_config_path: Path
     run_id: str
     tenant_prefix: str
     device_id: str
@@ -154,15 +141,17 @@ def main() -> None:
         else None
     )
     if arguments.text_only:
-        if prepared is not None or arguments.perception_model_revision is not None:
-            raise ValueError(
-                "text-only MEMLENS runs must omit prepared images and perception revision"
-            )
-    elif prepared is None or arguments.perception_model_revision is None:
-        raise ValueError("multimodal MEMLENS runs require prepared images and perception revision")
+        if prepared is not None:
+            raise ValueError("text-only MEMLENS runs must omit prepared images")
+    elif prepared is None:
+        raise ValueError("multimodal MEMLENS runs require prepared images")
     require_writable_output_pair(arguments.output_path, overwrite=arguments.overwrite)
+    deployment = load_deployment_snapshot(
+        arguments.deployment_config_path,
+        require_worker=not arguments.text_only,
+    )
     results = asyncio.run(_run(arguments, questions, prepared))
-    _write_artifacts(arguments, questions, results)
+    _write_artifacts(arguments, questions, results, deployment)
 
 
 async def _run(
@@ -171,7 +160,7 @@ async def _run(
     prepared: MemLensPreparedImages | None,
 ) -> tuple[MemLensQuestionResult, ...]:
     validate_memlens_images(questions, prepared, text_only=arguments.text_only)
-    memory = AsyncMindBridge.connect(
+    memory = MindBridge.connect(
         base_url=arguments.api_base_url,
         api_key=os.environ.get("MINDBRIDGE_API_KEY"),
         timeout_seconds=arguments.request_timeout_seconds,
@@ -203,6 +192,7 @@ def _write_artifacts(
     arguments: _Arguments,
     questions: tuple[MemLensQuestion, ...],
     results: tuple[MemLensQuestionResult, ...],
+    deployment: LoadedDeployment,
 ) -> None:
     if tuple(result.question_id for result in results) != tuple(
         question.question_id for question in questions
@@ -237,19 +227,12 @@ def _write_artifacts(
         ),
         text_only=arguments.text_only,
         code_revision=arguments.code_revision,
-        perception_model_id=None if arguments.text_only else arguments.perception_model_id,
-        perception_model_revision=(
-            None if arguments.text_only else arguments.perception_model_revision
-        ),
+        deployment=deployment.snapshot,
+        deployment_sha256=deployment.sha256,
         perception_prompt_version=(None if arguments.text_only else PERCEIVE_EVENTS_PROMPT.version),
-        answer_model_id=arguments.answer_model_id,
-        answer_model_revision=arguments.answer_model_revision,
         answer_prompt_version=ANSWER_FROM_EVIDENCE_PROMPT.version,
         query_prompt_version=MEMLENS_QUERY_PROMPT.version,
-        reasoning_effort=arguments.answer_reasoning_effort,
-        embedding_model_id=arguments.embedding_model_id,
-        embedding_model_revision=arguments.embedding_model_revision,
-        retrieval_task=RETRIEVAL_DOCUMENT_EMBEDDING_TASK,
+        retrieval_task=EmbedTask.DOCUMENT.value,
         run_id=arguments.run_id,
         tenant_prefix=arguments.tenant_prefix,
         device_id=arguments.device_id,
@@ -318,17 +301,7 @@ def _parse_arguments() -> _Arguments:
     parser.add_argument("--evaluator-revision", required=True)
     parser.add_argument("--code-revision", required=True)
     parser.add_argument("--text-only", action="store_true")
-    parser.add_argument("--perception-model-id", default=DEFAULT_OMNI_MODEL_ID)
-    parser.add_argument("--perception-model-revision")
-    parser.add_argument("--answer-model-id", default=DEFAULT_OMNI_MODEL_ID)
-    parser.add_argument("--answer-model-revision", required=True)
-    parser.add_argument(
-        "--answer-reasoning-effort",
-        choices=("omitted", *REASONING_EFFORT_VALUES),
-        required=True,
-    )
-    parser.add_argument("--embedding-model-id", default=DEFAULT_JINA_OMNI_MODEL_ID)
-    parser.add_argument("--embedding-model-revision", default=DEFAULT_JINA_OMNI_REVISION)
+    parser.add_argument("--deployment-config", type=Path, required=True)
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--tenant-prefix", default="benchmark_memlens")
     parser.add_argument("--device-id", default="memlens_conversation")
@@ -351,13 +324,7 @@ def _parse_arguments() -> _Arguments:
         evaluator_revision=parsed.evaluator_revision,
         code_revision=parsed.code_revision,
         text_only=parsed.text_only,
-        perception_model_id=parsed.perception_model_id,
-        perception_model_revision=parsed.perception_model_revision,
-        answer_model_id=parsed.answer_model_id,
-        answer_model_revision=parsed.answer_model_revision,
-        answer_reasoning_effort=parsed.answer_reasoning_effort,
-        embedding_model_id=parsed.embedding_model_id,
-        embedding_model_revision=parsed.embedding_model_revision,
+        deployment_config_path=parsed.deployment_config,
         run_id=parsed.run_id,
         tenant_prefix=parsed.tenant_prefix,
         device_id=parsed.device_id,

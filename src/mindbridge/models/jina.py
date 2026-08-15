@@ -1,14 +1,21 @@
-"""Jina v5 Omni embedding through the official Sentence Transformers API."""
+"""Local Jina adapter for MindBridge's atomic embedding capability."""
 
 from __future__ import annotations
 
 import asyncio
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from importlib import import_module
 from typing import Protocol, cast
 
-from mindbridge.application.ports import EmbeddingInput
+from mindbridge.application.capabilities import (
+    Embedding,
+    EmbedRequest,
+    EmbedResult,
+    EmbedTask,
+    ModelInput,
+    TextPart,
+)
 from mindbridge.core import (
     EmbeddingSpaceReference,
     ModelOutputError,
@@ -16,20 +23,13 @@ from mindbridge.core import (
     ModelUnavailableError,
 )
 from mindbridge.models.compute import select_torch_device
-from mindbridge.telemetry import set_current_span_attributes, trace_operation
-
-DEFAULT_JINA_OMNI_MODEL_ID = "jinaai/jina-embeddings-v5-omni-small-retrieval"
-DEFAULT_JINA_OMNI_REVISION = "12949877f0092093f366c6450340011320152a05"
-DEFAULT_JINA_TEXT_MODEL_ID = "jinaai/jina-embeddings-v5-text-small-retrieval"
-DEFAULT_JINA_TEXT_REVISION = "6856e76bb72982e58de0620458a4e8b3614da340"
-DEFAULT_JINA_OMNI_DIMENSION = 1_024
-DEFAULT_JINA_RETRIEVAL_SPACE = EmbeddingSpaceReference(
-    space_id="jinaai/jina-embeddings-v5-small-retrieval-1024",
-    revision=(
-        "omni@12949877f0092093f366c6450340011320152a05+"
-        "text@6856e76bb72982e58de0620458a4e8b3614da340"
-    ),
+from mindbridge.models.defaults import (
+    DEFAULT_EMBEDDING_DIMENSION,
+    DEFAULT_EMBEDDING_SPACE,
+    DEFAULT_MEDIA_EMBEDDER_MODEL_ID,
+    DEFAULT_MEDIA_EMBEDDER_REVISION,
 )
+from mindbridge.telemetry import set_current_span_attributes, trace_operation
 
 
 class _EmbeddingMatrix(Protocol):
@@ -69,7 +69,7 @@ class _SentenceTransformerFactory(Protocol):
     ) -> _SentenceEncoder: ...
 
 
-class JinaOmniEmbedder:
+class JinaEmbedder:
     """Async-safe query/document encoder for text, image, video, and audio."""
 
     def __init__(
@@ -77,8 +77,8 @@ class JinaOmniEmbedder:
         encoder: _SentenceEncoder,
         model_reference: ModelReference,
         *,
-        space_reference: EmbeddingSpaceReference = DEFAULT_JINA_RETRIEVAL_SPACE,
-        dimension: int = DEFAULT_JINA_OMNI_DIMENSION,
+        space_reference: EmbeddingSpaceReference = DEFAULT_EMBEDDING_SPACE,
+        dimension: int = DEFAULT_EMBEDDING_DIMENSION,
         max_concurrency: int = 1,
     ) -> None:
         if dimension <= 0:
@@ -96,12 +96,12 @@ class JinaOmniEmbedder:
         cls,
         *,
         revision: str,
-        model_id: str = DEFAULT_JINA_OMNI_MODEL_ID,
+        model_id: str = DEFAULT_MEDIA_EMBEDDER_MODEL_ID,
         device: str | None = None,
-        space_reference: EmbeddingSpaceReference = DEFAULT_JINA_RETRIEVAL_SPACE,
-        dimension: int = DEFAULT_JINA_OMNI_DIMENSION,
+        space_reference: EmbeddingSpaceReference = DEFAULT_EMBEDDING_SPACE,
+        dimension: int = DEFAULT_EMBEDDING_DIMENSION,
         max_concurrency: int = 1,
-    ) -> JinaOmniEmbedder:
+    ) -> JinaEmbedder:
         """Load a pinned upstream model without exposing training operations."""
         try:
             module = import_module("sentence_transformers")
@@ -133,40 +133,29 @@ class JinaOmniEmbedder:
             max_concurrency=max_concurrency,
         )
 
-    @property
-    def model_reference(self) -> ModelReference:
-        """Return the exact model identity stored beside every vector."""
-        return self._model_reference
-
-    @property
-    def dimension(self) -> int:
-        """Return the configured Matryoshka output dimension."""
-        return self._dimension
-
-    @property
-    def space_reference(self) -> EmbeddingSpaceReference:
-        """Return the exact aligned space used for cross-model search."""
-        return self._space_reference
-
-    @trace_operation("mindbridge.model.encode_queries")
-    async def encode_queries(
-        self,
-        inputs: tuple[EmbeddingInput, ...],
-    ) -> tuple[tuple[float, ...], ...]:
-        """Encode retrieval queries with the upstream query prompt semantics."""
-        return await self._encode(inputs, self._encoder.encode_query)
-
-    @trace_operation("mindbridge.model.encode_documents")
-    async def encode_documents(
-        self,
-        inputs: tuple[EmbeddingInput, ...],
-    ) -> tuple[tuple[float, ...], ...]:
-        """Encode index documents with the upstream document prompt semantics."""
-        return await self._encode(inputs, self._encoder.encode_document)
+    @trace_operation("mindbridge.model.embed")
+    async def embed(self, request: EmbedRequest) -> EmbedResult:
+        """Encode a homogeneous query or document batch."""
+        encode = (
+            self._encoder.encode_query
+            if request.task is EmbedTask.QUERY
+            else self._encoder.encode_document
+        )
+        vectors = await self._encode(request.inputs, encode)
+        return EmbedResult(
+            embeddings=tuple(
+                Embedding(
+                    values=vector,
+                    model_reference=self._model_reference,
+                    space_reference=self._space_reference,
+                )
+                for vector in vectors
+            )
+        )
 
     async def _encode(
         self,
-        inputs: tuple[EmbeddingInput, ...],
+        inputs: tuple[ModelInput, ...],
         encode: Callable[..., _EmbeddingMatrix],
     ) -> tuple[tuple[float, ...], ...]:
         if not inputs:
@@ -182,7 +171,7 @@ class JinaOmniEmbedder:
         async with self._semaphore:
             matrix = await asyncio.to_thread(
                 encode,
-                cast(list[object], list(inputs)),
+                cast(list[object], [_jina_input(item) for item in inputs]),
                 convert_to_numpy=True,
                 normalize_embeddings=True,
                 truncate_dim=self._dimension,
@@ -193,6 +182,67 @@ class JinaOmniEmbedder:
         for vector in vectors:
             validate_jina_embedding(vector, self._dimension)
         return vectors
+
+
+def create_embedder(config: Mapping[str, object]) -> JinaEmbedder:
+    """Entry-point factory for the bundled local Jina model."""
+    allowed = {
+        "model_id",
+        "revision",
+        "device",
+        "space_id",
+        "space_revision",
+        "dimension",
+        "max_concurrency",
+    }
+    unknown = set(config) - allowed
+    if unknown:
+        raise ValueError(f"unknown plugin configuration: {', '.join(sorted(unknown))}")
+    return JinaEmbedder.load(
+        model_id=_string(config, "model_id", DEFAULT_MEDIA_EMBEDDER_MODEL_ID),
+        revision=_string(config, "revision", DEFAULT_MEDIA_EMBEDDER_REVISION),
+        device=_optional_string(config, "device"),
+        space_reference=EmbeddingSpaceReference(
+            space_id=_string(config, "space_id", DEFAULT_EMBEDDING_SPACE.space_id),
+            revision=_string(
+                config,
+                "space_revision",
+                DEFAULT_EMBEDDING_SPACE.revision,
+            ),
+        ),
+        dimension=_integer(config, "dimension", DEFAULT_EMBEDDING_DIMENSION),
+        max_concurrency=_integer(config, "max_concurrency", 1),
+    )
+
+
+def _jina_input(input_value: ModelInput) -> str | tuple[str, ...]:
+    values = tuple(
+        part.text if isinstance(part, TextPart) else part.url for part in input_value.parts
+    )
+    return values[0] if len(values) == 1 else values
+
+
+def _string(config: Mapping[str, object], key: str, default: str) -> str:
+    value = config.get(key, default)
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{key} must be non-empty text")
+    return value
+
+
+def _optional_string(config: Mapping[str, object], key: str) -> str | None:
+    value = config.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{key} must be non-empty text when provided")
+    return value
+
+
+def _integer(config: Mapping[str, object], key: str, default: int) -> int:
+    value = config.get(key, default)
+    if type(value) is not int:
+        raise ValueError(f"{key} must be an integer")
+    return value
 
 
 def validate_jina_embedding(values: tuple[float, ...], dimension: int) -> None:

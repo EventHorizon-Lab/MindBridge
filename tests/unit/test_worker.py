@@ -1,15 +1,18 @@
 """Checks for the deployable observation Worker boundary."""
 
-from collections.abc import Mapping
+import asyncio
+from collections.abc import Awaitable, Mapping
 from typing import cast
 from unittest.mock import Mock
 
 import pytest
+from billiard.exceptions import SoftTimeLimitExceeded
 from celery import Task
 from celery.exceptions import Retry
 from pydantic import ValidationError
 
 import mindbridge.worker as worker_module
+from mindbridge.application.capabilities import Embedder, EmbedRequest, EmbedResult
 from mindbridge.core import DatabaseUnavailableError, JobState
 from mindbridge.infrastructure.task_queue import (
     PROCESS_OBSERVATION_TASK,
@@ -22,22 +25,108 @@ def test_worker_settings_pin_models_and_redact_credentials() -> None:
     """Worker startup fixes model identity without exposing injected secrets."""
     settings = WorkerSettings.from_environment(_environment())
 
-    assert settings.vlm_model_id == "qwen3.8-max"
-    assert settings.vlm_model_revision == "deployment-2026-08-11"
-    assert settings.jina_model_revision == "12949877f0092093f366c6450340011320152a05"
+    assert settings.generator_config["model_id"] == "qwen3.8-max"
+    assert settings.generator_config["model_revision"] == "deployment-2026-08-11"
+    assert settings.media_embedder_config["revision"] == (
+        "12949877f0092093f366c6450340011320152a05"
+    )
     assert "database-secret" not in repr(settings)
     assert "broker-secret" not in repr(settings)
-    assert "vlm-secret" not in repr(settings)
+    assert "generator-secret" not in repr(settings)
     assert "text-embedding-secret" not in repr(settings)
 
 
-def test_worker_settings_require_explicit_vlm_revision() -> None:
+def test_worker_settings_require_explicit_generator_revision() -> None:
     """Fallback provenance cannot silently use a mutable deployment alias."""
     environment = dict(_environment())
-    del environment["MINDBRIDGE_VLM_MODEL_REVISION"]
+    del environment["MINDBRIDGE_GENERATOR_MODEL_REVISION"]
 
-    with pytest.raises(ValueError, match="MINDBRIDGE_VLM_MODEL_REVISION"):
+    with pytest.raises(ValueError, match="MINDBRIDGE_GENERATOR_MODEL_REVISION"):
         WorkerSettings.from_environment(environment)
+
+
+def test_worker_reuses_and_closes_media_plugin_on_its_own_event_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    creation_loops: list[asyncio.AbstractEventLoop] = []
+    processing_loops: list[asyncio.AbstractEventLoop] = []
+    closing_loops: list[asyncio.AbstractEventLoop] = []
+
+    class LoopBoundEmbedder:
+        async def embed(self, _request: EmbedRequest) -> EmbedResult:
+            raise AssertionError("the lifecycle check does not invoke embedding")
+
+        async def close(self) -> None:
+            closing_loops.append(asyncio.get_running_loop())
+
+    embedder = LoopBoundEmbedder()
+
+    def load(_plugin: str, _config: Mapping[str, object]) -> LoopBoundEmbedder:
+        creation_loops.append(asyncio.get_running_loop())
+        return embedder
+
+    async def process(
+        _settings: object,
+        media_embedder: object,
+        *_identifiers: object,
+    ) -> JobState:
+        assert media_embedder is embedder
+        processing_loops.append(asyncio.get_running_loop())
+        return JobState.SUCCEEDED
+
+    worker_module._dispose_worker_runtime()
+    monkeypatch.setattr(worker_module, "load_embedder", load)
+    monkeypatch.setattr(worker_module, "_process_observation_once", process)
+    settings = WorkerSettings.from_environment(_environment())
+    message = ObservationProcessingTaskMessage(**_task_message())
+    try:
+        assert worker_module.run_observation_processing(settings, message) is JobState.SUCCEEDED
+        assert worker_module.run_observation_processing(settings, message) is JobState.SUCCEEDED
+    finally:
+        worker_module._dispose_worker_runtime()
+
+    assert len(creation_loops) == 1
+    assert processing_loops == creation_loops * 2
+    assert closing_loops == creation_loops
+
+
+def test_worker_cancels_a_delivery_interrupted_outside_its_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cancelled: list[bool] = []
+
+    async def process(*_arguments: object) -> JobState:
+        try:
+            await asyncio.Future()
+            return JobState.SUCCEEDED
+        finally:
+            cancelled.append(True)
+
+    loop = asyncio.new_event_loop()
+    run_until_complete = loop.run_until_complete
+    calls = 0
+
+    def interrupt_once(awaitable: Awaitable[object]) -> object:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            run_until_complete(asyncio.sleep(0))
+            raise SoftTimeLimitExceeded
+        return run_until_complete(awaitable)
+
+    monkeypatch.setattr(worker_module, "_process_observation_once", process)
+    monkeypatch.setattr(loop, "run_until_complete", interrupt_once)
+    runtime = worker_module._WorkerRuntime(loop, cast(Embedder, object()))
+    try:
+        with pytest.raises(SoftTimeLimitExceeded):
+            runtime.run(
+                WorkerSettings.from_environment(_environment()),
+                ObservationProcessingTaskMessage(**_task_message()),
+            )
+        assert cancelled == [True]
+        assert not asyncio.all_tasks(loop)
+    finally:
+        loop.close()
 
 
 def test_worker_task_calls_shared_use_case_with_ids_only(
@@ -134,11 +223,11 @@ def _environment() -> Mapping[str, str]:
         "MINDBRIDGE_DATABASE_URL": ("postgresql://mindbridge:database-secret@postgres/mindbridge"),
         "MINDBRIDGE_OBJECT_STORAGE_BUCKET": "memory",
         "MINDBRIDGE_TASK_BROKER_URL": "redis://:broker-secret@redis:6379/0",
-        "MINDBRIDGE_VLM_API_KEY": "vlm-secret",
-        "MINDBRIDGE_VLM_ENDPOINT": "https://vlm.example.test/api/v1/chat/completions",
-        "MINDBRIDGE_VLM_MODEL_REVISION": "deployment-2026-08-11",
-        "MINDBRIDGE_TEXT_EMBEDDING_API_KEY": "text-embedding-secret",
-        "MINDBRIDGE_TEXT_EMBEDDING_ENDPOINT": "https://text.example.test/api/v1/embeddings",
+        "MINDBRIDGE_GENERATOR_API_KEY": "generator-secret",
+        "MINDBRIDGE_GENERATOR_ENDPOINT": "https://generator.example.test/v1",
+        "MINDBRIDGE_GENERATOR_MODEL_REVISION": "deployment-2026-08-11",
+        "MINDBRIDGE_TEXT_EMBEDDER_API_KEY": "text-embedding-secret",
+        "MINDBRIDGE_TEXT_EMBEDDER_ENDPOINT": "https://text.example.test/v1",
     }
 
 

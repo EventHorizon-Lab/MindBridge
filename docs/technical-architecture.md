@@ -42,7 +42,7 @@ MindBridge 不是机器人、Agent 或大模型。MindBridge 是**记忆本身**
 4. **非参数演化**：系统通过记忆状态、索引、实体原型、召回统计、反馈和生命周期策略自学习，而不是修改模型参数。
 5. **生态优先**：优先使用官方 SDK、Hugging Face、NVIDIA、OpenAI-compatible、PostgreSQL 等成熟生态，不重复实现通用能力。
 6. **轻量起步**：首版采用模块化单体、异步 Worker 和一套主数据库；只有实际指标证明不足时才拆分。
-7. **可替换但不泛化过度**：保存模型版本和原始证据以支持重新编码，但不为尚不存在的提供商设计复杂工厂层。
+7. **原子能力插件**：模型层只保留 `Generator`、`Embedder`、`Reranker` 三个插口；供应商只实现 Adapter，Answer、Perception 等任务语义留在 MindBridge。
 8. **当前阶段效果优先**：当前研究与效果验证不以 License 作为候选过滤条件，代码和模型只要有助于能力即可复用；仍记录来源、精确 revision 和工件 hash，商业发布前再单独完成合规审查。
 9. **工程质量是功能要求**：命名、可读性、复杂度、类型、错误处理和测试均是合并门禁，不接受“功能能跑但以后再整理”。
 
@@ -359,9 +359,28 @@ watermark 只表示该 boot 已确认的最大序号，不充当逐条回执；�
 
 ## 6. 模型与 Embedding 架构
 
-### 6.1 初始模型配置
+### 6.1 原子能力与默认配置
 
-MindBridge 采用“明确默认、保存版本、允许重建”的策略。模型不微调。
+MindBridge 采用“极简核心、直接配置、保存版本、允许重建”的策略。模型不微调，也不建立
+`AutoModelFor...`、Profile、供应商任务类或多层 Registry。公共模型层只有三个运行时协议：
+
+| 插口 | 唯一操作 | 语义 |
+| --- | --- | --- |
+| `Generator` | `generate(GenerateRequest)` | 对任意已提供模态生成文本或结构化文本 |
+| `Embedder` | `embed(EmbedRequest)` | 以 `QUERY` 或 `DOCUMENT` 任务编码一批 `ModelInput` |
+| `Reranker` | `rerank(RerankRequest)` | 对调用方拥有的完整候选 ID 集合重新排序 |
+
+`ModelInput` 是按顺序排列的 `TextPart | MediaPart`，不要求所有模态同时存在。每个 `Embedding`
+自行携带真实 `model_reference` 与兼容 `space_reference`，因此 Query/Document 可以使用对齐但不同的
+编码器，而不需要 `QueryEmbedder`、`DocumentEmbedder`、`OmniEmbedder` 等重复接口。
+
+Answer、Occurrence、Perception、Episode、Claim、Summary 是 `application/pipelines` 中的产品管线，
+统一组合 `Generator`，不因 OpenAI、Anthropic、Gemini 或本地运行时而复制。插件通过 Python 标准
+entry point `mindbridge.generators`、`mindbridge.embedders`、`mindbridge.rerankers` 发现；进程只加载
+被直接选中的插件。完整契约见[模型插件架构](plugin-architecture.md)。
+
+默认配置必须是正常可部署的产品状态，而不是 Profile。Benchmark 通过每次运行的无密钥部署快照
+记录实际插件、配置和 SHA-256，不在生产 API 中引入 Benchmark 档位。当前默认候选如下：
 
 | 能力 | 初始实现 | 运行位置 |
 | --- | --- | --- |
@@ -397,7 +416,8 @@ MindBridge 采用“明确默认、保存版本、允许重建”的策略。模
 
 - 云端主索引保存 Small 的完整 1024 维归一化向量；
 - Nano 的 768 维向量只进入独立端侧近期索引，不和云端 Small 向量混查；
-- 对查询调用 `encode_query()`，对记忆对象调用 `encode_document()`；
+- 对查询提交 `EmbedRequest(task=EmbedTask.QUERY)`，对记忆对象提交
+  `EmbedRequest(task=EmbedTask.DOCUMENT)`；
 - 每条向量分别保存真实编码器的 `model_id/revision` 与可混查的
   `space_id/space_revision`，同时保存 `task`、`dimension`、`normalized` 和 `created_at`；
 - 切换模型时创建新向量版本并后台重建，不原地混用不同空间。
@@ -485,8 +505,8 @@ transcript，但标为 `scope=observation`，不得污染长期身份。FunASR �
 diarization probability，因此当前 confidence 是必须由真实麦克风集校准的部署门槛，不能解释成
 模型概率。活跃说话人检查复用 TaskMem 的可视锚点思路，
 由 FFmpeg 在发送给 VLM 的临时视频上绘制 `F0/F1/...` face box 并保留 16kHz mono 音轨，使模型在
-一个原生 AV 请求中联合检查口型、声音起止和可见行为；所有 VLM 请求仍只通过异步
-OpenAI SDK；模型输出仅形成可撤销关联证据，不直接合并模板。LR-ASD/DeepStream/TensorRT 仍是
+一个原生 AV 请求中联合检查口型、声音起止和可见行为；VLM 只通过 `Generator` capability
+调用选中的异步插件；模型输出仅形成可撤销关联证据，不直接合并模板。LR-ASD/DeepStream/TensorRT 仍是
 目标 Jetson 的下一轮质量/效率候选，不能写成已经上线的实现。
 
 ASR 或 diarization 无法无歧义归属的区间不会被丢弃，而是以 observation scope 保留 transcript；
@@ -907,7 +927,7 @@ HTTP、Python 和 MCP 共享同一层 use case，不各自复制业务逻辑。
 
 若上游代码不能作为依赖直接使用，可以 vendor 最小必要部分，但必须记录仓库、commit、修改补丁和调用边界。MindBridge 不维护与上游功能等价的长期 fork。
 
-### 10.3 OpenAI-compatible 统一调用
+### 10.3 OpenAI-compatible Adapter
 
 Qwen、vLLM 或其他提供 OpenAI-compatible endpoint 的模型统一使用 OpenAI SDK：
 
@@ -917,17 +937,18 @@ from openai import AsyncOpenAI
 client = AsyncOpenAI(api_key=api_key, base_url=base_url)
 ```
 
-供应商差异收敛到模型名、`base_url` 和必要请求字段；不为每个供应商新增一套 HTTP client。仅当服务不兼容且没有官方 SDK 时，才允许一个局部、可删除的薄适配器。
+供应商差异收敛在 `OpenAIGenerator` 与 `OpenAIEmbedder` Adapter 的模型名、`base_url` 和必要请求
+字段中；应用管线看不到 SDK 类型。非兼容供应商使用其官方 SDK 实现同一个能力协议，不得复制
+Answer、Perception 或 Recall 流程。
 
-共享 OpenAI 调用默认省略 `reasoning_effort`，确保非推理模型和不同 OpenAI-compatible
-服务不会收到不支持的字段。只有经过部署验证的 Omni Answerer 才通过
-`MINDBRIDGE_ANSWER_REASONING_EFFORT` 显式配置档位；Benchmark CLI 必须用
-`--answer-reasoning-effort` 记录实际部署值（未发送时记为 `omitted`）。模型 revision 变化时
-重跑 `omitted`、`low` 和 `medium` bake-off，不把某一供应商的参数强加给共享调用边界。
+OpenAI Adapter 默认省略 `reasoning_effort`，确保非推理模型和不同 OpenAI-compatible 服务不会收到
+不支持的字段；需要时通过 Generator 插件配置显式提供。Benchmark 将这个已解析配置写入部署快照，
+不再平铺供应商专用 CLI 参数。模型 revision 变化时重跑对应 bake-off，不把某一供应商参数加入
+`Generator` 协议。
 
-Omni Answerer 先保留供应商原生结构化生成并立即做 Pydantic 校验；只有首次答案不是合法 schema
-时，才用同一模型、同一上下文和 OpenAI SDK 的 `json_object` mode 重试一次。正常请求不承担
-JSON mode 的质量偏移，fallback 也不切换模型或无限重试。
+任务管线先保留供应商原生生成并立即做 Pydantic 与候选引用校验；只有首次输出不是合法结果时，
+才通过同一个 `Generator`、同一上下文和 `json_mode=True` 重试一次。正常请求不承担 JSON mode 的
+质量偏移，fallback 也不切换插件、模型或无限重试。
 
 音频内容块保留服务端的真实兼容契约：Qwen Chat 使用 URL 型 `input_audio`，vLLM 多模态
 Embedding 使用 `audio_url`。两者共享 OpenAI SDK 和图像/视频构造，但不把这两个不同的音频
@@ -1019,9 +1040,9 @@ async def forget(request: ForgetRequest) -> ForgetReceipt: ...
 | 层 | 可以做 | 不可以做 |
 | --- | --- | --- |
 | `api` | 协议转换、鉴权、输入验证、调用 use case | SQL、Prompt、Embedding、记忆合并规则 |
-| `core` | 领域类型、规则、用例和领域错误 | 导入 FastAPI、OpenAI、Transformers、数据库驱动 |
-| `ingest/recall/lifecycle` | 编排领域操作和声明事务边界 | 复制领域规则、直接处理 HTTP |
-| `models` | 封装 Hugging Face/OpenAI SDK 的模型 I/O | 决定记忆是否合并、保留或删除 |
+| `core` | 领域类型、规则和领域错误 | 导入 FastAPI、OpenAI、Transformers、数据库驱动 |
+| `application` | 用例、任务管线和外部端口 | 复制 Adapter、直接处理 HTTP/SQL |
+| `models` | 三个能力协议、插件加载与供应商 Adapter | 决定记忆是否合并、保留或删除 |
 | `edge` | 采集、身份、近期记忆和同步 | 知晓云端数据库内部结构 |
 | infrastructure adapter | PostgreSQL、S3、Redis、SDK 细节 | 向上泄漏供应商响应对象 |
 
@@ -1131,7 +1152,7 @@ Schema 变更必须向后兼容或带显式迁移；不得在 Worker 和 API 不
 - `process_data`、`MemoryManager` 等无法从名称判断职责的核心 API；
 - API handler、Celery task 或 MCP tool 内包含领域业务规则；
 - 新建与 OpenAI/Hugging Face/NVIDIA 官方能力重复的客户端或处理器；
-- 为单个实现加入 Factory、Registry、深继承或通用插件系统；
+- 在三个标准能力之外为单个实现加入 Factory、Registry、深继承或任务专用插件层；
 - 跨模块传递无 schema 的 `dict/Any`；
 - 捕获异常后只记录日志并继续返回成功；
 - 复制粘贴同一修复到多个调用方而不处理共同根因；
@@ -1195,10 +1216,10 @@ ASR/VAD 多端运行时候选，但当前没有证据证明它完整覆盖 punct
 Worker 通过 `mindbridge.celery_app:app` 启动，Redis 消息只传
 `tenant_id`、`observation_id`、`job_id`。原始媒体、Evidence 和任务状态均以 PostgreSQL/S3
 为事实来源。每个 prefork child 只加载一个固定 revision 的 Jina v5 Omni；默认并发为 1，
-多 GPU 通过每张卡一个 Worker 进程扩展，避免一个模型被 CPU 核数意外复制。API 进程不导入
-或加载 Jina；API 与 Worker 都用 OpenAI SDK 调用所需的 Omni-query 或 Text-document 兼容端点，
-不自行拼装 HTTP 请求。VLM、两个 Jina revision 和共享空间 revision 必须由部署配置固定并写入
-派生记录；凭证只从进程环境或基础设施 secret 注入。
+多 GPU 通过每张卡一个 Worker 进程扩展，避免一个模型被 CPU 核数意外复制。API 默认不加载
+Jina 权重；API 与 Worker 在 composition root 按插口直接选择插件，应用层只消费三个能力协议。
+Generator、两个 Embedder revision 和共享空间 revision 必须由部署配置固定并写入派生记录；凭证
+只从进程环境或基础设施 secret 注入。
 
 ### 12.2 推荐代码边界
 
@@ -1206,12 +1227,11 @@ Worker 通过 `mindbridge.celery_app:app` 启动，Redis 消息只传
 
 ```text
 src/mindbridge/
-├── api/          # REST、MCP、Pydantic schema
-├── core/         # Event/Claim/Memory 领域模型与 use cases
-├── ingest/       # observation、eventization、sync processing
-├── recall/       # retrieve、fusion、rerank、evidence inspection
-├── lifecycle/    # consolidation、decay、forget
-├── models/       # HF 和 OpenAI SDK 的薄调用边界
+├── api/          # 内部 REST、MCP 协议 Adapter
+├── application/  # use cases、capability ports、provider-neutral pipelines
+├── core/         # Event/Claim/Memory 领域模型与规则
+├── infrastructure/ # PostgreSQL、S3、任务队列 Adapter
+├── models/       # 供应商 Adapter、插件发现与 capability 公共导出
 └── edge/         # Jetson capture、identity、SQLite、outbox
 
 tests/
@@ -1282,7 +1302,7 @@ revision `0e3e41939bd8a0b66d756e7b7eb8d5fe9992da5c`、Video-MME 数据 revision
 Video-MME 2,700 题、EgoTempo 500 题，并保留其他已接入评测的完整样本计数。
 
 LoCoMo runner 将原始对话逐 turn 通过 `remember` 写入，并且不向生产接口传入参考答案、证据
-标签或 category。Recall query 只包含原始问题，作答格式由统一的 Omni Answerer 契约负责，避免指令文本
+标签或 category。Recall query 只包含原始问题，作答格式由统一的 `AnswerPipeline` 契约负责，避免指令文本
 污染 query embedding。所有题使用调用方显式给出的同一个 recall limit；生产代码不检查题目措辞、
 类别或答案形式来改变候选预算。参数进入 runner version/manifest；输出使用官方 evaluator 识别的
 `mindbridge_prediction` 与 `mindbridge_prediction_context`，因此答案 F1 和检索 recall 均走官方
@@ -1520,6 +1540,7 @@ Entity/Bridge/Scene/Horizon cue 明确推迟到完整数据证明增益之后，
 | ADR-009 | 可读性、简洁性、类型和测试作为合并门禁 | 首次实现需投入工具配置和评审成本 | 不重审；工程质量是产品能力的一部分 |
 | ADR-010 | face↔voice 只由可审计 ASD 证据跨 Observation 累积并可撤销解析 | 首次绑定更慢，低证据场景保持两个匿名 ID | 同条件实验证明替代方法在 false-link、撤销和部署成本上稳定更优 |
 | ADR-011 | 端侧语音默认收敛到 FunASR 在线 ASR + Event-close 统一质量管线，不保留 NeMo 并行栈 | 实时 partial 暂不提供稳定 speaker label | 带真值 replay 证明另一上游栈在同资源下显著降低 DER/false-link，且收益覆盖依赖和编排成本 |
+| ADR-012 | 模型扩展只使用 Generator、Embedder、Reranker；供应商是 Adapter，任务是应用管线 | 破坏旧任务专用类，插件必须遵守严格协议 | 出现无法由三种 I/O 语义表达且有两个真实实现的新能力 |
 
 ## 18. 待实测后锁定的参数
 

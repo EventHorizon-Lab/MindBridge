@@ -6,7 +6,7 @@ from typing import cast
 import pytest
 from pydantic import ValidationError
 
-from mindbridge import AsyncMindBridge
+from mindbridge import MindBridge
 from mindbridge.benchmarks import (
     SuperMemoryPreparedSegment,
     SuperMemoryPreparedSubject,
@@ -106,7 +106,7 @@ async def test_supermemory_ingests_through_question_boundary_without_future_segm
     api = RecordingMemoryApi()
 
     result = await run_supermemory_vqa(
-        cast(AsyncMindBridge, api),
+        cast(MindBridge, api),
         (_question(1, question_ended_at=ORIGIN + timedelta(seconds=45)),),
         _prepared_subject(),
         run_id="run_01",
@@ -139,7 +139,7 @@ async def test_supermemory_maps_production_abstention_to_explicit_choice() -> No
     api = RecordingMemoryApi(answer=None)
 
     result = await run_supermemory_vqa(
-        cast(AsyncMindBridge, api),
+        cast(MindBridge, api),
         (_question(1, question_ended_at=ORIGIN + timedelta(seconds=45)),),
         _prepared_subject(),
         run_id="run_02",
@@ -155,7 +155,7 @@ async def test_supermemory_rejects_missing_question_boundary_before_api_calls() 
 
     with pytest.raises(ValueError, match="question boundary"):
         await run_supermemory_vqa(
-            cast(AsyncMindBridge, api),
+            cast(MindBridge, api),
             (_question(1, question_ended_at=ORIGIN + timedelta(seconds=45)),),
             SuperMemoryPreparedSubject(
                 subject=1,
@@ -178,7 +178,7 @@ async def test_supermemory_accepts_question_at_video_start_without_ingesting_fut
     prepared = _prepared_subject()
 
     await run_supermemory_vqa(
-        cast(AsyncMindBridge, api),
+        cast(MindBridge, api),
         (_question(1, question_ended_at=ORIGIN),),
         prepared,
         run_id="run_01",

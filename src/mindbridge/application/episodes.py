@@ -7,8 +7,14 @@ from dataclasses import dataclass
 from datetime import datetime
 from itertools import pairwise
 
-from mindbridge.application.ports import TextDocumentEmbedder
-from mindbridge.application.recall import RETRIEVAL_DOCUMENT_EMBEDDING_TASK
+from mindbridge.application.capabilities import (
+    Embedder,
+    Embedding,
+    EmbedRequest,
+    EmbedTask,
+    ModelInput,
+    TextPart,
+)
 from mindbridge.core import (
     DomainInvariantError,
     EmbeddedObjectType,
@@ -35,7 +41,7 @@ from mindbridge.core import (
 
 @dataclass(frozen=True, slots=True)
 class EpisodeProposal:
-    """One Omni-verified group of existing events that form a coherent episode."""
+    """One model-verified group of existing events that form a coherent episode."""
 
     event_ids: tuple[EventId, ...]
     description: str
@@ -118,7 +124,7 @@ class EpisodeWrite:
         if (
             self.embedding.object_type is not EmbeddedObjectType.EVENT
             or self.embedding.object_id != self.episode.event_id
-            or self.embedding.task != RETRIEVAL_DOCUMENT_EMBEDDING_TASK
+            or self.embedding.task != EmbedTask.DOCUMENT.value
             or not self.embedding.normalized
             or self.embedding.created_at != self.episode.created_at
         ):
@@ -137,7 +143,7 @@ async def derive_episode_writes(
     tenant_id: TenantId,
     candidates: tuple[Event, ...],
     consolidation: EpisodeConsolidation,
-    text_embedder: TextDocumentEmbedder,
+    text_embedder: Embedder,
     created_at: datetime,
 ) -> tuple[EpisodeWrite, ...]:
     """Build deterministic Episode graph records and aligned text vectors."""
@@ -164,17 +170,20 @@ async def derive_episode_writes(
         )
         for proposal, children in zip(consolidation.episodes, child_groups, strict=True)
     )
-    vectors = await text_embedder.encode_documents(
-        tuple(episode.description for episode in episodes)
+    result = await text_embedder.embed(
+        EmbedRequest(
+            inputs=tuple(ModelInput((TextPart(episode.description),)) for episode in episodes),
+            task=EmbedTask.DOCUMENT,
+        )
     )
-    if len(vectors) != len(episodes):
-        raise MemoryIntegrityError("text embedder returned the wrong Episode vector count")
+    if len(result.embeddings) != len(episodes):
+        raise MemoryIntegrityError("embedder returned the wrong episode vector count")
     return tuple(
-        _episode_write(episode, children, vector, text_embedder, created_at)
-        for episode, children, vector in zip(
+        _episode_write(episode, children, embedding, created_at)
+        for episode, children, embedding in zip(
             episodes,
             child_groups,
-            vectors,
+            result.embeddings,
             strict=True,
         )
     )
@@ -223,8 +232,7 @@ def _episode_event(
 def _episode_write(
     episode: Event,
     children: tuple[Event, ...],
-    vector: tuple[float, ...],
-    text_embedder: TextDocumentEmbedder,
+    embedding: Embedding,
     created_at: datetime,
 ) -> EpisodeWrite:
     child_event_ids = tuple(child.event_id for child in children)
@@ -319,19 +327,19 @@ def _episode_write(
                     episode.tenant_id,
                     EmbeddedObjectType.EVENT.value,
                     episode.event_id,
-                    text_embedder.model_reference.model_id,
-                    text_embedder.model_reference.revision,
-                    RETRIEVAL_DOCUMENT_EMBEDDING_TASK,
+                    embedding.model_reference.model_id,
+                    embedding.model_reference.revision,
+                    EmbedTask.DOCUMENT.value,
                 )
             ),
             tenant_id=episode.tenant_id,
             object_type=EmbeddedObjectType.EVENT,
             object_id=episode.event_id,
-            values=vector,
-            model_reference=text_embedder.model_reference,
-            space_reference=text_embedder.space_reference,
-            task=RETRIEVAL_DOCUMENT_EMBEDDING_TASK,
-            dimension=text_embedder.dimension,
+            values=embedding.values,
+            model_reference=embedding.model_reference,
+            space_reference=embedding.space_reference,
+            task=EmbedTask.DOCUMENT.value,
+            dimension=embedding.dimension,
             normalized=True,
             created_at=created_at,
         ),

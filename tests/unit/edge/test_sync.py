@@ -8,7 +8,7 @@ from typing import cast
 import pytest
 from mypy_boto3_s3 import S3Client
 
-from mindbridge import AsyncMindBridge, MindBridgeClientError
+from mindbridge import MindBridge, MindBridgeError
 from mindbridge.contracts import (
     DeletionListRequest,
     DeletionPage,
@@ -51,7 +51,7 @@ class FailOnceMemoryApi:
     async def observe(self, request: ObserveRequest) -> ObservationReceipt:
         self.calls += 1
         if self.calls == 1:
-            raise MindBridgeClientError("offline", code="transport_error")
+            raise MindBridgeError("offline", code="transport_error")
         return ObservationReceipt(
             observation_id=derive_observation_id(
                 request.tenant_id,
@@ -197,7 +197,7 @@ class CompletedMemoryApi:
 
     async def get_memory(self, tenant_id: str, memory_id: str) -> MemoryResult:
         if memory_id == "memory_deleted":
-            raise MindBridgeClientError(
+            raise MindBridgeError(
                 "memory was deleted",
                 code="memory_deleted",
                 status_code=410,
@@ -219,11 +219,11 @@ async def test_sync_retries_only_metadata_after_media_upload(tmp_path: Path) -> 
     synchronizer = EdgeObservationSynchronizer(
         outbox,
         SQLiteDeletionInbox(tmp_path / "edge.db", clock=lambda: NOW),
-        cast(AsyncMindBridge, api),
+        cast(MindBridge, api),
         upload,
         recent_memory=SQLiteRecentMemory(tmp_path / "edge.db", clock=lambda: NOW),
     )
-    with pytest.raises(MindBridgeClientError, match="offline"):
+    with pytest.raises(MindBridgeError, match="offline"):
         await synchronizer.sync_next()
 
     pending = outbox.next_pending()
@@ -254,7 +254,7 @@ async def test_sync_applies_tombstone_before_media_upload(tmp_path: Path) -> Non
     receipt = await EdgeObservationSynchronizer(
         outbox,
         deletion_inbox,
-        cast(AsyncMindBridge, api),
+        cast(MindBridge, api),
         upload,
         recent_memory=SQLiteRecentMemory(database_path, clock=lambda: NOW),
     ).sync_next()
@@ -281,7 +281,7 @@ async def test_sync_blocks_upload_while_deletion_backlog_remains(tmp_path: Path)
     receipt = await EdgeObservationSynchronizer(
         outbox,
         deletion_inbox,
-        cast(AsyncMindBridge, api),
+        cast(MindBridge, api),
         upload,
         recent_memory=SQLiteRecentMemory(database_path, clock=lambda: NOW),
     ).sync_next()
@@ -326,7 +326,7 @@ async def test_sync_blocks_memory_cache_while_deletion_backlog_remains(tmp_path:
     receipts = await EdgeObservationSynchronizer(
         outbox,
         SQLiteDeletionInbox(database_path, clock=lambda: NOW),
-        cast(AsyncMindBridge, api),
+        cast(MindBridge, api),
         unexpected_upload,
         recent_memory=recent,
     ).sync_pending()
@@ -404,7 +404,7 @@ async def test_sync_pending_caches_completed_cloud_memory(tmp_path: Path) -> Non
     receipts = await EdgeObservationSynchronizer(
         outbox,
         SQLiteDeletionInbox(database_path, clock=lambda: NOW),
-        cast(AsyncMindBridge, api),
+        cast(MindBridge, api),
         unexpected_upload,
         recent_memory=recent,
     ).sync_pending()

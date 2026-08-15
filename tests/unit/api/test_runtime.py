@@ -1,132 +1,143 @@
-"""Tests for explicit production process configuration."""
+"""Tests for explicit server composition."""
 
 import pytest
 
-from mindbridge.api import RuntimeSettings, create_production_app
+import mindbridge.api.runtime as runtime_module
+from mindbridge.server import Settings, create_app
 
 
-def test_runtime_settings_use_documented_defaults_and_redact_key() -> None:
-    """A valid deployment config is concise and safe to inspect in diagnostics."""
-    settings = RuntimeSettings.from_environment(
+def test_settings_use_deployable_defaults_and_redact_credentials() -> None:
+    settings = Settings.from_environment(_environment())
+
+    assert settings.generator_plugin == "openai"
+    assert settings.embedder_plugin == "openai"
+    assert settings.reranker_plugin is None
+    assert settings.generator_config["model_id"] == "qwen3.8-max"
+    assert settings.generator_config["model_revision"] == "deployment-revision"
+    assert settings.generator_config["reasoning_effort"] == "low"
+    assert settings.embedder_config["model_id"] == (
+        "jinaai/jina-embeddings-v5-omni-small-retrieval"
+    )
+    assert settings.embedder_config["document_model_id"] == (
+        "jinaai/jina-embeddings-v5-text-small-retrieval"
+    )
+    assert settings.minimum_embedding_similarity == 0.0
+    assert "secret" not in repr(settings)
+
+
+def test_explicit_plugin_json_does_not_require_bundled_provider_variables() -> None:
+    settings = Settings.from_environment(
         {
-            "MINDBRIDGE_DATABASE_URL": (
-                "postgresql://mindbridge:database-secret@postgres/mindbridge"
-            ),
+            "MINDBRIDGE_DATABASE_URL": "postgresql://mindbridge@postgres/mindbridge",
             "MINDBRIDGE_OBJECT_STORAGE_BUCKET": "memory",
-            "MINDBRIDGE_TASK_BROKER_URL": "redis://:broker-secret@redis:6379/0",
-            "MINDBRIDGE_VLM_API_KEY": "secret-unit-test-key",
-            "MINDBRIDGE_VLM_ENDPOINT": "https://vlm.example.test/api/v1/chat/completions",
-            "MINDBRIDGE_VLM_MODEL_REVISION": "deployment-revision",
-            "MINDBRIDGE_ANSWER_REASONING_EFFORT": "low",
-            "MINDBRIDGE_EMBEDDING_API_KEY": "secret-embedding-key",
-            "MINDBRIDGE_EMBEDDING_ENDPOINT": "https://embedding.example.test/v1/embeddings",
-            "MINDBRIDGE_TEXT_EMBEDDING_API_KEY": "secret-text-embedding-key",
-            "MINDBRIDGE_TEXT_EMBEDDING_ENDPOINT": (
-                "https://text-embedding.example.test/v1/embeddings"
-            ),
-            "MINDBRIDGE_TENANT_API_KEYS_JSON": (
-                '{"tenant_01":["tenant-api-key-000000000000000000"]}'
-            ),
+            "MINDBRIDGE_TASK_BROKER_URL": "redis://redis:6379/0",
+            "MINDBRIDGE_GENERATOR_PLUGIN": "anthropic",
+            "MINDBRIDGE_GENERATOR_CONFIG_JSON": '{"model":"claude"}',
+            "MINDBRIDGE_EMBEDDER_PLUGIN": "custom",
+            "MINDBRIDGE_EMBEDDER_CONFIG_JSON": '{"model":"local"}',
         }
     )
 
-    assert settings.object_storage_endpoint_url is None
-    assert settings.object_storage_region == "us-east-1"
-    assert settings.vlm_model_id == "qwen3.8-max"
-    assert settings.vlm_model_revision == "deployment-revision"
-    assert settings.answer_reasoning_effort == "low"
-    assert settings.embedding_model_id == "jinaai/jina-embeddings-v5-omni-small-retrieval"
-    assert settings.embedding_model_revision == "12949877f0092093f366c6450340011320152a05"
-    assert settings.text_embedding_model_id == "jinaai/jina-embeddings-v5-text-small-retrieval"
-    assert settings.text_embedding_model_revision == "6856e76bb72982e58de0620458a4e8b3614da340"
-    assert settings.minimum_embedding_similarity == 0.0
-    assert settings.tenant_api_keys_json is not None
-    assert "secret-unit-test-key" not in repr(settings)
-    assert "secret-embedding-key" not in repr(settings)
-    assert "secret-text-embedding-key" not in repr(settings)
-    assert "broker-secret" not in repr(settings)
-    assert "database-secret" not in repr(settings)
-    assert "tenant-api-key" not in repr(settings)
+    assert settings.generator_config == {"model": "claude"}
+    assert settings.embedder_config == {"model": "local"}
 
 
-def test_runtime_settings_require_vlm_revision() -> None:
-    """Recall cannot run with an unversioned answer model."""
-    with pytest.raises(ValueError, match="MINDBRIDGE_VLM_MODEL_REVISION"):
-        RuntimeSettings.from_environment(
-            {
-                "MINDBRIDGE_DATABASE_URL": "postgresql://mindbridge@postgres/mindbridge",
-                "MINDBRIDGE_OBJECT_STORAGE_BUCKET": "memory",
-                "MINDBRIDGE_TASK_BROKER_URL": "redis://redis:6379/0",
-                "MINDBRIDGE_VLM_API_KEY": "unit-test-key",
-                "MINDBRIDGE_VLM_ENDPOINT": "https://vlm.example.test/v1",
-            }
-        )
+def test_settings_require_generator_revision_for_bundled_default() -> None:
+    environment = dict(_environment())
+    del environment["MINDBRIDGE_GENERATOR_MODEL_REVISION"]
+
+    with pytest.raises(ValueError, match="MINDBRIDGE_GENERATOR_MODEL_REVISION"):
+        Settings.from_environment(environment)
 
 
-def test_runtime_settings_reject_unsupported_answer_reasoning_effort() -> None:
-    with pytest.raises(ValueError, match="answer_reasoning_effort"):
-        RuntimeSettings(
-            database_url="postgresql://mindbridge@postgres/mindbridge",
-            object_storage_bucket="memory",
-            task_broker_url="redis://redis:6379/0",
-            vlm_api_key="unit-test-key",
-            vlm_endpoint="https://vlm.example.test/v1",
-            vlm_model_revision="deployment-revision",
-            embedding_api_key="unit-test-embedding-key",
-            embedding_endpoint="https://embedding.example.test/v1",
-            text_embedding_api_key="unit-test-text-key",
-            text_embedding_endpoint="https://text.example.test/v1",
-            answer_reasoning_effort="unsupported",  # type: ignore[arg-type]
-        )
-
-
-def test_runtime_settings_reject_empty_direct_configuration() -> None:
-    """Programmatic composition has the same validation as environment loading."""
+def test_settings_reject_empty_direct_configuration() -> None:
     with pytest.raises(ValueError, match="object_storage_bucket"):
-        RuntimeSettings(
-            database_url="postgresql://mindbridge@postgres/mindbridge",
-            object_storage_bucket=" ",
-            task_broker_url="redis://redis:6379/0",
-            vlm_api_key="unit-test-key",
-            vlm_endpoint="https://vlm.example.test/v1",
-            vlm_model_revision="deployment-revision",
-            embedding_api_key="unit-test-embedding-key",
-            embedding_endpoint="https://embedding.example.test/v1",
-            text_embedding_api_key="unit-test-text-key",
-            text_embedding_endpoint="https://text.example.test/v1",
-        )
+        _settings(object_storage_bucket=" ")
 
 
-def test_runtime_settings_reject_invalid_embedding_similarity() -> None:
+def test_settings_reject_invalid_plugin_name() -> None:
+    with pytest.raises(ValueError, match="generator_plugin"):
+        _settings(generator_plugin="OpenAI")
+
+
+def test_settings_reject_invalid_embedding_similarity() -> None:
     with pytest.raises(ValueError, match="minimum_embedding_similarity"):
-        RuntimeSettings(
-            database_url="postgresql://mindbridge@postgres/mindbridge",
-            object_storage_bucket="memory",
-            task_broker_url="redis://redis:6379/0",
-            vlm_api_key="unit-test-key",
-            vlm_endpoint="https://vlm.example.test/v1",
-            vlm_model_revision="deployment-revision",
-            embedding_api_key="unit-test-embedding-key",
-            embedding_endpoint="https://embedding.example.test/v1",
-            text_embedding_api_key="unit-test-text-key",
-            text_embedding_endpoint="https://text.example.test/v1",
-            minimum_embedding_similarity=float("nan"),
-        )
+        _settings(minimum_embedding_similarity=float("nan"))
 
 
-def test_production_rest_fails_closed_without_tenant_credentials() -> None:
-    settings = RuntimeSettings(
-        database_url="postgresql://mindbridge@postgres/mindbridge",
-        object_storage_bucket="memory",
-        task_broker_url="redis://redis:6379/0",
-        vlm_api_key="unit-test-key",
-        vlm_endpoint="https://vlm.example.test/v1",
-        vlm_model_revision="deployment-revision",
-        embedding_api_key="unit-test-embedding-key",
-        embedding_endpoint="https://embedding.example.test/v1",
-        text_embedding_api_key="unit-test-text-key",
-        text_embedding_endpoint="https://text.example.test/v1",
-    )
-
+def test_rest_fails_closed_without_tenant_credentials() -> None:
     with pytest.raises(ValueError, match="MINDBRIDGE_TENANT_API_KEYS_JSON"):
-        create_production_app(settings)
+        create_app(_settings())
+
+
+async def test_runtime_closes_a_falsey_reranker(monkeypatch: pytest.MonkeyPatch) -> None:
+    closed: list[str] = []
+
+    class Model:
+        def __init__(self, name: str, *, falsey: bool = False) -> None:
+            self.name = name
+            self.falsey = falsey
+
+        def __bool__(self) -> bool:
+            return not self.falsey
+
+        async def close(self) -> None:
+            closed.append(self.name)
+
+    class Store:
+        async def open(self) -> None:
+            return None
+
+        async def close(self) -> None:
+            closed.append("store")
+
+    generator = Model("generator")
+    embedder = Model("embedder")
+    reranker = Model("reranker", falsey=True)
+    monkeypatch.setattr(runtime_module, "load_generator", lambda *_arguments: generator)
+    monkeypatch.setattr(runtime_module, "load_embedder", lambda *_arguments: embedder)
+    monkeypatch.setattr(runtime_module, "load_reranker", lambda *_arguments: reranker)
+    monkeypatch.setattr(runtime_module, "PostgresMemoryStore", lambda *_arguments: Store())
+    monkeypatch.setattr(runtime_module, "S3MediaAccess", lambda *_arguments, **_options: object())
+    monkeypatch.setattr(runtime_module, "create_task_queue", lambda *_arguments: object())
+    monkeypatch.setattr(
+        runtime_module,
+        "CeleryObservationJobPublisher",
+        lambda *_arguments: object(),
+    )
+    monkeypatch.setattr(runtime_module, "MemoryKernel", lambda *_arguments, **_options: object())
+
+    runtime = runtime_module._build_runtime(_settings(reranker_plugin="falsey", reranker_config={}))
+    async with runtime.open():
+        pass
+
+    assert closed == ["store", "reranker", "embedder", "generator"]
+
+
+def _settings(**changes: object) -> Settings:
+    values: dict[str, object] = {
+        "database_url": "postgresql://mindbridge@postgres/mindbridge",
+        "object_storage_bucket": "memory",
+        "task_broker_url": "redis://redis:6379/0",
+        "generator_config": {"model": "test"},
+        "embedder_config": {"model": "test"},
+    }
+    values.update(changes)
+    return Settings(**values)  # type: ignore[arg-type]
+
+
+def _environment() -> dict[str, str]:
+    return {
+        "MINDBRIDGE_DATABASE_URL": ("postgresql://mindbridge:database-secret@postgres/mindbridge"),
+        "MINDBRIDGE_OBJECT_STORAGE_BUCKET": "memory",
+        "MINDBRIDGE_TASK_BROKER_URL": "redis://:broker-secret@redis:6379/0",
+        "MINDBRIDGE_GENERATOR_API_KEY": "generator-secret",
+        "MINDBRIDGE_GENERATOR_ENDPOINT": "https://generator.example.test/v1",
+        "MINDBRIDGE_GENERATOR_MODEL_REVISION": "deployment-revision",
+        "MINDBRIDGE_GENERATOR_REASONING_EFFORT": "low",
+        "MINDBRIDGE_EMBEDDER_API_KEY": "query-secret",
+        "MINDBRIDGE_EMBEDDER_ENDPOINT": "https://query.example.test/v1",
+        "MINDBRIDGE_EMBEDDER_DOCUMENT_API_KEY": "document-secret",
+        "MINDBRIDGE_EMBEDDER_DOCUMENT_ENDPOINT": "https://document.example.test/v1",
+        "MINDBRIDGE_TENANT_API_KEYS_JSON": ('{"tenant_01":["tenant-api-key-000000000000000000"]}'),
+    }

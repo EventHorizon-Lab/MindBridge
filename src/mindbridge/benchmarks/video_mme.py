@@ -25,7 +25,7 @@ from mindbridge.contracts import (
     RecallRequest,
 )
 from mindbridge.prompts import VIDEO_MME_QUERY_PROMPT
-from mindbridge.sdk import AsyncMindBridge, MindBridgeClientError
+from mindbridge.sdk import MindBridge, MindBridgeError
 
 VIDEO_MME_ADAPTER_VERSION = "video_mme_official_v1"
 VideoMMEDuration = Literal["short", "medium", "long"]
@@ -178,7 +178,7 @@ def load_video_mme(annotation_path: Path) -> tuple[VideoMMEVideo, ...]:
 
 
 async def run_video_mme_video(
-    memory: AsyncMindBridge,
+    memory: MindBridge,
     annotation: VideoMMEVideo,
     prepared: PreparedVideo,
     *,
@@ -293,7 +293,7 @@ def _video(rows: list[_RawQuestion]) -> VideoMMEVideo:
 
 
 async def _answer_question(
-    memory: AsyncMindBridge,
+    memory: MindBridge,
     tenant_id: str,
     question: VideoMMEQuestion,
     cutoff: AwareDatetime,
@@ -314,7 +314,7 @@ async def _answer_question(
                     limit=recall_limit,
                 )
             )
-    except MindBridgeClientError as error:
+    except MindBridgeError as error:
         if error.code not in {"model_output_invalid", "model_request_failed"}:
             raise
         return _question_result(

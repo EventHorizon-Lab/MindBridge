@@ -1,18 +1,23 @@
-"""Deterministic graph records derived from one validated Omni perception."""
+"""Deterministic graph records derived from one validated perception."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
+from mindbridge.application.capabilities import (
+    Embedder,
+    EmbedRequest,
+    EmbedTask,
+    ModelInput,
+    TextPart,
+)
 from mindbridge.application.perception import (
     EventPerception,
     PerceivedClaim,
     PerceivedEntity,
     time_ranges_overlap,
 )
-from mindbridge.application.ports import TextDocumentEmbedder
-from mindbridge.application.recall import RETRIEVAL_DOCUMENT_EMBEDDING_TASK
 from mindbridge.core import (
     Claim,
     ClaimId,
@@ -26,6 +31,7 @@ from mindbridge.core import (
     Event,
     EvidenceSpan,
     MemoryId,
+    MemoryIntegrityError,
     MemoryRecord,
     MemoryType,
     MentionId,
@@ -181,14 +187,21 @@ async def embed_observation_graph(
     tenant_id: TenantId,
     events: tuple[Event, ...],
     claims: tuple[Claim, ...],
-    embedder: TextDocumentEmbedder,
+    embedder: Embedder,
     created_at: datetime,
 ) -> tuple[EmbeddingRecord, ...]:
-    """Batch all event and claim text through the aligned Jina Text tower."""
+    """Batch all event and claim text through the selected document encoder."""
     objects = tuple(
         (EmbeddedObjectType.EVENT, event.event_id, event.description) for event in events
     ) + tuple((EmbeddedObjectType.CLAIM, claim.claim_id, claim.statement) for claim in claims)
-    vectors = await embedder.encode_documents(tuple(text for _, _, text in objects))
+    result = await embedder.embed(
+        EmbedRequest(
+            inputs=tuple(ModelInput((TextPart(text),)) for _, _, text in objects),
+            task=EmbedTask.DOCUMENT,
+        )
+    )
+    if len(result.embeddings) != len(objects):
+        raise MemoryIntegrityError("embedder returned the wrong graph vector count")
     return tuple(
         EmbeddingRecord(
             embedding_id=EmbeddingId(
@@ -197,23 +210,23 @@ async def embed_observation_graph(
                     tenant_id,
                     object_type.value,
                     object_id,
-                    embedder.model_reference.model_id,
-                    embedder.model_reference.revision,
-                    RETRIEVAL_DOCUMENT_EMBEDDING_TASK,
+                    embedding.model_reference.model_id,
+                    embedding.model_reference.revision,
+                    EmbedTask.DOCUMENT.value,
                 )
             ),
             tenant_id=tenant_id,
             object_type=object_type,
             object_id=object_id,
-            values=values,
-            model_reference=embedder.model_reference,
-            space_reference=embedder.space_reference,
-            task=RETRIEVAL_DOCUMENT_EMBEDDING_TASK,
-            dimension=embedder.dimension,
+            values=embedding.values,
+            model_reference=embedding.model_reference,
+            space_reference=embedding.space_reference,
+            task=EmbedTask.DOCUMENT.value,
+            dimension=embedding.dimension,
             normalized=True,
             created_at=created_at,
         )
-        for (object_type, object_id, _), values in zip(objects, vectors, strict=True)
+        for (object_type, object_id, _), embedding in zip(objects, result.embeddings, strict=True)
     )
 
 

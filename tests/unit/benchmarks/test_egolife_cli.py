@@ -7,6 +7,8 @@ from pathlib import Path
 
 import pytest
 
+import mindbridge.benchmarks.egolife_cli as egolife_cli
+from mindbridge.benchmarks.artifacts import load_deployment_snapshot
 from mindbridge.benchmarks.egolife_cli import (
     EgoLifeRunManifest,
     _Arguments,
@@ -21,9 +23,31 @@ from mindbridge.benchmarks.egolife_runner import (
 )
 from mindbridge.contracts import MediaObjectInput
 from mindbridge.core import MediaKind
-from mindbridge.models.jina import DEFAULT_JINA_OMNI_MODEL_ID, DEFAULT_JINA_OMNI_REVISION
 
 NOW = datetime(2026, 8, 12, 12, 0, tzinfo=timezone.utc)
+
+
+def test_egolife_validates_deployment_before_inference(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    arguments = _arguments(
+        tmp_path / "qa.json",
+        tmp_path / "prepared.json",
+        tmp_path / "predictions.json",
+    )
+    arguments.deployment_config_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(egolife_cli, "_parse_arguments", lambda: arguments)
+    monkeypatch.setattr(egolife_cli, "load_egolife_qa", lambda _path: (_question(),))
+    monkeypatch.setattr(egolife_cli, "load_prepared_egolife", lambda _path: _prepared())
+
+    async def fail_if_run(*_arguments: object) -> None:
+        raise AssertionError("inference started before deployment validation")
+
+    monkeypatch.setattr(egolife_cli, "_run", fail_if_run)
+
+    with pytest.raises(ValueError):
+        egolife_cli.main()
 
 
 def test_egolife_artifacts_pin_inputs_models_metrics_and_output(tmp_path: Path) -> None:
@@ -36,11 +60,13 @@ def test_egolife_artifacts_pin_inputs_models_metrics_and_output(tmp_path: Path) 
     prepared = _prepared()
     result = _result()
 
+    arguments = _arguments(dataset_path, prepared_path, output_path)
     _write_artifacts(
-        _arguments(dataset_path, prepared_path, output_path),
+        arguments,
         (question,),
         prepared,
         (result,),
+        load_deployment_snapshot(arguments.deployment_config_path, require_worker=True),
     )
 
     predictions = json.loads(output_path.read_text(encoding="utf-8"))
@@ -51,7 +77,7 @@ def test_egolife_artifacts_pin_inputs_models_metrics_and_output(tmp_path: Path) 
     assert predictions["results"][0]["model_option"] == "B"
     assert manifest.dataset_revision == "dataset-revision"
     assert manifest.evaluator_revision == "evaluator-revision"
-    assert manifest.reasoning_effort == "low"
+    assert manifest.deployment.server_generator.config["model_revision"] == ("answer-fingerprint")
     assert manifest.request_timeout_seconds == 1_800.0
     assert manifest.run_id == "run_01"
     assert manifest.metrics.correct_count == 1
@@ -68,6 +94,8 @@ def test_egolife_selection_rejects_unknown_question() -> None:
 
 
 def _arguments(dataset_path: Path, prepared_path: Path, output_path: Path) -> _Arguments:
+    deployment_path = dataset_path.parent / "deployment.json"
+    _write_deployment(deployment_path)
     return _Arguments(
         dataset_path=dataset_path,
         prepared_media_path=prepared_path,
@@ -76,13 +104,7 @@ def _arguments(dataset_path: Path, prepared_path: Path, output_path: Path) -> _A
         dataset_revision="dataset-revision",
         evaluator_revision="evaluator-revision",
         code_revision="mindbridge-commit",
-        perception_model_id="qwen3.8-max",
-        perception_model_revision="perception-fingerprint",
-        answer_model_id="qwen3.8-max",
-        answer_model_revision="answer-fingerprint",
-        answer_reasoning_effort="low",
-        embedding_model_id=DEFAULT_JINA_OMNI_MODEL_ID,
-        embedding_model_revision=DEFAULT_JINA_OMNI_REVISION,
+        deployment_config_path=deployment_path,
         run_id="run_01",
         tenant_prefix="benchmark_egolife",
         device_id="egolife_camera",
@@ -93,6 +115,46 @@ def _arguments(dataset_path: Path, prepared_path: Path, output_path: Path) -> _A
         processing_timeout_seconds=1_800.0,
         question_ids=(),
         overwrite=False,
+    )
+
+
+def _write_deployment(path: Path) -> None:
+    path.write_text(
+        json.dumps(
+            {
+                "server_generator": {
+                    "plugin": "openai",
+                    "distribution": "mindbridge",
+                    "version": "0.1.0",
+                    "config": {"model_revision": "answer-fingerprint"},
+                },
+                "server_embedder": {
+                    "plugin": "openai",
+                    "distribution": "mindbridge",
+                    "version": "0.1.0",
+                    "config": {},
+                },
+                "worker_generator": {
+                    "plugin": "openai",
+                    "distribution": "mindbridge",
+                    "version": "0.1.0",
+                    "config": {"model_revision": "perception-fingerprint"},
+                },
+                "worker_media_embedder": {
+                    "plugin": "jina",
+                    "distribution": "mindbridge",
+                    "version": "0.1.0",
+                    "config": {},
+                },
+                "worker_text_embedder": {
+                    "plugin": "openai",
+                    "distribution": "mindbridge",
+                    "version": "0.1.0",
+                    "config": {},
+                },
+            }
+        ),
+        encoding="utf-8",
     )
 
 
