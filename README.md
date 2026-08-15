@@ -732,6 +732,11 @@ MindBridge does not capture authorization headers, request bodies, prompts, memo
 telemetry. Response `trace_id` values use `trace_<32-hex W3C trace ID>` so the suffix maps directly
 to the configured backend. Set `OTEL_SDK_DISABLED=true` for an explicit process-level opt-out.
 
+The `mindbridge.stage.duration` histogram reports bounded `stage` values for edge capture-to-upload
+and acknowledgement, cloud job claim and searchable readiness, and recall first-answer and
+completion latency. Generator spans also report media count, JSON retry, time to first token, token
+usage, and the bounded recall phase/round; none of these attributes contain user content or IDs.
+
 Agents can start the same production kernel over the official MCP stdio transport. Tool input and
 structured output schemas are generated from the same Pydantic contracts used by REST and Python:
 

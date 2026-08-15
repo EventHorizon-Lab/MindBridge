@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import os
 import sys
-from collections.abc import Callable, Coroutine, Mapping
+from collections.abc import Callable, Coroutine, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import wraps
 from importlib.metadata import version
@@ -36,6 +38,37 @@ _OPERATION_DURATION = _METER.create_histogram(
     "mindbridge.operation.duration",
     unit="s",
     description="MindBridge domain operation duration.",
+)
+_STAGE_DURATION = _METER.create_histogram(
+    "mindbridge.stage.duration",
+    unit="s",
+    description="Elapsed time for low-cardinality MindBridge pipeline milestones.",
+)
+_DURATION_BUCKET_BOUNDARIES_SECONDS = (
+    0.01,
+    0.025,
+    0.05,
+    0.1,
+    0.25,
+    0.5,
+    1,
+    2,
+    5,
+    10,
+    30,
+    60,
+    120,
+    300,
+    600,
+    1_200,
+    1_800,
+    3_600,
+    7_200,
+    14_400,
+    28_800,
+    86_400,
+    259_200,
+    604_800,
 )
 _CONFIGURATION_LOCK = Lock()
 _configured_process: tuple[int, str, TelemetryProviders] | None = None
@@ -69,27 +102,41 @@ def trace_operation(
             *args: _Parameters.args,
             **kwargs: _Parameters.kwargs,
         ) -> _Result:
-            started_at = perf_counter()
-            outcome = "error"
-            try:
-                with _TRACER.start_as_current_span(name):
-                    result = await operation(*args, **kwargs)
-                outcome = "success"
-                return result
-            except asyncio.CancelledError:
-                outcome = "cancelled"
-                raise
-            finally:
-                attributes = {"operation": name, "outcome": outcome}
-                _OPERATION_CALLS.add(1, attributes)
-                _OPERATION_DURATION.record(
-                    max(0.0, perf_counter() - started_at),
-                    attributes,
-                )
+            with operation_span(name):
+                return await operation(*args, **kwargs)
 
         return traced
 
     return decorate
+
+
+@contextmanager
+def operation_span(name: str) -> Iterator[None]:
+    """Trace and measure one domain operation around an existing code block."""
+    if not name.strip():
+        raise ValueError("operation name must not be empty")
+    started_at = perf_counter()
+    outcome = "error"
+    try:
+        with _TRACER.start_as_current_span(name):
+            yield
+        outcome = "success"
+    except asyncio.CancelledError:
+        outcome = "cancelled"
+        raise
+    finally:
+        attributes = {"operation": name, "outcome": outcome}
+        _OPERATION_CALLS.add(1, attributes)
+        _OPERATION_DURATION.record(max(0.0, perf_counter() - started_at), attributes)
+
+
+def record_stage_duration(stage: str, duration_seconds: float) -> None:
+    """Record one successful, code-defined pipeline milestone without content or IDs."""
+    if not stage.strip():
+        raise ValueError("stage must not be empty")
+    if not math.isfinite(duration_seconds) or duration_seconds < 0:
+        raise ValueError("stage duration must be finite and non-negative")
+    _STAGE_DURATION.record(duration_seconds, {"stage": stage})
 
 
 def current_trace_id() -> str:
@@ -181,12 +228,29 @@ def _configure_metrics(resource: Resource) -> MeterProvider:
     from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
     from opentelemetry.sdk.metrics import MeterProvider
     from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
+    from opentelemetry.sdk.metrics.view import ExplicitBucketHistogramAggregation, View
 
     existing = metrics.get_meter_provider()
     if isinstance(existing, MeterProvider):
         return existing
     reader = PeriodicExportingMetricReader(OTLPMetricExporter())
-    provider = MeterProvider(resource=resource, metric_readers=(reader,))
+    duration_buckets = ExplicitBucketHistogramAggregation(
+        boundaries=_DURATION_BUCKET_BOUNDARIES_SECONDS
+    )
+    provider = MeterProvider(
+        resource=resource,
+        metric_readers=(reader,),
+        views=(
+            View(
+                instrument_name="mindbridge.operation.duration",
+                aggregation=duration_buckets,
+            ),
+            View(
+                instrument_name="mindbridge.stage.duration",
+                aggregation=duration_buckets,
+            ),
+        ),
+    )
     metrics.set_meter_provider(provider)
     return provider
 

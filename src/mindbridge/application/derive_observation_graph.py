@@ -45,6 +45,7 @@ from mindbridge.core import (
     derive_relation,
     derive_stable_id,
 )
+from mindbridge.telemetry import trace_operation
 
 
 @dataclass(frozen=True, slots=True)
@@ -183,6 +184,7 @@ def derive_observation_graph(
     )
 
 
+@trace_operation("mindbridge.process_observation.embed_graph")
 async def embed_observation_graph(
     tenant_id: TenantId,
     events: tuple[Event, ...],

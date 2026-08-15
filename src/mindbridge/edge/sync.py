@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 import boto3
@@ -25,7 +26,12 @@ from mindbridge.edge.recent_memory import SQLiteRecentMemory
 from mindbridge.file_integrity import sha256_file
 from mindbridge.infrastructure.s3 import tenant_s3_object_key
 from mindbridge.sdk import MindBridge, MindBridgeError
-from mindbridge.telemetry import set_current_span_attributes, trace_operation
+from mindbridge.telemetry import (
+    operation_span,
+    record_stage_duration,
+    set_current_span_attributes,
+    trace_operation,
+)
 
 if TYPE_CHECKING:
     from mypy_boto3_s3 import S3Client
@@ -111,12 +117,14 @@ class EdgeObservationSynchronizer:
         upload_media: UploadEdgeMedia,
         *,
         recent_memory: SQLiteRecentMemory,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._outbox = outbox
         self._deletion_inbox = deletion_inbox
         self._memory = memory
         self._upload_media = upload_media
         self._recent_memory = recent_memory
+        self._clock = clock or _utc_now
 
     @trace_operation("mindbridge.edge.sync_observation")
     async def sync_next(self) -> ObservationReceipt | None:
@@ -135,24 +143,37 @@ class EdgeObservationSynchronizer:
             {
                 "mindbridge.tenant.id": item.request.tenant_id,
                 "mindbridge.device.id": item.request.device_id,
-                "mindbridge.outbox.attempt": item.attempts,
+                "mindbridge.outbox.attempt": item.attempts + 1,
                 "mindbridge.media.count": len(item.media_files),
             }
         )
         if not item.media_uploaded:
+            with operation_span("mindbridge.edge.upload_media"):
+                try:
+                    for media_file in item.media_files:
+                        await self._upload_media(item.request, media_file)
+                except Exception as error:
+                    self._outbox.record_failure(item.outbox_id, _network_error_code(error))
+                    raise
+                self._outbox.mark_media_uploaded(item.outbox_id)
+                uploaded_at = self._now()
+            record_stage_duration(
+                "edge.capture_to_upload_complete",
+                max(0.0, (uploaded_at - item.request.ended_at).total_seconds()),
+            )
+        with operation_span("mindbridge.edge.observe_ack"):
             try:
-                for media_file in item.media_files:
-                    await self._upload_media(item.request, media_file)
+                receipt = await self._memory.observe(item.request)
             except Exception as error:
                 self._outbox.record_failure(item.outbox_id, _network_error_code(error))
                 raise
-            self._outbox.mark_media_uploaded(item.outbox_id)
-        try:
-            receipt = await self._memory.observe(item.request)
-        except Exception as error:
-            self._outbox.record_failure(item.outbox_id, _network_error_code(error))
-            raise
-        self._outbox.acknowledge(item, receipt)
+            set_current_span_attributes({"mindbridge.observation.status": receipt.status.value})
+            self._outbox.acknowledge(item, receipt)
+            acknowledged_at = self._now()
+        record_stage_duration(
+            "edge.capture_to_observation_ack",
+            max(0.0, (acknowledged_at - item.request.ended_at).total_seconds()),
+        )
         return receipt
 
     @trace_operation("mindbridge.edge.sync_deletions")
@@ -262,6 +283,12 @@ class EdgeObservationSynchronizer:
             receipts.append(receipt)
         return tuple(receipts)
 
+    def _now(self) -> datetime:
+        now = self._clock()
+        if now.utcoffset() is None:
+            raise ValueError("edge sync clock must return a timezone-aware datetime")
+        return now
+
 
 def _network_error_code(error: Exception) -> str:
     if isinstance(error, MindBridgeError):
@@ -269,3 +296,7 @@ def _network_error_code(error: Exception) -> str:
     if isinstance(error, ObjectStorageError):
         return "object_storage_error"
     return type(error).__name__[:255]
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)

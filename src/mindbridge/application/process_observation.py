@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import replace
 from datetime import datetime, timedelta
+from time import perf_counter
 
 from mindbridge.application.capabilities import (
     Embedder,
@@ -53,7 +54,12 @@ from mindbridge.core import (
     TenantId,
     derive_stable_id,
 )
-from mindbridge.telemetry import set_current_span_attributes, trace_operation
+from mindbridge.telemetry import (
+    operation_span,
+    record_stage_duration,
+    set_current_span_attributes,
+    trace_operation,
+)
 
 
 class ProcessObservation:
@@ -98,6 +104,18 @@ class ProcessObservation:
             if claim.job.state not in {JobState.RUNNING, JobState.SUCCEEDED}:
                 raise MemoryIntegrityError("unclaimed observation job has invalid state")
             return claim.job
+
+        processing_started_at = perf_counter()
+        job_age_at_claim_seconds = max(
+            0.0,
+            (claim.job.updated_at - claim.job.created_at).total_seconds(),
+        )
+        set_current_span_attributes({"mindbridge.job.attempt": claim.job.attempt})
+        if claim.job.attempt == 1:
+            set_current_span_attributes(
+                {"mindbridge.process_observation.queue_lag_seconds": job_age_at_claim_seconds}
+            )
+            record_stage_duration("cloud.job_to_first_claim", job_age_at_claim_seconds)
 
         try:
             batch = await self._store.read_observation_batch(tenant_id, observation_id)
@@ -160,13 +178,23 @@ class ProcessObservation:
                 relations=graph.relations,
                 embeddings=evidence_embeddings + graph_embeddings,
             )
-            return await self._store.commit_observation_processing(
-                tenant_id,
-                observation_id,
-                job_id,
-                attempt=claim.job.attempt,
-                output=output,
+            with operation_span("mindbridge.process_observation.commit"):
+                completed = await self._store.commit_observation_processing(
+                    tenant_id,
+                    observation_id,
+                    job_id,
+                    attempt=claim.job.attempt,
+                    output=output,
+                )
+            ready_seconds = job_age_at_claim_seconds + max(
+                0.0,
+                perf_counter() - processing_started_at,
             )
+            set_current_span_attributes(
+                {"mindbridge.process_observation.searchable_ready_seconds": ready_seconds}
+            )
+            record_stage_duration("cloud.job_to_searchable_ready", ready_seconds)
+            return completed
         except Exception as error:
             await self._store.mark_observation_processing_failed(
                 tenant_id,
@@ -280,6 +308,7 @@ def _events(
     )
 
 
+@trace_operation("mindbridge.process_observation.embed_evidence")
 async def _evidence_embeddings(
     tenant_id: TenantId,
     evidence: tuple[ResolvedEvidence, ...],

@@ -9,6 +9,7 @@ from typing import TypeVar
 
 from mindbridge.application.capabilities import GenerateRequest, GenerateResult, Generator
 from mindbridge.core import ModelOutputError
+from mindbridge.telemetry import set_current_span_attributes
 
 _Output = TypeVar("_Output")
 _JSON_CODE_FENCE = re.compile(
@@ -25,10 +26,13 @@ async def generate_json(
     """Retry malformed structured output once with provider JSON mode."""
     result = await generator.generate(request)
     try:
-        return parse(result.text), result
+        output = parse(result.text)
     except ModelOutputError:
+        set_current_span_attributes({"mindbridge.model.structured_retry_count": 1})
         result = await generator.generate(replace(request, json_mode=True))
         return parse(result.text), result
+    set_current_span_attributes({"mindbridge.model.structured_retry_count": 0})
+    return output, result
 
 
 def unwrap_json_code_fence(content: str) -> str:

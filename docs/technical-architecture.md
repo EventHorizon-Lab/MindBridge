@@ -1441,6 +1441,11 @@ ID；无 SDK 的嵌入式调用才生成独立 fallback ID。
 P50/P95/P99，也不会制造高基数或隐私泄漏。SLO 阈值由部署的 Collector/监控规则基于真实负载
 配置，不硬编码进业务代码。
 
+`mindbridge.stage.duration` 使用有限的 `stage` 维度记录端侧 capture→upload/ack、云端
+job→first claim/searchable ready，以及 recall→first answer/complete。Histogram 的显式桶覆盖
+10 ms 到 7 天，兼顾在线请求、多轮召回和离线重连长尾。Generator span 另记录媒体数量、JSON
+重试、TTFT、token usage，以及有限的召回 phase/round；这些字段均不包含用户正文或对象 ID。
+
 日志同样只记录 ID、耗时、模型版本、token/frame/audio 秒数和错误；默认不写原始人脸、音频
 内容、完整 Prompt 或用户记忆正文。生产导出先进入 OpenTelemetry Collector，再由 Collector
 负责采样、批处理、脱敏和后端路由。
