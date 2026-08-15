@@ -10,11 +10,11 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import NoReturn, Protocol
 
-from billiard.exceptions import (  # type: ignore[import-untyped]  # Celery dependency lacks types.
+from billiard.exceptions import (
     SoftTimeLimitExceeded,
 )
-from celery import Celery  # type: ignore[import-untyped]  # Upstream lacks PEP 561 metadata.
-from celery.signals import (  # type: ignore[import-untyped]  # Upstream lacks PEP 561 metadata.
+from celery import Celery
+from celery.signals import (
     worker_process_init,
 )
 

@@ -34,10 +34,8 @@ from mindbridge.models.jina import (
     DEFAULT_JINA_OMNI_REVISION,
 )
 from mindbridge.models.openai_chat import REASONING_EFFORT_VALUES
-from mindbridge.models.openai_omni import (
-    ANSWER_FROM_EVIDENCE_PROMPT_VERSION,
-    DEFAULT_OMNI_MODEL_ID,
-)
+from mindbridge.models.openai_omni import DEFAULT_OMNI_MODEL_ID
+from mindbridge.prompts import ANSWER_FROM_EVIDENCE_PROMPT
 from mindbridge.sdk import AsyncMindBridge
 
 LOCOMO_RUNNER_VERSION = "locomo_production_api_v8"
@@ -153,7 +151,7 @@ def _write_artifacts(
         code_revision=arguments.code_revision,
         answer_model_id=arguments.answer_model_id,
         answer_model_revision=arguments.answer_model_revision,
-        answer_prompt_version=ANSWER_FROM_EVIDENCE_PROMPT_VERSION,
+        answer_prompt_version=ANSWER_FROM_EVIDENCE_PROMPT.version,
         reasoning_effort=arguments.answer_reasoning_effort,
         embedding_model_id=arguments.embedding_model_id,
         embedding_model_revision=arguments.embedding_model_revision,

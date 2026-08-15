@@ -32,7 +32,7 @@ MindBridge 不是机器人、Agent 或大模型。MindBridge 是**记忆本身**
 2. 首批端侧平台是 NVIDIA Jetson 和机器人主机。
 3. 人脸识别与声纹识别尽可能在端侧完成；身份模板默认不离开设备。
 4. 不要求完全离线。云端是长期记忆和重型推理的主路径，端侧提供连续采集、隐私处理、近期记忆和断网缓冲。
-5. 文本侧以 LoCoMo 为核心 Benchmark；多模态侧覆盖 EgoLifeQA、SuperMemory-VQA 和 M3-Bench，并以 SOTA 为目标。
+5. 文本侧以 LoCoMo 为核心 Benchmark；多模态侧覆盖 EgoLifeQA、EgoTempo、Video-MME、SuperMemory-VQA 和 M3-Bench，并以 SOTA 为目标。
 
 ### 2.2 强制设计原则
 
@@ -1256,6 +1256,8 @@ tests/
 | EgoLifeQA | 跨小时/天的第一视角视听、身份和生活事件 | 端侧身份、分层 Episode、AV 证据和跨日关联 |
 | SuperMemory-VQA | 多证据、自然提问、物体位置、意图、时间线和拒答 | evidence coverage、关系展开、枚举、证据充分性判断 |
 | M3-Bench | 机器人视角长期记忆、人类理解、常识提取和跨模态推理 | 在线记忆构建、实体中心图、迭代召回和原始媒体核验 |
+| Video-MME | 短、中、长视频的感知、时序、空间与跨模态选择题 | 分段 AV 证据、长程召回、官方四选一协议 |
+| EgoTempo | 第一视角动作前后、频率、顺序、速度与持续时间 | clip 内时间线、事件边界、开放式证据回答 |
 
 ### 14.2 统一评测路径
 
@@ -1269,13 +1271,15 @@ tests/
 6. 模型、Prompt、索引参数和代码 commit 固定进 run manifest。
 
 可执行适配基线固定 LoCoMo revision `3eb6f2c585f5e1699204e3c3bdf7adc5c28cb376`、M3-Agent
-revision `0e3e41939bd8a0b66d756e7b7eb8d5fe9992da5c`、EgoLife 数据 revision
-`143fb319be7aa5ae210c936bf4f0f3a86092afb0` 和 SuperMemory-VQA 数据 revision
+revision `0e3e41939bd8a0b66d756e7b7eb8d5fe9992da5c`、Video-MME 数据 revision
+`ead1408f75b618502df9a1d8e0950166bf0a2a0b`、EgoLife 数据 revision
+`143fb319be7aa5ae210c936bf4f0f3a86092afb0`、EgoTempo revision
+`7022ba77b4d89f51cf34e499767995ccd5c90c7a` 和 SuperMemory-VQA 数据 revision
 `1d228e0f10049a8a84c458dded2aa25b1e21ce8f`。适配器只转换推理所需字段；EgoLife 的
 `target_time`、`keywords`、`reason` 与 SuperMemory 的 `answer_evidence` 不进入运行契约。
 媒体通过 Hugging Face Hub 官方客户端按 revision 获取，仓库不保存数据副本或自研下载器。
-`dataset-adapters-smoke.json` 记录源文件 SHA-256、适配器版本和完整样本计数；当前门禁覆盖
-LoCoMo 1,986 题、M3 两个 split 共 4,490 题、EgoLifeQA 500 题和 SuperMemory-VQA 4,853 题。
+`dataset-adapters-smoke.json` 记录源文件 SHA-256、适配器版本和完整样本计数；当前门禁还覆盖
+Video-MME 2,700 题、EgoTempo 500 题，并保留其他已接入评测的完整样本计数。
 
 LoCoMo runner 将原始对话逐 turn 通过 `remember` 写入，并且不向生产接口传入参考答案、证据
 标签或 category。Recall query 只包含原始问题，作答格式由统一的 Omni Answerer 契约负责，避免指令文本
@@ -1330,6 +1334,12 @@ SuperMemory-VQA runner 以 participant 为隔离单元，将各 session 的 Unix
 “This question can not be answered.” 是普通 answerability 选项，不等于 API 的 `null`
 abstention。当 transcript 与媒体同时存在时，前者引用后者的 source EvidenceSpan。输出计算
 Ans-F1、QA-Acc 与 QA-MRR。
+
+Video-MME 与 EgoTempo 共用通用 `PreparedVideo`/`PreparedVideoSegment` 媒体边界，但数据模型、
+官方 Prompt 和输出协议分别保留。Video-MME 从官方 Parquet 读取 900 个视频、输出官方嵌套
+`response` 结构；EgoTempo 按 `clip_id` 解析 Ego4D 源区间、每个 clip 只摄入一次，并输出官方
+`V/Q/QA/A/C/M` judge 输入。两者都只依赖 `AsyncMindBridge` 公共契约，新增模型提供商无需改动
+Benchmark；EgoTempo 的 Gemini judge 保持在固定 revision 的官方 notebook 中，不复制进产品代码。
 
 所有 runner 强制接收 `run_id`，并将其写入 tenant ID 与 sidecar manifest。每次运行使用新的
 `run_id`，从结构上阻断上一次完整摄入留下的未来记忆污染本次较早问题；输出还固定数据、prepared

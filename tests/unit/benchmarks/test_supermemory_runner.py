@@ -17,6 +17,7 @@ from mindbridge.benchmarks import (
     run_supermemory_vqa,
 )
 from mindbridge.contracts import (
+    IdentityObservationInput,
     MediaObjectInput,
     MemoryView,
     ObservationProcessingJobView,
@@ -27,7 +28,14 @@ from mindbridge.contracts import (
     RecallResult,
     RememberRequest,
 )
-from mindbridge.core import JobState, MediaKind, MemoryState, MemoryType, VerificationStatus
+from mindbridge.core import (
+    IdentityKind,
+    JobState,
+    MediaKind,
+    MemoryState,
+    MemoryType,
+    VerificationStatus,
+)
 
 ORIGIN = datetime(2026, 3, 10, tzinfo=timezone.utc)
 
@@ -36,11 +44,13 @@ class RecordingMemoryApi:
     def __init__(self, answer: str | None = "Ranking: C, A, D, B") -> None:
         self.answer = answer
         self.calls: list[str] = []
+        self.observe_requests: list[ObserveRequest] = []
         self.recall_requests: list[RecallRequest] = []
         self.remember_requests: list[RememberRequest] = []
 
     async def observe(self, request: ObserveRequest) -> ObservationReceipt:
         self.calls.append(f"observe:{request.sequence}")
+        self.observe_requests.append(request)
         return ObservationReceipt(
             observation_id=f"observation_{request.sequence}",
             processing_job_id=f"job_{request.sequence}",
@@ -117,6 +127,7 @@ async def test_supermemory_ingests_through_question_boundary_without_future_segm
     )
     assert api.calls.index("observe:1") < api.calls.index("job:job_1")
     assert api.remember_requests[0].evidence_ids == ("evidence_0",)
+    assert api.observe_requests[0].identity_observations == (_identity(),)
     assert result[0].ranked_option_indices == (2, 0, 3, 1)
     assert api.recall_requests[0].filters.occurred_before == ORIGIN + timedelta(seconds=45)
     request_json = api.recall_requests[0].model_dump_json()
@@ -209,6 +220,38 @@ def test_prepared_supermemory_rejects_globally_overlapping_segments() -> None:
         )
 
 
+def test_supermemory_identity_requires_source_media() -> None:
+    with pytest.raises(ValidationError, match="identity observations require source media"):
+        SuperMemoryPreparedSegment(
+            start_seconds=0,
+            duration_ms=30_000,
+            transcript="A person spoke.",
+            identity_observations=(_identity(),),
+        )
+
+
+def test_supermemory_allows_short_container_tail_but_rejects_overrun() -> None:
+    payload = _segment(0, "media_tail", duration_ms=9_000).model_dump()
+    payload["media_objects"][0]["duration_ms"] = 8_200
+
+    segment = SuperMemoryPreparedSegment.model_validate(payload)
+
+    assert segment.media_objects[0].duration_ms == 8_200
+    payload["media_objects"][0]["duration_ms"] = 9_001
+    with pytest.raises(ValidationError, match="must be positive and not exceed its segment"):
+        SuperMemoryPreparedSegment.model_validate(payload)
+    payload["media_objects"][0]["duration_ms"] = 0
+    with pytest.raises(ValidationError, match="must be positive and not exceed its segment"):
+        SuperMemoryPreparedSegment.model_validate(payload)
+    payload["media_objects"][0]["duration_ms"] = None
+    with pytest.raises(ValidationError, match="must be positive and not exceed its segment"):
+        SuperMemoryPreparedSegment.model_validate(payload)
+    payload["media_objects"][0]["duration_ms"] = 999
+    payload["identity_observations"] = [_identity().model_dump()]
+    with pytest.raises(ValidationError, match="identity observation exceeds its source media"):
+        SuperMemoryPreparedSegment.model_validate(payload)
+
+
 def _question(
     question_id: int,
     *,
@@ -244,7 +287,12 @@ def _prepared_subject() -> SuperMemoryPreparedSubject:
                 "Person_1_session_1",
                 ORIGIN,
                 (
-                    _segment(0, "media_0", transcript="B said the mug was in the sink."),
+                    _segment(
+                        0,
+                        "media_0",
+                        transcript="B said the mug was in the sink.",
+                        identity_observations=(_identity(),),
+                    ),
                     _segment(30, "media_1", duration_ms=15_000),
                     _segment(45, "media_2"),
                 ),
@@ -271,6 +319,7 @@ def _segment(
     *,
     duration_ms: int = 30_000,
     transcript: str | None = None,
+    identity_observations: tuple[IdentityObservationInput, ...] = (),
 ) -> SuperMemoryPreparedSegment:
     return SuperMemoryPreparedSegment(
         start_seconds=start_seconds,
@@ -287,6 +336,20 @@ def _segment(
             ),
         ),
         transcript=transcript,
+        identity_observations=identity_observations,
+    )
+
+
+def _identity() -> IdentityObservationInput:
+    return IdentityObservationInput(
+        identity_id="person_device_01",
+        kind=IdentityKind.FACE,
+        start_ms=0,
+        end_ms=1_000,
+        confidence=0.9,
+        model_id="insightface/buffalo_l",
+        model_revision="1.0.1",
+        visual_bbox_xyxy=(0.1, 0.1, 0.5, 0.8),
     )
 
 

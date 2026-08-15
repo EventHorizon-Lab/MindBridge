@@ -1,5 +1,5 @@
 {
-  "created_at": "2026-08-12T07:33:56.016090Z",
+  "created_at": "2026-08-14T10:23:59.856394Z",
   "datasets": [
     {
       "benchmark": "LoCoMo",
@@ -35,6 +35,17 @@
       "question_count": 3214
     },
     {
+      "benchmark": "Video-MME",
+      "source_repository": "lmms-eval/Video-MME",
+      "source_revision": "ead1408f75b618502df9a1d8e0950166bf0a2a0b",
+      "source_file": "test-00000-of-00001.parquet",
+      "source_sha256": "7fffab8ed38ecc2f9f0eca4c44d8a11636f0ee96116ede83580c8b9ae0faf986",
+      "adapter_version": "video_mme_official_v1",
+      "context_count": 900,
+      "memory_item_count": 900,
+      "question_count": 2700
+    },
+    {
       "benchmark": "EgoLifeQA",
       "source_repository": "lmms-lab/EgoLife",
       "source_revision": "143fb319be7aa5ae210c936bf4f0f3a86092afb0",
@@ -44,6 +55,83 @@
       "context_count": 1,
       "memory_item_count": 7,
       "question_count": 500
+    },
+    {
+      "benchmark": "EgoTempo",
+      "source_repository": "google-research-datasets/egotempo",
+      "source_revision": "7022ba77b4d89f51cf34e499767995ccd5c90c7a",
+      "source_file": "egotempo_openQA.json",
+      "source_sha256": "adc9e7d5b1075a46e2648d4e34260b41d26b8c6e339159b3746a3fe7fdf94eaf",
+      "adapter_version": "egotempo_official_v1",
+      "context_count": 222,
+      "memory_item_count": 367,
+      "question_count": 500
+    },
+    {
+      "benchmark": "EgoMemReason",
+      "source_repository": "Ted412/EgoMemReason",
+      "source_revision": "7e581505b9dce0e85193a27ae689ff899d0bc507",
+      "source_file": "annotations_public.jsonl",
+      "source_sha256": "8ec70ea94396df5fd405dd1fa890e1c70cd8ccdeb7d85ba73689083cd92c2a3b",
+      "adapter_version": "egomem_reason_official_v1",
+      "context_count": 6,
+      "memory_item_count": 318,
+      "question_count": 500
+    },
+    {
+      "benchmark": "MEMLENS-32K",
+      "source_repository": "xiyuRenBill/MEMLENS",
+      "source_revision": "afa101a1907cc37db40b50d649547964387b96b7",
+      "source_file": "dataset_32k.json",
+      "source_sha256": "4c75acc3e0a7e1cc71bc962bff3d2a0f1f35e268bc28254ca85f1d9867b03eb9",
+      "adapter_version": "memlens_official_v1",
+      "context_count": 789,
+      "memory_item_count": 10616,
+      "question_count": 789
+    },
+    {
+      "benchmark": "MM-Lifelong-day-test",
+      "source_repository": "MM-Lifelong/MM-Lifelong",
+      "source_revision": "248aa82039a574e63a2e524746a7cd8f32330443",
+      "source_file": "day_test:test.json",
+      "source_sha256": "a2ac08e1c90997acea234a088ac4a46ef9ddf9f0c13354a7d077a076b1004090",
+      "adapter_version": "mm_lifelong_official_v1",
+      "context_count": 1,
+      "memory_item_count": 418,
+      "question_count": 200
+    },
+    {
+      "benchmark": "MM-Lifelong-week-test",
+      "source_repository": "MM-Lifelong/MM-Lifelong",
+      "source_revision": "248aa82039a574e63a2e524746a7cd8f32330443",
+      "source_file": "week_test:test.json",
+      "source_sha256": "de11ac68f2b632fc02280e9ba5a2ea04747f40b34a10a5e99a7357398bb49cfe",
+      "adapter_version": "mm_lifelong_official_v1",
+      "context_count": 1,
+      "memory_item_count": 331,
+      "question_count": 200
+    },
+    {
+      "benchmark": "MM-Lifelong-month-train",
+      "source_repository": "MM-Lifelong/MM-Lifelong",
+      "source_revision": "248aa82039a574e63a2e524746a7cd8f32330443",
+      "source_file": "month_train:train.json",
+      "source_sha256": "1f6a252d37e07a51241517595feb6b4176d685614e1ed07a2b1fb84ea6685190",
+      "adapter_version": "mm_lifelong_official_v1",
+      "context_count": 1,
+      "memory_item_count": 298,
+      "question_count": 266
+    },
+    {
+      "benchmark": "MM-Lifelong-month-val",
+      "source_repository": "MM-Lifelong/MM-Lifelong",
+      "source_revision": "248aa82039a574e63a2e524746a7cd8f32330443",
+      "source_file": "month_val:val.json",
+      "source_sha256": "e288b75531d22a78572383fc1d7b8c78064825ee55f44246dee3e0b1968bbd37",
+      "adapter_version": "mm_lifelong_official_v1",
+      "context_count": 1,
+      "memory_item_count": 763,
+      "question_count": 623
     },
     {
       "benchmark": "SuperMemory-VQA",

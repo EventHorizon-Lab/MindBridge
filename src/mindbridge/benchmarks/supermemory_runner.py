@@ -22,6 +22,7 @@ from mindbridge.benchmarks.supermemory_vqa import (
 from mindbridge.contracts import (
     ContractModel,
     Identifier,
+    IdentityObservationInput,
     MediaObjectInput,
     NonEmptyString,
     ObserveRequest,
@@ -41,17 +42,34 @@ class SuperMemoryPreparedSegment(ContractModel):
     duration_ms: int = Field(gt=0)
     media_objects: tuple[MediaObjectInput, ...] = ()
     transcript: NonEmptyString | None = None
+    identity_observations: tuple[IdentityObservationInput, ...] = Field(default=(), max_length=512)
 
     @model_validator(mode="after")
     def require_aligned_content(self) -> SuperMemoryPreparedSegment:
         """Accept released transcript-only spans but validate every supplied medium."""
         if not self.media_objects and self.transcript is None:
             raise ValueError("SuperMemory-VQA segments require media or a transcript")
+        if not self.media_objects and self.identity_observations:
+            raise ValueError("SuperMemory-VQA identity observations require source media")
         media_ids = tuple(item.media_object_id for item in self.media_objects)
         if len(set(media_ids)) != len(media_ids):
             raise ValueError("SuperMemory-VQA segment media_object_ids must be unique")
-        if any(item.duration_ms != self.duration_ms for item in self.media_objects):
-            raise ValueError("SuperMemory-VQA media duration must match its segment")
+        if any(
+            item.duration_ms is None or not 0 < item.duration_ms <= self.duration_ms
+            for item in self.media_objects
+        ):
+            raise ValueError(
+                "SuperMemory-VQA media duration must be positive and not exceed its segment"
+            )
+        identity_bound_ms = max(
+            (
+                item.duration_ms if item.duration_ms is not None else self.duration_ms
+                for item in self.media_objects
+            ),
+            default=0,
+        )
+        if any(identity.end_ms > identity_bound_ms for identity in self.identity_observations):
+            raise ValueError("SuperMemory-VQA identity observation exceeds its source media")
         return self
 
 
@@ -304,6 +322,7 @@ async def _ingest_segment(
                     occurred_at=occurred_at,
                     ended_at=ended_at,
                     observed_at=ended_at,
+                    identity_observations=segment.identity_observations,
                     idempotency_key=f"{SUPERMEMORY_VQA_ADAPTER_VERSION}:{source_key}:media",
                 )
             )

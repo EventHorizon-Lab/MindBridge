@@ -95,34 +95,69 @@ The checked-in result is [benchmarks/manifests/jina-omni-small-smoke.json](bench
 
 ## Benchmark dataset smoke
 
-LoCoMo, M3-Bench, EgoLifeQA, and SuperMemory-VQA are consumed through thin adapters over pinned
-official files. Use Git for code releases and the Hugging Face CLI for Hub datasets; MindBridge does
-not ship another downloader:
+LoCoMo, M3-Bench, Video-MME, EgoLife (EgoLifeQA), EgoTempo, EgoMemReason, MEMLENS, MM-Lifelong,
+and SuperMemory-VQA are consumed through thin adapters over pinned official files. Use Git for code
+releases and the Hugging Face CLI for Hub datasets; MindBridge does not ship another downloader:
 
 ```bash
 git clone https://github.com/snap-research/locomo.git .benchmarks/locomo
 git -C .benchmarks/locomo checkout 3eb6f2c585f5e1699204e3c3bdf7adc5c28cb376
 git clone https://github.com/ByteDance-Seed/m3-agent.git .benchmarks/m3-agent
 git -C .benchmarks/m3-agent checkout 0e3e41939bd8a0b66d756e7b7eb8d5fe9992da5c
+uvx --from huggingface-hub hf download lmms-eval/Video-MME \
+  videomme/test-00000-of-00001.parquet \
+  --repo-type dataset \
+  --revision ead1408f75b618502df9a1d8e0950166bf0a2a0b \
+  --local-dir .benchmarks/video-mme
 uvx --from huggingface-hub hf download lmms-lab/EgoLife \
   EgoLifeQA/EgoLifeQA_A1_JAKE.json \
   --repo-type dataset \
   --revision 143fb319be7aa5ae210c936bf4f0f3a86092afb0 \
   --local-dir .benchmarks/egolife
+git clone https://github.com/google-research-datasets/egotempo.git .benchmarks/egotempo
+git -C .benchmarks/egotempo checkout 7022ba77b4d89f51cf34e499767995ccd5c90c7a
 uvx --from huggingface-hub hf download OSU-AIoT-MLSys-Lab/SuperMemory-VQA \
   data/json/all_qa.json \
   --repo-type dataset \
   --revision 1d228e0f10049a8a84c458dded2aa25b1e21ce8f \
   --local-dir .benchmarks/supermemory-vqa
+uvx --from huggingface-hub hf download Ted412/EgoMemReason \
+  annotations_public.jsonl \
+  --repo-type dataset \
+  --revision 7e581505b9dce0e85193a27ae689ff899d0bc507 \
+  --local-dir .benchmarks/egomem-reason
+uvx --from huggingface-hub hf download xiyuRenBill/MEMLENS \
+  dataset_32k.json agent_subset_195.json \
+  --repo-type dataset \
+  --revision afa101a1907cc37db40b50d649547964387b96b7 \
+  --local-dir .benchmarks/memlens
+uvx --from huggingface-hub hf download MM-Lifelong/MM-Lifelong \
+  day/test.json week/test.json month/train.json month/val.json \
+  --repo-type dataset \
+  --revision 248aa82039a574e63a2e524746a7cd8f32330443 \
+  --local-dir .benchmarks/mm-lifelong
 
-uv run python -m mindbridge.benchmarks.dataset_smoke \
+uv run --extra benchmarks python -m mindbridge.benchmarks.dataset_smoke \
   --locomo .benchmarks/locomo/data/locomo10.json \
   --locomo-revision 3eb6f2c585f5e1699204e3c3bdf7adc5c28cb376 \
   --m3-robot .benchmarks/m3-agent/data/annotations/robot.json \
   --m3-web .benchmarks/m3-agent/data/annotations/web.json \
   --m3-revision 0e3e41939bd8a0b66d756e7b7eb8d5fe9992da5c \
+  --video-mme .benchmarks/video-mme/videomme/test-00000-of-00001.parquet \
+  --video-mme-revision ead1408f75b618502df9a1d8e0950166bf0a2a0b \
   --egolife .benchmarks/egolife/EgoLifeQA/EgoLifeQA_A1_JAKE.json \
   --egolife-revision 143fb319be7aa5ae210c936bf4f0f3a86092afb0 \
+  --egotempo .benchmarks/egotempo/egotempo_openQA.json \
+  --egotempo-revision 7022ba77b4d89f51cf34e499767995ccd5c90c7a \
+  --egomem .benchmarks/egomem-reason/annotations_public.jsonl \
+  --egomem-revision 7e581505b9dce0e85193a27ae689ff899d0bc507 \
+  --memlens .benchmarks/memlens/dataset_32k.json \
+  --memlens-revision afa101a1907cc37db40b50d649547964387b96b7 \
+  --mm-day .benchmarks/mm-lifelong/day/test.json \
+  --mm-week .benchmarks/mm-lifelong/week/test.json \
+  --mm-month-train .benchmarks/mm-lifelong/month/train.json \
+  --mm-month-val .benchmarks/mm-lifelong/month/val.json \
+  --mm-lifelong-revision 248aa82039a574e63a2e524746a7cd8f32330443 \
   --supermemory .benchmarks/supermemory-vqa/data/json/all_qa.json \
   --supermemory-revision 1d228e0f10049a8a84c458dded2aa25b1e21ce8f
 ```
@@ -136,6 +171,26 @@ uvx --from huggingface-hub hf download ByteDance-Seed/M3-Bench \
   --revision 2672152eee36b25ccb38fdbc3b72135347adbb63 \
   --include 'videos/robot/*' \
   --local-dir .benchmarks/m3-bench
+
+uvx --from huggingface-hub hf download ByteDance-Seed/M3-Bench \
+  intermediate_outputs/robot.tar.gz.00 \
+  intermediate_outputs/robot.tar.gz.01 \
+  intermediate_outputs/robot.tar.gz.02 \
+  memory_graphs/robot.tar.gz \
+  --repo-type dataset \
+  --revision 2672152eee36b25ccb38fdbc3b72135347adbb63 \
+  --local-dir .benchmarks/m3-bench
+```
+
+Acquire the released SuperMemory-VQA RGB videos the same way; raw audio is not part of the public
+release:
+
+```bash
+uvx --from huggingface-hub hf download OSU-AIoT-MLSys-Lab/SuperMemory-VQA \
+  --repo-type dataset \
+  --revision 1d228e0f10049a8a84c458dded2aa25b1e21ce8f \
+  --include 'data/video/*' \
+  --local-dir .benchmarks/supermemory-vqa
 ```
 
 The resulting annotation identity and counts are recorded in
@@ -190,6 +245,19 @@ the already-addressable objects:
           "created_at": "2026-08-11T00:00:00Z",
           "duration_ms": 30000
         },
+        "identity_observations": [
+          {
+            "identity_id": "person_device_01",
+            "kind": "face",
+            "start_ms": 1200,
+            "end_ms": 4800,
+            "confidence": 0.91,
+            "model_id": "insightface/buffalo_l",
+            "model_revision": "1.0.1",
+            "scope": "device",
+            "visual_bbox_xyxy": [0.12, 0.08, 0.46, 0.82]
+          }
+        ],
         "caption": "[Event] The person places the red cup on the left shelf."
       }
     ]
@@ -204,6 +272,15 @@ released `[Event]` episodic view and `[Inference]` semantic view, so recall can 
 reinspect the same video. The runner ingests and waits for each durable job before answering
 questions whose official `before_clip` equals that index, so a question cannot see future video.
 Questions without `before_clip` run after the complete video.
+
+Optional `identity_observations` come from the existing Edge InsightFace/FunASR path. Only anonymous,
+timed IDs, transcripts, and face boxes enter the manifest; biometric vectors remain device-local.
+For M3-Bench Robot, a prepared-media producer may instead reuse the pinned released face/voice
+intermediates and memory-graph character mapping with the upstream matching thresholds; it must
+discard their embeddings and base64 samples after emitting the same cloud-safe contract.
+The Omni worker extracts speech, visible text, objects, actions, and relations from the raw AV into
+Event/Entity/Claim records that share the source `EvidenceSpan`. Recall therefore retrieves released
+text and structured cues together, then reopens each distinct source object before answering.
 
 ```bash
 uv run python -m mindbridge.benchmarks.m3_cli \
@@ -301,6 +378,13 @@ prepared media must split at every selected question span's end; the runner reje
 boundary before ingestion. It then includes that completed segment and no later media. The output
 reports Ans-F1, QA-Acc, and QA-MRR and contains no ground-truth fields:
 
+When an official question boundary extends past the released MP4 container, keep that segment's
+published transcript and attach only the available media duration. The resulting `EvidenceSpan`
+ends at the real container tail; media may be shorter than its segment but must never exceed it.
+At the pinned dataset revision, 82 of 83 referenced sessions have an MP4; the remaining
+`Person_1_session_2_01312026_glasses_1275` session is VRS-only and remains transcript-only unless
+the caller prepares that VRS with the upstream Project Aria tooling.
+
 ```json
 {
   "subject": 1,
@@ -313,6 +397,7 @@ reports Ans-F1, QA-Acc, and QA-MRR and contains no ground-truth fields:
           "start_seconds": 0,
           "duration_ms": 30000,
           "media_objects": [],
+          "identity_observations": [],
           "transcript": "User: Okay, it started."
         }
       ]
@@ -337,6 +422,208 @@ uv run python -m mindbridge.benchmarks.supermemory_cli \
   --request-timeout-seconds 1800 \
   --answer-model-revision serving-fingerprint
 ```
+
+EgoMemReason reuses the same causal EgoLife clip contract shown above. Its prepared-media file is a
+JSON array containing one `EgoLifePreparedStream` object for each selected identity. The runner
+withholds clips that cross each official `query_time`, supports the released A-J option range, and
+writes the exact answer-key-free leaderboard submission shape:
+
+```bash
+uv run python -m mindbridge.benchmarks.egomem_cli \
+  --dataset .benchmarks/egomem-reason/annotations_public.jsonl \
+  --prepared-media .benchmarks/egomem-prepared.json \
+  --output .benchmarks/results/egomem-submission.json \
+  --api-base-url http://localhost:8000 \
+  --dataset-revision 7e581505b9dce0e85193a27ae689ff899d0bc507 \
+  --evaluator-revision 2ea98f7002bfad785532b186964cd779b6cd0ed6 \
+  --run-id egomem-001 \
+  --code-revision "$(git rev-parse HEAD)" \
+  --perception-model-revision serving-fingerprint \
+  --answer-reasoning-effort low \
+  --answer-model-revision serving-fingerprint
+```
+
+MEMLENS follows the official memory-agent protocol: every question gets a fresh tenant, sessions
+are consumed in release order, and the question date is supplied only at answer time. Download
+`release_images.tar.gz` from the same pinned dataset revision for multimodal runs, upload the
+extracted images with the standard storage tooling, and map official relative paths to immutable
+image objects:
+
+```json
+{
+  "images": [
+    {
+      "source_file": "needle_images/2658faf8f6e6.jpg",
+      "media_object": {
+        "media_object_id": "memlens_2658faf8f6e6",
+        "kind": "image",
+        "uri": "s3://mindbridge-media/memlens/2658faf8f6e6.jpg",
+        "sha256": "<64 hexadecimal characters>",
+        "size_bytes": 123456,
+        "created_at": "2026-08-14T00:00:00Z"
+      }
+    }
+  ]
+}
+```
+
+Use `--agent-subset-index` for the canonical 195-question memory-agent comparison. The output
+contains the official judge fields under `data` and can be passed directly to the pinned
+`xrenaf/MEMLENS` `llm_judge.py`:
+
+```bash
+uv run python -m mindbridge.benchmarks.memlens_cli \
+  --dataset .benchmarks/memlens/dataset_32k.json \
+  --prepared-images .benchmarks/memlens-prepared-images.json \
+  --agent-subset-index .benchmarks/memlens/agent_subset_195.json \
+  --output .benchmarks/results/memlens-32k.json \
+  --api-base-url http://localhost:8000 \
+  --context-window 32k \
+  --dataset-revision afa101a1907cc37db40b50d649547964387b96b7 \
+  --evaluator-revision 77f3ab9a52fa2d6a17978e2dffe80438a4ecced2 \
+  --run-id memlens-32k-001 \
+  --code-revision "$(git rev-parse HEAD)" \
+  --perception-model-revision serving-fingerprint \
+  --answer-reasoning-effort low \
+  --answer-model-revision serving-fingerprint
+```
+
+For the official text-only ablation, add `--text-only` and omit both `--prepared-images` and
+`--perception-model-revision`; image placeholders remain `[image]` and no generated image caption
+is injected.
+
+MM-Lifelong prepared segments use the split-wide clock of the official `total_intervals` field.
+`start_seconds` must therefore be a global Day, Week, or Month offset, not a source-video-local
+timestamp. A segment can carry raw audio/video, a pinned caption, or both:
+
+```json
+{
+  "split": "month_val",
+  "timeline_origin": "2000-01-01T00:00:00Z",
+  "segments": [
+    {
+      "segment_id": "video_14_00000",
+      "start_seconds": 0,
+      "duration_ms": 30000,
+      "media_objects": [
+        {
+          "media_object_id": "mm_lifelong_14_00000",
+          "kind": "video",
+          "uri": "s3://mindbridge-media/mm-lifelong/14/00000.mp4",
+          "sha256": "<64 hexadecimal characters>",
+          "size_bytes": 12345678,
+          "created_at": "2026-08-14T00:00:00Z",
+          "duration_ms": 30000
+        }
+      ],
+      "caption": "The streamer enters the station."
+    }
+  ]
+}
+```
+
+The JSONL retains `question`, `answer`, and `pred.answer` for the released accuracy judge, adds
+`pred.intervals`, and records the official Ref@300 bucket Jaccard score per question and in the
+manifest:
+
+```bash
+uv run python -m mindbridge.benchmarks.mm_lifelong_cli \
+  --dataset .benchmarks/mm-lifelong/month/val.json \
+  --prepared-media .benchmarks/mm-lifelong-month-val-prepared.json \
+  --output .benchmarks/results/mm-lifelong-month-val.jsonl \
+  --api-base-url http://localhost:8000 \
+  --split month_val \
+  --source-revision 248aa82039a574e63a2e524746a7cd8f32330443 \
+  --run-id mm-lifelong-month-val-001 \
+  --code-revision "$(git rev-parse HEAD)" \
+  --perception-model-revision serving-fingerprint \
+  --answer-reasoning-effort low \
+  --answer-model-revision serving-fingerprint
+```
+
+### Video-MME and EgoTempo
+
+Both runners use the same prepared-video manifest. `video_id` is the official Video-MME numeric ID
+or the exact EgoTempo `clip_id`; EgoTempo segment times start at zero in the trimmed clip. Split long
+media and subtitles into ordered, non-overlapping segments. A segment may contain addressable media,
+a transcript, or both:
+
+```json
+[
+  {
+    "video_id": "001",
+    "timeline_origin": "2026-08-14T00:00:00Z",
+    "segments": [
+      {
+        "segment_id": "001-0000",
+        "start_seconds": 0,
+        "duration_ms": 30000,
+        "media_objects": [
+          {
+            "media_object_id": "video-mme-001-0000",
+            "kind": "video",
+            "uri": "s3://mindbridge-media/video-mme/001/0000.mp4",
+            "sha256": "<64 hexadecimal characters>",
+            "size_bytes": 12345678,
+            "created_at": "2026-08-14T00:00:00Z",
+            "duration_ms": 30000
+          }
+        ],
+        "transcript": "Optional subtitle text aligned to this segment."
+      }
+    ]
+  }
+]
+```
+
+Video-MME writes the released nested evaluator shape and an answered-only local accuracy matching
+the official parser. Parquet loading is isolated in the `benchmarks` extra:
+
+```bash
+uv run --extra benchmarks python -m mindbridge.benchmarks.video_mme_cli \
+  --dataset .benchmarks/video-mme/videomme/test-00000-of-00001.parquet \
+  --prepared-media .benchmarks/video-mme-prepared.json \
+  --output .benchmarks/results/video-mme.json \
+  --api-base-url http://localhost:8000 \
+  --dataset-revision ead1408f75b618502df9a1d8e0950166bf0a2a0b \
+  --evaluator-revision afd52cfe3dde5b3685e0d4f760c10c756860c758 \
+  --run-id video-mme-001 \
+  --code-revision "$(git rev-parse HEAD)" \
+  --perception-model-revision serving-fingerprint \
+  --answer-reasoning-effort low \
+  --answer-model-revision serving-fingerprint
+```
+
+EgoTempo writes the official `V`, `Q`, `QA`, `A`, `C`, and `M` fields. Run its pinned
+`gemini_eval.ipynb` for the released semantic judge rather than substituting a local metric:
+
+```bash
+uv run python -m mindbridge.benchmarks.egotempo_cli \
+  --dataset .benchmarks/egotempo/egotempo_openQA.json \
+  --prepared-media .benchmarks/egotempo-prepared.json \
+  --output .benchmarks/results/egotempo.json \
+  --api-base-url http://localhost:8000 \
+  --source-revision 7022ba77b4d89f51cf34e499767995ccd5c90c7a \
+  --evaluator-revision 7022ba77b4d89f51cf34e499767995ccd5c90c7a \
+  --run-id egotempo-001 \
+  --code-revision "$(git rev-parse HEAD)" \
+  --perception-model-revision serving-fingerprint \
+  --answer-reasoning-effort low \
+  --answer-model-revision serving-fingerprint
+```
+
+The official notebook reads every `.json` file in its configured `input_dir`. Copy only the
+prediction artifact, not its `.manifest.json` sidecar, into a run-specific directory and point the
+notebook there:
+
+```bash
+mkdir -p .benchmarks/egotempo-judge/egotempo-001
+cp .benchmarks/results/egotempo.json \
+  .benchmarks/egotempo-judge/egotempo-001/
+```
+
+The Ego-Life benchmark remains available through the existing `egolife_cli` and official
+EgoLifeQA schema; no second alias with divergent behavior is maintained.
 
 Every benchmark `run_id` must be unique for that deployment. It is included in the tenant ID and
 sidecar manifest, preventing a rerun from exposing an earlier question to future memories retained
@@ -582,7 +869,7 @@ partial = await streaming_asr.push_pcm16(pcm16_chunk, is_final=is_last_audio_chu
 
 The partial transcript is provisional. GStreamer/DeepStream still owns the bounded rolling fragment;
 when its Event gate closes, `FunASRSpeechPipeline` performs VAD, quality ASR, punctuation,
-diarization, and ERes2NetV2 centroid extraction in one upstream call.
+diarization, and CAM++ centroid extraction in one upstream call.
 `recognize_identities_in_av_segment()` combines that result with InsightFace and the optional
 OpenAI-SDK audiovisual active-speaker verifier, then returns only cloud-safe intervals ready for
 `enqueue_captured_video()`. `device=auto` selects CUDA when it is available, and explicit CUDA

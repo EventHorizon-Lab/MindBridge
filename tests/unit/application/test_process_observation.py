@@ -449,6 +449,17 @@ def _batch() -> ObservationBatch:
                     revision="1.0.1",
                 ),
             ),
+            AnonymousIdentityObservation(
+                identity_id="person_robot_01",
+                kind=IdentityKind.FACE,
+                start_ms=1_500,
+                end_ms=2_500,
+                confidence=0.82,
+                model_reference=ModelReference(
+                    model_id="insightface/buffalo_l",
+                    revision="1.0.1",
+                ),
+            ),
         ),
     )
     return ObservationBatch(

@@ -343,7 +343,7 @@ def _identity_graph(
     created_at: datetime,
 ) -> tuple[tuple[Entity, ...], tuple[EntityMention, ...]]:
     entities: dict[EntityId, Entity] = {}
-    mentions: list[EntityMention] = []
+    mentions: dict[MentionId, EntityMention] = {}
     evidence_by_id = {evidence.evidence_id: evidence for evidence in evidence_spans}
     for event in events:
         event_start_ms = round(
@@ -379,23 +379,24 @@ def _identity_graph(
                 ),
             )
             for evidence_id in matching_evidence_ids:
-                mentions.append(
-                    EntityMention(
-                        mention_id=MentionId(
-                            derive_stable_id(
-                                "mention",
-                                event.tenant_id,
-                                entity_id,
-                                event.event_id,
-                                evidence_id,
-                            )
-                        ),
-                        tenant_id=event.tenant_id,
-                        entity_id=entity_id,
-                        event_id=event.event_id,
-                        evidence_id=evidence_id,
-                        confidence=identity.confidence,
-                        created_at=created_at,
-                    )
+                mention = EntityMention(
+                    mention_id=MentionId(
+                        derive_stable_id(
+                            "mention",
+                            event.tenant_id,
+                            entity_id,
+                            event.event_id,
+                            evidence_id,
+                        )
+                    ),
+                    tenant_id=event.tenant_id,
+                    entity_id=entity_id,
+                    event_id=event.event_id,
+                    evidence_id=evidence_id,
+                    confidence=identity.confidence,
+                    created_at=created_at,
                 )
-    return tuple(entities.values()), tuple(mentions)
+                existing = mentions.get(mention.mention_id)
+                if existing is None or mention.confidence > existing.confidence:
+                    mentions[mention.mention_id] = mention
+    return tuple(entities.values()), tuple(mentions.values())
