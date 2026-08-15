@@ -11,6 +11,7 @@ from openai import AsyncOpenAI
 
 from mindbridge.application.perception import ResolvedEvidence
 from mindbridge.application.pipelines import AnswerPipeline, OccurrencePipeline
+from mindbridge.application.pipelines import structured as structured_module
 from mindbridge.application.ports import GeneratedAnswer, ResolvedQueryMedia
 from mindbridge.contracts import RecallQuery, RecallRequest
 from mindbridge.core import (
@@ -28,14 +29,21 @@ from mindbridge.core import (
     TenantId,
     VerificationStatus,
 )
+from mindbridge.models import openai as openai_module
 from mindbridge.models.openai import OpenAIGenerator, normalize_base_url
 from mindbridge.prompts import ANSWER_FROM_EVIDENCE_PROMPT, SELECT_OCCURRENCES_PROMPT
 
 NOW = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
 
 
-async def test_answer_pipeline_streams_raw_av_and_validates_answer() -> None:
+async def test_answer_pipeline_streams_raw_av_and_validates_answer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """The official SDK carries original media rather than text-only captions."""
+    span_attributes: list[dict[str, str | int | float | bool]] = []
+    clock = iter((10.0, 10.25))
+    monkeypatch.setattr(openai_module, "set_current_span_attributes", span_attributes.append)
+    monkeypatch.setattr(openai_module, "perf_counter", lambda: next(clock))
 
     async def respond(request: httpx.Request) -> httpx.Response:
         payload: dict[str, object] = json.loads(request.content)
@@ -107,6 +115,16 @@ async def test_answer_pipeline_streams_raw_av_and_validates_answer() -> None:
 
     assert answer.answer == "The screwdriver is beside the blue toolbox"
     assert answer.confidence == 0.87
+    assert {
+        "mindbridge.model.input.media_count": 3,
+        "mindbridge.model.json_mode": False,
+    }.items() <= span_attributes[0].items()
+    assert {"mindbridge.model.ttft_seconds": 0.25} in span_attributes
+    assert {
+        "mindbridge.model.input_tokens": 11,
+        "mindbridge.model.output_tokens": 3,
+        "mindbridge.model.total_tokens": 14,
+    } in span_attributes
 
 
 async def test_answer_pipeline_returns_bounded_queries_when_evidence_is_missing() -> None:
@@ -143,8 +161,16 @@ async def test_answer_pipeline_returns_bounded_queries_when_evidence_is_missing(
     assert answer.retrieval_queries == ("person_device_01 blue toolbox",)
 
 
-async def test_answer_pipeline_retries_invalid_answer_once_in_json_mode() -> None:
+async def test_answer_pipeline_retries_invalid_answer_once_in_json_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     calls = 0
+    span_attributes: list[dict[str, str | int | float | bool]] = []
+    monkeypatch.setattr(
+        structured_module,
+        "set_current_span_attributes",
+        span_attributes.append,
+    )
 
     async def respond(request: httpx.Request) -> httpx.Response:
         nonlocal calls
@@ -175,6 +201,7 @@ async def test_answer_pipeline_retries_invalid_answer_once_in_json_mode() -> Non
 
     assert calls == 2
     assert answer.answer == "blue toolbox"
+    assert {"mindbridge.model.structured_retry_count": 1} in span_attributes
 
 
 async def test_answer_pipeline_accepts_one_provider_added_json_code_fence() -> None:
@@ -568,6 +595,7 @@ def _completion_stream(*content_parts: str) -> str:
             "created": 1,
             "model": "qwen3.8-max",
             "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 11, "completion_tokens": 3, "total_tokens": 14},
         }
     )
     return "".join(f"data: {json.dumps(event)}\n\n" for event in events) + "data: [DONE]\n\n"

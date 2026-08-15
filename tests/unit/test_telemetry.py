@@ -21,6 +21,7 @@ from mindbridge.telemetry import (
     TelemetryProviders,
     current_trace_id,
     instrument_fastapi,
+    record_stage_duration,
     trace_operation,
 )
 
@@ -81,6 +82,28 @@ async def test_domain_operation_records_content_free_slo_metrics(
     assert len(durations.measurements) == 2
     assert all(value >= 0 for value, _ in durations.measurements)
     assert "private" not in repr(calls.measurements + durations.measurements)
+
+
+def test_stage_duration_records_only_a_code_defined_stage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    durations = RecordingMetric()
+    monkeypatch.setattr(telemetry, "_STAGE_DURATION", durations)
+
+    record_stage_duration("recall.first_answer", 0.125)
+
+    assert durations.measurements == [(0.125, {"stage": "recall.first_answer"})]
+
+
+@pytest.mark.parametrize("value", [-1.0, float("nan"), float("inf")])
+def test_stage_duration_rejects_invalid_measurements(value: float) -> None:
+    with pytest.raises(ValueError, match="finite and non-negative"):
+        record_stage_duration("recall.first_answer", value)
+
+
+def test_duration_buckets_cover_multi_round_and_offline_tail() -> None:
+    assert 7_200 in telemetry._DURATION_BUCKET_BOUNDARIES_SECONDS
+    assert telemetry._DURATION_BUCKET_BOUNDARIES_SECONDS[-1] >= 7 * 24 * 60 * 60
 
 
 def test_fastapi_returns_trace_identity_without_capturing_secret_content() -> None:

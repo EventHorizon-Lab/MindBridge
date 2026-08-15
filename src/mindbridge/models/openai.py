@@ -6,6 +6,7 @@ import asyncio
 import math
 from collections.abc import Mapping
 from pathlib import PurePosixPath
+from time import perf_counter
 from typing import cast
 from urllib.parse import urlsplit, urlunsplit
 
@@ -23,6 +24,7 @@ from mindbridge.application.capabilities import (
     EmbedTask,
     GenerateRequest,
     GenerateResult,
+    MediaPart,
     ModelInput,
     TextPart,
 )
@@ -108,6 +110,10 @@ class OpenAIGenerator:
                 "mindbridge.model.id": self._model_reference.model_id,
                 "mindbridge.model.revision": self._model_reference.revision,
                 "mindbridge.model.input_part_count": len(request.input.parts),
+                "mindbridge.model.input.media_count": sum(
+                    isinstance(part, MediaPart) for part in request.input.parts
+                ),
+                "mindbridge.model.json_mode": request.json_mode,
             }
         )
         response_format: ResponseFormatJSONObject | Omit = (
@@ -131,6 +137,8 @@ class OpenAIGenerator:
         parts: list[str] = []
         finish_reason: str | None = None
         system_fingerprint: str | None = None
+        request_started_at = perf_counter()
+        first_token_at: float | None = None
         try:
             stream = await self._client.chat.completions.create(
                 model=self._model_reference.model_id,
@@ -148,13 +156,29 @@ class OpenAIGenerator:
             )
             async for chunk in stream:
                 system_fingerprint = system_fingerprint or chunk.system_fingerprint
+                if chunk.usage is not None:
+                    set_current_span_attributes(
+                        {
+                            "mindbridge.model.input_tokens": chunk.usage.prompt_tokens,
+                            "mindbridge.model.output_tokens": chunk.usage.completion_tokens,
+                            "mindbridge.model.total_tokens": chunk.usage.total_tokens,
+                        }
+                    )
                 for choice in chunk.choices:
                     if choice.index == 0:
                         if choice.delta.content:
+                            if first_token_at is None:
+                                first_token_at = perf_counter()
                             parts.append(choice.delta.content)
                         finish_reason = finish_reason or choice.finish_reason
         except openai.APIError as error:
             _raise_model_error(error, "generation request failed")
+        attributes: dict[str, str | int | float | bool] = {}
+        if first_token_at is not None:
+            attributes["mindbridge.model.ttft_seconds"] = max(
+                0.0, first_token_at - request_started_at
+            )
+        set_current_span_attributes(attributes)
         if finish_reason in {"length", "content_filter"}:
             raise ModelOutputError(f"generation ended with finish reason {finish_reason}")
         return GenerateResult(
