@@ -14,8 +14,10 @@ from mindbridge.benchmarks import (
     EgoLifePreparedStream,
     EgoLifeQuestion,
     EgoLifeQuestionResult,
+    EgoMemReasonQuestion,
     evaluate_egolife_qa,
     run_egolife_qa,
+    run_egomem_reason,
 )
 from mindbridge.contracts import (
     MediaObjectInput,
@@ -236,6 +238,62 @@ def test_egolife_metrics_use_exact_option_match() -> None:
     assert metrics.question_count == 2
     assert metrics.correct_count == 1
     assert metrics.accuracy == 0.5
+
+
+async def test_egomem_reason_reuses_causal_stream_and_supports_ten_options() -> None:
+    api = RecordingMemoryApi()
+    choices = tuple(f"Choice {index}" for index in range(10))
+    questions = (
+        EgoMemReasonQuestion(
+            example_id=2,
+            question_id="A1_JAKE_late",
+            identity="A1_JAKE",
+            query_time="DAY1, 10:00:45",
+            query_offset_ms=36_045_000,
+            question="Which choice is correct?",
+            choices=choices,
+            query_type="Event Ordering",
+        ),
+        EgoMemReasonQuestion(
+            example_id=1,
+            question_id="A1_JAKE_early",
+            identity="A1_JAKE",
+            query_time="DAY1, 10:00:15",
+            query_offset_ms=36_015_000,
+            question="Which choice is correct?",
+            choices=choices,
+            query_type="Event Ordering",
+        ),
+    )
+
+    with pytest.raises(ValueError, match="between 1 and 100"):
+        await run_egomem_reason(
+            cast(MindBridge, api),
+            questions,
+            _prepared_stream(),
+            run_id="run_01",
+            recall_limit=101,
+        )
+    assert not api.calls
+
+    results = await run_egomem_reason(
+        cast(MindBridge, api),
+        questions,
+        _prepared_stream(),
+        run_id="run_01",
+        poll_interval_seconds=0.001,
+    )
+
+    assert api.calls[:2] == [
+        "recall:Query time reference: DAY1, 10:00:15",
+        "observe:0",
+    ]
+    assert api.observe_requests[0].boot_id == "egomem_reason_official_v1"
+    assert api.recall_requests[0].query.text is not None
+    assert "Query time reference: DAY1, 10:00:15" in api.recall_requests[0].query.text
+    assert "J. Choice 9" in api.recall_requests[0].query.text
+    assert [result.example_id for result in results] == [2, 1]
+    assert [result.predicted_answer for result in results] == ["B", "B"]
 
 
 def _question(question_id: str, timecode: str) -> EgoLifeQuestion:
