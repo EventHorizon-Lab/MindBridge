@@ -1,0 +1,103 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mindbridge"
+version = "0.1.0"
+description = "Agentic-native embodied memory as a service"
+readme = "README.md"
+requires-python = ">=3.10,<3.12"
+license = "Apache-2.0"
+dependencies = [
+    "httpx>=0.28,<1",
+    "pydantic>=2.10,<3",
+]
+
+[project.scripts]
+mindbridge-consolidate = "mindbridge.consolidation_cli:main"
+mindbridge-lifecycle = "mindbridge.lifecycle_cli:main"
+mindbridge-mcp = "mindbridge.api.runtime:run_production_mcp"
+
+[project.optional-dependencies]
+edge = [
+    "boto3>=1.40,<2",
+    "cryptography>=45,<51",
+    "openai>=2,<3",
+    "opentelemetry-api>=1.44,<2",
+    "opentelemetry-exporter-otlp-proto-http>=1.44,<2",
+    "opentelemetry-instrumentation-botocore>=0.65b0,<1",
+    "opentelemetry-instrumentation-httpx>=0.65b0,<1",
+    "opentelemetry-sdk>=1.44,<2",
+]
+server = [
+    "boto3>=1.40,<2",
+    "celery[redis]>=5.6,<6",
+    "fastapi>=0.116,<1",
+    "mcp>=2,<3",
+    "openai>=2,<3",
+    "opentelemetry-api>=1.44,<2",
+    "opentelemetry-exporter-otlp-proto-http>=1.44,<2",
+    "opentelemetry-instrumentation-botocore>=0.65b0,<1",
+    "opentelemetry-instrumentation-celery>=0.65b0,<1",
+    "opentelemetry-instrumentation-fastapi>=0.65b0,<1",
+    "opentelemetry-instrumentation-httpx>=0.65b0,<1",
+    "opentelemetry-instrumentation-psycopg>=0.65b0,<1",
+    "opentelemetry-sdk>=1.44,<2",
+    "pgvector>=0.4,<1",
+    "psycopg[binary,pool]>=3.2,<4",
+    "uvicorn>=0.35,<1",
+]
+cloud-models = [
+    "av>=16,<17",
+    "librosa>=0.11,<1",
+    "opentelemetry-api>=1.44,<2",
+    "pillow>=12,<13",
+    "sentence-transformers>=5.2,<6",
+    "soundfile>=0.13,<1",
+    "torch==2.9.1",
+    "transformers>=5.1,<6",
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+
+[dependency-groups]
+dev = [
+    "boto3-stubs[s3]>=1.40,<2",
+    "mypy>=1.15,<3",
+    "pytest>=8,<10",
+    "pytest-asyncio>=0.24,<2",
+    "ruff>=0.11,<1",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mindbridge"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["ANN", "ASYNC", "B", "C4", "C90", "DTZ", "E4", "E7", "E9", "F", "I", "RUF", "SIM", "UP"]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 10
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+files = ["src", "tests"]
+
+[tool.pytest.ini_options]
+addopts = ["--strict-config", "--strict-markers", "-ra"]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+markers = [
+    "integration: requires an external PostgreSQL test database",
+]

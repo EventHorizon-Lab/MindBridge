@@ -1,0 +1,15 @@
+{
+  "created_at": "2026-08-11T12:12:44.240061Z",
+  "model_id": "jinaai/jina-embeddings-v5-omni-small-retrieval",
+  "revision": "12949877f0092093f366c6450340011320152a05",
+  "device": "cuda",
+  "dimension": 1024,
+  "query_norm": 1.0000000258015245,
+  "relevant_similarity": 0.7774870978773198,
+  "unrelated_similarity": 0.030937474969275534,
+  "python_version": "3.11.13",
+  "torch_version": "2.9.1+cu128",
+  "transformers_version": "5.15.0",
+  "sentence_transformers_version": "5.7.0",
+  "passed": true
+}

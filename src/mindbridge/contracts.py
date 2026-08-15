@@ -1,0 +1,457 @@
+"""Shared Python, REST, and MCP contracts for MindBridge use cases."""
+
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from enum import Enum
+from typing import Annotated
+
+from pydantic import (
+    AfterValidator,
+    AwareDatetime,
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    model_validator,
+)
+
+from mindbridge.core import (
+    DeletionPropagationState,
+    FeedbackType,
+    ForgetTargetType,
+    IdentityKind,
+    IdentityScope,
+    JobState,
+    MediaKind,
+    MemoryState,
+    MemoryType,
+    SensorKind,
+    VerificationStatus,
+)
+
+NonEmptyString = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=2_048),
+]
+Identifier = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=255),
+]
+Sha256Hex = Annotated[
+    str,
+    StringConstraints(to_lower=True, pattern=r"^[0-9a-fA-F]{64}$"),
+]
+_MAXIMUM_IDENTITY_TRANSCRIPT_CHARACTERS = 65_536
+
+
+def _as_utc(value: datetime) -> datetime:
+    return value.astimezone(timezone.utc)
+
+
+UtcDatetime = Annotated[AwareDatetime, AfterValidator(_as_utc)]
+
+
+class ContractModel(BaseModel):
+    """Strict immutable base shared by every external contract."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+
+class MediaObjectInput(ContractModel):
+    """Metadata for an already addressable evidence object."""
+
+    media_object_id: Identifier
+    kind: MediaKind
+    uri: NonEmptyString
+    sha256: Sha256Hex
+    size_bytes: Annotated[int, Field(ge=0, le=9_223_372_036_854_775_807)]
+    created_at: UtcDatetime
+    duration_ms: Annotated[int, Field(ge=0, le=9_223_372_036_854_775_807)] | None = None
+
+
+class IdentityObservationInput(ContractModel):
+    """Anonymous edge identity metadata with no face or voice embedding."""
+
+    identity_id: Identifier
+    kind: IdentityKind
+    start_ms: Annotated[int, Field(ge=0)]
+    end_ms: Annotated[int, Field(ge=0)]
+    confidence: Annotated[float, Field(ge=0.0, le=1.0, allow_inf_nan=False)]
+    model_id: Identifier
+    model_revision: Identifier
+    scope: IdentityScope = IdentityScope.DEVICE
+    transcript: NonEmptyString | None = None
+    visual_bbox_xyxy: (
+        tuple[
+            Annotated[float, Field(ge=0.0, le=1.0, allow_inf_nan=False)],
+            Annotated[float, Field(ge=0.0, le=1.0, allow_inf_nan=False)],
+            Annotated[float, Field(ge=0.0, le=1.0, allow_inf_nan=False)],
+            Annotated[float, Field(ge=0.0, le=1.0, allow_inf_nan=False)],
+        ]
+        | None
+    ) = None
+
+    @model_validator(mode="after")
+    def require_ordered_time_range(self) -> IdentityObservationInput:
+        if self.end_ms < self.start_ms:
+            raise ValueError("identity end_ms must not precede start_ms")
+        if self.visual_bbox_xyxy is not None:
+            if self.kind is not IdentityKind.FACE:
+                raise ValueError("visual_bbox_xyxy is only valid for face identities")
+            left, top, right, bottom = self.visual_bbox_xyxy
+            if right <= left or bottom <= top:
+                raise ValueError("visual_bbox_xyxy must have positive width and height")
+        if self.transcript is not None and self.kind is not IdentityKind.VOICE:
+            raise ValueError("transcript is only valid for voice identities")
+        return self
+
+
+class ObserveRequest(ContractModel):
+    """Submit one timestamped device observation and its media metadata."""
+
+    tenant_id: Identifier
+    device_id: Identifier
+    boot_id: Identifier
+    sequence: Annotated[int, Field(ge=0, le=9_223_372_036_854_775_807)]
+    sensor: SensorKind
+    media_objects: Annotated[tuple[MediaObjectInput, ...], Field(min_length=1, max_length=8)]
+    occurred_at: UtcDatetime
+    ended_at: UtcDatetime
+    observed_at: UtcDatetime
+    clock_offset_ms: Annotated[int, Field(ge=-2_147_483_648, le=2_147_483_647)] = 0
+    identity_observations: Annotated[
+        tuple[IdentityObservationInput, ...], Field(max_length=512)
+    ] = ()
+    idempotency_key: Identifier | None = None
+
+    @model_validator(mode="after")
+    def require_consistent_observation(self) -> ObserveRequest:
+        if self.ended_at < self.occurred_at:
+            raise ValueError("ended_at must not precede occurred_at")
+        media_object_ids = [media.media_object_id for media in self.media_objects]
+        if len(set(media_object_ids)) != len(media_object_ids):
+            raise ValueError("media_objects must not contain duplicate IDs")
+        duration_ms = round((self.ended_at - self.occurred_at).total_seconds() * 1_000)
+        if any(
+            media.duration_ms is not None and media.duration_ms > duration_ms
+            for media in self.media_objects
+        ):
+            raise ValueError("media duration exceeds source observation")
+        if any(identity.end_ms > duration_ms for identity in self.identity_observations):
+            raise ValueError("identity observation exceeds source duration")
+        if (
+            sum(len(identity.transcript or "") for identity in self.identity_observations)
+            > _MAXIMUM_IDENTITY_TRANSCRIPT_CHARACTERS
+        ):
+            raise ValueError("identity transcripts exceed the per-observation character limit")
+        keys = [
+            (
+                identity.kind,
+                identity.identity_id,
+                identity.start_ms,
+                identity.end_ms,
+                identity.model_id,
+                identity.model_revision,
+            )
+            for identity in self.identity_observations
+        ]
+        if len(set(keys)) != len(keys):
+            raise ValueError("identity observations must not contain duplicates")
+        return self
+
+
+class ObservationStatus(str, Enum):
+    """Ingestion outcome returned to a retrying edge device."""
+
+    ACCEPTED = "accepted"
+    DUPLICATE = "duplicate"
+
+
+class ObservationReceipt(ContractModel):
+    """Retry-safe acknowledgement for an observation."""
+
+    observation_id: Identifier
+    processing_job_id: Identifier
+    evidence_ids: tuple[Identifier, ...] = ()
+    idempotency_key: Identifier
+    status: ObservationStatus
+    trace_id: Identifier
+
+
+class ObservationProcessingJobView(ContractModel):
+    """Public state of one durable observation processing job."""
+
+    job_id: Identifier
+    observation_id: Identifier
+    state: JobState
+    attempt: Annotated[int, Field(ge=0)]
+    error_code: Identifier | None
+    memory_ids: tuple[Identifier, ...] = ()
+    created_at: UtcDatetime
+    updated_at: UtcDatetime
+    trace_id: Identifier
+
+    @model_validator(mode="after")
+    def require_consistent_memory_ids(self) -> ObservationProcessingJobView:
+        if len(set(self.memory_ids)) != len(self.memory_ids):
+            raise ValueError("job memory_ids must be unique")
+        if self.state is not JobState.SUCCEEDED and self.memory_ids:
+            raise ValueError("only succeeded jobs may carry memory_ids")
+        return self
+
+
+class RememberRequest(ContractModel):
+    """Explicitly retain user- or agent-supplied content."""
+
+    tenant_id: Identifier
+    summary: NonEmptyString
+    memory_type: MemoryType
+    occurred_at: UtcDatetime
+    ended_at: UtcDatetime | None = None
+    evidence_ids: Annotated[tuple[Identifier, ...], Field(max_length=100)] = ()
+    idempotency_key: Identifier | None = None
+
+    @model_validator(mode="after")
+    def require_consistent_memory(self) -> RememberRequest:
+        if self.ended_at is not None and self.ended_at < self.occurred_at:
+            raise ValueError("ended_at must not precede occurred_at")
+        if len(set(self.evidence_ids)) != len(self.evidence_ids):
+            raise ValueError("evidence_ids must not contain duplicates")
+        return self
+
+
+class FeedbackRequest(ContractModel):
+    """Record useful, wrong, missing, or corrected recall feedback."""
+
+    tenant_id: Identifier
+    feedback_type: FeedbackType
+    memory_id: Identifier | None = None
+    recall_trace_id: Identifier | None = None
+    correction_summary: NonEmptyString | None = None
+    idempotency_key: Identifier | None = None
+
+    @model_validator(mode="after")
+    def require_feedback_target(self) -> FeedbackRequest:
+        """Make each feedback kind actionable without an untyped details bag."""
+        if self.feedback_type is FeedbackType.MISSING:
+            if self.recall_trace_id is None:
+                raise ValueError("missing feedback requires recall_trace_id")
+            if self.memory_id is not None:
+                raise ValueError("missing feedback must not provide memory_id")
+        elif self.memory_id is None:
+            raise ValueError("memory feedback requires memory_id")
+        if self.feedback_type is FeedbackType.CORRECTION:
+            if self.correction_summary is None:
+                raise ValueError("correction feedback requires correction_summary")
+        elif self.correction_summary is not None:
+            raise ValueError("correction_summary is only valid for correction feedback")
+        return self
+
+
+class FeedbackReceipt(ContractModel):
+    """Durable feedback result and resulting transparent lifecycle state."""
+
+    feedback_id: Identifier
+    feedback_type: FeedbackType
+    memory_id: Identifier | None
+    corrected_memory_id: Identifier | None
+    resulting_state: MemoryState | None
+    resulting_strength: float | None = Field(allow_inf_nan=False)
+    created_at: UtcDatetime
+    trace_id: Identifier
+
+    @model_validator(mode="after")
+    def require_result_pair(self) -> FeedbackReceipt:
+        """Keep lifecycle state and its score from drifting apart."""
+        if (self.resulting_state is None) != (self.resulting_strength is None):
+            raise ValueError("resulting_state and resulting_strength must be provided together")
+        return self
+
+
+class ForgetRequest(ContractModel):
+    """Explicitly delete one exact memory or its complete source observation."""
+
+    tenant_id: Identifier
+    target_type: ForgetTargetType
+    target_id: Identifier
+    idempotency_key: Identifier | None = None
+
+
+class DeletionTombstoneView(ContractModel):
+    """Content-free deletion state safe to retain after physical erasure."""
+
+    tombstone_id: Identifier
+    target_type: ForgetTargetType
+    target_id: Identifier
+    propagation_state: DeletionPropagationState
+    requested_at: UtcDatetime
+    completed_at: UtcDatetime | None
+    error_code: Identifier | None
+
+
+class ForgetReceipt(DeletionTombstoneView):
+    """Deletion result returned by one command or status lookup."""
+
+    trace_id: Identifier
+
+
+class DeletionListRequest(ContractModel):
+    """Tenant-scoped cursor request used by reconnecting edge devices."""
+
+    tenant_id: Identifier
+    cursor: Identifier | None = None
+    limit: Annotated[int, Field(ge=1, le=100)] = 100
+
+
+class DeletionPage(ContractModel):
+    """Stable ordered tombstones and the next cursor when another page exists."""
+
+    items: tuple[DeletionTombstoneView, ...]
+    next_cursor: Identifier | None
+    trace_id: Identifier
+
+
+class RecallQuery(ContractModel):
+    """Text, media, or both used to find relevant experience."""
+
+    text: NonEmptyString | None = None
+    media_object_ids: Annotated[tuple[Identifier, ...], Field(max_length=8)] = ()
+
+    @model_validator(mode="after")
+    def require_content(self) -> RecallQuery:
+        """Require at least one modality without privileging text."""
+        if self.text is None and not self.media_object_ids:
+            raise ValueError("recall query requires text or media_object_ids")
+        if len(set(self.media_object_ids)) != len(self.media_object_ids):
+            raise ValueError("recall query media_object_ids must be unique")
+        return self
+
+
+class RecallFilters(ContractModel):
+    """Structured constraints applied before semantic ranking."""
+
+    person_ids: Annotated[tuple[Identifier, ...], Field(max_length=100)] = ()
+    device_ids: Annotated[tuple[Identifier, ...], Field(max_length=100)] = ()
+    memory_types: Annotated[tuple[MemoryType, ...], Field(max_length=len(MemoryType))] = ()
+    occurred_after: UtcDatetime | None = None
+    occurred_before: UtcDatetime | None = None
+
+    @model_validator(mode="after")
+    def require_ordered_time_range(self) -> RecallFilters:
+        """Reject an impossible temporal query at the trust boundary."""
+        if (
+            self.occurred_after is not None
+            and self.occurred_before is not None
+            and self.occurred_before < self.occurred_after
+        ):
+            raise ValueError("occurred_before must not precede occurred_after")
+        return self
+
+
+class RecallMode(str, Enum):
+    """Supported recall result shapes."""
+
+    ANSWER = "answer"
+    SEARCH = "search"
+    ENUMERATE = "enumerate"
+
+
+class RecallRequest(ContractModel):
+    """Recall relevant memories and, by default, their evidence."""
+
+    tenant_id: Identifier
+    query: RecallQuery
+    memory_ids: Annotated[tuple[Identifier, ...], Field(max_length=100)] = ()
+    filters: RecallFilters = Field(default_factory=RecallFilters)
+    mode: RecallMode = RecallMode.ANSWER
+    limit: Annotated[int, Field(ge=1, le=100)] = 20
+    include_evidence: bool = True
+
+    @model_validator(mode="after")
+    def require_unique_memory_scope(self) -> RecallRequest:
+        """Keep explicit follow-up context ordered and unambiguous."""
+        if len(set(self.memory_ids)) != len(self.memory_ids):
+            raise ValueError("recall memory_ids must be unique")
+        return self
+
+
+class MemoryView(ContractModel):
+    """Serializable stable view of a retained memory."""
+
+    memory_id: Identifier
+    memory_type: MemoryType
+    summary: NonEmptyString
+    evidence_ids: tuple[Identifier, ...]
+    occurred_at: UtcDatetime
+    ended_at: UtcDatetime
+    created_at: UtcDatetime
+    verification_status: VerificationStatus
+    state: MemoryState
+    salience: Annotated[float, Field(ge=0.0, le=1.0)] = 0.5
+    strength: float = Field(default=0.5, allow_inf_nan=False)
+    useful_access_count: Annotated[int, Field(ge=0)] = 0
+    positive_feedback_count: Annotated[int, Field(ge=0)] = 0
+    negative_feedback_count: Annotated[int, Field(ge=0)] = 0
+    last_accessed_at: UtcDatetime | None = None
+    supersedes_memory_id: Identifier | None = None
+    superseded_at: UtcDatetime | None = None
+
+
+class GetMemoryRequest(ContractModel):
+    """Identify one tenant-owned memory without relying on ambient tenancy."""
+
+    tenant_id: Identifier
+    memory_id: Identifier
+
+
+class EvidenceView(ContractModel):
+    """Precise evidence location safe to expose to a caller."""
+
+    evidence_id: Identifier
+    media_object_id: Identifier
+    start_ms: Annotated[int, Field(ge=0)]
+    end_ms: Annotated[int, Field(ge=0)]
+    media_url: NonEmptyString
+    media_url_expires_at: UtcDatetime
+
+
+class MemoryResult(MemoryView):
+    """Top-level memory response with directly inspectable evidence."""
+
+    evidence: tuple[EvidenceView, ...] = ()
+    trace_id: Identifier
+
+
+class RecallResult(ContractModel):
+    """Answer plus the memory and evidence needed to verify it."""
+
+    answer: str | None
+    confidence: Annotated[float, Field(ge=0.0, le=1.0)]
+    memories: tuple[MemoryView, ...]
+    evidence: tuple[EvidenceView, ...]
+    trace_id: Identifier
+
+
+class ValidationIssue(ContractModel):
+    """One sanitized request validation failure."""
+
+    location: tuple[str, ...]
+    message: NonEmptyString
+    code: Identifier
+
+
+class ErrorResponse(ContractModel):
+    """Stable error envelope with a reproducible trace identifier."""
+
+    code: Identifier
+    message: NonEmptyString
+    trace_id: Identifier
+    issues: tuple[ValidationIssue, ...] = ()
+
+
+class HealthResponse(ContractModel):
+    """Liveness response that does not claim dependency readiness."""
+
+    status: str = "ok"
+    trace_id: Identifier

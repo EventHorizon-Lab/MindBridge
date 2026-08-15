@@ -1,0 +1,1876 @@
+[
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    },
+    "description": "Record a useful, wrong, missing, or correction signal for future recall.",
+    "inputSchema": {
+      "$defs": {
+        "FeedbackRequest": {
+          "additionalProperties": false,
+          "description": "Record useful, wrong, missing, or corrected recall feedback.",
+          "properties": {
+            "correction_summary": {
+              "anyOf": [
+                {
+                  "maxLength": 2048,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Correction Summary"
+            },
+            "feedback_type": {
+              "$ref": "#/$defs/FeedbackType"
+            },
+            "idempotency_key": {
+              "anyOf": [
+                {
+                  "maxLength": 255,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Idempotency Key"
+            },
+            "memory_id": {
+              "anyOf": [
+                {
+                  "maxLength": 255,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Memory Id"
+            },
+            "recall_trace_id": {
+              "anyOf": [
+                {
+                  "maxLength": 255,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Recall Trace Id"
+            },
+            "tenant_id": {
+              "maxLength": 255,
+              "minLength": 1,
+              "title": "Tenant Id",
+              "type": "string"
+            }
+          },
+          "required": [
+            "tenant_id",
+            "feedback_type"
+          ],
+          "title": "FeedbackRequest",
+          "type": "object"
+        },
+        "FeedbackType": {
+          "description": "Supported user or Agent signals about a recall result.",
+          "enum": [
+            "useful",
+            "wrong",
+            "missing",
+            "correction"
+          ],
+          "title": "FeedbackType",
+          "type": "string"
+        }
+      },
+      "properties": {
+        "request": {
+          "$ref": "#/$defs/FeedbackRequest"
+        }
+      },
+      "required": [
+        "request"
+      ],
+      "title": "memory_feedbackArguments",
+      "type": "object"
+    },
+    "name": "memory_feedback",
+    "outputSchema": {
+      "$defs": {
+        "FeedbackType": {
+          "description": "Supported user or Agent signals about a recall result.",
+          "enum": [
+            "useful",
+            "wrong",
+            "missing",
+            "correction"
+          ],
+          "title": "FeedbackType",
+          "type": "string"
+        },
+        "MemoryState": {
+          "description": "Retained states; explicit deletion is represented by a tombstone.",
+          "enum": [
+            "active",
+            "strengthened",
+            "cold",
+            "compressed"
+          ],
+          "title": "MemoryState",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "description": "Durable feedback result and resulting transparent lifecycle state.",
+      "properties": {
+        "corrected_memory_id": {
+          "anyOf": [
+            {
+              "maxLength": 255,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Corrected Memory Id"
+        },
+        "created_at": {
+          "format": "date-time",
+          "title": "Created At",
+          "type": "string"
+        },
+        "feedback_id": {
+          "maxLength": 255,
+          "minLength": 1,
+          "title": "Feedback Id",
+          "type": "string"
+        },
+        "feedback_type": {
+          "$ref": "#/$defs/FeedbackType"
+        },
+        "memory_id": {
+          "anyOf": [
+            {
+              "maxLength": 255,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Memory Id"
+        },
+        "resulting_state": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MemoryState"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "resulting_strength": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Resulting Strength"
+        },
+        "trace_id": {
+          "maxLength": 255,
+          "minLength": 1,
+          "title": "Trace Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "feedback_id",
+        "feedback_type",
+        "memory_id",
+        "corrected_memory_id",
+        "resulting_state",
+        "resulting_strength",
+        "created_at",
+        "trace_id"
+      ],
+      "title": "FeedbackReceipt",
+      "type": "object"
+    }
+  },
+  {
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    },
+    "description": "Recoverably erase one exact memory or source observation and its derivatives.",
+    "inputSchema": {
+      "$defs": {
+        "ForgetRequest": {
+          "additionalProperties": false,
+          "description": "Explicitly delete one exact memory or its complete source observation.",
+          "properties": {
+            "idempotency_key": {
+              "anyOf": [
+                {
+                  "maxLength": 255,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Idempotency Key"
+            },
+            "target_id": {
+              "maxLength": 255,
+              "minLength": 1,
+              "title": "Target Id",
+              "type": "string"
+            },
+            "target_type": {
+              "$ref": "#/$defs/ForgetTargetType"
+            },
+            "tenant_id": {
+              "maxLength": 255,
+              "minLength": 1,
+              "title": "Tenant Id",
+              "type": "string"
+            }
+          },
+          "required": [
+            "tenant_id",
+            "target_type",
+            "target_id"
+          ],
+          "title": "ForgetRequest",
+          "type": "object"
+        },
+        "ForgetTargetType": {
+          "description": "Exact deletion scopes supported by the first production path.",
+          "enum": [
+            "memory_record",
+            "observation"
+          ],
+          "title": "ForgetTargetType",
+          "type": "string"
+        }
+      },
+      "properties": {
+        "request": {
+          "$ref": "#/$defs/ForgetRequest"
+        }
+      },
+      "required": [
+        "request"
+      ],
+      "title": "memory_forgetArguments",
+      "type": "object"
+    },
+    "name": "memory_forget",
+    "outputSchema": {
+      "$defs": {
+        "DeletionPropagationState": {
+          "description": "Recoverable progress across PostgreSQL, S3, and offline edge devices.",
+          "enum": [
+            "pending",
+            "propagating",
+            "complete",
+            "failed"
+          ],
+          "title": "DeletionPropagationState",
+          "type": "string"
+        },
+        "ForgetTargetType": {
+          "description": "Exact deletion scopes supported by the first production path.",
+          "enum": [
+            "memory_record",
+            "observation"
+          ],
+          "title": "ForgetTargetType",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "description": "Deletion result returned by one command or status lookup.",
+      "properties": {
+        "completed_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Completed At"
+        },
+        "error_code": {
+          "anyOf": [
+            {
+              "maxLength": 255,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Error Code"
+        },
+        "propagation_state": {
+          "$ref": "#/$defs/DeletionPropagationState"
+        },
+        "requested_at": {
+          "format": "date-time",
+          "title": "Requested At",
+          "type": "string"
+        },
+        "target_id": {
+          "maxLength": 255,
+          "minLength": 1,
+          "title": "Target Id",
+          "type": "string"
+        },
+        "target_type": {
+          "$ref": "#/$defs/ForgetTargetType"
+        },
+        "tombstone_id": {
+          "maxLength": 255,
+          "minLength": 1,
+          "title": "Tombstone Id",
+          "type": "string"
+        },
+        "trace_id": {
+          "maxLength": 255,
+          "minLength": 1,
+          "title": "Trace Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tombstone_id",
+        "target_type",
+        "target_id",
+        "propagation_state",
+        "requested_at",
+        "completed_at",
+        "error_code",
+        "trace_id"
+      ],
+      "title": "ForgetReceipt",
+      "type": "object"
+    }
+  },
+  {
+    "annotations": {
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Read one tenant-owned memory by its stable identifier.",
+    "inputSchema": {
+      "$defs": {
+        "GetMemoryRequest": {
+          "additionalProperties": false,
+          "description": "Identify one tenant-owned memory without relying on ambient tenancy.",
+          "properties": {
+            "memory_id": {
+              "maxLength": 255,
+              "minLength": 1,
+              "title": "Memory Id",
+              "type": "string"
+            },
+            "tenant_id": {
+              "maxLength": 255,
+              "minLength": 1,
+              "title": "Tenant Id",
+              "type": "string"
+            }
+          },
+          "required": [
+            "tenant_id",
+            "memory_id"
+          ],
+          "title": "GetMemoryRequest",
+          "type": "object"
+        }
+      },
+      "properties": {
+        "request": {
+          "$ref": "#/$defs/GetMemoryRequest"
+        }
+      },
+      "required": [
+        "request"
+      ],
+      "title": "memory_getArguments",
+      "type": "object"
+    },
+    "name": "memory_get",
+    "outputSchema": {
+      "$defs": {
+        "EvidenceView": {
+          "additionalProperties": false,
+          "description": "Precise evidence location safe to expose to a caller.",
+          "properties": {
+            "end_ms": {
+              "minimum": 0,
+              "title": "End Ms",
+              "type": "integer"
+            },
+            "evidence_id": {
+              "maxLength": 255,
+              "minLength": 1,
+              "title": "Evidence Id",
+              "type": "string"
+            },
+            "media_object_id": {
+              "maxLength": 255,
+              "minLength": 1,
+              "title": "Media Object Id",
+              "type": "string"
+            },
+            "media_url": {
+              "maxLength": 2048,
+              "minLength": 1,
+              "title": "Media Url",
+              "type": "string"
+            },
+            "media_url_expires_at": {
+              "format": "date-time",
+              "title": "Media Url Expires At",
+              "type": "string"
+            },
+            "start_ms": {
+              "minimum": 0,
+              "title": "Start Ms",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "evidence_id",
+            "media_object_id",
+            "start_ms",
+            "end_ms",
+            "media_url",
+            "media_url_expires_at"
+          ],
+          "title": "EvidenceView",
+          "type": "object"
+        },
+        "MemoryState": {
+          "description": "Retained states; explicit deletion is represented by a tombstone.",
+          "enum": [
+            "active",
+            "strengthened",
+            "cold",
+            "compressed"
+          ],
+          "title": "MemoryState",
+          "type": "string"
+        },
+        "MemoryType": {
+          "description": "Long-term role a memory serves.",
+          "enum": [
+            "perceptual",
+            "working",
+            "episodic",
+            "semantic",
+            "procedural",
+            "prospective"
+          ],
+          "title": "MemoryType",
+          "type": "string"
+        },
+        "VerificationStatus": {
+          "description": "How a record is supported without conflating reports and observations.",
+          "enum": [
+            "verified",
+            "attested",
+            "unverified"
+          ],
+          "title": "VerificationStatus",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "description": "Top-level memory response with directly inspectable evidence.",
+      "properties": {
+        "created_at": {
+          "format": "date-time",
+          "title": "Created At",
+          "type": "string"
+        },
+        "ended_at": {
+          "format": "date-time",
+          "title": "Ended At",
+          "type": "string"
+        },
+        "evidence": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/EvidenceView"
+          },
+          "title": "Evidence",
+          "type": "array"
+        },
+        "evidence_ids": {
+          "items": {
+            "maxLength": 255,
+            "minLength": 1,
+            "type": "string"
+          },
+          "title": "Evidence Ids",
+          "type": "array"
+        },
+        "last_accessed_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Last Accessed At"
+        },
+        "memory_id": {
+          "maxLength": 255,
+          "minLength": 1,
+          "title": "Memory Id",
+          "type": "string"
+        },
+        "memory_type": {
+          "$ref": "#/$defs/MemoryType"
+        },
+        "negative_feedback_count": {
+          "default": 0,
+          "minimum": 0,
+          "title": "Negative Feedback Count",
+          "type": "integer"
+        },
+        "occurred_at": {
+          "format": "date-time",
+          "title": "Occurred At",
+          "type": "string"
+        },
+        "positive_feedback_count": {
+          "default": 0,
+          "minimum": 0,
+          "title": "Positive Feedback Count",
+          "type": "integer"
+        },
+        "salience": {
+          "default": 0.5,
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Salience",
+          "type": "number"
+        },
+        "state": {
+          "$ref": "#/$defs/MemoryState"
+        },
+        "strength": {
+          "default": 0.5,
+          "title": "Strength",
+          "type": "number"
+        },
+        "summary": {
+          "maxLength": 2048,
+          "minLength": 1,
+          "title": "Summary",
+          "type": "string"
+        },
+        "superseded_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Superseded At"
+        },
+        "supersedes_memory_id": {
+          "anyOf": [
+            {
+              "maxLength": 255,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Supersedes Memory Id"
+        },
+        "trace_id": {
+          "maxLength": 255,
+          "minLength": 1,
+          "title": "Trace Id",
+          "type": "string"
+        },
+        "useful_access_count": {
+          "default": 0,
+          "minimum": 0,
+          "title": "Useful Access Count",
+          "type": "integer"
+        },
+        "verification_status": {
+          "$ref": "#/$defs/VerificationStatus"
+        }
+      },
+      "required": [
+        "memory_id",
+        "memory_type",
+        "summary",
+        "evidence_ids",
+        "occurred_at",
+        "ended_at",
+        "created_at",
+        "verification_status",
+        "state",
+        "trace_id"
+      ],
+      "title": "MemoryResult",
+      "type": "object"
+    }
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    },
+    "description": "Store one timestamped multimodal observation and return its durable job ID.",
+    "inputSchema": {
+      "$defs": {
+        "IdentityKind": {
+          "description": "Biometric modality used only to create a device-domain anonymous identity.",
+          "enum": [
+            "face",
+            "voice"
+          ],
+          "title": "IdentityKind",
+          "type": "string"
+        },
+        "IdentityObservationInput": {
+          "additionalProperties": false,
+          "description": "Anonymous edge identity metadata with no face or voice embedding.",
+          "properties": {
+            "confidence": {
+              "maximum": 1.0,
+              "minimum": 0.0,
+              "title": "Confidence",
+              "type": "number"
+            },
+            "end_ms": {
+              "minimum": 0,
+              "title": "End Ms",
+              "type": "integer"
+            },
+            "identity_id": {
+              "maxLength": 255,
+              "minLength": 1,
+              "title": "Identity Id",
+              "type": "string"
+            },
+            "kind": {
+              "$ref": "#/$defs/IdentityKind"
+            },
+            "model_id": {
+              "maxLength": 255,
+              "minLength": 1,
+              "title": "Model Id",
+              "type": "string"
+            },
+            "model_revision": {
+              "maxLength": 255,
+              "minLength": 1,
+              "title": "Model Revision",
+              "type": "string"
+            },
+            "scope": {
+              "$ref": "#/$defs/IdentityScope",
+              "default": "device"
+            },
+            "start_ms": {
+              "minimum": 0,
+              "title": "Start Ms",
+              "type": "integer"
+            },
+            "transcript": {
+              "anyOf": [
+                {
+                  "maxLength": 2048,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Transcript"
+            },
+            "visual_bbox_xyxy": {
+              "anyOf": [
+                {
+                  "maxItems": 4,
+                  "minItems": 4,
+                  "prefixItems": [
+                    {
+                      "maximum": 1.0,
+                      "minimum": 0.0,
+                      "type": "number"
+                    },
+                    {
+                      "maximum": 1.0,
+                      "minimum": 0.0,
+                      "type": "number"
+                    },
+                    {
+                      "maximum": 1.0,
+                      "minimum": 0.0,
+                      "type": "number"
+                    },
+                    {
+                      "maximum": 1.0,
+                      "minimum": 0.0,
+                      "type": "number"
+                    }
+                  ],
+                  "type": "array"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Visual Bbox Xyxy"
+            }
+          },
+          "required": [
+            "identity_id",
+            "kind",
+            "start_ms",
+            "end_ms",
+            "confidence",
+            "model_id",
+            "model_revision"
+          ],
+          "title": "IdentityObservationInput",
+          "type": "object"
+        },
+        "IdentityScope": {
+          "description": "How long an anonymous identity is safe to reuse.",
+          "enum": [
+            "device",
+            "observation"
+          ],
+          "title": "IdentityScope",
+          "type": "string"
+        },
+        "MediaKind": {
+          "description": "Supported raw or derived media kinds.",
+          "enum": [
+            "image",
+            "video",
+            "audio"
+          ],
+          "title": "MediaKind",
+          "type": "string"
+        },
+        "MediaObjectInput": {
+          "additionalProperties": false,
+          "description": "Metadata for an already addressable evidence object.",
+          "properties": {
+            "created_at": {
+              "format": "date-time",
+              "title": "Created At",
+              "type": "string"
+            },
+            "duration_ms": {
+              "anyOf": [
+                {
+                  "maximum": 9223372036854775807,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Duration Ms"
+            },
+            "kind": {
+              "$ref": "#/$defs/MediaKind"
+            },
+            "media_object_id": {
+              "maxLength": 255,
+              "minLength": 1,
+              "title": "Media Object Id",
+              "type": "string"
+            },
+            "sha256": {
+              "pattern": "^[0-9a-fA-F]{64}$",
+              "title": "Sha256",
+              "type": "string"
+            },
+            "size_bytes": {
+              "maximum": 9223372036854775807,
+              "minimum": 0,
+              "title": "Size Bytes",
+              "type": "integer"
+            },
+            "uri": {
+              "maxLength": 2048,
+              "minLength": 1,
+              "title": "Uri",
+              "type": "string"
+            }
+          },
+          "required": [
+            "media_object_id",
+            "kind",
+            "uri",
+            "sha256",
+            "size_bytes",
+            "created_at"
+          ],
+          "title": "MediaObjectInput",
+          "type": "object"
+        },
+        "ObserveRequest": {
+          "additionalProperties": false,
+          "description": "Submit one timestamped device observation and its media metadata.",
+          "properties": {
+            "boot_id": {
+              "maxLength": 255,
+              "minLength": 1,
+              "title": "Boot Id",
+              "type": "string"
+            },
+            "clock_offset_ms": {
+              "default": 0,
+              "maximum": 2147483647,
+              "minimum": -2147483648,
+              "title": "Clock Offset Ms",
+              "type": "integer"
+            },
+            "device_id": {
+              "maxLength": 255,
+              "minLength": 1,
+              "title": "Device Id",
+              "type": "string"
+            },
+            "ended_at": {
+              "format": "date-time",
+              "title": "Ended At",
+              "type": "string"
+            },
+            "idempotency_key": {
+              "anyOf": [
+                {
+                  "maxLength": 255,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Idempotency Key"
+            },
+            "identity_observations": {
+              "default": [],
+              "items": {
+                "$ref": "#/$defs/IdentityObservationInput"
+              },
+              "maxItems": 512,
+              "title": "Identity Observations",
+              "type": "array"
+            },
+            "media_objects": {
+              "items": {
+                "$ref": "#/$defs/MediaObjectInput"
+              },
+              "maxItems": 8,
+              "minItems": 1,
+              "title": "Media Objects",
+              "type": "array"
+            },
+            "observed_at": {
+              "format": "date-time",
+              "title": "Observed At",
+              "type": "string"
+            },
+            "occurred_at": {
+              "format": "date-time",
+              "title": "Occurred At",
+              "type": "string"
+            },
+            "sensor": {
+              "$ref": "#/$defs/SensorKind"
+            },
+            "sequence": {
+              "maximum": 9223372036854775807,
+              "minimum": 0,
+              "title": "Sequence",
+              "type": "integer"
+            },
+            "tenant_id": {
+              "maxLength": 255,
+              "minLength": 1,
+              "title": "Tenant Id",
+              "type": "string"
+            }
+          },
+          "required": [
+            "tenant_id",
+            "device_id",
+            "boot_id",
+            "sequence",
+            "sensor",
+            "media_objects",
+            "occurred_at",
+            "ended_at",
+            "observed_at"
+          ],
+          "title": "ObserveRequest",
+          "type": "object"
+        },
+        "SensorKind": {
+          "description": "Sensor that produced an observation.",
+          "enum": [
+            "camera",
+            "microphone",
+            "gaze",
+            "imu",
+            "robot_state"
+          ],
+          "title": "SensorKind",
+          "type": "string"
+        }
+      },
+      "properties": {
+        "request": {
+          "$ref": "#/$defs/ObserveRequest"
+        }
+      },
+      "required": [
+        "request"
+      ],
+      "title": "memory_observeArguments",
+      "type": "object"
+    },
+    "name": "memory_observe",
+    "outputSchema": {
+      "$defs": {
+        "ObservationStatus": {
+          "description": "Ingestion outcome returned to a retrying edge device.",
+          "enum": [
+            "accepted",
+            "duplicate"
+          ],
+          "title": "ObservationStatus",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "description": "Retry-safe acknowledgement for an observation.",
+      "properties": {
+        "evidence_ids": {
+          "default": [],
+          "items": {
+            "maxLength": 255,
+            "minLength": 1,
+            "type": "string"
+          },
+          "title": "Evidence Ids",
+          "type": "array"
+        },
+        "idempotency_key": {
+          "maxLength": 255,
+          "minLength": 1,
+          "title": "Idempotency Key",
+          "type": "string"
+        },
+        "observation_id": {
+          "maxLength": 255,
+          "minLength": 1,
+          "title": "Observation Id",
+          "type": "string"
+        },
+        "processing_job_id": {
+          "maxLength": 255,
+          "minLength": 1,
+          "title": "Processing Job Id",
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/$defs/ObservationStatus"
+        },
+        "trace_id": {
+          "maxLength": 255,
+          "minLength": 1,
+          "title": "Trace Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "observation_id",
+        "processing_job_id",
+        "idempotency_key",
+        "status",
+        "trace_id"
+      ],
+      "title": "ObservationReceipt",
+      "type": "object"
+    }
+  },
+  {
+    "annotations": {
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Recall relevant memories and return inspectable evidence with the answer.",
+    "inputSchema": {
+      "$defs": {
+        "MemoryType": {
+          "description": "Long-term role a memory serves.",
+          "enum": [
+            "perceptual",
+            "working",
+            "episodic",
+            "semantic",
+            "procedural",
+            "prospective"
+          ],
+          "title": "MemoryType",
+          "type": "string"
+        },
+        "RecallFilters": {
+          "additionalProperties": false,
+          "description": "Structured constraints applied before semantic ranking.",
+          "properties": {
+            "device_ids": {
+              "default": [],
+              "items": {
+                "maxLength": 255,
+                "minLength": 1,
+                "type": "string"
+              },
+              "maxItems": 100,
+              "title": "Device Ids",
+              "type": "array"
+            },
+            "memory_types": {
+              "default": [],
+              "items": {
+                "$ref": "#/$defs/MemoryType"
+              },
+              "maxItems": 6,
+              "title": "Memory Types",
+              "type": "array"
+            },
+            "occurred_after": {
+              "anyOf": [
+                {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Occurred After"
+            },
+            "occurred_before": {
+              "anyOf": [
+                {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Occurred Before"
+            },
+            "person_ids": {
+              "default": [],
+              "items": {
+                "maxLength": 255,
+                "minLength": 1,
+                "type": "string"
+              },
+              "maxItems": 100,
+              "title": "Person Ids",
+              "type": "array"
+            }
+          },
+          "title": "RecallFilters",
+          "type": "object"
+        },
+        "RecallMode": {
+          "description": "Supported recall result shapes.",
+          "enum": [
+            "answer",
+            "search",
+            "enumerate"
+          ],
+          "title": "RecallMode",
+          "type": "string"
+        },
+        "RecallQuery": {
+          "additionalProperties": false,
+          "description": "Text, media, or both used to find relevant experience.",
+          "properties": {
+            "media_object_ids": {
+              "default": [],
+              "items": {
+                "maxLength": 255,
+                "minLength": 1,
+                "type": "string"
+              },
+              "maxItems": 8,
+              "title": "Media Object Ids",
+              "type": "array"
+            },
+            "text": {
+              "anyOf": [
+                {
+                  "maxLength": 2048,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Text"
+            }
+          },
+          "title": "RecallQuery",
+          "type": "object"
+        },
+        "RecallRequest": {
+          "additionalProperties": false,
+          "description": "Recall relevant memories and, by default, their evidence.",
+          "properties": {
+            "filters": {
+              "$ref": "#/$defs/RecallFilters"
+            },
+            "include_evidence": {
+              "default": true,
+              "title": "Include Evidence",
+              "type": "boolean"
+            },
+            "limit": {
+              "default": 20,
+              "maximum": 100,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            },
+            "memory_ids": {
+              "default": [],
+              "items": {
+                "maxLength": 255,
+                "minLength": 1,
+                "type": "string"
+              },
+              "maxItems": 100,
+              "title": "Memory Ids",
+              "type": "array"
+            },
+            "mode": {
+              "$ref": "#/$defs/RecallMode",
+              "default": "answer"
+            },
+            "query": {
+              "$ref": "#/$defs/RecallQuery"
+            },
+            "tenant_id": {
+              "maxLength": 255,
+              "minLength": 1,
+              "title": "Tenant Id",
+              "type": "string"
+            }
+          },
+          "required": [
+            "tenant_id",
+            "query"
+          ],
+          "title": "RecallRequest",
+          "type": "object"
+        }
+      },
+      "properties": {
+        "request": {
+          "$ref": "#/$defs/RecallRequest"
+        }
+      },
+      "required": [
+        "request"
+      ],
+      "title": "memory_recallArguments",
+      "type": "object"
+    },
+    "name": "memory_recall",
+    "outputSchema": {
+      "$defs": {
+        "EvidenceView": {
+          "additionalProperties": false,
+          "description": "Precise evidence location safe to expose to a caller.",
+          "properties": {
+            "end_ms": {
+              "minimum": 0,
+              "title": "End Ms",
+              "type": "integer"
+            },
+            "evidence_id": {
+              "maxLength": 255,
+              "minLength": 1,
+              "title": "Evidence Id",
+              "type": "string"
+            },
+            "media_object_id": {
+              "maxLength": 255,
+              "minLength": 1,
+              "title": "Media Object Id",
+              "type": "string"
+            },
+            "media_url": {
+              "maxLength": 2048,
+              "minLength": 1,
+              "title": "Media Url",
+              "type": "string"
+            },
+            "media_url_expires_at": {
+              "format": "date-time",
+              "title": "Media Url Expires At",
+              "type": "string"
+            },
+            "start_ms": {
+              "minimum": 0,
+              "title": "Start Ms",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "evidence_id",
+            "media_object_id",
+            "start_ms",
+            "end_ms",
+            "media_url",
+            "media_url_expires_at"
+          ],
+          "title": "EvidenceView",
+          "type": "object"
+        },
+        "MemoryState": {
+          "description": "Retained states; explicit deletion is represented by a tombstone.",
+          "enum": [
+            "active",
+            "strengthened",
+            "cold",
+            "compressed"
+          ],
+          "title": "MemoryState",
+          "type": "string"
+        },
+        "MemoryType": {
+          "description": "Long-term role a memory serves.",
+          "enum": [
+            "perceptual",
+            "working",
+            "episodic",
+            "semantic",
+            "procedural",
+            "prospective"
+          ],
+          "title": "MemoryType",
+          "type": "string"
+        },
+        "MemoryView": {
+          "additionalProperties": false,
+          "description": "Serializable stable view of a retained memory.",
+          "properties": {
+            "created_at": {
+              "format": "date-time",
+              "title": "Created At",
+              "type": "string"
+            },
+            "ended_at": {
+              "format": "date-time",
+              "title": "Ended At",
+              "type": "string"
+            },
+            "evidence_ids": {
+              "items": {
+                "maxLength": 255,
+                "minLength": 1,
+                "type": "string"
+              },
+              "title": "Evidence Ids",
+              "type": "array"
+            },
+            "last_accessed_at": {
+              "anyOf": [
+                {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Last Accessed At"
+            },
+            "memory_id": {
+              "maxLength": 255,
+              "minLength": 1,
+              "title": "Memory Id",
+              "type": "string"
+            },
+            "memory_type": {
+              "$ref": "#/$defs/MemoryType"
+            },
+            "negative_feedback_count": {
+              "default": 0,
+              "minimum": 0,
+              "title": "Negative Feedback Count",
+              "type": "integer"
+            },
+            "occurred_at": {
+              "format": "date-time",
+              "title": "Occurred At",
+              "type": "string"
+            },
+            "positive_feedback_count": {
+              "default": 0,
+              "minimum": 0,
+              "title": "Positive Feedback Count",
+              "type": "integer"
+            },
+            "salience": {
+              "default": 0.5,
+              "maximum": 1.0,
+              "minimum": 0.0,
+              "title": "Salience",
+              "type": "number"
+            },
+            "state": {
+              "$ref": "#/$defs/MemoryState"
+            },
+            "strength": {
+              "default": 0.5,
+              "title": "Strength",
+              "type": "number"
+            },
+            "summary": {
+              "maxLength": 2048,
+              "minLength": 1,
+              "title": "Summary",
+              "type": "string"
+            },
+            "superseded_at": {
+              "anyOf": [
+                {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Superseded At"
+            },
+            "supersedes_memory_id": {
+              "anyOf": [
+                {
+                  "maxLength": 255,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Supersedes Memory Id"
+            },
+            "useful_access_count": {
+              "default": 0,
+              "minimum": 0,
+              "title": "Useful Access Count",
+              "type": "integer"
+            },
+            "verification_status": {
+              "$ref": "#/$defs/VerificationStatus"
+            }
+          },
+          "required": [
+            "memory_id",
+            "memory_type",
+            "summary",
+            "evidence_ids",
+            "occurred_at",
+            "ended_at",
+            "created_at",
+            "verification_status",
+            "state"
+          ],
+          "title": "MemoryView",
+          "type": "object"
+        },
+        "VerificationStatus": {
+          "description": "How a record is supported without conflating reports and observations.",
+          "enum": [
+            "verified",
+            "attested",
+            "unverified"
+          ],
+          "title": "VerificationStatus",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "description": "Answer plus the memory and evidence needed to verify it.",
+      "properties": {
+        "answer": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Answer"
+        },
+        "confidence": {
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Confidence",
+          "type": "number"
+        },
+        "evidence": {
+          "items": {
+            "$ref": "#/$defs/EvidenceView"
+          },
+          "title": "Evidence",
+          "type": "array"
+        },
+        "memories": {
+          "items": {
+            "$ref": "#/$defs/MemoryView"
+          },
+          "title": "Memories",
+          "type": "array"
+        },
+        "trace_id": {
+          "maxLength": 255,
+          "minLength": 1,
+          "title": "Trace Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "answer",
+        "confidence",
+        "memories",
+        "evidence",
+        "trace_id"
+      ],
+      "title": "RecallResult",
+      "type": "object"
+    }
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    },
+    "description": "Retain one explicit memory, preserving evidence and temporal provenance.",
+    "inputSchema": {
+      "$defs": {
+        "MemoryType": {
+          "description": "Long-term role a memory serves.",
+          "enum": [
+            "perceptual",
+            "working",
+            "episodic",
+            "semantic",
+            "procedural",
+            "prospective"
+          ],
+          "title": "MemoryType",
+          "type": "string"
+        },
+        "RememberRequest": {
+          "additionalProperties": false,
+          "description": "Explicitly retain user- or agent-supplied content.",
+          "properties": {
+            "ended_at": {
+              "anyOf": [
+                {
+                  "format": "date-time",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Ended At"
+            },
+            "evidence_ids": {
+              "default": [],
+              "items": {
+                "maxLength": 255,
+                "minLength": 1,
+                "type": "string"
+              },
+              "maxItems": 100,
+              "title": "Evidence Ids",
+              "type": "array"
+            },
+            "idempotency_key": {
+              "anyOf": [
+                {
+                  "maxLength": 255,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Idempotency Key"
+            },
+            "memory_type": {
+              "$ref": "#/$defs/MemoryType"
+            },
+            "occurred_at": {
+              "format": "date-time",
+              "title": "Occurred At",
+              "type": "string"
+            },
+            "summary": {
+              "maxLength": 2048,
+              "minLength": 1,
+              "title": "Summary",
+              "type": "string"
+            },
+            "tenant_id": {
+              "maxLength": 255,
+              "minLength": 1,
+              "title": "Tenant Id",
+              "type": "string"
+            }
+          },
+          "required": [
+            "tenant_id",
+            "summary",
+            "memory_type",
+            "occurred_at"
+          ],
+          "title": "RememberRequest",
+          "type": "object"
+        }
+      },
+      "properties": {
+        "request": {
+          "$ref": "#/$defs/RememberRequest"
+        }
+      },
+      "required": [
+        "request"
+      ],
+      "title": "memory_rememberArguments",
+      "type": "object"
+    },
+    "name": "memory_remember",
+    "outputSchema": {
+      "$defs": {
+        "EvidenceView": {
+          "additionalProperties": false,
+          "description": "Precise evidence location safe to expose to a caller.",
+          "properties": {
+            "end_ms": {
+              "minimum": 0,
+              "title": "End Ms",
+              "type": "integer"
+            },
+            "evidence_id": {
+              "maxLength": 255,
+              "minLength": 1,
+              "title": "Evidence Id",
+              "type": "string"
+            },
+            "media_object_id": {
+              "maxLength": 255,
+              "minLength": 1,
+              "title": "Media Object Id",
+              "type": "string"
+            },
+            "media_url": {
+              "maxLength": 2048,
+              "minLength": 1,
+              "title": "Media Url",
+              "type": "string"
+            },
+            "media_url_expires_at": {
+              "format": "date-time",
+              "title": "Media Url Expires At",
+              "type": "string"
+            },
+            "start_ms": {
+              "minimum": 0,
+              "title": "Start Ms",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "evidence_id",
+            "media_object_id",
+            "start_ms",
+            "end_ms",
+            "media_url",
+            "media_url_expires_at"
+          ],
+          "title": "EvidenceView",
+          "type": "object"
+        },
+        "MemoryState": {
+          "description": "Retained states; explicit deletion is represented by a tombstone.",
+          "enum": [
+            "active",
+            "strengthened",
+            "cold",
+            "compressed"
+          ],
+          "title": "MemoryState",
+          "type": "string"
+        },
+        "MemoryType": {
+          "description": "Long-term role a memory serves.",
+          "enum": [
+            "perceptual",
+            "working",
+            "episodic",
+            "semantic",
+            "procedural",
+            "prospective"
+          ],
+          "title": "MemoryType",
+          "type": "string"
+        },
+        "VerificationStatus": {
+          "description": "How a record is supported without conflating reports and observations.",
+          "enum": [
+            "verified",
+            "attested",
+            "unverified"
+          ],
+          "title": "VerificationStatus",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "description": "Top-level memory response with directly inspectable evidence.",
+      "properties": {
+        "created_at": {
+          "format": "date-time",
+          "title": "Created At",
+          "type": "string"
+        },
+        "ended_at": {
+          "format": "date-time",
+          "title": "Ended At",
+          "type": "string"
+        },
+        "evidence": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/EvidenceView"
+          },
+          "title": "Evidence",
+          "type": "array"
+        },
+        "evidence_ids": {
+          "items": {
+            "maxLength": 255,
+            "minLength": 1,
+            "type": "string"
+          },
+          "title": "Evidence Ids",
+          "type": "array"
+        },
+        "last_accessed_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Last Accessed At"
+        },
+        "memory_id": {
+          "maxLength": 255,
+          "minLength": 1,
+          "title": "Memory Id",
+          "type": "string"
+        },
+        "memory_type": {
+          "$ref": "#/$defs/MemoryType"
+        },
+        "negative_feedback_count": {
+          "default": 0,
+          "minimum": 0,
+          "title": "Negative Feedback Count",
+          "type": "integer"
+        },
+        "occurred_at": {
+          "format": "date-time",
+          "title": "Occurred At",
+          "type": "string"
+        },
+        "positive_feedback_count": {
+          "default": 0,
+          "minimum": 0,
+          "title": "Positive Feedback Count",
+          "type": "integer"
+        },
+        "salience": {
+          "default": 0.5,
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Salience",
+          "type": "number"
+        },
+        "state": {
+          "$ref": "#/$defs/MemoryState"
+        },
+        "strength": {
+          "default": 0.5,
+          "title": "Strength",
+          "type": "number"
+        },
+        "summary": {
+          "maxLength": 2048,
+          "minLength": 1,
+          "title": "Summary",
+          "type": "string"
+        },
+        "superseded_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Superseded At"
+        },
+        "supersedes_memory_id": {
+          "anyOf": [
+            {
+              "maxLength": 255,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Supersedes Memory Id"
+        },
+        "trace_id": {
+          "maxLength": 255,
+          "minLength": 1,
+          "title": "Trace Id",
+          "type": "string"
+        },
+        "useful_access_count": {
+          "default": 0,
+          "minimum": 0,
+          "title": "Useful Access Count",
+          "type": "integer"
+        },
+        "verification_status": {
+          "$ref": "#/$defs/VerificationStatus"
+        }
+      },
+      "required": [
+        "memory_id",
+        "memory_type",
+        "summary",
+        "evidence_ids",
+        "occurred_at",
+        "ended_at",
+        "created_at",
+        "verification_status",
+        "state",
+        "trace_id"
+      ],
+      "title": "MemoryResult",
+      "type": "object"
+    }
+  }
+]

@@ -1,0 +1,125 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  installability:
+    name: Install ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: core
+            requirement: .
+            imports: import mindbridge.sdk
+          - name: edge
+            requirement: .[edge]
+            imports: import mindbridge.edge.identity_diarization
+          - name: server
+            requirement: .[server]
+            imports: import mindbridge.api.runtime
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          python-version: "3.10"
+          enable-cache: true
+
+      - name: Install isolated package
+        run: |
+          uv venv .install-venv
+          uv pip install --python .install-venv/bin/python --strict '${{ matrix.requirement }}'
+          .install-venv/bin/python -Ic '${{ matrix.imports }}'
+
+  documentation:
+    name: Documentation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      - name: Lint Markdown
+        uses: DavidAnson/markdownlint-cli2-action@ded1f9488f68a970bc66ea5619e13e9b52e601cd # v23.2.0
+        with:
+          globs: |
+            **/*.md
+            !.git/**
+            !.venv/**
+            !.pytest_cache/**
+
+      - name: Check documentation links
+        uses: lycheeverse/lychee-action@8646ba30535128ac92d33dfc9133794bfdd9b411 # v2.8.0
+        with:
+          args: >-
+            --no-progress
+            --root-dir "${{ github.workspace }}"
+            './*.md'
+            './docs/**/*.md'
+          fail: true
+          failIfEmpty: true
+
+  quality:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    env:
+      MINDBRIDGE_TEST_DATABASE_URL: postgresql://mindbridge:mindbridge_test@localhost:5432/mindbridge_test
+    services:
+      postgres:
+        image: pgvector/pgvector:0.8.2-pg18-trixie
+        env:
+          POSTGRES_DB: mindbridge_test
+          POSTGRES_USER: mindbridge
+          POSTGRES_PASSWORD: mindbridge_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U mindbridge -d mindbridge_test"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11"]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
+
+      - name: Install locked dependencies
+        run: uv sync --frozen --all-groups --extra edge --extra server
+
+      - name: Check formatting
+        run: uv run --frozen ruff format --check .
+
+      - name: Lint
+        run: uv run --frozen ruff check .
+
+      - name: Type check
+        run: uv run --frozen mypy
+
+      - name: Test
+        run: uv run --frozen pytest -W error
+
+      - name: Check whitespace
+        run: git diff --check

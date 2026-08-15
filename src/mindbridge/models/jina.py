@@ -1,0 +1,204 @@
+"""Jina v5 Omni embedding through the official Sentence Transformers API."""
+
+from __future__ import annotations
+
+import asyncio
+import math
+from collections.abc import Callable
+from importlib import import_module
+from typing import Protocol, cast
+
+from mindbridge.application.ports import EmbeddingInput
+from mindbridge.core import (
+    EmbeddingSpaceReference,
+    ModelOutputError,
+    ModelReference,
+    ModelUnavailableError,
+)
+from mindbridge.models.compute import select_torch_device
+from mindbridge.telemetry import set_current_span_attributes, trace_operation
+
+DEFAULT_JINA_OMNI_MODEL_ID = "jinaai/jina-embeddings-v5-omni-small-retrieval"
+DEFAULT_JINA_OMNI_REVISION = "12949877f0092093f366c6450340011320152a05"
+DEFAULT_JINA_TEXT_MODEL_ID = "jinaai/jina-embeddings-v5-text-small-retrieval"
+DEFAULT_JINA_TEXT_REVISION = "6856e76bb72982e58de0620458a4e8b3614da340"
+DEFAULT_JINA_OMNI_DIMENSION = 1_024
+DEFAULT_JINA_RETRIEVAL_SPACE = EmbeddingSpaceReference(
+    space_id="jinaai/jina-embeddings-v5-small-retrieval-1024",
+    revision=(
+        "omni@12949877f0092093f366c6450340011320152a05+"
+        "text@6856e76bb72982e58de0620458a4e8b3614da340"
+    ),
+)
+
+
+class _EmbeddingMatrix(Protocol):
+    def tolist(self) -> list[list[float]]: ...
+
+
+class _SentenceEncoder(Protocol):
+    def encode_query(
+        self,
+        sentences: list[object],
+        *,
+        convert_to_numpy: bool,
+        normalize_embeddings: bool,
+        truncate_dim: int,
+    ) -> _EmbeddingMatrix: ...
+
+    def encode_document(
+        self,
+        sentences: list[object],
+        *,
+        convert_to_numpy: bool,
+        normalize_embeddings: bool,
+        truncate_dim: int,
+    ) -> _EmbeddingMatrix: ...
+
+
+class _SentenceTransformerFactory(Protocol):
+    def __call__(
+        self,
+        model_name_or_path: str,
+        *,
+        revision: str,
+        trust_remote_code: bool,
+        device: str | None,
+        model_kwargs: dict[str, str],
+        config_kwargs: dict[str, str],
+    ) -> _SentenceEncoder: ...
+
+
+class JinaOmniEmbedder:
+    """Async-safe query/document encoder for text, image, video, and audio."""
+
+    def __init__(
+        self,
+        encoder: _SentenceEncoder,
+        model_reference: ModelReference,
+        *,
+        space_reference: EmbeddingSpaceReference = DEFAULT_JINA_RETRIEVAL_SPACE,
+        dimension: int = DEFAULT_JINA_OMNI_DIMENSION,
+        max_concurrency: int = 1,
+    ) -> None:
+        if dimension <= 0:
+            raise ValueError("dimension must be positive")
+        if max_concurrency <= 0:
+            raise ValueError("max_concurrency must be positive")
+        self._encoder = encoder
+        self._model_reference = model_reference
+        self._space_reference = space_reference
+        self._dimension = dimension
+        self._semaphore = asyncio.Semaphore(max_concurrency)
+
+    @classmethod
+    def load(
+        cls,
+        *,
+        revision: str,
+        model_id: str = DEFAULT_JINA_OMNI_MODEL_ID,
+        device: str | None = None,
+        space_reference: EmbeddingSpaceReference = DEFAULT_JINA_RETRIEVAL_SPACE,
+        dimension: int = DEFAULT_JINA_OMNI_DIMENSION,
+        max_concurrency: int = 1,
+    ) -> JinaOmniEmbedder:
+        """Load a pinned upstream model without exposing training operations."""
+        try:
+            module = import_module("sentence_transformers")
+            hub_module = import_module("huggingface_hub")
+        except ImportError as error:
+            raise ModelUnavailableError(
+                "install MindBridge with the cloud-models extra to load Jina Omni"
+            ) from error
+        sentence_transformer = cast(
+            _SentenceTransformerFactory,
+            module.SentenceTransformer,
+        )
+        snapshot_download = cast(Callable[..., str], hub_module.snapshot_download)
+        model_path = snapshot_download(repo_id=model_id, revision=revision)
+        selected_device = select_torch_device(device)
+        encoder = sentence_transformer(
+            model_path,
+            revision=revision,
+            trust_remote_code=True,
+            device=selected_device,
+            model_kwargs={"modality": "omni", "code_revision": revision},
+            config_kwargs={"code_revision": revision},
+        )
+        return cls(
+            encoder,
+            ModelReference(model_id=model_id, revision=revision),
+            space_reference=space_reference,
+            dimension=dimension,
+            max_concurrency=max_concurrency,
+        )
+
+    @property
+    def model_reference(self) -> ModelReference:
+        """Return the exact model identity stored beside every vector."""
+        return self._model_reference
+
+    @property
+    def dimension(self) -> int:
+        """Return the configured Matryoshka output dimension."""
+        return self._dimension
+
+    @property
+    def space_reference(self) -> EmbeddingSpaceReference:
+        """Return the exact aligned space used for cross-model search."""
+        return self._space_reference
+
+    @trace_operation("mindbridge.model.encode_queries")
+    async def encode_queries(
+        self,
+        inputs: tuple[EmbeddingInput, ...],
+    ) -> tuple[tuple[float, ...], ...]:
+        """Encode retrieval queries with the upstream query prompt semantics."""
+        return await self._encode(inputs, self._encoder.encode_query)
+
+    @trace_operation("mindbridge.model.encode_documents")
+    async def encode_documents(
+        self,
+        inputs: tuple[EmbeddingInput, ...],
+    ) -> tuple[tuple[float, ...], ...]:
+        """Encode index documents with the upstream document prompt semantics."""
+        return await self._encode(inputs, self._encoder.encode_document)
+
+    async def _encode(
+        self,
+        inputs: tuple[EmbeddingInput, ...],
+        encode: Callable[..., _EmbeddingMatrix],
+    ) -> tuple[tuple[float, ...], ...]:
+        if not inputs:
+            return ()
+        set_current_span_attributes(
+            {
+                "mindbridge.model.id": self._model_reference.model_id,
+                "mindbridge.model.revision": self._model_reference.revision,
+                "mindbridge.embedding.dimension": self._dimension,
+                "mindbridge.embedding.input_count": len(inputs),
+            }
+        )
+        async with self._semaphore:
+            matrix = await asyncio.to_thread(
+                encode,
+                cast(list[object], list(inputs)),
+                convert_to_numpy=True,
+                normalize_embeddings=True,
+                truncate_dim=self._dimension,
+            )
+        vectors = tuple(tuple(float(value) for value in row) for row in matrix.tolist())
+        if len(vectors) != len(inputs):
+            raise ModelOutputError("embedding batch size does not match its inputs")
+        for vector in vectors:
+            validate_jina_embedding(vector, self._dimension)
+        return vectors
+
+
+def validate_jina_embedding(values: tuple[float, ...], dimension: int) -> None:
+    """Reject malformed vectors before they cross into a versioned index."""
+    if len(values) != dimension or not all(math.isfinite(value) for value in values):
+        raise ModelOutputError("embedding vector has invalid dimension or values")
+    norm = math.sqrt(sum(value * value for value in values))
+    if not math.isclose(norm, 1.0, rel_tol=1e-4, abs_tol=1e-6):
+        raise ModelOutputError("embedding vector is not L2-normalized")

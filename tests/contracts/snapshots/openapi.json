@@ -1,0 +1,2072 @@
+{
+  "components": {
+    "schemas": {
+      "DeletionPage": {
+        "additionalProperties": false,
+        "description": "Stable ordered tombstones and the next cursor when another page exists.",
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/DeletionTombstoneView"
+            },
+            "title": "Items",
+            "type": "array"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "maxLength": 255,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
+          },
+          "trace_id": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Trace Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "items",
+          "next_cursor",
+          "trace_id"
+        ],
+        "title": "DeletionPage",
+        "type": "object"
+      },
+      "DeletionPropagationState": {
+        "description": "Recoverable progress across PostgreSQL, S3, and offline edge devices.",
+        "enum": [
+          "pending",
+          "propagating",
+          "complete",
+          "failed"
+        ],
+        "title": "DeletionPropagationState",
+        "type": "string"
+      },
+      "DeletionTombstoneView": {
+        "additionalProperties": false,
+        "description": "Content-free deletion state safe to retain after physical erasure.",
+        "properties": {
+          "completed_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Completed At"
+          },
+          "error_code": {
+            "anyOf": [
+              {
+                "maxLength": 255,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Code"
+          },
+          "propagation_state": {
+            "$ref": "#/components/schemas/DeletionPropagationState"
+          },
+          "requested_at": {
+            "format": "date-time",
+            "title": "Requested At",
+            "type": "string"
+          },
+          "target_id": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Target Id",
+            "type": "string"
+          },
+          "target_type": {
+            "$ref": "#/components/schemas/ForgetTargetType"
+          },
+          "tombstone_id": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Tombstone Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "tombstone_id",
+          "target_type",
+          "target_id",
+          "propagation_state",
+          "requested_at",
+          "completed_at",
+          "error_code"
+        ],
+        "title": "DeletionTombstoneView",
+        "type": "object"
+      },
+      "EvidenceView": {
+        "additionalProperties": false,
+        "description": "Precise evidence location safe to expose to a caller.",
+        "properties": {
+          "end_ms": {
+            "minimum": 0.0,
+            "title": "End Ms",
+            "type": "integer"
+          },
+          "evidence_id": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Evidence Id",
+            "type": "string"
+          },
+          "media_object_id": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Media Object Id",
+            "type": "string"
+          },
+          "media_url": {
+            "maxLength": 2048,
+            "minLength": 1,
+            "title": "Media Url",
+            "type": "string"
+          },
+          "media_url_expires_at": {
+            "format": "date-time",
+            "title": "Media Url Expires At",
+            "type": "string"
+          },
+          "start_ms": {
+            "minimum": 0.0,
+            "title": "Start Ms",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "evidence_id",
+          "media_object_id",
+          "start_ms",
+          "end_ms",
+          "media_url",
+          "media_url_expires_at"
+        ],
+        "title": "EvidenceView",
+        "type": "object"
+      },
+      "FeedbackReceipt": {
+        "additionalProperties": false,
+        "description": "Durable feedback result and resulting transparent lifecycle state.",
+        "properties": {
+          "corrected_memory_id": {
+            "anyOf": [
+              {
+                "maxLength": 255,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Corrected Memory Id"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "feedback_id": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Feedback Id",
+            "type": "string"
+          },
+          "feedback_type": {
+            "$ref": "#/components/schemas/FeedbackType"
+          },
+          "memory_id": {
+            "anyOf": [
+              {
+                "maxLength": 255,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Memory Id"
+          },
+          "resulting_state": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/MemoryState"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "resulting_strength": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Resulting Strength"
+          },
+          "trace_id": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Trace Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "feedback_id",
+          "feedback_type",
+          "memory_id",
+          "corrected_memory_id",
+          "resulting_state",
+          "resulting_strength",
+          "created_at",
+          "trace_id"
+        ],
+        "title": "FeedbackReceipt",
+        "type": "object"
+      },
+      "FeedbackRequest": {
+        "additionalProperties": false,
+        "description": "Record useful, wrong, missing, or corrected recall feedback.",
+        "properties": {
+          "correction_summary": {
+            "anyOf": [
+              {
+                "maxLength": 2048,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Correction Summary"
+          },
+          "feedback_type": {
+            "$ref": "#/components/schemas/FeedbackType"
+          },
+          "idempotency_key": {
+            "anyOf": [
+              {
+                "maxLength": 255,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Idempotency Key"
+          },
+          "memory_id": {
+            "anyOf": [
+              {
+                "maxLength": 255,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Memory Id"
+          },
+          "recall_trace_id": {
+            "anyOf": [
+              {
+                "maxLength": 255,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Recall Trace Id"
+          },
+          "tenant_id": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Tenant Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "tenant_id",
+          "feedback_type"
+        ],
+        "title": "FeedbackRequest",
+        "type": "object"
+      },
+      "FeedbackType": {
+        "description": "Supported user or Agent signals about a recall result.",
+        "enum": [
+          "useful",
+          "wrong",
+          "missing",
+          "correction"
+        ],
+        "title": "FeedbackType",
+        "type": "string"
+      },
+      "ForgetReceipt": {
+        "additionalProperties": false,
+        "description": "Deletion result returned by one command or status lookup.",
+        "properties": {
+          "completed_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Completed At"
+          },
+          "error_code": {
+            "anyOf": [
+              {
+                "maxLength": 255,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Code"
+          },
+          "propagation_state": {
+            "$ref": "#/components/schemas/DeletionPropagationState"
+          },
+          "requested_at": {
+            "format": "date-time",
+            "title": "Requested At",
+            "type": "string"
+          },
+          "target_id": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Target Id",
+            "type": "string"
+          },
+          "target_type": {
+            "$ref": "#/components/schemas/ForgetTargetType"
+          },
+          "tombstone_id": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Tombstone Id",
+            "type": "string"
+          },
+          "trace_id": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Trace Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "tombstone_id",
+          "target_type",
+          "target_id",
+          "propagation_state",
+          "requested_at",
+          "completed_at",
+          "error_code",
+          "trace_id"
+        ],
+        "title": "ForgetReceipt",
+        "type": "object"
+      },
+      "ForgetRequest": {
+        "additionalProperties": false,
+        "description": "Explicitly delete one exact memory or its complete source observation.",
+        "properties": {
+          "idempotency_key": {
+            "anyOf": [
+              {
+                "maxLength": 255,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Idempotency Key"
+          },
+          "target_id": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Target Id",
+            "type": "string"
+          },
+          "target_type": {
+            "$ref": "#/components/schemas/ForgetTargetType"
+          },
+          "tenant_id": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Tenant Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "tenant_id",
+          "target_type",
+          "target_id"
+        ],
+        "title": "ForgetRequest",
+        "type": "object"
+      },
+      "ForgetTargetType": {
+        "description": "Exact deletion scopes supported by the first production path.",
+        "enum": [
+          "memory_record",
+          "observation"
+        ],
+        "title": "ForgetTargetType",
+        "type": "string"
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "title": "Detail",
+            "type": "array"
+          }
+        },
+        "title": "HTTPValidationError",
+        "type": "object"
+      },
+      "HealthResponse": {
+        "additionalProperties": false,
+        "description": "Liveness response that does not claim dependency readiness.",
+        "properties": {
+          "status": {
+            "default": "ok",
+            "title": "Status",
+            "type": "string"
+          },
+          "trace_id": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Trace Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "trace_id"
+        ],
+        "title": "HealthResponse",
+        "type": "object"
+      },
+      "IdentityKind": {
+        "description": "Biometric modality used only to create a device-domain anonymous identity.",
+        "enum": [
+          "face",
+          "voice"
+        ],
+        "title": "IdentityKind",
+        "type": "string"
+      },
+      "IdentityObservationInput": {
+        "additionalProperties": false,
+        "description": "Anonymous edge identity metadata with no face or voice embedding.",
+        "properties": {
+          "confidence": {
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Confidence",
+            "type": "number"
+          },
+          "end_ms": {
+            "minimum": 0.0,
+            "title": "End Ms",
+            "type": "integer"
+          },
+          "identity_id": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Identity Id",
+            "type": "string"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/IdentityKind"
+          },
+          "model_id": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Model Id",
+            "type": "string"
+          },
+          "model_revision": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Model Revision",
+            "type": "string"
+          },
+          "scope": {
+            "$ref": "#/components/schemas/IdentityScope",
+            "default": "device"
+          },
+          "start_ms": {
+            "minimum": 0.0,
+            "title": "Start Ms",
+            "type": "integer"
+          },
+          "transcript": {
+            "anyOf": [
+              {
+                "maxLength": 2048,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Transcript"
+          },
+          "visual_bbox_xyxy": {
+            "anyOf": [
+              {
+                "maxItems": 4,
+                "minItems": 4,
+                "prefixItems": [
+                  {
+                    "maximum": 1.0,
+                    "minimum": 0.0,
+                    "type": "number"
+                  },
+                  {
+                    "maximum": 1.0,
+                    "minimum": 0.0,
+                    "type": "number"
+                  },
+                  {
+                    "maximum": 1.0,
+                    "minimum": 0.0,
+                    "type": "number"
+                  },
+                  {
+                    "maximum": 1.0,
+                    "minimum": 0.0,
+                    "type": "number"
+                  }
+                ],
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Visual Bbox Xyxy"
+          }
+        },
+        "required": [
+          "identity_id",
+          "kind",
+          "start_ms",
+          "end_ms",
+          "confidence",
+          "model_id",
+          "model_revision"
+        ],
+        "title": "IdentityObservationInput",
+        "type": "object"
+      },
+      "IdentityScope": {
+        "description": "How long an anonymous identity is safe to reuse.",
+        "enum": [
+          "device",
+          "observation"
+        ],
+        "title": "IdentityScope",
+        "type": "string"
+      },
+      "JobState": {
+        "description": "Persisted observation processing states.",
+        "enum": [
+          "pending",
+          "running",
+          "succeeded",
+          "failed"
+        ],
+        "title": "JobState",
+        "type": "string"
+      },
+      "MediaKind": {
+        "description": "Supported raw or derived media kinds.",
+        "enum": [
+          "image",
+          "video",
+          "audio"
+        ],
+        "title": "MediaKind",
+        "type": "string"
+      },
+      "MediaObjectInput": {
+        "additionalProperties": false,
+        "description": "Metadata for an already addressable evidence object.",
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "duration_ms": {
+            "anyOf": [
+              {
+                "maximum": 9.223372036854776e+18,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Duration Ms"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/MediaKind"
+          },
+          "media_object_id": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Media Object Id",
+            "type": "string"
+          },
+          "sha256": {
+            "pattern": "^[0-9a-fA-F]{64}$",
+            "title": "Sha256",
+            "type": "string"
+          },
+          "size_bytes": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "Size Bytes",
+            "type": "integer"
+          },
+          "uri": {
+            "maxLength": 2048,
+            "minLength": 1,
+            "title": "Uri",
+            "type": "string"
+          }
+        },
+        "required": [
+          "media_object_id",
+          "kind",
+          "uri",
+          "sha256",
+          "size_bytes",
+          "created_at"
+        ],
+        "title": "MediaObjectInput",
+        "type": "object"
+      },
+      "MemoryResult": {
+        "additionalProperties": false,
+        "description": "Top-level memory response with directly inspectable evidence.",
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "ended_at": {
+            "format": "date-time",
+            "title": "Ended At",
+            "type": "string"
+          },
+          "evidence": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/EvidenceView"
+            },
+            "title": "Evidence",
+            "type": "array"
+          },
+          "evidence_ids": {
+            "items": {
+              "maxLength": 255,
+              "minLength": 1,
+              "type": "string"
+            },
+            "title": "Evidence Ids",
+            "type": "array"
+          },
+          "last_accessed_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Accessed At"
+          },
+          "memory_id": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Memory Id",
+            "type": "string"
+          },
+          "memory_type": {
+            "$ref": "#/components/schemas/MemoryType"
+          },
+          "negative_feedback_count": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Negative Feedback Count",
+            "type": "integer"
+          },
+          "occurred_at": {
+            "format": "date-time",
+            "title": "Occurred At",
+            "type": "string"
+          },
+          "positive_feedback_count": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Positive Feedback Count",
+            "type": "integer"
+          },
+          "salience": {
+            "default": 0.5,
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Salience",
+            "type": "number"
+          },
+          "state": {
+            "$ref": "#/components/schemas/MemoryState"
+          },
+          "strength": {
+            "default": 0.5,
+            "title": "Strength",
+            "type": "number"
+          },
+          "summary": {
+            "maxLength": 2048,
+            "minLength": 1,
+            "title": "Summary",
+            "type": "string"
+          },
+          "superseded_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Superseded At"
+          },
+          "supersedes_memory_id": {
+            "anyOf": [
+              {
+                "maxLength": 255,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Supersedes Memory Id"
+          },
+          "trace_id": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Trace Id",
+            "type": "string"
+          },
+          "useful_access_count": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Useful Access Count",
+            "type": "integer"
+          },
+          "verification_status": {
+            "$ref": "#/components/schemas/VerificationStatus"
+          }
+        },
+        "required": [
+          "memory_id",
+          "memory_type",
+          "summary",
+          "evidence_ids",
+          "occurred_at",
+          "ended_at",
+          "created_at",
+          "verification_status",
+          "state",
+          "trace_id"
+        ],
+        "title": "MemoryResult",
+        "type": "object"
+      },
+      "MemoryState": {
+        "description": "Retained states; explicit deletion is represented by a tombstone.",
+        "enum": [
+          "active",
+          "strengthened",
+          "cold",
+          "compressed"
+        ],
+        "title": "MemoryState",
+        "type": "string"
+      },
+      "MemoryType": {
+        "description": "Long-term role a memory serves.",
+        "enum": [
+          "perceptual",
+          "working",
+          "episodic",
+          "semantic",
+          "procedural",
+          "prospective"
+        ],
+        "title": "MemoryType",
+        "type": "string"
+      },
+      "MemoryView": {
+        "additionalProperties": false,
+        "description": "Serializable stable view of a retained memory.",
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "ended_at": {
+            "format": "date-time",
+            "title": "Ended At",
+            "type": "string"
+          },
+          "evidence_ids": {
+            "items": {
+              "maxLength": 255,
+              "minLength": 1,
+              "type": "string"
+            },
+            "title": "Evidence Ids",
+            "type": "array"
+          },
+          "last_accessed_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Accessed At"
+          },
+          "memory_id": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Memory Id",
+            "type": "string"
+          },
+          "memory_type": {
+            "$ref": "#/components/schemas/MemoryType"
+          },
+          "negative_feedback_count": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Negative Feedback Count",
+            "type": "integer"
+          },
+          "occurred_at": {
+            "format": "date-time",
+            "title": "Occurred At",
+            "type": "string"
+          },
+          "positive_feedback_count": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Positive Feedback Count",
+            "type": "integer"
+          },
+          "salience": {
+            "default": 0.5,
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Salience",
+            "type": "number"
+          },
+          "state": {
+            "$ref": "#/components/schemas/MemoryState"
+          },
+          "strength": {
+            "default": 0.5,
+            "title": "Strength",
+            "type": "number"
+          },
+          "summary": {
+            "maxLength": 2048,
+            "minLength": 1,
+            "title": "Summary",
+            "type": "string"
+          },
+          "superseded_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Superseded At"
+          },
+          "supersedes_memory_id": {
+            "anyOf": [
+              {
+                "maxLength": 255,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Supersedes Memory Id"
+          },
+          "useful_access_count": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Useful Access Count",
+            "type": "integer"
+          },
+          "verification_status": {
+            "$ref": "#/components/schemas/VerificationStatus"
+          }
+        },
+        "required": [
+          "memory_id",
+          "memory_type",
+          "summary",
+          "evidence_ids",
+          "occurred_at",
+          "ended_at",
+          "created_at",
+          "verification_status",
+          "state"
+        ],
+        "title": "MemoryView",
+        "type": "object"
+      },
+      "ObservationProcessingJobView": {
+        "additionalProperties": false,
+        "description": "Public state of one durable observation processing job.",
+        "properties": {
+          "attempt": {
+            "minimum": 0.0,
+            "title": "Attempt",
+            "type": "integer"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "error_code": {
+            "anyOf": [
+              {
+                "maxLength": 255,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Code"
+          },
+          "job_id": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Job Id",
+            "type": "string"
+          },
+          "memory_ids": {
+            "default": [],
+            "items": {
+              "maxLength": 255,
+              "minLength": 1,
+              "type": "string"
+            },
+            "title": "Memory Ids",
+            "type": "array"
+          },
+          "observation_id": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Observation Id",
+            "type": "string"
+          },
+          "state": {
+            "$ref": "#/components/schemas/JobState"
+          },
+          "trace_id": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Trace Id",
+            "type": "string"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "title": "Updated At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "job_id",
+          "observation_id",
+          "state",
+          "attempt",
+          "error_code",
+          "created_at",
+          "updated_at",
+          "trace_id"
+        ],
+        "title": "ObservationProcessingJobView",
+        "type": "object"
+      },
+      "ObservationReceipt": {
+        "additionalProperties": false,
+        "description": "Retry-safe acknowledgement for an observation.",
+        "properties": {
+          "evidence_ids": {
+            "default": [],
+            "items": {
+              "maxLength": 255,
+              "minLength": 1,
+              "type": "string"
+            },
+            "title": "Evidence Ids",
+            "type": "array"
+          },
+          "idempotency_key": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Idempotency Key",
+            "type": "string"
+          },
+          "observation_id": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Observation Id",
+            "type": "string"
+          },
+          "processing_job_id": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Processing Job Id",
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/ObservationStatus"
+          },
+          "trace_id": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Trace Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "observation_id",
+          "processing_job_id",
+          "idempotency_key",
+          "status",
+          "trace_id"
+        ],
+        "title": "ObservationReceipt",
+        "type": "object"
+      },
+      "ObservationStatus": {
+        "description": "Ingestion outcome returned to a retrying edge device.",
+        "enum": [
+          "accepted",
+          "duplicate"
+        ],
+        "title": "ObservationStatus",
+        "type": "string"
+      },
+      "ObserveRequest": {
+        "additionalProperties": false,
+        "description": "Submit one timestamped device observation and its media metadata.",
+        "properties": {
+          "boot_id": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Boot Id",
+            "type": "string"
+          },
+          "clock_offset_ms": {
+            "default": 0,
+            "maximum": 2147483647.0,
+            "minimum": -2147483648.0,
+            "title": "Clock Offset Ms",
+            "type": "integer"
+          },
+          "device_id": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Device Id",
+            "type": "string"
+          },
+          "ended_at": {
+            "format": "date-time",
+            "title": "Ended At",
+            "type": "string"
+          },
+          "idempotency_key": {
+            "anyOf": [
+              {
+                "maxLength": 255,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Idempotency Key"
+          },
+          "identity_observations": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/IdentityObservationInput"
+            },
+            "maxItems": 512,
+            "title": "Identity Observations",
+            "type": "array"
+          },
+          "media_objects": {
+            "items": {
+              "$ref": "#/components/schemas/MediaObjectInput"
+            },
+            "maxItems": 8,
+            "minItems": 1,
+            "title": "Media Objects",
+            "type": "array"
+          },
+          "observed_at": {
+            "format": "date-time",
+            "title": "Observed At",
+            "type": "string"
+          },
+          "occurred_at": {
+            "format": "date-time",
+            "title": "Occurred At",
+            "type": "string"
+          },
+          "sensor": {
+            "$ref": "#/components/schemas/SensorKind"
+          },
+          "sequence": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "Sequence",
+            "type": "integer"
+          },
+          "tenant_id": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Tenant Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "tenant_id",
+          "device_id",
+          "boot_id",
+          "sequence",
+          "sensor",
+          "media_objects",
+          "occurred_at",
+          "ended_at",
+          "observed_at"
+        ],
+        "title": "ObserveRequest",
+        "type": "object"
+      },
+      "RecallFilters": {
+        "additionalProperties": false,
+        "description": "Structured constraints applied before semantic ranking.",
+        "properties": {
+          "device_ids": {
+            "default": [],
+            "items": {
+              "maxLength": 255,
+              "minLength": 1,
+              "type": "string"
+            },
+            "maxItems": 100,
+            "title": "Device Ids",
+            "type": "array"
+          },
+          "memory_types": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/MemoryType"
+            },
+            "maxItems": 6,
+            "title": "Memory Types",
+            "type": "array"
+          },
+          "occurred_after": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Occurred After"
+          },
+          "occurred_before": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Occurred Before"
+          },
+          "person_ids": {
+            "default": [],
+            "items": {
+              "maxLength": 255,
+              "minLength": 1,
+              "type": "string"
+            },
+            "maxItems": 100,
+            "title": "Person Ids",
+            "type": "array"
+          }
+        },
+        "title": "RecallFilters",
+        "type": "object"
+      },
+      "RecallMode": {
+        "description": "Supported recall result shapes.",
+        "enum": [
+          "answer",
+          "search",
+          "enumerate"
+        ],
+        "title": "RecallMode",
+        "type": "string"
+      },
+      "RecallQuery": {
+        "additionalProperties": false,
+        "description": "Text, media, or both used to find relevant experience.",
+        "properties": {
+          "media_object_ids": {
+            "default": [],
+            "items": {
+              "maxLength": 255,
+              "minLength": 1,
+              "type": "string"
+            },
+            "maxItems": 8,
+            "title": "Media Object Ids",
+            "type": "array"
+          },
+          "text": {
+            "anyOf": [
+              {
+                "maxLength": 2048,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Text"
+          }
+        },
+        "title": "RecallQuery",
+        "type": "object"
+      },
+      "RecallRequest": {
+        "additionalProperties": false,
+        "description": "Recall relevant memories and, by default, their evidence.",
+        "properties": {
+          "filters": {
+            "$ref": "#/components/schemas/RecallFilters"
+          },
+          "include_evidence": {
+            "default": true,
+            "title": "Include Evidence",
+            "type": "boolean"
+          },
+          "limit": {
+            "default": 20,
+            "maximum": 100.0,
+            "minimum": 1.0,
+            "title": "Limit",
+            "type": "integer"
+          },
+          "memory_ids": {
+            "default": [],
+            "items": {
+              "maxLength": 255,
+              "minLength": 1,
+              "type": "string"
+            },
+            "maxItems": 100,
+            "title": "Memory Ids",
+            "type": "array"
+          },
+          "mode": {
+            "$ref": "#/components/schemas/RecallMode",
+            "default": "answer"
+          },
+          "query": {
+            "$ref": "#/components/schemas/RecallQuery"
+          },
+          "tenant_id": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Tenant Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "tenant_id",
+          "query"
+        ],
+        "title": "RecallRequest",
+        "type": "object"
+      },
+      "RecallResult": {
+        "additionalProperties": false,
+        "description": "Answer plus the memory and evidence needed to verify it.",
+        "properties": {
+          "answer": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Answer"
+          },
+          "confidence": {
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Confidence",
+            "type": "number"
+          },
+          "evidence": {
+            "items": {
+              "$ref": "#/components/schemas/EvidenceView"
+            },
+            "title": "Evidence",
+            "type": "array"
+          },
+          "memories": {
+            "items": {
+              "$ref": "#/components/schemas/MemoryView"
+            },
+            "title": "Memories",
+            "type": "array"
+          },
+          "trace_id": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Trace Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "answer",
+          "confidence",
+          "memories",
+          "evidence",
+          "trace_id"
+        ],
+        "title": "RecallResult",
+        "type": "object"
+      },
+      "RememberRequest": {
+        "additionalProperties": false,
+        "description": "Explicitly retain user- or agent-supplied content.",
+        "properties": {
+          "ended_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ended At"
+          },
+          "evidence_ids": {
+            "default": [],
+            "items": {
+              "maxLength": 255,
+              "minLength": 1,
+              "type": "string"
+            },
+            "maxItems": 100,
+            "title": "Evidence Ids",
+            "type": "array"
+          },
+          "idempotency_key": {
+            "anyOf": [
+              {
+                "maxLength": 255,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Idempotency Key"
+          },
+          "memory_type": {
+            "$ref": "#/components/schemas/MemoryType"
+          },
+          "occurred_at": {
+            "format": "date-time",
+            "title": "Occurred At",
+            "type": "string"
+          },
+          "summary": {
+            "maxLength": 2048,
+            "minLength": 1,
+            "title": "Summary",
+            "type": "string"
+          },
+          "tenant_id": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Tenant Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "tenant_id",
+          "summary",
+          "memory_type",
+          "occurred_at"
+        ],
+        "title": "RememberRequest",
+        "type": "object"
+      },
+      "SensorKind": {
+        "description": "Sensor that produced an observation.",
+        "enum": [
+          "camera",
+          "microphone",
+          "gaze",
+          "imu",
+          "robot_state"
+        ],
+        "title": "SensorKind",
+        "type": "string"
+      },
+      "ValidationError": {
+        "properties": {
+          "ctx": {
+            "title": "Context",
+            "type": "object"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "title": "Location",
+            "type": "array"
+          },
+          "msg": {
+            "title": "Message",
+            "type": "string"
+          },
+          "type": {
+            "title": "Error Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError",
+        "type": "object"
+      },
+      "VerificationStatus": {
+        "description": "How a record is supported without conflating reports and observations.",
+        "enum": [
+          "verified",
+          "attested",
+          "unverified"
+        ],
+        "title": "VerificationStatus",
+        "type": "string"
+      }
+    },
+    "securitySchemes": {
+      "HTTPBearer": {
+        "scheme": "bearer",
+        "type": "http"
+      }
+    }
+  },
+  "info": {
+    "title": "MindBridge",
+    "version": "0.1.0"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/healthz": {
+      "get": {
+        "operationId": "health",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Health"
+      }
+    },
+    "/v1/deletions": {
+      "get": {
+        "operationId": "listDeletions",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "tenant_id",
+            "required": true,
+            "schema": {
+              "maxLength": 255,
+              "minLength": 1,
+              "title": "Tenant Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 255,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 100,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeletionPage"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "List Deletions"
+      }
+    },
+    "/v1/deletions/{tombstone_id}": {
+      "get": {
+        "operationId": "getForgetStatus",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "tombstone_id",
+            "required": true,
+            "schema": {
+              "maxLength": 255,
+              "minLength": 1,
+              "title": "Tombstone Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "tenant_id",
+            "required": true,
+            "schema": {
+              "maxLength": 255,
+              "minLength": 1,
+              "title": "Tenant Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ForgetReceipt"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Get Forget Status"
+      }
+    },
+    "/v1/feedback": {
+      "post": {
+        "operationId": "recordFeedback",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FeedbackRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FeedbackReceipt"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Record Feedback"
+      }
+    },
+    "/v1/forget": {
+      "post": {
+        "operationId": "forget",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ForgetRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ForgetReceipt"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Forget"
+      }
+    },
+    "/v1/jobs/{job_id}": {
+      "get": {
+        "operationId": "getObservationJob",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "maxLength": 255,
+              "minLength": 1,
+              "title": "Job Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "tenant_id",
+            "required": true,
+            "schema": {
+              "maxLength": 255,
+              "minLength": 1,
+              "title": "Tenant Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ObservationProcessingJobView"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Get Observation Job"
+      }
+    },
+    "/v1/memories": {
+      "post": {
+        "operationId": "remember",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RememberRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryResult"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Remember"
+      }
+    },
+    "/v1/memories/{memory_id}": {
+      "get": {
+        "operationId": "getMemory",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "memory_id",
+            "required": true,
+            "schema": {
+              "maxLength": 255,
+              "minLength": 1,
+              "title": "Memory Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "tenant_id",
+            "required": true,
+            "schema": {
+              "maxLength": 255,
+              "minLength": 1,
+              "title": "Tenant Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryResult"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Get Memory"
+      }
+    },
+    "/v1/observations": {
+      "post": {
+        "operationId": "observe",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ObserveRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ObservationReceipt"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Observe"
+      }
+    },
+    "/v1/recall": {
+      "post": {
+        "operationId": "recall",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RecallRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RecallResult"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Recall"
+      }
+    }
+  }
+}

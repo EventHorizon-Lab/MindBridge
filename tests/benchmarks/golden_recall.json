@@ -1,0 +1,61 @@
+{
+  "cases": [
+    {
+      "expected_answer": "The robot placed the red screwdriver beside the blue toolbox.",
+      "expected_evidence_count": 1,
+      "expected_memory_ids": [
+        "memory_visual_red_tool"
+      ],
+      "name": "dense_visual_evidence",
+      "occurred_after": null,
+      "query_axis": 0,
+      "text": "scarlet implement location"
+    },
+    {
+      "expected_answer": "The visible equipment label is ZX-490.",
+      "expected_evidence_count": 0,
+      "expected_memory_ids": [
+        "memory_exact_serial"
+      ],
+      "name": "exact_sparse_text",
+      "occurred_after": null,
+      "query_axis": -1,
+      "text": "ZX-490"
+    },
+    {
+      "expected_answer": null,
+      "expected_evidence_count": 0,
+      "expected_memory_ids": [],
+      "name": "unrelated_query_abstains",
+      "occurred_after": null,
+      "query_axis": -1,
+      "text": "moon rock color"
+    },
+    {
+      "expected_answer": null,
+      "expected_evidence_count": 0,
+      "expected_memory_ids": [],
+      "name": "structured_time_filter_wins",
+      "occurred_after": "2026-08-13T00:00:00Z",
+      "query_axis": 0,
+      "text": "scarlet implement location"
+    }
+  ],
+  "memories": [
+    {
+      "memory_id": "memory_visual_red_tool",
+      "memory_type": "episodic",
+      "occurred_at": "2026-08-12T10:00:00Z",
+      "source": "video",
+      "summary": "The robot placed the red screwdriver beside the blue toolbox."
+    },
+    {
+      "memory_id": "memory_exact_serial",
+      "memory_type": "semantic",
+      "occurred_at": "2026-08-12T11:00:00Z",
+      "source": "attested",
+      "summary": "The visible equipment label is ZX-490."
+    }
+  ],
+  "version": 1
+}
