@@ -24,9 +24,9 @@ from mindbridge.benchmarks.prompts import EGOMEM_REASON_QUERY_PROMPT
 from mindbridge.benchmarks.runtime import (
     OPTION_LABELS,
     benchmark_tenant_id,
+    ingest_media,
     multiple_choice_query,
     parse_option_ranking,
-    wait_for_observation_job,
 )
 from mindbridge.contracts import (
     ContractModel,
@@ -325,7 +325,8 @@ async def _ingest_clip(
         source_key = f"day:{clip.day}:clip:{clip.start_timecode}"
         evidence_ids: tuple[str, ...] = ()
         if clip.media_object is not None:
-            receipt = await memory.observe(
+            evidence_ids = await ingest_media(
+                memory,
                 ObserveRequest(
                     tenant_id=tenant_id,
                     device_id=device_id,
@@ -337,15 +338,9 @@ async def _ingest_clip(
                     ended_at=ended_at,
                     observed_at=ended_at,
                     idempotency_key=(f"{adapter_version}:{prepared.subject_id}:{source_key}:media"),
-                )
-            )
-            evidence_ids = receipt.evidence_ids
-            await wait_for_observation_job(
-                memory,
-                tenant_id,
-                receipt.processing_job_id,
+                ),
                 poll_interval_seconds=poll_interval_seconds,
-                timeout_seconds=processing_timeout_seconds,
+                processing_timeout_seconds=processing_timeout_seconds,
             )
         if clip.caption is not None:
             for suffix, summary in _caption_memories(clip.caption):
