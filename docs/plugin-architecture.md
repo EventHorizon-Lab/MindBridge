@@ -1,8 +1,14 @@
 # MindBridge Plugin Architecture
 
-MindBridge exposes three model capabilities: `Generator`, `Embedder`, and `Reranker`. They are the
+MindBridge exposes two model capabilities: `Generator` and `Embedder`. They are the
 only model-level extension points. Provider names, deployment tiers, and product tasks do not create
 new capability interfaces.
+
+A capability exists once a real implementation does. The former `Reranker` capability was removed
+because it never had one: only a protocol, three configuration fields, and one call branch. Ranking
+is currently owned by the application (reciprocal rank fusion plus frozen-model evidence
+inspection). Reranking returns as an explicit additive protocol change when a bake-off produces a
+model worth serving.
 
 ## Boundary
 
@@ -11,16 +17,14 @@ flowchart LR
     API["REST · MCP · Worker"] --> PIPE["MindBridge pipelines"]
     PIPE --> GEN["Generator"]
     PIPE --> EMB["Embedder"]
-    PIPE --> RERANK["Reranker (optional)"]
     GEN --> PROVIDERS["Provider or local adapters"]
     EMB --> PROVIDERS
-    RERANK --> PROVIDERS
 ```
 
 The application owns the meaning of Answer, Occurrence, Perception, Episode, Claim, and Summary.
 Those pipelines consume `Generator`; they are never implemented by `OpenAIAnswerer`,
 `GeminiPerceiver`, or another provider-specific task class. Retrieval consumes one `Embedder` for
-both query and document tasks and may consume one `Reranker`.
+both query and document tasks.
 
 The application owns these ports in `mindbridge.application.capabilities`; the stable plugin-author
 surface re-exports them from `mindbridge.models`:
@@ -33,9 +37,6 @@ from mindbridge.models import (
     Generator,
     GenerateRequest,
     GenerateResult,
-    Reranker,
-    RerankRequest,
-    RerankResult,
 )
 ```
 
@@ -53,7 +54,6 @@ process composition time:
 | --- | --- | --- |
 | Generation | `mindbridge.generators` | `Generator` |
 | Embedding | `mindbridge.embedders` | `Embedder` |
-| Reranking | `mindbridge.rerankers` | `Reranker` |
 
 A third-party package can expose an adapter without changing MindBridge:
 
@@ -91,7 +91,7 @@ MindBridge ships these adapters:
 | `openai` | Embedder | Aligned query/document OpenAI-compatible embedding endpoints |
 | `jina` | Embedder | Local Hugging Face Jina v5 Omni embedding |
 
-Anthropic, Gemini, local runtimes, and experimental rerankers belong in provider packages using the
+Anthropic, Gemini, and local runtimes belong in provider packages using the
 same entry points. Adding one does not add a new MindBridge pipeline or public task API.
 
 ## Configuration
@@ -104,8 +104,6 @@ MINDBRIDGE_GENERATOR_PLUGIN
 MINDBRIDGE_GENERATOR_CONFIG_JSON
 MINDBRIDGE_EMBEDDER_PLUGIN
 MINDBRIDGE_EMBEDDER_CONFIG_JSON
-MINDBRIDGE_RERANKER_PLUGIN
-MINDBRIDGE_RERANKER_CONFIG_JSON
 ```
 
 The bundled defaults also accept documented provider-specific environment variables so a normal

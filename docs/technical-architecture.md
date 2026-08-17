@@ -45,7 +45,7 @@ MindBridge 不是机器人、Agent 或大模型。MindBridge 是**记忆本身**
 4. **非参数演化**：系统通过记忆状态、索引、实体原型、召回统计、反馈和生命周期策略自学习，而不是修改模型参数。
 5. **生态优先**：优先使用官方 SDK、Hugging Face、目标平台厂商原生栈、OpenAI-compatible、PostgreSQL 等成熟生态，不重复实现通用能力。
 6. **轻量起步**：首版采用模块化单体、异步 Worker 和一套主数据库；只有实际指标证明不足时才拆分。
-7. **原子能力插件**：模型层只保留 `Generator`、`Embedder`、`Reranker` 三个插口；供应商只实现 Adapter，Answer、Perception 等任务语义留在 MindBridge。
+7. **原子能力插件**：模型层只保留 `Generator`、`Embedder` 两个插口；供应商只实现 Adapter，Answer、Perception 等任务语义留在 MindBridge。插口的数量由真实实现决定，不为规划中的能力预留空协议。
 8. **当前阶段效果优先**：当前研究与效果验证不以 License 作为候选过滤条件，代码和模型只要有助于能力即可复用；仍记录来源、精确 revision 和工件 hash，商业发布前再单独完成合规审查。
 9. **Code is the Product**：代码本身就是产品，不是产品的副产物。每写一行都必须当场回答三个问题——
    这一行是否必要？是否简洁优雅？是否易读易维护？答不上来就不写。MindBridge **不以代码行数衡量
@@ -97,7 +97,7 @@ flowchart LR
         KERNEL["Memory Kernel\nepisode · entity · claim · provenance"]
         LIFECYCLE["Lifecycle Engine\nconsolidate · strengthen · correct · forget"]
         PG["PostgreSQL + pgvector\nmetadata · vector · text · relation · time"]
-        RECALL["Recall Engine\nhybrid retrieve · fuse · rerank · inspect"]
+        RECALL["Recall Engine\nhybrid retrieve · fuse · inspect"]
         OMNI["Frozen Omni / VLM\nperception · evidence inspection · answer"]
 
         INGEST --> OBJECTS
@@ -389,13 +389,16 @@ watermark 只表示该 boot 已确认的最大序号，不充当逐条回执；�
 ### 6.1 原子能力与默认配置
 
 MindBridge 采用“极简核心、直接配置、保存版本、允许重建”的策略。模型不微调，也不建立
-`AutoModelFor...`、Profile、供应商任务类或多层 Registry。公共模型层只有三个运行时协议：
+`AutoModelFor...`、Profile、供应商任务类或多层 Registry。公共模型层只有两个运行时协议：
 
 | 插口 | 唯一操作 | 语义 |
 | --- | --- | --- |
 | `Generator` | `generate(GenerateRequest)` | 对任意已提供模态生成文本或结构化文本 |
 | `Embedder` | `embed(EmbedRequest)` | 以 `QUERY` 或 `DOCUMENT` 任务编码一批 `ModelInput` |
-| `Reranker` | `rerank(RerankRequest)` | 对调用方拥有的完整候选 ID 集合重新排序 |
+
+曾经存在的第三个插口 `Reranker` 已删除：它从未有过任何实现，只有配置、协议和一条调用分支。
+按 §11.3，插口在**出现第一个真实实现时**重新加入；重排目前由 `application/ranking` 的 RRF 融合
+和回答阶段的证据重读承担。
 
 `ModelInput` 是按顺序排列的 `TextPart | MediaPart`，不要求所有模态同时存在。每个 `Embedding`
 自行携带真实 `model_reference` 与兼容 `space_reference`，因此 Query/Document 可以使用对齐但不同的
@@ -403,7 +406,7 @@ MindBridge 采用“极简核心、直接配置、保存版本、允许重建”
 
 Answer、Occurrence、Perception、Episode、Claim、Summary 是 `application/pipelines` 中的产品管线，
 统一组合 `Generator`，不因 OpenAI、Anthropic、Gemini 或本地运行时而复制。插件通过 Python 标准
-entry point `mindbridge.generators`、`mindbridge.embedders`、`mindbridge.rerankers` 发现；进程只加载
+entry point `mindbridge.generators`、`mindbridge.embedders` 发现；进程只加载
 被直接选中的插件。完整契约见[模型插件架构](plugin-architecture.md)。
 
 默认配置必须是正常可部署的产品状态，而不是 Profile。Benchmark 通过每次运行的无密钥部署快照
@@ -596,7 +599,7 @@ flowchart LR
     FILTER["Time · Entity · Device · Type"]
     GRAPH["Relation Expansion"]
     FUSE["RRF Candidate Fusion"]
-    RERANK["Frozen Reranker / Omni Inspection"]
+    INSPECT["Frozen Omni Evidence Inspection"]
     ENOUGH{"Evidence sufficient?"}
     REINSPECT["Targeted Raw AV Reinspection"]
     ANSWER["Answer + Evidence + Confidence"]
@@ -609,7 +612,7 @@ flowchart LR
     DENSE --> FUSE
     SPARSE --> FUSE
     FILTER --> FUSE
-    FUSE --> GRAPH --> RERANK --> ENOUGH
+    FUSE --> GRAPH --> INSPECT --> ENOUGH
     ENOUGH -->|"yes"| ANSWER
     ENOUGH -->|"uncertain"| REINSPECT --> ENOUGH
     ENOUGH -->|"no evidence"| ABSTAIN
@@ -621,7 +624,7 @@ flowchart LR
 2. 并行执行跨模态稠密、文本稠密、全文、时间和实体检索。
 3. 使用 Reciprocal Rank Fusion（RRF）合并不同分值空间的结果，避免训练融合模型。
 4. 沿 `before/after`、`same_episode`、`mentions`、`supports` 等关系展开少量邻居。
-5. 用冻结 reranker 或 Omni/VLM 查看候选证据，而不是只看摘要。
+5. 用冻结 Omni/VLM 查看候选证据，而不是只看摘要。
 6. 对计数、先后、多跳和细节问题定向重读原始片段。
 7. 返回答案、MemoryRecord、EvidenceSpan、置信度和推理追踪 ID。
 8. 证据不足时明确拒答或请求补充，而不是从相似摘要中猜测。
@@ -1332,7 +1335,7 @@ MindBridge 的目标是**在各类权威 Benchmark 上取得工业级 SOTA 的�
 
 1. **eval 不要求控制变量。** 追求绝对分数时可以同时改动 Prompt、检索预算、管线结构和模型，不需要
    先做单变量消融再前进。消融只在需要定位退化原因时才做，是调试手段，不是晋级前置条件。
-2. **eval 可以使用当时可用的最强模型。** Generator/Embedder/Reranker 选型不受成本或本地化限制；
+2. **eval 可以使用当时可用的最强模型。** Generator/Embedder 选型不受成本或本地化限制；
    唯一约束是该配置必须是真实可部署的产品状态（写入 run manifest 的部署快照），而不是只在评测里
    存在的档位。成本/延迟单独报告，不用来压低分数上限。
 3. **禁止 reward hacking。** 允许提升绝对分数的手段只有一种：真实提高 MindBridge 的整体能力与
@@ -1531,7 +1534,7 @@ observe receipt
 → model calls
 → embedding/index write
 → recall candidate sources
-→ rerank/reinspection
+→ evidence reinspection
 → answer/evidence
 ```
 
@@ -1664,7 +1667,7 @@ Entity/Bridge/Scene/Horizon cue 明确推迟到完整数据证明增益之后，
 | ADR-009 | Code is the Product：可读性、简洁性、类型和测试作为合并门禁，行数不是产出 | 首次实现需投入工具配置和评审成本 | 不重审；工程质量是产品能力的一部分 |
 | ADR-010 | face↔voice 只由可审计 ASD 证据跨 Observation 累积并可撤销解析 | 首次绑定更慢，低证据场景保持两个匿名 ID | 同条件实验证明替代方法在 false-link、撤销和部署成本上稳定更优 |
 | ADR-011 | 端侧语音默认收敛到 FunASR 在线 ASR + Event-close 统一质量管线，不保留 NeMo 并行栈 | 实时 partial 暂不提供稳定 speaker label | 带真值 replay 证明另一上游栈在同资源下显著降低 DER/false-link，且收益覆盖依赖和编排成本 |
-| ADR-012 | 模型扩展只使用 Generator、Embedder、Reranker；供应商是 Adapter，任务是应用管线 | 破坏旧任务专用类，插件必须遵守严格协议 | 出现无法由三种 I/O 语义表达且有两个真实实现的新能力 |
+| ADR-012 | 模型扩展只使用 Generator、Embedder；供应商是 Adapter，任务是应用管线。原 `Reranker` 插口因零实现而删除 | 破坏旧任务专用类，插件必须遵守严格协议；重排能力回归时需要一次显式协议新增 | 出现无法由两种 I/O 语义表达、且已有真实实现的新能力（重排是首个候选） |
 
 ## 18. 待实测后锁定的参数
 

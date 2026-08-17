@@ -977,13 +977,10 @@
           "type": "object"
         },
         "SensorKind": {
-          "description": "Sensor that produced an observation.",
+          "description": "Sensor that produced an observation; each one must carry MediaKind evidence.",
           "enum": [
             "camera",
-            "microphone",
-            "gaze",
-            "imu",
-            "robot_state"
+            "microphone"
           ],
           "title": "SensorKind",
           "type": "string"

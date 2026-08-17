@@ -81,7 +81,10 @@ transaction sets one tenant locally. When migrations and the API use different d
 grant `mindbridge_runtime` to the API login; never give that login `SUPERUSER` or `BYPASSRLS`.
 Migration `0007` separates the encoder identity from its compatible search-space identity. Existing
 vectors remain isolated under their former model space and must be rebuilt before serving the new
-aligned Omni/Text space.
+aligned Omni/Text space. Migration `0015` narrows `observations.sensor` to `camera` and `microphone`,
+the only sensors that can carry the image, video, or audio evidence every observation requires. It
+fails instead of rewriting data if a historical row used `gaze`, `imu`, or `robot_state`; resolve
+those rows explicitly before applying it.
 
 Run the PostgreSQL contract tests against a disposable database whose name ends in `_test`:
 
@@ -727,11 +730,10 @@ uv run --extra server uvicorn mindbridge.server:create_app --factory
 ```
 
 These variables are the normal deployable default, not a Profile. To select any installed adapter,
-set its lowercase plugin name and provide the matching `MINDBRIDGE_GENERATOR_CONFIG_JSON`,
-`MINDBRIDGE_EMBEDDER_CONFIG_JSON`, or optional `MINDBRIDGE_RERANKER_CONFIG_JSON`. An explicit JSON
+set its lowercase plugin name and provide the matching `MINDBRIDGE_GENERATOR_CONFIG_JSON` or
+`MINDBRIDGE_EMBEDDER_CONFIG_JSON`. An explicit JSON
 object is authoritative, so Anthropic, Gemini, local runtimes, and experimental adapters do not need
-OpenAI-specific variables. Enabling reranking requires both `MINDBRIDGE_RERANKER_PLUGIN` and its
-configuration object. See the [plugin author contract](docs/plugin-architecture.md).
+OpenAI-specific variables. See the [plugin author contract](docs/plugin-architecture.md).
 
 OpenTelemetry is activated only when a standard common or signal-specific OTLP endpoint is set;
 without one it remains a no-op. The API, MCP process, Worker, edge sync, consolidation, and lifecycle

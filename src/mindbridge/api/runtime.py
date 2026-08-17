@@ -40,7 +40,7 @@ from mindbridge.models.defaults import (
     DEFAULT_TEXT_EMBEDDER_MODEL_ID,
     DEFAULT_TEXT_EMBEDDER_REVISION,
 )
-from mindbridge.models.plugins import load_embedder, load_generator, load_reranker
+from mindbridge.models.plugins import load_embedder, load_generator
 from mindbridge.telemetry import configure_telemetry, instrument_fastapi
 
 
@@ -57,8 +57,6 @@ class Settings:
     object_storage_region: str = "us-east-1"
     generator_plugin: str = "openai"
     embedder_plugin: str = "openai"
-    reranker_plugin: str | None = None
-    reranker_config: Mapping[str, object] = field(default_factory=dict, repr=False)
     minimum_embedding_similarity: float = 0.0
     tenant_api_keys_json: str | None = field(default=None, repr=False)
 
@@ -76,10 +74,6 @@ class Settings:
             ("embedder_plugin", self.embedder_plugin),
         ):
             validate_plugin_name(value, name)
-        if self.reranker_plugin is not None:
-            validate_plugin_name(self.reranker_plugin, "reranker_plugin")
-        elif self.reranker_config:
-            raise ValueError("reranker_config requires reranker_plugin")
         object.__setattr__(
             self,
             "generator_config",
@@ -89,11 +83,6 @@ class Settings:
             self,
             "embedder_config",
             copy_plugin_configuration(self.embedder_config, "embedder_config"),
-        )
-        object.__setattr__(
-            self,
-            "reranker_config",
-            copy_plugin_configuration(self.reranker_config, "reranker_config"),
         )
         if (
             self.object_storage_endpoint_url is not None
@@ -114,7 +103,6 @@ class Settings:
         source = os.environ if environ is None else environ
         generator_plugin = source.get("MINDBRIDGE_GENERATOR_PLUGIN", "openai")
         embedder_plugin = source.get("MINDBRIDGE_EMBEDDER_PLUGIN", "openai")
-        reranker_plugin = optional_environment_value(source, "MINDBRIDGE_RERANKER_PLUGIN")
         generator_config = plugin_configuration(
             source,
             "MINDBRIDGE_GENERATOR_CONFIG_JSON",
@@ -124,11 +112,6 @@ class Settings:
             source,
             "MINDBRIDGE_EMBEDDER_CONFIG_JSON",
             (lambda: _openai_embedder_config(source)) if embedder_plugin == "openai" else None,
-        )
-        reranker_config = (
-            plugin_configuration(source, "MINDBRIDGE_RERANKER_CONFIG_JSON", lambda: {})
-            if reranker_plugin is not None
-            else {}
         )
         return cls(
             database_url=require_environment_value(source, "MINDBRIDGE_DATABASE_URL"),
@@ -144,8 +127,6 @@ class Settings:
             generator_config=generator_config,
             embedder_plugin=embedder_plugin,
             embedder_config=embedder_config,
-            reranker_plugin=reranker_plugin,
-            reranker_config=reranker_config,
             minimum_embedding_similarity=float(
                 source.get("MINDBRIDGE_MINIMUM_EMBEDDING_SIMILARITY", "0.0")
             ),
@@ -217,11 +198,6 @@ def _build_runtime(settings: Settings) -> _Runtime:
     )
     generator = load_generator(settings.generator_plugin, settings.generator_config)
     embedder = load_embedder(settings.embedder_plugin, settings.embedder_config)
-    reranker = (
-        load_reranker(settings.reranker_plugin, settings.reranker_config)
-        if settings.reranker_plugin is not None
-        else None
-    )
     publisher = CeleryObservationJobPublisher(create_task_queue(settings.task_broker_url))
     kernel = MemoryKernel(
         store,
@@ -232,14 +208,9 @@ def _build_runtime(settings: Settings) -> _Runtime:
         media_url_signer=media_access,
         observation_job_publisher=publisher,
         embedder=embedder,
-        reranker=reranker,
         minimum_embedding_similarity=settings.minimum_embedding_similarity,
     )
-    models = cast(
-        tuple[object, ...],
-        (generator, embedder, *((reranker,) if reranker is not None else ())),
-    )
-    return _Runtime(kernel, store, models)
+    return _Runtime(kernel, store, cast(tuple[object, ...], (generator, embedder)))
 
 
 async def _close_model(model: object) -> None:

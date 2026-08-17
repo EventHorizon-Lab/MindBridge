@@ -12,13 +12,9 @@ from mindbridge.application.capabilities import (
     InputPart,
     MediaPart,
     ModelInput,
-    RerankCandidate,
-    Reranker,
-    RerankRequest,
-    RerankResult,
     TextPart,
 )
-from mindbridge.models.plugins import load_embedder, load_generator, load_reranker
+from mindbridge.models.plugins import load_embedder, load_generator
 
 __all__ = [
     "EmbedRequest",
@@ -32,12 +28,7 @@ __all__ = [
     "InputPart",
     "MediaPart",
     "ModelInput",
-    "RerankCandidate",
-    "RerankRequest",
-    "RerankResult",
-    "Reranker",
     "TextPart",
     "load_embedder",
     "load_generator",
-    "load_reranker",
 ]

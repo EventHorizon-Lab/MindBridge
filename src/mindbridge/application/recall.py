@@ -15,9 +15,6 @@ from mindbridge.application.capabilities import (
     EmbedTask,
     MediaPart,
     ModelInput,
-    RerankCandidate,
-    Reranker,
-    RerankRequest,
     TextPart,
 )
 from mindbridge.application.enumeration import EnumerateMemories
@@ -95,7 +92,6 @@ class RecallMemories:
         embedding_index: EmbeddingIndex,
         media_url_signer: MediaUrlSigner,
         embedder: Embedder,
-        reranker: Reranker | None,
         minimum_embedding_similarity: float,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
@@ -104,7 +100,6 @@ class RecallMemories:
         self._embedding_index = embedding_index
         self._media_url_signer = media_url_signer
         self._embedder = embedder
-        self._reranker = reranker
         self._minimum_embedding_similarity = minimum_embedding_similarity
         self._clock = clock or _utc_now
         self._enumerate = EnumerateMemories(
@@ -437,8 +432,6 @@ class RecallMemories:
                 semantic_search,
             )
             memories = fuse_memory_rankings((semantic, sparse), limit=limit)
-        if self._reranker is not None and len(memories) > 1:
-            memories = await self._rerank_candidates(request, query_media, memories)
         return memories[:limit]
 
     @trace_operation("mindbridge.recall.semantic_search")
@@ -517,31 +510,6 @@ class RecallMemories:
             (evidence_memories, graph_memories, direct_memories, hierarchy_memories),
             limit=limit,
         )
-
-    async def _rerank_candidates(
-        self,
-        request: RecallRequest,
-        query_media: tuple[ResolvedQueryMedia, ...],
-        candidates: tuple[MemoryRecord, ...],
-    ) -> tuple[MemoryRecord, ...]:
-        assert self._reranker is not None
-        result = await self._reranker.rerank(
-            RerankRequest(
-                query=_query_input(request, query_media),
-                candidates=tuple(
-                    RerankCandidate(
-                        candidate_id=str(memory.memory_id),
-                        input=ModelInput((TextPart(memory.summary),)),
-                    )
-                    for memory in candidates
-                ),
-            )
-        )
-        expected_ids = {str(memory.memory_id) for memory in candidates}
-        if set(result.candidate_ids) != expected_ids:
-            raise ModelOutputError("reranker must return every candidate ID exactly once")
-        by_id = {str(memory.memory_id): memory for memory in candidates}
-        return tuple(by_id[candidate_id] for candidate_id in result.candidate_ids)
 
     @trace_operation("mindbridge.recall.resolve_query_media")
     async def _resolve_query_media(
