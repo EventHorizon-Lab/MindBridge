@@ -19,7 +19,7 @@ from mindbridge.infrastructure._postgres_media import (
 )
 from mindbridge.infrastructure._postgres_types import (
     DatabaseConnection,
-    DatabasePool,
+    PostgresStoreOperations,
     tenant_connection,
 )
 
@@ -85,29 +85,6 @@ async def write_evidence_spans(
                 for evidence in evidence_spans
             ),
         )
-
-
-async def read_evidence(
-    pool: DatabasePool,
-    tenant_id: TenantId,
-    evidence_ids: tuple[EvidenceId, ...],
-) -> tuple[EvidenceSpan, ...]:
-    """Read evidence spans in caller order without crossing tenants."""
-    if not evidence_ids:
-        return ()
-    async with tenant_connection(pool, tenant_id) as connection:
-        cursor = await connection.execute(
-            f"{EVIDENCE_SELECT_SQL} WHERE tenant_id = %s AND evidence_id = ANY(%s)",
-            (tenant_id, list(evidence_ids)),
-        )
-        evidence_by_id = {
-            evidence.evidence_id: evidence
-            async for row in cursor
-            for evidence in (evidence_from_row(cast(EvidenceRow, row)),)
-        }
-    return tuple(
-        evidence_by_id[evidence_id] for evidence_id in evidence_ids if evidence_id in evidence_by_id
-    )
 
 
 async def read_observation_evidence(
@@ -218,26 +195,51 @@ async def write_evidence_clips(
         )
 
 
-async def list_known_clip_digests(
-    pool: DatabasePool,
-    tenant_id: TenantId,
-    digests: tuple[str, ...],
-) -> frozenset[str]:
-    """Return which content digests the database still accounts for.
-
-    Clip bytes are uploaded before the transaction that registers them, so a
-    rolled-back attempt leaves an object with no row at all. Object keys carry
-    the digest, which makes reclaiming them a set difference against this.
-    """
-    if not digests:
-        return frozenset()
-    async with tenant_connection(pool, tenant_id) as connection:
-        cursor = await connection.execute(
-            """
-            SELECT sha256 FROM media_objects
-            WHERE tenant_id = %s AND sha256 = ANY(%s)
-            """,
-            (tenant_id, list(digests)),
+class EvidenceReadOperations(PostgresStoreOperations):
+    async def read_evidence(
+        self,
+        tenant_id: TenantId,
+        evidence_ids: tuple[EvidenceId, ...],
+    ) -> tuple[EvidenceSpan, ...]:
+        """Read evidence spans in caller order without crossing tenants."""
+        if not evidence_ids:
+            return ()
+        async with tenant_connection(self._pool, tenant_id) as connection:
+            cursor = await connection.execute(
+                f"{EVIDENCE_SELECT_SQL} WHERE tenant_id = %s AND evidence_id = ANY(%s)",
+                (tenant_id, list(evidence_ids)),
+            )
+            evidence_by_id = {
+                evidence.evidence_id: evidence
+                async for row in cursor
+                for evidence in (evidence_from_row(cast(EvidenceRow, row)),)
+            }
+        return tuple(
+            evidence_by_id[evidence_id]
+            for evidence_id in evidence_ids
+            if evidence_id in evidence_by_id
         )
-        rows = await cursor.fetchall()
-    return frozenset(cast(str, row[0]) for row in rows)
+
+    async def list_known_clip_digests(
+        self,
+        tenant_id: TenantId,
+        digests: tuple[str, ...],
+    ) -> frozenset[str]:
+        """Return which content digests the database still accounts for.
+
+        Clip bytes are uploaded before the transaction that registers them, so a
+        rolled-back attempt leaves an object with no row at all. Object keys carry
+        the digest, which makes reclaiming them a set difference against this.
+        """
+        if not digests:
+            return frozenset()
+        async with tenant_connection(self._pool, tenant_id) as connection:
+            cursor = await connection.execute(
+                """
+                SELECT sha256 FROM media_objects
+                WHERE tenant_id = %s AND sha256 = ANY(%s)
+                """,
+                (tenant_id, list(digests)),
+            )
+            rows = await cursor.fetchall()
+        return frozenset(cast(str, row[0]) for row in rows)

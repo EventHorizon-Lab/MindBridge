@@ -17,6 +17,7 @@ from mindbridge.core import (
 from mindbridge.infrastructure._postgres_types import (
     DatabaseConnection,
     DatabasePool,
+    PostgresStoreOperations,
     tenant_connection,
 )
 
@@ -38,67 +39,6 @@ async def read_embedding_column_dimension(pool: DatabasePool) -> int:
     if row is None or not str(row[0]).startswith("vector("):
         raise MemoryIntegrityError("embeddings.embedding is not a dimensioned pgvector column")
     return int(str(row[0]).removeprefix("vector(").removesuffix(")"))
-
-
-async def has_embedding(
-    pool: DatabasePool,
-    tenant_id: TenantId,
-    embedding_id: EmbeddingId,
-) -> bool:
-    """Return whether one tenant already has the immutable vector."""
-    async with tenant_connection(pool, tenant_id) as connection:
-        cursor = await connection.execute(
-            "SELECT 1 FROM embeddings WHERE tenant_id = %s AND embedding_id = %s",
-            (tenant_id, embedding_id),
-        )
-        return await cursor.fetchone() is not None
-
-
-async def unreachable_embedded_object_types(
-    pool: DatabasePool,
-    tenant_id: TenantId,
-    space_reference: EmbeddingSpaceReference,
-) -> tuple[EmbeddedObjectType, ...]:
-    """Return the object types a tenant stored that no query in this space can match.
-
-    Row-level security hides other tenants, so this is asked per tenant. Holding vectors
-    in several spaces is legitimate while re-embedding; holding none in the configured
-    space is not, because recall then returns empty results instead of failing. Writers
-    do not share object types — the Worker owns evidence, events, and claims while the
-    server owns memory records — so this is asked per object type. A whole-tenant probe
-    would let the server's own memory records mask everything the Worker stranded.
-    """
-    async with tenant_connection(pool, tenant_id) as connection:
-        cursor = await connection.execute(
-            """
-            SELECT candidate.object_type
-            FROM unnest(%s::text[]) AS candidate(object_type)
-            WHERE EXISTS (
-                      SELECT 1 FROM embeddings
-                      WHERE tenant_id = %s AND object_type = candidate.object_type
-                  )
-              AND NOT EXISTS (
-                      SELECT 1 FROM embeddings
-                      WHERE tenant_id = %s AND object_type = candidate.object_type
-                        AND space_id = %s AND space_revision = %s
-                  )
-            ORDER BY candidate.object_type
-            """,
-            (
-                [object_type.value for object_type in EmbeddedObjectType],
-                tenant_id,
-                tenant_id,
-                space_reference.space_id,
-                space_reference.revision,
-            ),
-        )
-        return tuple(
-            [
-                EmbeddedObjectType(object_type)
-                async for row in cursor
-                for object_type in (cast(tuple[str], row)[0],)
-            ]
-        )
 
 
 async def write_embedding(pool: DatabasePool, embedding: EmbeddingRecord) -> bool:
@@ -236,3 +176,64 @@ async def search_embeddings(
                 )
             ]
         )
+
+
+class EmbeddingReadOperations(PostgresStoreOperations):
+    async def has_embedding(
+        self,
+        tenant_id: TenantId,
+        embedding_id: EmbeddingId,
+    ) -> bool:
+        """Return whether one tenant already has the immutable vector."""
+        async with tenant_connection(self._pool, tenant_id) as connection:
+            cursor = await connection.execute(
+                "SELECT 1 FROM embeddings WHERE tenant_id = %s AND embedding_id = %s",
+                (tenant_id, embedding_id),
+            )
+            return await cursor.fetchone() is not None
+
+    async def unreachable_embedded_object_types(
+        self,
+        tenant_id: TenantId,
+        space_reference: EmbeddingSpaceReference,
+    ) -> tuple[EmbeddedObjectType, ...]:
+        """Return the object types a tenant stored that no query in this space can match.
+
+        Row-level security hides other tenants, so this is asked per tenant. Holding vectors
+        in several spaces is legitimate while re-embedding; holding none in the configured
+        space is not, because recall then returns empty results instead of failing. Writers
+        do not share object types — the Worker owns evidence, events, and claims while the
+        server owns memory records — so this is asked per object type. A whole-tenant probe
+        would let the server's own memory records mask everything the Worker stranded.
+        """
+        async with tenant_connection(self._pool, tenant_id) as connection:
+            cursor = await connection.execute(
+                """
+                SELECT candidate.object_type
+                FROM unnest(%s::text[]) AS candidate(object_type)
+                WHERE EXISTS (
+                          SELECT 1 FROM embeddings
+                          WHERE tenant_id = %s AND object_type = candidate.object_type
+                      )
+                  AND NOT EXISTS (
+                          SELECT 1 FROM embeddings
+                          WHERE tenant_id = %s AND object_type = candidate.object_type
+                            AND space_id = %s AND space_revision = %s
+                      )
+                ORDER BY candidate.object_type
+                """,
+                (
+                    [object_type.value for object_type in EmbeddedObjectType],
+                    tenant_id,
+                    tenant_id,
+                    space_reference.space_id,
+                    space_reference.revision,
+                ),
+            )
+            return tuple(
+                [
+                    EmbeddedObjectType(object_type)
+                    async for row in cursor
+                    for object_type in (cast(tuple[str], row)[0],)
+                ]
+            )

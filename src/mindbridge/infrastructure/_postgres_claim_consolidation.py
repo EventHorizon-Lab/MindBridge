@@ -20,7 +20,10 @@ from mindbridge.core import (
     TenantId,
     VerificationStatus,
 )
-from mindbridge.infrastructure._postgres_types import DatabasePool, tenant_connection
+from mindbridge.infrastructure._postgres_types import (
+    PostgresStoreOperations,
+    tenant_connection,
+)
 
 ClaimCandidateRow: TypeAlias = tuple[
     str,
@@ -39,52 +42,6 @@ ClaimCandidateRow: TypeAlias = tuple[
     str,
     list[str],
 ]
-
-
-async def list_claim_candidates(
-    pool: DatabasePool,
-    request: ClaimCandidateRequest,
-) -> ClaimCandidatePage:
-    """Return one stable seed page expanded by entity or aligned-vector affinity."""
-    async with tenant_connection(pool, request.tenant_id) as connection:
-        cursor = await connection.execute(
-            _CLAIM_SEEDS_SQL,
-            {
-                "tenant_id": request.tenant_id,
-                "evaluated_at": request.evaluated_at,
-                "after_claim_id": request.after_claim_id,
-                "limit": request.limit + 1,
-            },
-        )
-        seed_ids = tuple([ClaimId(cast(tuple[str], row)[0]) async for row in cursor])
-        page_seed_ids = seed_ids[: request.limit]
-        if not page_seed_ids:
-            return ClaimCandidatePage(candidates=(), scanned_count=0, next_cursor=None)
-
-        cursor = await connection.execute(
-            _RELATED_CLAIM_IDS_SQL,
-            {
-                "tenant_id": request.tenant_id,
-                "evaluated_at": request.evaluated_at,
-                "seed_ids": list(page_seed_ids),
-                "maximum_gap_seconds": request.maximum_gap_seconds,
-                "minimum_similarity": request.minimum_similarity,
-                "candidate_limit": min(request.limit * 4, 64),
-            },
-        )
-        claim_ids = tuple([ClaimId(cast(tuple[str], row)[0]) async for row in cursor])
-        cursor = await connection.execute(
-            _READ_CLAIM_CANDIDATES_SQL,
-            (request.tenant_id, list(claim_ids)),
-        )
-        candidates = tuple(
-            [_claim_candidate_from_row(cast(ClaimCandidateRow, row)) async for row in cursor]
-        )
-    return ClaimCandidatePage(
-        candidates=candidates,
-        scanned_count=len(page_seed_ids),
-        next_cursor=(page_seed_ids[-1] if len(seed_ids) > request.limit else None),
-    )
 
 
 def _claim_candidate_from_row(row: ClaimCandidateRow) -> ClaimCandidate:
@@ -254,3 +211,50 @@ FROM claims AS claim
 WHERE claim.tenant_id = %s AND claim.claim_id = ANY(%s)
 ORDER BY claim.valid_from, claim.claim_id
 """
+
+
+class ClaimCandidateOperations(PostgresStoreOperations):
+    async def list_claim_candidates(
+        self,
+        request: ClaimCandidateRequest,
+    ) -> ClaimCandidatePage:
+        """Return one stable seed page expanded by entity or aligned-vector affinity."""
+        async with tenant_connection(self._pool, request.tenant_id) as connection:
+            cursor = await connection.execute(
+                _CLAIM_SEEDS_SQL,
+                {
+                    "tenant_id": request.tenant_id,
+                    "evaluated_at": request.evaluated_at,
+                    "after_claim_id": request.after_claim_id,
+                    "limit": request.limit + 1,
+                },
+            )
+            seed_ids = tuple([ClaimId(cast(tuple[str], row)[0]) async for row in cursor])
+            page_seed_ids = seed_ids[: request.limit]
+            if not page_seed_ids:
+                return ClaimCandidatePage(candidates=(), scanned_count=0, next_cursor=None)
+
+            cursor = await connection.execute(
+                _RELATED_CLAIM_IDS_SQL,
+                {
+                    "tenant_id": request.tenant_id,
+                    "evaluated_at": request.evaluated_at,
+                    "seed_ids": list(page_seed_ids),
+                    "maximum_gap_seconds": request.maximum_gap_seconds,
+                    "minimum_similarity": request.minimum_similarity,
+                    "candidate_limit": min(request.limit * 4, 64),
+                },
+            )
+            claim_ids = tuple([ClaimId(cast(tuple[str], row)[0]) async for row in cursor])
+            cursor = await connection.execute(
+                _READ_CLAIM_CANDIDATES_SQL,
+                (request.tenant_id, list(claim_ids)),
+            )
+            candidates = tuple(
+                [_claim_candidate_from_row(cast(ClaimCandidateRow, row)) async for row in cursor]
+            )
+        return ClaimCandidatePage(
+            candidates=candidates,
+            scanned_count=len(page_seed_ids),
+            next_cursor=(page_seed_ids[-1] if len(seed_ids) > request.limit else None),
+        )

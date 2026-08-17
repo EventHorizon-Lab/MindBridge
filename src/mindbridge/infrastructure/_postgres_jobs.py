@@ -23,6 +23,7 @@ from mindbridge.core import (
 from mindbridge.infrastructure._postgres_types import (
     DatabaseConnection,
     DatabasePool,
+    PostgresStoreOperations,
     tenant_connection,
 )
 
@@ -87,61 +88,6 @@ async def ensure_observation_processing_job(
     return job_id
 
 
-async def claim_observation_processing_job(
-    pool: DatabasePool,
-    tenant_id: TenantId,
-    observation_id: ObservationId,
-    job_id: JobId,
-) -> ObservationJobClaim:
-    """Atomically claim a ready or stale job without concurrent ownership."""
-    _require_expected_job_id(observation_id, job_id)
-    async with tenant_connection(pool, tenant_id) as connection:
-        cursor = await connection.execute(
-            """
-            UPDATE jobs
-            SET state = 'running', attempt = attempt + 1,
-                error_code = NULL, updated_at = now()
-            WHERE tenant_id = %s AND job_id = %s
-              AND job_type = %s AND payload ->> 'observation_id' = %s
-              AND (
-                  state IN ('pending', 'failed')
-                  OR (
-                      state = 'running'
-                      AND updated_at <= now() - make_interval(secs => %s)
-                  )
-              )
-            RETURNING job_id, tenant_id, state, attempt, error_code,
-                      created_at, updated_at, payload ->> 'observation_id',
-                      COALESCE(payload -> 'memory_ids', '[]'::jsonb)
-            """,
-            (
-                tenant_id,
-                job_id,
-                PROCESS_OBSERVATION_JOB_TYPE,
-                observation_id,
-                OBSERVATION_JOB_STALE_AFTER_SECONDS,
-            ),
-        )
-        row = await cursor.fetchone()
-        if row is not None:
-            return ObservationJobClaim(job=_job_from_row(cast(JobRow, row)), acquired=True)
-        job = await _read_expected_job(connection, tenant_id, observation_id, job_id)
-        return ObservationJobClaim(job=job, acquired=False)
-
-
-async def read_observation_processing_job(
-    pool: DatabasePool,
-    tenant_id: TenantId,
-    job_id: JobId,
-) -> ObservationProcessingJob:
-    """Read one tenant-owned processing job without exposing its payload."""
-    async with tenant_connection(pool, tenant_id) as connection:
-        job = await _find_observation_processing_job(connection, tenant_id, job_id)
-    if job is None:
-        raise JobNotFoundError("observation processing job does not exist")
-    return job
-
-
 async def mark_observation_processing_succeeded_on_connection(
     connection: DatabaseConnection,
     tenant_id: TenantId,
@@ -198,29 +144,6 @@ async def lock_observation_processing_attempt(
         raise MemoryIntegrityError("observation processing attempt was superseded")
     if job.state is not JobState.RUNNING:
         raise MemoryIntegrityError("observation processing job is not running")
-
-
-async def mark_observation_processing_failed(
-    pool: DatabasePool,
-    tenant_id: TenantId,
-    observation_id: ObservationId,
-    job_id: JobId,
-    *,
-    attempt: int,
-    error_code: str,
-) -> ObservationProcessingJob:
-    """Record a sanitized retryable failure without exception details."""
-    if _ERROR_CODE.fullmatch(error_code) is None:
-        raise ValueError("error_code must be a lowercase machine identifier")
-    return await _finish_observation_processing_job(
-        pool,
-        tenant_id,
-        observation_id,
-        job_id,
-        attempt=attempt,
-        state=JobState.FAILED,
-        error_code=error_code,
-    )
 
 
 async def _finish_observation_processing_job(
@@ -356,3 +279,80 @@ def _job_from_row(row: JobRow) -> ObservationProcessingJob:
 def _require_expected_job_id(observation_id: ObservationId, job_id: JobId) -> None:
     if job_id != f"job_process_{observation_id}":
         raise MemoryIntegrityError("observation processing job ID conflicts with task")
+
+
+class ObservationJobOperations(PostgresStoreOperations):
+    async def claim_observation_processing_job(
+        self,
+        tenant_id: TenantId,
+        observation_id: ObservationId,
+        job_id: JobId,
+    ) -> ObservationJobClaim:
+        """Atomically claim a ready or stale job without concurrent ownership."""
+        _require_expected_job_id(observation_id, job_id)
+        async with tenant_connection(self._pool, tenant_id) as connection:
+            cursor = await connection.execute(
+                """
+                UPDATE jobs
+                SET state = 'running', attempt = attempt + 1,
+                    error_code = NULL, updated_at = now()
+                WHERE tenant_id = %s AND job_id = %s
+                  AND job_type = %s AND payload ->> 'observation_id' = %s
+                  AND (
+                      state IN ('pending', 'failed')
+                      OR (
+                          state = 'running'
+                          AND updated_at <= now() - make_interval(secs => %s)
+                      )
+                  )
+                RETURNING job_id, tenant_id, state, attempt, error_code,
+                          created_at, updated_at, payload ->> 'observation_id',
+                          COALESCE(payload -> 'memory_ids', '[]'::jsonb)
+                """,
+                (
+                    tenant_id,
+                    job_id,
+                    PROCESS_OBSERVATION_JOB_TYPE,
+                    observation_id,
+                    OBSERVATION_JOB_STALE_AFTER_SECONDS,
+                ),
+            )
+            row = await cursor.fetchone()
+            if row is not None:
+                return ObservationJobClaim(job=_job_from_row(cast(JobRow, row)), acquired=True)
+            job = await _read_expected_job(connection, tenant_id, observation_id, job_id)
+            return ObservationJobClaim(job=job, acquired=False)
+
+    async def read_observation_processing_job(
+        self,
+        tenant_id: TenantId,
+        job_id: JobId,
+    ) -> ObservationProcessingJob:
+        """Read one tenant-owned processing job without exposing its payload."""
+        async with tenant_connection(self._pool, tenant_id) as connection:
+            job = await _find_observation_processing_job(connection, tenant_id, job_id)
+        if job is None:
+            raise JobNotFoundError("observation processing job does not exist")
+        return job
+
+    async def mark_observation_processing_failed(
+        self,
+        tenant_id: TenantId,
+        observation_id: ObservationId,
+        job_id: JobId,
+        *,
+        attempt: int,
+        error_code: str,
+    ) -> ObservationProcessingJob:
+        """Record a sanitized retryable failure without exception details."""
+        if _ERROR_CODE.fullmatch(error_code) is None:
+            raise ValueError("error_code must be a lowercase machine identifier")
+        return await _finish_observation_processing_job(
+            self._pool,
+            tenant_id,
+            observation_id,
+            job_id,
+            attempt=attempt,
+            state=JobState.FAILED,
+            error_code=error_code,
+        )

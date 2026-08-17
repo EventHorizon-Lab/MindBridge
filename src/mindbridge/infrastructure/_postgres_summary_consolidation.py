@@ -18,65 +18,10 @@ from mindbridge.infrastructure._postgres_memory_rows import (
     MemoryRow,
     memory_from_row,
 )
-from mindbridge.infrastructure._postgres_types import DatabasePool, tenant_connection
-
-
-async def list_summary_candidates(
-    pool: DatabasePool,
-    request: SummaryCandidateRequest,
-) -> SummaryCandidatePage:
-    """Return one stable seed page expanded by time, entity, or aligned-vector affinity."""
-    async with tenant_connection(pool, request.tenant_id) as connection:
-        cursor = await connection.execute(
-            _SUMMARY_SEEDS_SQL,
-            {
-                "tenant_id": request.tenant_id,
-                "evaluated_at": request.evaluated_at,
-                "after_occurred_at": (
-                    request.after_cursor.occurred_at if request.after_cursor is not None else None
-                ),
-                "after_memory_id": (
-                    request.after_cursor.memory_id if request.after_cursor is not None else None
-                ),
-                "limit": request.limit + 1,
-            },
-        )
-        seed_cursors = tuple(
-            [_summary_cursor_from_row(cast(tuple[object, ...], row)) async for row in cursor]
-        )
-        page_seed_cursors = seed_cursors[: request.limit]
-        page_seed_ids = tuple(cursor.memory_id for cursor in page_seed_cursors)
-        if not page_seed_ids:
-            return SummaryCandidatePage(candidates=(), scanned_count=0, next_cursor=None)
-
-        cursor = await connection.execute(
-            _RELATED_MEMORY_IDS_SQL,
-            {
-                "tenant_id": request.tenant_id,
-                "evaluated_at": request.evaluated_at,
-                "seed_ids": list(page_seed_ids),
-                "maximum_gap_seconds": request.maximum_gap_seconds,
-                "minimum_similarity": request.minimum_similarity,
-                "candidate_limit": min(request.limit * 4, 64),
-            },
-        )
-        memory_ids = tuple([MemoryId(cast(tuple[str], row)[0]) async for row in cursor])
-        cursor = await connection.execute(
-            _READ_SUMMARY_CANDIDATES_SQL,
-            {
-                "tenant_id": request.tenant_id,
-                "evaluated_at": request.evaluated_at,
-                "memory_ids": list(memory_ids),
-            },
-        )
-        candidates = tuple(
-            [_summary_candidate_from_row(cast(tuple[object, ...], row)) async for row in cursor]
-        )
-    return SummaryCandidatePage(
-        candidates=candidates,
-        scanned_count=len(page_seed_ids),
-        next_cursor=(page_seed_cursors[-1] if len(seed_cursors) > request.limit else None),
-    )
+from mindbridge.infrastructure._postgres_types import (
+    PostgresStoreOperations,
+    tenant_connection,
+)
 
 
 def _summary_cursor_from_row(row: tuple[object, ...]) -> SummaryCandidateCursor:
@@ -236,3 +181,64 @@ FROM (
 ) AS selected
 ORDER BY selected.occurred_at, selected.memory_id
 """
+
+
+class SummaryCandidateOperations(PostgresStoreOperations):
+    async def list_summary_candidates(
+        self,
+        request: SummaryCandidateRequest,
+    ) -> SummaryCandidatePage:
+        """Return one stable seed page expanded by time, entity, or aligned-vector affinity."""
+        async with tenant_connection(self._pool, request.tenant_id) as connection:
+            cursor = await connection.execute(
+                _SUMMARY_SEEDS_SQL,
+                {
+                    "tenant_id": request.tenant_id,
+                    "evaluated_at": request.evaluated_at,
+                    "after_occurred_at": (
+                        request.after_cursor.occurred_at
+                        if request.after_cursor is not None
+                        else None
+                    ),
+                    "after_memory_id": (
+                        request.after_cursor.memory_id if request.after_cursor is not None else None
+                    ),
+                    "limit": request.limit + 1,
+                },
+            )
+            seed_cursors = tuple(
+                [_summary_cursor_from_row(cast(tuple[object, ...], row)) async for row in cursor]
+            )
+            page_seed_cursors = seed_cursors[: request.limit]
+            page_seed_ids = tuple(cursor.memory_id for cursor in page_seed_cursors)
+            if not page_seed_ids:
+                return SummaryCandidatePage(candidates=(), scanned_count=0, next_cursor=None)
+
+            cursor = await connection.execute(
+                _RELATED_MEMORY_IDS_SQL,
+                {
+                    "tenant_id": request.tenant_id,
+                    "evaluated_at": request.evaluated_at,
+                    "seed_ids": list(page_seed_ids),
+                    "maximum_gap_seconds": request.maximum_gap_seconds,
+                    "minimum_similarity": request.minimum_similarity,
+                    "candidate_limit": min(request.limit * 4, 64),
+                },
+            )
+            memory_ids = tuple([MemoryId(cast(tuple[str], row)[0]) async for row in cursor])
+            cursor = await connection.execute(
+                _READ_SUMMARY_CANDIDATES_SQL,
+                {
+                    "tenant_id": request.tenant_id,
+                    "evaluated_at": request.evaluated_at,
+                    "memory_ids": list(memory_ids),
+                },
+            )
+            candidates = tuple(
+                [_summary_candidate_from_row(cast(tuple[object, ...], row)) async for row in cursor]
+            )
+        return SummaryCandidatePage(
+            candidates=candidates,
+            scanned_count=len(page_seed_ids),
+            next_cursor=(page_seed_cursors[-1] if len(seed_cursors) > request.limit else None),
+        )

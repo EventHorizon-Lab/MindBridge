@@ -31,6 +31,7 @@ from mindbridge.infrastructure._postgres_memories import write_memory_on_connect
 from mindbridge.infrastructure._postgres_types import (
     DatabaseConnection,
     DatabasePool,
+    PostgresStoreOperations,
     tenant_connection,
 )
 
@@ -105,46 +106,6 @@ async def commit_episode_consolidation(
             return committed_count
     except ForeignKeyViolation as error:
         raise DomainInvariantError("episode references missing source data") from error
-
-
-async def list_episode_candidates(
-    pool: DatabasePool,
-    request: EpisodeCandidateRequest,
-) -> EpisodeCandidatePage:
-    """Return one stable seed page expanded by time, entity, or vector affinity."""
-    async with tenant_connection(pool, request.tenant_id) as connection:
-        cursor = await connection.execute(
-            _EPISODE_SEEDS_SQL,
-            {
-                "tenant_id": request.tenant_id,
-                "evaluated_at": request.evaluated_at,
-                "after_event_id": request.after_event_id,
-                "limit": request.limit + 1,
-            },
-        )
-        seed_ids = tuple([EventId(cast(tuple[str], row)[0]) async for row in cursor])
-        page_seed_ids = seed_ids[: request.limit]
-        if not page_seed_ids:
-            return EpisodeCandidatePage(events=(), scanned_count=0, next_cursor=None)
-
-        cursor = await connection.execute(
-            _RELATED_EVENT_IDS_SQL,
-            {
-                "tenant_id": request.tenant_id,
-                "evaluated_at": request.evaluated_at,
-                "seed_ids": list(page_seed_ids),
-                "maximum_gap_seconds": request.maximum_gap_seconds,
-                "minimum_similarity": request.minimum_similarity,
-                "candidate_limit": min(request.limit * 4, 64),
-            },
-        )
-        event_ids = tuple([EventId(cast(tuple[str], row)[0]) async for row in cursor])
-        events = await _read_events(connection, request.tenant_id, event_ids)
-    return EpisodeCandidatePage(
-        events=events,
-        scanned_count=len(page_seed_ids),
-        next_cursor=(page_seed_ids[-1] if len(seed_ids) > request.limit else None),
-    )
 
 
 async def _lock_child_events(
@@ -331,3 +292,44 @@ FROM events AS event
 WHERE event.tenant_id = %s AND event.event_id = ANY(%s)
 ORDER BY event.occurred_at, event.event_id
 """
+
+
+class EpisodeCandidateOperations(PostgresStoreOperations):
+    async def list_episode_candidates(
+        self,
+        request: EpisodeCandidateRequest,
+    ) -> EpisodeCandidatePage:
+        """Return one stable seed page expanded by time, entity, or vector affinity."""
+        async with tenant_connection(self._pool, request.tenant_id) as connection:
+            cursor = await connection.execute(
+                _EPISODE_SEEDS_SQL,
+                {
+                    "tenant_id": request.tenant_id,
+                    "evaluated_at": request.evaluated_at,
+                    "after_event_id": request.after_event_id,
+                    "limit": request.limit + 1,
+                },
+            )
+            seed_ids = tuple([EventId(cast(tuple[str], row)[0]) async for row in cursor])
+            page_seed_ids = seed_ids[: request.limit]
+            if not page_seed_ids:
+                return EpisodeCandidatePage(events=(), scanned_count=0, next_cursor=None)
+
+            cursor = await connection.execute(
+                _RELATED_EVENT_IDS_SQL,
+                {
+                    "tenant_id": request.tenant_id,
+                    "evaluated_at": request.evaluated_at,
+                    "seed_ids": list(page_seed_ids),
+                    "maximum_gap_seconds": request.maximum_gap_seconds,
+                    "minimum_similarity": request.minimum_similarity,
+                    "candidate_limit": min(request.limit * 4, 64),
+                },
+            )
+            event_ids = tuple([EventId(cast(tuple[str], row)[0]) async for row in cursor])
+            events = await _read_events(connection, request.tenant_id, event_ids)
+        return EpisodeCandidatePage(
+            events=events,
+            scanned_count=len(page_seed_ids),
+            next_cursor=(page_seed_ids[-1] if len(seed_ids) > request.limit else None),
+        )

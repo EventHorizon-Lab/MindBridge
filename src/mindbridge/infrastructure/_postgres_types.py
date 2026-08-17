@@ -12,6 +12,18 @@ from mindbridge.core import DatabaseUnavailableError
 
 DatabaseConnection: TypeAlias = AsyncConnection[TupleRow]
 DatabasePool: TypeAlias = AsyncConnectionPool[DatabaseConnection]
+
+
+class PostgresStoreOperations:
+    """The pool held by the store and read by each group of its operations.
+
+    Groups are mixed into one store because a single ingest transaction spans every table;
+    giving each group its own object would only move pool sharing outward.
+    """
+
+    _pool: DatabasePool
+
+
 _TRANSIENT_SQLSTATES = frozenset(
     {"40000", "40001", "40003", "40P01", "53300", "57014", "57P01", "57P02", "57P03"}
 )

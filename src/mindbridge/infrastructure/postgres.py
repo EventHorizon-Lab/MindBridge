@@ -3,114 +3,61 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-from datetime import datetime
 
 from pgvector.psycopg import register_vector_async
 
-from mindbridge.application.claim_consolidation import (
-    ClaimCandidatePage,
-    ClaimCandidateRequest,
-)
-from mindbridge.application.consolidation import EpisodeCandidatePage, EpisodeCandidateRequest
 from mindbridge.application.episodes import EpisodeWrite
-from mindbridge.application.lifecycle import MemoryLifecycleChange
 from mindbridge.application.observation_processing import (
-    ObservationBatch,
     ObservationProcessingOutput,
 )
 from mindbridge.application.ports import (
     EmbeddingMatch,
     EmbeddingSearch,
-    FeedbackWriteResult,
-    ForgetPlan,
-    MemoryWriteResult,
-    ObservationWriteResult,
 )
 from mindbridge.application.semantic_claims import (
     ClaimConsolidationCommit,
     ClaimConsolidationWrite,
 )
 from mindbridge.application.summary_consolidation import (
-    SummaryCandidatePage,
-    SummaryCandidateRequest,
     SummaryWrite,
 )
-from mindbridge.contracts import RecallRequest
 from mindbridge.core import (
     DEFAULT_EMBEDDING_DIMENSION,
     DeletionTombstone,
     DomainInvariantError,
-    EmbeddedObjectType,
-    EmbeddingId,
     EmbeddingRecord,
-    EmbeddingSpaceReference,
-    EvidenceId,
-    EvidenceSpan,
     JobId,
-    MediaObject,
-    MediaObjectId,
-    MemoryFeedback,
-    MemoryId,
     MemoryIntegrityError,
-    MemoryRecord,
     ObservationId,
-    ObservationJobClaim,
     ObservationProcessingJob,
     TenantId,
     TombstoneId,
 )
-from mindbridge.infrastructure._postgres_claim_consolidation import list_claim_candidates
+from mindbridge.infrastructure._postgres_claim_consolidation import ClaimCandidateOperations
 from mindbridge.infrastructure._postgres_claim_writes import commit_claim_consolidation
 from mindbridge.infrastructure._postgres_consolidation import (
+    EpisodeCandidateOperations,
     commit_episode_consolidation,
-    list_episode_candidates,
 )
 from mindbridge.infrastructure._postgres_embeddings import (
-    has_embedding,
+    EmbeddingReadOperations,
     read_embedding_column_dimension,
     search_embeddings,
-    unreachable_embedded_object_types,
     write_embedding,
 )
-from mindbridge.infrastructure._postgres_evidence import (
-    list_known_clip_digests,
-    read_evidence,
-)
-from mindbridge.infrastructure._postgres_feedback import record_feedback
+from mindbridge.infrastructure._postgres_evidence import EvidenceReadOperations
+from mindbridge.infrastructure._postgres_feedback import FeedbackOperations
 from mindbridge.infrastructure._postgres_forget import (
-    complete_forget,
-    list_deletion_tombstones,
-    mark_forget_failed,
-    prepare_forget,
+    ForgetOperations,
     read_deletion_tombstone,
 )
-from mindbridge.infrastructure._postgres_jobs import (
-    claim_observation_processing_job,
-    mark_observation_processing_failed,
-    read_observation_processing_job,
-)
-from mindbridge.infrastructure._postgres_lifecycle import (
-    list_memories_for_lifecycle,
-    record_memory_accesses,
-    update_memory_lifecycles,
-)
-from mindbridge.infrastructure._postgres_memories import (
-    list_memories_for_enumeration,
-    read_memory,
-    search_memories,
-    search_memories_by_evidence,
-    search_memories_by_graph_objects,
-    search_memories_by_hierarchy,
-    search_memories_by_ids,
-    write_memory,
-)
-from mindbridge.infrastructure._postgres_observation_reads import (
-    read_media_objects,
-    read_observation_batch,
-)
-from mindbridge.infrastructure._postgres_observations import write_observation
+from mindbridge.infrastructure._postgres_jobs import ObservationJobOperations
+from mindbridge.infrastructure._postgres_lifecycle import LifecycleOperations
+from mindbridge.infrastructure._postgres_memories import MemoryOperations
+from mindbridge.infrastructure._postgres_observation_reads import ObservationReadOperations
+from mindbridge.infrastructure._postgres_observations import ObservationWriteOperations
 from mindbridge.infrastructure._postgres_processing import commit_observation_processing
-from mindbridge.infrastructure._postgres_summary_consolidation import list_summary_candidates
+from mindbridge.infrastructure._postgres_summary_consolidation import SummaryCandidateOperations
 from mindbridge.infrastructure._postgres_summary_writes import commit_summary_consolidation
 from mindbridge.infrastructure._postgres_types import (
     DatabaseConnection,
@@ -119,7 +66,20 @@ from mindbridge.infrastructure._postgres_types import (
 )
 
 
-class PostgresMemoryStore:
+class PostgresMemoryStore(
+    ObservationWriteOperations,
+    ObservationReadOperations,
+    ObservationJobOperations,
+    MemoryOperations,
+    LifecycleOperations,
+    FeedbackOperations,
+    ForgetOperations,
+    EmbeddingReadOperations,
+    EvidenceReadOperations,
+    EpisodeCandidateOperations,
+    ClaimCandidateOperations,
+    SummaryCandidateOperations,
+):
     """Transactional PostgreSQL implementation of the memory store boundary."""
 
     def __init__(
@@ -169,14 +129,6 @@ class PostgresMemoryStore:
             await self._pool.close()
             raise MemoryIntegrityError(self._schema_refusal)
 
-    async def list_known_clip_digests(
-        self,
-        tenant_id: TenantId,
-        digests: tuple[str, ...],
-    ) -> frozenset[str]:
-        """Report which stored clip digests the database still references."""
-        return await list_known_clip_digests(self._pool, tenant_id, digests)
-
     def _require_index_dimension(self, embeddings: Iterable[EmbeddingRecord]) -> None:
         """Reject vectors the configured pgvector index cannot store."""
         for embedding in embeddings:
@@ -189,74 +141,6 @@ class PostgresMemoryStore:
     async def close(self) -> None:
         """Close pooled connections cleanly during application shutdown."""
         await self._pool.close()
-
-    async def write_observation(
-        self,
-        batch: ObservationBatch,
-        *,
-        idempotency_key: str,
-        content_digest: str,
-    ) -> ObservationWriteResult:
-        """Atomically persist media, observation, and exact evidence spans."""
-        return await write_observation(
-            self._pool,
-            batch,
-            idempotency_key=idempotency_key,
-            content_digest=content_digest,
-        )
-
-    async def write_memory(
-        self,
-        memory: MemoryRecord,
-        *,
-        idempotency_key: str,
-        content_digest: str,
-    ) -> MemoryWriteResult:
-        """Persist one explicit memory and its evidence links atomically."""
-        return await write_memory(
-            self._pool,
-            memory,
-            idempotency_key=idempotency_key,
-            content_digest=content_digest,
-        )
-
-    async def list_memories_for_lifecycle(
-        self,
-        tenant_id: TenantId,
-        *,
-        evaluated_at: datetime,
-        after_memory_id: MemoryId | None,
-        limit: int,
-    ) -> tuple[MemoryRecord, ...]:
-        """Read one stable page eligible for automatic state evolution."""
-        return await list_memories_for_lifecycle(
-            self._pool,
-            tenant_id,
-            evaluated_at=evaluated_at,
-            after_memory_id=after_memory_id,
-            limit=limit,
-        )
-
-    async def list_episode_candidates(
-        self,
-        request: EpisodeCandidateRequest,
-    ) -> EpisodeCandidatePage:
-        """Discover a stable bounded page for Omni episode verification."""
-        return await list_episode_candidates(self._pool, request)
-
-    async def list_claim_candidates(
-        self,
-        request: ClaimCandidateRequest,
-    ) -> ClaimCandidatePage:
-        """Discover a stable bounded page for semantic Claim verification."""
-        return await list_claim_candidates(self._pool, request)
-
-    async def list_summary_candidates(
-        self,
-        request: SummaryCandidateRequest,
-    ) -> SummaryCandidatePage:
-        """Discover a stable bounded page for hierarchical Summary verification."""
-        return await list_summary_candidates(self._pool, request)
 
     async def commit_summary_consolidation(
         self,
@@ -285,77 +169,6 @@ class PostgresMemoryStore:
         self._require_index_dimension(write.embedding for write in writes)
         return await commit_episode_consolidation(self._pool, tenant_id, writes)
 
-    async def update_memory_lifecycles(
-        self,
-        changes: tuple[MemoryLifecycleChange, ...],
-        *,
-        evaluated_at: datetime,
-    ) -> int:
-        """Optimistically persist automatic score and state changes."""
-        return await update_memory_lifecycles(
-            self._pool,
-            changes,
-            evaluated_at=evaluated_at,
-        )
-
-    async def read_memory(
-        self,
-        tenant_id: TenantId,
-        memory_id: MemoryId,
-    ) -> MemoryRecord:
-        """Read one tenant-owned memory or raise the stable not-found error."""
-        return await read_memory(self._pool, tenant_id, memory_id)
-
-    async def record_feedback(
-        self,
-        feedback: MemoryFeedback,
-        corrected_memory: MemoryRecord | None,
-        *,
-        idempotency_key: str,
-        content_digest: str,
-    ) -> FeedbackWriteResult:
-        """Atomically retain feedback and evolve its target memory."""
-        return await record_feedback(
-            self._pool,
-            feedback,
-            corrected_memory,
-            idempotency_key=idempotency_key,
-            content_digest=content_digest,
-        )
-
-    async def prepare_forget(
-        self,
-        tombstone: DeletionTombstone,
-        *,
-        idempotency_key: str,
-        content_digest: str,
-    ) -> ForgetPlan:
-        """Persist the deletion barrier and return external media work."""
-        return await prepare_forget(
-            self._pool,
-            tombstone,
-            idempotency_key=idempotency_key,
-            content_digest=content_digest,
-        )
-
-    async def complete_forget(
-        self,
-        tombstone: DeletionTombstone,
-        *,
-        completed_at: datetime,
-    ) -> DeletionTombstone:
-        """Erase database derivatives after external media deletion."""
-        return await complete_forget(self._pool, tombstone, completed_at=completed_at)
-
-    async def mark_forget_failed(
-        self,
-        tombstone: DeletionTombstone,
-        *,
-        error_code: str,
-    ) -> DeletionTombstone:
-        """Keep a recoverable sanitized deletion failure."""
-        return await mark_forget_failed(self._pool, tombstone, error_code=error_code)
-
     async def read_deletion_tombstone(
         self,
         tenant_id: TenantId,
@@ -364,195 +177,15 @@ class PostgresMemoryStore:
         """Read one tenant-owned deletion propagation state."""
         return await read_deletion_tombstone(self._pool, tenant_id, TombstoneId(tombstone_id))
 
-    async def list_deletion_tombstones(
-        self,
-        tenant_id: TenantId,
-        *,
-        after_tombstone_id: str | None,
-        limit: int,
-    ) -> tuple[DeletionTombstone, ...]:
-        """List deletion barriers in stable propagation order."""
-        return await list_deletion_tombstones(
-            self._pool,
-            tenant_id,
-            after_tombstone_id=after_tombstone_id,
-            limit=limit,
-        )
-
-    async def search_memories(
-        self,
-        request: RecallRequest,
-        *,
-        limit: int,
-    ) -> tuple[MemoryRecord, ...]:
-        """Apply exact filters and PostgreSQL full-text candidate retrieval."""
-        return await search_memories(self._pool, request, limit=limit)
-
-    async def list_memories_for_enumeration(
-        self,
-        request: RecallRequest,
-        *,
-        limit: int,
-    ) -> tuple[MemoryRecord, ...]:
-        """Scan an exact structured-filter scope in chronological order."""
-        return await list_memories_for_enumeration(self._pool, request, limit=limit)
-
-    async def search_memories_by_evidence(
-        self,
-        request: RecallRequest,
-        ranked_evidence_ids: tuple[EvidenceId, ...],
-        *,
-        limit: int,
-    ) -> tuple[MemoryRecord, ...]:
-        """Map ranked semantic evidence hits to filtered memory candidates."""
-        return await search_memories_by_evidence(
-            self._pool,
-            request,
-            ranked_evidence_ids,
-            limit=limit,
-        )
-
-    async def search_memories_by_ids(
-        self,
-        request: RecallRequest,
-        ranked_memory_ids: tuple[MemoryId, ...],
-        *,
-        limit: int,
-    ) -> tuple[MemoryRecord, ...]:
-        """Resolve ranked memory-vector hits with exact recall filters."""
-        return await search_memories_by_ids(
-            self._pool,
-            request,
-            ranked_memory_ids,
-            limit=limit,
-        )
-
-    async def search_memories_by_hierarchy(
-        self,
-        request: RecallRequest,
-        ranked_memory_ids: tuple[MemoryId, ...],
-        *,
-        limit: int,
-    ) -> tuple[MemoryRecord, ...]:
-        """Expand semantic Memory hits through their Summary descendants."""
-        return await search_memories_by_hierarchy(
-            self._pool,
-            request,
-            ranked_memory_ids,
-            limit=limit,
-        )
-
-    async def search_memories_by_graph_objects(
-        self,
-        request: RecallRequest,
-        ranked_objects: tuple[EmbeddingMatch, ...],
-        *,
-        limit: int,
-    ) -> tuple[MemoryRecord, ...]:
-        """Follow ranked Event/Claim representation edges with exact filters."""
-        return await search_memories_by_graph_objects(
-            self._pool,
-            request,
-            ranked_objects,
-            limit=limit,
-        )
-
-    async def record_memory_accesses(
-        self,
-        tenant_id: TenantId,
-        memory_ids: tuple[MemoryId, ...],
-        *,
-        accessed_at: datetime,
-    ) -> tuple[MemoryRecord, ...]:
-        """Record selected recall results and return their current rows in input order."""
-        return await record_memory_accesses(
-            self._pool,
-            tenant_id,
-            memory_ids,
-            accessed_at=accessed_at,
-        )
-
-    async def read_evidence(
-        self,
-        tenant_id: TenantId,
-        evidence_ids: tuple[EvidenceId, ...],
-    ) -> tuple[EvidenceSpan, ...]:
-        """Read exact evidence spans while preserving caller order."""
-        return await read_evidence(self._pool, tenant_id, evidence_ids)
-
-    async def read_media_objects(
-        self,
-        tenant_id: TenantId,
-        media_object_ids: tuple[MediaObjectId, ...],
-    ) -> tuple[MediaObject, ...]:
-        """Read media metadata for evidence resolution in caller order."""
-        return await read_media_objects(self._pool, tenant_id, media_object_ids)
-
-    async def read_observation_processing_job(
-        self,
-        tenant_id: TenantId,
-        job_id: JobId,
-    ) -> ObservationProcessingJob:
-        """Read one tenant-owned observation processing state."""
-        return await read_observation_processing_job(self._pool, tenant_id, job_id)
-
-    async def read_observation_batch(
-        self,
-        tenant_id: TenantId,
-        observation_id: ObservationId,
-    ) -> ObservationBatch:
-        """Read one immutable observation with its complete source evidence."""
-        return await read_observation_batch(self._pool, tenant_id, observation_id)
-
     async def write_embedding(self, embedding: EmbeddingRecord) -> bool:
         """Persist one immutable vector version."""
         self._require_index_dimension((embedding,))
         return await write_embedding(self._pool, embedding)
 
-    async def has_embedding(self, tenant_id: TenantId, embedding_id: EmbeddingId) -> bool:
-        """Avoid recomputing an immutable vector during idempotent retries."""
-        return await has_embedding(self._pool, tenant_id, embedding_id)
-
     async def search_embeddings(self, search: EmbeddingSearch) -> tuple[EmbeddingMatch, ...]:
         """Search one explicit frozen embedding space by cosine similarity."""
         return await search_embeddings(
             self._pool, search, expected_dimension=self._embedding_dimension
-        )
-
-    async def unreachable_embedded_object_types(
-        self,
-        tenant_id: TenantId,
-        space_reference: EmbeddingSpaceReference,
-    ) -> tuple[EmbeddedObjectType, ...]:
-        """Report the object types whose stored vectors no query in this space can reach."""
-        return await unreachable_embedded_object_types(self._pool, tenant_id, space_reference)
-
-    async def claim_observation_processing_job(
-        self,
-        tenant_id: TenantId,
-        observation_id: ObservationId,
-        job_id: JobId,
-    ) -> ObservationJobClaim:
-        """Claim one ready job or report its current durable state."""
-        return await claim_observation_processing_job(self._pool, tenant_id, observation_id, job_id)
-
-    async def mark_observation_processing_failed(
-        self,
-        tenant_id: TenantId,
-        observation_id: ObservationId,
-        job_id: JobId,
-        *,
-        attempt: int,
-        error_code: str,
-    ) -> ObservationProcessingJob:
-        """Record a sanitized failure that remains eligible for retry."""
-        return await mark_observation_processing_failed(
-            self._pool,
-            tenant_id,
-            observation_id,
-            job_id,
-            attempt=attempt,
-            error_code=error_code,
         )
 
     async def commit_observation_processing(

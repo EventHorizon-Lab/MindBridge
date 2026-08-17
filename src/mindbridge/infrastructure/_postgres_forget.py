@@ -26,6 +26,7 @@ from mindbridge.infrastructure._postgres_idempotency import claim_idempotency_ke
 from mindbridge.infrastructure._postgres_types import (
     DatabaseConnection,
     DatabasePool,
+    PostgresStoreOperations,
     tenant_connection,
 )
 
@@ -41,57 +42,6 @@ TombstoneRow: TypeAlias = tuple[
 ]
 
 
-async def prepare_forget(
-    pool: DatabasePool,
-    tombstone: DeletionTombstone,
-    *,
-    idempotency_key: str,
-    content_digest: str,
-) -> ForgetPlan:
-    """Persist the deletion barrier and plan remaining object-store erasure."""
-    async with tenant_connection(pool, tombstone.tenant_id) as connection:
-        existing_id = await claim_idempotency_key(
-            connection,
-            tenant_id=tombstone.tenant_id,
-            operation="forget",
-            idempotency_key=idempotency_key,
-            content_digest=content_digest,
-            resource_id=tombstone.tombstone_id,
-        )
-        if existing_id is not None and existing_id != tombstone.tombstone_id:
-            raise MemoryIntegrityError("forget idempotency key references another tombstone")
-
-        existing = await _find_target_tombstone(
-            connection,
-            tombstone.tenant_id,
-            tombstone.target_type,
-            tombstone.target_id,
-            for_update=True,
-        )
-        if existing is None:
-            await _lock_forget_target(connection, tombstone)
-            existing = await _find_target_tombstone(
-                connection,
-                tombstone.tenant_id,
-                tombstone.target_type,
-                tombstone.target_id,
-                for_update=True,
-            )
-            if existing is None:
-                existing = await _insert_tombstone(connection, tombstone)
-        elif existing.tombstone_id != tombstone.tombstone_id:
-            raise MemoryIntegrityError("forget target has conflicting tombstone identity")
-
-        propagating = await _begin_propagation(connection, existing)
-        media_objects = (
-            await lock_exclusive_observation_media(connection, propagating)
-            if propagating.target_type is ForgetTargetType.OBSERVATION
-            and propagating.propagation_state is not DeletionPropagationState.COMPLETE
-            else ()
-        )
-        return ForgetPlan(tombstone=propagating, media_objects=media_objects)
-
-
 async def read_deletion_tombstone(
     pool: DatabasePool,
     tenant_id: TenantId,
@@ -103,94 +53,6 @@ async def read_deletion_tombstone(
     if tombstone is None:
         raise ForgetTargetNotFoundError("deletion tombstone does not exist")
     return tombstone
-
-
-async def list_deletion_tombstones(
-    pool: DatabasePool,
-    tenant_id: TenantId,
-    *,
-    after_tombstone_id: str | None,
-    limit: int,
-) -> tuple[DeletionTombstone, ...]:
-    """List one stable tenant page after an optional tombstone cursor."""
-    async with tenant_connection(pool, tenant_id) as connection:
-        after_sequence = 0
-        if after_tombstone_id is not None:
-            boundary = await connection.execute(
-                """
-                SELECT cursor_sequence FROM deletion_tombstones
-                WHERE tenant_id = %s AND tombstone_id = %s
-                """,
-                (tenant_id, after_tombstone_id),
-            )
-            row = await boundary.fetchone()
-            if row is None:
-                raise DomainInvariantError("deletion cursor does not exist")
-            after_sequence = cast(tuple[int], row)[0]
-        cursor = await connection.execute(
-            """
-            SELECT tombstone_id, tenant_id, target_type, target_id,
-                   propagation_state, requested_at, completed_at, error_code
-            FROM deletion_tombstones AS tombstone
-            WHERE tombstone.tenant_id = %s
-              AND tombstone.cursor_sequence > %s
-            ORDER BY tombstone.cursor_sequence
-            LIMIT %s
-            """,
-            (tenant_id, after_sequence, limit),
-        )
-        return tuple([_tombstone_from_row(cast(TombstoneRow, row)) async for row in cursor])
-
-
-async def complete_forget(
-    pool: DatabasePool,
-    tombstone: DeletionTombstone,
-    *,
-    completed_at: datetime,
-) -> DeletionTombstone:
-    """Erase database derivatives and atomically mark propagation complete."""
-    async with tenant_connection(pool, tombstone.tenant_id) as connection:
-        stored = await _require_matching_tombstone(connection, tombstone)
-        if stored.propagation_state is DeletionPropagationState.COMPLETE:
-            return stored
-        if stored.propagation_state is not DeletionPropagationState.PROPAGATING:
-            raise MemoryIntegrityError("forget completion requires propagating state")
-        if stored.target_type is ForgetTargetType.MEMORY_RECORD:
-            await delete_memory_scope(connection, stored.tenant_id, (stored.target_id,))
-        else:
-            await delete_observation_scope(
-                connection,
-                stored,
-                completed_at=completed_at,
-            )
-        return await _set_tombstone_complete(connection, stored, completed_at)
-
-
-async def mark_forget_failed(
-    pool: DatabasePool,
-    tombstone: DeletionTombstone,
-    *,
-    error_code: str,
-) -> DeletionTombstone:
-    """Retain a sanitized recoverable failure while the barrier stays active."""
-    async with tenant_connection(pool, tombstone.tenant_id) as connection:
-        stored = await _require_matching_tombstone(connection, tombstone)
-        if stored.propagation_state is DeletionPropagationState.COMPLETE:
-            return stored
-        cursor = await connection.execute(
-            """
-            UPDATE deletion_tombstones
-            SET propagation_state = 'failed', completed_at = NULL, error_code = %s
-            WHERE tenant_id = %s AND tombstone_id = %s
-            RETURNING tombstone_id, tenant_id, target_type, target_id,
-                      propagation_state, requested_at, completed_at, error_code
-            """,
-            (error_code, stored.tenant_id, stored.tombstone_id),
-        )
-        row = await cursor.fetchone()
-        if row is None:
-            raise MemoryIntegrityError("deletion tombstone disappeared during failure update")
-        return _tombstone_from_row(cast(TombstoneRow, row))
 
 
 async def ensure_target_not_tombstoned(
@@ -424,3 +286,140 @@ def _tombstone_from_row(row: TombstoneRow) -> DeletionTombstone:
         completed_at=completed_at,
         error_code=error_code,
     )
+
+
+class ForgetOperations(PostgresStoreOperations):
+    async def prepare_forget(
+        self,
+        tombstone: DeletionTombstone,
+        *,
+        idempotency_key: str,
+        content_digest: str,
+    ) -> ForgetPlan:
+        """Persist the deletion barrier and plan remaining object-store erasure."""
+        async with tenant_connection(self._pool, tombstone.tenant_id) as connection:
+            existing_id = await claim_idempotency_key(
+                connection,
+                tenant_id=tombstone.tenant_id,
+                operation="forget",
+                idempotency_key=idempotency_key,
+                content_digest=content_digest,
+                resource_id=tombstone.tombstone_id,
+            )
+            if existing_id is not None and existing_id != tombstone.tombstone_id:
+                raise MemoryIntegrityError("forget idempotency key references another tombstone")
+
+            existing = await _find_target_tombstone(
+                connection,
+                tombstone.tenant_id,
+                tombstone.target_type,
+                tombstone.target_id,
+                for_update=True,
+            )
+            if existing is None:
+                await _lock_forget_target(connection, tombstone)
+                existing = await _find_target_tombstone(
+                    connection,
+                    tombstone.tenant_id,
+                    tombstone.target_type,
+                    tombstone.target_id,
+                    for_update=True,
+                )
+                if existing is None:
+                    existing = await _insert_tombstone(connection, tombstone)
+            elif existing.tombstone_id != tombstone.tombstone_id:
+                raise MemoryIntegrityError("forget target has conflicting tombstone identity")
+
+            propagating = await _begin_propagation(connection, existing)
+            media_objects = (
+                await lock_exclusive_observation_media(connection, propagating)
+                if propagating.target_type is ForgetTargetType.OBSERVATION
+                and propagating.propagation_state is not DeletionPropagationState.COMPLETE
+                else ()
+            )
+            return ForgetPlan(tombstone=propagating, media_objects=media_objects)
+
+    async def list_deletion_tombstones(
+        self,
+        tenant_id: TenantId,
+        *,
+        after_tombstone_id: str | None,
+        limit: int,
+    ) -> tuple[DeletionTombstone, ...]:
+        """List one stable tenant page after an optional tombstone cursor."""
+        async with tenant_connection(self._pool, tenant_id) as connection:
+            after_sequence = 0
+            if after_tombstone_id is not None:
+                boundary = await connection.execute(
+                    """
+                    SELECT cursor_sequence FROM deletion_tombstones
+                    WHERE tenant_id = %s AND tombstone_id = %s
+                    """,
+                    (tenant_id, after_tombstone_id),
+                )
+                row = await boundary.fetchone()
+                if row is None:
+                    raise DomainInvariantError("deletion cursor does not exist")
+                after_sequence = cast(tuple[int], row)[0]
+            cursor = await connection.execute(
+                """
+                SELECT tombstone_id, tenant_id, target_type, target_id,
+                       propagation_state, requested_at, completed_at, error_code
+                FROM deletion_tombstones AS tombstone
+                WHERE tombstone.tenant_id = %s
+                  AND tombstone.cursor_sequence > %s
+                ORDER BY tombstone.cursor_sequence
+                LIMIT %s
+                """,
+                (tenant_id, after_sequence, limit),
+            )
+            return tuple([_tombstone_from_row(cast(TombstoneRow, row)) async for row in cursor])
+
+    async def complete_forget(
+        self,
+        tombstone: DeletionTombstone,
+        *,
+        completed_at: datetime,
+    ) -> DeletionTombstone:
+        """Erase database derivatives and atomically mark propagation complete."""
+        async with tenant_connection(self._pool, tombstone.tenant_id) as connection:
+            stored = await _require_matching_tombstone(connection, tombstone)
+            if stored.propagation_state is DeletionPropagationState.COMPLETE:
+                return stored
+            if stored.propagation_state is not DeletionPropagationState.PROPAGATING:
+                raise MemoryIntegrityError("forget completion requires propagating state")
+            if stored.target_type is ForgetTargetType.MEMORY_RECORD:
+                await delete_memory_scope(connection, stored.tenant_id, (stored.target_id,))
+            else:
+                await delete_observation_scope(
+                    connection,
+                    stored,
+                    completed_at=completed_at,
+                )
+            return await _set_tombstone_complete(connection, stored, completed_at)
+
+    async def mark_forget_failed(
+        self,
+        tombstone: DeletionTombstone,
+        *,
+        error_code: str,
+    ) -> DeletionTombstone:
+        """Retain a sanitized recoverable failure while the barrier stays active."""
+        async with tenant_connection(self._pool, tombstone.tenant_id) as connection:
+            stored = await _require_matching_tombstone(connection, tombstone)
+            if stored.propagation_state is DeletionPropagationState.COMPLETE:
+                return stored
+            cursor = await connection.execute(
+                """
+                UPDATE deletion_tombstones
+                SET propagation_state = 'failed', completed_at = NULL, error_code = %s
+                WHERE tenant_id = %s AND tombstone_id = %s
+                RETURNING tombstone_id, tenant_id, target_type, target_id,
+                          propagation_state, requested_at, completed_at, error_code
+                """,
+                (error_code, stored.tenant_id, stored.tombstone_id),
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                raise MemoryIntegrityError("deletion tombstone disappeared during failure update")
+            return _tombstone_from_row(cast(TombstoneRow, row))

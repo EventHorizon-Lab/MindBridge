@@ -27,7 +27,7 @@ from mindbridge.infrastructure._postgres_memories import (
 )
 from mindbridge.infrastructure._postgres_types import (
     DatabaseConnection,
-    DatabasePool,
+    PostgresStoreOperations,
     tenant_connection,
 )
 
@@ -40,80 +40,6 @@ FeedbackRow: TypeAlias = tuple[
     float | None,
     datetime,
 ]
-
-
-async def record_feedback(
-    pool: DatabasePool,
-    feedback: MemoryFeedback,
-    corrected_memory: MemoryRecord | None,
-    *,
-    idempotency_key: str,
-    content_digest: str,
-) -> FeedbackWriteResult:
-    """Atomically record feedback, lifecycle counters, and any correction version."""
-    async with tenant_connection(pool, feedback.tenant_id) as connection:
-        existing_id = await claim_idempotency_key(
-            connection,
-            tenant_id=feedback.tenant_id,
-            operation="feedback",
-            idempotency_key=idempotency_key,
-            content_digest=content_digest,
-            resource_id=feedback.feedback_id,
-        )
-        if existing_id is not None:
-            return await _read_feedback_result(
-                connection,
-                feedback.tenant_id,
-                FeedbackId(existing_id),
-                created=False,
-            )
-
-        evolved_memory = await _evolve_target_memory(connection, feedback)
-        if feedback.feedback_type is FeedbackType.CORRECTION:
-            _require_corrected_memory(feedback, corrected_memory)
-            assert corrected_memory is not None
-            await write_memory_on_connection(connection, corrected_memory, content_digest)
-            assert evolved_memory is not None
-            evolved_memory = replace(evolved_memory, superseded_at=feedback.created_at)
-        elif corrected_memory is not None:
-            raise DomainInvariantError("only correction feedback may create a memory version")
-
-        if evolved_memory is not None:
-            await _update_memory_lifecycle(
-                connection,
-                evolved_memory,
-                changed_at=feedback.created_at,
-            )
-        await connection.execute(
-            """
-            INSERT INTO memory_feedback (
-                tenant_id, feedback_id, memory_id, feedback_type, recall_trace_id,
-                corrected_memory_id, resulting_state, resulting_strength, created_at
-            )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-            """,
-            (
-                feedback.tenant_id,
-                feedback.feedback_id,
-                feedback.memory_id,
-                feedback.feedback_type.value,
-                feedback.recall_trace_id,
-                corrected_memory.memory_id if corrected_memory is not None else None,
-                evolved_memory.state.value if evolved_memory is not None else None,
-                evolved_memory.strength if evolved_memory is not None else None,
-                feedback.created_at,
-            ),
-        )
-        return FeedbackWriteResult(
-            feedback_id=feedback.feedback_id,
-            feedback_type=feedback.feedback_type,
-            memory_id=feedback.memory_id,
-            created_at=feedback.created_at,
-            resulting_state=evolved_memory.state if evolved_memory is not None else None,
-            resulting_strength=evolved_memory.strength if evolved_memory is not None else None,
-            corrected_memory=corrected_memory,
-            created=True,
-        )
 
 
 async def _evolve_target_memory(
@@ -230,3 +156,78 @@ async def _read_feedback_result(
         corrected_memory=corrected_memory,
         created=created,
     )
+
+
+class FeedbackOperations(PostgresStoreOperations):
+    async def record_feedback(
+        self,
+        feedback: MemoryFeedback,
+        corrected_memory: MemoryRecord | None,
+        *,
+        idempotency_key: str,
+        content_digest: str,
+    ) -> FeedbackWriteResult:
+        """Atomically record feedback, lifecycle counters, and any correction version."""
+        async with tenant_connection(self._pool, feedback.tenant_id) as connection:
+            existing_id = await claim_idempotency_key(
+                connection,
+                tenant_id=feedback.tenant_id,
+                operation="feedback",
+                idempotency_key=idempotency_key,
+                content_digest=content_digest,
+                resource_id=feedback.feedback_id,
+            )
+            if existing_id is not None:
+                return await _read_feedback_result(
+                    connection,
+                    feedback.tenant_id,
+                    FeedbackId(existing_id),
+                    created=False,
+                )
+
+            evolved_memory = await _evolve_target_memory(connection, feedback)
+            if feedback.feedback_type is FeedbackType.CORRECTION:
+                _require_corrected_memory(feedback, corrected_memory)
+                assert corrected_memory is not None
+                await write_memory_on_connection(connection, corrected_memory, content_digest)
+                assert evolved_memory is not None
+                evolved_memory = replace(evolved_memory, superseded_at=feedback.created_at)
+            elif corrected_memory is not None:
+                raise DomainInvariantError("only correction feedback may create a memory version")
+
+            if evolved_memory is not None:
+                await _update_memory_lifecycle(
+                    connection,
+                    evolved_memory,
+                    changed_at=feedback.created_at,
+                )
+            await connection.execute(
+                """
+                INSERT INTO memory_feedback (
+                    tenant_id, feedback_id, memory_id, feedback_type, recall_trace_id,
+                    corrected_memory_id, resulting_state, resulting_strength, created_at
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    feedback.tenant_id,
+                    feedback.feedback_id,
+                    feedback.memory_id,
+                    feedback.feedback_type.value,
+                    feedback.recall_trace_id,
+                    corrected_memory.memory_id if corrected_memory is not None else None,
+                    evolved_memory.state.value if evolved_memory is not None else None,
+                    evolved_memory.strength if evolved_memory is not None else None,
+                    feedback.created_at,
+                ),
+            )
+            return FeedbackWriteResult(
+                feedback_id=feedback.feedback_id,
+                feedback_type=feedback.feedback_type,
+                memory_id=feedback.memory_id,
+                created_at=feedback.created_at,
+                resulting_state=evolved_memory.state if evolved_memory is not None else None,
+                resulting_strength=evolved_memory.strength if evolved_memory is not None else None,
+                corrected_memory=corrected_memory,
+                created=True,
+            )
