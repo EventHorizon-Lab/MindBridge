@@ -57,21 +57,41 @@ platform will.
 
 `POST /aml/add`
 - Accepts `{request_id, messages[], user_id, session_id}`.
-- Feeds the chunk to `OpenAIGenerator` (`qwen3.8-max`, `json_mode`) to extract
-  atomic facts, preferences, and rules.
-- Writes each extracted item through `remember()`.
-- **Blocks until every processing job reaches `SUCCEEDED` before returning 200.**
-  AML requires that a 200 means the content is already searchable.
+- Feeds the chunk to the configured `Generator` (`qwen3.8-max`, `json_mode`) to
+  extract atomic facts, preferences, and rules.
+- Writes each extracted item through `kernel.remember()`.
 - Echoes `request_id`, `user_id`, and `session_id` byte for byte.
+
+AML requires that a 200 means the content is already searchable. `remember()`
+already satisfies this: it awaits `_index_memory` before returning, so the
+embedding is written inline. No job polling is involved — the asynchronous
+job path belongs to `/v1/observations`, not to `remember()`.
 
 `POST /aml/search`
 - Accepts `{query, options?, user_id, top_k}`.
-- Issues `RecallRequest(mode=EVIDENCE, limit=top_k)`.
-- Flattens the result to `{id, content, score, created_at}`, ranked.
+- Issues `RecallRequest(mode=RecallMode.SEARCH, limit=top_k,
+  include_evidence=False)`.
+- Maps `RecallResult.memories` to `{id: memory_id, content: summary,
+  created_at}`, preserving rank order. `score` is omitted: `MemoryView` carries
+  `salience` and `strength`, neither of which is a query-relevance score, and
+  AML treats the field as optional and the array order as authoritative.
+  `EvidenceView` is media-shaped (`media_url`) and irrelevant to text
+  benchmarks.
 
-`user_id` maps one-to-one onto `tenant_id`, reusing the existing
-`tenant_prefix` convention. Tenant isolation is already enforced below the API,
-which satisfies AML's cross-user retrieval prohibition without new code.
+### Tenant derivation and authorization
+
+`TenantApiKeyAuthenticator` proves an **exact set** of tenant IDs per key.
+AML supplies arbitrary `user_id` values (`eval:<run_id>:locomo:conv-0`) that
+cannot be enumerated in advance, so the AML routes need their own rule.
+
+One AML key authorizes one tenant **namespace**. The route derives
+`tenant_id = f"{prefix}:{sha256(user_id).hexdigest()[:32]}"` and never accepts
+a caller-supplied tenant. A caller therefore cannot name a tenant outside the
+namespace, and distinct `user_id`s cannot collide into one tenant — which is
+what AML's cross-user retrieval prohibition requires. Hashing also keeps the
+identifier inside the 255-character `Identifier` limit regardless of what AML
+sends. The readable `user_id` to `tenant_id` mapping is recorded in the run
+manifest for debugging.
 
 Health check: `GET /healthz` is unchanged. AML's health endpoint is
 configurable and only defaults to `/health`, so the submission form carries
@@ -166,6 +186,17 @@ chunks, each costing one extraction call plus N `remember()` writes.
 - Extraction results cache to disk keyed by chunk hash, making reruns free.
 - Driver output is append-only JSONL, matching the resume behaviour the
   official pipelines already implement through their `done` set.
+
+## Repository conventions this work must satisfy
+
+- The extraction prompt is a `PromptSpec` in `mindbridge.prompts.ALL_PROMPTS`,
+  with its sha256 registered in `tests/contracts/test_prompt_catalog.py`.
+  Prompt text cannot change without a version bump.
+- New routes change `tests/contracts/snapshots/openapi.json`; the snapshot is
+  regenerated in the same commit that adds them.
+- The run manifest follows the existing runner fields (`source_repository`,
+  `source_revision`, `source_sha256`, `code_revision`, `deployment`, `run_id`,
+  `tenant_prefix`, `recall_limit`, `request_concurrency`).
 
 ## Testing
 
