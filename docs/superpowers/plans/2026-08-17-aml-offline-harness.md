@@ -308,7 +308,9 @@ git commit -m "Add AML fact extraction prompt"
 
 **Interfaces:**
 - Consumes: `AmlMessage` (Task 1), `AML_EXTRACT_FACTS_PROMPT` (Task 2), `mindbridge.models.Generator`, `GenerateRequest`, `GenerateResult`, `ModelInput`, `TextPart`
-- Produces: `ExtractedMemory(summary: str, memory_type: MemoryType, occurred_at: datetime)`, `async extract_memories(generator: Generator, messages: Sequence[AmlMessage], *, now: datetime) -> tuple[ExtractedMemory, ...]`
+- Produces: `ExtractedMemory(summary: str, memory_type: MemoryType, occurred_at: datetime)`, `ExtractionOutcome(memories: tuple[ExtractedMemory, ...], skipped: int)`, `async extract_memories(generator: Generator, messages: Sequence[AmlMessageLike], *, now: datetime) -> ExtractionOutcome`
+
+**As built, differing from the code below.** Three corrections were applied during execution and are binding on later tasks: capability types are imported from `mindbridge.application.capabilities`, not `mindbridge.models`; the `messages` parameter is typed by a local `Protocol` rather than importing `AmlMessage` from the API layer; and a malformed item inside the `memories` list is skipped and counted rather than raising, so one bad item cannot discard its siblings. Whole-response failures — output that is not JSON, or a payload with no `memories` list — still raise `ModelOutputError`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -764,7 +766,7 @@ def register_aml_routes(
         _: None = Security(authorize),
     ) -> AmlAddResponse:
         tenant_id = derive_tenant_id(settings.tenant_prefix, request.user_id)
-        memories = await extract_memories(
+        outcome = await extract_memories(
             generator,
             request.messages,
             now=datetime.now(tz=timezone.utc),
@@ -779,7 +781,7 @@ def register_aml_routes(
                         occurred_at=memory.occurred_at,
                     )
                 )
-                for memory in memories
+                for memory in outcome.memories
             )
         )
         return AmlAddResponse(
