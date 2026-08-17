@@ -1051,6 +1051,10 @@ Each loader is one file under `src/mindbridge/benchmarks/aml/loaders/` exporting
 
 **Fixtures are hand-written, not copied wholesale.** Each test builds a small file with the same *shape* as the real dataset — two or three records, a couple of messages each — and asserts against it. Do not vendor slices of the real corpora into `tests/`: several are gigabytes, and some carry upstream licence terms.
 
+**A case is a retrieval scope, and the scope is fixed at ingestion time.** Under AML's protocol, `Add` writes a history and `Search` retrieves against a `user_id`; by search time the memories are already stored. There is no per-question slicing opportunity anywhere downstream. So whenever a dataset's questions are each generated against a *different prefix* of a shared history, the loader must split those into separate cases — one per distinct prefix — rather than emitting one case and expecting the driver to truncate. Emitting the full history instead leaks later conversation into questions asked about an earlier state, which shows up as a lower score that the memory system did not earn.
+
+PersonaMem v1 is the worked example: grouping by `(shared_context_id, end_index_in_shared_context)` gives 222 cases and 35,918 ingested messages, against 589 cases and 98,434 messages for one-case-per-question, and 37 cases and 6,425 messages for the leaking one-case-per-scope version. Grouping on the prefix is exactly as correct as per-question at a third of the cost. Check every dataset for the same hazard.
+
 **Every loader task follows the same five steps:** write the failing test, run it to see the import error, write the loader, run it green, commit. Each ends with the gate from Global Constraints.
 
 **ScriptMem is deliberately absent.** Its public release ships questions, gold answers, and scoring code, but every `conversation` field in both `data/public/conversations.jsonl` and `data/raw/*.json` contains only the placeholder `{"format_example": ...}` — the four source scripts are not distributed. With no corpus to ingest there is nothing for a memory system to retrieve, so an offline ScriptMem number would measure nothing. A real AML submission is unaffected: the platform runs ScriptMem server-side against its own copy.
@@ -1129,8 +1133,8 @@ Schema reference: section 3b. Sources: `.benchmarks/personamem-v2/benchmark/text
 
 v2 is a **different dataset from v1, not another split**, and its pipeline reads different keys.
 
-- Scope is one persona; `user_id = f"personamem-v2:{persona_id}"`.
 - Resolve chat history through the CSV's `chat_history_32k_link` column. A persona has several timestamped snapshots, so never reconstruct the filename from `persona_id`.
+- **Scope follows the prefix rule above.** A persona with several snapshots is the same hazard PersonaMem v1 had in a different shape: two rows pointing at different snapshots of one persona are two different histories and must be two cases. Determine from the real CSV whether rows for one `persona_id` ever differ in their link column, and scope on `(persona_id, chat_history_link)` if so — `user_id = f"personamem-v2:{persona_id}:{snapshot}"`. Report the counts you measured either way.
 - The CSV has **no id column of any kind**. Synthesize `f"persona{persona_id}-{row_index}"` using file-read order, and use the identical scheme at answer and evaluate time.
 - Payload: `id`, `user_query`, `correct_answer`, `incorrect_answers`, `persona_id`, and `preference` (which `evaluate-narrow` needs to pick its judge prompt).
 - The retrieved history goes under `chat_history`, not `context_messages` — see Task 12's emitter table.
