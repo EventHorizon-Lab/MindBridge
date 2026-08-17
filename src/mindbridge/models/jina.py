@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import math
 from collections.abc import Callable, Mapping
 from importlib import import_module
 from typing import Protocol, cast
@@ -17,9 +16,10 @@ from mindbridge.application.capabilities import (
     TextPart,
 )
 from mindbridge.configuration import (
-    config_integer,
-    config_optional_string,
-    config_string,
+    optional_plugin_string,
+    plugin_integer,
+    plugin_string,
+    reject_unknown_plugin_keys,
 )
 from mindbridge.core import (
     EmbeddingSpaceReference,
@@ -27,6 +27,7 @@ from mindbridge.core import (
     ModelReference,
     ModelUnavailableError,
 )
+from mindbridge.models._vectors import validate_embedding_vector
 from mindbridge.models.compute import select_torch_device
 from mindbridge.models.defaults import (
     DEFAULT_EMBEDDER_MODEL_ID,
@@ -186,40 +187,40 @@ class JinaEmbedder:
         if len(vectors) != len(inputs):
             raise ModelOutputError("embedding batch size does not match its inputs")
         for vector in vectors:
-            validate_jina_embedding(vector, self._dimension)
+            validate_embedding_vector(vector, self._dimension)
         return vectors
 
 
 def create_embedder(config: Mapping[str, object]) -> JinaEmbedder:
     """Entry-point factory for the bundled local Jina model."""
-    allowed = {
-        "model_id",
-        "revision",
-        "device",
-        "space_id",
-        "space_revision",
-        "dimension",
-        "max_concurrency",
-    }
-    unknown = set(config) - allowed
-    if unknown:
-        raise ValueError(f"unknown plugin configuration: {', '.join(sorted(unknown))}")
+    reject_unknown_plugin_keys(
+        config,
+        {
+            "model_id",
+            "revision",
+            "device",
+            "space_id",
+            "space_revision",
+            "dimension",
+            "max_concurrency",
+        },
+    )
     return JinaEmbedder.load(
-        model_id=config_string(config, "model_id", DEFAULT_EMBEDDER_MODEL_ID),
-        revision=config_string(config, "revision", DEFAULT_EMBEDDER_REVISION),
-        device=config_optional_string(config, "device"),
+        model_id=plugin_string(config, "model_id", DEFAULT_EMBEDDER_MODEL_ID),
+        revision=plugin_string(config, "revision", DEFAULT_EMBEDDER_REVISION),
+        device=optional_plugin_string(config, "device"),
         space_reference=EmbeddingSpaceReference(
-            space_id=config_string(config, "space_id", DEFAULT_EMBEDDING_SPACE.space_id),
-            revision=config_string(
+            space_id=plugin_string(config, "space_id", DEFAULT_EMBEDDING_SPACE.space_id),
+            revision=plugin_string(
                 config,
                 "space_revision",
                 DEFAULT_EMBEDDING_SPACE.revision,
             ),
         ),
         dimension=require_matryoshka_dimension(
-            config_integer(config, "dimension", DEFAULT_EMBEDDING_DIMENSION)
+            plugin_integer(config, "dimension", DEFAULT_EMBEDDING_DIMENSION)
         ),
-        max_concurrency=config_integer(config, "max_concurrency", 1),
+        max_concurrency=plugin_integer(config, "max_concurrency", 1),
     )
 
 
@@ -228,12 +229,3 @@ def _jina_input(input_value: ModelInput) -> str | tuple[str, ...]:
         part.text if isinstance(part, TextPart) else part.url for part in input_value.parts
     )
     return values[0] if len(values) == 1 else values
-
-
-def validate_jina_embedding(values: tuple[float, ...], dimension: int) -> None:
-    """Reject malformed vectors before they cross into a versioned index."""
-    if len(values) != dimension or not all(math.isfinite(value) for value in values):
-        raise ModelOutputError("embedding vector has invalid dimension or values")
-    norm = math.hypot(*values)
-    if not math.isclose(norm, 1.0, rel_tol=1e-4, abs_tol=1e-6):
-        raise ModelOutputError("embedding vector is not L2-normalized")

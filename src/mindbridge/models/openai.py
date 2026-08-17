@@ -3,16 +3,16 @@
 from __future__ import annotations
 
 import asyncio
-import math
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import PurePosixPath
 from time import perf_counter
 from typing import cast
 from urllib.parse import urlsplit, urlunsplit
 
 import openai
-from openai import AsyncOpenAI, Omit, omit
-from openai.types.chat import ChatCompletionMessageParam
+from openai import AsyncOpenAI, AsyncStream, Omit, omit
+from openai.types.chat import ChatCompletionChunk, ChatCompletionMessageParam
 from openai.types.create_embedding_response import CreateEmbeddingResponse
 from openai.types.shared import ReasoningEffort
 from openai.types.shared_params import ResponseFormatJSONObject
@@ -29,10 +29,11 @@ from mindbridge.application.capabilities import (
     TextPart,
 )
 from mindbridge.configuration import (
-    config_float,
-    config_integer,
-    config_optional_string,
-    config_string,
+    optional_plugin_string,
+    plugin_float,
+    plugin_integer,
+    plugin_string,
+    reject_unknown_plugin_keys,
 )
 from mindbridge.core import (
     EmbeddingSpaceReference,
@@ -42,6 +43,7 @@ from mindbridge.core import (
     ModelRequestError,
     ModelUnavailableError,
 )
+from mindbridge.models._vectors import validate_embedding_vector
 from mindbridge.models.defaults import (
     DEFAULT_EMBEDDING_DIMENSION,
     DEFAULT_GENERATOR_MODEL_ID,
@@ -144,11 +146,7 @@ class OpenAIGenerator:
                 },
             ],
         )
-        parts: list[str] = []
-        finish_reason: str | None = None
-        system_fingerprint: str | None = None
         request_started_at = perf_counter()
-        first_token_at: float | None = None
         try:
             stream = await self._client.chat.completions.create(
                 model=self._model_reference.model_id,
@@ -164,40 +162,25 @@ class OpenAIGenerator:
                 stream_options={"include_usage": True},
                 timeout=self._request_timeout_seconds,
             )
-            async for chunk in stream:
-                system_fingerprint = system_fingerprint or chunk.system_fingerprint
-                if chunk.usage is not None:
-                    set_current_span_attributes(
-                        {
-                            "mindbridge.model.input_tokens": chunk.usage.prompt_tokens,
-                            "mindbridge.model.output_tokens": chunk.usage.completion_tokens,
-                            "mindbridge.model.total_tokens": chunk.usage.total_tokens,
-                        }
-                    )
-                for choice in chunk.choices:
-                    if choice.index == 0:
-                        if choice.delta.content:
-                            if first_token_at is None:
-                                first_token_at = perf_counter()
-                            parts.append(choice.delta.content)
-                        finish_reason = finish_reason or choice.finish_reason
+            completion = await _consume_completion_stream(stream)
         except openai.APIError as error:
             _raise_model_error(error, "generation request failed")
         attributes: dict[str, str | int | float | bool] = {}
-        if first_token_at is not None:
+        if completion.first_token_at is not None:
             attributes["mindbridge.model.ttft_seconds"] = max(
-                0.0, first_token_at - request_started_at
+                0.0, completion.first_token_at - request_started_at
             )
+        if completion.system_fingerprint is not None:
+            # The serving fingerprint is observability only. Derived records key their stable
+            # IDs on model_reference, so a fingerprint that changes when the provider restarts
+            # would break idempotent replay of the same consolidation scan.
+            attributes["mindbridge.model.system_fingerprint"] = completion.system_fingerprint
         set_current_span_attributes(attributes)
-        if finish_reason in {"length", "content_filter"}:
-            raise ModelOutputError(f"generation ended with finish reason {finish_reason}")
-        return GenerateResult(
-            text="".join(parts),
-            model_reference=ModelReference(
-                model_id=self._model_reference.model_id,
-                revision=system_fingerprint or self._model_reference.revision,
-            ),
-        )
+        if completion.finish_reason in {"length", "content_filter"}:
+            raise ModelOutputError(
+                f"generation ended with finish reason {completion.finish_reason}"
+            )
+        return GenerateResult(text=completion.text, model_reference=self._model_reference)
 
     async def close(self) -> None:
         await self._client.close()
@@ -354,7 +337,7 @@ class OpenAIEmbedder:
 
 def create_generator(config: Mapping[str, object]) -> OpenAIGenerator:
     """Entry-point factory for the bundled OpenAI-compatible generator."""
-    _reject_unknown(
+    reject_unknown_plugin_keys(
         config,
         {
             "api_key",
@@ -369,26 +352,26 @@ def create_generator(config: Mapping[str, object]) -> OpenAIGenerator:
         },
     )
     return OpenAIGenerator.connect(
-        api_key=config_string(config, "api_key"),
-        endpoint=config_string(config, "endpoint"),
-        model_id=config_string(config, "model_id", DEFAULT_GENERATOR_MODEL_ID),
-        model_revision=config_string(config, "model_revision"),
-        request_timeout_seconds=config_float(config, "request_timeout_seconds", 1_800.0),
-        max_retries=config_integer(config, "max_retries", 2),
+        api_key=plugin_string(config, "api_key"),
+        endpoint=plugin_string(config, "endpoint"),
+        model_id=plugin_string(config, "model_id", DEFAULT_GENERATOR_MODEL_ID),
+        model_revision=plugin_string(config, "model_revision"),
+        request_timeout_seconds=plugin_float(config, "request_timeout_seconds", 1_800.0),
+        max_retries=plugin_integer(config, "max_retries", 2),
         reasoning_effort=cast(
             ReasoningEffort,
-            config_optional_string(config, "reasoning_effort"),
+            optional_plugin_string(config, "reasoning_effort"),
         ),
-        video_frames_per_second=config_float(
+        video_frames_per_second=plugin_float(
             config, "video_frames_per_second", DEFAULT_VIDEO_FRAMES_PER_SECOND
         ),
-        video_max_pixels=config_integer(config, "video_max_pixels", DEFAULT_VIDEO_MAX_PIXELS),
+        video_max_pixels=plugin_integer(config, "video_max_pixels", DEFAULT_VIDEO_MAX_PIXELS),
     )
 
 
 def create_embedder(config: Mapping[str, object]) -> OpenAIEmbedder:
     """Entry-point factory for the OpenAI-compatible Omni embedder."""
-    _reject_unknown(
+    reject_unknown_plugin_keys(
         config,
         {
             "api_key",
@@ -405,23 +388,23 @@ def create_embedder(config: Mapping[str, object]) -> OpenAIEmbedder:
         },
     )
     return OpenAIEmbedder.connect(
-        api_key=config_string(config, "api_key"),
-        endpoint=config_string(config, "endpoint"),
-        model_id=config_string(config, "model_id"),
-        model_revision=config_string(config, "model_revision"),
+        api_key=plugin_string(config, "api_key"),
+        endpoint=plugin_string(config, "endpoint"),
+        model_id=plugin_string(config, "model_id"),
+        model_revision=plugin_string(config, "model_revision"),
         space_reference=EmbeddingSpaceReference(
-            space_id=config_string(config, "space_id"),
-            revision=config_string(config, "space_revision"),
+            space_id=plugin_string(config, "space_id"),
+            revision=plugin_string(config, "space_revision"),
         ),
         dimension=require_matryoshka_dimension(
-            config_integer(config, "dimension", DEFAULT_EMBEDDING_DIMENSION)
+            plugin_integer(config, "dimension", DEFAULT_EMBEDDING_DIMENSION)
         ),
-        request_timeout_seconds=config_float(config, "request_timeout_seconds", 120.0),
-        max_retries=config_integer(config, "max_retries", 2),
-        video_frames_per_second=config_float(
+        request_timeout_seconds=plugin_float(config, "request_timeout_seconds", 120.0),
+        max_retries=plugin_integer(config, "max_retries", 2),
+        video_frames_per_second=plugin_float(
             config, "video_frames_per_second", DEFAULT_VIDEO_FRAMES_PER_SECOND
         ),
-        video_max_pixels=config_integer(config, "video_max_pixels", DEFAULT_VIDEO_MAX_PIXELS),
+        video_max_pixels=plugin_integer(config, "video_max_pixels", DEFAULT_VIDEO_MAX_PIXELS),
     )
 
 
@@ -443,6 +426,49 @@ def normalize_base_url(endpoint: str) -> str:
             path = path[: -len(suffix)]
             break
     return urlunsplit((location.scheme, location.netloc, path, "", ""))
+
+
+@dataclass(frozen=True, slots=True)
+class _StreamedCompletion:
+    """The first choice of one streamed completion and its serving metadata."""
+
+    text: str
+    finish_reason: str | None
+    system_fingerprint: str | None
+    first_token_at: float | None
+
+
+async def _consume_completion_stream(
+    stream: AsyncStream[ChatCompletionChunk],
+) -> _StreamedCompletion:
+    parts: list[str] = []
+    finish_reason: str | None = None
+    system_fingerprint: str | None = None
+    first_token_at: float | None = None
+    async for chunk in stream:
+        system_fingerprint = system_fingerprint or chunk.system_fingerprint
+        if chunk.usage is not None:
+            set_current_span_attributes(
+                {
+                    "mindbridge.model.input_tokens": chunk.usage.prompt_tokens,
+                    "mindbridge.model.output_tokens": chunk.usage.completion_tokens,
+                    "mindbridge.model.total_tokens": chunk.usage.total_tokens,
+                }
+            )
+        for choice in chunk.choices:
+            if choice.index != 0:
+                continue
+            if choice.delta.content:
+                if first_token_at is None:
+                    first_token_at = perf_counter()
+                parts.append(choice.delta.content)
+            finish_reason = finish_reason or choice.finish_reason
+    return _StreamedCompletion(
+        text="".join(parts),
+        finish_reason=finish_reason,
+        system_fingerprint=system_fingerprint,
+        first_token_at=first_token_at,
+    )
 
 
 def _content_parts(
@@ -522,17 +548,9 @@ def _embedding_vectors(
         if not isinstance(item.embedding, list):
             raise ModelOutputError("embedding response must use float encoding")
         vector = tuple(float(value) for value in item.embedding)
-        _validate_embedding(vector, dimension)
+        validate_embedding_vector(vector, dimension)
         vectors.append(vector)
     return tuple(vectors)
-
-
-def _validate_embedding(values: tuple[float, ...], dimension: int) -> None:
-    if len(values) != dimension or not all(math.isfinite(value) for value in values):
-        raise ModelOutputError("embedding vector has invalid dimension or values")
-    norm = math.hypot(*values)
-    if not math.isclose(norm, 1.0, rel_tol=1e-4, abs_tol=1e-6):
-        raise ModelOutputError("embedding vector is not L2-normalized")
 
 
 def _raise_model_error(error: openai.APIError, message: str) -> None:
@@ -542,9 +560,3 @@ def _raise_model_error(error: openai.APIError, message: str) -> None:
     ):
         raise ModelUnavailableError(message) from error
     raise ModelRequestError(message) from error
-
-
-def _reject_unknown(config: Mapping[str, object], allowed: set[str]) -> None:
-    unknown = set(config) - allowed
-    if unknown:
-        raise ValueError(f"unknown plugin configuration: {', '.join(sorted(unknown))}")

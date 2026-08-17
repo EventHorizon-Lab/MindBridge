@@ -16,8 +16,15 @@ from mindbridge.core import (
     ModelRequestError,
     ModelUnavailableError,
 )
-from mindbridge.models import EmbedRequest, EmbedTask, MediaPart, ModelInput, TextPart
-from mindbridge.models.openai import OpenAIEmbedder, normalize_base_url
+from mindbridge.models import (
+    EmbedRequest,
+    EmbedTask,
+    GenerateRequest,
+    MediaPart,
+    ModelInput,
+    TextPart,
+)
+from mindbridge.models.openai import OpenAIEmbedder, OpenAIGenerator, normalize_base_url
 
 MODEL_ID = "jinaai/jina-embeddings-v5-omni-small-retrieval"
 
@@ -215,6 +222,67 @@ async def test_only_transient_provider_failures_are_retryable(
             )
     finally:
         await embedder.close()
+
+
+async def test_generation_reports_the_configured_deployment_revision() -> None:
+    """A per-request serving fingerprint must not become the model identity."""
+
+    async def respond(_request: httpx.Request) -> httpx.Response:
+        return _completion_response("serving-fingerprint-01")
+
+    generator = _generator(respond)
+    try:
+        result = await generator.generate(
+            GenerateRequest(
+                system_prompt="Answer from evidence.",
+                input=ModelInput((TextPart("where is the tool?"),)),
+                max_output_tokens=64,
+            )
+        )
+    finally:
+        await generator.close()
+
+    assert result.text == "on the workbench"
+    assert result.model_reference == ModelReference(
+        model_id="qwen3.8-max",
+        revision="pinned-generator-revision",
+    )
+
+
+def _generator(
+    handler: Callable[[httpx.Request], Coroutine[None, None, httpx.Response]],
+) -> OpenAIGenerator:
+    return OpenAIGenerator(
+        AsyncOpenAI(
+            api_key="unit-test-key",
+            base_url=normalize_base_url("https://vlm.example.test/api/v1/chat/completions"),
+            http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+            max_retries=0,
+        ),
+        ModelReference(model_id="qwen3.8-max", revision="pinned-generator-revision"),
+    )
+
+
+def _completion_response(fingerprint: str) -> httpx.Response:
+    event = {
+        "id": "completion_01",
+        "object": "chat.completion.chunk",
+        "created": 1,
+        "model": "qwen3.8-max",
+        "system_fingerprint": fingerprint,
+        "choices": [
+            {
+                "index": 0,
+                "delta": {"content": "on the workbench"},
+                "finish_reason": "stop",
+            }
+        ],
+    }
+    return httpx.Response(
+        200,
+        headers={"content-type": "text/event-stream"},
+        content=f"data: {json.dumps(event)}\n\ndata: [DONE]\n\n",
+    )
 
 
 def _embedder(

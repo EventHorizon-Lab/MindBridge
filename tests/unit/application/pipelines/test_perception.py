@@ -32,7 +32,7 @@ from mindbridge.models.openai import OpenAIGenerator, normalize_base_url
 NOW = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
 
 
-async def test_perception_pipeline_returns_grounded_event_and_provider_revision() -> None:
+async def test_perception_pipeline_returns_grounded_event_and_deployment_revision() -> None:
     """The adapter sends original AV and preserves evidence and model provenance."""
 
     async def respond(request: httpx.Request) -> httpx.Response:
@@ -114,7 +114,7 @@ async def test_perception_pipeline_returns_grounded_event_and_provider_revision(
         EvidenceId("evidence_video"),
         EvidenceId("evidence_audio"),
     )
-    assert result.model_reference.revision == "qwen-serving-revision-01"
+    assert result.model_reference.revision == "deployment-revision"
     assert result.prompt_version == "perceive_events_v9"
     assert [entity.canonical_name for entity in result.events[0].entities] == [
         "red tool",

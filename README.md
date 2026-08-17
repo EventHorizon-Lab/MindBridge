@@ -12,7 +12,8 @@ MindBridge is an Agentic Native Embodied Memory System: Memory-as-a-Service for 
 
 ## Development
 
-MindBridge supports Python 3.10 and 3.11. Python 3.10 is kept as the compatibility floor for Jetson deployments.
+MindBridge supports Python 3.10 and 3.11. Python 3.10 is kept as the compatibility floor because
+several edge platform images (JetPack, D-Robotics RDK, Rockchip RKNN) still ship it.
 
 Install the project and development tools with [uv](https://docs.astral.sh/uv/):
 
@@ -24,7 +25,7 @@ Deployment installs only the process it runs:
 
 ```bash
 uv sync                                      # Core types and Python SDK
-uv sync --extra edge                         # Jetson / robot host
+uv sync --extra edge                         # Any edge host: Jetson, RDK, RK, OpenVINO x86, dGPU
 uv sync --extra server                       # API, MCP, PostgreSQL jobs
 uv sync --extra server --extra cloud-models  # GPU memory Worker
 ```
@@ -51,6 +52,16 @@ docker run --rm -v "$PWD:/input:ro" -w /input lycheeverse/lychee:0.23.0 \
 `tests/benchmarks/golden_recall.json` is the deterministic retrieval gate. It exercises dense
 evidence recall, exact text recall, temporal exclusion, and unsupported-query abstention through
 the production kernel and PostgreSQL/pgvector path; the normal integration test command runs it.
+
+Without `MINDBRIDGE_TEST_DATABASE_URL` the whole integration suite — Golden Recall included —
+skips, so a green run may never have touched the production store. CI and any change that affects
+recall, consolidation, or deletion must therefore require it explicitly:
+
+```bash
+MINDBRIDGE_REQUIRE_INTEGRATION=1 uv run pytest -W error
+```
+
+With that variable set, a missing test database fails the run instead of skipping it.
 
 ## Local PostgreSQL
 
@@ -859,10 +870,16 @@ The flag also reads the object storage variables, so enable it only where those 
 uv run --extra server mindbridge-lifecycle --tenant-id tenant_01 --reclaim-orphan-clips
 ```
 
-## Run the Jetson/robot edge path
+## Run the edge path
 
-Capture and encode with the installed NVIDIA/GStreamer stack. When `splitmuxsink` or the robot
-capture supervisor closes a segment, hand that completed file to the small durable boundary:
+The edge path is platform-neutral. It runs on NVIDIA Jetson, D-Robotics RDK, Rockchip RK,
+Intel/OpenVINO x86, generic ARM hosts, and on workstations where the "edge" is a 4090/5090/A100.
+Only the capture backend and inference runtime change; the Observation timeline, identity gates,
+and forget semantics are identical everywhere.
+
+Capture and encode with whatever GStreamer/FFmpeg stack the platform provides. When `splitmuxsink`
+or the robot capture supervisor closes a segment, hand that completed file to the small durable
+boundary:
 
 ```python
 from pathlib import Path
@@ -916,8 +933,8 @@ request = enqueue_captured_video(
 
 The handoff computes the SHA-256 and size, generates a deterministic tenant-scoped object key and
 idempotency key, then commits the request and absolute local path to a mode-`0600`, WAL-enabled
-SQLite Outbox. GStreamer/DeepStream remains responsible for camera decoding, encoding, frame rate,
-resolution, VAD/motion/scene gates, and hardware calibration.
+SQLite Outbox. The platform capture stack (GStreamer, optionally DeepStream) remains responsible for
+camera decoding, encoding, frame rate, resolution, VAD/motion/scene gates, and hardware calibration.
 
 The lower-level example accepts an embedding from an existing robot vision stack. Native hot paths
 do not need to reopen a completed media file: feed timestamped BGR frames to
@@ -939,18 +956,21 @@ faces = await asyncio.to_thread(
 partial = await streaming_asr.push_pcm16(pcm16_chunk, is_final=is_last_audio_chunk)
 ```
 
-The partial transcript is provisional. GStreamer/DeepStream still owns the bounded rolling fragment;
+The partial transcript is provisional. The platform capture stack still owns the bounded rolling fragment;
 when its Event gate closes, `FunASRSpeechPipeline` performs VAD, quality ASR, punctuation,
 diarization, and CAM++ centroid extraction in one upstream call.
 `recognize_identities_in_av_segment()` combines that result with InsightFace and the optional
 provider-neutral audiovisual active-speaker Pipeline, then returns only cloud-safe intervals ready for
-`enqueue_captured_video()`. `device=auto` selects CUDA when it is available, and explicit CUDA
-requests fail instead of silently using CPU.
+`enqueue_captured_video()`. `device=auto` selects an available accelerator, and an explicit
+accelerator request fails instead of silently using CPU.
 
-Install InsightFace/ONNX Runtime and FunASR/ModelScope from the JetPack-compatible device image; the
-generic `uv.lock` intentionally does not replace NVIDIA's platform Torch runtime. NeMo is not part of
-the current pipeline. MindBridge orchestrates upstream libraries but does not reimplement their
-networks.
+Install InsightFace/ONNX Runtime and FunASR/ModelScope from the device image that matches the target
+platform SDK — JetPack/CUDA, D-Robotics OpenExplorer, RKNN Toolkit, OpenVINO, or a plain CUDA/CPU
+host. The generic `uv.lock` intentionally pins no vendor accelerator wheel. ONNX is the default
+portable artifact; compiled engines (TensorRT, RKNN, OpenVINO IR, BPU `.bin`) are built and cached
+per platform and are never reused across device images. NeMo is not part of the current pipeline.
+MindBridge orchestrates upstream libraries but does not reimplement their networks, and adds no
+cross-platform abstraction layer of its own.
 
 `device_identity_key` is exactly 32 bytes loaded from
 the device TPM or secret manager. The local store normalizes and AES-256-GCM encrypts every bounded

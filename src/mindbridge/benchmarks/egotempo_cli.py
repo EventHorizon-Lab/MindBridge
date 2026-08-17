@@ -29,13 +29,13 @@ from mindbridge.benchmarks.egotempo import (
     load_egotempo,
     run_egotempo_clip,
 )
+from mindbridge.benchmarks.prompts import EGOTEMPO_QUERY_PROMPT
 from mindbridge.benchmarks.runtime import PreparedVideo, load_prepared_videos
 from mindbridge.contracts import ContractModel, Identifier, NonEmptyString, Sha256Hex
 from mindbridge.file_integrity import sha256_file
 from mindbridge.models import EmbedTask
 from mindbridge.prompts import (
     ANSWER_FROM_EVIDENCE_PROMPT,
-    EGOTEMPO_QUERY_PROMPT,
     PERCEIVE_EVENTS_PROMPT,
 )
 from mindbridge.sdk import MindBridge

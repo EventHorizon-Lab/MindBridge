@@ -20,6 +20,7 @@ from mindbridge.benchmarks.egomem_reason import (
     EGOMEM_REASON_ADAPTER_VERSION,
     EgoMemReasonQuestion,
 )
+from mindbridge.benchmarks.prompts import EGOMEM_REASON_QUERY_PROMPT
 from mindbridge.benchmarks.runtime import (
     OPTION_LABELS,
     benchmark_tenant_id,
@@ -39,7 +40,6 @@ from mindbridge.contracts import (
     RememberRequest,
 )
 from mindbridge.core import MediaKind, MemoryType, SensorKind
-from mindbridge.prompts import EGOMEM_REASON_QUERY_PROMPT
 from mindbridge.sdk import MindBridge
 
 

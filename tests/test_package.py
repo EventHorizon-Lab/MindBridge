@@ -8,6 +8,8 @@ from pathlib import Path
 
 import mindbridge
 
+SOURCE = Path(__file__).parents[1] / "src" / "mindbridge"
+
 
 def test_package_can_be_imported() -> None:
     """The installed package is importable through the src layout."""
@@ -55,17 +57,35 @@ def test_model_capabilities_do_not_import_provider_adapters() -> None:
 
 
 def test_application_does_not_depend_on_model_adapters() -> None:
-    application = Path(__file__).parents[1] / "src" / "mindbridge" / "application"
-    violations = []
-    for path in application.rglob("*.py"):
-        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
-            if isinstance(node, ast.Import) and any(
-                alias.name.startswith("mindbridge.models") for alias in node.names
-            ):
-                violations.append(str(path.relative_to(application)))
-            if isinstance(node, ast.ImportFrom) and (node.module or "").startswith(
-                "mindbridge.models"
-            ):
-                violations.append(str(path.relative_to(application)))
+    assert _modules_importing(SOURCE / "application", "mindbridge.models") == []
 
-    assert violations == []
+
+def test_product_code_does_not_depend_on_the_benchmark_harness() -> None:
+    """Evaluation adapters consume the public contracts; nothing may consume them back."""
+    assert (
+        _modules_importing(
+            SOURCE,
+            "mindbridge.benchmarks",
+            exclude=SOURCE / "benchmarks",
+        )
+        == []
+    )
+
+
+def _modules_importing(directory: Path, prefix: str, *, exclude: Path | None = None) -> list[str]:
+    return sorted(
+        str(path.relative_to(directory))
+        for path in directory.rglob("*.py")
+        if (exclude is None or not path.is_relative_to(exclude))
+        and any(name.startswith(prefix) for name in _imported_modules(path))
+    )
+
+
+def _imported_modules(path: Path) -> set[str]:
+    modules: set[str] = set()
+    for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+        if isinstance(node, ast.Import):
+            modules.update(alias.name for alias in node.names)
+        if isinstance(node, ast.ImportFrom) and node.module is not None:
+            modules.add(node.module)
+    return modules

@@ -69,6 +69,47 @@ def copy_plugin_configuration(
     return dict(config)
 
 
+def reject_unknown_plugin_keys(config: Mapping[str, object], allowed: set[str]) -> None:
+    """Fail a plugin factory on any key it would otherwise ignore."""
+    unknown = set(config) - allowed
+    if unknown:
+        raise ValueError(f"unknown plugin configuration: {', '.join(sorted(unknown))}")
+
+
+def plugin_string(config: Mapping[str, object], key: str, default: str | None = None) -> str:
+    """Read one required non-blank text value from a plugin configuration."""
+    value = config.get(key, default)
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{key} must be non-empty text")
+    return value
+
+
+def optional_plugin_string(config: Mapping[str, object], key: str) -> str | None:
+    """Read one optional text value, rejecting a blank as a configuration mistake."""
+    value = config.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{key} must be non-empty text when provided")
+    return value
+
+
+def plugin_integer(config: Mapping[str, object], key: str, default: int) -> int:
+    """Read one integer value without accepting a bool or a float that looks like one."""
+    value = config.get(key, default)
+    if type(value) is not int:
+        raise ValueError(f"{key} must be an integer")
+    return value
+
+
+def plugin_float(config: Mapping[str, object], key: str, default: float) -> float:
+    """Read one numeric value, accepting an integer literal from JSON."""
+    value = config.get(key, default)
+    if type(value) not in {int, float}:
+        raise ValueError(f"{key} must be a number")
+    return float(cast(int | float, value))
+
+
 def _reject_json_constant(value: str) -> NoReturn:
     raise ValueError(f"non-finite JSON number {value!r} is not supported")
 
@@ -82,37 +123,3 @@ def parse_aware_datetime(value: str) -> datetime:
     if parsed.utcoffset() is None:
         raise argparse.ArgumentTypeError("must include a timezone offset")
     return parsed
-
-
-def config_string(config: Mapping[str, object], key: str, default: str | None = None) -> str:
-    """Read required plugin text, rejecting a blank or non-string value."""
-    value = config.get(key, default)
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError(f"{key} must be non-empty text")
-    return value
-
-
-def config_optional_string(config: Mapping[str, object], key: str) -> str | None:
-    """Read plugin text that may be absent but must not be blank when present."""
-    value = config.get(key)
-    if value is None:
-        return None
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError(f"{key} must be non-empty text when provided")
-    return value
-
-
-def config_integer(config: Mapping[str, object], key: str, default: int) -> int:
-    """Read a plugin integer, rejecting the bool that int() would accept."""
-    value = config.get(key, default)
-    if type(value) is not int:
-        raise ValueError(f"{key} must be an integer")
-    return value
-
-
-def config_float(config: Mapping[str, object], key: str, default: float) -> float:
-    """Read a plugin number without silently coercing text."""
-    value = config.get(key, default)
-    if type(value) not in {int, float}:
-        raise ValueError(f"{key} must be a number")
-    return float(cast(int | float, value))

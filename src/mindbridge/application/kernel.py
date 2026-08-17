@@ -392,7 +392,7 @@ class MemoryKernel:
             created_at=feedback.created_at,
             verification_status=VerificationStatus.ATTESTED,
             salience=original.salience,
-            strength=original.salience,
+            strength=original.strength,
             supersedes_memory_id=original.memory_id,
         )
 

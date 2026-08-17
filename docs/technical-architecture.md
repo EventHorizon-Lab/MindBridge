@@ -1,8 +1,8 @@
 # MindBridge 技术实现架构
 
 > 状态：RTX 5090 实测基线（Phase 3 效果优化中）
-> 版本：0.7
-> 更新日期：2026-08-13
+> 版本：0.8
+> 更新日期：2026-08-17
 
 ## 1. 文档目的
 
@@ -29,10 +29,13 @@ MindBridge 不是机器人、Agent 或大模型。MindBridge 是**记忆本身**
 ### 2.1 产品目标
 
 1. 第一优先级是能力 SOTA，同时所有能力必须能够收敛为可部署的 MaaS 产品。
-2. 首批端侧平台是 NVIDIA Jetson 和机器人主机。
+2. **Edge 追求全平台可用**，不绑定任何一家硬件：NVIDIA Jetson、地瓜机器人 RDK（BPU）、
+   Rockchip RK 系列（RKNN）、Intel x86/OpenVINO（CPU/iGPU/NPU）、Apple/通用 ARM 主机，以及把
+   “端”直接放在 RTX 4090/5090、A100/H100 这类 GPU 主机上的部署，都是一等目标。“Edge”是
+   **职责位置**——离传感器最近、承担隐私与断网——不是某个 SKU 或某种算力档位。
 3. 人脸识别与声纹识别尽可能在端侧完成；身份模板默认不离开设备。
 4. 不要求完全离线。云端是长期记忆和重型推理的主路径，端侧提供连续采集、隐私处理、近期记忆和断网缓冲。
-5. 文本侧以 LoCoMo 为核心 Benchmark；多模态侧覆盖 EgoLifeQA、EgoTempo、Video-MME、SuperMemory-VQA 和 M3-Bench，并以 SOTA 为目标。
+5. 文本侧以 LoCoMo 为核心 Benchmark；多模态侧覆盖 EgoLifeQA、EgoTempo、Video-MME、SuperMemory-VQA 和 M3-Bench，并以**各类权威 Benchmark 上的工业级 SOTA** 为目标。
 
 ### 2.2 强制设计原则
 
@@ -40,11 +43,18 @@ MindBridge 不是机器人、Agent 或大模型。MindBridge 是**记忆本身**
 2. **证据优先**：文本描述、摘要和事实都是派生表示；原始图像、视频、音频及其时间跨度才是最终证据。
 3. **冻结模型**：不进行 SFT、LoRA、QLoRA、RL 或任何模型权重微调。
 4. **非参数演化**：系统通过记忆状态、索引、实体原型、召回统计、反馈和生命周期策略自学习，而不是修改模型参数。
-5. **生态优先**：优先使用官方 SDK、Hugging Face、NVIDIA、OpenAI-compatible、PostgreSQL 等成熟生态，不重复实现通用能力。
+5. **生态优先**：优先使用官方 SDK、Hugging Face、目标平台厂商原生栈、OpenAI-compatible、PostgreSQL 等成熟生态，不重复实现通用能力。
 6. **轻量起步**：首版采用模块化单体、异步 Worker 和一套主数据库；只有实际指标证明不足时才拆分。
 7. **原子能力插件**：模型层只保留 `Generator`、`Embedder`、`Reranker` 三个插口；供应商只实现 Adapter，Answer、Perception 等任务语义留在 MindBridge。
 8. **当前阶段效果优先**：当前研究与效果验证不以 License 作为候选过滤条件，代码和模型只要有助于能力即可复用；仍记录来源、精确 revision 和工件 hash，商业发布前再单独完成合规审查。
-9. **工程质量是功能要求**：命名、可读性、复杂度、类型、错误处理和测试均是合并门禁，不接受“功能能跑但以后再整理”。
+9. **Code is the Product**：代码本身就是产品，不是产品的副产物。每写一行都必须当场回答三个问题——
+   这一行是否必要？是否简洁优雅？是否易读易维护？答不上来就不写。MindBridge **不以代码行数衡量
+   进展**，只衡量每一行的效率：删除与新增同样是交付，一个平台适配层如果没有删掉更多分支就不该
+   合并。命名、可读性、复杂度、类型、错误处理和测试都是合并门禁，不接受“功能能跑但以后再整理”。
+10. **Benchmarks 服务于 Harness，不能绑架 Harness**：目标是各类权威 Benchmark 上的工业级绝对分数，
+    eval 时**不要求控制变量**、也不要求单变量消融，可以同时改动多处并使用当时可用的最强模型。但
+    **禁止 reward hacking**：任何提升必须来自 MindBridge 整体能力与性能，不得来自题面识别、Judge
+    迎合、数据集专用旁路或只在评测中存在的路径。Benchmark 分数是能力的度量，不是优化对象本身。
 
 ### 2.3 非目标
 
@@ -55,7 +65,8 @@ MindBridge 不是机器人、Agent 或大模型。MindBridge 是**记忆本身**
 - 自研视频解码、向量数据库、消息队列或 HTTP 客户端；
 - 多数据库并存的“全家桶”架构；
 - 提前拆分的微服务、Kafka、独立图数据库或独立时序数据库；
-- 为某个 Benchmark 特制、无法进入产品路径的旁路实现。
+- 为某个 Benchmark 特制、无法进入产品路径的旁路实现；
+- 为某一家硬件写死的采集/推理管线，或只能在单一 SDK 上成立的记忆语义。
 
 ## 3. 系统上下文与总体架构
 
@@ -63,9 +74,9 @@ MindBridge 的职责边界是从连续感知信号到可引用记忆；Agent 只
 
 ```mermaid
 flowchart LR
-    subgraph DEVICE["Edge Runtime · Jetson / Robot Host"]
+    subgraph DEVICE["Edge Runtime · Jetson / RDK / RK / OpenVINO / dGPU Host"]
         SENSOR["Camera · Microphone · Gaze · IMU · Robot State"]
-        CAPTURE["GStreamer / DeepStream Capture\nclock sync · decode · rolling buffer"]
+        CAPTURE["GStreamer Capture (DeepStream optional)\nclock sync · decode · rolling buffer"]
         GATE["Event Gate\nVAD · scene change · motion · gaze"]
         IDENTITY["Local Identity\nface · diarization · voiceprint"]
         EDGE_MEMORY["SQLite Recent Memory\nmanifest · prototypes · outbox"]
@@ -124,6 +135,22 @@ flowchart LR
 | 强设备上的可选轻量 Omni Embedding | 混合召回、重排、回答与证据引用 |
 
 不要求完全离线意味着端侧不需要复制完整云能力。断网时保证“继续记录、不丢队列、可查近期”；恢复连接后幂等补传。
+
+### 3.2 端侧的全平台边界
+
+端侧职责由上表定义，**与硬件厂商无关**。同一份 `mindbridge.edge` 代码必须能跑在 NVIDIA Jetson、
+地瓜 RDK、Rockchip RK、Intel/OpenVINO x86、通用 ARM 主机，以及直接把 4090/5090/A100 当作“端”的
+GPU 主机上。平台差异只允许出现在三个位置：
+
+| 可变的 | 不可变的 |
+| --- | --- |
+| 解码/采集后端（DeepStream、纯 GStreamer、V4L2、FFmpeg） | Observation 的时间轴、幂等键与 rolling fragment 语义 |
+| 推理 runtime 与编译工件（TensorRT engine、RKNN、OpenVINO IR、BPU `.bin`、ONNX Runtime EP、CoreML） | 模型的输入输出契约：归一化 bbox、embedding 维度与兼容空间 |
+| 档位选择与硬件校准阈值（分辨率、帧率、缓冲、并发） | 身份门禁、加密存储、证据可撤销性与遗忘语义 |
+
+因此不为“多平台”预建 provider factory 或抽象层：ONNX 是默认可移植工件，某个平台真正需要原生
+runtime 时才加一个薄适配器，并且该适配器必须删掉比它自身更多的分支代码。算力更强的平台只改变
+**哪些阶段留在端上**（是否常驻 Jina Nano、是否本地跑 Omni 理解），不改变管线本身。
 
 ## 4. 记忆领域模型
 
@@ -268,7 +295,7 @@ PCM，并用异步锁提供背压；frame 与音频 offset 均以当前 Observat
 音频，模型推理耗时 0.369 秒、峰值 CUDA allocation 872 MiB。
 
 在线 transcript 是低延迟、可丢弃的 provisional view，不直接写成长期身份或最终 Event。现有
-GStreamer/DeepStream 仍负责零拷贝采集、AEC、编码和有界 rolling fragment；VAD/场景/任务 gate
+平台采集栈（GStreamer，DeepStream 可选）仍负责零拷贝采集、AEC、编码和有界 rolling fragment；VAD/场景/任务 gate
 关闭一个可解码 fragment 后，统一 FunASR 质量路径再一次完成 VAD、离线 ASR、标点、diarization
 与 speaker centroid，随后才进入加密身份和 durable Observation。这样原始流不会等待云端或模型，
 而最终记忆仍有可重放媒体。断流时 cache 和 partial result 必须一起丢弃，禁止把不完整 utterance
@@ -289,8 +316,8 @@ GStreamer/DeepStream 仍负责零拷贝采集、AEC、编码和有界 rolling fr
 5. 原始时间范围保持不变，后续可以重新切分而不重新采集。
 
 M3-Agent 的 30 秒切片只保留为其 Benchmark 协议；TaskMem 的 10 秒输入块和约 50 秒滚动上下文
-提供更适合连续流的初始候选。两者都不能成为产品常量，最终边界由真实 Jetson 负载、事件完整率和
-多模态检索效果校准。
+提供更适合连续流的初始候选。两者都不能成为产品常量，最终边界由目标端侧平台的真实负载、事件
+完整率和多模态检索效果校准，并按平台档位分别记录。
 
 ### 5.3 多模态理解
 
@@ -350,10 +377,10 @@ Observation，不读取 Benchmark 类型或答案。
 
 首版 `mindbridge.edge` 已把这一恢复语义落实为文件型 SQLite Outbox：数据库启用 WAL 与
 `synchronous=FULL`，文件权限收紧为 `0600`；`tenant_id + device_id + boot_id + sequence` 同时受
-稳定 ID 和唯一约束保护，同一序列异内容立即冲突。GStreamer/DeepStream 关闭片段后，薄 capture
+稳定 ID 和唯一约束保护，同一序列异内容立即冲突。平台采集栈关闭片段后，薄 capture
 handoff 可把封装视频和同步的 16 kHz 原生音频 sidecar 放进同一个 Observation；两条媒体共享世界
 时间区间但各自保存 SHA-256、对象 ID 和 EvidenceSpan。它只计算 size/SHA-256、稳定对象键、时钟
-区间和幂等键并入队，不接管 NVIDIA 的解码、编码或门控。同步器先用 Boto3 标准凭证链上传
+区间和幂等键并入队，不接管任何平台的解码、编码或门控。同步器先用 Boto3 标准凭证链上传
 tenant-scoped S3 对象，再通过异步 Python SDK 调用
 `observe`。媒体上传成功会单独落盘，因此 API 暂时离线不会重复传大文件；receipt、水位推进和
 Outbox 删除在一个 SQLite 事务中完成，进程在任意网络步骤崩溃都可安全重放。失败仅保存错误码和
@@ -393,15 +420,15 @@ entry point `mindbridge.generators`、`mindbridge.embedders`、`mindbridge.reran
 | AV 理解、caption、时间定位、计数 | Qwen Omni，通过 OpenAI-compatible API；以当前可用最强版本为默认 | 云端 |
 | 视觉 OCR、grounding、补充检查 | Qwen VL/VLM 或对应成熟专用模型 | 云端，必要时端侧 |
 | 跨模态主召回 | `jina-embeddings-v5-omni-small-retrieval` | 云端 |
-| 端侧跨模态近期召回 | `jina-embeddings-v5-omni-nano-retrieval` | 强 Jetson/机器人主机，可选 |
+| 端侧跨模态近期召回 | `jina-embeddings-v5-omni-nano-retrieval` | 算力充裕的端侧主机（Jetson / RDK / RK / OpenVINO x86 / dGPU），可选 |
 | 人脸检测、跟踪与表征 | SCRFD-2.5GF-KPS + ArcFace R50；YuNet + SFace 为轻量生态对照 | 端侧 |
 | 流式 ASR | FunASR causal Paraformer，官方 cache 与 600ms 模型窗口 | 端侧 |
 | VAD、质量 ASR、标点、diarization | 一个 FunASR `AutoModel` 组合官方 VAD、ASR、punc、speaker model | 端侧 |
-| 声纹表征 | 上述 FunASR 调用直接返回 ERes2NetV2 speaker centroid；资源受限时再 bake-off CAM++ | 端侧 |
+| 声纹表征 | 上述 FunASR 调用直接返回 CAM++ speaker centroid（`iic/speech_campplus_sv_zh-cn_16k-common`）；ERes2NetV2 作为质量挑战者再 bake-off | 端侧 |
 | 活跃说话人与 face↔voice | LR-ASD + 多 Observation 可撤销证据；GateFusion 为质量挑战者 | 端侧 |
 | 最终回答和证据核验 | 能直接读取候选图像、视频和音频的冻结 Omni/VLM | 云端 |
 
-这些是进入目标 Jetson bake-off 的首选候选，不是未经实测的 FPS 承诺。完整指标、运行时、
+这些是进入目标端侧平台 bake-off 的首选候选，不是未经实测的 FPS 承诺。完整指标、运行时、
 分档和晋级门禁见[端侧人物一致性感知模型选型](edge-identity-sota.md)。具体模型 ID、服务地址和版本
 属于部署配置；数据中必须记录精确 `model_id` 和 `revision`。
 
@@ -461,19 +488,25 @@ OpenAI-compatible endpoint 批量生成 Event/Claim/Summary document 向量；AP
 5. 端侧隔离的人脸/声纹身份向量；
 6. Event、Entity、Claim 和 Summary Memory 的关系边。
 
-### 6.4 Jetson 模型分级
+### 6.4 端侧平台与模型分级
 
-| 设备档位 | 默认行为 |
-| --- | --- |
-| Orin Nano | SCRFD-500MF 或 YuNet/SFace；FunASR/llama.cpp acoustic path 进入同条件 bake-off；通用 Omni Embedding 交给云端 |
-| Orin NX | SCRFD-2.5GF + ArcFace；FunASR 在线 Paraformer + Event-close 统一 speech pipeline；LR-ASD 通过实测后启用 |
-| AGX Orin | SCRFD-10GF；FunASR CUDA 质量路径与在线路径；有余量时运行 LR-ASD、Jina Omni Nano 与质量挑战者 |
-| 带独立 GPU 的机器人主机 | 可运行完整本地近期召回和部分 Omni 理解；云端仍负责全局长期记忆 |
+分级按**可用算力档位**而不是厂商划分。同一档位内不同平台执行同一套默认行为，只替换 runtime：
+
+| 算力档位 | 代表平台 | 默认行为 |
+| --- | --- | --- |
+| 嵌入式 NPU | Orin Nano、地瓜 RDK X5/S100、RK3576/RK3588 | SCRFD-500MF 或 YuNet/SFace；FunASR/llama.cpp acoustic path 进入同条件 bake-off；通用 Omni Embedding 交给云端 |
+| 中算力 SoC / x86 | Orin NX、高配 RK3588、Intel Core + OpenVINO（iGPU/NPU） | SCRFD-2.5GF + ArcFace；FunASR 在线 Paraformer + Event-close 统一 speech pipeline；LR-ASD 通过实测后启用 |
+| 高算力端侧 | AGX Orin、带入门 dGPU 的机器人主机 | SCRFD-10GF；FunASR 质量路径与在线路径；有余量时运行 LR-ASD、Jina Omni Nano 与质量挑战者 |
+| 云端级 GPU 作“端” | RTX 4090/5090、A100/H100 工作站或机架 | 可运行完整本地近期召回和大部分 Omni 理解；云端仍负责跨设备全局长期记忆与重型 consolidation |
 
 是否启用任一模型由完整管线的吞吐、显存、功耗、温度和主任务余量决定，不按“能够加载模型”
-判断。端侧使用 TensorRT/DeepStream/GStreamer 等 NVIDIA 原生生态，保留帧率、分辨率、VAD、
-diarization 缓冲和事件窗口等硬件校准参数。ONNX 是可移植工件；TensorRT engine 必须按 Jetson
-SKU、JetPack、TensorRT、精度和 shape profile 构建及缓存，不能跨设备镜像盲目复用。
+判断；同一档位的不同平台必须各自实测，不能用其中一台的数字代表整档。
+
+运行时选择遵循同一条规则：**ONNX / ONNX Runtime 是默认可移植工件**，平台原生栈只在实测证明显著
+收益时启用——NVIDIA 用 TensorRT/DeepStream，地瓜用 BPU 工具链，Rockchip 用 RKNN，Intel 用
+OpenVINO，Apple/ARM 用 CoreML 或 llama.cpp。所有编译产物（TensorRT engine、RKNN、OpenVINO IR/blob、
+BPU `.bin`）都必须按平台、SDK 版本、精度和 shape profile 分别构建与缓存，不能跨设备镜像盲目复用；
+帧率、分辨率、VAD、diarization 缓冲和事件窗口等硬件校准参数在每个平台上单独标定。
 
 ### 6.5 冻结模型边界
 
@@ -497,7 +530,7 @@ SKU、JetPack、TensorRT、精度和 shape profile 构建及缓存，不能跨�
 端侧不自研人脸、diarization、声纹或 ASD 网络。人脸质量路径使用
 SCRFD-2.5GF-KPS + ArcFace R50；YuNet + SFace 作为有官方 ONNX 工件的轻量对照。语音默认路径已
 从 NeMo + FunASR + 单独 ERes2NetV2 三段编排收敛为一个 FunASR `AutoModel`：SeACo-Paraformer
-ASR、FSMN-VAD、CT-Transformer punctuation 和 ERes2NetV2 speaker model 在一次 `generate()` 中
+ASR、FSMN-VAD、CT-Transformer punctuation 和 CAM++ speaker model 在一次 `generate()` 中
 返回带毫秒边界、标点、speaker label 的 `sentence_info`，并通过 `return_spk_center` 返回每个
 speaker 的 192 维 centroid。MindBridge 删除了自维护的 NeMo turn 融合、波形二次解码和声纹模型
 二次推理；模型网络、聚类和预处理全部复用上游。
@@ -511,8 +544,9 @@ diarization probability，因此当前 confidence 是必须由真实麦克风集
 模型概率。活跃说话人检查复用 TaskMem 的可视锚点思路，
 由 FFmpeg 在发送给 VLM 的临时视频上绘制 `F0/F1/...` face box 并保留 16kHz mono 音轨，使模型在
 一个原生 AV 请求中联合检查口型、声音起止和可见行为；VLM 只通过 `Generator` capability
-调用选中的异步插件；模型输出仅形成可撤销关联证据，不直接合并模板。LR-ASD/DeepStream/TensorRT 仍是
-目标 Jetson 的下一轮质量/效率候选，不能写成已经上线的实现。
+调用选中的异步插件；模型输出仅形成可撤销关联证据，不直接合并模板。LR-ASD 与各平台原生 runtime
+（TensorRT/DeepStream、RKNN、OpenVINO、BPU）仍是目标端侧平台的下一轮质量/效率候选，不能写成已经
+上线的实现。
 
 ASR 或 diarization 无法无歧义归属的区间不会被丢弃，而是以 observation scope 保留 transcript；
 ASD 关联使用配置的模型 deployment revision 作为稳定证据键，不使用可能随请求变化的 provider
@@ -522,8 +556,9 @@ FunASR causal Paraformer 已接入持续 PCM chunk，并复用上游 cache；spe
 voiceprint 仍只在 Event/window 关闭后由统一质量路径确认，因为当前 upstream realtime diarization
 会在窗口增长时重新聚类，标签尚不稳定。入口会在当前空闲 CUDA 显存不少于 8 GiB 时并发人脸和
 统一 speech pipeline；不足时串行复用 GPU，
-CPU 降级也保持串行，避免模型线程争抢。该门槛是 5090 软件验证默认值，不是 Jetson 标定结果；
-调用方可以用 `parallel_model_inference` 按机器人主任务的显存预算显式覆盖。
+CPU 降级也保持串行，避免模型线程争抢。该门槛是 5090 软件验证默认值，不是任何目标端侧平台的
+标定结果；调用方可以用 `parallel_model_inference` 按机器人主任务的显存预算显式覆盖，无 CUDA 的
+平台（OpenVINO、RKNN、BPU、纯 CPU）按各自的内存与算力预算标定同一个开关。
 
 MindBridge 只维护一个设备本地身份记忆边界：
 
@@ -921,7 +956,7 @@ HTTP、Python 和 MCP 共享同一层 use case，不各自复制业务逻辑。
 | 云端模型 serving | vLLM/OpenAI-compatible server | 自研推理 HTTP 协议 |
 | 兼容模型调用 | `openai.AsyncOpenAI(base_url=...)` | `requests`/`httpx` 手写供应商接口 |
 | 非 OpenAI-compatible 服务 | 服务官方 SDK | 通用 REST 包装器 |
-| Jetson 媒体与推理 | DeepStream、GStreamer、TensorRT | 自研解码、帧管线和 runtime |
+| 端侧媒体与推理 | GStreamer/FFmpeg + 平台原生 runtime（ONNX Runtime EP、TensorRT/DeepStream、OpenVINO、RKNN、地瓜 BPU） | 自研解码、帧管线、runtime 和跨平台抽象层 |
 | 视频/音频 | FFmpeg、ffprobe、PyAV、TorchCodec | 自研编解码器 |
 | API 与 schema | FastAPI、Pydantic、OpenAPI | 自研 Web 框架和 schema 系统 |
 | Agent 接入 | MCP 官方 SDK | 独立维护第二套业务接口 |
@@ -946,6 +981,11 @@ client = AsyncOpenAI(api_key=api_key, base_url=base_url)
 字段中；应用管线看不到 SDK 类型。非兼容供应商使用其官方 SDK 实现同一个能力协议，不得复制
 Answer、Perception 或 Recall 流程。
 
+`GenerateResult.model_reference` 始终是部署配置固定的 `model_id/revision`。供应商返回的
+`system_fingerprint` 只作为 span 属性上报，不进入模型身份：Episode、Claim 与 Summary 的稳定 ID
+由该 `model_reference` 派生，会随请求变化的 fingerprint 会让同一次 sweep 的重试写出重复聚合，
+这与 §6.6 对端侧 ASD 证据键的要求是同一条规则。
+
 OpenAI Adapter 默认省略 `reasoning_effort`，确保非推理模型和不同 OpenAI-compatible 服务不会收到
 不支持的字段；需要时通过 Generator 插件配置显式提供。Benchmark 将这个已解析配置写入部署快照，
 不再平铺供应商专用 CLI 参数。模型 revision 变化时重跑对应 bake-off，不把某一供应商参数加入
@@ -962,6 +1002,11 @@ schema 伪装成一个通用格式。
 ## 11. 工程实现规范（强制）
 
 本章不是风格建议，而是代码进入主分支的 Definition of Done。MindBridge 的工程目标是：一个首次接触模块的工程师能够从名称、类型和测试理解行为，而不必先解读框架、隐式状态和历史包袱。
+
+**Code is the Product。** 交付的不是“实现了某个功能的一堆文件”，而是这份代码本身。因此每一行都要
+经受同一组提问：这一行是否必要？是否简洁优雅？是否易读易维护？答不上来的行不进主分支。行数不是
+产出指标——一个把 200 行换成 30 行的 PR 与一个新增能力的 PR 同等有价值，评审看的是每一行的效率，
+不是体量。这条原则对文档、Prompt 和配置同样成立。
 
 “优雅”不等于聪明或抽象层数多，而是：
 
@@ -1027,7 +1072,7 @@ async def forget(request: ForgetRequest) -> ForgetReceipt: ...
 1. 这段能力是否真的需要存在？
 2. 仓库中是否已经有相同领域函数、类型或调用路径？
 3. Python 标准库或数据库原生能力是否已经解决？
-4. Hugging Face、OpenAI SDK、NVIDIA 或现有依赖是否已经提供？
+4. Hugging Face、OpenAI SDK、平台厂商 SDK 或现有依赖是否已经提供？
 5. 只有前四项都不成立时，才写最小实现。
 
 强制规则：
@@ -1038,7 +1083,8 @@ async def forget(request: ForgetRequest) -> ForgetReceipt: ...
 - 优先组合，不建立深继承树；领域实体不继承 SDK/ORM 类型；
 - 不保留注释掉的代码、未使用 feature flag、死分支或“以后会用”的 helper；Git 已保存历史；
 - 新依赖必须删除明显更多的自研代码，并且不能与现有依赖能力重复；
-- 能用数据库唯一约束、外键、事务和索引保证的规则，不在多个业务函数中重复模拟。
+- 能用数据库唯一约束、外键、事务和索引保证的规则，不在多个业务函数中重复模拟；
+- 每一行都要能回答“删掉它会坏什么”；答不上来就删掉，Git 已保存历史。
 
 ### 11.4 模块边界与依赖方向
 
@@ -1156,7 +1202,9 @@ Schema 变更必须向后兼容或带显式迁移；不得在 Worker 和 API 不
 
 - `process_data`、`MemoryManager` 等无法从名称判断职责的核心 API；
 - API handler、Celery task 或 MCP tool 内包含领域业务规则；
-- 新建与 OpenAI/Hugging Face/NVIDIA 官方能力重复的客户端或处理器；
+- 新建与 OpenAI/Hugging Face/硬件厂商官方能力重复的客户端或处理器；
+- 只能在单一硬件平台上成立的采集/推理路径，或为“多平台”预建的空抽象层；
+- 以代码量、文件数或“更完整”为由保留没有当前调用方的代码；
 - 在三个标准能力之外为单个实现加入 Factory、Registry、深继承或任务专用插件层；
 - 跨模块传递无 schema 的 `dict/Any`；
 - 捕获异常后只记录日志并继续返回成功；
@@ -1173,7 +1221,8 @@ Schema 变更必须向后兼容或带显式迁移；不得在 Worker 和 API 不
 
 - [ ] 名称是否只看签名就能理解意图、输入和结果？
 - [ ] 是否复用了仓库、标准库、平台能力或成熟生态？
-- [ ] 是否删除了不必要的抽象、重复代码和死代码？
+- [ ] 是否删除了不必要的抽象、重复代码和死代码？本次 diff 中每一行是否都必要？
+- [ ] 是否与硬件平台无关，或平台相关部分是否被限制在 runtime 适配边界内？
 - [ ] 领域规则是否位于唯一正确的共同路径？
 - [ ] 输入、输出、单位、状态和失败方式是否有类型/Schema？
 - [ ] 外部调用是否有 timeout、有限重试、并发上限和可观测 trace？
@@ -1207,13 +1256,15 @@ Cloud
 
 API 和 Worker 可以使用同一个 Python package、两个进程部署。只有当吞吐、故障域或团队边界证明需要时，才将 ingestion、recall、lifecycle 或 model serving 拆成独立服务。
 
-基础安装只包含 Core 领域类型、Pydantic 契约和 Python SDK。Jetson/机器人主机安装 `edge`
+基础安装只包含 Core 领域类型、Pydantic 契约和 Python SDK。任意端侧主机——Jetson、地瓜 RDK、
+Rockchip RK、OpenVINO x86、ARM 主机或直接充当“端”的 4090/5090/A100——都安装同一个 `edge`
 extra；API、MCP 与云端任务安装 `server` extra；只有本地加载 Jina Omni 的 GPU Worker 再叠加
 `cloud-models`。端侧安装不得因 SQLite 身份或同步能力被迫携带 Celery、MCP、PostgreSQL、
 FastAPI 等服务端栈，子包导入隔离由独立进程测试守护。`edge` 的 Python 依赖只覆盖同步、安全、
 OpenAI SDK 和可观测性；不再为声纹二次解码携带 SoundFile，也不携带 NeMo。InsightFace/ONNX
-Runtime、FunASR/ModelScope 与设备版 Torch 必须使用与 JetPack/CUDA 匹配的设备镜像工件，不能由
-通用 lockfile 覆盖 NVIDIA 运行时。FunASR 自身仍是模型栈而非“轻依赖”，减重来自只维护一套上游
+Runtime、FunASR/ModelScope 与设备版 Torch 必须使用与目标平台 SDK 匹配的镜像工件（JetPack/CUDA、
+地瓜 OpenExplorer、RKNN Toolkit、OpenVINO 或普通 CUDA/CPU 主机），不能由通用 lockfile 覆盖任何
+平台运行时；`edge` 的通用依赖不钉死任何一家的加速器 wheel。FunASR 自身仍是模型栈而非“轻依赖”，减重来自只维护一套上游
 speech runtime、且不把它拖入 Core/SDK/server。llama.cpp 的 FunASR/GGUF 支持适合作为未来
 ASR/VAD 多端运行时候选，但当前没有证据证明它完整覆盖 punctuation、diarization 和 voiceprint，
 因此不能作为这一统一身份管线的透明替换。
@@ -1237,7 +1288,8 @@ src/mindbridge/
 ├── core/         # Event/Claim/Memory 领域模型与规则
 ├── infrastructure/ # PostgreSQL、S3、任务队列 Adapter
 ├── models/       # 供应商 Adapter、插件发现与 capability 公共导出
-└── edge/         # Jetson capture、identity、SQLite、outbox
+├── edge/         # 平台无关的 capture、identity、SQLite、outbox
+└── benchmarks/   # 官方数据适配器、生产 API runner 与 run manifest CLI
 
 tests/
 ├── unit/
@@ -1246,6 +1298,12 @@ tests/
 ```
 
 这是逻辑边界，不要求每个目录立即存在。实现以首条端到端路径需要的最少文件开始。
+
+`benchmarks/` 是单向依赖的评测边界，不是产品运行时的一部分：它只通过公共 `AsyncMindBridge`
+契约和 `mindbridge.contracts` 调用系统，并拥有自己的 Prompt 目录。任何产品模块（`api`、
+`application`、`core`、`edge`、`infrastructure`、`models` 及包根）都不得 import
+`mindbridge.benchmarks`，该方向由 `tests/test_package.py` 的导入门禁强制执行。评测依赖收敛在
+`benchmarks` extra，不进入基础安装的运行路径。
 
 ### 12.3 扩展触发条件
 
@@ -1273,6 +1331,25 @@ tests/
 
 ## 14. Benchmark 与 SOTA 路线
 
+### 14.0 评测立场
+
+MindBridge 的目标是**在各类权威 Benchmark 上取得工业级 SOTA 的绝对分数**。由此确定三条规则：
+
+1. **eval 不要求控制变量。** 追求绝对分数时可以同时改动 Prompt、检索预算、管线结构和模型，不需要
+   先做单变量消融再前进。消融只在需要定位退化原因时才做，是调试手段，不是晋级前置条件。
+2. **eval 可以使用当时可用的最强模型。** Generator/Embedder/Reranker 选型不受成本或本地化限制；
+   唯一约束是该配置必须是真实可部署的产品状态（写入 run manifest 的部署快照），而不是只在评测里
+   存在的档位。成本/延迟单独报告，不用来压低分数上限。
+3. **禁止 reward hacking。** 允许提升绝对分数的手段只有一种：真实提高 MindBridge 的整体能力与
+   性能。以下一律禁止，即使能提分——识别题面/类别/答案形式改变行为、迎合特定 Judge 的措辞、为某个
+   数据集特制的存储或检索旁路、绕过 `recall` 的长上下文直塞、把标注字段（证据标签、`target_time`、
+   `answer_evidence`、category）泄漏进运行契约。
+
+**Benchmark 服务于 Harness，Harness 不被 Benchmark 绑架。** 分数是能力的度量，不是优化对象；任何
+只在榜单上成立、无法让真实机器人用户受益的改动都不进产品路径。这与“不得过度宣称”是两件事：优化
+时不必控制变量，但**声明 SOTA 时**仍必须使用官方完整 split、官方 evaluator、固定 revision 和可
+重放的 run manifest，并如实说明输入条件与公开榜单的差异。
+
 ### 14.1 Benchmark 能力映射
 
 | Benchmark | 主要验证能力 | MindBridge 对应机制 |
@@ -1283,6 +1360,9 @@ tests/
 | M3-Bench | 机器人视角长期记忆、人类理解、常识提取和跨模态推理 | 在线记忆构建、实体中心图、迭代召回和原始媒体核验 |
 | Video-MME | 短、中、长视频的感知、时序、空间与跨模态选择题 | 分段 AV 证据、长程召回、官方四选一协议 |
 | EgoTempo | 第一视角动作前后、频率、顺序、速度与持续时间 | clip 内时间线、事件边界、开放式证据回答 |
+| EgoMemReason | 第一视角身份绑定的查询时刻推理与多选回答 | 查询时刻截断、身份实体、分层 Episode |
+| MEMLENS | 长上下文多模态对话记忆与不可答判定 | 逐 turn 显式记忆、图像证据、拒答边界 |
+| MM-Lifelong | 日/周/月尺度的长程事件定位与开放回答 | 全局时间轴、时间过滤、证据区间回溯 |
 
 ### 14.2 统一评测路径
 
@@ -1292,15 +1372,19 @@ tests/
 2. 视频、音频、图像和对话统一通过生产 `observe`/`remember` 接口写入；
 3. 问题统一通过生产 `recall` 接口执行；
 4. 结果转换为官方评测格式；
-5. 不允许 Benchmark 专用存储、隐藏答案、专用模型或绕过召回的长上下文直塞；
+5. 不允许 Benchmark 专用存储、隐藏答案、为数据集特制/微调的模型，或绕过召回的长上下文直塞；
+   选用当时最强的**通用**模型是允许的，前提是同一配置可以直接部署为产品；
 6. 模型、Prompt、索引参数和代码 commit 固定进 run manifest。
 
 可执行适配基线固定 LoCoMo revision `3eb6f2c585f5e1699204e3c3bdf7adc5c28cb376`、M3-Agent
 revision `0e3e41939bd8a0b66d756e7b7eb8d5fe9992da5c`、Video-MME 数据 revision
 `ead1408f75b618502df9a1d8e0950166bf0a2a0b`、EgoLife 数据 revision
 `143fb319be7aa5ae210c936bf4f0f3a86092afb0`、EgoTempo revision
-`7022ba77b4d89f51cf34e499767995ccd5c90c7a` 和 SuperMemory-VQA 数据 revision
-`1d228e0f10049a8a84c458dded2aa25b1e21ce8f`。适配器只转换推理所需字段；EgoLife 的
+`7022ba77b4d89f51cf34e499767995ccd5c90c7a`、SuperMemory-VQA 数据 revision
+`1d228e0f10049a8a84c458dded2aa25b1e21ce8f`、EgoMemReason revision
+`7e581505b9dce0e85193a27ae689ff899d0bc507`、MEMLENS revision
+`afa101a1907cc37db40b50d649547964387b96b7` 和 MM-Lifelong revision
+`248aa82039a574e63a2e524746a7cd8f32330443`。适配器只转换推理所需字段；EgoLife 的
 `target_time`、`keywords`、`reason` 与 SuperMemory 的 `answer_evidence` 不进入运行契约。
 媒体通过 Hugging Face Hub 官方客户端按 revision 获取，仓库不保存数据副本或自研下载器。
 `dataset-adapters-smoke.json` 记录源文件 SHA-256、适配器版本和完整样本计数；当前门禁还覆盖
@@ -1317,16 +1401,18 @@ LoCoMo runner 将原始对话逐 turn 通过 `remember` 写入，并且不向生
 固定 `conv-26` 的 199 题生产切片中，`qwen3.8-max`、Text Small F16 和官方 evaluator 下，
 `pre_reflection_v4` 到 `reflection_v8` 的组合改动使全题 F1 从 `0.6004` 变为 `0.6494`，
 non-adversarial F1 从 `0.5426` 变为
-`0.6002`，Evidence recall 从 `0.7722` 提升到 `0.7772`。该单会话结果只作为组合优化和回归证据，不作为全量 LoCoMo、
-单变量消融或 SOTA 声明；数据、Evaluator、运行配置、输出 hash 和五类指标保存在
+`0.6002`，Evidence recall 从 `0.7722` 提升到 `0.7772`。这是一次刻意的多处同时优化，符合 §14.0 的
+“不控制变量、只追绝对分数”；它只是切片证据，因此不能替代全量 LoCoMo 的 SOTA 声明。数据、
+Evaluator、运行配置、输出 hash 和五类指标保存在
 [`locomo-conv-26-optimization.json`](../benchmarks/manifests/locomo-conv-26-optimization.json)。
 
 当前 `v10` 删除了旧 runner 对 `would/likely/might` 问题单独扩大候选数的题面特判，并将同一套
 最多两轮 retrieval refinement 应用于所有产品查询。真实重跑表明，统一 Top-20 时全题 F1 为
 `0.6376`、non-adversarial F1 为 `0.5847`、Evidence recall 为 `0.7638`；统一 Top-50 时分别为
 `0.6532 / 0.6117 / 0.8551`。这说明较大的候选预算确实提高长程文本记忆覆盖，但也使该切片的
-结果文件从约 173 KB 增至 288 KB，并增加模型上下文和运行时间。因而 Top-50 只作为云端长程
-文本的实验 quality 配置证据，不作为 LoCoMo CLI 默认值；原生多媒体或边端请求也不被静默扩容。两次运行使用
+结果文件从约 173 KB 增至 288 KB，并增加模型上下文和运行时间。追求绝对分数的评测可以显式选择
+Top-50 并记录进 manifest；CLI 与产品默认仍是 Top-20，原生多媒体或边端请求不被静默扩容——差别
+必须来自显式配置，而不是运行时按题面偷偷切换。两次运行使用
 完全相同的 419 条记忆、199 个问题、Prompt、模型和并发，仅 `recall_limit` 不同，完整指标与输出
 SHA-256 同样保存在上述 manifest 中。
 
@@ -1366,6 +1452,34 @@ Video-MME 与 EgoTempo 共用通用 `PreparedVideo`/`PreparedVideoSegment` 媒�
 `V/Q/QA/A/C/M` judge 输入。两者都只依赖 `AsyncMindBridge` 公共契约，新增模型提供商无需改动
 Benchmark；EgoTempo 的 Gemini judge 保持在固定 revision 的官方 notebook 中，不复制进产品代码。
 
+EgoMemReason runner 按官方 `DAYn, HH:MM:SS` 查询时刻截断记忆，只写入该时刻之前的片段，输出
+leaderboard 预测与检索诊断。MEMLENS runner 以 question 为隔离单元重放整段带日期的多模态对话，
+图像走 `observe`、文本 turn 走 `remember`；API 拒答被渲染为数据集要求的
+`Insufficient information`。MM-Lifelong runner 把 Day/Week/Month split 对齐到全局
+`total_intervals` 时间轴，输出官方 `pred{answer, intervals}` 供官方 evaluator 计算。
+
+#### 14.2.1 评测口径的强制披露
+
+三处口径会让"看起来更好"和"实际更好"分叉，因此每次运行必须同时给出配套数值，不得单独引用：
+
+- **LoCoMo abstention**：对抗题（category 5）的标准答案就是
+  `Not mentioned in the conversation`，与 API 拒答的渲染文本相同。因此每行结果携带
+  `mindbridge_abstained`，run manifest 记录 `abstained_question_count`；引用全题 F1 时必须同时
+  给出拒答率与 non-adversarial F1。
+- **Video-MME 分母**：官方 parser 丢弃解析不出选项字母的行，拒答与 API 失败恰好落在该桶。
+  `evaluate_video_mme` 因此同时返回 `accuracy`（官方口径）、`strict_accuracy`（全题分母）和
+  `error_count`，官方数字不得脱离后两者出现。
+- **仓内诊断指标**：`unofficial_reference_at_n` 是 MM-Lifelong 的桶化 Jaccard 估计，字段名为
+  `mindbridge_unofficial_ref_at_300`，不是官方 Ref@N。SuperMemory 的 Ans-F1/QA-Acc/QA-MRR 与
+  EgoLife/Video-MME 的准确率同样为仓内实现。对外声明必须由官方 evaluator 跑一遍导出的官方字段
+  产生，仓内数值只用于回归。
+
+Benchmark 的官方题面措辞属于评测输入，集中在 `mindbridge.benchmarks.prompts`，与产品
+Prompt 目录 `mindbridge.prompts` 严格分离：生产 observe/recall 路径不读取前者，contract 测试
+同时锁定两个目录的版本与 SHA-256。产品回答 Prompt 中与评测形状相关的规则（最短完整答案、
+选项标签保真、答案串不携带引用与 caveat）统一施加于全部查询，不按 Benchmark 分支，也不读取
+题目类别或答案；证据仍通过 `evidence[]` 独立返回。
+
 所有 runner 强制接收 `run_id`，并将其写入 tenant ID 与 sidecar manifest。每次运行使用新的
 `run_id`，从结构上阻断上一次完整摄入留下的未来记忆污染本次较早问题；输出还固定数据、prepared
 media、代码、模型、Prompt、检索参数和预测文件哈希。
@@ -1380,10 +1494,12 @@ media、代码、模型、Prompt、检索参数和预测文件哈希。
 | 检索 | Evidence Recall@K、MRR/nDCG、时间范围命中、多证据覆盖率 |
 | 回答 | 官方 Accuracy/F1/LLM Judge、证据一致性、拒答准确率 |
 | 系统 | ingest throughput、queue lag、P50/P95 recall latency、GPU time、成本 |
-| 端侧 | FPS、显存、功耗、丢帧、缓存增长、断网恢复成功率 |
+| 端侧 | 每个目标平台分别记录 FPS/RTF、内存/显存、功耗、丢帧、缓存增长、断网恢复成功率 |
 | 生命周期 | 重复率、错误合并率、纠错生效时间、删除完成率、索引压缩率 |
 
-SOTA 声明必须使用官方 split、公开 run manifest 和可重放结果；同时报告质量、延迟和成本，避免只优化 Judge。
+SOTA 声明必须使用官方 split、官方 evaluator、公开 run manifest 和可重放结果；同时报告质量、延迟
+和成本，避免只优化 Judge。分数提升还必须能在分层指标上找到对应的能力提升（检索、事件构建或回答
+之一），只在最终分数上出现、上游指标毫无变化的“提升”按 reward hacking 处理并回滚。
 
 ### 14.4 Embedding Bake-off
 
@@ -1469,7 +1585,7 @@ job→first claim/searchable ready，以及 recall→first answer/complete。His
 
 ### Phase 1：端云垂直切片
 
-- Jetson/机器人主机采集、事件门控、SQLite Outbox；
+- 端侧主机（任一平台）采集、事件门控、SQLite Outbox；
 - 端侧人脸/声纹 prototype；
 - 云端导入、对象存储、Event 构建、pgvector 索引；
 - `observe`、`recall`、`get` 最小 API。
@@ -1490,7 +1606,8 @@ job→first claim/searchable ready，以及 recall→first answer/complete。His
 - Embedding/Omni 模型 bake-off；
 - 人脸、diarization、声纹、ASD 与 face↔voice 闭环 bake-off；
 - Benchmark 失败案例回放和查询策略优化；
-- Jetson 性能、功耗和端侧 Nano 评估；
+- 跨平台端侧性能、功耗与 Nano 常驻评估：至少覆盖一个 NVIDIA 平台、一个非 NVIDIA NPU 平台
+  （地瓜 RDK 或 RK）、一个 OpenVINO x86 平台和一个 dGPU 主机；
 - 多租户、配额、审计、备份删除和运行 SLO；
 - Python SDK、MCP 和完整 OpenAPI 文档。
 
@@ -1508,8 +1625,9 @@ Robot/Web 非官方 Qwen Judge `30.02%/58.18%`。M3 Web 混合了 908 个 v6 与
 包含选择性重跑，因而只是诊断值。逐运行 revision、输入表示、模型、结果 hash 和生命周期工件
 固定在 [`benchmark-5090-clean-007.json`](../benchmarks/manifests/benchmark-5090-clean-007.json)。
 当前生产 Recall 的单 conversation 组合回归中，LoCoMo non-adversarial token-F1 从 `54.26%`
-变为 `60.02%`；由于 Prompt 与反思代码同时变化，该差值不能作为反思的单变量收益。新的真实音频
-验证在 RTX 5090 上用一次 FunASR 调用贯通 VAD、ASR、标点、diarization 与 ERes2NetV2 centroid：
+变为 `60.02%`。Prompt 与反思代码是同时变化的——按 §14.0 这是允许的优化方式，因此该差值是组合
+收益，不能被引用为反思单独的贡献。新的真实音频
+验证在 RTX 5090 上用一次 FunASR 调用贯通 VAD、ASR、标点、diarization 与 CAM++ centroid：
 20 秒音频推理 1.283 秒、峰值 CUDA allocation 1.93 GiB；同一 centroid 跨两个 Observation 命中
 同一 AES-GCM 加密设备身份。另有 6 秒、60 次 100ms PCM push 的真实在线路径。两者都只作为当前代码
 增量证据；完整榜单和带真值身份 replay 仍按上述基线口径验收。
@@ -1522,32 +1640,33 @@ Entity/Bridge/Scene/Horizon cue 明确推迟到完整数据证明增益之后，
 | 阶段 | 当前状态 | 已落地证据 | 剩余验收 |
 | --- | --- | --- | --- |
 | Phase 0 | 完成 | 严格领域契约、锁定依赖、CI、Jina smoke、官方数据适配器、可追溯 LoCoMo 与 5090 全量评测 manifest | 无；后续运行继续沿用同一 manifest 门禁 |
-| Phase 1 | 软件垂直路径完成 | 原生 BGR/PCM 流入口、采集 handoff、FunASR 统一语音、加密身份 prototype、SQLite Outbox/近期记忆、S3 同步、durable Job、Event 精确 EvidenceSpan/pgvector 与 REST API | 在目标 Jetson 上完成真实摄像头、VAD/场景/运动门控、断网和功耗验收 |
+| Phase 1 | 软件垂直路径完成 | 原生 BGR/PCM 流入口、采集 handoff、FunASR 统一语音、加密身份 prototype、SQLite Outbox/近期记忆、S3 同步、durable Job、Event 精确 EvidenceSpan/pgvector 与 REST API | 在各目标端侧平台上完成真实摄像头、VAD/场景/运动门控、断网和功耗验收 |
 | Phase 2 | 完成（公开发布表示） | Episode/Claim/Summary consolidation、RRF/图展开/媒体重看、反馈纠错、生命周期、显式删除，以及四套 Benchmark 完整公开题集的生产 API 分层结果 | 原始 AV 全量重放属于 Phase 3 严格 SOTA 复现，不再作为 Phase 2 软件门禁 |
-| Phase 3 | 进行中 | RLS 多租户、Bearer allowlist、Python SDK、MCP/OpenAPI、OpenTelemetry、端侧 CUDA 人脸/FunASR 统一 speech path、PCM streaming、Omni ASD、发布文本↔原始媒体证据绑定、相关 Top-K 时间重排、无结果方向切换和有界层级展开 | 原始 AV/OCR/object 全量 SOTA 重放、官方 Judge 重跑、身份真值 replay、LR-ASD/TensorRT 与 Embedding bake-off、Jetson/Nano 实测、配额、持久审计和备份删除演练；experience/cue 等完整数据证明收益后再评估 |
+| Phase 3 | 进行中 | RLS 多租户、Bearer allowlist、Python SDK、MCP/OpenAPI、OpenTelemetry、端侧 CUDA 人脸/FunASR 统一 speech path、PCM streaming、Omni ASD、发布文本↔原始媒体证据绑定、相关 Top-K 时间重排、无结果方向切换和有界层级展开 | 原始 AV/OCR/object 全量 SOTA 重放、官方 Judge 重跑、身份真值 replay、LR-ASD 与 Embedding bake-off、跨平台端侧 runtime（TensorRT/RKNN/OpenVINO/BPU）与 Nano 实测、配额、持久审计和备份删除演练；experience/cue 等完整数据证明收益后再评估 |
 
 “软件路径完成”不等于硬件或榜单验收完成。以下项目不能由单元测试替代：
 
-1. Jetson 的 FPS、显存、功耗、温度、丢帧与断网缓存增长必须在目标 SKU 和真实传感器上记录；
+1. FPS/RTF、内存/显存、功耗、温度、丢帧与断网缓存增长必须在**每一个**目标端侧平台的真实 SKU 和
+   真实传感器上分别记录，一台设备的数字不能代表整个档位或其他厂商平台；
 2. Jina Nano 是否常驻、事件门控阈值和媒体保留期必须由同一真实机器人回放集校准；
 3. SOTA 只接受官方完整 split、固定代码/模型 revision、公开 run manifest 和可重放输出；
 4. 每租户配额、审计保留期、备份擦除窗口和 P95 SLO 必须先获得负载模型与运营约束，再进入配置和门禁。
 5. 人物一致性必须报告 false-link、跨日 IDF1、撤销延迟以及完整管线的 FPS/RTF、功耗、温度和
-   主任务资源余量；论文单模型指标不能替代目标 Jetson 证据。
+   主任务资源余量；论文单模型指标不能替代目标端侧平台的实测证据。
 
 ## 17. 关键架构决策记录
 
 | ADR | 决策 | 接受的代价 | 重审触发条件 |
 | --- | --- | --- | --- |
 | ADR-001 | 原始视听证据优先，文本是派生视图 | 存储与重看成本更高 | 只有法规或硬件禁止保留原始媒体 |
-| ADR-002 | Jetson 做身份/门控/近期记忆，云端做全局重型记忆 | 依赖网络，端侧能力不完全 | 明确提出完全离线产品需求 |
+| ADR-002 | 端侧做身份/门控/近期记忆，云端做全局重型记忆；端侧不绑定厂商，平台差异只存在于 runtime 适配 | 依赖网络；每个平台都要单独实测标定 | 明确提出完全离线产品需求 |
 | ADR-003 | 模型全部冻结，学习发生在记忆和策略层 | 放弃任务微调可能带来的单榜收益 | 用户明确取消“不微调”约束 |
 | ADR-004 | Jina v5 Omni Small 为云端跨模态主召回，Nano 为可选端侧召回 | 单向量不能独立完成身份、时间和多跳 | 同条件 bake-off 出现稳定更强模型 |
 | ADR-005 | PostgreSQL + pgvector 为首版唯一主数据库 | 极端规模下不如专用引擎 | 实测容量或 P95 延迟不达标 |
 | ADR-006 | 模块化单体 + Worker，不提前微服务化 | 进程级隔离较粗 | 模块出现明确独立扩缩容和故障域需求 |
-| ADR-007 | 官方 SDK/HF/NVIDIA/OpenAI-compatible 优先 | 受上游 API 和版本变化影响 | 上游无法满足必要能力且无替代实现 |
-| ADR-008 | Benchmark 走生产 API，不建旁路 | 迭代速度可能慢于特制脚本 | 不重审；这是 SOTA 可产品化的前提 |
-| ADR-009 | 可读性、简洁性、类型和测试作为合并门禁 | 首次实现需投入工具配置和评审成本 | 不重审；工程质量是产品能力的一部分 |
+| ADR-007 | 官方 SDK/HF/硬件厂商原生栈/OpenAI-compatible 优先；ONNX 为默认可移植工件 | 受上游 API 和版本变化影响 | 上游无法满足必要能力且无替代实现 |
+| ADR-008 | Benchmark 走生产 API，不建旁路；eval 不控制变量、只追绝对分数，但禁止 reward hacking | 迭代速度可能慢于特制脚本；单次提升的归因更弱 | 不重审；这是 SOTA 可产品化的前提 |
+| ADR-009 | Code is the Product：可读性、简洁性、类型和测试作为合并门禁，行数不是产出 | 首次实现需投入工具配置和评审成本 | 不重审；工程质量是产品能力的一部分 |
 | ADR-010 | face↔voice 只由可审计 ASD 证据跨 Observation 累积并可撤销解析 | 首次绑定更慢，低证据场景保持两个匿名 ID | 同条件实验证明替代方法在 false-link、撤销和部署成本上稳定更优 |
 | ADR-011 | 端侧语音默认收敛到 FunASR 在线 ASR + Event-close 统一质量管线，不保留 NeMo 并行栈 | 实时 partial 暂不提供稳定 speaker label | 带真值 replay 证明另一上游栈在同资源下显著降低 DER/false-link，且收益覆盖依赖和编排成本 |
 | ADR-012 | 模型扩展只使用 Generator、Embedder、Reranker；供应商是 Adapter，任务是应用管线 | 破坏旧任务专用类，插件必须遵守严格协议 | 出现无法由三种 I/O 语义表达且有两个真实实现的新能力 |
@@ -1556,14 +1675,16 @@ Entity/Bridge/Scene/Horizon cue 明确推迟到完整数据证明增益之后，
 
 以下内容不应在缺少数据时拍脑袋固定：
 
-- 首批 Jetson 的具体 SKU、内存和留给 MindBridge 的功耗/显存预算；
+- 各目标端侧平台（Jetson、地瓜 RDK、RK、OpenVINO x86、dGPU 主机）的具体 SKU、内存和留给
+  MindBridge 的功耗/显存预算；
 - 事件门控阈值、最大分析窗口和片段重叠；
 - 各人脸检测档位、diarization 缓冲/人数上限、声纹分桶阈值、ASD 置信度、累计时长、Observation
   数和双向 margin；
 - 端侧滚动缓存时长和云端原始媒体保留期；
 - 每租户设备数、媒体小时数和 Recall QPS；
 - 质量优先配置下可接受的 P95 回答延迟和单小时媒体成本；
-- Jina Nano 是否在各设备档位常驻；
+- Jina Nano 是否在各平台档位常驻，以及每个平台的推理 runtime 选型（ONNX Runtime EP、TensorRT、
+  RKNN、OpenVINO、BPU）；
 - 生命周期分数系数、冷热阈值和自动压缩策略。
 
 这些参数都必须通过真实机器人录制、完整 Benchmark 和故障演练决定，并作为可观测配置保存。

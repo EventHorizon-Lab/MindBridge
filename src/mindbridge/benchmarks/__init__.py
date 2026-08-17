@@ -86,8 +86,8 @@ from mindbridge.benchmarks.mm_lifelong_runner import (
     MMLifelongPreparedTimeline,
     MMLifelongQuestionResult,
     load_prepared_mm_lifelong,
-    reference_at_n,
     run_mm_lifelong,
+    unofficial_reference_at_n,
 )
 from mindbridge.benchmarks.runtime import (
     OPTION_LABELS,
@@ -213,7 +213,6 @@ __all__ = [
     "multiple_choice_query",
     "parse_option_ranking",
     "parse_video_mme_option",
-    "reference_at_n",
     "run_egolife_qa",
     "run_egomem_reason",
     "run_egotempo_clip",
@@ -223,5 +222,6 @@ __all__ = [
     "run_mm_lifelong",
     "run_supermemory_vqa",
     "run_video_mme_video",
+    "unofficial_reference_at_n",
     "wait_for_observation_job",
 ]

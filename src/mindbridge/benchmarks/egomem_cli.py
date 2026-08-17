@@ -33,12 +33,12 @@ from mindbridge.benchmarks.egomem_reason import (
     EgoMemReasonQuestion,
     load_egomem_reason,
 )
+from mindbridge.benchmarks.prompts import EGOMEM_REASON_QUERY_PROMPT
 from mindbridge.contracts import ContractModel, Identifier, NonEmptyString, Sha256Hex
 from mindbridge.file_integrity import sha256_file
 from mindbridge.models import EmbedTask
 from mindbridge.prompts import (
     ANSWER_FROM_EVIDENCE_PROMPT,
-    EGOMEM_REASON_QUERY_PROMPT,
     PERCEIVE_EVENTS_PROMPT,
 )
 from mindbridge.sdk import MindBridge
