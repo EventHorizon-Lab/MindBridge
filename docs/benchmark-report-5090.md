@@ -6,7 +6,7 @@
 > `locomo-reflection-v8-clean-008`、当前固定切片 `refinement-v9-uniform-l20/l50`；当前实现
 > `answer_from_evidence_v10`
 >
-> 验证边界：一台 RTX 5090 同时模拟机器人端与云端；本轮验证功能、质量和数据闭环，延迟、功耗、温度与 Jetson TensorRT 性能暂不作为验收门禁。
+> 验证边界：一台 RTX 5090 同时模拟机器人端与云端；本轮验证功能、质量和数据闭环，延迟、功耗、温度与各端侧平台（Jetson、地瓜 RDK、RK、OpenVINO x86）的原生 runtime 性能暂不作为验收门禁。
 >
 > 可复现清单：[`benchmark-5090-clean-007.json`](../benchmarks/manifests/benchmark-5090-clean-007.json)
 >
@@ -28,7 +28,13 @@
 
 MindBridge 的 MaaS 主链路已经能够真实运行：端侧原始视频进入近期记忆与 Outbox，云端完成对象存储、视听理解、事件/实体/Claim 构建、Embedding、混合召回和证据回答；反馈能够强化或版本化纠错；生命周期能够降冷并在访问时回热；显式遗忘能够删除云端媒体、派生记录、索引、端侧近期记忆和本地身份模板；Episode、Claim 与 Summary consolidation 也已通过真实 Omni/VLM 调用完成提交。
 
-这不等于 MindBridge 的最终目标已经完成：LoCoMo 的官方 token-F1 已超过当前公开 T-Mem 结果，但 Judge 模型和重复次数不同，不能据此宣布整体 SOTA；三个多模态 Benchmark 的完整公开题集已经评估，但公开输入条件分别是发布 caption、transcript 或 memory graph，而不是完全相同的原始视听管线，因此只能用于定位记忆层差距，不能冒充与论文榜单严格可比的 SOTA 复现。当前已加入一次有界的证据充分性反思检索；真正未完成的是原始视听全量重放、跨查询经验记忆、目标 Jetson 标定和严格官方 Judge 复跑。
+这不等于 MindBridge 的最终目标已经完成：LoCoMo 的官方 token-F1 已超过当前公开 T-Mem 结果，但 Judge 模型和重复次数不同，不能据此宣布整体 SOTA；三个多模态 Benchmark 的完整公开题集已经评估，但公开输入条件分别是发布 caption、transcript 或 memory graph，而不是完全相同的原始视听管线，因此只能用于定位记忆层差距，不能冒充与论文榜单严格可比的 SOTA 复现。当前已加入一次有界的证据充分性反思检索；真正未完成的是原始视听全量重放、跨查询经验记忆、各目标端侧平台的标定和严格官方 Judge 复跑。
+
+本报告遵循[技术架构 §14.0 评测立场](technical-architecture.md#140-评测立场)：目标是各类权威
+Benchmark 上的**绝对分数**，优化时不要求控制变量或单变量消融，评测可以使用当时可用的最强模型，
+但禁止 reward hacking——不识别题面/类别、不迎合特定 Judge、不建数据集专用旁路、不让标注字段进入
+运行契约。因此下文出现的“组合改动”不是缺陷，而是既定做法；而“不能宣布 SOTA”的限制针对的是
+**声明口径**（官方 split、官方 evaluator、可重放 manifest、输入条件一致），与优化方式无关。
 
 2026-08-14 的增量真实媒体复验使用 17.63 秒 EgoLife 原始 MP4：签名 URL 完整返回
 `6,663,507` bytes，同一 `qwen3.8-max` 通过异步 OpenAI SDK 直接查看视频并识别红白格桌布。随后
@@ -241,9 +247,9 @@ Observation，在不再调用 ASD 的情况下耗时 `1.273s`，相同片段内 
 自适应计算路径也在同一 5090 上以默认参数真实运行：模型加载后的空闲显存超过 8 GiB，入口自动
 并发 ASR 与 Sortformer，并在 `1.256s` 内生成 161 个 cloud-safe identity interval；四个本地适配器
 报告的实际 device/provider 均为 CUDA。该数值复用了已由 InsightFace CUDA 真实提取的 143 个人脸
-embedding，只证明调度与本地模型链路，不替代 Jetson 延迟、功耗或持续流验收。
+embedding，只证明调度与本地模型链路，不替代任何目标端侧平台的延迟、功耗或持续流验收。
 
-这些阈值只证明功能可分，不是 FAR/EER、跨日身份准确率或 Jetson 阈值。下一次身份验收必须使用带真值的机器人 replay 报告 TAR@FAR、false-link、跨日 IDF1 和撤销延迟。
+这些阈值只证明功能可分，不是 FAR/EER、跨日身份准确率或任何目标平台的标定阈值。下一次身份验收必须使用带真值的机器人 replay 报告 TAR@FAR、false-link、跨日 IDF1 和撤销延迟。
 
 ## 6. 优化优先级
 
@@ -269,9 +275,9 @@ embedding，只证明调度与本地模型链路，不替代 Jetson 延迟、功
 ### P2：完成产品验收而不是继续堆框架
 
 1. 用同一机器人 replay 在 Jina v5 Omni Small、Text Small、Nano 与必要候选间做 Evidence Recall@K bake-off；没有数据证明前不增加专用向量库或 reranker 服务。
-2. 在 Orin Nano/NX/AGX 上复跑 capture、identity、outbox、断网恢复与 tombstone，记录 FPS/RTF、显存、功耗、温度、丢帧和队列增长。
+2. 在跨厂商平台上复跑 capture、identity、outbox、断网恢复与 tombstone——至少覆盖一个 NVIDIA Jetson 档位、一个非 NVIDIA NPU 平台（地瓜 RDK 或 RK）、一个 OpenVINO x86 平台和一个 dGPU 主机——并按平台分别记录 FPS/RTF、内存/显存、功耗、温度、丢帧和队列增长。
 3. 已完成真实 Sortformer + ERes2NetV2 + Omni ASD segment 闭环；下一步是 LR-ASD
-   ONNX/TensorRT、持续 microphone chunk/speaker cache 和带真值 replay。历史跨设备 identity alias
+   ONNX（各平台再按需编译 TensorRT/RKNN/OpenVINO 工件）、持续 microphone chunk/speaker cache 和带真值 replay。历史跨设备 identity alias
    只有产品确实要求时再加入。
 4. 用新 `run_id`、单一 `m3_production_api_v7` 和不选择性重跑的失败计分重跑 M3 Web，并按论文
    Judge 做三次重复；当前混合分片只保留为诊断基线。
@@ -287,6 +293,6 @@ embedding，只证明调度与本地模型链路，不替代 Jetson 延迟、功
 | 四套 Benchmark 完整公开题集 | 已完成本轮可获得输入的评估 |
 | LoCoMo SOTA | token-F1 超过公开强基线；严格 Judge SOTA 尚未确认 |
 | 三套多模态 SOTA | 未完成；本轮是 memory-layer 诊断，原始 AV 与严格同协议复现仍缺失 |
-| Jetson 部署验收 | 未开始；按用户要求暂缓延迟与硬件指标 |
+| 端侧多平台部署验收 | 未开始；按用户要求暂缓延迟与硬件指标。Edge 目标为全平台（Jetson / RDK / RK / OpenVINO / dGPU），任一平台的数字都不可外推到其他平台 |
 
-因此，MindBridge 已经从“架构与单测”进入“可运行、可量化、能暴露真实瓶颈”的阶段，但最终 SOTA 和 Jetson 产品验收仍是明确未完成项。
+因此，MindBridge 已经从“架构与单测”进入“可运行、可量化、能暴露真实瓶颈”的阶段，但最终 SOTA 和跨平台端侧产品验收仍是明确未完成项。
