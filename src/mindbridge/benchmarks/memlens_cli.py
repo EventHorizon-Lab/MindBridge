@@ -23,6 +23,7 @@ from mindbridge.benchmarks.cli_common import (
     core_parser,
     media_arguments,
     media_manifest,
+    select_by_id,
     write_run_artifacts,
 )
 from mindbridge.benchmarks.memlens import (
@@ -219,15 +220,12 @@ def _select_questions(
                 f"MEMLENS agent subset contains unknown IDs: {', '.join(sorted(missing_subset))}"
             )
         questions = tuple(question for question in questions if question.question_id in subset_ids)
-    if len(set(question_ids)) != len(question_ids):
-        raise ValueError("question IDs must not contain duplicates")
-    if question_ids:
-        requested = set(question_ids)
-        selected = tuple(question for question in questions if question.question_id in requested)
-        missing = requested - {question.question_id for question in selected}
-        if missing:
-            raise ValueError(f"unknown selected MEMLENS question IDs: {', '.join(sorted(missing))}")
-        questions = selected
+    questions = select_by_id(
+        questions,
+        question_ids,
+        key=lambda question: question.question_id,
+        label="selected MEMLENS question IDs",
+    )
     if not questions:
         raise ValueError("MEMLENS selection must not be empty")
     return questions

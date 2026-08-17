@@ -23,6 +23,7 @@ from mindbridge.benchmarks.cli_common import (
     core_parser,
     media_arguments,
     media_manifest,
+    select_by_id,
     write_run_artifacts,
 )
 from mindbridge.benchmarks.egolife_qa import (
@@ -74,7 +75,12 @@ class _Arguments(MediaArguments):
 def main() -> None:
     """Run selected official questions and emit scored predictions plus a manifest."""
     arguments = _parse_arguments()
-    questions = _select_questions(load_egolife_qa(arguments.dataset_path), arguments.question_ids)
+    questions = select_by_id(
+        load_egolife_qa(arguments.dataset_path),
+        arguments.question_ids,
+        key=lambda question: question.question_id,
+        label="EgoLifeQA question IDs",
+    )
     prepared = load_prepared_egolife(arguments.prepared_media_path)
     require_writable_output_pair(arguments.output_path, overwrite=arguments.overwrite)
     deployment = load_deployment_snapshot(
@@ -151,22 +157,6 @@ def _write_artifacts(
         metrics=metrics,
     )
     write_run_artifacts(arguments.output_path, predictions, manifest)
-
-
-def _select_questions(
-    questions: tuple[EgoLifeQuestion, ...],
-    question_ids: tuple[str, ...],
-) -> tuple[EgoLifeQuestion, ...]:
-    if not question_ids:
-        return questions
-    if len(set(question_ids)) != len(question_ids):
-        raise ValueError("question IDs must not contain duplicates")
-    requested = set(question_ids)
-    selected = tuple(question for question in questions if question.question_id in requested)
-    missing = requested - {question.question_id for question in selected}
-    if missing:
-        raise ValueError(f"unknown EgoLifeQA question IDs: {', '.join(sorted(missing))}")
-    return selected
 
 
 def _parse_arguments() -> _Arguments:

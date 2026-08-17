@@ -24,6 +24,7 @@ from mindbridge.benchmarks.cli_common import (
     index_prepared,
     media_arguments,
     media_manifest,
+    select_by_id,
     write_run_artifacts,
 )
 from mindbridge.benchmarks.prompts import VIDEO_MME_QUERY_PROMPT
@@ -169,14 +170,12 @@ def _select_videos(
     video_ids: tuple[str, ...],
     durations: tuple[VideoMMEDuration, ...],
 ) -> tuple[VideoMMEVideo, ...]:
-    if video_ids:
-        if len(set(video_ids)) != len(video_ids):
-            raise ValueError("video IDs must not contain duplicates")
-        requested = set(video_ids)
-        videos = tuple(video for video in videos if video.video_id in requested)
-        missing = requested - {video.video_id for video in videos}
-        if missing:
-            raise ValueError(f"unknown Video-MME video IDs: {', '.join(sorted(missing))}")
+    videos = select_by_id(
+        videos,
+        video_ids,
+        key=lambda video: video.video_id,
+        label="Video-MME video IDs",
+    )
     if durations:
         videos = tuple(video for video in videos if video.duration in set(durations))
     if not videos:

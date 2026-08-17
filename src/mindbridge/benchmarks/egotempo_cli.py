@@ -24,6 +24,7 @@ from mindbridge.benchmarks.cli_common import (
     index_prepared,
     media_arguments,
     media_manifest,
+    select_by_id,
     write_run_artifacts,
 )
 from mindbridge.benchmarks.egotempo import (
@@ -70,7 +71,12 @@ class _Arguments(MediaArguments):
 def main() -> None:
     """Run selected questions and emit JSON accepted by the official judge notebook."""
     arguments = _parse_arguments()
-    questions = _select_questions(load_egotempo(arguments.dataset_path), arguments.question_ids)
+    questions = select_by_id(
+        load_egotempo(arguments.dataset_path),
+        arguments.question_ids,
+        key=lambda question: question.question_id,
+        label="EgoTempo question IDs",
+    )
     prepared = _select_prepared(load_prepared_videos(arguments.prepared_media_path), questions)
     require_writable_output_pair(arguments.output_path, overwrite=arguments.overwrite)
     deployment = load_deployment_snapshot(
@@ -154,21 +160,6 @@ def _write_artifacts(
         transcript_segment_count=sum(segment.transcript is not None for segment in segments),
     )
     write_run_artifacts(arguments.output_path, predictions, manifest)
-
-
-def _select_questions(
-    questions: tuple[EgoTempoQuestion, ...], question_ids: tuple[str, ...]
-) -> tuple[EgoTempoQuestion, ...]:
-    if not question_ids:
-        return questions
-    if len(set(question_ids)) != len(question_ids):
-        raise ValueError("question IDs must not contain duplicates")
-    requested = set(question_ids)
-    selected = tuple(question for question in questions if question.question_id in requested)
-    missing = requested - {question.question_id for question in selected}
-    if missing:
-        raise ValueError(f"unknown EgoTempo question IDs: {', '.join(sorted(missing))}")
-    return selected
 
 
 def _select_prepared(

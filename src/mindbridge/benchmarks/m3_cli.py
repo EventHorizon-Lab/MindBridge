@@ -24,6 +24,7 @@ from mindbridge.benchmarks.cli_common import (
     media_arguments,
     media_manifest,
     predictions_jsonl,
+    select_by_id,
     write_run_artifacts,
 )
 from mindbridge.benchmarks.m3_bench import M3_BENCH_ADAPTER_VERSION, M3BenchVideo, load_m3_bench
@@ -72,7 +73,12 @@ class _Arguments(MediaArguments):
 def main() -> None:
     """Run selected official videos and emit JSONL predictions plus a manifest."""
     arguments = _parse_arguments()
-    videos = _select_videos(load_m3_bench(arguments.dataset_path), arguments.video_ids)
+    videos = select_by_id(
+        load_m3_bench(arguments.dataset_path),
+        arguments.video_ids,
+        key=lambda video: video.video_id,
+        label="M3-Bench video IDs",
+    )
     _validate_subset(videos, arguments.subset)
     prepared = _prepared_by_video(videos, load_prepared_m3(arguments.prepared_media_path))
     require_writable_output_pair(arguments.output_path, overwrite=arguments.overwrite)
@@ -152,22 +158,6 @@ def _write_artifacts(
         question_count=sum(len(video.questions) for video in videos),
     )
     write_run_artifacts(arguments.output_path, predictions, manifest)
-
-
-def _select_videos(
-    videos: tuple[M3BenchVideo, ...],
-    video_ids: tuple[str, ...],
-) -> tuple[M3BenchVideo, ...]:
-    if not video_ids:
-        return videos
-    if len(set(video_ids)) != len(video_ids):
-        raise ValueError("video IDs must not contain duplicates")
-    requested = set(video_ids)
-    selected = tuple(video for video in videos if video.video_id in requested)
-    missing = requested - {video.video_id for video in selected}
-    if missing:
-        raise ValueError(f"unknown M3-Bench video IDs: {', '.join(sorted(missing))}")
-    return selected
 
 
 def _prepared_by_video(

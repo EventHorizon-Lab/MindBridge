@@ -31,6 +31,7 @@ from mindbridge.models import EmbedTask
 from mindbridge.prompts import ANSWER_FROM_EVIDENCE_PROMPT
 from mindbridge.sdk import MindBridge
 
+_Item = TypeVar("_Item")
 _Prepared = TypeVar("_Prepared")
 # Benchmarks key prepared units either by string ID or by integer index, and the two sort
 # differently: constraining the variable keeps `sorted` numeric so a missing EgoMemReason
@@ -284,6 +285,33 @@ async def connected_memory(arguments: CoreArguments) -> AsyncIterator[MindBridge
         yield memory
     finally:
         await memory.close()
+
+
+def select_by_id(
+    items: tuple[_Item, ...],
+    requested: Iterable[_Key],
+    *,
+    key: Callable[[_Item], _Key],
+    label: str,
+) -> tuple[_Item, ...]:
+    """Narrow an official release to the requested units, in the order the release lists them.
+
+    `label` names the unit the way the benchmark's own operator does — "EgoMemReason example IDs",
+    "MM-Lifelong question indices" — because that text is what someone reads when a run refuses to
+    start. Empty `requested` means the whole release, which is how every runner spells "no subset".
+    """
+    wanted = tuple(requested)
+    if not wanted:
+        return items
+    if len(set(wanted)) != len(wanted):
+        raise ValueError(f"{label} must not contain duplicates")
+    unique = set(wanted)
+    selected = tuple(item for item in items if key(item) in unique)
+    missing = unique - {key(item) for item in selected}
+    if missing:
+        formatted = ", ".join(str(item) for item in sorted(missing))
+        raise ValueError(f"unknown {label}: {formatted}")
+    return selected
 
 
 def index_prepared(

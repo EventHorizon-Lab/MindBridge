@@ -13,7 +13,6 @@ from mindbridge.benchmarks.m3_cli import (
     M3RunManifest,
     _Arguments,
     _prepared_by_video,
-    _select_videos,
     _validate_subset,
     _write_artifacts,
 )
@@ -86,12 +85,9 @@ def test_m3_artifacts_pin_media_models_code_and_jsonl_output(tmp_path: Path) -> 
 
 def test_m3_media_manifest_and_selection_fail_closed(tmp_path: Path) -> None:
     video = _video()
-    assert _select_videos((video,), ("video_01",)) == (video,)
     _validate_subset((video,), "robot")
     with pytest.raises(ValueError, match="web subset"):
         _validate_subset((video,), "web")
-    with pytest.raises(ValueError, match="unknown"):
-        _select_videos((video,), ("missing",))
     with pytest.raises(ValueError, match="missing prepared"):
         _prepared_by_video((video,), ())
 
