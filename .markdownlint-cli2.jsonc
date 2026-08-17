@@ -1,5 +1,9 @@
 {
   "config": {
-    "MD013": false
+    "MD013": false,
+    // A reference organised one section per dataset repeats the same sub-structure under each
+    // one — Files, Messages, Questions, Gotchas. Qualifying every heading with its dataset name
+    // would restate the parent for no reader benefit, so only flag duplicates that are siblings.
+    "MD024": { "siblings_only": true }
   }
 }

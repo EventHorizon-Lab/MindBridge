@@ -40,7 +40,7 @@ not in the public evaluation release).
 
 ## Architecture
 
-```
+```text
 6 loaders ──► AmlCase ──► driver ──► POST /aml/add    ──► extract ──► remember()
  (datasets)  (common IR)     │                                        (MindBridge)
                              └──► POST /aml/search ──► recall()
@@ -56,6 +56,7 @@ during a real submission, so the offline harness exercises the same code the
 platform will.
 
 `POST /aml/add`
+
 - Accepts `{request_id, messages[], user_id, session_id}`.
 - Feeds the chunk to the configured `Generator` (`qwen3.8-max`, `json_mode`) to
   extract atomic facts, preferences, and rules.
@@ -68,6 +69,7 @@ embedding is written inline. No job polling is involved — the asynchronous
 job path belongs to `/v1/observations`, not to `remember()`.
 
 `POST /aml/search`
+
 - Accepts `{query, options?, user_id, top_k}`.
 - Issues `RecallRequest(mode=RecallMode.SEARCH, limit=top_k,
   include_evidence=False)`.
