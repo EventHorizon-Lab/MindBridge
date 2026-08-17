@@ -164,3 +164,16 @@ def test_missing_credentials_are_rejected(
     assert (
         http.post("/aml/search", json={"query": "q", "user_id": "u", "top_k": 1}).status_code == 401
     )
+
+
+def test_wrong_bearer_token_is_rejected(
+    client: tuple[TestClient, _StubKernel],
+) -> None:
+    http, _ = client
+    wrong_token = "wrong_token_that_is_long_enough_0123456789"
+    response = http.post(
+        "/aml/search",
+        json={"query": "q", "user_id": "u", "top_k": 1},
+        headers={"Authorization": f"Bearer {wrong_token}"},
+    )
+    assert response.status_code == 401

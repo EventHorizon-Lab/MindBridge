@@ -25,6 +25,7 @@ from mindbridge.application.aml_extraction import extract_memories
 from mindbridge.application.kernel import MemoryKernel
 from mindbridge.contracts import RecallMode, RecallQuery, RecallRequest, RememberRequest
 from mindbridge.models import Generator
+from mindbridge.telemetry import set_current_span_attributes
 
 _BEARER = HTTPBearer(auto_error=False)
 _MINIMUM_API_KEY_LENGTH = 32
@@ -53,7 +54,13 @@ def register_aml_routes(
     *,
     settings: AmlSettings,
 ) -> None:
-    """Expose AML's two operations without widening the tenant API surface."""
+    """Expose AML's two operations without widening the tenant API surface.
+
+    Precondition: `app` must be built by `mindbridge.api.app.build_app`, which
+    registers the handler for `mindbridge.api.auth.AuthenticationError`. On a
+    bare `FastAPI()` app that handler is absent, so a 401 raised here escapes
+    unhandled instead of becoming an HTTP response.
+    """
     expected = hashlib.sha256(settings.api_key.encode()).digest()
 
     async def authorize(
@@ -84,7 +91,13 @@ def register_aml_routes(
             request.messages,
             now=datetime.now(tz=timezone.utc),
         )
-        await asyncio.gather(
+        set_current_span_attributes(
+            {
+                "mindbridge.aml.memories_stored": len(outcome.memories),
+                "mindbridge.aml.memories_skipped": outcome.skipped,
+            }
+        )
+        results = await asyncio.gather(
             *(
                 kernel.remember(
                     RememberRequest(
@@ -95,8 +108,12 @@ def register_aml_routes(
                     )
                 )
                 for memory in outcome.memories
-            )
+            ),
+            return_exceptions=True,
         )
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
         return AmlAddResponse(
             request_id=request.request_id,
             user_id=request.user_id,
