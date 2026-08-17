@@ -30,6 +30,7 @@ from mindbridge.benchmarks.prompts import VIDEO_MME_QUERY_PROMPT
 from mindbridge.benchmarks.runtime import PreparedVideo, load_prepared_videos
 from mindbridge.benchmarks.video_mme import (
     VIDEO_MME_ADAPTER_VERSION,
+    VideoMMEDuration,
     VideoMMEMetrics,
     VideoMMEVideo,
     VideoMMEVideoResult,
@@ -42,6 +43,7 @@ from mindbridge.file_integrity import sha256_file
 from mindbridge.prompts import PERCEIVE_EVENTS_PROMPT
 
 VIDEO_MME_RUNNER_VERSION = "video_mme_production_api_v2"
+VideoMMETranscriptSource = Literal["none", "asr", "official_subtitles"]
 
 
 class VideoMMERunManifest(MediaBenchmarkRunManifest):
@@ -59,6 +61,8 @@ class VideoMMERunManifest(MediaBenchmarkRunManifest):
     segment_count: int = Field(gt=0)
     media_segment_count: int = Field(ge=0)
     transcript_segment_count: int = Field(ge=0)
+    durations: tuple[VideoMMEDuration, ...] = Field(min_length=1)
+    transcript_source: VideoMMETranscriptSource
     metrics: VideoMMEMetrics
 
 
@@ -68,13 +72,18 @@ class _Arguments(MediaArguments):
     dataset_revision: str
     evaluator_revision: str
     video_ids: tuple[str, ...]
+    durations: tuple[VideoMMEDuration, ...]
+    transcript_source: VideoMMETranscriptSource
 
 
 def main() -> None:
     """Run selected videos and emit the official nested prediction JSON."""
     arguments = _parse_arguments()
-    videos = _select_videos(load_video_mme(arguments.dataset_path), arguments.video_ids)
+    videos = _select_videos(
+        load_video_mme(arguments.dataset_path), arguments.video_ids, arguments.durations
+    )
     prepared = _select_prepared(load_prepared_videos(arguments.prepared_media_path), videos)
+    _require_declared_transcripts(prepared, arguments.transcript_source)
     require_writable_output_pair(arguments.output_path, overwrite=arguments.overwrite)
     deployment = load_deployment_snapshot(
         arguments.deployment_config_path,
@@ -148,24 +157,50 @@ def _write_artifacts(
         segment_count=len(segments),
         media_segment_count=sum(bool(segment.media_objects) for segment in segments),
         transcript_segment_count=sum(segment.transcript is not None for segment in segments),
+        durations=tuple(dict.fromkeys(video.duration for video in videos)),
+        transcript_source=arguments.transcript_source,
         metrics=evaluate_video_mme(results),
     )
     write_run_artifacts(arguments.output_path, predictions, manifest)
 
 
 def _select_videos(
-    videos: tuple[VideoMMEVideo, ...], video_ids: tuple[str, ...]
+    videos: tuple[VideoMMEVideo, ...],
+    video_ids: tuple[str, ...],
+    durations: tuple[VideoMMEDuration, ...],
 ) -> tuple[VideoMMEVideo, ...]:
-    if not video_ids:
-        return videos
-    if len(set(video_ids)) != len(video_ids):
-        raise ValueError("video IDs must not contain duplicates")
-    requested = set(video_ids)
-    selected = tuple(video for video in videos if video.video_id in requested)
-    missing = requested - {video.video_id for video in selected}
-    if missing:
-        raise ValueError(f"unknown Video-MME video IDs: {', '.join(sorted(missing))}")
-    return selected
+    if video_ids:
+        if len(set(video_ids)) != len(video_ids):
+            raise ValueError("video IDs must not contain duplicates")
+        requested = set(video_ids)
+        videos = tuple(video for video in videos if video.video_id in requested)
+        missing = requested - {video.video_id for video in videos}
+        if missing:
+            raise ValueError(f"unknown Video-MME video IDs: {', '.join(sorted(missing))}")
+    if durations:
+        videos = tuple(video for video in videos if video.duration in set(durations))
+    if not videos:
+        raise ValueError("no Video-MME videos match the requested IDs and durations")
+    return videos
+
+
+def _require_declared_transcripts(
+    prepared: tuple[PreparedVideo, ...],
+    transcript_source: VideoMMETranscriptSource,
+) -> None:
+    """Refuse a run whose declared subtitle setting disagrees with its prepared media."""
+    present = any(
+        segment.transcript is not None for video in prepared for segment in video.segments
+    )
+    if present and transcript_source == "none":
+        raise ValueError(
+            "prepared media carries transcripts; a run declaring no transcript source would "
+            "report a with-subtitles result in the without-subtitles column"
+        )
+    if not present and transcript_source != "none":
+        raise ValueError(
+            f"prepared media carries no transcript, so it cannot be {transcript_source}"
+        )
 
 
 def _select_prepared(
@@ -189,6 +224,12 @@ def _parse_arguments() -> _Arguments:
     parser.add_argument("--dataset-revision", required=True)
     parser.add_argument("--evaluator-revision", required=True)
     parser.add_argument("--video-id", action="append", default=[])
+    parser.add_argument(
+        "--duration", action="append", default=[], choices=("short", "medium", "long")
+    )
+    parser.add_argument(
+        "--transcript-source", required=True, choices=("none", "asr", "official_subtitles")
+    )
     parsed = parser.parse_args()
     return media_arguments(
         _Arguments,
@@ -197,6 +238,8 @@ def _parse_arguments() -> _Arguments:
         dataset_revision=parsed.dataset_revision,
         evaluator_revision=parsed.evaluator_revision,
         video_ids=tuple(parsed.video_id),
+        durations=tuple(dict.fromkeys(parsed.duration)),
+        transcript_source=parsed.transcript_source,
     )
 
 
