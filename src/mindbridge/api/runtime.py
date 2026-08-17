@@ -13,6 +13,7 @@ from typing import cast
 from fastapi import FastAPI
 from mcp.server import MCPServer
 
+from mindbridge.api.aml import AmlSettings
 from mindbridge.api.app import build_app
 from mindbridge.api.auth import TenantApiKeyAuthenticator
 from mindbridge.api.mcp import build_mcp_server
@@ -31,6 +32,7 @@ from mindbridge.infrastructure.task_queue import (
     CeleryObservationJobPublisher,
     create_task_queue,
 )
+from mindbridge.models import Generator
 from mindbridge.models.defaults import (
     DEFAULT_EMBEDDING_DIMENSION,
     DEFAULT_EMBEDDING_SPACE,
@@ -61,6 +63,8 @@ class Settings:
     reranker_config: Mapping[str, object] = field(default_factory=dict, repr=False)
     minimum_embedding_similarity: float = 0.0
     tenant_api_keys_json: str | None = field(default=None, repr=False)
+    aml_api_key: str | None = field(default=None, repr=False)
+    aml_tenant_prefix: str = "bench_aml"
 
     def __post_init__(self) -> None:
         for name, value in (
@@ -152,6 +156,8 @@ class Settings:
             tenant_api_keys_json=optional_environment_value(
                 source, "MINDBRIDGE_TENANT_API_KEYS_JSON"
             ),
+            aml_api_key=optional_environment_value(source, "MINDBRIDGE_AML_API_KEY"),
+            aml_tenant_prefix=source.get("MINDBRIDGE_AML_TENANT_PREFIX", "bench_aml"),
         )
 
 
@@ -160,6 +166,7 @@ class _Runtime:
     kernel: MemoryKernel
     store: PostgresMemoryStore
     models: tuple[object, ...]
+    generator: Generator
 
     @asynccontextmanager
     async def open(self) -> AsyncIterator[None]:
@@ -185,7 +192,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         async with runtime.open():
             yield
 
-    app = build_app(runtime.kernel, authenticator=authenticator, lifespan=lifespan)
+    app = build_app(
+        runtime.kernel,
+        authenticator=authenticator,
+        lifespan=lifespan,
+        aml=(
+            (
+                AmlSettings(
+                    api_key=resolved.aml_api_key,
+                    tenant_prefix=resolved.aml_tenant_prefix,
+                ),
+                runtime.generator,
+            )
+            if resolved.aml_api_key is not None
+            else None
+        ),
+    )
     instrument_fastapi(app, telemetry)
     return app
 
@@ -239,7 +261,7 @@ def _build_runtime(settings: Settings) -> _Runtime:
         tuple[object, ...],
         (generator, embedder, *((reranker,) if reranker is not None else ())),
     )
-    return _Runtime(kernel, store, models)
+    return _Runtime(kernel, store, models, generator)
 
 
 async def _close_model(model: object) -> None:
