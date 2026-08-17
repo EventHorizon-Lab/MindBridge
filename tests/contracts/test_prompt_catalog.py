@@ -6,6 +6,7 @@ from mindbridge.prompts import ALL_PROMPTS
 
 _EXPECTED_FINGERPRINTS = {
     "active_speaker_v2": "0e6f8763910e580cbc3a9323dde717119eb5fd481e532af3f19c5a6cfb61b1cb",
+    "aml_extract_facts_v1": "55d9ba0c29cc04247730e6b756ada69e2a20f46f15af58d0be1bcace97cd2d3d",
     "answer_from_evidence_v10": (
         "5b1fa751f8b9cdc87584a94048b0dcf514948db1c7151edc14e3542a3f29d84b"
     ),
