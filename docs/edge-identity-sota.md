@@ -1,8 +1,8 @@
 # 端侧人物一致性感知与 FunASR 收敛决策
 
-> 状态：Phase 3 可执行基线，目标 Jetson 真值验收前不得宣称人物一致性 SOTA
+> 状态：Phase 3 可执行基线，目标端侧平台真值验收前不得宣称人物一致性 SOTA
 >
-> 更新日期：2026-08-14
+> 更新日期：2026-08-17
 >
 > 范围：原生视听流、人脸、VAD/ASR/标点/diarization、声纹、face↔voice 和端侧遗忘
 
@@ -12,10 +12,10 @@ MindBridge 当前默认链路只保留一套语音生态：
 
 | 能力 | 当前默认 | 说明 |
 | --- | --- | --- |
-| 原生视频流 | GStreamer/DeepStream appsink → `InsightFaceVideoEncoder.encode_frame()` | 直接接受带毫秒时间戳的 BGR frame，不重新打开视频 |
+| 原生视频流 | GStreamer appsink（DeepStream 可选）→ `InsightFaceVideoEncoder.encode_frame()` | 直接接受带毫秒时间戳的 BGR frame，不重新打开视频；采集后端可替换，帧契约不变 |
 | 原生音频流 | 16 kHz mono PCM16 → FunASR causal Paraformer | 任意输入 chunk；内部使用官方 600ms 窗口和 cache |
 | Event-close 语音理解 | 一个 FunASR `AutoModel` 组合 ASR + VAD + punctuation + speaker model | 一次推理返回 transcript、毫秒 sentence、speaker label 和 centroid |
-| 人脸 | InsightFace SCRFD + ArcFace | 目标 Jetson 再比较检测器档位；模板留在设备 |
+| 人脸 | InsightFace SCRFD + ArcFace | 在各目标端侧平台上再比较检测器档位；模板留在设备 |
 | 声纹 | FunASR 返回的 CAM++ speaker centroid | 不再二次解码波形或重复加载 speaker encoder |
 | 活跃说话人 | 带 face anchor 且保留音轨的 Omni/VLM 复核 | 只产出可撤销证据；LR-ASD 仍是本地质量候选 |
 | 本地身份 | AES-256-GCM 加密 SQLite prototype | 绝对阈值 + runner-up margin；显式遗忘同步删除 |
@@ -24,6 +24,12 @@ MindBridge 当前默认链路只保留一套语音生态：
 ASR/turn 融合器、波形临时文件和独立 ERes2NetV2 重推理，开发者只需提供同步 AV、一个 FunASR
 pipeline 和设备校准阈值。NeMo/Sortformer 不再是安装依赖；只有带真值的相同硬件 bake-off 证明其
 DER/false-link 收益足以覆盖额外依赖和编排成本时，才作为质量挑战者重新评估。
+
+这条链路的选型标准里包含**全平台可用**：MindBridge 的 Edge 不限定 Jetson，同一套身份感知必须能跑在
+地瓜 RDK、Rockchip RK、Intel/OpenVINO x86、通用 ARM 主机，以及把 4090/5090/A100 直接当作“端”的
+GPU 主机上。InsightFace 与 FunASR 之所以是默认，正因为它们都有 ONNX/GGUF 可移植路径；平台差异只
+允许出现在 runtime 与编译工件上，bbox 归一化、embedding 维度、身份门禁和遗忘语义在所有平台完全
+一致。任何只能在单一厂商 SDK 上成立的做法都不进默认路径。
 
 这不表示 FunASR 已经包办所有实时语义。在线 Paraformer 的 partial transcript 是 provisional；
 punctuation、稳定 speaker label 和长期 voiceprint 在 Event/window 关闭后才确认。当前 realtime
@@ -35,8 +41,12 @@ diarization 上游会随窗口增长重新聚类，不能把早期 speaker numbe
 每个 turn 解码为 WAV 交给独立 ERes2NetV2。它有三个问题：
 
 1. 两个模型栈给出的边界需要自定义启发式合并，错误归属会直接污染声纹；
-2. 相同音频被重复读取和推理，GPU 显存、冷启动和 Jetson 镜像都变重；
+2. 相同音频被重复读取和推理，显存、冷启动和每一个端侧平台的镜像都变重；
 3. 开发者必须理解四个中间类型，却仍无法获得真正的 microphone chunk API。
+
+这次收敛正是 **Code is the Product** 的直接结果：它删除的是一整套 MindBridge 自维护的融合代码，
+而不是新增一层封装。判断标准不是“支持的能力更多”，而是“更少的代码做同一件事且更难出错”。任何
+反向提案——重新引入第二套 runtime、为未来平台预建 provider 抽象——都必须先证明它删掉的比加入的多。
 
 [FunASR](https://github.com/modelscope/FunASR) 的官方 `AutoModel` 已能组合 VAD、ASR、标点和
 speaker model，并在 `sentence_info` 中返回 `start/end/text/spk/timestamp`。当前上游的
@@ -44,9 +54,11 @@ speaker model，并在 `sentence_info` 中返回 `start/end/text/spk/timestamp`�
 保留自己的领域职责：加密模板、匹配门槛、证据、撤销和云端安全输出。
 
 减重边界必须诚实：FunASR Python 发行本身仍包含 Torch、ModelScope/Transformers 和音频科学计算
-依赖，因此它不进入 Core/SDK/server 的通用 lock。Jetson 镜像安装与 JetPack/CUDA 匹配的 Torch、
-FunASR、ModelScope 和 ONNX Runtime；`mindbridge[edge]` 只携带同步、安全、OpenAI SDK 与可观测
-边界。减掉的是**重复模型栈和 MindBridge 代码**，不是把 FunASR 描述成小型纯 Python 包。
+依赖，因此它不进入 Core/SDK/server 的通用 lock。每个平台的设备镜像各自安装与本平台 SDK 匹配的
+Torch/ONNX Runtime、FunASR 和 ModelScope（Jetson 用 JetPack/CUDA 工件，地瓜 RDK 用 OpenExplorer，
+RK 用 RKNN Toolkit，x86 用 OpenVINO 或标准 CUDA/CPU wheel）；`mindbridge[edge]` 只携带同步、安全、
+OpenAI SDK 与可观测边界，不钉死任何一家的加速器 wheel。减掉的是**重复模型栈和 MindBridge 代码**，
+不是把 FunASR 描述成小型纯 Python 包。
 
 ## 3. 与 M3-Agent、TaskMem 的差异
 
@@ -77,7 +89,7 @@ MindBridge 复用了它的原子事件、稳定人物 ID、外观变化、对话
 
 ```mermaid
 flowchart LR
-    CAM["CSI / USB camera"] --> GST["GStreamer / DeepStream"]
+    CAM["CSI / USB camera"] --> GST["GStreamer (DeepStream optional)"]
     GST --> FRAME["timestamped BGR frame"]
     FRAME --> FACE["InsightFace encode_frame"]
 
@@ -108,14 +120,17 @@ flowchart LR
 ### 5.1 人脸
 
 [InsightFace](https://github.com/deepinsight/insightface) 的 SCRFD/ArcFace 生态提供多个检测器档位、
-五点对齐和 ONNX Runtime。当前代码直接复用 `buffalo_l` 验证质量路径；产品 bake-off 比较：
+五点对齐和 ONNX Runtime。**ONNX 是选择它的关键原因**：同一份权重可以在 CUDA、OpenVINO、RKNN、
+地瓜 BPU 和纯 CPU 上落地，档位划分因此按算力而不是厂商展开。当前代码直接复用 `buffalo_l` 验证质量
+路径；产品 bake-off 比较：
 
-- Orin Nano：SCRFD-500MF 或 YuNet/SFace；
-- Orin NX：SCRFD-2.5GF + ArcFace R50；
-- AGX Orin / dGPU：SCRFD-10GF + ArcFace R50。
+- 嵌入式 NPU（Orin Nano、RDK X5、RK3588）：SCRFD-500MF 或 YuNet/SFace；
+- 中算力 SoC / x86（Orin NX、高配 RK3588、Intel + OpenVINO）：SCRFD-2.5GF + ArcFace R50；
+- 高算力端侧与 dGPU（AGX Orin、4090/5090/A100 主机）：SCRFD-10GF + ArcFace R50。
 
 `encode_frame()` 只接受调用方已解码的 BGR frame、`timestamp_ms` 和 `duration_ms`，输出归一化 bbox
-与 embedding。DeepStream/NvDCF 负责真实生产 tracking；MindBridge 不复制 decoder/tracker。
+与 embedding。真实生产 tracking 交给平台原生组件（DeepStream/NvDCF、RKNN、OpenVINO 或平台自带
+tracker）；MindBridge 不复制 decoder/tracker，也不为它们建统一抽象层。
 只有清晰度、尺寸、姿态、遮挡和检测分数合格的轨迹样本才能进入 identity memory。
 
 ### 5.2 FunASR 在线与质量路径
@@ -146,10 +161,14 @@ FunASR 当前结果没有可解释的逐 turn diarization probability，因此�
 ### 5.3 llama.cpp 多端路径
 
 [llama.cpp](https://github.com/ggml-org/llama.cpp) 及其 FunASR/GGUF 生态让 ASR/VAD 在 x86、ARM、
-Apple 和非 CUDA 设备上共享一个轻运行时，未来很适合替换**在线 acoustic front-end**。当前不把它
-设计成抽象 provider：没有上游证据证明同一运行时完整返回 MindBridge 所需的 punctuation、稳定
-diarization 和 CAM++ centroid。先在 Nano/CPU 上比较 WER、RTF、内存与功耗；真正通过后再加
-一个薄适配器，不能为了未来可能性预建 factory/registry。
+Apple 和全部非 CUDA 设备上共享一个轻运行时，是**全平台 Edge 目标下最重要的候选**：Torch + CUDA
+在地瓜 RDK、RK 和部分 x86 NPU 平台上要么装不上，要么代价过高，而 GGUF 权重可以直接落地。
+
+但它现在仍不是默认路径，也不被包装成抽象 provider：没有上游证据证明同一运行时完整返回
+MindBridge 所需的 punctuation、稳定 diarization 和 CAM++ centroid。先在低算力 NPU 与纯 CPU 平台上
+比较 WER、RTF、内存与功耗；真正通过后再加一个薄适配器，不能为了未来可能性预建 factory/registry。
+在此之前，非 CUDA 平台的语音路径按“先跑通 ONNX Runtime + FunASR，再评估 llama.cpp 替换在线
+front-end”的顺序推进。
 
 ## 6. face↔voice 闭环
 
@@ -172,9 +191,11 @@ ID；加密 face/voice templates 仍各自存在。云端当前不会回写已�
 ## 7. 自适应算力
 
 `device=auto` 在 CUDA 可用时选择 GPU；显式请求 CUDA 而 runtime/provider 回落到 CPU 会立即失败。
-本地入口在空闲 CUDA 显存达到配置门槛时并发人脸与统一 speech pipeline，否则顺序复用 GPU。CPU
-承担 SQLite、AES、哈希、FFmpeg 控制与调度；没有 GPU 时才执行模型降级。8 GiB 当前只是 5090
-软件验证门槛，Jetson 必须与机器人主任务共同校准。
+同一条规则适用于其他加速器：显式请求 OpenVINO、RKNN 或 BPU 而实际回落到 CPU 同样必须报错，
+静默降级会让功耗和延迟验收失去意义。本地入口在空闲加速器内存达到配置门槛时并发人脸与统一
+speech pipeline，否则顺序复用同一加速器。CPU 承担 SQLite、AES、哈希、FFmpeg 控制与调度；没有
+可用加速器时才执行模型降级。8 GiB 当前只是 5090 软件验证门槛，每个目标平台都必须与机器人主任务
+共同校准出自己的数值。
 
 2026-08-13 的 RTX 5090 功能验证使用真实仓库音频，不是 mock：
 
@@ -185,19 +206,22 @@ ID；加密 face/voice templates 仍各自存在。云端当前不会回写已�
 | 加密声纹 | 同一真实 centroid，两个 Observation | 两次均为 device scope 且命中同一匿名 ID | 通过 |
 
 这些数字证明当前代码真实使用 GPU 和完整数据流，只适用于这台 5090 与该样本；没有 DER/WER/真值
-身份标注，不能据此宣称模型精度或 Jetson SOTA。
+身份标注，也没有任何非 CUDA 平台的数据，因此不能据此宣称模型精度或端侧 SOTA。
 
 ## 8. 安装与依赖边界
 
 - Core/SDK：`uv pip install .`；
-- Jetson/机器人编排：`uv pip install '.[edge]'`；
+- 任意端侧/机器人编排（Jetson、地瓜 RDK、RK、OpenVINO x86、ARM 主机、dGPU 工作站）：
+  `uv pip install '.[edge]'`——同一个 extra，不按平台分叉；
 - 云服务：`uv pip install '.[server]'`；
 - 本地 Jina GPU Worker：再叠加 `'.[cloud-models]'`；
-- InsightFace、ONNX Runtime、FunASR、ModelScope 和设备 Torch：由目标设备镜像提供。
+- InsightFace、ONNX Runtime、FunASR、ModelScope 和设备 Torch：由目标平台镜像提供。
 
-通用 lock 不钉死 Jetson Torch wheel。CI 用独立 venv 对 Core、Edge、Server 分别 build/install，并在
+通用 lock 不钉死任何平台的加速器 wheel（Jetson Torch、RKNN Toolkit、OpenVINO runtime、BPU
+工具链都一样）。CI 用独立 venv 对 Core、Edge、Server 分别 build/install，并在
 隔离解释器中导入对应入口，防止 Edge 再次拖入 FastAPI、Celery、MCP 或 PostgreSQL。FunASR 安装
-成功还不等于模型路径可用；设备镜像必须在启动验收中加载固定 revision，并核对真实 CUDA device。
+成功还不等于模型路径可用；设备镜像必须在启动验收中加载固定 revision，并核对**实际生效的
+device/provider**——不能因为进程起得来就认为加速器在工作。
 
 ## 9. 真值 bake-off 与 SOTA 门槛
 
@@ -208,11 +232,16 @@ ID；加密 face/voice templates 仍各自存在。云端当前不会回写已�
 - ASR：中英/噪声/远场分桶 WER/CER；
 - 声纹：EER、minDCF、TAR@固定 FAR，按 2s/3s/full、语言与距离分桶；
 - ASD/闭环：mAP、off-screen FP、pair precision/recall、false-link、time-to-link、撤销延迟；
-- 系统：完整链路 RTF/FPS、P50/P95、GPU/CPU/RAM/显存、功耗、温度、丢帧和队列深度。
+- 系统：完整链路 RTF/FPS、P50/P95、加速器/CPU/RAM/显存占用、功耗、温度、丢帧和队列深度，
+  **按平台分别报告**，不做跨平台外推。
+
+质量指标（人脸、diarization、ASR、声纹、ASD）追求的是绝对分数，评测时可以直接使用各自当前最强的
+可部署模型与配置，不要求为了可比性刻意压低档位；系统指标则必须来自真实目标平台。两类指标同时
+报告，不允许用其中一类掩盖另一类。
 
 候选晋级顺序是：先满足 false-link 与隐私/遗忘约束，再最大化 recall，最后在合格候选中选择更轻的
 运行时。两小时目标功耗 soak、机器人主任务并发、断电重启、幂等重放和 tombstone 都是门禁。
 
-下一步只做三件事：固定带真值的跨日 identity replay；在 Orin NX/Nano 实测当前 FunASR 路径；用
-同一 replay 决定 LR-ASD 是否替换 Omni ASD。没有结果前不恢复 NeMo 并行栈，也不新增 provider
-框架。
+下一步只做三件事：固定带真值的跨日 identity replay；在至少一个 NVIDIA 平台和一个非 NVIDIA 平台
+（地瓜 RDK、RK 或 OpenVINO x86）实测当前 FunASR 路径；用同一 replay 决定 LR-ASD 是否替换 Omni
+ASD。没有结果前不恢复 NeMo 并行栈，也不新增 provider 框架——包括不为多平台预建抽象层。
