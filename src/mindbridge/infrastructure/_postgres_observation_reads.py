@@ -25,7 +25,7 @@ from mindbridge.infrastructure._postgres_forget import ensure_target_not_tombsto
 from mindbridge.infrastructure._postgres_media import read_media_objects_on_connection
 from mindbridge.infrastructure._postgres_types import (
     DatabaseConnection,
-    DatabasePool,
+    PostgresStoreOperations,
     tenant_connection,
 )
 
@@ -44,41 +44,6 @@ ObservationRow: TypeAlias = tuple[
 ]
 
 _IDENTITY_OBSERVATIONS = TypeAdapter(tuple[IdentityObservationInput, ...])
-
-
-async def read_observation_batch(
-    pool: DatabasePool,
-    tenant_id: TenantId,
-    observation_id: ObservationId,
-) -> ObservationBatch:
-    """Read an immutable observation, media, and evidence from one snapshot."""
-    async with tenant_connection(pool, tenant_id) as connection:
-        observation = await read_observation(connection, tenant_id, observation_id)
-        media_objects = await read_media_objects_on_connection(
-            connection,
-            tenant_id,
-            observation.media_object_ids,
-        )
-        evidence_spans = await read_observation_evidence(
-            connection,
-            tenant_id,
-            observation_id,
-        )
-    return ObservationBatch(
-        media_objects=media_objects,
-        observation=observation,
-        evidence_spans=evidence_spans,
-    )
-
-
-async def read_media_objects(
-    pool: DatabasePool,
-    tenant_id: TenantId,
-    media_object_ids: tuple[MediaObjectId, ...],
-) -> tuple[MediaObject, ...]:
-    """Read immutable media metadata in caller order without crossing tenants."""
-    async with tenant_connection(pool, tenant_id) as connection:
-        return await read_media_objects_on_connection(connection, tenant_id, media_object_ids)
 
 
 async def read_observation(
@@ -172,3 +137,38 @@ def _identity_observations_from_json(value: object) -> tuple[AnonymousIdentityOb
         )
         for item in inputs
     )
+
+
+class ObservationReadOperations(PostgresStoreOperations):
+    async def read_observation_batch(
+        self,
+        tenant_id: TenantId,
+        observation_id: ObservationId,
+    ) -> ObservationBatch:
+        """Read an immutable observation, media, and evidence from one snapshot."""
+        async with tenant_connection(self._pool, tenant_id) as connection:
+            observation = await read_observation(connection, tenant_id, observation_id)
+            media_objects = await read_media_objects_on_connection(
+                connection,
+                tenant_id,
+                observation.media_object_ids,
+            )
+            evidence_spans = await read_observation_evidence(
+                connection,
+                tenant_id,
+                observation_id,
+            )
+        return ObservationBatch(
+            media_objects=media_objects,
+            observation=observation,
+            evidence_spans=evidence_spans,
+        )
+
+    async def read_media_objects(
+        self,
+        tenant_id: TenantId,
+        media_object_ids: tuple[MediaObjectId, ...],
+    ) -> tuple[MediaObject, ...]:
+        """Read immutable media metadata in caller order without crossing tenants."""
+        async with tenant_connection(self._pool, tenant_id) as connection:
+            return await read_media_objects_on_connection(connection, tenant_id, media_object_ids)

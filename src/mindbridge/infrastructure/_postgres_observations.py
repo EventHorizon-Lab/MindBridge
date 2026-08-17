@@ -27,84 +27,9 @@ from mindbridge.infrastructure._postgres_media import write_media_object
 from mindbridge.infrastructure._postgres_observation_reads import read_observation
 from mindbridge.infrastructure._postgres_types import (
     DatabaseConnection,
-    DatabasePool,
+    PostgresStoreOperations,
     tenant_connection,
 )
-
-
-async def write_observation(
-    pool: DatabasePool,
-    batch: ObservationBatch,
-    *,
-    idempotency_key: str,
-    content_digest: str,
-) -> ObservationWriteResult:
-    """Write an observation atomically or return its idempotent predecessor."""
-    observation = batch.observation
-    async with tenant_connection(pool, observation.tenant_id) as connection:
-        await ensure_target_not_tombstoned(
-            connection,
-            observation.tenant_id,
-            ForgetTargetType.OBSERVATION,
-            observation.observation_id,
-        )
-        existing_id = await claim_idempotency_key(
-            connection,
-            tenant_id=observation.tenant_id,
-            operation="observe",
-            idempotency_key=idempotency_key,
-            content_digest=content_digest,
-            resource_id=observation.observation_id,
-        )
-        if existing_id is not None:
-            existing = await read_observation(
-                connection,
-                observation.tenant_id,
-                ObservationId(existing_id),
-            )
-            job_id = await ensure_observation_processing_job(connection, existing)
-            return ObservationWriteResult(
-                observation=existing,
-                processing_job_id=job_id,
-                created=False,
-            )
-
-        created = await _insert_observation(connection, observation, content_digest)
-        if not created:
-            existing = await read_observation(
-                connection,
-                observation.tenant_id,
-                observation.observation_id,
-            )
-            if await _observation_digest(connection, observation) != content_digest:
-                raise IdempotencyConflictError(
-                    "device sequence already stores different observation content"
-                )
-            job_id = await ensure_observation_processing_job(connection, existing)
-            return ObservationWriteResult(
-                observation=existing,
-                processing_job_id=job_id,
-                created=False,
-            )
-
-        canonical_media_ids = await _write_media_objects(connection, batch.media_objects)
-        await _write_observation_media(connection, observation, canonical_media_ids)
-        await write_evidence_spans(
-            connection,
-            tuple(
-                replace(
-                    evidence,
-                    media_object_id=canonical_media_ids[evidence.media_object_id],
-                )
-                for evidence in batch.evidence_spans
-            ),
-        )
-        job_id = await ensure_observation_processing_job(connection, observation)
-        return ObservationWriteResult(
-            observation=observation,
-            processing_job_id=job_id,
-            created=True,
-        )
 
 
 async def _insert_observation(
@@ -208,3 +133,79 @@ async def _write_observation_media(
                 for ordinal, media_object_id in enumerate(observation.media_object_ids)
             ),
         )
+
+
+class ObservationWriteOperations(PostgresStoreOperations):
+    async def write_observation(
+        self,
+        batch: ObservationBatch,
+        *,
+        idempotency_key: str,
+        content_digest: str,
+    ) -> ObservationWriteResult:
+        """Write an observation atomically or return its idempotent predecessor."""
+        observation = batch.observation
+        async with tenant_connection(self._pool, observation.tenant_id) as connection:
+            await ensure_target_not_tombstoned(
+                connection,
+                observation.tenant_id,
+                ForgetTargetType.OBSERVATION,
+                observation.observation_id,
+            )
+            existing_id = await claim_idempotency_key(
+                connection,
+                tenant_id=observation.tenant_id,
+                operation="observe",
+                idempotency_key=idempotency_key,
+                content_digest=content_digest,
+                resource_id=observation.observation_id,
+            )
+            if existing_id is not None:
+                existing = await read_observation(
+                    connection,
+                    observation.tenant_id,
+                    ObservationId(existing_id),
+                )
+                job_id = await ensure_observation_processing_job(connection, existing)
+                return ObservationWriteResult(
+                    observation=existing,
+                    processing_job_id=job_id,
+                    created=False,
+                )
+
+            created = await _insert_observation(connection, observation, content_digest)
+            if not created:
+                existing = await read_observation(
+                    connection,
+                    observation.tenant_id,
+                    observation.observation_id,
+                )
+                if await _observation_digest(connection, observation) != content_digest:
+                    raise IdempotencyConflictError(
+                        "device sequence already stores different observation content"
+                    )
+                job_id = await ensure_observation_processing_job(connection, existing)
+                return ObservationWriteResult(
+                    observation=existing,
+                    processing_job_id=job_id,
+                    created=False,
+                )
+
+            canonical_media_ids = await _write_media_objects(connection, batch.media_objects)
+            await _write_observation_media(connection, observation, canonical_media_ids)
+            await write_evidence_spans(
+                connection,
+                tuple(
+                    replace(
+                        evidence,
+                        media_object_id=canonical_media_ids[evidence.media_object_id],
+                    )
+                    for evidence in batch.evidence_spans
+                ),
+            )
+            job_id = await ensure_observation_processing_job(connection, observation)
+            return ObservationWriteResult(
+                observation=observation,
+                processing_job_id=job_id,
+                created=True,
+            )

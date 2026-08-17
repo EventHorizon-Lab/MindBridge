@@ -31,57 +31,9 @@ from mindbridge.infrastructure._postgres_memory_rows import (
 )
 from mindbridge.infrastructure._postgres_types import (
     DatabaseConnection,
-    DatabasePool,
+    PostgresStoreOperations,
     tenant_connection,
 )
-
-
-async def write_memory(
-    pool: DatabasePool,
-    memory: MemoryRecord,
-    *,
-    idempotency_key: str,
-    content_digest: str,
-) -> MemoryWriteResult:
-    """Write a memory atomically or return its idempotent predecessor."""
-    async with tenant_connection(pool, memory.tenant_id) as connection:
-        existing_id = await claim_idempotency_key(
-            connection,
-            tenant_id=memory.tenant_id,
-            operation="remember",
-            idempotency_key=idempotency_key,
-            content_digest=content_digest,
-            resource_id=memory.memory_id,
-        )
-        if existing_id is not None:
-            existing = await _require_memory_on_connection(
-                connection,
-                memory.tenant_id,
-                MemoryId(existing_id),
-            )
-            return MemoryWriteResult(memory=existing, created=False)
-
-        created = await write_memory_on_connection(connection, memory, content_digest)
-        if not created:
-            existing = await _require_memory_on_connection(
-                connection, memory.tenant_id, memory.memory_id
-            )
-            return MemoryWriteResult(memory=existing, created=False)
-        return MemoryWriteResult(memory=memory, created=True)
-
-
-async def read_memory(
-    pool: DatabasePool,
-    tenant_id: TenantId,
-    memory_id: MemoryId,
-) -> MemoryRecord:
-    """Read one memory without revealing whether its ID exists in another tenant."""
-    async with tenant_connection(pool, tenant_id) as connection:
-        await ensure_memory_not_tombstoned(connection, tenant_id, memory_id)
-        memory = await find_memory_on_connection(connection, tenant_id, memory_id)
-    if memory is None:
-        raise MemoryNotFoundError("memory does not exist")
-    return memory
 
 
 async def write_memory_on_connection(
@@ -115,124 +67,6 @@ async def write_memory_on_connection(
     except ForeignKeyViolation as error:
         raise DomainInvariantError("memory references unknown evidence") from error
     return created
-
-
-async def search_memories(
-    pool: DatabasePool,
-    request: RecallRequest,
-    *,
-    limit: int,
-) -> tuple[MemoryRecord, ...]:
-    """Apply exact filters and PostgreSQL full-text candidate retrieval."""
-    if not 1 <= limit <= 1_000:
-        raise DomainInvariantError("memory candidate limit must be between 1 and 1000")
-    async with tenant_connection(pool, request.tenant_id) as connection:
-        parameters = _recall_parameters(request)
-        parameters["limit"] = limit
-        cursor = await connection.execute(_SEARCH_MEMORIES_SQL, parameters)
-        return tuple([memory_from_row(cast(MemoryRow, row)) async for row in cursor])
-
-
-async def list_memories_for_enumeration(
-    pool: DatabasePool,
-    request: RecallRequest,
-    *,
-    limit: int,
-) -> tuple[MemoryRecord, ...]:
-    """Scan the complete structured-filter scope in chronological order."""
-    if not 1 <= limit <= 1_001:
-        raise DomainInvariantError("enumeration candidate limit must be between 1 and 1001")
-    async with tenant_connection(pool, request.tenant_id) as connection:
-        parameters = _recall_parameters(request)
-        parameters["limit"] = limit
-        cursor = await connection.execute(_LIST_MEMORIES_FOR_ENUMERATION_SQL, parameters)
-        return tuple([memory_from_row(cast(MemoryRow, row)) async for row in cursor])
-
-
-async def search_memories_by_evidence(
-    pool: DatabasePool,
-    request: RecallRequest,
-    ranked_evidence_ids: tuple[EvidenceId, ...],
-    *,
-    limit: int,
-) -> tuple[MemoryRecord, ...]:
-    """Map semantic evidence rank to memories while retaining exact recall filters."""
-    if not ranked_evidence_ids:
-        return ()
-    if limit <= 0:
-        raise DomainInvariantError("semantic memory candidate limit must be positive")
-    parameters = _recall_parameters(request)
-    parameters.update(evidence_ids=list(ranked_evidence_ids), limit=limit)
-    async with tenant_connection(pool, request.tenant_id) as connection:
-        cursor = await connection.execute(_SEARCH_MEMORIES_BY_EVIDENCE_SQL, parameters)
-        return tuple([memory_from_row(cast(MemoryRow, row)) async for row in cursor])
-
-
-async def search_memories_by_ids(
-    pool: DatabasePool,
-    request: RecallRequest,
-    ranked_memory_ids: tuple[MemoryId, ...],
-    *,
-    limit: int,
-) -> tuple[MemoryRecord, ...]:
-    """Resolve semantic memory hits while retaining exact recall filters."""
-    if not ranked_memory_ids:
-        return ()
-    if limit <= 0:
-        raise DomainInvariantError("semantic memory candidate limit must be positive")
-    parameters = _recall_parameters(request)
-    parameters.update(memory_ids=list(ranked_memory_ids), limit=limit)
-    async with tenant_connection(pool, request.tenant_id) as connection:
-        cursor = await connection.execute(_SEARCH_MEMORIES_BY_IDS_SQL, parameters)
-        return tuple([memory_from_row(cast(MemoryRow, row)) async for row in cursor])
-
-
-async def search_memories_by_hierarchy(
-    pool: DatabasePool,
-    request: RecallRequest,
-    ranked_memory_ids: tuple[MemoryId, ...],
-    *,
-    limit: int,
-) -> tuple[MemoryRecord, ...]:
-    """Expand semantic Memory hits through directed and bounded Summary relations."""
-    if not ranked_memory_ids:
-        return ()
-    if limit <= 0:
-        raise DomainInvariantError("hierarchical memory candidate limit must be positive")
-    parameters = _recall_parameters(request)
-    parameters.update(memory_ids=list(ranked_memory_ids), limit=limit)
-    async with tenant_connection(pool, request.tenant_id) as connection:
-        cursor = await connection.execute(_SEARCH_MEMORIES_BY_HIERARCHY_SQL, parameters)
-        return tuple([memory_from_row(cast(MemoryRow, row)) async for row in cursor])
-
-
-async def search_memories_by_graph_objects(
-    pool: DatabasePool,
-    request: RecallRequest,
-    ranked_objects: tuple[EmbeddingMatch, ...],
-    *,
-    limit: int,
-) -> tuple[MemoryRecord, ...]:
-    """Follow ranked Event/Claim representation edges to filtered memories."""
-    if not ranked_objects:
-        return ()
-    if limit <= 0:
-        raise DomainInvariantError("semantic graph candidate limit must be positive")
-    if any(
-        match.object_type not in {EmbeddedObjectType.EVENT, EmbeddedObjectType.CLAIM}
-        for match in ranked_objects
-    ):
-        raise DomainInvariantError("semantic graph candidates must be events or claims")
-    parameters = _recall_parameters(request)
-    parameters.update(
-        object_types=[match.object_type.value for match in ranked_objects],
-        object_ids=[match.object_id for match in ranked_objects],
-        graph_neighbor_limit=min(limit, 16),
-        limit=limit,
-    )
-    async with tenant_connection(pool, request.tenant_id) as connection:
-        cursor = await connection.execute(_SEARCH_MEMORIES_BY_GRAPH_OBJECTS_SQL, parameters)
-        return tuple([memory_from_row(cast(MemoryRow, row)) async for row in cursor])
 
 
 def _recall_parameters(request: RecallRequest) -> dict[str, Any]:
@@ -600,3 +434,163 @@ WHERE memory.tenant_id = %(tenant_id)s
 ORDER BY dense.graph_rank, memory.strength DESC, memory.occurred_at DESC, memory.memory_id
 LIMIT %(limit)s
 """
+
+
+class MemoryOperations(PostgresStoreOperations):
+    async def write_memory(
+        self,
+        memory: MemoryRecord,
+        *,
+        idempotency_key: str,
+        content_digest: str,
+    ) -> MemoryWriteResult:
+        """Write a memory atomically or return its idempotent predecessor."""
+        async with tenant_connection(self._pool, memory.tenant_id) as connection:
+            existing_id = await claim_idempotency_key(
+                connection,
+                tenant_id=memory.tenant_id,
+                operation="remember",
+                idempotency_key=idempotency_key,
+                content_digest=content_digest,
+                resource_id=memory.memory_id,
+            )
+            if existing_id is not None:
+                existing = await _require_memory_on_connection(
+                    connection,
+                    memory.tenant_id,
+                    MemoryId(existing_id),
+                )
+                return MemoryWriteResult(memory=existing, created=False)
+
+            created = await write_memory_on_connection(connection, memory, content_digest)
+            if not created:
+                existing = await _require_memory_on_connection(
+                    connection, memory.tenant_id, memory.memory_id
+                )
+                return MemoryWriteResult(memory=existing, created=False)
+            return MemoryWriteResult(memory=memory, created=True)
+
+    async def read_memory(
+        self,
+        tenant_id: TenantId,
+        memory_id: MemoryId,
+    ) -> MemoryRecord:
+        """Read one memory without revealing whether its ID exists in another tenant."""
+        async with tenant_connection(self._pool, tenant_id) as connection:
+            await ensure_memory_not_tombstoned(connection, tenant_id, memory_id)
+            memory = await find_memory_on_connection(connection, tenant_id, memory_id)
+        if memory is None:
+            raise MemoryNotFoundError("memory does not exist")
+        return memory
+
+    async def search_memories(
+        self,
+        request: RecallRequest,
+        *,
+        limit: int,
+    ) -> tuple[MemoryRecord, ...]:
+        """Apply exact filters and PostgreSQL full-text candidate retrieval."""
+        if not 1 <= limit <= 1_000:
+            raise DomainInvariantError("memory candidate limit must be between 1 and 1000")
+        async with tenant_connection(self._pool, request.tenant_id) as connection:
+            parameters = _recall_parameters(request)
+            parameters["limit"] = limit
+            cursor = await connection.execute(_SEARCH_MEMORIES_SQL, parameters)
+            return tuple([memory_from_row(cast(MemoryRow, row)) async for row in cursor])
+
+    async def list_memories_for_enumeration(
+        self,
+        request: RecallRequest,
+        *,
+        limit: int,
+    ) -> tuple[MemoryRecord, ...]:
+        """Scan the complete structured-filter scope in chronological order."""
+        if not 1 <= limit <= 1_001:
+            raise DomainInvariantError("enumeration candidate limit must be between 1 and 1001")
+        async with tenant_connection(self._pool, request.tenant_id) as connection:
+            parameters = _recall_parameters(request)
+            parameters["limit"] = limit
+            cursor = await connection.execute(_LIST_MEMORIES_FOR_ENUMERATION_SQL, parameters)
+            return tuple([memory_from_row(cast(MemoryRow, row)) async for row in cursor])
+
+    async def search_memories_by_evidence(
+        self,
+        request: RecallRequest,
+        ranked_evidence_ids: tuple[EvidenceId, ...],
+        *,
+        limit: int,
+    ) -> tuple[MemoryRecord, ...]:
+        """Map semantic evidence rank to memories while retaining exact recall filters."""
+        if not ranked_evidence_ids:
+            return ()
+        if limit <= 0:
+            raise DomainInvariantError("semantic memory candidate limit must be positive")
+        parameters = _recall_parameters(request)
+        parameters.update(evidence_ids=list(ranked_evidence_ids), limit=limit)
+        async with tenant_connection(self._pool, request.tenant_id) as connection:
+            cursor = await connection.execute(_SEARCH_MEMORIES_BY_EVIDENCE_SQL, parameters)
+            return tuple([memory_from_row(cast(MemoryRow, row)) async for row in cursor])
+
+    async def search_memories_by_ids(
+        self,
+        request: RecallRequest,
+        ranked_memory_ids: tuple[MemoryId, ...],
+        *,
+        limit: int,
+    ) -> tuple[MemoryRecord, ...]:
+        """Resolve semantic memory hits while retaining exact recall filters."""
+        if not ranked_memory_ids:
+            return ()
+        if limit <= 0:
+            raise DomainInvariantError("semantic memory candidate limit must be positive")
+        parameters = _recall_parameters(request)
+        parameters.update(memory_ids=list(ranked_memory_ids), limit=limit)
+        async with tenant_connection(self._pool, request.tenant_id) as connection:
+            cursor = await connection.execute(_SEARCH_MEMORIES_BY_IDS_SQL, parameters)
+            return tuple([memory_from_row(cast(MemoryRow, row)) async for row in cursor])
+
+    async def search_memories_by_hierarchy(
+        self,
+        request: RecallRequest,
+        ranked_memory_ids: tuple[MemoryId, ...],
+        *,
+        limit: int,
+    ) -> tuple[MemoryRecord, ...]:
+        """Expand semantic Memory hits through directed and bounded Summary relations."""
+        if not ranked_memory_ids:
+            return ()
+        if limit <= 0:
+            raise DomainInvariantError("hierarchical memory candidate limit must be positive")
+        parameters = _recall_parameters(request)
+        parameters.update(memory_ids=list(ranked_memory_ids), limit=limit)
+        async with tenant_connection(self._pool, request.tenant_id) as connection:
+            cursor = await connection.execute(_SEARCH_MEMORIES_BY_HIERARCHY_SQL, parameters)
+            return tuple([memory_from_row(cast(MemoryRow, row)) async for row in cursor])
+
+    async def search_memories_by_graph_objects(
+        self,
+        request: RecallRequest,
+        ranked_objects: tuple[EmbeddingMatch, ...],
+        *,
+        limit: int,
+    ) -> tuple[MemoryRecord, ...]:
+        """Follow ranked Event/Claim representation edges to filtered memories."""
+        if not ranked_objects:
+            return ()
+        if limit <= 0:
+            raise DomainInvariantError("semantic graph candidate limit must be positive")
+        if any(
+            match.object_type not in {EmbeddedObjectType.EVENT, EmbeddedObjectType.CLAIM}
+            for match in ranked_objects
+        ):
+            raise DomainInvariantError("semantic graph candidates must be events or claims")
+        parameters = _recall_parameters(request)
+        parameters.update(
+            object_types=[match.object_type.value for match in ranked_objects],
+            object_ids=[match.object_id for match in ranked_objects],
+            graph_neighbor_limit=min(limit, 16),
+            limit=limit,
+        )
+        async with tenant_connection(self._pool, request.tenant_id) as connection:
+            cursor = await connection.execute(_SEARCH_MEMORIES_BY_GRAPH_OBJECTS_SQL, parameters)
+            return tuple([memory_from_row(cast(MemoryRow, row)) async for row in cursor])
