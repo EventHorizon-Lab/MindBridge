@@ -17,6 +17,7 @@ from mindbridge.core import (
 from mindbridge.infrastructure.postgres import PostgresMemoryStore
 
 NOW = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
+VECTOR_TENANT = TenantId("tenant_vectors")
 
 pytestmark = pytest.mark.integration
 
@@ -85,7 +86,7 @@ async def test_pgvector_mix_aligned_encoders_but_separates_space_revisions(
         )
     matches = await store.search_embeddings(
         EmbeddingSearch(
-            tenant_id=TenantId("tenant_vectors"),
+            tenant_id=VECTOR_TENANT,
             values=first.values,
             space_reference=space,
             document_task="retrieval_document",
@@ -95,7 +96,7 @@ async def test_pgvector_mix_aligned_encoders_but_separates_space_revisions(
     )
     other_revision = await store.search_embeddings(
         EmbeddingSearch(
-            tenant_id=TenantId("tenant_vectors"),
+            tenant_id=VECTOR_TENANT,
             values=first.values,
             space_reference=EmbeddingSpaceReference(space_id=space.space_id, revision="different"),
             document_task="retrieval_document",
@@ -105,7 +106,7 @@ async def test_pgvector_mix_aligned_encoders_but_separates_space_revisions(
     )
     thresholded = await store.search_embeddings(
         EmbeddingSearch(
-            tenant_id=TenantId("tenant_vectors"),
+            tenant_id=VECTOR_TENANT,
             values=first.values,
             space_reference=space,
             document_task="retrieval_document",
@@ -121,6 +122,50 @@ async def test_pgvector_mix_aligned_encoders_but_separates_space_revisions(
     assert other_revision == ()
 
 
+async def test_unreachable_probe_is_scoped_per_tenant_and_per_object_type(
+    store: PostgresMemoryStore,
+) -> None:
+    """A reachable memory record must not vouch for evidence stranded in another space."""
+    # A dedicated tenant: this writes into the session-scoped database that every other
+    # integration test shares, and tenant_vectors already owns fixture vectors.
+    tenant_id = TenantId("tenant_space_probe")
+    space = EmbeddingSpaceReference(space_id="jina-v5", revision="space-v1")
+    drifted = EmbeddingSpaceReference(space_id="jina-v5", revision="space-v2")
+    model = ModelReference(model_id="jina-omni", revision="abcdef0")
+
+    assert await store.unreachable_embedded_object_types(tenant_id, space) == ()
+    assert await store.write_embedding(
+        _embedding_record(
+            embedding_id="embedding_probe_memory",
+            object_id="memory_probe",
+            values=(0.0, 0.0, 1.0) + (0.0,) * 1_021,
+            model=model,
+            space=space,
+            tenant_id=tenant_id,
+        )
+    )
+    assert await store.write_embedding(
+        _embedding_record(
+            embedding_id="embedding_probe_evidence",
+            object_id="evidence_probe",
+            values=(0.0, 0.0, 0.0, 1.0) + (0.0,) * 1_020,
+            model=model,
+            space=drifted,
+            tenant_id=tenant_id,
+            object_type=EmbeddedObjectType.EVIDENCE_SPAN,
+        )
+    )
+
+    # The memory record sits in `space`, so a whole-tenant probe would report nothing wrong.
+    assert await store.unreachable_embedded_object_types(tenant_id, space) == (
+        EmbeddedObjectType.EVIDENCE_SPAN,
+    )
+    assert await store.unreachable_embedded_object_types(tenant_id, drifted) == (
+        EmbeddedObjectType.MEMORY_RECORD,
+    )
+    assert await store.unreachable_embedded_object_types(TenantId("tenant_empty"), drifted) == ()
+
+
 def _embedding_record(
     *,
     embedding_id: str,
@@ -128,11 +173,13 @@ def _embedding_record(
     values: tuple[float, ...],
     model: ModelReference,
     space: EmbeddingSpaceReference,
+    tenant_id: TenantId = VECTOR_TENANT,
+    object_type: EmbeddedObjectType = EmbeddedObjectType.MEMORY_RECORD,
 ) -> EmbeddingRecord:
     return EmbeddingRecord(
         embedding_id=EmbeddingId(embedding_id),
-        tenant_id=TenantId("tenant_vectors"),
-        object_type=EmbeddedObjectType.MEMORY_RECORD,
+        tenant_id=tenant_id,
+        object_type=object_type,
         object_id=object_id,
         values=values,
         model_reference=model,

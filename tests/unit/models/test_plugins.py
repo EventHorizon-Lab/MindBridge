@@ -7,6 +7,7 @@ from typing import cast
 
 import pytest
 
+import mindbridge.models.openai as openai_models
 import mindbridge.models.plugins as plugins
 from mindbridge.models import GenerateRequest, GenerateResult
 
@@ -84,3 +85,46 @@ def _install_points(monkeypatch: pytest.MonkeyPatch, *points: _Point) -> None:
         "_entry_points",
         lambda _group: cast(tuple[EntryPoint, ...], points),
     )
+
+
+def _embedder_config(**changes: object) -> dict[str, object]:
+    config: dict[str, object] = {
+        "api_key": "key",
+        "endpoint": "https://embeddings.example.test/v1",
+        "model_id": "omni",
+        "model_revision": "omni-revision",
+        "document_api_key": "key",
+        "document_endpoint": "https://text.example.test/v1",
+        "document_model_id": "text",
+        "document_model_revision": "text-revision",
+        "space_id": "space",
+        "space_revision": "space-revision",
+    }
+    config.update(changes)
+    return config
+
+
+def test_bundled_embedder_factory_accepts_a_complete_configuration() -> None:
+    embedder = openai_models.create_embedder(_embedder_config(request_timeout_seconds=30))
+
+    assert embedder.space_reference.space_id == "space"
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        pytest.param({"unexpected": 1}, id="unknown-key"),
+        pytest.param({"api_key": "   "}, id="blank-text"),
+        pytest.param({"api_key": 1}, id="non-text"),
+        pytest.param({"dimension": True}, id="bool-for-integer"),
+        pytest.param({"dimension": 1024.0}, id="float-for-integer"),
+        pytest.param({"max_retries": "2"}, id="quoted-integer"),
+        pytest.param({"request_timeout_seconds": "30"}, id="quoted-number"),
+    ],
+)
+def test_bundled_embedder_factory_rejects_a_malformed_configuration(
+    changes: dict[str, object],
+) -> None:
+    """A plugin factory fails on the operator's mistake instead of ignoring the key."""
+    with pytest.raises(ValueError):
+        openai_models.create_embedder(_embedder_config(**changes))

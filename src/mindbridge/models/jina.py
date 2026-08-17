@@ -15,12 +15,7 @@ from mindbridge.application.capabilities import (
     ModelInput,
     TextPart,
 )
-from mindbridge.configuration import (
-    optional_plugin_string,
-    plugin_integer,
-    plugin_string,
-    reject_unknown_plugin_keys,
-)
+from mindbridge.configuration import PluginConfigModel, PluginInteger, PluginText
 from mindbridge.core import (
     EmbeddingSpaceReference,
     ModelOutputError,
@@ -139,6 +134,11 @@ class JinaEmbedder:
             max_concurrency=max_concurrency,
         )
 
+    @property
+    def space_reference(self) -> EmbeddingSpaceReference:
+        """Declare the search space this model's vectors belong to."""
+        return self._space_reference
+
     @trace_operation("mindbridge.model.embed")
     async def embed(self, request: EmbedRequest) -> EmbedResult:
         """Encode a homogeneous query or document batch."""
@@ -170,6 +170,8 @@ class JinaEmbedder:
             {
                 "mindbridge.model.id": self._model_reference.model_id,
                 "mindbridge.model.revision": self._model_reference.revision,
+                "mindbridge.embedding.space_id": self._space_reference.space_id,
+                "mindbridge.embedding.space_revision": self._space_reference.revision,
                 "mindbridge.embedding.dimension": self._dimension,
                 "mindbridge.embedding.input_count": len(inputs),
             }
@@ -190,34 +192,29 @@ class JinaEmbedder:
         return vectors
 
 
+class _EmbedderConfig(PluginConfigModel):
+    model_id: PluginText = DEFAULT_MEDIA_EMBEDDER_MODEL_ID
+    revision: PluginText = DEFAULT_MEDIA_EMBEDDER_REVISION
+    device: PluginText | None = None
+    space_id: PluginText = DEFAULT_EMBEDDING_SPACE.space_id
+    space_revision: PluginText = DEFAULT_EMBEDDING_SPACE.revision
+    dimension: PluginInteger = DEFAULT_EMBEDDING_DIMENSION
+    max_concurrency: PluginInteger = 1
+
+
 def create_embedder(config: Mapping[str, object]) -> JinaEmbedder:
     """Entry-point factory for the bundled local Jina model."""
-    reject_unknown_plugin_keys(
-        config,
-        {
-            "model_id",
-            "revision",
-            "device",
-            "space_id",
-            "space_revision",
-            "dimension",
-            "max_concurrency",
-        },
-    )
+    validated = _EmbedderConfig.model_validate(config)
     return JinaEmbedder.load(
-        model_id=plugin_string(config, "model_id", DEFAULT_MEDIA_EMBEDDER_MODEL_ID),
-        revision=plugin_string(config, "revision", DEFAULT_MEDIA_EMBEDDER_REVISION),
-        device=optional_plugin_string(config, "device"),
+        model_id=validated.model_id,
+        revision=validated.revision,
+        device=validated.device,
         space_reference=EmbeddingSpaceReference(
-            space_id=plugin_string(config, "space_id", DEFAULT_EMBEDDING_SPACE.space_id),
-            revision=plugin_string(
-                config,
-                "space_revision",
-                DEFAULT_EMBEDDING_SPACE.revision,
-            ),
+            space_id=validated.space_id,
+            revision=validated.space_revision,
         ),
-        dimension=plugin_integer(config, "dimension", DEFAULT_EMBEDDING_DIMENSION),
-        max_concurrency=plugin_integer(config, "max_concurrency", 1),
+        dimension=validated.dimension,
+        max_concurrency=validated.max_concurrency,
     )
 
 

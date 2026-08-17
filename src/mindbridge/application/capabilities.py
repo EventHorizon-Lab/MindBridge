@@ -144,6 +144,13 @@ class EmbedResult:
 class Embedder(Protocol):
     """A replaceable provider or local embedding model."""
 
+    @property
+    def space_reference(self) -> EmbeddingSpaceReference:
+        """The search space every vector this embedder produces belongs to."""
+        # An explicit subclass inherits this body, so raise instead of returning None:
+        # a silent None would make the space guards compare equal and pass vacuously.
+        raise NotImplementedError("an Embedder must declare its embedding space")
+
     async def embed(self, request: EmbedRequest) -> EmbedResult: ...
 
 

@@ -82,6 +82,8 @@ class GoldenRecallSet(_GoldenModel):
 
 
 class GoldenEmbedder:
+    space_reference = SPACE_REFERENCE
+
     def __init__(self, query_axes: Mapping[str, int]) -> None:
         self._query_axes = query_axes
 

@@ -2,7 +2,7 @@
 
 import pytest
 
-from mindbridge.benchmarks import (
+from mindbridge.benchmarks.runtime import (
     benchmark_tenant_id,
     multiple_choice_query,
     parse_option_ranking,

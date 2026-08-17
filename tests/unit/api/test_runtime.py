@@ -3,7 +3,10 @@
 import pytest
 
 import mindbridge.api.runtime as runtime_module
+from mindbridge.core import EmbeddedObjectType, EmbeddingSpaceReference
 from mindbridge.server import Settings, create_app
+
+SPACE = EmbeddingSpaceReference(space_id="jina-v5", revision="space-v1")
 
 
 def test_settings_use_deployable_defaults_and_redact_credentials() -> None:
@@ -74,6 +77,8 @@ async def test_runtime_closes_a_falsey_reranker(monkeypatch: pytest.MonkeyPatch)
     closed: list[str] = []
 
     class Model:
+        space_reference = SPACE
+
         def __init__(self, name: str, *, falsey: bool = False) -> None:
             self.name = name
             self.falsey = falsey
@@ -112,6 +117,82 @@ async def test_runtime_closes_a_falsey_reranker(monkeypatch: pytest.MonkeyPatch)
         pass
 
     assert closed == ["store", "reranker", "embedder", "generator"]
+
+
+async def test_startup_rejects_a_space_no_stored_vector_can_match() -> None:
+    """An unreachable tenant must abort startup instead of degrading recall to empty results."""
+    asked: list[str] = []
+
+    class Probe:
+        async def unreachable_embedded_object_types(
+            self,
+            tenant_id: str,
+            space_reference: EmbeddingSpaceReference,
+        ) -> tuple[EmbeddedObjectType, ...]:
+            asked.append(tenant_id)
+            if tenant_id != "tenant_02":
+                return ()
+            return (EmbeddedObjectType.EVIDENCE_SPAN, EmbeddedObjectType.CLAIM)
+
+    await runtime_module._require_reachable_embedding_space(Probe(), ("tenant_01",), SPACE)
+    with pytest.raises(ValueError, match=r"tenant_02.*evidence_span, claim"):
+        await runtime_module._require_reachable_embedding_space(
+            Probe(),
+            ("tenant_01", "tenant_02"),
+            SPACE,
+        )
+
+    assert asked == ["tenant_01", "tenant_01", "tenant_02"]
+
+
+async def test_runtime_probes_every_configured_tenant_on_startup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The selected Embedder's own space is what startup compares against stored vectors."""
+    probed: list[tuple[str, EmbeddingSpaceReference]] = []
+
+    class Embedder:
+        space_reference = SPACE
+
+    class Store:
+        async def open(self) -> None:
+            return None
+
+        async def close(self) -> None:
+            return None
+
+        async def unreachable_embedded_object_types(
+            self,
+            tenant_id: str,
+            space_reference: EmbeddingSpaceReference,
+        ) -> tuple[EmbeddedObjectType, ...]:
+            probed.append((tenant_id, space_reference))
+            return ()
+
+    monkeypatch.setattr(runtime_module, "load_generator", lambda *_arguments: object())
+    monkeypatch.setattr(runtime_module, "load_embedder", lambda *_arguments: Embedder())
+    monkeypatch.setattr(runtime_module, "PostgresMemoryStore", lambda *_arguments: Store())
+    monkeypatch.setattr(runtime_module, "S3MediaAccess", lambda *_arguments, **_options: object())
+    monkeypatch.setattr(runtime_module, "create_task_queue", lambda *_arguments: object())
+    monkeypatch.setattr(
+        runtime_module,
+        "CeleryObservationJobPublisher",
+        lambda *_arguments: object(),
+    )
+    monkeypatch.setattr(runtime_module, "MemoryKernel", lambda *_arguments, **_options: object())
+
+    runtime = runtime_module._build_runtime(
+        _settings(
+            tenant_api_keys_json=(
+                '{"tenant_02":["tenant-api-key-000000000000000000"],'
+                '"tenant_01":["tenant-api-key-111111111111111111"]}'
+            )
+        )
+    )
+    async with runtime.open():
+        pass
+
+    assert probed == [("tenant_01", SPACE), ("tenant_02", SPACE)]
 
 
 def _settings(**changes: object) -> Settings:

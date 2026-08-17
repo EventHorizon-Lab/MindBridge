@@ -733,6 +733,15 @@ object is authoritative, so Anthropic, Gemini, local runtimes, and experimental 
 OpenAI-specific variables. Enabling reranking requires both `MINDBRIDGE_RERANKER_PLUGIN` and its
 configuration object. See the [plugin author contract](docs/plugin-architecture.md).
 
+`MINDBRIDGE_EMBEDDING_SPACE_ID` and `MINDBRIDGE_EMBEDDING_SPACE_REVISION` name the search space the
+selected Embedder writes into and queries. Startup probes every tenant in
+`MINDBRIDGE_TENANT_API_KEYS_JSON` and refuses to serve when one holds vectors that space cannot
+reach, so pointing the server at a new embedding model without re-embedding fails loudly instead of
+returning empty recalls. The probe reports each stranded object type separately, so memory records
+the server wrote itself cannot vouch for evidence, events, and claims the Worker wrote in another
+space. Vectors in several spaces are accepted while a re-embedding is in progress. The stdio MCP
+process has no configured tenant list and therefore cannot run this probe.
+
 OpenTelemetry is activated only when a standard common or signal-specific OTLP endpoint is set;
 without one it remains a no-op. The API, MCP process, Worker, edge sync, consolidation, and lifecycle
 commands use distinct default `service.name` values. Override them per process with
@@ -839,6 +848,8 @@ One prefork child is the safe default because each child owns a full embedding m
 Worker process per assigned GPU instead of increasing concurrency inside a process.
 Non-default Worker adapters use `MINDBRIDGE_MEDIA_EMBEDDER_CONFIG_JSON` and
 `MINDBRIDGE_TEXT_EMBEDDER_CONFIG_JSON`; explicit objects replace the bundled fallback variables.
+Both slots must resolve to one embedding space. The Worker compares the two declared spaces before
+processing and fails the job instead of writing media and text vectors that cannot be compared.
 
 Run evidence-verified Episode, semantic Claim, and hierarchical Summary consolidation as one
 tenant-scoped scheduled job.

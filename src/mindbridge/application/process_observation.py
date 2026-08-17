@@ -74,6 +74,11 @@ class ProcessObservation:
         *,
         media_url_signer: MediaUrlSigner,
     ) -> None:
+        if media_embedder.space_reference != text_embedder.space_reference:
+            raise ValueError(
+                "media and text embedders must write into one search space: "
+                f"{media_embedder.space_reference} != {text_embedder.space_reference}"
+            )
         self._store = store
         self._perceiver = perceiver
         self._media_embedder = media_embedder

@@ -6,13 +6,8 @@ from typing import cast
 import pytest
 
 from mindbridge import MindBridge
-from mindbridge.benchmarks import (
-    LOCOMO_ABSTENTION,
-    LoCoMoConversation,
-    LoCoMoQuestion,
-    LoCoMoTurn,
-    run_locomo_conversation,
-)
+from mindbridge.benchmarks.locomo import LoCoMoConversation, LoCoMoQuestion, LoCoMoTurn
+from mindbridge.benchmarks.locomo_runner import LOCOMO_ABSTENTION, run_locomo_conversation
 from mindbridge.contracts import (
     MemoryView,
     RecallRequest,
