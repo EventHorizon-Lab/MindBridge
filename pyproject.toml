@@ -111,6 +111,14 @@ module = [
     "celery.*",
     "kombu",
     "kombu.*",
+    # The media decoders live in the cloud-models extra, which CI does not install because
+    # it also carries torch. mindbridge.media.clipping imports them lazily and raises
+    # ModelUnavailableError without them; its tests skip rather than fail collection.
+    "av",
+    "av.*",
+    "numpy",
+    "PIL",
+    "PIL.*",
     "soundfile",
 ]
 ignore_missing_imports = true
