@@ -126,8 +126,9 @@ def test_load_omits_timestamp_key_rather_than_inventing_one(tmp_path: Path) -> N
     chat_path, questions_path = _write_fixture(tmp_path)
     [case] = load(chat_path, questions_path)
 
-    # First turn has a real time_anchor -- keep it verbatim.
-    assert case.messages[0]["timestamp"] == "March-15-2024"
+    # First turn has a real time_anchor, parsed to epoch milliseconds (UTC) --
+    # AML's wire contract requires `int`, not free text.
+    assert case.messages[0]["timestamp"] == 1710460800000
     # Every other turn in this fixture has no time_anchor at all -- the key
     # must be absent, not present-with-None (that would look like a real,
     # deliberately-null timestamp instead of "we never had one").

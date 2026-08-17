@@ -21,11 +21,18 @@ retrieved context, plus each question's payload, to the vendored pipeline.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, TypeAdapter
 
 from mindbridge.benchmarks.aml.cases import AmlCase, AmlQuestion
+
+# LongMemEval's session date, e.g. "2023/05/20 (Sat) 02:21" -- free text, no
+# timezone. AML's wire contract (`AmlMessage.timestamp`) requires epoch
+# milliseconds, so this is parsed and treated as UTC: the source carries no
+# offset, and UTC is the least-wrong assumption available.
+_TIMESTAMP_FORMAT = "%Y/%m/%d (%a) %H:%M"
 
 
 class _RawTurn(BaseModel):
@@ -68,6 +75,13 @@ def _messages(record: _RawRecord) -> tuple[dict[str, object], ...]:
     """Flatten haystack sessions in file order, tagging each turn with its session date."""
     messages: list[dict[str, object]] = []
     for session, date in zip(record.haystack_sessions, record.haystack_dates, strict=True):
+        timestamp = _parse_timestamp(date)
         for turn in session:
-            messages.append({"role": turn.role, "content": turn.content, "timestamp": date})
+            messages.append({"role": turn.role, "content": turn.content, "timestamp": timestamp})
     return tuple(messages)
+
+
+def _parse_timestamp(raw: str) -> int:
+    """Parse a LongMemEval haystack date string into epoch milliseconds (UTC)."""
+    parsed = datetime.strptime(raw, _TIMESTAMP_FORMAT).replace(tzinfo=timezone.utc)
+    return int(parsed.timestamp() * 1_000)

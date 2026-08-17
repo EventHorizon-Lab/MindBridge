@@ -19,6 +19,7 @@ JSON independently rather than reusing it.
 from __future__ import annotations
 
 import re
+from datetime import datetime, timezone
 from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, TypeAdapter
@@ -26,6 +27,12 @@ from pydantic import BaseModel, ConfigDict, TypeAdapter
 from mindbridge.benchmarks.aml.cases import AmlCase, AmlQuestion
 
 _SESSION_KEY = re.compile(r"session_(\d+)$")
+
+# LoCoMo's session timestamp, e.g. "1:56 pm on 8 May, 2023" -- free text, no
+# timezone. AML's wire contract (`AmlMessage.timestamp`) requires epoch
+# milliseconds, so this is parsed and treated as UTC: the source carries no
+# offset, and UTC is the least-wrong assumption available.
+_TIMESTAMP_FORMAT = "%I:%M %p on %d %B, %Y"
 
 
 class _RawTurn(BaseModel):
@@ -95,8 +102,17 @@ def _messages(conversation: dict[str, object]) -> tuple[dict[str, object], ...]:
     messages: list[dict[str, object]] = []
     for number in session_numbers:
         date_time = conversation.get(f"session_{number}_date_time")
+        timestamp = _parse_timestamp(date_time)
         turns = TypeAdapter(list[_RawTurn]).validate_python(conversation[f"session_{number}"])
         for turn in turns:
             role = "user" if turn.speaker == speaker_a else "assistant"
-            messages.append({"role": role, "content": turn.text, "timestamp": date_time})
+            messages.append({"role": role, "content": turn.text, "timestamp": timestamp})
     return tuple(messages)
+
+
+def _parse_timestamp(raw: object) -> int | None:
+    """Parse a LoCoMo session date-time string into epoch milliseconds (UTC)."""
+    if not isinstance(raw, str):
+        return None
+    parsed = datetime.strptime(raw, _TIMESTAMP_FORMAT).replace(tzinfo=timezone.utc)
+    return int(parsed.timestamp() * 1_000)

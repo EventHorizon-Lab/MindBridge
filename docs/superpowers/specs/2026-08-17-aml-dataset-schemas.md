@@ -47,26 +47,37 @@ N, and pull the matching `session_N_date_time`):
 
 ```python
 import re
+from datetime import datetime, timezone
 
 conv = sample["conversation"]
 session_nums = sorted(int(m.group(1)) for k in conv if (m := re.fullmatch(r"session_(\d+)", k)))
 messages = []
 for n in session_nums:
     date_time = conv.get(f"session_{n}_date_time")  # e.g. "1:56 pm on 8 May, 2023"
+    # AML's wire contract (`AmlMessage.timestamp`) requires `int | None`
+    # (epoch milliseconds) -- parse the free-text date and treat it as UTC,
+    # since no timezone is present in the source.
+    timestamp = None
+    if date_time is not None:
+        parsed = datetime.strptime(date_time, "%I:%M %p on %d %B, %Y").replace(tzinfo=timezone.utc)
+        timestamp = int(parsed.timestamp() * 1_000)
     for turn in conv[f"session_{n}"]:
         role = "user" if turn["speaker"] == conv["speaker_a"] else "assistant"
         messages.append(
             {
                 "role": role,
                 "content": turn["text"],
-                "timestamp": date_time,  # SESSION-level, not per-turn
+                "timestamp": timestamp,  # SESSION-level, not per-turn
             }
         )
 ```
 - Real timestamps exist but only at **session granularity** (free-text like
-  `"1:56 pm on 8 May, 2023"`, not ISO-8601) — every turn in a session shares
-  the same timestamp string. `dia_id` (e.g. `"D1:3"`) is the evidence-pointer
-  unit, not a timestamp.
+  `"1:56 pm on 8 May, 2023"` in the format `%I:%M %p on %d %B, %Y`, not
+  ISO-8601) — every turn in a session shares the same timestamp string. The
+  loader parses this format into epoch milliseconds (UTC, since the source
+  carries no timezone) before building the message, matching AML's
+  `int | None` wire contract. `dia_id` (e.g. `"D1:3"`) is the
+  evidence-pointer unit, not a timestamp.
 - `speaker_a`/`speaker_b` are the two participant names; role mapping is
   arbitrary (there's no inherent "user" vs "assistant" — LoCoMo is a
   peer dialogue, not a chatbot transcript). Keep the original speaker name
@@ -179,23 +190,33 @@ Question-type distribution across `longmemeval_s` (500 total):
 
 ### Messages
 ```python
+from datetime import datetime, timezone
+
 messages = []
 for session, session_id, date in zip(
     q["haystack_sessions"], q["haystack_session_ids"], q["haystack_dates"]
 ):
+    # AML's wire contract (`AmlMessage.timestamp`) requires `int | None`
+    # (epoch milliseconds) -- parse the free-text date and treat it as UTC,
+    # since no timezone is present in the source.
+    parsed = datetime.strptime(date, "%Y/%m/%d (%a) %H:%M").replace(tzinfo=timezone.utc)
+    timestamp = int(parsed.timestamp() * 1_000)
     for turn in session:
         messages.append(
             {
                 "role": turn["role"],  # "user" or "assistant" already
                 "content": turn["content"],
-                "timestamp": date,  # SESSION-level again, format "2023/05/20 (Sat) 02:21"
+                "timestamp": timestamp,  # SESSION-level again, source format "2023/05/20 (Sat) 02:21"
             }
         )
 ```
 - Real timestamps exist, at session granularity, format
   `"YYYY/MM/DD (Dow) HH:MM"`. Every turn within a session shares that
-  session's date. `question_date` (same format) is the time the question is
-  asked — useful as an "as-of" anchor for relative-time questions.
+  session's date. The loader parses this format into epoch milliseconds
+  (UTC, since the source carries no timezone) before building the message,
+  matching AML's `int | None` wire contract. `question_date` (same source
+  format) is the time the question is asked — useful as an "as-of" anchor
+  for relative-time questions.
 - Sessions are NOT shared across questions — verified `haystack_session_ids`
   for question 0 and question 1 have **zero overlap** — each question owns
   its own independent haystack.
@@ -470,25 +491,29 @@ conversation directories.
 
 ### Messages
 ```python
+from datetime import datetime, timezone
+
 messages = []
 for batch in chat_json:
     for turn_pair in batch["turns"]:
         for turn in turn_pair:
-            messages.append(
-                {
-                    "role": turn["role"],
-                    "content": turn["content"],
-                    "timestamp": turn.get(
-                        "time_anchor"
-                    ),  # only present on some (user) turns; free text like "March-15-2024"
-                }
-            )
+            anchor = turn.get("time_anchor")  # only present on some (user) turns
+            message = {"role": turn["role"], "content": turn["content"]}
+            if anchor is not None:
+                # AML's wire contract (`AmlMessage.timestamp`) requires
+                # `int | None` (epoch milliseconds) -- parse the free-text
+                # anchor and treat it as UTC, since no timezone is present
+                # in the source. Omit the key entirely when no anchor
+                # exists, rather than inventing or carrying one forward.
+                parsed = datetime.strptime(anchor, "%B-%d-%Y").replace(tzinfo=timezone.utc)
+                message["timestamp"] = int(parsed.timestamp() * 1_000)
+            messages.append(message)
 ```
-- Timestamps are **free-text month-day-year anchors** (`"March-15-2024"`),
-  present inconsistently — typically only on the `user` turn that opens a
-  batch, not on every turn. Treat as a coarse per-batch anchor; carry
-  forward the last-seen anchor onto assistant turns if the harness needs
-  every message timestamped, or leave assistant-turn timestamps `None`.
+- Timestamps are **free-text month-day-year anchors** (`"March-15-2024"`,
+  format `%B-%d-%Y`), present inconsistently — typically only on the `user`
+  turn that opens a batch, not on every turn. The loader parses this format
+  into epoch milliseconds (UTC) when present and omits the `timestamp` key
+  entirely otherwise; it does not carry a prior turn's anchor forward.
 - `content` strings for early turns may contain a literal `"->-> 1,1"`
   suffix (an internal index marker from the generation harness) — harmless
   to keep verbatim since it's part of what the official pipeline would see

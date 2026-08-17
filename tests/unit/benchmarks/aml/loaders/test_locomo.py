@@ -75,8 +75,10 @@ def test_load_orders_sessions_numerically_and_maps_roles(tmp_path: Path) -> None
         "final from alice",
     ]
     assert [message["role"] for message in conv1.messages] == ["user", "assistant", "user"]
-    assert conv1.messages[0]["timestamp"] == "10:00 am on 1 January, 2024"
-    assert conv1.messages[2]["timestamp"] == "11:00 am on 2 January, 2024"
+    # Epoch milliseconds, UTC -- "10:00 am on 1 January, 2024" / "11:00 am on
+    # 2 January, 2024" (AML's wire contract requires `int`, not free text).
+    assert conv1.messages[0]["timestamp"] == 1704103200000
+    assert conv1.messages[2]["timestamp"] == 1704193200000
 
     assert conv2.user_id == "locomo:conv-2"
     assert [message["role"] for message in conv2.messages] == ["assistant"]

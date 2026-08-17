@@ -85,8 +85,10 @@ def test_load_flattens_sessions_in_order_with_session_level_timestamps(
         "user",
         "assistant",
     ]
-    assert case1.messages[0]["timestamp"] == "2023/05/20 (Sat) 02:21"
-    assert case1.messages[2]["timestamp"] == "2023/05/21 (Sun) 10:05"
+    # Epoch milliseconds, UTC -- "2023/05/20 (Sat) 02:21" / "2023/05/21 (Sun)
+    # 10:05" (AML's wire contract requires `int`, not free text).
+    assert case1.messages[0]["timestamp"] == 1684549260000
+    assert case1.messages[2]["timestamp"] == 1684663500000
 
 
 def test_load_renames_answer_to_gold_answer_and_sets_id(tmp_path: Path) -> None:

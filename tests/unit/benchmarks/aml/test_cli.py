@@ -39,11 +39,13 @@ def test_every_benchmark_names_a_loader_an_emitter_and_a_pipeline() -> None:
         assert spec.pipeline.exists(), f"{name} pipeline is not vendored at {spec.pipeline}"
 
 
-def _case(user_id: str, question_id: str) -> AmlCase:
+def _case(user_id: str, question_id: str, payload: dict[str, object] | None = None) -> AmlCase:
     return AmlCase(
         user_id=user_id,
         messages=({"role": "user", "content": f"{user_id} said hello"},),
-        questions=(AmlQuestion(question_id=question_id, question="What happened?", payload={}),),
+        questions=(
+            AmlQuestion(question_id=question_id, question="What happened?", payload=payload or {}),
+        ),
     )
 
 
@@ -97,12 +99,38 @@ async def test_run_writes_one_jsonl_row_per_question(tmp_path: Path) -> None:
         assert tenant_id == derive_tenant_id("bench_aml", user_id)
 
 
+@pytest.mark.parametrize(
+    ("benchmark", "payload"),
+    [
+        # LoCoMo is the one benchmark whose loader puts nothing under "id" in
+        # the question payload, so the driver's own
+        # `{case.user_id}#{question.question_id}` id survives untouched. The
+        # other five loaders each set their own "id" in the payload (see
+        # loaders/{longmemeval,beam,clbench,personamem_v1,personamem_v2}.py),
+        # which overwrites the driver's id when `run_case` builds a row
+        # (`row.update(question.payload)`) -- Blocking 2 (final review,
+        # 2026-08-17): the CLI's resume check computed pending work from the
+        # driver's id format alone, which never matches what these five
+        # benchmarks actually write, so a resumed run treated every one of
+        # their cases as unfinished and silently doubled every memory.
+        ("locomo", {}),
+        ("longmemeval", {"id": "own-id"}),
+        ("beam", {"id": "own-id"}),
+        ("clbench", {"id": "own-id"}),
+        ("personamem-v1", {"id": "own-id"}),
+        ("personamem-v2", {"id": "own-id"}),
+    ],
+)
 @pytest.mark.asyncio
 async def test_run_resumes_without_recontacting_finished_cases_or_duplicating_rows(
-    tmp_path: Path,
+    tmp_path: Path, benchmark: str, payload: dict[str, object]
 ) -> None:
     output_path = tmp_path / "rows.jsonl"
-    cases = (_case("locomo:conv-0", "q0"), _case("locomo:conv-1", "q0"))
+    cases = (
+        _case(f"{benchmark}:conv-0", "q0", payload),
+        _case(f"{benchmark}:conv-1", "q0", payload),
+    )
+    spec = BENCHMARKS[benchmark]
 
     # A clean, uninterrupted run of both cases -- the ground truth to match.
     clean_seen: list[httpx.Request] = []
@@ -112,10 +140,10 @@ async def test_run_resumes_without_recontacting_finished_cases_or_duplicating_ro
     ) as client:
         await _run(
             client,
-            BENCHMARKS["locomo"],
+            spec,
             cases,
             run_id="run-1",
-            benchmark="locomo",
+            benchmark=benchmark,
             top_k=10,
             concurrency=2,
             output_path=clean_output,
@@ -124,8 +152,13 @@ async def test_run_resumes_without_recontacting_finished_cases_or_duplicating_ro
     expected_rows = [json.loads(line) for line in clean_output.read_text().splitlines()]
 
     # Simulate a run interrupted after finishing only the first case: only its
-    # (real, already-scored) row is on disk already.
-    finished_row = next(row for row in expected_rows if row["id"] == "locomo:conv-0#q0")
+    # (real, already-scored) row is on disk already. The row's actual id is
+    # whatever `run_case` wrote -- payload["id"] when the loader supplies one,
+    # else the driver's own `{case.user_id}#{question.question_id}` -- not
+    # necessarily the latter, which is the whole point of this test.
+    first_case, first_question = cases[0], cases[0].questions[0]
+    finished_id = str(payload.get("id") or f"{first_case.user_id}#{first_question.question_id}")
+    finished_row = next(row for row in expected_rows if row["id"] == finished_id)
     output_path.write_text(json.dumps(finished_row) + "\n", encoding="utf-8")
 
     resumed_seen: list[httpx.Request] = []
@@ -134,10 +167,10 @@ async def test_run_resumes_without_recontacting_finished_cases_or_duplicating_ro
     ) as client:
         await _run(
             client,
-            BENCHMARKS["locomo"],
+            spec,
             cases,
             run_id="run-1",
-            benchmark="locomo",
+            benchmark=benchmark,
             top_k=10,
             concurrency=2,
             output_path=output_path,
@@ -148,7 +181,7 @@ async def test_run_resumes_without_recontacting_finished_cases_or_duplicating_ro
     resumed_user_ids = {request.url.params.get("user_id") for request in resumed_seen}
     resumed_bodies = [json.loads(request.content) for request in resumed_seen if request.content]
     touched_user_ids = {body.get("user_id") for body in resumed_bodies} | resumed_user_ids
-    assert eval_user_id("run-1", "locomo", "locomo:conv-0") not in touched_user_ids
+    assert eval_user_id("run-1", benchmark, first_case.user_id) not in touched_user_ids
 
     resumed_rows = [json.loads(line) for line in output_path.read_text().splitlines()]
     assert sorted(resumed_rows, key=lambda row: str(row["id"])) == sorted(
@@ -198,6 +231,7 @@ def test_manifest_carries_source_deployment_and_tenant_mapping(tmp_path: Path) -
         tenant_prefix="bench_aml",
         top_k=10,
         concurrency=2,
+        request_timeout_seconds=600.0,
     )
     deployment = load_deployment_snapshot(deployment_path)
     tenant_ids = {
@@ -222,6 +256,9 @@ def test_manifest_carries_source_deployment_and_tenant_mapping(tmp_path: Path) -
     assert manifest["client_derived_tenant_ids"] == tenant_ids
     assert manifest["question_count"] == 1
     assert manifest["oversized_unsliced_question_count"] == 0
+    assert manifest["deployment_sha256"] == deployment.sha256
+    assert manifest["request_timeout_seconds"] == 600.0
+    assert len(manifest["predictions_sha256"]) == 64
 
 
 def test_write_manifest_counts_oversized_unsliced_questions_from_output_rows(
@@ -274,6 +311,7 @@ def test_write_manifest_counts_oversized_unsliced_questions_from_output_rows(
         tenant_prefix="bench_aml",
         top_k=10,
         concurrency=2,
+        request_timeout_seconds=600.0,
     )
     deployment = load_deployment_snapshot(deployment_path)
 
@@ -322,6 +360,7 @@ def _arguments(
         "tenant_prefix": "bench_aml",
         "top_k": 10,
         "concurrency": 2,
+        "request_timeout_seconds": 600.0,
     }
     fields.update(overrides)
     return _Arguments(**fields)  # type: ignore[arg-type]

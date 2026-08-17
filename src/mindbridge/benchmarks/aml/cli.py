@@ -29,6 +29,7 @@ from mindbridge.benchmarks.aml.driver import (
     emit_retrieved_context,
     emit_selected,
     eval_user_id,
+    row_id,
     run_case,
 )
 from mindbridge.benchmarks.aml.loaders import (
@@ -168,10 +169,21 @@ class AmlRunManifest(ContractModel):
     source_sha256: Sha256Hex
     code_revision: NonEmptyString
     deployment: DeploymentSnapshot
+    # Naming matches `mindbridge.benchmarks.cli_common._core_manifest_values`:
+    # every other benchmark manifest pins both a deployment and a predictions
+    # hash so a reviewer can confirm exactly which deployment and which
+    # output rows a manifest describes, not just a count (Cheap 4, final
+    # review, 2026-08-17).
+    deployment_sha256: Sha256Hex
     run_id: Identifier
     tenant_prefix: Identifier
     recall_limit: int = Field(gt=0, le=100)
     request_concurrency: int = Field(gt=0)
+    # Threaded from `--request-timeout-seconds` rather than hardcoded (Cheap
+    # 5, final review, 2026-08-17): `driver.run_case` used to hardcode
+    # `timeout=600.0` on both `/aml/add` and `/aml/search`, with no operator
+    # override and nothing in the manifest recording what was used.
+    request_timeout_seconds: float = Field(gt=0)
     # `gt=0`, not `ge=0`: a manifest describing zero questions is a run that
     # never happened (Important 2, task-13 review) -- `main()` also refuses
     # to get this far when a loader produces zero cases (see
@@ -199,6 +211,10 @@ class AmlRunManifest(ContractModel):
     # `tenant_ids` so a reader of the manifest cannot mistake this for
     # something the server confirmed.
     client_derived_tenant_ids: dict[Identifier, Identifier]
+    # Matches `_core_manifest_values`'s `predictions_sha256`: a hash of the
+    # output file this manifest is the sidecar for, so a reviewer can confirm
+    # the two haven't drifted apart.
+    predictions_sha256: Sha256Hex
     completed_at: datetime
 
 
@@ -214,6 +230,7 @@ class _Arguments:
     tenant_prefix: str
     top_k: int
     concurrency: int
+    request_timeout_seconds: float
 
 
 def main() -> None:
@@ -319,6 +336,7 @@ async def _connect_and_run(
             concurrency=arguments.concurrency,
             output_path=arguments.output_path,
             tenant_prefix=arguments.tenant_prefix,
+            request_timeout_seconds=arguments.request_timeout_seconds,
         )
 
 
@@ -333,6 +351,7 @@ async def _run(
     concurrency: int,
     output_path: Path,
     tenant_prefix: str,
+    request_timeout_seconds: float = 600.0,
 ) -> dict[str, str]:
     """Run every not-yet-finished case and append its rows; resumable by id.
 
@@ -359,18 +378,19 @@ async def _run(
                 benchmark=benchmark,
                 top_k=top_k,
                 emit=spec.emit,
+                timeout=request_timeout_seconds,
             )
 
     tasks = [asyncio.create_task(bounded(case)) for case in pending]
     with output_path.open("a", encoding="utf-8") as handle:
         for task in asyncio.as_completed(tasks):
             for row in await task:
-                row_id = str(row["id"])
-                if row_id in existing_ids:
+                written_id = str(row["id"])
+                if written_id in existing_ids:
                     continue
                 handle.write(json.dumps(row, ensure_ascii=False) + "\n")
                 handle.flush()
-                existing_ids.add(row_id)
+                existing_ids.add(written_id)
 
     tenant_ids: dict[str, str] = {}
     for case in cases:
@@ -380,7 +400,15 @@ async def _run(
 
 
 def _case_ids(case: AmlCase) -> set[str]:
-    return {f"{case.user_id}#{question.question_id}" for question in case.questions}
+    # Delegates to `row_id` (driver.py) rather than reconstructing the id
+    # format inline: `run_case` doesn't always write
+    # `{case.user_id}#{question.question_id}` -- five of six loaders put
+    # their own "id" in the question payload, which overwrites it. Blocking 2
+    # (final review, 2026-08-17): this function used to hardcode the driver's
+    # id format, which never matched what those five benchmarks actually
+    # wrote, so `_run`'s pending-work check never saw a finished case as
+    # done and resumed runs silently re-added and re-searched everything.
+    return {row_id(case, question) for question in case.questions}
 
 
 def _read_output_rows(output_path: Path) -> list[dict[str, object]]:
@@ -424,13 +452,16 @@ def _write_manifest(
         source_sha256=sha256_file(BENCHMARKS[arguments.benchmark].pipeline),
         code_revision=arguments.code_revision,
         deployment=deployment.snapshot,
+        deployment_sha256=deployment.sha256,
         run_id=arguments.run_id,
         tenant_prefix=arguments.tenant_prefix,
         recall_limit=arguments.top_k,
         request_concurrency=arguments.concurrency,
+        request_timeout_seconds=arguments.request_timeout_seconds,
         question_count=question_count,
         oversized_unsliced_question_count=oversized_unsliced_question_count,
         client_derived_tenant_ids=tenant_ids,
+        predictions_sha256=sha256_file(arguments.output_path),
         completed_at=datetime.now(timezone.utc),
     )
     write_text_atomically(
@@ -477,6 +508,12 @@ def _parse_arguments() -> _Arguments:
     parser.add_argument("--tenant-prefix", required=True)
     parser.add_argument("--top-k", type=int, default=20)
     parser.add_argument("--concurrency", type=_positive_int, default=4)
+    # Matches `cli_common.core_parser`'s `--request-timeout-seconds`, threaded
+    # through to `driver.run_case` instead of that module's hardcoded
+    # `timeout=600.0` on every `/aml/add` and `/aml/search` call (Cheap 5,
+    # final review, 2026-08-17), and pinned in the manifest like every other
+    # benchmark runner already pins it.
+    parser.add_argument("--request-timeout-seconds", type=float, default=600.0)
     parsed = parser.parse_args()
     return _Arguments(
         benchmark=parsed.benchmark,
@@ -489,6 +526,7 @@ def _parse_arguments() -> _Arguments:
         tenant_prefix=parsed.tenant_prefix,
         top_k=parsed.top_k,
         concurrency=parsed.concurrency,
+        request_timeout_seconds=parsed.request_timeout_seconds,
     )
 
 

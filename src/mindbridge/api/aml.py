@@ -21,14 +21,31 @@ from mindbridge.api.aml_contracts import (
     derive_tenant_id,
 )
 from mindbridge.api.auth import AuthenticationError
-from mindbridge.application.aml_extraction import extract_memories
+from mindbridge.application.aml_extraction import ExtractedMemory, extract_memories
 from mindbridge.application.kernel import MemoryKernel
-from mindbridge.contracts import RecallMode, RecallQuery, RecallRequest, RememberRequest
+from mindbridge.contracts import (
+    MemoryResult,
+    RecallMode,
+    RecallQuery,
+    RecallRequest,
+    RememberRequest,
+)
 from mindbridge.models import Generator
 from mindbridge.telemetry import set_current_span_attributes
 
 _BEARER = HTTPBearer(auto_error=False)
 _MINIMUM_API_KEY_LENGTH = 32
+
+# Bounds how many `kernel.remember()` calls one `/aml/add` fans out
+# concurrently. Cheap 10 (final review, 2026-08-17): a single extraction can
+# yield dozens of memories (`MAX_EXTRACTION_OUTPUT_TOKENS` allows for it),
+# and without a cap `asyncio.gather` issued one concurrent embed-and-write
+# round trip per memory, multiplied by every in-flight `/aml/add` request --
+# the design doc promised bounded concurrency, but the bound only existed on
+# the offline harness's own driver, not on this route. This protects the
+# embedder/store from unbounded fan-out from a single request, independent
+# of how many requests are in flight at once.
+_MAX_CONCURRENT_REMEMBERS = 8
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,9 +114,11 @@ def register_aml_routes(
                 "mindbridge.aml.memories_skipped": outcome.skipped,
             }
         )
-        results = await asyncio.gather(
-            *(
-                kernel.remember(
+        semaphore = asyncio.Semaphore(_MAX_CONCURRENT_REMEMBERS)
+
+        async def _remember(memory: ExtractedMemory) -> MemoryResult:
+            async with semaphore:
+                return await kernel.remember(
                     RememberRequest(
                         tenant_id=tenant_id,
                         summary=memory.summary,
@@ -107,8 +126,9 @@ def register_aml_routes(
                         occurred_at=memory.occurred_at,
                     )
                 )
-                for memory in outcome.memories
-            ),
+
+        results = await asyncio.gather(
+            *(_remember(memory) for memory in outcome.memories),
             return_exceptions=True,
         )
         for result in results:

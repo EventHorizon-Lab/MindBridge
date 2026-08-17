@@ -65,16 +65,26 @@ Real timestamps (`time_anchor`) are free-text month-day-year anchors (e.g.
 `"March-15-2024"`) present on a minority of turns -- typically just the user
 turn opening a batch (measured: 5,642 / 5,732 turns across the 100K corpus
 have none at all). The `timestamp` key is omitted entirely for turns without
-one rather than invented or carried forward from a prior turn.
+one rather than invented or carried forward from a prior turn. When present,
+`time_anchor` is parsed to epoch milliseconds (`%B-%d-%Y`, treated as UTC --
+the source carries no timezone) to satisfy AML's wire contract, which types
+`timestamp` as `int | None`, not free text.
 """
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
 from mindbridge.benchmarks.aml.cases import AmlCase, AmlQuestion
+
+# BEAM's turn timestamp, e.g. "March-15-2024" -- free text, no timezone. AML's
+# wire contract (`AmlMessage.timestamp`) requires epoch milliseconds, so this
+# is parsed and treated as UTC: the source carries no offset, and UTC is the
+# least-wrong assumption available.
+_TIMESTAMP_FORMAT = "%B-%d-%Y"
 
 
 class _RawTurn(BaseModel):
@@ -124,9 +134,15 @@ def _messages(batches: list[_RawBatch]) -> tuple[dict[str, object], ...]:
             for turn in turn_pair:
                 message: dict[str, object] = {"role": turn.role, "content": turn.content}
                 if turn.time_anchor is not None:
-                    message["timestamp"] = turn.time_anchor
+                    message["timestamp"] = _parse_timestamp(turn.time_anchor)
                 messages.append(message)
     return tuple(messages)
+
+
+def _parse_timestamp(raw: str) -> int:
+    """Parse a BEAM `time_anchor` string into epoch milliseconds (UTC)."""
+    parsed = datetime.strptime(raw, _TIMESTAMP_FORMAT).replace(tzinfo=timezone.utc)
+    return int(parsed.timestamp() * 1_000)
 
 
 def _questions(

@@ -1,12 +1,14 @@
 """AML route contract tests."""
 
+import asyncio
+import json
 from datetime import datetime, timezone
 from typing import cast
 
 import pytest
 from fastapi.testclient import TestClient
 
-from mindbridge.api.aml import AmlSettings
+from mindbridge.api.aml import _MAX_CONCURRENT_REMEMBERS, AmlSettings
 from mindbridge.api.aml_contracts import derive_tenant_id
 from mindbridge.api.app import build_app
 from mindbridge.api.auth import TenantApiKeyAuthenticator
@@ -177,3 +179,85 @@ def test_wrong_bearer_token_is_rejected(
         headers={"Authorization": f"Bearer {wrong_token}"},
     )
     assert response.status_code == 401
+
+
+class _ManyMemoriesGenerator:
+    """Extracts `count` memories from one chunk, regardless of its content."""
+
+    def __init__(self, count: int) -> None:
+        self._count = count
+
+    async def generate(self, request: GenerateRequest) -> GenerateResult:
+        memories = [
+            {"summary": f"fact {index}", "type": "semantic"} for index in range(self._count)
+        ]
+        return GenerateResult(
+            text=json.dumps({"memories": memories}),
+            model_reference=ModelReference(model_id="qwen3.8-max", revision="test"),
+        )
+
+
+class _ConcurrencyTrackingKernel:
+    """Records the highest number of `remember()` calls in flight at once."""
+
+    def __init__(self) -> None:
+        self._current = 0
+        self.max_seen = 0
+        self._lock = asyncio.Lock()
+
+    async def remember(self, request: RememberRequest) -> MemoryResult:
+        async with self._lock:
+            self._current += 1
+            self.max_seen = max(self.max_seen, self._current)
+        await asyncio.sleep(0.01)  # hold the slot open so overlapping calls can pile up
+        async with self._lock:
+            self._current -= 1
+        return MemoryResult(
+            memory_id="mem",
+            memory_type=MemoryType.SEMANTIC,
+            summary=request.summary,
+            evidence_ids=(),
+            occurred_at=_NOW,
+            ended_at=_NOW,
+            created_at=_NOW,
+            verification_status=VerificationStatus.ATTESTED,
+            state=MemoryState.ACTIVE,
+            trace_id="trace",
+        )
+
+    async def recall(self, request: RecallRequest) -> RecallResult:
+        raise NotImplementedError
+
+
+def test_add_bounds_concurrent_remembers() -> None:
+    """Cheap 10 (final review, 2026-08-17): a chunk yielding many memories
+    used to fan out one concurrent `remember()` per memory with no cap. A
+    generator that extracts more memories than `_MAX_CONCURRENT_REMEMBERS`
+    must never push more than that many `remember()` calls in flight at once.
+    """
+    memory_count = _MAX_CONCURRENT_REMEMBERS * 4
+    kernel = _ConcurrencyTrackingKernel()
+    authenticator = TenantApiKeyAuthenticator({"tenant_01": (_AUTHENTICATOR_KEY,)})
+    app = build_app(
+        cast(MemoryKernel, kernel),
+        authenticator=authenticator,
+        aml=(
+            AmlSettings(api_key=_KEY, tenant_prefix="bench_aml"),
+            _ManyMemoriesGenerator(memory_count),
+        ),
+    )
+    http = TestClient(app)
+
+    response = http.post(
+        "/aml/add",
+        json={
+            "request_id": "r1",
+            "messages": [{"role": "user", "content": "hi"}],
+            "user_id": "u1",
+            "session_id": "s1",
+        },
+        headers={"Authorization": f"Bearer {_KEY}"},
+    )
+
+    assert response.status_code == 200
+    assert 1 < kernel.max_seen <= _MAX_CONCURRENT_REMEMBERS

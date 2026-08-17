@@ -84,7 +84,29 @@ async def extract_memories(
 
 
 def _render_chunk(messages: Sequence[_AmlMessageLike]) -> str:
-    return "\n".join(f"{message.role}: {message.content}" for message in messages)
+    """Render one line per message, prefixed with a readable absolute
+    timestamp when the message carries one.
+
+    Blocking 3 (final review, 2026-08-17): without an anchor in the rendered
+    text, the extraction prompt's instruction to keep relative expressions
+    ("last week") relative while still grounding them is unusable -- the
+    model has nothing absolute to resolve them against. This changes only
+    the rendered user content, not `AML_EXTRACT_FACTS_PROMPT.text` (system
+    prompt, sha256-fingerprinted and unchanged).
+    """
+    return "\n".join(_render_line(message) for message in messages)
+
+
+def _render_line(message: _AmlMessageLike) -> str:
+    if message.timestamp is None:
+        return f"{message.role}: {message.content}"
+    return f"[{_format_timestamp(message.timestamp)}] {message.role}: {message.content}"
+
+
+def _format_timestamp(timestamp_ms: int) -> str:
+    return datetime.fromtimestamp(timestamp_ms / 1_000, tz=timezone.utc).strftime(
+        "%Y-%m-%d %H:%M:%S UTC"
+    )
 
 
 def _chunk_time(messages: Sequence[_AmlMessageLike], *, now: datetime) -> datetime:
