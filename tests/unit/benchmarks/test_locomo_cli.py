@@ -13,7 +13,6 @@ from mindbridge.benchmarks.locomo_cli import (
     LOCOMO_RUNNER_VERSION,
     LoCoMoRunManifest,
     _Arguments,
-    _select_conversations,
     _write_artifacts,
 )
 from mindbridge.benchmarks.locomo_runner import (
@@ -71,13 +70,6 @@ def test_locomo_artifacts_pin_source_system_code_and_output(tmp_path: Path) -> N
     assert manifest.predictions_sha256 == hashlib.sha256(output_path.read_bytes()).hexdigest()
     with pytest.raises(FileExistsError):
         require_writable_output_pair(output_path, overwrite=False)
-
-
-def test_locomo_subset_selection_rejects_unknown_samples() -> None:
-    conversation = _conversation()
-    assert _select_conversations((conversation,), ("conv-01",)) == (conversation,)
-    with pytest.raises(ValueError, match="unknown"):
-        _select_conversations((conversation,), ("missing",))
 
 
 def _arguments(dataset_path: Path, output_path: Path) -> _Arguments:

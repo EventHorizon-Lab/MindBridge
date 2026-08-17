@@ -12,7 +12,6 @@ from mindbridge.benchmarks.artifacts import load_deployment_snapshot
 from mindbridge.benchmarks.egolife_cli import (
     EgoLifeRunManifest,
     _Arguments,
-    _select_questions,
     _write_artifacts,
 )
 from mindbridge.benchmarks.egolife_qa import EgoLifeQuestion
@@ -84,13 +83,6 @@ def test_egolife_artifacts_pin_inputs_models_metrics_and_output(tmp_path: Path) 
     assert manifest.media_clip_count == 1
     assert manifest.caption_clip_count == 0
     assert manifest.predictions_sha256 == hashlib.sha256(output_path.read_bytes()).hexdigest()
-
-
-def test_egolife_selection_rejects_unknown_question() -> None:
-    question = _question()
-    assert _select_questions((question,), ("1",)) == (question,)
-    with pytest.raises(ValueError, match="unknown"):
-        _select_questions((question,), ("missing",))
 
 
 def _arguments(dataset_path: Path, prepared_path: Path, output_path: Path) -> _Arguments:

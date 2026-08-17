@@ -21,6 +21,7 @@ from mindbridge.benchmarks.cli_common import (
     core_arguments,
     core_manifest,
     core_parser,
+    select_by_id,
     write_run_artifacts,
 )
 from mindbridge.benchmarks.locomo import LOCOMO_ADAPTER_VERSION, LoCoMoConversation, load_locomo
@@ -60,7 +61,12 @@ class _Arguments(CoreArguments):
 def main() -> None:
     """Run selected official conversations and emit predictions plus a manifest."""
     arguments = _parse_arguments()
-    conversations = _select_conversations(load_locomo(arguments.dataset_path), arguments.sample_ids)
+    conversations = select_by_id(
+        load_locomo(arguments.dataset_path),
+        arguments.sample_ids,
+        key=lambda conversation: conversation.sample_id,
+        label="LoCoMo sample IDs",
+    )
     require_writable_output_pair(arguments.output_path, overwrite=arguments.overwrite)
     deployment = load_deployment_snapshot(arguments.deployment_config_path)
     results = asyncio.run(_run_conversations(arguments, conversations))
@@ -121,22 +127,6 @@ def _write_artifacts(
         ),
     )
     write_run_artifacts(arguments.output_path, predictions, manifest)
-
-
-def _select_conversations(
-    conversations: tuple[LoCoMoConversation, ...],
-    sample_ids: tuple[str, ...],
-) -> tuple[LoCoMoConversation, ...]:
-    if not sample_ids:
-        return conversations
-    if len(set(sample_ids)) != len(sample_ids):
-        raise ValueError("sample IDs must not contain duplicates")
-    requested = set(sample_ids)
-    selected = tuple(item for item in conversations if item.sample_id in requested)
-    missing = requested - {item.sample_id for item in selected}
-    if missing:
-        raise ValueError(f"unknown LoCoMo sample IDs: {', '.join(sorted(missing))}")
-    return selected
 
 
 def _parse_arguments() -> _Arguments:

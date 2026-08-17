@@ -5,7 +5,12 @@ from pathlib import Path
 
 import pytest
 
-from mindbridge.benchmarks.cli_common import CoreArguments, connected_memory, index_prepared
+from mindbridge.benchmarks.cli_common import (
+    CoreArguments,
+    connected_memory,
+    index_prepared,
+    select_by_id,
+)
 from mindbridge.sdk import MindBridge
 
 
@@ -48,6 +53,54 @@ async def test_connected_memory_allows_an_unauthenticated_endpoint(
     monkeypatch.delenv("MINDBRIDGE_API_KEY", raising=False)
     async with connected_memory(_arguments()) as memory:
         assert "authorization" not in memory._client.headers
+
+
+def test_select_by_id_returns_the_whole_release_when_nothing_is_requested() -> None:
+    """Empty means "no subset", which is how every runner spells a full official split."""
+    items = (_Prepared("a"), _Prepared("b"))
+
+    assert select_by_id(items, (), key=lambda i: i.unit_id, label="units") == items
+
+
+def test_select_by_id_keeps_release_order_not_request_order() -> None:
+    """A prediction artifact has to line up with the annotation, whatever order was asked for."""
+    items = (_Prepared("first"), _Prepared("second"), _Prepared("third"))
+
+    selected = select_by_id(items, ("third", "first"), key=lambda i: i.unit_id, label="units")
+
+    assert selected == (items[0], items[2])
+
+
+def test_select_by_id_rejects_a_duplicated_request() -> None:
+    with pytest.raises(ValueError, match=r"^EgoTempo question IDs must not contain duplicates$"):
+        select_by_id(
+            (_Prepared("q1"),),
+            ("q1", "q1"),
+            key=lambda i: i.unit_id,
+            label="EgoTempo question IDs",
+        )
+
+
+def test_select_by_id_names_the_benchmark_unit_in_its_refusal() -> None:
+    """The label is the part an operator reads, so each benchmark keeps its own wording."""
+    with pytest.raises(ValueError, match=r"^unknown LoCoMo sample IDs: nope$"):
+        select_by_id(
+            (_Prepared("conv-01"),),
+            ("nope",),
+            key=lambda i: i.unit_id,
+            label="LoCoMo sample IDs",
+        )
+
+
+def test_select_by_id_reports_integer_units_in_numeric_order() -> None:
+    """String ordering would print "10, 100, 9" and read as corrupt annotation data."""
+    with pytest.raises(ValueError, match=r"^unknown MM-Lifelong question indices: 9, 10, 100$"):
+        select_by_id(
+            (_Indexed(1),),
+            (9, 10, 100),
+            key=lambda item: item.index,
+            label="MM-Lifelong question indices",
+        )
 
 
 def test_index_prepared_keys_every_prepared_unit() -> None:

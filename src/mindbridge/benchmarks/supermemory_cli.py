@@ -23,6 +23,7 @@ from mindbridge.benchmarks.cli_common import (
     core_parser,
     media_arguments,
     media_manifest,
+    select_by_id,
     write_run_artifacts,
 )
 from mindbridge.benchmarks.supermemory_runner import (
@@ -164,20 +165,11 @@ def _select_questions(
 ) -> tuple[SuperMemoryQuestion, ...]:
     if subject <= 0:
         raise ValueError("subject must be positive")
-    if len(set(question_ids)) != len(question_ids):
-        raise ValueError("question IDs must not contain duplicates")
-    requested = set(question_ids)
-    subject_questions = tuple(question for question in questions if question.subject == subject)
-    missing = requested - {question.question_id for question in subject_questions}
-    if missing:
-        raise ValueError(
-            "unknown SuperMemory-VQA question IDs for subject "
-            f"{subject}: {', '.join(map(str, sorted(missing)))}"
-        )
-    selected = tuple(
-        question
-        for question in subject_questions
-        if not requested or question.question_id in requested
+    selected = select_by_id(
+        tuple(question for question in questions if question.subject == subject),
+        question_ids,
+        key=lambda question: question.question_id,
+        label=f"SuperMemory-VQA subject {subject} question IDs",
     )
     if not selected:
         raise ValueError(f"SuperMemory-VQA subject {subject} has no selected questions")

@@ -23,6 +23,7 @@ from mindbridge.benchmarks.cli_common import (
     media_arguments,
     media_manifest,
     predictions_jsonl,
+    select_by_id,
     write_run_artifacts,
 )
 from mindbridge.benchmarks.mm_lifelong import (
@@ -71,9 +72,11 @@ class _Arguments(MediaArguments):
 def main() -> None:
     """Run one official split and emit JSONL accepted by its released evaluators."""
     arguments = _parse_arguments()
-    questions = _select_questions(
+    questions = select_by_id(
         load_mm_lifelong(arguments.dataset_path, arguments.split),
         arguments.question_indices,
+        key=lambda question: question.index,
+        label="MM-Lifelong question indices",
     )
     prepared = load_prepared_mm_lifelong(arguments.prepared_media_path)
     require_writable_output_pair(arguments.output_path, overwrite=arguments.overwrite)
@@ -137,24 +140,6 @@ def _write_artifacts(
         ),
     )
     write_run_artifacts(arguments.output_path, predictions, manifest)
-
-
-def _select_questions(
-    questions: tuple[MMLifelongQuestion, ...],
-    question_indices: tuple[int, ...],
-) -> tuple[MMLifelongQuestion, ...]:
-    if not question_indices:
-        return questions
-    if len(set(question_indices)) != len(question_indices):
-        raise ValueError("question indices must not contain duplicates")
-    requested = set(question_indices)
-    selected = tuple(question for question in questions if question.index in requested)
-    missing = requested - {question.index for question in selected}
-    if missing:
-        raise ValueError(
-            f"unknown MM-Lifelong question indices: {', '.join(map(str, sorted(missing)))}"
-        )
-    return selected
 
 
 def _parse_arguments() -> _Arguments:

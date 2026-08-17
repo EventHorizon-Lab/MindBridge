@@ -24,6 +24,7 @@ from mindbridge.benchmarks.cli_common import (
     index_prepared,
     media_arguments,
     media_manifest,
+    select_by_id,
     write_run_artifacts,
 )
 from mindbridge.benchmarks.egolife_runner import (
@@ -74,7 +75,12 @@ class _Arguments(MediaArguments):
 def main() -> None:
     """Run selected questions and emit the exact public leaderboard submission shape."""
     arguments = _parse_arguments()
-    questions = _select_questions(load_egomem_reason(arguments.dataset_path), arguments.example_ids)
+    questions = select_by_id(
+        load_egomem_reason(arguments.dataset_path),
+        arguments.example_ids,
+        key=lambda question: question.example_id,
+        label="EgoMemReason example IDs",
+    )
     prepared = _prepared_by_identity(questions, load_prepared_egomem(arguments.prepared_media_path))
     require_writable_output_pair(arguments.output_path, overwrite=arguments.overwrite)
     deployment = load_deployment_snapshot(
@@ -166,24 +172,6 @@ def _write_artifacts(
         ),
     )
     write_run_artifacts(arguments.output_path, predictions, manifest)
-
-
-def _select_questions(
-    questions: tuple[EgoMemReasonQuestion, ...],
-    example_ids: tuple[int, ...],
-) -> tuple[EgoMemReasonQuestion, ...]:
-    if not example_ids:
-        return questions
-    if len(set(example_ids)) != len(example_ids):
-        raise ValueError("example IDs must not contain duplicates")
-    requested = set(example_ids)
-    selected = tuple(question for question in questions if question.example_id in requested)
-    missing = requested - {question.example_id for question in selected}
-    if missing:
-        raise ValueError(
-            f"unknown EgoMemReason example IDs: {', '.join(map(str, sorted(missing)))}"
-        )
-    return selected
 
 
 def _prepared_by_identity(
