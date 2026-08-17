@@ -245,29 +245,6 @@ async def ensure_memory_not_tombstoned(
         raise MemoryDeletedError("memory has been explicitly forgotten")
 
 
-async def ensure_media_not_scheduled_for_deletion(
-    connection: DatabaseConnection,
-    tenant_id: TenantId,
-    media_object_id: str,
-) -> None:
-    """Prevent content deduplication from attaching to a forgetting observation."""
-    cursor = await connection.execute(
-        """
-        SELECT 1
-        FROM observation_media AS link
-        JOIN deletion_tombstones AS tombstone
-          ON tombstone.tenant_id = link.tenant_id
-         AND tombstone.target_type = 'observation'
-         AND tombstone.target_id = link.observation_id
-        WHERE link.tenant_id = %s AND link.media_object_id = %s
-        LIMIT 1
-        """,
-        (tenant_id, media_object_id),
-    )
-    if await cursor.fetchone() is not None:
-        raise MemoryDeletedError("media belongs to an explicitly forgotten observation")
-
-
 async def _lock_forget_target(
     connection: DatabaseConnection,
     tombstone: DeletionTombstone,

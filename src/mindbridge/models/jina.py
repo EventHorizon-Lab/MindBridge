@@ -25,10 +25,11 @@ from mindbridge.core import (
 from mindbridge.models._vectors import validate_embedding_vector
 from mindbridge.models.compute import select_torch_device
 from mindbridge.models.defaults import (
+    DEFAULT_EMBEDDER_MODEL_ID,
+    DEFAULT_EMBEDDER_REVISION,
     DEFAULT_EMBEDDING_DIMENSION,
     DEFAULT_EMBEDDING_SPACE,
-    DEFAULT_MEDIA_EMBEDDER_MODEL_ID,
-    DEFAULT_MEDIA_EMBEDDER_REVISION,
+    MatryoshkaDimension,
 )
 from mindbridge.telemetry import set_current_span_attributes, trace_operation
 
@@ -97,7 +98,7 @@ class JinaEmbedder:
         cls,
         *,
         revision: str,
-        model_id: str = DEFAULT_MEDIA_EMBEDDER_MODEL_ID,
+        model_id: str = DEFAULT_EMBEDDER_MODEL_ID,
         device: str | None = None,
         space_reference: EmbeddingSpaceReference = DEFAULT_EMBEDDING_SPACE,
         dimension: int = DEFAULT_EMBEDDING_DIMENSION,
@@ -193,12 +194,12 @@ class JinaEmbedder:
 
 
 class _EmbedderConfig(PluginConfigModel):
-    model_id: PluginText = DEFAULT_MEDIA_EMBEDDER_MODEL_ID
-    revision: PluginText = DEFAULT_MEDIA_EMBEDDER_REVISION
+    model_id: PluginText = DEFAULT_EMBEDDER_MODEL_ID
+    revision: PluginText = DEFAULT_EMBEDDER_REVISION
     device: PluginText | None = None
     space_id: PluginText = DEFAULT_EMBEDDING_SPACE.space_id
     space_revision: PluginText = DEFAULT_EMBEDDING_SPACE.revision
-    dimension: PluginInteger = DEFAULT_EMBEDDING_DIMENSION
+    dimension: MatryoshkaDimension = DEFAULT_EMBEDDING_DIMENSION
     max_concurrency: PluginInteger = 1
 
 

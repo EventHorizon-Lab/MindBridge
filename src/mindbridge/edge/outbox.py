@@ -6,7 +6,7 @@ import os
 import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Annotated
 
@@ -19,7 +19,9 @@ from mindbridge.core import (
     MemoryIntegrityError,
     derive_observation_id,
     derive_stable_id,
+    utc_now,
 )
+from mindbridge.edge._sqlite import connect as sqlite_connect
 from mindbridge.edge.deletion_inbox import initialize_deletion_tables
 from mindbridge.edge.recent_memory import initialize_recent_memory_tables
 
@@ -100,7 +102,7 @@ class SQLiteObservationOutbox:
             raise ValueError("edge outbox must use a file-backed SQLite database")
         database_path.parent.mkdir(parents=True, exist_ok=True)
         self._database_path = database_path
-        self._clock = clock or _utc_now
+        self._clock = clock or utc_now
         self._initialize()
 
     def enqueue(
@@ -469,11 +471,7 @@ class SQLiteObservationOutbox:
         os.chmod(self._database_path, 0o600)
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self._database_path, timeout=30)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA journal_mode = WAL")
-        connection.execute("PRAGMA synchronous = FULL")
-        return connection
+        return sqlite_connect(self._database_path)
 
     @staticmethod
     def _backfill_observation_media(connection: sqlite3.Connection) -> None:
@@ -523,7 +521,3 @@ def _outbox_item(row: sqlite3.Row) -> EdgeObservationOutboxItem:
         attempts=row["attempts"],
         last_error_code=row["last_error_code"],
     )
-
-
-def _utc_now() -> datetime:
-    return datetime.now(timezone.utc)

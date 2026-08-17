@@ -51,6 +51,7 @@ from mindbridge.core import (
     SensorKind,
     TenantId,
 )
+from mindbridge.media.clipping import ClipRequest, MediaClip, audio_windows
 from mindbridge.models import Embedding, EmbedRequest, EmbedResult, MediaPart, TextPart
 
 NOW = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
@@ -231,8 +232,11 @@ class RecordingTextEmbedder:
 
 
 class DeterministicSigner:
+    """Object storage double that really round-trips derived clip bytes."""
+
     def __init__(self) -> None:
         self.calls = 0
+        self.uploaded: dict[str, bytes] = {}
 
     async def create_presigned_download(
         self,
@@ -243,6 +247,25 @@ class DeterministicSigner:
             download_url=f"https://objects.example.test/clip.mp4?signature={self.calls}",
             expires_at=NOW + timedelta(minutes=5),
         )
+
+    async def read_media(self, media_object: MediaObject) -> bytes:
+        return self.uploaded.get(media_object.uri, b"source-media-bytes")
+
+    async def upload_media(self, media_object: MediaObject, content: bytes) -> None:
+        self.uploaded[media_object.uri] = content
+
+
+def stub_cut(source: bytes, request: ClipRequest) -> tuple[MediaClip, ...]:
+    """Cut deterministically without decoding, so unit tests stay pure."""
+    return tuple(
+        MediaClip(
+            content=b"clip:%d-%d:" % (start, end) + source,
+            suffix=".mp4",
+            start_ms=start,
+            end_ms=end,
+        )
+        for start, end in audio_windows(request.start_ms, request.end_ms)
+    )
 
 
 async def test_processor_builds_event_memory_and_raw_media_embedding_once(
@@ -270,9 +293,21 @@ async def test_processor_builds_event_memory_and_raw_media_embedding_once(
     assert first.state is JobState.SUCCEEDED
     assert duplicate.state is JobState.SUCCEEDED
     assert perceiver.calls == 1
-    assert signer.calls == 2
-    assert embedder.documents == ("https://objects.example.test/clip.mp4?signature=2",)
+    # Two source signings (perception, clip derivation) plus one for the stored clip.
+    assert signer.calls == 3
+    # The encoder receives the derived clip, never the whole source recording.
+    assert embedder.documents == ("https://objects.example.test/clip.mp4?signature=3",)
     assert store.output is not None
+    assert len(signer.uploaded) == 1
+    assert len(store.output.media_objects) == 1
+    assert store.output.media_objects[0].derived_from_media_object_id == MediaObjectId("media_01")
+    # Clips follow the grounded event span, so the unreferenced source span that
+    # used to receive a whole-file vector now produces nothing at all.
+    assert len(store.output.evidence_clips) == 1
+    assert store.output.evidence_clips[0].evidence_id not in {
+        EvidenceId("evidence_01"),
+        EvidenceId("evidence_unused"),
+    }
     assert first.memory_ids == tuple(memory.memory_id for memory in store.output.memories)
     assert store.output.events[0].prompt_version == "perceive_events_v1"
     assert store.output.memories[0].summary == store.output.events[0].description
@@ -282,12 +317,16 @@ async def test_processor_builds_event_memory_and_raw_media_embedding_once(
     assert store.output.events[0].evidence_ids == (event_evidence.evidence_id,)
     assert store.output.claims[0].evidence_ids == (event_evidence.evidence_id,)
     assert store.output.embeddings[0].object_type is EmbeddedObjectType.EVIDENCE_SPAN
-    assert store.output.embeddings[0].object_id == "evidence_01"
+    assert store.output.embeddings[0].object_id == event_evidence.evidence_id
+    # The clip mapping and the vector agree on which span they describe.
+    assert store.output.evidence_clips[0].evidence_id == event_evidence.evidence_id
+    assert store.output.evidence_clips[0].start_ms == 500
+    assert store.output.evidence_clips[0].end_ms == 3_500
     assert tuple(
         embedding.object_id
         for embedding in store.output.embeddings
         if embedding.object_type is EmbeddedObjectType.EVIDENCE_SPAN
-    ) == ("evidence_01", "evidence_unused")
+    ) == (event_evidence.evidence_id,)
     assert text_embedder.documents == (
         "A person places a red tool beside a blue toolbox.",
         "The red tool is beside the blue toolbox.",
@@ -468,6 +507,7 @@ def _processor(
         embedder,
         text_embedder,
         media_url_signer=signer or DeterministicSigner(),
+        clip_cutter=stub_cut,
     )
 
 

@@ -1,0 +1,125 @@
+{
+  "description": "Consolidation merge decisions for the retrieval vs text-matching adapter bake-off. paraphrase = the same fact stated differently and SHOULD merge. contradiction = the same subject and predicate with an incompatible value; these answer the same question, so a retrieval-trained geometry is expected to place them close, and merging them would silently destroy a belief revision. unrelated = an easy negative that any adapter should reject.",
+  "pairs": [
+    {
+      "left": "The robot put the red screwdriver beside the blue toolbox.",
+      "right": "The red screwdriver was placed next to the blue toolbox by the robot.",
+      "label": "paraphrase"
+    },
+    {
+      "left": "The robot put the red screwdriver beside the blue toolbox.",
+      "right": "The robot put the red screwdriver inside the blue toolbox.",
+      "label": "contradiction"
+    },
+    {
+      "left": "The robot put the red screwdriver beside the blue toolbox.",
+      "right": "The kitchen window was left open overnight.",
+      "label": "unrelated"
+    },
+    {
+      "left": "Caroline plans to become a counselor.",
+      "right": "Caroline intends to train as a counselor.",
+      "label": "paraphrase"
+    },
+    {
+      "left": "Caroline plans to become a counselor.",
+      "right": "Caroline decided against becoming a counselor.",
+      "label": "contradiction"
+    },
+    {
+      "left": "Caroline plans to become a counselor.",
+      "right": "The delivery van arrived twenty minutes late.",
+      "label": "unrelated"
+    },
+    {
+      "left": "Zhang San was in Beijing yesterday.",
+      "right": "Yesterday Zhang San stayed in Beijing.",
+      "label": "paraphrase"
+    },
+    {
+      "left": "Zhang San was in Beijing yesterday.",
+      "right": "Zhang San was in Shanghai yesterday.",
+      "label": "contradiction"
+    },
+    {
+      "left": "Zhang San was in Beijing yesterday.",
+      "right": "The printer on the second floor is out of toner.",
+      "label": "unrelated"
+    },
+    {
+      "left": "张三昨天在北京。",
+      "right": "昨天张三待在北京。",
+      "label": "paraphrase"
+    },
+    {
+      "left": "张三昨天在北京。",
+      "right": "张三昨天在上海。",
+      "label": "contradiction"
+    },
+    {
+      "left": "张三昨天在北京。",
+      "right": "二楼的打印机没有墨粉了。",
+      "label": "unrelated"
+    },
+    {
+      "left": "会议被推迟到周五下午三点。",
+      "right": "会议改到了周五下午三点开。",
+      "label": "paraphrase"
+    },
+    {
+      "left": "会议被推迟到周五下午三点。",
+      "right": "会议被提前到周三上午九点。",
+      "label": "contradiction"
+    },
+    {
+      "left": "会议被推迟到周五下午三点。",
+      "right": "李四买了一辆二手自行车。",
+      "label": "unrelated"
+    },
+    {
+      "left": "The front door was locked when she left.",
+      "right": "She locked the front door on her way out.",
+      "label": "paraphrase"
+    },
+    {
+      "left": "The front door was locked when she left.",
+      "right": "The front door was unlocked when she left.",
+      "label": "contradiction"
+    },
+    {
+      "left": "The front door was locked when she left.",
+      "right": "The quarterly revenue report is due next Monday.",
+      "label": "unrelated"
+    },
+    {
+      "left": "药盒放在床头柜的第二个抽屉里。",
+      "right": "床头柜第二层抽屉里放着药盒。",
+      "label": "paraphrase"
+    },
+    {
+      "left": "药盒放在床头柜的第二个抽屉里。",
+      "right": "药盒放在厨房吊柜的最上层。",
+      "label": "contradiction"
+    },
+    {
+      "left": "药盒放在床头柜的第二个抽屉里。",
+      "right": "小区门口新开了一家咖啡店。",
+      "label": "unrelated"
+    },
+    {
+      "left": "老人在早上七点吃了降压药。",
+      "right": "降压药是老人早上七点服下的。",
+      "label": "paraphrase"
+    },
+    {
+      "left": "老人在早上七点吃了降压药。",
+      "right": "老人今天早上忘记吃降压药了。",
+      "label": "contradiction"
+    },
+    {
+      "left": "老人在早上七点吃了降压药。",
+      "right": "阳台上的绿萝需要浇水了。",
+      "label": "unrelated"
+    }
+  ]
+}

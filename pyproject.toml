@@ -60,7 +60,6 @@ server = [
 ]
 cloud-models = [
     "av>=16,<17",
-    "librosa>=0.11,<1",
     "opentelemetry-api>=1.44,<2",
     "pillow>=12,<13",
     "sentence-transformers>=5.2,<6",
@@ -105,7 +104,15 @@ strict = true
 files = ["src", "tests"]
 
 [[tool.mypy.overrides]]
-module = ["billiard", "billiard.*", "celery", "celery.*", "kombu", "kombu.*"]
+module = [
+    "billiard",
+    "billiard.*",
+    "celery",
+    "celery.*",
+    "kombu",
+    "kombu.*",
+    "soundfile",
+]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

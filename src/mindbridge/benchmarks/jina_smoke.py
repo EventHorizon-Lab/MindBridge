@@ -12,6 +12,7 @@ from typing import Literal
 
 from pydantic import AwareDatetime
 
+from mindbridge.benchmarks.runtime import dot_product
 from mindbridge.contracts import ContractModel
 from mindbridge.models import EmbedRequest, EmbedTask, ModelInput, TextPart
 from mindbridge.models.jina import JinaEmbedder
@@ -67,9 +68,9 @@ async def run_jina_smoke(*, revision: str, device: str) -> JinaSmokeResult:
         document_result.embeddings[0].values,
         document_result.embeddings[1].values,
     )
-    query_norm = math.sqrt(sum(value * value for value in query))
-    relevant_similarity = _dot(query, relevant)
-    unrelated_similarity = _dot(query, unrelated)
+    query_norm = math.hypot(*query)
+    relevant_similarity = dot_product(query, relevant)
+    unrelated_similarity = dot_product(query, unrelated)
     return JinaSmokeResult(
         created_at=datetime.now(timezone.utc),
         model_id=query_embedding.model_reference.model_id,
@@ -103,12 +104,6 @@ def main() -> None:
     print(result.model_dump_json(indent=2))
     if not result.passed:
         raise SystemExit(1)
-
-
-def _dot(left: tuple[float, ...], right: tuple[float, ...]) -> float:
-    return sum(
-        left_value * right_value for left_value, right_value in zip(left, right, strict=True)
-    )
 
 
 if __name__ == "__main__":

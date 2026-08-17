@@ -11,9 +11,15 @@ from mindbridge.core import (
     EmbeddingId,
     EmbeddingRecord,
     EmbeddingSpaceReference,
+    MediaKind,
+    MediaObject,
+    MediaObjectId,
+    MemoryIntegrityError,
     ModelReference,
     TenantId,
 )
+from mindbridge.infrastructure._postgres_media import write_media_object
+from mindbridge.infrastructure._postgres_types import tenant_connection
 from mindbridge.infrastructure.postgres import PostgresMemoryStore
 
 NOW = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
@@ -22,7 +28,7 @@ VECTOR_TENANT = TenantId("tenant_vectors")
 pytestmark = pytest.mark.integration
 
 
-async def test_pgvector_mix_aligned_encoders_but_separates_space_revisions(
+async def test_pgvector_separates_space_revisions(
     store: PostgresMemoryStore,
 ) -> None:
     """The cloud index retrieves only the requested frozen model version."""
@@ -42,10 +48,7 @@ async def test_pgvector_mix_aligned_encoders_but_separates_space_revisions(
         embedding_id="embedding_02",
         object_id="memory_far",
         values=(0.0, 1.0) + (0.0,) * 1_022,
-        model=ModelReference(
-            model_id="jinaai/jina-embeddings-v5-text-small-retrieval",
-            revision="text-revision",
-        ),
+        model=model,
         space=space,
     )
 
@@ -166,6 +169,14 @@ async def test_unreachable_probe_is_scoped_per_tenant_and_per_object_type(
     assert await store.unreachable_embedded_object_types(TenantId("tenant_empty"), drifted) == ()
 
 
+async def test_open_refuses_a_dimension_the_index_cannot_store(database_url: str) -> None:
+    """A shrunk Matryoshka width must fail at startup, not on the first write."""
+    mismatched = PostgresMemoryStore(database_url, embedding_dimension=256)
+
+    with pytest.raises(MemoryIntegrityError, match=r"vector\(1024\).*configured for 256"):
+        await mismatched.open()
+
+
 def _embedding_record(
     *,
     embedding_id: str,
@@ -189,3 +200,77 @@ def _embedding_record(
         normalized=True,
         created_at=NOW,
     )
+
+
+async def test_reading_a_clip_keeps_its_provenance_link(
+    store: PostgresMemoryStore,
+) -> None:
+    """A derived clip read back must still know which raw object it was cut from."""
+    tenant_id = TenantId("tenant_provenance")
+    source = MediaObject(
+        media_object_id=MediaObjectId("provenance_source_01"),
+        tenant_id=tenant_id,
+        kind=MediaKind.VIDEO,
+        uri="s3://memory/tenants/tenant_provenance/source.mp4",
+        sha256="7" * 64,
+        size_bytes=8_192,
+        created_at=NOW,
+    )
+    clip = MediaObject(
+        media_object_id=MediaObjectId("provenance_clip_01"),
+        tenant_id=tenant_id,
+        kind=MediaKind.VIDEO,
+        uri="s3://memory/tenants/tenant_provenance/clips/" + "8" * 64 + ".mp4",
+        sha256="8" * 64,
+        size_bytes=1_024,
+        created_at=NOW,
+        duration_ms=3_000,
+        derived_from_media_object_id=source.media_object_id,
+    )
+    async with tenant_connection(store._pool, tenant_id) as connection:
+        for media_object in (source, clip):
+            await write_media_object(connection, media_object)
+
+    read_back = await store.read_media_objects(
+        tenant_id, (source.media_object_id, clip.media_object_id)
+    )
+
+    assert read_back[0].derived_from_media_object_id is None
+    assert read_back[1].derived_from_media_object_id == source.media_object_id
+    assert read_back[1].duration_ms == 3_000
+
+
+async def test_known_clip_digests_separate_orphans_from_registered_clips(
+    store: PostgresMemoryStore,
+) -> None:
+    """An upload whose transaction rolled back has no row, so its digest is unknown."""
+    tenant_id = TenantId("tenant_clips")
+    registered_digest = "d" * 64
+    orphan_digest = "e" * 64
+    source = MediaObject(
+        media_object_id=MediaObjectId("clip_source_01"),
+        tenant_id=tenant_id,
+        kind=MediaKind.AUDIO,
+        uri="s3://memory/tenants/tenant_clips/source.wav",
+        sha256="c" * 64,
+        size_bytes=2_048,
+        created_at=NOW,
+    )
+    registered = MediaObject(
+        media_object_id=MediaObjectId("clip_registered_01"),
+        tenant_id=tenant_id,
+        kind=MediaKind.AUDIO,
+        uri=f"s3://memory/tenants/tenant_clips/clips/{registered_digest}.wav",
+        sha256=registered_digest,
+        size_bytes=512,
+        created_at=NOW,
+        duration_ms=1_000,
+        derived_from_media_object_id=source.media_object_id,
+    )
+    async with tenant_connection(store._pool, tenant_id) as connection:
+        for media_object in (source, registered):
+            await write_media_object(connection, media_object)
+
+    known = await store.list_known_clip_digests(tenant_id, (registered_digest, orphan_digest))
+
+    assert known == frozenset({registered_digest})

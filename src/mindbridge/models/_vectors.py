@@ -16,6 +16,6 @@ def validate_embedding_vector(values: tuple[float, ...], dimension: int) -> None
     """
     if len(values) != dimension or not all(math.isfinite(value) for value in values):
         raise ModelOutputError("embedding vector has invalid dimension or values")
-    norm = math.sqrt(sum(value * value for value in values))
+    norm = math.hypot(*values)
     if not math.isclose(norm, 1.0, rel_tol=1e-4, abs_tol=1e-6):
         raise ModelOutputError("embedding vector is not L2-normalized")

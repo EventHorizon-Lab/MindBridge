@@ -93,10 +93,6 @@ def _embedder_config(**changes: object) -> dict[str, object]:
         "endpoint": "https://embeddings.example.test/v1",
         "model_id": "omni",
         "model_revision": "omni-revision",
-        "document_api_key": "key",
-        "document_endpoint": "https://text.example.test/v1",
-        "document_model_id": "text",
-        "document_model_revision": "text-revision",
         "space_id": "space",
         "space_revision": "space-revision",
     }

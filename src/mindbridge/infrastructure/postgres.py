@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from datetime import datetime
 
 from pgvector.psycopg import register_vector_async
@@ -36,7 +37,9 @@ from mindbridge.application.summary_consolidation import (
 )
 from mindbridge.contracts import RecallRequest
 from mindbridge.core import (
+    DEFAULT_EMBEDDING_DIMENSION,
     DeletionTombstone,
+    DomainInvariantError,
     EmbeddedObjectType,
     EmbeddingId,
     EmbeddingRecord,
@@ -48,6 +51,7 @@ from mindbridge.core import (
     MediaObjectId,
     MemoryFeedback,
     MemoryId,
+    MemoryIntegrityError,
     MemoryRecord,
     ObservationId,
     ObservationJobClaim,
@@ -63,11 +67,15 @@ from mindbridge.infrastructure._postgres_consolidation import (
 )
 from mindbridge.infrastructure._postgres_embeddings import (
     has_embedding,
+    read_embedding_column_dimension,
     search_embeddings,
     unreachable_embedded_object_types,
     write_embedding,
 )
-from mindbridge.infrastructure._postgres_evidence import read_evidence
+from mindbridge.infrastructure._postgres_evidence import (
+    list_known_clip_digests,
+    read_evidence,
+)
 from mindbridge.infrastructure._postgres_feedback import record_feedback
 from mindbridge.infrastructure._postgres_forget import (
     complete_forget,
@@ -121,11 +129,16 @@ class PostgresMemoryStore:
         min_pool_size: int = 1,
         max_pool_size: int = 10,
         statement_timeout_ms: int = 30_000,
+        embedding_dimension: int = DEFAULT_EMBEDDING_DIMENSION,
     ) -> None:
         if min_pool_size < 0 or max_pool_size < max(1, min_pool_size):
             raise ValueError("pool sizes must satisfy 0 <= min_pool_size <= max_pool_size")
         if statement_timeout_ms <= 0:
             raise ValueError("statement_timeout_ms must be positive")
+        if embedding_dimension <= 0:
+            raise ValueError("embedding_dimension must be positive")
+        self._embedding_dimension = embedding_dimension
+        self._schema_refusal: str | None = None
         self._pool = DatabasePool(
             database_url,
             min_size=min_pool_size,
@@ -138,9 +151,40 @@ class PostgresMemoryStore:
         )
 
     async def open(self) -> None:
-        """Open the pool explicitly, as required by current Psycopg."""
+        """Open the pool and refuse a schema that cannot hold configured vectors."""
+        if self._schema_refusal is not None:
+            # Repeat the actionable message; the pool is already closed.
+            raise MemoryIntegrityError(self._schema_refusal)
         with translate_transient_database_errors():
             await self._pool.open(wait=True)
+            column_dimension = await read_embedding_column_dimension(self._pool)
+        if column_dimension != self._embedding_dimension:
+            self._schema_refusal = (
+                f"embeddings.embedding is vector({column_dimension}) but this deployment is "
+                f"configured for {self._embedding_dimension}; changing the width invalidates "
+                "every stored vector, so declare a new embedding space, run "
+                f"ALTER TABLE embeddings ALTER COLUMN embedding TYPE vector"
+                f"({self._embedding_dimension}) on an empty table, and re-index"
+            )
+            await self._pool.close()
+            raise MemoryIntegrityError(self._schema_refusal)
+
+    async def list_known_clip_digests(
+        self,
+        tenant_id: TenantId,
+        digests: tuple[str, ...],
+    ) -> frozenset[str]:
+        """Report which stored clip digests the database still references."""
+        return await list_known_clip_digests(self._pool, tenant_id, digests)
+
+    def _require_index_dimension(self, embeddings: Iterable[EmbeddingRecord]) -> None:
+        """Reject vectors the configured pgvector index cannot store."""
+        for embedding in embeddings:
+            if embedding.dimension != self._embedding_dimension:
+                raise DomainInvariantError(
+                    f"embedding dimension must be {self._embedding_dimension} "
+                    "to match the configured index"
+                )
 
     async def close(self) -> None:
         """Close pooled connections cleanly during application shutdown."""
@@ -220,6 +264,7 @@ class PostgresMemoryStore:
         writes: tuple[SummaryWrite, ...],
     ) -> int:
         """Atomically persist disjoint Summary parents and their aligned vectors."""
+        self._require_index_dimension(write.embedding for write in writes)
         return await commit_summary_consolidation(self._pool, tenant_id, writes)
 
     async def commit_claim_consolidation(
@@ -228,6 +273,7 @@ class PostgresMemoryStore:
         write: ClaimConsolidationWrite,
     ) -> ClaimConsolidationCommit:
         """Atomically persist verified Semantic Claims and version decisions."""
+        self._require_index_dimension(claim.embedding for claim in write.semantic_claims)
         return await commit_claim_consolidation(self._pool, tenant_id, write)
 
     async def commit_episode_consolidation(
@@ -236,6 +282,7 @@ class PostgresMemoryStore:
         writes: tuple[EpisodeWrite, ...],
     ) -> int:
         """Atomically claim child Events and persist verified Episodes."""
+        self._require_index_dimension(write.embedding for write in writes)
         return await commit_episode_consolidation(self._pool, tenant_id, writes)
 
     async def update_memory_lifecycles(
@@ -459,6 +506,7 @@ class PostgresMemoryStore:
 
     async def write_embedding(self, embedding: EmbeddingRecord) -> bool:
         """Persist one immutable vector version."""
+        self._require_index_dimension((embedding,))
         return await write_embedding(self._pool, embedding)
 
     async def has_embedding(self, tenant_id: TenantId, embedding_id: EmbeddingId) -> bool:
@@ -467,7 +515,9 @@ class PostgresMemoryStore:
 
     async def search_embeddings(self, search: EmbeddingSearch) -> tuple[EmbeddingMatch, ...]:
         """Search one explicit frozen embedding space by cosine similarity."""
-        return await search_embeddings(self._pool, search)
+        return await search_embeddings(
+            self._pool, search, expected_dimension=self._embedding_dimension
+        )
 
     async def unreachable_embedded_object_types(
         self,
@@ -515,6 +565,7 @@ class PostgresMemoryStore:
         output: ObservationProcessingOutput,
     ) -> ObservationProcessingJob:
         """Atomically persist derived memory and successful job state."""
+        self._require_index_dimension(output.embeddings)
         return await commit_observation_processing(
             self._pool,
             tenant_id,

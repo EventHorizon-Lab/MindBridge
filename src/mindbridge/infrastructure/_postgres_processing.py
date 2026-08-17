@@ -21,6 +21,7 @@ from mindbridge.infrastructure._postgres_derived_records import (
 from mindbridge.infrastructure._postgres_embeddings import write_embedding_on_connection
 from mindbridge.infrastructure._postgres_evidence import (
     read_observation_evidence,
+    write_evidence_clips,
     write_evidence_spans,
 )
 from mindbridge.infrastructure._postgres_forget import ensure_target_not_tombstoned
@@ -70,6 +71,13 @@ async def commit_observation_processing(
             )
             await _require_source_evidence(connection, tenant_id, observation_id, output)
             await write_evidence_spans(connection, output.evidence_spans)
+            await write_evidence_clips(
+                connection,
+                tenant_id,
+                observation_id,
+                output.media_objects,
+                output.evidence_clips,
+            )
             for event in output.events:
                 await write_event(connection, event)
             await write_entities(connection, output.entities)
