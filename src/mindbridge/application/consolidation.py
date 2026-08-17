@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Protocol
@@ -25,6 +24,9 @@ from mindbridge.core import (
     EventStatus,
     MemoryIntegrityError,
     TenantId,
+    require_aware_datetime,
+    require_non_empty,
+    require_similarity,
 )
 from mindbridge.telemetry import set_current_span_attributes, trace_operation
 
@@ -41,18 +43,15 @@ class EpisodeCandidateRequest:
     minimum_similarity: float = 0.7
 
     def __post_init__(self) -> None:
-        if not self.tenant_id.strip():
-            raise DomainInvariantError("tenant_id must not be empty")
-        if self.evaluated_at.utcoffset() is None:
-            raise DomainInvariantError("evaluated_at must be timezone-aware")
-        if self.after_event_id is not None and not self.after_event_id.strip():
-            raise DomainInvariantError("after_event_id must not be empty")
+        require_non_empty(self.tenant_id, "tenant_id")
+        require_aware_datetime(self.evaluated_at, "evaluated_at")
+        if self.after_event_id is not None:
+            require_non_empty(self.after_event_id, "after_event_id")
         if not 1 <= self.limit <= 32:
             raise DomainInvariantError("episode candidate page limit must be between 1 and 32")
         if not 0 <= self.maximum_gap_seconds <= 86_400:
             raise DomainInvariantError("maximum_gap_seconds must be between 0 and 86400")
-        if not math.isfinite(self.minimum_similarity) or not -1.0 <= self.minimum_similarity <= 1.0:
-            raise DomainInvariantError("minimum_similarity must be between -1 and 1")
+        require_similarity(self.minimum_similarity, "minimum_similarity")
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,8 +65,8 @@ class EpisodeCandidatePage:
     def __post_init__(self) -> None:
         if self.scanned_count < 0:
             raise DomainInvariantError("episode candidate scanned_count must be non-negative")
-        if self.next_cursor is not None and not self.next_cursor.strip():
-            raise DomainInvariantError("episode candidate cursor must not be empty")
+        if self.next_cursor is not None:
+            require_non_empty(self.next_cursor, "episode candidate cursor")
         if len({event.event_id for event in self.events}) != len(self.events):
             raise DomainInvariantError("episode candidate event IDs must be unique")
         if len({event.tenant_id for event in self.events}) > 1:

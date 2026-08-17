@@ -14,6 +14,8 @@ from mindbridge.core import (
     MemoryStrengthPolicy,
     TenantId,
     evolve_memory_strength,
+    require_aware_datetime,
+    require_non_empty,
 )
 from mindbridge.telemetry import set_current_span_attributes, trace_operation
 
@@ -28,12 +30,10 @@ class LifecycleSweepRequest:
     limit: int = 100
 
     def __post_init__(self) -> None:
-        if not self.tenant_id.strip():
-            raise DomainInvariantError("tenant_id must not be empty")
-        if self.evaluated_at.utcoffset() is None:
-            raise DomainInvariantError("evaluated_at must be timezone-aware")
-        if self.after_memory_id is not None and not self.after_memory_id.strip():
-            raise DomainInvariantError("after_memory_id must not be empty")
+        require_non_empty(self.tenant_id, "tenant_id")
+        require_aware_datetime(self.evaluated_at, "evaluated_at")
+        if self.after_memory_id is not None:
+            require_non_empty(self.after_memory_id, "after_memory_id")
         if not 1 <= self.limit <= 1_000:
             raise DomainInvariantError("lifecycle page limit must be between 1 and 1000")
 
