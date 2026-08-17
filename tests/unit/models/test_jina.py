@@ -6,6 +6,7 @@ import pytest
 
 from mindbridge.core import MediaKind, ModelOutputError, ModelReference
 from mindbridge.models import EmbedRequest, EmbedTask, MediaPart, ModelInput, TextPart
+from mindbridge.models.defaults import require_matryoshka_dimension
 from mindbridge.models.jina import JinaEmbedder
 
 
@@ -151,3 +152,12 @@ async def test_jina_skips_model_call_for_empty_batch() -> None:
 
     assert (await embedder.embed(EmbedRequest(inputs=(), task=EmbedTask.DOCUMENT))).embeddings == ()
     assert encoder.calls == []
+
+
+def test_matryoshka_validation_accepts_trained_widths_and_rejects_others() -> None:
+    """A deployment may shrink vectors, but only to a width Jina actually trained."""
+    assert require_matryoshka_dimension(256) == 256
+    assert require_matryoshka_dimension(1_024) == 1_024
+
+    with pytest.raises(ValueError, match="embedding dimension must be one of"):
+        require_matryoshka_dimension(500)

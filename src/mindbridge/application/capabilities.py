@@ -124,7 +124,7 @@ class Embedding:
     def __post_init__(self) -> None:
         if not self.values or not all(math.isfinite(value) for value in self.values):
             raise DomainInvariantError("embedding values must be finite and non-empty")
-        norm = math.sqrt(sum(value * value for value in self.values))
+        norm = math.hypot(*self.values)
         if not math.isclose(norm, 1.0, rel_tol=1e-4, abs_tol=1e-6):
             raise DomainInvariantError("embedding values must be L2-normalized")
 
@@ -143,6 +143,13 @@ class EmbedResult:
 @runtime_checkable
 class Embedder(Protocol):
     """A replaceable provider or local embedding model."""
+
+    @property
+    def space_reference(self) -> EmbeddingSpaceReference:
+        """The search space every vector this embedder produces belongs to."""
+        # An explicit subclass inherits this body, so raise instead of returning None:
+        # a silent None would make the space guards compare equal and pass vacuously.
+        raise NotImplementedError("an Embedder must declare its embedding space")
 
     async def embed(self, request: EmbedRequest) -> EmbedResult: ...
 

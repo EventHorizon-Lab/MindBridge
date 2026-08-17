@@ -58,13 +58,18 @@ server = [
     "psycopg[binary,pool]>=3.2,<4",
     "uvicorn>=0.35,<1",
 ]
-cloud-models = [
+# The decoders mindbridge.media.clipping loads lazily. Separate from cloud-models so CI can
+# install them without torch and actually run the clip tests.
+media = [
     "av>=16,<17",
-    "librosa>=0.11,<1",
-    "opentelemetry-api>=1.44,<2",
+    "numpy>=1.26,<3",
     "pillow>=12,<13",
-    "sentence-transformers>=5.2,<6",
     "soundfile>=0.13,<1",
+]
+cloud-models = [
+    "mindbridge[media]",
+    "opentelemetry-api>=1.44,<2",
+    "sentence-transformers>=5.2,<6",
     "torch==2.9.1",
     "transformers>=5.1,<6",
 ]
@@ -109,7 +114,23 @@ strict = true
 files = ["src", "tests"]
 
 [[tool.mypy.overrides]]
-module = ["billiard", "billiard.*", "celery", "celery.*", "kombu", "kombu.*"]
+module = [
+    "billiard",
+    "billiard.*",
+    "celery",
+    "celery.*",
+    "kombu",
+    "kombu.*",
+    # The media decoders live in the cloud-models extra, which CI does not install because
+    # it also carries torch. mindbridge.media.clipping imports them lazily and raises
+    # ModelUnavailableError without them; its tests skip rather than fail collection.
+    "av",
+    "av.*",
+    "numpy",
+    "PIL",
+    "PIL.*",
+    "soundfile",
+]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

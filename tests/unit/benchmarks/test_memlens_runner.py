@@ -7,16 +7,13 @@ from typing import cast
 import pytest
 
 from mindbridge import MindBridge
-from mindbridge.benchmarks import (
-    MemLensImage,
+from mindbridge.benchmarks.memlens import MemLensImage, MemLensQuestion, MemLensSession, MemLensTurn
+from mindbridge.benchmarks.memlens_runner import (
     MemLensPreparedImage,
     MemLensPreparedImages,
-    MemLensQuestion,
-    MemLensSession,
-    MemLensTurn,
     run_memlens_question,
+    validate_memlens_images,
 )
-from mindbridge.benchmarks.memlens_runner import validate_memlens_images
 from mindbridge.contracts import (
     MediaObjectInput,
     ObservationProcessingJobView,

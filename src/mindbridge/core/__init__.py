@@ -1,5 +1,6 @@
 """Stable domain vocabulary for MindBridge memory."""
 
+from mindbridge.core._validation import utc_now
 from mindbridge.core.errors import (
     DatabaseUnavailableError,
     DomainInvariantError,
@@ -17,6 +18,7 @@ from mindbridge.core.errors import (
     TaskBrokerError,
 )
 from mindbridge.core.evidence import (
+    EvidenceClip,
     EvidenceSpan,
     MediaKind,
     MediaObject,
@@ -68,6 +70,7 @@ from mindbridge.core.lifecycle import (
     evolve_memory_strength,
 )
 from mindbridge.core.memory import (
+    DEFAULT_EMBEDDING_DIMENSION,
     Claim,
     ClaimType,
     EmbeddedObjectType,
@@ -84,6 +87,7 @@ from mindbridge.core.memory import (
 )
 
 __all__ = [
+    "DEFAULT_EMBEDDING_DIMENSION",
     "DEFAULT_MEMORY_STRENGTH_POLICY",
     "AnonymousIdentityObservation",
     "Claim",
@@ -107,6 +111,7 @@ __all__ = [
     "EventHierarchyLevel",
     "EventId",
     "EventStatus",
+    "EvidenceClip",
     "EvidenceId",
     "EvidenceSpan",
     "FeedbackId",
@@ -157,4 +162,5 @@ __all__ = [
     "derive_relation",
     "derive_stable_id",
     "evolve_memory_strength",
+    "utc_now",
 ]

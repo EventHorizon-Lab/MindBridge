@@ -61,6 +61,13 @@ class TenantApiKeyAuthenticator:
             (digest, frozenset(tenant_ids)) for digest, tenant_ids in tenant_ids_by_digest.items()
         )
 
+    @property
+    def tenant_ids(self) -> tuple[str, ...]:
+        """Every configured tenant, so startup checks can probe tenant-scoped rows."""
+        return tuple(
+            sorted({tenant_id for _, tenants in self._credentials for tenant_id in tenants})
+        )
+
     @classmethod
     def from_json(cls, value: str) -> TenantApiKeyAuthenticator:
         """Parse ``tenant -> [rotatable keys]`` configuration without echoing secrets."""

@@ -8,6 +8,7 @@ from pathlib import Path
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
 
+from mindbridge.benchmarks.prompts import EGOTEMPO_QUERY_PROMPT
 from mindbridge.benchmarks.runtime import (
     PreparedVideo,
     benchmark_tenant_id,
@@ -22,7 +23,6 @@ from mindbridge.contracts import (
     RecallQuery,
     RecallRequest,
 )
-from mindbridge.prompts import EGOTEMPO_QUERY_PROMPT
 from mindbridge.sdk import MindBridge, MindBridgeError
 
 EGOTEMPO_ADAPTER_VERSION = "egotempo_official_v1"

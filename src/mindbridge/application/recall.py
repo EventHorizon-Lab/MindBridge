@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
-from datetime import datetime, timezone
+from dataclasses import dataclass, replace
+from datetime import datetime
 from time import perf_counter
 from typing import Literal
 
@@ -53,6 +54,7 @@ from mindbridge.core import (
     ModelOutputError,
     TenantId,
     VerificationStatus,
+    utc_now,
 )
 from mindbridge.telemetry import (
     current_trace_id,
@@ -62,6 +64,24 @@ from mindbridge.telemetry import (
 )
 
 _MAXIMUM_RETRIEVAL_REFINEMENTS = 2
+_UNANSWERED = GeneratedAnswer(answer=None, confidence=0.0)
+
+
+@dataclass(frozen=True, slots=True)
+class _AnswerWave:
+    """One candidate ranking and the most recent answer produced from it."""
+
+    ranked: tuple[MemoryRecord, ...]
+    visible: tuple[MemoryRecord, ...]
+    generated: GeneratedAnswer = _UNANSWERED
+    evidence: tuple[ResolvedEvidence, ...] = ()
+    attempted_queries: tuple[str, ...] = ()
+    round_count: int = 0
+
+    @property
+    def temporal_order(self) -> Literal["relevance", "newest", "oldest"]:
+        """Follow the newest answer, because later rounds see more evidence."""
+        return self.generated.temporal_order
 
 
 class RecallMemories:
@@ -87,7 +107,7 @@ class RecallMemories:
         self._embedder = embedder
         self._reranker = reranker
         self._minimum_embedding_similarity = minimum_embedding_similarity
-        self._clock = clock or _utc_now
+        self._clock = clock or utc_now
         self._enumerate = EnumerateMemories(
             store,
             occurrence_verifier,
@@ -113,116 +133,144 @@ class RecallMemories:
         if request.mode is RecallMode.ENUMERATE:
             return await self._enumerate_result(request, query_media)
         candidate_limit = min(request.limit * 4, 100)
-        memories = await self._retrieve_candidates(
-            request,
-            query_media,
-            limit=candidate_limit,
+        ranked = await self._retrieve_candidates(request, query_media, limit=candidate_limit)
+        wave = _AnswerWave(
+            ranked=ranked,
+            visible=await self._refresh_visible_candidates(request, ranked),
         )
-        visible_candidates = await self._refresh_visible_candidates(request, memories)
-        generated = GeneratedAnswer(answer=None, confidence=0.0)
-        answer_evidence: tuple[ResolvedEvidence, ...] = ()
-        retrieval_query_count = 0
-        retrieval_round_count = 0
         if request.mode is not RecallMode.SEARCH:
-            generated, answer_evidence = await self._answer_candidates(
+            wave = await self._answer_within_reflection_budget(
                 request,
-                visible_candidates,
+                wave,
                 query_media,
-                phase="initial",
-                round_number=1,
+                candidate_limit=candidate_limit,
+                started_at=started_at,
             )
-            retrieval_round_count = 1
-            record_stage_duration(
-                "recall.first_answer",
-                max(0.0, perf_counter() - started_at),
+        return await self._build_result(request, wave, started_at=started_at)
+
+    async def _answer_within_reflection_budget(
+        self,
+        request: RecallRequest,
+        wave: _AnswerWave,
+        query_media: tuple[ResolvedQueryMedia, ...],
+        *,
+        candidate_limit: int,
+        started_at: float,
+    ) -> _AnswerWave:
+        """Answer, then spend a bounded budget on temporal and retrieval reflection."""
+        wave = await self._answer_round(request, wave, query_media, phase="initial")
+        record_stage_duration("recall.first_answer", max(0.0, perf_counter() - started_at))
+        reordered = order_memory_candidates(wave.visible, wave.temporal_order)
+        if _memory_ids(reordered) != _memory_ids(wave.visible):
+            wave = await self._answer_round(
+                request,
+                replace(wave, visible=reordered),
+                query_media,
+                phase="temporal_reorder",
             )
-            temporal_order = generated.temporal_order
-            if temporal_order != "relevance":
-                ordered_candidates = order_memory_candidates(visible_candidates, temporal_order)
-                if tuple(memory.memory_id for memory in ordered_candidates) != tuple(
-                    memory.memory_id for memory in visible_candidates
-                ):
-                    visible_candidates = ordered_candidates
-                    generated, answer_evidence = await self._answer_candidates(
-                        request,
-                        visible_candidates,
-                        query_media,
-                        phase="temporal_reorder",
-                        round_number=retrieval_round_count + 1,
-                    )
-                    retrieval_round_count += 1
-            seen_queries = (
-                {request.query.text.casefold()} if request.query.text is not None else set()
+        seen_queries = {request.query.text.casefold()} if request.query.text is not None else set()
+        for _ in range(_MAXIMUM_RETRIEVAL_REFINEMENTS):
+            followup_queries = tuple(
+                query
+                for query in wave.generated.retrieval_queries
+                if query.casefold() not in seen_queries
             )
-            attempted_queries: tuple[str, ...] = ()
-            for _ in range(_MAXIMUM_RETRIEVAL_REFINEMENTS):
-                followup_queries = tuple(
-                    query
-                    for query in generated.retrieval_queries
-                    if query.casefold() not in seen_queries
-                )
-                if not followup_queries or request.memory_ids:
-                    break
-                seen_queries.update(query.casefold() for query in followup_queries)
-                attempted_queries += followup_queries
-                retrieval_query_count += len(followup_queries)
-                query_media = await self._resign_query_media(query_media)
-                followup_rankings = await asyncio.gather(
-                    *(
-                        self._retrieve_candidates(
-                            request.model_copy(
-                                update={
-                                    "query": RecallQuery(
-                                        text=query,
-                                        media_object_ids=request.query.media_object_ids,
-                                    )
-                                }
-                            ),
-                            query_media,
-                            limit=candidate_limit,
-                        )
-                        for query in followup_queries
-                    )
-                )
-                refined = fuse_memory_rankings(
-                    (*followup_rankings, memories),
-                    limit=candidate_limit,
-                )
-                refined_candidates = await self._refresh_visible_candidates(request, refined)
-                refined_candidates = order_memory_candidates(refined_candidates, temporal_order)
-                if tuple(memory.memory_id for memory in refined_candidates) == tuple(
-                    memory.memory_id for memory in visible_candidates
-                ):
-                    generated, answer_evidence = await self._answer_candidates(
-                        request,
-                        visible_candidates,
-                        query_media,
-                        attempted_retrieval_queries=attempted_queries,
-                        phase="reflection",
-                        round_number=retrieval_round_count + 1,
-                    )
-                    retrieval_round_count += 1
-                    continue
-                memories = refined
-                visible_candidates = refined_candidates
-                generated, answer_evidence = await self._answer_candidates(
+            if not followup_queries or request.memory_ids:
+                break
+            seen_queries.update(query.casefold() for query in followup_queries)
+            wave = replace(wave, attempted_queries=wave.attempted_queries + followup_queries)
+            query_media = await self._resign_query_media(query_media)
+            wave = await self._answer_round(
+                request,
+                await self._merge_followup_candidates(
                     request,
-                    visible_candidates,
+                    wave,
                     query_media,
-                    attempted_retrieval_queries=attempted_queries,
-                    phase="reflection",
-                    round_number=retrieval_round_count + 1,
+                    followup_queries,
+                    limit=candidate_limit,
+                ),
+                query_media,
+                phase="reflection",
+            )
+        return wave
+
+    async def _answer_round(
+        self,
+        request: RecallRequest,
+        wave: _AnswerWave,
+        query_media: tuple[ResolvedQueryMedia, ...],
+        *,
+        phase: Literal["initial", "temporal_reorder", "reflection"],
+    ) -> _AnswerWave:
+        """Inspect the current candidates once and adopt that round's temporal intent."""
+        generated, evidence = await self._answer_candidates(
+            request,
+            wave.visible,
+            query_media,
+            attempted_retrieval_queries=wave.attempted_queries,
+            phase=phase,
+            round_number=wave.round_count + 1,
+        )
+        return replace(
+            wave,
+            generated=generated,
+            evidence=evidence,
+            round_count=wave.round_count + 1,
+        )
+
+    async def _merge_followup_candidates(
+        self,
+        request: RecallRequest,
+        wave: _AnswerWave,
+        query_media: tuple[ResolvedQueryMedia, ...],
+        followup_queries: tuple[str, ...],
+        *,
+        limit: int,
+    ) -> _AnswerWave:
+        """Fuse extra retrieval waves into the current ranking without losing relevance order."""
+        followup_rankings = await asyncio.gather(
+            *(
+                self._retrieve_candidates(
+                    request.model_copy(
+                        update={
+                            "query": RecallQuery(
+                                text=query,
+                                media_object_ids=request.query.media_object_ids,
+                            )
+                        }
+                    ),
+                    query_media,
+                    limit=limit,
                 )
-                retrieval_round_count += 1
+                for query in followup_queries
+            )
+        )
+        refined = fuse_memory_rankings((*followup_rankings, wave.ranked), limit=limit)
+        visible = order_memory_candidates(
+            await self._refresh_visible_candidates(request, refined),
+            wave.temporal_order,
+        )
+        if _memory_ids(visible) == _memory_ids(wave.visible):
+            return wave
+        return replace(wave, ranked=refined, visible=visible)
+
+    async def _build_result(
+        self,
+        request: RecallRequest,
+        wave: _AnswerWave,
+        *,
+        started_at: float,
+    ) -> RecallResult:
+        """Charge the recall against memory strength and return only still-visible content."""
         visible_memories = await self._store.record_memory_accesses(
             TenantId(request.tenant_id),
-            tuple(memory.memory_id for memory in visible_candidates),
+            _memory_ids(wave.visible),
             accessed_at=self._clock(),
         )
-        if tuple(memory.memory_id for memory in visible_memories) != tuple(
-            memory.memory_id for memory in visible_candidates
-        ):
-            generated = GeneratedAnswer(answer=None, confidence=0.0)
+        generated = wave.generated
+        answer_evidence = wave.evidence
+        if _memory_ids(visible_memories) != _memory_ids(wave.visible):
+            generated = _UNANSWERED
             answer_evidence = ()
         answer_memories = self._grounded_memories(visible_memories)
         response_evidence = answer_evidence
@@ -233,11 +281,11 @@ class RecallMemories:
             )
         set_current_span_attributes(
             {
-                "mindbridge.recall.candidate_count": len(memories),
+                "mindbridge.recall.candidate_count": len(wave.ranked),
                 "mindbridge.recall.memory_count": len(visible_memories),
                 "mindbridge.recall.evidence_count": len(answer_evidence),
-                "mindbridge.recall.retrieval_query_count": retrieval_query_count,
-                "mindbridge.recall.retrieval_round_count": retrieval_round_count,
+                "mindbridge.recall.retrieval_query_count": len(wave.attempted_queries),
+                "mindbridge.recall.retrieval_round_count": wave.round_count,
                 "mindbridge.recall.answered": generated.answer is not None,
             }
         )
@@ -530,6 +578,10 @@ class RecallMemories:
         )
 
 
+def _memory_ids(memories: tuple[MemoryRecord, ...]) -> tuple[MemoryId, ...]:
+    return tuple(memory.memory_id for memory in memories)
+
+
 def _query_input(
     request: RecallRequest,
     query_media: tuple[ResolvedQueryMedia, ...],
@@ -592,7 +644,3 @@ def evidence_view(evidence: ResolvedEvidence) -> EvidenceView:
         media_url=evidence.media_url,
         media_url_expires_at=evidence.media_url_expires_at,
     )
-
-
-def _utc_now() -> datetime:
-    return datetime.now(timezone.utc)

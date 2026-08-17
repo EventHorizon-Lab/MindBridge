@@ -579,8 +579,7 @@ class _RecordedQuery:
 class RecordingEmbedder:
     """Returns valid vectors while retaining query and document inputs."""
 
-    query_model_reference = ModelReference(model_id="jina-omni", revision="pinned-revision")
-    document_model_reference = ModelReference(model_id="jina-text", revision="pinned-revision")
+    model_reference = ModelReference(model_id="jina-omni", revision="pinned-revision")
     space_reference = EmbeddingSpaceReference(space_id="jina-v5", revision="space-v1")
 
     def __init__(self, *, memory_document_failures: int = 0) -> None:
@@ -604,7 +603,6 @@ class RecordingEmbedder:
                         ),
                     )
                 )
-            model_reference = self.query_model_reference
         else:
             self.memory_documents.extend(
                 part.text
@@ -615,12 +613,11 @@ class RecordingEmbedder:
             if self.memory_document_failures:
                 self.memory_document_failures -= 1
                 raise ModelUnavailableError("temporary embedding failure")
-            model_reference = self.document_model_reference
         return EmbedResult(
             tuple(
                 Embedding(
                     (1.0,) + (0.0,) * 1_023,
-                    model_reference,
+                    self.model_reference,
                     self.space_reference,
                 )
                 for _ in request.inputs
@@ -775,6 +772,36 @@ async def test_feedback_strengthens_and_correction_supersedes_without_model_trai
     )
 
 
+async def test_correction_inherits_the_retention_strength_it_supersedes() -> None:
+    """The authoritative version must not be colder than the record it replaces."""
+    store = InMemoryStore()
+    kernel = _kernel(store, RecordingAnswerer())
+    original = await kernel.remember(_remember_request(idempotency_key="original"))
+    strengthened = await kernel.record_feedback(
+        FeedbackRequest(
+            tenant_id="tenant_01",
+            feedback_type=FeedbackType.USEFUL,
+            memory_id=original.memory_id,
+            idempotency_key="useful_01",
+        )
+    )
+
+    correction = await kernel.record_feedback(
+        FeedbackRequest(
+            tenant_id="tenant_01",
+            feedback_type=FeedbackType.CORRECTION,
+            memory_id=original.memory_id,
+            correction_summary="The robot put the red screwdriver in the green drawer.",
+            idempotency_key="correction_01",
+        )
+    )
+    assert correction.corrected_memory_id is not None
+    corrected = await kernel.get_memory("tenant_01", correction.corrected_memory_id)
+
+    assert strengthened.resulting_strength == 1.5
+    assert corrected.strength == 1.5
+
+
 async def test_missing_feedback_records_trace_without_inventing_a_memory() -> None:
     kernel = _kernel(InMemoryStore(), RecordingAnswerer())
 
@@ -880,7 +907,7 @@ async def test_remember_indexes_one_pinned_memory_document() -> None:
     assert embedder.memory_documents == [memory.summary]
     assert embedding.object_type is EmbeddedObjectType.MEMORY_RECORD
     assert embedding.object_id == memory.memory_id
-    assert embedding.model_reference == embedder.document_model_reference
+    assert embedding.model_reference == embedder.model_reference
     assert embedding.space_reference == embedder.space_reference
     assert embedding.task == "retrieval_document"
     assert embedding.dimension == 1_024
@@ -1100,6 +1127,52 @@ async def test_recall_switches_query_direction_when_reflection_finds_no_new_cand
         "red screwdriver exact location",
         "person_device_01 last placement",
     ]
+
+
+async def test_recall_applies_the_temporal_order_of_the_latest_answer_round() -> None:
+    """A reflection round that discovers a latest/first question must still reorder."""
+    store = InMemoryStore()
+    answerer = RecordingAnswerer(
+        answers=(
+            GeneratedAnswer(
+                answer="alpha",
+                confidence=0.4,
+                retrieval_queries=("beta",),
+            ),
+            GeneratedAnswer(
+                answer="alpha",
+                confidence=0.5,
+                retrieval_queries=("gamma",),
+                temporal_order="newest",
+            ),
+            GeneratedAnswer(answer="alpha", confidence=0.9, temporal_order="newest"),
+        )
+    )
+    kernel = _kernel(store, answerer)
+    old = await kernel.remember(
+        _remember_request(idempotency_key="old").model_copy(update={"summary": "old event"})
+    )
+    new = await kernel.remember(
+        _remember_request(idempotency_key="new", occurred_at=NOW + timedelta(days=1)).model_copy(
+            update={"summary": "new event"}
+        )
+    )
+    store.embedding_matches = tuple(
+        EmbeddingMatch(
+            embedding_id=f"embedding_{memory_id}",
+            object_type=EmbeddedObjectType.MEMORY_RECORD,
+            object_id=memory_id,
+            similarity=similarity,
+        )
+        for memory_id, similarity in ((old.memory_id, 0.9), (new.memory_id, 0.8))
+    )
+
+    result = await kernel.recall(
+        RecallRequest(tenant_id="tenant_01", query=RecallQuery(text="alpha"))
+    )
+
+    assert answerer.calls == 3
+    assert [item.memory_id for item in result.memories] == [new.memory_id, old.memory_id]
 
 
 async def test_recall_reorders_only_visible_candidates_for_an_explicit_latest_question(

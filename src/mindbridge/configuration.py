@@ -4,7 +4,16 @@ import argparse
 import json
 from collections.abc import Callable, Mapping
 from datetime import datetime
-from typing import NoReturn, cast
+from typing import Annotated, NoReturn, cast
+
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    ConfigDict,
+    StrictFloat,
+    StrictInt,
+    StringConstraints,
+)
 
 
 def require_environment_value(environ: Mapping[str, str], name: str) -> str:
@@ -67,6 +76,24 @@ def copy_plugin_configuration(
     except (TypeError, ValueError) as error:
         raise ValueError(f"{name} must contain JSON values") from error
     return dict(config)
+
+
+PluginText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+# StrictInt after StrictFloat so a JSON integer is accepted where a number belongs while a
+# quoted number or a bool is not. AfterValidator normalizes the accepted member to float.
+PluginNumber = Annotated[StrictFloat | StrictInt, AfterValidator(float)]
+PluginInteger = StrictInt
+
+
+class PluginConfigModel(BaseModel):
+    """Strict immutable schema for one plugin's JSON configuration object.
+
+    `extra="forbid"` is what fails a factory on any key it would otherwise ignore.
+    `protected_namespaces` is cleared because `model_id` and `model_revision` are
+    MindBridge's model-identity fields, not pydantic's reserved namespace.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True, protected_namespaces=())
 
 
 def _reject_json_constant(value: str) -> NoReturn:

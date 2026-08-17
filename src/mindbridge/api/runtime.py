@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-import inspect
 import math
 import os
 from collections.abc import AsyncIterator, Mapping
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass, field
-from typing import cast
+from typing import Protocol, cast
 
 from fastapi import FastAPI
 from mcp.server import MCPServer
@@ -26,6 +25,7 @@ from mindbridge.configuration import (
     require_environment_value,
     validate_plugin_name,
 )
+from mindbridge.core import EmbeddedObjectType, EmbeddingSpaceReference, TenantId
 from mindbridge.infrastructure.postgres import PostgresMemoryStore
 from mindbridge.infrastructure.s3 import S3MediaAccess
 from mindbridge.infrastructure.task_queue import (
@@ -34,15 +34,19 @@ from mindbridge.infrastructure.task_queue import (
 )
 from mindbridge.models import Generator
 from mindbridge.models.defaults import (
+    DEFAULT_EMBEDDER_MODEL_ID,
+    DEFAULT_EMBEDDER_REVISION,
     DEFAULT_EMBEDDING_DIMENSION,
     DEFAULT_EMBEDDING_SPACE,
     DEFAULT_GENERATOR_MODEL_ID,
-    DEFAULT_MEDIA_EMBEDDER_MODEL_ID,
-    DEFAULT_MEDIA_EMBEDDER_REVISION,
-    DEFAULT_TEXT_EMBEDDER_MODEL_ID,
-    DEFAULT_TEXT_EMBEDDER_REVISION,
+    embedding_dimension_from_environment,
 )
-from mindbridge.models.plugins import load_embedder, load_generator, load_reranker
+from mindbridge.models.plugins import (
+    close_model,
+    load_embedder,
+    load_generator,
+    load_reranker,
+)
 from mindbridge.telemetry import configure_telemetry, instrument_fastapi
 
 
@@ -62,6 +66,7 @@ class Settings:
     reranker_plugin: str | None = None
     reranker_config: Mapping[str, object] = field(default_factory=dict, repr=False)
     minimum_embedding_similarity: float = 0.0
+    embedding_dimension: int = DEFAULT_EMBEDDING_DIMENSION
     tenant_api_keys_json: str | None = field(default=None, repr=False)
     aml_api_key: str | None = field(default=None, repr=False)
     aml_tenant_prefix: str = "bench_aml"
@@ -153,6 +158,7 @@ class Settings:
             minimum_embedding_similarity=float(
                 source.get("MINDBRIDGE_MINIMUM_EMBEDDING_SIMILARITY", "0.0")
             ),
+            embedding_dimension=embedding_dimension_from_environment(source),
             tenant_api_keys_json=optional_environment_value(
                 source, "MINDBRIDGE_TENANT_API_KEYS_JSON"
             ),
@@ -161,20 +167,54 @@ class Settings:
         )
 
 
+class _EmbeddingSpaceProbe(Protocol):
+    async def unreachable_embedded_object_types(
+        self,
+        tenant_id: TenantId,
+        space_reference: EmbeddingSpaceReference,
+    ) -> tuple[EmbeddedObjectType, ...]: ...
+
+
+async def _require_reachable_embedding_space(
+    probe: _EmbeddingSpaceProbe,
+    tenant_ids: tuple[str, ...],
+    space_reference: EmbeddingSpaceReference,
+) -> None:
+    """Refuse to serve an Embedder that cannot reach what a configured tenant already stored."""
+    for tenant_id in tenant_ids:
+        stranded = await probe.unreachable_embedded_object_types(
+            TenantId(tenant_id),
+            space_reference,
+        )
+        if stranded:
+            names = ", ".join(object_type.value for object_type in stranded)
+            raise ValueError(
+                f"tenant {tenant_id!r} stores {names} vectors outside the selected space "
+                f"{space_reference}; recall would return nothing instead of failing"
+            )
+
+
 @dataclass(frozen=True, slots=True)
 class _Runtime:
     kernel: MemoryKernel
     store: PostgresMemoryStore
     models: tuple[object, ...]
     generator: Generator
+    embedding_space: EmbeddingSpaceReference
+    tenant_ids: tuple[str, ...]
 
     @asynccontextmanager
     async def open(self) -> AsyncIterator[None]:
         async with AsyncExitStack() as resources:
             for model in self.models:
-                resources.push_async_callback(_close_model, model)
+                resources.push_async_callback(close_model, model)
             await self.store.open()
             resources.push_async_callback(self.store.close)
+            await _require_reachable_embedding_space(
+                self.store,
+                self.tenant_ids,
+                self.embedding_space,
+            )
             yield
 
 
@@ -231,7 +271,9 @@ def run_mcp() -> None:
 
 
 def _build_runtime(settings: Settings) -> _Runtime:
-    store = PostgresMemoryStore(settings.database_url)
+    store = PostgresMemoryStore(
+        settings.database_url, embedding_dimension=settings.embedding_dimension
+    )
     media_access = S3MediaAccess(
         settings.object_storage_bucket,
         endpoint_url=settings.object_storage_endpoint_url,
@@ -261,16 +303,12 @@ def _build_runtime(settings: Settings) -> _Runtime:
         tuple[object, ...],
         (generator, embedder, *((reranker,) if reranker is not None else ())),
     )
-    return _Runtime(kernel, store, models, generator)
-
-
-async def _close_model(model: object) -> None:
-    close = getattr(model, "close", None)
-    if close is None:
-        return
-    result = close()
-    if inspect.isawaitable(result):
-        await result
+    tenant_ids = (
+        TenantApiKeyAuthenticator.from_json(settings.tenant_api_keys_json).tenant_ids
+        if settings.tenant_api_keys_json is not None
+        else ()
+    )
+    return _Runtime(kernel, store, models, generator, embedder.space_reference, tenant_ids)
 
 
 def _openai_generator_config(source: Mapping[str, str]) -> dict[str, object]:
@@ -290,27 +328,13 @@ def _openai_embedder_config(source: Mapping[str, str]) -> dict[str, object]:
     return {
         "api_key": require_environment_value(source, "MINDBRIDGE_EMBEDDER_API_KEY"),
         "endpoint": require_environment_value(source, "MINDBRIDGE_EMBEDDER_ENDPOINT"),
-        "model_id": source.get("MINDBRIDGE_EMBEDDER_MODEL_ID", DEFAULT_MEDIA_EMBEDDER_MODEL_ID),
+        "model_id": source.get("MINDBRIDGE_EMBEDDER_MODEL_ID", DEFAULT_EMBEDDER_MODEL_ID),
         "model_revision": source.get(
-            "MINDBRIDGE_EMBEDDER_MODEL_REVISION", DEFAULT_MEDIA_EMBEDDER_REVISION
-        ),
-        "document_api_key": require_environment_value(
-            source, "MINDBRIDGE_EMBEDDER_DOCUMENT_API_KEY"
-        ),
-        "document_endpoint": require_environment_value(
-            source, "MINDBRIDGE_EMBEDDER_DOCUMENT_ENDPOINT"
-        ),
-        "document_model_id": source.get(
-            "MINDBRIDGE_EMBEDDER_DOCUMENT_MODEL_ID", DEFAULT_TEXT_EMBEDDER_MODEL_ID
-        ),
-        "document_model_revision": source.get(
-            "MINDBRIDGE_EMBEDDER_DOCUMENT_MODEL_REVISION", DEFAULT_TEXT_EMBEDDER_REVISION
+            "MINDBRIDGE_EMBEDDER_MODEL_REVISION", DEFAULT_EMBEDDER_REVISION
         ),
         "space_id": source.get("MINDBRIDGE_EMBEDDING_SPACE_ID", DEFAULT_EMBEDDING_SPACE.space_id),
         "space_revision": source.get(
             "MINDBRIDGE_EMBEDDING_SPACE_REVISION", DEFAULT_EMBEDDING_SPACE.revision
         ),
-        "dimension": int(
-            source.get("MINDBRIDGE_EMBEDDING_DIMENSION", str(DEFAULT_EMBEDDING_DIMENSION))
-        ),
+        "dimension": embedding_dimension_from_environment(source),
     }

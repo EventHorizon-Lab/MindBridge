@@ -1,8 +1,13 @@
 """Shared validation for framework-independent domain records."""
 
-from datetime import datetime
+from datetime import datetime, timezone
 
 from mindbridge.core.errors import DomainInvariantError
+
+
+def utc_now() -> datetime:
+    """The single aware-clock reading every default timestamp uses."""
+    return datetime.now(timezone.utc)
 
 
 def require_aware_datetime(value: datetime, field_name: str) -> None:

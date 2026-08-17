@@ -20,6 +20,7 @@ from mindbridge.benchmarks.egomem_reason import (
     EGOMEM_REASON_ADAPTER_VERSION,
     EgoMemReasonQuestion,
 )
+from mindbridge.benchmarks.prompts import EGOMEM_REASON_QUERY_PROMPT
 from mindbridge.benchmarks.runtime import (
     OPTION_LABELS,
     benchmark_tenant_id,
@@ -39,7 +40,6 @@ from mindbridge.contracts import (
     RememberRequest,
 )
 from mindbridge.core import MediaKind, MemoryType, SensorKind
-from mindbridge.prompts import EGOMEM_REASON_QUERY_PROMPT
 from mindbridge.sdk import MindBridge
 
 
@@ -454,14 +454,6 @@ def _clip_end_ms(clip: EgoLifePreparedClip) -> int:
     return _clip_start_ms(clip) + _clip_duration_ms(clip)
 
 
-def _clip_duration_ms(clip: EgoLifePreparedClip) -> int:
-    duration_ms = (
-        clip.media_object.duration_ms if clip.media_object is not None else clip.duration_ms
-    )
-    assert duration_ms is not None
-    return duration_ms
-
-
 def _caption_memories(caption: str) -> tuple[tuple[str, str], ...]:
     """Keep released visual and audio observations independently retrievable."""
     lines = tuple(line.strip() for line in caption.splitlines() if line.strip())
@@ -477,3 +469,11 @@ def _caption_memories(caption: str) -> tuple[tuple[str, str], ...]:
     if other:
         memories.append(("caption", "\n".join(other)))
     return tuple(memories)
+
+
+def _clip_duration_ms(clip: EgoLifePreparedClip) -> int:
+    duration_ms = (
+        clip.media_object.duration_ms if clip.media_object is not None else clip.duration_ms
+    )
+    assert duration_ms is not None
+    return duration_ms

@@ -6,12 +6,12 @@ from typing import cast
 import pytest
 
 from mindbridge import MindBridge
-from mindbridge.benchmarks import (
+from mindbridge.benchmarks.mm_lifelong import MMLifelongQuestion
+from mindbridge.benchmarks.mm_lifelong_runner import (
     MMLifelongPreparedSegment,
     MMLifelongPreparedTimeline,
-    MMLifelongQuestion,
-    reference_at_n,
     run_mm_lifelong,
+    unofficial_reference_at_n,
 )
 from mindbridge.contracts import MemoryView, RecallRequest, RecallResult, RememberRequest
 from mindbridge.core import MemoryState, MemoryType, VerificationStatus
@@ -39,7 +39,7 @@ class RecordingMemoryApi:
         )
 
 
-async def test_mm_lifelong_emits_official_answer_shape_and_ref_300() -> None:
+async def test_mm_lifelong_emits_official_answer_shape_and_local_diagnostic() -> None:
     api = RecordingMemoryApi()
 
     with pytest.raises(ValueError, match="between 1 and 100"):
@@ -63,7 +63,7 @@ async def test_mm_lifelong_emits_official_answer_shape_and_ref_300() -> None:
     assert api.recall_requests[0].tenant_id == "benchmark_mm_lifelong_day_test_run_01"
     assert results[0].pred.answer == "A meeting"
     assert results[0].pred.intervals == ((100.0, 200.0),)
-    assert results[0].ref_300 == 1.0
+    assert results[0].mindbridge_unofficial_ref_at_300 == 1.0
 
 
 async def test_mm_lifelong_rejects_timeline_that_cannot_cover_labels() -> None:
@@ -81,8 +81,8 @@ async def test_mm_lifelong_rejects_timeline_that_cannot_cover_labels() -> None:
     assert not api.remember_requests
 
 
-def test_mm_lifelong_reference_at_n_matches_official_bucket_jaccard() -> None:
-    assert reference_at_n(((0.0, 600.0),), ((300.0, 600.0),), 600.0) == 0.5
+def test_mm_lifelong_unofficial_reference_at_n_uses_bucket_jaccard() -> None:
+    assert unofficial_reference_at_n(((0.0, 600.0),), ((300.0, 600.0),), 600.0) == 0.5
 
 
 def _question(

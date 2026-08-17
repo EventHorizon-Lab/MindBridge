@@ -114,6 +114,8 @@ class RecordingClaimConsolidator:
 
 
 class RecordingTextEmbedder:
+    space_reference = EmbeddingSpaceReference(space_id="jina-v5", revision="space-v1")
+
     def __init__(self) -> None:
         self.documents: tuple[str, ...] = ()
 

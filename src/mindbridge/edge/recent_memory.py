@@ -9,7 +9,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from mindbridge.contracts import EvidenceView, MemoryResult
-from mindbridge.core import MemoryIntegrityError
+from mindbridge.core import MemoryIntegrityError, utc_now
+from mindbridge.edge._sqlite import connect as sqlite_connect
 
 _DEFAULT_RETENTION = timedelta(hours=24)
 
@@ -31,7 +32,7 @@ class SQLiteRecentMemory:
         database_path.parent.mkdir(parents=True, exist_ok=True)
         self._database_path = database_path
         self._retention = retention
-        self._clock = clock or _utc_now
+        self._clock = clock or utc_now
         with self._connect() as connection:
             initialize_recent_memory_tables(connection)
         os.chmod(database_path, 0o600)
@@ -144,11 +145,7 @@ class SQLiteRecentMemory:
         )
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self._database_path, timeout=30)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA journal_mode = WAL")
-        connection.execute("PRAGMA synchronous = FULL")
-        return connection
+        return sqlite_connect(self._database_path)
 
     def _now(self) -> datetime:
         now = self._clock()
@@ -224,7 +221,3 @@ def _with_local_evidence(
 
 def _utc_iso(value: datetime) -> str:
     return value.astimezone(timezone.utc).isoformat()
-
-
-def _utc_now() -> datetime:
-    return datetime.now(timezone.utc)

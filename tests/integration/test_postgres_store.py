@@ -169,6 +169,7 @@ async def test_migration_installs_complete_phase_zero_schema(database_url: str) 
         "claims",
         "embeddings",
         "events",
+        "evidence_clips",
         "evidence_spans",
         "media_objects",
         "memory_records",
@@ -184,6 +185,7 @@ async def test_migration_installs_complete_phase_zero_schema(database_url: str) 
         "event_evidence",
         "event_observations",
         "events",
+        "evidence_clips",
         "evidence_spans",
         "idempotency_keys",
         "jobs",
@@ -217,6 +219,7 @@ async def test_migration_installs_complete_phase_zero_schema(database_url: str) 
         12,
         13,
         14,
+        15,
     ]
 
 

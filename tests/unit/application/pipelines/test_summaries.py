@@ -72,7 +72,7 @@ async def test_summary_consolidator_inspects_native_evidence_and_preserves_revis
         MemoryId("memory_02"),
     )
     assert result.summaries[0].scope is SummaryScope.SESSION
-    assert result.model_reference.revision == "summary-serving-revision-01"
+    assert result.model_reference.revision == "deployment-revision"
     assert result.prompt_version == "consolidate_summaries_v3"
 
 

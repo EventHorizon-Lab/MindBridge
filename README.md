@@ -12,7 +12,8 @@ MindBridge is an Agentic Native Embodied Memory System: Memory-as-a-Service for 
 
 ## Development
 
-MindBridge supports Python 3.10 and 3.11. Python 3.10 is kept as the compatibility floor for Jetson deployments.
+MindBridge supports Python 3.10 and 3.11. Python 3.10 is kept as the compatibility floor because
+several edge platform images (JetPack, D-Robotics RDK, Rockchip RKNN) still ship it.
 
 Install the project and development tools with [uv](https://docs.astral.sh/uv/):
 
@@ -24,7 +25,7 @@ Deployment installs only the process it runs:
 
 ```bash
 uv sync                                      # Core types and Python SDK
-uv sync --extra edge                         # Jetson / robot host
+uv sync --extra edge                         # Any edge host: Jetson, RDK, RK, OpenVINO x86, dGPU
 uv sync --extra server                       # API, MCP, PostgreSQL jobs
 uv sync --extra server --extra cloud-models  # GPU memory Worker
 ```
@@ -51,6 +52,16 @@ docker run --rm -v "$PWD:/input:ro" -w /input lycheeverse/lychee:0.23.0 \
 `tests/benchmarks/golden_recall.json` is the deterministic retrieval gate. It exercises dense
 evidence recall, exact text recall, temporal exclusion, and unsupported-query abstention through
 the production kernel and PostgreSQL/pgvector path; the normal integration test command runs it.
+
+Without `MINDBRIDGE_TEST_DATABASE_URL` the whole integration suite — Golden Recall included —
+skips, so a green run may never have touched the production store. CI and any change that affects
+recall, consolidation, or deletion must therefore require it explicitly:
+
+```bash
+MINDBRIDGE_REQUIRE_INTEGRATION=1 uv run pytest -W error
+```
+
+With that variable set, a missing test database fails the run instead of skipping it.
 
 ## Local PostgreSQL
 
@@ -347,8 +358,6 @@ from the deployed processes:
     "config": {
       "model_id": "jinaai/jina-embeddings-v5-omni-small-retrieval",
       "model_revision": "12949877f0092093f366c6450340011320152a05",
-      "document_model_id": "jinaai/jina-embeddings-v5-text-small-retrieval",
-      "document_model_revision": "6856e76bb72982e58de0620458a4e8b3614da340",
       "space_id": "jina-v5",
       "space_revision": "deployment-space-v1",
       "dimension": 1024
@@ -378,8 +387,8 @@ from the deployed processes:
     "distribution": "mindbridge",
     "version": "0.1.0",
     "config": {
-      "model_id": "jinaai/jina-embeddings-v5-text-small-retrieval",
-      "model_revision": "6856e76bb72982e58de0620458a4e8b3614da340"
+      "model_id": "jinaai/jina-embeddings-v5-omni-small-retrieval",
+      "model_revision": "12949877f0092093f366c6450340011320152a05"
     }
   }
 }
@@ -818,10 +827,6 @@ export MINDBRIDGE_EMBEDDER_API_KEY=replace-with-a-runtime-secret
 export MINDBRIDGE_EMBEDDER_ENDPOINT=https://embeddings.example.com/v1
 export MINDBRIDGE_EMBEDDER_MODEL_ID=jinaai/jina-embeddings-v5-omni-small-retrieval
 export MINDBRIDGE_EMBEDDER_MODEL_REVISION=12949877f0092093f366c6450340011320152a05
-export MINDBRIDGE_EMBEDDER_DOCUMENT_API_KEY=replace-with-a-runtime-secret
-export MINDBRIDGE_EMBEDDER_DOCUMENT_ENDPOINT=https://text-embeddings.example.com/v1
-export MINDBRIDGE_EMBEDDER_DOCUMENT_MODEL_ID=jinaai/jina-embeddings-v5-text-small-retrieval
-export MINDBRIDGE_EMBEDDER_DOCUMENT_MODEL_REVISION=6856e76bb72982e58de0620458a4e8b3614da340
 export MINDBRIDGE_EMBEDDING_SPACE_ID=jina-v5
 export MINDBRIDGE_EMBEDDING_SPACE_REVISION=deployment-space-v1
 export MINDBRIDGE_MINIMUM_EMBEDDING_SIMILARITY=0.0
@@ -839,6 +844,15 @@ set its lowercase plugin name and provide the matching `MINDBRIDGE_GENERATOR_CON
 object is authoritative, so Anthropic, Gemini, local runtimes, and experimental adapters do not need
 OpenAI-specific variables. Enabling reranking requires both `MINDBRIDGE_RERANKER_PLUGIN` and its
 configuration object. See the [plugin author contract](docs/plugin-architecture.md).
+
+`MINDBRIDGE_EMBEDDING_SPACE_ID` and `MINDBRIDGE_EMBEDDING_SPACE_REVISION` name the search space the
+selected Embedder writes into and queries. Startup probes every tenant in
+`MINDBRIDGE_TENANT_API_KEYS_JSON` and refuses to serve when one holds vectors that space cannot
+reach, so pointing the server at a new embedding model without re-embedding fails loudly instead of
+returning empty recalls. The probe reports each stranded object type separately, so memory records
+the server wrote itself cannot vouch for evidence, events, and claims the Worker wrote in another
+space. Vectors in several spaces are accepted while a re-embedding is in progress. The stdio MCP
+process has no configured tenant list and therefore cannot run this probe.
 
 OpenTelemetry is activated only when a standard common or signal-specific OTLP endpoint is set;
 without one it remains a no-op. The API, MCP process, Worker, edge sync, consolidation, and lifecycle
@@ -906,37 +920,33 @@ shape `s3://<bucket>/tenants/<tenant_id>/<object>`.
 `GET /v1/jobs/{job_id}?tenant_id=<tenant_id>` until it reaches `succeeded` before issuing a recall
 that depends on its derived events.
 
-The API sends multimodal recall queries to an OpenAI-compatible Jina v5 Omni pooling endpoint and
-explicit memory text to a separate Jina v5 Text Small retrieval endpoint. Both are pinned to one
-declared 1024-dimensional compatibility space, while every vector still records the encoder that
-actually produced it. The API loads neither model. Self-hosted endpoints can use the upstream
-validated vLLM path:
+The API sends both multimodal recall queries and explicit memory text to one OpenAI-compatible
+Jina v5 Omni pooling endpoint, which encodes each side with its own retrieval prompt. Vectors carry
+the declared 1024-dimensional compatibility space plus the encoder that actually produced them. The
+API loads no model. A self-hosted endpoint can use the upstream validated vLLM path:
 
 ```bash
 vllm serve jinaai/jina-embeddings-v5-omni-small-retrieval \
   --revision 12949877f0092093f366c6450340011320152a05 \
   --trust-remote-code
-
-vllm serve jinaai/jina-embeddings-v5-text-small-retrieval \
-  --revision 6856e76bb72982e58de0620458a4e8b3614da340 \
-  --port 8001
 ```
 
 ## Run the memory Worker
 
 The Worker shares storage and Generator variables with the server. It inspects original AV once,
-writes evidence-grounded Event/Entity/Claim graph records atomically, encodes raw evidence with the
-default local Jina plugin, and batches Event/Claim text through the default OpenAI-compatible
-Embedder. Select both capability slots directly:
+writes evidence-grounded Event/Entity/Claim graph records atomically, and cuts one derived clip per
+grounded event span before encoding it with the default local Jina plugin, so each vector covers the
+event's own slice of the recording rather than the whole file. Event and Claim text is batched through the
+default OpenAI-compatible Embedder. Select both capability slots directly:
 
 ```bash
 export MINDBRIDGE_MEDIA_EMBEDDER_PLUGIN=jina
 export MINDBRIDGE_MEDIA_EMBEDDER_DEVICE=cuda
 export MINDBRIDGE_TEXT_EMBEDDER_PLUGIN=openai
 export MINDBRIDGE_TEXT_EMBEDDER_API_KEY=replace-with-a-runtime-secret
-export MINDBRIDGE_TEXT_EMBEDDER_ENDPOINT=https://text-embeddings.example.com/v1
-export MINDBRIDGE_TEXT_EMBEDDER_MODEL_ID=jinaai/jina-embeddings-v5-text-small-retrieval
-export MINDBRIDGE_TEXT_EMBEDDER_MODEL_REVISION=6856e76bb72982e58de0620458a4e8b3614da340
+export MINDBRIDGE_TEXT_EMBEDDER_ENDPOINT=https://embeddings.example.com/v1
+export MINDBRIDGE_TEXT_EMBEDDER_MODEL_ID=jinaai/jina-embeddings-v5-omni-small-retrieval
+export MINDBRIDGE_TEXT_EMBEDDER_MODEL_REVISION=12949877f0092093f366c6450340011320152a05
 
 uv run --extra server --extra cloud-models \
   celery -A mindbridge.celery_app:app worker --loglevel=INFO
@@ -946,6 +956,8 @@ One prefork child is the safe default because each child owns a full embedding m
 Worker process per assigned GPU instead of increasing concurrency inside a process.
 Non-default Worker adapters use `MINDBRIDGE_MEDIA_EMBEDDER_CONFIG_JSON` and
 `MINDBRIDGE_TEXT_EMBEDDER_CONFIG_JSON`; explicit objects replace the bundled fallback variables.
+Both slots must resolve to one embedding space. The Worker compares the two declared spaces before
+processing and fails the job instead of writing media and text vectors that cannot be compared.
 
 Run evidence-verified Episode, semantic Claim, and hierarchical Summary consolidation as one
 tenant-scoped scheduled job.
@@ -978,10 +990,25 @@ Schedule this command with the deployment's existing CronJob/systemd/Celery beat
 The strength coefficients and hot/cold thresholds are explicit CLI options so hardware cadence and
 retention policy can be calibrated without changing model weights or code.
 
-## Run the Jetson/robot edge path
+Derived evidence clips are uploaded before the transaction that registers them, so an interrupted
+attempt can leave an object no record references. Clip keys are content addressed, which keeps a
+retry from multiplying that object, and `--reclaim-orphan-clips` deletes whatever is already there.
+The flag also reads the object storage variables, so enable it only where those are configured:
 
-Capture and encode with the installed NVIDIA/GStreamer stack. When `splitmuxsink` or the robot
-capture supervisor closes a segment, hand that completed file to the small durable boundary:
+```bash
+uv run --extra server mindbridge-lifecycle --tenant-id tenant_01 --reclaim-orphan-clips
+```
+
+## Run the edge path
+
+The edge path is platform-neutral. It runs on NVIDIA Jetson, D-Robotics RDK, Rockchip RK,
+Intel/OpenVINO x86, generic ARM hosts, and on workstations where the "edge" is a 4090/5090/A100.
+Only the capture backend and inference runtime change; the Observation timeline, identity gates,
+and forget semantics are identical everywhere.
+
+Capture and encode with whatever GStreamer/FFmpeg stack the platform provides. When `splitmuxsink`
+or the robot capture supervisor closes a segment, hand that completed file to the small durable
+boundary:
 
 ```python
 from pathlib import Path
@@ -1035,8 +1062,8 @@ request = enqueue_captured_video(
 
 The handoff computes the SHA-256 and size, generates a deterministic tenant-scoped object key and
 idempotency key, then commits the request and absolute local path to a mode-`0600`, WAL-enabled
-SQLite Outbox. GStreamer/DeepStream remains responsible for camera decoding, encoding, frame rate,
-resolution, VAD/motion/scene gates, and hardware calibration.
+SQLite Outbox. The platform capture stack (GStreamer, optionally DeepStream) remains responsible for
+camera decoding, encoding, frame rate, resolution, VAD/motion/scene gates, and hardware calibration.
 
 The lower-level example accepts an embedding from an existing robot vision stack. Native hot paths
 do not need to reopen a completed media file: feed timestamped BGR frames to
@@ -1058,18 +1085,21 @@ faces = await asyncio.to_thread(
 partial = await streaming_asr.push_pcm16(pcm16_chunk, is_final=is_last_audio_chunk)
 ```
 
-The partial transcript is provisional. GStreamer/DeepStream still owns the bounded rolling fragment;
+The partial transcript is provisional. The platform capture stack still owns the bounded rolling fragment;
 when its Event gate closes, `FunASRSpeechPipeline` performs VAD, quality ASR, punctuation,
 diarization, and CAM++ centroid extraction in one upstream call.
 `recognize_identities_in_av_segment()` combines that result with InsightFace and the optional
 provider-neutral audiovisual active-speaker Pipeline, then returns only cloud-safe intervals ready for
-`enqueue_captured_video()`. `device=auto` selects CUDA when it is available, and explicit CUDA
-requests fail instead of silently using CPU.
+`enqueue_captured_video()`. `device=auto` selects an available accelerator, and an explicit
+accelerator request fails instead of silently using CPU.
 
-Install InsightFace/ONNX Runtime and FunASR/ModelScope from the JetPack-compatible device image; the
-generic `uv.lock` intentionally does not replace NVIDIA's platform Torch runtime. NeMo is not part of
-the current pipeline. MindBridge orchestrates upstream libraries but does not reimplement their
-networks.
+Install InsightFace/ONNX Runtime and FunASR/ModelScope from the device image that matches the target
+platform SDK — JetPack/CUDA, D-Robotics OpenExplorer, RKNN Toolkit, OpenVINO, or a plain CUDA/CPU
+host. The generic `uv.lock` intentionally pins no vendor accelerator wheel. ONNX is the default
+portable artifact; compiled engines (TensorRT, RKNN, OpenVINO IR, BPU `.bin`) are built and cached
+per platform and are never reused across device images. NeMo is not part of the current pipeline.
+MindBridge orchestrates upstream libraries but does not reimplement their networks, and adds no
+cross-platform abstraction layer of its own.
 
 `device_identity_key` is exactly 32 bytes loaded from
 the device TPM or secret manager. The local store normalizes and AES-256-GCM encrypts every bounded

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
 import json
 import os
 from collections.abc import Mapping
@@ -47,15 +46,14 @@ from mindbridge.infrastructure.task_queue import (
     create_task_queue,
 )
 from mindbridge.models.defaults import (
+    DEFAULT_EMBEDDER_MODEL_ID,
+    DEFAULT_EMBEDDER_REVISION,
     DEFAULT_EMBEDDING_DIMENSION,
     DEFAULT_EMBEDDING_SPACE,
     DEFAULT_GENERATOR_MODEL_ID,
-    DEFAULT_MEDIA_EMBEDDER_MODEL_ID,
-    DEFAULT_MEDIA_EMBEDDER_REVISION,
-    DEFAULT_TEXT_EMBEDDER_MODEL_ID,
-    DEFAULT_TEXT_EMBEDDER_REVISION,
+    embedding_dimension_from_environment,
 )
-from mindbridge.models.plugins import load_embedder, load_generator
+from mindbridge.models.plugins import close_model, load_embedder, load_generator
 from mindbridge.telemetry import configure_telemetry
 
 _MODEL_REQUEST_TIMEOUT_SECONDS = 780.0
@@ -105,6 +103,7 @@ class WorkerSettings:
     generator_plugin: str = "openai"
     media_embedder_plugin: str = "jina"
     text_embedder_plugin: str = "openai"
+    embedding_dimension: int = DEFAULT_EMBEDDING_DIMENSION
 
     def __post_init__(self) -> None:
         for name, value in (
@@ -168,6 +167,7 @@ class WorkerSettings:
                 "MINDBRIDGE_TEXT_EMBEDDER_CONFIG_JSON",
                 (lambda: _text_embedder_config(source)) if text_plugin == "openai" else None,
             ),
+            embedding_dimension=embedding_dimension_from_environment(source),
         )
 
 
@@ -198,7 +198,7 @@ class _WorkerRuntime:
 
     def close(self) -> None:
         try:
-            self.loop.run_until_complete(_close_model(self.media_embedder))
+            self.loop.run_until_complete(close_model(self.media_embedder))
         finally:
             self.loop.close()
 
@@ -278,7 +278,9 @@ async def _process_observation_once(
     observation_id: ObservationId,
     job_id: JobId,
 ) -> JobState:
-    store = PostgresMemoryStore(settings.database_url)
+    store = PostgresMemoryStore(
+        settings.database_url, embedding_dimension=settings.embedding_dimension
+    )
     media_access = S3MediaAccess(
         settings.object_storage_bucket,
         endpoint_url=settings.object_storage_endpoint_url,
@@ -286,9 +288,9 @@ async def _process_observation_once(
     )
     async with AsyncExitStack() as resources:
         generator = load_generator(settings.generator_plugin, settings.generator_config)
-        resources.push_async_callback(_close_model, generator)
+        resources.push_async_callback(close_model, generator)
         text_embedder = load_embedder(settings.text_embedder_plugin, settings.text_embedder_config)
-        resources.push_async_callback(_close_model, text_embedder)
+        resources.push_async_callback(close_model, text_embedder)
         await store.open()
         resources.push_async_callback(store.close)
         job = await ProcessObservation(
@@ -346,15 +348,6 @@ def _close_worker_runtime(**_kwargs: object) -> None:
     _dispose_worker_runtime()
 
 
-async def _close_model(model: object) -> None:
-    close = getattr(model, "close", None)
-    if close is None:
-        return
-    result = close()
-    if inspect.isawaitable(result):
-        await result
-
-
 def _generator_config(source: Mapping[str, str]) -> Mapping[str, object]:
     return {
         "api_key": require_environment_value(source, "MINDBRIDGE_GENERATOR_API_KEY"),
@@ -367,19 +360,15 @@ def _generator_config(source: Mapping[str, str]) -> Mapping[str, object]:
 
 def _media_embedder_config(source: Mapping[str, str]) -> Mapping[str, object]:
     config: dict[str, object] = {
-        "model_id": source.get(
-            "MINDBRIDGE_MEDIA_EMBEDDER_MODEL_ID", DEFAULT_MEDIA_EMBEDDER_MODEL_ID
-        ),
+        "model_id": source.get("MINDBRIDGE_MEDIA_EMBEDDER_MODEL_ID", DEFAULT_EMBEDDER_MODEL_ID),
         "revision": source.get(
-            "MINDBRIDGE_MEDIA_EMBEDDER_MODEL_REVISION", DEFAULT_MEDIA_EMBEDDER_REVISION
+            "MINDBRIDGE_MEDIA_EMBEDDER_MODEL_REVISION", DEFAULT_EMBEDDER_REVISION
         ),
         "space_id": source.get("MINDBRIDGE_EMBEDDING_SPACE_ID", DEFAULT_EMBEDDING_SPACE.space_id),
         "space_revision": source.get(
             "MINDBRIDGE_EMBEDDING_SPACE_REVISION", DEFAULT_EMBEDDING_SPACE.revision
         ),
-        "dimension": int(
-            source.get("MINDBRIDGE_EMBEDDING_DIMENSION", str(DEFAULT_EMBEDDING_DIMENSION))
-        ),
+        "dimension": embedding_dimension_from_environment(source),
     }
     device = optional_environment_value(source, "MINDBRIDGE_MEDIA_EMBEDDER_DEVICE")
     if device is not None:
@@ -388,25 +377,17 @@ def _media_embedder_config(source: Mapping[str, str]) -> Mapping[str, object]:
 
 
 def _text_embedder_config(source: Mapping[str, str]) -> Mapping[str, object]:
-    api_key = require_environment_value(source, "MINDBRIDGE_TEXT_EMBEDDER_API_KEY")
-    endpoint = require_environment_value(source, "MINDBRIDGE_TEXT_EMBEDDER_ENDPOINT")
-    model_id = source.get("MINDBRIDGE_TEXT_EMBEDDER_MODEL_ID", DEFAULT_TEXT_EMBEDDER_MODEL_ID)
-    revision = source.get("MINDBRIDGE_TEXT_EMBEDDER_MODEL_REVISION", DEFAULT_TEXT_EMBEDDER_REVISION)
     return {
-        "api_key": api_key,
-        "endpoint": endpoint,
-        "model_id": model_id,
-        "model_revision": revision,
-        "document_api_key": api_key,
-        "document_endpoint": endpoint,
-        "document_model_id": model_id,
-        "document_model_revision": revision,
+        "api_key": require_environment_value(source, "MINDBRIDGE_TEXT_EMBEDDER_API_KEY"),
+        "endpoint": require_environment_value(source, "MINDBRIDGE_TEXT_EMBEDDER_ENDPOINT"),
+        "model_id": source.get("MINDBRIDGE_TEXT_EMBEDDER_MODEL_ID", DEFAULT_EMBEDDER_MODEL_ID),
+        "model_revision": source.get(
+            "MINDBRIDGE_TEXT_EMBEDDER_MODEL_REVISION", DEFAULT_EMBEDDER_REVISION
+        ),
         "space_id": source.get("MINDBRIDGE_EMBEDDING_SPACE_ID", DEFAULT_EMBEDDING_SPACE.space_id),
         "space_revision": source.get(
             "MINDBRIDGE_EMBEDDING_SPACE_REVISION", DEFAULT_EMBEDDING_SPACE.revision
         ),
-        "dimension": int(
-            source.get("MINDBRIDGE_EMBEDDING_DIMENSION", str(DEFAULT_EMBEDDING_DIMENSION))
-        ),
+        "dimension": embedding_dimension_from_environment(source),
         "request_timeout_seconds": _MODEL_REQUEST_TIMEOUT_SECONDS,
     }

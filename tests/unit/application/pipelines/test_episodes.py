@@ -63,7 +63,7 @@ async def test_episode_consolidator_inspects_native_evidence_and_preserves_revis
         await consolidator.close()
 
     assert result.episodes[0].event_ids == (EventId("event_01"), EventId("event_02"))
-    assert result.model_reference.revision == "episode-serving-revision-01"
+    assert result.model_reference.revision == "deployment-revision"
     assert result.prompt_version == "consolidate_episodes_v2"
 
 

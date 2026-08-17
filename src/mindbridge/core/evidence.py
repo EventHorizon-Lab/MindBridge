@@ -74,6 +74,7 @@ class MediaObject:
     size_bytes: int
     created_at: datetime
     duration_ms: int | None = None
+    derived_from_media_object_id: MediaObjectId | None = None
 
     def __post_init__(self) -> None:
         require_non_empty(self.media_object_id, "media_object_id")
@@ -86,6 +87,10 @@ class MediaObject:
             raise DomainInvariantError("size_bytes must fit a non-negative signed 64-bit integer")
         if self.duration_ms is not None and not 0 <= self.duration_ms <= _SIGNED_INT64_MAX:
             raise DomainInvariantError("duration_ms must fit a non-negative signed 64-bit integer")
+        if self.derived_from_media_object_id is not None:
+            require_non_empty(self.derived_from_media_object_id, "derived_from_media_object_id")
+            if self.derived_from_media_object_id == self.media_object_id:
+                raise DomainInvariantError("media object cannot derive from itself")
 
 
 @dataclass(frozen=True, slots=True)
@@ -193,6 +198,36 @@ class EvidenceSpan:
     def duration_ms(self) -> int:
         """Return the evidence window duration in milliseconds."""
         return self.end_ms - self.start_ms
+
+
+@dataclass(frozen=True, slots=True)
+class EvidenceClip:
+    """One encoder-sized window of an evidence span, stored as derived media.
+
+    A span longer than the encoder's window becomes several ordered clips, so
+    the mapping is one-to-many and cannot be recomputed from the evidence id
+    alone once identical clip content deduplicates onto one media object.
+    """
+
+    tenant_id: TenantId
+    evidence_id: EvidenceId
+    ordinal: int
+    media_object_id: MediaObjectId
+    start_ms: int
+    end_ms: int
+    created_at: datetime
+
+    def __post_init__(self) -> None:
+        require_non_empty(self.tenant_id, "tenant_id")
+        require_non_empty(self.evidence_id, "evidence_id")
+        require_non_empty(self.media_object_id, "media_object_id")
+        require_aware_datetime(self.created_at, "created_at")
+        if self.ordinal < 0:
+            raise DomainInvariantError("evidence clip ordinal must be non-negative")
+        if not 0 <= self.start_ms <= _SIGNED_INT64_MAX:
+            raise DomainInvariantError("start_ms must fit a non-negative signed 64-bit integer")
+        if self.end_ms < self.start_ms or self.end_ms > _SIGNED_INT64_MAX:
+            raise DomainInvariantError("end_ms must not precede start_ms")
 
 
 def _is_sha256(value: str) -> bool:

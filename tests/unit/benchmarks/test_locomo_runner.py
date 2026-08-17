@@ -6,13 +6,8 @@ from typing import cast
 import pytest
 
 from mindbridge import MindBridge
-from mindbridge.benchmarks import (
-    LOCOMO_ABSTENTION,
-    LoCoMoConversation,
-    LoCoMoQuestion,
-    LoCoMoTurn,
-    run_locomo_conversation,
-)
+from mindbridge.benchmarks.locomo import LoCoMoConversation, LoCoMoQuestion, LoCoMoTurn
+from mindbridge.benchmarks.locomo_runner import LOCOMO_ABSTENTION, run_locomo_conversation
 from mindbridge.contracts import (
     MemoryView,
     RecallRequest,
@@ -29,6 +24,7 @@ class RecordingMemoryApi:
         self.remember_requests: list[RememberRequest] = []
         self.recall_requests: list[RecallRequest] = []
         self.memories: list[MemoryView] = []
+        self.answer: str | None = None
 
     async def remember(self, request: RememberRequest) -> MemoryView:
         self.remember_requests.append(request)
@@ -49,8 +45,8 @@ class RecordingMemoryApi:
     async def recall(self, request: RecallRequest) -> RecallResult:
         self.recall_requests.append(request)
         return RecallResult(
-            answer=None,
-            confidence=0.0,
+            answer=self.answer,
+            confidence=0.0 if self.answer is None else 0.9,
             memories=tuple(self.memories[:1]),
             evidence=(),
             trace_id="trace_locomo",
@@ -93,8 +89,20 @@ async def test_locomo_uses_only_source_turns_and_questions_in_api_requests() -> 
     assert "SECRET REFERENCE ANSWER" not in api.recall_requests[0].model_dump_json()
     assert result.qa[0].answer == "SECRET REFERENCE ANSWER"
     assert result.qa[0].mindbridge_prediction == LOCOMO_ABSTENTION
+    assert result.qa[0].mindbridge_abstained is True
     assert result.qa[0].mindbridge_prediction_context == ("D1:1",)
     assert result.qa[0].mindbridge_trace_id == "trace_locomo"
+
+
+async def test_locomo_marks_an_answered_question_as_not_abstained() -> None:
+    """The adversarial reference string is also a valid answer, so scoring needs the flag."""
+    api = RecordingMemoryApi()
+    api.answer = "A new course."
+
+    result = await run_locomo_conversation(cast(MindBridge, api), _conversation(), run_id="run_01")
+
+    assert result.qa[0].mindbridge_prediction == "A new course."
+    assert result.qa[0].mindbridge_abstained is False
 
 
 async def test_locomo_rejects_unbounded_or_empty_request_pool() -> None:
