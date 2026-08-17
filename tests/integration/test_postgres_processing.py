@@ -93,6 +93,7 @@ from mindbridge.core import (
     derive_stable_id,
 )
 from mindbridge.infrastructure.postgres import PostgresMemoryStore
+from mindbridge.media.clipping import ClipRequest, MediaClip, audio_windows
 from mindbridge.models import (
     Embedding,
     EmbedRequest,
@@ -186,8 +187,8 @@ class FixedEmbedder:
 
 class FixedTextEmbedder:
     model_reference = ModelReference(
-        model_id="jinaai/jina-embeddings-v5-text-small-retrieval",
-        revision="6856e76bb72982e58de0620458a4e8b3614da340",
+        model_id="jinaai/jina-embeddings-v5-omni-small-retrieval",
+        revision="12949877f0092093f366c6450340011320152a05",
     )
     space_reference = EmbeddingSpaceReference(space_id="jina-v5", revision="space-v1")
 
@@ -317,16 +318,40 @@ class CoordinatedSummaryConsolidator(RecordingSummaryConsolidator):
 
 
 class DeterministicSigner:
-    """Keep processing integration independent from an S3 service."""
+    """Object storage double that really round-trips derived clip bytes."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.uploaded: dict[str, bytes] = {}
 
     async def create_presigned_download(
         self,
         media_object: MediaObject,
     ) -> PresignedMediaDownload:
+        self.calls += 1
         return PresignedMediaDownload(
-            download_url=f"https://objects.example.test/{media_object.media_object_id}.mp4",
+            download_url=f"https://objects.example.test/clip.mp4?signature={self.calls}",
             expires_at=NOW + timedelta(minutes=5),
         )
+
+    async def read_media(self, media_object: MediaObject) -> bytes:
+        return self.uploaded.get(media_object.uri, b"source-media-bytes")
+
+    async def upload_media(self, media_object: MediaObject, content: bytes) -> None:
+        self.uploaded[media_object.uri] = content
+
+
+def stub_cut(source: bytes, request: ClipRequest) -> tuple[MediaClip, ...]:
+    """Cut deterministically without decoding, so the DB check stays the subject."""
+    return tuple(
+        MediaClip(
+            content=b"clip:%d-%d:" % (start, end) + source,
+            suffix=".mp4",
+            start_ms=start,
+            end_ms=end,
+        )
+        for start, end in audio_windows(request.start_ms, request.end_ms)
+    )
 
 
 async def test_processing_commits_provenance_once(
@@ -346,6 +371,7 @@ async def test_processing_commits_provenance_once(
         embedder,
         text_embedder,
         media_url_signer=DeterministicSigner(),
+        clip_cutter=stub_cut,
     )
 
     first = await processor.run(tenant_id, observation_id, job_id)
@@ -363,7 +389,8 @@ async def test_processing_commits_provenance_once(
     assert repeated_observation.created is False
     assert repeated_observation.processing_job_id == job_id
     assert perceiver.calls == 1
-    assert embedder.documents == ("https://objects.example.test/media_01.mp4",)
+    # One clip per grounded event span, signed after every upload completes.
+    assert embedder.documents == ("https://objects.example.test/clip.mp4?signature=3",)
     assert text_embedder.documents == (
         "A person places a red tool beside a blue toolbox.",
         "The red tool is beside the blue toolbox.",
@@ -458,10 +485,10 @@ async def test_processing_commits_provenance_once(
         "A person places a red tool beside a blue toolbox.",
         "The red tool is beside the blue toolbox.",
     }
-    assert {memory.summary for memory in source_dense_candidates} == {
-        "A person places a red tool beside a blue toolbox.",
-        "The red tool is beside the blue toolbox.",
-    }
+    # Vectors are keyed to the grounded event span now, so the whole-file source
+    # span carries no embedding and no longer expands to the memories under it.
+    # The event-span lookup above is the path recall actually takes.
+    assert source_dense_candidates == ()
     assert {memory.summary for memory in graph_candidates} == {
         "A person places a red tool beside a blue toolbox.",
         "The red tool is beside the blue toolbox.",
@@ -487,9 +514,10 @@ async def test_processing_rolls_back_derived_records_before_retry(
         FixedEmbedder(dimension=2),
         FixedTextEmbedder(),
         media_url_signer=DeterministicSigner(),
+        clip_cutter=stub_cut,
     )
 
-    with pytest.raises(DomainInvariantError, match="cloud embedding dimension"):
+    with pytest.raises(DomainInvariantError, match="embedding dimension must be 1024"):
         await failing.run(tenant_id, observation_id, job_id)
 
     assert await _derived_counts(database_url, tenant_id) == (0,) * 11
@@ -505,6 +533,7 @@ async def test_processing_rolls_back_derived_records_before_retry(
         FixedEmbedder(),
         FixedTextEmbedder(),
         media_url_signer=DeterministicSigner(),
+        clip_cutter=stub_cut,
     ).run(tenant_id, observation_id, job_id)
 
     assert succeeded.state is JobState.SUCCEEDED
@@ -549,6 +578,7 @@ async def test_episode_candidates_expand_a_stable_seed_by_event_vector(
             FixedEmbedder(),
             FixedTextEmbedder(),
             media_url_signer=DeterministicSigner(),
+            clip_cutter=stub_cut,
         ).run(tenant_id, observation_id, job_id)
 
     page = await store.list_episode_candidates(
@@ -594,6 +624,7 @@ async def test_claim_candidates_expand_a_stable_seed_by_aligned_vector(
             FixedEmbedder(),
             FixedTextEmbedder(),
             media_url_signer=DeterministicSigner(),
+            clip_cutter=stub_cut,
         ).run(tenant_id, observation_id, job_id)
 
     page = await store.list_claim_candidates(
@@ -640,6 +671,7 @@ async def test_summary_candidates_expand_a_stable_seed_across_memory_representat
             FixedEmbedder(),
             FixedTextEmbedder(),
             media_url_signer=DeterministicSigner(),
+            clip_cutter=stub_cut,
         ).run(tenant_id, observation_id, job_id)
 
     page = await store.list_summary_candidates(
@@ -744,6 +776,7 @@ async def test_episode_consolidation_is_atomic_recallable_and_retry_safe(
             FixedEmbedder(),
             FixedTextEmbedder(),
             media_url_signer=DeterministicSigner(),
+            clip_cutter=stub_cut,
         ).run(tenant_id, observation_id, job_id)
 
     request = EpisodeCandidateRequest(
@@ -770,7 +803,7 @@ async def test_episode_consolidation_is_atomic_recallable_and_retry_safe(
         derive_stable_id("memory", event.event_id) for event in candidate_events
     }
     consolidator = RecordingEpisodeConsolidator()
-    with pytest.raises(DomainInvariantError, match="cloud embedding dimension"):
+    with pytest.raises(DomainInvariantError, match="embedding dimension must be 1024"):
         await ConsolidateEpisodes(
             store,
             consolidator,
@@ -872,6 +905,7 @@ async def test_claim_consolidation_is_atomic_versioned_and_forget_safe(
             FixedEmbedder(),
             FixedTextEmbedder(),
             media_url_signer=DeterministicSigner(),
+            clip_cutter=stub_cut,
         ).run(tenant_id, observation_id, job_id)
 
     request = ClaimCandidateRequest(
@@ -885,7 +919,7 @@ async def test_claim_consolidation_is_atomic_versioned_and_forget_safe(
     supporting_claim_id = ordered[0].claim.claim_id
     source_claim_id = ordered[3].claim.claim_id
     target_claim_id = ordered[2].claim.claim_id
-    with pytest.raises(DomainInvariantError, match="cloud embedding dimension"):
+    with pytest.raises(DomainInvariantError, match="embedding dimension must be 1024"):
         await ConsolidateClaims(
             store,
             RecordingClaimConsolidator(),
@@ -1027,6 +1061,7 @@ async def test_summary_consolidation_is_atomic_recallable_and_retry_safe(
             FixedEmbedder(),
             FixedTextEmbedder(),
             media_url_signer=DeterministicSigner(),
+            clip_cutter=stub_cut,
         ).run(tenant_id, observation_id, job_id)
 
     request = SummaryCandidateRequest(
@@ -1035,7 +1070,7 @@ async def test_summary_consolidation_is_atomic_recallable_and_retry_safe(
         maximum_gap_seconds=10,
         minimum_similarity=0.99,
     )
-    with pytest.raises(DomainInvariantError, match="cloud embedding dimension"):
+    with pytest.raises(DomainInvariantError, match="embedding dimension must be 1024"):
         await ConsolidateSummaries(
             store,
             RecordingSummaryConsolidator(),
@@ -1671,3 +1706,77 @@ async def _relation_counts(
         )
         rows = tuple([cast(tuple[str, int], row) async for row in cursor])
     return rows
+
+
+class NestedEventPerceiver:
+    """Return one event whose time range fully contains another event's."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def perceive_events(
+        self,
+        observation: Observation,
+        evidence: tuple[ResolvedEvidence, ...],
+    ) -> EventPerception:
+        self.calls += 1
+        evidence_id = evidence[0].evidence_span.evidence_id
+        return EventPerception(
+            events=(
+                PerceivedEvent(
+                    start_ms=0,
+                    end_ms=4_000,
+                    description="Someone walks the whole length of the workshop.",
+                    salience=0.7,
+                    evidence_ids=(evidence_id,),
+                    entities=(),
+                    claims=(),
+                ),
+                PerceivedEvent(
+                    start_ms=1_000,
+                    end_ms=2_000,
+                    description="A red tool is dropped on the floor.",
+                    salience=0.9,
+                    evidence_ids=(evidence_id,),
+                    entities=(),
+                    claims=(),
+                ),
+            ),
+            model_reference=MODEL,
+            prompt_version="perceive_events_v4",
+        )
+
+
+async def test_evidence_recall_does_not_leak_between_nested_event_spans(
+    store: PostgresMemoryStore,
+) -> None:
+    """A hit on the outer event must not drag in the event nested inside it."""
+    tenant_id, observation_id, job_id = await _write_source_observation(
+        store, "tenant_nested_events", include_identity=False
+    )
+    processor = ProcessObservation(
+        store,
+        NestedEventPerceiver(),
+        FixedEmbedder(),
+        FixedTextEmbedder(),
+        media_url_signer=DeterministicSigner(),
+        clip_cutter=stub_cut,
+    )
+
+    await processor.run(tenant_id, observation_id, job_id)
+
+    stored = (await store.read_observation_batch(tenant_id, observation_id)).evidence_spans
+    outer = next(span for span in stored if (span.start_ms, span.end_ms) == (0, 4_000))
+    inner = next(span for span in stored if (span.start_ms, span.end_ms) == (1_000, 2_000))
+    request = RecallRequest(
+        tenant_id=tenant_id,
+        query=RecallQuery(text="words absent from either summary"),
+    )
+
+    outer_hits = await store.search_memories_by_evidence(request, (outer.evidence_id,), limit=20)
+    inner_hits = await store.search_memories_by_evidence(request, (inner.evidence_id,), limit=20)
+
+    assert {memory.summary for memory in outer_hits} == {
+        "Someone walks the whole length of the workshop."
+    }
+    assert {memory.summary for memory in inner_hits} == {"A red tool is dropped on the floor."}

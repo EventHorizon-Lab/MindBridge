@@ -18,9 +18,6 @@ def test_settings_use_deployable_defaults_and_redact_credentials() -> None:
     assert settings.embedder_config["model_id"] == (
         "jinaai/jina-embeddings-v5-omni-small-retrieval"
     )
-    assert settings.embedder_config["document_model_id"] == (
-        "jinaai/jina-embeddings-v5-text-small-retrieval"
-    )
     assert settings.minimum_embedding_similarity == 0.0
     assert "secret" not in repr(settings)
 
@@ -97,7 +94,9 @@ async def test_runtime_closes_a_falsey_reranker(monkeypatch: pytest.MonkeyPatch)
     monkeypatch.setattr(runtime_module, "load_generator", lambda *_arguments: generator)
     monkeypatch.setattr(runtime_module, "load_embedder", lambda *_arguments: embedder)
     monkeypatch.setattr(runtime_module, "load_reranker", lambda *_arguments: reranker)
-    monkeypatch.setattr(runtime_module, "PostgresMemoryStore", lambda *_arguments: Store())
+    monkeypatch.setattr(
+        runtime_module, "PostgresMemoryStore", lambda *_arguments, **_options: Store()
+    )
     monkeypatch.setattr(runtime_module, "S3MediaAccess", lambda *_arguments, **_options: object())
     monkeypatch.setattr(runtime_module, "create_task_queue", lambda *_arguments: object())
     monkeypatch.setattr(
@@ -137,7 +136,5 @@ def _environment() -> dict[str, str]:
         "MINDBRIDGE_GENERATOR_REASONING_EFFORT": "low",
         "MINDBRIDGE_EMBEDDER_API_KEY": "query-secret",
         "MINDBRIDGE_EMBEDDER_ENDPOINT": "https://query.example.test/v1",
-        "MINDBRIDGE_EMBEDDER_DOCUMENT_API_KEY": "document-secret",
-        "MINDBRIDGE_EMBEDDER_DOCUMENT_ENDPOINT": "https://document.example.test/v1",
         "MINDBRIDGE_TENANT_API_KEYS_JSON": ('{"tenant_01":["tenant-api-key-000000000000000000"]}'),
     }

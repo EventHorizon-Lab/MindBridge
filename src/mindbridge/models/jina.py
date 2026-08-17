@@ -16,6 +16,11 @@ from mindbridge.application.capabilities import (
     ModelInput,
     TextPart,
 )
+from mindbridge.configuration import (
+    config_integer,
+    config_optional_string,
+    config_string,
+)
 from mindbridge.core import (
     EmbeddingSpaceReference,
     ModelOutputError,
@@ -24,10 +29,11 @@ from mindbridge.core import (
 )
 from mindbridge.models.compute import select_torch_device
 from mindbridge.models.defaults import (
+    DEFAULT_EMBEDDER_MODEL_ID,
+    DEFAULT_EMBEDDER_REVISION,
     DEFAULT_EMBEDDING_DIMENSION,
     DEFAULT_EMBEDDING_SPACE,
-    DEFAULT_MEDIA_EMBEDDER_MODEL_ID,
-    DEFAULT_MEDIA_EMBEDDER_REVISION,
+    require_matryoshka_dimension,
 )
 from mindbridge.telemetry import set_current_span_attributes, trace_operation
 
@@ -96,7 +102,7 @@ class JinaEmbedder:
         cls,
         *,
         revision: str,
-        model_id: str = DEFAULT_MEDIA_EMBEDDER_MODEL_ID,
+        model_id: str = DEFAULT_EMBEDDER_MODEL_ID,
         device: str | None = None,
         space_reference: EmbeddingSpaceReference = DEFAULT_EMBEDDING_SPACE,
         dimension: int = DEFAULT_EMBEDDING_DIMENSION,
@@ -199,19 +205,21 @@ def create_embedder(config: Mapping[str, object]) -> JinaEmbedder:
     if unknown:
         raise ValueError(f"unknown plugin configuration: {', '.join(sorted(unknown))}")
     return JinaEmbedder.load(
-        model_id=_string(config, "model_id", DEFAULT_MEDIA_EMBEDDER_MODEL_ID),
-        revision=_string(config, "revision", DEFAULT_MEDIA_EMBEDDER_REVISION),
-        device=_optional_string(config, "device"),
+        model_id=config_string(config, "model_id", DEFAULT_EMBEDDER_MODEL_ID),
+        revision=config_string(config, "revision", DEFAULT_EMBEDDER_REVISION),
+        device=config_optional_string(config, "device"),
         space_reference=EmbeddingSpaceReference(
-            space_id=_string(config, "space_id", DEFAULT_EMBEDDING_SPACE.space_id),
-            revision=_string(
+            space_id=config_string(config, "space_id", DEFAULT_EMBEDDING_SPACE.space_id),
+            revision=config_string(
                 config,
                 "space_revision",
                 DEFAULT_EMBEDDING_SPACE.revision,
             ),
         ),
-        dimension=_integer(config, "dimension", DEFAULT_EMBEDDING_DIMENSION),
-        max_concurrency=_integer(config, "max_concurrency", 1),
+        dimension=require_matryoshka_dimension(
+            config_integer(config, "dimension", DEFAULT_EMBEDDING_DIMENSION)
+        ),
+        max_concurrency=config_integer(config, "max_concurrency", 1),
     )
 
 
@@ -222,33 +230,10 @@ def _jina_input(input_value: ModelInput) -> str | tuple[str, ...]:
     return values[0] if len(values) == 1 else values
 
 
-def _string(config: Mapping[str, object], key: str, default: str) -> str:
-    value = config.get(key, default)
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError(f"{key} must be non-empty text")
-    return value
-
-
-def _optional_string(config: Mapping[str, object], key: str) -> str | None:
-    value = config.get(key)
-    if value is None:
-        return None
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError(f"{key} must be non-empty text when provided")
-    return value
-
-
-def _integer(config: Mapping[str, object], key: str, default: int) -> int:
-    value = config.get(key, default)
-    if type(value) is not int:
-        raise ValueError(f"{key} must be an integer")
-    return value
-
-
 def validate_jina_embedding(values: tuple[float, ...], dimension: int) -> None:
     """Reject malformed vectors before they cross into a versioned index."""
     if len(values) != dimension or not all(math.isfinite(value) for value in values):
         raise ModelOutputError("embedding vector has invalid dimension or values")
-    norm = math.sqrt(sum(value * value for value in values))
+    norm = math.hypot(*values)
     if not math.isclose(norm, 1.0, rel_tol=1e-4, abs_tol=1e-6):
         raise ModelOutputError("embedding vector is not L2-normalized")

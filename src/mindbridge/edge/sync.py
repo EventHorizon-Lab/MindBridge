@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import TYPE_CHECKING
 
 import boto3
@@ -19,7 +19,7 @@ from mindbridge.contracts import (
     ObservationReceipt,
     ObserveRequest,
 )
-from mindbridge.core import JobState, MemoryIntegrityError, ObjectStorageError
+from mindbridge.core import JobState, MemoryIntegrityError, ObjectStorageError, utc_now
 from mindbridge.edge.deletion_inbox import SQLiteDeletionInbox
 from mindbridge.edge.outbox import EdgeMediaFile, SQLiteObservationOutbox
 from mindbridge.edge.recent_memory import SQLiteRecentMemory
@@ -124,7 +124,7 @@ class EdgeObservationSynchronizer:
         self._memory = memory
         self._upload_media = upload_media
         self._recent_memory = recent_memory
-        self._clock = clock or _utc_now
+        self._clock = clock or utc_now
 
     @trace_operation("mindbridge.edge.sync_observation")
     async def sync_next(self) -> ObservationReceipt | None:
@@ -296,7 +296,3 @@ def _network_error_code(error: Exception) -> str:
     if isinstance(error, ObjectStorageError):
         return "object_storage_error"
     return type(error).__name__[:255]
-
-
-def _utc_now() -> datetime:
-    return datetime.now(timezone.utc)

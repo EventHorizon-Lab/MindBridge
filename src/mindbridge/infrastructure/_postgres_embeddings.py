@@ -19,9 +19,24 @@ from mindbridge.infrastructure._postgres_types import (
     tenant_connection,
 )
 
-CLOUD_EMBEDDING_DIMENSION = 1_024
 # Permit ~1e-4 normalized GPU jitter without masking model or input changes.
 _RETRY_MINIMUM_COSINE_SIMILARITY = 0.999_999
+
+
+async def read_embedding_column_dimension(pool: DatabasePool) -> int:
+    """Return the width the pgvector column actually enforces."""
+    async with pool.connection() as connection:
+        cursor = await connection.execute(
+            """
+            SELECT format_type(atttypid, atttypmod)
+            FROM pg_attribute
+            WHERE attrelid = 'embeddings'::regclass AND attname = 'embedding'
+            """
+        )
+        row = await cursor.fetchone()
+    if row is None or not str(row[0]).startswith("vector("):
+        raise MemoryIntegrityError("embeddings.embedding is not a dimensioned pgvector column")
+    return int(str(row[0]).removeprefix("vector(").removesuffix(")"))
 
 
 async def has_embedding(
@@ -49,7 +64,6 @@ async def write_embedding_on_connection(
     embedding: EmbeddingRecord,
 ) -> bool:
     """Write a vector inside a caller-owned transaction."""
-    _require_cloud_dimension(embedding.dimension)
     vector = Vector(list(embedding.values))
     cursor = await connection.execute(
         """
@@ -120,9 +134,14 @@ async def write_embedding_on_connection(
 async def search_embeddings(
     pool: DatabasePool,
     search: EmbeddingSearch,
+    *,
+    expected_dimension: int,
 ) -> tuple[EmbeddingMatch, ...]:
     """Return nearest objects only from the requested compatible space and task."""
-    _require_cloud_dimension(len(search.values))
+    if len(search.values) != expected_dimension:
+        raise DomainInvariantError(
+            f"query vector must have {expected_dimension} values to match the index"
+        )
     vector = Vector(list(search.values))
     async with tenant_connection(pool, search.tenant_id) as connection:
         await connection.execute("SET LOCAL hnsw.iterative_scan = strict_order")
@@ -169,8 +188,3 @@ async def search_embeddings(
                 )
             ]
         )
-
-
-def _require_cloud_dimension(dimension: int) -> None:
-    if dimension != CLOUD_EMBEDDING_DIMENSION:
-        raise DomainInvariantError(f"cloud embedding dimension must be {CLOUD_EMBEDDING_DIMENSION}")

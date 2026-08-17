@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
-from datetime import datetime, timezone
+from datetime import datetime
 from time import perf_counter
 from typing import Literal
 
@@ -53,6 +53,7 @@ from mindbridge.core import (
     ModelOutputError,
     TenantId,
     VerificationStatus,
+    utc_now,
 )
 from mindbridge.telemetry import (
     current_trace_id,
@@ -87,7 +88,7 @@ class RecallMemories:
         self._embedder = embedder
         self._reranker = reranker
         self._minimum_embedding_similarity = minimum_embedding_similarity
-        self._clock = clock or _utc_now
+        self._clock = clock or utc_now
         self._enumerate = EnumerateMemories(
             store,
             occurrence_verifier,
@@ -592,7 +593,3 @@ def evidence_view(evidence: ResolvedEvidence) -> EvidenceView:
         media_url=evidence.media_url,
         media_url_expires_at=evidence.media_url_expires_at,
     )
-
-
-def _utc_now() -> datetime:
-    return datetime.now(timezone.utc)

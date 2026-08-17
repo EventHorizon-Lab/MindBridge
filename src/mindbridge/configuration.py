@@ -82,3 +82,37 @@ def parse_aware_datetime(value: str) -> datetime:
     if parsed.utcoffset() is None:
         raise argparse.ArgumentTypeError("must include a timezone offset")
     return parsed
+
+
+def config_string(config: Mapping[str, object], key: str, default: str | None = None) -> str:
+    """Read required plugin text, rejecting a blank or non-string value."""
+    value = config.get(key, default)
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{key} must be non-empty text")
+    return value
+
+
+def config_optional_string(config: Mapping[str, object], key: str) -> str | None:
+    """Read plugin text that may be absent but must not be blank when present."""
+    value = config.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{key} must be non-empty text when provided")
+    return value
+
+
+def config_integer(config: Mapping[str, object], key: str, default: int) -> int:
+    """Read a plugin integer, rejecting the bool that int() would accept."""
+    value = config.get(key, default)
+    if type(value) is not int:
+        raise ValueError(f"{key} must be an integer")
+    return value
+
+
+def config_float(config: Mapping[str, object], key: str, default: float) -> float:
+    """Read a plugin number without silently coercing text."""
+    value = config.get(key, default)
+    if type(value) not in {int, float}:
+        raise ValueError(f"{key} must be a number")
+    return float(cast(int | float, value))

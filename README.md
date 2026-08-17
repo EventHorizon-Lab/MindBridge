@@ -229,8 +229,6 @@ from the deployed processes:
     "config": {
       "model_id": "jinaai/jina-embeddings-v5-omni-small-retrieval",
       "model_revision": "12949877f0092093f366c6450340011320152a05",
-      "document_model_id": "jinaai/jina-embeddings-v5-text-small-retrieval",
-      "document_model_revision": "6856e76bb72982e58de0620458a4e8b3614da340",
       "space_id": "jina-v5",
       "space_revision": "deployment-space-v1",
       "dimension": 1024
@@ -260,8 +258,8 @@ from the deployed processes:
     "distribution": "mindbridge",
     "version": "0.1.0",
     "config": {
-      "model_id": "jinaai/jina-embeddings-v5-text-small-retrieval",
-      "model_revision": "6856e76bb72982e58de0620458a4e8b3614da340"
+      "model_id": "jinaai/jina-embeddings-v5-omni-small-retrieval",
+      "model_revision": "12949877f0092093f366c6450340011320152a05"
     }
   }
 }
@@ -700,10 +698,6 @@ export MINDBRIDGE_EMBEDDER_API_KEY=replace-with-a-runtime-secret
 export MINDBRIDGE_EMBEDDER_ENDPOINT=https://embeddings.example.com/v1
 export MINDBRIDGE_EMBEDDER_MODEL_ID=jinaai/jina-embeddings-v5-omni-small-retrieval
 export MINDBRIDGE_EMBEDDER_MODEL_REVISION=12949877f0092093f366c6450340011320152a05
-export MINDBRIDGE_EMBEDDER_DOCUMENT_API_KEY=replace-with-a-runtime-secret
-export MINDBRIDGE_EMBEDDER_DOCUMENT_ENDPOINT=https://text-embeddings.example.com/v1
-export MINDBRIDGE_EMBEDDER_DOCUMENT_MODEL_ID=jinaai/jina-embeddings-v5-text-small-retrieval
-export MINDBRIDGE_EMBEDDER_DOCUMENT_MODEL_REVISION=6856e76bb72982e58de0620458a4e8b3614da340
 export MINDBRIDGE_EMBEDDING_SPACE_ID=jina-v5
 export MINDBRIDGE_EMBEDDING_SPACE_REVISION=deployment-space-v1
 export MINDBRIDGE_MINIMUM_EMBEDDING_SIMILARITY=0.0
@@ -788,37 +782,33 @@ shape `s3://<bucket>/tenants/<tenant_id>/<object>`.
 `GET /v1/jobs/{job_id}?tenant_id=<tenant_id>` until it reaches `succeeded` before issuing a recall
 that depends on its derived events.
 
-The API sends multimodal recall queries to an OpenAI-compatible Jina v5 Omni pooling endpoint and
-explicit memory text to a separate Jina v5 Text Small retrieval endpoint. Both are pinned to one
-declared 1024-dimensional compatibility space, while every vector still records the encoder that
-actually produced it. The API loads neither model. Self-hosted endpoints can use the upstream
-validated vLLM path:
+The API sends both multimodal recall queries and explicit memory text to one OpenAI-compatible
+Jina v5 Omni pooling endpoint, which encodes each side with its own retrieval prompt. Vectors carry
+the declared 1024-dimensional compatibility space plus the encoder that actually produced them. The
+API loads no model. A self-hosted endpoint can use the upstream validated vLLM path:
 
 ```bash
 vllm serve jinaai/jina-embeddings-v5-omni-small-retrieval \
   --revision 12949877f0092093f366c6450340011320152a05 \
   --trust-remote-code
-
-vllm serve jinaai/jina-embeddings-v5-text-small-retrieval \
-  --revision 6856e76bb72982e58de0620458a4e8b3614da340 \
-  --port 8001
 ```
 
 ## Run the memory Worker
 
 The Worker shares storage and Generator variables with the server. It inspects original AV once,
-writes evidence-grounded Event/Entity/Claim graph records atomically, encodes raw evidence with the
-default local Jina plugin, and batches Event/Claim text through the default OpenAI-compatible
-Embedder. Select both capability slots directly:
+writes evidence-grounded Event/Entity/Claim graph records atomically, and cuts one derived clip per
+grounded event span before encoding it with the default local Jina plugin, so each vector covers the
+event's own slice of the recording rather than the whole file. Event and Claim text is batched through the
+default OpenAI-compatible Embedder. Select both capability slots directly:
 
 ```bash
 export MINDBRIDGE_MEDIA_EMBEDDER_PLUGIN=jina
 export MINDBRIDGE_MEDIA_EMBEDDER_DEVICE=cuda
 export MINDBRIDGE_TEXT_EMBEDDER_PLUGIN=openai
 export MINDBRIDGE_TEXT_EMBEDDER_API_KEY=replace-with-a-runtime-secret
-export MINDBRIDGE_TEXT_EMBEDDER_ENDPOINT=https://text-embeddings.example.com/v1
-export MINDBRIDGE_TEXT_EMBEDDER_MODEL_ID=jinaai/jina-embeddings-v5-text-small-retrieval
-export MINDBRIDGE_TEXT_EMBEDDER_MODEL_REVISION=6856e76bb72982e58de0620458a4e8b3614da340
+export MINDBRIDGE_TEXT_EMBEDDER_ENDPOINT=https://embeddings.example.com/v1
+export MINDBRIDGE_TEXT_EMBEDDER_MODEL_ID=jinaai/jina-embeddings-v5-omni-small-retrieval
+export MINDBRIDGE_TEXT_EMBEDDER_MODEL_REVISION=12949877f0092093f366c6450340011320152a05
 
 uv run --extra server --extra cloud-models \
   celery -A mindbridge.celery_app:app worker --loglevel=INFO
@@ -859,6 +849,15 @@ uv run --extra server mindbridge-lifecycle --tenant-id tenant_01
 Schedule this command with the deployment's existing CronJob/systemd/Celery beat control plane.
 The strength coefficients and hot/cold thresholds are explicit CLI options so hardware cadence and
 retention policy can be calibrated without changing model weights or code.
+
+Derived evidence clips are uploaded before the transaction that registers them, so an interrupted
+attempt can leave an object no record references. Clip keys are content addressed, which keeps a
+retry from multiplying that object, and `--reclaim-orphan-clips` deletes whatever is already there.
+The flag also reads the object storage variables, so enable it only where those are configured:
+
+```bash
+uv run --extra server mindbridge-lifecycle --tenant-id tenant_01 --reclaim-orphan-clips
+```
 
 ## Run the Jetson/robot edge path
 

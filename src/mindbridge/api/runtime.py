@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import inspect
 import math
 import os
 from collections.abc import AsyncIterator, Mapping
@@ -32,15 +31,19 @@ from mindbridge.infrastructure.task_queue import (
     create_task_queue,
 )
 from mindbridge.models.defaults import (
+    DEFAULT_EMBEDDER_MODEL_ID,
+    DEFAULT_EMBEDDER_REVISION,
     DEFAULT_EMBEDDING_DIMENSION,
     DEFAULT_EMBEDDING_SPACE,
     DEFAULT_GENERATOR_MODEL_ID,
-    DEFAULT_MEDIA_EMBEDDER_MODEL_ID,
-    DEFAULT_MEDIA_EMBEDDER_REVISION,
-    DEFAULT_TEXT_EMBEDDER_MODEL_ID,
-    DEFAULT_TEXT_EMBEDDER_REVISION,
+    embedding_dimension_from_environment,
 )
-from mindbridge.models.plugins import load_embedder, load_generator, load_reranker
+from mindbridge.models.plugins import (
+    close_model,
+    load_embedder,
+    load_generator,
+    load_reranker,
+)
 from mindbridge.telemetry import configure_telemetry, instrument_fastapi
 
 
@@ -60,6 +63,7 @@ class Settings:
     reranker_plugin: str | None = None
     reranker_config: Mapping[str, object] = field(default_factory=dict, repr=False)
     minimum_embedding_similarity: float = 0.0
+    embedding_dimension: int = DEFAULT_EMBEDDING_DIMENSION
     tenant_api_keys_json: str | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
@@ -149,6 +153,7 @@ class Settings:
             minimum_embedding_similarity=float(
                 source.get("MINDBRIDGE_MINIMUM_EMBEDDING_SIMILARITY", "0.0")
             ),
+            embedding_dimension=embedding_dimension_from_environment(source),
             tenant_api_keys_json=optional_environment_value(
                 source, "MINDBRIDGE_TENANT_API_KEYS_JSON"
             ),
@@ -165,7 +170,7 @@ class _Runtime:
     async def open(self) -> AsyncIterator[None]:
         async with AsyncExitStack() as resources:
             for model in self.models:
-                resources.push_async_callback(_close_model, model)
+                resources.push_async_callback(close_model, model)
             await self.store.open()
             resources.push_async_callback(self.store.close)
             yield
@@ -209,7 +214,9 @@ def run_mcp() -> None:
 
 
 def _build_runtime(settings: Settings) -> _Runtime:
-    store = PostgresMemoryStore(settings.database_url)
+    store = PostgresMemoryStore(
+        settings.database_url, embedding_dimension=settings.embedding_dimension
+    )
     media_access = S3MediaAccess(
         settings.object_storage_bucket,
         endpoint_url=settings.object_storage_endpoint_url,
@@ -242,15 +249,6 @@ def _build_runtime(settings: Settings) -> _Runtime:
     return _Runtime(kernel, store, models)
 
 
-async def _close_model(model: object) -> None:
-    close = getattr(model, "close", None)
-    if close is None:
-        return
-    result = close()
-    if inspect.isawaitable(result):
-        await result
-
-
 def _openai_generator_config(source: Mapping[str, str]) -> dict[str, object]:
     config: dict[str, object] = {
         "api_key": require_environment_value(source, "MINDBRIDGE_GENERATOR_API_KEY"),
@@ -268,27 +266,13 @@ def _openai_embedder_config(source: Mapping[str, str]) -> dict[str, object]:
     return {
         "api_key": require_environment_value(source, "MINDBRIDGE_EMBEDDER_API_KEY"),
         "endpoint": require_environment_value(source, "MINDBRIDGE_EMBEDDER_ENDPOINT"),
-        "model_id": source.get("MINDBRIDGE_EMBEDDER_MODEL_ID", DEFAULT_MEDIA_EMBEDDER_MODEL_ID),
+        "model_id": source.get("MINDBRIDGE_EMBEDDER_MODEL_ID", DEFAULT_EMBEDDER_MODEL_ID),
         "model_revision": source.get(
-            "MINDBRIDGE_EMBEDDER_MODEL_REVISION", DEFAULT_MEDIA_EMBEDDER_REVISION
-        ),
-        "document_api_key": require_environment_value(
-            source, "MINDBRIDGE_EMBEDDER_DOCUMENT_API_KEY"
-        ),
-        "document_endpoint": require_environment_value(
-            source, "MINDBRIDGE_EMBEDDER_DOCUMENT_ENDPOINT"
-        ),
-        "document_model_id": source.get(
-            "MINDBRIDGE_EMBEDDER_DOCUMENT_MODEL_ID", DEFAULT_TEXT_EMBEDDER_MODEL_ID
-        ),
-        "document_model_revision": source.get(
-            "MINDBRIDGE_EMBEDDER_DOCUMENT_MODEL_REVISION", DEFAULT_TEXT_EMBEDDER_REVISION
+            "MINDBRIDGE_EMBEDDER_MODEL_REVISION", DEFAULT_EMBEDDER_REVISION
         ),
         "space_id": source.get("MINDBRIDGE_EMBEDDING_SPACE_ID", DEFAULT_EMBEDDING_SPACE.space_id),
         "space_revision": source.get(
             "MINDBRIDGE_EMBEDDING_SPACE_REVISION", DEFAULT_EMBEDDING_SPACE.revision
         ),
-        "dimension": int(
-            source.get("MINDBRIDGE_EMBEDDING_DIMENSION", str(DEFAULT_EMBEDDING_DIMENSION))
-        ),
+        "dimension": embedding_dimension_from_environment(source),
     }

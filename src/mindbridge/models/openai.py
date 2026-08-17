@@ -28,6 +28,12 @@ from mindbridge.application.capabilities import (
     ModelInput,
     TextPart,
 )
+from mindbridge.configuration import (
+    config_float,
+    config_integer,
+    config_optional_string,
+    config_string,
+)
 from mindbridge.core import (
     EmbeddingSpaceReference,
     MediaKind,
@@ -36,7 +42,11 @@ from mindbridge.core import (
     ModelRequestError,
     ModelUnavailableError,
 )
-from mindbridge.models.defaults import DEFAULT_GENERATOR_MODEL_ID
+from mindbridge.models.defaults import (
+    DEFAULT_EMBEDDING_DIMENSION,
+    DEFAULT_GENERATOR_MODEL_ID,
+    require_matryoshka_dimension,
+)
 from mindbridge.telemetry import set_current_span_attributes, trace_operation
 
 DEFAULT_VIDEO_FRAMES_PER_SECOND = 1.0
@@ -194,15 +204,13 @@ class OpenAIGenerator:
 
 
 class OpenAIEmbedder:
-    """Embed text or media through aligned OpenAI-compatible model endpoints."""
+    """Embed text or media through one OpenAI-compatible Omni endpoint."""
 
     def __init__(
         self,
-        query_client: AsyncOpenAI,
-        query_model_reference: ModelReference,
+        client: AsyncOpenAI,
+        model_reference: ModelReference,
         *,
-        document_client: AsyncOpenAI,
-        document_model_reference: ModelReference,
         space_reference: EmbeddingSpaceReference,
         dimension: int = 1_024,
         request_timeout_seconds: float = 120.0,
@@ -213,10 +221,8 @@ class OpenAIEmbedder:
             raise ValueError("dimension and request timeout must be positive")
         if video_frames_per_second <= 0 or video_max_pixels <= 0:
             raise ValueError("video sampling values must be positive")
-        self._query_client = query_client
-        self._query_model_reference = query_model_reference
-        self._document_client = document_client
-        self._document_model_reference = document_model_reference
+        self._client = client
+        self._model_reference = model_reference
         self._space_reference = space_reference
         self._dimension = dimension
         self._request_timeout_seconds = request_timeout_seconds
@@ -231,10 +237,6 @@ class OpenAIEmbedder:
         endpoint: str,
         model_id: str,
         model_revision: str,
-        document_api_key: str,
-        document_endpoint: str,
-        document_model_id: str,
-        document_model_revision: str,
         space_reference: EmbeddingSpaceReference,
         dimension: int = 1_024,
         request_timeout_seconds: float = 120.0,
@@ -242,15 +244,7 @@ class OpenAIEmbedder:
         video_frames_per_second: float = DEFAULT_VIDEO_FRAMES_PER_SECOND,
         video_max_pixels: int = DEFAULT_VIDEO_MAX_PIXELS,
     ) -> OpenAIEmbedder:
-        required = (
-            api_key,
-            model_id,
-            model_revision,
-            document_api_key,
-            document_model_id,
-            document_model_revision,
-        )
-        if any(not value.strip() for value in required):
+        if any(not value.strip() for value in (api_key, model_id, model_revision)):
             raise ValueError("embedding credentials and model identities are required")
         if not 0 <= max_retries <= 10:
             raise ValueError("max_retries must be between zero and ten")
@@ -262,16 +256,6 @@ class OpenAIEmbedder:
                 max_retries=max_retries,
             ),
             ModelReference(model_id=model_id, revision=model_revision),
-            document_client=AsyncOpenAI(
-                api_key=document_api_key,
-                base_url=normalize_base_url(document_endpoint),
-                timeout=request_timeout_seconds,
-                max_retries=max_retries,
-            ),
-            document_model_reference=ModelReference(
-                model_id=document_model_id,
-                revision=document_model_revision,
-            ),
             space_reference=space_reference,
             dimension=dimension,
             request_timeout_seconds=request_timeout_seconds,
@@ -284,15 +268,10 @@ class OpenAIEmbedder:
         """Encode a homogeneous batch without exposing provider request shapes."""
         if not request.inputs:
             return EmbedResult(embeddings=())
-        model_reference = (
-            self._query_model_reference
-            if request.task is EmbedTask.QUERY
-            else self._document_model_reference
-        )
         set_current_span_attributes(
             {
-                "mindbridge.model.id": model_reference.model_id,
-                "mindbridge.model.revision": model_reference.revision,
+                "mindbridge.model.id": self._model_reference.model_id,
+                "mindbridge.model.revision": self._model_reference.revision,
                 "mindbridge.embedding.dimension": self._dimension,
                 "mindbridge.embedding.input_count": len(request.inputs),
                 "mindbridge.embedding.task": request.task.value,
@@ -302,7 +281,6 @@ class OpenAIEmbedder:
             if all(_text_only(item) is not None for item in request.inputs):
                 vectors = await self._embed_text(request)
             else:
-                model_reference = self._query_model_reference
                 vectors = tuple(
                     await asyncio.gather(
                         *(self._embed_multimodal(item, request.task) for item in request.inputs)
@@ -314,7 +292,7 @@ class OpenAIEmbedder:
             embeddings=tuple(
                 Embedding(
                     values=values,
-                    model_reference=model_reference,
+                    model_reference=self._model_reference,
                     space_reference=self._space_reference,
                 )
                 for values in vectors
@@ -322,28 +300,20 @@ class OpenAIEmbedder:
         )
 
     async def close(self) -> None:
-        await self._query_client.close()
-        await self._document_client.close()
+        await self._client.close()
 
     async def _embed_text(self, request: EmbedRequest) -> tuple[tuple[float, ...], ...]:
-        if request.task is EmbedTask.QUERY:
-            client = self._query_client
-            model_reference = self._query_model_reference
-            prefix = "Query: "
-        else:
-            client = self._document_client
-            model_reference = self._document_model_reference
-            prefix = "Document: "
-        response = await client.embeddings.create(
+        prefix = "Query: " if request.task is EmbedTask.QUERY else "Document: "
+        response = await self._client.embeddings.create(
             input=[prefix + cast(str, _text_only(item)) for item in request.inputs],
-            model=model_reference.model_id,
+            model=self._model_reference.model_id,
             dimensions=self._dimension,
             encoding_format="float",
             timeout=self._request_timeout_seconds,
         )
         return _embedding_vectors(
             response,
-            model_reference,
+            self._model_reference,
             dimension=self._dimension,
             expected_count=len(request.inputs),
         )
@@ -353,7 +323,7 @@ class OpenAIEmbedder:
         input_value: ModelInput,
         task: EmbedTask,
     ) -> tuple[float, ...]:
-        response = await self._query_client.post(
+        response = await self._client.post(
             "/embeddings",
             cast_to=CreateEmbeddingResponse,
             body={
@@ -368,7 +338,7 @@ class OpenAIEmbedder:
                         ),
                     }
                 ],
-                "model": self._query_model_reference.model_id,
+                "model": self._model_reference.model_id,
                 "dimensions": self._dimension,
                 "encoding_format": "float",
             },
@@ -376,7 +346,7 @@ class OpenAIEmbedder:
         )
         return _embedding_vectors(
             response,
-            self._query_model_reference,
+            self._model_reference,
             dimension=self._dimension,
             expected_count=1,
         )[0]
@@ -399,25 +369,25 @@ def create_generator(config: Mapping[str, object]) -> OpenAIGenerator:
         },
     )
     return OpenAIGenerator.connect(
-        api_key=_string(config, "api_key"),
-        endpoint=_string(config, "endpoint"),
-        model_id=_string(config, "model_id", DEFAULT_GENERATOR_MODEL_ID),
-        model_revision=_string(config, "model_revision"),
-        request_timeout_seconds=_float(config, "request_timeout_seconds", 1_800.0),
-        max_retries=_integer(config, "max_retries", 2),
+        api_key=config_string(config, "api_key"),
+        endpoint=config_string(config, "endpoint"),
+        model_id=config_string(config, "model_id", DEFAULT_GENERATOR_MODEL_ID),
+        model_revision=config_string(config, "model_revision"),
+        request_timeout_seconds=config_float(config, "request_timeout_seconds", 1_800.0),
+        max_retries=config_integer(config, "max_retries", 2),
         reasoning_effort=cast(
             ReasoningEffort,
-            _optional_string(config, "reasoning_effort"),
+            config_optional_string(config, "reasoning_effort"),
         ),
-        video_frames_per_second=_float(
+        video_frames_per_second=config_float(
             config, "video_frames_per_second", DEFAULT_VIDEO_FRAMES_PER_SECOND
         ),
-        video_max_pixels=_integer(config, "video_max_pixels", DEFAULT_VIDEO_MAX_PIXELS),
+        video_max_pixels=config_integer(config, "video_max_pixels", DEFAULT_VIDEO_MAX_PIXELS),
     )
 
 
 def create_embedder(config: Mapping[str, object]) -> OpenAIEmbedder:
-    """Entry-point factory for an aligned OpenAI-compatible embedder pair."""
+    """Entry-point factory for the OpenAI-compatible Omni embedder."""
     _reject_unknown(
         config,
         {
@@ -425,10 +395,6 @@ def create_embedder(config: Mapping[str, object]) -> OpenAIEmbedder:
             "endpoint",
             "model_id",
             "model_revision",
-            "document_api_key",
-            "document_endpoint",
-            "document_model_id",
-            "document_model_revision",
             "space_id",
             "space_revision",
             "dimension",
@@ -439,25 +405,23 @@ def create_embedder(config: Mapping[str, object]) -> OpenAIEmbedder:
         },
     )
     return OpenAIEmbedder.connect(
-        api_key=_string(config, "api_key"),
-        endpoint=_string(config, "endpoint"),
-        model_id=_string(config, "model_id"),
-        model_revision=_string(config, "model_revision"),
-        document_api_key=_string(config, "document_api_key"),
-        document_endpoint=_string(config, "document_endpoint"),
-        document_model_id=_string(config, "document_model_id"),
-        document_model_revision=_string(config, "document_model_revision"),
+        api_key=config_string(config, "api_key"),
+        endpoint=config_string(config, "endpoint"),
+        model_id=config_string(config, "model_id"),
+        model_revision=config_string(config, "model_revision"),
         space_reference=EmbeddingSpaceReference(
-            space_id=_string(config, "space_id"),
-            revision=_string(config, "space_revision"),
+            space_id=config_string(config, "space_id"),
+            revision=config_string(config, "space_revision"),
         ),
-        dimension=_integer(config, "dimension", 1_024),
-        request_timeout_seconds=_float(config, "request_timeout_seconds", 120.0),
-        max_retries=_integer(config, "max_retries", 2),
-        video_frames_per_second=_float(
+        dimension=require_matryoshka_dimension(
+            config_integer(config, "dimension", DEFAULT_EMBEDDING_DIMENSION)
+        ),
+        request_timeout_seconds=config_float(config, "request_timeout_seconds", 120.0),
+        max_retries=config_integer(config, "max_retries", 2),
+        video_frames_per_second=config_float(
             config, "video_frames_per_second", DEFAULT_VIDEO_FRAMES_PER_SECOND
         ),
-        video_max_pixels=_integer(config, "video_max_pixels", DEFAULT_VIDEO_MAX_PIXELS),
+        video_max_pixels=config_integer(config, "video_max_pixels", DEFAULT_VIDEO_MAX_PIXELS),
     )
 
 
@@ -566,7 +530,7 @@ def _embedding_vectors(
 def _validate_embedding(values: tuple[float, ...], dimension: int) -> None:
     if len(values) != dimension or not all(math.isfinite(value) for value in values):
         raise ModelOutputError("embedding vector has invalid dimension or values")
-    norm = math.sqrt(sum(value * value for value in values))
+    norm = math.hypot(*values)
     if not math.isclose(norm, 1.0, rel_tol=1e-4, abs_tol=1e-6):
         raise ModelOutputError("embedding vector is not L2-normalized")
 
@@ -584,33 +548,3 @@ def _reject_unknown(config: Mapping[str, object], allowed: set[str]) -> None:
     unknown = set(config) - allowed
     if unknown:
         raise ValueError(f"unknown plugin configuration: {', '.join(sorted(unknown))}")
-
-
-def _string(config: Mapping[str, object], key: str, default: str | None = None) -> str:
-    value = config.get(key, default)
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError(f"{key} must be non-empty text")
-    return value
-
-
-def _optional_string(config: Mapping[str, object], key: str) -> str | None:
-    value = config.get(key)
-    if value is None:
-        return None
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError(f"{key} must be non-empty text when provided")
-    return value
-
-
-def _integer(config: Mapping[str, object], key: str, default: int) -> int:
-    value = config.get(key, default)
-    if type(value) is not int:
-        raise ValueError(f"{key} must be an integer")
-    return value
-
-
-def _float(config: Mapping[str, object], key: str, default: float) -> float:
-    value = config.get(key, default)
-    if type(value) not in {int, float}:
-        raise ValueError(f"{key} must be a number")
-    return float(cast(int | float, value))

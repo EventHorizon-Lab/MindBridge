@@ -19,8 +19,7 @@ from mindbridge.core import (
 from mindbridge.models import EmbedRequest, EmbedTask, MediaPart, ModelInput, TextPart
 from mindbridge.models.openai import OpenAIEmbedder, normalize_base_url
 
-QUERY_MODEL_ID = "jinaai/jina-embeddings-v5-omni-small-retrieval"
-DOCUMENT_MODEL_ID = "jinaai/jina-embeddings-v5-text-small-retrieval"
+MODEL_ID = "jinaai/jina-embeddings-v5-omni-small-retrieval"
 
 
 async def test_text_query_uses_typed_embedding_sdk() -> None:
@@ -29,7 +28,7 @@ async def test_text_query_uses_typed_embedding_sdk() -> None:
         assert request.url.path == "/api/v1/embeddings"
         assert payload == {
             "input": ["Query: where is the tool?"],
-            "model": QUERY_MODEL_ID,
+            "model": MODEL_ID,
             "dimensions": 1_024,
             "encoding_format": "float",
         }
@@ -54,11 +53,11 @@ async def test_memory_document_uses_jina_document_prompt() -> None:
         payload: dict[str, object] = json.loads(request.content)
         assert payload == {
             "input": ["Document: Caroline plans to become a counselor."],
-            "model": DOCUMENT_MODEL_ID,
+            "model": MODEL_ID,
             "dimensions": 1_024,
             "encoding_format": "float",
         }
-        return _embedding_response(model=DOCUMENT_MODEL_ID)
+        return _embedding_response(model=MODEL_ID)
 
     embedder = _embedder(respond)
     try:
@@ -92,7 +91,7 @@ async def test_text_document_embedder_batches_and_restores_index_order() -> None
                         "embedding": [1.0] + [0.0] * 1_023,
                     },
                 ],
-                "model": DOCUMENT_MODEL_ID,
+                "model": MODEL_ID,
                 "usage": {"prompt_tokens": 2, "total_tokens": 2},
             },
         )
@@ -123,7 +122,7 @@ async def test_multimodal_query_preserves_native_av_parts() -> None:
         messages = cast(list[dict[str, object]], payload["messages"])
         content = cast(list[dict[str, object]], messages[0]["content"])
         assert request.url.path == "/api/v1/embeddings"
-        assert payload["model"] == QUERY_MODEL_ID
+        assert payload["model"] == MODEL_ID
         assert payload["dimensions"] == 1_024
         assert content[0] == {"type": "text", "text": "Query: find this moment"}
         assert {item["type"] for item in content} == {
@@ -160,8 +159,8 @@ async def test_multimodal_query_preserves_native_av_parts() -> None:
     ("model", "embedding", "match"),
     [
         ("wrong-model", [1.0] + [0.0] * 1_023, "model"),
-        (QUERY_MODEL_ID, [1.0, 0.0], "dimension"),
-        (QUERY_MODEL_ID, [0.5] + [0.0] * 1_023, "L2-normalized"),
+        (MODEL_ID, [1.0, 0.0], "dimension"),
+        (MODEL_ID, [0.5] + [0.0] * 1_023, "L2-normalized"),
     ],
 )
 async def test_invalid_embedding_output_is_rejected(
@@ -227,20 +226,9 @@ def _embedder(
         http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
         max_retries=0,
     )
-    document_client = AsyncOpenAI(
-        api_key="unit-test-key",
-        base_url=normalize_base_url("https://text.example.test/api/v1/embeddings"),
-        http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
-        max_retries=0,
-    )
     return OpenAIEmbedder(
         client,
-        ModelReference(model_id=QUERY_MODEL_ID, revision="pinned-query-revision"),
-        document_client=document_client,
-        document_model_reference=ModelReference(
-            model_id=DOCUMENT_MODEL_ID,
-            revision="pinned-document-revision",
-        ),
+        ModelReference(model_id=MODEL_ID, revision="pinned-revision"),
         space_reference=EmbeddingSpaceReference(space_id="jina-space", revision="v1"),
     )
 
@@ -256,7 +244,7 @@ def _media_part(kind: MediaKind, suffix: str) -> MediaPart:
 
 def _embedding_response(
     *,
-    model: str = QUERY_MODEL_ID,
+    model: str = MODEL_ID,
     embedding: list[float] | None = None,
 ) -> httpx.Response:
     return httpx.Response(

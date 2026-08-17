@@ -579,8 +579,7 @@ class _RecordedQuery:
 class RecordingEmbedder:
     """Returns valid vectors while retaining query and document inputs."""
 
-    query_model_reference = ModelReference(model_id="jina-omni", revision="pinned-revision")
-    document_model_reference = ModelReference(model_id="jina-text", revision="pinned-revision")
+    model_reference = ModelReference(model_id="jina-omni", revision="pinned-revision")
     space_reference = EmbeddingSpaceReference(space_id="jina-v5", revision="space-v1")
 
     def __init__(self, *, memory_document_failures: int = 0) -> None:
@@ -604,7 +603,6 @@ class RecordingEmbedder:
                         ),
                     )
                 )
-            model_reference = self.query_model_reference
         else:
             self.memory_documents.extend(
                 part.text
@@ -615,12 +613,11 @@ class RecordingEmbedder:
             if self.memory_document_failures:
                 self.memory_document_failures -= 1
                 raise ModelUnavailableError("temporary embedding failure")
-            model_reference = self.document_model_reference
         return EmbedResult(
             tuple(
                 Embedding(
                     (1.0,) + (0.0,) * 1_023,
-                    model_reference,
+                    self.model_reference,
                     self.space_reference,
                 )
                 for _ in request.inputs
@@ -880,7 +877,7 @@ async def test_remember_indexes_one_pinned_memory_document() -> None:
     assert embedder.memory_documents == [memory.summary]
     assert embedding.object_type is EmbeddedObjectType.MEMORY_RECORD
     assert embedding.object_id == memory.memory_id
-    assert embedding.model_reference == embedder.document_model_reference
+    assert embedding.model_reference == embedder.model_reference
     assert embedding.space_reference == embedder.space_reference
     assert embedding.task == "retrieval_document"
     assert embedding.dimension == 1_024

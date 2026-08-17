@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import inspect
 import json
 import os
 from collections.abc import Mapping, Sequence
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime
+from typing import cast
 
 from mindbridge.application.consolidate_claims import ConsolidateClaims
 from mindbridge.application.consolidate_summaries import ConsolidateSummaries
@@ -30,17 +30,19 @@ from mindbridge.configuration import (
     require_environment_value,
     validate_plugin_name,
 )
-from mindbridge.core import TenantId
+from mindbridge.core import TenantId, utc_now
 from mindbridge.infrastructure.postgres import PostgresMemoryStore
 from mindbridge.infrastructure.s3 import S3MediaAccess
 from mindbridge.models.defaults import (
+    DEFAULT_EMBEDDER_MODEL_ID,
+    DEFAULT_EMBEDDER_REVISION,
     DEFAULT_EMBEDDING_DIMENSION,
     DEFAULT_EMBEDDING_SPACE,
     DEFAULT_GENERATOR_MODEL_ID,
-    DEFAULT_TEXT_EMBEDDER_MODEL_ID,
-    DEFAULT_TEXT_EMBEDDER_REVISION,
+    embedding_dimension_from_environment,
+    require_matryoshka_dimension,
 )
-from mindbridge.models.plugins import load_embedder, load_generator
+from mindbridge.models.plugins import close_model, load_embedder, load_generator
 from mindbridge.telemetry import configure_telemetry
 
 
@@ -154,7 +156,12 @@ async def _run_postgres_sweep(
     summary_maximum_gap_seconds: int,
     summary_minimum_similarity: float,
 ) -> ConsolidationSweepSummary:
-    store = PostgresMemoryStore(settings.database_url)
+    store = PostgresMemoryStore(
+        settings.database_url,
+        embedding_dimension=require_matryoshka_dimension(
+            int(cast(int, settings.embedder_config.get("dimension", DEFAULT_EMBEDDING_DIMENSION)))
+        ),
+    )
     media_access = S3MediaAccess(
         settings.object_storage_bucket,
         endpoint_url=settings.object_storage_endpoint_url,
@@ -162,9 +169,9 @@ async def _run_postgres_sweep(
     )
     async with AsyncExitStack() as resources:
         generator = load_generator(settings.generator_plugin, settings.generator_config)
-        resources.push_async_callback(_close_model, generator)
+        resources.push_async_callback(close_model, generator)
         embedder = load_embedder(settings.embedder_plugin, settings.embedder_config)
-        resources.push_async_callback(_close_model, embedder)
+        resources.push_async_callback(close_model, embedder)
         await store.open()
         resources.push_async_callback(store.close)
         episodes = await consolidate_tenant_episodes(
@@ -216,7 +223,7 @@ async def _run_postgres_sweep(
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tenant-id", required=True)
-    parser.add_argument("--evaluated-at", type=parse_aware_datetime, default=_utc_now())
+    parser.add_argument("--evaluated-at", type=parse_aware_datetime, default=utc_now())
     parser.add_argument("--page-size", type=int, default=16)
     parser.add_argument("--maximum-gap-seconds", type=int, default=900)
     parser.add_argument("--minimum-similarity", type=float, default=0.7)
@@ -259,10 +266,6 @@ def _summary_dict(summary: ConsolidationSweepSummary) -> dict[str, object]:
     }
 
 
-def _utc_now() -> datetime:
-    return datetime.now(timezone.utc)
-
-
 def _generator_config(source: Mapping[str, str]) -> Mapping[str, object]:
     return {
         "api_key": require_environment_value(source, "MINDBRIDGE_GENERATOR_API_KEY"),
@@ -273,36 +276,19 @@ def _generator_config(source: Mapping[str, str]) -> Mapping[str, object]:
 
 
 def _document_embedder_config(source: Mapping[str, str]) -> Mapping[str, object]:
-    api_key = require_environment_value(source, "MINDBRIDGE_EMBEDDER_API_KEY")
-    endpoint = require_environment_value(source, "MINDBRIDGE_EMBEDDER_ENDPOINT")
-    model_id = source.get("MINDBRIDGE_EMBEDDER_MODEL_ID", DEFAULT_TEXT_EMBEDDER_MODEL_ID)
-    revision = source.get("MINDBRIDGE_EMBEDDER_MODEL_REVISION", DEFAULT_TEXT_EMBEDDER_REVISION)
     return {
-        "api_key": api_key,
-        "endpoint": endpoint,
-        "model_id": model_id,
-        "model_revision": revision,
-        "document_api_key": api_key,
-        "document_endpoint": endpoint,
-        "document_model_id": model_id,
-        "document_model_revision": revision,
+        "api_key": require_environment_value(source, "MINDBRIDGE_EMBEDDER_API_KEY"),
+        "endpoint": require_environment_value(source, "MINDBRIDGE_EMBEDDER_ENDPOINT"),
+        "model_id": source.get("MINDBRIDGE_EMBEDDER_MODEL_ID", DEFAULT_EMBEDDER_MODEL_ID),
+        "model_revision": source.get(
+            "MINDBRIDGE_EMBEDDER_MODEL_REVISION", DEFAULT_EMBEDDER_REVISION
+        ),
         "space_id": source.get("MINDBRIDGE_EMBEDDING_SPACE_ID", DEFAULT_EMBEDDING_SPACE.space_id),
         "space_revision": source.get(
             "MINDBRIDGE_EMBEDDING_SPACE_REVISION", DEFAULT_EMBEDDING_SPACE.revision
         ),
-        "dimension": int(
-            source.get("MINDBRIDGE_EMBEDDING_DIMENSION", str(DEFAULT_EMBEDDING_DIMENSION))
-        ),
+        "dimension": embedding_dimension_from_environment(source),
     }
-
-
-async def _close_model(model: object) -> None:
-    close = getattr(model, "close", None)
-    if close is None:
-        return
-    result = close()
-    if inspect.isawaitable(result):
-        await result
 
 
 if __name__ == "__main__":

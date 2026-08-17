@@ -28,6 +28,13 @@ def load_reranker(name: str, config: PluginConfig) -> Reranker:
     return cast(Reranker, _load("mindbridge.rerankers", name, config, Reranker))
 
 
+async def close_model(model: object) -> None:
+    """Release a loaded plugin that chose to own a client or device."""
+    close = getattr(model, "close", None)
+    if close is not None:
+        await close()
+
+
 def _load(
     group: str,
     name: str,

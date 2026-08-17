@@ -399,6 +399,34 @@ class MediaUrlSigner(Protocol):
     ) -> PresignedMediaDownload: ...
 
 
+class DerivedMediaStore(MediaUrlSigner, Protocol):
+    """Everything clip derivation needs from object storage."""
+
+    async def read_media(self, media_object: MediaObject) -> bytes: ...
+    async def upload_media(self, media_object: MediaObject, content: bytes) -> None: ...
+
+
+class DerivedMediaJanitor(Protocol):
+    """Key-level access used to reclaim clips whose registration never committed."""
+
+    async def list_media_keys(
+        self,
+        tenant_id: str,
+        prefix: str,
+    ) -> tuple[tuple[str, datetime], ...]: ...
+    async def delete_media_key(self, tenant_id: str, key: str) -> None: ...
+
+
+class ClipDigestStore(Protocol):
+    """Reads which stored clip digests the system of record still references."""
+
+    async def list_known_clip_digests(
+        self,
+        tenant_id: TenantId,
+        digests: tuple[str, ...],
+    ) -> frozenset[str]: ...
+
+
 class MediaDeleter(Protocol):
     """Idempotent physical deletion for tenant-validated immutable media."""
 

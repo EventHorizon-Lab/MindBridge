@@ -5,11 +5,12 @@ from __future__ import annotations
 import os
 import sqlite3
 from collections.abc import Callable
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 
 from mindbridge.contracts import DeletionPage, DeletionTombstoneView, ObserveRequest
-from mindbridge.core import ForgetTargetType, MemoryIntegrityError, derive_observation_id
+from mindbridge.core import ForgetTargetType, MemoryIntegrityError, derive_observation_id, utc_now
+from mindbridge.edge._sqlite import connect as sqlite_connect
 from mindbridge.edge.identity_schema import initialize_identity_tables
 from mindbridge.edge.recent_memory import initialize_recent_memory_tables
 
@@ -27,7 +28,7 @@ class SQLiteDeletionInbox:
             raise ValueError("edge deletion inbox must use a file-backed SQLite database")
         database_path.parent.mkdir(parents=True, exist_ok=True)
         self._database_path = database_path
-        self._clock = clock or _utc_now
+        self._clock = clock or utc_now
         with self._connect() as connection:
             initialize_deletion_tables(connection)
             initialize_identity_tables(connection)
@@ -272,11 +273,7 @@ class SQLiteDeletionInbox:
         )
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self._database_path, timeout=30)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA journal_mode = WAL")
-        connection.execute("PRAGMA synchronous = FULL")
-        return connection
+        return sqlite_connect(self._database_path)
 
     def _now(self) -> datetime:
         now = self._clock()
@@ -320,7 +317,3 @@ def initialize_deletion_tables(connection: sqlite3.Connection) -> None:
         );
         """
     )
-
-
-def _utc_now() -> datetime:
-    return datetime.now(timezone.utc)

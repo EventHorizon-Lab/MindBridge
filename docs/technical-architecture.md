@@ -82,7 +82,7 @@ flowchart LR
         INGEST["Ingestion API\nidempotency · policy · tenant"]
         OBJECTS["S3-compatible Object Storage\nraw AV · keyframes · derived clips"]
         WORKER["Memory Worker\neventization · Omni perception · OCR/ASR"]
-        EMBED["Embedding Service\nJina v5 Omni Small + Text Small"]
+        EMBED["Embedding Service\nJina v5 Omni Small"]
         KERNEL["Memory Kernel\nepisode · entity · claim · provenance"]
         LIFECYCLE["Lifecycle Engine\nconsolidate · strengthen · correct · forget"]
         PG["PostgreSQL + pgvector\nmetadata · vector · text · relation · time"]
@@ -315,12 +315,18 @@ memory-layer 输入，但必须在评测报告中与原始视听复现分开。
 Claim 必须引用 Event 内的 EvidenceSpan，Claim 的有效时间必须落在 Event 内。模型首先引用输入
 source span；应用层随后按 Event 与 source 的时间交集生成稳定、精确的 Event EvidenceSpan，并在
 同一对象图中重写 Event、EntityMention、Claim 与 Memory 引用。完整性校验要求所有派生引用恰好
-等于本批 Event spans，事务会先写这些 spans 再写图，任何越界或冲突都整批回滚。原始媒体只编码
-一次；原始 AV 向量命中时，PostgreSQL 将其映射到同 Observation、同媒体且位于该 source span 内
-的 Event spans，避免复制一个全片向量来冒充多个“精确向量”。Worker 随后用
-Jina Omni Small 编码原始 source EvidenceSpan，用同一兼容空间的 Jina Text Small 批量编码 Event 描述
-和 Claim 陈述，并在一个 PostgreSQL 事务中写入 Event、Entity、EntityMention、Claim、
-MemoryRecord、类型关系、向量和成功 Job 状态。任何模型输出越界、关系悬空、版本冲突或向量错误
+等于本批 Event spans，事务会先写这些 spans 再写图，任何越界或冲突都整批回滚。Worker 按每个
+**已 grounding 的 Event EvidenceSpan**（不是覆盖整个文件的 source span）从原始媒体裁出一段派生 clip，用 Jina Omni Small 编码该 clip，因此向量的
+时间分辨率等于 span 本身而不是整个文件。裁剪时应用部署选定的视频帧率与像素预算；超过编码器
+音频窗口的跨度切成多个 clip，各自成向量，尾部不丢。clip 作为派生 MediaObject 持久化，
+`derived_from_media_object_id` 记录来源，`evidence_clips` 记录 span 到 clip 的映射；内容相同的
+clip 按 sha256 去重到同一个对象，但每个 span 仍保留自己的映射与向量。clip 同时登记进
+`observation_media`，因此既有的 forget 清理会自动回收它们。clip 的对象键按内容寻址，重试覆盖
+同一个对象；上传发生在事务之前，回滚留下的对象由 `mindbridge-lifecycle --reclaim-orphan-clips`
+按“S3 有、数据库无”回收，且只回收超过宽限期的对象，以免删掉某个 Worker 刚上传、尚未提交的 clip。
+由于向量现在挂在 Event span 上，源 span 不再带向量，检索按 Event span 直接命中记忆，不再需要由源 span 向下展开。Worker 用同一个 Omni Small 批量编码 Event 描述和 Claim 陈述，并在一个
+PostgreSQL 事务中写入 Event、Entity、EntityMention、Claim、MemoryRecord、类型关系、派生 clip
+媒体、span 到 clip 映射、向量和成功 Job 状态。任何模型输出越界、关系悬空、版本冲突或向量错误
 都会回滚整批派生数据。VLM 与后续 Jina 阶段分别获取新的短期签名 URL，禁止跨越长模型调用复用
 可能过期的地址；重试使用稳定 ID 且不会合并不同的证据集合。跨 Event 实体消歧、Episode
 合并和多次经历归纳属于后续 Consolidation，不在在线写入路径中凭名称猜测。
@@ -387,7 +393,6 @@ entry point `mindbridge.generators`、`mindbridge.embedders`、`mindbridge.reran
 | AV 理解、caption、时间定位、计数 | Qwen Omni，通过 OpenAI-compatible API；以当前可用最强版本为默认 | 云端 |
 | 视觉 OCR、grounding、补充检查 | Qwen VL/VLM 或对应成熟专用模型 | 云端，必要时端侧 |
 | 跨模态主召回 | `jina-embeddings-v5-omni-small-retrieval` | 云端 |
-| 文本派生表示 | `jina-embeddings-v5-text-small-retrieval`，与 Omni Small 对齐 | 云端 |
 | 端侧跨模态近期召回 | `jina-embeddings-v5-omni-nano-retrieval` | 强 Jetson/机器人主机，可选 |
 | 人脸检测、跟踪与表征 | SCRFD-2.5GF-KPS + ArcFace R50；YuNet + SFace 为轻量生态对照 | 端侧 |
 | 流式 ASR | FunASR causal Paraformer，官方 cache 与 600ms 模型窗口 | 端侧 |
@@ -407,7 +412,7 @@ entry point `mindbridge.generators`、`mindbridge.embedders`、`mindbridge.reran
 采用它的原因：
 
 - 文本、图像、视频和音频进入统一语义空间；
-- 与 `jina-embeddings-v5-text-small-retrieval` 对齐，派生文本可以使用更便宜的文本塔编码；
+- 同一个模型同时覆盖派生文本和原始媒体，检索两侧不存在跨编码器对齐假设；
 - 支持 retrieval 专用的 query/document 编码；
 - 支持 Matryoshka 截断维度，便于端侧或低成本索引试验；
 - 可以通过 Hugging Face 和 vLLM 生态直接使用，不需要自研加载和 serving。
@@ -422,16 +427,16 @@ entry point `mindbridge.generators`、`mindbridge.embedders`、`mindbridge.reran
   `space_id/space_revision`，同时保存 `task`、`dimension`、`normalized` 和 `created_at`；
 - 切换模型时创建新向量版本并后台重建，不原地混用不同空间。
 
-生产实现将编码器放在不同进程中，但严格声明同一冻结兼容空间：Memory Worker 通过 Hugging Face
-`sentence-transformers` 的 `encode_document()` 生成 EvidenceSpan 向量，并通过独立 vLLM
-OpenAI-compatible endpoint 用 Text Small 批量生成 Event/Claim/Summary document 向量；API 通过 Omni
-Small endpoint 生成 query 向量，并用同一个 Text Small 服务编码显式记忆。Omni 固定 revision
-`12949877f0092093f366c6450340011320152a05`，Text Small
-固定 revision `6856e76bb72982e58de0620458a4e8b3614da340`。文本请求使用 OpenAI SDK 的
-`embeddings.create()`；SDK 尚未声明类型的多模态 `messages` 也只通过同一 SDK 的低层
-`post()` 发送，不另写 HTTP 客户端。数据库按 `space_id/space_revision` 检索、按
-`model_id/revision` 保留真实生产者；升级任一编码器都创建新空间并重建，不把未经验证的版本混查。
-API 因此不加载 Jina 权重，模型只存在于 Worker 或独立 serving 进程。
+生产实现只使用一个编码器 `jina-embeddings-v5-omni-small-retrieval`，固定 revision
+`12949877f0092093f366c6450340011320152a05`；query 与 document 的差别完全由 retrieval prompt
+承担，不由模型承担。编码器仍然分布在不同进程中：Memory Worker 通过 Hugging Face
+`sentence-transformers` 的 `encode_document()` 生成 EvidenceSpan 向量，并通过 vLLM
+OpenAI-compatible endpoint 批量生成 Event/Claim/Summary document 向量；API 通过同一个 endpoint
+生成 query 向量并编码显式记忆。文本请求使用 OpenAI SDK 的 `embeddings.create()`；SDK 尚未声明
+类型的多模态 `messages` 也只通过同一 SDK 的低层 `post()` 发送，不另写 HTTP 客户端。数据库按
+`space_id/space_revision` 检索、按 `model_id/revision` 保留真实生产者；升级编码器创建新空间并
+重建，不把未经验证的版本混查。API 因此不加载 Jina 权重，模型只存在于 Worker 或独立 serving
+进程。
 
 同一对象、编码器 revision、空间和 task 的向量写入保持幂等。考虑 GPU/F16 serving 对同一文本可能
 产生末位浮点抖动，重放向量的余弦相似度不低于 `0.999999` 时视为同一内容；低于阈值仍作为
@@ -695,7 +700,7 @@ Event 向量相似度扩展最多 64 个候选。Omni/VLM 必须直接读取候�
 EvidenceSpan，并通过严格 schema 返回互不重叠的 Event 分组；摘要相似本身不能触发合并。
 
 应用层随后确定性派生 Episode、联合 Observation/Evidence 来源、verified Episodic
-MemoryRecord、`contains`/`same_episode`/`represented_by` 关系以及 Text Small Event 向量。
+MemoryRecord、`contains`/`same_episode`/`represented_by` 关系以及 Omni Small Event 向量。
 Episode 内按发生时间排序且互不重叠的相邻 Event 还会写成对的 `before`/`after` 边；重叠 Event
 不强行排序，只连接相邻项以保持线性边数。一次
 PostgreSQL 事务按稳定顺序锁定全部子 Event，只有仍为 active、基础层且未被占用的完整分组才能
@@ -709,7 +714,7 @@ Claim 路径只枚举当前、未被吸收的 verified Claim，以共享 Entity 
 Omni/VLM 直接检查每条 Claim 对应的原始图像、视频和音频，通过严格 schema 产生两类互斥结果：
 
 - 两条及以上独立证据支持同一持久事实时，生成一个联合全部 EvidenceSpan 和 Entity 的 verified
-  Semantic Claim、Semantic MemoryRecord、Text Small Claim 向量，以及来源 Claim 指向新 Claim
+  Semantic Claim、Semantic MemoryRecord、Omni Small Claim 向量，以及来源 Claim 指向新 Claim
   的 `supports` 边；
 - 证据不兼容时只生成显式有向 `contradicts` 或 `supersedes` 边；`supersedes` 的来源必须是时间上
   更晚的 Claim，并同时关闭旧 Claim 及其所代表的 MemoryRecord。
@@ -732,7 +737,7 @@ Session。
 冻结 Omni/VLM 直接检查候选引用的原始图像、视频和音频，并通过严格 schema 返回互不重叠的
 Memory 分组、`session/day/person/place/topic` scope、摘要和 salience。只有全部来源均为 verified
 且联合 EvidenceSpan 非空时，新 Summary 才是 verified；只要含 attested 来源就生成 unverified
-导航摘要，绝不把调用者陈述升级为传感器事实。Text Small 为每个新 Summary 生成对齐的 1024 维
+导航摘要，绝不把调用者陈述升级为传感器事实。Omni Small 为每个新 Summary 生成对齐的 1024 维
 Memory document 向量；稳定 ID 包含来源 Memory、scope、Omni revision、Prompt version 和固定
 `evaluated_at`。
 
@@ -1457,7 +1462,7 @@ job→first claim/searchable ready，以及 recall→first answer/complete。His
 - 固化本文的 Event、EvidenceSpan、Claim、Embedding schema；
 - 建立 `pyproject.toml`，配置 Ruff、mypy、pytest 和最小 CI 门禁；
 - 建立 LoCoMo 和一个多模态 Benchmark 的最小适配器；
-- 跑通 Jina v5 Omni Small、Text Small 和一个 Omni/VLM；
+- 跑通 Jina v5 Omni Small 和一个 Omni/VLM；
 - 产出可复现的 baseline run manifest。
 
 验收：同一输入可重复写入且不重复建忆；Recall 能返回答案和可打开的证据时间段。
@@ -1578,7 +1583,6 @@ Entity/Bridge/Scene/Horizon cue 明确推迟到完整数据证明增益之后，
 
 - [jina-embeddings-v5-omni paper](https://arxiv.org/abs/2605.08384)
 - [jina-embeddings-v5-omni-small](https://huggingface.co/jinaai/jina-embeddings-v5-omni-small)
-- [jina-embeddings-v5-text-small-retrieval](https://huggingface.co/jinaai/jina-embeddings-v5-text-small-retrieval)
 - [jina-embeddings-v5-omni-nano](https://huggingface.co/jinaai/jina-embeddings-v5-omni-nano)
 
 ### 19.3 端侧人物一致性感知

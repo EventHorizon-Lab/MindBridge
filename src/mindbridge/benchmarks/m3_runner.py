@@ -294,14 +294,6 @@ def _observe_request(
     )
 
 
-def _clip_duration_ms(clip: M3PreparedClip) -> int:
-    duration_ms = (
-        clip.media_object.duration_ms if clip.media_object is not None else clip.duration_ms
-    )
-    assert duration_ms is not None
-    return duration_ms
-
-
 def _caption_memories(caption: str) -> tuple[tuple[str, MemoryType, str], ...]:
     """Keep released observations and inferences in their native memory channels."""
     lines = tuple(line.strip() for line in caption.splitlines() if line.strip())
@@ -389,3 +381,11 @@ async def _answer_question(
         mindbridge_evidence_ids=tuple(evidence.evidence_id for evidence in result.evidence),
         mindbridge_trace_id=result.trace_id,
     )
+
+
+def _clip_duration_ms(clip: M3PreparedClip) -> int:
+    duration_ms = (
+        clip.media_object.duration_ms if clip.media_object is not None else clip.duration_ms
+    )
+    assert duration_ms is not None
+    return duration_ms

@@ -7,7 +7,7 @@ import os
 import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Annotated, TypeAlias, cast
 
@@ -23,7 +23,9 @@ from mindbridge.core import (
     MemoryIntegrityError,
     ModelReference,
     derive_stable_id,
+    utc_now,
 )
+from mindbridge.edge._sqlite import connect as sqlite_connect
 from mindbridge.edge.identity_schema import initialize_identity_tables
 
 _NONCE_BYTES = 12
@@ -160,7 +162,7 @@ class SQLiteIdentityMemory:
         self._device_id = device_id
         self._cipher = AESGCM(encryption_key)
         self._maximum_samples_per_identity = maximum_samples_per_identity
-        self._clock = clock or _utc_now
+        self._clock = clock or utc_now
         with self._connect() as connection:
             initialize_identity_tables(connection)
         os.chmod(database_path, 0o600)
@@ -616,11 +618,7 @@ class SQLiteIdentityMemory:
         )
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self._database_path, timeout=30)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA journal_mode = WAL")
-        connection.execute("PRAGMA synchronous = FULL")
-        return connection
+        return sqlite_connect(self._database_path)
 
     def _now(self) -> datetime:
         now = self._clock()
@@ -751,7 +749,3 @@ def _require_non_empty(**values: str) -> None:
     for name, value in values.items():
         if not value.strip():
             raise ValueError(f"{name} must not be empty")
-
-
-def _utc_now() -> datetime:
-    return datetime.now(timezone.utc)

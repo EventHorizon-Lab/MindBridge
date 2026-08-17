@@ -6,7 +6,7 @@ import hashlib
 import json
 import math
 from collections.abc import Callable
-from datetime import datetime, timezone
+from datetime import datetime
 
 from mindbridge.application.capabilities import (
     Embedder,
@@ -73,6 +73,7 @@ from mindbridge.core import (
     VerificationStatus,
     derive_observation_id,
     derive_stable_id,
+    utc_now,
 )
 from mindbridge.telemetry import (
     current_trace_id,
@@ -110,7 +111,7 @@ class MemoryKernel:
         self._media_url_signer = media_url_signer
         self._observation_job_publisher = observation_job_publisher
         self._embedder = embedder
-        self._clock = clock or _utc_now
+        self._clock = clock or utc_now
         self._recall = RecallMemories(
             store,
             answerer,
@@ -556,7 +557,3 @@ def _request_digest(request: ContractModel) -> str:
     payload = request.model_dump(mode="json", exclude={"idempotency_key"})
     canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-
-
-def _utc_now() -> datetime:
-    return datetime.now(timezone.utc)
