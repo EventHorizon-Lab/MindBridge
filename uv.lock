@@ -873,6 +873,8 @@ benchmarks = [
 ]
 cloud-models = [
     { name = "av" },
+    { name = "numpy", version = "2.2.6", source = { registry = "https://mirrors.aliyun.com/pypi/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "numpy", version = "2.4.6", source = { registry = "https://mirrors.aliyun.com/pypi/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "opentelemetry-api" },
     { name = "pillow" },
     { name = "sentence-transformers" },
@@ -889,6 +891,13 @@ edge = [
     { name = "opentelemetry-instrumentation-botocore" },
     { name = "opentelemetry-instrumentation-httpx" },
     { name = "opentelemetry-sdk" },
+]
+media = [
+    { name = "av" },
+    { name = "numpy", version = "2.2.6", source = { registry = "https://mirrors.aliyun.com/pypi/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "numpy", version = "2.4.6", source = { registry = "https://mirrors.aliyun.com/pypi/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "pillow" },
+    { name = "soundfile" },
 ]
 server = [
     { name = "boto3" },
@@ -920,7 +929,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "av", marker = "extra == 'cloud-models'", specifier = ">=16,<17" },
+    { name = "av", marker = "extra == 'media'", specifier = ">=16,<17" },
     { name = "boto3", marker = "extra == 'edge'", specifier = ">=1.40,<2" },
     { name = "boto3", marker = "extra == 'server'", specifier = ">=1.40,<2" },
     { name = "celery", extras = ["redis"], marker = "extra == 'server'", specifier = ">=5.6,<6" },
@@ -928,6 +937,8 @@ requires-dist = [
     { name = "fastapi", marker = "extra == 'server'", specifier = ">=0.116,<1" },
     { name = "httpx", specifier = ">=0.28,<1" },
     { name = "mcp", marker = "extra == 'server'", specifier = ">=2,<3" },
+    { name = "mindbridge", extras = ["media"], marker = "extra == 'cloud-models'" },
+    { name = "numpy", marker = "extra == 'media'", specifier = ">=1.26,<3" },
     { name = "openai", marker = "extra == 'edge'", specifier = ">=2,<3" },
     { name = "openai", marker = "extra == 'server'", specifier = ">=2,<3" },
     { name = "opentelemetry-api", marker = "extra == 'cloud-models'", specifier = ">=1.44,<2" },
@@ -945,17 +956,17 @@ requires-dist = [
     { name = "opentelemetry-sdk", marker = "extra == 'edge'", specifier = ">=1.44,<2" },
     { name = "opentelemetry-sdk", marker = "extra == 'server'", specifier = ">=1.44,<2" },
     { name = "pgvector", marker = "extra == 'server'", specifier = ">=0.4,<1" },
-    { name = "pillow", marker = "extra == 'cloud-models'", specifier = ">=12,<13" },
+    { name = "pillow", marker = "extra == 'media'", specifier = ">=12,<13" },
     { name = "psycopg", extras = ["binary", "pool"], marker = "extra == 'server'", specifier = ">=3.2,<4" },
     { name = "pyarrow", marker = "extra == 'benchmarks'", specifier = ">=18,<26" },
     { name = "pydantic", specifier = ">=2.10,<3" },
     { name = "sentence-transformers", marker = "extra == 'cloud-models'", specifier = ">=5.2,<6" },
-    { name = "soundfile", marker = "extra == 'cloud-models'", specifier = ">=0.13,<1" },
+    { name = "soundfile", marker = "extra == 'media'", specifier = ">=0.13,<1" },
     { name = "torch", marker = "extra == 'cloud-models'", specifier = "==2.9.1", index = "https://download.pytorch.org/whl/cu128" },
     { name = "transformers", marker = "extra == 'cloud-models'", specifier = ">=5.1,<6" },
     { name = "uvicorn", marker = "extra == 'server'", specifier = ">=0.35,<1" },
 ]
-provides-extras = ["benchmarks", "edge", "server", "cloud-models"]
+provides-extras = ["benchmarks", "edge", "server", "media", "cloud-models"]
 
 [package.metadata.requires-dev]
 dev = [
