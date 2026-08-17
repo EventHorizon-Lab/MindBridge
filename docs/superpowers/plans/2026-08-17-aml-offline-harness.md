@@ -30,6 +30,8 @@ Spec: [docs/superpowers/specs/2026-08-17-aml-offline-harness-design.md](../specs
 
   Note `pytest -W error`: any warning fails the build. Without `--all-groups --extra edge --extra server`, roughly 33 test modules fail to collect on missing `opentelemetry` and `mcp` — that is an unsynced environment, not a broken test.
 - `ContractModel` is `extra="forbid", frozen=True`. AML **request** models override this to `extra="ignore"` because we do not own that contract; **response** models stay strict.
+- **Nothing under `src/mindbridge/application/` may import `mindbridge.models`** — `tests/test_package.py::test_application_does_not_depend_on_model_adapters` enforces it. Import capability types from `mindbridge.application.capabilities`, which is what `mindbridge.models` re-exports. For the same reason, the application layer must not import `mindbridge.api` either; describe what it needs with a local `Protocol`.
+- `ruff format` formats Python code blocks inside markdown, so this plan document is itself covered by the gate. Fence incomplete Python fragments as `text`, not `python`.
 
 ---
 
@@ -850,7 +852,7 @@ In `src/mindbridge/api/runtime.py`, add two optional settings fields alongside t
     aml_tenant_prefix: str = "bench_aml"
 ```
 
-```python
+```text
             aml_api_key=optional_environment_value(source, "MINDBRIDGE_AML_API_KEY"),
             aml_tenant_prefix=source.get("MINDBRIDGE_AML_TENANT_PREFIX", "bench_aml"),
 ```
