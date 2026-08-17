@@ -35,13 +35,10 @@ class MediaKind(str, Enum):
 
 
 class SensorKind(str, Enum):
-    """Sensor that produced an observation."""
+    """Sensor that produced an observation; each one must carry MediaKind evidence."""
 
     CAMERA = "camera"
     MICROPHONE = "microphone"
-    GAZE = "gaze"
-    IMU = "imu"
-    ROBOT_STATE = "robot_state"
 
 
 @dataclass(frozen=True, slots=True)

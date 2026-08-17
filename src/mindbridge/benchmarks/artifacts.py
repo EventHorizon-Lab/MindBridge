@@ -38,7 +38,6 @@ class DeploymentSnapshot(ContractModel):
 
     server_generator: PluginSnapshot
     server_embedder: PluginSnapshot
-    server_reranker: PluginSnapshot | None = None
     worker_generator: PluginSnapshot | None = None
     worker_media_embedder: PluginSnapshot | None = None
     worker_text_embedder: PluginSnapshot | None = None

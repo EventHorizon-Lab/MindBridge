@@ -14,7 +14,6 @@ def test_settings_use_deployable_defaults_and_redact_credentials() -> None:
 
     assert settings.generator_plugin == "openai"
     assert settings.embedder_plugin == "openai"
-    assert settings.reranker_plugin is None
     assert settings.generator_config["model_id"] == "qwen3.8-max"
     assert settings.generator_config["model_revision"] == "deployment-revision"
     assert settings.embedder_config["model_id"] == (
@@ -69,7 +68,7 @@ def test_rest_fails_closed_without_tenant_credentials() -> None:
         create_app(_settings())
 
 
-async def test_runtime_closes_a_falsey_reranker(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_runtime_closes_every_model_and_the_store(monkeypatch: pytest.MonkeyPatch) -> None:
     closed: list[str] = []
 
     class Model:
@@ -93,11 +92,9 @@ async def test_runtime_closes_a_falsey_reranker(monkeypatch: pytest.MonkeyPatch)
             closed.append("store")
 
     generator = Model("generator")
-    embedder = Model("embedder")
-    reranker = Model("reranker", falsey=True)
+    embedder = Model("embedder", falsey=True)
     monkeypatch.setattr(runtime_module, "load_generator", lambda *_arguments: generator)
     monkeypatch.setattr(runtime_module, "load_embedder", lambda *_arguments: embedder)
-    monkeypatch.setattr(runtime_module, "load_reranker", lambda *_arguments: reranker)
     monkeypatch.setattr(
         runtime_module, "PostgresMemoryStore", lambda *_arguments, **_options: Store()
     )
@@ -110,11 +107,11 @@ async def test_runtime_closes_a_falsey_reranker(monkeypatch: pytest.MonkeyPatch)
     )
     monkeypatch.setattr(runtime_module, "MemoryKernel", lambda *_arguments, **_options: object())
 
-    runtime = runtime_module._build_runtime(_settings(reranker_plugin="falsey", reranker_config={}))
+    runtime = runtime_module._build_runtime(_settings())
     async with runtime.open():
         pass
 
-    assert closed == ["store", "reranker", "embedder", "generator"]
+    assert closed == ["store", "embedder", "generator"]
 
 
 async def test_startup_rejects_a_space_no_stored_vector_can_match() -> None:
