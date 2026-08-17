@@ -17,7 +17,18 @@ Spec: [docs/superpowers/specs/2026-08-17-aml-offline-harness-design.md](../specs
 - **All code we write uses `AsyncOpenAI`**, reached through the existing `mindbridge.models.openai.OpenAIGenerator`. Do not hand-roll HTTP calls to `/chat/completions`.
 - **`GET /healthz` is not renamed and gets no alias.** The AML submission form carries the custom path.
 - Prompts live in `mindbridge.prompts` as `PromptSpec` entries registered in `ALL_PROMPTS`, with a sha256 in `tests/contracts/test_prompt_catalog.py`.
-- Repository gate is `bash scripts/ci.sh`. Run it before the final commit of each task that touches `src/`.
+- Repository gate is the sequence in `.github/workflows/ci.yml`. There is no `scripts/ci.sh`. Run it before the final commit of each task that touches `src/`:
+
+  ```bash
+  uv sync --frozen --all-groups --extra edge --extra server
+  uv run --frozen ruff format --check .
+  uv run --frozen ruff check .
+  uv run --frozen mypy
+  uv run --frozen pytest -W error
+  git diff --check
+  ```
+
+  Note `pytest -W error`: any warning fails the build. Without `--all-groups --extra edge --extra server`, roughly 33 test modules fail to collect on missing `opentelemetry` and `mcp` — that is an unsynced environment, not a broken test.
 - `ContractModel` is `extra="forbid", frozen=True`. AML **request** models override this to `extra="ignore"` because we do not own that contract; **response** models stay strict.
 
 ---
