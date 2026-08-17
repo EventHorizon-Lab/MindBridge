@@ -9,7 +9,8 @@ from pathlib import Path
 from mindbridge.benchmarks.aml.loaders.personamem_v1 import load
 
 # Persona "ctx-1" has 5 messages; its two questions were generated against
-# different prefixes of that same shared context (2 messages, then 4).
+# different prefixes of that same shared context (2 messages, then 4) -- they
+# must land in two separate cases, one per truncation point.
 _CONTEXTS = {
     "ctx-1": [
         {"role": "user", "content": "User: hi, I'm planning a trip"},
@@ -70,42 +71,51 @@ def _write_fixture(tmp_path: Path) -> tuple[Path, Path]:
     return questions_path, contexts_path
 
 
-def test_load_groups_questions_by_shared_context_id(tmp_path: Path) -> None:
+def test_load_splits_one_scope_into_one_case_per_truncation_point(tmp_path: Path) -> None:
+    """Would fail under the old "one case per shared_context_id" grouping.
+
+    Under that grouping, ctx-1's two questions (end indices 2 and 4) would
+    collapse into a single case, and whichever message list won would either
+    starve the shorter question of nothing extra or leak later messages into
+    it. Splitting by (shared_context_id, end_index) keeps them apart.
+    """
     questions_csv, contexts_jsonl = _write_fixture(tmp_path)
     cases = load(questions_csv, contexts_jsonl)
 
-    assert len(cases) == 2
-    case1, case2 = cases
+    assert len(cases) == 3
+    ctx1_cases = [case for case in cases if case.user_id.startswith("personamem-v1:ctx-1:")]
+    assert len(ctx1_cases) == 2
 
-    assert case1.user_id == "personamem-v1:ctx-1"
-    assert len(case1.questions) == 2
-    assert case2.user_id == "personamem-v1:ctx-2"
-    assert len(case2.questions) == 1
+    short_case, long_case = sorted(ctx1_cases, key=lambda case: len(case.messages))
+    assert short_case.user_id == "personamem-v1:ctx-1:2"
+    assert long_case.user_id == "personamem-v1:ctx-1:4"
+    assert short_case.user_id != long_case.user_id
+    assert len(short_case.messages) == 2
+    assert len(long_case.messages) == 4
+
+    # The shorter case's messages are an exact prefix of the longer case's.
+    short_contents = [message["content"] for message in short_case.messages]
+    long_contents = [message["content"] for message in long_case.messages]
+    assert long_contents[: len(short_contents)] == short_contents
+
+    [short_question] = short_case.questions
+    [long_question] = long_case.questions
+    assert short_question.question_id == "q-0001"
+    assert long_question.question_id == "q-0002"
 
 
-def test_load_carries_the_full_untruncated_shared_context_per_case(tmp_path: Path) -> None:
+def test_load_truncates_messages_to_the_case_group_end_index(tmp_path: Path) -> None:
     questions_csv, contexts_jsonl = _write_fixture(tmp_path)
     cases = load(questions_csv, contexts_jsonl)
-    case1 = cases[0]
+    case = next(case for case in cases if case.user_id == "personamem-v1:ctx-1:2")
 
-    # The case-level history is the FULL persona conversation, not truncated to
-    # any single question's end_index -- see the module docstring for why.
-    assert [message["content"] for message in case1.messages] == [
+    assert [message["content"] for message in case.messages] == [
         "User: hi, I'm planning a trip",
         "Assistant: sounds fun, where to?",
-        "User: maybe Japan",
-        "Assistant: great choice",
-        "User: what should I pack",
     ]
-    assert [message["role"] for message in case1.messages] == [
-        "user",
-        "assistant",
-        "user",
-        "assistant",
-        "user",
-    ]
+    assert [message["role"] for message in case.messages] == ["user", "assistant"]
     # PersonaMem messages carry no timestamps at all.
-    assert all(message["timestamp"] is None for message in case1.messages)
+    assert all(message["timestamp"] is None for message in case.messages)
 
 
 def test_load_builds_the_official_payload_and_keeps_all_options_a_string(
@@ -113,39 +123,38 @@ def test_load_builds_the_official_payload_and_keeps_all_options_a_string(
 ) -> None:
     questions_csv, contexts_jsonl = _write_fixture(tmp_path)
     cases = load(questions_csv, contexts_jsonl)
-    case1 = cases[0]
+    case = next(case for case in cases if case.user_id == "personamem-v1:ctx-1:2")
 
-    q1, q2 = case1.questions
-    assert q1.question_id == "q-0001"
-    assert q1.question == "Where is the user planning to travel?"
-    assert q1.payload["id"] == "q-0001"
-    assert q1.payload["correct_answer"] == "(c)"
+    [question] = case.questions
+    assert question.question_id == "q-0001"
+    assert question.question == "Where is the user planning to travel?"
+    assert question.payload["id"] == "q-0001"
+    assert question.payload["correct_answer"] == "(c)"
     # This must stay a plain string -- the vendored pipeline raises TypeError
     # if `all_options` is anything else (e.g. a list of option strings).
-    assert q1.payload["all_options"] == "(a) France\n(b) Italy\n(c) Japan\n(d) Germany"
-    assert isinstance(q1.payload["all_options"], str)
-    assert not isinstance(q1.payload["all_options"], list)
+    assert question.payload["all_options"] == "(a) France\n(b) Italy\n(c) Japan\n(d) Germany"
+    assert isinstance(question.payload["all_options"], str)
+    assert not isinstance(question.payload["all_options"], list)
 
-    # Different questions in the same scope truncate the shared context at
-    # different points -- that per-question cut point rides along in the
-    # payload so a driver can slice `case.messages` correctly per question.
-    assert q1.payload["end_index_in_shared_context"] == 2
-    assert q2.payload["end_index_in_shared_context"] == 4
+    # end_index_in_shared_context is now expressed by the case split (the
+    # user_id / message truncation), not duplicated into the payload.
+    assert "end_index_in_shared_context" not in question.payload
+    assert question.payload == {
+        "id": "q-0001",
+        "all_options": "(a) France\n(b) Italy\n(c) Japan\n(d) Germany",
+        "correct_answer": "(c)",
+    }
 
 
 def test_load_scopes_second_persona_independently(tmp_path: Path) -> None:
     questions_csv, contexts_jsonl = _write_fixture(tmp_path)
     cases = load(questions_csv, contexts_jsonl)
-    case2 = cases[1]
+    case = next(case for case in cases if case.user_id == "personamem-v1:ctx-2:1")
 
-    assert [message["content"] for message in case2.messages] == [
-        "User: I like hiking",
-        "Assistant: noted",
-    ]
-    [question] = case2.questions
+    assert [message["content"] for message in case.messages] == ["User: I like hiking"]
+    [question] = case.questions
     assert question.payload == {
         "id": "q-0003",
         "all_options": "(a) swimming\n(b) hiking\n(c) chess\n(d) cooking",
         "correct_answer": "(b)",
-        "end_index_in_shared_context": 1,
     }
