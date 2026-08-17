@@ -7,23 +7,31 @@ import asyncio
 import json
 import os
 from collections.abc import Sequence
-from dataclasses import dataclass
-from datetime import datetime, timezone
+from dataclasses import dataclass, replace
+from datetime import datetime
 
+from mindbridge.application.evidence_clips import (
+    reclaim_orphan_clips as reclaim_orphan_clips_use_case,
+)
 from mindbridge.application.lifecycle import (
     EvolveMemoryLifecycle,
     LifecycleSweepRequest,
     MemoryLifecycleStore,
 )
-from mindbridge.configuration import parse_aware_datetime, require_environment_value
+from mindbridge.configuration import (
+    parse_aware_datetime,
+    require_environment_value,
+)
 from mindbridge.core import (
     DEFAULT_MEMORY_STRENGTH_POLICY,
     MemoryId,
     MemoryIntegrityError,
     MemoryStrengthPolicy,
     TenantId,
+    utc_now,
 )
 from mindbridge.infrastructure.postgres import PostgresMemoryStore
+from mindbridge.infrastructure.s3 import S3MediaAccess
 from mindbridge.telemetry import configure_telemetry
 
 
@@ -36,6 +44,7 @@ class LifecycleSweepSummary:
     page_count: int
     evaluated_count: int
     updated_count: int
+    reclaimed_clip_count: int | None = None
 
 
 async def sweep_tenant_lifecycle(
@@ -95,6 +104,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             options.evaluated_at,
             page_size=options.page_size,
             policy=policy,
+            reclaim_orphan_clips=options.reclaim_orphan_clips,
         )
     )
     print(
@@ -105,6 +115,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "page_count": summary.page_count,
                 "tenant_id": summary.tenant_id,
                 "updated_count": summary.updated_count,
+                "reclaimed_clip_count": summary.reclaimed_clip_count,
             },
             sort_keys=True,
         )
@@ -118,17 +129,27 @@ async def _run_postgres_sweep(
     *,
     page_size: int,
     policy: MemoryStrengthPolicy,
+    reclaim_orphan_clips: bool = False,
 ) -> LifecycleSweepSummary:
+    # Build object storage before the sweep so a missing variable fails fast
+    # instead of after every memory in the tenant has already been evaluated.
+    media_access = S3MediaAccess.from_environment() if reclaim_orphan_clips else None
     store = PostgresMemoryStore(database_url)
     await store.open()
     try:
-        return await sweep_tenant_lifecycle(
+        summary = await sweep_tenant_lifecycle(
             store,
             tenant_id,
             evaluated_at,
             page_size=page_size,
             policy=policy,
         )
+        if media_access is None:
+            return summary
+        reclaimed = await reclaim_orphan_clips_use_case(
+            tenant_id, janitor=media_access, digests=store
+        )
+        return replace(summary, reclaimed_clip_count=reclaimed.reclaimed_count)
     finally:
         await store.close()
 
@@ -137,8 +158,16 @@ def _parser() -> argparse.ArgumentParser:
     policy = DEFAULT_MEMORY_STRENGTH_POLICY
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tenant-id", required=True)
-    parser.add_argument("--evaluated-at", type=parse_aware_datetime, default=_utc_now())
+    parser.add_argument("--evaluated-at", type=parse_aware_datetime, default=utc_now())
     parser.add_argument("--page-size", type=int, default=100)
+    parser.add_argument(
+        "--reclaim-orphan-clips",
+        action="store_true",
+        help=(
+            "also delete derived clip objects no committed record references; "
+            "requires the object storage variables"
+        ),
+    )
     parser.add_argument("--access-weight", type=float, default=policy.access_weight)
     parser.add_argument(
         "--positive-feedback-weight", type=float, default=policy.positive_feedback_weight
@@ -150,10 +179,6 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--strengthen-at", type=float, default=policy.strengthen_at)
     parser.add_argument("--cold-below", type=float, default=policy.cold_below)
     return parser
-
-
-def _utc_now() -> datetime:
-    return datetime.now(timezone.utc)
 
 
 if __name__ == "__main__":

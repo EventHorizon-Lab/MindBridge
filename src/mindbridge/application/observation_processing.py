@@ -9,6 +9,7 @@ from mindbridge.core import (
     Entity,
     EntityMention,
     Event,
+    EvidenceClip,
     EvidenceSpan,
     MediaObject,
     MemoryRecord,
@@ -58,10 +59,13 @@ class ObservationProcessingOutput:
     memories: tuple[MemoryRecord, ...]
     relations: tuple[Relation, ...]
     embeddings: tuple[EmbeddingRecord, ...]
+    media_objects: tuple[MediaObject, ...] = ()
+    evidence_clips: tuple[EvidenceClip, ...] = ()
 
     def __post_init__(self) -> None:
         identifiers = _output_identifiers(self)
         _require_unique_ids(identifiers)
+        _require_valid_clips(self)
         _require_single_tenant(self)
         _require_valid_graph(self, identifiers)
 
@@ -78,6 +82,10 @@ def _output_identifiers(
         "memory": tuple(str(item.memory_id) for item in output.memories),
         "relation": tuple(str(item.relation_id) for item in output.relations),
         "embedding": tuple(str(item.embedding_id) for item in output.embeddings),
+        "clip media object": tuple(str(item.media_object_id) for item in output.media_objects),
+        "evidence clip": tuple(
+            f"{item.evidence_id}:{item.ordinal}" for item in output.evidence_clips
+        ),
     }
 
 
@@ -99,11 +107,23 @@ def _require_single_tenant(output: ObservationProcessingOutput) -> None:
             output.memories,
             output.relations,
             output.embeddings,
+            output.media_objects,
+            output.evidence_clips,
         )
         for item in items
     }
     if len(tenant_ids) > 1:
         raise DomainInvariantError("derived records must belong to one tenant")
+
+
+def _require_valid_clips(output: ObservationProcessingOutput) -> None:
+    """Every clip must point at a span and a media object derived in this batch."""
+    derived_evidence_ids = {str(span.evidence_id) for span in output.evidence_spans}
+    if not {str(clip.evidence_id) for clip in output.evidence_clips} <= derived_evidence_ids:
+        raise DomainInvariantError("evidence clips must reference derived evidence spans")
+    clip_media_ids = {str(item.media_object_id) for item in output.media_objects}
+    if not {str(clip.media_object_id) for clip in output.evidence_clips} <= clip_media_ids:
+        raise DomainInvariantError("evidence clips must reference derived media objects")
 
 
 def _require_valid_graph(

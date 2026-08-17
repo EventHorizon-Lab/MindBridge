@@ -19,11 +19,11 @@ from mindbridge.core import (
 )
 from mindbridge.infrastructure._postgres_evidence import write_evidence_spans
 from mindbridge.infrastructure._postgres_forget import (
-    ensure_media_not_scheduled_for_deletion,
     ensure_target_not_tombstoned,
 )
 from mindbridge.infrastructure._postgres_idempotency import claim_idempotency_key
 from mindbridge.infrastructure._postgres_jobs import ensure_observation_processing_job
+from mindbridge.infrastructure._postgres_media import write_media_object
 from mindbridge.infrastructure._postgres_observation_reads import read_observation
 from mindbridge.infrastructure._postgres_types import (
     DatabaseConnection,
@@ -180,81 +180,11 @@ async def _write_media_objects(
 ) -> dict[MediaObjectId, MediaObjectId]:
     canonical_ids: dict[MediaObjectId, MediaObjectId] = {}
     for media_object in media_objects:
-        canonical_id = await _write_media_object(connection, media_object)
+        canonical_id = await write_media_object(connection, media_object)
         if canonical_id in canonical_ids.values():
             raise DomainInvariantError("observation media objects must have unique content")
         canonical_ids[media_object.media_object_id] = canonical_id
     return canonical_ids
-
-
-async def _write_media_object(
-    connection: DatabaseConnection,
-    media_object: MediaObject,
-) -> MediaObjectId:
-    cursor = await connection.execute(
-        """
-        INSERT INTO media_objects (
-            tenant_id, media_object_id, kind, uri, sha256, size_bytes, duration_ms, created_at
-        )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-        ON CONFLICT DO NOTHING
-        RETURNING media_object_id
-        """,
-        (
-            media_object.tenant_id,
-            media_object.media_object_id,
-            media_object.kind.value,
-            media_object.uri,
-            media_object.sha256,
-            media_object.size_bytes,
-            media_object.duration_ms,
-            media_object.created_at,
-        ),
-    )
-    row = await cursor.fetchone()
-    if row is not None:
-        return MediaObjectId(cast(tuple[str], row)[0])
-    existing = await _find_media_object(connection, media_object, by_content_hash=False)
-    if existing is None:
-        existing = await _find_media_object(connection, media_object, by_content_hash=True)
-    if existing is None:
-        raise MemoryIntegrityError("media object conflict could not be resolved")
-    existing_id, kind, sha256, size_bytes, duration_ms = existing
-    await ensure_media_not_scheduled_for_deletion(
-        connection,
-        media_object.tenant_id,
-        existing_id,
-    )
-    if (
-        kind != media_object.kind.value
-        or sha256 != media_object.sha256
-        or size_bytes != media_object.size_bytes
-        or duration_ms != media_object.duration_ms
-    ):
-        raise DomainInvariantError("media identity conflicts with immutable metadata")
-    return MediaObjectId(existing_id)
-
-
-async def _find_media_object(
-    connection: DatabaseConnection,
-    media_object: MediaObject,
-    *,
-    by_content_hash: bool,
-) -> tuple[str, str, str, int, int | None] | None:
-    field_name = "sha256" if by_content_hash else "media_object_id"
-    field_value = media_object.sha256 if by_content_hash else media_object.media_object_id
-    cursor = await connection.execute(
-        f"""
-        SELECT media.media_object_id, media.kind, media.sha256,
-               media.size_bytes, media.duration_ms
-        FROM media_objects AS media
-        WHERE media.tenant_id = %s AND media.{field_name} = %s
-        FOR KEY SHARE OF media
-        """,
-        (media_object.tenant_id, field_value),
-    )
-    row = await cursor.fetchone()
-    return None if row is None else cast(tuple[str, str, str, int, int | None], row)
 
 
 async def _write_observation_media(

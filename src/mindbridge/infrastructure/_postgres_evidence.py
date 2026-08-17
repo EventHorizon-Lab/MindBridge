@@ -4,12 +4,18 @@ from datetime import datetime
 from typing import TypeAlias, cast
 
 from mindbridge.core import (
+    EvidenceClip,
     EvidenceId,
     EvidenceSpan,
+    MediaObject,
     MediaObjectId,
     ObservationId,
     PixelRegion,
     TenantId,
+)
+from mindbridge.infrastructure._postgres_media import (
+    link_observation_media,
+    write_media_object,
 )
 from mindbridge.infrastructure._postgres_types import (
     DatabaseConnection,
@@ -161,3 +167,77 @@ def evidence_from_row(row: EvidenceRow) -> EvidenceSpan:
         region=region,
         audio_track=audio_track,
     )
+
+
+async def write_evidence_clips(
+    connection: DatabaseConnection,
+    tenant_id: TenantId,
+    observation_id: ObservationId,
+    media_objects: tuple[MediaObject, ...],
+    clips: tuple[EvidenceClip, ...],
+) -> None:
+    """Persist derived clips and link them to the observation that owns them.
+
+    The observation link is what makes the existing forget sweep reclaim clip
+    objects: it already deletes media that no surviving observation references.
+    """
+    if not clips:
+        return
+    canonical_ids = {
+        media_object.media_object_id: await write_media_object(connection, media_object)
+        for media_object in media_objects
+    }
+    await link_observation_media(
+        connection,
+        tenant_id,
+        observation_id,
+        tuple(dict.fromkeys(canonical_ids.values())),
+    )
+    async with connection.cursor() as cursor:
+        await cursor.executemany(
+            """
+            INSERT INTO evidence_clips (
+                tenant_id, evidence_id, ordinal, media_object_id,
+                start_ms, end_ms, created_at
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT DO NOTHING
+            """,
+            (
+                (
+                    clip.tenant_id,
+                    clip.evidence_id,
+                    clip.ordinal,
+                    canonical_ids[clip.media_object_id],
+                    clip.start_ms,
+                    clip.end_ms,
+                    clip.created_at,
+                )
+                for clip in clips
+            ),
+        )
+
+
+async def list_known_clip_digests(
+    pool: DatabasePool,
+    tenant_id: TenantId,
+    digests: tuple[str, ...],
+) -> frozenset[str]:
+    """Return which content digests the database still accounts for.
+
+    Clip bytes are uploaded before the transaction that registers them, so a
+    rolled-back attempt leaves an object with no row at all. Object keys carry
+    the digest, which makes reclaiming them a set difference against this.
+    """
+    if not digests:
+        return frozenset()
+    async with tenant_connection(pool, tenant_id) as connection:
+        cursor = await connection.execute(
+            """
+            SELECT sha256 FROM media_objects
+            WHERE tenant_id = %s AND sha256 = ANY(%s)
+            """,
+            (tenant_id, list(digests)),
+        )
+        rows = await cursor.fetchall()
+    return frozenset(cast(str, row[0]) for row in rows)

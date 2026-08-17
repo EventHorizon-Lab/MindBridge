@@ -302,3 +302,10 @@ def parse_option_ranking(
     if re.search(r"[A-Za-z0-9]", residual):
         return ()
     return tuple(option_labels.index(label) for label in labels)
+
+
+def dot_product(left: tuple[float, ...], right: tuple[float, ...]) -> float:
+    """Cosine similarity for the L2-normalized vectors these runners compare."""
+    return sum(
+        left_value * right_value for left_value, right_value in zip(left, right, strict=True)
+    )

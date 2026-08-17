@@ -236,6 +236,9 @@ class MemoryRecord:
             raise DomainInvariantError("memory cannot supersede itself")
 
 
+DEFAULT_EMBEDDING_DIMENSION = 1_024
+
+
 @dataclass(frozen=True, slots=True)
 class EmbeddingRecord:
     """A versioned semantic vector that never mixes incompatible spaces."""
@@ -265,7 +268,7 @@ class EmbeddingRecord:
         if not all(math.isfinite(value) for value in self.values):
             raise DomainInvariantError("embedding values must be finite")
         if self.normalized and not math.isclose(
-            math.sqrt(sum(value * value for value in self.values)),
+            math.hypot(*self.values),
             1.0,
             rel_tol=1e-4,
             abs_tol=1e-6,

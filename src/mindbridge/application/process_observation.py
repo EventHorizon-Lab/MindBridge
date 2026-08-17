@@ -3,22 +3,20 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from dataclasses import replace
 from datetime import datetime, timedelta
 from time import perf_counter
 
 from mindbridge.application.capabilities import (
     Embedder,
-    EmbedRequest,
-    EmbedTask,
-    MediaPart,
-    ModelInput,
 )
 from mindbridge.application.derive_observation_graph import (
     derive_observation_graph,
     embed_observation_graph,
 )
 from mindbridge.application.evidence import resolve_evidence_media
+from mindbridge.application.evidence_clips import ClipSampling, derive_evidence_clips
 from mindbridge.application.observation_processing import ObservationProcessingOutput
 from mindbridge.application.perception import (
     EventPerception,
@@ -27,22 +25,20 @@ from mindbridge.application.perception import (
     time_ranges_overlap,
 )
 from mindbridge.application.ports import (
-    MediaUrlSigner,
+    DerivedMediaStore,
     ObservationProcessingStore,
     Perceiver,
 )
 from mindbridge.core import (
     DatabaseUnavailableError,
     DomainInvariantError,
-    EmbeddedObjectType,
-    EmbeddingId,
-    EmbeddingRecord,
     Event,
     EventId,
     EvidenceId,
     EvidenceSpan,
     JobId,
     JobState,
+    MediaObject,
     MemoryIntegrityError,
     ModelOutputError,
     ModelRequestError,
@@ -54,6 +50,7 @@ from mindbridge.core import (
     TenantId,
     derive_stable_id,
 )
+from mindbridge.media.clipping import ClipRequest, MediaClip, cut_clips
 from mindbridge.telemetry import (
     operation_span,
     record_stage_duration,
@@ -72,13 +69,17 @@ class ProcessObservation:
         media_embedder: Embedder,
         text_embedder: Embedder,
         *,
-        media_url_signer: MediaUrlSigner,
+        media_url_signer: DerivedMediaStore,
+        clip_sampling: ClipSampling | None = None,
+        clip_cutter: Callable[[bytes, ClipRequest], tuple[MediaClip, ...]] = cut_clips,
     ) -> None:
         self._store = store
         self._perceiver = perceiver
         self._media_embedder = media_embedder
         self._text_embedder = text_embedder
         self._media_url_signer = media_url_signer
+        self._clip_sampling = clip_sampling or ClipSampling()
+        self._clip_cutter = clip_cutter
 
     @trace_operation("mindbridge.process_observation")
     async def run(
@@ -148,17 +149,22 @@ class ProcessObservation:
                     "mindbridge.prompt.version": perception.prompt_version,
                 }
             )
+            # Clip the grounded event spans, not the whole-file source spans:
+            # a vector is only as precise as the span it was cut from.
             embedding_evidence = await resolve_evidence_media(
-                batch.evidence_spans,
-                batch.media_objects,
+                event_evidence,
+                _referenced_media(batch.media_objects, event_evidence),
                 self._media_url_signer,
             )
-            evidence_embeddings, graph_embeddings = await asyncio.gather(
-                _evidence_embeddings(
+            derived_clips, graph_embeddings = await asyncio.gather(
+                derive_evidence_clips(
                     tenant_id,
                     embedding_evidence,
-                    self._media_embedder,
-                    claim.job.created_at,
+                    store=self._media_url_signer,
+                    embedder=self._media_embedder,
+                    sampling=self._clip_sampling,
+                    created_at=claim.job.created_at,
+                    cut=self._clip_cutter,
                 ),
                 embed_observation_graph(
                     tenant_id,
@@ -176,7 +182,9 @@ class ProcessObservation:
                 claims=graph.claims,
                 memories=graph.memories,
                 relations=graph.relations,
-                embeddings=evidence_embeddings + graph_embeddings,
+                media_objects=derived_clips.media_objects,
+                evidence_clips=derived_clips.clips,
+                embeddings=derived_clips.embeddings + graph_embeddings,
             )
             with operation_span("mindbridge.process_observation.commit"):
                 completed = await self._store.commit_observation_processing(
@@ -204,6 +212,15 @@ class ProcessObservation:
                 error_code=_processing_error_code(error),
             )
             raise
+
+
+def _referenced_media(
+    media_objects: tuple[MediaObject, ...],
+    spans: tuple[EvidenceSpan, ...],
+) -> tuple[MediaObject, ...]:
+    """Keep only the media the given spans point at, as the resolver requires."""
+    required = {span.media_object_id for span in spans}
+    return tuple(item for item in media_objects if item.media_object_id in required)
 
 
 def _ground_events(
@@ -305,62 +322,6 @@ def _events(
             prompt_version=perception.prompt_version,
         )
         for ordinal, event in enumerate(perception.events)
-    )
-
-
-@trace_operation("mindbridge.process_observation.embed_evidence")
-async def _evidence_embeddings(
-    tenant_id: TenantId,
-    evidence: tuple[ResolvedEvidence, ...],
-    embedder: Embedder,
-    created_at: datetime,
-) -> tuple[EmbeddingRecord, ...]:
-    item_by_url = {item.media_url: item for item in evidence}
-    media_urls = tuple(item_by_url)
-    result = await embedder.embed(
-        EmbedRequest(
-            inputs=tuple(
-                ModelInput(
-                    (
-                        MediaPart(
-                            kind=item_by_url[url].media_object.kind,
-                            url=url,
-                            source_uri=item_by_url[url].media_object.uri,
-                        ),
-                    )
-                )
-                for url in media_urls
-            ),
-            task=EmbedTask.DOCUMENT,
-        )
-    )
-    if len(result.embeddings) != len(media_urls):
-        raise ModelOutputError("embedder returned the wrong evidence vector count")
-    embedding_by_url = dict(zip(media_urls, result.embeddings, strict=True))
-    return tuple(
-        EmbeddingRecord(
-            embedding_id=EmbeddingId(
-                derive_stable_id(
-                    "embedding",
-                    tenant_id,
-                    item.evidence_span.evidence_id,
-                    embedding_by_url[item.media_url].model_reference.model_id,
-                    embedding_by_url[item.media_url].model_reference.revision,
-                    EmbedTask.DOCUMENT.value,
-                )
-            ),
-            tenant_id=tenant_id,
-            object_type=EmbeddedObjectType.EVIDENCE_SPAN,
-            object_id=item.evidence_span.evidence_id,
-            values=embedding_by_url[item.media_url].values,
-            model_reference=embedding_by_url[item.media_url].model_reference,
-            space_reference=embedding_by_url[item.media_url].space_reference,
-            task=EmbedTask.DOCUMENT.value,
-            dimension=embedding_by_url[item.media_url].dimension,
-            normalized=True,
-            created_at=created_at,
-        )
-        for item in evidence
     )
 
 
