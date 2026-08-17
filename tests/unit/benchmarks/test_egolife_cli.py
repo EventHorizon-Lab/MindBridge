@@ -199,6 +199,7 @@ def _prepared() -> EgoLifePreparedStream:
 def _result() -> EgoLifeQuestionResult:
     return EgoLifeQuestionResult(
         id="1",
+        subject_id="A1_JAKE",
         question="Who used it?",
         answer="B",
         model_option="B",
