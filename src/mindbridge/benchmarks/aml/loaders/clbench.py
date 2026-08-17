@@ -137,7 +137,7 @@ def _case(record: _RawRecord) -> AmlCase:
         raise ValueError("CL-Bench record has no user/assistant turns to derive a question from")
     *prior, last = non_system
 
-    history_text, question_text = _split_question(last.content)
+    history_text, question_text, unsliced = _split_question(last.content)
     messages: list[dict[str, object]] = [
         {"role": message.role, "content": message.content} for message in prior
     ]
@@ -154,6 +154,7 @@ def _case(record: _RawRecord) -> AmlCase:
             "system_prompt": system_prompt,
             "rubrics": record.rubrics,
             "metadata": metadata,
+            "question_unsliced": unsliced,
         },
     )
     return AmlCase(
@@ -163,14 +164,16 @@ def _case(record: _RawRecord) -> AmlCase:
     )
 
 
-def _split_question(content: str) -> tuple[str, str]:
-    """Split a final user turn into `(history_text, question)` at its last
-    blank-line paragraph break. See the module docstring for the rule and
-    its measured coverage. Returns `("", content)` when no break is found --
-    the whole turn becomes the question and nothing is folded into history.
+def _split_question(content: str) -> tuple[str, str, bool]:
+    """Split a final user turn into `(history_text, question, unsliced)` at
+    its last blank-line paragraph break. See the module docstring for the
+    rule and its measured coverage. Returns `("", content, True)` when no
+    break is found -- the whole turn becomes the question, nothing is folded
+    into history, and `unsliced` flags this record for the caller so a
+    silently oversized/unsliced question doesn't pass for a normal one.
     """
     stripped = content.rstrip()
     paragraphs = [p for p in _PARAGRAPH_BREAK.split(stripped) if p.strip()]
     if len(paragraphs) < 2:
-        return "", stripped
-    return "\n\n".join(paragraphs[:-1]), paragraphs[-1].strip()
+        return "", stripped, True
+    return "\n\n".join(paragraphs[:-1]), paragraphs[-1].strip(), False

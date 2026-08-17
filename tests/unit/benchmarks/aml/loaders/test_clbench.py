@@ -86,6 +86,27 @@ _RECORD_3 = {
 }
 
 
+# Record 4: a 2-message record whose final (only) user turn is long
+# (>= 2,000 characters) with no blank-line break anywhere -- the genuine
+# failure mode measured at 2.9% (55/1,899) of the real corpus: no cheap,
+# safe signal to slice on, so the whole turn falls back to being the
+# question and gets flagged via `question_unsliced`.
+_RECORD_4_LONG_TURN = "The unbroken reference passage. " * 70 + "What year is described above?"
+_RECORD_4 = {
+    "messages": [
+        {"role": "system", "content": "You are DocQA."},
+        {"role": "user", "content": _RECORD_4_LONG_TURN},
+    ],
+    "rubrics": ["States the year"],
+    "metadata": {
+        "task_id": "task-4",
+        "context_id": "ctx-4",
+        "context_category": "History",
+        "sub_category": "Unstructured",
+    },
+}
+
+
 def _write_fixture(tmp_path: Path, *records: dict[str, object]) -> Path:
     path = tmp_path / "CL-bench.jsonl"
     path.write_text("\n".join(json.dumps(record) for record in records))
@@ -183,6 +204,27 @@ def test_load_omits_timestamp_field_entirely(tmp_path: Path) -> None:
     for case in cases:
         for message in case.messages:
             assert "timestamp" not in message
+
+
+def test_load_flags_question_unsliced_when_a_long_final_turn_has_no_blank_line(
+    tmp_path: Path,
+) -> None:
+    [case] = load(_write_fixture(tmp_path, _RECORD_4))
+
+    assert len(_RECORD_4_LONG_TURN) >= 2000
+    # No blank-line break anywhere -> nothing folds into history, and the
+    # whole turn becomes the question.
+    assert case.messages == ()
+    [question] = case.questions
+    assert question.question == _RECORD_4_LONG_TURN
+    assert question.payload["question_unsliced"] is True
+
+
+def test_load_sets_question_unsliced_false_for_a_cleanly_split_record(tmp_path: Path) -> None:
+    [case] = load(_write_fixture(tmp_path, _RECORD_1))
+
+    [question] = case.questions
+    assert question.payload["question_unsliced"] is False
 
 
 def test_load_raises_on_a_record_with_an_empty_rubrics_list(tmp_path: Path) -> None:
