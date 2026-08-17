@@ -172,20 +172,33 @@ class AmlRunManifest(ContractModel):
     tenant_prefix: Identifier
     recall_limit: int = Field(gt=0, le=100)
     request_concurrency: int = Field(gt=0)
-    question_count: int = Field(ge=0)
+    # `gt=0`, not `ge=0`: a manifest describing zero questions is a run that
+    # never happened (Important 2, task-13 review) -- `main()` also refuses
+    # to get this far when a loader produces zero cases (see
+    # `_require_nonempty_cases`), but this is the last-resort guarantee that
+    # no manifest, however it was built, can claim a run of nothing.
+    question_count: int = Field(gt=0)
     # How many of `question_count` carry CL-Bench's `question_unsliced`
-    # marker (`loaders/clbench.py`): a question whose text is a raw final
-    # turn from the source corpus, used verbatim because it had no
-    # blank-line break to slice the reference document from the actual
-    # query, so it can be tens of thousands of characters long. That both
-    # risks an oversized answer prompt and voids the retrieval test for the
-    # affected row -- a caveat on this run's score, not a memory-system
-    # weakness. Always 0 for every benchmark other than CL-Bench, whose rows
-    # never carry the key. Counted from the rows this run actually wrote to
-    # `--output` (including rows a resumed run already had on disk), not by
-    # re-reading the source dataset.
+    # marker (`loaders/clbench.py`): a question at least
+    # `_OVERSIZED_QUESTION_CHARACTERS` long, whether or not the loader found
+    # a blank-line break to slice the reference document from the actual
+    # query. That both risks an oversized answer prompt and voids the
+    # retrieval test for the affected row -- a caveat on this run's score,
+    # not a memory-system weakness. Always 0 for every benchmark other than
+    # CL-Bench, whose rows never carry the key. Counted from the rows this
+    # run actually wrote to `--output` (including rows a resumed run already
+    # had on disk), not by re-reading the source dataset.
     oversized_unsliced_question_count: int = Field(ge=0)
-    tenant_ids: dict[Identifier, Identifier]
+    # Computed client-side from `tenant_prefix` and each row's `user_id`
+    # (see `_derive_tenant_id`) -- never confirmed against the deployment.
+    # The server derives the same mapping independently from its own
+    # `MINDBRIDGE_AML_TENANT_PREFIX`; nothing on the AML wire contract
+    # carries or checks the prefix, so this map is only accurate if that
+    # deployment's environment variable happens to equal the `--tenant-prefix`
+    # this run was invoked with. Named `client_derived_...` rather than
+    # `tenant_ids` so a reader of the manifest cannot mistake this for
+    # something the server confirmed.
+    client_derived_tenant_ids: dict[Identifier, Identifier]
     completed_at: datetime
 
 
@@ -207,13 +220,83 @@ def main() -> None:
     """Load cases, replay them, and record predictions plus a manifest."""
     arguments = _parse_arguments()
     spec = BENCHMARKS[arguments.benchmark]
-    cases = spec.load(arguments.dataset_paths)
     deployment = load_deployment_snapshot(arguments.deployment_config_path)
+    _require_compatible_existing_manifest(
+        arguments.output_path,
+        benchmark=arguments.benchmark,
+        run_id=arguments.run_id,
+        deployment=deployment.snapshot,
+        recall_limit=arguments.top_k,
+    )
+    cases = spec.load(arguments.dataset_paths)
+    _require_nonempty_cases(
+        cases, benchmark=arguments.benchmark, dataset_paths=arguments.dataset_paths
+    )
     api_key = os.environ.get("MINDBRIDGE_AML_API_KEY")
     if not api_key:
         raise SystemExit("MINDBRIDGE_AML_API_KEY must be set")
     tenant_ids = asyncio.run(_connect_and_run(arguments, spec, cases, api_key))
     _write_manifest(arguments, deployment, tenant_ids)
+
+
+def _require_compatible_existing_manifest(
+    output_path: Path,
+    *,
+    benchmark: str,
+    run_id: str,
+    deployment: DeploymentSnapshot,
+    recall_limit: int,
+) -> None:
+    """Refuse to resume into an `--output` whose sidecar manifest disagrees
+    with this run's identity (Important 1, task-13 review).
+
+    Row ids (`{case.user_id}#{question.question_id}`, see `_case_ids`) carry
+    no `run_id`, `benchmark`, or deployment, so `_run`'s id-based resume
+    would otherwise skip every case as already-done -- and `_write_manifest`
+    would overwrite the sidecar unconditionally -- when a second invocation
+    with a different `--run-id`, `--deployment-config`, or `--top-k` points
+    at the same `--output`. That would attribute rows to a run that never
+    produced them. Checked before any dataset is loaded or any case is run,
+    so a mismatch fails fast. A first run (no sidecar yet) always passes.
+    """
+    manifest_path = sidecar_manifest_path(output_path)
+    if not manifest_path.exists():
+        return
+    existing = AmlRunManifest.model_validate_json(manifest_path.read_bytes())
+    disagreements: list[str] = []
+    if existing.benchmark != benchmark:
+        disagreements.append(f"benchmark ({existing.benchmark!r} != {benchmark!r})")
+    if existing.run_id != run_id:
+        disagreements.append(f"run_id ({existing.run_id!r} != {run_id!r})")
+    if existing.deployment != deployment:
+        disagreements.append("deployment (deployment snapshot differs)")
+    if existing.recall_limit != recall_limit:
+        disagreements.append(f"recall_limit ({existing.recall_limit} != {recall_limit})")
+    if disagreements:
+        raise ValueError(
+            f"existing manifest at {manifest_path} disagrees with this run: "
+            + "; ".join(disagreements)
+        )
+
+
+def _require_nonempty_cases(
+    cases: tuple[AmlCase, ...], *, benchmark: str, dataset_paths: tuple[Path, ...]
+) -> None:
+    """Refuse to write a manifest for a run that replayed zero cases
+    (Important 2, task-13 review).
+
+    The realistic trigger is a `--dataset` path pointed one directory too
+    high or too low: e.g. BEAM's loader (`chats_root.glob("*/*/chat.json")`)
+    silently yields nothing rather than erroring when the root is wrong.
+    Without this check the CLI would go on to write a complete-looking
+    manifest for zero questions. Naming the resolved dataset path in the
+    message is the point: the operator learns their path was wrong instead
+    of getting a clean, official-looking empty manifest.
+    """
+    if cases:
+        return
+    resolved = ", ".join(str(path.resolve()) for path in dataset_paths)
+    raise ValueError(f"{benchmark} loader produced zero cases from --dataset {resolved}")
 
 
 async def _connect_and_run(
@@ -347,13 +430,26 @@ def _write_manifest(
         request_concurrency=arguments.concurrency,
         question_count=question_count,
         oversized_unsliced_question_count=oversized_unsliced_question_count,
-        tenant_ids=tenant_ids,
+        client_derived_tenant_ids=tenant_ids,
         completed_at=datetime.now(timezone.utc),
     )
     write_text_atomically(
         sidecar_manifest_path(arguments.output_path),
         manifest.model_dump_json(indent=2) + "\n",
     )
+
+
+def _positive_int(raw: str) -> int:
+    """Argparse `type=` for `--concurrency`: reject non-positive values at
+    parse time (Minor 4, task-13 review). `asyncio.Semaphore(0)` blocks
+    forever with no output and no error, and the `Field(gt=0)` that would
+    otherwise catch it only runs once at manifest-write time -- after the
+    run has already hung.
+    """
+    value = int(raw)
+    if value <= 0:
+        raise argparse.ArgumentTypeError(f"must be a positive integer, got {value}")
+    return value
 
 
 def _parse_arguments() -> _Arguments:
@@ -372,9 +468,15 @@ def _parse_arguments() -> _Arguments:
     parser.add_argument("--code-revision", required=True)
     parser.add_argument("--deployment-config", type=Path, required=True)
     parser.add_argument("--run-id", required=True)
-    parser.add_argument("--tenant-prefix", default="bench_aml")
+    # No default: the server derives its half of the same mapping from its
+    # own `MINDBRIDGE_AML_TENANT_PREFIX` (see `AmlRunManifest`'s
+    # `client_derived_tenant_ids` docstring), which nothing on the wire
+    # confirms. A default here would let an operator silently inherit a
+    # value the deployment may not share; requiring it explicitly forces
+    # that choice to be made on purpose (Important 3, task-13 review).
+    parser.add_argument("--tenant-prefix", required=True)
     parser.add_argument("--top-k", type=int, default=20)
-    parser.add_argument("--concurrency", type=int, default=4)
+    parser.add_argument("--concurrency", type=_positive_int, default=4)
     parsed = parser.parse_args()
     return _Arguments(
         benchmark=parsed.benchmark,

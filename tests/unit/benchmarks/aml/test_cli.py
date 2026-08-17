@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Callable
 from pathlib import Path
 
@@ -11,7 +12,14 @@ import pytest
 
 from mindbridge.api.aml_contracts import derive_tenant_id
 from mindbridge.benchmarks.aml.cases import AmlCase, AmlQuestion
-from mindbridge.benchmarks.aml.cli import BENCHMARKS, _Arguments, _run, _write_manifest
+from mindbridge.benchmarks.aml.cli import (
+    BENCHMARKS,
+    _Arguments,
+    _require_compatible_existing_manifest,
+    _require_nonempty_cases,
+    _run,
+    _write_manifest,
+)
 from mindbridge.benchmarks.aml.driver import eval_user_id
 from mindbridge.benchmarks.artifacts import load_deployment_snapshot, sidecar_manifest_path
 
@@ -172,6 +180,13 @@ def test_manifest_carries_source_deployment_and_tenant_mapping(tmp_path: Path) -
         encoding="utf-8",
     )
     output_path = tmp_path / "rows.jsonl"
+    # One row on disk -- `question_count` must be positive for a manifest to
+    # validate at all (Important 2, task-13 review), so this run "produced"
+    # exactly one question.
+    output_path.write_text(
+        json.dumps({"id": "locomo:conv-0#q0", "question": "q0"}) + "\n",
+        encoding="utf-8",
+    )
     arguments = _Arguments(
         benchmark="locomo",
         dataset_paths=(tmp_path / "locomo10.json",),
@@ -204,9 +219,8 @@ def test_manifest_carries_source_deployment_and_tenant_mapping(tmp_path: Path) -
     assert manifest["tenant_prefix"] == "bench_aml"
     assert manifest["recall_limit"] == 10
     assert manifest["request_concurrency"] == 2
-    assert manifest["tenant_ids"] == tenant_ids
-    # No output rows were ever written in this test -- nothing to count.
-    assert manifest["question_count"] == 0
+    assert manifest["client_derived_tenant_ids"] == tenant_ids
+    assert manifest["question_count"] == 1
     assert manifest["oversized_unsliced_question_count"] == 0
 
 
@@ -268,3 +282,173 @@ def test_write_manifest_counts_oversized_unsliced_questions_from_output_rows(
     manifest = json.loads(sidecar_manifest_path(output_path).read_text(encoding="utf-8"))
     assert manifest["question_count"] == 3
     assert manifest["oversized_unsliced_question_count"] == 2
+
+
+def _deployment_path(tmp_path: Path) -> Path:
+    deployment_path = tmp_path / "deployment.json"
+    deployment_path.write_text(
+        json.dumps(
+            {
+                "server_generator": {
+                    "plugin": "openai",
+                    "distribution": "mindbridge",
+                    "version": "0.1.0",
+                    "config": {"model_id": "qwen3.8-max"},
+                },
+                "server_embedder": {
+                    "plugin": "openai",
+                    "distribution": "mindbridge",
+                    "version": "0.1.0",
+                    "config": {"space_id": "jina-v5"},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    return deployment_path
+
+
+def _arguments(
+    tmp_path: Path, output_path: Path, deployment_path: Path, **overrides: object
+) -> _Arguments:
+    fields: dict[str, object] = {
+        "benchmark": "locomo",
+        "dataset_paths": (tmp_path / "locomo10.json",),
+        "output_path": output_path,
+        "api_base_url": "https://memory.example.test",
+        "code_revision": "mindbridge-commit",
+        "deployment_config_path": deployment_path,
+        "run_id": "run-1",
+        "tenant_prefix": "bench_aml",
+        "top_k": 10,
+        "concurrency": 2,
+    }
+    fields.update(overrides)
+    return _Arguments(**fields)  # type: ignore[arg-type]
+
+
+def test_require_compatible_existing_manifest_allows_a_first_run(tmp_path: Path) -> None:
+    """No sidecar manifest yet -- nothing to disagree with."""
+    deployment = load_deployment_snapshot(_deployment_path(tmp_path))
+
+    _require_compatible_existing_manifest(
+        tmp_path / "rows.jsonl",
+        benchmark="locomo",
+        run_id="run-1",
+        deployment=deployment.snapshot,
+        recall_limit=10,
+    )
+
+
+def test_require_compatible_existing_manifest_allows_a_matching_resume(tmp_path: Path) -> None:
+    """Same benchmark/run_id/deployment/recall_limit as the existing sidecar
+    -- this is a legitimate resume of an interrupted run and must proceed."""
+    deployment_path = _deployment_path(tmp_path)
+    deployment = load_deployment_snapshot(deployment_path)
+    output_path = tmp_path / "rows.jsonl"
+    output_path.write_text(json.dumps({"id": "locomo:conv-0#q0", "question": "q0"}) + "\n")
+    arguments = _arguments(tmp_path, output_path, deployment_path)
+    _write_manifest(arguments, deployment, {})
+
+    _require_compatible_existing_manifest(
+        output_path,
+        benchmark="locomo",
+        run_id="run-1",
+        deployment=deployment.snapshot,
+        recall_limit=10,
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "overrides"),
+    [
+        ("run_id", {"run_id": "run-2"}),
+        ("benchmark", {"benchmark": "longmemeval"}),
+        ("recall_limit", {"top_k": 20}),
+    ],
+)
+def test_require_compatible_existing_manifest_refuses_a_mismatched_resume(
+    tmp_path: Path, field: str, overrides: dict[str, object]
+) -> None:
+    """The exact bug this guard exists for: point a second invocation with a
+    different run_id/benchmark/top_k at the same --output. Without the
+    guard, `_run` would resume (skip every case as already-done, since row
+    ids carry no run identity) and `_write_manifest` would silently restamp
+    the sidecar with the new run's provenance -- attributing rows to a run
+    that never produced them. As of this test being written, the current
+    `main()` has no such guard: this test fails until one exists."""
+    deployment_path = _deployment_path(tmp_path)
+    deployment = load_deployment_snapshot(deployment_path)
+    output_path = tmp_path / "rows.jsonl"
+    output_path.write_text(json.dumps({"id": "locomo:conv-0#q0", "question": "q0"}) + "\n")
+    first_run = _arguments(tmp_path, output_path, deployment_path)
+    _write_manifest(first_run, deployment, {})
+
+    second_run = _arguments(tmp_path, output_path, deployment_path, **overrides)
+    with pytest.raises(ValueError, match=field):
+        _require_compatible_existing_manifest(
+            output_path,
+            benchmark=second_run.benchmark,
+            run_id=second_run.run_id,
+            deployment=deployment.snapshot,
+            recall_limit=second_run.top_k,
+        )
+
+
+def test_require_compatible_existing_manifest_refuses_a_different_deployment(
+    tmp_path: Path,
+) -> None:
+    deployment_path = _deployment_path(tmp_path)
+    deployment = load_deployment_snapshot(deployment_path)
+    output_path = tmp_path / "rows.jsonl"
+    output_path.write_text(json.dumps({"id": "locomo:conv-0#q0", "question": "q0"}) + "\n")
+    arguments = _arguments(tmp_path, output_path, deployment_path)
+    _write_manifest(arguments, deployment, {})
+
+    other_deployment_path = tmp_path / "other-deployment.json"
+    other_deployment_path.write_text(
+        json.dumps(
+            {
+                "server_generator": {
+                    "plugin": "openai",
+                    "distribution": "mindbridge",
+                    "version": "0.1.0",
+                    "config": {"model_id": "a-different-model"},
+                },
+                "server_embedder": {
+                    "plugin": "openai",
+                    "distribution": "mindbridge",
+                    "version": "0.1.0",
+                    "config": {"space_id": "jina-v5"},
+                },
+            }
+        )
+    )
+    other_deployment = load_deployment_snapshot(other_deployment_path)
+
+    with pytest.raises(ValueError, match="deployment"):
+        _require_compatible_existing_manifest(
+            output_path,
+            benchmark="locomo",
+            run_id="run-1",
+            deployment=other_deployment.snapshot,
+            recall_limit=10,
+        )
+
+
+def test_require_nonempty_cases_allows_at_least_one_case() -> None:
+    cases = (_case("locomo:conv-0", "q0"),)
+    _require_nonempty_cases(cases, benchmark="locomo", dataset_paths=(Path("locomo10.json"),))
+
+
+def test_require_nonempty_cases_refuses_zero_cases_and_names_the_dataset_path(
+    tmp_path: Path,
+) -> None:
+    """The realistic trigger: a `--dataset` path pointed one directory too
+    high or too low (e.g. BEAM's `chats_root.glob("*/*/chat.json")` silently
+    yields nothing). Without this guard the CLI goes on to write a
+    complete-looking manifest for zero questions. As of this test being
+    written, no such guard exists: this test fails until one does."""
+    dataset_path = tmp_path / "chats"
+    with pytest.raises(ValueError, match=re.escape(str(dataset_path.resolve()))):
+        _require_nonempty_cases((), benchmark="beam", dataset_paths=(dataset_path,))

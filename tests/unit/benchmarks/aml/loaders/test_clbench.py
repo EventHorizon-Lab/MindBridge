@@ -107,6 +107,31 @@ _RECORD_4 = {
 }
 
 
+# Record 5: a 2-message record whose final user turn DOES have a blank-line
+# break -- so it takes the "cleanly sliced" branch -- but whose trailing
+# paragraph (the part that becomes the question) is itself
+# >= 2,000 characters. None of the measured real corpus hits this
+# combination, but the marker exists to catch oversized-prompt effects
+# regardless of which branch produced them, so this must still be flagged.
+_RECORD_5_FINAL_PARAGRAPH = "Long final paragraph text. " * 80
+_RECORD_5 = {
+    "messages": [
+        {"role": "system", "content": "You are DocQA."},
+        {
+            "role": "user",
+            "content": "Short intro paragraph.\n\n" + _RECORD_5_FINAL_PARAGRAPH,
+        },
+    ],
+    "rubrics": ["States something"],
+    "metadata": {
+        "task_id": "task-5",
+        "context_id": "ctx-5",
+        "context_category": "History",
+        "sub_category": "Oversized",
+    },
+}
+
+
 def _write_fixture(tmp_path: Path, *records: dict[str, object]) -> Path:
     path = tmp_path / "CL-bench.jsonl"
     path.write_text("\n".join(json.dumps(record) for record in records))
@@ -242,6 +267,25 @@ def test_load_sets_question_unsliced_false_for_a_short_whole_turn_fallback(
     [question] = case.questions
     assert len(question.question) < _OVERSIZED_QUESTION_CHARACTERS
     assert question.payload["question_unsliced"] is False
+
+
+def test_load_flags_question_unsliced_for_a_clean_split_with_an_oversized_tail(
+    tmp_path: Path,
+) -> None:
+    """A record that DID split cleanly at a blank line but whose trailing
+    paragraph is itself oversized has the same effect on the answer prompt
+    as the no-break fallback, and must be flagged the same way -- the
+    marker is scoped to the resulting question's length, not to which
+    branch of `_split_question` produced it."""
+    [case] = load(_write_fixture(tmp_path, _RECORD_5))
+
+    assert len(_RECORD_5_FINAL_PARAGRAPH.strip()) >= _OVERSIZED_QUESTION_CHARACTERS
+    # The short intro paragraph still correctly folds into history --
+    # slicing itself worked fine; only the resulting question is too long.
+    assert [m["content"] for m in case.messages] == ["Short intro paragraph."]
+    [question] = case.questions
+    assert question.question == _RECORD_5_FINAL_PARAGRAPH.strip()
+    assert question.payload["question_unsliced"] is True
 
 
 def test_load_raises_on_a_record_with_an_empty_rubrics_list(tmp_path: Path) -> None:

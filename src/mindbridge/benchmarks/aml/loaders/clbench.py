@@ -47,6 +47,14 @@ Measured outcomes over the real corpus:
   "trailing sentence" rule, e.g., would wrongly slice off the last citation
   in a reference list rather than a real question).
 
+The `question_unsliced` flag this loader emits (see `_split_question`) is
+keyed off the length of the *resulting* question, not off which of the two
+branches above produced it: a record that did find a blank-line break but
+whose trailing paragraph is itself >= `_OVERSIZED_QUESTION_CHARACTERS` long
+has the same oversized-prompt effect as the no-break fallback, so it is
+flagged the same way, even though none of the measured 1,899 real rows hit
+that combination.
+
 ### The scope rule (measured, not assumed)
 
 `metadata.task_id` is unique across all 1,899 lines (verified: zero
@@ -181,16 +189,24 @@ def _split_question(content: str) -> tuple[str, str, bool]:
     its last blank-line paragraph break. See the module docstring for the
     rule and its measured coverage. Returns `("", content, unsliced)` when no
     break is found -- the whole turn becomes the question and nothing is
-    folded into history. `unsliced` is only `True` when that whole-turn
-    fallback also produced a question at least `_OVERSIZED_QUESTION_CHARACTERS`
-    long: the genuine failure mode this flag exists to catch. A short
-    whole-turn fallback (the common, harmless case -- taking the whole turn
-    was exactly right) returns `unsliced=False`, same as a cleanly sliced
-    question, so a consumer filtering on the flag sees only the records that
-    are actually broken.
+    folded into history.
+
+    `unsliced` is `True` whenever the *resulting* question is at least
+    `_OVERSIZED_QUESTION_CHARACTERS` long, regardless of which branch
+    produced it. A record whose final turn did split at a blank line but
+    whose trailing paragraph is itself oversized has exactly the same
+    "blows the answer prompt, voids the retrieval test" effect as the
+    unsliced whole-turn fallback, so it gets the same flag -- the marker is
+    about the length of the question this loader is about to hand off, not
+    about which code path built it. A short question -- whether from a clean
+    split or a harmless whole-turn fallback -- returns `unsliced=False`, so a
+    consumer filtering on the flag sees only the records that are actually
+    broken.
     """
     stripped = content.rstrip()
     paragraphs = [p for p in _PARAGRAPH_BREAK.split(stripped) if p.strip()]
     if len(paragraphs) < 2:
-        return "", stripped, len(stripped) >= _OVERSIZED_QUESTION_CHARACTERS
-    return "\n\n".join(paragraphs[:-1]), paragraphs[-1].strip(), False
+        history, question = "", stripped
+    else:
+        history, question = "\n\n".join(paragraphs[:-1]), paragraphs[-1].strip()
+    return history, question, len(question) >= _OVERSIZED_QUESTION_CHARACTERS
