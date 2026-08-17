@@ -45,12 +45,20 @@ class ExtractedMemory:
     occurred_at: datetime
 
 
+@dataclass(frozen=True, slots=True)
+class ExtractionOutcome:
+    """Memories parsed from a chunk, plus a count of items dropped as malformed."""
+
+    memories: tuple[ExtractedMemory, ...]
+    skipped: int
+
+
 async def extract_memories(
     generator: Generator,
     messages: Sequence[_AmlMessageLike],
     *,
     now: datetime,
-) -> tuple[ExtractedMemory, ...]:
+) -> ExtractionOutcome:
     """Extract atomic memories, dating them from the chunk's own timestamps."""
     occurred_at = _chunk_time(messages, now=now)
     result = await generator.generate(
@@ -61,13 +69,17 @@ async def extract_memories(
             json_mode=True,
         )
     )
-    return tuple(
-        ExtractedMemory(
-            summary=summary,
-            memory_type=memory_type,
-            occurred_at=occurred_at,
-        )
-        for summary, memory_type in _parsed_memories(result.text)
+    parsed, skipped = _parsed_memories(result.text)
+    return ExtractionOutcome(
+        memories=tuple(
+            ExtractedMemory(
+                summary=summary,
+                memory_type=memory_type,
+                occurred_at=occurred_at,
+            )
+            for summary, memory_type in parsed
+        ),
+        skipped=skipped,
     )
 
 
@@ -82,7 +94,7 @@ def _chunk_time(messages: Sequence[_AmlMessageLike], *, now: datetime) -> dateti
     return datetime.fromtimestamp(min(timestamps) / 1_000, tz=timezone.utc)
 
 
-def _parsed_memories(text: str) -> list[tuple[str, MemoryType]]:
+def _parsed_memories(text: str) -> tuple[list[tuple[str, MemoryType]], int]:
     try:
         payload = json.loads(text)
     except json.JSONDecodeError as error:
@@ -90,12 +102,15 @@ def _parsed_memories(text: str) -> list[tuple[str, MemoryType]]:
     if not isinstance(payload, dict) or not isinstance(payload.get("memories"), list):
         raise ModelOutputError("AML extraction output has no memories list")
     memories: list[tuple[str, MemoryType]] = []
+    skipped = 0
     for item in payload["memories"]:
         if not isinstance(item, dict):
-            raise ModelOutputError("every extracted memory must be an object")
+            skipped += 1
+            continue
         summary = str(item.get("summary") or "").strip()[:MAX_SUMMARY_CHARACTERS]
         memory_type = _MEMORY_TYPES.get(str(item.get("type") or "").strip().lower())
         if not summary or memory_type is None:
+            skipped += 1
             continue
         memories.append((summary, memory_type))
-    return memories
+    return memories, skipped
