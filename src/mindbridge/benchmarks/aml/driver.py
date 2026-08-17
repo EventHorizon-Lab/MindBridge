@@ -36,6 +36,16 @@ def _require_identifier_length(value: str, label: str) -> None:
         )
 
 
+def eval_user_id(run_id: str, benchmark: str, case_user_id: str) -> str:
+    """Build the eval-scoped AML `user_id` this driver sends over the wire.
+
+    Exposed so the CLI (Task 13) can recompute the exact same id -- e.g. to
+    report a run's `user_id` -> `tenant_id` mapping in its manifest -- without
+    duplicating this format string and risking drift.
+    """
+    return f"eval:{run_id}:{benchmark}:{case_user_id}"
+
+
 async def run_case(
     client: httpx.AsyncClient,
     case: AmlCase,
@@ -46,7 +56,7 @@ async def run_case(
     emit: EmitFn,
 ) -> list[dict[str, object]]:
     """Add every chunk in order, then emit one scored-pipeline row per question."""
-    user_id = f"eval:{run_id}:{benchmark}:{case.user_id}"
+    user_id = eval_user_id(run_id, benchmark, case.user_id)
     session_id = user_id
     _require_identifier_length(user_id, "eval user_id")
 
