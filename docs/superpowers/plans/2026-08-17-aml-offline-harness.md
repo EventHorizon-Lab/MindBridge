@@ -1043,27 +1043,139 @@ git commit -m "Add the shared AML case model and chunker"
 
 ---
 
-### Tasks 6-11: dataset loaders
+## Dataset loaders (Tasks 6-11)
 
-Each loader is one file exporting `load(path: Path) -> tuple[AmlCase, ...]`, plus a fixture-backed shape test. Each task follows the same five steps: write the failing test with a three-record fixture, run it to see the import error, write the loader, run it green, commit.
+Each loader is one file under `src/mindbridge/benchmarks/aml/loaders/` exporting `load(path: Path) -> tuple[AmlCase, ...]`, with a fixture-backed test under `tests/unit/benchmarks/aml/loaders/`.
 
-The `payload` keys are not free choices — they are what each vendored pipeline reads. Verify against the pinned pipeline before writing the loader.
+**Every loader task reads [the dataset schema reference](../specs/2026-08-17-aml-dataset-schemas.md) first.** That document records, per benchmark, the exact files, how to reach the messages and questions, the payload keys its vendored pipeline actually looks up (including fallback chains), and the mismatches between what the dataset ships and what the pipeline expects. It was written by reading both the datasets on disk and the pinned pipeline source. The payload keys are not free choices.
 
-| Task | Benchmark | File | Required `payload` keys |
-| --- | --- | --- | --- |
-| 6 | LoCoMo | `loaders/locomo.py` | `gold_answer` |
-| 7 | LongMemEval-S | `loaders/longmemeval.py` | `gold_answer` |
-| 8 | BEAM | `loaders/beam.py` | `rubric_nuggets` |
-| 9 | CL-Bench | `loaders/clbench.py` | `system_prompt`, `qa_type`, `options`, `rubrics` |
-| 10 | ScriptMem | `loaders/scriptmem.py` | `dataset`, `qa_type` (gold stays in the dataset directory; `evaluate` reads it there) |
-| 11 | PersonaMem v1+v2 | `loaders/personamem.py` | `all_options`, `correct_answer` |
+**Fixtures are hand-written, not copied wholesale.** Each test builds a small file with the same *shape* as the real dataset — two or three records, a couple of messages each — and asserts against it. Do not vendor slices of the real corpora into `tests/`: several are gigabytes, and some carry upstream licence terms.
 
-- [ ] **Task 6: LoCoMo loader** — reuse the existing `mindbridge.benchmarks.locomo.load_locomo` adapter for parsing; one `AmlCase` per conversation, `user_id = f"locomo:{sample_id}"`.
-- [ ] **Task 7: LongMemEval-S loader** — one `AmlCase` per question's haystack; `user_id = f"longmemeval:{question_id}"`.
-- [ ] **Task 8: BEAM loader** — `rubric_nuggets` copied verbatim; `rubric_items()` rejects an empty list, so a case with no rubric is a loader bug, not a runtime skip.
-- [ ] **Task 9: CL-Bench loader** — keep `options` an ordered list of strings; `format_structured_question` renders them positionally.
-- [ ] **Task 10: ScriptMem loader** — `qa_id` must be `f"{dataset}:{sample_id}#q{qa_index:04d}"`, byte-identical to `load_gold_records`, or `evaluate` reports an ID mismatch.
-- [ ] **Task 11: PersonaMem loader** — `all_options` is the official option **string**, not a reconstructed list. v1 and v2 are separate splits from one file.
+**Every loader task follows the same five steps:** write the failing test, run it to see the import error, write the loader, run it green, commit. Each ends with the gate from Global Constraints.
+
+**ScriptMem is deliberately absent.** Its public release ships questions, gold answers, and scoring code, but every `conversation` field in both `data/public/conversations.jsonl` and `data/raw/*.json` contains only the placeholder `{"format_example": ...}` — the four source scripts are not distributed. With no corpus to ingest there is nothing for a memory system to retrieve, so an offline ScriptMem number would measure nothing. A real AML submission is unaffected: the platform runs ScriptMem server-side against its own copy.
+
+---
+
+### Task 6: LoCoMo loader
+
+**Files:**
+- Create: `src/mindbridge/benchmarks/aml/loaders/__init__.py`, `src/mindbridge/benchmarks/aml/loaders/locomo.py`
+- Test: `tests/unit/benchmarks/aml/loaders/test_locomo.py`
+
+**Interfaces:**
+- Consumes: `AmlCase`, `AmlQuestion` (Task 5)
+- Produces: `load(path: Path) -> tuple[AmlCase, ...]`
+
+Schema reference: section 1. Source: `.benchmarks/locomo/data/locomo10.json`.
+
+- One `AmlCase` per sample; `user_id = f"locomo:{sample_id}"`.
+- Messages come from the `session_N` keys under `conversation`, ordered by **numeric** session index — `session_10` sorts before `session_2` lexically, and getting this wrong silently reorders a decade of history.
+- `session_N_date_time` supplies the timestamp for every message in that session.
+- Payload: `gold_answer` (renamed from the dataset's `answer` — the pipeline never looks for `answer`).
+- `question_id` is synthesized as `f"{sample_id}:qa{index:04d}"`. It must be stable across reruns, because `evaluate()` raises `SystemExit` when the answers file's id set does not exactly equal the input file's.
+
+---
+
+### Task 7: LongMemEval-S loader
+
+**Files:**
+- Create: `src/mindbridge/benchmarks/aml/loaders/longmemeval.py`
+- Test: `tests/unit/benchmarks/aml/loaders/test_longmemeval.py`
+
+**Interfaces:**
+- Consumes: `AmlCase`, `AmlQuestion` (Task 5)
+- Produces: `load(path: Path) -> tuple[AmlCase, ...]`
+
+Schema reference: section 2. Source: `.benchmarks/longmemeval/longmemeval_s` (278 MB, 500 questions).
+
+- One `AmlCase` per question and its own haystack; `user_id = f"longmemeval:{question_id}"`.
+- Payload: `gold_answer` (renamed from `answer`), and `id` taken from the dataset's `question_id`.
+- Single-user: omit the `speaker_2_*` keys entirely rather than emitting empty ones.
+- Do not substitute `longmemeval_oracle` — it ships only the gold sessions, so retrieval has nothing to discriminate against and the score is meaningless. Do not load `longmemeval_m` (2.7 GB) eagerly.
+
+---
+
+### Task 8: PersonaMem v1 loader
+
+**Files:**
+- Create: `src/mindbridge/benchmarks/aml/loaders/personamem_v1.py`
+- Test: `tests/unit/benchmarks/aml/loaders/test_personamem_v1.py`
+
+**Interfaces:**
+- Consumes: `AmlCase`, `AmlQuestion` (Task 5)
+- Produces: `load(questions_csv: Path, contexts_jsonl: Path) -> tuple[AmlCase, ...]`
+
+Schema reference: section 3a. Sources: `.benchmarks/personamem-v1/questions_32k.csv` plus `.benchmarks/personamem-v1/shared_contexts_32k.jsonl`.
+
+- Scope is one `shared_context_id` (1:1 with a persona); `user_id = f"personamem-v1:{shared_context_id}"`.
+- Each question truncates the shared context at `end_index_in_shared_context`.
+- Payload: `id` (the dataset's native `question_id` — the pipeline's `row_id()` already checks it, so no rename), `all_options`, `correct_answer`.
+- `all_options` is a **plain string**, already formatted as the lettered options block. Passing a list raises `TypeError` in the pipeline. Do not parse and rebuild it.
+
+---
+
+### Task 9: PersonaMem v2 loader
+
+**Files:**
+- Create: `src/mindbridge/benchmarks/aml/loaders/personamem_v2.py`
+- Test: `tests/unit/benchmarks/aml/loaders/test_personamem_v2.py`
+
+**Interfaces:**
+- Consumes: `AmlCase`, `AmlQuestion` (Task 5)
+- Produces: `load(benchmark_csv: Path, data_root: Path) -> tuple[AmlCase, ...]`
+
+Schema reference: section 3b. Sources: `.benchmarks/personamem-v2/benchmark/text/benchmark.csv` plus the chat histories under `.benchmarks/personamem-v2/data/`.
+
+v2 is a **different dataset from v1, not another split**, and its pipeline reads different keys.
+
+- Scope is one persona; `user_id = f"personamem-v2:{persona_id}"`.
+- Resolve chat history through the CSV's `chat_history_32k_link` column. A persona has several timestamped snapshots, so never reconstruct the filename from `persona_id`.
+- The CSV has **no id column of any kind**. Synthesize `f"persona{persona_id}-{row_index}"` using file-read order, and use the identical scheme at answer and evaluate time.
+- Payload: `id`, `user_query`, `correct_answer`, `incorrect_answers`, `persona_id`, and `preference` (which `evaluate-narrow` needs to pick its judge prompt).
+- The retrieved history goes under `chat_history`, not `context_messages` — see Task 12's emitter table.
+
+---
+
+### Task 10: BEAM loader
+
+**Files:**
+- Create: `src/mindbridge/benchmarks/aml/loaders/beam.py`
+- Test: `tests/unit/benchmarks/aml/loaders/test_beam.py`
+
+**Interfaces:**
+- Consumes: `AmlCase`, `AmlQuestion` (Task 5)
+- Produces: `load(chat: Path, questions: Path) -> tuple[AmlCase, ...]`
+
+Schema reference: section 4. Sources: the per-conversation `chat.json` and `probing_questions.json` under `.benchmarks/beam/chats/`. Start with the 100K size.
+
+- One `AmlCase` per conversation; `user_id = f"beam:{conversation_id}"`.
+- Payload: `id` (synthesized; `rows()` raises `ValueError` on a duplicate or empty id), `rubric` (kept verbatim — the dataset's key already matches the pipeline's `rubric_nuggets`/`rubrics`/`rubric` fallback chain, so do not rename it), and `question_type` copied from the question's category.
+- `question_type` must be propagated faithfully: the value `event_ordering` switches on extra Kendall-tau scoring, and dropping it silently changes which metric the benchmark computes.
+- Many turns carry no timestamp. Omit `timestamp` for those rather than inventing one.
+
+---
+
+### Task 11: CL-Bench loader
+
+**Files:**
+- Create: `src/mindbridge/benchmarks/aml/loaders/clbench.py`
+- Test: `tests/unit/benchmarks/aml/loaders/test_clbench.py`
+
+**Interfaces:**
+- Consumes: `AmlCase`, `AmlQuestion` (Task 5)
+- Produces: `load(path: Path) -> tuple[AmlCase, ...]`
+
+Schema reference: section 5. Source: `.benchmarks/clbench/CL-bench.jsonl`.
+
+This loader does the most reshaping, because the raw record carries neither of the two fields the pipeline needs most.
+
+- **There is no `question` field.** It is the trailing query sentence of the **last** `user` message; everything before that message is the history to ingest. Records have 2, 4, 6, or more messages — never assume two. Feeding the whole 150K-character user turn in as "the question" would both destroy the retrieval test and blow the answer prompt.
+- **There is no `system_prompt` field.** Extract it from the `system` role message.
+- Preserve `metadata` verbatim so `row_id()`'s `metadata.task_id` fallback resolves, or set `id` explicitly from `metadata["task_id"]`.
+- Payload: `system_prompt`, `rubrics` (top-level, already a list of plain strings — no rename), `metadata`.
+- `qa_type` and `options` do not exist in this dataset and the pipeline handles their absence. Do not synthesize them.
+- No timestamps anywhere; omit the field.
 
 ---
 
@@ -1083,8 +1195,12 @@ Emit functions, one per output shape:
 | --- | --- | --- |
 | `emit_retrieved_context` | LoCoMo, LongMemEval, BEAM | `retrieved_context`: newline-joined `- [created_at] content` |
 | `emit_selected` | CL-Bench | `retrieval: {"selected": [{"text": ..., "created_at": ...}]}` |
-| `emit_speaker_memories` | ScriptMem | `speaker_1_memories`: same joined block |
-| `emit_context_messages` | PersonaMem | `context_messages`: list of `{"role": "user", "content": ...}` |
+| `emit_context_messages` | PersonaMem v1 | `context_messages`: list of `{"role": "user", "content": ...}` |
+| `emit_chat_history` | PersonaMem v2 | `chat_history`: same list shape under a different key |
+
+PersonaMem v1 and v2 differ here: `pipeline_v1.py` reads `context_messages`, `pipeline_v2.py` reads `chat_history` (falling back to `messages`, then `context_messages`). Relying on v2's fallback would work by accident today and break silently if upstream reorders the chain, so each gets its own emitter.
+
+`emit_speaker_memories` is not needed — it existed for ScriptMem, which is out of scope.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1279,12 +1395,12 @@ def emit_retrieved_context(
     return {"retrieved_context": _joined(retrieved)}
 
 
-def emit_speaker_memories(
+def emit_chat_history(
     _question: AmlQuestion,
     retrieved: Sequence[dict[str, object]],
 ) -> dict[str, object]:
-    """ScriptMem's answer template reads `speaker_1_memories`."""
-    return {"speaker_1_memories": _joined(retrieved)}
+    """PersonaMem v2 reads `chat_history` where v1 reads `context_messages`."""
+    return {"chat_history": _message_list(retrieved)}
 
 
 def emit_selected(
@@ -1306,14 +1422,16 @@ def emit_context_messages(
     _question: AmlQuestion,
     retrieved: Sequence[dict[str, object]],
 ) -> dict[str, object]:
-    """PersonaMem reads an already-sliced `context_messages` list."""
-    return {
-        "context_messages": [
-            {"role": "user", "content": str(item.get("content") or "")}
-            for item in retrieved
-            if str(item.get("content") or "").strip()
-        ]
-    }
+    """PersonaMem v1 reads an already-sliced `context_messages` list."""
+    return {"context_messages": _message_list(retrieved)}
+
+
+def _message_list(retrieved: Sequence[dict[str, object]]) -> list[dict[str, str]]:
+    return [
+        {"role": "user", "content": str(item.get("content") or "")}
+        for item in retrieved
+        if str(item.get("content") or "").strip()
+    ]
 ```
 
 - [ ] **Step 4: Run test to verify it passes**
@@ -1383,8 +1501,8 @@ def test_every_benchmark_names_a_loader_an_emitter_and_a_pipeline() -> None:
         "longmemeval",
         "beam",
         "clbench",
-        "scriptmem",
-        "personamem",
+        "personamem-v1",
+        "personamem-v2",
     }
     for name, spec in BENCHMARKS.items():
         assert callable(spec.load), name
