@@ -2,25 +2,18 @@
 
 from __future__ import annotations
 
-import argparse
 import asyncio
-import hashlib
 import json
-import os
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 
-from pydantic import AwareDatetime, Field
+from pydantic import Field
 
 from mindbridge.benchmarks.artifacts import (
-    DeploymentSnapshot,
     LoadedDeployment,
     load_deployment_snapshot,
     require_writable_output_pair,
-    sidecar_manifest_path,
-    write_text_atomically,
 )
 from mindbridge.benchmarks.egolife_runner import (
     EgoLifePreparedStream,
@@ -34,74 +27,54 @@ from mindbridge.benchmarks.egomem_reason import (
     load_egomem_reason,
 )
 from mindbridge.benchmarks.prompts import EGOMEM_REASON_QUERY_PROMPT
-from mindbridge.contracts import ContractModel, Identifier, NonEmptyString, Sha256Hex
+from mindbridge.benchmarks.runner_cli import (
+    MediaBenchmarkArguments,
+    MediaRunManifest,
+    add_media_arguments,
+    benchmark_parser,
+    completed_now,
+    connected_memory,
+    index_prepared,
+    media_argument_values,
+    predictions_digest,
+    select_by_id,
+    shared_argument_values,
+    write_run_artifacts,
+)
+from mindbridge.contracts import Identifier, NonEmptyString, Sha256Hex
 from mindbridge.file_integrity import sha256_file
 from mindbridge.models import EmbedTask
 from mindbridge.prompts import (
     ANSWER_FROM_EVIDENCE_PROMPT,
     PERCEIVE_EVENTS_PROMPT,
 )
-from mindbridge.sdk import MindBridge
 
 EGOMEM_RUNNER_VERSION = "egomem_production_api_v3"
 
 
-class EgoMemRunManifest(ContractModel):
+class EgoMemRunManifest(MediaRunManifest):
     """Immutable input, deployment, model, and submission identity for one run."""
 
     benchmark: Literal["EgoMemReason"] = "EgoMemReason"
-    runner_version: NonEmptyString
-    adapter_version: NonEmptyString
     dataset_repository: NonEmptyString
     dataset_revision: NonEmptyString
-    annotation_sha256: Sha256Hex
     evaluator_repository: NonEmptyString
     evaluator_revision: NonEmptyString
     prepared_media_manifest_sha256: Sha256Hex
-    code_revision: NonEmptyString
-    deployment: DeploymentSnapshot
-    deployment_sha256: Sha256Hex
-    perception_prompt_version: NonEmptyString
-    answer_prompt_version: NonEmptyString
     query_prompt_version: NonEmptyString
-    retrieval_task: NonEmptyString
-    run_id: Identifier
-    tenant_prefix: Identifier
-    device_id: Identifier
-    recall_limit: int = Field(gt=0, le=100)
-    request_concurrency: int = Field(gt=0)
-    request_timeout_seconds: float = Field(gt=0)
-    poll_interval_seconds: float = Field(gt=0)
-    processing_timeout_seconds: float = Field(gt=0)
     identities: tuple[Identifier, ...] = Field(min_length=1)
     example_ids: tuple[int, ...] = Field(min_length=1)
     clip_count: int = Field(gt=0)
     media_clip_count: int = Field(ge=0)
     caption_clip_count: int = Field(ge=0)
-    predictions_sha256: Sha256Hex
-    completed_at: AwareDatetime
 
 
 @dataclass(frozen=True, slots=True)
-class _Arguments:
-    dataset_path: Path
+class _Arguments(MediaBenchmarkArguments):
     prepared_media_path: Path
-    output_path: Path
-    api_base_url: str
     dataset_revision: str
     evaluator_revision: str
-    code_revision: str
-    deployment_config_path: Path
-    run_id: str
-    tenant_prefix: str
-    device_id: str
-    recall_limit: int
-    request_concurrency: int
-    request_timeout_seconds: float
-    poll_interval_seconds: float
-    processing_timeout_seconds: float
     example_ids: tuple[int, ...]
-    overwrite: bool
 
 
 def main() -> None:
@@ -125,12 +98,7 @@ async def _run(
     questions: tuple[EgoMemReasonQuestion, ...],
     prepared: dict[str, EgoLifePreparedStream],
 ) -> tuple[EgoMemReasonResult, ...]:
-    memory = MindBridge.connect(
-        base_url=arguments.api_base_url,
-        api_key=os.environ.get("MINDBRIDGE_API_KEY"),
-        timeout_seconds=arguments.request_timeout_seconds,
-    )
-    try:
+    async with connected_memory(arguments) as memory:
         by_example_id: dict[int, EgoMemReasonResult] = {}
         for identity in dict.fromkeys(question.identity for question in questions):
             identity_questions = tuple(
@@ -150,8 +118,6 @@ async def _run(
             )
             by_example_id.update((result.example_id, result) for result in results)
         return tuple(by_example_id[question.example_id] for question in questions)
-    finally:
-        await memory.close()
 
 
 def _write_artifacts(
@@ -213,88 +179,53 @@ def _write_artifacts(
         caption_clip_count=sum(
             clip.caption is not None for stream in streams for clip in stream.clips
         ),
-        predictions_sha256=hashlib.sha256(predictions.encode("utf-8")).hexdigest(),
-        completed_at=datetime.now(timezone.utc),
+        predictions_sha256=predictions_digest(predictions),
+        completed_at=completed_now(),
     )
-    write_text_atomically(arguments.output_path, predictions)
-    write_text_atomically(
-        sidecar_manifest_path(arguments.output_path),
-        manifest.model_dump_json(indent=2) + "\n",
-    )
+    write_run_artifacts(arguments.output_path, predictions, manifest)
 
 
 def _select_questions(
     questions: tuple[EgoMemReasonQuestion, ...],
     example_ids: tuple[int, ...],
 ) -> tuple[EgoMemReasonQuestion, ...]:
-    if not example_ids:
-        return questions
-    if len(set(example_ids)) != len(example_ids):
-        raise ValueError("example IDs must not contain duplicates")
-    requested = set(example_ids)
-    selected = tuple(question for question in questions if question.example_id in requested)
-    missing = requested - {question.example_id for question in selected}
-    if missing:
-        raise ValueError(
-            f"unknown EgoMemReason example IDs: {', '.join(map(str, sorted(missing)))}"
-        )
-    return selected
+    return select_by_id(
+        questions,
+        example_ids,
+        identify=lambda question: question.example_id,
+        label="EgoMemReason example",
+    )
 
 
 def _prepared_by_identity(
     questions: tuple[EgoMemReasonQuestion, ...],
     streams: tuple[EgoLifePreparedStream, ...],
 ) -> dict[str, EgoLifePreparedStream]:
-    by_identity = {stream.subject_id: stream for stream in streams}
-    missing = {question.identity for question in questions} - by_identity.keys()
-    if missing:
-        raise ValueError(f"missing prepared EgoMemReason identities: {', '.join(sorted(missing))}")
-    return {
-        identity: by_identity[identity]
-        for identity in dict.fromkeys(question.identity for question in questions)
-    }
+    identities = tuple(dict.fromkeys(question.identity for question in questions))
+    by_identity = index_prepared(
+        identities,
+        streams,
+        identify=lambda stream: stream.subject_id,
+        label="EgoMemReason identities",
+    )
+    return {identity: by_identity[identity] for identity in identities}
 
 
 def _parse_arguments() -> _Arguments:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", type=Path, required=True)
+    parser = benchmark_parser(tenant_prefix="benchmark_egomem")
+    add_media_arguments(parser, device_id="egolife_camera")
     parser.add_argument("--prepared-media", type=Path, required=True)
-    parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--api-base-url", required=True)
     parser.add_argument("--dataset-revision", required=True)
     parser.add_argument("--evaluator-revision", required=True)
-    parser.add_argument("--code-revision", required=True)
-    parser.add_argument("--deployment-config", type=Path, required=True)
-    parser.add_argument("--run-id", required=True)
-    parser.add_argument("--tenant-prefix", default="benchmark_egomem")
-    parser.add_argument("--device-id", default="egolife_camera")
-    parser.add_argument("--recall-limit", type=int, default=20)
-    parser.add_argument("--request-concurrency", type=int, default=4)
-    parser.add_argument("--request-timeout-seconds", type=float, default=1_800.0)
-    parser.add_argument("--poll-interval-seconds", type=float, default=1.0)
-    parser.add_argument("--processing-timeout-seconds", type=float, default=1_800.0)
     parser.add_argument("--example-id", type=int, action="append", default=[])
-    parser.add_argument("--overwrite", action="store_true")
     parsed = parser.parse_args()
     return _Arguments(
-        dataset_path=parsed.dataset,
+        **shared_argument_values(parsed),
+        **media_argument_values(parsed),
         prepared_media_path=parsed.prepared_media,
-        output_path=parsed.output,
-        api_base_url=parsed.api_base_url,
         dataset_revision=parsed.dataset_revision,
         evaluator_revision=parsed.evaluator_revision,
-        code_revision=parsed.code_revision,
-        deployment_config_path=parsed.deployment_config,
-        run_id=parsed.run_id,
-        tenant_prefix=parsed.tenant_prefix,
-        device_id=parsed.device_id,
-        recall_limit=parsed.recall_limit,
-        request_concurrency=parsed.request_concurrency,
-        request_timeout_seconds=parsed.request_timeout_seconds,
-        poll_interval_seconds=parsed.poll_interval_seconds,
-        processing_timeout_seconds=parsed.processing_timeout_seconds,
         example_ids=tuple(parsed.example_id),
-        overwrite=parsed.overwrite,
     )
 
 

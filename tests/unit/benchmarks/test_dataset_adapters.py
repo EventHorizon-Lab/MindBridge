@@ -6,19 +6,21 @@ from typing import ClassVar
 
 import pytest
 
-from mindbridge.benchmarks import (
-    MMLifelongSplit,
-    load_egolife_qa,
-    load_egomem_reason,
-    load_egotempo,
-    load_locomo,
-    load_m3_bench,
+from mindbridge.benchmarks.egolife_qa import load_egolife_qa
+from mindbridge.benchmarks.egomem_reason import load_egomem_reason
+from mindbridge.benchmarks.egotempo import load_egotempo
+from mindbridge.benchmarks.locomo import load_locomo
+from mindbridge.benchmarks.m3_bench import load_m3_bench
+from mindbridge.benchmarks.memlens import (
     load_memlens,
     load_memlens_agent_subset,
-    load_mm_lifelong,
-    load_supermemory_vqa,
-    load_video_mme,
 )
+from mindbridge.benchmarks.mm_lifelong import (
+    MMLifelongSplit,
+    load_mm_lifelong,
+)
+from mindbridge.benchmarks.supermemory_vqa import load_supermemory_vqa
+from mindbridge.benchmarks.video_mme import load_video_mme
 
 
 class _FakeArrowTable:

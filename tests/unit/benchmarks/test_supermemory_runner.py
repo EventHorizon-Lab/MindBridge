@@ -7,15 +7,15 @@ import pytest
 from pydantic import ValidationError
 
 from mindbridge import MindBridge
-from mindbridge.benchmarks import (
+from mindbridge.benchmarks.supermemory_runner import (
     SuperMemoryPreparedSegment,
     SuperMemoryPreparedSubject,
     SuperMemoryPreparedVideo,
-    SuperMemoryQuestion,
     SuperMemoryQuestionResult,
     evaluate_supermemory_vqa,
     run_supermemory_vqa,
 )
+from mindbridge.benchmarks.supermemory_vqa import SuperMemoryQuestion
 from mindbridge.contracts import (
     IdentityObservationInput,
     MediaObjectInput,

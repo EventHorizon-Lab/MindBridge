@@ -8,14 +8,16 @@ import pytest
 from pydantic import ValidationError
 
 from mindbridge import MindBridge
-from mindbridge.benchmarks import (
+from mindbridge.benchmarks.m3_bench import (
     M3BenchQuestion,
     M3BenchVideo,
+)
+from mindbridge.benchmarks.m3_runner import (
     M3PreparedClip,
     M3PreparedVideo,
     run_m3_video,
-    wait_for_observation_job,
 )
+from mindbridge.benchmarks.runtime import wait_for_observation_job
 from mindbridge.contracts import (
     IdentityObservationInput,
     MediaObjectInput,

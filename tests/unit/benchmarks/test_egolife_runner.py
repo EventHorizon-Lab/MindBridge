@@ -8,17 +8,19 @@ import pytest
 from pydantic import ValidationError
 
 from mindbridge import MindBridge
-from mindbridge.benchmarks import (
+from mindbridge.benchmarks.egolife_qa import (
     EgoLifeOption,
+    EgoLifeQuestion,
+)
+from mindbridge.benchmarks.egolife_runner import (
     EgoLifePreparedClip,
     EgoLifePreparedStream,
-    EgoLifeQuestion,
     EgoLifeQuestionResult,
-    EgoMemReasonQuestion,
     evaluate_egolife_qa,
     run_egolife_qa,
     run_egomem_reason,
 )
+from mindbridge.benchmarks.egomem_reason import EgoMemReasonQuestion
 from mindbridge.contracts import (
     MediaObjectInput,
     ObservationProcessingJobView,
