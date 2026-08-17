@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, cast
@@ -20,6 +19,7 @@ from mindbridge.benchmarks.cli_common import (
     MediaArguments,
     MediaBenchmarkRunManifest,
     add_media_arguments,
+    connected_memory,
     core_parser,
     media_arguments,
     media_manifest,
@@ -42,7 +42,6 @@ from mindbridge.benchmarks.prompts import MEMLENS_QUERY_PROMPT
 from mindbridge.contracts import Identifier, NonEmptyString, Sha256Hex
 from mindbridge.file_integrity import sha256_file
 from mindbridge.prompts import PERCEIVE_EVENTS_PROMPT
-from mindbridge.sdk import MindBridge
 
 MEMLENS_RUNNER_VERSION = "memlens_production_api_v3"
 MemLensContextWindow = Literal["32k", "64k", "128k", "256k"]
@@ -127,12 +126,7 @@ async def _run(
     prepared: MemLensPreparedImages | None,
 ) -> tuple[MemLensQuestionResult, ...]:
     validate_memlens_images(questions, prepared, text_only=arguments.text_only)
-    memory = MindBridge.connect(
-        base_url=arguments.api_base_url,
-        api_key=os.environ.get("MINDBRIDGE_API_KEY"),
-        timeout_seconds=arguments.request_timeout_seconds,
-    )
-    try:
+    async with connected_memory(arguments) as memory:
         results = []
         for question in questions:
             results.append(
@@ -151,8 +145,6 @@ async def _run(
                 )
             )
         return tuple(results)
-    finally:
-        await memory.close()
 
 
 def _write_artifacts(

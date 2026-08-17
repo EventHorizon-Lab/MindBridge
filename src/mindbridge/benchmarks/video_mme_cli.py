@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -20,7 +19,9 @@ from mindbridge.benchmarks.cli_common import (
     MediaArguments,
     MediaBenchmarkRunManifest,
     add_media_arguments,
+    connected_memory,
     core_parser,
+    index_prepared,
     media_arguments,
     media_manifest,
     write_run_artifacts,
@@ -39,7 +40,6 @@ from mindbridge.benchmarks.video_mme import (
 from mindbridge.contracts import Identifier, NonEmptyString, Sha256Hex
 from mindbridge.file_integrity import sha256_file
 from mindbridge.prompts import PERCEIVE_EVENTS_PROMPT
-from mindbridge.sdk import MindBridge
 
 VIDEO_MME_RUNNER_VERSION = "video_mme_production_api_v2"
 
@@ -91,12 +91,7 @@ async def _run(
     videos: tuple[VideoMMEVideo, ...],
     prepared: tuple[PreparedVideo, ...],
 ) -> tuple[VideoMMEVideoResult, ...]:
-    memory = MindBridge.connect(
-        base_url=arguments.api_base_url,
-        api_key=os.environ.get("MINDBRIDGE_API_KEY"),
-        timeout_seconds=arguments.request_timeout_seconds,
-    )
-    try:
+    async with connected_memory(arguments) as memory:
         return tuple(
             [
                 await run_video_mme_video(
@@ -114,8 +109,6 @@ async def _run(
                 for video, prepared_video in zip(videos, prepared, strict=True)
             ]
         )
-    finally:
-        await memory.close()
 
 
 def _write_artifacts(
@@ -178,10 +171,12 @@ def _select_videos(
 def _select_prepared(
     prepared: tuple[PreparedVideo, ...], videos: tuple[VideoMMEVideo, ...]
 ) -> tuple[PreparedVideo, ...]:
-    by_id = {video.video_id: video for video in prepared}
-    missing = {video.video_id for video in videos} - set(by_id)
-    if missing:
-        raise ValueError(f"missing prepared Video-MME videos: {', '.join(sorted(missing))}")
+    by_id = index_prepared(
+        (video.video_id for video in videos),
+        prepared,
+        key=lambda video: video.video_id,
+        label="Video-MME videos",
+    )
     return tuple(by_id[video.video_id] for video in videos)
 
 

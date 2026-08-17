@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-from collections.abc import Sequence
+import os
+from collections.abc import AsyncIterator, Callable, Iterable, Sequence
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -27,6 +29,13 @@ from mindbridge.benchmarks.artifacts import (
 from mindbridge.contracts import ContractModel, Identifier, NonEmptyString, Sha256Hex
 from mindbridge.models import EmbedTask
 from mindbridge.prompts import ANSWER_FROM_EVIDENCE_PROMPT
+from mindbridge.sdk import MindBridge
+
+_Prepared = TypeVar("_Prepared")
+# Benchmarks key prepared units either by string ID or by integer index, and the two sort
+# differently: constraining the variable keeps `sorted` numeric so a missing EgoMemReason
+# example is reported as "9, 10, 100" rather than "10, 100, 9".
+_Key = TypeVar("_Key", str, int)
 
 
 @dataclass(frozen=True, slots=True)
@@ -257,3 +266,41 @@ def write_run_artifacts(
         sidecar_manifest_path(output_path),
         manifest.model_dump_json(indent=2) + "\n",
     )
+
+
+@asynccontextmanager
+async def connected_memory(arguments: CoreArguments) -> AsyncIterator[MindBridge]:
+    """Open the production client a run measures, and release it however the run ends.
+
+    The API key is read from the environment rather than an argument so a run's recorded
+    invocation never carries the credential it used.
+    """
+    memory = MindBridge.connect(
+        base_url=arguments.api_base_url,
+        api_key=os.environ.get("MINDBRIDGE_API_KEY"),
+        timeout_seconds=arguments.request_timeout_seconds,
+    )
+    try:
+        yield memory
+    finally:
+        await memory.close()
+
+
+def index_prepared(
+    required: Iterable[_Key],
+    prepared: tuple[_Prepared, ...],
+    *,
+    key: Callable[[_Prepared], _Key],
+    label: str,
+) -> dict[_Key, _Prepared]:
+    """Index prepared media by unit, refusing a run that is missing any required entry.
+
+    Returns the whole index rather than an ordered sequence: callers that need release order
+    already hold the units and can read them back in it.
+    """
+    by_key = {key(item): item for item in prepared}
+    missing = set(required) - by_key.keys()
+    if missing:
+        formatted = ", ".join(str(item) for item in sorted(missing))
+        raise ValueError(f"missing prepared {label}: {formatted}")
+    return by_key

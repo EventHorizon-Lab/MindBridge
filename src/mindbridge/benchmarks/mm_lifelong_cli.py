@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, cast
@@ -19,6 +18,7 @@ from mindbridge.benchmarks.cli_common import (
     MediaArguments,
     MediaBenchmarkRunManifest,
     add_media_arguments,
+    connected_memory,
     core_parser,
     media_arguments,
     media_manifest,
@@ -40,7 +40,6 @@ from mindbridge.benchmarks.mm_lifelong_runner import (
 from mindbridge.contracts import NonEmptyString, Sha256Hex
 from mindbridge.file_integrity import sha256_file
 from mindbridge.prompts import PERCEIVE_EVENTS_PROMPT
-from mindbridge.sdk import MindBridge
 
 MM_LIFELONG_RUNNER_VERSION = "mm_lifelong_production_api_v2"
 
@@ -91,12 +90,7 @@ async def _run(
     questions: tuple[MMLifelongQuestion, ...],
     prepared: MMLifelongPreparedTimeline,
 ) -> tuple[MMLifelongQuestionResult, ...]:
-    memory = MindBridge.connect(
-        base_url=arguments.api_base_url,
-        api_key=os.environ.get("MINDBRIDGE_API_KEY"),
-        timeout_seconds=arguments.request_timeout_seconds,
-    )
-    try:
+    async with connected_memory(arguments) as memory:
         return await run_mm_lifelong(
             memory,
             questions,
@@ -109,8 +103,6 @@ async def _run(
             poll_interval_seconds=arguments.poll_interval_seconds,
             processing_timeout_seconds=arguments.processing_timeout_seconds,
         )
-    finally:
-        await memory.close()
 
 
 def _write_artifacts(

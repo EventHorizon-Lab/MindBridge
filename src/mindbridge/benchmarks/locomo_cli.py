@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 from dataclasses import dataclass
 from typing import Literal
 
@@ -18,6 +17,7 @@ from mindbridge.benchmarks.artifacts import (
 from mindbridge.benchmarks.cli_common import (
     BenchmarkRunManifest,
     CoreArguments,
+    connected_memory,
     core_arguments,
     core_manifest,
     core_parser,
@@ -32,7 +32,6 @@ from mindbridge.benchmarks.locomo_runner import (
 )
 from mindbridge.contracts import Identifier, NonEmptyString, Sha256Hex
 from mindbridge.file_integrity import sha256_file
-from mindbridge.sdk import MindBridge
 
 LOCOMO_RUNNER_VERSION = "locomo_production_api_v9"
 
@@ -72,12 +71,7 @@ async def _run_conversations(
     arguments: _Arguments,
     conversations: tuple[LoCoMoConversation, ...],
 ) -> tuple[LoCoMoOfficialConversationResult, ...]:
-    memory = MindBridge.connect(
-        base_url=arguments.api_base_url,
-        api_key=os.environ.get("MINDBRIDGE_API_KEY"),
-        timeout_seconds=arguments.request_timeout_seconds,
-    )
-    try:
+    async with connected_memory(arguments) as memory:
         results: list[LoCoMoOfficialConversationResult] = []
         for conversation in conversations:
             results.append(
@@ -91,8 +85,6 @@ async def _run_conversations(
                 )
             )
         return tuple(results)
-    finally:
-        await memory.close()
 
 
 def _write_artifacts(
