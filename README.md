@@ -105,6 +105,124 @@ uv run --extra cloud-models python -m mindbridge.benchmarks.jina_smoke \
 
 The checked-in result is [benchmarks/manifests/jina-omni-small-smoke.json](benchmarks/manifests/jina-omni-small-smoke.json).
 
+## Agent Memory Leaderboard offline harness
+
+[AML](https://agentmemories.ai/) does not distribute a benchmark you run yourself. It calls two
+endpoints you host — `Add` writes a history, `Search` returns ranked evidence — and owns the answer
+model, the prompts, the judges, and `top_k`. MindBridge serves that contract at `POST /aml/add` and
+`POST /aml/search`, registered only when `MINDBRIDGE_AML_API_KEY` is set, so no existing deployment
+grows an AML surface by accident. Set `MINDBRIDGE_AML_TENANT_PREFIX` too; the routes derive each
+tenant from `user_id` alone and never accept a caller-supplied tenant.
+
+The offline harness drives those same endpoints locally, then scores with AML's own published
+`answer` and `evaluate` stages, vendored verbatim under
+[benchmarks/aml/](benchmarks/aml/PINNED.md) and pinned by sha256. Those files are never edited and
+are excluded from `ruff`, because formatting them would break the byte-for-byte match that makes the
+scores comparable at all.
+
+### What these numbers are, and are not
+
+They measure progress between MindBridge versions. They are **not** leaderboard scores:
+
+- AML evaluates refined and held-out splits that are not distributed; the harness uses the public
+  upstream splits.
+- AML's answer and judge models are undisclosed. The harness points `ANSWER_*` and `JUDGE_*` at
+  whatever you configure.
+- A real submission must run Add and Search on `gpt-4o-mini` — mandatory on both the industry and
+  academic boards. Offline runs are free to use any model, so an offline number tells you the
+  architecture's ceiling, not the score you would post.
+
+### Datasets
+
+Six of AML's seven textual benchmarks. ScriptMem is absent on purpose: its public release ships
+questions, gold answers, and scoring code, but every `conversation` field contains only a
+`format_example` placeholder — the four source scripts are not distributed, so there is nothing for
+a memory system to retrieve and an offline number would measure nothing. A real submission is
+unaffected; AML runs ScriptMem server-side against its own copy.
+
+```bash
+git clone https://github.com/snap-research/locomo.git .benchmarks/locomo
+git -C .benchmarks/locomo checkout 3eb6f2c585f5e1699204e3c3bdf7adc5c28cb376
+git clone https://github.com/mohammadtavakoli78/BEAM.git .benchmarks/beam
+git -C .benchmarks/beam checkout 3e12035532eb85768f1a7cd779832b650c4b2ef9
+uvx --from huggingface-hub hf download xiaowu0162/longmemeval --repo-type dataset \
+  --local-dir .benchmarks/longmemeval
+uvx --from huggingface-hub hf download bowen-upenn/PersonaMem-v1 --repo-type dataset \
+  --local-dir .benchmarks/personamem-v1
+uvx --from huggingface-hub hf download bowen-upenn/PersonaMem-v2 --repo-type dataset \
+  --local-dir .benchmarks/personamem-v2
+uvx --from huggingface-hub hf download tencent/CL-bench --repo-type dataset \
+  --local-dir .benchmarks/clbench
+```
+
+Use `longmemeval_s`. `longmemeval_oracle` ships only each question's gold sessions, so retrieval has
+nothing to discriminate against and any score from it is meaningless; `longmemeval_m` is 2.7 GB.
+
+Per-benchmark field mappings, including the places a dataset's key differs from what its pipeline
+reads, are recorded in
+[the dataset schema reference](docs/superpowers/specs/2026-08-17-aml-dataset-schemas.md).
+
+### Retrieval and scoring
+
+`--dataset` is repeated once per positional argument the benchmark's loader takes, in order:
+`locomo`, `longmemeval`, and `clbench` take one path; `beam` takes `chat` then `questions`;
+`personamem-v1` takes `questions_csv` then `contexts_jsonl`; `personamem-v2` takes `benchmark_csv`
+then `data_root`.
+
+```bash
+uv run python -m mindbridge.benchmarks.aml.cli \
+  --benchmark locomo \
+  --dataset .benchmarks/locomo/data/locomo10.json \
+  --output .benchmarks/results/aml-locomo.jsonl \
+  --api-base-url "$MINDBRIDGE_API_BASE_URL" \
+  --code-revision "$(git rev-parse HEAD)" \
+  --deployment-config .benchmarks/deployment.json \
+  --run-id smoke-1 \
+  --tenant-prefix bench_aml \
+  --top-k 100 \
+  --concurrency 4
+```
+
+`--tenant-prefix` has no default and must match the deployment's `MINDBRIDGE_AML_TENANT_PREFIX`. The
+manifest's tenant map is derived client-side from the value you pass, so a mismatch produces a
+manifest recording tenants the server never used. Reruns against an existing `--output` resume, and
+refuse to start if the sidecar manifest disagrees on benchmark, run id, deployment, or recall limit.
+
+Then score through the vendored pipeline, unmodified:
+
+```bash
+export ANSWER_API_BASE="$MINDBRIDGE_GENERATOR_ENDPOINT"
+export ANSWER_API_KEY="$MINDBRIDGE_GENERATOR_API_KEY"
+export ANSWER_MODEL="qwen3.8-max"
+export JUDGE_API_BASE="$MINDBRIDGE_GENERATOR_ENDPOINT"
+export JUDGE_API_KEY="$MINDBRIDGE_GENERATOR_API_KEY"
+export JUDGE_MODEL="qwen3.8-max"
+export JUDGE_VERSION="qwen3.8-max"
+
+uv run python benchmarks/aml/pipelines/locomo-refined/pipeline.py answer \
+  --input .benchmarks/results/aml-locomo.jsonl \
+  --output .benchmarks/results/aml-locomo-answers.jsonl
+
+uv run python benchmarks/aml/pipelines/locomo-refined/pipeline.py evaluate \
+  --input .benchmarks/results/aml-locomo.jsonl \
+  --answers .benchmarks/results/aml-locomo-answers.jsonl \
+  --output .benchmarks/results/aml-locomo-scores.jsonl
+```
+
+### Disable thinking mode on the answer endpoint
+
+The vendored pipelines send exactly `{"model", "messages", "temperature": 0}` and expose no switch
+for thinking mode. Pointed at a thinking model such as Qwen3.8-Max, the answer stage can return
+reasoning text, the judge scores that text, and the run reads as a memory-system failure rather than
+a misconfigured harness. Default `enable_thinking` to false on the endpoint itself rather than
+patching the pinned files, and confirm it before trusting any score:
+
+```bash
+curl -s "$MINDBRIDGE_GENERATOR_ENDPOINT/chat/completions" -H "Authorization: Bearer $MINDBRIDGE_GENERATOR_API_KEY" -H 'Content-Type: application/json' -d '{"model":"qwen3.8-max","messages":[{"role":"user","content":"Reply with the single word: ok"}],"temperature":0}'
+```
+
+`choices[0].message.content` must be exactly `ok`, with no reasoning text and no empty content.
+
 ## Benchmark dataset smoke
 
 LoCoMo, M3-Bench, Video-MME, EgoLife (EgoLifeQA), EgoTempo, EgoMemReason, MEMLENS, MM-Lifelong,

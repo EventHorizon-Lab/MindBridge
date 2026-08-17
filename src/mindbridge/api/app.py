@@ -9,6 +9,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.types import Lifespan
 
+from mindbridge.api.aml import AmlSettings, register_aml_routes
 from mindbridge.api.auth import (
     AuthenticationError,
     TenantApiKeyAuthenticator,
@@ -51,6 +52,7 @@ from mindbridge.core import (
     ObjectStorageError,
     TaskBrokerError,
 )
+from mindbridge.models import Generator
 from mindbridge.telemetry import current_trace_id
 
 
@@ -59,6 +61,7 @@ def build_app(
     *,
     authenticator: TenantApiKeyAuthenticator,
     lifespan: Lifespan[FastAPI] | None = None,
+    aml: tuple[AmlSettings, Generator] | None = None,
 ) -> FastAPI:
     """Create a side-effect-free REST adapter around one memory kernel."""
     app = FastAPI(title="MindBridge", version="0.1.0", lifespan=lifespan)
@@ -147,6 +150,10 @@ def build_app(
     ) -> ObservationProcessingJobView:
         require_tenant(principal, tenant_id)
         return await kernel.get_observation_job(tenant_id, job_id)
+
+    if aml is not None:
+        aml_settings, aml_generator = aml
+        register_aml_routes(app, kernel, aml_generator, settings=aml_settings)
 
     return app
 
