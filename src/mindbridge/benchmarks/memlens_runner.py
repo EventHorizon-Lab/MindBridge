@@ -14,7 +14,10 @@ from mindbridge.benchmarks.memlens import (
     MemLensTurn,
 )
 from mindbridge.benchmarks.prompts import MEMLENS_QUERY_PROMPT
-from mindbridge.benchmarks.runtime import benchmark_tenant_id, wait_for_observation_job
+from mindbridge.benchmarks.runtime import (
+    benchmark_tenant_id,
+    ingest_media,
+)
 from mindbridge.contracts import (
     ContractModel,
     Identifier,
@@ -198,7 +201,8 @@ async def _ingest_turn(
             () if text_only else tuple(image_by_source[image.source_file] for image in turn.images)
         )
         if media_objects:
-            receipt = await memory.observe(
+            evidence_ids = await ingest_media(
+                memory,
                 ObserveRequest(
                     tenant_id=tenant_id,
                     device_id=device_id,
@@ -213,15 +217,9 @@ async def _ingest_turn(
                         f"{MEMLENS_ADAPTER_VERSION}:{question_id}:{session.session_id}:"
                         f"{turn.turn_id}:media"
                     ),
-                )
-            )
-            evidence_ids = receipt.evidence_ids
-            await wait_for_observation_job(
-                memory,
-                tenant_id,
-                receipt.processing_job_id,
+                ),
                 poll_interval_seconds=poll_interval_seconds,
-                timeout_seconds=processing_timeout_seconds,
+                processing_timeout_seconds=processing_timeout_seconds,
             )
         for index, summary in enumerate(_turn_summaries(turn)):
             await memory.remember(

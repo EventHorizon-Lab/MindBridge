@@ -11,9 +11,9 @@ from pydantic import AwareDatetime, Field, model_validator
 
 from mindbridge.benchmarks.runtime import (
     benchmark_tenant_id,
+    ingest_media,
     multiple_choice_query,
     parse_option_ranking,
-    wait_for_observation_job,
 )
 from mindbridge.benchmarks.supermemory_vqa import (
     SUPERMEMORY_VQA_ADAPTER_VERSION,
@@ -307,7 +307,8 @@ async def _ingest_segment(
         source_key = f"subject:{subject}:video:{video_id}:start:{segment.start_seconds:g}"
         evidence_ids: tuple[str, ...] = ()
         if segment.media_objects:
-            receipt = await memory.observe(
+            evidence_ids = await ingest_media(
+                memory,
                 ObserveRequest(
                     tenant_id=tenant_id,
                     device_id=device_id,
@@ -324,15 +325,9 @@ async def _ingest_segment(
                     observed_at=ended_at,
                     identity_observations=segment.identity_observations,
                     idempotency_key=f"{SUPERMEMORY_VQA_ADAPTER_VERSION}:{source_key}:media",
-                )
-            )
-            evidence_ids = receipt.evidence_ids
-            await wait_for_observation_job(
-                memory,
-                tenant_id,
-                receipt.processing_job_id,
+                ),
                 poll_interval_seconds=poll_interval_seconds,
-                timeout_seconds=processing_timeout_seconds,
+                processing_timeout_seconds=processing_timeout_seconds,
             )
         if segment.transcript is not None:
             await memory.remember(

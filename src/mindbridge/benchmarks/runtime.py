@@ -255,6 +255,29 @@ async def wait_for_observation_job(
         ) from error
 
 
+async def ingest_media(
+    memory: MindBridge,
+    request: ObserveRequest,
+    *,
+    poll_interval_seconds: float,
+    processing_timeout_seconds: float,
+) -> tuple[str, ...]:
+    """Submit one media observation and return its evidence once processing has succeeded.
+
+    Every runner needs the same three steps in the same order, and needs them to stay in that
+    order: evidence is only citable after the derived graph is durable.
+    """
+    receipt = await memory.observe(request)
+    await wait_for_observation_job(
+        memory,
+        request.tenant_id,
+        receipt.processing_job_id,
+        poll_interval_seconds=poll_interval_seconds,
+        timeout_seconds=processing_timeout_seconds,
+    )
+    return receipt.evidence_ids
+
+
 def multiple_choice_query(
     question: str,
     choices: tuple[NonEmptyString, ...],

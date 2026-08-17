@@ -14,7 +14,10 @@ from mindbridge.benchmarks.m3_bench import (
     M3BenchQuestion,
     M3BenchVideo,
 )
-from mindbridge.benchmarks.runtime import benchmark_tenant_id, wait_for_observation_job
+from mindbridge.benchmarks.runtime import (
+    benchmark_tenant_id,
+    ingest_media,
+)
 from mindbridge.contracts import (
     ContractModel,
     Identifier,
@@ -234,16 +237,11 @@ async def _ingest_clip(
     async with semaphore:
         evidence_ids: tuple[str, ...] = ()
         if clip.media_object is not None:
-            receipt = await memory.observe(
-                _observe_request(tenant_id, device_id, video_id, prepared, clip)
-            )
-            evidence_ids = receipt.evidence_ids
-            await wait_for_observation_job(
+            evidence_ids = await ingest_media(
                 memory,
-                tenant_id,
-                receipt.processing_job_id,
+                _observe_request(tenant_id, device_id, video_id, prepared, clip),
                 poll_interval_seconds=poll_interval_seconds,
-                timeout_seconds=processing_timeout_seconds,
+                processing_timeout_seconds=processing_timeout_seconds,
             )
         if clip.caption is not None:
             occurred_at = prepared.timeline_origin + timedelta(
