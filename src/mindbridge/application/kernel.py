@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import math
-from collections.abc import Callable
-from datetime import datetime
+from collections.abc import AsyncGenerator, Callable
+from datetime import datetime, timedelta
 
 from mindbridge.application.capabilities import (
     Embedder,
@@ -67,6 +68,7 @@ from mindbridge.core import (
     ModelReference,
     ObjectStorageError,
     Observation,
+    ObservationProcessingJob,
     TenantId,
     TombstoneId,
     VerificationStatus,
@@ -76,9 +78,13 @@ from mindbridge.core import (
 )
 from mindbridge.telemetry import (
     current_trace_id,
+    operation_span,
     set_current_span_attributes,
     trace_operation,
 )
+
+JOB_POLL_INTERVAL_SECONDS = 1.0
+JOB_WATCH_MAXIMUM_SECONDS = 300.0
 
 
 class MemoryKernel:
@@ -346,17 +352,43 @@ class MemoryKernel:
             TenantId(tenant_id),
             JobId(job_id),
         )
-        return ObservationProcessingJobView(
-            job_id=job.job_id,
-            observation_id=job.observation_id,
-            state=job.state,
-            attempt=job.attempt,
-            error_code=job.error_code,
-            memory_ids=job.memory_ids,
-            created_at=job.created_at,
-            updated_at=job.updated_at,
-            trace_id=current_trace_id(),
-        )
+        return _job_view(job)
+
+    async def watch_observation_job(
+        self,
+        tenant_id: str,
+        job_id: str,
+        *,
+        after_updated_at: datetime | None = None,
+        poll_interval_seconds: float = JOB_POLL_INTERVAL_SECONDS,
+        maximum_duration_seconds: float = JOB_WATCH_MAXIMUM_SECONDS,
+    ) -> AsyncGenerator[ObservationProcessingJobView, None]:
+        """Yield one complete job view per observed change until this attempt settles.
+
+        Every view is self-contained, so a caller that reconnects only needs the current state
+        and never a replayed history. `after_updated_at` suppresses a state the caller already
+        saw. Changes that occur between two reads coalesce into the newer state; the caller can
+        therefore miss an intermediate attempt, but never observes a stale one.
+        """
+        if poll_interval_seconds < 0:
+            raise ValueError("poll_interval_seconds must not be negative")
+        if maximum_duration_seconds <= 0:
+            raise ValueError("maximum_duration_seconds must be positive")
+        deadline = self._clock() + timedelta(seconds=maximum_duration_seconds)
+        previous: ObservationProcessingJob | None = None
+        with operation_span("mindbridge.watch_observation_job"):
+            while True:
+                job = await self._store.read_observation_processing_job(
+                    TenantId(tenant_id),
+                    JobId(job_id),
+                )
+                changed = job != previous
+                previous = job
+                if changed and (after_updated_at is None or job.updated_at > after_updated_at):
+                    yield _job_view(job)
+                if job.state.is_settled or self._clock() >= deadline:
+                    return
+                await asyncio.sleep(poll_interval_seconds)
 
     @trace_operation("mindbridge.get_memory")
     async def get_memory(self, tenant_id: str, memory_id: str) -> MemoryResult:
@@ -528,6 +560,20 @@ def _build_evidence_span(item: MediaObjectInput, observation: Observation) -> Ev
         start_ms=0,
         end_ms=end_ms,
         created_at=observation.observed_at,
+    )
+
+
+def _job_view(job: ObservationProcessingJob) -> ObservationProcessingJobView:
+    return ObservationProcessingJobView(
+        job_id=job.job_id,
+        observation_id=job.observation_id,
+        state=job.state,
+        attempt=job.attempt,
+        error_code=job.error_code,
+        memory_ids=job.memory_ids,
+        created_at=job.created_at,
+        updated_at=job.updated_at,
+        trace_id=current_trace_id(),
     )
 
 

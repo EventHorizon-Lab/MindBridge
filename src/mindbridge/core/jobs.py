@@ -19,6 +19,15 @@ class JobState(str, Enum):
     SUCCEEDED = "succeeded"
     FAILED = "failed"
 
+    @property
+    def is_settled(self) -> bool:
+        """Whether this processing attempt already reached an outcome.
+
+        Deliberately not called terminal: `SUCCEEDED` is irreversible, but the stale-job sweep
+        reclaims a `FAILED` job for a later attempt, so a settled job can still change state.
+        """
+        return self in {JobState.SUCCEEDED, JobState.FAILED}
+
 
 @dataclass(frozen=True, slots=True)
 class ObservationProcessingJob:

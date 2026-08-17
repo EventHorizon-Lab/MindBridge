@@ -1,6 +1,8 @@
 """Tests for the thin FastAPI protocol adapter."""
 
-from datetime import datetime, timezone
+import json
+from collections.abc import AsyncIterator
+from datetime import datetime, timedelta, timezone
 from typing import cast
 
 import pytest
@@ -164,6 +166,31 @@ class StubKernel:
             trace_id="trace_job",
         )
 
+    async def watch_observation_job(
+        self,
+        tenant_id: str,
+        job_id: str,
+        *,
+        after_updated_at: datetime | None = None,
+    ) -> AsyncIterator[ObservationProcessingJobView]:
+        for state, moment in (
+            (JobState.RUNNING, NOW),
+            (JobState.SUCCEEDED, NOW + timedelta(seconds=1)),
+        ):
+            if after_updated_at is not None and moment <= after_updated_at:
+                continue
+            yield ObservationProcessingJobView(
+                job_id=job_id,
+                observation_id="observation_01",
+                state=state,
+                attempt=1,
+                error_code=None,
+                memory_ids=("memory_01",) if state is JobState.SUCCEEDED else (),
+                created_at=NOW,
+                updated_at=moment,
+                trace_id="trace_job_stream",
+            )
+
     async def get_memory(self, tenant_id: str, memory_id: str) -> MemoryResult:
         if memory_id != "memory_01":
             raise MemoryNotFoundError("missing")
@@ -241,6 +268,81 @@ def test_job_route_is_tenant_scoped_and_returns_not_found() -> None:
     assert found.json()["state"] == "succeeded"
     assert missing.status_code == 404
     assert missing.json()["code"] == "job_not_found"
+
+
+def test_job_event_stream_sends_one_complete_view_per_change() -> None:
+    client = _client()
+
+    response = client.get("/v1/jobs/job_01/events", params={"tenant_id": "tenant_01"})
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    assert response.headers["cache-control"] == "no-store"
+    events = _sse_events(response.text)
+    assert [event["event"] for event in events] == ["job", "job"]
+    assert [event["id"] for event in events] == [
+        str(_expected_event_id(NOW)),
+        str(_expected_event_id(NOW + timedelta(seconds=1))),
+    ]
+    assert [json.loads(event["data"])["state"] for event in events] == ["running", "succeeded"]
+    # Each event carries the whole view, which is what makes resuming from one ID correct.
+    assert json.loads(events[-1]["data"])["memory_ids"] == ["memory_01"]
+
+
+def test_job_event_stream_resumes_after_the_last_received_event() -> None:
+    client = _client()
+
+    response = client.get(
+        "/v1/jobs/job_01/events",
+        params={"tenant_id": "tenant_01"},
+        headers={"Last-Event-ID": str(_expected_event_id(NOW))},
+    )
+
+    events = _sse_events(response.text)
+    assert [json.loads(event["data"])["state"] for event in events] == ["succeeded"]
+
+
+def test_job_event_stream_ignores_an_unusable_last_event_id() -> None:
+    client = _client()
+
+    response = client.get(
+        "/v1/jobs/job_01/events",
+        params={"tenant_id": "tenant_01"},
+        headers={"Last-Event-ID": "not-a-number"},
+    )
+
+    assert response.status_code == 200
+    assert len(_sse_events(response.text)) == 2
+
+
+def test_job_event_stream_rejects_a_missing_or_foreign_job_before_streaming() -> None:
+    client = _client()
+
+    missing = client.get("/v1/jobs/missing/events", params={"tenant_id": "tenant_01"})
+    foreign = client.get("/v1/jobs/job_01/events", params={"tenant_id": "tenant_02"})
+
+    assert missing.status_code == 404
+    assert missing.json()["code"] == "job_not_found"
+    assert foreign.status_code == 403
+
+
+def _sse_events(body: str) -> list[dict[str, str]]:
+    """Parse framed events, dropping keepalive comments."""
+    events: list[dict[str, str]] = []
+    for block in body.split("\n\n"):
+        fields = {
+            name: value.strip()
+            for name, _, value in (line.partition(":") for line in block.splitlines())
+            if name
+        }
+        if "event" in fields:
+            events.append(fields)
+    return events
+
+
+def _expected_event_id(moment: datetime) -> int:
+    """Pin the wire format independently of the implementation."""
+    return (moment - datetime(1970, 1, 1, tzinfo=timezone.utc)) // timedelta(microseconds=1)
 
 
 def test_memory_routes_are_tenant_scoped_and_traced() -> None:
@@ -364,6 +466,11 @@ def test_openapi_exposes_stable_operation_ids() -> None:
     assert paths["/v1/deletions"]["get"]["operationId"] == "listDeletions"
     assert paths["/v1/recall"]["post"]["operationId"] == "recall"
     assert paths["/v1/jobs/{job_id}"]["get"]["operationId"] == "getObservationJob"
+    assert paths["/v1/jobs/{job_id}/events"]["get"]["operationId"] == "streamObservationJob"
+    assert (
+        "text/event-stream"
+        in paths["/v1/jobs/{job_id}/events"]["get"]["responses"]["200"]["content"]
+    )
 
 
 @pytest.mark.parametrize(

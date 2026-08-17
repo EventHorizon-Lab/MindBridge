@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Mapping
+from dataclasses import dataclass
 from typing import Literal, TypeVar
 from urllib.parse import quote
 
@@ -45,6 +46,14 @@ class MindBridgeError(RuntimeError):
         self.code = code
         self.status_code = status_code
         self.trace_id = trace_id
+
+
+@dataclass(frozen=True, slots=True)
+class ObservationJobEvent:
+    """One streamed job state and the opaque ID that resumes after it."""
+
+    event_id: str
+    job: ObservationProcessingJobView
 
 
 class MindBridge:
@@ -150,6 +159,50 @@ class MindBridge:
             params={"tenant_id": tenant_id},
         )
 
+    async def stream_observation_job(
+        self,
+        tenant_id: str,
+        job_id: str,
+        *,
+        last_event_id: str | None = None,
+    ) -> AsyncIterator[ObservationJobEvent]:
+        """Follow one job's progress, resuming after `last_event_id` when it is supplied.
+
+        Every event carries a complete job view, so resuming needs only the last ID received
+        rather than a replayed history. The stream ends when the attempt settles or the server
+        closes its window; reconnecting is the caller's decision.
+        """
+        headers = {"Accept": "text/event-stream"}
+        if last_event_id is not None:
+            headers["Last-Event-ID"] = last_event_id
+        try:
+            async with self._client.stream(
+                "GET",
+                f"v1/jobs/{quote(job_id, safe='')}/events",
+                params={"tenant_id": tenant_id},
+                headers=headers,
+            ) as response:
+                if not response.is_success:
+                    await response.aread()
+                    raise _api_error(response)
+                frame: dict[str, str] = {}
+                async for line in response.aiter_lines():
+                    if line.startswith(":"):
+                        continue
+                    if line:
+                        name, _, value = line.partition(":")
+                        frame[name] = value.strip()
+                        continue
+                    event = _streamed_job_event(frame)
+                    frame = {}
+                    if event is not None:
+                        yield event
+        except httpx.HTTPError as error:
+            raise MindBridgeError(
+                "MindBridge stream failed",
+                code="transport_error",
+            ) from error
+
     async def close(self) -> None:
         """Release the underlying HTTP connection pool."""
         await self._client.aclose()
@@ -193,6 +246,35 @@ class MindBridge:
                 code="invalid_response",
                 status_code=response.status_code,
             ) from error
+
+
+def _streamed_job_event(frame: Mapping[str, str]) -> ObservationJobEvent | None:
+    """Read one framed event, ignoring event types this client version does not know."""
+    event = frame.get("event")
+    if event is None:
+        return None
+    if event == "error":
+        raise _streamed_error(frame.get("data", ""))
+    if event != "job":
+        return None
+    try:
+        return ObservationJobEvent(
+            event_id=frame.get("id", ""),
+            job=ObservationProcessingJobView.model_validate_json(frame.get("data", "")),
+        )
+    except ValidationError as error:
+        raise MindBridgeError(
+            "MindBridge returned an invalid response",
+            code="invalid_response",
+        ) from error
+
+
+def _streamed_error(payload: str) -> MindBridgeError:
+    try:
+        error = ErrorResponse.model_validate_json(payload)
+    except ValidationError:
+        return MindBridgeError("MindBridge stream reported an error", code="stream_error")
+    return MindBridgeError(error.message, code=error.code, trace_id=error.trace_id)
 
 
 def _api_error(response: httpx.Response) -> MindBridgeError:
