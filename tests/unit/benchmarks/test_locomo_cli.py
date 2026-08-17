@@ -38,6 +38,7 @@ def test_locomo_artifacts_pin_source_system_code_and_output(tmp_path: Path) -> N
                 evidence=("D1:1",),
                 category=1,
                 mindbridge_prediction="Hello",
+                mindbridge_abstained=False,
                 mindbridge_confidence=0.9,
                 mindbridge_prediction_context=("D1:1",),
                 mindbridge_trace_id="trace_01",
@@ -66,6 +67,7 @@ def test_locomo_artifacts_pin_source_system_code_and_output(tmp_path: Path) -> N
     assert manifest.request_timeout_seconds == 1_800.0
     assert manifest.memory_item_count == 1
     assert manifest.question_count == 1
+    assert manifest.abstained_question_count == 0
     assert manifest.predictions_sha256 == hashlib.sha256(output_path.read_bytes()).hexdigest()
     with pytest.raises(FileExistsError):
         require_writable_output_pair(output_path, overwrite=False)

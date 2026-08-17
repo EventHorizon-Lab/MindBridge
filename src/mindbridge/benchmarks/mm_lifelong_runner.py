@@ -99,7 +99,7 @@ class MMLifelongQuestionResult(ContractModel):
     temporal_certificate: NonEmptyString
     total_intervals: tuple[tuple[float, float], ...] = Field(min_length=1)
     pred: MMLifelongPrediction
-    ref_300: float = Field(ge=0.0, le=1.0)
+    mindbridge_unofficial_ref_at_300: float = Field(ge=0.0, le=1.0)
     mindbridge_confidence: float = Field(ge=0.0, le=1.0)
     mindbridge_memory_ids: tuple[Identifier, ...]
     mindbridge_evidence_ids: tuple[Identifier, ...]
@@ -273,7 +273,9 @@ async def _answer_question(
         temporal_certificate=question.temporal_certificate,
         total_intervals=question.reference_intervals,
         pred=MMLifelongPrediction(answer=recalled.answer or "", intervals=intervals),
-        ref_300=reference_at_n(question.reference_intervals, intervals, total_seconds),
+        mindbridge_unofficial_ref_at_300=unofficial_reference_at_n(
+            question.reference_intervals, intervals, total_seconds
+        ),
         mindbridge_confidence=recalled.confidence,
         mindbridge_memory_ids=tuple(item.memory_id for item in recalled.memories),
         mindbridge_evidence_ids=tuple(item.evidence_id for item in recalled.evidence),
@@ -295,13 +297,18 @@ def _memory_intervals(
     return tuple(sorted(intervals))
 
 
-def reference_at_n(
+def unofficial_reference_at_n(
     reference: tuple[tuple[float, float], ...],
     prediction: tuple[tuple[float, float], ...],
     total_seconds: float,
     bucket_size: float = 300.0,
 ) -> float:
-    """Compute the official MM-Lifelong Ref@N interval Jaccard score."""
+    """Estimate interval-localization quality as a bucketed Jaccard overlap.
+
+    This is an in-repo diagnostic, not the official Ref@N. Bucket edges and rounding are not
+    verified against the released scorer, so a published number must come from running that
+    scorer over the emitted `pred` rows.
+    """
     if total_seconds <= 0 or bucket_size <= 0:
         raise ValueError("MM-Lifelong total duration and bucket size must be positive")
 

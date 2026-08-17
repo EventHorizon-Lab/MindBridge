@@ -25,6 +25,9 @@ from mindbridge.core import MemoryType
 from mindbridge.sdk import MindBridge
 
 LOCOMO_PREDICTION_KEY = "mindbridge_prediction"
+# LoCoMo scores an adversarial question correct for exactly this wording, so an abstention and a
+# reasoned "no such thing was said" are indistinguishable to the official token-F1. Every row
+# therefore carries mindbridge_abstained, and a run must report the abstention rate next to F1.
 LOCOMO_ABSTENTION = "Not mentioned in the conversation"
 
 
@@ -36,6 +39,7 @@ class LoCoMoOfficialQuestionResult(ContractModel):
     evidence: tuple[Identifier, ...]
     category: int = Field(ge=1, le=5)
     mindbridge_prediction: NonEmptyString
+    mindbridge_abstained: bool
     mindbridge_confidence: float = Field(ge=0.0, le=1.0)
     mindbridge_prediction_context: tuple[Identifier, ...]
     mindbridge_trace_id: Identifier
@@ -137,6 +141,7 @@ async def _answer_question(
         evidence=question.evidence_dialog_ids,
         category=question.category,
         mindbridge_prediction=result.answer or LOCOMO_ABSTENTION,
+        mindbridge_abstained=not result.answer,
         mindbridge_confidence=result.confidence,
         mindbridge_prediction_context=retrieved_dialog_ids,
         mindbridge_trace_id=result.trace_id,

@@ -10,6 +10,7 @@ from typing import Literal, Protocol, cast
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, TypeAdapter, model_validator
 
+from mindbridge.benchmarks.prompts import VIDEO_MME_QUERY_PROMPT
 from mindbridge.benchmarks.runtime import (
     PreparedVideo,
     benchmark_tenant_id,
@@ -24,7 +25,6 @@ from mindbridge.contracts import (
     RecallQuery,
     RecallRequest,
 )
-from mindbridge.prompts import VIDEO_MME_QUERY_PROMPT
 from mindbridge.sdk import MindBridge, MindBridgeError
 
 VIDEO_MME_ADAPTER_VERSION = "video_mme_official_v1"
@@ -113,17 +113,27 @@ class VideoMMEVideoResult(ContractModel):
 
 
 class VideoMMEMetrics(ContractModel):
-    """Local accuracy using the released evaluator's answered-only denominator."""
+    """Both the released evaluator's denominator and the full-question-set floor.
+
+    `accuracy` reproduces the official parser, which drops rows whose response does not
+    contain an option letter. Abstentions and API failures land in exactly that bucket, so
+    `strict_accuracy` and `error_count` are reported alongside it: a run may not quote the
+    official number without the count of questions it never answered.
+    """
 
     question_count: int = Field(gt=0)
     answered_count: int = Field(ge=0)
     correct_count: int = Field(ge=0)
+    error_count: int = Field(ge=0)
     accuracy: float = Field(ge=0.0, le=1.0)
+    strict_accuracy: float = Field(ge=0.0, le=1.0)
 
     @model_validator(mode="after")
     def require_consistent_counts(self) -> VideoMMEMetrics:
         if self.correct_count > self.answered_count or self.answered_count > self.question_count:
             raise ValueError("Video-MME metric counts are inconsistent")
+        if self.error_count > self.question_count - self.answered_count:
+            raise ValueError("Video-MME failed questions must not carry a parsed answer")
         return self
 
 
@@ -233,7 +243,7 @@ async def run_video_mme_video(
 
 
 def evaluate_video_mme(results: tuple[VideoMMEVideoResult, ...]) -> VideoMMEMetrics:
-    """Compute the same aggregate accuracy denominator as the official parser."""
+    """Compute the official accuracy together with its unanswered and failed counts."""
     questions = tuple(question for video in results for question in video.questions)
     if not questions:
         raise ValueError("Video-MME results must not be empty")
@@ -243,7 +253,9 @@ def evaluate_video_mme(results: tuple[VideoMMEVideoResult, ...]) -> VideoMMEMetr
         question_count=len(questions),
         answered_count=len(answered),
         correct_count=correct_count,
+        error_count=sum(question.mindbridge_error_code is not None for question in questions),
         accuracy=correct_count / len(answered) if answered else 0.0,
+        strict_accuracy=correct_count / len(questions),
     )
 
 

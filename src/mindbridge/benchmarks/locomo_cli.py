@@ -62,6 +62,7 @@ class LoCoMoRunManifest(ContractModel):
     sample_ids: tuple[Identifier, ...] = Field(min_length=1)
     memory_item_count: int = Field(gt=0)
     question_count: int = Field(gt=0)
+    abstained_question_count: int = Field(ge=0)
     predictions_sha256: Sha256Hex
     completed_at: AwareDatetime
 
@@ -155,6 +156,9 @@ def _write_artifacts(
         sample_ids=tuple(conversation.sample_id for conversation in conversations),
         memory_item_count=sum(len(conversation.turns) for conversation in conversations),
         question_count=sum(len(conversation.questions) for conversation in conversations),
+        abstained_question_count=sum(
+            question.mindbridge_abstained for result in results for question in result.qa
+        ),
         predictions_sha256=hashlib.sha256(predictions.encode("utf-8")).hexdigest(),
         completed_at=datetime.now(timezone.utc),
     )

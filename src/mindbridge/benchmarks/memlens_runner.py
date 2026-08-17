@@ -13,6 +13,7 @@ from mindbridge.benchmarks.memlens import (
     MemLensSession,
     MemLensTurn,
 )
+from mindbridge.benchmarks.prompts import MEMLENS_QUERY_PROMPT
 from mindbridge.benchmarks.runtime import benchmark_tenant_id, wait_for_observation_job
 from mindbridge.contracts import (
     ContractModel,
@@ -25,7 +26,6 @@ from mindbridge.contracts import (
     RememberRequest,
 )
 from mindbridge.core import MediaKind, MemoryType, SensorKind
-from mindbridge.prompts import MEMLENS_QUERY_PROMPT
 from mindbridge.sdk import MindBridge
 
 
@@ -67,7 +67,6 @@ class MemLensQuestionResult(ContractModel):
     question_subtype: NonEmptyString | None = None
     reference_answer: NonEmptyString
     old_answer: NonEmptyString | None = None
-    raw_prediction: str
     prediction: str
     mindbridge_confidence: float = Field(ge=0.0, le=1.0)
     mindbridge_memory_ids: tuple[Identifier, ...]
@@ -171,7 +170,6 @@ async def run_memlens_question(
         question_subtype=question.question_subtype,
         reference_answer=question.reference_answer,
         old_answer=question.old_answer,
-        raw_prediction=prediction,
         prediction=prediction,
         mindbridge_confidence=recalled.confidence,
         mindbridge_memory_ids=tuple(item.memory_id for item in recalled.memories),

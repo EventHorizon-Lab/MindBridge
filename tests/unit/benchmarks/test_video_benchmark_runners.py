@@ -11,11 +11,14 @@ from mindbridge.benchmarks import (
     PreparedVideo,
     PreparedVideoSegment,
     VideoMMEQuestion,
+    VideoMMEQuestionResult,
     VideoMMEVideo,
+    VideoMMEVideoResult,
     evaluate_video_mme,
     run_egotempo_clip,
     run_video_mme_video,
 )
+from mindbridge.benchmarks.video_mme import VideoMMEOption
 from mindbridge.contracts import (
     MediaObjectInput,
     ObservationProcessingJobView,
@@ -135,6 +138,55 @@ async def test_video_mme_emits_official_nested_response() -> None:
     assert result.questions[0].response == "C"
     assert result.questions[0].mindbridge_model_answer == "The best answer is C."
     assert evaluate_video_mme((result,)).accuracy == 1.0
+
+
+def test_video_mme_metrics_separate_official_accuracy_from_unanswered_questions() -> None:
+    """An unparsed or failed row must not silently leave the reported denominator."""
+    results = (
+        _video_mme_result("001-1", answer="C", response="C"),
+        _video_mme_result("001-2", answer="A", response=""),
+        _video_mme_result("001-3", answer="B", response="", error_code="model_request_failed"),
+    )
+
+    metrics = evaluate_video_mme(results)
+
+    assert metrics.question_count == 3
+    assert metrics.answered_count == 1
+    assert metrics.correct_count == 1
+    assert metrics.error_count == 1
+    assert metrics.accuracy == 1.0
+    assert metrics.strict_accuracy == pytest.approx(1 / 3)
+
+
+def _video_mme_result(
+    question_id: str,
+    *,
+    answer: VideoMMEOption,
+    response: str,
+    error_code: str | None = None,
+) -> VideoMMEVideoResult:
+    return VideoMMEVideoResult(
+        video_id="001",
+        duration="short",
+        domain="Knowledge",
+        sub_category="Humanity & History",
+        questions=(
+            VideoMMEQuestionResult(
+                question_id=question_id,
+                task_type="Counting Problem",
+                question="Which decoration appears most?",
+                options=("A. Apples.", "B. Candles.", "C. Berries.", "D. Equal."),
+                answer=answer,
+                response=response,
+                mindbridge_model_answer=response,
+                mindbridge_confidence=0.0,
+                mindbridge_memory_ids=(),
+                mindbridge_evidence_ids=(),
+                mindbridge_trace_id=f"trace_{question_id}",
+                mindbridge_error_code=error_code,
+            ),
+        ),
+    )
 
 
 async def test_egotempo_emits_official_judge_fields_without_answer_leakage() -> None:
