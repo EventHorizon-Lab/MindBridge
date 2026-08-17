@@ -1,7 +1,11 @@
 """Deployable model defaults without importing any provider SDK."""
 
 from collections.abc import Mapping
+from typing import Annotated
 
+from pydantic import AfterValidator
+
+from mindbridge.configuration import PluginInteger
 from mindbridge.core import DEFAULT_EMBEDDING_DIMENSION, EmbeddingSpaceReference
 
 __all__ = [
@@ -11,6 +15,7 @@ __all__ = [
     "DEFAULT_EMBEDDING_SPACE",
     "DEFAULT_GENERATOR_MODEL_ID",
     "MATRYOSHKA_DIMENSIONS",
+    "MatryoshkaDimension",
     "embedding_dimension_from_environment",
     "require_matryoshka_dimension",
 ]
@@ -34,6 +39,9 @@ def require_matryoshka_dimension(dimension: int) -> int:
         supported = ", ".join(str(value) for value in MATRYOSHKA_DIMENSIONS)
         raise ValueError(f"embedding dimension must be one of {supported}")
     return dimension
+
+
+MatryoshkaDimension = Annotated[PluginInteger, AfterValidator(require_matryoshka_dimension)]
 
 
 def embedding_dimension_from_environment(source: Mapping[str, str]) -> int:

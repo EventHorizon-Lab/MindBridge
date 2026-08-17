@@ -182,6 +182,8 @@ class RecordingPerceiver:
 class RecordingEmbedder:
     """Proves raw signed media, not a caption, reaches Jina document encoding."""
 
+    space_reference = EmbeddingSpaceReference(space_id="jina-v5", revision="space-v1")
+
     def __init__(self) -> None:
         self.documents: tuple[str, ...] = ()
 
@@ -205,6 +207,8 @@ class RecordingEmbedder:
 
 
 class RecordingTextEmbedder:
+    space_reference = EmbeddingSpaceReference(space_id="jina-v5", revision="space-v1")
+
     def __init__(self) -> None:
         self.documents: tuple[str, ...] = ()
 
@@ -472,6 +476,21 @@ async def test_processor_records_sanitized_failure_state(
 
     assert store.job.state is JobState.FAILED
     assert store.job.error_code == error_code
+
+
+def test_processing_rejects_embedders_in_different_search_spaces() -> None:
+    """Media and text vectors are compared directly, so one drifted space must fail loudly."""
+
+    class DriftedTextEmbedder(RecordingTextEmbedder):
+        space_reference = EmbeddingSpaceReference(space_id="jina-v5", revision="space-v2")
+
+    with pytest.raises(ValueError, match="one search space"):
+        _processor(
+            RecordingProcessingStore(),
+            RecordingPerceiver(),
+            RecordingEmbedder(),
+            DriftedTextEmbedder(),
+        )
 
 
 def _processor(

@@ -29,11 +29,10 @@ from mindbridge.application.capabilities import (
     TextPart,
 )
 from mindbridge.configuration import (
-    optional_plugin_string,
-    plugin_float,
-    plugin_integer,
-    plugin_string,
-    reject_unknown_plugin_keys,
+    PluginConfigModel,
+    PluginInteger,
+    PluginNumber,
+    PluginText,
 )
 from mindbridge.core import (
     EmbeddingSpaceReference,
@@ -47,7 +46,7 @@ from mindbridge.models._vectors import validate_embedding_vector
 from mindbridge.models.defaults import (
     DEFAULT_EMBEDDING_DIMENSION,
     DEFAULT_GENERATOR_MODEL_ID,
-    require_matryoshka_dimension,
+    MatryoshkaDimension,
 )
 from mindbridge.telemetry import set_current_span_attributes, trace_operation
 
@@ -246,6 +245,11 @@ class OpenAIEmbedder:
             video_max_pixels=video_max_pixels,
         )
 
+    @property
+    def space_reference(self) -> EmbeddingSpaceReference:
+        """Declare the search space both aligned endpoints write into."""
+        return self._space_reference
+
     @trace_operation("mindbridge.model.embed")
     async def embed(self, request: EmbedRequest) -> EmbedResult:
         """Encode a homogeneous batch without exposing provider request shapes."""
@@ -255,6 +259,8 @@ class OpenAIEmbedder:
             {
                 "mindbridge.model.id": self._model_reference.model_id,
                 "mindbridge.model.revision": self._model_reference.revision,
+                "mindbridge.embedding.space_id": self._space_reference.space_id,
+                "mindbridge.embedding.space_revision": self._space_reference.revision,
                 "mindbridge.embedding.dimension": self._dimension,
                 "mindbridge.embedding.input_count": len(request.inputs),
                 "mindbridge.embedding.task": request.task.value,
@@ -335,76 +341,65 @@ class OpenAIEmbedder:
         )[0]
 
 
+class _GeneratorConfig(PluginConfigModel):
+    api_key: PluginText
+    endpoint: PluginText
+    model_revision: PluginText
+    model_id: PluginText = DEFAULT_GENERATOR_MODEL_ID
+    request_timeout_seconds: PluginNumber = 1_800.0
+    max_retries: PluginInteger = 2
+    reasoning_effort: PluginText | None = None
+    video_frames_per_second: PluginNumber = DEFAULT_VIDEO_FRAMES_PER_SECOND
+    video_max_pixels: PluginInteger = DEFAULT_VIDEO_MAX_PIXELS
+
+
+class _EmbedderConfig(PluginConfigModel):
+    api_key: PluginText
+    endpoint: PluginText
+    model_id: PluginText
+    model_revision: PluginText
+    space_id: PluginText
+    space_revision: PluginText
+    dimension: MatryoshkaDimension = DEFAULT_EMBEDDING_DIMENSION
+    request_timeout_seconds: PluginNumber = 120.0
+    max_retries: PluginInteger = 2
+    video_frames_per_second: PluginNumber = DEFAULT_VIDEO_FRAMES_PER_SECOND
+    video_max_pixels: PluginInteger = DEFAULT_VIDEO_MAX_PIXELS
+
+
 def create_generator(config: Mapping[str, object]) -> OpenAIGenerator:
     """Entry-point factory for the bundled OpenAI-compatible generator."""
-    reject_unknown_plugin_keys(
-        config,
-        {
-            "api_key",
-            "endpoint",
-            "model_id",
-            "model_revision",
-            "request_timeout_seconds",
-            "max_retries",
-            "reasoning_effort",
-            "video_frames_per_second",
-            "video_max_pixels",
-        },
-    )
+    validated = _GeneratorConfig.model_validate(config)
     return OpenAIGenerator.connect(
-        api_key=plugin_string(config, "api_key"),
-        endpoint=plugin_string(config, "endpoint"),
-        model_id=plugin_string(config, "model_id", DEFAULT_GENERATOR_MODEL_ID),
-        model_revision=plugin_string(config, "model_revision"),
-        request_timeout_seconds=plugin_float(config, "request_timeout_seconds", 1_800.0),
-        max_retries=plugin_integer(config, "max_retries", 2),
-        reasoning_effort=cast(
-            ReasoningEffort,
-            optional_plugin_string(config, "reasoning_effort"),
-        ),
-        video_frames_per_second=plugin_float(
-            config, "video_frames_per_second", DEFAULT_VIDEO_FRAMES_PER_SECOND
-        ),
-        video_max_pixels=plugin_integer(config, "video_max_pixels", DEFAULT_VIDEO_MAX_PIXELS),
+        api_key=validated.api_key,
+        endpoint=validated.endpoint,
+        model_id=validated.model_id,
+        model_revision=validated.model_revision,
+        request_timeout_seconds=validated.request_timeout_seconds,
+        max_retries=validated.max_retries,
+        reasoning_effort=cast(ReasoningEffort, validated.reasoning_effort),
+        video_frames_per_second=validated.video_frames_per_second,
+        video_max_pixels=validated.video_max_pixels,
     )
 
 
 def create_embedder(config: Mapping[str, object]) -> OpenAIEmbedder:
     """Entry-point factory for the OpenAI-compatible Omni embedder."""
-    reject_unknown_plugin_keys(
-        config,
-        {
-            "api_key",
-            "endpoint",
-            "model_id",
-            "model_revision",
-            "space_id",
-            "space_revision",
-            "dimension",
-            "request_timeout_seconds",
-            "max_retries",
-            "video_frames_per_second",
-            "video_max_pixels",
-        },
-    )
+    validated = _EmbedderConfig.model_validate(config)
     return OpenAIEmbedder.connect(
-        api_key=plugin_string(config, "api_key"),
-        endpoint=plugin_string(config, "endpoint"),
-        model_id=plugin_string(config, "model_id"),
-        model_revision=plugin_string(config, "model_revision"),
+        api_key=validated.api_key,
+        endpoint=validated.endpoint,
+        model_id=validated.model_id,
+        model_revision=validated.model_revision,
         space_reference=EmbeddingSpaceReference(
-            space_id=plugin_string(config, "space_id"),
-            revision=plugin_string(config, "space_revision"),
+            space_id=validated.space_id,
+            revision=validated.space_revision,
         ),
-        dimension=require_matryoshka_dimension(
-            plugin_integer(config, "dimension", DEFAULT_EMBEDDING_DIMENSION)
-        ),
-        request_timeout_seconds=plugin_float(config, "request_timeout_seconds", 120.0),
-        max_retries=plugin_integer(config, "max_retries", 2),
-        video_frames_per_second=plugin_float(
-            config, "video_frames_per_second", DEFAULT_VIDEO_FRAMES_PER_SECOND
-        ),
-        video_max_pixels=plugin_integer(config, "video_max_pixels", DEFAULT_VIDEO_MAX_PIXELS),
+        dimension=validated.dimension,
+        request_timeout_seconds=validated.request_timeout_seconds,
+        max_retries=validated.max_retries,
+        video_frames_per_second=validated.video_frames_per_second,
+        video_max_pixels=validated.video_max_pixels,
     )
 
 

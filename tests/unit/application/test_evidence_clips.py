@@ -212,6 +212,8 @@ class RecordingStore:
 
 
 class RecordingEmbedder:
+    space_reference = EmbeddingSpaceReference(space_id="jina-v5", revision="space-v1")
+
     def __init__(self) -> None:
         self.tasks: list[EmbedTask] = []
         self.urls: list[str] = []

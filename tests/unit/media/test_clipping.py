@@ -2,9 +2,7 @@
 
 import io
 
-import numpy
 import pytest
-import soundfile
 
 from mindbridge.core import DomainInvariantError, MediaKind
 from mindbridge.media.clipping import (
@@ -16,6 +14,15 @@ from mindbridge.media.clipping import (
     cut_clips,
     scaled_size,
 )
+
+# Real decoding needs the cloud-models extra; without it this module skips rather than
+# failing collection, the same way the PostgreSQL tests skip without a database. Importing
+# mindbridge.media.clipping stays safe: it loads its decoders lazily.
+numpy = pytest.importorskip("numpy")
+soundfile = pytest.importorskip("soundfile")
+pytest.importorskip("av")
+pytest.importorskip("PIL")
+
 
 SAMPLE_RATE = 16_000
 

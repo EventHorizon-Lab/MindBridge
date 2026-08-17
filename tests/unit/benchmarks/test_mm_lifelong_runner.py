@@ -6,10 +6,10 @@ from typing import cast
 import pytest
 
 from mindbridge import MindBridge
-from mindbridge.benchmarks import (
+from mindbridge.benchmarks.mm_lifelong import MMLifelongQuestion
+from mindbridge.benchmarks.mm_lifelong_runner import (
     MMLifelongPreparedSegment,
     MMLifelongPreparedTimeline,
-    MMLifelongQuestion,
     run_mm_lifelong,
     unofficial_reference_at_n,
 )

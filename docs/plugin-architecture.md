@@ -44,6 +44,13 @@ Each capability has one operation. `ModelInput` carries an ordered combination o
 producing model and compatible search-space references; this keeps asymmetric query/document
 encoders aligned without creating multiple Embedder interfaces.
 
+`Embedder` additionally declares `space_reference`, the search space every vector it produces
+belongs to. Declaring it before the first call is what lets a process that composes more than one
+Embedder reject a mismatch during construction instead of writing vectors that silently never
+match at recall. A plugin that omits `space_reference` fails the capability check at load time: the
+protocol member raises rather than returning a `None` that a subclass would inherit and that would
+make the space guards compare equal and pass vacuously.
+
 ## Discovery
 
 Plugins use standard Python package entry points. MindBridge loads only the selected entry point at
@@ -130,5 +137,14 @@ raw-media runs reject a missing Worker set.
   capabilities; a new capability is justified only by genuinely different I/O semantics.
 - Do not silently fall back to another plugin or model. Benchmark identity and production behavior
   must remain observable.
+- A process that composes more than one Embedder must resolve them into one embedding space. The
+  Worker rejects a media/text space mismatch while constructing the processing use case.
+- Replacing an Embedder with one in a different space is a data migration, not a configuration
+  change. The server probes every configured tenant at startup and refuses to serve when a tenant
+  holds vectors that the selected space cannot reach. The probe is per embedded object type, because
+  the Worker owns evidence, event, and claim vectors while the server owns memory records: a
+  whole-tenant probe would let the server's own writes vouch for everything the Worker stranded.
+  Row-level security scopes the probe per tenant, so a process with no configured tenants — the
+  stdio MCP server — cannot perform it.
 - Public protocol changes are explicit breaking changes. MindBridge does not retain compatibility
   aliases around a replaced extension contract.

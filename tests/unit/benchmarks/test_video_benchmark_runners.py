@@ -6,19 +6,17 @@ from typing import cast
 import pytest
 
 from mindbridge import MindBridge
-from mindbridge.benchmarks import (
-    EgoTempoQuestion,
-    PreparedVideo,
-    PreparedVideoSegment,
+from mindbridge.benchmarks.egotempo import EgoTempoQuestion, run_egotempo_clip
+from mindbridge.benchmarks.runtime import PreparedVideo, PreparedVideoSegment
+from mindbridge.benchmarks.video_mme import (
+    VideoMMEOption,
     VideoMMEQuestion,
     VideoMMEQuestionResult,
     VideoMMEVideo,
     VideoMMEVideoResult,
     evaluate_video_mme,
-    run_egotempo_clip,
     run_video_mme_video,
 )
-from mindbridge.benchmarks.video_mme import VideoMMEOption
 from mindbridge.contracts import (
     MediaObjectInput,
     ObservationProcessingJobView,

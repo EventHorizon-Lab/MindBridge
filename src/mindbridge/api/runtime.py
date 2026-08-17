@@ -7,7 +7,7 @@ import os
 from collections.abc import AsyncIterator, Mapping
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass, field
-from typing import cast
+from typing import Protocol, cast
 
 from fastapi import FastAPI
 from mcp.server import MCPServer
@@ -24,6 +24,7 @@ from mindbridge.configuration import (
     require_environment_value,
     validate_plugin_name,
 )
+from mindbridge.core import EmbeddedObjectType, EmbeddingSpaceReference, TenantId
 from mindbridge.infrastructure.postgres import PostgresMemoryStore
 from mindbridge.infrastructure.s3 import S3MediaAccess
 from mindbridge.infrastructure.task_queue import (
@@ -160,11 +161,40 @@ class Settings:
         )
 
 
+class _EmbeddingSpaceProbe(Protocol):
+    async def unreachable_embedded_object_types(
+        self,
+        tenant_id: TenantId,
+        space_reference: EmbeddingSpaceReference,
+    ) -> tuple[EmbeddedObjectType, ...]: ...
+
+
+async def _require_reachable_embedding_space(
+    probe: _EmbeddingSpaceProbe,
+    tenant_ids: tuple[str, ...],
+    space_reference: EmbeddingSpaceReference,
+) -> None:
+    """Refuse to serve an Embedder that cannot reach what a configured tenant already stored."""
+    for tenant_id in tenant_ids:
+        stranded = await probe.unreachable_embedded_object_types(
+            TenantId(tenant_id),
+            space_reference,
+        )
+        if stranded:
+            names = ", ".join(object_type.value for object_type in stranded)
+            raise ValueError(
+                f"tenant {tenant_id!r} stores {names} vectors outside the selected space "
+                f"{space_reference}; recall would return nothing instead of failing"
+            )
+
+
 @dataclass(frozen=True, slots=True)
 class _Runtime:
     kernel: MemoryKernel
     store: PostgresMemoryStore
     models: tuple[object, ...]
+    embedding_space: EmbeddingSpaceReference
+    tenant_ids: tuple[str, ...]
 
     @asynccontextmanager
     async def open(self) -> AsyncIterator[None]:
@@ -173,6 +203,11 @@ class _Runtime:
                 resources.push_async_callback(close_model, model)
             await self.store.open()
             resources.push_async_callback(self.store.close)
+            await _require_reachable_embedding_space(
+                self.store,
+                self.tenant_ids,
+                self.embedding_space,
+            )
             yield
 
 
@@ -246,7 +281,12 @@ def _build_runtime(settings: Settings) -> _Runtime:
         tuple[object, ...],
         (generator, embedder, *((reranker,) if reranker is not None else ())),
     )
-    return _Runtime(kernel, store, models)
+    tenant_ids = (
+        TenantApiKeyAuthenticator.from_json(settings.tenant_api_keys_json).tenant_ids
+        if settings.tenant_api_keys_json is not None
+        else ()
+    )
+    return _Runtime(kernel, store, models, embedder.space_reference, tenant_ids)
 
 
 def _openai_generator_config(source: Mapping[str, str]) -> dict[str, object]:

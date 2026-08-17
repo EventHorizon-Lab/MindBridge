@@ -4,7 +4,16 @@ import argparse
 import json
 from collections.abc import Callable, Mapping
 from datetime import datetime
-from typing import NoReturn, cast
+from typing import Annotated, NoReturn, cast
+
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    ConfigDict,
+    StrictFloat,
+    StrictInt,
+    StringConstraints,
+)
 
 
 def require_environment_value(environ: Mapping[str, str], name: str) -> str:
@@ -69,45 +78,22 @@ def copy_plugin_configuration(
     return dict(config)
 
 
-def reject_unknown_plugin_keys(config: Mapping[str, object], allowed: set[str]) -> None:
-    """Fail a plugin factory on any key it would otherwise ignore."""
-    unknown = set(config) - allowed
-    if unknown:
-        raise ValueError(f"unknown plugin configuration: {', '.join(sorted(unknown))}")
+PluginText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+# StrictInt after StrictFloat so a JSON integer is accepted where a number belongs while a
+# quoted number or a bool is not. AfterValidator normalizes the accepted member to float.
+PluginNumber = Annotated[StrictFloat | StrictInt, AfterValidator(float)]
+PluginInteger = StrictInt
 
 
-def plugin_string(config: Mapping[str, object], key: str, default: str | None = None) -> str:
-    """Read one required non-blank text value from a plugin configuration."""
-    value = config.get(key, default)
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError(f"{key} must be non-empty text")
-    return value
+class PluginConfigModel(BaseModel):
+    """Strict immutable schema for one plugin's JSON configuration object.
 
+    `extra="forbid"` is what fails a factory on any key it would otherwise ignore.
+    `protected_namespaces` is cleared because `model_id` and `model_revision` are
+    MindBridge's model-identity fields, not pydantic's reserved namespace.
+    """
 
-def optional_plugin_string(config: Mapping[str, object], key: str) -> str | None:
-    """Read one optional text value, rejecting a blank as a configuration mistake."""
-    value = config.get(key)
-    if value is None:
-        return None
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError(f"{key} must be non-empty text when provided")
-    return value
-
-
-def plugin_integer(config: Mapping[str, object], key: str, default: int) -> int:
-    """Read one integer value without accepting a bool or a float that looks like one."""
-    value = config.get(key, default)
-    if type(value) is not int:
-        raise ValueError(f"{key} must be an integer")
-    return value
-
-
-def plugin_float(config: Mapping[str, object], key: str, default: float) -> float:
-    """Read one numeric value, accepting an integer literal from JSON."""
-    value = config.get(key, default)
-    if type(value) not in {int, float}:
-        raise ValueError(f"{key} must be a number")
-    return float(cast(int | float, value))
+    model_config = ConfigDict(extra="forbid", frozen=True, protected_namespaces=())
 
 
 def _reject_json_constant(value: str) -> NoReturn:

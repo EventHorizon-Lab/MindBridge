@@ -40,8 +40,10 @@ from mindbridge.core import (
     DEFAULT_EMBEDDING_DIMENSION,
     DeletionTombstone,
     DomainInvariantError,
+    EmbeddedObjectType,
     EmbeddingId,
     EmbeddingRecord,
+    EmbeddingSpaceReference,
     EvidenceId,
     EvidenceSpan,
     JobId,
@@ -67,6 +69,7 @@ from mindbridge.infrastructure._postgres_embeddings import (
     has_embedding,
     read_embedding_column_dimension,
     search_embeddings,
+    unreachable_embedded_object_types,
     write_embedding,
 )
 from mindbridge.infrastructure._postgres_evidence import (
@@ -515,6 +518,14 @@ class PostgresMemoryStore:
         return await search_embeddings(
             self._pool, search, expected_dimension=self._embedding_dimension
         )
+
+    async def unreachable_embedded_object_types(
+        self,
+        tenant_id: TenantId,
+        space_reference: EmbeddingSpaceReference,
+    ) -> tuple[EmbeddedObjectType, ...]:
+        """Report the object types whose stored vectors no query in this space can reach."""
+        return await unreachable_embedded_object_types(self._pool, tenant_id, space_reference)
 
     async def claim_observation_processing_job(
         self,
