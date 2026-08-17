@@ -1,5 +1,6 @@
 """Shared validation for framework-independent domain records."""
 
+import math
 from datetime import datetime, timezone
 
 from mindbridge.core.errors import DomainInvariantError
@@ -8,6 +9,12 @@ from mindbridge.core.errors import DomainInvariantError
 def utc_now() -> datetime:
     """The single aware-clock reading every default timestamp uses."""
     return datetime.now(timezone.utc)
+
+
+def require_similarity(value: float, field_name: str) -> None:
+    """Reject a cosine bound outside the only range a normalized comparison can produce."""
+    if not math.isfinite(value) or not -1.0 <= value <= 1.0:
+        raise DomainInvariantError(f"{field_name} must be between -1 and 1")
 
 
 def require_aware_datetime(value: datetime, field_name: str) -> None:

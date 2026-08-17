@@ -1,6 +1,11 @@
 """Stable domain vocabulary for MindBridge memory."""
 
-from mindbridge.core._validation import utc_now
+from mindbridge.core._validation import (
+    require_aware_datetime,
+    require_non_empty,
+    require_similarity,
+    utc_now,
+)
 from mindbridge.core.errors import (
     DatabaseUnavailableError,
     DomainInvariantError,
@@ -162,5 +167,8 @@ __all__ = [
     "derive_relation",
     "derive_stable_id",
     "evolve_memory_strength",
+    "require_aware_datetime",
+    "require_non_empty",
+    "require_similarity",
     "utc_now",
 ]

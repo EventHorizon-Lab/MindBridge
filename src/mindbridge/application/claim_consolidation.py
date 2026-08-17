@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -12,6 +11,9 @@ from mindbridge.core import (
     DomainInvariantError,
     EntityId,
     TenantId,
+    require_aware_datetime,
+    require_non_empty,
+    require_similarity,
 )
 
 
@@ -27,18 +29,15 @@ class ClaimCandidateRequest:
     minimum_similarity: float = 0.8
 
     def __post_init__(self) -> None:
-        if not self.tenant_id.strip():
-            raise DomainInvariantError("tenant_id must not be empty")
-        if self.evaluated_at.utcoffset() is None:
-            raise DomainInvariantError("evaluated_at must be timezone-aware")
-        if self.after_claim_id is not None and not self.after_claim_id.strip():
-            raise DomainInvariantError("after_claim_id must not be empty")
+        require_non_empty(self.tenant_id, "tenant_id")
+        require_aware_datetime(self.evaluated_at, "evaluated_at")
+        if self.after_claim_id is not None:
+            require_non_empty(self.after_claim_id, "after_claim_id")
         if not 1 <= self.limit <= 32:
             raise DomainInvariantError("Claim candidate page limit must be between 1 and 32")
         if not 0 <= self.maximum_gap_seconds <= 31_536_000:
             raise DomainInvariantError("maximum_gap_seconds must be between 0 and 31536000")
-        if not math.isfinite(self.minimum_similarity) or not -1.0 <= self.minimum_similarity <= 1.0:
-            raise DomainInvariantError("minimum_similarity must be between -1 and 1")
+        require_similarity(self.minimum_similarity, "minimum_similarity")
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,8 +64,8 @@ class ClaimCandidatePage:
         claims = tuple(candidate.claim for candidate in self.candidates)
         if self.scanned_count < 0:
             raise DomainInvariantError("Claim candidate scanned_count must be non-negative")
-        if self.next_cursor is not None and not self.next_cursor.strip():
-            raise DomainInvariantError("Claim candidate cursor must not be empty")
+        if self.next_cursor is not None:
+            require_non_empty(self.next_cursor, "Claim candidate cursor")
         if len({claim.claim_id for claim in claims}) != len(claims):
             raise DomainInvariantError("Claim candidate IDs must be unique")
         if len({claim.tenant_id for claim in claims}) > 1:

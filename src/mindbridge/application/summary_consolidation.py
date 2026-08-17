@@ -33,6 +33,9 @@ from mindbridge.core import (
     VerificationStatus,
     derive_relation,
     derive_stable_id,
+    require_aware_datetime,
+    require_non_empty,
+    require_similarity,
 )
 
 
@@ -54,10 +57,8 @@ class SummaryCandidateCursor:
     memory_id: MemoryId
 
     def __post_init__(self) -> None:
-        if self.occurred_at.utcoffset() is None:
-            raise DomainInvariantError("Summary candidate cursor time must be timezone-aware")
-        if not self.memory_id.strip():
-            raise DomainInvariantError("Summary candidate cursor Memory ID must not be empty")
+        require_aware_datetime(self.occurred_at, "Summary candidate cursor time")
+        require_non_empty(self.memory_id, "Summary candidate cursor Memory ID")
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,16 +73,13 @@ class SummaryCandidateRequest:
     minimum_similarity: float = 0.8
 
     def __post_init__(self) -> None:
-        if not self.tenant_id.strip():
-            raise DomainInvariantError("tenant_id must not be empty")
-        if self.evaluated_at.utcoffset() is None:
-            raise DomainInvariantError("evaluated_at must be timezone-aware")
+        require_non_empty(self.tenant_id, "tenant_id")
+        require_aware_datetime(self.evaluated_at, "evaluated_at")
         if not 1 <= self.limit <= 32:
             raise DomainInvariantError("Summary candidate page limit must be between 1 and 32")
         if not 0 <= self.maximum_gap_seconds <= 31_536_000:
             raise DomainInvariantError("maximum_gap_seconds must be between 0 and 31536000")
-        if not math.isfinite(self.minimum_similarity) or not -1.0 <= self.minimum_similarity <= 1.0:
-            raise DomainInvariantError("minimum_similarity must be between -1 and 1")
+        require_similarity(self.minimum_similarity, "minimum_similarity")
 
 
 @dataclass(frozen=True, slots=True)

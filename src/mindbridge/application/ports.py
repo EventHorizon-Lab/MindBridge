@@ -36,6 +36,9 @@ from mindbridge.core import (
     ObservationJobClaim,
     ObservationProcessingJob,
     TenantId,
+    require_aware_datetime,
+    require_non_empty,
+    require_similarity,
 )
 
 
@@ -99,10 +102,8 @@ class ResolvedQueryMedia:
     media_url_expires_at: datetime
 
     def __post_init__(self) -> None:
-        if not self.media_url.strip():
-            raise DomainInvariantError("query media URL must not be empty")
-        if self.media_url_expires_at.utcoffset() is None:
-            raise DomainInvariantError("query media URL expiry must be timezone-aware")
+        require_non_empty(self.media_url, "query media URL")
+        require_aware_datetime(self.media_url_expires_at, "query media URL expiry")
 
 
 @dataclass(frozen=True, slots=True)
@@ -155,8 +156,7 @@ class EmbeddingSearch:
             raise DomainInvariantError("object_types must be non-empty and unique")
         if not 1 <= self.limit <= 1_000:
             raise DomainInvariantError("embedding search limit must be between 1 and 1000")
-        if not math.isfinite(self.minimum_similarity) or not -1.0 <= self.minimum_similarity <= 1.0:
-            raise DomainInvariantError("minimum_similarity must be between -1 and 1")
+        require_similarity(self.minimum_similarity, "minimum_similarity")
 
 
 @dataclass(frozen=True, slots=True)

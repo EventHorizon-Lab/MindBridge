@@ -14,6 +14,8 @@ from mindbridge.core import (
     EvidenceSpan,
     MediaObject,
     ModelReference,
+    require_aware_datetime,
+    require_non_empty,
 )
 
 MAX_PERCEPTION_EVENTS = 64
@@ -49,10 +51,8 @@ class ResolvedEvidence:
             raise DomainInvariantError("evidence and media tenants must match")
         if self.evidence_span.media_object_id != self.media_object.media_object_id:
             raise DomainInvariantError("evidence must resolve to its referenced media object")
-        if not self.media_url.strip():
-            raise DomainInvariantError("media_url must not be empty")
-        if self.media_url_expires_at.utcoffset() is None:
-            raise DomainInvariantError("media_url_expires_at must be timezone-aware")
+        require_non_empty(self.media_url, "media_url")
+        require_aware_datetime(self.media_url_expires_at, "media_url_expires_at")
 
 
 @dataclass(frozen=True, slots=True)
