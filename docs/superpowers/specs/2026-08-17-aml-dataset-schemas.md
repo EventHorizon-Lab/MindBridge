@@ -15,11 +15,13 @@ Pipelines were read directly from
 ## 1. LoCoMo (`benchmarks/aml/pipelines/locomo-refined/pipeline.py`)
 
 ### Files
+
 - `.benchmarks/locomo/data/locomo10.json` — a JSON list of 10 samples.
   Present and fully usable (10 samples, ~199 QA pairs each in the example
   checked).
 
 ### Sample shape
+
 ```python
 sample = {
   "sample_id": "conv-26",
@@ -41,6 +43,7 @@ sample = {
 ```
 
 ### Messages
+
 Flatten by walking `session_N` keys in numeric order (sessions are not
 necessarily contiguous — discover them by regex `session_(\d+)$`, sorted by
 N, and pull the matching `session_N_date_time`):
@@ -71,6 +74,7 @@ for n in session_nums:
             }
         )
 ```
+
 - Real timestamps exist but only at **session granularity** (free-text like
   `"1:56 pm on 8 May, 2023"` in the format `%I:%M %p on %d %B, %Y`, not
   ISO-8601) — every turn in a session shares the same timestamp string. The
@@ -85,20 +89,23 @@ for n in session_nums:
   addresses both speakers by name.
 
 ### Retrieval scope
+
 One **sample** (`sample_id`, e.g. `"conv-26"`) = one scope = one `user_id`.
 All ~199 QA pairs for that sample share the same conversation haystack.
 
 ### Questions
+
 `sample["qa"]` is a list of `{question, answer, evidence, category}`.
 **No id field** — must be synthesized, e.g. `f"{sample_id}:qa{index:04d}"`.
 `category` is an int (1-5); not read by the pipeline.
 
 ### Payload keys the pipeline reads
+
 `answer()` (via `render_answer_prompt`) and `evaluate()` (via
 `render_accuracy_prompt` / `gold_answer`) read, per record:
 
 | Key | Required | Notes |
-|---|---|---|
+| --- | --- | --- |
 | `id` | required | `rows()`/`answer()`/`evaluate()` all key off this; must be present and match between input file and generated-answers file |
 | `question` | required | raw string, inserted verbatim |
 | `speaker_1_name` | optional | default `"speaker 1"` |
@@ -112,6 +119,7 @@ All ~199 QA pairs for that sample share the same conversation haystack.
 so `speaker_1_memories` can be a list of memory strings, not just one blob.
 
 ### Gotchas
+
 - Dataset's gold key is **`answer`**, but the pipeline looks for
   `gold_answer`/`golden_answer`/`reference_answer`/`correct_answer` — the
   loader must rename `qa["answer"]` into one of those four keys (recommend
@@ -121,7 +129,7 @@ so `speaker_1_memories` can be a list of memory strings, not just one blob.
   `adversarial_answer` instead. Exact counts over the real 10-sample corpus:
 
   | category | has `answer` | has `adversarial_answer` | count |
-  |---|---|---|---|
+  | --- | --- | --- | --- |
   | 1 | yes | no | 282 |
   | 2 | yes | no | 321 |
   | 3 | yes | no | 96 |
@@ -148,8 +156,10 @@ so `speaker_1_memories` can be a list of memory strings, not just one blob.
 ## 2. LongMemEval (`benchmarks/aml/pipelines/longmemeval-s/pipeline.py`)
 
 ### Files present
+
 `.benchmarks/longmemeval/` contains three **fully materialized JSON files**
 (not git-lfs pointers — verified with `file`, they are plain ASCII JSON):
+
 - `longmemeval_s` (278 MB, 500 questions, ~40-60 haystack sessions/question) — **this is the "S" split the vendored pipeline directory is named for; use this one.**
 - `longmemeval_m` (2.7 GB, larger haystacks)
 - `longmemeval_oracle` (15 MB, 500 questions, only 2-3 gold sessions per question — a reduced/oracle-retrieval variant, not the full haystack)
@@ -158,6 +168,7 @@ All three share the same JSON schema. Present and usable as-is; no
 extraction/download step needed.
 
 ### Sample shape (one element of the top-level JSON list)
+
 ```python
 {
     "question_id": "e47becba",
@@ -183,12 +194,14 @@ extraction/download step needed.
     "answer_session_ids": ["answer_280352e9"],  # which haystack_session_ids are gold-relevant
 }
 ```
+
 Question-type distribution across `longmemeval_s` (500 total):
 `multi-session` 133, `temporal-reasoning` 133, `knowledge-update` 78,
 `single-session-user` 70, `single-session-assistant` 56,
 `single-session-preference` 30.
 
 ### Messages
+
 ```python
 from datetime import datetime, timezone
 
@@ -210,6 +223,7 @@ for session, session_id, date in zip(
             }
         )
 ```
+
 - Real timestamps exist, at session granularity, format
   `"YYYY/MM/DD (Dow) HH:MM"`. Every turn within a session shares that
   session's date. The loader parses this format into epoch milliseconds
@@ -222,6 +236,7 @@ for session, session_id, date in zip(
   its own independent haystack.
 
 ### Retrieval scope
+
 One **question** (`question_id`) = one scope = one `user_id`. Unlike
 LoCoMo/CL-bench, the "conversation" here is actually a bag of distinct
 distractor + gold sessions (a synthetic long-term-memory haystack), not one
@@ -229,10 +244,12 @@ continuous dialogue — ingest all of a question's `haystack_sessions` as that
 question's memory corpus.
 
 ### Questions
+
 Same JSON records carry both the haystack and the question (`question`,
 `answer`, `question_id`) — there's no separate question file.
 
 ### Payload keys the pipeline reads
+
 Identical contract to LoCoMo-refined (this pipeline file is a byte-for-byte
 copy per its own header comment "uses exactly the same answer and
 evaluation contracts"). Same table as LoCoMo section 1 above: `id`
@@ -242,6 +259,7 @@ evaluation contracts"). Same table as LoCoMo section 1 above: `id`
 `reference_answer`/`correct_answer` (required for evaluate).
 
 ### Gotchas
+
 - Dataset's id key is **`question_id`**, pipeline wants **`id`** — rename.
 - Dataset's gold key is **`answer`**, pipeline wants `gold_answer` (or one
   of its 3 aliases) — rename.
@@ -270,6 +288,7 @@ not merge them.
 ### 3a. PersonaMem v1 (`.benchmarks/personamem-v1/`)
 
 #### Files
+
 - `questions_32k.csv`, `questions_128k.csv`, `questions_1M.csv` — one CSV
   per context-length variant, 589 rows each (20 personas) for the 32k file
   (verified).
@@ -279,7 +298,8 @@ not merge them.
   example checked).
 
 Columns of `questions_*.csv`:
-```
+
+```text
 persona_id, question_id, question_type, topic, context_length_in_tokens,
 context_length_in_letters, distance_to_ref_in_blocks, distance_to_ref_in_tokens,
 num_irrelevant_tokens, distance_to_ref_proportion_in_context,
@@ -288,6 +308,7 @@ shared_context_id, end_index_in_shared_context
 ```
 
 #### Messages
+
 ```python
 import json
 
@@ -299,6 +320,7 @@ with open("shared_contexts_32k.jsonl") as f:
 row = ...  # one CSV row
 context_messages = shared[row["shared_context_id"]][: int(row["end_index_in_shared_context"])]
 ```
+
 - Messages have only `role`/`content` — **no timestamps at all**; omit the
   `timestamp` field (or set `None`) when building the flattened list.
 - Content strings are already prefixed with literal `"User: "` /
@@ -310,12 +332,14 @@ context_messages = shared[row["shared_context_id"]][: int(row["end_index_in_shar
   for the pipeline, per its own docstring.
 
 #### Retrieval scope
+
 One **`shared_context_id`** is a full simulated chat history for one
 persona; multiple questions reuse slices of the same `shared_context_id`.
 Practically, one `persona_id` (equivalently, one `shared_context_id`, they
 are 1:1 per context-length file) = one scope = one `user_id`.
 
 #### Questions
+
 `questions_*.csv`, keyed by `question_id`. `correct_answer` is a gold-option
 marker like `"(c)"`. `all_options` is a **plain string** already formatted
 as the four lettered options block (verified: it is literally a string
@@ -323,10 +347,11 @@ column, not JSON — matches the pipeline's docstring requirement exactly, do
 NOT `json.loads`/reconstruct it into a list).
 
 #### Payload keys the pipeline reads
+
 From the pipeline's own docstring and code:
 
 | Key | Required | Notes |
-|---|---|---|
+| --- | --- | --- |
 | `id` | required (`row_id`) | falls back to `question_id`, then `qid`, then row index |
 | `context_messages` | required | must be a `list`; falls back to `context` key; raises `TypeError` otherwise |
 | `question` | required | plain string |
@@ -334,6 +359,7 @@ From the pipeline's own docstring and code:
 | `correct_answer` | required for evaluate | gold option marker, e.g. `"(a)"` or `"a"`; stripped of `()` and whitespace, lowercased |
 
 #### Gotchas
+
 - Use `question_id` (dataset's native id) directly as `id` — `row_id()`
   already checks `id`/`question_id`/`qid` in that order, so **no rename
   needed**, just make sure the CSV's `question_id` value ends up on the
@@ -347,6 +373,7 @@ From the pipeline's own docstring and code:
 ### 3b. PersonaMem v2 (`.benchmarks/personamem-v2/`)
 
 #### Files
+
 - `benchmark/text/benchmark.csv` (5000 rows, 200 personas) — plus
   `train.csv`/`val.csv` splits of the same schema.
 - `benchmark/multimodal/*.csv` — a separate multimodal variant, out of scope
@@ -362,7 +389,8 @@ From the pipeline's own docstring and code:
   cross-checked below.
 
 Columns of `benchmark.csv` (28 total; relevant ones):
-```
+
+```text
 persona_id, chat_history_32k_link, chat_history_128k_link, raw_persona_file,
 short_persona, expanded_persona, user_query, correct_answer,
 incorrect_answers, topic_query, preference, topic_preference,
@@ -371,6 +399,7 @@ updated, prev_pref, sensitive_info, total_tokens_in_chat_history_32k, ...
 ```
 
 Chat history file shape:
+
 ```python
 {
     "metadata": {
@@ -389,6 +418,7 @@ Chat history file shape:
 ```
 
 #### Messages
+
 ```python
 import json, os
 
@@ -396,6 +426,7 @@ chat_path = os.path.join(".benchmarks/personamem-v2", row["chat_history_32k_link
 history = json.load(open(chat_path))["chat_history"]
 messages = [{"role": m["role"], "content": m["content"], "timestamp": None} for m in history]
 ```
+
 - No per-message timestamps — omit.
 - `user_query` CSV field is a **Python-repr string** (single-quoted dict,
   e.g. `"{'role': 'user', 'content': '...'}"`), not JSON — matches the
@@ -406,21 +437,24 @@ messages = [{"role": m["role"], "content": m["content"], "timestamp": None} for 
   `json.loads(incorrect_answers)` path.
 
 #### Retrieval scope
+
 One **`persona_id`** (equivalently one chat-history file) = one scope = one
 `user_id`. 200 personas x up to 25 questions each = 5000 rows.
 
 #### Questions
+
 `benchmark.csv` rows. No `id`/`question_id`/`qid`/`sample_id` column exists
 at all — `row_id()` will fall through to the enumerate index unless the
 loader adds an explicit id (recommended: `f"persona{persona_id}-{row_index}"`
 or similar, since the raw CSV provides nothing else unique per row).
 
 #### Payload keys the pipeline reads
+
 Two answer modes (`--mode mcq` / `--mode generative`) and two eval commands
 (`evaluate-mcq` / `evaluate-narrow`):
 
 | Key | Required | Notes |
-|---|---|---|
+| --- | --- | --- |
 | `id` | required (`row_id`) | checks `id`/`question_id`/`qid`/`sample_id`, else row index — **dataset provides none of these**, loader must synthesize |
 | `chat_history` | required | falls back to `messages`, then `context_messages`; must be a list, else `TypeError` |
 | `user_query` | required | falls back to `question`, then `query`; if the string looks like a dict literal (`starts with "{"`), it is `ast.literal_eval`'d and `.content`/`.text` extracted |
@@ -430,6 +464,7 @@ Two answer modes (`--mode mcq` / `--mode generative`) and two eval commands
 | `preference` / `target_preference` | required for `evaluate-narrow` (generative judge) | chooses the narrow-positive vs narrow-negative judge prompt based on whether it starts with `"do not"` |
 
 #### Gotchas
+
 - No id column in the CSV at all — must synthesize one and keep it
   consistent between the `answer` and `evaluate-*` steps (same id-assignment
   order/logic both times, e.g. row index in file-read order).
@@ -449,9 +484,11 @@ Two answer modes (`--mode mcq` / `--mode generative`) and two eval commands
 ## 4. BEAM (`benchmarks/aml/pipelines/beam/pipeline.py`)
 
 ### Files
+
 `.benchmarks/beam/` is the full upstream research repo (git checkout, not
 just a data dump). The actual per-conversation data lives under:
-```
+
+```text
 .benchmarks/beam/chats/{100K,500K,1M,10M}/{conv_id}/
     chat.json                        # the conversation transcript, batched
     user_messages.json                # user-only turns, batched (redundant view)
@@ -461,10 +498,12 @@ just a data dump). The actual per-conversation data lives under:
     (binary generation-time cache files, not needed)
 .benchmarks/beam/chats/{size}/topics.json      # index of all conv_id -> topic metadata for that size
 ```
+
 Conversation counts per size (verified): 100K=20, 500K=35, 1M=35, 10M=10
 conversation directories.
 
 ### `chat.json` shape
+
 ```python
 [
     {
@@ -490,6 +529,7 @@ conversation directories.
 ```
 
 ### Messages
+
 ```python
 from datetime import datetime, timezone
 
@@ -509,6 +549,7 @@ for batch in chat_json:
                 message["timestamp"] = int(parsed.timestamp() * 1_000)
             messages.append(message)
 ```
+
 - Timestamps are **free-text month-day-year anchors** (`"March-15-2024"`,
   format `%B-%d-%Y`), present inconsistently — typically only on the `user`
   turn that opens a batch, not on every turn. The loader parses this format
@@ -520,6 +561,7 @@ for batch in chat_json:
   too, but worth stripping if it pollutes retrieval embeddings.
 
 ### `probing_questions.json` shape
+
 ```python
 {
     "abstention": [
@@ -545,27 +587,31 @@ for batch in chat_json:
     "temporal_reasoning": [...],
 }
 ```
+
 The top-level **dict key is the category** and is exactly what upstream's
 own `answer_generation.py` uses as `question_type`/category when iterating
 (`for key in data.keys(): questions = data[key]`) — confirmed by reading
 `src/answer_probing_questions/answer_generation.py`.
 
 ### Retrieval scope
+
 One **conversation directory** (`{size}/{conv_id}`) = one scope = one
 `user_id`. All of that conversation's `probing_questions.json` entries
 (across all 10 categories) query the same haystack.
 
 ### Questions
+
 `probing_questions/probing_questions.json`, grouped by category key. **No
 id field on individual questions** — must synthesize, e.g.
 `f"{size}-{conv_id}-{category}-{index:04d}"`.
 
 ### Payload keys the pipeline reads
+
 `answer()` renders `ANSWER_GENERATION_FOR_RAG` via `render_answer_prompt` /
 `context_text`; `evaluate()` renders the rubric judge via `rubric_items`:
 
 | Key | Required | Notes |
-|---|---|---|
+| --- | --- | --- |
 | `id` | required (`rows()` enforces unique, non-empty ids — raises `ValueError` otherwise) | must synthesize (see above) |
 | `question` | required | plain string |
 | `context` / `retrieved_context` / `memories` | one required | first found wins, else falls back to assembling `speaker_1_memories`/`speaker_2_memories` (see LoCoMo-style keys), else raises `ValueError` |
@@ -573,6 +619,7 @@ id field on individual questions** — must synthesize, e.g.
 | `question_type` / `category` | optional | used to decide whether to additionally compute `event_ordering` metrics (Kendall-tau + F1 against the rubric list) — set this to the `probing_questions.json` category key (e.g. `"event_ordering"`) |
 
 ### Gotchas
+
 - No `id` on raw questions — synthesize one, and it must be non-empty and
   globally unique across the whole answer/eval file pair (`rows()` raises if
   not).
@@ -599,9 +646,11 @@ id field on individual questions** — must synthesize, e.g.
 ## 5. CL-Bench (`benchmarks/aml/pipelines/clbench/pipeline.py`)
 
 ### Files
+
 - `.benchmarks/clbench/CL-bench.jsonl` — 1899 lines, present and usable.
 
 ### Record shape
+
 ```python
 {
     "messages": [
@@ -620,6 +669,7 @@ id field on individual questions** — must synthesize, e.g.
     },
 }
 ```
+
 **Critically: the raw dataset has no separate `question` field.** The
 actual question is the tail of the final `user` message's content (verified
 example: a 158,789-character user message ending in
@@ -629,6 +679,7 @@ also no `qa_type`, `options`, or `system_prompt` top-level field, and no
 pipeline-input concepts the loader/harness must construct.
 
 ### Messages / question split
+
 ```python
 msgs = record["messages"]
 system_prompt = next((m["content"] for m in msgs if m["role"] == "system"), "")
@@ -639,19 +690,22 @@ conversation_history = history[:-1]  # ingest these as the memory corpus
 ```
 
 ### Retrieval scope
+
 One **JSONL record** (keyed by `metadata.task_id`) = one scope = one
 `user_id`. Each record is an independent long-document-plus-question task;
 there is no cross-record shared conversation.
 
 ### Questions
+
 Same record supplies both the "conversation to remember" and the question
 (the final user turn). `metadata.task_id` is the natural question id.
 
 ### Payload keys the pipeline reads
+
 `build_answer_prompt()` / `collected_memories()` / `official_rubrics()`:
 
 | Key | Required | Notes |
-|---|---|---|
+| --- | --- | --- |
 | `idx` / `id` / `question_id` / `task_id` | required (`row_id`), else falls back to `metadata.task_id`/`metadata.id`, else row index | dataset's `metadata.task_id` matches directly via the fallback chain — **no rename needed if `metadata` is preserved on the built record** |
 | `system_prompt` | optional, default `""` | loader must extract from `messages` (see above) — raw record has no top-level `system_prompt` |
 | `question` | required (used inside `format_structured_question`) | loader must extract from the last user turn — raw record has no top-level `question` |
@@ -661,6 +715,7 @@ Same record supplies both the "conversation to remember" and the question
 | `rubrics` | required for evaluate | list of strings or dicts with `rubric_criteria`; falls back to `metadata.rubrics` if top-level `rubrics` is absent — dataset's top-level `rubrics` (list of plain strings) matches directly, **no rename needed** |
 
 ### Gotchas
+
 - **No `question` field exists in the raw dataset** — it must be sliced out
   of the last `user` message's content. Do not attempt to answer using the
   full 150K-character user message as "the question"; only its trailing
@@ -680,6 +735,7 @@ Same record supplies both the "conversation to remember" and the question
 ## 6. ScriptMem (`benchmarks/aml/pipelines/scriptmem/pipeline.py`)
 
 ### Files
+
 - `.benchmarks/scriptmem/data/public/questions.jsonl` — 457 questions, present and usable.
 - `.benchmarks/scriptmem/data/public/conversations.jsonl` — 4 lines, **one per source work**, but each line's `conversation` field is only a placeholder: `{"format_example": {"speakers": [...], "session_1_date_time": "Unknown", "session_1": [{"type": "dialogue"|"narration", "speaker": ..., "dia_id": ..., "text": "Synthetic example ... schema."}]}}`.
 - `.benchmarks/scriptmem/data/public/manifest.json` — corpus stats + file map.
@@ -687,6 +743,7 @@ Same record supplies both the "conversation to remember" and the question
 - `.benchmarks/scriptmem/data/raw/{angry,enemy,friends,man_earth}.json` — the `DATASET_FILES` the official `evaluate()`/`load_gold_records()` reads gold answers from. **Verified**: every sample's `conversation` field in all four raw files is **also** just `{"format_example": {...}}` — i.e. this download does **not** contain the real script transcripts (Friends / 12 Angry Men / The Man from Earth / An Enemy of the People).
 
 ### CRITICAL GOTCHA: no real conversation text is present
+
 `.benchmarks/scriptmem/README.md` states explicitly: *"Please note ScriptMem
 releases task-specific questions, options, reference answers, metadata, and
 evaluation code; the original source texts are not included in this
@@ -705,6 +762,7 @@ best a loader can do is run the pipeline in a "conversation absent" mode
 — which is not a meaningful memory-system test.
 
 ### `raw/{dataset}.json` shape (used for gold + qa_id construction)
+
 ```python
 [
     {
@@ -723,6 +781,7 @@ best a loader can do is run the pipeline in a "conversation absent" mode
 ```
 
 ### `public/questions.jsonl` shape (already denormalized, one line per QA)
+
 ```python
 {
     "qa_id": "angry:conv-0#q0000",
@@ -740,6 +799,7 @@ best a loader can do is run the pipeline in a "conversation absent" mode
 ```
 
 ### `load_gold_records(data_dir)` — exact id derivation (read directly from pipeline.py)
+
 ```python
 DATASET_FILES = ("angry.json", "enemy.json", "friends.json", "man_earth.json")
 
@@ -758,6 +818,7 @@ for filename in DATASET_FILES:
         for qa_index, qa in enumerate(sample.get("qa", [])):
             qa_id = f"{source}:{sample_id}#q{qa_index:04d}"  # e.g. "angry:conv-0#q0000"
 ```
+
 So `dataset` = the raw filename stem (one of the 4 `DATASET_FILES` stems,
 exactly), `sample_id` = the sample's own `sample_id` field (verified: always
 present, always `"conv-0"` for all 4 current files — one sample per source
@@ -770,9 +831,11 @@ recomputing it**, as long as it doesn't touch `qa_index` numbering (it must
 stay 0-based, source-file order, not re-sorted).
 
 ### Messages
+
 Not obtainable from this download for real content (see CRITICAL GOTCHA).
 If/when real transcripts are sourced separately, the intended flattening
 (per the `format_example` schema) would be:
+
 ```python
 conv = sample["conversation"]  # once real, keyed like session_N / session_N_date_time (LoCoMo-style)
 messages = []
@@ -784,27 +847,31 @@ for session_key in sorted(k for k in conv if re.fullmatch(r"session_\d+", k)):
         messages.append({"role": "user" or "assistant" (map by turn["speaker"]),
                           "content": turn["text"], "timestamp": date})
 ```
+
 Timestamps, if the real data followed the placeholder's schema, would be
 per-session free text (`"session_1_date_time"`), sometimes literally
 `"Unknown"`.
 
 ### Retrieval scope
+
 One **source work** (`dataset`/`source`, one of `angry`/`enemy`/`friends`/
 `man_earth`) = one `sample_id` (`"conv-0"` in every current file) = one
 scope = one `user_id`. All ~90-174 questions for that work share the one
 mega-conversation.
 
 ### Questions
+
 `public/questions.jsonl`, one line per QA, already carrying `qa_id` and
 `conversation_id` to key against a scope.
 
 ### Payload keys the pipeline reads
+
 `answer()` uses `render_answer_prompt` (a locally-authored prompt, *not*
 part of ScriptMem's official repo per the module docstring); `evaluate()`
 is the **official** exact-match scorer, driven by `evaluate_official()`:
 
 | Key | Required | Where |
-|---|---|---|
+| --- | --- | --- |
 | `id` (for `answer()`'s bookkeeping only — dedup/resume) | optional | falls back to `qa_id`/`question_id`/`qid`, else row index |
 | `speaker_1_name`/`speaker_1_memories`/`speaker_2_name`/`speaker_2_memories` | optional | used only by the local (non-official) `render_answer_prompt` for generating an answer |
 | `question` | required for `render_answer_prompt` | plain string |
@@ -820,6 +887,7 @@ regex `^\s*([A-F])\.` — i.e. **gold answers are option-lettered strings like
 `"B. ..."`**, and only the leading letter is used for scoring).
 
 ### Gotchas
+
 - **No real conversation/script text is present in this download** — the
   single biggest gotcha of all six benchmarks; see CRITICAL GOTCHA above.
   Confirm with the project owner whether transcripts will be sourced
@@ -851,7 +919,7 @@ regex `^\s*([A-F])\.` — i.e. **gold answers are option-lettered strings like
 ## Cross-benchmark summary
 
 | Benchmark | Raw data usable as-is | Real conv. text present | Timestamp granularity | id/gold key rename needed |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | LoCoMo | Yes | Yes | per-session, free text | Yes — both `id` (synthesize) and gold (`answer`→`gold_answer`) |
 | LongMemEval | Yes (use `_s`) | Yes | per-session, `YYYY/MM/DD (Dow) HH:MM` | Yes — both `id` (`question_id`→`id`) and gold (`answer`→`gold_answer`) |
 | PersonaMem v1 | Yes | Yes (shared contexts) | none | No (native `question_id` matches `row_id` fallback); keep `all_options` as string |

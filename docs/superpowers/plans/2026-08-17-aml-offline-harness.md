@@ -38,10 +38,12 @@ Spec: [docs/superpowers/specs/2026-08-17-aml-offline-harness-design.md](../specs
 ### Task 1: AML wire contracts and tenant derivation
 
 **Files:**
+
 - Create: `src/mindbridge/api/aml_contracts.py`
 - Test: `tests/unit/api/test_aml_contracts.py`
 
 **Interfaces:**
+
 - Consumes: `mindbridge.contracts.ContractModel`, `Identifier`, `NonEmptyString`, `UtcDatetime`
 - Produces: `AmlMessage`, `AmlAddRequest`, `AmlAddResponse`, `AmlSearchRequest`, `AmlMemoryItem`, `AmlSearchResponse`, `derive_tenant_id(prefix: str, user_id: str) -> str`
 
@@ -212,10 +214,12 @@ git commit -m "Add AML Add/Search wire contracts"
 ### Task 2: Fact extraction prompt
 
 **Files:**
+
 - Modify: `src/mindbridge/prompts.py` (add spec, extend `ALL_PROMPTS`)
 - Modify: `tests/contracts/test_prompt_catalog.py:7-25` (add fingerprint)
 
 **Interfaces:**
+
 - Consumes: `mindbridge.prompts.PromptSpec`
 - Produces: `AML_EXTRACT_FACTS_PROMPT` with `version="aml_extract_facts_v1"`
 
@@ -303,10 +307,12 @@ git commit -m "Add AML fact extraction prompt"
 ### Task 3: Fact extractor
 
 **Files:**
+
 - Create: `src/mindbridge/application/aml_extraction.py`
 - Test: `tests/unit/application/test_aml_extraction.py`
 
 **Interfaces:**
+
 - Consumes: `AmlMessage` (Task 1), `AML_EXTRACT_FACTS_PROMPT` (Task 2), `mindbridge.models.Generator`, `GenerateRequest`, `GenerateResult`, `ModelInput`, `TextPart`
 - Produces: `ExtractedMemory(summary: str, memory_type: MemoryType, occurred_at: datetime)`, `ExtractionOutcome(memories: tuple[ExtractedMemory, ...], skipped: int)`, `async extract_memories(generator: Generator, messages: Sequence[AmlMessageLike], *, now: datetime) -> ExtractionOutcome`
 
@@ -508,6 +514,7 @@ git commit -m "Extract atomic memories from AML chunks"
 ### Task 4: Add and Search routes
 
 **Files:**
+
 - Create: `src/mindbridge/api/aml.py`
 - Modify: `src/mindbridge/api/app.py:57-68` (accept an optional AML router configuration)
 - Modify: `src/mindbridge/api/runtime.py:112-155` (settings), `:174-190` (`create_app`)
@@ -515,6 +522,7 @@ git commit -m "Extract atomic memories from AML chunks"
 - Test: `tests/unit/api/test_aml_routes.py`
 
 **Interfaces:**
+
 - Consumes: everything from Tasks 1 and 3, `MemoryKernel.remember`, `MemoryKernel.recall`
 - Produces: `AmlSettings(api_key: str, tenant_prefix: str)`, `register_aml_routes(app, kernel, generator, *, settings) -> None`
 
@@ -910,10 +918,12 @@ git commit -m "Serve the AML Add and Search contract"
 ### Task 5: Case model and chunker
 
 **Files:**
+
 - Create: `src/mindbridge/benchmarks/aml/__init__.py`, `src/mindbridge/benchmarks/aml/cases.py`
 - Test: `tests/unit/benchmarks/aml/test_cases.py`
 
 **Interfaces:**
+
 - Produces:
   - `AmlQuestion(question_id: str, question: str, payload: dict[str, object])`
   - `AmlCase(user_id: str, messages: tuple[dict[str, object], ...], questions: tuple[AmlQuestion, ...])`
@@ -1064,10 +1074,12 @@ PersonaMem v1 is the worked example: grouping by `(shared_context_id, end_index_
 ### Task 6: LoCoMo loader
 
 **Files:**
+
 - Create: `src/mindbridge/benchmarks/aml/loaders/__init__.py`, `src/mindbridge/benchmarks/aml/loaders/locomo.py`
 - Test: `tests/unit/benchmarks/aml/loaders/test_locomo.py`
 
 **Interfaces:**
+
 - Consumes: `AmlCase`, `AmlQuestion` (Task 5)
 - Produces: `load(path: Path) -> tuple[AmlCase, ...]`
 
@@ -1084,10 +1096,12 @@ Schema reference: section 1. Source: `.benchmarks/locomo/data/locomo10.json`.
 ### Task 7: LongMemEval-S loader
 
 **Files:**
+
 - Create: `src/mindbridge/benchmarks/aml/loaders/longmemeval.py`
 - Test: `tests/unit/benchmarks/aml/loaders/test_longmemeval.py`
 
 **Interfaces:**
+
 - Consumes: `AmlCase`, `AmlQuestion` (Task 5)
 - Produces: `load(path: Path) -> tuple[AmlCase, ...]`
 
@@ -1103,10 +1117,12 @@ Schema reference: section 2. Source: `.benchmarks/longmemeval/longmemeval_s` (27
 ### Task 8: PersonaMem v1 loader
 
 **Files:**
+
 - Create: `src/mindbridge/benchmarks/aml/loaders/personamem_v1.py`
 - Test: `tests/unit/benchmarks/aml/loaders/test_personamem_v1.py`
 
 **Interfaces:**
+
 - Consumes: `AmlCase`, `AmlQuestion` (Task 5)
 - Produces: `load(questions_csv: Path, contexts_jsonl: Path) -> tuple[AmlCase, ...]`
 
@@ -1122,10 +1138,12 @@ Schema reference: section 3a. Sources: `.benchmarks/personamem-v1/questions_32k.
 ### Task 9: PersonaMem v2 loader
 
 **Files:**
+
 - Create: `src/mindbridge/benchmarks/aml/loaders/personamem_v2.py`
 - Test: `tests/unit/benchmarks/aml/loaders/test_personamem_v2.py`
 
 **Interfaces:**
+
 - Consumes: `AmlCase`, `AmlQuestion` (Task 5)
 - Produces: `load(benchmark_csv: Path, data_root: Path) -> tuple[AmlCase, ...]`
 
@@ -1144,10 +1162,12 @@ v2 is a **different dataset from v1, not another split**, and its pipeline reads
 ### Task 10: BEAM loader
 
 **Files:**
+
 - Create: `src/mindbridge/benchmarks/aml/loaders/beam.py`
 - Test: `tests/unit/benchmarks/aml/loaders/test_beam.py`
 
 **Interfaces:**
+
 - Consumes: `AmlCase`, `AmlQuestion` (Task 5)
 - Produces: `load(chat: Path, questions: Path) -> tuple[AmlCase, ...]`
 
@@ -1163,10 +1183,12 @@ Schema reference: section 4. Sources: the per-conversation `chat.json` and `prob
 ### Task 11: CL-Bench loader
 
 **Files:**
+
 - Create: `src/mindbridge/benchmarks/aml/loaders/clbench.py`
 - Test: `tests/unit/benchmarks/aml/loaders/test_clbench.py`
 
 **Interfaces:**
+
 - Consumes: `AmlCase`, `AmlQuestion` (Task 5)
 - Produces: `load(path: Path) -> tuple[AmlCase, ...]`
 
@@ -1186,10 +1208,12 @@ This loader does the most reshaping, because the raw record carries neither of t
 ### Task 12: Driver
 
 **Files:**
+
 - Create: `src/mindbridge/benchmarks/aml/driver.py`
 - Test: `tests/unit/benchmarks/aml/test_driver.py`
 
 **Interfaces:**
+
 - Consumes: `AmlCase`, `AmlQuestion`, `chunk_messages` (Task 5)
 - Produces: `async run_case(client: httpx.AsyncClient, case: AmlCase, *, run_id: str, benchmark: str, top_k: int, emit: EmitFn) -> list[dict[str, object]]` where `EmitFn = Callable[[AmlQuestion, list[dict[str, object]]], dict[str, object]]`
 
@@ -1455,6 +1479,7 @@ git commit -m "Replay AML cases through the Add/Search contract"
 ### Task 13: Vendored pipelines and run CLI
 
 **Files:**
+
 - Create: `benchmarks/aml/pipelines/` (vendored, unmodified), `benchmarks/aml/PINNED.md`
 - Create: `src/mindbridge/benchmarks/aml/cli.py`
 - Test: `tests/unit/benchmarks/aml/test_cli.py`
@@ -1489,6 +1514,7 @@ Confirm the working tree has no local edits to those files:
 ```bash
 diff -r /tmp/aml-pin/data benchmarks/aml/pipelines && echo "unmodified"
 ```
+
 Expected: `unmodified`
 
 - [ ] **Step 3: Write the failing CLI test**
@@ -1552,6 +1578,7 @@ git commit -m "Vendor the pinned AML pipelines and add the run CLI"
 ### Task 14: First end-to-end run
 
 **Files:**
+
 - Create: `benchmarks/manifests/aml-locomo-smoke.json`
 - Modify: `README.md` (AML section)
 
@@ -1563,6 +1590,7 @@ curl -s "$MINDBRIDGE_GENERATOR_ENDPOINT/chat/completions" \
   -H 'Content-Type: application/json' \
   -d '{"model":"qwen3.8-max","messages":[{"role":"user","content":"Reply with the single word: ok"}],"temperature":0}'
 ```
+
 Expected: `choices[0].message.content` is exactly `ok`, with no reasoning text and no empty content. If it is not, fix the endpoint default before running anything — every downstream score depends on it.
 
 - [ ] **Step 2: Run LoCoMo end to end**
