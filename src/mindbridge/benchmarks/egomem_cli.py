@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -20,7 +19,9 @@ from mindbridge.benchmarks.cli_common import (
     MediaArguments,
     MediaBenchmarkRunManifest,
     add_media_arguments,
+    connected_memory,
     core_parser,
+    index_prepared,
     media_arguments,
     media_manifest,
     write_run_artifacts,
@@ -40,7 +41,6 @@ from mindbridge.benchmarks.prompts import EGOMEM_REASON_QUERY_PROMPT
 from mindbridge.contracts import Identifier, NonEmptyString, Sha256Hex
 from mindbridge.file_integrity import sha256_file
 from mindbridge.prompts import PERCEIVE_EVENTS_PROMPT
-from mindbridge.sdk import MindBridge
 
 EGOMEM_RUNNER_VERSION = "egomem_production_api_v3"
 
@@ -92,12 +92,7 @@ async def _run(
     questions: tuple[EgoMemReasonQuestion, ...],
     prepared: dict[str, EgoLifePreparedStream],
 ) -> tuple[EgoMemReasonResult, ...]:
-    memory = MindBridge.connect(
-        base_url=arguments.api_base_url,
-        api_key=os.environ.get("MINDBRIDGE_API_KEY"),
-        timeout_seconds=arguments.request_timeout_seconds,
-    )
-    try:
+    async with connected_memory(arguments) as memory:
         by_example_id: dict[int, EgoMemReasonResult] = {}
         for identity in dict.fromkeys(question.identity for question in questions):
             identity_questions = tuple(
@@ -117,8 +112,6 @@ async def _run(
             )
             by_example_id.update((result.example_id, result) for result in results)
         return tuple(by_example_id[question.example_id] for question in questions)
-    finally:
-        await memory.close()
 
 
 def _write_artifacts(
@@ -197,14 +190,14 @@ def _prepared_by_identity(
     questions: tuple[EgoMemReasonQuestion, ...],
     streams: tuple[EgoLifePreparedStream, ...],
 ) -> dict[str, EgoLifePreparedStream]:
-    by_identity = {stream.subject_id: stream for stream in streams}
-    missing = {question.identity for question in questions} - by_identity.keys()
-    if missing:
-        raise ValueError(f"missing prepared EgoMemReason identities: {', '.join(sorted(missing))}")
-    return {
-        identity: by_identity[identity]
-        for identity in dict.fromkeys(question.identity for question in questions)
-    }
+    identities = tuple(dict.fromkeys(question.identity for question in questions))
+    by_identity = index_prepared(
+        identities,
+        streams,
+        key=lambda stream: stream.subject_id,
+        label="EgoMemReason identities",
+    )
+    return {identity: by_identity[identity] for identity in identities}
 
 
 def _parse_arguments() -> _Arguments:

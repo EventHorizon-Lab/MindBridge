@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -20,7 +19,9 @@ from mindbridge.benchmarks.cli_common import (
     MediaArguments,
     MediaBenchmarkRunManifest,
     add_media_arguments,
+    connected_memory,
     core_parser,
+    index_prepared,
     media_arguments,
     media_manifest,
     write_run_artifacts,
@@ -37,7 +38,6 @@ from mindbridge.benchmarks.runtime import PreparedVideo, load_prepared_videos
 from mindbridge.contracts import Identifier, NonEmptyString, Sha256Hex
 from mindbridge.file_integrity import sha256_file
 from mindbridge.prompts import PERCEIVE_EVENTS_PROMPT
-from mindbridge.sdk import MindBridge
 
 EGOTEMPO_RUNNER_VERSION = "egotempo_production_api_v2"
 
@@ -92,12 +92,7 @@ async def _run(
     for question in questions:
         questions_by_clip.setdefault(question.clip_id, []).append(question)
     prepared_by_id = {video.video_id: video for video in prepared}
-    memory = MindBridge.connect(
-        base_url=arguments.api_base_url,
-        api_key=os.environ.get("MINDBRIDGE_API_KEY"),
-        timeout_seconds=arguments.request_timeout_seconds,
-    )
-    try:
+    async with connected_memory(arguments) as memory:
         unordered: list[EgoTempoQuestionResult] = []
         for clip_id, clip_questions in questions_by_clip.items():
             unordered.extend(
@@ -116,8 +111,6 @@ async def _run(
             )
         by_id = {result.question_id: result for result in unordered}
         return tuple(by_id[question.question_id] for question in questions)
-    finally:
-        await memory.close()
 
 
 def _write_artifacts(
@@ -181,11 +174,13 @@ def _select_questions(
 def _select_prepared(
     prepared: tuple[PreparedVideo, ...], questions: tuple[EgoTempoQuestion, ...]
 ) -> tuple[PreparedVideo, ...]:
-    by_id = {video.video_id: video for video in prepared}
     clip_ids = tuple(dict.fromkeys(question.clip_id for question in questions))
-    missing = set(clip_ids) - set(by_id)
-    if missing:
-        raise ValueError(f"missing prepared EgoTempo clips: {', '.join(sorted(missing))}")
+    by_id = index_prepared(
+        clip_ids,
+        prepared,
+        key=lambda video: video.video_id,
+        label="EgoTempo clips",
+    )
     return tuple(by_id[clip_id] for clip_id in clip_ids)
 
 

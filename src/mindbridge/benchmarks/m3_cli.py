@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, cast
@@ -19,7 +18,9 @@ from mindbridge.benchmarks.cli_common import (
     MediaArguments,
     MediaBenchmarkRunManifest,
     add_media_arguments,
+    connected_memory,
     core_parser,
+    index_prepared,
     media_arguments,
     media_manifest,
     predictions_jsonl,
@@ -36,7 +37,6 @@ from mindbridge.benchmarks.m3_runner import (
 from mindbridge.contracts import Identifier, NonEmptyString, Sha256Hex
 from mindbridge.file_integrity import sha256_file
 from mindbridge.prompts import PERCEIVE_EVENTS_PROMPT
-from mindbridge.sdk import MindBridge
 
 M3_RUNNER_VERSION = "m3_production_api_v9"
 
@@ -93,12 +93,7 @@ async def _run_videos(
     videos: tuple[M3BenchVideo, ...],
     prepared: dict[str, M3PreparedVideo],
 ) -> tuple[M3OfficialQuestionResult, ...]:
-    memory = MindBridge.connect(
-        base_url=arguments.api_base_url,
-        api_key=os.environ.get("MINDBRIDGE_API_KEY"),
-        timeout_seconds=arguments.request_timeout_seconds,
-    )
-    try:
+    async with connected_memory(arguments) as memory:
         results: list[M3OfficialQuestionResult] = []
         for video in videos:
             results.extend(
@@ -116,8 +111,6 @@ async def _run_videos(
                 )
             )
         return tuple(results)
-    finally:
-        await memory.close()
 
 
 def _write_artifacts(
@@ -181,11 +174,12 @@ def _prepared_by_video(
     videos: tuple[M3BenchVideo, ...],
     prepared: tuple[M3PreparedVideo, ...],
 ) -> dict[str, M3PreparedVideo]:
-    by_id = {video.video_id: video for video in prepared}
-    missing = {video.video_id for video in videos} - by_id.keys()
-    if missing:
-        raise ValueError(f"missing prepared M3-Bench videos: {', '.join(sorted(missing))}")
-    return by_id
+    return index_prepared(
+        (video.video_id for video in videos),
+        prepared,
+        key=lambda video: video.video_id,
+        label="M3-Bench videos",
+    )
 
 
 def _validate_subset(videos: tuple[M3BenchVideo, ...], subset: Literal["robot", "web"]) -> None:
