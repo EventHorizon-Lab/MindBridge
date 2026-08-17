@@ -47,21 +47,21 @@ N, and pull the matching `session_N_date_time`):
 
 ```python
 import re
+
 conv = sample["conversation"]
-session_nums = sorted(
-    int(m.group(1)) for k in conv
-    if (m := re.fullmatch(r"session_(\d+)", k))
-)
+session_nums = sorted(int(m.group(1)) for k in conv if (m := re.fullmatch(r"session_(\d+)", k)))
 messages = []
 for n in session_nums:
     date_time = conv.get(f"session_{n}_date_time")  # e.g. "1:56 pm on 8 May, 2023"
     for turn in conv[f"session_{n}"]:
         role = "user" if turn["speaker"] == conv["speaker_a"] else "assistant"
-        messages.append({
-            "role": role,
-            "content": turn["text"],
-            "timestamp": date_time,   # SESSION-level, not per-turn
-        })
+        messages.append(
+            {
+                "role": role,
+                "content": turn["text"],
+                "timestamp": date_time,  # SESSION-level, not per-turn
+            }
+        )
 ```
 - Real timestamps exist but only at **session granularity** (free-text like
   `"1:56 pm on 8 May, 2023"`, not ISO-8601) — every turn in a session shares
@@ -133,19 +133,27 @@ extraction/download step needed.
 ### Sample shape (one element of the top-level JSON list)
 ```python
 {
-  "question_id": "e47becba",
-  "question_type": "single-session-user",  # or multi-session / temporal-reasoning / knowledge-update / single-session-assistant / single-session-preference
-  "question": "What degree did I graduate with?",
-  "answer": "Business Administration",
-  "question_date": "2023/05/30 (Tue) 23:40",
-  "haystack_dates": ["2023/05/20 (Sat) 02:21", "2023/05/20 (Sat) 02:57", ...],  # one date per haystack session, same order/index as haystack_session_ids
-  "haystack_session_ids": ["sharegpt_yywfIrx_0", "85a1be56_1", ...],
-  "haystack_sessions": [
-      [ {"role": "user", "content": "..."}, {"role": "assistant", "content": "..."} , ...],  # session 0's turns
-      [ ... ],  # session 1's turns
-      ...
-  ],
-  "answer_session_ids": ["answer_280352e9"],  # which haystack_session_ids are gold-relevant
+    "question_id": "e47becba",
+    "question_type": "single-session-user",  # or multi-session / temporal-reasoning / knowledge-update / single-session-assistant / single-session-preference
+    "question": "What degree did I graduate with?",
+    "answer": "Business Administration",
+    "question_date": "2023/05/30 (Tue) 23:40",
+    "haystack_dates": [
+        "2023/05/20 (Sat) 02:21",
+        "2023/05/20 (Sat) 02:57",
+        ...,
+    ],  # one date per haystack session, same order/index as haystack_session_ids
+    "haystack_session_ids": ["sharegpt_yywfIrx_0", "85a1be56_1", ...],
+    "haystack_sessions": [
+        [
+            {"role": "user", "content": "..."},
+            {"role": "assistant", "content": "..."},
+            ...,
+        ],  # session 0's turns
+        [...],  # session 1's turns
+        ...,
+    ],
+    "answer_session_ids": ["answer_280352e9"],  # which haystack_session_ids are gold-relevant
 }
 ```
 Question-type distribution across `longmemeval_s` (500 total):
@@ -160,11 +168,13 @@ for session, session_id, date in zip(
     q["haystack_sessions"], q["haystack_session_ids"], q["haystack_dates"]
 ):
     for turn in session:
-        messages.append({
-            "role": turn["role"],       # "user" or "assistant" already
-            "content": turn["content"],
-            "timestamp": date,          # SESSION-level again, format "2023/05/20 (Sat) 02:21"
-        })
+        messages.append(
+            {
+                "role": turn["role"],  # "user" or "assistant" already
+                "content": turn["content"],
+                "timestamp": date,  # SESSION-level again, format "2023/05/20 (Sat) 02:21"
+            }
+        )
 ```
 - Real timestamps exist, at session granularity, format
   `"YYYY/MM/DD (Dow) HH:MM"`. Every turn within a session shares that
@@ -243,6 +253,7 @@ shared_context_id, end_index_in_shared_context
 #### Messages
 ```python
 import json
+
 shared = {}  # shared_context_id -> list[{"role","content"}]
 with open("shared_contexts_32k.jsonl") as f:
     for line in f:
@@ -325,21 +336,28 @@ updated, prev_pref, sensitive_info, total_tokens_in_chat_history_32k, ...
 Chat history file shape:
 ```python
 {
-  "metadata": {"total_messages": 237, "final_token_count": 31983,
-               "persona_id": 0, "input_filename": "..."},
-  "chat_history": [ {"role": "system", "content": "..."},
-                     {"role": "user", "content": "..."},
-                     {"role": "assistant", "content": "..."}, ... ]
+    "metadata": {
+        "total_messages": 237,
+        "final_token_count": 31983,
+        "persona_id": 0,
+        "input_filename": "...",
+    },
+    "chat_history": [
+        {"role": "system", "content": "..."},
+        {"role": "user", "content": "..."},
+        {"role": "assistant", "content": "..."},
+        ...,
+    ],
 }
 ```
 
 #### Messages
 ```python
 import json, os
+
 chat_path = os.path.join(".benchmarks/personamem-v2", row["chat_history_32k_link"])
 history = json.load(open(chat_path))["chat_history"]
-messages = [{"role": m["role"], "content": m["content"], "timestamp": None}
-            for m in history]
+messages = [{"role": m["role"], "content": m["content"], "timestamp": None} for m in history]
 ```
 - No per-message timestamps — omit.
 - `user_query` CSV field is a **Python-repr string** (single-quoted dict,
@@ -412,14 +430,25 @@ conversation directories.
 ### `chat.json` shape
 ```python
 [
-  {"batch_number": 1, "turns": [
-      [ {"role": "user", "id": 0, "time_anchor": "March-15-2024", "index": "1,1",
-         "question_type": "main_question", "content": "..."},
-        {"role": "assistant", "id": 1, "content": "..."} ],
-      ...  # more turn-pairs in this batch
-  ]},
-  {"batch_number": 2, "turns": [...]},
-  ...
+    {
+        "batch_number": 1,
+        "turns": [
+            [
+                {
+                    "role": "user",
+                    "id": 0,
+                    "time_anchor": "March-15-2024",
+                    "index": "1,1",
+                    "question_type": "main_question",
+                    "content": "...",
+                },
+                {"role": "assistant", "id": 1, "content": "..."},
+            ],
+            ...,  # more turn-pairs in this batch
+        ],
+    },
+    {"batch_number": 2, "turns": [...]},
+    ...,
 ]
 ```
 
@@ -429,11 +458,15 @@ messages = []
 for batch in chat_json:
     for turn_pair in batch["turns"]:
         for turn in turn_pair:
-            messages.append({
-                "role": turn["role"],
-                "content": turn["content"],
-                "timestamp": turn.get("time_anchor"),  # only present on some (user) turns; free text like "March-15-2024"
-            })
+            messages.append(
+                {
+                    "role": turn["role"],
+                    "content": turn["content"],
+                    "timestamp": turn.get(
+                        "time_anchor"
+                    ),  # only present on some (user) turns; free text like "March-15-2024"
+                }
+            )
 ```
 - Timestamps are **free-text month-day-year anchors** (`"March-15-2024"`),
   present inconsistently — typically only on the `user` turn that opens a
@@ -448,19 +481,27 @@ for batch in chat_json:
 ### `probing_questions.json` shape
 ```python
 {
-  "abstention": [ {"question": "...", "ideal_response": "...", "difficulty": "medium",
-                    "abstention_type": "missing_detail", "why_unanswerable": "...",
-                    "plan_reference": "Batch 3, Bullet 2",
-                    "rubric": ["..."]}, ... ],
-  "contradiction_resolution": [...],
-  "event_ordering": [...],
-  "information_extraction": [...],
-  "instruction_following": [...],
-  "knowledge_update": [...],
-  "multi_session_reasoning": [...],
-  "preference_following": [...],
-  "summarization": [...],
-  "temporal_reasoning": [...],
+    "abstention": [
+        {
+            "question": "...",
+            "ideal_response": "...",
+            "difficulty": "medium",
+            "abstention_type": "missing_detail",
+            "why_unanswerable": "...",
+            "plan_reference": "Batch 3, Bullet 2",
+            "rubric": ["..."],
+        },
+        ...,
+    ],
+    "contradiction_resolution": [...],
+    "event_ordering": [...],
+    "information_extraction": [...],
+    "instruction_following": [...],
+    "knowledge_update": [...],
+    "multi_session_reasoning": [...],
+    "preference_following": [...],
+    "summarization": [...],
+    "temporal_reasoning": [...],
 }
 ```
 The top-level **dict key is the category** and is exactly what upstream's
@@ -522,17 +563,20 @@ id field on individual questions** — must synthesize, e.g.
 ### Record shape
 ```python
 {
-  "messages": [
-    {"role": "system", "content": "<persona/system prompt>"},
-    {"role": "user", "content": "<huge reference document, ending in the actual question>"},
-    # OR, for multi-turn records (verified: 2/4/6/8/10/12-message variants exist):
-    # [system, user(doc), assistant(intro turn), user(short question)]
-    # (message-count distribution sampled from first 500 lines: {2: 278, 4: 125, 6: 82, 8: 14, 10: 2, 12: 1})
-  ],
-  "rubrics": ["The response should ...", "The response should ...", ...],  # list of plain strings
-  "metadata": {"task_id": "...", "context_id": "...",
-               "context_category": "Rule System Application",
-               "sub_category": "Game Mechanics"}
+    "messages": [
+        {"role": "system", "content": "<persona/system prompt>"},
+        {"role": "user", "content": "<huge reference document, ending in the actual question>"},
+        # OR, for multi-turn records (verified: 2/4/6/8/10/12-message variants exist):
+        # [system, user(doc), assistant(intro turn), user(short question)]
+        # (message-count distribution sampled from first 500 lines: {2: 278, 4: 125, 6: 82, 8: 14, 10: 2, 12: 1})
+    ],
+    "rubrics": ["The response should ...", "The response should ...", ...],  # list of plain strings
+    "metadata": {
+        "task_id": "...",
+        "context_id": "...",
+        "context_category": "Rule System Application",
+        "sub_category": "Game Mechanics",
+    },
 }
 ```
 **Critically: the raw dataset has no separate `question` field.** The
@@ -548,8 +592,8 @@ pipeline-input concepts the loader/harness must construct.
 msgs = record["messages"]
 system_prompt = next((m["content"] for m in msgs if m["role"] == "system"), "")
 history = [m for m in msgs if m["role"] != "system"]  # everything except system
-question = history[-1]["content"]           # the final user turn IS the question
-conversation_history = history[:-1]          # ingest these as the memory corpus
+question = history[-1]["content"]  # the final user turn IS the question
+conversation_history = history[:-1]  # ingest these as the memory corpus
 # -> flatten conversation_history into {"role","content","timestamp": None} — no timestamps exist anywhere in this dataset
 ```
 
@@ -621,34 +665,57 @@ best a loader can do is run the pipeline in a "conversation absent" mode
 
 ### `raw/{dataset}.json` shape (used for gold + qa_id construction)
 ```python
-[ { "sample_id": "conv-0",  # or omitted -> f"{source}-{sample_index}"
-    "conversation": {"format_example": {...}},   # placeholder only, see above
-    "qa": [ {"qa_type": "single_choice"|"multi_select"|"ordering",
-              "question": "...", "answer": "A. ..." or ["A. ...", "C. ..."]} , ... ] } ]
+[
+    {
+        "sample_id": "conv-0",  # or omitted -> f"{source}-{sample_index}"
+        "conversation": {"format_example": {...}},  # placeholder only, see above
+        "qa": [
+            {
+                "qa_type": "single_choice" | "multi_select" | "ordering",
+                "question": "...",
+                "answer": "A. ..." or ["A. ...", "C. ..."],
+            },
+            ...,
+        ],
+    }
+]
 ```
 
 ### `public/questions.jsonl` shape (already denormalized, one line per QA)
 ```python
-{"qa_id": "angry:conv-0#q0000", "question_id": "angry:conv-0#q0000",
- "conversation_id": "angry:conv-0", "source": "angry", "sample_id": "conv-0",
- "qa_index": 0, "qa_type": "single_choice", "question": "...",
- "option": ["A. ...", "B. ...", ...], "answer": "B. ...", "answer_letters": ["B"]}
+{
+    "qa_id": "angry:conv-0#q0000",
+    "question_id": "angry:conv-0#q0000",
+    "conversation_id": "angry:conv-0",
+    "source": "angry",
+    "sample_id": "conv-0",
+    "qa_index": 0,
+    "qa_type": "single_choice",
+    "question": "...",
+    "option": ["A. ...", "B. ...", ...],
+    "answer": "B. ...",
+    "answer_letters": ["B"],
+}
 ```
 
 ### `load_gold_records(data_dir)` — exact id derivation (read directly from pipeline.py)
 ```python
 DATASET_FILES = ("angry.json", "enemy.json", "friends.json", "man_earth.json")
 
-def dataset_name(filename):        # "angry.json" -> "angry"
+
+def dataset_name(filename):  # "angry.json" -> "angry"
     return filename[:-5]
 
+
 for filename in DATASET_FILES:
-    source = dataset_name(filename)              # "angry", "enemy", "friends", "man_earth"
+    source = dataset_name(filename)  # "angry", "enemy", "friends", "man_earth"
     data = json.loads((data_dir / filename).read_text())
     for sample_index, sample in enumerate(data):
-        sample_id = sample.get("sample_id") or f"{source}-{sample_index}"   # dataset already sets "conv-0" for all 4 files
+        sample_id = (
+            sample.get("sample_id") or f"{source}-{sample_index}"
+        )  # dataset already sets "conv-0" for all 4 files
         for qa_index, qa in enumerate(sample.get("qa", [])):
-            qa_id = f"{source}:{sample_id}#q{qa_index:04d}"                  # e.g. "angry:conv-0#q0000"
+            qa_id = f"{source}:{sample_id}#q{qa_index:04d}"  # e.g. "angry:conv-0#q0000"
 ```
 So `dataset` = the raw filename stem (one of the 4 `DATASET_FILES` stems,
 exactly), `sample_id` = the sample's own `sample_id` field (verified: always
