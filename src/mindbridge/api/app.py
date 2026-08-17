@@ -15,6 +15,7 @@ from mindbridge.api.auth import (
     TenantPrincipal,
     require_tenant,
 )
+from mindbridge.api.events import register_job_event_routes
 from mindbridge.application.kernel import MemoryKernel
 from mindbridge.contracts import (
     DeletionListRequest,
@@ -66,6 +67,7 @@ def build_app(
     _register_request_error_handlers(app)
     _register_runtime_error_handlers(app)
     _register_deletion_routes(app, kernel, authenticator)
+    register_job_event_routes(app, kernel, authenticator)
 
     @app.get("/healthz", response_model=HealthResponse, operation_id="health")
     async def health() -> HealthResponse:

@@ -783,6 +783,23 @@ For a grounded follow-up, pass selected IDs from the previous result in
 `RecallRequest.memory_ids`. Those IDs become the strict candidate scope; MindBridge still applies
 tenant, lifecycle, deletion, and evidence checks, but does not search unrelated memory.
 
+`observe` returns immediately with a `processing_job_id`. Poll it with `get_observation_job`, or
+follow it as an event stream — useful because deriving memory from raw media takes far longer than
+the request that submitted it:
+
+```python
+receipt = await memory.observe(request)
+async for event in memory.stream_observation_job("tenant_01", receipt.processing_job_id):
+    print(event.job.state, event.job.memory_ids)
+```
+
+Every event carries the complete job view rather than a delta, so resuming after a dropped
+connection needs only the last ID received — pass it as `last_event_id` and the server skips states
+you already have. The stream ends when the attempt settles; because a failed attempt can be retried
+later by the stale-job sweep, `failed` means "this attempt is done", not "this job is finished".
+Treat `event_id` as opaque. State changes occurring between two server reads are coalesced, so you
+always observe the newer state but not necessarily every intermediate `attempt`.
+
 Set `mode="enumerate"` for exhaustive count/timeline queries. This path scans the complete
 structured-filter scope, verifies candidates against original media in bounded Generator batches, and
 returns every occurrence chronologically; scopes above 1,000 candidates fail explicitly instead of
