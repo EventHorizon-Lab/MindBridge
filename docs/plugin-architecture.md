@@ -117,8 +117,24 @@ MINDBRIDGE_RERANKER_CONFIG_JSON
 
 The bundled defaults also accept documented provider-specific environment variables so a normal
 deployment does not need inline JSON. A supplied `*_CONFIG_JSON` value is authoritative and does not
-require the bundled provider's variables. Worker and consolidation processes follow the same naming
-scheme for the capability slots they own.
+require the bundled provider's variables. Worker and consolidation processes read the same names for
+the same capability slots: the Worker adds only `MINDBRIDGE_MEDIA_EMBEDDER_*` for its local media
+encoder, and its text encoder shares the deployment-wide `MINDBRIDGE_EMBEDDER_*` contract rather than
+owning a second family of names that could disagree about the search space.
+
+Every bundled fallback is built in one place, `mindbridge.models.defaults`, so a variable is read by
+exactly one function no matter how many processes need it. A plugin author adding a bundled default
+extends that module instead of copying a builder into each process.
+
+A bundled fallback covers credentials and model identity only. Optional settings stay reachable
+through the slot's `*_CONFIG_JSON` object and do not get an environment variable each, so adding a
+knob to a plugin schema does not widen the deployment surface. `MINDBRIDGE_MEDIA_EMBEDDER_DEVICE` is
+the one deliberate exception: it selects hardware rather than model behaviour, and routing it through
+`select_torch_device` turns a missing GPU into a startup failure instead of a silent fall back to CPU.
+
+Both embedding plugins spell the pinned model revision `model_revision` in their configuration
+objects. `PluginConfigModel` sets `extra="forbid"`, so a stale key such as `revision` fails the
+factory at startup rather than being ignored.
 
 Benchmark runners require `--deployment-config`. The referenced JSON records every selected server
 and Worker plugin, its owning Python distribution and version, plus its non-secret resolved

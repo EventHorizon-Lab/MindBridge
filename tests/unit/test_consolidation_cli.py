@@ -176,7 +176,7 @@ def test_consolidation_settings_require_and_redact_credentials() -> None:
 
     settings = ConsolidationSettings.from_environment(environment)
 
-    assert settings.object_storage_bucket == "memory"
+    assert settings.object_storage.bucket == "memory"
     assert "database-secret" not in repr(settings)
     assert "generator-secret" not in repr(settings)
     assert "embedding-secret" not in repr(settings)

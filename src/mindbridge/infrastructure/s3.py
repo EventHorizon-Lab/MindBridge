@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING
 from urllib.parse import quote, urlsplit
@@ -20,6 +21,28 @@ _DEFAULT_URL_LIFETIME_SECONDS = 300
 _MAX_URL_LIFETIME_SECONDS = 3_600
 
 
+@dataclass(frozen=True, slots=True)
+class ObjectStorageEnvironment:
+    """The one object storage contract every deployable process reads and validates."""
+
+    bucket: str
+    endpoint_url: str | None = None
+
+    def __post_init__(self) -> None:
+        if not self.bucket.strip():
+            raise ValueError("object_storage bucket must not be empty")
+        if self.endpoint_url is not None and not self.endpoint_url.strip():
+            raise ValueError("object_storage endpoint_url must not be empty when provided")
+
+
+def object_storage_from_environment(source: Mapping[str, str]) -> ObjectStorageEnvironment:
+    """Read the storage variables once so no process can drift from the documented names."""
+    return ObjectStorageEnvironment(
+        bucket=require_environment_value(source, "MINDBRIDGE_OBJECT_STORAGE_BUCKET"),
+        endpoint_url=optional_environment_value(source, "MINDBRIDGE_OBJECT_STORAGE_ENDPOINT_URL"),
+    )
+
+
 class InvalidMediaLocationError(ValueError):
     """Raised when a media URI escapes its configured tenant storage prefix."""
 
@@ -29,27 +52,25 @@ class S3MediaAccess:
 
     def __init__(
         self,
-        bucket: str,
+        storage: ObjectStorageEnvironment,
         *,
-        endpoint_url: str | None = None,
-        region_name: str = "us-east-1",
         url_lifetime_seconds: int = _DEFAULT_URL_LIFETIME_SECONDS,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
-        if not bucket.strip():
-            raise ValueError("bucket must not be empty")
         if not 1 <= url_lifetime_seconds <= _MAX_URL_LIFETIME_SECONDS:
             raise ValueError("url_lifetime_seconds must be between 1 and 3600")
         import boto3
         from botocore.config import Config
 
-        self._bucket = bucket
+        self._bucket = storage.bucket
         self._url_lifetime_seconds = url_lifetime_seconds
         self._clock = clock or utc_now
+        # region_name is deliberately absent: Boto3's own chain (AWS_REGION, AWS_DEFAULT_REGION,
+        # ~/.aws/config, instance metadata) already resolves it, and passing an explicit default
+        # here silently overrode whatever the deployment had configured for every other AWS tool.
         self._client: S3Client = boto3.client(
             "s3",
-            endpoint_url=endpoint_url,
-            region_name=region_name,
+            endpoint_url=storage.endpoint_url,
             config=Config(
                 signature_version="s3v4",
                 connect_timeout=5,
@@ -61,14 +82,7 @@ class S3MediaAccess:
     @classmethod
     def from_environment(cls, environ: Mapping[str, str] | None = None) -> S3MediaAccess:
         """Build tenant-scoped media access from the documented storage contract."""
-        source = os.environ if environ is None else environ
-        return cls(
-            require_environment_value(source, "MINDBRIDGE_OBJECT_STORAGE_BUCKET"),
-            endpoint_url=optional_environment_value(
-                source, "MINDBRIDGE_OBJECT_STORAGE_ENDPOINT_URL"
-            ),
-            region_name=source.get("MINDBRIDGE_OBJECT_STORAGE_REGION", "us-east-1"),
-        )
+        return cls(object_storage_from_environment(os.environ if environ is None else environ))
 
     async def create_presigned_download(
         self,

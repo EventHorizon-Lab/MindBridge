@@ -7,7 +7,12 @@ from fastapi.testclient import TestClient
 from mcp import Client
 from psycopg import connect
 
-from mindbridge.server import Settings, create_app, create_mcp_server
+from mindbridge.server import (
+    ObjectStorageEnvironment,
+    Settings,
+    create_app,
+    create_mcp_server,
+)
 
 DATABASE_URL = os.getenv("MINDBRIDGE_TEST_DATABASE_URL")
 
@@ -59,8 +64,10 @@ def _settings(*, tenant_api_keys_json: str | None = None) -> Settings:
     assert DATABASE_URL is not None
     return Settings(
         database_url=DATABASE_URL,
-        object_storage_bucket="memory",
-        object_storage_endpoint_url="https://objects.example.test",
+        object_storage=ObjectStorageEnvironment(
+            bucket="memory",
+            endpoint_url="https://objects.example.test",
+        ),
         task_broker_url="memory://",
         generator_config={
             "api_key": "unit-test-generator-key",

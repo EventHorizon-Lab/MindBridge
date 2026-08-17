@@ -4,7 +4,7 @@ import pytest
 
 import mindbridge.api.runtime as runtime_module
 from mindbridge.core import EmbeddedObjectType, EmbeddingSpaceReference
-from mindbridge.server import Settings, create_app
+from mindbridge.server import ObjectStorageEnvironment, Settings, create_app
 
 SPACE = EmbeddingSpaceReference(space_id="jina-v5", revision="space-v1")
 
@@ -17,7 +17,6 @@ def test_settings_use_deployable_defaults_and_redact_credentials() -> None:
     assert settings.reranker_plugin is None
     assert settings.generator_config["model_id"] == "qwen3.8-max"
     assert settings.generator_config["model_revision"] == "deployment-revision"
-    assert settings.generator_config["reasoning_effort"] == "low"
     assert settings.embedder_config["model_id"] == (
         "jinaai/jina-embeddings-v5-omni-small-retrieval"
     )
@@ -51,8 +50,8 @@ def test_settings_require_generator_revision_for_bundled_default() -> None:
 
 
 def test_settings_reject_empty_direct_configuration() -> None:
-    with pytest.raises(ValueError, match="object_storage_bucket"):
-        _settings(object_storage_bucket=" ")
+    with pytest.raises(ValueError, match="database_url"):
+        _settings(database_url=" ")
 
 
 def test_settings_reject_invalid_plugin_name() -> None:
@@ -199,7 +198,7 @@ async def test_runtime_probes_every_configured_tenant_on_startup(
 def _settings(**changes: object) -> Settings:
     values: dict[str, object] = {
         "database_url": "postgresql://mindbridge@postgres/mindbridge",
-        "object_storage_bucket": "memory",
+        "object_storage": ObjectStorageEnvironment(bucket="memory"),
         "task_broker_url": "redis://redis:6379/0",
         "generator_config": {"model": "test"},
         "embedder_config": {"model": "test"},
@@ -216,7 +215,6 @@ def _environment() -> dict[str, str]:
         "MINDBRIDGE_GENERATOR_API_KEY": "generator-secret",
         "MINDBRIDGE_GENERATOR_ENDPOINT": "https://generator.example.test/v1",
         "MINDBRIDGE_GENERATOR_MODEL_REVISION": "deployment-revision",
-        "MINDBRIDGE_GENERATOR_REASONING_EFFORT": "low",
         "MINDBRIDGE_EMBEDDER_API_KEY": "query-secret",
         "MINDBRIDGE_EMBEDDER_ENDPOINT": "https://query.example.test/v1",
         "MINDBRIDGE_TENANT_API_KEYS_JSON": ('{"tenant_01":["tenant-api-key-000000000000000000"]}'),
