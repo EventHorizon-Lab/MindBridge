@@ -24,7 +24,6 @@ from mindbridge.application.consolidation_sweep import (
 from mindbridge.application.pipelines import ClaimPipeline, EpisodePipeline, SummaryPipeline
 from mindbridge.configuration import (
     copy_plugin_configuration,
-    optional_environment_value,
     parse_aware_datetime,
     plugin_configuration,
     require_environment_value,
@@ -32,14 +31,15 @@ from mindbridge.configuration import (
 )
 from mindbridge.core import TenantId, utc_now
 from mindbridge.infrastructure.postgres import PostgresMemoryStore
-from mindbridge.infrastructure.s3 import S3MediaAccess
+from mindbridge.infrastructure.s3 import (
+    ObjectStorageEnvironment,
+    S3MediaAccess,
+    object_storage_from_environment,
+)
 from mindbridge.models.defaults import (
-    DEFAULT_EMBEDDER_MODEL_ID,
-    DEFAULT_EMBEDDER_REVISION,
     DEFAULT_EMBEDDING_DIMENSION,
-    DEFAULT_EMBEDDING_SPACE,
-    DEFAULT_GENERATOR_MODEL_ID,
-    embedding_dimension_from_environment,
+    openai_embedder_config,
+    openai_generator_config,
     require_matryoshka_dimension,
 )
 from mindbridge.models.plugins import close_model, load_embedder, load_generator
@@ -51,22 +51,15 @@ class ConsolidationSettings:
     """Validated consolidation process configuration with redacted credentials."""
 
     database_url: str = field(repr=False)
-    object_storage_bucket: str
+    object_storage: ObjectStorageEnvironment
     generator_config: Mapping[str, object] = field(repr=False)
     embedder_config: Mapping[str, object] = field(repr=False)
-    object_storage_endpoint_url: str | None = None
-    object_storage_region: str = "us-east-1"
     generator_plugin: str = "openai"
     embedder_plugin: str = "openai"
 
     def __post_init__(self) -> None:
-        for name, value in (
-            ("database_url", self.database_url),
-            ("object_storage_bucket", self.object_storage_bucket),
-            ("object_storage_region", self.object_storage_region),
-        ):
-            if not value.strip():
-                raise ValueError(f"{name} must not be empty")
+        if not self.database_url.strip():
+            raise ValueError("database_url must not be empty")
         for name, value in (
             ("generator_plugin", self.generator_plugin),
             ("embedder_plugin", self.embedder_plugin),
@@ -77,11 +70,6 @@ class ConsolidationSettings:
             ("embedder_config", self.embedder_config),
         ):
             object.__setattr__(self, name, copy_plugin_configuration(config, name))
-        if (
-            self.object_storage_endpoint_url is not None
-            and not self.object_storage_endpoint_url.strip()
-        ):
-            raise ValueError("object_storage_endpoint_url must not be empty when provided")
 
     @classmethod
     def from_environment(
@@ -94,26 +82,18 @@ class ConsolidationSettings:
         embedder_plugin = source.get("MINDBRIDGE_EMBEDDER_PLUGIN", "openai")
         return cls(
             database_url=require_environment_value(source, "MINDBRIDGE_DATABASE_URL"),
-            object_storage_bucket=require_environment_value(
-                source, "MINDBRIDGE_OBJECT_STORAGE_BUCKET"
-            ),
-            object_storage_endpoint_url=optional_environment_value(
-                source, "MINDBRIDGE_OBJECT_STORAGE_ENDPOINT_URL"
-            ),
-            object_storage_region=source.get("MINDBRIDGE_OBJECT_STORAGE_REGION", "us-east-1"),
+            object_storage=object_storage_from_environment(source),
             generator_plugin=generator_plugin,
             generator_config=plugin_configuration(
                 source,
                 "MINDBRIDGE_GENERATOR_CONFIG_JSON",
-                (lambda: _generator_config(source)) if generator_plugin == "openai" else None,
+                (lambda: openai_generator_config(source)) if generator_plugin == "openai" else None,
             ),
             embedder_plugin=embedder_plugin,
             embedder_config=plugin_configuration(
                 source,
                 "MINDBRIDGE_EMBEDDER_CONFIG_JSON",
-                (lambda: _document_embedder_config(source))
-                if embedder_plugin == "openai"
-                else None,
+                (lambda: openai_embedder_config(source)) if embedder_plugin == "openai" else None,
             ),
         )
 
@@ -162,11 +142,7 @@ async def _run_postgres_sweep(
             int(cast(int, settings.embedder_config.get("dimension", DEFAULT_EMBEDDING_DIMENSION)))
         ),
     )
-    media_access = S3MediaAccess(
-        settings.object_storage_bucket,
-        endpoint_url=settings.object_storage_endpoint_url,
-        region_name=settings.object_storage_region,
-    )
+    media_access = S3MediaAccess(settings.object_storage)
     async with AsyncExitStack() as resources:
         generator = load_generator(settings.generator_plugin, settings.generator_config)
         resources.push_async_callback(close_model, generator)
@@ -263,31 +239,6 @@ def _summary_dict(summary: ConsolidationSweepSummary) -> dict[str, object]:
         },
         "evaluated_at": summary.episodes.evaluated_at.isoformat(),
         "tenant_id": summary.episodes.tenant_id,
-    }
-
-
-def _generator_config(source: Mapping[str, str]) -> Mapping[str, object]:
-    return {
-        "api_key": require_environment_value(source, "MINDBRIDGE_GENERATOR_API_KEY"),
-        "endpoint": require_environment_value(source, "MINDBRIDGE_GENERATOR_ENDPOINT"),
-        "model_id": source.get("MINDBRIDGE_GENERATOR_MODEL_ID", DEFAULT_GENERATOR_MODEL_ID),
-        "model_revision": require_environment_value(source, "MINDBRIDGE_GENERATOR_MODEL_REVISION"),
-    }
-
-
-def _document_embedder_config(source: Mapping[str, str]) -> Mapping[str, object]:
-    return {
-        "api_key": require_environment_value(source, "MINDBRIDGE_EMBEDDER_API_KEY"),
-        "endpoint": require_environment_value(source, "MINDBRIDGE_EMBEDDER_ENDPOINT"),
-        "model_id": source.get("MINDBRIDGE_EMBEDDER_MODEL_ID", DEFAULT_EMBEDDER_MODEL_ID),
-        "model_revision": source.get(
-            "MINDBRIDGE_EMBEDDER_MODEL_REVISION", DEFAULT_EMBEDDER_REVISION
-        ),
-        "space_id": source.get("MINDBRIDGE_EMBEDDING_SPACE_ID", DEFAULT_EMBEDDING_SPACE.space_id),
-        "space_revision": source.get(
-            "MINDBRIDGE_EMBEDDING_SPACE_REVISION", DEFAULT_EMBEDDING_SPACE.revision
-        ),
-        "dimension": embedding_dimension_from_environment(source),
     }
 
 

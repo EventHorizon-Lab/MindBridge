@@ -195,7 +195,9 @@ class JinaEmbedder:
 
 class _EmbedderConfig(PluginConfigModel):
     model_id: PluginText = DEFAULT_EMBEDDER_MODEL_ID
-    revision: PluginText = DEFAULT_EMBEDDER_REVISION
+    # Spelled model_revision like every other plugin's configuration so one deployment does
+    # not have to remember two names for the pinned model revision.
+    model_revision: PluginText = DEFAULT_EMBEDDER_REVISION
     device: PluginText | None = None
     space_id: PluginText = DEFAULT_EMBEDDING_SPACE.space_id
     space_revision: PluginText = DEFAULT_EMBEDDING_SPACE.revision
@@ -208,7 +210,7 @@ def create_embedder(config: Mapping[str, object]) -> JinaEmbedder:
     validated = _EmbedderConfig.model_validate(config)
     return JinaEmbedder.load(
         model_id=validated.model_id,
-        revision=validated.revision,
+        revision=validated.model_revision,
         device=validated.device,
         space_reference=EmbeddingSpaceReference(
             space_id=validated.space_id,

@@ -24,7 +24,6 @@ from mindbridge.application.pipelines import PerceptionPipeline
 from mindbridge.application.process_observation import ProcessObservation
 from mindbridge.configuration import (
     copy_plugin_configuration,
-    optional_environment_value,
     plugin_configuration,
     require_environment_value,
     validate_plugin_name,
@@ -39,19 +38,22 @@ from mindbridge.core import (
     TenantId,
 )
 from mindbridge.infrastructure.postgres import PostgresMemoryStore
-from mindbridge.infrastructure.s3 import S3MediaAccess
+from mindbridge.infrastructure.s3 import (
+    ObjectStorageEnvironment,
+    S3MediaAccess,
+    object_storage_from_environment,
+)
 from mindbridge.infrastructure.task_queue import (
     PROCESS_OBSERVATION_TASK,
     ObservationProcessingTaskMessage,
     create_task_queue,
 )
 from mindbridge.models.defaults import (
-    DEFAULT_EMBEDDER_MODEL_ID,
-    DEFAULT_EMBEDDER_REVISION,
     DEFAULT_EMBEDDING_DIMENSION,
-    DEFAULT_EMBEDDING_SPACE,
-    DEFAULT_GENERATOR_MODEL_ID,
     embedding_dimension_from_environment,
+    jina_media_embedder_config,
+    openai_embedder_config,
+    openai_generator_config,
 )
 from mindbridge.models.plugins import close_model, load_embedder, load_generator
 from mindbridge.telemetry import configure_telemetry
@@ -93,13 +95,11 @@ class WorkerSettings:
     """Validated Worker configuration with credentials redacted from repr."""
 
     database_url: str = field(repr=False)
-    object_storage_bucket: str
+    object_storage: ObjectStorageEnvironment
     task_broker_url: str = field(repr=False)
     generator_config: Mapping[str, object] = field(repr=False)
     media_embedder_config: Mapping[str, object] = field(repr=False)
     text_embedder_config: Mapping[str, object] = field(repr=False)
-    object_storage_endpoint_url: str | None = None
-    object_storage_region: str = "us-east-1"
     generator_plugin: str = "openai"
     media_embedder_plugin: str = "jina"
     text_embedder_plugin: str = "openai"
@@ -108,8 +108,6 @@ class WorkerSettings:
     def __post_init__(self) -> None:
         for name, value in (
             ("database_url", self.database_url),
-            ("object_storage_bucket", self.object_storage_bucket),
-            ("object_storage_region", self.object_storage_region),
             ("task_broker_url", self.task_broker_url),
         ):
             if not value.strip():
@@ -126,11 +124,6 @@ class WorkerSettings:
             ("text_embedder_config", self.text_embedder_config),
         ):
             object.__setattr__(self, name, copy_plugin_configuration(config, name))
-        if (
-            self.object_storage_endpoint_url is not None
-            and not self.object_storage_endpoint_url.strip()
-        ):
-            raise ValueError("object_storage_endpoint_url must not be empty when provided")
 
     @classmethod
     def from_environment(cls, environ: Mapping[str, str] | None = None) -> WorkerSettings:
@@ -138,34 +131,44 @@ class WorkerSettings:
         source = os.environ if environ is None else environ
         generator_plugin = source.get("MINDBRIDGE_GENERATOR_PLUGIN", "openai")
         media_plugin = source.get("MINDBRIDGE_MEDIA_EMBEDDER_PLUGIN", "jina")
-        text_plugin = source.get("MINDBRIDGE_TEXT_EMBEDDER_PLUGIN", "openai")
+        # The Worker's text encoder must land in the same space the API queries, so it reads the
+        # deployment-wide MINDBRIDGE_EMBEDDER_* contract rather than a second set of names.
+        text_plugin = source.get("MINDBRIDGE_EMBEDDER_PLUGIN", "openai")
         return cls(
             database_url=require_environment_value(source, "MINDBRIDGE_DATABASE_URL"),
-            object_storage_bucket=require_environment_value(
-                source, "MINDBRIDGE_OBJECT_STORAGE_BUCKET"
-            ),
-            object_storage_endpoint_url=optional_environment_value(
-                source, "MINDBRIDGE_OBJECT_STORAGE_ENDPOINT_URL"
-            ),
-            object_storage_region=source.get("MINDBRIDGE_OBJECT_STORAGE_REGION", "us-east-1"),
+            object_storage=object_storage_from_environment(source),
             task_broker_url=require_environment_value(source, "MINDBRIDGE_TASK_BROKER_URL"),
             generator_plugin=generator_plugin,
             generator_config=plugin_configuration(
                 source,
                 "MINDBRIDGE_GENERATOR_CONFIG_JSON",
-                (lambda: _generator_config(source)) if generator_plugin == "openai" else None,
+                (
+                    lambda: openai_generator_config(
+                        source,
+                        request_timeout_seconds=_MODEL_REQUEST_TIMEOUT_SECONDS,
+                    )
+                )
+                if generator_plugin == "openai"
+                else None,
             ),
             media_embedder_plugin=media_plugin,
             media_embedder_config=plugin_configuration(
                 source,
                 "MINDBRIDGE_MEDIA_EMBEDDER_CONFIG_JSON",
-                (lambda: _media_embedder_config(source)) if media_plugin == "jina" else None,
+                (lambda: jina_media_embedder_config(source)) if media_plugin == "jina" else None,
             ),
             text_embedder_plugin=text_plugin,
             text_embedder_config=plugin_configuration(
                 source,
-                "MINDBRIDGE_TEXT_EMBEDDER_CONFIG_JSON",
-                (lambda: _text_embedder_config(source)) if text_plugin == "openai" else None,
+                "MINDBRIDGE_EMBEDDER_CONFIG_JSON",
+                (
+                    lambda: openai_embedder_config(
+                        source,
+                        request_timeout_seconds=_MODEL_REQUEST_TIMEOUT_SECONDS,
+                    )
+                )
+                if text_plugin == "openai"
+                else None,
             ),
             embedding_dimension=embedding_dimension_from_environment(source),
         )
@@ -281,11 +284,7 @@ async def _process_observation_once(
     store = PostgresMemoryStore(
         settings.database_url, embedding_dimension=settings.embedding_dimension
     )
-    media_access = S3MediaAccess(
-        settings.object_storage_bucket,
-        endpoint_url=settings.object_storage_endpoint_url,
-        region_name=settings.object_storage_region,
-    )
+    media_access = S3MediaAccess(settings.object_storage)
     async with AsyncExitStack() as resources:
         generator = load_generator(settings.generator_plugin, settings.generator_config)
         resources.push_async_callback(close_model, generator)
@@ -346,48 +345,3 @@ def _dispose_worker_runtime() -> None:
 def _close_worker_runtime(**_kwargs: object) -> None:
     """Release the process-owned plugin before the prefork child exits."""
     _dispose_worker_runtime()
-
-
-def _generator_config(source: Mapping[str, str]) -> Mapping[str, object]:
-    return {
-        "api_key": require_environment_value(source, "MINDBRIDGE_GENERATOR_API_KEY"),
-        "endpoint": require_environment_value(source, "MINDBRIDGE_GENERATOR_ENDPOINT"),
-        "model_id": source.get("MINDBRIDGE_GENERATOR_MODEL_ID", DEFAULT_GENERATOR_MODEL_ID),
-        "model_revision": require_environment_value(source, "MINDBRIDGE_GENERATOR_MODEL_REVISION"),
-        "request_timeout_seconds": _MODEL_REQUEST_TIMEOUT_SECONDS,
-    }
-
-
-def _media_embedder_config(source: Mapping[str, str]) -> Mapping[str, object]:
-    config: dict[str, object] = {
-        "model_id": source.get("MINDBRIDGE_MEDIA_EMBEDDER_MODEL_ID", DEFAULT_EMBEDDER_MODEL_ID),
-        "revision": source.get(
-            "MINDBRIDGE_MEDIA_EMBEDDER_MODEL_REVISION", DEFAULT_EMBEDDER_REVISION
-        ),
-        "space_id": source.get("MINDBRIDGE_EMBEDDING_SPACE_ID", DEFAULT_EMBEDDING_SPACE.space_id),
-        "space_revision": source.get(
-            "MINDBRIDGE_EMBEDDING_SPACE_REVISION", DEFAULT_EMBEDDING_SPACE.revision
-        ),
-        "dimension": embedding_dimension_from_environment(source),
-    }
-    device = optional_environment_value(source, "MINDBRIDGE_MEDIA_EMBEDDER_DEVICE")
-    if device is not None:
-        config["device"] = device
-    return config
-
-
-def _text_embedder_config(source: Mapping[str, str]) -> Mapping[str, object]:
-    return {
-        "api_key": require_environment_value(source, "MINDBRIDGE_TEXT_EMBEDDER_API_KEY"),
-        "endpoint": require_environment_value(source, "MINDBRIDGE_TEXT_EMBEDDER_ENDPOINT"),
-        "model_id": source.get("MINDBRIDGE_TEXT_EMBEDDER_MODEL_ID", DEFAULT_EMBEDDER_MODEL_ID),
-        "model_revision": source.get(
-            "MINDBRIDGE_TEXT_EMBEDDER_MODEL_REVISION", DEFAULT_EMBEDDER_REVISION
-        ),
-        "space_id": source.get("MINDBRIDGE_EMBEDDING_SPACE_ID", DEFAULT_EMBEDDING_SPACE.space_id),
-        "space_revision": source.get(
-            "MINDBRIDGE_EMBEDDING_SPACE_REVISION", DEFAULT_EMBEDDING_SPACE.revision
-        ),
-        "dimension": embedding_dimension_from_environment(source),
-        "request_timeout_seconds": _MODEL_REQUEST_TIMEOUT_SECONDS,
-    }

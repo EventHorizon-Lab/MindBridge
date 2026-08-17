@@ -27,19 +27,21 @@ from mindbridge.configuration import (
 )
 from mindbridge.core import EmbeddedObjectType, EmbeddingSpaceReference, TenantId
 from mindbridge.infrastructure.postgres import PostgresMemoryStore
-from mindbridge.infrastructure.s3 import S3MediaAccess
+from mindbridge.infrastructure.s3 import (
+    ObjectStorageEnvironment,
+    S3MediaAccess,
+    object_storage_from_environment,
+)
 from mindbridge.infrastructure.task_queue import (
     CeleryObservationJobPublisher,
     create_task_queue,
 )
 from mindbridge.models import Generator
 from mindbridge.models.defaults import (
-    DEFAULT_EMBEDDER_MODEL_ID,
-    DEFAULT_EMBEDDER_REVISION,
     DEFAULT_EMBEDDING_DIMENSION,
-    DEFAULT_EMBEDDING_SPACE,
-    DEFAULT_GENERATOR_MODEL_ID,
     embedding_dimension_from_environment,
+    openai_embedder_config,
+    openai_generator_config,
 )
 from mindbridge.models.plugins import (
     close_model,
@@ -55,12 +57,10 @@ class Settings:
     """Validated infrastructure and directly selected model plugin configuration."""
 
     database_url: str = field(repr=False)
-    object_storage_bucket: str
+    object_storage: ObjectStorageEnvironment
     task_broker_url: str = field(repr=False)
     generator_config: Mapping[str, object] = field(repr=False)
     embedder_config: Mapping[str, object] = field(repr=False)
-    object_storage_endpoint_url: str | None = None
-    object_storage_region: str = "us-east-1"
     generator_plugin: str = "openai"
     embedder_plugin: str = "openai"
     reranker_plugin: str | None = None
@@ -74,8 +74,6 @@ class Settings:
     def __post_init__(self) -> None:
         for name, value in (
             ("database_url", self.database_url),
-            ("object_storage_bucket", self.object_storage_bucket),
-            ("object_storage_region", self.object_storage_region),
             ("task_broker_url", self.task_broker_url),
         ):
             if not value.strip():
@@ -104,11 +102,6 @@ class Settings:
             "reranker_config",
             copy_plugin_configuration(self.reranker_config, "reranker_config"),
         )
-        if (
-            self.object_storage_endpoint_url is not None
-            and not self.object_storage_endpoint_url.strip()
-        ):
-            raise ValueError("object_storage_endpoint_url must not be empty when provided")
         if self.tenant_api_keys_json is not None and not self.tenant_api_keys_json.strip():
             raise ValueError("tenant_api_keys_json must not be empty when provided")
         if (
@@ -127,12 +120,12 @@ class Settings:
         generator_config = plugin_configuration(
             source,
             "MINDBRIDGE_GENERATOR_CONFIG_JSON",
-            (lambda: _openai_generator_config(source)) if generator_plugin == "openai" else None,
+            (lambda: openai_generator_config(source)) if generator_plugin == "openai" else None,
         )
         embedder_config = plugin_configuration(
             source,
             "MINDBRIDGE_EMBEDDER_CONFIG_JSON",
-            (lambda: _openai_embedder_config(source)) if embedder_plugin == "openai" else None,
+            (lambda: openai_embedder_config(source)) if embedder_plugin == "openai" else None,
         )
         reranker_config = (
             plugin_configuration(source, "MINDBRIDGE_RERANKER_CONFIG_JSON", lambda: {})
@@ -141,13 +134,7 @@ class Settings:
         )
         return cls(
             database_url=require_environment_value(source, "MINDBRIDGE_DATABASE_URL"),
-            object_storage_bucket=require_environment_value(
-                source, "MINDBRIDGE_OBJECT_STORAGE_BUCKET"
-            ),
-            object_storage_endpoint_url=optional_environment_value(
-                source, "MINDBRIDGE_OBJECT_STORAGE_ENDPOINT_URL"
-            ),
-            object_storage_region=source.get("MINDBRIDGE_OBJECT_STORAGE_REGION", "us-east-1"),
+            object_storage=object_storage_from_environment(source),
             task_broker_url=require_environment_value(source, "MINDBRIDGE_TASK_BROKER_URL"),
             generator_plugin=generator_plugin,
             generator_config=generator_config,
@@ -274,11 +261,7 @@ def _build_runtime(settings: Settings) -> _Runtime:
     store = PostgresMemoryStore(
         settings.database_url, embedding_dimension=settings.embedding_dimension
     )
-    media_access = S3MediaAccess(
-        settings.object_storage_bucket,
-        endpoint_url=settings.object_storage_endpoint_url,
-        region_name=settings.object_storage_region,
-    )
+    media_access = S3MediaAccess(settings.object_storage)
     generator = load_generator(settings.generator_plugin, settings.generator_config)
     embedder = load_embedder(settings.embedder_plugin, settings.embedder_config)
     reranker = (
@@ -309,32 +292,3 @@ def _build_runtime(settings: Settings) -> _Runtime:
         else ()
     )
     return _Runtime(kernel, store, models, generator, embedder.space_reference, tenant_ids)
-
-
-def _openai_generator_config(source: Mapping[str, str]) -> dict[str, object]:
-    config: dict[str, object] = {
-        "api_key": require_environment_value(source, "MINDBRIDGE_GENERATOR_API_KEY"),
-        "endpoint": require_environment_value(source, "MINDBRIDGE_GENERATOR_ENDPOINT"),
-        "model_id": source.get("MINDBRIDGE_GENERATOR_MODEL_ID", DEFAULT_GENERATOR_MODEL_ID),
-        "model_revision": require_environment_value(source, "MINDBRIDGE_GENERATOR_MODEL_REVISION"),
-    }
-    reasoning_effort = optional_environment_value(source, "MINDBRIDGE_GENERATOR_REASONING_EFFORT")
-    if reasoning_effort is not None:
-        config["reasoning_effort"] = reasoning_effort
-    return config
-
-
-def _openai_embedder_config(source: Mapping[str, str]) -> dict[str, object]:
-    return {
-        "api_key": require_environment_value(source, "MINDBRIDGE_EMBEDDER_API_KEY"),
-        "endpoint": require_environment_value(source, "MINDBRIDGE_EMBEDDER_ENDPOINT"),
-        "model_id": source.get("MINDBRIDGE_EMBEDDER_MODEL_ID", DEFAULT_EMBEDDER_MODEL_ID),
-        "model_revision": source.get(
-            "MINDBRIDGE_EMBEDDER_MODEL_REVISION", DEFAULT_EMBEDDER_REVISION
-        ),
-        "space_id": source.get("MINDBRIDGE_EMBEDDING_SPACE_ID", DEFAULT_EMBEDDING_SPACE.space_id),
-        "space_revision": source.get(
-            "MINDBRIDGE_EMBEDDING_SPACE_REVISION", DEFAULT_EMBEDDING_SPACE.revision
-        ),
-        "dimension": embedding_dimension_from_environment(source),
-    }

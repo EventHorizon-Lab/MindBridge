@@ -5,7 +5,11 @@ from typing import Annotated
 
 from pydantic import AfterValidator
 
-from mindbridge.configuration import PluginInteger
+from mindbridge.configuration import (
+    PluginInteger,
+    optional_environment_value,
+    require_environment_value,
+)
 from mindbridge.core import DEFAULT_EMBEDDING_DIMENSION, EmbeddingSpaceReference
 
 __all__ = [
@@ -17,6 +21,9 @@ __all__ = [
     "MATRYOSHKA_DIMENSIONS",
     "MatryoshkaDimension",
     "embedding_dimension_from_environment",
+    "jina_media_embedder_config",
+    "openai_embedder_config",
+    "openai_generator_config",
     "require_matryoshka_dimension",
 ]
 
@@ -49,3 +56,75 @@ def embedding_dimension_from_environment(source: Mapping[str, str]) -> int:
     return require_matryoshka_dimension(
         int(source.get("MINDBRIDGE_EMBEDDING_DIMENSION", str(DEFAULT_EMBEDDING_DIMENSION)))
     )
+
+
+# Every process that loads a bundled plugin builds its fallback configuration here, so each
+# variable is read in exactly one place. Three copies of these builders had already drifted
+# apart — only one of them applied a request deadline — and per-process differences now arrive
+# as arguments instead of as another variable.
+#
+# These builders cover credentials and model identity only: the values a deployment cannot start
+# without. A plugin's remaining optional settings are reachable through its `*_CONFIG_JSON`
+# object rather than one environment variable each, which is what keeps this surface bounded as
+# plugins gain knobs.
+def openai_generator_config(
+    source: Mapping[str, str],
+    *,
+    request_timeout_seconds: float | None = None,
+) -> dict[str, object]:
+    """Read the bundled OpenAI generator contract shared by every deployable process."""
+    config: dict[str, object] = {
+        "api_key": require_environment_value(source, "MINDBRIDGE_GENERATOR_API_KEY"),
+        "endpoint": require_environment_value(source, "MINDBRIDGE_GENERATOR_ENDPOINT"),
+        "model_id": source.get("MINDBRIDGE_GENERATOR_MODEL_ID", DEFAULT_GENERATOR_MODEL_ID),
+        "model_revision": require_environment_value(source, "MINDBRIDGE_GENERATOR_MODEL_REVISION"),
+    }
+    if request_timeout_seconds is not None:
+        config["request_timeout_seconds"] = request_timeout_seconds
+    return config
+
+
+def openai_embedder_config(
+    source: Mapping[str, str],
+    *,
+    request_timeout_seconds: float | None = None,
+) -> dict[str, object]:
+    """Read the bundled OpenAI text encoder contract for querying, ingest, and consolidation."""
+    config: dict[str, object] = {
+        "api_key": require_environment_value(source, "MINDBRIDGE_EMBEDDER_API_KEY"),
+        "endpoint": require_environment_value(source, "MINDBRIDGE_EMBEDDER_ENDPOINT"),
+        "model_id": source.get("MINDBRIDGE_EMBEDDER_MODEL_ID", DEFAULT_EMBEDDER_MODEL_ID),
+        "model_revision": source.get(
+            "MINDBRIDGE_EMBEDDER_MODEL_REVISION", DEFAULT_EMBEDDER_REVISION
+        ),
+        **_embedding_space_config(source),
+    }
+    if request_timeout_seconds is not None:
+        config["request_timeout_seconds"] = request_timeout_seconds
+    return config
+
+
+def jina_media_embedder_config(source: Mapping[str, str]) -> dict[str, object]:
+    """Read the bundled local Jina contract for the Worker's image, video, and audio encoder."""
+    config: dict[str, object] = {
+        "model_id": source.get("MINDBRIDGE_MEDIA_EMBEDDER_MODEL_ID", DEFAULT_EMBEDDER_MODEL_ID),
+        "model_revision": source.get(
+            "MINDBRIDGE_MEDIA_EMBEDDER_MODEL_REVISION", DEFAULT_EMBEDDER_REVISION
+        ),
+        **_embedding_space_config(source),
+    }
+    device = optional_environment_value(source, "MINDBRIDGE_MEDIA_EMBEDDER_DEVICE")
+    if device is not None:
+        config["device"] = device
+    return config
+
+
+def _embedding_space_config(source: Mapping[str, str]) -> dict[str, object]:
+    """Name the one search space and vector width every encoder in a deployment must share."""
+    return {
+        "space_id": source.get("MINDBRIDGE_EMBEDDING_SPACE_ID", DEFAULT_EMBEDDING_SPACE.space_id),
+        "space_revision": source.get(
+            "MINDBRIDGE_EMBEDDING_SPACE_REVISION", DEFAULT_EMBEDDING_SPACE.revision
+        ),
+        "dimension": embedding_dimension_from_environment(source),
+    }

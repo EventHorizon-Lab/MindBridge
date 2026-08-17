@@ -821,7 +821,6 @@ export MINDBRIDGE_GENERATOR_API_KEY=replace-with-a-runtime-secret
 export MINDBRIDGE_GENERATOR_ENDPOINT=https://generator.example.com/v1
 export MINDBRIDGE_GENERATOR_MODEL_ID=qwen3.8-max
 export MINDBRIDGE_GENERATOR_MODEL_REVISION=deployment-2026-08-11
-export MINDBRIDGE_GENERATOR_REASONING_EFFORT=low
 export MINDBRIDGE_EMBEDDER_PLUGIN=openai
 export MINDBRIDGE_EMBEDDER_API_KEY=replace-with-a-runtime-secret
 export MINDBRIDGE_EMBEDDER_ENDPOINT=https://embeddings.example.com/v1
@@ -829,6 +828,7 @@ export MINDBRIDGE_EMBEDDER_MODEL_ID=jinaai/jina-embeddings-v5-omni-small-retriev
 export MINDBRIDGE_EMBEDDER_MODEL_REVISION=12949877f0092093f366c6450340011320152a05
 export MINDBRIDGE_EMBEDDING_SPACE_ID=jina-v5
 export MINDBRIDGE_EMBEDDING_SPACE_REVISION=deployment-space-v1
+export MINDBRIDGE_EMBEDDING_DIMENSION=1024
 export MINDBRIDGE_MINIMUM_EMBEDDING_SIMILARITY=0.0
 export MINDBRIDGE_TENANT_API_KEYS_JSON='{"tenant_01":["replace-with-at-least-32-random-characters"]}'
 export OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318
@@ -845,8 +845,27 @@ object is authoritative, so Anthropic, Gemini, local runtimes, and experimental 
 OpenAI-specific variables. Enabling reranking requires both `MINDBRIDGE_RERANKER_PLUGIN` and its
 configuration object. See the [plugin author contract](docs/plugin-architecture.md).
 
+The bundled variables above cover credentials and model identity — what a deployment cannot start
+without. A plugin's remaining optional settings are reachable through its `*_CONFIG_JSON` object
+instead of one variable each, which is what keeps this list from growing with every knob a plugin
+gains. Tuning the bundled OpenAI generator therefore looks like:
+
+```bash
+export MINDBRIDGE_GENERATOR_CONFIG_JSON='{
+  "api_key": "replace-with-a-runtime-secret",
+  "endpoint": "https://generator.example.com/v1",
+  "model_id": "qwen3.8-max",
+  "model_revision": "deployment-2026-08-11",
+  "reasoning_effort": "low"
+}'
+```
+
 `MINDBRIDGE_EMBEDDING_SPACE_ID` and `MINDBRIDGE_EMBEDDING_SPACE_REVISION` name the search space the
-selected Embedder writes into and queries. Startup probes every tenant in
+selected Embedder writes into and queries. `MINDBRIDGE_EMBEDDING_DIMENSION` is the one vector width
+shared by the pgvector index and every encoder in the deployment; it defaults to 1024 and accepts
+only a width Jina v5 was trained to truncate to (32, 64, 128, 256, 512, 768, or 1024). Changing it
+requires re-embedding, so set it once per deployment and give every process the same value.
+Startup probes every tenant in
 `MINDBRIDGE_TENANT_API_KEYS_JSON` and refuses to serve when one holds vectors that space cannot
 reach, so pointing the server at a new embedding model without re-embedding fails loudly instead of
 returning empty recalls. The probe reports each stranded object type separately, so memory records
@@ -916,6 +935,12 @@ is public; benchmark runs must add every generated tenant ID to the mapping befo
 `MINDBRIDGE_OBJECT_STORAGE_ENDPOINT_URL` is optional for AWS S3. Media URIs must use the tenant-safe
 shape `s3://<bucket>/tenants/<tenant_id>/<object>`.
 
+MindBridge owns no S3 region setting. Boto3's own chain resolves it from `AWS_REGION`,
+`AWS_DEFAULT_REGION`, `~/.aws/config`, or instance metadata, exactly as it resolves credentials, so
+one AWS configuration serves MindBridge and every other tool in the deployment. S3-compatible stores
+that do not care about the value still need one set — `AWS_DEFAULT_REGION=us-east-1` is the
+conventional choice.
+
 `POST /v1/observations` returns a durable processing job. Poll
 `GET /v1/jobs/{job_id}?tenant_id=<tenant_id>` until it reaches `succeeded` before issuing a recall
 that depends on its derived events.
@@ -937,16 +962,14 @@ The Worker shares storage and Generator variables with the server. It inspects o
 writes evidence-grounded Event/Entity/Claim graph records atomically, and cuts one derived clip per
 grounded event span before encoding it with the default local Jina plugin, so each vector covers the
 event's own slice of the recording rather than the whole file. Event and Claim text is batched through the
-default OpenAI-compatible Embedder. Select both capability slots directly:
+default OpenAI-compatible Embedder. Its text encoder reads the same `MINDBRIDGE_EMBEDDER_*` contract
+the API queries with, so only the media slot needs Worker-specific variables:
 
 ```bash
 export MINDBRIDGE_MEDIA_EMBEDDER_PLUGIN=jina
 export MINDBRIDGE_MEDIA_EMBEDDER_DEVICE=cuda
-export MINDBRIDGE_TEXT_EMBEDDER_PLUGIN=openai
-export MINDBRIDGE_TEXT_EMBEDDER_API_KEY=replace-with-a-runtime-secret
-export MINDBRIDGE_TEXT_EMBEDDER_ENDPOINT=https://embeddings.example.com/v1
-export MINDBRIDGE_TEXT_EMBEDDER_MODEL_ID=jinaai/jina-embeddings-v5-omni-small-retrieval
-export MINDBRIDGE_TEXT_EMBEDDER_MODEL_REVISION=12949877f0092093f366c6450340011320152a05
+export MINDBRIDGE_MEDIA_EMBEDDER_MODEL_ID=jinaai/jina-embeddings-v5-omni-small-retrieval
+export MINDBRIDGE_MEDIA_EMBEDDER_MODEL_REVISION=12949877f0092093f366c6450340011320152a05
 
 uv run --extra server --extra cloud-models \
   celery -A mindbridge.celery_app:app worker --loglevel=INFO
@@ -954,8 +977,17 @@ uv run --extra server --extra cloud-models \
 
 One prefork child is the safe default because each child owns a full embedding model. Scale with one
 Worker process per assigned GPU instead of increasing concurrency inside a process.
+`MINDBRIDGE_MEDIA_EMBEDDER_DEVICE` is optional and falls back to automatic device selection.
+
+The Worker's text slot is deliberately not a separate variable family. It must land in the space the
+API queries, so it reads `MINDBRIDGE_EMBEDDER_PLUGIN`, `MINDBRIDGE_EMBEDDER_API_KEY`,
+`MINDBRIDGE_EMBEDDER_ENDPOINT`, `MINDBRIDGE_EMBEDDER_MODEL_ID`, and
+`MINDBRIDGE_EMBEDDER_MODEL_REVISION` exactly as the API does. Each process has its own environment,
+so a Worker that genuinely needs a different endpoint sets a different value for the same name rather
+than a second name that can silently disagree.
+
 Non-default Worker adapters use `MINDBRIDGE_MEDIA_EMBEDDER_CONFIG_JSON` and
-`MINDBRIDGE_TEXT_EMBEDDER_CONFIG_JSON`; explicit objects replace the bundled fallback variables.
+`MINDBRIDGE_EMBEDDER_CONFIG_JSON`; explicit objects replace the bundled fallback variables.
 Both slots must resolve to one embedding space. The Worker compares the two declared spaces before
 processing and fails the job instead of writing media and text vectors that cannot be compared.
 
