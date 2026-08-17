@@ -105,6 +105,22 @@ so `speaker_1_memories` can be a list of memory strings, not just one blob.
   `gold_answer`/`golden_answer`/`reference_answer`/`correct_answer` — the
   loader must rename `qa["answer"]` into one of those four keys (recommend
   `gold_answer`) when building the input JSONL.
+- **Correction, found while implementing Task 6:** `answer` is not always
+  present. Category-5 (adversarial) questions store their gold under
+  `adversarial_answer` instead. Exact counts over the real 10-sample corpus:
+
+  | category | has `answer` | has `adversarial_answer` | count |
+  |---|---|---|---|
+  | 1 | yes | no | 282 |
+  | 2 | yes | no | 321 |
+  | 3 | yes | no | 96 |
+  | 4 | yes | no | 841 |
+  | 5 | **no** | yes | 444 |
+  | 5 | yes | yes | 2 |
+
+  A loader that reads only `answer` raises on 444 of 1,986 questions. The
+  vendored pipeline has no category-5 special case, so the fallback belongs
+  in the loader: `answer`, then `adversarial_answer`, then raise.
   Do not confuse with `qa["question"]`, which the pipeline reads directly.
 - No `id` field exists in the raw QA objects — must construct one
   (`f"{sample_id}:qa{index:04d}"` is a safe convention, and keeps ids stable
