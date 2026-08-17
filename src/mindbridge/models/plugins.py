@@ -6,7 +6,7 @@ from collections.abc import Callable, Mapping
 from importlib.metadata import EntryPoint, entry_points
 from typing import cast
 
-from mindbridge.application.capabilities import Embedder, Generator, Reranker
+from mindbridge.application.capabilities import Embedder, Generator
 from mindbridge.configuration import copy_plugin_configuration, validate_plugin_name
 
 PluginConfig = Mapping[str, object]
@@ -21,11 +21,6 @@ def load_generator(name: str, config: PluginConfig) -> Generator:
 def load_embedder(name: str, config: PluginConfig) -> Embedder:
     """Load only the selected embedding plugin."""
     return cast(Embedder, _load("mindbridge.embedders", name, config, Embedder))
-
-
-def load_reranker(name: str, config: PluginConfig) -> Reranker:
-    """Load only the selected reranking plugin."""
-    return cast(Reranker, _load("mindbridge.rerankers", name, config, Reranker))
 
 
 async def close_model(model: object) -> None:

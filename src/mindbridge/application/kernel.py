@@ -13,7 +13,6 @@ from mindbridge.application.capabilities import (
     EmbedRequest,
     EmbedTask,
     ModelInput,
-    Reranker,
     TextPart,
 )
 from mindbridge.application.evidence import read_resolved_memory_evidence
@@ -96,7 +95,6 @@ class MemoryKernel:
         media_url_signer: MediaUrlSigner,
         observation_job_publisher: ObservationJobPublisher,
         embedder: Embedder,
-        reranker: Reranker | None = None,
         minimum_embedding_similarity: float = 0.0,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
@@ -119,7 +117,6 @@ class MemoryKernel:
             embedding_index=embedding_index,
             media_url_signer=media_url_signer,
             embedder=embedder,
-            reranker=reranker,
             minimum_embedding_similarity=minimum_embedding_similarity,
             clock=self._clock,
         )

@@ -76,9 +76,6 @@ from mindbridge.models import (
     EmbedResult,
     EmbedTask,
     MediaPart,
-    Reranker,
-    RerankRequest,
-    RerankResult,
     TextPart,
 )
 
@@ -622,20 +619,6 @@ class RecordingEmbedder:
                 )
                 for _ in request.inputs
             )
-        )
-
-
-class RecordingReranker:
-    def __init__(self, result_ids: tuple[str, ...] | None = None) -> None:
-        self.result_ids = result_ids
-        self.requests: list[RerankRequest] = []
-
-    async def rerank(self, request: RerankRequest) -> RerankResult:
-        self.requests.append(request)
-        return RerankResult(
-            self.result_ids
-            if self.result_ids is not None
-            else tuple(reversed([item.candidate_id for item in request.candidates]))
         )
 
 
@@ -1447,64 +1430,6 @@ async def test_semantic_memory_finds_attested_text_without_matching_words() -> N
     assert result.answer == memory.summary
 
 
-async def test_recall_uses_optional_reranker_without_changing_candidate_identity() -> None:
-    store = InMemoryStore()
-    reranker = RecordingReranker()
-    first = await _kernel(store, RecordingAnswerer()).remember(
-        _remember_request(idempotency_key="rerank-first")
-    )
-    second = await _kernel(store, RecordingAnswerer()).remember(
-        _remember_request(idempotency_key="rerank-second")
-    )
-    store.embedding_matches = tuple(
-        EmbeddingMatch(
-            embedding_id=f"embedding_{index}",
-            object_type=EmbeddedObjectType.MEMORY_RECORD,
-            object_id=memory_id,
-            similarity=1.0 - index / 10,
-        )
-        for index, memory_id in enumerate((first.memory_id, second.memory_id))
-    )
-
-    result = await _kernel(store, RecordingAnswerer(), reranker=reranker).recall(
-        RecallRequest(tenant_id="tenant_01", query=RecallQuery(text="semantic-only query"))
-    )
-
-    assert [item.memory_id for item in result.memories] == [second.memory_id, first.memory_id]
-    assert [item.candidate_id for item in reranker.requests[0].candidates] == [
-        first.memory_id,
-        second.memory_id,
-    ]
-
-
-async def test_recall_rejects_reranker_that_drops_a_candidate() -> None:
-    store = InMemoryStore()
-    first = await _kernel(store, RecordingAnswerer()).remember(
-        _remember_request(idempotency_key="rerank-invalid-first")
-    )
-    second = await _kernel(store, RecordingAnswerer()).remember(
-        _remember_request(idempotency_key="rerank-invalid-second")
-    )
-    store.embedding_matches = tuple(
-        EmbeddingMatch(
-            embedding_id=f"embedding_invalid_{index}",
-            object_type=EmbeddedObjectType.MEMORY_RECORD,
-            object_id=memory_id,
-            similarity=1.0 - index / 10,
-        )
-        for index, memory_id in enumerate((first.memory_id, second.memory_id))
-    )
-
-    with pytest.raises(ModelOutputError, match="every candidate ID"):
-        await _kernel(
-            store,
-            RecordingAnswerer(),
-            reranker=RecordingReranker((first.memory_id,)),
-        ).recall(
-            RecallRequest(tenant_id="tenant_01", query=RecallQuery(text="semantic-only query"))
-        )
-
-
 async def test_semantic_summary_hit_descends_to_attested_source_for_answering() -> None:
     store = InMemoryStore()
     answerer = RecordingAnswerer()
@@ -1964,7 +1889,6 @@ def _kernel(
     job_publisher: RecordingObservationJobPublisher | None = None,
     embedder: RecordingEmbedder | None = None,
     media_access: DeterministicMediaUrlSigner | None = None,
-    reranker: Reranker | None = None,
     clock: Callable[[], datetime] = lambda: NOW,
 ) -> MemoryKernel:
     resolved_media_access = media_access or DeterministicMediaUrlSigner()
@@ -1977,7 +1901,6 @@ def _kernel(
         media_url_signer=resolved_media_access,
         observation_job_publisher=job_publisher or RecordingObservationJobPublisher(),
         embedder=embedder or RecordingEmbedder(),
-        reranker=reranker,
         clock=clock,
     )
 
