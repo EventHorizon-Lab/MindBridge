@@ -852,8 +852,10 @@ MindBridge 对外只暴露少量稳定语义：
 | 获取记忆及其证据 | `get_memory(tenant_id, memory_id)` | `GET /v1/memories/{memory_id}` | `memory_get` |
 | 提交有用、错误、遗漏或纠正 | `record_feedback(request)` | `POST /v1/feedback` | `memory_feedback` |
 | 显式遗忘某段内容或范围 | `forget(request)` | `POST /v1/forget` | `memory_forget` |
+| 跟随一次 Observation 处理进度 | `watch_observation_job(...)` | `GET /v1/jobs/{job_id}/events` | 不提供 |
 
-HTTP、Python 和 MCP 共享同一层 use case，不各自复制业务逻辑。
+HTTP、Python 和 MCP 共享同一层 use case，不各自复制业务逻辑。进度流只出现在 REST 面：MCP Tool
+是请求/响应语义，在没有真实调用方要求前不为它发明一套流式约定。
 顶层 `remember` 与 `get_memory` 返回扁平的 `MemoryResult`：它保留 `MemoryView` 字段、请求
 `trace_id`，并直接附带短期签名的 `EvidenceView`；Recall 内嵌的记忆仍使用不重复 Trace 和 URL 的
 `MemoryView`。
@@ -927,6 +929,13 @@ HTTP、Python 和 MCP 共享同一层 use case，不各自复制业务逻辑。
 - 长任务立即返回 receipt/job ID，不占用同步请求；
 - Observation 处理状态通过 `GET /v1/jobs/{job_id}?tenant_id=...` 查询；成功状态原子携带本次
   生成的 `memory_ids`，调用方可直接 `get_memory` 获取证据完整的近期记忆，也可再发起 Recall；
+- 同一状态也可以通过 `GET /v1/jobs/{job_id}/events` 以 `text/event-stream` 跟随。每个 `job`
+  事件携带**完整**的 job view 而不是增量，因此断线重连只需要带上最后收到的 `Last-Event-ID`，
+  不需要服务端重放历史。事件 `id` 是 `updated_at` 的微秒整数——它是 job 行上唯一单调递增的值，
+  `state` 不是：过期 job 会被回收重跑。流在本次尝试落定（`succeeded`/`failed`）或服务端窗口
+  到期时结束；`failed` 之后仍可能有新尝试，所以它只表示"本次尝试已落定"，不表示终态。
+  两次读取之间的状态变化会合并，调用方总是看到较新的状态，但可能看不到每一个中间 `attempt`；
+  需要精确迁移历史时才升级为事件日志，届时本接口契约不变；
 - 所有列表使用 cursor 分页；
 - Recall 默认返回证据，不只返回自然语言答案；
 - `forget` 是幂等操作，并能查询端云传播状态；
@@ -1542,6 +1551,11 @@ observe receipt
 → evidence reinspection
 → answer/evidence
 ```
+
+对外的进度出口是 `GET /v1/jobs/{job_id}/events`：它把上述内部链路的可见结果收敛成一条可恢复的
+job 状态事件流，供前端和调用方在写入完成前就看到进展，而不需要轮询。它跟随的是 job 状态机，
+不是 Span；Trace 仍然是排查因果的主路径。整条流由 `mindbridge.watch_observation_job` 一个
+Span 覆盖，不为每次轮询各开一个 Span。
 
 运行时只读取标准 `OTEL_*` 环境变量；设置 common 或 signal-specific
 `OTEL_EXPORTER_OTLP_*_ENDPOINT` 才启用，否则保持 no-op。API、MCP、Worker、Edge Sync 和

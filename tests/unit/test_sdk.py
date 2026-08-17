@@ -14,7 +14,7 @@ from mindbridge.contracts import (
     RecallQuery,
     RecallRequest,
 )
-from mindbridge.core import FeedbackType, ForgetTargetType
+from mindbridge.core import FeedbackType, ForgetTargetType, JobState
 
 
 async def test_context_manager_closes_the_connection_pool() -> None:
@@ -270,6 +270,125 @@ async def test_forget_and_status_use_shared_contracts() -> None:
     assert forgotten.trace_id == "trace_forget"
     assert status.trace_id == "trace_status"
     assert page.items[0].tombstone_id == "tombstone_01"
+
+
+async def test_stream_observation_job_yields_each_state_with_a_resume_id() -> None:
+    async def respond(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/jobs/job_01/events"
+        assert request.url.params["tenant_id"] == "tenant_01"
+        assert request.headers["accept"] == "text/event-stream"
+        assert "last-event-id" not in request.headers
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=(
+                ": keepalive\n\n"
+                "id: 100\nevent: job\ndata: " + _job_payload("running", ()) + "\n\n"
+                "event: heartbeat\ndata: {}\n\n"
+                "id: 200\nevent: job\ndata: " + _job_payload("succeeded", ("memory_01",)) + "\n\n"
+            ).encode("utf-8"),
+        )
+
+    client = _client(respond)
+    try:
+        events = [event async for event in client.stream_observation_job("tenant_01", "job_01")]
+    finally:
+        await client.close()
+
+    assert [event.event_id for event in events] == ["100", "200"]
+    assert [event.job.state for event in events] == [JobState.RUNNING, JobState.SUCCEEDED]
+    assert events[-1].job.memory_ids == ("memory_01",)
+
+
+async def test_stream_observation_job_resumes_from_the_supplied_event_id() -> None:
+    async def respond(request: httpx.Request) -> httpx.Response:
+        assert request.headers["last-event-id"] == "100"
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=(
+                "id: 200\nevent: job\ndata: " + _job_payload("succeeded", ("memory_01",)) + "\n\n"
+            ).encode("utf-8"),
+        )
+
+    client = _client(respond)
+    try:
+        events = [
+            event
+            async for event in client.stream_observation_job(
+                "tenant_01",
+                "job_01",
+                last_event_id="100",
+            )
+        ]
+    finally:
+        await client.close()
+
+    assert [event.event_id for event in events] == ["200"]
+
+
+async def test_stream_observation_job_raises_a_typed_error_frame() -> None:
+    async def respond(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=(
+                b'event: error\ndata: {"code":"database_unavailable",'
+                b'"message":"memory storage is temporarily unavailable",'
+                b'"trace_id":"trace_stream","issues":[]}\n\n'
+            ),
+        )
+
+    client = _client(respond)
+    try:
+        with pytest.raises(MindBridgeError) as raised:
+            async for _event in client.stream_observation_job("tenant_01", "job_01"):
+                raise AssertionError("an error frame must not yield a job event")
+    finally:
+        await client.close()
+
+    assert raised.value.code == "database_unavailable"
+    assert raised.value.trace_id == "trace_stream"
+
+
+async def test_stream_observation_job_reports_a_rejected_request() -> None:
+    async def respond(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            404,
+            json={
+                "code": "job_not_found",
+                "message": "observation processing job does not exist",
+                "trace_id": "trace_missing",
+                "issues": [],
+            },
+        )
+
+    client = _client(respond)
+    try:
+        with pytest.raises(MindBridgeError) as raised:
+            async for _event in client.stream_observation_job("tenant_01", "missing"):
+                raise AssertionError("a rejected request must not yield a job event")
+    finally:
+        await client.close()
+
+    assert raised.value.code == "job_not_found"
+    assert raised.value.status_code == 404
+
+
+def _job_payload(state: str, memory_ids: tuple[str, ...]) -> str:
+    return json.dumps(
+        {
+            "job_id": "job_01",
+            "observation_id": "observation_01",
+            "state": state,
+            "attempt": 1,
+            "error_code": None,
+            "memory_ids": list(memory_ids),
+            "created_at": "2026-08-11T12:00:00Z",
+            "updated_at": "2026-08-11T12:00:01Z",
+            "trace_id": "trace_stream",
+        }
+    )
 
 
 def _client(
