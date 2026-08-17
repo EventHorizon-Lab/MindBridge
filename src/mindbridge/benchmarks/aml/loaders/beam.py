@@ -100,7 +100,13 @@ class _RawQuestion(BaseModel):
 
 def load(chat: Path, questions: Path) -> tuple[AmlCase, ...]:
     """Load one BEAM conversation's chat + probing questions into an AML case."""
-    conversation_id = chat.parent.name
+    # Conversation identity is `{size}:{conv_id}`, not `conv_id` alone: BEAM
+    # nests conversations under a size bucket
+    # (`.benchmarks/beam/chats/{100K,500K,1M,10M}/{conv_id}/`), and conv_id
+    # restarts from "1" in every bucket. Dropping the size segment collides
+    # unrelated conversations into one `user_id` -- the same MindBridge
+    # retrieval scope -- contaminating recall across sizes.
+    conversation_id = f"{chat.parent.parent.name}:{chat.parent.name}"
     batches = TypeAdapter(list[_RawBatch]).validate_json(chat.read_bytes())
     by_category = TypeAdapter(dict[str, list[_RawQuestion]]).validate_json(questions.read_bytes())
     case = AmlCase(

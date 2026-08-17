@@ -73,9 +73,13 @@ _QUESTIONS = {
 }
 
 
-def _write_fixture(tmp_path: Path, conv_name: str = "1") -> tuple[Path, Path]:
-    conv_dir = tmp_path / conv_name
-    conv_dir.mkdir()
+def _write_fixture(tmp_path: Path, size: str = "100K", conv_name: str = "1") -> tuple[Path, Path]:
+    # Real BEAM layout nests conversations two levels deep:
+    # `.benchmarks/beam/chats/{size}/{conv_id}/...` -- conv_id restarts from
+    # "1" in every size bucket, so fixtures must reproduce both levels or
+    # they can't catch a loader that only reads one of them.
+    conv_dir = tmp_path / size / conv_name
+    conv_dir.mkdir(parents=True)
     chat_path = conv_dir / "chat.json"
     chat_path.write_text(json.dumps(_CHAT))
 
@@ -88,12 +92,12 @@ def _write_fixture(tmp_path: Path, conv_name: str = "1") -> tuple[Path, Path]:
 
 
 def test_load_returns_one_case_named_after_the_conversation_directory(tmp_path: Path) -> None:
-    chat_path, questions_path = _write_fixture(tmp_path, conv_name="1")
+    chat_path, questions_path = _write_fixture(tmp_path, size="100K", conv_name="1")
     cases = load(chat_path, questions_path)
 
     assert len(cases) == 1
     [case] = cases
-    assert case.user_id == "beam:1"
+    assert case.user_id == "beam:100K:1"
 
 
 def test_load_flattens_batches_and_turn_pairs_of_any_length(tmp_path: Path) -> None:
@@ -169,19 +173,45 @@ def test_load_synthesizes_unique_nonempty_ids_across_categories(tmp_path: Path) 
 
 
 def test_load_scopes_a_second_conversation_independently(tmp_path: Path) -> None:
-    chat_path_1, questions_path_1 = _write_fixture(tmp_path, conv_name="1")
-    chat_path_2, questions_path_2 = _write_fixture(tmp_path, conv_name="2")
+    chat_path_1, questions_path_1 = _write_fixture(tmp_path, size="100K", conv_name="1")
+    chat_path_2, questions_path_2 = _write_fixture(tmp_path, size="100K", conv_name="2")
 
     [case_1] = load(chat_path_1, questions_path_1)
     [case_2] = load(chat_path_2, questions_path_2)
 
-    assert case_1.user_id == "beam:1"
-    assert case_2.user_id == "beam:2"
+    assert case_1.user_id == "beam:100K:1"
+    assert case_2.user_id == "beam:100K:2"
     # Same fixture content in both dirs -- ids must still not collide once a
     # driver mixes cases from multiple conversations into one answers file.
     ids_1 = {q.payload["id"] for q in case_1.questions}
     ids_2 = {q.payload["id"] for q in case_2.questions}
     assert ids_1.isdisjoint(ids_2)
+
+
+def test_load_scopes_conversations_with_the_same_name_across_size_buckets(
+    tmp_path: Path,
+) -> None:
+    # BEAM's real corpus restarts conversation directory names from "1" in
+    # every size bucket: `.benchmarks/beam/chats/{100K,500K,1M,10M}/1/` all
+    # exist simultaneously. A loader that only reads the conversation
+    # directory name (dropping the size bucket) would collide these into one
+    # `user_id` -- merging two unrelated conversations into the same
+    # MindBridge retrieval scope and contaminating recall for both.
+    chat_path_100k, questions_path_100k = _write_fixture(tmp_path, size="100K", conv_name="1")
+    chat_path_500k, questions_path_500k = _write_fixture(tmp_path, size="500K", conv_name="1")
+
+    [case_100k] = load(chat_path_100k, questions_path_100k)
+    [case_500k] = load(chat_path_500k, questions_path_500k)
+
+    assert case_100k.user_id != case_500k.user_id
+
+    ids_100k = {q.payload["id"] for q in case_100k.questions}
+    ids_500k = {q.payload["id"] for q in case_500k.questions}
+    assert ids_100k.isdisjoint(ids_500k)
+
+    question_ids_100k = {q.question_id for q in case_100k.questions}
+    question_ids_500k = {q.question_id for q in case_500k.questions}
+    assert question_ids_100k.isdisjoint(question_ids_500k)
 
 
 def test_load_raises_on_a_question_with_an_empty_rubric(tmp_path: Path) -> None:
