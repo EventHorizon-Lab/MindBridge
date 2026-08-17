@@ -941,6 +941,11 @@ client = AsyncOpenAI(api_key=api_key, base_url=base_url)
 字段中；应用管线看不到 SDK 类型。非兼容供应商使用其官方 SDK 实现同一个能力协议，不得复制
 Answer、Perception 或 Recall 流程。
 
+`GenerateResult.model_reference` 始终是部署配置固定的 `model_id/revision`。供应商返回的
+`system_fingerprint` 只作为 span 属性上报，不进入模型身份：Episode、Claim 与 Summary 的稳定 ID
+由该 `model_reference` 派生，会随请求变化的 fingerprint 会让同一次 sweep 的重试写出重复聚合，
+这与 §6.6 对端侧 ASD 证据键的要求是同一条规则。
+
 OpenAI Adapter 默认省略 `reasoning_effort`，确保非推理模型和不同 OpenAI-compatible 服务不会收到
 不支持的字段；需要时通过 Generator 插件配置显式提供。Benchmark 将这个已解析配置写入部署快照，
 不再平铺供应商专用 CLI 参数。模型 revision 变化时重跑对应 bake-off，不把某一供应商参数加入
@@ -1232,7 +1237,8 @@ src/mindbridge/
 ├── core/         # Event/Claim/Memory 领域模型与规则
 ├── infrastructure/ # PostgreSQL、S3、任务队列 Adapter
 ├── models/       # 供应商 Adapter、插件发现与 capability 公共导出
-└── edge/         # Jetson capture、identity、SQLite、outbox
+├── edge/         # Jetson capture、identity、SQLite、outbox
+└── benchmarks/   # 官方数据适配器、生产 API runner 与 run manifest CLI
 
 tests/
 ├── unit/
@@ -1241,6 +1247,12 @@ tests/
 ```
 
 这是逻辑边界，不要求每个目录立即存在。实现以首条端到端路径需要的最少文件开始。
+
+`benchmarks/` 是单向依赖的评测边界，不是产品运行时的一部分：它只通过公共 `AsyncMindBridge`
+契约和 `mindbridge.contracts` 调用系统，并拥有自己的 Prompt 目录。任何产品模块（`api`、
+`application`、`core`、`edge`、`infrastructure`、`models` 及包根）都不得 import
+`mindbridge.benchmarks`，该方向由 `tests/test_package.py` 的导入门禁强制执行。评测依赖收敛在
+`benchmarks` extra，不进入基础安装的运行路径。
 
 ### 12.3 扩展触发条件
 
@@ -1278,6 +1290,9 @@ tests/
 | M3-Bench | 机器人视角长期记忆、人类理解、常识提取和跨模态推理 | 在线记忆构建、实体中心图、迭代召回和原始媒体核验 |
 | Video-MME | 短、中、长视频的感知、时序、空间与跨模态选择题 | 分段 AV 证据、长程召回、官方四选一协议 |
 | EgoTempo | 第一视角动作前后、频率、顺序、速度与持续时间 | clip 内时间线、事件边界、开放式证据回答 |
+| EgoMemReason | 第一视角身份绑定的查询时刻推理与多选回答 | 查询时刻截断、身份实体、分层 Episode |
+| MEMLENS | 长上下文多模态对话记忆与不可答判定 | 逐 turn 显式记忆、图像证据、拒答边界 |
+| MM-Lifelong | 日/周/月尺度的长程事件定位与开放回答 | 全局时间轴、时间过滤、证据区间回溯 |
 
 ### 14.2 统一评测路径
 
@@ -1294,8 +1309,11 @@ tests/
 revision `0e3e41939bd8a0b66d756e7b7eb8d5fe9992da5c`、Video-MME 数据 revision
 `ead1408f75b618502df9a1d8e0950166bf0a2a0b`、EgoLife 数据 revision
 `143fb319be7aa5ae210c936bf4f0f3a86092afb0`、EgoTempo revision
-`7022ba77b4d89f51cf34e499767995ccd5c90c7a` 和 SuperMemory-VQA 数据 revision
-`1d228e0f10049a8a84c458dded2aa25b1e21ce8f`。适配器只转换推理所需字段；EgoLife 的
+`7022ba77b4d89f51cf34e499767995ccd5c90c7a`、SuperMemory-VQA 数据 revision
+`1d228e0f10049a8a84c458dded2aa25b1e21ce8f`、EgoMemReason revision
+`7e581505b9dce0e85193a27ae689ff899d0bc507`、MEMLENS revision
+`afa101a1907cc37db40b50d649547964387b96b7` 和 MM-Lifelong revision
+`248aa82039a574e63a2e524746a7cd8f32330443`。适配器只转换推理所需字段；EgoLife 的
 `target_time`、`keywords`、`reason` 与 SuperMemory 的 `answer_evidence` 不进入运行契约。
 媒体通过 Hugging Face Hub 官方客户端按 revision 获取，仓库不保存数据副本或自研下载器。
 `dataset-adapters-smoke.json` 记录源文件 SHA-256、适配器版本和完整样本计数；当前门禁还覆盖
@@ -1360,6 +1378,34 @@ Video-MME 与 EgoTempo 共用通用 `PreparedVideo`/`PreparedVideoSegment` 媒�
 `response` 结构；EgoTempo 按 `clip_id` 解析 Ego4D 源区间、每个 clip 只摄入一次，并输出官方
 `V/Q/QA/A/C/M` judge 输入。两者都只依赖 `AsyncMindBridge` 公共契约，新增模型提供商无需改动
 Benchmark；EgoTempo 的 Gemini judge 保持在固定 revision 的官方 notebook 中，不复制进产品代码。
+
+EgoMemReason runner 按官方 `DAYn, HH:MM:SS` 查询时刻截断记忆，只写入该时刻之前的片段，输出
+leaderboard 预测与检索诊断。MEMLENS runner 以 question 为隔离单元重放整段带日期的多模态对话，
+图像走 `observe`、文本 turn 走 `remember`；API 拒答被渲染为数据集要求的
+`Insufficient information`。MM-Lifelong runner 把 Day/Week/Month split 对齐到全局
+`total_intervals` 时间轴，输出官方 `pred{answer, intervals}` 供官方 evaluator 计算。
+
+#### 14.2.1 评测口径的强制披露
+
+三处口径会让"看起来更好"和"实际更好"分叉，因此每次运行必须同时给出配套数值，不得单独引用：
+
+- **LoCoMo abstention**：对抗题（category 5）的标准答案就是
+  `Not mentioned in the conversation`，与 API 拒答的渲染文本相同。因此每行结果携带
+  `mindbridge_abstained`，run manifest 记录 `abstained_question_count`；引用全题 F1 时必须同时
+  给出拒答率与 non-adversarial F1。
+- **Video-MME 分母**：官方 parser 丢弃解析不出选项字母的行，拒答与 API 失败恰好落在该桶。
+  `evaluate_video_mme` 因此同时返回 `accuracy`（官方口径）、`strict_accuracy`（全题分母）和
+  `error_count`，官方数字不得脱离后两者出现。
+- **仓内诊断指标**：`unofficial_reference_at_n` 是 MM-Lifelong 的桶化 Jaccard 估计，字段名为
+  `mindbridge_unofficial_ref_at_300`，不是官方 Ref@N。SuperMemory 的 Ans-F1/QA-Acc/QA-MRR 与
+  EgoLife/Video-MME 的准确率同样为仓内实现。对外声明必须由官方 evaluator 跑一遍导出的官方字段
+  产生，仓内数值只用于回归。
+
+Benchmark 的官方题面措辞属于评测输入，集中在 `mindbridge.benchmarks.prompts`，与产品
+Prompt 目录 `mindbridge.prompts` 严格分离：生产 observe/recall 路径不读取前者，contract 测试
+同时锁定两个目录的版本与 SHA-256。产品回答 Prompt 中与评测形状相关的规则（最短完整答案、
+选项标签保真、答案串不携带引用与 caveat）统一施加于全部查询，不按 Benchmark 分支，也不读取
+题目类别或答案；证据仍通过 `evidence[]` 独立返回。
 
 所有 runner 强制接收 `run_id`，并将其写入 tenant ID 与 sidecar manifest。每次运行使用新的
 `run_id`，从结构上阻断上一次完整摄入留下的未来记忆污染本次较早问题；输出还固定数据、prepared

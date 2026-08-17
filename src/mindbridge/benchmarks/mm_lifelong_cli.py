@@ -71,7 +71,7 @@ class MMLifelongRunManifest(ContractModel):
     segment_count: int = Field(gt=0)
     media_segment_count: int = Field(ge=0)
     caption_segment_count: int = Field(ge=0)
-    mean_ref_300: float = Field(ge=0.0, le=1.0)
+    mean_unofficial_ref_at_300: float = Field(ge=0.0, le=1.0)
     predictions_sha256: Sha256Hex
     completed_at: AwareDatetime
 
@@ -178,7 +178,9 @@ def _write_artifacts(
         segment_count=len(prepared.segments),
         media_segment_count=sum(bool(segment.media_objects) for segment in prepared.segments),
         caption_segment_count=sum(segment.caption is not None for segment in prepared.segments),
-        mean_ref_300=sum(result.ref_300 for result in results) / len(results),
+        mean_unofficial_ref_at_300=(
+            sum(result.mindbridge_unofficial_ref_at_300 for result in results) / len(results)
+        ),
         predictions_sha256=hashlib.sha256(predictions.encode("utf-8")).hexdigest(),
         completed_at=datetime.now(timezone.utc),
     )

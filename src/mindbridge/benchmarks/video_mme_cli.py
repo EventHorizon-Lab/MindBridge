@@ -22,6 +22,7 @@ from mindbridge.benchmarks.artifacts import (
     sidecar_manifest_path,
     write_text_atomically,
 )
+from mindbridge.benchmarks.prompts import VIDEO_MME_QUERY_PROMPT
 from mindbridge.benchmarks.runtime import PreparedVideo, load_prepared_videos
 from mindbridge.benchmarks.video_mme import (
     VIDEO_MME_ADAPTER_VERSION,
@@ -38,7 +39,6 @@ from mindbridge.models import EmbedTask
 from mindbridge.prompts import (
     ANSWER_FROM_EVIDENCE_PROMPT,
     PERCEIVE_EVENTS_PROMPT,
-    VIDEO_MME_QUERY_PROMPT,
 )
 from mindbridge.sdk import MindBridge
 

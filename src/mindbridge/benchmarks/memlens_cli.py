@@ -35,12 +35,12 @@ from mindbridge.benchmarks.memlens_runner import (
     run_memlens_question,
     validate_memlens_images,
 )
+from mindbridge.benchmarks.prompts import MEMLENS_QUERY_PROMPT
 from mindbridge.contracts import ContractModel, Identifier, NonEmptyString, Sha256Hex
 from mindbridge.file_integrity import sha256_file
 from mindbridge.models import EmbedTask
 from mindbridge.prompts import (
     ANSWER_FROM_EVIDENCE_PROMPT,
-    MEMLENS_QUERY_PROMPT,
     PERCEIVE_EVENTS_PROMPT,
 )
 from mindbridge.sdk import MindBridge

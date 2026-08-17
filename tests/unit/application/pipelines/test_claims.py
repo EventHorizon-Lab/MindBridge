@@ -77,7 +77,7 @@ async def test_claim_consolidator_inspects_native_evidence_and_preserves_revisio
         ClaimId("claim_02"),
     )
     assert result.relationships[0].relation_type is RelationType.CONTRADICTS
-    assert result.model_reference.revision == "claim-serving-revision-01"
+    assert result.model_reference.revision == "deployment-revision"
     assert result.prompt_version == "consolidate_claims_v2"
 
 

@@ -14,13 +14,19 @@ from psycopg import AsyncConnection
 from mindbridge.infrastructure.postgres import PostgresMemoryStore
 
 DATABASE_URL = os.getenv("MINDBRIDGE_TEST_DATABASE_URL")
+REQUIRE_INTEGRATION = os.getenv("MINDBRIDGE_REQUIRE_INTEGRATION") == "1"
 
 
 @pytest_asyncio.fixture(scope="session", loop_scope="session")
 async def database_url() -> AsyncIterator[str]:
     """Rebuild only an explicitly named disposable test database."""
     if DATABASE_URL is None:
-        pytest.skip("MINDBRIDGE_TEST_DATABASE_URL is not configured")
+        # A laptop may skip Golden Recall and the PostgreSQL contracts; CI must not report a
+        # green run that never exercised the production store.
+        message = "MINDBRIDGE_TEST_DATABASE_URL is not configured"
+        if REQUIRE_INTEGRATION:
+            raise RuntimeError(f"{message} while MINDBRIDGE_REQUIRE_INTEGRATION=1")
+        pytest.skip(message)
     connection = await AsyncConnection.connect(DATABASE_URL, autocommit=True)
     async with connection:
         row = await (await connection.execute("SELECT current_database()")).fetchone()

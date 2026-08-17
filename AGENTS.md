@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-MindBridge is a Python package under `src/mindbridge/`. Keep domain types in `core/`, use cases and ports in `application/`, external adapters in `infrastructure/` and `models/`, protocol entry points in `api/`, and Jetson/robot code in `edge/`. Tests live in `tests/unit/`, `tests/contracts/`, and `tests/integration/`; deterministic benchmark fixtures live in `tests/benchmarks/`. Numbered PostgreSQL migrations are in `migrations/`, reproducibility manifests are in `benchmarks/manifests/`, and architecture documentation is in `docs/`. Keep root files limited to project-wide documentation, dependency, deployment, and tooling configuration.
+MindBridge is a Python package under `src/mindbridge/`. Keep domain types in `core/`, use cases and ports in `application/`, external adapters in `infrastructure/` and `models/`, protocol entry points in `api/`, Jetson/robot code in `edge/`, and official dataset adapters plus their runners in `benchmarks/`. `benchmarks/` may only call the public SDK and contracts; no product module may import it. Tests live in `tests/unit/`, `tests/contracts/`, and `tests/integration/`; deterministic benchmark fixtures live in `tests/benchmarks/`. Numbered PostgreSQL migrations are in `migrations/`, reproducibility manifests are in `benchmarks/manifests/`, and architecture documentation is in `docs/`. Keep root files limited to project-wide documentation, dependency, deployment, and tooling configuration.
 
 ## Build, Test, and Development Commands
 
@@ -32,7 +32,7 @@ Use UTF-8 text, LF line endings, and a trailing newline. Write Markdown with sho
 
 ## Testing Guidelines
 
-Tests use pytest with pytest-asyncio. New behavior should include the smallest test that fails when the behavior regresses: unit tests for local logic, contract tests for public schemas, and integration tests for PostgreSQL/pgvector paths. Mark database-dependent tests with `pytest.mark.integration`; configure their disposable database as documented in `README.md`. `tests/benchmarks/golden_recall.json` is the deterministic production-path recall gate. There is no numeric coverage threshold, but all required quality gates above must pass. Documentation changes should also be checked for accurate commands, valid relative links, and readable rendered Markdown.
+Tests use pytest with pytest-asyncio. New behavior should include the smallest test that fails when the behavior regresses: unit tests for local logic, contract tests for public schemas, and integration tests for PostgreSQL/pgvector paths. Mark database-dependent tests with `pytest.mark.integration`; configure their disposable database as documented in `README.md`. `tests/benchmarks/golden_recall.json` is the deterministic production-path recall gate. It only runs with `MINDBRIDGE_TEST_DATABASE_URL` configured, so any change to recall, consolidation, or deletion must be validated with `MINDBRIDGE_REQUIRE_INTEGRATION=1 uv run pytest -W error`, which turns a missing database into a failure instead of a skip. There is no numeric coverage threshold, but all required quality gates above must pass. Documentation changes should also be checked for accurate commands, valid relative links, and readable rendered Markdown.
 
 ## Commit & Pull Request Guidelines
 

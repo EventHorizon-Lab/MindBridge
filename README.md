@@ -52,6 +52,16 @@ docker run --rm -v "$PWD:/input:ro" -w /input lycheeverse/lychee:0.23.0 \
 evidence recall, exact text recall, temporal exclusion, and unsupported-query abstention through
 the production kernel and PostgreSQL/pgvector path; the normal integration test command runs it.
 
+Without `MINDBRIDGE_TEST_DATABASE_URL` the whole integration suite — Golden Recall included —
+skips, so a green run may never have touched the production store. CI and any change that affects
+recall, consolidation, or deletion must therefore require it explicitly:
+
+```bash
+MINDBRIDGE_REQUIRE_INTEGRATION=1 uv run pytest -W error
+```
+
+With that variable set, a missing test database fails the run instead of skipping it.
+
 ## Local PostgreSQL
 
 The production store uses PostgreSQL 18 with pgvector 0.8+; filtered HNSW recall relies on iterative
