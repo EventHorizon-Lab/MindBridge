@@ -4,22 +4,24 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import hashlib
 import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal, cast
 
-from pydantic import AwareDatetime, Field
+from pydantic import Field
 
 from mindbridge.benchmarks.artifacts import (
-    DeploymentSnapshot,
     LoadedDeployment,
+    MediaArguments,
+    MediaRunManifestBase,
     load_deployment_snapshot,
+    media_benchmark_parser,
     require_writable_output_pair,
-    sidecar_manifest_path,
-    write_text_atomically,
+    select_by_id,
+    sha256_text,
+    write_run_artifacts,
 )
 from mindbridge.benchmarks.m3_bench import M3_BENCH_ADAPTER_VERSION, M3BenchVideo, load_m3_bench
 from mindbridge.benchmarks.m3_runner import (
@@ -29,7 +31,7 @@ from mindbridge.benchmarks.m3_runner import (
     load_prepared_m3,
     run_m3_video,
 )
-from mindbridge.contracts import ContractModel, Identifier, NonEmptyString, Sha256Hex
+from mindbridge.contracts import Identifier, NonEmptyString, Sha256Hex
 from mindbridge.file_integrity import sha256_file
 from mindbridge.models import EmbedTask
 from mindbridge.prompts import ANSWER_FROM_EVIDENCE_PROMPT, PERCEIVE_EVENTS_PROMPT
@@ -38,70 +40,43 @@ from mindbridge.sdk import MindBridge
 M3_RUNNER_VERSION = "m3_production_api_v9"
 
 
-class M3RunManifest(ContractModel):
+class M3RunManifest(MediaRunManifestBase):
     """Immutable data, deployment, code, and output identity for one M3 run."""
 
     benchmark: Literal["M3-Bench"] = "M3-Bench"
+    perception_prompt_version: NonEmptyString
     subset: Literal["robot", "web"]
-    runner_version: NonEmptyString
-    adapter_version: NonEmptyString
     source_repository: NonEmptyString
     source_revision: NonEmptyString
-    annotation_sha256: Sha256Hex
     media_repository: NonEmptyString
     media_revision: NonEmptyString
     prepared_media_manifest_sha256: Sha256Hex
-    code_revision: NonEmptyString
-    deployment: DeploymentSnapshot
-    deployment_sha256: Sha256Hex
-    perception_prompt_version: NonEmptyString
-    answer_prompt_version: NonEmptyString
-    retrieval_task: NonEmptyString
-    run_id: Identifier
-    tenant_prefix: Identifier
-    device_id: Identifier
     clip_duration_seconds: int = Field(gt=0)
-    recall_limit: int = Field(gt=0, le=100)
-    request_concurrency: int = Field(gt=0)
-    request_timeout_seconds: float = Field(gt=0)
-    poll_interval_seconds: float = Field(gt=0)
-    processing_timeout_seconds: float = Field(gt=0)
     video_ids: tuple[Identifier, ...] = Field(min_length=1)
     clip_count: int = Field(gt=0)
     media_clip_count: int = Field(ge=0)
     caption_clip_count: int = Field(ge=0)
     question_count: int = Field(gt=0)
-    predictions_sha256: Sha256Hex
-    completed_at: AwareDatetime
 
 
 @dataclass(frozen=True, slots=True)
-class _Arguments:
-    dataset_path: Path
+class _Arguments(MediaArguments):
     prepared_media_path: Path
-    output_path: Path
-    api_base_url: str
     subset: Literal["robot", "web"]
     source_revision: str
     media_revision: str
-    code_revision: str
-    deployment_config_path: Path
-    run_id: str
-    tenant_prefix: str
-    device_id: str
-    recall_limit: int
-    request_concurrency: int
-    request_timeout_seconds: float
-    poll_interval_seconds: float
-    processing_timeout_seconds: float
     video_ids: tuple[str, ...]
-    overwrite: bool
 
 
 def main() -> None:
     """Run selected official videos and emit JSONL predictions plus a manifest."""
     arguments = _parse_arguments()
-    videos = _select_videos(load_m3_bench(arguments.dataset_path), arguments.video_ids)
+    videos = select_by_id(
+        load_m3_bench(arguments.dataset_path),
+        arguments.video_ids,
+        key=lambda video: video.video_id,
+        label="M3-Bench video IDs",
+    )
     _validate_subset(videos, arguments.subset)
     prepared = _prepared_by_video(videos, load_prepared_m3(arguments.prepared_media_path))
     require_writable_output_pair(arguments.output_path, overwrite=arguments.overwrite)
@@ -195,30 +170,10 @@ def _write_artifacts(
             clip.caption is not None for video in videos for clip in prepared[video.video_id].clips
         ),
         question_count=sum(len(video.questions) for video in videos),
-        predictions_sha256=hashlib.sha256(predictions.encode("utf-8")).hexdigest(),
+        predictions_sha256=sha256_text(predictions),
         completed_at=datetime.now(timezone.utc),
     )
-    write_text_atomically(arguments.output_path, predictions)
-    write_text_atomically(
-        sidecar_manifest_path(arguments.output_path),
-        manifest.model_dump_json(indent=2) + "\n",
-    )
-
-
-def _select_videos(
-    videos: tuple[M3BenchVideo, ...],
-    video_ids: tuple[str, ...],
-) -> tuple[M3BenchVideo, ...]:
-    if not video_ids:
-        return videos
-    if len(set(video_ids)) != len(video_ids):
-        raise ValueError("video IDs must not contain duplicates")
-    requested = set(video_ids)
-    selected = tuple(video for video in videos if video.video_id in requested)
-    missing = requested - {video.video_id for video in selected}
-    if missing:
-        raise ValueError(f"unknown M3-Bench video IDs: {', '.join(sorted(missing))}")
-    return selected
+    write_run_artifacts(arguments.output_path, predictions, manifest)
 
 
 def _prepared_by_video(
@@ -244,26 +199,14 @@ def _validate_subset(videos: tuple[M3BenchVideo, ...], subset: Literal["robot", 
 
 
 def _parse_arguments() -> _Arguments:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", type=Path, required=True)
+    parser = argparse.ArgumentParser(
+        parents=[media_benchmark_parser(tenant_prefix="benchmark_m3", device_id="m3_bench_camera")]
+    )
     parser.add_argument("--prepared-media", type=Path, required=True)
-    parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--api-base-url", required=True)
     parser.add_argument("--subset", choices=("robot", "web"), required=True)
     parser.add_argument("--source-revision", required=True)
     parser.add_argument("--media-revision", required=True)
-    parser.add_argument("--code-revision", required=True)
-    parser.add_argument("--deployment-config", type=Path, required=True)
-    parser.add_argument("--run-id", required=True)
-    parser.add_argument("--tenant-prefix", default="benchmark_m3")
-    parser.add_argument("--device-id", default="m3_bench_camera")
-    parser.add_argument("--recall-limit", type=int, default=20)
-    parser.add_argument("--request-concurrency", type=int, default=4)
-    parser.add_argument("--request-timeout-seconds", type=float, default=1_800.0)
-    parser.add_argument("--poll-interval-seconds", type=float, default=1.0)
-    parser.add_argument("--processing-timeout-seconds", type=float, default=1_800.0)
     parser.add_argument("--video-id", action="append", default=[])
-    parser.add_argument("--overwrite", action="store_true")
     parsed = parser.parse_args()
     return _Arguments(
         dataset_path=parsed.dataset,

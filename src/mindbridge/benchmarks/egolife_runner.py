@@ -101,6 +101,7 @@ class EgoLifeQuestionResult(ContractModel):
     """One official answer plus production retrieval diagnostics."""
 
     id: Identifier
+    subject_id: Identifier
     question: NonEmptyString
     answer: EgoLifeOption
     model_option: EgoLifeOption | None
@@ -114,12 +115,27 @@ class EgoLifeQuestionResult(ContractModel):
     mindbridge_trace_id: Identifier
 
 
+class EgoLifeCategoryMetrics(ContractModel):
+    """Exact-choice accuracy for one of the five official question types."""
+
+    question_type: NonEmptyString
+    question_count: int = Field(gt=0)
+    correct_count: int = Field(ge=0)
+    accuracy: float = Field(ge=0.0, le=1.0)
+
+
 class EgoLifeMetrics(ContractModel):
-    """Official exact-choice accuracy for one EgoLifeQA run."""
+    """Official exact-choice accuracy for one EgoLifeQA run.
+
+    `accuracy` is the question-weighted figure published as a method's EgoLifeQA average, so it
+    is only comparable once every wearer's questions are pooled into a single run. `categories`
+    carries the five-column breakdown papers print beside that average.
+    """
 
     question_count: int = Field(gt=0)
     correct_count: int = Field(ge=0)
     accuracy: float = Field(ge=0.0, le=1.0)
+    categories: tuple[EgoLifeCategoryMetrics, ...] = Field(min_length=1)
 
 
 class EgoMemReasonResult(ContractModel):
@@ -166,10 +182,22 @@ def evaluate_egolife_qa(results: tuple[EgoLifeQuestionResult, ...]) -> EgoLifeMe
     if len({result.id for result in results}) != len(results):
         raise ValueError("EgoLifeQA results must have unique IDs")
     correct = sum(result.model_option == result.answer for result in results)
+    by_type: dict[str, list[EgoLifeQuestionResult]] = {}
+    for result in results:
+        by_type.setdefault(result.question_type, []).append(result)
     return EgoLifeMetrics(
         question_count=len(results),
         correct_count=correct,
         accuracy=correct / len(results),
+        categories=tuple(
+            EgoLifeCategoryMetrics(
+                question_type=question_type,
+                question_count=len(group),
+                correct_count=sum(item.model_option == item.answer for item in group),
+                accuracy=sum(item.model_option == item.answer for item in group) / len(group),
+            )
+            for question_type, group in sorted(by_type.items())
+        ),
     )
 
 
@@ -226,7 +254,15 @@ async def run_egolife_qa(
         cutoff = prepared.timeline_origin + timedelta(milliseconds=query_offset_ms)
         results = await asyncio.gather(
             *(
-                _answer_question(memory, tenant_id, question, cutoff, recall_limit, semaphore)
+                _answer_question(
+                    memory,
+                    tenant_id,
+                    prepared.subject_id,
+                    question,
+                    cutoff,
+                    recall_limit,
+                    semaphore,
+                )
                 for question in group
             )
         )
@@ -367,6 +403,7 @@ async def _ingest_clip(
 async def _answer_question(
     memory: MindBridge,
     tenant_id: str,
+    subject_id: str,
     question: EgoLifeQuestion,
     cutoff: AwareDatetime,
     recall_limit: int,
@@ -387,6 +424,7 @@ async def _answer_question(
     model_option = cast(EgoLifeOption, OPTION_LABELS[ranking[0]]) if ranking else None
     return EgoLifeQuestionResult(
         id=question.question_id,
+        subject_id=subject_id,
         question=question.question,
         answer=question.correct_option,
         model_option=model_option,

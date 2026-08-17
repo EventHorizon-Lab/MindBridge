@@ -6,13 +6,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
+from benchmark_deployment import SERVER_GENERATOR_REVISION, write_deployment_snapshot
 
 import mindbridge.benchmarks.egolife_cli as egolife_cli
-from mindbridge.benchmarks.artifacts import load_deployment_snapshot
+from mindbridge.benchmarks.artifacts import load_deployment_snapshot, select_by_id
 from mindbridge.benchmarks.egolife_cli import (
     EgoLifeRunManifest,
     _Arguments,
-    _select_questions,
     _write_artifacts,
 )
 from mindbridge.benchmarks.egolife_qa import EgoLifeQuestion
@@ -31,12 +31,14 @@ def test_egolife_validates_deployment_before_inference(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    deployment_path = tmp_path / "deployment.json"
+    deployment_path.write_text("{}", encoding="utf-8")
     arguments = _arguments(
         tmp_path / "qa.json",
         tmp_path / "prepared.json",
         tmp_path / "predictions.json",
+        deployment_path,
     )
-    arguments.deployment_config_path.write_text("{}", encoding="utf-8")
     monkeypatch.setattr(egolife_cli, "_parse_arguments", lambda: arguments)
     monkeypatch.setattr(egolife_cli, "load_egolife_qa", lambda _path: (_question(),))
     monkeypatch.setattr(egolife_cli, "load_prepared_egolife", lambda _path: _prepared())
@@ -60,7 +62,9 @@ def test_egolife_artifacts_pin_inputs_models_metrics_and_output(tmp_path: Path) 
     prepared = _prepared()
     result = _result()
 
-    arguments = _arguments(dataset_path, prepared_path, output_path)
+    arguments = _arguments(
+        dataset_path, prepared_path, output_path, write_deployment_snapshot(tmp_path)
+    )
     _write_artifacts(
         arguments,
         (question,),
@@ -77,7 +81,9 @@ def test_egolife_artifacts_pin_inputs_models_metrics_and_output(tmp_path: Path) 
     assert predictions["results"][0]["model_option"] == "B"
     assert manifest.dataset_revision == "dataset-revision"
     assert manifest.evaluator_revision == "evaluator-revision"
-    assert manifest.deployment.server_generator.config["model_revision"] == ("answer-fingerprint")
+    assert manifest.deployment.server_generator.config["model_revision"] == (
+        SERVER_GENERATOR_REVISION
+    )
     assert manifest.request_timeout_seconds == 1_800.0
     assert manifest.run_id == "run_01"
     assert manifest.metrics.correct_count == 1
@@ -88,14 +94,16 @@ def test_egolife_artifacts_pin_inputs_models_metrics_and_output(tmp_path: Path) 
 
 def test_egolife_selection_rejects_unknown_question() -> None:
     question = _question()
-    assert _select_questions((question,), ("1",)) == (question,)
+    assert select_by_id((question,), ("1",), key=lambda item: item.question_id, label="ids") == (
+        question,
+    )
     with pytest.raises(ValueError, match="unknown"):
-        _select_questions((question,), ("missing",))
+        select_by_id((question,), ("missing",), key=lambda item: item.question_id, label="ids")
 
 
-def _arguments(dataset_path: Path, prepared_path: Path, output_path: Path) -> _Arguments:
-    deployment_path = dataset_path.parent / "deployment.json"
-    _write_deployment(deployment_path)
+def _arguments(
+    dataset_path: Path, prepared_path: Path, output_path: Path, deployment_path: Path
+) -> _Arguments:
     return _Arguments(
         dataset_path=dataset_path,
         prepared_media_path=prepared_path,
@@ -115,46 +123,6 @@ def _arguments(dataset_path: Path, prepared_path: Path, output_path: Path) -> _A
         processing_timeout_seconds=1_800.0,
         question_ids=(),
         overwrite=False,
-    )
-
-
-def _write_deployment(path: Path) -> None:
-    path.write_text(
-        json.dumps(
-            {
-                "server_generator": {
-                    "plugin": "openai",
-                    "distribution": "mindbridge",
-                    "version": "0.1.0",
-                    "config": {"model_revision": "answer-fingerprint"},
-                },
-                "server_embedder": {
-                    "plugin": "openai",
-                    "distribution": "mindbridge",
-                    "version": "0.1.0",
-                    "config": {},
-                },
-                "worker_generator": {
-                    "plugin": "openai",
-                    "distribution": "mindbridge",
-                    "version": "0.1.0",
-                    "config": {"model_revision": "perception-fingerprint"},
-                },
-                "worker_media_embedder": {
-                    "plugin": "jina",
-                    "distribution": "mindbridge",
-                    "version": "0.1.0",
-                    "config": {},
-                },
-                "worker_text_embedder": {
-                    "plugin": "openai",
-                    "distribution": "mindbridge",
-                    "version": "0.1.0",
-                    "config": {},
-                },
-            }
-        ),
-        encoding="utf-8",
     )
 
 
@@ -199,6 +167,7 @@ def _prepared() -> EgoLifePreparedStream:
 def _result() -> EgoLifeQuestionResult:
     return EgoLifeQuestionResult(
         id="1",
+        subject_id="A1_JAKE",
         question="Who used it?",
         answer="B",
         model_option="B",

@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
+from benchmark_deployment import write_deployment_snapshot
 
 from mindbridge.benchmarks.artifacts import load_deployment_snapshot
 from mindbridge.benchmarks.supermemory_cli import (
@@ -37,7 +38,9 @@ def test_supermemory_artifacts_pin_inputs_models_metrics_and_output(tmp_path: Pa
     prepared = _prepared()
     result = _result(1)
 
-    arguments = _arguments(dataset_path, prepared_path, output_path)
+    arguments = _arguments(
+        dataset_path, prepared_path, output_path, write_deployment_snapshot(tmp_path)
+    )
     _write_artifacts(
         arguments,
         (question,),
@@ -68,9 +71,9 @@ def test_supermemory_selection_is_subject_scoped_and_fail_closed() -> None:
         _select_questions(questions, 1, (2,))
 
 
-def _arguments(dataset_path: Path, prepared_path: Path, output_path: Path) -> _Arguments:
-    deployment_path = dataset_path.parent / "deployment.json"
-    _write_deployment(deployment_path)
+def _arguments(
+    dataset_path: Path, prepared_path: Path, output_path: Path, deployment_path: Path
+) -> _Arguments:
     return _Arguments(
         dataset_path=dataset_path,
         prepared_media_path=prepared_path,
@@ -91,46 +94,6 @@ def _arguments(dataset_path: Path, prepared_path: Path, output_path: Path) -> _A
         processing_timeout_seconds=1_800.0,
         question_ids=(),
         overwrite=False,
-    )
-
-
-def _write_deployment(path: Path) -> None:
-    path.write_text(
-        json.dumps(
-            {
-                "server_generator": {
-                    "plugin": "openai",
-                    "distribution": "mindbridge",
-                    "version": "0.1.0",
-                    "config": {"model_revision": "answer-fingerprint"},
-                },
-                "server_embedder": {
-                    "plugin": "openai",
-                    "distribution": "mindbridge",
-                    "version": "0.1.0",
-                    "config": {},
-                },
-                "worker_generator": {
-                    "plugin": "openai",
-                    "distribution": "mindbridge",
-                    "version": "0.1.0",
-                    "config": {"model_revision": "perception-fingerprint"},
-                },
-                "worker_media_embedder": {
-                    "plugin": "jina",
-                    "distribution": "mindbridge",
-                    "version": "0.1.0",
-                    "config": {},
-                },
-                "worker_text_embedder": {
-                    "plugin": "openai",
-                    "distribution": "mindbridge",
-                    "version": "0.1.0",
-                    "config": {},
-                },
-            }
-        ),
-        encoding="utf-8",
     )
 
 

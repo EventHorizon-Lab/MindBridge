@@ -119,6 +119,10 @@ class VideoMMEMetrics(ContractModel):
     contain an option letter. Abstentions and API failures land in exactly that bucket, so
     `strict_accuracy` and `error_count` are reported alongside it: a run may not quote the
     official number without the count of questions it never answered.
+
+    `by_duration` carries the short/medium/long cells the leaderboard reports separately. The
+    overall number on this benchmark is saturated, so the long cell is the one a memory system
+    is actually judged on.
     """
 
     question_count: int = Field(gt=0)
@@ -127,6 +131,7 @@ class VideoMMEMetrics(ContractModel):
     error_count: int = Field(ge=0)
     accuracy: float = Field(ge=0.0, le=1.0)
     strict_accuracy: float = Field(ge=0.0, le=1.0)
+    by_duration: dict[VideoMMEDuration, VideoMMEMetrics] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def require_consistent_counts(self) -> VideoMMEMetrics:
@@ -134,6 +139,13 @@ class VideoMMEMetrics(ContractModel):
             raise ValueError("Video-MME metric counts are inconsistent")
         if self.error_count > self.question_count - self.answered_count:
             raise ValueError("Video-MME failed questions must not carry a parsed answer")
+        if any(cell.by_duration for cell in self.by_duration.values()):
+            raise ValueError("Video-MME duration cells must not nest further")
+        if sum(cell.question_count for cell in self.by_duration.values()) not in {
+            0,
+            self.question_count,
+        }:
+            raise ValueError("Video-MME duration cells must cover every scored question")
         return self
 
 
@@ -243,7 +255,28 @@ async def run_video_mme_video(
 
 
 def evaluate_video_mme(results: tuple[VideoMMEVideoResult, ...]) -> VideoMMEMetrics:
-    """Compute the official accuracy together with its unanswered and failed counts."""
+    """Compute the official accuracy, its unanswered counts, and the duration cells."""
+    if not results:
+        raise ValueError("Video-MME results must not be empty")
+    grouped: dict[VideoMMEDuration, list[VideoMMEVideoResult]] = {}
+    for video in results:
+        grouped.setdefault(video.duration, []).append(video)
+    # Built through the constructor, not `model_copy(update=...)`: the latter skips validators,
+    # which would leave `require_consistent_counts` unenforced on the only object that ever
+    # carries duration cells, and a manifest could then be written that cannot be read back.
+    return _duration_metrics(
+        results,
+        by_duration={
+            duration: _duration_metrics(tuple(group)) for duration, group in sorted(grouped.items())
+        },
+    )
+
+
+def _duration_metrics(
+    results: tuple[VideoMMEVideoResult, ...],
+    *,
+    by_duration: dict[VideoMMEDuration, VideoMMEMetrics] | None = None,
+) -> VideoMMEMetrics:
     questions = tuple(question for video in results for question in video.questions)
     if not questions:
         raise ValueError("Video-MME results must not be empty")
@@ -256,6 +289,7 @@ def evaluate_video_mme(results: tuple[VideoMMEVideoResult, ...]) -> VideoMMEMetr
         error_count=sum(question.mindbridge_error_code is not None for question in questions),
         accuracy=correct_count / len(answered) if answered else 0.0,
         strict_accuracy=correct_count / len(questions),
+        by_duration=by_duration or {},
     )
 
 

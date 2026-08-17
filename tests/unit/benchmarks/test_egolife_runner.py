@@ -351,11 +351,63 @@ def _result(
 ) -> EgoLifeQuestionResult:
     return EgoLifeQuestionResult(
         id=question_id,
+        subject_id="A1_JAKE",
         question="Who used it?",
         answer=cast(EgoLifeOption, answer),
         model_option=cast(EgoLifeOption | None, prediction),
         model_answer=prediction or "",
         question_type="EntityLog",
+        query_day=1,
+        query_timecode="10001500",
+        mindbridge_confidence=0.8,
+        mindbridge_memory_ids=(),
+        mindbridge_evidence_ids=(),
+        mindbridge_trace_id=f"trace_{question_id}",
+    )
+
+
+def test_metrics_break_out_the_five_official_question_types() -> None:
+    metrics = evaluate_egolife_qa(
+        (
+            _typed_result("q_1", "EntityLog", correct=True),
+            _typed_result("q_2", "EntityLog", correct=False),
+            _typed_result("q_3", "RelationMap", correct=True),
+        )
+    )
+
+    assert metrics.question_count == 3
+    assert metrics.accuracy == pytest.approx(2 / 3)
+    by_type = {category.question_type: category for category in metrics.categories}
+    assert by_type["EntityLog"].question_count == 2
+    assert by_type["EntityLog"].accuracy == pytest.approx(0.5)
+    assert by_type["RelationMap"].accuracy == pytest.approx(1.0)
+
+
+def test_category_order_is_stable_so_two_runs_compare_line_by_line() -> None:
+    metrics = evaluate_egolife_qa(
+        (
+            _typed_result("q_1", "TaskMaster", correct=True),
+            _typed_result("q_2", "EntityLog", correct=True),
+            _typed_result("q_3", "HabitInsight", correct=False),
+        )
+    )
+
+    assert tuple(category.question_type for category in metrics.categories) == (
+        "EntityLog",
+        "HabitInsight",
+        "TaskMaster",
+    )
+
+
+def _typed_result(question_id: str, question_type: str, *, correct: bool) -> EgoLifeQuestionResult:
+    return EgoLifeQuestionResult(
+        id=question_id,
+        subject_id="A1_JAKE",
+        question="Who used it?",
+        answer="B",
+        model_option="B" if correct else "C",
+        model_answer="B" if correct else "C",
+        question_type=question_type,
         query_day=1,
         query_timecode="10001500",
         mindbridge_confidence=0.8,

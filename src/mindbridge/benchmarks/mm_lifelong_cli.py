@@ -4,22 +4,24 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import hashlib
 import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal, cast
 
-from pydantic import AwareDatetime, Field
+from pydantic import Field
 
 from mindbridge.benchmarks.artifacts import (
-    DeploymentSnapshot,
     LoadedDeployment,
+    MediaArguments,
+    MediaRunManifestBase,
     load_deployment_snapshot,
+    media_benchmark_parser,
     require_writable_output_pair,
-    sidecar_manifest_path,
-    write_text_atomically,
+    select_by_id,
+    sha256_text,
+    write_run_artifacts,
 )
 from mindbridge.benchmarks.mm_lifelong import (
     MM_LIFELONG_ADAPTER_VERSION,
@@ -33,7 +35,7 @@ from mindbridge.benchmarks.mm_lifelong_runner import (
     load_prepared_mm_lifelong,
     run_mm_lifelong,
 )
-from mindbridge.contracts import ContractModel, Identifier, NonEmptyString, Sha256Hex
+from mindbridge.contracts import NonEmptyString, Sha256Hex
 from mindbridge.file_integrity import sha256_file
 from mindbridge.models import EmbedTask
 from mindbridge.prompts import ANSWER_FROM_EVIDENCE_PROMPT, PERCEIVE_EVENTS_PROMPT
@@ -42,68 +44,38 @@ from mindbridge.sdk import MindBridge
 MM_LIFELONG_RUNNER_VERSION = "mm_lifelong_production_api_v2"
 
 
-class MMLifelongRunManifest(ContractModel):
+class MMLifelongRunManifest(MediaRunManifestBase):
     """Immutable data, media, deployment, model, and output identity for one run."""
 
     benchmark: Literal["MM-Lifelong"] = "MM-Lifelong"
+    perception_prompt_version: NonEmptyString
     split: MMLifelongSplit
-    runner_version: NonEmptyString
-    adapter_version: NonEmptyString
     source_repository: NonEmptyString
     source_revision: NonEmptyString
-    annotation_sha256: Sha256Hex
     prepared_media_manifest_sha256: Sha256Hex
-    code_revision: NonEmptyString
-    deployment: DeploymentSnapshot
-    deployment_sha256: Sha256Hex
-    perception_prompt_version: NonEmptyString
-    answer_prompt_version: NonEmptyString
-    retrieval_task: NonEmptyString
-    run_id: Identifier
-    tenant_prefix: Identifier
-    device_id: Identifier
-    recall_limit: int = Field(gt=0, le=100)
-    request_concurrency: int = Field(gt=0)
-    request_timeout_seconds: float = Field(gt=0)
-    poll_interval_seconds: float = Field(gt=0)
-    processing_timeout_seconds: float = Field(gt=0)
     question_indices: tuple[int, ...] = Field(min_length=1)
     segment_count: int = Field(gt=0)
     media_segment_count: int = Field(ge=0)
     caption_segment_count: int = Field(ge=0)
     mean_unofficial_ref_at_300: float = Field(ge=0.0, le=1.0)
-    predictions_sha256: Sha256Hex
-    completed_at: AwareDatetime
 
 
 @dataclass(frozen=True, slots=True)
-class _Arguments:
-    dataset_path: Path
+class _Arguments(MediaArguments):
     prepared_media_path: Path
-    output_path: Path
-    api_base_url: str
     split: MMLifelongSplit
     source_revision: str
-    code_revision: str
-    deployment_config_path: Path
-    run_id: str
-    tenant_prefix: str
-    device_id: str
-    recall_limit: int
-    request_concurrency: int
-    request_timeout_seconds: float
-    poll_interval_seconds: float
-    processing_timeout_seconds: float
     question_indices: tuple[int, ...]
-    overwrite: bool
 
 
 def main() -> None:
     """Run one official split and emit JSONL accepted by its released evaluators."""
     arguments = _parse_arguments()
-    questions = _select_questions(
+    questions = select_by_id(
         load_mm_lifelong(arguments.dataset_path, arguments.split),
         arguments.question_indices,
+        key=lambda question: question.index,
+        label="MM-Lifelong question indices",
     )
     prepared = load_prepared_mm_lifelong(arguments.prepared_media_path)
     require_writable_output_pair(arguments.output_path, overwrite=arguments.overwrite)
@@ -181,58 +153,28 @@ def _write_artifacts(
         mean_unofficial_ref_at_300=(
             sum(result.mindbridge_unofficial_ref_at_300 for result in results) / len(results)
         ),
-        predictions_sha256=hashlib.sha256(predictions.encode("utf-8")).hexdigest(),
+        predictions_sha256=sha256_text(predictions),
         completed_at=datetime.now(timezone.utc),
     )
-    write_text_atomically(arguments.output_path, predictions)
-    write_text_atomically(
-        sidecar_manifest_path(arguments.output_path),
-        manifest.model_dump_json(indent=2) + "\n",
-    )
-
-
-def _select_questions(
-    questions: tuple[MMLifelongQuestion, ...],
-    question_indices: tuple[int, ...],
-) -> tuple[MMLifelongQuestion, ...]:
-    if not question_indices:
-        return questions
-    if len(set(question_indices)) != len(question_indices):
-        raise ValueError("question indices must not contain duplicates")
-    requested = set(question_indices)
-    selected = tuple(question for question in questions if question.index in requested)
-    missing = requested - {question.index for question in selected}
-    if missing:
-        raise ValueError(
-            f"unknown MM-Lifelong question indices: {', '.join(map(str, sorted(missing)))}"
-        )
-    return selected
+    write_run_artifacts(arguments.output_path, predictions, manifest)
 
 
 def _parse_arguments() -> _Arguments:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", type=Path, required=True)
+    parser = argparse.ArgumentParser(
+        parents=[
+            media_benchmark_parser(
+                tenant_prefix="benchmark_mm_lifelong", device_id="mm_lifelong_camera"
+            )
+        ]
+    )
     parser.add_argument("--prepared-media", type=Path, required=True)
-    parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--api-base-url", required=True)
     parser.add_argument(
         "--split",
         choices=("day_test", "week_test", "month_train", "month_val"),
         required=True,
     )
     parser.add_argument("--source-revision", required=True)
-    parser.add_argument("--code-revision", required=True)
-    parser.add_argument("--deployment-config", type=Path, required=True)
-    parser.add_argument("--run-id", required=True)
-    parser.add_argument("--tenant-prefix", default="benchmark_mm_lifelong")
-    parser.add_argument("--device-id", default="mm_lifelong_camera")
-    parser.add_argument("--recall-limit", type=int, default=20)
-    parser.add_argument("--request-concurrency", type=int, default=4)
-    parser.add_argument("--request-timeout-seconds", type=float, default=1_800.0)
-    parser.add_argument("--poll-interval-seconds", type=float, default=1.0)
-    parser.add_argument("--processing-timeout-seconds", type=float, default=1_800.0)
     parser.add_argument("--question-index", type=int, action="append", default=[])
-    parser.add_argument("--overwrite", action="store_true")
     parsed = parser.parse_args()
     return _Arguments(
         dataset_path=parsed.dataset,

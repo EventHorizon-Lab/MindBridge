@@ -9,6 +9,7 @@ MindBridge is an Agentic Native Embodied Memory System: Memory-as-a-Service for 
 - [RTX 5090 benchmark and lifecycle validation](docs/benchmark-report-5090.md)
 - [RTX 5090 reproducibility manifest](benchmarks/manifests/benchmark-5090-clean-007.json)
 - [Edge identity model selection and validation](docs/edge-identity-sota.md)
+- [SOTA baselines for the supported benchmarks](docs/benchmarks-sota.md)
 
 ## Development
 
@@ -641,17 +642,26 @@ a transcript, or both:
 ```
 
 Video-MME writes the released nested evaluator shape and an answered-only local accuracy matching
-the official parser. Parquet loading is isolated in the `benchmarks` extra:
+the official parser, broken out per `short`/`medium`/`long` cell. Parquet loading is isolated in the
+`benchmarks` extra.
+
+`--transcript-source` is mandatory because Video-MME publishes separate with- and without-subtitle
+tables, while a prepared segment's `transcript` may hold either MindBridge's own ASR or the released
+subtitle track. Declaring `none` while the prepared media carries transcripts is refused, as is
+declaring `asr` or `official_subtitles` when it carries none. `--duration` scopes a run to the cells
+being reported; the overall number is saturated, so the long cell is the one worth quoting:
 
 ```bash
 uv run --extra benchmarks python -m mindbridge.benchmarks.video_mme_cli \
   --dataset .benchmarks/video-mme/videomme/test-00000-of-00001.parquet \
   --prepared-media .benchmarks/video-mme-prepared.json \
-  --output .benchmarks/results/video-mme.json \
+  --output .benchmarks/results/video-mme-long.json \
   --api-base-url http://localhost:8000 \
   --dataset-revision ead1408f75b618502df9a1d8e0950166bf0a2a0b \
   --evaluator-revision afd52cfe3dde5b3685e0d4f760c10c756860c758 \
   --deployment-config .benchmarks/deployment.json \
+  --duration long \
+  --transcript-source none \
   --run-id video-mme-001 \
   --code-revision "$(git rev-parse HEAD)"
 ```
@@ -688,6 +698,33 @@ EgoLifeQA schema; no second alias with divergent behavior is maintained.
 Every benchmark `run_id` must be unique for that deployment. It is included in the tenant ID and
 sidecar manifest, preventing a rerun from exposing an earlier question to future memories retained
 by a previous run.
+
+## Recording an official scorer's result
+
+LoCoMo, MM-Lifelong, EgoTempo, and EgoMemReason are scored outside MindBridge. A run manifest is
+written before any of those scorers execute, so it can only pin inputs. Record their output in a
+`*.score.json` sidecar instead, which re-hashes the predictions and refuses numbers that belong to
+a different run:
+
+```bash
+uv run python -m mindbridge.benchmarks.official_score \
+  --predictions .benchmarks/results/locomo.json \
+  --manifest .benchmarks/results/locomo.json.manifest.json \
+  --scorer-output .benchmarks/results/locomo-scorer-stdout.json \
+  --scorer-repository snap-research/locomo \
+  --scorer-revision 3eb6f2c585f5e1699204e3c3bdf7adc5c28cb376 \
+  --scorer-command "python evaluation/evaluate.py --data locomo.json" \
+  --judge-model gpt-4o-mini \
+  --answer-backbone qwen3.8-max \
+  --scored-question-count 1540 \
+  --metric f1=45.65
+```
+
+`--judge-model` and `--answer-backbone` are the fields that make two LoCoMo numbers comparable or
+not, and the LoCoMo run manifest additionally records `category_question_counts` so a reader can
+tell a four-category result from a five-category one. See
+[SOTA baselines for the supported benchmarks](docs/benchmarks-sota.md) for what each number has to
+beat.
 
 ## Run the MaaS API
 

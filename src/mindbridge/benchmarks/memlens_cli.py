@@ -4,23 +4,25 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import hashlib
-import json
 import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal, cast
 
-from pydantic import AwareDatetime, Field, model_validator
+from pydantic import Field, model_validator
 
 from mindbridge.benchmarks.artifacts import (
-    DeploymentSnapshot,
     LoadedDeployment,
+    MediaArguments,
+    MediaRunManifestBase,
     load_deployment_snapshot,
+    media_benchmark_parser,
+    predictions_document,
     require_writable_output_pair,
-    sidecar_manifest_path,
-    write_text_atomically,
+    select_by_id,
+    sha256_text,
+    write_run_artifacts,
 )
 from mindbridge.benchmarks.memlens import (
     MEMLENS_ADAPTER_VERSION,
@@ -36,7 +38,7 @@ from mindbridge.benchmarks.memlens_runner import (
     validate_memlens_images,
 )
 from mindbridge.benchmarks.prompts import MEMLENS_QUERY_PROMPT
-from mindbridge.contracts import ContractModel, Identifier, NonEmptyString, Sha256Hex
+from mindbridge.contracts import Identifier, NonEmptyString, Sha256Hex
 from mindbridge.file_integrity import sha256_file
 from mindbridge.models import EmbedTask
 from mindbridge.prompts import (
@@ -49,42 +51,24 @@ MEMLENS_RUNNER_VERSION = "memlens_production_api_v3"
 MemLensContextWindow = Literal["32k", "64k", "128k", "256k"]
 
 
-class MemLensRunManifest(ContractModel):
+class MemLensRunManifest(MediaRunManifestBase):
     """Immutable source, protocol, deployment, model, and prediction identity."""
 
     benchmark: Literal["MEMLENS"] = "MEMLENS"
     context_window: MemLensContextWindow
-    runner_version: NonEmptyString
-    adapter_version: NonEmptyString
     dataset_repository: NonEmptyString
     dataset_revision: NonEmptyString
-    annotation_sha256: Sha256Hex
     evaluator_repository: NonEmptyString
     evaluator_revision: NonEmptyString
     agent_subset_sha256: Sha256Hex | None = None
     prepared_images_manifest_sha256: Sha256Hex | None = None
     text_only: bool
-    code_revision: NonEmptyString
-    deployment: DeploymentSnapshot
-    deployment_sha256: Sha256Hex
     perception_prompt_version: NonEmptyString | None = None
-    answer_prompt_version: NonEmptyString
     query_prompt_version: NonEmptyString
-    retrieval_task: NonEmptyString
-    run_id: Identifier
-    tenant_prefix: Identifier
-    device_id: Identifier
-    recall_limit: int = Field(gt=0, le=100)
-    request_concurrency: int = Field(gt=0)
-    request_timeout_seconds: float = Field(gt=0)
-    poll_interval_seconds: float = Field(gt=0)
-    processing_timeout_seconds: float = Field(gt=0)
     question_ids: tuple[Identifier, ...] = Field(min_length=1)
     session_count: int = Field(gt=0)
     turn_count: int = Field(gt=0)
     image_reference_count: int = Field(ge=0)
-    predictions_sha256: Sha256Hex
-    completed_at: AwareDatetime
 
     @model_validator(mode="after")
     def require_perception_identity_for_multimodal_run(self) -> MemLensRunManifest:
@@ -100,28 +84,14 @@ class MemLensRunManifest(ContractModel):
 
 
 @dataclass(frozen=True, slots=True)
-class _Arguments:
-    dataset_path: Path
+class _Arguments(MediaArguments):
     prepared_images_path: Path | None
     agent_subset_path: Path | None
-    output_path: Path
-    api_base_url: str
     context_window: MemLensContextWindow
     dataset_revision: str
     evaluator_revision: str
-    code_revision: str
     text_only: bool
-    deployment_config_path: Path
-    run_id: str
-    tenant_prefix: str
-    device_id: str
-    recall_limit: int
-    request_concurrency: int
-    request_timeout_seconds: float
-    poll_interval_seconds: float
-    processing_timeout_seconds: float
     question_ids: tuple[str, ...]
-    overwrite: bool
 
 
 def main() -> None:
@@ -198,13 +168,8 @@ def _write_artifacts(
         question.question_id for question in questions
     ):
         raise ValueError("MEMLENS predictions must match annotation question order")
-    predictions = (
-        json.dumps(
-            {"data": [result.model_dump(mode="json") for result in results]},
-            ensure_ascii=False,
-            indent=2,
-        )
-        + "\n"
+    predictions = predictions_document(
+        {"data": [result.model_dump(mode="json") for result in results]},
     )
     manifest = MemLensRunManifest(
         context_window=arguments.context_window,
@@ -252,14 +217,10 @@ def _write_artifacts(
             for session in question.sessions
             for turn in session.turns
         ),
-        predictions_sha256=hashlib.sha256(predictions.encode("utf-8")).hexdigest(),
+        predictions_sha256=sha256_text(predictions),
         completed_at=datetime.now(timezone.utc),
     )
-    write_text_atomically(arguments.output_path, predictions)
-    write_text_atomically(
-        sidecar_manifest_path(arguments.output_path),
-        manifest.model_dump_json(indent=2) + "\n",
-    )
+    write_run_artifacts(arguments.output_path, predictions, manifest)
 
 
 def _select_questions(
@@ -275,43 +236,32 @@ def _select_questions(
                 f"MEMLENS agent subset contains unknown IDs: {', '.join(sorted(missing_subset))}"
             )
         questions = tuple(question for question in questions if question.question_id in subset_ids)
-    if len(set(question_ids)) != len(question_ids):
-        raise ValueError("question IDs must not contain duplicates")
-    if question_ids:
-        requested = set(question_ids)
-        selected = tuple(question for question in questions if question.question_id in requested)
-        missing = requested - {question.question_id for question in selected}
-        if missing:
-            raise ValueError(f"unknown selected MEMLENS question IDs: {', '.join(sorted(missing))}")
-        questions = selected
+    questions = select_by_id(
+        questions,
+        question_ids,
+        key=lambda question: question.question_id,
+        label="selected MEMLENS question IDs",
+    )
     if not questions:
         raise ValueError("MEMLENS selection must not be empty")
     return questions
 
 
 def _parse_arguments() -> _Arguments:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", type=Path, required=True)
+    parser = argparse.ArgumentParser(
+        parents=[
+            media_benchmark_parser(
+                tenant_prefix="benchmark_memlens", device_id="memlens_conversation"
+            )
+        ]
+    )
     parser.add_argument("--prepared-images", type=Path)
     parser.add_argument("--agent-subset-index", type=Path)
-    parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--api-base-url", required=True)
     parser.add_argument("--context-window", choices=("32k", "64k", "128k", "256k"), required=True)
     parser.add_argument("--dataset-revision", required=True)
     parser.add_argument("--evaluator-revision", required=True)
-    parser.add_argument("--code-revision", required=True)
     parser.add_argument("--text-only", action="store_true")
-    parser.add_argument("--deployment-config", type=Path, required=True)
-    parser.add_argument("--run-id", required=True)
-    parser.add_argument("--tenant-prefix", default="benchmark_memlens")
-    parser.add_argument("--device-id", default="memlens_conversation")
-    parser.add_argument("--recall-limit", type=int, default=20)
-    parser.add_argument("--request-concurrency", type=int, default=4)
-    parser.add_argument("--request-timeout-seconds", type=float, default=1_800.0)
-    parser.add_argument("--poll-interval-seconds", type=float, default=1.0)
-    parser.add_argument("--processing-timeout-seconds", type=float, default=1_800.0)
     parser.add_argument("--question-id", action="append", default=[])
-    parser.add_argument("--overwrite", action="store_true")
     parsed = parser.parse_args()
     return _Arguments(
         dataset_path=parsed.dataset,

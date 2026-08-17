@@ -6,14 +6,18 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
+from benchmark_deployment import (
+    SERVER_GENERATOR_REVISION,
+    WORKER_GENERATOR_REVISION,
+    write_deployment_snapshot,
+)
 
-from mindbridge.benchmarks.artifacts import load_deployment_snapshot
+from mindbridge.benchmarks.artifacts import load_deployment_snapshot, select_by_id
 from mindbridge.benchmarks.m3_bench import M3BenchQuestion, M3BenchVideo
 from mindbridge.benchmarks.m3_cli import (
     M3RunManifest,
     _Arguments,
     _prepared_by_video,
-    _select_videos,
     _validate_subset,
     _write_artifacts,
 )
@@ -51,7 +55,9 @@ def test_m3_artifacts_pin_media_models_code_and_jsonl_output(tmp_path: Path) -> 
         mindbridge_trace_id="trace_01",
     )
 
-    arguments = _arguments(dataset_path, prepared_path, output_path)
+    arguments = _arguments(
+        dataset_path, prepared_path, output_path, write_deployment_snapshot(tmp_path)
+    )
     _write_artifacts(
         arguments,
         (video,),
@@ -70,10 +76,10 @@ def test_m3_artifacts_pin_media_models_code_and_jsonl_output(tmp_path: Path) -> 
     assert manifest.media_revision == "official-media-revision"
     assert manifest.deployment.worker_generator is not None
     assert manifest.deployment.worker_generator.config["model_revision"] == (
-        "perception-serving-fingerprint"
+        WORKER_GENERATOR_REVISION
     )
     assert manifest.deployment.server_generator.config["model_revision"] == (
-        "answer-serving-fingerprint"
+        SERVER_GENERATOR_REVISION
     )
     assert manifest.request_timeout_seconds == 1_800.0
     assert manifest.run_id == "run_01"
@@ -86,12 +92,14 @@ def test_m3_artifacts_pin_media_models_code_and_jsonl_output(tmp_path: Path) -> 
 
 def test_m3_media_manifest_and_selection_fail_closed(tmp_path: Path) -> None:
     video = _video()
-    assert _select_videos((video,), ("video_01",)) == (video,)
+    assert select_by_id((video,), ("video_01",), key=lambda item: item.video_id, label="ids") == (
+        video,
+    )
     _validate_subset((video,), "robot")
     with pytest.raises(ValueError, match="web subset"):
         _validate_subset((video,), "web")
     with pytest.raises(ValueError, match="unknown"):
-        _select_videos((video,), ("missing",))
+        select_by_id((video,), ("missing",), key=lambda item: item.video_id, label="ids")
     with pytest.raises(ValueError, match="missing prepared"):
         _prepared_by_video((video,), ())
 
@@ -106,6 +114,7 @@ def test_m3_artifacts_reject_missing_predictions(tmp_path: Path) -> None:
         tmp_path / "robot.json",
         tmp_path / "prepared.json",
         tmp_path / "out",
+        write_deployment_snapshot(tmp_path),
     )
     with pytest.raises(ValueError, match="question order"):
         _write_artifacts(
@@ -117,9 +126,9 @@ def test_m3_artifacts_reject_missing_predictions(tmp_path: Path) -> None:
         )
 
 
-def _arguments(dataset_path: Path, prepared_path: Path, output_path: Path) -> _Arguments:
-    deployment_path = dataset_path.parent / "deployment.json"
-    _write_deployment(deployment_path)
+def _arguments(
+    dataset_path: Path, prepared_path: Path, output_path: Path, deployment_path: Path
+) -> _Arguments:
     return _Arguments(
         dataset_path=dataset_path,
         prepared_media_path=prepared_path,
@@ -140,46 +149,6 @@ def _arguments(dataset_path: Path, prepared_path: Path, output_path: Path) -> _A
         processing_timeout_seconds=1_800.0,
         video_ids=(),
         overwrite=False,
-    )
-
-
-def _write_deployment(path: Path) -> None:
-    path.write_text(
-        json.dumps(
-            {
-                "server_generator": {
-                    "plugin": "openai",
-                    "distribution": "mindbridge",
-                    "version": "0.1.0",
-                    "config": {"model_revision": "answer-serving-fingerprint"},
-                },
-                "server_embedder": {
-                    "plugin": "openai",
-                    "distribution": "mindbridge",
-                    "version": "0.1.0",
-                    "config": {},
-                },
-                "worker_generator": {
-                    "plugin": "openai",
-                    "distribution": "mindbridge",
-                    "version": "0.1.0",
-                    "config": {"model_revision": "perception-serving-fingerprint"},
-                },
-                "worker_media_embedder": {
-                    "plugin": "jina",
-                    "distribution": "mindbridge",
-                    "version": "0.1.0",
-                    "config": {},
-                },
-                "worker_text_embedder": {
-                    "plugin": "openai",
-                    "distribution": "mindbridge",
-                    "version": "0.1.0",
-                    "config": {},
-                },
-            }
-        ),
-        encoding="utf-8",
     )
 
 

@@ -4,23 +4,25 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import hashlib
-import json
 import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 
-from pydantic import AwareDatetime, Field
+from pydantic import Field
 
 from mindbridge.benchmarks.artifacts import (
-    DeploymentSnapshot,
     LoadedDeployment,
+    MediaArguments,
+    MediaRunManifestBase,
     load_deployment_snapshot,
+    media_benchmark_parser,
+    predictions_document,
     require_writable_output_pair,
-    sidecar_manifest_path,
-    write_text_atomically,
+    select_by_id,
+    sha256_text,
+    write_run_artifacts,
 )
 from mindbridge.benchmarks.egolife_runner import (
     EgoLifePreparedStream,
@@ -34,7 +36,7 @@ from mindbridge.benchmarks.egomem_reason import (
     load_egomem_reason,
 )
 from mindbridge.benchmarks.prompts import EGOMEM_REASON_QUERY_PROMPT
-from mindbridge.contracts import ContractModel, Identifier, NonEmptyString, Sha256Hex
+from mindbridge.contracts import Identifier, NonEmptyString, Sha256Hex
 from mindbridge.file_integrity import sha256_file
 from mindbridge.models import EmbedTask
 from mindbridge.prompts import (
@@ -46,68 +48,41 @@ from mindbridge.sdk import MindBridge
 EGOMEM_RUNNER_VERSION = "egomem_production_api_v3"
 
 
-class EgoMemRunManifest(ContractModel):
+class EgoMemRunManifest(MediaRunManifestBase):
     """Immutable input, deployment, model, and submission identity for one run."""
 
     benchmark: Literal["EgoMemReason"] = "EgoMemReason"
-    runner_version: NonEmptyString
-    adapter_version: NonEmptyString
+    perception_prompt_version: NonEmptyString
     dataset_repository: NonEmptyString
     dataset_revision: NonEmptyString
-    annotation_sha256: Sha256Hex
     evaluator_repository: NonEmptyString
     evaluator_revision: NonEmptyString
     prepared_media_manifest_sha256: Sha256Hex
-    code_revision: NonEmptyString
-    deployment: DeploymentSnapshot
-    deployment_sha256: Sha256Hex
-    perception_prompt_version: NonEmptyString
-    answer_prompt_version: NonEmptyString
     query_prompt_version: NonEmptyString
-    retrieval_task: NonEmptyString
-    run_id: Identifier
-    tenant_prefix: Identifier
-    device_id: Identifier
-    recall_limit: int = Field(gt=0, le=100)
-    request_concurrency: int = Field(gt=0)
-    request_timeout_seconds: float = Field(gt=0)
-    poll_interval_seconds: float = Field(gt=0)
-    processing_timeout_seconds: float = Field(gt=0)
     identities: tuple[Identifier, ...] = Field(min_length=1)
     example_ids: tuple[int, ...] = Field(min_length=1)
     clip_count: int = Field(gt=0)
     media_clip_count: int = Field(ge=0)
     caption_clip_count: int = Field(ge=0)
-    predictions_sha256: Sha256Hex
-    completed_at: AwareDatetime
 
 
 @dataclass(frozen=True, slots=True)
-class _Arguments:
-    dataset_path: Path
+class _Arguments(MediaArguments):
     prepared_media_path: Path
-    output_path: Path
-    api_base_url: str
     dataset_revision: str
     evaluator_revision: str
-    code_revision: str
-    deployment_config_path: Path
-    run_id: str
-    tenant_prefix: str
-    device_id: str
-    recall_limit: int
-    request_concurrency: int
-    request_timeout_seconds: float
-    poll_interval_seconds: float
-    processing_timeout_seconds: float
     example_ids: tuple[int, ...]
-    overwrite: bool
 
 
 def main() -> None:
     """Run selected questions and emit the exact public leaderboard submission shape."""
     arguments = _parse_arguments()
-    questions = _select_questions(load_egomem_reason(arguments.dataset_path), arguments.example_ids)
+    questions = select_by_id(
+        load_egomem_reason(arguments.dataset_path),
+        arguments.example_ids,
+        key=lambda question: question.example_id,
+        label="EgoMemReason example IDs",
+    )
     prepared = _prepared_by_identity(questions, load_prepared_egomem(arguments.prepared_media_path))
     require_writable_output_pair(arguments.output_path, overwrite=arguments.overwrite)
     deployment = load_deployment_snapshot(
@@ -165,19 +140,14 @@ def _write_artifacts(
         question.example_id for question in questions
     ):
         raise ValueError("EgoMemReason predictions must match annotation question order")
-    predictions = (
-        json.dumps(
-            [
-                {
-                    "example_id": result.example_id,
-                    "predicted_answer": result.predicted_answer,
-                }
-                for result in results
-            ],
-            ensure_ascii=False,
-            indent=2,
-        )
-        + "\n"
+    predictions = predictions_document(
+        [
+            {
+                "example_id": result.example_id,
+                "predicted_answer": result.predicted_answer,
+            }
+            for result in results
+        ],
     )
     streams = tuple(prepared.values())
     manifest = EgoMemRunManifest(
@@ -213,32 +183,10 @@ def _write_artifacts(
         caption_clip_count=sum(
             clip.caption is not None for stream in streams for clip in stream.clips
         ),
-        predictions_sha256=hashlib.sha256(predictions.encode("utf-8")).hexdigest(),
+        predictions_sha256=sha256_text(predictions),
         completed_at=datetime.now(timezone.utc),
     )
-    write_text_atomically(arguments.output_path, predictions)
-    write_text_atomically(
-        sidecar_manifest_path(arguments.output_path),
-        manifest.model_dump_json(indent=2) + "\n",
-    )
-
-
-def _select_questions(
-    questions: tuple[EgoMemReasonQuestion, ...],
-    example_ids: tuple[int, ...],
-) -> tuple[EgoMemReasonQuestion, ...]:
-    if not example_ids:
-        return questions
-    if len(set(example_ids)) != len(example_ids):
-        raise ValueError("example IDs must not contain duplicates")
-    requested = set(example_ids)
-    selected = tuple(question for question in questions if question.example_id in requested)
-    missing = requested - {question.example_id for question in selected}
-    if missing:
-        raise ValueError(
-            f"unknown EgoMemReason example IDs: {', '.join(map(str, sorted(missing)))}"
-        )
-    return selected
+    write_run_artifacts(arguments.output_path, predictions, manifest)
 
 
 def _prepared_by_identity(
@@ -256,25 +204,15 @@ def _prepared_by_identity(
 
 
 def _parse_arguments() -> _Arguments:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", type=Path, required=True)
+    parser = argparse.ArgumentParser(
+        parents=[
+            media_benchmark_parser(tenant_prefix="benchmark_egomem", device_id="egolife_camera")
+        ]
+    )
     parser.add_argument("--prepared-media", type=Path, required=True)
-    parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--api-base-url", required=True)
     parser.add_argument("--dataset-revision", required=True)
     parser.add_argument("--evaluator-revision", required=True)
-    parser.add_argument("--code-revision", required=True)
-    parser.add_argument("--deployment-config", type=Path, required=True)
-    parser.add_argument("--run-id", required=True)
-    parser.add_argument("--tenant-prefix", default="benchmark_egomem")
-    parser.add_argument("--device-id", default="egolife_camera")
-    parser.add_argument("--recall-limit", type=int, default=20)
-    parser.add_argument("--request-concurrency", type=int, default=4)
-    parser.add_argument("--request-timeout-seconds", type=float, default=1_800.0)
-    parser.add_argument("--poll-interval-seconds", type=float, default=1.0)
-    parser.add_argument("--processing-timeout-seconds", type=float, default=1_800.0)
     parser.add_argument("--example-id", type=int, action="append", default=[])
-    parser.add_argument("--overwrite", action="store_true")
     parsed = parser.parse_args()
     return _Arguments(
         dataset_path=parsed.dataset,

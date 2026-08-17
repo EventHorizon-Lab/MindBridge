@@ -6,14 +6,18 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
+from benchmark_deployment import SERVER_GENERATOR_REVISION, write_deployment_snapshot
 
-from mindbridge.benchmarks.artifacts import load_deployment_snapshot, require_writable_output_pair
+from mindbridge.benchmarks.artifacts import (
+    load_deployment_snapshot,
+    require_writable_output_pair,
+    select_by_id,
+)
 from mindbridge.benchmarks.locomo import LoCoMoConversation, LoCoMoQuestion, LoCoMoTurn
 from mindbridge.benchmarks.locomo_cli import (
     LOCOMO_RUNNER_VERSION,
     LoCoMoRunManifest,
     _Arguments,
-    _select_conversations,
     _write_artifacts,
 )
 from mindbridge.benchmarks.locomo_runner import (
@@ -45,7 +49,9 @@ def test_locomo_artifacts_pin_source_system_code_and_output(tmp_path: Path) -> N
             ),
         ),
     )
-    arguments = _arguments(dataset_path, output_path)
+    arguments = _arguments(
+        dataset_path, output_path, write_deployment_snapshot(tmp_path, worker=False)
+    )
 
     _write_artifacts(
         arguments,
@@ -61,13 +67,16 @@ def test_locomo_artifacts_pin_source_system_code_and_output(tmp_path: Path) -> N
     assert predictions[0]["qa"][0]["mindbridge_prediction_context"] == ["D1:1"]
     assert manifest.source_revision == "official-revision"
     assert manifest.code_revision == "mindbridge-commit"
-    assert manifest.deployment.server_generator.config["model_revision"] == ("serving-fingerprint")
-    assert manifest.runner_version == LOCOMO_RUNNER_VERSION == "locomo_production_api_v9"
+    assert manifest.deployment.server_generator.config["model_revision"] == (
+        SERVER_GENERATOR_REVISION
+    )
+    assert manifest.runner_version == LOCOMO_RUNNER_VERSION == "locomo_production_api_v10"
     assert manifest.run_id == "run_01"
     assert manifest.request_timeout_seconds == 1_800.0
     assert manifest.memory_item_count == 1
     assert manifest.question_count == 1
     assert manifest.abstained_question_count == 0
+    assert manifest.category_question_counts == {1: 1}
     assert manifest.predictions_sha256 == hashlib.sha256(output_path.read_bytes()).hexdigest()
     with pytest.raises(FileExistsError):
         require_writable_output_pair(output_path, overwrite=False)
@@ -75,14 +84,21 @@ def test_locomo_artifacts_pin_source_system_code_and_output(tmp_path: Path) -> N
 
 def test_locomo_subset_selection_rejects_unknown_samples() -> None:
     conversation = _conversation()
-    assert _select_conversations((conversation,), ("conv-01",)) == (conversation,)
+
+    def select(sample_ids: tuple[str, ...]) -> tuple[LoCoMoConversation, ...]:
+        return select_by_id(
+            (conversation,),
+            sample_ids,
+            key=lambda item: item.sample_id,
+            label="LoCoMo sample IDs",
+        )
+
+    assert select(("conv-01",)) == (conversation,)
     with pytest.raises(ValueError, match="unknown"):
-        _select_conversations((conversation,), ("missing",))
+        select(("missing",))
 
 
-def _arguments(dataset_path: Path, output_path: Path) -> _Arguments:
-    deployment_path = dataset_path.parent / "deployment.json"
-    _write_deployment(deployment_path)
+def _arguments(dataset_path: Path, output_path: Path, deployment_path: Path) -> _Arguments:
     return _Arguments(
         dataset_path=dataset_path,
         output_path=output_path,
@@ -97,32 +113,6 @@ def _arguments(dataset_path: Path, output_path: Path) -> _Arguments:
         request_timeout_seconds=1_800.0,
         sample_ids=(),
         overwrite=False,
-    )
-
-
-def _write_deployment(path: Path) -> None:
-    path.write_text(
-        json.dumps(
-            {
-                "server_generator": {
-                    "plugin": "openai",
-                    "distribution": "mindbridge",
-                    "version": "0.1.0",
-                    "config": {
-                        "model_id": "qwen3.8-max",
-                        "model_revision": "serving-fingerprint",
-                        "reasoning_effort": "low",
-                    },
-                },
-                "server_embedder": {
-                    "plugin": "openai",
-                    "distribution": "mindbridge",
-                    "version": "0.1.0",
-                    "config": {"space_id": "jina-v5", "space_revision": "space-v1"},
-                },
-            }
-        ),
-        encoding="utf-8",
     )
 
 
@@ -146,4 +136,73 @@ def _conversation() -> LoCoMoConversation:
                 category=1,
             ),
         ),
+    )
+
+
+def test_manifest_exposes_adversarial_coverage_so_four_and_five_category_runs_differ(
+    tmp_path: Path,
+) -> None:
+    dataset_path = tmp_path / "locomo10.json"
+    dataset_path.write_text("official-input", encoding="utf-8")
+    output_path = tmp_path / "five" / "predictions.json"
+    conversation = LoCoMoConversation(
+        sample_id="conv-01",
+        turns=(LoCoMoTurn(dialog_id="D1:1", speaker="Caroline", text="Hello", occurred_at=NOW),),
+        questions=(
+            LoCoMoQuestion(
+                question_id="conv-01_Q0001",
+                question="What happened?",
+                reference_answers=("Hello",),
+                evidence_dialog_ids=("D1:1",),
+                category=1,
+            ),
+            LoCoMoQuestion(
+                question_id="conv-01_Q0002",
+                question="What was never said?",
+                reference_answers=("Not mentioned in the conversation",),
+                evidence_dialog_ids=(),
+                category=5,
+            ),
+        ),
+    )
+    arguments = _arguments(
+        dataset_path, output_path, write_deployment_snapshot(tmp_path, worker=False)
+    )
+
+    _write_artifacts(
+        arguments,
+        (conversation,),
+        (
+            LoCoMoOfficialConversationResult(
+                sample_id="conv-01",
+                qa=(
+                    _question_result("What happened?", 1, abstained=False),
+                    _question_result("What was never said?", 5, abstained=True),
+                ),
+            ),
+        ),
+        load_deployment_snapshot(arguments.deployment_config_path),
+    )
+
+    manifest = LoCoMoRunManifest.model_validate_json(
+        output_path.with_suffix(".json.manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest.category_question_counts == {1: 1, 5: 1}
+    assert manifest.question_count == 2
+    assert manifest.abstained_question_count == 1
+
+
+def _question_result(
+    question: str, category: int, *, abstained: bool
+) -> LoCoMoOfficialQuestionResult:
+    return LoCoMoOfficialQuestionResult(
+        question=question,
+        answer="Hello",
+        evidence=("D1:1",),
+        category=category,
+        mindbridge_prediction="Not mentioned in the conversation" if abstained else "Hello",
+        mindbridge_abstained=abstained,
+        mindbridge_confidence=0.9,
+        mindbridge_prediction_context=("D1:1",),
+        mindbridge_trace_id="trace_01",
     )

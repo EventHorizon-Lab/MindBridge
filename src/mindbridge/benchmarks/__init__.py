@@ -1,5 +1,12 @@
 """Production-path benchmark and component smoke entry points."""
 
+from mindbridge.benchmarks.artifacts import (
+    CommonArguments,
+    MediaArguments,
+    MediaRunManifestBase,
+    RunManifestBase,
+    select_by_id,
+)
 from mindbridge.benchmarks.egolife_qa import (
     EGOLIFE_QA_ADAPTER_VERSION,
     EgoLifeOption,
@@ -7,6 +14,7 @@ from mindbridge.benchmarks.egolife_qa import (
     load_egolife_qa,
 )
 from mindbridge.benchmarks.egolife_runner import (
+    EgoLifeCategoryMetrics,
     EgoLifeMetrics,
     EgoLifePreparedClip,
     EgoLifePreparedStream,
@@ -89,6 +97,11 @@ from mindbridge.benchmarks.mm_lifelong_runner import (
     run_mm_lifelong,
     unofficial_reference_at_n,
 )
+from mindbridge.benchmarks.official_score import (
+    OfficialScore,
+    build_official_score,
+    score_sidecar_path,
+)
 from mindbridge.benchmarks.runtime import (
     OPTION_LABELS,
     PreparedVideo,
@@ -143,6 +156,8 @@ __all__ = [
     "SUPERMEMORY_UNANSWERABLE_CHOICE",
     "SUPERMEMORY_VQA_ADAPTER_VERSION",
     "VIDEO_MME_ADAPTER_VERSION",
+    "CommonArguments",
+    "EgoLifeCategoryMetrics",
     "EgoLifeMetrics",
     "EgoLifeOption",
     "EgoLifePreparedClip",
@@ -169,6 +184,8 @@ __all__ = [
     "MMLifelongQuestion",
     "MMLifelongQuestionResult",
     "MMLifelongSplit",
+    "MediaArguments",
+    "MediaRunManifestBase",
     "MemLensImage",
     "MemLensPreparedImage",
     "MemLensPreparedImages",
@@ -176,8 +193,10 @@ __all__ = [
     "MemLensQuestionResult",
     "MemLensSession",
     "MemLensTurn",
+    "OfficialScore",
     "PreparedVideo",
     "PreparedVideoSegment",
+    "RunManifestBase",
     "SuperMemoryMetrics",
     "SuperMemoryPreparedSegment",
     "SuperMemoryPreparedSubject",
@@ -190,6 +209,7 @@ __all__ = [
     "VideoMMEVideo",
     "VideoMMEVideoResult",
     "benchmark_tenant_id",
+    "build_official_score",
     "evaluate_egolife_qa",
     "evaluate_supermemory_vqa",
     "evaluate_video_mme",
@@ -222,6 +242,8 @@ __all__ = [
     "run_mm_lifelong",
     "run_supermemory_vqa",
     "run_video_mme_video",
+    "score_sidecar_path",
+    "select_by_id",
     "unofficial_reference_at_n",
     "wait_for_observation_job",
 ]
