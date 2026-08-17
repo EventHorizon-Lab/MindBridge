@@ -205,3 +205,66 @@ def test_manifest_carries_source_deployment_and_tenant_mapping(tmp_path: Path) -
     assert manifest["recall_limit"] == 10
     assert manifest["request_concurrency"] == 2
     assert manifest["tenant_ids"] == tenant_ids
+    # No output rows were ever written in this test -- nothing to count.
+    assert manifest["question_count"] == 0
+    assert manifest["oversized_unsliced_question_count"] == 0
+
+
+def test_write_manifest_counts_oversized_unsliced_questions_from_output_rows(
+    tmp_path: Path,
+) -> None:
+    deployment_path = tmp_path / "deployment.json"
+    deployment_path.write_text(
+        json.dumps(
+            {
+                "server_generator": {
+                    "plugin": "openai",
+                    "distribution": "mindbridge",
+                    "version": "0.1.0",
+                    "config": {"model_id": "qwen3.8-max"},
+                },
+                "server_embedder": {
+                    "plugin": "openai",
+                    "distribution": "mindbridge",
+                    "version": "0.1.0",
+                    "config": {"space_id": "jina-v5"},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    output_path = tmp_path / "rows.jsonl"
+    # Three rows already on disk -- as if this run resumed from a prior,
+    # partially-completed invocation -- two of which carry CL-Bench's
+    # `question_unsliced` marker.
+    output_path.write_text(
+        "\n".join(
+            json.dumps(row)
+            for row in [
+                {"id": "clbench:task-1#task-1", "question": "q1", "question_unsliced": False},
+                {"id": "clbench:task-2#task-2", "question": "q2", "question_unsliced": True},
+                {"id": "clbench:task-3#task-3", "question": "q3", "question_unsliced": True},
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    arguments = _Arguments(
+        benchmark="clbench",
+        dataset_paths=(tmp_path / "CL-bench.jsonl",),
+        output_path=output_path,
+        api_base_url="https://memory.example.test",
+        code_revision="mindbridge-commit",
+        deployment_config_path=deployment_path,
+        run_id="run-1",
+        tenant_prefix="bench_aml",
+        top_k=10,
+        concurrency=2,
+    )
+    deployment = load_deployment_snapshot(deployment_path)
+
+    _write_manifest(arguments, deployment, {})
+
+    manifest = json.loads(sidecar_manifest_path(output_path).read_text(encoding="utf-8"))
+    assert manifest["question_count"] == 3
+    assert manifest["oversized_unsliced_question_count"] == 2

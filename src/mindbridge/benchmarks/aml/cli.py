@@ -172,6 +172,19 @@ class AmlRunManifest(ContractModel):
     tenant_prefix: Identifier
     recall_limit: int = Field(gt=0, le=100)
     request_concurrency: int = Field(gt=0)
+    question_count: int = Field(ge=0)
+    # How many of `question_count` carry CL-Bench's `question_unsliced`
+    # marker (`loaders/clbench.py`): a question whose text is a raw final
+    # turn from the source corpus, used verbatim because it had no
+    # blank-line break to slice the reference document from the actual
+    # query, so it can be tens of thousands of characters long. That both
+    # risks an oversized answer prompt and voids the retrieval test for the
+    # affected row -- a caveat on this run's score, not a memory-system
+    # weakness. Always 0 for every benchmark other than CL-Bench, whose rows
+    # never carry the key. Counted from the rows this run actually wrote to
+    # `--output` (including rows a resumed run already had on disk), not by
+    # re-reading the source dataset.
+    oversized_unsliced_question_count: int = Field(ge=0)
     tenant_ids: dict[Identifier, Identifier]
     completed_at: datetime
 
@@ -287,17 +300,32 @@ def _case_ids(case: AmlCase) -> set[str]:
     return {f"{case.user_id}#{question.question_id}" for question in case.questions}
 
 
-def _read_existing_ids(output_path: Path) -> set[str]:
+def _read_output_rows(output_path: Path) -> list[dict[str, object]]:
     if not output_path.exists():
-        return set()
-    ids: set[str] = set()
+        return []
+    rows: list[dict[str, object]] = []
     with output_path.open("r", encoding="utf-8") as handle:
         for line in handle:
             stripped = line.strip()
             if not stripped:
                 continue
-            ids.add(str(json.loads(stripped)["id"]))
-    return ids
+            rows.append(json.loads(stripped))
+    return rows
+
+
+def _read_existing_ids(output_path: Path) -> set[str]:
+    return {str(row["id"]) for row in _read_output_rows(output_path)}
+
+
+def _question_counts(output_path: Path) -> tuple[int, int]:
+    """Return `(question_count, oversized_unsliced_question_count)` for this
+    run's cumulative output. Reads `output_path` itself -- the rows the run
+    actually produced, including any a resumed run already had on disk --
+    rather than recomputing anything from the source dataset.
+    """
+    rows = _read_output_rows(output_path)
+    oversized_unsliced = sum(1 for row in rows if row.get("question_unsliced") is True)
+    return len(rows), oversized_unsliced
 
 
 def _write_manifest(
@@ -305,6 +333,7 @@ def _write_manifest(
     deployment: LoadedDeployment,
     tenant_ids: dict[str, str],
 ) -> None:
+    question_count, oversized_unsliced_question_count = _question_counts(arguments.output_path)
     manifest = AmlRunManifest(
         benchmark=arguments.benchmark,
         source_repository=_AML_SOURCE_REPOSITORY,
@@ -316,6 +345,8 @@ def _write_manifest(
         tenant_prefix=arguments.tenant_prefix,
         recall_limit=arguments.top_k,
         request_concurrency=arguments.concurrency,
+        question_count=question_count,
+        oversized_unsliced_question_count=oversized_unsliced_question_count,
         tenant_ids=tenant_ids,
         completed_at=datetime.now(timezone.utc),
     )

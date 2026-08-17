@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from mindbridge.benchmarks.aml.loaders.clbench import load
+from mindbridge.benchmarks.aml.loaders.clbench import _OVERSIZED_QUESTION_CHARACTERS, load
 
 # Record 1: a clean 2-message record whose final (only) user turn has one
 # blank-line paragraph break -- the common case (measured: 69.6% of the real
@@ -209,9 +209,11 @@ def test_load_omits_timestamp_field_entirely(tmp_path: Path) -> None:
 def test_load_flags_question_unsliced_when_a_long_final_turn_has_no_blank_line(
     tmp_path: Path,
 ) -> None:
+    """The oversized whole-turn fallback outcome: no blank-line break, and
+    the resulting question is too long to be a question."""
     [case] = load(_write_fixture(tmp_path, _RECORD_4))
 
-    assert len(_RECORD_4_LONG_TURN) >= 2000
+    assert len(_RECORD_4_LONG_TURN) >= _OVERSIZED_QUESTION_CHARACTERS
     # No blank-line break anywhere -> nothing folds into history, and the
     # whole turn becomes the question.
     assert case.messages == ()
@@ -221,9 +223,24 @@ def test_load_flags_question_unsliced_when_a_long_final_turn_has_no_blank_line(
 
 
 def test_load_sets_question_unsliced_false_for_a_cleanly_split_record(tmp_path: Path) -> None:
+    """The cleanly-sliced outcome: a blank-line break was found, so there is
+    nothing to flag."""
     [case] = load(_write_fixture(tmp_path, _RECORD_1))
 
     [question] = case.questions
+    assert question.payload["question_unsliced"] is False
+
+
+def test_load_sets_question_unsliced_false_for_a_short_whole_turn_fallback(
+    tmp_path: Path,
+) -> None:
+    """The harmless whole-turn fallback outcome: no blank-line break, but the
+    turn is short enough that taking the whole thing as the question is
+    exactly right -- this must NOT be flagged, or the marker is useless."""
+    [case] = load(_write_fixture(tmp_path, _RECORD_2))
+
+    [question] = case.questions
+    assert len(question.question) < _OVERSIZED_QUESTION_CHARACTERS
     assert question.payload["question_unsliced"] is False
 
 

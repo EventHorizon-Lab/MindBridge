@@ -92,6 +92,18 @@ from mindbridge.benchmarks.aml.cases import AmlCase, AmlQuestion
 
 _PARAGRAPH_BREAK = re.compile(r"\n[ \t]*\n")
 
+# The line between "a short final turn with no blank-line break, where
+# taking the whole turn as the question is correct" (measured: 522/1,899 =
+# 27.5% of the real corpus) and "a long final turn with no blank-line break,
+# where taking the whole turn blows the answer prompt and voids the
+# retrieval test" (measured: 55/1,899 = 2.9%). 2,000 characters cleanly
+# separates the two populations in the real corpus (the harmless group's
+# turns are all short instructions; the failing group's are reference
+# documents tens of thousands of characters long) -- named here, instead of
+# repeated as a bare literal, so the loader and its tests can't drift apart
+# on what "too long to be a question" means.
+_OVERSIZED_QUESTION_CHARACTERS = 2_000
+
 
 class _RawMessage(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -167,13 +179,18 @@ def _case(record: _RawRecord) -> AmlCase:
 def _split_question(content: str) -> tuple[str, str, bool]:
     """Split a final user turn into `(history_text, question, unsliced)` at
     its last blank-line paragraph break. See the module docstring for the
-    rule and its measured coverage. Returns `("", content, True)` when no
-    break is found -- the whole turn becomes the question, nothing is folded
-    into history, and `unsliced` flags this record for the caller so a
-    silently oversized/unsliced question doesn't pass for a normal one.
+    rule and its measured coverage. Returns `("", content, unsliced)` when no
+    break is found -- the whole turn becomes the question and nothing is
+    folded into history. `unsliced` is only `True` when that whole-turn
+    fallback also produced a question at least `_OVERSIZED_QUESTION_CHARACTERS`
+    long: the genuine failure mode this flag exists to catch. A short
+    whole-turn fallback (the common, harmless case -- taking the whole turn
+    was exactly right) returns `unsliced=False`, same as a cleanly sliced
+    question, so a consumer filtering on the flag sees only the records that
+    are actually broken.
     """
     stripped = content.rstrip()
     paragraphs = [p for p in _PARAGRAPH_BREAK.split(stripped) if p.strip()]
     if len(paragraphs) < 2:
-        return "", stripped, True
+        return "", stripped, len(stripped) >= _OVERSIZED_QUESTION_CHARACTERS
     return "\n\n".join(paragraphs[:-1]), paragraphs[-1].strip(), False
