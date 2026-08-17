@@ -357,7 +357,7 @@ AML_EXTRACT_FACTS_PROMPT = PromptSpec(
     name="aml_extract_facts",
     version="aml_extract_facts_v1",
     purpose="Extract retrievable atomic memories from one conversation chunk.",
-    used_by="mindbridge.application.aml_extraction.extract_facts",
+    used_by="mindbridge.application.aml_extraction.extract_memories",
     text="""# Role
 You turn a chunk of conversation into the smallest memories that can later answer a question
 about it.

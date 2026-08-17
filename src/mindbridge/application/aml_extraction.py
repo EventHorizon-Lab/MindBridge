@@ -1,0 +1,87 @@
+"""Turn one AML conversation chunk into retrievable memories."""
+
+from __future__ import annotations
+
+import json
+from collections.abc import Sequence
+from dataclasses import dataclass
+from datetime import datetime, timezone
+
+from mindbridge.api.aml_contracts import AmlMessage
+from mindbridge.core import MemoryType, ModelOutputError
+from mindbridge.models import GenerateRequest, Generator, ModelInput, TextPart
+from mindbridge.prompts import AML_EXTRACT_FACTS_PROMPT
+
+MAX_EXTRACTION_OUTPUT_TOKENS = 4_096
+MAX_SUMMARY_CHARACTERS = 2_048
+
+_MEMORY_TYPES = {
+    "semantic": MemoryType.SEMANTIC,
+    "episodic": MemoryType.EPISODIC,
+    "procedural": MemoryType.PROCEDURAL,
+}
+
+
+@dataclass(frozen=True, slots=True)
+class ExtractedMemory:
+    """One atomic memory ready for kernel.remember()."""
+
+    summary: str
+    memory_type: MemoryType
+    occurred_at: datetime
+
+
+async def extract_memories(
+    generator: Generator,
+    messages: Sequence[AmlMessage],
+    *,
+    now: datetime,
+) -> tuple[ExtractedMemory, ...]:
+    """Extract atomic memories, dating them from the chunk's own timestamps."""
+    occurred_at = _chunk_time(messages, now=now)
+    result = await generator.generate(
+        GenerateRequest(
+            system_prompt=AML_EXTRACT_FACTS_PROMPT.text,
+            input=ModelInput(parts=(TextPart(text=_render_chunk(messages)),)),
+            max_output_tokens=MAX_EXTRACTION_OUTPUT_TOKENS,
+            json_mode=True,
+        )
+    )
+    return tuple(
+        ExtractedMemory(
+            summary=summary,
+            memory_type=memory_type,
+            occurred_at=occurred_at,
+        )
+        for summary, memory_type in _parsed_memories(result.text)
+    )
+
+
+def _render_chunk(messages: Sequence[AmlMessage]) -> str:
+    return "\n".join(f"{message.role}: {message.content}" for message in messages)
+
+
+def _chunk_time(messages: Sequence[AmlMessage], *, now: datetime) -> datetime:
+    timestamps = [message.timestamp for message in messages if message.timestamp is not None]
+    if not timestamps:
+        return now
+    return datetime.fromtimestamp(min(timestamps) / 1_000, tz=timezone.utc)
+
+
+def _parsed_memories(text: str) -> list[tuple[str, MemoryType]]:
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as error:
+        raise ModelOutputError("AML extraction output is not JSON") from error
+    if not isinstance(payload, dict) or not isinstance(payload.get("memories"), list):
+        raise ModelOutputError("AML extraction output has no memories list")
+    memories: list[tuple[str, MemoryType]] = []
+    for item in payload["memories"]:
+        if not isinstance(item, dict):
+            raise ModelOutputError("every extracted memory must be an object")
+        summary = str(item.get("summary") or "").strip()[:MAX_SUMMARY_CHARACTERS]
+        memory_type = _MEMORY_TYPES.get(str(item.get("type") or "").strip().lower())
+        if not summary or memory_type is None:
+            continue
+        memories.append((summary, memory_type))
+    return memories
