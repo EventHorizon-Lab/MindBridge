@@ -6,11 +6,25 @@ import json
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import Protocol
 
-from mindbridge.api.aml_contracts import AmlMessage
+from mindbridge.application.capabilities import (
+    GenerateRequest,
+    Generator,
+    ModelInput,
+    TextPart,
+)
 from mindbridge.core import MemoryType, ModelOutputError
-from mindbridge.models import GenerateRequest, Generator, ModelInput, TextPart
 from mindbridge.prompts import AML_EXTRACT_FACTS_PROMPT
+
+
+class _AmlMessageLike(Protocol):
+    """The subset of `mindbridge.api.aml_contracts.AmlMessage` this module reads."""
+
+    role: str
+    content: str
+    timestamp: int | None
+
 
 MAX_EXTRACTION_OUTPUT_TOKENS = 4_096
 MAX_SUMMARY_CHARACTERS = 2_048
@@ -33,7 +47,7 @@ class ExtractedMemory:
 
 async def extract_memories(
     generator: Generator,
-    messages: Sequence[AmlMessage],
+    messages: Sequence[_AmlMessageLike],
     *,
     now: datetime,
 ) -> tuple[ExtractedMemory, ...]:
@@ -57,11 +71,11 @@ async def extract_memories(
     )
 
 
-def _render_chunk(messages: Sequence[AmlMessage]) -> str:
+def _render_chunk(messages: Sequence[_AmlMessageLike]) -> str:
     return "\n".join(f"{message.role}: {message.content}" for message in messages)
 
 
-def _chunk_time(messages: Sequence[AmlMessage], *, now: datetime) -> datetime:
+def _chunk_time(messages: Sequence[_AmlMessageLike], *, now: datetime) -> datetime:
     timestamps = [message.timestamp for message in messages if message.timestamp is not None]
     if not timestamps:
         return now
