@@ -130,6 +130,7 @@ def _arguments(dataset_path: Path, output_path: Path) -> _Arguments:
         request_timeout_seconds=1_800.0,
         sample_ids=(),
         overwrite=False,
+        quiet=True,
     )
 
 

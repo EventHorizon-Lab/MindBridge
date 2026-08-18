@@ -15,9 +15,15 @@ dependencies = [
 ]
 
 [project.scripts]
-mindbridge-consolidate = "mindbridge.consolidation_cli:main"
-mindbridge-lifecycle = "mindbridge.lifecycle_cli:main"
-mindbridge-mcp = "mindbridge.server:run_mcp"
+mindbridge = "mindbridge.cli:main"
+# The benchmark runners get their own binary: AGENTS.md keeps `benchmarks/` a leaf that no
+# product module imports, so the product entry point cannot address them.
+mindbridge-bench = "mindbridge.benchmarks.cli:main"
+# The three names the README has always documented, kept as aliases. They route through
+# mindbridge.cli so they report the same exit codes and one-line failures as the tree.
+mindbridge-consolidate = "mindbridge.cli:consolidate"
+mindbridge-lifecycle = "mindbridge.cli:lifecycle"
+mindbridge-mcp = "mindbridge.cli:mcp"
 
 [project.entry-points."mindbridge.generators"]
 openai = "mindbridge.models.openai:create_generator"

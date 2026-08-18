@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, cast
@@ -24,6 +25,8 @@ from mindbridge.benchmarks.cli_common import (
     media_arguments,
     media_manifest,
     predictions_jsonl,
+    report,
+    report_unit,
     select_by_id,
     write_run_artifacts,
 )
@@ -70,9 +73,9 @@ class _Arguments(MediaArguments):
     video_ids: tuple[str, ...]
 
 
-def main() -> None:
+def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
     """Run selected official videos and emit JSONL predictions plus a manifest."""
-    arguments = _parse_arguments()
+    arguments = _parse_arguments(argv, prog)
     videos = select_by_id(
         load_m3_bench(arguments.dataset_path),
         arguments.video_ids,
@@ -90,8 +93,10 @@ def main() -> None:
             for clip in prepared[video.video_id].clips
         ),
     )
+    report(f"running {len(videos)} videos", quiet=arguments.quiet)
     results = asyncio.run(_run_videos(arguments, videos, prepared))
     _write_artifacts(arguments, videos, prepared, results, deployment)
+    report(f"wrote {arguments.output_path}", quiet=arguments.quiet)
 
 
 async def _run_videos(
@@ -101,7 +106,13 @@ async def _run_videos(
 ) -> tuple[M3OfficialQuestionResult, ...]:
     async with connected_memory(arguments) as memory:
         results: list[M3OfficialQuestionResult] = []
-        for video in videos:
+        for index, video in enumerate(videos, start=1):
+            report_unit(
+                f"video {video.video_id}",
+                index=index,
+                total=len(videos),
+                quiet=arguments.quiet,
+            )
             results.extend(
                 await run_m3_video(
                     memory,
@@ -183,17 +194,30 @@ def _validate_subset(videos: tuple[M3BenchVideo, ...], subset: Literal["robot", 
         raise ValueError(f"M3-Bench annotations do not match the {subset} subset")
 
 
-def _parse_arguments() -> _Arguments:
+def _parse_arguments(argv: Sequence[str] | None, prog: str | None) -> _Arguments:
     parser = add_media_arguments(
-        core_parser(tenant_prefix="benchmark_m3"),
+        core_parser(tenant_prefix="benchmark_m3", prog=prog, description=__doc__),
         device_id="m3_bench_camera",
     )
-    parser.add_argument("--prepared-media", type=Path, required=True)
-    parser.add_argument("--subset", choices=("robot", "web"), required=True)
-    parser.add_argument("--source-revision", required=True)
-    parser.add_argument("--media-revision", required=True)
-    parser.add_argument("--video-id", action="append", default=[])
-    parsed = parser.parse_args()
+    parser.add_argument(
+        "--prepared-media", type=Path, required=True, help="manifest of clips prepared for ingest"
+    )
+    parser.add_argument(
+        "--subset", choices=("robot", "web"), required=True, help="official subset to replay"
+    )
+    parser.add_argument(
+        "--source-revision", required=True, help="revision of the official M3-Bench release"
+    )
+    parser.add_argument(
+        "--media-revision", required=True, help="revision of the official media release"
+    )
+    parser.add_argument(
+        "--video-id",
+        action="append",
+        default=[],
+        help="official video to run; repeatable, default the whole subset",
+    )
+    parsed = parser.parse_args(argv)
     return media_arguments(
         _Arguments,
         parsed,

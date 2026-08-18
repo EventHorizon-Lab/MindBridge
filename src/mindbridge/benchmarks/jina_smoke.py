@@ -2,16 +2,17 @@
 
 from __future__ import annotations
 
-import argparse
 import asyncio
 import math
 import platform
+from collections.abc import Sequence
 from datetime import datetime, timezone
 from importlib.metadata import version
 from typing import Literal
 
 from pydantic import AwareDatetime
 
+from mindbridge.benchmarks.cli import parser as build_parser
 from mindbridge.benchmarks.runtime import dot_product
 from mindbridge.contracts import ContractModel
 from mindbridge.models import EmbedRequest, EmbedTask, ModelInput, TextPart
@@ -94,17 +95,16 @@ async def run_jina_smoke(*, revision: str, device: str) -> JinaSmokeResult:
     )
 
 
-def main() -> None:
-    """Run the smoke and emit a machine-readable manifest."""
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--revision", required=True)
-    parser.add_argument("--device", default="cuda")
-    arguments = parser.parse_args()
+def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> int:
+    """Run the smoke and emit a machine-readable manifest, returning its verdict."""
+    parser = build_parser(prog=prog, description=__doc__)
+    parser.add_argument("--revision", required=True, help="model revision to pin in the manifest")
+    parser.add_argument("--device", default="cuda", help="torch device to load the adapter on")
+    arguments = parser.parse_args(argv)
     result = asyncio.run(run_jina_smoke(revision=arguments.revision, device=arguments.device))
     print(result.model_dump_json(indent=2))
-    if not result.passed:
-        raise SystemExit(1)
+    return 0 if result.passed else 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

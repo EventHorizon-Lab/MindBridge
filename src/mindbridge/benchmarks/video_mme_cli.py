@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -24,6 +25,8 @@ from mindbridge.benchmarks.cli_common import (
     index_prepared,
     media_arguments,
     media_manifest,
+    report,
+    report_unit,
     select_by_id,
     write_run_artifacts,
 )
@@ -77,9 +80,9 @@ class _Arguments(MediaArguments):
     transcript_source: VideoMMETranscriptSource
 
 
-def main() -> None:
+def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
     """Run selected videos and emit the official nested prediction JSON."""
-    arguments = _parse_arguments()
+    arguments = _parse_arguments(argv, prog)
     videos = _select_videos(
         load_video_mme(arguments.dataset_path), arguments.video_ids, arguments.durations
     )
@@ -92,8 +95,10 @@ def main() -> None:
             segment.media_objects for video in prepared for segment in video.segments
         ),
     )
+    report(f"running {len(videos)} videos", quiet=arguments.quiet)
     results = asyncio.run(_run(arguments, videos, prepared))
     _write_artifacts(arguments, videos, prepared, results, deployment)
+    report(f"wrote {arguments.output_path}", quiet=arguments.quiet)
 
 
 async def _run(
@@ -102,8 +107,17 @@ async def _run(
     prepared: tuple[PreparedVideo, ...],
 ) -> tuple[VideoMMEVideoResult, ...]:
     async with connected_memory(arguments) as memory:
-        return tuple(
-            [
+        results: list[VideoMMEVideoResult] = []
+        for index, (video, prepared_video) in enumerate(
+            zip(videos, prepared, strict=True), start=1
+        ):
+            report_unit(
+                f"video {video.video_id}",
+                index=index,
+                total=len(videos),
+                quiet=arguments.quiet,
+            )
+            results.append(
                 await run_video_mme_video(
                     memory,
                     video,
@@ -116,9 +130,8 @@ async def _run(
                     poll_interval_seconds=arguments.poll_interval_seconds,
                     processing_timeout_seconds=arguments.processing_timeout_seconds,
                 )
-                for video, prepared_video in zip(videos, prepared, strict=True)
-            ]
-        )
+            )
+        return tuple(results)
 
 
 def _write_artifacts(
@@ -214,22 +227,40 @@ def _select_prepared(
     return tuple(by_id[video.video_id] for video in videos)
 
 
-def _parse_arguments() -> _Arguments:
+def _parse_arguments(argv: Sequence[str] | None, prog: str | None) -> _Arguments:
     parser = add_media_arguments(
-        core_parser(tenant_prefix="benchmark_video_mme"),
+        core_parser(tenant_prefix="benchmark_video_mme", prog=prog, description=__doc__),
         device_id="video_mme_camera",
     )
-    parser.add_argument("--prepared-media", type=Path, required=True)
-    parser.add_argument("--dataset-revision", required=True)
-    parser.add_argument("--evaluator-revision", required=True)
-    parser.add_argument("--video-id", action="append", default=[])
     parser.add_argument(
-        "--duration", action="append", default=[], choices=("short", "medium", "long")
+        "--prepared-media", type=Path, required=True, help="manifest of prepared video segments"
     )
     parser.add_argument(
-        "--transcript-source", required=True, choices=("none", "asr", "official_subtitles")
+        "--dataset-revision", required=True, help="revision of the official dataset release"
     )
-    parsed = parser.parse_args()
+    parser.add_argument(
+        "--evaluator-revision", required=True, help="revision of the official evaluator"
+    )
+    parser.add_argument(
+        "--video-id",
+        action="append",
+        default=[],
+        help="official video to run; repeatable, default the whole release",
+    )
+    parser.add_argument(
+        "--duration",
+        action="append",
+        default=[],
+        choices=("short", "medium", "long"),
+        help="official duration band to keep; repeatable, default every band",
+    )
+    parser.add_argument(
+        "--transcript-source",
+        required=True,
+        choices=("none", "asr", "official_subtitles"),
+        help="which official transcript this run ingests, if any",
+    )
+    parsed = parser.parse_args(argv)
     return media_arguments(
         _Arguments,
         parsed,

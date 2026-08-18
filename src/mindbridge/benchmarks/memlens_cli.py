@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, cast
@@ -23,6 +24,8 @@ from mindbridge.benchmarks.cli_common import (
     core_parser,
     media_arguments,
     media_manifest,
+    report,
+    report_unit,
     select_by_id,
     write_run_artifacts,
 )
@@ -91,9 +94,9 @@ class _Arguments(MediaArguments):
     question_ids: tuple[str, ...]
 
 
-def main() -> None:
+def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
     """Run a full context split or its canonical 195-question agent subset."""
-    arguments = _parse_arguments()
+    arguments = _parse_arguments(argv, prog)
     subset_ids = (
         load_memlens_agent_subset(arguments.agent_subset_path)
         if arguments.agent_subset_path is not None
@@ -117,8 +120,10 @@ def main() -> None:
         arguments.deployment_config_path,
         require_worker=not arguments.text_only,
     )
+    report(f"running {len(questions)} questions", quiet=arguments.quiet)
     results = asyncio.run(_run(arguments, questions, prepared))
     _write_artifacts(arguments, questions, results, deployment)
+    report(f"wrote {arguments.output_path}", quiet=arguments.quiet)
 
 
 async def _run(
@@ -129,7 +134,13 @@ async def _run(
     validate_memlens_images(questions, prepared, text_only=arguments.text_only)
     async with connected_memory(arguments) as memory:
         results = []
-        for question in questions:
+        for index, question in enumerate(questions, start=1):
+            report_unit(
+                f"question {question.question_id}",
+                index=index,
+                total=len(questions),
+                quiet=arguments.quiet,
+            )
             results.append(
                 await run_memlens_question(
                     memory,
@@ -231,19 +242,39 @@ def _select_questions(
     return questions
 
 
-def _parse_arguments() -> _Arguments:
+def _parse_arguments(argv: Sequence[str] | None, prog: str | None) -> _Arguments:
     parser = add_media_arguments(
-        core_parser(tenant_prefix="benchmark_memlens"),
+        core_parser(tenant_prefix="benchmark_memlens", prog=prog, description=__doc__),
         device_id="memlens_conversation",
     )
-    parser.add_argument("--prepared-images", type=Path)
-    parser.add_argument("--agent-subset-index", type=Path)
-    parser.add_argument("--context-window", choices=("32k", "64k", "128k", "256k"), required=True)
-    parser.add_argument("--dataset-revision", required=True)
-    parser.add_argument("--evaluator-revision", required=True)
-    parser.add_argument("--text-only", action="store_true")
-    parser.add_argument("--question-id", action="append", default=[])
-    parsed = parser.parse_args()
+    parser.add_argument(
+        "--prepared-images", type=Path, help="manifest of prepared images; omit for --text-only"
+    )
+    parser.add_argument(
+        "--agent-subset-index", type=Path, help="official agent subset index to narrow the run to"
+    )
+    parser.add_argument(
+        "--context-window",
+        choices=("32k", "64k", "128k", "256k"),
+        required=True,
+        help="official context-window track to report under",
+    )
+    parser.add_argument(
+        "--dataset-revision", required=True, help="revision of the official dataset release"
+    )
+    parser.add_argument(
+        "--evaluator-revision", required=True, help="revision of the official evaluator"
+    )
+    parser.add_argument(
+        "--text-only", action="store_true", help="run the text-only track and ingest no images"
+    )
+    parser.add_argument(
+        "--question-id",
+        action="append",
+        default=[],
+        help="official question to run; repeatable, default the whole release",
+    )
+    parsed = parser.parse_args(argv)
     return media_arguments(
         _Arguments,
         parsed,

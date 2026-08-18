@@ -174,4 +174,4 @@ def test_the_metric_flag_is_required_so_omitting_it_is_a_usage_error(
     )
 
     with pytest.raises(SystemExit):
-        official_score._parse_arguments()
+        official_score._parse_arguments(None, None)

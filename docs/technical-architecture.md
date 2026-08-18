@@ -349,7 +349,7 @@ source span；应用层随后按 Event 与 source 的时间交集生成稳定、
 `derived_from_media_object_id` 记录来源，`evidence_clips` 记录 span 到 clip 的映射；内容相同的
 clip 按 sha256 去重到同一个对象，但每个 span 仍保留自己的映射与向量。clip 同时登记进
 `observation_media`，因此既有的 forget 清理会自动回收它们。clip 的对象键按内容寻址，重试覆盖
-同一个对象；上传发生在事务之前，回滚留下的对象由 `mindbridge-lifecycle --reclaim-orphan-clips`
+同一个对象；上传发生在事务之前，回滚留下的对象由 `mindbridge lifecycle --reclaim-orphan-clips`
 按“S3 有、数据库无”回收，且只回收超过宽限期的对象，以免删掉某个 Worker 刚上传、尚未提交的 clip。
 由于向量现在挂在 Event span 上，源 span 不再带向量，检索按 Event span 直接命中记忆，不再需要由源 span 向下展开。Worker 用同一个 Omni Small 批量编码 Event 描述和 Claim 陈述，并在一个
 PostgreSQL 事务中写入 Event、Entity、EntityMention、Claim、MemoryRecord、类型关系、派生 clip
@@ -746,7 +746,7 @@ recall 侧读一份冻结、带 revision 戳、并记进 benchmark manifest 的�
 
 不允许仅因向量相似就自动合并身份或互相矛盾的事件。
 
-当前 Episode、Claim 与 Summary 路径已经实现为同一个 `mindbridge-consolidate` 租户级计划任务。每轮以
+当前 Episode、Claim 与 Summary 路径已经实现为同一个 `mindbridge consolidate` 租户级计划任务。每轮以
 严格早于固定 `evaluated_at` 的记录作为稳定快照，新生成的聚合只会在下一轮继续演化。
 PostgreSQL 只枚举
 `active`、尚无父节点的基础 Event，并用可校准的时间邻近、实体重叠或同一 Jina 兼容空间中的
@@ -837,7 +837,7 @@ strength = salience
 > memory.strength DESC, ...`），所以改动衰减系数不是对分数中性的。标定必须在固定题目切片上实测，
 > 不能假设中性。
 
-首版自动演化由 `mindbridge-lifecycle` 作为租户级计划任务执行：一次完整扫描固定同一
+首版自动演化由 `mindbridge lifecycle` 作为租户级计划任务执行：一次完整扫描固定同一
 `evaluated_at`，按稳定 `memory_id` cursor 分页；年龄衰减从最近一次真实访问开始计算，没有访问
 时才从创建时间开始。更新以原状态、分数、计数和访问时间做乐观锁。扫描期间若
 发生反馈、纠错或删除，则并发操作优先，本次过期结果不会覆盖新状态；下一轮计划任务重新评估。

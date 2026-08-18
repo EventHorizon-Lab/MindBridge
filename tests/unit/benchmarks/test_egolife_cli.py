@@ -36,7 +36,7 @@ def test_egolife_validates_deployment_before_inference(
         tmp_path / "predictions.json",
     )
     arguments.deployment_config_path.write_text("{}", encoding="utf-8")
-    monkeypatch.setattr(egolife_cli, "_parse_arguments", lambda: arguments)
+    monkeypatch.setattr(egolife_cli, "_parse_arguments", lambda *_: arguments)
     monkeypatch.setattr(egolife_cli, "load_egolife_qa", lambda _path: (_question(),))
     monkeypatch.setattr(egolife_cli, "load_prepared_egolife", lambda _path: _prepared())
 
@@ -107,6 +107,7 @@ def _arguments(dataset_path: Path, prepared_path: Path, output_path: Path) -> _A
         processing_timeout_seconds=1_800.0,
         question_ids=(),
         overwrite=False,
+        quiet=True,
     )
 
 

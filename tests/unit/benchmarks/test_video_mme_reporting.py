@@ -128,6 +128,7 @@ def _arguments(
         durations=("long",),
         transcript_source="none",
         overwrite=False,
+        quiet=True,
     )
 
 

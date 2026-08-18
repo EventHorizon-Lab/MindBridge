@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections import Counter
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal
 
@@ -22,6 +23,8 @@ from mindbridge.benchmarks.cli_common import (
     core_arguments,
     core_manifest,
     core_parser,
+    report,
+    report_unit,
     select_by_id,
     write_run_artifacts,
 )
@@ -63,9 +66,9 @@ class _Arguments(CoreArguments):
     sample_ids: tuple[str, ...]
 
 
-def main() -> None:
+def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
     """Run selected official conversations and emit predictions plus a manifest."""
-    arguments = _parse_arguments()
+    arguments = _parse_arguments(argv, prog)
     conversations = select_by_id(
         load_locomo(arguments.dataset_path),
         arguments.sample_ids,
@@ -74,8 +77,10 @@ def main() -> None:
     )
     require_writable_output_pair(arguments.output_path, overwrite=arguments.overwrite)
     deployment = load_deployment_snapshot(arguments.deployment_config_path)
+    report(f"running {len(conversations)} conversations", quiet=arguments.quiet)
     results = asyncio.run(_run_conversations(arguments, conversations))
     _write_artifacts(arguments, conversations, results, deployment)
+    report(f"wrote {arguments.output_path}", quiet=arguments.quiet)
 
 
 async def _run_conversations(
@@ -84,7 +89,13 @@ async def _run_conversations(
 ) -> tuple[LoCoMoOfficialConversationResult, ...]:
     async with connected_memory(arguments) as memory:
         results: list[LoCoMoOfficialConversationResult] = []
-        for conversation in conversations:
+        for index, conversation in enumerate(conversations, start=1):
+            report_unit(
+                f"conversation {conversation.sample_id}",
+                index=index,
+                total=len(conversations),
+                quiet=arguments.quiet,
+            )
             results.append(
                 await run_locomo_conversation(
                     memory,
@@ -139,11 +150,18 @@ def _write_artifacts(
     write_run_artifacts(arguments.output_path, predictions, manifest)
 
 
-def _parse_arguments() -> _Arguments:
-    parser = core_parser(tenant_prefix="benchmark_locomo")
-    parser.add_argument("--source-revision", required=True)
-    parser.add_argument("--sample-id", action="append", default=[])
-    parsed = parser.parse_args()
+def _parse_arguments(argv: Sequence[str] | None, prog: str | None) -> _Arguments:
+    parser = core_parser(tenant_prefix="benchmark_locomo", prog=prog, description=__doc__)
+    parser.add_argument(
+        "--source-revision", required=True, help="revision of the official LoCoMo release"
+    )
+    parser.add_argument(
+        "--sample-id",
+        action="append",
+        default=[],
+        help="official conversation to run; repeatable, default the whole release",
+    )
+    parsed = parser.parse_args(argv)
     return core_arguments(
         _Arguments,
         parsed,
