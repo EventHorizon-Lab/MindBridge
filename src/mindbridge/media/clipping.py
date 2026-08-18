@@ -270,7 +270,16 @@ def _sample_video_frames(
     next_sample_seconds = start_seconds
     with av.open(io.BytesIO(source)) as container:
         stream = container.streams.video[0]
-        stream.thread_type = "AUTO"
+        # Single-threaded on purpose. FFmpeg frame threading intermittently deadlocks against
+        # the OpenMP runtime torchvision loads, and the Worker cuts clips in the same process as
+        # the local embedder, so AUTO hung raw-media jobs until their Celery time limit. It
+        # reproduced roughly one run in three, which is why the cheap fix is to not start the
+        # pool at all rather than to order the imports.
+        # This is not free: a 30s 720p source decodes in 1.7s here against 0.35s with AUTO, and
+        # the gap widens with resolution. ponytail: the ceiling is that this loop has no seek,
+        # so cost is (span end offset x span count) and a long source with many spans can reach
+        # the 900s task limit — seek to start_seconds before that becomes real.
+        stream.thread_type = "NONE"
         for frame in container.decode(stream):
             if frame.time is None:
                 continue

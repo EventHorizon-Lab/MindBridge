@@ -371,30 +371,35 @@ async def _run(
     row it would produce is already in `output_path`: `run_case` is not
     idempotent (each `/aml/add` call writes new memories), so re-running a
     finished case would duplicate memories server-side, not just output rows.
-    Chunks stay serial inside `run_case`; cases run concurrently up to
-    `concurrency`, and rows are appended (de-duplicated by id) as each case's
-    task completes, so a killed run leaves a prefix a rerun can resume from
-    exactly where it stopped.
+    Every case starts at once and one shared semaphore bounds `concurrency`
+    requests in flight across all of them, so the bound is on load the server
+    actually sees rather than on how that load is grouped into cases -- a
+    single-case run parallelises its own chunks and questions instead of
+    running strictly serially. Rows are appended (de-duplicated by id) as each
+    case's task completes, so a killed run leaves a prefix a rerun can resume
+    from exactly where it stopped.
     """
     existing_ids = _read_existing_ids(output_path)
     pending = tuple(case for case in cases if not _case_ids(case) <= existing_ids)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     semaphore = asyncio.Semaphore(concurrency)
 
-    async def bounded(case: AmlCase) -> list[dict[str, object]]:
-        async with semaphore:
-            return await run_case(
+    report(f"replaying {len(pending)} of {len(cases)} cases", quiet=quiet)
+    tasks = [
+        asyncio.create_task(
+            run_case(
                 client,
                 case,
                 run_id=run_id,
                 benchmark=benchmark,
                 top_k=top_k,
                 emit=spec.emit,
+                semaphore=semaphore,
                 timeout=request_timeout_seconds,
             )
-
-    report(f"replaying {len(pending)} of {len(cases)} cases", quiet=quiet)
-    tasks = [asyncio.create_task(bounded(case)) for case in pending]
+        )
+        for case in pending
+    ]
     with output_path.open("a", encoding="utf-8") as handle:
         for index, task in enumerate(asyncio.as_completed(tasks), start=1):
             rows = await task
@@ -553,7 +558,13 @@ def _parse_arguments(argv: Sequence[str] | None, prog: str | None) -> _Arguments
     )
     parser.add_argument("--top-k", type=int, default=20, help="memories to retrieve per question")
     parser.add_argument(
-        "--concurrency", type=_positive_int, default=4, help="cases replayed at once"
+        "--concurrency",
+        type=_positive_int,
+        default=4,
+        help=(
+            "requests in flight across every case; raising it needs "
+            "MINDBRIDGE_DATABASE_MAX_POOL_SIZE raised with it (see README)"
+        ),
     )
     # Matches `cli_common.core_parser`'s `--request-timeout-seconds`, threaded
     # through to `driver.run_case` instead of that module's hardcoded
