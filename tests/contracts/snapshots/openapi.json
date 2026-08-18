@@ -1,6 +1,211 @@
 {
   "components": {
     "schemas": {
+      "AmlAddRequest": {
+        "description": "One synchronously persisted chunk of conversation history.",
+        "properties": {
+          "messages": {
+            "items": {
+              "$ref": "#/components/schemas/AmlMessage"
+            },
+            "maxItems": 512,
+            "minItems": 1,
+            "title": "Messages",
+            "type": "array"
+          },
+          "request_id": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Request Id",
+            "type": "string"
+          },
+          "session_id": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Session Id",
+            "type": "string"
+          },
+          "user_id": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "User Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "request_id",
+          "messages",
+          "user_id",
+          "session_id"
+        ],
+        "title": "AmlAddRequest",
+        "type": "object"
+      },
+      "AmlAddResponse": {
+        "additionalProperties": false,
+        "description": "Byte-exact acknowledgement AML matches against its request.",
+        "properties": {
+          "request_id": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Request Id",
+            "type": "string"
+          },
+          "session_id": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Session Id",
+            "type": "string"
+          },
+          "success": {
+            "const": true,
+            "default": true,
+            "title": "Success",
+            "type": "boolean"
+          },
+          "user_id": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "User Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "request_id",
+          "user_id",
+          "session_id"
+        ],
+        "title": "AmlAddResponse",
+        "type": "object"
+      },
+      "AmlMemoryItem": {
+        "additionalProperties": false,
+        "description": "One retrieved memory in AML's required item shape.",
+        "properties": {
+          "content": {
+            "maxLength": 2048,
+            "minLength": 1,
+            "title": "Content",
+            "type": "string"
+          },
+          "created_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created At"
+          },
+          "id": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "content"
+        ],
+        "title": "AmlMemoryItem",
+        "type": "object"
+      },
+      "AmlMessage": {
+        "description": "One conversation message in an AML add chunk.",
+        "properties": {
+          "content": {
+            "maxLength": 2048,
+            "minLength": 1,
+            "title": "Content",
+            "type": "string"
+          },
+          "role": {
+            "maxLength": 2048,
+            "minLength": 1,
+            "title": "Role",
+            "type": "string"
+          },
+          "timestamp": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Timestamp"
+          }
+        },
+        "required": [
+          "role",
+          "content"
+        ],
+        "title": "AmlMessage",
+        "type": "object"
+      },
+      "AmlSearchRequest": {
+        "description": "One retrieval request scoped to a single AML user.",
+        "properties": {
+          "options": {
+            "default": [],
+            "items": {
+              "maxLength": 2048,
+              "minLength": 1,
+              "type": "string"
+            },
+            "title": "Options",
+            "type": "array"
+          },
+          "query": {
+            "maxLength": 2048,
+            "minLength": 1,
+            "title": "Query",
+            "type": "string"
+          },
+          "top_k": {
+            "maximum": 100.0,
+            "minimum": 1.0,
+            "title": "Top K",
+            "type": "integer"
+          },
+          "user_id": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "User Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "query",
+          "user_id",
+          "top_k"
+        ],
+        "title": "AmlSearchRequest",
+        "type": "object"
+      },
+      "AmlSearchResponse": {
+        "additionalProperties": false,
+        "description": "Ranked evidence, most relevant first.",
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/AmlMemoryItem"
+            },
+            "title": "Data",
+            "type": "array"
+          }
+        },
+        "required": [
+          "data"
+        ],
+        "title": "AmlSearchResponse",
+        "type": "object"
+      },
       "DeletionPage": {
         "additionalProperties": false,
         "description": "Stable ordered tombstones and the next cursor when another page exists.",
@@ -674,7 +879,7 @@
                 "type": "null"
               }
             ],
-            "description": "Where the face sits, as 0..1 normalized `(left, top, right, bottom)` — not pixels. Valid only when `kind` is `face`, and must have positive width and height.",
+            "description": "Where the face sits, as 0..1 normalized `(left, top, right, bottom)` \u2014 not pixels. Valid only when `kind` is `face`, and must have positive width and height.",
             "title": "Visual Bbox Xyxy"
           }
         },
@@ -1481,7 +1686,7 @@
         "properties": {
           "media_object_ids": {
             "default": [],
-            "description": "Stored media to search by, at most 8 and without repeats — an image or clip stands in for the query itself. Required unless `text` is given.",
+            "description": "Stored media to search by, at most 8 and without repeats \u2014 an image or clip stands in for the query itself. Required unless `text` is given.",
             "items": {
               "maxLength": 255,
               "minLength": 1,
@@ -1533,7 +1738,7 @@
           },
           "memory_ids": {
             "default": [],
-            "description": "Restrict the search to exactly these memories, at most 100 and without repeats — this is how a grounded follow-up reuses IDs from a previous result. It is a strict scope, not a ranking hint.",
+            "description": "Restrict the search to exactly these memories, at most 100 and without repeats \u2014 this is how a grounded follow-up reuses IDs from a previous result. It is a strict scope, not a ranking hint.",
             "items": {
               "maxLength": 255,
               "minLength": 1,
@@ -1939,6 +2144,152 @@
   },
   "openapi": "3.1.0",
   "paths": {
+    "/aml/add": {
+      "post": {
+        "operationId": "amlAdd",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AmlAddRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AmlAddResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "`authentication_required` \u2014 a valid bearer API key is required\n\n`authentication_failed` \u2014 the bearer API key is invalid"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "`request_validation_failed` \u2014 request validation failed\n\n`domain_invariant_failed` \u2014 the request is well-formed but violates a memory invariant"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "`model_request_failed` \u2014 memory model rejected its configured request\n\n`model_output_invalid` \u2014 memory model returned invalid output"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "`database_unavailable` \u2014 memory storage is temporarily unavailable\n\n`model_unavailable` \u2014 memory model is unavailable"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Aml Add"
+      }
+    },
+    "/aml/search": {
+      "post": {
+        "operationId": "amlSearch",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AmlSearchRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AmlSearchResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "`authentication_required` \u2014 a valid bearer API key is required\n\n`authentication_failed` \u2014 the bearer API key is invalid"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "`request_validation_failed` \u2014 request validation failed"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "`model_request_failed` \u2014 memory model rejected its configured request\n\n`model_output_invalid` \u2014 memory model returned invalid output"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "`database_unavailable` \u2014 memory storage is temporarily unavailable\n\n`model_unavailable` \u2014 memory model is unavailable"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Aml Search"
+      }
+    },
     "/healthz": {
       "get": {
         "operationId": "health",
@@ -2022,7 +2373,7 @@
                 }
               }
             },
-            "description": "`authentication_required` — a valid bearer API key is required\n\n`authentication_failed` — the bearer API key is invalid"
+            "description": "`authentication_required` \u2014 a valid bearer API key is required\n\n`authentication_failed` \u2014 the bearer API key is invalid"
           },
           "403": {
             "content": {
@@ -2032,7 +2383,7 @@
                 }
               }
             },
-            "description": "`tenant_access_denied` — the authenticated tenant cannot access this resource"
+            "description": "`tenant_access_denied` \u2014 the authenticated tenant cannot access this resource"
           },
           "422": {
             "content": {
@@ -2042,7 +2393,7 @@
                 }
               }
             },
-            "description": "`request_validation_failed` — request validation failed\n\n`domain_invariant_failed` — the request is well-formed but violates a memory invariant"
+            "description": "`request_validation_failed` \u2014 request validation failed\n\n`domain_invariant_failed` \u2014 the request is well-formed but violates a memory invariant"
           },
           "503": {
             "content": {
@@ -2052,7 +2403,7 @@
                 }
               }
             },
-            "description": "`database_unavailable` — memory storage is temporarily unavailable"
+            "description": "`database_unavailable` \u2014 memory storage is temporarily unavailable"
           }
         },
         "security": [
@@ -2109,7 +2460,7 @@
                 }
               }
             },
-            "description": "`authentication_required` — a valid bearer API key is required\n\n`authentication_failed` — the bearer API key is invalid"
+            "description": "`authentication_required` \u2014 a valid bearer API key is required\n\n`authentication_failed` \u2014 the bearer API key is invalid"
           },
           "403": {
             "content": {
@@ -2119,7 +2470,7 @@
                 }
               }
             },
-            "description": "`tenant_access_denied` — the authenticated tenant cannot access this resource"
+            "description": "`tenant_access_denied` \u2014 the authenticated tenant cannot access this resource"
           },
           "404": {
             "content": {
@@ -2129,7 +2480,7 @@
                 }
               }
             },
-            "description": "`forget_target_not_found` — forget target or deletion tombstone does not exist"
+            "description": "`forget_target_not_found` \u2014 forget target or deletion tombstone does not exist"
           },
           "422": {
             "content": {
@@ -2139,7 +2490,7 @@
                 }
               }
             },
-            "description": "`request_validation_failed` — request validation failed"
+            "description": "`request_validation_failed` \u2014 request validation failed"
           },
           "503": {
             "content": {
@@ -2149,7 +2500,7 @@
                 }
               }
             },
-            "description": "`database_unavailable` — memory storage is temporarily unavailable"
+            "description": "`database_unavailable` \u2014 memory storage is temporarily unavailable"
           }
         },
         "security": [
@@ -2192,7 +2543,7 @@
                 }
               }
             },
-            "description": "`authentication_required` — a valid bearer API key is required\n\n`authentication_failed` — the bearer API key is invalid"
+            "description": "`authentication_required` \u2014 a valid bearer API key is required\n\n`authentication_failed` \u2014 the bearer API key is invalid"
           },
           "403": {
             "content": {
@@ -2202,7 +2553,7 @@
                 }
               }
             },
-            "description": "`tenant_access_denied` — the authenticated tenant cannot access this resource"
+            "description": "`tenant_access_denied` \u2014 the authenticated tenant cannot access this resource"
           },
           "404": {
             "content": {
@@ -2212,7 +2563,7 @@
                 }
               }
             },
-            "description": "`memory_not_found` — memory does not exist"
+            "description": "`memory_not_found` \u2014 memory does not exist"
           },
           "409": {
             "content": {
@@ -2222,7 +2573,7 @@
                 }
               }
             },
-            "description": "`idempotency_conflict` — the idempotency key already stores different content"
+            "description": "`idempotency_conflict` \u2014 the idempotency key already stores different content"
           },
           "410": {
             "content": {
@@ -2232,7 +2583,7 @@
                 }
               }
             },
-            "description": "`memory_deleted` — memory content was explicitly deleted"
+            "description": "`memory_deleted` \u2014 memory content was explicitly deleted"
           },
           "422": {
             "content": {
@@ -2242,7 +2593,17 @@
                 }
               }
             },
-            "description": "`request_validation_failed` — request validation failed\n\n`domain_invariant_failed` — the request is well-formed but violates a memory invariant"
+            "description": "`request_validation_failed` \u2014 request validation failed\n\n`domain_invariant_failed` \u2014 the request is well-formed but violates a memory invariant"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "`memory_integrity_failed` \u2014 stored memory is inconsistent"
           },
           "502": {
             "content": {
@@ -2252,7 +2613,7 @@
                 }
               }
             },
-            "description": "`model_request_failed` — memory model rejected its configured request\n\n`model_output_invalid` — memory model returned invalid output"
+            "description": "`model_request_failed` \u2014 memory model rejected its configured request\n\n`model_output_invalid` \u2014 memory model returned invalid output"
           },
           "503": {
             "content": {
@@ -2262,7 +2623,7 @@
                 }
               }
             },
-            "description": "`database_unavailable` — memory storage is temporarily unavailable\n\n`model_unavailable` — memory model is unavailable"
+            "description": "`database_unavailable` \u2014 memory storage is temporarily unavailable\n\n`model_unavailable` \u2014 memory model is unavailable\n\n`object_storage_unavailable` \u2014 evidence media is unavailable"
           }
         },
         "security": [
@@ -2305,7 +2666,7 @@
                 }
               }
             },
-            "description": "`authentication_required` — a valid bearer API key is required\n\n`authentication_failed` — the bearer API key is invalid"
+            "description": "`authentication_required` \u2014 a valid bearer API key is required\n\n`authentication_failed` \u2014 the bearer API key is invalid"
           },
           "403": {
             "content": {
@@ -2315,7 +2676,7 @@
                 }
               }
             },
-            "description": "`tenant_access_denied` — the authenticated tenant cannot access this resource"
+            "description": "`tenant_access_denied` \u2014 the authenticated tenant cannot access this resource"
           },
           "404": {
             "content": {
@@ -2325,7 +2686,7 @@
                 }
               }
             },
-            "description": "`forget_target_not_found` — forget target or deletion tombstone does not exist"
+            "description": "`forget_target_not_found` \u2014 forget target or deletion tombstone does not exist"
           },
           "409": {
             "content": {
@@ -2335,7 +2696,7 @@
                 }
               }
             },
-            "description": "`idempotency_conflict` — the idempotency key already stores different content"
+            "description": "`idempotency_conflict` \u2014 the idempotency key already stores different content"
           },
           "422": {
             "content": {
@@ -2345,7 +2706,7 @@
                 }
               }
             },
-            "description": "`request_validation_failed` — request validation failed"
+            "description": "`request_validation_failed` \u2014 request validation failed"
           },
           "503": {
             "content": {
@@ -2355,7 +2716,7 @@
                 }
               }
             },
-            "description": "`database_unavailable` — memory storage is temporarily unavailable\n\n`object_storage_unavailable` — evidence media is unavailable"
+            "description": "`database_unavailable` \u2014 memory storage is temporarily unavailable\n\n`object_storage_unavailable` \u2014 evidence media is unavailable"
           }
         },
         "security": [
@@ -2412,7 +2773,7 @@
                 }
               }
             },
-            "description": "`authentication_required` — a valid bearer API key is required\n\n`authentication_failed` — the bearer API key is invalid"
+            "description": "`authentication_required` \u2014 a valid bearer API key is required\n\n`authentication_failed` \u2014 the bearer API key is invalid"
           },
           "403": {
             "content": {
@@ -2422,7 +2783,7 @@
                 }
               }
             },
-            "description": "`tenant_access_denied` — the authenticated tenant cannot access this resource"
+            "description": "`tenant_access_denied` \u2014 the authenticated tenant cannot access this resource"
           },
           "404": {
             "content": {
@@ -2432,7 +2793,7 @@
                 }
               }
             },
-            "description": "`job_not_found` — observation processing job does not exist"
+            "description": "`job_not_found` \u2014 observation processing job does not exist"
           },
           "422": {
             "content": {
@@ -2442,7 +2803,7 @@
                 }
               }
             },
-            "description": "`request_validation_failed` — request validation failed"
+            "description": "`request_validation_failed` \u2014 request validation failed"
           },
           "503": {
             "content": {
@@ -2452,7 +2813,7 @@
                 }
               }
             },
-            "description": "`database_unavailable` — memory storage is temporarily unavailable"
+            "description": "`database_unavailable` \u2014 memory storage is temporarily unavailable"
           }
         },
         "security": [
@@ -2509,7 +2870,7 @@
                 }
               }
             },
-            "description": "`authentication_required` — a valid bearer API key is required\n\n`authentication_failed` — the bearer API key is invalid"
+            "description": "`authentication_required` \u2014 a valid bearer API key is required\n\n`authentication_failed` \u2014 the bearer API key is invalid"
           },
           "403": {
             "content": {
@@ -2519,7 +2880,7 @@
                 }
               }
             },
-            "description": "`tenant_access_denied` — the authenticated tenant cannot access this resource"
+            "description": "`tenant_access_denied` \u2014 the authenticated tenant cannot access this resource"
           },
           "404": {
             "content": {
@@ -2529,7 +2890,7 @@
                 }
               }
             },
-            "description": "`job_not_found` — observation processing job does not exist"
+            "description": "`job_not_found` \u2014 observation processing job does not exist"
           },
           "422": {
             "content": {
@@ -2539,7 +2900,7 @@
                 }
               }
             },
-            "description": "`request_validation_failed` — request validation failed"
+            "description": "`request_validation_failed` \u2014 request validation failed"
           },
           "503": {
             "content": {
@@ -2549,7 +2910,7 @@
                 }
               }
             },
-            "description": "`database_unavailable` — memory storage is temporarily unavailable"
+            "description": "`database_unavailable` \u2014 memory storage is temporarily unavailable"
           }
         },
         "security": [
@@ -2592,7 +2953,7 @@
                 }
               }
             },
-            "description": "`authentication_required` — a valid bearer API key is required\n\n`authentication_failed` — the bearer API key is invalid"
+            "description": "`authentication_required` \u2014 a valid bearer API key is required\n\n`authentication_failed` \u2014 the bearer API key is invalid"
           },
           "403": {
             "content": {
@@ -2602,7 +2963,7 @@
                 }
               }
             },
-            "description": "`tenant_access_denied` — the authenticated tenant cannot access this resource"
+            "description": "`tenant_access_denied` \u2014 the authenticated tenant cannot access this resource"
           },
           "409": {
             "content": {
@@ -2612,7 +2973,7 @@
                 }
               }
             },
-            "description": "`idempotency_conflict` — the idempotency key already stores different content"
+            "description": "`idempotency_conflict` \u2014 the idempotency key already stores different content"
           },
           "422": {
             "content": {
@@ -2622,7 +2983,17 @@
                 }
               }
             },
-            "description": "`request_validation_failed` — request validation failed\n\n`domain_invariant_failed` — the request is well-formed but violates a memory invariant"
+            "description": "`request_validation_failed` \u2014 request validation failed\n\n`domain_invariant_failed` \u2014 the request is well-formed but violates a memory invariant"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "`memory_integrity_failed` \u2014 stored memory is inconsistent"
           },
           "502": {
             "content": {
@@ -2632,7 +3003,7 @@
                 }
               }
             },
-            "description": "`model_request_failed` — memory model rejected its configured request\n\n`model_output_invalid` — memory model returned invalid output"
+            "description": "`model_request_failed` \u2014 memory model rejected its configured request\n\n`model_output_invalid` \u2014 memory model returned invalid output"
           },
           "503": {
             "content": {
@@ -2642,7 +3013,7 @@
                 }
               }
             },
-            "description": "`database_unavailable` — memory storage is temporarily unavailable\n\n`model_unavailable` — memory model is unavailable"
+            "description": "`database_unavailable` \u2014 memory storage is temporarily unavailable\n\n`model_unavailable` \u2014 memory model is unavailable\n\n`object_storage_unavailable` \u2014 evidence media is unavailable"
           }
         },
         "security": [
@@ -2699,7 +3070,7 @@
                 }
               }
             },
-            "description": "`authentication_required` — a valid bearer API key is required\n\n`authentication_failed` — the bearer API key is invalid"
+            "description": "`authentication_required` \u2014 a valid bearer API key is required\n\n`authentication_failed` \u2014 the bearer API key is invalid"
           },
           "403": {
             "content": {
@@ -2709,7 +3080,7 @@
                 }
               }
             },
-            "description": "`tenant_access_denied` — the authenticated tenant cannot access this resource"
+            "description": "`tenant_access_denied` \u2014 the authenticated tenant cannot access this resource"
           },
           "404": {
             "content": {
@@ -2719,7 +3090,7 @@
                 }
               }
             },
-            "description": "`memory_not_found` — memory does not exist"
+            "description": "`memory_not_found` \u2014 memory does not exist"
           },
           "410": {
             "content": {
@@ -2729,7 +3100,7 @@
                 }
               }
             },
-            "description": "`memory_deleted` — memory content was explicitly deleted"
+            "description": "`memory_deleted` \u2014 memory content was explicitly deleted"
           },
           "422": {
             "content": {
@@ -2739,7 +3110,17 @@
                 }
               }
             },
-            "description": "`request_validation_failed` — request validation failed"
+            "description": "`request_validation_failed` \u2014 request validation failed"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "`memory_integrity_failed` \u2014 stored memory is inconsistent"
           },
           "503": {
             "content": {
@@ -2749,7 +3130,7 @@
                 }
               }
             },
-            "description": "`database_unavailable` — memory storage is temporarily unavailable"
+            "description": "`database_unavailable` \u2014 memory storage is temporarily unavailable\n\n`object_storage_unavailable` \u2014 evidence media is unavailable"
           }
         },
         "security": [
@@ -2792,7 +3173,7 @@
                 }
               }
             },
-            "description": "`authentication_required` — a valid bearer API key is required\n\n`authentication_failed` — the bearer API key is invalid"
+            "description": "`authentication_required` \u2014 a valid bearer API key is required\n\n`authentication_failed` \u2014 the bearer API key is invalid"
           },
           "403": {
             "content": {
@@ -2802,7 +3183,7 @@
                 }
               }
             },
-            "description": "`tenant_access_denied` — the authenticated tenant cannot access this resource"
+            "description": "`tenant_access_denied` \u2014 the authenticated tenant cannot access this resource"
           },
           "409": {
             "content": {
@@ -2812,7 +3193,7 @@
                 }
               }
             },
-            "description": "`idempotency_conflict` — the idempotency key already stores different content"
+            "description": "`idempotency_conflict` \u2014 the idempotency key already stores different content"
           },
           "422": {
             "content": {
@@ -2822,7 +3203,7 @@
                 }
               }
             },
-            "description": "`request_validation_failed` — request validation failed\n\n`domain_invariant_failed` — the request is well-formed but violates a memory invariant"
+            "description": "`request_validation_failed` \u2014 request validation failed\n\n`domain_invariant_failed` \u2014 the request is well-formed but violates a memory invariant"
           },
           "503": {
             "content": {
@@ -2832,7 +3213,7 @@
                 }
               }
             },
-            "description": "`database_unavailable` — memory storage is temporarily unavailable\n\n`task_broker_unavailable` — observation processing is temporarily unavailable"
+            "description": "`database_unavailable` \u2014 memory storage is temporarily unavailable\n\n`task_broker_unavailable` \u2014 observation processing is temporarily unavailable"
           }
         },
         "security": [
@@ -2875,7 +3256,7 @@
                 }
               }
             },
-            "description": "`authentication_required` — a valid bearer API key is required\n\n`authentication_failed` — the bearer API key is invalid"
+            "description": "`authentication_required` \u2014 a valid bearer API key is required\n\n`authentication_failed` \u2014 the bearer API key is invalid"
           },
           "403": {
             "content": {
@@ -2885,7 +3266,7 @@
                 }
               }
             },
-            "description": "`tenant_access_denied` — the authenticated tenant cannot access this resource"
+            "description": "`tenant_access_denied` \u2014 the authenticated tenant cannot access this resource"
           },
           "422": {
             "content": {
@@ -2895,7 +3276,7 @@
                 }
               }
             },
-            "description": "`request_validation_failed` — request validation failed\n\n`enumeration_limit_exceeded` — the enumerate scope exceeds the bound; narrow the filters"
+            "description": "`request_validation_failed` \u2014 request validation failed\n\n`enumeration_limit_exceeded` \u2014 the enumerate scope exceeds the bound; narrow the filters"
           },
           "500": {
             "content": {
@@ -2905,7 +3286,7 @@
                 }
               }
             },
-            "description": "`memory_integrity_failed` — stored memory is inconsistent"
+            "description": "`memory_integrity_failed` \u2014 stored memory is inconsistent"
           },
           "502": {
             "content": {
@@ -2915,7 +3296,7 @@
                 }
               }
             },
-            "description": "`model_request_failed` — memory model rejected its configured request\n\n`model_output_invalid` — memory model returned invalid output"
+            "description": "`model_request_failed` \u2014 memory model rejected its configured request\n\n`model_output_invalid` \u2014 memory model returned invalid output"
           },
           "503": {
             "content": {
@@ -2925,7 +3306,7 @@
                 }
               }
             },
-            "description": "`database_unavailable` — memory storage is temporarily unavailable\n\n`model_unavailable` — memory model is unavailable"
+            "description": "`database_unavailable` \u2014 memory storage is temporarily unavailable\n\n`model_unavailable` \u2014 memory model is unavailable\n\n`object_storage_unavailable` \u2014 evidence media is unavailable"
           }
         },
         "security": [

@@ -1008,8 +1008,11 @@ Tool 是请求/响应语义，在没有真实调用方要求前不为它发明�
 - OpenAPI 是 REST 契约的唯一事实来源，MCP Tool schema 从同一 Pydantic 模型生成。**错误面也在
   契约里**：`mindbridge.api.errors` 一行一个错误码，同时驱动运行时响应和每个路由的 `responses`，
   所以每个操作声明的状态就是它真能返回的状态，响应体一律是 `ErrorResponse`。路由只声明自己能
-  抛的码——例如 `object_storage_unavailable` 只出现在 `forget` 上，因为只有它的请求路径会碰到
-  媒体字节。
+  抛的码，且共享路径上的码按组声明而不是逐路由手写——例如 `object_storage_unavailable` 出现在
+  `forget` 上，也出现在每个会把 evidence 解析成签名 URL 的操作上（`getMemory`/`remember`/
+  `recordFeedback`/`recall`），因为读一条 memory 不只是读库，`read_resolved_memory_evidence`
+  会为每个媒体对象签一次名。契约快照按挂载了 `/aml/*` 的那个 app 生成，否则这两条路由就落在
+  唯一调用 `app.openapi()` 的地方之外，错误面可以静默回退而门禁不会发现。
 
 ## 10. 生态依附与技术栈
 
