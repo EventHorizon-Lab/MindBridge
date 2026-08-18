@@ -1,0 +1,506 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MindBridge Architecture</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      font-family: 'JetBrains Mono', ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+      background: #020617;
+      min-height: 100vh;
+      padding: 2rem 1.25rem;
+      color: white;
+    }
+
+    .container { max-width: 1400px; margin: 0 auto; }
+
+    .header { margin-bottom: 1.75rem; }
+    .header-row { display: flex; align-items: center; gap: 1rem; margin-bottom: 0.5rem; }
+    .pulse-dot { width: 12px; height: 12px; background: #22d3ee; border-radius: 50%; animation: pulse 2s infinite; }
+    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+
+    h1 { font-size: 1.5rem; font-weight: 700; letter-spacing: -0.025em; }
+    .subtitle { color: #94a3b8; font-size: 0.8125rem; margin-left: 1.75rem; line-height: 1.6; }
+    .subtitle strong { color: #cbd5e1; font-weight: 500; }
+
+    .diagram-container {
+      background: rgba(15, 23, 42, 0.5);
+      border-radius: 1rem;
+      border: 1px solid #1e293b;
+      padding: 1.25rem;
+      overflow-x: auto;
+    }
+
+    svg { width: 100%; min-width: 1100px; display: block; }
+
+    .cards {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+      gap: 1rem;
+      margin-top: 1.75rem;
+    }
+
+    .card {
+      background: rgba(15, 23, 42, 0.5);
+      border-radius: 0.75rem;
+      border: 1px solid #1e293b;
+      padding: 1.25rem;
+    }
+
+    .card-header { display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.75rem; }
+    .card-dot { width: 8px; height: 8px; border-radius: 50%; }
+    .card-dot.cyan { background: #22d3ee; }
+    .card-dot.emerald { background: #34d399; }
+    .card-dot.violet { background: #a78bfa; }
+    .card-dot.rose { background: #fb7185; }
+    .card h3 { font-size: 0.8125rem; font-weight: 600; letter-spacing: 0.02em; }
+
+    .card ul { list-style: none; }
+    .card li { color: #94a3b8; font-size: 0.75rem; line-height: 1.85; }
+    .card li code { color: #cbd5e1; font-size: 0.7rem; }
+    .card li b { color: #e2e8f0; font-weight: 500; }
+
+    footer {
+      margin-top: 1.75rem;
+      color: #475569;
+      font-size: 0.6875rem;
+      line-height: 1.8;
+      border-top: 1px solid #1e293b;
+      padding-top: 1rem;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+
+    <div class="header">
+      <div class="header-row">
+        <div class="pulse-dot"></div>
+        <h1>MindBridge — Agentic Native Embodied Memory System</h1>
+      </div>
+      <div class="subtitle">
+        Memory-as-a-Service，端云分离 · 证据优先 · 冻结模型 · 单库收敛<br>
+        <strong>Model is frozen, Memory is alive; evidence is durable, representations are rebuildable.</strong>
+      </div>
+    </div>
+
+    <div class="diagram-container">
+      <svg viewBox="0 0 1400 1160" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+            <path d="M 40 0 L 0 0 0 40" fill="none" stroke="#1e293b" stroke-width="0.5"/>
+          </pattern>
+          <marker id="arrowhead" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+            <polygon points="0 0, 10 3.5, 0 7" fill="#64748b"/>
+          </marker>
+          <marker id="arrowhead-rose" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+            <polygon points="0 0, 10 3.5, 0 7" fill="#fb7185"/>
+          </marker>
+          <marker id="arrowhead-back" markerWidth="10" markerHeight="7" refX="1" refY="3.5" orient="auto">
+            <polygon points="10 0, 0 3.5, 10 7" fill="#64748b"/>
+          </marker>
+        </defs>
+
+        <rect width="1400" height="1160" fill="url(#grid)"/>
+
+        <!-- ============ REGION BOUNDARIES ============ -->
+        <rect x="24" y="70" width="252" height="578" rx="12" fill="none" stroke="#fbbf24" stroke-width="1.5" stroke-dasharray="8,4"/>
+        <text x="36" y="90" fill="#fbbf24" font-size="9" font-weight="600">EDGE RUNTIME · 全平台同一份代码</text>
+
+        <rect x="320" y="70" width="1056" height="974" rx="12" fill="none" stroke="#fbbf24" stroke-width="1.5" stroke-dasharray="8,4"/>
+        <text x="332" y="90" fill="#fbbf24" font-size="9" font-weight="600">MINDBRIDGE CLOUD · 模块化单体 + 异步 Worker + 一套主数据库</text>
+
+        <rect x="344" y="322" width="496" height="282" rx="10" fill="none" stroke="#475569" stroke-width="1" stroke-dasharray="5,4"/>
+        <text x="356" y="338" fill="#64748b" font-size="8" font-weight="600">READ PATH · 同步</text>
+
+        <rect x="864" y="322" width="494" height="282" rx="10" fill="none" stroke="#475569" stroke-width="1" stroke-dasharray="5,4"/>
+        <text x="876" y="338" fill="#64748b" font-size="8" font-weight="600">WRITE PATH · 异步</text>
+
+        <!-- ============ ARROWS (drawn before boxes) ============ -->
+        <g fill="none" stroke="#64748b" stroke-width="1.2" marker-end="url(#arrowhead)">
+          <!-- clients -> protocol surfaces -->
+          <path d="M 660 68 L 660 92 L 459 92 L 459 112"/>
+          <path d="M 760 68 L 760 92 L 690 92 L 690 112"/>
+          <path d="M 896 68 L 896 112"/>
+          <path d="M 990 68 L 990 92 L 1087 92 L 1087 112"/>
+
+          <!-- protocol surfaces -> kernel -->
+          <path d="M 459 174 L 459 214"/>
+          <path d="M 690 174 L 690 214"/>
+          <path d="M 896 174 L 896 214"/>
+          <path d="M 1087 174 L 1087 214"/>
+
+          <!-- kernel -> read / write -->
+          <path d="M 592 278 L 592 346"/>
+          <path d="M 1100 278 L 1100 292"/>
+          <path d="M 1100 312 L 1100 346"/>
+
+          <!-- edge synchronizer -> ingest -->
+          <path d="M 260 589 L 292 589 L 292 143 L 344 143"/>
+
+          <!-- read/write -> models -->
+          <path d="M 700 604 L 700 630"/>
+          <path d="M 1050 604 L 1050 630"/>
+
+          <!-- read/write -> storage -->
+          <path d="M 430 604 L 430 752"/>
+          <path d="M 800 604 L 800 730 L 1060 730 L 1060 752"/>
+          <path d="M 1250 604 L 1250 752"/>
+          <path d="M 1300 604 L 1300 740 L 660 740 L 660 752"/>
+
+          <!-- scheduled planes <-> storage -->
+          <path d="M 592 920 L 592 886"/>
+          <path d="M 900 920 L 900 886"/>
+          <path d="M 1160 920 L 1160 886"/>
+        </g>
+
+        <!-- read-back arrowheads for the scheduled sweeps -->
+        <g fill="none" stroke="#64748b" stroke-width="1.2" marker-start="url(#arrowhead-back)">
+          <path d="M 560 920 L 560 886"/>
+          <path d="M 868 920 L 868 886"/>
+        </g>
+
+        <!-- auth + deletion propagation (rose, dashed) -->
+        <g fill="none" stroke="#fb7185" stroke-width="1.2" stroke-dasharray="4,4" marker-end="url(#arrowhead-rose)">
+          <path d="M 1273 174 L 1273 200 L 1240 200 L 1240 214"/>
+          <path d="M 344 160 L 304 160 L 304 593 L 260 593"/>
+        </g>
+
+        <!-- arrow labels -->
+        <text x="298" y="330" fill="#94a3b8" font-size="7" text-anchor="middle" transform="rotate(-90 298 330)">resumable sync · idempotent</text>
+        <text x="312" y="700" fill="#fb7185" font-size="7" text-anchor="middle" transform="rotate(-90 312 700)">tombstone pull</text>
+        <text x="1108" y="288" fill="#fb923c" font-size="7">enqueue</text>
+        <text x="436" y="700" fill="#94a3b8" font-size="7">hybrid retrieve</text>
+        <text x="866" y="726" fill="#94a3b8" font-size="7">presigned evidence</text>
+        <text x="1258" y="700" fill="#94a3b8" font-size="7">clips</text>
+        <text x="1000" y="736" fill="#94a3b8" font-size="7">one transactional commit</text>
+        <text x="1281" y="200" fill="#fb7185" font-size="7" text-anchor="end">tenant scope</text>
+
+        <!-- ============ EDGE COMPONENTS ============ -->
+        <!-- internal spine -->
+        <g fill="none" stroke="#64748b" stroke-width="1.2" marker-end="url(#arrowhead)">
+          <path d="M 150 164 L 150 184"/>
+          <path d="M 150 244 L 150 264"/>
+          <path d="M 150 318 L 150 338"/>
+          <path d="M 150 392 L 150 412"/>
+          <path d="M 150 466 L 150 486"/>
+          <path d="M 150 544 L 150 566"/>
+        </g>
+
+        <rect x="40" y="112" width="220" height="52" rx="6" fill="#0f172a"/>
+        <rect x="40" y="112" width="220" height="52" rx="6" fill="rgba(6, 78, 59, 0.4)" stroke="#34d399" stroke-width="1.5"/>
+        <text x="150" y="132" fill="white" font-size="11" font-weight="600" text-anchor="middle">Capture</text>
+        <text x="150" y="148" fill="#94a3b8" font-size="8" text-anchor="middle">camera · mic · gaze · IMU · robot state</text>
+        <text x="150" y="159" fill="#64748b" font-size="7" text-anchor="middle">edge/capture.py · 事件门控后入队</text>
+
+        <rect x="40" y="184" width="220" height="60" rx="6" fill="#0f172a"/>
+        <rect x="40" y="184" width="220" height="60" rx="6" fill="rgba(6, 78, 59, 0.4)" stroke="#34d399" stroke-width="1.5"/>
+        <text x="150" y="204" fill="white" font-size="11" font-weight="600" text-anchor="middle">Local Identity</text>
+        <text x="150" y="220" fill="#94a3b8" font-size="8" text-anchor="middle">InsightFace 人脸 · FunASR 分离</text>
+        <text x="150" y="232" fill="#94a3b8" font-size="8" text-anchor="middle">CAM++ 声纹 · 视觉主说话人</text>
+        <text x="150" y="241" fill="#64748b" font-size="7" text-anchor="middle">identity_inference · identity_diarization</text>
+
+        <rect x="40" y="264" width="220" height="54" rx="6" fill="#0f172a"/>
+        <rect x="40" y="264" width="220" height="54" rx="6" fill="rgba(136, 19, 55, 0.4)" stroke="#fb7185" stroke-width="1.5"/>
+        <text x="150" y="284" fill="white" font-size="11" font-weight="600" text-anchor="middle">SQLite Identity Memory</text>
+        <text x="150" y="299" fill="#fca5b4" font-size="8" text-anchor="middle">加密身份模板 · 默认不离开设备</text>
+        <text x="150" y="311" fill="#64748b" font-size="7" text-anchor="middle">edge/identity.py · AES-GCM 加密样本</text>
+
+        <rect x="40" y="338" width="220" height="54" rx="6" fill="#0f172a"/>
+        <rect x="40" y="338" width="220" height="54" rx="6" fill="rgba(76, 29, 149, 0.4)" stroke="#a78bfa" stroke-width="1.5"/>
+        <text x="150" y="358" fill="white" font-size="11" font-weight="600" text-anchor="middle">SQLite Outbox</text>
+        <text x="150" y="373" fill="#94a3b8" font-size="8" text-anchor="middle">断网缓冲 · 水位 · 媒体文件引用</text>
+        <text x="150" y="385" fill="#64748b" font-size="7" text-anchor="middle">edge/outbox.py · 幂等键 + 失败计数</text>
+
+        <rect x="40" y="412" width="220" height="54" rx="6" fill="#0f172a"/>
+        <rect x="40" y="412" width="220" height="54" rx="6" fill="rgba(76, 29, 149, 0.4)" stroke="#a78bfa" stroke-width="1.5"/>
+        <text x="150" y="432" fill="white" font-size="11" font-weight="600" text-anchor="middle">SQLite Recent Memory</text>
+        <text x="150" y="447" fill="#94a3b8" font-size="8" text-anchor="middle">近期记忆 TTL 缓存 · 断网可查</text>
+        <text x="150" y="459" fill="#64748b" font-size="7" text-anchor="middle">edge/recent_memory.py</text>
+
+        <rect x="40" y="486" width="220" height="58" rx="6" fill="#0f172a"/>
+        <rect x="40" y="486" width="220" height="58" rx="6" fill="rgba(6, 78, 59, 0.4)" stroke="#34d399" stroke-width="1.5"/>
+        <text x="150" y="506" fill="white" font-size="11" font-weight="600" text-anchor="middle">Edge Synchronizer</text>
+        <text x="150" y="521" fill="#94a3b8" font-size="8" text-anchor="middle">断点续传 · 幂等补传 · S3 直传</text>
+        <text x="150" y="536" fill="#64748b" font-size="7" text-anchor="middle">edge/sync.py · 上传校验后再提交 observe</text>
+
+        <rect x="40" y="566" width="220" height="54" rx="6" fill="#0f172a"/>
+        <rect x="40" y="566" width="220" height="54" rx="6" fill="rgba(136, 19, 55, 0.4)" stroke="#fb7185" stroke-width="1.5"/>
+        <text x="150" y="586" fill="white" font-size="11" font-weight="600" text-anchor="middle">Deletion Inbox</text>
+        <text x="150" y="601" fill="#fca5b4" font-size="8" text-anchor="middle">云端墓碑回放 · 端侧可验证遗忘</text>
+        <text x="150" y="613" fill="#64748b" font-size="7" text-anchor="middle">edge/deletion_inbox.py</text>
+
+        <text x="150" y="638" fill="#fbbf24" font-size="7" text-anchor="middle">Jetson · RDK BPU · RKNN · OpenVINO · ARM · 4090/5090 主机</text>
+
+        <!-- ============ CLIENTS ============ -->
+        <rect x="598" y="18" width="500" height="50" rx="6" fill="#0f172a"/>
+        <rect x="598" y="18" width="500" height="50" rx="6" fill="rgba(30, 41, 59, 0.5)" stroke="#94a3b8" stroke-width="1.5"/>
+        <text x="848" y="39" fill="white" font-size="12" font-weight="600" text-anchor="middle">Robot · Agent · Application</text>
+        <text x="848" y="56" fill="#94a3b8" font-size="8" text-anchor="middle">observe · remember · recall · get · feedback · forget</text>
+
+        <!-- ============ PROTOCOL SURFACES ============ -->
+        <rect x="344" y="112" width="230" height="62" rx="6" fill="#0f172a"/>
+        <rect x="344" y="112" width="230" height="62" rx="6" fill="rgba(8, 51, 68, 0.4)" stroke="#22d3ee" stroke-width="1.5"/>
+        <text x="459" y="131" fill="white" font-size="11" font-weight="600" text-anchor="middle">REST API · FastAPI</text>
+        <text x="459" y="146" fill="#94a3b8" font-size="8" text-anchor="middle">/v1/observations · /v1/memories</text>
+        <text x="459" y="157" fill="#94a3b8" font-size="8" text-anchor="middle">/v1/recall · /v1/forget · /v1/feedback</text>
+        <text x="459" y="169" fill="#64748b" font-size="7" text-anchor="middle">/v1/jobs/{id} SSE · /v1/deletions</text>
+
+        <rect x="590" y="112" width="200" height="62" rx="6" fill="#0f172a"/>
+        <rect x="590" y="112" width="200" height="62" rx="6" fill="rgba(8, 51, 68, 0.4)" stroke="#22d3ee" stroke-width="1.5"/>
+        <text x="690" y="131" fill="white" font-size="11" font-weight="600" text-anchor="middle">MCP Server</text>
+        <text x="690" y="146" fill="#94a3b8" font-size="8" text-anchor="middle">6 tools · stdio JSON-RPC</text>
+        <text x="690" y="157" fill="#94a3b8" font-size="8" text-anchor="middle">read-only / idempotent /</text>
+        <text x="690" y="168" fill="#94a3b8" font-size="8" text-anchor="middle">destructive 标注</text>
+
+        <rect x="806" y="112" width="180" height="62" rx="6" fill="#0f172a"/>
+        <rect x="806" y="112" width="180" height="62" rx="6" fill="rgba(8, 51, 68, 0.4)" stroke="#22d3ee" stroke-width="1.5"/>
+        <text x="896" y="131" fill="white" font-size="11" font-weight="600" text-anchor="middle">Python SDK</text>
+        <text x="896" y="146" fill="#94a3b8" font-size="8" text-anchor="middle">httpx async client</text>
+        <text x="896" y="157" fill="#94a3b8" font-size="8" text-anchor="middle">stream_observation_job</text>
+        <text x="896" y="169" fill="#64748b" font-size="7" text-anchor="middle">sdk.py · benchmarks 唯一入口</text>
+
+        <rect x="1002" y="112" width="170" height="62" rx="6" fill="#0f172a"/>
+        <rect x="1002" y="112" width="170" height="62" rx="6" fill="rgba(8, 51, 68, 0.4)" stroke="#22d3ee" stroke-width="1.5"/>
+        <text x="1087" y="131" fill="white" font-size="11" font-weight="600" text-anchor="middle">AML Routes</text>
+        <text x="1087" y="146" fill="#94a3b8" font-size="8" text-anchor="middle">/aml/add · /aml/search</text>
+        <text x="1087" y="158" fill="#64748b" font-size="7" text-anchor="middle">平台兼容层 · 可选挂载</text>
+
+        <rect x="1188" y="112" width="170" height="62" rx="6" fill="#0f172a"/>
+        <rect x="1188" y="112" width="170" height="62" rx="6" fill="rgba(136, 19, 55, 0.4)" stroke="#fb7185" stroke-width="1.5"/>
+        <text x="1273" y="131" fill="white" font-size="11" font-weight="600" text-anchor="middle">Tenant Auth</text>
+        <text x="1273" y="146" fill="#fca5b4" font-size="8" text-anchor="middle">API key → tenant · opt-in</text>
+        <text x="1273" y="158" fill="#fca5b4" font-size="8" text-anchor="middle">+ PostgreSQL row-level security</text>
+        <text x="1273" y="169" fill="#64748b" font-size="7" text-anchor="middle">凭据只从环境读，不进命令行</text>
+
+        <!-- ============ MEMORY KERNEL ============ -->
+        <rect x="344" y="214" width="1014" height="64" rx="6" fill="#0f172a"/>
+        <rect x="344" y="214" width="1014" height="64" rx="6" fill="rgba(6, 78, 59, 0.4)" stroke="#34d399" stroke-width="1.5"/>
+        <text x="851" y="234" fill="white" font-size="12" font-weight="600" text-anchor="middle">Memory Kernel — 唯一用例门面 · application/kernel.py</text>
+        <text x="851" y="250" fill="#94a3b8" font-size="8" text-anchor="middle">observe · remember · recall · record_feedback · forget · get_memory · get/watch_observation_job · list_deletions</text>
+        <text x="851" y="266" fill="#64748b" font-size="7.5" text-anchor="middle">只依赖 application/ports.py 的 Protocol：MemoryStore · Answerer · OccurrenceVerifier · EmbeddingIndex · MediaUrlSigner · MediaDeleter · ObservationJobPublisher · Embedder</text>
+
+        <!-- ============ REDIS BUS ============ -->
+        <rect x="1000" y="292" width="200" height="20" rx="4" fill="rgba(251, 146, 60, 0.3)" stroke="#fb923c" stroke-width="1"/>
+        <text x="1100" y="306" fill="#fb923c" font-size="7.5" text-anchor="middle">Redis 8 · Celery broker</text>
+
+        <!-- ============ READ PATH ============ -->
+        <rect x="364" y="346" width="456" height="44" rx="6" fill="#0f172a"/>
+        <rect x="364" y="346" width="456" height="44" rx="6" fill="rgba(6, 78, 59, 0.4)" stroke="#34d399" stroke-width="1.5"/>
+        <text x="592" y="365" fill="white" font-size="11" font-weight="600" text-anchor="middle">Recall Engine · application/recall.py</text>
+        <text x="592" y="381" fill="#94a3b8" font-size="8" text-anchor="middle">混合召回 → 融合 → 回答 → 证据引用 → 记录访问强化</text>
+
+        <rect x="364" y="406" width="220" height="48" rx="6" fill="#0f172a"/>
+        <rect x="364" y="406" width="220" height="48" rx="6" fill="rgba(6, 78, 59, 0.3)" stroke="#34d399" stroke-width="1.2"/>
+        <text x="474" y="424" fill="white" font-size="9.5" font-weight="600" text-anchor="middle">① 查询编码 + 媒体解析</text>
+        <text x="474" y="438" fill="#94a3b8" font-size="7.5" text-anchor="middle">EmbedTask.QUERY · 图/音查询预签名</text>
+        <text x="474" y="449" fill="#64748b" font-size="7" text-anchor="middle">空间不匹配直接拒绝</text>
+
+        <rect x="600" y="406" width="220" height="48" rx="6" fill="#0f172a"/>
+        <rect x="600" y="406" width="220" height="48" rx="6" fill="rgba(6, 78, 59, 0.3)" stroke="#34d399" stroke-width="1.2"/>
+        <text x="710" y="424" fill="white" font-size="9.5" font-weight="600" text-anchor="middle">② 稠密 ‖ 词法 并发检索</text>
+        <text x="710" y="438" fill="#94a3b8" font-size="7.5" text-anchor="middle">pgvector ANN · tsvector mindbridge_text</text>
+        <text x="710" y="449" fill="#64748b" font-size="7" text-anchor="middle">按 object_type 分三路 ANN</text>
+
+        <rect x="364" y="470" width="456" height="44" rx="6" fill="#0f172a"/>
+        <rect x="364" y="470" width="456" height="44" rx="6" fill="rgba(6, 78, 59, 0.3)" stroke="#34d399" stroke-width="1.2"/>
+        <text x="592" y="488" fill="white" font-size="9.5" font-weight="600" text-anchor="middle">③ 四路入口并发展开 memory</text>
+        <text x="592" y="503" fill="#94a3b8" font-size="7.5" text-anchor="middle">by_evidence · by_ids · by_hierarchy · by_graph_objects（Event / Claim / Entity 直接进图）</text>
+
+        <rect x="364" y="530" width="220" height="48" rx="6" fill="#0f172a"/>
+        <rect x="364" y="530" width="220" height="48" rx="6" fill="rgba(6, 78, 59, 0.3)" stroke="#34d399" stroke-width="1.2"/>
+        <text x="474" y="548" fill="white" font-size="9.5" font-weight="600" text-anchor="middle">④ RRF 排名融合</text>
+        <text x="474" y="562" fill="#94a3b8" font-size="7.5" text-anchor="middle">ranking.py · k=60 · 不比较异构原始分</text>
+        <text x="474" y="573" fill="#64748b" font-size="7" text-anchor="middle">再按 relevance / newest / oldest 排序</text>
+
+        <rect x="600" y="530" width="220" height="48" rx="6" fill="#0f172a"/>
+        <rect x="600" y="530" width="220" height="48" rx="6" fill="rgba(6, 78, 59, 0.3)" stroke="#34d399" stroke-width="1.2"/>
+        <text x="710" y="548" fill="white" font-size="9.5" font-weight="600" text-anchor="middle">⑤ 多轮反思回答</text>
+        <text x="710" y="562" fill="#94a3b8" font-size="7.5" text-anchor="middle">AnswerPipeline · 追问波次 + 证据核验</text>
+        <text x="710" y="573" fill="#64748b" font-size="7" text-anchor="middle">无证据支撑则弃权，不编造</text>
+
+        <!-- ============ WRITE PATH ============ -->
+        <rect x="884" y="346" width="454" height="44" rx="6" fill="#0f172a"/>
+        <rect x="884" y="346" width="454" height="44" rx="6" fill="rgba(6, 78, 59, 0.4)" stroke="#34d399" stroke-width="1.5"/>
+        <text x="1111" y="365" fill="white" font-size="11" font-weight="600" text-anchor="middle">Memory Worker · Celery · worker.py + process_observation.py</text>
+        <text x="1111" y="381" fill="#94a3b8" font-size="8" text-anchor="middle">observe 返回 202 + job_id；理解与索引全部在此进程之外完成</text>
+
+        <rect x="884" y="406" width="218" height="48" rx="6" fill="#0f172a"/>
+        <rect x="884" y="406" width="218" height="48" rx="6" fill="rgba(6, 78, 59, 0.3)" stroke="#34d399" stroke-width="1.2"/>
+        <text x="993" y="424" fill="white" font-size="9.5" font-weight="600" text-anchor="middle">① 抢占任务 · 计次重试</text>
+        <text x="993" y="438" fill="#94a3b8" font-size="7.5" text-anchor="middle">jobs 表持久状态 · RUNNING 续租</text>
+        <text x="993" y="449" fill="#64748b" font-size="7" text-anchor="middle">重复投递返回已有终态</text>
+
+        <rect x="1120" y="406" width="218" height="48" rx="6" fill="#0f172a"/>
+        <rect x="1120" y="406" width="218" height="48" rx="6" fill="rgba(6, 78, 59, 0.3)" stroke="#34d399" stroke-width="1.2"/>
+        <text x="1229" y="424" fill="white" font-size="9.5" font-weight="600" text-anchor="middle">② 感知 · 冻结 VLM / Omni</text>
+        <text x="1229" y="438" fill="#94a3b8" font-size="7.5" text-anchor="middle">PerceptionPipeline · 结构化输出校验</text>
+        <text x="1229" y="449" fill="#64748b" font-size="7" text-anchor="middle">未落到 EvidenceSpan 的输出直接拒收</text>
+
+        <rect x="884" y="470" width="454" height="44" rx="6" fill="#0f172a"/>
+        <rect x="884" y="470" width="454" height="44" rx="6" fill="rgba(6, 78, 59, 0.3)" stroke="#34d399" stroke-width="1.2"/>
+        <text x="1111" y="488" fill="white" font-size="9.5" font-weight="600" text-anchor="middle">③ derive_observation_graph · 重试稳定的纯函数</text>
+        <text x="1111" y="503" fill="#94a3b8" font-size="7.5" text-anchor="middle">Event · Entity · EntityMention · Claim · Relation · MemoryRecord（具名实体租户内全局唯一）</text>
+
+        <rect x="884" y="530" width="218" height="48" rx="6" fill="#0f172a"/>
+        <rect x="884" y="530" width="218" height="48" rx="6" fill="rgba(6, 78, 59, 0.3)" stroke="#34d399" stroke-width="1.2"/>
+        <text x="993" y="548" fill="white" font-size="9.5" font-weight="600" text-anchor="middle">④ 证据切片 + 媒体向量</text>
+        <text x="993" y="562" fill="#94a3b8" font-size="7.5" text-anchor="middle">media/clipping.py · PyAV / Pillow / soundfile</text>
+        <text x="993" y="573" fill="#64748b" font-size="7" text-anchor="middle">按落地后的事件跨度切，不切整文件</text>
+
+        <rect x="1120" y="530" width="218" height="48" rx="6" fill="#0f172a"/>
+        <rect x="1120" y="530" width="218" height="48" rx="6" fill="rgba(6, 78, 59, 0.3)" stroke="#34d399" stroke-width="1.2"/>
+        <text x="1229" y="548" fill="white" font-size="9.5" font-weight="600" text-anchor="middle">⑤ 图文本向量</text>
+        <text x="1229" y="562" fill="#94a3b8" font-size="7.5" text-anchor="middle">Event / Claim / Entity 一并进检索索引</text>
+        <text x="1229" y="573" fill="#64748b" font-size="7" text-anchor="middle">与 ④ asyncio.gather 并发</text>
+
+        <!-- ============ MODEL PLANE ============ -->
+        <rect x="540" y="630" width="660" height="88" rx="8" fill="rgba(30, 41, 59, 0.5)" stroke="#94a3b8" stroke-width="1.5"/>
+        <text x="870" y="648" fill="#e2e8f0" font-size="10" font-weight="600" text-anchor="middle">Model Plane — 只有两个插口，权重冻结</text>
+
+        <rect x="560" y="658" width="300" height="48" rx="6" fill="#0f172a"/>
+        <rect x="560" y="658" width="300" height="48" rx="6" fill="rgba(30, 41, 59, 0.7)" stroke="#94a3b8" stroke-width="1.2"/>
+        <text x="710" y="676" fill="white" font-size="9.5" font-weight="600" text-anchor="middle">Generator</text>
+        <text x="710" y="690" fill="#94a3b8" font-size="7.5" text-anchor="middle">entry point: openai（OpenAI-compatible 端点）</text>
+        <text x="710" y="701" fill="#64748b" font-size="7" text-anchor="middle">perception · answer · episode · claim · summary</text>
+
+        <rect x="880" y="658" width="300" height="48" rx="6" fill="#0f172a"/>
+        <rect x="880" y="658" width="300" height="48" rx="6" fill="rgba(30, 41, 59, 0.7)" stroke="#94a3b8" stroke-width="1.2"/>
+        <text x="1030" y="676" fill="white" font-size="9.5" font-weight="600" text-anchor="middle">Embedder</text>
+        <text x="1030" y="690" fill="#94a3b8" font-size="7.5" text-anchor="middle">entry points: jina · openai</text>
+        <text x="1030" y="701" fill="#64748b" font-size="7" text-anchor="middle">声明 space_reference，API/Worker 双侧校验可达</text>
+
+        <text x="870" y="731" fill="#64748b" font-size="7" text-anchor="middle">models/plugins.py 按 Python entry point 惰性发现 · 任务语义留在 MindBridge，供应商只写 Adapter · 不做 SFT / LoRA / RL</text>
+
+        <!-- ============ STORAGE ============ -->
+        <rect x="344" y="752" width="600" height="134" rx="6" fill="#0f172a"/>
+        <rect x="344" y="752" width="600" height="134" rx="6" fill="rgba(76, 29, 149, 0.4)" stroke="#a78bfa" stroke-width="1.5"/>
+        <text x="644" y="774" fill="white" font-size="12" font-weight="600" text-anchor="middle">PostgreSQL 18 + pgvector — 唯一主库</text>
+        <text x="644" y="791" fill="#c4b5fd" font-size="8" text-anchor="middle">元数据 · 向量 · 全文 · 关系 · 时间，全部同库同事务；21 张表，18 个编号迁移</text>
+        <text x="644" y="811" fill="#94a3b8" font-size="7.5" text-anchor="middle">observations · observation_media · media_objects · evidence_spans · evidence_clips</text>
+        <text x="644" y="824" fill="#94a3b8" font-size="7.5" text-anchor="middle">events · event_observations · event_evidence · entities · entity_mentions</text>
+        <text x="644" y="837" fill="#94a3b8" font-size="7.5" text-anchor="middle">claims · claim_evidence · relations · memory_records · memory_evidence</text>
+        <text x="644" y="850" fill="#94a3b8" font-size="7.5" text-anchor="middle">embeddings · memory_feedback · deletion_tombstones · jobs · idempotency_keys</text>
+        <text x="644" y="868" fill="#64748b" font-size="7" text-anchor="middle">PostgresMemoryStore = 12 个操作 mixin 组合成一个 MemoryStore 边界</text>
+        <text x="644" y="879" fill="#64748b" font-size="7" text-anchor="middle">按租户 row-level security · 无独立向量库 / 图库 / 时序库</text>
+
+        <rect x="964" y="752" width="394" height="134" rx="6" fill="#0f172a"/>
+        <rect x="964" y="752" width="394" height="134" rx="6" fill="rgba(120, 53, 15, 0.3)" stroke="#fbbf24" stroke-width="1.5"/>
+        <text x="1161" y="774" fill="white" font-size="12" font-weight="600" text-anchor="middle">S3-compatible Object Storage</text>
+        <text x="1161" y="791" fill="#fcd34d" font-size="8" text-anchor="middle">最终证据在这里，其余一切都是可重建的派生表示</text>
+        <text x="1161" y="812" fill="#94a3b8" font-size="7.5" text-anchor="middle">原始音视频 · 关键帧 · 派生证据切片</text>
+        <text x="1161" y="826" fill="#94a3b8" font-size="7.5" text-anchor="middle">端侧直传 · 校验后才提交 observe</text>
+        <text x="1161" y="840" fill="#94a3b8" font-size="7.5" text-anchor="middle">召回时按需签发预签名 URL，用后即弃</text>
+        <text x="1161" y="861" fill="#64748b" font-size="7" text-anchor="middle">infrastructure/s3.py</text>
+        <text x="1161" y="874" fill="#64748b" font-size="7" text-anchor="middle">删除是真删对象，不是标记</text>
+
+        <!-- ============ SCHEDULED PLANES ============ -->
+        <rect x="344" y="920" width="496" height="100" rx="6" fill="#0f172a"/>
+        <rect x="344" y="920" width="496" height="100" rx="6" fill="rgba(6, 78, 59, 0.4)" stroke="#34d399" stroke-width="1.5"/>
+        <text x="592" y="942" fill="white" font-size="11" font-weight="600" text-anchor="middle">mindbridge consolidate — 沉淀</text>
+        <text x="592" y="959" fill="#94a3b8" font-size="8" text-anchor="middle">一次运行三轮扫描：Episode → Claim → Summary</text>
+        <text x="592" y="974" fill="#94a3b8" font-size="8" text-anchor="middle">EpisodePipeline · ClaimPipeline · SummaryPipeline（走 Generator）</text>
+        <text x="592" y="991" fill="#64748b" font-size="7" text-anchor="middle">有界候选分页 · 时间间隔 + 相似度双阈值圈定候选</text>
+        <text x="592" y="1003" fill="#64748b" font-size="7" text-anchor="middle">每条沉淀结论都必须重新落到 EvidenceSpan 才提交</text>
+        <text x="592" y="1015" fill="#64748b" font-size="7" text-anchor="middle">consolidation_cli.py · stdout 一个 JSON 对象</text>
+
+        <rect x="864" y="920" width="494" height="100" rx="6" fill="#0f172a"/>
+        <rect x="864" y="920" width="494" height="100" rx="6" fill="rgba(6, 78, 59, 0.4)" stroke="#34d399" stroke-width="1.5"/>
+        <text x="1111" y="942" fill="white" font-size="11" font-weight="600" text-anchor="middle">mindbridge lifecycle — 演化与遗忘</text>
+        <text x="1111" y="959" fill="#94a3b8" font-size="8" text-anchor="middle">强度衰减 · 反馈强化与纠错 · hot → cold → compressed</text>
+        <text x="1111" y="974" fill="#94a3b8" font-size="8" text-anchor="middle">--compress-below 清理切片 · --reclaim-orphan-clips 回收对象</text>
+        <text x="1111" y="991" fill="#64748b" font-size="7" text-anchor="middle">非参数演化：只改记忆状态、索引与统计，从不改模型权重</text>
+        <text x="1111" y="1003" fill="#64748b" font-size="7" text-anchor="middle">--dry-run 一个字节都不写：只数不删，连强度扫描和压缩清理一起跳过</text>
+        <text x="1111" y="1015" fill="#64748b" font-size="7" text-anchor="middle">lifecycle_cli.py · 显式 forget 走 /v1/forget 墓碑链路</text>
+
+        <!-- ============ LEGEND (outside all boundaries) ============ -->
+        <g>
+          <rect x="24" y="1074" width="14" height="10" rx="2" fill="rgba(8, 51, 68, 0.4)" stroke="#22d3ee" stroke-width="1.2"/>
+          <text x="44" y="1083" fill="#94a3b8" font-size="8">协议面</text>
+
+          <rect x="104" y="1074" width="14" height="10" rx="2" fill="rgba(6, 78, 59, 0.4)" stroke="#34d399" stroke-width="1.2"/>
+          <text x="124" y="1083" fill="#94a3b8" font-size="8">应用用例 / 计算</text>
+
+          <rect x="234" y="1074" width="14" height="10" rx="2" fill="rgba(76, 29, 149, 0.4)" stroke="#a78bfa" stroke-width="1.2"/>
+          <text x="254" y="1083" fill="#94a3b8" font-size="8">数据库</text>
+
+          <rect x="314" y="1074" width="14" height="10" rx="2" fill="rgba(120, 53, 15, 0.3)" stroke="#fbbf24" stroke-width="1.2"/>
+          <text x="334" y="1083" fill="#94a3b8" font-size="8">对象存储 / 区域边界</text>
+
+          <rect x="464" y="1074" width="14" height="10" rx="2" fill="rgba(136, 19, 55, 0.4)" stroke="#fb7185" stroke-width="1.2"/>
+          <text x="484" y="1083" fill="#94a3b8" font-size="8">隐私 / 身份 / 遗忘</text>
+
+          <rect x="604" y="1074" width="14" height="10" rx="2" fill="rgba(251, 146, 60, 0.3)" stroke="#fb923c" stroke-width="1.2"/>
+          <text x="624" y="1083" fill="#94a3b8" font-size="8">消息队列</text>
+
+          <rect x="694" y="1074" width="14" height="10" rx="2" fill="rgba(30, 41, 59, 0.5)" stroke="#94a3b8" stroke-width="1.2"/>
+          <text x="714" y="1083" fill="#94a3b8" font-size="8">外部 / 冻结模型</text>
+
+          <line x1="824" y1="1079" x2="858" y2="1079" stroke="#64748b" stroke-width="1.2" marker-end="url(#arrowhead)"/>
+          <text x="866" y="1083" fill="#94a3b8" font-size="8">数据流</text>
+
+          <line x1="926" y1="1079" x2="960" y2="1079" stroke="#fb7185" stroke-width="1.2" stroke-dasharray="4,4" marker-end="url(#arrowhead-rose)"/>
+          <text x="968" y="1083" fill="#94a3b8" font-size="8">鉴权 / 删除传播</text>
+        </g>
+      </svg>
+    </div>
+
+    <div class="cards">
+      <div class="card">
+        <div class="card-header"><div class="card-dot emerald"></div><h3>写入路径 · 异步且幂等</h3></div>
+        <ul>
+          <li>• <b>observe</b> 只做三件事：查幂等键、落 observation + media 行、投递任务，然后 <code>202 + job_id</code> 返回</li>
+          <li>• Worker 抢占任务时带 attempt 计数，重复投递返回已有终态；<code>jobs</code> 表是唯一的真相</li>
+          <li>• 感知输出必须落到 <code>EvidenceSpan</code> 才收，否则整个 attempt 拒收</li>
+          <li>• 切片与图向量 <code>asyncio.gather</code> 并发，最后<b>一次事务</b>提交全部 8 类产物</li>
+          <li>• 切片按<b>落地后的事件跨度</b>切，不切整文件——向量的精度不会超过切它的那段</li>
+        </ul>
+      </div>
+
+      <div class="card">
+        <div class="card-header"><div class="card-dot cyan"></div><h3>召回路径 · 混合且可追证</h3></div>
+        <ul>
+          <li>• 三路 ANN 按 <code>object_type</code> 分开：EvidenceSpan / MemoryRecord / (Event·Claim·Entity)</li>
+          <li>• 第三路是<b>图入口</b>——具名实体可以直接命中并展开邻居，不再依赖 2-hop peer join</li>
+          <li>• 有文本查询时并发跑词法检索（<code>mindbridge_text</code> tsvector，保留 <code>&lt;voice_0&gt;</code> 这类标记）</li>
+          <li>• 四路候选用 <b>RRF（k=60）</b> 融合，不比较异构原始分</li>
+          <li>• 回答走多轮反思波次；无证据支撑就弃权，返回结果永远带 <code>evidence_ids</code></li>
+        </ul>
+      </div>
+
+      <div class="card">
+        <div class="card-header"><div class="card-dot violet"></div><h3>不可变的架构约束</h3></div>
+        <ul>
+          <li>• <b>证据优先</b>：只有 MediaObject / Observation / EvidenceSpan 是终局证据，其余都可重建</li>
+          <li>• <b>冻结模型</b>：不做任何权重微调；系统靠记忆状态、索引、原型和生命周期策略自学习</li>
+          <li>• <b>两个插口</b>：模型层只有 <code>Generator</code> 和 <code>Embedder</code>，任务语义不外包给供应商</li>
+          <li>• <b>一套主库</b>：向量 / 全文 / 关系 / 时间同库同事务，没有独立向量库或图库</li>
+          <li>• <b>三种可信度</b>：<code>verified</code>（传感器证据）· <code>attested</code>（调用者陈述）· <code>unverified</code></li>
+        </ul>
+      </div>
+
+      <div class="card">
+        <div class="card-header"><div class="card-dot rose"></div><h3>边界与分层纪律</h3></div>
+        <ul>
+          <li>• 依赖方向单向：<code>core</code> ← <code>application</code> ← <code>infrastructure</code> / <code>models</code> / <code>api</code> / <code>edge</code></li>
+          <li>• Kernel 只认 <code>ports.py</code> 的 Protocol，PostgreSQL 与 S3 都能整体替换</li>
+          <li>• <code>benchmarks/</code> 是叶子：只能调公开 SDK 和 contracts，任何产品模块都不许 import 它——所以它有自己的二进制 <code>mindbridge-bench</code></li>
+          <li>• 身份模板 AES-GCM 加密留在端上；删除沿 <code>/v1/deletions</code> 回放到设备，是真删对象不是打标记</li>
+          <li>• 媒体 URI 必须是 <code>s3://&lt;配置 bucket&gt;/tenants/&lt;tenant&gt;/…</code>，带 query / fragment 或越出前缀一律拒签</li>
+          <li>• 凭据只从环境读，进程列表、录制的命令和 systemd unit 里都不会带</li>
+        </ul>
+      </div>
+    </div>
+
+    <footer>
+      源自代码实测：<code>src/mindbridge/</code> @ master 374a582 · 21 张表 / 18 个迁移 · PostgreSQL 18 + pgvector 0.8.2 · Redis 8 · Python 3.10–3.11<br>
+      部署粒度按进程切分：<code>uv sync --extra edge</code>（端）· <code>--extra server</code>（API / MCP / 调度）· <code>--extra server --extra cloud-models</code>（Worker）
+    </footer>
+
+  </div>
+</body>
+</html>
