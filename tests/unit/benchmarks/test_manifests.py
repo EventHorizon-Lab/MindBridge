@@ -41,7 +41,7 @@ def test_dataset_adapter_manifest_matches_current_schema() -> None:
 
     assert result.passed is True
     assert {dataset.benchmark: dataset.question_count for dataset in result.datasets} == {
-        "LoCoMo": 1_986,
+        "LoCoMo-Refined": 1_382,
         "M3-Bench-robot": 1_276,
         "M3-Bench-web": 3_214,
         "Video-MME": 2_700,

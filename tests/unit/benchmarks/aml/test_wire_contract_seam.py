@@ -2,7 +2,7 @@
 
 Blocking 1 (final review, 2026-08-17): `AmlAddRequest`/`AmlMessage`
 (`mindbridge.api.aml_contracts`) type `timestamp` as `int | None` -- AML's
-wire contract, epoch milliseconds. Three loaders (`locomo`, `longmemeval`,
+wire contract, epoch milliseconds. Three loaders (`locomo_refined`, `longmemeval`,
 `beam`) emitted free-text dates instead (`"1:56 pm on 8 May, 2023"`,
 `"2023/05/20 (Sat) 02:21"`, `"March-15-2024"`), so the very first
 `/aml/add` of a real run 422'd.
@@ -31,7 +31,7 @@ from mindbridge.benchmarks.aml.cases import AmlCase, chunk_messages
 from mindbridge.benchmarks.aml.loaders import (
     beam,
     clbench,
-    locomo,
+    locomo_refined,
     longmemeval,
     personamem_v1,
     personamem_v2,
@@ -51,7 +51,9 @@ def _assert_wire_compatible(case: AmlCase) -> None:
         )
 
 
-def test_locomo_loader_output_satisfies_the_add_wire_contract(tmp_path: Path) -> None:
+def test_locomo_refined_loader_output_satisfies_the_add_wire_contract(
+    tmp_path: Path,
+) -> None:
     fixture = [
         {
             "sample_id": "conv-1",
@@ -64,13 +66,13 @@ def test_locomo_loader_output_satisfies_the_add_wire_contract(tmp_path: Path) ->
                     {"speaker": "Bob", "dia_id": "D1:2", "text": "hi from bob"},
                 ],
             },
-            "qa": [{"question": "Q1?", "answer": "A1", "evidence": ["D1:1"], "category": 1}],
+            "qa": [{"question": "Q1?", "answer": ["A1"], "evidence": ["D1:1"], "category": 1}],
         }
     ]
-    path = tmp_path / "locomo10.json"
+    path = tmp_path / "locomo_refined.json"
     path.write_text(json.dumps(fixture))
 
-    for case in locomo.load(path):
+    for case in locomo_refined.load(path):
         _assert_wire_compatible(case)
 
 
