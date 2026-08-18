@@ -59,6 +59,10 @@ from mindbridge.models.plugins import close_model, load_embedder, load_generator
 from mindbridge.telemetry import configure_telemetry
 
 _MODEL_REQUEST_TIMEOUT_SECONDS = 780.0
+# The generator fetches these signed URLs itself, so they have to outlive the call that hands
+# them over. Object storage signs for 300s by default, which expired mid-request and came back
+# as a permanent "could not download multimodal content" 400 rather than a retryable fetch.
+_MEDIA_URL_LIFETIME_SECONDS = int(_MODEL_REQUEST_TIMEOUT_SECONDS) + 300
 _RUNNING_RETRY_SECONDS = 30
 _RUNNING_MAX_RETRIES = 40
 _TRANSIENT_MAX_RETRIES = 5
@@ -284,7 +288,10 @@ async def _process_observation_once(
     store = PostgresMemoryStore(
         settings.database_url, embedding_dimension=settings.embedding_dimension
     )
-    media_access = S3MediaAccess(settings.object_storage)
+    media_access = S3MediaAccess(
+        settings.object_storage,
+        url_lifetime_seconds=_MEDIA_URL_LIFETIME_SECONDS,
+    )
     async with AsyncExitStack() as resources:
         generator = load_generator(settings.generator_plugin, settings.generator_config)
         resources.push_async_callback(close_model, generator)

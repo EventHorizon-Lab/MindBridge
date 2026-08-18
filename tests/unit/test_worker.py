@@ -13,7 +13,12 @@ from pydantic import ValidationError
 
 import mindbridge.worker as worker_module
 from mindbridge.application.capabilities import Embedder, EmbedRequest, EmbedResult
-from mindbridge.core import DatabaseUnavailableError, JobState
+from mindbridge.core import (
+    DatabaseUnavailableError,
+    JobState,
+    ModelUnavailableError,
+    ObjectStorageError,
+)
 from mindbridge.infrastructure.task_queue import (
     PROCESS_OBSERVATION_TASK,
     ObservationProcessingTaskMessage,
@@ -165,8 +170,21 @@ def test_worker_task_calls_shared_use_case_with_ids_only(
     assert calls == [("tenant_01", "observation_01", "job_process_observation_01")]
     assert app.conf.worker_concurrency == 1
     assert app.conf.worker_pool == "prefork"
-    assert DatabaseUnavailableError in task.autoretry_for
+    # Pinned as a set, not a membership check: ModelRequestError documents itself as
+    # "retrying an unchanged model request cannot succeed", so widening this tuple has to be
+    # a deliberate edit rather than something a later change can slip in.
+    assert task.autoretry_for == (
+        DatabaseUnavailableError,
+        ModelUnavailableError,
+        ObjectStorageError,
+        SoftTimeLimitExceeded,
+    )
     assert task.max_retries == 5
+
+
+def test_signed_media_urls_outlive_the_model_call_that_fetches_them() -> None:
+    """The generator downloads these URLs itself, so expiry has to beat the request timeout."""
+    assert worker_module._MEDIA_URL_LIFETIME_SECONDS > worker_module._MODEL_REQUEST_TIMEOUT_SECONDS
 
 
 def test_worker_retries_an_observation_owned_by_another_delivery(
