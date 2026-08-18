@@ -66,8 +66,9 @@ async def test_run_case_adds_every_chunk_then_emits_one_row_per_question() -> No
             semaphore=asyncio.Semaphore(8),
         )
 
+    # Both adds precede the search: the assertion is on the barrier, and the equality above
+    # already pins both leading entries to "/aml/add", so re-sorting them proved nothing.
     assert [request.url.path for request in seen] == ["/aml/add", "/aml/add", "/aml/search"]
-    assert sorted(request.url.path for request in seen[:2]) == ["/aml/add", "/aml/add"]
     assert len(rows) == 1
     assert rows[0]["id"] == "locomo:conv-0#q0"
     assert rows[0]["question"] == "Where did Rob move?"

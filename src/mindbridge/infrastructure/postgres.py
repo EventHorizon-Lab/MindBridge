@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+import os
+from collections.abc import Iterable, Mapping
 
 from pgvector.psycopg import register_vector_async
 
@@ -72,6 +73,24 @@ from mindbridge.infrastructure._postgres_types import (
 # ceiling costs nothing until load asks for it; deployments whose PostgreSQL has a lower
 # `max_connections` lower this through MINDBRIDGE_DATABASE_MAX_POOL_SIZE.
 DEFAULT_DATABASE_MAX_POOL_SIZE = 32
+
+
+def resolve_database_max_pool_size(environ: Mapping[str, str] | None = None) -> int:
+    """Read the one ceiling every process that opens a pool has to agree on."""
+    # The API, the Celery worker, and the consolidation and lifecycle sweeps all run against
+    # the same server, so the ceiling above is not a per-process budget -- four processes at
+    # 32 ask for 128 connections from a default `max_connections` of 100. Resolving the
+    # variable here rather than in one process's settings is what makes the comment above
+    # true for all of them: previously only the API read it, so lowering it left the other
+    # three at the default and the deployment still exceeded its server.
+    source = os.environ if environ is None else environ
+    raw = source.get("MINDBRIDGE_DATABASE_MAX_POOL_SIZE")
+    if raw is None:
+        return DEFAULT_DATABASE_MAX_POOL_SIZE
+    size = int(raw)
+    if size < 1:
+        raise ValueError("MINDBRIDGE_DATABASE_MAX_POOL_SIZE must be at least 1")
+    return size
 
 
 class PostgresMemoryStore(

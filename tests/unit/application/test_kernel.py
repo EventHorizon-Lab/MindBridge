@@ -998,6 +998,59 @@ async def test_remember_bounds_its_write_fan_out() -> None:
     assert store.max_concurrent_writes == _MAX_CONCURRENT_MEMORY_WRITES
 
 
+async def test_remember_settles_every_write_before_a_failure_propagates() -> None:
+    """A batch that fails must not leave sibling writes running after the caller is told."""
+    # A bare gather returns on the first exception while its siblings keep going detached, so
+    # the route answers 4xx/5xx while writes it never reported continue against a store whose
+    # request scope is already unwinding. Counting completions after the raise is what
+    # separates "settled" from "abandoned": the failing write is the earliest one, so every
+    # other write is still in flight at the moment the exception is raised.
+    store = _FailingWriteStore(failing_summary="fact 0")
+    kernel = _kernel(store, RecordingAnswerer(), embedder=RecordingEmbedder())
+
+    with pytest.raises(DomainInvariantError, match="write refused"):
+        await kernel.remember(
+            tuple(
+                _remember_request(idempotency_key=f"settle-{index}").model_copy(
+                    update={"summary": f"fact {index}"}
+                )
+                for index in range(8)
+            )
+        )
+
+    assert store.finished == 8
+
+
+class _FailingWriteStore(InMemoryStore):
+    """Fails one write and records how many others ran to completion."""
+
+    def __init__(self, *, failing_summary: str) -> None:
+        super().__init__()
+        self._failing_summary = failing_summary
+        self.finished = 0
+
+    async def write_memory(
+        self,
+        memory: MemoryRecord,
+        *,
+        idempotency_key: str,
+        content_digest: str,
+    ) -> MemoryWriteResult:
+        if memory.summary == self._failing_summary:
+            self.finished += 1
+            raise DomainInvariantError("write refused")
+        # Yield twice so this write is demonstrably still pending when the failure is raised.
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        result = await super().write_memory(
+            memory,
+            idempotency_key=idempotency_key,
+            content_digest=content_digest,
+        )
+        self.finished += 1
+        return result
+
+
 class _ConcurrencyTrackingStore(InMemoryStore):
     """Records the highest number of overlapping `write_memory` calls."""
 
@@ -1026,19 +1079,61 @@ class _ConcurrencyTrackingStore(InMemoryStore):
             self._in_flight -= 1
 
 
-async def test_remember_retry_repairs_embedding_after_model_failure() -> None:
+async def test_remember_writes_nothing_when_the_embedder_fails() -> None:
+    """Embedding precedes the write, so a model failure leaves no half-written memory."""
     store = InMemoryStore()
     embedder = RecordingEmbedder(memory_document_failures=1)
     kernel = _kernel(store, RecordingAnswerer(), embedder=embedder)
-    request = _remember_request(idempotency_key="remember-repair-01")
+    request = _remember_request(idempotency_key="remember-unwritten-01")
 
     with pytest.raises(ModelUnavailableError, match="temporary embedding failure"):
         await kernel.remember(request)
+
+    assert store.memories == {}
+    assert store.embeddings == {}
+
+
+async def test_remember_retry_repairs_an_unindexed_memory() -> None:
+    """A memory whose index write failed is repaired by the retry, not skipped as a duplicate."""
+    # The orphan has to come from the index write rather than the embedder: `remember` embeds
+    # before it writes, so an embedder failure now leaves nothing behind at all (above). This
+    # is the surviving way to reach the repair -- the row lands, its vector does not, and the
+    # retry sees `created=False` and must still index it. Written as a mutation guard: making
+    # `_index_memory` skip every duplicate leaves the memory permanently unretrievable by
+    # vector search, and only the embedding assertion here notices.
+    store = _FailingEmbeddingWriteStore()
+    kernel = _kernel(store, RecordingAnswerer(), embedder=RecordingEmbedder())
+    request = _remember_request(idempotency_key="remember-repair-01")
+
+    with pytest.raises(DomainInvariantError, match="index unavailable"):
+        await kernel.remember(request)
+    assert len(store.memories) == 1
+    assert store.embeddings == {}
+
     repaired = await kernel.remember(request)
 
     assert len(store.memories) == 1
     assert len(store.embeddings) == 1
     assert next(iter(store.embeddings.values())).object_id == repaired.memory_id
+
+
+class _FailingEmbeddingWriteStore(InMemoryStore):
+    """Refuses the first embedding write so the first remember leaves an unindexed memory."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._refusals = 1
+
+    async def write_embedding(
+        self,
+        embedding: EmbeddingRecord,
+        *,
+        allow_reencoding: bool = False,
+    ) -> bool:
+        if self._refusals:
+            self._refusals -= 1
+            raise DomainInvariantError("index unavailable")
+        return await super().write_embedding(embedding, allow_reencoding=allow_reencoding)
 
 
 async def test_hidden_evidence_is_still_used_for_answering() -> None:

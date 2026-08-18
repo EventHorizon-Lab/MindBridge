@@ -56,6 +56,7 @@ class _VideoFrame(Protocol):
 
 class _VideoStream(Protocol):
     thread_type: str
+    thread_count: int
     width: int
     height: int
     pix_fmt: str
@@ -240,6 +241,16 @@ def _cut_video(source: bytes, request: ClipRequest) -> MediaClip:
     with av.open(buffer, mode="w", format="mp4") as container:
         stream = container.add_stream("libx264", rate=_stream_rate(request.frames_per_second))
         stream.width, stream.height, stream.pix_fmt = width, height, "yuv420p"
+        # Single-threaded for the same reason the decode side is, and set here because the
+        # decode setting does not reach it: libx264 carries AV_CODEC_CAP_OTHER_THREADS, so
+        # libavcodec leaves the pool to x264 itself and `thread_type` never touches it.
+        # Measured on PyAV 16.1.0: this loop took the process from 1 OS thread to 7, in the
+        # same Worker that loads torchvision's OpenMP runtime. Whether that pool was the one
+        # that deadlocked is not established -- the reproduction was one run in three and
+        # nobody caught it in the act -- so this closes the remaining way to start native
+        # threads here rather than claiming the earlier fix was aimed wrong.
+        stream.thread_count = 1
+        stream.thread_type = "NONE"
         # Stamp real offsets on a millisecond timeline: rounding the rate to an
         # integer would make a fractional-fps clip play back at the wrong speed
         # and disagree with the duration recorded for it.
