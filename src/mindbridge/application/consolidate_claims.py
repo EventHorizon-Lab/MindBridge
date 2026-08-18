@@ -21,7 +21,7 @@ from mindbridge.application.semantic_claims import (
     derive_claim_consolidation_write,
 )
 from mindbridge.core import ClaimId, MemoryIntegrityError, TenantId
-from mindbridge.telemetry import set_current_span_attributes, trace_operation
+from mindbridge.telemetry import operation_span, set_current_span_attributes
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,7 +78,7 @@ class ConsolidateClaims:
         self._text_embedder = text_embedder
         self._media_url_signer = media_url_signer
 
-    @trace_operation("mindbridge.consolidation.claims")
+    @operation_span("mindbridge.consolidation.claims")
     async def run(self, request: ClaimCandidateRequest) -> ClaimConsolidationResult:
         """Discover, inspect, and atomically commit one stable Claim page."""
         page = await self._store.list_claim_candidates(request)

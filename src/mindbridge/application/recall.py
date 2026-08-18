@@ -55,9 +55,9 @@ from mindbridge.core import (
 )
 from mindbridge.telemetry import (
     current_trace_id,
+    operation_span,
     record_stage_duration,
     set_current_span_attributes,
-    trace_operation,
 )
 
 _MAXIMUM_RETRIEVAL_REFINEMENTS = 2
@@ -110,7 +110,7 @@ class RecallMemories:
             clock=self._clock,
         )
 
-    @trace_operation("mindbridge.recall")
+    @operation_span("mindbridge.recall")
     async def run(self, request: RecallRequest) -> RecallResult:
         """Retrieve memories, inspect evidence, and answer only when supported."""
         started_at = perf_counter()
@@ -308,7 +308,7 @@ class RecallMemories:
         )
         return result
 
-    @trace_operation("mindbridge.recall.answer_round")
+    @operation_span("mindbridge.recall.answer_round")
     async def _answer_candidates(
         self,
         request: RecallRequest,
@@ -435,7 +435,7 @@ class RecallMemories:
             memories = fuse_memory_rankings((semantic, sparse), limit=limit)
         return memories[:limit]
 
-    @trace_operation("mindbridge.recall.semantic_search")
+    @operation_span("mindbridge.recall.semantic_search")
     async def _search_semantic_memories(
         self,
         request: RecallRequest,
@@ -512,7 +512,7 @@ class RecallMemories:
             limit=limit,
         )
 
-    @trace_operation("mindbridge.recall.resolve_query_media")
+    @operation_span("mindbridge.recall.resolve_query_media")
     async def _resolve_query_media(
         self,
         request: RecallRequest,
@@ -532,7 +532,7 @@ class RecallMemories:
             self._media_url_signer,
         )
 
-    @trace_operation("mindbridge.recall.resolve_evidence")
+    @operation_span("mindbridge.recall.resolve_evidence")
     async def _read_evidence(
         self,
         request: RecallRequest,

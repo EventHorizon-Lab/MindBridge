@@ -17,7 +17,7 @@ from mindbridge.core import (
     require_aware_datetime,
     require_non_empty,
 )
-from mindbridge.telemetry import set_current_span_attributes, trace_operation
+from mindbridge.telemetry import operation_span, set_current_span_attributes
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,7 +95,7 @@ class EvolveMemoryLifecycle:
         self._store = store
         self._policy = policy
 
-    @trace_operation("mindbridge.lifecycle.evolve_page")
+    @operation_span("mindbridge.lifecycle.evolve_page")
     async def run(self, request: LifecycleSweepRequest) -> LifecycleSweepResult:
         """Evaluate one page and return the cursor needed for the next page."""
         set_current_span_attributes(

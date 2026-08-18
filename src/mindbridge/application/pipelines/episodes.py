@@ -21,7 +21,7 @@ from mindbridge.application.pipelines.evidence import evidence_parts
 from mindbridge.application.pipelines.structured import generate_json, unwrap_json_code_fence
 from mindbridge.core import DomainInvariantError, Event, EventId, ModelOutputError
 from mindbridge.prompts import CONSOLIDATE_EPISODES_PROMPT
-from mindbridge.telemetry import set_current_span_attributes, trace_operation
+from mindbridge.telemetry import operation_span, set_current_span_attributes
 
 _Description = Annotated[
     str, StringConstraints(strip_whitespace=True, min_length=1, max_length=4096)
@@ -69,7 +69,7 @@ class EpisodePipeline:
         self._generator = generator
         self._max_output_tokens = max_output_tokens
 
-    @trace_operation("mindbridge.pipeline.episodes")
+    @operation_span("mindbridge.pipeline.episodes")
     async def propose_episodes(
         self,
         events: tuple[Event, ...],

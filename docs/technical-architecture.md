@@ -1573,7 +1573,7 @@ answer、forget 和 lifecycle 使用命名领域 span。span 只包含 tenant/de
 正文、完整 Prompt、生物 embedding 或原始媒体。API/MCP 返回的 `trace_id` 使用当前 W3C trace
 ID；无 SDK 的嵌入式调用才生成独立 fallback ID。
 
-所有使用 `trace_operation` 的领域操作同时产生 `mindbridge.operation.calls` Counter 和
+所有使用 `operation_span` 的领域操作同时产生 `mindbridge.operation.calls` Counter 和
 `mindbridge.operation.duration` Histogram。指标维度固定为有限集合的 `operation` 与
 `outcome=success|error|cancelled`，不携带租户、对象 ID、正文或异常内容，既能计算吞吐、错误率和
 P50/P95/P99，也不会制造高基数或隐私泄漏。SLO 阈值由部署的 Collector/监控规则基于真实负载

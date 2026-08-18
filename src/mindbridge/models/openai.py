@@ -48,7 +48,7 @@ from mindbridge.models.defaults import (
     DEFAULT_GENERATOR_MODEL_ID,
     MatryoshkaDimension,
 )
-from mindbridge.telemetry import set_current_span_attributes, trace_operation
+from mindbridge.telemetry import operation_span, set_current_span_attributes
 
 DEFAULT_VIDEO_FRAMES_PER_SECOND = 1.0
 DEFAULT_VIDEO_MAX_PIXELS = 200_704
@@ -113,7 +113,7 @@ class OpenAIGenerator:
             video_max_pixels=video_max_pixels,
         )
 
-    @trace_operation("mindbridge.model.generate")
+    @operation_span("mindbridge.model.generate")
     async def generate(self, request: GenerateRequest) -> GenerateResult:
         """Stream one deterministic text result and normalize provider failures."""
         set_current_span_attributes(
@@ -250,7 +250,7 @@ class OpenAIEmbedder:
         """Declare the search space both aligned endpoints write into."""
         return self._space_reference
 
-    @trace_operation("mindbridge.model.embed")
+    @operation_span("mindbridge.model.embed")
     async def embed(self, request: EmbedRequest) -> EmbedResult:
         """Encode a homogeneous batch without exposing provider request shapes."""
         if not request.inputs:

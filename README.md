@@ -271,7 +271,7 @@ uvx --from huggingface-hub hf download MM-Lifelong/MM-Lifelong \
   --revision 248aa82039a574e63a2e524746a7cd8f32330443 \
   --local-dir .benchmarks/mm-lifelong
 
-uv run --extra benchmarks python -m mindbridge.benchmarks.dataset_smoke \
+uv run --group benchmarks python -m mindbridge.benchmarks.dataset_smoke \
   --locomo .benchmarks/locomo/data/locomo10.json \
   --locomo-revision 3eb6f2c585f5e1699204e3c3bdf7adc5c28cb376 \
   --m3-robot .benchmarks/m3-agent/data/annotations/robot.json \
@@ -771,7 +771,7 @@ declaring `asr` or `official_subtitles` when it carries none. `--duration` scope
 being reported; the overall number is saturated, so the long cell is the one worth quoting:
 
 ```bash
-uv run --extra benchmarks python -m mindbridge.benchmarks.video_mme_cli \
+uv run --group benchmarks python -m mindbridge.benchmarks.video_mme_cli \
   --dataset .benchmarks/video-mme/videomme/test-00000-of-00001.parquet \
   --prepared-media .benchmarks/video-mme-prepared.json \
   --output .benchmarks/results/video-mme-long.json \

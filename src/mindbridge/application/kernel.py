@@ -80,7 +80,6 @@ from mindbridge.telemetry import (
     current_trace_id,
     operation_span,
     set_current_span_attributes,
-    trace_operation,
 )
 
 JOB_POLL_INTERVAL_SECONDS = 1.0
@@ -127,7 +126,7 @@ class MemoryKernel:
             clock=self._clock,
         )
 
-    @trace_operation("mindbridge.observe")
+    @operation_span("mindbridge.observe")
     async def observe(self, request: ObserveRequest) -> ObservationReceipt:
         """Persist one observation atomically and acknowledge retries."""
         set_current_span_attributes(
@@ -169,7 +168,7 @@ class MemoryKernel:
             trace_id=current_trace_id(),
         )
 
-    @trace_operation("mindbridge.remember")
+    @operation_span("mindbridge.remember")
     async def remember(self, request: RememberRequest) -> MemoryResult:
         """Persist explicit content without pretending unsupported input is fact."""
         set_current_span_attributes(
@@ -200,7 +199,7 @@ class MemoryKernel:
         await self._index_memory(stored_memory, skip_existing=not result.created)
         return await self._memory_result(stored_memory)
 
-    @trace_operation("mindbridge.record_feedback")
+    @operation_span("mindbridge.record_feedback")
     async def record_feedback(self, request: FeedbackRequest) -> FeedbackReceipt:
         """Record an explainable learning signal and create a correction version when needed."""
         set_current_span_attributes(
@@ -249,7 +248,7 @@ class MemoryKernel:
             trace_id=current_trace_id(),
         )
 
-    @trace_operation("mindbridge.forget")
+    @operation_span("mindbridge.forget")
     async def forget(self, request: ForgetRequest) -> ForgetReceipt:
         """Explicitly erase one scope through a durable, retry-safe tombstone."""
         set_current_span_attributes(
@@ -299,7 +298,7 @@ class MemoryKernel:
             completed = plan.tombstone
         return _forget_receipt(completed)
 
-    @trace_operation("mindbridge.get_forget_status")
+    @operation_span("mindbridge.get_forget_status")
     async def get_forget_status(self, tenant_id: str, tombstone_id: str) -> ForgetReceipt:
         """Return content-free deletion progress for one tenant-owned tombstone."""
         set_current_span_attributes(
@@ -314,7 +313,7 @@ class MemoryKernel:
         )
         return _forget_receipt(tombstone)
 
-    @trace_operation("mindbridge.list_deletions")
+    @operation_span("mindbridge.list_deletions")
     async def list_deletions(self, request: DeletionListRequest) -> DeletionPage:
         """List stable deletion barriers for reconnecting edge devices."""
         set_current_span_attributes(
@@ -335,7 +334,7 @@ class MemoryKernel:
             trace_id=current_trace_id(),
         )
 
-    @trace_operation("mindbridge.get_observation_job")
+    @operation_span("mindbridge.get_observation_job")
     async def get_observation_job(
         self,
         tenant_id: str,
@@ -376,7 +375,7 @@ class MemoryKernel:
             raise ValueError("maximum_duration_seconds must be positive")
         deadline = self._clock() + timedelta(seconds=maximum_duration_seconds)
         previous: ObservationProcessingJob | None = None
-        with operation_span("mindbridge.watch_observation_job"):
+        async with operation_span("mindbridge.watch_observation_job"):
             while True:
                 job = await self._store.read_observation_processing_job(
                     TenantId(tenant_id),
@@ -390,7 +389,7 @@ class MemoryKernel:
                     return
                 await asyncio.sleep(poll_interval_seconds)
 
-    @trace_operation("mindbridge.get_memory")
+    @operation_span("mindbridge.get_memory")
     async def get_memory(self, tenant_id: str, memory_id: str) -> MemoryResult:
         """Return one tenant-owned memory through the shared stable view."""
         set_current_span_attributes(
@@ -434,7 +433,7 @@ class MemoryKernel:
         )
         return memory_result(memory, evidence)
 
-    @trace_operation("mindbridge.index_memory")
+    @operation_span("mindbridge.index_memory")
     async def _index_memory(self, memory: MemoryRecord, *, skip_existing: bool = False) -> None:
         result = await self._embedder.embed(
             EmbedRequest(

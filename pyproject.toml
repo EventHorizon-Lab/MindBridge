@@ -27,9 +27,6 @@ jina = "mindbridge.models.jina:create_embedder"
 openai = "mindbridge.models.openai:create_embedder"
 
 [project.optional-dependencies]
-benchmarks = [
-    "pyarrow>=18,<26",
-]
 edge = [
     "boto3>=1.40,<2",
     "cryptography>=45,<51",
@@ -83,6 +80,12 @@ explicit = true
 torch = { index = "pytorch-cu128" }
 
 [dependency-groups]
+# Parquet support for the Video-MME and dataset-smoke adapters. A group rather than an
+# extra because the harness that reads Parquet is excluded from the wheel: published as an
+# extra it would install pyarrow for modules the installed package does not contain.
+benchmarks = [
+    "pyarrow>=18,<26",
+]
 dev = [
     "boto3-stubs[s3]>=1.40,<2",
     "mypy>=1.15,<3",
@@ -93,6 +96,11 @@ dev = [
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/mindbridge"]
+# The benchmark harness is a leaf nothing shipped imports (enforced by
+# tests/test_package.py) and it cannot run from an installed wheel anyway: its datasets,
+# run manifests, and the pinned AML sources all live outside the package. Keeping it out
+# of the wheel stops every deployment from carrying a quarter of the tree it cannot use.
+exclude = ["src/mindbridge/benchmarks"]
 
 [tool.ruff]
 target-version = "py310"
