@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -23,6 +24,7 @@ from mindbridge.benchmarks.cli_common import (
     core_parser,
     media_arguments,
     media_manifest,
+    report,
     select_by_id,
     write_run_artifacts,
 )
@@ -72,9 +74,9 @@ class _Arguments(MediaArguments):
     question_ids: tuple[str, ...]
 
 
-def main() -> None:
+def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
     """Run selected official questions and emit scored predictions plus a manifest."""
-    arguments = _parse_arguments()
+    arguments = _parse_arguments(argv, prog)
     questions = select_by_id(
         load_egolife_qa(arguments.dataset_path),
         arguments.question_ids,
@@ -87,8 +89,12 @@ def main() -> None:
         arguments.deployment_config_path,
         require_worker=any(clip.media_object is not None for clip in prepared.clips),
     )
+    # Per-unit lines would have to come from inside the runner, which owns the
+    # concurrency this benchmark ingests with; the run announces its size instead.
+    report(f"running {len(questions)} questions", quiet=arguments.quiet)
     results = asyncio.run(_run(arguments, questions, prepared))
     _write_artifacts(arguments, questions, prepared, results, deployment)
+    report(f"wrote {arguments.output_path}", quiet=arguments.quiet)
 
 
 async def _run(
@@ -159,16 +165,30 @@ def _write_artifacts(
     write_run_artifacts(arguments.output_path, predictions, manifest)
 
 
-def _parse_arguments() -> _Arguments:
+def _parse_arguments(argv: Sequence[str] | None, prog: str | None) -> _Arguments:
     parser = add_media_arguments(
-        core_parser(tenant_prefix="benchmark_egolife"),
+        core_parser(tenant_prefix="benchmark_egolife", prog=prog, description=__doc__),
         device_id="egolife_camera",
     )
-    parser.add_argument("--prepared-media", type=Path, required=True)
-    parser.add_argument("--dataset-revision", required=True)
-    parser.add_argument("--evaluator-revision", required=True)
-    parser.add_argument("--question-id", action="append", default=[])
-    parsed = parser.parse_args()
+    parser.add_argument(
+        "--prepared-media",
+        type=Path,
+        required=True,
+        help="manifest of clips prepared from the official stream",
+    )
+    parser.add_argument(
+        "--dataset-revision", required=True, help="revision of the official dataset release"
+    )
+    parser.add_argument(
+        "--evaluator-revision", required=True, help="revision of the official evaluator"
+    )
+    parser.add_argument(
+        "--question-id",
+        action="append",
+        default=[],
+        help="official question to run; repeatable, default the whole release",
+    )
+    parsed = parser.parse_args(argv)
     return media_arguments(
         _Arguments,
         parsed,

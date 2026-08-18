@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -24,6 +25,8 @@ from mindbridge.benchmarks.cli_common import (
     index_prepared,
     media_arguments,
     media_manifest,
+    report,
+    report_unit,
     select_by_id,
     write_run_artifacts,
 )
@@ -72,9 +75,9 @@ class _Arguments(MediaArguments):
     example_ids: tuple[int, ...]
 
 
-def main() -> None:
+def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
     """Run selected questions and emit the exact public leaderboard submission shape."""
-    arguments = _parse_arguments()
+    arguments = _parse_arguments(argv, prog)
     questions = select_by_id(
         load_egomem_reason(arguments.dataset_path),
         arguments.example_ids,
@@ -89,8 +92,10 @@ def main() -> None:
             clip.media_object is not None for stream in prepared.values() for clip in stream.clips
         ),
     )
+    report(f"running {len(questions)} questions", quiet=arguments.quiet)
     results = asyncio.run(_run(arguments, questions, prepared))
     _write_artifacts(arguments, questions, prepared, results, deployment)
+    report(f"wrote {arguments.output_path}", quiet=arguments.quiet)
 
 
 async def _run(
@@ -100,7 +105,14 @@ async def _run(
 ) -> tuple[EgoMemReasonResult, ...]:
     async with connected_memory(arguments) as memory:
         by_example_id: dict[int, EgoMemReasonResult] = {}
-        for identity in dict.fromkeys(question.identity for question in questions):
+        identities = tuple(dict.fromkeys(question.identity for question in questions))
+        for index, identity in enumerate(identities, start=1):
+            report_unit(
+                f"identity {identity}",
+                index=index,
+                total=len(identities),
+                quiet=arguments.quiet,
+            )
             identity_questions = tuple(
                 question for question in questions if question.identity == identity
             )
@@ -188,16 +200,31 @@ def _prepared_by_identity(
     return {identity: by_identity[identity] for identity in identities}
 
 
-def _parse_arguments() -> _Arguments:
+def _parse_arguments(argv: Sequence[str] | None, prog: str | None) -> _Arguments:
     parser = add_media_arguments(
-        core_parser(tenant_prefix="benchmark_egomem"),
+        core_parser(tenant_prefix="benchmark_egomem", prog=prog, description=__doc__),
         device_id="egolife_camera",
     )
-    parser.add_argument("--prepared-media", type=Path, required=True)
-    parser.add_argument("--dataset-revision", required=True)
-    parser.add_argument("--evaluator-revision", required=True)
-    parser.add_argument("--example-id", type=int, action="append", default=[])
-    parsed = parser.parse_args()
+    parser.add_argument(
+        "--prepared-media",
+        type=Path,
+        required=True,
+        help="manifest of clips prepared from the official streams",
+    )
+    parser.add_argument(
+        "--dataset-revision", required=True, help="revision of the official dataset release"
+    )
+    parser.add_argument(
+        "--evaluator-revision", required=True, help="revision of the official evaluator"
+    )
+    parser.add_argument(
+        "--example-id",
+        type=int,
+        action="append",
+        default=[],
+        help="official example to run; repeatable, default the whole release",
+    )
+    parsed = parser.parse_args(argv)
     return media_arguments(
         _Arguments,
         parsed,

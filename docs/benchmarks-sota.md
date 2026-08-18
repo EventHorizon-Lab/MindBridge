@@ -295,7 +295,7 @@ EgoMemReason 用留出答案键的 leaderboard。run manifest 在 scorer 运行�
 装下结果，所以结果落在一个独立的 `*.score.json` sidecar 里：
 
 ```bash
-uv run python -m mindbridge.benchmarks.official_score \
+uv run mindbridge-bench score \
   --predictions runs/locomo/predictions.json \
   --manifest runs/locomo/predictions.json.manifest.json \
   --scorer-output runs/locomo/official-scorer-stdout.json \

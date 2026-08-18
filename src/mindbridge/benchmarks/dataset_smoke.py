@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-import argparse
+from collections.abc import Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 
 from pydantic import AwareDatetime, Field
 
+from mindbridge.benchmarks.cli import parser as build_parser
 from mindbridge.benchmarks.egolife_qa import EGOLIFE_QA_ADAPTER_VERSION, load_egolife_qa
 from mindbridge.benchmarks.egomem_reason import (
     EGOMEM_REASON_ADAPTER_VERSION,
@@ -219,32 +220,77 @@ def run_dataset_adapter_smoke(
     )
 
 
-def main() -> None:
+def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
     """Run the official-data smoke and emit a versioned JSON manifest."""
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--locomo", type=Path, required=True)
-    parser.add_argument("--locomo-revision", required=True)
-    parser.add_argument("--m3-robot", type=Path, required=True)
-    parser.add_argument("--m3-web", type=Path, required=True)
-    parser.add_argument("--m3-revision", required=True)
-    parser.add_argument("--video-mme", type=Path, required=True)
-    parser.add_argument("--video-mme-revision", required=True)
-    parser.add_argument("--egolife", type=Path, required=True)
-    parser.add_argument("--egolife-revision", required=True)
-    parser.add_argument("--egotempo", type=Path, required=True)
-    parser.add_argument("--egotempo-revision", required=True)
-    parser.add_argument("--egomem", type=Path, required=True)
-    parser.add_argument("--egomem-revision", required=True)
-    parser.add_argument("--memlens", type=Path, required=True)
-    parser.add_argument("--memlens-revision", required=True)
-    parser.add_argument("--mm-day", type=Path, required=True)
-    parser.add_argument("--mm-week", type=Path, required=True)
-    parser.add_argument("--mm-month-train", type=Path, required=True)
-    parser.add_argument("--mm-month-val", type=Path, required=True)
-    parser.add_argument("--mm-lifelong-revision", required=True)
-    parser.add_argument("--supermemory", type=Path, required=True)
-    parser.add_argument("--supermemory-revision", required=True)
-    arguments = parser.parse_args()
+    parser = build_parser(prog=prog, description=__doc__)
+    parser.add_argument(
+        "--locomo", type=Path, required=True, help="official locomo release to parse"
+    )
+    parser.add_argument(
+        "--locomo-revision", required=True, help="revision pinned for the locomo release"
+    )
+    parser.add_argument(
+        "--m3-robot", type=Path, required=True, help="official m3 robot release to parse"
+    )
+    parser.add_argument(
+        "--m3-web", type=Path, required=True, help="official m3 web release to parse"
+    )
+    parser.add_argument("--m3-revision", required=True, help="revision pinned for the m3 release")
+    parser.add_argument(
+        "--video-mme", type=Path, required=True, help="official video mme release to parse"
+    )
+    parser.add_argument(
+        "--video-mme-revision", required=True, help="revision pinned for the video mme release"
+    )
+    parser.add_argument(
+        "--egolife", type=Path, required=True, help="official egolife release to parse"
+    )
+    parser.add_argument(
+        "--egolife-revision", required=True, help="revision pinned for the egolife release"
+    )
+    parser.add_argument(
+        "--egotempo", type=Path, required=True, help="official egotempo release to parse"
+    )
+    parser.add_argument(
+        "--egotempo-revision", required=True, help="revision pinned for the egotempo release"
+    )
+    parser.add_argument(
+        "--egomem", type=Path, required=True, help="official egomem release to parse"
+    )
+    parser.add_argument(
+        "--egomem-revision", required=True, help="revision pinned for the egomem release"
+    )
+    parser.add_argument(
+        "--memlens", type=Path, required=True, help="official memlens release to parse"
+    )
+    parser.add_argument(
+        "--memlens-revision", required=True, help="revision pinned for the memlens release"
+    )
+    parser.add_argument(
+        "--mm-day", type=Path, required=True, help="official mm day release to parse"
+    )
+    parser.add_argument(
+        "--mm-week", type=Path, required=True, help="official mm week release to parse"
+    )
+    parser.add_argument(
+        "--mm-month-train",
+        type=Path,
+        required=True,
+        help="official mm month train release to parse",
+    )
+    parser.add_argument(
+        "--mm-month-val", type=Path, required=True, help="official mm month val release to parse"
+    )
+    parser.add_argument(
+        "--mm-lifelong-revision", required=True, help="revision pinned for the mm lifelong release"
+    )
+    parser.add_argument(
+        "--supermemory", type=Path, required=True, help="official supermemory release to parse"
+    )
+    parser.add_argument(
+        "--supermemory-revision", required=True, help="revision pinned for the supermemory release"
+    )
+    arguments = parser.parse_args(argv)
     result = run_dataset_adapter_smoke(
         locomo_path=arguments.locomo,
         locomo_revision=arguments.locomo_revision,

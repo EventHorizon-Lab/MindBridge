@@ -22,6 +22,7 @@ from mindbridge.application.consolidation_sweep import (
     consolidate_tenant_summaries,
 )
 from mindbridge.application.pipelines import ClaimPipeline, EpisodePipeline, SummaryPipeline
+from mindbridge.cli import parser as build_parser
 from mindbridge.configuration import (
     copy_plugin_configuration,
     parse_aware_datetime,
@@ -44,6 +45,27 @@ from mindbridge.models.defaults import (
 )
 from mindbridge.models.plugins import close_model, load_embedder, load_generator
 from mindbridge.telemetry import configure_telemetry
+
+CONSOLIDATION_ENVIRONMENT = """environment:
+  MINDBRIDGE_DATABASE_URL           PostgreSQL DSN (required). Read from the environment
+                                    rather than a flag so the DSN never reaches a process
+                                    list or this shell's history.
+  MINDBRIDGE_OBJECT_STORAGE_BUCKET, MINDBRIDGE_OBJECT_STORAGE_ENDPOINT_URL
+                                    object storage holding the source audio and video
+                                    this sweep lets the Generator inspect
+  MINDBRIDGE_GENERATOR_PLUGIN, MINDBRIDGE_EMBEDDER_PLUGIN
+                                    model plugins to load (default: openai)
+  MINDBRIDGE_GENERATOR_API_KEY, MINDBRIDGE_GENERATOR_ENDPOINT,
+  MINDBRIDGE_GENERATOR_MODEL_REVISION
+                                    required by the default openai generator plugin;
+                                    MINDBRIDGE_GENERATOR_MODEL_ID is optional
+  MINDBRIDGE_EMBEDDER_API_KEY, MINDBRIDGE_EMBEDDER_ENDPOINT
+                                    required by the default openai embedder plugin;
+                                    MINDBRIDGE_EMBEDDER_MODEL_ID and _MODEL_REVISION
+                                    are optional
+  MINDBRIDGE_GENERATOR_CONFIG_JSON, MINDBRIDGE_EMBEDDER_CONFIG_JSON
+                                    explicit plugin configuration; an object here
+                                    replaces the per-field variables above"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,15 +120,16 @@ class ConsolidationSettings:
         )
 
 
-def main(argv: Sequence[str] | None = None) -> None:
+def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
     """Run one tenant sweep using only explicit process configuration."""
+    options = _parser(prog).parse_args(argv)
+    # Configured after parsing so --help and a rejected flag stay side-effect free.
     configure_telemetry("mindbridge-consolidation")
-    options = _parser().parse_args(argv)
     summary = asyncio.run(
         _run_postgres_sweep(
             ConsolidationSettings.from_environment(),
             TenantId(options.tenant_id),
-            options.evaluated_at,
+            options.evaluated_at or utc_now(),
             page_size=options.page_size,
             maximum_gap_seconds=options.maximum_gap_seconds,
             minimum_similarity=options.minimum_similarity,
@@ -196,19 +219,60 @@ async def _run_postgres_sweep(
         )
 
 
-def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--tenant-id", required=True)
-    parser.add_argument("--evaluated-at", type=parse_aware_datetime, default=utc_now())
-    parser.add_argument("--page-size", type=int, default=16)
-    parser.add_argument("--maximum-gap-seconds", type=int, default=900)
-    parser.add_argument("--minimum-similarity", type=float, default=0.7)
-    parser.add_argument("--claim-page-size", type=int, default=16)
-    parser.add_argument("--claim-maximum-gap-seconds", type=int, default=2_592_000)
-    parser.add_argument("--claim-minimum-similarity", type=float, default=0.8)
-    parser.add_argument("--summary-page-size", type=int, default=16)
-    parser.add_argument("--summary-maximum-gap-seconds", type=int, default=2_592_000)
-    parser.add_argument("--summary-minimum-similarity", type=float, default=0.8)
+def _parser(prog: str | None = None) -> argparse.ArgumentParser:
+    parser = build_parser(prog=prog, description=__doc__, epilog=CONSOLIDATION_ENVIRONMENT)
+    parser.add_argument("--tenant-id", required=True, help="tenant whose memories are swept")
+    parser.add_argument(
+        "--evaluated-at",
+        type=parse_aware_datetime,
+        metavar="TIMESTAMP",
+        help="the one aware instant this whole sweep evaluates at (default: now)",
+    )
+    parser.add_argument(
+        "--page-size", type=int, default=16, help="Episode candidates per bounded page"
+    )
+    parser.add_argument(
+        "--maximum-gap-seconds",
+        type=int,
+        default=900,
+        help="longest silence two Events may span and still join one Episode",
+    )
+    parser.add_argument(
+        "--minimum-similarity",
+        type=float,
+        default=0.7,
+        help="lowest similarity two Events may have and still join one Episode",
+    )
+    parser.add_argument(
+        "--claim-page-size", type=int, default=16, help="Claim candidates per bounded page"
+    )
+    parser.add_argument(
+        "--claim-maximum-gap-seconds",
+        type=int,
+        default=2_592_000,
+        help="longest span two memories may cover and still support one Claim",
+    )
+    parser.add_argument(
+        "--claim-minimum-similarity",
+        type=float,
+        default=0.8,
+        help="lowest similarity two memories may have and still support one Claim",
+    )
+    parser.add_argument(
+        "--summary-page-size", type=int, default=16, help="Summary candidates per bounded page"
+    )
+    parser.add_argument(
+        "--summary-maximum-gap-seconds",
+        type=int,
+        default=2_592_000,
+        help="longest span two memories may cover and still join one Summary",
+    )
+    parser.add_argument(
+        "--summary-minimum-similarity",
+        type=float,
+        default=0.8,
+        help="lowest similarity two memories may have and still join one Summary",
+    )
     return parser
 
 

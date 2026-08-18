@@ -47,6 +47,8 @@ from mindbridge.benchmarks.artifacts import (
     sidecar_manifest_path,
     write_text_atomically,
 )
+from mindbridge.benchmarks.cli import parser as build_parser
+from mindbridge.benchmarks.cli_common import report, report_unit
 from mindbridge.contracts import ContractModel, Identifier, NonEmptyString, Sha256Hex
 from mindbridge.file_integrity import sha256_file
 
@@ -130,6 +132,11 @@ class BenchmarkSpec:
     load: Callable[[Sequence[Path]], tuple[AmlCase, ...]]
     emit: EmitFn
     pipeline: Path
+
+
+AML_ENVIRONMENT = """environment:
+  MINDBRIDGE_AML_API_KEY  bearer token for --api-base-url; required, read from the
+                          environment so a recorded invocation never carries it"""
 
 
 BENCHMARKS: dict[str, BenchmarkSpec] = {
@@ -231,11 +238,12 @@ class _Arguments:
     top_k: int
     concurrency: int
     request_timeout_seconds: float
+    quiet: bool
 
 
-def main() -> None:
+def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
     """Load cases, replay them, and record predictions plus a manifest."""
-    arguments = _parse_arguments()
+    arguments = _parse_arguments(argv, prog)
     spec = BENCHMARKS[arguments.benchmark]
     deployment = load_deployment_snapshot(arguments.deployment_config_path)
     _require_compatible_existing_manifest(
@@ -251,7 +259,7 @@ def main() -> None:
     )
     api_key = os.environ.get("MINDBRIDGE_AML_API_KEY")
     if not api_key:
-        raise SystemExit("MINDBRIDGE_AML_API_KEY must be set")
+        raise ValueError("MINDBRIDGE_AML_API_KEY must be set")
     tenant_ids = asyncio.run(_connect_and_run(arguments, spec, cases, api_key))
     _write_manifest(arguments, deployment, tenant_ids)
 
@@ -337,6 +345,7 @@ async def _connect_and_run(
             output_path=arguments.output_path,
             tenant_prefix=arguments.tenant_prefix,
             request_timeout_seconds=arguments.request_timeout_seconds,
+            quiet=arguments.quiet,
         )
 
 
@@ -352,6 +361,7 @@ async def _run(
     output_path: Path,
     tenant_prefix: str,
     request_timeout_seconds: float = 600.0,
+    quiet: bool = False,
 ) -> dict[str, str]:
     """Run every not-yet-finished case and append its rows; resumable by id.
 
@@ -381,10 +391,13 @@ async def _run(
                 timeout=request_timeout_seconds,
             )
 
+    report(f"replaying {len(pending)} of {len(cases)} cases", quiet=quiet)
     tasks = [asyncio.create_task(bounded(case)) for case in pending]
     with output_path.open("a", encoding="utf-8") as handle:
-        for task in asyncio.as_completed(tasks):
-            for row in await task:
+        for index, task in enumerate(asyncio.as_completed(tasks), start=1):
+            rows = await task
+            report_unit("case complete", index=index, total=len(pending), quiet=quiet)
+            for row in rows:
                 written_id = str(row["id"])
                 if written_id in existing_ids:
                     continue
@@ -483,9 +496,18 @@ def _positive_int(raw: str) -> int:
     return value
 
 
-def _parse_arguments() -> _Arguments:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--benchmark", required=True, choices=sorted(BENCHMARKS))
+def _parse_arguments(argv: Sequence[str] | None, prog: str | None) -> _Arguments:
+    parser = build_parser(
+        prog=prog,
+        description="Run one Agent Memory Leaderboard benchmark against a deployed API.",
+        epilog=AML_ENVIRONMENT,
+    )
+    parser.add_argument(
+        "--benchmark",
+        required=True,
+        choices=sorted(BENCHMARKS),
+        help="which AML pipeline to replay",
+    )
     parser.add_argument(
         "--dataset",
         type=Path,
@@ -494,27 +516,58 @@ def _parse_arguments() -> _Arguments:
         required=True,
         help="one per positional argument the benchmark's loader takes, in order",
     )
-    parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--api-base-url", required=True)
-    parser.add_argument("--code-revision", required=True)
-    parser.add_argument("--deployment-config", type=Path, required=True)
-    parser.add_argument("--run-id", required=True)
+    parser.add_argument(
+        "-o",
+        "--output",
+        type=Path,
+        required=True,
+        help="JSONL rows to append to; a resumed run keeps the rows already there",
+    )
+    parser.add_argument(
+        "--api-base-url", required=True, help="base URL of the deployed MindBridge API"
+    )
+    parser.add_argument(
+        "--code-revision", required=True, help="git revision of the code under measurement"
+    )
+    parser.add_argument(
+        "--deployment-config",
+        type=Path,
+        required=True,
+        help="JSON description of the deployment that answered",
+    )
+    parser.add_argument(
+        "--run-id", required=True, help="identifier this run's tenants and manifest are pinned to"
+    )
     # No default: the server derives its half of the same mapping from its
     # own `MINDBRIDGE_AML_TENANT_PREFIX` (see `AmlRunManifest`'s
     # `client_derived_tenant_ids` docstring), which nothing on the wire
     # confirms. A default here would let an operator silently inherit a
     # value the deployment may not share; requiring it explicitly forces
     # that choice to be made on purpose (Important 3, task-13 review).
-    parser.add_argument("--tenant-prefix", required=True)
-    parser.add_argument("--top-k", type=int, default=20)
-    parser.add_argument("--concurrency", type=_positive_int, default=4)
+    parser.add_argument(
+        "--tenant-prefix",
+        required=True,
+        help="prefix the deployment agrees on; deliberately has no default",
+    )
+    parser.add_argument("--top-k", type=int, default=20, help="memories to retrieve per question")
+    parser.add_argument(
+        "--concurrency", type=_positive_int, default=4, help="cases replayed at once"
+    )
     # Matches `cli_common.core_parser`'s `--request-timeout-seconds`, threaded
     # through to `driver.run_case` instead of that module's hardcoded
     # `timeout=600.0` on every `/aml/add` and `/aml/search` call (Cheap 5,
     # final review, 2026-08-17), and pinned in the manifest like every other
     # benchmark runner already pins it.
-    parser.add_argument("--request-timeout-seconds", type=float, default=600.0)
-    parsed = parser.parse_args()
+    parser.add_argument(
+        "--request-timeout-seconds", type=float, default=600.0, help="deadline for one request"
+    )
+    parser.add_argument(
+        "-q",
+        "--quiet",
+        action="store_true",
+        help="suppress the progress lines this replay writes to stderr",
+    )
+    parsed = parser.parse_args(argv)
     return _Arguments(
         benchmark=parsed.benchmark,
         dataset_paths=tuple(parsed.dataset),
@@ -527,6 +580,7 @@ def _parse_arguments() -> _Arguments:
         top_k=parsed.top_k,
         concurrency=parsed.concurrency,
         request_timeout_seconds=parsed.request_timeout_seconds,
+        quiet=parsed.quiet,
     )
 
 

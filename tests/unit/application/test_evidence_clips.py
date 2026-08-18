@@ -266,6 +266,28 @@ async def test_reclaim_deletes_only_clips_the_database_never_registered() -> Non
     assert (summary.scanned_count, summary.reclaimed_count) == (2, 1)
 
 
+async def test_reclaim_counts_the_orphans_a_dry_run_would_delete() -> None:
+    """`--dry-run` has to report the size of an irreversible sweep without running it."""
+    registered, orphan = "1" * 64, "2" * 64
+    janitor = RecordingJanitor(
+        keys=(
+            f"tenants/tenant_01/clips/{registered}.wav",
+            f"tenants/tenant_01/clips/{orphan}.wav",
+        )
+    )
+
+    summary = await reclaim_orphan_clips(
+        TENANT_ID,
+        janitor=janitor,
+        digests=KnownDigests(frozenset({registered})),
+        now=NOW,
+        dry_run=True,
+    )
+
+    assert janitor.deleted == []
+    assert (summary.scanned_count, summary.reclaimed_count) == (2, 1)
+
+
 async def test_reclaim_batches_digest_lookups() -> None:
     """A large prefix must not become one giant IN clause."""
     keys = tuple(f"tenants/tenant_01/clips/{index:064d}.wav" for index in range(5))

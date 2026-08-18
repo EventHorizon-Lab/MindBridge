@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 import os
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Protocol, cast
@@ -18,6 +18,7 @@ from mindbridge.api.auth import TenantApiKeyAuthenticator
 from mindbridge.api.mcp import build_mcp_server
 from mindbridge.application.kernel import MemoryKernel
 from mindbridge.application.pipelines import AnswerPipeline, OccurrencePipeline
+from mindbridge.cli import parser as build_parser
 from mindbridge.configuration import (
     copy_plugin_configuration,
     optional_environment_value,
@@ -232,8 +233,26 @@ def create_mcp_server(settings: Settings | None = None) -> MCPServer[None]:
     return build_mcp_server(runtime.kernel, lifespan=lifespan)
 
 
-def run_mcp() -> None:
-    """Run the deployable MCP server over stdio."""
+MCP_ENVIRONMENT = """environment:
+  MINDBRIDGE_DATABASE_URL      PostgreSQL DSN (required)
+  MINDBRIDGE_TASK_BROKER_URL   Celery broker URL for observation processing (required)
+  MINDBRIDGE_TENANT_API_KEYS_JSON, MINDBRIDGE_GENERATOR_*, MINDBRIDGE_EMBEDDER_*
+                               the same variables the HTTP API process reads"""
+
+
+def run_mcp(argv: Sequence[str] = (), *, prog: str | None = None) -> None:
+    """Run the deployable MCP server over stdio.
+
+    It takes no flags of its own; the parser exists so `--help` and `--version` answer
+    instead of silently starting a server that then blocks on stdin. `argv` defaults to
+    nothing rather than to `sys.argv`, because this is public API: a launcher that calls
+    `run_mcp()` must not have its own flags parsed as the server's.
+    """
+    build_parser(
+        prog=prog,
+        description="Serve the deployable MindBridge MCP server over stdio.",
+        epilog=MCP_ENVIRONMENT,
+    ).parse_args(argv)
     create_mcp_server().run(transport="stdio")
 
 

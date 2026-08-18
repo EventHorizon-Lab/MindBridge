@@ -232,6 +232,7 @@ def test_manifest_carries_source_deployment_and_tenant_mapping(tmp_path: Path) -
         top_k=10,
         concurrency=2,
         request_timeout_seconds=600.0,
+        quiet=True,
     )
     deployment = load_deployment_snapshot(deployment_path)
     tenant_ids = {
@@ -312,6 +313,7 @@ def test_write_manifest_counts_oversized_unsliced_questions_from_output_rows(
         top_k=10,
         concurrency=2,
         request_timeout_seconds=600.0,
+        quiet=True,
     )
     deployment = load_deployment_snapshot(deployment_path)
 
@@ -361,6 +363,7 @@ def _arguments(
         "top_k": 10,
         "concurrency": 2,
         "request_timeout_seconds": 600.0,
+        "quiet": True,
     }
     fields.update(overrides)
     return _Arguments(**fields)  # type: ignore[arg-type]

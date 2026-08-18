@@ -64,6 +64,58 @@ MINDBRIDGE_REQUIRE_INTEGRATION=1 uv run pytest -W error
 
 With that variable set, a missing test database fails the run instead of skipping it.
 
+## Command line
+
+Two commands, each a table of subcommands. `mindbridge` runs the deployable processes;
+`mindbridge-bench` runs the reproducible benchmark harness. They are separate binaries
+because `benchmarks/` is a leaf no product module may import (see AGENTS.md), so neither
+tree can address or borrow from the other.
+
+Either command with no arguments lists its table; any subcommand's `--help` documents its own
+flags, their defaults, the environment variables it reads, and its exit status:
+
+```bash
+uv run mindbridge
+```
+
+```bash
+uv run --extra server mindbridge lifecycle --help
+```
+
+| Command | Subcommands |
+| --- | --- |
+| `mindbridge` | `consolidate`, `lifecycle`, `mcp`, `edge sync` |
+| `mindbridge-bench` | `locomo`, `m3`, `egolife`, `egomem`, `egotempo`, `memlens`, `mm-lifelong`, `supermemory`, `video-mme`, `aml` |
+| `mindbridge-bench` support | `score`, `datasets`, `jina`, `bakeoff` |
+
+A subcommand's module is imported only when that subcommand runs, so each tree's own `--help`
+costs nothing and a missing optional extra cannot break the commands whose extras are
+installed. A subcommand whose extra is absent says which one to install rather than printing
+a traceback. `mindbridge-consolidate`, `mindbridge-lifecycle`, and `mindbridge-mcp` remain as
+aliases for the subcommands of the same name; they behave identically and report the same
+codes. The API and the memory Worker are long-running processes started by `uvicorn` and
+`celery`, not subcommands — see [Run the MaaS API](#run-the-maas-api) and
+[Run the memory Worker](#run-the-memory-worker).
+
+Both trees follow the same contract:
+
+- **stderr is for progress, stdout is for output.** `consolidate` and `lifecycle` print one
+  JSON object on stdout; the benchmark runners write their predictions and manifest to
+  `--output` and print nothing on stdout; `mcp` speaks JSON-RPC on stdout, so never redirect
+  it. Commands that report progress do it on stderr, and `-q`/`--quiet` silences those lines
+  (the benchmark runners; the sweeps have no progress to silence).
+- **exit status is documented.** `0` completed, `1` failed with a one-line message on stderr,
+  `2` the invocation was unusable, `130` interrupted. Every failure is one line by default,
+  infrastructure failures included; set `MINDBRIDGE_TRACEBACK=1` to get the frames back.
+- **credentials come from the environment, never a flag**, so a recorded invocation, a process
+  list, and a systemd unit never carry them. Each command's `--help` names the variables it
+  reads.
+- **`-V`/`--version`** reports the installed distribution on either tree and on every
+  subcommand.
+- **irreversible work has a preview.** `mindbridge lifecycle --reclaim-orphan-clips --dry-run`
+  writes nothing at all: it counts the orphan objects it would delete, deletes none of them,
+  and skips the strength sweep, whose counters then stay zero.
+
 ## Local PostgreSQL
 
 The production store uses PostgreSQL 18 with pgvector 0.8+; filtered HNSW recall relies on iterative
@@ -103,7 +155,7 @@ Cloud multimodal embedding dependencies are optional so the API and edge package
 
 ```bash
 uv sync --extra cloud-models
-uv run --extra cloud-models python -m mindbridge.benchmarks.jina_smoke \
+uv run --extra cloud-models mindbridge-bench jina \
   --revision 12949877f0092093f366c6450340011320152a05
 ```
 
@@ -173,8 +225,13 @@ reads, are recorded in
 `personamem-v1` takes `questions_csv` then `contexts_jsonl`; `personamem-v2` takes `benchmark_csv`
 then `data_root`.
 
+The replay reads its bearer token from `MINDBRIDGE_AML_API_KEY`, which is the client
+credential for `--api-base-url` and is separate from the `MINDBRIDGE_API_KEY` the other
+runners use:
+
 ```bash
-uv run python -m mindbridge.benchmarks.aml.cli \
+export MINDBRIDGE_AML_API_KEY=...
+uv run mindbridge-bench aml \
   --benchmark locomo \
   --dataset .benchmarks/locomo/data/locomo10.json \
   --output .benchmarks/results/aml-locomo.jsonl \
@@ -271,7 +328,7 @@ uvx --from huggingface-hub hf download MM-Lifelong/MM-Lifelong \
   --revision 248aa82039a574e63a2e524746a7cd8f32330443 \
   --local-dir .benchmarks/mm-lifelong
 
-uv run --extra benchmarks python -m mindbridge.benchmarks.dataset_smoke \
+uv run --extra benchmarks mindbridge-bench datasets \
   --locomo .benchmarks/locomo/data/locomo10.json \
   --locomo-revision 3eb6f2c585f5e1699204e3c3bdf7adc5c28cb376 \
   --m3-robot .benchmarks/m3-agent/data/annotations/robot.json \
@@ -400,7 +457,7 @@ from the deployed processes:
 
 ```bash
 export MINDBRIDGE_API_KEY=replace-with-a-runtime-secret
-uv run python -m mindbridge.benchmarks.locomo_cli \
+uv run mindbridge-bench locomo \
   --dataset .benchmarks/locomo/data/locomo10.json \
   --output .benchmarks/results/locomo-mindbridge.json \
   --api-base-url http://localhost:8000 \
@@ -479,7 +536,7 @@ Event/Entity/Claim records that share the source `EvidenceSpan`. Recall therefor
 text and structured cues together, then reopens each distinct source object before answering.
 
 ```bash
-uv run python -m mindbridge.benchmarks.m3_cli \
+uv run mindbridge-bench m3 \
   --dataset .benchmarks/m3-agent/data/annotations/robot.json \
   --prepared-media .benchmarks/m3-prepared-robot.json \
   --output .benchmarks/results/m3-robot-mindbridge.jsonl \
@@ -547,7 +604,7 @@ raw-media and caption clip counts separately. Use raw media for the end-to-end p
 the pinned official captions for a reproducible comparison with EgoRAG-style memory results.
 
 ```bash
-uv run python -m mindbridge.benchmarks.egolife_cli \
+uv run mindbridge-bench egolife \
   --dataset .benchmarks/egolife/EgoLifeQA/EgoLifeQA_A1_JAKE.json \
   --prepared-media .benchmarks/egolife-prepared-a1.json \
   --output .benchmarks/results/egolife-a1.json \
@@ -599,7 +656,7 @@ the caller prepares that VRS with the upstream Project Aria tooling.
 ```
 
 ```bash
-uv run python -m mindbridge.benchmarks.supermemory_cli \
+uv run mindbridge-bench supermemory \
   --dataset .benchmarks/supermemory-vqa/data/json/all_qa.json \
   --prepared-media .benchmarks/supermemory-prepared-person-1.json \
   --output .benchmarks/results/supermemory-person-1.json \
@@ -619,7 +676,7 @@ withholds clips that cross each official `query_time`, supports the released A-J
 writes the exact answer-key-free leaderboard submission shape:
 
 ```bash
-uv run python -m mindbridge.benchmarks.egomem_cli \
+uv run mindbridge-bench egomem \
   --dataset .benchmarks/egomem-reason/annotations_public.jsonl \
   --prepared-media .benchmarks/egomem-prepared.json \
   --output .benchmarks/results/egomem-submission.json \
@@ -660,7 +717,7 @@ contains the official judge fields under `data` and can be passed directly to th
 `xrenaf/MEMLENS` `llm_judge.py`:
 
 ```bash
-uv run python -m mindbridge.benchmarks.memlens_cli \
+uv run mindbridge-bench memlens \
   --dataset .benchmarks/memlens/dataset_32k.json \
   --prepared-images .benchmarks/memlens-prepared-images.json \
   --agent-subset-index .benchmarks/memlens/agent_subset_195.json \
@@ -713,7 +770,7 @@ The JSONL retains `question`, `answer`, and `pred.answer` for the released accur
 manifest:
 
 ```bash
-uv run python -m mindbridge.benchmarks.mm_lifelong_cli \
+uv run mindbridge-bench mm-lifelong \
   --dataset .benchmarks/mm-lifelong/month/val.json \
   --prepared-media .benchmarks/mm-lifelong-month-val-prepared.json \
   --output .benchmarks/results/mm-lifelong-month-val.jsonl \
@@ -771,7 +828,7 @@ declaring `asr` or `official_subtitles` when it carries none. `--duration` scope
 being reported; the overall number is saturated, so the long cell is the one worth quoting:
 
 ```bash
-uv run --extra benchmarks python -m mindbridge.benchmarks.video_mme_cli \
+uv run --extra benchmarks mindbridge-bench video-mme \
   --dataset .benchmarks/video-mme/videomme/test-00000-of-00001.parquet \
   --prepared-media .benchmarks/video-mme-prepared.json \
   --output .benchmarks/results/video-mme-long.json \
@@ -789,7 +846,7 @@ EgoTempo writes the official `V`, `Q`, `QA`, `A`, `C`, and `M` fields. Run its p
 `gemini_eval.ipynb` for the released semantic judge rather than substituting a local metric:
 
 ```bash
-uv run python -m mindbridge.benchmarks.egotempo_cli \
+uv run mindbridge-bench egotempo \
   --dataset .benchmarks/egotempo/egotempo_openQA.json \
   --prepared-media .benchmarks/egotempo-prepared.json \
   --output .benchmarks/results/egotempo.json \
@@ -826,7 +883,7 @@ written before any of those scorers execute, so it can only pin inputs. Record t
 a different run:
 
 ```bash
-uv run python -m mindbridge.benchmarks.official_score \
+uv run mindbridge-bench score \
   --predictions .benchmarks/results/locomo.json \
   --manifest .benchmarks/results/locomo.json.manifest.json \
   --scorer-output .benchmarks/results/locomo-scorer-stdout.json \
@@ -931,7 +988,7 @@ Agents can start the same production kernel over the official MCP stdio transpor
 structured output schemas are generated from the same Pydantic contracts used by REST and Python:
 
 ```bash
-uv run --extra server mindbridge-mcp
+uv run --extra server mindbridge mcp
 ```
 
 The stable tools are `memory_observe`, `memory_remember`, `memory_recall`, `memory_get`,
@@ -1053,7 +1110,7 @@ It reuses the database, object-storage, Generator, Embedder, and shared embeddin
 no task broker or local Jina Omni model is required:
 
 ```bash
-uv run --extra server mindbridge-consolidate --tenant-id tenant_01
+uv run --extra server mindbridge consolidate --tenant-id tenant_01
 ```
 
 Each sweep fixes one `evaluated_at`, scans bounded candidate pages, and lets the selected Generator inspect
@@ -1071,7 +1128,7 @@ Run automatic decay as a tenant-scoped scheduled job. A complete run uses stable
 one fixed evaluation instant; concurrent feedback or deletion wins through optimistic guards:
 
 ```bash
-uv run --extra server mindbridge-lifecycle --tenant-id tenant_01
+uv run --extra server mindbridge lifecycle --tenant-id tenant_01
 ```
 
 Schedule this command with the deployment's existing CronJob/systemd/Celery beat control plane.
@@ -1084,7 +1141,7 @@ retry from multiplying that object, and `--reclaim-orphan-clips` deletes whateve
 The flag also reads the object storage variables, so enable it only where those are configured:
 
 ```bash
-uv run --extra server mindbridge-lifecycle --tenant-id tenant_01 --reclaim-orphan-clips
+uv run --extra server mindbridge lifecycle --tenant-id tenant_01 --reclaim-orphan-clips
 ```
 
 ## Run the edge path
@@ -1201,7 +1258,7 @@ Drain a bounded batch with the standard Boto3 credential chain and the typed Min
 
 ```bash
 export MINDBRIDGE_API_KEY=replace-with-a-runtime-secret
-uv run --extra edge python -m mindbridge.edge.sync_cli \
+uv run --extra edge mindbridge edge sync \
   --database /var/lib/mindbridge/edge.db \
   --api-base-url https://memory.example.com \
   --bucket mindbridge-media \

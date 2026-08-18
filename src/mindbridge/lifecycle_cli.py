@@ -18,6 +18,7 @@ from mindbridge.application.lifecycle import (
     LifecycleSweepRequest,
     MemoryLifecycleStore,
 )
+from mindbridge.cli import parser as build_parser
 from mindbridge.configuration import (
     parse_aware_datetime,
     require_environment_value,
@@ -33,6 +34,14 @@ from mindbridge.core import (
 from mindbridge.infrastructure.postgres import PostgresMemoryStore
 from mindbridge.infrastructure.s3 import S3MediaAccess
 from mindbridge.telemetry import configure_telemetry
+
+LIFECYCLE_ENVIRONMENT = """environment:
+  MINDBRIDGE_DATABASE_URL          PostgreSQL DSN (required). Read from the environment
+                                   rather than a flag so the DSN never reaches a process
+                                   list or this shell's history.
+  MINDBRIDGE_OBJECT_STORAGE_BUCKET, MINDBRIDGE_OBJECT_STORAGE_ENDPOINT_URL
+                                   object storage holding derived evidence clips; read
+                                   only when --reclaim-orphan-clips is given"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,10 +94,14 @@ async def sweep_tenant_lifecycle(
     )
 
 
-def main(argv: Sequence[str] | None = None) -> None:
+def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
     """Run one tenant sweep using PostgreSQL configured by the process environment."""
+    parser = _parser(prog)
+    options = parser.parse_args(argv)
+    if options.dry_run and not options.reclaim_orphan_clips:
+        parser.error("--dry-run only applies to --reclaim-orphan-clips")
+    # Configured after parsing so --help and a rejected flag stay side-effect free.
     configure_telemetry("mindbridge-lifecycle")
-    options = _parser().parse_args(argv)
     policy = MemoryStrengthPolicy(
         access_weight=options.access_weight,
         positive_feedback_weight=options.positive_feedback_weight,
@@ -101,10 +114,11 @@ def main(argv: Sequence[str] | None = None) -> None:
         _run_postgres_sweep(
             require_environment_value(os.environ, "MINDBRIDGE_DATABASE_URL"),
             TenantId(options.tenant_id),
-            options.evaluated_at,
+            options.evaluated_at or utc_now(),
             page_size=options.page_size,
             policy=policy,
             reclaim_orphan_clips=options.reclaim_orphan_clips,
+            dry_run=options.dry_run,
         )
     )
     print(
@@ -116,9 +130,21 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "tenant_id": summary.tenant_id,
                 "updated_count": summary.updated_count,
                 "reclaimed_clip_count": summary.reclaimed_clip_count,
+                "dry_run": options.dry_run,
             },
             sort_keys=True,
         )
+    )
+
+
+def _skipped_sweep(tenant_id: TenantId, evaluated_at: datetime) -> LifecycleSweepSummary:
+    """Stand in for the sweep a dry run did not run, so its counters cannot be misread."""
+    return LifecycleSweepSummary(
+        tenant_id=tenant_id,
+        evaluated_at=evaluated_at,
+        page_count=0,
+        evaluated_count=0,
+        updated_count=0,
     )
 
 
@@ -130,6 +156,7 @@ async def _run_postgres_sweep(
     page_size: int,
     policy: MemoryStrengthPolicy,
     reclaim_orphan_clips: bool = False,
+    dry_run: bool = False,
 ) -> LifecycleSweepSummary:
     # Build object storage before the sweep so a missing variable fails fast
     # instead of after every memory in the tenant has already been evaluated.
@@ -137,29 +164,42 @@ async def _run_postgres_sweep(
     store = PostgresMemoryStore(database_url)
     await store.open()
     try:
-        summary = await sweep_tenant_lifecycle(
-            store,
-            tenant_id,
-            evaluated_at,
-            page_size=page_size,
-            policy=policy,
+        # A dry run writes nothing. The strength sweep persists new strengths and hot/cold
+        # transitions, so it is skipped rather than previewed, and its counters stay zero.
+        summary = (
+            _skipped_sweep(tenant_id, evaluated_at)
+            if dry_run
+            else await sweep_tenant_lifecycle(
+                store,
+                tenant_id,
+                evaluated_at,
+                page_size=page_size,
+                policy=policy,
+            )
         )
         if media_access is None:
             return summary
         reclaimed = await reclaim_orphan_clips_use_case(
-            tenant_id, janitor=media_access, digests=store
+            tenant_id, janitor=media_access, digests=store, dry_run=dry_run
         )
         return replace(summary, reclaimed_clip_count=reclaimed.reclaimed_count)
     finally:
         await store.close()
 
 
-def _parser() -> argparse.ArgumentParser:
+def _parser(prog: str | None = None) -> argparse.ArgumentParser:
     policy = DEFAULT_MEMORY_STRENGTH_POLICY
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--tenant-id", required=True)
-    parser.add_argument("--evaluated-at", type=parse_aware_datetime, default=utc_now())
-    parser.add_argument("--page-size", type=int, default=100)
+    parser = build_parser(prog=prog, description=__doc__, epilog=LIFECYCLE_ENVIRONMENT)
+    parser.add_argument("--tenant-id", required=True, help="tenant whose memories are swept")
+    parser.add_argument(
+        "--evaluated-at",
+        type=parse_aware_datetime,
+        metavar="TIMESTAMP",
+        help="the one aware instant this whole sweep evaluates at (default: now)",
+    )
+    parser.add_argument(
+        "--page-size", type=int, default=100, help="memories evaluated per bounded page"
+    )
     parser.add_argument(
         "--reclaim-orphan-clips",
         action="store_true",
@@ -168,16 +208,51 @@ def _parser() -> argparse.ArgumentParser:
             "requires the object storage variables"
         ),
     )
-    parser.add_argument("--access-weight", type=float, default=policy.access_weight)
     parser.add_argument(
-        "--positive-feedback-weight", type=float, default=policy.positive_feedback_weight
+        "-n",
+        "--dry-run",
+        action="store_true",
+        help=(
+            "write nothing: count the orphan clips --reclaim-orphan-clips would delete "
+            "and skip the strength sweep, whose counters then stay zero"
+        ),
     )
     parser.add_argument(
-        "--negative-feedback-weight", type=float, default=policy.negative_feedback_weight
+        "--access-weight",
+        type=float,
+        default=policy.access_weight,
+        help="weight recall frequency contributes to strength",
     )
-    parser.add_argument("--age-decay-weight", type=float, default=policy.age_decay_weight)
-    parser.add_argument("--strengthen-at", type=float, default=policy.strengthen_at)
-    parser.add_argument("--cold-below", type=float, default=policy.cold_below)
+    parser.add_argument(
+        "--positive-feedback-weight",
+        type=float,
+        default=policy.positive_feedback_weight,
+        help="weight useful feedback contributes to strength",
+    )
+    parser.add_argument(
+        "--negative-feedback-weight",
+        type=float,
+        default=policy.negative_feedback_weight,
+        help="weight wrong feedback subtracts from strength",
+    )
+    parser.add_argument(
+        "--age-decay-weight",
+        type=float,
+        default=policy.age_decay_weight,
+        help="weight elapsed time subtracts from strength",
+    )
+    parser.add_argument(
+        "--strengthen-at",
+        type=float,
+        default=policy.strengthen_at,
+        help="strength at or above which a memory becomes hot",
+    )
+    parser.add_argument(
+        "--cold-below",
+        type=float,
+        default=policy.cold_below,
+        help="strength below which a memory becomes cold",
+    )
     return parser
 
 

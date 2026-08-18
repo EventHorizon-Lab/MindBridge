@@ -72,6 +72,50 @@ def test_product_code_does_not_depend_on_the_benchmark_harness() -> None:
     )
 
 
+def test_product_code_does_not_address_the_benchmark_harness_by_name() -> None:
+    """A table of module strings is a dependency the import guard above cannot see.
+
+    `mindbridge.cli` dispatches by importing module paths it holds as text, so an entry for
+    a benchmark runner would couple the product entry point to the harness while leaving
+    every `ast.Import` check green. Prose may explain the boundary; code may not cross it,
+    so docstrings are exempt and any other string literal is not.
+    """
+    assert (
+        _modules_named_in_code(
+            SOURCE,
+            "mindbridge.benchmarks",
+            exclude=SOURCE / "benchmarks",
+        )
+        == []
+    )
+
+
+def _modules_named_in_code(directory: Path, prefix: str, *, exclude: Path) -> list[str]:
+    return sorted(
+        str(path.relative_to(directory))
+        for path in directory.rglob("*.py")
+        if not path.is_relative_to(exclude)
+        and any(name.startswith(prefix) for name in _string_constants(path))
+    )
+
+
+def _string_constants(path: Path) -> set[str]:
+    """Every string literal in one module except the docstrings that document it."""
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    documented = {
+        ast.get_docstring(node, clean=False)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Module | ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef)
+    }
+    return {
+        node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and node.value not in documented
+    }
+
+
 def _modules_importing(directory: Path, prefix: str, *, exclude: Path | None = None) -> list[str]:
     return sorted(
         str(path.relative_to(directory))
