@@ -394,6 +394,8 @@ async def test_processing_commits_provenance_once(
     assert text_embedder.documents == (
         "A person places a red tool beside a blue toolbox.",
         "The red tool is beside the blue toolbox.",
+        "red tool",
+        "blue toolbox",
     )
     assert await _derived_counts(database_url, tenant_id) == (
         1,
@@ -402,7 +404,7 @@ async def test_processing_commits_provenance_once(
         2,
         2,
         8,
-        3,
+        5,
         3,
         3,
         1,
@@ -545,7 +547,7 @@ async def test_processing_rolls_back_derived_records_before_retry(
         2,
         2,
         8,
-        3,
+        5,
         3,
         3,
         1,
@@ -800,6 +802,24 @@ async def test_episode_consolidation_is_atomic_recallable_and_retry_safe(
         limit=20,
     )
     assert {memory.memory_id for memory in identity_expanded_memories} >= {
+        derive_stable_id("memory", event.event_id) for event in candidate_events
+    }
+    # A named entity is its own entry point: one hit reaches every observation that mentions it.
+    entity_expanded_memories = await store.search_memories_by_graph_objects(
+        RecallRequest(tenant_id=tenant_id, query=RecallQuery(text="red tool")),
+        (
+            EmbeddingMatch(
+                embedding_id="isolated_entity_hit",
+                object_type=EmbeddedObjectType.ENTITY,
+                object_id=derive_stable_id(
+                    "entity", tenant_id, EntityType.OBJECT.value, "red tool"
+                ),
+                similarity=1.0,
+            ),
+        ),
+        limit=20,
+    )
+    assert {memory.memory_id for memory in entity_expanded_memories} >= {
         derive_stable_id("memory", event.event_id) for event in candidate_events
     }
     consolidator = RecordingEpisodeConsolidator()

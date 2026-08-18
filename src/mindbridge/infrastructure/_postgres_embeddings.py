@@ -114,7 +114,16 @@ async def write_embedding_on_connection(
     if row is None:
         raise MemoryIntegrityError("embedding conflict could not be resolved")
     existing_id, normalized, same_values = cast(tuple[str, bool, bool], row)
-    if existing_id == embedding.embedding_id and normalized == embedding.normalized and same_values:
+    # An entity's embedding_id hashes the casefolded name the vector encodes, so any stored
+    # vector for that ID encodes the same text and re-encoding it is expected: a later
+    # observation that mentions the entity again batches the name with different neighbouring
+    # texts, and that padding alone moves the vector well past this comparison's tolerance.
+    # Every other object type is only ever re-encoded by replaying one identical batch.
+    if (
+        existing_id == embedding.embedding_id
+        and normalized == embedding.normalized
+        and (same_values or embedding.object_type is EmbeddedObjectType.ENTITY)
+    ):
         return False
     raise DomainInvariantError("embedding version already stores different vector content")
 

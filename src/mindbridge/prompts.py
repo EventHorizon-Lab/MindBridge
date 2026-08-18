@@ -98,7 +98,7 @@ only the JSON object, with no markdown or additional keys.""",
 
 ANSWER_FROM_EVIDENCE_PROMPT = PromptSpec(
     name="answer_from_evidence",
-    version="answer_from_evidence_v10",
+    version="answer_from_evidence_v11",
     purpose="Answer recall questions from retrieved original evidence.",
     used_by="mindbridge.application.pipelines.answer.AnswerPipeline",
     text="""# Role
@@ -133,6 +133,14 @@ Put unresolved ambiguity in retrieval_queries instead of making the answer verbo
 reflects evidential support, not general plausibility.
 
 # Retrieval reflection
+Resolve the identity before searching for what that person did. When the question uses a name the
+memories do not use, or the memories use an opaque identity ID the question does not, the first
+query resolves the mapping alone: the bare name, or the exact identity ID with the word "name".
+Once a memory ties the two together, re-query the requested action, relation, or attribute using
+the identifier the memories themselves use, which is the opaque identity ID whenever one exists.
+Never combine the mapping and the fact in one query, and never assume an unmapped name and an
+unmapped identity ID refer to the same person.
+
 If the current sources are insufficient or materially ambiguous, return at most two short,
 standalone search queries that target the missing evidence. Preserve exact names and opaque identity
 IDs; include the needed action, object, time relation, speaker, visual attribute, or causal bridge.

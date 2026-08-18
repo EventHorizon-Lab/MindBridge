@@ -175,6 +175,7 @@ class ProcessObservation:
                     tenant_id,
                     events,
                     graph.claims,
+                    graph.entities,
                     self._text_embedder,
                     claim.job.created_at,
                 ),

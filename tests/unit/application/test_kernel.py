@@ -1587,7 +1587,8 @@ async def test_semantic_event_follows_its_memory_representation() -> None:
 
     assert [item.memory_id for item in result.memories] == [memory.memory_id]
     assert any(
-        search.object_types == (EmbeddedObjectType.EVENT, EmbeddedObjectType.CLAIM)
+        search.object_types
+        == (EmbeddedObjectType.EVENT, EmbeddedObjectType.CLAIM, EmbeddedObjectType.ENTITY)
         for search in store.embedding_searches
     )
 

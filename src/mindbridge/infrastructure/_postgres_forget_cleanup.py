@@ -260,7 +260,7 @@ async def delete_observation_scope(
             """,
             (tenant_id, list(entity_ids)),
         )
-        await _delete_relations(connection, tenant_id, "entity", orphan_entity_ids)
+        await _delete_typed_derivatives(connection, tenant_id, "entity", orphan_entity_ids)
         await connection.execute(
             """
             DELETE FROM entities

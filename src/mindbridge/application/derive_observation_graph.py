@@ -68,7 +68,7 @@ def derive_observation_graph(
 ) -> DerivedObservationGraph:
     """Create retry-stable entities, claims, memories, and typed edges."""
     entities: dict[EntityId, Entity] = {}
-    mentions: list[EntityMention] = []
+    mentions: dict[MentionId, EntityMention] = {}
     claims: list[Claim] = []
     event_memories = tuple(_event_memory(event) for event in events)
     claim_memories: list[MemoryRecord] = []
@@ -88,17 +88,14 @@ def derive_observation_graph(
 
     for event, perceived_event in zip(events, perception.events, strict=True):
         event_entities: list[Entity] = []
-        for entity_index, perceived_entity in enumerate(perceived_event.entities):
-            entity = _perceived_entity(
-                observation,
-                event,
-                perceived_entity,
-                entity_index,
-                created_at,
-            )
+        for perceived_entity in perceived_event.entities:
+            entity = _perceived_entity(observation, perceived_entity, created_at)
             entities[entity.entity_id] = entity
             event_entities.append(entity)
-            mentions.extend(_entity_mentions(event, entity, perceived_entity, created_at))
+            for mention in _entity_mentions(event, entity, perceived_entity, created_at):
+                existing = mentions.get(mention.mention_id)
+                if existing is None or mention.confidence > existing.confidence:
+                    mentions[mention.mention_id] = mention
             relation = derive_relation(
                 observation.tenant_id,
                 RelationNodeType.EVENT,
@@ -162,7 +159,7 @@ def derive_observation_graph(
         created_at,
     )
     entities.update((entity.entity_id, entity) for entity in identity_entities)
-    mentions.extend(identity_mentions)
+    mentions.update((mention.mention_id, mention) for mention in identity_mentions)
     for mention in identity_mentions:
         relation = derive_relation(
             observation.tenant_id,
@@ -177,7 +174,7 @@ def derive_observation_graph(
 
     return DerivedObservationGraph(
         entities=tuple(entities.values()),
-        entity_mentions=tuple(mentions),
+        entity_mentions=tuple(mentions.values()),
         claims=tuple(claims),
         memories=event_memories + tuple(claim_memories),
         relations=tuple(relations.values()),
@@ -189,13 +186,22 @@ async def embed_observation_graph(
     tenant_id: TenantId,
     events: tuple[Event, ...],
     claims: tuple[Claim, ...],
+    entities: tuple[Entity, ...],
     embedder: Embedder,
     created_at: datetime,
 ) -> tuple[EmbeddingRecord, ...]:
-    """Batch all event and claim text through the selected document encoder."""
-    objects = tuple(
-        (EmbeddedObjectType.EVENT, event.event_id, event.description) for event in events
-    ) + tuple((EmbeddedObjectType.CLAIM, claim.claim_id, claim.statement) for claim in claims)
+    """Batch event, claim, and named entity text through the selected document encoder."""
+    objects = (
+        tuple((EmbeddedObjectType.EVENT, event.event_id, event.description) for event in events)
+        + tuple((EmbeddedObjectType.CLAIM, claim.claim_id, claim.statement) for claim in claims)
+        + tuple(
+            (EmbeddedObjectType.ENTITY, entity.entity_id, entity.canonical_name)
+            for entity in entities
+            if entity.canonical_name is not None
+        )
+    )
+    if not objects:
+        return ()
     result = await embedder.embed(
         EmbedRequest(
             inputs=tuple(ModelInput((TextPart(text),)) for _, _, text in objects),
@@ -234,25 +240,28 @@ async def embed_observation_graph(
 
 def _perceived_entity(
     observation: Observation,
-    event: Event,
     perceived: PerceivedEntity,
-    entity_index: int,
     created_at: datetime,
 ) -> Entity:
+    """Key a named entity per tenant so every mentioning event shares one graph node."""
+    # ponytail: exact type plus casefolded name. Two different people with one name merge;
+    # split them on evidence only once a real corpus shows the false merges.
+    # The stored name is the casefolded one the ID is derived from: keeping the perceived
+    # casing would make the row depend on which clip arrived first, and the second casing
+    # of one name would then collide with its own entity ID in the store.
+    canonical_name = perceived.canonical_name.casefold()
     return Entity(
         entity_id=EntityId(
             derive_stable_id(
                 "entity",
                 observation.tenant_id,
-                event.event_id,
-                entity_index,
                 perceived.entity_type.value,
-                perceived.canonical_name.casefold(),
+                canonical_name,
             )
         ),
         tenant_id=observation.tenant_id,
         entity_type=perceived.entity_type,
-        canonical_name=perceived.canonical_name,
+        canonical_name=canonical_name,
         created_at=created_at,
     )
 

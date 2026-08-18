@@ -77,18 +77,49 @@ def test_identity_memory_refuses_an_ambiguous_biometric_merge(tmp_path: Path) ->
         encryption_key=AESGCM.generate_key(bit_length=256),
         clock=lambda: NOW,
     )
-    first = memory.recognize_and_remember(_sample("first", (1.0, 0.0)), minimum_similarity=0.9)
-    second = memory.recognize_and_remember(_sample("second", (0.8, 0.6)), minimum_similarity=0.9)
+    # 0.3 apart: two people, not one face twice. Both then score just over the 0.78 gate
+    # for the third sample and land inside the margin, so neither one clearly wins it.
+    first = memory.recognize_and_remember(_sample("first", (1.0, 0.0, 0.0)), minimum_similarity=0.9)
+    second = memory.recognize_and_remember(
+        _sample("second", (0.3, 0.953939, 0.0)), minimum_similarity=0.9
+    )
 
     ambiguous = memory.recognize_and_remember(
-        _sample("ambiguous", (0.95, 0.31)),
-        minimum_similarity=0.8,
+        _sample("ambiguous", (0.80, 0.5766, 0.1658)),
+        minimum_similarity=0.78,
         minimum_margin=0.02,
     )
 
     assert first.identity_id != second.identity_id
     assert ambiguous.enrolled_new
     assert ambiguous.identity_id not in {first.identity_id, second.identity_id}
+
+
+def test_identity_memory_binds_a_sample_tied_between_two_views_of_one_face(
+    tmp_path: Path,
+) -> None:
+    """A tie between fragments of one identity must not mint a third fragment."""
+    memory = SQLiteIdentityMemory(
+        tmp_path / "edge.sqlite3",
+        device_id="robot_01",
+        encryption_key=AESGCM.generate_key(bit_length=256),
+        clock=lambda: NOW,
+    )
+    # 0.99 apart: one face from two angles, split only because enrolment ran strict.
+    first = memory.recognize_and_remember(_sample("front", (1.0, 0.0)), minimum_similarity=0.995)
+    second = memory.recognize_and_remember(
+        _sample("angled", (0.99, 0.1411)), minimum_similarity=0.995
+    )
+
+    between = memory.recognize_and_remember(
+        _sample("between", (0.99749, 0.07073)),
+        minimum_similarity=0.9,
+        minimum_margin=0.02,
+    )
+
+    assert first.identity_id != second.identity_id
+    assert not between.enrolled_new
+    assert between.identity_id in {first.identity_id, second.identity_id}
 
 
 def test_identity_samples_are_idempotent_and_bound_to_the_device_key(tmp_path: Path) -> None:
