@@ -185,7 +185,6 @@ class MemoryKernel:
         )
         return (await self.remember_many((request,)))[0]
 
-    @trace_operation("mindbridge.remember_many")
     async def remember_many(
         self,
         requests: tuple[RememberRequest, ...],
@@ -200,6 +199,8 @@ class MemoryKernel:
         """
         if not requests:
             return ()
+        # No span of its own: `remember()` wraps this and would otherwise emit two spans
+        # per single write. The size lands on the caller's span instead.
         set_current_span_attributes({"mindbridge.memory.batch_size": len(requests)})
         embeddings = await self._embed_summaries(tuple(item.summary for item in requests))
         # Bounds the write fan-out one batch can aim at the store: each write is up to
