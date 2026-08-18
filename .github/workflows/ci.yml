@@ -61,12 +61,17 @@ jobs:
             !.venv/**
             !.pytest_cache/**
 
+      # Substack answers CI egress with 403, so the LoCoMo audit cited in
+      # docs/benchmarks-sota.md has never been verifiable from here -- Documentation has been
+      # red since that citation landed in 818da3b. Excluding the one host keeps every other
+      # link checked; `--accept 403` would have let a genuinely forbidden URL through anywhere.
       - name: Check documentation links
         uses: lycheeverse/lychee-action@8646ba30535128ac92d33dfc9133794bfdd9b411 # v2.8.0
         with:
           args: >-
             --no-progress
             --root-dir "${{ github.workspace }}"
+            --exclude '^https://penfieldlabs\.substack\.com/'
             './*.md'
             './docs/**/*.md'
           fail: true
