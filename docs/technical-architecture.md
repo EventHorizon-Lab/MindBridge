@@ -710,11 +710,27 @@ MindBridge 的学习对象是记忆状态：
 - 重复观察形成更稳定的 Claim；
 - 用户纠正产生新版本并降低错误 Claim 的可信度；
 - 人脸和声纹 embedding 更新设备域 prototype/centroid；
-- 召回反馈更新不同查询类型的候选预算和阈值统计；
+- 召回反馈与查询形状统计以 telemetry 暴露，候选预算和阈值由运维显式锁定；
 - 高频、有用、近期或高显著度记忆获得更高保留强度；
 - 低价值且长期未使用的派生表示被压缩或清除。
 
 所有变化写入审计字段和来源，不能产生无法解释的“模型自己记住了”。
+
+**关于第五条：检索参数刻意不做在线自适应。** `RecallResult.trace_id` 由调用方原样回传成
+`FeedbackRequest.recall_trace_id`，两侧都把查询形状（mode、有无文本/媒体/过滤器、候选数、反思轮数）
+和反馈类型记进同一条 trace，因此"哪类查询形状的反馈最差"在可观测性后端按 trace id 直接可 join——
+不需要建表，读路径上也不写库。
+
+但**参数本身不能在请求路径上自适应**，理由有两条，且第一条比泄漏更早生效：
+
+1. **可复现性。** 九个 benchmark runner 都走同一个 `recall` 路径。参数若在线更新，第 N 题的检索就
+   依赖第 1..N-1 题，分数变成运行顺序的函数，直接违反 §14.2.1 的可重放 manifest 要求。
+2. **被明令禁止的变体只差一步。** §2.2 与 benchmark 反 reward hacking 约束禁止"按题型统计规律调节
+   拒答率"，而"按查询类型学到的阈值"字面上就是这件事。
+
+因此这一项的产出是**统计**而非**自动更新**。若将来确实要持久化参数，安全形状是：key 只含
+(tenant, mode, modality, filters-present)、绝不含查询内容；value 带硬上限；只由离线计划任务更新；
+recall 侧读一份冻结、带 revision 戳、并记进 benchmark manifest 的参数集。
 
 ### 8.2 Consolidation
 
@@ -788,19 +804,38 @@ Summary，计划任务不会读到自己的写入。
 
 ### 8.3 记忆强度
 
-首版使用透明、可配置的统计分数，不训练遗忘模型：
+首版使用透明、可配置的统计分数，不训练遗忘模型。**已实现**的形式是：
 
 ```text
 strength = salience
-         + log(1 + useful_access_count)
-         + positive_feedback
-         + relation_utility
-         + novelty
-         - age_decay
-         - negative_feedback
+         + access_weight * log(1 + useful_access_count)
+         + positive_feedback_weight * positive_feedback_count
+         - negative_feedback_weight * negative_feedback_count
+         - age_decay_weight * age_days
 ```
 
 各项原始值和最终决策都要可观测。系数首先由 Benchmark 和产品回放集校准；需要为不同硬件采集频率和使用场景保留调节参数。
+
+> 尚未实现：`relation_utility` 与 `novelty` 两项在代码中不存在，加入前需要先定义各自的可观测原始值。
+
+**访问项取对数、年龄项取线性，这不是随手选的。** 访问次数应当饱和——第十次召回的信息量小于第二次；
+闲置时间不应当饱和。设 `D(s)` 为 salience 为 `s` 的记忆降冷所需的闲置天数：
+
+- 线性年龄项下 `D(s) = s / age_decay_weight`，要让 `D(s)` 落在目标窗口 `[D_min, D_max]`，
+  可行条件是 `s_max / s_min ≤ D_max / D_min`（7–365 天窗口即 52 倍）。
+- 对数年龄项下 `D(s) = e^(s/age_decay_weight) - 1`，可行条件是
+  `s_max / s_min ≤ ln(1+D_max) / ln(1+D_min)`（同一窗口只有 **2.84 倍**）。
+
+感知产出的 salience 现实跨度约 0.2–0.9，即 4.5 倍 > 2.84 倍，**所以对数形式下不存在任何系数能同时
+满足两端**——低显著度的记忆几天就冷，高显著度的记忆要几万年。这是形状问题而非取值问题，因此年龄项
+必须是线性的。
+
+默认 `age_decay_weight = 0.005` 由 `0.5 中位 salience / 100 天目标` 推出：salience 0.2/0.5/0.9 分别
+在 40/100/180 个闲置日降冷，一次有用访问买回约 139 个闲置日。
+
+> 标定注意：`strength` 同时作为检索排序的**次级排序键**参与召回（`ORDER BY dense.rank,
+> memory.strength DESC, ...`），所以改动衰减系数不是对分数中性的。标定必须在固定题目切片上实测，
+> 不能假设中性。
 
 首版自动演化由 `mindbridge-lifecycle` 作为租户级计划任务执行：一次完整扫描固定同一
 `evaluated_at`，按稳定 `memory_id` cursor 分页；年龄衰减从最近一次真实访问开始计算，没有访问
@@ -833,6 +868,21 @@ stateDiagram-v2
 - **Cold**：移除热索引或迁移媒体到低成本存储，但仍可恢复召回。
 - **Compressed**：保留上层 Claim/Summary 和必要证据，清理可重建派生表示。
 - **Deleted**：显式遗忘；删除原始证据、派生媒体、向量、缓存和相关身份映射，并向端侧传播 tombstone。
+
+**Compressed 的确切边界。** 清理的**只有** `evidence_clips` 行及其派生 `media_objects` 行。
+明确**保留**：原始媒体、`evidence_spans`、以及 `object_type='evidence_span'` 的向量——1024 个 float
+约 4 KB，相对上百 MB 的 clip 没有回收价值，删掉纯亏召回质量。因为证据解析签发的是**源**媒体对象
+而不是 clip，所以压缩完全不降低证据可达性。
+
+进入条件是强度继续衰减到 `--compress-below`（必须不高于 `--cold-below`；不设即关闭，升级不会突然
+开始删东西）——与 `cold_below`/`strengthen_at` 同一形状的第三个阈值，读的是已经算好的同一个分数。
+实现上不放宽 `MemoryLifecycleChange` 只改 `state`/`strength` 的不变量——那条不变量是乐观锁可证明性的
+基础。清理是一个以持久化 `COMPRESSED` 状态为意图的**幂等 janitor**：标记与清理之间崩溃，下一轮自愈。
+clip 是内容寻址的，删掉 clip 的 `media_objects` 行后其对象存储 key 即成孤儿，由既有
+`--reclaim-orphan-clips` 删除字节。
+
+压缩是**单向**的：`Cold` 可因召回回热，但没有任何东西会重新派生已清理的 clip，状态机也只给
+`Compressed` 留了通往 `Deleted` 的边。
 
 显式 `forget` 优先级高于自动保留策略。删除审计只记录对象 ID、范围、执行状态和时间，不保存被删除内容。
 树形 Summary 的遗忘沿依赖方向向上级联而不向下误删：删除叶子会删除所有依赖该叶子的祖先

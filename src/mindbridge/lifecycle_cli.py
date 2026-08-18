@@ -45,6 +45,20 @@ class LifecycleSweepSummary:
     evaluated_count: int
     updated_count: int
     reclaimed_clip_count: int | None = None
+    purged_clip_count: int | None = None
+
+
+async def purge_tenant_compressed_clips(
+    store: MemoryLifecycleStore,
+    tenant_id: TenantId,
+    *,
+    page_size: int,
+) -> int:
+    """Drop clips behind compressed memories until no purgeable page remains."""
+    purged = 0
+    while page := await store.purge_compressed_clips(tenant_id, limit=page_size):
+        purged += page
+    return purged
 
 
 async def sweep_tenant_lifecycle(
@@ -96,6 +110,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         age_decay_weight=options.age_decay_weight,
         strengthen_at=options.strengthen_at,
         cold_below=options.cold_below,
+        compress_below=options.compress_below,
     )
     summary = asyncio.run(
         _run_postgres_sweep(
@@ -116,6 +131,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "tenant_id": summary.tenant_id,
                 "updated_count": summary.updated_count,
                 "reclaimed_clip_count": summary.reclaimed_clip_count,
+                "purged_clip_count": summary.purged_clip_count,
             },
             sort_keys=True,
         )
@@ -144,6 +160,15 @@ async def _run_postgres_sweep(
             page_size=page_size,
             policy=policy,
         )
+        if policy.compress_below is not None:
+            # Purge the rows first: that leaves each clip's content-addressed key an orphan, which
+            # the reclaim pass below then deletes from object storage.
+            summary = replace(
+                summary,
+                purged_clip_count=await purge_tenant_compressed_clips(
+                    store, tenant_id, page_size=page_size
+                ),
+            )
         if media_access is None:
             return summary
         reclaimed = await reclaim_orphan_clips_use_case(
@@ -175,9 +200,27 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--negative-feedback-weight", type=float, default=policy.negative_feedback_weight
     )
-    parser.add_argument("--age-decay-weight", type=float, default=policy.age_decay_weight)
+    parser.add_argument(
+        "--age-decay-weight",
+        type=float,
+        default=policy.age_decay_weight,
+        help=(
+            "strength lost per idle day; idle days to cold are salience divided by this, "
+            "so the default cools a 0.5-salience memory after 100 unused days"
+        ),
+    )
     parser.add_argument("--strengthen-at", type=float, default=policy.strengthen_at)
     parser.add_argument("--cold-below", type=float, default=policy.cold_below)
+    parser.add_argument(
+        "--compress-below",
+        type=float,
+        default=policy.compress_below,
+        help=(
+            "strength at or under which a cold memory also drops its rebuildable clips "
+            "(must not exceed --cold-below); omit to leave compression off. Pair with "
+            "--reclaim-orphan-clips to also delete the clip objects the purge orphans"
+        ),
+    )
     return parser
 
 

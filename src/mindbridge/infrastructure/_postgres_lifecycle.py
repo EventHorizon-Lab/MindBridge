@@ -168,3 +168,75 @@ class LifecycleOperations(PostgresStoreOperations):
                 )
                 updated_count += int(await cursor.fetchone() is not None)
         return updated_count
+
+    async def purge_compressed_clips(self, tenant_id: TenantId, *, limit: int) -> int:
+        """Drop the rebuildable clips behind fully compressed memories, one bounded page.
+
+        Re-runnable: the persisted `COMPRESSED` state is the intent, so a crash mid-purge heals on
+        the next sweep. Deleting a clip's content-addressed `media_objects` row orphans its storage
+        key, which `--reclaim-orphan-clips` then deletes. Source media, evidence spans, and evidence
+        vectors stay: recall signs the source object, never the clip. Returns clip rows deleted, so
+        the caller's page loop terminates.
+        """
+        if limit <= 0:
+            raise DomainInvariantError("clip purge limit must be positive")
+        async with tenant_connection(self._pool, tenant_id) as connection:
+            # Two statements rather than one chain of data-modifying CTEs: those all read the same
+            # snapshot, so the orphan check below would never see this delete and would never drop
+            # a media row. Both run in the one transaction tenant_connection already opens.
+            cursor = await connection.execute(
+                """
+                DELETE FROM evidence_clips AS clip
+                USING (
+                    SELECT candidate.evidence_id, candidate.ordinal
+                    FROM evidence_clips AS candidate
+                    WHERE candidate.tenant_id = %(tenant_id)s
+                      -- Some memory must already cite this evidence. Without this an evidence
+                      -- span that no memory references yet satisfies the NOT EXISTS below
+                      -- vacuously, and a freshly observed span loses its clips.
+                      AND EXISTS (
+                          SELECT 1 FROM memory_evidence AS link
+                          WHERE link.tenant_id = candidate.tenant_id
+                            AND link.evidence_id = candidate.evidence_id
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM memory_evidence AS link
+                          JOIN memory_records AS memory
+                            ON memory.tenant_id = link.tenant_id
+                           AND memory.memory_id = link.memory_id
+                          WHERE link.tenant_id = candidate.tenant_id
+                            AND link.evidence_id = candidate.evidence_id
+                            AND memory.state <> 'compressed'
+                      )
+                    ORDER BY candidate.evidence_id, candidate.ordinal
+                    LIMIT %(limit)s
+                ) AS purgeable
+                WHERE clip.tenant_id = %(tenant_id)s
+                  AND clip.evidence_id = purgeable.evidence_id
+                  AND clip.ordinal = purgeable.ordinal
+                RETURNING clip.media_object_id
+                """,
+                {"tenant_id": tenant_id, "limit": limit},
+            )
+            media_object_ids = [cast(tuple[str], row)[0] async for row in cursor]
+            if media_object_ids:
+                await connection.execute(
+                    """
+                    DELETE FROM media_objects AS media
+                    WHERE media.tenant_id = %(tenant_id)s
+                      AND media.media_object_id = ANY(%(media_object_ids)s::text[])
+                      -- Identical clip content deduplicates onto one media object, and the clip
+                      -- foreign key is ON DELETE RESTRICT, so only drop it once nothing cites it.
+                      AND NOT EXISTS (
+                          SELECT 1 FROM evidence_clips AS remaining
+                          WHERE remaining.tenant_id = media.tenant_id
+                            AND remaining.media_object_id = media.media_object_id
+                      )
+                    """,
+                    {
+                        "tenant_id": tenant_id,
+                        "media_object_ids": list(dict.fromkeys(media_object_ids)),
+                    },
+                )
+        return len(media_object_ids)
