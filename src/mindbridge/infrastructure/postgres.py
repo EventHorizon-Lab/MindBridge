@@ -185,10 +185,15 @@ class PostgresMemoryStore(
         """Read one tenant-owned deletion propagation state."""
         return await read_deletion_tombstone(self._pool, tenant_id, TombstoneId(tombstone_id))
 
-    async def write_embedding(self, embedding: EmbeddingRecord) -> bool:
+    async def write_embedding(
+        self,
+        embedding: EmbeddingRecord,
+        *,
+        allow_reencoding: bool = False,
+    ) -> bool:
         """Persist one immutable vector version."""
         self._require_index_dimension((embedding,))
-        return await write_embedding(self._pool, embedding)
+        return await write_embedding(self._pool, embedding, allow_reencoding=allow_reencoding)
 
     async def search_embeddings(self, search: EmbeddingSearch) -> tuple[EmbeddingMatch, ...]:
         """Search one explicit frozen embedding space by cosine similarity."""

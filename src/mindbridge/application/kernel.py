@@ -548,6 +548,13 @@ class MemoryKernel:
             memory.tenant_id, embedding_id
         ):
             return
+        # This ID pins its text, so a differing stored vector is encoder noise, not drift.
+        # `embedding_id` derives from `memory_id`, which derives from the idempotency key,
+        # and `write_memory` has already refused that key if it carried a different content
+        # digest -- so reaching here means the stored vector encodes this exact summary.
+        # It matters because a batch's vectors depend on the batch's composition: two
+        # concurrent `remember` batches that share one memory encode it beside different
+        # neighbours, and the difference is far outside the write's equality tolerance.
         await self._embedding_index.write_embedding(
             EmbeddingRecord(
                 embedding_id=embedding_id,
@@ -561,7 +568,8 @@ class MemoryKernel:
                 dimension=embedding.dimension,
                 normalized=True,
                 created_at=memory.created_at,
-            )
+            ),
+            allow_reencoding=True,
         )
 
 

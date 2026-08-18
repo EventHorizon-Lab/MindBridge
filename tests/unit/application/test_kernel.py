@@ -433,7 +433,12 @@ class InMemoryStore:
     ) -> tuple[DeletionTombstone, ...]:
         raise AssertionError("forget is covered by the PostgreSQL integration store")
 
-    async def write_embedding(self, embedding: EmbeddingRecord) -> bool:
+    async def write_embedding(
+        self,
+        embedding: EmbeddingRecord,
+        *,
+        allow_reencoding: bool = False,
+    ) -> bool:
         existing = self.embeddings.get(embedding.embedding_id)
         if existing is not None:
             if existing != embedding:
