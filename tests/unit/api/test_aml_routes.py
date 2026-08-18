@@ -208,10 +208,10 @@ class _ManyMemoriesGenerator:
 
 def test_add_hands_the_kernel_one_batch_for_the_whole_chunk() -> None:
     """A chunk yielding many memories must reach the kernel as a single
-    `remember_many()` call, not one call per memory: the batch is what lets the
-    kernel encode every summary in one embedder round trip. The concurrency
-    bound this route used to own now lives with the fan-out itself, in
-    `MemoryKernel.remember_many` (see test_kernel.py).
+    `remember()` call carrying the batch, not one call per memory: the batch is
+    what lets the kernel encode every summary in one embedder round trip. The
+    concurrency bound this route used to own now lives with the fan-out itself,
+    in `MemoryKernel.remember` (see test_kernel.py).
     """
     memory_count = 40
     kernel = _StubKernel()
