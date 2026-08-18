@@ -116,6 +116,45 @@
         "title": "DeletionTombstoneView",
         "type": "object"
       },
+      "ErrorResponse": {
+        "additionalProperties": false,
+        "description": "Stable error envelope with a reproducible trace identifier.",
+        "properties": {
+          "code": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Code",
+            "type": "string"
+          },
+          "issues": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/ValidationIssue"
+            },
+            "title": "Issues",
+            "type": "array"
+          },
+          "message": {
+            "maxLength": 2048,
+            "minLength": 1,
+            "title": "Message",
+            "type": "string"
+          },
+          "trace_id": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Trace Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "message",
+          "trace_id"
+        ],
+        "title": "ErrorResponse",
+        "type": "object"
+      },
       "EvidenceView": {
         "additionalProperties": false,
         "description": "Precise evidence location safe to expose to a caller.",
@@ -455,19 +494,6 @@
         ],
         "title": "ForgetTargetType",
         "type": "string"
-      },
-      "HTTPValidationError": {
-        "properties": {
-          "detail": {
-            "items": {
-              "$ref": "#/components/schemas/ValidationError"
-            },
-            "title": "Detail",
-            "type": "array"
-          }
-        },
-        "title": "HTTPValidationError",
-        "type": "object"
       },
       "HealthResponse": {
         "additionalProperties": false,
@@ -1521,44 +1547,36 @@
         "title": "SensorKind",
         "type": "string"
       },
-      "ValidationError": {
+      "ValidationIssue": {
+        "additionalProperties": false,
+        "description": "One sanitized request validation failure.",
         "properties": {
-          "ctx": {
-            "title": "Context",
-            "type": "object"
+          "code": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Code",
+            "type": "string"
           },
-          "input": {
-            "title": "Input"
-          },
-          "loc": {
+          "location": {
             "items": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "integer"
-                }
-              ]
+              "type": "string"
             },
             "title": "Location",
             "type": "array"
           },
-          "msg": {
+          "message": {
+            "maxLength": 2048,
+            "minLength": 1,
             "title": "Message",
-            "type": "string"
-          },
-          "type": {
-            "title": "Error Type",
             "type": "string"
           }
         },
         "required": [
-          "loc",
-          "msg",
-          "type"
+          "location",
+          "message",
+          "code"
         ],
-        "title": "ValidationError",
+        "title": "ValidationIssue",
         "type": "object"
       },
       "VerificationStatus": {
@@ -1660,15 +1678,45 @@
             },
             "description": "Successful Response"
           },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "`authentication_required` — a valid bearer API key is required\n\n`authentication_failed` — the bearer API key is invalid"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "`tenant_access_denied` — the authenticated tenant cannot access this resource"
+          },
           "422": {
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "`request_validation_failed` — request validation failed\n\n`domain_invariant_failed` — the request is well-formed but violates a memory invariant"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "`database_unavailable` — memory storage is temporarily unavailable"
           }
         },
         "security": [
@@ -1717,15 +1765,55 @@
             },
             "description": "Successful Response"
           },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "`authentication_required` — a valid bearer API key is required\n\n`authentication_failed` — the bearer API key is invalid"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "`tenant_access_denied` — the authenticated tenant cannot access this resource"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "`forget_target_not_found` — forget target or deletion tombstone does not exist"
+          },
           "422": {
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "`request_validation_failed` — request validation failed"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "`database_unavailable` — memory storage is temporarily unavailable"
           }
         },
         "security": [
@@ -1760,15 +1848,85 @@
             },
             "description": "Successful Response"
           },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "`authentication_required` — a valid bearer API key is required\n\n`authentication_failed` — the bearer API key is invalid"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "`tenant_access_denied` — the authenticated tenant cannot access this resource"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "`memory_not_found` — memory does not exist"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "`idempotency_conflict` — the idempotency key already stores different content"
+          },
+          "410": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "`memory_deleted` — memory content was explicitly deleted"
+          },
           "422": {
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "`request_validation_failed` — request validation failed\n\n`domain_invariant_failed` — the request is well-formed but violates a memory invariant"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "`model_request_failed` — memory model rejected its configured request\n\n`model_output_invalid` — memory model returned invalid output"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "`database_unavailable` — memory storage is temporarily unavailable\n\n`model_unavailable` — memory model is unavailable"
           }
         },
         "security": [
@@ -1803,15 +1961,65 @@
             },
             "description": "Successful Response"
           },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "`authentication_required` — a valid bearer API key is required\n\n`authentication_failed` — the bearer API key is invalid"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "`tenant_access_denied` — the authenticated tenant cannot access this resource"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "`forget_target_not_found` — forget target or deletion tombstone does not exist"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "`idempotency_conflict` — the idempotency key already stores different content"
+          },
           "422": {
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "`request_validation_failed` — request validation failed"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "`database_unavailable` — memory storage is temporarily unavailable\n\n`object_storage_unavailable` — evidence media is unavailable"
           }
         },
         "security": [
@@ -1860,15 +2068,55 @@
             },
             "description": "Successful Response"
           },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "`authentication_required` — a valid bearer API key is required\n\n`authentication_failed` — the bearer API key is invalid"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "`tenant_access_denied` — the authenticated tenant cannot access this resource"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "`job_not_found` — observation processing job does not exist"
+          },
           "422": {
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "`request_validation_failed` — request validation failed"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "`database_unavailable` — memory storage is temporarily unavailable"
           }
         },
         "security": [
@@ -1915,17 +2163,57 @@
                 }
               }
             },
-            "description": "One `job` event per observed change, each carrying the complete job view. Reconnect with `Last-Event-ID` to skip states already received."
+            "description": "One `job` event per observed change, each carrying the complete job view. Reconnect with `Last-Event-ID` to skip states already received. After the stream opens, a failure arrives as an `error` event carrying this same `ErrorResponse` envelope rather than as a status code."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "`authentication_required` — a valid bearer API key is required\n\n`authentication_failed` — the bearer API key is invalid"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "`tenant_access_denied` — the authenticated tenant cannot access this resource"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "`job_not_found` — observation processing job does not exist"
           },
           "422": {
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "`request_validation_failed` — request validation failed"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "`database_unavailable` — memory storage is temporarily unavailable"
           }
         },
         "security": [
@@ -1960,15 +2248,65 @@
             },
             "description": "Successful Response"
           },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "`authentication_required` — a valid bearer API key is required\n\n`authentication_failed` — the bearer API key is invalid"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "`tenant_access_denied` — the authenticated tenant cannot access this resource"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "`idempotency_conflict` — the idempotency key already stores different content"
+          },
           "422": {
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "`request_validation_failed` — request validation failed\n\n`domain_invariant_failed` — the request is well-formed but violates a memory invariant"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "`model_request_failed` — memory model rejected its configured request\n\n`model_output_invalid` — memory model returned invalid output"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "`database_unavailable` — memory storage is temporarily unavailable\n\n`model_unavailable` — memory model is unavailable"
           }
         },
         "security": [
@@ -2017,15 +2355,65 @@
             },
             "description": "Successful Response"
           },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "`authentication_required` — a valid bearer API key is required\n\n`authentication_failed` — the bearer API key is invalid"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "`tenant_access_denied` — the authenticated tenant cannot access this resource"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "`memory_not_found` — memory does not exist"
+          },
+          "410": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "`memory_deleted` — memory content was explicitly deleted"
+          },
           "422": {
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "`request_validation_failed` — request validation failed"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "`database_unavailable` — memory storage is temporarily unavailable"
           }
         },
         "security": [
@@ -2060,15 +2448,55 @@
             },
             "description": "Successful Response"
           },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "`authentication_required` — a valid bearer API key is required\n\n`authentication_failed` — the bearer API key is invalid"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "`tenant_access_denied` — the authenticated tenant cannot access this resource"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "`idempotency_conflict` — the idempotency key already stores different content"
+          },
           "422": {
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "`request_validation_failed` — request validation failed\n\n`domain_invariant_failed` — the request is well-formed but violates a memory invariant"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "`database_unavailable` — memory storage is temporarily unavailable\n\n`task_broker_unavailable` — observation processing is temporarily unavailable"
           }
         },
         "security": [
@@ -2103,15 +2531,65 @@
             },
             "description": "Successful Response"
           },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "`authentication_required` — a valid bearer API key is required\n\n`authentication_failed` — the bearer API key is invalid"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "`tenant_access_denied` — the authenticated tenant cannot access this resource"
+          },
           "422": {
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "`request_validation_failed` — request validation failed\n\n`enumeration_limit_exceeded` — the enumerate scope exceeds the bound; narrow the filters"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "`memory_integrity_failed` — stored memory is inconsistent"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "`model_request_failed` — memory model rejected its configured request\n\n`model_output_invalid` — memory model returned invalid output"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "`database_unavailable` — memory storage is temporarily unavailable\n\n`model_unavailable` — memory model is unavailable"
           }
         },
         "security": [

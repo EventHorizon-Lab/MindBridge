@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import inspect
+from collections.abc import Awaitable, Callable
 from contextlib import AbstractAsyncContextManager
+from typing import Annotated, TypeVar, get_type_hints
 
 from mcp.server import MCPServer
 from mcp_types import ToolAnnotations
 
 from mindbridge.application.kernel import MemoryKernel
 from mindbridge.contracts import (
+    ContractModel,
     FeedbackReceipt,
     FeedbackRequest,
     ForgetReceipt,
@@ -38,6 +41,54 @@ _DESTRUCTIVE_WRITE = ToolAnnotations(
 )
 _McpLifespan = Callable[[MCPServer[None]], AbstractAsyncContextManager[None]]
 
+_RequestT = TypeVar("_RequestT", bound=ContractModel)
+_ResultT = TypeVar("_ResultT", bound=ContractModel)
+
+
+def _flattened(
+    model: type[_RequestT],
+    handler: Callable[[_RequestT], Awaitable[_ResultT]],
+) -> Callable[..., Awaitable[_ResultT]]:
+    """Publish `model`'s own fields as the tool's arguments instead of nesting them.
+
+    MCP derives a tool's input schema from its function signature, so a handler that takes one
+    model parameter publishes `{"request": {...}}` and rejects the flat object a caller
+    reaches for first. Synthesizing the signature from `model.model_fields` keeps the contract
+    single-sourced -- constraints, defaults, nested models, and cross-field validators all
+    still come from the same Pydantic model REST and Python use -- while the published
+    arguments match every other face of the API.
+
+    Ceiling: the argument model MCP generates around this signature ignores unknown fields
+    rather than rejecting them, so a misspelled optional field is dropped instead of faulted.
+    `ContractModel` forbade extras only because the old wrapper put them one level down inside
+    it. The published schema stays silent about extras rather than promising a strictness the
+    server no longer enforces; restoring it needs a stricter argument model upstream.
+    """
+    parameters = [
+        inspect.Parameter(
+            name,
+            inspect.Parameter.KEYWORD_ONLY,
+            default=inspect.Parameter.empty if field.is_required() else field.default,
+            annotation=Annotated[field.annotation, field],
+        )
+        for name, field in model.model_fields.items()
+    ]
+
+    async def tool(**fields: object) -> _ResultT:
+        return await handler(model.model_validate(fields))
+
+    # Resolved rather than reflected: `from __future__ import annotations` leaves every
+    # handler's own annotations as strings, and MCP reads this signature verbatim when it
+    # decides whether the tool has a structured output schema.
+    setattr(  # noqa: B010 - a function's __signature__ is absent from typeshed
+        tool,
+        "__signature__",
+        inspect.Signature(parameters, return_annotation=get_type_hints(handler)["return"]),
+    )
+    tool.__name__ = handler.__name__
+    tool.__doc__ = handler.__doc__
+    return tool
+
 
 def build_mcp_server(
     kernel: MemoryKernel,
@@ -53,34 +104,104 @@ def build_mcp_server(
         lifespan=lifespan,
     )
 
-    @server.tool(annotations=_IDEMPOTENT_WRITE)
     async def memory_observe(request: ObserveRequest) -> ObservationReceipt:
-        """Store one timestamped multimodal observation and return its durable job ID."""
+        """Store one timestamped multimodal observation and return its durable job ID.
+
+        Preconditions this tool cannot do for you: every `media_objects[*].uri` must already
+        be readable at `s3://<bucket>/tenants/<tenant_id>/<key>`, with `sha256` and
+        `size_bytes` matching those exact bytes. This is the first-party device path. An Agent
+        holding content rather than stored media objects wants `memory_remember` instead.
+
+        Rejected combinations: `ended_at` before `occurred_at`; a repeated `media_object_id`;
+        a media `duration_ms` longer than the observation's own span; an identity span with
+        `end_ms` past that span or `start_ms` after its own `end_ms`; `transcript` on anything
+        but a `voice` identity; `visual_bbox_xyxy` on anything but a `face` identity, or one
+        whose 0..1 normalized corners have no positive width and height.
+
+        `status` returns `duplicate` when a retry matched an earlier `idempotency_key`.
+        Deriving memory from raw media outlives this request: the returned
+        `processing_job_id` resolves over the REST job route, which MCP does not mirror, so
+        from here retry `memory_recall` until the derived memories appear.
+        """
         return await kernel.observe(request)
 
-    @server.tool(annotations=_IDEMPOTENT_WRITE)
+    server.add_tool(_flattened(ObserveRequest, memory_observe), annotations=_IDEMPOTENT_WRITE)
+
     async def memory_remember(request: RememberRequest) -> MemoryResult:
-        """Retain one explicit memory, preserving evidence and temporal provenance."""
+        """Retain one explicit memory, preserving evidence and temporal provenance.
+
+        Choose `memory_type` by the role the content will serve: `episodic` for something
+        that happened at a time, `semantic` for a durable fact, `procedural` for how to do
+        something, `prospective` for a future intention, `working` for short-lived task
+        state, `perceptual` for a raw sensory detail.
+
+        `ended_at` defaults to `occurred_at` and must not precede it. `evidence_ids` must
+        already exist and must not repeat. Omitting `idempotency_key` derives one from the
+        content, so an identical retry returns the same memory rather than a second copy.
+        """
         return await kernel.remember(request)
 
-    @server.tool(annotations=_READ_ONLY)
+    server.add_tool(_flattened(RememberRequest, memory_remember), annotations=_IDEMPOTENT_WRITE)
+
     async def memory_recall(request: RecallRequest) -> RecallResult:
-        """Recall relevant memories and return inspectable evidence with the answer."""
+        """Recall relevant memories and return inspectable evidence with the answer.
+
+        `query` needs `text`, `media_object_ids`, or both -- neither modality is privileged.
+
+        `mode` selects what work is done. `answer` reasons over the retrieved memories and
+        fills `answer`. `search` ranks and returns memories with `answer` left null. Use
+        `enumerate` for count and timeline questions: it scans the complete structured-filter
+        scope and verifies each candidate against original media, and fails with
+        `enumeration_limit_exceeded` rather than silently truncating an oversized scope.
+
+        For a grounded follow-up, pass IDs from a previous result in `memory_ids`; they become
+        the strict candidate scope instead of a ranking hint. `filters` applies before
+        ranking, and `occurred_before` must not precede `occurred_after`.
+        """
         return await kernel.recall(request)
 
-    @server.tool(annotations=_READ_ONLY)
+    server.add_tool(_flattened(RecallRequest, memory_recall), annotations=_READ_ONLY)
+
     async def memory_get(request: GetMemoryRequest) -> MemoryResult:
-        """Read one tenant-owned memory by its stable identifier."""
+        """Read one tenant-owned memory by its stable identifier.
+
+        Evidence arrives with the memory as short-lived signed URLs, so verifying an answer
+        needs no second storage call. A memory erased through `memory_forget` fails as
+        deleted rather than as missing, which distinguishes "was removed" from "never was".
+        """
         return await kernel.get_memory(request.tenant_id, request.memory_id)
 
-    @server.tool(annotations=_IDEMPOTENT_WRITE)
+    server.add_tool(_flattened(GetMemoryRequest, memory_get), annotations=_READ_ONLY)
+
     async def memory_feedback(request: FeedbackRequest) -> FeedbackReceipt:
-        """Record a useful, wrong, missing, or correction signal for future recall."""
+        """Record a useful, wrong, missing, or correction signal for future recall.
+
+        Which fields are required depends on `feedback_type`, and the wrong combination is
+        rejected rather than ignored. `missing` reports that a recall returned nothing
+        usable: it needs `recall_trace_id` -- the `trace_id` from that recall -- and must omit
+        `memory_id`. `useful`, `wrong`, and `correction` each judge one memory and need
+        `memory_id`. Only `correction` may carry `correction_summary`, and it must.
+
+        A correction supersedes the original with a new version rather than editing it, so the
+        receipt names both the `corrected_memory_id` and the original's resulting state.
+        """
         return await kernel.record_feedback(request)
 
-    @server.tool(annotations=_DESTRUCTIVE_WRITE)
+    server.add_tool(_flattened(FeedbackRequest, memory_feedback), annotations=_IDEMPOTENT_WRITE)
+
     async def memory_forget(request: ForgetRequest) -> ForgetReceipt:
-        """Recoverably erase one exact memory or source observation and its derivatives."""
+        """Recoverably erase one exact memory or source observation and its derivatives.
+
+        `target_type` decides what `target_id` names: `memory_record` erases that one memory,
+        `observation` erases a source observation and everything derived from it. Idempotent
+        -- a repeat returns the same tombstone rather than failing.
+
+        Erasure propagates across storage and offline edge devices after this reply, so read
+        `propagation_state` on the receipt instead of assuming `complete`. Confirming that it
+        finished uses the REST deletion routes, which MCP does not mirror.
+        """
         return await kernel.forget(request)
+
+    server.add_tool(_flattened(ForgetRequest, memory_forget), annotations=_DESTRUCTIVE_WRITE)
 
     return server

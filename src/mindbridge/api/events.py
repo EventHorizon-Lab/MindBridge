@@ -10,6 +10,7 @@ from fastapi import Depends, FastAPI, Request
 from fastapi.responses import StreamingResponse
 
 from mindbridge.api.auth import TenantApiKeyAuthenticator, TenantPrincipal, require_tenant
+from mindbridge.api.errors import ERRORS, TENANT_ERRORS, responses
 from mindbridge.application.kernel import MemoryKernel
 from mindbridge.contracts import ErrorResponse, Identifier, ObservationProcessingJobView
 from mindbridge.core import DatabaseUnavailableError, JobNotFoundError
@@ -36,10 +37,13 @@ def register_job_event_routes(
             200: {
                 "description": (
                     "One `job` event per observed change, each carrying the complete job view. "
-                    "Reconnect with `Last-Event-ID` to skip states already received."
+                    "Reconnect with `Last-Event-ID` to skip states already received. After the "
+                    "stream opens, a failure arrives as an `error` event carrying this same "
+                    "`ErrorResponse` envelope rather than as a status code."
                 ),
                 "content": {"text/event-stream": {"schema": {"type": "string"}}},
-            }
+            },
+            **responses(*TENANT_ERRORS, "job_not_found"),
         },
     )
     async def stream_observation_job(
@@ -106,12 +110,13 @@ def _job_frame(view: ObservationProcessingJobView) -> str:
 
 
 def _error_frame(error: DatabaseUnavailableError | JobNotFoundError) -> str:
-    code, message = (
-        ("job_not_found", "observation processing job does not exist")
-        if isinstance(error, JobNotFoundError)
-        else ("database_unavailable", "memory storage is temporarily unavailable")
+    """Frame the same code and sentence the non-streaming routes would have returned."""
+    code = "job_not_found" if isinstance(error, JobNotFoundError) else "database_unavailable"
+    response = ErrorResponse(
+        code=code,
+        message=ERRORS[code].description,
+        trace_id=current_trace_id(),
     )
-    response = ErrorResponse(code=code, message=message, trace_id=current_trace_id())
     return f"event: error\ndata: {response.model_dump_json()}\n\n"
 
 

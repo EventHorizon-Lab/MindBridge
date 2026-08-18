@@ -6,86 +6,9 @@
       "openWorldHint": false,
       "readOnlyHint": false
     },
-    "description": "Record a useful, wrong, missing, or correction signal for future recall.",
+    "description": "Record a useful, wrong, missing, or correction signal for future recall.\n\n        Which fields are required depends on `feedback_type`, and the wrong combination is\n        rejected rather than ignored. `missing` reports that a recall returned nothing\n        usable: it needs `recall_trace_id` -- the `trace_id` from that recall -- and must omit\n        `memory_id`. `useful`, `wrong`, and `correction` each judge one memory and need\n        `memory_id`. Only `correction` may carry `correction_summary`, and it must.\n\n        A correction supersedes the original with a new version rather than editing it, so the\n        receipt names both the `corrected_memory_id` and the original's resulting state.\n        ",
     "inputSchema": {
       "$defs": {
-        "FeedbackRequest": {
-          "additionalProperties": false,
-          "description": "Record useful, wrong, missing, or corrected recall feedback.",
-          "properties": {
-            "correction_summary": {
-              "anyOf": [
-                {
-                  "maxLength": 2048,
-                  "minLength": 1,
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "default": null,
-              "title": "Correction Summary"
-            },
-            "feedback_type": {
-              "$ref": "#/$defs/FeedbackType"
-            },
-            "idempotency_key": {
-              "anyOf": [
-                {
-                  "maxLength": 255,
-                  "minLength": 1,
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "default": null,
-              "title": "Idempotency Key"
-            },
-            "memory_id": {
-              "anyOf": [
-                {
-                  "maxLength": 255,
-                  "minLength": 1,
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "default": null,
-              "title": "Memory Id"
-            },
-            "recall_trace_id": {
-              "anyOf": [
-                {
-                  "maxLength": 255,
-                  "minLength": 1,
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "default": null,
-              "title": "Recall Trace Id"
-            },
-            "tenant_id": {
-              "maxLength": 255,
-              "minLength": 1,
-              "title": "Tenant Id",
-              "type": "string"
-            }
-          },
-          "required": [
-            "tenant_id",
-            "feedback_type"
-          ],
-          "title": "FeedbackRequest",
-          "type": "object"
-        },
         "FeedbackType": {
           "description": "Supported user or Agent signals about a recall result.",
           "enum": [
@@ -99,12 +22,75 @@
         }
       },
       "properties": {
-        "request": {
-          "$ref": "#/$defs/FeedbackRequest"
+        "correction_summary": {
+          "anyOf": [
+            {
+              "maxLength": 2048,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Correction Summary"
+        },
+        "feedback_type": {
+          "$ref": "#/$defs/FeedbackType"
+        },
+        "idempotency_key": {
+          "anyOf": [
+            {
+              "maxLength": 255,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Idempotency Key"
+        },
+        "memory_id": {
+          "anyOf": [
+            {
+              "maxLength": 255,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Memory Id"
+        },
+        "recall_trace_id": {
+          "anyOf": [
+            {
+              "maxLength": 255,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Recall Trace Id"
+        },
+        "tenant_id": {
+          "maxLength": 255,
+          "minLength": 1,
+          "title": "Tenant Id",
+          "type": "string"
         }
       },
       "required": [
-        "request"
+        "tenant_id",
+        "feedback_type"
       ],
       "title": "memory_feedbackArguments",
       "type": "object"
@@ -227,51 +213,9 @@
       "openWorldHint": false,
       "readOnlyHint": false
     },
-    "description": "Recoverably erase one exact memory or source observation and its derivatives.",
+    "description": "Recoverably erase one exact memory or source observation and its derivatives.\n\n        `target_type` decides what `target_id` names: `memory_record` erases that one memory,\n        `observation` erases a source observation and everything derived from it. Idempotent\n        -- a repeat returns the same tombstone rather than failing.\n\n        Erasure propagates across storage and offline edge devices after this reply, so read\n        `propagation_state` on the receipt instead of assuming `complete`. Confirming that it\n        finished uses the REST deletion routes, which MCP does not mirror.\n        ",
     "inputSchema": {
       "$defs": {
-        "ForgetRequest": {
-          "additionalProperties": false,
-          "description": "Explicitly delete one exact memory or its complete source observation.",
-          "properties": {
-            "idempotency_key": {
-              "anyOf": [
-                {
-                  "maxLength": 255,
-                  "minLength": 1,
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "default": null,
-              "title": "Idempotency Key"
-            },
-            "target_id": {
-              "maxLength": 255,
-              "minLength": 1,
-              "title": "Target Id",
-              "type": "string"
-            },
-            "target_type": {
-              "$ref": "#/$defs/ForgetTargetType"
-            },
-            "tenant_id": {
-              "maxLength": 255,
-              "minLength": 1,
-              "title": "Tenant Id",
-              "type": "string"
-            }
-          },
-          "required": [
-            "tenant_id",
-            "target_type",
-            "target_id"
-          ],
-          "title": "ForgetRequest",
-          "type": "object"
-        },
         "ForgetTargetType": {
           "description": "Exact deletion scopes supported by the first production path.",
           "enum": [
@@ -283,12 +227,40 @@
         }
       },
       "properties": {
-        "request": {
-          "$ref": "#/$defs/ForgetRequest"
+        "idempotency_key": {
+          "anyOf": [
+            {
+              "maxLength": 255,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Idempotency Key"
+        },
+        "target_id": {
+          "maxLength": 255,
+          "minLength": 1,
+          "title": "Target Id",
+          "type": "string"
+        },
+        "target_type": {
+          "$ref": "#/$defs/ForgetTargetType"
+        },
+        "tenant_id": {
+          "maxLength": 255,
+          "minLength": 1,
+          "title": "Tenant Id",
+          "type": "string"
         }
       },
       "required": [
-        "request"
+        "tenant_id",
+        "target_type",
+        "target_id"
       ],
       "title": "memory_forgetArguments",
       "type": "object"
@@ -394,41 +366,25 @@
       "openWorldHint": false,
       "readOnlyHint": true
     },
-    "description": "Read one tenant-owned memory by its stable identifier.",
+    "description": "Read one tenant-owned memory by its stable identifier.\n\n        Evidence arrives with the memory as short-lived signed URLs, so verifying an answer\n        needs no second storage call. A memory erased through `memory_forget` fails as\n        deleted rather than as missing, which distinguishes \"was removed\" from \"never was\".\n        ",
     "inputSchema": {
-      "$defs": {
-        "GetMemoryRequest": {
-          "additionalProperties": false,
-          "description": "Identify one tenant-owned memory without relying on ambient tenancy.",
-          "properties": {
-            "memory_id": {
-              "maxLength": 255,
-              "minLength": 1,
-              "title": "Memory Id",
-              "type": "string"
-            },
-            "tenant_id": {
-              "maxLength": 255,
-              "minLength": 1,
-              "title": "Tenant Id",
-              "type": "string"
-            }
-          },
-          "required": [
-            "tenant_id",
-            "memory_id"
-          ],
-          "title": "GetMemoryRequest",
-          "type": "object"
-        }
-      },
       "properties": {
-        "request": {
-          "$ref": "#/$defs/GetMemoryRequest"
+        "memory_id": {
+          "maxLength": 255,
+          "minLength": 1,
+          "title": "Memory Id",
+          "type": "string"
+        },
+        "tenant_id": {
+          "maxLength": 255,
+          "minLength": 1,
+          "title": "Tenant Id",
+          "type": "string"
         }
       },
       "required": [
-        "request"
+        "tenant_id",
+        "memory_id"
       ],
       "title": "memory_getArguments",
       "type": "object"
@@ -676,7 +632,7 @@
       "openWorldHint": false,
       "readOnlyHint": false
     },
-    "description": "Store one timestamped multimodal observation and return its durable job ID.",
+    "description": "Store one timestamped multimodal observation and return its durable job ID.\n\n        Preconditions this tool cannot do for you: every `media_objects[*].uri` must already\n        be readable at `s3://<bucket>/tenants/<tenant_id>/<key>`, with `sha256` and\n        `size_bytes` matching those exact bytes. This is the first-party device path. An Agent\n        holding content rather than stored media objects wants `memory_remember` instead.\n\n        Rejected combinations: `ended_at` before `occurred_at`; a repeated `media_object_id`;\n        a media `duration_ms` longer than the observation's own span; an identity span with\n        `end_ms` past that span or `start_ms` after its own `end_ms`; `transcript` on anything\n        but a `voice` identity; `visual_bbox_xyxy` on anything but a `face` identity, or one\n        whose 0..1 normalized corners have no positive width and height.\n\n        `status` returns `duplicate` when a retry matched an earlier `idempotency_key`.\n        Deriving memory from raw media outlives this request: the returned\n        `processing_job_id` resolves over the REST job route, which MCP does not mirror, so\n        from here retry `memory_recall` until the derived memories appear.\n        ",
     "inputSchema": {
       "$defs": {
         "IdentityKind": {
@@ -876,106 +832,6 @@
           "title": "MediaObjectInput",
           "type": "object"
         },
-        "ObserveRequest": {
-          "additionalProperties": false,
-          "description": "Submit one timestamped device observation and its media metadata.",
-          "properties": {
-            "boot_id": {
-              "maxLength": 255,
-              "minLength": 1,
-              "title": "Boot Id",
-              "type": "string"
-            },
-            "clock_offset_ms": {
-              "default": 0,
-              "maximum": 2147483647,
-              "minimum": -2147483648,
-              "title": "Clock Offset Ms",
-              "type": "integer"
-            },
-            "device_id": {
-              "maxLength": 255,
-              "minLength": 1,
-              "title": "Device Id",
-              "type": "string"
-            },
-            "ended_at": {
-              "format": "date-time",
-              "title": "Ended At",
-              "type": "string"
-            },
-            "idempotency_key": {
-              "anyOf": [
-                {
-                  "maxLength": 255,
-                  "minLength": 1,
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "default": null,
-              "title": "Idempotency Key"
-            },
-            "identity_observations": {
-              "default": [],
-              "items": {
-                "$ref": "#/$defs/IdentityObservationInput"
-              },
-              "maxItems": 512,
-              "title": "Identity Observations",
-              "type": "array"
-            },
-            "media_objects": {
-              "items": {
-                "$ref": "#/$defs/MediaObjectInput"
-              },
-              "maxItems": 8,
-              "minItems": 1,
-              "title": "Media Objects",
-              "type": "array"
-            },
-            "observed_at": {
-              "format": "date-time",
-              "title": "Observed At",
-              "type": "string"
-            },
-            "occurred_at": {
-              "format": "date-time",
-              "title": "Occurred At",
-              "type": "string"
-            },
-            "sensor": {
-              "$ref": "#/$defs/SensorKind"
-            },
-            "sequence": {
-              "maximum": 9223372036854775807,
-              "minimum": 0,
-              "title": "Sequence",
-              "type": "integer"
-            },
-            "tenant_id": {
-              "maxLength": 255,
-              "minLength": 1,
-              "title": "Tenant Id",
-              "type": "string"
-            }
-          },
-          "required": [
-            "tenant_id",
-            "device_id",
-            "boot_id",
-            "sequence",
-            "sensor",
-            "media_objects",
-            "occurred_at",
-            "ended_at",
-            "observed_at"
-          ],
-          "title": "ObserveRequest",
-          "type": "object"
-        },
         "SensorKind": {
           "description": "Sensor that produced an observation; each one must carry MediaKind evidence.",
           "enum": [
@@ -987,12 +843,98 @@
         }
       },
       "properties": {
-        "request": {
-          "$ref": "#/$defs/ObserveRequest"
+        "boot_id": {
+          "maxLength": 255,
+          "minLength": 1,
+          "title": "Boot Id",
+          "type": "string"
+        },
+        "clock_offset_ms": {
+          "default": 0,
+          "maximum": 2147483647,
+          "minimum": -2147483648,
+          "title": "Clock Offset Ms",
+          "type": "integer"
+        },
+        "device_id": {
+          "maxLength": 255,
+          "minLength": 1,
+          "title": "Device Id",
+          "type": "string"
+        },
+        "ended_at": {
+          "format": "date-time",
+          "title": "Ended At",
+          "type": "string"
+        },
+        "idempotency_key": {
+          "anyOf": [
+            {
+              "maxLength": 255,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Idempotency Key"
+        },
+        "identity_observations": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/IdentityObservationInput"
+          },
+          "maxItems": 512,
+          "title": "Identity Observations",
+          "type": "array"
+        },
+        "media_objects": {
+          "items": {
+            "$ref": "#/$defs/MediaObjectInput"
+          },
+          "maxItems": 8,
+          "minItems": 1,
+          "title": "Media Objects",
+          "type": "array"
+        },
+        "observed_at": {
+          "format": "date-time",
+          "title": "Observed At",
+          "type": "string"
+        },
+        "occurred_at": {
+          "format": "date-time",
+          "title": "Occurred At",
+          "type": "string"
+        },
+        "sensor": {
+          "$ref": "#/$defs/SensorKind"
+        },
+        "sequence": {
+          "maximum": 9223372036854775807,
+          "minimum": 0,
+          "title": "Sequence",
+          "type": "integer"
+        },
+        "tenant_id": {
+          "maxLength": 255,
+          "minLength": 1,
+          "title": "Tenant Id",
+          "type": "string"
         }
       },
       "required": [
-        "request"
+        "tenant_id",
+        "device_id",
+        "boot_id",
+        "sequence",
+        "sensor",
+        "media_objects",
+        "occurred_at",
+        "ended_at",
+        "observed_at"
       ],
       "title": "memory_observeArguments",
       "type": "object"
@@ -1067,7 +1009,7 @@
       "openWorldHint": false,
       "readOnlyHint": true
     },
-    "description": "Recall relevant memories and return inspectable evidence with the answer.",
+    "description": "Recall relevant memories and return inspectable evidence with the answer.\n\n        `query` needs `text`, `media_object_ids`, or both -- neither modality is privileged.\n\n        `mode` selects what work is done. `answer` reasons over the retrieved memories and\n        fills `answer`. `search` ranks and returns memories with `answer` left null. Use\n        `enumerate` for count and timeline questions: it scans the complete structured-filter\n        scope and verifies each candidate against original media, and fails with\n        `enumeration_limit_exceeded` rather than silently truncating an oversized scope.\n\n        For a grounded follow-up, pass IDs from a previous result in `memory_ids`; they become\n        the strict candidate scope instead of a ranking hint. `filters` applies before\n        ranking, and `occurred_before` must not precede `occurred_after`.\n        ",
     "inputSchema": {
       "$defs": {
         "MemoryType": {
@@ -1190,66 +1132,52 @@
           },
           "title": "RecallQuery",
           "type": "object"
-        },
-        "RecallRequest": {
-          "additionalProperties": false,
-          "description": "Recall relevant memories and, by default, their evidence.",
-          "properties": {
-            "filters": {
-              "$ref": "#/$defs/RecallFilters"
-            },
-            "include_evidence": {
-              "default": true,
-              "title": "Include Evidence",
-              "type": "boolean"
-            },
-            "limit": {
-              "default": 20,
-              "maximum": 100,
-              "minimum": 1,
-              "title": "Limit",
-              "type": "integer"
-            },
-            "memory_ids": {
-              "default": [],
-              "items": {
-                "maxLength": 255,
-                "minLength": 1,
-                "type": "string"
-              },
-              "maxItems": 100,
-              "title": "Memory Ids",
-              "type": "array"
-            },
-            "mode": {
-              "$ref": "#/$defs/RecallMode",
-              "default": "answer"
-            },
-            "query": {
-              "$ref": "#/$defs/RecallQuery"
-            },
-            "tenant_id": {
-              "maxLength": 255,
-              "minLength": 1,
-              "title": "Tenant Id",
-              "type": "string"
-            }
-          },
-          "required": [
-            "tenant_id",
-            "query"
-          ],
-          "title": "RecallRequest",
-          "type": "object"
         }
       },
       "properties": {
-        "request": {
-          "$ref": "#/$defs/RecallRequest"
+        "filters": {
+          "$ref": "#/$defs/RecallFilters"
+        },
+        "include_evidence": {
+          "default": true,
+          "title": "Include Evidence",
+          "type": "boolean"
+        },
+        "limit": {
+          "default": 20,
+          "maximum": 100,
+          "minimum": 1,
+          "title": "Limit",
+          "type": "integer"
+        },
+        "memory_ids": {
+          "default": [],
+          "items": {
+            "maxLength": 255,
+            "minLength": 1,
+            "type": "string"
+          },
+          "maxItems": 100,
+          "title": "Memory Ids",
+          "type": "array"
+        },
+        "mode": {
+          "$ref": "#/$defs/RecallMode",
+          "default": "answer"
+        },
+        "query": {
+          "$ref": "#/$defs/RecallQuery"
+        },
+        "tenant_id": {
+          "maxLength": 255,
+          "minLength": 1,
+          "title": "Tenant Id",
+          "type": "string"
         }
       },
       "required": [
-        "request"
+        "tenant_id",
+        "query"
       ],
       "title": "memory_recallArguments",
       "type": "object"
@@ -1534,7 +1462,7 @@
       "openWorldHint": false,
       "readOnlyHint": false
     },
-    "description": "Retain one explicit memory, preserving evidence and temporal provenance.",
+    "description": "Retain one explicit memory, preserving evidence and temporal provenance.\n\n        Choose `memory_type` by the role the content will serve: `episodic` for something\n        that happened at a time, `semantic` for a durable fact, `procedural` for how to do\n        something, `prospective` for a future intention, `working` for short-lived task\n        state, `perceptual` for a raw sensory detail.\n\n        `ended_at` defaults to `occurred_at` and must not precede it. `evidence_ids` must\n        already exist and must not repeat. Omitting `idempotency_key` derives one from the\n        content, so an identical retry returns the same memory rather than a second copy.\n        ",
     "inputSchema": {
       "$defs": {
         "MemoryType": {
@@ -1549,87 +1477,73 @@
           ],
           "title": "MemoryType",
           "type": "string"
-        },
-        "RememberRequest": {
-          "additionalProperties": false,
-          "description": "Explicitly retain user- or agent-supplied content.",
-          "properties": {
-            "ended_at": {
-              "anyOf": [
-                {
-                  "format": "date-time",
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "default": null,
-              "title": "Ended At"
-            },
-            "evidence_ids": {
-              "default": [],
-              "items": {
-                "maxLength": 255,
-                "minLength": 1,
-                "type": "string"
-              },
-              "maxItems": 100,
-              "title": "Evidence Ids",
-              "type": "array"
-            },
-            "idempotency_key": {
-              "anyOf": [
-                {
-                  "maxLength": 255,
-                  "minLength": 1,
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "default": null,
-              "title": "Idempotency Key"
-            },
-            "memory_type": {
-              "$ref": "#/$defs/MemoryType"
-            },
-            "occurred_at": {
-              "format": "date-time",
-              "title": "Occurred At",
-              "type": "string"
-            },
-            "summary": {
-              "maxLength": 2048,
-              "minLength": 1,
-              "title": "Summary",
-              "type": "string"
-            },
-            "tenant_id": {
-              "maxLength": 255,
-              "minLength": 1,
-              "title": "Tenant Id",
-              "type": "string"
-            }
-          },
-          "required": [
-            "tenant_id",
-            "summary",
-            "memory_type",
-            "occurred_at"
-          ],
-          "title": "RememberRequest",
-          "type": "object"
         }
       },
       "properties": {
-        "request": {
-          "$ref": "#/$defs/RememberRequest"
+        "ended_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Ended At"
+        },
+        "evidence_ids": {
+          "default": [],
+          "items": {
+            "maxLength": 255,
+            "minLength": 1,
+            "type": "string"
+          },
+          "maxItems": 100,
+          "title": "Evidence Ids",
+          "type": "array"
+        },
+        "idempotency_key": {
+          "anyOf": [
+            {
+              "maxLength": 255,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Idempotency Key"
+        },
+        "memory_type": {
+          "$ref": "#/$defs/MemoryType"
+        },
+        "occurred_at": {
+          "format": "date-time",
+          "title": "Occurred At",
+          "type": "string"
+        },
+        "summary": {
+          "maxLength": 2048,
+          "minLength": 1,
+          "title": "Summary",
+          "type": "string"
+        },
+        "tenant_id": {
+          "maxLength": 255,
+          "minLength": 1,
+          "title": "Tenant Id",
+          "type": "string"
         }
       },
       "required": [
-        "request"
+        "tenant_id",
+        "summary",
+        "memory_type",
+        "occurred_at"
       ],
       "title": "memory_rememberArguments",
       "type": "object"

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Annotated
+from typing import Annotated, Final
 
 from fastapi import Depends, FastAPI, Query, Request, status
 from fastapi.exceptions import RequestValidationError
@@ -16,12 +16,12 @@ from mindbridge.api.auth import (
     TenantPrincipal,
     require_tenant,
 )
+from mindbridge.api.errors import TENANT_ERRORS, error_response, responses
 from mindbridge.api.events import register_job_event_routes
 from mindbridge.application.kernel import MemoryKernel
 from mindbridge.contracts import (
     DeletionListRequest,
     DeletionPage,
-    ErrorResponse,
     FeedbackReceipt,
     FeedbackRequest,
     ForgetReceipt,
@@ -56,6 +56,23 @@ from mindbridge.core import (
 from mindbridge.models import Generator
 from mindbridge.telemetry import current_trace_id
 
+_MODEL_ERROR_CODES: Final[dict[type[Exception], str]] = {
+    ModelOutputError: "model_output_invalid",
+    ModelRequestError: "model_request_failed",
+}
+_DEPENDENCY_ERROR_CODES: Final[dict[type[Exception], str]] = {
+    DatabaseUnavailableError: "database_unavailable",
+    ModelUnavailableError: "model_unavailable",
+    ObjectStorageError: "object_storage_unavailable",
+    TaskBrokerError: "task_broker_unavailable",
+}
+_EMBEDDING_ERRORS: Final[tuple[str, ...]] = (
+    "model_request_failed",
+    "model_output_invalid",
+    "model_unavailable",
+)
+"""What any operation that encodes a vector before answering the caller can return."""
+
 
 def build_app(
     kernel: MemoryKernel,
@@ -81,6 +98,12 @@ def build_app(
         response_model=ObservationReceipt,
         status_code=status.HTTP_202_ACCEPTED,
         operation_id="observe",
+        responses=responses(
+            *TENANT_ERRORS,
+            "idempotency_conflict",
+            "domain_invariant_failed",
+            "task_broker_unavailable",
+        ),
     )
     async def observe(
         request: ObserveRequest,
@@ -94,6 +117,12 @@ def build_app(
         response_model=MemoryResult,
         status_code=status.HTTP_201_CREATED,
         operation_id="remember",
+        responses=responses(
+            *TENANT_ERRORS,
+            "idempotency_conflict",
+            "domain_invariant_failed",
+            *_EMBEDDING_ERRORS,
+        ),
     )
     async def remember(
         request: RememberRequest,
@@ -107,6 +136,15 @@ def build_app(
         response_model=FeedbackReceipt,
         status_code=status.HTTP_201_CREATED,
         operation_id="recordFeedback",
+        responses=responses(
+            *TENANT_ERRORS,
+            "memory_not_found",
+            "memory_deleted",
+            "idempotency_conflict",
+            "domain_invariant_failed",
+            # A correction writes a new memory version, so it encodes one before replying.
+            *_EMBEDDING_ERRORS,
+        ),
     )
     async def record_feedback(
         request: FeedbackRequest,
@@ -119,6 +157,12 @@ def build_app(
         "/v1/recall",
         response_model=RecallResult,
         operation_id="recall",
+        responses=responses(
+            *TENANT_ERRORS,
+            "enumeration_limit_exceeded",
+            "memory_integrity_failed",
+            *_EMBEDDING_ERRORS,
+        ),
     )
     async def recall(
         request: RecallRequest,
@@ -131,6 +175,7 @@ def build_app(
         "/v1/memories/{memory_id}",
         response_model=MemoryResult,
         operation_id="getMemory",
+        responses=responses(*TENANT_ERRORS, "memory_not_found", "memory_deleted"),
     )
     async def get_memory(
         memory_id: Identifier,
@@ -144,6 +189,7 @@ def build_app(
         "/v1/jobs/{job_id}",
         response_model=ObservationProcessingJobView,
         operation_id="getObservationJob",
+        responses=responses(*TENANT_ERRORS, "job_not_found"),
     )
     async def get_observation_job(
         job_id: Identifier,
@@ -172,6 +218,13 @@ def _register_deletion_routes(
         "/v1/forget",
         response_model=ForgetReceipt,
         operation_id="forget",
+        responses=responses(
+            *TENANT_ERRORS,
+            "forget_target_not_found",
+            "idempotency_conflict",
+            # Erasing media is part of the command, so its storage is on this request's path.
+            "object_storage_unavailable",
+        ),
     )
     async def forget(
         request: ForgetRequest,
@@ -184,6 +237,9 @@ def _register_deletion_routes(
         "/v1/deletions",
         response_model=DeletionPage,
         operation_id="listDeletions",
+        # A cursor from another tenant, or one whose tombstone is gone, is a domain failure
+        # rather than an empty page: an edge device must not read truncation as completion.
+        responses=responses(*TENANT_ERRORS, "domain_invariant_failed"),
     )
     async def list_deletions(
         tenant_id: Identifier,
@@ -200,6 +256,7 @@ def _register_deletion_routes(
         "/v1/deletions/{tombstone_id}",
         response_model=ForgetReceipt,
         operation_id="getForgetStatus",
+        responses=responses(*TENANT_ERRORS, "forget_target_not_found"),
     )
     async def get_forget_status(
         tombstone_id: Identifier,
@@ -216,8 +273,8 @@ def _register_request_error_handlers(app: FastAPI) -> None:
         _request: Request,
         error: AuthenticationError,
     ) -> JSONResponse:
-        response = _error_response(error.status_code, code=error.code, message=error.message)
-        if error.status_code == status.HTTP_401_UNAUTHORIZED:
+        response = error_response(error.code)
+        if response.status_code == status.HTTP_401_UNAUTHORIZED:
             response.headers["WWW-Authenticate"] = "Bearer"
         return response
 
@@ -226,10 +283,8 @@ def _register_request_error_handlers(app: FastAPI) -> None:
         _request: Request,
         error: RequestValidationError,
     ) -> JSONResponse:
-        response = ErrorResponse(
-            code="request_validation_failed",
-            message="request validation failed",
-            trace_id=current_trace_id(),
+        return error_response(
+            "request_validation_failed",
             issues=tuple(
                 ValidationIssue(
                     location=tuple(str(part) for part in issue["loc"]),
@@ -239,9 +294,6 @@ def _register_request_error_handlers(app: FastAPI) -> None:
                 for issue in error.errors()
             ),
         )
-        return JSONResponse(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, content=response.model_dump()
-        )
 
     @app.exception_handler(DomainInvariantError)
     async def handle_domain_error(
@@ -250,22 +302,11 @@ def _register_request_error_handlers(app: FastAPI) -> None:
     ) -> JSONResponse:
         if isinstance(error, IdempotencyConflictError):
             code = "idempotency_conflict"
-            status_code = status.HTTP_409_CONFLICT
         elif isinstance(error, EnumerationLimitExceededError):
             code = "enumeration_limit_exceeded"
-            status_code = status.HTTP_422_UNPROCESSABLE_CONTENT
         else:
             code = "domain_invariant_failed"
-            status_code = status.HTTP_422_UNPROCESSABLE_CONTENT
-        response = ErrorResponse(
-            code=code,
-            message=str(error),
-            trace_id=current_trace_id(),
-        )
-        return JSONResponse(
-            status_code=status_code,
-            content=response.model_dump(),
-        )
+        return error_response(code, message=str(error))
 
 
 def _register_runtime_error_handlers(app: FastAPI) -> None:
@@ -274,44 +315,28 @@ def _register_runtime_error_handlers(app: FastAPI) -> None:
         _request: Request,
         _error: ForgetTargetNotFoundError,
     ) -> JSONResponse:
-        return _error_response(
-            status.HTTP_404_NOT_FOUND,
-            code="forget_target_not_found",
-            message="forget target or deletion tombstone does not exist",
-        )
+        return error_response("forget_target_not_found")
 
     @app.exception_handler(MemoryDeletedError)
     async def handle_memory_deleted(
         _request: Request,
         _error: MemoryDeletedError,
     ) -> JSONResponse:
-        return _error_response(
-            status.HTTP_410_GONE,
-            code="memory_deleted",
-            message="memory content was explicitly deleted",
-        )
+        return error_response("memory_deleted")
 
     @app.exception_handler(MemoryNotFoundError)
     async def handle_memory_not_found(
         _request: Request,
         _error: MemoryNotFoundError,
     ) -> JSONResponse:
-        return _error_response(
-            status.HTTP_404_NOT_FOUND,
-            code="memory_not_found",
-            message="memory does not exist",
-        )
+        return error_response("memory_not_found")
 
     @app.exception_handler(JobNotFoundError)
     async def handle_job_not_found(
         _request: Request,
         _error: JobNotFoundError,
     ) -> JSONResponse:
-        return _error_response(
-            status.HTTP_404_NOT_FOUND,
-            code="job_not_found",
-            message="observation processing job does not exist",
-        )
+        return error_response("job_not_found")
 
     @app.exception_handler(ModelRequestError)
     @app.exception_handler(ModelOutputError)
@@ -319,21 +344,7 @@ def _register_runtime_error_handlers(app: FastAPI) -> None:
         _request: Request,
         error: ModelOutputError | ModelRequestError,
     ) -> JSONResponse:
-        code, message = {
-            ModelOutputError: (
-                "model_output_invalid",
-                "memory model returned invalid output",
-            ),
-            ModelRequestError: (
-                "model_request_failed",
-                "memory model rejected its configured request",
-            ),
-        }[type(error)]
-        return _error_response(
-            status.HTTP_502_BAD_GATEWAY,
-            code=code,
-            message=message,
-        )
+        return error_response(_MODEL_ERROR_CODES[type(error)])
 
     @app.exception_handler(DatabaseUnavailableError)
     @app.exception_handler(ModelUnavailableError)
@@ -346,39 +357,11 @@ def _register_runtime_error_handlers(app: FastAPI) -> None:
         | ObjectStorageError
         | TaskBrokerError,
     ) -> JSONResponse:
-        code, message = {
-            DatabaseUnavailableError: (
-                "database_unavailable",
-                "memory storage is temporarily unavailable",
-            ),
-            ModelUnavailableError: ("model_unavailable", "memory model is unavailable"),
-            ObjectStorageError: (
-                "object_storage_unavailable",
-                "evidence media is unavailable",
-            ),
-            TaskBrokerError: (
-                "task_broker_unavailable",
-                "observation processing is temporarily unavailable",
-            ),
-        }[type(error)]
-        return _error_response(
-            status.HTTP_503_SERVICE_UNAVAILABLE,
-            code=code,
-            message=message,
-        )
+        return error_response(_DEPENDENCY_ERROR_CODES[type(error)])
 
     @app.exception_handler(MemoryIntegrityError)
     async def handle_memory_integrity_error(
         _request: Request,
         _error: MemoryIntegrityError,
     ) -> JSONResponse:
-        return _error_response(
-            status.HTTP_500_INTERNAL_SERVER_ERROR,
-            code="memory_integrity_failed",
-            message="stored memory is inconsistent",
-        )
-
-
-def _error_response(status_code: int, *, code: str, message: str) -> JSONResponse:
-    response = ErrorResponse(code=code, message=message, trace_id=current_trace_id())
-    return JSONResponse(status_code=status_code, content=response.model_dump())
+        return error_response("memory_integrity_failed")

@@ -84,18 +84,10 @@ def register_aml_routes(
         credentials: Annotated[HTTPAuthorizationCredentials | None, Security(_BEARER)],
     ) -> None:
         if credentials is None:
-            raise AuthenticationError(
-                status_code=401,
-                code="authentication_required",
-                message="a valid bearer API key is required",
-            )
+            raise AuthenticationError("authentication_required")
         candidate = hashlib.sha256(credentials.credentials.encode()).digest()
         if not hmac.compare_digest(candidate, expected):
-            raise AuthenticationError(
-                status_code=401,
-                code="authentication_failed",
-                message="the bearer API key is invalid",
-            )
+            raise AuthenticationError("authentication_failed")
 
     @app.post("/aml/add", response_model=AmlAddResponse, operation_id="amlAdd")
     async def aml_add(
