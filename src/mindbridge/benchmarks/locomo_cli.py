@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections import Counter
 from dataclasses import dataclass
 from typing import Literal
 
@@ -50,6 +51,10 @@ class LoCoMoRunManifest(BenchmarkRunManifest):
     memory_item_count: int = Field(gt=0)
     question_count: int = Field(gt=0)
     abstained_question_count: int = Field(ge=0)
+    # Vendor LoCoMo numbers are mostly four-category, dropping adversarial (category 5), which is
+    # the single largest reason two published scores are not comparable. Keyed by official
+    # category so a reader can tell which protocol a number came from without rerunning it.
+    category_question_counts: dict[int, int] = Field(min_length=1)
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,6 +129,11 @@ def _write_artifacts(
         question_count=sum(len(conversation.questions) for conversation in conversations),
         abstained_question_count=sum(
             question.mindbridge_abstained for result in results for question in result.qa
+        ),
+        category_question_counts=dict(
+            sorted(
+                Counter(question.category for result in results for question in result.qa).items()
+            )
         ),
     )
     write_run_artifacts(arguments.output_path, predictions, manifest)

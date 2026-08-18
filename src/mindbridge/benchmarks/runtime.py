@@ -8,6 +8,7 @@ import re
 from datetime import timedelta
 from decimal import Decimal
 from pathlib import Path
+from time import monotonic
 
 from pydantic import AwareDatetime, Field, TypeAdapter, model_validator
 
@@ -231,28 +232,51 @@ async def wait_for_observation_job(
     *,
     poll_interval_seconds: float = 1.0,
     timeout_seconds: float = 1_800.0,
+    failed_grace_seconds: float = 600.0,
 ) -> ObservationProcessingJobView:
-    """Wait for durable success while allowing failed attempts to be retried."""
-    if poll_interval_seconds <= 0 or timeout_seconds <= 0:
-        raise ValueError("poll interval and timeout must be positive")
-    last_state: JobState | None = None
+    """Wait for durable success while allowing failed attempts to be retried.
+
+    `FAILED` is not terminal: the stale-job sweep reclaims it, moving it back to `RUNNING` with a
+    higher `attempt`, and Celery's backoff caps at 300s. So a failure whose attempt never advances
+    is permanent, and polling it to `timeout_seconds` burns that budget per observation while
+    discarding the `error_code` that says why. Give up early and report the code instead.
+    """
+    if poll_interval_seconds <= 0 or timeout_seconds <= 0 or failed_grace_seconds <= 0:
+        raise ValueError("poll interval, timeout, and failed grace must be positive")
+    last_job: ObservationProcessingJobView | None = None
 
     async def poll() -> ObservationProcessingJobView:
-        nonlocal last_state
+        nonlocal last_job
+        # Only read once failing_attempt matches, which is only true after it has been set.
+        failing_since = 0.0
+        failing_attempt: int | None = None
         while True:
             job = await memory.get_observation_job(tenant_id, job_id)
-            last_state = job.state
+            last_job = job
             if job.state is JobState.SUCCEEDED:
                 return job
+            if job.state is not JobState.FAILED:
+                failing_attempt = None
+            elif failing_attempt != job.attempt:
+                failing_since, failing_attempt = monotonic(), job.attempt
+            elif monotonic() - failing_since >= failed_grace_seconds:
+                raise RuntimeError(_job_failure_message(job_id, job))
             await asyncio.sleep(poll_interval_seconds)
 
     try:
         return await asyncio.wait_for(poll(), timeout_seconds)
     except asyncio.TimeoutError as error:
-        state = last_state.value if last_state is not None else "unavailable"
-        raise TimeoutError(
-            f"observation job {job_id} did not succeed; last state was {state}"
-        ) from error
+        raise TimeoutError(_job_failure_message(job_id, last_job)) from error
+
+
+def _job_failure_message(job_id: str, job: ObservationProcessingJobView | None) -> str:
+    """Name the state and the error code, so a stuck run says why it is stuck."""
+    if job is None:
+        return f"observation job {job_id} did not succeed; last state was unavailable"
+    return (
+        f"observation job {job_id} did not succeed; last state was {job.state.value} "
+        f"on attempt {job.attempt} with error code {job.error_code or 'none'}"
+    )
 
 
 async def ingest_media(

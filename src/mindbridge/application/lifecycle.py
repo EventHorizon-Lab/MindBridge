@@ -83,6 +83,8 @@ class MemoryLifecycleStore(Protocol):
         evaluated_at: datetime,
     ) -> int: ...
 
+    async def purge_compressed_clips(self, tenant_id: TenantId, *, limit: int) -> int: ...
+
 
 class EvolveMemoryLifecycle:
     """Recalculate one bounded page without overwriting concurrent feedback or deletion."""

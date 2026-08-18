@@ -4,6 +4,7 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 from mindbridge.core import (
+    DEFAULT_MEMORY_STRENGTH_POLICY,
     MemoryId,
     MemoryRecord,
     MemoryState,
@@ -39,6 +40,44 @@ def test_feedback_and_access_signals_drive_explicit_lifecycle_states() -> None:
     assert cold.strength == -0.5
     assert revived.state is MemoryState.ACTIVE
     assert calculate_memory_strength(memory, NOW + timedelta(days=365)) < memory.salience
+
+
+def test_idle_memories_cool_within_a_usable_window_across_the_salience_range() -> None:
+    """A logarithmic age term put salience 0.5 roughly 60 years from COLD, and 0.9 far beyond.
+
+    The horizon has to land inside a retention window an operator can actually name, for every
+    salience the perceiver produces — not just for the low tail.
+    """
+    for salience in (0.2, 0.5, 0.9):
+        memory = replace(_memory(), salience=salience)
+
+        assert evolve_memory_strength(memory, NOW + timedelta(days=7)).state is not MemoryState.COLD
+        assert evolve_memory_strength(memory, NOW + timedelta(days=365)).state is MemoryState.COLD
+
+
+def test_a_useful_access_buys_back_idle_time() -> None:
+    """Decay must not cool a memory the system keeps successfully retrieving."""
+    used = replace(_memory(), useful_access_count=1)
+
+    assert evolve_memory_strength(used, NOW + timedelta(days=120)).state is not MemoryState.COLD
+
+
+def test_compression_is_reachable_only_when_configured_and_never_reverses() -> None:
+    """COMPRESSED was a state nothing in the codebase could ever write."""
+    idle = replace(_memory(), created_at=NOW)
+    policy = replace(DEFAULT_MEMORY_STRENGTH_POLICY, compress_below=-0.5)
+
+    assert evolve_memory_strength(idle, NOW + timedelta(days=400)).state is MemoryState.COLD
+    compressed = evolve_memory_strength(idle, NOW + timedelta(days=400), policy)
+
+    assert compressed.state is MemoryState.COMPRESSED
+    # Cold at 150 days, but not yet decayed past the compression threshold.
+    assert evolve_memory_strength(idle, NOW + timedelta(days=150), policy).state is MemoryState.COLD
+    # Recall revives cold; nothing re-derives discarded clips, so compression stays put.
+    revived = replace(compressed, useful_access_count=5, positive_feedback_count=3)
+    assert evolve_memory_strength(revived, NOW + timedelta(days=400), policy).state is (
+        MemoryState.COMPRESSED
+    )
 
 
 def test_recent_access_resets_age_decay() -> None:

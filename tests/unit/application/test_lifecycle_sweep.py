@@ -54,6 +54,9 @@ class RecordingLifecycleStore:
         self.changes = changes
         return len(changes) - int(self.reject_first and bool(changes))
 
+    async def purge_compressed_clips(self, tenant_id: TenantId, *, limit: int) -> int:
+        raise AssertionError("the scoring sweep must not purge derived artifacts")
+
 
 async def test_lifecycle_sweep_is_bounded_scored_and_cursor_stable() -> None:
     store = RecordingLifecycleStore(

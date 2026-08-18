@@ -135,19 +135,34 @@ async def test_supermemory_ingests_through_question_boundary_without_future_segm
     assert "is_answerable" not in request_json
 
 
-async def test_supermemory_maps_production_abstention_to_explicit_choice() -> None:
+async def test_supermemory_abstention_is_not_the_dataset_unanswerable_choice() -> None:
+    """Substituting the choice scored an abstention correct on unanswerable questions."""
     api = RecordingMemoryApi(answer=None)
+    unanswerable = _question(
+        1,
+        question_ended_at=ORIGIN + timedelta(seconds=45),
+        correct_option_index=0,
+        is_answerable=False,
+    )
 
-    result = await run_supermemory_vqa(
+    results = await run_supermemory_vqa(
         cast(MindBridge, api),
-        (_question(1, question_ended_at=ORIGIN + timedelta(seconds=45)),),
+        (unanswerable,),
         _prepared_subject(),
         run_id="run_02",
         poll_interval_seconds=0.001,
     )
 
-    assert result[0].predicted_option_index == 0
-    assert result[0].ranked_option_indices == (0,)
+    assert results[0].predicted_option_index is None
+    assert results[0].ranked_option_indices == ()
+    assert results[0].mindbridge_abstained is True
+    # unanswerable_option_index is 0 and so is correct_option_index here, so the old substitution
+    # handed a retrieval failure both a correct answer and a reciprocal rank of 1.
+    metrics = evaluate_supermemory_vqa((unanswerable,), results)
+    assert metrics.qa_accuracy == 0.0
+    assert metrics.qa_mean_reciprocal_rank == 0.0
+    # Answerability is unaffected: None already reads as "not answerable".
+    assert metrics.answerability_recall == 0.0
 
 
 async def test_supermemory_rejects_missing_question_boundary_before_api_calls() -> None:

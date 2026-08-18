@@ -281,6 +281,21 @@ async def test_job_waiter_allows_failed_attempt_to_be_retried() -> None:
     assert job.state is JobState.SUCCEEDED
 
 
+async def test_job_waiter_gives_up_on_a_stuck_failure_and_reports_its_error_code() -> None:
+    """A failure that never advances its attempt used to burn the whole processing timeout."""
+    api = RecordingMemoryApi([JobState.FAILED])
+
+    with pytest.raises(RuntimeError, match="error code model_unavailable"):
+        await wait_for_observation_job(
+            cast(MindBridge, api),
+            "tenant",
+            "job_0",
+            poll_interval_seconds=0.001,
+            timeout_seconds=30.0,
+            failed_grace_seconds=0.01,
+        )
+
+
 async def test_job_waiter_times_out_when_status_request_never_returns() -> None:
     class HangingMemoryApi(RecordingMemoryApi):
         async def get_observation_job(
@@ -380,6 +395,9 @@ def _clip(index: int) -> M3PreparedClip:
     )
 
 
+_SUFFIX_BY_KIND = {MediaKind.VIDEO: "mp4", MediaKind.IMAGE: "png", MediaKind.AUDIO: "wav"}
+
+
 def _media(
     media_object_id: str,
     kind: MediaKind,
@@ -389,7 +407,9 @@ def _media(
     return MediaObjectInput(
         media_object_id=media_object_id,
         kind=kind,
-        uri=f"s3://benchmark/{media_object_id}.mp4",
+        # The extension has to follow the kind, or MediaObjectInput rejects the pair before the
+        # M3 clip rules under test ever run.
+        uri=f"s3://benchmark/{media_object_id}.{_SUFFIX_BY_KIND[kind]}",
         sha256="a" * 64,
         size_bytes=1_024,
         created_at=NOW,

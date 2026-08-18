@@ -2,7 +2,7 @@
 
 from typing import TYPE_CHECKING
 
-from mindbridge.edge.capture import enqueue_captured_video
+from mindbridge.edge.capture import enqueue_captured_media
 from mindbridge.edge.deletion_inbox import SQLiteDeletionInbox
 from mindbridge.edge.identity import (
     FaceVoiceAssociationEvidence,
@@ -36,7 +36,7 @@ __all__ = [
     "SQLiteIdentityMemory",
     "SQLiteObservationOutbox",
     "SQLiteRecentMemory",
-    "enqueue_captured_video",
+    "enqueue_captured_media",
 ]
 
 
