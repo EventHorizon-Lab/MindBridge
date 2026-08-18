@@ -237,7 +237,7 @@ class MemoryKernel:
         for outcome in settled:
             if isinstance(outcome, BaseException):
                 raise outcome
-        results = cast("tuple[MemoryResult, ...]", tuple(settled))
+        results = cast("tuple[RememberResult, ...]", tuple(settled))
         return results[0] if isinstance(request, RememberRequest) else results
 
     async def _write_remembered(
