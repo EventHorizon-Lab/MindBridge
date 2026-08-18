@@ -47,9 +47,9 @@ def row_id(case: AmlCase, question: AmlQuestion) -> str:
 
     `run_case` builds a row as `{"id": f"{case.user_id}#{question.question_id}",
     ...}` and then applies `row.update(question.payload)` -- so whenever a
-    loader's payload carries its own `"id"` (all six do),
-    that value wins over the driver's own format. This is the single place
-    that resolves which one applies, so a caller (the CLI's resume check,
+    loader's payload carries its own `"id"` (all six do), that value wins over
+    the driver's own format. This is the single place that resolves which one
+    applies, so a caller (the CLI's resume check,
     Blocking 2 in the 2026-08-17 final review) can predict a row's id without
     duplicating -- and risking drifting from -- `run_case`'s own logic.
     """
