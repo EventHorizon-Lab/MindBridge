@@ -216,7 +216,7 @@ caption），但结论仍然成立：**现有记忆管线相对直读丢失了�
 **MindBridge 目标**：agent 赛道超过 32.82 只是入场；真正要证明的是超过 63.59 的直读上限——即
 "结构化记忆 + 回原始证据"优于"把原图塞进上下文"。MindBridge 的证据优先设计（记忆保留可回源的
 `image_uri`/`video_uri`，而不是只存 caption）恰好绕开了论文指出的那个损失点。适配器和 CLI 已经
-支持 195 子集（`load_memlens_agent_subset`，`--agent-subset-path`），四档上下文都要跑。
+支持 195 子集（`load_memlens_agent_subset`，`--agent-subset-index`），四档上下文都要跑。
 
 ### 3.7 MM-Lifelong — 百小时级终身流理解
 
@@ -241,6 +241,16 @@ caption），但结论仍然成立：**现有记忆管线相对直读丢失了�
 
 > 工程缺口：`unofficial_reference_at_n()` 是 in-repo 诊断，分桶边界未对齐官方 scorer。对外公布的
 > 数字必须由官方 scorer 跑 `pred` 行产生。
+>
+> **覆盖率规则（必须在第一次跑之前遵守，校验器无法强制）。** prepared timeline 的
+> `require_ordered_non_overlapping_segments` 只检查排序与不重叠，`run_mm_lifelong` 只检查引用区间的
+> 结尾落在 timeline 之内——**都不检查覆盖率**。因此"只准备每道题 `temporal_certificate` 附近的片段"
+> 能拿到近乎完美的 Ref@300 并通过全部校验，这属于 §5 禁止的数据集专用旁路。
+>
+> 规则：prepared timeline **必须覆盖该 split 官方 `total_intervals` 的连续全长**，不得按题目位置
+> 裁剪、抽样或加密。唯一允许的缺口是官方发布本身缺失的区间，且必须在 run 说明里逐一列出。
+> 上报时必须同时给出 `segment_count` / `media_segment_count` / `caption_segment_count`，读者用它们
+> 除以官方区间总数即可验算覆盖率——这三个数字是这条规则唯一的外部可核验凭据。
 
 ### 3.8 SuperMemory-VQA — AI 眼镜长时记忆问答
 
@@ -326,7 +336,7 @@ sidecar 会重新计算 predictions 的 sha256，与 manifest 里的不一致就
 ### 4.2 仍是操作项，不需要改代码
 
 **MemLens 四档全跑。** 适配器与 CLI 已完整支持（`load_memlens_agent_subset`、
-`--agent-subset-path`），32K/64K/128K/256K 是四次独立调用、四份独立上报，没有可聚合的合并口径。
+`--agent-subset-index`），32K/64K/128K/256K 是四次独立调用、四份独立上报，没有可聚合的合并口径。
 
 **EgoMemReason 提交 leaderboard。** `egomem_cli` 输出的 `[{example_id, predicted_answer}]` 与官方
 要求的提交格式完全一致，直接上传即可；回收到的准确率用上面的 sidecar 记录。注意官方 2026-07-14 的

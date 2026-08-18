@@ -134,6 +134,7 @@ class SuperMemoryQuestionResult(ContractModel):
     predicted_option_index: int | None = Field(default=None, ge=0, lt=4)
     ranked_option_indices: tuple[int, ...] = Field(max_length=4)
     model_answer: str
+    mindbridge_abstained: bool = False
     mindbridge_confidence: float = Field(ge=0.0, le=1.0)
     mindbridge_memory_ids: tuple[Identifier, ...]
     mindbridge_evidence_ids: tuple[Identifier, ...]
@@ -361,16 +362,19 @@ async def _answer_question(
                 limit=recall_limit,
             )
         )
-    ranking = (
-        (question.unanswerable_option_index,)
-        if result.answer is None
-        else parse_option_ranking(result.answer, question.choices)
-    )
+    # API abstention ("no evidence supported an answer") is not the dataset's "cannot be answered"
+    # choice ("this question is unanswerable from the recording"). Substituting the latter for the
+    # former scored an abstention *correct* on every genuinely unanswerable question and handed it
+    # MRR 1.0, so a retrieval failure harvested the unanswerable class for free. An empty ranking
+    # is the honest shape, and answerability metrics already read None as not-answerable. A model
+    # that genuinely picks the unanswerable choice still parses into it below.
+    ranking = parse_option_ranking(result.answer, question.choices)
     return SuperMemoryQuestionResult(
         question_id=question.question_id,
         predicted_option_index=ranking[0] if ranking else None,
         ranked_option_indices=ranking,
         model_answer=result.answer or "",
+        mindbridge_abstained=result.answer is None,
         mindbridge_confidence=result.confidence,
         mindbridge_memory_ids=tuple(item.memory_id for item in result.memories),
         mindbridge_evidence_ids=tuple(item.evidence_id for item in result.evidence),

@@ -37,10 +37,16 @@ from mindbridge.contracts import (
     RecallFilters,
     RecallQuery,
     RecallRequest,
+    RecallResult,
     RememberRequest,
 )
 from mindbridge.core import MediaKind, MemoryType, SensorKind
-from mindbridge.sdk import MindBridge
+from mindbridge.sdk import MindBridge, MindBridgeError
+
+# Submissions need one row per example, so an abstention still needs a value. Deliberately outside
+# OPTION_LABELS: any real label would harvest a one-in-four guess on every abstained question.
+EGOMEM_REASON_ABSTENTION = "ABSTAIN"
+_RECOVERABLE_MODEL_ERRORS = frozenset({"model_output_invalid", "model_request_failed"})
 
 
 class EgoLifePreparedClip(ContractModel):
@@ -113,6 +119,7 @@ class EgoLifeQuestionResult(ContractModel):
     mindbridge_memory_ids: tuple[Identifier, ...]
     mindbridge_evidence_ids: tuple[Identifier, ...]
     mindbridge_trace_id: Identifier
+    mindbridge_error_code: NonEmptyString | None = None
 
 
 class EgoLifeCategoryMetrics(ContractModel):
@@ -145,10 +152,12 @@ class EgoMemReasonResult(ContractModel):
     question_id: Identifier
     predicted_answer: NonEmptyString
     model_answer: str
+    mindbridge_abstained: bool = False
     mindbridge_confidence: float = Field(ge=0.0, le=1.0)
     mindbridge_memory_ids: tuple[Identifier, ...]
     mindbridge_evidence_ids: tuple[Identifier, ...]
     mindbridge_trace_id: Identifier
+    mindbridge_error_code: NonEmptyString | None = None
 
 
 def load_prepared_egolife(path: Path) -> EgoLifePreparedStream:
@@ -395,6 +404,30 @@ async def _ingest_clip(
                 )
 
 
+async def _recall_or_empty(
+    memory: MindBridge,
+    request: RecallRequest,
+    semaphore: asyncio.Semaphore,
+    *,
+    trace_fallback: str,
+) -> tuple[RecallResult, str | None]:
+    """Recall, or turn a recoverable model failure into an empty result and its code."""
+    try:
+        async with semaphore:
+            return await memory.recall(request), None
+    except MindBridgeError as error:
+        if error.code not in _RECOVERABLE_MODEL_ERRORS:
+            raise
+        empty = RecallResult(
+            answer=None,
+            confidence=0.0,
+            memories=(),
+            evidence=(),
+            trace_id=error.trace_id or trace_fallback,
+        )
+        return empty, error.code
+
+
 async def _answer_question(
     memory: MindBridge,
     tenant_id: str,
@@ -404,25 +437,26 @@ async def _answer_question(
     recall_limit: int,
     semaphore: asyncio.Semaphore,
 ) -> EgoLifeQuestionResult:
-    async with semaphore:
-        result = await memory.recall(
-            RecallRequest(
-                tenant_id=tenant_id,
-                query=RecallQuery(
-                    text=multiple_choice_query(question.question, question.choices, rank_all=False)
-                ),
-                filters=RecallFilters(occurred_before=cutoff),
-                limit=recall_limit,
-            )
-        )
+    result, error_code = await _recall_or_empty(
+        memory,
+        RecallRequest(
+            tenant_id=tenant_id,
+            query=RecallQuery(
+                text=multiple_choice_query(question.question, question.choices, rank_all=False)
+            ),
+            filters=RecallFilters(occurred_before=cutoff),
+            limit=recall_limit,
+        ),
+        semaphore,
+        trace_fallback=f"trace_model_error_{question.question_id}",
+    )
     ranking = parse_option_ranking(result.answer, question.choices)
-    model_option = cast(EgoLifeOption, OPTION_LABELS[ranking[0]]) if ranking else None
     return EgoLifeQuestionResult(
         id=question.question_id,
         subject_id=subject_id,
         question=question.question,
         answer=question.correct_option,
-        model_option=model_option,
+        model_option=cast(EgoLifeOption, OPTION_LABELS[ranking[0]]) if ranking else None,
         model_answer=result.answer or "",
         question_type=question.question_type,
         query_day=question.query_day,
@@ -431,6 +465,7 @@ async def _answer_question(
         mindbridge_memory_ids=tuple(item.memory_id for item in result.memories),
         mindbridge_evidence_ids=tuple(item.evidence_id for item in result.evidence),
         mindbridge_trace_id=result.trace_id,
+        mindbridge_error_code=error_code,
     )
 
 
@@ -442,29 +477,32 @@ async def _answer_egomem_question(
     recall_limit: int,
     semaphore: asyncio.Semaphore,
 ) -> EgoMemReasonResult:
-    async with semaphore:
-        result = await memory.recall(
-            RecallRequest(
-                tenant_id=tenant_id,
-                query=RecallQuery(text=_egomem_question_query(question)),
-                filters=RecallFilters(occurred_before=cutoff),
-                limit=recall_limit,
-            )
-        )
+    result, error_code = await _recall_or_empty(
+        memory,
+        RecallRequest(
+            tenant_id=tenant_id,
+            query=RecallQuery(text=_egomem_question_query(question)),
+            filters=RecallFilters(occurred_before=cutoff),
+            limit=recall_limit,
+        ),
+        semaphore,
+        trace_fallback=f"trace_model_error_{question.question_id}",
+    )
+    # An abstaining answerer returns answer=None, which parses to no ranking. Recording that as an
+    # explicit non-answer keeps the rest of the run alive; raising here discarded every result,
+    # because egomem_cli writes its artifacts only after the whole run returns.
     ranking = parse_option_ranking(result.answer, question.choices)
-    if not ranking:
-        raise ValueError(
-            f"EgoMemReason question {question.example_id} did not produce a valid option label"
-        )
     return EgoMemReasonResult(
         example_id=question.example_id,
         question_id=question.question_id,
-        predicted_answer=OPTION_LABELS[ranking[0]],
+        predicted_answer=OPTION_LABELS[ranking[0]] if ranking else EGOMEM_REASON_ABSTENTION,
         model_answer=result.answer or "",
+        mindbridge_abstained=not ranking,
         mindbridge_confidence=result.confidence,
         mindbridge_memory_ids=tuple(item.memory_id for item in result.memories),
         mindbridge_evidence_ids=tuple(item.evidence_id for item in result.evidence),
         mindbridge_trace_id=result.trace_id,
+        mindbridge_error_code=error_code,
     )
 
 

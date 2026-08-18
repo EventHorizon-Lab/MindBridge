@@ -138,24 +138,37 @@ async def run_memlens_question(
 
     tenant_id = benchmark_tenant_id(tenant_prefix, question.question_id, run_id)
     semaphore = asyncio.Semaphore(request_concurrency)
-    sequence = 0
-    for session in question.sessions:
-        for index, turn in enumerate(session.turns):
-            await _ingest_turn(
-                memory,
-                tenant_id,
-                device_id,
-                question.question_id,
-                session,
-                turn,
-                sequence + index,
-                image_by_source,
-                text_only,
-                poll_interval_seconds,
-                processing_timeout_seconds,
-                semaphore,
+    # Sessions run concurrently; turns inside one session must not. Every turn of a session shares
+    # that session's occurred_at, so nothing but insertion order records which turn came first —
+    # reordering them rewrites the dialogue. Distinct sessions carry distinct occurred_at, so their
+    # relative order survives batching, and a question's sessions outnumber its turns per session,
+    # which is where the wall clock actually goes. Awaiting each turn at the top level also made
+    # request_concurrency inert, because the semaphore was acquired inside a serial await.
+    session_starts = tuple(
+        sum(len(previous.turns) for previous in question.sessions[:index])
+        for index in range(len(question.sessions))
+    )
+    for offset in range(0, len(question.sessions), request_concurrency):
+        await asyncio.gather(
+            *(
+                _ingest_session_turns(
+                    memory,
+                    tenant_id,
+                    device_id,
+                    question.question_id,
+                    session,
+                    session_starts[offset + index],
+                    image_by_source,
+                    text_only,
+                    poll_interval_seconds,
+                    processing_timeout_seconds,
+                    semaphore,
+                )
+                for index, session in enumerate(
+                    question.sessions[offset : offset + request_concurrency]
+                )
             )
-        sequence += len(session.turns)
+        )
 
     async with semaphore:
         recalled = await memory.recall(
@@ -179,6 +192,37 @@ async def run_memlens_question(
         mindbridge_evidence_ids=tuple(item.evidence_id for item in recalled.evidence),
         mindbridge_trace_id=recalled.trace_id,
     )
+
+
+async def _ingest_session_turns(
+    memory: MindBridge,
+    tenant_id: str,
+    device_id: str,
+    question_id: str,
+    session: MemLensSession,
+    first_sequence: int,
+    image_by_source: dict[str, MediaObjectInput],
+    text_only: bool,
+    poll_interval_seconds: float,
+    processing_timeout_seconds: float,
+    semaphore: asyncio.Semaphore,
+) -> None:
+    """Ingest one session's turns strictly in order, since they share one occurred_at."""
+    for index, turn in enumerate(session.turns):
+        await _ingest_turn(
+            memory,
+            tenant_id,
+            device_id,
+            question_id,
+            session,
+            turn,
+            first_sequence + index,
+            image_by_source,
+            text_only,
+            poll_interval_seconds,
+            processing_timeout_seconds,
+            semaphore,
+        )
 
 
 async def _ingest_turn(
