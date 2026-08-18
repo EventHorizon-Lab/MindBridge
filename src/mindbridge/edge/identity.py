@@ -195,12 +195,21 @@ class SQLiteIdentityMemory:
                 return self._match(existing, confidence=1.0, enrolled_new=False)
 
             # ponytail: device-local identities use a linear scan; add FAISS after measured need.
-            ranked_matches = self._rank_matches(connection, sample)
+            ranked_matches, templates = self._rank_matches(connection, sample)
             best_match = ranked_matches[0] if ranked_matches else None
             ambiguous = (
                 len(ranked_matches) > 1
                 and best_match is not None
                 and best_match[1] - ranked_matches[1][1] < minimum_margin
+                # A runner-up that would itself be accepted into the winner is the same face
+                # from another angle, not a rival. Enrolling a third identity there resolves
+                # nothing and leaves one more near-duplicate for the next sample to tie
+                # against, so the margin only guards against a genuinely distinct rival.
+                and _identities_are_distinct(
+                    templates[best_match[0]],
+                    templates[ranked_matches[1][0]],
+                    minimum_similarity,
+                )
             )
             if best_match is None or best_match[1] < minimum_similarity or ambiguous:
                 enrolled_new = True
@@ -476,8 +485,10 @@ class SQLiteIdentityMemory:
         self,
         connection: sqlite3.Connection,
         sample: LocalIdentitySample,
-    ) -> tuple[tuple[str, float], ...]:
+    ) -> tuple[tuple[tuple[str, float], ...], dict[str, tuple[tuple[float, ...], ...]]]:
+        """Score every identity and keep the templates the scan already decrypted."""
         scores_by_identity: dict[str, list[float]] = {}
+        templates_by_identity: dict[str, list[tuple[float, ...]]] = {}
         for row in connection.execute(
             """
             SELECT * FROM edge_identity_templates
@@ -487,13 +498,20 @@ class SQLiteIdentityMemory:
             """,
             (*self._sample_scope(sample), len(sample.embedding)),
         ):
-            similarity = _cosine_similarity(sample.embedding, self._decrypt(row).embedding)
-            scores_by_identity.setdefault(str(row["identity_id"]), []).append(similarity)
+            identity_id = str(row["identity_id"])
+            embedding = self._decrypt(row).embedding
+            scores_by_identity.setdefault(identity_id, []).append(
+                _cosine_similarity(sample.embedding, embedding)
+            )
+            templates_by_identity.setdefault(identity_id, []).append(embedding)
         ranked = []
         for identity_id, scores in scores_by_identity.items():
             strongest = sorted(scores, reverse=True)[:_IDENTITY_PROTOTYPE_SAMPLES]
             ranked.append((identity_id, math.fsum(strongest) / len(strongest)))
-        return tuple(sorted(ranked, key=lambda item: (-item[1], item[0])))
+        return (
+            tuple(sorted(ranked, key=lambda item: (-item[1], item[0]))),
+            {identity: tuple(values) for identity, values in templates_by_identity.items()},
+        )
 
     def _find_sample(
         self,
@@ -671,6 +689,25 @@ def _association_evidence_matches_row(
         row["association_model_id"],
         row["association_model_revision"],
     )
+
+
+def _identities_are_distinct(
+    left: tuple[tuple[float, ...], ...],
+    right: tuple[tuple[float, ...], ...],
+    minimum_similarity: float,
+) -> bool:
+    """Report whether the closest templates of two identities still fail to match.
+
+    Aggregated like `_rank_matches` scores a sample, so one outlier template pair cannot
+    declare two people the same identity and switch the ambiguity guard off.
+    """
+    similarities = sorted(
+        (_cosine_similarity(one, other) for one in left for other in right),
+        reverse=True,
+    )[:_IDENTITY_PROTOTYPE_SAMPLES]
+    if not similarities:
+        return True
+    return math.fsum(similarities) / len(similarities) < minimum_similarity
 
 
 def _is_clear_winner(

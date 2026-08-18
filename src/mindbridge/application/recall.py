@@ -476,7 +476,11 @@ class RecallMemories:
             values=query_embedding.values,
             space_reference=query_embedding.space_reference,
             document_task=EmbedTask.DOCUMENT.value,
-            object_types=(EmbeddedObjectType.EVENT, EmbeddedObjectType.CLAIM),
+            object_types=(
+                EmbeddedObjectType.EVENT,
+                EmbeddedObjectType.CLAIM,
+                EmbeddedObjectType.ENTITY,
+            ),
             limit=limit,
             minimum_similarity=self._minimum_embedding_similarity,
         )

@@ -367,6 +367,21 @@ WITH ranked_objects AS (
 related_objects AS (
     SELECT hit.object_type, hit.object_id, hit.rank, 0 AS hop
     FROM ranked_objects AS hit
+    WHERE hit.object_type <> 'entity'
+    UNION ALL
+    SELECT mention.object_type, mention.object_id, hit.rank, 0 AS hop
+    FROM ranked_objects AS hit
+    JOIN LATERAL (
+        SELECT relation.source_type AS object_type, relation.source_id AS object_id
+        FROM relations AS relation
+        WHERE relation.tenant_id = %(tenant_id)s
+          AND relation.target_type = 'entity'
+          AND relation.target_id = hit.object_id
+          AND relation.source_type IN ('event', 'claim')
+          AND relation.relation_type IN ('mentions', 'about')
+        ORDER BY relation.created_at DESC, relation.source_type, relation.source_id
+        LIMIT %(limit)s
+    ) AS mention ON hit.object_type = 'entity'
     UNION ALL
     SELECT relation.target_type, relation.target_id, hit.rank, 1 AS hop
     FROM ranked_objects AS hit
@@ -574,16 +589,23 @@ class MemoryOperations(PostgresStoreOperations):
         *,
         limit: int,
     ) -> tuple[MemoryRecord, ...]:
-        """Follow ranked Event/Claim representation edges to filtered memories."""
+        """Follow ranked Event/Claim/Entity representation edges to filtered memories."""
         if not ranked_objects:
             return ()
         if limit <= 0:
             raise DomainInvariantError("semantic graph candidate limit must be positive")
         if any(
-            match.object_type not in {EmbeddedObjectType.EVENT, EmbeddedObjectType.CLAIM}
+            match.object_type
+            not in {
+                EmbeddedObjectType.EVENT,
+                EmbeddedObjectType.CLAIM,
+                EmbeddedObjectType.ENTITY,
+            }
             for match in ranked_objects
         ):
-            raise DomainInvariantError("semantic graph candidates must be events or claims")
+            raise DomainInvariantError(
+                "semantic graph candidates must be events, claims, or entities"
+            )
         parameters = _recall_parameters(request)
         parameters.update(
             object_types=[match.object_type.value for match in ranked_objects],

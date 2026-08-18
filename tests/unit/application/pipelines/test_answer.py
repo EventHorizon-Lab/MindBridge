@@ -94,7 +94,7 @@ async def test_answer_pipeline_streams_raw_av_and_validates_answer(
     answerer = _answerer(respond)
     assert answerer.model_reference.model_id == "qwen3.8-max"
     assert answerer.model_reference.revision == "deployment-revision"
-    assert answerer.prompt_version == "answer_from_evidence_v10"
+    assert answerer.prompt_version == "answer_from_evidence_v11"
     assert answerer.occurrence_prompt_version == "select_occurrences_v2"
     evidence = (
         _resolved_evidence(MediaKind.IMAGE, "image.jpg", "media_image", 0),

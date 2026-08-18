@@ -177,6 +177,62 @@ async def test_open_refuses_a_dimension_the_index_cannot_store(database_url: str
         await mismatched.open()
 
 
+async def test_pgvector_keeps_one_vector_for_a_re_encoded_entity_name(
+    store: PostgresMemoryStore,
+) -> None:
+    """An entity name is re-encoded in later batches, so encoder noise must not fail the write."""
+    model = ModelReference(
+        model_id="jinaai/jina-embeddings-v5-omni-small-retrieval",
+        revision="abcdef0",
+    )
+    space = EmbeddingSpaceReference(space_id="jina-v5", revision="space-v1")
+    stored = _embedding_record(
+        embedding_id="embedding_entity_01",
+        object_id="entity_red_tool",
+        values=(1.0,) + (0.0,) * 1_023,
+        model=model,
+        space=space,
+        object_type=EmbeddedObjectType.ENTITY,
+    )
+    # 0.999 930 against the stored vector: the measured drift from batching one short name
+    # beside long event descriptions, and well outside the identical-replay tolerance.
+    re_encoded = _embedding_record(
+        embedding_id="embedding_entity_01",
+        object_id="entity_red_tool",
+        values=(0.999_93, 0.011_832) + (0.0,) * 1_022,
+        model=model,
+        space=space,
+        object_type=EmbeddedObjectType.ENTITY,
+    )
+
+    assert await store.write_embedding(stored) is True
+    assert await store.write_embedding(re_encoded) is False
+    # The same drift on any other object type is still a conflict: only an entity's text is
+    # recoverable from its object ID, so only an entity may be re-encoded from a new batch.
+    assert (
+        await store.write_embedding(
+            _embedding_record(
+                embedding_id="embedding_memory_01",
+                object_id="memory_red_tool",
+                values=stored.values,
+                model=model,
+                space=space,
+            )
+        )
+        is True
+    )
+    with pytest.raises(DomainInvariantError, match="different vector content"):
+        await store.write_embedding(
+            _embedding_record(
+                embedding_id="embedding_memory_01",
+                object_id="memory_red_tool",
+                values=re_encoded.values,
+                model=model,
+                space=space,
+            )
+        )
+
+
 def _embedding_record(
     *,
     embedding_id: str,

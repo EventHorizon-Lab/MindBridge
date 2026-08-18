@@ -327,14 +327,19 @@ async def test_processor_builds_event_memory_and_raw_media_embedding_once(
         for embedding in store.output.embeddings
         if embedding.object_type is EmbeddedObjectType.EVIDENCE_SPAN
     ) == (event_evidence.evidence_id,)
+    # Named entities are their own retrieval entry point; the anonymous identity entity has
+    # no name to embed and stays reachable only through the events that mention it.
     assert text_embedder.documents == (
         "A person places a red tool beside a blue toolbox.",
         "The red tool is beside the blue toolbox.",
+        "red tool",
+        "blue toolbox",
     )
     assert {embedding.object_type for embedding in store.output.embeddings} == {
         EmbeddedObjectType.EVIDENCE_SPAN,
         EmbeddedObjectType.EVENT,
         EmbeddedObjectType.CLAIM,
+        EmbeddedObjectType.ENTITY,
     }
     assert len(store.output.entities) == 3
     assert len(store.output.entity_mentions) == 3
@@ -352,6 +357,102 @@ async def test_processor_builds_event_memory_and_raw_media_embedding_once(
     )
     assert identity_mention.event_id == store.output.events[0].event_id
     assert identity_mention.evidence_id == event_evidence.evidence_id
+
+
+class RepeatedEntityPerceiver(RecordingPerceiver):
+    """Names the same object in two events, the way a real clip repeats a subject."""
+
+    async def perceive_events(
+        self,
+        observation: Observation,
+        evidence: tuple[ResolvedEvidence, ...],
+    ) -> EventPerception:
+        perception = await super().perceive_events(observation, evidence)
+        first = perception.events[0]
+        second = replace(
+            first,
+            start_ms=3_000,
+            end_ms=3_800,
+            description="The person picks the red tool back up.",
+            entities=(first.entities[0],),
+            claims=(),
+        )
+        return replace(perception, events=(first, second))
+
+
+class RecasedEntityPerceiver(RecordingPerceiver):
+    """Names one object twice with different capitalisation, as a real model does."""
+
+    async def perceive_events(
+        self,
+        observation: Observation,
+        evidence: tuple[ResolvedEvidence, ...],
+    ) -> EventPerception:
+        perception = await super().perceive_events(observation, evidence)
+        first = perception.events[0]
+        capitalised = replace(
+            first,
+            start_ms=3_000,
+            end_ms=3_800,
+            description="The person picks the Red Tool back up.",
+            entities=(replace(first.entities[0], canonical_name="Red Tool"),),
+            claims=(),
+        )
+        lowercase = first
+        return replace(perception, events=(lowercase, capitalised))
+
+
+async def test_a_case_variant_name_stores_the_value_its_entity_id_was_derived_from() -> None:
+    """The ID casefolds the name, so a row whose casing depends on which clip arrived first
+    would collide with itself across observations and fail the store's identity check."""
+    store = RecordingProcessingStore()
+    await _processor(
+        store,
+        RecasedEntityPerceiver(),
+        RecordingEmbedder(),
+        RecordingTextEmbedder(),
+    ).run(TENANT_ID, OBSERVATION_ID, JOB_ID)
+
+    assert store.output is not None
+    red_tool = [
+        entity
+        for entity in store.output.entities
+        if entity.canonical_name is not None and entity.canonical_name.casefold() == "red tool"
+    ]
+    assert len(red_tool) == 1
+    assert red_tool[0].canonical_name == "red tool"
+
+
+async def test_a_named_entity_is_one_graph_node_across_the_events_that_mention_it() -> None:
+    """Retrieval enters at the entity, so one name must not become one node per event."""
+    store = RecordingProcessingStore()
+    text_embedder = RecordingTextEmbedder()
+    await _processor(
+        store,
+        RepeatedEntityPerceiver(),
+        RecordingEmbedder(),
+        text_embedder,
+    ).run(TENANT_ID, OBSERVATION_ID, JOB_ID)
+
+    assert store.output is not None
+    red_tool = [entity for entity in store.output.entities if entity.canonical_name == "red tool"]
+    assert len(red_tool) == 1
+    mentioning_events = {
+        relation.source_id
+        for relation in store.output.relations
+        if relation.relation_type is RelationType.MENTIONS
+        and relation.target_id == red_tool[0].entity_id
+    }
+    assert mentioning_events == {event.event_id for event in store.output.events}
+    assert text_embedder.documents.count("red tool") == 1
+    assert (
+        tuple(
+            embedding.object_id
+            for embedding in store.output.embeddings
+            if embedding.object_type is EmbeddedObjectType.ENTITY
+        ).count(red_tool[0].entity_id)
+        == 1
+    )
 
 
 async def test_processing_output_rejects_a_graph_without_event_memory_link() -> None:
