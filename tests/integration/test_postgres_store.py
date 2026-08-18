@@ -223,6 +223,7 @@ async def test_migration_installs_complete_phase_zero_schema(database_url: str) 
         16,
         17,
         18,
+        19,
     ]
 
 
@@ -745,6 +746,16 @@ async def test_postgres_lexical_recall_matches_questions_and_identity_tokens(
     )
     identity = await store.search_memories(_request("What did <voice_0> say?"), limit=5)
     unrelated = await store.search_memories(_request("What colour is the moon rock?"), limit=5)
+    # Mapping `tag` into the configuration is what lets a lexeme carry a backslash, and the
+    # tsquery the query side builds has to quote it as tsquery does rather than as SQL does.
+    # Escaping this wrong raises a syntax error the caller sees as a bare 500.
+    backslash = await store.search_memories(_request('see <img src="a\\b.png"/> please'), limit=5)
+    # The substring arm takes caller text, not a pattern. Read as LIKE, either of these is a
+    # wildcard matching every summary the tenant owns; read literally, `%` appears in neither
+    # summary and `_` appears only inside <voice_0>. Asserting the underscore case this way
+    # separates "escaped correctly" from "stopped matching at all".
+    percent = await store.search_memories(_request("%"), limit=5)
+    underscore = await store.search_memories(_request("_"), limit=5)
 
     # A question is not a conjunction of every one of its words, and <voice_0> is a term the
     # parser would otherwise discard as an HTML tag on both the document and the query side.
@@ -754,3 +765,6 @@ async def test_postgres_lexical_recall_matches_questions_and_identity_tokens(
     assert [memory.summary for memory in question] == [summaries["target"]]
     assert [memory.summary for memory in identity] == [summaries["target"]]
     assert [memory.summary for memory in unrelated] == []
+    assert [memory.summary for memory in backslash] == []
+    assert [memory.summary for memory in percent] == []
+    assert [memory.summary for memory in underscore] == [summaries["target"]]

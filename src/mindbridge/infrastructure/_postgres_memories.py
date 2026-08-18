@@ -217,9 +217,19 @@ _STRUCTURED_RECALL_FILTER_SQL = f"""
 # summary can satisfy. Lexing the query with the same configuration as the document keeps
 # bracketed identity tokens such as <voice_0> intact on both sides; ts_rank_cd then orders
 # the partial matches, and dense retrieval still supplies the other half of the fusion.
+# The lexemes are quoted by hand rather than with quote_literal, which is an SQL-string
+# escaper and not a tsquery one: it answers a lexeme containing a backslash with the E'...'
+# form, and tsquery has no such syntax, so `<img src="a\b.png">` raised a bare syntax error
+# on caller-supplied text. tsquery quotes both a backslash and a quote by doubling it, and
+# doubling the backslash is not optional either -- escaping only the quote parses but drops
+# the backslash from the lexeme, so the query silently stops matching the document that
+# produced it.
 _QUERY_TSQUERY_SQL = """
     SELECT (
-        SELECT string_agg(quote_literal(lexeme), ' | ')
+        SELECT string_agg(
+            '''' || replace(replace(lexeme, '\\', '\\\\'), '''', '''''') || '''',
+            ' | '
+        )
         FROM unnest(to_tsvector('mindbridge_text', %(query)s)) AS term(lexeme)
     )::tsquery AS lexical_query
     WHERE %(query)s::text IS NOT NULL
@@ -233,7 +243,10 @@ WHERE memory.tenant_id = %(tenant_id)s
   AND (
       %(query)s::text IS NULL
       OR to_tsvector('mindbridge_text', memory.summary) @@ lexical.lexical_query
-      OR memory.summary ILIKE '%%' || %(query)s || '%%'
+      -- Substring containment, not a LIKE pattern. The query is caller text, and ILIKE read
+      -- its wildcard characters as wildcards, so a one-character query of either returned
+      -- the whole tenant ranked only by strength. strpos has no pattern language to escape.
+      OR strpos(lower(memory.summary), lower(%(query)s)) > 0
   )
 {_STRUCTURED_RECALL_FILTER_SQL}
 ORDER BY

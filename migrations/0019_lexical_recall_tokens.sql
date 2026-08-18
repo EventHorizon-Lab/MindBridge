@@ -32,6 +32,6 @@ DROP INDEX memory_records_summary_fts_idx;
 CREATE INDEX memory_records_summary_fts_idx
     ON memory_records USING gin (to_tsvector('mindbridge_text', summary));
 
-INSERT INTO schema_migrations (version) VALUES (18);
+INSERT INTO schema_migrations (version) VALUES (19);
 
 COMMIT;
