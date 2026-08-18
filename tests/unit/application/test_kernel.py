@@ -4,11 +4,12 @@ import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
+from typing import cast
 
 import pytest
 
 from mindbridge.application import recall as recall_module
-from mindbridge.application.kernel import MemoryKernel
+from mindbridge.application.kernel import _MAX_CONCURRENT_MEMORY_WRITES, MemoryKernel
 from mindbridge.application.observation_processing import ObservationBatch
 from mindbridge.application.perception import ResolvedEvidence
 from mindbridge.application.ports import (
@@ -26,6 +27,7 @@ from mindbridge.contracts import (
     FeedbackRequest,
     IdentityObservationInput,
     MediaObjectInput,
+    MemoryResult,
     ObservationStatus,
     ObserveRequest,
     RecallMode,
@@ -431,7 +433,12 @@ class InMemoryStore:
     ) -> tuple[DeletionTombstone, ...]:
         raise AssertionError("forget is covered by the PostgreSQL integration store")
 
-    async def write_embedding(self, embedding: EmbeddingRecord) -> bool:
+    async def write_embedding(
+        self,
+        embedding: EmbeddingRecord,
+        *,
+        allow_reencoding: bool = False,
+    ) -> bool:
         existing = self.embeddings.get(embedding.embedding_id)
         if existing is not None:
             if existing != embedding:
@@ -582,6 +589,7 @@ class RecordingEmbedder:
     def __init__(self, *, memory_document_failures: int = 0) -> None:
         self.queries: list[_RecordedQuery] = []
         self.memory_documents: list[str] = []
+        self.document_batch_sizes: list[int] = []
         self.memory_document_failures = memory_document_failures
 
     async def embed(self, request: EmbedRequest) -> EmbedResult:
@@ -601,6 +609,7 @@ class RecordingEmbedder:
                     )
                 )
         else:
+            self.document_batch_sizes.append(len(request.inputs))
             self.memory_documents.extend(
                 part.text
                 for input_value in request.inputs
@@ -896,6 +905,125 @@ async def test_remember_indexes_one_pinned_memory_document() -> None:
     assert embedding.dimension == 1_024
     assert embedding.normalized is True
     assert embedding.created_at == memory.created_at
+
+
+async def test_remember_encodes_a_whole_batch_in_one_embedder_call() -> None:
+    """The encoder round trip is the expensive part of remembering, so a batch of N
+    must cost one call carrying N inputs -- not N calls carrying one input each.
+    """
+    store = InMemoryStore()
+    embedder = RecordingEmbedder()
+    summaries = tuple(f"fact {index}" for index in range(12))
+
+    results = await _kernel(store, RecordingAnswerer(), embedder=embedder).remember(
+        tuple(
+            _remember_request(idempotency_key=f"batch-{index}").model_copy(
+                update={"summary": summary}
+            )
+            for index, summary in enumerate(summaries)
+        )
+    )
+
+    assert embedder.document_batch_sizes == [len(summaries)]
+    assert embedder.memory_documents == list(summaries)
+    # Order is the contract: result[i] must be the memory for requests[i].
+    assert tuple(result.summary for result in results) == summaries
+    assert len(store.embeddings) == len(summaries)
+
+
+async def test_remember_returns_one_result_for_one_request_and_a_batch_for_a_batch() -> None:
+    """One request in, one result out; a batch in, results in request order out.
+    The batch still costs exactly one encoder call, which is the point of taking one.
+    """
+    embedder = RecordingEmbedder()
+    kernel = _kernel(InMemoryStore(), RecordingAnswerer(), embedder=embedder)
+
+    single = await kernel.remember(
+        _remember_request(idempotency_key="shape-single").model_copy(update={"summary": "only one"})
+    )
+    batch = await kernel.remember(
+        tuple(
+            _remember_request(idempotency_key=f"shape-{index}").model_copy(
+                update={"summary": f"fact {index}"}
+            )
+            for index in range(3)
+        )
+    )
+
+    assert isinstance(single, MemoryResult)
+    assert single.summary == "only one"
+    assert isinstance(batch, tuple)
+    assert [item.summary for item in batch] == ["fact 0", "fact 1", "fact 2"]
+    # One call for the single, one for the batch of three -- not one per memory.
+    assert embedder.document_batch_sizes == [1, 3]
+
+
+async def test_remember_reads_a_list_as_a_batch_not_as_one_request() -> None:
+    """Dispatch discriminates on the single request, so a caller passing a list
+    gets a batch rather than an attribute error deep in the write path.
+    """
+    kernel = _kernel(InMemoryStore(), RecordingAnswerer(), embedder=RecordingEmbedder())
+    requests = [
+        _remember_request(idempotency_key=f"list-{index}").model_copy(
+            update={"summary": f"fact {index}"}
+        )
+        for index in range(2)
+    ]
+
+    results = await kernel.remember(cast(tuple[RememberRequest, ...], requests))
+
+    assert [item.summary for item in results] == ["fact 0", "fact 1"]
+
+
+async def test_remember_bounds_its_write_fan_out() -> None:
+    """A single extraction can yield dozens of memories, and each write is up to
+    three pooled connections. Without a cap the batch queues behind itself inside
+    the pool; this is the bound the AML route used to own before the fan-out moved
+    here with it.
+    """
+    store = _ConcurrencyTrackingStore()
+    kernel = _kernel(store, RecordingAnswerer(), embedder=RecordingEmbedder())
+
+    # A fixed batch size, well above the bound: deriving it from the constant under
+    # test would move both sides of the assertion together and never fail.
+    await kernel.remember(
+        tuple(
+            _remember_request(idempotency_key=f"bounded-{index}").model_copy(
+                update={"summary": f"fact {index}"}
+            )
+            for index in range(32)
+        )
+    )
+
+    assert store.max_concurrent_writes == _MAX_CONCURRENT_MEMORY_WRITES
+
+
+class _ConcurrencyTrackingStore(InMemoryStore):
+    """Records the highest number of overlapping `write_memory` calls."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._in_flight = 0
+        self.max_concurrent_writes = 0
+
+    async def write_memory(
+        self,
+        memory: MemoryRecord,
+        *,
+        idempotency_key: str,
+        content_digest: str,
+    ) -> MemoryWriteResult:
+        self._in_flight += 1
+        self.max_concurrent_writes = max(self.max_concurrent_writes, self._in_flight)
+        await asyncio.sleep(0)  # yield so overlapping writes can pile up
+        try:
+            return await super().write_memory(
+                memory,
+                idempotency_key=idempotency_key,
+                content_digest=content_digest,
+            )
+        finally:
+            self._in_flight -= 1
 
 
 async def test_remember_retry_repairs_embedding_after_model_failure() -> None:

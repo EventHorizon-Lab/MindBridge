@@ -246,6 +246,13 @@ uv run mindbridge-bench aml \
   --concurrency 4
 ```
 
+`--concurrency` bounds requests in flight across every case, not cases replayed at once: a case
+adds its chunks and searches its questions concurrently, with the add phase completing before any
+of that case's searches run. Each in-flight `/aml/add` can hold up to eight pooled connections while
+it writes, so the server needs roughly `8 x --concurrency` connections -- the default 4 matches the
+default `MINDBRIDGE_DATABASE_MAX_POOL_SIZE` of 32. Raise both together, and raise PostgreSQL's
+`max_connections` to match, or writes queue inside the pool until they time out.
+
 `--tenant-prefix` has no default and must match the deployment's `MINDBRIDGE_AML_TENANT_PREFIX`. The
 manifest's tenant map is derived client-side from the value you pass, so a mismatch produces a
 manifest recording tenants the server never used. Reruns against an existing `--output` resume, and
@@ -271,6 +278,38 @@ uv run python benchmarks/aml/pipelines/locomo-refined/pipeline.py evaluate \
   --answers .benchmarks/results/aml-locomo-answers.jsonl \
   --output .benchmarks/results/aml-locomo-scores.jsonl
 ```
+
+### Shard the scoring stages
+
+Both vendored stages are a strictly serial `for` loop over one LLM call each -- roughly 5,000
+questions through `answer` and again through `evaluate` -- so a full sweep spends hours holding one
+request open at a time while the serving GPU idles. The pinned files can never be edited, but they
+do not have to be: both stages take `--input`/`--output`, so shard the input and run one process per
+shard. Nothing inside the pinned files changes, and the concatenated output is byte-identical to a
+serial run's.
+
+```bash
+cd .benchmarks/results && split -n l/16 -d --additional-suffix=.jsonl aml-locomo.jsonl shard-
+```
+
+```bash
+ls .benchmarks/results/shard-*.jsonl | xargs -P 16 -I {} sh -c 'uv run python benchmarks/aml/pipelines/locomo-refined/pipeline.py answer --input {} --output {}.answers'
+```
+
+Then evaluate each shard against its own answers and concatenate. `evaluate` requires its `--input`
+and `--answers` to hold exactly the same ids, which is why the shards must be paired rather than
+scored against the whole answer file:
+
+```bash
+ls .benchmarks/results/shard-*.jsonl | xargs -P 16 -I {} sh -c 'uv run python benchmarks/aml/pipelines/locomo-refined/pipeline.py evaluate --input {} --answers {}.answers --output {}.scores'
+```
+
+```bash
+cat .benchmarks/results/shard-*.jsonl.scores > .benchmarks/results/aml-locomo-scores.jsonl
+```
+
+Pick the shard count from what the answer endpoint will actually serve concurrently, not from core
+count. `answer` resumes from its own output, so a killed shard restarts where it stopped.
 
 ### Disable thinking mode on the answer endpoint
 
@@ -912,6 +951,7 @@ not copied into MindBridge configuration:
 
 ```bash
 export MINDBRIDGE_DATABASE_URL=postgresql://mindbridge:password@localhost:5432/mindbridge
+export MINDBRIDGE_DATABASE_MAX_POOL_SIZE=32
 export MINDBRIDGE_OBJECT_STORAGE_BUCKET=mindbridge-media
 export MINDBRIDGE_OBJECT_STORAGE_ENDPOINT_URL=https://objects.example.com
 export MINDBRIDGE_TASK_BROKER_URL=redis://localhost:6379/0
@@ -957,6 +997,13 @@ export MINDBRIDGE_GENERATOR_CONFIG_JSON='{
   "reasoning_effort": "low"
 }'
 ```
+
+`MINDBRIDGE_DATABASE_MAX_POOL_SIZE` is the API's ceiling on pooled PostgreSQL connections; it
+defaults to 32 and the pool still opens only one connection eagerly, so a higher ceiling costs
+nothing until load asks for it. One recall alone peaks near ten connections -- a sparse search runs
+concurrently with three vector searches, then four memory searches, and a reflection round runs
+several such waves at once -- so a value near ten lets a single recall occupy the whole pool. Raise
+it with any client concurrency you raise, and keep it under the server's own `max_connections`.
 
 `MINDBRIDGE_EMBEDDING_SPACE_ID` and `MINDBRIDGE_EMBEDDING_SPACE_REVISION` name the search space the
 selected Embedder writes into and queries. `MINDBRIDGE_EMBEDDING_DIMENSION` is the one vector width
