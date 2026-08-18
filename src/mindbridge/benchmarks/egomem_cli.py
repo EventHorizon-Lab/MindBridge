@@ -65,6 +65,8 @@ class EgoMemRunManifest(MediaBenchmarkRunManifest):
     clip_count: int = Field(gt=0)
     media_clip_count: int = Field(ge=0)
     caption_clip_count: int = Field(ge=0)
+    abstained_question_count: int = Field(ge=0)
+    error_question_count: int = Field(ge=0)
 
 
 @dataclass(frozen=True, slots=True)
@@ -182,6 +184,8 @@ def _write_artifacts(
         caption_clip_count=sum(
             clip.caption is not None for stream in streams for clip in stream.clips
         ),
+        abstained_question_count=sum(result.mindbridge_abstained for result in results),
+        error_question_count=sum(result.mindbridge_error_code is not None for result in results),
     )
     write_run_artifacts(arguments.output_path, predictions, manifest)
 

@@ -10,6 +10,7 @@ from pydantic import ValidationError
 from mindbridge import MindBridge
 from mindbridge.benchmarks.egolife_qa import EgoLifeOption, EgoLifeQuestion
 from mindbridge.benchmarks.egolife_runner import (
+    EGOMEM_REASON_ABSTENTION,
     EgoLifePreparedClip,
     EgoLifePreparedStream,
     EgoLifeQuestionResult,
@@ -18,6 +19,7 @@ from mindbridge.benchmarks.egolife_runner import (
     run_egomem_reason,
 )
 from mindbridge.benchmarks.egomem_reason import EgoMemReasonQuestion
+from mindbridge.benchmarks.runtime import OPTION_LABELS
 from mindbridge.contracts import (
     MediaObjectInput,
     ObservationProcessingJobView,
@@ -237,6 +239,54 @@ def test_egolife_metrics_use_exact_option_match() -> None:
     assert metrics.question_count == 2
     assert metrics.correct_count == 1
     assert metrics.accuracy == 0.5
+
+
+async def test_egomem_reason_abstention_records_a_non_answer_and_keeps_running() -> None:
+    """One abstention used to raise, and artifacts land only after the whole run returns."""
+
+    class AbstainingMemoryApi(RecordingMemoryApi):
+        async def recall(self, request: RecallRequest) -> RecallResult:
+            await super().recall(request)
+            return RecallResult(
+                answer=None,
+                confidence=0.0,
+                memories=(),
+                evidence=(),
+                trace_id="trace_recall",
+            )
+
+    api = AbstainingMemoryApi()
+    choices = ("Choice 0", "Choice 1", "Choice 2", "Choice 3")
+    questions = tuple(
+        EgoMemReasonQuestion(
+            example_id=example_id,
+            question_id=f"A1_JAKE_{example_id}",
+            identity="A1_JAKE",
+            query_time="DAY1, 10:00:45",
+            query_offset_ms=36_045_000,
+            question="Which choice is correct?",
+            choices=choices,
+            query_type="Event Ordering",
+        )
+        for example_id in (1, 2)
+    )
+
+    results = await run_egomem_reason(
+        cast(MindBridge, api),
+        questions,
+        _prepared_stream(),
+        run_id="run_01",
+        poll_interval_seconds=0.001,
+    )
+
+    assert len(results) == 2
+    assert [result.predicted_answer for result in results] == [
+        EGOMEM_REASON_ABSTENTION,
+        EGOMEM_REASON_ABSTENTION,
+    ]
+    assert all(result.mindbridge_abstained for result in results)
+    # The submitted label must never be scoreable as one of the real options.
+    assert EGOMEM_REASON_ABSTENTION not in OPTION_LABELS
 
 
 async def test_egomem_reason_reuses_causal_stream_and_supports_ten_options() -> None:

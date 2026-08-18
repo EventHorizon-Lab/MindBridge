@@ -208,6 +208,12 @@ class MemoryKernel:
                 "mindbridge.tenant.id": request.tenant_id,
                 "mindbridge.feedback.type": request.feedback_type.value,
                 "mindbridge.feedback.has_correction": request.correction_summary is not None,
+                # The recall that produced this feedback recorded its own query shape under the
+                # same trace id, so emitting it here is what makes "which query shapes get the
+                # worst feedback" answerable in the observability backend — no table, and nothing
+                # written on the read path. MISSING feedback carries no memory_id, so this is the
+                # only thing that ties a retrieval failure back to what was asked.
+                "mindbridge.feedback.recall_trace_id": request.recall_trace_id or "",
             }
         )
         content_digest = _request_digest(request)

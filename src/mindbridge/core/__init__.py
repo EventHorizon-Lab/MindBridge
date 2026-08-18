@@ -30,6 +30,7 @@ from mindbridge.core.evidence import (
     Observation,
     PixelRegion,
     SensorKind,
+    media_kind_for_suffix,
 )
 from mindbridge.core.feedback import FeedbackType, MemoryFeedback
 from mindbridge.core.forget import (
@@ -167,6 +168,7 @@ __all__ = [
     "derive_relation",
     "derive_stable_id",
     "evolve_memory_strength",
+    "media_kind_for_suffix",
     "require_aware_datetime",
     "require_non_empty",
     "require_similarity",

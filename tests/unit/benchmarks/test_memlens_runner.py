@@ -1,7 +1,7 @@
 """Production-contract checks for the question-isolated MEMLENS runner."""
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import cast
 
 import pytest
@@ -101,15 +101,23 @@ async def test_memlens_binds_turn_images_and_keeps_question_tenant_isolated() ->
         poll_interval_seconds=0.001,
     )
 
-    assert api.calls == [
-        "observe:0",
-        "job:job_01",
-        'remember:User said: "I paid $150. [image]"',
+    # Distinct sessions ingest concurrently, so only the order that carries meaning is asserted:
+    # a turn's evidence must be durable before the memory citing it, and recall comes last.
+    assert api.calls.index("observe:0") < api.calls.index("job:job_01")
+    assert api.calls.index("job:job_01") < api.calls.index(
+        'remember:User said: "I paid $150. [image]"'
+    )
+    assert api.calls[-1] == "recall"
+    assert sorted(call for call in api.calls if call.startswith("remember:")) == [
         'remember:Assistant said: "Noted."',
-        "recall",
+        'remember:User said: "I paid $150. [image]"',
     ]
     assert api.observe_requests[0].tenant_id == "benchmark_memlens_q_01_run_01"
-    assert api.remember_requests[0].evidence_ids == ("evidence_01",)
+    evidence_by_summary = {
+        request.summary: request.evidence_ids for request in api.remember_requests
+    }
+    assert evidence_by_summary['User said: "I paid $150. [image]"'] == ("evidence_01",)
+    assert evidence_by_summary['Assistant said: "Noted."'] == ()
     assert api.recall_requests[0].query.text is not None
     assert "Question date: 2024/05/31 07:58 UTC" in api.recall_requests[0].query.text
     assert result.prediction == "$260.00"
@@ -175,6 +183,55 @@ async def test_memlens_ingests_turns_in_source_order() -> None:
         'User said: "first"',
         'Assistant said: "second"',
     ]
+
+
+async def test_memlens_overlaps_sessions_while_keeping_each_session_ordered() -> None:
+    """Sessions differ by occurred_at so they may overlap; turns inside one share it, so may not."""
+
+    class DelayedMemoryApi(RecordingMemoryApi):
+        async def remember(self, request: RememberRequest) -> object:
+            if request.summary.endswith('"sess_a turn_0"'):
+                await asyncio.sleep(0.01)
+            return await super().remember(request)
+
+    api = DelayedMemoryApi()
+    question = _question().model_copy(
+        update={
+            "question_id": "q_overlap",
+            "sessions": tuple(
+                MemLensSession(
+                    session_id=session_id,
+                    occurred_at=NOW - timedelta(days=day),
+                    turns=(
+                        MemLensTurn(turn_id="turn_0", role="user", content=f"{session_id} turn_0"),
+                        MemLensTurn(
+                            turn_id="turn_1", role="assistant", content=f"{session_id} turn_1"
+                        ),
+                    ),
+                )
+                for day, session_id in ((2, "sess_a"), (1, "sess_b"))
+            ),
+        }
+    )
+
+    await run_memlens_question(
+        cast(MindBridge, api),
+        question,
+        run_id="run_01",
+        text_only=True,
+        request_concurrency=2,
+    )
+
+    summaries = [call.removeprefix("remember:") for call in api.calls if call != "recall"]
+    # Each session stays internally ordered even though the first turn of sess_a was delayed.
+    for session_id in ("sess_a", "sess_b"):
+        ordered = [summary for summary in summaries if session_id in summary]
+        assert ordered == [
+            f'User said: "{session_id} turn_0"',
+            f'Assistant said: "{session_id} turn_1"',
+        ]
+    # sess_b did not wait behind the delayed sess_a turn, which is the point of batching sessions.
+    assert summaries[0] == 'User said: "sess_b turn_0"'
 
 
 def test_memlens_validates_all_prepared_images_before_run() -> None:

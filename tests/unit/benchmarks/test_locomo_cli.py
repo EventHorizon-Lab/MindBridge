@@ -67,9 +67,50 @@ def test_locomo_artifacts_pin_source_system_code_and_output(tmp_path: Path) -> N
     assert manifest.memory_item_count == 1
     assert manifest.question_count == 1
     assert manifest.abstained_question_count == 0
+    assert manifest.category_question_counts == {1: 1}
     assert manifest.predictions_sha256 == hashlib.sha256(output_path.read_bytes()).hexdigest()
     with pytest.raises(FileExistsError):
         require_writable_output_pair(output_path, overwrite=False)
+
+
+def test_locomo_manifest_discloses_whether_adversarial_questions_were_scored(
+    tmp_path: Path,
+) -> None:
+    """Four-category and five-category LoCoMo numbers are not comparable, so say which it is."""
+    dataset_path = tmp_path / "locomo10.json"
+    dataset_path.write_text("official-input", encoding="utf-8")
+    output_path = tmp_path / "run" / "predictions.json"
+    conversation = _conversation()
+    result = LoCoMoOfficialConversationResult(
+        sample_id=conversation.sample_id,
+        qa=tuple(
+            LoCoMoOfficialQuestionResult(
+                question=f"Question {category}?",
+                answer="Hello",
+                evidence=("D1:1",),
+                category=category,
+                mindbridge_prediction="Hello",
+                mindbridge_abstained=False,
+                mindbridge_confidence=0.9,
+                mindbridge_prediction_context=("D1:1",),
+                mindbridge_trace_id=f"trace_{category}",
+            )
+            for category in (1, 1, 2, 5)
+        ),
+    )
+    arguments = _arguments(dataset_path, output_path)
+
+    _write_artifacts(
+        arguments,
+        (conversation,),
+        (result,),
+        load_deployment_snapshot(arguments.deployment_config_path),
+    )
+
+    manifest_path = output_path.with_suffix(".json.manifest.json")
+    manifest = LoCoMoRunManifest.model_validate_json(manifest_path.read_text(encoding="utf-8"))
+    # Category 5 is adversarial; its presence is what separates the two published protocols.
+    assert manifest.category_question_counts == {1: 2, 2: 1, 5: 1}
 
 
 def _arguments(dataset_path: Path, output_path: Path) -> _Arguments:

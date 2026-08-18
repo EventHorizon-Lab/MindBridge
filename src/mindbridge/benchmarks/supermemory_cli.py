@@ -62,6 +62,7 @@ class SuperMemoryRunManifest(MediaBenchmarkRunManifest):
     question_ids: tuple[int, ...] = Field(min_length=1)
     video_count: int = Field(gt=0)
     segment_count: int = Field(gt=0)
+    abstained_question_count: int = Field(ge=0)
     metrics: SuperMemoryMetrics
 
 
@@ -159,6 +160,7 @@ def _write_artifacts(
         question_ids=tuple(question.question_id for question in questions),
         video_count=len(prepared.videos),
         segment_count=sum(len(video.segments) for video in prepared.videos),
+        abstained_question_count=sum(result.mindbridge_abstained for result in results),
         metrics=metrics,
     )
     write_run_artifacts(arguments.output_path, predictions, manifest)

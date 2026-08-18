@@ -19,17 +19,19 @@ from mindbridge.core import (
     VerificationStatus,
 )
 from mindbridge.infrastructure.s3 import S3MediaAccess
-from mindbridge.lifecycle_cli import sweep_tenant_lifecycle
+from mindbridge.lifecycle_cli import purge_tenant_compressed_clips, sweep_tenant_lifecycle
 
 NOW = datetime(2026, 8, 12, 12, 0, tzinfo=timezone.utc)
 
 
 class InMemoryLifecycleStore:
-    def __init__(self) -> None:
+    def __init__(self, purgeable_clip_pages: list[int] | None = None) -> None:
         self.memories = (
             _memory("memory_01", NOW - timedelta(days=30)),
             _memory("memory_02", NOW),
         )
+        self.purgeable_clip_pages = purgeable_clip_pages or []
+        self.purge_limits: list[int] = []
 
     async def list_memories_for_lifecycle(
         self,
@@ -55,6 +57,21 @@ class InMemoryLifecycleStore:
     ) -> int:
         assert evaluated_at == NOW
         return len(changes)
+
+    async def purge_compressed_clips(self, tenant_id: TenantId, *, limit: int) -> int:
+        assert tenant_id == "tenant_01"
+        self.purge_limits.append(limit)
+        return self.purgeable_clip_pages.pop(0) if self.purgeable_clip_pages else 0
+
+
+async def test_clip_purge_drains_every_page_before_reporting() -> None:
+    """Purging is paged, so the loop has to keep going until a page comes back empty."""
+    store = InMemoryLifecycleStore(purgeable_clip_pages=[2, 2, 1])
+
+    purged = await purge_tenant_compressed_clips(store, TenantId("tenant_01"), page_size=2)
+
+    assert purged == 5
+    assert store.purge_limits == [2, 2, 2, 2]
 
 
 async def test_sweep_tenant_lifecycle_accumulates_bounded_pages() -> None:

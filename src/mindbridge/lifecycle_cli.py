@@ -54,6 +54,20 @@ class LifecycleSweepSummary:
     evaluated_count: int
     updated_count: int
     reclaimed_clip_count: int | None = None
+    purged_clip_count: int | None = None
+
+
+async def purge_tenant_compressed_clips(
+    store: MemoryLifecycleStore,
+    tenant_id: TenantId,
+    *,
+    page_size: int,
+) -> int:
+    """Drop clips behind compressed memories until no purgeable page remains."""
+    purged = 0
+    while page := await store.purge_compressed_clips(tenant_id, limit=page_size):
+        purged += page
+    return purged
 
 
 async def sweep_tenant_lifecycle(
@@ -109,6 +123,7 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
         age_decay_weight=options.age_decay_weight,
         strengthen_at=options.strengthen_at,
         cold_below=options.cold_below,
+        compress_below=options.compress_below,
     )
     summary = asyncio.run(
         _run_postgres_sweep(
@@ -130,6 +145,7 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
                 "tenant_id": summary.tenant_id,
                 "updated_count": summary.updated_count,
                 "reclaimed_clip_count": summary.reclaimed_clip_count,
+                "purged_clip_count": summary.purged_clip_count,
                 "dry_run": options.dry_run,
             },
             sort_keys=True,
@@ -164,19 +180,29 @@ async def _run_postgres_sweep(
     store = PostgresMemoryStore(database_url)
     await store.open()
     try:
-        # A dry run writes nothing. The strength sweep persists new strengths and hot/cold
-        # transitions, so it is skipped rather than previewed, and its counters stay zero.
-        summary = (
-            _skipped_sweep(tenant_id, evaluated_at)
-            if dry_run
-            else await sweep_tenant_lifecycle(
+        # A dry run writes nothing: neither the strength sweep, which persists new strengths
+        # and hot/cold transitions, nor the compression purge, which drops clip rows. Both
+        # are skipped rather than previewed, so their counters stay empty and only the
+        # orphan-clip scan below reports what it would have deleted.
+        if dry_run:
+            summary = _skipped_sweep(tenant_id, evaluated_at)
+        else:
+            summary = await sweep_tenant_lifecycle(
                 store,
                 tenant_id,
                 evaluated_at,
                 page_size=page_size,
                 policy=policy,
             )
-        )
+            if policy.compress_below is not None:
+                # Purge the rows first: that leaves each clip's content-addressed key an
+                # orphan, which the reclaim pass below then deletes from object storage.
+                summary = replace(
+                    summary,
+                    purged_clip_count=await purge_tenant_compressed_clips(
+                        store, tenant_id, page_size=page_size
+                    ),
+                )
         if media_access is None:
             return summary
         reclaimed = await reclaim_orphan_clips_use_case(
@@ -214,7 +240,8 @@ def _parser(prog: str | None = None) -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "write nothing: count the orphan clips --reclaim-orphan-clips would delete "
-            "and skip the strength sweep, whose counters then stay zero"
+            "and skip both the strength sweep and the --compress-below purge, whose "
+            "counters then stay empty"
         ),
     )
     parser.add_argument(
@@ -239,7 +266,10 @@ def _parser(prog: str | None = None) -> argparse.ArgumentParser:
         "--age-decay-weight",
         type=float,
         default=policy.age_decay_weight,
-        help="weight elapsed time subtracts from strength",
+        help=(
+            "strength lost per idle day; idle days to cold are salience divided by this, "
+            "so the default cools a 0.5-salience memory after 100 unused days"
+        ),
     )
     parser.add_argument(
         "--strengthen-at",
@@ -252,6 +282,16 @@ def _parser(prog: str | None = None) -> argparse.ArgumentParser:
         type=float,
         default=policy.cold_below,
         help="strength below which a memory becomes cold",
+    )
+    parser.add_argument(
+        "--compress-below",
+        type=float,
+        default=policy.compress_below,
+        help=(
+            "strength at or under which a cold memory also drops its rebuildable clips "
+            "(must not exceed --cold-below); omit to leave compression off. Pair with "
+            "--reclaim-orphan-clips to also delete the clip objects the purge orphans"
+        ),
     )
     return parser
 

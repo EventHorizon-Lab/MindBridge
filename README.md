@@ -114,7 +114,8 @@ Both trees follow the same contract:
   subcommand.
 - **irreversible work has a preview.** `mindbridge lifecycle --reclaim-orphan-clips --dry-run`
   writes nothing at all: it counts the orphan objects it would delete, deletes none of them,
-  and skips the strength sweep, whose counters then stay zero.
+  and skips both the strength sweep and the `--compress-below` purge, whose counters then
+  stay empty.
 
 ## Local PostgreSQL
 
@@ -1163,7 +1164,7 @@ from mindbridge.edge import (
     LocalIdentitySample,
     SQLiteIdentityMemory,
     SQLiteObservationOutbox,
-    enqueue_captured_video,
+    enqueue_captured_media,
 )
 
 outbox = SQLiteObservationOutbox(Path("/var/lib/mindbridge/edge.db"))
@@ -1189,7 +1190,7 @@ face = identities.recognize_and_remember(
     ),
     minimum_similarity=calibrated_face_threshold,
 )
-request = enqueue_captured_video(
+request = enqueue_captured_media(
     outbox,
     Path("/var/lib/mindbridge/media/segment-000007.mp4"),
     tenant_id="tenant_01",
@@ -1209,6 +1210,14 @@ The handoff computes the SHA-256 and size, generates a deterministic tenant-scop
 idempotency key, then commits the request and absolute local path to a mode-`0600`, WAL-enabled
 SQLite Outbox. The platform capture stack (GStreamer, optionally DeepStream) remains responsible for
 camera decoding, encoding, frame rate, resolution, VAD/motion/scene gates, and hardware calibration.
+
+`kind` defaults to `MediaKind.VIDEO` and accepts `MediaKind.AUDIO` for a microphone-only capture or
+`MediaKind.IMAGE` for a still frame; the sensor follows from it, so audio-only segments are recorded
+against `SensorKind.MICROPHONE`. The `audio_path` sidecar applies only to video, and a still image
+carries no `duration_ms`. Modality routing downstream is driven entirely by the declared `kind`,
+which `MediaObjectInput` cross-checks against the URI extension when the extension is recognized —
+declaring one kind and pointing at another container is refused at the boundary rather than
+surfacing later as a decode failure in a worker.
 
 The lower-level example accepts an embedding from an existing robot vision stack. Native hot paths
 do not need to reopen a completed media file: feed timestamped BGR frames to
@@ -1235,7 +1244,7 @@ when its Event gate closes, `FunASRSpeechPipeline` performs VAD, quality ASR, pu
 diarization, and CAM++ centroid extraction in one upstream call.
 `recognize_identities_in_av_segment()` combines that result with InsightFace and the optional
 provider-neutral audiovisual active-speaker Pipeline, then returns only cloud-safe intervals ready for
-`enqueue_captured_video()`. `device=auto` selects an available accelerator, and an explicit
+`enqueue_captured_media()`. `device=auto` selects an available accelerator, and an explicit
 accelerator request fails instead of silently using CPU.
 
 Install InsightFace/ONNX Runtime and FunASR/ModelScope from the device image that matches the target
