@@ -26,7 +26,7 @@ from mindbridge.benchmarks.artifacts import load_deployment_snapshot, sidecar_ma
 
 def test_every_benchmark_names_a_loader_an_emitter_and_a_pipeline() -> None:
     assert set(BENCHMARKS) == {
-        "locomo",
+        "locomo-refined",
         "longmemeval",
         "beam",
         "clbench",
@@ -72,17 +72,17 @@ def _handler(seen: list[httpx.Request]) -> Callable[[httpx.Request], httpx.Respo
 async def test_run_writes_one_jsonl_row_per_question(tmp_path: Path) -> None:
     output_path = tmp_path / "rows.jsonl"
     seen: list[httpx.Request] = []
-    cases = (_case("locomo:conv-0", "q0"), _case("locomo:conv-1", "q0"))
+    cases = (_case("locomo-refined:conv-0", "q0"), _case("locomo-refined:conv-1", "q0"))
 
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(_handler(seen)), base_url="http://test"
     ) as client:
         tenant_ids = await _run(
             client,
-            BENCHMARKS["locomo"],
+            BENCHMARKS["locomo-refined"],
             cases,
             run_id="run-1",
-            benchmark="locomo",
+            benchmark="locomo-refined",
             top_k=10,
             concurrency=2,
             output_path=output_path,
@@ -90,30 +90,80 @@ async def test_run_writes_one_jsonl_row_per_question(tmp_path: Path) -> None:
         )
 
     rows = [json.loads(line) for line in output_path.read_text().splitlines()]
-    assert {row["id"] for row in rows} == {"locomo:conv-0#q0", "locomo:conv-1#q0"}
+    assert {row["id"] for row in rows} == {"locomo-refined:conv-0#q0", "locomo-refined:conv-1#q0"}
     assert set(tenant_ids) == {
-        eval_user_id("run-1", "locomo", "locomo:conv-0"),
-        eval_user_id("run-1", "locomo", "locomo:conv-1"),
+        eval_user_id("run-1", "locomo-refined", "locomo-refined:conv-0"),
+        eval_user_id("run-1", "locomo-refined", "locomo-refined:conv-1"),
     }
     for user_id, tenant_id in tenant_ids.items():
         assert tenant_id == derive_tenant_id("bench_aml", user_id)
 
 
+@pytest.mark.asyncio
+async def test_run_checkpoints_early_cases_instead_of_finishing_them_all_at_once(
+    tmp_path: Path,
+) -> None:
+    """A kill mid-run has to leave finished cases behind, which needs a bound on cases."""
+    # run_case gathers every add before issuing a search, so with only a request bound each
+    # case's adds queue ahead of every case's searches and nothing completes until nearly the
+    # whole add phase is done. Recording when the first search is issued measures exactly
+    # that: with a case bound, early cases have already finished and been written by then.
+    output_path = tmp_path / "rows.jsonl"
+    seen: list[httpx.Request] = []
+    adds_before_first_search: list[int] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        if request.url.path == "/aml/add":
+            payload = json.loads(request.content)
+            return httpx.Response(
+                200,
+                json={
+                    "success": True,
+                    "request_id": payload["request_id"],
+                    "user_id": payload["user_id"],
+                    "session_id": payload["session_id"],
+                },
+            )
+        if not adds_before_first_search:
+            adds_before_first_search.append(sum(1 for item in seen if item.url.path == "/aml/add"))
+        return httpx.Response(200, json={"data": [{"id": "mem_1", "content": "hi"}]})
+
+    cases = tuple(_case(f"locomo-refined:conv-{index}", "q0") for index in range(8))
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handle), base_url="http://test"
+    ) as client:
+        await _run(
+            client,
+            BENCHMARKS["locomo-refined"],
+            cases,
+            run_id="run-1",
+            benchmark="locomo-refined",
+            top_k=10,
+            concurrency=2,
+            output_path=output_path,
+            tenant_prefix="bench_aml",
+        )
+
+    # Two cases in flight means at most two adds land before the first search. Unbounded, all
+    # eight would, and no row could be written until then.
+    assert adds_before_first_search == [2]
+    assert len(output_path.read_text().splitlines()) == 8
+
+
 @pytest.mark.parametrize(
     ("benchmark", "payload"),
     [
-        # LoCoMo is the one benchmark whose loader puts nothing under "id" in
-        # the question payload, so the driver's own
-        # `{case.user_id}#{question.question_id}` id survives untouched. The
-        # other five loaders each set their own "id" in the payload (see
-        # loaders/{longmemeval,beam,clbench,personamem_v1,personamem_v2}.py),
-        # which overwrites the driver's id when `run_case` builds a row
-        # (`row.update(question.payload)`) -- Blocking 2 (final review,
+        # The empty payload keeps the driver's own
+        # `{case.user_id}#{question.question_id}` id, which is what a loader that
+        # sets no "id" leaves behind. Every real loader now sets one (see
+        # loaders/*.py), and it overwrites the driver's id when `run_case` builds a
+        # row (`row.update(question.payload)`) -- Blocking 2 (final review,
         # 2026-08-17): the CLI's resume check computed pending work from the
-        # driver's id format alone, which never matches what these five
-        # benchmarks actually write, so a resumed run treated every one of
-        # their cases as unfinished and silently doubled every memory.
-        ("locomo", {}),
+        # driver's id format alone, which never matches what those loaders actually
+        # write, so a resumed run treated every one of their cases as unfinished and
+        # silently doubled every memory. Both id sources stay covered here.
+        ("locomo-refined", {}),
         ("longmemeval", {"id": "own-id"}),
         ("beam", {"id": "own-id"}),
         ("clbench", {"id": "own-id"}),
@@ -217,12 +267,12 @@ def test_manifest_carries_source_deployment_and_tenant_mapping(tmp_path: Path) -
     # validate at all (Important 2, task-13 review), so this run "produced"
     # exactly one question.
     output_path.write_text(
-        json.dumps({"id": "locomo:conv-0#q0", "question": "q0"}) + "\n",
+        json.dumps({"id": "locomo-refined:conv-0#q0", "question": "q0"}) + "\n",
         encoding="utf-8",
     )
     arguments = _Arguments(
-        benchmark="locomo",
-        dataset_paths=(tmp_path / "locomo10.json",),
+        benchmark="locomo-refined",
+        dataset_paths=(tmp_path / "locomo_refined.json",),
         output_path=output_path,
         api_base_url="https://memory.example.test",
         code_revision="mindbridge-commit",
@@ -236,8 +286,8 @@ def test_manifest_carries_source_deployment_and_tenant_mapping(tmp_path: Path) -
     )
     deployment = load_deployment_snapshot(deployment_path)
     tenant_ids = {
-        "eval:run-1:locomo:locomo:conv-0": derive_tenant_id(
-            "bench_aml", "eval:run-1:locomo:locomo:conv-0"
+        "eval:run-1:locomo-refined:locomo-refined:conv-0": derive_tenant_id(
+            "bench_aml", "eval:run-1:locomo-refined:locomo-refined:conv-0"
         )
     }
 
@@ -352,8 +402,8 @@ def _arguments(
     tmp_path: Path, output_path: Path, deployment_path: Path, **overrides: object
 ) -> _Arguments:
     fields: dict[str, object] = {
-        "benchmark": "locomo",
-        "dataset_paths": (tmp_path / "locomo10.json",),
+        "benchmark": "locomo-refined",
+        "dataset_paths": (tmp_path / "locomo_refined.json",),
         "output_path": output_path,
         "api_base_url": "https://memory.example.test",
         "code_revision": "mindbridge-commit",
@@ -375,7 +425,7 @@ def test_require_compatible_existing_manifest_allows_a_first_run(tmp_path: Path)
 
     _require_compatible_existing_manifest(
         tmp_path / "rows.jsonl",
-        benchmark="locomo",
+        benchmark="locomo-refined",
         run_id="run-1",
         deployment=deployment.snapshot,
         recall_limit=10,
@@ -388,13 +438,13 @@ def test_require_compatible_existing_manifest_allows_a_matching_resume(tmp_path:
     deployment_path = _deployment_path(tmp_path)
     deployment = load_deployment_snapshot(deployment_path)
     output_path = tmp_path / "rows.jsonl"
-    output_path.write_text(json.dumps({"id": "locomo:conv-0#q0", "question": "q0"}) + "\n")
+    output_path.write_text(json.dumps({"id": "locomo-refined:conv-0#q0", "question": "q0"}) + "\n")
     arguments = _arguments(tmp_path, output_path, deployment_path)
     _write_manifest(arguments, deployment, {})
 
     _require_compatible_existing_manifest(
         output_path,
-        benchmark="locomo",
+        benchmark="locomo-refined",
         run_id="run-1",
         deployment=deployment.snapshot,
         recall_limit=10,
@@ -422,7 +472,7 @@ def test_require_compatible_existing_manifest_refuses_a_mismatched_resume(
     deployment_path = _deployment_path(tmp_path)
     deployment = load_deployment_snapshot(deployment_path)
     output_path = tmp_path / "rows.jsonl"
-    output_path.write_text(json.dumps({"id": "locomo:conv-0#q0", "question": "q0"}) + "\n")
+    output_path.write_text(json.dumps({"id": "locomo-refined:conv-0#q0", "question": "q0"}) + "\n")
     first_run = _arguments(tmp_path, output_path, deployment_path)
     _write_manifest(first_run, deployment, {})
 
@@ -443,7 +493,7 @@ def test_require_compatible_existing_manifest_refuses_a_different_deployment(
     deployment_path = _deployment_path(tmp_path)
     deployment = load_deployment_snapshot(deployment_path)
     output_path = tmp_path / "rows.jsonl"
-    output_path.write_text(json.dumps({"id": "locomo:conv-0#q0", "question": "q0"}) + "\n")
+    output_path.write_text(json.dumps({"id": "locomo-refined:conv-0#q0", "question": "q0"}) + "\n")
     arguments = _arguments(tmp_path, output_path, deployment_path)
     _write_manifest(arguments, deployment, {})
 
@@ -471,7 +521,7 @@ def test_require_compatible_existing_manifest_refuses_a_different_deployment(
     with pytest.raises(ValueError, match="deployment"):
         _require_compatible_existing_manifest(
             output_path,
-            benchmark="locomo",
+            benchmark="locomo-refined",
             run_id="run-1",
             deployment=other_deployment.snapshot,
             recall_limit=10,
@@ -479,8 +529,10 @@ def test_require_compatible_existing_manifest_refuses_a_different_deployment(
 
 
 def test_require_nonempty_cases_allows_at_least_one_case() -> None:
-    cases = (_case("locomo:conv-0", "q0"),)
-    _require_nonempty_cases(cases, benchmark="locomo", dataset_paths=(Path("locomo10.json"),))
+    cases = (_case("locomo-refined:conv-0", "q0"),)
+    _require_nonempty_cases(
+        cases, benchmark="locomo-refined", dataset_paths=(Path("locomo_refined.json"),)
+    )
 
 
 def test_require_nonempty_cases_refuses_zero_cases_and_names_the_dataset_path(

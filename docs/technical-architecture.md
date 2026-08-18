@@ -35,7 +35,7 @@ MindBridge 不是机器人、Agent 或大模型。MindBridge 是**记忆本身**
    **职责位置**——离传感器最近、承担隐私与断网——不是某个 SKU 或某种算力档位。
 3. 人脸识别与声纹识别尽可能在端侧完成；身份模板默认不离开设备。
 4. 不要求完全离线。云端是长期记忆和重型推理的主路径，端侧提供连续采集、隐私处理、近期记忆和断网缓冲。
-5. 文本侧以 LoCoMo 为核心 Benchmark；多模态侧覆盖 EgoLifeQA、EgoTempo、Video-MME、SuperMemory-VQA 和 M3-Bench，并以**各类权威 Benchmark 上的工业级 SOTA** 为目标。
+5. 文本侧以 LoCoMo-Refined 为核心 Benchmark；多模态侧覆盖 EgoLifeQA、EgoTempo、Video-MME、SuperMemory-VQA 和 M3-Bench，并以**各类权威 Benchmark 上的工业级 SOTA** 为目标。
 
 ### 2.2 强制设计原则
 
@@ -1434,7 +1434,7 @@ MindBridge 的目标是**在各类权威 Benchmark 上取得工业级 SOTA 的�
 
 | Benchmark | 主要验证能力 | MindBridge 对应机制 |
 | --- | --- | --- |
-| LoCoMo | 长期对话、单跳、多跳、时间和开放域记忆 | Claim 版本、全文+稠密召回、时间关系、证据回答 |
+| LoCoMo-Refined | 长期对话、单跳、多跳、时间和开放域记忆（严格时间粒度与列表完整性） | Claim 版本、全文+稠密召回、时间关系、证据回答 |
 | EgoLifeQA | 跨小时/天的第一视角视听、身份和生活事件 | 端侧身份、分层 Episode、AV 证据和跨日关联 |
 | SuperMemory-VQA | 多证据、自然提问、物体位置、意图、时间线和拒答 | evidence coverage、关系展开、枚举、证据充分性判断 |
 | M3-Bench | 机器人视角长期记忆、人类理解、常识提取和跨模态推理 | 在线记忆构建、实体中心图、迭代召回和原始媒体核验 |
@@ -1456,7 +1456,7 @@ MindBridge 的目标是**在各类权威 Benchmark 上取得工业级 SOTA 的�
    选用当时最强的**通用**模型是允许的，前提是同一配置可以直接部署为产品；
 6. 模型、Prompt、索引参数和代码 commit 固定进 run manifest。
 
-可执行适配基线固定 LoCoMo revision `3eb6f2c585f5e1699204e3c3bdf7adc5c28cb376`、M3-Agent
+可执行适配基线固定 LoCoMo-Refined revision `887091190789e8d6760e70b9edd696539923dc4f`、M3-Agent
 revision `0e3e41939bd8a0b66d756e7b7eb8d5fe9992da5c`、Video-MME 数据 revision
 `ead1408f75b618502df9a1d8e0950166bf0a2a0b`、EgoLife 数据 revision
 `143fb319be7aa5ae210c936bf4f0f3a86092afb0`、EgoTempo revision
@@ -1470,15 +1470,18 @@ revision `0e3e41939bd8a0b66d756e7b7eb8d5fe9992da5c`、Video-MME 数据 revision
 `dataset-adapters-smoke.json` 记录源文件 SHA-256、适配器版本和完整样本计数；当前门禁还覆盖
 Video-MME 2,700 题、EgoTempo 500 题，并保留其他已接入评测的完整样本计数。
 
-LoCoMo runner 将原始对话逐 turn 通过 `remember` 写入，并且不向生产接口传入参考答案、证据
-标签或 category。Recall query 只包含原始问题，作答格式由统一的 `AnswerPipeline` 契约负责，避免指令文本
+LoCoMo-Refined runner 将原始对话逐 turn 通过 `remember` 写入，并且不向生产接口传入参考答案、
+证据标签或 category。Recall query 只包含原始问题，作答格式由统一的 `AnswerPipeline` 契约负责，避免指令文本
 污染 query embedding。所有题使用调用方显式给出的同一个 recall limit；生产代码不检查题目措辞、
-类别或答案形式来改变候选预算。参数进入 runner version/manifest；输出使用官方 evaluator 识别的
-`mindbridge_prediction` 与 `mindbridge_prediction_context`，因此答案 F1 和检索 recall 均走官方
-计算路径。CLI 保持与产品一致的统一 Top-20 默认预算；Top-50 只能由调用方显式选择并记录，不能
+类别或答案形式来改变候选预算。参数进入 runner version/manifest；输出直接就是官方
+`predictions.jsonl` 形状——每行 `{qa_id, predicted_answer}`，`qa_id` 用发布方自己的
+`{sample_id}#q{index:04d}`，因此分数由 `mem-eval-suite/LoCoMo_refined` 的 `run_eval.sh` 计算，
+仓内不复制任何评分逻辑；检索诊断 `mindbridge_prediction_context` 同行携带，官方 evaluator 忽略它。CLI 保持与产品一致的统一 Top-20 默认预算；Top-50 只能由调用方显式选择并记录，不能
 根据同一评测集切片静默改变默认值。
 
 固定 `conv-26` 的 199 题生产切片中，`qwen3.8-max`、Text Small F16 和官方 evaluator 下，
+（以下三段是**原始 LoCoMo 语料**上的历史记录，语料换成 LoCoMo-Refined 后不可用当前代码复现，
+保留是因为它们是当时那次优化的证据。）
 `pre_reflection_v4` 到 `reflection_v8` 的组合改动使全题 F1 从 `0.6004` 变为 `0.6494`，
 non-adversarial F1 从 `0.5426` 变为
 `0.6002`，Evidence recall 从 `0.7722` 提升到 `0.7772`。这是一次刻意的多处同时优化，符合 §14.0 的
@@ -1542,10 +1545,10 @@ leaderboard 预测与检索诊断。MEMLENS runner 以 question 为隔离单元�
 
 三处口径会让"看起来更好"和"实际更好"分叉，因此每次运行必须同时给出配套数值，不得单独引用：
 
-- **LoCoMo abstention**：对抗题（category 5）的标准答案就是
-  `Not mentioned in the conversation`，与 API 拒答的渲染文本相同。因此每行结果携带
-  `mindbridge_abstained`，run manifest 记录 `abstained_question_count`；引用全题 F1 时必须同时
-  给出拒答率与 non-adversarial F1。
+- **LoCoMo-Refined 的空回答**：这一版删除了 adversarial（category 5），拒答不再是任何一题的
+  标准答案，API 拒答因此写成空的 `predicted_answer`，被官方 evaluator 直接判错。为了把"答错"
+  和"没答"分开，每行结果携带 `mindbridge_answered`，run manifest 记录
+  `unanswered_question_count`；引用分数时必须同时给出它。
 - **Video-MME 分母**：官方 parser 丢弃解析不出选项字母的行，拒答与 API 失败恰好落在该桶。
   `evaluate_video_mme` 因此同时返回 `accuracy`（官方口径）、`strict_accuracy`（全题分母）和
   `error_count`，官方数字不得脱离后两者出现。
@@ -1662,7 +1665,7 @@ job→first claim/searchable ready，以及 recall→first answer/complete。His
 
 - 固化本文的 Event、EvidenceSpan、Claim、Embedding schema；
 - 建立 `pyproject.toml`，配置 Ruff、mypy、pytest 和最小 CI 门禁；
-- 建立 LoCoMo 和一个多模态 Benchmark 的最小适配器；
+- 建立 LoCoMo-Refined 和一个多模态 Benchmark 的最小适配器；
 - 跑通 Jina v5 Omni Small 和一个 Omni/VLM；
 - 产出可复现的 baseline run manifest。
 
@@ -1704,12 +1707,13 @@ RTX 5090 同机端云验证的完整协议、四套公开题集结果、生命�
 优先级见 [`benchmark-report-5090.md`](benchmark-report-5090.md)。该报告把 released-text
 memory-layer 评测与原始视听复现分开，禁止用前者替代多模态 SOTA 声明。
 
-当前完整公开题集基线为：LoCoMo token-F1 `53.09%`、非官方 Qwen Judge `81.43%`；EgoLifeQA
+当前完整公开题集基线为：LoCoMo（原始语料，已退役）token-F1 `53.09%`、非官方 Qwen Judge
+`81.43%`；EgoLifeQA
 `61.20%`；SuperMemory-VQA Ans-F1/QA-Acc/QA-MRR `67.41%/58.69%/72.65%`；M3-Bench
 Robot/Web 非官方 Qwen Judge `30.02%/58.18%`。M3 Web 混合了 908 个 v6 与 12 个 v7 分片，且
 包含选择性重跑，因而只是诊断值。逐运行 revision、输入表示、模型、结果 hash 和生命周期工件
 固定在 [`benchmark-5090-clean-007.json`](../benchmarks/manifests/benchmark-5090-clean-007.json)。
-当前生产 Recall 的单 conversation 组合回归中，LoCoMo non-adversarial token-F1 从 `54.26%`
+当前生产 Recall 的单 conversation 组合回归中，LoCoMo（原始语料）non-adversarial token-F1 从 `54.26%`
 变为 `60.02%`。Prompt 与反思代码是同时变化的——按 §14.0 这是允许的优化方式，因此该差值是组合
 收益，不能被引用为反思单独的贡献。新的真实音频
 验证在 RTX 5090 上用一次 FunASR 调用贯通 VAD、ASR、标点、diarization 与 CAM++ centroid：
@@ -1724,7 +1728,7 @@ Entity/Bridge/Scene/Horizon cue 明确推迟到完整数据证明增益之后，
 
 | 阶段 | 当前状态 | 已落地证据 | 剩余验收 |
 | --- | --- | --- | --- |
-| Phase 0 | 完成 | 严格领域契约、锁定依赖、CI、Jina smoke、官方数据适配器、可追溯 LoCoMo 与 5090 全量评测 manifest | 无；后续运行继续沿用同一 manifest 门禁 |
+| Phase 0 | 完成 | 严格领域契约、锁定依赖、CI、Jina smoke、官方数据适配器、可追溯 LoCoMo-Refined 与 5090 全量评测 manifest | 无；后续运行继续沿用同一 manifest 门禁 |
 | Phase 1 | 软件垂直路径完成 | 原生 BGR/PCM 流入口、采集 handoff、FunASR 统一语音、加密身份 prototype、SQLite Outbox/近期记忆、S3 同步、durable Job、Event 精确 EvidenceSpan/pgvector 与 REST API | 在各目标端侧平台上完成真实摄像头、VAD/场景/运动门控、断网和功耗验收 |
 | Phase 2 | 完成（公开发布表示） | Episode/Claim/Summary consolidation、RRF/图展开/媒体重看、反馈纠错、生命周期、显式删除，以及四套 Benchmark 完整公开题集的生产 API 分层结果 | 原始 AV 全量重放属于 Phase 3 严格 SOTA 复现，不再作为 Phase 2 软件门禁 |
 | Phase 3 | 进行中 | RLS 多租户、Bearer allowlist、Python SDK、MCP/OpenAPI、OpenTelemetry、端侧 CUDA 人脸/FunASR 统一 speech path、PCM streaming、Omni ASD、发布文本↔原始媒体证据绑定、相关 Top-K 时间重排、无结果方向切换和有界层级展开 | 原始 AV/OCR/object 全量 SOTA 重放、官方 Judge 重跑、身份真值 replay、LR-ASD 与 Embedding bake-off、跨平台端侧 runtime（TensorRT/RKNN/OpenVINO/BPU）与 Nano 实测、配额、持久审计和备份删除演练；experience/cue 等完整数据证明收益后再评估 |
@@ -1801,7 +1805,7 @@ Entity/Bridge/Scene/Horizon cue 明确推迟到完整数据证明增益之后，
 
 ### 19.4 Benchmark
 
-- [LoCoMo](https://github.com/snap-research/locomo)
+- [LoCoMo-Refined](https://github.com/mem-eval-suite/LoCoMo_refined)
 - [EgoLifeQA](https://egolife-ai.github.io/)
 - [SuperMemory-VQA](https://github.com/AIoT-MLSys-Lab/supermemory-vqa)
 - [M3-Bench](https://github.com/bytedance-seed/m3-agent#m3-bench)

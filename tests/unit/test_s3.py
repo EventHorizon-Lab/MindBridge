@@ -1,6 +1,7 @@
 """Tests for tenant-safe S3 media access."""
 
 from datetime import datetime, timezone
+from inspect import signature
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
@@ -8,11 +9,14 @@ from botocore.exceptions import ClientError
 
 from mindbridge.core import MediaKind, MediaObject, MediaObjectId, ObjectStorageError, TenantId
 from mindbridge.infrastructure.s3 import (
+    _DEFAULT_URL_LIFETIME_SECONDS,
+    _MAX_URL_LIFETIME_SECONDS,
     InvalidMediaLocationError,
     ObjectStorageEnvironment,
     S3MediaAccess,
     object_storage_from_environment,
 )
+from mindbridge.models.openai import OpenAIGenerator
 
 NOW = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
 SHA256 = "00" * 32
@@ -110,3 +114,23 @@ def test_object_storage_contract_rejects_blank_values(
     """Blank storage settings must fail at startup, not when the first upload is signed."""
     with pytest.raises(ValueError, match=message):
         ObjectStorageEnvironment(**{"bucket": "memory", **changes})
+
+
+def test_signed_downloads_outlive_the_longest_model_call_that_fetches_them() -> None:
+    """A signed URL is fetched by the generator, so its expiry has to beat that call."""
+    # Not a restatement of the constant: it pins one module's default against another's, so
+    # raising the generator timeout past the signing window fails here instead of surfacing as
+    # a permanent "could not download multimodal content" 400 in production. Both defaults are
+    # what every S3MediaAccess construction in the tree actually gets -- none passes either
+    # value explicitly.
+    generator_timeout = (
+        signature(OpenAIGenerator.__init__).parameters["request_timeout_seconds"].default
+    )
+    assert generator_timeout < _DEFAULT_URL_LIFETIME_SECONDS
+    assert _DEFAULT_URL_LIFETIME_SECONDS <= _MAX_URL_LIFETIME_SECONDS
+
+
+def test_media_access_defaults_to_the_shared_lifetime() -> None:
+    """The default is the whole fix, so nothing may quietly shorten it per construction."""
+    access = S3MediaAccess(STORAGE, clock=lambda: NOW)
+    assert access._url_lifetime_seconds == _DEFAULT_URL_LIFETIME_SECONDS

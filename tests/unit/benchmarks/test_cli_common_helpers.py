@@ -85,12 +85,12 @@ def test_select_by_id_rejects_a_duplicated_request() -> None:
 
 def test_select_by_id_names_the_benchmark_unit_in_its_refusal() -> None:
     """The label is the part an operator reads, so each benchmark keeps its own wording."""
-    with pytest.raises(ValueError, match=r"^unknown LoCoMo sample IDs: nope$"):
+    with pytest.raises(ValueError, match=r"^unknown LoCoMo-Refined sample IDs: nope$"):
         select_by_id(
             (_Prepared("conv-01"),),
             ("nope",),
             key=lambda i: i.unit_id,
-            label="LoCoMo sample IDs",
+            label="LoCoMo-Refined sample IDs",
         )
 
 
