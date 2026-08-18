@@ -35,6 +35,7 @@ from mindbridge.contracts import (
     RecallRequest,
     RecallResult,
     RememberRequest,
+    RememberResult,
     ValidationIssue,
 )
 from mindbridge.core import (
@@ -114,7 +115,7 @@ def build_app(
 
     @app.post(
         "/v1/memories",
-        response_model=MemoryResult,
+        response_model=RememberResult,
         status_code=status.HTTP_201_CREATED,
         operation_id="remember",
         responses=responses(
@@ -127,7 +128,7 @@ def build_app(
     async def remember(
         request: RememberRequest,
         principal: TenantPrincipal = tenant_authentication,
-    ) -> MemoryResult:
+    ) -> RememberResult:
         require_tenant(principal, request.tenant_id)
         return await kernel.remember(request)
 

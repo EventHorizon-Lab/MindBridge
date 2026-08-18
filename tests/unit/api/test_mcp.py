@@ -15,13 +15,16 @@ from mindbridge.contracts import (
     ForgetRequest,
     GetMemoryRequest,
     MemoryResult,
+    MemoryWriteStatus,
+    ObservationProcessingJobView,
     ObservationReceipt,
     ObserveRequest,
     RecallRequest,
     RecallResult,
     RememberRequest,
+    RememberResult,
 )
-from mindbridge.core import MemoryState, MemoryType, VerificationStatus
+from mindbridge.core import JobState, MemoryState, MemoryType, VerificationStatus
 
 NOW = datetime(2026, 8, 12, 12, 0, tzinfo=timezone.utc)
 
@@ -29,8 +32,11 @@ NOW = datetime(2026, 8, 12, 12, 0, tzinfo=timezone.utc)
 class StubKernel:
     """Small protocol stub proving that MCP contains no memory business logic."""
 
-    async def remember(self, request: RememberRequest) -> MemoryResult:
-        return _memory_view(request.summary, request.memory_type)
+    async def remember(self, request: RememberRequest) -> RememberResult:
+        return RememberResult.model_validate(
+            _memory_view(request.summary, request.memory_type).model_dump()
+            | {"status": MemoryWriteStatus.CREATED}
+        )
 
     async def recall(self, request: RecallRequest) -> RecallResult:
         return RecallResult(
@@ -53,6 +59,23 @@ class StubKernel:
     async def forget(self, request: ForgetRequest) -> ForgetReceipt:
         raise AssertionError("not called")
 
+    async def get_observation_job(
+        self,
+        tenant_id: str,
+        job_id: str,
+    ) -> ObservationProcessingJobView:
+        return ObservationProcessingJobView(
+            job_id=job_id,
+            observation_id=f"observation_for_{tenant_id}",
+            state=JobState.SUCCEEDED,
+            attempt=1,
+            error_code=None,
+            memory_ids=("memory_01",),
+            created_at=NOW,
+            updated_at=NOW,
+            trace_id="trace_job",
+        )
+
 
 async def test_mcp_lists_stable_tools_from_shared_contracts() -> None:
     server = build_mcp_server(cast(MemoryKernel, StubKernel()))
@@ -65,6 +88,7 @@ async def test_mcp_lists_stable_tools_from_shared_contracts() -> None:
         "memory_feedback",
         "memory_forget",
         "memory_get",
+        "memory_job",
         "memory_observe",
         "memory_recall",
         "memory_remember",
@@ -99,9 +123,31 @@ async def test_mcp_calls_shared_kernel_and_returns_structured_output() -> None:
 
     assert result.is_error is False
     assert result.structured_content is not None
-    response = MemoryResult.model_validate(result.structured_content)
+    response = RememberResult.model_validate(result.structured_content)
     assert response.summary == request.summary
     assert response.trace_id == "trace_memory"
+    # A write says whether it is the write that stored the content, the way observe always has.
+    assert response.status is MemoryWriteStatus.CREATED
+
+
+async def test_mcp_resolves_the_job_id_observe_hands_back() -> None:
+    """The receipt's `processing_job_id` has to be usable from the face that returned it.
+
+    `memory_observe` answers before any memory exists, so without this tool an Agent holds an
+    ID it cannot redeem and has to poll recall until something appears.
+    """
+    server = build_mcp_server(cast(MemoryKernel, StubKernel()))
+
+    async with Client(server) as client:
+        result = await client.call_tool(
+            "memory_job",
+            {"tenant_id": "tenant_01", "job_id": "job_01"},
+        )
+
+    assert result.is_error is False
+    job = ObservationProcessingJobView.model_validate(result.structured_content)
+    assert job.state is JobState.SUCCEEDED
+    assert job.memory_ids == ("memory_01",)
 
 
 async def test_mcp_rejects_the_nested_request_shape() -> None:

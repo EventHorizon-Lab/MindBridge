@@ -18,12 +18,15 @@ from mindbridge.contracts import (
     ForgetReceipt,
     ForgetRequest,
     GetMemoryRequest,
+    GetObservationJobRequest,
     MemoryResult,
+    ObservationProcessingJobView,
     ObservationReceipt,
     ObserveRequest,
     RecallRequest,
     RecallResult,
     RememberRequest,
+    RememberResult,
 )
 
 _READ_ONLY = ToolAnnotations(read_only_hint=True, open_world_hint=False)
@@ -119,15 +122,15 @@ def build_mcp_server(
         whose 0..1 normalized corners have no positive width and height.
 
         `status` returns `duplicate` when a retry matched an earlier `idempotency_key`.
-        Deriving memory from raw media outlives this request: the returned
-        `processing_job_id` resolves over the REST job route, which MCP does not mirror, so
-        from here retry `memory_recall` until the derived memories appear.
+        Deriving memory from raw media outlives this request, so no memory exists yet when
+        this receipt returns: read the returned `processing_job_id` with `memory_job` until it
+        reaches `succeeded`, then use the `memory_ids` it carries.
         """
         return await kernel.observe(request)
 
     server.add_tool(_flattened(ObserveRequest, memory_observe), annotations=_IDEMPOTENT_WRITE)
 
-    async def memory_remember(request: RememberRequest) -> MemoryResult:
+    async def memory_remember(request: RememberRequest) -> RememberResult:
         """Retain one explicit memory, preserving evidence and temporal provenance.
 
         Choose `memory_type` by the role the content will serve: `episodic` for something
@@ -137,7 +140,8 @@ def build_mcp_server(
 
         `ended_at` defaults to `occurred_at` and must not precede it. `evidence_ids` must
         already exist and must not repeat. Omitting `idempotency_key` derives one from the
-        content, so an identical retry returns the same memory rather than a second copy.
+        content, so an identical retry returns the same memory rather than a second copy --
+        and says so: `status` is `created` only when this call is what stored it.
         """
         return await kernel.remember(request)
 
@@ -172,6 +176,22 @@ def build_mcp_server(
         return await kernel.get_memory(request.tenant_id, request.memory_id)
 
     server.add_tool(_flattened(GetMemoryRequest, memory_get), annotations=_READ_ONLY)
+
+    async def memory_job(request: GetObservationJobRequest) -> ObservationProcessingJobView:
+        """Read how far one observation's processing has got.
+
+        `memory_observe` returns a `processing_job_id` because deriving memory from raw media
+        outlives the request that submitted it. This resolves that ID. Once `state` is
+        `succeeded`, `memory_ids` names exactly what the observation produced, so the derived
+        memories can be read directly rather than searched for.
+
+        `failed` settles this attempt, not the job: a stale-job sweep can retry it, and
+        `attempt` counts how often it has been claimed. Following every intermediate state as
+        a stream is REST-only; this tool answers one read at a time.
+        """
+        return await kernel.get_observation_job(request.tenant_id, request.job_id)
+
+    server.add_tool(_flattened(GetObservationJobRequest, memory_job), annotations=_READ_ONLY)
 
     async def memory_feedback(request: FeedbackRequest) -> FeedbackReceipt:
         """Record a useful, wrong, missing, or correction signal for future recall.

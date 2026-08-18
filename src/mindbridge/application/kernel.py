@@ -41,6 +41,7 @@ from mindbridge.contracts import (
     ForgetRequest,
     MediaObjectInput,
     MemoryResult,
+    MemoryWriteStatus,
     ObservationProcessingJobView,
     ObservationReceipt,
     ObservationStatus,
@@ -48,6 +49,7 @@ from mindbridge.contracts import (
     RecallRequest,
     RecallResult,
     RememberRequest,
+    RememberResult,
 )
 from mindbridge.core import (
     AnonymousIdentityObservation,
@@ -175,19 +177,19 @@ class MemoryKernel:
         )
 
     @overload
-    async def remember(self, request: RememberRequest) -> MemoryResult: ...
+    async def remember(self, request: RememberRequest) -> RememberResult: ...
 
     @overload
     async def remember(
         self,
         request: tuple[RememberRequest, ...],
-    ) -> tuple[MemoryResult, ...]: ...
+    ) -> tuple[RememberResult, ...]: ...
 
     @trace_operation("mindbridge.remember")
     async def remember(
         self,
         request: RememberRequest | tuple[RememberRequest, ...],
-    ) -> MemoryResult | tuple[MemoryResult, ...]:
+    ) -> RememberResult | tuple[RememberResult, ...]:
         """Persist explicit content without pretending unsupported input is fact.
 
         Takes one memory or a batch of them. A batch costs one encoder round trip
@@ -219,7 +221,7 @@ class MemoryKernel:
         # would queue behind itself inside the pool.
         semaphore = asyncio.Semaphore(_MAX_CONCURRENT_MEMORY_WRITES)
 
-        async def write(item: RememberRequest, embedding: Embedding) -> MemoryResult:
+        async def write(item: RememberRequest, embedding: Embedding) -> RememberResult:
             async with semaphore:
                 return await self._write_remembered(item, embedding)
 
@@ -237,7 +239,7 @@ class MemoryKernel:
         self,
         request: RememberRequest,
         embedding: Embedding,
-    ) -> MemoryResult:
+    ) -> RememberResult:
         idempotency_key = request.idempotency_key or f"remember_{_request_digest(request)}"
         memory = MemoryRecord(
             memory_id=MemoryId(derive_stable_id("memory", request.tenant_id, idempotency_key)),
@@ -261,7 +263,7 @@ class MemoryKernel:
             embedding,
             skip_existing=not result.created,
         )
-        return await self._memory_result(stored_memory)
+        return await self._remember_result(stored_memory, created=result.created)
 
     @trace_operation("mindbridge.record_feedback")
     async def record_feedback(self, request: FeedbackRequest) -> FeedbackReceipt:
@@ -493,6 +495,24 @@ class MemoryKernel:
             salience=original.salience,
             strength=original.strength,
             supersedes_memory_id=original.memory_id,
+        )
+
+    async def _remember_result(
+        self,
+        memory: MemoryRecord,
+        *,
+        created: bool,
+    ) -> RememberResult:
+        """Say whether this write stored the memory or matched one already under its key.
+
+        `observe` has always answered `accepted` or `duplicate`; a caller retrying `remember`
+        could only infer it from a memory_id it had seen before. The store already knows.
+        """
+        return RememberResult.model_validate(
+            (await self._memory_result(memory)).model_dump()
+            | {
+                "status": (MemoryWriteStatus.CREATED if created else MemoryWriteStatus.DUPLICATE),
+            }
         )
 
     async def _memory_result(self, memory: MemoryRecord) -> MemoryResult:

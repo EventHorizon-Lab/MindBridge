@@ -26,6 +26,7 @@ from mindbridge.contracts import (
     RecallRequest,
     RecallResult,
     RememberRequest,
+    RememberResult,
 )
 
 _Response = TypeVar("_Response", bound=ContractModel)
@@ -96,9 +97,9 @@ class MindBridge:
         """Submit one observation through the production API."""
         return await self._post("v1/observations", request, ObservationReceipt)
 
-    async def remember(self, request: RememberRequest) -> MemoryResult:
-        """Retain one explicit memory through the production API."""
-        return await self._post("v1/memories", request, MemoryResult)
+    async def remember(self, request: RememberRequest) -> RememberResult:
+        """Retain one explicit memory, reporting whether this call is what created it."""
+        return await self._post("v1/memories", request, RememberResult)
 
     async def record_feedback(self, request: FeedbackRequest) -> FeedbackReceipt:
         """Record one useful, wrong, missing, or correction signal."""

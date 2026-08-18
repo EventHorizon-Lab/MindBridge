@@ -6,6 +6,7 @@
         "description": "Stable ordered tombstones and the next cursor when another page exists.",
         "properties": {
           "items": {
+            "description": "This page of deletion barriers, in a stable order.",
             "items": {
               "$ref": "#/components/schemas/DeletionTombstoneView"
             },
@@ -23,9 +24,11 @@
                 "type": "null"
               }
             ],
+            "description": "Pass as `cursor` for the next page, or null when this page is the last.",
             "title": "Next Cursor"
           },
           "trace_id": {
+            "description": "Correlates this request with its telemetry.",
             "maxLength": 255,
             "minLength": 1,
             "title": "Trace Id",
@@ -65,6 +68,7 @@
                 "type": "null"
               }
             ],
+            "description": "When erasure finished propagating, or null while it has not.",
             "title": "Completed At"
           },
           "error_code": {
@@ -78,26 +82,32 @@
                 "type": "null"
               }
             ],
+            "description": "Why propagation stalled, or null when it has not.",
             "title": "Error Code"
           },
           "propagation_state": {
-            "$ref": "#/components/schemas/DeletionPropagationState"
+            "$ref": "#/components/schemas/DeletionPropagationState",
+            "description": "How far erasure has reached across storage and offline edge devices. Only `complete` means every copy is gone."
           },
           "requested_at": {
+            "description": "When erasure was requested.",
             "format": "date-time",
             "title": "Requested At",
             "type": "string"
           },
           "target_id": {
+            "description": "Which memory or observation was erased.",
             "maxLength": 255,
             "minLength": 1,
             "title": "Target Id",
             "type": "string"
           },
           "target_type": {
-            "$ref": "#/components/schemas/ForgetTargetType"
+            "$ref": "#/components/schemas/ForgetTargetType",
+            "description": "What was erased."
           },
           "tombstone_id": {
+            "description": "Stable ID of this deletion barrier, usable as a cursor.",
             "maxLength": 255,
             "minLength": 1,
             "title": "Tombstone Id",
@@ -121,6 +131,7 @@
         "description": "Stable error envelope with a reproducible trace identifier.",
         "properties": {
           "code": {
+            "description": "Stable error code; branch on this, not on the message.",
             "maxLength": 255,
             "minLength": 1,
             "title": "Code",
@@ -128,6 +139,7 @@
           },
           "issues": {
             "default": [],
+            "description": "Which fields were rejected, present when the request failed validation.",
             "items": {
               "$ref": "#/components/schemas/ValidationIssue"
             },
@@ -135,12 +147,14 @@
             "type": "array"
           },
           "message": {
+            "description": "One human-readable sentence about the failure.",
             "maxLength": 2048,
             "minLength": 1,
             "title": "Message",
             "type": "string"
           },
           "trace_id": {
+            "description": "Correlates this failure with its telemetry.",
             "maxLength": 255,
             "minLength": 1,
             "title": "Trace Id",
@@ -160,34 +174,40 @@
         "description": "Precise evidence location safe to expose to a caller.",
         "properties": {
           "end_ms": {
+            "description": "Span end within that media, in milliseconds.",
             "minimum": 0.0,
             "title": "End Ms",
             "type": "integer"
           },
           "evidence_id": {
+            "description": "Stable ID of this evidence span.",
             "maxLength": 255,
             "minLength": 1,
             "title": "Evidence Id",
             "type": "string"
           },
           "media_object_id": {
+            "description": "Media object the span was cut from.",
             "maxLength": 255,
             "minLength": 1,
             "title": "Media Object Id",
             "type": "string"
           },
           "media_url": {
+            "description": "Signed URL for the bytes, so verifying needs no separate storage call.",
             "maxLength": 2048,
             "minLength": 1,
             "title": "Media Url",
             "type": "string"
           },
           "media_url_expires_at": {
+            "description": "When `media_url` stops working; re-read the memory for a fresh one.",
             "format": "date-time",
             "title": "Media Url Expires At",
             "type": "string"
           },
           "start_ms": {
+            "description": "Span start within that media, in milliseconds.",
             "minimum": 0.0,
             "title": "Start Ms",
             "type": "integer"
@@ -219,21 +239,25 @@
                 "type": "null"
               }
             ],
+            "description": "The new version a `correction` created, which supersedes `memory_id`.",
             "title": "Corrected Memory Id"
           },
           "created_at": {
+            "description": "When the signal was recorded.",
             "format": "date-time",
             "title": "Created At",
             "type": "string"
           },
           "feedback_id": {
+            "description": "Stable ID of the recorded signal.",
             "maxLength": 255,
             "minLength": 1,
             "title": "Feedback Id",
             "type": "string"
           },
           "feedback_type": {
-            "$ref": "#/components/schemas/FeedbackType"
+            "$ref": "#/components/schemas/FeedbackType",
+            "description": "The signal that was recorded."
           },
           "memory_id": {
             "anyOf": [
@@ -246,6 +270,7 @@
                 "type": "null"
               }
             ],
+            "description": "Memory that was judged, when one was.",
             "title": "Memory Id"
           },
           "resulting_state": {
@@ -256,7 +281,8 @@
               {
                 "type": "null"
               }
-            ]
+            ],
+            "description": "Lifecycle state the judged memory now holds; null when none was judged."
           },
           "resulting_strength": {
             "anyOf": [
@@ -267,9 +293,11 @@
                 "type": "null"
               }
             ],
+            "description": "Retention score the memory now holds, always paired with `resulting_state`.",
             "title": "Resulting Strength"
           },
           "trace_id": {
+            "description": "Correlates this request with its telemetry.",
             "maxLength": 255,
             "minLength": 1,
             "title": "Trace Id",
@@ -304,10 +332,12 @@
                 "type": "null"
               }
             ],
+            "description": "What the memory should have said. Required for `correction` and rejected for every other type; it supersedes the original with a new version.",
             "title": "Correction Summary"
           },
           "feedback_type": {
-            "$ref": "#/components/schemas/FeedbackType"
+            "$ref": "#/components/schemas/FeedbackType",
+            "description": "Which signal this is, and therefore which other fields are required. `useful`, `wrong`, and `correction` each judge one memory and need `memory_id`; `missing` reports that a recall found nothing usable and needs `recall_trace_id` instead."
           },
           "idempotency_key": {
             "anyOf": [
@@ -320,6 +350,7 @@
                 "type": "null"
               }
             ],
+            "description": "Makes a retry safe; derived from the content when omitted.",
             "title": "Idempotency Key"
           },
           "memory_id": {
@@ -333,6 +364,7 @@
                 "type": "null"
               }
             ],
+            "description": "The memory being judged. Required for `useful`, `wrong`, and `correction`; must be omitted for `missing`, which is about a recall rather than a memory.",
             "title": "Memory Id"
           },
           "recall_trace_id": {
@@ -346,9 +378,11 @@
                 "type": "null"
               }
             ],
+            "description": "The `trace_id` of the recall this judges. Required for `missing`, which is how a retrieval failure is tied back to what was asked.",
             "title": "Recall Trace Id"
           },
           "tenant_id": {
+            "description": "Tenant that owns the memory or recall being judged.",
             "maxLength": 255,
             "minLength": 1,
             "title": "Tenant Id",
@@ -387,6 +421,7 @@
                 "type": "null"
               }
             ],
+            "description": "When erasure finished propagating, or null while it has not.",
             "title": "Completed At"
           },
           "error_code": {
@@ -400,32 +435,39 @@
                 "type": "null"
               }
             ],
+            "description": "Why propagation stalled, or null when it has not.",
             "title": "Error Code"
           },
           "propagation_state": {
-            "$ref": "#/components/schemas/DeletionPropagationState"
+            "$ref": "#/components/schemas/DeletionPropagationState",
+            "description": "How far erasure has reached across storage and offline edge devices. Only `complete` means every copy is gone."
           },
           "requested_at": {
+            "description": "When erasure was requested.",
             "format": "date-time",
             "title": "Requested At",
             "type": "string"
           },
           "target_id": {
+            "description": "Which memory or observation was erased.",
             "maxLength": 255,
             "minLength": 1,
             "title": "Target Id",
             "type": "string"
           },
           "target_type": {
-            "$ref": "#/components/schemas/ForgetTargetType"
+            "$ref": "#/components/schemas/ForgetTargetType",
+            "description": "What was erased."
           },
           "tombstone_id": {
+            "description": "Stable ID of this deletion barrier, usable as a cursor.",
             "maxLength": 255,
             "minLength": 1,
             "title": "Tombstone Id",
             "type": "string"
           },
           "trace_id": {
+            "description": "Correlates this request with its telemetry.",
             "maxLength": 255,
             "minLength": 1,
             "title": "Trace Id",
@@ -460,18 +502,22 @@
                 "type": "null"
               }
             ],
+            "description": "Makes a retry safe; forget is idempotent either way.",
             "title": "Idempotency Key"
           },
           "target_id": {
+            "description": "Exact memory or observation ID to erase.",
             "maxLength": 255,
             "minLength": 1,
             "title": "Target Id",
             "type": "string"
           },
           "target_type": {
-            "$ref": "#/components/schemas/ForgetTargetType"
+            "$ref": "#/components/schemas/ForgetTargetType",
+            "description": "What `target_id` names: `memory_record` erases that one memory, `observation` erases a source observation and everything derived from it."
           },
           "tenant_id": {
+            "description": "Tenant that owns the target.",
             "maxLength": 255,
             "minLength": 1,
             "title": "Tenant Id",
@@ -501,10 +547,12 @@
         "properties": {
           "status": {
             "default": "ok",
+            "description": "Liveness only; it makes no claim about dependency readiness.",
             "title": "Status",
             "type": "string"
           },
           "trace_id": {
+            "description": "Correlates this request with its telemetry.",
             "maxLength": 255,
             "minLength": 1,
             "title": "Trace Id",
@@ -531,32 +579,38 @@
         "description": "Anonymous edge identity metadata with no face or voice embedding.",
         "properties": {
           "confidence": {
+            "description": "The edge detector's own confidence in this span.",
             "maximum": 1.0,
             "minimum": 0.0,
             "title": "Confidence",
             "type": "number"
           },
           "end_ms": {
+            "description": "Span end, in milliseconds from the observation's start. Must not precede `start_ms`, and must fall inside the observation's own span.",
             "minimum": 0.0,
             "title": "End Ms",
             "type": "integer"
           },
           "identity_id": {
+            "description": "Device-local identity this span belongs to; never a face or voice template.",
             "maxLength": 255,
             "minLength": 1,
             "title": "Identity Id",
             "type": "string"
           },
           "kind": {
-            "$ref": "#/components/schemas/IdentityKind"
+            "$ref": "#/components/schemas/IdentityKind",
+            "description": "Signal that produced the span; gates `transcript` and `visual_bbox_xyxy`."
           },
           "model_id": {
+            "description": "Edge model that produced the span, recorded for provenance.",
             "maxLength": 255,
             "minLength": 1,
             "title": "Model Id",
             "type": "string"
           },
           "model_revision": {
+            "description": "Exact revision of `model_id`, so a re-identification can be reproduced.",
             "maxLength": 255,
             "minLength": 1,
             "title": "Model Revision",
@@ -564,9 +618,11 @@
           },
           "scope": {
             "$ref": "#/components/schemas/IdentityScope",
-            "default": "device"
+            "default": "device",
+            "description": "How far `identity_id` is meaningful; device-local unless promoted."
           },
           "start_ms": {
+            "description": "Span start, in milliseconds from the observation's start.",
             "minimum": 0.0,
             "title": "Start Ms",
             "type": "integer"
@@ -582,6 +638,7 @@
                 "type": "null"
               }
             ],
+            "description": "What was said in this span. Valid only when `kind` is `voice`; all transcripts in one observation together may not exceed 65,536 characters.",
             "title": "Transcript"
           },
           "visual_bbox_xyxy": {
@@ -617,6 +674,7 @@
                 "type": "null"
               }
             ],
+            "description": "Where the face sits, as 0..1 normalized `(left, top, right, bottom)` — not pixels. Valid only when `kind` is `face`, and must have positive width and height.",
             "title": "Visual Bbox Xyxy"
           }
         },
@@ -667,6 +725,7 @@
         "description": "Metadata for an already addressable evidence object.",
         "properties": {
           "created_at": {
+            "description": "When this media was captured, not when it was uploaded.",
             "format": "date-time",
             "title": "Created At",
             "type": "string"
@@ -682,29 +741,35 @@
                 "type": "null"
               }
             ],
+            "description": "Playable length for time-based media; must not exceed the observation's own `occurred_at`-to-`ended_at` span. Omit for a still image.",
             "title": "Duration Ms"
           },
           "kind": {
-            "$ref": "#/components/schemas/MediaKind"
+            "$ref": "#/components/schemas/MediaKind",
+            "description": "Modality routing trusts; must not contradict the URI's extension."
           },
           "media_object_id": {
+            "description": "Caller-assigned ID for this object, unique within the observation.",
             "maxLength": 255,
             "minLength": 1,
             "title": "Media Object Id",
             "type": "string"
           },
           "sha256": {
+            "description": "Hex digest of the exact bytes at `uri`, used to detect a mismatch.",
             "pattern": "^[0-9a-fA-F]{64}$",
             "title": "Sha256",
             "type": "string"
           },
           "size_bytes": {
+            "description": "Byte length of the object at `uri`.",
             "maximum": 9.223372036854776e+18,
             "minimum": 0.0,
             "title": "Size Bytes",
             "type": "integer"
           },
           "uri": {
+            "description": "Where the bytes already live, as `s3://<bucket>/tenants/<tenant_id>/<key>`. MindBridge reads this object; it does not accept an upload.",
             "maxLength": 2048,
             "minLength": 1,
             "title": "Uri",
@@ -727,17 +792,20 @@
         "description": "Top-level memory response with directly inspectable evidence.",
         "properties": {
           "created_at": {
+            "description": "When MindBridge retained this version.",
             "format": "date-time",
             "title": "Created At",
             "type": "string"
           },
           "ended_at": {
+            "description": "When the remembered events ended.",
             "format": "date-time",
             "title": "Ended At",
             "type": "string"
           },
           "evidence": {
             "default": [],
+            "description": "Signed evidence for this memory, attached rather than referenced.",
             "items": {
               "$ref": "#/components/schemas/EvidenceView"
             },
@@ -745,6 +813,7 @@
             "type": "array"
           },
           "evidence_ids": {
+            "description": "Evidence spans grounding this memory.",
             "items": {
               "maxLength": 255,
               "minLength": 1,
@@ -763,50 +832,60 @@
                 "type": "null"
               }
             ],
+            "description": "When it was last recalled, or null if never.",
             "title": "Last Accessed At"
           },
           "memory_id": {
+            "description": "Stable ID; pass it to a read or a follow-up.",
             "maxLength": 255,
             "minLength": 1,
             "title": "Memory Id",
             "type": "string"
           },
           "memory_type": {
-            "$ref": "#/components/schemas/MemoryType"
+            "$ref": "#/components/schemas/MemoryType",
+            "description": "The role this memory serves."
           },
           "negative_feedback_count": {
             "default": 0,
+            "description": "How often it was reported wrong.",
             "minimum": 0.0,
             "title": "Negative Feedback Count",
             "type": "integer"
           },
           "occurred_at": {
+            "description": "When the remembered events began.",
             "format": "date-time",
             "title": "Occurred At",
             "type": "string"
           },
           "positive_feedback_count": {
             "default": 0,
+            "description": "How often it was reported correct.",
             "minimum": 0.0,
             "title": "Positive Feedback Count",
             "type": "integer"
           },
           "salience": {
             "default": 0.5,
+            "description": "How important this memory is judged to be.",
             "maximum": 1.0,
             "minimum": 0.0,
             "title": "Salience",
             "type": "number"
           },
           "state": {
-            "$ref": "#/components/schemas/MemoryState"
+            "$ref": "#/components/schemas/MemoryState",
+            "description": "Where this memory sits in its lifecycle, from active through compressed."
           },
           "strength": {
             "default": 0.5,
+            "description": "Retention score, raised by useful access and lowered by decay.",
             "title": "Strength",
             "type": "number"
           },
           "summary": {
+            "description": "What is remembered, in words.",
             "maxLength": 2048,
             "minLength": 1,
             "title": "Summary",
@@ -822,6 +901,7 @@
                 "type": "null"
               }
             ],
+            "description": "When a later version replaced this one; null while it is current.",
             "title": "Superseded At"
           },
           "supersedes_memory_id": {
@@ -835,9 +915,11 @@
                 "type": "null"
               }
             ],
+            "description": "The earlier version this one replaced, when it is a correction.",
             "title": "Supersedes Memory Id"
           },
           "trace_id": {
+            "description": "Correlates this request with its telemetry.",
             "maxLength": 255,
             "minLength": 1,
             "title": "Trace Id",
@@ -845,12 +927,14 @@
           },
           "useful_access_count": {
             "default": 0,
+            "description": "How often recalling this memory proved useful.",
             "minimum": 0.0,
             "title": "Useful Access Count",
             "type": "integer"
           },
           "verification_status": {
-            "$ref": "#/components/schemas/VerificationStatus"
+            "$ref": "#/components/schemas/VerificationStatus",
+            "description": "How the content was established: whether original media was inspected, or the content was only attested by its writer."
           }
         },
         "required": [
@@ -897,16 +981,19 @@
         "description": "Serializable stable view of a retained memory.",
         "properties": {
           "created_at": {
+            "description": "When MindBridge retained this version.",
             "format": "date-time",
             "title": "Created At",
             "type": "string"
           },
           "ended_at": {
+            "description": "When the remembered events ended.",
             "format": "date-time",
             "title": "Ended At",
             "type": "string"
           },
           "evidence_ids": {
+            "description": "Evidence spans grounding this memory.",
             "items": {
               "maxLength": 255,
               "minLength": 1,
@@ -925,50 +1012,60 @@
                 "type": "null"
               }
             ],
+            "description": "When it was last recalled, or null if never.",
             "title": "Last Accessed At"
           },
           "memory_id": {
+            "description": "Stable ID; pass it to a read or a follow-up.",
             "maxLength": 255,
             "minLength": 1,
             "title": "Memory Id",
             "type": "string"
           },
           "memory_type": {
-            "$ref": "#/components/schemas/MemoryType"
+            "$ref": "#/components/schemas/MemoryType",
+            "description": "The role this memory serves."
           },
           "negative_feedback_count": {
             "default": 0,
+            "description": "How often it was reported wrong.",
             "minimum": 0.0,
             "title": "Negative Feedback Count",
             "type": "integer"
           },
           "occurred_at": {
+            "description": "When the remembered events began.",
             "format": "date-time",
             "title": "Occurred At",
             "type": "string"
           },
           "positive_feedback_count": {
             "default": 0,
+            "description": "How often it was reported correct.",
             "minimum": 0.0,
             "title": "Positive Feedback Count",
             "type": "integer"
           },
           "salience": {
             "default": 0.5,
+            "description": "How important this memory is judged to be.",
             "maximum": 1.0,
             "minimum": 0.0,
             "title": "Salience",
             "type": "number"
           },
           "state": {
-            "$ref": "#/components/schemas/MemoryState"
+            "$ref": "#/components/schemas/MemoryState",
+            "description": "Where this memory sits in its lifecycle, from active through compressed."
           },
           "strength": {
             "default": 0.5,
+            "description": "Retention score, raised by useful access and lowered by decay.",
             "title": "Strength",
             "type": "number"
           },
           "summary": {
+            "description": "What is remembered, in words.",
             "maxLength": 2048,
             "minLength": 1,
             "title": "Summary",
@@ -984,6 +1081,7 @@
                 "type": "null"
               }
             ],
+            "description": "When a later version replaced this one; null while it is current.",
             "title": "Superseded At"
           },
           "supersedes_memory_id": {
@@ -997,16 +1095,19 @@
                 "type": "null"
               }
             ],
+            "description": "The earlier version this one replaced, when it is a correction.",
             "title": "Supersedes Memory Id"
           },
           "useful_access_count": {
             "default": 0,
+            "description": "How often recalling this memory proved useful.",
             "minimum": 0.0,
             "title": "Useful Access Count",
             "type": "integer"
           },
           "verification_status": {
-            "$ref": "#/components/schemas/VerificationStatus"
+            "$ref": "#/components/schemas/VerificationStatus",
+            "description": "How the content was established: whether original media was inspected, or the content was only attested by its writer."
           }
         },
         "required": [
@@ -1023,16 +1124,27 @@
         "title": "MemoryView",
         "type": "object"
       },
+      "MemoryWriteStatus": {
+        "description": "Whether an explicit write stored new content or matched an earlier one.",
+        "enum": [
+          "created",
+          "duplicate"
+        ],
+        "title": "MemoryWriteStatus",
+        "type": "string"
+      },
       "ObservationProcessingJobView": {
         "additionalProperties": false,
         "description": "Public state of one durable observation processing job.",
         "properties": {
           "attempt": {
+            "description": "How many times this job has been claimed.",
             "minimum": 0.0,
             "title": "Attempt",
             "type": "integer"
           },
           "created_at": {
+            "description": "When the job was enqueued.",
             "format": "date-time",
             "title": "Created At",
             "type": "string"
@@ -1048,9 +1160,11 @@
                 "type": "null"
               }
             ],
+            "description": "Why the last attempt failed, or null when none has.",
             "title": "Error Code"
           },
           "job_id": {
+            "description": "The job this state belongs to.",
             "maxLength": 255,
             "minLength": 1,
             "title": "Job Id",
@@ -1058,6 +1172,7 @@
           },
           "memory_ids": {
             "default": [],
+            "description": "Memories this job derived, unique and present only once `state` is `succeeded`. Read them directly instead of searching for what was just written.",
             "items": {
               "maxLength": 255,
               "minLength": 1,
@@ -1067,21 +1182,25 @@
             "type": "array"
           },
           "observation_id": {
+            "description": "Observation this job derives memory from.",
             "maxLength": 255,
             "minLength": 1,
             "title": "Observation Id",
             "type": "string"
           },
           "state": {
-            "$ref": "#/components/schemas/JobState"
+            "$ref": "#/components/schemas/JobState",
+            "description": "`pending`, `running`, `succeeded`, or `failed`. A `failed` attempt can still be retried by the stale-job sweep, so it settles the attempt, not the job."
           },
           "trace_id": {
+            "description": "Correlates this read with its telemetry.",
             "maxLength": 255,
             "minLength": 1,
             "title": "Trace Id",
             "type": "string"
           },
           "updated_at": {
+            "description": "When this state was written; the only value on the row that always rises.",
             "format": "date-time",
             "title": "Updated At",
             "type": "string"
@@ -1106,6 +1225,7 @@
         "properties": {
           "evidence_ids": {
             "default": [],
+            "description": "Evidence spans registered synchronously, before any derivation ran.",
             "items": {
               "maxLength": 255,
               "minLength": 1,
@@ -1115,27 +1235,32 @@
             "type": "array"
           },
           "idempotency_key": {
+            "description": "The key this write was recorded under, supplied or derived.",
             "maxLength": 255,
             "minLength": 1,
             "title": "Idempotency Key",
             "type": "string"
           },
           "observation_id": {
+            "description": "Stable ID of the stored observation.",
             "maxLength": 255,
             "minLength": 1,
             "title": "Observation Id",
             "type": "string"
           },
           "processing_job_id": {
+            "description": "The durable job deriving memory from this observation. Read it until it reaches `succeeded`; memory does not exist yet when this receipt returns.",
             "maxLength": 255,
             "minLength": 1,
             "title": "Processing Job Id",
             "type": "string"
           },
           "status": {
-            "$ref": "#/components/schemas/ObservationStatus"
+            "$ref": "#/components/schemas/ObservationStatus",
+            "description": "`accepted` for a first write, `duplicate` when a retry matched an earlier one."
           },
           "trace_id": {
+            "description": "Correlates this request with its telemetry.",
             "maxLength": 255,
             "minLength": 1,
             "title": "Trace Id",
@@ -1166,6 +1291,7 @@
         "description": "Submit one timestamped device observation and its media metadata.",
         "properties": {
           "boot_id": {
+            "description": "Changes on every device restart, so `sequence` need not survive one.",
             "maxLength": 255,
             "minLength": 1,
             "title": "Boot Id",
@@ -1173,18 +1299,21 @@
           },
           "clock_offset_ms": {
             "default": 0,
+            "description": "Known device clock skew, so a drifting edge clock stays reconcilable.",
             "maximum": 2147483647.0,
             "minimum": -2147483648.0,
             "title": "Clock Offset Ms",
             "type": "integer"
           },
           "device_id": {
+            "description": "Device that captured this observation.",
             "maxLength": 255,
             "minLength": 1,
             "title": "Device Id",
             "type": "string"
           },
           "ended_at": {
+            "description": "When the observed events ended; must not precede `occurred_at`.",
             "format": "date-time",
             "title": "Ended At",
             "type": "string"
@@ -1200,10 +1329,12 @@
                 "type": "null"
               }
             ],
+            "description": "Makes a retry safe. Omit it and one is derived from the content, so an identical resend answers `duplicate` instead of storing a second copy.",
             "title": "Idempotency Key"
           },
           "identity_observations": {
             "default": [],
+            "description": "Anonymous face and voice spans found on the edge, at most 512. The same identity, kind, span, and model must not appear twice.",
             "items": {
               "$ref": "#/components/schemas/IdentityObservationInput"
             },
@@ -1212,6 +1343,7 @@
             "type": "array"
           },
           "media_objects": {
+            "description": "The already-stored evidence this observation refers to, at most 8. `media_object_id` must not repeat.",
             "items": {
               "$ref": "#/components/schemas/MediaObjectInput"
             },
@@ -1221,25 +1353,30 @@
             "type": "array"
           },
           "observed_at": {
+            "description": "When the device recorded them, which may trail `ended_at`.",
             "format": "date-time",
             "title": "Observed At",
             "type": "string"
           },
           "occurred_at": {
+            "description": "When the observed events began.",
             "format": "date-time",
             "title": "Occurred At",
             "type": "string"
           },
           "sensor": {
-            "$ref": "#/components/schemas/SensorKind"
+            "$ref": "#/components/schemas/SensorKind",
+            "description": "Which sensor produced this observation."
           },
           "sequence": {
+            "description": "Monotonic counter within one `boot_id`, used to order and deduplicate.",
             "maximum": 9.223372036854776e+18,
             "minimum": 0.0,
             "title": "Sequence",
             "type": "integer"
           },
           "tenant_id": {
+            "description": "Tenant that owns the resulting memory; must be one this key authorizes.",
             "maxLength": 255,
             "minLength": 1,
             "title": "Tenant Id",
@@ -1266,6 +1403,7 @@
         "properties": {
           "device_ids": {
             "default": [],
+            "description": "Keep only memories captured by these devices.",
             "items": {
               "maxLength": 255,
               "minLength": 1,
@@ -1277,6 +1415,7 @@
           },
           "memory_types": {
             "default": [],
+            "description": "Keep only these memory types.",
             "items": {
               "$ref": "#/components/schemas/MemoryType"
             },
@@ -1294,6 +1433,7 @@
                 "type": "null"
               }
             ],
+            "description": "Keep only memories occurring at or after this moment.",
             "title": "Occurred After"
           },
           "occurred_before": {
@@ -1306,10 +1446,12 @@
                 "type": "null"
               }
             ],
+            "description": "Keep only memories occurring at or before this moment; must not precede `occurred_after`.",
             "title": "Occurred Before"
           },
           "person_ids": {
             "default": [],
+            "description": "Keep only memories involving these people.",
             "items": {
               "maxLength": 255,
               "minLength": 1,
@@ -1339,6 +1481,7 @@
         "properties": {
           "media_object_ids": {
             "default": [],
+            "description": "Stored media to search by, at most 8 and without repeats — an image or clip stands in for the query itself. Required unless `text` is given.",
             "items": {
               "maxLength": 255,
               "minLength": 1,
@@ -1359,6 +1502,7 @@
                 "type": "null"
               }
             ],
+            "description": "What to look for, in words. Required unless `media_object_ids` is given.",
             "title": "Text"
           }
         },
@@ -1370,15 +1514,18 @@
         "description": "Recall relevant memories and, by default, their evidence.",
         "properties": {
           "filters": {
-            "$ref": "#/components/schemas/RecallFilters"
+            "$ref": "#/components/schemas/RecallFilters",
+            "description": "Structured constraints applied before ranking, not after it."
           },
           "include_evidence": {
             "default": true,
+            "description": "Return the evidence needed to verify the answer; on by default.",
             "title": "Include Evidence",
             "type": "boolean"
           },
           "limit": {
             "default": 20,
+            "description": "Maximum memories to return.",
             "maximum": 100.0,
             "minimum": 1.0,
             "title": "Limit",
@@ -1386,6 +1533,7 @@
           },
           "memory_ids": {
             "default": [],
+            "description": "Restrict the search to exactly these memories, at most 100 and without repeats — this is how a grounded follow-up reuses IDs from a previous result. It is a strict scope, not a ranking hint.",
             "items": {
               "maxLength": 255,
               "minLength": 1,
@@ -1397,12 +1545,15 @@
           },
           "mode": {
             "$ref": "#/components/schemas/RecallMode",
-            "default": "answer"
+            "default": "answer",
+            "description": "What work to do. `answer` reasons over the retrieved memories and fills `answer`. `search` ranks and returns memories, leaving `answer` null. `enumerate` scans the complete filter scope for count and timeline questions and fails rather than silently truncating an oversized one."
           },
           "query": {
-            "$ref": "#/components/schemas/RecallQuery"
+            "$ref": "#/components/schemas/RecallQuery",
+            "description": "What to look for, as text, media, or both."
           },
           "tenant_id": {
+            "description": "Tenant whose memory to search.",
             "maxLength": 255,
             "minLength": 1,
             "title": "Tenant Id",
@@ -1429,15 +1580,18 @@
                 "type": "null"
               }
             ],
+            "description": "The answer, or null in `search` mode and when nothing supports one.",
             "title": "Answer"
           },
           "confidence": {
+            "description": "How well the retrieved evidence supports `answer`.",
             "maximum": 1.0,
             "minimum": 0.0,
             "title": "Confidence",
             "type": "number"
           },
           "evidence": {
+            "description": "Signed original media behind those memories, so the answer is checkable.",
             "items": {
               "$ref": "#/components/schemas/EvidenceView"
             },
@@ -1445,6 +1599,7 @@
             "type": "array"
           },
           "memories": {
+            "description": "Memories the answer rests on; pass their IDs back for a follow-up.",
             "items": {
               "$ref": "#/components/schemas/MemoryView"
             },
@@ -1452,6 +1607,7 @@
             "type": "array"
           },
           "trace_id": {
+            "description": "Correlates this recall with its telemetry, and names it to `missing` feedback.",
             "maxLength": 255,
             "minLength": 1,
             "title": "Trace Id",
@@ -1482,10 +1638,12 @@
                 "type": "null"
               }
             ],
+            "description": "End of the span; defaults to `occurred_at` and must not precede it.",
             "title": "Ended At"
           },
           "evidence_ids": {
             "default": [],
+            "description": "Existing evidence spans grounding this memory, at most 100 and without repeats. Leave empty for content with no stored media behind it.",
             "items": {
               "maxLength": 255,
               "minLength": 1,
@@ -1506,23 +1664,28 @@
                 "type": "null"
               }
             ],
+            "description": "Makes a retry safe. Omit it and one is derived from the content, so an identical resend returns `duplicate` with the same memory rather than a second copy.",
             "title": "Idempotency Key"
           },
           "memory_type": {
-            "$ref": "#/components/schemas/MemoryType"
+            "$ref": "#/components/schemas/MemoryType",
+            "description": "The role this content will serve: `episodic` for something that happened at a time, `semantic` for a durable fact, `procedural` for how to do something, `prospective` for a future intention, `working` for short-lived task state, `perceptual` for a raw sensory detail."
           },
           "occurred_at": {
+            "description": "When the content is about, which is not necessarily now.",
             "format": "date-time",
             "title": "Occurred At",
             "type": "string"
           },
           "summary": {
+            "description": "The content to retain, written so it stays useful out of context.",
             "maxLength": 2048,
             "minLength": 1,
             "title": "Summary",
             "type": "string"
           },
           "tenant_id": {
+            "description": "Tenant that will own the memory; must be one this key authorizes.",
             "maxLength": 255,
             "minLength": 1,
             "title": "Tenant Id",
@@ -1536,6 +1699,176 @@
           "occurred_at"
         ],
         "title": "RememberRequest",
+        "type": "object"
+      },
+      "RememberResult": {
+        "additionalProperties": false,
+        "description": "One retained memory and whether this request is what created it.",
+        "properties": {
+          "created_at": {
+            "description": "When MindBridge retained this version.",
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "ended_at": {
+            "description": "When the remembered events ended.",
+            "format": "date-time",
+            "title": "Ended At",
+            "type": "string"
+          },
+          "evidence": {
+            "default": [],
+            "description": "Signed evidence for this memory, attached rather than referenced.",
+            "items": {
+              "$ref": "#/components/schemas/EvidenceView"
+            },
+            "title": "Evidence",
+            "type": "array"
+          },
+          "evidence_ids": {
+            "description": "Evidence spans grounding this memory.",
+            "items": {
+              "maxLength": 255,
+              "minLength": 1,
+              "type": "string"
+            },
+            "title": "Evidence Ids",
+            "type": "array"
+          },
+          "last_accessed_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "When it was last recalled, or null if never.",
+            "title": "Last Accessed At"
+          },
+          "memory_id": {
+            "description": "Stable ID; pass it to a read or a follow-up.",
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Memory Id",
+            "type": "string"
+          },
+          "memory_type": {
+            "$ref": "#/components/schemas/MemoryType",
+            "description": "The role this memory serves."
+          },
+          "negative_feedback_count": {
+            "default": 0,
+            "description": "How often it was reported wrong.",
+            "minimum": 0.0,
+            "title": "Negative Feedback Count",
+            "type": "integer"
+          },
+          "occurred_at": {
+            "description": "When the remembered events began.",
+            "format": "date-time",
+            "title": "Occurred At",
+            "type": "string"
+          },
+          "positive_feedback_count": {
+            "default": 0,
+            "description": "How often it was reported correct.",
+            "minimum": 0.0,
+            "title": "Positive Feedback Count",
+            "type": "integer"
+          },
+          "salience": {
+            "default": 0.5,
+            "description": "How important this memory is judged to be.",
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Salience",
+            "type": "number"
+          },
+          "state": {
+            "$ref": "#/components/schemas/MemoryState",
+            "description": "Where this memory sits in its lifecycle, from active through compressed."
+          },
+          "status": {
+            "$ref": "#/components/schemas/MemoryWriteStatus",
+            "description": "`created` when this request stored the memory, `duplicate` when an earlier write under the same idempotency key already had. The memory returned is the same either way, so a retry is safe without being silent."
+          },
+          "strength": {
+            "default": 0.5,
+            "description": "Retention score, raised by useful access and lowered by decay.",
+            "title": "Strength",
+            "type": "number"
+          },
+          "summary": {
+            "description": "What is remembered, in words.",
+            "maxLength": 2048,
+            "minLength": 1,
+            "title": "Summary",
+            "type": "string"
+          },
+          "superseded_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "When a later version replaced this one; null while it is current.",
+            "title": "Superseded At"
+          },
+          "supersedes_memory_id": {
+            "anyOf": [
+              {
+                "maxLength": 255,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The earlier version this one replaced, when it is a correction.",
+            "title": "Supersedes Memory Id"
+          },
+          "trace_id": {
+            "description": "Correlates this request with its telemetry.",
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Trace Id",
+            "type": "string"
+          },
+          "useful_access_count": {
+            "default": 0,
+            "description": "How often recalling this memory proved useful.",
+            "minimum": 0.0,
+            "title": "Useful Access Count",
+            "type": "integer"
+          },
+          "verification_status": {
+            "$ref": "#/components/schemas/VerificationStatus",
+            "description": "How the content was established: whether original media was inspected, or the content was only attested by its writer."
+          }
+        },
+        "required": [
+          "memory_id",
+          "memory_type",
+          "summary",
+          "evidence_ids",
+          "occurred_at",
+          "ended_at",
+          "created_at",
+          "verification_status",
+          "state",
+          "trace_id",
+          "status"
+        ],
+        "title": "RememberResult",
         "type": "object"
       },
       "SensorKind": {
@@ -1552,12 +1885,14 @@
         "description": "One sanitized request validation failure.",
         "properties": {
           "code": {
+            "description": "Machine-readable kind of validation failure.",
             "maxLength": 255,
             "minLength": 1,
             "title": "Code",
             "type": "string"
           },
           "location": {
+            "description": "Path to the rejected field within the request.",
             "items": {
               "type": "string"
             },
@@ -1565,6 +1900,7 @@
             "type": "array"
           },
           "message": {
+            "description": "What was wrong with it.",
             "maxLength": 2048,
             "minLength": 1,
             "title": "Message",
@@ -2242,7 +2578,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/MemoryResult"
+                  "$ref": "#/components/schemas/RememberResult"
                 }
               }
             },
