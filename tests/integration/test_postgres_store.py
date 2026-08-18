@@ -22,6 +22,7 @@ from mindbridge.contracts import (
     FeedbackRequest,
     IdentityObservationInput,
     MediaObjectInput,
+    MemoryResult,
     ObservationStatus,
     ObserveRequest,
     RecallFilters,
@@ -436,7 +437,9 @@ async def test_postgres_round_trips_attested_source_memory(store: PostgresMemory
                 "trace_id": memory.trace_id,
             }
         )
-        == memory
+        # `remember` reports the write's own `status` beside the memory and a read has no such
+        # field, so what the two must agree on is the memory they share.
+        == MemoryResult.model_validate(memory.model_dump(exclude={"status"}))
     )
     assert found.trace_id.startswith("trace_")
     assert found.useful_access_count == 1

@@ -28,6 +28,7 @@ from mindbridge.contracts import (
     IdentityObservationInput,
     MediaObjectInput,
     MemoryResult,
+    MemoryWriteStatus,
     ObservationStatus,
     ObserveRequest,
     RecallMode,
@@ -866,7 +867,11 @@ async def test_observe_remember_recall_returns_openable_evidence() -> None:
 
 
 async def test_remember_retry_returns_original_record() -> None:
-    """A retry cannot replace the system creation time of an existing memory."""
+    """A retry cannot replace the system creation time of an existing memory.
+
+    It also has to say that it was a retry: the store knows, and a caller that can only infer
+    it from a memory_id it happens to recognize cannot tell a retry from a fresh write.
+    """
     store = InMemoryStore()
     embedder = RecordingEmbedder()
     request = _remember_request(idempotency_key="remember-01")
@@ -884,6 +889,8 @@ async def test_remember_retry_returns_original_record() -> None:
     assert retry.memory_id == first.memory_id
     assert retry.created_at == NOW
     assert embedder.memory_documents == [request.summary, request.summary]
+    assert first.status is MemoryWriteStatus.CREATED
+    assert retry.status is MemoryWriteStatus.DUPLICATE
 
 
 async def test_remember_indexes_one_pinned_memory_document() -> None:

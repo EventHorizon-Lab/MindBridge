@@ -13,6 +13,7 @@ from fastapi import Security
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import TypeAdapter, ValidationError
 
+from mindbridge.api.errors import ERRORS
 from mindbridge.contracts import Identifier
 
 _BEARER = HTTPBearer(auto_error=False)
@@ -28,13 +29,16 @@ class TenantPrincipal:
 
 
 class AuthenticationError(Exception):
-    """A sanitized authentication or tenant-authorization failure."""
+    """A sanitized authentication or tenant-authorization failure.
 
-    def __init__(self, *, status_code: int, code: str, message: str) -> None:
-        super().__init__(message)
-        self.status_code = status_code
+    The code is the whole payload: its status and its caller-visible sentence both come from
+    the one table in `mindbridge.api.errors`, so a raise site cannot describe a failure the
+    OpenAPI document does not.
+    """
+
+    def __init__(self, code: str) -> None:
+        super().__init__(ERRORS[code].description)
         self.code = code
-        self.message = message
 
 
 class TenantApiKeyAuthenticator:
@@ -84,33 +88,21 @@ class TenantApiKeyAuthenticator:
         credentials: Annotated[HTTPAuthorizationCredentials | None, Security(_BEARER)],
     ) -> TenantPrincipal:
         if credentials is None:
-            raise AuthenticationError(
-                status_code=401,
-                code="authentication_required",
-                message="a valid bearer API key is required",
-            )
+            raise AuthenticationError("authentication_required")
         candidate = hashlib.sha256(credentials.credentials.encode()).digest()
         tenant_ids = None
         for known_digest, known_tenant_ids in self._credentials:
             if hmac.compare_digest(candidate, known_digest):
                 tenant_ids = known_tenant_ids
         if tenant_ids is None:
-            raise AuthenticationError(
-                status_code=401,
-                code="authentication_failed",
-                message="the bearer API key is invalid",
-            )
+            raise AuthenticationError("authentication_failed")
         return TenantPrincipal(tenant_ids)
 
 
 def require_tenant(principal: TenantPrincipal, tenant_id: str) -> None:
     """Reject cross-tenant identifiers before a use case reaches storage."""
     if tenant_id not in principal.tenant_ids:
-        raise AuthenticationError(
-            status_code=403,
-            code="tenant_access_denied",
-            message="the authenticated tenant cannot access this resource",
-        )
+        raise AuthenticationError("tenant_access_denied")
 
 
 def _validated_tenant_id(value: object) -> str:

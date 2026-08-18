@@ -902,13 +902,24 @@ MindBridge 对外只暴露少量稳定语义：
 | 获取记忆及其证据 | `get_memory(tenant_id, memory_id)` | `GET /v1/memories/{memory_id}` | `memory_get` |
 | 提交有用、错误、遗漏或纠正 | `record_feedback(request)` | `POST /v1/feedback` | `memory_feedback` |
 | 显式遗忘某段内容或范围 | `forget(request)` | `POST /v1/forget` | `memory_forget` |
+| 读取一次 Observation 处理状态 | `get_observation_job(tenant_id, job_id)` | `GET /v1/jobs/{job_id}` | `memory_job` |
 | 跟随一次 Observation 处理进度 | `watch_observation_job(...)` | `GET /v1/jobs/{job_id}/events` | 不提供 |
 
-HTTP、Python 和 MCP 共享同一层 use case，不各自复制业务逻辑。进度流只出现在 REST 面：MCP Tool
-是请求/响应语义，在没有真实调用方要求前不为它发明一套流式约定。
-顶层 `remember` 与 `get_memory` 返回扁平的 `MemoryResult`：它保留 `MemoryView` 字段、请求
-`trace_id`，并直接附带短期签名的 `EvidenceView`；Recall 内嵌的记忆仍使用不重复 Trace 和 URL 的
-`MemoryView`。
+HTTP、Python 和 MCP 共享同一层 use case，不各自复制业务逻辑。**进度流**只出现在 REST 面：MCP
+Tool 是请求/响应语义，在没有真实调用方要求前不为它发明一套流式约定。但状态**读取**本身就是
+请求/响应，所以 `memory_job` 存在——否则 `memory_observe` 交回的 `processing_job_id` 在 MCP 面
+无法兑换，调用方只能盲目重试 Recall，而那正是本文在 REST 面明确劝阻的做法。
+
+三个协议面的参数形状一致：MCP Tool 的入参就是契约自身的字段，不额外包一层 `request` 对象。
+契约的每一个字段都带 `description`，因此跨字段规则（哪种 `feedback_type` 需要哪个字段、
+`observe` 对它并不负责上传的媒体有什么要求）出现在调用方读到的 schema 里，而不是只能靠失败
+一次才发现。
+
+`get_memory` 返回扁平的 `MemoryResult`：它保留 `MemoryView` 字段、请求 `trace_id`，并直接附带
+短期签名的 `EvidenceView`；Recall 内嵌的记忆仍使用不重复 Trace 和 URL 的 `MemoryView`。
+`remember` 返回 `RememberResult`——在 `MemoryResult` 之上多一个 `status`（`created` /
+`duplicate`），与 `observe` 的 `ObservationStatus` 对称：幂等重试本来就该是安全的，但不该是
+静默的。
 
 ### 9.2 `recall` 最小请求
 
@@ -994,7 +1005,14 @@ HTTP、Python 和 MCP 共享同一层 use case，不各自复制业务逻辑。�
   合计不得超过 65,536 个字符；显式 Memory 最多引用 100 个
   EvidenceSpan，Recall 的人物或设备过滤各最多 100 个，避免公共请求制造无界签名、模型和 SQL 扇出；
 - 每个响应带 `trace_id`，便于 Benchmark 和线上问题复现；
-- OpenAPI 是 REST 契约的唯一事实来源，MCP Tool schema 从同一 Pydantic 模型生成。
+- OpenAPI 是 REST 契约的唯一事实来源，MCP Tool schema 从同一 Pydantic 模型生成。**错误面也在
+  契约里**：`mindbridge.api.errors` 一行一个错误码，同时驱动运行时响应和每个路由的 `responses`，
+  所以每个操作声明的状态就是它真能返回的状态，响应体一律是 `ErrorResponse`。路由只声明自己能
+  抛的码，且共享路径上的码按组声明而不是逐路由手写——例如 `object_storage_unavailable` 出现在
+  `forget` 上，也出现在每个会把 evidence 解析成签名 URL 的操作上（`getMemory`/`remember`/
+  `recordFeedback`/`recall`），因为读一条 memory 不只是读库，`read_resolved_memory_evidence`
+  会为每个媒体对象签一次名。契约快照按挂载了 `/aml/*` 的那个 app 生成，否则这两条路由就落在
+  唯一调用 `app.openapi()` 的地方之外，错误面可以静默回退而门禁不会发现。
 
 ## 10. 生态依附与技术栈
 

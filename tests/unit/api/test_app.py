@@ -20,6 +20,7 @@ from mindbridge.contracts import (
     ForgetReceipt,
     ForgetRequest,
     MemoryResult,
+    MemoryWriteStatus,
     ObservationProcessingJobView,
     ObservationReceipt,
     ObservationStatus,
@@ -27,6 +28,7 @@ from mindbridge.contracts import (
     RecallRequest,
     RecallResult,
     RememberRequest,
+    RememberResult,
 )
 from mindbridge.core import (
     DatabaseUnavailableError,
@@ -67,10 +69,11 @@ class StubKernel:
             trace_id="trace_observe",
         )
 
-    async def remember(self, request: RememberRequest) -> MemoryResult:
+    async def remember(self, request: RememberRequest) -> RememberResult:
         if request.summary == "invalid":
             raise DomainInvariantError("invalid memory")
-        return MemoryResult(
+        return RememberResult(
+            status=MemoryWriteStatus.CREATED,
             memory_id="memory_01",
             memory_type=request.memory_type,
             summary=request.summary,

@@ -1048,17 +1048,21 @@ uv run --extra server mindbridge mcp
 ```
 
 The stable tools are `memory_observe`, `memory_remember`, `memory_recall`, `memory_get`,
-`memory_feedback`, and `memory_forget`. Deploy remote MCP only behind authenticated process or
-gateway isolation; the initial command intentionally exposes stdio rather than an unauthenticated
-HTTP listener. `memory_get` and the matching Python/REST operation return short-lived signed
-EvidenceSpan URLs with the memory, so an Agent does not need a second private storage call.
+`memory_job`, `memory_feedback`, and `memory_forget`. Each takes the contract's own fields as its
+arguments rather than one nested `request` object, and every field carries a description, so the
+rules an Agent would otherwise discover by failing a call — which `feedback_type` needs which
+field, what `observe` requires of media it did not upload — are in the schema it reads. Deploy
+remote MCP only behind authenticated process or gateway isolation; the initial command
+intentionally exposes stdio rather than an unauthenticated HTTP listener. `memory_get` and the
+matching Python/REST operation return short-lived signed EvidenceSpan URLs with the memory, so an
+Agent does not need a second private storage call. `memory_job` resolves the `processing_job_id`
+that `memory_observe` returns; following every intermediate state as a stream stays REST-only.
 
 Applications and Benchmark runners use the same typed REST contract through the asynchronous
 Python SDK:
 
 ```python
-from mindbridge import MindBridge
-from mindbridge.contracts import RecallQuery, RecallRequest
+from mindbridge import MindBridge, RecallQuery, RecallRequest
 
 async with MindBridge.connect(
     base_url="http://localhost:8000",
