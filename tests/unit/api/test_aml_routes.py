@@ -1,6 +1,5 @@
 """AML route contract tests."""
 
-import asyncio
 import json
 from datetime import datetime, timezone
 from typing import cast
@@ -8,7 +7,7 @@ from typing import cast
 import pytest
 from fastapi.testclient import TestClient
 
-from mindbridge.api.aml import _MAX_CONCURRENT_REMEMBERS, AmlSettings
+from mindbridge.api.aml import AmlSettings
 from mindbridge.api.aml_contracts import derive_tenant_id
 from mindbridge.api.app import build_app
 from mindbridge.api.auth import TenantApiKeyAuthenticator
@@ -39,7 +38,15 @@ class _StubGenerator:
 class _StubKernel:
     def __init__(self) -> None:
         self.written: list[tuple[str, str]] = []
+        self.batch_sizes: list[int] = []
         self.recalled: list[tuple[str, str, int]] = []
+
+    async def remember_many(
+        self,
+        requests: tuple[RememberRequest, ...],
+    ) -> tuple[MemoryResult, ...]:
+        self.batch_sizes.append(len(requests))
+        return tuple([await self.remember(request) for request in requests])
 
     async def remember(self, request: RememberRequest) -> MemoryResult:
         self.written.append((request.tenant_id, request.summary))
@@ -197,46 +204,15 @@ class _ManyMemoriesGenerator:
         )
 
 
-class _ConcurrencyTrackingKernel:
-    """Records the highest number of `remember()` calls in flight at once."""
-
-    def __init__(self) -> None:
-        self._current = 0
-        self.max_seen = 0
-        self._lock = asyncio.Lock()
-
-    async def remember(self, request: RememberRequest) -> MemoryResult:
-        async with self._lock:
-            self._current += 1
-            self.max_seen = max(self.max_seen, self._current)
-        await asyncio.sleep(0.01)  # hold the slot open so overlapping calls can pile up
-        async with self._lock:
-            self._current -= 1
-        return MemoryResult(
-            memory_id="mem",
-            memory_type=MemoryType.SEMANTIC,
-            summary=request.summary,
-            evidence_ids=(),
-            occurred_at=_NOW,
-            ended_at=_NOW,
-            created_at=_NOW,
-            verification_status=VerificationStatus.ATTESTED,
-            state=MemoryState.ACTIVE,
-            trace_id="trace",
-        )
-
-    async def recall(self, request: RecallRequest) -> RecallResult:
-        raise NotImplementedError
-
-
-def test_add_bounds_concurrent_remembers() -> None:
-    """Cheap 10 (final review, 2026-08-17): a chunk yielding many memories
-    used to fan out one concurrent `remember()` per memory with no cap. A
-    generator that extracts more memories than `_MAX_CONCURRENT_REMEMBERS`
-    must never push more than that many `remember()` calls in flight at once.
+def test_add_hands_the_kernel_one_batch_for_the_whole_chunk() -> None:
+    """A chunk yielding many memories must reach the kernel as a single
+    `remember_many()` call, not one call per memory: the batch is what lets the
+    kernel encode every summary in one embedder round trip. The concurrency
+    bound this route used to own now lives with the fan-out itself, in
+    `MemoryKernel.remember_many` (see test_kernel.py).
     """
-    memory_count = _MAX_CONCURRENT_REMEMBERS * 4
-    kernel = _ConcurrencyTrackingKernel()
+    memory_count = 40
+    kernel = _StubKernel()
     authenticator = TenantApiKeyAuthenticator({"tenant_01": (_AUTHENTICATOR_KEY,)})
     app = build_app(
         cast(MemoryKernel, kernel),
@@ -246,9 +222,8 @@ def test_add_bounds_concurrent_remembers() -> None:
             _ManyMemoriesGenerator(memory_count),
         ),
     )
-    http = TestClient(app)
 
-    response = http.post(
+    response = TestClient(app).post(
         "/aml/add",
         json={
             "request_id": "r1",
@@ -260,4 +235,5 @@ def test_add_bounds_concurrent_remembers() -> None:
     )
 
     assert response.status_code == 200
-    assert 1 < kernel.max_seen <= _MAX_CONCURRENT_REMEMBERS
+    assert kernel.batch_sizes == [memory_count]
+    assert len(kernel.written) == memory_count

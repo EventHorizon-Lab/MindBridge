@@ -65,6 +65,14 @@ from mindbridge.infrastructure._postgres_types import (
     translate_transient_database_errors,
 )
 
+# One recall alone peaks near ten pooled connections: a sparse search runs concurrently
+# with three vector searches, then four memory searches, and a reflection round runs
+# several such waves at once. The previous ceiling of ten therefore let a single recall
+# occupy the whole pool while a second queued behind it. `min_size` stays 1, so a higher
+# ceiling costs nothing until load asks for it; deployments whose PostgreSQL has a lower
+# `max_connections` lower this through MINDBRIDGE_DATABASE_MAX_POOL_SIZE.
+DEFAULT_DATABASE_MAX_POOL_SIZE = 32
+
 
 class PostgresMemoryStore(
     ObservationWriteOperations,
@@ -87,7 +95,7 @@ class PostgresMemoryStore(
         database_url: str,
         *,
         min_pool_size: int = 1,
-        max_pool_size: int = 10,
+        max_pool_size: int = DEFAULT_DATABASE_MAX_POOL_SIZE,
         statement_timeout_ms: int = 30_000,
         embedding_dimension: int = DEFAULT_EMBEDDING_DIMENSION,
     ) -> None:

@@ -11,6 +11,7 @@ from datetime import datetime, timedelta
 
 from mindbridge.application.capabilities import (
     Embedder,
+    Embedding,
     EmbedRequest,
     EmbedTask,
     ModelInput,
@@ -85,6 +86,9 @@ from mindbridge.telemetry import (
 
 JOB_POLL_INTERVAL_SECONDS = 1.0
 JOB_WATCH_MAXIMUM_SECONDS = 300.0
+# ponytail: one global bound on a batch's write fan-out. Per-tenant bounds only if one
+# tenant's batch is ever shown to starve another's.
+_MAX_CONCURRENT_MEMORY_WRITES = 8
 
 
 class MemoryKernel:
@@ -179,6 +183,48 @@ class MemoryKernel:
                 "mindbridge.evidence.count": len(request.evidence_ids),
             }
         )
+        return (await self.remember_many((request,)))[0]
+
+    @trace_operation("mindbridge.remember_many")
+    async def remember_many(
+        self,
+        requests: tuple[RememberRequest, ...],
+    ) -> tuple[MemoryResult, ...]:
+        """Persist a batch, encoding every summary in one embedder call.
+
+        `remember()` is one call of this, so both paths share one write body. The
+        encoder round trip is the expensive part of remembering, and it is a batch
+        interface at both ends -- `EmbedRequest.inputs` is a sequence and
+        `OpenAIEmbedder._embed_text` sends the whole batch as one request body -- so
+        a caller holding N memories pays for one round trip here instead of N.
+        """
+        if not requests:
+            return ()
+        set_current_span_attributes({"mindbridge.memory.batch_size": len(requests)})
+        embeddings = await self._embed_summaries(tuple(item.summary for item in requests))
+        # Bounds the write fan-out one batch can aim at the store: each write is up to
+        # three pooled connections, so an unbounded gather over a large extraction
+        # would queue behind itself inside the pool.
+        semaphore = asyncio.Semaphore(_MAX_CONCURRENT_MEMORY_WRITES)
+
+        async def write(request: RememberRequest, embedding: Embedding) -> MemoryResult:
+            async with semaphore:
+                return await self._write_remembered(request, embedding)
+
+        return tuple(
+            await asyncio.gather(
+                *(
+                    write(request, embedding)
+                    for request, embedding in zip(requests, embeddings, strict=True)
+                )
+            )
+        )
+
+    async def _write_remembered(
+        self,
+        request: RememberRequest,
+        embedding: Embedding,
+    ) -> MemoryResult:
         idempotency_key = request.idempotency_key or f"remember_{_request_digest(request)}"
         memory = MemoryRecord(
             memory_id=MemoryId(derive_stable_id("memory", request.tenant_id, idempotency_key)),
@@ -197,7 +243,11 @@ class MemoryKernel:
             content_digest=_request_digest(request),
         )
         stored_memory = result.memory
-        await self._index_memory(stored_memory, skip_existing=not result.created)
+        await self._index_memory(
+            stored_memory,
+            embedding,
+            skip_existing=not result.created,
+        )
         return await self._memory_result(stored_memory)
 
     @trace_operation("mindbridge.record_feedback")
@@ -241,7 +291,8 @@ class MemoryKernel:
             content_digest=content_digest,
         )
         if result.corrected_memory is not None:
-            await self._index_memory(result.corrected_memory)
+            (embedding,) = await self._embed_summaries((result.corrected_memory.summary,))
+            await self._index_memory(result.corrected_memory, embedding)
         return FeedbackReceipt(
             feedback_id=result.feedback_id,
             feedback_type=result.feedback_type,
@@ -440,17 +491,26 @@ class MemoryKernel:
         )
         return memory_result(memory, evidence)
 
-    @trace_operation("mindbridge.index_memory")
-    async def _index_memory(self, memory: MemoryRecord, *, skip_existing: bool = False) -> None:
+    async def _embed_summaries(self, summaries: tuple[str, ...]) -> tuple[Embedding, ...]:
+        """Encode every summary in one call, so a batch costs one round trip."""
         result = await self._embedder.embed(
             EmbedRequest(
-                inputs=(ModelInput((TextPart(memory.summary),)),),
+                inputs=tuple(ModelInput((TextPart(summary),)) for summary in summaries),
                 task=EmbedTask.DOCUMENT,
             )
         )
-        if len(result.embeddings) != 1:
+        if len(result.embeddings) != len(summaries):
             raise ModelOutputError("embedder returned the wrong memory vector count")
-        embedding = result.embeddings[0]
+        return result.embeddings
+
+    @trace_operation("mindbridge.index_memory")
+    async def _index_memory(
+        self,
+        memory: MemoryRecord,
+        embedding: Embedding,
+        *,
+        skip_existing: bool = False,
+    ) -> None:
         set_current_span_attributes(
             {
                 "mindbridge.tenant.id": memory.tenant_id,
