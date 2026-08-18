@@ -27,7 +27,7 @@ from mindbridge.edge import (
     SQLiteDeletionInbox,
     SQLiteObservationOutbox,
     SQLiteRecentMemory,
-    enqueue_captured_video,
+    enqueue_captured_media,
 )
 
 NOW = datetime(2026, 8, 12, 8, 0, tzinfo=timezone.utc)
@@ -149,7 +149,7 @@ def _queued_memory(
     media_path.write_bytes(b"video")
     effective_clock = clock or (lambda: NOW)
     outbox = SQLiteObservationOutbox(database_path, clock=effective_clock)
-    request = enqueue_captured_video(
+    request = enqueue_captured_media(
         outbox,
         media_path,
         tenant_id="tenant_01",

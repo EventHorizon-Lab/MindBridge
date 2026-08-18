@@ -4,11 +4,112 @@ import hashlib
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from mindbridge.contracts import IdentityObservationInput
-from mindbridge.core import IdentityKind
-from mindbridge.edge import SQLiteObservationOutbox, enqueue_captured_video
+import pytest
+
+from mindbridge.contracts import IdentityObservationInput, MediaObjectInput
+from mindbridge.core import IdentityKind, MediaKind, SensorKind
+from mindbridge.edge import SQLiteObservationOutbox, enqueue_captured_media
 
 NOW = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
+
+
+def test_microphone_only_capture_reaches_the_cloud_contract(tmp_path: Path) -> None:
+    """The cloud has always accepted a microphone sensor; the edge could not produce one."""
+    audio_path = tmp_path / "capture.wav"
+    audio_path.write_bytes(b"audio")
+    outbox = SQLiteObservationOutbox(tmp_path / "edge.db", clock=lambda: NOW)
+
+    request = enqueue_captured_media(
+        outbox,
+        audio_path,
+        kind=MediaKind.AUDIO,
+        tenant_id="tenant_01",
+        device_id="mic_01",
+        boot_id="boot_01",
+        sequence=1,
+        bucket="memory",
+        occurred_at=NOW,
+        ended_at=NOW + timedelta(seconds=30),
+        observed_at=NOW + timedelta(seconds=31),
+    )
+
+    assert request.sensor is SensorKind.MICROPHONE
+    assert [item.kind for item in request.media_objects] == [MediaKind.AUDIO]
+    assert request.media_objects[0].duration_ms == 30_000
+
+
+def test_image_only_capture_claims_no_duration(tmp_path: Path) -> None:
+    image_path = tmp_path / "frame.png"
+    image_path.write_bytes(b"image")
+    outbox = SQLiteObservationOutbox(tmp_path / "edge.db", clock=lambda: NOW)
+
+    request = enqueue_captured_media(
+        outbox,
+        image_path,
+        kind=MediaKind.IMAGE,
+        tenant_id="tenant_01",
+        device_id="camera_01",
+        boot_id="boot_01",
+        sequence=1,
+        bucket="memory",
+        occurred_at=NOW,
+        ended_at=NOW + timedelta(seconds=30),
+        observed_at=NOW + timedelta(seconds=31),
+    )
+
+    assert request.sensor is SensorKind.CAMERA
+    assert [item.kind for item in request.media_objects] == [MediaKind.IMAGE]
+    # A still frame has no duration, so it must not borrow the observation's span.
+    assert request.media_objects[0].duration_ms is None
+
+
+def test_audio_sidecar_is_rejected_for_non_video_capture(tmp_path: Path) -> None:
+    audio_path = tmp_path / "capture.wav"
+    audio_path.write_bytes(b"audio")
+    sidecar_path = tmp_path / "sidecar.wav"
+    sidecar_path.write_bytes(b"sidecar")
+    outbox = SQLiteObservationOutbox(tmp_path / "edge.db", clock=lambda: NOW)
+
+    with pytest.raises(ValueError, match="sidecar only accompanies captured video"):
+        enqueue_captured_media(
+            outbox,
+            audio_path,
+            kind=MediaKind.AUDIO,
+            audio_path=sidecar_path,
+            tenant_id="tenant_01",
+            device_id="mic_01",
+            boot_id="boot_01",
+            sequence=1,
+            bucket="memory",
+            occurred_at=NOW,
+            ended_at=NOW + timedelta(seconds=30),
+            observed_at=NOW + timedelta(seconds=31),
+        )
+
+
+def test_declared_media_kind_must_match_its_uri_extension() -> None:
+    """Routing trusts the declared kind, and the server cannot fetch the URI to check it."""
+    with pytest.raises(ValueError, match="contradicts its video URI extension"):
+        MediaObjectInput(
+            media_object_id="media_01",
+            kind=MediaKind.IMAGE,
+            uri="s3://memory/tenants/tenant_01/media/abc.mp4",
+            sha256="a" * 64,
+            size_bytes=1_024,
+            created_at=NOW,
+        )
+    # An extensionless object key carries no claim, so it must still be accepted.
+    assert (
+        MediaObjectInput(
+            media_object_id="media_02",
+            kind=MediaKind.IMAGE,
+            uri="s3://memory/tenants/tenant_01/media/abc",
+            sha256="a" * 64,
+            size_bytes=1_024,
+            created_at=NOW,
+        ).kind
+        is MediaKind.IMAGE
+    )
 
 
 def test_completed_video_becomes_one_retry_safe_outbox_item(tmp_path: Path) -> None:
@@ -27,7 +128,7 @@ def test_completed_video_becomes_one_retry_safe_outbox_item(tmp_path: Path) -> N
         ),
     )
 
-    first = enqueue_captured_video(
+    first = enqueue_captured_media(
         outbox,
         media_path,
         tenant_id="tenant_01",
@@ -41,7 +142,7 @@ def test_completed_video_becomes_one_retry_safe_outbox_item(tmp_path: Path) -> N
         clock_offset_ms=12,
         identity_observations=identities,
     )
-    duplicate = enqueue_captured_video(
+    duplicate = enqueue_captured_media(
         outbox,
         media_path,
         tenant_id="tenant_01",
@@ -73,7 +174,7 @@ def test_synchronized_audio_sidecar_shares_one_observation(tmp_path: Path) -> No
     audio_path.write_bytes(b"same bytes")
     outbox = SQLiteObservationOutbox(tmp_path / "edge.db", clock=lambda: NOW)
 
-    request = enqueue_captured_video(
+    request = enqueue_captured_media(
         outbox,
         video_path,
         audio_path=audio_path,

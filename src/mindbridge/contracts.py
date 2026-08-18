@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from enum import Enum
+from pathlib import PurePosixPath
 from typing import Annotated
+from urllib.parse import urlsplit
 
 from pydantic import (
     AfterValidator,
@@ -28,6 +30,7 @@ from mindbridge.core import (
     MemoryType,
     SensorKind,
     VerificationStatus,
+    media_kind_for_suffix,
 )
 
 NonEmptyString = Annotated[
@@ -68,6 +71,21 @@ class MediaObjectInput(ContractModel):
     size_bytes: Annotated[int, Field(ge=0, le=9_223_372_036_854_775_807)]
     created_at: UtcDatetime
     duration_ms: Annotated[int, Field(ge=0, le=9_223_372_036_854_775_807)] | None = None
+
+    @model_validator(mode="after")
+    def require_kind_matching_uri(self) -> MediaObjectInput:
+        """Reject a declared kind the URI contradicts.
+
+        Routing trusts this kind and the server cannot sniff an object it has not fetched, so a
+        wrong declaration otherwise surfaces as a decode failure in a worker. Unrecognized
+        suffixes are left alone: extensionless object keys are normal.
+        """
+        implied = media_kind_for_suffix(PurePosixPath(urlsplit(self.uri).path).suffix)
+        if implied is not None and implied is not self.kind:
+            raise ValueError(
+                f"media kind {self.kind.value} contradicts its {implied.value} URI extension"
+            )
+        return self
 
 
 class IdentityObservationInput(ContractModel):

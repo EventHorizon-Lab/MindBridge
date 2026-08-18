@@ -41,6 +41,39 @@ class SensorKind(str, Enum):
     MICROPHONE = "microphone"
 
 
+# Explicit rather than `mimetypes.guess_type`, whose answers come from the host's /etc/mime.types:
+# a validator that accepts a URI on one machine and rejects it on another is worse than none.
+_MEDIA_KIND_BY_SUFFIX = {
+    ".aac": MediaKind.AUDIO,
+    ".flac": MediaKind.AUDIO,
+    ".m4a": MediaKind.AUDIO,
+    ".mp3": MediaKind.AUDIO,
+    ".ogg": MediaKind.AUDIO,
+    ".opus": MediaKind.AUDIO,
+    ".wav": MediaKind.AUDIO,
+    ".bmp": MediaKind.IMAGE,
+    ".gif": MediaKind.IMAGE,
+    ".jpeg": MediaKind.IMAGE,
+    ".jpg": MediaKind.IMAGE,
+    ".png": MediaKind.IMAGE,
+    ".webp": MediaKind.IMAGE,
+    ".avi": MediaKind.VIDEO,
+    ".mkv": MediaKind.VIDEO,
+    ".mov": MediaKind.VIDEO,
+    ".mp4": MediaKind.VIDEO,
+    ".webm": MediaKind.VIDEO,
+}
+
+
+def media_kind_for_suffix(suffix: str) -> MediaKind | None:
+    """Return the kind a container extension implies, or None when it implies nothing.
+
+    None means "no opinion", not "invalid": object keys are frequently extensionless, so an
+    unrecognized suffix must never be treated as a mismatch.
+    """
+    return _MEDIA_KIND_BY_SUFFIX.get(suffix.lower())
+
+
 @dataclass(frozen=True, slots=True)
 class PixelRegion:
     """Axis-aligned image region in pixel coordinates."""
