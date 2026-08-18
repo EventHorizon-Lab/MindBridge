@@ -99,6 +99,58 @@ async def test_run_writes_one_jsonl_row_per_question(tmp_path: Path) -> None:
         assert tenant_id == derive_tenant_id("bench_aml", user_id)
 
 
+@pytest.mark.asyncio
+async def test_run_checkpoints_early_cases_instead_of_finishing_them_all_at_once(
+    tmp_path: Path,
+) -> None:
+    """A kill mid-run has to leave finished cases behind, which needs a bound on cases."""
+    # run_case gathers every add before issuing a search, so with only a request bound each
+    # case's adds queue ahead of every case's searches and nothing completes until nearly the
+    # whole add phase is done. Recording when the first search is issued measures exactly
+    # that: with a case bound, early cases have already finished and been written by then.
+    output_path = tmp_path / "rows.jsonl"
+    seen: list[httpx.Request] = []
+    adds_before_first_search: list[int] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        if request.url.path == "/aml/add":
+            payload = json.loads(request.content)
+            return httpx.Response(
+                200,
+                json={
+                    "success": True,
+                    "request_id": payload["request_id"],
+                    "user_id": payload["user_id"],
+                    "session_id": payload["session_id"],
+                },
+            )
+        if not adds_before_first_search:
+            adds_before_first_search.append(sum(1 for item in seen if item.url.path == "/aml/add"))
+        return httpx.Response(200, json={"data": [{"id": "mem_1", "content": "hi"}]})
+
+    cases = tuple(_case(f"locomo-refined:conv-{index}", "q0") for index in range(8))
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handle), base_url="http://test"
+    ) as client:
+        await _run(
+            client,
+            BENCHMARKS["locomo-refined"],
+            cases,
+            run_id="run-1",
+            benchmark="locomo-refined",
+            top_k=10,
+            concurrency=2,
+            output_path=output_path,
+            tenant_prefix="bench_aml",
+        )
+
+    # Two cases in flight means at most two adds land before the first search. Unbounded, all
+    # eight would, and no row could be written until then.
+    assert adds_before_first_search == [2]
+    assert len(output_path.read_text().splitlines()) == 8
+
+
 @pytest.mark.parametrize(
     ("benchmark", "payload"),
     [

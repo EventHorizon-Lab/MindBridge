@@ -30,6 +30,7 @@ from mindbridge.core import EmbeddedObjectType, EmbeddingSpaceReference, TenantI
 from mindbridge.infrastructure.postgres import (
     DEFAULT_DATABASE_MAX_POOL_SIZE,
     PostgresMemoryStore,
+    resolve_database_max_pool_size,
 )
 from mindbridge.infrastructure.s3 import (
     ObjectStorageEnvironment,
@@ -138,12 +139,9 @@ class Settings:
             ),
             aml_api_key=optional_environment_value(source, "MINDBRIDGE_AML_API_KEY"),
             aml_tenant_prefix=source.get("MINDBRIDGE_AML_TENANT_PREFIX", "bench_aml"),
-            database_max_pool_size=int(
-                source.get(
-                    "MINDBRIDGE_DATABASE_MAX_POOL_SIZE",
-                    str(DEFAULT_DATABASE_MAX_POOL_SIZE),
-                )
-            ),
+            # One parser for the variable, so the API cannot disagree with the worker and
+            # the two sweeps about what a given value means.
+            database_max_pool_size=resolve_database_max_pool_size(source),
         )
 
 
