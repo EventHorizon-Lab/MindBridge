@@ -8,6 +8,7 @@ import json
 import math
 from collections.abc import AsyncGenerator, Callable
 from datetime import datetime, timedelta
+from typing import overload
 
 from mindbridge.application.capabilities import (
     Embedder,
@@ -173,53 +174,64 @@ class MemoryKernel:
             trace_id=current_trace_id(),
         )
 
-    @trace_operation("mindbridge.remember")
-    async def remember(self, request: RememberRequest) -> MemoryResult:
-        """Persist explicit content without pretending unsupported input is fact."""
-        set_current_span_attributes(
-            {
-                "mindbridge.tenant.id": request.tenant_id,
-                "mindbridge.memory.type": request.memory_type.value,
-                "mindbridge.evidence.count": len(request.evidence_ids),
-            }
-        )
-        return (await self.remember_many((request,)))[0]
+    @overload
+    async def remember(self, request: RememberRequest) -> MemoryResult: ...
 
-    async def remember_many(
+    @overload
+    async def remember(
         self,
-        requests: tuple[RememberRequest, ...],
-    ) -> tuple[MemoryResult, ...]:
-        """Persist a batch, encoding every summary in one embedder call.
+        request: tuple[RememberRequest, ...],
+    ) -> tuple[MemoryResult, ...]: ...
 
-        `remember()` is one call of this, so both paths share one write body. The
-        encoder round trip is the expensive part of remembering, and it is a batch
-        interface at both ends -- `EmbedRequest.inputs` is a sequence and
-        `OpenAIEmbedder._embed_text` sends the whole batch as one request body -- so
-        a caller holding N memories pays for one round trip here instead of N.
+    @trace_operation("mindbridge.remember")
+    async def remember(
+        self,
+        request: RememberRequest | tuple[RememberRequest, ...],
+    ) -> MemoryResult | tuple[MemoryResult, ...]:
+        """Persist explicit content without pretending unsupported input is fact.
+
+        Takes one memory or a batch of them. A batch costs one encoder round trip
+        instead of N: `EmbedRequest.inputs` is a sequence and the bundled encoder
+        sends a whole batch as one request body, so a caller already holding N
+        memories should hand over all N rather than calling N times. One request
+        in, one result out; a batch in, results in request order out.
+
+        Dispatch tests for the single request rather than for the tuple. Asking
+        `isinstance(request, tuple)` would read a list as one request and fail
+        later on a missing attribute, whereas anything that is not one request is
+        a sequence of them.
         """
+        requests = (request,) if isinstance(request, RememberRequest) else tuple(request)
+        set_current_span_attributes({"mindbridge.memory.batch_size": len(requests)})
+        if len(requests) == 1:
+            set_current_span_attributes(
+                {
+                    "mindbridge.tenant.id": requests[0].tenant_id,
+                    "mindbridge.memory.type": requests[0].memory_type.value,
+                    "mindbridge.evidence.count": len(requests[0].evidence_ids),
+                }
+            )
         if not requests:
             return ()
-        # No span of its own: `remember()` wraps this and would otherwise emit two spans
-        # per single write. The size lands on the caller's span instead.
-        set_current_span_attributes({"mindbridge.memory.batch_size": len(requests)})
         embeddings = await self._embed_summaries(tuple(item.summary for item in requests))
         # Bounds the write fan-out one batch can aim at the store: each write is up to
         # three pooled connections, so an unbounded gather over a large extraction
         # would queue behind itself inside the pool.
         semaphore = asyncio.Semaphore(_MAX_CONCURRENT_MEMORY_WRITES)
 
-        async def write(request: RememberRequest, embedding: Embedding) -> MemoryResult:
+        async def write(item: RememberRequest, embedding: Embedding) -> MemoryResult:
             async with semaphore:
-                return await self._write_remembered(request, embedding)
+                return await self._write_remembered(item, embedding)
 
-        return tuple(
+        results = tuple(
             await asyncio.gather(
                 *(
-                    write(request, embedding)
-                    for request, embedding in zip(requests, embeddings, strict=True)
+                    write(item, embedding)
+                    for item, embedding in zip(requests, embeddings, strict=True)
                 )
             )
         )
+        return results[0] if isinstance(request, RememberRequest) else results
 
     async def _write_remembered(
         self,

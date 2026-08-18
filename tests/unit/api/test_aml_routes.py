@@ -41,14 +41,16 @@ class _StubKernel:
         self.batch_sizes: list[int] = []
         self.recalled: list[tuple[str, str, int]] = []
 
-    async def remember_many(
+    async def remember(
         self,
-        requests: tuple[RememberRequest, ...],
-    ) -> tuple[MemoryResult, ...]:
-        self.batch_sizes.append(len(requests))
-        return tuple([await self.remember(request) for request in requests])
+        request: RememberRequest | tuple[RememberRequest, ...],
+    ) -> MemoryResult | tuple[MemoryResult, ...]:
+        if isinstance(request, RememberRequest):
+            return await self._one(request)
+        self.batch_sizes.append(len(request))
+        return tuple([await self._one(item) for item in request])
 
-    async def remember(self, request: RememberRequest) -> MemoryResult:
+    async def _one(self, request: RememberRequest) -> MemoryResult:
         self.written.append((request.tenant_id, request.summary))
         return MemoryResult(
             memory_id="mem_1",

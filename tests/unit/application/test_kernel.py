@@ -4,6 +4,7 @@ import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
+from typing import cast
 
 import pytest
 
@@ -26,6 +27,7 @@ from mindbridge.contracts import (
     FeedbackRequest,
     IdentityObservationInput,
     MediaObjectInput,
+    MemoryResult,
     ObservationStatus,
     ObserveRequest,
     RecallMode,
@@ -900,7 +902,7 @@ async def test_remember_indexes_one_pinned_memory_document() -> None:
     assert embedding.created_at == memory.created_at
 
 
-async def test_remember_many_encodes_the_whole_batch_in_one_embedder_call() -> None:
+async def test_remember_encodes_a_whole_batch_in_one_embedder_call() -> None:
     """The encoder round trip is the expensive part of remembering, so a batch of N
     must cost one call carrying N inputs -- not N calls carrying one input each.
     """
@@ -908,7 +910,7 @@ async def test_remember_many_encodes_the_whole_batch_in_one_embedder_call() -> N
     embedder = RecordingEmbedder()
     summaries = tuple(f"fact {index}" for index in range(12))
 
-    results = await _kernel(store, RecordingAnswerer(), embedder=embedder).remember_many(
+    results = await _kernel(store, RecordingAnswerer(), embedder=embedder).remember(
         tuple(
             _remember_request(idempotency_key=f"batch-{index}").model_copy(
                 update={"summary": summary}
@@ -924,7 +926,51 @@ async def test_remember_many_encodes_the_whole_batch_in_one_embedder_call() -> N
     assert len(store.embeddings) == len(summaries)
 
 
-async def test_remember_many_bounds_its_write_fan_out() -> None:
+async def test_remember_returns_one_result_for_one_request_and_a_batch_for_a_batch() -> None:
+    """One request in, one result out; a batch in, results in request order out.
+    The batch still costs exactly one encoder call, which is the point of taking one.
+    """
+    embedder = RecordingEmbedder()
+    kernel = _kernel(InMemoryStore(), RecordingAnswerer(), embedder=embedder)
+
+    single = await kernel.remember(
+        _remember_request(idempotency_key="shape-single").model_copy(update={"summary": "only one"})
+    )
+    batch = await kernel.remember(
+        tuple(
+            _remember_request(idempotency_key=f"shape-{index}").model_copy(
+                update={"summary": f"fact {index}"}
+            )
+            for index in range(3)
+        )
+    )
+
+    assert isinstance(single, MemoryResult)
+    assert single.summary == "only one"
+    assert isinstance(batch, tuple)
+    assert [item.summary for item in batch] == ["fact 0", "fact 1", "fact 2"]
+    # One call for the single, one for the batch of three -- not one per memory.
+    assert embedder.document_batch_sizes == [1, 3]
+
+
+async def test_remember_reads_a_list_as_a_batch_not_as_one_request() -> None:
+    """Dispatch discriminates on the single request, so a caller passing a list
+    gets a batch rather than an attribute error deep in the write path.
+    """
+    kernel = _kernel(InMemoryStore(), RecordingAnswerer(), embedder=RecordingEmbedder())
+    requests = [
+        _remember_request(idempotency_key=f"list-{index}").model_copy(
+            update={"summary": f"fact {index}"}
+        )
+        for index in range(2)
+    ]
+
+    results = await kernel.remember(cast(tuple[RememberRequest, ...], requests))
+
+    assert [item.summary for item in results] == ["fact 0", "fact 1"]
+
+
+async def test_remember_bounds_its_write_fan_out() -> None:
     """A single extraction can yield dozens of memories, and each write is up to
     three pooled connections. Without a cap the batch queues behind itself inside
     the pool; this is the bound the AML route used to own before the fan-out moved
@@ -935,7 +981,7 @@ async def test_remember_many_bounds_its_write_fan_out() -> None:
 
     # A fixed batch size, well above the bound: deriving it from the constant under
     # test would move both sides of the assertion together and never fail.
-    await kernel.remember_many(
+    await kernel.remember(
         tuple(
             _remember_request(idempotency_key=f"bounded-{index}").model_copy(
                 update={"summary": f"fact {index}"}

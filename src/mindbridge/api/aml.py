@@ -101,7 +101,7 @@ def register_aml_routes(
                 "mindbridge.aml.memories_skipped": outcome.skipped,
             }
         )
-        await kernel.remember_many(
+        await kernel.remember(
             tuple(
                 RememberRequest(
                     tenant_id=tenant_id,
