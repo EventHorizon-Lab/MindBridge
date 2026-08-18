@@ -141,6 +141,12 @@ async def search_embeddings(
         )
     vector = Vector(list(search.values))
     async with tenant_connection(pool, search.tenant_id) as connection:
+        # Inert while no HNSW index exists: migration 0018 dropped the one this deployment
+        # shipped with, because RLS makes every query tenant-selective and the planner
+        # always reaches a tenant's vectors through embeddings_space_search_idx and sorts
+        # them exactly. Kept because it is what makes a filtered approximate search return
+        # a full LIMIT instead of silently fewer rows, so a deployment that adds the index
+        # back for one very large tenant is already correct.
         await connection.execute("SET LOCAL hnsw.iterative_scan = strict_order")
         cursor = await connection.execute(
             """
