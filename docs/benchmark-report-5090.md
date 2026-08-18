@@ -2,6 +2,13 @@
 
 > 运行日期：2026-08-13
 >
+> **语料已退役（2026-08-18）**：本报告全部 LoCoMo 数字来自 `snap-research/locomo` 的
+> `locomo10.json`（1,986 题 / 5 类）。该适配器已被
+> [LoCoMo-Refined](https://github.com/mem-eval-suite/LoCoMo_refined)（1,382 题 / 4 类，无
+> adversarial，官方 judge 为 `Qwen/Qwen3-14B`）整体取代，`mindbridge-bench locomo` 也已改名
+> 为 `mindbridge-bench locomo-refined`。下列 LoCoMo 数字保留为当时的运行记录，**当前代码无法
+> 复现，也不可与任何 LoCoMo-Refined 分数并列比较**。
+>
 > 运行编号：完整基线 LoCoMo `5090-clean-006`、多模态 `5090-clean-007`；当前代码诊断
 > `locomo-reflection-v8-clean-008`、当前固定切片 `refinement-v9-uniform-l20/l50`；当前实现
 > `answer_from_evidence_v10`
@@ -291,7 +298,7 @@ embedding，只证明调度与本地模型链路，不替代任何目标端侧�
 | 自学习、自进化 | 反馈、版本化 Claim、Consolidation 与生命周期已完成；跨任务检索经验学习尚未完成 |
 | 端侧近期记忆、身份加密与删除 | 已完成；真实人脸/ASR/Sortformer/声纹/Omni ASD segment 编排通过，真值精度与持续流 API 未验收 |
 | 四套 Benchmark 完整公开题集 | 已完成本轮可获得输入的评估 |
-| LoCoMo SOTA | token-F1 超过公开强基线；严格 Judge SOTA 尚未确认 |
+| LoCoMo SOTA | 原始语料 token-F1 超过公开强基线；语料已换成 LoCoMo-Refined，需在其官方 judge 下重跑 |
 | 三套多模态 SOTA | 未完成；本轮是 memory-layer 诊断，原始 AV 与严格同协议复现仍缺失 |
 | 端侧多平台部署验收 | 未开始；按用户要求暂缓延迟与硬件指标。Edge 目标为全平台（Jetson / RDK / RK / OpenVINO / dGPU），任一平台的数字都不可外推到其他平台 |
 

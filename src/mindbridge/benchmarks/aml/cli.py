@@ -35,7 +35,7 @@ from mindbridge.benchmarks.aml.driver import (
 from mindbridge.benchmarks.aml.loaders import (
     beam,
     clbench,
-    locomo,
+    locomo_refined,
     longmemeval,
     personamem_v1,
     personamem_v2,
@@ -86,8 +86,8 @@ def _two(paths: Sequence[Path]) -> tuple[Path, Path]:
     return paths[0], paths[1]
 
 
-def _load_locomo(paths: Sequence[Path]) -> tuple[AmlCase, ...]:
-    return locomo.load(_one(paths))
+def _load_locomo_refined(paths: Sequence[Path]) -> tuple[AmlCase, ...]:
+    return locomo_refined.load(_one(paths))
 
 
 def _load_longmemeval(paths: Sequence[Path]) -> tuple[AmlCase, ...]:
@@ -140,8 +140,10 @@ AML_ENVIRONMENT = """environment:
 
 
 BENCHMARKS: dict[str, BenchmarkSpec] = {
-    "locomo": BenchmarkSpec(
-        _load_locomo, emit_retrieved_context, _PIPELINES_ROOT / "locomo-refined" / "pipeline.py"
+    "locomo-refined": BenchmarkSpec(
+        _load_locomo_refined,
+        emit_retrieved_context,
+        _PIPELINES_ROOT / "locomo-refined" / "pipeline.py",
     ),
     "longmemeval": BenchmarkSpec(
         _load_longmemeval,
