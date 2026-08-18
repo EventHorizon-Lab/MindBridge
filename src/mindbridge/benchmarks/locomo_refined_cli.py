@@ -1,9 +1,13 @@
-"""Reproducible LoCoMo command line runner against a deployed MindBridge API."""
+"""Reproducible LoCoMo-Refined runner against a deployed MindBridge API.
+
+Writes `predictions.jsonl` in the shape `mem-eval-suite/LoCoMo_refined` scores
+directly: one `{"qa_id", "predicted_answer"}` object per line, ready for that
+repository's `./scripts/run_eval.sh`.
+"""
 
 from __future__ import annotations
 
 import asyncio
-import json
 from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -23,40 +27,49 @@ from mindbridge.benchmarks.cli_common import (
     core_arguments,
     core_manifest,
     core_parser,
+    predictions_jsonl,
     report,
     report_unit,
     select_by_id,
     write_run_artifacts,
 )
-from mindbridge.benchmarks.locomo import LOCOMO_ADAPTER_VERSION, LoCoMoConversation, load_locomo
-from mindbridge.benchmarks.locomo_runner import (
-    LOCOMO_ABSTENTION,
-    LOCOMO_PREDICTION_KEY,
-    LoCoMoOfficialConversationResult,
-    run_locomo_conversation,
+from mindbridge.benchmarks.locomo_refined import (
+    LOCOMO_REFINED_ADAPTER_VERSION,
+    LoCoMoRefinedConversation,
+    load_locomo_refined,
+)
+from mindbridge.benchmarks.locomo_refined_runner import (
+    LOCOMO_REFINED_PREDICTION_KEY,
+    LoCoMoRefinedPrediction,
+    run_locomo_refined_conversation,
 )
 from mindbridge.contracts import Identifier, NonEmptyString, Sha256Hex
 from mindbridge.file_integrity import sha256_file
 
-LOCOMO_RUNNER_VERSION = "locomo_production_api_v9"
+LOCOMO_REFINED_RUNNER_VERSION = "locomo_refined_production_api_v1"
 
 
-class LoCoMoRunManifest(BenchmarkRunManifest):
+class LoCoMoRefinedRunManifest(BenchmarkRunManifest):
     """Immutable dataset, deployment, code, and output identity for one run."""
 
-    benchmark: Literal["LoCoMo"] = "LoCoMo"
+    benchmark: Literal["LoCoMo-Refined"] = "LoCoMo-Refined"
     source_repository: NonEmptyString
     source_revision: NonEmptyString
     source_sha256: Sha256Hex
     prediction_key: NonEmptyString
-    abstention_text: NonEmptyString
     sample_ids: tuple[Identifier, ...] = Field(min_length=1)
     memory_item_count: int = Field(gt=0)
     question_count: int = Field(gt=0)
-    abstained_question_count: int = Field(ge=0)
-    # Vendor LoCoMo numbers are mostly four-category, dropping adversarial (category 5), which is
-    # the single largest reason two published scores are not comparable. Keyed by official
-    # category so a reader can tell which protocol a number came from without rerunning it.
+    # Rows whose recall produced no answer at all, written as an empty
+    # `predicted_answer`. LoCoMo-Refined has no adversarial category and therefore no
+    # gold abstention, so these are plain misses rather than a second protocol -- but a
+    # run whose score is dragged down by silence rather than by wrong answers is a
+    # different diagnosis, and only this count separates the two.
+    unanswered_question_count: int = Field(ge=0)
+    # LoCoMo's four-versus-five-category ambiguity is gone with the adversarial split, so
+    # these counts no longer decide whether two numbers are comparable. They stay because
+    # the refined release is deliberately uneven across categories (802 of 1,382 questions
+    # are category 4), which a subset run can skew without saying so.
     category_question_counts: dict[int, int] = Field(min_length=1)
 
 
@@ -70,25 +83,25 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
     """Run selected official conversations and emit predictions plus a manifest."""
     arguments = _parse_arguments(argv, prog)
     conversations = select_by_id(
-        load_locomo(arguments.dataset_path),
+        load_locomo_refined(arguments.dataset_path),
         arguments.sample_ids,
         key=lambda conversation: conversation.sample_id,
-        label="LoCoMo sample IDs",
+        label="LoCoMo-Refined sample IDs",
     )
     require_writable_output_pair(arguments.output_path, overwrite=arguments.overwrite)
     deployment = load_deployment_snapshot(arguments.deployment_config_path)
     report(f"running {len(conversations)} conversations", quiet=arguments.quiet)
-    results = asyncio.run(_run_conversations(arguments, conversations))
-    _write_artifacts(arguments, conversations, results, deployment)
+    predictions = asyncio.run(_run_conversations(arguments, conversations))
+    _write_artifacts(arguments, conversations, predictions, deployment)
     report(f"wrote {arguments.output_path}", quiet=arguments.quiet)
 
 
 async def _run_conversations(
     arguments: _Arguments,
-    conversations: tuple[LoCoMoConversation, ...],
-) -> tuple[LoCoMoOfficialConversationResult, ...]:
+    conversations: tuple[LoCoMoRefinedConversation, ...],
+) -> tuple[LoCoMoRefinedPrediction, ...]:
     async with connected_memory(arguments) as memory:
-        results: list[LoCoMoOfficialConversationResult] = []
+        predictions: list[LoCoMoRefinedPrediction] = []
         for index, conversation in enumerate(conversations, start=1):
             report_unit(
                 f"conversation {conversation.sample_id}",
@@ -96,8 +109,8 @@ async def _run_conversations(
                 total=len(conversations),
                 quiet=arguments.quiet,
             )
-            results.append(
-                await run_locomo_conversation(
+            predictions.extend(
+                await run_locomo_refined_conversation(
                     memory,
                     conversation,
                     run_id=arguments.run_id,
@@ -106,54 +119,45 @@ async def _run_conversations(
                     request_concurrency=arguments.request_concurrency,
                 )
             )
-        return tuple(results)
+        return tuple(predictions)
 
 
 def _write_artifacts(
     arguments: _Arguments,
-    conversations: tuple[LoCoMoConversation, ...],
-    results: tuple[LoCoMoOfficialConversationResult, ...],
+    conversations: tuple[LoCoMoRefinedConversation, ...],
+    predictions: tuple[LoCoMoRefinedPrediction, ...],
     deployment: LoadedDeployment,
 ) -> None:
-    predictions = (
-        json.dumps(
-            [result.model_dump(mode="json") for result in results],
-            ensure_ascii=False,
-            indent=2,
-        )
-        + "\n"
+    categories = Counter(
+        question.category for conversation in conversations for question in conversation.questions
     )
+    rows = predictions_jsonl(predictions)
     manifest = core_manifest(
-        LoCoMoRunManifest,
+        LoCoMoRefinedRunManifest,
         arguments,
         deployment,
-        runner_version=LOCOMO_RUNNER_VERSION,
-        adapter_version=LOCOMO_ADAPTER_VERSION,
-        predictions=predictions,
-        source_repository="snap-research/locomo",
+        runner_version=LOCOMO_REFINED_RUNNER_VERSION,
+        adapter_version=LOCOMO_REFINED_ADAPTER_VERSION,
+        predictions=rows,
+        source_repository="mem-eval-suite/LoCoMo_refined",
         source_revision=arguments.source_revision,
         source_sha256=sha256_file(arguments.dataset_path),
-        prediction_key=LOCOMO_PREDICTION_KEY,
-        abstention_text=LOCOMO_ABSTENTION,
+        prediction_key=LOCOMO_REFINED_PREDICTION_KEY,
         sample_ids=tuple(conversation.sample_id for conversation in conversations),
         memory_item_count=sum(len(conversation.turns) for conversation in conversations),
-        question_count=sum(len(conversation.questions) for conversation in conversations),
-        abstained_question_count=sum(
-            question.mindbridge_abstained for result in results for question in result.qa
+        question_count=len(predictions),
+        unanswered_question_count=sum(
+            not prediction.mindbridge_answered for prediction in predictions
         ),
-        category_question_counts=dict(
-            sorted(
-                Counter(question.category for result in results for question in result.qa).items()
-            )
-        ),
+        category_question_counts=dict(sorted(categories.items())),
     )
-    write_run_artifacts(arguments.output_path, predictions, manifest)
+    write_run_artifacts(arguments.output_path, rows, manifest)
 
 
 def _parse_arguments(argv: Sequence[str] | None, prog: str | None) -> _Arguments:
-    parser = core_parser(tenant_prefix="benchmark_locomo", prog=prog, description=__doc__)
+    parser = core_parser(tenant_prefix="benchmark_locomo_refined", prog=prog, description=__doc__)
     parser.add_argument(
-        "--source-revision", required=True, help="revision of the official LoCoMo release"
+        "--source-revision", required=True, help="revision of the official LoCoMo-Refined release"
     )
     parser.add_argument(
         "--sample-id",

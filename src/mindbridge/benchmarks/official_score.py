@@ -1,8 +1,9 @@
 """Bind an external official scorer's numbers to the exact run that produced them.
 
-Most benchmarks here are scored outside MindBridge: LoCoMo by `snap-research/locomo`,
-MM-Lifelong by its released scorer, EgoMemReason by a held-out leaderboard. A run manifest is
-written before any of them execute, so it can only pin inputs — never results. This module
+Most benchmarks here are scored outside MindBridge: LoCoMo-Refined by
+`mem-eval-suite/LoCoMo_refined`, MM-Lifelong by its released scorer, EgoMemReason by a held-out
+leaderboard. A run manifest is written before any of them execute, so it can only pin inputs —
+never results. This module
 writes the missing half as a separate sidecar that refuses to attach numbers to predictions the
 manifest did not produce, and records which judge and answer model stood behind them.
 """
@@ -68,8 +69,9 @@ def parse_metric_assignment(assignment: str) -> tuple[str, float]:
 def parse_metric_assignments(assignments: Iterable[str]) -> dict[str, float]:
     """Collect `name=value` metrics, refusing a repeated name rather than keeping the last.
 
-    LoCoMo alone is reported under both a four-category and a five-category protocol, so the
-    same metric name arriving twice means two different numbers were measured. Silently keeping
+    One scorer can legitimately produce the same metric name twice under different protocols --
+    LoCoMo-Refined's `run_eval.sh` scores `llm` under either its refined judge or the original
+    LoCoMo one -- so a repeated name means two different numbers were measured. Silently keeping
     one of them would put an unrecoverable figure in the artifact that exists to be audited.
     """
     metrics: dict[str, float] = {}

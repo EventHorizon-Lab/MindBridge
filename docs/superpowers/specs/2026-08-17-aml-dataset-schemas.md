@@ -12,13 +12,18 @@ Pipelines were read directly from
 
 ---
 
-## 1. LoCoMo (`benchmarks/aml/pipelines/locomo-refined/pipeline.py`)
+## 1. LoCoMo-Refined (`benchmarks/aml/pipelines/locomo-refined/pipeline.py`)
 
 ### Files
 
-- `.benchmarks/locomo/data/locomo10.json` — a JSON list of 10 samples.
-  Present and fully usable (10 samples, ~199 QA pairs each in the example
-  checked).
+- `.benchmarks/locomo-refined/data/raw/locomo_refined.json` — a JSON list of
+  10 samples, 1,382 QA pairs total. Same record layout as the original
+  `snap-research/locomo` `locomo10.json` this loader used to read, but
+  recalibrated: 337 questions revised, every `answer` a list of complete gold
+  candidates, and the adversarial category 5 removed outright. AML's textual
+  suite lists LoCoMo-Refined, so this is the corpus the pipeline expects.
+- `data/public/questions.jsonl` publishes the same 1,382 questions with their
+  `qa_id`; the loader derives that id rather than reading the file.
 
 ### Sample shape
 
@@ -36,7 +41,8 @@ sample = {
     ...  # session_N / session_N_date_time repeat, N = 1..however many exist
   },
   "qa": [
-    {"question": "...", "answer": "...", "evidence": ["D1:3"], "category": 2}
+    {"question": "...", "answer": ["..."], "evidence": ["D1:3"], "category": 2,
+     "is_multi_modality": false}
   ],
   "event_summary": {...}, "observation": {...}, "session_summary": {...},
 }
@@ -83,7 +89,7 @@ for n in session_nums:
   `int | None` wire contract. `dia_id` (e.g. `"D1:3"`) is the
   evidence-pointer unit, not a timestamp.
 - `speaker_a`/`speaker_b` are the two participant names; role mapping is
-  arbitrary (there's no inherent "user" vs "assistant" — LoCoMo is a
+  arbitrary (there's no inherent "user" vs "assistant" — LoCoMo-Refined is a
   peer dialogue, not a chatbot transcript). Keep the original speaker name
   alongside role if the harness needs it, since the answer prompt template
   addresses both speakers by name.
@@ -95,9 +101,15 @@ All ~199 QA pairs for that sample share the same conversation haystack.
 
 ### Questions
 
-`sample["qa"]` is a list of `{question, answer, evidence, category}`.
-**No id field** — must be synthesized, e.g. `f"{sample_id}:qa{index:04d}"`.
-`category` is an int (1-5); not read by the pipeline.
+`sample["qa"]` is a list of
+`{question, answer, evidence, category, is_multi_modality}`.
+**No id field in the raw file** — but the release publishes one, so synthesize
+exactly `f"{sample_id}#q{index:04d}"` (zero-based, in file order): that is the
+`qa_id` in `data/public/questions.jsonl` and the key the official evaluator
+joins predictions on. `category` is an int (1-4, adversarial gone); not read by
+the pipeline. `answer` is a list of alternative complete golds — the pipeline's
+`gold_answer()` renders a list by joining it with newlines, which its own judge
+reads as "cover all of these", so hand it only the first candidate.
 
 ### Payload keys the pipeline reads
 
@@ -250,7 +262,7 @@ Same JSON records carry both the haystack and the question (`question`,
 
 ### Payload keys the pipeline reads
 
-Identical contract to LoCoMo-refined (this pipeline file is a byte-for-byte
+Identical contract to LoCoMo-Refined (this pipeline file is a byte-for-byte
 copy per its own header comment "uses exactly the same answer and
 evaluation contracts"). Same table as LoCoMo section 1 above: `id`
 (required), `question` (required), `speaker_1_name`/`speaker_1_memories`/
@@ -920,7 +932,7 @@ regex `^\s*([A-F])\.` — i.e. **gold answers are option-lettered strings like
 
 | Benchmark | Raw data usable as-is | Real conv. text present | Timestamp granularity | id/gold key rename needed |
 | --- | --- | --- | --- | --- |
-| LoCoMo | Yes | Yes | per-session, free text | Yes — both `id` (synthesize) and gold (`answer`→`gold_answer`) |
+| LoCoMo-Refined | Yes | Yes | per-session, free text | Yes — both `id` (synthesize the official `qa_id`) and gold (first of `answer`→`gold_answer`) |
 | LongMemEval | Yes (use `_s`) | Yes | per-session, `YYYY/MM/DD (Dow) HH:MM` | Yes — both `id` (`question_id`→`id`) and gold (`answer`→`gold_answer`) |
 | PersonaMem v1 | Yes | Yes (shared contexts) | none | No (native `question_id` matches `row_id` fallback); keep `all_options` as string |
 | PersonaMem v2 | Yes | Yes (chat_history files) | none | Yes — no id column at all, must synthesize |

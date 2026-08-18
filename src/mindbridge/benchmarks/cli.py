@@ -78,7 +78,9 @@ class Runner:
 
 
 RUNNERS: dict[str, Runner] = {
-    "locomo": Runner("mindbridge.benchmarks.locomo_cli", "Run official LoCoMo"),
+    "locomo-refined": Runner(
+        "mindbridge.benchmarks.locomo_refined_cli", "Run official LoCoMo-Refined"
+    ),
     "m3": Runner("mindbridge.benchmarks.m3_cli", "Run official M3-Bench"),
     "egolife": Runner("mindbridge.benchmarks.egolife_cli", "Run official EgoLifeQA"),
     "egomem": Runner("mindbridge.benchmarks.egomem_cli", "Run official EgoMemReason"),
@@ -123,7 +125,7 @@ def parser(
     """Build the parser shape every benchmark command shares.
 
     `prog` is what the dispatcher passes down so a runner's usage line reads
-    `mindbridge-bench locomo` rather than the module file that happens to hold it.
+    `mindbridge-bench locomo-refined` rather than the module file that happens to hold it.
     """
     sections = (epilog, exit_status_help()) if epilog else (exit_status_help(),)
     built = argparse.ArgumentParser(

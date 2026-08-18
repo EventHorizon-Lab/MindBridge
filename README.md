@@ -5,6 +5,7 @@ MindBridge is an Agentic Native Embodied Memory System: Memory-as-a-Service for 
 ## Documentation
 
 - [Technical implementation architecture](docs/technical-architecture.md)
+- [System architecture diagram](docs/architecture-diagram.html)
 - [Model plugin architecture and author contract](docs/plugin-architecture.md)
 - [RTX 5090 benchmark and lifecycle validation](docs/benchmark-report-5090.md)
 - [RTX 5090 reproducibility manifest](benchmarks/manifests/benchmark-5090-clean-007.json)
@@ -85,7 +86,7 @@ uv run --extra server mindbridge lifecycle --help
 | Command | Subcommands |
 | --- | --- |
 | `mindbridge` | `consolidate`, `lifecycle`, `mcp`, `edge sync` |
-| `mindbridge-bench` | `locomo`, `m3`, `egolife`, `egomem`, `egotempo`, `memlens`, `mm-lifelong`, `supermemory`, `video-mme`, `aml` |
+| `mindbridge-bench` | `locomo-refined`, `m3`, `egolife`, `egomem`, `egotempo`, `memlens`, `mm-lifelong`, `supermemory`, `video-mme`, `aml` |
 | `mindbridge-bench` support | `score`, `datasets`, `jina`, `bakeoff` |
 
 A subcommand's module is imported only when that subcommand runs, so each tree's own `--help`
@@ -198,8 +199,8 @@ a memory system to retrieve and an offline number would measure nothing. A real 
 unaffected; AML runs ScriptMem server-side against its own copy.
 
 ```bash
-git clone https://github.com/snap-research/locomo.git .benchmarks/locomo
-git -C .benchmarks/locomo checkout 3eb6f2c585f5e1699204e3c3bdf7adc5c28cb376
+git clone https://github.com/mem-eval-suite/LoCoMo_refined.git .benchmarks/locomo-refined
+git -C .benchmarks/locomo-refined checkout 887091190789e8d6760e70b9edd696539923dc4f
 git clone https://github.com/mohammadtavakoli78/BEAM.git .benchmarks/beam
 git -C .benchmarks/beam checkout 3e12035532eb85768f1a7cd779832b650c4b2ef9
 uvx --from huggingface-hub hf download xiaowu0162/longmemeval --repo-type dataset \
@@ -222,7 +223,8 @@ reads, are recorded in
 ### Retrieval and scoring
 
 `--dataset` is repeated once per positional argument the benchmark's loader takes, in order:
-`locomo`, `longmemeval`, and `clbench` take one path; `beam` takes `chat` then `questions`;
+`locomo-refined`, `longmemeval`, and `clbench` take one path; `beam` takes `chat` then
+`questions`;
 `personamem-v1` takes `questions_csv` then `contexts_jsonl`; `personamem-v2` takes `benchmark_csv`
 then `data_root`.
 
@@ -233,9 +235,9 @@ runners use:
 ```bash
 export MINDBRIDGE_AML_API_KEY=...
 uv run mindbridge-bench aml \
-  --benchmark locomo \
-  --dataset .benchmarks/locomo/data/locomo10.json \
-  --output .benchmarks/results/aml-locomo.jsonl \
+  --benchmark locomo-refined \
+  --dataset .benchmarks/locomo-refined/data/raw/locomo_refined.json \
+  --output .benchmarks/results/aml-locomo-refined.jsonl \
   --api-base-url "$MINDBRIDGE_API_BASE_URL" \
   --code-revision "$(git rev-parse HEAD)" \
   --deployment-config .benchmarks/deployment.json \
@@ -244,6 +246,13 @@ uv run mindbridge-bench aml \
   --top-k 100 \
   --concurrency 4
 ```
+
+`--concurrency` bounds requests in flight across every case, not cases replayed at once: a case
+adds its chunks and searches its questions concurrently, with the add phase completing before any
+of that case's searches run. Each in-flight `/aml/add` can hold up to eight pooled connections while
+it writes, so the server needs roughly `8 x --concurrency` connections -- the default 4 matches the
+default `MINDBRIDGE_DATABASE_MAX_POOL_SIZE` of 32. Raise both together, and raise PostgreSQL's
+`max_connections` to match, or writes queue inside the pool until they time out.
 
 `--tenant-prefix` has no default and must match the deployment's `MINDBRIDGE_AML_TENANT_PREFIX`. The
 manifest's tenant map is derived client-side from the value you pass, so a mismatch produces a
@@ -262,14 +271,46 @@ export JUDGE_MODEL="qwen3.8-max"
 export JUDGE_VERSION="qwen3.8-max"
 
 uv run python benchmarks/aml/pipelines/locomo-refined/pipeline.py answer \
-  --input .benchmarks/results/aml-locomo.jsonl \
-  --output .benchmarks/results/aml-locomo-answers.jsonl
+  --input .benchmarks/results/aml-locomo-refined.jsonl \
+  --output .benchmarks/results/aml-locomo-refined-answers.jsonl
 
 uv run python benchmarks/aml/pipelines/locomo-refined/pipeline.py evaluate \
-  --input .benchmarks/results/aml-locomo.jsonl \
-  --answers .benchmarks/results/aml-locomo-answers.jsonl \
-  --output .benchmarks/results/aml-locomo-scores.jsonl
+  --input .benchmarks/results/aml-locomo-refined.jsonl \
+  --answers .benchmarks/results/aml-locomo-refined-answers.jsonl \
+  --output .benchmarks/results/aml-locomo-refined-scores.jsonl
 ```
+
+### Shard the scoring stages
+
+Both vendored stages are a strictly serial `for` loop over one LLM call each -- roughly 5,000
+questions through `answer` and again through `evaluate` -- so a full sweep spends hours holding one
+request open at a time while the serving GPU idles. The pinned files can never be edited, but they
+do not have to be: both stages take `--input`/`--output`, so shard the input and run one process per
+shard. Nothing inside the pinned files changes, and the concatenated output is byte-identical to a
+serial run's.
+
+```bash
+cd .benchmarks/results && split -n l/16 -d --additional-suffix=.jsonl aml-locomo.jsonl shard-
+```
+
+```bash
+ls .benchmarks/results/shard-*.jsonl | xargs -P 16 -I {} sh -c 'uv run python benchmarks/aml/pipelines/locomo-refined/pipeline.py answer --input {} --output {}.answers'
+```
+
+Then evaluate each shard against its own answers and concatenate. `evaluate` requires its `--input`
+and `--answers` to hold exactly the same ids, which is why the shards must be paired rather than
+scored against the whole answer file:
+
+```bash
+ls .benchmarks/results/shard-*.jsonl | xargs -P 16 -I {} sh -c 'uv run python benchmarks/aml/pipelines/locomo-refined/pipeline.py evaluate --input {} --answers {}.answers --output {}.scores'
+```
+
+```bash
+cat .benchmarks/results/shard-*.jsonl.scores > .benchmarks/results/aml-locomo-scores.jsonl
+```
+
+Pick the shard count from what the answer endpoint will actually serve concurrently, not from core
+count. `answer` resumes from its own output, so a killed shard restarts where it stopped.
 
 ### Disable thinking mode on the answer endpoint
 
@@ -287,13 +328,13 @@ curl -s "$MINDBRIDGE_GENERATOR_ENDPOINT/chat/completions" -H "Authorization: Bea
 
 ## Benchmark dataset smoke
 
-LoCoMo, M3-Bench, Video-MME, EgoLife (EgoLifeQA), EgoTempo, EgoMemReason, MEMLENS, MM-Lifelong,
-and SuperMemory-VQA are consumed through thin adapters over pinned official files. Use Git for code
+LoCoMo-Refined, M3-Bench, Video-MME, EgoLife (EgoLifeQA), EgoTempo, EgoMemReason, MEMLENS,
+MM-Lifelong, and SuperMemory-VQA are consumed through thin adapters over pinned official files. Use Git for code
 releases and the Hugging Face CLI for Hub datasets; MindBridge does not ship another downloader:
 
 ```bash
-git clone https://github.com/snap-research/locomo.git .benchmarks/locomo
-git -C .benchmarks/locomo checkout 3eb6f2c585f5e1699204e3c3bdf7adc5c28cb376
+git clone https://github.com/mem-eval-suite/LoCoMo_refined.git .benchmarks/locomo-refined
+git -C .benchmarks/locomo-refined checkout 887091190789e8d6760e70b9edd696539923dc4f
 git clone https://github.com/ByteDance-Seed/m3-agent.git .benchmarks/m3-agent
 git -C .benchmarks/m3-agent checkout 0e3e41939bd8a0b66d756e7b7eb8d5fe9992da5c
 uvx --from huggingface-hub hf download lmms-eval/Video-MME \
@@ -330,8 +371,8 @@ uvx --from huggingface-hub hf download MM-Lifelong/MM-Lifelong \
   --local-dir .benchmarks/mm-lifelong
 
 uv run --extra benchmarks mindbridge-bench datasets \
-  --locomo .benchmarks/locomo/data/locomo10.json \
-  --locomo-revision 3eb6f2c585f5e1699204e3c3bdf7adc5c28cb376 \
+  --locomo-refined .benchmarks/locomo-refined/data/raw/locomo_refined.json \
+  --locomo-refined-revision 887091190789e8d6760e70b9edd696539923dc4f \
   --m3-robot .benchmarks/m3-agent/data/annotations/robot.json \
   --m3-web .benchmarks/m3-agent/data/annotations/web.json \
   --m3-revision 0e3e41939bd8a0b66d756e7b7eb8d5fe9992da5c \
@@ -388,9 +429,9 @@ uvx --from huggingface-hub hf download OSU-AIoT-MLSys-Lab/SuperMemory-VQA \
 The resulting annotation identity and counts are recorded in
 [benchmarks/manifests/dataset-adapters-smoke.json](benchmarks/manifests/dataset-adapters-smoke.json).
 
-Run LoCoMo against the deployed production API. The command writes the official conversation-level
-prediction shape and a sidecar manifest containing source, code, model, Prompt, retrieval, and output
-identities. `MINDBRIDGE_API_KEY` identifies the exact benchmark tenant and is never written to the
+Run LoCoMo-Refined against the deployed production API. The command writes the official
+`predictions.jsonl` shape and a sidecar manifest containing source, code, model, Prompt,
+retrieval, and output identities. `MINDBRIDGE_API_KEY` identifies the exact benchmark tenant and is never written to the
 manifest.
 
 Every benchmark also requires a secret-free deployment snapshot. It records the actual capability
@@ -458,13 +499,13 @@ from the deployed processes:
 
 ```bash
 export MINDBRIDGE_API_KEY=replace-with-a-runtime-secret
-uv run mindbridge-bench locomo \
-  --dataset .benchmarks/locomo/data/locomo10.json \
-  --output .benchmarks/results/locomo-mindbridge.json \
+uv run mindbridge-bench locomo-refined \
+  --dataset .benchmarks/locomo-refined/data/raw/locomo_refined.json \
+  --output .benchmarks/results/locomo-refined-mindbridge.jsonl \
   --api-base-url http://localhost:8000 \
-  --source-revision 3eb6f2c585f5e1699204e3c3bdf7adc5c28cb376 \
+  --source-revision 887091190789e8d6760e70b9edd696539923dc4f \
   --deployment-config .benchmarks/deployment.json \
-  --run-id locomo-001 \
+  --run-id locomo-refined-001 \
   --code-revision "$(git rev-parse HEAD)" \
   --recall-limit 50 \
   --request-timeout-seconds 1800
@@ -473,9 +514,10 @@ uv run mindbridge-bench locomo \
 Use `--sample-id` for a smoke subset. The example explicitly selects the experimental Top-50 recall
 budget; the benchmark default remains the product-wide Top-20 budget until held-out or full-split
 evidence justifies changing it. Existing results are preserved unless `--overwrite` is supplied. The
-prediction field is `mindbridge_prediction`, ready for the official LoCoMo evaluation functions;
-retrieved dialogue IDs use its matching
-`mindbridge_prediction_context` field.
+rows are `{"qa_id", "predicted_answer"}` keyed by the release's own `qa_id`, so the file
+is fed straight to `./scripts/run_eval.sh` in a LoCoMo-Refined checkout; retrieved dialogue
+IDs ride along in the `mindbridge_prediction_context` field that evaluator ignores.
+LoCoMo-Refined is CC BY-NC 4.0, so the corpus itself is not licensed for commercial use.
 
 Run M3-Bench through the same deployed API after the official videos have been split into
 30-second clips with FFmpeg and uploaded with the standard S3 tooling. MindBridge does not contain
@@ -880,28 +922,30 @@ by a previous run.
 
 ## Recording an official scorer's result
 
-LoCoMo, MM-Lifelong, EgoTempo, and EgoMemReason are scored outside MindBridge. A run manifest is
+LoCoMo-Refined, MM-Lifelong, EgoTempo, and EgoMemReason are scored outside MindBridge. A run manifest is
 written before any of those scorers execute, so it can only pin inputs. Record their output in a
 `*.score.json` sidecar instead, which re-hashes the predictions and refuses numbers that belong to
 a different run:
 
 ```bash
 uv run mindbridge-bench score \
-  --predictions .benchmarks/results/locomo.json \
-  --manifest .benchmarks/results/locomo.json.manifest.json \
-  --scorer-output .benchmarks/results/locomo-scorer-stdout.json \
-  --scorer-repository snap-research/locomo \
-  --scorer-revision 3eb6f2c585f5e1699204e3c3bdf7adc5c28cb376 \
-  --scorer-command "python evaluation/evaluate.py --data locomo.json" \
-  --judge-model gpt-4o-mini \
+  --predictions .benchmarks/results/locomo-refined.jsonl \
+  --manifest .benchmarks/results/locomo-refined.jsonl.manifest.json \
+  --scorer-output .benchmarks/results/locomo-refined-scorer-summary.json \
+  --scorer-repository mem-eval-suite/LoCoMo_refined \
+  --scorer-revision 887091190789e8d6760e70b9edd696539923dc4f \
+  --scorer-command "./scripts/run_eval.sh --metrics llm f1 bleu --llm-judge refined" \
+  --judge-model Qwen/Qwen3-14B \
   --answer-backbone qwen3.8-max \
-  --scored-question-count 1540 \
-  --metric f1=45.65
+  --scored-question-count 1382 \
+  --metric llm=82.65
 ```
 
-`--judge-model` and `--answer-backbone` are the fields that make two LoCoMo numbers comparable or
-not, and the LoCoMo run manifest additionally records `category_question_counts` so a reader can
-tell a four-category result from a five-category one. See
+`--judge-model` and `--answer-backbone` are the fields that make two LoCoMo-Refined numbers
+comparable or not: the official judge is `Qwen/Qwen3-14B` under the `refined` prompt, and
+`run_eval.sh` also accepts the looser `original` LoCoMo judge. The run manifest additionally
+records `category_question_counts`, because 802 of the release's 1,382 questions are category 4
+and a subset run can skew that mix without saying so. See
 [SOTA baselines for the supported benchmarks](docs/benchmarks-sota.md) for what each number has to
 beat.
 
@@ -913,6 +957,7 @@ not copied into MindBridge configuration:
 
 ```bash
 export MINDBRIDGE_DATABASE_URL=postgresql://mindbridge:password@localhost:5432/mindbridge
+export MINDBRIDGE_DATABASE_MAX_POOL_SIZE=32
 export MINDBRIDGE_OBJECT_STORAGE_BUCKET=mindbridge-media
 export MINDBRIDGE_OBJECT_STORAGE_ENDPOINT_URL=https://objects.example.com
 export MINDBRIDGE_TASK_BROKER_URL=redis://localhost:6379/0
@@ -958,6 +1003,13 @@ export MINDBRIDGE_GENERATOR_CONFIG_JSON='{
   "reasoning_effort": "low"
 }'
 ```
+
+`MINDBRIDGE_DATABASE_MAX_POOL_SIZE` is the API's ceiling on pooled PostgreSQL connections; it
+defaults to 32 and the pool still opens only one connection eagerly, so a higher ceiling costs
+nothing until load asks for it. One recall alone peaks near ten connections -- a sparse search runs
+concurrently with three vector searches, then four memory searches, and a reflection round runs
+several such waves at once -- so a value near ten lets a single recall occupy the whole pool. Raise
+it with any client concurrency you raise, and keep it under the server's own `max_connections`.
 
 `MINDBRIDGE_EMBEDDING_SPACE_ID` and `MINDBRIDGE_EMBEDDING_SPACE_REVISION` name the search space the
 selected Embedder writes into and queries. `MINDBRIDGE_EMBEDDING_DIMENSION` is the one vector width
