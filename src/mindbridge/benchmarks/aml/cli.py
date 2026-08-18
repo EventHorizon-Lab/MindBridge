@@ -371,23 +371,31 @@ async def _run(
     row it would produce is already in `output_path`: `run_case` is not
     idempotent (each `/aml/add` call writes new memories), so re-running a
     finished case would duplicate memories server-side, not just output rows.
-    Every case starts at once and one shared semaphore bounds `concurrency`
-    requests in flight across all of them, so the bound is on load the server
-    actually sees rather than on how that load is grouped into cases -- a
-    single-case run parallelises its own chunks and questions instead of
-    running strictly serially. Rows are appended (de-duplicated by id) as each
-    case's task completes, so a killed run leaves a prefix a rerun can resume
-    from exactly where it stopped.
+    One shared semaphore bounds `concurrency` requests in flight, so the bound
+    is on load the server actually sees rather than on how that load is grouped
+    into cases -- a single-case run parallelises its own chunks and questions
+    instead of running strictly serially. A second bound admits only
+    `concurrency` cases at a time, which is what keeps the resume guarantee
+    below true: `run_case` gathers all of its adds before it issues a single
+    search, so starting every case at once puts every case's adds ahead of any
+    case's searches in the shared FIFO queue and no case can finish -- and
+    therefore no row can be written -- until nearly the whole run's add phase
+    is done. A kill before that point left an empty output file even though
+    most `/aml/add` writes had landed, and because the rerun re-adds every
+    chunk it silently doubled the corpus it then scored against.
+
+    Rows are appended (de-duplicated by id) as each case's task completes, so a
+    killed run leaves a prefix a rerun can resume from exactly where it stopped.
     """
     existing_ids = _read_existing_ids(output_path)
     pending = tuple(case for case in cases if not _case_ids(case) <= existing_ids)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     semaphore = asyncio.Semaphore(concurrency)
+    case_slots = asyncio.Semaphore(concurrency)
 
-    report(f"replaying {len(pending)} of {len(cases)} cases", quiet=quiet)
-    tasks = [
-        asyncio.create_task(
-            run_case(
+    async def run_bounded_case(case: AmlCase) -> list[dict[str, object]]:
+        async with case_slots:
+            return await run_case(
                 client,
                 case,
                 run_id=run_id,
@@ -397,9 +405,9 @@ async def _run(
                 semaphore=semaphore,
                 timeout=request_timeout_seconds,
             )
-        )
-        for case in pending
-    ]
+
+    report(f"replaying {len(pending)} of {len(cases)} cases", quiet=quiet)
+    tasks = [asyncio.create_task(run_bounded_case(case)) for case in pending]
     with output_path.open("a", encoding="utf-8") as handle:
         for index, task in enumerate(asyncio.as_completed(tasks), start=1):
             rows = await task
@@ -422,12 +430,12 @@ async def _run(
 def _case_ids(case: AmlCase) -> set[str]:
     # Delegates to `row_id` (driver.py) rather than reconstructing the id
     # format inline: `run_case` doesn't always write
-    # `{case.user_id}#{question.question_id}` -- five of six loaders put
-    # their own "id" in the question payload, which overwrites it. Blocking 2
-    # (final review, 2026-08-17): this function used to hardcode the driver's
-    # id format, which never matched what those five benchmarks actually
-    # wrote, so `_run`'s pending-work check never saw a finished case as
-    # done and resumed runs silently re-added and re-searched everything.
+    # `{case.user_id}#{question.question_id}` -- every loader puts its own
+    # "id" in the question payload, which overwrites it. Blocking 2 (final
+    # review, 2026-08-17): this function used to hardcode the driver's id
+    # format, which never matched what those benchmarks actually wrote, so
+    # `_run`'s pending-work check never saw a finished case as done and
+    # resumed runs silently re-added and re-searched everything.
     return {row_id(case, question) for question in case.questions}
 
 

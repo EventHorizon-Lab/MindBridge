@@ -290,7 +290,8 @@ shard. Nothing inside the pinned files changes, and the concatenated output is b
 serial run's.
 
 ```bash
-cd .benchmarks/results && split -n l/16 -d --additional-suffix=.jsonl aml-locomo.jsonl shard-
+split -n l/16 -d --additional-suffix=.jsonl \
+  .benchmarks/results/aml-locomo-refined.jsonl .benchmarks/results/shard-
 ```
 
 ```bash
@@ -306,7 +307,7 @@ ls .benchmarks/results/shard-*.jsonl | xargs -P 16 -I {} sh -c 'uv run python be
 ```
 
 ```bash
-cat .benchmarks/results/shard-*.jsonl.scores > .benchmarks/results/aml-locomo-scores.jsonl
+cat .benchmarks/results/shard-*.jsonl.scores > .benchmarks/results/aml-locomo-refined-scores.jsonl
 ```
 
 Pick the shard count from what the answer endpoint will actually serve concurrently, not from core

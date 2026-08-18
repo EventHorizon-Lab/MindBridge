@@ -31,7 +31,10 @@ from mindbridge.configuration import (
     validate_plugin_name,
 )
 from mindbridge.core import TenantId, utc_now
-from mindbridge.infrastructure.postgres import PostgresMemoryStore
+from mindbridge.infrastructure.postgres import (
+    PostgresMemoryStore,
+    resolve_database_max_pool_size,
+)
 from mindbridge.infrastructure.s3 import (
     ObjectStorageEnvironment,
     S3MediaAccess,
@@ -164,6 +167,7 @@ async def _run_postgres_sweep(
         embedding_dimension=require_matryoshka_dimension(
             int(cast(int, settings.embedder_config.get("dimension", DEFAULT_EMBEDDING_DIMENSION)))
         ),
+        max_pool_size=resolve_database_max_pool_size(),
     )
     media_access = S3MediaAccess(settings.object_storage)
     async with AsyncExitStack() as resources:
