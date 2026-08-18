@@ -551,7 +551,9 @@ uv run mindbridge-bench m3 \
   --request-timeout-seconds 1800
 ```
 
-Use `--video-id` for a smoke subset. The runner rejects a `--subset` that does not match the
+Use `--video-id` for a smoke subset. Web video IDs are YouTube IDs, and 14 of them begin with
+`-`, so pass those as `--video-id=-bMyTZYVzgw`: in the separated form `argparse` reads the ID
+as the next option. The runner rejects a `--subset` that does not match the
 official Robot timing fields or their absence from Web. The JSONL uses the official `id`,
 `question`, `answer`, `type`, `before_clip`, and `response` fields and adds MindBridge retrieval
 diagnostics. Its sidecar manifest pins annotation/media hashes and revisions, code, both Omni calls,

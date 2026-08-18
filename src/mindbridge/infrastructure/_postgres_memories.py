@@ -212,21 +212,36 @@ _STRUCTURED_RECALL_FILTER_SQL = f"""
   )
 """
 
+# Callers ask in whole sentences, so the query side ORs the lexemes instead of requiring
+# every one of them: websearch_to_tsquery ANDs each term, stopwords included, which no
+# summary can satisfy. Lexing the query with the same configuration as the document keeps
+# bracketed identity tokens such as <voice_0> intact on both sides; ts_rank_cd then orders
+# the partial matches, and dense retrieval still supplies the other half of the fusion.
+_QUERY_TSQUERY_SQL = """
+    SELECT (
+        SELECT string_agg(quote_literal(lexeme), ' | ')
+        FROM unnest(to_tsvector('mindbridge_text', %(query)s)) AS term(lexeme)
+    )::tsquery AS lexical_query
+    WHERE %(query)s::text IS NOT NULL
+"""
+
 _SEARCH_MEMORIES_SQL = f"""
+WITH lexical AS ({_QUERY_TSQUERY_SQL})
 {MEMORY_SELECT_SQL}
+LEFT JOIN lexical ON TRUE
 WHERE memory.tenant_id = %(tenant_id)s
   AND (
       %(query)s::text IS NULL
-      OR to_tsvector('simple', memory.summary) @@ websearch_to_tsquery('simple', %(query)s)
+      OR to_tsvector('mindbridge_text', memory.summary) @@ lexical.lexical_query
       OR memory.summary ILIKE '%%' || %(query)s || '%%'
   )
 {_STRUCTURED_RECALL_FILTER_SQL}
 ORDER BY
     CASE
-        WHEN %(query)s::text IS NULL THEN 0
+        WHEN lexical.lexical_query IS NULL THEN 0
         ELSE ts_rank_cd(
-            to_tsvector('simple', memory.summary),
-            websearch_to_tsquery('simple', %(query)s)
+            to_tsvector('mindbridge_text', memory.summary),
+            lexical.lexical_query
         )
     END DESC,
     memory.strength DESC,

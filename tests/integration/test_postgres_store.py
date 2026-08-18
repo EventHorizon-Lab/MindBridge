@@ -222,6 +222,7 @@ async def test_migration_installs_complete_phase_zero_schema(database_url: str) 
         15,
         16,
         17,
+        18,
     ]
 
 
@@ -713,3 +714,43 @@ def _kernel(store: PostgresMemoryStore) -> MemoryKernel:
         embedder=FixedEmbedder(),
         clock=lambda: NOW,
     )
+
+
+async def test_postgres_lexical_recall_matches_questions_and_identity_tokens(
+    store: PostgresMemoryStore,
+) -> None:
+    """Lexical recall must survive whole-sentence queries and bracketed identity tokens."""
+    kernel = _kernel(store)
+    tenant_id = "tenant_lexical"
+    summaries = {
+        "target": "<voice_0> explains that the meat was prepared according to Islamic rules.",
+        "decoy": "A cyclist repairs a punctured tyre beside the road.",
+    }
+    for name, summary in summaries.items():
+        await kernel.remember(
+            RememberRequest(
+                tenant_id=tenant_id,
+                summary=summary,
+                memory_type=MemoryType.EPISODIC,
+                occurred_at=NOW,
+                idempotency_key=f"lexical_{name}",
+            )
+        )
+
+    def _request(text: str) -> RecallRequest:
+        return RecallRequest(tenant_id=tenant_id, query=RecallQuery(text=text))
+
+    question = await store.search_memories(
+        _request("How was the meat prepared according to Islamic rules?"), limit=5
+    )
+    identity = await store.search_memories(_request("What did <voice_0> say?"), limit=5)
+    unrelated = await store.search_memories(_request("What colour is the moon rock?"), limit=5)
+
+    # A question is not a conjunction of every one of its words, and <voice_0> is a term the
+    # parser would otherwise discard as an HTML tag on both the document and the query side.
+    # Each match is asserted whole: ranking the target first is not enough, because a query
+    # that also drags in the decoy through a shared stopword still ranks the target first.
+    # The unrelated probe is itself a question, so it fails if stopwords ever match on their own.
+    assert [memory.summary for memory in question] == [summaries["target"]]
+    assert [memory.summary for memory in identity] == [summaries["target"]]
+    assert [memory.summary for memory in unrelated] == []

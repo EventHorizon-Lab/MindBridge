@@ -23,6 +23,28 @@
       "text": "ZX-490"
     },
     {
+      "expected_answer": "<voice_0> confirmed the calibration run finished.",
+      "expected_evidence_count": 0,
+      "expected_memory_ids": [
+        "memory_identity_token"
+      ],
+      "name": "bracketed_identity_token_sparse",
+      "occurred_after": null,
+      "query_axis": -1,
+      "text": "What did <voice_0> say?"
+    },
+    {
+      "expected_answer": "The visible equipment label is ZX-490.",
+      "expected_evidence_count": 0,
+      "expected_memory_ids": [
+        "memory_exact_serial"
+      ],
+      "name": "sentence_question_sparse",
+      "occurred_after": null,
+      "query_axis": -1,
+      "text": "What is the visible equipment label on the machine?"
+    },
+    {
       "expected_answer": null,
       "expected_evidence_count": 0,
       "expected_memory_ids": [],
@@ -55,6 +77,13 @@
       "occurred_at": "2026-08-12T11:00:00Z",
       "source": "attested",
       "summary": "The visible equipment label is ZX-490."
+    },
+    {
+      "memory_id": "memory_identity_token",
+      "memory_type": "semantic",
+      "occurred_at": "2026-08-12T11:30:00Z",
+      "source": "attested",
+      "summary": "<voice_0> confirmed the calibration run finished."
     }
   ],
   "version": 1
