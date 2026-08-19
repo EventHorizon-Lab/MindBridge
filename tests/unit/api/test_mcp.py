@@ -1,5 +1,6 @@
 """Contract tests for the official MCP protocol adapter."""
 
+import json
 from datetime import datetime, timezone
 from typing import cast
 
@@ -26,7 +27,13 @@ from mindbridge.contracts import (
     RememberRequest,
     RememberResult,
 )
-from mindbridge.core import JobState, MemoryState, MemoryType, VerificationStatus
+from mindbridge.core import (
+    JobState,
+    MemoryDeletedError,
+    MemoryState,
+    MemoryType,
+    VerificationStatus,
+)
 
 NOW = datetime(2026, 8, 12, 12, 0, tzinfo=timezone.utc)
 
@@ -240,3 +247,62 @@ def _memory_view(summary: str, memory_type: MemoryType) -> MemoryResult:
         state=MemoryState.ACTIVE,
         trace_id="trace_memory",
     )
+
+
+async def test_mcp_errors_carry_the_code_and_trace_id_rest_callers_get() -> None:
+    """An agent has to branch on a code, not grep a sentence.
+
+    `ErrorResponse.code` tells callers to branch on it rather than on the message, and the
+    tool descriptions promise specific codes. Over MCP the only channel is the error text, so
+    the envelope goes there: `memory_deleted` and `memory_not_found` are a substring apart in
+    prose and a different decision in practice, and without `trace_id` an MCP failure cannot
+    be correlated with the telemetry the other two faces correlate with.
+    """
+
+    class DeletedKernel(StubKernel):
+        async def get_memory(self, tenant_id: str, memory_id: str) -> MemoryResult:
+            raise MemoryDeletedError("memory has been explicitly forgotten")
+
+    server = build_mcp_server(cast(MemoryKernel, DeletedKernel()))
+
+    async with Client(server) as client:
+        result = await client.call_tool(
+            "memory_get",
+            {"tenant_id": "tenant_01", "memory_id": "memory_01"},
+        )
+
+    assert result.is_error is True
+    reported = result.content[0]
+    assert isinstance(reported, TextContent)
+    # MCP prefixes the raised text with "Error executing tool <name>: "; the envelope is the
+    # remainder, so a caller recovers it without depending on that prefix's wording.
+    envelope = json.loads(reported.text[reported.text.index("{") :])
+    assert envelope["code"] == "memory_deleted"
+    assert envelope["message"] == "memory has been explicitly forgotten"
+    assert envelope["trace_id"]
+
+
+async def test_mcp_leaves_an_unmapped_failure_alone() -> None:
+    """Only contract failures get the envelope; a bug stays a bug.
+
+    Dressing an unexpected exception as a contract code would tell an agent to branch on a
+    failure mode the contract never promised, and would hide the defect behind a tidy code.
+    """
+
+    class BrokenKernel(StubKernel):
+        async def get_memory(self, tenant_id: str, memory_id: str) -> MemoryResult:
+            raise ZeroDivisionError("a genuine bug")
+
+    server = build_mcp_server(cast(MemoryKernel, BrokenKernel()))
+
+    async with Client(server) as client:
+        result = await client.call_tool(
+            "memory_get",
+            {"tenant_id": "tenant_01", "memory_id": "memory_01"},
+        )
+
+    assert result.is_error is True
+    reported = result.content[0]
+    assert isinstance(reported, TextContent)
+    assert "a genuine bug" in reported.text
+    assert "{" not in reported.text

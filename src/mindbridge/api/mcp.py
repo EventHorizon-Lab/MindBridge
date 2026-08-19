@@ -9,8 +9,10 @@ from typing import Annotated, Any, TypeVar, get_type_hints
 
 from mcp.server import MCPServer
 from mcp.server.context import CallNext, HandlerResult, ServerMiddleware, ServerRequestContext
+from mcp.server.mcpserver.exceptions import ToolError
 from mcp_types import CallToolResult, TextContent, ToolAnnotations
 
+from mindbridge.api.errors import code_for, error_body
 from mindbridge.application.kernel import MemoryKernel
 from mindbridge.contracts import (
     ContractModel,
@@ -90,7 +92,30 @@ def _flattened(
         raise TypeError(f"{handler.__name__} must take exactly one contract parameter")
 
     async def tool(**fields: object) -> _ResultT:
-        return await handler(model.model_validate(fields))
+        try:
+            return await handler(model.model_validate(fields))
+        except Exception as error:
+            code = code_for(error)
+            if code is None:
+                # A bug stays a bug rather than arriving dressed as a code the contract
+                # promises and an agent might branch on.
+                raise
+            # The envelope, not prose. REST returns `{code, message, trace_id}` and the SDK
+            # parses it; an agent driving the same kernel needs the code to branch on --
+            # `memory_deleted` and `memory_not_found` are one substring apart in prose and a
+            # different decision in practice -- and the `trace_id` to correlate with telemetry.
+            # These tools' own descriptions promise codes.
+            #
+            # Here, and as text, because this is the only place and channel that work.
+            # Returning a `CallToolResult` from the body is passed through by `convert_result`
+            # but has its `structured_content` validated against the tool's *success* output
+            # model, which an error body is not; `MCPError` would report a JSON-RPC protocol
+            # failure, which a memory that does not exist is not; and middleware is too late --
+            # MCP converts a raised exception into `CallToolResult(is_error=True)` before the
+            # middleware layer, so by there the type is gone (measured, not assumed). MCP
+            # prefixes this text with "Error executing tool <name>: "; the envelope is the
+            # remainder of the line.
+            raise ToolError(error_body(code, message=str(error)).model_dump_json()) from error
 
     # Resolved rather than reflected: `from __future__ import annotations` leaves every
     # handler's own annotations as strings, and MCP reads this signature verbatim when it

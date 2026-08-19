@@ -10,11 +10,9 @@ from fastapi import Depends, FastAPI, Request
 from fastapi.responses import StreamingResponse
 
 from mindbridge.api.auth import TenantApiKeyAuthenticator, TenantPrincipal, require_tenant
-from mindbridge.api.errors import ERRORS, RUNTIME_ERROR_CODES, TENANT_ERRORS, responses
+from mindbridge.api.errors import TENANT_ERRORS, code_for, error_body, responses
 from mindbridge.application.kernel import MemoryKernel
-from mindbridge.contracts import ErrorResponse, Identifier, ObservationProcessingJobView
-from mindbridge.core import DatabaseUnavailableError, JobNotFoundError
-from mindbridge.telemetry import current_trace_id
+from mindbridge.contracts import Identifier, ObservationProcessingJobView
 
 _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 _KEEPALIVE_SECONDS = 15.0
@@ -43,7 +41,7 @@ def register_job_event_routes(
                 ),
                 "content": {"text/event-stream": {"schema": {"type": "string"}}},
             },
-            **responses(*TENANT_ERRORS, "job_not_found"),
+            **responses(*TENANT_ERRORS, "job_not_found", "internal_error"),
         },
     )
     async def stream_observation_job(
@@ -93,7 +91,15 @@ async def _job_events(
                 view = upcoming.result()
             except StopAsyncIteration:
                 return
-            except (DatabaseUnavailableError, JobNotFoundError) as error:
+            except Exception as error:
+                # Every failure, not the two that were foreseen. A silent close is
+                # byte-identical to normal completion for the client -- `aiter_lines` just
+                # ends -- so anything escaping here without a frame was read as "the job
+                # settled". `translate_transient_database_errors` deliberately re-raises a
+                # psycopg error whose sqlstate it does not recognise, and a malformed row
+                # raises `MemoryIntegrityError`; neither was caught, and both told the caller
+                # the opposite of what happened. `Exception`, not `BaseException`, so
+                # cancellation still propagates.
                 # Distinguish a broken stream from a settled job; a silent close would look
                 # identical to normal completion.
                 yield _error_frame(error)
@@ -109,20 +115,17 @@ def _job_frame(view: ObservationProcessingJobView) -> str:
     return f"id: {_event_id(view.updated_at)}\nevent: job\ndata: {view.model_dump_json()}\n\n"
 
 
-def _error_frame(error: DatabaseUnavailableError | JobNotFoundError) -> str:
+def _error_frame(error: Exception) -> str:
     """Frame the same code and sentence the non-streaming routes would have returned.
 
-    Read from the same table the handlers use, so a stream cannot report a failure by a name
-    the rest of the API stopped using -- a divergence nothing would catch until a client was
-    already connected.
+    Read through the same mapping the handlers use, so a stream cannot report a failure by a
+    name the rest of the API stopped using -- a divergence nothing would catch until a client
+    was already connected. `internal_error` is the honest answer for a failure the contract
+    has no word for: the caller still learns the stream broke and still gets a `trace_id`,
+    which is strictly more than the silence this replaced.
     """
-    code = RUNTIME_ERROR_CODES[type(error)]
-    response = ErrorResponse(
-        code=code,
-        message=ERRORS[code].description,
-        trace_id=current_trace_id(),
-    )
-    return f"event: error\ndata: {response.model_dump_json()}\n\n"
+    body = error_body(code_for(error) or "internal_error")
+    return f"event: error\ndata: {body.model_dump_json()}\n\n"
 
 
 def _event_id(moment: datetime) -> int:

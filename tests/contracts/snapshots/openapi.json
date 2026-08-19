@@ -2921,6 +2921,16 @@
             },
             "description": "`request_validation_failed` — request validation failed"
           },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "`internal_error` — the request failed for a reason the server did not anticipate"
+          },
           "503": {
             "content": {
               "application/json": {

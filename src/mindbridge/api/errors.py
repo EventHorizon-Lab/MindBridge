@@ -4,6 +4,10 @@
 itself from the same entries. A code therefore cannot reach a caller without also reaching
 the OpenAPI document, which is what makes that document the contract rather than a partial
 description of the success path. Adding an error means adding one row here.
+
+The tables also name the failure for the faces that are not REST: `code_for` is what lets the
+job stream and the MCP tools report a failure by the same code REST would, instead of each
+deciding for itself. One mapping, three renderers.
 """
 
 from __future__ import annotations
@@ -17,7 +21,10 @@ from fastapi.responses import JSONResponse
 from mindbridge.contracts import ErrorResponse, ValidationIssue
 from mindbridge.core import (
     DatabaseUnavailableError,
+    DomainInvariantError,
+    EnumerationLimitExceededError,
     ForgetTargetNotFoundError,
+    IdempotencyConflictError,
     JobNotFoundError,
     MemoryDeletedError,
     MemoryIntegrityError,
@@ -49,6 +56,7 @@ ErrorCode = Literal[
     "model_unavailable",
     "object_storage_unavailable",
     "task_broker_unavailable",
+    "internal_error",
 ]
 """The closed set of error codes, so a misspelling is a type error rather than a KeyError.
 
@@ -140,6 +148,10 @@ ERRORS: Final[dict[ErrorCode, ApiError]] = {
         status.HTTP_503_SERVICE_UNAVAILABLE,
         "evidence media is unavailable",
     ),
+    "internal_error": ApiError(
+        status.HTTP_500_INTERNAL_SERVER_ERROR,
+        "the request failed for a reason the server did not anticipate",
+    ),
     "task_broker_unavailable": ApiError(
         status.HTTP_503_SERVICE_UNAVAILABLE,
         "observation processing is temporarily unavailable",
@@ -181,6 +193,52 @@ looks the code up the same way.
 """
 
 
+DOMAIN_INVARIANT_ERROR_CODES: Final[dict[type[Exception], ErrorCode]] = {
+    IdempotencyConflictError: "idempotency_conflict",
+    EnumerationLimitExceededError: "enumeration_limit_exceeded",
+    DomainInvariantError: "domain_invariant_failed",
+}
+"""The failures whose message is the caller's, so the handler passes `str(error)` through."""
+
+_ALL_ERROR_CODES: Final[dict[type[Exception], ErrorCode]] = {
+    **RUNTIME_ERROR_CODES,
+    **DOMAIN_INVARIANT_ERROR_CODES,
+}
+
+
+def code_for(error: BaseException) -> ErrorCode | None:
+    """Name the code this failure reports, or None if no row in the contract claims it.
+
+    Walks the MRO for the same reason the REST handler does -- a subclass of a mapped error is
+    still that error -- and is shared so the streaming and MCP faces cannot drift from REST on
+    what a failure is called. None means "nothing here has a word for this", which each face
+    answers in its own terms rather than inventing a code.
+    """
+    return next(
+        (
+            _ALL_ERROR_CODES[ancestor]
+            for ancestor in type(error).__mro__
+            if ancestor in _ALL_ERROR_CODES
+        ),
+        None,
+    )
+
+
+def error_body(
+    code: ErrorCode,
+    *,
+    message: str | None = None,
+    issues: tuple[ValidationIssue, ...] = (),
+) -> ErrorResponse:
+    """Build the envelope every face sends, so only the wrapper around it differs."""
+    return ErrorResponse(
+        code=code,
+        message=message or ERRORS[code].description,
+        trace_id=current_trace_id(),
+        issues=issues,
+    )
+
+
 def responses(*codes: ErrorCode) -> dict[int | str, dict[str, Any]]:
     """Document the exact codes one operation returns, grouped under their shared statuses.
 
@@ -206,11 +264,5 @@ def error_response(
     issues: tuple[ValidationIssue, ...] = (),
 ) -> JSONResponse:
     """Render one error, taking its status from the same row the OpenAPI document reads."""
-    error = ERRORS[code]
-    body = ErrorResponse(
-        code=code,
-        message=message or error.description,
-        trace_id=current_trace_id(),
-        issues=issues,
-    )
-    return JSONResponse(status_code=error.status_code, content=body.model_dump())
+    body = error_body(code, message=message, issues=issues)
+    return JSONResponse(status_code=ERRORS[code].status_code, content=body.model_dump())
