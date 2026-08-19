@@ -13,15 +13,22 @@ from datetime import datetime
 from typing import cast
 
 from mindbridge.application.consolidate_claims import ConsolidateClaims
+from mindbridge.application.consolidate_entities import ConsolidateEntities
 from mindbridge.application.consolidate_summaries import ConsolidateSummaries
 from mindbridge.application.consolidation import ConsolidateEpisodes
 from mindbridge.application.consolidation_sweep import (
     ConsolidationSweepSummary,
     consolidate_tenant_claims,
+    consolidate_tenant_entities,
     consolidate_tenant_episodes,
     consolidate_tenant_summaries,
 )
-from mindbridge.application.pipelines import ClaimPipeline, EpisodePipeline, SummaryPipeline
+from mindbridge.application.pipelines import (
+    ClaimPipeline,
+    EntityResolutionPipeline,
+    EpisodePipeline,
+    SummaryPipeline,
+)
 from mindbridge.cli import parser as build_parser
 from mindbridge.configuration import (
     copy_plugin_configuration,
@@ -30,7 +37,7 @@ from mindbridge.configuration import (
     require_environment_value,
     validate_plugin_name,
 )
-from mindbridge.core import TenantId, utc_now
+from mindbridge.core import EntityType, TenantId, utc_now
 from mindbridge.infrastructure.postgres import (
     PostgresMemoryStore,
     resolve_database_max_pool_size,
@@ -142,6 +149,18 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
             summary_page_size=options.summary_page_size,
             summary_maximum_gap_seconds=options.summary_maximum_gap_seconds,
             summary_minimum_similarity=options.summary_minimum_similarity,
+            entity_page_size=options.entity_page_size,
+            entity_maximum_gap_seconds=options.entity_maximum_gap_seconds,
+            entity_candidate_limit=options.entity_candidate_limit,
+            entity_minimum_confidence=options.entity_minimum_confidence,
+            entity_evidence_per_side=options.entity_evidence_per_side,
+            entity_maximum_pairs=options.entity_maximum_pairs,
+            # argparse append leaves None when the flag is absent, and the default is a
+            # deliberate choice rather than "all types", so it is spelled out here.
+            entity_types=tuple(
+                EntityType(value) for value in (options.entity_types or [EntityType.PERSON.value])
+            ),
+            entity_readjudicate=options.entity_readjudicate,
         )
     )
     print(json.dumps(_summary_dict(summary), sort_keys=True))
@@ -161,6 +180,14 @@ async def _run_postgres_sweep(
     summary_page_size: int,
     summary_maximum_gap_seconds: int,
     summary_minimum_similarity: float,
+    entity_page_size: int,
+    entity_maximum_gap_seconds: int,
+    entity_candidate_limit: int,
+    entity_minimum_confidence: float,
+    entity_evidence_per_side: int,
+    entity_maximum_pairs: int,
+    entity_types: tuple[EntityType, ...],
+    entity_readjudicate: bool,
 ) -> ConsolidationSweepSummary:
     store = PostgresMemoryStore(
         settings.database_url,
@@ -216,10 +243,28 @@ async def _run_postgres_sweep(
             maximum_gap_seconds=summary_maximum_gap_seconds,
             minimum_similarity=summary_minimum_similarity,
         )
+        entities = await consolidate_tenant_entities(
+            ConsolidateEntities(
+                store,
+                EntityResolutionPipeline(generator),
+                media_url_signer=media_access,
+            ),
+            tenant_id,
+            evaluated_at,
+            page_size=entity_page_size,
+            maximum_gap_seconds=entity_maximum_gap_seconds,
+            candidate_limit=entity_candidate_limit,
+            minimum_confidence=entity_minimum_confidence,
+            evidence_per_side=entity_evidence_per_side,
+            maximum_pairs=entity_maximum_pairs,
+            entity_types=entity_types,
+            readjudicate=entity_readjudicate,
+        )
         return ConsolidationSweepSummary(
             episodes=episodes,
             claims=claims,
             summaries=summaries,
+            entities=entities,
         )
 
 
@@ -277,6 +322,51 @@ def _parser(prog: str | None = None) -> argparse.ArgumentParser:
         default=0.8,
         help="lowest similarity two memories may have and still join one Summary",
     )
+    parser.add_argument(
+        "--entity-page-size", type=int, default=16, help="entity seeds per bounded page"
+    )
+    parser.add_argument(
+        "--entity-maximum-gap-seconds",
+        type=int,
+        default=2_592_000,
+        help="longest span two entities may cover and still be judged the same entity",
+    )
+    parser.add_argument(
+        "--entity-candidate-limit",
+        type=int,
+        default=8,
+        help="peers per entity seed, taken in order of vector affinity",
+    )
+    parser.add_argument(
+        "--entity-minimum-confidence",
+        type=float,
+        default=0.75,
+        help="lowest confidence a verdict may carry and still be recorded either way",
+    )
+    parser.add_argument(
+        "--entity-evidence-per-side",
+        type=int,
+        default=3,
+        help="evidence spans reopened per entity when judging one pair",
+    )
+    parser.add_argument(
+        "--entity-maximum-pairs",
+        type=int,
+        default=64,
+        help="pairs judged per page; the rest are reported as dropped, not hidden",
+    )
+    parser.add_argument(
+        "--entity-type",
+        dest="entity_types",
+        action="append",
+        choices=[item.value for item in EntityType],
+        help="entity type to adjudicate; repeatable, default person only",
+    )
+    parser.add_argument(
+        "--entity-readjudicate",
+        action="store_true",
+        help="re-judge pairs that already carry a verdict, replacing it",
+    )
     return parser
 
 
@@ -304,6 +394,16 @@ def _summary_dict(summary: ConsolidationSweepSummary) -> dict[str, object]:
             "page_count": summary.summaries.page_count,
             "proposed_count": summary.summaries.proposed_count,
             "scanned_count": summary.summaries.scanned_count,
+        },
+        "entities": {
+            "candidate_pair_count": summary.entities.candidate_pair_count,
+            "committed_count": summary.entities.committed_count,
+            "dropped_pair_count": summary.entities.dropped_pair_count,
+            "not_same_as_count": summary.entities.not_same_as_count,
+            "page_count": summary.entities.page_count,
+            "same_as_count": summary.entities.same_as_count,
+            "scanned_count": summary.entities.scanned_count,
+            "skipped_pair_count": summary.entities.skipped_pair_count,
         },
         "evaluated_at": summary.episodes.evaluated_at.isoformat(),
         "tenant_id": summary.episodes.tenant_id,

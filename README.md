@@ -1164,8 +1164,8 @@ Non-default Worker adapters use `MINDBRIDGE_MEDIA_EMBEDDER_CONFIG_JSON` and
 Both slots must resolve to one embedding space. The Worker compares the two declared spaces before
 processing and fails the job instead of writing media and text vectors that cannot be compared.
 
-Run evidence-verified Episode, semantic Claim, and hierarchical Summary consolidation as one
-tenant-scoped scheduled job.
+Run evidence-verified Episode, semantic Claim, hierarchical Summary, and entity consolidation as
+one tenant-scoped scheduled job.
 It reuses the database, object-storage, Generator, Embedder, and shared embedding-space variables above;
 no task broker or local Jina Omni model is required:
 
@@ -1183,6 +1183,26 @@ original AV before grouping, and remain recursively expandable to their source m
 The corresponding `--summary-*` options calibrate hierarchical Memory grouping.
 Schedule the command with the deployment's existing CronJob/systemd/Celery beat control plane;
 concurrent runs are idempotent.
+
+Entity consolidation decides whether two separately-named entity records are one real entity.
+Perception names what it sees once per clip, so the same person can accumulate a fresh name in
+every clip; identical names already collapse, and an edge identity signal already keeps anonymous
+people stable, so what is left is the same entity described two different ways. The sweep pairs
+same-type entities whose mentioning events fall inside `--entity-maximum-gap-seconds`, shortlists
+`--entity-candidate-limit` peers per entity by vector affinity, reopens up to
+`--entity-evidence-per-side` spans of each record's original recording, and asks the Generator to
+judge that pair alone.
+
+A verdict is written only when the judge reached one: a confident `same_as`, or a confident
+`not_same_as` so the pair is not paid for again. Anything else — unreadable media, unparseable
+output, or a confidence under `--entity-minimum-confidence` in either direction — leaves the pair
+unjudged for a later sweep. Verdicts are pairwise and never composed, so `same_as` between A and B
+and between B and C does not imply anything about A and C. One pair owns one verdict row, and
+`--entity-readjudicate` replaces it rather than adding a contradiction. `--entity-maximum-pairs`
+bounds a page and reports what it left behind. `--entity-type` is repeatable and defaults to
+`person` only, because that is where the fragmentation is and widening it carries identical risk
+for much less value. Retrieval does not traverse `same_as` yet; the edge is written for the graph
+and for agents reading it.
 
 Run automatic decay as a tenant-scoped scheduled job. A complete run uses stable bounded pages and
 one fixed evaluation instant; concurrent feedback or deletion wins through optimistic guards:
