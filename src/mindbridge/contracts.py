@@ -801,14 +801,26 @@ class EvidenceView(ContractModel):
     )
 
 
-class MemoryResult(MemoryView):
-    """Top-level memory response with directly inspectable evidence."""
+class _InspectableMemory(MemoryView):
+    """One memory, its signed evidence, and the trace of the request that returned it.
+
+    Shared by the read and the write result rather than inherited by one from the other. A
+    write result carries a field a read has no value for, so making it a subclass would let it
+    pass wherever a read result is accepted: serializing it through a `MemoryResult`-typed
+    position silently drops `status`, and persisting it where a `MemoryResult` is expected
+    stores a field that then fails to parse on the way back out. Siblings make both a type
+    error at the boundary instead.
+    """
 
     evidence: tuple[EvidenceView, ...] = Field(
         default=(),
         description="Signed evidence for this memory, attached rather than referenced.",
     )
     trace_id: Identifier = Field(description="Correlates this request with its telemetry.")
+
+
+class MemoryResult(_InspectableMemory):
+    """Top-level memory response with directly inspectable evidence."""
 
 
 class MemoryWriteStatus(str, Enum):
@@ -818,7 +830,9 @@ class MemoryWriteStatus(str, Enum):
     DUPLICATE = "duplicate"
 
 
-class RememberResult(MemoryResult):
+# A sibling of `MemoryResult`, not a subclass: see `_InspectableMemory`. Kept out of the
+# docstring because that is published to callers, who read the same field names either way.
+class RememberResult(_InspectableMemory):
     """One retained memory and whether this request is what created it."""
 
     status: MemoryWriteStatus = Field(

@@ -35,6 +35,7 @@ from mindbridge.contracts import (
     RecallQuery,
     RecallRequest,
     RememberRequest,
+    RememberResult,
 )
 from mindbridge.core import (
     DeletionTombstone,
@@ -982,7 +983,10 @@ async def test_remember_returns_one_result_for_one_request_and_a_batch_for_a_bat
         )
     )
 
-    assert isinstance(single, MemoryResult)
+    # `RememberResult`, not a `MemoryResult`: a write result is a sibling of a read result,
+    # so isinstance here also pins that it never became substitutable for one.
+    assert isinstance(single, RememberResult)
+    assert not isinstance(single, MemoryResult)
     assert single.summary == "only one"
     assert isinstance(batch, tuple)
     assert [item.summary for item in batch] == ["fact 0", "fact 1", "fact 2"]
