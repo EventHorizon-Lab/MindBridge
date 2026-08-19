@@ -24,7 +24,8 @@ from mindbridge.infrastructure.task_queue import (
     PROCESS_OBSERVATION_TASK,
     ObservationProcessingTaskMessage,
 )
-from mindbridge.worker import WorkerSettings, create_worker_app
+from mindbridge.models.openai import _GeneratorConfig
+from mindbridge.worker import WorkerSettings, create_worker_app, processing_budget_seconds
 
 
 def test_worker_settings_pin_models_and_redact_credentials() -> None:
@@ -308,3 +309,53 @@ def _task_message() -> dict[str, str]:
         "observation_id": "observation_01",
         "job_id": "job_process_observation_01",
     }
+
+
+@pytest.mark.parametrize(
+    ("configured", "expected"),
+    [
+        # An absent key means the generator applies its own default, not the 780 this module
+        # injects on the path where no generator JSON is supplied at all -- that path writes its
+        # key into the config, so it never reaches the fallback.
+        ({}, 2_100.0),
+        ({"request_timeout_seconds": 1_800.0}, 2_100.0),
+        ({"request_timeout_seconds": 780.0}, 1_080.0),
+    ],
+)
+def test_worker_sizes_its_task_budget_from_the_generator_deadline(
+    configured: dict[str, object], expected: float
+) -> None:
+    """The Celery budget follows the model deadline the deployment actually configured.
+
+    These two numbers used to be independent, and a deployment that gave its generator 1800s kept
+    a 840s task limit: every observation was killed mid-perception and retried, so the write path
+    could never finish however long it was left running.
+    """
+    assert processing_budget_seconds(configured) == expected
+
+
+def test_a_generator_config_that_names_no_deadline_still_outlives_the_one_it_gets() -> None:
+    """Reads the plugin's own default rather than restating it, so the two cannot drift apart.
+
+    A config supplying an endpoint but no `request_timeout_seconds` is the ordinary shape, and the
+    generator then applies its own default. Sizing the budget from a different constant put a
+    1800s model call inside a 1080s task -- and `SoftTimeLimitExceeded` is in `autoretry_for`, so
+    that deterministic overrun was retried rather than reported.
+    """
+    config: dict[str, object] = {
+        "api_key": "k",
+        "endpoint": "https://example.test/v1",
+        "model_revision": "rev",
+    }
+    client_deadline = _GeneratorConfig.model_validate(config).request_timeout_seconds
+
+    assert processing_budget_seconds(config) > client_deadline
+
+
+@pytest.mark.parametrize(
+    "configured", [{"request_timeout_seconds": 0}, {"request_timeout_seconds": "soon"}]
+)
+def test_worker_rejects_an_unusable_generator_deadline(configured: dict[str, object]) -> None:
+    """A budget derived from nonsense would be worse than the constant it replaced."""
+    with pytest.raises(ValueError, match="request_timeout_seconds must be"):
+        processing_budget_seconds(configured)

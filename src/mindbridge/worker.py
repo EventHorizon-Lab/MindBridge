@@ -64,6 +64,7 @@ from mindbridge.media.clipping import (
 )
 from mindbridge.models.defaults import (
     DEFAULT_EMBEDDING_DIMENSION,
+    DEFAULT_GENERATOR_REQUEST_TIMEOUT_SECONDS,
     embedding_dimension_from_environment,
     jina_media_embedder_config,
     openai_embedder_config,
@@ -73,6 +74,14 @@ from mindbridge.models.plugins import close_model, load_embedder, load_generator
 from mindbridge.telemetry import configure_telemetry
 
 _MODEL_REQUEST_TIMEOUT_SECONDS = 780.0
+_POST_MODEL_BUDGET_SECONDS = 300.0
+"""What one observation needs after its model call: media and text encoding, and the graph write.
+
+Encoding a 30-second clip through a local Omni model is minutes on its own, so this cannot be the
+handful of seconds a fast deployment gets away with. It is added to the model deadline to size the
+Celery budget, which is what keeps a slow generator from being cut off by the task limit instead of
+by its own timeout.
+"""
 _RUNNING_RETRY_SECONDS = 30
 _RUNNING_MAX_RETRIES = 40
 _TRANSIENT_MAX_RETRIES = 5
@@ -256,9 +265,35 @@ _worker_runtime: _WorkerRuntime | None = None
 _worker_runtime_key: tuple[str, str] | None = None
 
 
+def processing_budget_seconds(generator_config: Mapping[str, object]) -> float:
+    """Size the task budget from the deadline this deployment gave its generator.
+
+    Perception is one model call per observation, so the budget is that call's own deadline plus
+    what the encoding and graph write after it need. Reading the configured value rather than a
+    constant is the point: a deployment on a slow generator raises `request_timeout_seconds` in
+    one place and the Celery limits follow, instead of the task being killed mid-call by a limit
+    that was written for a faster one.
+    """
+    # Absent means the plugin's own default applies, which is not the value this module
+    # injects on the path where no generator JSON is supplied at all -- that path puts its
+    # own key in the config, so it never reaches this fallback. Reading 780 here instead
+    # sized the budget below the 1800 the bundled generator would actually take.
+    configured = generator_config.get(
+        "request_timeout_seconds", DEFAULT_GENERATOR_REQUEST_TIMEOUT_SECONDS
+    )
+    if isinstance(configured, bool) or not isinstance(configured, (int, float)):
+        raise ValueError("generator request_timeout_seconds must be a number")
+    if configured <= 0:
+        raise ValueError("generator request_timeout_seconds must be positive")
+    return float(configured) + _POST_MODEL_BUDGET_SECONDS
+
+
 def create_worker_app(settings: WorkerSettings) -> Celery:
     """Register the ID-only processing task on one GPU-safe Celery app."""
-    task_queue = create_task_queue(settings.task_broker_url)
+    task_queue = create_task_queue(
+        settings.task_broker_url,
+        processing_budget_seconds=processing_budget_seconds(settings.generator_config),
+    )
     task_queue.conf.update(worker_concurrency=1, worker_pool="prefork")
 
     @task_queue.task(  # type: ignore[untyped-decorator]

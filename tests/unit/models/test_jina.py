@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from mindbridge.core import MediaKind, ModelOutputError, ModelReference
+from mindbridge.core import MediaKind, ModelOutputError, ModelReference, ModelUnavailableError
 from mindbridge.models import EmbedRequest, EmbedTask, MediaPart, ModelInput, TextPart
 from mindbridge.models.defaults import require_matryoshka_dimension
 from mindbridge.models.jina import JinaEmbedder
@@ -161,3 +161,54 @@ def test_matryoshka_validation_accepts_trained_widths_and_rejects_others() -> No
 
     with pytest.raises(ValueError, match="embedding dimension must be one of"):
         require_matryoshka_dimension(500)
+
+
+class OmniModule:
+    """One SentenceTransformer submodule, with or without its media processor."""
+
+    def __init__(self, processor: object) -> None:
+        self.processor = processor
+
+
+class OmniEncoder(RecordingEncoder):
+    """An encoder that exposes its submodules the way SentenceTransformer does."""
+
+    def __init__(self, processor: object) -> None:
+        super().__init__([[1.0, 0.0]])
+        self._modules = [OmniModule(processor)]
+
+    def __iter__(self) -> object:
+        return iter(self._modules)
+
+
+def _load_with(encoder: object, monkeypatch: pytest.MonkeyPatch) -> JinaEmbedder:
+    monkeypatch.setattr(
+        "mindbridge.models.jina.import_module",
+        lambda name: (
+            SimpleNamespace(SentenceTransformer=lambda *_a, **_k: encoder)
+            if name == "sentence_transformers"
+            else SimpleNamespace(snapshot_download=lambda **_k: "/models/pinned")
+        ),
+    )
+    monkeypatch.setattr("mindbridge.models.jina.select_torch_device", lambda _device: "cuda")
+    return JinaEmbedder.load(revision="pinned-revision", dimension=2)
+
+
+def test_jina_refuses_a_model_whose_media_processor_failed_to_load(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A text-only degradation is refused at load, not discovered on the first frame.
+
+    Jina assigns `None` to the processor inside a bare `except Exception`, so without this the
+    model loads, embeds text, and raises an opaque TypeError once a perception call has already
+    been spent on the clip it cannot encode.
+    """
+    with pytest.raises(ModelUnavailableError, match="only embed text"):
+        _load_with(OmniEncoder(None), monkeypatch)
+
+
+def test_jina_accepts_a_model_that_carries_its_media_processor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The guard rejects an empty processor slot, not every model it cannot introspect."""
+    assert _load_with(OmniEncoder(object()), monkeypatch) is not None

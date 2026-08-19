@@ -18,6 +18,7 @@ __all__ = [
     "DEFAULT_EMBEDDING_DIMENSION",
     "DEFAULT_EMBEDDING_SPACE",
     "DEFAULT_GENERATOR_MODEL_ID",
+    "DEFAULT_GENERATOR_REQUEST_TIMEOUT_SECONDS",
     "MATRYOSHKA_DIMENSIONS",
     "MatryoshkaDimension",
     "embedding_dimension_from_environment",
@@ -28,6 +29,14 @@ __all__ = [
 ]
 
 DEFAULT_GENERATOR_MODEL_ID = "qwen3.8-max"
+DEFAULT_GENERATOR_REQUEST_TIMEOUT_SECONDS = 1_800.0
+"""Deadline the bundled generator applies when a supplied config does not name one.
+
+The Worker sizes its Celery budget from this, so the two have to be the same number. They
+were not: the plugin defaulted to 1800 while the Worker assumed 780, and a deployment that
+supplied MINDBRIDGE_GENERATOR_CONFIG_JSON without this key got a model client allowed 1800s
+inside a task killed at 1080 -- the disagreement the derived budget exists to remove.
+"""
 DEFAULT_EMBEDDER_MODEL_ID = "jinaai/jina-embeddings-v5-omni-small-retrieval"
 DEFAULT_EMBEDDER_REVISION = "12949877f0092093f366c6450340011320152a05"
 DEFAULT_EMBEDDING_SPACE = EmbeddingSpaceReference(

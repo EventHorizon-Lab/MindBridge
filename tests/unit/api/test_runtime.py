@@ -106,7 +106,9 @@ async def test_runtime_closes_every_model_and_the_store(monkeypatch: pytest.Monk
         runtime_module, "PostgresMemoryStore", lambda *_arguments, **_options: Store()
     )
     monkeypatch.setattr(runtime_module, "S3MediaAccess", lambda *_arguments, **_options: object())
-    monkeypatch.setattr(runtime_module, "create_task_queue", lambda *_arguments: object())
+    monkeypatch.setattr(
+        runtime_module, "create_task_queue", lambda *_arguments, **_keywords: object()
+    )
     monkeypatch.setattr(
         runtime_module,
         "CeleryObservationJobPublisher",
@@ -177,7 +179,9 @@ async def test_runtime_probes_every_configured_tenant_on_startup(
         runtime_module, "PostgresMemoryStore", lambda *_arguments, **_options: Store()
     )
     monkeypatch.setattr(runtime_module, "S3MediaAccess", lambda *_arguments, **_options: object())
-    monkeypatch.setattr(runtime_module, "create_task_queue", lambda *_arguments: object())
+    monkeypatch.setattr(
+        runtime_module, "create_task_queue", lambda *_arguments, **_keywords: object()
+    )
     monkeypatch.setattr(
         runtime_module,
         "CeleryObservationJobPublisher",

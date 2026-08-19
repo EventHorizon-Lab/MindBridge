@@ -77,6 +77,11 @@ cloud-models = [
     "opentelemetry-api>=1.44,<2",
     "sentence-transformers>=5.2,<6",
     "torch==2.9.1",
+    # Jina Omni's image and video processor is a Qwen3-VL processor, and that one refuses to
+    # construct without Torchvision. Its loader swallows the ImportError and leaves the
+    # processor unset, so an install without this line embeds text and dies on the first
+    # frame instead of failing where the dependency is missing.
+    "torchvision==0.24.1",
     "transformers>=5.1,<6",
 ]
 
@@ -87,6 +92,9 @@ explicit = true
 
 [tool.uv.sources]
 torch = { index = "pytorch-cu128" }
+# Torchvision ships one wheel per CUDA build like torch does, and the PyPI wheel links against a
+# different runtime, so it has to resolve from the same index its torch does.
+torchvision = { index = "pytorch-cu128" }
 
 [dependency-groups]
 dev = [

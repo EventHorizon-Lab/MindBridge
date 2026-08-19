@@ -114,6 +114,13 @@ bundled per-field variables or through one explicit JSON object.
 what each one is for. A model ID has a sensible default; the exact revision behind an endpoint
 does not, and recording the wrong one makes every derived record's provenance a lie.
 
+`request_timeout_seconds` has no fallback variable — it lives in
+`MINDBRIDGE_GENERATOR_CONFIG_JSON` and defaults to **1800**. It is worth knowing because it does
+double duty: the worker derives its whole Celery task budget from it, adding a fixed 300-second
+allowance for the encoding and graph write after the model call. Raising it is how a deployment on
+a slow generator moves both deadlines at once. See
+[deployment](deployment.md#how-long-one-observation-may-take).
+
 ### Text embedder
 
 | Variable | Required | Default |

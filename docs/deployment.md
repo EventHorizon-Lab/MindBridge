@@ -149,6 +149,32 @@ Both embedder slots must resolve to one embedding space. The worker compares the
 spaces before processing and fails the job rather than writing media and text vectors that cannot
 be compared.
 
+### How long one observation may take
+
+This is not a separate setting. Perception is one generator call per observation, so the worker
+sizes its Celery soft limit, hard limit, and broker re-delivery window from the generator's own
+`request_timeout_seconds`, plus a fixed 300-second allowance for the encoding and graph write that
+follow. A slow deployment raises one value and the budget follows:
+
+```bash
+export MINDBRIDGE_GENERATOR_CONFIG_JSON='{
+  "api_key": "...",
+  "endpoint": "https://generator.example.com/v1",
+  "model_id": "qwen3.8-max",
+  "model_revision": "deployment-2026-08-11",
+  "request_timeout_seconds": 1800
+}'
+```
+
+Omitting the key is fine: the bundled generator's own default of 1800 seconds applies, and the
+budget is derived from that same number, so the two cannot disagree.
+
+Sizing them independently is what makes a slow generator look like a *broken* write path rather
+than a slow one. Perception can spend thousands of output tokens on a busy 30-second clip; if the
+task limit expires first, the overrun is retried as though it were transient and the same call is
+paid for again until the retries run out. Nothing is written either way. Set the generator's
+deadline to what its slowest clip actually needs and let the budget follow.
+
 The worker inspects original AV once, writes evidence-grounded Event/Entity/Claim records
 atomically, and cuts one derived clip per grounded span before encoding it locally. Event and
 Claim text is batched through the remote embedder.

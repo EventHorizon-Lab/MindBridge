@@ -71,3 +71,27 @@ async def test_publisher_sanitizes_broker_failures(monkeypatch: pytest.MonkeyPat
             ObservationId("observation_01"),
             JobId("job_process_observation_01"),
         )
+
+
+def test_task_queue_deadlines_follow_the_processing_budget() -> None:
+    """One budget moves all three deadlines, so a slow generator cannot be cut off by them.
+
+    Fixed constants here silently overrode the model's own timeout: the soft limit killed every
+    observation mid-call, the overrun was retried as if it were transient, and the same call was
+    paid for again. The ordering matters as much as the values -- re-delivery has to sit beyond
+    the hard kill, or a task still running is handed to a second worker.
+    """
+    task_queue = create_task_queue("memory://", processing_budget_seconds=2_100.0)
+
+    soft = task_queue.conf.task_soft_time_limit
+    hard = task_queue.conf.task_time_limit
+    redelivery = task_queue.conf.broker_transport_options["visibility_timeout"]
+
+    assert soft == 2_100.0
+    assert soft < hard < redelivery
+
+
+def test_task_queue_rejects_a_budget_that_cannot_hold_any_work() -> None:
+    """A non-positive budget would kill every task instantly instead of bounding it."""
+    with pytest.raises(ValueError, match="processing_budget_seconds must be positive"):
+        create_task_queue("memory://", processing_budget_seconds=0)

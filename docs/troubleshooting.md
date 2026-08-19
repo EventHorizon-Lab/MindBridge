@@ -162,10 +162,35 @@ and `attempt`.
 Redis is unreachable from the API. Nothing is half-written — the transaction and the enqueue are
 ordered so a broker failure rejects the request outright.
 
+### The same observation is retried until it gives up
+
+The task budget expired mid-model-call. A soft-limit overrun is retried as though it were
+transient, so an observation that legitimately needs longer never finishes — it repeats the same
+generator call, paying for each one, until the retries run out. Nothing is written either way.
+
+Raise `request_timeout_seconds` in `MINDBRIDGE_GENERATOR_CONFIG_JSON`; the worker's Celery limits
+are derived from it and follow automatically.
+
 ### Jobs stay `pending`
 
 The worker is not consuming. Check it is running, has `--extra server --extra cloud-models`
 installed, and points at the same `MINDBRIDGE_TASK_BROKER_URL`.
+
+### `TypeError: 'NoneType' object is not callable` on the first frame
+
+Torchvision is missing. Jina Omni's image and video processor is a Qwen3-VL processor that refuses
+to construct without it, and the upstream loader swallows that `ImportError` and leaves the
+processor unset — so the model loads, embeds text happily, and dies on the first frame it is given.
+
+MindBridge now detects the empty processor slot and says so instead. Install the extra, which
+pins `torchvision` from the same CUDA index as torch:
+
+```bash
+uv sync --extra server --extra cloud-models
+```
+
+A `torchvision` from PyPI links against a different CUDA runtime, so installing it by hand
+generally does not work.
 
 ### The worker fails every media job
 
