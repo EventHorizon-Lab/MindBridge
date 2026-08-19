@@ -16,7 +16,13 @@ from mindbridge.api.auth import (
     TenantPrincipal,
     require_tenant,
 )
-from mindbridge.api.errors import TENANT_ERRORS, error_response, responses
+from mindbridge.api.errors import (
+    RUNTIME_ERROR_CODES,
+    TENANT_ERRORS,
+    ErrorCode,
+    error_response,
+    responses,
+)
 from mindbridge.api.events import register_job_event_routes
 from mindbridge.application.kernel import MemoryKernel
 from mindbridge.contracts import (
@@ -39,40 +45,30 @@ from mindbridge.contracts import (
     ValidationIssue,
 )
 from mindbridge.core import (
-    DatabaseUnavailableError,
     DomainInvariantError,
     EnumerationLimitExceededError,
-    ForgetTargetNotFoundError,
     IdempotencyConflictError,
-    JobNotFoundError,
-    MemoryDeletedError,
-    MemoryIntegrityError,
-    MemoryNotFoundError,
-    ModelOutputError,
-    ModelRequestError,
-    ModelUnavailableError,
-    ObjectStorageError,
-    TaskBrokerError,
 )
 from mindbridge.models import Generator
 from mindbridge.telemetry import current_trace_id
 
-_MODEL_ERROR_CODES: Final[dict[type[Exception], str]] = {
-    ModelOutputError: "model_output_invalid",
-    ModelRequestError: "model_request_failed",
-}
-_DEPENDENCY_ERROR_CODES: Final[dict[type[Exception], str]] = {
-    DatabaseUnavailableError: "database_unavailable",
-    ModelUnavailableError: "model_unavailable",
-    ObjectStorageError: "object_storage_unavailable",
-    TaskBrokerError: "task_broker_unavailable",
-}
-_EMBEDDING_ERRORS: Final[tuple[str, ...]] = (
+_EMBEDDING_ERRORS: Final[tuple[ErrorCode, ...]] = (
     "model_request_failed",
     "model_output_invalid",
     "model_unavailable",
 )
 """What any operation that encodes a vector before answering the caller can return."""
+
+_EVIDENCE_ERRORS: Final[tuple[ErrorCode, ...]] = (
+    "memory_integrity_failed",
+    "object_storage_unavailable",
+)
+"""What any operation that resolves and signs evidence before replying can return.
+
+Signing is on the request path, not only in the worker: `_memory_result` reads the evidence
+rows and presigns each media object, so a broken object store or a memory pointing at missing
+or cross-tenant evidence surfaces to whoever asked, not to a background job.
+"""
 
 
 def build_app(
@@ -123,6 +119,7 @@ def build_app(
             "idempotency_conflict",
             "domain_invariant_failed",
             *_EMBEDDING_ERRORS,
+            *_EVIDENCE_ERRORS,
         ),
     )
     async def remember(
@@ -161,8 +158,8 @@ def build_app(
         responses=responses(
             *TENANT_ERRORS,
             "enumeration_limit_exceeded",
-            "memory_integrity_failed",
             *_EMBEDDING_ERRORS,
+            *_EVIDENCE_ERRORS,
         ),
     )
     async def recall(
@@ -176,7 +173,12 @@ def build_app(
         "/v1/memories/{memory_id}",
         response_model=MemoryResult,
         operation_id="getMemory",
-        responses=responses(*TENANT_ERRORS, "memory_not_found", "memory_deleted"),
+        responses=responses(
+            *TENANT_ERRORS,
+            "memory_not_found",
+            "memory_deleted",
+            *_EVIDENCE_ERRORS,
+        ),
     )
     async def get_memory(
         memory_id: Identifier,
@@ -223,7 +225,8 @@ def _register_deletion_routes(
             *TENANT_ERRORS,
             "forget_target_not_found",
             "idempotency_conflict",
-            # Erasing media is part of the command, so its storage is on this request's path.
+            # Erasing the bytes is part of the command, and a failure to reach them is
+            # reported rather than swallowed: the tombstone is marked failed and re-raised.
             "object_storage_unavailable",
         ),
     )
@@ -301,6 +304,7 @@ def _register_request_error_handlers(app: FastAPI) -> None:
         _request: Request,
         error: DomainInvariantError,
     ) -> JSONResponse:
+        code: ErrorCode
         if isinstance(error, IdempotencyConflictError):
             code = "idempotency_conflict"
         elif isinstance(error, EnumerationLimitExceededError):
@@ -311,58 +315,16 @@ def _register_request_error_handlers(app: FastAPI) -> None:
 
 
 def _register_runtime_error_handlers(app: FastAPI) -> None:
-    @app.exception_handler(ForgetTargetNotFoundError)
-    async def handle_forget_target_not_found(
-        _request: Request,
-        _error: ForgetTargetNotFoundError,
-    ) -> JSONResponse:
-        return error_response("forget_target_not_found")
+    """Answer every runtime failure from the one table, so none escapes the envelope."""
 
-    @app.exception_handler(MemoryDeletedError)
-    async def handle_memory_deleted(
-        _request: Request,
-        _error: MemoryDeletedError,
-    ) -> JSONResponse:
-        return error_response("memory_deleted")
+    async def handle(_request: Request, error: Exception) -> JSONResponse:
+        # Starlette dispatches by MRO, so a subclass of a registered error arrives here too.
+        code = next(
+            RUNTIME_ERROR_CODES[ancestor]
+            for ancestor in type(error).__mro__
+            if ancestor in RUNTIME_ERROR_CODES
+        )
+        return error_response(code)
 
-    @app.exception_handler(MemoryNotFoundError)
-    async def handle_memory_not_found(
-        _request: Request,
-        _error: MemoryNotFoundError,
-    ) -> JSONResponse:
-        return error_response("memory_not_found")
-
-    @app.exception_handler(JobNotFoundError)
-    async def handle_job_not_found(
-        _request: Request,
-        _error: JobNotFoundError,
-    ) -> JSONResponse:
-        return error_response("job_not_found")
-
-    @app.exception_handler(ModelRequestError)
-    @app.exception_handler(ModelOutputError)
-    async def handle_model_protocol_error(
-        _request: Request,
-        error: ModelOutputError | ModelRequestError,
-    ) -> JSONResponse:
-        return error_response(_MODEL_ERROR_CODES[type(error)])
-
-    @app.exception_handler(DatabaseUnavailableError)
-    @app.exception_handler(ModelUnavailableError)
-    @app.exception_handler(ObjectStorageError)
-    @app.exception_handler(TaskBrokerError)
-    async def handle_dependency_unavailable(
-        _request: Request,
-        error: DatabaseUnavailableError
-        | ModelUnavailableError
-        | ObjectStorageError
-        | TaskBrokerError,
-    ) -> JSONResponse:
-        return error_response(_DEPENDENCY_ERROR_CODES[type(error)])
-
-    @app.exception_handler(MemoryIntegrityError)
-    async def handle_memory_integrity_error(
-        _request: Request,
-        _error: MemoryIntegrityError,
-    ) -> JSONResponse:
-        return error_response("memory_integrity_failed")
+    for exception in RUNTIME_ERROR_CODES:
+        app.add_exception_handler(exception, handle)

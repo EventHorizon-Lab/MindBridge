@@ -508,11 +508,13 @@ class MemoryKernel:
         `observe` has always answered `accepted` or `duplicate`; a caller retrying `remember`
         could only infer it from a memory_id it had seen before. The store already knows.
         """
-        return RememberResult.model_validate(
-            (await self._memory_result(memory)).model_dump()
-            | {
-                "status": (MemoryWriteStatus.CREATED if created else MemoryWriteStatus.DUPLICATE),
-            }
+        result = await self._memory_result(memory)
+        # `__dict__` hands over the EvidenceView instances already built; dumping and
+        # revalidating would rebuild every one of them, so the cost of attaching a single
+        # enum would grow with the evidence count.
+        return RememberResult(
+            **result.__dict__,
+            status=MemoryWriteStatus.CREATED if created else MemoryWriteStatus.DUPLICATE,
         )
 
     async def _memory_result(self, memory: MemoryRecord) -> MemoryResult:

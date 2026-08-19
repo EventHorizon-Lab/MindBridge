@@ -20,6 +20,7 @@ from mindbridge.api.aml_contracts import (
     derive_tenant_id,
 )
 from mindbridge.api.auth import AuthenticationError
+from mindbridge.api.errors import ErrorCode, responses
 from mindbridge.application.aml_extraction import extract_memories
 from mindbridge.application.kernel import MemoryKernel
 from mindbridge.contracts import (
@@ -33,6 +34,23 @@ from mindbridge.telemetry import set_current_span_attributes
 
 _BEARER = HTTPBearer(auto_error=False)
 _MINIMUM_API_KEY_LENGTH = 32
+
+
+_AML_ERRORS: tuple[ErrorCode, ...] = (
+    "authentication_required",
+    "authentication_failed",
+    "request_validation_failed",
+    "domain_invariant_failed",
+    "database_unavailable",
+    "model_request_failed",
+    "model_output_invalid",
+    "model_unavailable",
+)
+"""What both AML routes can return: one key, then extraction or recall over the kernel.
+
+They answer in the same `ErrorResponse` envelope as `/v1`, so they document it the same way;
+leaving them undeclared republished FastAPI's `HTTPValidationError` for a body it never sends.
+"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,7 +94,12 @@ def register_aml_routes(
         if not hmac.compare_digest(candidate, expected):
             raise AuthenticationError("authentication_failed")
 
-    @app.post("/aml/add", response_model=AmlAddResponse, operation_id="amlAdd")
+    @app.post(
+        "/aml/add",
+        response_model=AmlAddResponse,
+        operation_id="amlAdd",
+        responses=responses(*_AML_ERRORS),
+    )
     async def aml_add(
         request: AmlAddRequest,
         _: None = Security(authorize),
@@ -110,7 +133,12 @@ def register_aml_routes(
             session_id=request.session_id,
         )
 
-    @app.post("/aml/search", response_model=AmlSearchResponse, operation_id="amlSearch")
+    @app.post(
+        "/aml/search",
+        response_model=AmlSearchResponse,
+        operation_id="amlSearch",
+        responses=responses(*_AML_ERRORS, "memory_integrity_failed", "object_storage_unavailable"),
+    )
     async def aml_search(
         request: AmlSearchRequest,
         _: None = Security(authorize),

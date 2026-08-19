@@ -356,7 +356,7 @@
         },
         "target_type": {
           "$ref": "#/$defs/ForgetTargetType",
-          "description": "What was erased."
+          "description": "What `target_id` named: `memory_record` erased that one memory, `observation` erased a source observation and everything derived from it."
         },
         "tombstone_id": {
           "description": "Stable ID of this deletion barrier, usable as a cursor.",
@@ -1281,7 +1281,7 @@
                 }
               ],
               "default": null,
-              "description": "Keep only memories occurring at or after this moment.",
+              "description": "Keep only memories occurring at or after this moment; the bound is inclusive.",
               "title": "Occurred After"
             },
             "occurred_before": {
@@ -1295,7 +1295,7 @@
                 }
               ],
               "default": null,
-              "description": "Keep only memories occurring at or before this moment; must not precede `occurred_after`.",
+              "description": "Keep only memories occurring strictly before this moment -- unlike `occurred_after`, this bound is exclusive, so a memory exactly at it is left out. Must not precede `occurred_after`.",
               "title": "Occurred Before"
             },
             "person_ids": {

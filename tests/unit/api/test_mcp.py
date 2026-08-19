@@ -9,11 +9,13 @@ from mcp_types import TextContent
 from mindbridge.api.mcp import build_mcp_server
 from mindbridge.application.kernel import MemoryKernel
 from mindbridge.contracts import (
+    ContractModel,
     FeedbackReceipt,
     FeedbackRequest,
     ForgetReceipt,
     ForgetRequest,
     GetMemoryRequest,
+    GetObservationJobRequest,
     MemoryResult,
     MemoryWriteStatus,
     ObservationProcessingJobView,
@@ -27,6 +29,21 @@ from mindbridge.contracts import (
 from mindbridge.core import JobState, MemoryState, MemoryType, VerificationStatus
 
 NOW = datetime(2026, 8, 12, 12, 0, tzinfo=timezone.utc)
+
+TOOL_CONTRACTS: dict[str, type[ContractModel]] = {
+    "memory_observe": ObserveRequest,
+    "memory_remember": RememberRequest,
+    "memory_recall": RecallRequest,
+    "memory_get": GetMemoryRequest,
+    "memory_job": GetObservationJobRequest,
+    "memory_feedback": FeedbackRequest,
+    "memory_forget": ForgetRequest,
+}
+"""Every published tool and the contract whose fields are its arguments.
+
+Adding a tool without adding a row here fails the tool-set assertion, which is what makes the
+per-tool shape check below cover the new one too.
+"""
 
 
 class StubKernel:
@@ -84,29 +101,41 @@ async def test_mcp_lists_stable_tools_from_shared_contracts() -> None:
         result = await client.list_tools()
 
     tools = {tool.name: tool for tool in result.tools}
-    assert set(tools) == {
-        "memory_feedback",
-        "memory_forget",
-        "memory_get",
-        "memory_job",
-        "memory_observe",
-        "memory_recall",
-        "memory_remember",
-    }
+    assert set(tools) == set(TOOL_CONTRACTS)
     # The contract's own fields are the tool's arguments, not one nested `request` object:
     # a caller reaches for the flat shape first, and there is no second contract to keep in
-    # step with this one.
-    assert (
-        tools["memory_remember"].input_schema["properties"]
-        == RememberRequest.model_json_schema()["properties"]
-    )
-    assert (
-        tools["memory_get"].input_schema["properties"]
-        == GetMemoryRequest.model_json_schema()["properties"]
-    )
-    assert "request" not in tools["memory_recall"].input_schema["properties"]
+    # step with this one. Asserted for every tool, because the way the library documents --
+    # one `request: SomeContract` parameter -- silently produces the nested shape, and a new
+    # tool written that way would otherwise only move the snapshot.
+    for name, model in TOOL_CONTRACTS.items():
+        assert tools[name].input_schema["properties"] == model.model_json_schema()["properties"], (
+            name
+        )
+        assert "request" not in tools[name].input_schema["properties"], name
     assert tools["memory_forget"].annotations is not None
     assert tools["memory_forget"].annotations.destructive_hint is True
+
+
+async def test_mcp_rejects_an_unknown_argument() -> None:
+    """An unknown key must fault rather than be dropped.
+
+    MCP's generated argument model ignores extras, so `ContractModel`'s `extra="forbid"` no
+    longer covers the flattened fields. Dropping one is not a lost value but a different
+    question: `Mode` ignored leaves `mode` at its default, so a caller asking to enumerate
+    gets a truncating ranked answer and no indication it happened.
+    """
+    server = build_mcp_server(cast(MemoryKernel, StubKernel()))
+
+    async with Client(server) as client:
+        result = await client.call_tool(
+            "memory_recall",
+            {"tenant_id": "tenant_01", "query": {"text": "how many mugs"}, "Mode": "enumerate"},
+        )
+
+    assert result.is_error is True
+    reported = result.content[0]
+    assert isinstance(reported, TextContent)
+    assert "unknown arguments: Mode" in reported.text
 
 
 async def test_mcp_calls_shared_kernel_and_returns_structured_output() -> None:

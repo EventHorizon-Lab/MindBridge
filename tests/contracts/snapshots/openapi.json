@@ -104,7 +104,7 @@
           },
           "target_type": {
             "$ref": "#/components/schemas/ForgetTargetType",
-            "description": "What was erased."
+            "description": "What `target_id` named: `memory_record` erased that one memory, `observation` erased a source observation and everything derived from it."
           },
           "tombstone_id": {
             "description": "Stable ID of this deletion barrier, usable as a cursor.",
@@ -457,7 +457,7 @@
           },
           "target_type": {
             "$ref": "#/components/schemas/ForgetTargetType",
-            "description": "What was erased."
+            "description": "What `target_id` named: `memory_record` erased that one memory, `observation` erased a source observation and everything derived from it."
           },
           "tombstone_id": {
             "description": "Stable ID of this deletion barrier, usable as a cursor.",
@@ -1433,7 +1433,7 @@
                 "type": "null"
               }
             ],
-            "description": "Keep only memories occurring at or after this moment.",
+            "description": "Keep only memories occurring at or after this moment; the bound is inclusive.",
             "title": "Occurred After"
           },
           "occurred_before": {
@@ -1446,7 +1446,7 @@
                 "type": "null"
               }
             ],
-            "description": "Keep only memories occurring at or before this moment; must not precede `occurred_after`.",
+            "description": "Keep only memories occurring strictly before this moment -- unlike `occurred_after`, this bound is exclusive, so a memory exactly at it is left out. Must not precede `occurred_after`.",
             "title": "Occurred Before"
           },
           "person_ids": {
@@ -1900,7 +1900,7 @@
             "type": "array"
           },
           "message": {
-            "description": "What was wrong with it.",
+            "description": "Why that field was rejected.",
             "maxLength": 2048,
             "minLength": 1,
             "title": "Message",
@@ -2624,6 +2624,16 @@
             },
             "description": "`request_validation_failed` — request validation failed\n\n`domain_invariant_failed` — the request is well-formed but violates a memory invariant"
           },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "`memory_integrity_failed` — stored memory is inconsistent"
+          },
           "502": {
             "content": {
               "application/json": {
@@ -2642,7 +2652,7 @@
                 }
               }
             },
-            "description": "`database_unavailable` — memory storage is temporarily unavailable\n\n`model_unavailable` — memory model is unavailable"
+            "description": "`database_unavailable` — memory storage is temporarily unavailable\n\n`model_unavailable` — memory model is unavailable\n\n`object_storage_unavailable` — evidence media is unavailable"
           }
         },
         "security": [
@@ -2741,6 +2751,16 @@
             },
             "description": "`request_validation_failed` — request validation failed"
           },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "`memory_integrity_failed` — stored memory is inconsistent"
+          },
           "503": {
             "content": {
               "application/json": {
@@ -2749,7 +2769,7 @@
                 }
               }
             },
-            "description": "`database_unavailable` — memory storage is temporarily unavailable"
+            "description": "`database_unavailable` — memory storage is temporarily unavailable\n\n`object_storage_unavailable` — evidence media is unavailable"
           }
         },
         "security": [
@@ -2925,7 +2945,7 @@
                 }
               }
             },
-            "description": "`database_unavailable` — memory storage is temporarily unavailable\n\n`model_unavailable` — memory model is unavailable"
+            "description": "`database_unavailable` — memory storage is temporarily unavailable\n\n`model_unavailable` — memory model is unavailable\n\n`object_storage_unavailable` — evidence media is unavailable"
           }
         },
         "security": [
