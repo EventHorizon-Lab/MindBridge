@@ -1141,10 +1141,12 @@ continuous audio — falls back to the untouched source, so a long single-span o
 exactly as it did before this knob existed. Every ingest path in this repo segments video well
 inside that ceiling.
 
-A proxy that did not come out smaller is discarded, and the copy is transient derived media: it is
-never registered, so it is not cited as provenance and `forget()` does not reach it, and only the
-`--reclaim-orphan-clips` sweep removes it. Schedule that sweep on any deployment ingesting video
-continuously, and read `reclaimed_count` as routine traffic rather than as evidence of a crash.
+A proxy that did not come out smaller is discarded, and the request states the sampling the copy
+actually carries rather than letting the generator plugin's own frame rate apply to bytes that were
+already sampled. The copy is lent for the length of one model call and deleted when it returns,
+including on an attempt that failed: nothing registers it, so it is never cited as provenance, and
+leaving it behind would put a re-encoded copy of an observation's picture and speech beyond the
+reach of `forget()`.
 
 The proxy costs one extra read of the source, because clip derivation reads it again after the
 model call rather than holding the whole recording in memory across it. That read is internal, so

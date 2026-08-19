@@ -7,7 +7,7 @@ import pytest
 from mindbridge.application.evidence_clips import (
     ClipSampling,
     derive_evidence_clips,
-    derive_generation_proxies,
+    generation_proxies,
     reclaim_orphan_clips,
 )
 from mindbridge.application.perception import ResolvedEvidence
@@ -195,6 +195,7 @@ class RecordingStore:
     def __init__(self) -> None:
         self.reads = 0
         self.uploaded: dict[str, bytes] = {}
+        self.deleted: tuple[str, ...] = ()
 
     async def read_media(self, media_object: MediaObject) -> bytes:
         self.reads += 1
@@ -202,6 +203,9 @@ class RecordingStore:
 
     async def upload_media(self, media_object: MediaObject, content: bytes) -> None:
         self.uploaded[media_object.uri] = content
+
+    async def delete_media(self, media_object: MediaObject) -> None:
+        self.deleted = (*self.deleted, media_object.uri)
 
     async def create_presigned_download(
         self,
@@ -425,21 +429,20 @@ async def test_generation_proxy_hands_the_model_a_sampled_copy_of_the_video() ->
     source only moves bytes the model discards on arrival."""
     store = RecordingStore()
 
-    resolved = await derive_generation_proxies(
+    async with generation_proxies(
         TENANT_ID,
         (_video_evidence("evidence_video_01", 0, 30_000),),
         store=store,
         sampling=ClipSampling(),
         cut=_shrinking_cut,
-    )
-
-    assert len(store.uploaded) == 1
-    proxy_uri, proxy_bytes = next(iter(store.uploaded.items()))
-    assert len(proxy_bytes) < VIDEO_SOURCE.size_bytes
-    assert resolved[0].media_url != "https://objects.example.test/media_video_01.mp4"
-    # Provenance is unchanged: the span still cites the source object the operator uploaded.
-    assert resolved[0].media_object == VIDEO_SOURCE
-    assert proxy_uri.startswith("s3://memory/tenants/tenant_01/clips/")
+    ) as resolved:
+        assert len(store.uploaded) == 1
+        proxy_uri, proxy_bytes = next(iter(store.uploaded.items()))
+        assert len(proxy_bytes) < VIDEO_SOURCE.size_bytes
+        assert resolved[0].media_url != "https://objects.example.test/media_video_01.mp4"
+        # Provenance is unchanged: the span still cites the source object the operator uploaded.
+        assert resolved[0].media_object == VIDEO_SOURCE
+        assert proxy_uri.startswith("s3://memory/tenants/tenant_01/clips/")
 
 
 async def test_generation_proxy_is_cut_at_the_configured_sampling() -> None:
@@ -451,13 +454,14 @@ async def test_generation_proxy_is_cut_at_the_configured_sampling() -> None:
         requests.append(request)
         return _shrinking_cut(source, request)
 
-    await derive_generation_proxies(
+    async with generation_proxies(
         TENANT_ID,
         (_video_evidence("evidence_video_01", 0, 30_000),),
         store=store,
         sampling=ClipSampling(frames_per_second=0.5, max_pixels=50_176),
         cut=record,
-    )
+    ):
+        pass
 
     assert [(item.frames_per_second, item.max_pixels) for item in requests] == [(0.5, 50_176)]
     assert [(item.start_ms, item.end_ms) for item in requests] == [(0, 30_000)]
@@ -467,7 +471,7 @@ async def test_generation_proxy_is_dropped_when_it_would_not_shrink_the_source()
     """Re-encoding media that is already at the sampling budget would cost bytes, not save them."""
     store = RecordingStore()
 
-    resolved = await derive_generation_proxies(
+    async with generation_proxies(
         TENANT_ID,
         (_video_evidence("evidence_video_01", 0, 30_000),),
         store=store,
@@ -478,7 +482,8 @@ async def test_generation_proxy_is_dropped_when_it_would_not_shrink_the_source()
             start_ms=request.start_ms,
             end_ms=request.end_ms,
         ),
-    )
+    ) as resolved:
+        pass
 
     assert store.uploaded == {}
     assert resolved[0].media_url == "https://objects.example.test/media_video_01.mp4"
@@ -489,13 +494,14 @@ async def test_generation_proxy_leaves_non_video_evidence_untouched() -> None:
     store = RecordingStore()
     original = _evidence("evidence_01", 0, 30_000)
 
-    resolved = await derive_generation_proxies(
+    async with generation_proxies(
         TENANT_ID,
         (original,),
         store=store,
         sampling=ClipSampling(),
         cut=_shrinking_cut,
-    )
+    ) as resolved:
+        pass
 
     assert resolved == (original,)
     assert store.reads == 0
@@ -506,13 +512,14 @@ async def test_generation_proxy_can_be_switched_off_for_a_colocated_model() -> N
     store = RecordingStore()
     original = _video_evidence("evidence_video_01", 0, 30_000)
 
-    resolved = await derive_generation_proxies(
+    async with generation_proxies(
         TENANT_ID,
         (original,),
         store=store,
         sampling=ClipSampling(generation_proxy=False),
         cut=_shrinking_cut,
-    )
+    ) as resolved:
+        pass
 
     assert resolved == (original,)
     assert store.reads == 0
@@ -522,7 +529,7 @@ async def test_generation_proxy_reads_each_source_once_for_all_of_its_spans() ->
     """Two spans on one file must not download that file twice."""
     store = RecordingStore()
 
-    await derive_generation_proxies(
+    async with generation_proxies(
         TENANT_ID,
         (
             _video_evidence("evidence_video_01", 0, 10_000),
@@ -531,7 +538,8 @@ async def test_generation_proxy_reads_each_source_once_for_all_of_its_spans() ->
         store=store,
         sampling=ClipSampling(),
         cut=_shrinking_cut,
-    )
+    ):
+        pass
 
     assert store.reads == 1
     assert len(store.uploaded) == 1
@@ -584,13 +592,82 @@ async def test_generation_proxy_falls_back_to_the_source_it_could_not_sample(
     def refuse(source: bytes, request: ClipRequest) -> MediaClip:
         raise error
 
-    resolved = await derive_generation_proxies(
+    async with generation_proxies(
         TENANT_ID,
         (_video_evidence("evidence_video_01", 0, 30_000),),
         store=store,
         sampling=ClipSampling(),
         cut=refuse,
-    )
+    ) as resolved:
+        pass
 
     assert resolved[0].media_url == "https://objects.example.test/media_video_01.mp4"
     assert store.uploaded == {}
+
+
+async def test_generation_proxy_reports_the_sampling_it_was_cut_at() -> None:
+    """The proxy carries the deployment's sampling, but the model is told a budget from an
+    unrelated variable, so the request has to state what the bytes actually are."""
+    store = RecordingStore()
+
+    async with generation_proxies(
+        TENANT_ID,
+        (_video_evidence("evidence_video_01", 0, 30_000),),
+        store=store,
+        sampling=ClipSampling(frames_per_second=0.5, max_pixels=50_176),
+        cut=_shrinking_cut,
+    ) as resolved:
+        assert resolved[0].sampled_max_pixels == 50_176
+
+
+async def test_source_evidence_declares_no_sampling_of_its_own() -> None:
+    """Untouched source media must keep letting the generator apply its own budget."""
+    store = RecordingStore()
+
+    async with generation_proxies(
+        TENANT_ID,
+        (_video_evidence("evidence_video_01", 0, 30_000),),
+        store=store,
+        sampling=ClipSampling(generation_proxy=False),
+        cut=_shrinking_cut,
+    ) as resolved:
+        pass
+
+    assert resolved[0].sampled_frames_per_second is None
+    assert resolved[0].sampled_max_pixels is None
+
+
+async def test_generation_proxy_is_deleted_once_the_model_has_read_it() -> None:
+    """The proxy is never registered, so nothing else can reach it: not the write batch, not
+    provenance, and not forget(). Leaving it behind would keep a full re-encoded copy of the
+    speech and picture of an observation a tenant asked to erase."""
+    store = RecordingStore()
+
+    async with generation_proxies(
+        TENANT_ID,
+        (_video_evidence("evidence_video_01", 0, 30_000),),
+        store=store,
+        sampling=ClipSampling(),
+        cut=_shrinking_cut,
+    ) as resolved:
+        assert resolved[0].media_url != "https://objects.example.test/media_video_01.mp4"
+        assert len(store.uploaded) == 1
+
+    assert store.deleted == tuple(store.uploaded)
+
+
+async def test_a_failed_perception_still_deletes_the_proxy_it_uploaded() -> None:
+    """A retried observation re-cuts the proxy, so an attempt that raised must not keep one."""
+    store = RecordingStore()
+
+    with pytest.raises(RuntimeError, match="perception exploded"):
+        async with generation_proxies(
+            TENANT_ID,
+            (_video_evidence("evidence_video_01", 0, 30_000),),
+            store=store,
+            sampling=ClipSampling(),
+            cut=_shrinking_cut,
+        ):
+            raise RuntimeError("perception exploded")
+
+    assert store.deleted == tuple(store.uploaded)

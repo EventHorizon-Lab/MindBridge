@@ -32,6 +32,8 @@ def evidence_parts(
                     kind=item.media_object.kind,
                     url=item.media_url,
                     source_uri=item.media_object.uri,
+                    frames_per_second=item.sampled_frames_per_second,
+                    max_pixels=item.sampled_max_pixels,
                 ),
             )
         )

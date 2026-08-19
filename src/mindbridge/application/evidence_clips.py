@@ -13,7 +13,8 @@ object instead of leaving one orphan per attempt.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from hashlib import sha256
@@ -157,8 +158,8 @@ async def derive_evidence_clips(
     )
 
 
-@trace_operation("mindbridge.evidence_clips.generation_proxy")
-async def derive_generation_proxies(
+@asynccontextmanager
+async def generation_proxies(
     tenant_id: TenantId,
     evidence: tuple[ResolvedEvidence, ...],
     *,
@@ -166,7 +167,40 @@ async def derive_generation_proxies(
     sampling: ClipSampling,
     cut: Callable[[bytes, ClipRequest], MediaClip] = cut_generation_proxy,
     max_concurrency: int = 4,
-) -> tuple[ResolvedEvidence, ...]:
+) -> AsyncIterator[tuple[ResolvedEvidence, ...]]:
+    """Lend sampled copies for the length of one model call, then take them back.
+
+    A proxy is never registered, so nothing downstream can reach it: it is not in the write
+    batch, it is not cited as provenance, and `forget()` would not find it. Scoping it to the
+    call that needs it is what keeps that from meaning "kept forever" — including for an
+    observation a tenant later asks to erase, and including on the attempt that raised.
+    """
+    resolved, proxies = await _derive_generation_proxies(
+        tenant_id,
+        evidence,
+        store=store,
+        sampling=sampling,
+        cut=cut,
+        max_concurrency=max_concurrency,
+    )
+    try:
+        yield resolved
+    finally:
+        await asyncio.gather(
+            *(store.delete_media(proxy) for proxy in proxies), return_exceptions=True
+        )
+
+
+@trace_operation("mindbridge.evidence_clips.generation_proxy")
+async def _derive_generation_proxies(
+    tenant_id: TenantId,
+    evidence: tuple[ResolvedEvidence, ...],
+    *,
+    store: DerivedMediaStore,
+    sampling: ClipSampling,
+    cut: Callable[[bytes, ClipRequest], MediaClip] = cut_generation_proxy,
+    max_concurrency: int = 4,
+) -> tuple[tuple[ResolvedEvidence, ...], tuple[MediaObject, ...]]:
     """Point generation at the sampled copy of each video the model would produce anyway.
 
     Every generation request already carries the frame rate and pixel budget the model must
@@ -178,43 +212,50 @@ async def derive_generation_proxies(
     if max_concurrency <= 0:
         raise ValueError("max_concurrency must be positive")
     if not sampling.generation_proxy:
-        return evidence
+        return evidence, ()
     groups: dict[MediaObjectId, list[ResolvedEvidence]] = {}
     for item in evidence:
         if item.media_object.kind is MediaKind.VIDEO:
             groups.setdefault(item.media_object.media_object_id, []).append(item)
     if not groups:
-        return evidence
+        return evidence, ()
 
     semaphore = asyncio.Semaphore(max_concurrency)
     proxies = {
-        media_object_id: download
-        for media_object_id, download in await asyncio.gather(
-            *(
-                _store_generation_proxy(
-                    tenant_id,
-                    items,
-                    store=store,
-                    sampling=sampling,
-                    cut=cut,
-                    semaphore=semaphore,
+        media_object_id: derived
+        for media_object_id, derived in zip(
+            groups,
+            await asyncio.gather(
+                *(
+                    _store_generation_proxy(
+                        tenant_id,
+                        items,
+                        store=store,
+                        sampling=sampling,
+                        cut=cut,
+                        semaphore=semaphore,
+                    )
+                    for items in groups.values()
                 )
-                for items in groups.values()
-            )
+            ),
+            strict=True,
         )
-        if download is not None
+        if derived is not None
     }
     set_current_span_attributes({"mindbridge.generation_proxy.count": len(proxies)})
-    return tuple(
+    resolved = tuple(
         item
-        if (download := proxies.get(item.media_object.media_object_id)) is None
+        if (derived := proxies.get(item.media_object.media_object_id)) is None
         else replace(
             item,
-            media_url=download.download_url,
-            media_url_expires_at=download.expires_at,
+            media_url=derived[1].download_url,
+            media_url_expires_at=derived[1].expires_at,
+            sampled_frames_per_second=sampling.frames_per_second,
+            sampled_max_pixels=sampling.max_pixels,
         )
         for item in evidence
     )
+    return resolved, tuple(media_object for media_object, _ in proxies.values())
 
 
 async def _store_generation_proxy(
@@ -225,7 +266,7 @@ async def _store_generation_proxy(
     sampling: ClipSampling,
     cut: Callable[[bytes, ClipRequest], MediaClip],
     semaphore: asyncio.Semaphore,
-) -> tuple[MediaObjectId, PresignedMediaDownload | None]:
+) -> tuple[MediaObject, PresignedMediaDownload] | None:
     """Cut, store, and sign one sampled copy covering every span read from one source."""
     source_object = items[0].media_object
     async with semaphore:
@@ -251,11 +292,11 @@ async def _store_generation_proxy(
                     "mindbridge.generation_proxy.skipped_reason": type(error).__name__,
                 }
             )
-            return source_object.media_object_id, None
+            return None
         finally:
             del source
         if len(proxy.content) >= source_object.size_bytes:
-            return source_object.media_object_id, None
+            return None
         media_object = _clip_media_object(
             tenant_id,
             items[0],
@@ -263,7 +304,7 @@ async def _store_generation_proxy(
             created_at=items[0].evidence_span.created_at,
         )
         await store.upload_media(media_object, proxy.content)
-        return source_object.media_object_id, await store.create_presigned_download(media_object)
+        return media_object, await store.create_presigned_download(media_object)
 
 
 async def _store_source_group(

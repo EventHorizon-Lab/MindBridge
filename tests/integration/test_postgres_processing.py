@@ -323,6 +323,7 @@ class DeterministicSigner:
     def __init__(self) -> None:
         self.calls = 0
         self.uploaded: dict[str, bytes] = {}
+        self.deleted: tuple[str, ...] = ()
 
     async def create_presigned_download(
         self,
@@ -339,6 +340,9 @@ class DeterministicSigner:
 
     async def upload_media(self, media_object: MediaObject, content: bytes) -> None:
         self.uploaded[media_object.uri] = content
+
+    async def delete_media(self, media_object: MediaObject) -> None:
+        self.deleted = (*self.deleted, media_object.uri)
 
 
 def stub_proxy_cut(source: bytes, request: ClipRequest) -> MediaClip:

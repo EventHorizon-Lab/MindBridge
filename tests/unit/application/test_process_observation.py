@@ -241,6 +241,7 @@ class DeterministicSigner:
     def __init__(self) -> None:
         self.calls = 0
         self.uploaded: dict[str, bytes] = {}
+        self.deleted: tuple[str, ...] = ()
 
     async def create_presigned_download(
         self,
@@ -257,6 +258,9 @@ class DeterministicSigner:
 
     async def upload_media(self, media_object: MediaObject, content: bytes) -> None:
         self.uploaded[media_object.uri] = content
+
+    async def delete_media(self, media_object: MediaObject) -> None:
+        self.deleted = (*self.deleted, media_object.uri)
 
 
 def stub_proxy_cut(source: bytes, request: ClipRequest) -> MediaClip:
@@ -759,9 +763,11 @@ async def test_perception_reads_a_sampled_proxy_instead_of_the_untouched_source(
         f"{sha256(b'clip:0-4000:source-media-bytes').hexdigest()}.mp4"
     )
     assert signer.uploaded[proxy_uri] == b"clip:0-4000:source-media-bytes"
-    # The proxy is transient derived media, not a new source the memory now cites.
+    # The proxy is transient derived media, not a new source the memory now cites, and nothing
+    # downstream could reach it to clean it up later.
     assert store.output is not None
     assert proxy_uri not in [item.uri for item in store.output.media_objects]
+    assert proxy_uri in signer.deleted
 
 
 async def test_perception_reads_the_source_when_the_proxy_is_switched_off() -> None:
