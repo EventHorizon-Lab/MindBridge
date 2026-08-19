@@ -150,6 +150,9 @@ class ProcessObservation:
                 evidence,
                 store=self._media_url_signer,
                 sampling=self._clip_sampling,
+                # This attempt, not this observation: a claim reclaimed after the stale window
+                # leaves two attempts running, and each must only reclaim its own copies.
+                scope=f"{job_id}:{claim.job.attempt}",
                 cut=self._proxy_cutter,
             ) as perceived_evidence:
                 perception = await self._perceiver.perceive_events(

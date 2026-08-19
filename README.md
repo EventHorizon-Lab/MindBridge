@@ -1135,11 +1135,16 @@ the transfer it removes.
 
 The proxy is best-effort by design and covers **video only**: `image_max_pixels` governs stored
 image clips, not what the model is sent, and an image reaches the model at full resolution because
-the request carries no pixel budget for images at all. A span the encoder will not produce — past
-roughly forty sampled frames the MP4 muxer refuses to interleave a sparse video track with
-continuous audio — falls back to the untouched source, so a long single-span observation behaves
-exactly as it did before this knob existed. Every ingest path in this repo segments video well
-inside that ceiling.
+the request carries no pixel budget for images at all.
+
+Its ceiling is a **frame count, not a duration**: past roughly forty sampled frames the MP4 muxer
+refuses to interleave a sparse video track with continuous audio, so `frames_per_second` decides
+the ceiling as much as span length does — at 30-second segments, the granularity every ingest path
+in this repo uses, anything above about 1.3 fps exceeds it. A span over that budget is skipped
+before its source is read, and anything else the encoder or object storage refuses degrades the
+same way, so the observation behaves exactly as it did before this knob existed rather than paying
+for a doomed encode. Raising `frames_per_second` therefore trades the proxy away; lower it, or
+segment shorter, to keep both.
 
 A proxy that did not come out smaller is discarded, and the request states the sampling the copy
 actually carries rather than letting the generator plugin's own frame rate apply to bytes that were

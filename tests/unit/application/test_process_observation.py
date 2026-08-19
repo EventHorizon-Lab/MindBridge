@@ -2,7 +2,6 @@
 
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
-from hashlib import sha256
 
 import pytest
 
@@ -264,9 +263,9 @@ class DeterministicSigner:
 
 
 def stub_proxy_cut(source: bytes, request: ClipRequest) -> MediaClip:
-    """Stand in for the real proxy encoder, which needs the optional media extra."""
+    """Stand in for the real proxy encoder, and come out smaller like the real one does."""
     return MediaClip(
-        content=b"clip:%d-%d:" % (request.start_ms, request.end_ms) + source,
+        content=b"px%d-%d" % (request.start_ms, request.end_ms),
         suffix=".mp4",
         start_ms=request.start_ms,
         end_ms=request.end_ms,
@@ -758,13 +757,11 @@ async def test_perception_reads_a_sampled_proxy_instead_of_the_untouched_source(
 
     (perceived_url,) = perceiver.evidence_urls
     assert "/media_clip_" in perceived_url
-    proxy_uri = (
-        "s3://memory/tenants/tenant_01/clips/"
-        f"{sha256(b'clip:0-4000:source-media-bytes').hexdigest()}.mp4"
-    )
-    assert signer.uploaded[proxy_uri] == b"clip:0-4000:source-media-bytes"
+    (proxy_uri,) = [uri for uri in signer.uploaded if "/clips/proxy-" in uri]
+    assert signer.uploaded[proxy_uri] == b"px0-4000"
     # The proxy is transient derived media, not a new source the memory now cites, and nothing
-    # downstream could reach it to clean it up later.
+    # downstream could reach it to clean it up later. Its key carries the proxy infix so it can
+    # never be the object a registered clip of the same bytes owns.
     assert store.output is not None
     assert proxy_uri not in [item.uri for item in store.output.media_objects]
     assert proxy_uri in signer.deleted

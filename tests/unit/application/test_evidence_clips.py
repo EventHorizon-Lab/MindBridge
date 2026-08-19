@@ -1,5 +1,6 @@
 """Checks that clip derivation stores, dedupes, and embeds the right windows."""
 
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -23,6 +24,7 @@ from mindbridge.core import (
     MediaObjectId,
     ModelOutputError,
     ModelReference,
+    ObjectStorageError,
     ObservationId,
     TenantId,
 )
@@ -199,7 +201,7 @@ class RecordingStore:
 
     async def read_media(self, media_object: MediaObject) -> bytes:
         self.reads += 1
-        return b"source-bytes"
+        return b"source-bytes" * 128
 
     async def upload_media(self, media_object: MediaObject, content: bytes) -> None:
         self.uploaded[media_object.uri] = content
@@ -223,9 +225,16 @@ class RecordingEmbedder:
     def __init__(self) -> None:
         self.tasks: list[EmbedTask] = []
         self.urls: list[str] = []
+        self.sampling: tuple[tuple[float | None, int | None], ...] = ()
 
     async def embed(self, request: EmbedRequest) -> EmbedResult:
         self.tasks.append(request.task)
+        self.sampling = tuple(
+            (part.frames_per_second, part.max_pixels)
+            for input_value in request.inputs
+            for part in input_value.parts
+            if isinstance(part, MediaPart)
+        )
         self.urls.extend(
             part.url
             for input_value in request.inputs
@@ -435,6 +444,7 @@ async def test_generation_proxy_hands_the_model_a_sampled_copy_of_the_video() ->
         store=store,
         sampling=ClipSampling(),
         cut=_shrinking_cut,
+        scope="job_01:1",
     ) as resolved:
         assert len(store.uploaded) == 1
         proxy_uri, proxy_bytes = next(iter(store.uploaded.items()))
@@ -460,6 +470,7 @@ async def test_generation_proxy_is_cut_at_the_configured_sampling() -> None:
         store=store,
         sampling=ClipSampling(frames_per_second=0.5, max_pixels=50_176),
         cut=record,
+        scope="job_01:1",
     ):
         pass
 
@@ -477,11 +488,12 @@ async def test_generation_proxy_is_dropped_when_it_would_not_shrink_the_source()
         store=store,
         sampling=ClipSampling(),
         cut=lambda source, request: MediaClip(
-            content=b"x" * (VIDEO_SOURCE.size_bytes + 1),
+            content=b"x" * (len(b"source-bytes" * 128) + 1),
             suffix=".mp4",
             start_ms=request.start_ms,
             end_ms=request.end_ms,
         ),
+        scope="job_01:1",
     ) as resolved:
         pass
 
@@ -500,6 +512,7 @@ async def test_generation_proxy_leaves_non_video_evidence_untouched() -> None:
         store=store,
         sampling=ClipSampling(),
         cut=_shrinking_cut,
+        scope="job_01:1",
     ) as resolved:
         pass
 
@@ -518,6 +531,7 @@ async def test_generation_proxy_can_be_switched_off_for_a_colocated_model() -> N
         store=store,
         sampling=ClipSampling(generation_proxy=False),
         cut=_shrinking_cut,
+        scope="job_01:1",
     ) as resolved:
         pass
 
@@ -538,6 +552,7 @@ async def test_generation_proxy_reads_each_source_once_for_all_of_its_spans() ->
         store=store,
         sampling=ClipSampling(),
         cut=_shrinking_cut,
+        scope="job_01:1",
     ):
         pass
 
@@ -545,26 +560,70 @@ async def test_generation_proxy_reads_each_source_once_for_all_of_its_spans() ->
     assert len(store.uploaded) == 1
 
 
-def _video_evidence(evidence_id: str, start_ms: int, end_ms: int) -> ResolvedEvidence:
+SECOND_VIDEO_SOURCE = MediaObject(
+    media_object_id=MediaObjectId("media_video_02"),
+    tenant_id=TENANT_ID,
+    kind=MediaKind.VIDEO,
+    uri="s3://memory/tenants/tenant_01/media_video_02.mp4",
+    sha256="c" * 64,
+    size_bytes=14_000_000,
+    created_at=NOW,
+    duration_ms=30_000,
+)
+
+
+def _video_evidence(
+    evidence_id: str,
+    start_ms: int,
+    end_ms: int,
+    *,
+    media: MediaObject | None = None,
+) -> ResolvedEvidence:
+    source = media or VIDEO_SOURCE
     return ResolvedEvidence(
         evidence_span=EvidenceSpan(
             evidence_id=EvidenceId(evidence_id),
             tenant_id=TENANT_ID,
             observation_id=ObservationId("observation_01"),
-            media_object_id=VIDEO_SOURCE.media_object_id,
+            media_object_id=source.media_object_id,
             start_ms=start_ms,
             end_ms=end_ms,
             created_at=NOW,
         ),
-        media_object=VIDEO_SOURCE,
-        media_url="https://objects.example.test/media_video_01.mp4",
+        media_object=source,
+        media_url=f"https://objects.example.test/{source.media_object_id}.mp4",
         media_url_expires_at=NOW + timedelta(minutes=5),
     )
 
 
+class FailingSignerStore(RecordingStore):
+    """Uploads fine, then refuses to sign after a set number of successes."""
+
+    def __init__(self, *, fail_after: int) -> None:
+        super().__init__()
+        self._remaining = fail_after
+
+    async def create_presigned_download(
+        self,
+        media_object: MediaObject,
+    ) -> PresignedMediaDownload:
+        if self._remaining <= 0:
+            raise ObjectStorageError("could not sign S3 GET request")
+        self._remaining -= 1
+        return await super().create_presigned_download(media_object)
+
+
+class UnreadableStore(RecordingStore):
+    """Object storage that cannot serve the source the proxy wants to sample."""
+
+    async def read_media(self, media_object: MediaObject) -> bytes:
+        raise ObjectStorageError("could not read S3 evidence media")
+
+
 def _shrinking_cut(source: bytes, request: ClipRequest) -> MediaClip:
+    """Stand in for the encoder, and actually come out smaller than what it was given."""
     return MediaClip(
-        content=b"proxy:" + source,
+        content=b"proxy:%d-%d" % (request.start_ms, request.end_ms),
         suffix=".mp4",
         start_ms=request.start_ms,
         end_ms=request.end_ms,
@@ -598,6 +657,7 @@ async def test_generation_proxy_falls_back_to_the_source_it_could_not_sample(
         store=store,
         sampling=ClipSampling(),
         cut=refuse,
+        scope="job_01:1",
     ) as resolved:
         pass
 
@@ -616,6 +676,7 @@ async def test_generation_proxy_reports_the_sampling_it_was_cut_at() -> None:
         store=store,
         sampling=ClipSampling(frames_per_second=0.5, max_pixels=50_176),
         cut=_shrinking_cut,
+        scope="job_01:1",
     ) as resolved:
         assert resolved[0].sampled_max_pixels == 50_176
 
@@ -630,6 +691,7 @@ async def test_source_evidence_declares_no_sampling_of_its_own() -> None:
         store=store,
         sampling=ClipSampling(generation_proxy=False),
         cut=_shrinking_cut,
+        scope="job_01:1",
     ) as resolved:
         pass
 
@@ -649,6 +711,7 @@ async def test_generation_proxy_is_deleted_once_the_model_has_read_it() -> None:
         store=store,
         sampling=ClipSampling(),
         cut=_shrinking_cut,
+        scope="job_01:1",
     ) as resolved:
         assert resolved[0].media_url != "https://objects.example.test/media_video_01.mp4"
         assert len(store.uploaded) == 1
@@ -667,7 +730,173 @@ async def test_a_failed_perception_still_deletes_the_proxy_it_uploaded() -> None
             store=store,
             sampling=ClipSampling(),
             cut=_shrinking_cut,
+            scope="job_01:1",
         ):
             raise RuntimeError("perception exploded")
 
     assert store.deleted == tuple(store.uploaded)
+
+
+async def test_a_proxy_can_never_own_a_registered_clips_object_key() -> None:
+    """For a silent video the proxy and the evidence clip cut identical bytes, and the key is a
+    content digest, so they used to be the same object. Deleting the proxy then erased evidence a
+    committed attempt still cites, and the orphan sweep would never flag it because the database
+    knows that digest."""
+    store = RecordingStore()
+    identical = MediaClip(content=b"identical-bytes", suffix=".mp4", start_ms=0, end_ms=30_000)
+
+    async with generation_proxies(
+        TENANT_ID,
+        (_video_evidence("evidence_video_01", 0, 30_000),),
+        store=store,
+        sampling=ClipSampling(),
+        cut=lambda source, request: identical,
+        scope="job_01:1",
+    ):
+        pass
+    proxy_uri = next(iter(store.uploaded))
+
+    clips = await derive_evidence_clips(
+        TENANT_ID,
+        (_video_evidence("evidence_video_01", 0, 30_000),),
+        store=store,
+        embedder=RecordingEmbedder(),
+        sampling=ClipSampling(),
+        created_at=NOW,
+        cut=lambda source, request: (identical,),
+    )
+
+    assert proxy_uri not in {item.uri for item in clips.media_objects}
+
+
+async def test_two_attempts_on_one_source_do_not_share_a_proxy_object() -> None:
+    """A claim reclaimed after the stale window leaves two attempts alive at once; whichever
+    finishes first must not delete the copy the other is still handing to the model."""
+    store = RecordingStore()
+
+    for attempt in (1, 2):
+        async with generation_proxies(
+            TENANT_ID,
+            (_video_evidence("evidence_video_01", 0, 30_000),),
+            store=store,
+            sampling=ClipSampling(),
+            cut=_shrinking_cut,
+            scope=f"job_01:{attempt}",
+        ):
+            pass
+
+    # Identical bytes, so a content-only key would have been one object deleted twice.
+    assert len(store.uploaded) == 2
+    assert len(set(store.deleted)) == 2
+
+
+async def test_a_proxy_uploaded_before_a_later_failure_is_still_reclaimed() -> None:
+    """A copy is recorded for cleanup the moment it is uploaded, so a source that fails while
+    being signed cannot leave it behind — derivation used to finish before the scope opened."""
+    store = FailingSignerStore(fail_after=1)
+
+    async with generation_proxies(
+        TENANT_ID,
+        (
+            _video_evidence("evidence_video_01", 0, 30_000),
+            _video_evidence("evidence_video_02", 0, 20_000, media=SECOND_VIDEO_SOURCE),
+        ),
+        store=store,
+        sampling=ClipSampling(),
+        cut=_shrinking_cut,
+        scope="job_01:1",
+    ) as resolved:
+        # The source whose signing failed degrades to its own untouched media.
+        assert sum(item.sampled_max_pixels is None for item in resolved) == 1
+
+    assert len(store.uploaded) == 2
+    assert set(store.deleted) == set(store.uploaded)
+
+
+async def test_object_storage_trouble_degrades_to_the_source_instead_of_failing() -> None:
+    """Reading, writing and signing a proxy are work the observation did not need before. An
+    optimization must not be able to fail an attempt whose perception would have succeeded."""
+    store = UnreadableStore()
+
+    async with generation_proxies(
+        TENANT_ID,
+        (_video_evidence("evidence_video_01", 0, 30_000),),
+        store=store,
+        sampling=ClipSampling(),
+        cut=_shrinking_cut,
+        scope="job_01:1",
+    ) as resolved:
+        assert resolved[0].media_url == "https://objects.example.test/media_video_01.mp4"
+
+
+async def test_the_shrink_check_measures_the_source_it_actually_read() -> None:
+    """size_bytes is client-declared and never verified, so trusting it let one wrong number
+    silently disable the feature after paying for the read and the encode."""
+    store = RecordingStore()
+    understated = replace(VIDEO_SOURCE, size_bytes=0)
+
+    async with generation_proxies(
+        TENANT_ID,
+        (_video_evidence("evidence_video_01", 0, 30_000, media=understated),),
+        store=store,
+        sampling=ClipSampling(),
+        cut=_shrinking_cut,
+        scope="job_01:1",
+    ) as resolved:
+        assert resolved[0].media_url != "https://objects.example.test/media_video_01.mp4"
+
+
+async def test_a_span_too_long_to_encode_is_skipped_before_it_is_read() -> None:
+    """The muxer ceiling is a frame count, so frames_per_second decides it as much as span
+    length. Paying a full source read and a doomed encode per observation is the whole cost the
+    proxy exists to remove."""
+    store = RecordingStore()
+
+    async with generation_proxies(
+        TENANT_ID,
+        (_video_evidence("evidence_video_01", 0, 30_000),),
+        store=store,
+        sampling=ClipSampling(frames_per_second=4.0),
+        cut=_shrinking_cut,
+        scope="job_01:1",
+    ) as resolved:
+        assert resolved[0].media_url == "https://objects.example.test/media_video_01.mp4"
+    assert store.reads == 0
+
+
+async def test_the_embedder_is_told_the_sampling_its_clip_was_cut_at() -> None:
+    """The clip was cut at the deployment's sampling, but the request used to carry the model
+    plugin's own budget, so a served embedder resampled bytes that no longer had those frames."""
+    store = RecordingStore()
+    embedder = RecordingEmbedder()
+
+    await derive_evidence_clips(
+        TENANT_ID,
+        (_video_evidence("evidence_video_01", 0, 30_000),),
+        store=store,
+        embedder=embedder,
+        sampling=ClipSampling(frames_per_second=2.0, max_pixels=50_176),
+        created_at=NOW,
+        cut=lambda source, request: (_shrinking_cut(source, request),),
+    )
+
+    assert embedder.sampling == ((2.0, 50_176),)
+
+
+async def test_a_stored_audio_clip_declares_no_frame_rate() -> None:
+    """Frame rate is meaningless off video and MediaPart rejects it, so the guard has to hold for
+    the audio and image clips this same path stores."""
+    store = RecordingStore()
+    embedder = RecordingEmbedder()
+
+    await derive_evidence_clips(
+        TENANT_ID,
+        (_evidence("evidence_01", 0, 30_000),),
+        store=store,
+        embedder=embedder,
+        sampling=ClipSampling(frames_per_second=2.0, max_pixels=50_176),
+        created_at=NOW,
+        cut=_stub_cut,
+    )
+
+    assert embedder.sampling == ((None, None),)

@@ -346,9 +346,9 @@ class DeterministicSigner:
 
 
 def stub_proxy_cut(source: bytes, request: ClipRequest) -> MediaClip:
-    """Stand in for the real proxy encoder, which needs the optional media extra."""
+    """Stand in for the real proxy encoder, and come out smaller like the real one does."""
     return MediaClip(
-        content=b"clip:%d-%d:" % (request.start_ms, request.end_ms) + source,
+        content=b"px%d-%d" % (request.start_ms, request.end_ms),
         suffix=".mp4",
         start_ms=request.start_ms,
         end_ms=request.end_ms,
