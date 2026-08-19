@@ -71,6 +71,31 @@ class _SentenceTransformerFactory(Protocol):
     ) -> _SentenceEncoder: ...
 
 
+_ABSENT = object()
+"""Distinguishes an upstream that never had a processor slot from one whose slot is empty."""
+
+_MISSING_PROCESSOR = (
+    "the Jina Omni image and video processor did not load, so this model can only embed text; "
+    "install MindBridge with the cloud-models extra so Torchvision is present"
+)
+
+
+def _media_processor_missing(encoder: object) -> bool:
+    """Report an upstream module whose processor slot exists but was left empty.
+
+    Jina builds that processor inside a bare `except Exception` and assigns `None` on failure, so
+    a missing Torchvision produces a model that loads, embeds text, and then raises
+    `TypeError: 'NoneType' object is not callable` on the first frame -- after a perception call
+    has already been paid for. An absent attribute is not a failure: a future upstream may hold
+    the processor somewhere else, and guessing wrong must not refuse a working model.
+    """
+    try:
+        modules = list(iter(encoder))  # type: ignore[call-overload]
+    except TypeError:
+        return False
+    return any(getattr(module, "processor", _ABSENT) is None for module in modules)
+
+
 class JinaEmbedder:
     """Async-safe query/document encoder for text, image, video, and audio."""
 
@@ -127,6 +152,8 @@ class JinaEmbedder:
             model_kwargs={"modality": "omni", "code_revision": revision},
             config_kwargs={"code_revision": revision},
         )
+        if _media_processor_missing(encoder):
+            raise ModelUnavailableError(_MISSING_PROCESSOR)
         return cls(
             encoder,
             ModelReference(model_id=model_id, revision=revision),
