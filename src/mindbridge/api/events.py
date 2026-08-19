@@ -10,7 +10,7 @@ from fastapi import Depends, FastAPI, Request
 from fastapi.responses import StreamingResponse
 
 from mindbridge.api.auth import TenantApiKeyAuthenticator, TenantPrincipal, require_tenant
-from mindbridge.api.errors import ERRORS, TENANT_ERRORS, responses
+from mindbridge.api.errors import ERRORS, RUNTIME_ERROR_CODES, TENANT_ERRORS, responses
 from mindbridge.application.kernel import MemoryKernel
 from mindbridge.contracts import ErrorResponse, Identifier, ObservationProcessingJobView
 from mindbridge.core import DatabaseUnavailableError, JobNotFoundError
@@ -110,8 +110,13 @@ def _job_frame(view: ObservationProcessingJobView) -> str:
 
 
 def _error_frame(error: DatabaseUnavailableError | JobNotFoundError) -> str:
-    """Frame the same code and sentence the non-streaming routes would have returned."""
-    code = "job_not_found" if isinstance(error, JobNotFoundError) else "database_unavailable"
+    """Frame the same code and sentence the non-streaming routes would have returned.
+
+    Read from the same table the handlers use, so a stream cannot report a failure by a name
+    the rest of the API stopped using -- a divergence nothing would catch until a client was
+    already connected.
+    """
+    code = RUNTIME_ERROR_CODES[type(error)]
     response = ErrorResponse(
         code=code,
         message=ERRORS[code].description,

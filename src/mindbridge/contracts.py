@@ -538,7 +538,12 @@ class DeletionTombstoneView(ContractModel):
     tombstone_id: Identifier = Field(
         description="Stable ID of this deletion barrier, usable as a cursor.",
     )
-    target_type: ForgetTargetType = Field(description="What was erased.")
+    target_type: ForgetTargetType = Field(
+        description=(
+            "What `target_id` named: `memory_record` erased that one memory, `observation` "
+            "erased a source observation and everything derived from it."
+        ),
+    )
     target_id: Identifier = Field(description="Which memory or observation was erased.")
     propagation_state: DeletionPropagationState = Field(
         description=(
@@ -635,13 +640,14 @@ class RecallFilters(ContractModel):
     ] = ()
     occurred_after: UtcDatetime | None = Field(
         default=None,
-        description="Keep only memories occurring at or after this moment.",
+        description="Keep only memories occurring at or after this moment; the bound is inclusive.",
     )
     occurred_before: UtcDatetime | None = Field(
         default=None,
         description=(
-            "Keep only memories occurring at or before this moment; must not precede "
-            "`occurred_after`."
+            "Keep only memories occurring strictly before this moment -- unlike "
+            "`occurred_after`, this bound is exclusive, so a memory exactly at it is left "
+            "out. Must not precede `occurred_after`."
         ),
     )
 
@@ -849,7 +855,7 @@ class ValidationIssue(ContractModel):
     """One sanitized request validation failure."""
 
     location: tuple[str, ...] = Field(description="Path to the rejected field within the request.")
-    message: NonEmptyString = Field(description="What was wrong with it.")
+    message: NonEmptyString = Field(description="Why that field was rejected.")
     code: Identifier = Field(description="Machine-readable kind of validation failure.")
 
 

@@ -20,7 +20,7 @@ from mindbridge.api.aml_contracts import (
     derive_tenant_id,
 )
 from mindbridge.api.auth import AuthenticationError
-from mindbridge.api.errors import responses
+from mindbridge.api.errors import ErrorCode, responses
 from mindbridge.application.aml_extraction import extract_memories
 from mindbridge.application.kernel import MemoryKernel
 from mindbridge.contracts import (
@@ -32,7 +32,7 @@ from mindbridge.contracts import (
 from mindbridge.models import Generator
 from mindbridge.telemetry import set_current_span_attributes
 
-AML_ERRORS: Final[tuple[str, ...]] = (
+AML_ERRORS: Final[tuple[ErrorCode, ...]] = (
     "authentication_required",
     "authentication_failed",
     "request_validation_failed",
@@ -45,7 +45,7 @@ than proving one against an allow-set, so `tenant_access_denied` is unreachable 
 listing it would document a status the server cannot send.
 """
 
-_AML_MODEL_ERRORS: Final[tuple[str, ...]] = (
+_AML_MODEL_ERRORS: Final[tuple[ErrorCode, ...]] = (
     "model_request_failed",
     "model_output_invalid",
     "model_unavailable",

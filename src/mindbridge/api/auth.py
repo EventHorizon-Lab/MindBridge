@@ -13,7 +13,7 @@ from fastapi import Security
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import TypeAdapter, ValidationError
 
-from mindbridge.api.errors import ERRORS
+from mindbridge.api.errors import ERRORS, ErrorCode
 from mindbridge.contracts import Identifier
 
 _BEARER = HTTPBearer(auto_error=False)
@@ -36,7 +36,7 @@ class AuthenticationError(Exception):
     OpenAPI document does not.
     """
 
-    def __init__(self, code: str) -> None:
+    def __init__(self, code: ErrorCode) -> None:
         super().__init__(ERRORS[code].description)
         self.code = code
 

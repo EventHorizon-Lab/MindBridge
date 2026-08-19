@@ -9,13 +9,54 @@ description of the success path. Adding an error means adding one row here.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Final
+from typing import Any, Final, Literal
 
 from fastapi import status
 from fastapi.responses import JSONResponse
 
 from mindbridge.contracts import ErrorResponse, ValidationIssue
+from mindbridge.core import (
+    DatabaseUnavailableError,
+    ForgetTargetNotFoundError,
+    JobNotFoundError,
+    MemoryDeletedError,
+    MemoryIntegrityError,
+    MemoryNotFoundError,
+    ModelOutputError,
+    ModelRequestError,
+    ModelUnavailableError,
+    ObjectStorageError,
+    TaskBrokerError,
+)
 from mindbridge.telemetry import current_trace_id
+
+ErrorCode = Literal[
+    "authentication_required",
+    "authentication_failed",
+    "tenant_access_denied",
+    "forget_target_not_found",
+    "memory_not_found",
+    "job_not_found",
+    "idempotency_conflict",
+    "memory_deleted",
+    "request_validation_failed",
+    "domain_invariant_failed",
+    "enumeration_limit_exceeded",
+    "memory_integrity_failed",
+    "model_output_invalid",
+    "model_request_failed",
+    "database_unavailable",
+    "model_unavailable",
+    "object_storage_unavailable",
+    "task_broker_unavailable",
+]
+"""The closed set of error codes, so a misspelling is a type error rather than a KeyError.
+
+`ERRORS` is keyed by this, and every function that takes a code takes this: `error_response`
+runs inside an exception handler, where an unknown key would turn a documented 4xx into an
+unhandled 500. `test_every_documented_error_code_is_a_real_code` covers the other direction,
+a member with no row.
+"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,7 +71,7 @@ class ApiError:
     description: str
 
 
-ERRORS: Final[dict[str, ApiError]] = {
+ERRORS: Final[dict[ErrorCode, ApiError]] = {
     "authentication_required": ApiError(
         status.HTTP_401_UNAUTHORIZED,
         "a valid bearer API key is required",
@@ -105,7 +146,7 @@ ERRORS: Final[dict[str, ApiError]] = {
     ),
 }
 
-TENANT_ERRORS: Final[tuple[str, ...]] = (
+TENANT_ERRORS: Final[tuple[ErrorCode, ...]] = (
     "authentication_required",
     "authentication_failed",
     "tenant_access_denied",
@@ -119,28 +160,47 @@ distinguishes "this operation can 404" from "every operation shares an auth fail
 """
 
 
-def responses(*codes: str) -> dict[int | str, dict[str, Any]]:
+RUNTIME_ERROR_CODES: Final[dict[type[Exception], ErrorCode]] = {
+    ForgetTargetNotFoundError: "forget_target_not_found",
+    MemoryNotFoundError: "memory_not_found",
+    JobNotFoundError: "job_not_found",
+    MemoryDeletedError: "memory_deleted",
+    MemoryIntegrityError: "memory_integrity_failed",
+    ModelOutputError: "model_output_invalid",
+    ModelRequestError: "model_request_failed",
+    DatabaseUnavailableError: "database_unavailable",
+    ModelUnavailableError: "model_unavailable",
+    ObjectStorageError: "object_storage_unavailable",
+    TaskBrokerError: "task_broker_unavailable",
+}
+"""Every failure the app answers without reading anything off the exception itself.
+
+One row registers the handler and names the code, so an error class and its published code
+cannot be added apart. Subclasses are covered: Starlette dispatches by MRO and the handler
+looks the code up the same way.
+"""
+
+
+def responses(*codes: ErrorCode) -> dict[int | str, dict[str, Any]]:
     """Document the exact codes one operation returns, grouped under their shared statuses.
 
     Returning `ErrorResponse` as the model for each status is what puts the envelope into
     `components.schemas`; without it a generated client parses no error at all.
     """
-    grouped: dict[int, list[str]] = {}
+    grouped: dict[int, list[ErrorCode]] = {}
     for code in codes:
         grouped.setdefault(ERRORS[code].status_code, []).append(code)
     return {
         status_code: {
             "model": ErrorResponse,
-            "description": "".join(
-                f"`{code}` — {ERRORS[code].description}\n\n" for code in group
-            ).strip(),
+            "description": "\n\n".join(f"`{code}` — {ERRORS[code].description}" for code in group),
         }
         for status_code, group in sorted(grouped.items())
     }
 
 
 def error_response(
-    code: str,
+    code: ErrorCode,
     *,
     message: str | None = None,
     issues: tuple[ValidationIssue, ...] = (),

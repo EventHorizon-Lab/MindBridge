@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import inspect
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from contextlib import AbstractAsyncContextManager
-from typing import Annotated, TypeVar, get_type_hints
+from typing import Annotated, Any, TypeVar, get_type_hints
 
 from mcp.server import MCPServer
-from mcp_types import ToolAnnotations
+from mcp.server.context import CallNext, HandlerResult, ServerMiddleware, ServerRequestContext
+from mcp_types import CallToolResult, TextContent, ToolAnnotations
 
 from mindbridge.application.kernel import MemoryKernel
 from mindbridge.contracts import (
@@ -61,21 +62,32 @@ def _flattened(
     still come from the same Pydantic model REST and Python use -- while the published
     arguments match every other face of the API.
 
-    Ceiling: the argument model MCP generates around this signature ignores unknown fields
-    rather than rejecting them, so a misspelled optional field is dropped instead of faulted.
-    `ContractModel` forbade extras only because the old wrapper put them one level down inside
-    it. The published schema stays silent about extras rather than promising a strictness the
-    server no longer enforces; restoring it needs a stricter argument model upstream.
+    Two consequences of the fields being top-level rather than nested. Unknown keys reach an
+    argument model MCP builds on its own base, which ignores them instead of rejecting them;
+    `_reject_unknown_arguments` restores that check before validation runs, because dropping
+    a misspelled `mode` or `memory_ids` silently answers a different question than the one
+    asked. And MCP JSON-decodes any top-level argument whose annotation is not exactly `str`,
+    which every `X | None` string field trips: `idempotency_key="null"` arrives as None, and
+    `correction_summary="123"` fails as a non-string. That one is not fixable from here -- the
+    check reads the field's own annotation -- so callers must send those values as JSON
+    strings only when they mean them as JSON.
     """
     parameters = [
+        # `Annotated[..., field]` already carries requiredness and the default, including
+        # `default_factory`; a `default=` here would only restate it, and wrongly for the
+        # factory case, where `field.default` is `PydanticUndefined`.
         inspect.Parameter(
             name,
             inspect.Parameter.KEYWORD_ONLY,
-            default=inspect.Parameter.empty if field.is_required() else field.default,
             annotation=Annotated[field.annotation, field],
         )
         for name, field in model.model_fields.items()
     ]
+    if len(inspect.signature(handler).parameters) != 1:
+        # MCP finds `Context` and resolved parameters through `__annotations__`, which cannot
+        # describe the synthesized signature. Such a handler would register clean and fail on
+        # its first call, so refuse it here instead.
+        raise TypeError(f"{handler.__name__} must take exactly one contract parameter")
 
     async def tool(**fields: object) -> _ResultT:
         return await handler(model.model_validate(fields))
@@ -83,14 +95,54 @@ def _flattened(
     # Resolved rather than reflected: `from __future__ import annotations` leaves every
     # handler's own annotations as strings, and MCP reads this signature verbatim when it
     # decides whether the tool has a structured output schema.
-    setattr(  # noqa: B010 - a function's __signature__ is absent from typeshed
-        tool,
-        "__signature__",
-        inspect.Signature(parameters, return_annotation=get_type_hints(handler)["return"]),
+    tool.__signature__ = inspect.Signature(  # type: ignore[attr-defined]
+        parameters,
+        return_annotation=get_type_hints(handler)["return"],
     )
     tool.__name__ = handler.__name__
     tool.__doc__ = handler.__doc__
     return tool
+
+
+def _reject_unknown_arguments(
+    fields_by_tool: Mapping[str, frozenset[str]],
+) -> ServerMiddleware[Any]:
+    """Fault an unknown tool argument instead of letting MCP drop it.
+
+    `ContractModel` forbids extras, but flattening moves the fields out of it into an
+    argument model MCP generates on a base whose config ignores them, and there is no
+    supported way to tighten that model. Middleware sees the raw params before validation,
+    which is early enough to reject the key rather than answer a different question with it.
+    """
+
+    async def reject_unknown_arguments(
+        ctx: ServerRequestContext[Any, Any],
+        call_next: CallNext,
+    ) -> HandlerResult:
+        params = ctx.params if isinstance(ctx.params, dict) else {}
+        if ctx.method == "tools/call":
+            known = fields_by_tool.get(str(params.get("name", "")))
+            arguments = params.get("arguments")
+            if known is not None and isinstance(arguments, dict):
+                unknown = sorted(set(arguments) - known)
+                if unknown:
+                    # A tool result rather than a raise: raising here becomes a protocol-level
+                    # "Internal server error", which tells the caller nothing it can correct.
+                    return CallToolResult(
+                        content=[
+                            TextContent(
+                                type="text",
+                                text=(
+                                    f"unknown arguments: {', '.join(unknown)}. "
+                                    f"This tool accepts: {', '.join(sorted(known))}."
+                                ),
+                            )
+                        ],
+                        is_error=True,
+                    )
+        return await call_next(ctx)
+
+    return reject_unknown_arguments
 
 
 def build_mcp_server(
@@ -99,13 +151,24 @@ def build_mcp_server(
     lifespan: _McpLifespan | None = None,
 ) -> MCPServer[None]:
     """Expose one memory kernel through typed, agent-friendly MCP tools."""
+    fields_by_tool: dict[str, frozenset[str]] = {}
     server: MCPServer[None] = MCPServer(
         "mindbridge",
         title="MindBridge Memory",
         description="Evidence-grounded embodied Memory as a Service.",
         version="0.1.0",
         lifespan=lifespan,
+        middleware=[_reject_unknown_arguments(fields_by_tool)],
     )
+
+    def register(
+        model: type[_RequestT],
+        handler: Callable[[_RequestT], Awaitable[_ResultT]],
+        annotations: ToolAnnotations,
+    ) -> None:
+        """Publish one tool and record the arguments it accepts, from the one model."""
+        fields_by_tool[handler.__name__] = frozenset(model.model_fields)
+        server.add_tool(_flattened(model, handler), annotations=annotations)
 
     async def memory_observe(request: ObserveRequest) -> ObservationReceipt:
         """Store one timestamped multimodal observation and return its durable job ID.
@@ -128,7 +191,7 @@ def build_mcp_server(
         """
         return await kernel.observe(request)
 
-    server.add_tool(_flattened(ObserveRequest, memory_observe), annotations=_IDEMPOTENT_WRITE)
+    register(ObserveRequest, memory_observe, _IDEMPOTENT_WRITE)
 
     async def memory_remember(request: RememberRequest) -> RememberResult:
         """Retain one explicit memory, preserving evidence and temporal provenance.
@@ -145,7 +208,7 @@ def build_mcp_server(
         """
         return await kernel.remember(request)
 
-    server.add_tool(_flattened(RememberRequest, memory_remember), annotations=_IDEMPOTENT_WRITE)
+    register(RememberRequest, memory_remember, _IDEMPOTENT_WRITE)
 
     async def memory_recall(request: RecallRequest) -> RecallResult:
         """Recall relevant memories and return inspectable evidence with the answer.
@@ -164,7 +227,7 @@ def build_mcp_server(
         """
         return await kernel.recall(request)
 
-    server.add_tool(_flattened(RecallRequest, memory_recall), annotations=_READ_ONLY)
+    register(RecallRequest, memory_recall, _READ_ONLY)
 
     async def memory_get(request: GetMemoryRequest) -> MemoryResult:
         """Read one tenant-owned memory by its stable identifier.
@@ -175,7 +238,7 @@ def build_mcp_server(
         """
         return await kernel.get_memory(request.tenant_id, request.memory_id)
 
-    server.add_tool(_flattened(GetMemoryRequest, memory_get), annotations=_READ_ONLY)
+    register(GetMemoryRequest, memory_get, _READ_ONLY)
 
     async def memory_job(request: GetObservationJobRequest) -> ObservationProcessingJobView:
         """Read how far one observation's processing has got.
@@ -191,7 +254,7 @@ def build_mcp_server(
         """
         return await kernel.get_observation_job(request.tenant_id, request.job_id)
 
-    server.add_tool(_flattened(GetObservationJobRequest, memory_job), annotations=_READ_ONLY)
+    register(GetObservationJobRequest, memory_job, _READ_ONLY)
 
     async def memory_feedback(request: FeedbackRequest) -> FeedbackReceipt:
         """Record a useful, wrong, missing, or correction signal for future recall.
@@ -207,7 +270,7 @@ def build_mcp_server(
         """
         return await kernel.record_feedback(request)
 
-    server.add_tool(_flattened(FeedbackRequest, memory_feedback), annotations=_IDEMPOTENT_WRITE)
+    register(FeedbackRequest, memory_feedback, _IDEMPOTENT_WRITE)
 
     async def memory_forget(request: ForgetRequest) -> ForgetReceipt:
         """Recoverably erase one exact memory or source observation and its derivatives.
@@ -222,6 +285,6 @@ def build_mcp_server(
         """
         return await kernel.forget(request)
 
-    server.add_tool(_flattened(ForgetRequest, memory_forget), annotations=_DESTRUCTIVE_WRITE)
+    register(ForgetRequest, memory_forget, _DESTRUCTIVE_WRITE)
 
     return server
