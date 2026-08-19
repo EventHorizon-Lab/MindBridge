@@ -147,6 +147,48 @@ def test_one_pair_cannot_carry_two_verdicts_in_one_write() -> None:
         )
 
 
+def test_each_edge_carries_the_verdict_it_was_derived_from() -> None:
+    """The cue is bound to its own edge, so an audit reads the reason for that merge.
+
+    Two pairs, two different cues: a derivation that zipped the wrong way round would still
+    produce two edges and two cues, and only the pairing catches it.
+    """
+    write = derive_entity_resolution_write(
+        TenantId("tenant_01"),
+        (
+            (_pair("entity_a", "entity_b"), EntityAdjudication(True, 0.9, "same scar")),
+            (_pair("entity_c", "entity_d"), EntityAdjudication(False, 0.8, "both on screen")),
+        ),
+        _AT,
+    )
+    assert {
+        (relation.source_id, relation.target_id): (
+            adjudication.discriminating_cue,
+            adjudication.confidence,
+        )
+        for relation, adjudication in write.decided
+    } == {
+        ("entity_a", "entity_b"): ("same scar", 0.9),
+        ("entity_c", "entity_d"): ("both on screen", 0.8),
+    }
+
+
+def test_the_edges_alone_stay_readable_for_callers_that_only_count() -> None:
+    """Counting callers still see every edge, in order, with the cue kept out of their way."""
+    write = derive_entity_resolution_write(
+        TenantId("tenant_01"),
+        (
+            (_pair("entity_a", "entity_b"), EntityAdjudication(True, 0.9, "same scar")),
+            (_pair("entity_c", "entity_d"), EntityAdjudication(False, 0.8, "both on screen")),
+        ),
+        _AT,
+    )
+    assert [(item.source_id, item.target_id, item.relation_type) for item in write.relations] == [
+        ("entity_a", "entity_b", RelationType.SAME_AS),
+        ("entity_c", "entity_d", RelationType.NOT_SAME_AS),
+    ]
+
+
 def test_an_adjudication_must_name_what_it_decided_on() -> None:
     with pytest.raises(DomainInvariantError):
         EntityAdjudication(True, 0.9, "  ")

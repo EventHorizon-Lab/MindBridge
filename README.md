@@ -1255,11 +1255,19 @@ A verdict is written only when the judge reached one: a confident `same_as`, or 
 output, or a confidence under `--entity-minimum-confidence` in either direction — leaves the pair
 unjudged for a later sweep. Verdicts are pairwise and never composed, so `same_as` between A and B
 and between B and C does not imply anything about A and C. One pair owns one verdict row, and
-`--entity-readjudicate` replaces it rather than adding a contradiction. `--entity-maximum-pairs`
+`--entity-readjudicate` replaces it rather than adding a contradiction. The judge must name the
+cue its verdict rested on, and that cue is kept in `entity_resolution_verdicts` beside the
+confidence and the instant it was reached, keyed to the same pair as the edge — so a merge that
+turns out wrong can be read back rather than guessed at. A re-judgement supersedes the cue even
+when the answer itself holds, because the stored reason has to be the one the standing verdict
+was actually reached on. `--entity-maximum-pairs`
 bounds a page and reports what it left behind. `--entity-type` is repeatable and defaults to
 `person` only, because that is where the fragmentation is and widening it carries identical risk
-for much less value. Retrieval does not traverse `same_as` yet; the edge is written for the graph
-and for agents reading it.
+for much less value. This is the only sweep here that opens media and spends a Generator call per
+candidate pair, so `--skip-entity-resolution` declines it while the other three still run; the
+summary then reports `entities` as `null` rather than zeros, because a run that never called the
+Generator is not a run that called it and paired nothing. Retrieval does not traverse `same_as`
+yet; the edge is written for the graph and for agents reading it.
 
 Run automatic decay as a tenant-scoped scheduled job. A complete run uses stable bounded pages and
 one fixed evaluation instant; concurrent feedback or deletion wins through optimistic guards:
