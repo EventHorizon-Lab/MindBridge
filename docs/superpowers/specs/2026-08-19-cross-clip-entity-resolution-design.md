@@ -170,6 +170,37 @@ database, because the benchmark tenants are shared and can be cleared.
 
 Reported: merge precision (gate: 1.0) and recall (reported).
 
+### Measured result
+
+Run 2026-08-19 against `benchmark_m3_living_room_22_m3sub-raw-001`, 17 `person` entities /
+136 pairs, prompt `resolve_entities_v1`, judge `qwen3.8-max`, evidence reopened from the
+original 720p clips.
+
+| | shipped defaults | exhaustive |
+| --- | --- | --- |
+| bounds | `candidate_limit` 8, `maximum_pairs` 64 | `candidate_limit` 16, `maximum_pairs` 512 |
+| pairs judged | 67 / 136 | 135 / 136 |
+| merge precision | **1.0000** (21/21) | **1.0000** (38/38) |
+| merge recall | 0.5385 (21/39) | **0.9744** (38/39) |
+| negative accuracy | 1.0000 (46/46) | 1.0000 (97/97) |
+
+The gate holds in both: zero false merges and zero true pairs recorded as different, over
+135 adjudications. Per referent, exhaustively: camera wearer 3/3, woman 21/21, man 14/15.
+The collective was offered to every individual and merged with none.
+
+Two things this separates. Recall at the shipped bounds is limited by the shortlist and the
+page budget, not by the judge — all 18 pairs missed there were never looked at, and none was
+refused. And the single exhaustive miss is the confidence floor working: that pair was judged
+three times across runs at 0.65, 0.72 and 0.72, the 0.72 reasoning was correct, and 0.75
+rejected it anyway. Raising recall means widening the shortlist, not lowering the floor.
+
+The cost of that floor is that an unsure pair never settles, so every later sweep pays for it
+again with no backoff.
+
+Single annotator, one video. Precision this clean on 38 merges says the pairwise-with-media
+design works on this material; it does not establish a rate for a tenant whose clips hold
+more than three people.
+
 **Unit,** with a fake adjudicator, in `tests/unit/application/test_entity_resolution.py`:
 
 - non-transitivity — adjudicating A~B and B~C produces no A~C edge
