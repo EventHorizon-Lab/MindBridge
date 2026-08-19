@@ -18,7 +18,10 @@ from mindbridge.benchmarks.egotempo import (
     EGOTEMPO_ADAPTER_VERSION,
     load_egotempo,
 )
-from mindbridge.benchmarks.locomo import LOCOMO_ADAPTER_VERSION, load_locomo
+from mindbridge.benchmarks.locomo_refined import (
+    LOCOMO_REFINED_ADAPTER_VERSION,
+    load_locomo_refined,
+)
 from mindbridge.benchmarks.m3_bench import (
     M3_BENCH_ADAPTER_VERSION,
     M3BenchVideo,
@@ -64,8 +67,8 @@ class DatasetAdapterSmokeResult(ContractModel):
 
 def run_dataset_adapter_smoke(
     *,
-    locomo_path: Path,
-    locomo_revision: str,
+    locomo_refined_path: Path,
+    locomo_refined_revision: str,
     m3_robot_path: Path,
     m3_web_path: Path,
     m3_revision: str,
@@ -88,7 +91,7 @@ def run_dataset_adapter_smoke(
     supermemory_revision: str,
 ) -> DatasetAdapterSmokeResult:
     """Parse every official benchmark annotation release and record immutable inputs."""
-    locomo = load_locomo(locomo_path)
+    locomo_refined = load_locomo_refined(locomo_refined_path)
     m3_robot = load_m3_bench(m3_robot_path)
     m3_web = load_m3_bench(m3_web_path)
     video_mme = load_video_mme(video_mme_path)
@@ -105,15 +108,15 @@ def run_dataset_adapter_smoke(
         created_at=datetime.now(timezone.utc),
         datasets=(
             BenchmarkDatasetSummary(
-                benchmark="LoCoMo",
-                source_repository="snap-research/locomo",
-                source_revision=locomo_revision,
-                source_file=locomo_path.name,
-                source_sha256=sha256_file(locomo_path),
-                adapter_version=LOCOMO_ADAPTER_VERSION,
-                context_count=len(locomo),
-                memory_item_count=sum(len(item.turns) for item in locomo),
-                question_count=sum(len(item.questions) for item in locomo),
+                benchmark="LoCoMo-Refined",
+                source_repository="mem-eval-suite/LoCoMo_refined",
+                source_revision=locomo_refined_revision,
+                source_file=locomo_refined_path.name,
+                source_sha256=sha256_file(locomo_refined_path),
+                adapter_version=LOCOMO_REFINED_ADAPTER_VERSION,
+                context_count=len(locomo_refined),
+                memory_item_count=sum(len(item.turns) for item in locomo_refined),
+                question_count=sum(len(item.questions) for item in locomo_refined),
             ),
             _m3_summary("M3-Bench-robot", m3_robot_path, m3_revision, m3_robot),
             _m3_summary("M3-Bench-web", m3_web_path, m3_revision, m3_web),
@@ -224,10 +227,15 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
     """Run the official-data smoke and emit a versioned JSON manifest."""
     parser = build_parser(prog=prog, description=__doc__)
     parser.add_argument(
-        "--locomo", type=Path, required=True, help="official locomo release to parse"
+        "--locomo-refined",
+        type=Path,
+        required=True,
+        help="official locomo-refined release to parse",
     )
     parser.add_argument(
-        "--locomo-revision", required=True, help="revision pinned for the locomo release"
+        "--locomo-refined-revision",
+        required=True,
+        help="revision pinned for the locomo-refined release",
     )
     parser.add_argument(
         "--m3-robot", type=Path, required=True, help="official m3 robot release to parse"
@@ -292,8 +300,8 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
     )
     arguments = parser.parse_args(argv)
     result = run_dataset_adapter_smoke(
-        locomo_path=arguments.locomo,
-        locomo_revision=arguments.locomo_revision,
+        locomo_refined_path=arguments.locomo_refined,
+        locomo_refined_revision=arguments.locomo_refined_revision,
         m3_robot_path=arguments.m3_robot,
         m3_web_path=arguments.m3_web,
         m3_revision=arguments.m3_revision,

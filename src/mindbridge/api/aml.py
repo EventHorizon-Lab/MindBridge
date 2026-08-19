@@ -6,7 +6,7 @@ import hashlib
 import hmac
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Annotated
+from typing import Annotated, Final
 
 from fastapi import FastAPI, Security
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -32,25 +32,28 @@ from mindbridge.contracts import (
 from mindbridge.models import Generator
 from mindbridge.telemetry import set_current_span_attributes
 
-_BEARER = HTTPBearer(auto_error=False)
-_MINIMUM_API_KEY_LENGTH = 32
-
-
-_AML_ERRORS: tuple[ErrorCode, ...] = (
+AML_ERRORS: Final[tuple[ErrorCode, ...]] = (
     "authentication_required",
     "authentication_failed",
     "request_validation_failed",
-    "domain_invariant_failed",
     "database_unavailable",
+)
+"""What both leaderboard operations return whatever else they do.
+
+Deliberately not `TENANT_ERRORS`: these routes derive their tenant from `user_id` rather
+than proving one against an allow-set, so `tenant_access_denied` is unreachable here and
+listing it would document a status the server cannot send.
+"""
+
+_AML_MODEL_ERRORS: Final[tuple[ErrorCode, ...]] = (
     "model_request_failed",
     "model_output_invalid",
     "model_unavailable",
 )
-"""What both AML routes can return: one key, then extraction or recall over the kernel.
+"""Both operations call a model: add extracts memories, search encodes the query."""
 
-They answer in the same `ErrorResponse` envelope as `/v1`, so they document it the same way;
-leaving them undeclared republished FastAPI's `HTTPValidationError` for a body it never sends.
-"""
+_BEARER = HTTPBearer(auto_error=False)
+_MINIMUM_API_KEY_LENGTH = 32
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,11 +97,15 @@ def register_aml_routes(
         if not hmac.compare_digest(candidate, expected):
             raise AuthenticationError("authentication_failed")
 
+    # The leaderboard adapter documents itself from the same table as /v1: without this the
+    # two routes published FastAPI's default `422 -> HTTPValidationError`, whose only field is
+    # `detail`, while the app-wide handler actually answers with an ErrorResponse -- and the
+    # 401 this module raises below reached callers without appearing in the document at all.
     @app.post(
         "/aml/add",
         response_model=AmlAddResponse,
         operation_id="amlAdd",
-        responses=responses(*_AML_ERRORS),
+        responses=responses(*AML_ERRORS, "domain_invariant_failed", *_AML_MODEL_ERRORS),
     )
     async def aml_add(
         request: AmlAddRequest,
@@ -137,7 +144,7 @@ def register_aml_routes(
         "/aml/search",
         response_model=AmlSearchResponse,
         operation_id="amlSearch",
-        responses=responses(*_AML_ERRORS, "memory_integrity_failed", "object_storage_unavailable"),
+        responses=responses(*AML_ERRORS, *_AML_MODEL_ERRORS),
     )
     async def aml_search(
         request: AmlSearchRequest,

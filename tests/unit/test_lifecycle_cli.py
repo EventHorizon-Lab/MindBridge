@@ -105,7 +105,9 @@ async def test_a_dry_run_never_reaches_the_strength_sweep(
         )
 
     monkeypatch.setattr(lifecycle_cli, "sweep_tenant_lifecycle", fail_if_swept)
-    monkeypatch.setattr(lifecycle_cli, "PostgresMemoryStore", lambda _url: _OpenableStore())
+    monkeypatch.setattr(
+        lifecycle_cli, "PostgresMemoryStore", lambda _url, **_options: _OpenableStore()
+    )
     monkeypatch.setattr(S3MediaAccess, "from_environment", classmethod(lambda _cls: object()))
     monkeypatch.setattr(lifecycle_cli, "reclaim_orphan_clips_use_case", reclaim)
 

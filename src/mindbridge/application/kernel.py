@@ -8,7 +8,7 @@ import json
 import math
 from collections.abc import AsyncGenerator, Callable
 from datetime import datetime, timedelta
-from typing import overload
+from typing import cast, overload
 
 from mindbridge.application.capabilities import (
     Embedder,
@@ -225,14 +225,19 @@ class MemoryKernel:
             async with semaphore:
                 return await self._write_remembered(item, embedding)
 
-        results = tuple(
-            await asyncio.gather(
-                *(
-                    write(item, embedding)
-                    for item, embedding in zip(requests, embeddings, strict=True)
-                )
-            )
+        # Every write settles before the first failure propagates. A bare gather returns on
+        # the first exception while its siblings keep running detached, so the caller would be
+        # told the batch failed while writes it cannot see continue against a store whose
+        # request scope is already unwinding -- and a second failure among them would surface
+        # only as "Task exception was never retrieved", with nothing tying it to the request.
+        settled = await asyncio.gather(
+            *(write(item, embedding) for item, embedding in zip(requests, embeddings, strict=True)),
+            return_exceptions=True,
         )
+        for outcome in settled:
+            if isinstance(outcome, BaseException):
+                raise outcome
+        results = cast("tuple[RememberResult, ...]", tuple(settled))
         return results[0] if isinstance(request, RememberRequest) else results
 
     async def _write_remembered(

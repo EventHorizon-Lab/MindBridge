@@ -62,7 +62,7 @@ duplicates), and every record's `messages` list is fully self-contained --
 one JSONL line supplies its own complete turn sequence, including its own
 `assistant` reply where one exists. So one line = one scope = one
 `AmlCase` with exactly one question, matching longmemeval.py's pattern
-rather than locomo.py's/beam.py's "group several questions under one
+rather than locomo_refined.py's/beam.py's "group several questions under one
 shared conversation" pattern.
 
 This does *not* mean lines never share content: `metadata.context_id` is

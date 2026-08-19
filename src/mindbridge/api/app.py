@@ -63,11 +63,13 @@ _EVIDENCE_ERRORS: Final[tuple[ErrorCode, ...]] = (
     "memory_integrity_failed",
     "object_storage_unavailable",
 )
-"""What any operation that resolves and signs evidence before replying can return.
+"""What any operation that resolves a memory's evidence into signed URLs can return.
 
-Signing is on the request path, not only in the worker: `_memory_result` reads the evidence
-rows and presigns each media object, so a broken object store or a memory pointing at missing
-or cross-tenant evidence surfaces to whoever asked, not to a background job.
+Reading a memory is not only a database read: `read_resolved_memory_evidence` signs a
+download per media object, so object storage is on the request path of every route that
+returns evidence, not only of the one that erases it. Naming the pair once is what stops a
+route from being written without them -- listing them per route is how `getMemory` came to
+document a 503 it cannot return and omit the two it can.
 """
 
 
@@ -142,6 +144,7 @@ def build_app(
             "domain_invariant_failed",
             # A correction writes a new memory version, so it encodes one before replying.
             *_EMBEDDING_ERRORS,
+            *_EVIDENCE_ERRORS,
         ),
     )
     async def record_feedback(

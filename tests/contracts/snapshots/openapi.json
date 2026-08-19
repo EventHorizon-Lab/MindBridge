@@ -1,6 +1,230 @@
 {
   "components": {
     "schemas": {
+      "AmlAddRequest": {
+        "description": "One synchronously persisted chunk of conversation history.",
+        "properties": {
+          "messages": {
+            "description": "The conversation chunk to extract memories from, in order.",
+            "items": {
+              "$ref": "#/components/schemas/AmlMessage"
+            },
+            "maxItems": 512,
+            "minItems": 1,
+            "title": "Messages",
+            "type": "array"
+          },
+          "request_id": {
+            "description": "Echoed back so AML can match the reply.",
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Request Id",
+            "type": "string"
+          },
+          "session_id": {
+            "description": "AML conversation this chunk belongs to.",
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Session Id",
+            "type": "string"
+          },
+          "user_id": {
+            "description": "AML user, mapped onto one derived tenant.",
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "User Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "request_id",
+          "messages",
+          "user_id",
+          "session_id"
+        ],
+        "title": "AmlAddRequest",
+        "type": "object"
+      },
+      "AmlAddResponse": {
+        "additionalProperties": false,
+        "description": "Byte-exact acknowledgement AML matches against its request.",
+        "properties": {
+          "request_id": {
+            "description": "The `request_id` this acknowledges.",
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Request Id",
+            "type": "string"
+          },
+          "session_id": {
+            "description": "The `session_id` this acknowledges.",
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Session Id",
+            "type": "string"
+          },
+          "success": {
+            "const": true,
+            "default": true,
+            "description": "Always true; a failure is an error.",
+            "title": "Success",
+            "type": "boolean"
+          },
+          "user_id": {
+            "description": "The `user_id` this acknowledges.",
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "User Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "request_id",
+          "user_id",
+          "session_id"
+        ],
+        "title": "AmlAddResponse",
+        "type": "object"
+      },
+      "AmlMemoryItem": {
+        "additionalProperties": false,
+        "description": "One retrieved memory in AML's required item shape.",
+        "properties": {
+          "content": {
+            "description": "The remembered content, in words.",
+            "maxLength": 2048,
+            "minLength": 1,
+            "title": "Content",
+            "type": "string"
+          },
+          "created_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "When MindBridge retained it, when that is known.",
+            "title": "Created At"
+          },
+          "id": {
+            "description": "Stable memory ID.",
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "content"
+        ],
+        "title": "AmlMemoryItem",
+        "type": "object"
+      },
+      "AmlMessage": {
+        "description": "One conversation message in an AML add chunk.",
+        "properties": {
+          "content": {
+            "description": "What was said, verbatim.",
+            "maxLength": 2048,
+            "minLength": 1,
+            "title": "Content",
+            "type": "string"
+          },
+          "role": {
+            "description": "Who spoke, in AML's own vocabulary.",
+            "maxLength": 2048,
+            "minLength": 1,
+            "title": "Role",
+            "type": "string"
+          },
+          "timestamp": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "AML's own message timestamp, when it supplies one.",
+            "title": "Timestamp"
+          }
+        },
+        "required": [
+          "role",
+          "content"
+        ],
+        "title": "AmlMessage",
+        "type": "object"
+      },
+      "AmlSearchRequest": {
+        "description": "One retrieval request scoped to a single AML user.",
+        "properties": {
+          "options": {
+            "default": [],
+            "description": "Answer choices AML supplies for a multiple-choice question.",
+            "items": {
+              "maxLength": 2048,
+              "minLength": 1,
+              "type": "string"
+            },
+            "title": "Options",
+            "type": "array"
+          },
+          "query": {
+            "description": "What to retrieve, in words.",
+            "maxLength": 2048,
+            "minLength": 1,
+            "title": "Query",
+            "type": "string"
+          },
+          "top_k": {
+            "description": "How many memories to return, most relevant first.",
+            "maximum": 100.0,
+            "minimum": 1.0,
+            "title": "Top K",
+            "type": "integer"
+          },
+          "user_id": {
+            "description": "AML user whose memory to search.",
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "User Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "query",
+          "user_id",
+          "top_k"
+        ],
+        "title": "AmlSearchRequest",
+        "type": "object"
+      },
+      "AmlSearchResponse": {
+        "additionalProperties": false,
+        "description": "Ranked evidence, most relevant first.",
+        "properties": {
+          "data": {
+            "description": "Retrieved memories, most relevant first.",
+            "items": {
+              "$ref": "#/components/schemas/AmlMemoryItem"
+            },
+            "title": "Data",
+            "type": "array"
+          }
+        },
+        "required": [
+          "data"
+        ],
+        "title": "AmlSearchResponse",
+        "type": "object"
+      },
       "DeletionPage": {
         "additionalProperties": false,
         "description": "Stable ordered tombstones and the next cursor when another page exists.",
@@ -1939,6 +2163,152 @@
   },
   "openapi": "3.1.0",
   "paths": {
+    "/aml/add": {
+      "post": {
+        "operationId": "amlAdd",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AmlAddRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AmlAddResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "`authentication_required` — a valid bearer API key is required\n\n`authentication_failed` — the bearer API key is invalid"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "`request_validation_failed` — request validation failed\n\n`domain_invariant_failed` — the request is well-formed but violates a memory invariant"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "`model_request_failed` — memory model rejected its configured request\n\n`model_output_invalid` — memory model returned invalid output"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "`database_unavailable` — memory storage is temporarily unavailable\n\n`model_unavailable` — memory model is unavailable"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Aml Add"
+      }
+    },
+    "/aml/search": {
+      "post": {
+        "operationId": "amlSearch",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AmlSearchRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AmlSearchResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "`authentication_required` — a valid bearer API key is required\n\n`authentication_failed` — the bearer API key is invalid"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "`request_validation_failed` — request validation failed"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "`model_request_failed` — memory model rejected its configured request\n\n`model_output_invalid` — memory model returned invalid output"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "`database_unavailable` — memory storage is temporarily unavailable\n\n`model_unavailable` — memory model is unavailable"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Aml Search"
+      }
+    },
     "/healthz": {
       "get": {
         "operationId": "health",
@@ -2244,6 +2614,16 @@
             },
             "description": "`request_validation_failed` — request validation failed\n\n`domain_invariant_failed` — the request is well-formed but violates a memory invariant"
           },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "`memory_integrity_failed` — stored memory is inconsistent"
+          },
           "502": {
             "content": {
               "application/json": {
@@ -2262,7 +2642,7 @@
                 }
               }
             },
-            "description": "`database_unavailable` — memory storage is temporarily unavailable\n\n`model_unavailable` — memory model is unavailable"
+            "description": "`database_unavailable` — memory storage is temporarily unavailable\n\n`model_unavailable` — memory model is unavailable\n\n`object_storage_unavailable` — evidence media is unavailable"
           }
         },
         "security": [
