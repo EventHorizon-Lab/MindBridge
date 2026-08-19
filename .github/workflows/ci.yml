@@ -74,6 +74,7 @@ jobs:
             --exclude '^https://penfieldlabs\.substack\.com/'
             './*.md'
             './docs/**/*.md'
+            './.github/**/*.md'
           fail: true
           failIfEmpty: true
 
