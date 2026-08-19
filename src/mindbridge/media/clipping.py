@@ -74,20 +74,28 @@ class _Container(Protocol):
     def __exit__(self, *arguments: object) -> None: ...
 
 
-class _AudioContainer(Protocol):
-    """The same PyAV container seen through its audio methods.
+class _ProxyContainer(Protocol):
+    """The same PyAV container seen by the proxy cutter, which drives both media kinds.
 
-    PyAV's `decode` and `add_stream` serve both media kinds; these shims stay one-kind-per-name
-    so no call site has to widen a frame type it already knows.
+    PyAV's own `decode` and `add_stream` serve video and audio through one name each; these
+    overloads keep the frame and stream types apart so no call site has to widen a type it
+    already knows.
     """
 
     streams: _Streams
 
-    def decode(self, stream: _AudioStream) -> Iterator[_AudioFrame]: ...
-    def add_stream(self, codec: str, *, rate: int) -> _AudioStream: ...
+    def decode(self, stream: _VideoStream) -> Iterator[_VideoFrame]: ...
+    def add_stream(self, codec: str, *, rate: int) -> _VideoStream: ...
     def mux(self, packets: list[object]) -> None: ...
-    def __enter__(self) -> _AudioContainer: ...
+    def seek(self, offset: int) -> None: ...
+    def __enter__(self) -> _ProxyContainer: ...
     def __exit__(self, *arguments: object) -> None: ...
+
+
+class _AudioReader(Protocol):
+    """The same container seen through its audio decode, which PyAV spells with one name."""
+
+    def decode(self, stream: _AudioStream) -> Iterator[_AudioFrame]: ...
 
 
 class _Streams(Protocol):
@@ -209,33 +217,56 @@ def cut_clips(source: bytes, request: ClipRequest) -> tuple[MediaClip, ...]:
 def cut_generation_proxy(source: bytes, request: ClipRequest) -> MediaClip:
     """Re-encode one video span at the sampling a generator was going to apply anyway.
 
-    This is the copy a model reads instead of the source, so it keeps the source's audio: a
-    video-only proxy would silently take speech away from every question that depends on what
-    was said. Its video track carries exactly the frames and pixel budget the request names,
-    which is what makes it smaller than the source without being worth less to the model.
+    This is the copy a model reads instead of the source, so two things have to hold. It keeps
+    the source's audio, because a video-only proxy would silently take speech away from every
+    question that depends on what was said. And both tracks stay on the source's clock, because
+    perception is told event times are milliseconds from the start of the observation and is
+    handed each span's absolute offsets alongside this media.
+
+    ponytail: the ceiling is span length. A sampled video track is sparse next to continuous
+    audio, and past roughly forty sampled frames the MP4 muxer refuses the interleave, so this
+    raises rather than returning a broken file. Callers treat the proxy as best-effort and fall
+    back to the source; writing the two tracks through a real interleaving buffer is the upgrade
+    path if long single-span observations become common.
     """
     if not source:
         raise DomainInvariantError("source media must not be empty")
     if request.kind is not MediaKind.VIDEO:
         raise DomainInvariantError("a generation proxy is only defined for video")
     av = cast(_AvModule, _import("av"))
-    sampled = _sample_video_frames(av, source, request)
-    if not sampled:
-        raise DomainInvariantError("video span selected no frames from its source")
-    width, height = scaled_size(sampled[0].width, sampled[0].height, request.max_pixels)
     buffer = io.BytesIO()
-    first_seconds = sampled[0].time or 0.0
-    with av.open(buffer, mode="w", format="mp4") as output:
-        stream = output.add_stream("libx264", rate=_stream_rate(request.frames_per_second))
-        stream.width, stream.height, stream.pix_fmt = width, height, "yuv420p"
-        stream.time_base = _MILLISECOND_TIME_BASE
-        for frame in sampled:
-            resized = frame.reformat(width=width, height=height, format="yuv420p")
-            resized.pts = round(((frame.time or 0.0) - first_seconds) * 1_000)
-            resized.time_base = stream.time_base
-            output.mux(stream.encode(resized))
-        _copy_span_audio(av, source, cast(_AudioContainer, output), request)
-        output.mux(stream.encode())
+    with cast(_ProxyContainer, av.open(io.BytesIO(source))) as container:
+        if not container.streams.video:
+            raise DomainInvariantError("video source has no decodable video stream")
+        source_video = container.streams.video[0]
+        width, height = scaled_size(source_video.width, source_video.height, request.max_pixels)
+        source_audio = container.streams.audio[0] if container.streams.audio else None
+        with cast(_ProxyContainer, av.open(buffer, mode="w", format="mp4")) as output:
+            # Both tracks are declared before the first packet: libavformat writes the container
+            # header on that packet, and a stream added afterwards is rejected.
+            video = output.add_stream("libx264", rate=_stream_rate(request.frames_per_second))
+            video.width, video.height, video.pix_fmt = width, height, "yuv420p"
+            video.time_base = _MILLISECOND_TIME_BASE
+            audio, resampler = _proxy_audio_stream(av, output, source_audio)
+            frames = 0
+            for frame in _sampled_span_frames(source_video, container, request):
+                resized = frame.reformat(width=width, height=height, format="yuv420p")
+                resized.pts = round((frame.time or 0.0) * 1_000)
+                resized.time_base = video.time_base
+                output.mux(video.encode(resized))
+                frames += 1
+            if not frames:
+                raise DomainInvariantError("video span selected no frames from its source")
+            output.mux(video.encode())
+            if source_audio is not None and audio is not None and resampler is not None:
+                _copy_span_audio(
+                    container,
+                    output,
+                    request,
+                    source=source_audio,
+                    audio=audio,
+                    resampler=resampler,
+                )
     return MediaClip(
         content=buffer.getvalue(),
         suffix=".mp4",
@@ -244,37 +275,46 @@ def cut_generation_proxy(source: bytes, request: ClipRequest) -> MediaClip:
     )
 
 
-def _copy_span_audio(
+def _proxy_audio_stream(
     av: _AvModule,
-    source: bytes,
-    output: _AudioContainer,
+    output: _ProxyContainer,
+    source_audio: _AudioStream | None,
+) -> tuple[_AudioStream | None, _AudioResampler | None]:
+    """Declare the proxy's audio track up front, keeping the source's rate and channel layout."""
+    if source_audio is None:
+        return None, None
+    audio = cast(_AudioStream, output.add_stream("aac", rate=source_audio.rate))
+    audio.layout = source_audio.layout
+    # AAC only accepts planar float, and a source in any other sample format would raise
+    # mid-encode rather than at the boundary.
+    resampler = av.AudioResampler(format="fltp", layout=source_audio.layout, rate=source_audio.rate)
+    return audio, resampler
+
+
+def _copy_span_audio(
+    container: _ProxyContainer,
+    output: _ProxyContainer,
     request: ClipRequest,
+    *,
+    source: _AudioStream,
+    audio: _AudioStream,
+    resampler: _AudioResampler,
 ) -> None:
-    """Re-encode the span's audio into the proxy, keeping its rate and channel layout."""
-    with cast(_AudioContainer, av.open(io.BytesIO(source))) as container:
-        if not container.streams.audio:
-            return
-        source_stream = container.streams.audio[0]
-        stream = output.add_stream("aac", rate=source_stream.rate)
-        stream.layout = source_stream.layout
-        # AAC only accepts planar float, and a source in any other sample format would raise
-        # mid-encode rather than at the boundary.
-        resampler = av.AudioResampler(
-            format="fltp",
-            layout=source_stream.layout,
-            rate=source_stream.rate,
-        )
-        start_seconds, end_seconds = request.start_ms / 1_000, request.end_ms / 1_000
-        for frame in container.decode(source_stream):
-            if frame.time is None or frame.time < start_seconds:
-                continue
-            if frame.time > end_seconds:
-                break
-            for resampled in resampler.resample(frame):
-                output.mux(stream.encode(resampled))
-        for resampled in resampler.resample(None):
-            output.mux(stream.encode(resampled))
-        output.mux(stream.encode())
+    """Pass the span's audio through unshifted, so speech lines up with the frames above it."""
+    # The video pass left the demuxer wherever the span ended and a decoder cannot read
+    # backwards; without this rewind the audio track comes out empty.
+    container.seek(0)
+    start_seconds, end_seconds = request.start_ms / 1_000, request.end_ms / 1_000
+    for frame in cast(_AudioReader, container).decode(source):
+        if frame.time is None or frame.time < start_seconds:
+            continue
+        if frame.time > end_seconds:
+            break
+        for resampled in resampler.resample(frame):
+            output.mux(audio.encode(resampled))
+    for resampled in resampler.resample(None):
+        output.mux(audio.encode(resampled))
+    output.mux(audio.encode())
 
 
 def audio_windows(start_ms: int, end_ms: int) -> tuple[tuple[int, int], ...]:
@@ -377,36 +417,46 @@ def _sample_video_frames(
     request: ClipRequest,
 ) -> list[_VideoFrame]:
     """Keep one frame per requested interval inside the span, decoding once."""
+    with av.open(io.BytesIO(source)) as container:
+        return list(
+            _sampled_span_frames(
+                container.streams.video[0], cast(_ProxyContainer, container), request
+            )
+        )
+
+
+def _sampled_span_frames(
+    stream: _VideoStream,
+    container: _ProxyContainer,
+    request: ClipRequest,
+) -> Iterator[_VideoFrame]:
+    """Yield one frame per requested interval inside the span, from an already-open container."""
     interval_seconds = 1.0 / request.frames_per_second
     start_seconds, end_seconds = request.start_ms / 1_000, request.end_ms / 1_000
-    frames: list[_VideoFrame] = []
     next_sample_seconds = start_seconds
-    with av.open(io.BytesIO(source)) as container:
-        stream = container.streams.video[0]
-        # Single-threaded on purpose. FFmpeg frame threading intermittently deadlocks against
-        # the OpenMP runtime torchvision loads, and the Worker cuts clips in the same process as
-        # the local embedder, so AUTO hung raw-media jobs until their Celery time limit. It
-        # reproduced roughly one run in three, which is why the cheap fix is to not start the
-        # pool at all rather than to order the imports.
-        # This is not free: a 30s 720p source decodes in 1.7s here against 0.35s with AUTO, and
-        # the gap widens with resolution. ponytail: the ceiling is that this loop has no seek,
-        # so cost is (span end offset x span count) and a long source with many spans can reach
-        # the 900s task limit — seek to start_seconds before that becomes real.
-        stream.thread_type = "NONE"
-        for frame in container.decode(stream):
-            if frame.time is None:
-                continue
-            if frame.time < start_seconds:
-                continue
-            if frame.time > end_seconds:
-                # A zero-width span still deserves the frame it points at.
-                if not frames:
-                    frames.append(frame)
-                break
-            if frame.time + 1e-9 >= next_sample_seconds:
-                frames.append(frame)
-                next_sample_seconds += interval_seconds
-    return frames
+    yielded = False
+    # Single-threaded on purpose. FFmpeg frame threading intermittently deadlocks against
+    # the OpenMP runtime torchvision loads, and the Worker cuts clips in the same process as
+    # the local embedder, so AUTO hung raw-media jobs until their Celery time limit. It
+    # reproduced roughly one run in three, which is why the cheap fix is to not start the
+    # pool at all rather than to order the imports.
+    # This is not free: a 30s 720p source decodes in 1.7s here against 0.35s with AUTO, and
+    # the gap widens with resolution. ponytail: the ceiling is that this loop has no seek,
+    # so cost is (span end offset x span count) and a long source with many spans can reach
+    # the 900s task limit — seek to start_seconds before that becomes real.
+    stream.thread_type = "NONE"
+    for frame in container.decode(stream):
+        if frame.time is None or frame.time < start_seconds:
+            continue
+        if frame.time > end_seconds:
+            # A zero-width span still deserves the frame it points at.
+            if not yielded:
+                yield frame
+            break
+        if frame.time + 1e-9 >= next_sample_seconds:
+            next_sample_seconds += interval_seconds
+            yielded = True
+            yield frame
 
 
 def _clamped_region(

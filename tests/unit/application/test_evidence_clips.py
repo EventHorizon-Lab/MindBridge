@@ -563,13 +563,26 @@ def _shrinking_cut(source: bytes, request: ClipRequest) -> MediaClip:
     )
 
 
-async def test_generation_proxy_falls_back_to_the_source_it_could_not_sample() -> None:
-    """The proxy is an optimization; a source it cannot sample must still reach the model
-    rather than turning a working observation into a permanently failed one."""
+@pytest.mark.parametrize(
+    "error",
+    [
+        DomainInvariantError("video span selected no frames from its source"),
+        ValueError("[Errno 22] Invalid argument"),
+        IndexError("tuple index out of range"),
+        RuntimeError("decoder exploded"),
+    ],
+)
+async def test_generation_proxy_falls_back_to_the_source_it_could_not_sample(
+    error: Exception,
+) -> None:
+    """The proxy is an optimization, so every way the encoder can fail has to degrade to the
+    source rather than turn a working observation into a permanently failed one. The muxer
+    raises a bare ValueError for a span it will not interleave, and PyAV raises IndexError for a
+    video object with no decodable video stream; neither is a DomainInvariantError."""
     store = RecordingStore()
 
     def refuse(source: bytes, request: ClipRequest) -> MediaClip:
-        raise DomainInvariantError("video span selected no frames from its source")
+        raise error
 
     resolved = await derive_generation_proxies(
         TENANT_ID,

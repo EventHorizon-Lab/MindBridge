@@ -199,7 +199,7 @@ class MindBridge:
                         yield event
         except httpx.HTTPError as error:
             raise MindBridgeError(
-                "MindBridge stream failed",
+                f"MindBridge job event stream failed: {type(error).__name__}: {error}",
                 code="transport_error",
             ) from error
 

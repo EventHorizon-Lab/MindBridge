@@ -761,7 +761,7 @@ async def test_perception_reads_a_sampled_proxy_instead_of_the_untouched_source(
     assert signer.uploaded[proxy_uri] == b"clip:0-4000:source-media-bytes"
     # The proxy is transient derived media, not a new source the memory now cites.
     assert store.output is not None
-    assert [item.media_object_id for item in store.output.media_objects] != [proxy_uri]
+    assert proxy_uri not in [item.uri for item in store.output.media_objects]
 
 
 async def test_perception_reads_the_source_when_the_proxy_is_switched_off() -> None:

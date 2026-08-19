@@ -156,6 +156,59 @@ def test_generation_proxy_applies_the_requested_frame_rate_and_pixel_budget() ->
     assert stream.codec_context.width * stream.codec_context.height <= 10_000
 
 
+def test_generation_proxy_refuses_a_span_it_cannot_interleave() -> None:
+    """A sampled video track is sparse next to continuous audio, and past roughly forty frames
+    the MP4 muxer refuses the interleave. It has to raise rather than hand back a file whose
+    audio or video is silently truncated, because the caller's fallback is the source itself."""
+    source = _audiovisual_bytes(seconds=60.0, fps=10, width=160, height=120)
+
+    with pytest.raises(Exception, match=r"Invalid argument|monotonic"):
+        cut_generation_proxy(
+            source,
+            ClipRequest(kind=MediaKind.VIDEO, start_ms=0, end_ms=60_000, frames_per_second=1.0),
+        )
+
+
+def test_generation_proxy_covers_the_span_length_observations_actually_use() -> None:
+    """Every ingest path in the repo segments video well inside the ceiling above."""
+    import av
+
+    source = _audiovisual_bytes(seconds=30.0, fps=10, width=160, height=120)
+
+    proxy = cut_generation_proxy(
+        source,
+        ClipRequest(kind=MediaKind.VIDEO, start_ms=0, end_ms=30_000, frames_per_second=1.0),
+    )
+
+    assert len(proxy.content) < len(source)
+    with av.open(io.BytesIO(proxy.content), mode="r") as container:
+        assert {stream.type for stream in container.streams} == {"video", "audio"}
+        assert len(list(container.decode(container.streams.video[0]))) >= 25
+
+
+def test_generation_proxy_keeps_picture_and_speech_on_one_timeline() -> None:
+    """Video was rebased to zero while audio kept the source timeline, so the model heard speech
+    against the wrong frames by exactly the span offset."""
+    import av
+
+    source = _audiovisual_bytes(seconds=6.0, fps=10, width=320, height=240)
+
+    proxy = cut_generation_proxy(
+        source,
+        ClipRequest(kind=MediaKind.VIDEO, start_ms=2_000, end_ms=5_000, frames_per_second=2.0),
+    )
+
+    with av.open(io.BytesIO(proxy.content), mode="r") as container:
+        video = [frame.time for frame in container.decode(container.streams.video[0])]
+    with av.open(io.BytesIO(proxy.content), mode="r") as container:
+        audio = [frame.time for frame in container.decode(container.streams.audio[0])]
+    assert video[0] == pytest.approx(audio[0], abs=0.2)
+    assert video[-1] == pytest.approx(audio[-1], abs=0.2)
+    # Perception is told event times are milliseconds from observation start, so the copy it
+    # reads has to stay on the source's clock rather than restarting at zero.
+    assert video[0] == pytest.approx(2.0, abs=0.2)
+
+
 def test_generation_proxy_of_a_silent_source_stays_video_only() -> None:
     import av
 

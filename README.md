@@ -1054,7 +1054,9 @@ shape `s3://<bucket>/tenants/<tenant_id>/<object>`.
 Set it only when a hosted model must fetch signed evidence over a different address than the one
 the deployment reads and writes through: signed URLs then name the public address while every
 internal read, write, and delete stays on the direct one instead of leaving and re-entering the
-network. Signatures cover the host, so both names must reach the same bucket.
+network. Signatures cover the host, so both names must reach the same bucket. It moves **every**
+signed URL, including the derived-clip URLs a self-hosted embedder fetches, so set it only where
+that endpoint can reach the public name too.
 
 MindBridge owns no S3 region setting. Boto3's own chain resolves it from `AWS_REGION`,
 `AWS_DEFAULT_REGION`, `~/.aws/config`, or instance metadata, exactly as it resolves credentials, so
@@ -1120,14 +1122,29 @@ export MINDBRIDGE_MEDIA_SAMPLING_CONFIG_JSON='{
 }'
 ```
 
-Unset keys keep the defaults shown above, and an unrecognized key fails startup rather than
-silently keeping a default. `generation_proxy` decides what a generation request downloads. Every
-request already carries the frame rate and pixel budget the model must apply, so handing over the
-untouched source makes the model fetch frames it discards on arrival; with the proxy on, video is
-cut once to that same budget and the sampled copy is what the model reads. The evidence span still
-cites its original object, a proxy that did not come out smaller is discarded, and the copy is
-transient derived media the orphan-clip sweep reclaims. Turn it off for a generator that reads the
-same storage the Worker does, where the encode costs more than the transfer it removes.
+Unset keys keep the defaults shown above; an unrecognized key or a value of the wrong type fails
+startup rather than silently meaning something else.
+
+`generation_proxy` decides what a generation request downloads. Every request already carries the
+frame rate and pixel budget the model must apply, so handing over the untouched source makes the
+model fetch frames it discards on arrival; with the proxy on, video is cut once to that same budget
+and the sampled copy is what perception reads. Both of its tracks stay on the source's clock,
+because perception is told event times are milliseconds from the start of the observation. Turn it
+off for a generator that reads the same storage the Worker does, where the encode costs more than
+the transfer it removes.
+
+The proxy is best-effort by design and covers **video only**: `image_max_pixels` governs stored
+image clips, not what the model is sent, and an image reaches the model at full resolution because
+the request carries no pixel budget for images at all. A span the encoder will not produce — past
+roughly forty sampled frames the MP4 muxer refuses to interleave a sparse video track with
+continuous audio — falls back to the untouched source, so a long single-span observation behaves
+exactly as it did before this knob existed. Every ingest path in this repo segments video well
+inside that ceiling.
+
+A proxy that did not come out smaller is discarded, and the copy is transient derived media: it is
+never registered, so it is not cited as provenance and `forget()` does not reach it, and only the
+`--reclaim-orphan-clips` sweep removes it. Schedule that sweep on any deployment ingesting video
+continuously, and read `reclaimed_count` as routine traffic rather than as evidence of a crash.
 
 The proxy costs one extra read of the source, because clip derivation reads it again after the
 model call rather than holding the whole recording in memory across it. That read is internal, so

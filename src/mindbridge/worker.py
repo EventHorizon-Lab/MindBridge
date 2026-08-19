@@ -7,8 +7,8 @@ import json
 import os
 from collections.abc import Mapping
 from contextlib import AsyncExitStack
-from dataclasses import dataclass, field, fields
-from typing import Any, NoReturn, Protocol, cast
+from dataclasses import dataclass, field
+from typing import Annotated, NoReturn, Protocol
 
 from billiard.exceptions import (
     SoftTimeLimitExceeded,
@@ -18,12 +18,16 @@ from celery.signals import (
     worker_process_init,
     worker_process_shutdown,
 )
+from pydantic import Field, StrictBool
 
 from mindbridge.application.capabilities import Embedder
 from mindbridge.application.evidence_clips import ClipSampling
 from mindbridge.application.pipelines import PerceptionPipeline
 from mindbridge.application.process_observation import ProcessObservation
 from mindbridge.configuration import (
+    PluginConfigModel,
+    PluginInteger,
+    PluginNumber,
     copy_plugin_configuration,
     optional_environment_value,
     plugin_configuration,
@@ -49,6 +53,11 @@ from mindbridge.infrastructure.task_queue import (
     PROCESS_OBSERVATION_TASK,
     ObservationProcessingTaskMessage,
     create_task_queue,
+)
+from mindbridge.media.clipping import (
+    DEFAULT_IMAGE_MAX_PIXELS,
+    DEFAULT_VIDEO_FRAMES_PER_SECOND,
+    DEFAULT_VIDEO_MAX_PIXELS,
 )
 from mindbridge.models.defaults import (
     DEFAULT_EMBEDDING_DIMENSION,
@@ -182,6 +191,20 @@ class WorkerSettings:
         )
 
 
+class _MediaSamplingConfig(PluginConfigModel):
+    """Strict schema for the optional media sampling object.
+
+    It reads value types as well as key names, which a hand-written key check does not: a
+    quoted number or a `"false"` string for the off-switch would otherwise be accepted and
+    silently mean something else.
+    """
+
+    frames_per_second: Annotated[PluginNumber, Field(gt=0)] = DEFAULT_VIDEO_FRAMES_PER_SECOND
+    max_pixels: Annotated[PluginInteger, Field(gt=0)] = DEFAULT_VIDEO_MAX_PIXELS
+    image_max_pixels: Annotated[PluginInteger, Field(gt=0)] = DEFAULT_IMAGE_MAX_PIXELS
+    generation_proxy: StrictBool = True
+
+
 def _clip_sampling_from_environment(source: Mapping[str, str]) -> ClipSampling:
     """Read the optional media sampling knob that sets the whole write cost of video.
 
@@ -190,17 +213,12 @@ def _clip_sampling_from_environment(source: Mapping[str, str]) -> ClipSampling:
     has to be able to choose it, so it travels as one optional JSON object rather than four
     more fallback variables.
     """
-    encoded = optional_environment_value(source, "MINDBRIDGE_MEDIA_SAMPLING_CONFIG_JSON")
-    if encoded is None:
+    if optional_environment_value(source, "MINDBRIDGE_MEDIA_SAMPLING_CONFIG_JSON") is None:
         return ClipSampling()
-    config = plugin_configuration(source, "MINDBRIDGE_MEDIA_SAMPLING_CONFIG_JSON")
-    unsupported = set(config) - {field.name for field in fields(ClipSampling)}
-    if unsupported:
-        raise ValueError(
-            "MINDBRIDGE_MEDIA_SAMPLING_CONFIG_JSON has unsupported keys: "
-            f"{', '.join(sorted(unsupported))}"
-        )
-    return ClipSampling(**cast(dict[str, Any], config))
+    config = _MediaSamplingConfig.model_validate(
+        plugin_configuration(source, "MINDBRIDGE_MEDIA_SAMPLING_CONFIG_JSON")
+    )
+    return ClipSampling(**config.model_dump())
 
 
 @dataclass(slots=True)

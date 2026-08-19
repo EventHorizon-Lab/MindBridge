@@ -13,7 +13,6 @@ object instead of leaving one orphan per attempt.
 from __future__ import annotations
 
 import asyncio
-import math
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
@@ -35,7 +34,6 @@ from mindbridge.application.ports import (
     PresignedMediaDownload,
 )
 from mindbridge.core import (
-    DomainInvariantError,
     EmbeddedObjectType,
     EmbeddingId,
     EmbeddingRecord,
@@ -71,12 +69,6 @@ class ClipSampling:
     # Off only for a generator that reads the same storage the Worker does, where the encode
     # costs more than the transfer it removes.
     generation_proxy: bool = True
-
-    def __post_init__(self) -> None:
-        if not math.isfinite(self.frames_per_second) or self.frames_per_second <= 0:
-            raise ValueError("frames_per_second must be a positive number")
-        if self.max_pixels <= 0 or self.image_max_pixels <= 0:
-            raise ValueError("pixel budgets must be positive")
 
 
 @dataclass(frozen=True, slots=True)
@@ -185,11 +177,13 @@ async def derive_generation_proxies(
     """
     if max_concurrency <= 0:
         raise ValueError("max_concurrency must be positive")
+    if not sampling.generation_proxy:
+        return evidence
     groups: dict[MediaObjectId, list[ResolvedEvidence]] = {}
     for item in evidence:
         if item.media_object.kind is MediaKind.VIDEO:
             groups.setdefault(item.media_object.media_object_id, []).append(item)
-    if not sampling.generation_proxy or not groups:
+    if not groups:
         return evidence
 
     semaphore = asyncio.Semaphore(max_concurrency)
@@ -242,14 +236,21 @@ async def _store_generation_proxy(
             end_ms=max(item.evidence_span.end_ms for item in items),
             frames_per_second=sampling.frames_per_second,
             max_pixels=sampling.max_pixels,
-            image_max_pixels=sampling.image_max_pixels,
         )
         try:
             proxy = await asyncio.to_thread(cut, source, request)
-        except DomainInvariantError:
-            # Sampling is an optimization. A source it cannot cut still has to reach the model,
-            # rather than turning a working observation into a permanently failed one.
-            set_current_span_attributes({"mindbridge.generation_proxy.skipped": True})
+        except Exception as error:
+            # Sampling is an optimization, so every way the encoder can fail degrades to the
+            # source rather than turning a working observation into a permanently failed one.
+            # Deliberately broad: the muxer raises a bare ValueError for a span it will not
+            # interleave and PyAV raises IndexError for a container it cannot read, and neither
+            # is worth losing an observation over.
+            set_current_span_attributes(
+                {
+                    "mindbridge.generation_proxy.skipped": True,
+                    "mindbridge.generation_proxy.skipped_reason": type(error).__name__,
+                }
+            )
             return source_object.media_object_id, None
         finally:
             del source

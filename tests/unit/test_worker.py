@@ -264,11 +264,24 @@ def test_worker_media_sampling_defaults_keep_the_documented_encoder_budget() -> 
     assert settings.clip_sampling == ClipSampling()
 
 
-def test_worker_rejects_unsupported_media_sampling_keys() -> None:
-    """A typo in an optional tuning knob must fail startup, not silently keep the default."""
+@pytest.mark.parametrize(
+    "config",
+    [
+        '{"fps": 0.5}',
+        '{"generation_proxy": "false"}',
+        '{"max_pixels": true}',
+        '{"frames_per_second": "0.5"}',
+        '{"max_pixels": 1.5}',
+        '{"frames_per_second": 0}',
+    ],
+)
+def test_worker_rejects_a_malformed_media_sampling_knob(config: str) -> None:
+    """A typo in an optional tuning knob must fail startup, not silently mean something else.
+    `"false"` is a truthy string, and a quoted or floating pixel count would reach a budget
+    comparison as the wrong type."""
     with pytest.raises(ValueError):
         WorkerSettings.from_environment(
-            {**_environment(), "MINDBRIDGE_MEDIA_SAMPLING_CONFIG_JSON": '{"fps": 0.5}'}
+            {**_environment(), "MINDBRIDGE_MEDIA_SAMPLING_CONFIG_JSON": config}
         )
 
 
