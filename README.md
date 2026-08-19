@@ -1175,6 +1175,9 @@ export MINDBRIDGE_GENERATOR_CONFIG_JSON='{
 }'
 ```
 
+Omitting `request_timeout_seconds` is fine and means the bundled Generator's own default of 1800
+seconds applies; the budget is sized from that same number, so the two never disagree.
+
 Sizing these independently is what makes a slow Generator look like a broken write path rather than
 a slow one: perception can spend thousands of output tokens on a busy 30-second clip, and if the task
 limit expires first, the overrun is retried as though it were transient and the same call is paid for

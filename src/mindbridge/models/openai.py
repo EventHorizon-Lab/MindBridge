@@ -47,6 +47,7 @@ from mindbridge.models._vectors import validate_embedding_vector
 from mindbridge.models.defaults import (
     DEFAULT_EMBEDDING_DIMENSION,
     DEFAULT_GENERATOR_MODEL_ID,
+    DEFAULT_GENERATOR_REQUEST_TIMEOUT_SECONDS,
     MatryoshkaDimension,
 )
 from mindbridge.telemetry import operation_span, set_current_span_attributes
@@ -352,7 +353,7 @@ class _GeneratorConfig(PluginConfigModel):
     endpoint: PluginText
     model_revision: PluginText
     model_id: PluginText = DEFAULT_GENERATOR_MODEL_ID
-    request_timeout_seconds: PluginNumber = 1_800.0
+    request_timeout_seconds: PluginNumber = DEFAULT_GENERATOR_REQUEST_TIMEOUT_SECONDS
     max_retries: PluginInteger = 2
     reasoning_effort: PluginText | None = None
     video_frames_per_second: PluginNumber = DEFAULT_VIDEO_FRAMES_PER_SECOND
