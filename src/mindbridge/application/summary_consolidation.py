@@ -34,6 +34,7 @@ from mindbridge.core import (
     derive_relation,
     derive_stable_id,
     require_aware_datetime,
+    require_bounded_count,
     require_non_empty,
     require_similarity,
 )
@@ -75,10 +76,10 @@ class SummaryCandidateRequest:
     def __post_init__(self) -> None:
         require_non_empty(self.tenant_id, "tenant_id")
         require_aware_datetime(self.evaluated_at, "evaluated_at")
-        if not 1 <= self.limit <= 32:
-            raise DomainInvariantError("Summary candidate page limit must be between 1 and 32")
-        if not 0 <= self.maximum_gap_seconds <= 31_536_000:
-            raise DomainInvariantError("maximum_gap_seconds must be between 0 and 31536000")
+        require_bounded_count(self.limit, "Summary candidate page limit", minimum=1, maximum=32)
+        require_bounded_count(
+            self.maximum_gap_seconds, "maximum_gap_seconds", minimum=0, maximum=31_536_000
+        )
         require_similarity(self.minimum_similarity, "minimum_similarity")
 
 

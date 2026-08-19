@@ -174,3 +174,68 @@ def test_a_page_reports_what_its_bound_refused_to_look_at() -> None:
             dropped_pair_count=0,
             next_cursor=None,
         )
+
+
+def _request(**overrides: object) -> EntityCandidateRequest:
+    return EntityCandidateRequest(
+        tenant_id=TenantId("tenant_01"),
+        evaluated_at=_AT,
+        **overrides,  # type: ignore[arg-type]
+    )
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("limit", 0),
+        ("limit", 33),
+        ("maximum_gap_seconds", -1),
+        ("maximum_gap_seconds", 31_536_001),
+        ("candidate_limit", 0),
+        ("candidate_limit", 33),
+        ("minimum_confidence", -0.1),
+        ("minimum_confidence", 1.1),
+        ("evidence_per_side", 0),
+        ("evidence_per_side", 9),
+        ("maximum_pairs", 0),
+        ("maximum_pairs", 513),
+    ],
+)
+def test_every_spend_bound_rejects_a_value_outside_its_range(field: str, value: object) -> None:
+    """These are the budgets a sweep is allowed to spend; none may be set out of range."""
+    with pytest.raises(DomainInvariantError):
+        _request(**{field: value})
+
+
+def test_minimum_confidence_rejects_a_non_finite_value() -> None:
+    """The shared probability guard keeps the isfinite half the inline copy had dropped."""
+    with pytest.raises(DomainInvariantError):
+        _request(minimum_confidence=float("nan"))
+
+
+def test_entity_types_must_be_a_non_empty_unique_set() -> None:
+    with pytest.raises(DomainInvariantError):
+        _request(entity_types=())
+    with pytest.raises(DomainInvariantError):
+        _request(entity_types=(EntityType.PERSON, EntityType.PERSON))
+
+
+def test_a_candidate_rejects_duplicate_evidence() -> None:
+    with pytest.raises(DomainInvariantError):
+        EntityCandidate(
+            entity=Entity(
+                entity_id=EntityId("entity_a"),
+                tenant_id=TenantId("tenant_01"),
+                entity_type=EntityType.PERSON,
+                canonical_name="a",
+                created_at=_AT,
+            ),
+            evidence_ids=(EvidenceId("evidence_1"), EvidenceId("evidence_1")),
+        )
+
+
+def test_a_page_rejects_negative_counts() -> None:
+    with pytest.raises(DomainInvariantError):
+        EntityCandidatePage(pairs=(), scanned_count=-1, dropped_pair_count=0, next_cursor=None)
+    with pytest.raises(DomainInvariantError):
+        EntityCandidatePage(pairs=(), scanned_count=0, dropped_pair_count=-1, next_cursor=None)

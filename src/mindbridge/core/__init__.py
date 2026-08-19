@@ -2,6 +2,7 @@
 
 from mindbridge.core._validation import (
     require_aware_datetime,
+    require_bounded_count,
     require_non_empty,
     require_probability,
     require_similarity,
@@ -171,6 +172,7 @@ __all__ = [
     "evolve_memory_strength",
     "media_kind_for_suffix",
     "require_aware_datetime",
+    "require_bounded_count",
     "require_non_empty",
     "require_probability",
     "require_similarity",

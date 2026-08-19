@@ -29,6 +29,7 @@ from mindbridge.core import (
     TenantId,
     derive_stable_id,
     require_aware_datetime,
+    require_bounded_count,
     require_non_empty,
     require_probability,
 )
@@ -59,19 +60,16 @@ class EntityCandidateRequest:
         require_aware_datetime(self.evaluated_at, "evaluated_at")
         if self.after_entity_id is not None:
             require_non_empty(self.after_entity_id, "after_entity_id")
-        if not 1 <= self.limit <= 32:
-            raise DomainInvariantError("entity candidate page limit must be between 1 and 32")
-        if not 0 <= self.maximum_gap_seconds <= 31_536_000:
-            raise DomainInvariantError("maximum_gap_seconds must be between 0 and 31536000")
-        if not 1 <= self.candidate_limit <= 32:
-            raise DomainInvariantError("candidate_limit must be between 1 and 32")
+        require_bounded_count(self.limit, "entity candidate page limit", minimum=1, maximum=32)
+        require_bounded_count(
+            self.maximum_gap_seconds, "maximum_gap_seconds", minimum=0, maximum=31_536_000
+        )
+        require_bounded_count(self.candidate_limit, "candidate_limit", minimum=1, maximum=32)
         require_probability(self.minimum_confidence, "minimum_confidence")
-        if not 1 <= self.evidence_per_side <= 8:
-            raise DomainInvariantError("evidence_per_side must be between 1 and 8")
-        if not 1 <= self.maximum_pairs <= _MAXIMUM_PAIRS_CEILING:
-            raise DomainInvariantError(
-                f"maximum_pairs must be between 1 and {_MAXIMUM_PAIRS_CEILING}"
-            )
+        require_bounded_count(self.evidence_per_side, "evidence_per_side", minimum=1, maximum=8)
+        require_bounded_count(
+            self.maximum_pairs, "maximum_pairs", minimum=1, maximum=_MAXIMUM_PAIRS_CEILING
+        )
         if not self.entity_types:
             raise DomainInvariantError("entity_types must not be empty")
         if len(set(self.entity_types)) != len(self.entity_types):

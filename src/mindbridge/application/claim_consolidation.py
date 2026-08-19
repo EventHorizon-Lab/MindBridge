@@ -12,6 +12,7 @@ from mindbridge.core import (
     EntityId,
     TenantId,
     require_aware_datetime,
+    require_bounded_count,
     require_non_empty,
     require_similarity,
 )
@@ -33,10 +34,10 @@ class ClaimCandidateRequest:
         require_aware_datetime(self.evaluated_at, "evaluated_at")
         if self.after_claim_id is not None:
             require_non_empty(self.after_claim_id, "after_claim_id")
-        if not 1 <= self.limit <= 32:
-            raise DomainInvariantError("Claim candidate page limit must be between 1 and 32")
-        if not 0 <= self.maximum_gap_seconds <= 31_536_000:
-            raise DomainInvariantError("maximum_gap_seconds must be between 0 and 31536000")
+        require_bounded_count(self.limit, "Claim candidate page limit", minimum=1, maximum=32)
+        require_bounded_count(
+            self.maximum_gap_seconds, "maximum_gap_seconds", minimum=0, maximum=31_536_000
+        )
         require_similarity(self.minimum_similarity, "minimum_similarity")
 
 
