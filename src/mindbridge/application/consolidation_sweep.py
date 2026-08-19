@@ -1,4 +1,4 @@
-"""Stable tenant sweeps across Episode, Claim, and Summary consolidation."""
+"""Stable tenant sweeps across Episode, Claim, Summary, and entity consolidation."""
 
 from __future__ import annotations
 
@@ -10,13 +10,22 @@ from typing import Generic, TypeVar
 
 from mindbridge.application.claim_consolidation import ClaimCandidateRequest
 from mindbridge.application.consolidate_claims import ConsolidateClaims
+from mindbridge.application.consolidate_entities import ConsolidateEntities
 from mindbridge.application.consolidate_summaries import ConsolidateSummaries
 from mindbridge.application.consolidation import ConsolidateEpisodes, EpisodeCandidateRequest
+from mindbridge.application.entity_resolution import EntityCandidateRequest
 from mindbridge.application.summary_consolidation import (
     SummaryCandidateCursor,
     SummaryCandidateRequest,
 )
-from mindbridge.core import ClaimId, EventId, MemoryIntegrityError, TenantId
+from mindbridge.core import (
+    ClaimId,
+    EntityId,
+    EntityType,
+    EventId,
+    MemoryIntegrityError,
+    TenantId,
+)
 
 # Each sweep pages with the cursor its own request field accepts; keeping that type on the
 # shared loop is what stops a copied sweep from feeding a Claim cursor to an Episode page.
@@ -46,6 +55,7 @@ class ConsolidationSweepSummary:
     episodes: SweepSummary
     claims: SweepSummary
     summaries: SweepSummary
+    entities: SweepSummary
 
 
 @dataclass(frozen=True, slots=True)
@@ -163,6 +173,58 @@ async def consolidate_tenant_summaries(
         )
 
     return await _sweep("Summary", tenant_id, evaluated_at, run_page)
+
+
+async def consolidate_tenant_entities(
+    use_case: ConsolidateEntities,
+    tenant_id: TenantId,
+    evaluated_at: datetime,
+    *,
+    page_size: int,
+    maximum_gap_seconds: int,
+    candidate_limit: int,
+    minimum_confidence: float,
+    evidence_per_side: int,
+    maximum_pairs: int,
+    entity_types: tuple[EntityType, ...],
+    readjudicate: bool,
+) -> SweepSummary:
+    """Adjudicate stable entity pair pages at one fixed evaluation instant."""
+
+    async def run_page(cursor: EntityId | None) -> _Page[EntityId]:
+        result = await use_case.run(
+            EntityCandidateRequest(
+                tenant_id=tenant_id,
+                evaluated_at=evaluated_at,
+                after_entity_id=cursor,
+                limit=page_size,
+                maximum_gap_seconds=maximum_gap_seconds,
+                candidate_limit=candidate_limit,
+                minimum_confidence=minimum_confidence,
+                evidence_per_side=evidence_per_side,
+                maximum_pairs=maximum_pairs,
+                entity_types=entity_types,
+                readjudicate=readjudicate,
+            )
+        )
+        return _Page(
+            result.scanned_count,
+            result.candidate_pair_count,
+            {
+                "same_as_count": result.same_as_count,
+                "not_same_as_count": result.not_same_as_count,
+                # These two read like one number and are not. A skipped pair was reached and
+                # the judge declined to answer it; a dropped pair is one the page budget never
+                # looked at. Which of "the model is unsure" and "the sweep is too small" is
+                # holding a tenant back is only visible while they stay apart.
+                "skipped_pair_count": result.skipped_pair_count,
+                "dropped_pair_count": result.dropped_pair_count,
+                "committed_count": result.committed_count,
+            },
+            result.next_cursor,
+        )
+
+    return await _sweep("entity", tenant_id, evaluated_at, run_page)
 
 
 async def _sweep(

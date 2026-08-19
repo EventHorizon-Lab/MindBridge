@@ -49,6 +49,11 @@ class RelationType(str, Enum):
     SUPPORTS = "supports"
     CONTRADICTS = "contradicts"
     SUPERSEDES = "supersedes"
+    # Entity resolution verdicts. Deliberately two members and no "unknown": a pair
+    # carrying neither edge has not been judged, which is a different state from one
+    # judged to be two entities.
+    SAME_AS = "same_as"
+    NOT_SAME_AS = "not_same_as"
     SAME_EPISODE = "same_episode"
     BEFORE = "before"
     AFTER = "after"

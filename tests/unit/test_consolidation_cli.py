@@ -3,10 +3,16 @@
 from datetime import datetime, timezone
 from typing import cast
 
+import pytest
+
 from mindbridge.application.claim_consolidation import ClaimCandidateRequest
 from mindbridge.application.consolidate_claims import (
     ClaimConsolidationResult,
     ConsolidateClaims,
+)
+from mindbridge.application.consolidate_entities import (
+    ConsolidateEntities,
+    EntityResolutionResult,
 )
 from mindbridge.application.consolidate_summaries import (
     ConsolidateSummaries,
@@ -18,16 +24,27 @@ from mindbridge.application.consolidation import (
     EpisodeConsolidationResult,
 )
 from mindbridge.application.consolidation_sweep import (
+    SweepSummary,
     consolidate_tenant_claims,
+    consolidate_tenant_entities,
     consolidate_tenant_episodes,
     consolidate_tenant_summaries,
 )
+from mindbridge.application.entity_resolution import EntityCandidateRequest
 from mindbridge.application.summary_consolidation import (
     SummaryCandidateCursor,
     SummaryCandidateRequest,
 )
-from mindbridge.consolidation_cli import ConsolidationSettings
-from mindbridge.core import ClaimId, EventId, MemoryId, TenantId
+from mindbridge.consolidation_cli import ConsolidationSettings, _parser
+from mindbridge.core import (
+    ClaimId,
+    EntityId,
+    EntityType,
+    EventId,
+    MemoryId,
+    MemoryIntegrityError,
+    TenantId,
+)
 
 NOW = datetime(2026, 8, 12, 12, 0, tzinfo=timezone.utc)
 
@@ -183,3 +200,107 @@ def test_consolidation_settings_require_and_redact_credentials() -> None:
     assert "database-secret" not in repr(settings)
     assert "generator-secret" not in repr(settings)
     assert "embedding-secret" not in repr(settings)
+
+
+class ScriptedEntityResolution:
+    def __init__(self, *, stuck: bool = False) -> None:
+        self.requests: list[EntityCandidateRequest] = []
+        self._stuck = stuck
+
+    async def run(self, request: EntityCandidateRequest) -> EntityResolutionResult:
+        self.requests.append(request)
+        if self._stuck:
+            return _entity_result(next_cursor=EntityId("entity_02"))
+        if request.after_entity_id is None:
+            return _entity_result(
+                scanned_count=2,
+                candidate_pair_count=3,
+                dropped_pair_count=1,
+                same_as_count=1,
+                not_same_as_count=1,
+                skipped_pair_count=1,
+                committed_count=2,
+                next_cursor=EntityId("entity_02"),
+            )
+        return _entity_result(
+            scanned_count=1, candidate_pair_count=1, not_same_as_count=1, committed_count=1
+        )
+
+
+def _entity_result(
+    *,
+    scanned_count: int = 0,
+    candidate_pair_count: int = 0,
+    dropped_pair_count: int = 0,
+    same_as_count: int = 0,
+    not_same_as_count: int = 0,
+    skipped_pair_count: int = 0,
+    committed_count: int = 0,
+    next_cursor: EntityId | None = None,
+) -> EntityResolutionResult:
+    return EntityResolutionResult(
+        scanned_count=scanned_count,
+        candidate_pair_count=candidate_pair_count,
+        dropped_pair_count=dropped_pair_count,
+        same_as_count=same_as_count,
+        not_same_as_count=not_same_as_count,
+        skipped_pair_count=skipped_pair_count,
+        committed_count=committed_count,
+        next_cursor=next_cursor,
+    )
+
+
+async def _entity_sweep(scripted: ScriptedEntityResolution) -> SweepSummary:
+    return await consolidate_tenant_entities(
+        cast(ConsolidateEntities, scripted),
+        TenantId("tenant_01"),
+        NOW,
+        page_size=8,
+        maximum_gap_seconds=2_592_000,
+        candidate_limit=8,
+        minimum_confidence=0.75,
+        evidence_per_side=3,
+        maximum_pairs=64,
+        entity_types=(EntityType.PERSON,),
+        readjudicate=False,
+    )
+
+
+async def test_entity_sweep_accumulates_both_verdicts_and_both_kinds_of_refusal() -> None:
+    scripted = ScriptedEntityResolution()
+
+    summary = await _entity_sweep(scripted)
+
+    assert (summary.page_count, summary.scanned_count, summary.candidate_count) == (2, 3, 4)
+    assert (summary.counts["same_as_count"], summary.counts["not_same_as_count"]) == (1, 2)
+    # The two ways the sweep declines to answer stay separate: one pair was reached and left
+    # unjudged, one was never looked at because the page hit its budget.
+    assert summary.counts["skipped_pair_count"] == 1
+    assert summary.counts["dropped_pair_count"] == 1
+    assert summary.counts["committed_count"] == 3
+    assert scripted.requests[1].after_entity_id == "entity_02"
+    assert all(request.evaluated_at == NOW for request in scripted.requests)
+
+
+async def test_entity_sweep_refuses_a_cursor_that_does_not_advance() -> None:
+    with pytest.raises(MemoryIntegrityError):
+        await _entity_sweep(ScriptedEntityResolution(stuck=True))
+
+
+def test_entity_options_default_to_person_only_and_bounded() -> None:
+    """Widening to other types and re-judging settled pairs are both opt-in."""
+    options = _parser().parse_args(["--tenant-id", "tenant_01"])
+
+    assert options.entity_types is None
+    assert options.entity_readjudicate is False
+    assert (options.entity_page_size, options.entity_maximum_pairs) == (16, 64)
+    assert options.entity_minimum_confidence == 0.75
+
+
+def test_entity_type_is_repeatable_and_validated() -> None:
+    options = _parser().parse_args(
+        ["--tenant-id", "tenant_01", "--entity-type", "person", "--entity-type", "object"]
+    )
+    assert options.entity_types == ["person", "object"]
+    with pytest.raises(SystemExit):
+        _parser().parse_args(["--tenant-id", "tenant_01", "--entity-type", "not-a-type"])

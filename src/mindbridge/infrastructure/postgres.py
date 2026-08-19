@@ -46,6 +46,7 @@ from mindbridge.infrastructure._postgres_embeddings import (
     search_embeddings,
     write_embedding,
 )
+from mindbridge.infrastructure._postgres_entity_resolution import EntityCandidateOperations
 from mindbridge.infrastructure._postgres_evidence import EvidenceReadOperations
 from mindbridge.infrastructure._postgres_feedback import FeedbackOperations
 from mindbridge.infrastructure._postgres_forget import (
@@ -105,6 +106,7 @@ class PostgresMemoryStore(
     EvidenceReadOperations,
     EpisodeCandidateOperations,
     ClaimCandidateOperations,
+    EntityCandidateOperations,
     SummaryCandidateOperations,
 ):
     """Transactional PostgreSQL implementation of the memory store boundary."""

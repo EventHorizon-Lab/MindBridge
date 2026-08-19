@@ -17,6 +17,28 @@ def require_similarity(value: float, field_name: str) -> None:
         raise DomainInvariantError(f"{field_name} must be between -1 and 1")
 
 
+def require_bounded_count(
+    value: int,
+    field_name: str,
+    *,
+    minimum: int,
+    maximum: int,
+) -> None:
+    """Reject a page size, window, or budget outside the range its sweep allows.
+
+    Every consolidation kind bounds the same shape of knob, and each one had written the
+    comparison and the message out by hand.
+    """
+    if not minimum <= value <= maximum:
+        raise DomainInvariantError(f"{field_name} must be between {minimum} and {maximum}")
+
+
+def require_probability(value: float, field_name: str) -> None:
+    """Reject a confidence or probability outside the unit interval."""
+    if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+        raise DomainInvariantError(f"{field_name} must be between 0 and 1")
+
+
 def require_aware_datetime(value: datetime, field_name: str) -> None:
     """Reject timestamps whose real-world instant is ambiguous."""
     if value.tzinfo is None or value.utcoffset() is None:

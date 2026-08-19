@@ -25,6 +25,7 @@ from mindbridge.core import (
     MemoryIntegrityError,
     TenantId,
     require_aware_datetime,
+    require_bounded_count,
     require_non_empty,
     require_similarity,
 )
@@ -47,10 +48,10 @@ class EpisodeCandidateRequest:
         require_aware_datetime(self.evaluated_at, "evaluated_at")
         if self.after_event_id is not None:
             require_non_empty(self.after_event_id, "after_event_id")
-        if not 1 <= self.limit <= 32:
-            raise DomainInvariantError("episode candidate page limit must be between 1 and 32")
-        if not 0 <= self.maximum_gap_seconds <= 86_400:
-            raise DomainInvariantError("maximum_gap_seconds must be between 0 and 86400")
+        require_bounded_count(self.limit, "episode candidate page limit", minimum=1, maximum=32)
+        require_bounded_count(
+            self.maximum_gap_seconds, "maximum_gap_seconds", minimum=0, maximum=86_400
+        )
         require_similarity(self.minimum_similarity, "minimum_similarity")
 
 
