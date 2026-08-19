@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/EventHorizon-Lab/MindBridge/security/advisories/new
+    about: Report privately. Do not open a public issue for a security vulnerability.
+  - name: Documentation
+    url: https://github.com/EventHorizon-Lab/MindBridge/tree/master/docs
+    about: Deployment, configuration, API reference, and troubleshooting guides.
