@@ -1,7 +1,7 @@
 """Contract tests for the bundled OpenAI-compatible adapters."""
 
 import json
-from collections.abc import Callable, Coroutine
+from collections.abc import AsyncIterator, Callable, Coroutine
 from typing import cast
 
 import httpx
@@ -224,6 +224,28 @@ async def test_only_transient_provider_failures_are_retryable(
         await embedder.close()
 
 
+async def test_a_dropped_completion_stream_is_retryable() -> None:
+    """A provider that closes a long multimodal response mid-stream raises inside the stream
+    iterator, past the SDK error handler, so an observation died permanently on a transient
+    network fault instead of being retried."""
+
+    async def respond(_request: httpx.Request) -> httpx.Response:
+        return _truncated_completion_response()
+
+    generator = _generator(respond)
+    try:
+        with pytest.raises(ModelUnavailableError, match="generation request failed"):
+            await generator.generate(
+                GenerateRequest(
+                    system_prompt="Answer from evidence.",
+                    input=ModelInput((TextPart("where is the tool?"),)),
+                    max_output_tokens=64,
+                )
+            )
+    finally:
+        await generator.close()
+
+
 async def test_generation_reports_the_configured_deployment_revision() -> None:
     """A per-request serving fingerprint must not become the model identity."""
 
@@ -282,6 +304,29 @@ def _completion_response(fingerprint: str) -> httpx.Response:
         200,
         headers={"content-type": "text/event-stream"},
         content=f"data: {json.dumps(event)}\n\ndata: [DONE]\n\n",
+    )
+
+
+def _truncated_completion_response() -> httpx.Response:
+    """One valid chunk, then the peer disappears in the middle of the body."""
+    event = {
+        "id": "completion_01",
+        "object": "chat.completion.chunk",
+        "created": 1,
+        "model": "qwen3.8-max",
+        "choices": [{"index": 0, "delta": {"content": "on the "}, "finish_reason": None}],
+    }
+
+    async def body() -> AsyncIterator[bytes]:
+        yield f"data: {json.dumps(event)}\n\n".encode()
+        raise httpx.RemoteProtocolError(
+            "peer closed connection without sending complete message body"
+        )
+
+    return httpx.Response(
+        200,
+        headers={"content-type": "text/event-stream"},
+        content=body(),
     )
 
 

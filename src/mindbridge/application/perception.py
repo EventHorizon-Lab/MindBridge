@@ -39,12 +39,20 @@ def time_ranges_overlap(
 
 @dataclass(frozen=True, slots=True)
 class ResolvedEvidence:
-    """An exact evidence span joined to openable source media."""
+    """An exact evidence span joined to openable media.
+
+    `media_url` is not always the source object: a deployment may substitute a copy already cut
+    to the sampling a model was going to apply. When it does, the sampling travels with it, so
+    the request can state what the attached bytes are instead of asking the model to resample
+    them at a budget read from an unrelated variable. Both are None for untouched source media.
+    """
 
     evidence_span: EvidenceSpan
     media_object: MediaObject
     media_url: str
     media_url_expires_at: datetime
+    sampled_frames_per_second: float | None = None
+    sampled_max_pixels: int | None = None
 
     def __post_init__(self) -> None:
         if self.evidence_span.tenant_id != self.media_object.tenant_id:

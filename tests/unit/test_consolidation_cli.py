@@ -24,7 +24,7 @@ from mindbridge.application.consolidation import (
     EpisodeConsolidationResult,
 )
 from mindbridge.application.consolidation_sweep import (
-    EntitySweepSummary,
+    SweepSummary,
     consolidate_tenant_claims,
     consolidate_tenant_entities,
     consolidate_tenant_episodes,
@@ -137,7 +137,8 @@ async def test_episode_sweep_accumulates_stable_pages() -> None:
         minimum_similarity=0.75,
     )
 
-    assert (summary.page_count, summary.scanned_count, summary.committed_count) == (2, 3, 1)
+    assert (summary.page_count, summary.scanned_count) == (2, 3)
+    assert summary.counts["committed_count"] == 1
     assert scripted.requests[1].after_event_id == "event_02"
     assert all(request.evaluated_at == NOW for request in scripted.requests)
 
@@ -155,7 +156,8 @@ async def test_claim_sweep_accumulates_semantic_and_relationship_counts() -> Non
     )
 
     assert (summary.page_count, summary.scanned_count, summary.candidate_count) == (2, 3, 4)
-    assert (summary.committed_semantic_claim_count, summary.committed_relationship_count) == (1, 1)
+    assert summary.counts["committed_semantic_claim_count"] == 1
+    assert summary.counts["committed_relationship_count"] == 1
     assert scripted.requests[1].after_claim_id == "claim_02"
     assert all(request.evaluated_at == NOW for request in scripted.requests)
 
@@ -172,7 +174,8 @@ async def test_summary_sweep_accumulates_stable_memory_pages() -> None:
         minimum_similarity=0.8,
     )
 
-    assert (summary.page_count, summary.scanned_count, summary.committed_count) == (2, 3, 1)
+    assert (summary.page_count, summary.scanned_count) == (2, 3)
+    assert summary.counts["committed_count"] == 1
     assert scripted.requests[1].after_cursor == SummaryCandidateCursor(
         occurred_at=NOW,
         memory_id=MemoryId("memory_02"),
@@ -247,7 +250,7 @@ def _entity_result(
     )
 
 
-async def _entity_sweep(scripted: ScriptedEntityResolution) -> EntitySweepSummary:
+async def _entity_sweep(scripted: ScriptedEntityResolution) -> SweepSummary:
     return await consolidate_tenant_entities(
         cast(ConsolidateEntities, scripted),
         TenantId("tenant_01"),
@@ -268,12 +271,13 @@ async def test_entity_sweep_accumulates_both_verdicts_and_both_kinds_of_refusal(
 
     summary = await _entity_sweep(scripted)
 
-    assert (summary.page_count, summary.scanned_count, summary.candidate_pair_count) == (2, 3, 4)
-    assert (summary.same_as_count, summary.not_same_as_count) == (1, 2)
+    assert (summary.page_count, summary.scanned_count, summary.candidate_count) == (2, 3, 4)
+    assert (summary.counts["same_as_count"], summary.counts["not_same_as_count"]) == (1, 2)
     # The two ways the sweep declines to answer stay separate: one pair was reached and left
     # unjudged, one was never looked at because the page hit its budget.
-    assert (summary.skipped_pair_count, summary.dropped_pair_count) == (1, 1)
-    assert summary.committed_count == 3
+    assert summary.counts["skipped_pair_count"] == 1
+    assert summary.counts["dropped_pair_count"] == 1
+    assert summary.counts["committed_count"] == 3
     assert scripted.requests[1].after_entity_id == "entity_02"
     assert all(request.evaluated_at == NOW for request in scripted.requests)
 

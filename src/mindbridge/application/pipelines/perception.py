@@ -39,7 +39,7 @@ from mindbridge.core import (
     Observation,
 )
 from mindbridge.prompts import PERCEIVE_EVENTS_PROMPT
-from mindbridge.telemetry import set_current_span_attributes, trace_operation
+from mindbridge.telemetry import operation_span, set_current_span_attributes
 
 _Description = Annotated[
     str, StringConstraints(strip_whitespace=True, min_length=1, max_length=4096)
@@ -134,7 +134,7 @@ class PerceptionPipeline:
         self._generator = generator
         self._max_output_tokens = max_output_tokens
 
-    @trace_operation("mindbridge.pipeline.perception")
+    @operation_span("mindbridge.pipeline.perception")
     async def perceive_events(
         self,
         observation: Observation,

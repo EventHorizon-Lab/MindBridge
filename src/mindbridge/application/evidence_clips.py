@@ -13,10 +13,12 @@ object instead of leaving one orphan per attempt.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
-from dataclasses import dataclass
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from hashlib import sha256
+from typing import TypeVar
 from urllib.parse import quote, urlsplit
 
 from mindbridge.application.capabilities import (
@@ -31,6 +33,7 @@ from mindbridge.application.ports import (
     ClipDigestStore,
     DerivedMediaJanitor,
     DerivedMediaStore,
+    PresignedMediaDownload,
 )
 from mindbridge.core import (
     EmbeddedObjectType,
@@ -38,6 +41,7 @@ from mindbridge.core import (
     EmbeddingRecord,
     EvidenceClip,
     EvidenceSpan,
+    MediaKind,
     MediaObject,
     MediaObjectId,
     ModelOutputError,
@@ -52,8 +56,11 @@ from mindbridge.media.clipping import (
     ClipRequest,
     MediaClip,
     cut_clips,
+    cut_generation_proxy,
 )
-from mindbridge.telemetry import set_current_span_attributes, trace_operation
+from mindbridge.telemetry import operation_span, set_current_span_attributes
+
+_Budget = TypeVar("_Budget", float, int)
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,6 +70,9 @@ class ClipSampling:
     frames_per_second: float = DEFAULT_VIDEO_FRAMES_PER_SECOND
     max_pixels: int = DEFAULT_VIDEO_MAX_PIXELS
     image_max_pixels: int = DEFAULT_IMAGE_MAX_PIXELS
+    # Off only for a generator that reads the same storage the Worker does, where the encode
+    # costs more than the transfer it removes.
+    generation_proxy: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,7 +95,7 @@ class _StoredClip:
     media_object: MediaObject
 
 
-@trace_operation("mindbridge.evidence_clips.derive")
+@operation_span("mindbridge.evidence_clips.derive")
 async def derive_evidence_clips(
     tenant_id: TenantId,
     evidence: tuple[ResolvedEvidence, ...],
@@ -132,7 +142,7 @@ async def derive_evidence_clips(
             "mindbridge.evidence.clip_count": len(stored),
         }
     )
-    embeddings = await _embed_stored_clips(tenant_id, stored, store, embedder, created_at)
+    embeddings = await _embed_stored_clips(tenant_id, stored, store, embedder, created_at, sampling)
     return DerivedEvidenceClips(
         media_objects=tuple(item.media_object for item in _unique_by_media_object(stored)),
         clips=tuple(
@@ -149,6 +159,202 @@ async def derive_evidence_clips(
         ),
         embeddings=embeddings,
     )
+
+
+@asynccontextmanager
+async def generation_proxies(
+    tenant_id: TenantId,
+    evidence: tuple[ResolvedEvidence, ...],
+    *,
+    store: DerivedMediaStore,
+    sampling: ClipSampling,
+    scope: str,
+    cut: Callable[[bytes, ClipRequest], MediaClip] = cut_generation_proxy,
+    max_concurrency: int = 4,
+) -> AsyncIterator[tuple[ResolvedEvidence, ...]]:
+    """Lend sampled copies for the length of one model call, then take them back.
+
+    A proxy is never registered, so nothing downstream can reach it: it is not in the write
+    batch, it is not cited as provenance, and `forget()` would not find it. Scoping it to the
+    call that needs it is what keeps that from meaning "kept forever" — including for an
+    observation a tenant later asks to erase, and including on the attempt that raised.
+
+    `scope` has to name that one call, not the observation: a claim reclaimed after the stale
+    window leaves two attempts running at once, and each has to delete only its own copies.
+    """
+    # Collected as they are uploaded, not returned at the end: a source that fails to sign after
+    # an earlier one uploaded would otherwise leave that copy behind, which is the leak this
+    # scope exists to prevent.
+    uploaded: list[MediaObject] = []
+    try:
+        yield await _derive_generation_proxies(
+            tenant_id,
+            evidence,
+            store=store,
+            sampling=sampling,
+            scope=scope,
+            cut=cut,
+            max_concurrency=max_concurrency,
+            uploaded=uploaded,
+        )
+    finally:
+        outcomes = await asyncio.gather(
+            *(store.delete_media(proxy) for proxy in uploaded), return_exceptions=True
+        )
+        failed = sum(isinstance(outcome, BaseException) for outcome in outcomes)
+        if failed:
+            # The whole justification for the scope is that nothing else can reach these, so a
+            # silent cleanup failure is exactly the one that needs to be visible.
+            set_current_span_attributes({"mindbridge.generation_proxy.undeleted": failed})
+
+
+@operation_span("mindbridge.evidence_clips.generation_proxy")
+async def _derive_generation_proxies(
+    tenant_id: TenantId,
+    evidence: tuple[ResolvedEvidence, ...],
+    *,
+    store: DerivedMediaStore,
+    sampling: ClipSampling,
+    scope: str,
+    cut: Callable[[bytes, ClipRequest], MediaClip] = cut_generation_proxy,
+    max_concurrency: int = 4,
+    uploaded: list[MediaObject],
+) -> tuple[ResolvedEvidence, ...]:
+    """Point generation at the sampled copy of each video the model would produce anyway.
+
+    Every generation request already carries the frame rate and pixel budget the model must
+    apply, so handing over untouched source video makes the provider download frames it
+    immediately discards. Each video source is cut once at that same budget and the sampled copy
+    becomes what the model fetches. The span keeps citing its original object, non-video evidence
+    is untouched, and a proxy that did not come out smaller is discarded rather than uploaded.
+    """
+    if max_concurrency <= 0:
+        raise ValueError("max_concurrency must be positive")
+    if not sampling.generation_proxy:
+        return evidence
+    groups: dict[MediaObjectId, list[ResolvedEvidence]] = {}
+    for item in evidence:
+        if item.media_object.kind is MediaKind.VIDEO:
+            groups.setdefault(item.media_object.media_object_id, []).append(item)
+    if not groups:
+        return evidence
+
+    semaphore = asyncio.Semaphore(max_concurrency)
+    proxies = {
+        media_object_id: download
+        for media_object_id, download in zip(
+            groups,
+            await asyncio.gather(
+                *(
+                    _store_generation_proxy(
+                        tenant_id,
+                        items,
+                        store=store,
+                        sampling=sampling,
+                        scope=scope,
+                        cut=cut,
+                        semaphore=semaphore,
+                        uploaded=uploaded,
+                    )
+                    for items in groups.values()
+                )
+            ),
+            strict=True,
+        )
+        if download is not None
+    }
+    set_current_span_attributes({"mindbridge.generation_proxy.count": len(proxies)})
+    return tuple(
+        item
+        if (download := proxies.get(item.media_object.media_object_id)) is None
+        else replace(
+            item,
+            media_url=download.download_url,
+            media_url_expires_at=download.expires_at,
+            sampled_frames_per_second=sampling.frames_per_second,
+            sampled_max_pixels=sampling.max_pixels,
+        )
+        for item in evidence
+    )
+
+
+async def _store_generation_proxy(
+    tenant_id: TenantId,
+    items: list[ResolvedEvidence],
+    *,
+    store: DerivedMediaStore,
+    sampling: ClipSampling,
+    scope: str,
+    cut: Callable[[bytes, ClipRequest], MediaClip],
+    semaphore: asyncio.Semaphore,
+    uploaded: list[MediaObject],
+) -> PresignedMediaDownload | None:
+    """Cut, store, and sign one sampled copy covering every span read from one source.
+
+    Everything here is best-effort, storage included. Reading a source, writing a copy and
+    signing it are work the observation did not do before, so a blip in any of them must degrade
+    to the untouched source rather than fail an attempt whose perception would have succeeded.
+    """
+    source_object = items[0].media_object
+    request = ClipRequest(
+        kind=source_object.kind,
+        start_ms=min(item.evidence_span.start_ms for item in items),
+        end_ms=max(item.evidence_span.end_ms for item in items),
+        frames_per_second=sampling.frames_per_second,
+        max_pixels=sampling.max_pixels,
+    )
+    # The muxer ceiling is a frame count, so the frame rate decides it as much as the span does.
+    # Checked before the read because the alternative is paying for a full source download and a
+    # doomed encode on every observation.
+    frames = (request.end_ms - request.start_ms) / 1_000 * request.frames_per_second
+    if frames > MAX_PROXY_SAMPLED_FRAMES:
+        set_current_span_attributes(
+            {
+                "mindbridge.generation_proxy.skipped": True,
+                "mindbridge.generation_proxy.skipped_reason": "span_exceeds_frame_ceiling",
+            }
+        )
+        return None
+    async with semaphore:
+        try:
+            source = await store.read_media(source_object)
+            try:
+                proxy = await asyncio.to_thread(cut, source, request)
+                # Not source_object.size_bytes: that is client-declared and never verified, so
+                # one wrong number would silently disable the feature after paying for the read.
+                shrank = len(proxy.content) < len(source)
+            finally:
+                del source
+            if not shrank:
+                set_current_span_attributes(
+                    {
+                        "mindbridge.generation_proxy.skipped": True,
+                        "mindbridge.generation_proxy.skipped_reason": "no_smaller_than_source",
+                    }
+                )
+                return None
+            media_object = _clip_media_object(
+                tenant_id,
+                items[0],
+                proxy,
+                created_at=items[0].evidence_span.created_at,
+                scope=scope,
+            )
+            await store.upload_media(media_object, proxy.content)
+            uploaded.append(media_object)
+            return await store.create_presigned_download(media_object)
+        except Exception as error:
+            # Deliberately broad, and covering storage as well as the encoder: the muxer raises a
+            # bare ValueError for a span it will not interleave, PyAV raises IndexError for a
+            # container it cannot read, and object storage raises for a transient outage. None of
+            # them is worth losing an observation over.
+            set_current_span_attributes(
+                {
+                    "mindbridge.generation_proxy.skipped": True,
+                    "mindbridge.generation_proxy.skipped_reason": type(error).__name__,
+                }
+            )
+            return None
 
 
 async def _store_source_group(
@@ -198,6 +404,7 @@ async def _embed_stored_clips(
     store: DerivedMediaStore,
     embedder: Embedder,
     created_at: datetime,
+    sampling: ClipSampling,
 ) -> tuple[EmbeddingRecord, ...]:
     """Sign immediately before encoding so no URL ages during the upload phase."""
     if not stored:
@@ -219,6 +426,10 @@ async def _embed_stored_clips(
                             kind=item.media_object.kind,
                             url=urls[item.media_object.media_object_id],
                             source_uri=item.media_object.uri,
+                            frames_per_second=_video_only(
+                                sampling.frames_per_second, item.media_object.kind
+                            ),
+                            max_pixels=_video_only(sampling.max_pixels, item.media_object.kind),
                         ),
                     )
                 )
@@ -257,6 +468,11 @@ async def _embed_stored_clips(
     )
 
 
+def _video_only(value: _Budget, kind: MediaKind) -> _Budget | None:
+    """Declare a sampling budget only where it means anything, since MediaPart rejects it off video."""
+    return value if kind is MediaKind.VIDEO else None
+
+
 def _span_region(span: EvidenceSpan) -> tuple[int, int, int, int] | None:
     """Pass the span's region of interest through to image cropping."""
     if span.region is None:
@@ -270,13 +486,26 @@ def _clip_media_object(
     clip: MediaClip,
     *,
     created_at: datetime,
+    scope: str | None = None,
 ) -> MediaObject:
+    """Address one derived clip by its content, or by content and scope when it is transient.
+
+    A registered clip dedupes on content, which is what makes a retry overwrite the same object.
+    A proxy must not: for a silent video it cuts bytes identical to the evidence clip of the same
+    span, and deleting it at the end of its scope would then erase evidence a committed attempt
+    still cites. `scope` also keeps two live attempts on one source off each other's object.
+    """
     digest = sha256(clip.content).hexdigest()
+    name = (
+        digest
+        if scope is None
+        else f"{PROXY_KEY_INFIX}{sha256(f'{scope}:{digest}'.encode()).hexdigest()}"
+    )
     return MediaObject(
-        media_object_id=MediaObjectId(derive_stable_id("media_clip", tenant_id, digest)),
+        media_object_id=MediaObjectId(derive_stable_id("media_clip", tenant_id, name)),
         tenant_id=tenant_id,
         kind=item.media_object.kind,
-        uri=_clip_uri(item.media_object.uri, tenant_id, digest, clip.suffix),
+        uri=_clip_uri(item.media_object.uri, tenant_id, name, clip.suffix),
         sha256=digest,
         size_bytes=len(clip.content),
         created_at=created_at,
@@ -285,10 +514,10 @@ def _clip_media_object(
     )
 
 
-def _clip_uri(source_uri: str, tenant_id: TenantId, digest: str, suffix: str) -> str:
+def _clip_uri(source_uri: str, tenant_id: TenantId, name: str, suffix: str) -> str:
     """Address the clip by content inside its source object's bucket."""
     bucket = urlsplit(source_uri).netloc
-    return f"s3://{bucket}/tenants/{quote(tenant_id, safe='')}/clips/{digest}{suffix}"
+    return f"s3://{bucket}/tenants/{quote(tenant_id, safe='')}/{CLIP_KEY_PREFIX}{name}{suffix}"
 
 
 def _unique_by_media_object(stored: tuple[_StoredClip, ...]) -> tuple[_StoredClip, ...]:
@@ -300,6 +529,13 @@ def _unique_by_media_object(stored: tuple[_StoredClip, ...]) -> tuple[_StoredCli
 
 
 CLIP_KEY_PREFIX = "clips/"
+# Transient proxies share the swept prefix so a leaked one is still reclaimable, but never a
+# registered clip's key.
+PROXY_KEY_INFIX = "proxy-"
+# The MP4 muxer refuses to interleave a sparse sampled video track with continuous audio past
+# roughly this many frames. Checking it before reading the source turns a doomed full decode and
+# encode into a decision.
+MAX_PROXY_SAMPLED_FRAMES = 40
 # A clip is uploaded before the transaction that registers it, so a freshly
 # written object is not evidence of an orphan. The grace period must exceed
 # OBSERVATION_JOB_STALE_AFTER_SECONDS so no in-flight attempt is ever robbed.
@@ -316,7 +552,7 @@ class ClipReclaimSummary:
     reclaimed_count: int
 
 
-@trace_operation("mindbridge.evidence_clips.reclaim")
+@operation_span("mindbridge.evidence_clips.reclaim")
 async def reclaim_orphan_clips(
     tenant_id: TenantId,
     *,

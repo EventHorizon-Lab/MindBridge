@@ -73,6 +73,52 @@ async def test_presigned_download_uses_get_and_configured_bucket() -> None:
     assert query["X-Amz-Expires"] == ["120"]
 
 
+async def test_presigned_download_can_be_addressed_at_a_separate_public_endpoint() -> None:
+    """Models fetch evidence over the public address, but every read and write the deployment
+    makes itself should stay on the direct one instead of leaving and re-entering the network."""
+    access = S3MediaAccess(
+        ObjectStorageEnvironment(
+            bucket="memory",
+            endpoint_url="http://objects.internal:9000",
+            public_endpoint_url="https://objects.example.test",
+        ),
+        url_lifetime_seconds=120,
+        clock=lambda: NOW,
+    )
+
+    download = await access.create_presigned_download(media_object())
+
+    assert download.download_url.startswith(
+        "https://objects.example.test/memory/tenants/tenant_01/media_01.mp4?"
+    )
+    assert access._client.meta.endpoint_url == "http://objects.internal:9000"
+
+
+def test_public_endpoint_defaults_to_the_direct_endpoint() -> None:
+    """A deployment that never sets the public name must sign exactly as it did before."""
+    storage = object_storage_from_environment(
+        {
+            "MINDBRIDGE_OBJECT_STORAGE_BUCKET": "memory",
+            "MINDBRIDGE_OBJECT_STORAGE_ENDPOINT_URL": "https://objects.example.test",
+        }
+    )
+
+    assert storage.public_endpoint_url is None
+    assert storage.signing_endpoint_url == "https://objects.example.test"
+
+
+def test_object_storage_contract_reads_the_public_endpoint() -> None:
+    storage = object_storage_from_environment(
+        {
+            "MINDBRIDGE_OBJECT_STORAGE_BUCKET": "memory",
+            "MINDBRIDGE_OBJECT_STORAGE_ENDPOINT_URL": "http://objects.internal:9000",
+            "MINDBRIDGE_OBJECT_STORAGE_PUBLIC_ENDPOINT_URL": "https://objects.example.test",
+        }
+    )
+
+    assert storage.signing_endpoint_url == "https://objects.example.test"
+
+
 async def test_delete_normalizes_s3_service_errors(monkeypatch: pytest.MonkeyPatch) -> None:
     access = S3MediaAccess(STORAGE)
 

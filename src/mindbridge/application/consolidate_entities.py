@@ -32,7 +32,7 @@ from mindbridge.core import (
     RelationType,
     TenantId,
 )
-from mindbridge.telemetry import set_current_span_attributes, trace_operation
+from mindbridge.telemetry import operation_span, set_current_span_attributes
 
 # Pairs are independent, so they are judged concurrently, bounded the way every other
 # fan-out in this layer is bounded (kernel writes, evidence signing, clip derivation).
@@ -92,7 +92,7 @@ class ConsolidateEntities:
         self._adjudicator = adjudicator
         self._media_url_signer = media_url_signer
 
-    @trace_operation("mindbridge.consolidation.entities")
+    @operation_span("mindbridge.consolidation.entities")
     async def run(self, request: EntityCandidateRequest) -> EntityResolutionResult:
         """Discover, inspect, and atomically commit one stable page of entity pairs."""
         page = await self._store.list_entity_candidates(request)

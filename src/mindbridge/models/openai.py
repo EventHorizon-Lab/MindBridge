@@ -10,6 +10,7 @@ from time import perf_counter
 from typing import cast
 from urllib.parse import urlsplit, urlunsplit
 
+import httpx
 import openai
 from openai import AsyncOpenAI, AsyncStream, Omit, omit
 from openai.types.chat import ChatCompletionChunk, ChatCompletionMessageParam
@@ -48,7 +49,7 @@ from mindbridge.models.defaults import (
     DEFAULT_GENERATOR_MODEL_ID,
     MatryoshkaDimension,
 )
-from mindbridge.telemetry import set_current_span_attributes, trace_operation
+from mindbridge.telemetry import operation_span, set_current_span_attributes
 
 DEFAULT_VIDEO_FRAMES_PER_SECOND = 1.0
 DEFAULT_VIDEO_MAX_PIXELS = 200_704
@@ -113,7 +114,7 @@ class OpenAIGenerator:
             video_max_pixels=video_max_pixels,
         )
 
-    @trace_operation("mindbridge.model.generate")
+    @operation_span("mindbridge.model.generate")
     async def generate(self, request: GenerateRequest) -> GenerateResult:
         """Stream one deterministic text result and normalize provider failures."""
         set_current_span_attributes(
@@ -164,6 +165,11 @@ class OpenAIGenerator:
             completion = await _consume_completion_stream(stream)
         except openai.APIError as error:
             _raise_model_error(error, "generation request failed")
+        except httpx.HTTPError as error:
+            # A provider that drops a long response mid-body raises inside the stream iterator,
+            # past the SDK's own error wrapping. Left unclassified it looked permanent, so one
+            # transient disconnect failed the whole observation instead of being retried.
+            raise ModelUnavailableError("generation request failed") from error
         attributes: dict[str, str | int | float | bool] = {}
         if completion.first_token_at is not None:
             attributes["mindbridge.model.ttft_seconds"] = max(
@@ -250,7 +256,7 @@ class OpenAIEmbedder:
         """Declare the search space both aligned endpoints write into."""
         return self._space_reference
 
-    @trace_operation("mindbridge.model.embed")
+    @operation_span("mindbridge.model.embed")
     async def embed(self, request: EmbedRequest) -> EmbedResult:
         """Encode a homogeneous batch without exposing provider request shapes."""
         if not request.inputs:

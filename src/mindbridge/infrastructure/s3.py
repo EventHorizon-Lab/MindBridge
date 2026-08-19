@@ -35,12 +35,25 @@ class ObjectStorageEnvironment:
 
     bucket: str
     endpoint_url: str | None = None
+    # Models fetch signed evidence from outside the deployment, so the name they must use is
+    # not always the one the deployment should read and write through. Setting only
+    # endpoint_url keeps both on the same address, exactly as before this field existed.
+    public_endpoint_url: str | None = None
 
     def __post_init__(self) -> None:
         if not self.bucket.strip():
             raise ValueError("object_storage bucket must not be empty")
-        if self.endpoint_url is not None and not self.endpoint_url.strip():
-            raise ValueError("object_storage endpoint_url must not be empty when provided")
+        for name, value in (
+            ("endpoint_url", self.endpoint_url),
+            ("public_endpoint_url", self.public_endpoint_url),
+        ):
+            if value is not None and not value.strip():
+                raise ValueError(f"object_storage {name} must not be empty when provided")
+
+    @property
+    def signing_endpoint_url(self) -> str | None:
+        """The address a presigned URL must name for a reader outside the deployment."""
+        return self.public_endpoint_url or self.endpoint_url
 
 
 def object_storage_from_environment(source: Mapping[str, str]) -> ObjectStorageEnvironment:
@@ -48,6 +61,9 @@ def object_storage_from_environment(source: Mapping[str, str]) -> ObjectStorageE
     return ObjectStorageEnvironment(
         bucket=require_environment_value(source, "MINDBRIDGE_OBJECT_STORAGE_BUCKET"),
         endpoint_url=optional_environment_value(source, "MINDBRIDGE_OBJECT_STORAGE_ENDPOINT_URL"),
+        public_endpoint_url=optional_environment_value(
+            source, "MINDBRIDGE_OBJECT_STORAGE_PUBLIC_ENDPOINT_URL"
+        ),
     )
 
 
@@ -81,15 +97,24 @@ class S3MediaAccess:
         # region_name is deliberately absent: Boto3's own chain (AWS_REGION, AWS_DEFAULT_REGION,
         # ~/.aws/config, instance metadata) already resolves it, and passing an explicit default
         # here silently overrode whatever the deployment had configured for every other AWS tool.
+        config = Config(
+            signature_version="s3v4",
+            connect_timeout=5,
+            read_timeout=30,
+            retries={"max_attempts": 3, "mode": "standard"},
+        )
         self._client: S3Client = boto3.client(
             "s3",
             endpoint_url=storage.endpoint_url,
-            config=Config(
-                signature_version="s3v4",
-                connect_timeout=5,
-                read_timeout=30,
-                retries={"max_attempts": 3, "mode": "standard"},
-            ),
+            config=config,
+        )
+        # SigV4 covers the Host header, so a URL a model fetches from outside the deployment has
+        # to be signed against the address it will actually use. Only a deployment that sets a
+        # separate public name pays for a second client.
+        self._signing_client: S3Client = (
+            self._client
+            if storage.signing_endpoint_url == storage.endpoint_url
+            else boto3.client("s3", endpoint_url=storage.signing_endpoint_url, config=config)
         )
 
     @classmethod
@@ -211,7 +236,7 @@ class S3MediaAccess:
 
         try:
             return await asyncio.to_thread(
-                self._client.generate_presigned_url,
+                self._signing_client.generate_presigned_url,
                 operation,
                 Params=parameters,
                 ExpiresIn=self._url_lifetime_seconds,

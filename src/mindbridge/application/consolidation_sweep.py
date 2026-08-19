@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
+from types import MappingProxyType
+from typing import Generic, TypeVar
 
 from mindbridge.application.claim_consolidation import ClaimCandidateRequest
 from mindbridge.application.consolidate_claims import ConsolidateClaims
@@ -24,78 +27,45 @@ from mindbridge.core import (
     TenantId,
 )
 
-
-@dataclass(frozen=True, slots=True)
-class EpisodeSweepSummary:
-    """Content-free operational totals for one complete tenant Episode sweep."""
-
-    tenant_id: TenantId
-    evaluated_at: datetime
-    page_count: int
-    scanned_count: int
-    candidate_count: int
-    proposed_count: int
-    committed_count: int
+# Each sweep pages with the cursor its own request field accepts; keeping that type on the
+# shared loop is what stops a copied sweep from feeding a Claim cursor to an Episode page.
+_Cursor = TypeVar("_Cursor")
 
 
 @dataclass(frozen=True, slots=True)
-class ClaimSweepSummary:
-    """Content-free operational totals for one complete semantic Claim sweep."""
+class SweepSummary:
+    """Content-free operational totals for one complete tenant sweep.
 
-    tenant_id: TenantId
-    evaluated_at: datetime
-    page_count: int
-    scanned_count: int
-    candidate_count: int
-    proposed_semantic_claim_count: int
-    proposed_relationship_count: int
-    committed_semantic_claim_count: int
-    committed_relationship_count: int
-
-
-@dataclass(frozen=True, slots=True)
-class SummarySweepSummary:
-    """Content-free operational totals for one complete Memory Summary sweep."""
-
-    tenant_id: TenantId
-    evaluated_at: datetime
-    page_count: int
-    scanned_count: int
-    candidate_count: int
-    proposed_count: int
-    committed_count: int
-
-
-@dataclass(frozen=True, slots=True)
-class EntitySweepSummary:
-    """Content-free operational totals for one complete entity resolution sweep.
-
-    `skipped_pair_count` and `dropped_pair_count` are the two ways this sweep declines to
-    answer, and they mean different things: skipped pairs were reached and left unjudged
-    because nothing could be inspected or the judge was unsure, while dropped pairs were never
-    looked at because the page hit its budget.
+    `counts` carries the proposed/committed totals under the names the process prints; they
+    differ per memory kind and exist only to be reported, never to be branched on.
     """
 
     tenant_id: TenantId
     evaluated_at: datetime
     page_count: int
     scanned_count: int
-    candidate_pair_count: int
-    dropped_pair_count: int
-    same_as_count: int
-    not_same_as_count: int
-    skipped_pair_count: int
-    committed_count: int
+    candidate_count: int
+    counts: Mapping[str, int]
 
 
 @dataclass(frozen=True, slots=True)
 class ConsolidationSweepSummary:
     """All consolidation outcomes from one scheduled tenant run."""
 
-    episodes: EpisodeSweepSummary
-    claims: ClaimSweepSummary
-    summaries: SummarySweepSummary
-    entities: EntitySweepSummary
+    episodes: SweepSummary
+    claims: SweepSummary
+    summaries: SweepSummary
+    entities: SweepSummary
+
+
+@dataclass(frozen=True, slots=True)
+class _Page(Generic[_Cursor]):
+    """One consolidation result reduced to what a sweep accumulates."""
+
+    scanned_count: int
+    candidate_count: int
+    counts: Mapping[str, int]
+    next_cursor: _Cursor | None
 
 
 async def consolidate_tenant_episodes(
@@ -106,11 +76,10 @@ async def consolidate_tenant_episodes(
     page_size: int,
     maximum_gap_seconds: int,
     minimum_similarity: float,
-) -> EpisodeSweepSummary:
+) -> SweepSummary:
     """Consolidate stable Episode pages at one fixed evaluation instant."""
-    cursor: EventId | None = None
-    page_count = scanned_count = candidate_count = proposed_count = committed_count = 0
-    while True:
+
+    async def run_page(cursor: EventId | None) -> _Page[EventId]:
         result = await use_case.run(
             EpisodeCandidateRequest(
                 tenant_id=tenant_id,
@@ -121,25 +90,17 @@ async def consolidate_tenant_episodes(
                 minimum_similarity=minimum_similarity,
             )
         )
-        page_count += 1
-        scanned_count += result.scanned_count
-        candidate_count += result.candidate_count
-        proposed_count += result.proposed_count
-        committed_count += result.committed_count
-        if result.next_cursor is None:
-            break
-        if result.next_cursor == cursor:
-            raise MemoryIntegrityError("Episode consolidation cursor did not advance")
-        cursor = result.next_cursor
-    return EpisodeSweepSummary(
-        tenant_id=tenant_id,
-        evaluated_at=evaluated_at,
-        page_count=page_count,
-        scanned_count=scanned_count,
-        candidate_count=candidate_count,
-        proposed_count=proposed_count,
-        committed_count=committed_count,
-    )
+        return _Page(
+            result.scanned_count,
+            result.candidate_count,
+            {
+                "proposed_count": result.proposed_count,
+                "committed_count": result.committed_count,
+            },
+            result.next_cursor,
+        )
+
+    return await _sweep("Episode", tenant_id, evaluated_at, run_page)
 
 
 async def consolidate_tenant_claims(
@@ -150,13 +111,10 @@ async def consolidate_tenant_claims(
     page_size: int,
     maximum_gap_seconds: int,
     minimum_similarity: float,
-) -> ClaimSweepSummary:
+) -> SweepSummary:
     """Consolidate stable Claim pages at one fixed evaluation instant."""
-    cursor: ClaimId | None = None
-    page_count = scanned_count = candidate_count = 0
-    proposed_semantic_count = proposed_relationship_count = 0
-    committed_semantic_count = committed_relationship_count = 0
-    while True:
+
+    async def run_page(cursor: ClaimId | None) -> _Page[ClaimId]:
         result = await use_case.run(
             ClaimCandidateRequest(
                 tenant_id=tenant_id,
@@ -167,29 +125,19 @@ async def consolidate_tenant_claims(
                 minimum_similarity=minimum_similarity,
             )
         )
-        page_count += 1
-        scanned_count += result.scanned_count
-        candidate_count += result.candidate_count
-        proposed_semantic_count += result.proposed_semantic_claim_count
-        proposed_relationship_count += result.proposed_relationship_count
-        committed_semantic_count += result.committed_semantic_claim_count
-        committed_relationship_count += result.committed_relationship_count
-        if result.next_cursor is None:
-            break
-        if result.next_cursor == cursor:
-            raise MemoryIntegrityError("Claim consolidation cursor did not advance")
-        cursor = result.next_cursor
-    return ClaimSweepSummary(
-        tenant_id=tenant_id,
-        evaluated_at=evaluated_at,
-        page_count=page_count,
-        scanned_count=scanned_count,
-        candidate_count=candidate_count,
-        proposed_semantic_claim_count=proposed_semantic_count,
-        proposed_relationship_count=proposed_relationship_count,
-        committed_semantic_claim_count=committed_semantic_count,
-        committed_relationship_count=committed_relationship_count,
-    )
+        return _Page(
+            result.scanned_count,
+            result.candidate_count,
+            {
+                "proposed_semantic_claim_count": result.proposed_semantic_claim_count,
+                "proposed_relationship_count": result.proposed_relationship_count,
+                "committed_semantic_claim_count": result.committed_semantic_claim_count,
+                "committed_relationship_count": result.committed_relationship_count,
+            },
+            result.next_cursor,
+        )
+
+    return await _sweep("Claim", tenant_id, evaluated_at, run_page)
 
 
 async def consolidate_tenant_summaries(
@@ -200,11 +148,10 @@ async def consolidate_tenant_summaries(
     page_size: int,
     maximum_gap_seconds: int,
     minimum_similarity: float,
-) -> SummarySweepSummary:
+) -> SweepSummary:
     """Consolidate stable Memory pages at one fixed evaluation instant."""
-    cursor: SummaryCandidateCursor | None = None
-    page_count = scanned_count = candidate_count = proposed_count = committed_count = 0
-    while True:
+
+    async def run_page(cursor: SummaryCandidateCursor | None) -> _Page[SummaryCandidateCursor]:
         result = await use_case.run(
             SummaryCandidateRequest(
                 tenant_id=tenant_id,
@@ -215,25 +162,17 @@ async def consolidate_tenant_summaries(
                 minimum_similarity=minimum_similarity,
             )
         )
-        page_count += 1
-        scanned_count += result.scanned_count
-        candidate_count += result.candidate_count
-        proposed_count += result.proposed_count
-        committed_count += result.committed_count
-        if result.next_cursor is None:
-            break
-        if result.next_cursor == cursor:
-            raise MemoryIntegrityError("Summary consolidation cursor did not advance")
-        cursor = result.next_cursor
-    return SummarySweepSummary(
-        tenant_id=tenant_id,
-        evaluated_at=evaluated_at,
-        page_count=page_count,
-        scanned_count=scanned_count,
-        candidate_count=candidate_count,
-        proposed_count=proposed_count,
-        committed_count=committed_count,
-    )
+        return _Page(
+            result.scanned_count,
+            result.candidate_count,
+            {
+                "proposed_count": result.proposed_count,
+                "committed_count": result.committed_count,
+            },
+            result.next_cursor,
+        )
+
+    return await _sweep("Summary", tenant_id, evaluated_at, run_page)
 
 
 async def consolidate_tenant_entities(
@@ -249,12 +188,10 @@ async def consolidate_tenant_entities(
     maximum_pairs: int,
     entity_types: tuple[EntityType, ...],
     readjudicate: bool,
-) -> EntitySweepSummary:
-    """Judge stable entity pages at one fixed evaluation instant."""
-    cursor: EntityId | None = None
-    page_count = scanned_count = candidate_pair_count = dropped_pair_count = 0
-    same_as_count = not_same_as_count = skipped_pair_count = committed_count = 0
-    while True:
+) -> SweepSummary:
+    """Adjudicate stable entity pair pages at one fixed evaluation instant."""
+
+    async def run_page(cursor: EntityId | None) -> _Page[EntityId]:
         result = await use_case.run(
             EntityCandidateRequest(
                 tenant_id=tenant_id,
@@ -270,28 +207,53 @@ async def consolidate_tenant_entities(
                 readjudicate=readjudicate,
             )
         )
+        return _Page(
+            result.scanned_count,
+            result.candidate_pair_count,
+            {
+                "same_as_count": result.same_as_count,
+                "not_same_as_count": result.not_same_as_count,
+                # These two read like one number and are not. A skipped pair was reached and
+                # the judge declined to answer it; a dropped pair is one the page budget never
+                # looked at. Which of "the model is unsure" and "the sweep is too small" is
+                # holding a tenant back is only visible while they stay apart.
+                "skipped_pair_count": result.skipped_pair_count,
+                "dropped_pair_count": result.dropped_pair_count,
+                "committed_count": result.committed_count,
+            },
+            result.next_cursor,
+        )
+
+    return await _sweep("entity", tenant_id, evaluated_at, run_page)
+
+
+async def _sweep(
+    label: str,
+    tenant_id: TenantId,
+    evaluated_at: datetime,
+    run_page: Callable[[_Cursor | None], Awaitable[_Page[_Cursor]]],
+) -> SweepSummary:
+    """Page until the cursor stops, refusing a cursor that cannot make progress."""
+    cursor: _Cursor | None = None
+    page_count = scanned_count = candidate_count = 0
+    counts: dict[str, int] = {}
+    while True:
+        page = await run_page(cursor)
         page_count += 1
-        scanned_count += result.scanned_count
-        candidate_pair_count += result.candidate_pair_count
-        dropped_pair_count += result.dropped_pair_count
-        same_as_count += result.same_as_count
-        not_same_as_count += result.not_same_as_count
-        skipped_pair_count += result.skipped_pair_count
-        committed_count += result.committed_count
-        if result.next_cursor is None:
+        scanned_count += page.scanned_count
+        candidate_count += page.candidate_count
+        for name, value in page.counts.items():
+            counts[name] = counts.get(name, 0) + value
+        if page.next_cursor is None:
             break
-        if result.next_cursor == cursor:
-            raise MemoryIntegrityError("entity consolidation cursor did not advance")
-        cursor = result.next_cursor
-    return EntitySweepSummary(
+        if page.next_cursor == cursor:
+            raise MemoryIntegrityError(f"{label} consolidation cursor did not advance")
+        cursor = page.next_cursor
+    return SweepSummary(
         tenant_id=tenant_id,
         evaluated_at=evaluated_at,
         page_count=page_count,
         scanned_count=scanned_count,
-        candidate_pair_count=candidate_pair_count,
-        dropped_pair_count=dropped_pair_count,
-        same_as_count=same_as_count,
-        not_same_as_count=not_same_as_count,
-        skipped_pair_count=skipped_pair_count,
-        committed_count=committed_count,
+        candidate_count=candidate_count,
+        counts=MappingProxyType(counts),
     )

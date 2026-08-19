@@ -70,17 +70,7 @@ def test_unverified_claim_may_record_unsupported_input() -> None:
 
 def test_attested_memory_preserves_source_statement_without_claiming_observation() -> None:
     """Caller-provided text stays usable while distinct from verified sensor evidence."""
-    memory = MemoryRecord(
-        memory_id=MemoryId("memory_attested"),
-        tenant_id=TENANT_ID,
-        memory_type=MemoryType.SEMANTIC,
-        summary="Caroline said she plans to become a counselor.",
-        evidence_ids=(),
-        occurred_at=NOW,
-        ended_at=NOW,
-        created_at=NOW,
-        verification_status=VerificationStatus.ATTESTED,
-    )
+    memory = _memory(summary="Caroline said she plans to become a counselor.")
 
     assert memory.verification_status is VerificationStatus.ATTESTED
 
@@ -88,33 +78,19 @@ def test_attested_memory_preserves_source_statement_without_claiming_observation
 def test_verified_memory_requires_evidence() -> None:
     """The unified memory view cannot turn an unsupported summary into fact."""
     with pytest.raises(DomainInvariantError, match="verified memory"):
-        MemoryRecord(
-            memory_id=MemoryId("memory_01"),
-            tenant_id=TENANT_ID,
-            memory_type=MemoryType.SEMANTIC,
-            summary="The screwdriver is in the toolbox.",
-            evidence_ids=(),
-            occurred_at=NOW,
-            ended_at=NOW,
-            created_at=NOW,
-            verification_status=VerificationStatus.VERIFIED,
-        )
+        _memory(verification_status=VerificationStatus.VERIFIED)
+
+
+def test_evidence_backed_memory_may_be_verified() -> None:
+    """Evidence is what lets the unified view present a summary as verified fact."""
+    memory = _memory(evidence_ids=(EVIDENCE_ID,), verification_status=VerificationStatus.VERIFIED)
+
+    assert memory.verification_status is VerificationStatus.VERIFIED
 
 
 def test_memory_access_cannot_precede_creation() -> None:
     with pytest.raises(DomainInvariantError, match="last_accessed_at"):
-        MemoryRecord(
-            memory_id=MemoryId("memory_01"),
-            tenant_id=TENANT_ID,
-            memory_type=MemoryType.EPISODIC,
-            summary="The screwdriver is in the toolbox.",
-            evidence_ids=(),
-            occurred_at=NOW,
-            ended_at=NOW,
-            created_at=NOW,
-            verification_status=VerificationStatus.ATTESTED,
-            last_accessed_at=NOW.replace(hour=11),
-        )
+        _memory(memory_type=MemoryType.EPISODIC, last_accessed_at=NOW.replace(hour=11))
 
 
 def test_claim_rejects_reversed_validity() -> None:
@@ -197,4 +173,26 @@ def _embedding(
         dimension=dimension,
         normalized=True,
         created_at=NOW,
+    )
+
+
+def _memory(
+    *,
+    summary: str = "The screwdriver is in the toolbox.",
+    memory_type: MemoryType = MemoryType.SEMANTIC,
+    evidence_ids: tuple[EvidenceId, ...] = (),
+    verification_status: VerificationStatus = VerificationStatus.ATTESTED,
+    last_accessed_at: datetime | None = None,
+) -> MemoryRecord:
+    return MemoryRecord(
+        memory_id=MemoryId("memory_01"),
+        tenant_id=TENANT_ID,
+        memory_type=memory_type,
+        summary=summary,
+        evidence_ids=evidence_ids,
+        occurred_at=NOW,
+        ended_at=NOW,
+        created_at=NOW,
+        verification_status=verification_status,
+        last_accessed_at=last_accessed_at,
     )

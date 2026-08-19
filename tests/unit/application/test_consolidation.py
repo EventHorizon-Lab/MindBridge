@@ -4,6 +4,7 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from consolidation_doubles import DeterministicSigner, RecordingTextEmbedder
 
 from mindbridge.application.consolidation import (
     ConsolidateEpisodes,
@@ -16,10 +17,8 @@ from mindbridge.application.episodes import (
     EpisodeWrite,
 )
 from mindbridge.application.perception import ResolvedEvidence
-from mindbridge.application.ports import PresignedMediaDownload
 from mindbridge.core import (
     EmbeddedObjectType,
-    EmbeddingSpaceReference,
     Event,
     EventHierarchyLevel,
     EventId,
@@ -36,7 +35,6 @@ from mindbridge.core import (
     TenantId,
     VerificationStatus,
 )
-from mindbridge.models import Embedding, EmbedRequest, EmbedResult, TextPart
 
 NOW = datetime(2026, 8, 12, 12, 0, tzinfo=timezone.utc)
 TENANT_ID = TenantId("tenant_01")
@@ -117,42 +115,6 @@ class RecordingConsolidator:
         )
 
 
-class RecordingTextEmbedder:
-    space_reference = EmbeddingSpaceReference(space_id="jina-v5", revision="space-v1")
-
-    def __init__(self) -> None:
-        self.documents: tuple[str, ...] = ()
-
-    async def embed(self, request: EmbedRequest) -> EmbedResult:
-        self.documents = tuple(
-            part.text
-            for input_value in request.inputs
-            for part in input_value.parts
-            if isinstance(part, TextPart)
-        )
-        return EmbedResult(
-            tuple(
-                Embedding(
-                    (1.0, 0.0),
-                    ModelReference(model_id="jina-text", revision="text-revision"),
-                    EmbeddingSpaceReference(space_id="jina-v5", revision="space-v1"),
-                )
-                for _ in request.inputs
-            )
-        )
-
-
-class DeterministicSigner:
-    async def create_presigned_download(
-        self,
-        media_object: MediaObject,
-    ) -> PresignedMediaDownload:
-        return PresignedMediaDownload(
-            download_url=f"https://objects.example.test/{media_object.media_object_id}",
-            expires_at=NOW + timedelta(minutes=5),
-        )
-
-
 async def test_consolidation_builds_one_complete_episode_aggregate() -> None:
     events = (_event(1), _event(2))
     store = RecordingEpisodeStore(events)
@@ -163,7 +125,7 @@ async def test_consolidation_builds_one_complete_episode_aggregate() -> None:
         store,
         consolidator,
         text_embedder,
-        media_url_signer=DeterministicSigner(),
+        media_url_signer=DeterministicSigner(NOW),
     ).run(
         EpisodeCandidateRequest(
             tenant_id=TENANT_ID,
@@ -215,7 +177,7 @@ async def test_consolidation_rejects_an_unknown_candidate_before_embedding() -> 
             store,
             RecordingConsolidator((events[0].event_id, EventId("event_unknown"))),
             embedder,
-            media_url_signer=DeterministicSigner(),
+            media_url_signer=DeterministicSigner(NOW),
         ).run(EpisodeCandidateRequest(tenant_id=TENANT_ID, evaluated_at=NOW))
 
     assert embedder.documents == ()
@@ -235,7 +197,7 @@ async def test_consolidation_does_not_order_overlapping_events() -> None:
         store,
         RecordingConsolidator((first.event_id, second.event_id)),
         RecordingTextEmbedder(),
-        media_url_signer=DeterministicSigner(),
+        media_url_signer=DeterministicSigner(NOW),
     ).run(EpisodeCandidateRequest(tenant_id=TENANT_ID, evaluated_at=NOW + timedelta(hours=1)))
 
     assert store.writes[0].temporal_event_pairs == ()

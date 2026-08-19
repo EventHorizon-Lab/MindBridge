@@ -42,7 +42,8 @@ LIFECYCLE_ENVIRONMENT = """environment:
   MINDBRIDGE_DATABASE_URL          PostgreSQL DSN (required). Read from the environment
                                    rather than a flag so the DSN never reaches a process
                                    list or this shell's history.
-  MINDBRIDGE_OBJECT_STORAGE_BUCKET, MINDBRIDGE_OBJECT_STORAGE_ENDPOINT_URL
+  MINDBRIDGE_OBJECT_STORAGE_BUCKET, MINDBRIDGE_OBJECT_STORAGE_ENDPOINT_URL,
+  MINDBRIDGE_OBJECT_STORAGE_PUBLIC_ENDPOINT_URL
                                    object storage holding derived evidence clips; read
                                    only when --reclaim-orphan-clips is given"""
 

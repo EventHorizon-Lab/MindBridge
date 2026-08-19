@@ -6,7 +6,7 @@ import asyncio
 import re
 from importlib import import_module
 from pathlib import Path
-from typing import Literal, Protocol, cast
+from typing import Any, Literal, cast
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, TypeAdapter, model_validator
 
@@ -149,14 +149,6 @@ class VideoMMEMetrics(ContractModel):
         return self
 
 
-class _ArrowTable(Protocol):
-    def to_pylist(self) -> list[dict[str, object]]: ...
-
-
-class _ParquetModule(Protocol):
-    def read_table(self, source: Path) -> _ArrowTable: ...
-
-
 class _RawQuestion(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -176,12 +168,12 @@ class _RawQuestion(BaseModel):
 def load_video_mme(annotation_path: Path) -> tuple[VideoMMEVideo, ...]:
     """Load the official Hugging Face Parquet release without materializing media."""
     try:
-        parquet = cast(_ParquetModule, import_module("pyarrow.parquet"))
+        parquet = cast(Any, import_module("pyarrow.parquet"))
     except ModuleNotFoundError as error:
         if error.name is not None and not error.name.startswith("pyarrow"):
             raise
         raise RuntimeError(
-            "Video-MME Parquet support requires `uv sync --extra benchmarks`"
+            "Video-MME Parquet support requires `uv sync --group benchmarks`"
         ) from error
     rows = TypeAdapter(list[_RawQuestion]).validate_python(
         parquet.read_table(annotation_path).to_pylist()

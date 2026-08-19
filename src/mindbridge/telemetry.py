@@ -6,14 +6,13 @@ import asyncio
 import math
 import os
 import sys
-from collections.abc import Callable, Coroutine, Iterator, Mapping
-from contextlib import contextmanager
+from collections.abc import AsyncIterator, Mapping
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from functools import wraps
 from importlib.metadata import version
 from threading import Lock
 from time import perf_counter
-from typing import TYPE_CHECKING, ParamSpec, TypeVar
+from typing import TYPE_CHECKING
 from uuid import uuid4
 
 from opentelemetry import metrics, trace
@@ -24,8 +23,6 @@ if TYPE_CHECKING:
     from opentelemetry.sdk.resources import Resource
     from opentelemetry.sdk.trace import TracerProvider
 
-_Parameters = ParamSpec("_Parameters")
-_Result = TypeVar("_Result")
 _INSTRUMENTATION_VERSION = version("mindbridge")
 _TRACER = trace.get_tracer("mindbridge", _INSTRUMENTATION_VERSION)
 _METER = metrics.get_meter("mindbridge", _INSTRUMENTATION_VERSION)
@@ -86,33 +83,13 @@ class TelemetryProviders:
         return self.tracer is not None or self.meter is not None
 
 
-def trace_operation(
-    name: str,
-) -> Callable[
-    [Callable[_Parameters, Coroutine[object, object, _Result]]],
-    Callable[_Parameters, Coroutine[object, object, _Result]],
-]:
-    """Trace one async domain operation without changing its typed signature."""
+@asynccontextmanager
+async def operation_span(name: str) -> AsyncIterator[None]:
+    """Trace and measure one domain operation, as an `async with` block or a decorator.
 
-    def decorate(
-        operation: Callable[_Parameters, Coroutine[object, object, _Result]],
-    ) -> Callable[_Parameters, Coroutine[object, object, _Result]]:
-        @wraps(operation)
-        async def traced(
-            *args: _Parameters.args,
-            **kwargs: _Parameters.kwargs,
-        ) -> _Result:
-            with operation_span(name):
-                return await operation(*args, **kwargs)
-
-        return traced
-
-    return decorate
-
-
-@contextmanager
-def operation_span(name: str) -> Iterator[None]:
-    """Trace and measure one domain operation around an existing code block."""
+    `asynccontextmanager` returns an `AsyncContextDecorator`, so `@operation_span(...)` wraps
+    an async operation without changing its typed signature.
+    """
     if not name.strip():
         raise ValueError("operation name must not be empty")
     started_at = perf_counter()

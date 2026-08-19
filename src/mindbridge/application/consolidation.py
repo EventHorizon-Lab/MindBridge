@@ -29,7 +29,7 @@ from mindbridge.core import (
     require_non_empty,
     require_similarity,
 )
-from mindbridge.telemetry import set_current_span_attributes, trace_operation
+from mindbridge.telemetry import operation_span, set_current_span_attributes
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,7 +133,7 @@ class ConsolidateEpisodes:
         self._text_embedder = text_embedder
         self._media_url_signer = media_url_signer
 
-    @trace_operation("mindbridge.consolidation.episodes")
+    @operation_span("mindbridge.consolidation.episodes")
     async def run(self, request: EpisodeCandidateRequest) -> EpisodeConsolidationResult:
         """Discover, inspect, and atomically commit one stable candidate page."""
         page = await self._store.list_episode_candidates(request)

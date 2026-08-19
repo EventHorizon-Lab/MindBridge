@@ -18,6 +18,7 @@ from mindbridge.application.consolidate_summaries import ConsolidateSummaries
 from mindbridge.application.consolidation import ConsolidateEpisodes
 from mindbridge.application.consolidation_sweep import (
     ConsolidationSweepSummary,
+    SweepSummary,
     consolidate_tenant_claims,
     consolidate_tenant_entities,
     consolidate_tenant_episodes,
@@ -60,7 +61,8 @@ CONSOLIDATION_ENVIRONMENT = """environment:
   MINDBRIDGE_DATABASE_URL           PostgreSQL DSN (required). Read from the environment
                                     rather than a flag so the DSN never reaches a process
                                     list or this shell's history.
-  MINDBRIDGE_OBJECT_STORAGE_BUCKET, MINDBRIDGE_OBJECT_STORAGE_ENDPOINT_URL
+  MINDBRIDGE_OBJECT_STORAGE_BUCKET, MINDBRIDGE_OBJECT_STORAGE_ENDPOINT_URL,
+  MINDBRIDGE_OBJECT_STORAGE_PUBLIC_ENDPOINT_URL
                                     object storage holding the source audio and video
                                     this sweep lets the Generator inspect
   MINDBRIDGE_GENERATOR_PLUGIN, MINDBRIDGE_EMBEDDER_PLUGIN
@@ -372,41 +374,21 @@ def _parser(prog: str | None = None) -> argparse.ArgumentParser:
 
 def _summary_dict(summary: ConsolidationSweepSummary) -> dict[str, object]:
     return {
-        "claims": {
-            "candidate_count": summary.claims.candidate_count,
-            "committed_relationship_count": summary.claims.committed_relationship_count,
-            "committed_semantic_claim_count": summary.claims.committed_semantic_claim_count,
-            "page_count": summary.claims.page_count,
-            "proposed_relationship_count": summary.claims.proposed_relationship_count,
-            "proposed_semantic_claim_count": summary.claims.proposed_semantic_claim_count,
-            "scanned_count": summary.claims.scanned_count,
-        },
-        "episodes": {
-            "candidate_count": summary.episodes.candidate_count,
-            "committed_count": summary.episodes.committed_count,
-            "page_count": summary.episodes.page_count,
-            "proposed_count": summary.episodes.proposed_count,
-            "scanned_count": summary.episodes.scanned_count,
-        },
-        "summaries": {
-            "candidate_count": summary.summaries.candidate_count,
-            "committed_count": summary.summaries.committed_count,
-            "page_count": summary.summaries.page_count,
-            "proposed_count": summary.summaries.proposed_count,
-            "scanned_count": summary.summaries.scanned_count,
-        },
-        "entities": {
-            "candidate_pair_count": summary.entities.candidate_pair_count,
-            "committed_count": summary.entities.committed_count,
-            "dropped_pair_count": summary.entities.dropped_pair_count,
-            "not_same_as_count": summary.entities.not_same_as_count,
-            "page_count": summary.entities.page_count,
-            "same_as_count": summary.entities.same_as_count,
-            "scanned_count": summary.entities.scanned_count,
-            "skipped_pair_count": summary.entities.skipped_pair_count,
-        },
+        "claims": _sweep_dict(summary.claims),
+        "episodes": _sweep_dict(summary.episodes),
+        "entities": _sweep_dict(summary.entities),
+        "summaries": _sweep_dict(summary.summaries),
         "evaluated_at": summary.episodes.evaluated_at.isoformat(),
         "tenant_id": summary.episodes.tenant_id,
+    }
+
+
+def _sweep_dict(sweep: SweepSummary) -> dict[str, int]:
+    return {
+        "candidate_count": sweep.candidate_count,
+        "page_count": sweep.page_count,
+        "scanned_count": sweep.scanned_count,
+        **sweep.counts,
     }
 
 
