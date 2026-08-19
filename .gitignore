@@ -12,3 +12,10 @@ dist/
 .env
 .env.local
 .benchmarks/
+
+# Audit receipts written by the protect-mcp tooling, not by this project. It writes them
+# relative to the working directory it is invoked from, so they appear at the repo root and
+# under src/ alike -- the latter would otherwise land inside the wheel's package root. The
+# patterns are unanchored for that reason.
+receipts/
+review-receipts/
