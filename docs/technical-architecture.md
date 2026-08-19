@@ -1708,34 +1708,30 @@ job→first claim/searchable ready，以及 recall→first answer/complete。His
 
 ### 16.1 当前实施状态
 
-RTX 5090 同机端云验证的完整协议、四套公开题集结果、生命周期证据、SOTA 可比性边界与下一步
-优先级见 [`benchmark-report-5090.md`](benchmark-report-5090.md)。该报告把 released-text
-memory-layer 评测与原始视听复现分开，禁止用前者替代多模态 SOTA 声明。
+2026-08-13 的 RTX 5090 四套公开题集基线报告已在 2026-08-19 退役并删除，不能再被引用：LoCoMo
+数字来自已被 LoCoMo-Refined 取代的原始语料；M3-Bench Web 分数由 908 个 v6 分片与 12 个 v7 分片
+混合并包含选择性重跑；后续子集实测又推翻了它关于 SuperMemory 过度拒答和 EgoLifeQA 片段级检索
+命中的两条结论。**当前没有成立的四套完整题集基线**，任何分数或 SOTA 声明都必须来自新的同协议
+重跑。评测立场本身不变（§14.0）：released-text memory-layer 评测与原始视听复现必须分开，前者
+不能替代多模态 SOTA 声明；目标与公开对照见 [`benchmarks-sota.md`](benchmarks-sota.md)。
 
-当前完整公开题集基线为：LoCoMo（原始语料，已退役）token-F1 `53.09%`、非官方 Qwen Judge
-`81.43%`；EgoLifeQA
-`61.20%`；SuperMemory-VQA Ans-F1/QA-Acc/QA-MRR `67.41%/58.69%/72.65%`；M3-Bench
-Robot/Web 非官方 Qwen Judge `30.02%/58.18%`。M3 Web 混合了 908 个 v6 与 12 个 v7 分片，且
-包含选择性重跑，因而只是诊断值。逐运行 revision、输入表示、模型、结果 hash 和生命周期工件
-固定在 [`benchmark-5090-clean-007.json`](../benchmarks/manifests/benchmark-5090-clean-007.json)。
-当前生产 Recall 的单 conversation 组合回归中，LoCoMo（原始语料）non-adversarial token-F1 从 `54.26%`
-变为 `60.02%`。Prompt 与反思代码是同时变化的——按 §14.0 这是允许的优化方式，因此该差值是组合
-收益，不能被引用为反思单独的贡献。新的真实音频
-验证在 RTX 5090 上用一次 FunASR 调用贯通 VAD、ASR、标点、diarization 与 CAM++ centroid：
-20 秒音频推理 1.283 秒、峰值 CUDA allocation 1.93 GiB；同一 centroid 跨两个 Observation 命中
-同一 AES-GCM 加密设备身份。另有 6 秒、60 次 100ms PCM push 的真实在线路径。两者都只作为当前代码
-增量证据；完整榜单和带真值身份 replay 仍按上述基线口径验收。
+`.benchmarks/results/` 现在只保留 2026-08-18 之后的诊断运行，跑批媒体也只保留同期 tenant；旧运行
+的结果文件、媒体和 artifact hash 已删除，旧 manifest 因此不可再校验。新基线必须与结果文件一同落盘
+manifest 才能被引用。
 
-当前 `answer_from_evidence_v10` 已完成发布文本↔原始媒体 EvidenceSpan 绑定、最终相关 Top-K 内
-newest/oldest 重排、无新增结果时的反思方向切换，以及 Summary 有向下钻与有界单跳父/同父展开；这些改动通过生产路径
-回归，但尚未重跑四套完整 split，因此不改写上面的基线数字。跨查询 experience memory 与
+当前代码的增量证据只作为功能证据，不作为榜单分数：一次 FunASR 调用在 RTX 5090 上贯通 VAD、ASR、
+标点、diarization 与 CAM++ centroid，20 秒音频推理 1.283 秒、峰值 CUDA allocation 1.93 GiB，同一
+centroid 跨两个 Observation 命中同一 AES-GCM 加密设备身份；另有 6 秒、60 次 100ms PCM push 的真实
+在线路径。`answer_from_evidence_v10` 已完成发布文本↔原始媒体 EvidenceSpan 绑定、最终相关 Top-K 内
+newest/oldest 重排、无新增结果时的反思方向切换，以及 Summary 有向下钻与有界单跳父/同父展开；这些
+改动通过生产路径回归，但没有任何完整 split 数字支撑。跨查询 experience memory 与
 Entity/Bridge/Scene/Horizon cue 明确推迟到完整数据证明增益之后，避免为榜单题型预埋旁路。
 
 | 阶段 | 当前状态 | 已落地证据 | 剩余验收 |
 | --- | --- | --- | --- |
-| Phase 0 | 完成 | 严格领域契约、锁定依赖、CI、Jina smoke、官方数据适配器、可追溯 LoCoMo-Refined 与 5090 全量评测 manifest | 无；后续运行继续沿用同一 manifest 门禁 |
+| Phase 0 | 完成 | 严格领域契约、锁定依赖、CI、Jina smoke、官方数据适配器、可追溯 LoCoMo-Refined 数据集 manifest | 无；后续运行继续沿用同一 manifest 门禁 |
 | Phase 1 | 软件垂直路径完成 | 原生 BGR/PCM 流入口、采集 handoff、FunASR 统一语音、加密身份 prototype、SQLite Outbox/近期记忆、S3 同步、durable Job、Event 精确 EvidenceSpan/pgvector 与 REST API | 在各目标端侧平台上完成真实摄像头、VAD/场景/运动门控、断网和功耗验收 |
-| Phase 2 | 完成（公开发布表示） | Episode/Claim/Summary consolidation、RRF/图展开/媒体重看、反馈纠错、生命周期、显式删除，以及四套 Benchmark 完整公开题集的生产 API 分层结果 | 原始 AV 全量重放属于 Phase 3 严格 SOTA 复现，不再作为 Phase 2 软件门禁 |
+| Phase 2 | 完成（公开发布表示） | Episode/Claim/Summary consolidation、RRF/图展开/媒体重看、反馈纠错、生命周期、显式删除，以及子集诊断运行的生产 API 分层结果（四套完整公开题集待重跑） | 原始 AV 全量重放属于 Phase 3 严格 SOTA 复现，不再作为 Phase 2 软件门禁 |
 | Phase 3 | 进行中 | RLS 多租户、Bearer allowlist、Python SDK、MCP/OpenAPI、OpenTelemetry、端侧 CUDA 人脸/FunASR 统一 speech path、PCM streaming、Omni ASD、发布文本↔原始媒体证据绑定、相关 Top-K 时间重排、无结果方向切换和有界层级展开 | 原始 AV/OCR/object 全量 SOTA 重放、官方 Judge 重跑、身份真值 replay、LR-ASD 与 Embedding bake-off、跨平台端侧 runtime（TensorRT/RKNN/OpenVINO/BPU）与 Nano 实测、配额、持久审计和备份删除演练；experience/cue 等完整数据证明收益后再评估 |
 
 “软件路径完成”不等于硬件或榜单验收完成。以下项目不能由单元测试替代：

@@ -7,8 +7,6 @@ MindBridge is an Agentic Native Embodied Memory System: Memory-as-a-Service for 
 - [Technical implementation architecture](docs/technical-architecture.md)
 - [System architecture diagram](docs/architecture-diagram.html)
 - [Model plugin architecture and author contract](docs/plugin-architecture.md)
-- [RTX 5090 benchmark and lifecycle validation](docs/benchmark-report-5090.md)
-- [RTX 5090 reproducibility manifest](benchmarks/manifests/benchmark-5090-clean-007.json)
 - [Edge identity model selection and validation](docs/edge-identity-sota.md)
 - [SOTA baselines for the supported benchmarks](docs/benchmarks-sota.md)
 
