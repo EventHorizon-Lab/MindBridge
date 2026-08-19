@@ -410,8 +410,7 @@ def derive_entity_resolution_write(
     """Turn verdicts into pairwise edges, one per pair, with no inferred edges."""
     return EntityResolutionWrite(
         relations=tuple(
-            _relation(tenant_id, pair, adjudication, evaluated_at)
-            for pair, adjudication in decided
+            _relation(tenant_id, pair, adjudication, evaluated_at) for pair, adjudication in decided
         )
     )
 
@@ -484,8 +483,9 @@ and reuse its `_completion_stream` helper and generator double rather than inven
 
 ```python
 async def test_adjudication_parses_a_structured_verdict() -> None:
-    generator = _generator('{"same_entity":true,"confidence":0.86,'
-                           '"discriminating_cue":"same scar above left eyebrow"}')
+    generator = _generator(
+        '{"same_entity":true,"confidence":0.86,"discriminating_cue":"same scar above left eyebrow"}'
+    )
     pipeline = EntityResolutionPipeline(generator)
     verdict = await pipeline.adjudicate(_pair("entity_a", "entity_b"), ())
     assert verdict.same_entity is True

@@ -56,3 +56,9 @@ def test_relation_rejects_a_self_edge() -> None:
             target_id="event_01",
             created_at=NOW,
         )
+
+
+def test_entity_resolution_relation_types_are_available() -> None:
+    """Entity resolution needs a verdict vocabulary the store can index."""
+    assert RelationType.SAME_AS.value == "same_as"
+    assert RelationType.NOT_SAME_AS.value == "not_same_as"
