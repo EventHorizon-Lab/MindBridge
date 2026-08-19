@@ -98,6 +98,7 @@ class InMemoryStore:
         self.graph_memories: dict[tuple[EmbeddedObjectType, str], MemoryId] = {}
         self.summary_children: dict[MemoryId, tuple[MemoryId, ...]] = {}
         self.embeddings: dict[str, EmbeddingRecord] = {}
+        self.reencoding_allowed: list[bool] = []
         self.feedback: dict[str, tuple[str, FeedbackWriteResult]] = {}
 
     async def write_observation(
@@ -440,9 +441,14 @@ class InMemoryStore:
         *,
         allow_reencoding: bool = False,
     ) -> bool:
+        # Honours `allow_reencoding` rather than merely accepting it. A double that takes the
+        # keyword and ignores it makes the kernel's use of it untestable: dropping
+        # `allow_reencoding=True` at the one call site left every test green while production
+        # began raising on two concurrent batches that share a memory.
+        self.reencoding_allowed.append(allow_reencoding)
         existing = self.embeddings.get(embedding.embedding_id)
         if existing is not None:
-            if existing != embedding:
+            if existing != embedding and not allow_reencoding:
                 raise DomainInvariantError("embedding ID stores different content")
             return False
         self.embeddings[embedding.embedding_id] = embedding
@@ -891,6 +897,25 @@ async def test_remember_retry_returns_original_record() -> None:
     assert embedder.memory_documents == [request.summary, request.summary]
     assert first.status is MemoryWriteStatus.CREATED
     assert retry.status is MemoryWriteStatus.DUPLICATE
+
+
+async def test_remember_asserts_its_embedding_id_pins_its_text() -> None:
+    """The kernel must claim `allow_reencoding` here, or the race it exists for reopens.
+
+    Two concurrent batches that share one memory encode it beside different neighbours, and
+    that padding alone moves the vector far outside the write's equality tolerance. The store
+    cannot tell that from content drift -- only a caller knows the ID pins its text -- so the
+    kernel asserts it. Dropping the keyword leaves every other test green while production
+    starts raising DomainInvariantError on exactly the concurrency the pool ceiling invites,
+    which is why this pins the assertion itself rather than a vector comparison. Store-side
+    semantics are covered by tests/integration/test_pgvector.py.
+    """
+    store = InMemoryStore()
+    kernel = _kernel(store, RecordingAnswerer(), embedder=RecordingEmbedder())
+
+    await kernel.remember(_remember_request(idempotency_key="remember-reencode"))
+
+    assert store.reencoding_allowed == [True]
 
 
 async def test_remember_indexes_one_pinned_memory_document() -> None:

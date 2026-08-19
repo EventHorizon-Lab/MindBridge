@@ -638,8 +638,13 @@ flowchart LR
 PostgreSQL FTS、结构化过滤、RRF 和原始视听证据重看。Event/Claim 命中通过有类型的
 `represented_by` 关系映射回 MemoryRecord，映射后再次应用租户、时间、人物、设备和记忆类型
 过滤。纯媒体查询只使用跨模态稠密候选，避免把“最近记忆”伪装成相关结果；文本查询并行运行
-稠密与稀疏召回。pgvector HNSW 查询在事务内启用 `strict_order` iterative scan，避免过滤条件
-导致候选不足，因此部署要求 pgvector 0.8+。稠密命中的 Event/Claim 会在 PostgreSQL 内做一次
+稠密与稀疏召回。向量检索走的是**单租户内的精确扫描**，不是近似检索：RLS 给每条查询注入
+`tenant_id` 谓词，`embeddings_space_search_idx` 又以 `tenant_id` 开头，所以 planner 总能直达
+一个租户的向量并精确排序——迁移 0018 因此删掉了从没被读过的 HNSW 索引。代价是耗时随**单个**
+租户的向量数线性增长（1,000 行约 5 ms，11,000 行约 51 ms）。事务内仍然启用 `strict_order`
+iterative scan：没有 HNSW 索引时它是空操作，但只要某个超大租户重新加回该索引，带过滤的检索
+就仍能返回完整的 LIMIT 而不是静默变少——这才是部署要求 pgvector 0.8+ 的真正原因。
+稠密命中的 Event/Claim 会在 PostgreSQL 内做一次
 有界关系展开：直接覆盖 `asserts`、`contains`、`same_episode`、`supports`、`contradicts`、
 `supersedes`、`before` 和 `after` 的双向邻居；经 `mentions/about` 共享 Entity 的邻居，每个命中
 最多取 16 个。直接表示始终先于关系邻居排序，所有展开结果在映射为 MemoryRecord 后再次执行
