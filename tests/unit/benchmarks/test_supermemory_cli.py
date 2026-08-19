@@ -91,6 +91,7 @@ def _arguments(dataset_path: Path, prepared_path: Path, output_path: Path) -> _A
         processing_timeout_seconds=1_800.0,
         question_ids=(),
         overwrite=False,
+        quiet=True,
     )
 
 

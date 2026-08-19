@@ -15,9 +15,15 @@ dependencies = [
 ]
 
 [project.scripts]
-mindbridge-consolidate = "mindbridge.consolidation_cli:main"
-mindbridge-lifecycle = "mindbridge.lifecycle_cli:main"
-mindbridge-mcp = "mindbridge.server:run_mcp"
+mindbridge = "mindbridge.cli:main"
+# The benchmark runners get their own binary: AGENTS.md keeps `benchmarks/` a leaf that no
+# product module imports, so the product entry point cannot address them.
+mindbridge-bench = "mindbridge.benchmarks.cli:main"
+# The three names the README has always documented, kept as aliases. They route through
+# mindbridge.cli so they report the same exit codes and one-line failures as the tree.
+mindbridge-consolidate = "mindbridge.cli:consolidate"
+mindbridge-lifecycle = "mindbridge.cli:lifecycle"
+mindbridge-mcp = "mindbridge.cli:mcp"
 
 [project.entry-points."mindbridge.generators"]
 openai = "mindbridge.models.openai:create_generator"
@@ -27,6 +33,9 @@ jina = "mindbridge.models.jina:create_embedder"
 openai = "mindbridge.models.openai:create_embedder"
 
 [project.optional-dependencies]
+benchmarks = [
+    "pyarrow>=18,<26",
+]
 edge = [
     "boto3>=1.40,<2",
     "cryptography>=45,<51",
@@ -80,12 +89,6 @@ explicit = true
 torch = { index = "pytorch-cu128" }
 
 [dependency-groups]
-# Parquet support for the Video-MME and dataset-smoke adapters. A group rather than an
-# extra because the harness that reads Parquet is excluded from the wheel: published as an
-# extra it would install pyarrow for modules the installed package does not contain.
-benchmarks = [
-    "pyarrow>=18,<26",
-]
 dev = [
     "boto3-stubs[s3]>=1.40,<2",
     "mypy>=1.15,<3",
@@ -96,11 +99,6 @@ dev = [
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/mindbridge"]
-# The benchmark harness is a leaf nothing shipped imports (enforced by
-# tests/test_package.py) and it cannot run from an installed wheel anyway: its datasets,
-# run manifests, and the pinned AML sources all live outside the package. Keeping it out
-# of the wheel stops every deployment from carrying a quarter of the tree it cannot use.
-exclude = ["src/mindbridge/benchmarks"]
 
 [tool.ruff]
 target-version = "py310"

@@ -325,12 +325,16 @@ async def reclaim_orphan_clips(
     now: datetime | None = None,
     grace_seconds: int = CLIP_RECLAIM_GRACE_SECONDS,
     batch_size: int = 500,
+    dry_run: bool = False,
 ) -> ClipReclaimSummary:
     """Delete stored clips the system of record never registered.
 
     Keys are content addressed, so an orphan is a digest the database does not
     know. Objects younger than the grace period are left alone because a Worker
     may still be between its upload and its commit.
+
+    `dry_run` counts what it would delete and deletes nothing, so an operator can see
+    the size of an irreversible sweep before running it.
     """
     if batch_size <= 0:
         raise ValueError("batch_size must be positive")
@@ -348,7 +352,8 @@ async def reclaim_orphan_clips(
         )
         for key in batch:
             if _key_digest(key) not in known:
-                await janitor.delete_media_key(tenant_id, key)
+                if not dry_run:
+                    await janitor.delete_media_key(tenant_id, key)
                 reclaimed += 1
     set_current_span_attributes(
         {
@@ -356,6 +361,9 @@ async def reclaim_orphan_clips(
             "mindbridge.clip.scanned_count": len(listed),
             "mindbridge.clip.skipped_recent_count": len(listed) - len(settled),
             "mindbridge.clip.reclaimed_count": reclaimed,
+            # Without this a preview is indistinguishable from a deletion in any dashboard
+            # summing reclaimed_count, which would report storage that is still there.
+            "mindbridge.clip.dry_run": dry_run,
         }
     )
     return ClipReclaimSummary(

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -23,6 +24,7 @@ from mindbridge.benchmarks.cli_common import (
     core_parser,
     media_arguments,
     media_manifest,
+    report,
     select_by_id,
     write_run_artifacts,
 )
@@ -60,6 +62,7 @@ class SuperMemoryRunManifest(MediaBenchmarkRunManifest):
     question_ids: tuple[int, ...] = Field(min_length=1)
     video_count: int = Field(gt=0)
     segment_count: int = Field(gt=0)
+    abstained_question_count: int = Field(ge=0)
     metrics: SuperMemoryMetrics
 
 
@@ -72,9 +75,9 @@ class _Arguments(MediaArguments):
     question_ids: tuple[int, ...]
 
 
-def main() -> None:
+def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
     """Run one participant and emit predictions, official metrics, and a manifest."""
-    arguments = _parse_arguments()
+    arguments = _parse_arguments(argv, prog)
     questions = _select_questions(
         load_supermemory_vqa(arguments.dataset_path),
         arguments.subject,
@@ -88,8 +91,12 @@ def main() -> None:
             segment.media_objects for video in prepared.videos for segment in video.segments
         ),
     )
+    # Per-unit lines would have to come from inside the runner, which owns the
+    # concurrency this benchmark ingests with; the run announces its size instead.
+    report(f"running {len(questions)} questions", quiet=arguments.quiet)
     results = asyncio.run(_run(arguments, questions, prepared))
     _write_artifacts(arguments, questions, prepared, results, deployment)
+    report(f"wrote {arguments.output_path}", quiet=arguments.quiet)
 
 
 async def _run(
@@ -153,6 +160,7 @@ def _write_artifacts(
         question_ids=tuple(question.question_id for question in questions),
         video_count=len(prepared.videos),
         segment_count=sum(len(video.segments) for video in prepared.videos),
+        abstained_question_count=sum(result.mindbridge_abstained for result in results),
         metrics=metrics,
     )
     write_run_artifacts(arguments.output_path, predictions, manifest)
@@ -176,17 +184,31 @@ def _select_questions(
     return selected
 
 
-def _parse_arguments() -> _Arguments:
+def _parse_arguments(argv: Sequence[str] | None, prog: str | None) -> _Arguments:
     parser = add_media_arguments(
-        core_parser(tenant_prefix="benchmark_supermemory"),
+        core_parser(tenant_prefix="benchmark_supermemory", prog=prog, description=__doc__),
         device_id="supermemory_glasses",
     )
-    parser.add_argument("--prepared-media", type=Path, required=True)
-    parser.add_argument("--subject", type=int, required=True)
-    parser.add_argument("--dataset-revision", required=True)
-    parser.add_argument("--source-revision", required=True)
-    parser.add_argument("--question-id", type=int, action="append", default=[])
-    parsed = parser.parse_args()
+    parser.add_argument(
+        "--prepared-media", type=Path, required=True, help="manifest of clips prepared for ingest"
+    )
+    parser.add_argument(
+        "--subject", type=int, required=True, help="official subject whose videos this run replays"
+    )
+    parser.add_argument(
+        "--dataset-revision", required=True, help="revision of the official dataset release"
+    )
+    parser.add_argument(
+        "--source-revision", required=True, help="revision of the official video release"
+    )
+    parser.add_argument(
+        "--question-id",
+        type=int,
+        action="append",
+        default=[],
+        help="official question to run; repeatable, default the whole subject",
+    )
+    parsed = parser.parse_args(argv)
     return media_arguments(
         _Arguments,
         parsed,

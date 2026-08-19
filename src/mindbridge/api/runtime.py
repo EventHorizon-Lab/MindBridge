@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 import os
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Protocol, cast
@@ -18,6 +18,7 @@ from mindbridge.api.auth import TenantApiKeyAuthenticator
 from mindbridge.api.mcp import build_mcp_server
 from mindbridge.application.kernel import MemoryKernel
 from mindbridge.application.pipelines import AnswerPipeline, OccurrencePipeline
+from mindbridge.cli import parser as build_parser
 from mindbridge.configuration import (
     copy_plugin_configuration,
     optional_environment_value,
@@ -26,7 +27,11 @@ from mindbridge.configuration import (
     validate_plugin_name,
 )
 from mindbridge.core import EmbeddedObjectType, EmbeddingSpaceReference, TenantId
-from mindbridge.infrastructure.postgres import PostgresMemoryStore
+from mindbridge.infrastructure.postgres import (
+    DEFAULT_DATABASE_MAX_POOL_SIZE,
+    PostgresMemoryStore,
+    resolve_database_max_pool_size,
+)
 from mindbridge.infrastructure.s3 import (
     ObjectStorageEnvironment,
     S3MediaAccess,
@@ -67,6 +72,7 @@ class Settings:
     tenant_api_keys_json: str | None = field(default=None, repr=False)
     aml_api_key: str | None = field(default=None, repr=False)
     aml_tenant_prefix: str = "bench_aml"
+    database_max_pool_size: int = DEFAULT_DATABASE_MAX_POOL_SIZE
 
     def __post_init__(self) -> None:
         for name, value in (
@@ -97,6 +103,8 @@ class Settings:
             or not -1.0 <= self.minimum_embedding_similarity <= 1.0
         ):
             raise ValueError("minimum_embedding_similarity must be between -1 and 1")
+        if self.database_max_pool_size < 1:
+            raise ValueError("database_max_pool_size must be at least 1")
 
     @classmethod
     def from_environment(cls, environ: Mapping[str, str] | None = None) -> Settings:
@@ -131,6 +139,9 @@ class Settings:
             ),
             aml_api_key=optional_environment_value(source, "MINDBRIDGE_AML_API_KEY"),
             aml_tenant_prefix=source.get("MINDBRIDGE_AML_TENANT_PREFIX", "bench_aml"),
+            # One parser for the variable, so the API cannot disagree with the worker and
+            # the two sweeps about what a given value means.
+            database_max_pool_size=resolve_database_max_pool_size(source),
         )
 
 
@@ -232,14 +243,34 @@ def create_mcp_server(settings: Settings | None = None) -> MCPServer[None]:
     return build_mcp_server(runtime.kernel, lifespan=lifespan)
 
 
-def run_mcp() -> None:
-    """Run the deployable MCP server over stdio."""
+MCP_ENVIRONMENT = """environment:
+  MINDBRIDGE_DATABASE_URL      PostgreSQL DSN (required)
+  MINDBRIDGE_TASK_BROKER_URL   Celery broker URL for observation processing (required)
+  MINDBRIDGE_TENANT_API_KEYS_JSON, MINDBRIDGE_GENERATOR_*, MINDBRIDGE_EMBEDDER_*
+                               the same variables the HTTP API process reads"""
+
+
+def run_mcp(argv: Sequence[str] = (), *, prog: str | None = None) -> None:
+    """Run the deployable MCP server over stdio.
+
+    It takes no flags of its own; the parser exists so `--help` and `--version` answer
+    instead of silently starting a server that then blocks on stdin. `argv` defaults to
+    nothing rather than to `sys.argv`, because this is public API: a launcher that calls
+    `run_mcp()` must not have its own flags parsed as the server's.
+    """
+    build_parser(
+        prog=prog,
+        description="Serve the deployable MindBridge MCP server over stdio.",
+        epilog=MCP_ENVIRONMENT,
+    ).parse_args(argv)
     create_mcp_server().run(transport="stdio")
 
 
 def _build_runtime(settings: Settings) -> _Runtime:
     store = PostgresMemoryStore(
-        settings.database_url, embedding_dimension=settings.embedding_dimension
+        settings.database_url,
+        embedding_dimension=settings.embedding_dimension,
+        max_pool_size=settings.database_max_pool_size,
     )
     media_access = S3MediaAccess(settings.object_storage)
     generator = load_generator(settings.generator_plugin, settings.generator_config)

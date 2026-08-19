@@ -258,6 +258,117 @@ async def test_postgres_runtime_role_enforces_tenant_row_security(
             )
 
 
+async def test_postgres_clip_purge_only_touches_fully_compressed_evidence(
+    store: PostgresMemoryStore,
+    database_url: str,
+) -> None:
+    """The EXISTS guard is what keeps a not-yet-cited evidence span from losing its clips."""
+    tenant_id = TenantId("tenant_clip_purge")
+    await _seed_clip_graph(database_url, tenant_id)
+
+    purged = await store.purge_compressed_clips(tenant_id, limit=100)
+
+    connection = await AsyncConnection.connect(database_url)
+    async with connection:
+        surviving = await (
+            await connection.execute(
+                "SELECT evidence_id FROM evidence_clips WHERE tenant_id = %s ORDER BY evidence_id",
+                (tenant_id,),
+            )
+        ).fetchall()
+        media = await (
+            await connection.execute(
+                "SELECT media_object_id FROM media_objects "
+                "WHERE tenant_id = %s ORDER BY media_object_id",
+                (tenant_id,),
+            )
+        ).fetchall()
+        spans = await (
+            await connection.execute(
+                "SELECT count(*) FROM evidence_spans WHERE tenant_id = %s",
+                (tenant_id,),
+            )
+        ).fetchone()
+
+    assert purged == 1
+    # Only the wholly compressed span loses its clip. The span shared with an active memory keeps
+    # its clip, and so does the span no memory cites yet.
+    assert [row[0] for row in surviving] == ["evidence_shared", "evidence_unlinked"]
+    # The purged clip's derived media row is gone, which is what orphans its storage key; the
+    # source object and every evidence span stay put.
+    assert "media_clip_compressed" not in {row[0] for row in media}
+    assert "media_source" in {row[0] for row in media}
+    assert spans is not None and spans[0] == 3
+
+
+async def _seed_clip_graph(database_url: str, tenant_id: TenantId) -> None:
+    """Build one compressed, one shared, and one uncited evidence span, each with a clip."""
+    connection = await AsyncConnection.connect(database_url, autocommit=True)
+    async with connection:
+        await connection.execute(
+            "INSERT INTO observations (tenant_id, observation_id, device_id, boot_id, sequence,"
+            " sensor, occurred_at, ended_at, observed_at, clock_offset_ms, content_digest)"
+            " VALUES (%s, 'observation_01', 'd', 'b', 1, 'camera', %s, %s, %s, 0, %s)",
+            (tenant_id, NOW, NOW, NOW, "f" * 64),
+        )
+        media = (
+            "media_source",
+            "media_clip_compressed",
+            "media_clip_shared",
+            "media_clip_unlinked",
+        )
+        for digest, media_object_id in enumerate(media, start=1):
+            await connection.execute(
+                "INSERT INTO media_objects (tenant_id, media_object_id, kind, uri, sha256,"
+                " size_bytes, created_at, derived_from_media_object_id)"
+                " VALUES (%s, %s, 'video', %s, %s, 1024, %s, %s)",
+                (
+                    tenant_id,
+                    media_object_id,
+                    f"s3://bucket/{media_object_id}.mp4",
+                    str(digest) * 64,
+                    NOW,
+                    None if media_object_id == "media_source" else "media_source",
+                ),
+            )
+        for evidence_id, clip_media in zip(
+            ("evidence_compressed", "evidence_shared", "evidence_unlinked"), media[1:], strict=True
+        ):
+            await connection.execute(
+                "INSERT INTO evidence_spans (tenant_id, evidence_id, observation_id,"
+                " media_object_id, start_ms, end_ms, created_at)"
+                " VALUES (%s, %s, 'observation_01', 'media_source', 0, 1000, %s)",
+                (tenant_id, evidence_id, NOW),
+            )
+            await connection.execute(
+                "INSERT INTO evidence_clips (tenant_id, evidence_id, ordinal, media_object_id,"
+                " start_ms, end_ms, created_at) VALUES (%s, %s, 0, %s, 0, 1000, %s)",
+                (tenant_id, evidence_id, clip_media, NOW),
+            )
+        # memory_active also cites the shared span, so that span's clip must survive;
+        # evidence_unlinked is cited by nobody, which is what the EXISTS guard protects.
+        for digest, (memory_id, state, evidence_ids) in enumerate(
+            (
+                ("memory_compressed", "compressed", ("evidence_compressed", "evidence_shared")),
+                ("memory_active", "active", ("evidence_shared",)),
+            ),
+            start=1,
+        ):
+            await connection.execute(
+                "INSERT INTO memory_records (tenant_id, memory_id, memory_type, summary,"
+                " verification_status, state, occurred_at, ended_at, content_digest, created_at,"
+                " lifecycle_changed_at)"
+                " VALUES (%s, %s, 'episodic', 'seeded', 'unverified', %s, %s, %s, %s, %s, %s)",
+                (tenant_id, memory_id, state, NOW, NOW, str(digest) * 64, NOW, NOW),
+            )
+            for evidence_id in evidence_ids:
+                await connection.execute(
+                    "INSERT INTO memory_evidence (tenant_id, memory_id, evidence_id)"
+                    " VALUES (%s, %s, %s)",
+                    (tenant_id, memory_id, evidence_id),
+                )
+
+
 async def _write_memory(store: PostgresMemoryStore, memory: MemoryRecord) -> None:
     await store.write_memory(
         memory,

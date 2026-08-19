@@ -868,6 +868,9 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+benchmarks = [
+    { name = "pyarrow" },
+]
 cloud-models = [
     { name = "av" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://mirrors.aliyun.com/pypi/simple" }, marker = "python_full_version < '3.11'" },
@@ -916,9 +919,6 @@ server = [
 ]
 
 [package.dev-dependencies]
-benchmarks = [
-    { name = "pyarrow" },
-]
 dev = [
     { name = "boto3-stubs", extra = ["s3"] },
     { name = "mypy" },
@@ -958,6 +958,7 @@ requires-dist = [
     { name = "pgvector", marker = "extra == 'server'", specifier = ">=0.4,<1" },
     { name = "pillow", marker = "extra == 'media'", specifier = ">=12,<13" },
     { name = "psycopg", extras = ["binary", "pool"], marker = "extra == 'server'", specifier = ">=3.2,<4" },
+    { name = "pyarrow", marker = "extra == 'benchmarks'", specifier = ">=18,<26" },
     { name = "pydantic", specifier = ">=2.10,<3" },
     { name = "sentence-transformers", marker = "extra == 'cloud-models'", specifier = ">=5.2,<6" },
     { name = "soundfile", marker = "extra == 'media'", specifier = ">=0.13,<1" },
@@ -965,10 +966,9 @@ requires-dist = [
     { name = "transformers", marker = "extra == 'cloud-models'", specifier = ">=5.1,<6" },
     { name = "uvicorn", marker = "extra == 'server'", specifier = ">=0.35,<1" },
 ]
-provides-extras = ["edge", "server", "media", "cloud-models"]
+provides-extras = ["benchmarks", "edge", "server", "media", "cloud-models"]
 
 [package.metadata.requires-dev]
-benchmarks = [{ name = "pyarrow", specifier = ">=18,<26" }]
 dev = [
     { name = "boto3-stubs", extras = ["s3"], specifier = ">=1.40,<2" },
     { name = "mypy", specifier = ">=1.15,<3" },

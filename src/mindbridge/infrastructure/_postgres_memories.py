@@ -212,21 +212,49 @@ _STRUCTURED_RECALL_FILTER_SQL = f"""
   )
 """
 
+# Callers ask in whole sentences, so the query side ORs the lexemes instead of requiring
+# every one of them: websearch_to_tsquery ANDs each term, stopwords included, which no
+# summary can satisfy. Lexing the query with the same configuration as the document keeps
+# bracketed identity tokens such as <voice_0> intact on both sides; ts_rank_cd then orders
+# the partial matches, and dense retrieval still supplies the other half of the fusion.
+# The lexemes are quoted by hand rather than with quote_literal, which is an SQL-string
+# escaper and not a tsquery one: it answers a lexeme containing a backslash with the E'...'
+# form, and tsquery has no such syntax, so `<img src="a\b.png">` raised a bare syntax error
+# on caller-supplied text. tsquery quotes both a backslash and a quote by doubling it, and
+# doubling the backslash is not optional either -- escaping only the quote parses but drops
+# the backslash from the lexeme, so the query silently stops matching the document that
+# produced it.
+_QUERY_TSQUERY_SQL = """
+    SELECT (
+        SELECT string_agg(
+            '''' || replace(replace(lexeme, '\\', '\\\\'), '''', '''''') || '''',
+            ' | '
+        )
+        FROM unnest(to_tsvector('mindbridge_text', %(query)s)) AS term(lexeme)
+    )::tsquery AS lexical_query
+    WHERE %(query)s::text IS NOT NULL
+"""
+
 _SEARCH_MEMORIES_SQL = f"""
+WITH lexical AS ({_QUERY_TSQUERY_SQL})
 {MEMORY_SELECT_SQL}
+LEFT JOIN lexical ON TRUE
 WHERE memory.tenant_id = %(tenant_id)s
   AND (
       %(query)s::text IS NULL
-      OR to_tsvector('simple', memory.summary) @@ websearch_to_tsquery('simple', %(query)s)
-      OR memory.summary ILIKE '%%' || %(query)s || '%%'
+      OR to_tsvector('mindbridge_text', memory.summary) @@ lexical.lexical_query
+      -- Substring containment, not a LIKE pattern. The query is caller text, and ILIKE read
+      -- its wildcard characters as wildcards, so a one-character query of either returned
+      -- the whole tenant ranked only by strength. strpos has no pattern language to escape.
+      OR strpos(lower(memory.summary), lower(%(query)s)) > 0
   )
 {_STRUCTURED_RECALL_FILTER_SQL}
 ORDER BY
     CASE
-        WHEN %(query)s::text IS NULL THEN 0
+        WHEN lexical.lexical_query IS NULL THEN 0
         ELSE ts_rank_cd(
-            to_tsvector('simple', memory.summary),
-            websearch_to_tsquery('simple', %(query)s)
+            to_tsvector('mindbridge_text', memory.summary),
+            lexical.lexical_query
         )
     END DESC,
     memory.strength DESC,
@@ -367,6 +395,21 @@ WITH ranked_objects AS (
 related_objects AS (
     SELECT hit.object_type, hit.object_id, hit.rank, 0 AS hop
     FROM ranked_objects AS hit
+    WHERE hit.object_type <> 'entity'
+    UNION ALL
+    SELECT mention.object_type, mention.object_id, hit.rank, 0 AS hop
+    FROM ranked_objects AS hit
+    JOIN LATERAL (
+        SELECT relation.source_type AS object_type, relation.source_id AS object_id
+        FROM relations AS relation
+        WHERE relation.tenant_id = %(tenant_id)s
+          AND relation.target_type = 'entity'
+          AND relation.target_id = hit.object_id
+          AND relation.source_type IN ('event', 'claim')
+          AND relation.relation_type IN ('mentions', 'about')
+        ORDER BY relation.created_at DESC, relation.source_type, relation.source_id
+        LIMIT %(limit)s
+    ) AS mention ON hit.object_type = 'entity'
     UNION ALL
     SELECT relation.target_type, relation.target_id, hit.rank, 1 AS hop
     FROM ranked_objects AS hit
@@ -574,16 +617,23 @@ class MemoryOperations(PostgresStoreOperations):
         *,
         limit: int,
     ) -> tuple[MemoryRecord, ...]:
-        """Follow ranked Event/Claim representation edges to filtered memories."""
+        """Follow ranked Event/Claim/Entity representation edges to filtered memories."""
         if not ranked_objects:
             return ()
         if limit <= 0:
             raise DomainInvariantError("semantic graph candidate limit must be positive")
         if any(
-            match.object_type not in {EmbeddedObjectType.EVENT, EmbeddedObjectType.CLAIM}
+            match.object_type
+            not in {
+                EmbeddedObjectType.EVENT,
+                EmbeddedObjectType.CLAIM,
+                EmbeddedObjectType.ENTITY,
+            }
             for match in ranked_objects
         ):
-            raise DomainInvariantError("semantic graph candidates must be events or claims")
+            raise DomainInvariantError(
+                "semantic graph candidates must be events, claims, or entities"
+            )
         parameters = _recall_parameters(request)
         parameters.update(
             object_types=[match.object_type.value for match in ranked_objects],

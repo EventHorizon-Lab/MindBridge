@@ -35,7 +35,7 @@ from mindbridge.benchmarks.aml.driver import (
 from mindbridge.benchmarks.aml.loaders import (
     beam,
     clbench,
-    locomo,
+    locomo_refined,
     longmemeval,
     personamem_v1,
     personamem_v2,
@@ -47,6 +47,8 @@ from mindbridge.benchmarks.artifacts import (
     sidecar_manifest_path,
     write_text_atomically,
 )
+from mindbridge.benchmarks.cli import parser as build_parser
+from mindbridge.benchmarks.cli_common import report, report_unit
 from mindbridge.contracts import ContractModel, Identifier, NonEmptyString, Sha256Hex
 from mindbridge.file_integrity import sha256_file
 
@@ -84,8 +86,8 @@ def _two(paths: Sequence[Path]) -> tuple[Path, Path]:
     return paths[0], paths[1]
 
 
-def _load_locomo(paths: Sequence[Path]) -> tuple[AmlCase, ...]:
-    return locomo.load(_one(paths))
+def _load_locomo_refined(paths: Sequence[Path]) -> tuple[AmlCase, ...]:
+    return locomo_refined.load(_one(paths))
 
 
 def _load_longmemeval(paths: Sequence[Path]) -> tuple[AmlCase, ...]:
@@ -132,9 +134,16 @@ class BenchmarkSpec:
     pipeline: Path
 
 
+AML_ENVIRONMENT = """environment:
+  MINDBRIDGE_AML_API_KEY  bearer token for --api-base-url; required, read from the
+                          environment so a recorded invocation never carries it"""
+
+
 BENCHMARKS: dict[str, BenchmarkSpec] = {
-    "locomo": BenchmarkSpec(
-        _load_locomo, emit_retrieved_context, _PIPELINES_ROOT / "locomo-refined" / "pipeline.py"
+    "locomo-refined": BenchmarkSpec(
+        _load_locomo_refined,
+        emit_retrieved_context,
+        _PIPELINES_ROOT / "locomo-refined" / "pipeline.py",
     ),
     "longmemeval": BenchmarkSpec(
         _load_longmemeval,
@@ -231,11 +240,12 @@ class _Arguments:
     top_k: int
     concurrency: int
     request_timeout_seconds: float
+    quiet: bool
 
 
-def main() -> None:
+def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
     """Load cases, replay them, and record predictions plus a manifest."""
-    arguments = _parse_arguments()
+    arguments = _parse_arguments(argv, prog)
     spec = BENCHMARKS[arguments.benchmark]
     deployment = load_deployment_snapshot(arguments.deployment_config_path)
     _require_compatible_existing_manifest(
@@ -251,7 +261,7 @@ def main() -> None:
     )
     api_key = os.environ.get("MINDBRIDGE_AML_API_KEY")
     if not api_key:
-        raise SystemExit("MINDBRIDGE_AML_API_KEY must be set")
+        raise ValueError("MINDBRIDGE_AML_API_KEY must be set")
     tenant_ids = asyncio.run(_connect_and_run(arguments, spec, cases, api_key))
     _write_manifest(arguments, deployment, tenant_ids)
 
@@ -337,6 +347,7 @@ async def _connect_and_run(
             output_path=arguments.output_path,
             tenant_prefix=arguments.tenant_prefix,
             request_timeout_seconds=arguments.request_timeout_seconds,
+            quiet=arguments.quiet,
         )
 
 
@@ -352,6 +363,7 @@ async def _run(
     output_path: Path,
     tenant_prefix: str,
     request_timeout_seconds: float = 600.0,
+    quiet: bool = False,
 ) -> dict[str, str]:
     """Run every not-yet-finished case and append its rows; resumable by id.
 
@@ -359,18 +371,30 @@ async def _run(
     row it would produce is already in `output_path`: `run_case` is not
     idempotent (each `/aml/add` call writes new memories), so re-running a
     finished case would duplicate memories server-side, not just output rows.
-    Chunks stay serial inside `run_case`; cases run concurrently up to
-    `concurrency`, and rows are appended (de-duplicated by id) as each case's
-    task completes, so a killed run leaves a prefix a rerun can resume from
-    exactly where it stopped.
+    One shared semaphore bounds `concurrency` requests in flight, so the bound
+    is on load the server actually sees rather than on how that load is grouped
+    into cases -- a single-case run parallelises its own chunks and questions
+    instead of running strictly serially. A second bound admits only
+    `concurrency` cases at a time, which is what keeps the resume guarantee
+    below true: `run_case` gathers all of its adds before it issues a single
+    search, so starting every case at once puts every case's adds ahead of any
+    case's searches in the shared FIFO queue and no case can finish -- and
+    therefore no row can be written -- until nearly the whole run's add phase
+    is done. A kill before that point left an empty output file even though
+    most `/aml/add` writes had landed, and because the rerun re-adds every
+    chunk it silently doubled the corpus it then scored against.
+
+    Rows are appended (de-duplicated by id) as each case's task completes, so a
+    killed run leaves a prefix a rerun can resume from exactly where it stopped.
     """
     existing_ids = _read_existing_ids(output_path)
     pending = tuple(case for case in cases if not _case_ids(case) <= existing_ids)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     semaphore = asyncio.Semaphore(concurrency)
+    case_slots = asyncio.Semaphore(concurrency)
 
-    async def bounded(case: AmlCase) -> list[dict[str, object]]:
-        async with semaphore:
+    async def run_bounded_case(case: AmlCase) -> list[dict[str, object]]:
+        async with case_slots:
             return await run_case(
                 client,
                 case,
@@ -378,13 +402,17 @@ async def _run(
                 benchmark=benchmark,
                 top_k=top_k,
                 emit=spec.emit,
+                semaphore=semaphore,
                 timeout=request_timeout_seconds,
             )
 
-    tasks = [asyncio.create_task(bounded(case)) for case in pending]
+    report(f"replaying {len(pending)} of {len(cases)} cases", quiet=quiet)
+    tasks = [asyncio.create_task(run_bounded_case(case)) for case in pending]
     with output_path.open("a", encoding="utf-8") as handle:
-        for task in asyncio.as_completed(tasks):
-            for row in await task:
+        for index, task in enumerate(asyncio.as_completed(tasks), start=1):
+            rows = await task
+            report_unit("case complete", index=index, total=len(pending), quiet=quiet)
+            for row in rows:
                 written_id = str(row["id"])
                 if written_id in existing_ids:
                     continue
@@ -402,12 +430,12 @@ async def _run(
 def _case_ids(case: AmlCase) -> set[str]:
     # Delegates to `row_id` (driver.py) rather than reconstructing the id
     # format inline: `run_case` doesn't always write
-    # `{case.user_id}#{question.question_id}` -- five of six loaders put
-    # their own "id" in the question payload, which overwrites it. Blocking 2
-    # (final review, 2026-08-17): this function used to hardcode the driver's
-    # id format, which never matched what those five benchmarks actually
-    # wrote, so `_run`'s pending-work check never saw a finished case as
-    # done and resumed runs silently re-added and re-searched everything.
+    # `{case.user_id}#{question.question_id}` -- every loader puts its own
+    # "id" in the question payload, which overwrites it. Blocking 2 (final
+    # review, 2026-08-17): this function used to hardcode the driver's id
+    # format, which never matched what those benchmarks actually wrote, so
+    # `_run`'s pending-work check never saw a finished case as done and
+    # resumed runs silently re-added and re-searched everything.
     return {row_id(case, question) for question in case.questions}
 
 
@@ -483,9 +511,18 @@ def _positive_int(raw: str) -> int:
     return value
 
 
-def _parse_arguments() -> _Arguments:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--benchmark", required=True, choices=sorted(BENCHMARKS))
+def _parse_arguments(argv: Sequence[str] | None, prog: str | None) -> _Arguments:
+    parser = build_parser(
+        prog=prog,
+        description="Run one Agent Memory Leaderboard benchmark against a deployed API.",
+        epilog=AML_ENVIRONMENT,
+    )
+    parser.add_argument(
+        "--benchmark",
+        required=True,
+        choices=sorted(BENCHMARKS),
+        help="which AML pipeline to replay",
+    )
     parser.add_argument(
         "--dataset",
         type=Path,
@@ -494,27 +531,64 @@ def _parse_arguments() -> _Arguments:
         required=True,
         help="one per positional argument the benchmark's loader takes, in order",
     )
-    parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--api-base-url", required=True)
-    parser.add_argument("--code-revision", required=True)
-    parser.add_argument("--deployment-config", type=Path, required=True)
-    parser.add_argument("--run-id", required=True)
+    parser.add_argument(
+        "-o",
+        "--output",
+        type=Path,
+        required=True,
+        help="JSONL rows to append to; a resumed run keeps the rows already there",
+    )
+    parser.add_argument(
+        "--api-base-url", required=True, help="base URL of the deployed MindBridge API"
+    )
+    parser.add_argument(
+        "--code-revision", required=True, help="git revision of the code under measurement"
+    )
+    parser.add_argument(
+        "--deployment-config",
+        type=Path,
+        required=True,
+        help="JSON description of the deployment that answered",
+    )
+    parser.add_argument(
+        "--run-id", required=True, help="identifier this run's tenants and manifest are pinned to"
+    )
     # No default: the server derives its half of the same mapping from its
     # own `MINDBRIDGE_AML_TENANT_PREFIX` (see `AmlRunManifest`'s
     # `client_derived_tenant_ids` docstring), which nothing on the wire
     # confirms. A default here would let an operator silently inherit a
     # value the deployment may not share; requiring it explicitly forces
     # that choice to be made on purpose (Important 3, task-13 review).
-    parser.add_argument("--tenant-prefix", required=True)
-    parser.add_argument("--top-k", type=int, default=20)
-    parser.add_argument("--concurrency", type=_positive_int, default=4)
+    parser.add_argument(
+        "--tenant-prefix",
+        required=True,
+        help="prefix the deployment agrees on; deliberately has no default",
+    )
+    parser.add_argument("--top-k", type=int, default=20, help="memories to retrieve per question")
+    parser.add_argument(
+        "--concurrency",
+        type=_positive_int,
+        default=4,
+        help=(
+            "requests in flight across every case; raising it needs "
+            "MINDBRIDGE_DATABASE_MAX_POOL_SIZE raised with it (see README)"
+        ),
+    )
     # Matches `cli_common.core_parser`'s `--request-timeout-seconds`, threaded
     # through to `driver.run_case` instead of that module's hardcoded
     # `timeout=600.0` on every `/aml/add` and `/aml/search` call (Cheap 5,
     # final review, 2026-08-17), and pinned in the manifest like every other
     # benchmark runner already pins it.
-    parser.add_argument("--request-timeout-seconds", type=float, default=600.0)
-    parsed = parser.parse_args()
+    parser.add_argument(
+        "--request-timeout-seconds", type=float, default=600.0, help="deadline for one request"
+    )
+    parser.add_argument(
+        "-q",
+        "--quiet",
+        action="store_true",
+        help="suppress the progress lines this replay writes to stderr",
+    )
+    parsed = parser.parse_args(argv)
     return _Arguments(
         benchmark=parsed.benchmark,
         dataset_paths=tuple(parsed.dataset),
@@ -527,6 +601,7 @@ def _parse_arguments() -> _Arguments:
         top_k=parsed.top_k,
         concurrency=parsed.concurrency,
         request_timeout_seconds=parsed.request_timeout_seconds,
+        quiet=parsed.quiet,
     )
 
 

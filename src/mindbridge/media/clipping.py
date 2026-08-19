@@ -165,6 +165,16 @@ def _cut_video(source: bytes, request: ClipRequest) -> MediaClip:
     with av.open(buffer, mode="w", format="mp4") as container:
         stream = container.add_stream("libx264", rate=_stream_rate(request.frames_per_second))
         stream.width, stream.height, stream.pix_fmt = width, height, "yuv420p"
+        # Single-threaded for the same reason the decode side is, and set here because the
+        # decode setting does not reach it: libx264 carries AV_CODEC_CAP_OTHER_THREADS, so
+        # libavcodec leaves the pool to x264 itself and `thread_type` never touches it.
+        # Measured on PyAV 16.1.0: this loop took the process from 1 OS thread to 7, in the
+        # same Worker that loads torchvision's OpenMP runtime. Whether that pool was the one
+        # that deadlocked is not established -- the reproduction was one run in three and
+        # nobody caught it in the act -- so this closes the remaining way to start native
+        # threads here rather than claiming the earlier fix was aimed wrong.
+        stream.thread_count = 1
+        stream.thread_type = "NONE"
         # Stamp real offsets on a millisecond timeline: rounding the rate to an
         # integer would make a fractional-fps clip play back at the wrong speed
         # and disagree with the duration recorded for it.
@@ -192,7 +202,26 @@ def _sample_video_frames(source: bytes, request: ClipRequest) -> list[Any]:
     next_sample_seconds = start_seconds
     with av.open(io.BytesIO(source)) as container:
         stream = container.streams.video[0]
-        stream.thread_type = "AUTO"
+        # Single-threaded on purpose. FFmpeg frame threading intermittently deadlocks against
+        # the OpenMP runtime torchvision loads, and the Worker cuts clips in the same process as
+        # the local embedder, so AUTO hung raw-media jobs until their Celery time limit. It
+        # reproduced roughly one run in three, which is why the cheap fix is to not start the
+        # pool at all rather than to order the imports.
+        # This is not free: a 30s 720p source decodes in 1.7s here against 0.35s with AUTO, and
+        # the gap widens with resolution.
+        stream.thread_type = "NONE"
+        # Which is why this seeks rather than decoding from byte zero. `cut_clips` runs once per
+        # span, so without a seek a source costs sum(span end offset) rather than
+        # sum(span length): a 30 min recording with 32 spans decoded ~28,800 source-seconds,
+        # ran past `task_soft_time_limit`, and `SoftTimeLimitExceeded` being in `autoretry_for`
+        # then re-ran the identical doomed decode up to `max_retries` times. Measured on a 60s
+        # 720p source with 8 five-second spans: 7.57s without the seek against 1.38s with it.
+        # `backward=True` is load-bearing -- it lands on the keyframe at or before the target,
+        # so the `frame.time < start_seconds` filter below discards the pre-roll instead of the
+        # span losing its opening frames. The offset is in microseconds because no stream is
+        # passed, which keeps the untyped `stream.time_base` out of the arithmetic.
+        if start_seconds > 0:
+            container.seek(int(start_seconds * 1_000_000), backward=True)
         for frame in container.decode(stream):
             if frame.time is None:
                 continue

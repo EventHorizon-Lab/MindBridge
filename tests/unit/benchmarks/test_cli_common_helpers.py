@@ -9,6 +9,8 @@ from mindbridge.benchmarks.cli_common import (
     CoreArguments,
     connected_memory,
     index_prepared,
+    report,
+    report_unit,
     select_by_id,
 )
 from mindbridge.sdk import MindBridge
@@ -83,12 +85,12 @@ def test_select_by_id_rejects_a_duplicated_request() -> None:
 
 def test_select_by_id_names_the_benchmark_unit_in_its_refusal() -> None:
     """The label is the part an operator reads, so each benchmark keeps its own wording."""
-    with pytest.raises(ValueError, match=r"^unknown LoCoMo sample IDs: nope$"):
+    with pytest.raises(ValueError, match=r"^unknown LoCoMo-Refined sample IDs: nope$"):
         select_by_id(
             (_Prepared("conv-01"),),
             ("nope",),
             key=lambda i: i.unit_id,
-            label="LoCoMo sample IDs",
+            label="LoCoMo-Refined sample IDs",
         )
 
 
@@ -156,4 +158,25 @@ def _arguments() -> CoreArguments:
         request_concurrency=4,
         request_timeout_seconds=1_800.0,
         overwrite=False,
+        quiet=True,
     )
+
+
+def test_progress_lines_go_to_stderr_so_stdout_stays_the_artifact(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A runner's stdout is its machine-readable output; progress must never land there."""
+    report("running 3 conversations", quiet=False)
+    report_unit("conversation conv-1", index=1, total=3, quiet=False)
+
+    streams = capsys.readouterr()
+    assert streams.out == ""
+    assert streams.err == "running 3 conversations\n[1/3] conversation conv-1\n"
+
+
+def test_quiet_silences_every_progress_line(capsys: pytest.CaptureFixture[str]) -> None:
+    report("running 3 conversations", quiet=True)
+    report_unit("conversation conv-1", index=1, total=3, quiet=True)
+
+    streams = capsys.readouterr()
+    assert (streams.out, streams.err) == ("", "")

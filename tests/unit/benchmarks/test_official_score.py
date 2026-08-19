@@ -27,7 +27,7 @@ def test_official_score_binds_metrics_to_the_scored_predictions(tmp_path: Path) 
         manifest_path=manifest_path,
         predictions_path=predictions_path,
         scorer_output_path=scorer_output_path,
-        scorer_repository="snap-research/locomo",
+        scorer_repository="mem-eval-suite/LoCoMo_refined",
         scorer_revision="3eb6f2c5",
         scorer_command="python evaluation/evaluate.py --data predictions.json",
         judge_model="gpt-4o-mini",
@@ -36,7 +36,7 @@ def test_official_score_binds_metrics_to_the_scored_predictions(tmp_path: Path) 
         metrics={"f1": 45.65},
     )
 
-    assert score.benchmark == "LoCoMo"
+    assert score.benchmark == "LoCoMo-Refined"
     assert score.run_id == "run_01"
     assert score.predictions_sha256 == sha256_file(predictions_path)
     assert score.scorer_output_sha256 == sha256_file(scorer_output_path)
@@ -56,7 +56,7 @@ def test_official_score_rejects_predictions_the_manifest_did_not_produce(tmp_pat
             manifest_path=manifest_path,
             predictions_path=predictions_path,
             scorer_output_path=scorer_output_path,
-            scorer_repository="snap-research/locomo",
+            scorer_repository="mem-eval-suite/LoCoMo_refined",
             scorer_revision="3eb6f2c5",
             scorer_command="python evaluation/evaluate.py",
             judge_model="gpt-4o-mini",
@@ -78,7 +78,7 @@ def test_official_score_requires_at_least_one_metric(tmp_path: Path) -> None:
             manifest_path=manifest_path,
             predictions_path=predictions_path,
             scorer_output_path=scorer_output_path,
-            scorer_repository="snap-research/locomo",
+            scorer_repository="mem-eval-suite/LoCoMo_refined",
             scorer_revision="3eb6f2c5",
             scorer_command="python evaluation/evaluate.py",
             judge_model=None,
@@ -130,7 +130,7 @@ def _write_manifest(directory: Path, predictions_path: Path) -> Path:
     manifest_path.write_text(
         json.dumps(
             {
-                "benchmark": "LoCoMo",
+                "benchmark": "LoCoMo-Refined",
                 "run_id": "run_01",
                 "predictions_sha256": sha256_file(predictions_path),
             }
@@ -163,7 +163,7 @@ def test_the_metric_flag_is_required_so_omitting_it_is_a_usage_error(
             "--scorer-output",
             "s.json",
             "--scorer-repository",
-            "snap-research/locomo",
+            "mem-eval-suite/LoCoMo_refined",
             "--scorer-revision",
             "3eb6f2c5",
             "--scorer-command",
@@ -174,4 +174,4 @@ def test_the_metric_flag_is_required_so_omitting_it_is_a_usage_error(
     )
 
     with pytest.raises(SystemExit):
-        official_score._parse_arguments()
+        official_score._parse_arguments(None, None)

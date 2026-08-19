@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -24,6 +25,8 @@ from mindbridge.benchmarks.cli_common import (
     index_prepared,
     media_arguments,
     media_manifest,
+    report,
+    report_unit,
     select_by_id,
     write_run_artifacts,
 )
@@ -68,9 +71,9 @@ class _Arguments(MediaArguments):
     question_ids: tuple[str, ...]
 
 
-def main() -> None:
+def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
     """Run selected questions and emit JSON accepted by the official judge notebook."""
-    arguments = _parse_arguments()
+    arguments = _parse_arguments(argv, prog)
     questions = select_by_id(
         load_egotempo(arguments.dataset_path),
         arguments.question_ids,
@@ -85,8 +88,10 @@ def main() -> None:
             segment.media_objects for video in prepared for segment in video.segments
         ),
     )
+    report(f"running {len(questions)} questions", quiet=arguments.quiet)
     results = asyncio.run(_run(arguments, questions, prepared))
     _write_artifacts(arguments, questions, prepared, results, deployment)
+    report(f"wrote {arguments.output_path}", quiet=arguments.quiet)
 
 
 async def _run(
@@ -100,7 +105,13 @@ async def _run(
     prepared_by_id = {video.video_id: video for video in prepared}
     async with connected_memory(arguments) as memory:
         unordered: list[EgoTempoQuestionResult] = []
-        for clip_id, clip_questions in questions_by_clip.items():
+        for index, (clip_id, clip_questions) in enumerate(questions_by_clip.items(), start=1):
+            report_unit(
+                f"clip {clip_id}",
+                index=index,
+                total=len(questions_by_clip),
+                quiet=arguments.quiet,
+            )
             unordered.extend(
                 await run_egotempo_clip(
                     memory,
@@ -175,16 +186,27 @@ def _select_prepared(
     return tuple(by_id[clip_id] for clip_id in clip_ids)
 
 
-def _parse_arguments() -> _Arguments:
+def _parse_arguments(argv: Sequence[str] | None, prog: str | None) -> _Arguments:
     parser = add_media_arguments(
-        core_parser(tenant_prefix="benchmark_egotempo"),
+        core_parser(tenant_prefix="benchmark_egotempo", prog=prog, description=__doc__),
         device_id="egotempo_camera",
     )
-    parser.add_argument("--prepared-media", type=Path, required=True)
-    parser.add_argument("--source-revision", required=True)
-    parser.add_argument("--evaluator-revision", required=True)
-    parser.add_argument("--question-id", action="append", default=[])
-    parsed = parser.parse_args()
+    parser.add_argument(
+        "--prepared-media", type=Path, required=True, help="manifest of clips prepared for ingest"
+    )
+    parser.add_argument(
+        "--source-revision", required=True, help="revision of the official EgoTempo release"
+    )
+    parser.add_argument(
+        "--evaluator-revision", required=True, help="revision of the official evaluator"
+    )
+    parser.add_argument(
+        "--question-id",
+        action="append",
+        default=[],
+        help="official question to run; repeatable, default the whole release",
+    )
+    parsed = parser.parse_args(argv)
     return media_arguments(
         _Arguments,
         parsed,

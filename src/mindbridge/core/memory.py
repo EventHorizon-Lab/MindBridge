@@ -44,6 +44,7 @@ class EmbeddedObjectType(str, Enum):
     EVENT = "event"
     CLAIM = "claim"
     MEMORY_RECORD = "memory_record"
+    ENTITY = "entity"
 
 
 class MemoryType(str, Enum):

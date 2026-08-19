@@ -131,6 +131,7 @@ def _require_output_identity(
     valid_graph_embedding_objects = {
         *((EmbeddedObjectType.EVENT, str(event.event_id)) for event in output.events),
         *((EmbeddedObjectType.CLAIM, str(claim.claim_id)) for claim in output.claims),
+        *((EmbeddedObjectType.ENTITY, str(entity.entity_id)) for entity in output.entities),
     }
     if any(
         embedding.object_type is not EmbeddedObjectType.EVIDENCE_SPAN

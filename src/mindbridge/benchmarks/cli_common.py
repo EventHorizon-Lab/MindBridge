@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import os
+import sys
 from collections.abc import AsyncIterator, Callable, Iterable, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -26,6 +27,7 @@ from mindbridge.benchmarks.artifacts import (
     sidecar_manifest_path,
     write_text_atomically,
 )
+from mindbridge.benchmarks.cli import parser as build_parser
 from mindbridge.contracts import ContractModel, Identifier, NonEmptyString, Sha256Hex
 from mindbridge.models import EmbedTask
 from mindbridge.prompts import ANSWER_FROM_EVIDENCE_PROMPT
@@ -54,6 +56,7 @@ class CoreArguments:
     request_concurrency: int
     request_timeout_seconds: float
     overwrite: bool
+    quiet: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,20 +72,65 @@ class MediaArguments(CoreArguments):
     processing_timeout_seconds: float
 
 
-def core_parser(*, tenant_prefix: str) -> argparse.ArgumentParser:
+BENCHMARK_ENVIRONMENT = """environment:
+  MINDBRIDGE_API_KEY    bearer token for --api-base-url; read from the environment so a
+                        recorded invocation never carries the credential it used"""
+
+
+def core_parser(
+    *,
+    tenant_prefix: str,
+    prog: str | None = None,
+    description: str | None = None,
+) -> argparse.ArgumentParser:
     """Build the parser every benchmark CLI starts from."""
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", type=Path, required=True)
-    parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--api-base-url", required=True)
-    parser.add_argument("--code-revision", required=True)
-    parser.add_argument("--deployment-config", type=Path, required=True)
-    parser.add_argument("--run-id", required=True)
-    parser.add_argument("--tenant-prefix", default=tenant_prefix)
-    parser.add_argument("--recall-limit", type=int, default=20)
-    parser.add_argument("--request-concurrency", type=int, default=4)
-    parser.add_argument("--request-timeout-seconds", type=float, default=1_800.0)
-    parser.add_argument("--overwrite", action="store_true")
+    parser = build_parser(prog=prog, description=description, epilog=BENCHMARK_ENVIRONMENT)
+    parser.add_argument(
+        "--dataset", type=Path, required=True, help="official dataset release to replay"
+    )
+    parser.add_argument(
+        "-o",
+        "--output",
+        type=Path,
+        required=True,
+        help="predictions file to write; its manifest goes beside it as .manifest.json",
+    )
+    parser.add_argument(
+        "--api-base-url", required=True, help="base URL of the deployed MindBridge API to measure"
+    )
+    parser.add_argument(
+        "--code-revision", required=True, help="git revision of the code under measurement"
+    )
+    parser.add_argument(
+        "--deployment-config",
+        type=Path,
+        required=True,
+        help="JSON description of the deployment that answered, pinned into the manifest",
+    )
+    parser.add_argument(
+        "--run-id", required=True, help="identifier isolating this run's tenants from every other"
+    )
+    parser.add_argument(
+        "--tenant-prefix", default=tenant_prefix, help="prefix for the tenants this run writes to"
+    )
+    parser.add_argument(
+        "--recall-limit", type=int, default=20, help="memories to retrieve per question"
+    )
+    parser.add_argument(
+        "--request-concurrency", type=int, default=4, help="in-flight API requests per unit"
+    )
+    parser.add_argument(
+        "--request-timeout-seconds", type=float, default=1_800.0, help="deadline for one request"
+    )
+    parser.add_argument(
+        "--overwrite", action="store_true", help="replace existing predictions and manifest"
+    )
+    parser.add_argument(
+        "-q",
+        "--quiet",
+        action="store_true",
+        help="suppress the progress lines this run writes to stderr",
+    )
     return parser
 
 
@@ -92,10 +140,31 @@ def add_media_arguments(
     device_id: str,
 ) -> argparse.ArgumentParser:
     """Add the ingest-and-wait knobs every benchmark that uploads media shares."""
-    parser.add_argument("--device-id", default=device_id)
-    parser.add_argument("--poll-interval-seconds", type=float, default=1.0)
-    parser.add_argument("--processing-timeout-seconds", type=float, default=1_800.0)
+    parser.add_argument("--device-id", default=device_id, help="device identity to ingest as")
+    parser.add_argument(
+        "--poll-interval-seconds",
+        type=float,
+        default=1.0,
+        help="delay between processing-status polls",
+    )
+    parser.add_argument(
+        "--processing-timeout-seconds",
+        type=float,
+        default=1_800.0,
+        help="deadline for one observation to finish processing",
+    )
     return parser
+
+
+def report(message: str, *, quiet: bool) -> None:
+    """Write one progress line to stderr so stdout stays the machine-readable artifact."""
+    if not quiet:
+        print(message, file=sys.stderr, flush=True)
+
+
+def report_unit(label: str, *, index: int, total: int, quiet: bool) -> None:
+    """Announce one unit before it runs, which is the only output a long run gives."""
+    report(f"[{index}/{total}] {label}", quiet=quiet)
 
 
 _ArgumentsT = TypeVar("_ArgumentsT", bound=CoreArguments)
@@ -140,6 +209,7 @@ def _core_values(parsed: argparse.Namespace) -> dict[str, object]:
         "request_concurrency": parsed.request_concurrency,
         "request_timeout_seconds": parsed.request_timeout_seconds,
         "overwrite": parsed.overwrite,
+        "quiet": parsed.quiet,
     }
 
 

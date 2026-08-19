@@ -8,8 +8,8 @@ from mindbridge.prompts import ALL_PROMPTS, PromptSpec
 _EXPECTED_FINGERPRINTS = {
     "active_speaker_v2": "0e6f8763910e580cbc3a9323dde717119eb5fd481e532af3f19c5a6cfb61b1cb",
     "aml_extract_facts_v1": "55d9ba0c29cc04247730e6b756ada69e2a20f46f15af58d0be1bcace97cd2d3d",
-    "answer_from_evidence_v10": (
-        "5b1fa751f8b9cdc87584a94048b0dcf514948db1c7151edc14e3542a3f29d84b"
+    "answer_from_evidence_v11": (
+        "5cf69e81875876f2e2a5fca60735652c5c76de01bc3b14d09e59512256604a73"
     ),
     "consolidate_claims_v2": ("65e3de18448f2879ef8bc83c19290a46cf66d64052230242ae96851a5ecc93a2"),
     "consolidate_episodes_v2": ("f2455d3e72319d68f94a1f4f7f4fab3845f3a9e34f138823013f346228d13c22"),

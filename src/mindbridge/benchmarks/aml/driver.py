@@ -7,11 +7,12 @@ server, not just an in-process one.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable, Sequence
 
 import httpx
 
-from mindbridge.benchmarks.aml.cases import AmlCase, AmlQuestion, chunk_messages
+from mindbridge.benchmarks.aml.cases import AmlCase, AmlQuestion, Message, chunk_messages
 
 EmitFn = Callable[[AmlQuestion, Sequence[dict[str, object]]], dict[str, object]]
 
@@ -46,9 +47,9 @@ def row_id(case: AmlCase, question: AmlQuestion) -> str:
 
     `run_case` builds a row as `{"id": f"{case.user_id}#{question.question_id}",
     ...}` and then applies `row.update(question.payload)` -- so whenever a
-    loader's payload carries its own `"id"` (every loader but `locomo.py`),
-    that value wins over the driver's own format. This is the single place
-    that resolves which one applies, so a caller (the CLI's resume check,
+    loader's payload carries its own `"id"` (all six do), that value wins over
+    the driver's own format. This is the single place that resolves which one
+    applies, so a caller (the CLI's resume check,
     Blocking 2 in the 2026-08-17 final review) can predict a row's id without
     duplicating -- and risking drifting from -- `run_case`'s own logic.
     """
@@ -74,46 +75,115 @@ async def run_case(
     benchmark: str,
     top_k: int,
     emit: EmitFn,
+    semaphore: asyncio.Semaphore,
     timeout: float = _DEFAULT_TIMEOUT_SECONDS,
 ) -> list[dict[str, object]]:
-    """Add every chunk in order, then emit one scored-pipeline row per question."""
+    """Add every chunk, then emit one scored-pipeline row per question.
+
+    Both phases run concurrently under `semaphore`, which bounds requests in
+    flight across every case sharing it. Chunks used to be serialised "to
+    preserve temporal order", but nothing in the add path reads prior state:
+    `extract_memories` is stateless per chunk, each memory's `occurred_at`
+    comes from that chunk's own message timestamps, and `remember` keys on a
+    content digest, so two chunks extracting the same fact converge on one
+    memory rather than racing. Adds still complete before any search: a search
+    must see every memory the case wrote.
+    """
     user_id = eval_user_id(run_id, benchmark, case.user_id)
     session_id = user_id
     _require_identifier_length(user_id, "eval user_id")
-
-    for index, chunk in enumerate(chunk_messages(case.messages)):
-        request_id = f"{user_id}:chunk-{index}"
+    chunks = tuple(chunk_messages(case.messages))
+    request_ids = tuple(f"{user_id}:chunk-{index}" for index in range(len(chunks)))
+    # Validated up front, not inside the gathered coroutines: an overlong id must
+    # still fail before this case sends its first request, not after some are away.
+    for request_id in request_ids:
         _require_identifier_length(request_id, "eval request_id")
-        payload = {
-            "request_id": request_id,
-            "messages": list(chunk),
-            "user_id": user_id,
-            "session_id": session_id,
-        }
-        response = await client.post("/aml/add", json=payload, timeout=timeout)
-        response.raise_for_status()
-        body = response.json()
-        if (
-            body.get("request_id") != request_id
-            or body.get("user_id") != user_id
-            or body.get("session_id") != session_id
-        ):
-            raise ValueError(f"add did not echo its identifiers for {request_id}")
 
-    rows: list[dict[str, object]] = []
-    for question in case.questions:
+    await asyncio.gather(
+        *(
+            _add_chunk(
+                client,
+                semaphore,
+                request_id=request_id,
+                chunk=chunk,
+                user_id=user_id,
+                session_id=session_id,
+                timeout=timeout,
+            )
+            for request_id, chunk in zip(request_ids, chunks, strict=True)
+        )
+    )
+
+    return list(
+        await asyncio.gather(
+            *(
+                _search_question(
+                    client,
+                    semaphore,
+                    case,
+                    question,
+                    user_id=user_id,
+                    top_k=top_k,
+                    emit=emit,
+                    timeout=timeout,
+                )
+                for question in case.questions
+            )
+        )
+    )
+
+
+async def _add_chunk(
+    client: httpx.AsyncClient,
+    semaphore: asyncio.Semaphore,
+    *,
+    request_id: str,
+    chunk: Sequence[Message],
+    user_id: str,
+    session_id: str,
+    timeout: float,
+) -> None:
+    payload = {
+        "request_id": request_id,
+        "messages": list(chunk),
+        "user_id": user_id,
+        "session_id": session_id,
+    }
+    async with semaphore:
+        response = await client.post("/aml/add", json=payload, timeout=timeout)
+    response.raise_for_status()
+    body = response.json()
+    if (
+        body.get("request_id") != request_id
+        or body.get("user_id") != user_id
+        or body.get("session_id") != session_id
+    ):
+        raise ValueError(f"add did not echo its identifiers for {request_id}")
+
+
+async def _search_question(
+    client: httpx.AsyncClient,
+    semaphore: asyncio.Semaphore,
+    case: AmlCase,
+    question: AmlQuestion,
+    *,
+    user_id: str,
+    top_k: int,
+    emit: EmitFn,
+    timeout: float,
+) -> dict[str, object]:
+    async with semaphore:
         response = await client.post(
             "/aml/search",
             json={"query": question.question, "user_id": user_id, "top_k": top_k},
             timeout=timeout,
         )
-        response.raise_for_status()
-        retrieved = response.json().get("data", [])
-        row: dict[str, object] = {"id": row_id(case, question), "question": question.question}
-        row.update(question.payload)
-        row.update(emit(question, retrieved))
-        rows.append(row)
-    return rows
+    response.raise_for_status()
+    retrieved = response.json().get("data", [])
+    row: dict[str, object] = {"id": row_id(case, question), "question": question.question}
+    row.update(question.payload)
+    row.update(emit(question, retrieved))
+    return row
 
 
 def _joined(retrieved: Sequence[dict[str, object]]) -> str:
@@ -131,7 +201,7 @@ def emit_retrieved_context(
     _question: AmlQuestion,
     retrieved: Sequence[dict[str, object]],
 ) -> dict[str, object]:
-    """LoCoMo, LongMemEval, and BEAM all read `retrieved_context`."""
+    """LoCoMo-Refined, LongMemEval, and BEAM all read `retrieved_context`."""
     return {"retrieved_context": _joined(retrieved)}
 
 

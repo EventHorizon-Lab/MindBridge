@@ -9,10 +9,10 @@ labeled pairs before anyone pays for a second serving instance.
 
 from __future__ import annotations
 
-import argparse
 import asyncio
 import json
 import platform
+from collections.abc import Sequence
 from datetime import datetime, timezone
 from importlib.metadata import version
 from pathlib import Path
@@ -21,6 +21,7 @@ from typing import Literal
 
 from pydantic import AwareDatetime, Field
 
+from mindbridge.benchmarks.cli import parser as build_parser
 from mindbridge.benchmarks.runtime import dot_product
 from mindbridge.contracts import ContractModel, NonEmptyString
 from mindbridge.models import EmbedRequest, EmbedTask, ModelInput, TextPart
@@ -223,22 +224,35 @@ async def _close(embedder: object) -> None:
         await close()
 
 
-def main() -> None:
+def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
     """Compare both adapters and emit a machine-readable manifest."""
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--pairs", type=Path, required=True)
+    parser = build_parser(prog=prog, description=__doc__)
     parser.add_argument(
-        "--retrieval-model-id", default="jinaai/jina-embeddings-v5-omni-small-retrieval"
+        "--pairs", type=Path, required=True, help="prepared pair corpus both adapters answer"
     )
-    parser.add_argument("--retrieval-revision", required=True)
+    parser.add_argument(
+        "--retrieval-model-id",
+        default="jinaai/jina-embeddings-v5-omni-small-retrieval",
+        help="Hugging Face repository of the retrieval adapter",
+    )
+    parser.add_argument(
+        "--retrieval-revision", required=True, help="revision of the retrieval adapter"
+    )
     parser.add_argument(
         "--text-matching-model-id",
         default="jinaai/jina-embeddings-v5-omni-small-text-matching",
+        help="Hugging Face repository of the text-matching adapter",
     )
-    parser.add_argument("--text-matching-revision", required=True)
-    parser.add_argument("--device", default="cuda")
-    parser.add_argument("--dimension", type=int, default=1_024)
-    arguments = parser.parse_args()
+    parser.add_argument(
+        "--text-matching-revision",
+        required=True,
+        help="revision of the text-matching adapter",
+    )
+    parser.add_argument("--device", default="cuda", help="torch device to load both adapters on")
+    parser.add_argument(
+        "--dimension", type=int, default=1_024, help="Matryoshka dimension to compare at"
+    )
+    arguments = parser.parse_args(argv)
 
     corpus = PairCorpus.model_validate_json(arguments.pairs.read_text(encoding="utf-8"))
     result = asyncio.run(

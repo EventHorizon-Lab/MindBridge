@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, cast
@@ -23,6 +24,7 @@ from mindbridge.benchmarks.cli_common import (
     media_arguments,
     media_manifest,
     predictions_jsonl,
+    report,
     select_by_id,
     write_run_artifacts,
 )
@@ -69,9 +71,9 @@ class _Arguments(MediaArguments):
     question_indices: tuple[int, ...]
 
 
-def main() -> None:
+def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
     """Run one official split and emit JSONL accepted by its released evaluators."""
-    arguments = _parse_arguments()
+    arguments = _parse_arguments(argv, prog)
     questions = select_by_id(
         load_mm_lifelong(arguments.dataset_path, arguments.split),
         arguments.question_indices,
@@ -84,8 +86,12 @@ def main() -> None:
         arguments.deployment_config_path,
         require_worker=any(segment.media_objects for segment in prepared.segments),
     )
+    # Per-unit lines would have to come from inside the runner, which owns the
+    # concurrency this benchmark ingests with; the run announces its size instead.
+    report(f"running {len(questions)} questions", quiet=arguments.quiet)
     results = asyncio.run(_run(arguments, questions, prepared))
     _write_artifacts(arguments, questions, prepared, results, deployment)
+    report(f"wrote {arguments.output_path}", quiet=arguments.quiet)
 
 
 async def _run(
@@ -142,20 +148,31 @@ def _write_artifacts(
     write_run_artifacts(arguments.output_path, predictions, manifest)
 
 
-def _parse_arguments() -> _Arguments:
+def _parse_arguments(argv: Sequence[str] | None, prog: str | None) -> _Arguments:
     parser = add_media_arguments(
-        core_parser(tenant_prefix="benchmark_mm_lifelong"),
+        core_parser(tenant_prefix="benchmark_mm_lifelong", prog=prog, description=__doc__),
         device_id="mm_lifelong_camera",
     )
-    parser.add_argument("--prepared-media", type=Path, required=True)
+    parser.add_argument(
+        "--prepared-media", type=Path, required=True, help="manifest of prepared timeline segments"
+    )
     parser.add_argument(
         "--split",
         choices=("day_test", "week_test", "month_train", "month_val"),
         required=True,
+        help="official split to replay",
     )
-    parser.add_argument("--source-revision", required=True)
-    parser.add_argument("--question-index", type=int, action="append", default=[])
-    parsed = parser.parse_args()
+    parser.add_argument(
+        "--source-revision", required=True, help="revision of the official MM-Lifelong release"
+    )
+    parser.add_argument(
+        "--question-index",
+        type=int,
+        action="append",
+        default=[],
+        help="official question index to run; repeatable, default the whole split",
+    )
+    parsed = parser.parse_args(argv)
     return media_arguments(
         _Arguments,
         parsed,

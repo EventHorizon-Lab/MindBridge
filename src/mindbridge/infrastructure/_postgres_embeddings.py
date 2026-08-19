@@ -41,17 +41,33 @@ async def read_embedding_column_dimension(pool: DatabasePool) -> int:
     return int(str(row[0]).removeprefix("vector(").removesuffix(")"))
 
 
-async def write_embedding(pool: DatabasePool, embedding: EmbeddingRecord) -> bool:
+async def write_embedding(
+    pool: DatabasePool,
+    embedding: EmbeddingRecord,
+    *,
+    allow_reencoding: bool = False,
+) -> bool:
     """Insert one immutable model-versioned vector; return false for a retry."""
     async with tenant_connection(pool, embedding.tenant_id) as connection:
-        return await write_embedding_on_connection(connection, embedding)
+        return await write_embedding_on_connection(
+            connection, embedding, allow_reencoding=allow_reencoding
+        )
 
 
 async def write_embedding_on_connection(
     connection: DatabaseConnection,
     embedding: EmbeddingRecord,
+    *,
+    allow_reencoding: bool = False,
 ) -> bool:
-    """Write a vector inside a caller-owned transaction."""
+    """Write a vector inside a caller-owned transaction.
+
+    `allow_reencoding` is the caller asserting that this `embedding_id` can only ever
+    encode one text, so a stored vector that differs is encoder noise rather than
+    content drift. Only a caller can know that: the guarantee comes from how the ID was
+    derived, which this layer cannot see. It defaults to false, so a caller that has not
+    thought about it still gets the strict comparison.
+    """
     vector = Vector(list(embedding.values))
     cursor = await connection.execute(
         """
@@ -114,7 +130,19 @@ async def write_embedding_on_connection(
     if row is None:
         raise MemoryIntegrityError("embedding conflict could not be resolved")
     existing_id, normalized, same_values = cast(tuple[str, bool, bool], row)
-    if existing_id == embedding.embedding_id and normalized == embedding.normalized and same_values:
+    # Two independent reasons a differing vector can be legitimate, each known at a
+    # different layer. An entity's embedding_id hashes the casefolded name the vector
+    # encodes, so any stored vector for that ID encodes the same text and re-encoding it is
+    # expected: a later observation that mentions the entity again batches the name with
+    # different neighbouring texts, and that padding alone moves the vector well past this
+    # comparison's tolerance -- that is a property of the object type, true everywhere.
+    # `allow_reencoding` is the same guarantee arrived at per call site, for IDs whose text
+    # is pinned upstream. Anything else re-encoding into a different vector is content drift.
+    if (
+        existing_id == embedding.embedding_id
+        and normalized == embedding.normalized
+        and (same_values or allow_reencoding or embedding.object_type is EmbeddedObjectType.ENTITY)
+    ):
         return False
     raise DomainInvariantError("embedding version already stores different vector content")
 
@@ -132,6 +160,12 @@ async def search_embeddings(
         )
     vector = Vector(list(search.values))
     async with tenant_connection(pool, search.tenant_id) as connection:
+        # Inert while no HNSW index exists: migration 0018 dropped the one this deployment
+        # shipped with, because RLS makes every query tenant-selective and the planner
+        # always reaches a tenant's vectors through embeddings_space_search_idx and sorts
+        # them exactly. Kept because it is what makes a filtered approximate search return
+        # a full LIMIT instead of silently fewer rows, so a deployment that adds the index
+        # back for one very large tenant is already correct.
         await connection.execute("SET LOCAL hnsw.iterative_scan = strict_order")
         cursor = await connection.execute(
             """

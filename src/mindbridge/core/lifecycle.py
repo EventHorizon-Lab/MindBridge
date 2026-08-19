@@ -14,14 +14,22 @@ from mindbridge.core.memory import MemoryRecord, MemoryState
 
 @dataclass(frozen=True, slots=True)
 class MemoryStrengthPolicy:
-    """Calibratable coefficients and state thresholds for one deployment."""
+    """Calibratable coefficients and state thresholds for one deployment.
+
+    `age_decay_weight` is strength lost per idle day, so a memory cools after
+    `salience / age_decay_weight` unused days. The default targets 100 days at the median 0.5
+    salience. See technical-architecture.md 8.3 for why the age term must stay linear.
+    """
 
     access_weight: float = 1.0
     positive_feedback_weight: float = 1.0
     negative_feedback_weight: float = 1.0
-    age_decay_weight: float = 0.05
+    age_decay_weight: float = 0.005
     strengthen_at: float = 1.25
     cold_below: float = 0.0
+    # Strength at which a cold memory also drops its rebuildable derived representations.
+    # None keeps compression off, so an upgrade never starts discarding artifacts on its own.
+    compress_below: float | None = None
 
     def __post_init__(self) -> None:
         values = (
@@ -46,6 +54,10 @@ class MemoryStrengthPolicy:
             raise DomainInvariantError("memory strength weights must be non-negative")
         if self.cold_below >= self.strengthen_at:
             raise DomainInvariantError("cold threshold must be below strengthen threshold")
+        if self.compress_below is not None and not (
+            math.isfinite(self.compress_below) and self.compress_below <= self.cold_below
+        ):
+            raise DomainInvariantError("compression threshold must be finite and at most cold")
 
 
 DEFAULT_MEMORY_STRENGTH_POLICY = MemoryStrengthPolicy()
@@ -56,7 +68,12 @@ def calculate_memory_strength(
     evaluated_at: datetime,
     policy: MemoryStrengthPolicy = DEFAULT_MEMORY_STRENGTH_POLICY,
 ) -> float:
-    """Calculate one explainable score from retained counters and logarithmic age decay."""
+    """Calculate one explainable score from retained counters and linear age decay.
+
+    Access still saturates logarithmically — the tenth recall of a memory says less than the
+    second. Idle time does not: it is a steady loss of strength per day, which is both what makes
+    the retention window tunable (see MemoryStrengthPolicy) and the simpler thing to explain.
+    """
     require_aware_datetime(evaluated_at, "evaluated_at")
     last_activity_at = memory.last_accessed_at or memory.created_at
     if evaluated_at < last_activity_at:
@@ -67,7 +84,7 @@ def calculate_memory_strength(
         + policy.access_weight * math.log1p(memory.useful_access_count)
         + policy.positive_feedback_weight * memory.positive_feedback_count
         - policy.negative_feedback_weight * memory.negative_feedback_count
-        - policy.age_decay_weight * math.log1p(age_days)
+        - policy.age_decay_weight * age_days
     )
 
 
@@ -76,7 +93,12 @@ def evolve_memory_strength(
     evaluated_at: datetime,
     policy: MemoryStrengthPolicy = DEFAULT_MEMORY_STRENGTH_POLICY,
 ) -> MemoryRecord:
-    """Return the scored lifecycle state while preserving compressed records."""
+    """Return the scored lifecycle state while preserving compressed records.
+
+    Compression is one-way by design: a recalled memory revives from `COLD`, but nothing
+    re-derives discarded clips, and the documented state machine gives `COMPRESSED` no edge but
+    deletion. So this only advances into it, never back out.
+    """
     strength = calculate_memory_strength(memory, evaluated_at, policy)
     state: MemoryState
     if memory.state is MemoryState.COMPRESSED:
@@ -84,7 +106,11 @@ def evolve_memory_strength(
     elif strength >= policy.strengthen_at:
         state = MemoryState.STRENGTHENED
     elif strength <= policy.cold_below:
-        state = MemoryState.COLD
+        state = (
+            MemoryState.COMPRESSED
+            if policy.compress_below is not None and strength <= policy.compress_below
+            else MemoryState.COLD
+        )
     else:
         state = MemoryState.ACTIVE
     return replace(memory, strength=strength, state=state)

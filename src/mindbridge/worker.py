@@ -37,7 +37,10 @@ from mindbridge.core import (
     ObservationId,
     TenantId,
 )
-from mindbridge.infrastructure.postgres import PostgresMemoryStore
+from mindbridge.infrastructure.postgres import (
+    PostgresMemoryStore,
+    resolve_database_max_pool_size,
+)
 from mindbridge.infrastructure.s3 import (
     ObjectStorageEnvironment,
     S3MediaAccess,
@@ -282,7 +285,9 @@ async def _process_observation_once(
     job_id: JobId,
 ) -> JobState:
     store = PostgresMemoryStore(
-        settings.database_url, embedding_dimension=settings.embedding_dimension
+        settings.database_url,
+        embedding_dimension=settings.embedding_dimension,
+        max_pool_size=resolve_database_max_pool_size(),
     )
     media_access = S3MediaAccess(settings.object_storage)
     async with AsyncExitStack() as resources:

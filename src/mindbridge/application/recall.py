@@ -35,6 +35,7 @@ from mindbridge.contracts import (
     EvidenceView,
     MemoryResult,
     MemoryView,
+    RecallFilters,
     RecallMode,
     RecallQuery,
     RecallRequest,
@@ -122,6 +123,9 @@ class RecallMemories:
                 "mindbridge.query.has_text": request.query.text is not None,
                 "mindbridge.query.media_count": len(request.query.media_object_ids),
                 "mindbridge.query.memory_count": len(request.memory_ids),
+                # Completes the query-shape dimensions, so feedback joined on this trace's id can
+                # be grouped by shape. Presence only: the filter values are caller content.
+                "mindbridge.query.has_filters": request.filters != RecallFilters(),
             }
         )
         query_media = await self._resolve_query_media(request)
@@ -472,7 +476,11 @@ class RecallMemories:
             values=query_embedding.values,
             space_reference=query_embedding.space_reference,
             document_task=EmbedTask.DOCUMENT.value,
-            object_types=(EmbeddedObjectType.EVENT, EmbeddedObjectType.CLAIM),
+            object_types=(
+                EmbeddedObjectType.EVENT,
+                EmbeddedObjectType.CLAIM,
+                EmbeddedObjectType.ENTITY,
+            ),
             limit=limit,
             minimum_similarity=self._minimum_embedding_similarity,
         )
