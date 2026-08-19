@@ -246,3 +246,52 @@ async def test_missing_evidence_skips_the_pair_instead_of_discarding_the_page() 
     result = await _run(evidence_error=MemoryIntegrityError("evidence is gone"))
     assert (result.same_as_count, result.not_same_as_count) == (0, 0)
     assert result.skipped_pair_count == 1
+
+
+@dataclass
+class _FailsOnePair:
+    """Raise for one named pair and answer every other, regardless of arrival order."""
+
+    verdict: EntityAdjudication
+    failing_left: str
+
+    async def adjudicate(
+        self, pair: EntityPair, evidence: tuple[ResolvedEvidence, ...]
+    ) -> EntityAdjudication:
+        if pair.left.entity.entity_id == self.failing_left:
+            raise ModelRequestError("call failed")
+        return self.verdict
+
+
+def _two_pair_page() -> EntityCandidatePage:
+    return EntityCandidatePage(
+        pairs=(
+            EntityPair(
+                left=_candidate("entity_a", evidence_ids=(_EVIDENCE,)),
+                right=_candidate("entity_b", evidence_ids=(_EVIDENCE,)),
+            ),
+            EntityPair(
+                left=_candidate("entity_c", evidence_ids=(_EVIDENCE,)),
+                right=_candidate("entity_d", evidence_ids=(_EVIDENCE,)),
+            ),
+        ),
+        scanned_count=4,
+        dropped_pair_count=0,
+        next_cursor=None,
+    )
+
+
+async def test_a_page_fatal_error_still_commits_the_verdicts_the_page_reached() -> None:
+    """A page is up to maximum_pairs multimodal calls; one blip must not void the rest."""
+    store = _Store(page=_two_pair_page())
+    use_case = ConsolidateEntities(
+        store,
+        _FailsOnePair(EntityAdjudication(True, 0.9, "same scar"), failing_left="entity_c"),
+        media_url_signer=_Signer(),
+    )
+
+    with pytest.raises(ModelRequestError):
+        await use_case.run(EntityCandidateRequest(tenant_id=_TENANT, evaluated_at=_AT))
+
+    assert store.committed is not None, "the reached verdict was discarded with the failure"
+    assert [len(write.relations) for write in store.committed] == [1]

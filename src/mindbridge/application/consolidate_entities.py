@@ -104,26 +104,37 @@ class ConsolidateEntities:
                 "mindbridge.consolidation.entity_pair_dropped": page.dropped_pair_count,
             }
         )
-        decided, skipped = await self._decide(request, page)
+        decided, skipped, failure = await self._decide(request, page)
         write = derive_entity_resolution_write(request.tenant_id, decided, request.evaluated_at)
         committed = (
             await self._store.commit_entity_resolution(request.tenant_id, write)
             if write.relations
             else 0
         )
+        if failure is not None:
+            # Commit first, then fail. A page here is up to maximum_pairs multimodal calls
+            # over original recordings, and this raise stops the whole sweep with no retry
+            # around it, so discarding the verdicts the page did reach would make one
+            # transient provider error cost every adjudication paid for beside it.
+            raise failure
         return _result(page, write, skipped=skipped, committed=committed)
 
     async def _decide(
         self,
         request: EntityCandidateRequest,
         page: EntityCandidatePage,
-    ) -> tuple[tuple[tuple[EntityPair, EntityAdjudication], ...], int]:
+    ) -> tuple[tuple[tuple[EntityPair, EntityAdjudication], ...], int, BaseException | None]:
         semaphore = asyncio.Semaphore(_MAX_CONCURRENT_ADJUDICATIONS)
+        # return_exceptions, so one pair raising cannot leave its siblings running detached
+        # against a page that has already unwound. The first failure is handed back for the
+        # caller to raise once what was reached is safely written.
         verdicts = await asyncio.gather(
-            *(self._judge(request, pair, semaphore) for pair in page.pairs)
+            *(self._judge(request, pair, semaphore) for pair in page.pairs),
+            return_exceptions=True,
         )
-        decided = tuple(item for item in verdicts if item is not None)
-        return decided, len(verdicts) - len(decided)
+        decided = tuple(item for item in verdicts if isinstance(item, tuple))
+        failure = next((item for item in verdicts if isinstance(item, BaseException)), None)
+        return decided, sum(item is None for item in verdicts), failure
 
     async def _judge(
         self,
