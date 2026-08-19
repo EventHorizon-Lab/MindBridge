@@ -205,10 +205,17 @@ class MemoryKernel:
         """
         requests = (request,) if isinstance(request, RememberRequest) else tuple(request)
         set_current_span_attributes({"mindbridge.memory.batch_size": len(requests)})
+        tenant_ids = {item.tenant_id for item in requests}
+        if len(tenant_ids) == 1:
+            # Unlike `memory.type` and `evidence.count`, which genuinely vary per item, a batch
+            # has one tenant in every caller today -- so gating this on the single-request path
+            # left batch writes, the whole reason the batch API exists, invisible to a
+            # per-tenant span query. Still conditional: a future mixed batch should omit the
+            # attribute rather than label every span in it with whichever request came first.
+            set_current_span_attributes({"mindbridge.tenant.id": next(iter(tenant_ids))})
         if len(requests) == 1:
             set_current_span_attributes(
                 {
-                    "mindbridge.tenant.id": requests[0].tenant_id,
                     "mindbridge.memory.type": requests[0].memory_type.value,
                     "mindbridge.evidence.count": len(requests[0].evidence_ids),
                 }

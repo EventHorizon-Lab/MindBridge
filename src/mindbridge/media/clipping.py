@@ -69,6 +69,7 @@ class _Container(Protocol):
     streams: _Streams
 
     def decode(self, stream: _VideoStream) -> Iterator[_VideoFrame]: ...
+    def seek(self, offset: int, *, backward: bool = ...) -> None: ...
     def add_stream(self, codec: str, *, rate: int) -> _VideoStream: ...
     def mux(self, packets: list[object]) -> None: ...
     def __enter__(self) -> _Container: ...
@@ -287,10 +288,20 @@ def _sample_video_frames(
         # reproduced roughly one run in three, which is why the cheap fix is to not start the
         # pool at all rather than to order the imports.
         # This is not free: a 30s 720p source decodes in 1.7s here against 0.35s with AUTO, and
-        # the gap widens with resolution. ponytail: the ceiling is that this loop has no seek,
-        # so cost is (span end offset x span count) and a long source with many spans can reach
-        # the 900s task limit — seek to start_seconds before that becomes real.
+        # the gap widens with resolution.
         stream.thread_type = "NONE"
+        # Which is why this seeks rather than decoding from byte zero. `cut_clips` runs once per
+        # span, so without a seek a source costs sum(span end offset) rather than
+        # sum(span length): a 30 min recording with 32 spans decoded ~28,800 source-seconds,
+        # ran past `task_soft_time_limit`, and `SoftTimeLimitExceeded` being in `autoretry_for`
+        # then re-ran the identical doomed decode up to `max_retries` times. Measured on a 60s
+        # 720p source with 8 five-second spans: 7.57s without the seek against 1.38s with it.
+        # `backward=True` is load-bearing -- it lands on the keyframe at or before the target,
+        # so the `frame.time < start_seconds` filter below discards the pre-roll instead of the
+        # span losing its opening frames. The offset is in microseconds because no stream is
+        # passed, which keeps the untyped `stream.time_base` out of the arithmetic.
+        if start_seconds > 0:
+            container.seek(int(start_seconds * 1_000_000), backward=True)
         for frame in container.decode(stream):
             if frame.time is None:
                 continue
