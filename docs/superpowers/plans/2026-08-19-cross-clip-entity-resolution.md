@@ -43,15 +43,16 @@ the `mindbridge consolidate` CLI), pytest + pytest-asyncio.
 **Files:**
 
 - Modify: `src/mindbridge/core/graph.py` (the `RelationType` enum)
-- Create: `migrations/0019_entity_resolution_edges.sql`
 - Test: `tests/unit/core/test_graph.py`
-- Test: `tests/integration/test_postgres_migrations.py`
 
 **Interfaces:**
 
 - Consumes: nothing.
 - Produces: `RelationType.SAME_AS` (`"same_as"`) and `RelationType.NOT_SAME_AS`
-  (`"not_same_as"`), plus the index `relations_entity_resolution_idx`.
+  (`"not_same_as"`). No migration: the existing
+  `UNIQUE (tenant_id, source_type, source_id, relation_type, target_type, target_id)` on
+  `relations` already covers the settled-pair lookup exactly, and `relation_type` is plain
+  `text` with no CHECK constraint, so the new values need no schema change.
 
 - [ ] **Step 1: Write the failing test**
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Annotated
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, ValidationError
@@ -50,7 +51,7 @@ class EntityResolutionPipeline:
                 system_prompt=RESOLVE_ENTITIES_PROMPT.text,
                 input=ModelInput(
                     (
-                        TextPart(_context(pair)),
+                        TextPart(_context(pair, evidence)),
                         *evidence_parts(evidence),
                         TextPart(
                             "<final_task>Judge these two records now. Answer false unless the "
@@ -79,14 +80,37 @@ class EntityResolutionPipeline:
         )
 
 
-def _context(pair: EntityPair) -> str:
-    return (
-        "<entity_pair>\n"
-        f"<record_a type={pair.left.entity.entity_type.value!r}>"
-        f"{pair.left.entity.canonical_name}</record_a>\n"
-        f"<record_b type={pair.right.entity.entity_type.value!r}>"
-        f"{pair.right.entity.canonical_name}</record_b>\n"
-        "</entity_pair>"
+def _context(pair: EntityPair, evidence: tuple[ResolvedEvidence, ...]) -> str:
+    """Name each record, say which spans it cites, and bound every span in time.
+
+    Without this the judge sees two names and a bag of whole recordings: two records citing
+    different moments of one clip collapse to a single attachment, and nothing says which
+    moment belongs to which record. The claim and summary pipelines join their candidates to
+    their spans the same way.
+    """
+    return json.dumps(
+        {
+            "records": [
+                {
+                    "label": label,
+                    "entity_type": candidate.entity.entity_type.value,
+                    "canonical_name": candidate.entity.canonical_name,
+                    "evidence_ids": list(candidate.evidence_ids),
+                }
+                for label, candidate in (("record_a", pair.left), ("record_b", pair.right))
+            ],
+            "evidence_spans": [
+                {
+                    "evidence_id": item.evidence_span.evidence_id,
+                    "media_object_id": item.media_object.media_object_id,
+                    "media_kind": item.media_object.kind.value,
+                    "start_ms": item.evidence_span.start_ms,
+                    "end_ms": item.evidence_span.end_ms,
+                }
+                for item in evidence
+            ],
+        },
+        sort_keys=True,
     )
 
 

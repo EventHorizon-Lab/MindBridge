@@ -1,7 +1,7 @@
 """What the entity resolution pass writes, and — mostly — what it refuses to write."""
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -25,6 +25,7 @@ from mindbridge.core import (
     EntityType,
     EvidenceId,
     EvidenceSpan,
+    MediaKind,
     MediaObject,
     MediaObjectId,
     MemoryIntegrityError,
@@ -32,11 +33,39 @@ from mindbridge.core import (
     ModelRequestError,
     ModelUnavailableError,
     ObjectStorageError,
+    ObservationId,
     TenantId,
 )
 
 _AT = datetime(2026, 8, 19, tzinfo=timezone.utc)
 _TENANT = TenantId("tenant_01")
+_EVIDENCE = EvidenceId("evidence_1")
+_MEDIA = MediaObjectId("media_1")
+
+
+def _span() -> EvidenceSpan:
+    return EvidenceSpan(
+        evidence_id=_EVIDENCE,
+        tenant_id=_TENANT,
+        observation_id=ObservationId("observation_1"),
+        media_object_id=_MEDIA,
+        start_ms=0,
+        end_ms=4_000,
+        created_at=_AT,
+    )
+
+
+def _media() -> MediaObject:
+    return MediaObject(
+        media_object_id=_MEDIA,
+        tenant_id=_TENANT,
+        kind=MediaKind.VIDEO,
+        uri="s3://memory/tenants/tenant_01/clip.mp4",
+        sha256=f"{1:064x}",
+        size_bytes=100,
+        created_at=_AT,
+        duration_ms=4_000,
+    )
 
 
 @dataclass
@@ -53,12 +82,12 @@ class _Store:
     ) -> tuple[EvidenceSpan, ...]:
         if self.evidence_error is not None:
             raise self.evidence_error
-        return ()
+        return tuple(_span() for _ in evidence_ids)
 
     async def read_media_objects(
         self, tenant_id: TenantId, media_object_ids: tuple[MediaObjectId, ...]
     ) -> tuple[MediaObject, ...]:
-        return ()
+        return tuple(_media() for _ in media_object_ids)
 
     async def commit_entity_resolution(
         self, tenant_id: TenantId, write: EntityResolutionWrite
@@ -85,7 +114,10 @@ class _Adjudicator:
 
 class _Signer:
     async def create_presigned_download(self, media_object: MediaObject) -> PresignedMediaDownload:
-        raise AssertionError("no media is resolved in these tests")
+        return PresignedMediaDownload(
+            download_url="https://objects.example.test/clip.mp4",
+            expires_at=_AT + timedelta(minutes=5),
+        )
 
 
 async def _run(
@@ -95,13 +127,10 @@ async def _run(
     adjudicator_error: Exception | None = None,
     minimum_confidence: float = 0.75,
     tenant_id: TenantId = _TENANT,
+    evidence_ids: tuple[EvidenceId, ...] = (_EVIDENCE,),
 ) -> EntityResolutionResult:
     store = _Store(
-        page=_page(
-            tenant_id=tenant_id,
-            # Only a pair that actually has evidence can fail to have it read.
-            evidence_ids=(EvidenceId("evidence_1"),) if evidence_error else (),
-        ),
+        page=_page(tenant_id=tenant_id, evidence_ids=evidence_ids),
         evidence_error=evidence_error,
     )
     use_case = ConsolidateEntities(
@@ -167,9 +196,15 @@ async def test_a_positive_below_the_confidence_floor_writes_nothing() -> None:
     assert result.skipped_pair_count == 1
 
 
-async def test_a_confident_negative_below_the_floor_is_still_recorded() -> None:
-    """The floor guards merging. Refusing to merge needs no confidence bar."""
+async def test_an_unsure_negative_is_not_recorded_as_a_difference() -> None:
+    """The prompt answers false when it cannot tell, so a hedged no means unknown."""
     result = await _run(verdict=EntityAdjudication(False, 0.1, "cue"), minimum_confidence=0.75)
+    assert (result.same_as_count, result.not_same_as_count) == (0, 0)
+    assert result.skipped_pair_count == 1
+
+
+async def test_a_confident_negative_is_recorded() -> None:
+    result = await _run(verdict=EntityAdjudication(False, 0.9, "cue"), minimum_confidence=0.75)
     assert (result.same_as_count, result.not_same_as_count) == (0, 1)
 
 
@@ -197,3 +232,17 @@ async def test_infrastructure_failure_propagates_instead_of_recording_a_negative
 async def test_a_cross_tenant_candidate_is_refused() -> None:
     with pytest.raises(MemoryIntegrityError):
         await _run(verdict=EntityAdjudication(True, 0.9, "cue"), tenant_id=TenantId("tenant_02"))
+
+
+async def test_a_pair_with_nothing_to_look_at_is_never_merged() -> None:
+    """Answering from the two names alone is the merge this pass exists to prevent."""
+    result = await _run(verdict=EntityAdjudication(True, 1.0, "cue"), evidence_ids=())
+    assert (result.same_as_count, result.not_same_as_count) == (0, 0)
+    assert result.skipped_pair_count == 1
+
+
+async def test_missing_evidence_skips_the_pair_instead_of_discarding_the_page() -> None:
+    """A forget between the page read and the judge must not void the other verdicts."""
+    result = await _run(evidence_error=MemoryIntegrityError("evidence is gone"))
+    assert (result.same_as_count, result.not_same_as_count) == (0, 0)
+    assert result.skipped_pair_count == 1

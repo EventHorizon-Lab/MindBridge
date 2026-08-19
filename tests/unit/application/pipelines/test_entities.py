@@ -2,7 +2,7 @@
 
 import json
 from collections.abc import Callable, Coroutine
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import cast
 
 import httpx
@@ -10,14 +10,20 @@ import pytest
 from openai import AsyncOpenAI
 
 from mindbridge.application.entity_resolution import EntityCandidate, EntityPair
+from mindbridge.application.perception import ResolvedEvidence
 from mindbridge.application.pipelines.entities import EntityResolutionPipeline
 from mindbridge.core import (
     Entity,
     EntityId,
     EntityType,
     EvidenceId,
+    EvidenceSpan,
+    MediaKind,
+    MediaObject,
+    MediaObjectId,
     ModelOutputError,
     ModelReference,
+    ObservationId,
     TenantId,
 )
 from mindbridge.models.openai import OpenAIGenerator, normalize_base_url
@@ -160,3 +166,56 @@ def _pipeline(
     return _Harness(
         OpenAIGenerator(client, ModelReference(model_id="qwen3.8-max", revision="rev-1"))
     )
+
+
+def _resolved(evidence_id: str, media_id: str, start_ms: int) -> ResolvedEvidence:
+    return ResolvedEvidence(
+        evidence_span=EvidenceSpan(
+            evidence_id=EvidenceId(evidence_id),
+            tenant_id=TenantId("tenant_01"),
+            observation_id=ObservationId("observation_1"),
+            media_object_id=MediaObjectId(media_id),
+            start_ms=start_ms,
+            end_ms=start_ms + 4_000,
+            created_at=NOW,
+        ),
+        media_object=MediaObject(
+            media_object_id=MediaObjectId(media_id),
+            tenant_id=TenantId("tenant_01"),
+            kind=MediaKind.VIDEO,
+            uri=f"s3://memory/tenants/tenant_01/{media_id}.mp4",
+            sha256=f"{1:064x}",
+            size_bytes=100,
+            created_at=NOW,
+            duration_ms=600_000,
+        ),
+        media_url=f"https://objects.example.test/{media_id}.mp4",
+        media_url_expires_at=NOW + timedelta(minutes=5),
+    )
+
+
+async def test_the_judge_receives_the_media_and_learns_which_span_each_record_cites() -> None:
+    """Two records citing different moments of one recording must not collapse to one blob."""
+    seen: dict[str, str] = {}
+
+    async def respond(request: httpx.Request) -> httpx.Response:
+        payload = cast(dict[str, object], json.loads(request.content))
+        messages = cast(list[dict[str, object]], payload["messages"])
+        seen["user"] = json.dumps(messages[1]["content"])
+        return _completion(
+            '{"same_entity":false,"confidence":0.9,"discriminating_cue":"different build"}'
+        )
+
+    evidence = (_resolved("evidence_1", "media_x", 0), _resolved("evidence_2", "media_x", 600_000))
+    pipeline = _pipeline(respond)
+    try:
+        await pipeline.adjudicate(_pair(), evidence)
+    finally:
+        await pipeline.close()
+
+    # The media itself reaches the model, once per distinct recording.
+    assert seen["user"].count('"type": "video_url"') == 1
+    # And the time bounds plus the per-record citation survive, so "which of these two" is answerable.
+    assert "600000" in seen["user"]
+    assert "record_a" in seen["user"] and "record_b" in seen["user"]
+    assert "evidence_1" in seen["user"] and "evidence_2" in seen["user"]

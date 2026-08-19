@@ -30,6 +30,7 @@ from mindbridge.core import (
     derive_stable_id,
     require_aware_datetime,
     require_non_empty,
+    require_probability,
 )
 
 _MAXIMUM_PAIRS_CEILING = 512
@@ -64,8 +65,7 @@ class EntityCandidateRequest:
             raise DomainInvariantError("maximum_gap_seconds must be between 0 and 31536000")
         if not 1 <= self.candidate_limit <= 32:
             raise DomainInvariantError("candidate_limit must be between 1 and 32")
-        if not 0.0 <= self.minimum_confidence <= 1.0:
-            raise DomainInvariantError("minimum_confidence must be between 0 and 1")
+        require_probability(self.minimum_confidence, "minimum_confidence")
         if not 1 <= self.evidence_per_side <= 8:
             raise DomainInvariantError("evidence_per_side must be between 1 and 8")
         if not 1 <= self.maximum_pairs <= _MAXIMUM_PAIRS_CEILING:
@@ -138,8 +138,7 @@ class EntityAdjudication:
     discriminating_cue: str
 
     def __post_init__(self) -> None:
-        if not 0.0 <= self.confidence <= 1.0:
-            raise DomainInvariantError("adjudication confidence must be between 0 and 1")
+        require_probability(self.confidence, "adjudication confidence")
         require_non_empty(self.discriminating_cue, "discriminating_cue")
 
 
@@ -155,7 +154,12 @@ def derive_entity_resolution_write(
     decided: tuple[tuple[EntityPair, EntityAdjudication], ...],
     evaluated_at: datetime,
 ) -> EntityResolutionWrite:
-    """Turn verdicts into pairwise edges, one per verdict, with nothing inferred."""
+    """Turn verdicts into pairwise edges, one per pair, with nothing inferred."""
+    keys = tuple((pair.left.entity.entity_id, pair.right.entity.entity_id) for pair, _ in decided)
+    if len(set(keys)) != len(keys):
+        # One pair, one verdict. Two verdicts for one pair is the worst state this subsystem
+        # can produce: the graph would assert the records are and are not the same entity.
+        raise DomainInvariantError("one entity pair cannot carry two verdicts")
     return EntityResolutionWrite(
         relations=tuple(
             _relation(tenant_id, pair, adjudication, evaluated_at) for pair, adjudication in decided
@@ -173,10 +177,19 @@ def _relation(
     source_id = pair.left.entity.entity_id
     target_id = pair.right.entity.entity_id
     return Relation(
-        # The verdict is part of the identity: re-judging a pair the other way has to land
-        # on its own row rather than silently overwrite the first answer.
+        # Keyed on the pair, deliberately NOT on the verdict, and deliberately not built by
+        # core.derive_relation — that helper folds relation_type into the id, which would let
+        # a flipped re-judgement insert a second row and leave the pair asserted both same
+        # and not-same. One row per pair means a re-judgement can only replace a verdict.
+        #
+        # The cost of that choice: the shared relation writer in _postgres_graph inserts with
+        # ON CONFLICT DO NOTHING and then raises MemoryIntegrityError when the stored row
+        # differs from the one offered — created_at included. Since created_at is the sweep's
+        # evaluated_at, this id is stable while that column is not, so commit_entity_resolution
+        # MUST upsert relation_type and created_at on (tenant_id, relation_id) conflict and
+        # cannot reuse that strict writer.
         relation_id=RelationId(
-            derive_stable_id("relation", tenant_id, relation_type.value, source_id, target_id)
+            derive_stable_id("relation", tenant_id, "entity_resolution", source_id, target_id)
         ),
         tenant_id=TenantId(tenant_id),
         source_type=RelationNodeType.ENTITY,

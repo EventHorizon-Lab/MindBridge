@@ -121,8 +121,8 @@ def test_relation_ids_are_stable_across_runs() -> None:
     assert first.relations[0].relation_id == second.relations[0].relation_id
 
 
-def test_the_two_verdicts_do_not_share_a_relation_id() -> None:
-    """Re-judging a pair the other way must not collide with the first answer's row."""
+def test_a_pair_has_one_verdict_slot_whichever_way_it_is_judged() -> None:
+    """Keyed on the pair, not the verdict: a re-judgement replaces, it cannot contradict."""
     pair = _pair("entity_a", "entity_b")
     same = derive_entity_resolution_write(
         TenantId("tenant_01"), ((pair, EntityAdjudication(True, 0.9, "cue")),), _AT
@@ -130,7 +130,21 @@ def test_the_two_verdicts_do_not_share_a_relation_id() -> None:
     different = derive_entity_resolution_write(
         TenantId("tenant_01"), ((pair, EntityAdjudication(False, 0.9, "cue")),), _AT
     )
-    assert same.relations[0].relation_id != different.relations[0].relation_id
+    assert same.relations[0].relation_id == different.relations[0].relation_id
+    assert same.relations[0].relation_type is not different.relations[0].relation_type
+
+
+def test_one_pair_cannot_carry_two_verdicts_in_one_write() -> None:
+    pair = _pair("entity_a", "entity_b")
+    with pytest.raises(DomainInvariantError):
+        derive_entity_resolution_write(
+            TenantId("tenant_01"),
+            (
+                (pair, EntityAdjudication(True, 0.9, "cue")),
+                (pair, EntityAdjudication(False, 0.9, "cue")),
+            ),
+            _AT,
+        )
 
 
 def test_an_adjudication_must_name_what_it_decided_on() -> None:

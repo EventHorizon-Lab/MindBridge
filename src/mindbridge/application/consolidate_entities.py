@@ -9,6 +9,7 @@ an explicit no — and everything else leaves the pair unjudged for a later swee
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -32,6 +33,10 @@ from mindbridge.core import (
     TenantId,
 )
 from mindbridge.telemetry import set_current_span_attributes, trace_operation
+
+# Pairs are independent, so they are judged concurrently, bounded the way every other
+# fan-out in this layer is bounded (kernel writes, evidence signing, clip derivation).
+_MAX_CONCURRENT_ADJUDICATIONS = 4
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,26 +118,49 @@ class ConsolidateEntities:
         request: EntityCandidateRequest,
         page: EntityCandidatePage,
     ) -> tuple[tuple[tuple[EntityPair, EntityAdjudication], ...], int]:
-        decided: list[tuple[EntityPair, EntityAdjudication]] = []
-        skipped = 0
-        for pair in page.pairs:
+        semaphore = asyncio.Semaphore(_MAX_CONCURRENT_ADJUDICATIONS)
+        verdicts = await asyncio.gather(
+            *(self._judge(request, pair, semaphore) for pair in page.pairs)
+        )
+        decided = tuple(item for item in verdicts if item is not None)
+        return decided, len(verdicts) - len(decided)
+
+    async def _judge(
+        self,
+        request: EntityCandidateRequest,
+        pair: EntityPair,
+        semaphore: asyncio.Semaphore,
+    ) -> tuple[EntityPair, EntityAdjudication] | None:
+        """Judge one pair, or return None so the pair stays unjudged for a later sweep."""
+        async with semaphore:
             try:
                 evidence = await self._pair_evidence(request, pair)
+            except (ObjectStorageError, MemoryIntegrityError):
+                # The media could not be opened, or the evidence rows it named are gone —
+                # a forget between the page read and this call does exactly that. Either way
+                # this pair was never inspected, and one stale pair must not discard the
+                # verdicts already reached for every other pair on the page.
+                return None
+            if not evidence:
+                # Nothing to look at. Answering from the two names alone is the merge this
+                # whole pass exists to prevent, so the pair is left for a sweep that can
+                # actually open something.
+                return None
+            try:
                 adjudication = await self._adjudicator.adjudicate(pair, evidence)
-            except (ObjectStorageError, ModelOutputError):
-                # Could not open the media, or could not read the verdict. Both mean the pair
-                # was never actually inspected, and an uninspected pair must stay unjudged.
+            except ModelOutputError:
+                # The verdict could not be read. Unreadable is not "different".
                 # ModelUnavailableError and ModelRequestError are deliberately not caught:
                 # they are the sweep's problem to retry, not this pair's verdict.
-                skipped += 1
-                continue
-            if adjudication.same_entity and adjudication.confidence < request.minimum_confidence:
-                # A hedged yes is not a yes. It is also not a no, so nothing is written and
-                # the pair stays available to a later sweep with better evidence.
-                skipped += 1
-                continue
-            decided.append((pair, adjudication))
-        return tuple(decided), skipped
+                return None
+            if adjudication.confidence < request.minimum_confidence:
+                # The floor guards both directions. The prompt tells the judge to answer
+                # false when the media cannot settle it, so a low-confidence false is
+                # "unknown", not "different" — and writing not_same_as for it would record
+                # the one thing this pass promises never to record, then block the pair from
+                # ever being re-judged with better evidence.
+                return None
+            return pair, adjudication
 
     async def _pair_evidence(
         self,

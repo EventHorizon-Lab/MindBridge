@@ -3,6 +3,7 @@
 from mindbridge.core._validation import (
     require_aware_datetime,
     require_non_empty,
+    require_probability,
     require_similarity,
     utc_now,
 )
@@ -171,6 +172,7 @@ __all__ = [
     "media_kind_for_suffix",
     "require_aware_datetime",
     "require_non_empty",
+    "require_probability",
     "require_similarity",
     "utc_now",
 ]

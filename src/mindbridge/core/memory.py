@@ -7,7 +7,11 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 
-from mindbridge.core._validation import require_aware_datetime, require_non_empty
+from mindbridge.core._validation import (
+    require_aware_datetime,
+    require_non_empty,
+    require_probability,
+)
 from mindbridge.core.errors import DomainInvariantError
 from mindbridge.core.identifiers import (
     ClaimId,
@@ -286,6 +290,4 @@ def _require_identifiers(identifiers: tuple[str, ...], field_name: str) -> None:
         raise DomainInvariantError(f"{field_name} must not contain duplicates")
 
 
-def _require_probability(value: float, field_name: str) -> None:
-    if not math.isfinite(value) or not 0.0 <= value <= 1.0:
-        raise DomainInvariantError(f"{field_name} must be between 0 and 1")
+_require_probability = require_probability

@@ -93,12 +93,15 @@ Every component mirrors an existing one; the shapes are copied deliberately.
 | `application/pipelines/entities.py` — adjudication pipeline | `application/pipelines/claims.py` |
 | `RESOLVE_ENTITIES_PROMPT` (`resolve_entities_v1`) in `prompts.py` | `consolidate_claims_v2` |
 | `--entity-*` options in `consolidation_cli.py` | existing `--claim-*` options |
-| Migration `0019_entity_resolution_edges.sql` | `relations_claim_consolidation_idx` |
 
-No new table. The generic `relations` row
+No new table and no migration. The generic `relations` row
 `(tenant_id, relation_id, source_type, source_id, relation_type, target_type, target_id, created_at)`
-already carries this edge; the migration adds only a partial index for
-`source_type = 'entity' AND target_type = 'entity'`.
+already carries this edge, and the table's existing
+`UNIQUE (tenant_id, source_type, source_id, relation_type, target_type, target_id)` is an exact
+match for the settled-pair lookup, so a dedicated index would add write cost for no read. The
+`relation_id` is keyed on the pair and not on the verdict, so one pair holds exactly one verdict
+row and the write upserts `relation_type` on conflict — a flipped re-judgement replaces the
+previous answer instead of standing beside it.
 
 ## Data flow
 
@@ -118,9 +121,10 @@ already carries this edge; the migration adds only a partial index for
    and call the Generator with `RESOLVE_ENTITIES_PROMPT`. Structured output:
    `{"same_entity": bool, "confidence": float, "discriminating_cue": str}`.
 6. **Write.** `same_entity` true and `confidence >= minimum_confidence` writes `same_as`;
-   an explicit false writes `not_same_as`. Anything else writes nothing.
-   `relation_id = derive_stable_id("relation", tenant_id, relation_type, a, b)`, so a
-   re-run is a no-op and concurrent sweeps stay idempotent.
+   an explicit false writes `not_same_as`. A pair with no resolvable evidence writes nothing,
+   and neither does anything else. `relation_id = derive_stable_id("relation", tenant_id,
+   "entity_resolution", a, b)` — keyed on the pair, so a re-run is a no-op, concurrent sweeps
+   stay idempotent, and a pair can never hold two contradictory verdicts.
 
 ## Error handling
 
@@ -129,7 +133,8 @@ never mean "could not inspect".**
 
 | Condition | Behaviour |
 | --- | --- |
-| Media missing or signed URL expired | Skip the pair, count it, write no edge |
+| Media missing, signed URL expired, or the evidence rows are gone | Skip the pair, count it, write no edge — one stale pair must not discard the page's other verdicts |
+| Evidence resolves to nothing at all | Skip the pair: a verdict from the two names alone is the merge this exists to prevent |
 | Generator returns invalid JSON | Existing `generate_json` retry-once; still invalid, skip and write no edge |
 | `ModelUnavailableError` / `ModelRequestError` | Propagate so the sweep retries later; never record a negative from an infrastructure failure |
 | Entity deleted between page read and write | The atomic write guard drops the pair |
