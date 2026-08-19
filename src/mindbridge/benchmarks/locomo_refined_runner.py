@@ -1,4 +1,4 @@
-"""Run LoCoMo through the public MindBridge remember and recall contract."""
+"""Run LoCoMo-Refined through the public MindBridge remember and recall contract."""
 
 from __future__ import annotations
 
@@ -6,17 +6,16 @@ import asyncio
 
 from pydantic import Field
 
-from mindbridge.benchmarks.locomo import (
-    LOCOMO_ADAPTER_VERSION,
-    LoCoMoConversation,
-    LoCoMoQuestion,
-    LoCoMoTurn,
+from mindbridge.benchmarks.locomo_refined import (
+    LOCOMO_REFINED_ADAPTER_VERSION,
+    LoCoMoRefinedConversation,
+    LoCoMoRefinedQuestion,
+    LoCoMoRefinedTurn,
 )
 from mindbridge.benchmarks.runtime import benchmark_tenant_id
 from mindbridge.contracts import (
     ContractModel,
     Identifier,
-    NonEmptyString,
     RecallQuery,
     RecallRequest,
     RememberRequest,
@@ -24,43 +23,39 @@ from mindbridge.contracts import (
 from mindbridge.core import MemoryType
 from mindbridge.sdk import MindBridge
 
-LOCOMO_PREDICTION_KEY = "mindbridge_prediction"
-# LoCoMo scores an adversarial question correct for exactly this wording, so an abstention and a
-# reasoned "no such thing was said" are indistinguishable to the official token-F1. Every row
-# therefore carries mindbridge_abstained, and a run must report the abstention rate next to F1.
-LOCOMO_ABSTENTION = "Not mentioned in the conversation"
+LOCOMO_REFINED_PREDICTION_KEY = "predicted_answer"
 
 
-class LoCoMoOfficialQuestionResult(ContractModel):
-    """One official QA row plus reproducibility diagnostics ignored by its scorer."""
+class LoCoMoRefinedPrediction(ContractModel):
+    """One official prediction row plus reproducibility diagnostics its scorer ignores.
 
-    question: NonEmptyString
-    answer: NonEmptyString | tuple[NonEmptyString, ...]
-    evidence: tuple[Identifier, ...]
-    category: int = Field(ge=1, le=5)
-    mindbridge_prediction: NonEmptyString
-    mindbridge_abstained: bool
+    `qa_id` and `predicted_answer` are exactly what `mem-eval-suite/LoCoMo_refined`'s
+    `scripts/run_eval.sh` reads; it merges each row into its own question record by
+    `qa_id` and never looks at the other keys, so the diagnostics ride along for free.
+    """
+
+    qa_id: Identifier
+    # Deliberately not `NonEmptyString`: LoCoMo-Refined dropped the adversarial category,
+    # so there is no gold abstention wording left to substitute. A recall that produced no
+    # answer is simply a wrong answer, and the empty string is how the official evaluator
+    # already represents one -- `mindbridge_answered` below is what makes the two
+    # distinguishable in a run's own diagnostics.
+    predicted_answer: str
+    mindbridge_answered: bool
     mindbridge_confidence: float = Field(ge=0.0, le=1.0)
     mindbridge_prediction_context: tuple[Identifier, ...]
     mindbridge_trace_id: Identifier
 
 
-class LoCoMoOfficialConversationResult(ContractModel):
-    """Prediction shape accepted by the official conversation-level evaluator."""
-
-    sample_id: Identifier
-    qa: tuple[LoCoMoOfficialQuestionResult, ...] = Field(min_length=1)
-
-
-async def run_locomo_conversation(
+async def run_locomo_refined_conversation(
     memory: MindBridge,
-    conversation: LoCoMoConversation,
+    conversation: LoCoMoRefinedConversation,
     *,
     run_id: str,
-    tenant_prefix: str = "benchmark_locomo",
+    tenant_prefix: str = "benchmark_locomo_refined",
     recall_limit: int = 20,
     request_concurrency: int = 4,
-) -> LoCoMoOfficialConversationResult:
+) -> tuple[LoCoMoRefinedPrediction, ...]:
     """Ingest one conversation, then answer its questions without label leakage."""
     if not 1 <= recall_limit <= 100 or request_concurrency <= 0:
         raise ValueError("recall_limit must be between 1 and 100; concurrency must be positive")
@@ -73,27 +68,28 @@ async def run_locomo_conversation(
         )
     )
     dialog_id_by_memory_id = {memory_id: dialog_id for dialog_id, memory_id in remembered}
-    qa = await asyncio.gather(
-        *(
-            _answer_question(
-                memory,
-                tenant_id,
-                question,
-                dialog_id_by_memory_id,
-                recall_limit,
-                semaphore,
+    return tuple(
+        await asyncio.gather(
+            *(
+                _answer_question(
+                    memory,
+                    tenant_id,
+                    question,
+                    dialog_id_by_memory_id,
+                    recall_limit,
+                    semaphore,
+                )
+                for question in conversation.questions
             )
-            for question in conversation.questions
         )
     )
-    return LoCoMoOfficialConversationResult(sample_id=conversation.sample_id, qa=tuple(qa))
 
 
 async def _remember_turn(
     memory: MindBridge,
     tenant_id: str,
     sample_id: str,
-    turn: LoCoMoTurn,
+    turn: LoCoMoRefinedTurn,
     semaphore: asyncio.Semaphore,
 ) -> tuple[str, str]:
     async with semaphore:
@@ -103,7 +99,7 @@ async def _remember_turn(
                 summary=_turn_summary(turn),
                 memory_type=MemoryType.EPISODIC,
                 occurred_at=turn.occurred_at,
-                idempotency_key=f"{LOCOMO_ADAPTER_VERSION}:{sample_id}:{turn.dialog_id}",
+                idempotency_key=f"{LOCOMO_REFINED_ADAPTER_VERSION}:{sample_id}:{turn.dialog_id}",
             )
         )
     return turn.dialog_id, stored.memory_id
@@ -112,11 +108,11 @@ async def _remember_turn(
 async def _answer_question(
     memory: MindBridge,
     tenant_id: str,
-    question: LoCoMoQuestion,
+    question: LoCoMoRefinedQuestion,
     dialog_id_by_memory_id: dict[str, str],
     recall_limit: int,
     semaphore: asyncio.Semaphore,
-) -> LoCoMoOfficialQuestionResult:
+) -> LoCoMoRefinedPrediction:
     async with semaphore:
         result = await memory.recall(
             RecallRequest(
@@ -131,24 +127,17 @@ async def _answer_question(
         for item in result.memories
         if item.memory_id in dialog_id_by_memory_id
     )
-    return LoCoMoOfficialQuestionResult(
-        question=question.question,
-        answer=(
-            question.reference_answers[0]
-            if len(question.reference_answers) == 1
-            else question.reference_answers
-        ),
-        evidence=question.evidence_dialog_ids,
-        category=question.category,
-        mindbridge_prediction=result.answer or LOCOMO_ABSTENTION,
-        mindbridge_abstained=not result.answer,
+    return LoCoMoRefinedPrediction(
+        qa_id=question.question_id,
+        predicted_answer=result.answer or "",
+        mindbridge_answered=bool(result.answer),
         mindbridge_confidence=result.confidence,
         mindbridge_prediction_context=retrieved_dialog_ids,
         mindbridge_trace_id=result.trace_id,
     )
 
 
-def _turn_summary(turn: LoCoMoTurn) -> str:
+def _turn_summary(turn: LoCoMoRefinedTurn) -> str:
     statement = f'{turn.speaker} said: "{turn.text}"'
     if turn.image_caption is None:
         return statement

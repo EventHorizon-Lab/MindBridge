@@ -4,11 +4,12 @@ import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
+from typing import cast
 
 import pytest
 
 from mindbridge.application import recall as recall_module
-from mindbridge.application.kernel import MemoryKernel
+from mindbridge.application.kernel import _MAX_CONCURRENT_MEMORY_WRITES, MemoryKernel
 from mindbridge.application.observation_processing import ObservationBatch
 from mindbridge.application.perception import ResolvedEvidence
 from mindbridge.application.ports import (
@@ -26,12 +27,15 @@ from mindbridge.contracts import (
     FeedbackRequest,
     IdentityObservationInput,
     MediaObjectInput,
+    MemoryResult,
+    MemoryWriteStatus,
     ObservationStatus,
     ObserveRequest,
     RecallMode,
     RecallQuery,
     RecallRequest,
     RememberRequest,
+    RememberResult,
 )
 from mindbridge.core import (
     DeletionTombstone,
@@ -95,6 +99,7 @@ class InMemoryStore:
         self.graph_memories: dict[tuple[EmbeddedObjectType, str], MemoryId] = {}
         self.summary_children: dict[MemoryId, tuple[MemoryId, ...]] = {}
         self.embeddings: dict[str, EmbeddingRecord] = {}
+        self.reencoding_allowed: list[bool] = []
         self.feedback: dict[str, tuple[str, FeedbackWriteResult]] = {}
 
     async def write_observation(
@@ -431,10 +436,20 @@ class InMemoryStore:
     ) -> tuple[DeletionTombstone, ...]:
         raise AssertionError("forget is covered by the PostgreSQL integration store")
 
-    async def write_embedding(self, embedding: EmbeddingRecord) -> bool:
+    async def write_embedding(
+        self,
+        embedding: EmbeddingRecord,
+        *,
+        allow_reencoding: bool = False,
+    ) -> bool:
+        # Honours `allow_reencoding` rather than merely accepting it. A double that takes the
+        # keyword and ignores it makes the kernel's use of it untestable: dropping
+        # `allow_reencoding=True` at the one call site left every test green while production
+        # began raising on two concurrent batches that share a memory.
+        self.reencoding_allowed.append(allow_reencoding)
         existing = self.embeddings.get(embedding.embedding_id)
         if existing is not None:
-            if existing != embedding:
+            if existing != embedding and not allow_reencoding:
                 raise DomainInvariantError("embedding ID stores different content")
             return False
         self.embeddings[embedding.embedding_id] = embedding
@@ -582,6 +597,7 @@ class RecordingEmbedder:
     def __init__(self, *, memory_document_failures: int = 0) -> None:
         self.queries: list[_RecordedQuery] = []
         self.memory_documents: list[str] = []
+        self.document_batch_sizes: list[int] = []
         self.memory_document_failures = memory_document_failures
 
     async def embed(self, request: EmbedRequest) -> EmbedResult:
@@ -601,6 +617,7 @@ class RecordingEmbedder:
                     )
                 )
         else:
+            self.document_batch_sizes.append(len(request.inputs))
             self.memory_documents.extend(
                 part.text
                 for input_value in request.inputs
@@ -857,7 +874,11 @@ async def test_observe_remember_recall_returns_openable_evidence() -> None:
 
 
 async def test_remember_retry_returns_original_record() -> None:
-    """A retry cannot replace the system creation time of an existing memory."""
+    """A retry cannot replace the system creation time of an existing memory.
+
+    It also has to say that it was a retry: the store knows, and a caller that can only infer
+    it from a memory_id it happens to recognize cannot tell a retry from a fresh write.
+    """
     store = InMemoryStore()
     embedder = RecordingEmbedder()
     request = _remember_request(idempotency_key="remember-01")
@@ -875,6 +896,27 @@ async def test_remember_retry_returns_original_record() -> None:
     assert retry.memory_id == first.memory_id
     assert retry.created_at == NOW
     assert embedder.memory_documents == [request.summary, request.summary]
+    assert first.status is MemoryWriteStatus.CREATED
+    assert retry.status is MemoryWriteStatus.DUPLICATE
+
+
+async def test_remember_asserts_its_embedding_id_pins_its_text() -> None:
+    """The kernel must claim `allow_reencoding` here, or the race it exists for reopens.
+
+    Two concurrent batches that share one memory encode it beside different neighbours, and
+    that padding alone moves the vector far outside the write's equality tolerance. The store
+    cannot tell that from content drift -- only a caller knows the ID pins its text -- so the
+    kernel asserts it. Dropping the keyword leaves every other test green while production
+    starts raising DomainInvariantError on exactly the concurrency the pool ceiling invites,
+    which is why this pins the assertion itself rather than a vector comparison. Store-side
+    semantics are covered by tests/integration/test_pgvector.py.
+    """
+    store = InMemoryStore()
+    kernel = _kernel(store, RecordingAnswerer(), embedder=RecordingEmbedder())
+
+    await kernel.remember(_remember_request(idempotency_key="remember-reencode"))
+
+    assert store.reencoding_allowed == [True]
 
 
 async def test_remember_indexes_one_pinned_memory_document() -> None:
@@ -898,19 +940,236 @@ async def test_remember_indexes_one_pinned_memory_document() -> None:
     assert embedding.created_at == memory.created_at
 
 
-async def test_remember_retry_repairs_embedding_after_model_failure() -> None:
+async def test_remember_encodes_a_whole_batch_in_one_embedder_call() -> None:
+    """The encoder round trip is the expensive part of remembering, so a batch of N
+    must cost one call carrying N inputs -- not N calls carrying one input each.
+    """
+    store = InMemoryStore()
+    embedder = RecordingEmbedder()
+    summaries = tuple(f"fact {index}" for index in range(12))
+
+    results = await _kernel(store, RecordingAnswerer(), embedder=embedder).remember(
+        tuple(
+            _remember_request(idempotency_key=f"batch-{index}").model_copy(
+                update={"summary": summary}
+            )
+            for index, summary in enumerate(summaries)
+        )
+    )
+
+    assert embedder.document_batch_sizes == [len(summaries)]
+    assert embedder.memory_documents == list(summaries)
+    # Order is the contract: result[i] must be the memory for requests[i].
+    assert tuple(result.summary for result in results) == summaries
+    assert len(store.embeddings) == len(summaries)
+
+
+async def test_remember_returns_one_result_for_one_request_and_a_batch_for_a_batch() -> None:
+    """One request in, one result out; a batch in, results in request order out.
+    The batch still costs exactly one encoder call, which is the point of taking one.
+    """
+    embedder = RecordingEmbedder()
+    kernel = _kernel(InMemoryStore(), RecordingAnswerer(), embedder=embedder)
+
+    single = await kernel.remember(
+        _remember_request(idempotency_key="shape-single").model_copy(update={"summary": "only one"})
+    )
+    batch = await kernel.remember(
+        tuple(
+            _remember_request(idempotency_key=f"shape-{index}").model_copy(
+                update={"summary": f"fact {index}"}
+            )
+            for index in range(3)
+        )
+    )
+
+    # `RememberResult`, not a `MemoryResult`: a write result is a sibling of a read result,
+    # so isinstance here also pins that it never became substitutable for one.
+    assert isinstance(single, RememberResult)
+    assert not isinstance(single, MemoryResult)
+    assert single.summary == "only one"
+    assert isinstance(batch, tuple)
+    assert [item.summary for item in batch] == ["fact 0", "fact 1", "fact 2"]
+    # One call for the single, one for the batch of three -- not one per memory.
+    assert embedder.document_batch_sizes == [1, 3]
+
+
+async def test_remember_reads_a_list_as_a_batch_not_as_one_request() -> None:
+    """Dispatch discriminates on the single request, so a caller passing a list
+    gets a batch rather than an attribute error deep in the write path.
+    """
+    kernel = _kernel(InMemoryStore(), RecordingAnswerer(), embedder=RecordingEmbedder())
+    requests = [
+        _remember_request(idempotency_key=f"list-{index}").model_copy(
+            update={"summary": f"fact {index}"}
+        )
+        for index in range(2)
+    ]
+
+    results = await kernel.remember(cast(tuple[RememberRequest, ...], requests))
+
+    assert [item.summary for item in results] == ["fact 0", "fact 1"]
+
+
+async def test_remember_bounds_its_write_fan_out() -> None:
+    """A single extraction can yield dozens of memories, and each write is up to
+    three pooled connections. Without a cap the batch queues behind itself inside
+    the pool; this is the bound the AML route used to own before the fan-out moved
+    here with it.
+    """
+    store = _ConcurrencyTrackingStore()
+    kernel = _kernel(store, RecordingAnswerer(), embedder=RecordingEmbedder())
+
+    # A fixed batch size, well above the bound: deriving it from the constant under
+    # test would move both sides of the assertion together and never fail.
+    await kernel.remember(
+        tuple(
+            _remember_request(idempotency_key=f"bounded-{index}").model_copy(
+                update={"summary": f"fact {index}"}
+            )
+            for index in range(32)
+        )
+    )
+
+    assert store.max_concurrent_writes == _MAX_CONCURRENT_MEMORY_WRITES
+
+
+async def test_remember_settles_every_write_before_a_failure_propagates() -> None:
+    """A batch that fails must not leave sibling writes running after the caller is told."""
+    # A bare gather returns on the first exception while its siblings keep going detached, so
+    # the route answers 4xx/5xx while writes it never reported continue against a store whose
+    # request scope is already unwinding. Counting completions after the raise is what
+    # separates "settled" from "abandoned": the failing write is the earliest one, so every
+    # other write is still in flight at the moment the exception is raised.
+    store = _FailingWriteStore(failing_summary="fact 0")
+    kernel = _kernel(store, RecordingAnswerer(), embedder=RecordingEmbedder())
+
+    with pytest.raises(DomainInvariantError, match="write refused"):
+        await kernel.remember(
+            tuple(
+                _remember_request(idempotency_key=f"settle-{index}").model_copy(
+                    update={"summary": f"fact {index}"}
+                )
+                for index in range(8)
+            )
+        )
+
+    assert store.finished == 8
+
+
+class _FailingWriteStore(InMemoryStore):
+    """Fails one write and records how many others ran to completion."""
+
+    def __init__(self, *, failing_summary: str) -> None:
+        super().__init__()
+        self._failing_summary = failing_summary
+        self.finished = 0
+
+    async def write_memory(
+        self,
+        memory: MemoryRecord,
+        *,
+        idempotency_key: str,
+        content_digest: str,
+    ) -> MemoryWriteResult:
+        if memory.summary == self._failing_summary:
+            self.finished += 1
+            raise DomainInvariantError("write refused")
+        # Yield twice so this write is demonstrably still pending when the failure is raised.
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        result = await super().write_memory(
+            memory,
+            idempotency_key=idempotency_key,
+            content_digest=content_digest,
+        )
+        self.finished += 1
+        return result
+
+
+class _ConcurrencyTrackingStore(InMemoryStore):
+    """Records the highest number of overlapping `write_memory` calls."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._in_flight = 0
+        self.max_concurrent_writes = 0
+
+    async def write_memory(
+        self,
+        memory: MemoryRecord,
+        *,
+        idempotency_key: str,
+        content_digest: str,
+    ) -> MemoryWriteResult:
+        self._in_flight += 1
+        self.max_concurrent_writes = max(self.max_concurrent_writes, self._in_flight)
+        await asyncio.sleep(0)  # yield so overlapping writes can pile up
+        try:
+            return await super().write_memory(
+                memory,
+                idempotency_key=idempotency_key,
+                content_digest=content_digest,
+            )
+        finally:
+            self._in_flight -= 1
+
+
+async def test_remember_writes_nothing_when_the_embedder_fails() -> None:
+    """Embedding precedes the write, so a model failure leaves no half-written memory."""
     store = InMemoryStore()
     embedder = RecordingEmbedder(memory_document_failures=1)
     kernel = _kernel(store, RecordingAnswerer(), embedder=embedder)
-    request = _remember_request(idempotency_key="remember-repair-01")
+    request = _remember_request(idempotency_key="remember-unwritten-01")
 
     with pytest.raises(ModelUnavailableError, match="temporary embedding failure"):
         await kernel.remember(request)
+
+    assert store.memories == {}
+    assert store.embeddings == {}
+
+
+async def test_remember_retry_repairs_an_unindexed_memory() -> None:
+    """A memory whose index write failed is repaired by the retry, not skipped as a duplicate."""
+    # The orphan has to come from the index write rather than the embedder: `remember` embeds
+    # before it writes, so an embedder failure now leaves nothing behind at all (above). This
+    # is the surviving way to reach the repair -- the row lands, its vector does not, and the
+    # retry sees `created=False` and must still index it. Written as a mutation guard: making
+    # `_index_memory` skip every duplicate leaves the memory permanently unretrievable by
+    # vector search, and only the embedding assertion here notices.
+    store = _FailingEmbeddingWriteStore()
+    kernel = _kernel(store, RecordingAnswerer(), embedder=RecordingEmbedder())
+    request = _remember_request(idempotency_key="remember-repair-01")
+
+    with pytest.raises(DomainInvariantError, match="index unavailable"):
+        await kernel.remember(request)
+    assert len(store.memories) == 1
+    assert store.embeddings == {}
+
     repaired = await kernel.remember(request)
 
     assert len(store.memories) == 1
     assert len(store.embeddings) == 1
     assert next(iter(store.embeddings.values())).object_id == repaired.memory_id
+
+
+class _FailingEmbeddingWriteStore(InMemoryStore):
+    """Refuses the first embedding write so the first remember leaves an unindexed memory."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._refusals = 1
+
+    async def write_embedding(
+        self,
+        embedding: EmbeddingRecord,
+        *,
+        allow_reencoding: bool = False,
+    ) -> bool:
+        if self._refusals:
+            self._refusals -= 1
+            raise DomainInvariantError("index unavailable")
+        return await super().write_embedding(embedding, allow_reencoding=allow_reencoding)
 
 
 async def test_hidden_evidence_is_still_used_for_answering() -> None:

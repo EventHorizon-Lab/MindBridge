@@ -26,7 +26,7 @@ from mindbridge.application.summary_consolidation import (
 )
 from mindbridge.core import DomainInvariantError, MemoryId, ModelOutputError
 from mindbridge.prompts import CONSOLIDATE_SUMMARIES_PROMPT
-from mindbridge.telemetry import set_current_span_attributes, trace_operation
+from mindbridge.telemetry import operation_span, set_current_span_attributes
 
 _SummaryText = Annotated[
     str, StringConstraints(strip_whitespace=True, min_length=1, max_length=4096)
@@ -78,7 +78,7 @@ class SummaryPipeline:
         self._generator = generator
         self._max_output_tokens = max_output_tokens
 
-    @trace_operation("mindbridge.pipeline.summaries")
+    @operation_span("mindbridge.pipeline.summaries")
     async def propose_summaries(
         self,
         candidates: tuple[SummaryCandidate, ...],

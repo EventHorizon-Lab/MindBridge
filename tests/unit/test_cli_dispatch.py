@@ -59,7 +59,7 @@ def test_both_version_spellings_work_on_a_subcommand_and_on_a_tree(
     assert capsys.readouterr().out.strip() == expected
     assert bench_cli.main([flag]) == 0
     assert capsys.readouterr().out.strip() == expected
-    for tree, argv in ((cli, ["lifecycle", flag]), (bench_cli, ["locomo", flag])):
+    for tree, argv in ((cli, ["lifecycle", flag]), (bench_cli, ["locomo-refined", flag])):
         with pytest.raises(SystemExit) as exit_info:
             tree.main(argv)
         assert exit_info.value.code == 0
@@ -144,9 +144,9 @@ def test_an_infrastructure_failure_is_one_line_too(capsys: pytest.CaptureFixture
     def handler(argv: Sequence[str], *, prog: str) -> None:
         raise RuntimeError("POST /remember failed with 401")
 
-    assert cli.invoke(handler, [], prog="mindbridge-bench locomo") == 1
+    assert cli.invoke(handler, [], prog="mindbridge-bench locomo-refined") == 1
     assert capsys.readouterr().err == (
-        "mindbridge-bench locomo: error: POST /remember failed with 401\n"
+        "mindbridge-bench locomo-refined: error: POST /remember failed with 401\n"
     )
 
 

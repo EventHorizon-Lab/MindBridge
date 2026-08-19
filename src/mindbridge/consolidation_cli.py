@@ -17,6 +17,7 @@ from mindbridge.application.consolidate_summaries import ConsolidateSummaries
 from mindbridge.application.consolidation import ConsolidateEpisodes
 from mindbridge.application.consolidation_sweep import (
     ConsolidationSweepSummary,
+    SweepSummary,
     consolidate_tenant_claims,
     consolidate_tenant_episodes,
     consolidate_tenant_summaries,
@@ -31,7 +32,10 @@ from mindbridge.configuration import (
     validate_plugin_name,
 )
 from mindbridge.core import TenantId, utc_now
-from mindbridge.infrastructure.postgres import PostgresMemoryStore
+from mindbridge.infrastructure.postgres import (
+    PostgresMemoryStore,
+    resolve_database_max_pool_size,
+)
 from mindbridge.infrastructure.s3 import (
     ObjectStorageEnvironment,
     S3MediaAccess,
@@ -165,6 +169,7 @@ async def _run_postgres_sweep(
         embedding_dimension=require_matryoshka_dimension(
             int(cast(int, settings.embedder_config.get("dimension", DEFAULT_EMBEDDING_DIMENSION)))
         ),
+        max_pool_size=resolve_database_max_pool_size(),
     )
     media_access = S3MediaAccess(settings.object_storage)
     async with AsyncExitStack() as resources:
@@ -279,31 +284,20 @@ def _parser(prog: str | None = None) -> argparse.ArgumentParser:
 
 def _summary_dict(summary: ConsolidationSweepSummary) -> dict[str, object]:
     return {
-        "claims": {
-            "candidate_count": summary.claims.candidate_count,
-            "committed_relationship_count": summary.claims.committed_relationship_count,
-            "committed_semantic_claim_count": summary.claims.committed_semantic_claim_count,
-            "page_count": summary.claims.page_count,
-            "proposed_relationship_count": summary.claims.proposed_relationship_count,
-            "proposed_semantic_claim_count": summary.claims.proposed_semantic_claim_count,
-            "scanned_count": summary.claims.scanned_count,
-        },
-        "episodes": {
-            "candidate_count": summary.episodes.candidate_count,
-            "committed_count": summary.episodes.committed_count,
-            "page_count": summary.episodes.page_count,
-            "proposed_count": summary.episodes.proposed_count,
-            "scanned_count": summary.episodes.scanned_count,
-        },
-        "summaries": {
-            "candidate_count": summary.summaries.candidate_count,
-            "committed_count": summary.summaries.committed_count,
-            "page_count": summary.summaries.page_count,
-            "proposed_count": summary.summaries.proposed_count,
-            "scanned_count": summary.summaries.scanned_count,
-        },
+        "claims": _sweep_dict(summary.claims),
+        "episodes": _sweep_dict(summary.episodes),
+        "summaries": _sweep_dict(summary.summaries),
         "evaluated_at": summary.episodes.evaluated_at.isoformat(),
         "tenant_id": summary.episodes.tenant_id,
+    }
+
+
+def _sweep_dict(sweep: SweepSummary) -> dict[str, int]:
+    return {
+        "candidate_count": sweep.candidate_count,
+        "page_count": sweep.page_count,
+        "scanned_count": sweep.scanned_count,
+        **sweep.counts,
     }
 
 

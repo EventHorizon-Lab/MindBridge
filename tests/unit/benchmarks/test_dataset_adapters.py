@@ -9,7 +9,7 @@ import pytest
 from mindbridge.benchmarks.egolife_qa import load_egolife_qa
 from mindbridge.benchmarks.egomem_reason import load_egomem_reason
 from mindbridge.benchmarks.egotempo import load_egotempo
-from mindbridge.benchmarks.locomo import load_locomo
+from mindbridge.benchmarks.locomo_refined import load_locomo_refined
 from mindbridge.benchmarks.m3_bench import load_m3_bench
 from mindbridge.benchmarks.memlens import load_memlens, load_memlens_agent_subset
 from mindbridge.benchmarks.mm_lifelong import MMLifelongSplit, load_mm_lifelong
@@ -34,13 +34,15 @@ class _FakeParquet:
         return _FakeArrowTable(cls.rows)
 
 
-def test_locomo_adapter_orders_sessions_and_normalizes_adversarial_qa(tmp_path: Path) -> None:
-    dataset_path = tmp_path / "locomo10.json"
+def test_locomo_refined_adapter_orders_sessions_and_uses_official_question_ids(
+    tmp_path: Path,
+) -> None:
+    dataset_path = tmp_path / "locomo_refined.json"
     dataset_path.write_text(
         json.dumps(
             [
                 {
-                    "sample_id": "conv-01",
+                    "sample_id": "conv-26",
                     "conversation": {
                         "speaker_a": "Caroline",
                         "speaker_b": "Melanie",
@@ -62,15 +64,17 @@ def test_locomo_adapter_orders_sessions_and_normalizes_adversarial_qa(tmp_path: 
                     "qa": [
                         {
                             "question": "What happened first?",
-                            "answer": "Earlier turn",
+                            "answer": ["Earlier turn"],
                             "evidence": ["D1:1; D2:1"],
                             "category": 2,
+                            "is_multi_modality": True,
                         },
                         {
-                            "question": "What was never discussed?",
-                            "answer": "A distractor",
-                            "evidence": [],
-                            "category": 5,
+                            "question": "When did Melanie paint a sunrise?",
+                            "answer": [2022],
+                            "evidence": ["D2:1"],
+                            "category": 2,
+                            "is_multi_modality": False,
                         },
                     ],
                 }
@@ -79,13 +83,21 @@ def test_locomo_adapter_orders_sessions_and_normalizes_adversarial_qa(tmp_path: 
         encoding="utf-8",
     )
 
-    conversation = load_locomo(dataset_path)[0]
+    conversation = load_locomo_refined(dataset_path)[0]
 
     assert [turn.dialog_id for turn in conversation.turns] == ["D1:1", "D2:1"]
     assert conversation.turns[0].occurred_at.isoformat() == "2023-05-08T13:56:00+00:00"
     assert conversation.turns[0].image_sources[0].startswith("data:image/jpeg;base64,")
     assert conversation.questions[0].evidence_dialog_ids == ("D1:1", "D2:1")
-    assert conversation.questions[1].reference_answers == ("Not mentioned in the conversation",)
+    assert conversation.questions[0].is_multi_modality is True
+    # `{sample_id}#q{index:04d}`, zero-based, is the release's own `qa_id` -- the key its
+    # evaluator joins predictions on, so a drift here silently scores nothing.
+    assert [question.question_id for question in conversation.questions] == [
+        "conv-26#q0000",
+        "conv-26#q0001",
+    ]
+    # `data/public/questions.jsonl` publishes the six numeric golds as strings.
+    assert conversation.questions[1].reference_answers == ("2022",)
 
 
 def test_m3_bench_adapter_preserves_multimodal_question_metadata(tmp_path: Path) -> None:

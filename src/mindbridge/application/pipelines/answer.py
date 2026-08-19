@@ -29,7 +29,7 @@ from mindbridge.application.ports import GeneratedAnswer, ResolvedQueryMedia
 from mindbridge.contracts import RecallRequest
 from mindbridge.core import MemoryId, MemoryRecord, ModelOutputError
 from mindbridge.prompts import ANSWER_FROM_EVIDENCE_PROMPT, SELECT_OCCURRENCES_PROMPT
-from mindbridge.telemetry import set_current_span_attributes, trace_operation
+from mindbridge.telemetry import operation_span, set_current_span_attributes
 
 _NonEmptyAnswer = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 _RetrievalQuery = Annotated[
@@ -76,7 +76,7 @@ class AnswerPipeline:
         self._generator = generator
         self._max_output_tokens = max_output_tokens
 
-    @trace_operation("mindbridge.pipeline.answer")
+    @operation_span("mindbridge.pipeline.answer")
     async def answer(
         self,
         request: RecallRequest,
@@ -129,7 +129,7 @@ class OccurrencePipeline:
         self._generator = generator
         self._max_output_tokens = max_output_tokens
 
-    @trace_operation("mindbridge.pipeline.occurrences")
+    @operation_span("mindbridge.pipeline.occurrences")
     async def select_occurrences(
         self,
         request: RecallRequest,

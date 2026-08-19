@@ -9,7 +9,7 @@ a shared conversation.
 
 The vendored `longmemeval-s` pipeline is a byte-for-byte copy of the LoCoMo
 pipeline (same answer/evaluation contracts), so the payload shape mirrors
-`loaders/locomo.py`: rename the dataset's `answer` to `gold_answer` and carry
+`loaders/locomo_refined.py`: rename the dataset's `answer` to `gold_answer` and carry
 the dataset's `question_id` as `id`. LongMemEval is single-user, so the
 `speaker_2_*` keys the shared pipeline optionally reads are simply omitted
 rather than emitted empty.

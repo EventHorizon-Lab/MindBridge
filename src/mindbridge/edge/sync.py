@@ -30,7 +30,6 @@ from mindbridge.telemetry import (
     operation_span,
     record_stage_duration,
     set_current_span_attributes,
-    trace_operation,
 )
 
 if TYPE_CHECKING:
@@ -126,7 +125,7 @@ class EdgeObservationSynchronizer:
         self._recent_memory = recent_memory
         self._clock = clock or utc_now
 
-    @trace_operation("mindbridge.edge.sync_observation")
+    @operation_span("mindbridge.edge.sync_observation")
     async def sync_next(self) -> ObservationReceipt | None:
         """Synchronize the oldest item, leaving it durable after any network failure."""
         item = self._outbox.next_pending()
@@ -148,7 +147,7 @@ class EdgeObservationSynchronizer:
             }
         )
         if not item.media_uploaded:
-            with operation_span("mindbridge.edge.upload_media"):
+            async with operation_span("mindbridge.edge.upload_media"):
                 try:
                     for media_file in item.media_files:
                         await self._upload_media(item.request, media_file)
@@ -161,7 +160,7 @@ class EdgeObservationSynchronizer:
                 "edge.capture_to_upload_complete",
                 max(0.0, (uploaded_at - item.request.ended_at).total_seconds()),
             )
-        with operation_span("mindbridge.edge.observe_ack"):
+        async with operation_span("mindbridge.edge.observe_ack"):
             try:
                 receipt = await self._memory.observe(item.request)
             except Exception as error:
@@ -176,7 +175,7 @@ class EdgeObservationSynchronizer:
         )
         return receipt
 
-    @trace_operation("mindbridge.edge.sync_deletions")
+    @operation_span("mindbridge.edge.sync_deletions")
     async def sync_deletions(
         self,
         tenant_id: str,
@@ -217,7 +216,7 @@ class EdgeObservationSynchronizer:
             cursor = page.next_cursor
         return applied, False
 
-    @trace_operation("mindbridge.edge.sync_recent_memories")
+    @operation_span("mindbridge.edge.sync_recent_memories")
     async def _sync_recent_memories(
         self,
         caught_up_tenant_ids: frozenset[str],
@@ -264,7 +263,7 @@ class EdgeObservationSynchronizer:
             cached += len(fetched)
         return cached
 
-    @trace_operation("mindbridge.edge.sync_pending")
+    @operation_span("mindbridge.edge.sync_pending")
     async def sync_pending(self, *, limit: int = 100) -> tuple[ObservationReceipt, ...]:
         """Synchronize at most `limit` items so the caller controls scheduling and backoff."""
         if limit <= 0:

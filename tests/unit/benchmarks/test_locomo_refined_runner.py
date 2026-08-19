@@ -1,4 +1,4 @@
-"""Production-contract checks for the LoCoMo runner."""
+"""Production-contract checks for the LoCoMo-Refined runner."""
 
 from datetime import datetime, timezone
 from typing import cast
@@ -6,8 +6,12 @@ from typing import cast
 import pytest
 
 from mindbridge import MindBridge
-from mindbridge.benchmarks.locomo import LoCoMoConversation, LoCoMoQuestion, LoCoMoTurn
-from mindbridge.benchmarks.locomo_runner import LOCOMO_ABSTENTION, run_locomo_conversation
+from mindbridge.benchmarks.locomo_refined import (
+    LoCoMoRefinedConversation,
+    LoCoMoRefinedQuestion,
+    LoCoMoRefinedTurn,
+)
+from mindbridge.benchmarks.locomo_refined_runner import run_locomo_refined_conversation
 from mindbridge.contracts import (
     MemoryView,
     RecallRequest,
@@ -49,16 +53,16 @@ class RecordingMemoryApi:
             confidence=0.0 if self.answer is None else 0.9,
             memories=tuple(self.memories[:1]),
             evidence=(),
-            trace_id="trace_locomo",
+            trace_id="trace_locomo_refined",
         )
 
 
-async def test_locomo_uses_only_source_turns_and_questions_in_api_requests() -> None:
+async def test_locomo_refined_uses_only_source_turns_and_questions_in_api_requests() -> None:
     api = RecordingMemoryApi()
-    conversation = LoCoMoConversation(
-        sample_id="conv-01",
+    conversation = LoCoMoRefinedConversation(
+        sample_id="conv-26",
         turns=(
-            LoCoMoTurn(
+            LoCoMoRefinedTurn(
                 dialog_id="D1:1",
                 speaker="Caroline",
                 text="I started a new course.",
@@ -67,47 +71,53 @@ async def test_locomo_uses_only_source_turns_and_questions_in_api_requests() -> 
             ),
         ),
         questions=(
-            LoCoMoQuestion(
-                question_id="conv-01_Q0001",
+            LoCoMoRefinedQuestion(
+                question_id="conv-26#q0000",
                 question="What did Caroline start?",
                 reference_answers=("SECRET REFERENCE ANSWER",),
                 evidence_dialog_ids=("D1:1",),
                 category=2,
+                is_multi_modality=False,
             ),
         ),
     )
 
-    result = await run_locomo_conversation(cast(MindBridge, api), conversation, run_id="run_01")
+    predictions = await run_locomo_refined_conversation(
+        cast(MindBridge, api), conversation, run_id="run_01"
+    )
 
     assert api.remember_requests[0].summary == (
         'Caroline said: "I started a new course."\n'
         'Caroline shared an image described as: "a classroom at sunrise"'
     )
-    assert api.remember_requests[0].idempotency_key == "locomo_official_v1:conv-01:D1:1"
+    assert api.remember_requests[0].idempotency_key == "locomo_refined_v1:conv-26:D1:1"
     assert api.recall_requests[0].query.text == "What did Caroline start?"
     assert "SECRET REFERENCE ANSWER" not in api.remember_requests[0].model_dump_json()
     assert "SECRET REFERENCE ANSWER" not in api.recall_requests[0].model_dump_json()
-    assert result.qa[0].answer == "SECRET REFERENCE ANSWER"
-    assert result.qa[0].mindbridge_prediction == LOCOMO_ABSTENTION
-    assert result.qa[0].mindbridge_abstained is True
-    assert result.qa[0].mindbridge_prediction_context == ("D1:1",)
-    assert result.qa[0].mindbridge_trace_id == "trace_locomo"
+    # The official evaluator joins on `qa_id` alone, so the row must carry the release's own
+    # id and nothing that would leak the gold answer back into the scored artifact.
+    assert predictions[0].qa_id == "conv-26#q0000"
+    assert predictions[0].predicted_answer == ""
+    assert predictions[0].mindbridge_answered is False
+    assert predictions[0].mindbridge_prediction_context == ("D1:1",)
+    assert predictions[0].mindbridge_trace_id == "trace_locomo_refined"
 
 
-async def test_locomo_marks_an_answered_question_as_not_abstained() -> None:
-    """The adversarial reference string is also a valid answer, so scoring needs the flag."""
+async def test_locomo_refined_writes_the_recalled_answer_as_the_prediction() -> None:
     api = RecordingMemoryApi()
     api.answer = "A new course."
 
-    result = await run_locomo_conversation(cast(MindBridge, api), _conversation(), run_id="run_01")
+    predictions = await run_locomo_refined_conversation(
+        cast(MindBridge, api), _conversation(), run_id="run_01"
+    )
 
-    assert result.qa[0].mindbridge_prediction == "A new course."
-    assert result.qa[0].mindbridge_abstained is False
+    assert predictions[0].predicted_answer == "A new course."
+    assert predictions[0].mindbridge_answered is True
 
 
-async def test_locomo_rejects_unbounded_or_empty_request_pool() -> None:
+async def test_locomo_refined_rejects_unbounded_or_empty_request_pool() -> None:
     with pytest.raises(ValueError, match="positive"):
-        await run_locomo_conversation(
+        await run_locomo_refined_conversation(
             cast(MindBridge, RecordingMemoryApi()),
             _conversation(),
             run_id="run_01",
@@ -115,23 +125,24 @@ async def test_locomo_rejects_unbounded_or_empty_request_pool() -> None:
         )
 
 
-async def test_locomo_uses_the_same_recall_budget_for_every_question_wording() -> None:
+async def test_locomo_refined_uses_the_same_recall_budget_for_every_question_wording() -> None:
     api = RecordingMemoryApi()
     conversation = _conversation().model_copy(
         update={
             "questions": (
-                LoCoMoQuestion(
-                    question_id="conv-01_Q0001",
+                LoCoMoRefinedQuestion(
+                    question_id="conv-26#q0000",
                     question="Would Caroline likely enjoy another course?",
                     reference_answers=("Yes",),
                     evidence_dialog_ids=("D1:1",),
-                    category=1,
+                    category=3,
+                    is_multi_modality=False,
                 ),
             )
         }
     )
 
-    await run_locomo_conversation(
+    await run_locomo_refined_conversation(
         cast(MindBridge, api),
         conversation,
         run_id="run_01",
@@ -141,11 +152,11 @@ async def test_locomo_uses_the_same_recall_budget_for_every_question_wording() -
     assert api.recall_requests[0].limit == 20
 
 
-def _conversation() -> LoCoMoConversation:
-    return LoCoMoConversation(
-        sample_id="conv-01",
+def _conversation() -> LoCoMoRefinedConversation:
+    return LoCoMoRefinedConversation(
+        sample_id="conv-26",
         turns=(
-            LoCoMoTurn(
+            LoCoMoRefinedTurn(
                 dialog_id="D1:1",
                 speaker="Caroline",
                 text="Hello",
@@ -153,12 +164,13 @@ def _conversation() -> LoCoMoConversation:
             ),
         ),
         questions=(
-            LoCoMoQuestion(
-                question_id="conv-01_Q0001",
+            LoCoMoRefinedQuestion(
+                question_id="conv-26#q0000",
                 question="What happened?",
                 reference_answers=("Hello",),
                 evidence_dialog_ids=("D1:1",),
                 category=1,
+                is_multi_modality=False,
             ),
         ),
     )

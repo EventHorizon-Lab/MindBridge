@@ -215,7 +215,8 @@ def _parse_arguments(argv: Sequence[str] | None, prog: str | None) -> _Arguments
         "--video-id",
         action="append",
         default=[],
-        help="official video to run; repeatable, default the whole subset",
+        help="official video to run; repeatable, default the whole subset. "
+        "Pass an ID beginning with '-' as --video-id=ID",
     )
     parsed = parser.parse_args(argv)
     return media_arguments(

@@ -3,7 +3,14 @@
 import pytest
 
 import mindbridge.api.runtime as runtime_module
+import mindbridge.consolidation_cli as consolidation_cli
+import mindbridge.lifecycle_cli as lifecycle_cli
+import mindbridge.worker as worker
 from mindbridge.core import EmbeddedObjectType, EmbeddingSpaceReference
+from mindbridge.infrastructure.postgres import (
+    DEFAULT_DATABASE_MAX_POOL_SIZE,
+    resolve_database_max_pool_size,
+)
 from mindbridge.server import ObjectStorageEnvironment, Settings, create_app
 
 SPACE = EmbeddingSpaceReference(space_id="jina-v5", revision="space-v1")
@@ -216,3 +223,22 @@ def _environment() -> dict[str, str]:
         "MINDBRIDGE_EMBEDDER_ENDPOINT": "https://query.example.test/v1",
         "MINDBRIDGE_TENANT_API_KEYS_JSON": ('{"tenant_01":["tenant-api-key-000000000000000000"]}'),
     }
+
+
+def test_every_process_that_opens_a_pool_reads_one_ceiling() -> None:
+    """The variable governs the server's total, so one process honouring it is not enough."""
+    # The API, the worker, and the two sweeps share a PostgreSQL `max_connections`, so a
+    # deployment lowering the ceiling has to lower all four. Previously only Settings read the
+    # variable and the other three silently kept the default.
+    assert resolve_database_max_pool_size({}) == DEFAULT_DATABASE_MAX_POOL_SIZE
+    assert resolve_database_max_pool_size({"MINDBRIDGE_DATABASE_MAX_POOL_SIZE": "8"}) == 8
+    assert (
+        Settings.from_environment(
+            {**_environment(), "MINDBRIDGE_DATABASE_MAX_POOL_SIZE": "8"}
+        ).database_max_pool_size
+        == 8
+    )
+    with pytest.raises(ValueError, match="MINDBRIDGE_DATABASE_MAX_POOL_SIZE"):
+        resolve_database_max_pool_size({"MINDBRIDGE_DATABASE_MAX_POOL_SIZE": "0"})
+    for module in (worker, consolidation_cli, lifecycle_cli):
+        assert "resolve_database_max_pool_size" in module.__dict__

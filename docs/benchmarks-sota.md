@@ -2,7 +2,7 @@
 
 > 状态：目标基线，不代表 MindBridge 已取得任何一项分数
 >
-> 更新日期：2026-08-17
+> 更新日期：2026-08-18
 >
 > 范围：`src/mindbridge/benchmarks/` 中已有官方适配器的九个 Benchmark
 >
@@ -10,12 +10,12 @@
 
 ## 1. 结论
 
-九个 Benchmark 里只有 **LoCoMo** 和 **Video-MME** 存在真正意义上的工业榜；其余七个是纯学术榜，
+九个 Benchmark 里只有 **LoCoMo-Refined** 和 **Video-MME** 存在真正意义上的工业榜；其余七个是纯学术榜，
 最强系统全部来自论文。这决定了 MindBridge 的超越策略在两条赛道上完全不同：
 
 | Benchmark | 官方指标 | 学术 SOTA | 工业 SOTA | MindBridge 需越过的线 |
 | --- | --- | --- | --- | --- |
-| LoCoMo | 5 类 F1 + LLM-judge | HMO 45.65 F1 | Zep 94.7 / Mem0 92.5（自测，口径不可比） | 官方 5 类 F1 > 45.65，且归一化口径 > 88.2 |
+| LoCoMo-Refined | 4 类 LLM-judge（Qwen3-14B refined prompt） | 无（发布方未收录论文系统） | MemoraX AI 82.65 | 官方 judge 下 > 82.65 |
 | Video-MME | MCQ Accuracy | video-SALMONN 2+ 81.6（含字幕） | Qwen3.8 Max 90.4（含字幕） | 记忆赛道先超 M3-Agent 的 long 61.8 |
 | EgoLifeQA | 四选一 Accuracy | EgoGraph 45.8 | 无 | > 45.8（公开集 = A1_JAKE 500 题） |
 | EgoTempo | 开放式 LLM-judge Acc | GPT-4o 42.0（人类 63.2） | 无 | > 42.0，目标逼近 63.2 |
@@ -32,22 +32,26 @@
    34.0，纯 MLLM 是 39.6。这正是 MindBridge 的正面战场：证明结构化记忆不是有损压缩。
 2. **MM-Lifelong 的证据定位几乎无人做**。ReMA 的 Ref@300 是 15.46，GPT-5 是 0.44——差两个数量
    级。MindBridge 的证据优先架构（原始视听跨度是最终证据）天然产出可定位区间。
-3. **LoCoMo 的工业分数不能直接对标**。92.5/94.7 这类数字来自各家自定的 judge、backbone 和 4 类
-   题面；同一批系统在统一口径下重跑只有 66.9–88.2。
+3. **LoCoMo 的旧工业分数已经作废**。92.5/94.7 这类数字来自各家自定的 judge、backbone 和 4 类
+   题面。LoCoMo-Refined 用统一的官方 judge 重打了同一批系统预测，EverMemOS、MemOS、MemPalace、
+   Mem0 分别掉了 22.07、17.30、15.78、15.56 个百分点——差距本来就在 judge 里，不在系统里。
 
 ## 2. 评测口径警告
 
 在报任何分数之前，这四条必须先落到 runner 里，否则数字无法被外部采信。
 
-**LoCoMo 的答案键本身有问题。** 一份公开审计发现 1,540 题里有 99 题（6.4%）答案键错误，且官方
-gpt-4o-mini judge 会接受最多 63% 的"故意写错"答案——具体失效模式是：答案找对了会话、但没有任何
-细节时也判对，这恰好奖励弱检索。同一份审计称 56% 的分类对比与噪声无法区分。
+**原始 LoCoMo 的答案键和 judge 都不可用，这正是换成 LoCoMo-Refined 的原因。** 一份公开审计发现
+1,540 题里有 99 题（6.4%）答案键错误，且官方 gpt-4o-mini judge 会接受最多 63% 的"故意写错"答案
+——具体失效模式是：答案找对了会话、但没有任何细节时也判对，这恰好奖励弱检索。
 （[审计](https://penfieldlabs.substack.com/p/we-audited-locomo-64-of-the-answer)、[代码](https://github.com/dial481/locomo-audit)）
+[LoCoMo-Refined](https://github.com/mem-eval-suite/LoCoMo_refined) 由 5 名标注者修订了 1,382 题
+中的 337 题（措辞歧义、主客体反转、时间与原对话不一致），并换上一套要求"包含而不矛盾、完整而不
+越界"的 judge：在 300 条人工标注上，与人类一致率从 43.67% 提到 86.33%。
 
-**LoCoMo 的厂商分数口径互不相同。** 多数厂商只报 4 类（剔除 adversarial），且 answer model、
-response prompt、judge prompt 各不相同。统一口径重跑后：Dakera 88.2、Zep 修正 75.1、Letta
-Filesystem 74.0、Continua 74.4、Mem0（Letta 第三方评测）68.5。
-（[Continua 归一化重跑](https://blog.continua.ai/p/the-locomo-fair-fight)、[Dakera 对照表](https://dakera.ai/benchmark/)）
+**旧的"统一口径重跑"数字同样过期。** 那批数字（Dakera 88.2、Zep 修正 75.1、Letta Filesystem
+74.0、Continua 74.4、Mem0 68.5）统一的是 answer model 和 response prompt，judge 仍是原始那个。
+现在唯一有意义的统一口径是 LoCoMo-Refined 自带的 `Qwen/Qwen3-14B` + refined prompt。
+（历史参考：[Continua 归一化重跑](https://blog.continua.ai/p/the-locomo-fair-fight)、[Dakera 对照表](https://dakera.ai/benchmark/)）
 
 **Video-MME v1 已经饱和。** 官方 leaderboard 最后一次更新是 2025-09-28，前沿模型在含字幕设定下已
 到 90.4；作者自己发布的 Video-MME-v2 用组内非线性打分把 Gemini-3-Pro 打到 49.4（人类 90.7），
@@ -59,33 +63,28 @@ Filesystem 74.0、Continua 74.4、Mem0（Letta 第三方评测）68.5。
 
 ## 3. 逐 Benchmark 详表
 
-### 3.1 LoCoMo — 长程对话记忆（文本）
+### 3.1 LoCoMo-Refined — 长程对话记忆（文本）
 
-官方发布 1,540 题 / 5 类（single-hop、multi-hop、open-domain、temporal、adversarial）。
+官方发布 1,382 题 / 10 段对话 / 4 类（category 1–4，按 `manifest.json` 分别是 213 / 299 / 68 /
+802 题）。原始 LoCoMo 的 adversarial（category 5）在这一版里被整体删除，所以"4 类还是 5 类"这个
+历史上最大的不可比来源已经不存在；521 题带图。
 
-学术榜（Overall F1，backbone 统一为 GPT-4o-mini，取自 [HMO](https://arxiv.org/pdf/2604.01670) Table 2）：
+唯一有意义的榜是发布方用官方 judge（`Qwen/Qwen3-14B` + refined prompt，temperature 0，关思考
+模式）重打同一批系统预测得到的：
 
-| 名次 | 方法 | Overall F1 |
-| --- | --- | --- |
-| 1 | HMO | 45.65 |
-| 2 | MemVerse | 43.44 |
-| 3 | MemoryOS | 42.84 |
-
-HMO 分项：Single-Hop 48.24、Open-Domain 51.08、Temporal 35.66、Multi-Hop 32.15。
-
-工业榜（厂商自测 LLM-judge accuracy，**互不可比**）：
-
-| 名次 | 系统 | 分数 | 备注 |
+| 名次 | 系统 | LoCoMo-Refined | 相对原始 judge 的跌幅 |
 | --- | --- | --- | --- |
-| 1 | Zep | 94.7 | Graphiti 时序知识图谱，自测 |
-| 2 | Mem0 2026 算法 | 92.5 | 6,956 tokens/查询 |
-| 3 | [ByteRover 2.0](https://www.byterover.dev/blog/benchmark-ai-agent-memory) | 92.2 | 含 adversarial 的 5 类；用 Hindsight 评测 prompt + Gemini 3 |
+| 1 | MemoraX AI | 82.65 | 未公布 |
+| 2 | MemOS | 63.60 | 17.30 |
+| 3 | MemPalace | 58.68 | 15.78 |
+| 4 | EverMemOS | 58.25 | 22.07 |
+| 5 | Mem0 | 48.91 | 15.56 |
 
-ByteRover 是这批里唯一公开了 5 类分项的：Single-Hop 95.4、Temporal 94.4、Multi-Hop 85.1、
-Open-Domain 77.2。Hindsight（Gemini-3）89.6 紧随其后。
+跌幅那一列才是重点：同一批预测、同一批题，只换 judge 就掉 15–22 个百分点。任何引用原始 LoCoMo
+9x 分数的比较都应视为无效。
 
-**MindBridge 目标**：官方 5 类 F1 超过 45.65；同时在 Continua/Dakera 归一化口径下超过 88.2，并
-公开 judge 模型、answer backbone 和是否含 adversarial。只报一个 9x 的数字没有意义。
+**MindBridge 目标**：官方 judge 下超过 82.65，并公开 answer backbone、judge 模型与 `--llm-judge`
+用的是 `refined` 还是 `original`。用 `original` judge 报出来的数字不计入。
 
 ### 3.2 Video-MME — 通用视频理解
 
@@ -299,31 +298,33 @@ Video-RAG 全面优于 EgoButler。论文指出：83.9 的可答性判别配上 
 
 ### 4.1 已落地
 
-**外部 scorer 绑定（LoCoMo / MM-Lifelong / EgoMemReason 共用）。** 这三个 benchmark 的分数都由
-MindBridge 之外的程序产出：LoCoMo 用 `snap-research/locomo`，MM-Lifelong 用其发布的 scorer，
-EgoMemReason 用留出答案键的 leaderboard。run manifest 在 scorer 运行之前就写完了，结构上不可能
-装下结果，所以结果落在一个独立的 `*.score.json` sidecar 里：
+**外部 scorer 绑定（LoCoMo-Refined / MM-Lifelong / EgoMemReason 共用）。** 这三个 benchmark 的
+分数都由 MindBridge 之外的程序产出：LoCoMo-Refined 用 `mem-eval-suite/LoCoMo_refined`，
+MM-Lifelong 用其发布的 scorer，EgoMemReason 用留出答案键的 leaderboard。run manifest 在 scorer
+运行之前就写完了，结构上不可能装下结果，所以结果落在一个独立的 `*.score.json` sidecar 里：
 
 ```bash
 uv run mindbridge-bench score \
-  --predictions runs/locomo/predictions.json \
-  --manifest runs/locomo/predictions.json.manifest.json \
-  --scorer-output runs/locomo/official-scorer-stdout.json \
-  --scorer-repository snap-research/locomo \
-  --scorer-revision 3eb6f2c585f5e1699204e3c3bdf7adc5c28cb376 \
-  --scorer-command "python evaluation/evaluate.py --data predictions.json" \
-  --judge-model gpt-4o-mini \
+  --predictions runs/locomo-refined/predictions.jsonl \
+  --manifest runs/locomo-refined/predictions.jsonl.manifest.json \
+  --scorer-output runs/locomo-refined/official-scorer-summary.json \
+  --scorer-repository mem-eval-suite/LoCoMo_refined \
+  --scorer-revision 887091190789e8d6760e70b9edd696539923dc4f \
+  --scorer-command "./scripts/run_eval.sh --metrics llm f1 bleu --llm-judge refined" \
+  --judge-model Qwen/Qwen3-14B \
   --answer-backbone qwen3.8-max \
-  --scored-question-count 1540 \
-  --metric f1=45.65
+  --scored-question-count 1382 \
+  --metric llm=82.65
 ```
 
 sidecar 会重新计算 predictions 的 sha256，与 manifest 里的不一致就拒绝写入——因此一个公布出去的
 分数必然绑定到真实跑出来的那份预测，而不是"据说"。judge 模型与 answer backbone 是必填语义位，
-正是 LoCoMo 各家不可比的根因。
+正是 LoCoMo 各家不可比的根因；`run_eval.sh` 同时接受 `refined` 与 `original` 两套 judge，用哪一套
+必须写进 `--scorer-command`。
 
-**LoCoMo 分类别题量。** manifest 新增 `category_question_counts`，读者可以直接看出这次报的是 4 类
-还是 5 类（含 adversarial）。
+**LoCoMo-Refined 分类别题量。** manifest 保留 `category_question_counts`。adversarial 已被删除，
+所以它不再区分两套协议，但 1,382 题里有 802 题是 category 4，子集跑法很容易把题型分布跑歪而不
+自知。
 
 **EgoLifeQA 五类指标。** `EgoLifeMetrics` 新增 `categories`，与论文表格逐列对齐；预测行新增
 `subject_id`，标明证据来自哪位佩戴者的流。
@@ -348,10 +349,12 @@ sidecar 会重新计算 predictions 的 sha256，与 manifest 里的不一致就
 分数必须来自 MindBridge 的整体能力，不得来自题面识别、judge 迎合或数据集专用旁路。在本文列出的
 数字面前，这条约束有几个具体落点：
 
-- LoCoMo 的 judge 会接受"找对会话但零细节"的答案。**刻意生成模糊回答**能提分，但这正是弱检索的
-  特征，禁止。
-- SuperMemory-VQA 与 LoCoMo 的 adversarial 都有拒答选项。**按题型统计规律调节拒答率**能提分，
-  禁止；拒答必须由"证据不足"这一条真实判定触发。
+- 原始 LoCoMo 的 judge 会接受"找对会话但零细节"的答案，**刻意生成模糊回答**能提分。
+  LoCoMo-Refined 的 judge 反过来同时惩罚遗漏和无依据的补充，所以模糊化和堆细节两个方向都会掉分
+  ——但两者仍然都属于迎合 judge，禁止。
+- SuperMemory-VQA 仍有拒答选项。**按题型统计规律调节拒答率**能提分，禁止；拒答必须由"证据不足"
+  这一条真实判定触发。LoCoMo-Refined 没有 adversarial 类，空回答就是一次纯粹的失分，manifest 的
+  `unanswered_question_count` 就是用来看这件事的。
 - EgoLifeQA / EgoMemReason 是四选一。**利用选项文本长度或分布先验**属于题面识别，禁止。
 - Video-MME 的字幕设定。**在声称无字幕的设定下偷用字幕轨**，禁止。
 

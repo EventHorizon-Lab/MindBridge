@@ -31,7 +31,10 @@ from mindbridge.core import (
     TenantId,
     utc_now,
 )
-from mindbridge.infrastructure.postgres import PostgresMemoryStore
+from mindbridge.infrastructure.postgres import (
+    PostgresMemoryStore,
+    resolve_database_max_pool_size,
+)
 from mindbridge.infrastructure.s3 import S3MediaAccess
 from mindbridge.telemetry import configure_telemetry
 
@@ -178,7 +181,7 @@ async def _run_postgres_sweep(
     # Build object storage before the sweep so a missing variable fails fast
     # instead of after every memory in the tenant has already been evaluated.
     media_access = S3MediaAccess.from_environment() if reclaim_orphan_clips else None
-    store = PostgresMemoryStore(database_url)
+    store = PostgresMemoryStore(database_url, max_pool_size=resolve_database_max_pool_size())
     await store.open()
     try:
         # A dry run writes nothing: neither the strength sweep, which persists new strengths

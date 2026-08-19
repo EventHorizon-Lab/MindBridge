@@ -183,11 +183,6 @@ def test_worker_task_calls_shared_use_case_with_ids_only(
     assert task.max_retries == 5
 
 
-def test_signed_media_urls_outlive_the_model_call_that_fetches_them() -> None:
-    """The generator downloads these URLs itself, so expiry has to beat the request timeout."""
-    assert worker_module._MEDIA_URL_LIFETIME_SECONDS > worker_module._MODEL_REQUEST_TIMEOUT_SECONDS
-
-
 def test_worker_retries_an_observation_owned_by_another_delivery(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

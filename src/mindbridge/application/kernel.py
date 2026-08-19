@@ -8,9 +8,11 @@ import json
 import math
 from collections.abc import AsyncGenerator, Callable
 from datetime import datetime, timedelta
+from typing import cast, overload
 
 from mindbridge.application.capabilities import (
     Embedder,
+    Embedding,
     EmbedRequest,
     EmbedTask,
     ModelInput,
@@ -39,6 +41,7 @@ from mindbridge.contracts import (
     ForgetRequest,
     MediaObjectInput,
     MemoryResult,
+    MemoryWriteStatus,
     ObservationProcessingJobView,
     ObservationReceipt,
     ObservationStatus,
@@ -46,6 +49,7 @@ from mindbridge.contracts import (
     RecallRequest,
     RecallResult,
     RememberRequest,
+    RememberResult,
 )
 from mindbridge.core import (
     AnonymousIdentityObservation,
@@ -80,11 +84,13 @@ from mindbridge.telemetry import (
     current_trace_id,
     operation_span,
     set_current_span_attributes,
-    trace_operation,
 )
 
 JOB_POLL_INTERVAL_SECONDS = 1.0
 JOB_WATCH_MAXIMUM_SECONDS = 300.0
+# ponytail: one global bound on a batch's write fan-out. Per-tenant bounds only if one
+# tenant's batch is ever shown to starve another's.
+_MAX_CONCURRENT_MEMORY_WRITES = 8
 
 
 class MemoryKernel:
@@ -127,7 +133,7 @@ class MemoryKernel:
             clock=self._clock,
         )
 
-    @trace_operation("mindbridge.observe")
+    @operation_span("mindbridge.observe")
     async def observe(self, request: ObserveRequest) -> ObservationReceipt:
         """Persist one observation atomically and acknowledge retries."""
         set_current_span_attributes(
@@ -169,16 +175,82 @@ class MemoryKernel:
             trace_id=current_trace_id(),
         )
 
-    @trace_operation("mindbridge.remember")
-    async def remember(self, request: RememberRequest) -> MemoryResult:
-        """Persist explicit content without pretending unsupported input is fact."""
-        set_current_span_attributes(
-            {
-                "mindbridge.tenant.id": request.tenant_id,
-                "mindbridge.memory.type": request.memory_type.value,
-                "mindbridge.evidence.count": len(request.evidence_ids),
-            }
+    @overload
+    async def remember(self, request: RememberRequest) -> RememberResult: ...
+
+    @overload
+    async def remember(
+        self,
+        request: tuple[RememberRequest, ...],
+    ) -> tuple[RememberResult, ...]: ...
+
+    @operation_span("mindbridge.remember")
+    async def remember(
+        self,
+        request: RememberRequest | tuple[RememberRequest, ...],
+    ) -> RememberResult | tuple[RememberResult, ...]:
+        """Persist explicit content without pretending unsupported input is fact.
+
+        Takes one memory or a batch of them. A batch costs one encoder round trip
+        instead of N: `EmbedRequest.inputs` is a sequence and the bundled encoder
+        sends a whole batch as one request body, so a caller already holding N
+        memories should hand over all N rather than calling N times. One request
+        in, one result out; a batch in, results in request order out.
+
+        Dispatch tests for the single request rather than for the tuple. Asking
+        `isinstance(request, tuple)` would read a list as one request and fail
+        later on a missing attribute, whereas anything that is not one request is
+        a sequence of them.
+        """
+        requests = (request,) if isinstance(request, RememberRequest) else tuple(request)
+        set_current_span_attributes({"mindbridge.memory.batch_size": len(requests)})
+        tenant_ids = {item.tenant_id for item in requests}
+        if len(tenant_ids) == 1:
+            # Unlike `memory.type` and `evidence.count`, which genuinely vary per item, a batch
+            # has one tenant in every caller today -- so gating this on the single-request path
+            # left batch writes, the whole reason the batch API exists, invisible to a
+            # per-tenant span query. Still conditional: a future mixed batch should omit the
+            # attribute rather than label every span in it with whichever request came first.
+            set_current_span_attributes({"mindbridge.tenant.id": next(iter(tenant_ids))})
+        if len(requests) == 1:
+            set_current_span_attributes(
+                {
+                    "mindbridge.memory.type": requests[0].memory_type.value,
+                    "mindbridge.evidence.count": len(requests[0].evidence_ids),
+                }
+            )
+        if not requests:
+            return ()
+        embeddings = await self._embed_summaries(tuple(item.summary for item in requests))
+        # Bounds the write fan-out one batch can aim at the store: each write is up to
+        # three pooled connections, so an unbounded gather over a large extraction
+        # would queue behind itself inside the pool.
+        semaphore = asyncio.Semaphore(_MAX_CONCURRENT_MEMORY_WRITES)
+
+        async def write(item: RememberRequest, embedding: Embedding) -> RememberResult:
+            async with semaphore:
+                return await self._write_remembered(item, embedding)
+
+        # Every write settles before the first failure propagates. A bare gather returns on
+        # the first exception while its siblings keep running detached, so the caller would be
+        # told the batch failed while writes it cannot see continue against a store whose
+        # request scope is already unwinding -- and a second failure among them would surface
+        # only as "Task exception was never retrieved", with nothing tying it to the request.
+        settled = await asyncio.gather(
+            *(write(item, embedding) for item, embedding in zip(requests, embeddings, strict=True)),
+            return_exceptions=True,
         )
+        for outcome in settled:
+            if isinstance(outcome, BaseException):
+                raise outcome
+        results = cast("tuple[RememberResult, ...]", tuple(settled))
+        return results[0] if isinstance(request, RememberRequest) else results
+
+    async def _write_remembered(
+        self,
+        request: RememberRequest,
+        embedding: Embedding,
+    ) -> RememberResult:
         idempotency_key = request.idempotency_key or f"remember_{_request_digest(request)}"
         memory = MemoryRecord(
             memory_id=MemoryId(derive_stable_id("memory", request.tenant_id, idempotency_key)),
@@ -197,10 +269,14 @@ class MemoryKernel:
             content_digest=_request_digest(request),
         )
         stored_memory = result.memory
-        await self._index_memory(stored_memory, skip_existing=not result.created)
-        return await self._memory_result(stored_memory)
+        await self._index_memory(
+            stored_memory,
+            embedding,
+            skip_existing=not result.created,
+        )
+        return await self._remember_result(stored_memory, created=result.created)
 
-    @trace_operation("mindbridge.record_feedback")
+    @operation_span("mindbridge.record_feedback")
     async def record_feedback(self, request: FeedbackRequest) -> FeedbackReceipt:
         """Record an explainable learning signal and create a correction version when needed."""
         set_current_span_attributes(
@@ -241,7 +317,8 @@ class MemoryKernel:
             content_digest=content_digest,
         )
         if result.corrected_memory is not None:
-            await self._index_memory(result.corrected_memory)
+            (embedding,) = await self._embed_summaries((result.corrected_memory.summary,))
+            await self._index_memory(result.corrected_memory, embedding)
         return FeedbackReceipt(
             feedback_id=result.feedback_id,
             feedback_type=result.feedback_type,
@@ -255,7 +332,7 @@ class MemoryKernel:
             trace_id=current_trace_id(),
         )
 
-    @trace_operation("mindbridge.forget")
+    @operation_span("mindbridge.forget")
     async def forget(self, request: ForgetRequest) -> ForgetReceipt:
         """Explicitly erase one scope through a durable, retry-safe tombstone."""
         set_current_span_attributes(
@@ -305,7 +382,7 @@ class MemoryKernel:
             completed = plan.tombstone
         return _forget_receipt(completed)
 
-    @trace_operation("mindbridge.get_forget_status")
+    @operation_span("mindbridge.get_forget_status")
     async def get_forget_status(self, tenant_id: str, tombstone_id: str) -> ForgetReceipt:
         """Return content-free deletion progress for one tenant-owned tombstone."""
         set_current_span_attributes(
@@ -320,7 +397,7 @@ class MemoryKernel:
         )
         return _forget_receipt(tombstone)
 
-    @trace_operation("mindbridge.list_deletions")
+    @operation_span("mindbridge.list_deletions")
     async def list_deletions(self, request: DeletionListRequest) -> DeletionPage:
         """List stable deletion barriers for reconnecting edge devices."""
         set_current_span_attributes(
@@ -341,7 +418,7 @@ class MemoryKernel:
             trace_id=current_trace_id(),
         )
 
-    @trace_operation("mindbridge.get_observation_job")
+    @operation_span("mindbridge.get_observation_job")
     async def get_observation_job(
         self,
         tenant_id: str,
@@ -382,7 +459,7 @@ class MemoryKernel:
             raise ValueError("maximum_duration_seconds must be positive")
         deadline = self._clock() + timedelta(seconds=maximum_duration_seconds)
         previous: ObservationProcessingJob | None = None
-        with operation_span("mindbridge.watch_observation_job"):
+        async with operation_span("mindbridge.watch_observation_job"):
             while True:
                 job = await self._store.read_observation_processing_job(
                     TenantId(tenant_id),
@@ -396,7 +473,7 @@ class MemoryKernel:
                     return
                 await asyncio.sleep(poll_interval_seconds)
 
-    @trace_operation("mindbridge.get_memory")
+    @operation_span("mindbridge.get_memory")
     async def get_memory(self, tenant_id: str, memory_id: str) -> MemoryResult:
         """Return one tenant-owned memory through the shared stable view."""
         set_current_span_attributes(
@@ -431,6 +508,26 @@ class MemoryKernel:
             supersedes_memory_id=original.memory_id,
         )
 
+    async def _remember_result(
+        self,
+        memory: MemoryRecord,
+        *,
+        created: bool,
+    ) -> RememberResult:
+        """Say whether this write stored the memory or matched one already under its key.
+
+        `observe` has always answered `accepted` or `duplicate`; a caller retrying `remember`
+        could only infer it from a memory_id it had seen before. The store already knows.
+        """
+        result = await self._memory_result(memory)
+        # `__dict__` hands over the EvidenceView instances already built; dumping and
+        # revalidating would rebuild every one of them, so the cost of attaching a single
+        # enum would grow with the evidence count.
+        return RememberResult(
+            **result.__dict__,
+            status=MemoryWriteStatus.CREATED if created else MemoryWriteStatus.DUPLICATE,
+        )
+
     async def _memory_result(self, memory: MemoryRecord) -> MemoryResult:
         evidence = await read_resolved_memory_evidence(
             self._store,
@@ -440,17 +537,26 @@ class MemoryKernel:
         )
         return memory_result(memory, evidence)
 
-    @trace_operation("mindbridge.index_memory")
-    async def _index_memory(self, memory: MemoryRecord, *, skip_existing: bool = False) -> None:
+    async def _embed_summaries(self, summaries: tuple[str, ...]) -> tuple[Embedding, ...]:
+        """Encode every summary in one call, so a batch costs one round trip."""
         result = await self._embedder.embed(
             EmbedRequest(
-                inputs=(ModelInput((TextPart(memory.summary),)),),
+                inputs=tuple(ModelInput((TextPart(summary),)) for summary in summaries),
                 task=EmbedTask.DOCUMENT,
             )
         )
-        if len(result.embeddings) != 1:
+        if len(result.embeddings) != len(summaries):
             raise ModelOutputError("embedder returned the wrong memory vector count")
-        embedding = result.embeddings[0]
+        return result.embeddings
+
+    @operation_span("mindbridge.index_memory")
+    async def _index_memory(
+        self,
+        memory: MemoryRecord,
+        embedding: Embedding,
+        *,
+        skip_existing: bool = False,
+    ) -> None:
         set_current_span_attributes(
             {
                 "mindbridge.tenant.id": memory.tenant_id,
@@ -475,6 +581,13 @@ class MemoryKernel:
             memory.tenant_id, embedding_id
         ):
             return
+        # This ID pins its text, so a differing stored vector is encoder noise, not drift.
+        # `embedding_id` derives from `memory_id`, which derives from the idempotency key,
+        # and `write_memory` has already refused that key if it carried a different content
+        # digest -- so reaching here means the stored vector encodes this exact summary.
+        # It matters because a batch's vectors depend on the batch's composition: two
+        # concurrent `remember` batches that share one memory encode it beside different
+        # neighbours, and the difference is far outside the write's equality tolerance.
         await self._embedding_index.write_embedding(
             EmbeddingRecord(
                 embedding_id=embedding_id,
@@ -488,7 +601,8 @@ class MemoryKernel:
                 dimension=embedding.dimension,
                 normalized=True,
                 created_at=memory.created_at,
-            )
+            ),
+            allow_reencoding=True,
         )
 
 

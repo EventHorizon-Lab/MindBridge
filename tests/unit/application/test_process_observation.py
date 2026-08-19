@@ -4,6 +4,7 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from consolidation_doubles import RecordingTextEmbedder
 
 from mindbridge.application import process_observation as process_observation_module
 from mindbridge.application.evidence_clips import ClipSampling
@@ -53,7 +54,7 @@ from mindbridge.core import (
     TenantId,
 )
 from mindbridge.media.clipping import ClipRequest, MediaClip, audio_windows
-from mindbridge.models import Embedding, EmbedRequest, EmbedResult, MediaPart, TextPart
+from mindbridge.models import Embedding, EmbedRequest, EmbedResult, MediaPart
 
 NOW = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
 TENANT_ID = TenantId("tenant_01")
@@ -209,32 +210,7 @@ class RecordingEmbedder:
         )
 
 
-class RecordingTextEmbedder:
-    space_reference = EmbeddingSpaceReference(space_id="jina-v5", revision="space-v1")
-
-    def __init__(self) -> None:
-        self.documents: tuple[str, ...] = ()
-
-    async def embed(self, request: EmbedRequest) -> EmbedResult:
-        self.documents = tuple(
-            part.text
-            for input_value in request.inputs
-            for part in input_value.parts
-            if isinstance(part, TextPart)
-        )
-        return EmbedResult(
-            tuple(
-                Embedding(
-                    (1.0, 0.0),
-                    ModelReference(model_id="jina-text", revision="text-revision-01"),
-                    EmbeddingSpaceReference(space_id="jina-v5", revision="space-v1"),
-                )
-                for _ in request.inputs
-            )
-        )
-
-
-class DeterministicSigner:
+class RoundTrippingSigner:
     """Object storage double that really round-trips derived clip bytes."""
 
     def __init__(self) -> None:
@@ -301,7 +277,7 @@ async def test_processor_builds_event_memory_and_raw_media_embedding_once(
     perceiver = RecordingPerceiver()
     embedder = RecordingEmbedder()
     text_embedder = RecordingTextEmbedder()
-    signer = DeterministicSigner()
+    signer = RoundTrippingSigner()
     processor = _processor(store, perceiver, embedder, text_embedder, signer=signer)
 
     first = await processor.run(TENANT_ID, OBSERVATION_ID, JOB_ID)
@@ -620,14 +596,14 @@ def _processor(
     embedder: RecordingEmbedder,
     text_embedder: RecordingTextEmbedder,
     *,
-    signer: DeterministicSigner | None = None,
+    signer: RoundTrippingSigner | None = None,
 ) -> ProcessObservation:
     return ProcessObservation(
         store,
         perceiver,
         embedder,
         text_embedder,
-        media_url_signer=signer or DeterministicSigner(),
+        media_url_signer=signer or RoundTrippingSigner(),
         clip_cutter=stub_cut,
         proxy_cutter=stub_proxy_cut,
     )
@@ -730,7 +706,7 @@ def _job(
     )
 
 
-class ObjectNamingSigner(DeterministicSigner):
+class ObjectNamingSigner(RoundTrippingSigner):
     """Signs a URL that names the object it signed, so a proxy is distinguishable."""
 
     async def create_presigned_download(

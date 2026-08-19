@@ -12,12 +12,20 @@ from urllib.parse import quote, urlsplit
 
 from mindbridge.application.ports import PresignedMediaDownload
 from mindbridge.configuration import optional_environment_value, require_environment_value
-from mindbridge.core import MediaObject, ObjectStorageError, utc_now
+from mindbridge.core import MediaObject, MemoryIntegrityError, ObjectStorageError, utc_now
 
 if TYPE_CHECKING:
     from mypy_boto3_s3 import S3Client
 
-_DEFAULT_URL_LIFETIME_SECONDS = 300
+# A signed download is handed to a generator that fetches it itself, so it has to outlive the
+# model call rather than the request that signs it. At 300s it expired mid-call and object
+# storage answered with a permanent "could not download multimodal content" 400 instead of a
+# retryable fetch. The default is set from the longest model request the tree can issue --
+# OpenAiGenerator's own request_timeout_seconds default of 1800s -- plus the margin the fetch
+# itself needs. It belongs here rather than at a call site because all three processes that
+# sign media hand the result to a generator; a deployment configuring a request timeout above
+# this has to raise the lifetime with it, and _MAX_URL_LIFETIME_SECONDS is the ceiling.
+_DEFAULT_URL_LIFETIME_SECONDS = 2_100
 _MAX_URL_LIFETIME_SECONDS = 3_600
 
 
@@ -59,8 +67,13 @@ def object_storage_from_environment(source: Mapping[str, str]) -> ObjectStorageE
     )
 
 
-class InvalidMediaLocationError(ValueError):
-    """Raised when a media URI escapes its configured tenant storage prefix."""
+class InvalidMediaLocationError(MemoryIntegrityError):
+    """Raised when a media URI escapes its configured tenant storage prefix.
+
+    An integrity failure rather than a plain ValueError: it is reached by resolving evidence
+    a request already accepted, so it must answer in the same envelope every other stored-state
+    inconsistency does instead of escaping as a bare 500.
+    """
 
 
 class S3MediaAccess:

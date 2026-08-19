@@ -27,7 +27,11 @@ from mindbridge.configuration import (
     validate_plugin_name,
 )
 from mindbridge.core import EmbeddedObjectType, EmbeddingSpaceReference, TenantId
-from mindbridge.infrastructure.postgres import PostgresMemoryStore
+from mindbridge.infrastructure.postgres import (
+    DEFAULT_DATABASE_MAX_POOL_SIZE,
+    PostgresMemoryStore,
+    resolve_database_max_pool_size,
+)
 from mindbridge.infrastructure.s3 import (
     ObjectStorageEnvironment,
     S3MediaAccess,
@@ -68,6 +72,7 @@ class Settings:
     tenant_api_keys_json: str | None = field(default=None, repr=False)
     aml_api_key: str | None = field(default=None, repr=False)
     aml_tenant_prefix: str = "bench_aml"
+    database_max_pool_size: int = DEFAULT_DATABASE_MAX_POOL_SIZE
 
     def __post_init__(self) -> None:
         for name, value in (
@@ -98,6 +103,8 @@ class Settings:
             or not -1.0 <= self.minimum_embedding_similarity <= 1.0
         ):
             raise ValueError("minimum_embedding_similarity must be between -1 and 1")
+        if self.database_max_pool_size < 1:
+            raise ValueError("database_max_pool_size must be at least 1")
 
     @classmethod
     def from_environment(cls, environ: Mapping[str, str] | None = None) -> Settings:
@@ -132,6 +139,9 @@ class Settings:
             ),
             aml_api_key=optional_environment_value(source, "MINDBRIDGE_AML_API_KEY"),
             aml_tenant_prefix=source.get("MINDBRIDGE_AML_TENANT_PREFIX", "bench_aml"),
+            # One parser for the variable, so the API cannot disagree with the worker and
+            # the two sweeps about what a given value means.
+            database_max_pool_size=resolve_database_max_pool_size(source),
         )
 
 
@@ -258,7 +268,9 @@ def run_mcp(argv: Sequence[str] = (), *, prog: str | None = None) -> None:
 
 def _build_runtime(settings: Settings) -> _Runtime:
     store = PostgresMemoryStore(
-        settings.database_url, embedding_dimension=settings.embedding_dimension
+        settings.database_url,
+        embedding_dimension=settings.embedding_dimension,
+        max_pool_size=settings.database_max_pool_size,
     )
     media_access = S3MediaAccess(settings.object_storage)
     generator = load_generator(settings.generator_plugin, settings.generator_config)

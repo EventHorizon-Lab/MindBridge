@@ -58,7 +58,7 @@ from mindbridge.media.clipping import (
     cut_clips,
     cut_generation_proxy,
 )
-from mindbridge.telemetry import set_current_span_attributes, trace_operation
+from mindbridge.telemetry import operation_span, set_current_span_attributes
 
 _Budget = TypeVar("_Budget", float, int)
 
@@ -95,7 +95,7 @@ class _StoredClip:
     media_object: MediaObject
 
 
-@trace_operation("mindbridge.evidence_clips.derive")
+@operation_span("mindbridge.evidence_clips.derive")
 async def derive_evidence_clips(
     tenant_id: TenantId,
     evidence: tuple[ResolvedEvidence, ...],
@@ -208,7 +208,7 @@ async def generation_proxies(
             set_current_span_attributes({"mindbridge.generation_proxy.undeleted": failed})
 
 
-@trace_operation("mindbridge.evidence_clips.generation_proxy")
+@operation_span("mindbridge.evidence_clips.generation_proxy")
 async def _derive_generation_proxies(
     tenant_id: TenantId,
     evidence: tuple[ResolvedEvidence, ...],
@@ -552,7 +552,7 @@ class ClipReclaimSummary:
     reclaimed_count: int
 
 
-@trace_operation("mindbridge.evidence_clips.reclaim")
+@operation_span("mindbridge.evidence_clips.reclaim")
 async def reclaim_orphan_clips(
     tenant_id: TenantId,
     *,
