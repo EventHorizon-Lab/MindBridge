@@ -24,6 +24,7 @@ from mindbridge.infrastructure.task_queue import (
     PROCESS_OBSERVATION_TASK,
     ObservationProcessingTaskMessage,
 )
+from mindbridge.models.openai import _GeneratorConfig
 from mindbridge.worker import WorkerSettings, create_worker_app, processing_budget_seconds
 
 
@@ -312,7 +313,14 @@ def _task_message() -> dict[str, str]:
 
 @pytest.mark.parametrize(
     ("configured", "expected"),
-    [({}, 1_080.0), ({"request_timeout_seconds": 1_800.0}, 2_100.0)],
+    [
+        # An absent key means the generator applies its own default, not the 780 this module
+        # injects on the path where no generator JSON is supplied at all -- that path writes its
+        # key into the config, so it never reaches the fallback.
+        ({}, 2_100.0),
+        ({"request_timeout_seconds": 1_800.0}, 2_100.0),
+        ({"request_timeout_seconds": 780.0}, 1_080.0),
+    ],
 )
 def test_worker_sizes_its_task_budget_from_the_generator_deadline(
     configured: dict[str, object], expected: float
@@ -324,6 +332,24 @@ def test_worker_sizes_its_task_budget_from_the_generator_deadline(
     could never finish however long it was left running.
     """
     assert processing_budget_seconds(configured) == expected
+
+
+def test_a_generator_config_that_names_no_deadline_still_outlives_the_one_it_gets() -> None:
+    """Reads the plugin's own default rather than restating it, so the two cannot drift apart.
+
+    A config supplying an endpoint but no `request_timeout_seconds` is the ordinary shape, and the
+    generator then applies its own default. Sizing the budget from a different constant put a
+    1800s model call inside a 1080s task -- and `SoftTimeLimitExceeded` is in `autoretry_for`, so
+    that deterministic overrun was retried rather than reported.
+    """
+    config: dict[str, object] = {
+        "api_key": "k",
+        "endpoint": "https://example.test/v1",
+        "model_revision": "rev",
+    }
+    client_deadline = _GeneratorConfig.model_validate(config).request_timeout_seconds
+
+    assert processing_budget_seconds(config) > client_deadline
 
 
 @pytest.mark.parametrize(

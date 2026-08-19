@@ -64,6 +64,7 @@ from mindbridge.media.clipping import (
 )
 from mindbridge.models.defaults import (
     DEFAULT_EMBEDDING_DIMENSION,
+    DEFAULT_GENERATOR_REQUEST_TIMEOUT_SECONDS,
     embedding_dimension_from_environment,
     jina_media_embedder_config,
     openai_embedder_config,
@@ -273,7 +274,13 @@ def processing_budget_seconds(generator_config: Mapping[str, object]) -> float:
     one place and the Celery limits follow, instead of the task being killed mid-call by a limit
     that was written for a faster one.
     """
-    configured = generator_config.get("request_timeout_seconds", _MODEL_REQUEST_TIMEOUT_SECONDS)
+    # Absent means the plugin's own default applies, which is not the value this module
+    # injects on the path where no generator JSON is supplied at all -- that path puts its
+    # own key in the config, so it never reaches this fallback. Reading 780 here instead
+    # sized the budget below the 1800 the bundled generator would actually take.
+    configured = generator_config.get(
+        "request_timeout_seconds", DEFAULT_GENERATOR_REQUEST_TIMEOUT_SECONDS
+    )
     if isinstance(configured, bool) or not isinstance(configured, (int, float)):
         raise ValueError("generator request_timeout_seconds must be a number")
     if configured <= 0:
