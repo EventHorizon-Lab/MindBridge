@@ -20,6 +20,7 @@ from mindbridge.api.errors import (
     RUNTIME_ERROR_CODES,
     TENANT_ERRORS,
     ErrorCode,
+    code_for,
     error_response,
     responses,
 )
@@ -46,8 +47,6 @@ from mindbridge.contracts import (
 )
 from mindbridge.core import (
     DomainInvariantError,
-    EnumerationLimitExceededError,
-    IdempotencyConflictError,
 )
 from mindbridge.models import Generator
 from mindbridge.telemetry import current_trace_id
@@ -307,26 +306,19 @@ def _register_request_error_handlers(app: FastAPI) -> None:
         _request: Request,
         error: DomainInvariantError,
     ) -> JSONResponse:
-        code: ErrorCode
-        if isinstance(error, IdempotencyConflictError):
-            code = "idempotency_conflict"
-        elif isinstance(error, EnumerationLimitExceededError):
-            code = "enumeration_limit_exceeded"
-        else:
-            code = "domain_invariant_failed"
-        return error_response(code, message=str(error))
+        # The mapping decides, here and on the other two faces. `or` covers only the case of
+        # this handler being registered for something outside `DOMAIN_INVARIANT_ERROR_CODES`.
+        return error_response(code_for(error) or "domain_invariant_failed", message=str(error))
 
 
 def _register_runtime_error_handlers(app: FastAPI) -> None:
     """Answer every runtime failure from the one table, so none escapes the envelope."""
 
     async def handle(_request: Request, error: Exception) -> JSONResponse:
-        # Starlette dispatches by MRO, so a subclass of a registered error arrives here too.
-        code = next(
-            RUNTIME_ERROR_CODES[ancestor]
-            for ancestor in type(error).__mro__
-            if ancestor in RUNTIME_ERROR_CODES
-        )
+        # `code_for` walks the MRO, so a subclass of a registered error arrives here and still
+        # resolves. Registration is what guarantees a row, so a miss is a wiring bug here.
+        code = code_for(error)
+        assert code is not None, f"no error code is mapped for {type(error).__name__}"
         return error_response(code)
 
     for exception in RUNTIME_ERROR_CODES:

@@ -292,6 +292,61 @@ def test_job_event_stream_sends_one_complete_view_per_change() -> None:
     assert json.loads(events[-1]["data"])["memory_ids"] == ["memory_01"]
 
 
+def test_job_event_stream_reports_a_failure_the_contract_has_no_word_for() -> None:
+    """A stream that just stops is byte-identical to one that finished.
+
+    `translate_transient_database_errors` re-raises a psycopg error whose sqlstate it does not
+    recognise, and only two exception types were caught, so anything else ended the response
+    body after the 200 -- and `aiter_lines` completing normally is exactly what a settled job
+    looks like. The caller was told the opposite of what happened. `internal_error` is the
+    honest answer: it still names the failure and still carries a `trace_id`.
+    """
+
+    class BrokenStreamKernel(StubKernel):
+        async def watch_observation_job(
+            self,
+            tenant_id: str,
+            job_id: str,
+            *,
+            after_updated_at: datetime | None = None,
+        ) -> AsyncIterator[ObservationProcessingJobView]:
+            raise RuntimeError("connection died mid-stream")
+            yield  # pragma: no cover - unreachable, present to keep this a generator
+
+    response = _client(BrokenStreamKernel()).get(
+        "/v1/jobs/job_01/events", params={"tenant_id": "tenant_01"}
+    )
+
+    assert response.status_code == 200
+    events = _sse_events(response.text)
+    assert [event["event"] for event in events] == ["error"]
+    assert json.loads(events[0]["data"])["code"] == "internal_error"
+    assert json.loads(events[0]["data"])["trace_id"]
+
+
+def test_job_event_stream_names_a_mapped_failure_as_the_routes_do() -> None:
+    """A code the contract does have arrives as that code, not as a generic one."""
+
+    class UnavailableStreamKernel(StubKernel):
+        async def watch_observation_job(
+            self,
+            tenant_id: str,
+            job_id: str,
+            *,
+            after_updated_at: datetime | None = None,
+        ) -> AsyncIterator[ObservationProcessingJobView]:
+            raise DatabaseUnavailableError("storage went away")
+            yield  # pragma: no cover - unreachable, present to keep this a generator
+
+    response = _client(UnavailableStreamKernel()).get(
+        "/v1/jobs/job_01/events", params={"tenant_id": "tenant_01"}
+    )
+
+    events = _sse_events(response.text)
+    assert [event["event"] for event in events] == ["error"]
+    assert json.loads(events[0]["data"])["code"] == "database_unavailable"
+
+
 def test_job_event_stream_resumes_after_the_last_received_event() -> None:
     client = _client()
 
