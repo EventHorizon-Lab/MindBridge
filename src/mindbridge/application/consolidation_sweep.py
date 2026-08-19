@@ -55,7 +55,11 @@ class ConsolidationSweepSummary:
     episodes: SweepSummary
     claims: SweepSummary
     summaries: SweepSummary
-    entities: SweepSummary
+    # None when the run was told to skip entity resolution, which is not the same fact as a
+    # sweep that ran and paired nothing: one says the generator was never called, the other
+    # says it was and found no candidates. Reporting a zeroed summary for the first would
+    # read as the second in any dashboard summing these.
+    entities: SweepSummary | None
 
 
 @dataclass(frozen=True, slots=True)

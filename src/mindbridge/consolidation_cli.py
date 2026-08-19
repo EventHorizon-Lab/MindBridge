@@ -163,6 +163,7 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
                 EntityType(value) for value in (options.entity_types or [EntityType.PERSON.value])
             ),
             entity_readjudicate=options.entity_readjudicate,
+            skip_entity_resolution=options.skip_entity_resolution,
         )
     )
     print(json.dumps(_summary_dict(summary), sort_keys=True))
@@ -190,6 +191,7 @@ async def _run_postgres_sweep(
     entity_maximum_pairs: int,
     entity_types: tuple[EntityType, ...],
     entity_readjudicate: bool,
+    skip_entity_resolution: bool,
 ) -> ConsolidationSweepSummary:
     store = PostgresMemoryStore(
         settings.database_url,
@@ -245,22 +247,29 @@ async def _run_postgres_sweep(
             maximum_gap_seconds=summary_maximum_gap_seconds,
             minimum_similarity=summary_minimum_similarity,
         )
-        entities = await consolidate_tenant_entities(
-            ConsolidateEntities(
-                store,
-                EntityResolutionPipeline(generator),
-                media_url_signer=media_access,
-            ),
-            tenant_id,
-            evaluated_at,
-            page_size=entity_page_size,
-            maximum_gap_seconds=entity_maximum_gap_seconds,
-            candidate_limit=entity_candidate_limit,
-            minimum_confidence=entity_minimum_confidence,
-            evidence_per_side=entity_evidence_per_side,
-            maximum_pairs=entity_maximum_pairs,
-            entity_types=entity_types,
-            readjudicate=entity_readjudicate,
+        # The only sweep here that opens media and spends a generator call per candidate
+        # pair, so it is also the only one worth being able to turn off without dropping the
+        # rest of the run.
+        entities = (
+            None
+            if skip_entity_resolution
+            else await consolidate_tenant_entities(
+                ConsolidateEntities(
+                    store,
+                    EntityResolutionPipeline(generator),
+                    media_url_signer=media_access,
+                ),
+                tenant_id,
+                evaluated_at,
+                page_size=entity_page_size,
+                maximum_gap_seconds=entity_maximum_gap_seconds,
+                candidate_limit=entity_candidate_limit,
+                minimum_confidence=entity_minimum_confidence,
+                evidence_per_side=entity_evidence_per_side,
+                maximum_pairs=entity_maximum_pairs,
+                entity_types=entity_types,
+                readjudicate=entity_readjudicate,
+            )
         )
         return ConsolidationSweepSummary(
             episodes=episodes,
@@ -369,6 +378,14 @@ def _parser(prog: str | None = None) -> argparse.ArgumentParser:
         action="store_true",
         help="re-judge pairs that already carry a verdict, replacing it",
     )
+    parser.add_argument(
+        "--skip-entity-resolution",
+        action="store_true",
+        help=(
+            "skip the entity-resolution sweep; the other three still run. It is the only "
+            "sweep that opens media and spends a generator call per candidate pair"
+        ),
+    )
     return parser
 
 
@@ -376,7 +393,7 @@ def _summary_dict(summary: ConsolidationSweepSummary) -> dict[str, object]:
     return {
         "claims": _sweep_dict(summary.claims),
         "episodes": _sweep_dict(summary.episodes),
-        "entities": _sweep_dict(summary.entities),
+        "entities": None if summary.entities is None else _sweep_dict(summary.entities),
         "summaries": _sweep_dict(summary.summaries),
         "evaluated_at": summary.episodes.evaluated_at.isoformat(),
         "tenant_id": summary.episodes.tenant_id,

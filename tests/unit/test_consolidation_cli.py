@@ -24,6 +24,7 @@ from mindbridge.application.consolidation import (
     EpisodeConsolidationResult,
 )
 from mindbridge.application.consolidation_sweep import (
+    ConsolidationSweepSummary,
     SweepSummary,
     consolidate_tenant_claims,
     consolidate_tenant_entities,
@@ -35,7 +36,7 @@ from mindbridge.application.summary_consolidation import (
     SummaryCandidateCursor,
     SummaryCandidateRequest,
 )
-from mindbridge.consolidation_cli import ConsolidationSettings, _parser
+from mindbridge.consolidation_cli import ConsolidationSettings, _parser, _summary_dict
 from mindbridge.core import (
     ClaimId,
     EntityId,
@@ -304,3 +305,32 @@ def test_entity_type_is_repeatable_and_validated() -> None:
     assert options.entity_types == ["person", "object"]
     with pytest.raises(SystemExit):
         _parser().parse_args(["--tenant-id", "tenant_01", "--entity-type", "not-a-type"])
+
+
+def test_entity_resolution_is_the_one_sweep_an_operator_can_turn_off() -> None:
+    """It is the only sweep that opens media and spends a generator call per pair."""
+    assert _parser().parse_args(["--tenant-id", "tenant_01"]).skip_entity_resolution is False
+    options = _parser().parse_args(["--tenant-id", "tenant_01", "--skip-entity-resolution"])
+
+    assert options.skip_entity_resolution is True
+
+
+def test_a_skipped_entity_sweep_is_reported_apart_from_one_that_found_nothing() -> None:
+    """Zeroing the counts would read as "ran, paired nothing" in anything summing them."""
+    empty = SweepSummary(
+        tenant_id=TenantId("tenant_01"),
+        evaluated_at=NOW,
+        page_count=1,
+        scanned_count=0,
+        candidate_count=0,
+        counts={},
+    )
+    ran = _summary_dict(
+        ConsolidationSweepSummary(episodes=empty, claims=empty, summaries=empty, entities=empty)
+    )
+    skipped = _summary_dict(
+        ConsolidationSweepSummary(episodes=empty, claims=empty, summaries=empty, entities=None)
+    )
+
+    assert skipped["entities"] is None
+    assert ran["entities"] == {"candidate_count": 0, "page_count": 1, "scanned_count": 0}
