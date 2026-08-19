@@ -8,7 +8,7 @@ import os
 from collections.abc import Mapping
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
-from typing import NoReturn, Protocol
+from typing import Annotated, NoReturn, Protocol
 
 from billiard.exceptions import (
     SoftTimeLimitExceeded,
@@ -18,12 +18,18 @@ from celery.signals import (
     worker_process_init,
     worker_process_shutdown,
 )
+from pydantic import Field, StrictBool
 
 from mindbridge.application.capabilities import Embedder
+from mindbridge.application.evidence_clips import ClipSampling
 from mindbridge.application.pipelines import PerceptionPipeline
 from mindbridge.application.process_observation import ProcessObservation
 from mindbridge.configuration import (
+    PluginConfigModel,
+    PluginInteger,
+    PluginNumber,
     copy_plugin_configuration,
+    optional_environment_value,
     plugin_configuration,
     require_environment_value,
     validate_plugin_name,
@@ -50,6 +56,11 @@ from mindbridge.infrastructure.task_queue import (
     PROCESS_OBSERVATION_TASK,
     ObservationProcessingTaskMessage,
     create_task_queue,
+)
+from mindbridge.media.clipping import (
+    DEFAULT_IMAGE_MAX_PIXELS,
+    DEFAULT_VIDEO_FRAMES_PER_SECOND,
+    DEFAULT_VIDEO_MAX_PIXELS,
 )
 from mindbridge.models.defaults import (
     DEFAULT_EMBEDDING_DIMENSION,
@@ -107,6 +118,7 @@ class WorkerSettings:
     media_embedder_plugin: str = "jina"
     text_embedder_plugin: str = "openai"
     embedding_dimension: int = DEFAULT_EMBEDDING_DIMENSION
+    clip_sampling: ClipSampling = field(default_factory=ClipSampling)
 
     def __post_init__(self) -> None:
         for name, value in (
@@ -174,7 +186,38 @@ class WorkerSettings:
                 else None,
             ),
             embedding_dimension=embedding_dimension_from_environment(source),
+            clip_sampling=_clip_sampling_from_environment(source),
         )
+
+
+class _MediaSamplingConfig(PluginConfigModel):
+    """Strict schema for the optional media sampling object.
+
+    It reads value types as well as key names, which a hand-written key check does not: a
+    quoted number or a `"false"` string for the off-switch would otherwise be accepted and
+    silently mean something else.
+    """
+
+    frames_per_second: Annotated[PluginNumber, Field(gt=0)] = DEFAULT_VIDEO_FRAMES_PER_SECOND
+    max_pixels: Annotated[PluginInteger, Field(gt=0)] = DEFAULT_VIDEO_MAX_PIXELS
+    image_max_pixels: Annotated[PluginInteger, Field(gt=0)] = DEFAULT_IMAGE_MAX_PIXELS
+    generation_proxy: StrictBool = True
+
+
+def _clip_sampling_from_environment(source: Mapping[str, str]) -> ClipSampling:
+    """Read the optional media sampling knob that sets the whole write cost of video.
+
+    Frame rate multiplies every downstream cost in the write path: one clip cut, one encoder
+    call, and one stored object per sampled window. A deployment ingesting continuous video
+    has to be able to choose it, so it travels as one optional JSON object rather than four
+    more fallback variables.
+    """
+    if optional_environment_value(source, "MINDBRIDGE_MEDIA_SAMPLING_CONFIG_JSON") is None:
+        return ClipSampling()
+    config = _MediaSamplingConfig.model_validate(
+        plugin_configuration(source, "MINDBRIDGE_MEDIA_SAMPLING_CONFIG_JSON")
+    )
+    return ClipSampling(**config.model_dump())
 
 
 @dataclass(slots=True)
@@ -303,6 +346,7 @@ async def _process_observation_once(
             media_embedder,
             text_embedder,
             media_url_signer=media_access,
+            clip_sampling=settings.clip_sampling,
         ).run(tenant_id, observation_id, job_id)
     return job.state
 

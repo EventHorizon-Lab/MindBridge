@@ -13,6 +13,7 @@ from pydantic import ValidationError
 
 import mindbridge.worker as worker_module
 from mindbridge.application.capabilities import Embedder, EmbedRequest, EmbedResult
+from mindbridge.application.evidence_clips import ClipSampling
 from mindbridge.core import (
     DatabaseUnavailableError,
     JobState,
@@ -233,6 +234,50 @@ def test_worker_preserves_transient_retry_after_running_waits(
             task.run(message)
     finally:
         task.pop_request()
+
+
+def test_worker_reads_media_sampling_from_the_environment() -> None:
+    """Frame rate is the whole write cost of a video deployment and had no configuration."""
+    settings = WorkerSettings.from_environment(
+        {
+            **_environment(),
+            "MINDBRIDGE_MEDIA_SAMPLING_CONFIG_JSON": (
+                '{"frames_per_second": 0.5, "max_pixels": 50176, "generation_proxy": false}'
+            ),
+        }
+    )
+
+    assert settings.clip_sampling.frames_per_second == 0.5
+    assert settings.clip_sampling.max_pixels == 50_176
+    assert settings.clip_sampling.generation_proxy is False
+
+
+def test_worker_media_sampling_defaults_keep_the_documented_encoder_budget() -> None:
+    """An unset deployment must behave exactly as it did before the knob existed."""
+    settings = WorkerSettings.from_environment(_environment())
+
+    assert settings.clip_sampling == ClipSampling()
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        '{"fps": 0.5}',
+        '{"generation_proxy": "false"}',
+        '{"max_pixels": true}',
+        '{"frames_per_second": "0.5"}',
+        '{"max_pixels": 1.5}',
+        '{"frames_per_second": 0}',
+    ],
+)
+def test_worker_rejects_a_malformed_media_sampling_knob(config: str) -> None:
+    """A typo in an optional tuning knob must fail startup, not silently mean something else.
+    `"false"` is a truthy string, and a quoted or floating pixel count would reach a budget
+    comparison as the wrong type."""
+    with pytest.raises(ValueError):
+        WorkerSettings.from_environment(
+            {**_environment(), "MINDBRIDGE_MEDIA_SAMPLING_CONFIG_JSON": config}
+        )
 
 
 def test_worker_rejects_invalid_task_identity() -> None:

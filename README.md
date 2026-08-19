@@ -1108,6 +1108,14 @@ is public; benchmark runs must add every generated tenant ID to the mapping befo
 `MINDBRIDGE_OBJECT_STORAGE_ENDPOINT_URL` is optional for AWS S3. Media URIs must use the tenant-safe
 shape `s3://<bucket>/tenants/<tenant_id>/<object>`.
 
+`MINDBRIDGE_OBJECT_STORAGE_PUBLIC_ENDPOINT_URL` is also optional and defaults to the endpoint above.
+Set it only when a hosted model must fetch signed evidence over a different address than the one
+the deployment reads and writes through: signed URLs then name the public address while every
+internal read, write, and delete stays on the direct one instead of leaving and re-entering the
+network. Signatures cover the host, so both names must reach the same bucket. It moves **every**
+signed URL, including the derived-clip URLs a self-hosted embedder fetches, so set it only where
+that endpoint can reach the public name too.
+
 MindBridge owns no S3 region setting. Boto3's own chain resolves it from `AWS_REGION`,
 `AWS_DEFAULT_REGION`, `~/.aws/config`, or instance metadata, exactly as it resolves credentials, so
 one AWS configuration serves MindBridge and every other tool in the deployment. S3-compatible stores
@@ -1158,6 +1166,55 @@ API queries, so it reads `MINDBRIDGE_EMBEDDER_PLUGIN`, `MINDBRIDGE_EMBEDDER_API_
 `MINDBRIDGE_EMBEDDER_MODEL_REVISION` exactly as the API does. Each process has its own environment,
 so a Worker that genuinely needs a different endpoint sets a different value for the same name rather
 than a second name that can silently disagree.
+
+`MINDBRIDGE_MEDIA_SAMPLING_CONFIG_JSON` is the optional media sampling contract. Frame rate sets
+the entire write cost of a video deployment — one clip cut, one encoder call, and one stored object
+per sampled window — so a deployment ingesting continuous footage has to be able to choose it:
+
+```bash
+export MINDBRIDGE_MEDIA_SAMPLING_CONFIG_JSON='{
+  "frames_per_second": 1.0,
+  "max_pixels": 200704,
+  "image_max_pixels": 1003520,
+  "generation_proxy": true
+}'
+```
+
+Unset keys keep the defaults shown above; an unrecognized key or a value of the wrong type fails
+startup rather than silently meaning something else.
+
+`generation_proxy` decides what a generation request downloads. Every request already carries the
+frame rate and pixel budget the model must apply, so handing over the untouched source makes the
+model fetch frames it discards on arrival; with the proxy on, video is cut once to that same budget
+and the sampled copy is what perception reads. Both of its tracks stay on the source's clock,
+because perception is told event times are milliseconds from the start of the observation. Turn it
+off for a generator that reads the same storage the Worker does, where the encode costs more than
+the transfer it removes.
+
+The proxy is best-effort by design and covers **video only**: `image_max_pixels` governs stored
+image clips, not what the model is sent, and an image reaches the model at full resolution because
+the request carries no pixel budget for images at all.
+
+Its ceiling is a **frame count, not a duration**: past roughly forty sampled frames the MP4 muxer
+refuses to interleave a sparse video track with continuous audio, so `frames_per_second` decides
+the ceiling as much as span length does — at 30-second segments, the granularity every ingest path
+in this repo uses, anything above about 1.3 fps exceeds it. A span over that budget is skipped
+before its source is read, and anything else the encoder or object storage refuses degrades the
+same way, so the observation behaves exactly as it did before this knob existed rather than paying
+for a doomed encode. Raising `frames_per_second` therefore trades the proxy away; lower it, or
+segment shorter, to keep both.
+
+A proxy that did not come out smaller is discarded, and the request states the sampling the copy
+actually carries rather than letting the generator plugin's own frame rate apply to bytes that were
+already sampled. The copy is lent for the length of one model call and deleted when it returns,
+including on an attempt that failed: nothing registers it, so it is never cited as provenance, and
+leaving it behind would put a re-encoded copy of an observation's picture and speech beyond the
+reach of `forget()`.
+
+The proxy costs one extra read of the source, because clip derivation reads it again after the
+model call rather than holding the whole recording in memory across it. That read is internal, so
+a deployment whose object storage is only reachable over a slow public address should set
+`MINDBRIDGE_OBJECT_STORAGE_PUBLIC_ENDPOINT_URL` and keep the direct endpoint local.
 
 Non-default Worker adapters use `MINDBRIDGE_MEDIA_EMBEDDER_CONFIG_JSON` and
 `MINDBRIDGE_EMBEDDER_CONFIG_JSON`; explicit objects replace the bundled fallback variables.

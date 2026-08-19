@@ -87,6 +87,102 @@ def cut_clips(source: bytes, request: ClipRequest) -> tuple[MediaClip, ...]:
     return (_cut_video(source, request),)
 
 
+def cut_generation_proxy(source: bytes, request: ClipRequest) -> MediaClip:
+    """Re-encode one video span at the sampling a generator was going to apply anyway.
+
+    This is the copy a model reads instead of the source, so two things have to hold. It keeps
+    the source's audio, because a video-only proxy would silently take speech away from every
+    question that depends on what was said. And both tracks stay on the source's clock, because
+    perception is told event times are milliseconds from the start of the observation and is
+    handed each span's absolute offsets alongside this media.
+
+    ponytail: the ceiling is sampled frame count, not span length. A sparse video track is
+    sparse next to continuous audio, and past roughly forty frames the MP4 muxer refuses the
+    interleave, so this raises rather than returning a file with one track truncated. Callers
+    treat the proxy as best-effort and fall back to the source; writing both tracks through a
+    real interleaving buffer is the upgrade path if long single-span observations become common.
+    """
+    if not source:
+        raise DomainInvariantError("source media must not be empty")
+    if request.kind is not MediaKind.VIDEO:
+        raise DomainInvariantError("a generation proxy is only defined for video")
+    av = cast(Any, _import("av"))
+    sampled = _sample_video_frames(source, request)
+    if not sampled:
+        raise DomainInvariantError("video span selected no frames from its source")
+    width, height = scaled_size(sampled[0].width, sampled[0].height, request.max_pixels)
+    buffer = io.BytesIO()
+    with (
+        av.open(io.BytesIO(source)) as container,
+        av.open(buffer, mode="w", format="mp4") as output,
+    ):
+        source_audio = container.streams.audio[0] if container.streams.audio else None
+        # Both tracks are declared before the first packet: libavformat writes the container
+        # header on that packet, and a stream added afterwards is rejected.
+        video = output.add_stream("libx264", rate=_stream_rate(request.frames_per_second))
+        video.width, video.height, video.pix_fmt = width, height, "yuv420p"
+        # Single-threaded for the same reason _cut_video's encoder is.
+        video.thread_count = 1
+        video.thread_type = "NONE"
+        video.time_base = _MILLISECOND_TIME_BASE
+        audio, resampler = _proxy_audio_stream(av, output, source_audio)
+        for frame in sampled:
+            resized = frame.reformat(width=width, height=height, format="yuv420p")
+            # Absolute, unlike _cut_video: this copy stands in for the whole source in a call
+            # whose prompt counts milliseconds from the observation's start.
+            resized.pts = round((frame.time or 0.0) * 1_000)
+            resized.time_base = video.time_base
+            output.mux(video.encode(resized))
+        output.mux(video.encode())
+        if source_audio is not None:
+            _copy_span_audio(
+                container, output, request, source=source_audio, audio=audio, resampler=resampler
+            )
+    return MediaClip(
+        content=buffer.getvalue(),
+        suffix=".mp4",
+        start_ms=request.start_ms,
+        end_ms=request.end_ms,
+    )
+
+
+def _proxy_audio_stream(av: Any, output: Any, source_audio: Any) -> tuple[Any, Any]:  # noqa: ANN401
+    """Declare the proxy's audio track up front, keeping the source's rate and channel layout."""
+    if source_audio is None:
+        return None, None
+    audio = output.add_stream("aac", rate=source_audio.rate)
+    audio.layout = source_audio.layout
+    # AAC only accepts planar float, and a source in any other sample format would raise
+    # mid-encode rather than at the boundary.
+    resampler = av.AudioResampler(format="fltp", layout=source_audio.layout, rate=source_audio.rate)
+    return audio, resampler
+
+
+def _copy_span_audio(
+    container: Any,  # noqa: ANN401
+    output: Any,  # noqa: ANN401
+    request: ClipRequest,
+    *,
+    source: Any,  # noqa: ANN401
+    audio: Any,  # noqa: ANN401
+    resampler: Any,  # noqa: ANN401
+) -> None:
+    """Pass the span's audio through unshifted, so speech lines up with the frames above it."""
+    start_seconds, end_seconds = request.start_ms / 1_000, request.end_ms / 1_000
+    if start_seconds > 0:
+        container.seek(int(start_seconds * 1_000_000), backward=True)
+    for frame in container.decode(source):
+        if frame.time is None or frame.time < start_seconds:
+            continue
+        if frame.time > end_seconds:
+            break
+        for resampled in resampler.resample(frame):
+            output.mux(audio.encode(resampled))
+    for resampled in resampler.resample(None):
+        output.mux(audio.encode(resampled))
+    output.mux(audio.encode())
+
+
 def audio_windows(start_ms: int, end_ms: int) -> tuple[tuple[int, int], ...]:
     """Split a span into encoder-sized windows without dropping the tail."""
     if end_ms <= start_ms:

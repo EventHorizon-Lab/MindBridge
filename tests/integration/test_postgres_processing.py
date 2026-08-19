@@ -323,6 +323,7 @@ class DeterministicSigner:
     def __init__(self) -> None:
         self.calls = 0
         self.uploaded: dict[str, bytes] = {}
+        self.deleted: tuple[str, ...] = ()
 
     async def create_presigned_download(
         self,
@@ -339,6 +340,19 @@ class DeterministicSigner:
 
     async def upload_media(self, media_object: MediaObject, content: bytes) -> None:
         self.uploaded[media_object.uri] = content
+
+    async def delete_media(self, media_object: MediaObject) -> None:
+        self.deleted = (*self.deleted, media_object.uri)
+
+
+def stub_proxy_cut(source: bytes, request: ClipRequest) -> MediaClip:
+    """Stand in for the real proxy encoder, and come out smaller like the real one does."""
+    return MediaClip(
+        content=b"px%d-%d" % (request.start_ms, request.end_ms),
+        suffix=".mp4",
+        start_ms=request.start_ms,
+        end_ms=request.end_ms,
+    )
 
 
 def stub_cut(source: bytes, request: ClipRequest) -> tuple[MediaClip, ...]:
@@ -372,6 +386,7 @@ async def test_processing_commits_provenance_once(
         text_embedder,
         media_url_signer=DeterministicSigner(),
         clip_cutter=stub_cut,
+        proxy_cutter=stub_proxy_cut,
     )
 
     first = await processor.run(tenant_id, observation_id, job_id)
@@ -389,8 +404,9 @@ async def test_processing_commits_provenance_once(
     assert repeated_observation.created is False
     assert repeated_observation.processing_job_id == job_id
     assert perceiver.calls == 1
-    # One clip per grounded event span, signed after every upload completes.
-    assert embedder.documents == ("https://objects.example.test/clip.mp4?signature=3",)
+    # One clip per grounded event span, signed after every upload completes. The signature runs
+    # one ahead of the clip count because perception signs its sampled proxy first.
+    assert embedder.documents == ("https://objects.example.test/clip.mp4?signature=4",)
     assert text_embedder.documents == (
         "A person places a red tool beside a blue toolbox.",
         "The red tool is beside the blue toolbox.",
@@ -517,6 +533,7 @@ async def test_processing_rolls_back_derived_records_before_retry(
         FixedTextEmbedder(),
         media_url_signer=DeterministicSigner(),
         clip_cutter=stub_cut,
+        proxy_cutter=stub_proxy_cut,
     )
 
     with pytest.raises(DomainInvariantError, match="embedding dimension must be 1024"):
@@ -536,6 +553,7 @@ async def test_processing_rolls_back_derived_records_before_retry(
         FixedTextEmbedder(),
         media_url_signer=DeterministicSigner(),
         clip_cutter=stub_cut,
+        proxy_cutter=stub_proxy_cut,
     ).run(tenant_id, observation_id, job_id)
 
     assert succeeded.state is JobState.SUCCEEDED
@@ -581,6 +599,7 @@ async def test_episode_candidates_expand_a_stable_seed_by_event_vector(
             FixedTextEmbedder(),
             media_url_signer=DeterministicSigner(),
             clip_cutter=stub_cut,
+            proxy_cutter=stub_proxy_cut,
         ).run(tenant_id, observation_id, job_id)
 
     page = await store.list_episode_candidates(
@@ -627,6 +646,7 @@ async def test_claim_candidates_expand_a_stable_seed_by_aligned_vector(
             FixedTextEmbedder(),
             media_url_signer=DeterministicSigner(),
             clip_cutter=stub_cut,
+            proxy_cutter=stub_proxy_cut,
         ).run(tenant_id, observation_id, job_id)
 
     page = await store.list_claim_candidates(
@@ -674,6 +694,7 @@ async def test_summary_candidates_expand_a_stable_seed_across_memory_representat
             FixedTextEmbedder(),
             media_url_signer=DeterministicSigner(),
             clip_cutter=stub_cut,
+            proxy_cutter=stub_proxy_cut,
         ).run(tenant_id, observation_id, job_id)
 
     page = await store.list_summary_candidates(
@@ -779,6 +800,7 @@ async def test_episode_consolidation_is_atomic_recallable_and_retry_safe(
             FixedTextEmbedder(),
             media_url_signer=DeterministicSigner(),
             clip_cutter=stub_cut,
+            proxy_cutter=stub_proxy_cut,
         ).run(tenant_id, observation_id, job_id)
 
     request = EpisodeCandidateRequest(
@@ -926,6 +948,7 @@ async def test_claim_consolidation_is_atomic_versioned_and_forget_safe(
             FixedTextEmbedder(),
             media_url_signer=DeterministicSigner(),
             clip_cutter=stub_cut,
+            proxy_cutter=stub_proxy_cut,
         ).run(tenant_id, observation_id, job_id)
 
     request = ClaimCandidateRequest(
@@ -1082,6 +1105,7 @@ async def test_summary_consolidation_is_atomic_recallable_and_retry_safe(
             FixedTextEmbedder(),
             media_url_signer=DeterministicSigner(),
             clip_cutter=stub_cut,
+            proxy_cutter=stub_proxy_cut,
         ).run(tenant_id, observation_id, job_id)
 
     request = SummaryCandidateRequest(
@@ -1781,6 +1805,7 @@ async def test_evidence_recall_does_not_leak_between_nested_event_spans(
         FixedTextEmbedder(),
         media_url_signer=DeterministicSigner(),
         clip_cutter=stub_cut,
+        proxy_cutter=stub_proxy_cut,
     )
 
     await processor.run(tenant_id, observation_id, job_id)
