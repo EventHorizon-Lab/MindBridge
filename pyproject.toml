@@ -136,6 +136,9 @@ module = [
     "PIL",
     "PIL.*",
     "soundfile",
+    # Read by tests/test_package.py on 3.10 only; mypy pins python_version = "3.10",
+    # so the tomllib branch beside it is the one it never sees.
+    "tomli",
 ]
 ignore_missing_imports = true
 
