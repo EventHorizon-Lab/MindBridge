@@ -252,10 +252,167 @@ async def test_a_re_judgement_replaces_the_verdict_instead_of_contradicting_it(
 async def test_committing_nothing_writes_nothing(store: PostgresMemoryStore) -> None:
     assert (
         await store.commit_entity_resolution(
-            TenantId("tenant_entity_empty"), EntityResolutionWrite(relations=())
+            TenantId("tenant_entity_empty"), EntityResolutionWrite(decided=())
         )
         == 0
     )
+
+
+async def test_a_committed_verdict_keeps_the_cue_it_rested_on(
+    store: PostgresMemoryStore,
+    database_url: str,
+) -> None:
+    """The judge is required to name a cue; an operator auditing the merge must be able to
+    read it back. Before this was stored, a same_as edge was a durable claim with nothing
+    behind it."""
+    tenant_id = "tenant_entity_cue"
+    await _seed(
+        database_url,
+        tenant_id,
+        entities=(("entity_a", "first", "person"), ("entity_b", "second", "person")),
+    )
+    page = await store.list_entity_candidates(_request(tenant_id))
+    write = derive_entity_resolution_write(
+        TenantId(tenant_id),
+        ((page.pairs[0], EntityAdjudication(True, 0.91, "identical scar above left brow")),),
+        NOW,
+    )
+    assert await store.commit_entity_resolution(TenantId(tenant_id), write) == 1
+
+    assert await _cues(database_url, tenant_id) == [
+        ("entity_a", "entity_b", "same_as", 0.91, "identical scar above left brow", NOW)
+    ]
+
+
+async def test_a_re_judgement_that_holds_its_answer_still_replaces_the_cue(
+    store: PostgresMemoryStore,
+    database_url: str,
+) -> None:
+    """The edge upsert deliberately skips an unchanged verdict, so the cue write must not be
+    gated on it. Otherwise --entity-readjudicate leaves yesterday's reasoning standing beside
+    a verdict that was reached today on different grounds."""
+    tenant_id = "tenant_entity_recue"
+    await _seed(
+        database_url,
+        tenant_id,
+        entities=(("entity_a", "first", "person"), ("entity_b", "second", "person")),
+    )
+    pair = (await store.list_entity_candidates(_request(tenant_id))).pairs[0]
+
+    first = derive_entity_resolution_write(
+        TenantId(tenant_id), ((pair, EntityAdjudication(True, 0.80, "same red scarf")),), NOW
+    )
+    assert await store.commit_entity_resolution(TenantId(tenant_id), first) == 1
+
+    later = NOW + timedelta(hours=1)
+    second = derive_entity_resolution_write(
+        TenantId(tenant_id), ((pair, EntityAdjudication(True, 0.97, "same scar")),), later
+    )
+    # Nothing an operator would call a decision changed, so the count stays honest at zero.
+    assert await store.commit_entity_resolution(TenantId(tenant_id), second) == 0
+
+    # One row still, carrying the reasoning the standing verdict actually rested on.
+    assert await _cues(database_url, tenant_id) == [
+        ("entity_a", "entity_b", "same_as", 0.97, "same scar", later)
+    ]
+
+
+async def test_a_flipped_verdict_replaces_the_cue_rather_than_appending_one(
+    store: PostgresMemoryStore,
+    database_url: str,
+) -> None:
+    """One pair owns one verdict row, cue included: the pair must never read as both."""
+    tenant_id = "tenant_entity_flipcue"
+    await _seed(
+        database_url,
+        tenant_id,
+        entities=(("entity_a", "first", "person"), ("entity_b", "second", "person")),
+    )
+    pair = (await store.list_entity_candidates(_request(tenant_id))).pairs[0]
+
+    await store.commit_entity_resolution(
+        TenantId(tenant_id),
+        derive_entity_resolution_write(
+            TenantId(tenant_id), ((pair, EntityAdjudication(True, 0.90, "same scar")),), NOW
+        ),
+    )
+    later = NOW + timedelta(hours=1)
+    await store.commit_entity_resolution(
+        TenantId(tenant_id),
+        derive_entity_resolution_write(
+            TenantId(tenant_id),
+            ((pair, EntityAdjudication(False, 0.95, "both on screen at once")),),
+            later,
+        ),
+    )
+
+    assert await _cues(database_url, tenant_id) == [
+        ("entity_a", "entity_b", "not_same_as", 0.95, "both on screen at once", later)
+    ]
+
+
+async def test_deleting_an_edge_takes_its_justification_with_it(
+    store: PostgresMemoryStore,
+    database_url: str,
+) -> None:
+    """A cue that outlived its edge would justify a merge the graph no longer asserts."""
+    tenant_id = "tenant_entity_cascade"
+    await _seed(
+        database_url,
+        tenant_id,
+        entities=(("entity_a", "first", "person"), ("entity_b", "second", "person")),
+    )
+    pair = (await store.list_entity_candidates(_request(tenant_id))).pairs[0]
+    await store.commit_entity_resolution(
+        TenantId(tenant_id),
+        derive_entity_resolution_write(
+            TenantId(tenant_id), ((pair, EntityAdjudication(True, 0.90, "same scar")),), NOW
+        ),
+    )
+    assert await _stored_cue_count(database_url, tenant_id) == 1
+
+    connection = await AsyncConnection.connect(database_url, autocommit=True)
+    async with connection:
+        await connection.execute("DELETE FROM relations WHERE tenant_id = %s", (tenant_id,))
+
+    # Counted straight off the table, never through a join to relations: the join would
+    # report an orphaned cue as absent and this assertion would hold with no cascade at all.
+    assert await _stored_cue_count(database_url, tenant_id) == 0
+
+
+async def _stored_cue_count(database_url: str, tenant_id: str) -> int:
+    connection = await AsyncConnection.connect(database_url, autocommit=True)
+    async with connection:
+        row = await (
+            await connection.execute(
+                "SELECT count(*) FROM entity_resolution_verdicts WHERE tenant_id = %s",
+                (tenant_id,),
+            )
+        ).fetchone()
+    assert row is not None
+    return int(row[0])
+
+
+async def _cues(
+    database_url: str,
+    tenant_id: str,
+) -> list[tuple[str, str, str, float, str, datetime]]:
+    connection = await AsyncConnection.connect(database_url, autocommit=True)
+    async with connection:
+        cursor = await connection.execute(
+            "SELECT edge.source_id, edge.target_id, edge.relation_type, verdict.confidence,"
+            " verdict.discriminating_cue, verdict.decided_at"
+            " FROM entity_resolution_verdicts AS verdict"
+            " JOIN relations AS edge"
+            "   ON edge.tenant_id = verdict.tenant_id"
+            "  AND edge.relation_id = verdict.relation_id"
+            " WHERE verdict.tenant_id = %s ORDER BY edge.source_id, edge.target_id",
+            (tenant_id,),
+        )
+        return [
+            (str(row[0]), str(row[1]), str(row[2]), float(row[3]), str(row[4]), row[5])
+            async for row in cursor
+        ]
 
 
 async def _verdicts(database_url: str, tenant_id: str) -> list[tuple[str, str, str]]:

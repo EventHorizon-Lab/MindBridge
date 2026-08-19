@@ -10,6 +10,12 @@ The verdict write upserts instead of inserting. `relation_id` is keyed on the pa
 the verdict, so one pair owns exactly one row and a re-judgement replaces it — which the
 shared relation writer cannot express, because it raises when a conflicting row differs in
 any column and `created_at` moves every sweep.
+
+The cue the judge was required to name is written beside the edge, into
+`entity_resolution_verdicts`, under that same pair-keyed id. It is stored apart from the edge
+because it justifies the adjudication rather than describing the edge; every other relation
+kind would carry such a column empty. Both writes share one transaction, so an edge is never
+committed without the reason an operator would need to audit it.
 """
 
 from __future__ import annotations
@@ -168,6 +174,20 @@ SET relation_type = EXCLUDED.relation_type,
 WHERE relations.relation_type <> EXCLUDED.relation_type
 """
 
+# Unconditional DO UPDATE, unlike the edge above. A re-judgement that reaches the same
+# answer for a different reason leaves the edge untouched but still supersedes the cue: the
+# stored justification has to be the one the current verdict actually rested on. Keyed on
+# relation_id, so the pair's single verdict row is replaced rather than appended to.
+_UPSERT_CUE_SQL = """
+INSERT INTO entity_resolution_verdicts (
+    tenant_id, relation_id, confidence, discriminating_cue, decided_at
+) VALUES (%s, %s, %s, %s, %s)
+ON CONFLICT (tenant_id, relation_id) DO UPDATE
+SET confidence = EXCLUDED.confidence,
+    discriminating_cue = EXCLUDED.discriminating_cue,
+    decided_at = EXCLUDED.decided_at
+"""
+
 
 def _candidate_from_row(row: EntityCandidateRow) -> EntityCandidate:
     entity_id, tenant_id, entity_type, canonical_name, created_at, evidence_ids = row
@@ -259,12 +279,12 @@ class EntityCandidateOperations(PostgresStoreOperations):
         tenant_id: TenantId,
         write: EntityResolutionWrite,
     ) -> int:
-        """Record each pair's verdict, replacing any verdict that pair already carried."""
-        if not write.relations:
+        """Record each pair's verdict and the cue behind it, replacing any it already had."""
+        if not write.decided:
             return 0
         changed = 0
         async with tenant_connection(self._pool, tenant_id) as connection:
-            for relation in write.relations:
+            for relation, adjudication in write.decided:
                 cursor = await connection.execute(
                     _UPSERT_VERDICT_SQL,
                     (
@@ -278,5 +298,21 @@ class EntityCandidateOperations(PostgresStoreOperations):
                         relation.created_at,
                     ),
                 )
+                # Counted from the edge alone. A re-run that reaches the same verdict changed
+                # nothing an operator would call a decision, even when it reworded its cue,
+                # and the caller reports this as "verdicts that actually changed".
                 changed += cursor.rowcount
+                # Never gated on that rowcount: the edge row is left alone when the direction
+                # holds, and gating here would strand the superseded cue beside a fresh
+                # verdict. The foreign key is why this runs second.
+                await connection.execute(
+                    _UPSERT_CUE_SQL,
+                    (
+                        relation.tenant_id,
+                        relation.relation_id,
+                        adjudication.confidence,
+                        adjudication.discriminating_cue,
+                        relation.created_at,
+                    ),
+                )
         return changed

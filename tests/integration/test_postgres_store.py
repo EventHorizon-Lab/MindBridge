@@ -183,6 +183,7 @@ async def test_migration_installs_complete_phase_zero_schema(database_url: str) 
         "embeddings",
         "entities",
         "entity_mentions",
+        "entity_resolution_verdicts",
         "event_evidence",
         "event_observations",
         "events",
@@ -225,6 +226,7 @@ async def test_migration_installs_complete_phase_zero_schema(database_url: str) 
         17,
         18,
         19,
+        20,
     ]
 
 

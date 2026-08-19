@@ -142,9 +142,20 @@ class EntityAdjudication:
 
 @dataclass(frozen=True, slots=True)
 class EntityResolutionWrite:
-    """Every edge one adjudicated page adds, and nothing else."""
+    """Every edge one adjudicated page adds, each bound to the verdict behind it.
 
-    relations: tuple[Relation, ...]
+    The edge and its adjudication are one value because they are only ever correct together.
+    An edge whose cue was dropped is the unauditable merge this pass exists to prevent, and a
+    cue whose edge was never committed justifies nothing. Carrying them as one tuple means no
+    later caller can persist half of it.
+    """
+
+    decided: tuple[tuple[Relation, EntityAdjudication], ...]
+
+    @property
+    def relations(self) -> tuple[Relation, ...]:
+        """The edges alone, for callers that count verdicts rather than persist them."""
+        return tuple(relation for relation, _ in self.decided)
 
 
 def derive_entity_resolution_write(
@@ -159,8 +170,9 @@ def derive_entity_resolution_write(
         # can produce: the graph would assert the records are and are not the same entity.
         raise DomainInvariantError("one entity pair cannot carry two verdicts")
     return EntityResolutionWrite(
-        relations=tuple(
-            _relation(tenant_id, pair, adjudication, evaluated_at) for pair, adjudication in decided
+        decided=tuple(
+            (_relation(tenant_id, pair, adjudication, evaluated_at), adjudication)
+            for pair, adjudication in decided
         )
     )
 
