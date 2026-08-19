@@ -54,7 +54,7 @@ the `mindbridge consolidate` CLI), pytest + pytest-asyncio.
   `relations` already covers the settled-pair lookup exactly, and `relation_type` is plain
   `text` with no CHECK constraint, so the new values need no schema change.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to `tests/unit/core/test_graph.py`:
 
@@ -67,12 +67,12 @@ def test_entity_resolution_relation_types_are_available() -> None:
 
 Add `RelationType` to that file's existing `from mindbridge.core import ...` line if absent.
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `uv run pytest tests/unit/core/test_graph.py::test_entity_resolution_relation_types_are_available -v`
 Expected: FAIL with `AttributeError: SAME_AS`
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 In `src/mindbridge/core/graph.py`, inside `class RelationType`, after `SUPERSEDES`:
 
@@ -83,12 +83,12 @@ In `src/mindbridge/core/graph.py`, inside `class RelationType`, after `SUPERSEDE
     NOT_SAME_AS = "not_same_as"
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `uv run pytest tests/unit/core/test_graph.py -v`
 Expected: PASS
 
-- [ ] **Step 5: Write the migration**
+- [x] **Step 5: Write the migration**
 
 Create `migrations/0019_entity_resolution_edges.sql`:
 
@@ -109,7 +109,7 @@ ON CONFLICT (version) DO NOTHING;
 Before writing, run `tail -5 migrations/0018_drop_unused_vector_index.sql` and copy its
 exact `schema_migrations` insert form; if it differs from the two lines above, use its form.
 
-- [ ] **Step 6: Apply and verify the migration**
+- [x] **Step 6: Apply and verify the migration**
 
 Run:
 
@@ -119,7 +119,7 @@ docker compose exec -T postgres psql -v ON_ERROR_STOP=1 -U mindbridge -d mindbri
 
 Expected: `CREATE INDEX` then `INSERT 0 1`. Re-running prints `INSERT 0 0` and no error.
 
-- [ ] **Step 7: Run the full gates and commit**
+- [x] **Step 7: Run the full gates and commit**
 
 ```bash
 uv run ruff format --check . && uv run ruff check . && uv run mypy && uv run pytest -W error
@@ -154,7 +154,7 @@ git commit -m "Add same_as and not_same_as relation types"
   - `derive_entity_resolution_write(tenant_id, decided, evaluated_at) ->
     EntityResolutionWrite` where `decided: tuple[tuple[EntityPair, EntityAdjudication], ...]`
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Create `tests/unit/application/test_entity_resolution.py`:
 
@@ -251,12 +251,12 @@ def test_default_candidacy_is_person_only_and_bounded() -> None:
     assert request.readjudicate is False
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `uv run pytest tests/unit/application/test_entity_resolution.py -v`
 Expected: FAIL with `ModuleNotFoundError: No module named 'mindbridge.application.entity_resolution'`
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
 Create `src/mindbridge/application/entity_resolution.py`. Open
 `src/mindbridge/application/claim_consolidation.py` first and copy its validation idiom
@@ -443,12 +443,12 @@ If `RelationNodeType.ENTITY` does not exist, run
 `grep -n -A 10 "class RelationNodeType" src/mindbridge/core/graph.py` and use the member the
 enum actually defines for entities; do not add one.
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `uv run pytest tests/unit/application/test_entity_resolution.py -v`
 Expected: 6 passed
 
-- [ ] **Step 5: Run the full gates and commit**
+- [x] **Step 5: Run the full gates and commit**
 
 ```bash
 uv run ruff format --check . && uv run ruff check . && uv run mypy && uv run pytest -W error
@@ -476,7 +476,7 @@ git commit -m "Derive pairwise entity resolution edges without transitivity"
   `async def adjudicate(pair: EntityPair, evidence: tuple[ResolvedEvidence, ...]) ->
   EntityAdjudication`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Create `tests/unit/application/pipelines/test_entities.py`. Copy the fake-generator
 scaffolding from `tests/unit/application/pipelines/test_answer.py` — read that file first
@@ -500,12 +500,12 @@ async def test_a_missing_cue_is_rejected_rather_than_defaulted() -> None:
         await pipeline.adjudicate(_pair("entity_a", "entity_b"), ())
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `uv run pytest tests/unit/application/pipelines/test_entities.py -v`
 Expected: FAIL with `ModuleNotFoundError`
 
-- [ ] **Step 3: Add the prompt**
+- [x] **Step 3: Add the prompt**
 
 In `src/mindbridge/prompts.py`, after `CONSOLIDATE_CLAIMS_PROMPT`:
 
@@ -541,7 +541,7 @@ markdown or additional keys.""",
 
 Append `RESOLVE_ENTITIES_PROMPT` to the module's `ALL_PROMPTS` tuple.
 
-- [ ] **Step 4: Write the pipeline**
+- [x] **Step 4: Write the pipeline**
 
 Create `src/mindbridge/application/pipelines/entities.py`, mirroring
 `src/mindbridge/application/pipelines/answer.py`: a Pydantic `_AdjudicationOutput` with
@@ -552,12 +552,12 @@ then a class that calls `generate_json` with `RESOLVE_ENTITIES_PROMPT.text`, the
 names as text parts, and `evidence_parts(evidence)` for the media. Export it from
 `src/mindbridge/application/pipelines/__init__.py` beside the existing pipelines.
 
-- [ ] **Step 5: Run tests to verify they pass**
+- [x] **Step 5: Run tests to verify they pass**
 
 Run: `uv run pytest tests/unit/application/pipelines/test_entities.py -v`
 Expected: 2 passed
 
-- [ ] **Step 6: Update the prompt fingerprint contract**
+- [x] **Step 6: Update the prompt fingerprint contract**
 
 Run:
 
@@ -568,7 +568,7 @@ uv run python -c "import hashlib; from mindbridge.prompts import RESOLVE_ENTITIE
 Add that version and fingerprint to `_EXPECTED_FINGERPRINTS` in
 `tests/contracts/test_prompt_catalog.py`.
 
-- [ ] **Step 7: Run the full gates and commit**
+- [x] **Step 7: Run the full gates and commit**
 
 ```bash
 uv run ruff format --check . && uv run ruff check . && uv run mypy && uv run pytest -W error
@@ -601,7 +601,7 @@ git commit -m "Adjudicate entity pairs against their original recordings"
   - `ConsolidateEntities(store, adjudicator, *, media_url_signer)` with
     `async def run(request: EntityCandidateRequest) -> EntityResolutionResult`
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Create `tests/unit/application/test_consolidate_entities.py` with a fake store and fake
 adjudicator. Cover exactly these behaviours:
@@ -636,12 +636,12 @@ async def test_infrastructure_failure_propagates_instead_of_recording_a_negative
         await _run(adjudicator_error=ModelUnavailableError("down"))
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `uv run pytest tests/unit/application/test_consolidate_entities.py -v`
 Expected: FAIL with `ModuleNotFoundError`
 
-- [ ] **Step 3: Write the use case**
+- [x] **Step 3: Write the use case**
 
 Create `src/mindbridge/application/consolidate_entities.py`, mirroring
 `src/mindbridge/application/consolidate_claims.py` structure: read the page, guard that no
@@ -671,12 +671,12 @@ The error policy is the whole point of this task, so write it explicitly:
 `ModelUnavailableError` and `ModelRequestError` are deliberately absent from that `except`:
 they propagate so the sweep retries later.
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `uv run pytest tests/unit/application/test_consolidate_entities.py -v`
 Expected: 5 passed
 
-- [ ] **Step 5: Run the full gates and commit**
+- [x] **Step 5: Run the full gates and commit**
 
 ```bash
 uv run ruff format --check . && uv run ruff check . && uv run mypy && uv run pytest -W error
@@ -700,7 +700,7 @@ git commit -m "Never persist a verdict the judge could not reach"
 - Produces: `PostgresMemoryStore.list_entity_candidates` and
   `PostgresMemoryStore.commit_entity_resolution`, satisfying that protocol.
 
-- [ ] **Step 1: Write the failing integration test**
+- [x] **Step 1: Write the failing integration test**
 
 Create `tests/integration/test_postgres_entity_resolution.py`, marked
 `pytestmark = pytest.mark.integration`, following the fixtures in
@@ -730,7 +730,7 @@ async def test_commit_is_idempotent() -> None:
     """Committing the same write twice leaves one row."""
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run:
 
@@ -745,7 +745,7 @@ If that database refuses the password, list the running containers and use which
 Postgres accepts `mindbridge/mindbridge_test`; verify with
 `docker exec <container> psql -U mindbridge -d mindbridge_test -tAc "select 1"`.
 
-- [ ] **Step 3: Write the query and the write**
+- [x] **Step 3: Write the query and the write**
 
 Create `src/mindbridge/infrastructure/_postgres_entity_resolution.py`, following the mixin
 style of `_postgres_claim_consolidation.py`. The candidate query selects entities of the
@@ -759,12 +759,12 @@ with `ON CONFLICT (tenant_id, relation_id) DO NOTHING` and returns the inserted 
 Register both methods on `PostgresMemoryStore` in `postgres.py` next to the claim
 consolidation ones.
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run the Step 2 command again.
 Expected: 6 passed
 
-- [ ] **Step 5: Run the full gates and commit**
+- [x] **Step 5: Run the full gates and commit**
 
 ```bash
 uv run ruff format --check . && uv run ruff check . && uv run mypy
@@ -794,7 +794,7 @@ git commit -m "Page and commit entity resolution candidates in PostgreSQL"
   maximum_pairs, entity_types, readjudicate) -> EntitySweepSummary`, and the eight
   `--entity-*` CLI options.
 
-- [ ] **Step 1: Write the failing sweep test**
+- [x] **Step 1: Write the failing sweep test**
 
 Append to `tests/unit/application/test_consolidation_sweep.py`, mirroring the existing claim
 sweep test:
@@ -810,35 +810,35 @@ async def test_entity_sweep_refuses_a_cursor_that_does_not_advance() -> None:
         await consolidate_tenant_entities(_FakeUseCase(stuck=True), "tenant_01", _AT, ...)
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `uv run pytest tests/unit/application/test_consolidation_sweep.py -v`
 Expected: FAIL with `ImportError: cannot import name 'consolidate_tenant_entities'`
 
-- [ ] **Step 3: Add the sweep**
+- [x] **Step 3: Add the sweep**
 
 Copy `consolidate_tenant_claims` in `consolidation_sweep.py`, substituting the entity
 request, result and summary types. Keep the `MemoryIntegrityError` guard verbatim.
 
-- [ ] **Step 4: Add the CLI options**
+- [x] **Step 4: Add the CLI options**
 
 In `consolidation_cli.py`, add `--entity-page-size`, `--entity-maximum-gap-seconds`,
 `--entity-candidate-limit`, `--entity-minimum-confidence`, `--entity-evidence-per-side`,
 `--entity-maximum-pairs`, `--entity-types` (repeatable, default `person`) and
 `--entity-readjudicate` (flag), and include the entity summary in the printed JSON.
 
-- [ ] **Step 5: Run tests to verify they pass**
+- [x] **Step 5: Run tests to verify they pass**
 
 Run: `uv run pytest tests/unit/application/test_consolidation_sweep.py tests/unit/test_consolidation_cli.py -v`
 Expected: PASS
 
-- [ ] **Step 6: Document it**
+- [x] **Step 6: Document it**
 
 Add a short paragraph to the consolidation section of `README.md` stating what the sweep
 does, that `same_as` is non-transitive, that retrieval does not traverse it yet, and that
 `--entity-types` defaults to `person`.
 
-- [ ] **Step 7: Run every gate including Markdown, then commit**
+- [x] **Step 7: Run every gate including Markdown, then commit**
 
 ```bash
 uv run ruff format --check . && uv run ruff check . && uv run mypy && uv run pytest -W error
@@ -866,7 +866,7 @@ git commit -m "Sweep entity resolution from the consolidation control plane"
 This task produces no product code. It lives in the scratchpad because `AGENTS.md` keeps
 benchmark and evaluation material out of product modules.
 
-- [ ] **Step 1: Label the ground truth**
+- [x] **Step 1: Label the ground truth**
 
 The 17 `person` entities of `living_room_22` are in
 `<scratchpad>/entity-truth/entities.jsonl`. Write `labels.json` mapping each `entity_id` to
@@ -874,25 +874,25 @@ one of `person_man`, `person_woman`, `person_camera_wearer`, or `not-an-individu
 `two people seated on living room sofa` takes `not-an-individual`: it is a collective, joins
 no positive pair, and the adjudicator must still refuse to merge it with anyone.
 
-- [ ] **Step 2: Write the scorer**
+- [x] **Step 2: Write the scorer**
 
 `score_entity_resolution.py` reads `labels.json`, reads the written `same_as` edges for the
 tenant from PostgreSQL, and prints precision, recall, and every false positive in full so a
 precision miss is inspectable rather than just a number.
 
-- [ ] **Step 3: Run the sweep against the labelled tenant**
+- [x] **Step 3: Run the sweep against the labelled tenant**
 
 ```bash
 uv run --extra server mindbridge consolidate --tenant-id benchmark_m3_living_room_22_m3sub-raw-001
 ```
 
-- [ ] **Step 4: Score and gate**
+- [x] **Step 4: Score and gate**
 
 Run the scorer. Precision must be 1.0. If it is not, do not tune the threshold to hide the
 failure: read the false pair's `discriminating_cue`, decide whether the prompt or the
 shortlist admitted it, and fix that.
 
-- [ ] **Step 5: Record the result**
+- [x] **Step 5: Record the result**
 
 Append the precision, recall, pair count and prompt version to the spec's Testing section as
 a measured result, then commit the spec change.
