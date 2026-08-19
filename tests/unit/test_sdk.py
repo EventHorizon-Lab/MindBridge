@@ -100,6 +100,30 @@ async def test_typed_api_error_preserves_retry_information() -> None:
     assert failure.value.trace_id == "trace_failure"
 
 
+async def test_transport_failure_names_the_underlying_cause() -> None:
+    """ "MindBridge request failed" alone sent operators to the server log to learn whether the
+    deployment was down, the name was wrong, or the request had simply timed out."""
+
+    async def refuse(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("All connection attempts failed", request=request)
+
+    client = _client(refuse)
+    try:
+        with pytest.raises(MindBridgeError) as failure:
+            await client.recall(
+                RecallRequest(
+                    tenant_id="tenant_01",
+                    query=RecallQuery(text="Where is the tool?"),
+                )
+            )
+    finally:
+        await client.close()
+
+    assert failure.value.code == "transport_error"
+    assert "All connection attempts failed" in str(failure.value)
+    assert "v1/recall" in str(failure.value)
+
+
 async def test_get_observation_job_uses_tenant_scoped_route() -> None:
     async def respond(request: httpx.Request) -> httpx.Response:
         assert request.method == "GET"

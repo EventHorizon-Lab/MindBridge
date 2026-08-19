@@ -232,8 +232,10 @@ class MindBridge:
                 params=params,
             )
         except httpx.HTTPError as error:
+            # The cause is the only thing that separates "wrong address", "nothing listening",
+            # and "timed out", and none of it reaches a caller who cannot read the server log.
             raise MindBridgeError(
-                "MindBridge request failed",
+                f"MindBridge {method} {path} failed: {type(error).__name__}: {error}",
                 code="transport_error",
             ) from error
         if not response.is_success:

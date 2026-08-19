@@ -12,6 +12,7 @@ from mindbridge.media.clipping import (
     ClipRequest,
     audio_windows,
     cut_clips,
+    cut_generation_proxy,
     scaled_size,
 )
 
@@ -106,6 +107,69 @@ def test_video_clip_applies_the_requested_frame_rate_and_pixel_budget() -> None:
     assert stream.codec_context.width * stream.codec_context.height <= 10_000
 
 
+def test_generation_proxy_keeps_the_speech_the_model_has_to_hear() -> None:
+    """Perception reads this copy instead of the source, so dropping its audio track would
+    silently take speech away from every question that depends on what was said."""
+    import av
+
+    source = _audiovisual_bytes(seconds=4.0, fps=10, width=320, height=240)
+
+    proxy = cut_generation_proxy(
+        source,
+        ClipRequest(
+            kind=MediaKind.VIDEO,
+            start_ms=0,
+            end_ms=4_000,
+            frames_per_second=1.0,
+            max_pixels=10_000,
+        ),
+    )
+
+    with av.open(io.BytesIO(proxy.content), mode="r") as container:
+        assert len(container.streams.audio) == 1
+        samples = sum(frame.samples for frame in container.decode(container.streams.audio[0]))
+    assert samples > SAMPLE_RATE  # over a second of audio survived the re-encode
+
+
+def test_generation_proxy_applies_the_requested_frame_rate_and_pixel_budget() -> None:
+    """The point of the proxy is that it carries the sampling the model was going to apply."""
+    import av
+
+    source = _audiovisual_bytes(seconds=6.0, fps=10, width=320, height=240)
+
+    proxy = cut_generation_proxy(
+        source,
+        ClipRequest(
+            kind=MediaKind.VIDEO,
+            start_ms=2_000,
+            end_ms=5_000,
+            frames_per_second=2.0,
+            max_pixels=10_000,
+        ),
+    )
+
+    assert len(proxy.content) < len(source)
+    with av.open(io.BytesIO(proxy.content), mode="r") as container:
+        stream = container.streams.video[0]
+        decoded = list(container.decode(stream))
+    assert 5 <= len(decoded) <= 8
+    assert stream.codec_context.width * stream.codec_context.height <= 10_000
+
+
+def test_generation_proxy_of_a_silent_source_stays_video_only() -> None:
+    import av
+
+    source = _video_bytes(seconds=3.0, fps=10, width=160, height=120)
+
+    proxy = cut_generation_proxy(
+        source,
+        ClipRequest(kind=MediaKind.VIDEO, start_ms=0, end_ms=3_000, frames_per_second=1.0),
+    )
+
+    with av.open(io.BytesIO(proxy.content), mode="r") as container:
+        assert not container.streams.audio
+
+
 def test_cut_rejects_empty_source_and_backwards_spans() -> None:
     with pytest.raises(DomainInvariantError, match="source media must not be empty"):
         cut_clips(b"", ClipRequest(kind=MediaKind.AUDIO, start_ms=0, end_ms=1_000))
@@ -142,6 +206,41 @@ def _video_bytes(*, seconds: float, fps: int, width: int, height: int) -> bytes:
             frame.pts = index
             container.mux(stream.encode(frame))
         container.mux(stream.encode())
+    return buffer.getvalue()
+
+
+def _audiovisual_bytes(*, seconds: float, fps: int, width: int, height: int) -> bytes:
+    """One MP4 carrying both a video track and a real audio track."""
+    import av
+
+    buffer = io.BytesIO()
+    with av.open(buffer, mode="w", format="mp4") as container:
+        video = container.add_stream("libx264", rate=fps)
+        video.width, video.height, video.pix_fmt = width, height, "yuv420p"
+        audio = container.add_stream("aac", rate=SAMPLE_RATE)
+        audio.layout = "mono"
+        for index in range(int(seconds * fps)):
+            array = numpy.full((height, width, 3), index % 256, dtype="uint8")
+            video_frame = av.VideoFrame.from_ndarray(array, format="rgb24")
+            video_frame.pts = index
+            container.mux(video.encode(video_frame))
+        samples_per_frame = SAMPLE_RATE // fps
+        for index in range(int(seconds * fps)):
+            tone = numpy.sin(
+                2
+                * numpy.pi
+                * 440
+                * numpy.arange(index * samples_per_frame, (index + 1) * samples_per_frame)
+                / SAMPLE_RATE
+            )
+            audio_frame = av.AudioFrame.from_ndarray(
+                (tone * 16_000).astype("int16").reshape(1, -1), format="s16", layout="mono"
+            )
+            audio_frame.sample_rate = SAMPLE_RATE
+            audio_frame.pts = index * samples_per_frame
+            container.mux(audio.encode(audio_frame))
+        container.mux(video.encode())
+        container.mux(audio.encode())
     return buffer.getvalue()
 
 

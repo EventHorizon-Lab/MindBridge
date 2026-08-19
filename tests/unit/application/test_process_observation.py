@@ -2,10 +2,12 @@
 
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+from hashlib import sha256
 
 import pytest
 
 from mindbridge.application import process_observation as process_observation_module
+from mindbridge.application.evidence_clips import ClipSampling
 from mindbridge.application.observation_processing import (
     ObservationBatch,
     ObservationProcessingOutput,
@@ -126,6 +128,7 @@ class RecordingPerceiver:
 
     def __init__(self, error: Exception | None = None) -> None:
         self.calls = 0
+        self.evidence_urls: tuple[str, ...] = ()
         self._error = error
 
     async def perceive_events(
@@ -134,6 +137,7 @@ class RecordingPerceiver:
         evidence: tuple[ResolvedEvidence, ...],
     ) -> EventPerception:
         self.calls += 1
+        self.evidence_urls = tuple(dict.fromkeys(item.media_url for item in evidence))
         if self._error is not None:
             raise self._error
         return EventPerception(
@@ -255,6 +259,16 @@ class DeterministicSigner:
         self.uploaded[media_object.uri] = content
 
 
+def stub_proxy_cut(source: bytes, request: ClipRequest) -> MediaClip:
+    """Stand in for the real proxy encoder, which needs the optional media extra."""
+    return MediaClip(
+        content=b"clip:%d-%d:" % (request.start_ms, request.end_ms) + source,
+        suffix=".mp4",
+        start_ms=request.start_ms,
+        end_ms=request.end_ms,
+    )
+
+
 def stub_cut(source: bytes, request: ClipRequest) -> tuple[MediaClip, ...]:
     """Cut deterministically without decoding, so unit tests stay pure."""
     return tuple(
@@ -293,12 +307,15 @@ async def test_processor_builds_event_memory_and_raw_media_embedding_once(
     assert first.state is JobState.SUCCEEDED
     assert duplicate.state is JobState.SUCCEEDED
     assert perceiver.calls == 1
-    # Two source signings (perception, clip derivation) plus one for the stored clip.
-    assert signer.calls == 3
+    # Two source signings (perception, clip derivation) plus one each for the perception
+    # proxy and the stored clip.
+    assert signer.calls == 4
     # The encoder receives the derived clip, never the whole source recording.
-    assert embedder.documents == ("https://objects.example.test/clip.mp4?signature=3",)
+    assert embedder.documents == ("https://objects.example.test/clip.mp4?signature=4",)
     assert store.output is not None
-    assert len(signer.uploaded) == 1
+    # The stored clip plus the perception proxy, which stays transient: it is never registered
+    # as an output media object and the orphan-clip sweep reclaims it.
+    assert len(signer.uploaded) == 2
     assert len(store.output.media_objects) == 1
     assert store.output.media_objects[0].derived_from_media_object_id == MediaObjectId("media_01")
     # Clips follow the grounded event span, so the unreferenced source span that
@@ -609,6 +626,7 @@ def _processor(
         text_embedder,
         media_url_signer=signer or DeterministicSigner(),
         clip_cutter=stub_cut,
+        proxy_cutter=stub_proxy_cut,
     )
 
 
@@ -707,3 +725,61 @@ def _job(
         updated_at=updated_at,
         memory_ids=memory_ids,
     )
+
+
+class ObjectNamingSigner(DeterministicSigner):
+    """Signs a URL that names the object it signed, so a proxy is distinguishable."""
+
+    async def create_presigned_download(
+        self,
+        media_object: MediaObject,
+    ) -> PresignedMediaDownload:
+        self.calls += 1
+        return PresignedMediaDownload(
+            download_url=f"https://objects.example.test/{media_object.media_object_id}.mp4",
+            expires_at=NOW + timedelta(minutes=5),
+        )
+
+
+async def test_perception_reads_a_sampled_proxy_instead_of_the_untouched_source() -> None:
+    """The generation request already pins the frame rate and pixel budget, so a remote model
+    downloading the full-resolution source moves bytes it throws away on arrival."""
+    store = RecordingProcessingStore()
+    perceiver = RecordingPerceiver()
+    signer = ObjectNamingSigner()
+
+    await _processor(
+        store, perceiver, RecordingEmbedder(), RecordingTextEmbedder(), signer=signer
+    ).run(TENANT_ID, OBSERVATION_ID, JOB_ID)
+
+    (perceived_url,) = perceiver.evidence_urls
+    assert "/media_clip_" in perceived_url
+    proxy_uri = (
+        "s3://memory/tenants/tenant_01/clips/"
+        f"{sha256(b'clip:0-4000:source-media-bytes').hexdigest()}.mp4"
+    )
+    assert signer.uploaded[proxy_uri] == b"clip:0-4000:source-media-bytes"
+    # The proxy is transient derived media, not a new source the memory now cites.
+    assert store.output is not None
+    assert [item.media_object_id for item in store.output.media_objects] != [proxy_uri]
+
+
+async def test_perception_reads_the_source_when_the_proxy_is_switched_off() -> None:
+    """A colocated generator must keep the previous behaviour exactly."""
+    store = RecordingProcessingStore()
+    perceiver = RecordingPerceiver()
+    signer = ObjectNamingSigner()
+    processor = ProcessObservation(
+        store,
+        perceiver,
+        RecordingEmbedder(),
+        RecordingTextEmbedder(),
+        media_url_signer=signer,
+        clip_sampling=ClipSampling(generation_proxy=False),
+        clip_cutter=stub_cut,
+        proxy_cutter=stub_proxy_cut,
+    )
+
+    await processor.run(TENANT_ID, OBSERVATION_ID, JOB_ID)
+
+    assert perceiver.evidence_urls == ("https://objects.example.test/media_01.mp4",)

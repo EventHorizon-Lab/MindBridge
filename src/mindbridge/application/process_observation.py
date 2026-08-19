@@ -16,7 +16,11 @@ from mindbridge.application.derive_observation_graph import (
     embed_observation_graph,
 )
 from mindbridge.application.evidence import resolve_evidence_media
-from mindbridge.application.evidence_clips import ClipSampling, derive_evidence_clips
+from mindbridge.application.evidence_clips import (
+    ClipSampling,
+    derive_evidence_clips,
+    derive_generation_proxies,
+)
 from mindbridge.application.observation_processing import ObservationProcessingOutput
 from mindbridge.application.perception import (
     EventPerception,
@@ -50,7 +54,12 @@ from mindbridge.core import (
     TenantId,
     derive_stable_id,
 )
-from mindbridge.media.clipping import ClipRequest, MediaClip, cut_clips
+from mindbridge.media.clipping import (
+    ClipRequest,
+    MediaClip,
+    cut_clips,
+    cut_generation_proxy,
+)
 from mindbridge.telemetry import (
     operation_span,
     record_stage_duration,
@@ -72,6 +81,7 @@ class ProcessObservation:
         media_url_signer: DerivedMediaStore,
         clip_sampling: ClipSampling | None = None,
         clip_cutter: Callable[[bytes, ClipRequest], tuple[MediaClip, ...]] = cut_clips,
+        proxy_cutter: Callable[[bytes, ClipRequest], MediaClip] = cut_generation_proxy,
     ) -> None:
         if media_embedder.space_reference != text_embedder.space_reference:
             raise ValueError(
@@ -85,6 +95,7 @@ class ProcessObservation:
         self._media_url_signer = media_url_signer
         self._clip_sampling = clip_sampling or ClipSampling()
         self._clip_cutter = clip_cutter
+        self._proxy_cutter = proxy_cutter
 
     @trace_operation("mindbridge.process_observation")
     async def run(
@@ -130,7 +141,19 @@ class ProcessObservation:
                 batch.media_objects,
                 self._media_url_signer,
             )
-            perception = await self._perceiver.perceive_events(batch.observation, evidence)
+            # Perception already asks the model for exactly this frame rate and pixel budget,
+            # so it reads a copy cut to them rather than making the model download the frames
+            # it is about to discard.
+            perception = await self._perceiver.perceive_events(
+                batch.observation,
+                await derive_generation_proxies(
+                    tenant_id,
+                    evidence,
+                    store=self._media_url_signer,
+                    sampling=self._clip_sampling,
+                    cut=self._proxy_cutter,
+                ),
+            )
             _require_grounded_perception(batch.observation, evidence, perception.events)
             perception, event_evidence = _ground_events(
                 batch.observation,

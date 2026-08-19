@@ -7,8 +7,8 @@ import json
 import os
 from collections.abc import Mapping
 from contextlib import AsyncExitStack
-from dataclasses import dataclass, field
-from typing import NoReturn, Protocol
+from dataclasses import dataclass, field, fields
+from typing import Any, NoReturn, Protocol, cast
 
 from billiard.exceptions import (
     SoftTimeLimitExceeded,
@@ -20,10 +20,12 @@ from celery.signals import (
 )
 
 from mindbridge.application.capabilities import Embedder
+from mindbridge.application.evidence_clips import ClipSampling
 from mindbridge.application.pipelines import PerceptionPipeline
 from mindbridge.application.process_observation import ProcessObservation
 from mindbridge.configuration import (
     copy_plugin_configuration,
+    optional_environment_value,
     plugin_configuration,
     require_environment_value,
     validate_plugin_name,
@@ -108,6 +110,7 @@ class WorkerSettings:
     media_embedder_plugin: str = "jina"
     text_embedder_plugin: str = "openai"
     embedding_dimension: int = DEFAULT_EMBEDDING_DIMENSION
+    clip_sampling: ClipSampling = field(default_factory=ClipSampling)
 
     def __post_init__(self) -> None:
         for name, value in (
@@ -175,7 +178,29 @@ class WorkerSettings:
                 else None,
             ),
             embedding_dimension=embedding_dimension_from_environment(source),
+            clip_sampling=_clip_sampling_from_environment(source),
         )
+
+
+def _clip_sampling_from_environment(source: Mapping[str, str]) -> ClipSampling:
+    """Read the optional media sampling knob that sets the whole write cost of video.
+
+    Frame rate multiplies every downstream cost in the write path: one clip cut, one encoder
+    call, and one stored object per sampled window. A deployment ingesting continuous video
+    has to be able to choose it, so it travels as one optional JSON object rather than four
+    more fallback variables.
+    """
+    encoded = optional_environment_value(source, "MINDBRIDGE_MEDIA_SAMPLING_CONFIG_JSON")
+    if encoded is None:
+        return ClipSampling()
+    config = plugin_configuration(source, "MINDBRIDGE_MEDIA_SAMPLING_CONFIG_JSON")
+    unsupported = set(config) - {field.name for field in fields(ClipSampling)}
+    if unsupported:
+        raise ValueError(
+            "MINDBRIDGE_MEDIA_SAMPLING_CONFIG_JSON has unsupported keys: "
+            f"{', '.join(sorted(unsupported))}"
+        )
+    return ClipSampling(**cast(dict[str, Any], config))
 
 
 @dataclass(slots=True)
@@ -305,6 +330,7 @@ async def _process_observation_once(
             media_embedder,
             text_embedder,
             media_url_signer=media_access,
+            clip_sampling=settings.clip_sampling,
         ).run(tenant_id, observation_id, job_id)
     return job.state
 

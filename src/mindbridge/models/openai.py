@@ -10,6 +10,7 @@ from time import perf_counter
 from typing import cast
 from urllib.parse import urlsplit, urlunsplit
 
+import httpx
 import openai
 from openai import AsyncOpenAI, AsyncStream, Omit, omit
 from openai.types.chat import ChatCompletionChunk, ChatCompletionMessageParam
@@ -164,6 +165,11 @@ class OpenAIGenerator:
             completion = await _consume_completion_stream(stream)
         except openai.APIError as error:
             _raise_model_error(error, "generation request failed")
+        except httpx.HTTPError as error:
+            # A provider that drops a long response mid-body raises inside the stream iterator,
+            # past the SDK's own error wrapping. Left unclassified it looked permanent, so one
+            # transient disconnect failed the whole observation instead of being retried.
+            raise ModelUnavailableError("generation request failed") from error
         attributes: dict[str, str | int | float | bool] = {}
         if completion.first_token_at is not None:
             attributes["mindbridge.model.ttft_seconds"] = max(

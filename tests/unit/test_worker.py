@@ -13,6 +13,7 @@ from pydantic import ValidationError
 
 import mindbridge.worker as worker_module
 from mindbridge.application.capabilities import Embedder, EmbedRequest, EmbedResult
+from mindbridge.application.evidence_clips import ClipSampling
 from mindbridge.core import (
     DatabaseUnavailableError,
     JobState,
@@ -238,6 +239,37 @@ def test_worker_preserves_transient_retry_after_running_waits(
             task.run(message)
     finally:
         task.pop_request()
+
+
+def test_worker_reads_media_sampling_from_the_environment() -> None:
+    """Frame rate is the whole write cost of a video deployment and had no configuration."""
+    settings = WorkerSettings.from_environment(
+        {
+            **_environment(),
+            "MINDBRIDGE_MEDIA_SAMPLING_CONFIG_JSON": (
+                '{"frames_per_second": 0.5, "max_pixels": 50176, "generation_proxy": false}'
+            ),
+        }
+    )
+
+    assert settings.clip_sampling.frames_per_second == 0.5
+    assert settings.clip_sampling.max_pixels == 50_176
+    assert settings.clip_sampling.generation_proxy is False
+
+
+def test_worker_media_sampling_defaults_keep_the_documented_encoder_budget() -> None:
+    """An unset deployment must behave exactly as it did before the knob existed."""
+    settings = WorkerSettings.from_environment(_environment())
+
+    assert settings.clip_sampling == ClipSampling()
+
+
+def test_worker_rejects_unsupported_media_sampling_keys() -> None:
+    """A typo in an optional tuning knob must fail startup, not silently keep the default."""
+    with pytest.raises(ValueError):
+        WorkerSettings.from_environment(
+            {**_environment(), "MINDBRIDGE_MEDIA_SAMPLING_CONFIG_JSON": '{"fps": 0.5}'}
+        )
 
 
 def test_worker_rejects_invalid_task_identity() -> None:

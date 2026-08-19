@@ -13,8 +13,9 @@ object instead of leaving one orphan per attempt.
 from __future__ import annotations
 
 import asyncio
+import math
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from hashlib import sha256
 from urllib.parse import quote, urlsplit
@@ -31,13 +32,16 @@ from mindbridge.application.ports import (
     ClipDigestStore,
     DerivedMediaJanitor,
     DerivedMediaStore,
+    PresignedMediaDownload,
 )
 from mindbridge.core import (
+    DomainInvariantError,
     EmbeddedObjectType,
     EmbeddingId,
     EmbeddingRecord,
     EvidenceClip,
     EvidenceSpan,
+    MediaKind,
     MediaObject,
     MediaObjectId,
     ModelOutputError,
@@ -52,6 +56,7 @@ from mindbridge.media.clipping import (
     ClipRequest,
     MediaClip,
     cut_clips,
+    cut_generation_proxy,
 )
 from mindbridge.telemetry import set_current_span_attributes, trace_operation
 
@@ -63,6 +68,15 @@ class ClipSampling:
     frames_per_second: float = DEFAULT_VIDEO_FRAMES_PER_SECOND
     max_pixels: int = DEFAULT_VIDEO_MAX_PIXELS
     image_max_pixels: int = DEFAULT_IMAGE_MAX_PIXELS
+    # Off only for a generator that reads the same storage the Worker does, where the encode
+    # costs more than the transfer it removes.
+    generation_proxy: bool = True
+
+    def __post_init__(self) -> None:
+        if not math.isfinite(self.frames_per_second) or self.frames_per_second <= 0:
+            raise ValueError("frames_per_second must be a positive number")
+        if self.max_pixels <= 0 or self.image_max_pixels <= 0:
+            raise ValueError("pixel budgets must be positive")
 
 
 @dataclass(frozen=True, slots=True)
@@ -149,6 +163,106 @@ async def derive_evidence_clips(
         ),
         embeddings=embeddings,
     )
+
+
+@trace_operation("mindbridge.evidence_clips.generation_proxy")
+async def derive_generation_proxies(
+    tenant_id: TenantId,
+    evidence: tuple[ResolvedEvidence, ...],
+    *,
+    store: DerivedMediaStore,
+    sampling: ClipSampling,
+    cut: Callable[[bytes, ClipRequest], MediaClip] = cut_generation_proxy,
+    max_concurrency: int = 4,
+) -> tuple[ResolvedEvidence, ...]:
+    """Point generation at the sampled copy of each video the model would produce anyway.
+
+    Every generation request already carries the frame rate and pixel budget the model must
+    apply, so handing over untouched source video makes the provider download frames it
+    immediately discards. Each video source is cut once at that same budget and the sampled copy
+    becomes what the model fetches. The span keeps citing its original object, non-video evidence
+    is untouched, and a proxy that did not come out smaller is discarded rather than uploaded.
+    """
+    if max_concurrency <= 0:
+        raise ValueError("max_concurrency must be positive")
+    groups: dict[MediaObjectId, list[ResolvedEvidence]] = {}
+    for item in evidence:
+        if item.media_object.kind is MediaKind.VIDEO:
+            groups.setdefault(item.media_object.media_object_id, []).append(item)
+    if not sampling.generation_proxy or not groups:
+        return evidence
+
+    semaphore = asyncio.Semaphore(max_concurrency)
+    proxies = {
+        media_object_id: download
+        for media_object_id, download in await asyncio.gather(
+            *(
+                _store_generation_proxy(
+                    tenant_id,
+                    items,
+                    store=store,
+                    sampling=sampling,
+                    cut=cut,
+                    semaphore=semaphore,
+                )
+                for items in groups.values()
+            )
+        )
+        if download is not None
+    }
+    set_current_span_attributes({"mindbridge.generation_proxy.count": len(proxies)})
+    return tuple(
+        item
+        if (download := proxies.get(item.media_object.media_object_id)) is None
+        else replace(
+            item,
+            media_url=download.download_url,
+            media_url_expires_at=download.expires_at,
+        )
+        for item in evidence
+    )
+
+
+async def _store_generation_proxy(
+    tenant_id: TenantId,
+    items: list[ResolvedEvidence],
+    *,
+    store: DerivedMediaStore,
+    sampling: ClipSampling,
+    cut: Callable[[bytes, ClipRequest], MediaClip],
+    semaphore: asyncio.Semaphore,
+) -> tuple[MediaObjectId, PresignedMediaDownload | None]:
+    """Cut, store, and sign one sampled copy covering every span read from one source."""
+    source_object = items[0].media_object
+    async with semaphore:
+        source = await store.read_media(source_object)
+        request = ClipRequest(
+            kind=source_object.kind,
+            start_ms=min(item.evidence_span.start_ms for item in items),
+            end_ms=max(item.evidence_span.end_ms for item in items),
+            frames_per_second=sampling.frames_per_second,
+            max_pixels=sampling.max_pixels,
+            image_max_pixels=sampling.image_max_pixels,
+        )
+        try:
+            proxy = await asyncio.to_thread(cut, source, request)
+        except DomainInvariantError:
+            # Sampling is an optimization. A source it cannot cut still has to reach the model,
+            # rather than turning a working observation into a permanently failed one.
+            set_current_span_attributes({"mindbridge.generation_proxy.skipped": True})
+            return source_object.media_object_id, None
+        finally:
+            del source
+        if len(proxy.content) >= source_object.size_bytes:
+            return source_object.media_object_id, None
+        media_object = _clip_media_object(
+            tenant_id,
+            items[0],
+            proxy,
+            created_at=items[0].evidence_span.created_at,
+        )
+        await store.upload_media(media_object, proxy.content)
+        return source_object.media_object_id, await store.create_presigned_download(media_object)
 
 
 async def _store_source_group(

@@ -74,12 +74,54 @@ class _Container(Protocol):
     def __exit__(self, *arguments: object) -> None: ...
 
 
+class _AudioContainer(Protocol):
+    """The same PyAV container seen through its audio methods.
+
+    PyAV's `decode` and `add_stream` serve both media kinds; these shims stay one-kind-per-name
+    so no call site has to widen a frame type it already knows.
+    """
+
+    streams: _Streams
+
+    def decode(self, stream: _AudioStream) -> Iterator[_AudioFrame]: ...
+    def add_stream(self, codec: str, *, rate: int) -> _AudioStream: ...
+    def mux(self, packets: list[object]) -> None: ...
+    def __enter__(self) -> _AudioContainer: ...
+    def __exit__(self, *arguments: object) -> None: ...
+
+
 class _Streams(Protocol):
     video: list[_VideoStream]
+    audio: list[_AudioStream]
+
+
+class _AudioFrame(Protocol):
+    time: float | None
+    pts: int | None
+    samples: int
+
+
+class _AudioStream(Protocol):
+    rate: int
+    layout: object
+    time_base: object
+
+    def encode(self, frame: _AudioFrame | None = None) -> list[object]: ...
+
+
+class _AudioResampler(Protocol):
+    def resample(self, frame: _AudioFrame | None) -> list[_AudioFrame]: ...
 
 
 class _AvModule(Protocol):
     def open(self, target: io.BytesIO, mode: str = ..., format: str = ...) -> _Container: ...
+    def AudioResampler(
+        self,
+        *,
+        format: str,
+        layout: object,
+        rate: int,
+    ) -> _AudioResampler: ...
 
 
 class _Image(Protocol):
@@ -162,6 +204,77 @@ def cut_clips(source: bytes, request: ClipRequest) -> tuple[MediaClip, ...]:
     if request.kind is MediaKind.AUDIO:
         return _cut_audio(source, request)
     return (_cut_video(source, request),)
+
+
+def cut_generation_proxy(source: bytes, request: ClipRequest) -> MediaClip:
+    """Re-encode one video span at the sampling a generator was going to apply anyway.
+
+    This is the copy a model reads instead of the source, so it keeps the source's audio: a
+    video-only proxy would silently take speech away from every question that depends on what
+    was said. Its video track carries exactly the frames and pixel budget the request names,
+    which is what makes it smaller than the source without being worth less to the model.
+    """
+    if not source:
+        raise DomainInvariantError("source media must not be empty")
+    if request.kind is not MediaKind.VIDEO:
+        raise DomainInvariantError("a generation proxy is only defined for video")
+    av = cast(_AvModule, _import("av"))
+    sampled = _sample_video_frames(av, source, request)
+    if not sampled:
+        raise DomainInvariantError("video span selected no frames from its source")
+    width, height = scaled_size(sampled[0].width, sampled[0].height, request.max_pixels)
+    buffer = io.BytesIO()
+    first_seconds = sampled[0].time or 0.0
+    with av.open(buffer, mode="w", format="mp4") as output:
+        stream = output.add_stream("libx264", rate=_stream_rate(request.frames_per_second))
+        stream.width, stream.height, stream.pix_fmt = width, height, "yuv420p"
+        stream.time_base = _MILLISECOND_TIME_BASE
+        for frame in sampled:
+            resized = frame.reformat(width=width, height=height, format="yuv420p")
+            resized.pts = round(((frame.time or 0.0) - first_seconds) * 1_000)
+            resized.time_base = stream.time_base
+            output.mux(stream.encode(resized))
+        _copy_span_audio(av, source, cast(_AudioContainer, output), request)
+        output.mux(stream.encode())
+    return MediaClip(
+        content=buffer.getvalue(),
+        suffix=".mp4",
+        start_ms=request.start_ms,
+        end_ms=request.end_ms,
+    )
+
+
+def _copy_span_audio(
+    av: _AvModule,
+    source: bytes,
+    output: _AudioContainer,
+    request: ClipRequest,
+) -> None:
+    """Re-encode the span's audio into the proxy, keeping its rate and channel layout."""
+    with cast(_AudioContainer, av.open(io.BytesIO(source))) as container:
+        if not container.streams.audio:
+            return
+        source_stream = container.streams.audio[0]
+        stream = output.add_stream("aac", rate=source_stream.rate)
+        stream.layout = source_stream.layout
+        # AAC only accepts planar float, and a source in any other sample format would raise
+        # mid-encode rather than at the boundary.
+        resampler = av.AudioResampler(
+            format="fltp",
+            layout=source_stream.layout,
+            rate=source_stream.rate,
+        )
+        start_seconds, end_seconds = request.start_ms / 1_000, request.end_ms / 1_000
+        for frame in container.decode(source_stream):
+            if frame.time is None or frame.time < start_seconds:
+                continue
+            if frame.time > end_seconds:
+                break
+            for resampled in resampler.resample(frame):
+                output.mux(stream.encode(resampled))
+        for resampled in resampler.resample(None):
+            output.mux(stream.encode(resampled))
+        output.mux(stream.encode())
 
 
 def audio_windows(start_ms: int, end_ms: int) -> tuple[tuple[int, int], ...]:
