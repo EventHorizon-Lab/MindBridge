@@ -1158,6 +1158,29 @@ One prefork child is the safe default because each child owns a full embedding m
 Worker process per assigned GPU instead of increasing concurrency inside a process.
 `MINDBRIDGE_MEDIA_EMBEDDER_DEVICE` is optional and falls back to automatic device selection.
 
+How long one observation may take is not a separate setting. Perception is one Generator call per
+observation, so the Worker sizes its Celery soft limit, hard limit, and broker re-delivery window
+from the `request_timeout_seconds` the Generator was configured with, plus a fixed allowance for the
+encoding and graph write that follow. A deployment on a slow Generator therefore raises that one
+value and the task budget follows:
+
+```bash
+export MINDBRIDGE_GENERATOR_CONFIG_JSON='{
+  "api_key": "replace-with-a-runtime-secret",
+  "endpoint": "https://generator.example.com/v1",
+  "model_id": "qwen3.8-max",
+  "model_revision": "deployment-2026-08-11",
+  "reasoning_effort": "low",
+  "request_timeout_seconds": 1800
+}'
+```
+
+Sizing these independently is what makes a slow Generator look like a broken write path rather than
+a slow one: perception can spend thousands of output tokens on a busy 30-second clip, and if the task
+limit expires first, the overrun is retried as though it were transient and the same call is paid for
+again until the retries run out. Nothing is written either way. Set the Generator's deadline to what
+its slowest clip actually needs and let the budget follow.
+
 The Worker's text slot is deliberately not a separate variable family. It must land in the space the
 API queries, so it reads `MINDBRIDGE_EMBEDDER_PLUGIN`, `MINDBRIDGE_EMBEDDER_API_KEY`,
 `MINDBRIDGE_EMBEDDER_ENDPOINT`, `MINDBRIDGE_EMBEDDER_MODEL_ID`, and

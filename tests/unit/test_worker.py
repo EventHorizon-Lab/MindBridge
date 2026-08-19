@@ -24,7 +24,7 @@ from mindbridge.infrastructure.task_queue import (
     PROCESS_OBSERVATION_TASK,
     ObservationProcessingTaskMessage,
 )
-from mindbridge.worker import WorkerSettings, create_worker_app
+from mindbridge.worker import WorkerSettings, create_worker_app, processing_budget_seconds
 
 
 def test_worker_settings_pin_models_and_redact_credentials() -> None:
@@ -308,3 +308,28 @@ def _task_message() -> dict[str, str]:
         "observation_id": "observation_01",
         "job_id": "job_process_observation_01",
     }
+
+
+@pytest.mark.parametrize(
+    ("configured", "expected"),
+    [({}, 1_080.0), ({"request_timeout_seconds": 1_800.0}, 2_100.0)],
+)
+def test_worker_sizes_its_task_budget_from_the_generator_deadline(
+    configured: dict[str, object], expected: float
+) -> None:
+    """The Celery budget follows the model deadline the deployment actually configured.
+
+    These two numbers used to be independent, and a deployment that gave its generator 1800s kept
+    a 840s task limit: every observation was killed mid-perception and retried, so the write path
+    could never finish however long it was left running.
+    """
+    assert processing_budget_seconds(configured) == expected
+
+
+@pytest.mark.parametrize(
+    "configured", [{"request_timeout_seconds": 0}, {"request_timeout_seconds": "soon"}]
+)
+def test_worker_rejects_an_unusable_generator_deadline(configured: dict[str, object]) -> None:
+    """A budget derived from nonsense would be worse than the constant it replaced."""
+    with pytest.raises(ValueError, match="request_timeout_seconds must be"):
+        processing_budget_seconds(configured)
