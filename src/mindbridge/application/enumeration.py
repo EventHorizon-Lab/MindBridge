@@ -25,7 +25,7 @@ from mindbridge.core import (
     TenantId,
     VerificationStatus,
 )
-from mindbridge.telemetry import set_current_span_attributes, trace_operation
+from mindbridge.telemetry import operation_span, set_current_span_attributes
 
 ENUMERATION_CANDIDATE_LIMIT = 1_000
 ENUMERATION_BATCH_SIZE = 16
@@ -61,7 +61,7 @@ class EnumerateMemories:
         self._media_url_signer = media_url_signer
         self._clock = clock
 
-    @trace_operation("mindbridge.recall.enumerate")
+    @operation_span("mindbridge.recall.enumerate")
     async def run(
         self,
         request: RecallRequest,

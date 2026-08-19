@@ -211,6 +211,23 @@ def test_image_uses_its_own_budget_and_honours_a_region() -> None:
         assert rendered.width <= 300
 
 
+def test_region_larger_than_the_frame_is_clamped_to_it() -> None:
+    """An out-of-bounds region must be clamped per axis, not transposed or dropped."""
+    from PIL import Image
+
+    source = _image_bytes(width=1_000, height=800)
+
+    # 100x100 survives only if x clamps to width and y clamps to height; swapping the two
+    # would clamp x at 799 and stretch y to 1000, and PIL would refuse the crop outright.
+    clipped = cut_clips(
+        source,
+        ClipRequest(kind=MediaKind.IMAGE, start_ms=0, end_ms=0, region=(900, 700, 2_000, 2_000)),
+    )
+
+    with Image.open(io.BytesIO(clipped[0].content)) as rendered:
+        assert (rendered.width, rendered.height) == (100, 100)
+
+
 def _image_bytes(*, width: int, height: int) -> bytes:
     from PIL import Image
 

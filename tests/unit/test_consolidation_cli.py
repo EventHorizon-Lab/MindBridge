@@ -120,7 +120,8 @@ async def test_episode_sweep_accumulates_stable_pages() -> None:
         minimum_similarity=0.75,
     )
 
-    assert (summary.page_count, summary.scanned_count, summary.committed_count) == (2, 3, 1)
+    assert (summary.page_count, summary.scanned_count) == (2, 3)
+    assert summary.counts["committed_count"] == 1
     assert scripted.requests[1].after_event_id == "event_02"
     assert all(request.evaluated_at == NOW for request in scripted.requests)
 
@@ -138,7 +139,8 @@ async def test_claim_sweep_accumulates_semantic_and_relationship_counts() -> Non
     )
 
     assert (summary.page_count, summary.scanned_count, summary.candidate_count) == (2, 3, 4)
-    assert (summary.committed_semantic_claim_count, summary.committed_relationship_count) == (1, 1)
+    assert summary.counts["committed_semantic_claim_count"] == 1
+    assert summary.counts["committed_relationship_count"] == 1
     assert scripted.requests[1].after_claim_id == "claim_02"
     assert all(request.evaluated_at == NOW for request in scripted.requests)
 
@@ -155,7 +157,8 @@ async def test_summary_sweep_accumulates_stable_memory_pages() -> None:
         minimum_similarity=0.8,
     )
 
-    assert (summary.page_count, summary.scanned_count, summary.committed_count) == (2, 3, 1)
+    assert (summary.page_count, summary.scanned_count) == (2, 3)
+    assert summary.counts["committed_count"] == 1
     assert scripted.requests[1].after_cursor == SummaryCandidateCursor(
         occurred_at=NOW,
         memory_id=MemoryId("memory_02"),

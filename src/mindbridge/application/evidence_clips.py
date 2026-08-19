@@ -53,7 +53,7 @@ from mindbridge.media.clipping import (
     MediaClip,
     cut_clips,
 )
-from mindbridge.telemetry import set_current_span_attributes, trace_operation
+from mindbridge.telemetry import operation_span, set_current_span_attributes
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,7 +85,7 @@ class _StoredClip:
     media_object: MediaObject
 
 
-@trace_operation("mindbridge.evidence_clips.derive")
+@operation_span("mindbridge.evidence_clips.derive")
 async def derive_evidence_clips(
     tenant_id: TenantId,
     evidence: tuple[ResolvedEvidence, ...],
@@ -316,7 +316,7 @@ class ClipReclaimSummary:
     reclaimed_count: int
 
 
-@trace_operation("mindbridge.evidence_clips.reclaim")
+@operation_span("mindbridge.evidence_clips.reclaim")
 async def reclaim_orphan_clips(
     tenant_id: TenantId,
     *,

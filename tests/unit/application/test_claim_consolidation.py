@@ -3,6 +3,7 @@
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from consolidation_doubles import DeterministicSigner, RecordingTextEmbedder
 
 from mindbridge.application.claim_consolidation import (
     ClaimCandidate,
@@ -11,7 +12,6 @@ from mindbridge.application.claim_consolidation import (
 )
 from mindbridge.application.consolidate_claims import ConsolidateClaims
 from mindbridge.application.perception import ResolvedEvidence
-from mindbridge.application.ports import PresignedMediaDownload
 from mindbridge.application.semantic_claims import (
     ClaimConsolidation,
     ClaimConsolidationCommit,
@@ -24,7 +24,6 @@ from mindbridge.core import (
     ClaimId,
     ClaimType,
     EmbeddedObjectType,
-    EmbeddingSpaceReference,
     EntityId,
     EvidenceId,
     EvidenceSpan,
@@ -39,7 +38,6 @@ from mindbridge.core import (
     TenantId,
     VerificationStatus,
 )
-from mindbridge.models import Embedding, EmbedRequest, EmbedResult, TextPart
 
 NOW = datetime(2026, 8, 12, 12, 0, tzinfo=timezone.utc)
 TENANT_ID = TenantId("tenant_01")
@@ -113,42 +111,6 @@ class RecordingClaimConsolidator:
         return self._consolidation
 
 
-class RecordingTextEmbedder:
-    space_reference = EmbeddingSpaceReference(space_id="jina-v5", revision="space-v1")
-
-    def __init__(self) -> None:
-        self.documents: tuple[str, ...] = ()
-
-    async def embed(self, request: EmbedRequest) -> EmbedResult:
-        self.documents = tuple(
-            part.text
-            for input_value in request.inputs
-            for part in input_value.parts
-            if isinstance(part, TextPart)
-        )
-        return EmbedResult(
-            tuple(
-                Embedding(
-                    (1.0, 0.0),
-                    ModelReference(model_id="jina-text", revision="text-revision"),
-                    EmbeddingSpaceReference(space_id="jina-v5", revision="space-v1"),
-                )
-                for _ in request.inputs
-            )
-        )
-
-
-class DeterministicSigner:
-    async def create_presigned_download(
-        self,
-        media_object: MediaObject,
-    ) -> PresignedMediaDownload:
-        return PresignedMediaDownload(
-            download_url=f"https://objects.example.test/{media_object.media_object_id}",
-            expires_at=NOW + timedelta(minutes=5),
-        )
-
-
 async def test_claim_consolidation_builds_semantic_memory_and_version_decision() -> None:
     candidates = tuple(_candidate(index) for index in range(1, 5))
     consolidation = ClaimConsolidation(
@@ -177,7 +139,7 @@ async def test_claim_consolidation_builds_semantic_memory_and_version_decision()
         store,
         consolidator,
         embedder,
-        media_url_signer=DeterministicSigner(),
+        media_url_signer=DeterministicSigner(NOW),
     ).run(ClaimCandidateRequest(tenant_id=TENANT_ID, evaluated_at=NOW + timedelta(hours=1)))
 
     assert result.candidate_count == 4
@@ -224,7 +186,7 @@ async def test_claim_consolidation_rejects_unknown_sources_before_embedding() ->
             store,
             RecordingClaimConsolidator(consolidation),
             embedder,
-            media_url_signer=DeterministicSigner(),
+            media_url_signer=DeterministicSigner(NOW),
         ).run(ClaimCandidateRequest(tenant_id=TENANT_ID, evaluated_at=NOW))
 
     assert embedder.documents == ()

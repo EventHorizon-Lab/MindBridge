@@ -31,7 +31,7 @@ from mindbridge.models.defaults import (
     DEFAULT_EMBEDDING_SPACE,
     MatryoshkaDimension,
 )
-from mindbridge.telemetry import set_current_span_attributes, trace_operation
+from mindbridge.telemetry import operation_span, set_current_span_attributes
 
 
 class _EmbeddingMatrix(Protocol):
@@ -140,7 +140,7 @@ class JinaEmbedder:
         """Declare the search space this model's vectors belong to."""
         return self._space_reference
 
-    @trace_operation("mindbridge.model.embed")
+    @operation_span("mindbridge.model.embed")
     async def embed(self, request: EmbedRequest) -> EmbedResult:
         """Encode a homogeneous query or document batch."""
         encode = (

@@ -19,7 +19,7 @@ from mindbridge.application.summary_consolidation import (
     derive_summary_writes,
 )
 from mindbridge.core import MemoryIntegrityError, TenantId
-from mindbridge.telemetry import set_current_span_attributes, trace_operation
+from mindbridge.telemetry import operation_span, set_current_span_attributes
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,7 +74,7 @@ class ConsolidateSummaries:
         self._text_embedder = text_embedder
         self._media_url_signer = media_url_signer
 
-    @trace_operation("mindbridge.consolidation.summaries")
+    @operation_span("mindbridge.consolidation.summaries")
     async def run(self, request: SummaryCandidateRequest) -> SummaryConsolidationResult:
         """Discover, inspect, and atomically commit one stable Summary page."""
         page = await self._store.list_summary_candidates(request)

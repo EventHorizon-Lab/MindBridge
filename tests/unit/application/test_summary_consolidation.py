@@ -3,10 +3,10 @@
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from consolidation_doubles import DeterministicSigner, RecordingTextEmbedder
 
 from mindbridge.application.consolidate_summaries import ConsolidateSummaries
 from mindbridge.application.perception import ResolvedEvidence
-from mindbridge.application.ports import PresignedMediaDownload
 from mindbridge.application.summary_consolidation import (
     SummaryCandidate,
     SummaryCandidatePage,
@@ -18,7 +18,6 @@ from mindbridge.application.summary_consolidation import (
 )
 from mindbridge.core import (
     EmbeddedObjectType,
-    EmbeddingSpaceReference,
     EntityId,
     EvidenceId,
     EvidenceSpan,
@@ -35,7 +34,6 @@ from mindbridge.core import (
     TenantId,
     VerificationStatus,
 )
-from mindbridge.models import Embedding, EmbedRequest, EmbedResult, TextPart
 
 NOW = datetime(2026, 8, 12, 12, 0, tzinfo=timezone.utc)
 TENANT_ID = TenantId("tenant_01")
@@ -96,42 +94,6 @@ class RecordingSummaryConsolidator:
         return self._consolidation
 
 
-class RecordingTextEmbedder:
-    space_reference = EmbeddingSpaceReference(space_id="jina-v5", revision="space-v1")
-
-    def __init__(self) -> None:
-        self.documents: tuple[str, ...] = ()
-
-    async def embed(self, request: EmbedRequest) -> EmbedResult:
-        self.documents = tuple(
-            part.text
-            for input_value in request.inputs
-            for part in input_value.parts
-            if isinstance(part, TextPart)
-        )
-        return EmbedResult(
-            tuple(
-                Embedding(
-                    (1.0, 0.0),
-                    ModelReference(model_id="jina-text", revision="text-revision"),
-                    EmbeddingSpaceReference(space_id="jina-v5", revision="space-v1"),
-                )
-                for _ in request.inputs
-            )
-        )
-
-
-class DeterministicSigner:
-    async def create_presigned_download(
-        self,
-        media_object: MediaObject,
-    ) -> PresignedMediaDownload:
-        return PresignedMediaDownload(
-            download_url=f"https://objects.example.test/{media_object.media_object_id}",
-            expires_at=NOW + timedelta(minutes=5),
-        )
-
-
 async def test_summary_consolidation_builds_verified_and_attested_hierarchy() -> None:
     candidates = tuple(_candidate(index) for index in range(1, 5))
     consolidation = SummaryConsolidation(
@@ -160,7 +122,7 @@ async def test_summary_consolidation_builds_verified_and_attested_hierarchy() ->
         store,
         consolidator,
         embedder,
-        media_url_signer=DeterministicSigner(),
+        media_url_signer=DeterministicSigner(NOW),
     ).run(SummaryCandidateRequest(tenant_id=TENANT_ID, evaluated_at=NOW + timedelta(hours=1)))
 
     assert result.candidate_count == 4
@@ -209,7 +171,7 @@ async def test_summary_consolidation_rejects_unknown_sources_before_embedding() 
             store,
             RecordingSummaryConsolidator(consolidation),
             embedder,
-            media_url_signer=DeterministicSigner(),
+            media_url_signer=DeterministicSigner(NOW),
         ).run(SummaryCandidateRequest(tenant_id=TENANT_ID, evaluated_at=NOW))
 
     assert embedder.documents == ()

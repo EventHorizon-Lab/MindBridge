@@ -55,7 +55,6 @@ from mindbridge.telemetry import (
     operation_span,
     record_stage_duration,
     set_current_span_attributes,
-    trace_operation,
 )
 
 
@@ -86,7 +85,7 @@ class ProcessObservation:
         self._clip_sampling = clip_sampling or ClipSampling()
         self._clip_cutter = clip_cutter
 
-    @trace_operation("mindbridge.process_observation")
+    @operation_span("mindbridge.process_observation")
     async def run(
         self,
         tenant_id: TenantId,
@@ -192,7 +191,7 @@ class ProcessObservation:
                 evidence_clips=derived_clips.clips,
                 embeddings=derived_clips.embeddings + graph_embeddings,
             )
-            with operation_span("mindbridge.process_observation.commit"):
+            async with operation_span("mindbridge.process_observation.commit"):
                 completed = await self._store.commit_observation_processing(
                     tenant_id,
                     observation_id,

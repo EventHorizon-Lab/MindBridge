@@ -3,19 +3,9 @@
 from __future__ import annotations
 
 from importlib import import_module
-from typing import Protocol, cast
+from typing import Any, cast
 
 from mindbridge.core import ModelUnavailableError
-
-
-class _Cuda(Protocol):
-    def is_available(self) -> bool: ...
-
-    def mem_get_info(self) -> tuple[int, int]: ...
-
-
-class _Torch(Protocol):
-    cuda: _Cuda
 
 
 def select_torch_device(requested: str | None = None) -> str:
@@ -24,7 +14,7 @@ def select_torch_device(requested: str | None = None) -> str:
     if device != "auto" and device != "cpu" and not device.startswith("cuda"):
         raise ValueError("device must be auto, cpu, cuda, or cuda:<index>")
     try:
-        torch = cast(_Torch, import_module("torch"))
+        torch = cast(Any, import_module("torch"))
         cuda_available = torch.cuda.is_available()
     except ImportError:
         cuda_available = False
@@ -66,7 +56,9 @@ def has_free_cuda_memory(minimum_bytes: int) -> bool:
     if minimum_bytes <= 0:
         raise ValueError("minimum CUDA memory must be positive")
     try:
-        torch = cast(_Torch, import_module("torch"))
-        return torch.cuda.is_available() and torch.cuda.mem_get_info()[0] >= minimum_bytes
+        torch = cast(Any, import_module("torch"))
+        return bool(torch.cuda.is_available()) and bool(
+            torch.cuda.mem_get_info()[0] >= minimum_bytes
+        )
     except (ImportError, RuntimeError):
         return False

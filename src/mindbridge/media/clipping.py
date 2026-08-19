@@ -14,91 +14,12 @@ from __future__ import annotations
 
 import io
 import math
-from collections.abc import Iterator
 from dataclasses import dataclass
 from fractions import Fraction
-from typing import Protocol, cast
+from types import ModuleType
+from typing import Any, cast
 
 from mindbridge.core import DomainInvariantError, MediaKind, ModelUnavailableError
-
-
-class _AudioSamples(Protocol):
-    """The slice-and-measure surface this module needs from a sample array."""
-
-    def __len__(self) -> int: ...
-    def __getitem__(self, item: slice) -> _AudioSamples: ...
-
-
-class _SoundFileModule(Protocol):
-    def read(
-        self, file: io.BytesIO, *, dtype: str, always_2d: bool
-    ) -> tuple[_AudioSamples, int]: ...
-    def write(
-        self,
-        file: io.BytesIO,
-        data: _AudioSamples,
-        samplerate: int,
-        *,
-        format: str,
-        subtype: str,
-    ) -> None: ...
-
-
-class _VideoFrame(Protocol):
-    time: float | None
-    pts: int | None
-    time_base: object
-    width: int
-    height: int
-
-    def reformat(self, *, width: int, height: int, format: str) -> _VideoFrame: ...
-
-
-class _VideoStream(Protocol):
-    thread_type: str
-    thread_count: int
-    width: int
-    height: int
-    pix_fmt: str
-    time_base: object
-
-    def encode(self, frame: _VideoFrame | None = None) -> list[object]: ...
-
-
-class _Container(Protocol):
-    streams: _Streams
-
-    def decode(self, stream: _VideoStream) -> Iterator[_VideoFrame]: ...
-    def seek(self, offset: int, *, backward: bool = ...) -> None: ...
-    def add_stream(self, codec: str, *, rate: int) -> _VideoStream: ...
-    def mux(self, packets: list[object]) -> None: ...
-    def __enter__(self) -> _Container: ...
-    def __exit__(self, *arguments: object) -> None: ...
-
-
-class _Streams(Protocol):
-    video: list[_VideoStream]
-
-
-class _AvModule(Protocol):
-    def open(self, target: io.BytesIO, mode: str = ..., format: str = ...) -> _Container: ...
-
-
-class _Image(Protocol):
-    width: int
-    height: int
-
-    def convert(self, mode: str) -> _Image: ...
-    def crop(self, box: tuple[int, int, int, int]) -> _Image: ...
-    def resize(self, size: tuple[int, int]) -> _Image: ...
-    def save(self, file: io.BytesIO, *, format: str) -> None: ...
-    def __enter__(self) -> _Image: ...
-    def __exit__(self, *arguments: object) -> None: ...
-
-
-class _ImageModule(Protocol):
-    def open(self, file: io.BytesIO) -> _Image: ...
-
 
 DEFAULT_VIDEO_FRAMES_PER_SECOND = 1.0
 DEFAULT_VIDEO_MAX_PIXELS = 200_704
@@ -188,7 +109,7 @@ def scaled_size(width: int, height: int, max_pixels: int) -> tuple[int, int]:
 
 
 def _cut_audio(source: bytes, request: ClipRequest) -> tuple[MediaClip, ...]:
-    soundfile = cast(_SoundFileModule, _import("soundfile"))
+    soundfile = cast(Any, _import("soundfile"))
     samples, sample_rate = soundfile.read(io.BytesIO(source), dtype="float32", always_2d=True)
     clips = []
     for window_start, window_end in audio_windows(request.start_ms, request.end_ms):
@@ -214,11 +135,13 @@ def _cut_audio(source: bytes, request: ClipRequest) -> tuple[MediaClip, ...]:
 
 
 def _cut_image(source: bytes, request: ClipRequest) -> MediaClip:
-    image_module = cast(_ImageModule, _import("PIL.Image"))
+    image_module = cast(Any, _import("PIL.Image"))
     with image_module.open(io.BytesIO(source)) as image:
         converted = image.convert("RGB")
         if request.region is not None:
-            converted = converted.crop(_clamped_region(request.region, converted))
+            converted = converted.crop(
+                _clamped_region(request.region, converted.width, converted.height)
+            )
         width, height = scaled_size(converted.width, converted.height, request.image_max_pixels)
         resized = converted.resize((width, height))
         buffer = io.BytesIO()
@@ -232,8 +155,8 @@ def _cut_image(source: bytes, request: ClipRequest) -> MediaClip:
 
 
 def _cut_video(source: bytes, request: ClipRequest) -> MediaClip:
-    av = cast(_AvModule, _import("av"))
-    sampled = _sample_video_frames(av, source, request)
+    av = cast(Any, _import("av"))
+    sampled = _sample_video_frames(source, request)
     if not sampled:
         raise DomainInvariantError("video span selected no frames from its source")
     width, height = scaled_size(sampled[0].width, sampled[0].height, request.max_pixels)
@@ -270,15 +193,12 @@ def _cut_video(source: bytes, request: ClipRequest) -> MediaClip:
     )
 
 
-def _sample_video_frames(
-    av: _AvModule,
-    source: bytes,
-    request: ClipRequest,
-) -> list[_VideoFrame]:
+def _sample_video_frames(source: bytes, request: ClipRequest) -> list[Any]:
     """Keep one frame per requested interval inside the span, decoding once."""
+    av = cast(Any, _import("av"))
     interval_seconds = 1.0 / request.frames_per_second
     start_seconds, end_seconds = request.start_ms / 1_000, request.end_ms / 1_000
-    frames: list[_VideoFrame] = []
+    frames: list[Any] = []
     next_sample_seconds = start_seconds
     with av.open(io.BytesIO(source)) as container:
         stream = container.streams.video[0]
@@ -320,16 +240,12 @@ def _sample_video_frames(
 
 def _clamped_region(
     region: tuple[int, int, int, int],
-    image: _Image,
+    width: int,
+    height: int,
 ) -> tuple[int, int, int, int]:
     """Keep a region of interest inside the frame it was measured against."""
     x_min, y_min, x_max, y_max = region
-    return (
-        min(x_min, image.width - 1),
-        min(y_min, image.height - 1),
-        min(x_max, image.width),
-        min(y_max, image.height),
-    )
+    return (min(x_min, width - 1), min(y_min, height - 1), min(x_max, width), min(y_max, height))
 
 
 def _stream_rate(frames_per_second: float) -> int:
@@ -337,7 +253,10 @@ def _stream_rate(frames_per_second: float) -> int:
     return max(1, round(frames_per_second))
 
 
-def _import(module_name: str) -> object:
+# ponytail: av/soundfile/PIL sit in mypy's ignore_missing_imports list, so a Protocol per
+# module would only re-describe libraries mypy already treats as untyped. Callers cast the
+# handle at the use site because ANN401 bans `Any` in a signature.
+def _import(module_name: str) -> ModuleType:
     from importlib import import_module
 
     try:

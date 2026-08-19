@@ -1,5 +1,6 @@
 """OpenTelemetry configuration and privacy-safe trace identity checks."""
 
+import asyncio
 import os
 import subprocess
 import sys
@@ -21,8 +22,8 @@ from mindbridge.telemetry import (
     TelemetryProviders,
     current_trace_id,
     instrument_fastapi,
+    operation_span,
     record_stage_duration,
-    trace_operation,
 )
 
 
@@ -45,7 +46,7 @@ async def test_domain_operation_returns_the_active_w3c_trace_identity() -> None:
         trace_flags=TraceFlags(TraceFlags.SAMPLED),
     )
 
-    @trace_operation("mindbridge.test")
+    @operation_span("mindbridge.test")
     async def operation() -> str:
         return current_trace_id()
 
@@ -63,11 +64,11 @@ async def test_domain_operation_records_content_free_slo_metrics(
     monkeypatch.setattr(telemetry, "_OPERATION_CALLS", calls)
     monkeypatch.setattr(telemetry, "_OPERATION_DURATION", durations)
 
-    @trace_operation("mindbridge.test.metrics")
+    @operation_span("mindbridge.test.metrics")
     async def succeed() -> str:
         return "private-memory-content"
 
-    @trace_operation("mindbridge.test.metrics")
+    @operation_span("mindbridge.test.metrics")
     async def fail() -> None:
         raise RuntimeError("private-error-content")
 
@@ -82,6 +83,24 @@ async def test_domain_operation_records_content_free_slo_metrics(
     assert len(durations.measurements) == 2
     assert all(value >= 0 for value, _ in durations.measurements)
     assert "private" not in repr(calls.measurements + durations.measurements)
+
+
+async def test_one_decorated_operation_serves_repeated_and_concurrent_calls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`@operation_span` builds one context manager that every later call must reuse."""
+    calls = RecordingMetric()
+    monkeypatch.setattr(telemetry, "_OPERATION_CALLS", calls)
+
+    @operation_span("mindbridge.test.reuse")
+    async def operation(value: int) -> int:
+        await asyncio.sleep(0)
+        return value * 2
+
+    assert await operation(1) == 2
+    assert await operation(2) == 4
+    assert await asyncio.gather(*(operation(value) for value in range(4))) == [0, 2, 4, 6]
+    assert len(calls.measurements) == 6
 
 
 def test_stage_duration_records_only_a_code_defined_stage(

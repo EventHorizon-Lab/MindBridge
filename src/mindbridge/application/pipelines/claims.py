@@ -26,7 +26,7 @@ from mindbridge.application.semantic_claims import (
 )
 from mindbridge.core import ClaimId, DomainInvariantError, ModelOutputError, RelationType
 from mindbridge.prompts import CONSOLIDATE_CLAIMS_PROMPT
-from mindbridge.telemetry import set_current_span_attributes, trace_operation
+from mindbridge.telemetry import operation_span, set_current_span_attributes
 
 _Statement = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=4096)]
 _ClaimIdentifier = Annotated[
@@ -100,7 +100,7 @@ class ClaimPipeline:
         self._generator = generator
         self._max_output_tokens = max_output_tokens
 
-    @trace_operation("mindbridge.pipeline.claims")
+    @operation_span("mindbridge.pipeline.claims")
     async def propose_claims(
         self,
         candidates: tuple[ClaimCandidate, ...],

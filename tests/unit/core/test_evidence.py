@@ -26,29 +26,13 @@ MEDIA_ID = MediaObjectId("media_01")
 def test_media_object_rejects_naive_created_at() -> None:
     """Media timestamps must be timezone-aware at the domain boundary."""
     with pytest.raises(DomainInvariantError, match="created_at"):
-        MediaObject(
-            media_object_id=MEDIA_ID,
-            tenant_id=TenantId("tenant_01"),
-            kind=MediaKind.VIDEO,
-            uri="s3://memories/video.mp4",
-            sha256="a" * 64,
-            size_bytes=1,
-            created_at=datetime(2026, 8, 11, 12, 0),  # noqa: DTZ001 - invalid input
-        )
+        _media_object(created_at=datetime(2026, 8, 11, 12, 0))  # noqa: DTZ001 - invalid input
 
 
 def test_media_object_rejects_invalid_content_hash() -> None:
     """Evidence cannot be stored without a valid content digest."""
     with pytest.raises(DomainInvariantError, match="sha256"):
-        MediaObject(
-            media_object_id=MEDIA_ID,
-            tenant_id=TenantId("tenant_01"),
-            kind=MediaKind.VIDEO,
-            uri="s3://memories/video.mp4",
-            sha256="not-a-sha256",
-            size_bytes=1,
-            created_at=NOW,
-        )
+        _media_object(sha256="not-a-sha256")
 
 
 @pytest.mark.parametrize(
@@ -60,16 +44,7 @@ def test_media_object_rejects_values_outside_storage_integer_range(
     duration_ms: int | None,
 ) -> None:
     with pytest.raises(DomainInvariantError, match="signed 64-bit"):
-        MediaObject(
-            media_object_id=MEDIA_ID,
-            tenant_id=TenantId("tenant_01"),
-            kind=MediaKind.VIDEO,
-            uri="s3://memories/video.mp4",
-            sha256="a" * 64,
-            size_bytes=size_bytes,
-            created_at=NOW,
-            duration_ms=duration_ms,
-        )
+        _media_object(size_bytes=size_bytes, duration_ms=duration_ms)
 
 
 def test_observation_builds_stable_idempotency_key() -> None:
@@ -184,4 +159,23 @@ def _evidence_span(
         frame_end=frame_end,
         region=region,
         audio_track=audio_track,
+    )
+
+
+def _media_object(
+    *,
+    sha256: str = "a" * 64,
+    size_bytes: int = 1,
+    created_at: datetime = NOW,
+    duration_ms: int | None = None,
+) -> MediaObject:
+    return MediaObject(
+        media_object_id=MEDIA_ID,
+        tenant_id=TenantId("tenant_01"),
+        kind=MediaKind.VIDEO,
+        uri="s3://memories/video.mp4",
+        sha256=sha256,
+        size_bytes=size_bytes,
+        created_at=created_at,
+        duration_ms=duration_ms,
     )
