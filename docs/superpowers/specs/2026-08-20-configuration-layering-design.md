@@ -196,6 +196,24 @@ schema can validate.
 `MINDBRIDGE_GENERATOR_PLUGIN` and is excluded from the serialised object, because the
 selector is read separately from the config it selects.
 
+Two consequences of assembling the object rather than letting a builder do it, both found
+while planning and both verified against the running code rather than inferred:
+
+**An override is read in the type the file declared for its key.** `_GeneratorConfig`'s
+`request_timeout_seconds` is `StrictFloat | StrictInt` and `_MediaSamplingConfig`'s
+`generation_proxy` is `StrictBool`; a validated object rejects `"1800"` and `"false"` as
+surely as it rejects a missing key. The environment carries only strings, so a value
+overriding a file key is parsed as that key's type. `bool` is checked before `int` — it is a
+subclass of `int`, and `bool("false")` is `True`.
+
+**`[embedding]` folds into the two encoder sections.** `_embedding_space_config()` exists so
+one deployment-wide `space_id`, `space_revision`, and `dimension` reach the index and every
+encoder from one place. That function runs inside `openai_embedder_config()`, which a produced
+`*_CONFIG_JSON` skips — and `space_id` and `space_revision` are required with no default. A
+file naming `[embedder]` without repeating the space keys would therefore fail validation at
+startup. The loader folds `[embedding]` into `[embedder]` and `[media_embedder]` when
+assembling their objects, so the file states the space once, as the environment does today.
+
 The four plugin section names live in one tuple constant that the loader, the credential
 guard, and the documentation generator all read.
 
