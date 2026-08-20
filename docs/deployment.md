@@ -100,15 +100,12 @@ export MINDBRIDGE_GENERATOR_PLUGIN=openai
 export MINDBRIDGE_GENERATOR_API_KEY=...
 export MINDBRIDGE_GENERATOR_ENDPOINT=https://generator.example.com/v1
 export MINDBRIDGE_GENERATOR_MODEL_ID=qwen3.8-max
-export MINDBRIDGE_GENERATOR_MODEL_REVISION=deployment-2026-08-11
 
 export MINDBRIDGE_EMBEDDER_PLUGIN=openai
 export MINDBRIDGE_EMBEDDER_API_KEY=...
 export MINDBRIDGE_EMBEDDER_ENDPOINT=https://embeddings.example.com/v1
 export MINDBRIDGE_EMBEDDER_MODEL_ID=jinaai/jina-embeddings-v5-omni-small-retrieval
-export MINDBRIDGE_EMBEDDER_MODEL_REVISION=12949877f0092093f366c6450340011320152a05
 export MINDBRIDGE_EMBEDDING_SPACE_ID=jina-v5
-export MINDBRIDGE_EMBEDDING_SPACE_REVISION=deployment-space-v1
 export MINDBRIDGE_EMBEDDING_DIMENSION=1024
 
 export MINDBRIDGE_TENANT_API_KEYS_JSON='{"tenant_01":["at-least-32-random-characters"]}'
@@ -136,7 +133,6 @@ model itself. A self-hosted endpoint can use the upstream validated vLLM path:
 
 ```bash
 vllm serve jinaai/jina-embeddings-v5-omni-small-retrieval \
-  --revision 12949877f0092093f366c6450340011320152a05 \
   --trust-remote-code
 ```
 
@@ -150,7 +146,6 @@ worker-specific variables:
 export MINDBRIDGE_MEDIA_EMBEDDER_PLUGIN=jina
 export MINDBRIDGE_MEDIA_EMBEDDER_DEVICE=cuda
 export MINDBRIDGE_MEDIA_EMBEDDER_MODEL_ID=jinaai/jina-embeddings-v5-omni-small-retrieval
-export MINDBRIDGE_MEDIA_EMBEDDER_MODEL_REVISION=12949877f0092093f366c6450340011320152a05
 
 uv run --extra server --extra cloud-models \
   celery -A mindbridge.celery_app:app worker --loglevel=INFO
@@ -175,7 +170,6 @@ export MINDBRIDGE_GENERATOR_CONFIG_JSON='{
   "api_key": "...",
   "endpoint": "https://generator.example.com/v1",
   "model_id": "qwen3.8-max",
-  "model_revision": "deployment-2026-08-11",
   "request_timeout_seconds": 1800
 }'
 ```

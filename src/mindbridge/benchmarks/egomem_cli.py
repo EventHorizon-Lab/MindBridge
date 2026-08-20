@@ -54,9 +54,7 @@ class EgoMemRunManifest(MediaBenchmarkRunManifest):
 
     benchmark: Literal["EgoMemReason"] = "EgoMemReason"
     dataset_repository: NonEmptyString
-    dataset_revision: NonEmptyString
     evaluator_repository: NonEmptyString
-    evaluator_revision: NonEmptyString
     prepared_media_manifest_sha256: Sha256Hex
     perception_prompt_version: NonEmptyString
     query_prompt_version: NonEmptyString
@@ -72,8 +70,6 @@ class EgoMemRunManifest(MediaBenchmarkRunManifest):
 @dataclass(frozen=True, slots=True)
 class _Arguments(MediaArguments):
     prepared_media_path: Path
-    dataset_revision: str
-    evaluator_revision: str
     example_ids: tuple[int, ...]
 
 
@@ -169,9 +165,7 @@ def _write_artifacts(
         annotation_sha256=sha256_file(arguments.dataset_path),
         predictions=predictions,
         dataset_repository="Ted412/EgoMemReason",
-        dataset_revision=arguments.dataset_revision,
         evaluator_repository="Ziyang412/EgoMemReason",
-        evaluator_revision=arguments.evaluator_revision,
         prepared_media_manifest_sha256=sha256_file(arguments.prepared_media_path),
         perception_prompt_version=PERCEIVE_EVENTS_PROMPT.version,
         query_prompt_version=EGOMEM_REASON_QUERY_PROMPT.version,
@@ -216,12 +210,6 @@ def _parse_arguments(argv: Sequence[str] | None, prog: str | None) -> _Arguments
         help="manifest of clips prepared from the official streams",
     )
     parser.add_argument(
-        "--dataset-revision", required=True, help="revision of the official dataset release"
-    )
-    parser.add_argument(
-        "--evaluator-revision", required=True, help="revision of the official evaluator"
-    )
-    parser.add_argument(
         "--example-id",
         type=int,
         action="append",
@@ -233,8 +221,6 @@ def _parse_arguments(argv: Sequence[str] | None, prog: str | None) -> _Arguments
         _Arguments,
         parsed,
         prepared_media_path=parsed.prepared_media,
-        dataset_revision=parsed.dataset_revision,
-        evaluator_revision=parsed.evaluator_revision,
         example_ids=tuple(parsed.example_id),
     )
 

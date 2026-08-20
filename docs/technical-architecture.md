@@ -46,7 +46,7 @@ MindBridge 不是机器人、Agent 或大模型。MindBridge 是**记忆本身**
 5. **生态优先**：优先使用官方 SDK、Hugging Face、目标平台厂商原生栈、OpenAI-compatible、PostgreSQL 等成熟生态，不重复实现通用能力。
 6. **轻量起步**：首版采用模块化单体、异步 Worker 和一套主数据库；只有实际指标证明不足时才拆分。
 7. **原子能力插件**：模型层只保留 `Generator`、`Embedder` 两个插口；供应商只实现 Adapter，Answer、Perception 等任务语义留在 MindBridge。插口的数量由真实实现决定，不为规划中的能力预留空协议。
-8. **当前阶段效果优先**：当前研究与效果验证不以 License 作为候选过滤条件，代码和模型只要有助于能力即可复用；仍记录来源、精确 revision 和工件 hash，商业发布前再单独完成合规审查。
+8. **当前阶段效果优先**：当前研究与效果验证不以 License 作为候选过滤条件，代码和模型只要有助于能力即可复用；仍记录来源和工件 hash，商业发布前再单独完成合规审查。
 9. **Code is the Product**：代码本身就是产品，不是产品的副产物。每写一行都必须当场回答三个问题——
    这一行是否必要？是否简洁优雅？是否易读易维护？答不上来就不写。MindBridge **不以代码行数衡量
    进展**，只衡量每一行的效率：删除与新增同样是交付，一个平台适配层如果没有删掉更多分支就不该
@@ -433,7 +433,7 @@ entry point `mindbridge.generators`、`mindbridge.embedders` 发现；进程只�
 
 这些是进入目标端侧平台 bake-off 的首选候选，不是未经实测的 FPS 承诺。完整指标、运行时、
 分档和晋级门禁见[端侧人物一致性感知模型选型](edge-identity-sota.md)。具体模型 ID、服务地址和版本
-属于部署配置；数据中必须记录精确 `model_id` 和 `revision`。
+属于部署配置；数据中必须记录产出它的 `model_id`。
 
 ### 6.2 Jina v5 Omni 的职责
 
@@ -453,22 +453,22 @@ entry point `mindbridge.generators`、`mindbridge.embedders` 发现；进程只�
 - Nano 的 768 维向量只进入独立端侧近期索引，不和云端 Small 向量混查；
 - 对查询提交 `EmbedRequest(task=EmbedTask.QUERY)`，对记忆对象提交
   `EmbedRequest(task=EmbedTask.DOCUMENT)`；
-- 每条向量分别保存真实编码器的 `model_id/revision` 与可混查的
-  `space_id/space_revision`，同时保存 `task`、`dimension`、`normalized` 和 `created_at`；
+- 每条向量分别保存真实编码器的 `model_id` 与可混查的 `space_id`，同时保存 `task`、
+  `dimension`、`normalized` 和 `created_at`；
 - 切换模型时创建新向量版本并后台重建，不原地混用不同空间。
 
-生产实现只使用一个编码器 `jina-embeddings-v5-omni-small-retrieval`，固定 revision
-`12949877f0092093f366c6450340011320152a05`；query 与 document 的差别完全由 retrieval prompt
+生产实现只使用一个编码器 `jina-embeddings-v5-omni-small-retrieval`；query 与 document
+的差别完全由 retrieval prompt
 承担，不由模型承担。编码器仍然分布在不同进程中：Memory Worker 通过 Hugging Face
 `sentence-transformers` 的 `encode_document()` 生成 EvidenceSpan 向量，并通过 vLLM
 OpenAI-compatible endpoint 批量生成 Event/Claim/Summary document 向量；API 通过同一个 endpoint
 生成 query 向量并编码显式记忆。文本请求使用 OpenAI SDK 的 `embeddings.create()`；SDK 尚未声明
 类型的多模态 `messages` 也只通过同一 SDK 的低层 `post()` 发送，不另写 HTTP 客户端。数据库按
-`space_id/space_revision` 检索、按 `model_id/revision` 保留真实生产者；升级编码器创建新空间并
+`space_id` 检索、按 `model_id` 保留真实生产者；升级编码器创建新空间并
 重建，不把未经验证的版本混查。API 因此不加载 Jina 权重，模型只存在于 Worker 或独立 serving
 进程。
 
-同一对象、编码器 revision、空间和 task 的向量写入保持幂等。考虑 GPU/F16 serving 对同一文本可能
+同一对象、编码器、空间和 task 的向量写入保持幂等。考虑 GPU/F16 serving 对同一文本可能
 产生末位浮点抖动，重放向量的余弦相似度不低于 `0.999999` 时视为同一内容；低于阈值仍作为
 “同版本不同向量”拒绝，不能用容差掩盖模型或输入变化。
 
@@ -552,8 +552,8 @@ diarization probability，因此当前 confidence 是必须由真实麦克风集
 上线的实现。
 
 ASR 或 diarization 无法无歧义归属的区间不会被丢弃，而是以 observation scope 保留 transcript；
-ASD 关联使用配置的模型 deployment revision 作为稳定证据键，不使用可能随请求变化的 provider
-fingerprint。后续片段没有新增 ASD 命中时，仍会用同一 revision 复核历史累计证据。
+ASD 关联使用部署配置固定的模型作为稳定证据键，不使用可能随请求变化的 provider
+fingerprint。后续片段没有新增 ASD 命中时，仍会用同一模型复核历史累计证据。
 
 FunASR causal Paraformer 已接入持续 PCM chunk，并复用上游 cache；speaker label、标点和长期
 voiceprint 仍只在 Event/window 关闭后由统一质量路径确认，因为当前 upstream realtime diarization
@@ -565,7 +565,7 @@ CPU 降级也保持串行，避免模型线程争抢。该门槛是 5090 软件�
 
 MindBridge 只维护一个设备本地身份记忆边界：
 
-1. 每个模板绑定 `tenant_id`、`device_id`、模态、来源 Observation、模型 ID/revision 和维度；本地
+1. 每个模板绑定 `tenant_id`、`device_id`、模态、来源 Observation、模型 ID 和维度；本地
    sample key 由 Observation 与片段内 sample ID 共同派生，避免每个视频从 `0ms` 计时造成跨片段冲突；
 2. embedding 归一化后使用 cosine similarity 与可校准阈值匹配，不跨模型空间比较；
 3. 每个匿名身份默认最多保留 32 个样本，持续观察只更新有界 prototype 样本集；
@@ -735,7 +735,7 @@ MindBridge 的学习对象是记忆状态：
 
 因此这一项的产出是**统计**而非**自动更新**。若将来确实要持久化参数，安全形状是：key 只含
 (tenant, mode, modality, filters-present)、绝不含查询内容；value 带硬上限；只由离线计划任务更新；
-recall 侧读一份冻结、带 revision 戳、并记进 benchmark manifest 的参数集。
+recall 侧读一份冻结、并记进 benchmark manifest 的参数集。
 
 ### 8.2 Consolidation
 
@@ -765,7 +765,7 @@ Episode 内按发生时间排序且互不重叠的相邻 Event 还会写成对�
 PostgreSQL 事务按稳定顺序锁定全部子 Event，只有仍为 active、基础层且未被占用的完整分组才能
 提交；Episode、来源链接、MemoryRecord、关系、向量和子节点父指针要么全部成功，要么全部回滚。
 并发 Consolidator、重试和显式遗忘发生竞争时，已经提交或删除的一方优先，过期提案不会覆盖新
-状态。稳定 ID 包含子 Event、模型 revision、Prompt version 和固定 `evaluated_at`，同一次扫描可
+状态。稳定 ID 包含子 Event、模型 ID、Prompt version 和固定 `evaluated_at`，同一次扫描可
 安全重放。计划频率交给既有 CronJob、systemd 或 Celery beat，不在框架内再造调度器。
 
 Claim 路径只枚举当前、未被吸收的 verified Claim，以共享 Entity 或同一 Jina v5 空间中的 Claim
@@ -797,12 +797,12 @@ Session。
 Memory 分组、`session/day/person/place/topic` scope、摘要和 salience。只有全部来源均为 verified
 且联合 EvidenceSpan 非空时，新 Summary 才是 verified；只要含 attested 来源就生成 unverified
 导航摘要，绝不把调用者陈述升级为传感器事实。Omni Small 为每个新 Summary 生成对齐的 1024 维
-Memory document 向量；稳定 ID 包含来源 Memory、scope、Omni revision、Prompt version 和固定
+Memory document 向量；稳定 ID 包含来源 Memory、scope、Omni 模型 ID、Prompt version 和固定
 `evaluated_at`。
 
 提交事务按 Memory ID 排序锁定全部来源，再次检查当前版本、删除屏障和既有父节点，一次写入
 Summary Memory、联合 Evidence、`contains` 边和向量。数据库唯一索引从根本上保证一个 Memory
-只有一个 Summary 父节点；不同模型 revision 的并发提案也只能有一个成功。删除 Summary 本身保留
+只有一个 Summary 父节点；不同模型的并发提案也只能有一个成功。删除 Summary 本身保留
 其子 Memory；删除任一子 Memory 或其 Observation 时，则递归删除依赖它的 Summary 祖先，避免
 遗忘后残留派生内容。三个阶段共享同一固定快照，因此本轮 Episode/Claim 新写入只会在下一轮进入
 Summary，计划任务不会读到自己的写入。
@@ -1066,14 +1066,14 @@ client = AsyncOpenAI(api_key=api_key, base_url=base_url)
 字段中；应用管线看不到 SDK 类型。非兼容供应商使用其官方 SDK 实现同一个能力协议，不得复制
 Answer、Perception 或 Recall 流程。
 
-`GenerateResult.model_reference` 始终是部署配置固定的 `model_id/revision`。供应商返回的
+`GenerateResult.model_reference` 始终是部署配置固定的 `model_id`。供应商返回的
 `system_fingerprint` 只作为 span 属性上报，不进入模型身份：Episode、Claim 与 Summary 的稳定 ID
 由该 `model_reference` 派生，会随请求变化的 fingerprint 会让同一次 sweep 的重试写出重复聚合，
 这与 §6.6 对端侧 ASD 证据键的要求是同一条规则。
 
 OpenAI Adapter 默认省略 `reasoning_effort`，确保非推理模型和不同 OpenAI-compatible 服务不会收到
 不支持的字段；需要时通过 Generator 插件配置显式提供。Benchmark 将这个已解析配置写入部署快照，
-不再平铺供应商专用 CLI 参数。模型 revision 变化时重跑对应 bake-off，不把某一供应商参数加入
+不再平铺供应商专用 CLI 参数。模型变化时重跑对应 bake-off，不把某一供应商参数加入
 `Generator` 协议。
 
 任务管线先保留供应商原生生成并立即做 Pydantic 与候选引用校验；只有首次输出不是合法结果时，
@@ -1240,7 +1240,7 @@ Schema 变更必须向后兼容或带显式迁移；不得在 Worker 和 API 不
 - 优先复用上游经过公开任务验证的 Prompt 约束，但必须删除与本系统证据、隐私或输出 Schema 冲突的
   部分；来源和取舍写入架构文档，不能逐 Benchmark 复制提示词；
 - 优先使用结构化输出，并在模型边界立即做 schema 校验；不靠脆弱正则从自然语言中猜 JSON；
-- 模型 ID、revision、task、采样参数和 Prompt 版本全部进入 trace/run manifest；
+- 模型 ID、task、采样参数和 Prompt 版本全部进入 trace/run manifest；
 - 模型供应商特例只存在于 Adapter，核心逻辑只消费领域结果；
 - fallback 必须显式、可观测且有次数上限，禁止悄悄切换模型导致 Benchmark 不可复现。
 
@@ -1356,10 +1356,10 @@ ASR/VAD 多端运行时候选，但当前没有证据证明它完整覆盖 punct
 
 Worker 通过 `mindbridge.celery_app:app` 启动，Redis 消息只传
 `tenant_id`、`observation_id`、`job_id`。原始媒体、Evidence 和任务状态均以 PostgreSQL/S3
-为事实来源。每个 prefork child 只加载一个固定 revision 的 Jina v5 Omni；默认并发为 1，
+为事实来源。每个 prefork child 只加载一个 Jina v5 Omni；默认并发为 1，
 多 GPU 通过每张卡一个 Worker 进程扩展，避免一个模型被 CPU 核数意外复制。API 默认不加载
 Jina 权重；API 与 Worker 在 composition root 按插口直接选择插件，应用层只消费三个能力协议。
-Generator、两个 Embedder revision 和共享空间 revision 必须由部署配置固定并写入派生记录；凭证
+Generator、两个 Embedder 和共享空间必须由部署配置固定并写入派生记录；凭证
 只从进程环境或基础设施 secret 注入。
 
 ### 12.2 推荐代码边界
@@ -1432,7 +1432,7 @@ MindBridge 的目标是**在各类权威 Benchmark 上取得工业级 SOTA 的�
 
 **Benchmark 服务于 Harness，Harness 不被 Benchmark 绑架。** 分数是能力的度量，不是优化对象；任何
 只在榜单上成立、无法让真实机器人用户受益的改动都不进产品路径。这与“不得过度宣称”是两件事：优化
-时不必控制变量，但**声明 SOTA 时**仍必须使用官方完整 split、官方 evaluator、固定 revision 和可
+时不必控制变量，但**声明 SOTA 时**仍必须使用官方完整 split、官方 evaluator 和可
 重放的 run manifest，并如实说明输入条件与公开榜单的差异。
 
 ### 14.1 Benchmark 能力映射
@@ -1453,7 +1453,7 @@ MindBridge 的目标是**在各类权威 Benchmark 上取得工业级 SOTA 的�
 
 每个 Benchmark 只实现薄数据适配器：
 
-1. 官方数据通过 Hugging Face 官方 CLI/Hub 库或官方 Git 仓库按 revision 获取；
+1. 官方数据通过 Hugging Face 官方 CLI/Hub 库或官方 Git 仓库获取；
 2. 视频、音频、图像和对话统一通过生产 `observe`/`remember` 接口写入；
 3. 问题统一通过生产 `recall` 接口执行；
 4. 结果转换为官方评测格式；
@@ -1461,17 +1461,11 @@ MindBridge 的目标是**在各类权威 Benchmark 上取得工业级 SOTA 的�
    选用当时最强的**通用**模型是允许的，前提是同一配置可以直接部署为产品；
 6. 模型、Prompt、索引参数和代码 commit 固定进 run manifest。
 
-可执行适配基线固定 LoCoMo-Refined revision `887091190789e8d6760e70b9edd696539923dc4f`、M3-Agent
-revision `0e3e41939bd8a0b66d756e7b7eb8d5fe9992da5c`、Video-MME 数据 revision
-`ead1408f75b618502df9a1d8e0950166bf0a2a0b`、EgoLife 数据 revision
-`143fb319be7aa5ae210c936bf4f0f3a86092afb0`、EgoTempo revision
-`7022ba77b4d89f51cf34e499767995ccd5c90c7a`、SuperMemory-VQA 数据 revision
-`1d228e0f10049a8a84c458dded2aa25b1e21ce8f`、EgoMemReason revision
-`7e581505b9dce0e85193a27ae689ff899d0bc507`、MEMLENS revision
-`afa101a1907cc37db40b50d649547964387b96b7` 和 MM-Lifelong revision
-`248aa82039a574e63a2e524746a7cd8f32330443`。适配器只转换推理所需字段；EgoLife 的
+可执行适配基线覆盖 LoCoMo-Refined、M3-Agent、Video-MME、EgoLife、EgoTempo、SuperMemory-VQA、
+EgoMemReason、MEMLENS 和 MM-Lifelong 的官方发布。适配器只转换推理所需字段；EgoLife 的
 `target_time`、`keywords`、`reason` 与 SuperMemory 的 `answer_evidence` 不进入运行契约。
-媒体通过 Hugging Face Hub 官方客户端按 revision 获取，仓库不保存数据副本或自研下载器。
+媒体通过 Hugging Face Hub 官方客户端获取，仓库不保存数据副本或自研下载器。数据身份由
+`dataset-adapters-smoke.json` 里的源文件 SHA-256 承担。
 `dataset-adapters-smoke.json` 记录源文件 SHA-256、适配器版本和完整样本计数；当前门禁还覆盖
 Video-MME 2,700 题、EgoTempo 500 题，并保留其他已接入评测的完整样本计数。
 
@@ -1510,8 +1504,8 @@ M3-Bench 的生产 runner 沿用官方 30 秒、零起点连续切片约定。�
 官方 `before_clip=N` 按包含边界解释；执行顺序固定为“写入第 N 个片段 → 轮询持久化 Job 至
 `succeeded` → 回答该边界的问题”，未来片段不会提前进入该租户记忆。没有 `before_clip` 的问题
 在整段视频完成后回答。输出采用官方 JSONL 字段，并附带记忆、证据和 trace 诊断；sidecar run
-manifest 同时固定标注与媒体 revision/hash、代码、感知模型与 Prompt、回答模型与 Prompt、Jina
-revision、召回参数和最终输出 hash。基准路径不使用固定 sleep、标签提示或 Benchmark 专用存储。
+manifest 同时固定标注与媒体 hash、感知模型与 Prompt、回答模型与 Prompt、Jina、召回参数和
+最终输出 hash。基准路径不使用固定 sleep、标签提示或 Benchmark 专用存储。
 原始媒体和发布 caption 同时存在时，runner 把 `[Event]` 行合为一条 episodic memory、把
 `[Inference]` 行合为一条 semantic memory，两者均引用 `observe` 回执中的 source EvidenceSpan；
 这保留 M3 的信息通道而不制造逐行写入风暴。
@@ -1538,7 +1532,7 @@ Video-MME 与 EgoTempo 共用通用 `PreparedVideo`/`PreparedVideoSegment` 媒�
 官方 Prompt 和输出协议分别保留。Video-MME 从官方 Parquet 读取 900 个视频、输出官方嵌套
 `response` 结构；EgoTempo 按 `clip_id` 解析 Ego4D 源区间、每个 clip 只摄入一次，并输出官方
 `V/Q/QA/A/C/M` judge 输入。两者都只依赖 `AsyncMindBridge` 公共契约，新增模型提供商无需改动
-Benchmark；EgoTempo 的 Gemini judge 保持在固定 revision 的官方 notebook 中，不复制进产品代码。
+Benchmark；EgoTempo 的 Gemini judge 保持在官方 notebook 中，不复制进产品代码。
 
 EgoMemReason runner 按官方 `DAYn, HH:MM:SS` 查询时刻截断记忆，只写入该时刻之前的片段，输出
 leaderboard 预测与检索诊断。MEMLENS runner 以 question 为隔离单元重放整段带日期的多模态对话，
@@ -1645,7 +1639,7 @@ HTTPX 传播到模型/API，
 
 `observe`、`process_observation`、perception、embedding、recall candidate、evidence resolve、
 answer、forget 和 lifecycle 使用命名领域 span。span 只包含 tenant/device/object ID、数量、
-状态、模型/revision、Prompt version 和性能数据；不采集 Authorization、请求/响应 body、查询
+状态、模型 ID、Prompt version 和性能数据；不采集 Authorization、请求/响应 body、查询
 正文、完整 Prompt、生物 embedding 或原始媒体。API/MCP 返回的 `trace_id` 使用当前 W3C trace
 ID；无 SDK 的嵌入式调用才生成独立 fallback ID。
 
@@ -1739,7 +1733,7 @@ Entity/Bridge/Scene/Horizon cue 明确推迟到完整数据证明增益之后，
 1. FPS/RTF、内存/显存、功耗、温度、丢帧与断网缓存增长必须在**每一个**目标端侧平台的真实 SKU 和
    真实传感器上分别记录，一台设备的数字不能代表整个档位或其他厂商平台；
 2. Jina Nano 是否常驻、事件门控阈值和媒体保留期必须由同一真实机器人回放集校准；
-3. SOTA 只接受官方完整 split、固定代码/模型 revision、公开 run manifest 和可重放输出；
+3. SOTA 只接受官方完整 split、公开 run manifest 和可重放输出；
 4. 每租户配额、审计保留期、备份擦除窗口和 P95 SLO 必须先获得负载模型与运营约束，再进入配置和门禁。
 5. 人物一致性必须报告 false-link、跨日 IDF1、撤销延迟以及完整管线的 FPS/RTF、功耗、温度和
    主任务资源余量；论文单模型指标不能替代目标端侧平台的实测证据。

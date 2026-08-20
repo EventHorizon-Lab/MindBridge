@@ -281,7 +281,6 @@ def _summary_memory(
                     "summary-memory",
                     tenant_id,
                     model_reference.model_id,
-                    model_reference.revision,
                     prompt_version,
                     proposal.scope.value,
                     created_at.isoformat(),
@@ -333,7 +332,6 @@ def _summary_write(
                     EmbeddedObjectType.MEMORY_RECORD.value,
                     memory.memory_id,
                     embedding.model_reference.model_id,
-                    embedding.model_reference.revision,
                     EmbedTask.DOCUMENT.value,
                 )
             ),

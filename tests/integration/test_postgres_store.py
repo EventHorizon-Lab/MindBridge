@@ -117,8 +117,8 @@ class DiscardingObservationJobPublisher:
 class FixedEmbedder:
     """Keeps persistence integration independent from the embedding service."""
 
-    model_reference = ModelReference(model_id="jina-omni", revision="pinned-revision")
-    space_reference = EmbeddingSpaceReference(space_id="jina-v5", revision="space-v1")
+    model_reference = ModelReference(model_id="jina-omni")
+    space_reference = EmbeddingSpaceReference(space_id="jina-v5")
 
     async def embed(self, request: EmbedRequest) -> EmbedResult:
         vector = (1.0,) + (0.0,) * 1_023
@@ -227,6 +227,7 @@ async def test_migration_installs_complete_phase_zero_schema(database_url: str) 
         18,
         19,
         20,
+        21,
     ]
 
 
@@ -260,6 +261,66 @@ async def test_access_time_migration_repairs_legacy_clock_rollback(database_url:
 
     assert repaired is not None
     assert repaired[1] == repaired[0]
+
+
+async def test_dropping_model_revisions_dedupes_vectors_and_rewrites_stored_identities(
+    database_url: str,
+) -> None:
+    """The suite's own replay starts empty, so these two branches would never run.
+
+    Both only do work on rows written before migration 0021: two vectors that differed only by
+    revision now collide on the narrowed unique key, and a stored identity span carrying
+    `model_revision` would fail the reader's own contract, which forbids unknown fields.
+    """
+    migration = Path(__file__).parents[2] / "migrations/0021_drop_model_revisions.sql"
+    connection = await AsyncConnection.connect(database_url, autocommit=True)
+    async with connection:
+        await connection.execute("DROP SCHEMA IF EXISTS migration_0021_legacy CASCADE")
+        await connection.execute("CREATE SCHEMA migration_0021_legacy")
+        await connection.execute("SET search_path TO migration_0021_legacy")
+        await connection.execute(
+            """
+            CREATE TABLE events (model_id text, model_revision text);
+            CREATE TABLE claims (model_id text, model_revision text);
+            CREATE TABLE memory_records (model_id text, model_revision text);
+            CREATE TABLE embeddings (
+                tenant_id text NOT NULL,
+                embedding_id text NOT NULL,
+                object_type text NOT NULL,
+                object_id text NOT NULL,
+                model_id text NOT NULL,
+                model_revision text NOT NULL,
+                space_id text NOT NULL,
+                space_revision text NOT NULL,
+                task text NOT NULL,
+                created_at timestamptz NOT NULL,
+                UNIQUE (tenant_id, object_type, object_id, model_id, model_revision, task)
+            );
+            CREATE INDEX embeddings_space_search_idx
+                ON embeddings (tenant_id, space_id, space_revision, task, object_type);
+            CREATE INDEX embeddings_object_lookup_idx
+                ON embeddings (tenant_id, object_type, object_id, space_id, space_revision, task);
+            CREATE TABLE observations (identity_observations jsonb NOT NULL);
+            CREATE TABLE schema_migrations (version integer PRIMARY KEY);
+            INSERT INTO embeddings VALUES
+                ('t', 'first', 'event', 'e', 'm', 'r1', 's', 'r1', 'document', now()),
+                ('t', 'second', 'event', 'e', 'm', 'r2', 's', 'r2', 'document', now() + '1s');
+            INSERT INTO observations VALUES ('[{"model_id": "m", "model_revision": "r1"}]'::jsonb);
+            """,
+            prepare=False,
+        )
+        await connection.execute(migration.read_text(encoding="utf-8"), prepare=False)
+        surviving = await (
+            await connection.execute("SELECT embedding_id FROM embeddings")
+        ).fetchall()
+        identities = await (
+            await connection.execute("SELECT identity_observations FROM observations")
+        ).fetchone()
+        await connection.execute("RESET search_path")
+        await connection.execute("DROP SCHEMA migration_0021_legacy CASCADE")
+
+    assert [cast(tuple[str], row)[0] for row in surviving] == ["first"]
+    assert cast(tuple[list[dict[str, str]]], identities)[0] == [{"model_id": "m"}]
 
 
 async def test_postgres_vertical_path_is_idempotent_and_evidence_first(
@@ -302,7 +363,9 @@ async def test_postgres_vertical_path_is_idempotent_and_evidence_first(
     assert stored_batch.media_objects[0].media_object_id == "media_01"
     assert stored_batch.evidence_spans[0].end_ms == 4_000
     assert stored_batch.observation.identity_observations[0].identity_id == "person_device_01"
-    assert stored_batch.observation.identity_observations[0].model_reference.revision == "1.0.1"
+    assert stored_batch.observation.identity_observations[0].model_reference.model_id == (
+        "insightface/buffalo_l"
+    )
     assert await _processing_job_count(database_url, "tenant_roundtrip") == 1
     assert memory.verification_status is VerificationStatus.ATTESTED
     assert result.answer == "The robot put the red screwdriver beside the blue toolbox."
@@ -689,7 +752,6 @@ def _observe_request(
                 end_ms=3_500,
                 confidence=0.91,
                 model_id="insightface/buffalo_l",
-                model_revision="1.0.1",
             ),
         ),
         idempotency_key=idempotency_key,

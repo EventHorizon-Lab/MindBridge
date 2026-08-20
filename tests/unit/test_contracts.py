@@ -165,7 +165,6 @@ def test_observe_accepts_only_bounded_anonymous_identity_metadata() -> None:
         end_ms=1,
         confidence=0.9,
         model_id="insightface/buffalo_l",
-        model_revision="1.0.1",
     )
 
     with pytest.raises(ValidationError, match="exceeds source duration"):
@@ -208,7 +207,6 @@ def test_request_collections_reject_unbounded_fanout() -> None:
         end_ms=0,
         confidence=0.9,
         model_id="insightface/buffalo_l",
-        model_revision="1.0.1",
     )
 
     with pytest.raises(ValidationError, match="at most 8 items"):

@@ -106,7 +106,6 @@ async def write_claims(
             claim.valid_from,
             claim.valid_to,
             claim.model_reference.model_id,
-            claim.model_reference.revision,
             claim.prompt_version,
             claim.created_at,
         )
@@ -115,8 +114,8 @@ async def write_claims(
             INSERT INTO claims (
                 tenant_id, claim_id, supersedes_claim_id, claim_type, statement,
                 confidence, verification_status, valid_from, valid_to,
-                model_id, model_revision, prompt_version, created_at
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                model_id, prompt_version, created_at
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT DO NOTHING
             RETURNING claim_id
             """,
@@ -129,7 +128,7 @@ async def write_claims(
                     """
                     SELECT tenant_id, claim_id, supersedes_claim_id, claim_type, statement,
                            confidence, verification_status, valid_from, valid_to,
-                           model_id, model_revision, prompt_version, created_at
+                           model_id, prompt_version, created_at
                     FROM claims WHERE tenant_id = %s AND claim_id = %s
                     """,
                     (claim.tenant_id, claim.claim_id),

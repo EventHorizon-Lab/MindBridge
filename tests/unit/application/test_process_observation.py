@@ -175,10 +175,7 @@ class RecordingPerceiver:
                     ),
                 ),
             ),
-            model_reference=ModelReference(
-                model_id="qwen3.8-max",
-                revision="serving-revision-01",
-            ),
+            model_reference=ModelReference(model_id="qwen3.8-max"),
             prompt_version="perceive_events_v1",
         )
 
@@ -186,7 +183,7 @@ class RecordingPerceiver:
 class RecordingEmbedder:
     """Proves raw signed media, not a caption, reaches Jina document encoding."""
 
-    space_reference = EmbeddingSpaceReference(space_id="jina-v5", revision="space-v1")
+    space_reference = EmbeddingSpaceReference(space_id="jina-v5")
 
     def __init__(self) -> None:
         self.documents: tuple[str, ...] = ()
@@ -202,8 +199,8 @@ class RecordingEmbedder:
             tuple(
                 Embedding(
                     (1.0, 0.0),
-                    ModelReference(model_id="jina-omni", revision="revision-01"),
-                    EmbeddingSpaceReference(space_id="jina-v5", revision="space-v1"),
+                    ModelReference(model_id="jina-omni"),
+                    EmbeddingSpaceReference(space_id="jina-v5"),
                 )
                 for _ in request.inputs
             )
@@ -542,7 +539,7 @@ def test_event_perception_rejects_an_unbounded_detail_fanout() -> None:
     with pytest.raises(DomainInvariantError, match="entity count"):
         EventPerception(
             events=(event,) * 5,
-            model_reference=ModelReference(model_id="omni", revision="revision-01"),
+            model_reference=ModelReference(model_id="omni"),
             prompt_version="perceive_events_v3",
         )
 
@@ -579,7 +576,7 @@ def test_processing_rejects_embedders_in_different_search_spaces() -> None:
     """Media and text vectors are compared directly, so one drifted space must fail loudly."""
 
     class DriftedTextEmbedder(RecordingTextEmbedder):
-        space_reference = EmbeddingSpaceReference(space_id="jina-v5", revision="space-v2")
+        space_reference = EmbeddingSpaceReference(space_id="jina-v5-text-matching")
 
     with pytest.raises(ValueError, match="one search space"):
         _processor(
@@ -630,10 +627,7 @@ def _batch() -> ObservationBatch:
                 start_ms=250,
                 end_ms=2_000,
                 confidence=0.97,
-                model_reference=ModelReference(
-                    model_id="insightface/buffalo_l",
-                    revision="1.0.1",
-                ),
+                model_reference=ModelReference(model_id="insightface/buffalo_l"),
             ),
             AnonymousIdentityObservation(
                 identity_id="person_robot_01",
@@ -641,10 +635,7 @@ def _batch() -> ObservationBatch:
                 start_ms=1_500,
                 end_ms=2_500,
                 confidence=0.82,
-                model_reference=ModelReference(
-                    model_id="insightface/buffalo_l",
-                    revision="1.0.1",
-                ),
+                model_reference=ModelReference(model_id="insightface/buffalo_l"),
             ),
         ),
     )

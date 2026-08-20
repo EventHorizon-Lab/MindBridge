@@ -54,7 +54,6 @@ class LoCoMoRefinedRunManifest(BenchmarkRunManifest):
 
     benchmark: Literal["LoCoMo-Refined"] = "LoCoMo-Refined"
     source_repository: NonEmptyString
-    source_revision: NonEmptyString
     source_sha256: Sha256Hex
     prediction_key: NonEmptyString
     sample_ids: tuple[Identifier, ...] = Field(min_length=1)
@@ -75,7 +74,6 @@ class LoCoMoRefinedRunManifest(BenchmarkRunManifest):
 
 @dataclass(frozen=True, slots=True)
 class _Arguments(CoreArguments):
-    source_revision: str
     sample_ids: tuple[str, ...]
 
 
@@ -140,7 +138,6 @@ def _write_artifacts(
         adapter_version=LOCOMO_REFINED_ADAPTER_VERSION,
         predictions=rows,
         source_repository="mem-eval-suite/LoCoMo_refined",
-        source_revision=arguments.source_revision,
         source_sha256=sha256_file(arguments.dataset_path),
         prediction_key=LOCOMO_REFINED_PREDICTION_KEY,
         sample_ids=tuple(conversation.sample_id for conversation in conversations),
@@ -157,9 +154,6 @@ def _write_artifacts(
 def _parse_arguments(argv: Sequence[str] | None, prog: str | None) -> _Arguments:
     parser = core_parser(tenant_prefix="benchmark_locomo_refined", prog=prog, description=__doc__)
     parser.add_argument(
-        "--source-revision", required=True, help="revision of the official LoCoMo-Refined release"
-    )
-    parser.add_argument(
         "--sample-id",
         action="append",
         default=[],
@@ -169,7 +163,6 @@ def _parse_arguments(argv: Sequence[str] | None, prog: str | None) -> _Arguments
     return core_arguments(
         _Arguments,
         parsed,
-        source_revision=parsed.source_revision,
         sample_ids=tuple(parsed.sample_id),
     )
 

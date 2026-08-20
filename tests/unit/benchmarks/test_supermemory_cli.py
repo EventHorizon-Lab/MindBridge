@@ -52,9 +52,7 @@ def test_supermemory_artifacts_pin_inputs_models_metrics_and_output(tmp_path: Pa
     )
     assert predictions["metrics"]["qa_accuracy"] == 1.0
     assert predictions["results"][0]["predicted_option_index"] == 1
-    assert manifest.dataset_revision == "dataset-revision"
-    assert manifest.source_revision == "source-revision"
-    assert manifest.deployment.server_generator.config["model_revision"] == ("answer-fingerprint")
+    assert manifest.deployment.server_generator.config["model_id"] == "qwen3.8-max"
     assert manifest.request_timeout_seconds == 1_800.0
     assert manifest.run_id == "run_01"
     assert manifest.metrics.answerability_f1 == 1.0
@@ -77,9 +75,6 @@ def _arguments(dataset_path: Path, prepared_path: Path, output_path: Path) -> _A
         output_path=output_path,
         api_base_url="https://memory.example.test",
         subject=1,
-        dataset_revision="dataset-revision",
-        source_revision="source-revision",
-        code_revision="mindbridge-commit",
         deployment_config_path=deployment_path,
         run_id="run_01",
         tenant_prefix="benchmark_supermemory",
@@ -103,7 +98,7 @@ def _write_deployment(path: Path) -> None:
                     "plugin": "openai",
                     "distribution": "mindbridge",
                     "version": "0.1.0",
-                    "config": {"model_revision": "answer-fingerprint"},
+                    "config": {"model_id": "qwen3.8-max"},
                 },
                 "server_embedder": {
                     "plugin": "openai",
@@ -115,7 +110,7 @@ def _write_deployment(path: Path) -> None:
                     "plugin": "openai",
                     "distribution": "mindbridge",
                     "version": "0.1.0",
-                    "config": {"model_revision": "perception-fingerprint"},
+                    "config": {"model_id": "qwen3.8-omni"},
                 },
                 "worker_media_embedder": {
                     "plugin": "jina",

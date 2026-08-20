@@ -163,9 +163,7 @@ def _pipeline(
         http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
         max_retries=0,
     )
-    return _Harness(
-        OpenAIGenerator(client, ModelReference(model_id="qwen3.8-max", revision="rev-1"))
-    )
+    return _Harness(OpenAIGenerator(client, ModelReference(model_id="qwen3.8-max")))
 
 
 def _resolved(evidence_id: str, media_id: str, start_ms: int) -> ResolvedEvidence:

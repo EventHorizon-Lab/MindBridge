@@ -21,15 +21,9 @@ from mindbridge.core import (
 from mindbridge.edge.identity import LocalIdentitySample, SQLiteIdentityMemory
 from mindbridge.models.compute import select_onnx_providers
 
-INSIGHTFACE_MODEL = ModelReference(model_id="insightface/buffalo_l", revision="1.0.1")
-CAMPPLUS_MODEL = ModelReference(
-    model_id="iic/speech_campplus_sv_zh-cn_16k-common",
-    revision="v2.0.2",
-)
-OBSERVATION_SCOPED_VOICE_MODEL = ModelReference(
-    model_id="mindbridge/observation-scoped-voice",
-    revision="1",
-)
+INSIGHTFACE_MODEL = ModelReference(model_id="insightface/buffalo_l")
+CAMPPLUS_MODEL = ModelReference(model_id="iic/speech_campplus_sv_zh-cn_16k-common")
+OBSERVATION_SCOPED_VOICE_MODEL = ModelReference(model_id="mindbridge/observation-scoped-voice")
 
 
 class _FaceAnalysis(Protocol):
@@ -380,7 +374,6 @@ def recognize_speakers(
                     end_ms=segment.end_ms,
                     confidence=segment.confidence,
                     model_id=OBSERVATION_SCOPED_VOICE_MODEL.model_id,
-                    model_revision=OBSERVATION_SCOPED_VOICE_MODEL.revision,
                     scope=IdentityScope.OBSERVATION,
                     transcript=segment.transcript,
                 )

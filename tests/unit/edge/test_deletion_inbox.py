@@ -72,7 +72,7 @@ def test_tombstone_erasure_rolls_back_until_local_media_can_be_deleted(
             source_observation_id=observation_id,
             sample_id="face_track_01",
             embedding=(1.0, 0.0),
-            model_reference=ModelReference(model_id="insightface/buffalo_l", revision="1.0.1"),
+            model_reference=ModelReference(model_id="insightface/buffalo_l"),
         ),
         minimum_similarity=0.8,
     )
@@ -83,11 +83,11 @@ def test_tombstone_erasure_rolls_back_until_local_media_can_be_deleted(
             source_observation_id="voice_observation",
             sample_id="voice_track_01",
             embedding=(1.0, 0.0),
-            model_reference=ModelReference(model_id="3d-speaker/eres2netv2", revision="v1.0.1"),
+            model_reference=ModelReference(model_id="3d-speaker/eres2netv2"),
         ),
         minimum_similarity=0.8,
     )
-    association_model = ModelReference(model_id="lr-asd", revision="ijcv-2025")
+    association_model = ModelReference(model_id="lr-asd")
     identity_memory.record_face_voice_evidence(
         FaceVoiceAssociationEvidence(
             tenant_id=request.tenant_id,

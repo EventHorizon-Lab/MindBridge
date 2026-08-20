@@ -32,7 +32,7 @@ from mindbridge.models.openai import OpenAIGenerator, normalize_base_url
 NOW = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
 
 
-async def test_perception_pipeline_returns_grounded_event_and_deployment_revision() -> None:
+async def test_perception_pipeline_returns_grounded_event_and_its_model() -> None:
     """The adapter sends original AV and preserves evidence and model provenance."""
 
     async def respond(request: httpx.Request) -> httpx.Response:
@@ -96,7 +96,7 @@ async def test_perception_pipeline_returns_grounded_event_and_deployment_revisio
                     }
                 ]
             },
-            fingerprint="qwen-serving-revision-01",
+            fingerprint="qwen-serving-fingerprint-01",
         )
 
     perceiver = _perceiver(respond)
@@ -114,7 +114,7 @@ async def test_perception_pipeline_returns_grounded_event_and_deployment_revisio
         EvidenceId("evidence_video"),
         EvidenceId("evidence_audio"),
     )
-    assert result.model_reference.revision == "deployment-revision"
+    assert result.model_reference.model_id == "qwen3.8-max"
     assert result.prompt_version == "perceive_events_v9"
     assert [entity.canonical_name for entity in result.events[0].entities] == [
         "red tool",
@@ -260,7 +260,7 @@ def _perceiver(
     return _PerceptionHarness(
         OpenAIGenerator(
             client,
-            ModelReference(model_id="qwen3.8-max", revision="deployment-revision"),
+            ModelReference(model_id="qwen3.8-max"),
         )
     )
 
@@ -294,10 +294,7 @@ def _observation() -> Observation:
                 start_ms=500,
                 end_ms=3_500,
                 confidence=0.91,
-                model_reference=ModelReference(
-                    model_id="insightface/buffalo_l",
-                    revision="1.0.1",
-                ),
+                model_reference=ModelReference(model_id="insightface/buffalo_l"),
                 visual_bbox_xyxy=(0.1, 0.2, 0.4, 0.8),
             ),
         ),

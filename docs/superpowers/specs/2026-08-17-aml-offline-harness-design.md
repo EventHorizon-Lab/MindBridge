@@ -197,8 +197,8 @@ chunks, each costing one extraction call plus N `remember()` writes.
 - New routes change `tests/contracts/snapshots/openapi.json`; the snapshot is
   regenerated in the same commit that adds them.
 - The run manifest follows the existing runner fields (`source_repository`,
-  `source_revision`, `source_sha256`, `code_revision`, `deployment`, `run_id`,
-  `tenant_prefix`, `recall_limit`, `request_concurrency`).
+  `source_sha256`, `deployment`, `run_id`, `tenant_prefix`, `recall_limit`,
+  `request_concurrency`).
 
 ## Testing
 
@@ -210,9 +210,8 @@ chunks, each costing one extraction call plus N `remember()` writes.
 ## Output
 
 A run manifest matching the existing benchmark runner convention
-(`source_repository`, `source_revision`, `source_sha256`, `code_revision`,
-`deployment`, `run_id`, `tenant_prefix`, `recall_limit`, `request_concurrency`),
-written to `benchmarks/manifests/`.
+(`source_repository`, `source_sha256`, `deployment`, `run_id`, `tenant_prefix`,
+`recall_limit`, `request_concurrency`), written to `benchmarks/manifests/`.
 
 ## What this cannot tell us
 

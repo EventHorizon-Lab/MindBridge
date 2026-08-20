@@ -109,7 +109,6 @@ class SummaryPipeline:
         set_current_span_attributes(
             {
                 "mindbridge.model.id": result.model_reference.model_id,
-                "mindbridge.model.revision": result.model_reference.revision,
                 "mindbridge.prompt.version": CONSOLIDATE_SUMMARIES_PROMPT.version,
                 "mindbridge.memory.count": len(candidates),
                 "mindbridge.evidence.count": len(evidence),

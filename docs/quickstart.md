@@ -21,7 +21,6 @@ reference embedder yourself:
 
 ```bash
 vllm serve jinaai/jina-embeddings-v5-omni-small-retrieval \
-  --revision 12949877f0092093f366c6450340011320152a05 \
   --trust-remote-code
 ```
 
@@ -72,14 +71,11 @@ export MINDBRIDGE_OBJECT_STORAGE_ENDPOINT_URL=http://localhost:9000
 export MINDBRIDGE_GENERATOR_API_KEY=...
 export MINDBRIDGE_GENERATOR_ENDPOINT=https://generator.example.com/v1
 export MINDBRIDGE_GENERATOR_MODEL_ID=qwen3.8-max
-export MINDBRIDGE_GENERATOR_MODEL_REVISION=deployment-2026-08-11
 
 export MINDBRIDGE_EMBEDDER_API_KEY=...
 export MINDBRIDGE_EMBEDDER_ENDPOINT=https://embeddings.example.com/v1
 export MINDBRIDGE_EMBEDDER_MODEL_ID=jinaai/jina-embeddings-v5-omni-small-retrieval
-export MINDBRIDGE_EMBEDDER_MODEL_REVISION=12949877f0092093f366c6450340011320152a05
 export MINDBRIDGE_EMBEDDING_SPACE_ID=jina-v5
-export MINDBRIDGE_EMBEDDING_SPACE_REVISION=local-space-v1
 
 export MINDBRIDGE_TENANT_API_KEYS_JSON='{"tenant_01":["'"$(openssl rand -hex 24)"'"]}'
 export AWS_DEFAULT_REGION=us-east-1

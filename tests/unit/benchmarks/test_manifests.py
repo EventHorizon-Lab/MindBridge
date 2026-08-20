@@ -10,6 +10,7 @@ from pydantic import JsonValue, ValidationError
 from mindbridge.benchmarks.artifacts import (
     DeploymentSnapshot,
     PluginSnapshot,
+    jsonl_lines,
     load_deployment_snapshot,
 )
 from mindbridge.benchmarks.dataset_smoke import DatasetAdapterSmokeResult
@@ -65,7 +66,6 @@ def test_locomo_optimization_manifest_preserves_reported_category_metrics() -> N
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     runs = {run["name"]: run for run in manifest["runs"]}
 
-    assert manifest["dataset"]["revision"] == ("3eb6f2c585f5e1699204e3c3bdf7adc5c28cb376")
     assert runs["baseline"]["metrics"]["answer_f1"] == 0.5459446372710516
     assert runs["optimized"]["metrics"]["answer_f1"] == 0.6136889267575371
     assert runs["reflection_v8"]["metrics"]["answer_f1"] == 0.649383027799884
@@ -167,3 +167,23 @@ def test_deployment_snapshot_and_hash_use_the_same_frozen_bytes(tmp_path: Path) 
 
     assert loaded.snapshot.server_generator.plugin == "openai"
     assert loaded.sha256 == hashlib.sha256(encoded).hexdigest()
+
+
+def test_jsonl_lines_drops_blank_lines_and_normalises_crlf_and_cr_endings(
+    tmp_path: Path,
+) -> None:
+    """The claims the loader tests cannot reach: their fixtures are all LF-only.
+
+    `read_text` reads in universal-newline mode, so splitting on the newline
+    alone still handles CRLF and CR-only corpora and leaves no carriage
+    return behind -- reading the bytes instead would strand one on every
+    line. Blank and whitespace-only lines are dropped, not returned empty.
+    """
+    crlf = tmp_path / "crlf.jsonl"
+    crlf.write_bytes(b'{"a": 1}\r\n\r\n   \r\n{"a": 2}\r\n')
+    cr_only = tmp_path / "cr.jsonl"
+    cr_only.write_bytes(b'{"a": 3}\r{"a": 4}\r')
+
+    assert jsonl_lines(crlf) == ('{"a": 1}', '{"a": 2}')
+    assert jsonl_lines(cr_only) == ('{"a": 3}', '{"a": 4}')
+    assert [json.loads(line) for line in jsonl_lines(crlf)] == [{"a": 1}, {"a": 2}]

@@ -47,7 +47,6 @@ EventRow: TypeAlias = tuple[
     datetime,
     str,
     str,
-    str,
     str | None,
     str,
     str,
@@ -169,7 +168,6 @@ def _event_from_row(row: EventRow) -> Event:
         salience,
         created_at,
         model_id,
-        model_revision,
         prompt_version,
         parent_event_id,
         hierarchy_level,
@@ -185,7 +183,7 @@ def _event_from_row(row: EventRow) -> Event:
         description=description,
         salience=salience,
         created_at=created_at,
-        model_reference=ModelReference(model_id=model_id, revision=model_revision),
+        model_reference=ModelReference(model_id=model_id),
         prompt_version=prompt_version,
         parent_event_id=EventId(parent_event_id) if parent_event_id is not None else None,
         hierarchy_level=EventHierarchyLevel(hierarchy_level),
@@ -242,7 +240,6 @@ related_pairs AS (
             JOIN embeddings AS peer_embedding
               ON peer_embedding.tenant_id = seed_embedding.tenant_id
              AND peer_embedding.space_id = seed_embedding.space_id
-             AND peer_embedding.space_revision = seed_embedding.space_revision
              AND peer_embedding.task = seed_embedding.task
             WHERE seed_embedding.tenant_id = seed.tenant_id
               AND seed_embedding.object_type = 'event'
@@ -283,7 +280,6 @@ SELECT event.event_id,
        event.salience,
        event.created_at,
        event.model_id,
-       event.model_revision,
        event.prompt_version,
        event.parent_event_id,
        event.hierarchy_level,

@@ -41,6 +41,10 @@ Plugin configs use `extra="forbid"`. An unrecognized key fails startup rather th
 because "that setting had no effect" is a much worse outcome to debug than a failed boot. Check
 the key against the plugin's documented fields.
 
+After upgrading past migration `0021` the usual culprits are `model_revision` and
+`space_revision`, which no longer exist on any plugin. Delete them from your `*_CONFIG_JSON`
+objects; `model_id` and `space_id` still carry the identity they were paired with.
+
 ### `embedding dimension must be one of 32, 64, 128, 256, 512, 768, 1024`
 
 `MINDBRIDGE_EMBEDDING_DIMENSION` accepts only widths Jina v5 was trained to truncate to. Any other
@@ -51,7 +55,7 @@ value is an untrained truncation that silently degrades recall quality.
 The embedding-space probe found a tenant holding vectors the configured space cannot reach. This
 is the guard that stops a changed embedder from turning every recall into an empty result.
 
-Either restore the previous `MINDBRIDGE_EMBEDDING_SPACE_ID` / `_REVISION` / `_DIMENSION`, or
+Either restore the previous `MINDBRIDGE_EMBEDDING_SPACE_ID` / `_DIMENSION`, or
 complete the re-embedding. Vectors in several spaces are accepted **while** a migration is in
 progress, so a partial rebuild is not itself the problem.
 
@@ -156,6 +160,16 @@ and `attempt`.
 | `model_output_invalid` | The model returned something unusable. Persistent means it drifted off contract. |
 | `object_storage_unavailable` | Media could not be read. Check the URI, credentials, and endpoint. |
 | `memory_integrity_failed` | Stored state is inconsistent. Investigate; this should be zero. |
+
+### `request_validation_failed` naming `model_revision` on observe
+
+An edge device older than migration `0021` is still sending `model_revision` inside
+`identity_observations`. The field used to be required and is now rejected, because request
+contracts refuse unknown fields rather than dropping them silently — the alternative is a device
+believing it recorded provenance the server threw away.
+
+Upgrade the device. There is no server-side setting to accept the old shape, and the field has no
+replacement: `model_id` alone now records which edge model produced a span.
 
 ### `task_broker_unavailable` on observe
 

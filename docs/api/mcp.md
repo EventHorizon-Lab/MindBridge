@@ -22,7 +22,6 @@ uv run --extra server mindbridge mcp
         "MINDBRIDGE_OBJECT_STORAGE_BUCKET": "mindbridge-media",
         "MINDBRIDGE_GENERATOR_API_KEY": "...",
         "MINDBRIDGE_GENERATOR_ENDPOINT": "https://generator.example.com/v1",
-        "MINDBRIDGE_GENERATOR_MODEL_REVISION": "deployment-2026-08-11",
         "MINDBRIDGE_EMBEDDER_API_KEY": "...",
         "MINDBRIDGE_EMBEDDER_ENDPOINT": "https://embeddings.example.com/v1"
       }

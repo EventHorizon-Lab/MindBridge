@@ -70,7 +70,7 @@ def read_jsonl(path: str | Path) -> list[dict[str, Any]]:
     p = Path(path)
     if not p.exists():
         return []
-    return [json.loads(line) for line in p.read_text(encoding="utf-8").splitlines() if line.strip()]
+    return [json.loads(line) for line in p.read_text(encoding="utf-8").split("\n") if line.strip()]
 
 
 def row_id(item: dict[str, Any], index: int) -> str:

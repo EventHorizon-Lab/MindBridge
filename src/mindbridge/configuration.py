@@ -89,8 +89,8 @@ class PluginConfigModel(BaseModel):
     """Strict immutable schema for one plugin's JSON configuration object.
 
     `extra="forbid"` is what fails a factory on any key it would otherwise ignore.
-    `protected_namespaces` is cleared because `model_id` and `model_revision` are
-    MindBridge's model-identity fields, not pydantic's reserved namespace.
+    `protected_namespaces` is cleared because `model_id` is MindBridge's model-identity
+    field, not pydantic's reserved namespace.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True, protected_namespaces=())

@@ -52,11 +52,10 @@ from mindbridge.benchmarks.cli_common import report, report_unit
 from mindbridge.contracts import ContractModel, Identifier, NonEmptyString, Sha256Hex
 from mindbridge.file_integrity import sha256_file
 
-# The exact pin recorded in `benchmarks/aml/PINNED.md` (Task 13, steps 1-2).
-# A constant, not a CLI flag: upgrading it means re-vendoring and re-pinning,
-# not choosing a different value per run.
+# The upstream this benchmark's vendored pipelines come from, recorded in
+# `benchmarks/aml/PINNED.md`. A constant, not a CLI flag: changing it means
+# re-vendoring, not choosing a different value per run.
 _AML_SOURCE_REPOSITORY = "AML-memory/agent-memory-leaderboard"
-_AML_SOURCE_REVISION = "5761ed58502d24153115cbdc010e44957cb18c3a"
 
 # Duplicated from `mindbridge.api.aml_contracts.derive_tenant_id` rather than
 # imported: nothing under `mindbridge.benchmarks.aml` may import
@@ -174,9 +173,7 @@ class AmlRunManifest(ContractModel):
 
     benchmark: NonEmptyString
     source_repository: NonEmptyString
-    source_revision: NonEmptyString
     source_sha256: Sha256Hex
-    code_revision: NonEmptyString
     deployment: DeploymentSnapshot
     # Naming matches `mindbridge.benchmarks.cli_common._core_manifest_values`:
     # every other benchmark manifest pins both a deployment and a predictions
@@ -233,7 +230,6 @@ class _Arguments:
     dataset_paths: tuple[Path, ...]
     output_path: Path
     api_base_url: str
-    code_revision: str
     deployment_config_path: Path
     run_id: str
     tenant_prefix: str
@@ -416,7 +412,18 @@ async def _run(
                 written_id = str(row["id"])
                 if written_id in existing_ids:
                     continue
-                handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+                # `ensure_ascii=True` here, against this repo's usual
+                # `ensure_ascii=False`: `docs/benchmarking.md` feeds these shards to
+                # the vendored scorers, which are standalone upstream scripts, and to
+                # third-party tooling. A raw U+2028, U+2029 or U+0085 -- the only
+                # three `splitlines()` breaks on that `ensure_ascii=False` emits
+                # unescaped -- shreds a record mid-string in any reader that splits
+                # on Unicode line boundaries. Escaping puts that guarantee on the
+                # write side instead of assuming every reader is fixed. It costs
+                # about 1% here because all seven AML corpora are 0.00% CJK; the
+                # CJK-heavy benchmarks write through their own CLIs, which keep
+                # `ensure_ascii=False` and stay readable.
+                handle.write(json.dumps(row, ensure_ascii=True) + "\n")
                 handle.flush()
                 existing_ids.add(written_id)
 
@@ -476,9 +483,7 @@ def _write_manifest(
     manifest = AmlRunManifest(
         benchmark=arguments.benchmark,
         source_repository=_AML_SOURCE_REPOSITORY,
-        source_revision=_AML_SOURCE_REVISION,
         source_sha256=sha256_file(BENCHMARKS[arguments.benchmark].pipeline),
-        code_revision=arguments.code_revision,
         deployment=deployment.snapshot,
         deployment_sha256=deployment.sha256,
         run_id=arguments.run_id,
@@ -542,9 +547,6 @@ def _parse_arguments(argv: Sequence[str] | None, prog: str | None) -> _Arguments
         "--api-base-url", required=True, help="base URL of the deployed MindBridge API"
     )
     parser.add_argument(
-        "--code-revision", required=True, help="git revision of the code under measurement"
-    )
-    parser.add_argument(
         "--deployment-config",
         type=Path,
         required=True,
@@ -594,7 +596,6 @@ def _parse_arguments(argv: Sequence[str] | None, prog: str | None) -> _Arguments
         dataset_paths=tuple(parsed.dataset),
         output_path=parsed.output,
         api_base_url=parsed.api_base_url,
-        code_revision=parsed.code_revision,
         deployment_config_path=parsed.deployment_config,
         run_id=parsed.run_id,
         tenant_prefix=parsed.tenant_prefix,
