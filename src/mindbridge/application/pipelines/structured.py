@@ -65,6 +65,14 @@ _UNSUPPORTED_KEYWORDS = frozenset(
         "then",
     }
 )
+_NAMESPACE_KEYWORDS = frozenset({"$defs", "definitions", "properties"})
+"""Keywords whose keys are names the model chose, not schema keywords of their own.
+
+Filtering these as keywords is how a field called `title` or `format` disappears from
+`properties` while `additionalProperties: false` forbids the model from emitting it -- a
+shape the validator then rejects on every single call -- and how a field called `then` is
+mistaken for a conditional subschema and fails derivation outright.
+"""
 """Keywords no strict decoder will compile, so a schema using one must not be built.
 
 Composition and conditional subschemas are excluded by the provider contract rather than
@@ -108,7 +116,7 @@ def _strict_schema(node: object) -> object:
             f"output schema uses keywords strict decoding rejects: {sorted(unsupported)}"
         )
     rewritten = {
-        key: _strict_schema(value)
+        key: _strict_subschemas(value) if key in _NAMESPACE_KEYWORDS else _strict_schema(value)
         for key, value in node.items()
         if key not in _UNCONSTRAINED_KEYWORDS
     }
@@ -120,6 +128,13 @@ def _strict_schema(node: object) -> object:
         rewritten["required"] = sorted(properties)
         rewritten["additionalProperties"] = False
     return rewritten
+
+
+def _strict_subschemas(node: object) -> object:
+    """Rewrite the subschemas one namespace holds, leaving the names it keys them by alone."""
+    if not isinstance(node, Mapping):
+        return _strict_schema(node)
+    return {name: _strict_schema(subschema) for name, subschema in node.items()}
 
 
 async def generate_json(
@@ -134,7 +149,7 @@ async def generate_json(
     except ModelOutputError as error:
         set_current_span_attributes({"mindbridge.model.structured_retry_count": 1})
         _LOGGER.warning(
-            "structured output rejected, retrying in JSON mode",
+            "structured output rejected, retrying once",
             extra=_retry_fields(request, error),
         )
         result = await generator.generate(replace(request, json_mode=True))
@@ -150,7 +165,14 @@ def unwrap_json_code_fence(content: str) -> str:
 
 
 def _retry_fields(request: GenerateRequest, error: ModelOutputError) -> dict[str, object]:
-    """Report why one generation is being paid for twice, without the content that failed."""
+    """Report why one generation is being paid for twice, without the content that failed.
+
+    `constrained` is the field worth reading: `json_mode` does not weaken a request that
+    still carries a schema, because `_response_format` prefers the schema whenever the
+    endpoint accepts one. On such an endpoint the retry repeats the first attempt's
+    arguments at temperature 0, so a run showing these lines is paying for two identical
+    generations and the bound that failed is the one to look at.
+    """
     return log_fields(
         schema=request.output_schema.name if request.output_schema is not None else None,
         constrained=request.output_schema is not None,

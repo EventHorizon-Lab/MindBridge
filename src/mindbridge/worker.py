@@ -71,7 +71,7 @@ from mindbridge.models.defaults import (
     openai_generator_config,
 )
 from mindbridge.models.plugins import close_model, load_embedder, load_generator
-from mindbridge.telemetry import configure_observability
+from mindbridge.telemetry import configure_observability, flush_timing_summary
 
 _MODEL_REQUEST_TIMEOUT_SECONDS = 780.0
 _POST_MODEL_BUDGET_SECONDS = 300.0
@@ -465,3 +465,6 @@ def _dispose_worker_runtime() -> None:
 def _close_worker_runtime(**_kwargs: object) -> None:
     """Release the process-owned plugin before the prefork child exits."""
     _dispose_worker_runtime()
+    # This child exits through `os._exit`, which runs no `atexit` handler, so the summary
+    # has to be emitted from the last signal Celery does deliver.
+    flush_timing_summary()

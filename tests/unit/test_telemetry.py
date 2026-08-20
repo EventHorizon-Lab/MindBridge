@@ -460,6 +460,62 @@ def test_the_timing_summary_is_registered_once_per_process_not_per_configuration
     assert registered == [telemetry.log_timing_summary]
 
 
+async def test_the_summary_is_reachable_without_atexit_for_a_child_that_os_exits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Celery's prefork child ends in `os._exit`, which runs no `atexit` handler.
+
+    That child is the worker, where the write path spends its wall clock, so leaving the
+    summary to `atexit` leaves the one process worth profiling unmeasured.
+    """
+    monkeypatch.setattr("atexit.register", lambda _handler: None)
+    monkeypatch.setattr(telemetry, "_summary_registered", False)
+    captured = _configure_capture(monkeypatch, MINDBRIDGE_TIMING_SUMMARY="1")
+
+    @operation_span("mindbridge.test.flushed")
+    async def operation() -> None:
+        return None
+
+    await operation()
+    telemetry.flush_timing_summary()
+
+    messages = [record["message"] for record in _records(captured)]
+    assert "timing summary" in messages
+
+
+def test_flushing_the_summary_twice_reports_it_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A process that flushes and then exits normally must not print the summary twice."""
+    unregistered: list[object] = []
+    monkeypatch.setattr("atexit.register", lambda _handler: None)
+    monkeypatch.setattr("atexit.unregister", unregistered.append)
+    monkeypatch.setattr(telemetry, "_summary_registered", True)
+    emitted: list[int] = []
+    monkeypatch.setattr(telemetry, "log_timing_summary", lambda: emitted.append(1))
+
+    telemetry.flush_timing_summary()
+    telemetry.flush_timing_summary()
+
+    assert emitted == [1]
+    assert unregistered == [telemetry.log_timing_summary]
+
+
+def test_a_reported_field_cannot_rewrite_the_record_it_travels_on(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`log_fields` keeps a domain key off `LogRecord`; this keeps it off the payload too."""
+    captured = _configure_capture(monkeypatch)
+
+    telemetry.logger("mindbridge.test").info(
+        "real message",
+        extra=telemetry.log_fields(message="spoofed", level="DEBUG", service="elsewhere"),
+    )
+
+    (record,) = _records(captured)
+    assert record["message"] == "real message"
+    assert record["level"] == "INFO"
+    assert record["service"] == "mindbridge-test"
+
+
 def test_the_timing_summary_stays_opt_in(monkeypatch: pytest.MonkeyPatch) -> None:
     registered: list[object] = []
     monkeypatch.setattr("atexit.register", registered.append)

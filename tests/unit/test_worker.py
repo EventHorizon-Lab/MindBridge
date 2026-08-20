@@ -400,3 +400,19 @@ def test_a_blank_concurrency_reads_as_unset_like_every_other_optional_value(
     environment["MINDBRIDGE_WORKER_CONCURRENCY"] = configured
 
     assert WorkerSettings.from_environment(environment).worker_concurrency == 1
+
+
+def test_the_prefork_child_reports_its_timings_before_it_exits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """billiard ends the child with `os._exit`, so no `atexit` handler ever runs there.
+
+    The worker owns the write path, so its summary is the one worth having, and the last
+    signal Celery delivers is the only place left to emit it from.
+    """
+    flushed: list[int] = []
+    monkeypatch.setattr(worker_module, "flush_timing_summary", lambda: flushed.append(1))
+
+    worker_module._close_worker_runtime()
+
+    assert flushed == [1]
