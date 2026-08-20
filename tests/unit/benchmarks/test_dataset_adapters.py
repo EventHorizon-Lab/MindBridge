@@ -265,6 +265,48 @@ def test_egolife_adapter_rejects_invalid_query_clock(tmp_path: Path) -> None:
         load_egolife_qa(annotation_path)
 
 
+# U+2028 LINE SEPARATOR is legal inside a JSON string and is not a JSON line
+# delimiter, but `str.splitlines()` breaks on it. The shipped EgoMemReason
+# v1.1 public release happens to carry none today, so no fixture built from
+# the real corpus can exercise this -- hence a synthetic annotation that does.
+_EGOMEM_SEPARATOR = "\u2028"
+_EGOMEM_SEPARATED_QUESTION = f"What do I eat{_EGOMEM_SEPARATOR}most often?"
+
+
+def test_egomem_reason_adapter_keeps_a_unicode_line_separator_in_a_question(
+    tmp_path: Path,
+) -> None:
+    """Splitting the annotations JSONL on Unicode line boundaries shreds records.
+
+    Under `str.splitlines()` this one annotation becomes two truncated
+    pieces, so `model_validate_json` raises `Invalid JSON` and the loader
+    fails outright. Asserting the round-tripped question text (not just that
+    loading succeeded) also rules out a rule that split the line and silently
+    dropped or rejoined the character.
+    """
+    annotation_path = tmp_path / "annotations_public.jsonl"
+    annotation_path.write_text(
+        json.dumps(
+            {
+                "example_id": 1,
+                "p_id": "A1_JAKE_DAY7_19_00_00_q001",
+                "identity": "A1_JAKE",
+                "query_time": "DAY7, 19:00:00",
+                "question": _EGOMEM_SEPARATED_QUESTION,
+                "options": {"A": "Rice", "B": "Dumplings", "C": "Burger", "D": "Pancake"},
+                "query_type": "Activity Pattern",
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    [question] = load_egomem_reason(annotation_path)
+
+    assert question.question == _EGOMEM_SEPARATED_QUESTION
+
+
 def test_egomem_reason_adapter_preserves_reshuffled_option_order(tmp_path: Path) -> None:
     annotation_path = tmp_path / "annotations_public.jsonl"
     annotation_path.write_text(

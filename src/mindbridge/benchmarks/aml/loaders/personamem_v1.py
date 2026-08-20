@@ -44,6 +44,7 @@ from pathlib import Path
 from pydantic import BaseModel, ConfigDict, TypeAdapter
 
 from mindbridge.benchmarks.aml.cases import AmlCase, AmlQuestion
+from mindbridge.benchmarks.artifacts import jsonl_lines
 
 
 class _RawTurn(BaseModel):
@@ -77,9 +78,7 @@ def load(questions_csv: Path, contexts_jsonl: Path) -> tuple[AmlCase, ...]:
 def _read_shared_contexts(path: Path) -> dict[str, tuple[dict[str, object], ...]]:
     """Parse `{shared_context_id: [{role, content}, ...]}` per line into messages."""
     shared: dict[str, tuple[dict[str, object], ...]] = {}
-    for line in path.read_text().splitlines():
-        if not line.strip():
-            continue
+    for line in jsonl_lines(path):
         raw: dict[str, object] = json.loads(line)
         for shared_context_id, turns in raw.items():
             parsed = TypeAdapter(list[_RawTurn]).validate_python(turns)

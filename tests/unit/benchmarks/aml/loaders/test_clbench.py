@@ -132,9 +132,16 @@ _RECORD_5 = {
 }
 
 
+# `ensure_ascii=False`/`encoding="utf-8"` so a record carrying an exotic
+# separator reaches the loader as the raw character the real release stores,
+# not as the `\uXXXX` escape `json.dumps` would emit by default -- an escaped
+# fixture is inert here and would pass under either line-splitting rule.
 def _write_fixture(tmp_path: Path, *records: dict[str, object]) -> Path:
     path = tmp_path / "CL-bench.jsonl"
-    path.write_text("\n".join(json.dumps(record) for record in records))
+    path.write_text(
+        "\n".join(json.dumps(record, ensure_ascii=False) for record in records),
+        encoding="utf-8",
+    )
     return path
 
 
@@ -294,3 +301,48 @@ def test_load_raises_on_a_record_with_an_empty_rubrics_list(tmp_path: Path) -> N
 
     with pytest.raises(ValueError, match="rubrics"):
         load(path)
+
+
+# U+2028 LINE SEPARATOR appears 343 times inside JSON string values of the
+# real corpus (tencent/CL-bench revision b28a5832a09b0d96c0cf4c22e90d7c60ede25b80,
+# 90,085,681 bytes). It is legal inside a JSON string and is not a JSON line
+# delimiter, but `str.splitlines()` breaks on it -- which shredded 350 of the
+# 1,899 records mid-string and made this loader raise on the real release.
+_SEPARATOR = "\u2028"
+_RECORD_6_HISTORY = (
+    f"Chapter 1 surveys thermal expansion.{_SEPARATOR}Chapter 2 surveys pyrokinetic alloys."
+)
+_RECORD_6_QUESTION = f"Which chapter{_SEPARATOR}surveys alloys?"
+_RECORD_6 = {
+    "messages": [
+        {"role": "system", "content": "You are DocQA."},
+        {"role": "user", "content": f"{_RECORD_6_HISTORY}\n\n{_RECORD_6_QUESTION}"},
+    ],
+    "rubrics": ["Names chapter 2"],
+    "metadata": {
+        "task_id": "task-6",
+        "context_id": "ctx-6",
+        "context_category": "Science",
+        "sub_category": "Materials",
+    },
+}
+
+
+def test_load_keeps_a_unicode_line_separator_inside_a_json_string_value(
+    tmp_path: Path,
+) -> None:
+    """Splitting records on Unicode line boundaries, not newlines, shreds them.
+
+    Under `str.splitlines()` this one record becomes three pieces -- two of
+    them truncated mid-string -- so `validate_json` raises `Invalid JSON: EOF
+    while parsing a string` and no case loads at all. Both surviving halves
+    are asserted so a rule that merely tolerated the character while dropping
+    it (or that split and rejoined on the wrong boundary) still fails.
+    """
+    cases = load(_write_fixture(tmp_path, _RECORD_1, _RECORD_6))
+
+    assert len(cases) == 2, "an exotic separator must not inflate the record count"
+    case = cases[1]
+    assert [message["content"] for message in case.messages] == [_RECORD_6_HISTORY]
+    [question] = case.questions
+    assert question.question == _RECORD_6_QUESTION
