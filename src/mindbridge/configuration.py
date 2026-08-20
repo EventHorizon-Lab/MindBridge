@@ -91,6 +91,127 @@ def _located_path(environ: Mapping[str, str]) -> Path | None:
     return default if default.is_file() else None
 
 
+PLUGIN_SECTIONS: tuple[str, ...] = ("generator", "embedder", "media_embedder", "media_sampling")
+"""Sections whose body is one plugin's config object rather than a set of named scalars.
+
+`plugin_configuration()` reads a plugin's config as one opaque object whose schema belongs to
+the plugin, so these sections serialise to their `*_CONFIG_JSON` variable instead of
+contributing one variable per key. `plugin` is the exception: the selector is read separately
+from the config it selects.
+"""
+
+PLUGIN_SELECTOR_KEY = "plugin"
+"""Reserved inside a plugin section: it names the plugin rather than configuring it."""
+
+KNOWN_SCALAR_KEYS: Mapping[str, tuple[str, ...]] = {
+    "database": ("max_pool_size",),
+    "object_storage": ("bucket", "endpoint_url", "public_endpoint_url"),
+    "embedding": ("dimension", "space_id", "space_revision"),
+    "aml": ("tenant_prefix",),
+}
+"""Sections holding named values MindBridge owns, one variable per key.
+
+Spelled out rather than derived because nothing in the code enumerates them, and an unlisted
+key has to be an error: a typo that flattens to a variable no reader looks up is a value that
+silently reverts to its default, which is the failure `extra="forbid"` already prevents inside
+a plugin config. `test_the_known_keys_cannot_fall_behind_what_the_code_reads` is the guard that
+keeps this table honest.
+"""
+
+TOP_LEVEL_KEYS: tuple[str, ...] = ("minimum_embedding_similarity",)
+"""Keys configuring one deployment-wide value that belongs to no section."""
+
+CREDENTIAL_VARIABLES: frozenset[str] = frozenset(
+    {
+        "MINDBRIDGE_API_KEY",
+        "MINDBRIDGE_AML_API_KEY",
+        "MINDBRIDGE_DATABASE_URL",
+        "MINDBRIDGE_EMBEDDER_API_KEY",
+        "MINDBRIDGE_GENERATOR_API_KEY",
+        "MINDBRIDGE_TASK_BROKER_URL",
+        "MINDBRIDGE_TENANT_API_KEYS_JSON",
+    }
+)
+"""The variables that may never be read from a file.
+
+Keeping credentials out of every file is the property this split exists to preserve, so a
+credential key is an error rather than a warning: a warning that is ignored puts a secret on
+disk just as effectively as no check at all.
+"""
+
+
+def _flattened_scalars(document: Mapping[str, object]) -> dict[str, str]:
+    """Flatten every file key that configures one named variable."""
+    flattened: dict[str, str] = {}
+    for name, value in document.items():
+        if not isinstance(value, dict):
+            flattened.update(_top_level(name, value))
+        elif name in PLUGIN_SECTIONS:
+            flattened.update(_plugin_selector(name, value))
+        else:
+            flattened.update(_scalar_section(name, value))
+    return flattened
+
+
+def _top_level(name: str, value: object) -> dict[str, str]:
+    """Flatten one key that belongs to no section."""
+    # The credential check comes first on every path: "put this in the environment" is what an
+    # operator needs to read, where "unknown key" would send them hunting for a typo.
+    _reject_credential(variable_name(name))
+    if name not in TOP_LEVEL_KEYS:
+        raise ValueError(f"{name} is not a known top-level configuration key")
+    return _scalar(variable_name(name), value)
+
+
+def _plugin_selector(name: str, body: Mapping[str, object]) -> dict[str, str]:
+    """Take only the selector from a plugin section, and refuse its credentials.
+
+    The rest of the body is one opaque object, assembled by `_flattened_plugins`.
+    """
+    for key in body:
+        _reject_credential(variable_name(key, name))
+    selector = body.get(PLUGIN_SELECTOR_KEY)
+    if selector is None:
+        return {}
+    return _scalar(variable_name(PLUGIN_SELECTOR_KEY, name), selector)
+
+
+def _scalar_section(name: str, body: Mapping[str, object]) -> dict[str, str]:
+    """Flatten one section of named values, rejecting anything no variable could carry."""
+    for key in body:
+        _reject_credential(variable_name(key, name))
+    known = KNOWN_SCALAR_KEYS.get(name)
+    if known is None:
+        raise ValueError(f"{name} is not a known configuration section")
+    flattened: dict[str, str] = {}
+    for key, entry in body.items():
+        if isinstance(entry, dict):
+            raise ValueError(f"{name}.{key} must not nest another table")
+        if key not in known:
+            raise ValueError(f"{key} is not a known key of [{name}]")
+        flattened.update(_scalar(variable_name(key, name), entry))
+    return flattened
+
+
+def _scalar(variable: str, value: object) -> dict[str, str]:
+    """Render one file scalar as the string an environment reader would have received."""
+    _reject_credential(variable)
+    if isinstance(value, bool):
+        return {variable: "true" if value else "false"}
+    if isinstance(value, str | int | float):
+        return {variable: str(value)}
+    raise ValueError(f"{variable} must be text, a number, or a boolean")
+
+
+def _reject_credential(variable: str) -> None:
+    """Keep every credential out of every file, in one place both flatteners call."""
+    if variable in CREDENTIAL_VARIABLES:
+        raise ValueError(
+            f"{variable} is a credential and must not appear in the configuration file. "
+            f"Set it in the environment instead."
+        )
+
+
 def validate_plugin_name(value: object, name: str = "plugin name") -> str:
     """Require the canonical entry-point spelling used by every process."""
     if (
