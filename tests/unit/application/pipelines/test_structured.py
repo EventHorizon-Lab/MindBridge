@@ -213,7 +213,6 @@ def test_a_definition_named_like_a_keyword_is_still_there_to_be_referenced() -> 
 
     schema = json.loads(output_schema("holder", Holder).json_schema)
 
-    definitions = cast(dict[str, object], schema["$defs"])
-    reference = cast(dict[str, str], cast(dict[str, object], schema["properties"])["nested"])
-    assert reference["$ref"] == "#/$defs/default"
-    assert sorted(definitions) == ["default"]
+    properties = cast(dict[str, dict[str, str]], schema["properties"])
+    assert properties["nested"]["$ref"] == "#/$defs/default"
+    assert sorted(cast(dict[str, object], schema["$defs"])) == ["default"]
