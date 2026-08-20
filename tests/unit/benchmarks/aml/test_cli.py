@@ -275,7 +275,6 @@ def test_manifest_carries_source_deployment_and_tenant_mapping(tmp_path: Path) -
         dataset_paths=(tmp_path / "locomo_refined.json",),
         output_path=output_path,
         api_base_url="https://memory.example.test",
-        code_revision="mindbridge-commit",
         deployment_config_path=deployment_path,
         run_id="run-1",
         tenant_prefix="bench_aml",
@@ -296,9 +295,7 @@ def test_manifest_carries_source_deployment_and_tenant_mapping(tmp_path: Path) -
     manifest_path = sidecar_manifest_path(output_path)
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert manifest["source_repository"] == "AML-memory/agent-memory-leaderboard"
-    assert manifest["source_revision"] == "5761ed58502d24153115cbdc010e44957cb18c3a"
     assert len(manifest["source_sha256"]) == 64
-    assert manifest["code_revision"] == "mindbridge-commit"
     assert manifest["deployment"]["server_generator"]["plugin"] == "openai"
     assert manifest["run_id"] == "run-1"
     assert manifest["tenant_prefix"] == "bench_aml"
@@ -356,7 +353,6 @@ def test_write_manifest_counts_oversized_unsliced_questions_from_output_rows(
         dataset_paths=(tmp_path / "CL-bench.jsonl",),
         output_path=output_path,
         api_base_url="https://memory.example.test",
-        code_revision="mindbridge-commit",
         deployment_config_path=deployment_path,
         run_id="run-1",
         tenant_prefix="bench_aml",
@@ -406,7 +402,6 @@ def _arguments(
         "dataset_paths": (tmp_path / "locomo_refined.json",),
         "output_path": output_path,
         "api_base_url": "https://memory.example.test",
-        "code_revision": "mindbridge-commit",
         "deployment_config_path": deployment_path,
         "run_id": "run-1",
         "tenant_prefix": "bench_aml",

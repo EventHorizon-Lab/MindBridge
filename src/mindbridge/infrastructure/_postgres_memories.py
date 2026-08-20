@@ -91,13 +91,13 @@ async def _insert_memory(
         """
         INSERT INTO memory_records (
             tenant_id, memory_id, memory_type, summary, verification_status, state,
-            occurred_at, ended_at, model_id, model_revision, content_digest, created_at,
+            occurred_at, ended_at, model_id, content_digest, created_at,
             salience, strength, useful_access_count, positive_feedback_count,
             negative_feedback_count, last_accessed_at, lifecycle_changed_at,
             supersedes_memory_id, superseded_at
         )
         VALUES (
-            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
             %s, %s, %s, %s, %s, %s, GREATEST(now(), %s), %s, %s
         )
         ON CONFLICT DO NOTHING
@@ -113,7 +113,6 @@ async def _insert_memory(
             memory.occurred_at,
             memory.ended_at,
             memory.model_reference.model_id if memory.model_reference is not None else None,
-            memory.model_reference.revision if memory.model_reference is not None else None,
             content_digest,
             memory.created_at,
             memory.salience,

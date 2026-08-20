@@ -833,13 +833,6 @@
             "title": "Model Id",
             "type": "string"
           },
-          "model_revision": {
-            "description": "Exact revision of `model_id`, so a re-identification can be reproduced.",
-            "maxLength": 255,
-            "minLength": 1,
-            "title": "Model Revision",
-            "type": "string"
-          },
           "scope": {
             "$ref": "#/components/schemas/IdentityScope",
             "default": "device",
@@ -908,8 +901,7 @@
           "start_ms",
           "end_ms",
           "confidence",
-          "model_id",
-          "model_revision"
+          "model_id"
         ],
         "title": "IdentityObservationInput",
         "type": "object"

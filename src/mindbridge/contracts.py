@@ -157,9 +157,6 @@ class IdentityObservationInput(ContractModel):
     model_id: Identifier = Field(
         description="Edge model that produced the span, recorded for provenance.",
     )
-    model_revision: Identifier = Field(
-        description="Exact revision of `model_id`, so a re-identification can be reproduced.",
-    )
     scope: IdentityScope = Field(
         default=IdentityScope.DEVICE,
         description="How far `identity_id` is meaningful; device-local unless promoted.",
@@ -292,7 +289,6 @@ class ObserveRequest(ContractModel):
                 identity.start_ms,
                 identity.end_ms,
                 identity.model_id,
-                identity.model_revision,
             )
             for identity in self.identity_observations
         ]

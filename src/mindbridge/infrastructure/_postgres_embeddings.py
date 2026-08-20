@@ -73,10 +73,10 @@ async def write_embedding_on_connection(
         """
         INSERT INTO embeddings (
             tenant_id, embedding_id, object_type, object_id,
-            model_id, model_revision, space_id, space_revision, task,
+            model_id, space_id, task,
             dimension, normalized, embedding, created_at
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT DO NOTHING
         RETURNING embedding_id
         """,
@@ -86,9 +86,7 @@ async def write_embedding_on_connection(
             embedding.object_type.value,
             embedding.object_id,
             embedding.model_reference.model_id,
-            embedding.model_reference.revision,
             embedding.space_reference.space_id,
-            embedding.space_reference.revision,
             embedding.task,
             embedding.dimension,
             embedding.normalized,
@@ -108,9 +106,7 @@ async def write_embedding_on_connection(
           AND object_type = %s
           AND object_id = %s
           AND model_id = %s
-          AND model_revision = %s
           AND space_id = %s
-          AND space_revision = %s
           AND task = %s
         """,
         (
@@ -120,9 +116,7 @@ async def write_embedding_on_connection(
             embedding.object_type.value,
             embedding.object_id,
             embedding.model_reference.model_id,
-            embedding.model_reference.revision,
             embedding.space_reference.space_id,
-            embedding.space_reference.revision,
             embedding.task,
         ),
     )
@@ -176,7 +170,6 @@ async def search_embeddings(
             FROM embeddings
             WHERE tenant_id = %s
               AND space_id = %s
-              AND space_revision = %s
               AND task = %s
               AND object_type = ANY(%s)
               AND 1 - (embedding <=> %s) >= %s
@@ -187,7 +180,6 @@ async def search_embeddings(
                 vector,
                 search.tenant_id,
                 search.space_reference.space_id,
-                search.space_reference.revision,
                 search.document_task,
                 [object_type.value for object_type in search.object_types],
                 vector,
@@ -252,7 +244,7 @@ class EmbeddingReadOperations(PostgresStoreOperations):
                   AND NOT EXISTS (
                           SELECT 1 FROM embeddings
                           WHERE tenant_id = %s AND object_type = candidate.object_type
-                            AND space_id = %s AND space_revision = %s
+                            AND space_id = %s
                       )
                 ORDER BY candidate.object_type
                 """,
@@ -261,7 +253,6 @@ class EmbeddingReadOperations(PostgresStoreOperations):
                     tenant_id,
                     tenant_id,
                     space_reference.space_id,
-                    space_reference.revision,
                 ),
             )
             return tuple(

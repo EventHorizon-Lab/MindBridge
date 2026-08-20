@@ -66,7 +66,6 @@ FUNASR_STREAMING_ASR_MODEL_ID = (
 )
 FUNASR_VAD_MODEL_ID = "iic/speech_fsmn_vad_zh-cn-16k-common-pytorch"
 FUNASR_PUNCTUATION_MODEL_ID = "iic/punc_ct-transformer_zh-cn-common-vad_realtime-vocab272727"
-FUNASR_MODEL_REVISION = "v2.0.4"
 _PARALLEL_MODEL_MINIMUM_FREE_CUDA_BYTES = 8 * 1024 * 1024 * 1024
 
 _Transcript = Annotated[
@@ -219,13 +218,9 @@ class FunASRSpeechPipeline:
         selected_device = select_torch_device(device)
         pipeline = funasr.AutoModel(
             model=FUNASR_ASR_MODEL_ID,
-            model_revision=FUNASR_MODEL_REVISION,
             vad_model=FUNASR_VAD_MODEL_ID,
-            vad_model_revision=FUNASR_MODEL_REVISION,
             punc_model=FUNASR_PUNCTUATION_MODEL_ID,
-            punc_model_revision=FUNASR_MODEL_REVISION,
             spk_model=CAMPPLUS_MODEL.model_id,
-            spk_model_revision=CAMPPLUS_MODEL.revision,
             device=selected_device,
             disable_update=True,
             disable_pbar=True,
@@ -316,7 +311,6 @@ class FunASRStreamingTranscriber:
         selected_device = select_torch_device(device)
         pipeline = funasr.AutoModel(
             model=FUNASR_STREAMING_ASR_MODEL_ID,
-            model_revision=FUNASR_MODEL_REVISION,
             device=selected_device,
             disable_update=True,
             disable_pbar=True,
@@ -705,10 +699,7 @@ def _record_and_resolve_voice_identities(
                 identity_id=voice.identity_id,
                 kind=voice.kind,
                 confidence=voice.confidence,
-                model_reference=ModelReference(
-                    model_id=voice.model_id,
-                    revision=voice.model_revision,
-                ),
+                model_reference=ModelReference(model_id=voice.model_id),
                 enrolled_new=False,
             ),
             association_model_reference=association_model_reference,

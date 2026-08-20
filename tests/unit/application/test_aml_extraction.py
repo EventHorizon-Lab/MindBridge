@@ -21,7 +21,7 @@ class _StubGenerator:
         self.requests.append(request)
         return GenerateResult(
             text=self.text,
-            model_reference=ModelReference(model_id="qwen3.8-max", revision="test"),
+            model_reference=ModelReference(model_id="qwen3.8-max"),
         )
 
 

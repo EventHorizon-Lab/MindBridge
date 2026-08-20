@@ -25,7 +25,7 @@ for a given `persona_id` points at exactly the same `chat_history_32k_link`
 the correct, un-leaky retrieval scope for this release, and `user_id` needs
 no snapshot suffix. `_group_rows` still asserts this invariant per persona
 (raising loudly rather than silently picking one link) so that if a future
-corpus revision does violate it, loading fails fast instead of quietly
+corpus release does violate it, loading fails fast instead of quietly
 leaking one snapshot's content into another's questions.
 
 ### No id column

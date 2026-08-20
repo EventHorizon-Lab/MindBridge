@@ -13,7 +13,7 @@ from mindbridge.infrastructure.postgres import (
 )
 from mindbridge.server import ObjectStorageEnvironment, Settings, create_app
 
-SPACE = EmbeddingSpaceReference(space_id="jina-v5", revision="space-v1")
+SPACE = EmbeddingSpaceReference(space_id="jina-v5")
 
 
 def test_settings_use_deployable_defaults_and_redact_credentials() -> None:
@@ -22,7 +22,6 @@ def test_settings_use_deployable_defaults_and_redact_credentials() -> None:
     assert settings.generator_plugin == "openai"
     assert settings.embedder_plugin == "openai"
     assert settings.generator_config["model_id"] == "qwen3.8-max"
-    assert settings.generator_config["model_revision"] == "deployment-revision"
     assert settings.embedder_config["model_id"] == (
         "jinaai/jina-embeddings-v5-omni-small-retrieval"
     )
@@ -45,14 +44,6 @@ def test_explicit_plugin_json_does_not_require_bundled_provider_variables() -> N
 
     assert settings.generator_config == {"model": "claude"}
     assert settings.embedder_config == {"model": "local"}
-
-
-def test_settings_require_generator_revision_for_bundled_default() -> None:
-    environment = dict(_environment())
-    del environment["MINDBRIDGE_GENERATOR_MODEL_REVISION"]
-
-    with pytest.raises(ValueError, match="MINDBRIDGE_GENERATOR_MODEL_REVISION"):
-        Settings.from_environment(environment)
 
 
 def test_settings_reject_empty_direct_configuration() -> None:
@@ -222,7 +213,6 @@ def _environment() -> dict[str, str]:
         "MINDBRIDGE_TASK_BROKER_URL": "redis://:broker-secret@redis:6379/0",
         "MINDBRIDGE_GENERATOR_API_KEY": "generator-secret",
         "MINDBRIDGE_GENERATOR_ENDPOINT": "https://generator.example.test/v1",
-        "MINDBRIDGE_GENERATOR_MODEL_REVISION": "deployment-revision",
         "MINDBRIDGE_EMBEDDER_API_KEY": "query-secret",
         "MINDBRIDGE_EMBEDDER_ENDPOINT": "https://query.example.test/v1",
         "MINDBRIDGE_TENANT_API_KEYS_JSON": ('{"tenant_01":["tenant-api-key-000000000000000000"]}'),

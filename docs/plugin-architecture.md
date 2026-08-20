@@ -130,8 +130,8 @@ knob to a plugin schema does not widen the deployment surface. `MINDBRIDGE_MEDIA
 the one deliberate exception: it selects hardware rather than model behaviour, and routing it through
 `select_torch_device` turns a missing GPU into a startup failure instead of a silent fall back to CPU.
 
-Both embedding plugins spell the pinned model revision `model_revision` in their configuration
-objects. `PluginConfigModel` sets `extra="forbid"`, so a stale key such as `revision` fails the
+Both embedding plugins spell the model they load `model_id` in their configuration objects.
+`PluginConfigModel` sets `extra="forbid"`, so a stale key such as `model_revision` fails the
 factory at startup rather than being ignored.
 
 Benchmark runners require `--deployment-config`. The referenced JSON records every selected server

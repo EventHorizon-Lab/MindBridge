@@ -48,7 +48,6 @@ class CoreArguments:
     dataset_path: Path
     output_path: Path
     api_base_url: str
-    code_revision: str
     deployment_config_path: Path
     run_id: str
     tenant_prefix: str
@@ -97,9 +96,6 @@ def core_parser(
     )
     parser.add_argument(
         "--api-base-url", required=True, help="base URL of the deployed MindBridge API to measure"
-    )
-    parser.add_argument(
-        "--code-revision", required=True, help="git revision of the code under measurement"
     )
     parser.add_argument(
         "--deployment-config",
@@ -201,7 +197,6 @@ def _core_values(parsed: argparse.Namespace) -> dict[str, object]:
         "dataset_path": parsed.dataset,
         "output_path": parsed.output,
         "api_base_url": parsed.api_base_url,
-        "code_revision": parsed.code_revision,
         "deployment_config_path": parsed.deployment_config,
         "run_id": parsed.run_id,
         "tenant_prefix": parsed.tenant_prefix,
@@ -214,7 +209,7 @@ def _core_values(parsed: argparse.Namespace) -> dict[str, object]:
 
 
 class BenchmarkRunManifest(ContractModel):
-    """Immutable data, deployment, code, and output identity for one benchmark run.
+    """Immutable data, deployment, and output identity for one benchmark run.
 
     Subclasses narrow `benchmark` to their own literal and add the counts they pin.
     Redeclaring an inherited field keeps its position, so `benchmark` stays first in the
@@ -224,7 +219,6 @@ class BenchmarkRunManifest(ContractModel):
     benchmark: NonEmptyString
     runner_version: NonEmptyString
     adapter_version: NonEmptyString
-    code_revision: NonEmptyString
     deployment: DeploymentSnapshot
     deployment_sha256: Sha256Hex
     answer_prompt_version: NonEmptyString
@@ -311,7 +305,6 @@ def _core_manifest_values(
     return {
         "runner_version": runner_version,
         "adapter_version": adapter_version,
-        "code_revision": arguments.code_revision,
         "deployment": deployment.snapshot,
         "deployment_sha256": deployment.sha256,
         "answer_prompt_version": ANSWER_FROM_EVIDENCE_PROMPT.version,

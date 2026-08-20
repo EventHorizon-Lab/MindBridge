@@ -132,7 +132,7 @@ Anonymous by construction — an `identity_id`, never a face or voice template.
 | `kind` | `face` \| `voice` | Gates `transcript` and `visual_bbox_xyxy`. |
 | `start_ms`, `end_ms` | int ≥ 0 | Milliseconds from the observation's start; must fall inside its span. |
 | `confidence` | 0.0–1.0 | The edge detector's own confidence. |
-| `model_id`, `model_revision` | string | Provenance, so a re-identification is reproducible. |
+| `model_id` | string | Provenance: the edge model that produced the span. |
 | `scope` | `device` \| `observation` | Default `device`. |
 | `transcript` | string \| null | `voice` only. All transcripts in one observation ≤ 65,536 characters. |
 | `visual_bbox_xyxy` | 4 floats \| null | `face` only. **0..1 normalized** `(left, top, right, bottom)`, not pixels. Must have positive width and height. |

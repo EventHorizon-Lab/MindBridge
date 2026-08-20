@@ -130,7 +130,6 @@ def test_funasr_loads_registered_integrated_speaker_model(
 
     assert pipeline.device == "cuda"
     assert arguments["spk_model"] == CAMPPLUS_MODEL.model_id
-    assert arguments["spk_model_revision"] == CAMPPLUS_MODEL.revision
 
 
 async def test_funasr_rejects_unrecoverably_untimed_speech(tmp_path: Path) -> None:
@@ -270,7 +269,7 @@ async def test_av_identity_segment_runs_the_complete_revocable_handoff(tmp_path:
 
     class Matcher:
         calls = 0
-        model_reference = ModelReference("test/asd", "1")
+        model_reference = ModelReference("test/asd")
 
         async def match_file(
             self,
@@ -298,7 +297,7 @@ async def test_av_identity_segment_runs_the_complete_revocable_handoff(tmp_path:
                     start_ms=0,
                     end_ms=1_000,
                     confidence=0.9,
-                    model_reference=ModelReference("test/asd", "1"),
+                    model_reference=ModelReference("test/asd"),
                 ),
             )
 
@@ -409,10 +408,7 @@ async def test_visual_active_speaker_returns_revocable_edge_evidence(
     assert evidence[0].face_identity_id == "face_01"
     assert evidence[0].voice_identity_id == "voice_01"
     assert (evidence[0].start_ms, evidence[0].end_ms) == (200, 800)
-    assert evidence[0].model_reference == ModelReference(
-        "qwen3.8-max",
-        "deployment-revision",
-    )
+    assert evidence[0].model_reference == ModelReference("qwen3.8-max")
 
 
 async def test_visual_active_speaker_skips_observation_scoped_voices(tmp_path: Path) -> None:
@@ -421,7 +417,7 @@ async def test_visual_active_speaker_skips_observation_scoped_voices(tmp_path: P
 
     media = tmp_path / "clip.mp4"
     media.write_bytes(b"real-media-placeholder")
-    matcher = _VisualHarness(_generator(fail, revision="revision"))
+    matcher = _VisualHarness(_generator(fail))
     try:
         evidence = await matcher.match_file(
             media,
@@ -531,8 +527,6 @@ def _segmenter(
 
 def _generator(
     handler: Callable[[httpx.Request], Coroutine[None, None, httpx.Response]],
-    *,
-    revision: str = "deployment-revision",
 ) -> OpenAIGenerator:
     return OpenAIGenerator(
         AsyncOpenAI(
@@ -541,7 +535,7 @@ def _generator(
             http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
             max_retries=0,
         ),
-        ModelReference("qwen3.8-max", revision),
+        ModelReference("qwen3.8-max"),
     )
 
 
@@ -558,7 +552,7 @@ class _VisualHarness(VisualActiveSpeakerPipeline):
     def __init__(self, generator: OpenAIGenerator) -> None:
         super().__init__(
             generator,
-            model_reference=ModelReference("qwen3.8-max", "deployment-revision"),
+            model_reference=ModelReference("qwen3.8-max"),
         )
         self._owned_generator = generator
 
@@ -583,7 +577,6 @@ def _identity(
         end_ms=end_ms,
         confidence=0.95,
         model_id="test/model",
-        model_revision="1",
         scope=scope,
         transcript=transcript,
         visual_bbox_xyxy=bbox,
