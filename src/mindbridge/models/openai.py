@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import PurePosixPath
@@ -16,7 +17,7 @@ from openai import AsyncOpenAI, AsyncStream, Omit, omit
 from openai.types.chat import ChatCompletionChunk, ChatCompletionMessageParam
 from openai.types.create_embedding_response import CreateEmbeddingResponse
 from openai.types.shared import ReasoningEffort
-from openai.types.shared_params import ResponseFormatJSONObject
+from openai.types.shared_params import ResponseFormatJSONObject, ResponseFormatJSONSchema
 
 from mindbridge.application.capabilities import (
     Embedding,
@@ -50,11 +51,19 @@ from mindbridge.models.defaults import (
     DEFAULT_GENERATOR_REQUEST_TIMEOUT_SECONDS,
     MatryoshkaDimension,
 )
-from mindbridge.telemetry import operation_span, set_current_span_attributes
+from mindbridge.telemetry import log_fields, logger, operation_span, set_current_span_attributes
 
 DEFAULT_VIDEO_FRAMES_PER_SECOND = 1.0
 DEFAULT_VIDEO_MAX_PIXELS = 200_704
 REASONING_EFFORT_VALUES = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+_LOGGER = logger("mindbridge.models.openai")
+_SCHEMA_REJECTION_MARKERS = ("response_format", "json_schema", "guided", "structured output")
+"""What a provider says when it cannot compile a schema rather than when the request is bad.
+
+A 400 is normally permanent, so an endpoint predating schema support would fail every
+observation outright. Matching its complaint is what turns that into one warning and a
+fallback; the markers are narrow so an ordinary bad request is still reported as one.
+"""
 
 
 class OpenAIGenerator:
@@ -82,6 +91,7 @@ class OpenAIGenerator:
         self._reasoning_effort = reasoning_effort
         self._video_frames_per_second = video_frames_per_second
         self._video_max_pixels = video_max_pixels
+        self._schema_decoding_supported = True
 
     @classmethod
     def connect(
@@ -118,6 +128,7 @@ class OpenAIGenerator:
     @operation_span("mindbridge.model.generate")
     async def generate(self, request: GenerateRequest) -> GenerateResult:
         """Stream one deterministic text result and normalize provider failures."""
+        constrained = request.output_schema is not None and self._schema_decoding_supported
         set_current_span_attributes(
             {
                 "mindbridge.model.id": self._model_reference.model_id,
@@ -127,10 +138,8 @@ class OpenAIGenerator:
                     isinstance(part, MediaPart) for part in request.input.parts
                 ),
                 "mindbridge.model.json_mode": request.json_mode,
+                "mindbridge.model.schema_constrained": constrained,
             }
-        )
-        response_format: ResponseFormatJSONObject | Omit = (
-            {"type": "json_object"} if request.json_mode else omit
         )
         messages = cast(
             list[ChatCompletionMessageParam],
@@ -149,21 +158,7 @@ class OpenAIGenerator:
         )
         request_started_at = perf_counter()
         try:
-            stream = await self._client.chat.completions.create(
-                model=self._model_reference.model_id,
-                messages=messages,
-                modalities=["text"],
-                max_tokens=request.max_output_tokens,
-                response_format=response_format,
-                reasoning_effort=(
-                    self._reasoning_effort if self._reasoning_effort is not None else omit
-                ),
-                temperature=0.0,
-                stream=True,
-                stream_options={"include_usage": True},
-                timeout=self._request_timeout_seconds,
-            )
-            completion = await _consume_completion_stream(stream)
+            completion = await self._complete(request, messages, constrained=constrained)
         except openai.APIError as error:
             _raise_model_error(error, "generation request failed")
         except httpx.HTTPError as error:
@@ -190,6 +185,57 @@ class OpenAIGenerator:
 
     async def close(self) -> None:
         await self._client.close()
+
+    async def _complete(
+        self,
+        request: GenerateRequest,
+        messages: list[ChatCompletionMessageParam],
+        *,
+        constrained: bool,
+    ) -> _StreamedCompletion:
+        """Stream one completion, degrading once if this endpoint cannot compile a schema."""
+        try:
+            return await self._stream(request, messages, constrained=constrained)
+        except openai.BadRequestError as error:
+            if not constrained or not _rejects_schema_decoding(error):
+                raise
+            # Latched for the process, not retried per call: an endpoint that cannot compile
+            # a schema will not learn to, and paying a rejected request per generation to
+            # rediscover that is the cost this flag exists to avoid.
+            self._schema_decoding_supported = False
+            set_current_span_attributes({"mindbridge.model.schema_constrained": False})
+            _LOGGER.warning(
+                "endpoint rejected schema-constrained decoding, falling back to JSON mode",
+                extra=log_fields(
+                    model_id=self._model_reference.model_id,
+                    schema=request.output_schema.name if request.output_schema else None,
+                    status_code=error.status_code,
+                ),
+            )
+        return await self._stream(request, messages, constrained=False)
+
+    async def _stream(
+        self,
+        request: GenerateRequest,
+        messages: list[ChatCompletionMessageParam],
+        *,
+        constrained: bool,
+    ) -> _StreamedCompletion:
+        stream = await self._client.chat.completions.create(
+            model=self._model_reference.model_id,
+            messages=messages,
+            modalities=["text"],
+            max_tokens=request.max_output_tokens,
+            response_format=_response_format(request, constrained=constrained),
+            reasoning_effort=(
+                self._reasoning_effort if self._reasoning_effort is not None else omit
+            ),
+            temperature=0.0,
+            stream=True,
+            stream_options={"include_usage": True},
+            timeout=self._request_timeout_seconds,
+        )
+        return await _consume_completion_stream(stream)
 
 
 class OpenAIEmbedder:
@@ -512,6 +558,31 @@ def _content_parts(
     return content
 
 
+def _response_format(
+    request: GenerateRequest,
+    *,
+    constrained: bool,
+) -> ResponseFormatJSONSchema | ResponseFormatJSONObject | Omit:
+    """Ask for the strongest output contract this request and endpoint both support."""
+    schema = request.output_schema
+    if constrained and schema is not None:
+        return {
+            "type": "json_schema",
+            "json_schema": {
+                "name": schema.name,
+                "schema": cast(dict[str, object], json.loads(schema.json_schema)),
+                "strict": True,
+            },
+        }
+    return {"type": "json_object"} if request.json_mode or schema is not None else omit
+
+
+def _rejects_schema_decoding(error: openai.BadRequestError) -> bool:
+    """Tell a provider without schema support apart from a request that is simply invalid."""
+    message = str(error).casefold()
+    return any(marker in message for marker in _SCHEMA_REJECTION_MARKERS)
+
+
 def _text_only(input_value: ModelInput) -> str | None:
     return (
         input_value.parts[0].text
@@ -556,9 +627,20 @@ def _embedding_vectors(
 
 
 def _raise_model_error(error: openai.APIError, message: str) -> None:
-    if isinstance(error, openai.APIConnectionError) or (
+    transient = isinstance(error, openai.APIConnectionError) or (
         isinstance(error, openai.APIStatusError)
         and (error.status_code in {408, 409, 429} or error.status_code >= 500)
-    ):
+    )
+    # This classification decides whether a long run retries or dies, and both outcomes
+    # otherwise reach the operator as the same one-line message with the status code gone.
+    _LOGGER.warning(
+        "provider request failed",
+        extra=log_fields(
+            error_type=type(error).__name__,
+            status_code=getattr(error, "status_code", None),
+            retryable=transient,
+        ),
+    )
+    if transient:
         raise ModelUnavailableError(message) from error
     raise ModelRequestError(message) from error

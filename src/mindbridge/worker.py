@@ -71,7 +71,7 @@ from mindbridge.models.defaults import (
     openai_generator_config,
 )
 from mindbridge.models.plugins import close_model, load_embedder, load_generator
-from mindbridge.telemetry import configure_telemetry
+from mindbridge.telemetry import configure_observability
 
 _MODEL_REQUEST_TIMEOUT_SECONDS = 780.0
 _POST_MODEL_BUDGET_SECONDS = 300.0
@@ -86,13 +86,15 @@ _RUNNING_RETRY_SECONDS = 30
 _RUNNING_MAX_RETRIES = 40
 _TRANSIENT_MAX_RETRIES = 5
 _RUNNING_RETRIES_HEADER = "mindbridge_running_retries"
+DEFAULT_WORKER_CONCURRENCY = 1
+MAXIMUM_WORKER_CONCURRENCY = 32
 
 
 @worker_process_init.connect(weak=False)  # type: ignore[untyped-decorator]
 def _configure_worker_telemetry(**_kwargs: object) -> None:
-    """Initialize exporters after Celery forks its process-safe worker child."""
+    """Initialize logging and exporters after Celery forks its process-safe worker child."""
     _dispose_worker_runtime()
-    configure_telemetry("mindbridge-worker")
+    configure_observability("mindbridge-worker")
 
 
 class _TaskRequest(Protocol):
@@ -128,6 +130,20 @@ class WorkerSettings:
     text_embedder_plugin: str = "openai"
     embedding_dimension: int = DEFAULT_EMBEDDING_DIMENSION
     clip_sampling: ClipSampling = field(default_factory=ClipSampling)
+    worker_concurrency: int = DEFAULT_WORKER_CONCURRENCY
+    """How many observations this worker may have in flight at once.
+
+    One observation is one model call and then some encoding, so a worker against remote
+    model endpoints spends most of its budget waiting on the network and a concurrency of one
+    leaves that capacity unused. Raising it is the single largest throughput lever a
+    deployment has.
+
+    It defaults to one because the ceiling is not the network in every deployment: Celery's
+    prefork pool builds the media embedder once per child, so a worker whose embedder plugin
+    loads the model in-process multiplies device memory by this number rather than
+    overlapping anything. Raise it when the models are served over the network, and remember
+    that each child opens its own database pool -- see MINDBRIDGE_DATABASE_MAX_POOL_SIZE.
+    """
 
     def __post_init__(self) -> None:
         for name, value in (
@@ -136,6 +152,11 @@ class WorkerSettings:
         ):
             if not value.strip():
                 raise ValueError(f"{name} must not be empty")
+        if not 1 <= self.worker_concurrency <= MAXIMUM_WORKER_CONCURRENCY:
+            raise ValueError(
+                "worker_concurrency must be between 1 and "
+                f"{MAXIMUM_WORKER_CONCURRENCY}, not {self.worker_concurrency}"
+            )
         for name, value in (
             ("generator_plugin", self.generator_plugin),
             ("media_embedder_plugin", self.media_embedder_plugin),
@@ -196,6 +217,7 @@ class WorkerSettings:
             ),
             embedding_dimension=embedding_dimension_from_environment(source),
             clip_sampling=_clip_sampling_from_environment(source),
+            worker_concurrency=_worker_concurrency_from_environment(source),
         )
 
 
@@ -211,6 +233,17 @@ class _MediaSamplingConfig(PluginConfigModel):
     max_pixels: Annotated[PluginInteger, Field(gt=0)] = DEFAULT_VIDEO_MAX_PIXELS
     image_max_pixels: Annotated[PluginInteger, Field(gt=0)] = DEFAULT_IMAGE_MAX_PIXELS
     generation_proxy: StrictBool = True
+
+
+def _worker_concurrency_from_environment(source: Mapping[str, str]) -> int:
+    """Read the one knob that decides whether a network-bound worker sits idle."""
+    raw = optional_environment_value(source, "MINDBRIDGE_WORKER_CONCURRENCY")
+    if raw is None:
+        return DEFAULT_WORKER_CONCURRENCY
+    try:
+        return int(raw)
+    except ValueError as error:
+        raise ValueError("MINDBRIDGE_WORKER_CONCURRENCY must be an integer") from error
 
 
 def _clip_sampling_from_environment(source: Mapping[str, str]) -> ClipSampling:
@@ -294,7 +327,10 @@ def create_worker_app(settings: WorkerSettings) -> Celery:
         settings.task_broker_url,
         processing_budget_seconds=processing_budget_seconds(settings.generator_config),
     )
-    task_queue.conf.update(worker_concurrency=1, worker_pool="prefork")
+    task_queue.conf.update(
+        worker_concurrency=settings.worker_concurrency,
+        worker_pool="prefork",
+    )
 
     @task_queue.task(  # type: ignore[untyped-decorator]
         name=PROCESS_OBSERVATION_TASK,

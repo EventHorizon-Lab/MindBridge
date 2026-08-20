@@ -18,7 +18,11 @@ from mindbridge.application.capabilities import GenerateRequest, Generator, Mode
 from mindbridge.application.claim_consolidation import ClaimCandidate
 from mindbridge.application.perception import ResolvedEvidence
 from mindbridge.application.pipelines.evidence import evidence_parts
-from mindbridge.application.pipelines.structured import generate_json, unwrap_json_code_fence
+from mindbridge.application.pipelines.structured import (
+    generate_json,
+    output_schema,
+    unwrap_json_code_fence,
+)
 from mindbridge.application.semantic_claims import (
     ClaimConsolidation,
     ClaimRelationshipProposal,
@@ -91,6 +95,9 @@ class _ConsolidationOutput(BaseModel):
         return self
 
 
+_CLAIM_CONSOLIDATION_SCHEMA = output_schema("claim_consolidation", _ConsolidationOutput)
+
+
 class ClaimPipeline:
     """Turn a Generator into evidence-first semantic claim verification."""
 
@@ -126,6 +133,7 @@ class ClaimPipeline:
                     )
                 ),
                 max_output_tokens=self._max_output_tokens,
+                output_schema=_CLAIM_CONSOLIDATION_SCHEMA,
             ),
             lambda content: _parse_output(content, candidates),
         )

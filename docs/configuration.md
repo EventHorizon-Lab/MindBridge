@@ -22,9 +22,13 @@ fails to start rather than failing one call an hour later.
 | `MINDBRIDGE_EMBEDDING_*` | ○ | ○ | ○ | ○ | | |
 | `MINDBRIDGE_MEDIA_EMBEDDER_*` | | | ○ | | | |
 | `MINDBRIDGE_MEDIA_SAMPLING_CONFIG_JSON` | | | ○ | | | |
+| `MINDBRIDGE_WORKER_CONCURRENCY` | | | ○ | | | |
 | `MINDBRIDGE_TENANT_API_KEYS_JSON` | ● | | | | | |
 | `MINDBRIDGE_API_KEY` | | | | | | ● |
 | `MINDBRIDGE_AML_*` | ○ | | | | | |
+| `MINDBRIDGE_LOG_LEVEL` | ○ | ○ | ○ | ○ | ○ | ○ |
+| `MINDBRIDGE_LOG_FORMAT` | ○ | ○ | ○ | ○ | ○ | ○ |
+| `MINDBRIDGE_TIMING_SUMMARY` | ○ | ○ | ○ | ○ | ○ | ○ |
 
 ● required ○ optional ◐ required only with `--reclaim-orphan-clips`
 
@@ -283,10 +287,61 @@ deleted when it returns, including on a failed attempt: nothing registers it, so
 cited as provenance, and leaving it behind would put a re-encoded copy of an observation's
 picture and speech beyond the reach of `forget()`.
 
+## Worker throughput
+
+`MINDBRIDGE_WORKER_CONCURRENCY` is optional and defaults to **1**: how many observations one
+worker may have in flight at once.
+
+One observation is one model call and then some encoding, so a worker against remote model
+endpoints spends most of its budget waiting on the network. At the default it waits on one
+observation at a time, which is the single largest throughput lever a deployment has.
+
+It defaults to 1 because the ceiling is not the network in every deployment. Celery's prefork
+pool builds the media embedder once per child, so:
+
+- **Models served over the network** (an OpenAI-compatible endpoint for the media embedder):
+  raise it. Each child holds HTTP clients, not weights.
+- **A media embedder that loads its model in-process** (the bundled `jina` plugin): this
+  multiplies device memory rather than overlapping anything. Leave it at 1 and add worker
+  processes on separate hosts instead.
+
+Each child also opens its own database pool, so `MINDBRIDGE_DATABASE_MAX_POOL_SIZE` is a
+per-child ceiling here, not a per-deployment one. Values outside 1–32, and anything that is not
+an integer, fail startup rather than being clamped.
+
+## Logs and timings
+
+Every process writes structured logs to stderr. This is unconditional and needs no collector:
+each instrumented operation logs its own duration and outcome on completion, so the read and
+write paths are attributable from `docker logs` alone.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `MINDBRIDGE_LOG_LEVEL` | `INFO` | Standard level name. `WARNING` silences the per-operation stream and keeps failures. |
+| `MINDBRIDGE_LOG_FORMAT` | auto | `json` for a log shipper, `text` for a terminal. Unset picks `text` on a TTY and `json` otherwise. |
+| `MINDBRIDGE_TIMING_SUMMARY` | unset | Set `1` to log a ranked per-operation cost summary at process exit. |
+
+An unusable level or format fails startup; falling back silently to `INFO` is worse to debug
+than refusing to start.
+
+Each record carries `operation`, `duration_ms`, `self_ms`, `outcome`, and — whenever a span is
+active — `trace_id` and `span_id`, so a reported `trace_id` joins the logs to the trace. Only
+the MindBridge logger namespace is configured, never the root logger: this package is embedded
+as a library as well as run as a service.
+
+`MINDBRIDGE_TIMING_SUMMARY=1` is the answer to "where did the time go". It emits one row per
+operation, ranked by **self time** — duration minus nested instrumented operations — because
+ranked by total time the outermost operation always wins and explains nothing. An operation that
+only gathers others reports near-zero self time by construction; that is the intended reading,
+not a missing measurement.
+
+`mindbridge-bench` logs that summary at the end of every run, successful or not, without the
+variable: a measurement run's own cost breakdown is part of its result.
+
 ## Telemetry
 
 OpenTelemetry activates only when a standard common or signal-specific OTLP endpoint is set.
-Without one it stays a no-op.
+Without one it stays a no-op — but the logs above do not depend on it.
 
 | Variable | Purpose |
 | --- | --- |

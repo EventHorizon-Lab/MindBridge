@@ -55,7 +55,7 @@ from mindbridge.models.defaults import (
     require_matryoshka_dimension,
 )
 from mindbridge.models.plugins import close_model, load_embedder, load_generator
-from mindbridge.telemetry import configure_telemetry
+from mindbridge.telemetry import configure_observability
 
 CONSOLIDATION_ENVIRONMENT = """environment:
   MINDBRIDGE_DATABASE_URL           PostgreSQL DSN (required). Read from the environment
@@ -136,7 +136,7 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
     """Run one tenant sweep using only explicit process configuration."""
     options = _parser(prog).parse_args(argv)
     # Configured after parsing so --help and a rejected flag stay side-effect free.
-    configure_telemetry("mindbridge-consolidation")
+    configure_observability("mindbridge-consolidation")
     summary = asyncio.run(
         _run_postgres_sweep(
             ConsolidationSettings.from_environment(),

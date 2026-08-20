@@ -501,6 +501,39 @@ async def test_generation_proxy_is_dropped_when_it_would_not_shrink_the_source()
     assert resolved[0].media_url == "https://objects.example.test/media_video_01.mp4"
 
 
+async def test_a_skipped_generation_proxy_says_so_where_an_operator_will_see_it(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Perception still succeeds on the untouched source, so the downgrade is invisible.
+
+    A media path that quietly falls back is the failure mode this project has already paid
+    for once. Recording the reason only as a span attribute means nobody without a collector
+    can tell a working deployment from a degraded one.
+    """
+    store = RecordingStore()
+
+    with caplog.at_level("WARNING", logger="mindbridge.application.evidence_clips"):
+        async with generation_proxies(
+            TENANT_ID,
+            (_video_evidence("evidence_video_01", 0, 30_000),),
+            store=store,
+            sampling=ClipSampling(),
+            cut=_refusing_cut,
+            scope="job_01:1",
+        ) as resolved:
+            pass
+
+    assert resolved[0].media_url == "https://objects.example.test/media_video_01.mp4"
+    (record,) = caplog.records
+    assert record.mindbridge_fields["reason"] == "ValueError"  # type: ignore[attr-defined]
+    assert record.mindbridge_fields["media_object_id"] == "media_video_01"  # type: ignore[attr-defined]
+
+
+def _refusing_cut(source: bytes, request: object) -> MediaClip:
+    """Stand in for the muxer refusing a span it will not interleave."""
+    raise ValueError("cannot interleave a sparse video track with this audio track")
+
+
 async def test_generation_proxy_leaves_non_video_evidence_untouched() -> None:
     """Audio and images are already small; a second encode is pure loss."""
     store = RecordingStore()

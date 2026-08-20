@@ -61,10 +61,14 @@ from mindbridge.media.clipping import (
     cut_generation_proxy,
 )
 from mindbridge.telemetry import (
+    log_fields,
+    logger,
     operation_span,
     record_stage_duration,
     set_current_span_attributes,
 )
+
+_LOGGER = logger("mindbridge.application.process_observation")
 
 
 class ProcessObservation:
@@ -236,12 +240,28 @@ class ProcessObservation:
             record_stage_duration("cloud.job_to_searchable_ready", ready_seconds)
             return completed
         except Exception as error:
+            error_code = _processing_error_code(error)
+            # The code is what decides whether Celery retries this attempt or settles it, and
+            # it is written to the job row rather than raised, so without this line the
+            # operator sees a failed observation and has to query the store to learn why.
+            _LOGGER.warning(
+                "observation processing attempt failed",
+                extra=log_fields(
+                    tenant_id=tenant_id,
+                    observation_id=observation_id,
+                    job_id=job_id,
+                    attempt=claim.job.attempt,
+                    error_code=error_code,
+                    error_type=type(error).__name__,
+                    error=str(error),
+                ),
+            )
             await self._store.mark_observation_processing_failed(
                 tenant_id,
                 observation_id,
                 job_id,
                 attempt=claim.job.attempt,
-                error_code=_processing_error_code(error),
+                error_code=error_code,
             )
             raise
 

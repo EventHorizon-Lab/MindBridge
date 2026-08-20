@@ -8,6 +8,7 @@ import httpx
 import pytest
 from openai import AsyncOpenAI
 
+from mindbridge.application.capabilities import OutputSchema
 from mindbridge.core import (
     EmbeddingSpaceReference,
     MediaKind,
@@ -268,6 +269,116 @@ async def test_generation_reports_the_configured_deployment_revision() -> None:
     assert result.model_reference == ModelReference(
         model_id="qwen3.8-max",
         revision="pinned-generator-revision",
+    )
+
+
+async def test_schema_constrained_generation_asks_for_the_named_shape() -> None:
+    formats: list[object] = []
+
+    async def respond(request: httpx.Request) -> httpx.Response:
+        formats.append(cast(dict[str, object], json.loads(request.content))["response_format"])
+        return _completion_response("serving-fingerprint-01")
+
+    generator = _generator(respond)
+    try:
+        await generator.generate(_schema_request())
+    finally:
+        await generator.close()
+
+    assert formats == [
+        {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "verdict",
+                "schema": {
+                    "additionalProperties": False,
+                    "properties": {"ok": {"type": "boolean"}},
+                    "required": ["ok"],
+                    "type": "object",
+                },
+                "strict": True,
+            },
+        }
+    ]
+
+
+async def test_an_endpoint_without_schema_support_degrades_once_and_stays_degraded() -> None:
+    """A 400 is otherwise permanent, so an older endpoint would fail every observation.
+
+    The capability is latched for the process: rediscovering it costs one rejected request
+    per generation, and an endpoint that cannot compile a schema will not start to.
+    """
+    formats: list[object] = []
+
+    async def respond(request: httpx.Request) -> httpx.Response:
+        response_format = cast(dict[str, object], json.loads(request.content))["response_format"]
+        formats.append(response_format)
+        if cast(dict[str, object], response_format)["type"] == "json_schema":
+            return httpx.Response(
+                400,
+                json={
+                    "error": {
+                        "message": "response_format json_schema is not supported",
+                        "type": "invalid_request_error",
+                    }
+                },
+            )
+        return _completion_response("serving-fingerprint-01")
+
+    generator = _generator(respond)
+    try:
+        first = await generator.generate(_schema_request())
+        second = await generator.generate(_schema_request())
+    finally:
+        await generator.close()
+
+    assert first.text == second.text == "on the workbench"
+    assert [cast(dict[str, object], item)["type"] for item in formats] == [
+        "json_schema",
+        "json_object",
+        "json_object",
+    ]
+
+
+async def test_an_ordinary_bad_request_is_not_mistaken_for_missing_schema_support() -> None:
+    """Falling back on any 400 would silently pay for a second call on every real failure."""
+    attempts = 0
+
+    async def respond(_request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        return httpx.Response(
+            400,
+            json={"error": {"message": "image exceeds the pixel budget", "type": "invalid"}},
+        )
+
+    generator = _generator(respond)
+    try:
+        with pytest.raises(ModelRequestError, match="generation request failed"):
+            await generator.generate(_schema_request())
+    finally:
+        await generator.close()
+
+    assert attempts == 1
+
+
+def _schema_request() -> GenerateRequest:
+    return GenerateRequest(
+        system_prompt="Answer from evidence.",
+        input=ModelInput((TextPart("where is the tool?"),)),
+        max_output_tokens=64,
+        output_schema=OutputSchema(
+            name="verdict",
+            json_schema=json.dumps(
+                {
+                    "additionalProperties": False,
+                    "properties": {"ok": {"type": "boolean"}},
+                    "required": ["ok"],
+                    "type": "object",
+                },
+                sort_keys=True,
+            ),
+        ),
     )
 
 

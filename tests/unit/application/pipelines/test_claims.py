@@ -160,7 +160,7 @@ async def test_claim_consolidator_retries_invalid_structure_in_json_mode() -> No
 
     async def respond(request: httpx.Request) -> httpx.Response:
         payload: dict[str, object] = json.loads(request.content)
-        response_formats.append(payload.get("response_format"))
+        response_formats.append(_schema_name(payload))
         return _streaming_response(next(responses))
 
     consolidator = _consolidator(respond)
@@ -170,7 +170,7 @@ async def test_claim_consolidator_retries_invalid_structure_in_json_mode() -> No
         await consolidator.close()
 
     assert result.semantic_claims == ()
-    assert response_formats == [None, {"type": "json_object"}]
+    assert response_formats == ["claim_consolidation", "claim_consolidation"]
 
 
 def _consolidator(
@@ -268,6 +268,16 @@ def _evidence(index: int, kind: MediaKind) -> ResolvedEvidence:
         media_url=f"https://objects.example.test/clip_{suffix}.{extension}",
         media_url_expires_at=NOW + timedelta(minutes=5),
     )
+
+
+def _schema_name(payload: dict[str, object]) -> str | None:
+    """Return the schema one request constrained decoding to, or None when unconstrained."""
+    response_format = payload.get("response_format")
+    if not isinstance(response_format, dict) or response_format.get("type") != "json_schema":
+        return None
+    schema = cast(dict[str, object], response_format["json_schema"])
+    assert schema["strict"] is True
+    return cast(str, schema["name"])
 
 
 def _streaming_response(payload: object, *, fingerprint: str | None = None) -> httpx.Response:
