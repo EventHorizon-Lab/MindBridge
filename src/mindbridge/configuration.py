@@ -24,11 +24,24 @@ else:  # pragma: no cover - the 3.10 floor, which the mypy pin is the one that s
     import tomli as tomllib
 
 
+class MissingConfigurationError(ValueError):
+    """Raised when a required setting is absent, carrying the variable it names.
+
+    A `ValueError` subclass so every existing caller and test keeps working, and named so the
+    pre-flight report can learn a role's requirements from the role itself instead of from a
+    table here that would drift away from it.
+    """
+
+    def __init__(self, name: str) -> None:
+        super().__init__(f"{name} must be configured")
+        self.name = name
+
+
 def require_environment_value(environ: Mapping[str, str], name: str) -> str:
     """Return one non-blank required value without logging its contents."""
     value = environ.get(name)
     if value is None or not value.strip():
-        raise ValueError(f"{name} must be configured")
+        raise MissingConfigurationError(name)
     return value
 
 

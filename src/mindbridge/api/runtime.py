@@ -19,6 +19,7 @@ from mindbridge.application.kernel import MemoryKernel
 from mindbridge.application.pipelines import AnswerPipeline, OccurrencePipeline
 from mindbridge.cli import parser as build_parser
 from mindbridge.configuration import (
+    MissingConfigurationError,
     configuration_source,
     copy_plugin_configuration,
     optional_environment_value,
@@ -196,12 +197,23 @@ class _Runtime:
             yield
 
 
+def require_rest_authentication(settings: Settings) -> str:
+    """The tenant key map the REST surface refuses to build without.
+
+    There is no anonymous mode; only `/healthz` is public. `Settings` keeps the field optional
+    because the MCP surface does not read it, so the requirement belongs to this surface -- and
+    it lives in one function so `mindbridge config check` reports it from the same definition
+    `create_app` enforces, rather than from a second copy that could fall behind.
+    """
+    if settings.tenant_api_keys_json is None:
+        raise MissingConfigurationError("MINDBRIDGE_TENANT_API_KEYS_JSON")
+    return settings.tenant_api_keys_json
+
+
 def create_app(settings: Settings | None = None) -> FastAPI:
     """Create the deployable REST application."""
     resolved = settings or Settings.from_environment()
-    if resolved.tenant_api_keys_json is None:
-        raise ValueError("MINDBRIDGE_TENANT_API_KEYS_JSON must be configured for the REST API")
-    authenticator = TenantApiKeyAuthenticator.from_json(resolved.tenant_api_keys_json)
+    authenticator = TenantApiKeyAuthenticator.from_json(require_rest_authentication(resolved))
     runtime = _build_runtime(resolved)
     telemetry = configure_telemetry("mindbridge-api")
 

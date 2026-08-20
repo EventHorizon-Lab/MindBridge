@@ -188,7 +188,19 @@ def _imported_modules(path: Path) -> set[str]:
 # belongs to exactly one of them, so a new module without a scenario fails the partition test
 # below rather than quietly relying on whatever extra a developer happened to have synced.
 SCENARIOS: dict[str, tuple[str, ...]] = {
-    "": ("__init__", "configuration", "contracts", "core", "file_integrity", "prompts", "sdk"),
+    # config_cli is core, not server: `mindbridge config check` has to run on a bare install,
+    # which is exactly the state an operator runs it from. Its heavy imports are deferred into
+    # `_settings_probe`, so nothing but stdlib and the base dependencies loads eagerly.
+    "": (
+        "__init__",
+        "config_cli",
+        "configuration",
+        "contracts",
+        "core",
+        "file_integrity",
+        "prompts",
+        "sdk",
+    ),
     "edge": ("edge",),
     "server": (
         "api",
