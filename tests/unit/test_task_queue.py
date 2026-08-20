@@ -3,7 +3,7 @@
 from unittest.mock import Mock
 
 import pytest
-from kombu.exceptions import (
+from celery.exceptions import (
     OperationalError,
 )
 

@@ -20,15 +20,25 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # `probe` names the modules each install is responsible for, and
+          # tests/test_package.py holds these rows to the same table the declaration checks
+          # use. One module per scenario was not enough: importing `mindbridge.api.runtime`
+          # said nothing about the benchmark harness, whose own extra could not import it.
           - name: core
             requirement: .
-            imports: import mindbridge.sdk
+            probe: configuration contracts core file_integrity prompts sdk
           - name: edge
             requirement: .[edge]
-            imports: import mindbridge.edge.identity_diarization
+            probe: edge
           - name: server
             requirement: .[server]
-            imports: import mindbridge.api.runtime
+            probe: api application celery_app cli consolidation_cli infrastructure lifecycle_cli models server telemetry worker
+          - name: benchmarks
+            requirement: .[benchmarks]
+            probe: benchmarks
+          - name: media
+            requirement: .[media]
+            probe: media
     steps:
       - name: Check out repository
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
@@ -43,7 +53,45 @@ jobs:
         run: |
           uv venv .install-venv
           uv pip install --python .install-venv/bin/python --strict '${{ matrix.requirement }}'
-          .install-venv/bin/python -Ic '${{ matrix.imports }}'
+
+      - name: Import everything the install is responsible for
+        env:
+          PROBE: ${{ matrix.probe }}
+        run: |
+          .install-venv/bin/python -I - <<'PROBE_SCRIPT'
+          import importlib
+          import os
+          import pkgutil
+          import sys
+
+          import mindbridge
+
+          wanted = tuple(f"mindbridge.{name}" for name in os.environ["PROBE"].split())
+          found = sorted(
+              name
+              for _, name, _ in pkgutil.walk_packages(mindbridge.__path__, "mindbridge.")
+              if any(name == prefix or name.startswith(f"{prefix}.") for prefix in wanted)
+          )
+          failed = []
+          for name in found:
+              try:
+                  importlib.import_module(name)
+              except ImportError as error:
+                  failed.append(f"{name}: {error}")
+              except Exception:
+                  # Importing a module runs it, and the worker entry point builds its Celery
+                  # app from the environment as it loads. Anything that is not a missing
+                  # import is configuration, not packaging, so it is not this job's business.
+                  pass
+          print(f"imported {len(found)} modules under {' '.join(wanted)}")
+          for line in failed:
+              print(f"  FAILED {line}")
+          if not found:
+              # A probe that matched nothing reports success while checking nothing, which is
+              # how a renamed module would leave this job green.
+              sys.exit("probe matched no modules")
+          sys.exit(bool(failed))
+          PROBE_SCRIPT
 
   documentation:
     name: Documentation

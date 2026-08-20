@@ -6,7 +6,7 @@ import asyncio
 from typing import Annotated
 
 from celery import Celery
-from kombu.exceptions import (
+from celery.exceptions import (
     OperationalError,
 )
 from pydantic import BaseModel, ConfigDict, StringConstraints

@@ -10,10 +10,10 @@ from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
 from typing import Annotated, NoReturn, Protocol
 
-from billiard.exceptions import (
+from celery import Celery
+from celery.exceptions import (
     SoftTimeLimitExceeded,
 )
-from celery import Celery
 from celery.signals import (
     worker_process_init,
     worker_process_shutdown,

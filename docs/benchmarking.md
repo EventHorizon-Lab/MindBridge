@@ -67,6 +67,11 @@ uv run mindbridge-bench
 uv run mindbridge-bench m3 --help
 ```
 
+Most runners need nothing past the core install because they drive the product through its own
+API. `video-mme` and `datasets` need `--extra benchmarks`; `jina` and `bakeoff` load the local
+embedder and need `--extra cloud-models`. A runner whose extra is missing names it and exits
+instead of failing part-way through a run.
+
 Runners need a live API and a bearer token in `MINDBRIDGE_API_KEY`. Every generated tenant ID must
 be in the deployment's `MINDBRIDGE_TENANT_API_KEYS_JSON` **before** the API starts — one key can
 authorize all of them.
