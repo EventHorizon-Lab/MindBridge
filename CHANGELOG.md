@@ -46,13 +46,31 @@ The capabilities present on `master` today:
 
 - Multi-tenant isolation through forced PostgreSQL row-level security plus API-key allowlists.
 - Model plugin architecture over `importlib.metadata` entry points; models are frozen.
-- Versioned embedding spaces with a startup probe that refuses to serve a stranded tenant.
+- Embedding spaces with a startup probe that refuses to serve a stranded tenant.
 - Platform-neutral edge path with on-device anonymous identity, an encrypted local store, a
   durable outbox, and offline recall.
 - OpenTelemetry across REST, model calls, PostgreSQL, S3, and queued jobs, capturing no user
   content.
 - Benchmark harness driving the production API across nine official datasets plus the Agent
   Memory Leaderboard offline replay.
+
+### Upgrading an existing deployment
+
+Called out on their own because these are the changes that cost an operator real work.
+
+- **Migration `0021`** drops `model_revision` from `events`, `claims`, `memory_records`, and
+  `embeddings`, and `space_revision` from `embeddings`. No manual step: it recreates the unique key
+  and both embedding-space indexes without those columns, deletes the later of any two vectors that
+  differed only by revision, and strips the retired key from stored identity spans.
+- **Removed environment variables:** `MINDBRIDGE_GENERATOR_MODEL_REVISION`, which was *required*,
+  plus the optional `MINDBRIDGE_EMBEDDER_MODEL_REVISION`,
+  `MINDBRIDGE_MEDIA_EMBEDDER_MODEL_REVISION`, and `MINDBRIDGE_EMBEDDING_SPACE_REVISION`. A
+  `*_CONFIG_JSON` object still naming `model_revision` or `space_revision` fails startup rather
+  than ignoring the key.
+- **`POST /v1/observations` no longer accepts `model_revision`** inside `identity_observations`,
+  and the same field is gone from the `observe` MCP tool. It was a required field, and unknown
+  fields are rejected, so a device still sending it now gets `request_validation_failed` — upgrade
+  the edge alongside the server.
 
 ### Known gaps
 
