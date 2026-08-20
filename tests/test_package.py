@@ -277,7 +277,12 @@ by Jina Omni's own Qwen3-VL processor, which swallows the ImportError and embeds
 
 @cache
 def _pyproject() -> dict[str, Any]:
-    return tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    # The annotation is load-bearing, not decoration. mypy runs as 3.10 and so always reads
+    # the `import tomli as tomllib` branch, but the backport is only installed under that
+    # marker, so on 3.11 the import is unresolved, `ignore_missing_imports` makes `loads`
+    # return `Any`, and returning that straight out trips `no-any-return` on half the matrix.
+    parsed: dict[str, Any] = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    return parsed
 
 
 @cache
