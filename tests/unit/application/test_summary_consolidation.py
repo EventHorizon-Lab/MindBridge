@@ -111,7 +111,7 @@ async def test_summary_consolidation_builds_verified_and_attested_hierarchy() ->
                 salience=0.7,
             ),
         ),
-        model_reference=ModelReference(model_id="qwen3.8-max", revision="summary-revision"),
+        model_reference=ModelReference(model_id="qwen3.8-max"),
         prompt_version="consolidate_summaries_v1",
     )
     store = RecordingSummaryStore(candidates)
@@ -162,7 +162,7 @@ async def test_summary_consolidation_rejects_unknown_sources_before_embedding() 
                 salience=0.5,
             ),
         ),
-        model_reference=ModelReference(model_id="omni", revision="revision"),
+        model_reference=ModelReference(model_id="omni"),
         prompt_version="consolidate_summaries_v1",
     )
 
@@ -194,7 +194,7 @@ def _candidate(index: int) -> SummaryCandidate:
             verification_status=(
                 VerificationStatus.VERIFIED if verified else VerificationStatus.ATTESTED
             ),
-            model_reference=ModelReference(model_id="omni", revision="perception-revision"),
+            model_reference=ModelReference(model_id="omni"),
             salience=0.8,
             strength=0.8,
         ),

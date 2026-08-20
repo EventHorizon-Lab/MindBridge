@@ -246,7 +246,7 @@ async def test_a_dropped_completion_stream_is_retryable() -> None:
         await generator.close()
 
 
-async def test_generation_reports_the_configured_deployment_revision() -> None:
+async def test_generation_reports_the_configured_model_not_the_serving_fingerprint() -> None:
     """A per-request serving fingerprint must not become the model identity."""
 
     async def respond(_request: httpx.Request) -> httpx.Response:
@@ -265,10 +265,7 @@ async def test_generation_reports_the_configured_deployment_revision() -> None:
         await generator.close()
 
     assert result.text == "on the workbench"
-    assert result.model_reference == ModelReference(
-        model_id="qwen3.8-max",
-        revision="pinned-generator-revision",
-    )
+    assert result.model_reference == ModelReference(model_id="qwen3.8-max")
 
 
 def _generator(
@@ -281,7 +278,7 @@ def _generator(
             http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
             max_retries=0,
         ),
-        ModelReference(model_id="qwen3.8-max", revision="pinned-generator-revision"),
+        ModelReference(model_id="qwen3.8-max"),
     )
 
 
@@ -341,8 +338,8 @@ def _embedder(
     )
     return OpenAIEmbedder(
         client,
-        ModelReference(model_id=MODEL_ID, revision="pinned-revision"),
-        space_reference=EmbeddingSpaceReference(space_id="jina-space", revision="v1"),
+        ModelReference(model_id=MODEL_ID),
+        space_reference=EmbeddingSpaceReference(space_id="jina-space"),
     )
 
 

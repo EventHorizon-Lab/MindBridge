@@ -124,7 +124,6 @@ def test_completed_video_becomes_one_retry_safe_outbox_item(tmp_path: Path) -> N
             end_ms=900,
             confidence=0.91,
             model_id="insightface/buffalo_l",
-            model_revision="1.0.1",
         ),
     )
 

@@ -571,9 +571,7 @@ class MemoryKernel:
                 memory.tenant_id,
                 memory.memory_id,
                 embedding.model_reference.model_id,
-                embedding.model_reference.revision,
                 embedding.space_reference.space_id,
-                embedding.space_reference.revision,
                 EmbedTask.DOCUMENT.value,
             )
         )
@@ -634,10 +632,7 @@ def _build_observation(request: ObserveRequest) -> Observation:
                 start_ms=item.start_ms,
                 end_ms=item.end_ms,
                 confidence=item.confidence,
-                model_reference=ModelReference(
-                    model_id=item.model_id,
-                    revision=item.model_revision,
-                ),
+                model_reference=ModelReference(model_id=item.model_id),
                 scope=item.scope,
                 transcript=item.transcript,
                 visual_bbox_xyxy=item.visual_bbox_xyxy,

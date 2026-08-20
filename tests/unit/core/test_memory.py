@@ -28,7 +28,7 @@ from mindbridge.core import (
 NOW = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
 TENANT_ID = TenantId("tenant_01")
 EVIDENCE_ID = EvidenceId("evidence_01")
-MODEL = ModelReference(model_id="Qwen/Qwen3-Omni", revision="2026-08-01")
+MODEL = ModelReference(model_id="Qwen/Qwen3-Omni")
 
 
 def test_derived_records_preserve_provenance() -> None:
@@ -38,7 +38,9 @@ def test_derived_records_preserve_provenance() -> None:
 
     assert event.evidence_ids == (EVIDENCE_ID,)
     assert event.model_reference == MODEL
-    assert embedding.model_reference.revision == "abcdef0"
+    assert embedding.model_reference == ModelReference(
+        model_id="jinaai/jina-embeddings-v5-omni-small"
+    )
 
 
 def test_event_requires_traceable_evidence() -> None:
@@ -164,11 +166,8 @@ def _embedding(
         object_type=EmbeddedObjectType.EVENT,
         object_id="event_01",
         values=values,
-        model_reference=ModelReference(
-            model_id="jinaai/jina-embeddings-v5-omni-small",
-            revision="abcdef0",
-        ),
-        space_reference=EmbeddingSpaceReference(space_id="jina-v5", revision="space-v1"),
+        model_reference=ModelReference(model_id="jinaai/jina-embeddings-v5-omni-small"),
+        space_reference=EmbeddingSpaceReference(space_id="jina-v5"),
         task="retrieval_document",
         dimension=dimension,
         normalized=True,

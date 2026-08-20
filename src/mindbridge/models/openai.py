@@ -90,15 +90,14 @@ class OpenAIGenerator:
         api_key: str,
         endpoint: str,
         model_id: str = DEFAULT_GENERATOR_MODEL_ID,
-        model_revision: str,
         request_timeout_seconds: float = 1_800.0,
         max_retries: int = 2,
         reasoning_effort: ReasoningEffort = None,
         video_frames_per_second: float = DEFAULT_VIDEO_FRAMES_PER_SECOND,
         video_max_pixels: int = DEFAULT_VIDEO_MAX_PIXELS,
     ) -> OpenAIGenerator:
-        if any(not value.strip() for value in (api_key, model_id, model_revision)):
-            raise ValueError("API key, model ID, and model revision are required")
+        if any(not value.strip() for value in (api_key, model_id)):
+            raise ValueError("API key and model ID are required")
         if not 0 <= max_retries <= 10:
             raise ValueError("max_retries must be between zero and ten")
         return cls(
@@ -108,7 +107,7 @@ class OpenAIGenerator:
                 timeout=request_timeout_seconds,
                 max_retries=max_retries,
             ),
-            ModelReference(model_id=model_id, revision=model_revision),
+            ModelReference(model_id=model_id),
             request_timeout_seconds=request_timeout_seconds,
             reasoning_effort=reasoning_effort,
             video_frames_per_second=video_frames_per_second,
@@ -121,7 +120,6 @@ class OpenAIGenerator:
         set_current_span_attributes(
             {
                 "mindbridge.model.id": self._model_reference.model_id,
-                "mindbridge.model.revision": self._model_reference.revision,
                 "mindbridge.model.input_part_count": len(request.input.parts),
                 "mindbridge.model.input.media_count": sum(
                     isinstance(part, MediaPart) for part in request.input.parts
@@ -225,7 +223,6 @@ class OpenAIEmbedder:
         api_key: str,
         endpoint: str,
         model_id: str,
-        model_revision: str,
         space_reference: EmbeddingSpaceReference,
         dimension: int = 1_024,
         request_timeout_seconds: float = 120.0,
@@ -233,7 +230,7 @@ class OpenAIEmbedder:
         video_frames_per_second: float = DEFAULT_VIDEO_FRAMES_PER_SECOND,
         video_max_pixels: int = DEFAULT_VIDEO_MAX_PIXELS,
     ) -> OpenAIEmbedder:
-        if any(not value.strip() for value in (api_key, model_id, model_revision)):
+        if any(not value.strip() for value in (api_key, model_id)):
             raise ValueError("embedding credentials and model identities are required")
         if not 0 <= max_retries <= 10:
             raise ValueError("max_retries must be between zero and ten")
@@ -244,7 +241,7 @@ class OpenAIEmbedder:
                 timeout=request_timeout_seconds,
                 max_retries=max_retries,
             ),
-            ModelReference(model_id=model_id, revision=model_revision),
+            ModelReference(model_id=model_id),
             space_reference=space_reference,
             dimension=dimension,
             request_timeout_seconds=request_timeout_seconds,
@@ -265,9 +262,7 @@ class OpenAIEmbedder:
         set_current_span_attributes(
             {
                 "mindbridge.model.id": self._model_reference.model_id,
-                "mindbridge.model.revision": self._model_reference.revision,
                 "mindbridge.embedding.space_id": self._space_reference.space_id,
-                "mindbridge.embedding.space_revision": self._space_reference.revision,
                 "mindbridge.embedding.dimension": self._dimension,
                 "mindbridge.embedding.input_count": len(request.inputs),
                 "mindbridge.embedding.task": request.task.value,
@@ -351,7 +346,6 @@ class OpenAIEmbedder:
 class _GeneratorConfig(PluginConfigModel):
     api_key: PluginText
     endpoint: PluginText
-    model_revision: PluginText
     model_id: PluginText = DEFAULT_GENERATOR_MODEL_ID
     request_timeout_seconds: PluginNumber = DEFAULT_GENERATOR_REQUEST_TIMEOUT_SECONDS
     max_retries: PluginInteger = 2
@@ -364,9 +358,7 @@ class _EmbedderConfig(PluginConfigModel):
     api_key: PluginText
     endpoint: PluginText
     model_id: PluginText
-    model_revision: PluginText
     space_id: PluginText
-    space_revision: PluginText
     dimension: MatryoshkaDimension = DEFAULT_EMBEDDING_DIMENSION
     request_timeout_seconds: PluginNumber = 120.0
     max_retries: PluginInteger = 2
@@ -381,7 +373,6 @@ def create_generator(config: Mapping[str, object]) -> OpenAIGenerator:
         api_key=validated.api_key,
         endpoint=validated.endpoint,
         model_id=validated.model_id,
-        model_revision=validated.model_revision,
         request_timeout_seconds=validated.request_timeout_seconds,
         max_retries=validated.max_retries,
         reasoning_effort=cast(ReasoningEffort, validated.reasoning_effort),
@@ -397,11 +388,7 @@ def create_embedder(config: Mapping[str, object]) -> OpenAIEmbedder:
         api_key=validated.api_key,
         endpoint=validated.endpoint,
         model_id=validated.model_id,
-        model_revision=validated.model_revision,
-        space_reference=EmbeddingSpaceReference(
-            space_id=validated.space_id,
-            revision=validated.space_revision,
-        ),
+        space_reference=EmbeddingSpaceReference(space_id=validated.space_id),
         dimension=validated.dimension,
         request_timeout_seconds=validated.request_timeout_seconds,
         max_retries=validated.max_retries,

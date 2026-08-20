@@ -150,7 +150,6 @@ def _arguments() -> CoreArguments:
         dataset_path=Path("dataset.json"),
         output_path=Path("predictions.json"),
         api_base_url="https://memory.example.test",
-        code_revision="mindbridge-commit",
         deployment_config_path=Path("deployment.json"),
         run_id="run_01",
         tenant_prefix="benchmark_test",

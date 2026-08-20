@@ -591,8 +591,8 @@ class _RecordedQuery:
 class RecordingEmbedder:
     """Returns valid vectors while retaining query and document inputs."""
 
-    model_reference = ModelReference(model_id="jina-omni", revision="pinned-revision")
-    space_reference = EmbeddingSpaceReference(space_id="jina-v5", revision="space-v1")
+    model_reference = ModelReference(model_id="jina-omni")
+    space_reference = EmbeddingSpaceReference(space_id="jina-v5")
 
     def __init__(self, *, memory_document_failures: int = 0) -> None:
         self.queries: list[_RecordedQuery] = []
@@ -687,7 +687,6 @@ async def test_observe_keeps_only_anonymous_edge_identity_metadata() -> None:
                 end_ms=3_500,
                 confidence=0.91,
                 model_id="insightface/buffalo_l",
-                model_revision="1.0.1",
             ),
         )
     )
@@ -696,7 +695,9 @@ async def test_observe_keeps_only_anonymous_edge_identity_metadata() -> None:
 
     observation = next(iter(store.observations.values()))[1]
     assert observation.identity_observations[0].identity_id == "person_device_01"
-    assert observation.identity_observations[0].model_reference.revision == "1.0.1"
+    assert observation.identity_observations[0].model_reference.model_id == (
+        "insightface/buffalo_l"
+    )
 
 
 async def test_observation_job_status_is_tenant_scoped() -> None:
@@ -1703,7 +1704,7 @@ async def test_semantic_summary_hit_descends_to_attested_source_for_answering() 
         ended_at=child.ended_at,
         created_at=NOW,
         verification_status=VerificationStatus.UNVERIFIED,
-        model_reference=ModelReference(model_id="omni", revision="summary-revision"),
+        model_reference=ModelReference(model_id="omni"),
     )
     middle = MemoryRecord(
         memory_id=MemoryId("summary_middle"),
@@ -1715,7 +1716,7 @@ async def test_semantic_summary_hit_descends_to_attested_source_for_answering() 
         ended_at=child.ended_at,
         created_at=NOW,
         verification_status=VerificationStatus.UNVERIFIED,
-        model_reference=ModelReference(model_id="omni", revision="summary-revision"),
+        model_reference=ModelReference(model_id="omni"),
     )
     store.memories["summary"] = ("a" * 64, parent)
     store.memories["summary_middle"] = ("b" * 64, middle)

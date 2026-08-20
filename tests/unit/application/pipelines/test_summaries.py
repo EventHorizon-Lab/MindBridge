@@ -34,7 +34,7 @@ from mindbridge.models.openai import OpenAIGenerator, normalize_base_url
 NOW = datetime(2026, 8, 12, 12, 0, tzinfo=timezone.utc)
 
 
-async def test_summary_consolidator_inspects_native_evidence_and_preserves_revision() -> None:
+async def test_summary_consolidator_inspects_native_evidence_and_reports_its_model() -> None:
     async def respond(request: httpx.Request) -> httpx.Response:
         payload: dict[str, object] = json.loads(request.content)
         messages = cast(list[dict[str, object]], payload["messages"])
@@ -57,7 +57,7 @@ async def test_summary_consolidator_inspects_native_evidence_and_preserves_revis
                     }
                 ]
             },
-            fingerprint="summary-serving-revision-01",
+            fingerprint="summary-serving-fingerprint-01",
         )
 
     consolidator = _consolidator(respond)
@@ -72,7 +72,7 @@ async def test_summary_consolidator_inspects_native_evidence_and_preserves_revis
         MemoryId("memory_02"),
     )
     assert result.summaries[0].scope is SummaryScope.SESSION
-    assert result.model_reference.revision == "deployment-revision"
+    assert result.model_reference.model_id == "qwen3.8-max"
     assert result.prompt_version == "consolidate_summaries_v3"
 
 
@@ -147,7 +147,7 @@ def _consolidator(
     return _SummaryHarness(
         OpenAIGenerator(
             client,
-            ModelReference(model_id="qwen3.8-max", revision="deployment-revision"),
+            ModelReference(model_id="qwen3.8-max"),
         )
     )
 
@@ -174,7 +174,7 @@ def _candidates() -> tuple[tuple[SummaryCandidate, ...], tuple[ResolvedEvidence,
                 ended_at=NOW + timedelta(seconds=4),
                 created_at=NOW,
                 verification_status=VerificationStatus.VERIFIED,
-                model_reference=ModelReference(model_id="omni", revision="perception-revision"),
+                model_reference=ModelReference(model_id="omni"),
             ),
             entity_ids=(EntityId("tool"),),
         ),

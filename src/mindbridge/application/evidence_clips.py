@@ -449,7 +449,6 @@ async def _embed_stored_clips(
                     item.evidence.evidence_span.evidence_id,
                     str(item.ordinal),
                     embedding.model_reference.model_id,
-                    embedding.model_reference.revision,
                     EmbedTask.DOCUMENT.value,
                 )
             ),

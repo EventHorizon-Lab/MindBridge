@@ -47,9 +47,9 @@ async def _seed(
             )
             await connection.execute(
                 "INSERT INTO events (tenant_id, event_id, hierarchy_level, description,"
-                " salience, status, occurred_at, ended_at, model_id, model_revision,"
+                " salience, status, occurred_at, ended_at, model_id,"
                 " prompt_version, content_digest, created_at)"
-                " VALUES (%s, %s, 'event', %s, 0.5, 'active', %s, %s, 'm', 'r', 'p', %s, %s)",
+                " VALUES (%s, %s, 'event', %s, 0.5, 'active', %s, %s, 'm', 'p', %s, %s)",
                 (
                     tenant_id,
                     f"event_{entity_id}",

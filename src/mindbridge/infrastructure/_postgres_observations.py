@@ -68,7 +68,6 @@ async def _insert_observation(
                         "end_ms": identity.end_ms,
                         "confidence": identity.confidence,
                         "model_id": identity.model_reference.model_id,
-                        "model_revision": identity.model_reference.revision,
                         "scope": identity.scope.value,
                         "transcript": identity.transcript,
                         "visual_bbox_xyxy": identity.visual_bbox_xyxy,

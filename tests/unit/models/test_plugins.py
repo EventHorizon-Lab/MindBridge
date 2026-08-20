@@ -92,9 +92,7 @@ def _embedder_config(**changes: object) -> dict[str, object]:
         "api_key": "key",
         "endpoint": "https://embeddings.example.test/v1",
         "model_id": "omni",
-        "model_revision": "omni-revision",
         "space_id": "space",
-        "space_revision": "space-revision",
     }
     config.update(changes)
     return config
