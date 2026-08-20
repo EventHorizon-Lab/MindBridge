@@ -106,6 +106,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Annotated
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
@@ -137,7 +138,15 @@ class _RawBatch(BaseModel):
 # `_batches` is unambiguous -- a plan group has no `turns`, and a batch's
 # `batch_number` is an int, not a list of batches -- so neither shape can
 # validate as the other.
-_RawPlanGroup = dict[str, list[_RawBatch]]
+#
+# Both lengths are bounded below because an unbounded `dict` accepts `{}`, and an
+# empty plan group contributes no turns while validating: the element that used to
+# fail this file loudly would instead vanish from the conversation. A benchmark that
+# silently drops records reports a score for a corpus it did not read.
+_RawPlanGroup = Annotated[
+    dict[str, Annotated[list[_RawBatch], Field(min_length=1)]],
+    Field(min_length=1),
+]
 
 
 class _RawQuestion(BaseModel):
