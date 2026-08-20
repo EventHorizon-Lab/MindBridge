@@ -65,7 +65,7 @@ _UNSUPPORTED_KEYWORDS = frozenset(
         "then",
     }
 )
-_NAMESPACE_KEYWORDS = frozenset({"$defs", "definitions", "properties"})
+_NAMESPACE_KEYWORDS = frozenset({"$defs", "properties"})
 """Keywords whose keys are names the model chose, not schema keywords of their own.
 
 Filtering these as keywords is how a field called `title` or `format` disappears from

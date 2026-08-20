@@ -192,10 +192,16 @@ def test_a_field_named_like_an_unsupported_keyword_is_not_mistaken_for_one() -> 
     assert "then" in cast(dict[str, object], schema["properties"])
 
 
-def test_the_definitions_namespace_keeps_a_model_named_like_a_keyword() -> None:
-    """`$defs` keys are model names, so the same filter must not reach them either."""
+def test_a_definition_named_like_a_keyword_is_still_there_to_be_referenced() -> None:
+    """`$defs` is keyed by model name, and dropping one leaves the `$ref` to it dangling.
 
-    class Format(BaseModel):
+    Worse than a missing property: the provider is handed `{"$ref": "#/$defs/default"}` with
+    nothing at that pointer. The name has to be lowercase to collide at all, since Pydantic
+    keys `$defs` by class name -- which is why a CamelCase nested model proves nothing here.
+    """
+
+    # Lowercase deliberately: the collision needs the keyword's own spelling.
+    class default(BaseModel):
         model_config = ConfigDict(extra="forbid", frozen=True)
 
         label: str
@@ -203,8 +209,11 @@ def test_the_definitions_namespace_keeps_a_model_named_like_a_keyword() -> None:
     class Holder(BaseModel):
         model_config = ConfigDict(extra="forbid", frozen=True)
 
-        nested: Format
+        nested: default
 
     schema = json.loads(output_schema("holder", Holder).json_schema)
 
-    assert sorted(cast(dict[str, object], schema["$defs"])) == ["Format"]
+    definitions = cast(dict[str, object], schema["$defs"])
+    reference = cast(dict[str, str], cast(dict[str, object], schema["properties"])["nested"])
+    assert reference["$ref"] == "#/$defs/default"
+    assert sorted(definitions) == ["default"]
