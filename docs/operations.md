@@ -187,7 +187,7 @@ Four warnings exist because the condition is otherwise invisible in a working de
 
 | Warning | What it means |
 | --- | --- |
-| `structured output rejected, retrying in JSON mode` | The model left its output contract and a second generation was paid for. |
+| `structured output rejected, retrying once` | The model left its output contract and a second generation was paid for. Read `constrained`: a retry that is still constrained repeats the first attempt's arguments, so the bound that failed is what to look at. |
 | `generation proxy skipped, perceiving the untouched source` | Media was silently downgraded; perception still succeeded on the source. |
 | `database failure classified as transient` | Carries the SQLSTATE the retry translation otherwise discards. |
 | `provider request failed` | Carries the status code and whether it was treated as retryable. |

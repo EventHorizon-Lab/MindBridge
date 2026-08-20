@@ -262,11 +262,11 @@ def logger(name: str) -> logging.Logger:
 
 
 def timing_summary() -> tuple[OperationTotals, ...]:
-    """Return this process's operations ordered by the wall clock they account for.
+    """Return this process's operations ordered by the self time they account for.
 
-    Ordering by total rather than by mean is the whole point: the bottleneck is the
-    operation that owns the most seconds, which a list of per-call means hides whenever a
-    cheap call is made thousands of times.
+    Ordering by self rather than by total is the whole point: ranked by inclusive time the
+    outermost operation always wins because it contains everything, so the row at the top
+    would never be the one to go and optimize. Both columns are reported either way.
     """
     with _TIMINGS_LOCK:
         snapshot = tuple(
@@ -287,6 +287,23 @@ def reset_timings() -> None:
     """Discard accumulated timings, so one process can measure phases separately."""
     with _TIMINGS_LOCK:
         _timings.clear()
+
+
+def flush_timing_summary() -> None:
+    """Emit the summary now, for a process whose exit never reaches `atexit`.
+
+    Celery's prefork children end in `os._exit` -- billiard calls it directly from
+    `Worker._do_exit` -- so the handler registered at configuration time never runs there.
+    The worker is the process whose timings matter most, being where the write path spends
+    its wall clock, so leaving it to `atexit` is leaving it unmeasured. Unregisters as it
+    goes, so a process that both flushes and exits normally still reports once.
+    """
+    global _summary_registered
+    if not _summary_registered:
+        return
+    atexit.unregister(log_timing_summary)
+    _summary_registered = False
+    log_timing_summary()
 
 
 def log_timing_summary() -> None:
@@ -448,18 +465,24 @@ class _JsonFormatter(logging.Formatter):
         self._service_name = service_name
 
     def format(self, record: logging.LogRecord) -> str:
-        payload: dict[str, object] = {
-            "timestamp": datetime.fromtimestamp(record.created, tz=timezone.utc).isoformat(),
-            "level": record.levelname,
-            "service": self._service_name,
-            "logger": record.name,
-            "message": record.getMessage(),
-        }
+        # Reported fields go in first so the record's own identity overwrites them rather
+        # than the other way round: `log_fields` keeps a domain key from colliding with a
+        # `LogRecord` attribute, and this keeps one named `level` or `message` from
+        # rewriting the line that carries it.
+        payload: dict[str, object] = dict(_record_fields(record))
+        payload.update(
+            {
+                "timestamp": datetime.fromtimestamp(record.created, tz=timezone.utc).isoformat(),
+                "level": record.levelname,
+                "service": self._service_name,
+                "logger": record.name,
+                "message": record.getMessage(),
+            }
+        )
         for attribute in ("trace_id", "span_id"):
             value = getattr(record, attribute, None)
             if value is not None:
                 payload[attribute] = value
-        payload.update(_record_fields(record))
         if record.exc_info is not None:
             payload["exception"] = self.formatException(record.exc_info)
         return json.dumps(payload, default=str, ensure_ascii=False, sort_keys=True)

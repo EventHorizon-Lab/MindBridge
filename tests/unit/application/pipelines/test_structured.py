@@ -26,6 +26,22 @@ class _Sample(BaseModel):
     listed: Annotated[tuple[_Nested, ...], Field(max_length=4)] = ()
 
 
+class _KeywordNamed(BaseModel):
+    """A model whose fields are spelled like the keywords the rewrite filters.
+
+    Not contrived: `title`, `format` and `default` are ordinary names for a summary, a
+    rendering hint and a fallback, and `then` is one for a rule.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    body: str
+    default: str
+    format: str
+    then: str
+    title: str
+
+
 def _schema() -> dict[str, object]:
     derived = output_schema("sample", _Sample)
     assert derived.name == "sample"
@@ -148,3 +164,47 @@ def test_a_provider_added_fence_is_still_unwrapped() -> None:
     """Constrained decoding removes the fence; the fallback path can still produce one."""
     assert unwrap_json_code_fence('```json\n{"a":1}\n```') == '{"a":1}'
     assert unwrap_json_code_fence('{"a":1}') == '{"a":1}'
+
+
+def test_fields_named_like_schema_keywords_reach_the_provider() -> None:
+    """Keys under `properties` are names the model chose, not keywords to filter.
+
+    Dropping one is silent and total rather than partial: the field leaves `required` too,
+    and `additionalProperties: false` then forbids the model from volunteering it, so the
+    validator rejects every single response and the retry pays for a second one.
+    """
+    schema = json.loads(output_schema("keyword_named", _KeywordNamed).json_schema)
+
+    assert sorted(cast(dict[str, object], schema["properties"])) == sorted(
+        _KeywordNamed.model_fields
+    )
+    assert schema["required"] == sorted(_KeywordNamed.model_fields)
+
+
+def test_a_field_named_like_an_unsupported_keyword_is_not_mistaken_for_one() -> None:
+    """The fail-loud guard reads schema keywords, and a property name is not one.
+
+    Mistaking a field called `then` for a conditional subschema fails derivation at import
+    and takes the whole package down with it.
+    """
+    schema = json.loads(output_schema("keyword_named", _KeywordNamed).json_schema)
+
+    assert "then" in cast(dict[str, object], schema["properties"])
+
+
+def test_the_definitions_namespace_keeps_a_model_named_like_a_keyword() -> None:
+    """`$defs` keys are model names, so the same filter must not reach them either."""
+
+    class Format(BaseModel):
+        model_config = ConfigDict(extra="forbid", frozen=True)
+
+        label: str
+
+    class Holder(BaseModel):
+        model_config = ConfigDict(extra="forbid", frozen=True)
+
+        nested: Format
+
+    schema = json.loads(output_schema("holder", Holder).json_schema)
+
+    assert sorted(cast(dict[str, object], schema["$defs"])) == ["Format"]
