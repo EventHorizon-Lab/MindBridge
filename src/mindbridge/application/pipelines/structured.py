@@ -51,7 +51,28 @@ outright, and the ones they tolerate they ignore. Dropping them loses nothing, b
 same model that derived the schema still validates every bound after parsing -- the schema
 buys the field names and types, the validator keeps the limits.
 """
-_UNSUPPORTED_KEYWORDS = frozenset({"allOf", "not", "oneOf", "patternProperties", "prefixItems"})
+_UNSUPPORTED_KEYWORDS = frozenset(
+    {
+        "allOf",
+        "dependentRequired",
+        "dependentSchemas",
+        "else",
+        "if",
+        "not",
+        "oneOf",
+        "patternProperties",
+        "prefixItems",
+        "then",
+    }
+)
+"""Keywords no strict decoder will compile, so a schema using one must not be built.
+
+Composition and conditional subschemas are excluded by the provider contract rather than
+merely ignored, and a fixed-length tuple reaches JSON Schema as `prefixItems`, which has no
+strict equivalent either. Naming all of them matters because this guard is the only thing
+standing between an output model growing an inexpressible shape and a deployment discovering
+it on its first observation.
+"""
 
 
 def output_schema(name: str, model: type[BaseModel]) -> OutputSchema:
@@ -60,13 +81,15 @@ def output_schema(name: str, model: type[BaseModel]) -> OutputSchema:
     Deriving beats hand-writing: the schema and the parser cannot drift apart, because a
     field renamed in the model is renamed in the constraint by construction.
     """
+    schema = _strict_schema(model.model_json_schema())
+    if not isinstance(schema, Mapping) or schema.get("type") != "object":
+        # Required by the provider contract: a strict root has to be an object, so a model
+        # whose root is an array or a union cannot be constrained at all. Caught here rather
+        # than as a rejected request, which the fallback would quietly turn into JSON mode.
+        raise ValueError("a strict output schema must have an object at its root")
     return OutputSchema(
         name=name,
-        json_schema=json.dumps(
-            _strict_schema(model.model_json_schema()),
-            separators=(",", ":"),
-            sort_keys=True,
-        ),
+        json_schema=json.dumps(schema, separators=(",", ":"), sort_keys=True),
     )
 
 

@@ -4,8 +4,9 @@ import json
 from typing import Annotated, Literal, cast
 
 import pytest
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints
+from pydantic import BaseModel, ConfigDict, Field, RootModel, StringConstraints
 
+from mindbridge.application.pipelines import structured
 from mindbridge.application.pipelines.structured import output_schema, unwrap_json_code_fence
 
 
@@ -99,6 +100,26 @@ def test_a_model_the_constraint_cannot_express_fails_derivation() -> None:
 
     with pytest.raises(ValueError, match="strict decoding rejects"):
         output_schema("unexpressible", _Unexpressible)
+
+
+@pytest.mark.parametrize(
+    "keyword",
+    ["allOf", "not", "oneOf", "if", "then", "else", "dependentRequired", "dependentSchemas"],
+)
+def test_every_keyword_the_provider_contract_excludes_is_named(keyword: str) -> None:
+    """A guard that names only some of them implies a coverage it does not have."""
+    assert keyword in structured._UNSUPPORTED_KEYWORDS
+
+
+def test_a_root_that_is_not_an_object_fails_derivation() -> None:
+    """A strict root must be an object, and a rejected request would degrade to JSON mode.
+
+    The provider fallback exists for an endpoint that cannot compile schemas at all, so
+    letting an inexpressible root reach it would silently drop the constraint instead of
+    naming the model that cannot carry one.
+    """
+    with pytest.raises(ValueError, match="object at its root"):
+        output_schema("array_root", RootModel[list[int]])
 
 
 def test_derived_schema_admits_what_the_model_parses() -> None:
