@@ -42,6 +42,18 @@ _CHAT = [
     },
 ]
 
+# The flat message stream every tier must land on, whatever its `chat.json`
+# nesting looks like: batches concatenated, turn-pairs flattened, in document
+# order.
+_EXPECTED_CONTENTS = [
+    "I'm planning a Flask app.",
+    "Great, let's start.",
+    "Add a login page.",
+    "Sure, here's a plan.",
+    "Also add logout.",
+    "Done.",
+]
+
 # "information_extraction" carries an inner "question_type" field in the real
 # corpus (e.g. "context_date/time") that is a sub-classification, NOT the
 # category -- the payload's question_type must come from the outer dict key
@@ -73,6 +85,20 @@ _QUESTIONS = {
 }
 
 
+def _chat_document(size: str) -> list[object]:
+    """One tier's real top-level `chat.json` shape: 10M wraps batches in plans.
+
+    Emitting the flat shape under a `10M/` path is exactly what let the
+    plan-wrapped schema go unnoticed -- the derived `user_id` reads "10M" while
+    the bytes are a 100K document. Each batch goes into its own single-key
+    element, matching the real corpus (measured: every 10M element carries
+    exactly one plan key), so element order alone fixes message order.
+    """
+    if size != "10M":
+        return [*_CHAT]
+    return [{"plan-1": [_CHAT[0]]}, {"plan-2": [_CHAT[1]]}]
+
+
 def _write_fixture(tmp_path: Path, size: str = "100K", conv_name: str = "1") -> tuple[Path, Path]:
     # Real BEAM layout nests conversations two levels deep:
     # `.benchmarks/beam/chats/{size}/{conv_id}/...` -- conv_id restarts from
@@ -81,7 +107,7 @@ def _write_fixture(tmp_path: Path, size: str = "100K", conv_name: str = "1") -> 
     conv_dir = tmp_path / size / conv_name
     conv_dir.mkdir(parents=True)
     chat_path = conv_dir / "chat.json"
-    chat_path.write_text(json.dumps(_CHAT))
+    chat_path.write_text(json.dumps(_chat_document(size)))
 
     pq_dir = conv_dir / "probing_questions"
     pq_dir.mkdir()
@@ -104,14 +130,7 @@ def test_load_flattens_batches_and_turn_pairs_of_any_length(tmp_path: Path) -> N
     chat_path, questions_path = _write_fixture(tmp_path)
     [case] = load(chat_path, questions_path)
 
-    assert [m["content"] for m in case.messages] == [
-        "I'm planning a Flask app.",
-        "Great, let's start.",
-        "Add a login page.",
-        "Sure, here's a plan.",
-        "Also add logout.",
-        "Done.",
-    ]
+    assert [m["content"] for m in case.messages] == _EXPECTED_CONTENTS
     assert [m["role"] for m in case.messages] == [
         "user",
         "assistant",
@@ -213,6 +232,45 @@ def test_load_scopes_conversations_with_the_same_name_across_size_buckets(
     question_ids_100k = {q.question_id for q in case_100k.questions}
     question_ids_500k = {q.question_id for q in case_500k.questions}
     assert question_ids_100k.isdisjoint(question_ids_500k)
+
+
+@pytest.mark.parametrize("size", ["100K", "500K", "1M", "10M"])
+def test_load_parses_every_size_bucket_to_the_same_message_stream(
+    tmp_path: Path, size: str
+) -> None:
+    # Asserting only on `user_id` here proves nothing about a tier's schema:
+    # the id is derived from the path, so it comes out "beam:10M:1" even when
+    # the bytes under that path are another tier's shape entirely. The content
+    # assertions are what make this test tier-specific.
+    chat_path, questions_path = _write_fixture(tmp_path, size=size)
+    [case] = load(chat_path, questions_path)
+
+    assert case.user_id == f"beam:{size}:1"
+    assert [m["content"] for m in case.messages] == _EXPECTED_CONTENTS
+    assert case.messages[0]["timestamp"] == 1710460800000
+    assert len(case.questions) == 3
+
+
+def test_load_concatenates_10m_plan_groups_in_document_order(tmp_path: Path) -> None:
+    # The 10M tier's `chat.json` is a list of single-key `{"plan-N": [...batches
+    # ...]}` dicts; the other three tiers put bare batch objects at that level.
+    # Plans are consecutive stretches of one conversation (turn ids ascend
+    # straight across the boundaries in the real corpus), so the batches under
+    # them concatenate into one message stream in document order.
+    chat_path, questions_path = _write_fixture(tmp_path, size="10M")
+
+    # Guard the fixture itself. A 10M fixture that silently emitted the flat
+    # shape would leave the plan branch running zero times while every
+    # assertion below still passed.
+    document = json.loads(chat_path.read_text())
+    assert [sorted(element) for element in document] == [["plan-1"], ["plan-2"]]
+
+    [case] = load(chat_path, questions_path)
+
+    # Both plans' batches survive, in the document order of the plan elements --
+    # the second plan's turns must not lead, and neither plan may be dropped.
+    assert [m["content"] for m in case.messages] == _EXPECTED_CONTENTS
+    assert len(case.messages) == 6
 
 
 def test_load_raises_on_a_question_with_an_empty_rubric(tmp_path: Path) -> None:
