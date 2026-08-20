@@ -236,6 +236,10 @@ specifically so a device can never read truncation as completion.
 One SQLite file holds three things: the observation outbox, the deletion inbox, and the recent
 memory cache. Mode `0600`, WAL enabled.
 
+Each store operation opens its own connection and closes it again, so a process that runs for weeks
+holds no growing set of descriptors on this file. WAL is what makes that cheap and what lets a
+reader run while a writer commits.
+
 Put it on persistent storage that survives reboot — it is the durability boundary for everything
 captured but not yet acknowledged. Losing it loses observations that the cloud never saw.
 
