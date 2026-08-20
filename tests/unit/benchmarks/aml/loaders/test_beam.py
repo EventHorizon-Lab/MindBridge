@@ -287,3 +287,27 @@ def test_load_raises_on_a_question_with_an_empty_rubric(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="rubric"):
         load(chat_path, questions_path)
+
+
+@pytest.mark.parametrize(
+    ("label", "element"),
+    [("an empty element", {}), ("a plan carrying no batches", {"plan-1": []})],
+)
+def test_load_raises_on_an_element_that_would_contribute_no_turns(
+    tmp_path: Path,
+    label: str,
+    element: object,
+) -> None:
+    """An element that reads as an empty plan group has to fail, not vanish.
+
+    A bare `dict` accepts `{}`, and the plan-group half of the union is a dict, so
+    either shape validates and then contributes nothing -- turning what used to be a
+    loud parse failure into a conversation quietly missing a stretch of itself. A
+    benchmark that drops records reports a score for a corpus it did not read.
+    """
+    chat_path, questions_path = _write_fixture(tmp_path, size="10M")
+    document = json.loads(chat_path.read_text())
+    chat_path.write_text(json.dumps([*document, element]))
+
+    with pytest.raises(ValueError):
+        load(chat_path, questions_path)

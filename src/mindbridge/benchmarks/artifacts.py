@@ -100,10 +100,13 @@ def jsonl_lines(path: Path) -> tuple[str, ...]:
 
     Splits on the newline character alone, never with `str.splitlines()` --
     that distinction is the whole reason this function exists.
-    `splitlines()` also breaks on U+2028 LINE SEPARATOR, U+2029, U+0085 NEL,
-    U+000B, U+000C and U+001C-U+001E. Those are legal *inside* a JSON string
-    value and are not JSON line delimiters, so splitting on them cuts
-    records in half mid-string and every half then fails to parse.
+    `splitlines()` also breaks on U+2028 LINE SEPARATOR, U+2029 and U+0085
+    NEL, none of which is a JSON line delimiter and all of which a JSON
+    string may carry raw, so splitting on one cuts a record in half
+    mid-string and every half then fails to parse. It breaks on U+000B,
+    U+000C and U+001C-U+001E as well, but those never cost a valid record:
+    RFC 8259 forbids every unescaped character below U+0020 inside a string,
+    so a record carrying one is rejected by the parser either way.
 
     Measured against the official CL-Bench release (`tencent/CL-bench`
     revision `b28a5832a09b0d96c0cf4c22e90d7c60ede25b80`, 90,085,681 bytes):
