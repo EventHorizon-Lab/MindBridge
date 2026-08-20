@@ -309,3 +309,46 @@ def test_every_settings_class_reads_the_same_layered_source(tmp_path: Path) -> N
     assert settings.generator_config["endpoint"] == "https://g/v1"
     assert settings.embedder_config["api_key"] == "sk-embedder"
     assert settings.embedding_dimension == 1024
+
+
+ROOT = Path(__file__).resolve().parents[2]
+
+
+def test_the_committed_configuration_file_loads_and_carries_no_credential() -> None:
+    resolved = configuration_source({}, path=ROOT / "mindbridge.toml")
+
+    assert resolved["MINDBRIDGE_OBJECT_STORAGE_BUCKET"] == "mindbridge-media"
+    assert resolved["MINDBRIDGE_EMBEDDING_DIMENSION"] == "1024"
+    # The guard is worth nothing if the shipped file was never run through it.
+    assert not CREDENTIAL_VARIABLES & set(resolved)
+    named = {
+        line.split("=", 1)[0]
+        for line in (ROOT / ".env.example").read_text(encoding="utf-8").splitlines()
+        if line and not line.startswith("#")
+    }
+    assert named, ".env.example names no credential"
+    assert named <= CREDENTIAL_VARIABLES, "the example names something the file could hold"
+
+
+def test_a_supplied_environment_is_a_closed_world(monkeypatch: pytest.MonkeyPatch) -> None:
+    # `Settings.from_environment({...})` has to mean only those values. Without this, the
+    # committed mindbridge.toml leaks into every test that injects a mapping, and whether a
+    # caller's answer changes depends on the directory it happens to run in.
+    monkeypatch.chdir(ROOT)
+
+    assert dict(configuration_source({"OTHER": "kept"})) == {"OTHER": "kept"}
+    # Naming the file inside the mapping is explicit, so it still opts in.
+    named = configuration_source({"MINDBRIDGE_CONFIG_FILE": str(ROOT / "mindbridge.toml")})
+    assert named["MINDBRIDGE_OBJECT_STORAGE_BUCKET"] == "mindbridge-media"
+
+
+def test_reading_the_real_environment_finds_the_working_directory_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = tmp_path / "mindbridge.toml"
+    config.write_text("[database]\nmax_pool_size = 5\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("MINDBRIDGE_CONFIG_FILE", raising=False)
+
+    assert configuration_source()["MINDBRIDGE_DATABASE_MAX_POOL_SIZE"] == "5"

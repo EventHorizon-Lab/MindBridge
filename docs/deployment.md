@@ -89,29 +89,53 @@ which still cost roughly 18× on write and held over a gigabyte. Read plans are 
 
 ## API
 
+Structure goes in `mindbridge.toml`, committed alongside the deployment:
+
+```toml
+[database]
+max_pool_size = 32
+
+[object_storage]
+bucket = "mindbridge-media"
+endpoint_url = "https://objects.example.com"
+
+[embedding]
+dimension = 1024
+space_id = "jina-v5"
+space_revision = "deployment-space-v1"
+
+[generator]
+plugin = "openai"
+endpoint = "https://generator.example.com/v1"
+model_id = "qwen3.8-max"
+model_revision = "deployment-2026-08-11"
+
+[embedder]
+plugin = "openai"
+endpoint = "https://embeddings.example.com/v1"
+model_id = "jinaai/jina-embeddings-v5-omni-small-retrieval"
+model_revision = "12949877f0092093f366c6450340011320152a05"
+```
+
+Credentials go in the environment, never in that file — a systemd unit reads them with
+`EnvironmentFile=`, a container with `env_file:`, and neither puts them on disk beside the code:
+
 ```bash
-export MINDBRIDGE_DATABASE_URL=postgresql://mindbridge:password@db.internal:5432/mindbridge
-export MINDBRIDGE_DATABASE_MAX_POOL_SIZE=32
-export MINDBRIDGE_TASK_BROKER_URL=redis://redis.internal:6379/0
-export MINDBRIDGE_OBJECT_STORAGE_BUCKET=mindbridge-media
-export MINDBRIDGE_OBJECT_STORAGE_ENDPOINT_URL=https://objects.example.com
+MINDBRIDGE_DATABASE_URL=postgresql://mindbridge:password@db.internal:5432/mindbridge
+MINDBRIDGE_TASK_BROKER_URL=redis://redis.internal:6379/0
+MINDBRIDGE_GENERATOR_API_KEY=...
+MINDBRIDGE_EMBEDDER_API_KEY=...
+MINDBRIDGE_TENANT_API_KEYS_JSON={"tenant_01":["at-least-32-random-characters"]}
+```
 
-export MINDBRIDGE_GENERATOR_PLUGIN=openai
-export MINDBRIDGE_GENERATOR_API_KEY=...
-export MINDBRIDGE_GENERATOR_ENDPOINT=https://generator.example.com/v1
-export MINDBRIDGE_GENERATOR_MODEL_ID=qwen3.8-max
-export MINDBRIDGE_GENERATOR_MODEL_REVISION=deployment-2026-08-11
+Confirm both halves resolved before starting anything. This reports every missing setting in one
+pass and names the source of each resolved value, without printing any of them:
 
-export MINDBRIDGE_EMBEDDER_PLUGIN=openai
-export MINDBRIDGE_EMBEDDER_API_KEY=...
-export MINDBRIDGE_EMBEDDER_ENDPOINT=https://embeddings.example.com/v1
-export MINDBRIDGE_EMBEDDER_MODEL_ID=jinaai/jina-embeddings-v5-omni-small-retrieval
-export MINDBRIDGE_EMBEDDER_MODEL_REVISION=12949877f0092093f366c6450340011320152a05
-export MINDBRIDGE_EMBEDDING_SPACE_ID=jina-v5
-export MINDBRIDGE_EMBEDDING_SPACE_REVISION=deployment-space-v1
-export MINDBRIDGE_EMBEDDING_DIMENSION=1024
+```bash
+mindbridge config check --role api
+```
 
-export MINDBRIDGE_TENANT_API_KEYS_JSON='{"tenant_01":["at-least-32-random-characters"]}'
+```bash
 export OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318
 export OTEL_TRACES_SAMPLER=parentbased_traceidratio
 export OTEL_TRACES_SAMPLER_ARG=0.1
@@ -146,12 +170,15 @@ Shares storage and generator variables with the API. Its text slot reads the sam
 `MINDBRIDGE_EMBEDDER_*` contract the API queries with, so only the media slot needs
 worker-specific variables:
 
-```bash
-export MINDBRIDGE_MEDIA_EMBEDDER_PLUGIN=jina
-export MINDBRIDGE_MEDIA_EMBEDDER_DEVICE=cuda
-export MINDBRIDGE_MEDIA_EMBEDDER_MODEL_ID=jinaai/jina-embeddings-v5-omni-small-retrieval
-export MINDBRIDGE_MEDIA_EMBEDDER_MODEL_REVISION=12949877f0092093f366c6450340011320152a05
+```toml
+[media_embedder]
+plugin = "jina"
+device = "cuda"
+model_id = "jinaai/jina-embeddings-v5-omni-small-retrieval"
+model_revision = "12949877f0092093f366c6450340011320152a05"
+```
 
+```bash
 uv run --extra server --extra cloud-models \
   celery -A mindbridge.celery_app:app worker --loglevel=INFO
 ```
@@ -170,14 +197,12 @@ sizes its Celery soft limit, hard limit, and broker re-delivery window from the 
 `request_timeout_seconds`, plus a fixed 300-second allowance for the encoding and graph write that
 follow. A slow deployment raises one value and the budget follows:
 
-```bash
-export MINDBRIDGE_GENERATOR_CONFIG_JSON='{
-  "api_key": "...",
-  "endpoint": "https://generator.example.com/v1",
-  "model_id": "qwen3.8-max",
-  "model_revision": "deployment-2026-08-11",
-  "request_timeout_seconds": 1800
-}'
+```toml
+[generator]
+endpoint = "https://generator.example.com/v1"
+model_id = "qwen3.8-max"
+model_revision = "deployment-2026-08-11"
+request_timeout_seconds = 1800
 ```
 
 Omitting the key is fine: the bundled generator's own default of 1800 seconds applies, and the

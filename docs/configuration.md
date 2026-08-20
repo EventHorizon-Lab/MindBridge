@@ -1,32 +1,69 @@
 # Configuration
 
-Every process is configured entirely through environment variables. There is no config file, and
-credentials are never accepted as CLI flags — so a recorded invocation, a process list, and a
-systemd unit never carry a secret.
+Credentials are configured entirely through environment variables, and are never accepted as a
+CLI flag or read from a file — so a recorded invocation, a process list, a systemd unit, and the
+repository itself never carry a secret. Everything that is not a credential lives in
+`mindbridge.toml`, which is committed, commented, and diffable.
+
+Each setting's environment variable overrides the file, so a container or a CI job changes one
+value without rebuilding anything. `mindbridge config check --role <role>` reports which source
+won for each setting, and every setting a role still needs, in one pass rather than one per
+restart.
+
+A credential key inside `mindbridge.toml` is refused when the file loads, and so is a key no
+reader looks up: a typo that is ignored is a value that silently reverts to its default.
 
 Configuration is validated at startup, not at first request. A deployment with a wrong value
 fails to start rather than failing one call an hour later.
 
 ## Which process reads what
 
-| Variable | API | MCP | Worker | Consolidate | Lifecycle | Edge sync |
-| --- | :-: | :-: | :-: | :-: | :-: | :-: |
-| `MINDBRIDGE_DATABASE_URL` | ● | ● | ● | ● | ● | |
-| `MINDBRIDGE_DATABASE_MAX_POOL_SIZE` | ○ | ○ | ○ | ○ | ○ | |
-| `MINDBRIDGE_TASK_BROKER_URL` | ● | | ● | | | |
-| `MINDBRIDGE_OBJECT_STORAGE_BUCKET` | ● | ● | ● | ● | ◐ | |
-| `MINDBRIDGE_OBJECT_STORAGE_ENDPOINT_URL` | ○ | ○ | ○ | ○ | ○ | |
-| `MINDBRIDGE_OBJECT_STORAGE_PUBLIC_ENDPOINT_URL` | ○ | ○ | ○ | ○ | ○ | |
-| `MINDBRIDGE_GENERATOR_*` | ● | ● | ● | ● | | |
-| `MINDBRIDGE_EMBEDDER_*` | ● | ● | ● | ● | | |
-| `MINDBRIDGE_EMBEDDING_*` | ○ | ○ | ○ | ○ | | |
-| `MINDBRIDGE_MEDIA_EMBEDDER_*` | | | ○ | | | |
-| `MINDBRIDGE_MEDIA_SAMPLING_CONFIG_JSON` | | | ○ | | | |
-| `MINDBRIDGE_TENANT_API_KEYS_JSON` | ● | | | | | |
-| `MINDBRIDGE_API_KEY` | | | | | | ● |
-| `MINDBRIDGE_AML_*` | ○ | | | | | |
+| Variable | Source | API | MCP | Worker | Consolidate | Lifecycle | Edge sync |
+| --- | :-: | :-: | :-: | :-: | :-: | :-: | :-: |
+| `MINDBRIDGE_CONFIG_FILE` | env | ○ | ○ | ○ | ○ | ○ | ○ |
+| `MINDBRIDGE_DATABASE_URL` | env | ● | ● | ● | ● | ● | |
+| `MINDBRIDGE_DATABASE_MAX_POOL_SIZE` | file | ○ | ○ | ○ | ○ | ○ | |
+| `MINDBRIDGE_TASK_BROKER_URL` | env | ● | | ● | | | |
+| `MINDBRIDGE_OBJECT_STORAGE_BUCKET` | file | ● | ● | ● | ● | ◐ | |
+| `MINDBRIDGE_OBJECT_STORAGE_ENDPOINT_URL` | file | ○ | ○ | ○ | ○ | ○ | |
+| `MINDBRIDGE_OBJECT_STORAGE_PUBLIC_ENDPOINT_URL` | file | ○ | ○ | ○ | ○ | ○ | |
+| `MINDBRIDGE_GENERATOR_*` | both | ● | ● | ● | ● | | |
+| `MINDBRIDGE_EMBEDDER_*` | both | ● | ● | ● | ● | | |
+| `MINDBRIDGE_EMBEDDING_*` | file | ○ | ○ | ○ | ○ | | |
+| `MINDBRIDGE_MEDIA_EMBEDDER_*` | file | | | ○ | | | |
+| `MINDBRIDGE_MEDIA_SAMPLING_CONFIG_JSON` | file | | | ○ | | | |
+| `MINDBRIDGE_TENANT_API_KEYS_JSON` | env | ● | | | | | |
+| `MINDBRIDGE_API_KEY` | env | | | | | | ● |
+| `MINDBRIDGE_AML_*` | both | ○ | | | | | |
 
 ● required ○ optional ◐ required only with `--reclaim-orphan-clips`
+
+**Source** is where a setting is configured: `file` in `mindbridge.toml`, `env` in the
+environment only, `both` for a group whose API key is a credential and whose remaining keys are
+structure. Every `file` row is also settable from the environment, which overrides the file.
+
+## The configuration file
+
+`mindbridge.toml` is read from the working directory. `MINDBRIDGE_CONFIG_FILE` names a different
+path, and a path it names that is not a file is an error rather than a fall back — there is no
+parent-directory search and no XDG lookup, because a configuration file found somewhere nobody
+named is worse than none at all.
+
+No file at all is not an error either. A deployment that sets everything in the environment
+behaves exactly as it did before this file existed.
+
+| Condition | Behaviour |
+| --- | --- |
+| `MINDBRIDGE_CONFIG_FILE` set, path missing | Error naming the path. |
+| File is not valid TOML | Error naming the file and the parse position. |
+| File contains a credential key | Error naming the key and the variable it belongs in. |
+| File has an unknown section or key | Error naming it. |
+| Both file and environment set a value | The environment wins. `config check` shows which. |
+| No file at all | Not an error. |
+
+A key `k` in section `s` configures `MINDBRIDGE_<S>_<K>`, and a key at the top level configures
+`MINDBRIDGE_<K>`. That derivation is the whole mapping; the tables in this document are written
+from it rather than beside it.
 
 ## Storage
 
@@ -149,25 +186,36 @@ is an endpoint-side alias. They frequently hold the same string and are still no
 
 An explicit `DEVICE` that is unavailable fails rather than silently falling back to CPU.
 
-### Plugin JSON
+### Plugin sections
 
-Every slot accepts one explicit JSON object that **replaces** the per-field variables entirely:
+A plugin's whole configuration is one object, and `mindbridge.toml` is where it is written. Its
+keys are the plugin's own — `reasoning_effort` below belongs to the bundled OpenAI generator, not
+to MindBridge:
 
-```bash
-export MINDBRIDGE_GENERATOR_CONFIG_JSON='{
-  "api_key": "...",
-  "endpoint": "https://generator.example.com/v1",
-  "model_id": "qwen3.8-max",
-  "model_revision": "deployment-2026-08-11",
-  "reasoning_effort": "low"
-}'
+```toml
+[generator]
+plugin = "openai"
+endpoint = "https://generator.example.com/v1"
+model_id = "qwen3.8-max"
+model_revision = "deployment-2026-08-11"
+reasoning_effort = "low"
 ```
 
-Also `MINDBRIDGE_EMBEDDER_CONFIG_JSON` and `MINDBRIDGE_MEDIA_EMBEDDER_CONFIG_JSON`.
+Also `[embedder]`, `[media_embedder]`, and `[media_sampling]`. `[embedding]`'s three keys are
+folded into `[embedder]` and `[media_embedder]` when they are read, so one space is stated once.
 
-The rule that keeps this surface bounded: **fallback variables cover credentials and model
-identity only** — what a deployment cannot start without. Every other knob lives in the
-`*_CONFIG_JSON` object. Without that rule, the variable list grows with every setting any plugin
+An individual `MINDBRIDGE_<SECTION>_<KEY>` variable overrides one key of a section, in the type
+the file declared for it: `MINDBRIDGE_GENERATOR_REQUEST_TIMEOUT_SECONDS=900` against a file
+saying `request_timeout_seconds = 1800` resolves to the number 900, not the string. The API key
+arrives by the same mechanism, which is why it never has to appear in the file.
+
+`MINDBRIDGE_GENERATOR_CONFIG_JSON` still exists and still **replaces** the whole section rather
+than merging into it. An opaque object that is half overridden is not something a plugin schema
+can validate, so the environment either supplies the object or overrides its keys one at a time.
+
+The rule that keeps this surface bounded: **a variable exists for a credential or for model
+identity** — what a deployment cannot start without. Every other knob is a key of a section, not
+a variable of its own. Without that rule, the variable list grows with every setting any plugin
 ever gains.
 
 Configs are validated with `extra="forbid"`. An unrecognized key fails startup rather than being
@@ -237,15 +285,14 @@ call. It is a client credential, not a server one.
 
 ## Media sampling (worker)
 
-`MINDBRIDGE_MEDIA_SAMPLING_CONFIG_JSON` is optional; unset keys keep the defaults shown:
+`[media_sampling]` is optional; unset keys keep the defaults shown:
 
-```bash
-export MINDBRIDGE_MEDIA_SAMPLING_CONFIG_JSON='{
-  "frames_per_second": 1.0,
-  "max_pixels": 200704,
-  "image_max_pixels": 1003520,
-  "generation_proxy": true
-}'
+```toml
+[media_sampling]
+frames_per_second = 1.0
+max_pixels = 200704
+image_max_pixels = 1003520
+generation_proxy = true
 ```
 
 An unrecognized key or a value of the wrong type fails startup.

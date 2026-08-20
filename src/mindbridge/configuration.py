@@ -77,9 +77,11 @@ def variable_name(key: str, section: str | None = None) -> str:
 def _configuration_document(
     environ: Mapping[str, str],
     path: Path | None,
+    *,
+    allow_default: bool = True,
 ) -> dict[str, object] | None:
     """Locate and parse the configuration file, or report that there is none."""
-    located = path if path is not None else _located_path(environ)
+    located = path if path is not None else _located_path(environ, allow_default=allow_default)
     if located is None or not located.is_file():
         return None
     try:
@@ -93,14 +95,22 @@ def _configuration_document(
     return cast(dict[str, object], document)
 
 
-def _located_path(environ: Mapping[str, str]) -> Path | None:
-    """Resolve which file to read without searching anywhere the operator did not name."""
+def _located_path(environ: Mapping[str, str], *, allow_default: bool = True) -> Path | None:
+    """Resolve which file to read without searching anywhere the operator did not name.
+
+    `allow_default` is false when a caller supplied its own environment mapping. That mapping is
+    a closed world: `Settings.from_environment({...})` has to mean only those values, or a file
+    in whatever directory the caller happens to be in changes the answer. Naming
+    `MINDBRIDGE_CONFIG_FILE` inside the mapping still opts in, because that is explicit.
+    """
     named = optional_environment_value(environ, CONFIG_FILE_VARIABLE)
     if named is not None:
         located = Path(named)
         if not located.is_file():
             raise ValueError(f"{CONFIG_FILE_VARIABLE} names {named}, which is not a file")
         return located
+    if not allow_default:
+        return None
     default = Path(DEFAULT_CONFIG_FILE)
     return default if default.is_file() else None
 
@@ -318,9 +328,13 @@ def configuration_source(
     Scalar keys resolve by lookup order. The four `*_CONFIG_JSON` keys cannot: their values are
     objects assembled from the file and the environment together, so the mapping is built once
     rather than layered lazily.
+
+    An `environ` a caller supplies is a closed world: the working directory's `mindbridge.toml`
+    is read only when this reads the real environment, so `from_environment({...})` still means
+    only those values. A supplied mapping opts in by naming `MINDBRIDGE_CONFIG_FILE` itself.
     """
     source = os.environ if environ is None else environ
-    document = _configuration_document(source, path)
+    document = _configuration_document(source, path, allow_default=environ is None)
     if document is None:
         return source
     flattened = _flattened_scalars(document)
