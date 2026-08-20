@@ -8,7 +8,7 @@ import sys
 from collections.abc import Iterable, Mapping
 from functools import cache
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 if sys.version_info >= (3, 11):
     import tomllib
@@ -438,6 +438,36 @@ def _absolute_import(path: Path, node: ast.ImportFrom) -> str | None:
 
 def _tests_type_checking(test: ast.expr) -> bool:
     return isinstance(test, ast.Name) and test.id == "TYPE_CHECKING"
+
+
+def test_relative_imports_resolve_against_the_importing_file() -> None:
+    """`_absolute_import`'s relative branch has no other cover in this suite.
+
+    Nothing under `src/` imports relatively today, so across a whole run of the checks below
+    the resolution they lean on is called 1275 times and takes the `level == 0` path every
+    time. A wrong anchor -- off by one, or forgetting that a package's `__init__.py` is
+    anchored on the package rather than its parent -- would fail nothing without this.
+    """
+    module = SOURCE / "media" / "clipping.py"
+    package = SOURCE / "media" / "__init__.py"
+    cases = [
+        (module, "from mindbridge.telemetry import span", "mindbridge.telemetry"),
+        (module, "from .decoders import open_container", "mindbridge.media.decoders"),
+        (module, "from ..telemetry import span", "mindbridge.telemetry"),
+        (module, "from . import decoders", "mindbridge.media"),
+        # A package's `__init__.py` is anchored on the package, not on its parent.
+        (package, "from .clipping import cut", "mindbridge.media.clipping"),
+        (package, "from ..telemetry import span", "mindbridge.telemetry"),
+        # Past the top of the tree resolves to nothing rather than to a shorter wrong prefix.
+        (module, "from ....telemetry import span", None),
+    ]
+
+    resolved = [
+        _absolute_import(path, cast("ast.ImportFrom", ast.parse(source).body[0]))
+        for path, source, _ in cases
+    ]
+
+    assert resolved == [expected for _, _, expected in cases]
 
 
 def _modules(*directories: Path) -> list[Path]:
