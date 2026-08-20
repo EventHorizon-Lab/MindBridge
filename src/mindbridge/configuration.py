@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import os
 import sys
 from collections.abc import Callable, Mapping
 from datetime import datetime
@@ -287,6 +288,32 @@ def _as_declared(declared: object, text: str) -> object:
     if isinstance(declared, float):
         return float(text)
     return text
+
+
+def configuration_source(
+    environ: Mapping[str, str] | None = None,
+    *,
+    path: Path | None = None,
+) -> Mapping[str, str]:
+    """The environment layered over the flattened configuration file, if there is one.
+
+    Every reader in the codebase already takes a `Mapping[str, str]`, so layering here is what
+    lets one file configure all of them without any reader learning a second shape. With no
+    file the environment mapping is returned unchanged, which is why a deployment that has
+    none behaves exactly as it did before this existed.
+
+    Scalar keys resolve by lookup order. The four `*_CONFIG_JSON` keys cannot: their values are
+    objects assembled from the file and the environment together, so the mapping is built once
+    rather than layered lazily.
+    """
+    source = os.environ if environ is None else environ
+    document = _configuration_document(source, path)
+    if document is None:
+        return source
+    flattened = _flattened_scalars(document)
+    flattened.update(_flattened_plugins(document, source))
+    flattened.update(source)
+    return flattened
 
 
 def validate_plugin_name(value: object, name: str = "plugin name") -> str:

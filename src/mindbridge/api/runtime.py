@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import math
-import os
 from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass, field
@@ -20,6 +19,7 @@ from mindbridge.application.kernel import MemoryKernel
 from mindbridge.application.pipelines import AnswerPipeline, OccurrencePipeline
 from mindbridge.cli import parser as build_parser
 from mindbridge.configuration import (
+    configuration_source,
     copy_plugin_configuration,
     optional_environment_value,
     plugin_configuration,
@@ -109,7 +109,7 @@ class Settings:
     @classmethod
     def from_environment(cls, environ: Mapping[str, str] | None = None) -> Settings:
         """Read the documented deployment contract and fail before startup."""
-        source = os.environ if environ is None else environ
+        source = configuration_source(environ)
         generator_plugin = source.get("MINDBRIDGE_GENERATOR_PLUGIN", "openai")
         embedder_plugin = source.get("MINDBRIDGE_EMBEDDER_PLUGIN", "openai")
         generator_config = plugin_configuration(

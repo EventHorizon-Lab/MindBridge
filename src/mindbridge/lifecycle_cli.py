@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-import os
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime
@@ -20,6 +19,7 @@ from mindbridge.application.lifecycle import (
 )
 from mindbridge.cli import parser as build_parser
 from mindbridge.configuration import (
+    configuration_source,
     parse_aware_datetime,
     require_environment_value,
 )
@@ -131,7 +131,7 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
     )
     summary = asyncio.run(
         _run_postgres_sweep(
-            require_environment_value(os.environ, "MINDBRIDGE_DATABASE_URL"),
+            require_environment_value(configuration_source(), "MINDBRIDGE_DATABASE_URL"),
             TenantId(options.tenant_id),
             options.evaluated_at or utc_now(),
             page_size=options.page_size,

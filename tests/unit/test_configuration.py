@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from mindbridge.api.runtime import Settings
 from mindbridge.configuration import (
     CREDENTIAL_VARIABLES,
     KNOWN_SCALAR_KEYS,
@@ -13,6 +14,7 @@ from mindbridge.configuration import (
     _configuration_document,
     _flattened_plugins,
     _flattened_scalars,
+    configuration_source,
     copy_plugin_configuration,
     optional_environment_value,
     plugin_configuration,
@@ -20,6 +22,7 @@ from mindbridge.configuration import (
     validate_plugin_name,
     variable_name,
 )
+from mindbridge.infrastructure.postgres import resolve_database_max_pool_size
 
 
 def test_environment_values_are_validated_without_transformation() -> None:
@@ -228,3 +231,81 @@ def test_an_override_of_a_key_the_file_omits_arrives_as_text() -> None:
     )
 
     assert json.loads(flattened["MINDBRIDGE_EMBEDDER_CONFIG_JSON"])["model_revision"] == "abc123"
+
+
+def test_with_no_file_the_source_is_the_environment_unchanged(tmp_path: Path) -> None:
+    environ = {"MINDBRIDGE_DATABASE_URL": "postgresql://u:p@h/d", "OTHER": "kept"}
+
+    resolved = configuration_source(environ, path=tmp_path / "absent.toml")
+
+    assert dict(resolved) == environ
+
+
+def test_the_environment_wins_over_the_file_key_by_key(tmp_path: Path) -> None:
+    config = tmp_path / "mindbridge.toml"
+    config.write_text(
+        "[database]\nmax_pool_size = 32\n[object_storage]\nbucket = 'from-file'\n",
+        encoding="utf-8",
+    )
+
+    resolved = configuration_source({"MINDBRIDGE_OBJECT_STORAGE_BUCKET": "from-env"}, path=config)
+
+    assert resolved["MINDBRIDGE_OBJECT_STORAGE_BUCKET"] == "from-env"
+    assert resolved["MINDBRIDGE_DATABASE_MAX_POOL_SIZE"] == "32"
+
+
+def test_an_environment_config_object_wins_over_the_whole_file_section(tmp_path: Path) -> None:
+    config = tmp_path / "mindbridge.toml"
+    config.write_text("[generator]\nendpoint = 'https://from-file/v1'\n", encoding="utf-8")
+
+    resolved = configuration_source(
+        {"MINDBRIDGE_GENERATOR_CONFIG_JSON": '{"endpoint":"https://from-env/v1"}'},
+        path=config,
+    )
+
+    # A half-overridden opaque object is not something a plugin schema can validate.
+    assert json.loads(resolved["MINDBRIDGE_GENERATOR_CONFIG_JSON"]) == {
+        "endpoint": "https://from-env/v1"
+    }
+
+
+def test_the_pool_ceiling_reaches_the_processes_that_pass_no_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The Worker, consolidate, and lifecycle call this with no argument; only the API passes a
+    # source. A file honoured by one of the four and ignored by three is the exact failure the
+    # comment on this function records as already found once.
+    config = tmp_path / "mindbridge.toml"
+    config.write_text("[database]\nmax_pool_size = 7\n", encoding="utf-8")
+    monkeypatch.setenv("MINDBRIDGE_CONFIG_FILE", str(config))
+
+    assert resolve_database_max_pool_size() == 7
+    monkeypatch.setenv("MINDBRIDGE_DATABASE_MAX_POOL_SIZE", "9")
+    assert resolve_database_max_pool_size() == 9
+
+
+def test_every_settings_class_reads_the_same_layered_source(tmp_path: Path) -> None:
+    config = tmp_path / "mindbridge.toml"
+    config.write_text(
+        "[object_storage]\nbucket = 'mindbridge-media'\n"
+        "[embedding]\ndimension = 1024\nspace_id = 's'\nspace_revision = 'r'\n"
+        "[generator]\nendpoint = 'https://g/v1'\nmodel_revision = 'gr'\n"
+        "[embedder]\nendpoint = 'https://e/v1'\nmodel_id = 'm'\nmodel_revision = 'er'\n",
+        encoding="utf-8",
+    )
+    environ = {
+        "MINDBRIDGE_CONFIG_FILE": str(config),
+        "MINDBRIDGE_DATABASE_URL": "postgresql://u:p@h/d",
+        "MINDBRIDGE_TASK_BROKER_URL": "redis://h:6379/0",
+        "MINDBRIDGE_GENERATOR_API_KEY": "sk-generator",
+        "MINDBRIDGE_EMBEDDER_API_KEY": "sk-embedder",
+        "MINDBRIDGE_TENANT_API_KEYS_JSON": '{"tenant_01":["' + "a" * 48 + '"]}',
+    }
+
+    settings = Settings.from_environment(environ)
+
+    assert settings.object_storage.bucket == "mindbridge-media"
+    assert settings.generator_config["endpoint"] == "https://g/v1"
+    assert settings.embedder_config["api_key"] == "sk-embedder"
+    assert settings.embedding_dimension == 1024
