@@ -2,8 +2,10 @@
 
 import argparse
 import json
+import sys
 from collections.abc import Callable, Mapping
 from datetime import datetime
+from pathlib import Path
 from typing import Annotated, NoReturn, cast
 
 from pydantic import (
@@ -14,6 +16,11 @@ from pydantic import (
     StrictInt,
     StringConstraints,
 )
+
+if sys.version_info >= (3, 11):
+    import tomllib
+else:  # pragma: no cover - the 3.10 floor, which the mypy pin is the one that sees
+    import tomli as tomllib
 
 
 def require_environment_value(environ: Mapping[str, str], name: str) -> str:
@@ -28,6 +35,60 @@ def optional_environment_value(environ: Mapping[str, str], name: str) -> str | N
     """Normalize a missing optional value to None and reject blank equivalently."""
     value = environ.get(name)
     return value if value is not None and value.strip() else None
+
+
+CONFIG_FILE_VARIABLE = "MINDBRIDGE_CONFIG_FILE"
+"""Names the configuration file explicitly. A set-but-missing path is an error."""
+
+DEFAULT_CONFIG_FILE = "mindbridge.toml"
+"""Read from the working directory when nothing names a file.
+
+There is deliberately no parent-directory walk and no XDG lookup: a configuration file found
+somewhere the operator did not name is worse than no configuration file.
+"""
+
+
+def variable_name(key: str, section: str | None = None) -> str:
+    """Derive the one variable a file key configures.
+
+    The mapping is this function rather than a table, so nothing can fall behind the loader:
+    key `k` under section `s` configures `MINDBRIDGE_<S>_<K>`, and a key at the top level of
+    the document configures `MINDBRIDGE_<K>`.
+    """
+    if section is None:
+        return f"MINDBRIDGE_{key.upper()}"
+    return f"MINDBRIDGE_{section.upper()}_{key.upper()}"
+
+
+def _configuration_document(
+    environ: Mapping[str, str],
+    path: Path | None,
+) -> dict[str, object] | None:
+    """Locate and parse the configuration file, or report that there is none."""
+    located = path if path is not None else _located_path(environ)
+    if located is None or not located.is_file():
+        return None
+    try:
+        text = located.read_text(encoding="utf-8")
+    except OSError as error:
+        raise ValueError(f"{located} could not be read") from error
+    try:
+        document = tomllib.loads(text)
+    except (tomllib.TOMLDecodeError, UnicodeDecodeError) as error:
+        raise ValueError(f"{located} must contain valid TOML: {error}") from error
+    return cast(dict[str, object], document)
+
+
+def _located_path(environ: Mapping[str, str]) -> Path | None:
+    """Resolve which file to read without searching anywhere the operator did not name."""
+    named = optional_environment_value(environ, CONFIG_FILE_VARIABLE)
+    if named is not None:
+        located = Path(named)
+        if not located.is_file():
+            raise ValueError(f"{CONFIG_FILE_VARIABLE} names {named}, which is not a file")
+        return located
+    default = Path(DEFAULT_CONFIG_FILE)
+    return default if default.is_file() else None
 
 
 def validate_plugin_name(value: object, name: str = "plugin name") -> str:

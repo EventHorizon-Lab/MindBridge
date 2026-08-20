@@ -248,6 +248,7 @@ PROVIDERS: dict[str, str] = {
     "psycopg_pool": "psycopg",
     "pyarrow": "pyarrow",
     "pydantic": "pydantic",
+    "tomli": "tomli",
     "pytest": "pytest",
     "sentence_transformers": "sentence-transformers",
     "soundfile": "soundfile",
@@ -264,6 +265,15 @@ PLATFORM_SUPPLIED = frozenset({"cv2", "funasr", "insightface", "onnxruntime"})
 would pull the generic PyPI wheel over the vendor build on four of the five supported
 platforms, so `edge/identity_inference.py` and `edge/identity_diarization.py` import them
 lazily and raise `ModelUnavailableError` naming the platform requirement.
+"""
+
+STDLIB_ABOVE_FLOOR = frozenset({"tomllib"})
+"""Modules the standard library provides above the floor and a backport supplies below it.
+
+`sys.stdlib_module_names` describes the interpreter running the tests, so a 3.10 run does not
+recognise `tomllib` and reads the version-guarded import in `mindbridge.configuration` as an
+undeclared dependency. Its `tomli` half is declared and named in `PROVIDERS`; this names the
+other half, so one conditional import is not read as two missing ones.
 """
 
 RUNTIME_ONLY = frozenset({"torchvision", "uvicorn"})
@@ -334,6 +344,7 @@ def _third_party(modules: Iterable[str]) -> set[str]:
         if module.partition(".")[0] not in sys.stdlib_module_names
         and not module.startswith("mindbridge")
         and module.partition(".")[0] not in PLATFORM_SUPPLIED
+        and module.partition(".")[0] not in STDLIB_ABOVE_FLOOR
     }
 
 

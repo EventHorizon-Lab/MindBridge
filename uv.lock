@@ -867,6 +867,7 @@ source = { editable = "." }
 dependencies = [
     { name = "httpx" },
     { name = "pydantic" },
+    { name = "tomli", marker = "python_full_version < '3.11'" },
 ]
 
 [package.optional-dependencies]
@@ -1012,6 +1013,7 @@ requires-dist = [
     { name = "sentence-transformers", marker = "extra == 'cloud-models'", specifier = ">=5.2,<6" },
     { name = "soundfile", marker = "extra == 'media'", specifier = ">=0.13,<1" },
     { name = "starlette", marker = "extra == 'server'", specifier = ">=0.46,<2" },
+    { name = "tomli", marker = "python_full_version < '3.11'", specifier = ">=2,<3" },
     { name = "torch", marker = "extra == 'cloud-models'", specifier = "==2.9.1", index = "https://download.pytorch.org/whl/cu128" },
     { name = "torchvision", marker = "extra == 'cloud-models'", specifier = "==0.24.1", index = "https://download.pytorch.org/whl/cu128" },
     { name = "transformers", marker = "extra == 'cloud-models'", specifier = ">=5.1,<6" },
