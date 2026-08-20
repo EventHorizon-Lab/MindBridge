@@ -158,3 +158,50 @@ def test_load_scopes_second_persona_independently(tmp_path: Path) -> None:
         "all_options": "(a) swimming\n(b) hiking\n(c) chess\n(d) cooking",
         "correct_answer": "(b)",
     }
+
+
+# U+2028 LINE SEPARATOR is legal inside a JSON string and is not a JSON line
+# delimiter, but `str.splitlines()` breaks on it. The shipped PersonaMem v1
+# release happens to carry none today, so no fixture built from the real
+# corpus can exercise this -- hence a synthetic context line that does.
+_SEPARATOR = "\u2028"
+_SEPARATED_CONTENT = f"User: I flew to Osaka{_SEPARATOR}and then to Kyoto"
+
+
+def test_load_keeps_a_unicode_line_separator_inside_a_context_line(tmp_path: Path) -> None:
+    """Splitting the contexts JSONL on Unicode line boundaries shreds records.
+
+    Under `str.splitlines()` this one context line becomes two truncated
+    pieces, so `json.loads` raises `Unterminated string` and the shared
+    context never registers. Asserting the round-tripped content (not just
+    that loading succeeded) also rules out a rule that split the line and
+    silently dropped or rejoined the character.
+    """
+    contexts_path = tmp_path / "shared_contexts_32k.jsonl"
+    contexts_path.write_text(
+        json.dumps(
+            {"ctx-9": [{"role": "user", "content": _SEPARATED_CONTENT}]},
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    questions_path = tmp_path / "questions_32k.csv"
+    with questions_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(_QUESTIONS[0].keys()))
+        writer.writeheader()
+        writer.writerow(
+            {
+                "persona_id": "persona-9",
+                "question_id": "q-0009",
+                "user_question_or_message": "Which cities did the user fly to?",
+                "correct_answer": "(a)",
+                "all_options": "(a) Osaka and Kyoto\n(b) Tokyo\n(c) Nara\n(d) Kobe",
+                "shared_context_id": "ctx-9",
+                "end_index_in_shared_context": "1",
+            }
+        )
+
+    [case] = load(questions_path, contexts_path)
+
+    assert [message["content"] for message in case.messages] == [_SEPARATED_CONTENT]

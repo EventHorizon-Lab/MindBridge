@@ -91,7 +91,7 @@ Just return the label CORRECT or WRONG in a json format with the key as "label":
 
 
 def rows(path: str | Path) -> list[dict]:
-    return [json.loads(line) for line in Path(path).read_text(encoding="utf-8").splitlines() if line.strip()]
+    return [json.loads(line) for line in Path(path).read_text(encoding="utf-8").split("\n") if line.strip()]
 
 
 def memory_text(value: object) -> str:

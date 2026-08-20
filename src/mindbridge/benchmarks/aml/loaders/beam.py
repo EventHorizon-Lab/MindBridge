@@ -28,6 +28,37 @@ violations across all 400 questions. So one conversation directory is
 already a correct, un-leaky retrieval scope: one `AmlCase` per conversation,
 no per-question grouping like `personamem_v1` needs.
 
+### The 10M tier's plan wrapping is grouping, not scope (measured, not assumed)
+
+The 10M tier alone nests one level deeper: its `chat.json` is a list of
+single-key `{"plan-N": [...batches...]}` dicts rather than a list of batch
+objects. Measured across all 10 of that tier's conversations: every one is
+exactly 10 such elements, keyed `plan-1` ... `plan-10` in document order. (The
+sibling `plan-0/` ... `plan-9/` directories on disk are off by one from the
+JSON keys; the loader reads only `chat.json`, so that mismatch is irrelevant
+here.)
+
+Those plans are consecutive stretches of one conversation, not separate
+conversations, so a 10M directory is still exactly one `AmlCase` -- the same
+rule as every other tier. Two measurements settle it, the same way
+`source_chat_ids` reachability settles the question-scope split above:
+
+- Turn `id`s are conversation-global and strictly increasing across plan
+  boundaries in document order -- `0..N-1`, no gaps, no restarts, on all 10
+  conversations (18,760 to 23,716 turns each, 208,696 total).
+- 47 of the 176 probing questions carrying `source_chat_ids` point at turns
+  living in **two different plans** (200 questions total; `abstention` never
+  carries source ids, nor do 4 of the 20 `summarization` questions). All 176
+  resolve to a turn in the same conversation -- 0 violations, matching the
+  100K result above. The questions' own `plan_reference` field says the same
+  thing in words, e.g. `"Plan 0-1"`.
+
+One case per plan would therefore push the evidence for 27% of the answerable
+questions outside the retrieval scope of the case that asks them --
+manufacturing unanswerable questions rather than preventing leakage. So the
+plan key is dropped as the generation-pipeline grouping artifact it is, and
+the batches under it are concatenated in document order.
+
 ### The category field's real name and values
 
 The category is not a field on each question object -- it is the **top-level
@@ -75,6 +106,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Annotated
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
@@ -101,6 +133,22 @@ class _RawBatch(BaseModel):
     turns: list[list[_RawTurn]]
 
 
+# The 10M tier's extra nesting level: one `{"plan-N": [...batches...]}` dict per
+# plan where the other tiers put a bare batch object. The union of the two in
+# `_batches` is unambiguous -- a plan group has no `turns`, and a batch's
+# `batch_number` is an int, not a list of batches -- so neither shape can
+# validate as the other.
+#
+# Both lengths are bounded below because an unbounded `dict` accepts `{}`, and an
+# empty plan group contributes no turns while validating: the element that used to
+# fail this file loudly would instead vanish from the conversation. A benchmark that
+# silently drops records reports a score for a corpus it did not read.
+_RawPlanGroup = Annotated[
+    dict[str, Annotated[list[_RawBatch], Field(min_length=1)]],
+    Field(min_length=1),
+]
+
+
 class _RawQuestion(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
@@ -117,7 +165,7 @@ def load(chat: Path, questions: Path) -> tuple[AmlCase, ...]:
     # unrelated conversations into one `user_id` -- the same MindBridge
     # retrieval scope -- contaminating recall across sizes.
     conversation_id = f"{chat.parent.parent.name}:{chat.parent.name}"
-    batches = TypeAdapter(list[_RawBatch]).validate_json(chat.read_bytes())
+    batches = _batches(chat)
     by_category = TypeAdapter(dict[str, list[_RawQuestion]]).validate_json(questions.read_bytes())
     case = AmlCase(
         user_id=f"beam:{conversation_id}",
@@ -125,6 +173,25 @@ def load(chat: Path, questions: Path) -> tuple[AmlCase, ...]:
         questions=_questions(conversation_id, by_category),
     )
     return (case,)
+
+
+def _batches(chat: Path) -> list[_RawBatch]:
+    """Read one `chat.json` as batches, flattening the 10M tier's plan grouping.
+
+    Both shapes concatenate in document order, which is the conversation's own
+    order -- turn ids ascend straight across plan boundaries (see the module
+    docstring). Every real 10M element carries exactly one plan key, so a plan
+    key labels a stretch of that timeline and never orders it.
+    """
+    elements = TypeAdapter(list[_RawBatch | _RawPlanGroup]).validate_json(chat.read_bytes())
+    batches: list[_RawBatch] = []
+    for element in elements:
+        if isinstance(element, _RawBatch):
+            batches.append(element)
+            continue
+        for plan_batches in element.values():
+            batches.extend(plan_batches)
+    return batches
 
 
 def _messages(batches: list[_RawBatch]) -> tuple[dict[str, object], ...]:

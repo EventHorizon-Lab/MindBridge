@@ -97,6 +97,7 @@ from pathlib import Path
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
 from mindbridge.benchmarks.aml.cases import AmlCase, AmlQuestion
+from mindbridge.benchmarks.artifacts import jsonl_lines
 
 _PARAGRAPH_BREAK = re.compile(r"\n[ \t]*\n")
 
@@ -143,8 +144,7 @@ class _RawRecord(BaseModel):
 
 def load(path: Path) -> tuple[AmlCase, ...]:
     """Load the official CL-Bench corpus into benchmark-neutral AML cases."""
-    lines = [line for line in path.read_text().splitlines() if line.strip()]
-    records = [TypeAdapter(_RawRecord).validate_json(line) for line in lines]
+    records = [TypeAdapter(_RawRecord).validate_json(line) for line in jsonl_lines(path)]
     return tuple(_case(record) for record in records)
 
 

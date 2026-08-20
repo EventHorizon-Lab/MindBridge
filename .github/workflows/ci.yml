@@ -69,7 +69,12 @@ jobs:
           wanted = tuple(f"mindbridge.{name}" for name in os.environ["PROBE"].split())
           found = sorted(
               name
-              for _, name, _ in pkgutil.walk_packages(mindbridge.__path__, "mindbridge.")
+              # Without `onerror` the walk re-raises anything that is not an ImportError, so
+              # one package whose import reaches configuration would end this step in a
+              # traceback rather than the report below -- the opposite of what the loop decides.
+              for _, name, _ in pkgutil.walk_packages(
+                  mindbridge.__path__, "mindbridge.", onerror=lambda _name: None
+              )
               if any(name == prefix or name.startswith(f"{prefix}.") for prefix in wanted)
           )
           failed = []
@@ -83,7 +88,7 @@ jobs:
                   # app from the environment as it loads. Anything that is not a missing
                   # import is configuration, not packaging, so it is not this job's business.
                   pass
-          print(f"imported {len(found)} modules under {' '.join(wanted)}")
+          print(f"imported {len(found) - len(failed)} of {len(found)} modules under {' '.join(wanted)}")
           for line in failed:
               print(f"  FAILED {line}")
           if not found:
