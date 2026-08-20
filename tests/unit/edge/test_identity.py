@@ -269,7 +269,7 @@ def test_face_voice_association_requires_repeatable_unambiguous_evidence(tmp_pat
 def test_a_device_upgraded_from_a_revision_keyed_store_can_still_learn(tmp_path: Path) -> None:
     """A device carrying the old schema must not meet a NOT NULL column that no writer fills."""
     database_path = tmp_path / "edge.sqlite3"
-    with sqlite3.connect(database_path) as connection:
+    with closing(sqlite3.connect(database_path)) as connection, connection:
         connection.executescript(
             """
             CREATE TABLE edge_identity_templates (
@@ -323,7 +323,7 @@ def test_a_device_upgraded_from_a_revision_keyed_store_can_still_learn(tmp_path:
     match = memory.recognize_and_remember(_sample("sample_01", (1.0, 0.0)), minimum_similarity=0.8)
 
     assert match.enrolled_new is True
-    with sqlite3.connect(database_path) as connection:
+    with closing(sqlite3.connect(database_path)) as connection, connection:
         for table in ("edge_identity_templates", "edge_face_voice_evidence"):
             columns = {
                 str(row[1]) for row in connection.execute(f"PRAGMA table_info({table})").fetchall()
