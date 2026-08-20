@@ -64,8 +64,7 @@ OpenAI SDK 与可观测边界，不钉死任何一家的加速器 wheel。减掉
 
 ### 3.1 M3-Agent
 
-依据 M3-Agent 固定 revision
-`0e3e41939bd8a0b66d756e7b7eb8d5fe9992da5c`：
+依据 M3-Agent 官方发布：
 
 | 环节 | M3-Agent | MindBridge |
 | --- | --- | --- |
@@ -179,7 +178,7 @@ MindBridge 当前将 face box 标为 `F0/F1/...`，保留原视频音轨，并�
 一对 face↔voice 必须满足：
 
 1. 时间区间真实重叠，排除画外音、屏幕人物、机器人 TTS 和明显音画不同步；
-2. 证据绑定 Observation、精确区间和模型 deployment revision；
+2. 证据绑定 Observation、精确区间和产出它的模型；
 3. 跨多个 Observation 达到累计时长和加权 confidence；
 4. face→voice 与 voice→face 双向互为最佳，且都以校准 margin 胜过第二名；
 5. 新竞争证据或 tombstone 能立即让解析退回未绑定。
@@ -220,7 +219,7 @@ speech pipeline，否则顺序复用同一加速器。CPU 承担 SQLite、AES、
 通用 lock 不钉死任何平台的加速器 wheel（Jetson Torch、RKNN Toolkit、OpenVINO runtime、BPU
 工具链都一样）。CI 用独立 venv 对 Core、Edge、Server 分别 build/install，并在
 隔离解释器中导入对应入口，防止 Edge 再次拖入 FastAPI、Celery、MCP 或 PostgreSQL。FunASR 安装
-成功还不等于模型路径可用；设备镜像必须在启动验收中加载固定 revision，并核对**实际生效的
+成功还不等于模型路径可用；设备镜像必须在启动验收中真正加载模型，并核对**实际生效的
 device/provider**——不能因为进程起得来就认为加速器在工作。
 
 ## 9. 真值 bake-off 与 SOTA 门槛

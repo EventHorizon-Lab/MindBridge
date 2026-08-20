@@ -105,7 +105,6 @@ class AnswerPipeline:
         set_current_span_attributes(
             {
                 "mindbridge.model.id": result.model_reference.model_id,
-                "mindbridge.model.revision": result.model_reference.revision,
                 "mindbridge.prompt.version": ANSWER_FROM_EVIDENCE_PROMPT.version,
                 "mindbridge.memory.count": len(memories),
                 "mindbridge.evidence.count": len(evidence),
@@ -159,7 +158,6 @@ class OccurrencePipeline:
         set_current_span_attributes(
             {
                 "mindbridge.model.id": result.model_reference.model_id,
-                "mindbridge.model.revision": result.model_reference.revision,
                 "mindbridge.prompt.version": SELECT_OCCURRENCES_PROMPT.version,
                 "mindbridge.memory.count": len(memories),
                 "mindbridge.evidence.count": len(evidence),

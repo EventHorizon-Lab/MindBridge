@@ -51,9 +51,7 @@ class M3RunManifest(MediaBenchmarkRunManifest):
     benchmark: Literal["M3-Bench"] = "M3-Bench"
     subset: Literal["robot", "web"]
     source_repository: NonEmptyString
-    source_revision: NonEmptyString
     media_repository: NonEmptyString
-    media_revision: NonEmptyString
     prepared_media_manifest_sha256: Sha256Hex
     perception_prompt_version: NonEmptyString
     clip_duration_seconds: int = Field(gt=0)
@@ -68,8 +66,6 @@ class M3RunManifest(MediaBenchmarkRunManifest):
 class _Arguments(MediaArguments):
     prepared_media_path: Path
     subset: Literal["robot", "web"]
-    source_revision: str
-    media_revision: str
     video_ids: tuple[str, ...]
 
 
@@ -154,9 +150,7 @@ def _write_artifacts(
         predictions=predictions,
         subset=arguments.subset,
         source_repository="ByteDance-Seed/m3-agent",
-        source_revision=arguments.source_revision,
         media_repository="ByteDance-Seed/M3-Bench",
-        media_revision=arguments.media_revision,
         prepared_media_manifest_sha256=sha256_file(arguments.prepared_media_path),
         perception_prompt_version=PERCEIVE_EVENTS_PROMPT.version,
         clip_duration_seconds=M3_CLIP_DURATION_SECONDS,
@@ -206,12 +200,6 @@ def _parse_arguments(argv: Sequence[str] | None, prog: str | None) -> _Arguments
         "--subset", choices=("robot", "web"), required=True, help="official subset to replay"
     )
     parser.add_argument(
-        "--source-revision", required=True, help="revision of the official M3-Bench release"
-    )
-    parser.add_argument(
-        "--media-revision", required=True, help="revision of the official media release"
-    )
-    parser.add_argument(
         "--video-id",
         action="append",
         default=[],
@@ -224,8 +212,6 @@ def _parse_arguments(argv: Sequence[str] | None, prog: str | None) -> _Arguments
         parsed,
         prepared_media_path=parsed.prepared_media,
         subset=cast(Literal["robot", "web"], parsed.subset),
-        source_revision=parsed.source_revision,
-        media_revision=parsed.media_revision,
         video_ids=tuple(parsed.video_id),
     )
 

@@ -130,10 +130,6 @@ knob to a plugin schema does not widen the deployment surface. `MINDBRIDGE_MEDIA
 the one deliberate exception: it selects hardware rather than model behaviour, and routing it through
 `select_torch_device` turns a missing GPU into a startup failure instead of a silent fall back to CPU.
 
-Both embedding plugins spell the pinned model revision `model_revision` in their configuration
-objects. `PluginConfigModel` sets `extra="forbid"`, so a stale key such as `revision` fails the
-factory at startup rather than being ignored.
-
 Benchmark runners require `--deployment-config`. The referenced JSON records every selected server
 and Worker plugin, its owning Python distribution and version, plus its non-secret resolved
 configuration. The runner reads and validates those bytes before inference starts, then embeds the

@@ -17,7 +17,7 @@ from mindbridge.core import EmbeddingSpaceReference, MediaObject, ModelReference
 class RecordingTextEmbedder:
     """Returns a valid unit vector while retaining the text that was embedded."""
 
-    space_reference = EmbeddingSpaceReference(space_id="jina-v5", revision="space-v1")
+    space_reference = EmbeddingSpaceReference(space_id="jina-v5")
 
     def __init__(self) -> None:
         self.documents: tuple[str, ...] = ()
@@ -33,8 +33,8 @@ class RecordingTextEmbedder:
             tuple(
                 Embedding(
                     (1.0, 0.0),
-                    ModelReference(model_id="jina-text", revision="text-revision"),
-                    EmbeddingSpaceReference(space_id="jina-v5", revision="space-v1"),
+                    ModelReference(model_id="jina-text"),
+                    EmbeddingSpaceReference(space_id="jina-v5"),
                 )
                 for _ in request.inputs
             )

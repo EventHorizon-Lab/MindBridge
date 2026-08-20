@@ -14,7 +14,6 @@ from mindbridge.core import DEFAULT_EMBEDDING_DIMENSION, EmbeddingSpaceReference
 
 __all__ = [
     "DEFAULT_EMBEDDER_MODEL_ID",
-    "DEFAULT_EMBEDDER_REVISION",
     "DEFAULT_EMBEDDING_DIMENSION",
     "DEFAULT_EMBEDDING_SPACE",
     "DEFAULT_GENERATOR_MODEL_ID",
@@ -38,10 +37,8 @@ supplied MINDBRIDGE_GENERATOR_CONFIG_JSON without this key got a model client al
 inside a task killed at 1080 -- the disagreement the derived budget exists to remove.
 """
 DEFAULT_EMBEDDER_MODEL_ID = "jinaai/jina-embeddings-v5-omni-small-retrieval"
-DEFAULT_EMBEDDER_REVISION = "12949877f0092093f366c6450340011320152a05"
 DEFAULT_EMBEDDING_SPACE = EmbeddingSpaceReference(
     space_id="jinaai/jina-embeddings-v5-omni-small-retrieval-1024",
-    revision="omni@12949877f0092093f366c6450340011320152a05",
 )
 
 # Jina v5 trains these Matryoshka prefixes; any other width is an untrained
@@ -86,7 +83,6 @@ def openai_generator_config(
         "api_key": require_environment_value(source, "MINDBRIDGE_GENERATOR_API_KEY"),
         "endpoint": require_environment_value(source, "MINDBRIDGE_GENERATOR_ENDPOINT"),
         "model_id": source.get("MINDBRIDGE_GENERATOR_MODEL_ID", DEFAULT_GENERATOR_MODEL_ID),
-        "model_revision": require_environment_value(source, "MINDBRIDGE_GENERATOR_MODEL_REVISION"),
     }
     if request_timeout_seconds is not None:
         config["request_timeout_seconds"] = request_timeout_seconds
@@ -103,9 +99,6 @@ def openai_embedder_config(
         "api_key": require_environment_value(source, "MINDBRIDGE_EMBEDDER_API_KEY"),
         "endpoint": require_environment_value(source, "MINDBRIDGE_EMBEDDER_ENDPOINT"),
         "model_id": source.get("MINDBRIDGE_EMBEDDER_MODEL_ID", DEFAULT_EMBEDDER_MODEL_ID),
-        "model_revision": source.get(
-            "MINDBRIDGE_EMBEDDER_MODEL_REVISION", DEFAULT_EMBEDDER_REVISION
-        ),
         **_embedding_space_config(source),
     }
     if request_timeout_seconds is not None:
@@ -117,9 +110,6 @@ def jina_media_embedder_config(source: Mapping[str, str]) -> dict[str, object]:
     """Read the bundled local Jina contract for the Worker's image, video, and audio encoder."""
     config: dict[str, object] = {
         "model_id": source.get("MINDBRIDGE_MEDIA_EMBEDDER_MODEL_ID", DEFAULT_EMBEDDER_MODEL_ID),
-        "model_revision": source.get(
-            "MINDBRIDGE_MEDIA_EMBEDDER_MODEL_REVISION", DEFAULT_EMBEDDER_REVISION
-        ),
         **_embedding_space_config(source),
     }
     device = optional_environment_value(source, "MINDBRIDGE_MEDIA_EMBEDDER_DEVICE")
@@ -132,8 +122,5 @@ def _embedding_space_config(source: Mapping[str, str]) -> dict[str, object]:
     """Name the one search space and vector width every encoder in a deployment must share."""
     return {
         "space_id": source.get("MINDBRIDGE_EMBEDDING_SPACE_ID", DEFAULT_EMBEDDING_SPACE.space_id),
-        "space_revision": source.get(
-            "MINDBRIDGE_EMBEDDING_SPACE_REVISION", DEFAULT_EMBEDDING_SPACE.revision
-        ),
         "dimension": embedding_dimension_from_environment(source),
     }

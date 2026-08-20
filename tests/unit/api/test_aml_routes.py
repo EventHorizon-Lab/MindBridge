@@ -31,7 +31,7 @@ class _StubGenerator:
     async def generate(self, request: GenerateRequest) -> GenerateResult:
         return GenerateResult(
             text='{"memories": [{"summary": "Rob moved to Sweden.", "type": "episodic"}]}',
-            model_reference=ModelReference(model_id="qwen3.8-max", revision="test"),
+            model_reference=ModelReference(model_id="qwen3.8-max"),
         )
 
 
@@ -202,7 +202,7 @@ class _ManyMemoriesGenerator:
         ]
         return GenerateResult(
             text=json.dumps({"memories": memories}),
-            model_reference=ModelReference(model_id="qwen3.8-max", revision="test"),
+            model_reference=ModelReference(model_id="qwen3.8-max"),
         )
 
 

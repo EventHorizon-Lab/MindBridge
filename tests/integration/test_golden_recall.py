@@ -45,8 +45,8 @@ from mindbridge.models import Embedding, EmbedRequest, EmbedResult, EmbedTask, T
 
 TENANT_ID = TenantId("tenant_golden_recall")
 NOW = datetime(2026, 8, 12, 12, 0, tzinfo=timezone.utc)
-MODEL_REFERENCE = ModelReference(model_id="golden-jina", revision="v1")
-SPACE_REFERENCE = EmbeddingSpaceReference(space_id="golden-space", revision="v1")
+MODEL_REFERENCE = ModelReference(model_id="golden-jina")
+SPACE_REFERENCE = EmbeddingSpaceReference(space_id="golden-space")
 VECTOR_DIMENSION = 1_024
 GOLDEN_SET_PATH = Path(__file__).parents[1] / "benchmarks" / "golden_recall.json"
 

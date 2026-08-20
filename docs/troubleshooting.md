@@ -51,7 +51,7 @@ value is an untrained truncation that silently degrades recall quality.
 The embedding-space probe found a tenant holding vectors the configured space cannot reach. This
 is the guard that stops a changed embedder from turning every recall into an empty result.
 
-Either restore the previous `MINDBRIDGE_EMBEDDING_SPACE_ID` / `_REVISION` / `_DIMENSION`, or
+Either restore the previous `MINDBRIDGE_EMBEDDING_SPACE_ID` / `_DIMENSION`, or
 complete the re-embedding. Vectors in several spaces are accepted **while** a migration is in
 progress, so a partial rebuild is not itself the problem.
 

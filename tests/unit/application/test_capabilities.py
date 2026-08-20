@@ -15,8 +15,8 @@ def test_embedding_requires_a_normalized_vector(values: tuple[float, ...]) -> No
     with pytest.raises(DomainInvariantError, match="L2-normalized"):
         Embedding(
             values,
-            ModelReference("test/model", "1"),
-            EmbeddingSpaceReference("test-space", "1"),
+            ModelReference("test/model"),
+            EmbeddingSpaceReference("test-space"),
         )
 
 

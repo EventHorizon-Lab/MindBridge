@@ -2,7 +2,7 @@
 
 Cheap 7 (final review, 2026-08-17): `PINNED.md`'s entire purpose is being a
 claim a reviewer can check -- "these vendored files match this sha256, as of
-this revision" -- but nothing in the suite ever checked it. A vendored file
+these digests" -- but nothing in the suite ever checked it. A vendored file
 edited (accidentally or otherwise) without updating the pin would go
 undetected indefinitely; this test makes that drift a CI failure instead.
 """

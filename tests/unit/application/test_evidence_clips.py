@@ -220,7 +220,7 @@ class RecordingStore:
 
 
 class RecordingEmbedder:
-    space_reference = EmbeddingSpaceReference(space_id="jina-v5", revision="space-v1")
+    space_reference = EmbeddingSpaceReference(space_id="jina-v5")
 
     def __init__(self) -> None:
         self.tasks: list[EmbedTask] = []
@@ -245,8 +245,8 @@ class RecordingEmbedder:
             tuple(
                 Embedding(
                     (1.0, 0.0),
-                    ModelReference(model_id="jina-omni", revision="revision-01"),
-                    EmbeddingSpaceReference(space_id="jina-v5", revision="space-v1"),
+                    ModelReference(model_id="jina-omni"),
+                    EmbeddingSpaceReference(space_id="jina-v5"),
                 )
                 for _ in request.inputs
             )

@@ -190,7 +190,6 @@ def test_consolidation_settings_require_and_redact_credentials() -> None:
         "MINDBRIDGE_OBJECT_STORAGE_BUCKET": "memory",
         "MINDBRIDGE_GENERATOR_API_KEY": "generator-secret",
         "MINDBRIDGE_GENERATOR_ENDPOINT": "https://generator.example.test/v1",
-        "MINDBRIDGE_GENERATOR_MODEL_REVISION": "deployment-revision",
         "MINDBRIDGE_EMBEDDER_API_KEY": "embedding-secret",
         "MINDBRIDGE_EMBEDDER_ENDPOINT": "https://embedding.example.test/v1",
     }

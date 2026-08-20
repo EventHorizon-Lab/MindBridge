@@ -117,8 +117,8 @@ class DiscardingObservationJobPublisher:
 class FixedEmbedder:
     """Keeps persistence integration independent from the embedding service."""
 
-    model_reference = ModelReference(model_id="jina-omni", revision="pinned-revision")
-    space_reference = EmbeddingSpaceReference(space_id="jina-v5", revision="space-v1")
+    model_reference = ModelReference(model_id="jina-omni")
+    space_reference = EmbeddingSpaceReference(space_id="jina-v5")
 
     async def embed(self, request: EmbedRequest) -> EmbedResult:
         vector = (1.0,) + (0.0,) * 1_023
@@ -227,6 +227,7 @@ async def test_migration_installs_complete_phase_zero_schema(database_url: str) 
         18,
         19,
         20,
+        21,
     ]
 
 
@@ -302,7 +303,6 @@ async def test_postgres_vertical_path_is_idempotent_and_evidence_first(
     assert stored_batch.media_objects[0].media_object_id == "media_01"
     assert stored_batch.evidence_spans[0].end_ms == 4_000
     assert stored_batch.observation.identity_observations[0].identity_id == "person_device_01"
-    assert stored_batch.observation.identity_observations[0].model_reference.revision == "1.0.1"
     assert await _processing_job_count(database_url, "tenant_roundtrip") == 1
     assert memory.verification_status is VerificationStatus.ATTESTED
     assert result.answer == "The robot put the red screwdriver beside the blue toolbox."
@@ -689,7 +689,6 @@ def _observe_request(
                 end_ms=3_500,
                 confidence=0.91,
                 model_id="insightface/buffalo_l",
-                model_revision="1.0.1",
             ),
         ),
         idempotency_key=idempotency_key,

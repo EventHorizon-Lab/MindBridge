@@ -107,12 +107,10 @@ bundled per-field variables or through one explicit JSON object.
 | --- | --- | --- |
 | `MINDBRIDGE_GENERATOR_API_KEY` | yes | — |
 | `MINDBRIDGE_GENERATOR_ENDPOINT` | yes | — |
-| `MINDBRIDGE_GENERATOR_MODEL_REVISION` | yes | — |
 | `MINDBRIDGE_GENERATOR_MODEL_ID` | no | `qwen3.8-max` |
 
-`MODEL_REVISION` is required while `MODEL_ID` is not, which looks backwards until you consider
-what each one is for. A model ID has a sensible default; the exact revision behind an endpoint
-does not, and recording the wrong one makes every derived record's provenance a lie.
+The credentials are required and the model ID is not: an endpoint has no sensible default, while
+the model behind it does.
 
 `request_timeout_seconds` has no fallback variable — it lives in
 `MINDBRIDGE_GENERATOR_CONFIG_JSON` and defaults to **1800**. It is worth knowing because it does
@@ -128,7 +126,6 @@ a slow generator moves both deadlines at once. See
 | `MINDBRIDGE_EMBEDDER_API_KEY` | yes | — |
 | `MINDBRIDGE_EMBEDDER_ENDPOINT` | yes | — |
 | `MINDBRIDGE_EMBEDDER_MODEL_ID` | no | `jinaai/jina-embeddings-v5-omni-small-retrieval` |
-| `MINDBRIDGE_EMBEDDER_MODEL_REVISION` | no | `12949877f0092093f366c6450340011320152a05` |
 
 The worker's text slot deliberately reads these same names rather than a parallel family. It has
 to land in the space the API queries, and a second name is a second thing that can silently
@@ -140,7 +137,6 @@ name — each process has its own environment.
 | Variable | Required | Default |
 | --- | --- | --- |
 | `MINDBRIDGE_MEDIA_EMBEDDER_MODEL_ID` | no | `jinaai/jina-embeddings-v5-omni-small-retrieval` |
-| `MINDBRIDGE_MEDIA_EMBEDDER_MODEL_REVISION` | no | `12949877f0092093f366c6450340011320152a05` |
 | `MINDBRIDGE_MEDIA_EMBEDDER_DEVICE` | no | automatic selection |
 
 `MINDBRIDGE_MEDIA_EMBEDDER_MODEL_ID` is a Hugging Face repository ID; `MINDBRIDGE_EMBEDDER_MODEL_ID`
@@ -158,7 +154,6 @@ export MINDBRIDGE_GENERATOR_CONFIG_JSON='{
   "api_key": "...",
   "endpoint": "https://generator.example.com/v1",
   "model_id": "qwen3.8-max",
-  "model_revision": "deployment-2026-08-11",
   "reasoning_effort": "low"
 }'
 ```
@@ -182,14 +177,12 @@ set the plugin name and provide its JSON. See [plugin-architecture.md](plugin-ar
 | Variable | Required | Default |
 | --- | --- | --- |
 | `MINDBRIDGE_EMBEDDING_SPACE_ID` | no | `jinaai/jina-embeddings-v5-omni-small-retrieval-1024` |
-| `MINDBRIDGE_EMBEDDING_SPACE_REVISION` | no | `omni@12949877f0092093f366c6450340011320152a05` |
 | `MINDBRIDGE_EMBEDDING_DIMENSION` | no | `1024` |
 | `MINDBRIDGE_MINIMUM_EMBEDDING_SIMILARITY` | no | `0.0` |
 
-`SPACE_ID` and `SPACE_REVISION` name the compatibility space the selected embedder writes into
-and queries. They are separate from the encoder's own identity because several independently
-served encoders can write into one comparable space, while the same encoder at a different
-revision may not.
+`SPACE_ID` names the compatibility space the selected embedder writes into and queries. It is
+separate from the encoder's own identity because several independently served encoders can write
+into one comparable space, while a different encoder may not.
 
 `EMBEDDING_DIMENSION` is one width shared by the pgvector column and every encoder in the
 deployment. It accepts only widths Jina v5 was trained to truncate to — 32, 64, 128, 256, 512,

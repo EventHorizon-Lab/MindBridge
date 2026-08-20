@@ -65,7 +65,6 @@ def test_locomo_optimization_manifest_preserves_reported_category_metrics() -> N
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     runs = {run["name"]: run for run in manifest["runs"]}
 
-    assert manifest["dataset"]["revision"] == ("3eb6f2c585f5e1699204e3c3bdf7adc5c28cb376")
     assert runs["baseline"]["metrics"]["answer_f1"] == 0.5459446372710516
     assert runs["optimized"]["metrics"]["answer_f1"] == 0.6136889267575371
     assert runs["reflection_v8"]["metrics"]["answer_f1"] == 0.649383027799884

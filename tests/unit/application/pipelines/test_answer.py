@@ -93,7 +93,7 @@ async def test_answer_pipeline_streams_raw_av_and_validates_answer(
 
     answerer = _answerer(respond)
     assert answerer.model_reference.model_id == "qwen3.8-max"
-    assert answerer.model_reference.revision == "deployment-revision"
+    assert answerer.model_reference.model_id == "qwen3.8-max"
     assert answerer.prompt_version == "answer_from_evidence_v11"
     assert answerer.occurrence_prompt_version == "select_occurrences_v2"
     evidence = (
@@ -456,7 +456,7 @@ class _AnswerHarness:
 
     @property
     def model_reference(self) -> ModelReference:
-        return ModelReference(model_id="qwen3.8-max", revision="deployment-revision")
+        return ModelReference(model_id="qwen3.8-max")
 
     @property
     def prompt_version(self) -> str:
@@ -515,7 +515,7 @@ def _answerer(
     return _AnswerHarness(
         OpenAIGenerator(
             client,
-            ModelReference(model_id="qwen3.8-max", revision="deployment-revision"),
+            ModelReference(model_id="qwen3.8-max"),
             reasoning_effort="low",
         )
     )

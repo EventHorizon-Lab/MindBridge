@@ -88,26 +88,22 @@ class EventStatus(str, Enum):
 
 @dataclass(frozen=True, slots=True)
 class ModelReference:
-    """Exact frozen model version that produced a derived record."""
+    """Model that produced a derived record."""
 
     model_id: str
-    revision: str
 
     def __post_init__(self) -> None:
         require_non_empty(self.model_id, "model_id")
-        require_non_empty(self.revision, "revision")
 
 
 @dataclass(frozen=True, slots=True)
 class EmbeddingSpaceReference:
-    """Versioned compatibility space shared by independently served encoders."""
+    """Compatibility space shared by independently served encoders."""
 
     space_id: str
-    revision: str
 
     def __post_init__(self) -> None:
         require_non_empty(self.space_id, "space_id")
-        require_non_empty(self.revision, "revision")
 
 
 @dataclass(frozen=True, slots=True)

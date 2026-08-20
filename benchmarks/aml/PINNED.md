@@ -1,11 +1,10 @@
 # Pinned AML evaluation contract
 
 Source: <https://github.com/AML-memory/agent-memory-leaderboard>
-Revision: 5761ed58502d24153115cbdc010e44957cb18c3a
 
 These files are vendored verbatim and must never be edited. Scores are
-comparable to the leaderboard only while they match this revision byte
-for byte. To upgrade, re-pin the revision and regenerate this file.
+comparable to the leaderboard only while they match these digests byte
+for byte. To upgrade, re-vendor and regenerate this file.
 
 ```text
 04ccace501f29a3ce808286bfbe5a9a34ed5ed30e42143e6289772b02bbb84f9  benchmarks/aml/api_config.py

@@ -50,7 +50,7 @@ class RecordingEncoder:
         return Matrix(self.values)
 
 
-def test_jina_pins_remote_code_to_the_model_revision(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_jina_loads_the_omni_modality_by_name(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[tuple[str, dict[str, object]]] = []
 
     def sentence_transformer(model_path: str, **kwargs: object) -> RecordingEncoder:
@@ -59,7 +59,7 @@ def test_jina_pins_remote_code_to_the_model_revision(monkeypatch: pytest.MonkeyP
 
     def snapshot_download(**kwargs: object) -> str:
         calls.append(("snapshot_download", kwargs))
-        return "/models/pinned"
+        return "/models/omni"
 
     monkeypatch.setattr(
         "mindbridge.models.jina.import_module",
@@ -71,27 +71,23 @@ def test_jina_pins_remote_code_to_the_model_revision(monkeypatch: pytest.MonkeyP
     )
     monkeypatch.setattr("mindbridge.models.jina.select_torch_device", lambda _device: "cuda")
 
-    JinaEmbedder.load(revision="pinned-revision", dimension=2)
+    JinaEmbedder.load(dimension=2)
 
     assert calls == [
         (
             "snapshot_download",
             {
                 "repo_id": "jinaai/jina-embeddings-v5-omni-small-retrieval",
-                "revision": "pinned-revision",
             },
         ),
         (
-            "/models/pinned",
+            "/models/omni",
             {
-                "revision": "pinned-revision",
                 "trust_remote_code": True,
                 "device": "cuda",
                 "model_kwargs": {
                     "modality": "omni",
-                    "code_revision": "pinned-revision",
                 },
-                "config_kwargs": {"code_revision": "pinned-revision"},
             },
         ),
     ]
@@ -102,7 +98,7 @@ async def test_jina_uses_distinct_query_and_document_methods() -> None:
     encoder = RecordingEncoder([[1.0, 0.0]])
     embedder = JinaEmbedder(
         encoder,
-        ModelReference(model_id="jina", revision="revision"),
+        ModelReference(model_id="jina"),
         dimension=2,
     )
 
@@ -128,7 +124,7 @@ async def test_jina_rejects_invalid_model_output() -> None:
     """Malformed upstream vectors cannot enter the semantic index."""
     embedder = JinaEmbedder(
         RecordingEncoder([[1.0, 1.0]]),
-        ModelReference(model_id="jina", revision="revision"),
+        ModelReference(model_id="jina"),
         dimension=2,
     )
 
@@ -146,7 +142,7 @@ async def test_jina_skips_model_call_for_empty_batch() -> None:
     encoder = RecordingEncoder([])
     embedder = JinaEmbedder(
         encoder,
-        ModelReference(model_id="jina", revision="revision"),
+        ModelReference(model_id="jina"),
         dimension=2,
     )
 
@@ -191,7 +187,7 @@ def _load_with(encoder: object, monkeypatch: pytest.MonkeyPatch) -> JinaEmbedder
         ),
     )
     monkeypatch.setattr("mindbridge.models.jina.select_torch_device", lambda _device: "cuda")
-    return JinaEmbedder.load(revision="pinned-revision", dimension=2)
+    return JinaEmbedder.load(dimension=2)
 
 
 def test_jina_refuses_a_model_whose_media_processor_failed_to_load(

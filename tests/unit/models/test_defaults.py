@@ -13,11 +13,9 @@ from mindbridge.models.defaults import (
 ENVIRONMENT = {
     "MINDBRIDGE_GENERATOR_API_KEY": "generator-secret",
     "MINDBRIDGE_GENERATOR_ENDPOINT": "https://generator.example.test/v1",
-    "MINDBRIDGE_GENERATOR_MODEL_REVISION": "deployment-revision",
     "MINDBRIDGE_EMBEDDER_API_KEY": "embedder-secret",
     "MINDBRIDGE_EMBEDDER_ENDPOINT": "https://embedder.example.test/v1",
     "MINDBRIDGE_EMBEDDING_SPACE_ID": "jina-v5",
-    "MINDBRIDGE_EMBEDDING_SPACE_REVISION": "space-v1",
     "MINDBRIDGE_EMBEDDING_DIMENSION": "512",
 }
 
@@ -34,20 +32,18 @@ def test_text_and_media_encoders_agree_on_one_search_space() -> None:
     text = openai_embedder_config(ENVIRONMENT)
     media = jina_media_embedder_config(ENVIRONMENT)
 
-    for key in ("space_id", "space_revision", "dimension"):
+    for key in ("space_id", "dimension"):
         assert text[key] == media[key]
     assert text["dimension"] == 512
 
 
-def test_generator_requires_an_immutable_revision() -> None:
-    """A mutable deployment alias would make recorded provenance unverifiable."""
+def test_generator_requires_its_injected_credentials() -> None:
+    """A blank required credential must fail the builder, not reach the provider."""
     environment = {
-        name: value
-        for name, value in ENVIRONMENT.items()
-        if name != "MINDBRIDGE_GENERATOR_MODEL_REVISION"
+        name: value for name, value in ENVIRONMENT.items() if name != "MINDBRIDGE_GENERATOR_API_KEY"
     }
 
-    with pytest.raises(ValueError, match="MINDBRIDGE_GENERATOR_MODEL_REVISION"):
+    with pytest.raises(ValueError, match="MINDBRIDGE_GENERATOR_API_KEY"):
         openai_generator_config(environment)
 
 

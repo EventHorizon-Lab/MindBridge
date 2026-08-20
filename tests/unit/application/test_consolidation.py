@@ -110,7 +110,7 @@ class RecordingConsolidator:
                     salience=0.9,
                 ),
             ),
-            model_reference=ModelReference(model_id="qwen3.8-max", revision="omni-revision"),
+            model_reference=ModelReference(model_id="qwen3.8-max"),
             prompt_version="consolidate_episodes_v1",
         )
 
@@ -220,7 +220,7 @@ def _event(index: int) -> Event:
         description=f"Observed event {suffix}",
         salience=0.8,
         created_at=NOW,
-        model_reference=ModelReference(model_id="omni", revision="perception-revision"),
+        model_reference=ModelReference(model_id="omni"),
         prompt_version="perceive_events_v3",
     )
 

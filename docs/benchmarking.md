@@ -20,7 +20,7 @@ not be presented as a multimodal result.
 A number may be quoted as a benchmark score only when all four hold:
 
 1. An official complete split, not a subset.
-2. Fixed code and model revisions.
+2. Fixed models, named in the run manifest.
 3. A published run manifest committed alongside the results.
 4. Replayable outputs.
 
@@ -122,9 +122,7 @@ unaffected; AML runs ScriptMem server-side against its own copy.
 
 ```bash
 git clone https://github.com/mem-eval-suite/LoCoMo_refined.git .benchmarks/locomo-refined
-git -C .benchmarks/locomo-refined checkout 887091190789e8d6760e70b9edd696539923dc4f
 git clone https://github.com/mohammadtavakoli78/BEAM.git .benchmarks/beam
-git -C .benchmarks/beam checkout 3e12035532eb85768f1a7cd779832b650c4b2ef9
 uvx --from huggingface-hub hf download xiaowu0162/longmemeval --repo-type dataset \
   --local-dir .benchmarks/longmemeval
 uvx --from huggingface-hub hf download bowen-upenn/PersonaMem-v1 --repo-type dataset \
@@ -161,7 +159,6 @@ uv run mindbridge-bench aml \
   --dataset .benchmarks/locomo-refined/data/raw/locomo_refined.json \
   --output .benchmarks/results/aml-locomo-refined.jsonl \
   --api-base-url "$MINDBRIDGE_API_BASE_URL" \
-  --code-revision "$(git rev-parse HEAD)" \
   --deployment-config .benchmarks/deployment.json \
   --run-id smoke-1 \
   --tenant-prefix bench_aml \
@@ -257,65 +254,47 @@ releases and the Hugging Face CLI for Hub datasets; MindBridge does not ship ano
 
 ```bash
 git clone https://github.com/mem-eval-suite/LoCoMo_refined.git .benchmarks/locomo-refined
-git -C .benchmarks/locomo-refined checkout 887091190789e8d6760e70b9edd696539923dc4f
 git clone https://github.com/ByteDance-Seed/m3-agent.git .benchmarks/m3-agent
-git -C .benchmarks/m3-agent checkout 0e3e41939bd8a0b66d756e7b7eb8d5fe9992da5c
 uvx --from huggingface-hub hf download lmms-eval/Video-MME \
   videomme/test-00000-of-00001.parquet \
   --repo-type dataset \
-  --revision ead1408f75b618502df9a1d8e0950166bf0a2a0b \
   --local-dir .benchmarks/video-mme
 uvx --from huggingface-hub hf download lmms-lab/EgoLife \
   EgoLifeQA/EgoLifeQA_A1_JAKE.json \
   --repo-type dataset \
-  --revision 143fb319be7aa5ae210c936bf4f0f3a86092afb0 \
   --local-dir .benchmarks/egolife
 git clone https://github.com/google-research-datasets/egotempo.git .benchmarks/egotempo
-git -C .benchmarks/egotempo checkout 7022ba77b4d89f51cf34e499767995ccd5c90c7a
 uvx --from huggingface-hub hf download OSU-AIoT-MLSys-Lab/SuperMemory-VQA \
   data/json/all_qa.json \
   --repo-type dataset \
-  --revision 1d228e0f10049a8a84c458dded2aa25b1e21ce8f \
   --local-dir .benchmarks/supermemory-vqa
 uvx --from huggingface-hub hf download Ted412/EgoMemReason \
   annotations_public.jsonl \
   --repo-type dataset \
-  --revision 7e581505b9dce0e85193a27ae689ff899d0bc507 \
   --local-dir .benchmarks/egomem-reason
 uvx --from huggingface-hub hf download xiyuRenBill/MEMLENS \
   dataset_32k.json agent_subset_195.json \
   --repo-type dataset \
-  --revision afa101a1907cc37db40b50d649547964387b96b7 \
   --local-dir .benchmarks/memlens
 uvx --from huggingface-hub hf download MM-Lifelong/MM-Lifelong \
   day/test.json week/test.json month/train.json month/val.json \
   --repo-type dataset \
-  --revision 248aa82039a574e63a2e524746a7cd8f32330443 \
   --local-dir .benchmarks/mm-lifelong
 
 uv run --extra benchmarks mindbridge-bench datasets \
   --locomo-refined .benchmarks/locomo-refined/data/raw/locomo_refined.json \
-  --locomo-refined-revision 887091190789e8d6760e70b9edd696539923dc4f \
   --m3-robot .benchmarks/m3-agent/data/annotations/robot.json \
   --m3-web .benchmarks/m3-agent/data/annotations/web.json \
-  --m3-revision 0e3e41939bd8a0b66d756e7b7eb8d5fe9992da5c \
   --video-mme .benchmarks/video-mme/videomme/test-00000-of-00001.parquet \
-  --video-mme-revision ead1408f75b618502df9a1d8e0950166bf0a2a0b \
   --egolife .benchmarks/egolife/EgoLifeQA/EgoLifeQA_A1_JAKE.json \
-  --egolife-revision 143fb319be7aa5ae210c936bf4f0f3a86092afb0 \
   --egotempo .benchmarks/egotempo/egotempo_openQA.json \
-  --egotempo-revision 7022ba77b4d89f51cf34e499767995ccd5c90c7a \
   --egomem .benchmarks/egomem-reason/annotations_public.jsonl \
-  --egomem-revision 7e581505b9dce0e85193a27ae689ff899d0bc507 \
   --memlens .benchmarks/memlens/dataset_32k.json \
-  --memlens-revision afa101a1907cc37db40b50d649547964387b96b7 \
   --mm-day .benchmarks/mm-lifelong/day/test.json \
   --mm-week .benchmarks/mm-lifelong/week/test.json \
   --mm-month-train .benchmarks/mm-lifelong/month/train.json \
   --mm-month-val .benchmarks/mm-lifelong/month/val.json \
-  --mm-lifelong-revision 248aa82039a574e63a2e524746a7cd8f32330443 \
-  --supermemory .benchmarks/supermemory-vqa/data/json/all_qa.json \
-  --supermemory-revision 1d228e0f10049a8a84c458dded2aa25b1e21ce8f
+  --supermemory .benchmarks/supermemory-vqa/data/json/all_qa.json
 ```
 
 Large M3-Bench media stays outside Git. Acquire it through the official Hugging Face client rather
@@ -324,7 +303,6 @@ than a MindBridge downloader:
 ```bash
 uvx --from huggingface-hub hf download ByteDance-Seed/M3-Bench \
   --repo-type dataset \
-  --revision 2672152eee36b25ccb38fdbc3b72135347adbb63 \
   --include 'videos/robot/*' \
   --local-dir .benchmarks/m3-bench
 
@@ -334,7 +312,6 @@ uvx --from huggingface-hub hf download ByteDance-Seed/M3-Bench \
   intermediate_outputs/robot.tar.gz.02 \
   memory_graphs/robot.tar.gz \
   --repo-type dataset \
-  --revision 2672152eee36b25ccb38fdbc3b72135347adbb63 \
   --local-dir .benchmarks/m3-bench
 ```
 
@@ -344,7 +321,6 @@ release:
 ```bash
 uvx --from huggingface-hub hf download OSU-AIoT-MLSys-Lab/SuperMemory-VQA \
   --repo-type dataset \
-  --revision 1d228e0f10049a8a84c458dded2aa25b1e21ce8f \
   --include 'data/video/*' \
   --local-dir .benchmarks/supermemory-vqa
 ```
@@ -358,11 +334,11 @@ retrieval, and output identities. `MINDBRIDGE_API_KEY` identifies the exact benc
 manifest.
 
 Every benchmark also requires a secret-free deployment snapshot. It records the actual capability
-slots, plugin distribution versions, model revisions, embedding space, and inference options used by
+slots, plugin distribution versions, model identities, embedding space, and inference options used by
 the server and Worker. Before inference begins, the runner freezes the validated snapshot and the
 SHA-256 of those same bytes; credential-like keys are rejected.
 This is a run artifact, not a named Profile. For example, save the following as
-`.benchmarks/deployment.json` and replace the distribution versions and model revisions with those
+`.benchmarks/deployment.json` and replace the distribution versions and model identities with those
 from the deployed processes:
 
 ```json
@@ -373,7 +349,6 @@ from the deployed processes:
     "version": "0.1.0",
     "config": {
       "model_id": "qwen3.8-max",
-      "model_revision": "serving-fingerprint",
       "reasoning_effort": "low"
     }
   },
@@ -383,9 +358,7 @@ from the deployed processes:
     "version": "0.1.0",
     "config": {
       "model_id": "jinaai/jina-embeddings-v5-omni-small-retrieval",
-      "model_revision": "12949877f0092093f366c6450340011320152a05",
       "space_id": "jina-v5",
-      "space_revision": "deployment-space-v1",
       "dimension": 1024
     }
   },
@@ -394,8 +367,7 @@ from the deployed processes:
     "distribution": "mindbridge",
     "version": "0.1.0",
     "config": {
-      "model_id": "qwen3.8-max",
-      "model_revision": "serving-fingerprint"
+      "model_id": "qwen3.8-max"
     }
   },
   "worker_media_embedder": {
@@ -404,7 +376,6 @@ from the deployed processes:
     "version": "0.1.0",
     "config": {
       "model_id": "jinaai/jina-embeddings-v5-omni-small-retrieval",
-      "revision": "12949877f0092093f366c6450340011320152a05",
       "device": "cuda"
     }
   },
@@ -413,8 +384,7 @@ from the deployed processes:
     "distribution": "mindbridge",
     "version": "0.1.0",
     "config": {
-      "model_id": "jinaai/jina-embeddings-v5-omni-small-retrieval",
-      "model_revision": "12949877f0092093f366c6450340011320152a05"
+      "model_id": "jinaai/jina-embeddings-v5-omni-small-retrieval"
     }
   }
 }
@@ -426,10 +396,8 @@ uv run mindbridge-bench locomo-refined \
   --dataset .benchmarks/locomo-refined/data/raw/locomo_refined.json \
   --output .benchmarks/results/locomo-refined-mindbridge.jsonl \
   --api-base-url http://localhost:8000 \
-  --source-revision 887091190789e8d6760e70b9edd696539923dc4f \
   --deployment-config .benchmarks/deployment.json \
   --run-id locomo-refined-001 \
-  --code-revision "$(git rev-parse HEAD)" \
   --recall-limit 50 \
   --request-timeout-seconds 1800
 ```
@@ -472,7 +440,6 @@ the already-addressable objects:
             "end_ms": 4800,
             "confidence": 0.91,
             "model_id": "insightface/buffalo_l",
-            "model_revision": "1.0.1",
             "scope": "device",
             "visual_bbox_xyxy": [0.12, 0.08, 0.46, 0.82]
           }
@@ -508,11 +475,8 @@ uv run mindbridge-bench m3 \
   --output .benchmarks/results/m3-robot-mindbridge.jsonl \
   --api-base-url http://localhost:8000 \
   --subset robot \
-  --source-revision 0e3e41939bd8a0b66d756e7b7eb8d5fe9992da5c \
-  --media-revision 2672152eee36b25ccb38fdbc3b72135347adbb63 \
   --deployment-config .benchmarks/deployment.json \
   --run-id m3-robot-001 \
-  --code-revision "$(git rev-parse HEAD)" \
   --request-timeout-seconds 1800
 ```
 
@@ -521,7 +485,7 @@ Use `--video-id` for a smoke subset. Web video IDs are YouTube IDs, and 14 of th
 as the next option. The runner rejects a `--subset` that does not match the
 official Robot timing fields or their absence from Web. The JSONL uses the official `id`,
 `question`, `answer`, `type`, `before_clip`, and `response` fields and adds MindBridge retrieval
-diagnostics. Its sidecar manifest pins annotation/media hashes and revisions, code, both Omni calls,
+diagnostics. Its sidecar manifest pins annotation and media hashes, both Omni calls,
 Jina, Prompt versions, retrieval settings, and output hash.
 
 EgoLifeQA uses its official `DAYn` plus `HHMMSSFF` clock, whose final two digits are frame counts at
@@ -577,11 +541,8 @@ uv run mindbridge-bench egolife \
   --prepared-media .benchmarks/egolife-prepared-a1.json \
   --output .benchmarks/results/egolife-a1.json \
   --api-base-url http://localhost:8000 \
-  --dataset-revision 143fb319be7aa5ae210c936bf4f0f3a86092afb0 \
-  --evaluator-revision 7a97157908757cc898c26835b718653055ecc5f5 \
   --deployment-config .benchmarks/deployment.json \
   --run-id egolife-a1-001 \
-  --code-revision "$(git rev-parse HEAD)" \
   --request-timeout-seconds 1800
 ```
 
@@ -598,7 +559,7 @@ reports Ans-F1, QA-Acc, and QA-MRR and contains no ground-truth fields:
 When an official question boundary extends past the released MP4 container, keep that segment's
 published transcript and attach only the available media duration. The resulting `EvidenceSpan`
 ends at the real container tail; media may be shorter than its segment but must never exceed it.
-At the pinned dataset revision, 82 of 83 referenced sessions have an MP4; the remaining
+In the official release, 82 of 83 referenced sessions have an MP4; the remaining
 `Person_1_session_2_01312026_glasses_1275` session is VRS-only and remains transcript-only unless
 the caller prepares that VRS with the upstream Project Aria tooling.
 
@@ -630,11 +591,8 @@ uv run mindbridge-bench supermemory \
   --output .benchmarks/results/supermemory-person-1.json \
   --api-base-url http://localhost:8000 \
   --subject 1 \
-  --dataset-revision 1d228e0f10049a8a84c458dded2aa25b1e21ce8f \
-  --source-revision 8123980820ffa23a3452faa6bd8ce5dff0f03164 \
   --deployment-config .benchmarks/deployment.json \
   --run-id supermemory-person-1-001 \
-  --code-revision "$(git rev-parse HEAD)" \
   --request-timeout-seconds 1800
 ```
 
@@ -649,16 +607,13 @@ uv run mindbridge-bench egomem \
   --prepared-media .benchmarks/egomem-prepared.json \
   --output .benchmarks/results/egomem-submission.json \
   --api-base-url http://localhost:8000 \
-  --dataset-revision 7e581505b9dce0e85193a27ae689ff899d0bc507 \
-  --evaluator-revision 2ea98f7002bfad785532b186964cd779b6cd0ed6 \
   --deployment-config .benchmarks/deployment.json \
-  --run-id egomem-001 \
-  --code-revision "$(git rev-parse HEAD)"
+  --run-id egomem-001
 ```
 
 MEMLENS follows the official memory-agent protocol: every question gets a fresh tenant, sessions
 are consumed in release order, and the question date is supplied only at answer time. Download
-`release_images.tar.gz` from the same pinned dataset revision for multimodal runs, upload the
+`release_images.tar.gz` from the same official release for multimodal runs, upload the
 extracted images with the standard storage tooling, and map official relative paths to immutable
 image objects:
 
@@ -692,11 +647,8 @@ uv run mindbridge-bench memlens \
   --output .benchmarks/results/memlens-32k.json \
   --api-base-url http://localhost:8000 \
   --context-window 32k \
-  --dataset-revision afa101a1907cc37db40b50d649547964387b96b7 \
-  --evaluator-revision 77f3ab9a52fa2d6a17978e2dffe80438a4ecced2 \
   --deployment-config .benchmarks/deployment.json \
-  --run-id memlens-32k-001 \
-  --code-revision "$(git rev-parse HEAD)"
+  --run-id memlens-32k-001
 ```
 
 For the official text-only ablation, add `--text-only`, omit `--prepared-images`, and use a
@@ -744,10 +696,8 @@ uv run mindbridge-bench mm-lifelong \
   --output .benchmarks/results/mm-lifelong-month-val.jsonl \
   --api-base-url http://localhost:8000 \
   --split month_val \
-  --source-revision 248aa82039a574e63a2e524746a7cd8f32330443 \
   --deployment-config .benchmarks/deployment.json \
-  --run-id mm-lifelong-month-val-001 \
-  --code-revision "$(git rev-parse HEAD)"
+  --run-id mm-lifelong-month-val-001
 ```
 
 ### Video-MME and EgoTempo
@@ -801,13 +751,10 @@ uv run --extra benchmarks mindbridge-bench video-mme \
   --prepared-media .benchmarks/video-mme-prepared.json \
   --output .benchmarks/results/video-mme-long.json \
   --api-base-url http://localhost:8000 \
-  --dataset-revision ead1408f75b618502df9a1d8e0950166bf0a2a0b \
-  --evaluator-revision afd52cfe3dde5b3685e0d4f760c10c756860c758 \
   --deployment-config .benchmarks/deployment.json \
   --duration long \
   --transcript-source none \
-  --run-id video-mme-001 \
-  --code-revision "$(git rev-parse HEAD)"
+  --run-id video-mme-001
 ```
 
 EgoTempo writes the official `V`, `Q`, `QA`, `A`, `C`, and `M` fields. Run its pinned
@@ -819,11 +766,8 @@ uv run mindbridge-bench egotempo \
   --prepared-media .benchmarks/egotempo-prepared.json \
   --output .benchmarks/results/egotempo.json \
   --api-base-url http://localhost:8000 \
-  --source-revision 7022ba77b4d89f51cf34e499767995ccd5c90c7a \
-  --evaluator-revision 7022ba77b4d89f51cf34e499767995ccd5c90c7a \
   --deployment-config .benchmarks/deployment.json \
-  --run-id egotempo-001 \
-  --code-revision "$(git rev-parse HEAD)"
+  --run-id egotempo-001
 ```
 
 The official notebook reads every `.json` file in its configured `input_dir`. Copy only the
@@ -856,7 +800,6 @@ uv run mindbridge-bench score \
   --manifest .benchmarks/results/locomo-refined.jsonl.manifest.json \
   --scorer-output .benchmarks/results/locomo-refined-scorer-summary.json \
   --scorer-repository mem-eval-suite/LoCoMo_refined \
-  --scorer-revision 887091190789e8d6760e70b9edd696539923dc4f \
   --scorer-command "./scripts/run_eval.sh --metrics llm f1 bleu --llm-judge refined" \
   --judge-model Qwen/Qwen3-14B \
   --answer-backbone qwen3.8-max \
@@ -878,8 +821,7 @@ Cloud multimodal embedding dependencies are optional, so the API and edge packag
 
 ```bash
 uv sync --extra cloud-models
-uv run --extra cloud-models mindbridge-bench jina \
-  --revision 12949877f0092093f366c6450340011320152a05
+uv run --extra cloud-models mindbridge-bench jina
 ```
 
 The checked-in result is
@@ -894,7 +836,7 @@ A checklist for anyone about to quote a number from this harness.
 | Complete official split? | It is a diagnostic run. Say so. |
 | Manifest committed beside the result file? | It is not citable. |
 | Blind-answer control run? | You cannot separate memory from model. |
-| Code and model revisions pinned? | It is not reproducible. |
+| Models named in the manifest? | It is not reproducible. |
 | Released text, or raw audiovisual? | Text-only results are not multimodal results. |
 | Thinking mode confirmed off on the answer endpoint? | The judge may be scoring reasoning traces. |
 

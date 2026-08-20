@@ -32,9 +32,8 @@ def test_worker_settings_pin_models_and_redact_credentials() -> None:
     settings = WorkerSettings.from_environment(_environment())
 
     assert settings.generator_config["model_id"] == "qwen3.8-max"
-    assert settings.generator_config["model_revision"] == "deployment-2026-08-11"
-    assert settings.media_embedder_config["model_revision"] == (
-        "12949877f0092093f366c6450340011320152a05"
+    assert settings.media_embedder_config["model_id"] == (
+        "jinaai/jina-embeddings-v5-omni-small-retrieval"
     )
     assert "database-secret" not in repr(settings)
     assert "broker-secret" not in repr(settings)
@@ -48,19 +47,15 @@ def test_worker_text_encoder_shares_the_deployment_wide_embedder_contract() -> N
 
     assert settings.text_embedder_config["endpoint"] == "https://text.example.test/v1"
     assert settings.text_embedder_config["space_id"] == settings.media_embedder_config["space_id"]
-    assert (
-        settings.text_embedder_config["space_revision"]
-        == settings.media_embedder_config["space_revision"]
-    )
     assert settings.text_embedder_config["dimension"] == settings.media_embedder_config["dimension"]
 
 
-def test_worker_settings_require_explicit_generator_revision() -> None:
-    """Fallback provenance cannot silently use a mutable deployment alias."""
+def test_worker_settings_require_explicit_generator_credentials() -> None:
+    """A Worker must fail startup rather than call a provider with no key."""
     environment = dict(_environment())
-    del environment["MINDBRIDGE_GENERATOR_MODEL_REVISION"]
+    del environment["MINDBRIDGE_GENERATOR_API_KEY"]
 
-    with pytest.raises(ValueError, match="MINDBRIDGE_GENERATOR_MODEL_REVISION"):
+    with pytest.raises(ValueError, match="MINDBRIDGE_GENERATOR_API_KEY"):
         WorkerSettings.from_environment(environment)
 
 
@@ -296,7 +291,6 @@ def _environment() -> Mapping[str, str]:
         "MINDBRIDGE_TASK_BROKER_URL": "redis://:broker-secret@redis:6379/0",
         "MINDBRIDGE_GENERATOR_API_KEY": "generator-secret",
         "MINDBRIDGE_GENERATOR_ENDPOINT": "https://generator.example.test/v1",
-        "MINDBRIDGE_GENERATOR_MODEL_REVISION": "deployment-2026-08-11",
         "MINDBRIDGE_EMBEDDER_API_KEY": "text-embedding-secret",
         "MINDBRIDGE_EMBEDDER_ENDPOINT": "https://text.example.test/v1",
     }
@@ -344,7 +338,6 @@ def test_a_generator_config_that_names_no_deadline_still_outlives_the_one_it_get
     config: dict[str, object] = {
         "api_key": "k",
         "endpoint": "https://example.test/v1",
-        "model_revision": "rev",
     }
     client_deadline = _GeneratorConfig.model_validate(config).request_timeout_seconds
 

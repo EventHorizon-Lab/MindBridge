@@ -363,7 +363,6 @@ def _identity() -> IdentityObservationInput:
         end_ms=1_000,
         confidence=0.9,
         model_id="insightface/buffalo_l",
-        model_revision="1.0.1",
         visual_bbox_xyxy=(0.1, 0.1, 0.5, 0.8),
     )
 

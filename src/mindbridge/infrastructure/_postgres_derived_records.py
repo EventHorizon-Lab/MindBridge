@@ -17,10 +17,10 @@ async def write_event(connection: DatabaseConnection, event: Event) -> bool:
         """
         INSERT INTO events (
             tenant_id, event_id, parent_event_id, hierarchy_level, description, salience,
-            status, occurred_at, ended_at, model_id, model_revision, prompt_version,
+            status, occurred_at, ended_at, model_id, prompt_version,
             content_digest, created_at
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT DO NOTHING
         RETURNING event_id
         """,
@@ -35,7 +35,6 @@ async def write_event(connection: DatabaseConnection, event: Event) -> bool:
             event.occurred_at,
             event.ended_at,
             event.model_reference.model_id,
-            event.model_reference.revision,
             event.prompt_version,
             content_digest,
             event.created_at,
@@ -74,7 +73,6 @@ def event_content_digest(event: Event) -> str:
             "description": event.description,
             "salience": event.salience,
             "model_id": event.model_reference.model_id,
-            "model_revision": event.model_reference.revision,
             "prompt_version": event.prompt_version,
             "created_at": event.created_at.isoformat(),
         }
@@ -99,9 +97,6 @@ def derived_memory_content_digest(memory: MemoryRecord) -> str:
             "supersedes_memory_id": memory.supersedes_memory_id,
             "model_id": (
                 memory.model_reference.model_id if memory.model_reference is not None else None
-            ),
-            "model_revision": (
-                memory.model_reference.revision if memory.model_reference is not None else None
             ),
         }
     )

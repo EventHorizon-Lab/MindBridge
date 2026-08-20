@@ -62,7 +62,6 @@ class AdapterScore(ContractModel):
     """One adapter measured as a symmetric consolidation scorer."""
 
     model_id: NonEmptyString
-    revision: NonEmptyString
     separation_auc: float
     contradiction_auc: float
     mean_paraphrase_similarity: float
@@ -96,23 +95,16 @@ async def run_adapter_bakeoff(
     *,
     corpus: PairCorpus,
     retrieval_model_id: str,
-    retrieval_revision: str,
     text_matching_model_id: str,
-    text_matching_revision: str,
     device: str,
     dimension: int,
 ) -> AdapterBakeoffResult:
     """Score every pair with both adapters using the symmetric document side."""
     scores: list[AdapterScore] = []
-    for model_id, revision in (
-        (retrieval_model_id, retrieval_revision),
-        (text_matching_model_id, text_matching_revision),
-    ):
-        embedder = JinaEmbedder.load(
-            model_id=model_id, revision=revision, device=device, dimension=dimension
-        )
+    for model_id in (retrieval_model_id, text_matching_model_id):
+        embedder = JinaEmbedder.load(model_id=model_id, device=device, dimension=dimension)
         try:
-            scores.append(await _score_adapter(embedder, corpus, model_id, revision))
+            scores.append(await _score_adapter(embedder, corpus, model_id))
         finally:
             await _close(embedder)
 
@@ -140,7 +132,6 @@ async def _score_adapter(
     embedder: JinaEmbedder,
     corpus: PairCorpus,
     model_id: str,
-    revision: str,
 ) -> AdapterScore:
     """Encode both sides as documents, because consolidation has no query side."""
     texts = [side for pair in corpus.pairs for side in (pair.left, pair.right)]
@@ -168,7 +159,6 @@ async def _score_adapter(
     best_threshold, best_j = _best_threshold(positives, negatives)
     return AdapterScore(
         model_id=model_id,
-        revision=revision,
         separation_auc=_roc_auc(positives, negatives),
         contradiction_auc=_roc_auc(positives, by_label["contradiction"]),
         mean_paraphrase_similarity=fmean(positives),
@@ -236,17 +226,9 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
         help="Hugging Face repository of the retrieval adapter",
     )
     parser.add_argument(
-        "--retrieval-revision", required=True, help="revision of the retrieval adapter"
-    )
-    parser.add_argument(
         "--text-matching-model-id",
         default="jinaai/jina-embeddings-v5-omni-small-text-matching",
         help="Hugging Face repository of the text-matching adapter",
-    )
-    parser.add_argument(
-        "--text-matching-revision",
-        required=True,
-        help="revision of the text-matching adapter",
     )
     parser.add_argument("--device", default="cuda", help="torch device to load both adapters on")
     parser.add_argument(
@@ -259,9 +241,7 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
         run_adapter_bakeoff(
             corpus=corpus,
             retrieval_model_id=arguments.retrieval_model_id,
-            retrieval_revision=arguments.retrieval_revision,
             text_matching_model_id=arguments.text_matching_model_id,
-            text_matching_revision=arguments.text_matching_revision,
             device=arguments.device,
             dimension=arguments.dimension,
         )

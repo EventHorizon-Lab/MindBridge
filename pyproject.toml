@@ -91,7 +91,7 @@ media = [
 ]
 cloud-models = [
     "mindbridge[media]",
-    # models/jina.py resolves the pinned revision through huggingface_hub.snapshot_download.
+    # models/jina.py resolves the model snapshot through huggingface_hub.snapshot_download.
     "huggingface-hub>=0.30,<2",
     "opentelemetry-api>=1.44,<2",
     "sentence-transformers>=5.2,<6",
@@ -147,7 +147,7 @@ packages = ["src/mindbridge"]
 [tool.ruff]
 target-version = "py310"
 line-length = 100
-# Vendored verbatim from the Agent Memory Leaderboard at the revision pinned in
+# Vendored verbatim from the Agent Memory Leaderboard, with per-file digests in
 # benchmarks/aml/PINNED.md. Formatting it would break the byte-for-byte match
 # that makes our offline scores comparable to the published ones.
 exclude = ["benchmarks/aml"]

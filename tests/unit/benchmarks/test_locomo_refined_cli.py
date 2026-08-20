@@ -55,9 +55,6 @@ def test_locomo_refined_artifacts_pin_source_system_code_and_output(tmp_path: Pa
     assert rows[0]["mindbridge_prediction_context"] == ["D1:1"]
     assert manifest.benchmark == "LoCoMo-Refined"
     assert manifest.source_repository == "mem-eval-suite/LoCoMo_refined"
-    assert manifest.source_revision == "official-revision"
-    assert manifest.code_revision == "mindbridge-commit"
-    assert manifest.deployment.server_generator.config["model_revision"] == ("serving-fingerprint")
     assert (
         manifest.runner_version
         == LOCOMO_REFINED_RUNNER_VERSION
@@ -137,8 +134,6 @@ def _arguments(dataset_path: Path, output_path: Path) -> _Arguments:
         dataset_path=dataset_path,
         output_path=output_path,
         api_base_url="https://memory.example.test",
-        source_revision="official-revision",
-        code_revision="mindbridge-commit",
         deployment_config_path=deployment_path,
         run_id="run_01",
         tenant_prefix="benchmark_locomo_refined",
@@ -161,7 +156,6 @@ def _write_deployment(path: Path) -> None:
                     "version": "0.1.0",
                     "config": {
                         "model_id": "qwen3.8-max",
-                        "model_revision": "serving-fingerprint",
                         "reasoning_effort": "low",
                     },
                 },
@@ -169,7 +163,7 @@ def _write_deployment(path: Path) -> None:
                     "plugin": "openai",
                     "distribution": "mindbridge",
                     "version": "0.1.0",
-                    "config": {"space_id": "jina-v5", "space_revision": "space-v1"},
+                    "config": {"space_id": "jina-v5"},
                 },
             }
         ),

@@ -165,7 +165,6 @@ class PerceptionPipeline:
         set_current_span_attributes(
             {
                 "mindbridge.model.id": result.model_reference.model_id,
-                "mindbridge.model.revision": result.model_reference.revision,
                 "mindbridge.prompt.version": PERCEIVE_EVENTS_PROMPT.version,
                 "mindbridge.evidence.count": len(evidence),
             }
@@ -223,7 +222,6 @@ def _context(observation: Observation, evidence: tuple[ResolvedEvidence, ...]) -
                     "end_ms": identity.end_ms,
                     "confidence": identity.confidence,
                     "model_id": identity.model_reference.model_id,
-                    "model_revision": identity.model_reference.revision,
                     "scope": identity.scope.value,
                     "transcript": identity.transcript,
                     "visual_bbox_xyxy": identity.visual_bbox_xyxy,

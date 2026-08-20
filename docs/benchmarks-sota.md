@@ -309,7 +309,6 @@ uv run mindbridge-bench score \
   --manifest runs/locomo-refined/predictions.jsonl.manifest.json \
   --scorer-output runs/locomo-refined/official-scorer-summary.json \
   --scorer-repository mem-eval-suite/LoCoMo_refined \
-  --scorer-revision 887091190789e8d6760e70b9edd696539923dc4f \
   --scorer-command "./scripts/run_eval.sh --metrics llm f1 bleu --llm-judge refined" \
   --judge-model Qwen/Qwen3-14B \
   --answer-backbone qwen3.8-max \
@@ -358,5 +357,5 @@ sidecar 会重新计算 predictions 的 sha256，与 manifest 里的不一致就
 - EgoLifeQA / EgoMemReason 是四选一。**利用选项文本长度或分布先验**属于题面识别，禁止。
 - Video-MME 的字幕设定。**在声称无字幕的设定下偷用字幕轨**，禁止。
 
-任何一项 SOTA 声明都必须附带：官方 revision、工件 hash、judge 模型与版本、backbone 模型、上下文
+任何一项 SOTA 声明都必须附带：官方仓库、工件 hash、judge 模型与版本、backbone 模型、上下文
 档位，以及可复现的 manifest（沿用 `benchmarks/manifests/` 的既有格式）。

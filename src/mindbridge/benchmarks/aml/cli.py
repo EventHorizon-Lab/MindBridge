@@ -52,11 +52,10 @@ from mindbridge.benchmarks.cli_common import report, report_unit
 from mindbridge.contracts import ContractModel, Identifier, NonEmptyString, Sha256Hex
 from mindbridge.file_integrity import sha256_file
 
-# The exact pin recorded in `benchmarks/aml/PINNED.md` (Task 13, steps 1-2).
-# A constant, not a CLI flag: upgrading it means re-vendoring and re-pinning,
-# not choosing a different value per run.
+# The upstream the vendored pipelines under `benchmarks/aml/` came from, whose
+# per-file digests `benchmarks/aml/PINNED.md` records. A constant, not a CLI
+# flag: changing it means re-vendoring, not choosing a value per run.
 _AML_SOURCE_REPOSITORY = "AML-memory/agent-memory-leaderboard"
-_AML_SOURCE_REVISION = "5761ed58502d24153115cbdc010e44957cb18c3a"
 
 # Duplicated from `mindbridge.api.aml_contracts.derive_tenant_id` rather than
 # imported: nothing under `mindbridge.benchmarks.aml` may import
@@ -174,9 +173,7 @@ class AmlRunManifest(ContractModel):
 
     benchmark: NonEmptyString
     source_repository: NonEmptyString
-    source_revision: NonEmptyString
     source_sha256: Sha256Hex
-    code_revision: NonEmptyString
     deployment: DeploymentSnapshot
     # Naming matches `mindbridge.benchmarks.cli_common._core_manifest_values`:
     # every other benchmark manifest pins both a deployment and a predictions
@@ -233,7 +230,6 @@ class _Arguments:
     dataset_paths: tuple[Path, ...]
     output_path: Path
     api_base_url: str
-    code_revision: str
     deployment_config_path: Path
     run_id: str
     tenant_prefix: str
@@ -476,9 +472,7 @@ def _write_manifest(
     manifest = AmlRunManifest(
         benchmark=arguments.benchmark,
         source_repository=_AML_SOURCE_REPOSITORY,
-        source_revision=_AML_SOURCE_REVISION,
         source_sha256=sha256_file(BENCHMARKS[arguments.benchmark].pipeline),
-        code_revision=arguments.code_revision,
         deployment=deployment.snapshot,
         deployment_sha256=deployment.sha256,
         run_id=arguments.run_id,
@@ -542,9 +536,6 @@ def _parse_arguments(argv: Sequence[str] | None, prog: str | None) -> _Arguments
         "--api-base-url", required=True, help="base URL of the deployed MindBridge API"
     )
     parser.add_argument(
-        "--code-revision", required=True, help="git revision of the code under measurement"
-    )
-    parser.add_argument(
         "--deployment-config",
         type=Path,
         required=True,
@@ -594,7 +585,6 @@ def _parse_arguments(argv: Sequence[str] | None, prog: str | None) -> _Arguments
         dataset_paths=tuple(parsed.dataset),
         output_path=parsed.output,
         api_base_url=parsed.api_base_url,
-        code_revision=parsed.code_revision,
         deployment_config_path=parsed.deployment_config,
         run_id=parsed.run_id,
         tenant_prefix=parsed.tenant_prefix,

@@ -284,7 +284,6 @@ def _semantic_claim(
                     "semantic-claim",
                     tenant_id,
                     model_reference.model_id,
-                    model_reference.revision,
                     prompt_version,
                     created_at.isoformat(),
                     *sorted(str(claim_id) for claim_id in proposal.source_claim_ids),
@@ -382,7 +381,6 @@ def _semantic_claim_write(
                     EmbeddedObjectType.CLAIM.value,
                     claim.claim_id,
                     embedding.model_reference.model_id,
-                    embedding.model_reference.revision,
                     EmbedTask.DOCUMENT.value,
                 )
             ),

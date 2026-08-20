@@ -28,15 +28,14 @@ VECTOR_TENANT = TenantId("tenant_vectors")
 pytestmark = pytest.mark.integration
 
 
-async def test_pgvector_separates_space_revisions(
+async def test_pgvector_separates_embedding_spaces(
     store: PostgresMemoryStore,
 ) -> None:
-    """The cloud index retrieves only the requested frozen model version."""
+    """The cloud index retrieves only the requested embedding space."""
     model = ModelReference(
         model_id="jinaai/jina-embeddings-v5-omni-small-retrieval",
-        revision="abcdef0",
     )
-    space = EmbeddingSpaceReference(space_id="jina-v5", revision="space-v1")
+    space = EmbeddingSpaceReference(space_id="jina-v5")
     first = _embedding_record(
         embedding_id="embedding_01",
         object_id="memory_near",
@@ -97,11 +96,11 @@ async def test_pgvector_separates_space_revisions(
             limit=2,
         )
     )
-    other_revision = await store.search_embeddings(
+    other_space = await store.search_embeddings(
         EmbeddingSearch(
             tenant_id=VECTOR_TENANT,
             values=first.values,
-            space_reference=EmbeddingSpaceReference(space_id=space.space_id, revision="different"),
+            space_reference=EmbeddingSpaceReference(space_id="jina-v4"),
             document_task="retrieval_document",
             object_types=(EmbeddedObjectType.MEMORY_RECORD,),
             limit=2,
@@ -122,7 +121,7 @@ async def test_pgvector_separates_space_revisions(
     assert [match.object_id for match in matches] == ["memory_near", "memory_far"]
     assert matches[0].similarity == pytest.approx(1.0)
     assert [match.object_id for match in thresholded] == ["memory_near"]
-    assert other_revision == ()
+    assert other_space == ()
 
 
 async def test_unreachable_probe_is_scoped_per_tenant_and_per_object_type(
@@ -132,9 +131,9 @@ async def test_unreachable_probe_is_scoped_per_tenant_and_per_object_type(
     # A dedicated tenant: this writes into the session-scoped database that every other
     # integration test shares, and tenant_vectors already owns fixture vectors.
     tenant_id = TenantId("tenant_space_probe")
-    space = EmbeddingSpaceReference(space_id="jina-v5", revision="space-v1")
-    drifted = EmbeddingSpaceReference(space_id="jina-v5", revision="space-v2")
-    model = ModelReference(model_id="jina-omni", revision="abcdef0")
+    space = EmbeddingSpaceReference(space_id="jina-v5")
+    drifted = EmbeddingSpaceReference(space_id="jina-v4")
+    model = ModelReference(model_id="jina-omni")
 
     assert await store.unreachable_embedded_object_types(tenant_id, space) == ()
     assert await store.write_embedding(
@@ -183,9 +182,8 @@ async def test_pgvector_keeps_one_vector_for_a_re_encoded_entity_name(
     """An entity name is re-encoded in later batches, so encoder noise must not fail the write."""
     model = ModelReference(
         model_id="jinaai/jina-embeddings-v5-omni-small-retrieval",
-        revision="abcdef0",
     )
-    space = EmbeddingSpaceReference(space_id="jina-v5", revision="space-v1")
+    space = EmbeddingSpaceReference(space_id="jina-v5")
     stored = _embedding_record(
         embedding_id="embedding_entity_01",
         object_id="entity_red_tool",
@@ -245,8 +243,8 @@ async def test_pgvector_accepts_a_reencoded_vector_only_when_the_caller_allows_i
     derives its ID from the source IDs and timestamp, NOT from the generated summary
     text, so there a differing vector really can mean differing content.
     """
-    model = ModelReference(model_id="jina", revision="r1")
-    space = EmbeddingSpaceReference(space_id="jina-v5", revision="space-v1")
+    model = ModelReference(model_id="jina")
+    space = EmbeddingSpaceReference(space_id="jina-v5")
     stored = _embedding_record(
         embedding_id="embedding_memory_reencode",
         object_id="memory_reencode",

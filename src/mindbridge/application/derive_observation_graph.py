@@ -219,7 +219,6 @@ async def embed_observation_graph(
                     object_type.value,
                     object_id,
                     embedding.model_reference.model_id,
-                    embedding.model_reference.revision,
                     EmbedTask.DOCUMENT.value,
                 )
             ),

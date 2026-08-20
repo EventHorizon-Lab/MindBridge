@@ -21,9 +21,9 @@ from mindbridge.edge import (
 )
 
 NOW = datetime(2026, 8, 12, 12, 0, tzinfo=timezone.utc)
-MODEL = ModelReference(model_id="insightface/buffalo_l", revision="1.0.1")
-VOICE_MODEL = ModelReference(model_id="3d-speaker/eres2netv2", revision="v1.0.1")
-ASSOCIATION_MODEL = ModelReference(model_id="lr-asd", revision="ijcv-2025")
+MODEL = ModelReference(model_id="insightface/buffalo_l")
+VOICE_MODEL = ModelReference(model_id="3d-speaker/eres2netv2")
+ASSOCIATION_MODEL = ModelReference(model_id="lr-asd")
 
 
 def test_identity_memory_matches_learns_and_encrypts_samples(tmp_path: Path) -> None:

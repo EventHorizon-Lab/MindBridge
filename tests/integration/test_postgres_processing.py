@@ -103,10 +103,9 @@ from mindbridge.models import (
 )
 
 NOW = datetime.now(timezone.utc).replace(microsecond=0)
-MODEL = ModelReference(model_id="qwen3.8-max", revision="serving-revision-01")
+MODEL = ModelReference(model_id="qwen3.8-max")
 EMBEDDING_MODEL = ModelReference(
     model_id="jinaai/jina-embeddings-v5-omni-small-retrieval",
-    revision="12949877f0092093f366c6450340011320152a05",
 )
 DerivedCounts: TypeAlias = tuple[int, int, int, int, int, int, int, int, int, int, int]
 
@@ -169,7 +168,7 @@ class FixedEmbedder:
     """Emit a deterministic unit vector in a configured model dimension."""
 
     model_reference = EMBEDDING_MODEL
-    space_reference = EmbeddingSpaceReference(space_id="jina-v5", revision="space-v1")
+    space_reference = EmbeddingSpaceReference(space_id="jina-v5")
 
     def __init__(self, dimension: int = 1_024) -> None:
         self.dimension = dimension
@@ -188,9 +187,8 @@ class FixedEmbedder:
 class FixedTextEmbedder:
     model_reference = ModelReference(
         model_id="jinaai/jina-embeddings-v5-omni-small-retrieval",
-        revision="12949877f0092093f366c6450340011320152a05",
     )
-    space_reference = EmbeddingSpaceReference(space_id="jina-v5", revision="space-v1")
+    space_reference = EmbeddingSpaceReference(space_id="jina-v5")
 
     def __init__(self, dimension: int = 1_024) -> None:
         self.dimension = dimension
@@ -306,15 +304,10 @@ class CoordinatedSummaryConsolidator(RecordingSummaryConsolidator):
         evidence: tuple[ResolvedEvidence, ...],
     ) -> SummaryConsolidation:
         consolidation = await super().propose_summaries(candidates, evidence)
-        revision = f"summary-serving-revision-{self.calls:02d}"
         if self.calls == 2:
             self._ready.set()
         await asyncio.wait_for(self._ready.wait(), timeout=2)
-        return SummaryConsolidation(
-            summaries=consolidation.summaries,
-            model_reference=ModelReference(model_id="qwen3.8-max", revision=revision),
-            prompt_version=consolidation.prompt_version,
-        )
+        return consolidation
 
 
 class DeterministicSigner:
@@ -430,14 +423,12 @@ async def test_processing_commits_provenance_once(
     assert await _event_provenance(database_url, tenant_id) == (
         "A person places a red tool beside a blue toolbox.",
         "qwen3.8-max",
-        "serving-revision-01",
         "perceive_events_v4",
     )
     assert await _claim_provenance(database_url, tenant_id) == (
         "relation",
         "The red tool is beside the blue toolbox.",
         "qwen3.8-max",
-        "serving-revision-01",
         "perceive_events_v4",
     )
     assert await _relation_counts(database_url, tenant_id) == (
@@ -469,7 +460,7 @@ async def test_processing_commits_provenance_once(
         EmbeddingSearch(
             tenant_id=tenant_id,
             values=(1.0,) + (0.0,) * 1_023,
-            space_reference=EmbeddingSpaceReference(space_id="jina-v5", revision="space-v1"),
+            space_reference=EmbeddingSpaceReference(space_id="jina-v5"),
             document_task="retrieval_document",
             object_types=(EmbeddedObjectType.EVENT, EmbeddedObjectType.CLAIM),
             limit=20,
@@ -903,7 +894,7 @@ async def test_episode_consolidation_is_atomic_recallable_and_retry_safe(
         EmbeddingSearch(
             tenant_id=tenant_id,
             values=(1.0,) + (0.0,) * 1_023,
-            space_reference=EmbeddingSpaceReference(space_id="jina-v5", revision="space-v1"),
+            space_reference=EmbeddingSpaceReference(space_id="jina-v5"),
             document_task="retrieval_document",
             object_types=(EmbeddedObjectType.EVENT,),
             limit=20,
@@ -1031,7 +1022,7 @@ async def test_claim_consolidation_is_atomic_versioned_and_forget_safe(
         EmbeddingSearch(
             tenant_id=tenant_id,
             values=(1.0,) + (0.0,) * 1_023,
-            space_reference=EmbeddingSpaceReference(space_id="jina-v5", revision="space-v1"),
+            space_reference=EmbeddingSpaceReference(space_id="jina-v5"),
             document_task="retrieval_document",
             object_types=(EmbeddedObjectType.CLAIM,),
             limit=20,
@@ -1155,7 +1146,7 @@ async def test_summary_consolidation_is_atomic_recallable_and_retry_safe(
         EmbeddingSearch(
             tenant_id=tenant_id,
             values=(1.0,) + (0.0,) * 1_023,
-            space_reference=EmbeddingSpaceReference(space_id="jina-v5", revision="space-v1"),
+            space_reference=EmbeddingSpaceReference(space_id="jina-v5"),
             document_task="retrieval_document",
             object_types=(EmbeddedObjectType.MEMORY_RECORD,),
             limit=20,
@@ -1229,7 +1220,7 @@ async def test_summary_consolidation_is_atomic_recallable_and_retry_safe(
         EmbeddingSearch(
             tenant_id=tenant_id,
             values=(1.0,) + (0.0,) * 1_023,
-            space_reference=EmbeddingSpaceReference(space_id="jina-v5", revision="space-v1"),
+            space_reference=EmbeddingSpaceReference(space_id="jina-v5"),
             document_task="retrieval_document",
             object_types=(EmbeddedObjectType.MEMORY_RECORD,),
             limit=20,
@@ -1339,7 +1330,6 @@ async def _write_source_observation(
                     confidence=0.97,
                     model_reference=ModelReference(
                         model_id="insightface/buffalo_l",
-                        revision="1.0.1",
                     ),
                 ),
             )
@@ -1391,13 +1381,13 @@ def _episode_consolidation(events: tuple[Event, ...]) -> EpisodeConsolidation:
         ),
         model_reference=ModelReference(
             model_id="qwen3.8-max",
-            revision="episode-serving-revision-01",
         ),
         prompt_version="consolidate_episodes_v1",
     )
 
 
 _SEMANTIC_CLAIM_STATEMENT = "Across two observations, the red tool remained beside the toolbox."
+_SESSION_SUMMARY = "Across the session, a person kept a red tool beside a blue toolbox."
 
 
 def _claim_consolidation(candidates: tuple[ClaimCandidate, ...]) -> ClaimConsolidation:
@@ -1420,7 +1410,6 @@ def _claim_consolidation(candidates: tuple[ClaimCandidate, ...]) -> ClaimConsoli
         ),
         model_reference=ModelReference(
             model_id="qwen3.8-max",
-            revision="claim-serving-revision-01",
         ),
         prompt_version="consolidate_claims_v1",
     )
@@ -1435,13 +1424,12 @@ def _summary_consolidation(
             SummaryProposal(
                 source_memory_ids=tuple(candidate.memory.memory_id for candidate in candidates),
                 scope=SummaryScope.SESSION,
-                summary="Across the session, a person kept a red tool beside a blue toolbox.",
+                summary=_SESSION_SUMMARY,
                 salience=0.9,
             ),
         ),
         model_reference=ModelReference(
             model_id="qwen3.8-max",
-            revision="summary-serving-revision-01",
         ),
         prompt_version="consolidate_summaries_v1",
     )
@@ -1575,7 +1563,7 @@ async def _semantic_claim_counts(
                     (SELECT count(*) FROM semantic_claim),
                     (SELECT count(*) FROM memory_records AS memory
                      WHERE memory.tenant_id = %s
-                       AND memory.model_revision = 'claim-serving-revision-01'),
+                       AND memory.summary = %s),
                     (SELECT count(*) FROM claim_evidence AS link
                      WHERE link.tenant_id = %s
                        AND link.claim_id IN (SELECT claim_id FROM semantic_claim)),
@@ -1587,7 +1575,7 @@ async def _semantic_claim_counts(
                      WHERE relation.tenant_id = %s
                        AND relation.relation_type = 'supersedes')
                 """,
-                (tenant_id,) * 5,
+                (tenant_id, tenant_id, _SEMANTIC_CLAIM_STATEMENT, *((tenant_id,) * 3)),
             )
         ).fetchone()
     return cast(tuple[int, int, int, int, int], row)
@@ -1604,8 +1592,7 @@ async def _summary_counts(
                 """
                 WITH summary AS (
                     SELECT memory_id FROM memory_records
-                    WHERE tenant_id = %s
-                      AND model_revision LIKE 'summary-serving-revision-%%'
+                    WHERE tenant_id = %s AND summary = %s
                 )
                 SELECT
                     (SELECT count(*) FROM summary),
@@ -1623,7 +1610,7 @@ async def _summary_counts(
                        AND embedding.object_type = 'memory_record'
                        AND embedding.object_id IN (SELECT memory_id FROM summary))
                 """,
-                (tenant_id,) * 4,
+                (tenant_id, _SESSION_SUMMARY, *((tenant_id,) * 3)),
             )
         ).fetchone()
     return cast(tuple[int, int, int, int], row)
@@ -1701,37 +1688,37 @@ async def _job_state(
 async def _event_provenance(
     database_url: str,
     tenant_id: TenantId,
+) -> tuple[str, str, str]:
+    connection = await AsyncConnection.connect(database_url)
+    async with connection:
+        row = await (
+            await connection.execute(
+                """
+                SELECT description, model_id, prompt_version
+                FROM events WHERE tenant_id = %s
+                """,
+                (tenant_id,),
+            )
+        ).fetchone()
+    return cast(tuple[str, str, str], row)
+
+
+async def _claim_provenance(
+    database_url: str,
+    tenant_id: TenantId,
 ) -> tuple[str, str, str, str]:
     connection = await AsyncConnection.connect(database_url)
     async with connection:
         row = await (
             await connection.execute(
                 """
-                SELECT description, model_id, model_revision, prompt_version
-                FROM events WHERE tenant_id = %s
-                """,
-                (tenant_id,),
-            )
-        ).fetchone()
-    return cast(tuple[str, str, str, str], row)
-
-
-async def _claim_provenance(
-    database_url: str,
-    tenant_id: TenantId,
-) -> tuple[str, str, str, str, str]:
-    connection = await AsyncConnection.connect(database_url)
-    async with connection:
-        row = await (
-            await connection.execute(
-                """
-                SELECT claim_type, statement, model_id, model_revision, prompt_version
+                SELECT claim_type, statement, model_id, prompt_version
                 FROM claims WHERE tenant_id = %s
                 """,
                 (tenant_id,),
             )
         ).fetchone()
-    return cast(tuple[str, str, str, str, str], row)
+    return cast(tuple[str, str, str, str], row)
 
 
 async def _relation_counts(

@@ -53,9 +53,7 @@ class EgoLifeRunManifest(MediaBenchmarkRunManifest):
 
     benchmark: Literal["EgoLifeQA"] = "EgoLifeQA"
     dataset_repository: NonEmptyString
-    dataset_revision: NonEmptyString
     evaluator_repository: NonEmptyString
-    evaluator_revision: NonEmptyString
     prepared_media_manifest_sha256: Sha256Hex
     perception_prompt_version: NonEmptyString
     subject_id: Identifier
@@ -69,8 +67,6 @@ class EgoLifeRunManifest(MediaBenchmarkRunManifest):
 @dataclass(frozen=True, slots=True)
 class _Arguments(MediaArguments):
     prepared_media_path: Path
-    dataset_revision: str
-    evaluator_revision: str
     question_ids: tuple[str, ...]
 
 
@@ -150,9 +146,7 @@ def _write_artifacts(
         annotation_sha256=sha256_file(arguments.dataset_path),
         predictions=predictions,
         dataset_repository="lmms-lab/EgoLife",
-        dataset_revision=arguments.dataset_revision,
         evaluator_repository="EvolvingLMMs-Lab/EgoLife",
-        evaluator_revision=arguments.evaluator_revision,
         prepared_media_manifest_sha256=sha256_file(arguments.prepared_media_path),
         perception_prompt_version=PERCEIVE_EVENTS_PROMPT.version,
         subject_id=prepared.subject_id,
@@ -177,12 +171,6 @@ def _parse_arguments(argv: Sequence[str] | None, prog: str | None) -> _Arguments
         help="manifest of clips prepared from the official stream",
     )
     parser.add_argument(
-        "--dataset-revision", required=True, help="revision of the official dataset release"
-    )
-    parser.add_argument(
-        "--evaluator-revision", required=True, help="revision of the official evaluator"
-    )
-    parser.add_argument(
         "--question-id",
         action="append",
         default=[],
@@ -193,8 +181,6 @@ def _parse_arguments(argv: Sequence[str] | None, prog: str | None) -> _Arguments
         _Arguments,
         parsed,
         prepared_media_path=parsed.prepared_media,
-        dataset_revision=parsed.dataset_revision,
-        evaluator_revision=parsed.evaluator_revision,
         question_ids=tuple(parsed.question_id),
     )
 
