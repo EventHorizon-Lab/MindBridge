@@ -8,6 +8,7 @@ import sys
 from collections.abc import Iterable, Mapping
 from functools import cache
 from pathlib import Path
+from typing import Any
 
 if sys.version_info >= (3, 11):
     import tomllib
@@ -275,16 +276,19 @@ by Jina Omni's own Qwen3-VL processor, which swallows the ImportError and embeds
 
 
 @cache
+def _pyproject() -> dict[str, Any]:
+    return tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+
+
+@cache
 def _extras() -> Mapping[str, list[str]]:
-    pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
-    extras: Mapping[str, list[str]] = pyproject["project"]["optional-dependencies"]
+    extras: Mapping[str, list[str]] = _pyproject()["project"]["optional-dependencies"]
     return extras
 
 
 @cache
 def _base_dependencies() -> tuple[str, ...]:
-    pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
-    declared: list[str] = pyproject["project"]["dependencies"]
+    declared: list[str] = _pyproject()["project"]["dependencies"]
     return tuple(declared)
 
 
@@ -298,8 +302,15 @@ def _declared(extra: str) -> frozenset[str]:
     """Every distribution a scenario install puts on disk, following self-references."""
     declared = {_distribution(requirement) for requirement in _base_dependencies()}
     pending = [extra] if extra else []
+    seen: set[str] = set()
     while pending:
-        for requirement in _extras()[pending.pop()]:
+        current = pending.pop()
+        if current in seen:
+            # `all` and `cloud-models` both reach `media`. Re-walking it only duplicates
+            # work today, but a pair of extras naming each other would never terminate.
+            continue
+        seen.add(current)
+        for requirement in _extras()[current]:
             name = _distribution(requirement)
             if name == "mindbridge":
                 pending.extend(re.findall(r"[\w-]+", requirement.partition("[")[2]))
@@ -371,6 +382,11 @@ def _eagerly_imported_modules(path: Path) -> frozenset[str]:
 
     Function bodies are deferred until called, and `if TYPE_CHECKING:` blocks never run at
     all -- `mypy_boto3_s3` and the OpenTelemetry SDK types are only ever needed there.
+
+    A `from` import also names first-party modules, not only the package holding them, and a
+    relative one names them without spelling `mindbridge` at all. Both are edges the walk in
+    `_reached_third_party` has to follow: drop either and a scenario reaches a dependency it
+    never declares while the check that exists to catch that stays green.
     """
     modules: set[str] = set()
 
@@ -383,13 +399,36 @@ def _eagerly_imported_modules(path: Path) -> frozenset[str]:
             if isinstance(child, ast.Import):
                 modules.update(alias.name for alias in child.names)
             elif isinstance(child, ast.ImportFrom):
-                if child.level == 0 and child.module is not None:
-                    modules.add(child.module)
+                base = _absolute_import(path, child)
+                if base is None:
+                    continue
+                modules.add(base)
+                if base.startswith("mindbridge"):
+                    # `from mindbridge.x import y` is an edge to `mindbridge.x.y` when y is a
+                    # module; `_import_graph` drops the names that turn out to be symbols.
+                    modules.update(f"{base}.{alias.name}" for alias in child.names)
             else:
                 visit(child)
 
     visit(ast.parse(path.read_text(encoding="utf-8")))
     return frozenset(modules)
+
+
+def _absolute_import(path: Path, node: ast.ImportFrom) -> str | None:
+    """The module a `from ... import` names, with any relative level resolved.
+
+    A relative import is anchored on the importing file's own package, which for a package's
+    `__init__.py` is the package itself and for every other module is its parent.
+    """
+    if node.level == 0:
+        return node.module
+    parts = _module_name(path).split(".")
+    if path.name != "__init__.py":
+        parts.pop()
+    anchor = parts[: max(0, len(parts) - node.level + 1)]
+    if not anchor:
+        return None
+    return ".".join((*anchor, node.module) if node.module else anchor)
 
 
 def _tests_type_checking(test: ast.expr) -> bool:
