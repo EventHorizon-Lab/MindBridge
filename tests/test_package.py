@@ -443,31 +443,36 @@ def _tests_type_checking(test: ast.expr) -> bool:
 def test_relative_imports_resolve_against_the_importing_file() -> None:
     """`_absolute_import`'s relative branch has no other cover in this suite.
 
-    Nothing under `src/` imports relatively today, so across a whole run of the checks below
-    the resolution they lean on is called 1275 times and takes the `level == 0` path every
-    time. A wrong anchor -- off by one, or forgetting that a package's `__init__.py` is
-    anchored on the package rather than its parent -- would fail nothing without this.
+    Nothing under `src/` imports relatively and the checks above only read `src/`, so every
+    call they make takes the `level == 0` path and the resolution never runs. A wrong anchor
+    -- off by one, or forgetting that a package's `__init__.py` is anchored on the package
+    rather than its parent -- would fail nothing without this.
+
+    Each row spells `api/runtime.py`'s real import of `api/mcp.py` and of `telemetry` the
+    relative way, and every expectation is what `importlib._bootstrap._resolve_name` returns
+    for the same package and level.
     """
-    module = SOURCE / "media" / "clipping.py"
-    package = SOURCE / "media" / "__init__.py"
-    cases = [
-        (module, "from mindbridge.telemetry import span", "mindbridge.telemetry"),
-        (module, "from .decoders import open_container", "mindbridge.media.decoders"),
-        (module, "from ..telemetry import span", "mindbridge.telemetry"),
-        (module, "from . import decoders", "mindbridge.media"),
+    files = {"module": SOURCE / "api" / "runtime.py", "package": SOURCE / "api" / "__init__.py"}
+    cases = {
+        ("module", "from mindbridge.api.mcp import build_mcp_server"): "mindbridge.api.mcp",
+        ("module", "from .mcp import build_mcp_server"): "mindbridge.api.mcp",
+        ("module", "from ..telemetry import operation_span"): "mindbridge.telemetry",
+        ("module", "from . import mcp"): "mindbridge.api",
         # A package's `__init__.py` is anchored on the package, not on its parent.
-        (package, "from .clipping import cut", "mindbridge.media.clipping"),
-        (package, "from ..telemetry import span", "mindbridge.telemetry"),
-        # Past the top of the tree resolves to nothing rather than to a shorter wrong prefix.
-        (module, "from ....telemetry import span", None),
-    ]
+        ("package", "from .runtime import create_app"): "mindbridge.api.runtime",
+        ("package", "from ..telemetry import operation_span"): "mindbridge.telemetry",
+        # Past the top of the tree resolves to nothing rather than a shorter wrong prefix.
+        ("module", "from ....telemetry import operation_span"): None,
+    }
 
-    resolved = [
-        _absolute_import(path, cast("ast.ImportFrom", ast.parse(source).body[0]))
-        for path, source, _ in cases
-    ]
+    resolved = {
+        (shape, source): _absolute_import(
+            files[shape], cast(ast.ImportFrom, ast.parse(source).body[0])
+        )
+        for shape, source in cases
+    }
 
-    assert resolved == [expected for _, _, expected in cases]
+    assert resolved == cases
 
 
 def _modules(*directories: Path) -> list[Path]:
