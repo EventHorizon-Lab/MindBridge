@@ -540,6 +540,31 @@ conversation directories.
 ]
 ```
 
+### 10M `chat.json` shape: one extra nesting level
+
+The 10M tier -- and only that tier -- wraps the list above one level deeper.
+Each top-level element is a single-key `{"plan-N": [...batches...]}` dict in
+place of a batch object:
+
+```python
+[
+    {"plan-1": [{"batch_number": 1, "turns": [...]}, ...]},
+    {"plan-2": [...]},
+    ...,  # plan-1 ... plan-10, in document order
+]
+```
+
+Measured across all 10 conversations of the tier: exactly 10 such elements
+each, one plan key per element, `plan-1` through `plan-10` in document order.
+(The sibling `plan-0/` ... `plan-9/` directories on disk are off by one from
+these JSON keys.) Those plans are consecutive stretches of one conversation
+rather than separate conversations -- turn `id`s ascend straight across the
+boundaries (`0..N-1`, no gaps or restarts), and 47 of the 176 probing
+questions carrying `source_chat_ids` point at turns living in two different
+plans. So a 10M directory is still exactly one retrieval scope, one case, like
+every other tier: the loader concatenates the batches under every plan in
+document order and drops the plan key before the message loop below runs.
+
 ### Messages
 
 ```python
