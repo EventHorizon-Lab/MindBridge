@@ -1,5 +1,6 @@
 """Tests for environment parsing shared by deployable processes."""
 
+import json
 import re
 from pathlib import Path
 
@@ -10,6 +11,7 @@ from mindbridge.configuration import (
     KNOWN_SCALAR_KEYS,
     TOP_LEVEL_KEYS,
     _configuration_document,
+    _flattened_plugins,
     _flattened_scalars,
     copy_plugin_configuration,
     optional_environment_value,
@@ -157,3 +159,72 @@ def test_the_known_keys_cannot_fall_behind_what_the_code_reads() -> None:
 
     for key in TOP_LEVEL_KEYS:
         assert variable_name(key) in read, f"{key} configures no variable the code reads"
+
+
+def test_a_plugin_section_becomes_its_config_object() -> None:
+    flattened = _flattened_plugins(
+        {"generator": {"plugin": "openai", "endpoint": "https://g/v1", "model_id": "qwen3.8-max"}},
+        {"MINDBRIDGE_GENERATOR_API_KEY": "sk-live"},
+    )
+
+    assert json.loads(flattened["MINDBRIDGE_GENERATOR_CONFIG_JSON"]) == {
+        "api_key": "sk-live",
+        "endpoint": "https://g/v1",
+        "model_id": "qwen3.8-max",
+    }
+    assert "MINDBRIDGE_GENERATOR_PLUGIN" not in flattened
+
+
+def test_an_environment_override_is_read_in_the_type_the_file_declared() -> None:
+    flattened = _flattened_plugins(
+        {"generator": {"request_timeout_seconds": 1800, "max_retries": 2, "model_id": "a"}},
+        {
+            "MINDBRIDGE_GENERATOR_REQUEST_TIMEOUT_SECONDS": "900",
+            "MINDBRIDGE_GENERATOR_MAX_RETRIES": "5",
+            "MINDBRIDGE_GENERATOR_MODEL_ID": "b",
+        },
+    )
+    generator = json.loads(flattened["MINDBRIDGE_GENERATOR_CONFIG_JSON"])
+
+    # Strict pydantic fields reject "900" and "5" as surely as they reject a missing key.
+    assert generator == {"request_timeout_seconds": 900, "max_retries": 5, "model_id": "b"}
+    assert isinstance(generator["request_timeout_seconds"], int)
+
+
+def test_a_boolean_override_is_not_read_as_a_non_empty_string() -> None:
+    flattened = _flattened_plugins(
+        {"media_sampling": {"generation_proxy": True}},
+        {"MINDBRIDGE_MEDIA_SAMPLING_GENERATION_PROXY": "false"},
+    )
+
+    # bool("false") is True; bool must be matched before int, which it subclasses.
+    assert json.loads(flattened["MINDBRIDGE_MEDIA_SAMPLING_CONFIG_JSON"]) == {
+        "generation_proxy": False
+    }
+
+
+def test_the_embedding_space_reaches_every_encoder_from_one_place() -> None:
+    document: dict[str, object] = {
+        "embedding": {"dimension": 1024, "space_id": "jina-v5", "space_revision": "omni@abc"},
+        "embedder": {"endpoint": "https://e/v1"},
+        "media_embedder": {"device": "cuda:0"},
+        "generator": {"endpoint": "https://g/v1"},
+    }
+    flattened = _flattened_plugins(document, {})
+
+    for section in ("embedder", "media_embedder"):
+        encoded = json.loads(flattened[f"MINDBRIDGE_{section.upper()}_CONFIG_JSON"])
+        assert encoded["space_id"] == "jina-v5"
+        assert encoded["space_revision"] == "omni@abc"
+        assert encoded["dimension"] == 1024
+    # The generator shares no embedding space.
+    assert "space_id" not in json.loads(flattened["MINDBRIDGE_GENERATOR_CONFIG_JSON"])
+
+
+def test_an_override_of_a_key_the_file_omits_arrives_as_text() -> None:
+    flattened = _flattened_plugins(
+        {"embedder": {"endpoint": "https://e/v1"}},
+        {"MINDBRIDGE_EMBEDDER_MODEL_REVISION": "abc123"},
+    )
+
+    assert json.loads(flattened["MINDBRIDGE_EMBEDDER_CONFIG_JSON"])["model_revision"] == "abc123"

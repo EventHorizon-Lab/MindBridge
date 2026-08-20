@@ -212,6 +212,83 @@ def _reject_credential(variable: str) -> None:
         )
 
 
+ENCODER_SECTIONS: tuple[str, ...] = ("embedder", "media_embedder")
+"""Plugin sections that must share the one deployment-wide embedding space."""
+
+EMBEDDING_SECTION = "embedding"
+"""The section whose keys every encoder section inherits."""
+
+
+def _flattened_plugins(
+    document: Mapping[str, object],
+    environ: Mapping[str, str],
+) -> dict[str, str]:
+    """Serialise each plugin section into the `*_CONFIG_JSON` its factory reads."""
+    space = document.get(EMBEDDING_SECTION)
+    shared = space if isinstance(space, dict) else {}
+    flattened: dict[str, str] = {}
+    for section in PLUGIN_SECTIONS:
+        body = document.get(section)
+        if not isinstance(body, dict):
+            continue
+        assembled: dict[str, object] = {}
+        if section in ENCODER_SECTIONS:
+            assembled.update(shared)
+        assembled.update({key: value for key, value in body.items() if key != PLUGIN_SELECTOR_KEY})
+        assembled.update(_overrides(section, assembled, environ))
+        flattened[variable_name("config_json", section)] = json.dumps(
+            assembled, sort_keys=True, allow_nan=False
+        )
+    return flattened
+
+
+def _overrides(
+    section: str,
+    assembled: Mapping[str, object],
+    environ: Mapping[str, str],
+) -> dict[str, object]:
+    """Read every individual variable that overrides one key of this plugin section.
+
+    The environment wins per key rather than per section. Splicing in only the credential would
+    make every other individual variable silently dead the moment a file existed, because
+    `plugin_configuration()` short-circuits on `*_CONFIG_JSON` and never calls the builder that
+    reads them.
+    """
+    prefix = f"MINDBRIDGE_{section.upper()}_"
+    reserved = {
+        variable_name("config_json", section),
+        variable_name(PLUGIN_SELECTOR_KEY, section),
+    }
+    overrides: dict[str, object] = {}
+    for name, text in environ.items():
+        if not name.startswith(prefix) or name in reserved:
+            continue
+        key = name[len(prefix) :].lower()
+        overrides[key] = _as_declared(assembled.get(key), text)
+    return overrides
+
+
+def _as_declared(declared: object, text: str) -> object:
+    """Read an environment override in the type the file declared for that key.
+
+    A validated plugin config rejects `"1800"` where it wants a number and `"false"` where it
+    wants a boolean, so an override cannot arrive as text wherever the file said otherwise. A
+    key the file omits has no declared type and arrives as text, which is what every individual
+    plugin variable in the contract today already is.
+
+    `bool` precedes `int` because it subclasses it, and `bool("false")` is `True`.
+    """
+    if isinstance(declared, bool):
+        if text.lower() not in {"true", "false"}:
+            raise ValueError(f"{text!r} must be 'true' or 'false'")
+        return text.lower() == "true"
+    if isinstance(declared, int):
+        return int(text)
+    if isinstance(declared, float):
+        return float(text)
+    return text
+
+
 def validate_plugin_name(value: object, name: str = "plugin name") -> str:
     """Require the canonical entry-point spelling used by every process."""
     if (
