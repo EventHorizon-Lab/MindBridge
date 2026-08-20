@@ -22,9 +22,15 @@ below U+0020 inside a string, so the parser rejects such a record either way.
 Each reader now splits on the newline alone; nothing else changed.
 
 This is reachable through the documented workflow, not a hypothetical.
-`mindbridge.benchmarks.aml.cli` writes its shards with `ensure_ascii=False`,
-so a separator in the corpus reaches these files as a raw character, and
-`docs/benchmarking.md` runs them over exactly those shards. The official
+`docs/benchmarking.md` runs these files over shards this repo writes, and they
+also write their own intermediate answers files with `ensure_ascii=False` (21
+such writes across the seven) and read them straight back -- `answer` emits
+`--output`, `evaluate` consumes it as `--answers`. That write is upstream code
+this repo does not control, and the answers it serializes are model output
+reproducing corpus text, so a raw separator reaches these readers regardless
+of how this repo serializes its own shards. (It now escapes them: see
+`ensure_ascii=True` in `mindbridge.benchmarks.aml.cli`, which closes the shard
+hop but not this one.) The official
 CL-Bench release (`tencent/CL-bench` revision
 `b28a5832a09b0d96c0cf4c22e90d7c60ede25b80`) carries 343 bare U+2028
 characters, so `pipeline.py answer --input <shard>` raised

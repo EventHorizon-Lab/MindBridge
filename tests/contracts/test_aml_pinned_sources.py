@@ -95,10 +95,11 @@ def _jsonl_readers_splitting_on_unicode_boundaries(source: str) -> list[str]:
 def test_no_vendored_pipeline_reads_jsonl_with_splitlines() -> None:
     """The one deliberate local delta from upstream, asserted so a re-vendor keeps it.
 
-    `mindbridge.benchmarks.aml.cli` writes its shards with
-    `ensure_ascii=False`, so a corpus separator reaches these files as a raw
-    character; `docs/benchmarking.md` then runs them over those shards. Upstream
-    reads them with `splitlines()`, which made scoring CL-Bench raise
+    These files write their own intermediate answers files with
+    `ensure_ascii=False` and read them straight back, so a raw separator
+    reaches them from upstream's own output whatever this repo writes -- and
+    `docs/benchmarking.md` also runs them over this repo's shards. Upstream
+    read both with `splitlines()`, which made scoring CL-Bench raise
     `JSONDecodeError: Unterminated string`. Re-pinning a fresh upstream copy
     silently reinstates that, which is exactly the drift `PINNED.md` exists to
     prevent -- so the delta gets a check of its own, not just a recorded hash.
