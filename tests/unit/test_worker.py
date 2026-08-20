@@ -6,9 +6,8 @@ from typing import cast
 from unittest.mock import Mock
 
 import pytest
-from billiard.exceptions import SoftTimeLimitExceeded
 from celery import Task
-from celery.exceptions import Retry
+from celery.exceptions import Retry, SoftTimeLimitExceeded
 from pydantic import ValidationError
 
 import mindbridge.worker as worker_module

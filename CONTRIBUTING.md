@@ -17,11 +17,19 @@ authoritative; `pip install -e .` will not reproduce it.
 ```bash
 git clone https://github.com/EventHorizon-Lab/MindBridge.git
 cd MindBridge
-uv sync --all-groups --extra edge --extra server
+uv sync --all-groups --extra edge --extra media --extra server
 ```
 
-Add `--extra media` if you are touching the clipping path, and `--extra cloud-models` if you need
-the local Jina embedder. The latter pulls torch, so skip it unless you need it.
+That is the set CI installs, so the clipping tests run here rather than skipping. `uv sync` is an
+exact sync: to add the local Jina embedder, extend that same command with `--extra cloud-models`
+rather than syncing it alone, which would uninstall everything above. It pulls torch, so skip it
+unless you need it.
+
+For everything at once — every scenario plus the benchmark harness and the local models:
+
+```bash
+uv sync --all-groups --all-extras
+```
 
 ### A database for the tests that need one
 

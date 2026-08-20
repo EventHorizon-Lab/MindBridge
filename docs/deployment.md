@@ -16,16 +16,30 @@ Five process roles. Only the first three are long-running.
 | Consolidation | `mindbridge consolidate --tenant-id ...` | `server` |
 | Lifecycle | `mindbridge lifecycle --tenant-id ...` | `server` |
 
-Install only what a process runs:
+Install only what a process runs. Each line below is a whole environment for one role, not a
+step in a sequence — `uv sync` is exact, so running the next one uninstalls the last one's
+packages:
 
 ```bash
 uv sync                                      # Core types and Python SDK
 uv sync --extra edge                         # Any edge host
 uv sync --extra server                       # API, MCP, scheduled sweeps
 uv sync --extra server --extra cloud-models  # GPU memory worker
+uv sync --extra benchmarks                   # Benchmark harness
+uv sync --all-extras                         # Every role at once
 ```
 
-The API image should not carry `cloud-models`; it pulls torch and the API loads no model.
+The API image should not carry `cloud-models`; it pulls torch and the API loads no model. A host
+that runs more than one role names their extras together in one `uv sync`, or extends what is
+installed with `uv sync --inexact --extra ...`.
+
+`--all-extras` is a uv flag. Installers that have no equivalent take the `all` extra, which is
+the same set by name:
+
+```bash
+uv pip install '.[all]'
+python -m pip install '.[all]'
+```
 
 ## Datastores
 

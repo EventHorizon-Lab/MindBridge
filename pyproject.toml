@@ -34,12 +34,20 @@ openai = "mindbridge.models.openai:create_embedder"
 
 [project.optional-dependencies]
 benchmarks = [
+    # The adapter benchmarks import mindbridge.models.jina, which reaches
+    # mindbridge.telemetry. Without this the harness imports only next to some other extra
+    # that happens to carry the API: `mindbridge-bench jina --help` raised ModuleNotFoundError
+    # on a benchmarks-only install while `m3` ran, which is a scenario that cannot import its
+    # own modules rather than a missing model dependency.
+    "opentelemetry-api>=1.44,<2",
     "pyarrow>=18,<26",
 ]
 edge = [
     "boto3>=1.40,<2",
+    # boto3 pulls botocore, but edge/sync.py imports botocore.config and botocore.exceptions
+    # by name, so the dependency is this package's, not a detail of boto3's own tree.
+    "botocore>=1.40,<2",
     "cryptography>=45,<51",
-    "openai>=2,<3",
     "opentelemetry-api>=1.44,<2",
     "opentelemetry-exporter-otlp-proto-http>=1.44,<2",
     "opentelemetry-instrumentation-botocore>=0.65b0,<1",
@@ -48,9 +56,13 @@ edge = [
 ]
 server = [
     "boto3>=1.40,<2",
+    "botocore>=1.40,<2",
     "celery[redis]>=5.6,<6",
     "fastapi>=0.116,<1",
     "mcp>=2,<3",
+    # api/mcp.py imports the payload types straight from mcp_types. mcp brings it today; the
+    # import is ours, so the requirement is declared here rather than inherited.
+    "mcp-types>=2,<3",
     "openai>=2,<3",
     "opentelemetry-api>=1.44,<2",
     "opentelemetry-exporter-otlp-proto-http>=1.44,<2",
@@ -62,6 +74,11 @@ server = [
     "opentelemetry-sdk>=1.44,<2",
     "pgvector>=0.4,<1",
     "psycopg[binary,pool]>=3.2,<4",
+    # FastAPI does not re-export starlette.types.Lifespan, so api/app.py imports it from
+    # starlette itself. The floor is FastAPI's own; a tighter one downgrades the resolution
+    # that FastAPI would otherwise pick, which is what naming a transitive dependency costs
+    # when the range is guessed rather than read.
+    "starlette>=0.46,<2",
     "uvicorn>=0.35,<1",
 ]
 # The decoders mindbridge.media.clipping loads lazily. Separate from cloud-models so CI can
@@ -74,6 +91,8 @@ media = [
 ]
 cloud-models = [
     "mindbridge[media]",
+    # models/jina.py resolves the pinned revision through huggingface_hub.snapshot_download.
+    "huggingface-hub>=0.30,<2",
     "opentelemetry-api>=1.44,<2",
     "sentence-transformers>=5.2,<6",
     "torch==2.9.1",
@@ -84,6 +103,20 @@ cloud-models = [
     "torchvision==0.24.1",
     "transformers>=5.1,<6",
 ]
+# One token for every scenario at once, for the workstation that plays all the roles and for
+# installers with no `--all-extras` flag of their own. tests/test_package.py fails if this
+# stops being the exact union, so a new extra cannot quietly stay out of it.
+all = [
+    "mindbridge[benchmarks,cloud-models,edge,media,server]",
+]
+
+# Declared so the lockfile resolves from PyPI whoever runs `uv lock`. Without it uv takes the
+# default index from the machine's own uv.toml, and a contributor's local mirror ends up as the
+# download URL for all 900-odd wheels that CI and every other checkout then install from.
+[[tool.uv.index]]
+name = "pypi"
+url = "https://pypi.org/simple"
+default = true
 
 [[tool.uv.index]]
 name = "pytorch-cu128"
@@ -103,6 +136,9 @@ dev = [
     "pytest>=8,<10",
     "pytest-asyncio>=0.24,<2",
     "ruff>=0.11,<1",
+    # tests/test_package.py reads this file; tomllib is 3.11+. mypy also requires the
+    # backport on 3.10, which is why the tests passed before anything declared it.
+    "tomli>=2,<3; python_version < '3.11'",
 ]
 
 [tool.hatch.build.targets.wheel]
@@ -129,12 +165,8 @@ files = ["src", "tests"]
 
 [[tool.mypy.overrides]]
 module = [
-    "billiard",
-    "billiard.*",
     "celery",
     "celery.*",
-    "kombu",
-    "kombu.*",
     # The media decoders live in the cloud-models extra, which CI does not install because
     # it also carries torch. mindbridge.media.clipping imports them lazily and raises
     # ModelUnavailableError without them; its tests skip rather than fail collection.
