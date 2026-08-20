@@ -1,6 +1,7 @@
 """Checks for encrypted, bounded, and forgettable device identity learning."""
 
 import sqlite3
+from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -61,7 +62,7 @@ def test_identity_memory_matches_learns_and_encrypts_samples(tmp_path: Path) -> 
     assert cloud_identity.visual_bbox_xyxy == (0.1, 0.2, 0.4, 0.8)
     assert "embedding" not in cloud_identity.model_dump()
     assert database_path.stat().st_mode & 0o777 == 0o600
-    with sqlite3.connect(database_path) as connection:
+    with closing(sqlite3.connect(database_path)) as connection, connection:
         retained = connection.execute(
             "SELECT encrypted_embedding FROM edge_identity_templates WHERE identity_id = ?",
             (first.identity_id,),

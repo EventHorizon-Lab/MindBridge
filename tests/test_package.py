@@ -13,7 +13,7 @@ from typing import Any, cast
 if sys.version_info >= (3, 11):
     import tomllib
 else:
-    # tomllib landed in 3.11. On the 3.10 half of the matrix mypy itself requires the
+    # tomllib landed in 3.11. On the 3.10 leg of the matrix mypy itself requires the
     # tomli backport, so it is present wherever the dev group that runs this test is.
     import tomli as tomllib
 
@@ -277,10 +277,10 @@ by Jina Omni's own Qwen3-VL processor, which swallows the ImportError and embeds
 
 @cache
 def _pyproject() -> dict[str, Any]:
-    # The annotation is load-bearing, not decoration. mypy runs as 3.10 and so always reads
-    # the `import tomli as tomllib` branch, but the backport is only installed under that
-    # marker, so on 3.11 the import is unresolved, `ignore_missing_imports` makes `loads`
-    # return `Any`, and returning that straight out trips `no-any-return` on half the matrix.
+    # The annotation is load-bearing, not decoration. mypy checks as the interpreter it runs
+    # on, so which of the two branches above it reads changes with the matrix leg, and
+    # `ignore_missing_imports` makes `loads` return `Any` on any leg where the module it
+    # picked is unresolved -- returning that straight out trips `no-any-return` there.
     parsed: dict[str, Any] = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     return parsed
 

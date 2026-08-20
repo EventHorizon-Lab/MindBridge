@@ -8,8 +8,10 @@ Repository conventions that apply to automated agents as well as people are in
 
 ## Setup
 
-MindBridge supports Python 3.10 and 3.11. 3.10 is the compatibility floor because several edge
-platform images — JetPack, D-Robotics RDK, Rockchip RKNN — still ship it.
+MindBridge supports Python 3.10 through 3.14, and CI runs the whole gate on every one of
+them. 3.10 is the compatibility floor because several edge platform images — JetPack,
+D-Robotics RDK, Rockchip RKNN — still ship it. The ceiling is the newest release the matrix
+covers, so raising it means adding a leg and reading what it says, not editing one number.
 
 The project uses [uv](https://docs.astral.sh/uv/) with a checked-in `uv.lock`. That lockfile is
 authoritative; `pip install -e .` will not reproduce it.
@@ -56,9 +58,12 @@ uv run pytest -W error
 git diff --check
 ```
 
-`mypy` runs in **strict** mode over `src` and `tests`. Ruff enforces `ANN`, `ASYNC`, `B`, `C4`,
-`C90`, `DTZ`, `E4`, `E7`, `E9`, `F`, `I`, `RUF`, `SIM`, and `UP`, with a McCabe complexity ceiling
-of 10 and a 100-character line length.
+`mypy` runs in **strict** mode over `src` and `tests`, targeting whichever interpreter invokes
+it rather than a pinned version, so each matrix leg checks the branches its own version takes.
+Ruff's `target-version = "py310"` is what holds the tree to syntax the floor can parse.
+
+Ruff enforces `ANN`, `ASYNC`, `B`, `C4`, `C90`, `DTZ`, `E4`, `E7`, `E9`, `F`, `I`, `RUF`, `SIM`,
+and `UP`, with a McCabe complexity ceiling of 10 and a 100-character line length.
 
 `ANN401` bans `Any` in signatures. When you genuinely need to accept a structural type, write a
 `Protocol` shim rather than reaching for `Any`.

@@ -149,6 +149,10 @@ class Embedder(Protocol):
         """The search space every vector this embedder produces belongs to."""
         # An explicit subclass inherits this body, so raise instead of returning None:
         # a silent None would make the space guards compare equal and pass vacuously.
+        #
+        # Reading the member is the only thing that reaches this: since 3.12 `isinstance`
+        # resolves protocol members statically, so an `isinstance(plugin, Embedder)` passes
+        # for a subclass that inherited this body. `load_embedder` reads it for that reason.
         raise NotImplementedError("an Embedder must declare its embedding space")
 
     async def embed(self, request: EmbedRequest) -> EmbedResult: ...

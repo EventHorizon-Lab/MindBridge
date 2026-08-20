@@ -21,7 +21,13 @@ def test_embedding_requires_a_normalized_vector(values: tuple[float, ...]) -> No
 
 
 def test_an_embedder_without_a_space_fails_the_capability_check() -> None:
-    """A structural isinstance cannot reject an explicit subclass, so the member must not be None."""
+    """Reading the member is the check, because no structural check can be.
+
+    `isinstance` cannot reject an explicit subclass -- before 3.12 it reached this property
+    and raised from here, and since 3.12 it resolves protocol members statically and passes.
+    Asserting on the read rather than on `isinstance` is what makes this hold on both.
+    `load_embedder` is where the read happens for a plugin; its own test covers that path.
+    """
 
     class Incomplete(Embedder):
         async def embed(self, request: EmbedRequest) -> EmbedResult:
@@ -30,4 +36,4 @@ def test_an_embedder_without_a_space_fails_the_capability_check() -> None:
     # mypy rejects this class too; the runtime guard covers plugins published without type checking.
     incomplete = Incomplete()  # type: ignore[abstract]
     with pytest.raises(NotImplementedError, match="declare its embedding space"):
-        isinstance(incomplete, Embedder)
+        _ = incomplete.space_reference
