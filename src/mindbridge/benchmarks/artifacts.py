@@ -95,6 +95,31 @@ def write_text_atomically(path: Path, content: str) -> None:
     temporary_path.replace(path)
 
 
+def jsonl_lines(path: Path) -> tuple[str, ...]:
+    """Return one unparsed string per JSONL record, blank lines dropped.
+
+    Splits on the newline character alone, never with `str.splitlines()` --
+    that distinction is the whole reason this function exists.
+    `splitlines()` also breaks on U+2028 LINE SEPARATOR, U+2029, U+0085 NEL,
+    U+000B, U+000C and U+001C-U+001E. Those are legal *inside* a JSON string
+    value and are not JSON line delimiters, so splitting on them cuts
+    records in half mid-string and every half then fails to parse.
+
+    Measured against the official CL-Bench release (`tencent/CL-bench`
+    revision `b28a5832a09b0d96c0cf4c22e90d7c60ede25b80`, 90,085,681 bytes):
+    343 bare U+2028 characters turn its 1,899 records into 2,242 pieces, of
+    which 350 fail to parse; splitting on the newline alone yields 1,899
+    records and zero failures. The corpora behind the other callers carry no
+    such character today, so only their tests can show the difference.
+
+    `read_text` reads in universal-newline mode, so CRLF and CR-only input
+    arrives already normalised and leaves no carriage return on any line.
+    That translation does not touch any of the separators listed above,
+    which is why `splitlines()` was the only thing shredding these records.
+    """
+    return tuple(line for line in path.read_text(encoding="utf-8").split("\n") if line.strip())
+
+
 def _contains_secret(value: JsonValue) -> bool:
     if isinstance(value, dict):
         for key, item in value.items():
