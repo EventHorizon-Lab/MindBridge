@@ -25,6 +25,12 @@ exact sync: to add the local Jina embedder, extend that same command with `--ext
 rather than syncing it alone, which would uninstall everything above. It pulls torch, so skip it
 unless you need it.
 
+For everything at once — every scenario plus the benchmark harness and the local models:
+
+```bash
+uv sync --all-groups --all-extras
+```
+
 ### A database for the tests that need one
 
 ```bash

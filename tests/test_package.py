@@ -207,6 +207,9 @@ SCENARIOS: dict[str, tuple[str, ...]] = {
     "media": ("media",),
 }
 
+UNION_EXTRAS = frozenset({"all"})
+"""Extras that only re-export other extras, so no module and no distribution is theirs."""
+
 ARTIFACT_EXTRAS = frozenset({"cloud-models"})
 """Extras that carry weights and decoders rather than serving a subtree of their own.
 
@@ -415,7 +418,7 @@ def test_scenarios_partition_the_package() -> None:
     unassigned = areas - assigned
 
     assert unassigned == set()
-    assert set(_extras()) == (set(SCENARIOS) - {""}) | ARTIFACT_EXTRAS
+    assert set(_extras()) == (set(SCENARIOS) - {""}) | ARTIFACT_EXTRAS | UNION_EXTRAS
 
 
 def _module_name(path: Path) -> str:
@@ -583,3 +586,17 @@ def test_every_extra_named_outside_pyproject_exists() -> None:
 
 def _documentation() -> list[Path]:
     return sorted(path for path in (ROOT / "docs").rglob("*.md"))
+
+
+def test_the_all_extra_installs_every_other_extra() -> None:
+    """`all` has to stay the union, or the one command for everything stops being it.
+
+    A union written out by hand is the kind of list that goes stale on the commit adding the
+    next extra, and nothing about installing it would look wrong -- it would just be missing
+    a scenario.
+    """
+    everything = {
+        name for extra in _extras() if extra not in UNION_EXTRAS for name in _declared(extra)
+    }
+
+    assert set(_declared("all")) == everything

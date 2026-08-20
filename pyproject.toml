@@ -103,6 +103,12 @@ cloud-models = [
     "torchvision==0.24.1",
     "transformers>=5.1,<6",
 ]
+# One token for every scenario at once, for the workstation that plays all the roles and for
+# installers with no `--all-extras` flag of their own. tests/test_package.py fails if this
+# stops being the exact union, so a new extra cannot quietly stay out of it.
+all = [
+    "mindbridge[benchmarks,cloud-models,edge,media,server]",
+]
 
 # Declared so the lockfile resolves from PyPI whoever runs `uv lock`. Without it uv takes the
 # default index from the machine's own uv.toml, and a contributor's local mirror ends up as the

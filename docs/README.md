@@ -63,9 +63,9 @@ recommended deployment shape, not an optimisation.
 
 `uv sync` makes the environment match exactly the extras it is given, so a later `uv sync` with a
 different set uninstalls the earlier one's packages. Per host that is the point: one role, one
-environment. On a workstation that plays several roles, name every extra in a single command, or
-add to what is already installed with `uv sync --inexact --extra ...`. `uv run --extra ...` only
-ever adds, so it is safe to mix.
+environment. On a workstation that plays several roles, name every extra in a single command,
+take all of them with `uv sync --all-extras`, or add to what is already installed with
+`uv sync --inexact --extra ...`. `uv run --extra ...` only ever adds, so it is safe to mix.
 
 Where a document explains why something is the way it is, that reasoning is usually load-bearing:
 it records a constraint discovered in production or a decision with a stated cost. The

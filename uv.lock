@@ -870,6 +870,40 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+all = [
+    { name = "av" },
+    { name = "boto3" },
+    { name = "botocore" },
+    { name = "celery", extra = ["redis"] },
+    { name = "cryptography" },
+    { name = "fastapi" },
+    { name = "huggingface-hub" },
+    { name = "mcp" },
+    { name = "mcp-types" },
+    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "openai" },
+    { name = "opentelemetry-api" },
+    { name = "opentelemetry-exporter-otlp-proto-http" },
+    { name = "opentelemetry-instrumentation-botocore" },
+    { name = "opentelemetry-instrumentation-celery" },
+    { name = "opentelemetry-instrumentation-fastapi" },
+    { name = "opentelemetry-instrumentation-httpx" },
+    { name = "opentelemetry-instrumentation-psycopg" },
+    { name = "opentelemetry-sdk" },
+    { name = "pgvector" },
+    { name = "pillow" },
+    { name = "psycopg", extra = ["binary", "pool"] },
+    { name = "pyarrow" },
+    { name = "sentence-transformers" },
+    { name = "soundfile" },
+    { name = "starlette" },
+    { name = "torch" },
+    { name = "torchvision", version = "0.24.1", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "platform_machine == 'aarch64' and sys_platform == 'linux'" },
+    { name = "torchvision", version = "0.24.1+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "platform_machine != 'aarch64' or sys_platform != 'linux'" },
+    { name = "transformers" },
+    { name = "uvicorn" },
+]
 benchmarks = [
     { name = "opentelemetry-api" },
     { name = "pyarrow" },
@@ -951,6 +985,7 @@ requires-dist = [
     { name = "huggingface-hub", marker = "extra == 'cloud-models'", specifier = ">=0.30,<2" },
     { name = "mcp", marker = "extra == 'server'", specifier = ">=2,<3" },
     { name = "mcp-types", marker = "extra == 'server'", specifier = ">=2,<3" },
+    { name = "mindbridge", extras = ["benchmarks", "cloud-models", "edge", "media", "server"], marker = "extra == 'all'" },
     { name = "mindbridge", extras = ["media"], marker = "extra == 'cloud-models'" },
     { name = "numpy", marker = "extra == 'media'", specifier = ">=1.26,<3" },
     { name = "openai", marker = "extra == 'server'", specifier = ">=2,<3" },
@@ -982,7 +1017,7 @@ requires-dist = [
     { name = "transformers", marker = "extra == 'cloud-models'", specifier = ">=5.1,<6" },
     { name = "uvicorn", marker = "extra == 'server'", specifier = ">=0.35,<1" },
 ]
-provides-extras = ["benchmarks", "edge", "server", "media", "cloud-models"]
+provides-extras = ["benchmarks", "edge", "server", "media", "cloud-models", "all"]
 
 [package.metadata.requires-dev]
 dev = [
