@@ -65,14 +65,6 @@ _UNSUPPORTED_KEYWORDS = frozenset(
         "then",
     }
 )
-_NAMESPACE_KEYWORDS = frozenset({"$defs", "properties"})
-"""Keywords whose keys are names the model chose, not schema keywords of their own.
-
-Filtering these as keywords is how a field called `title` or `format` disappears from
-`properties` while `additionalProperties: false` forbids the model from emitting it -- a
-shape the validator then rejects on every single call -- and how a field called `then` is
-mistaken for a conditional subschema and fails derivation outright.
-"""
 """Keywords no strict decoder will compile, so a schema using one must not be built.
 
 Composition and conditional subschemas are excluded by the provider contract rather than
@@ -80,6 +72,16 @@ merely ignored, and a fixed-length tuple reaches JSON Schema as `prefixItems`, w
 strict equivalent either. Naming all of them matters because this guard is the only thing
 standing between an output model growing an inexpressible shape and a deployment discovering
 it on its first observation.
+"""
+_NAMESPACE_KEYWORDS = frozenset({"$defs", "properties"})
+"""Keywords whose keys are names the model chose, not schema keywords of their own.
+
+Filtering these as keywords is how a field called `title` or `format` disappears from
+`properties` while `additionalProperties: false` forbids the model from emitting it -- a
+shape the validator then rejects on every single call -- and how a field called `then` is
+mistaken for a conditional subschema and fails derivation outright. Under `$defs` the same
+filter drops a whole definition and leaves the `$ref` that named it pointing at nothing,
+which is a schema no provider can compile rather than one that merely omits a field.
 """
 
 
