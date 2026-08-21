@@ -5,7 +5,7 @@ import json
 import os
 import subprocess
 import sys
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncGenerator, Mapping
 from typing import cast
 
 import httpx
@@ -221,15 +221,19 @@ async def test_nested_operations_charge_the_outermost_one_once(
 async def test_an_operation_around_a_yield_survives_closing_in_another_context() -> None:
     """`kernel.watch_observation_job:462` is an async generator, so its account closes late."""
 
-    async def watch() -> AsyncIterator[int]:
+    async def watch() -> AsyncGenerator[int, None]:
         async with operation_span("mindbridge.test.watch"):
             while True:
                 yield 1
 
     generator = watch()
+
+    async def start() -> int:
+        return await anext(generator)
+
     # Started inside a task, which copies the context; closed from this one, which never held
     # whatever the task set. Resetting a token here raises; the operation must not.
-    assert await asyncio.create_task(generator.__anext__()) == 1
+    assert await asyncio.create_task(start()) == 1
     await generator.aclose()
 
     async with operation_span("mindbridge.test.after_watch"):
