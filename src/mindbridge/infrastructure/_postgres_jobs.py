@@ -26,6 +26,7 @@ from mindbridge.infrastructure._postgres_types import (
     PostgresStoreOperations,
     tenant_connection,
 )
+from mindbridge.telemetry import model_token_usage
 
 PROCESS_OBSERVATION_JOB_TYPE = "process_observation"
 OBSERVATION_JOB_STALE_AFTER_SECONDS = 960
@@ -180,6 +181,11 @@ async def _finish_observation_processing_job_on_connection(
     memory_ids: tuple[MemoryId, ...] | None = None,
 ) -> ObservationProcessingJob:
     _require_expected_job_id(observation_id, job_id)
+    # Whatever the models charged while this attempt ran. The account belongs to the operation
+    # that spent it -- `mindbridge.process_observation` here -- and this is the last moment it
+    # is still open, so it is read rather than passed down through every pipeline in between.
+    # Success and failure both land here, which is the point: a failed attempt was paid for.
+    charged = model_token_usage()
     cursor = await connection.execute(
         """
         UPDATE jobs
@@ -188,6 +194,8 @@ async def _finish_observation_processing_job_on_connection(
                 jsonb_set(payload, '{memory_ids}', %s::jsonb),
                 payload
             ),
+            input_tokens = COALESCE(input_tokens, 0) + %s,
+            output_tokens = COALESCE(output_tokens, 0) + %s,
             updated_at = now()
         WHERE tenant_id = %s AND job_id = %s
           AND state = 'running' AND attempt = %s
@@ -200,6 +208,8 @@ async def _finish_observation_processing_job_on_connection(
             state.value,
             error_code,
             Jsonb(list(memory_ids)) if memory_ids is not None else None,
+            charged.get("input", 0),
+            charged.get("output", 0),
             tenant_id,
             job_id,
             attempt,
@@ -288,14 +298,19 @@ class ObservationJobOperations(PostgresStoreOperations):
         observation_id: ObservationId,
         job_id: JobId,
     ) -> ObservationJobClaim:
-        """Atomically claim a ready or stale job without concurrent ownership."""
+        """Atomically claim a ready or stale job without concurrent ownership.
+
+        The claim is also what stamps `started_at`, so the row always separates the wait from
+        the attempt it is currently reporting. A re-claim moves it, because the previous
+        attempt's start describes an attempt the row no longer reports.
+        """
         _require_expected_job_id(observation_id, job_id)
         async with tenant_connection(self._pool, tenant_id) as connection:
             cursor = await connection.execute(
                 """
                 UPDATE jobs
                 SET state = 'running', attempt = attempt + 1,
-                    error_code = NULL, updated_at = now()
+                    error_code = NULL, started_at = now(), updated_at = now()
                 WHERE tenant_id = %s AND job_id = %s
                   AND job_type = %s AND payload ->> 'observation_id' = %s
                   AND (

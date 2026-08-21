@@ -55,6 +55,7 @@ from mindbridge.core import (
 )
 from mindbridge.infrastructure.postgres import PostgresMemoryStore
 from mindbridge.models import Embedding, EmbedRequest, EmbedResult
+from mindbridge.telemetry import operation_span, set_current_span_attributes
 
 NOW = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
 
@@ -228,6 +229,7 @@ async def test_migration_installs_complete_phase_zero_schema(database_url: str) 
         19,
         20,
         21,
+        22,
     ]
 
 
@@ -715,6 +717,78 @@ async def _processing_job_count(database_url: str, tenant_id: str) -> int:
             )
         ).fetchone()
     return cast(tuple[int], row)[0]
+
+
+async def test_job_row_separates_queue_wait_from_work_and_accumulates_cost(
+    store: PostgresMemoryStore,
+    database_url: str,
+) -> None:
+    """created_at and updated_at alone answered neither "how long did it wait" nor "cost"."""
+    receipt = await _kernel(store).observe(_observe_request(tenant_id="tenant_job_cost"))
+    tenant_id = TenantId("tenant_job_cost")
+    observation_id = ObservationId(receipt.observation_id)
+    job_id = JobId(receipt.processing_job_id)
+    empty_output = ObservationProcessingOutput(
+        evidence_spans=(),
+        events=(),
+        entities=(),
+        entity_mentions=(),
+        claims=(),
+        memories=(),
+        relations=(),
+        embeddings=(),
+    )
+
+    async with operation_span("mindbridge.test.first_attempt"):
+        await store.claim_observation_processing_job(tenant_id, observation_id, job_id)
+        set_current_span_attributes(
+            {"mindbridge.model.input_tokens": 120, "mindbridge.model.output_tokens": 8}
+        )
+        await store.mark_observation_processing_failed(
+            tenant_id,
+            observation_id,
+            job_id,
+            attempt=1,
+            error_code="model_output_invalid",
+        )
+    first_attempt = await _job_timing(database_url, tenant_id, job_id)
+    async with operation_span("mindbridge.test.second_attempt"):
+        await store.claim_observation_processing_job(tenant_id, observation_id, job_id)
+        set_current_span_attributes({"mindbridge.model.input_tokens": 30})
+        await store.commit_observation_processing(
+            tenant_id,
+            observation_id,
+            job_id,
+            attempt=2,
+            output=empty_output,
+        )
+    second_attempt = await _job_timing(database_url, tenant_id, job_id)
+
+    started_at, created_at, input_tokens, output_tokens = first_attempt
+    assert started_at is not None and started_at >= created_at
+    assert (input_tokens, output_tokens) == (120, 8)
+    # The retry reports its own wait, and the tokens the failed attempt burned are still owed.
+    assert second_attempt[0] is not None and second_attempt[0] > started_at
+    assert second_attempt[2:] == (150, 8)
+
+
+async def _job_timing(
+    database_url: str,
+    tenant_id: str,
+    job_id: str,
+) -> tuple[datetime | None, datetime, int | None, int | None]:
+    connection = await AsyncConnection.connect(database_url)
+    async with connection:
+        row = await (
+            await connection.execute(
+                """
+                SELECT started_at, created_at, input_tokens, output_tokens
+                FROM jobs WHERE tenant_id = %s AND job_id = %s
+                """,
+                (tenant_id, job_id),
+            )
+        ).fetchone()
+    return cast("tuple[datetime | None, datetime, int | None, int | None]", row)
 
 
 def _observe_request(
