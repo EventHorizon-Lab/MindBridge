@@ -7,6 +7,7 @@ import pytest
 from consolidation_doubles import RecordingTextEmbedder
 
 from mindbridge.application import process_observation as process_observation_module
+from mindbridge.application.derive_observation_graph import embed_observation_graph
 from mindbridge.application.evidence_clips import ClipSampling
 from mindbridge.application.observation_processing import (
     ObservationBatch,
@@ -42,6 +43,7 @@ from mindbridge.core import (
     MediaObject,
     MediaObjectId,
     MemoryId,
+    MemoryIntegrityError,
     ModelReference,
     ModelRequestError,
     ModelUnavailableError,
@@ -333,7 +335,28 @@ async def test_processor_builds_event_memory_and_raw_media_embedding_once(
         EmbeddedObjectType.EVENT,
         EmbeddedObjectType.CLAIM,
         EmbeddedObjectType.ENTITY,
+        EmbeddedObjectType.MEMORY_RECORD,
     }
+    # Recall searches the memory channel and turns its hits into memory IDs for two of its
+    # four store lookups, so a derived memory without a vector there is unreachable by half
+    # the fusion. Both rows come out of the four encoder inputs asserted above -- the memory's
+    # summary is its record's own text, so the second row reuses the first row's vector.
+    memory_vectors = {
+        embedding.object_id: embedding.values
+        for embedding in store.output.embeddings
+        if embedding.object_type is EmbeddedObjectType.MEMORY_RECORD
+    }
+    assert set(memory_vectors) == {memory.memory_id for memory in store.output.memories}
+    represented = {
+        embedding.object_id: embedding.values
+        for embedding in store.output.embeddings
+        if embedding.object_type in {EmbeddedObjectType.EVENT, EmbeddedObjectType.CLAIM}
+    }
+    assert {
+        relation.target_id: represented[relation.source_id]
+        for relation in store.output.relations
+        if relation.relation_type is RelationType.REPRESENTED_BY
+    } == memory_vectors
     assert len(store.output.entities) == 3
     assert len(store.output.entity_mentions) == 3
     assert len(store.output.claims) == 1
@@ -468,6 +491,73 @@ async def test_processing_output_rejects_a_graph_without_event_memory_link() -> 
 
     with pytest.raises(DomainInvariantError, match="one-to-one"):
         replace(store.output, relations=relations)
+
+
+async def test_processing_output_rejects_a_memory_recall_cannot_look_up() -> None:
+    """The regression that ran a whole evaluation unnoticed has to fail, not go quiet.
+
+    3 336 memories with no MEMORY_RECORD vector across six audiovisual benchmarks broke
+    nothing observable: recall got an empty ID set out of that channel and its two ID-driven
+    store lookups returned nothing. Only a guard turns that back into a failure.
+    """
+    store = RecordingProcessingStore()
+    await _processor(
+        store,
+        RecordingPerceiver(),
+        RecordingEmbedder(),
+        RecordingTextEmbedder(),
+    ).run(TENANT_ID, OBSERVATION_ID, JOB_ID)
+    assert store.output is not None
+    embeddings = tuple(
+        embedding
+        for embedding in store.output.embeddings
+        if not (
+            embedding.object_type is EmbeddedObjectType.MEMORY_RECORD
+            and embedding.object_id == store.output.memories[0].memory_id
+        )
+    )
+
+    with pytest.raises(DomainInvariantError, match="searchable vector"):
+        replace(store.output, embeddings=embeddings)
+
+
+async def test_a_memory_vector_is_refused_when_it_would_encode_another_text() -> None:
+    """One vector stands for a record and its memory only while both carry one text.
+
+    The two rows share a vector because a derived memory restates its record rather than
+    summarising it. The day that stops being true the reused vector is silently stale, so the
+    reuse is checked against the memory that will be committed instead of assumed.
+    """
+    store = RecordingProcessingStore()
+    perceiver = RecordingPerceiver()
+    text_embedder = RecordingTextEmbedder()
+    processor = _processor(store, perceiver, RecordingEmbedder(), text_embedder)
+    await processor.run(TENANT_ID, OBSERVATION_ID, JOB_ID)
+    assert store.output is not None
+    events = store.output.events
+    claims = store.output.claims
+    entities = store.output.entities
+    memories = store.output.memories
+
+    embeddings = await embed_observation_graph(
+        TENANT_ID, events, claims, entities, memories, text_embedder, NOW
+    )
+    # Every memory stays present, so the refusal can only come from the changed text: a
+    # short tuple would trip the missing-memory branch instead and prove nothing.
+    paraphrased = (
+        replace(memories[0], summary="A different summary of the same event."),
+        *memories[1:],
+    )
+
+    assert {
+        embedding.object_id
+        for embedding in embeddings
+        if embedding.object_type is EmbeddedObjectType.MEMORY_RECORD
+    } == {memory.memory_id for memory in memories}
+    with pytest.raises(MemoryIntegrityError, match="text of the record it represents"):
+        await embed_observation_graph(
+            TENANT_ID, events, claims, entities, paraphrased, text_embedder, NOW
+        )
 
 
 async def test_processing_output_rejects_memory_evidence_from_another_record() -> None:

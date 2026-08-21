@@ -202,6 +202,7 @@ class ProcessObservation:
                     events,
                     graph.claims,
                     graph.entities,
+                    graph.memories,
                     self._text_embedder,
                     claim.job.created_at,
                 ),
