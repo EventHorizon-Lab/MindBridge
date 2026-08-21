@@ -78,7 +78,7 @@ async def test_claim_consolidator_inspects_native_evidence_and_reports_its_model
     )
     assert result.relationships[0].relation_type is RelationType.CONTRADICTS
     assert result.model_reference.model_id == "qwen3.8-max"
-    assert result.prompt_version == "consolidate_claims_v3"
+    assert result.prompt_version == "consolidate_claims_v4"
 
 
 async def test_claim_consolidator_rejects_unknown_and_reversed_relationships() -> None:

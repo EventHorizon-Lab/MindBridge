@@ -11,7 +11,7 @@ _EXPECTED_FINGERPRINTS = {
     "answer_from_evidence_v12": (
         "6a939ed81473a45bfc28267b5501849fe2e5e8acee7c023d5c97bed27913ab70"
     ),
-    "consolidate_claims_v3": "a8df3ad832ccf01ccc56557bfa82e3de360d7374b4f2c48a253ecf500662922e",
+    "consolidate_claims_v4": "4c075d9b5fe18a737bf93f3b4a99c3a84f3401c705482e4f166b89a116794693",
     "consolidate_episodes_v3": "40963f8c2a177f2172672bbbb4be74539a5560a62f44cbffcfa171918859f931",
     "consolidate_summaries_v4": (
         "05e2c2e1c06f73ad1fb177efa719f5b1a6bdffbeebbb2f9a52f404150b1bbd09"
