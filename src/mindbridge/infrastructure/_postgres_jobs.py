@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from datetime import datetime
+from decimal import Decimal
 from typing import TypeAlias, cast
 
 from psycopg.types.json import Jsonb
@@ -42,6 +44,148 @@ JobRow: TypeAlias = tuple[
     str,
     list[str],
 ]
+_AccountingRow: TypeAlias = tuple[
+    str,
+    int,
+    int,
+    int,
+    int,
+    int,
+    Decimal,
+    Decimal,
+    Decimal,
+    Decimal,
+]
+
+
+@dataclass(frozen=True, slots=True)
+class ObservationJobAccounting:
+    """One tenant's share of the ledger: how many jobs, how long they waited, what they cost."""
+
+    tenant_id: TenantId
+    jobs: int
+    pending: int
+    running: int
+    failed: int
+    succeeded: int
+    queue_wait_seconds: float
+    work_seconds: float
+    input_tokens: int
+    output_tokens: int
+
+
+async def tenant_scope_required(connection: DatabaseConnection) -> bool:
+    """Report whether row-level security confines this role to one tenant at a time.
+
+    `jobs` is FORCE ROW LEVEL SECURITY, so a cross-tenant scan by the runtime role returns no
+    rows rather than failing. A repair tool that reads that as "nothing to repair" is worse than
+    one that refuses, which is why both scans below are only offered to a role that can see
+    every tenant, or to a caller that names the one tenant it means.
+    """
+    cursor = await connection.execute(
+        """
+        SELECT current_setting('is_superuser') = 'on'
+               OR EXISTS (
+                   SELECT 1 FROM pg_roles
+                   WHERE rolname = current_user AND rolbypassrls
+               )
+        """
+    )
+    row = await cursor.fetchone()
+    return not cast(tuple[bool], row)[0]
+
+
+async def unreachable_observation_jobs(
+    connection: DatabaseConnection,
+    *,
+    tenant_id: TenantId | None = None,
+    include_failed: bool = False,
+) -> tuple[tuple[TenantId, ObservationId, JobId], ...]:
+    """List the jobs a worker would still accept a claim for, in the order they arrived.
+
+    This is the claim predicate of `claim_observation_processing_job`, read instead of written:
+    a row matching it is work the ledger still owes, whether or not the broker has a message
+    left for it. A stale `running` row is included because that is what a lost worker leaves
+    behind, and `failed` only on request because a deterministic failure republished on a timer
+    is a paid-for loop.
+
+    The join keeps a job whose observation has since been deleted out of the result: the worker
+    would only fail it again.
+    """
+    cursor = await connection.execute(
+        """
+        SELECT job.tenant_id, job.payload ->> 'observation_id', job.job_id
+        FROM jobs AS job
+        JOIN observations AS observation
+          ON observation.tenant_id = job.tenant_id
+         AND observation.observation_id = job.payload ->> 'observation_id'
+        WHERE job.job_type = %s
+          AND (%s::text IS NULL OR job.tenant_id = %s)
+          AND (
+              job.state = 'pending'
+              OR (%s AND job.state = 'failed')
+              OR (
+                  job.state = 'running'
+                  AND job.updated_at <= now() - make_interval(secs => %s)
+              )
+          )
+        ORDER BY job.created_at, job.job_id
+        """,
+        (
+            PROCESS_OBSERVATION_JOB_TYPE,
+            tenant_id,
+            tenant_id,
+            include_failed,
+            OBSERVATION_JOB_STALE_AFTER_SECONDS,
+        ),
+    )
+    return tuple(
+        (TenantId(tenant), ObservationId(observation), JobId(job))
+        for tenant, observation, job in cast(list[tuple[str, str, str]], await cursor.fetchall())
+    )
+
+
+async def observation_job_accounting(
+    connection: DatabaseConnection,
+    *,
+    tenant_id: TenantId | None = None,
+) -> tuple[ObservationJobAccounting, ...]:
+    """Summarize the ledger per tenant, busiest first, from the columns migration 0022 added."""
+    cursor = await connection.execute(
+        """
+        SELECT tenant_id,
+               count(*),
+               count(*) FILTER (WHERE state = 'pending'),
+               count(*) FILTER (WHERE state = 'running'),
+               count(*) FILTER (WHERE state = 'failed'),
+               count(*) FILTER (WHERE state = 'succeeded'),
+               COALESCE(SUM(EXTRACT(epoch FROM started_at - created_at)), 0),
+               COALESCE(SUM(EXTRACT(epoch FROM updated_at - started_at)), 0),
+               COALESCE(SUM(input_tokens), 0),
+               COALESCE(SUM(output_tokens), 0)
+        FROM jobs
+        WHERE job_type = %s AND (%s::text IS NULL OR tenant_id = %s)
+        GROUP BY tenant_id
+        -- 8 is the work time, which is the answer to "who is consuming the worker".
+        ORDER BY 8 DESC, tenant_id
+        """,
+        (PROCESS_OBSERVATION_JOB_TYPE, tenant_id, tenant_id),
+    )
+    return tuple(
+        ObservationJobAccounting(
+            tenant_id=TenantId(row[0]),
+            jobs=row[1],
+            pending=row[2],
+            running=row[3],
+            failed=row[4],
+            succeeded=row[5],
+            queue_wait_seconds=float(row[6]),
+            work_seconds=float(row[7]),
+            input_tokens=int(row[8]),
+            output_tokens=int(row[9]),
+        )
+        for row in cast(list[_AccountingRow], await cursor.fetchall())
+    )
 
 
 def observation_processing_job_id(observation: Observation) -> JobId:
