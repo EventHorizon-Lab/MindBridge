@@ -309,6 +309,12 @@ class MemoryStore(Protocol):
         media_object_ids: tuple[MediaObjectId, ...],
     ) -> tuple[MediaObject, ...]: ...
 
+    async def read_evidence_clip_media(
+        self,
+        tenant_id: TenantId,
+        evidence_ids: tuple[EvidenceId, ...],
+    ) -> dict[EvidenceId, MediaObject]: ...
+
     async def read_observation_processing_job(
         self,
         tenant_id: TenantId,

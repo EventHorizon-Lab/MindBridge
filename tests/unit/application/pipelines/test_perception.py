@@ -115,7 +115,7 @@ async def test_perception_pipeline_returns_grounded_event_and_its_model() -> Non
         EvidenceId("evidence_audio"),
     )
     assert result.model_reference.model_id == "qwen3.8-max"
-    assert result.prompt_version == "perceive_events_v9"
+    assert result.prompt_version == "perceive_events_v10"
     assert [entity.canonical_name for entity in result.events[0].entities] == [
         "red tool",
         "toolbox",
@@ -349,3 +349,44 @@ def _streaming_response(payload: object, *, fingerprint: str | None = None) -> h
         headers={"content-type": "text/event-stream"},
         content=content,
     )
+
+
+async def test_perception_pipeline_keeps_an_answer_that_carries_an_invented_key() -> None:
+    """A key the model padded its answer with must not discard the perception around it.
+
+    Measured on this deployment: forbidding extras threw away every event, entity and claim in
+    a clip because the JSON also carried `"start_ms_note": null`. Retrying does not help, since
+    the model reproduces the same key -- so the run paid for two full generations, stored
+    nothing, and aborted. A repeated evidence id is repaired for the same reason: it says
+    nothing a single mention does not.
+    """
+
+    async def respond(_request: httpx.Request) -> httpx.Response:
+        return _streaming_response(
+            {
+                "start_ms_note": None,
+                "events": [
+                    {
+                        "start_ms": 0,
+                        "end_ms": 1_000,
+                        "description": "A person sets a cup down.",
+                        "salience": 0.5,
+                        "evidence_ids": ["evidence_video", "evidence_video"],
+                        "commentary": "not a field this pipeline reads",
+                    }
+                ],
+            }
+        )
+
+    perceiver = _perceiver(respond)
+    try:
+        result = await perceiver.perceive_events(
+            _observation(),
+            (_evidence(MediaKind.VIDEO, "clip.mp4", "video"),),
+        )
+    finally:
+        await perceiver.close()
+
+    assert len(result.events) == 1
+    assert result.events[0].description == "A person sets a cup down."
+    assert result.events[0].evidence_ids == ("evidence_video",)

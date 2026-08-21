@@ -70,6 +70,14 @@ class RecordingClaimStore:
             if item.evidence_id == evidence_id
         )
 
+    async def read_evidence_clip_media(
+        self,
+        tenant_id: TenantId,
+        evidence_ids: tuple[EvidenceId, ...],
+    ) -> dict[EvidenceId, MediaObject]:
+        """No derived clips in this fixture, so evidence falls back to its source media."""
+        return {}
+
     async def read_media_objects(
         self,
         tenant_id: TenantId,

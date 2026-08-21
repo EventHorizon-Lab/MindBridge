@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Mapping
 from typing import Protocol
 
 from mindbridge.application.perception import ResolvedEvidence
@@ -36,6 +37,12 @@ class EvidenceReader(Protocol):
         tenant_id: TenantId,
         media_object_ids: tuple[MediaObjectId, ...],
     ) -> tuple[MediaObject, ...]: ...
+
+    async def read_evidence_clip_media(
+        self,
+        tenant_id: TenantId,
+        evidence_ids: tuple[EvidenceId, ...],
+    ) -> dict[EvidenceId, MediaObject]: ...
 
 
 async def read_resolved_memory_evidence(
@@ -72,7 +79,10 @@ async def read_resolved_evidence(
         media.tenant_id != tenant_id for media in media_objects
     ):
         raise MemoryIntegrityError("evidence references missing media")
-    return await resolve_evidence_media(evidence_spans, media_objects, signer)
+    clip_media = await store.read_evidence_clip_media(tenant_id, evidence_ids)
+    return await resolve_evidence_media(
+        evidence_spans, media_objects, signer, clip_media=clip_media
+    )
 
 
 async def sign_query_media(
@@ -99,8 +109,15 @@ async def resolve_evidence_media(
     signer: MediaUrlSigner,
     *,
     max_concurrency: int = 8,
+    clip_media: Mapping[EvidenceId, MediaObject] | None = None,
 ) -> tuple[ResolvedEvidence, ...]:
-    """Join and sign evidence media without unbounded external I/O fan-out."""
+    """Join and sign evidence media without unbounded external I/O fan-out.
+
+    A span whose derived clip is in `clip_media` is signed to that clip instead of its
+    source, which is what `ResolvedEvidence.media_url` already documents. The span still
+    reports its source `media_object`, so every id, uri and duration a caller reads is
+    unchanged; only the bytes a model opens get smaller.
+    """
     if max_concurrency <= 0:
         raise ValueError("max_concurrency must be positive")
     media_by_id = {item.media_object_id: item for item in media_objects}
@@ -111,6 +128,10 @@ async def resolve_evidence_media(
         raise MemoryIntegrityError("evidence media set is incomplete or ambiguous")
 
     semaphore = asyncio.Semaphore(max_concurrency)
+    clip_media = dict(clip_media or {})
+    # One presign per distinct object, whether it is a source or a substituted clip.
+    to_sign = {item.media_object_id: item for item in media_objects}
+    to_sign.update({item.media_object_id: item for item in clip_media.values()})
 
     async def sign(
         media_object: MediaObject,
@@ -120,13 +141,18 @@ async def resolve_evidence_media(
                 media_object
             )
 
-    downloads = dict(await asyncio.gather(*(sign(item) for item in media_objects)))
+    downloads = dict(await asyncio.gather(*(sign(item) for item in to_sign.values())))
+
+    def attached(evidence: EvidenceSpan) -> MediaObjectId:
+        clip = clip_media.get(evidence.evidence_id)
+        return clip.media_object_id if clip is not None else evidence.media_object_id
+
     return tuple(
         ResolvedEvidence(
             evidence_span=evidence,
             media_object=media_by_id[evidence.media_object_id],
-            media_url=downloads[evidence.media_object_id].download_url,
-            media_url_expires_at=downloads[evidence.media_object_id].expires_at,
+            media_url=downloads[attached(evidence)].download_url,
+            media_url_expires_at=downloads[attached(evidence)].expires_at,
         )
         for evidence in evidence_spans
     )

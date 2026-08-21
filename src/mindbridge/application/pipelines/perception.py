@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import json
-from typing import Annotated
+from typing import Annotated, TypeVar
 
 from pydantic import (
+    AfterValidator,
     BaseModel,
     ConfigDict,
     Field,
@@ -41,6 +42,35 @@ from mindbridge.core import (
 from mindbridge.prompts import PERCEIVE_EVENTS_PROMPT
 from mindbridge.telemetry import operation_span, set_current_span_attributes
 
+_MODEL_OUTPUT_CONFIG = ConfigDict(extra="ignore", frozen=True)
+"""What these models accept: everything the prompt asked for, and nothing about what it did not.
+
+This is a model-output boundary, not a trust boundary. Forbidding extras here rejected the whole
+observation over one key the model invented and nothing reads -- a run lost every event, entity,
+and claim in a clip, after minutes of generation, because the JSON also carried
+`"start_ms_note": null`. On a slow generator that is the most expensive failure in the pipeline,
+and it aborts the caller rather than degrading.
+
+Ignoring an unknown key costs no safety. Every field below is still validated exactly as before,
+and a *renamed* field still fails, because the field it replaced is then missing. Extras are
+forbidden where a caller could smuggle something past a contract -- the Celery message schema and
+the public request models -- not where a language model padded its own answer.
+"""
+
+_T = TypeVar("_T")
+
+
+def _deduplicated(values: tuple[_T, ...]) -> tuple[_T, ...]:
+    """Collapse repeats the model emitted, keeping the order it first mentioned them in.
+
+    A repeated evidence id or entity index says nothing a single mention does not, so rejecting
+    the observation over one is throwing away minutes of generation to punish a typo. Repair what
+    carries no meaning; keep rejecting what does -- an unknown evidence id, an event that ends
+    before it starts, a claim whose validity leaves its event.
+    """
+    return tuple(dict.fromkeys(values))
+
+
 _Description = Annotated[
     str, StringConstraints(strip_whitespace=True, min_length=1, max_length=4096)
 ]
@@ -48,53 +78,49 @@ _EvidenceIdentifier = Annotated[
     str,
     StringConstraints(strip_whitespace=True, min_length=1, max_length=255),
 ]
+_EvidenceIdentifiers = Annotated[
+    tuple[_EvidenceIdentifier, ...], Field(min_length=1), AfterValidator(_deduplicated)
+]
+_EntityIndices = Annotated[
+    tuple[Annotated[int, Field(ge=0)], ...], Field(max_length=32), AfterValidator(_deduplicated)
+]
 
 
 class _EntityOutput(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = _MODEL_OUTPUT_CONFIG
 
     entity_type: EntityType
     canonical_name: _Description
     confidence: Annotated[float, Field(ge=0.0, le=1.0)]
-    evidence_ids: Annotated[tuple[_EvidenceIdentifier, ...], Field(min_length=1)]
-
-    @model_validator(mode="after")
-    def require_unique_evidence(self) -> _EntityOutput:
-        if len(set(self.evidence_ids)) != len(self.evidence_ids):
-            raise ValueError("entity evidence_ids must be unique")
-        return self
+    evidence_ids: _EvidenceIdentifiers
 
 
 class _ClaimOutput(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = _MODEL_OUTPUT_CONFIG
 
     claim_type: ClaimType
     statement: _Description
     confidence: Annotated[float, Field(ge=0.0, le=1.0)]
-    evidence_ids: Annotated[tuple[_EvidenceIdentifier, ...], Field(min_length=1)]
+    evidence_ids: _EvidenceIdentifiers
     valid_from_ms: Annotated[int, Field(ge=0)]
     valid_to_ms: Annotated[int, Field(ge=0)] | None
-    entity_indices: Annotated[tuple[Annotated[int, Field(ge=0)], ...], Field(max_length=32)] = ()
+    entity_indices: _EntityIndices = ()
 
     @model_validator(mode="after")
     def require_valid_references(self) -> _ClaimOutput:
         if self.valid_to_ms is not None and self.valid_to_ms < self.valid_from_ms:
             raise ValueError("valid_to_ms must not precede valid_from_ms")
-        if len(set(self.evidence_ids)) != len(self.evidence_ids):
-            raise ValueError("claim evidence_ids must be unique")
-        if len(set(self.entity_indices)) != len(self.entity_indices):
-            raise ValueError("claim entity_indices must be unique")
         return self
 
 
 class _EventOutput(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = _MODEL_OUTPUT_CONFIG
 
     start_ms: Annotated[int, Field(ge=0)]
     end_ms: Annotated[int, Field(ge=0)]
     description: _Description
     salience: Annotated[float, Field(ge=0.0, le=1.0)]
-    evidence_ids: Annotated[tuple[_EvidenceIdentifier, ...], Field(min_length=1)]
+    evidence_ids: _EvidenceIdentifiers
     entities: Annotated[
         tuple[_EntityOutput, ...], Field(max_length=MAX_PERCEIVED_ENTITIES_PER_EVENT)
     ] = ()
@@ -106,13 +132,11 @@ class _EventOutput(BaseModel):
     def require_ordered_range(self) -> _EventOutput:
         if self.end_ms < self.start_ms:
             raise ValueError("end_ms must not precede start_ms")
-        if len(set(self.evidence_ids)) != len(self.evidence_ids):
-            raise ValueError("evidence_ids must be unique")
         return self
 
 
 class _PerceptionOutput(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = _MODEL_OUTPUT_CONFIG
 
     events: Annotated[tuple[_EventOutput, ...], Field(max_length=MAX_PERCEPTION_EVENTS)]
 

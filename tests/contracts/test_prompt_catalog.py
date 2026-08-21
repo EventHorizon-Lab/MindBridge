@@ -6,20 +6,20 @@ from mindbridge.benchmarks.prompts import BENCHMARK_PROMPTS
 from mindbridge.prompts import ALL_PROMPTS, PromptSpec
 
 _EXPECTED_FINGERPRINTS = {
-    "active_speaker_v2": "0e6f8763910e580cbc3a9323dde717119eb5fd481e532af3f19c5a6cfb61b1cb",
+    "active_speaker_v3": "9eba83fb24bb4c2a0eb9f69f76cb949b70571b54df8659364e68e1a96cfc023f",
     "aml_extract_facts_v1": "55d9ba0c29cc04247730e6b756ada69e2a20f46f15af58d0be1bcace97cd2d3d",
-    "answer_from_evidence_v11": (
-        "5cf69e81875876f2e2a5fca60735652c5c76de01bc3b14d09e59512256604a73"
+    "answer_from_evidence_v12": (
+        "6a939ed81473a45bfc28267b5501849fe2e5e8acee7c023d5c97bed27913ab70"
     ),
-    "consolidate_claims_v2": ("65e3de18448f2879ef8bc83c19290a46cf66d64052230242ae96851a5ecc93a2"),
-    "consolidate_episodes_v2": ("f2455d3e72319d68f94a1f4f7f4fab3845f3a9e34f138823013f346228d13c22"),
-    "consolidate_summaries_v3": (
-        "29fd2da85ecaea2deddbee31a28595feb33ce0171fc0711347a9e9548ad74926"
+    "consolidate_claims_v3": "a8df3ad832ccf01ccc56557bfa82e3de360d7374b4f2c48a253ecf500662922e",
+    "consolidate_episodes_v3": "40963f8c2a177f2172672bbbb4be74539a5560a62f44cbffcfa171918859f931",
+    "consolidate_summaries_v4": (
+        "05e2c2e1c06f73ad1fb177efa719f5b1a6bdffbeebbb2f9a52f404150b1bbd09"
     ),
-    "resolve_entities_v1": ("413e59c736ac9478ff9595c03e7282459154c2f192f9cc5413793f601541c993"),
-    "perceive_events_v9": ("1d130f8eef164d988efdfa4870b3350280faf9d720d27da1f370d89239318792"),
-    "segment_speech_v1": ("819e6429099f4d4bc852d1db482dc65c5e19d2f41f6fc1bbe576a32bc6562850"),
-    "select_occurrences_v2": ("e5062faf64a439dd5232c132bde032ac677e5712ed7594997124f957cf8c0aa3"),
+    "perceive_events_v10": "51a6f4c57edf080451e54bd5962caba456fb946fa25e3ca97fa6ebdd90187c7b",
+    "resolve_entities_v1": "413e59c736ac9478ff9595c03e7282459154c2f192f9cc5413793f601541c993",
+    "segment_speech_v1": "819e6429099f4d4bc852d1db482dc65c5e19d2f41f6fc1bbe576a32bc6562850",
+    "select_occurrences_v2": "e5062faf64a439dd5232c132bde032ac677e5712ed7594997124f957cf8c0aa3",
 }
 _EXPECTED_BENCHMARK_FINGERPRINTS = {
     "egomem_reason_query_v1": ("be1b4861320908f7575c5b72151bd715f9ac5f3498dfe0de2d8f8dc9faac0bf6"),
