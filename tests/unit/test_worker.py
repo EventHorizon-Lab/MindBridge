@@ -9,8 +9,8 @@ import pytest
 from celery import Task
 from celery.exceptions import Retry, SoftTimeLimitExceeded
 from celery.signals import worker_init, worker_process_init, worker_process_shutdown
-from opentelemetry.metrics import MeterProvider
-from opentelemetry.trace import TracerProvider
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.trace import TracerProvider
 from pydantic import ValidationError
 
 import mindbridge.worker as worker_module
