@@ -113,7 +113,15 @@ class JinaEmbedder:
         self._model_reference = model_reference
         self._space_reference = space_reference
         self._dimension = dimension
-        self._semaphore = asyncio.Semaphore(max_concurrency)
+        self._document_semaphore = asyncio.Semaphore(max_concurrency)
+        # A query is one short string a caller is waiting on; a document batch is bulk work
+        # nobody is watching. Sharing one semaphore made an interactive recall queue behind
+        # whatever ingest was running: an empty recall, with no memories and no generation at
+        # all, took 57-71 s against a 12.4 s idle baseline during the 2026-08-21 evaluation.
+        # The query lane is its own single slot rather than a reservation out of
+        # `max_concurrency`, because that value defaults to 1 and carving a slot out of it
+        # would leave documents none.
+        self._query_semaphore = asyncio.Semaphore(1)
 
     @classmethod
     def load(
@@ -164,12 +172,13 @@ class JinaEmbedder:
     @operation_span("mindbridge.model.embed")
     async def embed(self, request: EmbedRequest) -> EmbedResult:
         """Encode a homogeneous query or document batch."""
-        encode = (
-            self._encoder.encode_query
-            if request.task is EmbedTask.QUERY
-            else self._encoder.encode_document
+        is_query = request.task is EmbedTask.QUERY
+        encode = self._encoder.encode_query if is_query else self._encoder.encode_document
+        vectors = await self._encode(
+            request.inputs,
+            encode,
+            self._query_semaphore if is_query else self._document_semaphore,
         )
-        vectors = await self._encode(request.inputs, encode)
         return EmbedResult(
             embeddings=tuple(
                 Embedding(
@@ -185,6 +194,7 @@ class JinaEmbedder:
         self,
         inputs: tuple[ModelInput, ...],
         encode: Callable[..., _EmbeddingMatrix],
+        semaphore: asyncio.Semaphore,
     ) -> tuple[tuple[float, ...], ...]:
         if not inputs:
             return ()
@@ -196,7 +206,7 @@ class JinaEmbedder:
                 "mindbridge.embedding.input_count": len(inputs),
             }
         )
-        async with self._semaphore:
+        async with semaphore:
             matrix = await asyncio.to_thread(
                 encode,
                 cast(list[object], [_jina_input(item) for item in inputs]),
