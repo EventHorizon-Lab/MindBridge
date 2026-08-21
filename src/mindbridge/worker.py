@@ -353,9 +353,9 @@ def require_bounded_in_process_models(settings: WorkerSettings, concurrency: int
     if concurrency <= 1 or not slots:
         return
     raise ValueError(
-        f"{' and '.join(slots)} loads the encoder into the Worker process, so --concurrency "
-        f"{concurrency} asks for {concurrency} copies of it: about "
-        f"{concurrency * _IN_PROCESS_EMBEDDER_VRAM_GIB:.1f} GiB of VRAM and about "
+        f"{' and '.join(slots)} loads an encoder into the Worker process, and every prefork "
+        f"child holds its own, so --concurrency {concurrency} means {concurrency} of them: "
+        f"about {concurrency * _IN_PROCESS_EMBEDDER_VRAM_GIB:.1f} GiB of VRAM and about "
         f"{concurrency * _IN_PROCESS_EMBEDDER_RSS_GIB:.1f} GiB of resident host memory, before "
         "any activation memory. --max-memory-per-child bounds resident memory and cannot bound "
         "VRAM. Serve the encoder instead -- set the plugin to openai and give it an endpoint, "
