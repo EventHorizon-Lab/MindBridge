@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from typing import TypeAlias, cast
 
@@ -159,6 +160,31 @@ class RecordingPerceiver:
             ),
             model_reference=MODEL,
             prompt_version="perceive_events_v4",
+        )
+
+
+class ShortEventPerceiver(RecordingPerceiver):
+    """One event too short to sample twice, which is what the clip floor has to widen."""
+
+    async def perceive_events(
+        self,
+        observation: Observation,
+        evidence: tuple[ResolvedEvidence, ...],
+    ) -> EventPerception:
+        perception = await super().perceive_events(observation, evidence)
+        event = perception.events[0]
+        return replace(
+            perception,
+            events=(
+                replace(
+                    event,
+                    start_ms=500,
+                    end_ms=700,
+                    claims=tuple(
+                        replace(claim, valid_from_ms=500, valid_to_ms=700) for claim in event.claims
+                    ),
+                ),
+            ),
         )
 
 
@@ -510,6 +536,46 @@ async def test_processing_commits_provenance_once(
         memory.summary == "A person places a red tool beside a blue toolbox."
         for memory in person_candidates
     )
+
+
+async def test_a_widened_clip_window_commits_alongside_the_span_it_covers(
+    store: PostgresMemoryStore,
+    database_url: str,
+) -> None:
+    """A sub-two-second event is cut as a wider clip, and the store has to accept that.
+
+    At 1 fps such an event used to be cut into a one-frame video the encoder refuses outright,
+    which failed the whole observation 72 times across 105 observations on 2026-08-21. The clip
+    now covers two sampling intervals, so its window is wider than the span it belongs to -- a
+    shape only the real adapter can confirm, since nothing in the fake store carries the
+    constraints that decide it.
+    """
+    tenant_id, observation_id, job_id = await _write_source_observation(store, "tenant_short_event")
+    job = await ProcessObservation(
+        store,
+        ShortEventPerceiver(),
+        FixedEmbedder(),
+        FixedTextEmbedder(),
+        media_url_signer=DeterministicSigner(),
+        clip_cutter=stub_cut,
+        proxy_cutter=stub_proxy_cut,
+    ).run(tenant_id, observation_id, job_id)
+
+    assert job.state is JobState.SUCCEEDED
+    connection = await AsyncConnection.connect(database_url)
+    async with connection:
+        windows = await (
+            await connection.execute(
+                "SELECT clip.start_ms, clip.end_ms, span.start_ms, span.end_ms "
+                "FROM evidence_clips AS clip "
+                "JOIN evidence_spans AS span ON span.tenant_id = clip.tenant_id "
+                "AND span.evidence_id = clip.evidence_id "
+                "WHERE clip.tenant_id = %s",
+                (tenant_id,),
+            )
+        ).fetchall()
+
+    assert windows == [(0, 2_000, 500, 700)]
 
 
 async def test_processing_rolls_back_derived_records_before_retry(
