@@ -1,4 +1,10 @@
-"""Small OpenTelemetry boundary for runtime setup and domain spans."""
+"""Small OpenTelemetry boundary for runtime setup and domain spans.
+
+Every measurement here has two sinks and one definition. `OTEL_TRACES_EXPORTER=console` and
+`OTEL_METRICS_EXPORTER=console` render the same instruments into the process's own output, so a
+deployment with no collector can still read its stage timings and its token counts; they cannot
+disagree with what OTLP reports, because there is nothing measured twice.
+"""
 
 from __future__ import annotations
 
@@ -20,8 +26,10 @@ from opentelemetry import metrics, trace
 if TYPE_CHECKING:
     from fastapi import FastAPI
     from opentelemetry.sdk.metrics import MeterProvider
+    from opentelemetry.sdk.metrics.export import MetricExporter, MetricsData
     from opentelemetry.sdk.resources import Resource
-    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace import ReadableSpan, TracerProvider
+    from opentelemetry.sdk.trace.export import SpanExporter
 
 _INSTRUMENTATION_VERSION = version("mindbridge")
 _TRACER = trace.get_tracer("mindbridge", _INSTRUMENTATION_VERSION)
@@ -137,9 +145,9 @@ def configure_telemetry(default_service_name: str) -> TelemetryProviders:
     if _sdk_disabled(os.environ):
         return TelemetryProviders(tracer=None, meter=None)
 
-    trace_enabled = _signal_enabled(os.environ, "TRACES")
-    metrics_enabled = _signal_enabled(os.environ, "METRICS")
-    if not trace_enabled and not metrics_enabled:
+    trace_exporter = _selected_exporter(os.environ, "TRACES")
+    metric_exporter = _selected_exporter(os.environ, "METRICS")
+    if trace_exporter is None and metric_exporter is None:
         return TelemetryProviders(tracer=None, meter=None)
 
     service_name = os.environ.get("OTEL_SERVICE_NAME", default_service_name).strip()
@@ -161,8 +169,14 @@ def configure_telemetry(default_service_name: str) -> TelemetryProviders:
                 "service.version": version("mindbridge"),
             }
         )
-        meter_provider = _configure_metrics(resource) if metrics_enabled else None
-        tracer_provider = _configure_traces(resource, meter_provider) if trace_enabled else None
+        meter_provider = (
+            _configure_metrics(resource, metric_exporter) if metric_exporter is not None else None
+        )
+        tracer_provider = (
+            _configure_traces(resource, meter_provider, trace_exporter)
+            if trace_exporter is not None
+            else None
+        )
         providers = TelemetryProviders(tracer=tracer_provider, meter=meter_provider)
         _instrument_clients(providers)
         _configured_process = (process_id, service_name, providers)
@@ -187,8 +201,8 @@ def instrument_fastapi(app: FastAPI, providers: TelemetryProviders) -> None:
 def _configure_traces(
     resource: Resource,
     meter_provider: MeterProvider | None,
+    exporter: str,
 ) -> TracerProvider:
-    from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
     from opentelemetry.sdk.trace import TracerProvider
     from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
@@ -196,13 +210,12 @@ def _configure_traces(
     if isinstance(existing, TracerProvider):
         return existing
     provider = TracerProvider(resource=resource, meter_provider=meter_provider)
-    provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter()))
+    provider.add_span_processor(BatchSpanProcessor(_span_exporter(exporter)))
     trace.set_tracer_provider(provider)
     return provider
 
 
-def _configure_metrics(resource: Resource) -> MeterProvider:
-    from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
+def _configure_metrics(resource: Resource, exporter: str) -> MeterProvider:
     from opentelemetry.sdk.metrics import MeterProvider
     from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
     from opentelemetry.sdk.metrics.view import ExplicitBucketHistogramAggregation, View
@@ -210,7 +223,7 @@ def _configure_metrics(resource: Resource) -> MeterProvider:
     existing = metrics.get_meter_provider()
     if isinstance(existing, MeterProvider):
         return existing
-    reader = PeriodicExportingMetricReader(OTLPMetricExporter())
+    reader = PeriodicExportingMetricReader(_metric_exporter(exporter))
     duration_buckets = ExplicitBucketHistogramAggregation(
         boundaries=_DURATION_BUCKET_BOUNDARIES_SECONDS
     )
@@ -230,6 +243,77 @@ def _configure_metrics(resource: Resource) -> MeterProvider:
     )
     metrics.set_meter_provider(provider)
     return provider
+
+
+def _span_exporter(exporter: str) -> SpanExporter:
+    """Build the span exporter one process was configured for."""
+    if exporter == "console":
+        from opentelemetry.sdk.trace.export import ConsoleSpanExporter
+
+        return ConsoleSpanExporter(formatter=_format_span_line)
+    from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+
+    return OTLPSpanExporter()
+
+
+def _metric_exporter(exporter: str) -> MetricExporter:
+    """Build the metric exporter one process was configured for."""
+    if exporter == "console":
+        from opentelemetry.sdk.metrics.export import ConsoleMetricExporter
+
+        return ConsoleMetricExporter(formatter=_format_metric_lines)
+    from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
+
+    return OTLPMetricExporter()
+
+
+def _format_span_line(span: ReadableSpan) -> str:
+    """Render one finished span as one line, so a console sink stays readable.
+
+    The SDK's own formatter writes each span as a multi-line JSON document, which is fine for a
+    file a machine reads and unusable for the case this exists for: an operator following a
+    worker's output. Nothing is rendered here that the span does not already carry, and what a
+    span carries is content-free by construction -- see the FastAPI test that asserts it.
+    """
+    started_at, ended_at = span.start_time, span.end_time
+    elapsed_seconds = (ended_at - started_at) / 1e9 if started_at and ended_at else 0.0
+    return f"{span.name} {elapsed_seconds:.3f}s{_format_attributes(span.attributes)}\n"
+
+
+def _format_metric_lines(metrics_data: MetricsData) -> str:
+    """Render one metric export as one line per data point.
+
+    This is the sink that answers "how long did each stage take, and what did the tokens cost"
+    without a collector: the durations are aggregated already, so one export is a few lines
+    rather than one per operation.
+    """
+    return "".join(
+        f"{metric.name}{_format_attributes(point.attributes)} {_format_measurement(point)}\n"
+        for resource_metrics in metrics_data.resource_metrics
+        for scope_metrics in resource_metrics.scope_metrics
+        for metric in scope_metrics.metrics
+        for point in metric.data.data_points
+    )
+
+
+def _format_attributes(attributes: Mapping[str, object] | None) -> str:
+    return "".join(f" {name}={value}" for name, value in (attributes or {}).items())
+
+
+def _format_measurement(point: object) -> str:
+    """Describe one data point without asking which aggregation produced it.
+
+    A counter carries a single value and a histogram carries a distribution; both arrive here,
+    and neither the operation duration view nor a future one should have to be enumerated.
+    """
+    value = getattr(point, "value", None)
+    if value is not None:
+        return f"value={value}"
+    return (
+        f"count={getattr(point, 'count', 0)}"
+        f" sum={getattr(point, 'sum', 0)}"
+        f" max={getattr(point, 'max', 0)}"
+    )
 
 
 def _instrument_clients(providers: TelemetryProviders) -> None:
@@ -258,9 +342,23 @@ def _sdk_disabled(environ: Mapping[str, str]) -> bool:
     return environ.get("OTEL_SDK_DISABLED", "false").strip().lower() == "true"
 
 
-def _signal_enabled(environ: Mapping[str, str], signal: str) -> bool:
+def _selected_exporter(environ: Mapping[str, str], signal: str) -> str | None:
+    """Name the exporter one signal is configured for, or None when that signal is off.
+
+    `console` is OpenTelemetry's own value for "write it where this process writes", and it
+    needs no endpoint. That is the whole gap this closes: this function used to answer only
+    whether an OTLP endpoint was configured, so a box with no collector recorded every duration
+    and every token count and then dropped all of it, including when the operator had asked for
+    `console` by name. Any other exporter still needs an endpoint, because defaulting to
+    localhost:4318 would make every deployment retry a connection nothing is listening on.
+    """
     exporter = environ.get(f"OTEL_{signal}_EXPORTER", "otlp").strip().lower()
-    return exporter != "none" and bool(
+    if exporter == "console":
+        return "console"
+    if exporter == "none":
+        return None
+    endpoint_configured = bool(
         environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", "").strip()
         or environ.get(f"OTEL_EXPORTER_OTLP_{signal}_ENDPOINT", "").strip()
     )
+    return "otlp" if endpoint_configured else None

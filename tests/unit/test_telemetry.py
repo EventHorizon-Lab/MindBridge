@@ -9,6 +9,8 @@ from typing import cast
 
 import pytest
 from fastapi.testclient import TestClient
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import InMemoryMetricReader
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
@@ -153,6 +155,101 @@ def test_fastapi_returns_trace_identity_without_capturing_secret_content() -> No
     assert "tenant-api-key" not in attributes
     assert "private-memory-content" not in attributes
     provider.shutdown()
+
+
+@pytest.mark.parametrize(
+    ("environ", "expected"),
+    [
+        ({"OTEL_TRACES_EXPORTER": "console"}, "console"),
+        ({"OTEL_TRACES_EXPORTER": "CONSOLE "}, "console"),
+        ({"OTEL_TRACES_EXPORTER": "none", "OTEL_EXPORTER_OTLP_ENDPOINT": "http://c:4318"}, None),
+        ({"OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": "http://c:4318/v1/traces"}, "otlp"),
+        # The gap this closes: no endpoint and no console asked for means nothing is recorded,
+        # which is the only case where dropping a measurement is the operator's own choice.
+        ({}, None),
+    ],
+)
+def test_console_needs_no_endpoint_while_otlp_still_does(
+    environ: dict[str, str],
+    expected: str | None,
+) -> None:
+    assert telemetry._selected_exporter(environ, "TRACES") == expected
+
+
+def test_console_span_line_carries_the_duration_and_the_attributes() -> None:
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    with provider.get_tracer("test").start_as_current_span("mindbridge.test.console") as span:
+        span.set_attribute("mindbridge.model.input_tokens", 41)
+
+    line = telemetry._format_span_line(exporter.get_finished_spans()[0])
+
+    assert line.count("\n") == 1
+    assert line.startswith("mindbridge.test.console 0.")
+    assert line.rstrip().endswith("mindbridge.model.input_tokens=41")
+    provider.shutdown()
+
+
+def test_console_metric_lines_describe_counters_and_histograms() -> None:
+    reader = InMemoryMetricReader()
+    provider = MeterProvider(metric_readers=(reader,))
+    meter = provider.get_meter("test")
+    meter.create_counter("mindbridge.test.tokens").add(7, {"kind": "input"})
+    meter.create_histogram("mindbridge.test.duration").record(0.5, {"stage": "test.console"})
+    metrics_data = reader.get_metrics_data()
+    assert metrics_data is not None
+
+    lines = telemetry._format_metric_lines(metrics_data).splitlines()
+
+    assert "mindbridge.test.tokens kind=input value=7" in lines
+    assert "mindbridge.test.duration stage=test.console count=1 sum=0.5 max=0.5" in lines
+    provider.shutdown()
+
+
+_CONSOLE_RUNTIME_PROGRAM = """
+import asyncio
+
+from mindbridge.telemetry import configure_telemetry, operation_span, record_stage_duration
+
+providers = configure_telemetry("mindbridge-test")
+assert providers.tracer is not None and providers.meter is not None
+
+
+async def main() -> None:
+    async with operation_span("mindbridge.test.console"):
+        record_stage_duration("test.console", 0.25)
+
+
+asyncio.run(main())
+providers.tracer.shutdown()
+providers.meter.shutdown()
+"""
+
+
+def test_console_runtime_prints_measurements_with_no_collector_configured() -> None:
+    """A box with no OTLP endpoint must still be able to read what it measured."""
+    environment = {
+        key: value for key, value in os.environ.items() if not key.startswith("OTEL_")
+    } | {
+        "OTEL_METRICS_EXPORTER": "console",
+        "OTEL_SDK_DISABLED": "false",
+        "OTEL_SERVICE_NAME": "mindbridge-test",
+        "OTEL_TRACES_EXPORTER": "console",
+    }
+    result = subprocess.run(
+        [sys.executable, "-c", _CONSOLE_RUNTIME_PROGRAM],
+        check=False,
+        capture_output=True,
+        env=environment,
+        text=True,
+        timeout=60,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "mindbridge.test.console 0." in result.stdout
+    assert "mindbridge.stage.duration stage=test.console count=1 sum=0.25" in result.stdout
+    assert "mindbridge.operation.duration operation=mindbridge.test.console" in result.stdout
 
 
 def test_otlp_runtime_configures_in_an_isolated_process() -> None:
