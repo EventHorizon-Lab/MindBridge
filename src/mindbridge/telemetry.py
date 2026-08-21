@@ -123,7 +123,9 @@ async def operation_span(name: str) -> AsyncIterator[None]:
     outcome = "error"
     # The outermost operation owns the token account, so a nested span cannot drain what its
     # parent is still spending and no total is counted twice on the way out.
-    scope = _model_token_usage.set({}) if _model_token_usage.get() is None else None
+    owns_account = _model_token_usage.get() is None
+    if owns_account:
+        _model_token_usage.set({})
     try:
         with _TRACER.start_as_current_span(name):
             yield
@@ -135,10 +137,15 @@ async def operation_span(name: str) -> AsyncIterator[None]:
         attributes = {"operation": name, "outcome": outcome}
         _OPERATION_CALLS.add(1, attributes)
         _OPERATION_DURATION.record(max(0.0, perf_counter() - started_at), attributes)
-        if scope is not None:
+        if owns_account:
             for kind, charged in model_token_usage().items():
                 _MODEL_TOKENS.add(charged, {"operation": name, "kind": kind})
-            _model_token_usage.reset(scope)
+            # Closed by assignment rather than by resetting a token, because this block can run
+            # in a context that never held one: `kernel.watch_observation_job` wraps a yield, so
+            # asyncio may finalize it from a task of its own, and `ContextVar.reset` raises
+            # there. The account is only ever opened where it was absent, so assigning that back
+            # restores exactly what a reset would have.
+            _model_token_usage.set(None)
 
 
 def record_stage_duration(stage: str, duration_seconds: float) -> None:
