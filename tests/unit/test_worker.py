@@ -8,7 +8,9 @@ from unittest.mock import Mock
 import pytest
 from celery import Task
 from celery.exceptions import Retry, SoftTimeLimitExceeded
-from celery.signals import worker_init
+from celery.signals import worker_init, worker_process_init, worker_process_shutdown
+from opentelemetry.metrics import MeterProvider
+from opentelemetry.trace import TracerProvider
 from pydantic import ValidationError
 
 import mindbridge.worker as worker_module
@@ -25,6 +27,7 @@ from mindbridge.infrastructure.task_queue import (
     ObservationProcessingTaskMessage,
 )
 from mindbridge.models.openai import _GeneratorConfig
+from mindbridge.telemetry import TelemetryProviders
 from mindbridge.worker import (
     WorkerSettings,
     create_worker_app,
@@ -341,6 +344,45 @@ def test_worker_media_slot_reaches_a_served_encoder_without_new_variables() -> N
     assert settings.media_embedder_config["api_key"] == "text-embedding-secret"
     assert settings.media_embedder_config["space_id"] == settings.text_embedder_config["space_id"]
     assert "device" not in settings.media_embedder_config
+
+
+class _RecordingProvider:
+    """A telemetry provider that only records whether it was drained."""
+
+    def __init__(self) -> None:
+        self.shutdowns = 0
+
+    def shutdown(self) -> None:
+        self.shutdowns += 1
+
+
+def test_worker_child_flushes_telemetry_before_it_exits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Billiard ends a child with `os._exit`, so nothing buffered survives an atexit hook.
+
+    Both exporters batch -- metrics on `OTEL_METRIC_EXPORT_INTERVAL`, 60 s by default, and
+    spans on the batch processor's own delay -- so a recycled child silently discarded up to a
+    full interval of measurements. `--max-memory-per-child` recycles children often.
+    """
+    tracer = _RecordingProvider()
+    meter = _RecordingProvider()
+    monkeypatch.setattr(
+        worker_module,
+        "configure_telemetry",
+        lambda _name: TelemetryProviders(
+            tracer=cast(TracerProvider, tracer),
+            meter=cast(MeterProvider, meter),
+        ),
+    )
+
+    worker_process_init.send(sender=None)
+    worker_process_shutdown.send(sender=None)
+
+    assert (tracer.shutdowns, meter.shutdowns) == (1, 1)
+    # A second shutdown must not double-drain a provider the child no longer owns.
+    worker_process_shutdown.send(sender=None)
+    assert (tracer.shutdowns, meter.shutdowns) == (1, 1)
 
 
 def test_worker_rejects_invalid_task_identity() -> None:

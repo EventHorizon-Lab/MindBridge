@@ -72,7 +72,7 @@ from mindbridge.models.defaults import (
     openai_generator_config,
 )
 from mindbridge.models.plugins import close_model, load_embedder, load_generator
-from mindbridge.telemetry import configure_telemetry
+from mindbridge.telemetry import TelemetryProviders, configure_telemetry
 
 _MODEL_REQUEST_TIMEOUT_SECONDS = 780.0
 _POST_MODEL_BUDGET_SECONDS = 300.0
@@ -103,11 +103,15 @@ memory, per child, before any activation memory. The 2026-08-21 evaluation ran s
 """
 
 
+_worker_telemetry: TelemetryProviders | None = None
+
+
 @worker_process_init.connect(weak=False)  # type: ignore[untyped-decorator]
 def _configure_worker_telemetry(**_kwargs: object) -> None:
     """Initialize exporters after Celery forks its process-safe worker child."""
+    global _worker_telemetry
     _dispose_worker_runtime()
-    configure_telemetry("mindbridge-worker")
+    _worker_telemetry = configure_telemetry("mindbridge-worker")
 
 
 class _TaskRequest(Protocol):
@@ -514,5 +518,21 @@ def _dispose_worker_runtime() -> None:
 
 @worker_process_shutdown.connect(weak=False)  # type: ignore[untyped-decorator]
 def _close_worker_runtime(**_kwargs: object) -> None:
-    """Release the process-owned plugin before the prefork child exits."""
-    _dispose_worker_runtime()
+    """Release the plugin and flush telemetry before the prefork child exits.
+
+    Billiard ends a child with `os._exit`, which runs no `atexit` hook, so anything holding a
+    buffer has to be drained from this signal explicitly. Both exporters batch: metrics are
+    pushed on `OTEL_METRIC_EXPORT_INTERVAL` (60 s by default) and spans on the batch
+    processor's own delay, so without this a recycled child discarded up to a full interval of
+    measurements -- and `--max-memory-per-child` recycles children often.
+    """
+    global _worker_telemetry
+    providers, _worker_telemetry = _worker_telemetry, None
+    try:
+        _dispose_worker_runtime()
+    finally:
+        if providers is not None:
+            if providers.tracer is not None:
+                providers.tracer.shutdown()
+            if providers.meter is not None:
+                providers.meter.shutdown()
