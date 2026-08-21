@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+from collections import Counter
+from collections.abc import Mapping
 from typing import Annotated, TypeVar
 
 from pydantic import (
@@ -36,6 +38,7 @@ from mindbridge.core import (
     DomainInvariantError,
     EntityType,
     EvidenceId,
+    EvidenceSpan,
     ModelOutputError,
     Observation,
 )
@@ -58,6 +61,7 @@ the public request models -- not where a language model padded its own answer.
 """
 
 _T = TypeVar("_T")
+_Element = TypeVar("_Element", bound=BaseModel)
 
 
 def _deduplicated(values: tuple[_T, ...]) -> tuple[_T, ...]:
@@ -65,10 +69,29 @@ def _deduplicated(values: tuple[_T, ...]) -> tuple[_T, ...]:
 
     A repeated evidence id or entity index says nothing a single mention does not, so rejecting
     the observation over one is throwing away minutes of generation to punish a typo. Repair what
-    carries no meaning; keep rejecting what does -- an unknown evidence id, an event that ends
-    before it starts, a claim whose validity leaves its event.
+    carries no meaning; refuse to repair what does -- an unknown evidence id, an event that ends
+    before it starts, a claim whose validity leaves its event. Those values are not coerced into
+    something acceptable; `_kept` drops the element that carries them.
     """
     return tuple(dict.fromkeys(values))
+
+
+def _kept(model: type[_Element], payload: object) -> _Element | None:
+    """Validate one element on its own, so a wrong one costs only itself.
+
+    Validating the whole answer as a unit made one bad field cost every other element in the same
+    generation: 28 of 61 write-path job failures in the 2026-08-21 evaluation were
+    `model_output_invalid`, all of them from a single rejected value inside output that was
+    otherwise usable, and each one had already been paid for in full -- minutes of generation per
+    clip. An element is the unit a model gets wrong, so it is the unit that gets dropped.
+
+    Retry is not the alternative here. The three clips that gated EgoLifeQA each failed at
+    `attempt=3` with the identical rejection, so a re-ask buys the same failure at full price.
+    """
+    try:
+        return model.model_validate(payload)
+    except ValidationError:
+        return None
 
 
 _Description = Annotated[
@@ -133,6 +156,14 @@ class _EventOutput(BaseModel):
         if self.end_ms < self.start_ms:
             raise ValueError("end_ms must not precede start_ms")
         return self
+
+
+class _RawPerceptionOutput(BaseModel):
+    """The outer shape only: every event is judged, and kept or dropped, on its own."""
+
+    model_config = _MODEL_OUTPUT_CONFIG
+
+    events: tuple[object, ...]
 
 
 class _PerceptionOutput(BaseModel):
@@ -276,11 +307,36 @@ def _parse_output(
     if not content.strip():
         raise ModelOutputError("perception pipeline returned empty content")
     try:
-        output = _PerceptionOutput.model_validate_json(unwrap_json_code_fence(content))
+        raw = _RawPerceptionOutput.model_validate_json(unwrap_json_code_fence(content))
     except ValidationError as error:
         raise ModelOutputError("perception pipeline returned invalid structured output") from error
-    _require_grounded_output(observation, evidence, output)
-    return output
+    duration_ms = round((observation.ended_at - observation.occurred_at).total_seconds() * 1000)
+    spans = {str(item.evidence_span.evidence_id): item.evidence_span for item in evidence}
+    dropped: Counter[str] = Counter()
+    events = tuple(
+        event
+        for event in (_usable_event(item, duration_ms, spans, dropped) for item in raw.events)
+        if event is not None
+    )
+    if dropped:
+        # Partial output that nobody can see is just quiet data loss, so what was discarded is
+        # recorded even though the observation goes on to commit.
+        set_current_span_attributes(
+            {
+                "mindbridge.perception.dropped_event_count": dropped["event"],
+                "mindbridge.perception.dropped_entity_count": dropped["entity"],
+                "mindbridge.perception.dropped_claim_count": dropped["claim"],
+            }
+        )
+    # Perceiving nothing is a legitimate answer; having every event dropped is not the same thing.
+    # Committing an observation whose entire content was discarded would report success for work
+    # that produced none, so that stays a failure the caller sees.
+    if raw.events and not events:
+        raise ModelOutputError("perception pipeline returned no usable event")
+    try:
+        return _PerceptionOutput(events=events)
+    except ValidationError as error:
+        raise ModelOutputError("perception pipeline returned invalid structured output") from error
 
 
 def _require_observation_evidence(
@@ -297,40 +353,117 @@ def _require_observation_evidence(
         raise DomainInvariantError("event perception evidence must belong to its observation")
 
 
-def _require_grounded_output(
-    observation: Observation,
-    evidence: tuple[ResolvedEvidence, ...],
-    output: _PerceptionOutput,
-) -> None:
-    duration_ms = round((observation.ended_at - observation.occurred_at).total_seconds() * 1000)
-    evidence_by_id = {str(item.evidence_span.evidence_id): item.evidence_span for item in evidence}
-    for event in output.events:
-        if event.end_ms > duration_ms:
-            raise ModelOutputError("perception event exceeds observation duration")
-        try:
-            spans = tuple(evidence_by_id[evidence_id] for evidence_id in event.evidence_ids)
-        except KeyError as error:
-            raise ModelOutputError("perception event references unknown evidence") from error
-        if any(
-            not time_ranges_overlap(span.start_ms, span.end_ms, event.start_ms, event.end_ms)
-            for span in spans
-        ):
-            raise ModelOutputError("perception event does not overlap its evidence")
-        event_evidence_ids = set(event.evidence_ids)
-        if any(
-            not set(entity.evidence_ids) <= event_evidence_ids for entity in event.entities
-        ) or any(not set(claim.evidence_ids) <= event_evidence_ids for claim in event.claims):
-            raise ModelOutputError("perception detail references evidence outside its event")
-        if any(
-            claim.valid_from_ms < event.start_ms
-            or claim.valid_from_ms > event.end_ms
-            or (claim.valid_to_ms is not None and claim.valid_to_ms > event.end_ms)
-            for claim in event.claims
-        ):
-            raise ModelOutputError("perception claim validity exceeds its event")
-        if any(
-            entity_index >= len(event.entities)
-            for claim in event.claims
-            for entity_index in claim.entity_indices
-        ):
-            raise ModelOutputError("perception claim references an unknown entity")
+def _usable_event(
+    raw: object,
+    duration_ms: int,
+    spans: Mapping[str, EvidenceSpan],
+    dropped: Counter[str],
+) -> _EventOutput | None:
+    """Keep one event, carrying only the details its own window and evidence support.
+
+    The event is validated twice: once bare, because its window and evidence list are what the
+    details are judged against, and once with the surviving details, because the per-event detail
+    limits are the event's own bound.
+    """
+    if not isinstance(raw, Mapping):
+        dropped["event"] += 1
+        return None
+    bare = _kept(_EventOutput, {**raw, "entities": (), "claims": ()})
+    if bare is None or not _grounded_event(bare, duration_ms, spans):
+        dropped["event"] += 1
+        return None
+    entities, positions = _grounded_entities(raw.get("entities", ()), bare, dropped)
+    claims = _grounded_claims(raw.get("claims", ()), bare, positions, dropped)
+    event = _kept(_EventOutput, {**raw, "entities": entities, "claims": claims})
+    if event is None:
+        dropped["event"] += 1
+    return event
+
+
+def _grounded_event(
+    event: _EventOutput,
+    duration_ms: int,
+    spans: Mapping[str, EvidenceSpan],
+) -> bool:
+    """An event has to sit inside the observation and overlap every span it cites.
+
+    Fabricated provenance is not repairable: dropping the unknown id would leave an event claiming
+    support it never had, and widening the event to the span it names would invent the support
+    instead. The event goes.
+    """
+    if event.end_ms > duration_ms:
+        return False
+    cited = tuple(spans.get(evidence_id) for evidence_id in event.evidence_ids)
+    return all(
+        span is not None
+        and time_ranges_overlap(span.start_ms, span.end_ms, event.start_ms, event.end_ms)
+        for span in cited
+    )
+
+
+def _grounded_entities(
+    raw: object,
+    event: _EventOutput,
+    dropped: Counter[str],
+) -> tuple[object, Mapping[int, int]]:
+    """Keep the entities the event's own evidence supports, and where each one ended up.
+
+    Claims address entities by position, so a dropped entity has to be remembered as a moved
+    position. Renumbering silently would leave a surviving claim describing its neighbour, which
+    is a wrong memory rather than a lost one.
+    """
+    if not isinstance(raw, list):
+        # Not a list of entities at all: the event's own validation is what should judge that.
+        return raw, {}
+    kept: list[_EntityOutput] = []
+    positions: dict[int, int] = {}
+    for position, item in enumerate(raw):
+        entity = _kept(_EntityOutput, item)
+        if entity is None or not set(entity.evidence_ids) <= set(event.evidence_ids):
+            dropped["entity"] += 1
+            continue
+        positions[position] = len(kept)
+        kept.append(entity)
+    return tuple(kept), positions
+
+
+def _grounded_claims(
+    raw: object,
+    event: _EventOutput,
+    positions: Mapping[int, int],
+    dropped: Counter[str],
+) -> object:
+    """Keep the claims the event supports, pointed at where their entities actually are."""
+    if not isinstance(raw, list):
+        return raw
+    kept: list[_ClaimOutput] = []
+    for item in raw:
+        claim = _kept(_ClaimOutput, item)
+        if claim is None or not _grounded_claim(claim, event, positions):
+            dropped["claim"] += 1
+            continue
+        kept.append(
+            claim.model_copy(
+                update={"entity_indices": tuple(positions[index] for index in claim.entity_indices)}
+            )
+        )
+    return tuple(kept)
+
+
+def _grounded_claim(
+    claim: _ClaimOutput,
+    event: _EventOutput,
+    positions: Mapping[int, int],
+) -> bool:
+    """A claim has to cite the event's evidence, stay inside its window, and name a kept entity.
+
+    Validity outside the window is not clamped into it: the window is what the evidence covers, so
+    a claim reaching past it is asserting something the clip cannot show. This rejection was
+    measured once in the 2026-08-21 run, and it cost the whole observation.
+    """
+    return (
+        set(claim.evidence_ids) <= set(event.evidence_ids)
+        and event.start_ms <= claim.valid_from_ms <= event.end_ms
+        and (claim.valid_to_ms is None or claim.valid_to_ms <= event.end_ms)
+        and set(claim.entity_indices) <= set(positions)
+    )
