@@ -197,7 +197,15 @@ async def _answer_question(
                 )
             )
     except MindBridgeError as error:
-        if error.code not in {"model_output_invalid", "model_request_failed"}:
+        # `model_unavailable` is the deployment's 60 s gateway timeout under load (~5.5% of
+        # recalls once nine benchmarks share the endpoint). Fatal here discarded every answer
+        # the sweep had already produced; recoverable records the code against this one
+        # question instead, which is counted as infrastructure and never as a wrong answer.
+        if error.code not in {
+            "model_output_invalid",
+            "model_request_failed",
+            "model_unavailable",
+        }:
             raise
         return _question_result(
             question,
