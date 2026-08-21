@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from collections import Counter
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Annotated, TypeVar
 
 from pydantic import (
@@ -313,19 +314,28 @@ def _parse_output(
     duration_ms = round((observation.ended_at - observation.occurred_at).total_seconds() * 1000)
     spans = {str(item.evidence_span.evidence_id): item.evidence_span for item in evidence}
     dropped: Counter[str] = Counter()
-    events = tuple(
-        event
-        for event in (_usable_event(item, duration_ms, spans, dropped) for item in raw.events)
-        if event is not None
-    )
+    budget = _DetailBudget()
+    events: list[_EventOutput] = []
+    for item in raw.events:
+        if len(events) >= MAX_PERCEPTION_EVENTS:
+            dropped["event_over_cap"] += 1
+            continue
+        event = _usable_event(item, duration_ms, spans, budget, dropped)
+        if event is not None:
+            events.append(event)
     if dropped:
         # Partial output that nobody can see is just quiet data loss, so what was discarded is
-        # recorded even though the observation goes on to commit.
+        # recorded even though the observation goes on to commit. The two kinds are counted
+        # apart because they call for opposite responses: a model that got a value wrong is not
+        # the same problem as a processing limit that has become too small for the prompt.
         set_current_span_attributes(
             {
                 "mindbridge.perception.dropped_event_count": dropped["event"],
                 "mindbridge.perception.dropped_entity_count": dropped["entity"],
                 "mindbridge.perception.dropped_claim_count": dropped["claim"],
+                "mindbridge.perception.over_cap_event_count": dropped["event_over_cap"],
+                "mindbridge.perception.over_cap_entity_count": dropped["entity_over_cap"],
+                "mindbridge.perception.over_cap_claim_count": dropped["claim_over_cap"],
             }
         )
     # Perceiving nothing is a legitimate answer; having every event dropped is not the same thing.
@@ -334,7 +344,9 @@ def _parse_output(
     if raw.events and not events:
         raise ModelOutputError("perception pipeline returned no usable event")
     try:
-        return _PerceptionOutput(events=events)
+        # Every bound above is applied while building, so this can only fail if one of them was
+        # missed -- which is worth failing loudly for rather than writing an unbounded batch.
+        return _PerceptionOutput(events=tuple(events))
     except ValidationError as error:
         raise ModelOutputError("perception pipeline returned invalid structured output") from error
 
@@ -353,17 +365,37 @@ def _require_observation_evidence(
         raise DomainInvariantError("event perception evidence must belong to its observation")
 
 
+@dataclass(slots=True)
+class _DetailBudget:
+    """What is left of one observation's entity and claim allowance, spent in event order.
+
+    The totals used to be a validator that raised, so an observation carrying one claim past the
+    limit lost every event it had -- the same failure the rest of this module exists to stop, with
+    a processing bound as the trigger instead of a wrong value. Nothing about the 257th claim is
+    invalid; the system simply declines to store that many, which is a reason to drop the surplus
+    and not the observation. The per-event limits behave the same way, and the frame ceiling in
+    `evidence_clips` already set the precedent: too much degrades, it does not fail.
+
+    ponytail: spent first-come, so a clip that overruns loses the claims of its last events while
+    keeping their descriptions. Fair shares would need the totals up front and a second pass; the
+    over-cap counters on the span are what would say the limit is worth raising instead.
+    """
+
+    entities: int = MAX_PERCEPTION_ENTITIES
+    claims: int = MAX_PERCEPTION_CLAIMS
+
+
 def _usable_event(
     raw: object,
     duration_ms: int,
     spans: Mapping[str, EvidenceSpan],
+    budget: _DetailBudget,
     dropped: Counter[str],
 ) -> _EventOutput | None:
-    """Keep one event, carrying only the details its own window and evidence support.
+    """Keep one event, carrying only the details its own window, evidence, and budget allow.
 
     The event is validated twice: once bare, because its window and evidence list are what the
-    details are judged against, and once with the surviving details, because the per-event detail
-    limits are the event's own bound.
+    details are judged against, and once with the surviving details.
     """
     if not isinstance(raw, Mapping):
         dropped["event"] += 1
@@ -372,11 +404,26 @@ def _usable_event(
     if bare is None or not _grounded_event(bare, duration_ms, spans):
         dropped["event"] += 1
         return None
-    entities, positions = _grounded_entities(raw.get("entities", ()), bare, dropped)
-    claims = _grounded_claims(raw.get("claims", ()), bare, positions, dropped)
+    entities, positions = _grounded_entities(
+        raw.get("entities", ()),
+        bare,
+        min(budget.entities, MAX_PERCEIVED_ENTITIES_PER_EVENT),
+        dropped,
+    )
+    claims = _grounded_claims(
+        raw.get("claims", ()),
+        bare,
+        positions,
+        min(budget.claims, MAX_PERCEIVED_CLAIMS_PER_EVENT),
+        dropped,
+    )
     event = _kept(_EventOutput, {**raw, "entities": entities, "claims": claims})
     if event is None:
         dropped["event"] += 1
+        return None
+    # Charged from what survived, so an event that was dropped never spends another event's room.
+    budget.entities -= len(event.entities)
+    budget.claims -= len(event.claims)
     return event
 
 
@@ -404,6 +451,7 @@ def _grounded_event(
 def _grounded_entities(
     raw: object,
     event: _EventOutput,
+    limit: int,
     dropped: Counter[str],
 ) -> tuple[object, Mapping[int, int]]:
     """Keep the entities the event's own evidence supports, and where each one ended up.
@@ -418,6 +466,9 @@ def _grounded_entities(
     kept: list[_EntityOutput] = []
     positions: dict[int, int] = {}
     for position, item in enumerate(raw):
+        if len(kept) >= limit:
+            dropped["entity_over_cap"] += 1
+            continue
         entity = _kept(_EntityOutput, item)
         if entity is None or not set(entity.evidence_ids) <= set(event.evidence_ids):
             dropped["entity"] += 1
@@ -431,6 +482,7 @@ def _grounded_claims(
     raw: object,
     event: _EventOutput,
     positions: Mapping[int, int],
+    limit: int,
     dropped: Counter[str],
 ) -> object:
     """Keep the claims the event supports, pointed at where their entities actually are."""
@@ -438,6 +490,9 @@ def _grounded_claims(
         return raw
     kept: list[_ClaimOutput] = []
     for item in raw:
+        if len(kept) >= limit:
+            dropped["claim_over_cap"] += 1
+            continue
         claim = _kept(_ClaimOutput, item)
         if claim is None or not _grounded_claim(claim, event, positions):
             dropped["claim"] += 1

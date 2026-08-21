@@ -9,8 +9,17 @@ import httpx
 import pytest
 from openai import AsyncOpenAI
 
-from mindbridge.application.perception import ResolvedEvidence
+from mindbridge.application.perception import (
+    MAX_PERCEIVED_CLAIMS_PER_EVENT,
+    MAX_PERCEIVED_ENTITIES_PER_EVENT,
+    MAX_PERCEPTION_CLAIMS,
+    MAX_PERCEPTION_ENTITIES,
+    MAX_PERCEPTION_EVENTS,
+    EventPerception,
+    ResolvedEvidence,
+)
 from mindbridge.application.pipelines import PerceptionPipeline
+from mindbridge.application.pipelines import perception as perception_module
 from mindbridge.core import (
     AnonymousIdentityObservation,
     ClaimType,
@@ -689,3 +698,124 @@ async def test_perception_pipeline_never_accepts_a_renamed_or_inverted_event() -
         await perceiver.close()
 
     assert [event.description for event in result.events] == ["A person sets a cup down."]
+
+
+def _event_payload(*, entities: int = 0, claims: int = 0) -> dict[str, object]:
+    """One valid event carrying however many valid details a cap test needs."""
+    return {
+        "start_ms": 0,
+        "end_ms": 1_000,
+        "description": "A person works through a sequence of small actions.",
+        "salience": 0.5,
+        "evidence_ids": ["evidence_video"],
+        "entities": [
+            {
+                "entity_type": "object",
+                "canonical_name": f"object {index}",
+                "confidence": 0.7,
+                "evidence_ids": ["evidence_video"],
+            }
+            for index in range(entities)
+        ],
+        "claims": [
+            {
+                "claim_type": "state",
+                "statement": f"Something is the case, number {index}.",
+                "confidence": 0.7,
+                "evidence_ids": ["evidence_video"],
+                "valid_from_ms": 0,
+                "valid_to_ms": 1_000,
+            }
+            for index in range(claims)
+        ],
+    }
+
+
+async def _perceive(payload: object) -> EventPerception:
+    async def respond(_request: httpx.Request) -> httpx.Response:
+        return _streaming_response(payload)
+
+    perceiver = _perceiver(respond)
+    try:
+        return await perceiver.perceive_events(
+            _observation(),
+            (_evidence(MediaKind.VIDEO, "clip.mp4", "video"),),
+        )
+    finally:
+        await perceiver.close()
+
+
+async def test_a_clip_past_the_claim_total_keeps_the_claims_that_fit() -> None:
+    """A processing limit is not a wrong value, so crossing it costs the surplus, not the clip.
+
+    `perceive_events_v11` asks for one event per atomic action -- on the order of 10-25 events per
+    clip against the 3.48 measured on 2026-08-21 -- which is what brings these totals within
+    reach. They used to raise, which would have turned the density change into a new instance of
+    the failure the rest of this module removes.
+    """
+    result = await _perceive({"events": [_event_payload(claims=60) for _ in range(6)]})
+
+    assert len(result.events) == 6
+    assert sum(len(event.claims) for event in result.events) == MAX_PERCEPTION_CLAIMS
+    # Spent in event order: the clip keeps its timeline, and the tail loses its claims.
+    assert [len(event.claims) for event in result.events] == [60, 60, 60, 60, 16, 0]
+
+
+async def test_a_clip_past_the_entity_total_keeps_the_entities_that_fit() -> None:
+    """And the claims that pointed past them go too, rather than being left pointing at nothing."""
+    result = await _perceive(
+        {
+            "events": [
+                {
+                    **_event_payload(entities=60, claims=1),
+                    "claims": [
+                        {
+                            "claim_type": "relation",
+                            "statement": "About the last entity of this event.",
+                            "confidence": 0.7,
+                            "evidence_ids": ["evidence_video"],
+                            "valid_from_ms": 0,
+                            "valid_to_ms": 1_000,
+                            "entity_indices": [59],
+                        }
+                    ],
+                }
+                for _ in range(6)
+            ]
+        }
+    )
+
+    assert sum(len(event.entities) for event in result.events) == MAX_PERCEPTION_ENTITIES
+    assert [len(event.claims) for event in result.events] == [1, 1, 1, 1, 0, 0]
+
+
+async def test_one_event_past_its_own_detail_limit_keeps_what_fits() -> None:
+    """The per-event limit truncates for the same reason the totals do, and by the same rule."""
+    result = await _perceive({"events": [_event_payload(entities=70, claims=70)]})
+
+    assert len(result.events) == 1
+    assert len(result.events[0].entities) == MAX_PERCEIVED_ENTITIES_PER_EVENT
+    assert len(result.events[0].claims) == MAX_PERCEIVED_CLAIMS_PER_EVENT
+
+
+async def test_a_clip_past_the_event_limit_keeps_the_events_that_fit() -> None:
+    result = await _perceive(
+        {"events": [_event_payload() for _ in range(MAX_PERCEPTION_EVENTS + 6)]}
+    )
+
+    assert len(result.events) == MAX_PERCEPTION_EVENTS
+
+
+async def test_what_a_cap_discarded_is_recorded_apart_from_what_was_wrong(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Truncation is only honest if it is visible, and the two reasons need telling apart: a wrong
+    value is the model's problem, a binding limit is ours."""
+    recorded: list[dict[str, str | int | float | bool]] = []
+    monkeypatch.setattr(perception_module, "set_current_span_attributes", recorded.append)
+
+    await _perceive({"events": [_event_payload(claims=60) for _ in range(6)]})
+
+    attributes = {key: value for item in recorded for key, value in item.items()}
+    assert attributes["mindbridge.perception.over_cap_claim_count"] == 104
+    assert attributes["mindbridge.perception.dropped_claim_count"] == 0
