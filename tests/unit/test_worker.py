@@ -8,6 +8,7 @@ from unittest.mock import Mock
 import pytest
 from celery import Task
 from celery.exceptions import Retry, SoftTimeLimitExceeded
+from celery.signals import worker_init
 from pydantic import ValidationError
 
 import mindbridge.worker as worker_module
@@ -24,7 +25,12 @@ from mindbridge.infrastructure.task_queue import (
     ObservationProcessingTaskMessage,
 )
 from mindbridge.models.openai import _GeneratorConfig
-from mindbridge.worker import WorkerSettings, create_worker_app, processing_budget_seconds
+from mindbridge.worker import (
+    WorkerSettings,
+    create_worker_app,
+    processing_budget_seconds,
+    require_bounded_in_process_models,
+)
 
 
 def test_worker_settings_pin_models_and_redact_credentials() -> None:
@@ -264,6 +270,77 @@ def test_worker_rejects_a_malformed_media_sampling_knob(config: str) -> None:
         WorkerSettings.from_environment(
             {**_environment(), "MINDBRIDGE_MEDIA_SAMPLING_CONFIG_JSON": config}
         )
+
+
+def test_worker_refuses_to_fork_an_in_process_encoder_into_every_child() -> None:
+    """The configuration that exhausted the GPU has to fail at startup, not hours in.
+
+    Six children each held their own 4.3-4.8 GB copy of the media encoder and reached 30.2 of
+    the card's 32.6 GB while the GPU sat at 1-5% utilisation. `--max-memory-per-child` was set
+    and could not help: it bounds resident host memory and cannot bound VRAM.
+    """
+    settings = WorkerSettings.from_environment(_environment())
+
+    with pytest.raises(ValueError) as failure:
+        require_bounded_in_process_models(settings, 6)
+
+    message = str(failure.value)
+    assert "MINDBRIDGE_MEDIA_EMBEDDER_PLUGIN=jina" in message
+    # The arithmetic, not just the objection: 6 x 3.7 GiB of VRAM and 6 x 1.4 GiB resident.
+    assert "22.2 GiB of VRAM" in message
+    assert "8.4 GiB of resident host memory" in message
+
+
+def test_worker_allows_one_child_to_hold_an_in_process_encoder() -> None:
+    """One resident copy is the shape the deployment guide recommends, not a defect."""
+    require_bounded_in_process_models(WorkerSettings.from_environment(_environment()), 1)
+
+
+def test_worker_allows_many_children_when_every_encoder_is_served() -> None:
+    """A served encoder leaves no model in any child, so concurrency stops being a GPU budget."""
+    settings = WorkerSettings.from_environment(
+        {**_environment(), "MINDBRIDGE_MEDIA_EMBEDDER_PLUGIN": "openai"}
+    )
+
+    require_bounded_in_process_models(settings, 12)
+
+
+class _StartingWorker:
+    """A Celery worker at `worker_init`, which is where its pool size is finally known."""
+
+    def __init__(self, concurrency: int) -> None:
+        self.concurrency = concurrency
+
+
+def test_worker_startup_refuses_rather_than_logging_and_carrying_on() -> None:
+    """The guard has to stop boot, off the pool size Celery settled on.
+
+    `worker_init` fires after the CLI flag, this app's own default, and Celery's CPU-count
+    fallback have all been resolved, which is why the check hangs off that signal rather than
+    off app creation. It must raise `SystemExit`: Celery's `Signal.send` catches `Exception`
+    from every receiver, logs it, and starts the worker anyway.
+    """
+    create_worker_app(WorkerSettings.from_environment(_environment()))
+
+    with pytest.raises(SystemExit, match="--concurrency 4"):
+        worker_init.send(sender=_StartingWorker(4))
+
+
+def test_worker_media_slot_reaches_a_served_encoder_without_new_variables() -> None:
+    """Flipping the media slot to the served path must not need a second family of names.
+
+    The deployment already has one embedding endpoint, for the text encoder that has to write
+    into the same space, so the served media slot reuses it. That keeps the recommended
+    configuration one variable away rather than five.
+    """
+    settings = WorkerSettings.from_environment(
+        {**_environment(), "MINDBRIDGE_MEDIA_EMBEDDER_PLUGIN": "openai"}
+    )
+
+    assert settings.media_embedder_config["endpoint"] == "https://text.example.test/v1"
+    assert settings.media_embedder_config["api_key"] == "text-embedding-secret"
+    assert settings.media_embedder_config["space_id"] == settings.text_embedder_config["space_id"]
+    assert "device" not in settings.media_embedder_config
 
 
 def test_worker_rejects_invalid_task_identity() -> None:
