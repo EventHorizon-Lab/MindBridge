@@ -14,6 +14,7 @@ import os
 import sys
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from importlib.metadata import version
 from threading import Lock
@@ -48,6 +49,24 @@ _STAGE_DURATION = _METER.create_histogram(
     "mindbridge.stage.duration",
     unit="s",
     description="Elapsed time for low-cardinality MindBridge pipeline milestones.",
+)
+_MODEL_TOKENS = _METER.create_counter(
+    "mindbridge.model.tokens",
+    unit="{token}",
+    description="Tokens a model charged for, attributed to the operation that spent them.",
+)
+MODEL_TOKEN_ATTRIBUTES = {
+    "mindbridge.model.input_tokens": "input",
+    "mindbridge.model.output_tokens": "output",
+}
+"""The span attributes a model adapter reports usage under, and the kind each one counts.
+
+The adapter already measured these; nothing here measures them again. `total_tokens` is
+deliberately absent: it is the sum, and the two halves are what price differently.
+"""
+_model_token_usage: ContextVar[dict[str, int] | None] = ContextVar(
+    "mindbridge_model_token_usage",
+    default=None,
 )
 _DURATION_BUCKET_BOUNDARIES_SECONDS = (
     0.01,
@@ -102,6 +121,9 @@ async def operation_span(name: str) -> AsyncIterator[None]:
         raise ValueError("operation name must not be empty")
     started_at = perf_counter()
     outcome = "error"
+    # The outermost operation owns the token account, so a nested span cannot drain what its
+    # parent is still spending and no total is counted twice on the way out.
+    scope = _model_token_usage.set({}) if _model_token_usage.get() is None else None
     try:
         with _TRACER.start_as_current_span(name):
             yield
@@ -113,6 +135,10 @@ async def operation_span(name: str) -> AsyncIterator[None]:
         attributes = {"operation": name, "outcome": outcome}
         _OPERATION_CALLS.add(1, attributes)
         _OPERATION_DURATION.record(max(0.0, perf_counter() - started_at), attributes)
+        if scope is not None:
+            for kind, charged in model_token_usage().items():
+                _MODEL_TOKENS.add(charged, {"operation": name, "kind": kind})
+            _model_token_usage.reset(scope)
 
 
 def record_stage_duration(stage: str, duration_seconds: float) -> None:
@@ -132,10 +158,31 @@ def current_trace_id() -> str:
 
 
 def set_current_span_attributes(attributes: Mapping[str, str | int | float | bool]) -> None:
-    """Attach content-free domain diagnostics when the active span is sampled."""
+    """Attach content-free domain diagnostics, and keep any token charge among them.
+
+    The charge is kept whether or not a span is recording, because what it costs to process an
+    observation is not a debugging detail that a sampling decision may drop.
+    """
+    usage = _model_token_usage.get()
+    if usage is not None:
+        for attribute, kind in MODEL_TOKEN_ATTRIBUTES.items():
+            charged = attributes.get(attribute)
+            if isinstance(charged, int) and not isinstance(charged, bool):
+                usage[kind] = usage.get(kind, 0) + charged
     span = trace.get_current_span()
     if span.is_recording():
         span.set_attributes(attributes)
+
+
+def model_token_usage() -> Mapping[str, int]:
+    """Return the tokens charged so far inside the operation that owns the token account.
+
+    A caller with somewhere durable to put this -- the job row of the observation being
+    processed -- reads it here rather than measuring again. `operation_span` reports the same
+    numbers to `mindbridge.model.tokens` when the operation ends, so the two agree by
+    construction.
+    """
+    return dict(_model_token_usage.get() or {})
 
 
 def configure_telemetry(default_service_name: str) -> TelemetryProviders:
