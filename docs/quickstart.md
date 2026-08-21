@@ -12,7 +12,7 @@ worker, which is covered in [deployment](deployment.md).
 | [uv](https://docs.astral.sh/uv/) | The lockfile is authoritative; `pip` will not reproduce it. |
 | Docker with Compose | Runs the pinned PostgreSQL 18 + pgvector and Redis. |
 | An OpenAI-compatible **generator** endpoint | Answers recalls and judges consolidation candidates. |
-| An OpenAI-compatible **embedder** endpoint | Encodes queries and text. Must serve Jina v5 Omni or another model at the dimension you configure. |
+| An OpenAI-compatible **embedder** endpoint | Encodes queries, text, and — if you ingest media — images, video, and audio. Must serve Jina v5 Omni or another model at the dimension you configure. |
 | S3-compatible object storage | Holds evidence media. MinIO is fine locally; AWS S3 needs no endpoint URL. |
 
 MindBridge loads no model in-process on the API path. Both model slots are remote endpoints you
@@ -159,6 +159,10 @@ asyncio.run(main())
 safe without being silent: omit `idempotency_key` and one is derived from the content, so the
 second call returns the same memory rather than a second copy.
 
+Writing more than one memory at a time? Use `memory.remember_many([...])` (up to 100, `POST
+/v1/memories/batch`). It costs one encoder round trip for the whole batch instead of one each, and
+returns a result per memory in request order — each with its own `created` or `duplicate` status.
+
 The same call over HTTP:
 
 ```bash
@@ -171,15 +175,20 @@ curl -s localhost:8000/v1/recall \
 ## What you have not exercised yet
 
 This quickstart never ran the perception path. To ingest actual audio and video you need the
-memory worker, which loads a local media embedder and therefore wants a GPU:
+memory worker. Point its media slot at the same embedding endpoint you already configured — that
+endpoint embeds video and audio as well as text, so there is no second model and no GPU:
 
 ```bash
-uv sync --extra server --extra cloud-models
-export MINDBRIDGE_MEDIA_EMBEDDER_PLUGIN=jina
-export MINDBRIDGE_MEDIA_EMBEDDER_DEVICE=cuda
-uv run --extra server --extra cloud-models \
-  celery -A mindbridge.celery_app:app worker --loglevel=INFO
+export MINDBRIDGE_MEDIA_EMBEDDER_PLUGIN=openai
+uv run --extra server celery -A mindbridge.celery_app:app worker --loglevel=INFO
 ```
+
+The alternative is `MINDBRIDGE_MEDIA_EMBEDDER_PLUGIN=jina`, which loads Jina v5 Omni into the
+worker process and needs `--extra cloud-models` and a GPU. It is measurably the slower path —
+0.062 s per video clip served against 10.2 s in-process on an RTX 5090 — and it holds 3.7 GiB of
+VRAM in **every** prefork child, so the worker refuses to start with `--concurrency` above 1 while
+it is selected. [Deployment](deployment.md#media-encoder-served-or-in-process) has the numbers and
+the one caveat about switching an already-populated deployment.
 
 `POST /v1/observations` then returns a `processing_job_id`; memory does not exist when that
 receipt returns. Poll `GET /v1/jobs/{job_id}` until `succeeded`, or follow it as a stream. See

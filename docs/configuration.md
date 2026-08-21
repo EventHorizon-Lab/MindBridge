@@ -101,6 +101,11 @@ bundled per-field variables or through one explicit JSON object.
 | Text embedder | `MINDBRIDGE_EMBEDDER_PLUGIN` | `openai` |
 | Media embedder | `MINDBRIDGE_MEDIA_EMBEDDER_PLUGIN` | `jina` |
 
+`openai` means "any OpenAI-compatible endpoint", including one you serve yourself, and it is the
+recommended value for **all three** slots — media included, where it is not the default. `jina`
+loads the model into the process; see [media embedder](#media-embedder-worker-only) for what that
+costs and when the worker refuses to run it.
+
 ### Generator
 
 | Variable | Required | Default |
@@ -131,6 +136,17 @@ name — each process has its own environment.
 
 ### Media embedder (worker only)
 
+Two shapes, and the recommended one is **not** the default plugin.
+
+**Served (recommended).** One variable, because the media slot then reuses the text embedder's
+endpoint — it has to write into the same embedding space anyway:
+
+```bash
+export MINDBRIDGE_MEDIA_EMBEDDER_PLUGIN=openai
+```
+
+**In-process (`jina`, the default).** Loads the encoder into the worker itself:
+
 | Variable | Required | Default |
 | --- | --- | --- |
 | `MINDBRIDGE_MEDIA_EMBEDDER_MODEL_ID` | no | `jinaai/jina-embeddings-v5-omni-small-retrieval` |
@@ -141,6 +157,17 @@ is an endpoint-side alias. They frequently hold the same string and are still no
 — do not consolidate them.
 
 An explicit `DEVICE` that is unavailable fails rather than silently falling back to CPU.
+
+What the in-process plugin costs, measured on one RTX 5090 against the same model served through
+vLLM, is in [deployment](deployment.md#media-encoder-served-or-in-process): **3.7 GiB of VRAM per
+prefork child**, and 61-198x the wall time per media object. The worker **refuses to start** with
+more than one child while either embedder slot names `jina`, because a prefork child holds its own
+copy of the model and `--max-memory-per-child` cannot bound VRAM.
+
+Switching an existing deployment from `jina` to `openai` is not free: video vectors from the two
+backends agree only to cosine **0.944**, because they sample different numbers of frames from the
+same clip. Text agrees to 0.99994 and images to 0.985. Re-encode media evidence, or accept that
+old and new video vectors are not strictly comparable.
 
 ### Plugin JSON
 
