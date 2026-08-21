@@ -406,6 +406,9 @@ async def test_processing_commits_provenance_once(
         "red tool",
         "blue toolbox",
     )
+    # Seven vectors, not five: one evidence span, one event, one claim, two named entities,
+    # and one per derived memory. The four encoder inputs asserted above are unchanged, because
+    # a memory's vector is the one already computed for the record it represents.
     assert await _derived_counts(database_url, tenant_id) == (
         1,
         1,
@@ -413,7 +416,7 @@ async def test_processing_commits_provenance_once(
         2,
         2,
         8,
-        5,
+        7,
         3,
         3,
         1,
@@ -549,6 +552,9 @@ async def test_processing_rolls_back_derived_records_before_retry(
 
     assert succeeded.state is JobState.SUCCEEDED
     assert succeeded.attempt == 2
+    # Seven vectors, not five: one evidence span, one event, one claim, two named entities,
+    # and one per derived memory. The four encoder inputs asserted above are unchanged, because
+    # a memory's vector is the one already computed for the record it represents.
     assert await _derived_counts(database_url, tenant_id) == (
         1,
         1,
@@ -556,7 +562,7 @@ async def test_processing_rolls_back_derived_records_before_retry(
         2,
         2,
         8,
-        5,
+        7,
         3,
         3,
         1,
@@ -1157,22 +1163,33 @@ async def test_summary_consolidation_is_atomic_recallable_and_retry_safe(
         tuple(MemoryId(match.object_id) for match in matches),
         limit=20,
     )
-    assert [memory.summary for memory in strict_memories] == [
-        "Across the session, a person kept a red tool beside a blue toolbox."
-    ]
+    # This channel used to hold the consolidated summary and nothing else, because `observe()`
+    # wrote no vector for the memories it derived -- so a direct memory lookup could not reach
+    # a single thing the two observations recorded. All five are reachable now: the summary,
+    # plus the event and claim memory from each observation.
+    session_summary = "Across the session, a person kept a red tool beside a blue toolbox."
+    assert sorted(memory.summary for memory in strict_memories) == sorted(
+        [
+            session_summary,
+            "A person places a red tool beside a blue toolbox.",
+            "A person places a red tool beside a blue toolbox.",
+            "The red tool is beside the blue toolbox.",
+            "The red tool is beside the blue toolbox.",
+        ]
+    )
     expanded_memories = await store.search_memories_by_hierarchy(
         RecallRequest(tenant_id=tenant_id, query=RecallQuery(text="repair session")),
         tuple(MemoryId(match.object_id) for match in matches),
         limit=20,
     )
-    assert expanded_memories[0].memory_id == strict_memories[0].memory_id
+    assert expanded_memories[0].summary == session_summary
     assert len(expanded_memories) == 5
     assert {memory.summary for memory in expanded_memories[1:]} == {
         "A person places a red tool beside a blue toolbox.",
         "The red tool is beside the blue toolbox.",
     }
 
-    first_summary_id = strict_memories[0].memory_id
+    first_summary_id = expanded_memories[0].memory_id
     source_memory_ids = tuple(memory.memory_id for memory in expanded_memories[1:])
     bounded_roots = await store.search_memories_by_hierarchy(
         RecallRequest(tenant_id=tenant_id, query=RecallQuery(text="red tool")),
@@ -1226,8 +1243,14 @@ async def test_summary_consolidation_is_atomic_recallable_and_retry_safe(
             limit=20,
         )
     )
-    assert len(rebuilt_matches) == 1
-    rebuilt_summary_id = MemoryId(rebuilt_matches[0].object_id)
+    # The four observation-derived memories keep their own vectors through a summary rebuild,
+    # so the rebuilt summary is the one match that is not one of them.
+    rebuilt_summary_ids = {MemoryId(match.object_id) for match in rebuilt_matches} - set(
+        source_memory_ids
+    )
+    assert len(rebuilt_matches) == len(source_memory_ids) + 1
+    assert len(rebuilt_summary_ids) == 1
+    rebuilt_summary_id = next(iter(rebuilt_summary_ids))
 
     await _forget_memory(
         store,
