@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
@@ -39,6 +40,53 @@ class ClaimType(str, Enum):
     STATE = "state"
     INTENT = "intent"
     RELATION = "relation"
+
+    @classmethod
+    def _missing_(cls, value: object) -> ClaimType | None:
+        """Resolve a listed alias for a role this enum names differently.
+
+        Perception asked for `claim_type='action'` 186 times across 134 observations in the
+        2026-08-21 evaluation, the only enum violation in the whole run, and deterministic
+        rather than stochastic: three clips each failed all three attempts with the identical
+        rejection. Every rejection discarded an entire observation's events, entities, and
+        claims after paying a slow generator for them.
+
+        An observed action is a perceptible fact at a time, and a claim already carries its
+        temporal extent in `valid_from`/`valid_to`, so this mapping loses the type label
+        rather than any content. Resolving it here instead of at one parse site covers every
+        caller that builds a `ClaimType` from a string -- the perception pipeline, the claim
+        consolidation reader -- without either of them holding a copy of the alias table.
+
+        Only listed aliases resolve. Anything else still raises, because the sole reason
+        `action` is known at all is that an unrecognised value surfaced instead of being
+        quietly coerced into something plausible.
+
+        Giving `action` its own member is the better model of a robotics memory and stays
+        open, but it is not a one-line change, and doing it carelessly would move the same
+        loss later and make it more expensive. Three things have to be decided first:
+        `migrations/0008_semantic_graph.sql:5` constrains the column to exactly these four
+        values, so a fifth member without a migration converts these parse rejections into
+        commit-time constraint violations; and `consolidate_claims.py` and
+        `_postgres_claim_consolidation.py` both partition merge candidates by exact
+        `claim_type`, so a fifth type is a fifth partition in each.
+        """
+        if not isinstance(value, str):
+            return None
+        alias = value.strip().casefold()
+        resolved = _CLAIM_TYPE_ALIASES.get(alias)
+        if resolved is None:
+            return None
+        _CLAIM_TYPE_ALIAS_USES[alias] += 1
+        return resolved
+
+    @classmethod
+    def alias_uses(cls) -> dict[str, int]:
+        """How often each alias resolved in this process, so drift is seen and not inferred."""
+        return dict(_CLAIM_TYPE_ALIAS_USES)
+
+
+_CLAIM_TYPE_ALIASES: dict[str, ClaimType] = {"action": ClaimType.FACT}
+_CLAIM_TYPE_ALIAS_USES: Counter[str] = Counter()
 
 
 class EmbeddedObjectType(str, Enum):

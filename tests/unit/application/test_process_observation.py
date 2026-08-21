@@ -396,6 +396,58 @@ class RepeatedEntityPerceiver(RecordingPerceiver):
         return replace(perception, events=(first, second))
 
 
+class AliasedClaimPerceiver(RecordingPerceiver):
+    """Asks for a claim type by the word the model reaches for, as the real parse does."""
+
+    async def perceive_events(
+        self,
+        observation: Observation,
+        evidence: tuple[ResolvedEvidence, ...],
+    ) -> EventPerception:
+        perception = await super().perceive_events(observation, evidence)
+        event = perception.events[0]
+        return replace(
+            perception,
+            events=(
+                replace(event, claims=(replace(event.claims[0], claim_type=ClaimType("action")),)),
+            ),
+        )
+
+
+async def test_a_resolved_claim_type_alias_stays_visible_for_the_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An aliased claim is indistinguishable from a native one once it lands.
+
+    The attempt's delta is the last point the substitution can be seen, so it is reported
+    beside the event and prompt counts -- a vocabulary that shifts, or that stops shifting
+    after a prompt change, should be readable instead of inferred.
+    """
+    attributes: list[dict[str, str | int | float | bool]] = []
+    monkeypatch.setattr(
+        process_observation_module,
+        "set_current_span_attributes",
+        attributes.append,
+    )
+    store = RecordingProcessingStore()
+
+    await _processor(
+        store,
+        AliasedClaimPerceiver(),
+        RecordingEmbedder(),
+        RecordingTextEmbedder(),
+    ).run(TENANT_ID, OBSERVATION_ID, JOB_ID)
+
+    assert store.output is not None
+    assert store.output.claims[0].claim_type is ClaimType.FACT
+    assert [
+        value
+        for attribute in attributes
+        for key, value in attribute.items()
+        if key == "mindbridge.perception.claim_type_alias_count"
+    ] == [1]
+
+
 class RecasedEntityPerceiver(RecordingPerceiver):
     """Names one object twice with different capitalisation, as a real model does."""
 
