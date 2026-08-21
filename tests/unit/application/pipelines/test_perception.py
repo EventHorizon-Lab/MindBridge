@@ -13,6 +13,7 @@ from mindbridge.application.perception import ResolvedEvidence
 from mindbridge.application.pipelines import PerceptionPipeline
 from mindbridge.core import (
     AnonymousIdentityObservation,
+    ClaimType,
     DeviceId,
     EvidenceId,
     EvidenceSpan,
@@ -115,7 +116,7 @@ async def test_perception_pipeline_returns_grounded_event_and_its_model() -> Non
         EvidenceId("evidence_audio"),
     )
     assert result.model_reference.model_id == "qwen3.8-max"
-    assert result.prompt_version == "perceive_events_v10"
+    assert result.prompt_version == "perceive_events_v11"
     assert [entity.canonical_name for entity in result.events[0].entities] == [
         "red tool",
         "toolbox",
@@ -151,7 +152,9 @@ async def test_perception_pipeline_retries_invalid_output_once_in_json_mode() ->
     assert result.events == ()
 
 
-async def test_perception_pipeline_rejects_detail_evidence_outside_its_event() -> None:
+async def test_perception_pipeline_drops_a_detail_whose_evidence_leaves_its_event() -> None:
+    """A detail the event's own evidence does not support goes; the event does not go with it."""
+
     async def respond(_request: httpx.Request) -> httpx.Response:
         return _streaming_response(
             {
@@ -168,6 +171,22 @@ async def test_perception_pipeline_rejects_detail_evidence_outside_its_event() -
                                 "canonical_name": "unsupported detail",
                                 "confidence": 0.5,
                                 "evidence_ids": ["evidence_audio"],
+                            },
+                            {
+                                "entity_type": "object",
+                                "canonical_name": "cup",
+                                "confidence": 0.7,
+                                "evidence_ids": ["evidence_video"],
+                            },
+                        ],
+                        "claims": [
+                            {
+                                "claim_type": "state",
+                                "statement": "Heard elsewhere in the recording.",
+                                "confidence": 0.6,
+                                "evidence_ids": ["evidence_audio"],
+                                "valid_from_ms": 0,
+                                "valid_to_ms": 1_000,
                             }
                         ],
                     }
@@ -177,20 +196,281 @@ async def test_perception_pipeline_rejects_detail_evidence_outside_its_event() -
 
     perceiver = _perceiver(respond)
     try:
-        with pytest.raises(ModelOutputError, match="outside its event"):
-            await perceiver.perceive_events(
-                _observation(),
-                (
-                    _evidence(MediaKind.VIDEO, "clip.mp4", "video"),
-                    _evidence(MediaKind.AUDIO, "clip.wav", "audio"),
-                ),
-            )
+        result = await perceiver.perceive_events(
+            _observation(),
+            (
+                _evidence(MediaKind.VIDEO, "clip.mp4", "video"),
+                _evidence(MediaKind.AUDIO, "clip.wav", "audio"),
+            ),
+        )
     finally:
         await perceiver.close()
 
+    assert [entity.canonical_name for entity in result.events[0].entities] == ["cup"]
+    assert result.events[0].claims == ()
 
-async def test_perception_pipeline_rejects_unknown_evidence() -> None:
-    """A model cannot fabricate provenance IDs not present in its input."""
+
+async def test_perception_pipeline_drops_the_event_that_fabricated_its_evidence() -> None:
+    """A model cannot fabricate provenance IDs, and its other events do not pay for the one that did."""
+
+    async def respond(_request: httpx.Request) -> httpx.Response:
+        return _streaming_response(
+            {
+                "events": [
+                    {
+                        "start_ms": 0,
+                        "end_ms": 1_000,
+                        "description": "Unsupported event",
+                        "salience": 0.5,
+                        "evidence_ids": ["evidence_fabricated"],
+                    },
+                    {
+                        "start_ms": 1_000,
+                        "end_ms": 2_000,
+                        "description": "A person sets a cup down.",
+                        "salience": 0.5,
+                        "evidence_ids": ["evidence_video"],
+                    },
+                ]
+            }
+        )
+
+    perceiver = _perceiver(respond)
+    try:
+        result = await perceiver.perceive_events(
+            _observation(),
+            (_evidence(MediaKind.VIDEO, "clip.mp4", "video"),),
+        )
+    finally:
+        await perceiver.close()
+
+    assert [event.description for event in result.events] == ["A person sets a cup down."]
+
+
+async def test_perception_pipeline_drops_an_event_reaching_past_the_observation() -> None:
+    """Provider timestamps cannot extend a memory beyond captured time."""
+
+    async def respond(_request: httpx.Request) -> httpx.Response:
+        return _streaming_response(
+            {
+                "events": [
+                    {
+                        "start_ms": 0,
+                        "end_ms": 5_000,
+                        "description": "Overlong event",
+                        "salience": 0.5,
+                        "evidence_ids": ["evidence_video"],
+                    },
+                    {
+                        "start_ms": 0,
+                        "end_ms": 4_000,
+                        "description": "A person sets a cup down.",
+                        "salience": 0.5,
+                        "evidence_ids": ["evidence_video"],
+                    },
+                ]
+            }
+        )
+
+    perceiver = _perceiver(respond)
+    try:
+        result = await perceiver.perceive_events(
+            _observation(),
+            (_evidence(MediaKind.VIDEO, "clip.mp4", "video"),),
+        )
+    finally:
+        await perceiver.close()
+
+    assert [event.end_ms for event in result.events] == [4_000]
+
+
+async def test_perception_pipeline_drops_an_unknown_claim_type_and_keeps_the_event() -> None:
+    """The enum violation class, which cost 28 of 61 write-path job failures on 2026-08-21.
+
+    The one value the run actually asked for is handled at the enum boundary now, so what this
+    covers is the class rather than that instance: any value outside the taxonomy costs its own
+    claim and nothing else. It must stay a drop, not a substitution -- `claim_type` reaches a
+    database CHECK constraint, so a repaired fifth value would only fail later, after the commit
+    was already paid for.
+    """
+
+    async def respond(_request: httpx.Request) -> httpx.Response:
+        return _streaming_response(
+            {
+                "events": [
+                    {
+                        "start_ms": 0,
+                        "end_ms": 1_000,
+                        "description": "A person greets a guest.",
+                        "salience": 0.5,
+                        "evidence_ids": ["evidence_video"],
+                        "claims": [
+                            {
+                                "claim_type": "preference",
+                                "statement": "The host prefers tea.",
+                                "confidence": 0.6,
+                                "evidence_ids": ["evidence_video"],
+                                "valid_from_ms": 0,
+                                "valid_to_ms": 1_000,
+                            },
+                            {
+                                "claim_type": "state",
+                                "statement": "A guest is at the door.",
+                                "confidence": 0.7,
+                                "evidence_ids": ["evidence_video"],
+                                "valid_from_ms": 0,
+                                "valid_to_ms": 1_000,
+                            },
+                        ],
+                    }
+                ]
+            }
+        )
+
+    perceiver = _perceiver(respond)
+    try:
+        result = await perceiver.perceive_events(
+            _observation(),
+            (_evidence(MediaKind.VIDEO, "clip.mp4", "video"),),
+        )
+    finally:
+        await perceiver.close()
+
+    claims = result.events[0].claims
+    assert [claim.statement for claim in claims] == ["A guest is at the door."]
+    assert claims[0].claim_type is ClaimType.STATE
+
+
+async def test_perception_pipeline_drops_a_claim_whose_validity_leaves_its_event() -> None:
+    """Measured once in the 2026-08-21 run, where it cost the whole observation.
+
+    The window is what the evidence covers, so validity reaching past it is not clamped back in.
+    """
+
+    async def respond(_request: httpx.Request) -> httpx.Response:
+        return _streaming_response(
+            {
+                "events": [
+                    {
+                        "start_ms": 0,
+                        "end_ms": 1_000,
+                        "description": "A person sets a cup down.",
+                        "salience": 0.5,
+                        "evidence_ids": ["evidence_video"],
+                        "claims": [
+                            {
+                                "claim_type": "state",
+                                "statement": "The cup stays there all afternoon.",
+                                "confidence": 0.6,
+                                "evidence_ids": ["evidence_video"],
+                                "valid_from_ms": 0,
+                                "valid_to_ms": 3_500,
+                            },
+                            {
+                                "claim_type": "state",
+                                "statement": "The cup is on the table.",
+                                "confidence": 0.8,
+                                "evidence_ids": ["evidence_video"],
+                                "valid_from_ms": 500,
+                                "valid_to_ms": 1_000,
+                            },
+                        ],
+                    }
+                ]
+            }
+        )
+
+    perceiver = _perceiver(respond)
+    try:
+        result = await perceiver.perceive_events(
+            _observation(),
+            (_evidence(MediaKind.VIDEO, "clip.mp4", "video"),),
+        )
+    finally:
+        await perceiver.close()
+
+    assert [claim.valid_to_ms for claim in result.events[0].claims] == [1_000]
+
+
+async def test_perception_pipeline_repoints_claims_when_an_entity_is_dropped() -> None:
+    """Dropping an entity must move the claims that follow it, not re-point them at a neighbour.
+
+    Entities are addressed by position, so leaving the numbering alone would turn a lost detail
+    into a wrong memory: the surviving claim would describe whichever entity slid into the gap.
+    """
+
+    async def respond(_request: httpx.Request) -> httpx.Response:
+        return _streaming_response(
+            {
+                "events": [
+                    {
+                        "start_ms": 0,
+                        "end_ms": 1_000,
+                        "description": "A person hands over a cup.",
+                        "salience": 0.5,
+                        "evidence_ids": ["evidence_video"],
+                        "entities": [
+                            {
+                                "entity_type": "spacecraft",
+                                "canonical_name": "not a known entity type",
+                                "confidence": 0.5,
+                                "evidence_ids": ["evidence_video"],
+                            },
+                            {
+                                "entity_type": "person",
+                                "canonical_name": "host",
+                                "confidence": 0.9,
+                                "evidence_ids": ["evidence_video"],
+                            },
+                            {
+                                "entity_type": "object",
+                                "canonical_name": "cup",
+                                "confidence": 0.9,
+                                "evidence_ids": ["evidence_video"],
+                            },
+                        ],
+                        "claims": [
+                            {
+                                "claim_type": "relation",
+                                "statement": "The host is holding the cup.",
+                                "confidence": 0.8,
+                                "evidence_ids": ["evidence_video"],
+                                "valid_from_ms": 0,
+                                "valid_to_ms": 1_000,
+                                "entity_indices": [1, 2],
+                            },
+                            {
+                                "claim_type": "state",
+                                "statement": "About the entity that did not survive.",
+                                "confidence": 0.4,
+                                "evidence_ids": ["evidence_video"],
+                                "valid_from_ms": 0,
+                                "valid_to_ms": 1_000,
+                                "entity_indices": [0],
+                            },
+                        ],
+                    }
+                ]
+            }
+        )
+
+    perceiver = _perceiver(respond)
+    try:
+        result = await perceiver.perceive_events(
+            _observation(),
+            (_evidence(MediaKind.VIDEO, "clip.mp4", "video"),),
+        )
+    finally:
+        await perceiver.close()
+
+    event = result.events[0]
+    assert [entity.canonical_name for entity in event.entities] == ["host", "cup"]
+    assert [claim.statement for claim in event.claims] == ["The host is holding the cup."]
+    assert event.claims[0].entity_indices == (0, 1)
+
+
+async def test_perception_pipeline_rejects_output_whose_every_event_was_dropped() -> None:
+    """Tolerance stops where there is nothing left: an empty commit would report false success."""
 
     async def respond(_request: httpx.Request) -> httpx.Response:
         return _streaming_response(
@@ -209,36 +489,7 @@ async def test_perception_pipeline_rejects_unknown_evidence() -> None:
 
     perceiver = _perceiver(respond)
     try:
-        with pytest.raises(ModelOutputError, match="unknown evidence"):
-            await perceiver.perceive_events(
-                _observation(),
-                (_evidence(MediaKind.VIDEO, "clip.mp4", "video"),),
-            )
-    finally:
-        await perceiver.close()
-
-
-async def test_perception_pipeline_rejects_event_outside_observation() -> None:
-    """Provider timestamps cannot extend a memory beyond captured time."""
-
-    async def respond(_request: httpx.Request) -> httpx.Response:
-        return _streaming_response(
-            {
-                "events": [
-                    {
-                        "start_ms": 0,
-                        "end_ms": 5_000,
-                        "description": "Overlong event",
-                        "salience": 0.5,
-                        "evidence_ids": ["evidence_video"],
-                    }
-                ]
-            }
-        )
-
-    perceiver = _perceiver(respond)
-    try:
-        with pytest.raises(ModelOutputError, match="exceeds observation"):
+        with pytest.raises(ModelOutputError, match="no usable event"):
             await perceiver.perceive_events(
                 _observation(),
                 (_evidence(MediaKind.VIDEO, "clip.mp4", "video"),),
@@ -390,3 +641,51 @@ async def test_perception_pipeline_keeps_an_answer_that_carries_an_invented_key(
     assert len(result.events) == 1
     assert result.events[0].description == "A person sets a cup down."
     assert result.events[0].evidence_ids == ("evidence_video",)
+
+
+async def test_perception_pipeline_never_accepts_a_renamed_or_inverted_event() -> None:
+    """Dropping an element must not shade into accepting it.
+
+    A renamed field leaves the field it replaced missing, and an inverted range is not reordered
+    into a valid one: both events go, and neither contributes a repaired version of itself.
+    """
+
+    async def respond(_request: httpx.Request) -> httpx.Response:
+        return _streaming_response(
+            {
+                "events": [
+                    {
+                        "start_ms": 0,
+                        "finish_ms": 1_000,
+                        "description": "Renamed field",
+                        "salience": 0.5,
+                        "evidence_ids": ["evidence_video"],
+                    },
+                    {
+                        "start_ms": 900,
+                        "end_ms": 100,
+                        "description": "Inverted range",
+                        "salience": 0.5,
+                        "evidence_ids": ["evidence_video"],
+                    },
+                    {
+                        "start_ms": 0,
+                        "end_ms": 1_000,
+                        "description": "A person sets a cup down.",
+                        "salience": 0.5,
+                        "evidence_ids": ["evidence_video"],
+                    },
+                ]
+            }
+        )
+
+    perceiver = _perceiver(respond)
+    try:
+        result = await perceiver.perceive_events(
+            _observation(),
+            (_evidence(MediaKind.VIDEO, "clip.mp4", "video"),),
+        )
+    finally:
+        await perceiver.close()
+
+    assert [event.description for event in result.events] == ["A person sets a cup down."]

@@ -32,7 +32,7 @@ class PromptSpec:
 
 PERCEIVE_EVENTS_PROMPT = PromptSpec(
     name="perceive_events",
-    version="perceive_events_v10",
+    version="perceive_events_v11",
     purpose="Turn synchronized embodied media into grounded semantic events.",
     used_by="mindbridge.application.pipelines.perception.PerceptionPipeline",
     text=f"""# Role
@@ -41,8 +41,14 @@ You convert embodied image, video, and audio observations into grounded, retriev
 # Goal
 Inspect every supplied source as one synchronized audiovisual stream. Align faces, active speakers,
 off-screen voices, dialogue, visible text, objects, actions, state changes, locations, intentions,
-and relations before producing atomic semantic events. Split distinct or repeated actions when
-their occurrences are temporally distinguishable, and keep one continuous action together. Preserve
+and relations before producing atomic semantic events. One event is one atomic action: one actor
+doing one thing to one object or place, with a perceptible start and end. A new object, a different
+manipulation, or a completed step starts a new event, so a stretch of continuous activity becomes a
+sequence of events rather than one summary standing in for all of it; an action stays whole only
+while the actor, the thing acted on, and the activity all stay the same. In sustained activity those
+boundaries fall seconds apart, not tens of seconds. Order is recoverable only from events recorded
+and timed separately, so cover the whole interval at that grain, and where a limit below binds,
+spend it on covering the interval rather than on further detail inside one event. Preserve
 important spoken wording and visible text exactly in descriptions or claims. Report an exact count
 only when the media supports it.
 

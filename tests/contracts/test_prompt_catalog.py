@@ -16,7 +16,7 @@ _EXPECTED_FINGERPRINTS = {
     "consolidate_summaries_v4": (
         "05e2c2e1c06f73ad1fb177efa719f5b1a6bdffbeebbb2f9a52f404150b1bbd09"
     ),
-    "perceive_events_v10": "51a6f4c57edf080451e54bd5962caba456fb946fa25e3ca97fa6ebdd90187c7b",
+    "perceive_events_v11": "4b37da84a5ecddb560f8a16facbead56e526f220899453cfc67c55a32b6c6c3c",
     "resolve_entities_v1": "413e59c736ac9478ff9595c03e7282459154c2f192f9cc5413793f601541c993",
     "segment_speech_v1": "819e6429099f4d4bc852d1db482dc65c5e19d2f41f6fc1bbe576a32bc6562850",
     "select_occurrences_v2": "e5062faf64a439dd5232c132bde032ac677e5712ed7594997124f957cf8c0aa3",
