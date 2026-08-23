@@ -158,7 +158,12 @@ async def observation_job_accounting(
     *,
     tenant_id: TenantId | None = None,
 ) -> tuple[ObservationJobAccounting, ...]:
-    """Summarize the ledger per tenant, busiest first, from the columns migration 0022 added."""
+    """Summarize the ledger per tenant, busiest first, from the duration and cost columns.
+
+    Costs come from migration 0022, durations from 0023. The two are read differently on
+    purpose: a token count is only ever charged when an attempt closes, while a duration has
+    an interval still open that has to be added here to mean anything.
+    """
     cursor = await connection.execute(
         """
         SELECT tenant_id,
@@ -178,9 +183,19 @@ async def observation_job_accounting(
                    -- And the attempt in flight, which is the one actually holding a worker. Its
                    -- share is not in `work_seconds` until it closes, so without this the tenant
                    -- consuming the worker right now contributes nothing and sorts last.
+                   --
+                   -- Capped at the stale window because past it the claim treats the row as
+                   -- reclaimable: whatever held it is gone, and an uncapped term would let a
+                   -- worker that died grow its tenant's total forever and sort every live
+                   -- tenant below a corpse. Observed while writing the reference for this
+                   -- command -- an abandoned test row was reporting 729 seconds of work.
                    + COALESCE(SUM(
                        CASE WHEN state = 'running' AND started_at IS NOT NULL
-                       THEN EXTRACT(epoch FROM now() - started_at) ELSE 0 END
+                       THEN least(
+                           EXTRACT(epoch FROM now() - started_at),
+                           %s::double precision
+                       )
+                       ELSE 0 END
                    ), 0),
                COALESCE(SUM(input_tokens), 0),
                COALESCE(SUM(output_tokens), 0)
@@ -190,7 +205,12 @@ async def observation_job_accounting(
         -- 8 is the work time, which is the answer to "who is consuming the worker".
         ORDER BY 8 DESC, tenant_id
         """,
-        (PROCESS_OBSERVATION_JOB_TYPE, tenant_id, tenant_id),
+        (
+            OBSERVATION_JOB_STALE_AFTER_SECONDS,
+            PROCESS_OBSERVATION_JOB_TYPE,
+            tenant_id,
+            tenant_id,
+        ),
     )
     return tuple(
         ObservationJobAccounting(

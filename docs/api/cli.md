@@ -17,7 +17,7 @@ uv run --extra server mindbridge lifecycle --help
 
 | Command | Subcommands |
 | --- | --- |
-| `mindbridge` | `consolidate`, `lifecycle`, `mcp`, `edge sync` |
+| `mindbridge` | `consolidate`, `jobs`, `lifecycle`, `mcp`, `edge sync` |
 | `mindbridge-bench` | `locomo-refined`, `m3`, `egolife`, `egomem`, `egotempo`, `memlens`, `mm-lifelong`, `supermemory`, `video-mme`, `aml` |
 | `mindbridge-bench` support | `score`, `datasets`, `jina`, `bakeoff` |
 
@@ -112,6 +112,107 @@ happens. Widening it carries identical risk for much less value.
 
 **Environment:** `MINDBRIDGE_DATABASE_URL` (required), the object-storage variables (source AV
 the generator inspects), and the generator and embedder variables.
+
+---
+
+## `mindbridge jobs`
+
+Reports the observation job ledger against the broker, and repairs the difference. Requires
+`--extra server`.
+
+```bash
+uv run --extra server mindbridge jobs --tenant-id tenant_01
+```
+
+PostgreSQL is the authority for job state; the broker only carries the ID of work already
+recorded there. The two drift apart silently, in both directions. `task_acks_late=True` acks a
+message the moment its task raises, so any exception outside the worker's `autoretry_for` throws
+the message away while the row stays claimable — 479 `torch.OutOfMemoryError` did exactly that
+during one evaluation, leaving rows no worker would ever be told about again. Republishing from
+the ledger repairs any such divergence rather than one exception class at a time.
+
+**Reporting is the default, because republishing spends money:** every message that lands runs a
+generator. `--republish` is the flag that acts.
+
+| Flag | Default | Purpose |
+| --- | --- | --- |
+| `--tenant-id` | all tenants | Restrict the report and the repair to one tenant. Required when row-level security confines the role's reads — see below. |
+| `--include-failed` | off | Also count and republish `failed` rows. |
+| `--republish` | off | Publish one message per claimable row, oldest observation first. |
+
+`--include-failed` is off because a deterministic failure republished on a timer pays for the
+same rejection every time. A row is *claimable* when a worker would still accept a claim for it:
+`pending`, stale `running` (what a lost worker leaves behind), and `failed` only when asked.
+
+**Scope is not optional under row-level security.** `jobs` is `FORCE ROW LEVEL SECURITY`, so a
+cross-tenant scan by a confined role returns no rows rather than failing — and a repair tool that
+reads that as "nothing to repair" is worse than one that refuses. Without `--tenant-id` the
+command requires a role that can see every tenant.
+
+### What the report means
+
+```json
+{
+  "queue": "mindbridge",
+  "queue_depth": 0,
+  "claimable": 0,
+  "include_failed": false,
+  "republished": 0,
+  "tenants": [
+    {
+      "tenant_id": "tenant_01",
+      "jobs": 1,
+      "pending": 0,
+      "running": 0,
+      "failed": 0,
+      "succeeded": 1,
+      "queue_wait_seconds": 0.005,
+      "work_seconds": 0.404,
+      "input_tokens": 0,
+      "output_tokens": 0
+    }
+  ]
+}
+```
+
+`queue` is the queue the worker actually consumes, `task_default_queue` — **`mindbridge`, not
+`celery`**. Looking at the wrong queue is how one investigation concluded the queue had been
+destroyed.
+
+`queue_depth` is read *before* any repair, so it describes what was found. It matters for
+interpreting a repair rather than just recording one: kombu publishes with `LPUSH` and consumes
+with `RPOP`, so a republished job waits behind every message already queued. Six republishes of
+one job across 84 minutes moved its attempt count not at all, for exactly that reason.
+
+`tenants` is ordered by `work_seconds`, descending — the summary exists to answer *who is
+consuming the worker*.
+
+| Field | Meaning |
+| --- | --- |
+| `jobs`, `pending`, `running`, `failed`, `succeeded` | Row counts by state. |
+| `queue_wait_seconds` | Total time this tenant's jobs spent waiting to be claimed, plus the wait a still-pending job has accrued so far. |
+| `work_seconds` | Total time workers spent on them, **across every attempt**, plus the attempt in flight. |
+| `input_tokens`, `output_tokens` | What the generator charged, across every attempt. |
+
+Four things worth knowing before acting on those numbers:
+
+- **Both durations count every attempt, not the last one.** A job that failed twice and succeeded
+  on the third reports all three, which is what makes them comparable to the token columns beside
+  them — a failed attempt held a worker and was billed as surely as a successful one.
+- **Both include the interval still open.** A pending job's wait so far, and a running job's work
+  so far. Without that, the tenant holding a worker *right now* would contribute nothing to the
+  column the report is sorted by.
+- **An abandoned attempt stops accruing at the stale window** (960 s). Past it the claim treats
+  the row as reclaimable, so whatever held it is gone; charging it forever would sort every live
+  tenant below a worker that died.
+- **`work_seconds` is worker time, not wall time.** A job created an hour ago and processed in two
+  seconds reports two seconds of work and an hour of wait.
+
+`null` in either duration means the job last moved before the columns existed (migrations 0022
+and 0023); `0` means it was measured and was that fast.
+
+**Environment:** `MINDBRIDGE_DATABASE_URL` and `MINDBRIDGE_TASK_BROKER_URL`, both required. Read
+from the environment rather than flags so neither reaches a process list or a shell history.
 
 ---
 

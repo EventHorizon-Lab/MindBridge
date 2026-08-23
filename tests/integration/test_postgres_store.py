@@ -970,6 +970,27 @@ async def test_the_ledger_charges_the_attempt_in_flight_and_every_attempt_before
     # The defect: this was 0 for the whole time the job held a worker.
     assert running.work_seconds >= slow_seconds
 
+    # An abandoned attempt stops accruing at the stale window. Past it the claim treats the row
+    # as reclaimable, so whatever held it is gone; without the cap a worker that died would grow
+    # its tenant's total forever and sort every live tenant below a corpse.
+    abandoned = await AsyncConnection.connect(database_url, autocommit=True)
+    async with abandoned:
+        await abandoned.execute(
+            # `created_at` moves with it: migration 0022's CHECK forbids a start before creation,
+            # which is that constraint doing its job on a hand-built row.
+            "UPDATE jobs SET created_at = now() - make_interval(secs => %s),"
+            " started_at = now() - make_interval(secs => %s) WHERE tenant_id = %s",
+            (
+                OBSERVATION_JOB_STALE_AFTER_SECONDS * 6,
+                OBSERVATION_JOB_STALE_AFTER_SECONDS * 5,
+                running_tenant,
+            ),
+        )
+        stale = {row.tenant_id: row for row in await observation_job_accounting(abandoned)}[
+            running_tenant
+        ]
+    assert stale.work_seconds == pytest.approx(OBSERVATION_JOB_STALE_AFTER_SECONDS, rel=0.01)
+
     retried = rows[retried_tenant]
     assert retried.succeeded == 1
     # Both attempts are charged, not just the last -- which is what makes this consistent with

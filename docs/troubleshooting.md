@@ -187,8 +187,27 @@ are derived from it and follow automatically.
 
 ### Jobs stay `pending`
 
-The worker is not consuming. Check it is running, has `--extra server --extra cloud-models`
-installed, and points at the same `MINDBRIDGE_TASK_BROKER_URL`.
+Two different causes, and they are told apart by the queue rather than by the rows.
+
+**The worker is not consuming.** Check it is running, points at the same
+`MINDBRIDGE_TASK_BROKER_URL`, and is installed with the extras it actually needs:
+`--extra server --extra media` at minimum. `media` carries the PyAV, Pillow, and SoundFile
+decoders that cut evidence clips, which the worker does whatever its embedder slots say — without
+it the process starts fine and fails the first observation that carries media. Add
+`--extra cloud-models` only for an in-process encoder, which brings `media` with it.
+
+**Or the message is gone and the row is not.** `task_acks_late=True` acks a message the moment its
+task raises, so any exception outside the worker's `autoretry_for` discards the message while the
+row stays claimable. The row will sit `pending` forever because nothing will tell a worker about it
+again. The tell is a non-zero `claimable` beside an empty `queue_depth`:
+
+```bash
+mindbridge jobs --tenant-id tenant_01
+mindbridge jobs --tenant-id tenant_01 --republish
+```
+
+Reporting is the default because each republished message runs a generator. See
+[operations](operations.md#job-ledger-reconciliation).
 
 ### `TypeError: 'NoneType' object is not callable` on the first frame
 
