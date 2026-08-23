@@ -60,7 +60,15 @@ _AccountingRow: TypeAlias = tuple[
 
 @dataclass(frozen=True, slots=True)
 class ObservationJobAccounting:
-    """One tenant's share of the ledger: how many jobs, how long they waited, what they cost."""
+    """One tenant's share of the ledger: how many jobs, how long they waited, what they cost.
+
+    Both durations are totals over every attempt, matching the token columns beside them, and
+    both include the interval currently open: a pending job's wait so far, and a running job's
+    work so far. That last part is the point of the summary -- it answers "who is consuming the
+    worker", so the attempt actually holding one has to count. `work_seconds` is time a worker
+    spent, not wall time a job existed for; a job that failed twice and succeeded on the third
+    attempt reports all three.
+    """
 
     tenant_id: TenantId
     jobs: int
@@ -159,8 +167,21 @@ async def observation_job_accounting(
                count(*) FILTER (WHERE state = 'running'),
                count(*) FILTER (WHERE state = 'failed'),
                count(*) FILTER (WHERE state = 'succeeded'),
-               COALESCE(SUM(EXTRACT(epoch FROM started_at - created_at)), 0),
-               COALESCE(SUM(EXTRACT(epoch FROM updated_at - started_at)), 0),
+               COALESCE(SUM(queue_wait_seconds), 0)
+                   -- A job still pending has done all of its waiting and none of it is recorded
+                   -- yet, because nothing has claimed it to close the interval.
+                   + COALESCE(SUM(
+                       CASE WHEN state = 'pending'
+                       THEN EXTRACT(epoch FROM now() - updated_at) ELSE 0 END
+                   ), 0),
+               COALESCE(SUM(work_seconds), 0)
+                   -- And the attempt in flight, which is the one actually holding a worker. Its
+                   -- share is not in `work_seconds` until it closes, so without this the tenant
+                   -- consuming the worker right now contributes nothing and sorts last.
+                   + COALESCE(SUM(
+                       CASE WHEN state = 'running' AND started_at IS NOT NULL
+                       THEN EXTRACT(epoch FROM now() - started_at) ELSE 0 END
+                   ), 0),
                COALESCE(SUM(input_tokens), 0),
                COALESCE(SUM(output_tokens), 0)
         FROM jobs
@@ -340,6 +361,10 @@ async def _finish_observation_processing_job_on_connection(
             ),
             input_tokens = COALESCE(input_tokens, 0) + %s,
             output_tokens = COALESCE(output_tokens, 0) + %s,
+            -- Charged on the same principle as the tokens beside it: this attempt's share, added
+            -- as it closes. A failed attempt held the worker as surely as a successful one.
+            work_seconds = COALESCE(work_seconds, 0)
+                + EXTRACT(epoch FROM now() - COALESCE(started_at, updated_at)),
             updated_at = now()
         WHERE tenant_id = %s AND job_id = %s
           AND state = 'running' AND attempt = %s
@@ -454,7 +479,21 @@ class ObservationJobOperations(PostgresStoreOperations):
                 """
                 UPDATE jobs
                 SET state = 'running', attempt = attempt + 1,
-                    error_code = NULL, started_at = now(), updated_at = now()
+                    error_code = NULL, started_at = now(), updated_at = now(),
+                    -- This attempt's wait, added as it ends rather than derived later: at
+                    -- enqueue `updated_at` equals `created_at`, so on attempt 1 this is the
+                    -- queue wait, and on a retry it is the backoff since the previous attempt
+                    -- closed. `started_at` is overwritten just above, which is exactly why the
+                    -- difference cannot be taken afterwards.
+                    queue_wait_seconds = COALESCE(queue_wait_seconds, 0)
+                        + EXTRACT(epoch FROM now() - updated_at),
+                    -- A reclaimed stale attempt is abandoned mid-flight and never reaches the
+                    -- completion path, so its work would otherwise go uncharged.
+                    work_seconds = CASE
+                        WHEN state = 'running' AND started_at IS NOT NULL
+                        THEN COALESCE(work_seconds, 0) + EXTRACT(epoch FROM now() - started_at)
+                        ELSE COALESCE(work_seconds, 0)
+                    END
                 WHERE tenant_id = %s AND job_id = %s
                   AND job_type = %s AND payload ->> 'observation_id' = %s
                   AND (

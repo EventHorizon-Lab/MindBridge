@@ -11,7 +11,7 @@ Five process roles. Only the first three are long-running.
 | Role | Command | Extras |
 | --- | --- | --- |
 | API | `uvicorn mindbridge.server:create_app --factory` | `server` |
-| Memory worker | `celery -A mindbridge.celery_app:app worker` | `server` (+ `cloud-models` only for an in-process media encoder) |
+| Memory worker | `celery -A mindbridge.celery_app:app worker` | `server` + `media` (+ `cloud-models` only for an in-process media encoder, which brings `media` with it) |
 | MCP (optional) | `mindbridge mcp` | `server` |
 | Consolidation | `mindbridge consolidate --tenant-id ...` | `server` |
 | Lifecycle | `mindbridge lifecycle --tenant-id ...` | `server` |
@@ -149,11 +149,19 @@ same endpoint, so the whole worker is one variable away from the API's configura
 ```bash
 export MINDBRIDGE_MEDIA_EMBEDDER_PLUGIN=openai
 
-uv run --extra server celery -A mindbridge.celery_app:app worker --loglevel=INFO --concurrency=8
+uv run --extra server --extra media celery -A mindbridge.celery_app:app worker --loglevel=INFO --concurrency=8
 ```
 
 No `cloud-models`, no GPU, no torch: with both embedder slots served, the worker loads no model at
 all and its concurrency is bounded by the endpoint and the database rather than by a card.
+
+`media` is still required, and is easy to lose sight of precisely because serving removes
+everything else. Clip derivation runs in the worker whatever the embedder slots say, and its PyAV,
+Pillow, and SoundFile decoders are declared only in that extra. They are imported lazily, so a
+`server`-only install starts cleanly, passes an import probe, and then fails the first observation
+that carries media -- as `ModelUnavailableError`, which is in `autoretry_for`, so it retries with
+backoff before failing. The in-process command below does not need it spelled out because
+`cloud-models` depends on `mindbridge[media]`.
 
 Both embedder slots must resolve to one embedding space. The worker compares the two declared
 spaces before processing and fails the job rather than writing media and text vectors that cannot

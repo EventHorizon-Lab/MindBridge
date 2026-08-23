@@ -55,6 +55,7 @@ from mindbridge.core import (
 )
 from mindbridge.infrastructure._postgres_jobs import (
     OBSERVATION_JOB_STALE_AFTER_SECONDS,
+    observation_job_accounting,
     tenant_scope_required,
     unreachable_observation_jobs,
 )
@@ -237,6 +238,7 @@ async def test_migration_installs_complete_phase_zero_schema(database_url: str) 
         20,
         21,
         22,
+        23,
     ]
 
 
@@ -879,7 +881,14 @@ async def test_the_reconciler_republishes_what_the_ledger_still_owes(
     # Zero because the publisher the kernel was given here discards, which is the divergence
     # this repairs; the depth is read before the repair so it describes what was found.
     assert (report["queue_depth"], report["claimable"], report["republished"]) == (0, 1, 1)
-    assert report["tenants"] == [
+    tenants = cast(list[dict[str, object]], report["tenants"])
+    # Split out because it is now a real measured duration rather than a constant: a job that has
+    # only ever waited has its wait counted from `updated_at`, where the previous expression
+    # derived it from a `started_at` that is still NULL until something claims the job -- so this
+    # read 0.0 for every pending job no matter how long it had been queued.
+    waited = cast(float, tenants[0].pop("queue_wait_seconds"))
+    assert waited > 0
+    assert tenants == [
         {
             "tenant_id": tenant_id,
             "jobs": 1,
@@ -887,12 +896,87 @@ async def test_the_reconciler_republishes_what_the_ledger_still_owes(
             "running": 0,
             "failed": 0,
             "succeeded": 0,
-            "queue_wait_seconds": 0.0,
             "work_seconds": 0.0,
             "input_tokens": 0,
             "output_tokens": 0,
         }
     ]
+
+
+async def test_the_ledger_charges_the_attempt_in_flight_and_every_attempt_before_it(
+    store: PostgresMemoryStore,
+    database_url: str,
+) -> None:
+    """Two ways the ledger understated worker time, both structural rather than approximate.
+
+    The claim stamps `started_at` and `updated_at` together, so `updated_at - started_at` was
+    exactly zero for a *running* job -- and this summary exists to answer "who is consuming the
+    worker" and orders by that column, so the tenant holding a worker right now contributed
+    nothing and sorted last. A retry then moved `started_at` forward, leaving the difference
+    covering only the final attempt while the token columns beside it counted every attempt.
+
+    Both are pinned by making the first attempt the slow one: under the old expressions the
+    retried tenant's work would collapse to its short second attempt while its "wait" absorbed
+    the long first one, so `wait > work`. It is the other way around.
+    """
+    kernel = _kernel(store)
+    slow_seconds = 0.4
+
+    running_tenant = TenantId("tenant_accounting_running")
+    receipt = await kernel.observe(
+        _observe_request(
+            tenant_id=running_tenant, sequence=1, media_object_id="media_accounting_running"
+        )
+    )
+    running_job = (ObservationId(receipt.observation_id), JobId(receipt.processing_job_id))
+    await store.claim_observation_processing_job(running_tenant, *running_job)
+    await asyncio.sleep(slow_seconds)
+
+    retried_tenant = TenantId("tenant_accounting_retried")
+    receipt = await kernel.observe(
+        _observe_request(
+            tenant_id=retried_tenant, sequence=1, media_object_id="media_accounting_retried"
+        )
+    )
+    retried_job = (ObservationId(receipt.observation_id), JobId(receipt.processing_job_id))
+    await store.claim_observation_processing_job(retried_tenant, *retried_job)
+    await asyncio.sleep(slow_seconds)
+    await store.mark_observation_processing_failed(
+        retried_tenant, *retried_job, attempt=1, error_code="model_output_invalid"
+    )
+    await store.claim_observation_processing_job(retried_tenant, *retried_job)
+    await store.commit_observation_processing(
+        retried_tenant,
+        *retried_job,
+        attempt=2,
+        output=ObservationProcessingOutput(
+            evidence_spans=(),
+            events=(),
+            entities=(),
+            entity_mentions=(),
+            claims=(),
+            relations=(),
+            memories=(),
+            embeddings=(),
+        ),
+    )
+
+    connection = await AsyncConnection.connect(database_url, autocommit=True)
+    async with connection:
+        rows = {row.tenant_id: row for row in await observation_job_accounting(connection)}
+
+    running = rows[running_tenant]
+    assert running.running == 1
+    # The defect: this was 0 for the whole time the job held a worker.
+    assert running.work_seconds >= slow_seconds
+
+    retried = rows[retried_tenant]
+    assert retried.succeeded == 1
+    # Both attempts are charged, not just the last -- which is what makes this consistent with
+    # the token columns, where 0022 already counted every attempt.
+    assert retried.work_seconds >= slow_seconds
+    # And the long first attempt is work, not waiting. Reversed under the old expressions.
+    assert retried.queue_wait_seconds < retried.work_seconds
 
 
 async def test_a_tenant_confined_role_is_refused_a_ledger_wide_scan(

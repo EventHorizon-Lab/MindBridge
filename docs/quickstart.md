@@ -180,7 +180,7 @@ endpoint embeds video and audio as well as text, so there is no second model and
 
 ```bash
 export MINDBRIDGE_MEDIA_EMBEDDER_PLUGIN=openai
-uv run --extra server celery -A mindbridge.celery_app:app worker --loglevel=INFO
+uv run --extra server --extra media celery -A mindbridge.celery_app:app worker --loglevel=INFO
 ```
 
 The alternative is `MINDBRIDGE_MEDIA_EMBEDDER_PLUGIN=jina`, which loads Jina v5 Omni into the

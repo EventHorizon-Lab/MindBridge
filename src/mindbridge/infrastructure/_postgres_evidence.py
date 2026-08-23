@@ -233,16 +233,28 @@ class EvidenceReadOperations(PostgresStoreOperations):
         recall attached full-resolution originals: measured 12.3k prompt tokens per clip
         against 1.65k for the stored clip, and four originals exceed this endpoint's
         60 s gateway limit outright. Spans with no clip fall back to their source.
+
+        A span is only substituted when one clip covers all of it. A span is not always one
+        clip: `cut_clips` splits audio at `AUDIO_WINDOW_MS`, so a 70 s audio span is stored
+        as three ordinals. Returning the lowest of those -- which is what an earlier
+        `DISTINCT ON (evidence_id) ... ORDER BY ordinal` did -- hands the answer model the
+        first 30 seconds while the recall that retrieved the span may well have matched a
+        later window's embedding, and nothing about the result says a tail is missing.
+        Falling back to the source is a bigger request but a complete one, and a
+        `MediaObject` per evidence id cannot express more than one window anyway.
         """
         if not evidence_ids:
             return {}
         async with tenant_connection(self._pool, tenant_id) as connection:
             cursor = await connection.execute(
                 """
-                SELECT DISTINCT ON (evidence_id) evidence_id, media_object_id
+                SELECT evidence_id, min(media_object_id)
                 FROM evidence_clips
                 WHERE tenant_id = %s AND evidence_id = ANY(%s)
-                ORDER BY evidence_id, ordinal
+                GROUP BY evidence_id
+                -- The whole point: a span cut into several windows is skipped, not truncated.
+                -- With exactly one row per group, min() is that row's clip.
+                HAVING count(*) = 1
                 """,
                 (tenant_id, list(evidence_ids)),
             )

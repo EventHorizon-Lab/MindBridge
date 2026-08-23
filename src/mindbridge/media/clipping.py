@@ -6,8 +6,10 @@ window of it. Cutting the span first makes the stored vector mean what its
 EvidenceSpan claims, and lets the deployment choose the video frame rate
 instead of inheriting whatever the encoder defaults to.
 
-Media libraries live in the optional cloud-models extra, so every import is
-deferred to the call that needs it.
+Media libraries live in the optional `media` extra, so every import is deferred to the
+call that needs it. Deferring them is what lets a `server`-only install start and pass an
+import probe while being unable to cut a single clip, so the error below has to name the
+extra that actually carries them.
 """
 
 from __future__ import annotations
@@ -372,5 +374,5 @@ def _import(module_name: str) -> ModuleType:
         return import_module(module_name)
     except ImportError as error:
         raise ModelUnavailableError(
-            "install MindBridge with the cloud-models extra to cut evidence clips"
+            "install MindBridge with the media extra to cut evidence clips"
         ) from error

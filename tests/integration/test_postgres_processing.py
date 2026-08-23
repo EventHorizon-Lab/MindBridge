@@ -578,6 +578,81 @@ async def test_a_widened_clip_window_commits_alongside_the_span_it_covers(
     assert windows == [(0, 2_000, 500, 700)]
 
 
+async def test_a_span_cut_into_several_windows_falls_back_to_its_whole_source(
+    store: PostgresMemoryStore,
+    database_url: str,
+) -> None:
+    """A span is not always one clip. `cut_clips` splits audio at `AUDIO_WINDOW_MS`, so a 70 s
+    audio span is stored as three ordinals, and substituting the lowest hands the answer model
+    the first 30 seconds of a span the recall may have matched on a later window -- with nothing
+    in the result saying a tail is missing. The complete source is the honest fallback.
+
+    Not reachable from the evaluation corpus, which is why it needs a test rather than a metric:
+    all 3,285 of its evidence spans were video and every one had a single ordinal.
+    """
+    tenant_id = TenantId("tenant_clip_windows")
+    connection = await AsyncConnection.connect(database_url, autocommit=True)
+    async with connection:
+        await connection.execute("DELETE FROM observations WHERE tenant_id = %s", (tenant_id,))
+        await connection.execute(
+            "INSERT INTO observations (tenant_id, observation_id, device_id, boot_id, sequence,"
+            " sensor, occurred_at, ended_at, observed_at, clock_offset_ms, content_digest)"
+            " VALUES (%s, 'observation_win', 'd', 'b', 1, 'microphone', %s, %s, %s, 0, %s)",
+            (tenant_id, NOW, NOW, NOW, "a" * 64),
+        )
+        for index, media_object_id in enumerate(
+            ("media_src", "media_win_0", "media_win_1", "media_win_2", "media_whole"), start=1
+        ):
+            await connection.execute(
+                "INSERT INTO media_objects (tenant_id, media_object_id, kind, uri, sha256,"
+                " size_bytes, created_at, derived_from_media_object_id)"
+                " VALUES (%s, %s, 'audio', %s, %s, 1024, %s, %s)",
+                (
+                    tenant_id,
+                    media_object_id,
+                    f"s3://bucket/{media_object_id}.m4a",
+                    str(index) * 64,
+                    NOW,
+                    None if media_object_id == "media_src" else "media_src",
+                ),
+            )
+        for evidence_id, end_ms in (("evidence_long", 70_000), ("evidence_short", 20_000)):
+            await connection.execute(
+                "INSERT INTO evidence_spans (tenant_id, evidence_id, observation_id,"
+                " media_object_id, start_ms, end_ms, created_at)"
+                " VALUES (%s, %s, 'observation_win', 'media_src', 0, %s, %s)",
+                (tenant_id, evidence_id, end_ms, NOW),
+            )
+        # The 70 s span as the write path would store it: three windows of 30/30/10.
+        for ordinal, (clip_media, start_ms, end_ms) in enumerate(
+            (
+                ("media_win_0", 0, 30_000),
+                ("media_win_1", 30_000, 60_000),
+                ("media_win_2", 60_000, 70_000),
+            )
+        ):
+            await connection.execute(
+                "INSERT INTO evidence_clips (tenant_id, evidence_id, ordinal, media_object_id,"
+                " start_ms, end_ms, created_at) VALUES (%s, 'evidence_long', %s, %s, %s, %s, %s)",
+                (tenant_id, ordinal, clip_media, start_ms, end_ms, NOW),
+            )
+        await connection.execute(
+            "INSERT INTO evidence_clips (tenant_id, evidence_id, ordinal, media_object_id,"
+            " start_ms, end_ms, created_at)"
+            " VALUES (%s, 'evidence_short', 0, 'media_whole', 0, 20000, %s)",
+            (tenant_id, NOW),
+        )
+
+    attached = await store.read_evidence_clip_media(
+        tenant_id, (EvidenceId("evidence_long"), EvidenceId("evidence_short"))
+    )
+
+    # The span one clip covers is substituted; the span three cover is absent, and an absent
+    # entry is what makes `resolve_evidence_media` attach the source instead.
+    assert set(attached) == {EvidenceId("evidence_short")}
+    assert attached[EvidenceId("evidence_short")].media_object_id == MediaObjectId("media_whole")
+
+
 async def test_processing_rolls_back_derived_records_before_retry(
     store: PostgresMemoryStore,
     database_url: str,
