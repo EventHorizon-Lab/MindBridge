@@ -129,44 +129,78 @@ degraded service.
 
 The API sends both multimodal recall queries and explicit memory text to one OpenAI-compatible
 Jina v5 Omni pooling endpoint, which encodes each side with its own retrieval prompt. It loads no
-model itself. A self-hosted endpoint can serve the same model through vLLM:
+model itself. A self-hosted endpoint can serve the same model through vLLM.
+
+`Qwen3VLAudioModel` is not in vLLM's model registry. The model repo carries its own vLLM
+implementation and registers it as a side effect of the `trust_remote_code` config import, and that
+side effect reaches the API server process but **not** the engine subprocess, which resolves the
+model class again and otherwise falls back to a generic Transformers backend. Registering through
+vLLM's own plugin hook is what covers every process, so bring-up is two steps:
 
 ```bash
+# 1. A plugin vLLM loads in each of its processes, engine subprocess included.
+mkdir -p vllm-jina-omni && cd vllm-jina-omni
+cat > pyproject.toml <<'TOML'
+[project]
+name = "vllm-jina-omni-plugin"
+version = "0"
+dependencies = ["huggingface-hub"]
+
+[project.entry-points."vllm.general_plugins"]
+jina_v5_omni = "vllm_jina_omni_plugin:register"
+TOML
+cat > vllm_jina_omni_plugin.py <<'PYPLUGIN'
+import importlib
+import os
+import sys
+
+
+def register() -> None:
+    from huggingface_hub import hf_hub_download
+
+    path = hf_hub_download(
+        "jinaai/jina-embeddings-v5-omni-small-retrieval", "vllm_qwen3vl_audio.py"
+    )
+    sys.path.insert(0, os.path.dirname(path))
+    importlib.import_module("vllm_qwen3vl_audio")
+PYPLUGIN
+pip install .
+cd -
+
+# 2. Serve.
 vllm serve jinaai/jina-embeddings-v5-omni-small-retrieval \
   --trust-remote-code \
   --runner pooling --convert embed \
   --pooler-config '{"pooling_type":"LAST"}'
 ```
 
+Check that it took before trusting the endpoint. The engine process logs `Model architecture
+Qwen3VLAudioModel is already registered, and will be overwritten by
+<...vllm_qwen3vl_audio.Qwen3VLAudioForEmbedding>`, and never logs `no vLLM implementation, falling
+back to Transformers implementation`. The second message means the endpoint is answering from the
+generic backend instead, which is a different encoder.
+
+Pin the revision in both places or neither. `vllm serve --revision` selects the weights while the
+plugin above downloads plugin code from `main`, and the two revisions of that file do not agree
+about video.
+
 Serve this once and point **every** slot at it, including the worker's media slot. That endpoint
 embeds text, images, video, and audio, so there is no second model to run — see
 [media encoder](#media-encoder-served-or-in-process) for the measured comparison and the one
 version-dependent caveat that goes with it.
 
-The model repo carries its own vLLM implementation and registers the `Qwen3VLAudioModel`
-architecture out of tree, as a side effect of the `trust_remote_code` config import; vLLM's own
-registry does not contain it. Most of what goes wrong here is that registration not happening, in
-a process or at a version where it cannot:
+Four more things to get right:
 
 - **`--runner pooling` is not optional.** Without it vLLM selects the generate runner and refuses
   to start on `language_model.lm_head.weight`, a weight an embedding checkpoint does not carry and
   one the repo's own loader deliberately skips.
-- **Serve the repo id, not a local directory.** The registration shim locates its sibling module
-  from the Hugging Face module package name, which only carries enough segments when the model was
-  resolved by repo id. A local path yields a shorter name, the fetch is skipped, and the failure is
-  a warning rather than an error.
-- **Registration has to reach the engine process.** vLLM resolves the model class again inside its
-  engine subprocess, which does not inherit the API server's registration and falls back to the
-  generic Transformers backend. Import the plugin module from a `sitecustomize.py` on the server's
-  path, or install it as a vLLM plugin entry point. `no vLLM implementation, falling back to
-  Transformers implementation` in the engine's log means it did not take.
 - **Pooler keys move between versions.** The model card's snippet passes `normalize=True`, which
   0.19 rejects during argument parsing. Read the `PoolerConfig` fields of the version you installed
   rather than copying the snippet.
 - **Pin a vLLM version and record it next to any measurement.** The model card validates
   `vllm==0.20.1`, whose wheels resolve CUDA 13 and therefore need an r580 or newer driver; 0.20.0
   is already CUDA 13, so against a CUDA 12.8 driver the newest usable release is 0.19.1, where
-  this plugin also registers. Which version is serving changes what the endpoint can encode.
+  the repo's module still imports. Which version is serving changes what the endpoint can encode.
 - **On Blackwell, override both attention backends**: `--attention-backend TRITON_ATTN
   --mm-encoder-attn-backend TORCH_SDPA`. The bundled FlashAttention objects ship cubins for sm_80
   and sm_90 only, so sm_120 falls through to PTX that a CUDA 12.8 driver cannot compile. Overriding

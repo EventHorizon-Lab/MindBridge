@@ -16,20 +16,13 @@ worker, which is covered in [deployment](deployment.md).
 | S3-compatible object storage | Holds evidence media. MinIO is fine locally; AWS S3 needs no endpoint URL. |
 
 MindBridge loads no model in-process on the API path. Both model slots are remote endpoints you
-point it at, so this quickstart needs somewhere to point. If you have neither, serve the
-reference embedder yourself:
+point it at, so this quickstart needs somewhere to point.
 
-```bash
-vllm serve jinaai/jina-embeddings-v5-omni-small-retrieval \
-  --trust-remote-code \
-  --runner pooling --convert embed \
-  --pooler-config '{"pooling_type":"LAST"}'
-```
-
-Without the pooling flags vLLM starts this checkpoint as a generative model and refuses to load on
-a missing `lm_head`. Text is all this quickstart needs; serving image, video, or audio through the
-same endpoint carries further constraints, which
-[deployment](deployment.md#embedding-endpoint) lists.
+If you have neither, you can serve the reference embedder yourself, but it takes more than one
+command: vLLM does not carry this architecture, so it needs a small plugin installed alongside the
+pooling flags, and the rest of the flags depend on the vLLM version and the card.
+[deployment](deployment.md#embedding-endpoint) has the two-step recipe and the log line that
+confirms it took. Come back here once `/v1/embeddings` answers.
 
 ## 1. Install
 
