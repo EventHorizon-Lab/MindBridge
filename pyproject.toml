@@ -95,19 +95,27 @@ cloud-models = [
     "huggingface-hub>=0.30,<2",
     "opentelemetry-api>=1.44,<2",
     "sentence-transformers>=5.2,<6",
-    "torch==2.9.1",
+    "torch==2.13.0",
     # Jina Omni's image and video processor is a Qwen3-VL processor, and that one refuses to
     # construct without Torchvision. Its loader swallows the ImportError and leaves the
     # processor unset, so an install without this line embeds text and dies on the first
     # frame instead of failing where the dependency is missing.
-    "torchvision==0.24.1",
+    "torchvision==0.28.0",
     "transformers>=5.1,<6",
+]
+# The OpenAI-compatible embedding server is a separate process from MindBridge. Keep its CUDA
+# stack out of the default development and server installs, but lock the exact cu129 build used
+# by RTX 5090 workstations so `uv sync` cannot silently replace it with a CUDA 13 wheel.
+vllm-server = [
+    "torchaudio==2.11.0; sys_platform == 'linux'",
+    "torchcodec==0.16.0; sys_platform == 'linux'",
+    "vllm==0.27.1+cu129; sys_platform == 'linux'",
 ]
 # One token for every scenario at once, for the workstation that plays all the roles and for
 # installers with no `--all-extras` flag of their own. tests/test_package.py fails if this
 # stops being the exact union, so a new extra cannot quietly stay out of it.
 all = [
-    "mindbridge[benchmarks,cloud-models,edge,media,server]",
+    "mindbridge[benchmarks,cloud-models,edge,media,server,vllm-server]",
 ]
 
 # Declared so the lockfile resolves from PyPI whoever runs `uv lock`. Without it uv takes the
@@ -119,15 +127,23 @@ url = "https://pypi.org/simple"
 default = true
 
 [[tool.uv.index]]
-name = "pytorch-cu128"
-url = "https://download.pytorch.org/whl/cu128"
+name = "pytorch-cu129"
+url = "https://download.pytorch.org/whl/cu129"
+explicit = true
+
+[[tool.uv.index]]
+name = "vllm-cu129"
+url = "https://wheels.vllm.ai/0.27.1/cu129"
 explicit = true
 
 [tool.uv.sources]
-torch = { index = "pytorch-cu128" }
+torch = { index = "pytorch-cu129" }
 # Torchvision ships one wheel per CUDA build like torch does, and the PyPI wheel links against a
 # different runtime, so it has to resolve from the same index its torch does.
-torchvision = { index = "pytorch-cu128" }
+torchaudio = { index = "pytorch-cu129" }
+torchcodec = { index = "pytorch-cu129" }
+torchvision = { index = "pytorch-cu129" }
+vllm = { index = "vllm-cu129" }
 
 [dependency-groups]
 dev = [
