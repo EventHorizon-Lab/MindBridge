@@ -46,6 +46,9 @@ class ClipRequest:
     max_pixels: int = DEFAULT_VIDEO_MAX_PIXELS
     image_max_pixels: int = DEFAULT_IMAGE_MAX_PIXELS
     region: tuple[int, int, int, int] | None = None
+    # Only a generation proxy reads this: a stored clip has never carried audio, and a
+    # generator that ignores the track pays for it twice, in the encode and in the transfer.
+    include_audio: bool = True
 
     def __post_init__(self) -> None:
         if self.start_ms < 0 or self.end_ms < self.start_ms:
@@ -91,16 +94,22 @@ def cut_generation_proxy(source: bytes, request: ClipRequest) -> MediaClip:
     """Re-encode one video span at the sampling a generator was going to apply anyway.
 
     This is the copy a model reads instead of the source, so two things have to hold. It keeps
-    the source's audio, because a video-only proxy would silently take speech away from every
-    question that depends on what was said. And both tracks stay on the source's clock, because
-    perception is told event times are milliseconds from the start of the observation and is
-    handed each span's absolute offsets alongside this media.
+    the source's audio by default, because a video-only proxy would silently take speech away
+    from every question that depends on what was said. And both tracks stay on the source's
+    clock, because perception is told event times are milliseconds from the start of the
+    observation and is handed each span's absolute offsets alongside this media.
 
-    ponytail: the ceiling is sampled frame count, not span length. A sparse video track is
-    sparse next to continuous audio, and past roughly forty frames the MP4 muxer refuses the
-    interleave, so this raises rather than returning a file with one track truncated. Callers
-    treat the proxy as best-effort and fall back to the source; writing both tracks through a
-    real interleaving buffer is the upgrade path if long single-span observations become common.
+    `request.include_audio` exists because that default is wrong for a generator that cannot
+    hear. Measured against the evaluation's endpoint on one 15 s clip: `prompt_tokens` was 1009
+    whether or not the file carried its audio track, so the track was never ingested, while the
+    file itself was 336 KiB with audio against 212 KiB without. A deployment whose generator
+    ignores audio is paying an encode and a transfer for nothing.
+
+    ponytail: the ceiling is sampled frame count, not span length, and dropping the audio does
+    not lift it -- a silent source cut with `include_audio=False` fails at the same 45 frames.
+    See `MAX_PROXY_SAMPLED_FRAMES` for what has and has not been ruled out. This raises rather
+    than returning a truncated file, and callers treat the proxy as best-effort and fall back
+    to the source.
     """
     if not source:
         raise DomainInvariantError("source media must not be empty")
@@ -116,7 +125,11 @@ def cut_generation_proxy(source: bytes, request: ClipRequest) -> MediaClip:
         av.open(io.BytesIO(source)) as container,
         av.open(buffer, mode="w", format="mp4") as output,
     ):
-        source_audio = container.streams.audio[0] if container.streams.audio else None
+        source_audio = (
+            container.streams.audio[0]
+            if request.include_audio and container.streams.audio
+            else None
+        )
         # Both tracks are declared before the first packet: libavformat writes the container
         # header on that packet, and a stream added afterwards is rejected.
         video = output.add_stream("libx264", rate=_stream_rate(request.frames_per_second))

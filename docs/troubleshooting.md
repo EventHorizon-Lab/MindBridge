@@ -233,9 +233,14 @@ default `max_connections` of 100. Size it across your whole deployment, not per 
 Frame rate sets the entire write cost: one clip cut, one encoder call, one stored object per
 sampled window. Lower `frames_per_second` in `MINDBRIDGE_MEDIA_SAMPLING_CONFIG_JSON` first.
 
-Above roughly 1.3 fps at 30-second segments, the generation proxy also stops working — the MP4
-muxer refuses to interleave a sparse video track with continuous audio past about forty sampled
-frames. Raising frame rate therefore trades the proxy away as well.
+Above roughly 1.3 fps at 30-second segments, the generation proxy also stops working — past about
+forty sampled frames its encode fails on the flush that drains the encoder. Raising frame rate
+therefore trades the proxy away as well. This was documented as the MP4 muxer refusing to
+interleave a sparse video track with continuous audio; it is not, and so turning `proxy_audio`
+off buys no frames. Lower the frame rate or segment shorter.
+
+If your generator ignores audio, `proxy_audio: false` is still worth setting — it is a smaller
+file to encode and transfer, just not a longer one.
 
 ### Consolidation is expensive
 

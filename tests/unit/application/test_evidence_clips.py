@@ -478,6 +478,30 @@ async def test_generation_proxy_is_cut_at_the_configured_sampling() -> None:
     assert [(item.start_ms, item.end_ms) for item in requests] == [(0, 30_000)]
 
 
+async def test_generation_proxy_carries_the_deployment_s_audio_decision_to_the_cutter() -> None:
+    """A deployment whose generator cannot hear turns `proxy_audio` off; without this the flag
+    would be readable in configuration and have no effect on what is cut, which is the shape of
+    bug that leaves a knob documented and dead."""
+    seen: list[bool] = []
+
+    def record(source: bytes, request: ClipRequest) -> MediaClip:
+        seen.append(request.include_audio)
+        return _shrinking_cut(source, request)
+
+    for proxy_audio in (True, False):
+        async with generation_proxies(
+            TENANT_ID,
+            (_video_evidence("evidence_video_01", 0, 30_000),),
+            store=RecordingStore(),
+            sampling=ClipSampling(proxy_audio=proxy_audio),
+            cut=record,
+            scope="job_01:1",
+        ):
+            pass
+
+    assert seen == [True, False]
+
+
 async def test_generation_proxy_is_dropped_when_it_would_not_shrink_the_source() -> None:
     """Re-encoding media that is already at the sampling budget would cost bytes, not save them."""
     store = RecordingStore()

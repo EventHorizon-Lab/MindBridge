@@ -261,7 +261,8 @@ export MINDBRIDGE_MEDIA_SAMPLING_CONFIG_JSON='{
   "frames_per_second": 1.0,
   "max_pixels": 200704,
   "image_max_pixels": 1003520,
-  "generation_proxy": true
+  "generation_proxy": true,
+  "proxy_audio": true
 }'
 ```
 
@@ -277,16 +278,29 @@ model fetch frames it discards on arrival. With the proxy on, video is cut once 
 and the sampled copy is what perception reads. Turn it off for a generator that reads the same
 storage the worker does, where the encode costs more than the transfer it removes.
 
+`proxy_audio` decides whether the copy carries the source's audio track. Keep it on for a
+generator that listens: a video-only proxy silently takes speech away from every question that
+depends on what was said. Turn it off for one that does not. Whether yours does is worth
+measuring rather than assuming — send the same clip twice, once with its audio track and once
+without, and compare `prompt_tokens`. Against the endpoint used for the 2026-08-21 evaluation the
+count was identical at 1009 either way, so the track was never ingested, while the file was
+336 KiB with it against 212 KiB without: an encode and a transfer bought nothing. Note also that
+such an endpoint will still answer "what was said" with fluent invented dialogue rather than
+saying it heard nothing, so a silent deployment does not announce itself.
+
 Four constraints on the proxy, all of which have bitten before:
 
 - **Video only.** `image_max_pixels` governs stored image clips, not what the model is sent. An
   image reaches the model at full resolution because the request carries no pixel budget for
   images at all.
-- **Its ceiling is a frame count, not a duration.** Past roughly forty sampled frames the MP4
-  muxer refuses to interleave a sparse video track with continuous audio. At the 30-second
+- **Its ceiling is a frame count, not a duration.** Past roughly forty sampled frames the encode
+  fails, on the flush that drains the encoder rather than on any one frame. At the 30-second
   segments every ingest path here uses, anything above about 1.3 fps exceeds it. Raising
   `frames_per_second` therefore trades the proxy away; lower it, or segment shorter, to keep
-  both.
+  both. **Turning `proxy_audio` off does not raise this ceiling** — a silent source with the
+  audio disabled fails at the same frame count, so the limit is not the audio interleave it was
+  previously documented as. What has been ruled out, and what has not, is recorded next to
+  `MAX_PROXY_SAMPLED_FRAMES` in `application/evidence_clips.py`.
 - **Best-effort.** A span over budget is skipped before its source is read, and anything the
   encoder or object storage refuses degrades the same way — the observation behaves exactly as
   it did before this knob existed rather than paying for a doomed encode.

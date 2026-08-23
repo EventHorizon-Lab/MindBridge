@@ -237,7 +237,8 @@ def test_worker_reads_media_sampling_from_the_environment() -> None:
         {
             **_environment(),
             "MINDBRIDGE_MEDIA_SAMPLING_CONFIG_JSON": (
-                '{"frames_per_second": 0.5, "max_pixels": 50176, "generation_proxy": false}'
+                '{"frames_per_second": 0.5, "max_pixels": 50176, "generation_proxy": false,'
+                ' "proxy_audio": false}'
             ),
         }
     )
@@ -245,6 +246,8 @@ def test_worker_reads_media_sampling_from_the_environment() -> None:
     assert settings.clip_sampling.frames_per_second == 0.5
     assert settings.clip_sampling.max_pixels == 50_176
     assert settings.clip_sampling.generation_proxy is False
+    # A generator that cannot hear should not be sent an audio track it never reads.
+    assert settings.clip_sampling.proxy_audio is False
 
 
 def test_worker_media_sampling_defaults_keep_the_documented_encoder_budget() -> None:

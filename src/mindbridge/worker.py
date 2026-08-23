@@ -252,6 +252,7 @@ class _MediaSamplingConfig(PluginConfigModel):
     max_pixels: Annotated[PluginInteger, Field(gt=0)] = DEFAULT_VIDEO_MAX_PIXELS
     image_max_pixels: Annotated[PluginInteger, Field(gt=0)] = DEFAULT_IMAGE_MAX_PIXELS
     generation_proxy: StrictBool = True
+    proxy_audio: StrictBool = True
 
 
 def _clip_sampling_from_environment(source: Mapping[str, str]) -> ClipSampling:
