@@ -15,7 +15,7 @@ from mindbridge.edge.outbox import SQLiteObservationOutbox
 from mindbridge.edge.recent_memory import SQLiteRecentMemory
 from mindbridge.edge.sync import EdgeObservationSynchronizer, S3EdgeMediaUploader
 from mindbridge.sdk import MindBridge
-from mindbridge.telemetry import configure_telemetry
+from mindbridge.telemetry import configure_observability
 
 EDGE_ENVIRONMENT = """environment:
   MINDBRIDGE_API_KEY  bearer token for --api-base-url; read from the environment so the
@@ -54,7 +54,7 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
     )
     arguments = parser.parse_args(argv)
     # Configured after parsing so --help and a rejected flag stay side-effect free.
-    configure_telemetry("mindbridge-edge")
+    configure_observability("mindbridge-edge")
     synchronized, pending = asyncio.run(
         _synchronize(
             database_path=arguments.database,

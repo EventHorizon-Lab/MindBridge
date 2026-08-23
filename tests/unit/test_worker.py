@@ -721,3 +721,61 @@ def test_worker_rejects_an_unusable_generator_deadline(configured: dict[str, obj
     """A budget derived from nonsense would be worse than the constant it replaced."""
     with pytest.raises(ValueError, match="request_timeout_seconds must be"):
         processing_budget_seconds(configured)
+
+
+def test_worker_concurrency_defaults_to_one_so_a_local_model_is_never_multiplied() -> None:
+    """Celery's prefork pool builds the media embedder once per child.
+
+    An embedder plugin that loads its model in-process therefore multiplies device memory by
+    the concurrency rather than overlapping anything, so the safe value has to be the default
+    and raising it has to be a deployment's explicit decision.
+    """
+    assert WorkerSettings.from_environment(_environment()).worker_concurrency == 1
+
+
+def test_a_network_bound_worker_can_raise_its_concurrency() -> None:
+    """One observation is mostly waiting on a model endpoint, so serializing them idles."""
+    environment = dict(_environment())
+    environment["MINDBRIDGE_WORKER_CONCURRENCY"] = "6"
+
+    settings = WorkerSettings.from_environment(environment)
+
+    assert settings.worker_concurrency == 6
+    assert create_worker_app(settings).conf.worker_concurrency == 6
+
+
+@pytest.mark.parametrize("configured", ["0", "-1", "33", "many", "2.5"])
+def test_worker_refuses_an_unusable_concurrency(configured: str) -> None:
+    """Silently clamping would leave a deployment believing it raised its throughput."""
+    environment = dict(_environment())
+    environment["MINDBRIDGE_WORKER_CONCURRENCY"] = configured
+
+    with pytest.raises(ValueError, match=r"MINDBRIDGE_WORKER_CONCURRENCY|worker_concurrency"):
+        WorkerSettings.from_environment(environment)
+
+
+@pytest.mark.parametrize("configured", ["", "   "])
+def test_a_blank_concurrency_reads_as_unset_like_every_other_optional_value(
+    configured: str,
+) -> None:
+    """One convention across the contract: a variable exported empty is a variable unset."""
+    environment = dict(_environment())
+    environment["MINDBRIDGE_WORKER_CONCURRENCY"] = configured
+
+    assert WorkerSettings.from_environment(environment).worker_concurrency == 1
+
+
+def test_the_prefork_child_reports_its_timings_before_it_exits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """billiard ends the child with `os._exit`, so no `atexit` handler ever runs there.
+
+    The worker owns the write path, so its summary is the one worth having, and the last
+    signal Celery delivers is the only place left to emit it from.
+    """
+    flushed: list[int] = []
+    monkeypatch.setattr(worker_module, "flush_timing_summary", lambda: flushed.append(1))
+
+    worker_module._close_worker_runtime()
+
+    assert flushed == [1]

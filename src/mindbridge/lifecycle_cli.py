@@ -36,7 +36,7 @@ from mindbridge.infrastructure.postgres import (
     resolve_database_max_pool_size,
 )
 from mindbridge.infrastructure.s3 import S3MediaAccess
-from mindbridge.telemetry import configure_telemetry
+from mindbridge.telemetry import configure_observability
 
 LIFECYCLE_ENVIRONMENT = """environment:
   MINDBRIDGE_DATABASE_URL          PostgreSQL DSN (required). Read from the environment
@@ -119,7 +119,7 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
     if options.dry_run and not options.reclaim_orphan_clips:
         parser.error("--dry-run only applies to --reclaim-orphan-clips")
     # Configured after parsing so --help and a rejected flag stay side-effect free.
-    configure_telemetry("mindbridge-lifecycle")
+    configure_observability("mindbridge-lifecycle")
     policy = MemoryStrengthPolicy(
         access_weight=options.access_weight,
         positive_feedback_weight=options.positive_feedback_weight,

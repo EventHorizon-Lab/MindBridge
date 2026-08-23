@@ -53,7 +53,7 @@ from mindbridge.models.plugins import (
     load_embedder,
     load_generator,
 )
-from mindbridge.telemetry import configure_telemetry, instrument_fastapi
+from mindbridge.telemetry import configure_observability, instrument_fastapi
 
 
 @dataclass(frozen=True, slots=True)
@@ -203,7 +203,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         raise ValueError("MINDBRIDGE_TENANT_API_KEYS_JSON must be configured for the REST API")
     authenticator = TenantApiKeyAuthenticator.from_json(resolved.tenant_api_keys_json)
     runtime = _build_runtime(resolved)
-    telemetry = configure_telemetry("mindbridge-api")
+    telemetry = configure_observability("mindbridge-api")
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
@@ -233,7 +233,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 def create_mcp_server(settings: Settings | None = None) -> MCPServer[None]:
     """Create the deployable MCP server."""
     runtime = _build_runtime(settings or Settings.from_environment())
-    configure_telemetry("mindbridge-mcp")
+    configure_observability("mindbridge-mcp")
 
     @asynccontextmanager
     async def lifespan(_server: MCPServer[None]) -> AsyncIterator[None]:

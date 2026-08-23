@@ -323,8 +323,27 @@ The import happens inside the same guard as the run, so a missing extra fails th
 incomplete environment does — including for `--help` — instead of printing frames from a
 third-party package.
 
+## Reading the logs
+
+Every process writes structured records to stderr with no collector needed, so the first place to
+look is the process output rather than a dashboard:
+
+```bash
+MINDBRIDGE_LOG_FORMAT=text MINDBRIDGE_LOG_LEVEL=DEBUG mindbridge mcp
+```
+
+Each instrumented operation logs its own `duration_ms` and `outcome` on completion, and every
+record carries `trace_id` when a span is active — so the ID from a failing response greps
+straight to the operations behind it. Four warnings name conditions that are otherwise invisible
+in a deployment that looks healthy: a structured-output retry, a silently downgraded generation
+proxy, a transient database failure with its SQLSTATE, and a provider error with its status code.
+[Operations](operations.md) lists them.
+
+To find where a slow run spends its time, set `MINDBRIDGE_TIMING_SUMMARY=1` and read the ranked
+per-operation summary at exit. `mindbridge-bench` prints it for every run without the variable.
+
 ## Getting help
 
 Include the `trace_id` from the failing response. It maps directly onto the OTLP backend and
-identifies the whole request. Everything else — logs, timing, span attributes — is reachable from
-it, and none of it contains user content.
+identifies the whole request, and it appears in the logs above, so timings and span attributes
+are both reachable from it. None of it contains user content.

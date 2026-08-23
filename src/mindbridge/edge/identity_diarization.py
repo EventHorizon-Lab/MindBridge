@@ -29,7 +29,11 @@ from mindbridge.application.capabilities import (
     ModelInput,
     TextPart,
 )
-from mindbridge.application.pipelines.structured import generate_json, unwrap_json_code_fence
+from mindbridge.application.pipelines.structured import (
+    generate_json,
+    output_schema,
+    unwrap_json_code_fence,
+)
 from mindbridge.contracts import IdentityObservationInput
 from mindbridge.core import (
     IdentityKind,
@@ -190,6 +194,11 @@ class SpeechAnalysis:
 
     segments: tuple[SpeechSegment, ...]
     speaker_embeddings: tuple[SpeakerEmbeddingSample, ...]
+
+
+_ACTIVE_SPEAKER_SCHEMA = output_schema("active_speaker_match", _ActiveSpeakerOutput)
+
+_SPEECH_SEGMENT_SCHEMA = output_schema("speech_segmentation", _DiarizationOutput)
 
 
 class FunASRSpeechPipeline:
@@ -457,6 +466,7 @@ class VisualActiveSpeakerPipeline:
                     )
                 ),
                 max_output_tokens=self._max_output_tokens,
+                output_schema=_ACTIVE_SPEAKER_SCHEMA,
             ),
             _parse_active_speakers,
         )
@@ -661,6 +671,7 @@ class SpeechSegmentationPipeline:
                     )
                 ),
                 max_output_tokens=self._max_output_tokens,
+                output_schema=_SPEECH_SEGMENT_SCHEMA,
             ),
             lambda content: _parse_output(content, duration_ms),
         )

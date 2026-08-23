@@ -528,6 +528,42 @@ def test_scenarios_partition_the_package() -> None:
     assert set(_extras()) == (set(SCENARIOS) - {""}) | ARTIFACT_EXTRAS | UNION_EXTRAS
 
 
+def test_no_docstring_documents_nothing() -> None:
+    """A string under an assignment documents it; anywhere else it documents nothing.
+
+    This codebase carries 31 of these attribute docstrings and treats the reasoning in them
+    as load-bearing, but the syntax is positional: insert a constant between an assignment
+    and its docstring and the docstring silently detaches, leaving a no-op string expression
+    and an undocumented constant. Neither ruff nor mypy reports it, and nothing reads
+    docstrings at runtime, so the loss is invisible -- which is how one got through review.
+    """
+    orphaned = sorted(
+        f"{path.relative_to(ROOT)}:{node.lineno}"
+        for path in _modules(SOURCE, ROOT / "tests")
+        for scope in _documented_scopes(path)
+        for index, node in enumerate(scope)
+        if index and _is_string_expression(node)
+        if not isinstance(scope[index - 1], ast.Assign | ast.AnnAssign)
+    )
+
+    assert orphaned == []
+
+
+def _documented_scopes(path: Path) -> list[list[ast.stmt]]:
+    """The bodies where a bare string is read as documentation: the module and its classes."""
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    classes = [node for node in ast.walk(tree) if isinstance(node, ast.ClassDef)]
+    return [tree.body, *(node.body for node in classes)]
+
+
+def _is_string_expression(node: ast.stmt) -> bool:
+    return (
+        isinstance(node, ast.Expr)
+        and isinstance(node.value, ast.Constant)
+        and isinstance(node.value.value, str)
+    )
+
+
 def _module_name(path: Path) -> str:
     parts = path.relative_to(SOURCE.parent).with_suffix("").parts
     return ".".join(parts[:-1] if parts[-1] == "__init__" else parts)

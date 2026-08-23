@@ -59,9 +59,11 @@ from mindbridge.media.clipping import (
     cut_clips,
     cut_generation_proxy,
 )
-from mindbridge.telemetry import operation_span, set_current_span_attributes
+from mindbridge.telemetry import log_fields, logger, operation_span, set_current_span_attributes
 
 _Budget = TypeVar("_Budget", float, int)
+
+_LOGGER = logger("mindbridge.application.evidence_clips")
 
 
 # Past roughly this many sampled frames the proxy encode fails, on the flush that drains the
@@ -361,11 +363,10 @@ async def _store_generation_proxy(
     # doomed encode on every observation.
     frames = (request.end_ms - request.start_ms) / 1_000 * request.frames_per_second
     if frames > MAX_PROXY_SAMPLED_FRAMES:
-        set_current_span_attributes(
-            {
-                "mindbridge.generation_proxy.skipped": True,
-                "mindbridge.generation_proxy.skipped_reason": "span_exceeds_frame_ceiling",
-            }
+        _skipped_proxy(
+            "span_exceeds_frame_ceiling",
+            media_object_id=str(source_object.media_object_id),
+            frames=round(frames),
         )
         return None
     async with semaphore:
@@ -379,11 +380,9 @@ async def _store_generation_proxy(
             finally:
                 del source
             if not shrank:
-                set_current_span_attributes(
-                    {
-                        "mindbridge.generation_proxy.skipped": True,
-                        "mindbridge.generation_proxy.skipped_reason": "no_smaller_than_source",
-                    }
+                _skipped_proxy(
+                    "no_smaller_than_source",
+                    media_object_id=str(source_object.media_object_id),
                 )
                 return None
             media_object = _clip_media_object(
@@ -404,13 +403,31 @@ async def _store_generation_proxy(
             # bare ValueError for a span it will not interleave, PyAV raises IndexError for a
             # container it cannot read, and object storage raises for a transient outage. None of
             # them is worth losing an observation over.
-            set_current_span_attributes(
-                {
-                    "mindbridge.generation_proxy.skipped": True,
-                    "mindbridge.generation_proxy.skipped_reason": type(error).__name__,
-                }
+            _skipped_proxy(
+                type(error).__name__,
+                media_object_id=str(source_object.media_object_id),
+                error=str(error),
             )
             return None
+
+
+def _skipped_proxy(reason: str, **fields: str | int) -> None:
+    """Report one silently degraded generation proxy on both the span and the log.
+
+    Perception still runs, on the untouched source, so nothing fails and the observation
+    looks normal. A quiet downgrade in the media path is precisely the failure this project
+    has paid for before, so it is a warning rather than an attribute only a collector sees.
+    """
+    set_current_span_attributes(
+        {
+            "mindbridge.generation_proxy.skipped": True,
+            "mindbridge.generation_proxy.skipped_reason": reason,
+        }
+    )
+    _LOGGER.warning(
+        "generation proxy skipped, perceiving the untouched source",
+        extra=log_fields(reason=reason, **fields),
+    )
 
 
 async def _store_source_group(

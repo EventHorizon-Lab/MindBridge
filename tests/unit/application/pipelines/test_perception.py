@@ -55,7 +55,7 @@ async def test_perception_pipeline_returns_grounded_event_and_its_model() -> Non
         assert request.url.path == "/api/v1/chat/completions"
         assert payload["max_tokens"] == 8_192
         assert "reasoning_effort" not in payload
-        assert "response_format" not in payload
+        assert _schema_name(payload) == "perception_events"
         assert "atomic semantic" in system_prompt
         assert "spoken wording and visible text exactly" in system_prompt
         assert "supplied opaque identity_id" in system_prompt
@@ -141,12 +141,10 @@ async def test_perception_pipeline_retries_invalid_output_once_in_json_mode() ->
         nonlocal calls
         calls += 1
         payload: dict[str, object] = json.loads(request.content)
-        if calls == 1:
-            assert "response_format" not in payload
-            content = {"events": [{"start_ms": 0}]}
-        else:
-            assert payload["response_format"] == {"type": "json_object"}
-            content = {"events": []}
+        # Both attempts stay schema-constrained: `json_mode` on the retry is the weaker
+        # fallback for a provider without schema support, not a downgrade to ask for.
+        assert _schema_name(payload) == "perception_events"
+        content = {"events": [{"start_ms": 0}]} if calls == 1 else {"events": []}
         return _streaming_response(content)
 
     perceiver = _perceiver(respond)
@@ -587,6 +585,16 @@ def _evidence(kind: MediaKind, filename: str, suffix: str) -> ResolvedEvidence:
         media_url=f"https://objects.example.test/{suffix}",
         media_url_expires_at=NOW + timedelta(minutes=5),
     )
+
+
+def _schema_name(payload: dict[str, object]) -> str | None:
+    """Return the schema one request constrained decoding to, or None when unconstrained."""
+    response_format = payload.get("response_format")
+    if not isinstance(response_format, dict) or response_format.get("type") != "json_schema":
+        return None
+    schema = cast(dict[str, object], response_format["json_schema"])
+    assert schema["strict"] is True
+    return cast(str, schema["name"])
 
 
 def _streaming_response(payload: object, *, fingerprint: str | None = None) -> httpx.Response:

@@ -33,7 +33,11 @@ from mindbridge.application.perception import (
     time_ranges_overlap,
 )
 from mindbridge.application.pipelines.evidence import evidence_parts
-from mindbridge.application.pipelines.structured import generate_json, unwrap_json_code_fence
+from mindbridge.application.pipelines.structured import (
+    generate_json,
+    output_schema,
+    unwrap_json_code_fence,
+)
 from mindbridge.core import (
     ClaimType,
     DomainInvariantError,
@@ -185,6 +189,9 @@ class _PerceptionOutput(BaseModel):
         return self
 
 
+_PERCEPTION_SCHEMA = output_schema("perception_events", _PerceptionOutput)
+
+
 class PerceptionPipeline:
     """Turn a Generator into bounded, evidence-linked semantic intervals."""
 
@@ -219,6 +226,7 @@ class PerceptionPipeline:
                     )
                 ),
                 max_output_tokens=self._max_output_tokens,
+                output_schema=_PERCEPTION_SCHEMA,
             ),
             lambda content: _parse_output(content, observation, evidence),
         )

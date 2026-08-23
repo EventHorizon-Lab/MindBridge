@@ -206,9 +206,53 @@ bill into a spike.
 Both commands print one JSON object on stdout. Capture it: it is the record of what the sweep did,
 and the only place the dropped-pair counts appear.
 
+## Logs
+
+Every process writes structured records to stderr with no collector and no configuration. Each
+instrumented operation logs its own duration and outcome as it completes, so the write and read
+paths are attributable from `docker logs` alone.
+
+```bash
+export MINDBRIDGE_LOG_FORMAT=json     # or text for a terminal; unset picks by TTY
+export MINDBRIDGE_LOG_LEVEL=INFO      # WARNING keeps failures and drops the operation stream
+```
+
+```json
+{"level":"INFO","message":"operation success","operation":"mindbridge.recall",
+ "duration_ms":812.4,"self_ms":31.2,"mindbridge.recall.answered":true,
+ "trace_id":"4f1c...","service":"mindbridge-api"}
+```
+
+`duration_ms` is inclusive and `self_ms` excludes nested instrumented operations. Records carry
+IDs and counts, never memory text, prompts, media, or credentials — the same rule the spans
+follow.
+
+Four warnings exist because the condition is otherwise invisible in a working deployment:
+
+| Warning | What it means |
+| --- | --- |
+| `structured output rejected, retrying once` | The model left its output contract and a second generation was paid for. Read `constrained`: a retry that is still constrained repeats the first attempt's arguments, so the bound that failed is what to look at. |
+| `generation proxy skipped, perceiving the untouched source` | Media was silently downgraded; perception still succeeded on the source. |
+| `database failure classified as transient` | Carries the SQLSTATE the retry translation otherwise discards. |
+| `provider request failed` | Carries the status code and whether it was treated as retryable. |
+
+### Finding the bottleneck
+
+```bash
+MINDBRIDGE_TIMING_SUMMARY=1 mindbridge consolidate --tenant tenant_01
+```
+
+One row per operation at exit, ranked by self time, with `calls`, `self_seconds`,
+`total_seconds`, `mean_ms`, `max_ms`, and `self_share`. Rank by self time rather than total:
+by total, the outermost operation always wins because it contains everything.
+
+`mindbridge-bench` emits it at the end of every run without the variable, including a run that
+died halfway — which is when knowing what owned the clock is worth most.
+
 ## Telemetry
 
-OpenTelemetry activates only when a standard OTLP endpoint is configured; otherwise it is a no-op.
+OpenTelemetry activates only when a standard OTLP endpoint is configured; otherwise it is a
+no-op. The logs above do not depend on it.
 
 ```bash
 export OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318
@@ -233,12 +277,14 @@ whole request.
 acknowledgement, cloud job claim and searchable readiness, and recall first-answer and completion
 latency.
 
-Generator spans additionally report media count, JSON retry, time to first token, token usage, and
-the bounded recall phase and round. None of these attributes carry user content or IDs.
+Generator spans additionally report media count, JSON retry, whether decoding was
+schema-constrained, time to first token, token usage, and the bounded recall phase and round.
+None of these attributes carry user content or IDs.
 
 | Signal | Why it matters |
 | --- | --- |
 | Recall first-answer latency | Perceived latency. Measure time to first token, not wall clock — they diverge substantially. |
+| `mindbridge.model.schema_constrained` | False across the fleet means the endpoint refused schema decoding and every structured call is back on prompt-only output. |
 | Job claim → searchable readiness | How stale memory is relative to capture. |
 | Generator JSON retry rate | A rising rate means the model is drifting off its output contract. |
 | `task_broker_unavailable` rate | Observations are being rejected outright. |

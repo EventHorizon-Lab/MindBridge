@@ -8,11 +8,15 @@ module file it happens to live in.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+import asyncio
+import sys
+from collections.abc import Callable, Mapping, Sequence
+from io import StringIO
+from types import ModuleType
 
 import pytest
 
-from mindbridge import cli, lifecycle_cli
+from mindbridge import cli, lifecycle_cli, telemetry
 from mindbridge.benchmarks import cli as bench_cli
 
 PRODUCT_PATHS = list(cli.COMMANDS)
@@ -203,3 +207,81 @@ def test_dry_run_refuses_to_pretend_it_covers_the_whole_sweep(
         lifecycle_cli.main(["--tenant-id", "tenant_01", "--dry-run"])
 
     assert exit_info.value.code == cli.USAGE_EXIT_CODE
+
+
+def test_a_benchmark_run_reports_where_its_own_wall_clock_went(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A measurement run that cannot account for its own cost is the reason this exists.
+
+    `mindbridge-bench` configured no logging at all, so every duration the instrumented
+    write and read paths already recorded was discarded in exactly the runs being optimized.
+    """
+    captured = _capture_bench_logs(monkeypatch)
+
+    @telemetry.operation_span("mindbridge.test.bench_stage")
+    async def instrumented() -> None:
+        return None
+
+    def handler(argv: Sequence[str], *, prog: str) -> int:
+        asyncio.run(instrumented())
+        return 0
+
+    runner = _stub_runner(monkeypatch, handler)
+
+    assert bench_cli.guarded(runner, [], prog="mindbridge-bench stub") == 0
+
+    logged = captured.getvalue()
+    assert "mindbridge.test.bench_stage" in logged
+    assert "timing summary" in logged
+
+
+def test_a_benchmark_that_dies_still_reports_its_timings(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A half-finished long run is when the stage that owned the clock matters most."""
+    captured = _capture_bench_logs(monkeypatch)
+
+    @telemetry.operation_span("mindbridge.test.bench_failure")
+    async def instrumented() -> None:
+        raise RuntimeError("upstream refused the request")
+
+    def handler(argv: Sequence[str], *, prog: str) -> int:
+        asyncio.run(instrumented())
+        return 0
+
+    runner = _stub_runner(monkeypatch, handler)
+
+    assert bench_cli.guarded(runner, [], prog="mindbridge-bench stub") == 1
+
+    assert "upstream refused the request" in capsys.readouterr().err
+    logged = captured.getvalue()
+    assert "mindbridge.test.bench_failure" in logged
+    assert "timing summary" in logged
+
+
+def _stub_runner(
+    monkeypatch: pytest.MonkeyPatch,
+    handler: Callable[..., object],
+) -> bench_cli.Runner:
+    """Register one importable stand-in runner; `Runner` is frozen and resolves by module."""
+    module = ModuleType("mindbridge_stub_runner")
+    module.main = handler  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "mindbridge_stub_runner", module)
+    return bench_cli.Runner("mindbridge_stub_runner", "Stub", extra=None)
+
+
+def _capture_bench_logs(monkeypatch: pytest.MonkeyPatch) -> StringIO:
+    """Capture what the run logs, through the same call the CLI makes to configure it."""
+    monkeypatch.setattr(telemetry, "_timings", {})
+    monkeypatch.setenv("MINDBRIDGE_LOG_FORMAT", "text")
+    captured = StringIO()
+    original = telemetry.configure_logging
+
+    def configure(default_service_name: str, environ: Mapping[str, str] | None = None) -> None:
+        original(default_service_name, environ)
+        monkeypatch.setattr(telemetry._LOGGER.handlers[0], "stream", captured)
+
+    monkeypatch.setattr(telemetry, "configure_logging", configure)
+    return captured

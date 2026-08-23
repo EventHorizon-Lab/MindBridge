@@ -29,7 +29,11 @@ from mindbridge.application.pipelines.evidence import (
     DEFAULT_MAX_EVIDENCE_MEDIA_PARTS,
     evidence_parts,
 )
-from mindbridge.application.pipelines.structured import generate_json, unwrap_json_code_fence
+from mindbridge.application.pipelines.structured import (
+    generate_json,
+    output_schema,
+    unwrap_json_code_fence,
+)
 from mindbridge.application.ports import GeneratedAnswer, ResolvedQueryMedia
 from mindbridge.contracts import RecallRequest
 from mindbridge.core import MemoryId, MemoryRecord, ModelOutputError
@@ -140,6 +144,17 @@ class _OccurrenceOutput(BaseModel):
     ]
 
 
+_OCCURRENCE_SCHEMA = output_schema("occurrence_selection", _OccurrenceOutput)
+"""Occurrence selection is constrained; the answer envelope beside it deliberately is not.
+
+Strict decoding cannot express an optional key, so a schema for `_AnswerOutput` would force
+`retrieval_queries` to be emitted on every recall round. Each query the model volunteers
+buys another reflection round, and another whole generation, so constraining that shape
+would trade a rare parse retry for a routine extra call. `_OccurrenceOutput` carries no
+optional field and no prose, which is why the same treatment is free there.
+"""
+
+
 class AnswerPipeline:
     """Turn a Generator into MindBridge's evidence-grounded answer policy."""
 
@@ -225,6 +240,7 @@ class OccurrencePipeline:
                     )
                 ),
                 max_output_tokens=self._max_output_tokens,
+                output_schema=_OCCURRENCE_SCHEMA,
             ),
             lambda content: _parse_occurrences(content, candidate_ids),
         )
