@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import math
+from collections import defaultdict
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from typing import cast
 
@@ -12,12 +14,18 @@ from mindbridge.application.capabilities import (
     EmbedRequest,
     EmbedResult,
     EmbedTask,
+    ModelInput,
+    TextPart,
 )
 from mindbridge.application.derive_observation_graph import (
     derive_observation_graph,
     embed_observation_graph,
 )
-from mindbridge.application.perception import EventPerception, PerceivedEvent
+from mindbridge.application.perception import (
+    EventPerception,
+    PerceivedEntity,
+    PerceivedEvent,
+)
 from mindbridge.application.ports import (
     Answerer,
     EmbeddingIndex,
@@ -35,6 +43,7 @@ from mindbridge.core import (
     EmbeddingId,
     EmbeddingRecord,
     EmbeddingSpaceReference,
+    EntityType,
     Event,
     EventId,
     EvidenceId,
@@ -64,20 +73,71 @@ REMEMBERED_VECTOR = (0.9, math.sqrt(1.0 - 0.81), 0.0)
 # The media vector of the clip the observed span was cut from: a different object, encoded
 # from different bytes, and the one channel that is genuinely independent of the summary.
 EVIDENCE_VECTOR = (0.95, math.sqrt(1.0 - 0.9025), 0.0)
+# A second observed event, closer to the query than the first one, and the name of the
+# entity the first one mentions: the query asked about that name, so the entity's own
+# vector is the closest thing in the graph index to it.
+NEIGHBOUR_VECTOR = (0.85, math.sqrt(1.0 - 0.7225), 0.0)
+ENTITY_VECTOR = (0.99, math.sqrt(1.0 - 0.9801), 0.0)
+
+
+def _input_text(model_input: ModelInput) -> str:
+    return "".join(part.text for part in model_input.parts if isinstance(part, TextPart))
+
+
+_PLACED_TOOL = PerceivedEvent(
+    start_ms=500,
+    end_ms=3_500,
+    description="A person places a red tool beside a blue toolbox.",
+    salience=0.8,
+    evidence_ids=(EvidenceId("evidence_01"),),
+)
+# The same clip, with the person named: the entity carries a vector of its own, and it is
+# the only object in the graph index that the query's name is close to.
+_PLACED_TOOL_BY_MARA = replace(
+    _PLACED_TOOL,
+    entities=(
+        PerceivedEntity(
+            entity_type=EntityType.PERSON,
+            canonical_name="Mara",
+            confidence=0.9,
+            evidence_ids=(EvidenceId("evidence_01"),),
+        ),
+    ),
+)
+_OPENED_TOOLBOX = PerceivedEvent(
+    start_ms=4_000,
+    end_ms=7_500,
+    description="A person opens the blue toolbox and looks inside it.",
+    salience=0.7,
+    evidence_ids=(EvidenceId("evidence_03"),),
+)
 
 
 class FixedEmbedder:
-    """Return one configured unit vector for every input."""
+    """Return one configured unit vector per input, or a different one for named text."""
 
     model_reference = EMBEDDING_MODEL
     space_reference = SPACE
 
-    def __init__(self, values: tuple[float, ...]) -> None:
+    def __init__(
+        self,
+        values: tuple[float, ...],
+        by_text: dict[str, tuple[float, ...]] | None = None,
+    ) -> None:
         self.values = values
+        self.by_text = by_text or {}
 
     async def embed(self, request: EmbedRequest) -> EmbedResult:
-        embedding = Embedding(self.values, self.model_reference, self.space_reference)
-        return EmbedResult((embedding,) * len(request.inputs))
+        return EmbedResult(
+            tuple(
+                Embedding(
+                    self.by_text.get(_input_text(model_input), self.values),
+                    self.model_reference,
+                    self.space_reference,
+                )
+                for model_input in request.inputs
+            )
+        )
 
 
 class FakeEmbeddingIndex:
@@ -164,18 +224,31 @@ class FakeMemoryStore:
         *,
         limit: int,
     ) -> tuple[MemoryRecord, ...]:
+        # An entity match enters the walk through the events and claims that mention it, and
+        # the query groups every path that reaches one memory into a single row carrying its
+        # best rank, so a memory two matched objects both reach is returned once.
         represented = {
             (relation.source_type.value, relation.source_id): MemoryId(relation.target_id)
             for relation in self.relations
             if relation.relation_type is RelationType.REPRESENTED_BY
         }
+        mentioning: defaultdict[str, list[tuple[str, str]]] = defaultdict(list)
+        for relation in self.relations:
+            if relation.relation_type in {RelationType.MENTIONS, RelationType.ABOUT}:
+                mentioning[relation.target_id].append(
+                    (relation.source_type.value, relation.source_id)
+                )
         found = tuple(
             memory_id
             for match in ranked_objects
-            if (memory_id := represented.get((match.object_type.value, match.object_id)))
-            is not None
+            for source in (
+                mentioning[match.object_id]
+                if match.object_type is EmbeddedObjectType.ENTITY
+                else [(match.object_type.value, match.object_id)]
+            )
+            if (memory_id := represented.get(source)) is not None
         )
-        return self._ranked(found, limit=limit)
+        return self._ranked(tuple(dict.fromkeys(found)), limit=limit)
 
     def _ranked(
         self,
@@ -260,6 +333,43 @@ async def test_two_channels_reading_two_vectors_still_add_up() -> None:
     ]
 
 
+async def test_an_entity_match_keeps_promoting_the_memory_it_reached() -> None:
+    """A vector no other channel saw must keep moving recall, whatever else shares its row.
+
+    Two observed events, one of them naming the person the query asks about. That one is the
+    weaker summary match of the two, and the graph query returns one row per memory however
+    many paths reached it, so the entity vector leaves exactly one trace: the memory it
+    reached arrives at the front of the graph ranking. Drop that row as a duplicate of the
+    summary vector and searching entities stops changing recall at all.
+    """
+    memories, embeddings, relations = await _observed_memories(
+        (_PLACED_TOOL_BY_MARA, _OPENED_TOOLBOX),
+        {
+            _OPENED_TOOLBOX.description: NEIGHBOUR_VECTOR,
+            # The encoder is handed the casefolded name the entity record stores.
+            "mara": ENTITY_VECTOR,
+        },
+    )
+    named, neighbour = memories
+    remembered = _remembered_memory()
+    store = FakeMemoryStore((*memories, remembered), relations)
+    recall = _recall(store, (*embeddings, _remembered_embedding(remembered)))
+
+    fused = await recall._search_semantic_memories(
+        RecallRequest(tenant_id=TENANT, query=RecallQuery(text="what did mara do")),
+        (),
+        limit=10,
+    )
+
+    # The remembered memory is the closest vector of the three. The named memory outranks the
+    # nearer observed one only through the entity, which no other channel searched.
+    assert [memory.memory_id for memory in fused] == [
+        remembered.memory_id,
+        named.memory_id,
+        neighbour.memory_id,
+    ]
+
+
 def _recall(store: FakeMemoryStore, embeddings: tuple[EmbeddingRecord, ...]) -> RecallMemories:
     return RecallMemories(
         cast(MemoryStore, store),
@@ -276,6 +386,15 @@ async def _observed_memory() -> tuple[
     MemoryRecord, tuple[EmbeddingRecord, ...], tuple[Relation, ...]
 ]:
     """Derive and index one observed event exactly as the write path does."""
+    memories, embeddings, relations = await _observed_memories((_PLACED_TOOL,))
+    return memories[0], embeddings, relations
+
+
+async def _observed_memories(
+    perceived_events: tuple[PerceivedEvent, ...],
+    by_text: dict[str, tuple[float, ...]] | None = None,
+) -> tuple[tuple[MemoryRecord, ...], tuple[EmbeddingRecord, ...], tuple[Relation, ...]]:
+    """Derive and index observed events exactly as the write path does."""
     observation = Observation(
         observation_id=ObservationId("observation_01"),
         tenant_id=TENANT,
@@ -285,46 +404,41 @@ async def _observed_memory() -> tuple[
         sensor=SensorKind.CAMERA,
         media_object_ids=(MediaObjectId("media_01"),),
         occurred_at=NOW,
-        ended_at=NOW + timedelta(seconds=4),
+        ended_at=NOW + timedelta(seconds=10),
         observed_at=NOW,
     )
     perception = EventPerception(
-        events=(
-            PerceivedEvent(
-                start_ms=500,
-                end_ms=3_500,
-                description="A person places a red tool beside a blue toolbox.",
-                salience=0.8,
-                evidence_ids=(EvidenceId("evidence_01"),),
-            ),
-        ),
+        events=perceived_events,
         model_reference=MODEL,
         prompt_version="perceive_events_v4",
     )
-    event = Event(
-        event_id=EventId("event_01"),
-        tenant_id=TENANT,
-        observation_ids=(observation.observation_id,),
-        evidence_ids=(EvidenceId("evidence_01"),),
-        occurred_at=NOW + timedelta(milliseconds=500),
-        ended_at=NOW + timedelta(milliseconds=3_500),
-        description=perception.events[0].description,
-        salience=0.8,
-        created_at=NOW,
-        model_reference=MODEL,
-        prompt_version="perceive_events_v4",
+    events = tuple(
+        Event(
+            event_id=EventId(f"event_{index:02d}"),
+            tenant_id=TENANT,
+            observation_ids=(observation.observation_id,),
+            evidence_ids=perceived.evidence_ids,
+            occurred_at=observation.occurred_at + timedelta(milliseconds=perceived.start_ms),
+            ended_at=observation.occurred_at + timedelta(milliseconds=perceived.end_ms),
+            description=perceived.description,
+            salience=perceived.salience,
+            created_at=NOW,
+            model_reference=MODEL,
+            prompt_version="perceive_events_v4",
+        )
+        for index, perceived in enumerate(perceived_events, start=1)
     )
-    graph = derive_observation_graph(observation, perception, (event,), (), NOW)
+    graph = derive_observation_graph(observation, perception, events, (), NOW)
     embeddings = await embed_observation_graph(
         TENANT,
-        (event,),
+        events,
         graph.claims,
         graph.entities,
         graph.memories,
-        cast(Embedder, FixedEmbedder(DERIVED_VECTOR)),
+        cast(Embedder, FixedEmbedder(DERIVED_VECTOR, by_text)),
         NOW,
     )
-    return graph.memories[0], embeddings, graph.relations
+    return graph.memories, embeddings, graph.relations
 
 
 def _remembered_memory() -> MemoryRecord:

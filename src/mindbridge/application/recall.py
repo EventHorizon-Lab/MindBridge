@@ -520,8 +520,8 @@ class RecallMemories:
         return fuse_memory_rankings(
             (
                 evidence_memories,
-                _without_shared_vector_credit(graph_memories, direct_memories, graph_matches),
-                direct_memories,
+                graph_memories,
+                _without_shared_vector_credit(direct_memories, graph_memories, graph_matches),
                 hierarchy_memories,
             ),
             limit=limit,
@@ -566,11 +566,11 @@ def _memory_ids(memories: tuple[MemoryRecord, ...]) -> tuple[MemoryId, ...]:
 
 
 def _without_shared_vector_credit(
-    graph_memories: tuple[MemoryRecord, ...],
     direct_memories: tuple[MemoryRecord, ...],
+    graph_memories: tuple[MemoryRecord, ...],
     graph_matches: tuple[EmbeddingMatch, ...],
 ) -> tuple[MemoryRecord, ...]:
-    """Drop the graph hit a derived memory already earned under its own object type.
+    """Drop the ID-lookup hit a derived memory already earned as its own event or claim.
 
     `observe()` files one vector under two keys, the event or claim and the memory that
     represents it, because the memory channel is otherwise empty and two of the four store
@@ -581,16 +581,26 @@ def _without_shared_vector_credit(
     observe-derived memory would outrank a `remember()`-written one for no reason a similarity
     can account for.
 
-    Only the hit itself is removed, and only where the ID lookup already returned it. A memory
-    the graph reached from some other object -- an entity name, a neighbouring event -- was
-    found by a different vector and keeps its contribution.
+    The ID lookup is the side that loses the credit, because it is the side that can carry
+    nothing else: a memory reaches it exactly when its own `MEMORY_RECORD` row matched, and
+    for a derived memory that row is the shared vector and only ever that. The graph row is
+    kept because it can stand for more than that vector -- the same row comes back when an
+    entity name or a neighbouring record reached the memory too, and the graph query groups
+    every such path into one row before this runs, so dropping the row drops those signals
+    with it. Only memories the graph ranking actually returned lose the lookup credit: a
+    match whose row that query truncated away never doubled anything.
     """
-    duplicated = {memory.memory_id for memory in direct_memories} & {
+    # ponytail: what survives the grouping is rank, not provenance -- an independent path
+    # shows up as a better position in the graph ranking, never as a second summand. To pay
+    # it separately, `_SEARCH_MEMORIES_BY_GRAPH_OBJECTS_SQL` would have to tag its first UNION
+    # branch (`true AS own_vector`, `false` on the other four), aggregate
+    # `bool_or(NOT own_vector)` in `ranked_memories`, and return that column.
+    duplicated = {memory.memory_id for memory in graph_memories} & {
         representing_memory_id(match.object_id)
         for match in graph_matches
         if match.object_type is not EmbeddedObjectType.ENTITY
     }
-    return tuple(memory for memory in graph_memories if memory.memory_id not in duplicated)
+    return tuple(memory for memory in direct_memories if memory.memory_id not in duplicated)
 
 
 def _query_input(

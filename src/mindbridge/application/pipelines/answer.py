@@ -271,10 +271,12 @@ def _recall_parts(
     parts.extend(
         evidence_parts(
             evidence,
-            # Excluding the query object's *id* would drop the derived clips of every span cut
-            # from it, which on a media query is exactly the evidence being asked about. What
-            # must not be sent twice is one set of bytes.
-            excluded_media_urls={item.media_url for item in attached_query_media},
+            # The id of the object actually attached, which is the clip for every span cut from
+            # this query object and so leaves exactly the evidence a media query asks about in
+            # place. Keying on the signed URL instead let one object presigned twice through.
+            excluded_media_object_ids={
+                item.media_object.media_object_id for item in attached_query_media
+            },
             max_media_parts=(
                 DEFAULT_MAX_EVIDENCE_MEDIA_PARTS - QUERY_MEDIA_PART_COST * len(attached_query_media)
             ),

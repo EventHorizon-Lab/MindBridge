@@ -177,7 +177,9 @@ slot each. It exists because a guard with no way to say yes gets routed around, 
 operator reaches for is `--autoscale`, which the guard cannot see from `--concurrency` alone.
 **The estimate it bounds counts resident weights and CUDA contexts only, not activation memory**:
 the evaluation's six children measured 30.2 GB against an estimated 22.2, so leave room. A value
-that is not a positive number fails startup rather than disabling the guard.
+that is not a **finite** positive number fails startup rather than disabling the guard — `Infinity`
+parses, and every estimate compares below it, so a typo in the one variable that raises the guard
+would otherwise switch it off.
 
 Switching an existing deployment from `jina` to `openai` is not free: video vectors from the two
 backends agree only to cosine **0.944**, because they sample different numbers of frames from the

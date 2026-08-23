@@ -9,8 +9,10 @@ row stays claimable. Republishing from the ledger is the sanctioned repair, and 
 such divergence rather than one exception class at a time.
 
 Reporting is the default because republishing spends money: each message that lands runs a
-generator. `--republish` is the flag that acts, and it publishes only the rows the queue cannot
-already hold, because duplicating a healthy backlog costs more than the repair saves.
+generator. `--republish` is the flag that acts, and ledger-wide it publishes only the rows the
+queue cannot already hold, because duplicating a healthy backlog costs more than the repair
+saves. Under `--tenant-id` that subtraction would set one tenant's rows against every tenant's
+messages, so it is not made, and the report carries the count it withheld either way.
 """
 
 from __future__ import annotations
@@ -110,6 +112,7 @@ async def reconcile(
         )
         accounting = await observation_job_accounting(connection, tenant_id=tenant_id)
     depth = queue_depth(task_queue)
+    withheld = _withheld(depth, len(unreachable), tenant_id=tenant_id)
     return {
         "queue": str(task_queue.conf.task_default_queue),
         # Read before publishing, because kombu publishes with LPUSH and consumes with RPOP: a
@@ -117,12 +120,31 @@ async def reconcile(
         # across 84 minutes moved its attempt count not at all for exactly this reason.
         "queue_depth": depth,
         "claimable": len(unreachable),
+        "withheld": withheld,
         "include_failed": include_failed,
         "republished": (
-            await _republish(task_queue, unreachable, already_queued=depth) if republish else 0
+            await _republish(task_queue, unreachable, already_queued=withheld) if republish else 0
         ),
         "tenants": [_accounting_dict(tenant) for tenant in accounting],
     }
+
+
+def _withheld(depth: int, claimable: int, *, tenant_id: TenantId | None) -> int:
+    """Count the claimable rows a repair treats as already carried by the queue.
+
+    Ledger-wide the queue depth is that count: the queue carries this job type and nothing else,
+    so `claimable - depth` rows can have no message left. A scoped scan breaks the arithmetic
+    rather than narrowing it -- `claimable` is one tenant's, the depth is every tenant's, and
+    five messages for tenant B would cancel five stranded rows for tenant A and publish nothing.
+    Nothing recovers the missing term: a queue count per tenant needs each message read, which
+    for every transport kombu speaks means taking it off the queue.
+
+    So a scoped repair withholds nothing, and the report says so. The two errors are not
+    symmetric: a duplicate costs broker round trips and is self-limiting, while a strand costs
+    the work outright and waits for a human to notice it twice. The tool that publishes a few
+    duplicates beats the one that silently repaired nothing for 479 stranded rows.
+    """
+    return min(depth, claimable) if tenant_id is None else 0
 
 
 async def _republish(
@@ -131,13 +153,13 @@ async def _republish(
     *,
     already_queued: int,
 ) -> int:
-    """Publish one message per claimable row the queue cannot already hold, oldest first.
+    """Publish one message per claimable row past `already_queued`, oldest first.
 
     The ledger says a row is owed work; it cannot say whether a message for it survives, and no
-    transport answers that per message. The count does: the queue holds `already_queued`
-    messages for this job type and nothing else, so at most `claimable - already_queued` rows
-    have none. Publishing to that bound repairs a queue that lost messages and leaves a healthy
-    backlog alone.
+    transport answers that per message. A count of the rows the queue already covers stands in
+    for it -- `_withheld` decides how many that is -- so at most `claimable - already_queued`
+    rows have none. Publishing to that bound repairs a queue that lost messages and leaves a
+    healthy backlog alone.
 
     Both halves matter because a duplicate is not a no-op. The delivery that loses the claim
     gets `RUNNING`, and the task re-queues itself every 30 seconds up to 40 times waiting for the
@@ -185,8 +207,9 @@ def _parser(prog: str | None = None) -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "publish one message per claimable row the queue cannot already hold, oldest "
-            "first. Without it nothing is written, because each message that lands spends "
-            "generator tokens"
+            "first -- and every claimable row under --tenant-id, whose rows the queue depth "
+            "does not count. Without it nothing is written, because each message that lands "
+            "spends generator tokens"
         ),
     )
     return parser

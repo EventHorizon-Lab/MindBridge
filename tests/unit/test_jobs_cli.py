@@ -2,14 +2,20 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+from types import SimpleNamespace
+
+import pytest
 from celery import Celery
 
+from mindbridge import jobs_cli
 from mindbridge.core import JobId, ObservationId, TenantId
+from mindbridge.infrastructure._postgres_jobs import ObservationJobAccounting
 from mindbridge.infrastructure.task_queue import (
     CeleryObservationJobPublisher,
     create_task_queue,
 )
-from mindbridge.jobs_cli import _republish, queue_depth
+from mindbridge.jobs_cli import _republish, queue_depth, reconcile
 
 
 async def test_queue_depth_reads_the_queue_the_worker_consumes() -> None:
@@ -57,6 +63,96 @@ async def test_republishing_leaves_the_backlog_the_queue_already_holds_alone() -
     # And it is the oldest row that was published: kombu consumes with RPOP, so the messages
     # still queued are the newest ones and the row with none is at the front of the list.
     assert _drain(task_queue)[-1] == "job_process_obs_0"
+
+
+async def test_a_scoped_repair_does_not_withhold_against_another_tenants_backlog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The queue is shared and `--tenant-id` is not, so subtracting the depth from one tenant's
+    rows cancelled five stranded jobs against five messages for tenant_02 and published nothing.
+
+    Both arms run here rather than against the bound alone, because the defect was the number
+    handed to the repair: the ledger-wide call is the one that must still withhold.
+    """
+    task_queue = _memory_queue("reconcile-scoped-test")
+    publisher = CeleryObservationJobPublisher(task_queue)
+    for index in range(5):
+        await publisher.publish_observation_processing_job(
+            TenantId("tenant_02"), ObservationId(f"obs_other_{index}"), JobId(f"job_other_{index}")
+        )
+    _stub_ledger(monkeypatch, task_queue, claimable=_claimable(3))
+
+    scoped = await _reconcile(tenant_id=TenantId("tenant_01"))
+    # The repair left eight messages on the queue, which is more than the ledger-wide scan finds
+    # claimable -- so the bound there is the row count, not the depth.
+    ledger_wide = await _reconcile(tenant_id=None)
+
+    assert (scoped["queue_depth"], scoped["withheld"], scoped["republished"]) == (5, 0, 3)
+    assert (ledger_wide["queue_depth"], ledger_wide["withheld"]) == (8, 3)
+    assert (ledger_wide["claimable"], ledger_wide["republished"]) == (3, 0)
+
+
+async def _reconcile(*, tenant_id: TenantId | None) -> dict[str, object]:
+    """Run the reconciler with `--republish` against the stubbed ledger."""
+    return await reconcile(
+        "postgresql://ledger",
+        "memory://",
+        tenant_id=tenant_id,
+        include_failed=False,
+        republish=True,
+    )
+
+
+def _stub_ledger(
+    monkeypatch: pytest.MonkeyPatch,
+    task_queue: Celery,
+    *,
+    claimable: Sequence[tuple[TenantId, ObservationId, JobId]],
+) -> None:
+    """Give the reconciler the two ledger answers it reads, and the queue it reads them against.
+
+    The broker is real -- what the repair publishes is counted off it -- and only PostgreSQL is
+    replaced, because what is under test is the arithmetic between the two.
+    """
+
+    async def unreachable(
+        connection: object,
+        *,
+        tenant_id: TenantId | None,
+        include_failed: bool,
+    ) -> tuple[tuple[TenantId, ObservationId, JobId], ...]:
+        return tuple(claimable)
+
+    async def accounting(
+        connection: object, *, tenant_id: TenantId | None
+    ) -> tuple[ObservationJobAccounting, ...]:
+        return ()
+
+    async def unconfined(connection: object) -> bool:
+        return False
+
+    monkeypatch.setattr(jobs_cli, "create_task_queue", lambda broker_url: task_queue)
+    monkeypatch.setattr(jobs_cli, "psycopg", SimpleNamespace(AsyncConnection=_LedgerConnection))
+    monkeypatch.setattr(jobs_cli, "unreachable_observation_jobs", unreachable)
+    monkeypatch.setattr(jobs_cli, "observation_job_accounting", accounting)
+    monkeypatch.setattr(jobs_cli, "tenant_scope_required", unconfined)
+
+
+class _LedgerConnection:
+    """As much of an async psycopg connection as the reconciler uses: open, scope, close."""
+
+    @classmethod
+    async def connect(cls, database_url: str) -> _LedgerConnection:
+        return cls()
+
+    async def execute(self, statement: str, parameters: tuple[str, ...]) -> None:
+        return None
+
+    async def __aenter__(self) -> _LedgerConnection:
+        return self
+
+    async def __aexit__(self, *exception: object) -> None:
+        return None
 
 
 async def test_republishing_publishes_nothing_when_the_queue_holds_every_row() -> None:

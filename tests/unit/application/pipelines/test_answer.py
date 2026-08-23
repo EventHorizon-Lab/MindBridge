@@ -38,6 +38,10 @@ from mindbridge.prompts import ANSWER_FROM_EVIDENCE_PROMPT, SELECT_OCCURRENCES_P
 
 NOW = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
 
+# Two presigns of one object, one wall-clock second apart, as S3MediaAccess emits them.
+_EARLIER_SIGNATURE = "X-Amz-Date=20260823T112223Z&X-Amz-Signature=a0e018b7"
+_LATER_SIGNATURE = "X-Amz-Date=20260823T112224Z&X-Amz-Signature=165b8b7a"
+
 
 async def test_answer_pipeline_streams_raw_av_and_validates_answer(
     monkeypatch: pytest.MonkeyPatch,
@@ -413,6 +417,60 @@ async def test_query_media_does_not_suppress_the_clips_cut_from_its_own_source()
         await answerer.close()
 
     assert answer.answer == "twice"
+
+
+async def test_a_second_signature_of_the_query_object_is_not_attached_twice() -> None:
+    """One object signed twice is two URL strings and one set of bytes.
+
+    Query media and evidence are presigned by separate calls, and SigV4 stamps `X-Amz-Date` at
+    one-second resolution, so the same object crossing a second boundary between those two calls
+    signs to a different string. Comparing strings then attached the caller's full-resolution
+    upload a second time -- most often an image, which has no derived clip to substitute.
+    """
+
+    async def respond(request: httpx.Request) -> httpx.Response:
+        payload: dict[str, object] = json.loads(request.content)
+        messages = cast(list[dict[str, object]], payload["messages"])
+        content = cast(list[dict[str, object]], messages[1]["content"])
+        attached = [
+            cast(dict[str, str], item["image_url"])["url"]
+            for item in content
+            if item["type"] == "image_url"
+        ]
+
+        assert attached == [f"https://objects.example.test/query_image?{_LATER_SIGNATURE}"]
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=_completion_stream('{"answer":"once","confidence":0.5}'),
+        )
+
+    signed_as_evidence = replace(
+        _resolved_evidence(MediaKind.IMAGE, "query.jpg", "query_image", 0),
+        media_url=f"https://objects.example.test/query_image?{_EARLIER_SIGNATURE}",
+    )
+    query_media = (
+        ResolvedQueryMedia(
+            media_object=signed_as_evidence.media_object,
+            media_url=f"https://objects.example.test/query_image?{_LATER_SIGNATURE}",
+            media_url_expires_at=signed_as_evidence.media_url_expires_at,
+        ),
+    )
+    answerer = _answerer(respond)
+    try:
+        answer = await answerer.answer(
+            RecallRequest(
+                tenant_id="tenant_01",
+                query=RecallQuery(text="Where is this?", media_object_ids=("query_image",)),
+            ),
+            (_memory((), verification_status=VerificationStatus.ATTESTED),),
+            (signed_as_evidence,),
+            query_media=query_media,
+        )
+    finally:
+        await answerer.close()
+
+    assert answer.answer == "once"
 
 
 async def test_query_media_and_evidence_share_one_media_part_ceiling() -> None:

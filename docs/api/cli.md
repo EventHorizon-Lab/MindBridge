@@ -138,7 +138,7 @@ generator. `--republish` is the flag that acts.
 | --- | --- | --- |
 | `--tenant-id` | all tenants | Restrict the report and the repair to one tenant. Required when row-level security confines the role's reads — see below. |
 | `--include-failed` | off | Also count and republish `failed` rows. |
-| `--republish` | off | Publish one message per claimable row the queue cannot already hold, oldest observation first. |
+| `--republish` | off | Publish one message per claimable row the queue cannot already hold, oldest observation first — `--tenant-id` changes that bound, below. |
 
 `--include-failed` is off because a deterministic failure republished on a timer pays for the
 same rejection every time. A row is *claimable* when a worker would still accept a claim for it:
@@ -146,13 +146,23 @@ same rejection every time. A row is *claimable* when a worker would still accept
 its observation still exists, because a job whose observation was deleted would only fail again.
 That last condition is why a tenant can report `pending: 5` with `claimable: 0`.
 
-**`--republish` publishes at most `claimable - queue_depth` rows.** The ledger knows a row is owed
-work but cannot know whether a message for it survives, and no broker answers that per message;
-the count does, since the queue carries this job type and nothing else. Without the bound, a
-`--republish` against a healthy deep backlog duplicates every queued message — and a duplicate is
-not a no-op, because the delivery that loses the claim gets `RUNNING` and then re-queues itself
-every 30 seconds up to 40 times waiting for the winner. Oldest first, because the messages still
-queued are the most recently published, so the rows whose message is gone are the oldest.
+**Across the whole ledger, `--republish` publishes at most `claimable - queue_depth` rows.** The
+ledger knows a row is owed work but cannot know whether a message for it survives, and no broker
+answers that per message; the count does, since the queue carries this job type and nothing else.
+Without the bound, a `--republish` against a healthy deep backlog duplicates every queued
+message — and a duplicate is not a no-op: the delivery that loses the claim gets `RUNNING` and then
+re-queues itself every 30 seconds up to 40 times waiting for the winner. Oldest first, because the
+messages still queued are the most recently published, so the rows whose message is gone are the
+oldest.
+
+**With `--tenant-id`, nothing is subtracted and every claimable row is published.** That
+subtraction sets one tenant's rows against a queue carrying every tenant's messages: five messages
+for another tenant would cancel five stranded rows for this one and publish nothing at all. The
+missing term cannot be recovered, because no transport counts a queue per tenant without reading
+each message off it. The two mistakes also cost differently — a duplicate costs broker round trips
+and stops on its own, while a strand costs the work until someone notices it a second time. So on a
+deep queue, read `queue_depth` before repairing one tenant: it belongs to the whole queue, and the
+messages it counts for this tenant will be duplicated.
 
 **Scope is not optional under row-level security.** `jobs` is `FORCE ROW LEVEL SECURITY`, so a
 cross-tenant scan by a confined role returns no rows rather than failing — and a repair tool that
@@ -166,6 +176,7 @@ command requires a role that can see every tenant.
   "queue": "mindbridge",
   "queue_depth": 0,
   "claimable": 0,
+  "withheld": 0,
   "include_failed": false,
   "republished": 0,
   "tenants": [
@@ -193,6 +204,11 @@ destroyed.
 interpreting a repair rather than just recording one: kombu publishes with `LPUSH` and consumes
 with `RPOP`, so a republished job waits behind every message already queued. Six republishes of
 one job across 84 minutes moved its attempt count not at all, for exactly that reason.
+
+`withheld` is how many claimable rows the repair treated as already carried by the queue:
+`min(claimable, queue_depth)` across the ledger, and `0` under `--tenant-id`. `claimable - withheld`
+is what `--republish` publishes, so a repair that published less than it found says so in the
+report rather than leaving the difference to be inferred.
 
 `tenants` is ordered by `work_seconds`, descending — the summary exists to answer *who is
 consuming the worker*.

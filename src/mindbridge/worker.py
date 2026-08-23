@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 from collections.abc import Callable, Mapping
 from contextlib import AsyncExitStack
@@ -254,8 +255,12 @@ def _vram_budget_from_environment(source: Mapping[str, str]) -> float:
     if value is None:
         return _IN_PROCESS_EMBEDDER_VRAM_GIB
     budget = float(value)
-    if not budget > 0:
-        raise ValueError("MINDBRIDGE_WORKER_VRAM_BUDGET_GIB must be a positive number")
+    # Finite as well as positive, and this field has no upper bound to reject an infinity on its
+    # behalf: `float()` accepts `inf`, `Infinity`, and any literal that overflows to one, and
+    # every estimate compares below an infinite budget -- so the one variable that raises the
+    # guard would switch it off instead, silently, on a typo. NaN fails `isfinite` too.
+    if not math.isfinite(budget) or budget <= 0:
+        raise ValueError("MINDBRIDGE_WORKER_VRAM_BUDGET_GIB must be a finite positive number")
     return budget
 
 

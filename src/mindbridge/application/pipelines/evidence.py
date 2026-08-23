@@ -10,6 +10,7 @@ from mindbridge.application.capabilities import (
     TextPart,
 )
 from mindbridge.application.perception import ResolvedEvidence
+from mindbridge.core import MediaObjectId
 from mindbridge.media.clipping import AUDIO_WINDOW_MS
 
 # Measured against the deployment's endpoint (qwen3.8-27b, vLLM, 262k ctx) with the derived
@@ -35,16 +36,19 @@ MAX_ATTACHED_SPAN_RATIO = 3
 def evidence_parts(
     evidence: tuple[ResolvedEvidence, ...],
     *,
-    excluded_media_urls: Collection[str] = (),
+    excluded_media_object_ids: Collection[MediaObjectId] = (),
     max_media_parts: int = DEFAULT_MAX_EVIDENCE_MEDIA_PARTS,
 ) -> tuple[InputPart, ...]:
     """Label and attach each distinct set of evidence bytes at most once.
 
-    Exclusion and deduplication both key on the attached URL, not on the source media object id:
-    once a span is signed to its own derived clip, two spans of one recording are two different
-    clips, and keying on the source drops all but the first -- and drops every clip cut from an
-    object the question itself was asked with. The source id still labels each part, because that
-    is the identity a model is asked to cite.
+    Exclusion and deduplication both key on the *attached* object, not on the source media object
+    id and not on the signed URL. Keying on the source drops all but the first of two spans of one
+    recording once each is signed to its own derived clip, and drops every clip cut from an object
+    the question itself was asked with. Keying on the URL misses the opposite case: one object
+    presigned by two calls is two strings, because SigV4 stamps `X-Amz-Date` at one-second
+    resolution, so a query image also returned as evidence was attached a second time whenever the
+    two signings straddled a second. The source id still labels each part, because that is the
+    identity a model is asked to cite.
 
     A span whose attached bytes are not about the span contributes its label and no bytes. That is
     the multi-window audio case: no single stored clip covers such a span, so it falls back to the
@@ -53,16 +57,17 @@ def evidence_parts(
     if max_media_parts < 0:
         raise ValueError("max_media_parts must not be negative")
     parts: list[InputPart] = []
-    excluded = set(excluded_media_urls)
-    seen_urls: set[str] = set()
+    excluded = set(excluded_media_object_ids)
+    attached_ids: set[MediaObjectId] = set()
     for item in evidence:
-        if item.media_url in excluded or item.media_url in seen_urls:
+        attached = item.attached_media_object or item.media_object
+        if attached.media_object_id in excluded or attached.media_object_id in attached_ids:
             continue
         if not _is_about_the_span(item):
             continue
-        if len(seen_urls) >= max_media_parts:
+        if len(attached_ids) >= max_media_parts:
             break
-        seen_urls.add(item.media_url)
+        attached_ids.add(attached.media_object_id)
         parts.extend(
             (
                 TextPart(f"Source media_object_id={item.media_object.media_object_id} follows."),
@@ -71,7 +76,7 @@ def evidence_parts(
                     url=item.media_url,
                     # Read as the container format of the bytes being sent, so it has to name
                     # them: a span signed to its `.wav` clip is not the `.m4a` it was cut from.
-                    source_uri=(item.attached_media_object or item.media_object).uri,
+                    source_uri=attached.uri,
                     frames_per_second=item.sampled_frames_per_second,
                     max_pixels=item.sampled_max_pixels,
                 ),

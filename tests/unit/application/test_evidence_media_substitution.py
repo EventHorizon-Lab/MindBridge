@@ -134,8 +134,13 @@ def test_identical_bytes_are_attached_once() -> None:
 def test_the_media_part_count_is_capped() -> None:
     source = _media("source_e")
     span = _span("evidence_e", "source_e")
+    # Forty distinct clips: forty URLs of one object would be one set of bytes, not a fan-out.
     many = tuple(
-        _resolved(span, source, f"https://cdn.example/clip_e{index}?sig=x") for index in range(40)
+        replace(
+            _resolved(span, source, f"https://cdn.example/clip_e{index}?sig=x"),
+            attached_media_object=_media(f"clip_e{index}", derived_from="source_e"),
+        )
+        for index in range(40)
     )
     assert sum(1 for part in evidence_parts(many, max_media_parts=3) if hasattr(part, "url")) == 3
     # The default ceiling is what keeps a pathological fan-out under the gateway limit.

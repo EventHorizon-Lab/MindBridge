@@ -508,9 +508,15 @@ def test_worker_lets_a_larger_card_declare_the_budget_it_actually_has() -> None:
         require_bounded_in_process_models(settings, 14)
 
 
-@pytest.mark.parametrize("budget", ["0", "-8", "nan"])
+@pytest.mark.parametrize("budget", ["0", "-8", "nan", "inf", "Infinity", "1e400"])
 def test_worker_rejects_a_vram_budget_that_bounds_nothing(budget: str) -> None:
-    """An override the guard cannot compare against would disable it rather than raise it."""
+    """An override the guard cannot compare against would disable it rather than raise it.
+
+    `nan` falls out of a positivity test on its own, and an infinity does not: `float()` accepts
+    `inf`, `Infinity`, and any literal that overflows to one, and every finite estimate compares
+    below it -- so a typo in the one variable that raises the budget turns the guard off instead,
+    silently, which is the failure this exists to prevent.
+    """
     with pytest.raises(ValueError):
         WorkerSettings.from_environment(
             {**_environment(), "MINDBRIDGE_WORKER_VRAM_BUDGET_GIB": budget}
