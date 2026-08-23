@@ -395,10 +395,10 @@
       },
       "EvidenceView": {
         "additionalProperties": false,
-        "description": "Precise evidence location safe to expose to a caller.",
+        "description": "Precise evidence location safe to expose to a caller.\n\nThe offsets locate the span inside `media_object_id`. They do not locate it inside\n`media_url`, which is usually a copy cut for this span alone: that copy's own timeline\nstarts at zero and may carry slightly more than the span, and where no single copy covers\nthe span it is the whole source object instead. Seek with these offsets only into\n`media_object_id`.",
         "properties": {
           "end_ms": {
-            "description": "Span end within that media, in milliseconds.",
+            "description": "Span end within `media_object_id`, in milliseconds.",
             "minimum": 0.0,
             "title": "End Ms",
             "type": "integer"
@@ -411,14 +411,14 @@
             "type": "string"
           },
           "media_object_id": {
-            "description": "Media object the span was cut from.",
+            "description": "Media object the span was cut from, and the one the offsets below index.",
             "maxLength": 255,
             "minLength": 1,
             "title": "Media Object Id",
             "type": "string"
           },
           "media_url": {
-            "description": "Signed URL for the bytes, so verifying needs no separate storage call.",
+            "description": "Signed URL for this span's bytes, so verifying needs no separate storage call. It is a copy cut for the span where one exists, and the whole source object where none does; bytes are attached to a generation request only while they are about the span, so an answer over a span its source dwarfs was produced without them.",
             "maxLength": 2048,
             "minLength": 1,
             "title": "Media Url",
@@ -431,7 +431,7 @@
             "type": "string"
           },
           "start_ms": {
-            "description": "Span start within that media, in milliseconds.",
+            "description": "Span start within `media_object_id`, in milliseconds.",
             "minimum": 0.0,
             "title": "Start Ms",
             "type": "integer"

@@ -138,11 +138,21 @@ generator. `--republish` is the flag that acts.
 | --- | --- | --- |
 | `--tenant-id` | all tenants | Restrict the report and the repair to one tenant. Required when row-level security confines the role's reads — see below. |
 | `--include-failed` | off | Also count and republish `failed` rows. |
-| `--republish` | off | Publish one message per claimable row, oldest observation first. |
+| `--republish` | off | Publish one message per claimable row the queue cannot already hold, oldest observation first. |
 
 `--include-failed` is off because a deterministic failure republished on a timer pays for the
 same rejection every time. A row is *claimable* when a worker would still accept a claim for it:
-`pending`, stale `running` (what a lost worker leaves behind), and `failed` only when asked.
+`pending`, stale `running` (what a lost worker leaves behind), and `failed` only when asked — and
+its observation still exists, because a job whose observation was deleted would only fail again.
+That last condition is why a tenant can report `pending: 5` with `claimable: 0`.
+
+**`--republish` publishes at most `claimable - queue_depth` rows.** The ledger knows a row is owed
+work but cannot know whether a message for it survives, and no broker answers that per message;
+the count does, since the queue carries this job type and nothing else. Without the bound, a
+`--republish` against a healthy deep backlog duplicates every queued message — and a duplicate is
+not a no-op, because the delivery that loses the claim gets `RUNNING` and then re-queues itself
+every 30 seconds up to 40 times waiting for the winner. Oldest first, because the messages still
+queued are the most recently published, so the rows whose message is gone are the oldest.
 
 **Scope is not optional under row-level security.** `jobs` is `FORCE ROW LEVEL SECURITY`, so a
 cross-tenant scan by a confined role returns no rows rather than failing — and a repair tool that
@@ -192,7 +202,7 @@ consuming the worker*.
 | `jobs`, `pending`, `running`, `failed`, `succeeded` | Row counts by state. |
 | `queue_wait_seconds` | Total time this tenant's jobs spent waiting to be claimed, plus the wait a still-pending job has accrued so far. |
 | `work_seconds` | Total time workers spent on them, **across every attempt**, plus the attempt in flight. |
-| `input_tokens`, `output_tokens` | What the generator charged, across every attempt. |
+| `input_tokens`, `output_tokens` | What the models charged, across every attempt — the generator, plus the embedder when it is a served endpoint rather than a local GPU. |
 
 Four things worth knowing before acting on those numbers:
 
@@ -202,14 +212,18 @@ Four things worth knowing before acting on those numbers:
 - **Both include the interval still open.** A pending job's wait so far, and a running job's work
   so far. Without that, the tenant holding a worker *right now* would contribute nothing to the
   column the report is sorted by.
-- **An abandoned attempt stops accruing at the stale window** (960 s). Past it the claim treats
-  the row as reclaimable, so whatever held it is gone; charging it forever would sort every live
-  tenant below a worker that died.
+- **An abandoned attempt stops accruing at the stale window** (960 s), whether it is still open
+  or has been reclaimed. Past it the claim treats the row as reclaimable, so whatever held it is
+  gone; charging it forever would sort every live tenant below a worker that died. The reclaim
+  charges it to `work_seconds` alone — an abandoned attempt was running, not queued.
 - **`work_seconds` is worker time, not wall time.** A job created an hour ago and processed in two
   seconds reports two seconds of work and an hour of wait.
 
-`null` in either duration means the job last moved before the columns existed (migrations 0022
-and 0023); `0` means it was measured and was that fast.
+The duration and token columns are `null` on a row that last moved before they existed
+(migrations 0022 and 0023), where `0` means measured and that fast. The report does not preserve
+the difference: it sums a tenant's rows, and a `null` contributes nothing, so a tenant whose jobs
+all predate the migrations reports `0` rather than `null`. Read a suspiciously cheap tenant
+against `jobs` — an old ledger, not a fast one.
 
 **Environment:** `MINDBRIDGE_DATABASE_URL` and `MINDBRIDGE_TASK_BROKER_URL`, both required. Read
 from the environment rather than flags so neither reaches a process list or a shell history.

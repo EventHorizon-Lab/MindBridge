@@ -117,6 +117,10 @@ async def resolve_evidence_media(
     source, which is what `ResolvedEvidence.media_url` already documents. The span still
     reports its source `media_object`, so every id, uri and duration a caller reads is
     unchanged; only the bytes a model opens get smaller.
+
+    Whichever object was signed is reported as `attached_media_object`, source included. A
+    consumer about to send those bytes has no other way to tell a span-sized clip from the
+    two-hour recording a span with no usable clip falls back to.
     """
     if max_concurrency <= 0:
         raise ValueError("max_concurrency must be positive")
@@ -143,16 +147,17 @@ async def resolve_evidence_media(
 
     downloads = dict(await asyncio.gather(*(sign(item) for item in to_sign.values())))
 
-    def attached(evidence: EvidenceSpan) -> MediaObjectId:
+    def resolved(evidence: EvidenceSpan) -> ResolvedEvidence:
+        source = media_by_id[evidence.media_object_id]
         clip = clip_media.get(evidence.evidence_id)
-        return clip.media_object_id if clip is not None else evidence.media_object_id
-
-    return tuple(
-        ResolvedEvidence(
+        attached = clip if clip is not None else source
+        download = downloads[attached.media_object_id]
+        return ResolvedEvidence(
             evidence_span=evidence,
-            media_object=media_by_id[evidence.media_object_id],
-            media_url=downloads[attached(evidence)].download_url,
-            media_url_expires_at=downloads[attached(evidence)].expires_at,
+            media_object=source,
+            media_url=download.download_url,
+            media_url_expires_at=download.expires_at,
+            attached_media_object=attached,
         )
-        for evidence in evidence_spans
-    )
+
+    return tuple(resolved(evidence) for evidence in evidence_spans)

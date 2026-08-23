@@ -9,7 +9,8 @@ row stays claimable. Republishing from the ledger is the sanctioned repair, and 
 such divergence rather than one exception class at a time.
 
 Reporting is the default because republishing spends money: each message that lands runs a
-generator. `--republish` is the flag that acts.
+generator. `--republish` is the flag that acts, and it publishes only the rows the queue cannot
+already hold, because duplicating a healthy backlog costs more than the repair saves.
 """
 
 from __future__ import annotations
@@ -117,7 +118,9 @@ async def reconcile(
         "queue_depth": depth,
         "claimable": len(unreachable),
         "include_failed": include_failed,
-        "republished": await _republish(task_queue, unreachable) if republish else 0,
+        "republished": (
+            await _republish(task_queue, unreachable, already_queued=depth) if republish else 0
+        ),
         "tenants": [_accounting_dict(tenant) for tenant in accounting],
     }
 
@@ -125,19 +128,31 @@ async def reconcile(
 async def _republish(
     task_queue: Celery,
     unreachable: Sequence[tuple[TenantId, ObservationId, JobId]],
+    *,
+    already_queued: int,
 ) -> int:
-    """Publish one message per claimable row, oldest observation first.
+    """Publish one message per claimable row the queue cannot already hold, oldest first.
 
-    Publishing for a row that still has a message is harmless: the claim only moves a row in
-    `pending`, `failed`, or stale `running`, so whichever delivery loses the race no-ops. Order
-    is preserved because a question can need every observation before its cutoff.
+    The ledger says a row is owed work; it cannot say whether a message for it survives, and no
+    transport answers that per message. The count does: the queue holds `already_queued`
+    messages for this job type and nothing else, so at most `claimable - already_queued` rows
+    have none. Publishing to that bound repairs a queue that lost messages and leaves a healthy
+    backlog alone.
+
+    Both halves matter because a duplicate is not a no-op. The delivery that loses the claim
+    gets `RUNNING`, and the task re-queues itself every 30 seconds up to 40 times waiting for the
+    winner, so one duplicate is up to 40 more round trips. Republishing a deep backlog wholesale
+    is how a repair becomes the outage.
+
+    Oldest first, because kombu consumes with `RPOP`: the messages still queued are the most
+    recently published, so the rows whose message is gone are at the front of this list. Order
+    is preserved anyway, because a question can need every observation before its cutoff.
     """
+    owed = unreachable[: max(len(unreachable) - already_queued, 0)]
     publisher = CeleryObservationJobPublisher(task_queue)
-    published = 0
-    for tenant_id, observation_id, job_id in unreachable:
+    for tenant_id, observation_id, job_id in owed:
         await publisher.publish_observation_processing_job(tenant_id, observation_id, job_id)
-        published += 1
-    return published
+    return len(owed)
 
 
 def _accounting_dict(accounting: ObservationJobAccounting) -> dict[str, object]:
@@ -169,8 +184,9 @@ def _parser(prog: str | None = None) -> argparse.ArgumentParser:
         "--republish",
         action="store_true",
         help=(
-            "publish one message per claimable row. Without it nothing is written, because "
-            "each message that lands spends generator tokens"
+            "publish one message per claimable row the queue cannot already hold, oldest "
+            "first. Without it nothing is written, because each message that lands spends "
+            "generator tokens"
         ),
     )
     return parser

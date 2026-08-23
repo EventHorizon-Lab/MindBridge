@@ -94,8 +94,12 @@ matching SHA-256. MCP does not upload bytes.
 ### `memory_recall`
 
 Modes are `answer` (default), `search`, and `enumerate`. Returns the answer, a confidence, the
-memories it rests on, and signed evidence URLs pointing at exact `start_ms`–`end_ms` slices of
-the original recording — so the agent can verify rather than trust.
+memories it rests on, and signed evidence URLs — so the agent can verify rather than trust.
+
+`start_ms`–`end_ms` locate the span inside the original recording, and `media_url` is signed
+media *covering* that span rather than a byte-exact cut of it: normally a clip derived for the
+span, whose own timeline starts at zero and which may run wider than the cited range, and
+otherwise the whole source object. Play the bytes; do not seek to `start_ms` inside them.
 
 For a grounded follow-up, pass `memory_ids` from the previous result. It is a strict scope.
 

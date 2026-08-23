@@ -34,14 +34,55 @@ async def test_queue_depth_reads_the_queue_the_worker_consumes() -> None:
 
 async def test_republishing_sends_one_message_per_claimable_row() -> None:
     task_queue = _memory_queue("republish-test")
-    claimable = tuple(
-        (TenantId("tenant_01"), ObservationId(f"obs_{index}"), JobId(f"job_process_obs_{index}"))
-        for index in range(3)
-    )
 
-    published = await _republish(task_queue, claimable)
+    published = await _republish(task_queue, _claimable(3), already_queued=0)
 
     assert (published, queue_depth(task_queue)) == (3, 3)
+
+
+async def test_republishing_leaves_the_backlog_the_queue_already_holds_alone() -> None:
+    """Every claimable row was republished, so a healthy backlog was duplicated message for
+    message -- and a duplicate is not a no-op: the losing delivery claims nothing and the task
+    then re-queues itself every 30s up to 40 times."""
+    task_queue = _memory_queue("republish-bound-test")
+    publisher = CeleryObservationJobPublisher(task_queue)
+    for _, observation_id, job_id in _claimable(3)[1:]:
+        await publisher.publish_observation_processing_job(
+            TenantId("tenant_01"), observation_id, job_id
+        )
+
+    published = await _republish(task_queue, _claimable(3), already_queued=2)
+
+    assert (published, queue_depth(task_queue)) == (1, 3)
+    # And it is the oldest row that was published: kombu consumes with RPOP, so the messages
+    # still queued are the newest ones and the row with none is at the front of the list.
+    assert _drain(task_queue)[-1] == "job_process_obs_0"
+
+
+async def test_republishing_publishes_nothing_when_the_queue_holds_every_row() -> None:
+    task_queue = _memory_queue("republish-full-test")
+
+    assert await _republish(task_queue, _claimable(3), already_queued=5) == 0
+    assert queue_depth(task_queue) == 0
+
+
+def _claimable(count: int) -> tuple[tuple[TenantId, ObservationId, JobId], ...]:
+    """Claimable rows in the order the ledger returns them, oldest first."""
+    return tuple(
+        (TenantId("tenant_01"), ObservationId(f"obs_{index}"), JobId(f"job_process_obs_{index}"))
+        for index in range(count)
+    )
+
+
+def _drain(task_queue: Celery) -> list[str]:
+    """Take every message off the queue and name the job each one carries."""
+    job_ids = []
+    with task_queue.connection_for_read() as connection:
+        channel = connection.default_channel
+        while message := channel.basic_get(queue=str(task_queue.conf.task_default_queue)):
+            message.ack()
+            job_ids.append(message.properties["correlation_id"])
+    return job_ids
 
 
 def _memory_queue(name: str) -> Celery:

@@ -463,3 +463,34 @@ def _image_bytes(*, width: int, height: int) -> bytes:
     buffer = io.BytesIO()
     Image.fromarray(array).save(buffer, format="PNG")
     return buffer.getvalue()
+
+
+def test_a_one_frame_video_clip_is_repeated_rather_than_left_unembeddable() -> None:
+    """`_sampled_window` widens the window asked for, not the frames a source can deliver.
+
+    Two sources still reach the encoder with one frame: one shorter than the widened window,
+    and one whose own frame rate is below the requested sampling. A one-frame video raises
+    `t:1 must be larger than temporal_factor:2` at the embed call and takes the whole
+    observation down with it, so the frame is repeated instead.
+    """
+    import av
+
+    shorter_than_its_window = _video_bytes(seconds=0.5, fps=10, width=160, height=120)
+    slower_than_the_sampling = _video_bytes(seconds=4.0, fps=1, width=160, height=120)
+
+    for source, request in (
+        (
+            shorter_than_its_window,
+            ClipRequest(kind=MediaKind.VIDEO, start_ms=0, end_ms=2_000, frames_per_second=1.0),
+        ),
+        (
+            slower_than_the_sampling,
+            ClipRequest(kind=MediaKind.VIDEO, start_ms=0, end_ms=500, frames_per_second=4.0),
+        ),
+    ):
+        clips = cut_clips(source, request)
+
+        with av.open(io.BytesIO(clips[0].content), mode="r") as container:
+            decoded = list(container.decode(container.streams.video[0]))
+        assert len(decoded) >= 2
+        assert decoded[0].time != decoded[1].time

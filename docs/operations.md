@@ -143,8 +143,11 @@ mindbridge jobs --tenant-id tenant_01 --republish
 ```
 
 Reporting is the default because republishing spends money: every message that lands runs a
-generator. Read `claimable` first. A non-zero count beside an empty `queue_depth` is exactly this
-divergence; a non-zero count beside a deep queue usually just means the workers are behind.
+generator. Read `claimable` against `queue_depth`. A non-zero count beside an empty `queue_depth`
+is exactly this divergence; a non-zero count beside a deep queue usually just means the workers
+are behind, and `--republish` will publish only the difference. The queue already holds a message
+for the rest, and duplicating those is not free: the delivery that loses the claim re-queues
+itself every 30 seconds up to 40 times waiting for the winner.
 
 The same report answers "who is consuming the worker", ordered by `work_seconds` — total worker
 time across every attempt, including the attempt in flight. Both durations and both token counts

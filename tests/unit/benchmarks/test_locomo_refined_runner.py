@@ -19,6 +19,7 @@ from mindbridge.contracts import (
     RememberRequest,
 )
 from mindbridge.core import MemoryState, VerificationStatus
+from mindbridge.sdk import MindBridgeError
 
 NOW = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
 
@@ -150,6 +151,50 @@ async def test_locomo_refined_uses_the_same_recall_budget_for_every_question_wor
     )
 
     assert api.recall_requests[0].limit == 20
+
+
+async def test_locomo_refined_keeps_stored_turns_when_one_turn_fails_to_remember() -> None:
+    """A turn that cannot be written used to discard every turn written beside it."""
+
+    class FailingMemoryApi(RecordingMemoryApi):
+        async def remember(self, request: RememberRequest) -> MemoryView:
+            if request.idempotency_key == "locomo_refined_v1:conv-26:D1:2":
+                raise MindBridgeError(
+                    "turn could not be written",
+                    code="model_request_failed",
+                    status_code=502,
+                    trace_id="trace_ingest_error",
+                )
+            return await super().remember(request)
+
+    api = FailingMemoryApi()
+    api.answer = "A new course."
+    conversation = _conversation().model_copy(
+        update={
+            "turns": tuple(
+                LoCoMoRefinedTurn(
+                    dialog_id=dialog_id,
+                    speaker="Caroline",
+                    text=f"turn {dialog_id}",
+                    occurred_at=NOW,
+                )
+                for dialog_id in ("D1:1", "D1:2", "D1:3")
+            )
+        }
+    )
+
+    predictions = await run_locomo_refined_conversation(
+        cast(MindBridge, api), conversation, run_id="run_01"
+    )
+
+    assert [request.summary for request in api.remember_requests] == [
+        'Caroline said: "turn D1:1"',
+        'Caroline said: "turn D1:3"',
+    ]
+    assert predictions[0].predicted_answer == "A new course."
+    # The surviving turns must still resolve to their own dialog ids, not shift onto the dead one.
+    assert predictions[0].mindbridge_prediction_context == ("D1:1",)
+    assert predictions[0].mindbridge_ingest_failure_count == 1
 
 
 def _conversation() -> LoCoMoRefinedConversation:

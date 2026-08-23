@@ -82,6 +82,14 @@ MAX_PROXY_SAMPLED_FRAMES = 40
 # The other end of the same bound, and the reason `_sampled_window` exists: Qwen3-VL's video
 # processor merges frames in temporal pairs, so anything it is given has to carry at least two.
 MIN_SAMPLED_FRAMES = 2
+# How far that floor may reach in wall clock, which is not the same bound. Two sampling
+# intervals is a length only once the rate is fixed, and the rate is a deployment setting:
+# `{"frames_per_second": 0.2}` made the floor ten seconds, so every prompt-v11 event -- 2 to 5
+# seconds of them -- was cut as a ten second clip that recall then attached and the answering
+# model then read. Past this the clip samples its own window faster instead, which lands the
+# same two frames on a span that still means what it says. The number is the floor the default
+# 1 fps already produces: that is the widening evidence resolution was measured against.
+MAX_SAMPLING_FLOOR_MS = 2_000
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,6 +119,14 @@ class DerivedEvidenceClips:
 
 
 @dataclass(frozen=True, slots=True)
+class _StoredProxy:
+    """One uploaded generation proxy and the sampling it was really cut at."""
+
+    download: PresignedMediaDownload
+    frames_per_second: float
+
+
+@dataclass(frozen=True, slots=True)
 class _StoredClip:
     """One uploaded clip, holding metadata only so bytes can be released."""
 
@@ -119,6 +135,7 @@ class _StoredClip:
     start_ms: int
     end_ms: int
     media_object: MediaObject
+    frames_per_second: float
 
 
 @operation_span("mindbridge.evidence_clips.derive")
@@ -267,8 +284,8 @@ async def _derive_generation_proxies(
 
     semaphore = asyncio.Semaphore(max_concurrency)
     proxies = {
-        media_object_id: download
-        for media_object_id, download in zip(
+        media_object_id: proxy
+        for media_object_id, proxy in zip(
             groups,
             await asyncio.gather(
                 *(
@@ -287,17 +304,20 @@ async def _derive_generation_proxies(
             ),
             strict=True,
         )
-        if download is not None
+        if proxy is not None
     }
     set_current_span_attributes({"mindbridge.generation_proxy.count": len(proxies)})
     return tuple(
         item
-        if (download := proxies.get(item.media_object.media_object_id)) is None
+        if (proxy := proxies.get(item.media_object.media_object_id)) is None
         else replace(
             item,
-            media_url=download.download_url,
-            media_url_expires_at=download.expires_at,
-            sampled_frames_per_second=sampling.frames_per_second,
+            media_url=proxy.download.download_url,
+            media_url_expires_at=proxy.download.expires_at,
+            # The rate the copy was cut at, not the one asked for: a proxy sampled faster than
+            # the setting because its window was too short is a copy the generator has to be
+            # told about, or it re-samples it back down to one frame.
+            sampled_frames_per_second=proxy.frames_per_second,
             sampled_max_pixels=sampling.max_pixels,
         )
         for item in evidence
@@ -314,7 +334,7 @@ async def _store_generation_proxy(
     cut: Callable[[bytes, ClipRequest], MediaClip],
     semaphore: asyncio.Semaphore,
     uploaded: list[MediaObject],
-) -> PresignedMediaDownload | None:
+) -> _StoredProxy | None:
     """Cut, store, and sign one sampled copy covering every span read from one source.
 
     Everything here is best-effort, storage included. Reading a source, writing a copy and
@@ -322,7 +342,7 @@ async def _store_generation_proxy(
     to the untouched source rather than fail an attempt whose perception would have succeeded.
     """
     source_object = items[0].media_object
-    start_ms, end_ms = _sampled_window(
+    start_ms, end_ms, frames_per_second = _sampled_window(
         min(item.evidence_span.start_ms for item in items),
         max(item.evidence_span.end_ms for item in items),
         source_object.kind,
@@ -332,7 +352,7 @@ async def _store_generation_proxy(
         kind=source_object.kind,
         start_ms=start_ms,
         end_ms=end_ms,
-        frames_per_second=sampling.frames_per_second,
+        frames_per_second=frames_per_second,
         max_pixels=sampling.max_pixels,
         include_audio=sampling.proxy_audio,
     )
@@ -375,7 +395,10 @@ async def _store_generation_proxy(
             )
             await store.upload_media(media_object, proxy.content)
             uploaded.append(media_object)
-            return await store.create_presigned_download(media_object)
+            return _StoredProxy(
+                await store.create_presigned_download(media_object),
+                request.frames_per_second,
+            )
         except Exception as error:
             # Deliberately broad, and covering storage as well as the encoder: the muxer raises a
             # bare ValueError for a span it will not interleave, PyAV raises IndexError for a
@@ -405,7 +428,7 @@ async def _store_source_group(
         stored: list[_StoredClip] = []
         for item in items:
             span = item.evidence_span
-            start_ms, end_ms = _sampled_window(
+            start_ms, end_ms, frames_per_second = _sampled_window(
                 span.start_ms,
                 span.end_ms,
                 item.media_object.kind,
@@ -415,7 +438,7 @@ async def _store_source_group(
                 kind=item.media_object.kind,
                 start_ms=start_ms,
                 end_ms=end_ms,
-                frames_per_second=sampling.frames_per_second,
+                frames_per_second=frames_per_second,
                 max_pixels=sampling.max_pixels,
                 image_max_pixels=sampling.image_max_pixels,
                 region=_span_region(span),
@@ -431,6 +454,7 @@ async def _store_source_group(
                         start_ms=clip.start_ms,
                         end_ms=clip.end_ms,
                         media_object=media_object,
+                        frames_per_second=frames_per_second,
                     )
                 )
         del source
@@ -466,7 +490,7 @@ async def _embed_stored_clips(
                             url=urls[item.media_object.media_object_id],
                             source_uri=item.media_object.uri,
                             frames_per_second=_video_only(
-                                sampling.frames_per_second, item.media_object.kind
+                                item.frames_per_second, item.media_object.kind
                             ),
                             max_pixels=_video_only(sampling.max_pixels, item.media_object.kind),
                         ),
@@ -511,7 +535,7 @@ def _sampled_window(
     end_ms: int,
     kind: MediaKind,
     frames_per_second: float,
-) -> tuple[int, int]:
+) -> tuple[int, int, float]:
     """Widen a video span too short to sample twice, as the ceiling narrows one sampled too often.
 
     The sampler takes a frame at the start of the span and one every interval after it, so a span
@@ -529,14 +553,24 @@ def _sampled_window(
 
     Widening runs backwards by preference: media starts at zero, so earlier is always inside the
     source, while later may be past its end -- and a window past the end samples nothing new.
+
+    Two intervals of window is only two frames while the rate can fill it, and how long that
+    window is in seconds is a deployment setting, so the reach is capped and the returned rate
+    makes up whatever the cap took away. Both bounds are needed: the window is what covers a
+    source whose own frames are sparser than the sampling, and the rate is what keeps a slow
+    deployment setting from stretching a two second event into ten seconds of clip.
     """
     if kind is not MediaKind.VIDEO:
-        return start_ms, end_ms
-    minimum_ms = ceil(1_000 * MIN_SAMPLED_FRAMES / frames_per_second)
+        return start_ms, end_ms, frames_per_second
+    minimum_ms = min(MAX_SAMPLING_FLOOR_MS, ceil(1_000 * MIN_SAMPLED_FRAMES / frames_per_second))
+    # One millisecond at the least, because the divisor below has to be positive: a point span
+    # and a frame rate high enough to floor the minimum leave nothing else between them.
+    window_ms = max(end_ms - start_ms, minimum_ms, 1)
+    sampled_per_second = max(frames_per_second, 1_000 * MIN_SAMPLED_FRAMES / window_ms)
     if end_ms - start_ms >= minimum_ms:
-        return start_ms, end_ms
+        return start_ms, end_ms, sampled_per_second
     widened_start_ms = max(0, end_ms - minimum_ms)
-    return widened_start_ms, widened_start_ms + minimum_ms
+    return widened_start_ms, widened_start_ms + minimum_ms, sampled_per_second
 
 
 def _video_only(value: _Budget, kind: MediaKind) -> _Budget | None:

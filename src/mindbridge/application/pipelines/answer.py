@@ -25,7 +25,10 @@ from mindbridge.application.capabilities import (
     TextPart,
 )
 from mindbridge.application.perception import ResolvedEvidence
-from mindbridge.application.pipelines.evidence import evidence_parts
+from mindbridge.application.pipelines.evidence import (
+    DEFAULT_MAX_EVIDENCE_MEDIA_PARTS,
+    evidence_parts,
+)
 from mindbridge.application.pipelines.structured import generate_json, unwrap_json_code_fence
 from mindbridge.application.ports import GeneratedAnswer, ResolvedQueryMedia
 from mindbridge.contracts import RecallRequest
@@ -49,6 +52,14 @@ _TemporalOrder = Literal["relevance", "newest", "oldest"]
 _DEFAULT_TEMPORAL_ORDER: _TemporalOrder = "relevance"
 # What GeneratedAnswer accepts, and what the prompt asks for: at most two follow-up queries.
 _MAX_RETRIEVAL_QUERIES = 2
+
+# Query media is attached as the caller uploaded it. Nothing is substituted for it: a derived clip
+# is cut per evidence span, and an object asked *with* is not a span of anything, so what goes on
+# the wire is a full-resolution source -- ~12.3k prompt tokens against ~1.65k for a clip, and four
+# of them in one call is the measured 60 s gateway timeout. So it is charged what it costs against
+# the one ceiling the whole request shares, rather than a second ceiling of its own: at most three
+# query objects are attached, and each one attached is eight evidence clips that are not.
+QUERY_MEDIA_PART_COST = 8
 
 _NonEmptyAnswer = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 _RetrievalQuery = Annotated[
@@ -245,13 +256,11 @@ def _recall_parts(
             "</recall_context>"
         )
     ]
-    seen_media_object_ids: set[str] = set()
-    for item in query_media:
-        media_object_id = item.media_object.media_object_id
-        seen_media_object_ids.add(media_object_id)
+    attached_query_media = query_media[: DEFAULT_MAX_EVIDENCE_MEDIA_PARTS // QUERY_MEDIA_PART_COST]
+    for item in attached_query_media:
         parts.extend(
             (
-                TextPart(f"Query media_object_id={media_object_id} follows."),
+                TextPart(f"Query media_object_id={item.media_object.media_object_id} follows."),
                 MediaPart(
                     kind=item.media_object.kind,
                     url=item.media_url,
@@ -259,7 +268,18 @@ def _recall_parts(
                 ),
             )
         )
-    parts.extend(evidence_parts(evidence, excluded_media_object_ids=seen_media_object_ids))
+    parts.extend(
+        evidence_parts(
+            evidence,
+            # Excluding the query object's *id* would drop the derived clips of every span cut
+            # from it, which on a media query is exactly the evidence being asked about. What
+            # must not be sent twice is one set of bytes.
+            excluded_media_urls={item.media_url for item in attached_query_media},
+            max_media_parts=(
+                DEFAULT_MAX_EVIDENCE_MEDIA_PARTS - QUERY_MEDIA_PART_COST * len(attached_query_media)
+            ),
+        )
+    )
     final_input = json.dumps(
         {
             "question": request.query.text,

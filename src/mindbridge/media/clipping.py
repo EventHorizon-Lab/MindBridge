@@ -295,6 +295,19 @@ def _cut_video(source: bytes, request: ClipRequest) -> MediaClip:
             resized.pts = round(((frame.time or 0.0) - first_seconds) * 1_000)
             resized.time_base = stream.time_base
             container.mux(stream.encode(resized))
+        if len(sampled) == 1:
+            # `_sampled_window` widens the window a span is cut from, which cannot help a source
+            # that is shorter than the widened window or whose own frame rate is below the
+            # sampling. Those still arrive here with one frame, and a one-frame video is not a
+            # video to a Qwen3-VL encoder: `t:1 must be larger than temporal_factor:2` fails the
+            # embed and the observation behind it. A repeated frame is a still, which is what a
+            # span this sparse holds anyway, and it is embeddable.
+            repeated = sampled[0].reformat(width=width, height=height, format="yuv420p")
+            # Two sampling intervals on, because whatever reads this clip samples it at the same
+            # rate: one interval is the instant a frame served late already misses.
+            repeated.pts = round(2_000 / request.frames_per_second)
+            repeated.time_base = stream.time_base
+            container.mux(stream.encode(repeated))
         container.mux(stream.encode())
     return MediaClip(
         content=buffer.getvalue(),

@@ -14,6 +14,7 @@ import httpx
 import openai
 from openai import AsyncOpenAI, AsyncStream, Omit, omit
 from openai.types.chat import ChatCompletionChunk, ChatCompletionMessageParam
+from openai.types.completion_usage import CompletionUsage
 from openai.types.create_embedding_response import CreateEmbeddingResponse
 from openai.types.shared import ReasoningEffort
 from openai.types.shared_params import ResponseFormatJSONObject
@@ -453,24 +454,34 @@ async def _consume_completion_stream(
     finish_reason: str | None = None
     system_fingerprint: str | None = None
     first_token_at: float | None = None
-    async for chunk in stream:
-        system_fingerprint = system_fingerprint or chunk.system_fingerprint
-        if chunk.usage is not None:
+    charged: CompletionUsage | None = None
+    try:
+        async for chunk in stream:
+            system_fingerprint = system_fingerprint or chunk.system_fingerprint
+            # Kept rather than reported here: the token account accumulates what it is given,
+            # and a server with `continuous_usage_stats` repeats the running total on every
+            # chunk, which would bill the request once per chunk. Each report supersedes the
+            # last, so the final one is the charge.
+            charged = chunk.usage or charged
+            for choice in chunk.choices:
+                if choice.index != 0:
+                    continue
+                if choice.delta.content:
+                    if first_token_at is None:
+                        first_token_at = perf_counter()
+                    parts.append(choice.delta.content)
+                finish_reason = finish_reason or choice.finish_reason
+    finally:
+        # Reported even when the stream drops mid-body: the partial response was still billed,
+        # and the failed attempt carries that charge into its job row.
+        if charged is not None:
             set_current_span_attributes(
                 {
-                    "mindbridge.model.input_tokens": chunk.usage.prompt_tokens,
-                    "mindbridge.model.output_tokens": chunk.usage.completion_tokens,
-                    "mindbridge.model.total_tokens": chunk.usage.total_tokens,
+                    "mindbridge.model.input_tokens": charged.prompt_tokens,
+                    "mindbridge.model.output_tokens": charged.completion_tokens,
+                    "mindbridge.model.total_tokens": charged.total_tokens,
                 }
             )
-        for choice in chunk.choices:
-            if choice.index != 0:
-                continue
-            if choice.delta.content:
-                if first_token_at is None:
-                    first_token_at = perf_counter()
-                parts.append(choice.delta.content)
-            finish_reason = finish_reason or choice.finish_reason
     return _StreamedCompletion(
         text="".join(parts),
         finish_reason=finish_reason,

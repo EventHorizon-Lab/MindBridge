@@ -2,6 +2,7 @@
 
 import asyncio
 from collections.abc import Awaitable, Mapping
+from datetime import datetime, timezone
 from typing import cast
 from unittest.mock import Mock
 
@@ -15,12 +16,21 @@ from pydantic import ValidationError
 
 import mindbridge.worker as worker_module
 from mindbridge.application.capabilities import Embedder, EmbedRequest, EmbedResult
-from mindbridge.application.evidence_clips import ClipSampling
+from mindbridge.application.evidence_clips import (
+    MAX_PROXY_SAMPLED_FRAMES,
+    MAX_SAMPLING_FLOOR_MS,
+    ClipSampling,
+)
 from mindbridge.core import (
     DatabaseUnavailableError,
+    JobId,
     JobState,
     ModelUnavailableError,
     ObjectStorageError,
+    ObservationId,
+    ObservationJobClaim,
+    ObservationProcessingJob,
+    TenantId,
 )
 from mindbridge.infrastructure.task_queue import (
     PROCESS_OBSERVATION_TASK,
@@ -59,32 +69,49 @@ def test_worker_text_encoder_shares_the_deployment_wide_embedder_contract() -> N
     assert settings.text_embedder_config["dimension"] == settings.media_embedder_config["dimension"]
 
 
-def test_worker_reuses_and_closes_media_plugin_on_its_own_event_loop(
+def test_worker_reuses_and_closes_both_embedder_plugins_on_its_own_event_loop(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    creation_loops: list[asyncio.AbstractEventLoop] = []
+    """Both encoder slots are loaded once per child, not once per delivery.
+
+    The text slot was loaded inside the task and released with a `close_model` the bundled
+    encoder does not implement, so every observation re-allocated its weights -- and that
+    allocation happened before `ProcessObservation` claims the ledger row. With
+    `task_acks_late` an out-of-memory error there acks and drops the message while the row
+    stays `pending`, which is how the 2026-08-21 evaluation turned 479 CUDA out-of-memory
+    errors into ~17 `failed` rows and ~318 stranded `pending` ones.
+    """
+    creations: list[tuple[str, asyncio.AbstractEventLoop]] = []
     processing_loops: list[asyncio.AbstractEventLoop] = []
-    closing_loops: list[asyncio.AbstractEventLoop] = []
+    closed: list[str] = []
 
     class LoopBoundEmbedder:
+        def __init__(self, plugin: str) -> None:
+            self.plugin = plugin
+
         async def embed(self, _request: EmbedRequest) -> EmbedResult:
             raise AssertionError("the lifecycle check does not invoke embedding")
 
         async def close(self) -> None:
-            closing_loops.append(asyncio.get_running_loop())
+            assert asyncio.get_running_loop() is creations[0][1]
+            closed.append(self.plugin)
 
-    embedder = LoopBoundEmbedder()
-
-    def load(_plugin: str, _config: Mapping[str, object]) -> LoopBoundEmbedder:
-        creation_loops.append(asyncio.get_running_loop())
-        return embedder
+    def load(plugin: str, _config: Mapping[str, object]) -> LoopBoundEmbedder:
+        creations.append((plugin, asyncio.get_running_loop()))
+        return LoopBoundEmbedder(plugin)
 
     async def process(
-        _settings: object,
-        media_embedder: object,
+        settings: WorkerSettings,
+        runtime: worker_module._WorkerRuntime,
         *_identifiers: object,
     ) -> JobState:
-        assert media_embedder is embedder
+        # The stand-in asks for the encoders where the real delivery does, inside the store it
+        # has open: that is what makes an out-of-memory error there a recorded failure rather
+        # than a dropped message.
+        media_embedder, text_embedder = await runtime.encoders(settings)
+        assert isinstance(media_embedder, LoopBoundEmbedder)
+        assert isinstance(text_embedder, LoopBoundEmbedder)
+        assert (media_embedder.plugin, text_embedder.plugin) == ("jina", "openai")
         processing_loops.append(asyncio.get_running_loop())
         return JobState.SUCCEEDED
 
@@ -99,9 +126,107 @@ def test_worker_reuses_and_closes_media_plugin_on_its_own_event_loop(
     finally:
         worker_module._dispose_worker_runtime()
 
-    assert len(creation_loops) == 1
-    assert processing_loops == creation_loops * 2
-    assert closing_loops == creation_loops
+    # Two deliveries, one load per slot: nothing is re-allocated per observation.
+    assert [plugin for plugin, _loop in creations] == ["jina", "openai"]
+    assert processing_loops == [creations[0][1]] * 2
+    assert sorted(closed) == ["jina", "openai"]
+
+
+class _RecordingJobStore:
+    """The ledger half of the store the Worker opens, recording only its job writes."""
+
+    def __init__(self) -> None:
+        self.states: list[str] = []
+        self.attempts: list[int] = []
+        self.error_codes: list[str] = []
+        self.closed = False
+
+    async def open(self) -> None:
+        return None
+
+    async def close(self) -> None:
+        self.closed = True
+
+    async def claim_observation_processing_job(
+        self,
+        tenant_id: str,
+        observation_id: str,
+        job_id: str,
+    ) -> ObservationJobClaim:
+        self.states.append("running")
+        return ObservationJobClaim(
+            job=_pending_job(JobState.RUNNING, attempt=len(self.states)),
+            acquired=True,
+        )
+
+    async def mark_observation_processing_failed(
+        self,
+        tenant_id: str,
+        observation_id: str,
+        job_id: str,
+        *,
+        attempt: int,
+        error_code: str,
+    ) -> ObservationProcessingJob:
+        self.states.append("failed")
+        self.attempts.append(attempt)
+        self.error_codes.append(error_code)
+        return _pending_job(JobState.FAILED, attempt=attempt, error_code=error_code)
+
+
+def _pending_job(
+    state: JobState,
+    *,
+    attempt: int,
+    error_code: str | None = None,
+) -> ObservationProcessingJob:
+    moment = datetime(2026, 8, 21, 12, 0, tzinfo=timezone.utc)
+    return ObservationProcessingJob(
+        job_id=JobId("job_process_observation_01"),
+        tenant_id=TenantId("tenant_01"),
+        observation_id=ObservationId("observation_01"),
+        state=state,
+        attempt=attempt,
+        error_code=error_code,
+        created_at=moment,
+        updated_at=moment,
+    )
+
+
+def test_a_model_load_failure_is_recorded_against_the_row_it_would_have_stranded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The encoder load is the first thing a fresh child does, and it can exhaust the card.
+
+    `task_acks_late` drops the message of a task that raised, so a load that fails before the
+    ledger row is claimed leaves the row `pending` with nothing left to deliver it: 479 CUDA
+    out-of-memory errors against ~17 `failed` rows and ~318 stranded `pending` ones. The setup
+    now runs inside the open store, so the same failure lands on the row as a recorded state.
+    """
+    store = _RecordingJobStore()
+
+    def load(_plugin: str, _config: Mapping[str, object]) -> Embedder:
+        # torch.OutOfMemoryError is a RuntimeError subclass; the Worker cannot import torch to
+        # name it, which is also why the class cannot simply be added to `autoretry_for`.
+        raise RuntimeError("CUDA out of memory")
+
+    worker_module._dispose_worker_runtime()
+    monkeypatch.setattr(worker_module, "load_embedder", load)
+    monkeypatch.setattr(worker_module, "PostgresMemoryStore", lambda *_a, **_k: store)
+    settings = WorkerSettings.from_environment(_environment())
+    message = ObservationProcessingTaskMessage(**_task_message())
+    try:
+        with pytest.raises(RuntimeError, match="CUDA out of memory"):
+            worker_module.run_observation_processing(settings, message)
+    finally:
+        worker_module._dispose_worker_runtime()
+
+    # Claimed only in order to record: the row is `running` for the length of one write, so a
+    # child killed outright still leaves `pending`, which `mindbridge jobs` republishes at once.
+    assert store.states == ["running", "failed"]
+    assert store.attempts == [1]
+    assert store.error_codes == ["worker_setup_failed"]
+    assert store.closed is True
 
 
 def test_worker_cancels_a_delivery_interrupted_outside_its_task(
@@ -130,7 +255,7 @@ def test_worker_cancels_a_delivery_interrupted_outside_its_task(
 
     monkeypatch.setattr(worker_module, "_process_observation_once", process)
     monkeypatch.setattr(loop, "run_until_complete", interrupt_once)
-    runtime = worker_module._WorkerRuntime(loop, cast(Embedder, object()))
+    runtime = worker_module._WorkerRuntime(loop)
     try:
         with pytest.raises(SoftTimeLimitExceeded):
             runtime.run(
@@ -250,6 +375,26 @@ def test_worker_reads_media_sampling_from_the_environment() -> None:
     assert settings.clip_sampling.proxy_audio is False
 
 
+def test_worker_accepts_the_highest_rate_a_generation_proxy_can_still_carry() -> None:
+    """The bound is the media layer's own ceiling, so the rate that reaches it must pass.
+
+    `MAX_PROXY_SAMPLED_FRAMES` over `MAX_SAMPLING_FLOOR_MS`: 40 frames across the 2 s window a
+    short span is widened to. Reading both from `evidence_clips` rather than restating 20.0 is
+    what keeps this from drifting when either constant is measured again.
+    """
+    settings = WorkerSettings.from_environment(
+        {
+            **_environment(),
+            "MINDBRIDGE_MEDIA_SAMPLING_CONFIG_JSON": (
+                '{"frames_per_second": %s}'
+                % (MAX_PROXY_SAMPLED_FRAMES / (MAX_SAMPLING_FLOOR_MS / 1_000))
+            ),
+        }
+    )
+
+    assert settings.clip_sampling.frames_per_second == 20.0
+
+
 def test_worker_media_sampling_defaults_keep_the_documented_encoder_budget() -> None:
     """An unset deployment must behave exactly as it did before the knob existed."""
     settings = WorkerSettings.from_environment(_environment())
@@ -266,12 +411,21 @@ def test_worker_media_sampling_defaults_keep_the_documented_encoder_budget() -> 
         '{"frames_per_second": "0.5"}',
         '{"max_pixels": 1.5}',
         '{"frames_per_second": 0}',
+        # `json.loads` parses these out of the environment variable, and `gt=0` admitted the
+        # first: it reached the media layer as a frame rate and was caught by a downstream
+        # invariant rather than by the boundary it entered through.
+        '{"frames_per_second": Infinity}',
+        '{"frames_per_second": NaN}',
+        # Past 20 fps the generation proxy is skipped for every event long enough to be widened
+        # to the sampling floor, so the knob would switch off the feature it is tuning.
+        '{"frames_per_second": 20.5}',
     ],
 )
 def test_worker_rejects_a_malformed_media_sampling_knob(config: str) -> None:
     """A typo in an optional tuning knob must fail startup, not silently mean something else.
     `"false"` is a truthy string, and a quoted or floating pixel count would reach a budget
-    comparison as the wrong type."""
+    comparison as the wrong type. A rate can also be well-formed and still mean nothing the
+    media layer can serve: `Infinity`, and anything past the proxy frame ceiling."""
     with pytest.raises(ValueError):
         WorkerSettings.from_environment(
             {**_environment(), "MINDBRIDGE_MEDIA_SAMPLING_CONFIG_JSON": config}
@@ -292,14 +446,75 @@ def test_worker_refuses_to_fork_an_in_process_encoder_into_every_child() -> None
 
     message = str(failure.value)
     assert "MINDBRIDGE_MEDIA_EMBEDDER_PLUGIN=jina" in message
-    # The arithmetic, not just the objection: 6 x 3.7 GiB of VRAM and 6 x 1.4 GiB resident.
+    # The arithmetic, not just the objection: 6 x 3.7 GiB of VRAM and 6 x 1.4 GiB resident,
+    # past the default budget of one copy that keeps this configuration refused by default.
     assert "22.2 GiB of VRAM" in message
     assert "8.4 GiB of resident host memory" in message
+
+
+def test_worker_counts_every_in_process_slot_it_names() -> None:
+    """A child holding two cached encoders holds two copies, which the estimate has to say.
+
+    The 2026-08-21 evaluation ran `jina` in both Worker slots. The message named both
+    variables and then quoted the arithmetic for one of them, understating the card by half.
+    """
+    settings = WorkerSettings.from_environment(_both_slots_in_process())
+
+    with pytest.raises(ValueError) as failure:
+        require_bounded_in_process_models(settings, 6)
+
+    message = str(failure.value)
+    assert "MINDBRIDGE_EMBEDDER_PLUGIN=jina" in message
+    # Two cached models per child, six children: 12 x 3.7 GiB and 12 x 1.4 GiB.
+    assert "44.4 GiB of VRAM" in message
+    assert "16.8 GiB of resident host memory" in message
 
 
 def test_worker_allows_one_child_to_hold_an_in_process_encoder() -> None:
     """One resident copy is the shape the deployment guide recommends, not a defect."""
     require_bounded_in_process_models(WorkerSettings.from_environment(_environment()), 1)
+
+
+def test_worker_allows_many_children_when_the_encoder_holds_no_device() -> None:
+    """`device=cpu` costs no VRAM, so refusing it cites a budget the run cannot exhaust."""
+    settings = WorkerSettings.from_environment(
+        {**_environment(), "MINDBRIDGE_MEDIA_EMBEDDER_DEVICE": "cpu"}
+    )
+
+    require_bounded_in_process_models(settings, 4)
+
+
+def test_worker_allows_many_workers_in_a_pool_that_shares_one_process() -> None:
+    """`--pool=threads` runs one process, so its concurrency is not a device budget."""
+    settings = WorkerSettings.from_environment(_environment())
+
+    require_bounded_in_process_models(settings, 6, pool="threads")
+    require_bounded_in_process_models(settings, 6, pool="solo")
+
+
+def test_worker_lets_a_larger_card_declare_the_budget_it_actually_has() -> None:
+    """A guard with no way to say yes gets routed around, which is what --autoscale did.
+
+    3.7 GiB per copy was measured on one RTX 5090. A card that can hold six copies has to be
+    able to say so in a number rather than by reaching for a flag the guard cannot see.
+    """
+    settings = WorkerSettings.from_environment(
+        {**_environment(), "MINDBRIDGE_WORKER_VRAM_BUDGET_GIB": "48"}
+    )
+
+    require_bounded_in_process_models(settings, 6)
+
+    with pytest.raises(ValueError, match=r"48\.0 GiB"):
+        require_bounded_in_process_models(settings, 14)
+
+
+@pytest.mark.parametrize("budget", ["0", "-8", "nan"])
+def test_worker_rejects_a_vram_budget_that_bounds_nothing(budget: str) -> None:
+    """An override the guard cannot compare against would disable it rather than raise it."""
+    with pytest.raises(ValueError):
+        WorkerSettings.from_environment(
+            {**_environment(), "MINDBRIDGE_WORKER_VRAM_BUDGET_GIB": budget}
+        )
 
 
 def test_worker_allows_many_children_when_every_encoder_is_served() -> None:
@@ -312,10 +527,11 @@ def test_worker_allows_many_children_when_every_encoder_is_served() -> None:
 
 
 class _StartingWorker:
-    """A Celery worker at `worker_init`, which is where its pool size is finally known."""
+    """A Celery worker at `worker_init`, holding what Celery has settled on by then."""
 
-    def __init__(self, concurrency: int) -> None:
+    def __init__(self, concurrency: int, pool_cls: str = "prefork") -> None:
         self.concurrency = concurrency
+        self.pool_cls = pool_cls
 
 
 def test_worker_startup_refuses_rather_than_logging_and_carrying_on() -> None:
@@ -328,8 +544,37 @@ def test_worker_startup_refuses_rather_than_logging_and_carrying_on() -> None:
     """
     create_worker_app(WorkerSettings.from_environment(_environment()))
 
-    with pytest.raises(SystemExit, match="--concurrency 4"):
+    with pytest.raises(SystemExit, match="a pool of 4"):
         worker_init.send(sender=_StartingWorker(4))
+
+
+def test_worker_startup_reads_the_pool_class_celery_has_not_resolved_yet() -> None:
+    """One process holds one copy however wide it runs, so boot must not refuse it.
+
+    `pool_cls` is still the flag's own string at `worker_init`; Celery resolves it to a class
+    on the line after the signal.
+    """
+    create_worker_app(WorkerSettings.from_environment(_environment()))
+
+    worker_init.send(sender=_StartingWorker(6, pool_cls="threads"))
+
+
+def test_worker_startup_sees_the_autoscale_ceiling_the_pool_has_not_parsed_yet() -> None:
+    """`--autoscale` is what an operator refused at `--concurrency` reaches for next.
+
+    Celery sets `autoscale` and `max_concurrency` in the Pool bootstep, which runs inside
+    `blueprint.apply` -- after `worker_init` (celery 5.6.3: `worker/worker.py:127` sends the
+    signal, `worker/components.py:117-127` parses the flag). At the signal the flag is still
+    an unparsed entry in `sender.options` and `concurrency` reads this app's default of 1, so
+    reading `concurrency` alone waved through exactly the six children this refuses.
+
+    This drives a real `WorkController` rather than a stand-in, because the ordering it is
+    asserting is Celery's, not ours. Building one establishes no broker connection.
+    """
+    app = create_worker_app(WorkerSettings.from_environment(_environment()))
+
+    with pytest.raises(SystemExit, match="a pool of 6"):
+        app.Worker(autoscale=(6, 1))
 
 
 def test_worker_media_slot_reaches_a_served_encoder_without_new_variables() -> None:
@@ -406,6 +651,15 @@ def _environment() -> Mapping[str, str]:
         "MINDBRIDGE_GENERATOR_ENDPOINT": "https://generator.example.test/v1",
         "MINDBRIDGE_EMBEDDER_API_KEY": "text-embedding-secret",
         "MINDBRIDGE_EMBEDDER_ENDPOINT": "https://text.example.test/v1",
+    }
+
+
+def _both_slots_in_process() -> Mapping[str, str]:
+    """The 2026-08-21 evaluation's own shape: the bundled local encoder in both slots."""
+    return {
+        **_environment(),
+        "MINDBRIDGE_EMBEDDER_PLUGIN": "jina",
+        "MINDBRIDGE_EMBEDDER_CONFIG_JSON": '{"model_id": "jinaai/jina-embeddings-v5-omni-small-retrieval"}',
     }
 
 

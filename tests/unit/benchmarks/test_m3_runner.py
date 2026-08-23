@@ -99,6 +99,25 @@ class RecordingMemoryApi:
         )
 
 
+class IngestFailingMemoryApi(RecordingMemoryApi):
+    """Fail one clip's ingestion permanently, the way a clip the perceiver cannot read does."""
+
+    def __init__(self, failing_sequence: int) -> None:
+        super().__init__()
+        self.failing_sequence = failing_sequence
+
+    async def observe(self, request: ObserveRequest) -> ObservationReceipt:
+        if request.sequence == self.failing_sequence:
+            self.calls.append(f"observe_failed:{request.sequence}")
+            raise MindBridgeError(
+                "clip could not be observed",
+                code="model_request_failed",
+                status_code=502,
+                trace_id="trace_ingest_error",
+            )
+        return await super().observe(request)
+
+
 async def test_m3_answers_at_clip_boundaries_without_future_ingestion() -> None:
     api = RecordingMemoryApi()
     results = await run_m3_video(
@@ -354,6 +373,65 @@ def test_prepared_video_requires_contiguous_video_clips() -> None:
             duration_ms=30_000,
             identity_observations=(_identity(),),
         )
+
+
+async def test_m3_boundary_batch_survives_one_clip_that_never_ingests() -> None:
+    """A dead clip used to abort the whole video, discarding every clip already ingested."""
+    api = IngestFailingMemoryApi(1)
+    prepared = M3PreparedVideo(
+        video_id="video_01",
+        timeline_origin=NOW,
+        clips=(_clip(0), _clip(1), _clip(2)),
+    )
+    annotation = _annotation(
+        questions=(
+            M3BenchQuestion(
+                question_id="video_01_Q01",
+                question="What was visible first?",
+                reference_answer="SECRET FIRST ANSWER",
+                question_types=("Visual",),
+                before_clip_index=2,
+            ),
+        )
+    )
+
+    results = await run_m3_video(
+        cast(MindBridge, api),
+        annotation,
+        prepared,
+        run_id="run_01",
+        poll_interval_seconds=0.001,
+    )
+
+    assert [request.sequence for request in api.observe_requests] == [0, 2]
+    assert {"job:job_0:succeeded", "job:job_2:succeeded"} <= set(api.calls)
+    assert results[0].response == "grounded prediction"
+    assert results[0].mindbridge_ingest_failure_count == 1
+
+
+async def test_m3_final_batch_survives_one_clip_that_never_ingests() -> None:
+    """The trailing ingest is its own fan-out, so it needs its own accounting."""
+    api = IngestFailingMemoryApi(2)
+    prepared = M3PreparedVideo(
+        video_id="video_01",
+        timeline_origin=NOW,
+        clips=(_clip(0), _clip(1), _clip(2)),
+    )
+
+    results = await run_m3_video(
+        cast(MindBridge, api),
+        _annotation(),
+        prepared,
+        run_id="run_01",
+        poll_interval_seconds=0.001,
+    )
+
+    assert [request.sequence for request in api.observe_requests] == [0, 1]
+    assert "job:job_1:succeeded" in api.calls
+    assert results[1].response == "grounded prediction"
+    # The first question was answered before the failure, so it must not inherit it.
+    assert results[0].mindbridge_ingest_failure_count == 0
+    assert results[1].mindbridge_ingest_failure_count == 1
 
 
 def _annotation(*, questions: tuple[M3BenchQuestion, ...] | None = None) -> M3BenchVideo:

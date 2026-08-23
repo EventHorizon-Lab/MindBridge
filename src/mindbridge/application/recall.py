@@ -17,12 +17,14 @@ from mindbridge.application.capabilities import (
     ModelInput,
     TextPart,
 )
+from mindbridge.application.derive_observation_graph import representing_memory_id
 from mindbridge.application.enumeration import EnumerateMemories
 from mindbridge.application.evidence import read_resolved_memory_evidence, sign_query_media
 from mindbridge.application.perception import ResolvedEvidence
 from mindbridge.application.ports import (
     Answerer,
     EmbeddingIndex,
+    EmbeddingMatch,
     EmbeddingSearch,
     GeneratedAnswer,
     MediaUrlSigner,
@@ -516,7 +518,12 @@ class RecallMemories:
             }
         )
         return fuse_memory_rankings(
-            (evidence_memories, graph_memories, direct_memories, hierarchy_memories),
+            (
+                evidence_memories,
+                _without_shared_vector_credit(graph_memories, direct_memories, graph_matches),
+                direct_memories,
+                hierarchy_memories,
+            ),
             limit=limit,
         )
 
@@ -556,6 +563,34 @@ class RecallMemories:
 
 def _memory_ids(memories: tuple[MemoryRecord, ...]) -> tuple[MemoryId, ...]:
     return tuple(memory.memory_id for memory in memories)
+
+
+def _without_shared_vector_credit(
+    graph_memories: tuple[MemoryRecord, ...],
+    direct_memories: tuple[MemoryRecord, ...],
+    graph_matches: tuple[EmbeddingMatch, ...],
+) -> tuple[MemoryRecord, ...]:
+    """Drop the graph hit a derived memory already earned under its own object type.
+
+    `observe()` files one vector under two keys, the event or claim and the memory that
+    represents it, because the memory channel is otherwise empty and two of the four store
+    lookups below return nothing at all (see `embed_observation_graph`). Both keys then match
+    one query at the identical cosine, so the memory arrives twice: once through the graph
+    walk from its record, once through the ID lookup on itself. Fusion sums across rankings
+    because they are independent evidence, and these two are one measurement, so an
+    observe-derived memory would outrank a `remember()`-written one for no reason a similarity
+    can account for.
+
+    Only the hit itself is removed, and only where the ID lookup already returned it. A memory
+    the graph reached from some other object -- an entity name, a neighbouring event -- was
+    found by a different vector and keeps its contribution.
+    """
+    duplicated = {memory.memory_id for memory in direct_memories} & {
+        representing_memory_id(match.object_id)
+        for match in graph_matches
+        if match.object_type is not EmbeddedObjectType.ENTITY
+    }
+    return tuple(memory for memory in graph_memories if memory.memory_id not in duplicated)
 
 
 def _query_input(

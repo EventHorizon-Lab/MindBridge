@@ -3,12 +3,15 @@
 Every measurement here has two sinks and one definition. `OTEL_TRACES_EXPORTER=console` and
 `OTEL_METRICS_EXPORTER=console` render the same instruments into the process's own output, so a
 deployment with no collector can still read its stage timings and its token counts; they cannot
-disagree with what OTLP reports, because there is nothing measured twice.
+disagree with what OTLP reports, because there is nothing measured twice. What a pipeline threw
+away goes to `logging` on top of that, because that count has to survive a process configured
+for neither -- see `record_output_repairs`.
 """
 
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 import os
 import sys
@@ -32,6 +35,7 @@ if TYPE_CHECKING:
     from opentelemetry.sdk.trace import ReadableSpan, TracerProvider
     from opentelemetry.sdk.trace.export import SpanExporter
 
+_LOGGER = logging.getLogger(__name__)
 _INSTRUMENTATION_VERSION = version("mindbridge")
 _TRACER = trace.get_tracer("mindbridge", _INSTRUMENTATION_VERSION)
 _METER = metrics.get_meter("mindbridge", _INSTRUMENTATION_VERSION)
@@ -179,6 +183,29 @@ def set_current_span_attributes(attributes: Mapping[str, str | int | float | boo
     span = trace.get_current_span()
     if span.is_recording():
         span.set_attributes(attributes)
+
+
+def record_output_repairs(attributes: Mapping[str, int]) -> None:
+    """Report what a stage discarded or rewrote, on a sink no collector is needed to read.
+
+    Span attributes are the wrong and only sink these had. A span keeps them while it is
+    recording, and the deployment they matter on is the one that samples a tenth of its traces
+    into a collector it does not run -- so nine of ten of these vanish and the tenth goes
+    nowhere. What survived that is a job marked SUCCEEDED and a low census, which reads exactly
+    the same whether the model said little or this process threw most of it away.
+
+    So the counts also go to `logging`, at WARNING because that is the level an unconfigured
+    process still prints: `logging.lastResort` writes it to stderr, and every deployed process
+    here already has its output somewhere an operator looks. This is the token charge's rule
+    (`set_current_span_attributes`) applied to the other measurement a sampling decision must
+    not be allowed to lose.
+
+    A zero still reaches the trace, because "nothing was discarded" is what makes a count that
+    is not zero mean anything; only a repair that happened is worth waking a log up for.
+    """
+    set_current_span_attributes(attributes)
+    if any(attributes.values()):
+        _LOGGER.warning("model output repaired:%s", _format_attributes(attributes))
 
 
 def model_token_usage() -> Mapping[str, int]:

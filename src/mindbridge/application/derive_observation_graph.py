@@ -221,7 +221,7 @@ async def embed_observation_graph(
                     (EmbeddedObjectType.EVENT, event.event_id),
                     event.description,
                     memory_by_id,
-                    _representing_memory_id(event.event_id),
+                    representing_memory_id(event.event_id),
                 ),
             )
         )
@@ -233,7 +233,7 @@ async def embed_observation_graph(
                     (EmbeddedObjectType.CLAIM, claim.claim_id),
                     claim.statement,
                     memory_by_id,
-                    _representing_memory_id(claim.claim_id),
+                    representing_memory_id(claim.claim_id),
                 ),
             )
         )
@@ -383,19 +383,20 @@ def _claim(
     )
 
 
-def _representing_memory_id(record_id: str) -> MemoryId:
+def representing_memory_id(record_id: str) -> MemoryId:
     """Derive in one place the memory that stands for one event or claim.
 
-    Two callers need it: the builder that creates the memory, and the encoder batch that
-    indexes the memory's summary beside its record. A second copy of this derivation is a
-    silent divergence -- the vector would be filed under a memory ID that nothing stores.
+    Three callers need it: the builder that creates the memory, the encoder batch that indexes
+    the memory's summary beside its record, and recall, which has to recognise the two hits one
+    shared vector produces. A second copy of this derivation is a silent divergence -- the
+    vector would be filed under a memory ID that nothing stores.
     """
     return MemoryId(derive_stable_id("memory", record_id))
 
 
 def _event_memory(event: Event) -> MemoryRecord:
     return MemoryRecord(
-        memory_id=_representing_memory_id(event.event_id),
+        memory_id=representing_memory_id(event.event_id),
         tenant_id=event.tenant_id,
         memory_type=MemoryType.EPISODIC,
         summary=event.description,
@@ -412,7 +413,7 @@ def _event_memory(event: Event) -> MemoryRecord:
 
 def _claim_memory(claim: Claim, event: Event) -> MemoryRecord:
     return MemoryRecord(
-        memory_id=_representing_memory_id(claim.claim_id),
+        memory_id=representing_memory_id(claim.claim_id),
         tenant_id=claim.tenant_id,
         memory_type=MemoryType.SEMANTIC,
         summary=claim.statement,

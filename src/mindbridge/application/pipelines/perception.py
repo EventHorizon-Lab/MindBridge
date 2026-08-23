@@ -44,7 +44,11 @@ from mindbridge.core import (
     Observation,
 )
 from mindbridge.prompts import PERCEIVE_EVENTS_PROMPT
-from mindbridge.telemetry import operation_span, set_current_span_attributes
+from mindbridge.telemetry import (
+    operation_span,
+    record_output_repairs,
+    set_current_span_attributes,
+)
 
 _MODEL_OUTPUT_CONFIG = ConfigDict(extra="ignore", frozen=True)
 """What these models accept: everything the prompt asked for, and nothing about what it did not.
@@ -328,7 +332,7 @@ def _parse_output(
         # recorded even though the observation goes on to commit. The two kinds are counted
         # apart because they call for opposite responses: a model that got a value wrong is not
         # the same problem as a processing limit that has become too small for the prompt.
-        set_current_span_attributes(
+        record_output_repairs(
             {
                 "mindbridge.perception.dropped_event_count": dropped["event"],
                 "mindbridge.perception.dropped_entity_count": dropped["entity"],

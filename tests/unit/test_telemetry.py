@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -18,6 +19,7 @@ from opentelemetry.sdk.metrics.export import InMemoryMetricReader
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from opentelemetry.sdk.trace.sampling import ALWAYS_OFF
 from opentelemetry.trace import NonRecordingSpan, SpanContext, SpanKind, TraceFlags, use_span
 
 from mindbridge import telemetry
@@ -33,6 +35,7 @@ from mindbridge.telemetry import (
     instrument_fastapi,
     model_token_usage,
     operation_span,
+    record_output_repairs,
     record_stage_duration,
     set_current_span_attributes,
 )
@@ -425,3 +428,76 @@ def test_otlp_runtime_configures_in_an_isolated_process() -> None:
     )
 
     assert result.returncode == 0, result.stderr
+
+
+def test_output_repairs_outlive_a_sampler_that_drops_the_span(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """What a pipeline threw away is not a debugging detail a sampling decision may drop.
+
+    Same rule as a token charge, and for a stronger reason: a dropped count cannot be inferred
+    from anything else that lands. A low claim census reads identically whether the model said
+    little or the parser discarded most of what it said.
+    """
+    provider = TracerProvider(sampler=ALWAYS_OFF)
+    with caplog.at_level(logging.WARNING), provider.get_tracer("test").start_as_current_span("s"):
+        recording = trace.get_current_span().is_recording()
+        record_output_repairs({"mindbridge.perception.dropped_claim_count": 37})
+
+    assert recording is False
+    assert "mindbridge.perception.dropped_claim_count=37" in caplog.text
+    provider.shutdown()
+
+
+def test_output_repairs_stay_on_a_recording_span(caplog: pytest.LogCaptureFixture) -> None:
+    """The trace keeps them too: a count with no zero beside it says nothing about a trend."""
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    with caplog.at_level(logging.WARNING), provider.get_tracer("test").start_as_current_span("s"):
+        record_output_repairs({"mindbridge.perception.claim_type_alias_count": 0})
+
+    assert exporter.get_finished_spans()[0].attributes == {
+        "mindbridge.perception.claim_type_alias_count": 0
+    }
+    assert caplog.text == ""
+    provider.shutdown()
+
+
+_REPAIR_REPORT_PROGRAM = """
+import asyncio
+
+from mindbridge.telemetry import configure_telemetry, operation_span, record_output_repairs
+
+providers = configure_telemetry("mindbridge-test")
+assert not providers.enabled
+
+
+async def main() -> None:
+    async with operation_span("mindbridge.test.repairs"):
+        record_output_repairs({"mindbridge.perception.dropped_claim_count": 37})
+
+
+asyncio.run(main())
+"""
+
+
+def test_output_repairs_print_with_no_collector_and_the_documented_sampler() -> None:
+    """The deployment the 2026-08-21 evaluation ran on: no collector, one tenth of the traces."""
+    environment = {
+        key: value for key, value in os.environ.items() if not key.startswith("OTEL_")
+    } | {
+        "OTEL_TRACES_SAMPLER": "parentbased_traceidratio",
+        "OTEL_TRACES_SAMPLER_ARG": "0.1",
+    }
+    result = subprocess.run(
+        [sys.executable, "-c", _REPAIR_REPORT_PROGRAM],
+        check=False,
+        capture_output=True,
+        env=environment,
+        text=True,
+        timeout=60,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "mindbridge.perception.dropped_claim_count=37" in result.stderr
