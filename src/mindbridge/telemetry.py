@@ -1,10 +1,8 @@
 """Observability boundary: structured logs, domain spans, and runtime setup.
 
-One module owns all three so an entry point cannot wire exporters and forget logs. The
-signals are deliberately layered: spans and metrics reach a collector when one is
-configured, while the same measurements always reach stderr as structured log records.
-Instrumentation whose only sink is OTLP is instrumentation a developer without a collector
-cannot read, which is how a fully traced write path stayed unattributable.
+One module owns structured logs and OpenTelemetry so entry points cannot wire one and forget the
+other. Console exporters and completion logs keep measurements readable without a collector;
+OTLP exports the same instruments when configured.
 """
 
 from __future__ import annotations
@@ -32,8 +30,10 @@ from opentelemetry import metrics, trace
 if TYPE_CHECKING:
     from fastapi import FastAPI
     from opentelemetry.sdk.metrics import MeterProvider
+    from opentelemetry.sdk.metrics.export import MetricExporter, MetricsData
     from opentelemetry.sdk.resources import Resource
-    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace import ReadableSpan, TracerProvider
+    from opentelemetry.sdk.trace.export import SpanExporter
 
 LogValue: TypeAlias = str | int | float | bool | None
 """What a structured log field may hold: no objects, so no content leaks by repr."""
@@ -55,6 +55,24 @@ _STAGE_DURATION = _METER.create_histogram(
     "mindbridge.stage.duration",
     unit="s",
     description="Elapsed time for low-cardinality MindBridge pipeline milestones.",
+)
+_MODEL_TOKENS = _METER.create_counter(
+    "mindbridge.model.tokens",
+    unit="{token}",
+    description="Tokens a model charged for, attributed to the operation that spent them.",
+)
+MODEL_TOKEN_ATTRIBUTES = {
+    "mindbridge.model.input_tokens": "input",
+    "mindbridge.model.output_tokens": "output",
+}
+"""The span attributes a model adapter reports usage under, and the kind each one counts.
+
+The adapter already measured these; nothing here measures them again. `total_tokens` is
+deliberately absent: it is the sum, and the two halves are what price differently.
+"""
+_model_token_usage: ContextVar[dict[str, int] | None] = ContextVar(
+    "mindbridge_model_token_usage",
+    default=None,
 )
 _DURATION_BUCKET_BOUNDARIES_SECONDS = (
     0.01,
@@ -186,9 +204,15 @@ async def operation_span(name: str) -> AsyncIterator[None]:
     if not name.strip():
         raise ValueError("operation name must not be empty")
     frame = _OperationFrame(fields={})
-    token = _operation_frame.set(frame)
+    parent_frame = _operation_frame.get()
+    _operation_frame.set(frame)
     started_at = perf_counter()
     outcome = "error"
+    # The outermost operation owns the token account, so a nested span cannot drain what its
+    # parent is still spending and no total is counted twice on the way out.
+    owns_account = _model_token_usage.get() is None
+    if owns_account:
+        _model_token_usage.set({})
     try:
         with _TRACER.start_as_current_span(name):
             yield
@@ -197,11 +221,12 @@ async def operation_span(name: str) -> AsyncIterator[None]:
         outcome = "cancelled"
         raise
     finally:
-        _operation_frame.reset(token)
+        # An async generator may finish in a task that did not create this frame. Assignment is
+        # context-independent; resetting the creator's ContextVar token is not.
+        _operation_frame.set(parent_frame)
         duration_seconds = max(0.0, perf_counter() - started_at)
-        parent = _operation_frame.get()
-        if parent is not None:
-            parent.child_seconds += duration_seconds
+        if parent_frame is not None:
+            parent_frame.child_seconds += duration_seconds
         # Children are billed by the sum of their durations, which overlap under
         # `asyncio.gather` and can exceed the parent's own wall clock. Clamping keeps self
         # time non-negative, at the price that a parent gathering more child-seconds than it
@@ -230,6 +255,15 @@ async def operation_span(name: str) -> AsyncIterator[None]:
                 }
             },
         )
+        if owns_account:
+            for kind, charged in model_token_usage().items():
+                _MODEL_TOKENS.add(charged, {"operation": name, "kind": kind})
+            # Closed by assignment rather than by resetting a token, because this block can run
+            # in a context that never held one: `kernel.watch_observation_job` wraps a yield, so
+            # asyncio may finalize it from a task of its own, and `ContextVar.reset` raises
+            # there. The account is only ever opened where it was absent, so assigning that back
+            # restores exactly what a reset would have.
+            _model_token_usage.set(None)
 
 
 def record_stage_duration(stage: str, duration_seconds: float) -> None:
@@ -361,10 +395,16 @@ def current_trace_id() -> str:
 
 
 def set_current_span_attributes(attributes: Mapping[str, str | int | float | bool]) -> None:
-    """Attach content-free domain diagnostics to the active span and its completion log."""
+    """Attach diagnostics to the span and completion log, retaining any token charge."""
     frame = _operation_frame.get()
     if frame is not None:
         frame.fields.update(attributes)
+    usage = _model_token_usage.get()
+    if usage is not None:
+        for attribute, kind in MODEL_TOKEN_ATTRIBUTES.items():
+            charged = attributes.get(attribute)
+            if isinstance(charged, int) and not isinstance(charged, bool):
+                usage[kind] = usage.get(kind, 0) + charged
     span = trace.get_current_span()
     if span.is_recording():
         span.set_attributes(attributes)
@@ -515,6 +555,40 @@ def _record_fields(record: logging.LogRecord) -> dict[str, LogValue]:
     return dict(fields) if isinstance(fields, dict) else {}
 
 
+def record_output_repairs(attributes: Mapping[str, int]) -> None:
+    """Report what a stage discarded or rewrote, on a sink no collector is needed to read.
+
+    Span attributes are the wrong and only sink these had. A span keeps them while it is
+    recording, and the deployment they matter on is the one that samples a tenth of its traces
+    into a collector it does not run -- so nine of ten of these vanish and the tenth goes
+    nowhere. What survived that is a job marked SUCCEEDED and a low census, which reads exactly
+    the same whether the model said little or this process threw most of it away.
+
+    So the counts also go to `logging`, at WARNING because that is the level an unconfigured
+    process still prints: `logging.lastResort` writes it to stderr, and every deployed process
+    here already has its output somewhere an operator looks. This is the token charge's rule
+    (`set_current_span_attributes`) applied to the other measurement a sampling decision must
+    not be allowed to lose.
+
+    A zero still reaches the trace, because "nothing was discarded" is what makes a count that
+    is not zero mean anything; only a repair that happened is worth waking a log up for.
+    """
+    set_current_span_attributes(attributes)
+    if any(attributes.values()):
+        _LOGGER.warning("model output repaired:%s", _format_attributes(attributes))
+
+
+def model_token_usage() -> Mapping[str, int]:
+    """Return the tokens charged so far inside the operation that owns the token account.
+
+    A caller with somewhere durable to put this -- the job row of the observation being
+    processed -- reads it here rather than measuring again. `operation_span` reports the same
+    numbers to `mindbridge.model.tokens` when the operation ends, so the two agree by
+    construction.
+    """
+    return dict(_model_token_usage.get() or {})
+
+
 def configure_telemetry(default_service_name: str) -> TelemetryProviders:
     """Configure OTLP from standard environment variables once per process."""
     if not default_service_name.strip():
@@ -522,9 +596,9 @@ def configure_telemetry(default_service_name: str) -> TelemetryProviders:
     if _sdk_disabled(os.environ):
         return TelemetryProviders(tracer=None, meter=None)
 
-    trace_enabled = _signal_enabled(os.environ, "TRACES")
-    metrics_enabled = _signal_enabled(os.environ, "METRICS")
-    if not trace_enabled and not metrics_enabled:
+    trace_exporter = _selected_exporter(os.environ, "TRACES")
+    metric_exporter = _selected_exporter(os.environ, "METRICS")
+    if trace_exporter is None and metric_exporter is None:
         return TelemetryProviders(tracer=None, meter=None)
 
     service_name = os.environ.get("OTEL_SERVICE_NAME", default_service_name).strip()
@@ -546,8 +620,14 @@ def configure_telemetry(default_service_name: str) -> TelemetryProviders:
                 "service.version": version("mindbridge"),
             }
         )
-        meter_provider = _configure_metrics(resource) if metrics_enabled else None
-        tracer_provider = _configure_traces(resource, meter_provider) if trace_enabled else None
+        meter_provider = (
+            _configure_metrics(resource, metric_exporter) if metric_exporter is not None else None
+        )
+        tracer_provider = (
+            _configure_traces(resource, meter_provider, trace_exporter)
+            if trace_exporter is not None
+            else None
+        )
         providers = TelemetryProviders(tracer=tracer_provider, meter=meter_provider)
         _instrument_clients(providers)
         _configured_process = (process_id, service_name, providers)
@@ -572,8 +652,8 @@ def instrument_fastapi(app: FastAPI, providers: TelemetryProviders) -> None:
 def _configure_traces(
     resource: Resource,
     meter_provider: MeterProvider | None,
+    exporter: str,
 ) -> TracerProvider:
-    from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
     from opentelemetry.sdk.trace import TracerProvider
     from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
@@ -581,13 +661,12 @@ def _configure_traces(
     if isinstance(existing, TracerProvider):
         return existing
     provider = TracerProvider(resource=resource, meter_provider=meter_provider)
-    provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter()))
+    provider.add_span_processor(BatchSpanProcessor(_span_exporter(exporter)))
     trace.set_tracer_provider(provider)
     return provider
 
 
-def _configure_metrics(resource: Resource) -> MeterProvider:
-    from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
+def _configure_metrics(resource: Resource, exporter: str) -> MeterProvider:
     from opentelemetry.sdk.metrics import MeterProvider
     from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
     from opentelemetry.sdk.metrics.view import ExplicitBucketHistogramAggregation, View
@@ -595,7 +674,7 @@ def _configure_metrics(resource: Resource) -> MeterProvider:
     existing = metrics.get_meter_provider()
     if isinstance(existing, MeterProvider):
         return existing
-    reader = PeriodicExportingMetricReader(OTLPMetricExporter())
+    reader = PeriodicExportingMetricReader(_metric_exporter(exporter))
     duration_buckets = ExplicitBucketHistogramAggregation(
         boundaries=_DURATION_BUCKET_BOUNDARIES_SECONDS
     )
@@ -615,6 +694,77 @@ def _configure_metrics(resource: Resource) -> MeterProvider:
     )
     metrics.set_meter_provider(provider)
     return provider
+
+
+def _span_exporter(exporter: str) -> SpanExporter:
+    """Build the span exporter one process was configured for."""
+    if exporter == "console":
+        from opentelemetry.sdk.trace.export import ConsoleSpanExporter
+
+        return ConsoleSpanExporter(formatter=_format_span_line)
+    from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+
+    return OTLPSpanExporter()
+
+
+def _metric_exporter(exporter: str) -> MetricExporter:
+    """Build the metric exporter one process was configured for."""
+    if exporter == "console":
+        from opentelemetry.sdk.metrics.export import ConsoleMetricExporter
+
+        return ConsoleMetricExporter(formatter=_format_metric_lines)
+    from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
+
+    return OTLPMetricExporter()
+
+
+def _format_span_line(span: ReadableSpan) -> str:
+    """Render one finished span as one line, so a console sink stays readable.
+
+    The SDK's own formatter writes each span as a multi-line JSON document, which is fine for a
+    file a machine reads and unusable for the case this exists for: an operator following a
+    worker's output. Nothing is rendered here that the span does not already carry, and what a
+    span carries is content-free by construction -- see the FastAPI test that asserts it.
+    """
+    started_at, ended_at = span.start_time, span.end_time
+    elapsed_seconds = (ended_at - started_at) / 1e9 if started_at and ended_at else 0.0
+    return f"{span.name} {elapsed_seconds:.3f}s{_format_attributes(span.attributes)}\n"
+
+
+def _format_metric_lines(metrics_data: MetricsData) -> str:
+    """Render one metric export as one line per data point.
+
+    This is the sink that answers "how long did each stage take, and what did the tokens cost"
+    without a collector: the durations are aggregated already, so one export is a few lines
+    rather than one per operation.
+    """
+    return "".join(
+        f"{metric.name}{_format_attributes(point.attributes)} {_format_measurement(point)}\n"
+        for resource_metrics in metrics_data.resource_metrics
+        for scope_metrics in resource_metrics.scope_metrics
+        for metric in scope_metrics.metrics
+        for point in metric.data.data_points
+    )
+
+
+def _format_attributes(attributes: Mapping[str, object] | None) -> str:
+    return "".join(f" {name}={value}" for name, value in (attributes or {}).items())
+
+
+def _format_measurement(point: object) -> str:
+    """Describe one data point without asking which aggregation produced it.
+
+    A counter carries a single value and a histogram carries a distribution; both arrive here,
+    and neither the operation duration view nor a future one should have to be enumerated.
+    """
+    value = getattr(point, "value", None)
+    if value is not None:
+        return f"value={value}"
+    return (
+        f"count={getattr(point, 'count', 0)}"
+        f" sum={getattr(point, 'sum', 0)}"
+        f" max={getattr(point, 'max', 0)}"
+    )
 
 
 def _instrument_clients(providers: TelemetryProviders) -> None:
@@ -643,9 +793,23 @@ def _sdk_disabled(environ: Mapping[str, str]) -> bool:
     return environ.get("OTEL_SDK_DISABLED", "false").strip().lower() == "true"
 
 
-def _signal_enabled(environ: Mapping[str, str], signal: str) -> bool:
+def _selected_exporter(environ: Mapping[str, str], signal: str) -> str | None:
+    """Name the exporter one signal is configured for, or None when that signal is off.
+
+    `console` is OpenTelemetry's own value for "write it where this process writes", and it
+    needs no endpoint. That is the whole gap this closes: this function used to answer only
+    whether an OTLP endpoint was configured, so a box with no collector recorded every duration
+    and every token count and then dropped all of it, including when the operator had asked for
+    `console` by name. Any other exporter still needs an endpoint, because defaulting to
+    localhost:4318 would make every deployment retry a connection nothing is listening on.
+    """
     exporter = environ.get(f"OTEL_{signal}_EXPORTER", "otlp").strip().lower()
-    return exporter != "none" and bool(
+    if exporter == "console":
+        return "console"
+    if exporter == "none":
+        return None
+    endpoint_configured = bool(
         environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", "").strip()
         or environ.get(f"OTEL_EXPORTER_OTLP_{signal}_ENDPOINT", "").strip()
     )
+    return "otlp" if endpoint_configured else None

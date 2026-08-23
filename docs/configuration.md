@@ -23,6 +23,7 @@ fails to start rather than failing one call an hour later.
 | `MINDBRIDGE_MEDIA_EMBEDDER_*` | | | ○ | | | |
 | `MINDBRIDGE_MEDIA_SAMPLING_CONFIG_JSON` | | | ○ | | | |
 | `MINDBRIDGE_WORKER_CONCURRENCY` | | | ○ | | | |
+| `MINDBRIDGE_WORKER_VRAM_BUDGET_GIB` | | | ○ | | | |
 | `MINDBRIDGE_TENANT_API_KEYS_JSON` | ● | | | | | |
 | `MINDBRIDGE_API_KEY` | | | | | | ● |
 | `MINDBRIDGE_AML_*` | ○ | | | | | |
@@ -105,18 +106,18 @@ bundled per-field variables or through one explicit JSON object.
 | Text embedder | `MINDBRIDGE_EMBEDDER_PLUGIN` | `openai` |
 | Media embedder | `MINDBRIDGE_MEDIA_EMBEDDER_PLUGIN` | `jina` |
 
+`openai` means "any OpenAI-compatible endpoint", including one you serve yourself, and it is the
+recommended value for **all three** slots — media included, where it is not the default. `jina`
+loads the model into the process; see [media embedder](#media-embedder-worker-only) for what that
+costs and when the worker refuses to run it.
+
 ### Generator
 
 | Variable | Required | Default |
 | --- | --- | --- |
 | `MINDBRIDGE_GENERATOR_API_KEY` | yes | — |
 | `MINDBRIDGE_GENERATOR_ENDPOINT` | yes | — |
-| `MINDBRIDGE_GENERATOR_MODEL_REVISION` | yes | — |
 | `MINDBRIDGE_GENERATOR_MODEL_ID` | no | `qwen3.8-max` |
-
-`MODEL_REVISION` is required while `MODEL_ID` is not, which looks backwards until you consider
-what each one is for. A model ID has a sensible default; the exact revision behind an endpoint
-does not, and recording the wrong one makes every derived record's provenance a lie.
 
 `request_timeout_seconds` has no fallback variable — it lives in
 `MINDBRIDGE_GENERATOR_CONFIG_JSON` and defaults to **1800**. It is worth knowing because it does
@@ -132,7 +133,6 @@ a slow generator moves both deadlines at once. See
 | `MINDBRIDGE_EMBEDDER_API_KEY` | yes | — |
 | `MINDBRIDGE_EMBEDDER_ENDPOINT` | yes | — |
 | `MINDBRIDGE_EMBEDDER_MODEL_ID` | no | `jinaai/jina-embeddings-v5-omni-small-retrieval` |
-| `MINDBRIDGE_EMBEDDER_MODEL_REVISION` | no | `12949877f0092093f366c6450340011320152a05` |
 
 The worker's text slot deliberately reads these same names rather than a parallel family. It has
 to land in the space the API queries, and a second name is a second thing that can silently
@@ -141,17 +141,54 @@ name — each process has its own environment.
 
 ### Media embedder (worker only)
 
+Two shapes, and the recommended one is **not** the default plugin.
+
+**Served (recommended).** One variable, because the media slot then reuses the text embedder's
+endpoint — it has to write into the same embedding space anyway:
+
+```bash
+export MINDBRIDGE_MEDIA_EMBEDDER_PLUGIN=openai
+```
+
+**In-process (`jina`, the default).** Loads the encoder into the worker itself:
+
 | Variable | Required | Default |
 | --- | --- | --- |
 | `MINDBRIDGE_MEDIA_EMBEDDER_MODEL_ID` | no | `jinaai/jina-embeddings-v5-omni-small-retrieval` |
-| `MINDBRIDGE_MEDIA_EMBEDDER_MODEL_REVISION` | no | `12949877f0092093f366c6450340011320152a05` |
 | `MINDBRIDGE_MEDIA_EMBEDDER_DEVICE` | no | automatic selection |
+| `MINDBRIDGE_WORKER_VRAM_BUDGET_GIB` | no | `3.7` — one model copy per child |
 
 `MINDBRIDGE_MEDIA_EMBEDDER_MODEL_ID` is a Hugging Face repository ID; `MINDBRIDGE_EMBEDDER_MODEL_ID`
 is an endpoint-side alias. They frequently hold the same string and are still not the same field
 — do not consolidate them.
 
 An explicit `DEVICE` that is unavailable fails rather than silently falling back to CPU.
+
+What the in-process plugin costs, measured on one RTX 5090 against the same model served through
+vLLM, is in [deployment](deployment.md#media-encoder-served-or-in-process): **3.7 GiB of VRAM per
+prefork child**, and 61-198x the wall time per media object. The worker **refuses to start** when a
+pool of more than one child would hold more than `MINDBRIDGE_WORKER_VRAM_BUDGET_GIB`, while either
+embedder slot names `jina`, because a prefork child holds its own copy of the model and
+`--max-memory-per-child` cannot bound VRAM. The pool size is whichever of `--concurrency` and
+`--autoscale` is larger; a pool that shares one process (`--pool=threads`, `solo`) holds one copy
+however wide it runs, and `MINDBRIDGE_MEDIA_EMBEDDER_DEVICE=cpu` holds no VRAM at all, so neither
+is refused.
+
+`MINDBRIDGE_WORKER_VRAM_BUDGET_GIB` defaults to **3.7 GiB, one model copy per child**, which is
+what keeps a second resident copy a decision rather than an accident. Raise it on a card that can
+genuinely hold more — `MINDBRIDGE_WORKER_VRAM_BUDGET_GIB=48` admits six children with one loaded
+slot each. It exists because a guard with no way to say yes gets routed around, and the route an
+operator reaches for is `--autoscale`, which the guard cannot see from `--concurrency` alone.
+**The estimate it bounds counts resident weights and CUDA contexts only, not activation memory**:
+the evaluation's six children measured 30.2 GB against an estimated 22.2, so leave room. A value
+that is not a **finite** positive number fails startup rather than disabling the guard — `Infinity`
+parses, and every estimate compares below it, so a typo in the one variable that raises the guard
+would otherwise switch it off.
+
+Switching an existing deployment from `jina` to `openai` is not free: video vectors from the two
+backends agree only to cosine **0.944**, because they sample different numbers of frames from the
+same clip. Text agrees to 0.99994 and images to 0.985. Re-encode media evidence, or accept that
+old and new video vectors are not strictly comparable.
 
 ### Plugin JSON
 
@@ -162,7 +199,6 @@ export MINDBRIDGE_GENERATOR_CONFIG_JSON='{
   "api_key": "...",
   "endpoint": "https://generator.example.com/v1",
   "model_id": "qwen3.8-max",
-  "model_revision": "deployment-2026-08-11",
   "reasoning_effort": "low"
 }'
 ```
@@ -186,14 +222,12 @@ set the plugin name and provide its JSON. See [plugin-architecture.md](plugin-ar
 | Variable | Required | Default |
 | --- | --- | --- |
 | `MINDBRIDGE_EMBEDDING_SPACE_ID` | no | `jinaai/jina-embeddings-v5-omni-small-retrieval-1024` |
-| `MINDBRIDGE_EMBEDDING_SPACE_REVISION` | no | `omni@12949877f0092093f366c6450340011320152a05` |
 | `MINDBRIDGE_EMBEDDING_DIMENSION` | no | `1024` |
 | `MINDBRIDGE_MINIMUM_EMBEDDING_SIMILARITY` | no | `0.0` |
 
-`SPACE_ID` and `SPACE_REVISION` name the compatibility space the selected embedder writes into
-and queries. They are separate from the encoder's own identity because several independently
-served encoders can write into one comparable space, while the same encoder at a different
-revision may not.
+`SPACE_ID` names the compatibility space the selected embedder writes into and queries. It is
+separate from the encoder's own identity because several independently served encoders can write
+into one comparable space.
 
 `EMBEDDING_DIMENSION` is one width shared by the pgvector column and every encoder in the
 deployment. It accepts only widths Jina v5 was trained to truncate to — 32, 64, 128, 256, 512,
@@ -248,11 +282,15 @@ export MINDBRIDGE_MEDIA_SAMPLING_CONFIG_JSON='{
   "frames_per_second": 1.0,
   "max_pixels": 200704,
   "image_max_pixels": 1003520,
-  "generation_proxy": true
+  "generation_proxy": true,
+  "proxy_audio": true
 }'
 ```
 
-An unrecognized key or a value of the wrong type fails startup.
+An unrecognized key or a value of the wrong type fails startup, and so does a frame rate outside
+`0 < fps <= 20`. The upper bound is the media layer's own: past 20 fps every span widened to the
+sampling floor exceeds the proxy frame ceiling below, so the knob would silently switch off the
+feature it is tuning. `Infinity` is well-formed JSON and is refused here rather than downstream.
 
 **Frame rate sets the entire write cost of a video deployment** — one clip cut, one encoder call,
 and one stored object per sampled window. It is the first thing to change if ingest is too
@@ -264,16 +302,29 @@ model fetch frames it discards on arrival. With the proxy on, video is cut once 
 and the sampled copy is what perception reads. Turn it off for a generator that reads the same
 storage the worker does, where the encode costs more than the transfer it removes.
 
+`proxy_audio` decides whether the copy carries the source's audio track. Keep it on for a
+generator that listens: a video-only proxy silently takes speech away from every question that
+depends on what was said. Turn it off for one that does not. Whether yours does is worth
+measuring rather than assuming — send the same clip twice, once with its audio track and once
+without, and compare `prompt_tokens`. Against the endpoint used for the 2026-08-21 evaluation the
+count was identical at 1009 either way, so the track was never ingested, while the file was
+336 KiB with it against 212 KiB without: an encode and a transfer bought nothing. Note also that
+such an endpoint will still answer "what was said" with fluent invented dialogue rather than
+saying it heard nothing, so a silent deployment does not announce itself.
+
 Four constraints on the proxy, all of which have bitten before:
 
 - **Video only.** `image_max_pixels` governs stored image clips, not what the model is sent. An
   image reaches the model at full resolution because the request carries no pixel budget for
   images at all.
-- **Its ceiling is a frame count, not a duration.** Past roughly forty sampled frames the MP4
-  muxer refuses to interleave a sparse video track with continuous audio. At the 30-second
+- **Its ceiling is a frame count, not a duration.** Past roughly forty sampled frames the encode
+  fails, on the flush that drains the encoder rather than on any one frame. At the 30-second
   segments every ingest path here uses, anything above about 1.3 fps exceeds it. Raising
   `frames_per_second` therefore trades the proxy away; lower it, or segment shorter, to keep
-  both.
+  both. **Turning `proxy_audio` off does not raise this ceiling** — a silent source with the
+  audio disabled fails at the same frame count, so the limit is not the audio interleave it was
+  previously documented as. What has been ruled out, and what has not, is recorded next to
+  `MAX_PROXY_SAMPLED_FRAMES` in `application/evidence_clips.py`.
 - **Best-effort.** A span over budget is skipped before its source is read, and anything the
   encoder or object storage refuses degrades the same way — the observation behaves exactly as
   it did before this knob existed rather than paying for a doomed encode.
@@ -340,16 +391,26 @@ variable: a measurement run's own cost breakdown is part of its result.
 
 ## Telemetry
 
-OpenTelemetry activates only when a standard common or signal-specific OTLP endpoint is set.
-Without one it stays a no-op — but the logs above do not depend on it.
+OpenTelemetry activates per signal, according to the exporter that signal is configured for.
+The default exporter is `otlp`, which needs an endpoint and stays a no-op without one. `console`
+needs no endpoint and renders the same instruments into the process's own output, which is how a
+box with no collector reads its stage timings and token counts. `none` turns the signal off.
 
 | Variable | Purpose |
 | --- | --- |
+| `OTEL_TRACES_EXPORTER`, `OTEL_METRICS_EXPORTER` | `otlp` (default), `console`, or `none`. |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | Collector address, e.g. `http://otel-collector:4318`. |
 | `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | Signal-specific override. |
 | `OTEL_SERVICE_NAME` | Override the per-process default. |
 | `OTEL_TRACES_SAMPLER`, `OTEL_TRACES_SAMPLER_ARG` | Standard sampler configuration. |
 | `OTEL_SDK_DISABLED` | Set `true` for an explicit process-level opt-out. |
+
+Two measurements deliberately do not depend on any of this, because losing them to a sampling
+decision would misreport what happened rather than merely fail to describe it. What a model
+charged for an observation is written to that observation's job row. What a stage discarded or
+rewrote from a model's answer — dropped events, entities and claims, and claim types resolved
+through an alias — is also logged at `WARNING`, so a low memory count can be told apart from a
+model whose output was mostly thrown away.
 
 Each process has a distinct default `service.name`, so they are already separable without
 configuration. MindBridge captures no authorization headers, request bodies, prompts, memory

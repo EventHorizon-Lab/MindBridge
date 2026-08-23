@@ -140,7 +140,6 @@ class ClaimPipeline:
         set_current_span_attributes(
             {
                 "mindbridge.model.id": result.model_reference.model_id,
-                "mindbridge.model.revision": result.model_reference.revision,
                 "mindbridge.prompt.version": CONSOLIDATE_CLAIMS_PROMPT.version,
                 "mindbridge.claim.count": len(candidates),
                 "mindbridge.evidence.count": len(evidence),

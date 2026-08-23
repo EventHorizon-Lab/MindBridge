@@ -70,6 +70,14 @@ class RecordingClaimStore:
             if item.evidence_id == evidence_id
         )
 
+    async def read_evidence_clip_media(
+        self,
+        tenant_id: TenantId,
+        evidence_ids: tuple[EvidenceId, ...],
+    ) -> dict[EvidenceId, MediaObject]:
+        """No derived clips in this fixture, so evidence falls back to its source media."""
+        return {}
+
     async def read_media_objects(
         self,
         tenant_id: TenantId,
@@ -128,7 +136,7 @@ async def test_claim_consolidation_builds_semantic_memory_and_version_decision()
                 target_claim_id=ClaimId("claim_03"),
             ),
         ),
-        model_reference=ModelReference(model_id="qwen3.8-max", revision="claim-revision"),
+        model_reference=ModelReference(model_id="qwen3.8-max"),
         prompt_version="consolidate_claims_v1",
     )
     store = RecordingClaimStore(candidates)
@@ -177,7 +185,7 @@ async def test_claim_consolidation_rejects_unknown_sources_before_embedding() ->
             ),
         ),
         relationships=(),
-        model_reference=ModelReference(model_id="omni", revision="revision"),
+        model_reference=ModelReference(model_id="omni"),
         prompt_version="consolidate_claims_v1",
     )
 
@@ -207,7 +215,7 @@ def _candidate(index: int) -> ClaimCandidate:
             valid_from=NOW + timedelta(minutes=index),
             valid_to=None,
             created_at=NOW,
-            model_reference=ModelReference(model_id="omni", revision="perception-revision"),
+            model_reference=ModelReference(model_id="omni"),
             prompt_version="perceive_events_v3",
         ),
         entity_ids=(EntityId("red_tool"), EntityId("blue_toolbox")),

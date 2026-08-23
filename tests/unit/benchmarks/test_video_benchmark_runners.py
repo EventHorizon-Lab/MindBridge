@@ -223,6 +223,81 @@ async def test_egotempo_emits_official_judge_fields_without_answer_leakage() -> 
     }
 
 
+class SegmentFailingMemoryApi(RecordingMemoryApi):
+    """Fails the first segment's observation and serves every other request."""
+
+    async def observe(self, request: ObserveRequest) -> ObservationReceipt:
+        if request.sequence == 0:
+            raise RuntimeError("clip media could not be read")
+        return await super().observe(request)
+
+
+async def test_video_mme_answers_every_question_when_one_segment_fails_to_ingest() -> None:
+    """A bare gather made the first exception the whole video's result: the segments that had
+    already succeeded were cancelled with it and nothing was answered at all."""
+    api = SegmentFailingMemoryApi("The best answer is C.")
+    video = VideoMMEVideo(
+        video_id="001",
+        duration="short",
+        domain="Knowledge",
+        sub_category="Humanity & History",
+        source_url="https://www.youtube.com/watch?v=source",
+        source_video_id="source",
+        questions=(
+            VideoMMEQuestion(
+                question_id="001-1",
+                task_type="Counting Problem",
+                question="Which decoration appears most?",
+                options=("A. Apples.", "B. Candles.", "C. Berries.", "D. Equal."),
+                answer="C",
+            ),
+            VideoMMEQuestion(
+                question_id="001-2",
+                task_type="Counting Problem",
+                question="Which decoration appears least?",
+                options=("A. Apples.", "B. Candles.", "C. Berries.", "D. Equal."),
+                answer="C",
+            ),
+        ),
+    )
+
+    result = await run_video_mme_video(
+        cast(MindBridge, api), video, _prepared_pair("001"), run_id="run_01"
+    )
+
+    # The surviving segment was ingested rather than cancelled alongside its failed sibling.
+    assert [request.sequence for request in api.observe_requests] == [1]
+    assert [question.response for question in result.questions] == ["C", "C"]
+    # And the loss rides along on every answer, so an answer given over incomplete memory is
+    # not read as a wrong one.
+    assert [question.mindbridge_ingest_failure_count for question in result.questions] == [1, 1]
+
+
+async def test_egotempo_answers_every_question_when_one_segment_fails_to_ingest() -> None:
+    api = SegmentFailingMemoryApi("A spoon.")
+    questions = tuple(
+        EgoTempoQuestion(
+            question_id=f"source_0.0_2.0_{index}",
+            clip_id="source_0.0_2.0",
+            source_video_id="source",
+            clip_start_seconds=0,
+            clip_end_seconds=2,
+            question_type="action-specific object",
+            question="What did the person pick up?",
+            reference_answer="A spoon.",
+        )
+        for index in range(2)
+    )
+
+    results = await run_egotempo_clip(
+        cast(MindBridge, api), questions, _prepared_pair("source_0.0_2.0"), run_id="run_01"
+    )
+
+    assert [request.sequence for request in api.observe_requests] == [1]
+    assert [result.model_answer for result in results] == ["A spoon.", "A spoon."]
+    assert [result.mindbridge_ingest_failure_count for result in results] == [1, 1]
+
+
 async def test_new_video_runners_validate_before_ingestion() -> None:
     api = RecordingMemoryApi("C")
     video = VideoMMEVideo(
@@ -253,6 +328,34 @@ async def test_new_video_runners_validate_before_ingestion() -> None:
         )
 
     assert not api.remember_requests
+
+
+def _prepared_pair(video_id: str) -> PreparedVideo:
+    """Two segments with media, so one can fail while the other is in the same gather."""
+    return PreparedVideo(
+        video_id=video_id,
+        timeline_origin=ORIGIN,
+        segments=tuple(
+            PreparedVideoSegment(
+                segment_id=f"segment_{index}",
+                start_seconds=index,
+                duration_ms=1_000,
+                media_objects=(
+                    MediaObjectInput(
+                        media_object_id=f"media_{video_id}_{index}",
+                        kind=MediaKind.VIDEO,
+                        uri=f"s3://benchmark/{video_id}_{index}.mp4",
+                        sha256="a" * 64,
+                        size_bytes=100,
+                        created_at=ORIGIN,
+                        duration_ms=1_000,
+                    ),
+                ),
+                transcript="The person picked up a spoon near some berries.",
+            )
+            for index in range(2)
+        ),
+    )
 
 
 def _prepared(video_id: str, *, with_media: bool = False) -> PreparedVideo:

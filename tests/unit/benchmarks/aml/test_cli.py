@@ -275,7 +275,6 @@ def test_manifest_carries_source_deployment_and_tenant_mapping(tmp_path: Path) -
         dataset_paths=(tmp_path / "locomo_refined.json",),
         output_path=output_path,
         api_base_url="https://memory.example.test",
-        code_revision="mindbridge-commit",
         deployment_config_path=deployment_path,
         run_id="run-1",
         tenant_prefix="bench_aml",
@@ -296,9 +295,7 @@ def test_manifest_carries_source_deployment_and_tenant_mapping(tmp_path: Path) -
     manifest_path = sidecar_manifest_path(output_path)
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert manifest["source_repository"] == "AML-memory/agent-memory-leaderboard"
-    assert manifest["source_revision"] == "5761ed58502d24153115cbdc010e44957cb18c3a"
     assert len(manifest["source_sha256"]) == 64
-    assert manifest["code_revision"] == "mindbridge-commit"
     assert manifest["deployment"]["server_generator"]["plugin"] == "openai"
     assert manifest["run_id"] == "run-1"
     assert manifest["tenant_prefix"] == "bench_aml"
@@ -356,7 +353,6 @@ def test_write_manifest_counts_oversized_unsliced_questions_from_output_rows(
         dataset_paths=(tmp_path / "CL-bench.jsonl",),
         output_path=output_path,
         api_base_url="https://memory.example.test",
-        code_revision="mindbridge-commit",
         deployment_config_path=deployment_path,
         run_id="run-1",
         tenant_prefix="bench_aml",
@@ -406,7 +402,6 @@ def _arguments(
         "dataset_paths": (tmp_path / "locomo_refined.json",),
         "output_path": output_path,
         "api_base_url": "https://memory.example.test",
-        "code_revision": "mindbridge-commit",
         "deployment_config_path": deployment_path,
         "run_id": "run-1",
         "tenant_prefix": "bench_aml",
@@ -546,3 +541,80 @@ def test_require_nonempty_cases_refuses_zero_cases_and_names_the_dataset_path(
     dataset_path = tmp_path / "chats"
     with pytest.raises(ValueError, match=re.escape(str(dataset_path.resolve()))):
         _require_nonempty_cases((), benchmark="beam", dataset_paths=(dataset_path,))
+
+
+# U+2028 LINE SEPARATOR is legal inside a JSON string and is not a JSON line
+# delimiter, but `str.splitlines()` breaks on it -- and it is one of only
+# three such characters `json.dumps(ensure_ascii=False)` emits raw (U+2029
+# and U+0085 are the others; the rest are control characters below 0x20,
+# which JSON requires escaping regardless). The official CL-Bench release
+# carries 343 of them, so retrieved context really does contain them.
+_SHARD_SEPARATOR = "\u2028"
+
+
+def _separator_handler(
+    seen: list[httpx.Request],
+) -> Callable[[httpx.Request], httpx.Response]:
+    """Answer recalls with content carrying a raw Unicode line separator."""
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        if request.url.path == "/aml/add":
+            payload = json.loads(request.content)
+            return httpx.Response(
+                200,
+                json={
+                    "success": True,
+                    "request_id": payload["request_id"],
+                    "user_id": payload["user_id"],
+                    "session_id": payload["session_id"],
+                },
+            )
+        return httpx.Response(
+            200,
+            json={"data": [{"id": "mem_1", "content": f"before{_SHARD_SEPARATOR}after"}]},
+        )
+
+    return handle
+
+
+@pytest.mark.asyncio
+async def test_run_writes_shards_that_a_splitlines_reader_cannot_shred(tmp_path: Path) -> None:
+    """One row per line however the reader splits, with the separator preserved.
+
+    `docs/benchmarking.md` hands these shards to the vendored scorers, which
+    are standalone upstream scripts rather than callers of anything here, and
+    third-party tooling reads them too. So the guarantee belongs on the write
+    side and cannot be stated as "our readers cope": a shard must survive a
+    reader that splits on Unicode line boundaries, which is what `splitlines()`
+    does. Escaping costs ~1% on these corpora -- all seven are 0.00% CJK.
+    """
+    output_path = tmp_path / "rows.jsonl"
+    seen: list[httpx.Request] = []
+    cases = (_case("locomo-refined:conv-0", "q0"), _case("locomo-refined:conv-1", "q0"))
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_separator_handler(seen)), base_url="http://test"
+    ) as client:
+        await _run(
+            client,
+            BENCHMARKS["locomo-refined"],
+            cases,
+            run_id="run-1",
+            benchmark="locomo-refined",
+            top_k=10,
+            concurrency=2,
+            output_path=output_path,
+            tenant_prefix="bench_aml",
+        )
+
+    raw = output_path.read_text(encoding="utf-8")
+    newline_rows = [line for line in raw.split("\n") if line]
+    assert len(newline_rows) == 2
+    assert len(raw.splitlines()) == len(newline_rows), (
+        "a splitlines() reader sees more lines than there are records, so the shard "
+        "carries a raw separator that shreds a record mid-string"
+    )
+    # Escaping must not lose the character: it has to survive the round trip.
+    decoded = [json.loads(line) for line in newline_rows]
+    assert all(_SHARD_SEPARATOR in row["retrieved_context"] for row in decoded), decoded[0]

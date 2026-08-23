@@ -1,7 +1,7 @@
 # MindBridge
 
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
-[![Python](https://img.shields.io/badge/Python-3.10%20|%203.11-blue.svg)](pyproject.toml)
+[![Python](https://img.shields.io/badge/Python-3.10%20%E2%80%93%203.14-blue.svg)](pyproject.toml)
 
 Memory-as-a-Service for machines that see and hear.
 

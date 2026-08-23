@@ -20,7 +20,14 @@ def load_generator(name: str, config: PluginConfig) -> Generator:
 
 def load_embedder(name: str, config: PluginConfig) -> Embedder:
     """Load only the selected embedding plugin."""
-    return cast(Embedder, _load("mindbridge.embedders", name, config, Embedder))
+    embedder = cast(Embedder, _load("mindbridge.embedders", name, config, Embedder))
+    # Reading the member is the check. Since 3.12 `isinstance` resolves protocol members
+    # statically, so an explicit subclass that inherited `Embedder.space_reference`'s raising
+    # body satisfies the structural check in `_load` on every version this package supports
+    # -- before 3.12 it raised from there instead. Doing it here keeps the rejection at load
+    # time on all of them, rather than at whichever call site reads the space first.
+    _ = embedder.space_reference
+    return embedder
 
 
 async def close_model(model: object) -> None:

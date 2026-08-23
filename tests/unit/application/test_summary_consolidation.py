@@ -61,6 +61,14 @@ class RecordingSummaryStore:
         assert tenant_id == TENANT_ID
         return tuple(item for item in self.evidence if item.evidence_id in evidence_ids)
 
+    async def read_evidence_clip_media(
+        self,
+        tenant_id: TenantId,
+        evidence_ids: tuple[EvidenceId, ...],
+    ) -> dict[EvidenceId, MediaObject]:
+        """No derived clips in this fixture, so evidence falls back to its source media."""
+        return {}
+
     async def read_media_objects(
         self,
         tenant_id: TenantId,
@@ -111,7 +119,7 @@ async def test_summary_consolidation_builds_verified_and_attested_hierarchy() ->
                 salience=0.7,
             ),
         ),
-        model_reference=ModelReference(model_id="qwen3.8-max", revision="summary-revision"),
+        model_reference=ModelReference(model_id="qwen3.8-max"),
         prompt_version="consolidate_summaries_v1",
     )
     store = RecordingSummaryStore(candidates)
@@ -162,7 +170,7 @@ async def test_summary_consolidation_rejects_unknown_sources_before_embedding() 
                 salience=0.5,
             ),
         ),
-        model_reference=ModelReference(model_id="omni", revision="revision"),
+        model_reference=ModelReference(model_id="omni"),
         prompt_version="consolidate_summaries_v1",
     )
 
@@ -194,7 +202,7 @@ def _candidate(index: int) -> SummaryCandidate:
             verification_status=(
                 VerificationStatus.VERIFIED if verified else VerificationStatus.ATTESTED
             ),
-            model_reference=ModelReference(model_id="omni", revision="perception-revision"),
+            model_reference=ModelReference(model_id="omni"),
             salience=0.8,
             strength=0.8,
         ),

@@ -15,6 +15,7 @@ import httpx
 import openai
 from openai import AsyncOpenAI, AsyncStream, Omit, omit
 from openai.types.chat import ChatCompletionChunk, ChatCompletionMessageParam
+from openai.types.completion_usage import CompletionUsage
 from openai.types.create_embedding_response import CreateEmbeddingResponse
 from openai.types.shared import ReasoningEffort
 from openai.types.shared_params import ResponseFormatJSONObject, ResponseFormatJSONSchema
@@ -100,15 +101,14 @@ class OpenAIGenerator:
         api_key: str,
         endpoint: str,
         model_id: str = DEFAULT_GENERATOR_MODEL_ID,
-        model_revision: str,
         request_timeout_seconds: float = 1_800.0,
         max_retries: int = 2,
         reasoning_effort: ReasoningEffort = None,
         video_frames_per_second: float = DEFAULT_VIDEO_FRAMES_PER_SECOND,
         video_max_pixels: int = DEFAULT_VIDEO_MAX_PIXELS,
     ) -> OpenAIGenerator:
-        if any(not value.strip() for value in (api_key, model_id, model_revision)):
-            raise ValueError("API key, model ID, and model revision are required")
+        if any(not value.strip() for value in (api_key, model_id)):
+            raise ValueError("API key and model ID are required")
         if not 0 <= max_retries <= 10:
             raise ValueError("max_retries must be between zero and ten")
         return cls(
@@ -118,7 +118,7 @@ class OpenAIGenerator:
                 timeout=request_timeout_seconds,
                 max_retries=max_retries,
             ),
-            ModelReference(model_id=model_id, revision=model_revision),
+            ModelReference(model_id=model_id),
             request_timeout_seconds=request_timeout_seconds,
             reasoning_effort=reasoning_effort,
             video_frames_per_second=video_frames_per_second,
@@ -132,7 +132,6 @@ class OpenAIGenerator:
         set_current_span_attributes(
             {
                 "mindbridge.model.id": self._model_reference.model_id,
-                "mindbridge.model.revision": self._model_reference.revision,
                 "mindbridge.model.input_part_count": len(request.input.parts),
                 "mindbridge.model.input.media_count": sum(
                     isinstance(part, MediaPart) for part in request.input.parts
@@ -271,7 +270,6 @@ class OpenAIEmbedder:
         api_key: str,
         endpoint: str,
         model_id: str,
-        model_revision: str,
         space_reference: EmbeddingSpaceReference,
         dimension: int = 1_024,
         request_timeout_seconds: float = 120.0,
@@ -279,7 +277,7 @@ class OpenAIEmbedder:
         video_frames_per_second: float = DEFAULT_VIDEO_FRAMES_PER_SECOND,
         video_max_pixels: int = DEFAULT_VIDEO_MAX_PIXELS,
     ) -> OpenAIEmbedder:
-        if any(not value.strip() for value in (api_key, model_id, model_revision)):
+        if any(not value.strip() for value in (api_key, model_id)):
             raise ValueError("embedding credentials and model identities are required")
         if not 0 <= max_retries <= 10:
             raise ValueError("max_retries must be between zero and ten")
@@ -290,7 +288,7 @@ class OpenAIEmbedder:
                 timeout=request_timeout_seconds,
                 max_retries=max_retries,
             ),
-            ModelReference(model_id=model_id, revision=model_revision),
+            ModelReference(model_id=model_id),
             space_reference=space_reference,
             dimension=dimension,
             request_timeout_seconds=request_timeout_seconds,
@@ -311,9 +309,7 @@ class OpenAIEmbedder:
         set_current_span_attributes(
             {
                 "mindbridge.model.id": self._model_reference.model_id,
-                "mindbridge.model.revision": self._model_reference.revision,
                 "mindbridge.embedding.space_id": self._space_reference.space_id,
-                "mindbridge.embedding.space_revision": self._space_reference.revision,
                 "mindbridge.embedding.dimension": self._dimension,
                 "mindbridge.embedding.input_count": len(request.inputs),
                 "mindbridge.embedding.task": request.task.value,
@@ -321,15 +317,25 @@ class OpenAIEmbedder:
         )
         try:
             if all(_text_only(item) is not None for item in request.inputs):
-                vectors = await self._embed_text(request)
+                vectors, charged_tokens = await self._embed_text(request)
             else:
-                vectors = tuple(
-                    await asyncio.gather(
-                        *(self._embed_multimodal(item, request.task) for item in request.inputs)
-                    )
+                encoded = await asyncio.gather(
+                    *(self._embed_multimodal(item, request.task) for item in request.inputs)
                 )
+                vectors = tuple(vector for vector, _ in encoded)
+                charged_tokens = sum(tokens for _, tokens in encoded)
         except openai.APIError as error:
             _raise_model_error(error, "embedding request failed")
+        # Serving the encoder turns embedding into a metered call, so its cost has to reach the
+        # same account generation already reports into. An embedding charges entirely on its
+        # input -- there are no completion tokens to report -- and a multimodal batch is one
+        # request per item, so what lands here is the whole batch's bill.
+        set_current_span_attributes(
+            {
+                "mindbridge.model.input_tokens": charged_tokens,
+                "mindbridge.model.total_tokens": charged_tokens,
+            }
+        )
         return EmbedResult(
             embeddings=tuple(
                 Embedding(
@@ -344,7 +350,10 @@ class OpenAIEmbedder:
     async def close(self) -> None:
         await self._client.close()
 
-    async def _embed_text(self, request: EmbedRequest) -> tuple[tuple[float, ...], ...]:
+    async def _embed_text(
+        self,
+        request: EmbedRequest,
+    ) -> tuple[tuple[tuple[float, ...], ...], int]:
         prefix = "Query: " if request.task is EmbedTask.QUERY else "Document: "
         response = await self._client.embeddings.create(
             input=[prefix + cast(str, _text_only(item)) for item in request.inputs],
@@ -353,18 +362,21 @@ class OpenAIEmbedder:
             encoding_format="float",
             timeout=self._request_timeout_seconds,
         )
-        return _embedding_vectors(
-            response,
-            self._model_reference,
-            dimension=self._dimension,
-            expected_count=len(request.inputs),
+        return (
+            _embedding_vectors(
+                response,
+                self._model_reference,
+                dimension=self._dimension,
+                expected_count=len(request.inputs),
+            ),
+            response.usage.prompt_tokens,
         )
 
     async def _embed_multimodal(
         self,
         input_value: ModelInput,
         task: EmbedTask,
-    ) -> tuple[float, ...]:
+    ) -> tuple[tuple[float, ...], int]:
         response = await self._client.post(
             "/embeddings",
             cast_to=CreateEmbeddingResponse,
@@ -386,18 +398,20 @@ class OpenAIEmbedder:
             },
             options={"timeout": self._request_timeout_seconds},
         )
-        return _embedding_vectors(
-            response,
-            self._model_reference,
-            dimension=self._dimension,
-            expected_count=1,
-        )[0]
+        return (
+            _embedding_vectors(
+                response,
+                self._model_reference,
+                dimension=self._dimension,
+                expected_count=1,
+            )[0],
+            response.usage.prompt_tokens,
+        )
 
 
 class _GeneratorConfig(PluginConfigModel):
     api_key: PluginText
     endpoint: PluginText
-    model_revision: PluginText
     model_id: PluginText = DEFAULT_GENERATOR_MODEL_ID
     request_timeout_seconds: PluginNumber = DEFAULT_GENERATOR_REQUEST_TIMEOUT_SECONDS
     max_retries: PluginInteger = 2
@@ -410,9 +424,7 @@ class _EmbedderConfig(PluginConfigModel):
     api_key: PluginText
     endpoint: PluginText
     model_id: PluginText
-    model_revision: PluginText
     space_id: PluginText
-    space_revision: PluginText
     dimension: MatryoshkaDimension = DEFAULT_EMBEDDING_DIMENSION
     request_timeout_seconds: PluginNumber = 120.0
     max_retries: PluginInteger = 2
@@ -427,7 +439,6 @@ def create_generator(config: Mapping[str, object]) -> OpenAIGenerator:
         api_key=validated.api_key,
         endpoint=validated.endpoint,
         model_id=validated.model_id,
-        model_revision=validated.model_revision,
         request_timeout_seconds=validated.request_timeout_seconds,
         max_retries=validated.max_retries,
         reasoning_effort=cast(ReasoningEffort, validated.reasoning_effort),
@@ -443,11 +454,7 @@ def create_embedder(config: Mapping[str, object]) -> OpenAIEmbedder:
         api_key=validated.api_key,
         endpoint=validated.endpoint,
         model_id=validated.model_id,
-        model_revision=validated.model_revision,
-        space_reference=EmbeddingSpaceReference(
-            space_id=validated.space_id,
-            revision=validated.space_revision,
-        ),
+        space_reference=EmbeddingSpaceReference(space_id=validated.space_id),
         dimension=validated.dimension,
         request_timeout_seconds=validated.request_timeout_seconds,
         max_retries=validated.max_retries,
@@ -493,24 +500,34 @@ async def _consume_completion_stream(
     finish_reason: str | None = None
     system_fingerprint: str | None = None
     first_token_at: float | None = None
-    async for chunk in stream:
-        system_fingerprint = system_fingerprint or chunk.system_fingerprint
-        if chunk.usage is not None:
+    charged: CompletionUsage | None = None
+    try:
+        async for chunk in stream:
+            system_fingerprint = system_fingerprint or chunk.system_fingerprint
+            # Kept rather than reported here: the token account accumulates what it is given,
+            # and a server with `continuous_usage_stats` repeats the running total on every
+            # chunk, which would bill the request once per chunk. Each report supersedes the
+            # last, so the final one is the charge.
+            charged = chunk.usage or charged
+            for choice in chunk.choices:
+                if choice.index != 0:
+                    continue
+                if choice.delta.content:
+                    if first_token_at is None:
+                        first_token_at = perf_counter()
+                    parts.append(choice.delta.content)
+                finish_reason = finish_reason or choice.finish_reason
+    finally:
+        # Reported even when the stream drops mid-body: the partial response was still billed,
+        # and the failed attempt carries that charge into its job row.
+        if charged is not None:
             set_current_span_attributes(
                 {
-                    "mindbridge.model.input_tokens": chunk.usage.prompt_tokens,
-                    "mindbridge.model.output_tokens": chunk.usage.completion_tokens,
-                    "mindbridge.model.total_tokens": chunk.usage.total_tokens,
+                    "mindbridge.model.input_tokens": charged.prompt_tokens,
+                    "mindbridge.model.output_tokens": charged.completion_tokens,
+                    "mindbridge.model.total_tokens": charged.total_tokens,
                 }
             )
-        for choice in chunk.choices:
-            if choice.index != 0:
-                continue
-            if choice.delta.content:
-                if first_token_at is None:
-                    first_token_at = perf_counter()
-                parts.append(choice.delta.content)
-            finish_reason = finish_reason or choice.finish_reason
     return _StreamedCompletion(
         text="".join(parts),
         finish_reason=finish_reason,

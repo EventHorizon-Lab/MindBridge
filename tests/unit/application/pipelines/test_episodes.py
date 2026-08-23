@@ -30,7 +30,7 @@ from mindbridge.models.openai import OpenAIGenerator, normalize_base_url
 NOW = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
 
 
-async def test_episode_consolidator_inspects_native_evidence_and_preserves_revision() -> None:
+async def test_episode_consolidator_inspects_native_evidence_and_reports_its_model() -> None:
     async def respond(request: httpx.Request) -> httpx.Response:
         payload: dict[str, object] = json.loads(request.content)
         messages = cast(list[dict[str, object]], payload["messages"])
@@ -52,7 +52,7 @@ async def test_episode_consolidator_inspects_native_evidence_and_preserves_revis
                     }
                 ]
             },
-            fingerprint="episode-serving-revision-01",
+            fingerprint="episode-serving-fingerprint-01",
         )
 
     consolidator = _consolidator(respond)
@@ -63,8 +63,8 @@ async def test_episode_consolidator_inspects_native_evidence_and_preserves_revis
         await consolidator.close()
 
     assert result.episodes[0].event_ids == (EventId("event_01"), EventId("event_02"))
-    assert result.model_reference.revision == "deployment-revision"
-    assert result.prompt_version == "consolidate_episodes_v2"
+    assert result.model_reference.model_id == "qwen3.8-max"
+    assert result.prompt_version == "consolidate_episodes_v3"
 
 
 async def test_episode_consolidator_rejects_an_unknown_event_id() -> None:
@@ -147,7 +147,7 @@ def _consolidator(
     return _EpisodeHarness(
         OpenAIGenerator(
             client,
-            ModelReference(model_id="qwen3.8-max", revision="deployment-revision"),
+            ModelReference(model_id="qwen3.8-max"),
         )
     )
 
@@ -173,7 +173,7 @@ def _candidates() -> tuple[tuple[Event, ...], tuple[ResolvedEvidence, ...]]:
             description=description,
             salience=0.8,
             created_at=NOW,
-            model_reference=ModelReference(model_id="omni", revision="perception-revision"),
+            model_reference=ModelReference(model_id="omni"),
             prompt_version="perceive_events_v3",
         )
         for index, description in enumerate(

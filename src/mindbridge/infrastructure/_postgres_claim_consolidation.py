@@ -39,7 +39,6 @@ ClaimCandidateRow: TypeAlias = tuple[
     datetime,
     str,
     str,
-    str,
     list[str],
 ]
 
@@ -58,7 +57,6 @@ def _claim_candidate_from_row(row: ClaimCandidateRow) -> ClaimCandidate:
         valid_to,
         created_at,
         model_id,
-        model_revision,
         prompt_version,
         entity_ids,
     ) = row
@@ -77,7 +75,7 @@ def _claim_candidate_from_row(row: ClaimCandidateRow) -> ClaimCandidate:
             valid_from=valid_from,
             valid_to=valid_to,
             created_at=created_at,
-            model_reference=ModelReference(model_id=model_id, revision=model_revision),
+            model_reference=ModelReference(model_id=model_id),
             prompt_version=prompt_version,
         ),
         entity_ids=tuple(EntityId(value) for value in entity_ids),
@@ -157,7 +155,6 @@ related_pairs AS (
               JOIN embeddings AS peer_embedding
                 ON peer_embedding.tenant_id = seed_embedding.tenant_id
                AND peer_embedding.space_id = seed_embedding.space_id
-               AND peer_embedding.space_revision = seed_embedding.space_revision
                AND peer_embedding.task = seed_embedding.task
               WHERE seed_embedding.tenant_id = seed.tenant_id
                 AND seed_embedding.object_type = 'claim'
@@ -195,7 +192,6 @@ SELECT claim.claim_id,
        claim.valid_to,
        claim.created_at,
        claim.model_id,
-       claim.model_revision,
        claim.prompt_version,
        ARRAY(
            SELECT relation.target_id

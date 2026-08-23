@@ -32,7 +32,7 @@ jobs:
             probe: edge
           - name: server
             requirement: .[server]
-            probe: api application celery_app cli consolidation_cli infrastructure lifecycle_cli models server telemetry worker
+            probe: api application celery_app cli consolidation_cli infrastructure jobs_cli lifecycle_cli models server telemetry worker
           - name: benchmarks
             requirement: .[benchmarks]
             probe: benchmarks
@@ -153,7 +153,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.10", "3.11"]
+        # Every supported version, floor to ceiling. Each leg runs mypy as well as the tests,
+        # which is what replaces the `python_version` pin the mypy configuration used to carry.
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
 
     steps:
       - name: Check out repository

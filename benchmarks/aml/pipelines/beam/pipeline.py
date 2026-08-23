@@ -136,7 +136,7 @@ DO NOT provide any exaplanation."""
 
 
 def rows(path: str | Path) -> list[dict]:
-    parsed = [json.loads(line) for line in Path(path).read_text(encoding="utf-8").splitlines() if line.strip()]
+    parsed = [json.loads(line) for line in Path(path).read_text(encoding="utf-8").split("\n") if line.strip()]
     ids = [row.get("id") for row in parsed]
     if any(ident is None for ident in ids) or len(ids) != len(set(ids)):
         raise ValueError(f"{path} must contain unique, non-empty ids")

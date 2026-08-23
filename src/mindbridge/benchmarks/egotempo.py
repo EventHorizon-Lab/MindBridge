@@ -62,6 +62,10 @@ class EgoTempoQuestionResult(ContractModel):
     mindbridge_evidence_ids: tuple[Identifier, ...]
     mindbridge_trace_id: Identifier
     mindbridge_error_code: NonEmptyString | None = None
+    # Every question over one clip carries the same count, unlike the per-cutoff counts in the
+    # runners that ingest and answer in interleaved cohorts: this runner ingests the whole clip
+    # before answering anything, so any failed segment is missing from every answer here.
+    mindbridge_ingest_failure_count: int = Field(default=0, ge=0)
 
 
 class _ReleaseInfo(BaseModel):
@@ -131,7 +135,7 @@ async def run_egotempo_clip(
         raise ValueError("EgoTempo questions for one clip have inconsistent boundaries")
 
     tenant_id = benchmark_tenant_id(tenant_prefix, prepared.video_id, run_id)
-    await ingest_prepared_video(
+    ingest_failures = await ingest_prepared_video(
         memory,
         tenant_id,
         device_id,
@@ -148,7 +152,15 @@ async def run_egotempo_clip(
         answers.extend(
             await asyncio.gather(
                 *(
-                    _answer_question(memory, tenant_id, question, cutoff, recall_limit, semaphore)
+                    _answer_question(
+                        memory,
+                        tenant_id,
+                        question,
+                        cutoff,
+                        recall_limit,
+                        semaphore,
+                        ingest_failures,
+                    )
                     for question in questions[offset : offset + request_concurrency]
                 )
             )
@@ -184,6 +196,7 @@ async def _answer_question(
     cutoff: AwareDatetime,
     recall_limit: int,
     semaphore: asyncio.Semaphore,
+    ingest_failures: int,
 ) -> EgoTempoQuestionResult:
     prompt = EGOTEMPO_QUERY_PROMPT.text.format(question=question.question)
     try:
@@ -197,7 +210,15 @@ async def _answer_question(
                 )
             )
     except MindBridgeError as error:
-        if error.code not in {"model_output_invalid", "model_request_failed"}:
+        # `model_unavailable` is the deployment's 60 s gateway timeout under load (~5.5% of
+        # recalls once nine benchmarks share the endpoint). Fatal here discarded every answer
+        # the sweep had already produced; recoverable records the code against this one
+        # question instead, which is counted as infrastructure and never as a wrong answer.
+        if error.code not in {
+            "model_output_invalid",
+            "model_request_failed",
+            "model_unavailable",
+        }:
             raise
         return _question_result(
             question,
@@ -208,6 +229,7 @@ async def _answer_question(
             evidence_ids=(),
             trace_id=error.trace_id or f"trace_model_error_{question.question_id}",
             error_code=error.code,
+            ingest_failures=ingest_failures,
         )
     return _question_result(
         question,
@@ -217,6 +239,7 @@ async def _answer_question(
         memory_ids=tuple(item.memory_id for item in result.memories),
         evidence_ids=tuple(item.evidence_id for item in result.evidence),
         trace_id=result.trace_id,
+        ingest_failures=ingest_failures,
     )
 
 
@@ -229,6 +252,7 @@ def _question_result(
     memory_ids: tuple[str, ...],
     evidence_ids: tuple[str, ...],
     trace_id: str,
+    ingest_failures: int,
     error_code: str | None = None,
 ) -> EgoTempoQuestionResult:
     return EgoTempoQuestionResult(
@@ -244,4 +268,5 @@ def _question_result(
         mindbridge_evidence_ids=evidence_ids,
         mindbridge_trace_id=trace_id,
         mindbridge_error_code=error_code,
+        mindbridge_ingest_failure_count=ingest_failures,
     )

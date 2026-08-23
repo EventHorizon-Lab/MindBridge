@@ -139,6 +139,7 @@ class SuperMemoryQuestionResult(ContractModel):
     mindbridge_memory_ids: tuple[Identifier, ...]
     mindbridge_evidence_ids: tuple[Identifier, ...]
     mindbridge_trace_id: Identifier
+    mindbridge_ingest_failure_count: int = Field(default=0, ge=0)
 
     @model_validator(mode="after")
     def require_consistent_ranking(self) -> SuperMemoryQuestionResult:
@@ -215,6 +216,7 @@ async def run_supermemory_vqa(
     ordered = sorted(questions, key=lambda question: question.question_ended_at)
     answers: dict[int, SuperMemoryQuestionResult] = {}
     next_segment = 0
+    ingest_failures = 0
     semaphore = asyncio.Semaphore(request_concurrency)
     for question_ended_at, group in groupby(
         ordered, key=lambda question: question.question_ended_at
@@ -239,15 +241,29 @@ async def run_supermemory_vqa(
                 )
             )
             next_segment += 1
-        await asyncio.gather(*due_segments)
+        ingest_failures += _count_ingest_failures(
+            await asyncio.gather(*due_segments, return_exceptions=True)
+        )
         results = await asyncio.gather(
             *(
-                _answer_question(memory, tenant_id, question, recall_limit, semaphore)
+                _answer_question(
+                    memory, tenant_id, question, recall_limit, semaphore, ingest_failures
+                )
                 for question in group
             )
         )
         answers.update((result.question_id, result) for result in results)
     return tuple(answers[question.question_id] for question in questions)
+
+
+def _count_ingest_failures(outcomes: list[BaseException | None]) -> int:
+    """Count the segments that failed so a single bad segment cannot discard its whole cohort.
+
+    A bare gather made the first exception the whole subject's result, throwing away every
+    segment already ingested. The count rides along on every answer produced after it, so a run
+    still tells missing evidence apart from a wrong answer.
+    """
+    return sum(isinstance(outcome, BaseException) for outcome in outcomes)
 
 
 def evaluate_supermemory_vqa(
@@ -350,6 +366,7 @@ async def _answer_question(
     question: SuperMemoryQuestion,
     recall_limit: int,
     semaphore: asyncio.Semaphore,
+    ingest_failures: int,
 ) -> SuperMemoryQuestionResult:
     async with semaphore:
         result = await memory.recall(
@@ -379,6 +396,7 @@ async def _answer_question(
         mindbridge_memory_ids=tuple(item.memory_id for item in result.memories),
         mindbridge_evidence_ids=tuple(item.evidence_id for item in result.evidence),
         mindbridge_trace_id=result.trace_id,
+        mindbridge_ingest_failure_count=ingest_failures,
     )
 
 

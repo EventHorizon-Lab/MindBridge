@@ -9,11 +9,18 @@ import pytest
 
 import mindbridge.models.openai as openai_models
 import mindbridge.models.plugins as plugins
-from mindbridge.models import GenerateRequest, GenerateResult
+from mindbridge.models import Embedder, EmbedRequest, EmbedResult, GenerateRequest, GenerateResult
 
 
 class _Generator:
     async def generate(self, request: GenerateRequest) -> GenerateResult:
+        raise AssertionError(f"not invoked by discovery: {request}")
+
+
+class _SpacelessEmbedder(Embedder):
+    """An embedder published without type checking: it never declares its space."""
+
+    async def embed(self, request: EmbedRequest) -> EmbedResult:
         raise AssertionError(f"not invoked by discovery: {request}")
 
 
@@ -79,6 +86,24 @@ def test_loader_rejects_non_callable_entry_point(monkeypatch: pytest.MonkeyPatch
         plugins.load_generator("broken", {})
 
 
+def test_loader_rejects_an_embedder_that_declares_no_space(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The capability check cannot be left to `isinstance` for this one.
+
+    A plugin that subclasses `Embedder` inherits the protocol's raising `space_reference`,
+    and since 3.12 `isinstance` resolves protocol members statically -- so the structural
+    check passes and only reading the member rejects it. Without the read in `load_embedder`
+    this plugin would load here and fail at whichever call site read the space first.
+    """
+    # mypy rejects the instantiation too; the runtime guard is for plugins it never checked.
+    point = _Point("spaceless", lambda _config: _SpacelessEmbedder())  # type: ignore[abstract]
+    _install_points(monkeypatch, point)
+
+    with pytest.raises(NotImplementedError, match="declare its embedding space"):
+        plugins.load_embedder("spaceless", {})
+
+
 def _install_points(monkeypatch: pytest.MonkeyPatch, *points: _Point) -> None:
     monkeypatch.setattr(
         plugins,
@@ -92,9 +117,7 @@ def _embedder_config(**changes: object) -> dict[str, object]:
         "api_key": "key",
         "endpoint": "https://embeddings.example.test/v1",
         "model_id": "omni",
-        "model_revision": "omni-revision",
         "space_id": "space",
-        "space_revision": "space-revision",
     }
     config.update(changes)
     return config

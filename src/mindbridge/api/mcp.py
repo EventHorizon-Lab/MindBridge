@@ -125,7 +125,12 @@ def _flattened(
         return_annotation=get_type_hints(handler)["return"],
     )
     tool.__name__ = handler.__name__
-    tool.__doc__ = handler.__doc__
+    # Dedented rather than copied: a handler's docstring is published verbatim as the tool's
+    # description, and 3.13 strips the indentation of every line but the first at compile
+    # time. Copying it would make the contract an agent reads depend on the interpreter this
+    # process happens to run -- the snapshot in tests/contracts caught exactly that. FastAPI
+    # already normalizes the same way for the REST descriptions beside these.
+    tool.__doc__ = inspect.cleandoc(handler.__doc__ or "")
     return tool
 
 

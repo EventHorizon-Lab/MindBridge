@@ -99,7 +99,7 @@ async def run_case(
     for request_id in request_ids:
         _require_identifier_length(request_id, "eval request_id")
 
-    await asyncio.gather(
+    outcomes = await asyncio.gather(
         *(
             _add_chunk(
                 client,
@@ -111,8 +111,16 @@ async def run_case(
                 timeout=timeout,
             )
             for request_id, chunk in zip(request_ids, chunks, strict=True)
-        )
+        ),
+        return_exceptions=True,
     )
+    for outcome in outcomes:
+        # A request that failed costs this case one chunk. A 200 that does not echo its own
+        # identifiers means the deployment merged two retrieval scopes, which poisons every row
+        # the run writes -- `_add_chunk` raises that as a ValueError, and it stays fatal.
+        if isinstance(outcome, ValueError):
+            raise outcome
+    ingest_failures = _count_ingest_failures(outcomes)
 
     return list(
         await asyncio.gather(
@@ -126,11 +134,22 @@ async def run_case(
                     top_k=top_k,
                     emit=emit,
                     timeout=timeout,
+                    ingest_failures=ingest_failures,
                 )
                 for question in case.questions
             )
         )
     )
+
+
+def _count_ingest_failures(outcomes: list[BaseException | None]) -> int:
+    """Count the chunks that failed so a single bad chunk cannot discard its whole case.
+
+    A bare gather made the first exception the whole case's result -- and, because the CLI awaits
+    each case task in turn, the whole run's. Every row this case writes carries the count, so a
+    scored shard still tells missing history apart from a wrong answer.
+    """
+    return sum(isinstance(outcome, BaseException) for outcome in outcomes)
 
 
 async def _add_chunk(
@@ -171,6 +190,7 @@ async def _search_question(
     top_k: int,
     emit: EmitFn,
     timeout: float,
+    ingest_failures: int,
 ) -> dict[str, object]:
     async with semaphore:
         response = await client.post(
@@ -183,6 +203,8 @@ async def _search_question(
     row: dict[str, object] = {"id": row_id(case, question), "question": question.question}
     row.update(question.payload)
     row.update(emit(question, retrieved))
+    # Written last: a loader payload key of this name must not silently overwrite the diagnostic.
+    row["mindbridge_ingest_failure_count"] = ingest_failures
     return row
 
 

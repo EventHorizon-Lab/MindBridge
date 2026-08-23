@@ -33,7 +33,6 @@ class OfficialScore(ContractModel):
     run_id: Identifier
     predictions_sha256: Sha256Hex
     scorer_repository: NonEmptyString
-    scorer_revision: NonEmptyString
     scorer_command: NonEmptyString
     judge_model: NonEmptyString | None = None
     answer_backbone: NonEmptyString | None = None
@@ -89,7 +88,6 @@ def build_official_score(
     predictions_path: Path,
     scorer_output_path: Path,
     scorer_repository: str,
-    scorer_revision: str,
     scorer_command: str,
     judge_model: str | None,
     answer_backbone: str | None,
@@ -108,7 +106,6 @@ def build_official_score(
         run_id=run.run_id,
         predictions_sha256=predictions_sha256,
         scorer_repository=scorer_repository,
-        scorer_revision=scorer_revision,
         scorer_command=scorer_command,
         judge_model=judge_model,
         answer_backbone=answer_backbone,
@@ -127,7 +124,6 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
         predictions_path=parsed.predictions,
         scorer_output_path=parsed.scorer_output,
         scorer_repository=parsed.scorer_repository,
-        scorer_revision=parsed.scorer_revision,
         scorer_command=parsed.scorer_command,
         judge_model=parsed.judge_model,
         answer_backbone=parsed.answer_backbone,
@@ -157,7 +153,6 @@ def _parse_arguments(argv: Sequence[str] | None, prog: str | None) -> argparse.N
     parser.add_argument(
         "--scorer-repository", required=True, help="repository the official scorer came from"
     )
-    parser.add_argument("--scorer-revision", required=True, help="revision of that scorer")
     parser.add_argument(
         "--scorer-command", required=True, help="exact command line that produced the output"
     )

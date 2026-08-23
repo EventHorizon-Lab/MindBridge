@@ -1,7 +1,7 @@
 """Shared PostgreSQL row shape and mapping for memory records."""
 
 from datetime import datetime
-from typing import TypeAlias, cast
+from typing import TypeAlias
 
 from mindbridge.core import (
     EvidenceId,
@@ -25,7 +25,6 @@ MemoryRow: TypeAlias = tuple[
     datetime,
     datetime,
     str | None,
-    str | None,
     float,
     float,
     int,
@@ -48,7 +47,6 @@ SELECT memory.memory_id,
        memory.ended_at,
        memory.created_at,
        memory.model_id,
-       memory.model_revision,
        memory.salience,
        memory.strength,
        memory.useful_access_count,
@@ -102,7 +100,6 @@ def memory_from_row(row: MemoryRow) -> MemoryRecord:
         ended_at,
         created_at,
         model_id,
-        model_revision,
         salience,
         strength,
         useful_access_count,
@@ -113,11 +110,7 @@ def memory_from_row(row: MemoryRow) -> MemoryRecord:
         superseded_at,
         evidence_ids,
     ) = row
-    model_reference = (
-        ModelReference(model_id=model_id, revision=cast(str, model_revision))
-        if model_id is not None
-        else None
-    )
+    model_reference = ModelReference(model_id=model_id) if model_id is not None else None
     return MemoryRecord(
         memory_id=MemoryId(memory_id),
         tenant_id=TenantId(tenant_id),

@@ -6,27 +6,39 @@ import logging
 import os
 import subprocess
 import sys
-from collections.abc import Mapping
+from collections.abc import AsyncGenerator, Mapping
 from io import StringIO
 from typing import cast
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
+from openai import AsyncOpenAI
+from opentelemetry import trace
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import InMemoryMetricReader
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from opentelemetry.sdk.trace.sampling import ALWAYS_OFF
 from opentelemetry.trace import NonRecordingSpan, SpanContext, SpanKind, TraceFlags, use_span
 
 from mindbridge import telemetry
 from mindbridge.api.app import build_app
 from mindbridge.api.auth import TenantApiKeyAuthenticator
 from mindbridge.application.kernel import MemoryKernel
+from mindbridge.core import ModelReference
+from mindbridge.models import GenerateRequest, ModelInput, TextPart
+from mindbridge.models.openai import OpenAIGenerator, normalize_base_url
 from mindbridge.telemetry import (
     TelemetryProviders,
     current_trace_id,
     instrument_fastapi,
+    model_token_usage,
     operation_span,
+    record_output_repairs,
     record_stage_duration,
+    set_current_span_attributes,
 )
 
 
@@ -156,6 +168,235 @@ def test_fastapi_returns_trace_identity_without_capturing_secret_content() -> No
     assert "tenant-api-key" not in attributes
     assert "private-memory-content" not in attributes
     provider.shutdown()
+
+
+async def test_token_charges_survive_a_process_that_records_no_spans() -> None:
+    """What an observation cost is not a debugging detail a sampling decision may drop."""
+
+    @operation_span("mindbridge.test.cost")
+    async def spend() -> tuple[bool, Mapping[str, int]]:
+        recording = trace.get_current_span().is_recording()
+        set_current_span_attributes(
+            {
+                "mindbridge.model.input_tokens": 120,
+                "mindbridge.model.output_tokens": 8,
+                "mindbridge.model.total_tokens": 128,
+            }
+        )
+        return recording, model_token_usage()
+
+    recording, usage = await spend()
+
+    assert recording is False
+    assert usage == {"input": 120, "output": 8}
+
+
+async def test_nested_operations_charge_the_outermost_one_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """40+ operation spans nest; a token spent inside one of them is spent once."""
+    tokens = RecordingMetric()
+    monkeypatch.setattr(telemetry, "_MODEL_TOKENS", tokens)
+
+    @operation_span("mindbridge.test.model_call")
+    async def call() -> None:
+        set_current_span_attributes(
+            {"mindbridge.model.input_tokens": 10, "mindbridge.model.output_tokens": 4}
+        )
+
+    @operation_span("mindbridge.test.observation")
+    async def process() -> None:
+        await call()
+        await call()
+
+    # Twice, because a worker child processes one observation after another in one context: the
+    # second must open its own account rather than inherit the first one's.
+    await process()
+    await process()
+
+    assert tokens.measurements == [
+        (20, {"operation": "mindbridge.test.observation", "kind": "input"}),
+        (8, {"operation": "mindbridge.test.observation", "kind": "output"}),
+        (20, {"operation": "mindbridge.test.observation", "kind": "input"}),
+        (8, {"operation": "mindbridge.test.observation", "kind": "output"}),
+    ]
+
+
+async def test_an_operation_around_a_yield_survives_closing_in_another_context() -> None:
+    """`kernel.watch_observation_job:462` is an async generator, so its account closes late."""
+
+    async def watch() -> AsyncGenerator[int, None]:
+        async with operation_span("mindbridge.test.watch"):
+            while True:
+                yield 1
+
+    generator = watch()
+
+    async def start() -> int:
+        return await anext(generator)
+
+    # Started inside a task, which copies the context; closed from this one, which never held
+    # whatever the task set. Resetting a token here raises; the operation must not.
+    assert await asyncio.create_task(start()) == 1
+    await generator.aclose()
+
+    async with operation_span("mindbridge.test.after_watch"):
+        set_current_span_attributes({"mindbridge.model.input_tokens": 5})
+        assert model_token_usage() == {"input": 5}
+
+
+async def test_concurrent_operations_keep_separate_token_accounts() -> None:
+    """One tenant's recall must not be charged for another's, and they run at once."""
+
+    @operation_span("mindbridge.test.recall")
+    async def recall(charged: int) -> Mapping[str, int]:
+        set_current_span_attributes({"mindbridge.model.input_tokens": charged})
+        await asyncio.sleep(0)
+        return model_token_usage()
+
+    accounts = await asyncio.gather(recall(3), recall(5))
+
+    assert [account["input"] for account in accounts] == [3, 5]
+
+
+async def test_a_model_adapter_reports_usage_into_the_token_account() -> None:
+    """Pin the attribute names `models/openai.py` charges under to the ones counted here."""
+    completion = {
+        "id": "completion_01",
+        "object": "chat.completion.chunk",
+        "created": 1,
+        "model": "qwen3.8-max",
+        "choices": [
+            {"index": 0, "delta": {"content": "on the workbench"}, "finish_reason": "stop"}
+        ],
+        "usage": {"prompt_tokens": 120, "completion_tokens": 8, "total_tokens": 128},
+    }
+
+    async def respond(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=f"data: {json.dumps(completion)}\n\ndata: [DONE]\n\n",
+        )
+
+    generator = OpenAIGenerator(
+        AsyncOpenAI(
+            api_key="unit-test-key",
+            base_url=normalize_base_url("https://vlm.example.test/api/v1/chat/completions"),
+            http_client=httpx.AsyncClient(transport=httpx.MockTransport(respond)),
+            max_retries=0,
+        ),
+        ModelReference(model_id="qwen3.8-max"),
+    )
+    try:
+        async with operation_span("mindbridge.test.observation"):
+            await generator.generate(
+                GenerateRequest(
+                    system_prompt="Answer from evidence.",
+                    input=ModelInput((TextPart("where is the tool?"),)),
+                    max_output_tokens=64,
+                )
+            )
+            usage = model_token_usage()
+    finally:
+        await generator.close()
+
+    assert usage == {"input": 120, "output": 8}
+
+
+@pytest.mark.parametrize(
+    ("environ", "expected"),
+    [
+        ({"OTEL_TRACES_EXPORTER": "console"}, "console"),
+        ({"OTEL_TRACES_EXPORTER": "CONSOLE "}, "console"),
+        ({"OTEL_TRACES_EXPORTER": "none", "OTEL_EXPORTER_OTLP_ENDPOINT": "http://c:4318"}, None),
+        ({"OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": "http://c:4318/v1/traces"}, "otlp"),
+        # The gap this closes: no endpoint and no console asked for means nothing is recorded,
+        # which is the only case where dropping a measurement is the operator's own choice.
+        ({}, None),
+    ],
+)
+def test_console_needs_no_endpoint_while_otlp_still_does(
+    environ: dict[str, str],
+    expected: str | None,
+) -> None:
+    assert telemetry._selected_exporter(environ, "TRACES") == expected
+
+
+def test_console_span_line_carries_the_duration_and_the_attributes() -> None:
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    with provider.get_tracer("test").start_as_current_span("mindbridge.test.console") as span:
+        span.set_attribute("mindbridge.model.input_tokens", 41)
+
+    line = telemetry._format_span_line(exporter.get_finished_spans()[0])
+
+    assert line.count("\n") == 1
+    assert line.startswith("mindbridge.test.console 0.")
+    assert line.rstrip().endswith("mindbridge.model.input_tokens=41")
+    provider.shutdown()
+
+
+def test_console_metric_lines_describe_counters_and_histograms() -> None:
+    reader = InMemoryMetricReader()
+    provider = MeterProvider(metric_readers=(reader,))
+    meter = provider.get_meter("test")
+    meter.create_counter("mindbridge.test.tokens").add(7, {"kind": "input"})
+    meter.create_histogram("mindbridge.test.duration").record(0.5, {"stage": "test.console"})
+    metrics_data = reader.get_metrics_data()
+    assert metrics_data is not None
+
+    lines = telemetry._format_metric_lines(metrics_data).splitlines()
+
+    assert "mindbridge.test.tokens kind=input value=7" in lines
+    assert "mindbridge.test.duration stage=test.console count=1 sum=0.5 max=0.5" in lines
+    provider.shutdown()
+
+
+_CONSOLE_RUNTIME_PROGRAM = """
+import asyncio
+
+from mindbridge.telemetry import configure_telemetry, operation_span, record_stage_duration
+
+providers = configure_telemetry("mindbridge-test")
+assert providers.tracer is not None and providers.meter is not None
+
+
+async def main() -> None:
+    async with operation_span("mindbridge.test.console"):
+        record_stage_duration("test.console", 0.25)
+
+
+asyncio.run(main())
+providers.tracer.shutdown()
+providers.meter.shutdown()
+"""
+
+
+def test_console_runtime_prints_measurements_with_no_collector_configured() -> None:
+    """A box with no OTLP endpoint must still be able to read what it measured."""
+    environment = {
+        key: value for key, value in os.environ.items() if not key.startswith("OTEL_")
+    } | {
+        "OTEL_METRICS_EXPORTER": "console",
+        "OTEL_SDK_DISABLED": "false",
+        "OTEL_SERVICE_NAME": "mindbridge-test",
+        "OTEL_TRACES_EXPORTER": "console",
+    }
+    result = subprocess.run(
+        [sys.executable, "-c", _CONSOLE_RUNTIME_PROGRAM],
+        check=False,
+        capture_output=True,
+        env=environment,
+        text=True,
+        timeout=60,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "mindbridge.test.console 0." in result.stdout
+    assert "mindbridge.stage.duration stage=test.console count=1 sum=0.25" in result.stdout
+    assert "mindbridge.operation.duration operation=mindbridge.test.console" in result.stdout
 
 
 def test_otlp_runtime_configures_in_an_isolated_process() -> None:
@@ -524,3 +765,76 @@ def test_the_timing_summary_stays_opt_in(monkeypatch: pytest.MonkeyPatch) -> Non
     telemetry.configure_logging("mindbridge-test", {"MINDBRIDGE_LOG_FORMAT": "json"})
 
     assert registered == []
+
+
+def test_output_repairs_outlive_a_sampler_that_drops_the_span(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """What a pipeline threw away is not a debugging detail a sampling decision may drop.
+
+    Same rule as a token charge, and for a stronger reason: a dropped count cannot be inferred
+    from anything else that lands. A low claim census reads identically whether the model said
+    little or the parser discarded most of what it said.
+    """
+    provider = TracerProvider(sampler=ALWAYS_OFF)
+    with caplog.at_level(logging.WARNING), provider.get_tracer("test").start_as_current_span("s"):
+        recording = trace.get_current_span().is_recording()
+        record_output_repairs({"mindbridge.perception.dropped_claim_count": 37})
+
+    assert recording is False
+    assert "mindbridge.perception.dropped_claim_count=37" in caplog.text
+    provider.shutdown()
+
+
+def test_output_repairs_stay_on_a_recording_span(caplog: pytest.LogCaptureFixture) -> None:
+    """The trace keeps them too: a count with no zero beside it says nothing about a trend."""
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    with caplog.at_level(logging.WARNING), provider.get_tracer("test").start_as_current_span("s"):
+        record_output_repairs({"mindbridge.perception.claim_type_alias_count": 0})
+
+    assert exporter.get_finished_spans()[0].attributes == {
+        "mindbridge.perception.claim_type_alias_count": 0
+    }
+    assert caplog.text == ""
+    provider.shutdown()
+
+
+_REPAIR_REPORT_PROGRAM = """
+import asyncio
+
+from mindbridge.telemetry import configure_telemetry, operation_span, record_output_repairs
+
+providers = configure_telemetry("mindbridge-test")
+assert not providers.enabled
+
+
+async def main() -> None:
+    async with operation_span("mindbridge.test.repairs"):
+        record_output_repairs({"mindbridge.perception.dropped_claim_count": 37})
+
+
+asyncio.run(main())
+"""
+
+
+def test_output_repairs_print_with_no_collector_and_the_documented_sampler() -> None:
+    """The deployment the 2026-08-21 evaluation ran on: no collector, one tenth of the traces."""
+    environment = {
+        key: value for key, value in os.environ.items() if not key.startswith("OTEL_")
+    } | {
+        "OTEL_TRACES_SAMPLER": "parentbased_traceidratio",
+        "OTEL_TRACES_SAMPLER_ARG": "0.1",
+    }
+    result = subprocess.run(
+        [sys.executable, "-c", _REPAIR_REPORT_PROGRAM],
+        check=False,
+        capture_output=True,
+        env=environment,
+        text=True,
+        timeout=60,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "mindbridge.perception.dropped_claim_count=37" in result.stderr

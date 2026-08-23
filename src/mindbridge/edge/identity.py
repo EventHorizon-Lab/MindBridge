@@ -6,6 +6,7 @@ import math
 import os
 import sqlite3
 from collections.abc import Callable
+from contextlib import AbstractContextManager
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
@@ -88,7 +89,6 @@ class LocalIdentityMatch:
             end_ms=end_ms,
             confidence=self.confidence,
             model_id=self.model_reference.model_id,
-            model_revision=self.model_reference.revision,
             scope=IdentityScope.DEVICE,
             transcript=transcript,
             visual_bbox_xyxy=visual_bbox_xyxy,
@@ -133,7 +133,6 @@ class _EncryptedSample(BaseModel):
     source_observation_id: str
     sample_id: str
     model_id: str
-    model_revision: str
     embedding: Annotated[tuple[float, ...], Field(min_length=1)]
 
 
@@ -284,7 +283,7 @@ class SQLiteIdentityMemory:
                        SUM((end_ms - start_ms) * confidence) AS score
                 FROM edge_face_voice_evidence
                 WHERE tenant_id = ? AND device_id = ?
-                  AND association_model_id = ? AND association_model_revision = ?
+                  AND association_model_id = ?
                 GROUP BY face_identity_id, voice_identity_id
                 HAVING COUNT(DISTINCT source_observation_id) >= ?
                    AND SUM(end_ms - start_ms) >= ?
@@ -296,7 +295,6 @@ class SQLiteIdentityMemory:
                     tenant_id,
                     self._device_id,
                     association_model_reference.model_id,
-                    association_model_reference.revision,
                     minimum_observations,
                     minimum_duration_ms,
                     minimum_confidence,
@@ -406,7 +404,7 @@ class SQLiteIdentityMemory:
                 """
                 SELECT * FROM edge_face_voice_evidence
                 WHERE tenant_id = ? AND device_id = ?
-                  AND association_model_id = ? AND association_model_revision = ?
+                  AND association_model_id = ?
                   AND evidence_id = ?
                 """,
                 (*self._association_scope(evidence), evidence.evidence_id),
@@ -421,10 +419,10 @@ class SQLiteIdentityMemory:
         connection.execute(
             """
             INSERT INTO edge_face_voice_evidence (
-                tenant_id, device_id, association_model_id, association_model_revision,
+                tenant_id, device_id, association_model_id,
                 evidence_id, source_observation_id, face_identity_id, voice_identity_id,
                 start_ms, end_ms, confidence, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 *self._association_scope(evidence),
@@ -448,7 +446,7 @@ class SQLiteIdentityMemory:
             """
             SELECT evidence_id FROM edge_face_voice_evidence
             WHERE tenant_id = ? AND device_id = ?
-              AND association_model_id = ? AND association_model_revision = ?
+              AND association_model_id = ?
               AND face_identity_id = ? AND voice_identity_id = ?
             ORDER BY created_at DESC, evidence_id DESC
             LIMIT -1 OFFSET ?
@@ -464,7 +462,7 @@ class SQLiteIdentityMemory:
             """
             DELETE FROM edge_face_voice_evidence
             WHERE tenant_id = ? AND device_id = ?
-              AND association_model_id = ? AND association_model_revision = ?
+              AND association_model_id = ?
               AND evidence_id = ?
             """,
             ((*self._association_scope(evidence), row["evidence_id"]) for row in old_evidence),
@@ -473,12 +471,11 @@ class SQLiteIdentityMemory:
     def _association_scope(
         self,
         evidence: FaceVoiceAssociationEvidence,
-    ) -> tuple[str, str, str, str]:
+    ) -> tuple[str, str, str]:
         return (
             evidence.tenant_id,
             self._device_id,
             evidence.model_reference.model_id,
-            evidence.model_reference.revision,
         )
 
     def _rank_matches(
@@ -493,7 +490,7 @@ class SQLiteIdentityMemory:
             """
             SELECT * FROM edge_identity_templates
             WHERE tenant_id = ? AND device_id = ? AND kind = ?
-              AND model_id = ? AND model_revision = ? AND dimension = ?
+              AND model_id = ? AND dimension = ?
             ORDER BY identity_id, created_at, sample_id
             """,
             (*self._sample_scope(sample), len(sample.embedding)),
@@ -524,7 +521,7 @@ class SQLiteIdentityMemory:
                 """
                 SELECT * FROM edge_identity_templates
                 WHERE tenant_id = ? AND device_id = ? AND kind = ?
-                  AND model_id = ? AND model_revision = ? AND sample_id = ?
+                  AND model_id = ? AND sample_id = ?
                 """,
                 (*self._sample_scope(sample), sample.sample_id),
             ).fetchone(),
@@ -544,7 +541,6 @@ class SQLiteIdentityMemory:
             source_observation_id=sample.source_observation_id,
             sample_id=sample.sample_id,
             model_id=sample.model_reference.model_id,
-            model_revision=sample.model_reference.revision,
             embedding=sample.embedding,
         )
         nonce = os.urandom(_NONCE_BYTES)
@@ -552,9 +548,9 @@ class SQLiteIdentityMemory:
             """
             INSERT INTO edge_identity_templates (
                 tenant_id, device_id, kind, identity_id, source_observation_id,
-                sample_id, model_id, model_revision, dimension, nonce,
+                sample_id, model_id, dimension, nonce,
                 encrypted_embedding, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 sample.tenant_id,
@@ -564,7 +560,6 @@ class SQLiteIdentityMemory:
                 sample.source_observation_id,
                 sample.sample_id,
                 sample.model_reference.model_id,
-                sample.model_reference.revision,
                 len(sample.embedding),
                 nonce,
                 self._cipher.encrypt(nonce, payload.model_dump_json().encode(), None),
@@ -593,7 +588,7 @@ class SQLiteIdentityMemory:
             """
             SELECT sample_id FROM edge_identity_templates
             WHERE tenant_id = ? AND device_id = ? AND kind = ?
-              AND model_id = ? AND model_revision = ? AND identity_id = ?
+              AND model_id = ? AND identity_id = ?
             ORDER BY created_at DESC, sample_id DESC
             LIMIT -1 OFFSET ?
             """,
@@ -603,18 +598,17 @@ class SQLiteIdentityMemory:
             """
             DELETE FROM edge_identity_templates
             WHERE tenant_id = ? AND device_id = ? AND kind = ?
-              AND model_id = ? AND model_revision = ? AND sample_id = ?
+              AND model_id = ? AND sample_id = ?
             """,
             ((*self._sample_scope(sample), row["sample_id"]) for row in old_samples),
         )
 
-    def _sample_scope(self, sample: LocalIdentitySample) -> tuple[str, str, str, str, str]:
+    def _sample_scope(self, sample: LocalIdentitySample) -> tuple[str, str, str, str]:
         return (
             sample.tenant_id,
             self._device_id,
             sample.kind.value,
             sample.model_reference.model_id,
-            sample.model_reference.revision,
         )
 
     def _match(
@@ -628,14 +622,11 @@ class SQLiteIdentityMemory:
             identity_id=str(row["identity_id"]),
             kind=IdentityKind(row["kind"]),
             confidence=confidence,
-            model_reference=ModelReference(
-                model_id=str(row["model_id"]),
-                revision=str(row["model_revision"]),
-            ),
+            model_reference=ModelReference(model_id=str(row["model_id"])),
             enrolled_new=enrolled_new,
         )
 
-    def _connect(self) -> sqlite3.Connection:
+    def _connect(self) -> AbstractContextManager[sqlite3.Connection]:
         return sqlite_connect(self._database_path)
 
     def _now(self) -> datetime:
@@ -676,7 +667,6 @@ def _association_evidence_matches_row(
         evidence.end_ms,
         evidence.confidence,
         evidence.model_reference.model_id,
-        evidence.model_reference.revision,
     ) == (
         row["tenant_id"],
         row["source_observation_id"],
@@ -687,7 +677,6 @@ def _association_evidence_matches_row(
         row["end_ms"],
         row["confidence"],
         row["association_model_id"],
-        row["association_model_revision"],
     )
 
 
@@ -755,7 +744,6 @@ def _payload_matches_row(payload: _EncryptedSample, row: _TemplateRow) -> bool:
         payload.source_observation_id,
         payload.sample_id,
         payload.model_id,
-        payload.model_revision,
         len(payload.embedding),
     ) == (
         row["tenant_id"],
@@ -765,7 +753,6 @@ def _payload_matches_row(payload: _EncryptedSample, row: _TemplateRow) -> bool:
         row["source_observation_id"],
         row["sample_id"],
         row["model_id"],
-        row["model_revision"],
         row["dimension"],
     )
 
@@ -777,7 +764,6 @@ def _new_identity_id(device_id: str, sample: LocalIdentitySample) -> str:
         sample.tenant_id,
         device_id,
         sample.model_reference.model_id,
-        sample.model_reference.revision,
         sample.sample_id,
     )
 

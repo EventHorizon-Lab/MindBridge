@@ -53,9 +53,7 @@ class SuperMemoryRunManifest(MediaBenchmarkRunManifest):
 
     benchmark: Literal["SuperMemory-VQA"] = "SuperMemory-VQA"
     dataset_repository: NonEmptyString
-    dataset_revision: NonEmptyString
     source_repository: NonEmptyString
-    source_revision: NonEmptyString
     prepared_media_manifest_sha256: Sha256Hex
     perception_prompt_version: NonEmptyString
     subject: int = Field(gt=0)
@@ -70,8 +68,6 @@ class SuperMemoryRunManifest(MediaBenchmarkRunManifest):
 class _Arguments(MediaArguments):
     prepared_media_path: Path
     subject: int
-    dataset_revision: str
-    source_revision: str
     question_ids: tuple[int, ...]
 
 
@@ -151,9 +147,7 @@ def _write_artifacts(
         annotation_sha256=sha256_file(arguments.dataset_path),
         predictions=predictions,
         dataset_repository="OSU-AIoT-MLSys-Lab/SuperMemory-VQA",
-        dataset_revision=arguments.dataset_revision,
         source_repository="AIoT-MLSys-Lab/supermemory-vqa",
-        source_revision=arguments.source_revision,
         prepared_media_manifest_sha256=sha256_file(arguments.prepared_media_path),
         perception_prompt_version=PERCEIVE_EVENTS_PROMPT.version,
         subject=arguments.subject,
@@ -196,12 +190,6 @@ def _parse_arguments(argv: Sequence[str] | None, prog: str | None) -> _Arguments
         "--subject", type=int, required=True, help="official subject whose videos this run replays"
     )
     parser.add_argument(
-        "--dataset-revision", required=True, help="revision of the official dataset release"
-    )
-    parser.add_argument(
-        "--source-revision", required=True, help="revision of the official video release"
-    )
-    parser.add_argument(
         "--question-id",
         type=int,
         action="append",
@@ -214,8 +202,6 @@ def _parse_arguments(argv: Sequence[str] | None, prog: str | None) -> _Arguments
         parsed,
         prepared_media_path=parsed.prepared_media,
         subject=parsed.subject,
-        dataset_revision=parsed.dataset_revision,
-        source_revision=parsed.source_revision,
         question_ids=tuple(parsed.question_id),
     )
 

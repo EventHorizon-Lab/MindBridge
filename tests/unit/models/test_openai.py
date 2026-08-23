@@ -26,6 +26,7 @@ from mindbridge.models import (
     TextPart,
 )
 from mindbridge.models.openai import OpenAIEmbedder, OpenAIGenerator, normalize_base_url
+from mindbridge.telemetry import model_token_usage, operation_span
 
 MODEL_ID = "jinaai/jina-embeddings-v5-omni-small-retrieval"
 
@@ -247,7 +248,31 @@ async def test_a_dropped_completion_stream_is_retryable() -> None:
         await generator.close()
 
 
-async def test_generation_reports_the_configured_deployment_revision() -> None:
+async def test_a_dropped_stream_still_charges_what_it_had_already_spent() -> None:
+    """A truncated response was still billed, and a failed attempt's charge reaches the job row."""
+
+    async def respond(_request: httpx.Request) -> httpx.Response:
+        return _truncated_completion_response(with_usage=True)
+
+    generator = _generator(respond)
+    try:
+        async with operation_span("mindbridge.test.observation"):
+            with pytest.raises(ModelUnavailableError):
+                await generator.generate(
+                    GenerateRequest(
+                        system_prompt="Answer from evidence.",
+                        input=ModelInput((TextPart("where is the tool?"),)),
+                        max_output_tokens=64,
+                    )
+                )
+            usage = model_token_usage()
+    finally:
+        await generator.close()
+
+    assert usage == {"input": 11, "output": 1}
+
+
+async def test_generation_reports_the_configured_model_not_the_serving_fingerprint() -> None:
     """A per-request serving fingerprint must not become the model identity."""
 
     async def respond(_request: httpx.Request) -> httpx.Response:
@@ -266,10 +291,38 @@ async def test_generation_reports_the_configured_deployment_revision() -> None:
         await generator.close()
 
     assert result.text == "on the workbench"
-    assert result.model_reference == ModelReference(
-        model_id="qwen3.8-max",
-        revision="pinned-generator-revision",
-    )
+    assert result.model_reference == ModelReference(model_id="qwen3.8-max")
+
+
+async def test_cumulative_stream_usage_is_charged_once_not_once_per_chunk() -> None:
+    """A server sending usage on every chunk multiplied the recorded bill by the chunk count.
+
+    OpenAI sends one final usage chunk, but vLLM's `continuous_usage_stats` -- and several
+    gateways by default -- repeat the running total on each one. The token account accumulates
+    whatever it is given, so what reached the job row and `mindbridge.model.tokens` was the sum
+    of every partial total rather than the charge.
+    """
+
+    async def respond(_request: httpx.Request) -> httpx.Response:
+        return _continuous_usage_completion_response()
+
+    generator = _generator(respond)
+    try:
+        async with operation_span("mindbridge.test.observation"):
+            result = await generator.generate(
+                GenerateRequest(
+                    system_prompt="Answer from evidence.",
+                    input=ModelInput((TextPart("where is the tool?"),)),
+                    max_output_tokens=64,
+                )
+            )
+            usage = model_token_usage()
+    finally:
+        await generator.close()
+
+    assert result.text == "on the workbench"
+    # The last chunk's totals, which are the whole request's charge.
+    assert usage == {"input": 11, "output": 3}
 
 
 async def test_schema_constrained_generation_asks_for_the_named_shape() -> None:
@@ -392,7 +445,7 @@ def _generator(
             http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
             max_retries=0,
         ),
-        ModelReference(model_id="qwen3.8-max", revision="pinned-generator-revision"),
+        ModelReference(model_id="qwen3.8-max"),
     )
 
 
@@ -418,15 +471,46 @@ def _completion_response(fingerprint: str) -> httpx.Response:
     )
 
 
-def _truncated_completion_response() -> httpx.Response:
+def _continuous_usage_completion_response() -> httpx.Response:
+    """Three chunks, each repeating the running total, as `continuous_usage_stats` does."""
+    events = [
+        {
+            "id": "completion_01",
+            "object": "chat.completion.chunk",
+            "created": 1,
+            "model": "qwen3.8-max",
+            "choices": [{"index": 0, "delta": {"content": content}, "finish_reason": finish}],
+            "usage": {
+                "prompt_tokens": 11,
+                "completion_tokens": completion_tokens,
+                "total_tokens": 11 + completion_tokens,
+            },
+        }
+        for content, finish, completion_tokens in (
+            ("on ", None, 1),
+            ("the ", None, 2),
+            ("workbench", "stop", 3),
+        )
+    ]
+    body = "".join(f"data: {json.dumps(event)}\n\n" for event in events)
+    return httpx.Response(
+        200,
+        headers={"content-type": "text/event-stream"},
+        content=f"{body}data: [DONE]\n\n",
+    )
+
+
+def _truncated_completion_response(*, with_usage: bool = False) -> httpx.Response:
     """One valid chunk, then the peer disappears in the middle of the body."""
-    event = {
+    event: dict[str, object] = {
         "id": "completion_01",
         "object": "chat.completion.chunk",
         "created": 1,
         "model": "qwen3.8-max",
         "choices": [{"index": 0, "delta": {"content": "on the "}, "finish_reason": None}],
     }
+    if with_usage:
+        event["usage"] = {"prompt_tokens": 11, "completion_tokens": 1, "total_tokens": 12}
 
     async def body() -> AsyncIterator[bytes]:
         yield f"data: {json.dumps(event)}\n\n".encode()
@@ -441,6 +525,75 @@ def _truncated_completion_response() -> httpx.Response:
     )
 
 
+async def test_embedding_reports_its_usage_into_the_token_account() -> None:
+    """Serving the encoder makes embedding a metered call, so its bill has to land somewhere.
+
+    Only the generator reported usage, so an embedding endpoint's charge was invisible -- which
+    matters exactly when the recommended configuration moves embedding off the local GPU and
+    onto a metered endpoint. An embedding charges entirely on its input; there is no completion
+    half to report.
+    """
+
+    async def respond(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "object": "list",
+                "data": [
+                    {"object": "embedding", "index": 0, "embedding": [1.0] + [0.0] * 1_023},
+                    {"object": "embedding", "index": 1, "embedding": [0.0, 1.0] + [0.0] * 1_022},
+                ],
+                "model": MODEL_ID,
+                "usage": {"prompt_tokens": 42, "total_tokens": 42},
+            },
+        )
+
+    embedder = _embedder(respond)
+    try:
+        async with operation_span("mindbridge.test.observation"):
+            await embedder.embed(
+                EmbedRequest(
+                    inputs=(
+                        ModelInput((TextPart("first event"),)),
+                        ModelInput((TextPart("second claim"),)),
+                    ),
+                    task=EmbedTask.DOCUMENT,
+                )
+            )
+            usage = model_token_usage()
+    finally:
+        await embedder.close()
+
+    assert usage == {"input": 42}
+
+
+async def test_multimodal_embedding_charges_the_whole_batch() -> None:
+    """A multimodal batch is one request per item, so the account has to sum them."""
+
+    async def respond(_request: httpx.Request) -> httpx.Response:
+        return _embedding_response()
+
+    embedder = _embedder(respond)
+    try:
+        async with operation_span("mindbridge.test.observation"):
+            await embedder.embed(
+                EmbedRequest(
+                    inputs=(
+                        ModelInput((_media_part(MediaKind.VIDEO, "01"),)),
+                        ModelInput((_media_part(MediaKind.IMAGE, "02"),)),
+                        ModelInput((_media_part(MediaKind.AUDIO, "03"),)),
+                    ),
+                    task=EmbedTask.DOCUMENT,
+                )
+            )
+            usage = model_token_usage()
+    finally:
+        await embedder.close()
+
+    # One prompt token per clip in the stub response, three clips.
+    assert usage == {"input": 3}
+
+
 def _embedder(
     handler: Callable[[httpx.Request], Coroutine[None, None, httpx.Response]],
 ) -> OpenAIEmbedder:
@@ -452,8 +605,8 @@ def _embedder(
     )
     return OpenAIEmbedder(
         client,
-        ModelReference(model_id=MODEL_ID, revision="pinned-revision"),
-        space_reference=EmbeddingSpaceReference(space_id="jina-space", revision="v1"),
+        ModelReference(model_id=MODEL_ID),
+        space_reference=EmbeddingSpaceReference(space_id="jina-space"),
     )
 
 

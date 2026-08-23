@@ -67,14 +67,12 @@ CONSOLIDATION_ENVIRONMENT = """environment:
                                     this sweep lets the Generator inspect
   MINDBRIDGE_GENERATOR_PLUGIN, MINDBRIDGE_EMBEDDER_PLUGIN
                                     model plugins to load (default: openai)
-  MINDBRIDGE_GENERATOR_API_KEY, MINDBRIDGE_GENERATOR_ENDPOINT,
-  MINDBRIDGE_GENERATOR_MODEL_REVISION
+  MINDBRIDGE_GENERATOR_API_KEY, MINDBRIDGE_GENERATOR_ENDPOINT
                                     required by the default openai generator plugin;
                                     MINDBRIDGE_GENERATOR_MODEL_ID is optional
   MINDBRIDGE_EMBEDDER_API_KEY, MINDBRIDGE_EMBEDDER_ENDPOINT
                                     required by the default openai embedder plugin;
-                                    MINDBRIDGE_EMBEDDER_MODEL_ID and _MODEL_REVISION
-                                    are optional
+                                    MINDBRIDGE_EMBEDDER_MODEL_ID is optional
   MINDBRIDGE_GENERATOR_CONFIG_JSON, MINDBRIDGE_EMBEDDER_CONFIG_JSON
                                     explicit plugin configuration; an object here
                                     replaces the per-field variables above"""

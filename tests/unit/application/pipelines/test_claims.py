@@ -34,7 +34,7 @@ from mindbridge.models.openai import OpenAIGenerator, normalize_base_url
 NOW = datetime(2026, 8, 12, 12, 0, tzinfo=timezone.utc)
 
 
-async def test_claim_consolidator_inspects_native_evidence_and_preserves_revision() -> None:
+async def test_claim_consolidator_inspects_native_evidence_and_reports_its_model() -> None:
     async def respond(request: httpx.Request) -> httpx.Response:
         payload: dict[str, object] = json.loads(request.content)
         messages = cast(list[dict[str, object]], payload["messages"])
@@ -62,7 +62,7 @@ async def test_claim_consolidator_inspects_native_evidence_and_preserves_revisio
                     }
                 ],
             },
-            fingerprint="claim-serving-revision-01",
+            fingerprint="claim-serving-fingerprint-01",
         )
 
     consolidator = _consolidator(respond)
@@ -77,8 +77,8 @@ async def test_claim_consolidator_inspects_native_evidence_and_preserves_revisio
         ClaimId("claim_02"),
     )
     assert result.relationships[0].relation_type is RelationType.CONTRADICTS
-    assert result.model_reference.revision == "deployment-revision"
-    assert result.prompt_version == "consolidate_claims_v2"
+    assert result.model_reference.model_id == "qwen3.8-max"
+    assert result.prompt_version == "consolidate_claims_v4"
 
 
 async def test_claim_consolidator_rejects_unknown_and_reversed_relationships() -> None:
@@ -185,7 +185,7 @@ def _consolidator(
     return _ClaimHarness(
         OpenAIGenerator(
             client,
-            ModelReference(model_id="qwen3.8-max", revision="deployment-revision"),
+            ModelReference(model_id="qwen3.8-max"),
         )
     )
 
@@ -213,10 +213,7 @@ def _candidates() -> tuple[tuple[ClaimCandidate, ...], tuple[ResolvedEvidence, .
                 valid_from=NOW + timedelta(minutes=index),
                 valid_to=None,
                 created_at=NOW,
-                model_reference=ModelReference(
-                    model_id="qwen3.8-max",
-                    revision="perception-revision",
-                ),
+                model_reference=ModelReference(model_id="qwen3.8-max"),
                 prompt_version="perceive_events_v3",
             ),
             entity_ids=(EntityId("person_robot_01"), EntityId("red_tool")),

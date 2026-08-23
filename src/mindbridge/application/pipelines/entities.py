@@ -75,7 +75,6 @@ class EntityResolutionPipeline:
         set_current_span_attributes(
             {
                 "mindbridge.model.id": result.model_reference.model_id,
-                "mindbridge.model.revision": result.model_reference.revision,
                 "mindbridge.prompt.version": RESOLVE_ENTITIES_PROMPT.version,
                 "mindbridge.entity.same_entity": output.same_entity,
                 "mindbridge.evidence.count": len(evidence),

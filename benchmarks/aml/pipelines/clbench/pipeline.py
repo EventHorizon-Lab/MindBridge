@@ -50,7 +50,7 @@ def read_jsonl(path: str | Path) -> list[dict[str, Any]]:
     file = Path(path)
     if not file.exists():
         return []
-    return [json.loads(line) for line in file.read_text(encoding="utf-8").splitlines() if line.strip()]
+    return [json.loads(line) for line in file.read_text(encoding="utf-8").split("\n") if line.strip()]
 
 
 def row_id(item: dict[str, Any], index: int) -> str:

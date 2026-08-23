@@ -127,10 +127,7 @@ def _identity_observations_from_json(value: object) -> tuple[AnonymousIdentityOb
             start_ms=item.start_ms,
             end_ms=item.end_ms,
             confidence=item.confidence,
-            model_reference=ModelReference(
-                model_id=item.model_id,
-                revision=item.model_revision,
-            ),
+            model_reference=ModelReference(model_id=item.model_id),
             scope=item.scope,
             transcript=item.transcript,
             visual_bbox_xyxy=item.visual_bbox_xyxy,

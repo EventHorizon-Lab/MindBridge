@@ -1,5 +1,7 @@
 """Tests for the Jina Sentence Transformers boundary."""
 
+import asyncio
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -50,7 +52,7 @@ class RecordingEncoder:
         return Matrix(self.values)
 
 
-def test_jina_pins_remote_code_to_the_model_revision(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_jina_loads_the_snapshot_it_downloaded(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[tuple[str, dict[str, object]]] = []
 
     def sentence_transformer(model_path: str, **kwargs: object) -> RecordingEncoder:
@@ -71,27 +73,19 @@ def test_jina_pins_remote_code_to_the_model_revision(monkeypatch: pytest.MonkeyP
     )
     monkeypatch.setattr("mindbridge.models.jina.select_torch_device", lambda _device: "cuda")
 
-    JinaEmbedder.load(revision="pinned-revision", dimension=2)
+    JinaEmbedder.load(dimension=2)
 
     assert calls == [
         (
             "snapshot_download",
-            {
-                "repo_id": "jinaai/jina-embeddings-v5-omni-small-retrieval",
-                "revision": "pinned-revision",
-            },
+            {"repo_id": "jinaai/jina-embeddings-v5-omni-small-retrieval"},
         ),
         (
             "/models/pinned",
             {
-                "revision": "pinned-revision",
                 "trust_remote_code": True,
                 "device": "cuda",
-                "model_kwargs": {
-                    "modality": "omni",
-                    "code_revision": "pinned-revision",
-                },
-                "config_kwargs": {"code_revision": "pinned-revision"},
+                "model_kwargs": {"modality": "omni"},
             },
         ),
     ]
@@ -102,7 +96,7 @@ async def test_jina_uses_distinct_query_and_document_methods() -> None:
     encoder = RecordingEncoder([[1.0, 0.0]])
     embedder = JinaEmbedder(
         encoder,
-        ModelReference(model_id="jina", revision="revision"),
+        ModelReference(model_id="jina"),
         dimension=2,
     )
 
@@ -124,11 +118,78 @@ async def test_jina_uses_distinct_query_and_document_methods() -> None:
     assert encoder.calls == ["query", "document"]
 
 
+class GatedEncoder(RecordingEncoder):
+    """A document encode that parks inside the worker thread until it is released."""
+
+    def __init__(self) -> None:
+        super().__init__([[1.0, 0.0]])
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def encode_document(
+        self,
+        sentences: list[object],
+        *,
+        convert_to_numpy: bool,
+        normalize_embeddings: bool,
+        truncate_dim: int,
+    ) -> Matrix:
+        self.calls.append("document")
+        self.entered.set()
+        assert self.release.wait(timeout=10)
+        return Matrix(self.values)
+
+
+async def test_jina_keeps_a_query_lane_free_while_documents_encode() -> None:
+    """An interactive recall must not queue behind bulk ingest.
+
+    Reads and writes shared one semaphore, so an empty recall -- no memories retrieved and no
+    generation at all -- took 57-71 s under write load against a 12.4 s idle baseline: the query
+    embed was waiting for whichever document batch held the slot. The document lane stays
+    bounded by `max_concurrency`; only the query lane is separate.
+    """
+    encoder = GatedEncoder()
+    embedder = JinaEmbedder(
+        encoder,
+        ModelReference(model_id="jina"),
+        dimension=2,
+        max_concurrency=1,
+    )
+    document = EmbedRequest(
+        inputs=(ModelInput((TextPart("bulk document"),)),),
+        task=EmbedTask.DOCUMENT,
+    )
+
+    first = asyncio.create_task(embedder.embed(document))
+    await asyncio.to_thread(encoder.entered.wait, 10)
+    second = asyncio.create_task(embedder.embed(document))
+    await asyncio.sleep(0.05)
+
+    query = await asyncio.wait_for(
+        embedder.embed(
+            EmbedRequest(
+                inputs=(ModelInput((TextPart("Where is the screwdriver?"),)),),
+                task=EmbedTask.QUERY,
+            )
+        ),
+        timeout=5,
+    )
+
+    assert query.embeddings[0].values == (1.0, 0.0)
+    # The document lane is still one at a time: the second batch has not been handed to the
+    # encoder while the first holds the only document slot.
+    assert encoder.calls.count("document") == 1
+
+    encoder.release.set()
+    await asyncio.wait_for(asyncio.gather(first, second), timeout=10)
+    assert encoder.calls.count("document") == 2
+
+
 async def test_jina_rejects_invalid_model_output() -> None:
     """Malformed upstream vectors cannot enter the semantic index."""
     embedder = JinaEmbedder(
         RecordingEncoder([[1.0, 1.0]]),
-        ModelReference(model_id="jina", revision="revision"),
+        ModelReference(model_id="jina"),
         dimension=2,
     )
 
@@ -146,7 +207,7 @@ async def test_jina_skips_model_call_for_empty_batch() -> None:
     encoder = RecordingEncoder([])
     embedder = JinaEmbedder(
         encoder,
-        ModelReference(model_id="jina", revision="revision"),
+        ModelReference(model_id="jina"),
         dimension=2,
     )
 
@@ -191,7 +252,7 @@ def _load_with(encoder: object, monkeypatch: pytest.MonkeyPatch) -> JinaEmbedder
         ),
     )
     monkeypatch.setattr("mindbridge.models.jina.select_torch_device", lambda _device: "cuda")
-    return JinaEmbedder.load(revision="pinned-revision", dimension=2)
+    return JinaEmbedder.load(dimension=2)
 
 
 def test_jina_refuses_a_model_whose_media_processor_failed_to_load(

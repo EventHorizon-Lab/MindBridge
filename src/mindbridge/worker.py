@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
 from typing import Annotated, NoReturn, Protocol
@@ -15,15 +16,23 @@ from celery.exceptions import (
     SoftTimeLimitExceeded,
 )
 from celery.signals import (
+    worker_init,
     worker_process_init,
     worker_process_shutdown,
 )
 from pydantic import Field, StrictBool
 
 from mindbridge.application.capabilities import Embedder
-from mindbridge.application.evidence_clips import ClipSampling
+from mindbridge.application.evidence_clips import (
+    MAX_PROXY_SAMPLED_FRAMES,
+    MAX_SAMPLING_FLOOR_MS,
+    ClipSampling,
+)
 from mindbridge.application.pipelines import PerceptionPipeline
-from mindbridge.application.process_observation import ProcessObservation
+from mindbridge.application.process_observation import (
+    ProcessObservation,
+    record_unclaimed_processing_failure,
+)
 from mindbridge.configuration import (
     PluginConfigModel,
     PluginInteger,
@@ -71,7 +80,12 @@ from mindbridge.models.defaults import (
     openai_generator_config,
 )
 from mindbridge.models.plugins import close_model, load_embedder, load_generator
-from mindbridge.telemetry import configure_observability, flush_timing_summary
+from mindbridge.telemetry import (
+    TelemetryProviders,
+    configure_logging,
+    configure_telemetry,
+    flush_timing_summary,
+)
 
 _MODEL_REQUEST_TIMEOUT_SECONDS = 780.0
 _POST_MODEL_BUDGET_SECONDS = 300.0
@@ -89,12 +103,45 @@ _RUNNING_RETRIES_HEADER = "mindbridge_running_retries"
 DEFAULT_WORKER_CONCURRENCY = 1
 MAXIMUM_WORKER_CONCURRENCY = 32
 
+# ponytail: an allowlist of plugin names, because a plugin cannot be asked whether it holds a
+# device. Give `Embedder` a "runs in this process" property if a third-party local plugin ever
+# needs to be covered by the guard below.
+_IN_PROCESS_EMBEDDER_PLUGINS = frozenset({"jina"})
+
+_IN_PROCESS_EMBEDDER_VRAM_GIB = 3.7
+_IN_PROCESS_EMBEDDER_RSS_GIB = 1.4
+"""What one prefork child holds for the bundled Jina Omni encoder, measured on an RTX 5090.
+
+3 745 MiB of VRAM (weights plus the child's own CUDA context) and 1.36 GiB of resident host
+memory, per loaded copy, before any activation memory. The 2026-08-21 evaluation ran six children at
+4.3-4.8 GB each and reached 30.2 of the card's 32.6 GB with the GPU at 1-5% utilisation.
+"""
+
+_MAX_SAMPLING_FRAMES_PER_SECOND = MAX_PROXY_SAMPLED_FRAMES / (MAX_SAMPLING_FLOOR_MS / 1_000)
+"""The rate past which the sampling knob silently switches off the feature it is tuning.
+
+`MAX_SAMPLING_FLOOR_MS` is the longest window a span is widened to before sampling, and
+`MAX_PROXY_SAMPLED_FRAMES` is the most frames a generation proxy may carry, so above their
+quotient every span at least that long -- which is every perceived event, 2 to 5 seconds of
+them -- exceeds the ceiling and has its proxy skipped. Bounding the rate here rather than
+downstream is the difference between a refusal naming the variable and a decode that silently
+does nothing.
+"""
+
+_SINGLE_PROCESS_POOLS = ("thread", "solo", "gevent", "eventlet")
+"""Celery pools that run one process, where concurrency buys no second copy of a model."""
+
+
+_worker_telemetry: TelemetryProviders | None = None
+
 
 @worker_process_init.connect(weak=False)  # type: ignore[untyped-decorator]
 def _configure_worker_telemetry(**_kwargs: object) -> None:
     """Initialize logging and exporters after Celery forks its process-safe worker child."""
+    global _worker_telemetry
     _dispose_worker_runtime()
-    configure_observability("mindbridge-worker")
+    configure_logging("mindbridge-worker")
+    _worker_telemetry = configure_telemetry("mindbridge-worker")
 
 
 class _TaskRequest(Protocol):
@@ -144,6 +191,7 @@ class WorkerSettings:
     overlapping anything. Raise it when the models are served over the network, and remember
     that each child opens its own database pool -- see MINDBRIDGE_DATABASE_MAX_POOL_SIZE.
     """
+    vram_budget_gib: float = _IN_PROCESS_EMBEDDER_VRAM_GIB
 
     def __post_init__(self) -> None:
         for name, value in (
@@ -200,7 +248,7 @@ class WorkerSettings:
             media_embedder_config=plugin_configuration(
                 source,
                 "MINDBRIDGE_MEDIA_EMBEDDER_CONFIG_JSON",
-                (lambda: jina_media_embedder_config(source)) if media_plugin == "jina" else None,
+                _media_embedder_fallback(source, media_plugin),
             ),
             text_embedder_plugin=text_plugin,
             text_embedder_config=plugin_configuration(
@@ -218,7 +266,52 @@ class WorkerSettings:
             embedding_dimension=embedding_dimension_from_environment(source),
             clip_sampling=_clip_sampling_from_environment(source),
             worker_concurrency=_worker_concurrency_from_environment(source),
+            vram_budget_gib=_vram_budget_from_environment(source),
         )
+
+
+def _vram_budget_from_environment(source: Mapping[str, str]) -> float:
+    """Read how much device memory this deployment lets resident encoders occupy.
+
+    The default is one copy, so a second in-process encoder stays a decision rather than an
+    accident. A larger card says otherwise in one number: a guard with no way to say yes gets
+    routed around, and the route an operator finds is a flag the guard cannot see. The estimate
+    this bounds covers weights and CUDA contexts only, so leave room for activation memory --
+    the evaluation's six children measured 30.2 GB against an estimated 22.2.
+    """
+    value = optional_environment_value(source, "MINDBRIDGE_WORKER_VRAM_BUDGET_GIB")
+    if value is None:
+        return _IN_PROCESS_EMBEDDER_VRAM_GIB
+    budget = float(value)
+    # Finite as well as positive, and this field has no upper bound to reject an infinity on its
+    # behalf: `float()` accepts `inf`, `Infinity`, and any literal that overflows to one, and
+    # every estimate compares below an infinite budget -- so the one variable that raises the
+    # guard would switch it off instead, silently, on a typo. NaN fails `isfinite` too.
+    if not math.isfinite(budget) or budget <= 0:
+        raise ValueError("MINDBRIDGE_WORKER_VRAM_BUDGET_GIB must be a finite positive number")
+    return budget
+
+
+def _media_embedder_fallback(
+    source: Mapping[str, str],
+    plugin: str,
+) -> Callable[[], dict[str, object]] | None:
+    """Let the media slot reach a served encoder without a second family of variables.
+
+    The bundled local plugin needs a device and a model id, which the Worker-specific names
+    already supply. Serving the same model instead needs credentials and an endpoint -- and the
+    deployment necessarily has one of those already, for the text encoder that must write into
+    the same embedding space. Reusing it makes the served media slot one variable rather than
+    five, which matters because it is the configuration that keeps a model out of every child.
+    """
+    if plugin == "jina":
+        return lambda: jina_media_embedder_config(source)
+    if plugin == "openai":
+        return lambda: openai_embedder_config(
+            source,
+            request_timeout_seconds=_MODEL_REQUEST_TIMEOUT_SECONDS,
+        )
+    return None
 
 
 class _MediaSamplingConfig(PluginConfigModel):
@@ -229,10 +322,20 @@ class _MediaSamplingConfig(PluginConfigModel):
     silently mean something else.
     """
 
-    frames_per_second: Annotated[PluginNumber, Field(gt=0)] = DEFAULT_VIDEO_FRAMES_PER_SECOND
+    # The upper bound is also what rejects `Infinity`, which `json.loads` accepts and `gt=0`
+    # admitted: the value used to reach the media layer as a frame rate and be caught there by a
+    # downstream invariant instead of at the boundary it entered through. `allow_inf_nan=False`
+    # is not carried beside it because it is inert -- measured on this field, the bound rejects
+    # both `Infinity` and `NaN` with the identical message either way. Removing the bound is what
+    # would let them back in, which is what the parametrized refusals pin.
+    frames_per_second: Annotated[
+        PluginNumber,
+        Field(gt=0, le=_MAX_SAMPLING_FRAMES_PER_SECOND),
+    ] = DEFAULT_VIDEO_FRAMES_PER_SECOND
     max_pixels: Annotated[PluginInteger, Field(gt=0)] = DEFAULT_VIDEO_MAX_PIXELS
     image_max_pixels: Annotated[PluginInteger, Field(gt=0)] = DEFAULT_IMAGE_MAX_PIXELS
     generation_proxy: StrictBool = True
+    proxy_audio: StrictBool = True
 
 
 def _worker_concurrency_from_environment(source: Mapping[str, str]) -> int:
@@ -264,16 +367,16 @@ def _clip_sampling_from_environment(source: Mapping[str, str]) -> ClipSampling:
 
 @dataclass(slots=True)
 class _WorkerRuntime:
-    """One event loop and media model owned by a prefork Worker child."""
+    """One event loop and both encoder models owned by a prefork Worker child."""
 
     loop: asyncio.AbstractEventLoop
-    media_embedder: Embedder
+    embedders: tuple[Embedder, Embedder] | None = None
 
     def run(self, settings: WorkerSettings, message: ObservationProcessingTaskMessage) -> JobState:
         task = self.loop.create_task(
             _process_observation_once(
                 settings,
-                self.media_embedder,
+                self,
                 TenantId(message.tenant_id),
                 ObservationId(message.observation_id),
                 JobId(message.job_id),
@@ -287,15 +390,37 @@ class _WorkerRuntime:
                 self.loop.run_until_complete(asyncio.gather(task, return_exceptions=True))
             raise
 
+    async def encoders(self, settings: WorkerSettings) -> tuple[Embedder, Embedder]:
+        """Load both encoder plugins once per child, while their owning loop is running.
+
+        The text encoder used to be loaded inside every task and released with a `close_model`
+        the bundled encoder does not implement, so each observation re-allocated its weights and
+        reclaimed nothing. What is left of that cost is the first delivery to a fresh child and
+        every `--max-memory-per-child` recycle after it, which is exactly when a card that is
+        already full says so. Loading from here rather than while the runtime is being built is
+        what puts that allocation inside an open store, where the failure can reach the ledger
+        instead of being acked away with its message.
+        """
+        if self.embedders is None:
+            self.embedders = (
+                load_embedder(settings.media_embedder_plugin, settings.media_embedder_config),
+                load_embedder(settings.text_embedder_plugin, settings.text_embedder_config),
+            )
+        return self.embedders
+
     def close(self) -> None:
         try:
-            self.loop.run_until_complete(close_model(self.media_embedder))
+            self.loop.run_until_complete(self._close_models())
         finally:
             self.loop.close()
 
+    async def _close_models(self) -> None:
+        for model in self.embedders or ():
+            await close_model(model)
+
 
 _worker_runtime: _WorkerRuntime | None = None
-_worker_runtime_key: tuple[str, str] | None = None
+_worker_runtime_key: str | None = None
 
 
 def processing_budget_seconds(generator_config: Mapping[str, object]) -> float:
@@ -321,6 +446,118 @@ def processing_budget_seconds(generator_config: Mapping[str, object]) -> float:
     return float(configured) + _POST_MODEL_BUDGET_SECONDS
 
 
+def require_bounded_in_process_models(
+    settings: WorkerSettings,
+    concurrency: int,
+    *,
+    pool: object = "prefork",
+) -> None:
+    """Refuse to fork an encoder into every child, which is what exhausted the GPU.
+
+    A prefork child owns its own plugins, so an in-process encoder is loaded once per child and
+    its device memory scales with the pool size. `--max-memory-per-child` bounds resident host
+    memory and structurally cannot bound VRAM, so during the 2026-08-21 evaluation nothing
+    reported this until the allocator failed hours in -- 479 CUDA out-of-memory errors and a
+    kernel `global_oom` on the host.
+
+    Only a configuration that really holds device memory in more than one process is refused: a
+    pool that shares one process holds one copy however wide it runs, and an encoder pinned to
+    `device=cpu` holds no VRAM at all. What is left is measured against a budget the deployment
+    can raise, because a guard that refuses valid configurations and offers no way to say yes
+    gets routed around -- and the route is a flag this cannot see.
+
+    Refusing costs no capability. One worker process per assigned GPU at concurrency 1 is what
+    the deployment guide already recommends for scaling, and a served encoder removes the
+    resident model from every child, which is both faster and unbounded by the card.
+    """
+    slots = tuple(
+        f"{variable}={plugin}"
+        for variable, plugin, config in (
+            (
+                "MINDBRIDGE_MEDIA_EMBEDDER_PLUGIN",
+                settings.media_embedder_plugin,
+                settings.media_embedder_config,
+            ),
+            (
+                "MINDBRIDGE_EMBEDDER_PLUGIN",
+                settings.text_embedder_plugin,
+                settings.text_embedder_config,
+            ),
+        )
+        if plugin in _IN_PROCESS_EMBEDDER_PLUGINS and _holds_device_memory(config)
+    )
+    if concurrency <= 1 or not slots or not _pool_forks_children(pool):
+        return
+    # Every named slot is cached for the life of the child, so a child holding two of them
+    # holds two copies -- which is the evaluation's own configuration.
+    copies = concurrency * len(slots)
+    vram = copies * _IN_PROCESS_EMBEDDER_VRAM_GIB
+    if vram <= settings.vram_budget_gib:
+        return
+    raise ValueError(
+        f"{' and '.join(slots)} loads an encoder into the Worker process, and every prefork "
+        f"child holds its own, so a pool of {concurrency} means {copies} of them: about "
+        f"{vram:.1f} GiB of VRAM and about {copies * _IN_PROCESS_EMBEDDER_RSS_GIB:.1f} GiB of "
+        f"resident host memory, past the {settings.vram_budget_gib:.1f} GiB this deployment "
+        "allows and before any activation memory. --max-memory-per-child bounds resident memory "
+        "and cannot bound VRAM. Serve the encoder instead -- set the plugin to openai and give "
+        "it an endpoint, which leaves no model in any child -- or run one worker process per "
+        "assigned GPU at --concurrency 1. A card that can hold them all says so in "
+        "MINDBRIDGE_WORKER_VRAM_BUDGET_GIB."
+    )
+
+
+def _holds_device_memory(config: Mapping[str, object]) -> bool:
+    """Read the device the plugin will actually select: only `cpu` costs no VRAM.
+
+    An absent key and `auto` both resolve to CUDA whenever a card is present, so only the
+    explicit host device is exempt. Matching `select_torch_device` means normalising the same
+    way it does, or a config it accepts would be read here as something else.
+    """
+    device = config.get("device")
+    return not isinstance(device, str) or device.strip().lower() != "cpu"
+
+
+def _pool_forks_children(pool: object) -> bool:
+    """Only a process pool gives every child its own copy of an in-process model.
+
+    Celery has not resolved `pool_cls` to a class yet when `worker_init` fires, so this reads a
+    name. Anything unrecognised counts as forking, which errs towards refusing.
+    """
+    name = (pool if isinstance(pool, str) else getattr(pool, "__module__", "")).lower()
+    return not any(single in name for single in _SINGLE_PROCESS_POOLS)
+
+
+def _resolved_pool_size(sender: object) -> int:
+    """Read how many children the worker will actually fork, `--autoscale` included.
+
+    `worker_init` fires before the Pool bootstep that parses that flag: celery 5.6.3 sends the
+    signal at `worker/worker.py:127` and sets `autoscale` and `max_concurrency` at
+    `worker/components.py:117-127`, inside the later `blueprint.apply`. At the signal the flag
+    is still an unparsed entry in `sender.options` and `concurrency` is this app's default of 1,
+    so reading `concurrency` alone waved `--autoscale=6,1` through to six children -- the
+    workaround an operator refused at `--concurrency` reaches for first.
+    """
+    autoscale = getattr(sender, "autoscale", None)
+    if autoscale is None:
+        options = getattr(sender, "options", None)
+        autoscale = options.get("autoscale") if isinstance(options, Mapping) else None
+    if isinstance(autoscale, str):
+        autoscale = autoscale.split(",")
+    if isinstance(autoscale, (list, tuple)):
+        autoscale = autoscale[0] if autoscale else None
+    return max(_child_count(getattr(sender, "concurrency", 1)), _child_count(autoscale))
+
+
+def _child_count(value: object) -> int:
+    """Read one pool-size value; anything unparseable makes no claim on the card."""
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value.strip())
+    return 0
+
+
 def create_worker_app(settings: WorkerSettings) -> Celery:
     """Register the ID-only processing task on one GPU-safe Celery app."""
     task_queue = create_task_queue(
@@ -331,6 +568,25 @@ def create_worker_app(settings: WorkerSettings) -> Celery:
         worker_concurrency=settings.worker_concurrency,
         worker_pool="prefork",
     )
+
+    # `worker_init` is the earliest point at which every input to the pool size is readable:
+    # the CLI flags, this app's default, and Celery's own CPU-count fallback. `--autoscale` is
+    # readable but not yet parsed there, which `_resolved_pool_size` handles. The dispatch UID
+    # keeps a re-created app from stacking a second receiver.
+    @worker_init.connect(weak=False, dispatch_uid="mindbridge-in-process-model-guard")  # type: ignore[untyped-decorator]
+    def _guard_in_process_models(sender: object = None, **_kwargs: object) -> None:
+        try:
+            require_bounded_in_process_models(
+                settings,
+                _resolved_pool_size(sender),
+                pool=getattr(sender, "pool_cls", "prefork"),
+            )
+        except ValueError as error:
+            # Celery's `Signal.send` catches `Exception` from every receiver, logs it, and
+            # carries on -- so raising `ValueError` here would print a traceback and then start
+            # the worker anyway, which is the silent failure this guard exists to replace.
+            # `SystemExit` is not an `Exception`, so it survives that handler and stops boot.
+            raise SystemExit(f"refusing to start the Worker: {error}") from error
 
     @task_queue.task(  # type: ignore[untyped-decorator]
         name=PROCESS_OBSERVATION_TASK,
@@ -384,72 +640,83 @@ def run_observation_processing(
     message: ObservationProcessingTaskMessage,
 ) -> JobState:
     """Run one synchronous Celery delivery through the shared async use case."""
-    runtime = _get_worker_runtime(
-        settings.media_embedder_plugin,
-        json.dumps(settings.media_embedder_config, sort_keys=True, separators=(",", ":")),
-    )
-    return runtime.run(settings, message)
+    return _get_worker_runtime(settings).run(settings, message)
 
 
 async def _process_observation_once(
     settings: WorkerSettings,
-    media_embedder: Embedder,
+    runtime: _WorkerRuntime,
     tenant_id: TenantId,
     observation_id: ObservationId,
     job_id: JobId,
 ) -> JobState:
+    """Prepare this delivery inside the open store, so a setup failure reaches the ledger.
+
+    The store is opened first and everything fallible after it is guarded, because `task_acks_late`
+    discards the message of a task that raised: work done before `ProcessObservation` claims the
+    row fails with nothing written and nothing left to redeliver it. Only the pool itself is
+    outside, and a pool that cannot open raises `DatabaseUnavailableError`, which is retried, or
+    the schema refusal -- a deployment-wide mismatch that would otherwise stamp `failed` on every
+    row it touched, when `pending` is what `mindbridge jobs --republish` picks up once the schema
+    is fixed.
+    """
     store = PostgresMemoryStore(
         settings.database_url,
         embedding_dimension=settings.embedding_dimension,
         max_pool_size=resolve_database_max_pool_size(),
     )
-    media_access = S3MediaAccess(settings.object_storage)
     async with AsyncExitStack() as resources:
-        generator = load_generator(settings.generator_plugin, settings.generator_config)
-        resources.push_async_callback(close_model, generator)
-        text_embedder = load_embedder(settings.text_embedder_plugin, settings.text_embedder_config)
-        resources.push_async_callback(close_model, text_embedder)
         await store.open()
         resources.push_async_callback(store.close)
-        job = await ProcessObservation(
-            store,
-            PerceptionPipeline(generator),
-            media_embedder,
-            text_embedder,
-            media_url_signer=media_access,
-            clip_sampling=settings.clip_sampling,
-        ).run(tenant_id, observation_id, job_id)
+        try:
+            media_embedder, text_embedder = await runtime.encoders(settings)
+            generator = load_generator(settings.generator_plugin, settings.generator_config)
+            resources.push_async_callback(close_model, generator)
+            processor = ProcessObservation(
+                store,
+                PerceptionPipeline(generator),
+                media_embedder,
+                text_embedder,
+                media_url_signer=S3MediaAccess(settings.object_storage),
+                clip_sampling=settings.clip_sampling,
+            )
+        except Exception as error:
+            await record_unclaimed_processing_failure(
+                store,
+                tenant_id,
+                observation_id,
+                job_id,
+                error,
+            )
+            raise
+        job = await processor.run(tenant_id, observation_id, job_id)
     return job.state
 
 
-def _get_worker_runtime(
-    plugin: str,
-    config_json: str,
-) -> _WorkerRuntime:
+def _get_worker_runtime(settings: WorkerSettings) -> _WorkerRuntime:
     global _worker_runtime, _worker_runtime_key
-    # ponytail: one frozen model per worker process; split queues when multiple models are needed.
-    key = (plugin, config_json)
+    # ponytail: one frozen pair of models per worker process; split queues when more are needed.
+    key = _worker_model_key(settings)
     if _worker_runtime is not None:
         if _worker_runtime_key != key:
-            raise RuntimeError("worker media plugin configuration changed after initialization")
+            raise RuntimeError("worker embedder plugin configuration changed after initialization")
         return _worker_runtime
-    loop = asyncio.new_event_loop()
-    try:
-        media_embedder = loop.run_until_complete(_create_media_embedder(plugin, config_json))
-    except BaseException:
-        loop.close()
-        raise
-    _worker_runtime = _WorkerRuntime(loop, media_embedder)
+    runtime = _WorkerRuntime(asyncio.new_event_loop())
+    _worker_runtime = runtime
     _worker_runtime_key = key
-    return _worker_runtime
+    return runtime
 
 
-async def _create_media_embedder(plugin: str, config_json: str) -> Embedder:
-    """Construct the plugin while its owning event loop is running."""
-    config = json.loads(config_json)
-    if not isinstance(config, dict):
-        raise ValueError("cached embedder config must be a JSON object")
-    return load_embedder(plugin, config)
+def _worker_model_key(settings: WorkerSettings) -> str:
+    """Name the exact pair of plugins a child froze, so a changed one is caught not ignored."""
+    return json.dumps(
+        [
+            [settings.media_embedder_plugin, settings.media_embedder_config],
+            [settings.text_embedder_plugin, settings.text_embedder_config],
+        ],
+        sort_keys=True,
+        separators=(",", ":"),
+    )
 
 
 def _dispose_worker_runtime() -> None:
@@ -463,8 +730,24 @@ def _dispose_worker_runtime() -> None:
 
 @worker_process_shutdown.connect(weak=False)  # type: ignore[untyped-decorator]
 def _close_worker_runtime(**_kwargs: object) -> None:
-    """Release the process-owned plugin before the prefork child exits."""
-    _dispose_worker_runtime()
-    # This child exits through `os._exit`, which runs no `atexit` handler, so the summary
-    # has to be emitted from the last signal Celery does deliver.
-    flush_timing_summary()
+    """Release the plugin and flush telemetry before the prefork child exits.
+
+    Billiard ends a child with `os._exit`, which runs no `atexit` hook, so anything holding a
+    buffer has to be drained from this signal explicitly. Both exporters batch: metrics are
+    pushed on `OTEL_METRIC_EXPORT_INTERVAL` (60 s by default) and spans on the batch
+    processor's own delay, so without this a recycled child discarded up to a full interval of
+    measurements -- and `--max-memory-per-child` recycles children often.
+    """
+    global _worker_telemetry
+    providers, _worker_telemetry = _worker_telemetry, None
+    try:
+        _dispose_worker_runtime()
+    finally:
+        try:
+            flush_timing_summary()
+        finally:
+            if providers is not None:
+                if providers.tracer is not None:
+                    providers.tracer.shutdown()
+                if providers.meter is not None:
+                    providers.meter.shutdown()

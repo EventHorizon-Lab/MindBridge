@@ -53,7 +53,6 @@ class MMLifelongRunManifest(MediaBenchmarkRunManifest):
     benchmark: Literal["MM-Lifelong"] = "MM-Lifelong"
     split: MMLifelongSplit
     source_repository: NonEmptyString
-    source_revision: NonEmptyString
     prepared_media_manifest_sha256: Sha256Hex
     perception_prompt_version: NonEmptyString
     question_indices: tuple[int, ...] = Field(min_length=1)
@@ -67,7 +66,6 @@ class MMLifelongRunManifest(MediaBenchmarkRunManifest):
 class _Arguments(MediaArguments):
     prepared_media_path: Path
     split: MMLifelongSplit
-    source_revision: str
     question_indices: tuple[int, ...]
 
 
@@ -134,7 +132,6 @@ def _write_artifacts(
         predictions=predictions,
         split=arguments.split,
         source_repository="MM-Lifelong/MM-Lifelong",
-        source_revision=arguments.source_revision,
         prepared_media_manifest_sha256=sha256_file(arguments.prepared_media_path),
         perception_prompt_version=PERCEIVE_EVENTS_PROMPT.version,
         question_indices=tuple(question.index for question in questions),
@@ -163,9 +160,6 @@ def _parse_arguments(argv: Sequence[str] | None, prog: str | None) -> _Arguments
         help="official split to replay",
     )
     parser.add_argument(
-        "--source-revision", required=True, help="revision of the official MM-Lifelong release"
-    )
-    parser.add_argument(
         "--question-index",
         type=int,
         action="append",
@@ -178,7 +172,6 @@ def _parse_arguments(argv: Sequence[str] | None, prog: str | None) -> _Arguments
         parsed,
         prepared_media_path=parsed.prepared_media,
         split=cast(MMLifelongSplit, parsed.split),
-        source_revision=parsed.source_revision,
         question_indices=tuple(parsed.question_index),
     )
 

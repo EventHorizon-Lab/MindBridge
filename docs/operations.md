@@ -127,6 +127,50 @@ first and read the count — a number far larger than expected means something e
 
 The flag reads the object-storage variables, so enable it only where those are configured.
 
+## Job ledger reconciliation
+
+PostgreSQL is the authority for job state; the broker only carries the ID of work already recorded
+there. The two drift apart silently. `task_acks_late=True` acks a message the moment its task
+raises, so any exception outside the worker's `autoretry_for` throws the message away while the row
+stays claimable — the row is still `pending`, and no worker will ever be told about it again.
+
+The symptom is observations that never become searchable while the queue sits empty and the workers
+look idle. Nothing errors, because from each side's own point of view nothing is wrong.
+
+```bash
+mindbridge jobs --tenant-id tenant_01
+mindbridge jobs --tenant-id tenant_01 --republish
+```
+
+Reporting is the default because republishing spends money: every message that lands runs a
+generator. Read `claimable` against `queue_depth`. A non-zero count beside an empty `queue_depth`
+is exactly this divergence; a non-zero count beside a deep queue usually just means the workers
+are behind.
+
+What `--republish` then does depends on the scope, and the report's `withheld` field says which
+happened. Across the whole ledger it publishes only the difference — the queue already holds a
+message for the rest, and duplicating those is not free: the delivery that loses the claim
+re-queues itself every 30 seconds up to 40 times waiting for the winner. Under `--tenant-id` it
+publishes every claimable row and withholds nothing, because the depth counts every tenant's
+messages and cancelling one tenant's stranded rows against another's backlog would repair nothing.
+On a deep queue, then, judge a scoped repair by `claimable` before running it: the messages already
+queued for that tenant will be duplicated.
+
+The same report answers "who is consuming the worker", ordered by `work_seconds` — total worker
+time across every attempt, including the attempt in flight. Both durations and both token counts
+cover every attempt, because a failed attempt held a worker and was billed as surely as a
+successful one. Field-by-field meanings are in the [CLI reference](api/cli.md#mindbridge-jobs).
+
+Two cautions. `--include-failed` is off by default because a deterministic failure republished on a
+timer pays for the same rejection every time — republish `failed` rows once you know why they
+failed, not on a schedule. And kombu publishes with `LPUSH` while the worker consumes with `RPOP`,
+so a republished job waits behind everything already queued: on a deep queue, expect the repair to
+take effect slowly rather than assuming it did not work.
+
+Under row-level security a cross-tenant scan returns no rows rather than failing, so a confined
+role reading "nothing to repair" is the one answer you cannot trust. Pass `--tenant-id`, or use a
+role that can see every tenant; the command refuses rather than guessing.
+
 ## Scheduling
 
 Both commands are one-shot, idempotent, and tenant-scoped. Use the deployment's existing control
@@ -245,6 +289,7 @@ None of these attributes carry user content or IDs.
 | Generator JSON retry rate | A rising rate means the model is drifting off its output contract. |
 | `task_broker_unavailable` rate | Observations are being rejected outright. |
 | Job `failed` count | Remember it settles the attempt, not the job. |
+| Claimable rows against queue depth | `mindbridge jobs`. Claimable work beside an empty queue is ledger/broker divergence, not backlog. |
 | Consolidation dropped pairs | From the stdout JSON, not telemetry. Persistent drops mean a page bound is too tight. |
 
 ## Suggested alerts
@@ -256,6 +301,7 @@ None of these attributes carry user content or IDs.
 | Model degrading | `model_output_invalid` or JSON retry rate rising. |
 | Storage inconsistent | Any `memory_integrity_failed`. This should be zero. |
 | Deletion stalled | Tombstones in `failed`, or in `propagating` beyond your SLA. |
+| Work recorded but not queued | `claimable` non-zero while `queue_depth` is zero. The ledger owes work no worker will be told about. |
 
 `memory_integrity_failed` deserves a page rather than a dashboard. It means stored state is
 inconsistent, which is not a load condition and will not clear on its own.

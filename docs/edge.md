@@ -34,7 +34,7 @@ scope, normalized face bounding boxes, and the media the deployment chose to upl
 **Never leaves the device:** raw face and voice embeddings, and the device encryption key.
 
 The local identity store normalizes and AES-256-GCM encrypts every bounded sample, and matches
-only across equal model, revision, and dimension spaces. `device_identity_key` is exactly 32
+only across equal model and dimension spaces. `device_identity_key` is exactly 32
 bytes, loaded from the device TPM or a secret manager. AWS credentials and the MindBridge API key
 are never written to SQLite.
 
@@ -75,7 +75,7 @@ face = identities.recognize_and_remember(
         source_observation_id=observation_id,
         sample_id="face-track-7-1",
         embedding=insightface_embedding,
-        model_reference=ModelReference(model_id="insightface/buffalo_l", revision="1.0.1"),
+        model_reference=ModelReference(model_id="insightface/buffalo_l"),
     ),
     minimum_similarity=calibrated_face_threshold,
 )
@@ -235,6 +235,10 @@ specifically so a device can never read truncation as completion.
 
 One SQLite file holds three things: the observation outbox, the deletion inbox, and the recent
 memory cache. Mode `0600`, WAL enabled.
+
+Each store operation opens its own connection and closes it again, so a process that runs for weeks
+holds no growing set of descriptors on this file. WAL is what makes that cheap and what lets a
+reader run while a writer commits.
 
 Put it on persistent storage that survives reboot — it is the durability boundary for everything
 captured but not yet acknowledged. Losing it loses observations that the cloud never saw.

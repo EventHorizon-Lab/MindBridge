@@ -7,6 +7,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from mindbridge.benchmarks.artifacts import jsonl_lines
 from mindbridge.benchmarks.runtime import OPTION_LABELS
 from mindbridge.contracts import ContractModel, Identifier, NonEmptyString
 
@@ -42,9 +43,7 @@ class _RawQuestion(BaseModel):
 def load_egomem_reason(annotation_path: Path) -> tuple[EgoMemReasonQuestion, ...]:
     """Load the v1.1 public JSONL without inventing or retaining answer keys."""
     raw_questions = tuple(
-        _RawQuestion.model_validate_json(line)
-        for line in annotation_path.read_text(encoding="utf-8").splitlines()
-        if line.strip()
+        _RawQuestion.model_validate_json(line) for line in jsonl_lines(annotation_path)
     )
     questions = tuple(_question(raw) for raw in raw_questions)
     if not questions:

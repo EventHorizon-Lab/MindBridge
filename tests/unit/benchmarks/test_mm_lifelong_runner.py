@@ -15,6 +15,7 @@ from mindbridge.benchmarks.mm_lifelong_runner import (
 )
 from mindbridge.contracts import MemoryView, RecallRequest, RecallResult, RememberRequest
 from mindbridge.core import MemoryState, MemoryType, VerificationStatus
+from mindbridge.sdk import MindBridgeError
 
 ORIGIN = datetime(2026, 1, 1, tzinfo=timezone.utc)
 
@@ -85,6 +86,37 @@ def test_mm_lifelong_unofficial_reference_at_n_uses_bucket_jaccard() -> None:
     assert unofficial_reference_at_n(((0.0, 600.0),), ((300.0, 600.0),), 600.0) == 0.5
 
 
+async def test_mm_lifelong_keeps_ingested_segments_when_one_segment_fails() -> None:
+    """A segment that cannot be written used to discard the whole timeline behind it."""
+
+    class FailingMemoryApi(RecordingMemoryApi):
+        async def remember(self, request: RememberRequest) -> object:
+            if request.summary == "segment_02 happened.":
+                raise MindBridgeError(
+                    "segment could not be written",
+                    code="model_request_failed",
+                    status_code=502,
+                    trace_id="trace_ingest_error",
+                )
+            return await super().remember(request)
+
+    api = FailingMemoryApi()
+
+    results = await run_mm_lifelong(
+        cast(MindBridge, api),
+        (_question(),),
+        _prepared(segment_count=3),
+        run_id="run_01",
+    )
+
+    assert [request.summary for request in api.remember_requests] == [
+        "A meeting took place.",
+        "segment_03 happened.",
+    ]
+    assert results[0].pred.answer == "A meeting"
+    assert results[0].mindbridge_ingest_failure_count == 1
+
+
 def _question(
     *, reference_intervals: tuple[tuple[float, float], ...] = ((100.0, 200.0),)
 ) -> MMLifelongQuestion:
@@ -100,17 +132,20 @@ def _question(
     )
 
 
-def _prepared() -> MMLifelongPreparedTimeline:
+def _prepared(*, segment_count: int = 1) -> MMLifelongPreparedTimeline:
     return MMLifelongPreparedTimeline(
         split="day_test",
         timeline_origin=ORIGIN,
-        segments=(
+        segments=tuple(
             MMLifelongPreparedSegment(
-                segment_id="segment_01",
-                start_seconds=0,
+                segment_id=f"segment_{index + 1:02d}",
+                start_seconds=index * 600,
                 duration_ms=600_000,
-                caption="A meeting took place.",
-            ),
+                caption=(
+                    "A meeting took place." if index == 0 else f"segment_{index + 1:02d} happened."
+                ),
+            )
+            for index in range(segment_count)
         ),
     )
 
