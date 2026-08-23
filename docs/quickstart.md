@@ -8,7 +8,7 @@ worker, which is covered in [deployment](deployment.md).
 
 | Requirement | Why |
 | --- | --- |
-| Python 3.10 or 3.11 | 3.10 is the floor because JetPack, RDK, and RKNN edge images still ship it. |
+| Python 3.10 – 3.14 | 3.10 is the floor because JetPack, RDK, and RKNN edge images still ship it. |
 | [uv](https://docs.astral.sh/uv/) | The lockfile is authoritative; `pip` will not reproduce it. |
 | Docker with Compose | Runs the pinned PostgreSQL 18 + pgvector and Redis. |
 | An OpenAI-compatible **generator** endpoint | Answers recalls and judges consolidation candidates. |

@@ -1,6 +1,7 @@
 """Durability and idempotency checks for the Jetson SQLite outbox."""
 
 import sqlite3
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -103,7 +104,7 @@ def test_acknowledgement_keeps_watermark_without_dropping_late_work(
 
 def test_outbox_upgrades_existing_processing_jobs_for_fair_polling(tmp_path: Path) -> None:
     database_path = tmp_path / "edge.db"
-    with sqlite3.connect(database_path) as connection:
+    with closing(sqlite3.connect(database_path)) as connection, connection:
         connection.executescript(
             """
             CREATE TABLE edge_processing_jobs (
@@ -120,7 +121,7 @@ def test_outbox_upgrades_existing_processing_jobs_for_fair_polling(tmp_path: Pat
 
     SQLiteObservationOutbox(database_path, clock=lambda: NOW)
 
-    with sqlite3.connect(database_path) as connection:
+    with closing(sqlite3.connect(database_path)) as connection, connection:
         columns = {row[1] for row in connection.execute("PRAGMA table_info(edge_processing_jobs)")}
         version = connection.execute("PRAGMA user_version").fetchone()
     assert "last_polled_at" in columns

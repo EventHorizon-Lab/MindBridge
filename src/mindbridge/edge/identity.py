@@ -6,6 +6,7 @@ import math
 import os
 import sqlite3
 from collections.abc import Callable
+from contextlib import AbstractContextManager
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
@@ -625,7 +626,7 @@ class SQLiteIdentityMemory:
             enrolled_new=enrolled_new,
         )
 
-    def _connect(self) -> sqlite3.Connection:
+    def _connect(self) -> AbstractContextManager[sqlite3.Connection]:
         return sqlite_connect(self._database_path)
 
     def _now(self) -> datetime:

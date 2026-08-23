@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import sqlite3
 from collections.abc import Callable
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -470,7 +471,7 @@ class SQLiteObservationOutbox:
             connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
         os.chmod(self._database_path, 0o600)
 
-    def _connect(self) -> sqlite3.Connection:
+    def _connect(self) -> AbstractContextManager[sqlite3.Connection]:
         return sqlite_connect(self._database_path)
 
     @staticmethod

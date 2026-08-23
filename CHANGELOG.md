@@ -53,6 +53,8 @@ The capabilities present on `master` today:
   content.
 - Benchmark harness driving the production API across nine official datasets plus the Agent
   Memory Leaderboard offline replay.
+- Python 3.10 through 3.14, with the whole quality gate — format, lint, types, tests — run on
+  every one of them.
 
 ### Upgrading an existing deployment
 

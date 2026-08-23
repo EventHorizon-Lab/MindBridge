@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import sqlite3
 from collections.abc import Callable
+from contextlib import AbstractContextManager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -144,7 +145,7 @@ class SQLiteRecentMemory:
             (_utc_iso(self._now()),),
         )
 
-    def _connect(self) -> sqlite3.Connection:
+    def _connect(self) -> AbstractContextManager[sqlite3.Connection]:
         return sqlite_connect(self._database_path)
 
     def _now(self) -> datetime:
