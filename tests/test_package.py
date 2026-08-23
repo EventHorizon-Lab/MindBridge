@@ -198,6 +198,7 @@ SCENARIOS: dict[str, tuple[str, ...]] = {
         "cli",
         "consolidation_cli",
         "infrastructure",
+        "jobs_cli",
         "lifecycle_cli",
         "models",
         "server",
@@ -438,6 +439,33 @@ def _absolute_import(path: Path, node: ast.ImportFrom) -> str | None:
 
 def _tests_type_checking(test: ast.expr) -> bool:
     return isinstance(test, ast.Name) and test.id == "TYPE_CHECKING"
+
+
+def test_the_extra_the_clip_cutter_names_is_the_one_that_provides_its_decoders() -> None:
+    """A worker installed with `server` alone starts, passes the import probe in this file, and
+    then cannot cut a single clip -- the decoders are imported lazily, so nothing before the first
+    observation says so. That makes the error message the only thing pointing an operator at the
+    fix, and it named `cloud-models` while the decoders had moved to `media`.
+
+    Asserted against the declarations rather than as a string match, so the message cannot drift
+    from where the dependencies actually live.
+    """
+    named = re.findall(
+        r"install MindBridge with the ([a-z-]+) extra",
+        (SOURCE / "media" / "clipping.py").read_text(encoding="utf-8"),
+    )
+    assert named, "the clip cutter must tell an operator which extra to install"
+
+    decoders = {"av", "pillow", "soundfile"}
+    for extra in set(named):
+        provided = {_distribution(item) for item in _extras()[extra]}
+        assert decoders <= provided, (
+            f"clipping.py sends operators to the {extra!r} extra, which declares "
+            f"{sorted(decoders - provided)} nowhere"
+        )
+    # And the reason the message matters at all: the extra a worker is otherwise told to install
+    # does not carry them, so this failure is reachable from the documented command.
+    assert not decoders & {_distribution(item) for item in _extras()["server"]}
 
 
 def test_relative_imports_resolve_against_the_importing_file() -> None:

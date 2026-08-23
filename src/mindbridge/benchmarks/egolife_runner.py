@@ -46,7 +46,15 @@ from mindbridge.sdk import MindBridge, MindBridgeError
 # Submissions need one row per example, so an abstention still needs a value. Deliberately outside
 # OPTION_LABELS: any real label would harvest a one-in-four guess on every abstained question.
 EGOMEM_REASON_ABSTENTION = "ABSTAIN"
-_RECOVERABLE_MODEL_ERRORS = frozenset({"model_output_invalid", "model_request_failed"})
+# `model_unavailable` is this deployment's 60 s gateway timeout, measured at ~5.5% of recalls
+# once nine benchmarks saturate the shared endpoint. Treating it as fatal killed a whole block
+# and discarded every answer the block had already produced -- an 11-question block carried
+# ~47% risk of dying that way. Recoverable here means "record an empty result carrying the
+# error code", so the question lands in the infrastructure column instead of destroying its
+# eleven neighbours. It is never counted as a wrong answer.
+_RECOVERABLE_MODEL_ERRORS = frozenset(
+    {"model_output_invalid", "model_request_failed", "model_unavailable"}
+)
 
 
 class EgoLifePreparedClip(ContractModel):

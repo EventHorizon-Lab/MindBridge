@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
 from typing import Annotated, NoReturn, Protocol
@@ -15,6 +15,7 @@ from celery.exceptions import (
     SoftTimeLimitExceeded,
 )
 from celery.signals import (
+    worker_init,
     worker_process_init,
     worker_process_shutdown,
 )
@@ -71,7 +72,7 @@ from mindbridge.models.defaults import (
     openai_generator_config,
 )
 from mindbridge.models.plugins import close_model, load_embedder, load_generator
-from mindbridge.telemetry import configure_telemetry
+from mindbridge.telemetry import TelemetryProviders, configure_telemetry
 
 _MODEL_REQUEST_TIMEOUT_SECONDS = 780.0
 _POST_MODEL_BUDGET_SECONDS = 300.0
@@ -87,12 +88,30 @@ _RUNNING_MAX_RETRIES = 40
 _TRANSIENT_MAX_RETRIES = 5
 _RUNNING_RETRIES_HEADER = "mindbridge_running_retries"
 
+# ponytail: an allowlist of plugin names, because a plugin cannot be asked whether it holds a
+# device. Give `Embedder` a "runs in this process" property if a third-party local plugin ever
+# needs to be covered by the guard below.
+_IN_PROCESS_EMBEDDER_PLUGINS = frozenset({"jina"})
+
+_IN_PROCESS_EMBEDDER_VRAM_GIB = 3.7
+_IN_PROCESS_EMBEDDER_RSS_GIB = 1.4
+"""What one prefork child holds for the bundled Jina Omni encoder, measured on an RTX 5090.
+
+3 745 MiB of VRAM (weights plus the child's own CUDA context) and 1.36 GiB of resident host
+memory, per child, before any activation memory. The 2026-08-21 evaluation ran six children at
+4.3-4.8 GB each and reached 30.2 of the card's 32.6 GB with the GPU at 1-5% utilisation.
+"""
+
+
+_worker_telemetry: TelemetryProviders | None = None
+
 
 @worker_process_init.connect(weak=False)  # type: ignore[untyped-decorator]
 def _configure_worker_telemetry(**_kwargs: object) -> None:
     """Initialize exporters after Celery forks its process-safe worker child."""
+    global _worker_telemetry
     _dispose_worker_runtime()
-    configure_telemetry("mindbridge-worker")
+    _worker_telemetry = configure_telemetry("mindbridge-worker")
 
 
 class _TaskRequest(Protocol):
@@ -179,7 +198,7 @@ class WorkerSettings:
             media_embedder_config=plugin_configuration(
                 source,
                 "MINDBRIDGE_MEDIA_EMBEDDER_CONFIG_JSON",
-                (lambda: jina_media_embedder_config(source)) if media_plugin == "jina" else None,
+                _media_embedder_fallback(source, media_plugin),
             ),
             text_embedder_plugin=text_plugin,
             text_embedder_config=plugin_configuration(
@@ -199,6 +218,28 @@ class WorkerSettings:
         )
 
 
+def _media_embedder_fallback(
+    source: Mapping[str, str],
+    plugin: str,
+) -> Callable[[], dict[str, object]] | None:
+    """Let the media slot reach a served encoder without a second family of variables.
+
+    The bundled local plugin needs a device and a model id, which the Worker-specific names
+    already supply. Serving the same model instead needs credentials and an endpoint -- and the
+    deployment necessarily has one of those already, for the text encoder that must write into
+    the same embedding space. Reusing it makes the served media slot one variable rather than
+    five, which matters because it is the configuration that keeps a model out of every child.
+    """
+    if plugin == "jina":
+        return lambda: jina_media_embedder_config(source)
+    if plugin == "openai":
+        return lambda: openai_embedder_config(
+            source,
+            request_timeout_seconds=_MODEL_REQUEST_TIMEOUT_SECONDS,
+        )
+    return None
+
+
 class _MediaSamplingConfig(PluginConfigModel):
     """Strict schema for the optional media sampling object.
 
@@ -211,6 +252,7 @@ class _MediaSamplingConfig(PluginConfigModel):
     max_pixels: Annotated[PluginInteger, Field(gt=0)] = DEFAULT_VIDEO_MAX_PIXELS
     image_max_pixels: Annotated[PluginInteger, Field(gt=0)] = DEFAULT_IMAGE_MAX_PIXELS
     generation_proxy: StrictBool = True
+    proxy_audio: StrictBool = True
 
 
 def _clip_sampling_from_environment(source: Mapping[str, str]) -> ClipSampling:
@@ -288,6 +330,41 @@ def processing_budget_seconds(generator_config: Mapping[str, object]) -> float:
     return float(configured) + _POST_MODEL_BUDGET_SECONDS
 
 
+def require_bounded_in_process_models(settings: WorkerSettings, concurrency: int) -> None:
+    """Refuse to fork an encoder into every child, which is what exhausted the GPU.
+
+    A prefork child owns its own plugins, so an in-process encoder is loaded once per child and
+    its device memory scales with `--concurrency`. `--max-memory-per-child` bounds resident host
+    memory and structurally cannot bound VRAM, so during the 2026-08-21 evaluation nothing
+    reported this until the allocator failed hours in -- 479 CUDA out-of-memory errors and a
+    kernel `global_oom` on the host.
+
+    Refusing costs no capability. One worker process per assigned GPU at concurrency 1 is what
+    the deployment guide already recommends for scaling, and a served encoder removes the
+    resident model from every child, which is both faster and unbounded by the card.
+    """
+    slots = tuple(
+        f"{variable}={plugin}"
+        for variable, plugin in (
+            ("MINDBRIDGE_MEDIA_EMBEDDER_PLUGIN", settings.media_embedder_plugin),
+            ("MINDBRIDGE_EMBEDDER_PLUGIN", settings.text_embedder_plugin),
+        )
+        if plugin in _IN_PROCESS_EMBEDDER_PLUGINS
+    )
+    if concurrency <= 1 or not slots:
+        return
+    raise ValueError(
+        f"{' and '.join(slots)} loads an encoder into the Worker process, and every prefork "
+        f"child holds its own, so --concurrency {concurrency} means {concurrency} of them: "
+        f"about {concurrency * _IN_PROCESS_EMBEDDER_VRAM_GIB:.1f} GiB of VRAM and about "
+        f"{concurrency * _IN_PROCESS_EMBEDDER_RSS_GIB:.1f} GiB of resident host memory, before "
+        "any activation memory. --max-memory-per-child bounds resident memory and cannot bound "
+        "VRAM. Serve the encoder instead -- set the plugin to openai and give it an endpoint, "
+        "which leaves no model in any child -- or run one worker process per assigned GPU at "
+        "--concurrency 1."
+    )
+
+
 def create_worker_app(settings: WorkerSettings) -> Celery:
     """Register the ID-only processing task on one GPU-safe Celery app."""
     task_queue = create_task_queue(
@@ -295,6 +372,21 @@ def create_worker_app(settings: WorkerSettings) -> Celery:
         processing_budget_seconds=processing_budget_seconds(settings.generator_config),
     )
     task_queue.conf.update(worker_concurrency=1, worker_pool="prefork")
+
+    # `worker_init` is the first point at which the pool size is settled: the CLI flag, this
+    # app's default, and Celery's own CPU-count fallback have all been resolved by then, so the
+    # guard reads what the worker will actually fork rather than what was asked for. The
+    # dispatch UID keeps a re-created app from stacking a second receiver.
+    @worker_init.connect(weak=False, dispatch_uid="mindbridge-in-process-model-guard")  # type: ignore[untyped-decorator]
+    def _guard_in_process_models(sender: object = None, **_kwargs: object) -> None:
+        try:
+            require_bounded_in_process_models(settings, getattr(sender, "concurrency", 1))
+        except ValueError as error:
+            # Celery's `Signal.send` catches `Exception` from every receiver, logs it, and
+            # carries on -- so raising `ValueError` here would print a traceback and then start
+            # the worker anyway, which is the silent failure this guard exists to replace.
+            # `SystemExit` is not an `Exception`, so it survives that handler and stops boot.
+            raise SystemExit(f"refusing to start the Worker: {error}") from error
 
     @task_queue.task(  # type: ignore[untyped-decorator]
         name=PROCESS_OBSERVATION_TASK,
@@ -427,5 +519,21 @@ def _dispose_worker_runtime() -> None:
 
 @worker_process_shutdown.connect(weak=False)  # type: ignore[untyped-decorator]
 def _close_worker_runtime(**_kwargs: object) -> None:
-    """Release the process-owned plugin before the prefork child exits."""
-    _dispose_worker_runtime()
+    """Release the plugin and flush telemetry before the prefork child exits.
+
+    Billiard ends a child with `os._exit`, which runs no `atexit` hook, so anything holding a
+    buffer has to be drained from this signal explicitly. Both exporters batch: metrics are
+    pushed on `OTEL_METRIC_EXPORT_INTERVAL` (60 s by default) and spans on the batch
+    processor's own delay, so without this a recycled child discarded up to a full interval of
+    measurements -- and `--max-memory-per-child` recycles children often.
+    """
+    global _worker_telemetry
+    providers, _worker_telemetry = _worker_telemetry, None
+    try:
+        _dispose_worker_runtime()
+    finally:
+        if providers is not None:
+            if providers.tracer is not None:
+                providers.tracer.shutdown()
+            if providers.meter is not None:
+                providers.meter.shutdown()

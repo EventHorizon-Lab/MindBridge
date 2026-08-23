@@ -1343,8 +1343,11 @@ API 和 Worker 可以使用同一个 Python package、两个进程部署。只�
 
 基础安装只包含 Core 领域类型、Pydantic 契约和 Python SDK。任意端侧主机——Jetson、地瓜 RDK、
 Rockchip RK、OpenVINO x86、ARM 主机或直接充当“端”的 4090/5090/A100——都安装同一个 `edge`
-extra；API、MCP 与云端任务安装 `server` extra；只有本地加载 Jina Omni 的 GPU Worker 再叠加
-`cloud-models`。端侧安装不得因 SQLite 身份或同步能力被迫携带 Celery、MCP、PostgreSQL、
+extra；API、MCP 与云端任务安装 `server` extra；**Worker 还必须叠加 `media`**，因为切 evidence
+clip 的 PyAV、Pillow、SoundFile 解码器只声明在这个 extra 里，且与选哪个 embedder 无关——只装
+`server` 的 Worker 能正常启动、能通过导入探针，然后在第一条带媒体的 observation 上失败；只有
+本地加载 Jina Omni 的 GPU Worker 再叠加 `cloud-models`（它依赖 `mindbridge[media]`，所以会把
+`media` 一并带上）。端侧安装不得因 SQLite 身份或同步能力被迫携带 Celery、MCP、PostgreSQL、
 FastAPI 等服务端栈，子包导入隔离由独立进程测试守护。`edge` 的 Python 依赖只覆盖同步、安全、
 OpenAI SDK 和可观测性；不再为声纹二次解码携带 SoundFile，也不携带 NeMo。InsightFace/ONNX
 Runtime、FunASR/ModelScope 与设备版 Torch 必须使用与目标平台 SDK 匹配的镜像工件（JetPack/CUDA、

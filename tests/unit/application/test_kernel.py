@@ -94,6 +94,7 @@ class InMemoryStore:
         self.memories: dict[str, tuple[str, MemoryRecord]] = {}
         self.evidence: dict[EvidenceId, EvidenceSpan] = {}
         self.media_objects: dict[MediaObjectId, MediaObject] = {}
+        self.evidence_clip_media: dict[EvidenceId, MediaObjectId] = {}
         self.embedding_matches: tuple[EmbeddingMatch, ...] = ()
         self.embedding_searches: list[EmbeddingSearch] = []
         self.graph_memories: dict[tuple[EmbeddedObjectType, str], MemoryId] = {}
@@ -372,6 +373,19 @@ class InMemoryStore:
             if media_object_id in self.media_objects
             and self.media_objects[media_object_id].tenant_id == tenant_id
         )
+
+    async def read_evidence_clip_media(
+        self,
+        tenant_id: TenantId,
+        evidence_ids: tuple[EvidenceId, ...],
+    ) -> dict[EvidenceId, MediaObject]:
+        return {
+            evidence_id: self.media_objects[media_object_id]
+            for evidence_id in evidence_ids
+            if (media_object_id := self.evidence_clip_media.get(evidence_id)) is not None
+            and media_object_id in self.media_objects
+            and self.media_objects[media_object_id].tenant_id == tenant_id
+        }
 
     async def read_observation_processing_job(
         self,

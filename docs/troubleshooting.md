@@ -187,8 +187,27 @@ are derived from it and follow automatically.
 
 ### Jobs stay `pending`
 
-The worker is not consuming. Check it is running, has `--extra server --extra cloud-models`
-installed, and points at the same `MINDBRIDGE_TASK_BROKER_URL`.
+Two different causes, and they are told apart by the queue rather than by the rows.
+
+**The worker is not consuming.** Check it is running, points at the same
+`MINDBRIDGE_TASK_BROKER_URL`, and is installed with the extras it actually needs:
+`--extra server --extra media` at minimum. `media` carries the PyAV, Pillow, and SoundFile
+decoders that cut evidence clips, which the worker does whatever its embedder slots say — without
+it the process starts fine and fails the first observation that carries media. Add
+`--extra cloud-models` only for an in-process encoder, which brings `media` with it.
+
+**Or the message is gone and the row is not.** `task_acks_late=True` acks a message the moment its
+task raises, so any exception outside the worker's `autoretry_for` discards the message while the
+row stays claimable. The row will sit `pending` forever because nothing will tell a worker about it
+again. The tell is a non-zero `claimable` beside an empty `queue_depth`:
+
+```bash
+mindbridge jobs --tenant-id tenant_01
+mindbridge jobs --tenant-id tenant_01 --republish
+```
+
+Reporting is the default because each republished message runs a generator. See
+[operations](operations.md#job-ledger-reconciliation).
 
 ### `TypeError: 'NoneType' object is not callable` on the first frame
 
@@ -233,9 +252,14 @@ default `max_connections` of 100. Size it across your whole deployment, not per 
 Frame rate sets the entire write cost: one clip cut, one encoder call, one stored object per
 sampled window. Lower `frames_per_second` in `MINDBRIDGE_MEDIA_SAMPLING_CONFIG_JSON` first.
 
-Above roughly 1.3 fps at 30-second segments, the generation proxy also stops working — the MP4
-muxer refuses to interleave a sparse video track with continuous audio past about forty sampled
-frames. Raising frame rate therefore trades the proxy away as well.
+Above roughly 1.3 fps at 30-second segments, the generation proxy also stops working — past about
+forty sampled frames its encode fails on the flush that drains the encoder. Raising frame rate
+therefore trades the proxy away as well. This was documented as the MP4 muxer refusing to
+interleave a sparse video track with continuous audio; it is not, and so turning `proxy_audio`
+off buys no frames. Lower the frame rate or segment shorter.
+
+If your generator ignores audio, `proxy_audio: false` is still worth setting — it is a smaller
+file to encode and transfer, just not a longer one.
 
 ### Consolidation is expensive
 

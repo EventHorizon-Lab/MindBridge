@@ -18,6 +18,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from hashlib import sha256
+from math import ceil
 from typing import TypeVar
 from urllib.parse import quote, urlsplit
 
@@ -63,6 +64,26 @@ from mindbridge.telemetry import operation_span, set_current_span_attributes
 _Budget = TypeVar("_Budget", float, int)
 
 
+# Past roughly this many sampled frames the proxy encode fails, on the flush that drains the
+# encoder rather than on any single frame: `av.error.ValueError: [Errno 22] Invalid argument`.
+# Checking it before reading the source turns a doomed full decode and encode into a decision.
+#
+# This was documented as the MP4 muxer refusing to interleave a sparse video track with
+# continuous audio. That is wrong, and measurably so: a silent source cut with
+# `include_audio=False` -- no audio anywhere in the pipeline -- fails at 45 frames exactly as an
+# audiovisual one does, so dropping audio does not buy a single frame. Also ruled out by
+# bisection: timestamp magnitude (45 frames fails across 45 s, 22.5 s and 9 s spans alike),
+# holding frames past their decode container, and the picture type inherited from the source.
+# It reproduces only for frames obtained by decoding a source -- 120 synthetic frames encode
+# fine through the identical loop -- and the mechanism is not yet identified. The number stays
+# where measurement put it; what changed is that it is no longer attributed to a cause that
+# would suggest audio is the thing to give up.
+MAX_PROXY_SAMPLED_FRAMES = 40
+# The other end of the same bound, and the reason `_sampled_window` exists: Qwen3-VL's video
+# processor merges frames in temporal pairs, so anything it is given has to carry at least two.
+MIN_SAMPLED_FRAMES = 2
+
+
 @dataclass(frozen=True, slots=True)
 class ClipSampling:
     """Deployment-chosen sampling applied when a clip is cut."""
@@ -73,6 +94,11 @@ class ClipSampling:
     # Off only for a generator that reads the same storage the Worker does, where the encode
     # costs more than the transfer it removes.
     generation_proxy: bool = True
+    # Off for a generator that cannot hear. Measured against the evaluation's endpoint on one
+    # 15 s clip: `prompt_tokens` was 1009 whether or not the file carried its audio track, so
+    # the track was never ingested, while the file was 336 KiB with it against 212 KiB without.
+    # This does *not* raise the frame ceiling below -- see the note there.
+    proxy_audio: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -296,14 +322,21 @@ async def _store_generation_proxy(
     to the untouched source rather than fail an attempt whose perception would have succeeded.
     """
     source_object = items[0].media_object
+    start_ms, end_ms = _sampled_window(
+        min(item.evidence_span.start_ms for item in items),
+        max(item.evidence_span.end_ms for item in items),
+        source_object.kind,
+        sampling.frames_per_second,
+    )
     request = ClipRequest(
         kind=source_object.kind,
-        start_ms=min(item.evidence_span.start_ms for item in items),
-        end_ms=max(item.evidence_span.end_ms for item in items),
+        start_ms=start_ms,
+        end_ms=end_ms,
         frames_per_second=sampling.frames_per_second,
         max_pixels=sampling.max_pixels,
+        include_audio=sampling.proxy_audio,
     )
-    # The muxer ceiling is a frame count, so the frame rate decides it as much as the span does.
+    # The ceiling is a frame count, so the frame rate decides it as much as the span does.
     # Checked before the read because the alternative is paying for a full source download and a
     # doomed encode on every observation.
     frames = (request.end_ms - request.start_ms) / 1_000 * request.frames_per_second
@@ -372,10 +405,16 @@ async def _store_source_group(
         stored: list[_StoredClip] = []
         for item in items:
             span = item.evidence_span
+            start_ms, end_ms = _sampled_window(
+                span.start_ms,
+                span.end_ms,
+                item.media_object.kind,
+                sampling.frames_per_second,
+            )
             request = ClipRequest(
                 kind=item.media_object.kind,
-                start_ms=span.start_ms,
-                end_ms=span.end_ms,
+                start_ms=start_ms,
+                end_ms=end_ms,
                 frames_per_second=sampling.frames_per_second,
                 max_pixels=sampling.max_pixels,
                 image_max_pixels=sampling.image_max_pixels,
@@ -467,6 +506,39 @@ async def _embed_stored_clips(
     )
 
 
+def _sampled_window(
+    start_ms: int,
+    end_ms: int,
+    kind: MediaKind,
+    frames_per_second: float,
+) -> tuple[int, int]:
+    """Widen a video span too short to sample twice, as the ceiling narrows one sampled too often.
+
+    The sampler takes a frame at the start of the span and one every interval after it, so a span
+    shorter than a single interval yields exactly one frame -- and a one-frame video is not a video
+    to a Qwen3-VL encoder, whose patch embedding merges frames in temporal pairs. It raises
+    `t:1 must be larger than temporal_factor:2`, which on 2026-08-21 destroyed the whole
+    observation, perception included, on 72 occasions across 105 observations.
+
+    One interval of window is not enough, which a real decode is the only way to find out: the
+    sample instants are counted from the requested start, but each one is served by the first real
+    frame at or after it, up to one source frame late. A 999 ms window at 1 fps therefore still
+    came back with a single frame, and so did a window ending where the source's own last frame
+    already had. Two intervals leave room for that lateness at any source frame rate at or above
+    the sampling rate, which is every real recording.
+
+    Widening runs backwards by preference: media starts at zero, so earlier is always inside the
+    source, while later may be past its end -- and a window past the end samples nothing new.
+    """
+    if kind is not MediaKind.VIDEO:
+        return start_ms, end_ms
+    minimum_ms = ceil(1_000 * MIN_SAMPLED_FRAMES / frames_per_second)
+    if end_ms - start_ms >= minimum_ms:
+        return start_ms, end_ms
+    widened_start_ms = max(0, end_ms - minimum_ms)
+    return widened_start_ms, widened_start_ms + minimum_ms
+
+
 def _video_only(value: _Budget, kind: MediaKind) -> _Budget | None:
     """Declare a sampling budget only where it means anything, since MediaPart rejects it off video."""
     return value if kind is MediaKind.VIDEO else None
@@ -531,10 +603,6 @@ CLIP_KEY_PREFIX = "clips/"
 # Transient proxies share the swept prefix so a leaked one is still reclaimable, but never a
 # registered clip's key.
 PROXY_KEY_INFIX = "proxy-"
-# The MP4 muxer refuses to interleave a sparse sampled video track with continuous audio past
-# roughly this many frames. Checking it before reading the source turns a doomed full decode and
-# encode into a decision.
-MAX_PROXY_SAMPLED_FRAMES = 40
 # A clip is uploaded before the transaction that registers it, so a freshly
 # written object is not evidence of an orphan. The grace period must exceed
 # OBSERVATION_JOB_STALE_AFTER_SECONDS so no in-flight attempt is ever robbed.

@@ -427,6 +427,22 @@ class RememberRequest(ContractModel):
         return self
 
 
+class RememberBatchRequest(ContractModel):
+    """Retain several memories in one call, and so in one encoder round trip."""
+
+    memories: Annotated[
+        tuple[RememberRequest, ...],
+        Field(
+            min_length=1,
+            max_length=100,
+            description=(
+                "The memories to retain, at most 100, each exactly as the single-memory "
+                "request accepts it. Results come back in this order."
+            ),
+        ),
+    ]
+
+
 class FeedbackRequest(ContractModel):
     """Record useful, wrong, missing, or corrected recall feedback."""
 
@@ -836,6 +852,18 @@ class RememberResult(_InspectableMemory):
             "`created` when this request stored the memory, `duplicate` when an earlier write "
             "under the same idempotency key already had. The memory returned is the same "
             "either way, so a retry is safe without being silent."
+        ),
+    )
+
+
+class RememberBatchResult(ContractModel):
+    """One result per requested memory, in request order."""
+
+    memories: tuple[RememberResult, ...] = Field(
+        description=(
+            "One result per requested memory, positionally aligned with the request. Each "
+            "carries its own `created` or `duplicate` status, so a partially resent batch "
+            "reports exactly which of its memories were already stored."
         ),
     )
 

@@ -34,6 +34,7 @@ from mindbridge.application.ports import (
     Perceiver,
 )
 from mindbridge.core import (
+    ClaimType,
     DatabaseUnavailableError,
     DomainInvariantError,
     Event,
@@ -144,6 +145,15 @@ class ProcessObservation:
             # so it reads a copy cut to them rather than making the model download the frames it
             # is about to discard. The copies are lent for the length of the call: nothing
             # registers them, so scoping them here is what keeps them from outliving it.
+            # `ClaimType` resolves a listed alias rather than rejecting the observation over
+            # it, which means an aliased claim is indistinguishable from a native one by the
+            # time it lands. The delta across this attempt is the only place the substitution
+            # is still visible, so it is reported next to the event and prompt counts: a
+            # vocabulary that shifts, or one that stops shifting after a prompt change, should
+            # be readable rather than inferred. A worker child runs one attempt at a time, so
+            # the delta is this observation's; a process that perceived concurrently would see
+            # the two attempts' aliases pooled.
+            aliases_before = sum(ClaimType.alias_uses().values())
             async with generation_proxies(
                 tenant_id,
                 evidence,
@@ -178,6 +188,9 @@ class ProcessObservation:
                     "mindbridge.evidence.count": len(event_evidence),
                     "mindbridge.model.id": perception.model_reference.model_id,
                     "mindbridge.prompt.version": perception.prompt_version,
+                    "mindbridge.perception.claim_type_alias_count": (
+                        sum(ClaimType.alias_uses().values()) - aliases_before
+                    ),
                 }
             )
             # Clip the grounded event spans, not the whole-file source spans:
@@ -202,6 +215,7 @@ class ProcessObservation:
                     events,
                     graph.claims,
                     graph.entities,
+                    graph.memories,
                     self._text_embedder,
                     claim.job.created_at,
                 ),

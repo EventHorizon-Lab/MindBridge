@@ -15,6 +15,7 @@ from mindbridge.core import (
 )
 from mindbridge.infrastructure._postgres_media import (
     link_observation_media,
+    read_media_objects_on_connection,
     write_media_object,
 )
 from mindbridge.infrastructure._postgres_types import (
@@ -219,6 +220,61 @@ class EvidenceReadOperations(PostgresStoreOperations):
             for evidence_id in evidence_ids
             if evidence_id in evidence_by_id
         )
+
+    async def read_evidence_clip_media(
+        self,
+        tenant_id: TenantId,
+        evidence_ids: tuple[EvidenceId, ...],
+    ) -> dict[EvidenceId, MediaObject]:
+        """Map each evidence span to the derived clip already cut for a model to read.
+
+        The write path stores one clip per span at the deployment's sampling and embeds
+        that, not the source. Generation asked for the source instead, so a populated
+        recall attached full-resolution originals: measured 12.3k prompt tokens per clip
+        against 1.65k for the stored clip, and four originals exceed this endpoint's
+        60 s gateway limit outright. Spans with no clip fall back to their source.
+
+        A span is only substituted when one clip covers all of it. A span is not always one
+        clip: `cut_clips` splits audio at `AUDIO_WINDOW_MS`, so a 70 s audio span is stored
+        as three ordinals. Returning the lowest of those -- which is what an earlier
+        `DISTINCT ON (evidence_id) ... ORDER BY ordinal` did -- hands the answer model the
+        first 30 seconds while the recall that retrieved the span may well have matched a
+        later window's embedding, and nothing about the result says a tail is missing.
+        Falling back to the source is a bigger request but a complete one, and a
+        `MediaObject` per evidence id cannot express more than one window anyway.
+        """
+        if not evidence_ids:
+            return {}
+        async with tenant_connection(self._pool, tenant_id) as connection:
+            cursor = await connection.execute(
+                """
+                SELECT evidence_id, min(media_object_id)
+                FROM evidence_clips
+                WHERE tenant_id = %s AND evidence_id = ANY(%s)
+                GROUP BY evidence_id
+                -- The whole point: a span cut into several windows is skipped, not truncated.
+                -- With exactly one row per group, min() is that row's clip.
+                HAVING count(*) = 1
+                """,
+                (tenant_id, list(evidence_ids)),
+            )
+            rows = await cursor.fetchall()
+            if not rows:
+                return {}
+            clip_id_by_evidence = {
+                EvidenceId(cast(str, row[0])): MediaObjectId(cast(str, row[1])) for row in rows
+            }
+            media_objects = await read_media_objects_on_connection(
+                connection,
+                tenant_id,
+                tuple(dict.fromkeys(clip_id_by_evidence.values())),
+            )
+        media_by_id = {item.media_object_id: item for item in media_objects}
+        return {
+            evidence_id: media_by_id[clip_id]
+            for evidence_id, clip_id in clip_id_by_evidence.items()
+            if clip_id in media_by_id
+        }
 
     async def list_known_clip_digests(
         self,

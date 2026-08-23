@@ -156,10 +156,14 @@ def test_generation_proxy_applies_the_requested_frame_rate_and_pixel_budget() ->
     assert stream.codec_context.width * stream.codec_context.height <= 10_000
 
 
-def test_generation_proxy_refuses_a_span_it_cannot_interleave() -> None:
-    """A sampled video track is sparse next to continuous audio, and past roughly forty frames
-    the MP4 muxer refuses the interleave. It has to raise rather than hand back a file whose
-    audio or video is silently truncated, because the caller's fallback is the source itself."""
+def test_generation_proxy_refuses_a_span_past_its_frame_ceiling() -> None:
+    """Past roughly forty sampled frames the encode fails on the flush that drains the encoder.
+    It has to raise rather than hand back a file whose audio or video is silently truncated,
+    because the caller's fallback is the source itself.
+
+    The cause is not the audio interleave this test used to name -- see
+    `test_dropping_audio_does_not_lift_the_frame_ceiling`, which fails the same way with no
+    audio anywhere."""
     source = _audiovisual_bytes(seconds=60.0, fps=10, width=160, height=120)
 
     with pytest.raises(Exception, match=r"Invalid argument|monotonic"):
@@ -221,6 +225,77 @@ def test_generation_proxy_of_a_silent_source_stays_video_only() -> None:
 
     with av.open(io.BytesIO(proxy.content), mode="r") as container:
         assert not container.streams.audio
+
+
+def test_generation_proxy_drops_audio_when_the_generator_cannot_hear() -> None:
+    """Measured against the evaluation's endpoint, prompt_tokens was identical with and without
+    the track, so a deployment whose generator ignores audio pays an encode and a transfer for
+    bytes nothing reads."""
+    import av
+
+    source = _audiovisual_bytes(seconds=10.0, fps=10, width=160, height=120)
+
+    heard = cut_generation_proxy(
+        source,
+        ClipRequest(kind=MediaKind.VIDEO, start_ms=0, end_ms=10_000, frames_per_second=1.0),
+    )
+    deaf = cut_generation_proxy(
+        source,
+        ClipRequest(
+            kind=MediaKind.VIDEO,
+            start_ms=0,
+            end_ms=10_000,
+            frames_per_second=1.0,
+            include_audio=False,
+        ),
+    )
+
+    with av.open(io.BytesIO(deaf.content), mode="r") as container:
+        assert not container.streams.audio
+        # The picture is untouched: this drops a track, it does not re-sample the video.
+        assert len(list(container.decode(container.streams.video[0]))) >= 8
+    with av.open(io.BytesIO(heard.content), mode="r") as container:
+        assert container.streams.audio
+    assert len(deaf.content) < len(heard.content)
+
+
+def test_dropping_audio_does_not_lift_the_frame_ceiling() -> None:
+    """The ceiling was documented as the MP4 muxer refusing to interleave a sparse video track
+    with continuous audio, which would make audio the thing to give up to cut a longer span.
+    It is not: a silent source cut with `include_audio=False` -- no audio anywhere in the
+    pipeline -- fails at the same frame count an audiovisual one does.
+
+    Pinned as a test because the wrong explanation is the kind that gets acted on: it invites a
+    deployment to disable proxy audio expecting longer spans to start working, and they do not.
+    """
+    silent_source = _video_bytes(seconds=60.0, fps=10, width=160, height=120)
+
+    with pytest.raises(Exception, match=r"Invalid argument|monotonic") as failure:
+        cut_generation_proxy(
+            silent_source,
+            ClipRequest(
+                kind=MediaKind.VIDEO,
+                start_ms=0,
+                end_ms=60_000,
+                frames_per_second=1.0,
+                include_audio=False,
+            ),
+        )
+
+    assert type(failure.value).__module__.startswith("av")
+    # The same silent source inside the ceiling cuts fine, so what binds is the frame count --
+    # not the span length, and not the audio track that is absent from both calls.
+    inside = cut_generation_proxy(
+        silent_source,
+        ClipRequest(
+            kind=MediaKind.VIDEO,
+            start_ms=0,
+            end_ms=30_000,
+            frames_per_second=1.0,
+            include_audio=False,
+        ),
+    )
+    assert inside.content
 
 
 def test_cut_rejects_empty_source_and_backwards_spans() -> None:

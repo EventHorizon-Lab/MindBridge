@@ -93,7 +93,7 @@ async def test_answer_pipeline_streams_raw_av_and_validates_answer(
 
     answerer = _answerer(respond)
     assert answerer.model_reference.model_id == "qwen3.8-max"
-    assert answerer.prompt_version == "answer_from_evidence_v11"
+    assert answerer.prompt_version == "answer_from_evidence_v12"
     assert answerer.occurrence_prompt_version == "select_occurrences_v2"
     evidence = (
         _resolved_evidence(MediaKind.IMAGE, "image.jpg", "media_image", 0),
@@ -347,15 +347,46 @@ async def test_occurrence_pipeline_selects_schema_validated_candidate_ids() -> N
     "content",
     [
         '{"memory_ids":["memory_01","memory_01"]}',
-        '{"memory_ids":["memory_unknown"]}',
+        '{"memory_ids":["memory_01","memory_unknown"]}',
+        '{"memory_ids":["memory_unknown","memory_01",""],"note":"padded"}',
     ],
 )
-async def test_occurrence_pipeline_rejects_invalid_selection(content: str) -> None:
+async def test_occurrence_pipeline_keeps_the_candidates_it_can_verify(content: str) -> None:
+    """A repeat, an invented ID, or a padded key costs itself, not the batch's real selections.
+
+    Enumeration verifies memories in batches, so one invented ID used to fail a whole count.
+    """
+
     async def respond(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             200,
             headers={"content-type": "text/event-stream"},
             content=_completion_stream(content),
+        )
+
+    answerer = _answerer(respond)
+    memory = _memory((), verification_status=VerificationStatus.ATTESTED)
+    try:
+        selected = await answerer.select_occurrences(
+            RecallRequest(tenant_id="tenant_01", query=RecallQuery(text="count the tools")),
+            (memory,),
+            (),
+            query_media=(),
+        )
+    finally:
+        await answerer.close()
+
+    assert selected == (memory.memory_id,)
+
+
+async def test_occurrence_pipeline_still_rejects_a_missing_selection() -> None:
+    """`memory_ids` is required: an absent one is not the same statement as an empty one."""
+
+    async def respond(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=_completion_stream('{"selected":["memory_01"]}'),
         )
 
     answerer = _answerer(respond)
@@ -371,25 +402,103 @@ async def test_occurrence_pipeline_rejects_invalid_selection(content: str) -> No
         await answerer.close()
 
 
-async def test_answer_pipeline_rejects_invalid_structured_output() -> None:
-    """Provider JSON cannot bypass the answer confidence invariant."""
+async def test_answer_pipeline_keeps_an_abstention_whose_confidence_contradicts_it() -> None:
+    """The abstention is what the model decided; the confidence beside it is the typo.
+
+    Read-path validation discarded 14 of 55 M3-Bench robot predictions on 2026-08-21, more than
+    every wrong answer that benchmark made combined. Zeroing the confidence keeps the abstention
+    exactly as given -- including the follow-up queries a second retrieval round needs, which
+    used to be thrown away with it.
+    """
 
     async def respond(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             200,
             headers={"content-type": "text/event-stream"},
-            content=_completion_stream('{"answer":null,"confidence":0.9}'),
+            content=_completion_stream(
+                '{"answer":null,"confidence":0.9,"retrieval_queries":["blue toolbox"]}'
+            ),
         )
 
     answerer = _answerer(respond)
     evidence = (_resolved_evidence(MediaKind.IMAGE, "image.jpg", "media_image", 0),)
 
     try:
+        answer = await answerer.answer(
+            RecallRequest(tenant_id="tenant_01", query=RecallQuery(text="What happened?")),
+            (_memory((evidence[0].evidence_span.evidence_id,)),),
+            evidence,
+            query_media=(),
+        )
+    finally:
+        await answerer.close()
+
+    assert answer.answer is None
+    assert answer.confidence == 0.0
+    assert answer.retrieval_queries == ("blue toolbox",)
+
+
+async def test_answer_pipeline_keeps_an_answer_that_overran_its_output_contract() -> None:
+    """An invented key, a third query, a repeat, a blank, and an unknown ordering hint all drop."""
+
+    async def respond(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=_completion_stream(
+                '{"answer":"blue toolbox","confidence":0.8,"reasoning":"because",',
+                '"retrieval_queries":["toolbox colour","toolbox colour","",'
+                '"where the toolbox is","a third"],',
+                '"temporal_order":"chronological"}',
+            ),
+        )
+
+    answerer = _answerer(respond)
+    try:
+        answer = await answerer.answer(
+            RecallRequest(tenant_id="tenant_01", query=RecallQuery(text="Where is it?")),
+            (_memory((), verification_status=VerificationStatus.ATTESTED),),
+            (),
+            query_media=(),
+        )
+    finally:
+        await answerer.close()
+
+    assert answer.answer == "blue toolbox"
+    assert answer.retrieval_queries == ("toolbox colour", "where the toolbox is")
+    assert answer.temporal_order == "relevance"
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        pytest.param('{"answer":"blue toolbox","confidence":4}', id="confidence-off-scale"),
+        pytest.param('{"response":"blue toolbox","confidence":0.8}', id="renamed-answer"),
+        pytest.param('{"answer":"blue toolbox"}', id="missing-confidence"),
+    ],
+)
+async def test_answer_pipeline_still_rejects_what_it_cannot_repair(content: str) -> None:
+    """Where the line is: a required field cannot be invented, and a number is not clamped.
+
+    `confidence` on a 1-5 scale is not read as 1.0 -- abstention and its calibration were
+    measured as sound, and fabricating a maximum here would be reporting a confidence nobody
+    produced. A renamed `answer` leaves the answer missing, which is not an abstention either.
+    """
+
+    async def respond(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=_completion_stream(content),
+        )
+
+    answerer = _answerer(respond)
+    try:
         with pytest.raises(ModelOutputError, match="invalid structured output"):
             await answerer.answer(
                 RecallRequest(tenant_id="tenant_01", query=RecallQuery(text="What happened?")),
-                (_memory((evidence[0].evidence_span.evidence_id,)),),
-                evidence,
+                (_memory((), verification_status=VerificationStatus.ATTESTED),),
+                (),
                 query_media=(),
             )
     finally:

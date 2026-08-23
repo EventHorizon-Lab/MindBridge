@@ -32,7 +32,7 @@ jobs:
             probe: edge
           - name: server
             requirement: .[server]
-            probe: api application celery_app cli consolidation_cli infrastructure lifecycle_cli models server telemetry worker
+            probe: api application celery_app cli consolidation_cli infrastructure jobs_cli lifecycle_cli models server telemetry worker
           - name: benchmarks
             requirement: .[benchmarks]
             probe: benchmarks

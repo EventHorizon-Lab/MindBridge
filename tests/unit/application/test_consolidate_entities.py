@@ -84,6 +84,14 @@ class _Store:
             raise self.evidence_error
         return tuple(_span() for _ in evidence_ids)
 
+    async def read_evidence_clip_media(
+        self,
+        tenant_id: TenantId,
+        evidence_ids: tuple[EvidenceId, ...],
+    ) -> dict[EvidenceId, MediaObject]:
+        """No derived clips in this fixture, so evidence falls back to its source media."""
+        return {}
+
     async def read_media_objects(
         self, tenant_id: TenantId, media_object_ids: tuple[MediaObjectId, ...]
     ) -> tuple[MediaObject, ...]:

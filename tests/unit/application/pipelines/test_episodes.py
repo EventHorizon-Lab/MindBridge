@@ -64,7 +64,7 @@ async def test_episode_consolidator_inspects_native_evidence_and_reports_its_mod
 
     assert result.episodes[0].event_ids == (EventId("event_01"), EventId("event_02"))
     assert result.model_reference.model_id == "qwen3.8-max"
-    assert result.prompt_version == "consolidate_episodes_v2"
+    assert result.prompt_version == "consolidate_episodes_v3"
 
 
 async def test_episode_consolidator_rejects_an_unknown_event_id() -> None:

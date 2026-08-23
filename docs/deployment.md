@@ -11,7 +11,7 @@ Five process roles. Only the first three are long-running.
 | Role | Command | Extras |
 | --- | --- | --- |
 | API | `uvicorn mindbridge.server:create_app --factory` | `server` |
-| Memory worker | `celery -A mindbridge.celery_app:app worker` | `server` + `cloud-models` |
+| Memory worker | `celery -A mindbridge.celery_app:app worker` | `server` + `media` (+ `cloud-models` only for an in-process media encoder, which brings `media` with it) |
 | MCP (optional) | `mindbridge mcp` | `server` |
 | Consolidation | `mindbridge consolidate --tenant-id ...` | `server` |
 | Lifecycle | `mindbridge lifecycle --tenant-id ...` | `server` |
@@ -136,27 +136,85 @@ vllm serve jinaai/jina-embeddings-v5-omni-small-retrieval \
   --trust-remote-code
 ```
 
+Serve this once and point **every** slot at it, including the worker's media slot. That endpoint
+embeds text, images, video, and audio, so there is no second model to run — see
+[media encoder](#media-encoder-served-or-in-process).
+
 ## Memory worker
 
 Shares storage and generator variables with the API. Its text slot reads the same
-`MINDBRIDGE_EMBEDDER_*` contract the API queries with, so only the media slot needs
-worker-specific variables:
+`MINDBRIDGE_EMBEDDER_*` contract the API queries with, and the recommended media slot reuses that
+same endpoint, so the whole worker is one variable away from the API's configuration:
 
 ```bash
-export MINDBRIDGE_MEDIA_EMBEDDER_PLUGIN=jina
-export MINDBRIDGE_MEDIA_EMBEDDER_DEVICE=cuda
-export MINDBRIDGE_MEDIA_EMBEDDER_MODEL_ID=jinaai/jina-embeddings-v5-omni-small-retrieval
+export MINDBRIDGE_MEDIA_EMBEDDER_PLUGIN=openai
 
-uv run --extra server --extra cloud-models \
-  celery -A mindbridge.celery_app:app worker --loglevel=INFO
+uv run --extra server --extra media celery -A mindbridge.celery_app:app worker --loglevel=INFO --concurrency=8
 ```
 
-**One prefork child is the safe default**, because each child owns a full embedding model. Scale
-with one worker process per assigned GPU rather than raising concurrency inside a process.
+No `cloud-models`, no GPU, no torch: with both embedder slots served, the worker loads no model at
+all and its concurrency is bounded by the endpoint and the database rather than by a card.
+
+`media` is still required, and is easy to lose sight of precisely because serving removes
+everything else. Clip derivation runs in the worker whatever the embedder slots say, and its PyAV,
+Pillow, and SoundFile decoders are declared only in that extra. They are imported lazily, so a
+`server`-only install starts cleanly, passes an import probe, and then fails the first observation
+that carries media -- as `ModelUnavailableError`, which is in `autoretry_for`, so it retries with
+backoff before failing. The in-process command below does not need it spelled out because
+`cloud-models` depends on `mindbridge[media]`.
 
 Both embedder slots must resolve to one embedding space. The worker compares the two declared
 spaces before processing and fails the job rather than writing media and text vectors that cannot
 be compared.
+
+### Media encoder: served or in-process
+
+The alternative is the bundled `jina` plugin, which loads Jina v5 Omni into the worker process:
+
+```bash
+uv sync --extra server --extra cloud-models
+export MINDBRIDGE_MEDIA_EMBEDDER_PLUGIN=jina
+export MINDBRIDGE_MEDIA_EMBEDDER_DEVICE=cuda
+
+uv run --extra server --extra cloud-models \
+  celery -A mindbridge.celery_app:app worker --loglevel=INFO --concurrency=1
+```
+
+Measured on one RTX 5090, same model and same revision on both sides, the served endpoint being
+the `vllm serve` command above:
+
+| | Served | In-process `cuda` | In-process `cpu` |
+| --- | --- | --- | --- |
+| VRAM held per prefork child | 0 | 3 745 MiB | 0 |
+| Model load per child | none | 3.8 s | — |
+| Video clip, first embed, median of 8 | **0.062 s** | 10.2 s | — |
+| Image, first embed, median of 5 | **0.048 s** | 2.9 s | — |
+| Text, 6 callers × batches of 32 | 600/s | 719/s | 1.8/s |
+| Text, 6 callers × one at a time | **183/s** | 63/s | 3.1/s |
+
+Clips and images are real derived evidence from a nine-benchmark run, 4-22 s and 84-306 KB; the
+text figures are 128 real memory summaries averaging 189 characters.
+
+Read the table as two separate results. Media is where serving wins outright — 61x on images,
+198x on video — though part of the video figure is that the served path samples a fixed frame
+budget (404-416 prompt tokens whether the clip is 4 s or 22 s) while the in-process path samples
+in proportion to clip length. Text is a wash on a GPU, better served when callers arrive one at a
+time, and a rout on a CPU: a local encoder on CPU manages 1.8 documents per second, which is what
+makes an ingest of any size impossible.
+
+**The worker refuses to start with `--concurrency` above 1 while either embedder slot names
+`jina`.** A prefork child owns its plugins, so the model is loaded once per child and six children
+need about 22 GiB of VRAM. `--max-memory-per-child` bounds resident host memory and structurally
+cannot bound VRAM; during a nine-benchmark evaluation that combination reached 30.2 of the card's
+32.6 GB with the GPU at 1-5% utilisation, then produced 479 CUDA out-of-memory errors and a kernel
+`global_oom` on the host. Scale in-process encoding with one worker process per assigned GPU at
+concurrency 1, or serve the encoder and stop budgeting VRAM per child.
+
+One caveat on switching an existing deployment: **video vectors from the two backends agree only
+to cosine 0.944** (text 0.99994, images 0.985), because they sample different numbers of frames
+from the same clip — neither path honours a per-request frame-rate hint. Re-encode media evidence
+after the switch, or accept that old and new video vectors are not strictly comparable. The
+`space_id` is the same string on both sides, so nothing will stop you.
 
 ### How long one observation may take
 
@@ -261,8 +319,11 @@ These are shapes to plan against, not benchmarks:
   every MindBridge process, not per process.
 - **Ingest cost is set by frame rate.** One clip cut, one encoder call, and one stored object per
   sampled window.
-- **The worker is GPU-bound, the API is not.** They scale independently, which is why the media
-  slot is the only in-process model.
+- **The worker is network-bound once its encoder is served.** With `MINDBRIDGE_MEDIA_EMBEDDER_PLUGIN=openai`
+  a worker holds no model, so concurrency is bounded by the endpoint and the connection pool. With
+  the in-process encoder it is bounded by one card, one child at a time, and it spends most of its
+  wall clock waiting on the generator anyway — measured GPU utilisation was 1-5% against 93%
+  allocation.
 - **`search` mode is much cheaper than `answer`.** It skips the generator entirely.
 
 ## Backup and deletion

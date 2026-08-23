@@ -73,7 +73,7 @@ async def test_summary_consolidator_inspects_native_evidence_and_reports_its_mod
     )
     assert result.summaries[0].scope is SummaryScope.SESSION
     assert result.model_reference.model_id == "qwen3.8-max"
-    assert result.prompt_version == "consolidate_summaries_v3"
+    assert result.prompt_version == "consolidate_summaries_v4"
 
 
 async def test_summary_consolidator_rejects_unknown_memory_and_missing_evidence() -> None:

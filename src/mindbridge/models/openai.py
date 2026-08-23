@@ -270,15 +270,25 @@ class OpenAIEmbedder:
         )
         try:
             if all(_text_only(item) is not None for item in request.inputs):
-                vectors = await self._embed_text(request)
+                vectors, charged_tokens = await self._embed_text(request)
             else:
-                vectors = tuple(
-                    await asyncio.gather(
-                        *(self._embed_multimodal(item, request.task) for item in request.inputs)
-                    )
+                encoded = await asyncio.gather(
+                    *(self._embed_multimodal(item, request.task) for item in request.inputs)
                 )
+                vectors = tuple(vector for vector, _ in encoded)
+                charged_tokens = sum(tokens for _, tokens in encoded)
         except openai.APIError as error:
             _raise_model_error(error, "embedding request failed")
+        # Serving the encoder turns embedding into a metered call, so its cost has to reach the
+        # same account generation already reports into. An embedding charges entirely on its
+        # input -- there are no completion tokens to report -- and a multimodal batch is one
+        # request per item, so what lands here is the whole batch's bill.
+        set_current_span_attributes(
+            {
+                "mindbridge.model.input_tokens": charged_tokens,
+                "mindbridge.model.total_tokens": charged_tokens,
+            }
+        )
         return EmbedResult(
             embeddings=tuple(
                 Embedding(
@@ -293,7 +303,10 @@ class OpenAIEmbedder:
     async def close(self) -> None:
         await self._client.close()
 
-    async def _embed_text(self, request: EmbedRequest) -> tuple[tuple[float, ...], ...]:
+    async def _embed_text(
+        self,
+        request: EmbedRequest,
+    ) -> tuple[tuple[tuple[float, ...], ...], int]:
         prefix = "Query: " if request.task is EmbedTask.QUERY else "Document: "
         response = await self._client.embeddings.create(
             input=[prefix + cast(str, _text_only(item)) for item in request.inputs],
@@ -302,18 +315,21 @@ class OpenAIEmbedder:
             encoding_format="float",
             timeout=self._request_timeout_seconds,
         )
-        return _embedding_vectors(
-            response,
-            self._model_reference,
-            dimension=self._dimension,
-            expected_count=len(request.inputs),
+        return (
+            _embedding_vectors(
+                response,
+                self._model_reference,
+                dimension=self._dimension,
+                expected_count=len(request.inputs),
+            ),
+            response.usage.prompt_tokens,
         )
 
     async def _embed_multimodal(
         self,
         input_value: ModelInput,
         task: EmbedTask,
-    ) -> tuple[float, ...]:
+    ) -> tuple[tuple[float, ...], int]:
         response = await self._client.post(
             "/embeddings",
             cast_to=CreateEmbeddingResponse,
@@ -335,12 +351,15 @@ class OpenAIEmbedder:
             },
             options={"timeout": self._request_timeout_seconds},
         )
-        return _embedding_vectors(
-            response,
-            self._model_reference,
-            dimension=self._dimension,
-            expected_count=1,
-        )[0]
+        return (
+            _embedding_vectors(
+                response,
+                self._model_reference,
+                dimension=self._dimension,
+                expected_count=1,
+            )[0],
+            response.usage.prompt_tokens,
+        )
 
 
 class _GeneratorConfig(PluginConfigModel):

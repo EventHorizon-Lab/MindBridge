@@ -97,6 +97,11 @@ COMMANDS: dict[tuple[str, ...], Command] = {
         "Consolidate one tenant's Episodes, Claims, and Summaries",
         extra="server",
     ),
+    ("jobs",): Command(
+        "mindbridge.jobs_cli",
+        "Report the observation job ledger against the broker, and repair it",
+        extra="server",
+    ),
     ("lifecycle",): Command(
         "mindbridge.lifecycle_cli",
         "Decay and transition one tenant's memory strength",
