@@ -129,16 +129,56 @@ degraded service.
 
 The API sends both multimodal recall queries and explicit memory text to one OpenAI-compatible
 Jina v5 Omni pooling endpoint, which encodes each side with its own retrieval prompt. It loads no
-model itself. A self-hosted endpoint can use the upstream validated vLLM path:
+model itself. A self-hosted endpoint can serve the same model through vLLM:
 
 ```bash
 vllm serve jinaai/jina-embeddings-v5-omni-small-retrieval \
-  --trust-remote-code
+  --trust-remote-code \
+  --runner pooling --convert embed \
+  --pooler-config '{"pooling_type":"LAST"}'
 ```
 
 Serve this once and point **every** slot at it, including the worker's media slot. That endpoint
 embeds text, images, video, and audio, so there is no second model to run — see
-[media encoder](#media-encoder-served-or-in-process).
+[media encoder](#media-encoder-served-or-in-process) for the measured comparison and the one
+version-dependent caveat that goes with it.
+
+The model repo carries its own vLLM implementation and registers the `Qwen3VLAudioModel`
+architecture out of tree, as a side effect of the `trust_remote_code` config import; vLLM's own
+registry does not contain it. Most of what goes wrong here is that registration not happening, in
+a process or at a version where it cannot:
+
+- **`--runner pooling` is not optional.** Without it vLLM selects the generate runner and refuses
+  to start on `language_model.lm_head.weight`, a weight an embedding checkpoint does not carry and
+  one the repo's own loader deliberately skips.
+- **Serve the repo id, not a local directory.** The registration shim locates its sibling module
+  from the Hugging Face module package name, which only carries enough segments when the model was
+  resolved by repo id. A local path yields a shorter name, the fetch is skipped, and the failure is
+  a warning rather than an error.
+- **Registration has to reach the engine process.** vLLM resolves the model class again inside its
+  engine subprocess, which does not inherit the API server's registration and falls back to the
+  generic Transformers backend. Import the plugin module from a `sitecustomize.py` on the server's
+  path, or install it as a vLLM plugin entry point. `no vLLM implementation, falling back to
+  Transformers implementation` in the engine's log means it did not take.
+- **Pooler keys move between versions.** The model card's snippet passes `normalize=True`, which
+  0.19 rejects during argument parsing. Read the `PoolerConfig` fields of the version you installed
+  rather than copying the snippet.
+- **Pin a vLLM version and record it next to any measurement.** The model card validates
+  `vllm==0.20.1`, whose wheels resolve CUDA 13 and therefore need an r580 or newer driver; 0.20.0
+  is already CUDA 13, so against a CUDA 12.8 driver the newest usable release is 0.19.1, where
+  this plugin also registers. Which version is serving changes what the endpoint can encode.
+- **On Blackwell, override both attention backends**: `--attention-backend TRITON_ATTN
+  --mm-encoder-attn-backend TORCH_SDPA`. The bundled FlashAttention objects ship cubins for sm_80
+  and sm_90 only, so sm_120 falls through to PTX that a CUDA 12.8 driver cannot compile. Overriding
+  only the encoder backend is worse than not overriding at all: the server passes `/health` and
+  then dies on the first request.
+
+Audio needs an upstream fix before the endpoint returns anything for it. The plugin's data parser
+accepts `target_sr` and never forwards it to its base class, so the base resampler is built without
+one and raises `Audio resampling is not supported when target_sr is not provided` before it
+compares any sample rates — a 16 kHz file into a 16 kHz model fails too. Forwarding that keyword to
+`super().__init__` is the whole fix. `--media-io-kwargs '{"audio":{"sampling_rate":16000}}'` does
+not substitute for it: the flag parses and the failure is in the parser, not the IO layer.
 
 ## Memory worker
 
@@ -215,6 +255,22 @@ to cosine 0.944** (text 0.99994, images 0.985), because they sample different nu
 from the same clip — neither path honours a per-request frame-rate hint. Re-encode media evidence
 after the switch, or accept that old and new video vectors are not strictly comparable. The
 `space_id` is the same string on both sides, so nothing will stop you.
+
+That table holds for one vLLM version, and the served video path does not survive every version.
+On **0.19.1** — the newest release a CUDA 12.8 driver can run — a served video request is refused
+outright:
+
+```text
+ValueError: Mismatch in `video` token count between text and `input_ids`.
+            Got ids=[496] and text=[748].
+```
+
+raised inside the plugin's own processor while it re-derives the per-frame timestamp expansion.
+The counts are identical on the repo's `main` and on the `12949877` revision, and identical with
+and without the per-request frame-rate and pixel hints, so it is neither the model revision nor the
+request shape. Verify the served media path on the exact version you intend to deploy before
+pointing the worker's media slot at it, and record that version alongside any numbers you measure:
+the same command against two vLLM releases is two different experiments.
 
 ### How long one observation may take
 

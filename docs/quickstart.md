@@ -21,8 +21,15 @@ reference embedder yourself:
 
 ```bash
 vllm serve jinaai/jina-embeddings-v5-omni-small-retrieval \
-  --trust-remote-code
+  --trust-remote-code \
+  --runner pooling --convert embed \
+  --pooler-config '{"pooling_type":"LAST"}'
 ```
+
+Without the pooling flags vLLM starts this checkpoint as a generative model and refuses to load on
+a missing `lm_head`. Text is all this quickstart needs; serving image, video, or audio through the
+same endpoint carries further constraints, which
+[deployment](deployment.md#embedding-endpoint) lists.
 
 ## 1. Install
 
