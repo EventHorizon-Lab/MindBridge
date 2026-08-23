@@ -32,6 +32,9 @@ exact sync: to add the local Jina embedder, extend that same command with `--ext
 rather than syncing it alone, which would uninstall everything above. It pulls torch, so skip it
 unless you need it.
 
+For the cu129 vLLM embedding endpoint used by RTX 5090 workstations, also add
+`--extra vllm-server`. This keeps `.venv/bin/vllm` and its matching Torch build in the exact sync.
+
 For everything at once — every scenario plus the benchmark harness and the local models:
 
 ```bash

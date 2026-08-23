@@ -25,6 +25,7 @@ uv sync                                      # Core types and Python SDK
 uv sync --extra edge                         # Any edge host
 uv sync --extra server                       # API, MCP, scheduled sweeps
 uv sync --extra server --extra cloud-models  # GPU memory worker
+uv sync --extra vllm-server                  # RTX 5090 embedding endpoint (CUDA 12.9)
 uv sync --extra benchmarks                   # Benchmark harness
 uv sync --all-extras                         # Every role at once
 ```
@@ -135,10 +136,14 @@ model itself. A self-hosted endpoint can serve the same model through vLLM.
 implementation and registers it as a side effect of the `trust_remote_code` config import, and that
 side effect reaches the API server process but **not** the engine subprocess, which resolves the
 model class again and otherwise falls back to a generic Transformers backend. Registering through
-vLLM's own plugin hook is what covers every process, so bring-up is two steps:
+vLLM's own plugin hook is what covers every process, so bring-up is three steps:
 
 ```bash
-# 1. A plugin vLLM loads in each of its processes, engine subprocess included.
+# 1. Install the matching CUDA compiler/runtime and Python environment.
+sudo apt install cuda-compiler-12-9 libcurand-dev-12-9
+uv sync --extra vllm-server
+
+# 2. Add a plugin vLLM loads in each of its processes, engine subprocess included.
 mkdir -p vllm-jina-omni && cd vllm-jina-omni
 cat > pyproject.toml <<'TOML'
 [project]
@@ -164,11 +169,12 @@ def register() -> None:
     sys.path.insert(0, os.path.dirname(path))
     importlib.import_module("vllm_qwen3vl_audio")
 PYPLUGIN
-pip install .
+uv pip install --python ../.venv/bin/python .
 cd -
 
-# 2. Serve.
-vllm serve jinaai/jina-embeddings-v5-omni-small-retrieval \
+# 3. Serve.
+CUDA_HOME=/usr/local/cuda-12.9 \
+  .venv/bin/vllm serve jinaai/jina-embeddings-v5-omni-small-retrieval \
   --trust-remote-code \
   --runner pooling --convert embed \
   --pooler-config '{"pooling_type":"LAST"}'
@@ -197,15 +203,13 @@ Four more things to get right:
 - **Pooler keys move between versions.** The model card's snippet passes `normalize=True`, which
   0.19 rejects during argument parsing. Read the `PoolerConfig` fields of the version you installed
   rather than copying the snippet.
-- **Pin a vLLM version and record it next to any measurement.** The model card validates
-  `vllm==0.20.1`, whose wheels resolve CUDA 13 and therefore need an r580 or newer driver; 0.20.0
-  is already CUDA 13, so against a CUDA 12.8 driver the newest usable release is 0.19.1, where
-  the repo's module still imports. Which version is serving changes what the endpoint can encode.
-- **On Blackwell, override both attention backends**: `--attention-backend TRITON_ATTN
-  --mm-encoder-attn-backend TORCH_SDPA`. The bundled FlashAttention objects ship cubins for sm_80
-  and sm_90 only, so sm_120 falls through to PTX that a CUDA 12.8 driver cannot compile. Overriding
-  only the encoder backend is worse than not overriding at all: the server passes `/health` and
-  then dies on the first request.
+- **Use the `vllm-server` extra rather than an unqualified `uv pip install`.** It pins
+  `vllm==0.27.1+cu129`, Torch 2.13.0, and the matching audio packages from their cu129 indexes.
+  The RTX 5090 reports `sm_120`, so FlashInfer JIT also needs the system CUDA 12.9 compiler and
+  headers installed above; the NVIDIA driver alone does not provide them.
+- **On Blackwell, keep the CUDA compiler aligned with Torch.** A `CUDA_HOME` pointing at 12.8
+  makes FlashInfer reject `sm_120` even when `torch.version.cuda` reports 12.9. If a kernel still
+  fails to compile, add `--attention-backend TRITON_ATTN --mm-encoder-attn-backend TORCH_SDPA`.
 
 Audio needs an upstream fix before the endpoint returns anything for it. The plugin's data parser
 accepts `target_sr` and never forwards it to its base class, so the base resampler is built without
