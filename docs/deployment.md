@@ -276,13 +276,19 @@ in proportion to clip length. Text is a wash on a GPU, better served when caller
 time, and a rout on a CPU: a local encoder on CPU manages 1.8 documents per second, which is what
 makes an ingest of any size impossible.
 
-**The worker refuses to start with `--concurrency` above 1 while either embedder slot names
-`jina`.** A prefork child owns its plugins, so the model is loaded once per child and six children
-need about 22 GiB of VRAM. `--max-memory-per-child` bounds resident host memory and structurally
-cannot bound VRAM; during a nine-benchmark evaluation that combination reached 30.2 of the card's
-32.6 GB with the GPU at 1-5% utilisation, then produced 479 CUDA out-of-memory errors and a kernel
-`global_oom` on the host. Scale in-process encoding with one worker process per assigned GPU at
-concurrency 1, or serve the encoder and stop budgeting VRAM per child.
+**The worker refuses to start when a pool of more than one child would hold more resident encoder
+weight than the deployment allows, while either embedder slot names `jina`.** A prefork child owns
+its plugins, so the model is loaded once per child and six children need about 22 GiB of VRAM. The
+pool size is whatever Celery settles on, from `--concurrency` or from `--autoscale`; a pool that
+shares one process, `--pool=threads` or `solo`, holds one copy however wide it runs and is not
+refused. `--max-memory-per-child` bounds resident host memory and structurally cannot bound VRAM;
+during a nine-benchmark evaluation that combination reached 30.2 of the card's 32.6 GB with the GPU
+at 1-5% utilisation, then produced 479 CUDA out-of-memory errors and a kernel `global_oom` on the
+host. Scale in-process encoding with one worker process per assigned GPU at concurrency 1, or serve
+the encoder and stop budgeting VRAM per child. A card that can genuinely hold more copies says so
+in [`MINDBRIDGE_WORKER_VRAM_BUDGET_GIB`](configuration.md#media-embedder-worker-only), which is the
+supported way to raise the limit — the estimate it bounds counts resident weights only, so leave
+room for activation memory.
 
 One caveat on switching an existing deployment: **video vectors from the two backends agree only
 to cosine 0.944** (text 0.99994, images 0.985), because they sample different numbers of frames

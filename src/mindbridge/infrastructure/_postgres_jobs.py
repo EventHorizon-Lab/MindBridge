@@ -51,8 +51,10 @@ _AccountingRow: TypeAlias = tuple[
     int,
     int,
     int,
-    Decimal,
-    Decimal,
+    # The durations are `double precision` and the token sums are `SUM(bigint)`, which is
+    # `numeric`, so the two halves arrive as different Python types.
+    float,
+    float,
     Decimal,
     Decimal,
 ]
@@ -505,13 +507,27 @@ class ObservationJobOperations(PostgresStoreOperations):
                     -- queue wait, and on a retry it is the backoff since the previous attempt
                     -- closed. `started_at` is overwritten just above, which is exactly why the
                     -- difference cannot be taken afterwards.
-                    queue_wait_seconds = COALESCE(queue_wait_seconds, 0)
-                        + EXTRACT(epoch FROM now() - updated_at),
+                    --
+                    -- A stale `running` row is the exception: the previous claim stamped
+                    -- `started_at` and `updated_at` in one statement, so the interval since
+                    -- `updated_at` is the abandoned attempt itself. Charging it here would bill
+                    -- the same seconds to both columns and call time spent running a wait.
+                    queue_wait_seconds = CASE
+                        WHEN state = 'running' THEN COALESCE(queue_wait_seconds, 0)
+                        ELSE COALESCE(queue_wait_seconds, 0)
+                            + EXTRACT(epoch FROM now() - updated_at)
+                    END,
                     -- A reclaimed stale attempt is abandoned mid-flight and never reaches the
-                    -- completion path, so its work would otherwise go uncharged.
+                    -- completion path, so its work would otherwise go uncharged. Capped at the
+                    -- stale window on the same reasoning the reader uses for the open interval:
+                    -- past it whatever held the row is gone, and this write is permanent, so an
+                    -- uncapped charge would sort every live tenant below a dead worker forever.
                     work_seconds = CASE
                         WHEN state = 'running' AND started_at IS NOT NULL
-                        THEN COALESCE(work_seconds, 0) + EXTRACT(epoch FROM now() - started_at)
+                        THEN COALESCE(work_seconds, 0) + least(
+                            EXTRACT(epoch FROM now() - started_at),
+                            %s::double precision
+                        )
                         ELSE COALESCE(work_seconds, 0)
                     END
                 WHERE tenant_id = %s AND job_id = %s
@@ -528,6 +544,7 @@ class ObservationJobOperations(PostgresStoreOperations):
                           COALESCE(payload -> 'memory_ids', '[]'::jsonb)
                 """,
                 (
+                    OBSERVATION_JOB_STALE_AFTER_SECONDS,
                     tenant_id,
                     job_id,
                     PROCESS_OBSERVATION_JOB_TYPE,

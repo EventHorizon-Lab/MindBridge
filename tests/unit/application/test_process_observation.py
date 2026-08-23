@@ -1,11 +1,13 @@
 """Vertical unit checks for retry-safe observation processing."""
 
+import logging
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 import pytest
 from consolidation_doubles import RecordingTextEmbedder
 
+from mindbridge import telemetry
 from mindbridge.application import process_observation as process_observation_module
 from mindbridge.application.derive_observation_graph import embed_observation_graph
 from mindbridge.application.evidence_clips import ClipSampling
@@ -24,6 +26,7 @@ from mindbridge.application.ports import PresignedMediaDownload
 from mindbridge.application.process_observation import (
     ProcessObservation,
     _require_grounded_perception,
+    record_unclaimed_processing_failure,
 )
 from mindbridge.core import (
     AnonymousIdentityObservation,
@@ -416,6 +419,7 @@ class AliasedClaimPerceiver(RecordingPerceiver):
 
 async def test_a_resolved_claim_type_alias_stays_visible_for_the_attempt(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """An aliased claim is indistinguishable from a native one once it lands.
 
@@ -424,19 +428,16 @@ async def test_a_resolved_claim_type_alias_stays_visible_for_the_attempt(
     after a prompt change, should be readable instead of inferred.
     """
     attributes: list[dict[str, str | int | float | bool]] = []
-    monkeypatch.setattr(
-        process_observation_module,
-        "set_current_span_attributes",
-        attributes.append,
-    )
+    monkeypatch.setattr(telemetry, "set_current_span_attributes", attributes.append)
     store = RecordingProcessingStore()
 
-    await _processor(
-        store,
-        AliasedClaimPerceiver(),
-        RecordingEmbedder(),
-        RecordingTextEmbedder(),
-    ).run(TENANT_ID, OBSERVATION_ID, JOB_ID)
+    with caplog.at_level(logging.WARNING):
+        await _processor(
+            store,
+            AliasedClaimPerceiver(),
+            RecordingEmbedder(),
+            RecordingTextEmbedder(),
+        ).run(TENANT_ID, OBSERVATION_ID, JOB_ID)
 
     assert store.output is not None
     assert store.output.claims[0].claim_type is ClaimType.FACT
@@ -446,6 +447,9 @@ async def test_a_resolved_claim_type_alias_stays_visible_for_the_attempt(
         for key, value in attribute.items()
         if key == "mindbridge.perception.claim_type_alias_count"
     ] == [1]
+    # And on the deployment that samples a tenth of its traces into no collector, where the
+    # span carrying that number is discarded before anything reads it.
+    assert "mindbridge.perception.claim_type_alias_count=1" in caplog.text
 
 
 class RecasedEntityPerceiver(RecordingPerceiver):
@@ -712,6 +716,53 @@ async def test_processor_records_sanitized_failure_state(
 
     assert store.job.state is JobState.FAILED
     assert store.job.error_code == error_code
+
+
+async def test_a_failure_before_the_claim_still_reaches_the_ledger() -> None:
+    """A worker that cannot load its models has to say so on the row, not drop the message.
+
+    `task_acks_late` acks and discards a message whose task raised, so anything that fails
+    before the claim above leaves no trace at all: the 2026-08-21 evaluation turned 479 CUDA
+    out-of-memory errors into ~17 `failed` rows and ~318 rows stranded `pending`. The claim is
+    taken here only in order to record -- it is what makes the row this delivery's to fail.
+    """
+    store = RecordingProcessingStore()
+
+    await record_unclaimed_processing_failure(
+        store,
+        TENANT_ID,
+        OBSERVATION_ID,
+        JOB_ID,
+        RuntimeError("CUDA out of memory"),
+    )
+
+    # `worker_setup_failed`, not the generic fallthrough: this observation was never perceived,
+    # so republishing it after the environment is fixed pays for nothing it already paid for.
+    assert (store.job.state, store.job.attempt, store.job.error_code) == (
+        JobState.FAILED,
+        1,
+        "worker_setup_failed",
+    )
+
+
+async def test_a_setup_failure_leaves_a_row_this_delivery_does_not_own_alone() -> None:
+    """Recording is only ever allowed on a row the claim actually handed over.
+
+    A redelivery of a job another worker finished, or one it still holds, must not be stamped
+    failed by a child that never got as far as loading a model.
+    """
+    store = RecordingProcessingStore()
+    store.job = _job(JobState.SUCCEEDED, attempt=1)
+
+    await record_unclaimed_processing_failure(
+        store,
+        TENANT_ID,
+        OBSERVATION_ID,
+        JOB_ID,
+        RuntimeError("CUDA out of memory"),
+    )
+
+    assert store.job.state is JobState.SUCCEEDED
 
 
 def test_processing_rejects_embedders_in_different_search_spaces() -> None:

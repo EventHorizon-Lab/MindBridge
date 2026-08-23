@@ -1000,6 +1000,69 @@ async def test_the_ledger_charges_the_attempt_in_flight_and_every_attempt_before
     assert retried.queue_wait_seconds < retried.work_seconds
 
 
+async def test_reclaiming_a_stale_attempt_charges_it_once_and_stops_at_the_stale_window(
+    store: PostgresMemoryStore,
+    database_url: str,
+) -> None:
+    """A dead worker's abandoned interval was written to both duration columns, uncapped.
+
+    The claim's SET list reads the pre-update row, where a running job has `started_at` equal to
+    `updated_at` because the previous claim stamped both in one statement. So the same interval
+    was added to `queue_wait_seconds` and to `work_seconds`, and the wait column absorbed time
+    the job spent running. The reader's cap only guards the interval still open; a reclaim wrote
+    the uncapped value permanently, so `--republish` after a worker died sorted the tenant with
+    the deadest worker first in the summary that answers "who is consuming the worker".
+    """
+    tenant_id = TenantId("tenant_stale_reclaim")
+    receipt = await _kernel(store).observe(
+        _observe_request(tenant_id=tenant_id, media_object_id="media_stale_reclaim")
+    )
+    job = (ObservationId(receipt.observation_id), JobId(receipt.processing_job_id))
+    await store.claim_observation_processing_job(tenant_id, *job)
+
+    connection = await AsyncConnection.connect(database_url, autocommit=True)
+    async with connection:
+        await connection.execute(
+            "SELECT set_config('mindbridge.tenant_id', %s, false)", (tenant_id,)
+        )
+        # Age the claimed row past the stale window, exactly as a worker that died would leave
+        # it. `created_at` moves too because migration 0022 forbids a start before creation.
+        await connection.execute(
+            """
+            UPDATE jobs
+            SET created_at = now() - make_interval(secs => %s),
+                started_at = now() - make_interval(secs => %s),
+                updated_at = now() - make_interval(secs => %s)
+            WHERE tenant_id = %s
+            """,
+            (
+                OBSERVATION_JOB_STALE_AFTER_SECONDS * 3,
+                OBSERVATION_JOB_STALE_AFTER_SECONDS * 2,
+                OBSERVATION_JOB_STALE_AFTER_SECONDS * 2,
+                tenant_id,
+            ),
+        )
+        waited_before = await _job_durations(connection, tenant_id)
+
+        claim = await store.claim_observation_processing_job(tenant_id, *job)
+        wait_seconds, work_seconds = await _job_durations(connection, tenant_id)
+
+    assert claim.acquired and claim.job.attempt == 2
+    # The abandoned attempt was running, not queued, so it owes the wait column nothing.
+    assert wait_seconds == waited_before[0]
+    # And it stops accruing where the reader stops counting it, for the same reason: past the
+    # stale window whatever held it is gone.
+    assert work_seconds == pytest.approx(OBSERVATION_JOB_STALE_AFTER_SECONDS, rel=0.01)
+
+
+async def _job_durations(connection: AsyncConnection, tenant_id: TenantId) -> tuple[float, float]:
+    """Read the columns as written, which is what a reclaim makes permanent."""
+    cursor = await connection.execute(
+        "SELECT queue_wait_seconds, work_seconds FROM jobs WHERE tenant_id = %s", (tenant_id,)
+    )
+    return cast(tuple[float, float], await cursor.fetchone())
+
+
 async def test_a_tenant_confined_role_is_refused_a_ledger_wide_scan(
     store: PostgresMemoryStore,
     database_url: str,

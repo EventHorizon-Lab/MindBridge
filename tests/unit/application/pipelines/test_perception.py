@@ -1,6 +1,7 @@
 """Contract tests for the multimodal Perception pipeline."""
 
 import json
+import logging
 from collections.abc import Callable, Coroutine
 from datetime import datetime, timedelta, timezone
 from typing import cast
@@ -9,6 +10,7 @@ import httpx
 import pytest
 from openai import AsyncOpenAI
 
+from mindbridge import telemetry
 from mindbridge.application.perception import (
     MAX_PERCEIVED_CLAIMS_PER_EVENT,
     MAX_PERCEIVED_ENTITIES_PER_EVENT,
@@ -19,7 +21,6 @@ from mindbridge.application.perception import (
     ResolvedEvidence,
 )
 from mindbridge.application.pipelines import PerceptionPipeline
-from mindbridge.application.pipelines import perception as perception_module
 from mindbridge.core import (
     AnonymousIdentityObservation,
     ClaimType,
@@ -812,10 +813,27 @@ async def test_what_a_cap_discarded_is_recorded_apart_from_what_was_wrong(
     """Truncation is only honest if it is visible, and the two reasons need telling apart: a wrong
     value is the model's problem, a binding limit is ours."""
     recorded: list[dict[str, str | int | float | bool]] = []
-    monkeypatch.setattr(perception_module, "set_current_span_attributes", recorded.append)
+    monkeypatch.setattr(telemetry, "set_current_span_attributes", recorded.append)
 
     await _perceive({"events": [_event_payload(claims=60) for _ in range(6)]})
 
     attributes = {key: value for item in recorded for key, value in item.items()}
     assert attributes["mindbridge.perception.over_cap_claim_count"] == 104
     assert attributes["mindbridge.perception.dropped_claim_count"] == 0
+
+
+async def test_what_was_discarded_reaches_an_operator_with_no_collector(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The span attributes are not a sink on the deployment this fix exists for.
+
+    A span carries them only while it is recording, and the documented recipe is a 0.1 sampler
+    against a collector the evaluation did not run. On that box a model emitting one unsupported
+    enum per claim looks exactly like a model with little to say: every job succeeds and the
+    census is simply low. So the counts go somewhere that needs neither.
+    """
+    with caplog.at_level(logging.WARNING):
+        await _perceive({"events": [_event_payload(claims=60) for _ in range(6)]})
+
+    assert "mindbridge.perception.over_cap_claim_count=104" in caplog.text
+    assert "mindbridge.perception.dropped_claim_count=0" in caplog.text

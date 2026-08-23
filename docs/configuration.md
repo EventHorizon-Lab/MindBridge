@@ -22,6 +22,7 @@ fails to start rather than failing one call an hour later.
 | `MINDBRIDGE_EMBEDDING_*` | ○ | ○ | ○ | ○ | | |
 | `MINDBRIDGE_MEDIA_EMBEDDER_*` | | | ○ | | | |
 | `MINDBRIDGE_MEDIA_SAMPLING_CONFIG_JSON` | | | ○ | | | |
+| `MINDBRIDGE_WORKER_VRAM_BUDGET_GIB` | | | ○ | | | |
 | `MINDBRIDGE_TENANT_API_KEYS_JSON` | ● | | | | | |
 | `MINDBRIDGE_API_KEY` | | | | | | ● |
 | `MINDBRIDGE_AML_*` | ○ | | | | | |
@@ -151,6 +152,7 @@ export MINDBRIDGE_MEDIA_EMBEDDER_PLUGIN=openai
 | --- | --- | --- |
 | `MINDBRIDGE_MEDIA_EMBEDDER_MODEL_ID` | no | `jinaai/jina-embeddings-v5-omni-small-retrieval` |
 | `MINDBRIDGE_MEDIA_EMBEDDER_DEVICE` | no | automatic selection |
+| `MINDBRIDGE_WORKER_VRAM_BUDGET_GIB` | no | `3.7` — one model copy per child |
 
 `MINDBRIDGE_MEDIA_EMBEDDER_MODEL_ID` is a Hugging Face repository ID; `MINDBRIDGE_EMBEDDER_MODEL_ID`
 is an endpoint-side alias. They frequently hold the same string and are still not the same field
@@ -160,9 +162,24 @@ An explicit `DEVICE` that is unavailable fails rather than silently falling back
 
 What the in-process plugin costs, measured on one RTX 5090 against the same model served through
 vLLM, is in [deployment](deployment.md#media-encoder-served-or-in-process): **3.7 GiB of VRAM per
-prefork child**, and 61-198x the wall time per media object. The worker **refuses to start** with
-more than one child while either embedder slot names `jina`, because a prefork child holds its own
-copy of the model and `--max-memory-per-child` cannot bound VRAM.
+prefork child**, and 61-198x the wall time per media object. The worker **refuses to start** when a
+pool of more than one child would hold more than `MINDBRIDGE_WORKER_VRAM_BUDGET_GIB`, while either
+embedder slot names `jina`, because a prefork child holds its own copy of the model and
+`--max-memory-per-child` cannot bound VRAM. The pool size is whichever of `--concurrency` and
+`--autoscale` is larger; a pool that shares one process (`--pool=threads`, `solo`) holds one copy
+however wide it runs, and `MINDBRIDGE_MEDIA_EMBEDDER_DEVICE=cpu` holds no VRAM at all, so neither
+is refused.
+
+`MINDBRIDGE_WORKER_VRAM_BUDGET_GIB` defaults to **3.7 GiB, one model copy per child**, which is
+what keeps a second resident copy a decision rather than an accident. Raise it on a card that can
+genuinely hold more — `MINDBRIDGE_WORKER_VRAM_BUDGET_GIB=48` admits six children with one loaded
+slot each. It exists because a guard with no way to say yes gets routed around, and the route an
+operator reaches for is `--autoscale`, which the guard cannot see from `--concurrency` alone.
+**The estimate it bounds counts resident weights and CUDA contexts only, not activation memory**:
+the evaluation's six children measured 30.2 GB against an estimated 22.2, so leave room. A value
+that is not a **finite** positive number fails startup rather than disabling the guard — `Infinity`
+parses, and every estimate compares below it, so a typo in the one variable that raises the guard
+would otherwise switch it off.
 
 Switching an existing deployment from `jina` to `openai` is not free: video vectors from the two
 backends agree only to cosine **0.944**, because they sample different numbers of frames from the
@@ -266,7 +283,10 @@ export MINDBRIDGE_MEDIA_SAMPLING_CONFIG_JSON='{
 }'
 ```
 
-An unrecognized key or a value of the wrong type fails startup.
+An unrecognized key or a value of the wrong type fails startup, and so does a frame rate outside
+`0 < fps <= 20`. The upper bound is the media layer's own: past 20 fps every span widened to the
+sampling floor exceeds the proxy frame ceiling below, so the knob would silently switch off the
+feature it is tuning. `Infinity` is well-formed JSON and is refused here rather than downstream.
 
 **Frame rate sets the entire write cost of a video deployment** — one clip cut, one encoder call,
 and one stored object per sampled window. It is the first thing to change if ingest is too
@@ -316,16 +336,26 @@ picture and speech beyond the reach of `forget()`.
 
 ## Telemetry
 
-OpenTelemetry activates only when a standard common or signal-specific OTLP endpoint is set.
-Without one it stays a no-op.
+OpenTelemetry activates per signal, according to the exporter that signal is configured for.
+The default exporter is `otlp`, which needs an endpoint and stays a no-op without one. `console`
+needs no endpoint and renders the same instruments into the process's own output, which is how a
+box with no collector reads its stage timings and token counts. `none` turns the signal off.
 
 | Variable | Purpose |
 | --- | --- |
+| `OTEL_TRACES_EXPORTER`, `OTEL_METRICS_EXPORTER` | `otlp` (default), `console`, or `none`. |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | Collector address, e.g. `http://otel-collector:4318`. |
 | `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | Signal-specific override. |
 | `OTEL_SERVICE_NAME` | Override the per-process default. |
 | `OTEL_TRACES_SAMPLER`, `OTEL_TRACES_SAMPLER_ARG` | Standard sampler configuration. |
 | `OTEL_SDK_DISABLED` | Set `true` for an explicit process-level opt-out. |
+
+Two measurements deliberately do not depend on any of this, because losing them to a sampling
+decision would misreport what happened rather than merely fail to describe it. What a model
+charged for an observation is written to that observation's job row. What a stage discarded or
+rewrote from a model's answer — dropped events, entities and claims, and claim types resolved
+through an alias — is also logged at `WARNING`, so a low memory count can be told apart from a
+model whose output was mostly thrown away.
 
 Each process has a distinct default `service.name`, so they are already separable without
 configuration. MindBridge captures no authorization headers, request bodies, prompts, memory

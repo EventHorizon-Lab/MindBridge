@@ -28,7 +28,12 @@ from mindbridge.core import (
     ObservationId,
     TenantId,
 )
-from mindbridge.media.clipping import ClipRequest, MediaClip, audio_windows
+from mindbridge.media.clipping import (
+    DEFAULT_VIDEO_MAX_PIXELS,
+    ClipRequest,
+    MediaClip,
+    audio_windows,
+)
 from mindbridge.models import Embedding, EmbedRequest, EmbedResult, EmbedTask, MediaPart
 
 NOW = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
@@ -957,7 +962,8 @@ async def test_a_span_too_short_to_sample_twice_is_widened_instead_of_failing() 
 
 async def test_the_floor_follows_the_configured_frame_rate() -> None:
     """The floor is two sampling intervals, so it moves with the deployment's frame rate rather
-    than being a fixed number of milliseconds."""
+    than being a fixed number of milliseconds -- until it reaches the wall-clock ceiling, past
+    which it is the sampling that moves instead."""
     requests: list[ClipRequest] = []
 
     def record(source: bytes, request: ClipRequest) -> tuple[MediaClip, ...]:
@@ -975,7 +981,10 @@ async def test_the_floor_follows_the_configured_frame_rate() -> None:
             cut=record,
         )
 
-    assert [(item.start_ms, item.end_ms) for item in requests] == [(4_100, 8_100), (7_600, 8_100)]
+    # Four seconds of window is what 0.5 fps used to buy for a 100 ms event; the ceiling holds
+    # it to two and hands back the frame rate that fills them.
+    assert [(item.start_ms, item.end_ms) for item in requests] == [(6_100, 8_100), (7_600, 8_100)]
+    assert [item.frames_per_second for item in requests] == [1.0, 4.0]
 
 
 async def test_a_span_at_the_start_of_a_source_is_widened_forwards() -> None:
@@ -1080,3 +1089,84 @@ async def test_widening_cannot_push_a_proxy_past_the_frame_ceiling() -> None:
         # 100 ms asked for, 2 s cut, still far below the 40-frame ceiling.
         assert resolved[0].media_url != "https://objects.example.test/media_video_01.mp4"
     assert store.reads == 1
+
+
+async def test_a_frame_rate_below_the_floor_samples_faster_instead_of_reaching_further() -> None:
+    """The floor is two frames, and two frames is a count, not a length of tape.
+
+    `MINDBRIDGE_MEDIA_SAMPLING_CONFIG_JSON={"frames_per_second":0.2}` is a plausible way to cut
+    token cost, and it used to turn every prompt-v11 event -- 2 to 5 seconds of them -- into a
+    10 second clip, because the floor was two sampling intervals and nothing capped it in wall
+    clock. Recall attaches that clip and the answering model reads ten seconds of context for a
+    two second span. Past the ceiling the clip samples its own window faster rather than
+    reaching further back for frames.
+    """
+    store = RecordingStore()
+    embedder = RecordingEmbedder()
+    requests: list[ClipRequest] = []
+
+    def record(source: bytes, request: ClipRequest) -> tuple[MediaClip, ...]:
+        requests.append(request)
+        return (_shrinking_cut(source, request),)
+
+    derived = await derive_evidence_clips(
+        TENANT_ID,
+        (_video_evidence("evidence_video_01", 4_000, 6_000),),
+        store=store,
+        embedder=embedder,
+        sampling=ClipSampling(frames_per_second=0.2),
+        created_at=NOW,
+        cut=record,
+    )
+
+    assert [(item.start_ms, item.end_ms) for item in requests] == [(4_000, 6_000)]
+    assert [item.frames_per_second for item in requests] == [1.0]
+    assert [(clip.start_ms, clip.end_ms) for clip in derived.clips] == [(4_000, 6_000)]
+    # The rate the bytes were cut at is the rate the encoder has to be told, or it re-samples
+    # the clip down to the single frame the widening exists to avoid.
+    assert embedder.sampling == ((1.0, DEFAULT_VIDEO_MAX_PIXELS),)
+
+
+async def test_the_floor_is_capped_however_short_a_span_is() -> None:
+    """The cap binds on the widening as well as on a span already longer than it."""
+    requests: list[ClipRequest] = []
+
+    def record(source: bytes, request: ClipRequest) -> tuple[MediaClip, ...]:
+        requests.append(request)
+        return (_shrinking_cut(source, request),)
+
+    await derive_evidence_clips(
+        TENANT_ID,
+        (_video_evidence("evidence_video_01", 8_000, 8_100),),
+        store=RecordingStore(),
+        embedder=RecordingEmbedder(),
+        sampling=ClipSampling(frames_per_second=0.2),
+        created_at=NOW,
+        cut=record,
+    )
+
+    assert [(item.start_ms, item.end_ms) for item in requests] == [(6_100, 8_100)]
+    assert [item.frames_per_second for item in requests] == [1.0]
+
+
+async def test_the_generation_proxy_is_capped_and_resampled_with_the_stored_clip() -> None:
+    """A proxy stretched to ten seconds costs the same context, and one sampled too slowly to
+    fill its own window fails perception -- the expensive half -- instead of the embed."""
+    requests: list[ClipRequest] = []
+
+    def record(source: bytes, request: ClipRequest) -> MediaClip:
+        requests.append(request)
+        return _shrinking_cut(source, request)
+
+    async with generation_proxies(
+        TENANT_ID,
+        (_video_evidence("evidence_video_01", 6_000, 6_200),),
+        store=RecordingStore(),
+        sampling=ClipSampling(frames_per_second=0.2),
+        cut=record,
+        scope="job_01:1",
+    ) as resolved:
+        assert resolved[0].sampled_frames_per_second == 1.0
+
+    assert [(item.start_ms, item.end_ms) for item in requests] == [(4_200, 6_200)]
+    assert [item.frames_per_second for item in requests] == [1.0]

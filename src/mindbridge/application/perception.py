@@ -41,10 +41,17 @@ def time_ranges_overlap(
 class ResolvedEvidence:
     """An exact evidence span joined to openable media.
 
-    `media_url` is not always the source object: a deployment may substitute a copy already cut
-    to the sampling a model was going to apply. When it does, the sampling travels with it, so
-    the request can state what the attached bytes are instead of asking the model to resample
-    them at a budget read from an unrelated variable. Both are None for untouched source media.
+    `media_url` is not always the source object: a deployment may substitute a copy cut from it,
+    and `attached_media_object` is that copy when the resolver knows which object it signed. It
+    is None when the request carries `media_object`'s own bytes, and also when a caller swapped
+    in bytes it did not describe -- so a consumer deciding what it is about to send may only draw
+    conclusions from a value that is present.
+
+    `sampled_frames_per_second` and `sampled_max_pixels` state the budget a copy was cut at where
+    the caller knows it, and are None otherwise. They are a description, not a lever: the local
+    embedder path sends nothing but the URL, and the deployment's generation endpoint measurably
+    ignores both (fps 1.0 and 0.5 produced the same 12,282 prompt tokens for one clip). Sending
+    physically smaller bytes is what changes cost, which is what the substitution is for.
     """
 
     evidence_span: EvidenceSpan
@@ -53,12 +60,18 @@ class ResolvedEvidence:
     media_url_expires_at: datetime
     sampled_frames_per_second: float | None = None
     sampled_max_pixels: int | None = None
+    attached_media_object: MediaObject | None = None
 
     def __post_init__(self) -> None:
         if self.evidence_span.tenant_id != self.media_object.tenant_id:
             raise DomainInvariantError("evidence and media tenants must match")
         if self.evidence_span.media_object_id != self.media_object.media_object_id:
             raise DomainInvariantError("evidence must resolve to its referenced media object")
+        if (
+            self.attached_media_object is not None
+            and self.attached_media_object.tenant_id != self.evidence_span.tenant_id
+        ):
+            raise DomainInvariantError("attached media must belong to the evidence tenant")
         require_non_empty(self.media_url, "media_url")
         require_aware_datetime(self.media_url_expires_at, "media_url_expires_at")
 

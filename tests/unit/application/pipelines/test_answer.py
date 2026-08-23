@@ -2,6 +2,7 @@
 
 import json
 from collections.abc import Callable, Coroutine
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from typing import cast
 
@@ -12,6 +13,8 @@ from openai import AsyncOpenAI
 from mindbridge.application.perception import ResolvedEvidence
 from mindbridge.application.pipelines import AnswerPipeline, OccurrencePipeline
 from mindbridge.application.pipelines import structured as structured_module
+from mindbridge.application.pipelines.answer import QUERY_MEDIA_PART_COST
+from mindbridge.application.pipelines.evidence import DEFAULT_MAX_EVIDENCE_MEDIA_PARTS
 from mindbridge.application.ports import GeneratedAnswer, ResolvedQueryMedia
 from mindbridge.contracts import RecallQuery, RecallRequest
 from mindbridge.core import (
@@ -34,6 +37,10 @@ from mindbridge.models.openai import OpenAIGenerator, normalize_base_url
 from mindbridge.prompts import ANSWER_FROM_EVIDENCE_PROMPT, SELECT_OCCURRENCES_PROMPT
 
 NOW = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
+
+# Two presigns of one object, one wall-clock second apart, as S3MediaAccess emits them.
+_EARLIER_SIGNATURE = "X-Amz-Date=20260823T112223Z&X-Amz-Signature=a0e018b7"
+_LATER_SIGNATURE = "X-Amz-Date=20260823T112224Z&X-Amz-Signature=165b8b7a"
 
 
 async def test_answer_pipeline_streams_raw_av_and_validates_answer(
@@ -313,6 +320,259 @@ async def test_answer_pipeline_inspects_query_media_before_candidate_evidence() 
         await answerer.close()
 
     assert answer.answer == "matching moment"
+
+
+async def test_a_span_signed_to_its_clip_is_announced_with_the_clips_container() -> None:
+    """The container format has to describe the bytes actually sent.
+
+    A span is signed to the derived clip the write path cut, which is WAV, while the recording
+    it was cut from is M4A. Announcing the source's container declared WAV bytes as m4a on every
+    audio span whose recording was not already WAV.
+    """
+
+    async def respond(request: httpx.Request) -> httpx.Response:
+        payload: dict[str, object] = json.loads(request.content)
+        messages = cast(list[dict[str, object]], payload["messages"])
+        content = cast(list[dict[str, object]], messages[1]["content"])
+        audio = next(item for item in content if item["type"] == "input_audio")
+        labels = [item["text"] for item in content if item["type"] == "text"]
+
+        assert cast(dict[str, str], audio["input_audio"]) == {
+            "data": "https://objects.example.test/clips/deadbeef.wav?sig=x",
+            "format": "wav",
+        }
+        # The source is still the identity the model is asked to cite.
+        assert "Source media_object_id=media_audio follows." in labels
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=_completion_stream('{"answer":"they agreed","confidence":0.6}'),
+        )
+
+    span = _resolved_evidence(MediaKind.AUDIO, "recording.m4a", "media_audio", 2_000)
+    answerer = _answerer(respond)
+    try:
+        answer = await answerer.answer(
+            RecallRequest(tenant_id="tenant_01", query=RecallQuery(text="What was agreed?")),
+            (_memory((), verification_status=VerificationStatus.ATTESTED),),
+            (_signed_to_clip(span, "deadbeef.wav"),),
+            query_media=(),
+        )
+    finally:
+        await answerer.close()
+
+    assert answer.answer == "they agreed"
+
+
+async def test_query_media_does_not_suppress_the_clips_cut_from_its_own_source() -> None:
+    """Recalling by a stored object must not drop that object's span-scoped clips.
+
+    The exclusion exists so one set of bytes is not attached twice. Once a span is signed to its
+    own derived clip, the clip and the source are different bytes, and excluding on the source id
+    dropped exactly the cheap, span-scoped bytes the question was about.
+    """
+
+    async def respond(request: httpx.Request) -> httpx.Response:
+        payload: dict[str, object] = json.loads(request.content)
+        messages = cast(list[dict[str, object]], payload["messages"])
+        content = cast(list[dict[str, object]], messages[1]["content"])
+        attached = [
+            cast(dict[str, str], item["video_url"])["url"]
+            for item in content
+            if item["type"] == "video_url"
+        ]
+
+        assert attached == [
+            "https://objects.example.test/media_video",
+            "https://objects.example.test/clips/first.mp4?sig=x",
+            "https://objects.example.test/clips/second.mp4?sig=x",
+        ]
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=_completion_stream('{"answer":"twice","confidence":0.5}'),
+        )
+
+    span = _resolved_evidence(MediaKind.VIDEO, "recording.mp4", "media_video", 0)
+    evidence = tuple(_signed_to_clip(span, name) for name in ("first.mp4", "second.mp4"))
+    query_media = (
+        ResolvedQueryMedia(
+            media_object=span.media_object,
+            media_url=span.media_url,
+            media_url_expires_at=span.media_url_expires_at,
+        ),
+    )
+    answerer = _answerer(respond)
+    try:
+        answer = await answerer.answer(
+            RecallRequest(
+                tenant_id="tenant_01",
+                query=RecallQuery(text="How often?", media_object_ids=("media_video",)),
+            ),
+            (_memory((), verification_status=VerificationStatus.ATTESTED),),
+            evidence,
+            query_media=query_media,
+        )
+    finally:
+        await answerer.close()
+
+    assert answer.answer == "twice"
+
+
+async def test_a_second_signature_of_the_query_object_is_not_attached_twice() -> None:
+    """One object signed twice is two URL strings and one set of bytes.
+
+    Query media and evidence are presigned by separate calls, and SigV4 stamps `X-Amz-Date` at
+    one-second resolution, so the same object crossing a second boundary between those two calls
+    signs to a different string. Comparing strings then attached the caller's full-resolution
+    upload a second time -- most often an image, which has no derived clip to substitute.
+    """
+
+    async def respond(request: httpx.Request) -> httpx.Response:
+        payload: dict[str, object] = json.loads(request.content)
+        messages = cast(list[dict[str, object]], payload["messages"])
+        content = cast(list[dict[str, object]], messages[1]["content"])
+        attached = [
+            cast(dict[str, str], item["image_url"])["url"]
+            for item in content
+            if item["type"] == "image_url"
+        ]
+
+        assert attached == [f"https://objects.example.test/query_image?{_LATER_SIGNATURE}"]
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=_completion_stream('{"answer":"once","confidence":0.5}'),
+        )
+
+    signed_as_evidence = replace(
+        _resolved_evidence(MediaKind.IMAGE, "query.jpg", "query_image", 0),
+        media_url=f"https://objects.example.test/query_image?{_EARLIER_SIGNATURE}",
+    )
+    query_media = (
+        ResolvedQueryMedia(
+            media_object=signed_as_evidence.media_object,
+            media_url=f"https://objects.example.test/query_image?{_LATER_SIGNATURE}",
+            media_url_expires_at=signed_as_evidence.media_url_expires_at,
+        ),
+    )
+    answerer = _answerer(respond)
+    try:
+        answer = await answerer.answer(
+            RecallRequest(
+                tenant_id="tenant_01",
+                query=RecallQuery(text="Where is this?", media_object_ids=("query_image",)),
+            ),
+            (_memory((), verification_status=VerificationStatus.ATTESTED),),
+            (signed_as_evidence,),
+            query_media=query_media,
+        )
+    finally:
+        await answerer.close()
+
+    assert answer.answer == "once"
+
+
+async def test_query_media_and_evidence_share_one_media_part_ceiling() -> None:
+    """Both halves of one call are attached against one budget, not one ceiling each.
+
+    Query media carries no derived clip to substitute, so each object is the caller's
+    full-resolution upload -- the shape measured at a 60 s gateway timeout with four of them.
+    Eight of those plus a full page of evidence is that shape with the evidence still attached.
+    """
+    attached: list[int] = []
+
+    async def respond(request: httpx.Request) -> httpx.Response:
+        payload: dict[str, object] = json.loads(request.content)
+        messages = cast(list[dict[str, object]], payload["messages"])
+        content = cast(list[dict[str, object]], messages[1]["content"])
+        attached.append(sum(1 for item in content if item["type"] != "text"))
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=_completion_stream('{"answer":"bounded","confidence":0.5}'),
+        )
+
+    span = _resolved_evidence(MediaKind.VIDEO, "recording.mp4", "media_video", 0)
+    query_media = tuple(
+        ResolvedQueryMedia(
+            media_object=replace(span.media_object, media_object_id=MediaObjectId(name)),
+            media_url=f"https://objects.example.test/query/{name}.mp4",
+            media_url_expires_at=span.media_url_expires_at,
+        )
+        for name in (f"query_{index:02d}" for index in range(8))
+    )
+    evidence = tuple(_signed_to_clip(span, f"{index:02d}.mp4") for index in range(40))
+    answerer = _answerer(respond)
+    try:
+        for media in (query_media, query_media[:1]):
+            await answerer.answer(
+                RecallRequest(
+                    tenant_id="tenant_01",
+                    query=RecallQuery(
+                        text="How many?",
+                        media_object_ids=tuple(item.media_object.media_object_id for item in media),
+                    ),
+                ),
+                (_memory((), verification_status=VerificationStatus.ATTESTED),),
+                evidence,
+                query_media=media,
+            )
+    finally:
+        await answerer.close()
+
+    # Eight query objects: three are attached and they have spent the whole budget. One query
+    # object: it and sixteen clips, because what it did not spend is still there for evidence.
+    assert attached == [
+        DEFAULT_MAX_EVIDENCE_MEDIA_PARTS // QUERY_MEDIA_PART_COST,
+        1 + DEFAULT_MAX_EVIDENCE_MEDIA_PARTS - QUERY_MEDIA_PART_COST,
+    ]
+
+
+async def test_a_span_that_can_only_offer_the_whole_recording_sends_no_bytes() -> None:
+    """Audio cut into several windows has no single clip covering it, and falls back.
+
+    Falling back to the source is complete, but the source is the entire recording: a 70 s span
+    of a two-hour file costs more on its own than the whole page of clips beside it, which is the
+    timeout this ceiling exists to prevent. The span keeps its place in the prompt's text.
+    """
+
+    async def respond(request: httpx.Request) -> httpx.Response:
+        payload: dict[str, object] = json.loads(request.content)
+        messages = cast(list[dict[str, object]], payload["messages"])
+        content = cast(list[dict[str, object]], messages[1]["content"])
+        attached = [item["type"] for item in content if item["type"] != "text"]
+
+        assert attached == ["video_url"]
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=_completion_stream('{"answer":"partly","confidence":0.4}'),
+        )
+
+    recording = replace(
+        _resolved_evidence(MediaKind.AUDIO, "recording.m4a", "media_audio", 0),
+        media_url="https://objects.example.test/media_audio",
+    )
+    unsubstituted = replace(
+        recording,
+        evidence_span=replace(recording.evidence_span, end_ms=70_000),
+        media_object=replace(recording.media_object, duration_ms=2 * 60 * 60 * 1_000),
+        attached_media_object=replace(recording.media_object, duration_ms=2 * 60 * 60 * 1_000),
+    )
+    span = _resolved_evidence(MediaKind.VIDEO, "recording.mp4", "media_video", 0)
+    answerer = _answerer(respond)
+    try:
+        answer = await answerer.answer(
+            RecallRequest(tenant_id="tenant_01", query=RecallQuery(text="What happened?")),
+            (_memory((), verification_status=VerificationStatus.ATTESTED),),
+            (unsubstituted, _signed_to_clip(span, "covered.mp4")),
+            query_media=(),
+        )
+    finally:
+        await answerer.close()
+
+    assert answer.answer == "partly"
 
 
 async def test_occurrence_pipeline_selects_schema_validated_candidate_ids() -> None:
@@ -658,6 +918,22 @@ def _resolved_evidence(
         ),
         media_url=f"https://objects.example.test/{media_object_id}",
         media_url_expires_at=NOW + timedelta(minutes=5),
+    )
+
+
+def _signed_to_clip(evidence: ResolvedEvidence, name: str) -> ResolvedEvidence:
+    """One span as the read path resolves it: signed to the clip the write path cut for it."""
+    span = evidence.evidence_span
+    return replace(
+        evidence,
+        media_url=f"https://objects.example.test/clips/{name}?sig=x",
+        attached_media_object=replace(
+            evidence.media_object,
+            media_object_id=MediaObjectId(f"clip_{name}"),
+            uri=f"s3://memory/tenants/tenant_01/clips/{name}",
+            duration_ms=span.end_ms - span.start_ms,
+            derived_from_media_object_id=evidence.media_object.media_object_id,
+        ),
     )
 
 

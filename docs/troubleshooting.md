@@ -124,9 +124,12 @@ threshold. Check which of the two you actually have before changing anything: co
 
 ### Confidence is high but the answer is wrong
 
-Pull the evidence. `RecallResult.evidence` carries signed URLs to the exact `start_ms`–`end_ms`
-slice. Playing it tells you immediately whether retrieval or perception failed — which is the
-entire reason evidence is attached rather than referenced.
+Pull the evidence. `RecallResult.evidence` carries a signed URL to media covering the cited
+`start_ms`–`end_ms` span: normally a clip derived for that span, whose own timeline starts at
+zero and which may run wider than the cited range, and otherwise the whole source object. Play
+it from the start rather than seeking to `start_ms`, and it tells you immediately whether
+retrieval or perception failed — which is the entire reason evidence is attached rather than
+referenced.
 
 Then record it, so the lifecycle layer learns:
 

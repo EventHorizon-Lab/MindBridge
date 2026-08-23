@@ -143,8 +143,18 @@ mindbridge jobs --tenant-id tenant_01 --republish
 ```
 
 Reporting is the default because republishing spends money: every message that lands runs a
-generator. Read `claimable` first. A non-zero count beside an empty `queue_depth` is exactly this
-divergence; a non-zero count beside a deep queue usually just means the workers are behind.
+generator. Read `claimable` against `queue_depth`. A non-zero count beside an empty `queue_depth`
+is exactly this divergence; a non-zero count beside a deep queue usually just means the workers
+are behind.
+
+What `--republish` then does depends on the scope, and the report's `withheld` field says which
+happened. Across the whole ledger it publishes only the difference — the queue already holds a
+message for the rest, and duplicating those is not free: the delivery that loses the claim
+re-queues itself every 30 seconds up to 40 times waiting for the winner. Under `--tenant-id` it
+publishes every claimable row and withholds nothing, because the depth counts every tenant's
+messages and cancelling one tenant's stranded rows against another's backlog would repair nothing.
+On a deep queue, then, judge a scoped repair by `claimable` before running it: the messages already
+queued for that tenant will be duplicated.
 
 The same report answers "who is consuming the worker", ordered by `work_seconds` — total worker
 time across every attempt, including the attempt in flight. Both durations and both token counts

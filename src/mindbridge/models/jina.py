@@ -120,7 +120,10 @@ class JinaEmbedder:
         # all, took 57-71 s against a 12.4 s idle baseline during the 2026-08-21 evaluation.
         # The query lane is its own single slot rather than a reservation out of
         # `max_concurrency`, because that value defaults to 1 and carving a slot out of it
-        # would leave documents none.
+        # would leave documents none. Its price is a ceiling of `max_concurrency + 1`
+        # concurrent encodes wherever one process both queries and ingests -- one encode's
+        # worth of activation memory beyond what the Worker's VRAM guard estimates, which
+        # counts resident weights only and says so.
         self._query_semaphore = asyncio.Semaphore(1)
 
     @classmethod

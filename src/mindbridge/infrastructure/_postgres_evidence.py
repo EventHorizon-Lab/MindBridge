@@ -240,8 +240,10 @@ class EvidenceReadOperations(PostgresStoreOperations):
         `DISTINCT ON (evidence_id) ... ORDER BY ordinal` did -- hands the answer model the
         first 30 seconds while the recall that retrieved the span may well have matched a
         later window's embedding, and nothing about the result says a tail is missing.
-        Falling back to the source is a bigger request but a complete one, and a
-        `MediaObject` per evidence id cannot express more than one window anyway.
+        Falling back to the source is complete, and a `MediaObject` per evidence id cannot
+        express more than one window anyway. What it is not is affordable: the source is the
+        whole recording, so a generation request attaches such a span's bytes only while they
+        are still about the span, and reports the source object either way.
         """
         if not evidence_ids:
             return {}

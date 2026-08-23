@@ -186,8 +186,9 @@ uv run --extra server --extra media celery -A mindbridge.celery_app:app worker -
 The alternative is `MINDBRIDGE_MEDIA_EMBEDDER_PLUGIN=jina`, which loads Jina v5 Omni into the
 worker process and needs `--extra cloud-models` and a GPU. It is measurably the slower path —
 0.062 s per video clip served against 10.2 s in-process on an RTX 5090 — and it holds 3.7 GiB of
-VRAM in **every** prefork child, so the worker refuses to start with `--concurrency` above 1 while
-it is selected. [Deployment](deployment.md#media-encoder-served-or-in-process) has the numbers and
+VRAM in **every** prefork child, so the worker refuses to start when a pool of more than one child
+would exceed `MINDBRIDGE_WORKER_VRAM_BUDGET_GIB`, whether the pool comes from `--concurrency` or
+`--autoscale`. [Deployment](deployment.md#media-encoder-served-or-in-process) has the numbers and
 the one caveat about switching an already-populated deployment.
 
 `POST /v1/observations` then returns a `processing_job_id`; memory does not exist when that
