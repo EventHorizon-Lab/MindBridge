@@ -2618,7 +2618,7 @@ Create `tests/unit/benchmarks/test_mem_gallery_runner.py`:
 ```python
 """Production-contract checks for the per-topic Mem-Gallery runner."""
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import cast
 
 import pytest
@@ -2649,7 +2649,13 @@ from mindbridge.contracts import (
     RecallResult,
     RememberRequest,
 )
-from mindbridge.core import JobState, MediaKind, MemoryType
+from mindbridge.core import (
+    JobState,
+    MediaKind,
+    MemoryState,
+    MemoryType,
+    VerificationStatus,
+)
 
 NOW = datetime(2024, 6, 24, tzinfo=timezone.utc)
 
@@ -2698,11 +2704,13 @@ class RecordingMemoryApi:
                 MemoryView(
                     memory_id="memory_01",
                     memory_type=MemoryType.EPISODIC,
-                    summary="D1:1 User asked: Can you tell me the basics?",
+                    summary="D1:1 User said: Can you tell me the basics?",
                     evidence_ids=(),
                     occurred_at=NOW,
                     ended_at=NOW,
                     created_at=NOW,
+                    verification_status=VerificationStatus.ATTESTED,
+                    state=MemoryState.ACTIVE,
                 ),
             ),
             evidence=(
@@ -2712,6 +2720,7 @@ class RecordingMemoryApi:
                     start_ms=0,
                     end_ms=0,
                     media_url="https://example.invalid/signed",
+                    media_url_expires_at=NOW + timedelta(minutes=5),
                 ),
             ),
             trace_id="trace_recall",
