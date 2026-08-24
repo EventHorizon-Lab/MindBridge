@@ -1,11 +1,22 @@
 """Schema checks for official memory benchmark adapters."""
 
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import ClassVar
 
 import pytest
 
+from mindbridge.benchmarks.atm_bench import (
+    atm_email_block,
+    atm_evidence_kind,
+    atm_memory_chunks,
+    atm_sgm_block,
+    load_atm_bench,
+    load_atm_emails,
+    load_atm_niah_pool,
+    load_atm_sgm,
+)
 from mindbridge.benchmarks.egolife_qa import load_egolife_qa
 from mindbridge.benchmarks.egomem_reason import load_egomem_reason
 from mindbridge.benchmarks.egotempo import load_egotempo
@@ -15,6 +26,7 @@ from mindbridge.benchmarks.memlens import load_memlens, load_memlens_agent_subse
 from mindbridge.benchmarks.mm_lifelong import MMLifelongSplit, load_mm_lifelong
 from mindbridge.benchmarks.supermemory_vqa import load_supermemory_vqa
 from mindbridge.benchmarks.video_mme import load_video_mme
+from mindbridge.core import MediaKind
 
 
 class _FakeArrowTable:
@@ -557,3 +569,238 @@ def _supermemory_question(
         "is_answerable": True,
         "answer_evidence": {"text": "SECRET ANSWER EVIDENCE"},
     }
+
+
+def _atm_question(**overrides: object) -> dict[str, object]:
+    question = {
+        "id": "1defb7d5-aab4-4244-8b3c-971a36376b04",
+        "question": "How much did I pay for accommodation for BMVC 2024?",
+        "answer": "£799.74",
+        "notes": "",
+        "evidence_ids": ["email202411160004", "20250223_130249"],
+        "qtype": "number",
+    }
+    return question | overrides
+
+
+def test_atm_bench_adapter_reads_questions_and_classifies_evidence(tmp_path: Path) -> None:
+    dataset_path = tmp_path / "atm-bench.json"
+    dataset_path.write_text(json.dumps([_atm_question()]), encoding="utf-8")
+
+    questions = load_atm_bench(dataset_path)
+
+    assert len(questions) == 1
+    assert questions[0].question_id == "1defb7d5-aab4-4244-8b3c-971a36376b04"
+    assert questions[0].qtype == "number"
+    assert questions[0].evidence_ids == ("email202411160004", "20250223_130249")
+    assert questions[0].niah_evidence_ids == ()
+    assert atm_evidence_kind("email202411160004") == "email"
+    assert atm_evidence_kind("20250223_130249") == "media"
+
+
+def test_atm_bench_adapter_refuses_duplicate_ids_and_missing_evidence(tmp_path: Path) -> None:
+    duplicated = tmp_path / "duplicated.json"
+    duplicated.write_text(json.dumps([_atm_question(), _atm_question()]), encoding="utf-8")
+    with pytest.raises(ValueError, match="duplicate question IDs"):
+        load_atm_bench(duplicated)
+
+    empty_evidence = tmp_path / "empty_evidence.json"
+    empty_evidence.write_text(json.dumps([_atm_question(evidence_ids=[])]), encoding="utf-8")
+    with pytest.raises(ValueError):
+        load_atm_bench(empty_evidence)
+
+    empty_release = tmp_path / "empty.json"
+    empty_release.write_text("[]", encoding="utf-8")
+    with pytest.raises(ValueError, match="must not be empty"):
+        load_atm_bench(empty_release)
+
+
+def test_atm_niah_pool_requires_every_gold_evidence_in_the_pool(tmp_path: Path) -> None:
+    complete = tmp_path / "niah25.json"
+    complete.write_text(
+        json.dumps(
+            [
+                _atm_question(
+                    niah_evidence_ids=[
+                        "email202411160004",
+                        "20250223_130249",
+                        "20220430_132212",
+                    ]
+                )
+            ]
+        ),
+        encoding="utf-8",
+    )
+    pool = load_atm_niah_pool(complete)
+    assert len(pool[0].niah_evidence_ids) == 3
+
+    truncated = tmp_path / "broken.json"
+    truncated.write_text(
+        json.dumps([_atm_question(niah_evidence_ids=["20250223_130249"])]),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="pool must contain every gold evidence"):
+        load_atm_niah_pool(truncated)
+
+
+def test_atm_email_adapter_reads_naive_timestamps_as_utc(tmp_path: Path) -> None:
+    emails_path = tmp_path / "emails.json"
+    emails_path.write_text(
+        json.dumps(
+            [
+                {
+                    "id": "email202411160004",
+                    "timestamp": "2024-11-16 09:12:00",
+                    "short_summary": "Hotel confirmation",
+                    "detail": "Total £799.74 for four nights.",
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    emails = load_atm_emails(emails_path)
+
+    assert emails[0].email_id == "email202411160004"
+    assert emails[0].occurred_at == datetime(2024, 11, 16, 9, 12, tzinfo=timezone.utc)
+    assert emails[0].summary == "Hotel confirmation"
+
+
+def test_atm_email_block_reproduces_the_official_field_order(tmp_path: Path) -> None:
+    emails_path = tmp_path / "emails.json"
+    emails_path.write_text(
+        json.dumps(
+            [
+                {
+                    "id": "email202411160004",
+                    "timestamp": "2024-11-16 09:12:00",
+                    "short_summary": "Hotel confirmation",
+                    "detail": "Total £799.74 for four nights.",
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    block = atm_email_block(load_atm_emails(emails_path)[0])
+
+    assert block.splitlines() == [
+        "ID: email202411160004",
+        "Timestamp: 2024-11-16 09:12:00",
+        "Summary: Hotel confirmation",
+        "Detail: Total £799.74 for four nights.",
+    ]
+
+
+def test_atm_sgm_adapter_takes_capture_time_from_the_stem_not_the_timestamp(
+    tmp_path: Path,
+) -> None:
+    batch_path = tmp_path / "video_batch_results.json"
+    batch_path.write_text(
+        json.dumps(
+            [
+                {
+                    "video_path": "data/raw_memory/video/20220502_172850.mp4",
+                    "timestamp": "2022-05-02 16:28:54+00:00",
+                    "location_name": "Fellows' Garden, Cambridge, United Kingdom",
+                    "city": "Cambridge, United Kingdom",
+                    "short_caption": "A blackbird forages on a lawn.",
+                    "caption": "A solitary blackbird moves across a green lawn.",
+                    "ocr_text": "",
+                    "tags": ["blackbird", "garden"],
+                    "duration": 3.300756,
+                    "file_size": 790569,
+                    "entities": [{"entity": "bird", "type": "other"}],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    records = load_atm_sgm(batch_path)
+
+    assert records[0].media_id == "20220502_172850"
+    assert records[0].media_kind is MediaKind.VIDEO
+    # The stem is local wall clock; the record's own timestamp is UTC and an hour earlier.
+    assert records[0].occurred_at == datetime(2022, 5, 2, 17, 28, 50, tzinfo=timezone.utc)
+    assert records[0].duration_seconds == pytest.approx(3.300756)
+    assert records[0].size_bytes == 790569
+    assert records[0].tags == ("blackbird", "garden")
+
+
+def test_atm_sgm_adapter_tolerates_a_disambiguated_media_stem(tmp_path: Path) -> None:
+    # 28 of the release's 3,759 real image filenames carry a disambiguating suffix that its
+    # export tooling appends to a duplicate capture, e.g. `20221212_115316_001.jpg` or
+    # `20220627_155122(0).jpg`. Only the leading 15 characters are the timestamp.
+    batch_path = tmp_path / "image_batch_results.json"
+    batch_path.write_text(
+        json.dumps(
+            [
+                {
+                    "image_path": "data/raw_memory/image/20221212_115316_001.jpg",
+                    "timestamp": "2022-12-12 11:53:16",
+                    "location_name": "",
+                    "city": "",
+                    "short_caption": "",
+                    "caption": "",
+                    "ocr_text": "",
+                    "tags": [],
+                    "file_size": 12_345,
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    records = load_atm_sgm(batch_path)
+
+    assert records[0].media_id == "20221212_115316_001"
+    assert records[0].occurred_at == datetime(2022, 12, 12, 11, 53, 16, tzinfo=timezone.utc)
+
+
+def test_atm_sgm_block_reproduces_the_official_field_order(tmp_path: Path) -> None:
+    batch_path = tmp_path / "image_batch_results.json"
+    batch_path.write_text(
+        json.dumps(
+            [
+                {
+                    "image_path": "data/raw_memory/image/20220703_210745.jpg",
+                    "timestamp": "2022-07-03 21:07:45",
+                    "location_name": "West Quay Road, Southampton, United Kingdom",
+                    "city": "Southampton, United Kingdom",
+                    "short_caption": "A small airplane against a clear sky.",
+                    "caption": "A solitary small aircraft streaks across a cloudless sky.",
+                    "ocr_text": "There is no text visible in the image.",
+                    "tags": ["airplane", "sky"],
+                    "file_size": 100686,
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    block = atm_sgm_block(load_atm_sgm(batch_path)[0])
+
+    assert block.splitlines() == [
+        "ID: 20220703_210745",
+        "Type: image",
+        "Timestamp: 2022-07-03 21:07:45",
+        "Location: West Quay Road, Southampton, United Kingdom",
+        "Short Caption: A small airplane against a clear sky.",
+        "Caption: A solitary small aircraft streaks across a cloudless sky.",
+        "OCR: There is no text visible in the image.",
+        "Tags: airplane, sky",
+    ]
+
+
+def test_atm_memory_chunks_keep_every_chunk_addressable_and_within_the_limit() -> None:
+    short_block = "ID: 20220703_210745\nType: image\n"
+    assert atm_memory_chunks(short_block, "20220703_210745") == (short_block,)
+
+    long_block = "ID: 20220703_210745\n" + "x" * 9_000
+    chunks = atm_memory_chunks(long_block, "20220703_210745")
+
+    assert len(chunks) == 5
+    assert all(len(chunk) <= 2_048 for chunk in chunks)
+    assert all(chunk.startswith("ID: 20220703_210745\n") for chunk in chunks)
+    assert "Part 1/5" in chunks[0]
