@@ -2133,6 +2133,7 @@ Create `tests/unit/benchmarks/test_atm_cli.py`:
 """Argument and artifact checks for the ATM-Bench CLI."""
 
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -2250,6 +2251,74 @@ def test_cli_table_dispatches_atm() -> None:
 
     assert RUNNERS["atm"].module == "mindbridge.benchmarks.atm_cli"
     assert RUNNERS["atm"].extra is None
+
+
+def _prepared_media(**overrides: object) -> "AtmPreparedArchive":
+    from mindbridge.benchmarks.atm_bench_runner import AtmPreparedArchive, AtmPreparedMedia
+    from mindbridge.contracts import MediaObjectInput
+    from mindbridge.core import MediaKind
+
+    fields: dict[str, object] = {
+        "media_object_id": "20250223_130249",
+        "kind": MediaKind.IMAGE,
+        "uri": "s3://mindbridge-media/atm-bench/20250223_130249.jpg",
+        "sha256": "a" * 64,
+        "size_bytes": 1,
+        "created_at": datetime(2025, 2, 23, 13, 2, 49, tzinfo=timezone.utc),
+    }
+    return AtmPreparedArchive(
+        media=(
+            AtmPreparedMedia(
+                media_id=str(fields["media_object_id"]),
+                media_object=MediaObjectInput.model_validate(fields | overrides),
+            ),
+        )
+    )
+
+
+def _sgm_record(**overrides: object) -> "AtmSgmRecord":
+    from mindbridge.benchmarks.atm_bench import AtmSgmRecord
+    from mindbridge.core import MediaKind
+
+    fields: dict[str, object] = {
+        "media_id": "20250223_130249",
+        "media_kind": MediaKind.IMAGE,
+        "occurred_at": datetime(2025, 2, 23, 13, 2, 49, tzinfo=timezone.utc),
+        "raw_timestamp": "2025-02-23 13:02:49",
+        "location_name": "Porto, Portugal",
+        "city": "Porto, Portugal",
+        "short_caption": "A steel bridge.",
+        "caption": "A wide steel arch bridge.",
+        "ocr_text": "",
+        "tags": ("bridge",),
+        "size_bytes": 1,
+    }
+    return AtmSgmRecord.model_validate(fields | overrides)
+
+
+def test_a_manifest_whose_capture_time_disagrees_with_the_release_is_refused() -> None:
+    skewed = _prepared_media(created_at=datetime(2025, 2, 23, 12, 2, 49, tzinfo=timezone.utc))
+
+    with pytest.raises(ValueError, match="disagree with the release about capture time"):
+        atm_cli._require_one_clock((skewed), (_sgm_record(),), media_source="raw")
+
+    # The same manifest is fine once both sides name the same instant.
+    atm_cli._require_one_clock(_prepared_media(), (_sgm_record(),), media_source="raw")
+
+
+def test_a_raw_run_staging_a_video_needs_the_record_that_dates_it() -> None:
+    from mindbridge.core import MediaKind
+
+    video = _prepared_media(
+        kind=MediaKind.VIDEO,
+        uri="s3://mindbridge-media/atm-bench/20250223_130249.mp4",
+    )
+
+    with pytest.raises(ValueError, match="need --sgm-video"):
+        atm_cli._require_one_clock(video, (), media_source="raw")
+
+    # An sgm run never observes the bytes, so it needs no duration for them.
+    atm_cli._require_one_clock(video, (), media_source="sgm")
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
@@ -2283,12 +2352,14 @@ from mindbridge.benchmarks.artifacts import (
 from mindbridge.benchmarks.atm_bench import (
     ATM_BENCH_ADAPTER_VERSION,
     AtmBenchQuestion,
+    AtmSgmRecord,
     load_atm_bench,
     load_atm_emails,
     load_atm_sgm,
 )
 from mindbridge.benchmarks.atm_bench_runner import (
     AtmMediaSource,
+    AtmPreparedArchive,
     AtmQuestionResult,
     answer_atm_question,
     ingest_atm_archive,
@@ -2311,6 +2382,7 @@ from mindbridge.benchmarks.cli_common import (
 from mindbridge.benchmarks.prompts import ATM_BENCH_QUERY_PROMPT
 from mindbridge.benchmarks.runtime import benchmark_tenant_id
 from mindbridge.contracts import Identifier, NonEmptyString, Sha256Hex
+from mindbridge.core import MediaKind
 from mindbridge.file_integrity import sha256_file
 from mindbridge.prompts import PERCEIVE_EVENTS_PROMPT
 
@@ -2382,6 +2454,7 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
         if path is not None
         for record in load_atm_sgm(path)
     )
+    _require_one_clock(prepared, sgm_records, media_source=arguments.media_source)
     report(f"running {len(questions)} questions", quiet=arguments.quiet)
     failures, results = asyncio.run(_run(arguments, questions, prepared, sgm_records, emails))
     _write_artifacts(arguments, questions, results, deployment, failures, emails, sgm_records)
@@ -2505,6 +2578,51 @@ def _write_artifacts(
     write_run_artifacts(arguments.output_path, predictions, manifest)
 
 
+def _require_one_clock(
+    prepared: AtmPreparedArchive | None,
+    sgm_records: tuple[AtmSgmRecord, ...],
+    *,
+    media_source: AtmMediaSource,
+) -> None:
+    """Refuse a run whose two arms would disagree about when the archive happened.
+
+    The `raw` arm takes capture time from the prepared manifest and the `sgm` arm from the
+    release's own record. Both are supposed to originate in the same filename stem, but
+    staging is an operator step and nothing enforces that for a manifest this repository
+    did not produce. This is the one place both are in hand, so the disagreement is caught
+    here rather than read out of a finished score as a retrieval result.
+
+    The same pass refuses a raw run that stages a video no record gives a duration for: the
+    observation would otherwise declare a zero-length span for a clip that runs for seconds.
+    """
+    if prepared is None:
+        return
+    by_id = {record.media_id: record for record in sgm_records}
+    skewed = sorted(
+        item.media_id
+        for item in prepared.media
+        if item.media_id in by_id
+        and item.media_object.created_at != by_id[item.media_id].occurred_at
+    )
+    if skewed:
+        raise ValueError(
+            "prepared ATM-Bench media disagree with the release about capture time: "
+            + ", ".join(skewed)
+        )
+    if media_source != "raw":
+        return
+    undated = sorted(
+        item.media_id
+        for item in prepared.media
+        if item.media_object.kind is MediaKind.VIDEO and item.media_id not in by_id
+    )
+    if undated:
+        raise ValueError(
+            "raw ATM-Bench runs need --sgm-video for the duration of staged videos: "
+            + ", ".join(undated)
+        )
+
+
 def _parse_arguments(argv: Sequence[str] | None, prog: str | None) -> _Arguments:
     parser = add_media_arguments(
         core_parser(tenant_prefix="benchmark_atm", prog=prog, description=__doc__),
@@ -2571,13 +2689,20 @@ Then add the row to `RUNNERS` in `src/mindbridge/benchmarks/cli.py`, after the
 Run: `uv run pytest tests/unit/benchmarks/test_atm_cli.py -v`
 Expected: 3 passed
 
-- [ ] **Step 5: Check the help text renders**
+- [ ] **Step 5: Mutation-check the one-clock guard**
+
+Change `item.media_object.created_at != by_id[item.media_id].occurred_at` to `==`, run
+`uv run pytest tests/unit/benchmarks/test_atm_cli.py -v`, confirm
+`test_a_manifest_whose_capture_time_disagrees_with_the_release_is_refused` fails, then restore
+it. Do the same for the video-duration branch and its test.
+
+- [ ] **Step 6: Check the help text renders**
 
 Run: `uv run mindbridge-bench atm --help`
 Expected: usage line reads `mindbridge-bench atm`, `--media-source` shows
 `(default: raw)`, and the exit-status block is present.
 
-- [ ] **Step 6: Run the gates and commit**
+- [ ] **Step 7: Run the gates and commit**
 
 ```bash
 uv run ruff format --check . && uv run ruff check . && uv run mypy && uv run pytest -W error && git diff --check
@@ -3873,13 +3998,16 @@ manifest formats it writes are inputs to `mindbridge-bench atm` and `... mem-gal
 import argparse
 import hashlib
 import json
-import re
-from datetime import datetime, timezone
 from pathlib import Path
 
 import boto3
 
-STEM = re.compile(r"^(\d{8})_(\d{6})$")
+# The one clock. Reimplementing the stem-to-timestamp rule here would leave the raw arm's
+# capture times and the sgm arm's maintained by two copies that have to agree by hand, and
+# the CLI's own pre-flight check would then be comparing a copy against a copy. This script
+# lives outside the wheel but runs under `uv run`, so the installed package is importable.
+from mindbridge.benchmarks.atm_bench import atm_capture_time
+
 KIND_BY_SUFFIX = {".jpg": "image", ".jpeg": "image", ".png": "image", ".mp4": "video"}
 
 
@@ -3888,12 +4016,18 @@ def digest(path: Path) -> tuple[str, int]:
     return hashlib.sha256(data).hexdigest(), len(data)
 
 
-def capture_time(path: Path) -> str:
-    matched = STEM.match(path.stem)
-    if matched is None:
+def capture_time(path: Path, layout: str) -> str:
+    """Return the capture instant this manifest should carry.
+
+    ATM-Bench's clock is the filename stem and the adapter owns that rule, so this asks the
+    adapter rather than restating it — and `atm_capture_time` raises on a name that carries
+    no time, which is the right outcome for that corpus. Mem-Gallery's filenames carry no
+    time at all: its observations take theirs from the session date, so this field is
+    metadata there and the epoch says so plainly.
+    """
+    if layout != "atm":
         return "1970-01-01T00:00:00Z"
-    stamp = datetime.strptime(matched.group(1) + matched.group(2), "%Y%m%d%H%M%S")
-    return stamp.replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
+    return atm_capture_time(path.name).isoformat().replace("+00:00", "Z")
 
 
 def main() -> None:
@@ -3928,7 +4062,7 @@ def main() -> None:
             "uri": f"s3://{arguments.bucket}/{key}",
             "sha256": checksum,
             "size_bytes": size,
-            "created_at": capture_time(path),
+            "created_at": capture_time(path, arguments.layout),
         }
         if arguments.layout == "atm":
             media_object["media_object_id"] = path.stem
