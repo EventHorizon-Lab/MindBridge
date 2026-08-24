@@ -17,7 +17,7 @@ uv run --extra server mindbridge lifecycle --help
 
 | Command | Subcommands |
 | --- | --- |
-| `mindbridge` | `config check`, `consolidate`, `lifecycle`, `mcp`, `edge sync` |
+| `mindbridge` | `config check`, `consolidate`, `lifecycle`, `mcp`, `jina serve`, `edge sync` |
 | `mindbridge-bench` | `locomo-refined`, `m3`, `egolife`, `egomem`, `egotempo`, `memlens`, `mm-lifelong`, `supermemory`, `video-mme`, `aml` |
 | `mindbridge-bench` support | `score`, `datasets`, `jina`, `bakeoff` |
 
@@ -195,6 +195,30 @@ uv run --extra server mindbridge mcp
 ```
 
 JSON-RPC goes on stdout. Never redirect it. See [MCP tools](mcp.md).
+
+---
+
+## `mindbridge jina serve`
+
+Loads the pinned Jina v5 Omni model with SentenceTransformers and serves all embedding
+modalities. Requires `--extra server --extra cloud-models`.
+
+```bash
+MINDBRIDGE_EMBEDDER_API_KEY=... \
+uv run --extra server --extra cloud-models mindbridge jina serve --device cuda
+```
+
+| Flag | Default | Purpose |
+| --- | --- | --- |
+| `--host` | `127.0.0.1` | Listen address. |
+| `--port` | `8002` | Listen port. |
+| `--device` | `cuda` | Torch device passed to SentenceTransformers. |
+| `--model-id` | pinned Jina Small | Hugging Face repository ID. |
+| `--model-revision` | pinned commit | Model and remote-code revision. |
+| `--max-concurrency` | `1` | Concurrent model calls. |
+
+**Environment:** `MINDBRIDGE_EMBEDDER_API_KEY` (required bearer token for `/v1/*`). `/health`
+remains public for liveness.
 
 ---
 

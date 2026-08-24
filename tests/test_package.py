@@ -210,6 +210,7 @@ SCENARIOS: dict[str, tuple[str, ...]] = {
         "cli",
         "consolidation_cli",
         "infrastructure",
+        "jina_server",
         "lifecycle_cli",
         "models",
         "server",
@@ -268,6 +269,7 @@ PROVIDERS: dict[str, str] = {
     "starlette": "starlette",
     "torch": "torch",
     "transformers": "transformers",
+    "uvicorn": "uvicorn",
 }
 """Import name to the distribution that provides it, spelled as `pyproject.toml` spells it."""
 
@@ -289,12 +291,8 @@ undeclared dependency. Its `tomli` half is declared and named in `PROVIDERS`; th
 other half, so one conditional import is not read as two missing ones.
 """
 
-RUNTIME_ONLY = frozenset({"torchvision", "uvicorn"})
-"""Declared dependencies that nothing in this repository imports, and why they stay.
-
-`uvicorn` is the ASGI server `docs/deployment.md` runs as a command. `torchvision` is loaded
-by Jina Omni's own Qwen3-VL processor, which swallows the ImportError and embeds text-only.
-"""
+RUNTIME_ONLY = frozenset({"torchvision"})
+"""Dependency Jina's Qwen3-VL processor imports itself rather than through MindBridge."""
 
 
 @cache

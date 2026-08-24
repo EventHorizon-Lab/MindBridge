@@ -33,6 +33,8 @@ def test_worker_settings_pin_models_and_redact_credentials() -> None:
 
     assert settings.generator_config["model_id"] == "qwen3.8-max"
     assert settings.generator_config["model_revision"] == "deployment-2026-08-11"
+    assert settings.media_embedder_plugin == settings.text_embedder_plugin == "openai"
+    assert settings.media_embedder_config == settings.text_embedder_config
     assert settings.media_embedder_config["model_revision"] == (
         "12949877f0092093f366c6450340011320152a05"
     )
@@ -53,6 +55,16 @@ def test_worker_text_encoder_shares_the_deployment_wide_embedder_contract() -> N
         == settings.media_embedder_config["space_revision"]
     )
     assert settings.text_embedder_config["dimension"] == settings.media_embedder_config["dimension"]
+
+
+def test_worker_can_explicitly_opt_into_the_local_jina_embedder() -> None:
+    settings = WorkerSettings.from_environment(
+        {**_environment(), "MINDBRIDGE_MEDIA_EMBEDDER_DEVICE": "cuda"}
+    )
+
+    assert settings.media_embedder_plugin == "jina"
+    assert settings.media_embedder_config["device"] == "cuda"
+    assert "endpoint" not in settings.media_embedder_config
 
 
 def test_worker_settings_require_explicit_generator_revision() -> None:

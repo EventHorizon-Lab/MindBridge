@@ -6,12 +6,13 @@ the variables themselves see [configuration](configuration.md); for the runtime 
 
 ## Topology
 
-Five process roles. Only the first three are long-running.
+Six process roles. Only the first four are long-running.
 
 | Role | Command | Extras |
 | --- | --- | --- |
+| Jina embedder | `mindbridge jina serve` | `server` + `cloud-models` |
 | API | `uvicorn mindbridge.server:create_app --factory` | `server` |
-| Memory worker | `celery -A mindbridge.celery_app:app worker` | `server` + `cloud-models` |
+| Memory worker | `celery -A mindbridge.celery_app:app worker` | `server` |
 | MCP (optional) | `mindbridge mcp` | `server` |
 | Consolidation | `mindbridge consolidate --tenant-id ...` | `server` |
 | Lifecycle | `mindbridge lifecycle --tenant-id ...` | `server` |
@@ -24,14 +25,14 @@ packages:
 uv sync                                      # Core types and Python SDK
 uv sync --extra edge                         # Any edge host
 uv sync --extra server                       # API, MCP, scheduled sweeps
-uv sync --extra server --extra cloud-models  # GPU memory worker
+uv sync --extra server --extra cloud-models  # Jina SentenceTransformers service
 uv sync --extra benchmarks                   # Benchmark harness
 uv sync --all-extras                         # Every role at once
 ```
 
-The API image should not carry `cloud-models`; it pulls torch and the API loads no model. A host
-that runs more than one role names their extras together in one `uv sync`, or extends what is
-installed with `uv sync --inexact --extra ...`.
+Only the Jina service image needs `cloud-models`; it pulls Torch. The API and worker load no
+model. A host that runs more than one role names their extras together in one `uv sync`, or
+extends what is installed with `uv sync --inexact --extra ...`.
 
 `--all-extras` is a uv flag. Installers that have no equivalent take the `all` extra, which is
 the same set by name:
@@ -152,39 +153,36 @@ under 32 characters, an unrecognized plugin config key, or a tenant holding vect
 configured embedding space cannot reach. All four are better as a failed deploy than as a
 degraded service.
 
-### Embedding endpoint
+### Jina SentenceTransformers service
 
-The API sends both multimodal recall queries and explicit memory text to one OpenAI-compatible
-Jina v5 Omni pooling endpoint, which encodes each side with its own retrieval prompt. It loads no
-model itself. A self-hosted endpoint can use the upstream validated vLLM path:
+The API, worker, MCP server, and consolidation jobs send all text, image, video, audio, and mixed
+inputs to one Jina v5 Omni service. The service uses the model's SentenceTransformers
+`encode_query()` and `encode_document()` paths and exposes the embedding response shape consumed
+by MindBridge:
 
 ```bash
-vllm serve jinaai/jina-embeddings-v5-omni-small-retrieval \
-  --revision 12949877f0092093f366c6450340011320152a05 \
-  --trust-remote-code
+MINDBRIDGE_EMBEDDER_API_KEY=... \
+uv run --extra server --extra cloud-models \
+  mindbridge jina serve --host 0.0.0.0 --port 8002 --device cuda
 ```
+
+Run one process per GPU. Keep port 8002 on a private network; `/health` is public for liveness,
+while `/v1/models` and `/v1/embeddings` require the bearer token. The service defaults to the
+pinned model and revision in this repository.
 
 ## Memory worker
 
-Shares storage and generator variables with the API. Its text slot reads the same
-`MINDBRIDGE_EMBEDDER_*` contract the API queries with, so only the media slot needs
-worker-specific variables:
-
-```toml
-[media_embedder]
-plugin = "jina"
-device = "cuda"
-model_id = "jinaai/jina-embeddings-v5-omni-small-retrieval"
-model_revision = "12949877f0092093f366c6450340011320152a05"
-```
+Shares storage, generator, and `MINDBRIDGE_EMBEDDER_*` variables with the API. By default its
+text and media slots are the same remote SentenceTransformers service.
 
 ```bash
-uv run --extra server --extra cloud-models \
+uv run --extra server \
   celery -A mindbridge.celery_app:app worker --loglevel=INFO
 ```
 
-**One prefork child is the safe default**, because each child owns a full embedding model. Scale
-with one worker process per assigned GPU rather than raising concurrency inside a process.
+The worker keeps one reusable client for both slots. Its default concurrency remains one because
+observation processing is long-running and job ownership is serialized, not because it owns
+model weights.
 
 Both embedder slots must resolve to one embedding space. The worker compares the two declared
 spaces before processing and fails the job rather than writing media and text vectors that cannot
@@ -215,8 +213,8 @@ paid for again until the retries run out. Nothing is written either way. Set the
 deadline to what its slowest clip actually needs and let the budget follow.
 
 The worker inspects original AV once, writes evidence-grounded Event/Entity/Claim records
-atomically, and cuts one derived clip per grounded span before encoding it locally. Event and
-Claim text is batched through the remote embedder.
+atomically, and cuts one derived clip per grounded span before sending media and text to the
+shared embedder.
 
 Sampling is the cost lever: see
 [media sampling](configuration.md#media-sampling-worker). Frame rate sets the entire write cost

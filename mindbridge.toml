@@ -16,8 +16,7 @@ bucket = "mindbridge-media"
 # Unset for AWS S3, which needs no endpoint. MinIO and other S3-compatible stores need one.
 endpoint_url = "http://localhost:9000"
 
-# One search space and one vector width shared by the index and every encoder. Both encoder
-# sections below inherit these three keys, so the deployment states them once.
+# One search space and one vector width shared by the index and every encoder.
 [embedding]
 dimension = 1024
 space_id = "jinaai/jina-embeddings-v5-omni-small-retrieval-1024"
@@ -33,14 +32,8 @@ model_revision = "deployment-2026-08-11"
 request_timeout_seconds = 1800
 
 [embedder]
+# Wire protocol used by the bundled `mindbridge jina serve` SentenceTransformers service.
 plugin = "openai"
 endpoint = "http://localhost:8002/v1"
-model_id = "jinaai/jina-embeddings-v5-omni-small-retrieval"
-model_revision = "12949877f0092093f366c6450340011320152a05"
-
-# The Worker's local image, video, and audio encoder. model_id here is a Hugging Face
-# repository ID; the embedder's model_id above is an endpoint's alias for a served model.
-[media_embedder]
-plugin = "jina"
 model_id = "jinaai/jina-embeddings-v5-omni-small-retrieval"
 model_revision = "12949877f0092093f366c6450340011320152a05"

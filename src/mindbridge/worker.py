@@ -124,7 +124,7 @@ class WorkerSettings:
     media_embedder_config: Mapping[str, object] = field(repr=False)
     text_embedder_config: Mapping[str, object] = field(repr=False)
     generator_plugin: str = "openai"
-    media_embedder_plugin: str = "jina"
+    media_embedder_plugin: str = "openai"
     text_embedder_plugin: str = "openai"
     embedding_dimension: int = DEFAULT_EMBEDDING_DIMENSION
     clip_sampling: ClipSampling = field(default_factory=ClipSampling)
@@ -154,10 +154,36 @@ class WorkerSettings:
         """Read the explicit Worker contract and fail before consuming jobs."""
         source = configuration_source(environ)
         generator_plugin = source.get("MINDBRIDGE_GENERATOR_PLUGIN", "openai")
-        media_plugin = source.get("MINDBRIDGE_MEDIA_EMBEDDER_PLUGIN", "jina")
         # The Worker's text encoder must land in the same space the API queries, so it reads the
         # deployment-wide MINDBRIDGE_EMBEDDER_* contract rather than a second set of names.
         text_plugin = source.get("MINDBRIDGE_EMBEDDER_PLUGIN", "openai")
+        text_config = plugin_configuration(
+            source,
+            "MINDBRIDGE_EMBEDDER_CONFIG_JSON",
+            (
+                lambda: openai_embedder_config(
+                    source,
+                    request_timeout_seconds=_MODEL_REQUEST_TIMEOUT_SECONDS,
+                )
+            )
+            if text_plugin == "openai"
+            else None,
+        )
+        media_is_explicit = any(name.startswith("MINDBRIDGE_MEDIA_EMBEDDER_") for name in source)
+        media_plugin = (
+            source.get("MINDBRIDGE_MEDIA_EMBEDDER_PLUGIN", "jina")
+            if media_is_explicit
+            else text_plugin
+        )
+        media_config = (
+            plugin_configuration(
+                source,
+                "MINDBRIDGE_MEDIA_EMBEDDER_CONFIG_JSON",
+                (lambda: jina_media_embedder_config(source)) if media_plugin == "jina" else None,
+            )
+            if media_is_explicit
+            else text_config
+        )
         return cls(
             database_url=require_environment_value(source, "MINDBRIDGE_DATABASE_URL"),
             object_storage=object_storage_from_environment(source),
@@ -176,24 +202,9 @@ class WorkerSettings:
                 else None,
             ),
             media_embedder_plugin=media_plugin,
-            media_embedder_config=plugin_configuration(
-                source,
-                "MINDBRIDGE_MEDIA_EMBEDDER_CONFIG_JSON",
-                (lambda: jina_media_embedder_config(source)) if media_plugin == "jina" else None,
-            ),
+            media_embedder_config=media_config,
             text_embedder_plugin=text_plugin,
-            text_embedder_config=plugin_configuration(
-                source,
-                "MINDBRIDGE_EMBEDDER_CONFIG_JSON",
-                (
-                    lambda: openai_embedder_config(
-                        source,
-                        request_timeout_seconds=_MODEL_REQUEST_TIMEOUT_SECONDS,
-                    )
-                )
-                if text_plugin == "openai"
-                else None,
-            ),
+            text_embedder_config=text_config,
             embedding_dimension=embedding_dimension_from_environment(source),
             clip_sampling=_clip_sampling_from_environment(source),
         )
@@ -371,8 +382,16 @@ async def _process_observation_once(
     async with AsyncExitStack() as resources:
         generator = load_generator(settings.generator_plugin, settings.generator_config)
         resources.push_async_callback(close_model, generator)
-        text_embedder = load_embedder(settings.text_embedder_plugin, settings.text_embedder_config)
-        resources.push_async_callback(close_model, text_embedder)
+        if (
+            settings.text_embedder_plugin == settings.media_embedder_plugin
+            and settings.text_embedder_config == settings.media_embedder_config
+        ):
+            text_embedder = media_embedder
+        else:
+            text_embedder = load_embedder(
+                settings.text_embedder_plugin, settings.text_embedder_config
+            )
+            resources.push_async_callback(close_model, text_embedder)
         await store.open()
         resources.push_async_callback(store.close)
         job = await ProcessObservation(
