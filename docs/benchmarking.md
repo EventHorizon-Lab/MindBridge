@@ -249,8 +249,9 @@ curl -s "$MINDBRIDGE_GENERATOR_ENDPOINT/chat/completions" -H "Authorization: Bea
 ## Benchmark dataset smoke
 
 LoCoMo-Refined, M3-Bench, Video-MME, EgoLife (EgoLifeQA), EgoTempo, EgoMemReason, MEMLENS,
-MM-Lifelong, and SuperMemory-VQA are consumed through thin adapters over pinned official files. Use Git for code
-releases and the Hugging Face CLI for Hub datasets; MindBridge does not ship another downloader:
+MM-Lifelong, SuperMemory-VQA, ATM-Bench, and Mem-Gallery are consumed through thin adapters over
+pinned official files. Use Git for code releases and the Hugging Face CLI for Hub datasets;
+MindBridge does not ship another downloader:
 
 ```bash
 git clone https://github.com/mem-eval-suite/LoCoMo_refined.git .benchmarks/locomo-refined
@@ -280,6 +281,14 @@ uvx --from huggingface-hub hf download MM-Lifelong/MM-Lifelong \
   day/test.json week/test.json month/train.json month/val.json \
   --repo-type dataset \
   --local-dir .benchmarks/mm-lifelong
+uvx --from huggingface-hub hf download Jingbiao/ATM-Bench \
+  --repo-type dataset \
+  --revision 78e826dc07e97466b2f54443831ef9a83ab8b27c \
+  --local-dir .benchmarks/atm-bench
+uvx --from huggingface-hub hf download Ethan-Bei/Mem-Gallery \
+  --repo-type dataset \
+  --revision af912daba984e896e253016b7c7e334ef92c2a6f \
+  --local-dir .benchmarks/mem-gallery
 
 uv run --extra benchmarks mindbridge-bench datasets \
   --locomo-refined .benchmarks/locomo-refined/data/raw/locomo_refined.json \
@@ -294,8 +303,15 @@ uv run --extra benchmarks mindbridge-bench datasets \
   --mm-week .benchmarks/mm-lifelong/week/test.json \
   --mm-month-train .benchmarks/mm-lifelong/month/train.json \
   --mm-month-val .benchmarks/mm-lifelong/month/val.json \
-  --supermemory .benchmarks/supermemory-vqa/data/json/all_qa.json
+  --supermemory .benchmarks/supermemory-vqa/data/json/all_qa.json \
+  --atm .benchmarks/atm-bench/data/atm-bench/atm-bench.json \
+  --atm-hard .benchmarks/atm-bench/data/atm-bench/atm-bench-hard.json \
+  --mem-gallery-dialog .benchmarks/mem-gallery/data/dialog
 ```
+
+Both ATM-Bench and Mem-Gallery are pinned by revision because the digests in this smoke are only
+meaningful against a fixed revision. ATM-Bench is 3.2 GB including the raw media; Mem-Gallery is
+530 MB.
 
 Large M3-Bench media stays outside Git. Acquire it through the official Hugging Face client rather
 than a MindBridge downloader:
