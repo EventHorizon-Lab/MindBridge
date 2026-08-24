@@ -136,7 +136,7 @@ bundled per-field variables or through one explicit JSON object.
 | --- | --- | --- |
 | Generator | `MINDBRIDGE_GENERATOR_PLUGIN` | `openai` |
 | Text embedder | `MINDBRIDGE_EMBEDDER_PLUGIN` | `openai` |
-| Media embedder | `MINDBRIDGE_MEDIA_EMBEDDER_PLUGIN` | inherits `MINDBRIDGE_EMBEDDER_PLUGIN` |
+| Media embedder | `MINDBRIDGE_MEDIA_EMBEDDER_PLUGIN` | `jina` |
 
 ### Generator
 
@@ -158,7 +158,7 @@ allowance for the encoding and graph write after the model call. Raising it is h
 a slow generator moves both deadlines at once. See
 [deployment](deployment.md#how-long-one-observation-may-take).
 
-### Shared embedder
+### Text embedder
 
 | Variable | Required | Default |
 | --- | --- | --- |
@@ -167,11 +167,12 @@ a slow generator moves both deadlines at once. See
 | `MINDBRIDGE_EMBEDDER_MODEL_ID` | no | `jinaai/jina-embeddings-v5-omni-small-retrieval` |
 | `MINDBRIDGE_EMBEDDER_MODEL_REVISION` | no | `12949877f0092093f366c6450340011320152a05` |
 
-The default `openai` plugin names the wire adapter, not the model runtime. The committed endpoint
-points to `mindbridge jina serve`, which loads Jina v5 Omni with SentenceTransformers. The API,
-MCP, consolidation jobs, and both worker slots use that one service by default.
+The worker's text slot deliberately reads these same names rather than a parallel family. It has
+to land in the space the API queries, and a second name is a second thing that can silently
+disagree. A worker that genuinely needs a different endpoint sets a different value for the same
+name — each process has its own environment.
 
-### Optional local media embedder (worker only)
+### Media embedder (worker only)
 
 | Variable | Required | Default |
 | --- | --- | --- |
@@ -179,9 +180,9 @@ MCP, consolidation jobs, and both worker slots use that one service by default.
 | `MINDBRIDGE_MEDIA_EMBEDDER_MODEL_REVISION` | no | `12949877f0092093f366c6450340011320152a05` |
 | `MINDBRIDGE_MEDIA_EMBEDDER_DEVICE` | no | automatic selection |
 
-These variables are read only when a `MINDBRIDGE_MEDIA_EMBEDDER_*` override is present. Setting
-`MINDBRIDGE_MEDIA_EMBEDDER_PLUGIN=jina` opts the worker into loading a second, local
-SentenceTransformers model. Without that explicit override, media inherits the shared endpoint.
+`MINDBRIDGE_MEDIA_EMBEDDER_MODEL_ID` is a Hugging Face repository ID; `MINDBRIDGE_EMBEDDER_MODEL_ID`
+is an endpoint-side alias. They frequently hold the same string and are still not the same field
+— do not consolidate them.
 
 An explicit `DEVICE` that is unavailable fails rather than silently falling back to CPU.
 

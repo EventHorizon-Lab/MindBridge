@@ -445,7 +445,7 @@ entry point `mindbridge.generators`、`mindbridge.embedders` 发现；进程只�
 - 同一个模型同时覆盖派生文本和原始媒体，检索两侧不存在跨编码器对齐假设；
 - 支持 retrieval 专用的 query/document 编码；
 - 支持 Matryoshka 截断维度，便于端侧或低成本索引试验；
-- 可以通过 Hugging Face 与 SentenceTransformers 的官方接口直接加载，不重复实现 processor、pooling 或批处理。
+- 可以通过 Hugging Face 和 vLLM 生态直接使用，不需要自研加载和 serving。
 
 首版约定：
 
@@ -458,12 +458,15 @@ entry point `mindbridge.generators`、`mindbridge.embedders` 发现；进程只�
 - 切换模型时创建新向量版本并后台重建，不原地混用不同空间。
 
 生产实现只使用一个编码器 `jina-embeddings-v5-omni-small-retrieval`，固定 revision
-`12949877f0092093f366c6450340011320152a05`；query 与 document 分别调用 SentenceTransformers 的
-`encode_query()` 与 `encode_document()`。独立的 `mindbridge jina serve` 进程加载一次模型，并为
-API、Worker、MCP 与 consolidation 提供文本、图像、视频、音频及混合输入。调用侧通过统一的
-`input` 契约访问该服务，不保留旧的多模态 `messages`、`fps` 或 `max_pixels` 适配。数据库按
+`12949877f0092093f366c6450340011320152a05`；query 与 document 的差别完全由 retrieval prompt
+承担，不由模型承担。编码器仍然分布在不同进程中：Memory Worker 通过 Hugging Face
+`sentence-transformers` 的 `encode_document()` 生成 EvidenceSpan 向量，并通过 vLLM
+OpenAI-compatible endpoint 批量生成 Event/Claim/Summary document 向量；API 通过同一个 endpoint
+生成 query 向量并编码显式记忆。文本请求使用 OpenAI SDK 的 `embeddings.create()`；SDK 尚未声明
+类型的多模态 `messages` 也只通过同一 SDK 的低层 `post()` 发送，不另写 HTTP 客户端。数据库按
 `space_id/space_revision` 检索、按 `model_id/revision` 保留真实生产者；升级编码器创建新空间并
-重建，不把未经验证的版本混查。API 与 Worker 都不加载 Jina 权重。
+重建，不把未经验证的版本混查。API 因此不加载 Jina 权重，模型只存在于 Worker 或独立 serving
+进程。
 
 同一对象、编码器 revision、空间和 task 的向量写入保持幂等。考虑 GPU/F16 serving 对同一文本可能
 产生末位浮点抖动，重放向量的余弦相似度不低于 `0.999999` 时视为同一内容；低于阈值仍作为
@@ -1035,8 +1038,7 @@ Tool 是请求/响应语义，在没有真实调用方要求前不为它发明�
 | 模型加载 | `transformers`、`sentence-transformers` | tokenizer、processor、pooling、批处理 |
 | 模型和数据下载 | `huggingface_hub` | 自写下载器、缓存和断点逻辑 |
 | Benchmark 数据 | `datasets`，优先官方 loader | 手工抓取和私有数据格式 |
-| Jina embedding serving | SentenceTransformers + MindBridge 薄 HTTP 边界 | 自研 processor、pooling、批处理 |
-| 生成模型 serving | OpenAI-compatible server | 自研推理 HTTP 协议 |
+| 云端模型 serving | vLLM/OpenAI-compatible server | 自研推理 HTTP 协议 |
 | 兼容模型调用 | `openai.AsyncOpenAI(base_url=...)` | `requests`/`httpx` 手写供应商接口 |
 | 非 OpenAI-compatible 服务 | 服务官方 SDK | 通用 REST 包装器 |
 | 端侧媒体与推理 | GStreamer/FFmpeg + 平台原生 runtime（ONNX Runtime EP、TensorRT/DeepStream、OpenVINO、RKNN、地瓜 BPU） | 自研解码、帧管线、runtime 和跨平台抽象层 |
@@ -1052,7 +1054,7 @@ Tool 是请求/响应语义，在没有真实调用方要求前不为它发明�
 
 ### 10.3 OpenAI-compatible Adapter
 
-Qwen 或其他提供 OpenAI-compatible endpoint 的模型统一使用 OpenAI SDK：
+Qwen、vLLM 或其他提供 OpenAI-compatible endpoint 的模型统一使用 OpenAI SDK：
 
 ```python
 from openai import AsyncOpenAI
@@ -1078,8 +1080,9 @@ OpenAI Adapter 默认省略 `reasoning_effort`，确保非推理模型和不同 
 才通过同一个 `Generator`、同一上下文和 `json_mode=True` 重试一次。正常请求不承担 JSON mode 的
 质量偏移，fallback 也不切换插件、模型或无限重试。
 
-音频内容块保留服务端的真实兼容契约：Qwen Chat 使用 URL 型 `input_audio`；Jina embedding
-服务使用 `audio_url`，并与 `image_url`、`video_url` 一起位于顶层 `input` 的 content 中。
+音频内容块保留服务端的真实兼容契约：Qwen Chat 使用 URL 型 `input_audio`，vLLM 多模态
+Embedding 使用 `audio_url`。两者共享 OpenAI SDK 和图像/视频构造，但不把这两个不同的音频
+schema 伪装成一个通用格式。
 
 ## 11. 工程实现规范（强制）
 
@@ -1333,15 +1336,15 @@ Cloud
 ├── PostgreSQL + pgvector
 ├── S3-compatible object storage
 ├── Redis + Celery
-└── model endpoints      # Jina SentenceTransformers / provider APIs
+└── model endpoints      # vLLM / provider APIs
 ```
 
 API 和 Worker 可以使用同一个 Python package、两个进程部署。只有当吞吐、故障域或团队边界证明需要时，才将 ingestion、recall、lifecycle 或 model serving 拆成独立服务。
 
 基础安装只包含 Core 领域类型、Pydantic 契约和 Python SDK。任意端侧主机——Jetson、地瓜 RDK、
 Rockchip RK、OpenVINO x86、ARM 主机或直接充当“端”的 4090/5090/A100——都安装同一个 `edge`
-extra；API、Worker、MCP 与云端任务安装 `server` extra；只有加载 Jina Omni 的
-`mindbridge jina serve` 进程再叠加 `cloud-models`。端侧安装不得因 SQLite 身份或同步能力被迫携带 Celery、MCP、PostgreSQL、
+extra；API、MCP 与云端任务安装 `server` extra；只有本地加载 Jina Omni 的 GPU Worker 再叠加
+`cloud-models`。端侧安装不得因 SQLite 身份或同步能力被迫携带 Celery、MCP、PostgreSQL、
 FastAPI 等服务端栈，子包导入隔离由独立进程测试守护。`edge` 的 Python 依赖只覆盖同步、安全、
 OpenAI SDK 和可观测性；不再为声纹二次解码携带 SoundFile，也不携带 NeMo。InsightFace/ONNX
 Runtime、FunASR/ModelScope 与设备版 Torch 必须使用与目标平台 SDK 匹配的镜像工件（JetPack/CUDA、

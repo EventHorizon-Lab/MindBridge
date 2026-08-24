@@ -140,6 +140,7 @@ class OpenAIGenerator:
                     "role": "user",
                     "content": _content_parts(
                         request.input,
+                        for_embedding=False,
                         video_frames_per_second=self._video_frames_per_second,
                         video_max_pixels=self._video_max_pixels,
                     ),
@@ -202,14 +203,20 @@ class OpenAIEmbedder:
         space_reference: EmbeddingSpaceReference,
         dimension: int = 1_024,
         request_timeout_seconds: float = 120.0,
+        video_frames_per_second: float = DEFAULT_VIDEO_FRAMES_PER_SECOND,
+        video_max_pixels: int = DEFAULT_VIDEO_MAX_PIXELS,
     ) -> None:
         if dimension <= 0 or request_timeout_seconds <= 0:
             raise ValueError("dimension and request timeout must be positive")
+        if video_frames_per_second <= 0 or video_max_pixels <= 0:
+            raise ValueError("video sampling values must be positive")
         self._client = client
         self._model_reference = model_reference
         self._space_reference = space_reference
         self._dimension = dimension
         self._request_timeout_seconds = request_timeout_seconds
+        self._video_frames_per_second = video_frames_per_second
+        self._video_max_pixels = video_max_pixels
 
     @classmethod
     def connect(
@@ -223,6 +230,8 @@ class OpenAIEmbedder:
         dimension: int = 1_024,
         request_timeout_seconds: float = 120.0,
         max_retries: int = 2,
+        video_frames_per_second: float = DEFAULT_VIDEO_FRAMES_PER_SECOND,
+        video_max_pixels: int = DEFAULT_VIDEO_MAX_PIXELS,
     ) -> OpenAIEmbedder:
         if any(not value.strip() for value in (api_key, model_id, model_revision)):
             raise ValueError("embedding credentials and model identities are required")
@@ -239,6 +248,8 @@ class OpenAIEmbedder:
             space_reference=space_reference,
             dimension=dimension,
             request_timeout_seconds=request_timeout_seconds,
+            video_frames_per_second=video_frames_per_second,
+            video_max_pixels=video_max_pixels,
         )
 
     @property
@@ -312,11 +323,14 @@ class OpenAIEmbedder:
             "/embeddings",
             cast_to=CreateEmbeddingResponse,
             body={
-                "input": [
+                "messages": [
                     {
                         "role": "user",
-                        "content": _embedding_content_parts(
-                            _prefixed_embedding_input(input_value, task)
+                        "content": _content_parts(
+                            _prefixed_embedding_input(input_value, task),
+                            for_embedding=True,
+                            video_frames_per_second=self._video_frames_per_second,
+                            video_max_pixels=self._video_max_pixels,
                         ),
                     }
                 ],
@@ -356,6 +370,8 @@ class _EmbedderConfig(PluginConfigModel):
     dimension: MatryoshkaDimension = DEFAULT_EMBEDDING_DIMENSION
     request_timeout_seconds: PluginNumber = 120.0
     max_retries: PluginInteger = 2
+    video_frames_per_second: PluginNumber = DEFAULT_VIDEO_FRAMES_PER_SECOND
+    video_max_pixels: PluginInteger = DEFAULT_VIDEO_MAX_PIXELS
 
 
 def create_generator(config: Mapping[str, object]) -> OpenAIGenerator:
@@ -389,6 +405,8 @@ def create_embedder(config: Mapping[str, object]) -> OpenAIEmbedder:
         dimension=validated.dimension,
         request_timeout_seconds=validated.request_timeout_seconds,
         max_retries=validated.max_retries,
+        video_frames_per_second=validated.video_frames_per_second,
+        video_max_pixels=validated.video_max_pixels,
     )
 
 
@@ -458,6 +476,7 @@ async def _consume_completion_stream(
 def _content_parts(
     input_value: ModelInput,
     *,
+    for_embedding: bool,
     video_frames_per_second: float,
     video_max_pixels: int,
 ) -> list[dict[str, object]]:
@@ -476,6 +495,8 @@ def _content_parts(
                     "max_pixels": part.max_pixels or video_max_pixels,
                 }
             )
+        elif for_embedding:
+            content.append({"type": "audio_url", "audio_url": {"url": part.url}})
         else:
             source = part.source_uri or part.url
             suffix = PurePosixPath(urlsplit(source).path).suffix
@@ -488,22 +509,6 @@ def _content_parts(
                     },
                 }
             )
-    return content
-
-
-def _embedding_content_parts(input_value: ModelInput) -> list[dict[str, object]]:
-    """Render the bundled SentenceTransformers service contract."""
-    content: list[dict[str, object]] = []
-    for part in input_value.parts:
-        if isinstance(part, TextPart):
-            content.append({"type": "text", "text": part.text})
-        else:
-            kind = {
-                MediaKind.IMAGE: "image_url",
-                MediaKind.VIDEO: "video_url",
-                MediaKind.AUDIO: "audio_url",
-            }[part.kind]
-            content.append({"type": kind, kind: {"url": part.url}})
     return content
 
 

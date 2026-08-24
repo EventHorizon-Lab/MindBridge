@@ -12,23 +12,29 @@ worker, which is covered in [deployment](deployment.md).
 | [uv](https://docs.astral.sh/uv/) | The lockfile is authoritative; `pip` will not reproduce it. |
 | Docker with Compose | Runs the pinned PostgreSQL 18 + pgvector and Redis. |
 | An OpenAI-compatible **generator** endpoint | Answers recalls and judges consolidation candidates. |
-| A CUDA-capable GPU | Runs the default Jina v5 Omni SentenceTransformers service. CPU works for smoke tests but is slow. |
+| An OpenAI-compatible **embedder** endpoint | Encodes queries and text. Must serve Jina v5 Omni or another model at the dimension you configure. |
 | S3-compatible object storage | Holds evidence media. MinIO is fine locally; AWS S3 needs no endpoint URL. |
 
-MindBridge loads no model in the API or worker process. The default deployment starts one
-SentenceTransformers service for Jina v5 Omni and sends text, image, video, audio, and mixed
-queries to it through the configured embedding endpoint.
+MindBridge loads no model in-process on the API path. Both model slots are remote endpoints you
+point it at, so this quickstart needs somewhere to point. If you have neither, serve the
+reference embedder yourself:
+
+```bash
+vllm serve jinaai/jina-embeddings-v5-omni-small-retrieval \
+  --revision 12949877f0092093f366c6450340011320152a05 \
+  --trust-remote-code
+```
 
 ## 1. Install
 
 ```bash
 git clone https://github.com/EventHorizon-Lab/MindBridge.git
 cd MindBridge
-uv sync --extra server --extra cloud-models
+uv sync --extra server
 ```
 
-`server` supplies the HTTP and worker processes; `cloud-models` supplies SentenceTransformers,
-Torch, and the Jina media processors used by the embedding service.
+`--extra server` pulls FastAPI, psycopg, Celery, and the MCP server. It deliberately excludes
+`cloud-models`, which carries torch — the API does not need it.
 
 ## 2. Start the datastores
 
@@ -63,7 +69,7 @@ Copy the credential template:
 cp .env.example .env
 ```
 
-Fill in the generator and local embedder bearer tokens, then generate a tenant key:
+Fill in the two API keys and generate a tenant key:
 
 ```bash
 openssl rand -hex 24
@@ -96,18 +102,7 @@ uv run --env-file .env mindbridge config check --role api
 That reports every missing setting in one pass, and names whether each resolved value came from
 the environment or from `mindbridge.toml`. It never prints a value.
 
-## 5. Run the Jina embedding service
-
-```bash
-uv run --env-file .env --extra server --extra cloud-models \
-  mindbridge jina serve --host 127.0.0.1 --port 8002 --device cuda
-```
-
-This command loads the pinned Jina model with SentenceTransformers. `/v1/embeddings` accepts
-text, image, video, audio, and mixed content. Keep it bound to a private interface; every `/v1/*`
-route requires `MINDBRIDGE_EMBEDDER_API_KEY`.
-
-## 6. Run the API
+## 5. Run the API
 
 ```bash
 uv run --env-file .env --extra server uvicorn mindbridge.server:create_app --factory
@@ -127,7 +122,7 @@ configured embedding space cannot reach, and refuses to serve if so. That is wha
 changed embedder from turning every recall into a silent empty result. On a fresh database it
 passes trivially.
 
-## 7. Write and recall
+## 6. Write and recall
 
 ```python
 import asyncio
@@ -178,11 +173,23 @@ curl -s localhost:8000/v1/recall \
 
 ## What you have not exercised yet
 
-This quickstart never ran the perception path. To ingest actual audio and video, start the memory
-worker. It uses the same Jina endpoint as the API, so it does not load a second model:
+This quickstart never ran the perception path. To ingest actual audio and video you need the
+memory worker, which loads a local media embedder and therefore wants a GPU:
 
 ```bash
-uv run --env-file .env --extra server \
+uv sync --extra server --extra cloud-models
+```
+
+Point the local encoder at the GPU in `mindbridge.toml`:
+
+```toml
+[media_embedder]
+plugin = "jina"
+device = "cuda"
+```
+
+```bash
+uv run --env-file .env --extra server --extra cloud-models \
   celery -A mindbridge.celery_app:app worker --loglevel=INFO
 ```
 

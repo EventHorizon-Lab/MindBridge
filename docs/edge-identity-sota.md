@@ -214,7 +214,7 @@ speech pipeline，否则顺序复用同一加速器。CPU 承担 SQLite、AES、
 - 任意端侧/机器人编排（Jetson、地瓜 RDK、RK、OpenVINO x86、ARM 主机、dGPU 工作站）：
   `uv pip install '.[edge]'`——同一个 extra，不按平台分叉；
 - 云服务：`uv pip install '.[server]'`；
-- Jina SentenceTransformers 服务：再叠加 `'.[cloud-models]'`；
+- 本地 Jina GPU Worker：再叠加 `'.[cloud-models]'`；
 - InsightFace、ONNX Runtime、FunASR、ModelScope 和设备 Torch：由目标平台镜像提供。
 
 通用 lock 不钉死任何平台的加速器 wheel（Jetson Torch、RKNN Toolkit、OpenVINO runtime、BPU

@@ -177,8 +177,8 @@ are derived from it and follow automatically.
 
 ### Jobs stay `pending`
 
-The worker is not consuming. Check it is running, has `--extra server` installed, and points at
-the same `MINDBRIDGE_TASK_BROKER_URL`.
+The worker is not consuming. Check it is running, has `--extra server --extra cloud-models`
+installed, and points at the same `MINDBRIDGE_TASK_BROKER_URL`.
 
 ### `TypeError: 'NoneType' object is not callable` on the first frame
 
@@ -186,8 +186,8 @@ Torchvision is missing. Jina Omni's image and video processor is a Qwen3-VL proc
 to construct without it, and the upstream loader swallows that `ImportError` and leaves the
 processor unset — so the model loads, embeds text happily, and dies on the first frame it is given.
 
-MindBridge detects the empty processor slot while the Jina service starts. Install the extra,
-which pins `torchvision` from the same CUDA index as torch:
+MindBridge now detects the empty processor slot and says so instead. Install the extra, which
+pins `torchvision` from the same CUDA index as torch:
 
 ```bash
 uv sync --extra server --extra cloud-models

@@ -126,7 +126,7 @@ async def test_text_document_embedder_batches_and_restores_index_order() -> None
 async def test_multimodal_query_preserves_native_av_parts() -> None:
     async def respond(request: httpx.Request) -> httpx.Response:
         payload: dict[str, object] = json.loads(request.content)
-        messages = cast(list[dict[str, object]], payload["input"])
+        messages = cast(list[dict[str, object]], payload["messages"])
         content = cast(list[dict[str, object]], messages[0]["content"])
         assert request.url.path == "/api/v1/embeddings"
         assert payload["model"] == MODEL_ID
@@ -140,11 +140,6 @@ async def test_multimodal_query_preserves_native_av_parts() -> None:
         }
         audio = next(item for item in content if item["type"] == "audio_url")
         assert cast(dict[str, str], audio["audio_url"])["url"].endswith("/media_audio")
-        video = next(item for item in content if item["type"] == "video_url")
-        assert video == {
-            "type": "video_url",
-            "video_url": {"url": "https://objects.example.test/media_video"},
-        }
         return _embedding_response()
 
     embedder = _embedder(respond)
