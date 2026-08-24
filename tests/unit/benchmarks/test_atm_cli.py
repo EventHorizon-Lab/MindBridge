@@ -176,6 +176,117 @@ def test_a_manifest_whose_capture_time_disagrees_with_the_release_is_refused() -
     atm_cli._require_one_clock(_prepared_media(), (_sgm_record(),), media_source="raw")
 
 
+def test_main_refuses_a_raw_run_whose_clocks_disagree_before_ingesting(tmp_path: Path) -> None:
+    """The one-clock guard must actually be wired into `main()`, not just unit-testable.
+
+    Everything here is otherwise a normal, complete raw-arm invocation -- a real dataset,
+    emails, prepared-media manifest, and a matching `--sgm-image` -- so the only way it can
+    fail is the `_require_one_clock(...)` call site inside `main()` itself. Deleting that one
+    line would leave `_require_one_clock` and its direct-call tests green while this run
+    silently ingested a skewed archive.
+    """
+    dataset_path = tmp_path / "atm-bench.json"
+    dataset_path.write_text(
+        json.dumps(
+            [
+                {
+                    "id": "question_01",
+                    "question": "Where was the steel bridge?",
+                    "answer": "Porto, Portugal",
+                    "notes": "",
+                    "evidence_ids": ["20250223_130249"],
+                    "qtype": "open_end",
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    emails_path = tmp_path / "emails.json"
+    emails_path.write_text(
+        json.dumps(
+            [
+                {
+                    "id": "email202411160004",
+                    "timestamp": "2024-11-16 09:12:00",
+                    "short_summary": "Hotel",
+                    "detail": "Total £799.74.",
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    # created_at is an hour off the "20250223_130249" stem -- the same skew the direct-call
+    # test above exercises, just reached this time by ingesting it through `main()`.
+    prepared_path = tmp_path / "prepared.json"
+    prepared_path.write_text(
+        json.dumps(
+            {
+                "media": [
+                    {
+                        "media_id": "20250223_130249",
+                        "media_object": {
+                            "media_object_id": "20250223_130249",
+                            "kind": "image",
+                            "uri": "s3://mindbridge-media/atm-bench/20250223_130249.jpg",
+                            "sha256": "a" * 64,
+                            "size_bytes": 1,
+                            "created_at": "2025-02-23T12:02:49Z",
+                        },
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    sgm_image_path = tmp_path / "image_batch_results.json"
+    sgm_image_path.write_text(
+        json.dumps(
+            [
+                {
+                    "image_path": "data/raw_memory/image/20250223_130249.jpg",
+                    "timestamp": "2025-02-23 13:02:49",
+                    "location_name": "Porto, Portugal",
+                    "city": "Porto, Portugal",
+                    "short_caption": "A steel bridge.",
+                    "caption": "A wide steel arch bridge.",
+                    "ocr_text": "",
+                    "tags": ["bridge"],
+                    "file_size": 1,
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    deployment_path = write_deployment_snapshot(tmp_path)
+
+    with pytest.raises(ValueError, match="disagree with the release about capture time"):
+        atm_cli.main(
+            [
+                "--dataset",
+                str(dataset_path),
+                "--emails",
+                str(emails_path),
+                "--output",
+                str(tmp_path / "predictions.json"),
+                "--api-base-url",
+                "http://localhost:8000",
+                "--deployment-config",
+                str(deployment_path),
+                "--run-id",
+                "run1",
+                "--split",
+                "main",
+                "--media-source",
+                "raw",
+                "--prepared-media",
+                str(prepared_path),
+                "--sgm-image",
+                str(sgm_image_path),
+            ],
+            prog="mindbridge-bench atm",
+        )
+
+
 def test_a_raw_run_staging_a_video_needs_the_record_that_dates_it() -> None:
     from mindbridge.core import MediaKind
 
