@@ -502,7 +502,7 @@ def atm_email_block(email: AtmEmail) -> str:
 def atm_memory_chunks(block: str, evidence_id: str) -> tuple[str, ...]:
     """Split one serialized block into writes that fit `RememberRequest.summary`.
 
-    1,059 of the 4,292 SGM blocks exceed the 2,048-character limit, the longest at 9,199.
+    1,063 of the 4,292 SGM blocks exceed the 2,048-character limit, the longest at 9,212.
     Every chunk repeats the ID line, so retrieving any one of them still names its evidence.
     """
     if len(block) <= _MEMORY_CHARACTER_LIMIT:
