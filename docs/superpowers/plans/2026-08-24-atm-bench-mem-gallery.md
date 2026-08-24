@@ -514,8 +514,7 @@ def atm_memory_chunks(block: str, evidence_id: str) -> tuple[str, ...]:
         for offset in range(0, len(body), _CHUNK_BODY_CHARACTERS)
     )
     return tuple(
-        f"{head}Part {index}/{len(slices)}\n{piece}"
-        for index, piece in enumerate(slices, start=1)
+        f"{head}Part {index}/{len(slices)}\n{piece}" for index, piece in enumerate(slices, start=1)
     )
 
 
@@ -537,8 +536,7 @@ def _questions(path: Path, *, require_pool: bool) -> tuple[AtmBenchQuestion, ...
             raise ValueError("ATM-Bench NIAH pools must carry niah_evidence_ids")
         if not set(question.evidence_ids) <= set(question.niah_evidence_ids):
             raise ValueError(
-                f"ATM-Bench NIAH pool must contain every gold evidence for "
-                f"{question.question_id}"
+                f"ATM-Bench NIAH pool must contain every gold evidence for {question.question_id}"
             )
     return questions
 
@@ -1109,9 +1107,7 @@ def test_dataset_smoke_result_requires_all_sixteen_benchmark_summaries() -> None
     """A benchmark dropped out of the smoke must fail the contract, not pass quietly."""
     from mindbridge.benchmarks.dataset_smoke import DatasetAdapterSmokeResult
 
-    assert (
-        DatasetAdapterSmokeResult.model_fields["datasets"].metadata[0].min_length == 16
-    )
+    assert DatasetAdapterSmokeResult.model_fields["datasets"].metadata[0].min_length == 16
 ```
 
 - [ ] **Step 2: Run the test to verify it fails**
@@ -1156,31 +1152,33 @@ from mindbridge.benchmarks.mem_gallery import (
 **Edit 5** — append three summaries to the `datasets` tuple, after the SuperMemory entry:
 
 ```python
-            BenchmarkDatasetSummary(
-                benchmark="ATM-Bench",
-                source_repository="Jingbiao/ATM-Bench",
-                source_file=atm_path.name,
-                source_sha256=sha256_file(atm_path),
-                adapter_version=ATM_BENCH_ADAPTER_VERSION,
-                context_count=1,
-                memory_item_count=len(
-                    {evidence for question in atm for evidence in question.evidence_ids}
-                ),
-                question_count=len(atm),
-            ),
-            BenchmarkDatasetSummary(
-                benchmark="ATM-Bench-Hard",
-                source_repository="Jingbiao/ATM-Bench",
-                source_file=atm_hard_path.name,
-                source_sha256=sha256_file(atm_hard_path),
-                adapter_version=ATM_BENCH_ADAPTER_VERSION,
-                context_count=1,
-                memory_item_count=len(
-                    {evidence for question in atm_hard for evidence in question.evidence_ids}
-                ),
-                question_count=len(atm_hard),
-            ),
-            _mem_gallery_summary(mem_gallery_dialog_path, mem_gallery),
+(
+    BenchmarkDatasetSummary(
+        benchmark="ATM-Bench",
+        source_repository="Jingbiao/ATM-Bench",
+        source_file=atm_path.name,
+        source_sha256=sha256_file(atm_path),
+        adapter_version=ATM_BENCH_ADAPTER_VERSION,
+        context_count=1,
+        memory_item_count=len({evidence for question in atm for evidence in question.evidence_ids}),
+        question_count=len(atm),
+    ),
+)
+(
+    BenchmarkDatasetSummary(
+        benchmark="ATM-Bench-Hard",
+        source_repository="Jingbiao/ATM-Bench",
+        source_file=atm_hard_path.name,
+        source_sha256=sha256_file(atm_hard_path),
+        adapter_version=ATM_BENCH_ADAPTER_VERSION,
+        context_count=1,
+        memory_item_count=len(
+            {evidence for question in atm_hard for evidence in question.evidence_ids}
+        ),
+        question_count=len(atm_hard),
+    ),
+)
+(_mem_gallery_summary(mem_gallery_dialog_path, mem_gallery),)
 ```
 
 **Edit 6** — add the summary helper beside `_m3_summary`:
@@ -1196,9 +1194,9 @@ def _mem_gallery_summary(
     digests: one number that changes if any topic file changes.
     """
     digest = hashlib.sha256(
-        "".join(
-            sha256_file(path) for path in sorted(dialog_directory.glob("*.json"))
-        ).encode("utf-8")
+        "".join(sha256_file(path) for path in sorted(dialog_directory.glob("*.json"))).encode(
+            "utf-8"
+        )
     ).hexdigest()
     return BenchmarkDatasetSummary(
         benchmark="Mem-Gallery",
@@ -1207,7 +1205,9 @@ def _mem_gallery_summary(
         source_sha256=digest,
         adapter_version=MEM_GALLERY_ADAPTER_VERSION,
         context_count=len(topics),
-        memory_item_count=sum(len(session.rounds) for topic in topics for session in topic.sessions),
+        memory_item_count=sum(
+            len(session.rounds) for topic in topics for session in topic.sessions
+        ),
         question_count=sum(len(topic.questions) for topic in topics),
     )
 ```
@@ -1234,9 +1234,9 @@ def _mem_gallery_summary(
 **Edit 9** — pass them through in `main`:
 
 ```python
-        atm_path=arguments.atm,
-        atm_hard_path=arguments.atm_hard,
-        mem_gallery_dialog_path=arguments.mem_gallery_dialog,
+atm_path = (arguments.atm,)
+atm_hard_path = (arguments.atm_hard,)
+mem_gallery_dialog_path = (arguments.mem_gallery_dialog,)
 ```
 
 - [ ] **Step 4: Run the test to verify it passes**
@@ -2067,9 +2067,7 @@ async def _remember_blocks(
                     summary=chunk,
                     memory_type=MemoryType.EPISODIC,
                     occurred_at=occurred_at,
-                    idempotency_key=(
-                        f"{ATM_BENCH_ADAPTER_VERSION}:text:{evidence_id}:{index}"
-                    ),
+                    idempotency_key=(f"{ATM_BENCH_ADAPTER_VERSION}:text:{evidence_id}:{index}"),
                 )
             )
 ```
@@ -2376,9 +2374,7 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
         for record in load_atm_sgm(path)
     )
     report(f"running {len(questions)} questions", quiet=arguments.quiet)
-    failures, results = asyncio.run(
-        _run(arguments, questions, prepared, sgm_records, emails)
-    )
+    failures, results = asyncio.run(_run(arguments, questions, prepared, sgm_records, emails))
     _write_artifacts(arguments, questions, results, deployment, failures, emails, sgm_records)
     report(f"wrote {arguments.output_path}", quiet=arguments.quiet)
 ```
@@ -2483,14 +2479,10 @@ def _write_artifacts(
         ),
         emails_sha256=sha256_file(arguments.emails_path),
         sgm_image_sha256=(
-            sha256_file(arguments.sgm_image_path)
-            if arguments.sgm_image_path is not None
-            else None
+            sha256_file(arguments.sgm_image_path) if arguments.sgm_image_path is not None else None
         ),
         sgm_video_sha256=(
-            sha256_file(arguments.sgm_video_path)
-            if arguments.sgm_video_path is not None
-            else None
+            sha256_file(arguments.sgm_video_path) if arguments.sgm_video_path is not None else None
         ),
         perception_prompt_version=(
             PERCEIVE_EVENTS_PROMPT.version if arguments.media_source == "raw" else None
@@ -2509,18 +2501,14 @@ def _parse_arguments(argv: Sequence[str] | None, prog: str | None) -> _Arguments
         core_parser(tenant_prefix="benchmark_atm", prog=prog, description=__doc__),
         device_id="atm_archive",
     )
-    parser.add_argument(
-        "--emails", type=Path, required=True, help="official emails.json to ingest"
-    )
+    parser.add_argument("--emails", type=Path, required=True, help="official emails.json to ingest")
     parser.add_argument(
         "--prepared-media", type=Path, help="manifest of staged archive media; required for raw"
     )
     parser.add_argument(
         "--sgm-image", type=Path, help="official image_batch_results.json; required for sgm"
     )
-    parser.add_argument(
-        "--sgm-video", type=Path, help="official video_batch_results.json"
-    )
+    parser.add_argument("--sgm-video", type=Path, help="official video_batch_results.json")
     parser.add_argument(
         "--split",
         choices=("main", "hard"),
@@ -3132,9 +3120,7 @@ async def _ingest_round(
                     occurred_at=session.occurred_at,
                     ended_at=session.occurred_at,
                     observed_at=session.occurred_at,
-                    idempotency_key=(
-                        f"{MEM_GALLERY_ADAPTER_VERSION}:media:{round_.round_id}"
-                    ),
+                    idempotency_key=(f"{MEM_GALLERY_ADAPTER_VERSION}:media:{round_.round_id}"),
                 ),
                 poll_interval_seconds=poll_interval_seconds,
                 processing_timeout_seconds=processing_timeout_seconds,
@@ -3537,9 +3523,7 @@ def _write_artifacts(
     results: tuple[MemGalleryQuestionResult, ...],
     deployment: LoadedDeployment,
 ) -> None:
-    expected = tuple(
-        question.question_id for topic in topics for question in topic.questions
-    )
+    expected = tuple(question.question_id for topic in topics for question in topic.questions)
     if tuple(result.question_id for result in results) != expected:
         raise ValueError("Mem-Gallery predictions must match annotation question order")
     # The official evaluator reads a list of per-question objects with `point` as category.
@@ -3584,9 +3568,7 @@ def _write_artifacts(
         topics=tuple(topic.topic for topic in topics),
         question_ids=expected,
         session_count=sum(len(topic.sessions) for topic in topics),
-        round_count=sum(
-            len(session.rounds) for topic in topics for session in topic.sessions
-        ),
+        round_count=sum(len(session.rounds) for topic in topics for session in topic.sessions),
         image_reference_count=sum(
             1
             for topic in topics
