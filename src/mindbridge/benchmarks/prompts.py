@@ -65,12 +65,14 @@ MEM_GALLERY_QUERY_PROMPT = PromptSpec(
     purpose="Apply the official Mem-Gallery concise-answer instruction.",
     used_by="mindbridge.benchmarks.mem_gallery_runner._question_query",
     text=(
-        "Your task is to answer the question about the conversation in a concise manner "
-        "with the help of memory content. Please only provide the content of the answer, "
-        "without including introductory phrases like 'answer:'. For questions that require "
-        "answering a date or time, strictly follow the format and provide a specific date "
-        "or time whenever possible. Generate answers primarily concise, yet complete enough "
-        "to accurately answer the questions.\n\n"
+        "Your task is to answer the question about the conversation between {speaker_a} "
+        "and {speaker_b} in a concise manner with the help of memory content.\n"
+        "Please only provide the content of the answer, without including introductory "
+        "phrases like 'answer:'.\n"
+        "For questions that require answering a date or time, strictly follow the format "
+        "and provide a specific date or time whenever possible.\n"
+        "Generate answers primarily concise, yet complete enough to accurately answer the "
+        "questions.\n\n"
         "The current question is as follows:\n{question} {format_constraint}"
     ),
 )
@@ -118,13 +120,19 @@ _MEM_GALLERY_CONSTRAINTS = {
 
 
 def mem_gallery_format_constraint(point: str) -> str:
-    """Return the official constraint text for one task type, empty where it has none.
+    """Return one task type's official constraint, already separated, or empty text.
 
     The official runner applies a constraint file for `AR`, `CD` and `VS` only; the other
-    six task types are asked without one, and adding one would change the task.
+    six task types are asked without one, and adding one would change the task. It also
+    prefixes the constraint with a blank line -- `format_constraint_str = "\\n\\n" +
+    format_constraint` -- and interpolates it after a literal space, so a constrained
+    question renders as its own paragraph. The separator belongs here rather than in the
+    template, because this is the only place that knows whether a constraint exists at all,
+    and it keeps each `PromptSpec.text` byte-identical to the upstream `.txt` file it
+    reproduces.
     """
     prompt = _MEM_GALLERY_CONSTRAINTS.get(point.upper())
-    return prompt.text if prompt is not None else ""
+    return f"\n\n{prompt.text}" if prompt is not None else ""
 
 
 BENCHMARK_PROMPTS = (
