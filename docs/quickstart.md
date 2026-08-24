@@ -18,11 +18,14 @@ worker, which is covered in [deployment](deployment.md).
 MindBridge loads no model in-process on the API path. Both model slots are remote endpoints you
 point it at, so this quickstart needs somewhere to point.
 
-If you have neither, you can serve the reference embedder yourself, but it takes more than one
-command: vLLM does not carry this architecture, so it needs a small plugin installed alongside the
-pooling flags, and the rest of the flags depend on the vLLM version and the card.
-[deployment](deployment.md#embedding-endpoint) has the two-step recipe and the log line that
-confirms it took. Come back here once `/v1/embeddings` answers.
+You can serve the reference embedder with the bundled SentenceTransformers service. In a separate
+environment on the GPU host:
+
+```bash
+uv sync --extra server --extra cloud-models
+export MINDBRIDGE_EMBEDDER_API_KEY=replace-with-at-least-32-random-characters
+uv run --extra server --extra cloud-models mindbridge jina serve --host 0.0.0.0
+```
 
 ## 1. Install
 
@@ -73,7 +76,7 @@ export MINDBRIDGE_GENERATOR_ENDPOINT=https://generator.example.com/v1
 export MINDBRIDGE_GENERATOR_MODEL_ID=qwen3.8-max
 
 export MINDBRIDGE_EMBEDDER_API_KEY=...
-export MINDBRIDGE_EMBEDDER_ENDPOINT=https://embeddings.example.com/v1
+export MINDBRIDGE_EMBEDDER_ENDPOINT=http://localhost:8002/v1
 export MINDBRIDGE_EMBEDDER_MODEL_ID=jinaai/jina-embeddings-v5-omni-small-retrieval
 export MINDBRIDGE_EMBEDDING_SPACE_ID=jina-v5
 
@@ -179,17 +182,14 @@ memory worker. Point its media slot at the same embedding endpoint you already c
 endpoint embeds video and audio as well as text, so there is no second model and no GPU:
 
 ```bash
-export MINDBRIDGE_MEDIA_EMBEDDER_PLUGIN=openai
 uv run --extra server --extra media celery -A mindbridge.celery_app:app worker --loglevel=INFO
 ```
 
 The alternative is `MINDBRIDGE_MEDIA_EMBEDDER_PLUGIN=jina`, which loads Jina v5 Omni into the
-worker process and needs `--extra cloud-models` and a GPU. It is measurably the slower path —
-0.062 s per video clip served against 10.2 s in-process on an RTX 5090 — and it holds 3.7 GiB of
-VRAM in **every** prefork child, so the worker refuses to start when a pool of more than one child
-would exceed `MINDBRIDGE_WORKER_VRAM_BUDGET_GIB`, whether the pool comes from `--concurrency` or
-`--autoscale`. [Deployment](deployment.md#media-encoder-served-or-in-process) has the numbers and
-the one caveat about switching an already-populated deployment.
+worker process and needs `--extra cloud-models` and a GPU. It holds 3.7 GiB of VRAM in **every**
+prefork child, so the worker refuses to start when a pool of more than one child would exceed
+`MINDBRIDGE_WORKER_VRAM_BUDGET_GIB`, whether the pool comes from `--concurrency` or `--autoscale`.
+[Deployment](deployment.md#optional-in-process-media-encoder) covers that opt-in path.
 
 `POST /v1/observations` then returns a `processing_job_id`; memory does not exist when that
 receipt returns. Poll `GET /v1/jobs/{job_id}` until `succeeded`, or follow it as a stream. See

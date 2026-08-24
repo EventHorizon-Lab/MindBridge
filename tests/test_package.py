@@ -198,6 +198,7 @@ SCENARIOS: dict[str, tuple[str, ...]] = {
         "cli",
         "consolidation_cli",
         "infrastructure",
+        "jina_server",
         "jobs_cli",
         "lifecycle_cli",
         "models",
@@ -212,12 +213,12 @@ SCENARIOS: dict[str, tuple[str, ...]] = {
 UNION_EXTRAS = frozenset({"all"})
 """Extras that only re-export other extras, so no module and no distribution is theirs."""
 
-ARTIFACT_EXTRAS = frozenset({"cloud-models", "vllm-server"})
+ARTIFACT_EXTRAS = frozenset({"cloud-models"})
 """Extras that carry weights and decoders rather than serving a subtree of their own.
 
 `cloud-models` is reached only through lazy imports -- `models/jina.py` and
 `media/clipping.py` raise `ModelUnavailableError` naming it -- so no module is import-broken
-without it. `vllm-server` installs an external service binary. Neither owns a product module.
+without it and it owns no scenario.
 """
 
 PROVIDERS: dict[str, str] = {
@@ -256,6 +257,7 @@ PROVIDERS: dict[str, str] = {
     "starlette": "starlette",
     "torch": "torch",
     "transformers": "transformers",
+    "uvicorn": "uvicorn",
 }
 """Import name to the distribution that provides it, spelled as `pyproject.toml` spells it."""
 
@@ -268,13 +270,8 @@ platforms, so `edge/identity_inference.py` and `edge/identity_diarization.py` im
 lazily and raise `ModelUnavailableError` naming the platform requirement.
 """
 
-RUNTIME_ONLY = frozenset({"torchaudio", "torchcodec", "torchvision", "uvicorn", "vllm"})
-"""Declared dependencies that nothing in this repository imports, and why they stay.
-
-`uvicorn` and `vllm` are service commands run by `docs/deployment.md`; `torchaudio` and
-`torchcodec` are vLLM runtime requirements. `torchvision` is loaded by Jina Omni's own Qwen3-VL
-processor, which swallows the ImportError and embeds text-only.
-"""
+RUNTIME_ONLY = frozenset({"torchvision"})
+"""Dependency Jina's Qwen3-VL processor imports itself rather than through MindBridge."""
 
 
 @cache
