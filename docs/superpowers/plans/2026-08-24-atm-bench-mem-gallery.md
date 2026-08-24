@@ -1320,7 +1320,8 @@ git commit -m "Cover ATM-Bench and Mem-Gallery in the dataset smoke"
 - Produces: `ATM_BENCH_QUERY_PROMPT`, `MEM_GALLERY_QUERY_PROMPT`,
   `MEM_GALLERY_REFUSAL_PROMPT`, `MEM_GALLERY_CONFLICT_PROMPT`,
   `MEM_GALLERY_SEARCH_PROMPT`, all `PromptSpec`, all appended to `BENCHMARK_PROMPTS`.
-  `def mem_gallery_format_constraint(point: str) -> str | None`.
+  `def mem_gallery_format_constraint(point: str) -> str` — returns the constraint already
+  prefixed with `\n\n`, or empty text where the task type has none.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1359,12 +1360,14 @@ MEM_GALLERY_QUERY_PROMPT = PromptSpec(
     purpose="Apply the official Mem-Gallery concise-answer instruction.",
     used_by="mindbridge.benchmarks.mem_gallery_runner._question_query",
     text=(
-        "Your task is to answer the question about the conversation in a concise manner "
-        "with the help of memory content. Please only provide the content of the answer, "
-        "without including introductory phrases like 'answer:'. For questions that require "
-        "answering a date or time, strictly follow the format and provide a specific date "
-        "or time whenever possible. Generate answers primarily concise, yet complete enough "
-        "to accurately answer the questions.\n\n"
+        "Your task is to answer the question about the conversation between {speaker_a} "
+        "and {speaker_b} in a concise manner with the help of memory content.\n"
+        "Please only provide the content of the answer, without including introductory "
+        "phrases like 'answer:'.\n"
+        "For questions that require answering a date or time, strictly follow the format "
+        "and provide a specific date or time whenever possible.\n"
+        "Generate answers primarily concise, yet complete enough to accurately answer the "
+        "questions.\n\n"
         "The current question is as follows:\n{question} {format_constraint}"
     ),
 )
@@ -1412,13 +1415,19 @@ _MEM_GALLERY_CONSTRAINTS = {
 
 
 def mem_gallery_format_constraint(point: str) -> str:
-    """Return the official constraint text for one task type, empty where it has none.
+    """Return one task type's official constraint, already separated, or empty text.
 
     The official runner applies a constraint file for `AR`, `CD` and `VS` only; the other
-    six task types are asked without one, and adding one would change the task.
+    six task types are asked without one, and adding one would change the task. It also
+    prefixes the constraint with a blank line -- `format_constraint_str = "\\n\\n" +
+    format_constraint` -- and interpolates it after a literal space, so a constrained
+    question renders as its own paragraph. The separator belongs here rather than in the
+    template, because this is the only place that knows whether a constraint exists at all,
+    and it keeps each `PromptSpec.text` byte-identical to the upstream `.txt` file it
+    reproduces.
     """
     prompt = _MEM_GALLERY_CONSTRAINTS.get(point.upper())
-    return prompt.text if prompt is not None else ""
+    return f"\n\n{prompt.text}" if prompt is not None else ""
 ```
 
 Then extend the tuple:
@@ -2861,6 +2870,15 @@ async def test_official_constraints_are_applied_only_to_ar_cd_and_vs() -> None:
     search_query = api.recall_requests[1].query.text or ""
     assert "Return the image_id" not in factual_query
     assert "Return the image_id" in search_query
+    # The official wording names the speakers, and the constraint arrives as its own
+    # paragraph rather than trailing the question on one line.
+    assert "between user (Maya) and assistant" in factual_query
+    assert search_query.endswith(
+        "\n\nReturn the image_id of the image(s). If there are "
+        "multiple images, sort them in ascending order and separate "
+        "them by commas. Format example: \u201cD2:IMG_003, "
+        "D2:IMG_010, D10:IMG_002\u201d (for format reference only)."
+    )
 
 
 async def test_clue_recall_counts_rounds_the_recall_actually_returned() -> None:
@@ -3163,7 +3181,7 @@ async def _answer_question(
             RecallRequest(
                 tenant_id=tenant_id,
                 query=RecallQuery(
-                    text=_question_query(question),
+                    text=_question_query(topic, question),
                     media_object_ids=(
                         () if question_image is None else (question_image.media_object_id,)
                     ),
@@ -3196,8 +3214,17 @@ async def _answer_question(
     )
 
 
-def _question_query(question: MemGalleryQuestion) -> str:
+def _question_query(topic: MemGalleryTopic, question: MemGalleryQuestion) -> str:
+    """Reproduce the official query, including the speaker framing it names.
+
+    Upstream resolves `speaker_a` to `user (<persona name>)` and `speaker_b` to
+    `assistant`, so which persona the dialogue belongs to is part of what the model is
+    asked. The adapter already carries that name, so dropping the clause would tell the
+    model less than the benchmark tells its own baselines.
+    """
     return MEM_GALLERY_QUERY_PROMPT.text.format(
+        speaker_a=f"user ({topic.profile.name})",
+        speaker_b="assistant",
         question=question.question,
         format_constraint=mem_gallery_format_constraint(question.point),
     )
