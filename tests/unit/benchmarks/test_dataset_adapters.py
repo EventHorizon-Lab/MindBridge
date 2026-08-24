@@ -22,6 +22,7 @@ from mindbridge.benchmarks.egomem_reason import load_egomem_reason
 from mindbridge.benchmarks.egotempo import load_egotempo
 from mindbridge.benchmarks.locomo_refined import load_locomo_refined
 from mindbridge.benchmarks.m3_bench import load_m3_bench
+from mindbridge.benchmarks.mem_gallery import load_mem_gallery, load_mem_gallery_topic
 from mindbridge.benchmarks.memlens import load_memlens, load_memlens_agent_subset
 from mindbridge.benchmarks.mm_lifelong import MMLifelongSplit, load_mm_lifelong
 from mindbridge.benchmarks.supermemory_vqa import load_supermemory_vqa
@@ -804,3 +805,121 @@ def test_atm_memory_chunks_keep_every_chunk_addressable_and_within_the_limit() -
     assert all(len(chunk) <= 2_048 for chunk in chunks)
     assert all(chunk.startswith("ID: 20220703_210745\n") for chunk in chunks)
     assert "Part 1/5" in chunks[0]
+
+
+def _mem_gallery_topic_payload() -> dict[str, object]:
+    return {
+        "character_profile": {
+            "name": "Maya",
+            "persona_summary": "A part-time librarian who took up baking.",
+            "traits": ["curious", "earnest"],
+            "conversation_style": "Inquisitive and earnest.",
+        },
+        "multi_session_dialogues": [
+            {
+                "session_id": "D1",
+                "date": "2024-06-24",
+                "dialogues": [
+                    {
+                        "round": "D1:1",
+                        "user": "Can you tell me the basics of handmade baking?",
+                        "assistant": "Start with an oven of 30 litres or more.",
+                    },
+                    {
+                        "round": "D1:2",
+                        "user": "What is in this picture?",
+                        "assistant": "A tray of shortbread.",
+                        "image_id": ["D1:IMG_001"],
+                        "input_image": ["../image/Baking/D1_IMG_001.jpg"],
+                        "image_caption": ["A tray of pale shortbread fingers."],
+                    },
+                ],
+            }
+        ],
+        "human-annotated QAs": [
+            {
+                "point": "FR",
+                "question": "What oven size was recommended?",
+                "answer": "30 litres or more.",
+                "session_id": ["D1"],
+                "clue": ["D1:1"],
+            },
+            {
+                "point": "TTL",
+                "question": "What species of plant is shown in the picture?",
+                "question_image": "../image/Baking/QA_IMG_001.jpg",
+                "answer": "Foxglove",
+                "session_id": ["D1"],
+                "clue": ["D1:2"],
+                "image_caption": "Cluster of purple bell-shaped flowers.",
+            },
+        ],
+    }
+
+
+def test_mem_gallery_adapter_reads_sessions_rounds_and_question_images(tmp_path: Path) -> None:
+    topic_path = tmp_path / "Baking_Dessert_Daily_Life_Skill.json"
+    topic_path.write_text(json.dumps(_mem_gallery_topic_payload()), encoding="utf-8")
+
+    topic = load_mem_gallery_topic(topic_path)
+
+    assert topic.topic == "Baking_Dessert_Daily_Life_Skill"
+    assert topic.profile.name == "Maya"
+    assert topic.sessions[0].session_id == "D1"
+    assert topic.sessions[0].occurred_at == datetime(2024, 6, 24, tzinfo=timezone.utc)
+    assert topic.sessions[0].rounds[0].image_id is None
+    assert topic.sessions[0].rounds[1].image_id == "D1:IMG_001"
+    assert topic.sessions[0].rounds[1].image_path == "../image/Baking/D1_IMG_001.jpg"
+    assert topic.questions[0].question_id == "Baking_Dessert_Daily_Life_Skill:1"
+    assert topic.questions[0].point == "FR"
+    assert topic.questions[0].clue_round_ids == ("D1:1",)
+    assert topic.questions[1].question_image_path == "../image/Baking/QA_IMG_001.jpg"
+    assert topic.questions[1].question_image_caption == "Cluster of purple bell-shaped flowers."
+
+
+def test_mem_gallery_adapter_refuses_unknown_points_and_dangling_clues(tmp_path: Path) -> None:
+    unknown_point = _mem_gallery_topic_payload()
+    qas = unknown_point["human-annotated QAs"]
+    assert isinstance(qas, list)
+    qas[0]["point"] = "ZZ"
+    unknown_path = tmp_path / "unknown.json"
+    unknown_path.write_text(json.dumps(unknown_point), encoding="utf-8")
+    with pytest.raises(ValueError, match="unknown Mem-Gallery point"):
+        load_mem_gallery_topic(unknown_path)
+
+    dangling = _mem_gallery_topic_payload()
+    dangling_qas = dangling["human-annotated QAs"]
+    assert isinstance(dangling_qas, list)
+    dangling_qas[0]["clue"] = ["D9:7"]
+    dangling_path = tmp_path / "dangling.json"
+    dangling_path.write_text(json.dumps(dangling), encoding="utf-8")
+    with pytest.raises(ValueError, match="clue names an unknown round"):
+        load_mem_gallery_topic(dangling_path)
+
+
+def test_mem_gallery_adapter_refuses_a_round_carrying_more_than_one_image(
+    tmp_path: Path,
+) -> None:
+    payload = _mem_gallery_topic_payload()
+    sessions = payload["multi_session_dialogues"]
+    assert isinstance(sessions, list)
+    sessions[0]["dialogues"][1]["input_image"] = ["a.jpg", "b.jpg"]
+    sessions[0]["dialogues"][1]["image_id"] = ["D1:IMG_001", "D1:IMG_002"]
+    path = tmp_path / "two_images.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="exactly one image"):
+        load_mem_gallery_topic(path)
+
+
+def test_mem_gallery_directory_loader_keeps_sorted_topic_order(tmp_path: Path) -> None:
+    directory = tmp_path / "dialog"
+    directory.mkdir()
+    for name in ("Zebra_Topic", "Apple_Topic"):
+        (directory / f"{name}.json").write_text(
+            json.dumps(_mem_gallery_topic_payload()), encoding="utf-8"
+        )
+
+    topics = load_mem_gallery(directory)
+
+    assert tuple(topic.topic for topic in topics) == ("Apple_Topic", "Zebra_Topic")
