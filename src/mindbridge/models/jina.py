@@ -26,7 +26,6 @@ from mindbridge.models._vectors import validate_embedding_vector
 from mindbridge.models.compute import select_torch_device
 from mindbridge.models.defaults import (
     DEFAULT_EMBEDDER_MODEL_ID,
-    DEFAULT_EMBEDDER_REVISION,
     DEFAULT_EMBEDDING_DIMENSION,
     DEFAULT_EMBEDDING_SPACE,
     MatryoshkaDimension,
@@ -63,11 +62,9 @@ class _SentenceTransformerFactory(Protocol):
         self,
         model_name_or_path: str,
         *,
-        revision: str,
         trust_remote_code: bool,
         device: str | None,
         model_kwargs: dict[str, str],
-        config_kwargs: dict[str, str],
     ) -> _SentenceEncoder: ...
 
 
@@ -116,20 +113,30 @@ class JinaEmbedder:
         self._model_reference = model_reference
         self._space_reference = space_reference
         self._dimension = dimension
-        self._semaphore = asyncio.Semaphore(max_concurrency)
+        self._document_semaphore = asyncio.Semaphore(max_concurrency)
+        # A query is one short string a caller is waiting on; a document batch is bulk work
+        # nobody is watching. Sharing one semaphore made an interactive recall queue behind
+        # whatever ingest was running: an empty recall, with no memories and no generation at
+        # all, took 57-71 s against a 12.4 s idle baseline during the 2026-08-21 evaluation.
+        # The query lane is its own single slot rather than a reservation out of
+        # `max_concurrency`, because that value defaults to 1 and carving a slot out of it
+        # would leave documents none. Its price is a ceiling of `max_concurrency + 1`
+        # concurrent encodes wherever one process both queries and ingests -- one encode's
+        # worth of activation memory beyond what the Worker's VRAM guard estimates, which
+        # counts resident weights only and says so.
+        self._query_semaphore = asyncio.Semaphore(1)
 
     @classmethod
     def load(
         cls,
         *,
-        revision: str,
         model_id: str = DEFAULT_EMBEDDER_MODEL_ID,
         device: str | None = None,
         space_reference: EmbeddingSpaceReference = DEFAULT_EMBEDDING_SPACE,
         dimension: int = DEFAULT_EMBEDDING_DIMENSION,
         max_concurrency: int = 1,
     ) -> JinaEmbedder:
-        """Load a pinned upstream model without exposing training operations."""
+        """Load the upstream model without exposing training operations."""
         try:
             module = import_module("sentence_transformers")
             hub_module = import_module("huggingface_hub")
@@ -142,21 +149,19 @@ class JinaEmbedder:
             module.SentenceTransformer,
         )
         snapshot_download = cast(Callable[..., str], hub_module.snapshot_download)
-        model_path = snapshot_download(repo_id=model_id, revision=revision)
+        model_path = snapshot_download(repo_id=model_id)
         selected_device = select_torch_device(device)
         encoder = sentence_transformer(
             model_path,
-            revision=revision,
             trust_remote_code=True,
             device=selected_device,
-            model_kwargs={"modality": "omni", "code_revision": revision},
-            config_kwargs={"code_revision": revision},
+            model_kwargs={"modality": "omni"},
         )
         if _media_processor_missing(encoder):
             raise ModelUnavailableError(_MISSING_PROCESSOR)
         return cls(
             encoder,
-            ModelReference(model_id=model_id, revision=revision),
+            ModelReference(model_id=model_id),
             space_reference=space_reference,
             dimension=dimension,
             max_concurrency=max_concurrency,
@@ -170,12 +175,13 @@ class JinaEmbedder:
     @operation_span("mindbridge.model.embed")
     async def embed(self, request: EmbedRequest) -> EmbedResult:
         """Encode a homogeneous query or document batch."""
-        encode = (
-            self._encoder.encode_query
-            if request.task is EmbedTask.QUERY
-            else self._encoder.encode_document
+        is_query = request.task is EmbedTask.QUERY
+        encode = self._encoder.encode_query if is_query else self._encoder.encode_document
+        vectors = await self._encode(
+            request.inputs,
+            encode,
+            self._query_semaphore if is_query else self._document_semaphore,
         )
-        vectors = await self._encode(request.inputs, encode)
         return EmbedResult(
             embeddings=tuple(
                 Embedding(
@@ -191,20 +197,19 @@ class JinaEmbedder:
         self,
         inputs: tuple[ModelInput, ...],
         encode: Callable[..., _EmbeddingMatrix],
+        semaphore: asyncio.Semaphore,
     ) -> tuple[tuple[float, ...], ...]:
         if not inputs:
             return ()
         set_current_span_attributes(
             {
                 "mindbridge.model.id": self._model_reference.model_id,
-                "mindbridge.model.revision": self._model_reference.revision,
                 "mindbridge.embedding.space_id": self._space_reference.space_id,
-                "mindbridge.embedding.space_revision": self._space_reference.revision,
                 "mindbridge.embedding.dimension": self._dimension,
                 "mindbridge.embedding.input_count": len(inputs),
             }
         )
-        async with self._semaphore:
+        async with semaphore:
             matrix = await asyncio.to_thread(
                 encode,
                 cast(list[object], [_jina_input(item) for item in inputs]),
@@ -222,12 +227,8 @@ class JinaEmbedder:
 
 class _EmbedderConfig(PluginConfigModel):
     model_id: PluginText = DEFAULT_EMBEDDER_MODEL_ID
-    # Spelled model_revision like every other plugin's configuration so one deployment does
-    # not have to remember two names for the pinned model revision.
-    model_revision: PluginText = DEFAULT_EMBEDDER_REVISION
     device: PluginText | None = None
     space_id: PluginText = DEFAULT_EMBEDDING_SPACE.space_id
-    space_revision: PluginText = DEFAULT_EMBEDDING_SPACE.revision
     dimension: MatryoshkaDimension = DEFAULT_EMBEDDING_DIMENSION
     max_concurrency: PluginInteger = 1
 
@@ -237,12 +238,8 @@ def create_embedder(config: Mapping[str, object]) -> JinaEmbedder:
     validated = _EmbedderConfig.model_validate(config)
     return JinaEmbedder.load(
         model_id=validated.model_id,
-        revision=validated.model_revision,
         device=validated.device,
-        space_reference=EmbeddingSpaceReference(
-            space_id=validated.space_id,
-            revision=validated.space_revision,
-        ),
+        space_reference=EmbeddingSpaceReference(space_id=validated.space_id),
         dimension=validated.dimension,
         max_concurrency=validated.max_concurrency,
     )

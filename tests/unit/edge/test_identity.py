@@ -1,6 +1,7 @@
 """Checks for encrypted, bounded, and forgettable device identity learning."""
 
 import sqlite3
+from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -21,9 +22,9 @@ from mindbridge.edge import (
 )
 
 NOW = datetime(2026, 8, 12, 12, 0, tzinfo=timezone.utc)
-MODEL = ModelReference(model_id="insightface/buffalo_l", revision="1.0.1")
-VOICE_MODEL = ModelReference(model_id="3d-speaker/eres2netv2", revision="v1.0.1")
-ASSOCIATION_MODEL = ModelReference(model_id="lr-asd", revision="ijcv-2025")
+MODEL = ModelReference(model_id="insightface/buffalo_l")
+VOICE_MODEL = ModelReference(model_id="3d-speaker/eres2netv2")
+ASSOCIATION_MODEL = ModelReference(model_id="lr-asd")
 
 
 def test_identity_memory_matches_learns_and_encrypts_samples(tmp_path: Path) -> None:
@@ -61,7 +62,7 @@ def test_identity_memory_matches_learns_and_encrypts_samples(tmp_path: Path) -> 
     assert cloud_identity.visual_bbox_xyxy == (0.1, 0.2, 0.4, 0.8)
     assert "embedding" not in cloud_identity.model_dump()
     assert database_path.stat().st_mode & 0o777 == 0o600
-    with sqlite3.connect(database_path) as connection:
+    with closing(sqlite3.connect(database_path)) as connection, connection:
         retained = connection.execute(
             "SELECT encrypted_embedding FROM edge_identity_templates WHERE identity_id = ?",
             (first.identity_id,),
@@ -263,6 +264,71 @@ def test_face_voice_association_requires_repeatable_unambiguous_evidence(tmp_pat
     assert _resolve(memory, voice).identity_id == face.identity_id
     assert memory.forget_observation("tenant_01", "face_enrollment") == 1
     assert _resolve(memory, voice).identity_id == voice.identity_id
+
+
+def test_a_device_upgraded_from_a_revision_keyed_store_can_still_learn(tmp_path: Path) -> None:
+    """A device carrying the old schema must not meet a NOT NULL column that no writer fills."""
+    database_path = tmp_path / "edge.sqlite3"
+    with closing(sqlite3.connect(database_path)) as connection, connection:
+        connection.executescript(
+            """
+            CREATE TABLE edge_identity_templates (
+                tenant_id TEXT NOT NULL,
+                device_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                identity_id TEXT NOT NULL,
+                source_observation_id TEXT NOT NULL,
+                sample_id TEXT NOT NULL,
+                model_id TEXT NOT NULL,
+                model_revision TEXT NOT NULL,
+                dimension INTEGER NOT NULL,
+                nonce BLOB NOT NULL,
+                encrypted_embedding BLOB NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (
+                    tenant_id, device_id, kind, model_id, model_revision, sample_id
+                )
+            );
+            CREATE INDEX edge_identity_match_idx
+                ON edge_identity_templates (
+                    tenant_id, device_id, kind, model_id, model_revision, dimension, identity_id
+                );
+            CREATE TABLE edge_face_voice_evidence (
+                tenant_id TEXT NOT NULL,
+                device_id TEXT NOT NULL,
+                association_model_id TEXT NOT NULL,
+                association_model_revision TEXT NOT NULL,
+                evidence_id TEXT NOT NULL,
+                source_observation_id TEXT NOT NULL,
+                face_identity_id TEXT NOT NULL,
+                voice_identity_id TEXT NOT NULL,
+                start_ms INTEGER NOT NULL,
+                end_ms INTEGER NOT NULL,
+                confidence REAL NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (
+                    tenant_id, device_id, association_model_id,
+                    association_model_revision, evidence_id
+                )
+            );
+            """
+        )
+
+    memory = SQLiteIdentityMemory(
+        database_path,
+        device_id="robot_01",
+        encryption_key=AESGCM.generate_key(bit_length=256),
+        clock=lambda: NOW,
+    )
+    match = memory.recognize_and_remember(_sample("sample_01", (1.0, 0.0)), minimum_similarity=0.8)
+
+    assert match.enrolled_new is True
+    with closing(sqlite3.connect(database_path)) as connection, connection:
+        for table in ("edge_identity_templates", "edge_face_voice_evidence"):
+            columns = {
+                str(row[1]) for row in connection.execute(f"PRAGMA table_info({table})").fetchall()
+            }
+            assert not {name for name in columns if "revision" in name}
 
 
 def _sample(

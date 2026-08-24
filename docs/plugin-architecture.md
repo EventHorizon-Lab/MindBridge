@@ -48,9 +48,16 @@ encoders aligned without creating multiple Embedder interfaces.
 `Embedder` additionally declares `space_reference`, the search space every vector it produces
 belongs to. Declaring it before the first call is what lets a process that composes more than one
 Embedder reject a mismatch during construction instead of writing vectors that silently never
-match at recall. A plugin that omits `space_reference` fails the capability check at load time: the
-protocol member raises rather than returning a `None` that a subclass would inherit and that would
-make the space guards compare equal and pass vacuously.
+match at recall. A plugin that omits `space_reference` fails at load time: the protocol member
+raises rather than returning a `None` that a subclass would inherit and that would make the space
+guards compare equal and pass vacuously.
+
+That rejection comes from `load_embedder` reading the member, not from the capability check beside
+it. Since Python 3.12 `isinstance` resolves a protocol's members statically instead of reading
+them, so a plugin that subclasses `Embedder` and inherits the raising body satisfies the structural
+check on every version this package supports. Reading the member is what still refuses it, and
+doing so in the loader is what keeps the refusal at load time rather than at whichever call site
+reads the space first.
 
 ## Discovery
 
@@ -130,8 +137,8 @@ knob to a plugin schema does not widen the deployment surface. `MINDBRIDGE_MEDIA
 the one deliberate exception: it selects hardware rather than model behaviour, and routing it through
 `select_torch_device` turns a missing GPU into a startup failure instead of a silent fall back to CPU.
 
-Both embedding plugins spell the pinned model revision `model_revision` in their configuration
-objects. `PluginConfigModel` sets `extra="forbid"`, so a stale key such as `revision` fails the
+Both embedding plugins spell the model they load `model_id` in their configuration objects.
+`PluginConfigModel` sets `extra="forbid"`, so a stale key such as `model_revision` fails the
 factory at startup rather than being ignored.
 
 Benchmark runners require `--deployment-config`. The referenced JSON records every selected server

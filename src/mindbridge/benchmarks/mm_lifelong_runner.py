@@ -107,6 +107,7 @@ class MMLifelongQuestionResult(ContractModel):
     mindbridge_memory_ids: tuple[Identifier, ...]
     mindbridge_evidence_ids: tuple[Identifier, ...]
     mindbridge_trace_id: Identifier
+    mindbridge_ingest_failure_count: int = Field(default=0, ge=0)
 
 
 def load_prepared_mm_lifelong(path: Path) -> MMLifelongPreparedTimeline:
@@ -148,8 +149,9 @@ async def run_mm_lifelong(
 
     tenant_id = benchmark_tenant_id(tenant_prefix, prepared.split, run_id)
     semaphore = asyncio.Semaphore(request_concurrency)
+    ingest_failures = 0
     for offset in range(0, len(prepared.segments), request_concurrency):
-        await asyncio.gather(
+        outcomes = await asyncio.gather(
             *(
                 _ingest_segment(
                     memory,
@@ -165,8 +167,10 @@ async def run_mm_lifelong(
                 for index, segment in enumerate(
                     prepared.segments[offset : offset + request_concurrency]
                 )
-            )
+            ),
+            return_exceptions=True,
         )
+        ingest_failures += _count_ingest_failures(outcomes)
 
     results = []
     for offset in range(0, len(questions), request_concurrency):
@@ -181,12 +185,23 @@ async def run_mm_lifelong(
                         total_seconds,
                         recall_limit,
                         semaphore,
+                        ingest_failures,
                     )
                     for question in questions[offset : offset + request_concurrency]
                 )
             )
         )
     return tuple(results)
+
+
+def _count_ingest_failures(outcomes: list[BaseException | None]) -> int:
+    """Count the segments that failed so a single bad segment cannot discard its whole timeline.
+
+    A bare gather made the first exception the whole split's result, throwing away every segment
+    already ingested. The count rides along on every answer, so a run still tells missing evidence
+    apart from a wrong answer.
+    """
+    return sum(isinstance(outcome, BaseException) for outcome in outcomes)
 
 
 async def _ingest_segment(
@@ -253,6 +268,7 @@ async def _answer_question(
     total_seconds: float,
     recall_limit: int,
     semaphore: asyncio.Semaphore,
+    ingest_failures: int,
 ) -> MMLifelongQuestionResult:
     async with semaphore:
         recalled = await memory.recall(
@@ -278,6 +294,7 @@ async def _answer_question(
         mindbridge_memory_ids=tuple(item.memory_id for item in recalled.memories),
         mindbridge_evidence_ids=tuple(item.evidence_id for item in recalled.evidence),
         mindbridge_trace_id=recalled.trace_id,
+        mindbridge_ingest_failure_count=ingest_failures,
     )
 
 

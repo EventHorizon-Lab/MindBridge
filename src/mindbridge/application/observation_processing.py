@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from mindbridge.core import (
     Claim,
     DomainInvariantError,
+    EmbeddedObjectType,
     EmbeddingRecord,
     Entity,
     EntityMention,
@@ -202,6 +203,7 @@ def _require_valid_graph(
             "derived events and claims must map one-to-one to memory representations"
         )
     _require_matching_memory_evidence(output, representations)
+    _require_searchable_memories(output)
 
     asserted_claims = {
         target_id
@@ -225,6 +227,25 @@ def _require_valid_graph(
     }
     if mention_edges != expected_mentions:
         raise DomainInvariantError("entity mention rows and graph relations must agree")
+
+
+def _require_searchable_memories(output: ObservationProcessingOutput) -> None:
+    """Every derived memory carries the vector recall looks it up by.
+
+    The write path went the whole 2026-08-21 evaluation without this: 3 336 memories across
+    six audiovisual benchmarks and not one MEMORY_RECORD vector, while every text tenant had
+    them because `remember()` writes its own. Nothing failed, because nothing asked -- recall
+    simply got an empty ID set back from that channel and two of its four store lookups
+    returned nothing. A guard is the only thing that turns that back into a failure, since a
+    missing vector is invisible in every record this output otherwise validates.
+    """
+    embedded_memory_ids = {
+        embedding.object_id
+        for embedding in output.embeddings
+        if embedding.object_type is EmbeddedObjectType.MEMORY_RECORD
+    }
+    if {str(memory.memory_id) for memory in output.memories} != embedded_memory_ids:
+        raise DomainInvariantError("each derived memory must carry exactly one searchable vector")
 
 
 def _require_matching_memory_evidence(

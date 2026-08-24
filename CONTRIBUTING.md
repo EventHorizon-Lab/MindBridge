@@ -8,8 +8,15 @@ Repository conventions that apply to automated agents as well as people are in
 
 ## Setup
 
-MindBridge supports Python 3.10 and 3.11. 3.10 is the compatibility floor because several edge
-platform images — JetPack, D-Robotics RDK, Rockchip RKNN — still ship it.
+MindBridge supports Python 3.10 through 3.14, and CI runs the whole gate on every one of
+them. 3.10 is the compatibility floor because several edge platform images — JetPack,
+D-Robotics RDK, Rockchip RKNN — still ship it. The ceiling is the newest release the matrix
+covers, so raising it means adding a leg and reading what it says, not editing one number.
+
+Test 3.14 against a released build. A `uv` old enough to offer only `3.14.0b3` fails the whole
+suite at collection — b3's private `typing._eval_type` has no `prefer_fwd_module` parameter, which
+Pydantic passes — and that says nothing about this tree. `uv python install 3.14` on a current uv,
+or a conda-forge `python=3.14.x`, both work.
 
 The project uses [uv](https://docs.astral.sh/uv/) with a checked-in `uv.lock`. That lockfile is
 authoritative; `pip install -e .` will not reproduce it.
@@ -24,6 +31,9 @@ That is the set CI installs, so the clipping tests run here rather than skipping
 exact sync: to add the local Jina embedder, extend that same command with `--extra cloud-models`
 rather than syncing it alone, which would uninstall everything above. It pulls torch, so skip it
 unless you need it.
+
+For the cu129 vLLM embedding endpoint used by RTX 5090 workstations, also add
+`--extra vllm-server`. This keeps `.venv/bin/vllm` and its matching Torch build in the exact sync.
 
 For everything at once — every scenario plus the benchmark harness and the local models:
 
@@ -56,9 +66,12 @@ uv run pytest -W error
 git diff --check
 ```
 
-`mypy` runs in **strict** mode over `src` and `tests`. Ruff enforces `ANN`, `ASYNC`, `B`, `C4`,
-`C90`, `DTZ`, `E4`, `E7`, `E9`, `F`, `I`, `RUF`, `SIM`, and `UP`, with a McCabe complexity ceiling
-of 10 and a 100-character line length.
+`mypy` runs in **strict** mode over `src` and `tests`, targeting whichever interpreter invokes
+it rather than a pinned version, so each matrix leg checks the branches its own version takes.
+Ruff's `target-version = "py310"` is what holds the tree to syntax the floor can parse.
+
+Ruff enforces `ANN`, `ASYNC`, `B`, `C4`, `C90`, `DTZ`, `E4`, `E7`, `E9`, `F`, `I`, `RUF`, `SIM`,
+and `UP`, with a McCabe complexity ceiling of 10 and a 100-character line length.
 
 `ANN401` bans `Any` in signatures. When you genuinely need to accept a structural type, write a
 `Protocol` shim rather than reaching for `Any`.
@@ -114,6 +127,11 @@ the behaviour regresses:
 | Contract | `tests/contracts/` | Public schemas. |
 | Integration | `tests/integration/` | PostgreSQL and pgvector paths. Mark `pytest.mark.integration`. |
 | Benchmark fixtures | `tests/benchmarks/` | Deterministic recall gates. |
+
+`pytest -W error` is how CI runs, so a warning is a failure. The one that catches people is
+SQLite: `with sqlite3.connect(...)` ends the transaction on exit and leaves the handle open, which
+3.13 and later report as a `ResourceWarning`. Wrap it — `with closing(sqlite3.connect(path)) as
+connection, connection:` — or use `mindbridge.edge._sqlite.connect`, which does both.
 
 There is no numeric coverage threshold. There is a stronger requirement: **prove the test can
 fail.** Break the code deliberately and watch it go red before you trust it. Assertions that

@@ -120,7 +120,6 @@ candidate AS (
      AND peer_vector.object_type = 'entity'
      AND peer_vector.object_id = peer.entity_id
      AND peer_vector.space_id = seed_vector.space_id
-     AND peer_vector.space_revision = seed_vector.space_revision
      AND peer_vector.task = seed_vector.task
     WHERE seed_extent.first_at
               <= peer_extent.last_at + make_interval(secs => %(maximum_gap_seconds)s)

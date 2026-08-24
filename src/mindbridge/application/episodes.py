@@ -203,7 +203,6 @@ def _episode_event(
                 "episode",
                 tenant_id,
                 model_reference.model_id,
-                model_reference.revision,
                 prompt_version,
                 created_at.isoformat(),
                 *sorted(str(event_id) for event_id in proposal.event_ids),
@@ -328,7 +327,6 @@ def _episode_write(
                     EmbeddedObjectType.EVENT.value,
                     episode.event_id,
                     embedding.model_reference.model_id,
-                    embedding.model_reference.revision,
                     EmbedTask.DOCUMENT.value,
                 )
             ),

@@ -31,6 +31,7 @@ from mindbridge.contracts import (
     RememberRequest,
 )
 from mindbridge.core import JobState, MediaKind
+from mindbridge.sdk import MindBridgeError
 
 ORIGIN = datetime(2026, 1, 1, tzinfo=timezone.utc)
 
@@ -85,6 +86,25 @@ class RecordingMemoryApi:
         self.calls.append(f"remember:{request.summary}")
         self.remember_requests.append(request)
         return object()
+
+
+class IngestFailingMemoryApi(RecordingMemoryApi):
+    """Fail one clip's ingestion permanently, the way a clip the perceiver cannot read does."""
+
+    def __init__(self, failing_sequence: int) -> None:
+        super().__init__()
+        self.failing_sequence = failing_sequence
+
+    async def observe(self, request: ObserveRequest) -> ObservationReceipt:
+        if request.sequence == self.failing_sequence:
+            self.calls.append(f"observe_failed:{request.sequence}")
+            raise MindBridgeError(
+                "clip could not be observed",
+                code="model_request_failed",
+                status_code=502,
+                trace_id="trace_ingest_error",
+            )
+        return await super().observe(request)
 
 
 async def test_egolife_answers_before_ingesting_a_clip_that_crosses_query_time() -> None:
@@ -343,6 +363,52 @@ async def test_egomem_reason_reuses_causal_stream_and_supports_ten_options() -> 
     assert "J. Choice 9" in api.recall_requests[0].query.text
     assert [result.example_id for result in results] == [2, 1]
     assert [result.predicted_answer for result in results] == ["B", "B"]
+
+
+async def test_egolife_batch_survives_one_clip_that_never_ingests() -> None:
+    """A dead clip used to cancel its batch and abort every question behind it."""
+    api = IngestFailingMemoryApi(0)
+
+    results = await run_egolife_qa(
+        cast(MindBridge, api),
+        (_question("q_late", "10010000"),),
+        _prepared_stream(),
+        run_id="run_01",
+        poll_interval_seconds=0.001,
+    )
+
+    assert [request.sequence for request in api.observe_requests] == [1]
+    assert "job:job_1" in api.calls
+    assert results[0].model_option == "B"
+    assert results[0].mindbridge_ingest_failure_count == 1
+
+
+async def test_egomem_reason_batch_survives_one_clip_that_never_ingests() -> None:
+    """EgoMemReason fans out its own clips, so it needs its own accounting."""
+    api = IngestFailingMemoryApi(0)
+    question = EgoMemReasonQuestion(
+        example_id=1,
+        question_id="A1_JAKE_1",
+        identity="A1_JAKE",
+        query_time="DAY1, 10:01:00",
+        query_offset_ms=36_060_000,
+        question="Which choice is correct?",
+        choices=("Choice 0", "Choice 1", "Choice 2", "Choice 3"),
+        query_type="Event Ordering",
+    )
+
+    results = await run_egomem_reason(
+        cast(MindBridge, api),
+        (question,),
+        _prepared_stream(),
+        run_id="run_01",
+        poll_interval_seconds=0.001,
+    )
+
+    assert [request.sequence for request in api.observe_requests] == [1]
+    assert "job:job_1" in api.calls
+    assert results[0].predicted_answer == "B"
+    assert results[0].mindbridge_ingest_failure_count == 1
 
 
 def _question(question_id: str, timecode: str) -> EgoLifeQuestion:

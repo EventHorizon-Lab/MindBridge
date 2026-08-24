@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Literal, TypeVar
 from urllib.parse import quote
@@ -25,6 +25,8 @@ from mindbridge.contracts import (
     ObserveRequest,
     RecallRequest,
     RecallResult,
+    RememberBatchRequest,
+    RememberBatchResult,
     RememberRequest,
     RememberResult,
 )
@@ -100,6 +102,24 @@ class MindBridge:
     async def remember(self, request: RememberRequest) -> RememberResult:
         """Retain one explicit memory, reporting whether this call is what created it."""
         return await self._post("v1/memories", request, RememberResult)
+
+    async def remember_many(
+        self,
+        requests: Sequence[RememberRequest],
+    ) -> tuple[RememberResult, ...]:
+        """Retain up to 100 memories in one call, and so in one encoder round trip.
+
+        A caller already holding N memories should hand over all N: the server encodes the
+        whole batch in one request to its embedder instead of N, which is the difference
+        between one round trip and N for the same work. Results come back in request order,
+        each with its own `created` or `duplicate` status.
+        """
+        result = await self._post(
+            "v1/memories/batch",
+            RememberBatchRequest(memories=tuple(requests)),
+            RememberBatchResult,
+        )
+        return result.memories
 
     async def record_feedback(self, request: FeedbackRequest) -> FeedbackReceipt:
         """Record one useful, wrong, missing, or correction signal."""

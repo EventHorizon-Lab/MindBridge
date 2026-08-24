@@ -13,7 +13,7 @@ from typing import Any, cast
 if sys.version_info >= (3, 11):
     import tomllib
 else:
-    # tomllib landed in 3.11. On the 3.10 half of the matrix mypy itself requires the
+    # tomllib landed in 3.11. On the 3.10 leg of the matrix mypy itself requires the
     # tomli backport, so it is present wherever the dev group that runs this test is.
     import tomli as tomllib
 
@@ -210,6 +210,7 @@ SCENARIOS: dict[str, tuple[str, ...]] = {
         "cli",
         "consolidation_cli",
         "infrastructure",
+        "jobs_cli",
         "lifecycle_cli",
         "models",
         "server",
@@ -223,12 +224,12 @@ SCENARIOS: dict[str, tuple[str, ...]] = {
 UNION_EXTRAS = frozenset({"all"})
 """Extras that only re-export other extras, so no module and no distribution is theirs."""
 
-ARTIFACT_EXTRAS = frozenset({"cloud-models"})
+ARTIFACT_EXTRAS = frozenset({"cloud-models", "vllm-server"})
 """Extras that carry weights and decoders rather than serving a subtree of their own.
 
 `cloud-models` is reached only through lazy imports -- `models/jina.py` and
 `media/clipping.py` raise `ModelUnavailableError` naming it -- so no module is import-broken
-without it and it owns no scenario.
+without it. `vllm-server` installs an external service binary. Neither owns a product module.
 """
 
 PROVIDERS: dict[str, str] = {
@@ -289,20 +290,21 @@ undeclared dependency. Its `tomli` half is declared and named in `PROVIDERS`; th
 other half, so one conditional import is not read as two missing ones.
 """
 
-RUNTIME_ONLY = frozenset({"torchvision", "uvicorn"})
+RUNTIME_ONLY = frozenset({"torchaudio", "torchcodec", "torchvision", "uvicorn", "vllm"})
 """Declared dependencies that nothing in this repository imports, and why they stay.
 
-`uvicorn` is the ASGI server `docs/deployment.md` runs as a command. `torchvision` is loaded
-by Jina Omni's own Qwen3-VL processor, which swallows the ImportError and embeds text-only.
+`uvicorn` and `vllm` are service commands run by `docs/deployment.md`; `torchaudio` and
+`torchcodec` are vLLM runtime requirements. `torchvision` is loaded by Jina Omni's own Qwen3-VL
+processor, which swallows the ImportError and embeds text-only.
 """
 
 
 @cache
 def _pyproject() -> dict[str, Any]:
-    # The annotation is load-bearing, not decoration. mypy runs as 3.10 and so always reads
-    # the `import tomli as tomllib` branch, but the backport is only installed under that
-    # marker, so on 3.11 the import is unresolved, `ignore_missing_imports` makes `loads`
-    # return `Any`, and returning that straight out trips `no-any-return` on half the matrix.
+    # The annotation is load-bearing, not decoration. mypy checks as the interpreter it runs
+    # on, so which of the two branches above it reads changes with the matrix leg, and
+    # `ignore_missing_imports` makes `loads` return `Any` on any leg where the module it
+    # picked is unresolved -- returning that straight out trips `no-any-return` there.
     parsed: dict[str, Any] = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     return parsed
 
@@ -463,6 +465,33 @@ def _tests_type_checking(test: ast.expr) -> bool:
     return isinstance(test, ast.Name) and test.id == "TYPE_CHECKING"
 
 
+def test_the_extra_the_clip_cutter_names_is_the_one_that_provides_its_decoders() -> None:
+    """A worker installed with `server` alone starts, passes the import probe in this file, and
+    then cannot cut a single clip -- the decoders are imported lazily, so nothing before the first
+    observation says so. That makes the error message the only thing pointing an operator at the
+    fix, and it named `cloud-models` while the decoders had moved to `media`.
+
+    Asserted against the declarations rather than as a string match, so the message cannot drift
+    from where the dependencies actually live.
+    """
+    named = re.findall(
+        r"install MindBridge with the ([a-z-]+) extra",
+        (SOURCE / "media" / "clipping.py").read_text(encoding="utf-8"),
+    )
+    assert named, "the clip cutter must tell an operator which extra to install"
+
+    decoders = {"av", "pillow", "soundfile"}
+    for extra in set(named):
+        provided = {_distribution(item) for item in _extras()[extra]}
+        assert decoders <= provided, (
+            f"clipping.py sends operators to the {extra!r} extra, which declares "
+            f"{sorted(decoders - provided)} nowhere"
+        )
+    # And the reason the message matters at all: the extra a worker is otherwise told to install
+    # does not carry them, so this failure is reachable from the documented command.
+    assert not decoders & {_distribution(item) for item in _extras()["server"]}
+
+
 def test_relative_imports_resolve_against_the_importing_file() -> None:
     """`_absolute_import`'s relative branch has no other cover in this suite.
 
@@ -521,6 +550,42 @@ def test_scenarios_partition_the_package() -> None:
 
     assert unassigned == set()
     assert set(_extras()) == (set(SCENARIOS) - {""}) | ARTIFACT_EXTRAS | UNION_EXTRAS
+
+
+def test_no_docstring_documents_nothing() -> None:
+    """A string under an assignment documents it; anywhere else it documents nothing.
+
+    This codebase carries 31 of these attribute docstrings and treats the reasoning in them
+    as load-bearing, but the syntax is positional: insert a constant between an assignment
+    and its docstring and the docstring silently detaches, leaving a no-op string expression
+    and an undocumented constant. Neither ruff nor mypy reports it, and nothing reads
+    docstrings at runtime, so the loss is invisible -- which is how one got through review.
+    """
+    orphaned = sorted(
+        f"{path.relative_to(ROOT)}:{node.lineno}"
+        for path in _modules(SOURCE, ROOT / "tests")
+        for scope in _documented_scopes(path)
+        for index, node in enumerate(scope)
+        if index and _is_string_expression(node)
+        if not isinstance(scope[index - 1], ast.Assign | ast.AnnAssign)
+    )
+
+    assert orphaned == []
+
+
+def _documented_scopes(path: Path) -> list[list[ast.stmt]]:
+    """The bodies where a bare string is read as documentation: the module and its classes."""
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    classes = [node for node in ast.walk(tree) if isinstance(node, ast.ClassDef)]
+    return [tree.body, *(node.body for node in classes)]
+
+
+def _is_string_expression(node: ast.stmt) -> bool:
+    return (
+        isinstance(node, ast.Expr)
+        and isinstance(node.value, ast.Constant)
+        and isinstance(node.value.value, str)
+    )
 
 
 def _module_name(path: Path) -> str:

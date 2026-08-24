@@ -345,7 +345,7 @@ class _StubGenerator:
         self.requests.append(request)
         return GenerateResult(
             text=self.text,
-            model_reference=ModelReference(model_id="qwen3.8-max", revision="test"),
+            model_reference=ModelReference(model_id="qwen3.8-max"),
         )
 
 
@@ -552,7 +552,7 @@ class _StubGenerator:
     async def generate(self, request):  # noqa: ANN001, ANN201
         return GenerateResult(
             text='{"memories": [{"summary": "Rob moved to Sweden.", "type": "episodic"}]}',
-            model_reference=ModelReference(model_id="qwen3.8-max", revision="test"),
+            model_reference=ModelReference(model_id="qwen3.8-max"),
         )
 
 
@@ -1552,7 +1552,7 @@ Expected: FAIL with `ModuleNotFoundError: No module named 'mindbridge.benchmarks
 1. loads cases for `--benchmark`,
 2. runs them through `run_case` with an `asyncio.Semaphore(--concurrency)` — chunks within one case stay serial inside `run_case`, cases run concurrently,
 3. appends rows to `--output` as JSONL, skipping ids already present so a rerun resumes,
-4. writes a sidecar manifest through `mindbridge.benchmarks.artifacts.sidecar_manifest_path` carrying `source_repository`, `source_revision`, `source_sha256`, `code_revision`, `deployment`, `run_id`, `tenant_prefix`, `recall_limit`, `request_concurrency`, and the `user_id` to `tenant_id` mapping.
+4. writes a sidecar manifest through `mindbridge.benchmarks.artifacts.sidecar_manifest_path` carrying `source_repository`, `source_sha256`, `deployment`, `run_id`, `tenant_prefix`, `recall_limit`, `request_concurrency`, and the `user_id` to `tenant_id` mapping.
 
 Follow the argument and manifest conventions in `src/mindbridge/benchmarks/locomo_cli.py`.
 

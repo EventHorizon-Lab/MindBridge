@@ -30,7 +30,7 @@ from mindbridge.models.openai import OpenAIGenerator, normalize_base_url
 NOW = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
 
 
-async def test_episode_consolidator_inspects_native_evidence_and_preserves_revision() -> None:
+async def test_episode_consolidator_inspects_native_evidence_and_reports_its_model() -> None:
     async def respond(request: httpx.Request) -> httpx.Response:
         payload: dict[str, object] = json.loads(request.content)
         messages = cast(list[dict[str, object]], payload["messages"])
@@ -52,7 +52,7 @@ async def test_episode_consolidator_inspects_native_evidence_and_preserves_revis
                     }
                 ]
             },
-            fingerprint="episode-serving-revision-01",
+            fingerprint="episode-serving-fingerprint-01",
         )
 
     consolidator = _consolidator(respond)
@@ -63,8 +63,8 @@ async def test_episode_consolidator_inspects_native_evidence_and_preserves_revis
         await consolidator.close()
 
     assert result.episodes[0].event_ids == (EventId("event_01"), EventId("event_02"))
-    assert result.model_reference.revision == "deployment-revision"
-    assert result.prompt_version == "consolidate_episodes_v2"
+    assert result.model_reference.model_id == "qwen3.8-max"
+    assert result.prompt_version == "consolidate_episodes_v3"
 
 
 async def test_episode_consolidator_rejects_an_unknown_event_id() -> None:
@@ -121,7 +121,7 @@ async def test_episode_consolidator_retries_invalid_structure_in_json_mode() -> 
 
     async def respond(request: httpx.Request) -> httpx.Response:
         payload: dict[str, object] = json.loads(request.content)
-        response_formats.append(payload.get("response_format"))
+        response_formats.append(_schema_name(payload))
         return _streaming_response(next(responses))
 
     consolidator = _consolidator(respond)
@@ -131,7 +131,7 @@ async def test_episode_consolidator_retries_invalid_structure_in_json_mode() -> 
         await consolidator.close()
 
     assert result.episodes == ()
-    assert response_formats == [None, {"type": "json_object"}]
+    assert response_formats == ["episode_consolidation", "episode_consolidation"]
 
 
 def _consolidator(
@@ -147,7 +147,7 @@ def _consolidator(
     return _EpisodeHarness(
         OpenAIGenerator(
             client,
-            ModelReference(model_id="qwen3.8-max", revision="deployment-revision"),
+            ModelReference(model_id="qwen3.8-max"),
         )
     )
 
@@ -173,7 +173,7 @@ def _candidates() -> tuple[tuple[Event, ...], tuple[ResolvedEvidence, ...]]:
             description=description,
             salience=0.8,
             created_at=NOW,
-            model_reference=ModelReference(model_id="omni", revision="perception-revision"),
+            model_reference=ModelReference(model_id="omni"),
             prompt_version="perceive_events_v3",
         )
         for index, description in enumerate(
@@ -215,6 +215,16 @@ def _evidence(index: int, kind: MediaKind) -> ResolvedEvidence:
         media_url=f"https://objects.example.test/clip_{suffix}.{extension}",
         media_url_expires_at=NOW + timedelta(minutes=5),
     )
+
+
+def _schema_name(payload: dict[str, object]) -> str | None:
+    """Return the schema one request constrained decoding to, or None when unconstrained."""
+    response_format = payload.get("response_format")
+    if not isinstance(response_format, dict) or response_format.get("type") != "json_schema":
+        return None
+    schema = cast(dict[str, object], response_format["json_schema"])
+    assert schema["strict"] is True
+    return cast(str, schema["name"])
 
 
 def _streaming_response(payload: object, *, fingerprint: str | None = None) -> httpx.Response:

@@ -82,8 +82,8 @@ class FirstCandidateAnswerer:
 
 
 class FixedEmbedder:
-    model_reference = ModelReference(model_id="jina-omni", revision="pinned-revision")
-    space_reference = EmbeddingSpaceReference(space_id="jina-v5", revision="space-v1")
+    model_reference = ModelReference(model_id="jina-omni")
+    space_reference = EmbeddingSpaceReference(space_id="jina-v5")
 
     async def embed(self, request: EmbedRequest) -> EmbedResult:
         vector = (1.0,) + (0.0,) * 1_023

@@ -111,6 +111,7 @@ class M3OfficialQuestionResult(ContractModel):
     mindbridge_evidence_ids: tuple[Identifier, ...]
     mindbridge_trace_id: Identifier
     mindbridge_error_code: NonEmptyString | None = None
+    mindbridge_ingest_failure_count: int = Field(default=0, ge=0)
 
 
 def load_prepared_m3(path: Path) -> tuple[M3PreparedVideo, ...]:
@@ -163,8 +164,9 @@ async def run_m3_video(
     answers: dict[str, M3OfficialQuestionResult] = {}
     semaphore = asyncio.Semaphore(request_concurrency)
     next_clip = 0
+    ingest_failures = 0
     for boundary in sorted(value for value in questions_by_boundary if value is not None):
-        await asyncio.gather(
+        outcomes = await asyncio.gather(
             *(
                 _ingest_clip(
                     memory,
@@ -178,8 +180,10 @@ async def run_m3_video(
                     semaphore=semaphore,
                 )
                 for clip in prepared.clips[next_clip : boundary + 1]
-            )
+            ),
+            return_exceptions=True,
         )
+        ingest_failures += _count_ingest_failures(outcomes)
         answers.update(
             await _answer_questions(
                 memory,
@@ -188,11 +192,12 @@ async def run_m3_video(
                 _clip_end(prepared, prepared.clips[boundary]),
                 recall_limit,
                 semaphore,
+                ingest_failures,
             )
         )
         next_clip = boundary + 1
 
-    await asyncio.gather(
+    outcomes = await asyncio.gather(
         *(
             _ingest_clip(
                 memory,
@@ -206,8 +211,10 @@ async def run_m3_video(
                 semaphore=semaphore,
             )
             for clip in prepared.clips[next_clip:]
-        )
+        ),
+        return_exceptions=True,
     )
+    ingest_failures += _count_ingest_failures(outcomes)
 
     answers.update(
         await _answer_questions(
@@ -217,9 +224,21 @@ async def run_m3_video(
             _clip_end(prepared, prepared.clips[-1]),
             recall_limit,
             semaphore,
+            ingest_failures,
         )
     )
     return tuple(answers[question.question_id] for question in annotation.questions)
+
+
+def _count_ingest_failures(outcomes: list[BaseException | None]) -> int:
+    """Count the clips that failed so a single bad clip cannot discard its whole cohort.
+
+    A bare gather made the first exception the whole video's result: two permanently failing
+    clips out of 145 cost 23 questions, 29% of this benchmark's N, and wrote nothing at all for
+    one video. The count rides along on every answer produced after it, so a run still tells
+    missing evidence apart from a wrong answer.
+    """
+    return sum(isinstance(outcome, BaseException) for outcome in outcomes)
 
 
 async def _ingest_clip(
@@ -321,10 +340,13 @@ async def _answer_questions(
     cutoff: AwareDatetime,
     recall_limit: int,
     semaphore: asyncio.Semaphore,
+    ingest_failures: int,
 ) -> dict[str, M3OfficialQuestionResult]:
     results = await asyncio.gather(
         *(
-            _answer_question(memory, tenant_id, question, cutoff, recall_limit, semaphore)
+            _answer_question(
+                memory, tenant_id, question, cutoff, recall_limit, semaphore, ingest_failures
+            )
             for question in questions
         )
     )
@@ -338,6 +360,7 @@ async def _answer_question(
     cutoff: AwareDatetime,
     recall_limit: int,
     semaphore: asyncio.Semaphore,
+    ingest_failures: int,
 ) -> M3OfficialQuestionResult:
     try:
         async with semaphore:
@@ -350,7 +373,15 @@ async def _answer_question(
                 )
             )
     except MindBridgeError as error:
-        if error.code not in {"model_output_invalid", "model_request_failed"}:
+        # `model_unavailable` is the deployment's 60 s gateway timeout under load (~5.5% of
+        # recalls once nine benchmarks share the endpoint). Fatal here discarded every answer
+        # the sweep had already produced; recoverable records the code against this one
+        # question instead, which is counted as infrastructure and never as a wrong answer.
+        if error.code not in {
+            "model_output_invalid",
+            "model_request_failed",
+            "model_unavailable",
+        }:
             raise
         return M3OfficialQuestionResult(
             id=question.question_id,
@@ -365,6 +396,7 @@ async def _answer_question(
             mindbridge_evidence_ids=(),
             mindbridge_trace_id=(error.trace_id or f"trace_model_error_{question.question_id}"),
             mindbridge_error_code=error.code,
+            mindbridge_ingest_failure_count=ingest_failures,
         )
     return M3OfficialQuestionResult(
         id=question.question_id,
@@ -378,6 +410,7 @@ async def _answer_question(
         mindbridge_memory_ids=tuple(memory.memory_id for memory in result.memories),
         mindbridge_evidence_ids=tuple(evidence.evidence_id for evidence in result.evidence),
         mindbridge_trace_id=result.trace_id,
+        mindbridge_ingest_failure_count=ingest_failures,
     )
 
 

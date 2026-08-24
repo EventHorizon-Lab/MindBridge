@@ -60,6 +60,9 @@ OTHER_TENANT_API_KEY = "other-tenant-test-key-00000000000"
 class StubKernel:
     """Protocol stub keeping adapter tests independent from persistence."""
 
+    def __init__(self) -> None:
+        self.batch_sizes: list[int] = []
+
     async def observe(self, request: ObserveRequest) -> ObservationReceipt:
         return ObservationReceipt(
             observation_id="observation_01",
@@ -69,7 +72,14 @@ class StubKernel:
             trace_id="trace_observe",
         )
 
-    async def remember(self, request: RememberRequest) -> RememberResult:
+    async def remember(
+        self,
+        request: RememberRequest | tuple[RememberRequest, ...],
+    ) -> RememberResult | tuple[RememberResult, ...]:
+        if isinstance(request, tuple):
+            self.batch_sizes.append(len(request))
+            results = [cast(RememberResult, await self.remember(item)) for item in request]
+            return tuple(results)
         if request.summary == "invalid":
             raise DomainInvariantError("invalid memory")
         return RememberResult(
@@ -428,6 +438,76 @@ def test_memory_routes_are_tenant_scoped_and_traced() -> None:
     assert missing.json()["code"] == "memory_not_found"
 
 
+def _memory(summary: str, tenant_id: str = "tenant_01") -> dict[str, str]:
+    return {
+        "tenant_id": tenant_id,
+        "summary": summary,
+        "memory_type": "episodic",
+        "occurred_at": NOW.isoformat(),
+    }
+
+
+def test_batch_remember_reaches_the_kernel_as_one_call() -> None:
+    """The batch has to arrive as a batch, which is the only reason it exists.
+
+    The kernel's batch form costs one encoder round trip instead of N, and every face was
+    single-item: MEMLENS's graded set alone would have needed 24 624 of them.
+    """
+    stub = StubKernel()
+    client = _client(stub)
+
+    response = client.post(
+        "/v1/memories/batch",
+        json={"memories": [_memory("first"), _memory("second"), _memory("third")]},
+    )
+
+    assert response.status_code == 201
+    assert stub.batch_sizes == [3]
+    assert [item["summary"] for item in response.json()["memories"]] == [
+        "first",
+        "second",
+        "third",
+    ]
+
+
+def test_batch_remember_is_tenant_scoped_per_memory() -> None:
+    """One authorized memory must not carry an unauthorized one into the store with it."""
+    stub = StubKernel()
+
+    response = _client(stub).post(
+        "/v1/memories/batch",
+        json={"memories": [_memory("mine"), _memory("theirs", tenant_id="third_tenant")]},
+    )
+
+    assert response.status_code == 403
+    assert response.json()["code"] == "tenant_access_denied"
+    assert stub.batch_sizes == []
+
+
+def test_batch_remember_bounds_and_requires_its_batch() -> None:
+    """An empty batch is a caller mistake, and an unbounded one is an unbounded encoder call."""
+    client = _client()
+
+    empty = client.post("/v1/memories/batch", json={"memories": []})
+    too_many = client.post(
+        "/v1/memories/batch",
+        json={"memories": [_memory(f"memory {index}") for index in range(101)]},
+    )
+
+    assert empty.status_code == 422
+    assert too_many.status_code == 422
+    assert empty.json()["code"] == "request_validation_failed"
+
+
+def test_batch_path_is_not_read_as_a_memory_id() -> None:
+    """`/v1/memories/batch` has a parameterised sibling that would happily match `batch`."""
+    response = _client().get("/v1/memories/batch", params={"tenant_id": "tenant_01"})
+
+    # The GET has no batch form, so the parameterised read still owns that method.
+    assert response.status_code == 404
+    assert response.json()["code"] == "memory_not_found"
+
+
 def test_validation_errors_have_trace_and_field_location() -> None:
     """Malformed requests fail predictably without entering the kernel."""
     response = _client().post(
@@ -563,6 +643,7 @@ class FailingKernel(StubKernel):
     """Raises one sanitized runtime category from the shared recall route."""
 
     def __init__(self, error: Exception) -> None:
+        super().__init__()
         self._error = error
 
     async def recall(self, request: RecallRequest) -> RecallResult:

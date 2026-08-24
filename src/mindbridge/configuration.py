@@ -130,7 +130,9 @@ PLUGIN_SELECTOR_KEY = "plugin"
 KNOWN_SCALAR_KEYS: Mapping[str, tuple[str, ...]] = {
     "database": ("max_pool_size",),
     "object_storage": ("bucket", "endpoint_url", "public_endpoint_url"),
-    "embedding": ("dimension", "space_id", "space_revision"),
+    "embedding": ("dimension", "space_id"),
+    "worker": ("concurrency", "vram_budget_gib"),
+    "log": ("level", "format"),
     "aml": ("tenant_prefix",),
 }
 """Sections holding named values MindBridge owns, one variable per key.
@@ -142,7 +144,7 @@ a plugin config. `test_the_known_keys_cannot_fall_behind_what_the_code_reads` is
 keeps this table honest.
 """
 
-TOP_LEVEL_KEYS: tuple[str, ...] = ("minimum_embedding_similarity",)
+TOP_LEVEL_KEYS: tuple[str, ...] = ("minimum_embedding_similarity", "timing_summary")
 """Keys configuring one deployment-wide value that belongs to no section."""
 
 CREDENTIAL_VARIABLES: frozenset[str] = frozenset(
@@ -402,8 +404,8 @@ class PluginConfigModel(BaseModel):
     """Strict immutable schema for one plugin's JSON configuration object.
 
     `extra="forbid"` is what fails a factory on any key it would otherwise ignore.
-    `protected_namespaces` is cleared because `model_id` and `model_revision` are
-    MindBridge's model-identity fields, not pydantic's reserved namespace.
+    `protected_namespaces` is cleared because `model_id` is MindBridge's model-identity
+    field, not pydantic's reserved namespace.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True, protected_namespaces=())

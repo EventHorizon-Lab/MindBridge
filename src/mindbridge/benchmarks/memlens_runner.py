@@ -75,6 +75,7 @@ class MemLensQuestionResult(ContractModel):
     mindbridge_memory_ids: tuple[Identifier, ...]
     mindbridge_evidence_ids: tuple[Identifier, ...]
     mindbridge_trace_id: Identifier
+    mindbridge_ingest_failure_count: int = Field(default=0, ge=0)
 
 
 def load_prepared_memlens(path: Path) -> MemLensPreparedImages:
@@ -148,8 +149,9 @@ async def run_memlens_question(
         sum(len(previous.turns) for previous in question.sessions[:index])
         for index in range(len(question.sessions))
     )
+    ingest_failures = 0
     for offset in range(0, len(question.sessions), request_concurrency):
-        await asyncio.gather(
+        outcomes = await asyncio.gather(
             *(
                 _ingest_session_turns(
                     memory,
@@ -167,8 +169,10 @@ async def run_memlens_question(
                 for index, session in enumerate(
                     question.sessions[offset : offset + request_concurrency]
                 )
-            )
+            ),
+            return_exceptions=True,
         )
+        ingest_failures += _count_ingest_failures(outcomes)
 
     async with semaphore:
         recalled = await memory.recall(
@@ -191,7 +195,17 @@ async def run_memlens_question(
         mindbridge_memory_ids=tuple(item.memory_id for item in recalled.memories),
         mindbridge_evidence_ids=tuple(item.evidence_id for item in recalled.evidence),
         mindbridge_trace_id=recalled.trace_id,
+        mindbridge_ingest_failure_count=ingest_failures,
     )
+
+
+def _count_ingest_failures(outcomes: list[BaseException | None]) -> int:
+    """Count the sessions that failed so a single bad session cannot discard its cohort.
+
+    A bare gather made the first exception the whole question's result. The count is reported
+    with the prediction, so a run still tells missing history apart from a wrong answer.
+    """
+    return sum(isinstance(outcome, BaseException) for outcome in outcomes)
 
 
 async def _ingest_session_turns(

@@ -46,7 +46,15 @@ from mindbridge.sdk import MindBridge, MindBridgeError
 # Submissions need one row per example, so an abstention still needs a value. Deliberately outside
 # OPTION_LABELS: any real label would harvest a one-in-four guess on every abstained question.
 EGOMEM_REASON_ABSTENTION = "ABSTAIN"
-_RECOVERABLE_MODEL_ERRORS = frozenset({"model_output_invalid", "model_request_failed"})
+# `model_unavailable` is this deployment's 60 s gateway timeout, measured at ~5.5% of recalls
+# once nine benchmarks saturate the shared endpoint. Treating it as fatal killed a whole block
+# and discarded every answer the block had already produced -- an 11-question block carried
+# ~47% risk of dying that way. Recoverable here means "record an empty result carrying the
+# error code", so the question lands in the infrastructure column instead of destroying its
+# eleven neighbours. It is never counted as a wrong answer.
+_RECOVERABLE_MODEL_ERRORS = frozenset(
+    {"model_output_invalid", "model_request_failed", "model_unavailable"}
+)
 
 
 class EgoLifePreparedClip(ContractModel):
@@ -120,6 +128,7 @@ class EgoLifeQuestionResult(ContractModel):
     mindbridge_evidence_ids: tuple[Identifier, ...]
     mindbridge_trace_id: Identifier
     mindbridge_error_code: NonEmptyString | None = None
+    mindbridge_ingest_failure_count: int = Field(default=0, ge=0)
 
 
 class EgoLifeCategoryMetrics(ContractModel):
@@ -158,6 +167,7 @@ class EgoMemReasonResult(ContractModel):
     mindbridge_evidence_ids: tuple[Identifier, ...]
     mindbridge_trace_id: Identifier
     mindbridge_error_code: NonEmptyString | None = None
+    mindbridge_ingest_failure_count: int = Field(default=0, ge=0)
 
 
 def load_prepared_egolife(path: Path) -> EgoLifePreparedStream:
@@ -237,6 +247,7 @@ async def run_egolife_qa(
     ordered = sorted(questions, key=lambda question: question.query_offset_ms)
     answers: dict[str, EgoLifeQuestionResult] = {}
     next_clip = 0
+    ingest_failures = 0
     semaphore = asyncio.Semaphore(request_concurrency)
     for query_offset_ms, group in groupby(ordered, key=lambda question: question.query_offset_ms):
         due_clips = []
@@ -259,7 +270,9 @@ async def run_egolife_qa(
                 )
             )
             next_clip += 1
-        await asyncio.gather(*due_clips)
+        ingest_failures += _count_ingest_failures(
+            await asyncio.gather(*due_clips, return_exceptions=True)
+        )
         cutoff = prepared.timeline_origin + timedelta(milliseconds=query_offset_ms)
         results = await asyncio.gather(
             *(
@@ -271,6 +284,7 @@ async def run_egolife_qa(
                     cutoff,
                     recall_limit,
                     semaphore,
+                    ingest_failures,
                 )
                 for question in group
             )
@@ -310,6 +324,7 @@ async def run_egomem_reason(
     ordered = sorted(questions, key=lambda question: question.query_offset_ms)
     answers: dict[int, EgoMemReasonResult] = {}
     next_clip = 0
+    ingest_failures = 0
     semaphore = asyncio.Semaphore(request_concurrency)
     for query_offset_ms, group in groupby(ordered, key=lambda question: question.query_offset_ms):
         due_clips = []
@@ -332,7 +347,9 @@ async def run_egomem_reason(
                 )
             )
             next_clip += 1
-        await asyncio.gather(*due_clips)
+        ingest_failures += _count_ingest_failures(
+            await asyncio.gather(*due_clips, return_exceptions=True)
+        )
         cutoff = prepared.timeline_origin + timedelta(milliseconds=query_offset_ms)
         results = await asyncio.gather(
             *(
@@ -343,12 +360,23 @@ async def run_egomem_reason(
                     cutoff,
                     recall_limit,
                     semaphore,
+                    ingest_failures,
                 )
                 for question in group
             )
         )
         answers.update((result.example_id, result) for result in results)
     return tuple(answers[question.example_id] for question in questions)
+
+
+def _count_ingest_failures(outcomes: list[BaseException | None]) -> int:
+    """Count the clips that failed so a single bad clip cannot discard its whole cohort.
+
+    A bare gather made the first exception the whole wearer's result: one failed clip out of 130
+    gated 187 of 198 questions. The count rides along on every answer produced after it, so a run
+    still tells missing evidence apart from a wrong answer.
+    """
+    return sum(isinstance(outcome, BaseException) for outcome in outcomes)
 
 
 async def _ingest_clip(
@@ -436,6 +464,7 @@ async def _answer_question(
     cutoff: AwareDatetime,
     recall_limit: int,
     semaphore: asyncio.Semaphore,
+    ingest_failures: int,
 ) -> EgoLifeQuestionResult:
     result, error_code = await _recall_or_empty(
         memory,
@@ -466,6 +495,7 @@ async def _answer_question(
         mindbridge_evidence_ids=tuple(item.evidence_id for item in result.evidence),
         mindbridge_trace_id=result.trace_id,
         mindbridge_error_code=error_code,
+        mindbridge_ingest_failure_count=ingest_failures,
     )
 
 
@@ -476,6 +506,7 @@ async def _answer_egomem_question(
     cutoff: AwareDatetime,
     recall_limit: int,
     semaphore: asyncio.Semaphore,
+    ingest_failures: int,
 ) -> EgoMemReasonResult:
     result, error_code = await _recall_or_empty(
         memory,
@@ -503,6 +534,7 @@ async def _answer_egomem_question(
         mindbridge_evidence_ids=tuple(item.evidence_id for item in result.evidence),
         mindbridge_trace_id=result.trace_id,
         mindbridge_error_code=error_code,
+        mindbridge_ingest_failure_count=ingest_failures,
     )
 
 

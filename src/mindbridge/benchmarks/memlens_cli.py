@@ -57,9 +57,7 @@ class MemLensRunManifest(MediaBenchmarkRunManifest):
     benchmark: Literal["MEMLENS"] = "MEMLENS"
     context_window: MemLensContextWindow
     dataset_repository: NonEmptyString
-    dataset_revision: NonEmptyString
     evaluator_repository: NonEmptyString
-    evaluator_revision: NonEmptyString
     agent_subset_sha256: Sha256Hex | None = None
     prepared_images_manifest_sha256: Sha256Hex | None = None
     text_only: bool
@@ -88,8 +86,6 @@ class _Arguments(MediaArguments):
     prepared_images_path: Path | None
     agent_subset_path: Path | None
     context_window: MemLensContextWindow
-    dataset_revision: str
-    evaluator_revision: str
     text_only: bool
     question_ids: tuple[str, ...]
 
@@ -187,9 +183,7 @@ def _write_artifacts(
         predictions=predictions,
         context_window=arguments.context_window,
         dataset_repository="xiyuRenBill/MEMLENS",
-        dataset_revision=arguments.dataset_revision,
         evaluator_repository="xrenaf/MEMLENS",
-        evaluator_revision=arguments.evaluator_revision,
         agent_subset_sha256=(
             sha256_file(arguments.agent_subset_path)
             if arguments.agent_subset_path is not None
@@ -260,12 +254,6 @@ def _parse_arguments(argv: Sequence[str] | None, prog: str | None) -> _Arguments
         help="official context-window track to report under",
     )
     parser.add_argument(
-        "--dataset-revision", required=True, help="revision of the official dataset release"
-    )
-    parser.add_argument(
-        "--evaluator-revision", required=True, help="revision of the official evaluator"
-    )
-    parser.add_argument(
         "--text-only", action="store_true", help="run the text-only track and ingest no images"
     )
     parser.add_argument(
@@ -281,8 +269,6 @@ def _parse_arguments(argv: Sequence[str] | None, prog: str | None) -> _Arguments
         prepared_images_path=parsed.prepared_images,
         agent_subset_path=parsed.agent_subset_index,
         context_window=cast(MemLensContextWindow, parsed.context_window),
-        dataset_revision=parsed.dataset_revision,
-        evaluator_revision=parsed.evaluator_revision,
         text_only=parsed.text_only,
         question_ids=tuple(parsed.question_id),
     )

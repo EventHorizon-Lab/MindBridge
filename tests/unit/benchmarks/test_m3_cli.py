@@ -65,15 +65,9 @@ def test_m3_artifacts_pin_media_models_code_and_jsonl_output(tmp_path: Path) -> 
     )
     assert prediction["id"] == "video_01_Q01"
     assert prediction["response"] == "A person entered"
-    assert manifest.source_revision == "official-revision"
-    assert manifest.media_revision == "official-media-revision"
     assert manifest.deployment.worker_generator is not None
-    assert manifest.deployment.worker_generator.config["model_revision"] == (
-        "perception-serving-fingerprint"
-    )
-    assert manifest.deployment.server_generator.config["model_revision"] == (
-        "answer-serving-fingerprint"
-    )
+    assert manifest.deployment.worker_generator.config["model_id"] == "qwen3.8-omni"
+    assert manifest.deployment.server_generator.config["model_id"] == "qwen3.8-max"
     assert manifest.request_timeout_seconds == 1_800.0
     assert manifest.run_id == "run_01"
     assert manifest.clip_count == 1
@@ -122,9 +116,6 @@ def _arguments(dataset_path: Path, prepared_path: Path, output_path: Path) -> _A
         output_path=output_path,
         api_base_url="https://memory.example.test",
         subset="robot",
-        source_revision="official-revision",
-        media_revision="official-media-revision",
-        code_revision="mindbridge-commit",
         deployment_config_path=deployment_path,
         run_id="run_01",
         tenant_prefix="benchmark_m3",
@@ -148,7 +139,7 @@ def _write_deployment(path: Path) -> None:
                     "plugin": "openai",
                     "distribution": "mindbridge",
                     "version": "0.1.0",
-                    "config": {"model_revision": "answer-serving-fingerprint"},
+                    "config": {"model_id": "qwen3.8-max"},
                 },
                 "server_embedder": {
                     "plugin": "openai",
@@ -160,7 +151,7 @@ def _write_deployment(path: Path) -> None:
                     "plugin": "openai",
                     "distribution": "mindbridge",
                     "version": "0.1.0",
-                    "config": {"model_revision": "perception-serving-fingerprint"},
+                    "config": {"model_id": "qwen3.8-omni"},
                 },
                 "worker_media_embedder": {
                     "plugin": "jina",

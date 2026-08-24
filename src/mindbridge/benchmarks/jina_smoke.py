@@ -24,14 +24,12 @@ UNRELATED_DOCUMENT = "The weather outside is sunny and warm."
 
 
 class JinaSmokeResult(ContractModel):
-    """Versioned output needed to reproduce an embedding smoke run."""
+    """Output needed to reproduce an embedding smoke run."""
 
     created_at: AwareDatetime
     embedder_plugin: Literal["jina"] = "jina"
     model_id: str
-    revision: str
     space_id: str
-    space_revision: str
     task: Literal["retrieval_query"] = "retrieval_query"
     device: str
     dimension: int
@@ -45,9 +43,9 @@ class JinaSmokeResult(ContractModel):
     passed: bool
 
 
-async def run_jina_smoke(*, revision: str, device: str) -> JinaSmokeResult:
-    """Load the pinned model and compare one relevant and irrelevant document."""
-    embedder = JinaEmbedder.load(revision=revision, device=device)
+async def run_jina_smoke(*, device: str) -> JinaSmokeResult:
+    """Load the model and compare one relevant and irrelevant document."""
+    embedder = JinaEmbedder.load(device=device)
     query_result = await embedder.embed(
         EmbedRequest(
             inputs=(ModelInput((TextPart(QUERY),)),),
@@ -75,9 +73,7 @@ async def run_jina_smoke(*, revision: str, device: str) -> JinaSmokeResult:
     return JinaSmokeResult(
         created_at=datetime.now(timezone.utc),
         model_id=query_embedding.model_reference.model_id,
-        revision=query_embedding.model_reference.revision,
         space_id=query_embedding.space_reference.space_id,
-        space_revision=query_embedding.space_reference.revision,
         device=device,
         dimension=len(query),
         query_norm=query_norm,
@@ -98,10 +94,9 @@ async def run_jina_smoke(*, revision: str, device: str) -> JinaSmokeResult:
 def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> int:
     """Run the smoke and emit a machine-readable manifest, returning its verdict."""
     parser = build_parser(prog=prog, description=__doc__)
-    parser.add_argument("--revision", required=True, help="model revision to pin in the manifest")
     parser.add_argument("--device", default="cuda", help="torch device to load the adapter on")
     arguments = parser.parse_args(argv)
-    result = asyncio.run(run_jina_smoke(revision=arguments.revision, device=arguments.device))
+    result = asyncio.run(run_jina_smoke(device=arguments.device))
     print(result.model_dump_json(indent=2))
     return 0 if result.passed else 1
 

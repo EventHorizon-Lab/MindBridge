@@ -20,9 +20,9 @@ def _complete(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     config = tmp_path / "mindbridge.toml"
     config.write_text(
         "[object_storage]\nbucket = 'mindbridge-media'\n"
-        "[embedding]\ndimension = 1024\nspace_id = 's'\nspace_revision = 'r'\n"
-        "[generator]\nendpoint = 'https://g/v1'\nmodel_revision = 'gr'\n"
-        "[embedder]\nendpoint = 'https://e/v1'\nmodel_id = 'm'\nmodel_revision = 'er'\n",
+        "[embedding]\ndimension = 1024\nspace_id = 's'\n"
+        "[generator]\nendpoint = 'https://g/v1'\nrequest_timeout_seconds = 1800\n"
+        "[embedder]\nendpoint = 'https://e/v1'\nmodel_id = 'm'\n",
         encoding="utf-8",
     )
     for name, value in {

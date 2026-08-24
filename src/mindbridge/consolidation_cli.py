@@ -55,7 +55,7 @@ from mindbridge.models.defaults import (
     require_matryoshka_dimension,
 )
 from mindbridge.models.plugins import close_model, load_embedder, load_generator
-from mindbridge.telemetry import configure_telemetry
+from mindbridge.telemetry import configure_observability
 
 CONSOLIDATION_ENVIRONMENT = """environment:
   MINDBRIDGE_DATABASE_URL           PostgreSQL DSN (required). Read from the environment
@@ -67,14 +67,12 @@ CONSOLIDATION_ENVIRONMENT = """environment:
                                     this sweep lets the Generator inspect
   MINDBRIDGE_GENERATOR_PLUGIN, MINDBRIDGE_EMBEDDER_PLUGIN
                                     model plugins to load (default: openai)
-  MINDBRIDGE_GENERATOR_API_KEY, MINDBRIDGE_GENERATOR_ENDPOINT,
-  MINDBRIDGE_GENERATOR_MODEL_REVISION
+  MINDBRIDGE_GENERATOR_API_KEY, MINDBRIDGE_GENERATOR_ENDPOINT
                                     required by the default openai generator plugin;
                                     MINDBRIDGE_GENERATOR_MODEL_ID is optional
   MINDBRIDGE_EMBEDDER_API_KEY, MINDBRIDGE_EMBEDDER_ENDPOINT
                                     required by the default openai embedder plugin;
-                                    MINDBRIDGE_EMBEDDER_MODEL_ID and _MODEL_REVISION
-                                    are optional
+                                    MINDBRIDGE_EMBEDDER_MODEL_ID is optional
   MINDBRIDGE_GENERATOR_CONFIG_JSON, MINDBRIDGE_EMBEDDER_CONFIG_JSON
                                     explicit plugin configuration; an object here
                                     replaces the per-field variables above"""
@@ -136,7 +134,7 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
     """Run one tenant sweep using only explicit process configuration."""
     options = _parser(prog).parse_args(argv)
     # Configured after parsing so --help and a rejected flag stay side-effect free.
-    configure_telemetry("mindbridge-consolidation")
+    configure_observability("mindbridge-consolidation")
     summary = asyncio.run(
         _run_postgres_sweep(
             ConsolidationSettings.from_environment(),

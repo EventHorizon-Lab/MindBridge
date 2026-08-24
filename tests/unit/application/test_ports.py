@@ -17,7 +17,7 @@ def test_embedding_search_requires_unique_object_types() -> None:
         EmbeddingSearch(
             tenant_id=TenantId("tenant_01"),
             values=(1.0,),
-            space_reference=EmbeddingSpaceReference(space_id="space", revision="revision"),
+            space_reference=EmbeddingSpaceReference(space_id="space"),
             document_task="retrieval_document",
             object_types=(EmbeddedObjectType.EVENT, EmbeddedObjectType.EVENT),
             limit=20,
@@ -29,7 +29,7 @@ def test_embedding_search_rejects_invalid_similarity_threshold() -> None:
         EmbeddingSearch(
             tenant_id=TenantId("tenant_01"),
             values=(1.0,),
-            space_reference=EmbeddingSpaceReference(space_id="space", revision="revision"),
+            space_reference=EmbeddingSpaceReference(space_id="space"),
             document_task="retrieval_document",
             object_types=(EmbeddedObjectType.EVENT,),
             limit=20,

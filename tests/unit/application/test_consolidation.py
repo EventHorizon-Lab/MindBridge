@@ -67,6 +67,14 @@ class RecordingEpisodeStore:
             if item.evidence_id == evidence_id
         )
 
+    async def read_evidence_clip_media(
+        self,
+        tenant_id: TenantId,
+        evidence_ids: tuple[EvidenceId, ...],
+    ) -> dict[EvidenceId, MediaObject]:
+        """No derived clips in this fixture, so evidence falls back to its source media."""
+        return {}
+
     async def read_media_objects(
         self,
         tenant_id: TenantId,
@@ -110,7 +118,7 @@ class RecordingConsolidator:
                     salience=0.9,
                 ),
             ),
-            model_reference=ModelReference(model_id="qwen3.8-max", revision="omni-revision"),
+            model_reference=ModelReference(model_id="qwen3.8-max"),
             prompt_version="consolidate_episodes_v1",
         )
 
@@ -220,7 +228,7 @@ def _event(index: int) -> Event:
         description=f"Observed event {suffix}",
         salience=0.8,
         created_at=NOW,
-        model_reference=ModelReference(model_id="omni", revision="perception-revision"),
+        model_reference=ModelReference(model_id="omni"),
         prompt_version="perceive_events_v3",
     )
 

@@ -7,7 +7,7 @@ name = "mindbridge"
 version = "0.1.0"
 description = "Agentic-native embodied memory as a service"
 readme = "README.md"
-requires-python = ">=3.10,<3.12"
+requires-python = ">=3.10,<3.15"
 license = "Apache-2.0"
 dependencies = [
     "httpx>=0.28,<1",
@@ -95,23 +95,31 @@ media = [
 ]
 cloud-models = [
     "mindbridge[media]",
-    # models/jina.py resolves the pinned revision through huggingface_hub.snapshot_download.
+    # models/jina.py downloads the model snapshot through huggingface_hub.snapshot_download.
     "huggingface-hub>=0.30,<2",
     "opentelemetry-api>=1.44,<2",
     "sentence-transformers>=5.2,<6",
-    "torch==2.9.1",
+    "torch==2.13.0",
     # Jina Omni's image and video processor is a Qwen3-VL processor, and that one refuses to
     # construct without Torchvision. Its loader swallows the ImportError and leaves the
     # processor unset, so an install without this line embeds text and dies on the first
     # frame instead of failing where the dependency is missing.
-    "torchvision==0.24.1",
+    "torchvision==0.28.0",
     "transformers>=5.1,<6",
+]
+# The OpenAI-compatible embedding server is a separate process from MindBridge. Keep its CUDA
+# stack out of the default development and server installs, but lock the exact cu129 build used
+# by RTX 5090 workstations so `uv sync` cannot silently replace it with a CUDA 13 wheel.
+vllm-server = [
+    "torchaudio==2.11.0; sys_platform == 'linux'",
+    "torchcodec==0.16.0; sys_platform == 'linux'",
+    "vllm==0.27.1+cu129; sys_platform == 'linux'",
 ]
 # One token for every scenario at once, for the workstation that plays all the roles and for
 # installers with no `--all-extras` flag of their own. tests/test_package.py fails if this
 # stops being the exact union, so a new extra cannot quietly stay out of it.
 all = [
-    "mindbridge[benchmarks,cloud-models,edge,media,server]",
+    "mindbridge[benchmarks,cloud-models,edge,media,server,vllm-server]",
 ]
 
 # Declared so the lockfile resolves from PyPI whoever runs `uv lock`. Without it uv takes the
@@ -123,15 +131,23 @@ url = "https://pypi.org/simple"
 default = true
 
 [[tool.uv.index]]
-name = "pytorch-cu128"
-url = "https://download.pytorch.org/whl/cu128"
+name = "pytorch-cu129"
+url = "https://download.pytorch.org/whl/cu129"
+explicit = true
+
+[[tool.uv.index]]
+name = "vllm-cu129"
+url = "https://wheels.vllm.ai/0.27.1/cu129"
 explicit = true
 
 [tool.uv.sources]
-torch = { index = "pytorch-cu128" }
+torch = { index = "pytorch-cu129" }
 # Torchvision ships one wheel per CUDA build like torch does, and the PyPI wheel links against a
 # different runtime, so it has to resolve from the same index its torch does.
-torchvision = { index = "pytorch-cu128" }
+torchaudio = { index = "pytorch-cu129" }
+torchcodec = { index = "pytorch-cu129" }
+torchvision = { index = "pytorch-cu129" }
+vllm = { index = "vllm-cu129" }
 
 [dependency-groups]
 dev = [
@@ -164,7 +180,12 @@ select = ["ANN", "ASYNC", "B", "C4", "C90", "DTZ", "E4", "E7", "E9", "F", "I", "
 max-complexity = 10
 
 [tool.mypy]
-python_version = "3.10"
+# Deliberately not pinned to the 3.10 floor. Every leg of the CI matrix runs mypy, so each
+# one checks itself, and `ruff`'s own `target-version = "py310"` is what holds the whole tree
+# to syntax the floor can parse. A `python_version` pin below the interpreter also makes mypy
+# refuse stubs that are newer than it: numpy 2.5 (`Requires-Python >=3.12`) writes PEP 695
+# `type` aliases, and reading them as 3.10 ended the run before any of this package's own
+# code was checked.
 strict = true
 files = ["src", "tests"]
 
@@ -181,8 +202,9 @@ module = [
     "PIL",
     "PIL.*",
     "soundfile",
-    # Read by tests/test_package.py on 3.10 only; mypy pins python_version = "3.10",
-    # so the tomllib branch beside it is the one it never sees.
+    # Read by tests/test_package.py on 3.10 only, where the backport is installed. mypy now
+    # checks as the interpreter it runs on, so every other leg reads the `tomllib` branch and
+    # leaves this import unresolved.
     "tomli",
 ]
 ignore_missing_imports = true

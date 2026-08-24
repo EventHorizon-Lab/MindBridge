@@ -2,6 +2,7 @@
 
 import json
 from collections.abc import Callable, Coroutine
+from datetime import datetime, timezone
 
 import httpx
 import pytest
@@ -11,10 +12,12 @@ from mindbridge.contracts import (
     DeletionListRequest,
     FeedbackRequest,
     ForgetRequest,
+    MemoryWriteStatus,
     RecallQuery,
     RecallRequest,
+    RememberRequest,
 )
-from mindbridge.core import FeedbackType, ForgetTargetType, JobState
+from mindbridge.core import FeedbackType, ForgetTargetType, JobState, MemoryType
 
 
 async def test_context_manager_closes_the_connection_pool() -> None:
@@ -397,6 +400,70 @@ async def test_stream_observation_job_reports_a_rejected_request() -> None:
 
     assert raised.value.code == "job_not_found"
     assert raised.value.status_code == 404
+
+
+async def test_remember_many_sends_one_request_for_the_whole_batch() -> None:
+    """A caller holding N memories should cost one round trip, not N.
+
+    The kernel has taken a batch all along -- one encoder call instead of N -- while every
+    caller-facing surface was single-item.
+    """
+    requests: list[httpx.Request] = []
+
+    async def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        payload = json.loads(request.content)
+        return httpx.Response(
+            201,
+            json={
+                "memories": [
+                    _remembered(index, memory["summary"])
+                    for index, memory in enumerate(payload["memories"])
+                ]
+            },
+        )
+
+    client = _client(respond)
+    try:
+        results = await client.remember_many(
+            [
+                RememberRequest(
+                    tenant_id="tenant_01",
+                    summary=summary,
+                    memory_type=MemoryType.EPISODIC,
+                    occurred_at=datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc),
+                )
+                for summary in ("first", "second")
+            ]
+        )
+    finally:
+        await client.close()
+
+    assert len(requests) == 1
+    assert requests[0].url.path == "/v1/memories/batch"
+    assert [memory["summary"] for memory in json.loads(requests[0].content)["memories"]] == [
+        "first",
+        "second",
+    ]
+    assert tuple(result.summary for result in results) == ("first", "second")
+    assert results[0].status is MemoryWriteStatus.CREATED
+
+
+def _remembered(index: int, summary: str) -> dict[str, object]:
+    return {
+        "status": "created",
+        "memory_id": f"memory_{index:02d}",
+        "memory_type": "episodic",
+        "summary": summary,
+        "evidence_ids": [],
+        "occurred_at": "2026-08-11T12:00:00Z",
+        "ended_at": "2026-08-11T12:00:00Z",
+        "created_at": "2026-08-11T12:00:00Z",
+        "verification_status": "attested",
+        "state": "active",
+        "evidence": [],
+        "trace_id": "trace_remember",
+    }
 
 
 def _job_payload(state: str, memory_ids: tuple[str, ...]) -> str:

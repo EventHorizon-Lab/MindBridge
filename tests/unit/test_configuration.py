@@ -208,7 +208,7 @@ def test_a_boolean_override_is_not_read_as_a_non_empty_string() -> None:
 
 def test_the_embedding_space_reaches_every_encoder_from_one_place() -> None:
     document: dict[str, object] = {
-        "embedding": {"dimension": 1024, "space_id": "jina-v5", "space_revision": "omni@abc"},
+        "embedding": {"dimension": 1024, "space_id": "jina-v5"},
         "embedder": {"endpoint": "https://e/v1"},
         "media_embedder": {"device": "cuda:0"},
         "generator": {"endpoint": "https://g/v1"},
@@ -218,7 +218,6 @@ def test_the_embedding_space_reaches_every_encoder_from_one_place() -> None:
     for section in ("embedder", "media_embedder"):
         encoded = json.loads(flattened[f"MINDBRIDGE_{section.upper()}_CONFIG_JSON"])
         assert encoded["space_id"] == "jina-v5"
-        assert encoded["space_revision"] == "omni@abc"
         assert encoded["dimension"] == 1024
     # The generator shares no embedding space.
     assert "space_id" not in json.loads(flattened["MINDBRIDGE_GENERATOR_CONFIG_JSON"])
@@ -227,10 +226,10 @@ def test_the_embedding_space_reaches_every_encoder_from_one_place() -> None:
 def test_an_override_of_a_key_the_file_omits_arrives_as_text() -> None:
     flattened = _flattened_plugins(
         {"embedder": {"endpoint": "https://e/v1"}},
-        {"MINDBRIDGE_EMBEDDER_MODEL_REVISION": "abc123"},
+        {"MINDBRIDGE_EMBEDDER_MODEL_ID": "abc123"},
     )
 
-    assert json.loads(flattened["MINDBRIDGE_EMBEDDER_CONFIG_JSON"])["model_revision"] == "abc123"
+    assert json.loads(flattened["MINDBRIDGE_EMBEDDER_CONFIG_JSON"])["model_id"] == "abc123"
 
 
 def test_with_no_file_the_source_is_the_environment_unchanged(tmp_path: Path) -> None:
@@ -289,9 +288,9 @@ def test_every_settings_class_reads_the_same_layered_source(tmp_path: Path) -> N
     config = tmp_path / "mindbridge.toml"
     config.write_text(
         "[object_storage]\nbucket = 'mindbridge-media'\n"
-        "[embedding]\ndimension = 1024\nspace_id = 's'\nspace_revision = 'r'\n"
-        "[generator]\nendpoint = 'https://g/v1'\nmodel_revision = 'gr'\n"
-        "[embedder]\nendpoint = 'https://e/v1'\nmodel_id = 'm'\nmodel_revision = 'er'\n",
+        "[embedding]\ndimension = 1024\nspace_id = 's'\n"
+        "[generator]\nendpoint = 'https://g/v1'\nrequest_timeout_seconds = 1800\n"
+        "[embedder]\nendpoint = 'https://e/v1'\nmodel_id = 'm'\n",
         encoding="utf-8",
     )
     environ = {

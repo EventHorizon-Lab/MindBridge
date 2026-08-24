@@ -43,6 +43,7 @@ finally:
 | --- | --- |
 | `observe(request)` | `POST /v1/observations` |
 | `remember(request)` | `POST /v1/memories` |
+| `remember_many(requests)` | `POST /v1/memories/batch` |
 | `recall(request)` | `POST /v1/recall` |
 | `get_memory(tenant_id, memory_id)` | `GET /v1/memories/{memory_id}` |
 | `record_feedback(request)` | `POST /v1/feedback` |
@@ -80,6 +81,29 @@ result = await memory.recall(
 
 `result.answer` is `None` when nothing supports an answer. That is a correct outcome, not an
 error — check it rather than assuming a string.
+
+Holding more than one memory? Hand over all of them. `remember_many` takes up to 100 requests and
+returns one `RememberResult` per request **in the order sent**, each with its own `created` or
+`duplicate` status — the server encodes the whole batch in one call to its embedder instead of one
+call each:
+
+```python
+written = await memory.remember_many(
+    [
+        RememberRequest(
+            tenant_id="tenant_01",
+            summary=summary,
+            memory_type=MemoryType.SEMANTIC,
+            occurred_at=datetime.now(timezone.utc),
+        )
+        for summary in summaries
+    ]
+)
+assert len(written) == len(summaries)
+```
+
+Measured on one RTX 5090 against the same model, encoding 128 real memory summaries: 600 per
+second in batches of 32 against 183 per second one at a time.
 
 Verifying an answer needs no second call to storage: `result.evidence` already carries signed
 `media_url`s pointing at the exact `start_ms`–`end_ms` slice of the original recording.

@@ -6,7 +6,7 @@
       "openWorldHint": false,
       "readOnlyHint": false
     },
-    "description": "Record a useful, wrong, missing, or correction signal for future recall.\n\n        Which fields are required depends on `feedback_type`, and the wrong combination is\n        rejected rather than ignored. `missing` reports that a recall returned nothing\n        usable: it needs `recall_trace_id` -- the `trace_id` from that recall -- and must omit\n        `memory_id`. `useful`, `wrong`, and `correction` each judge one memory and need\n        `memory_id`. Only `correction` may carry `correction_summary`, and it must.\n\n        A correction supersedes the original with a new version rather than editing it, so the\n        receipt names both the `corrected_memory_id` and the original's resulting state.\n        ",
+    "description": "Record a useful, wrong, missing, or correction signal for future recall.\n\nWhich fields are required depends on `feedback_type`, and the wrong combination is\nrejected rather than ignored. `missing` reports that a recall returned nothing\nusable: it needs `recall_trace_id` -- the `trace_id` from that recall -- and must omit\n`memory_id`. `useful`, `wrong`, and `correction` each judge one memory and need\n`memory_id`. Only `correction` may carry `correction_summary`, and it must.\n\nA correction supersedes the original with a new version rather than editing it, so the\nreceipt names both the `corrected_memory_id` and the original's resulting state.",
     "inputSchema": {
       "$defs": {
         "FeedbackType": {
@@ -227,7 +227,7 @@
       "openWorldHint": false,
       "readOnlyHint": false
     },
-    "description": "Recoverably erase one exact memory or source observation and its derivatives.\n\n        `target_type` decides what `target_id` names: `memory_record` erases that one memory,\n        `observation` erases a source observation and everything derived from it. Idempotent\n        -- a repeat returns the same tombstone rather than failing.\n\n        Erasure propagates across storage and offline edge devices after this reply, so read\n        `propagation_state` on the receipt instead of assuming `complete`. Confirming that it\n        finished uses the REST deletion routes, which MCP does not mirror.\n        ",
+    "description": "Recoverably erase one exact memory or source observation and its derivatives.\n\n`target_type` decides what `target_id` names: `memory_record` erases that one memory,\n`observation` erases a source observation and everything derived from it. Idempotent\n-- a repeat returns the same tombstone rather than failing.\n\nErasure propagates across storage and offline edge devices after this reply, so read\n`propagation_state` on the receipt instead of assuming `complete`. Confirming that it\nfinished uses the REST deletion routes, which MCP does not mirror.",
     "inputSchema": {
       "$defs": {
         "ForgetTargetType": {
@@ -392,7 +392,7 @@
       "openWorldHint": false,
       "readOnlyHint": true
     },
-    "description": "Read one tenant-owned memory by its stable identifier.\n\n        Evidence arrives with the memory as short-lived signed URLs, so verifying an answer\n        needs no second storage call. A memory erased through `memory_forget` fails as\n        deleted rather than as missing, which distinguishes \"was removed\" from \"never was\".\n        ",
+    "description": "Read one tenant-owned memory by its stable identifier.\n\nEvidence arrives with the memory as short-lived signed URLs, so verifying an answer\nneeds no second storage call. A memory erased through `memory_forget` fails as\ndeleted rather than as missing, which distinguishes \"was removed\" from \"never was\".",
     "inputSchema": {
       "properties": {
         "memory_id": {
@@ -422,10 +422,10 @@
       "$defs": {
         "EvidenceView": {
           "additionalProperties": false,
-          "description": "Precise evidence location safe to expose to a caller.",
+          "description": "Precise evidence location safe to expose to a caller.\n\nThe offsets locate the span inside `media_object_id`. They do not locate it inside\n`media_url`, which is usually a copy cut for this span alone: that copy's own timeline\nstarts at zero and may carry slightly more than the span, and where no single copy covers\nthe span it is the whole source object instead. Seek with these offsets only into\n`media_object_id`.",
           "properties": {
             "end_ms": {
-              "description": "Span end within that media, in milliseconds.",
+              "description": "Span end within `media_object_id`, in milliseconds.",
               "minimum": 0,
               "title": "End Ms",
               "type": "integer"
@@ -438,14 +438,14 @@
               "type": "string"
             },
             "media_object_id": {
-              "description": "Media object the span was cut from.",
+              "description": "Media object the span was cut from, and the one the offsets below index.",
               "maxLength": 255,
               "minLength": 1,
               "title": "Media Object Id",
               "type": "string"
             },
             "media_url": {
-              "description": "Signed URL for the bytes, so verifying needs no separate storage call.",
+              "description": "Signed URL for this span's bytes, so verifying needs no separate storage call. It is a copy cut for the span where one exists, and the whole source object where none does; bytes are attached to a generation request only while they are about the span, so an answer over a span its source dwarfs was produced without them.",
               "maxLength": 2048,
               "minLength": 1,
               "title": "Media Url",
@@ -458,7 +458,7 @@
               "type": "string"
             },
             "start_ms": {
-              "description": "Span start within that media, in milliseconds.",
+              "description": "Span start within `media_object_id`, in milliseconds.",
               "minimum": 0,
               "title": "Start Ms",
               "type": "integer"
@@ -683,7 +683,7 @@
       "openWorldHint": false,
       "readOnlyHint": true
     },
-    "description": "Read how far one observation's processing has got.\n\n        `memory_observe` returns a `processing_job_id` because deriving memory from raw media\n        outlives the request that submitted it. This resolves that ID. Once `state` is\n        `succeeded`, `memory_ids` names exactly what the observation produced, so the derived\n        memories can be read directly rather than searched for.\n\n        `failed` settles this attempt, not the job: a stale-job sweep can retry it, and\n        `attempt` counts how often it has been claimed. Following every intermediate state as\n        a stream is REST-only; this tool answers one read at a time.\n        ",
+    "description": "Read how far one observation's processing has got.\n\n`memory_observe` returns a `processing_job_id` because deriving memory from raw media\noutlives the request that submitted it. This resolves that ID. Once `state` is\n`succeeded`, `memory_ids` names exactly what the observation produced, so the derived\nmemories can be read directly rather than searched for.\n\n`failed` settles this attempt, not the job: a stale-job sweep can retry it, and\n`attempt` counts how often it has been claimed. Following every intermediate state as\na stream is REST-only; this tool answers one read at a time.",
     "inputSchema": {
       "properties": {
         "job_id": {
@@ -816,7 +816,7 @@
       "openWorldHint": false,
       "readOnlyHint": false
     },
-    "description": "Store one timestamped multimodal observation and return its durable job ID.\n\n        Preconditions this tool cannot do for you: every `media_objects[*].uri` must already\n        be readable at `s3://<bucket>/tenants/<tenant_id>/<key>`, with `sha256` and\n        `size_bytes` matching those exact bytes. This is the first-party device path. An Agent\n        holding content rather than stored media objects wants `memory_remember` instead.\n\n        Rejected combinations: `ended_at` before `occurred_at`; a repeated `media_object_id`;\n        a media `duration_ms` longer than the observation's own span; an identity span with\n        `end_ms` past that span or `start_ms` after its own `end_ms`; `transcript` on anything\n        but a `voice` identity; `visual_bbox_xyxy` on anything but a `face` identity, or one\n        whose 0..1 normalized corners have no positive width and height.\n\n        `status` returns `duplicate` when a retry matched an earlier `idempotency_key`.\n        Deriving memory from raw media outlives this request, so no memory exists yet when\n        this receipt returns: read the returned `processing_job_id` with `memory_job` until it\n        reaches `succeeded`, then use the `memory_ids` it carries.\n        ",
+    "description": "Store one timestamped multimodal observation and return its durable job ID.\n\nPreconditions this tool cannot do for you: every `media_objects[*].uri` must already\nbe readable at `s3://<bucket>/tenants/<tenant_id>/<key>`, with `sha256` and\n`size_bytes` matching those exact bytes. This is the first-party device path. An Agent\nholding content rather than stored media objects wants `memory_remember` instead.\n\nRejected combinations: `ended_at` before `occurred_at`; a repeated `media_object_id`;\na media `duration_ms` longer than the observation's own span; an identity span with\n`end_ms` past that span or `start_ms` after its own `end_ms`; `transcript` on anything\nbut a `voice` identity; `visual_bbox_xyxy` on anything but a `face` identity, or one\nwhose 0..1 normalized corners have no positive width and height.\n\n`status` returns `duplicate` when a retry matched an earlier `idempotency_key`.\nDeriving memory from raw media outlives this request, so no memory exists yet when\nthis receipt returns: read the returned `processing_job_id` with `memory_job` until it\nreaches `succeeded`, then use the `memory_ids` it carries.",
     "inputSchema": {
       "$defs": {
         "IdentityKind": {
@@ -861,13 +861,6 @@
               "maxLength": 255,
               "minLength": 1,
               "title": "Model Id",
-              "type": "string"
-            },
-            "model_revision": {
-              "description": "Exact revision of `model_id`, so a re-identification can be reproduced.",
-              "maxLength": 255,
-              "minLength": 1,
-              "title": "Model Revision",
               "type": "string"
             },
             "scope": {
@@ -940,8 +933,7 @@
             "start_ms",
             "end_ms",
             "confidence",
-            "model_id",
-            "model_revision"
+            "model_id"
           ],
           "title": "IdentityObservationInput",
           "type": "object"
@@ -1228,7 +1220,7 @@
       "openWorldHint": false,
       "readOnlyHint": true
     },
-    "description": "Recall relevant memories and return inspectable evidence with the answer.\n\n        `query` needs `text`, `media_object_ids`, or both -- neither modality is privileged.\n\n        `mode` selects what work is done. `answer` reasons over the retrieved memories and\n        fills `answer`. `search` ranks and returns memories with `answer` left null. Use\n        `enumerate` for count and timeline questions: it scans the complete structured-filter\n        scope and verifies each candidate against original media, and fails with\n        `enumeration_limit_exceeded` rather than silently truncating an oversized scope.\n\n        For a grounded follow-up, pass IDs from a previous result in `memory_ids`; they become\n        the strict candidate scope instead of a ranking hint. `filters` applies before\n        ranking, and `occurred_before` must not precede `occurred_after`.\n        ",
+    "description": "Recall relevant memories and return inspectable evidence with the answer.\n\n`query` needs `text`, `media_object_ids`, or both -- neither modality is privileged.\n\n`mode` selects what work is done. `answer` reasons over the retrieved memories and\nfills `answer`. `search` ranks and returns memories with `answer` left null. Use\n`enumerate` for count and timeline questions: it scans the complete structured-filter\nscope and verifies each candidate against original media, and fails with\n`enumeration_limit_exceeded` rather than silently truncating an oversized scope.\n\nFor a grounded follow-up, pass IDs from a previous result in `memory_ids`; they become\nthe strict candidate scope instead of a ranking hint. `filters` applies before\nranking, and `occurred_before` must not precede `occurred_after`.",
     "inputSchema": {
       "$defs": {
         "MemoryType": {
@@ -1420,10 +1412,10 @@
       "$defs": {
         "EvidenceView": {
           "additionalProperties": false,
-          "description": "Precise evidence location safe to expose to a caller.",
+          "description": "Precise evidence location safe to expose to a caller.\n\nThe offsets locate the span inside `media_object_id`. They do not locate it inside\n`media_url`, which is usually a copy cut for this span alone: that copy's own timeline\nstarts at zero and may carry slightly more than the span, and where no single copy covers\nthe span it is the whole source object instead. Seek with these offsets only into\n`media_object_id`.",
           "properties": {
             "end_ms": {
-              "description": "Span end within that media, in milliseconds.",
+              "description": "Span end within `media_object_id`, in milliseconds.",
               "minimum": 0,
               "title": "End Ms",
               "type": "integer"
@@ -1436,14 +1428,14 @@
               "type": "string"
             },
             "media_object_id": {
-              "description": "Media object the span was cut from.",
+              "description": "Media object the span was cut from, and the one the offsets below index.",
               "maxLength": 255,
               "minLength": 1,
               "title": "Media Object Id",
               "type": "string"
             },
             "media_url": {
-              "description": "Signed URL for the bytes, so verifying needs no separate storage call.",
+              "description": "Signed URL for this span's bytes, so verifying needs no separate storage call. It is a copy cut for the span where one exists, and the whole source object where none does; bytes are attached to a generation request only while they are about the span, so an answer over a span its source dwarfs was produced without them.",
               "maxLength": 2048,
               "minLength": 1,
               "title": "Media Url",
@@ -1456,7 +1448,7 @@
               "type": "string"
             },
             "start_ms": {
-              "description": "Span start within that media, in milliseconds.",
+              "description": "Span start within `media_object_id`, in milliseconds.",
               "minimum": 0,
               "title": "Start Ms",
               "type": "integer"
@@ -1723,7 +1715,7 @@
       "openWorldHint": false,
       "readOnlyHint": false
     },
-    "description": "Retain one explicit memory, preserving evidence and temporal provenance.\n\n        Choose `memory_type` by the role the content will serve: `episodic` for something\n        that happened at a time, `semantic` for a durable fact, `procedural` for how to do\n        something, `prospective` for a future intention, `working` for short-lived task\n        state, `perceptual` for a raw sensory detail.\n\n        `ended_at` defaults to `occurred_at` and must not precede it. `evidence_ids` must\n        already exist and must not repeat. Omitting `idempotency_key` derives one from the\n        content, so an identical retry returns the same memory rather than a second copy --\n        and says so: `status` is `created` only when this call is what stored it.\n        ",
+    "description": "Retain one explicit memory, preserving evidence and temporal provenance.\n\nChoose `memory_type` by the role the content will serve: `episodic` for something\nthat happened at a time, `semantic` for a durable fact, `procedural` for how to do\nsomething, `prospective` for a future intention, `working` for short-lived task\nstate, `perceptual` for a raw sensory detail.\n\n`ended_at` defaults to `occurred_at` and must not precede it. `evidence_ids` must\nalready exist and must not repeat. Omitting `idempotency_key` derives one from the\ncontent, so an identical retry returns the same memory rather than a second copy --\nand says so: `status` is `created` only when this call is what stored it.",
     "inputSchema": {
       "$defs": {
         "MemoryType": {
@@ -1821,10 +1813,10 @@
       "$defs": {
         "EvidenceView": {
           "additionalProperties": false,
-          "description": "Precise evidence location safe to expose to a caller.",
+          "description": "Precise evidence location safe to expose to a caller.\n\nThe offsets locate the span inside `media_object_id`. They do not locate it inside\n`media_url`, which is usually a copy cut for this span alone: that copy's own timeline\nstarts at zero and may carry slightly more than the span, and where no single copy covers\nthe span it is the whole source object instead. Seek with these offsets only into\n`media_object_id`.",
           "properties": {
             "end_ms": {
-              "description": "Span end within that media, in milliseconds.",
+              "description": "Span end within `media_object_id`, in milliseconds.",
               "minimum": 0,
               "title": "End Ms",
               "type": "integer"
@@ -1837,14 +1829,14 @@
               "type": "string"
             },
             "media_object_id": {
-              "description": "Media object the span was cut from.",
+              "description": "Media object the span was cut from, and the one the offsets below index.",
               "maxLength": 255,
               "minLength": 1,
               "title": "Media Object Id",
               "type": "string"
             },
             "media_url": {
-              "description": "Signed URL for the bytes, so verifying needs no separate storage call.",
+              "description": "Signed URL for this span's bytes, so verifying needs no separate storage call. It is a copy cut for the span where one exists, and the whole source object where none does; bytes are attached to a generation request only while they are about the span, so an answer over a span its source dwarfs was produced without them.",
               "maxLength": 2048,
               "minLength": 1,
               "title": "Media Url",
@@ -1857,7 +1849,7 @@
               "type": "string"
             },
             "start_ms": {
-              "description": "Span start within that media, in milliseconds.",
+              "description": "Span start within `media_object_id`, in milliseconds.",
               "minimum": 0,
               "title": "Start Ms",
               "type": "integer"

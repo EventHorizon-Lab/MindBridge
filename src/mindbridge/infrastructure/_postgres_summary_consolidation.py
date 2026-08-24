@@ -76,7 +76,6 @@ memory_embeddings AS (
     SELECT embedding.tenant_id,
            embedding.object_id AS memory_id,
            embedding.space_id,
-           embedding.space_revision,
            embedding.task,
            embedding.embedding
     FROM embeddings AS embedding
@@ -86,7 +85,6 @@ memory_embeddings AS (
     SELECT relation.tenant_id,
            relation.target_id AS memory_id,
            embedding.space_id,
-           embedding.space_revision,
            embedding.task,
            embedding.embedding
     FROM relations AS relation
@@ -137,7 +135,6 @@ related_pairs AS (
               JOIN memory_embeddings AS peer_embedding
                 ON peer_embedding.tenant_id = seed_embedding.tenant_id
                AND peer_embedding.space_id = seed_embedding.space_id
-               AND peer_embedding.space_revision = seed_embedding.space_revision
                AND peer_embedding.task = seed_embedding.task
               WHERE seed_embedding.tenant_id = seed.tenant_id
                 AND seed_embedding.memory_id = seed.memory_id

@@ -45,6 +45,7 @@ class LoCoMoRefinedPrediction(ContractModel):
     mindbridge_confidence: float = Field(ge=0.0, le=1.0)
     mindbridge_prediction_context: tuple[Identifier, ...]
     mindbridge_trace_id: Identifier
+    mindbridge_ingest_failure_count: int = Field(default=0, ge=0)
 
 
 async def run_locomo_refined_conversation(
@@ -65,9 +66,13 @@ async def run_locomo_refined_conversation(
         *(
             _remember_turn(memory, tenant_id, conversation.sample_id, turn, semaphore)
             for turn in conversation.turns
-        )
+        ),
+        return_exceptions=True,
     )
-    dialog_id_by_memory_id = {memory_id: dialog_id for dialog_id, memory_id in remembered}
+    ingest_failures = _count_ingest_failures(remembered)
+    dialog_id_by_memory_id = {
+        outcome[1]: outcome[0] for outcome in remembered if not isinstance(outcome, BaseException)
+    }
     return tuple(
         await asyncio.gather(
             *(
@@ -78,11 +83,22 @@ async def run_locomo_refined_conversation(
                     dialog_id_by_memory_id,
                     recall_limit,
                     semaphore,
+                    ingest_failures,
                 )
                 for question in conversation.questions
             )
         )
     )
+
+
+def _count_ingest_failures(outcomes: list[tuple[str, str] | BaseException]) -> int:
+    """Count the turns that failed so a single bad turn cannot discard its whole conversation.
+
+    A bare gather made the first exception the whole conversation's result, throwing away every
+    turn already written. The count rides along on every prediction, so a run still tells missing
+    history apart from a wrong answer.
+    """
+    return sum(isinstance(outcome, BaseException) for outcome in outcomes)
 
 
 async def _remember_turn(
@@ -112,6 +128,7 @@ async def _answer_question(
     dialog_id_by_memory_id: dict[str, str],
     recall_limit: int,
     semaphore: asyncio.Semaphore,
+    ingest_failures: int,
 ) -> LoCoMoRefinedPrediction:
     async with semaphore:
         result = await memory.recall(
@@ -134,6 +151,7 @@ async def _answer_question(
         mindbridge_confidence=result.confidence,
         mindbridge_prediction_context=retrieved_dialog_ids,
         mindbridge_trace_id=result.trace_id,
+        mindbridge_ingest_failure_count=ingest_failures,
     )
 
 

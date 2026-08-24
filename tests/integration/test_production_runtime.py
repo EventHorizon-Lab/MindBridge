@@ -73,15 +73,12 @@ def _settings(*, tenant_api_keys_json: str | None = None) -> Settings:
             "api_key": "unit-test-generator-key",
             "endpoint": "https://generator.example.test/v1",
             "model_id": "qwen3.8-max",
-            "model_revision": "deployment-revision",
         },
         embedder_config={
             "api_key": "unit-test-query-key",
             "endpoint": "https://query.example.test/v1",
             "model_id": "jina-omni",
-            "model_revision": "omni-revision",
             "space_id": "jina-v5",
-            "space_revision": "space-v1",
         },
         tenant_api_keys_json=tenant_api_keys_json,
     )

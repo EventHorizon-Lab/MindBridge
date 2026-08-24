@@ -45,6 +45,10 @@ Plugin configs use `extra="forbid"`. An unrecognized key fails startup rather th
 because "that setting had no effect" is a much worse outcome to debug than a failed boot. Check
 the key against the plugin's documented fields.
 
+After upgrading past migration `0021` the usual culprits are `model_revision` and
+`space_revision`, which no longer exist on any plugin. Delete them from your `*_CONFIG_JSON`
+objects; `model_id` and `space_id` still carry the identity they were paired with.
+
 ### `embedding dimension must be one of 32, 64, 128, 256, 512, 768, 1024`
 
 `MINDBRIDGE_EMBEDDING_DIMENSION` accepts only widths Jina v5 was trained to truncate to. Any other
@@ -55,7 +59,7 @@ value is an untrained truncation that silently degrades recall quality.
 The embedding-space probe found a tenant holding vectors the configured space cannot reach. This
 is the guard that stops a changed embedder from turning every recall into an empty result.
 
-Either restore the previous `MINDBRIDGE_EMBEDDING_SPACE_ID` / `_REVISION` / `_DIMENSION`, or
+Either restore the previous `MINDBRIDGE_EMBEDDING_SPACE_ID` / `_DIMENSION`, or
 complete the re-embedding. Vectors in several spaces are accepted **while** a migration is in
 progress, so a partial rebuild is not itself the problem.
 
@@ -124,9 +128,12 @@ threshold. Check which of the two you actually have before changing anything: co
 
 ### Confidence is high but the answer is wrong
 
-Pull the evidence. `RecallResult.evidence` carries signed URLs to the exact `start_ms`–`end_ms`
-slice. Playing it tells you immediately whether retrieval or perception failed — which is the
-entire reason evidence is attached rather than referenced.
+Pull the evidence. `RecallResult.evidence` carries a signed URL to media covering the cited
+`start_ms`–`end_ms` span: normally a clip derived for that span, whose own timeline starts at
+zero and which may run wider than the cited range, and otherwise the whole source object. Play
+it from the start rather than seeking to `start_ms`, and it tells you immediately whether
+retrieval or perception failed — which is the entire reason evidence is attached rather than
+referenced.
 
 Then record it, so the lifecycle layer learns:
 
@@ -161,6 +168,16 @@ and `attempt`.
 | `object_storage_unavailable` | Media could not be read. Check the URI, credentials, and endpoint. |
 | `memory_integrity_failed` | Stored state is inconsistent. Investigate; this should be zero. |
 
+### `request_validation_failed` naming `model_revision` on observe
+
+An edge device older than migration `0021` is still sending `model_revision` inside
+`identity_observations`. The field used to be required and is now rejected, because request
+contracts refuse unknown fields rather than dropping them silently — the alternative is a device
+believing it recorded provenance the server threw away.
+
+Upgrade the device. There is no server-side setting to accept the old shape, and the field has no
+replacement: `model_id` alone now records which edge model produced a span.
+
 ### `task_broker_unavailable` on observe
 
 Redis is unreachable from the API. Nothing is half-written — the transaction and the enqueue are
@@ -177,8 +194,27 @@ are derived from it and follow automatically.
 
 ### Jobs stay `pending`
 
-The worker is not consuming. Check it is running, has `--extra server --extra cloud-models`
-installed, and points at the same `MINDBRIDGE_TASK_BROKER_URL`.
+Two different causes, and they are told apart by the queue rather than by the rows.
+
+**The worker is not consuming.** Check it is running, points at the same
+`MINDBRIDGE_TASK_BROKER_URL`, and is installed with the extras it actually needs:
+`--extra server --extra media` at minimum. `media` carries the PyAV, Pillow, and SoundFile
+decoders that cut evidence clips, which the worker does whatever its embedder slots say — without
+it the process starts fine and fails the first observation that carries media. Add
+`--extra cloud-models` only for an in-process encoder, which brings `media` with it.
+
+**Or the message is gone and the row is not.** `task_acks_late=True` acks a message the moment its
+task raises, so any exception outside the worker's `autoretry_for` discards the message while the
+row stays claimable. The row will sit `pending` forever because nothing will tell a worker about it
+again. The tell is a non-zero `claimable` beside an empty `queue_depth`:
+
+```bash
+mindbridge jobs --tenant-id tenant_01
+mindbridge jobs --tenant-id tenant_01 --republish
+```
+
+Reporting is the default because each republished message runs a generator. See
+[operations](operations.md#job-ledger-reconciliation).
 
 ### `TypeError: 'NoneType' object is not callable` on the first frame
 
@@ -223,9 +259,14 @@ default `max_connections` of 100. Size it across your whole deployment, not per 
 Frame rate sets the entire write cost: one clip cut, one encoder call, one stored object per
 sampled window. Lower `frames_per_second` in `MINDBRIDGE_MEDIA_SAMPLING_CONFIG_JSON` first.
 
-Above roughly 1.3 fps at 30-second segments, the generation proxy also stops working — the MP4
-muxer refuses to interleave a sparse video track with continuous audio past about forty sampled
-frames. Raising frame rate therefore trades the proxy away as well.
+Above roughly 1.3 fps at 30-second segments, the generation proxy also stops working — past about
+forty sampled frames its encode fails on the flush that drains the encoder. Raising frame rate
+therefore trades the proxy away as well. This was documented as the MP4 muxer refusing to
+interleave a sparse video track with continuous audio; it is not, and so turning `proxy_audio`
+off buys no frames. Lower the frame rate or segment shorter.
+
+If your generator ignores audio, `proxy_audio: false` is still worth setting — it is a smaller
+file to encode and transfer, just not a longer one.
 
 ### Consolidation is expensive
 
@@ -286,8 +327,27 @@ The import happens inside the same guard as the run, so a missing extra fails th
 incomplete environment does — including for `--help` — instead of printing frames from a
 third-party package.
 
+## Reading the logs
+
+Every process writes structured records to stderr with no collector needed, so the first place to
+look is the process output rather than a dashboard:
+
+```bash
+MINDBRIDGE_LOG_FORMAT=text MINDBRIDGE_LOG_LEVEL=DEBUG mindbridge mcp
+```
+
+Each instrumented operation logs its own `duration_ms` and `outcome` on completion, and every
+record carries `trace_id` when a span is active — so the ID from a failing response greps
+straight to the operations behind it. Four warnings name conditions that are otherwise invisible
+in a deployment that looks healthy: a structured-output retry, a silently downgraded generation
+proxy, a transient database failure with its SQLSTATE, and a provider error with its status code.
+[Operations](operations.md) lists them.
+
+To find where a slow run spends its time, set `MINDBRIDGE_TIMING_SUMMARY=1` and read the ranked
+per-operation summary at exit. `mindbridge-bench` prints it for every run without the variable.
+
 ## Getting help
 
 Include the `trace_id` from the failing response. It maps directly onto the OTLP backend and
-identifies the whole request. Everything else — logs, timing, span attributes — is reachable from
-it, and none of it contains user content.
+identifies the whole request, and it appears in the logs above, so timings and span attributes
+are both reachable from it. None of it contains user content.

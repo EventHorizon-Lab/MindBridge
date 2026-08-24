@@ -34,7 +34,7 @@ from mindbridge.models.openai import OpenAIGenerator, normalize_base_url
 NOW = datetime(2026, 8, 12, 12, 0, tzinfo=timezone.utc)
 
 
-async def test_summary_consolidator_inspects_native_evidence_and_preserves_revision() -> None:
+async def test_summary_consolidator_inspects_native_evidence_and_reports_its_model() -> None:
     async def respond(request: httpx.Request) -> httpx.Response:
         payload: dict[str, object] = json.loads(request.content)
         messages = cast(list[dict[str, object]], payload["messages"])
@@ -57,7 +57,7 @@ async def test_summary_consolidator_inspects_native_evidence_and_preserves_revis
                     }
                 ]
             },
-            fingerprint="summary-serving-revision-01",
+            fingerprint="summary-serving-fingerprint-01",
         )
 
     consolidator = _consolidator(respond)
@@ -72,8 +72,8 @@ async def test_summary_consolidator_inspects_native_evidence_and_preserves_revis
         MemoryId("memory_02"),
     )
     assert result.summaries[0].scope is SummaryScope.SESSION
-    assert result.model_reference.revision == "deployment-revision"
-    assert result.prompt_version == "consolidate_summaries_v3"
+    assert result.model_reference.model_id == "qwen3.8-max"
+    assert result.prompt_version == "consolidate_summaries_v4"
 
 
 async def test_summary_consolidator_rejects_unknown_memory_and_missing_evidence() -> None:
@@ -122,7 +122,7 @@ async def test_summary_consolidator_retries_invalid_structure_in_json_mode() -> 
 
     async def respond(request: httpx.Request) -> httpx.Response:
         payload: dict[str, object] = json.loads(request.content)
-        response_formats.append(payload.get("response_format"))
+        response_formats.append(_schema_name(payload))
         return _streaming_response(next(responses))
 
     consolidator = _consolidator(respond)
@@ -132,7 +132,7 @@ async def test_summary_consolidator_retries_invalid_structure_in_json_mode() -> 
         await consolidator.close()
 
     assert result.summaries == ()
-    assert response_formats == [None, {"type": "json_object"}]
+    assert response_formats == ["summary_consolidation", "summary_consolidation"]
 
 
 def _consolidator(
@@ -147,7 +147,7 @@ def _consolidator(
     return _SummaryHarness(
         OpenAIGenerator(
             client,
-            ModelReference(model_id="qwen3.8-max", revision="deployment-revision"),
+            ModelReference(model_id="qwen3.8-max"),
         )
     )
 
@@ -174,7 +174,7 @@ def _candidates() -> tuple[tuple[SummaryCandidate, ...], tuple[ResolvedEvidence,
                 ended_at=NOW + timedelta(seconds=4),
                 created_at=NOW,
                 verification_status=VerificationStatus.VERIFIED,
-                model_reference=ModelReference(model_id="omni", revision="perception-revision"),
+                model_reference=ModelReference(model_id="omni"),
             ),
             entity_ids=(EntityId("tool"),),
         ),
@@ -221,6 +221,16 @@ def _evidence() -> ResolvedEvidence:
         media_url="https://objects.example.test/clip.mp4",
         media_url_expires_at=NOW + timedelta(minutes=5),
     )
+
+
+def _schema_name(payload: dict[str, object]) -> str | None:
+    """Return the schema one request constrained decoding to, or None when unconstrained."""
+    response_format = payload.get("response_format")
+    if not isinstance(response_format, dict) or response_format.get("type") != "json_schema":
+        return None
+    schema = cast(dict[str, object], response_format["json_schema"])
+    assert schema["strict"] is True
+    return cast(str, schema["name"])
 
 
 def _streaming_response(payload: object, *, fingerprint: str | None = None) -> httpx.Response:

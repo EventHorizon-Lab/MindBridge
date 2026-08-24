@@ -29,7 +29,11 @@ from mindbridge.application.capabilities import (
     ModelInput,
     TextPart,
 )
-from mindbridge.application.pipelines.structured import generate_json, unwrap_json_code_fence
+from mindbridge.application.pipelines.structured import (
+    generate_json,
+    output_schema,
+    unwrap_json_code_fence,
+)
 from mindbridge.contracts import IdentityObservationInput
 from mindbridge.core import (
     IdentityKind,
@@ -66,7 +70,6 @@ FUNASR_STREAMING_ASR_MODEL_ID = (
 )
 FUNASR_VAD_MODEL_ID = "iic/speech_fsmn_vad_zh-cn-16k-common-pytorch"
 FUNASR_PUNCTUATION_MODEL_ID = "iic/punc_ct-transformer_zh-cn-common-vad_realtime-vocab272727"
-FUNASR_MODEL_REVISION = "v2.0.4"
 _PARALLEL_MODEL_MINIMUM_FREE_CUDA_BYTES = 8 * 1024 * 1024 * 1024
 
 _Transcript = Annotated[
@@ -193,6 +196,11 @@ class SpeechAnalysis:
     speaker_embeddings: tuple[SpeakerEmbeddingSample, ...]
 
 
+_ACTIVE_SPEAKER_SCHEMA = output_schema("active_speaker_match", _ActiveSpeakerOutput)
+
+_SPEECH_SEGMENT_SCHEMA = output_schema("speech_segmentation", _DiarizationOutput)
+
+
 class FunASRSpeechPipeline:
     """Run upstream VAD, ASR, punctuation, diarization, and speaker embedding once."""
 
@@ -219,13 +227,9 @@ class FunASRSpeechPipeline:
         selected_device = select_torch_device(device)
         pipeline = funasr.AutoModel(
             model=FUNASR_ASR_MODEL_ID,
-            model_revision=FUNASR_MODEL_REVISION,
             vad_model=FUNASR_VAD_MODEL_ID,
-            vad_model_revision=FUNASR_MODEL_REVISION,
             punc_model=FUNASR_PUNCTUATION_MODEL_ID,
-            punc_model_revision=FUNASR_MODEL_REVISION,
             spk_model=CAMPPLUS_MODEL.model_id,
-            spk_model_revision=CAMPPLUS_MODEL.revision,
             device=selected_device,
             disable_update=True,
             disable_pbar=True,
@@ -316,7 +320,6 @@ class FunASRStreamingTranscriber:
         selected_device = select_torch_device(device)
         pipeline = funasr.AutoModel(
             model=FUNASR_STREAMING_ASR_MODEL_ID,
-            model_revision=FUNASR_MODEL_REVISION,
             device=selected_device,
             disable_update=True,
             disable_pbar=True,
@@ -463,6 +466,7 @@ class VisualActiveSpeakerPipeline:
                     )
                 ),
                 max_output_tokens=self._max_output_tokens,
+                output_schema=_ACTIVE_SPEAKER_SCHEMA,
             ),
             _parse_active_speakers,
         )
@@ -667,6 +671,7 @@ class SpeechSegmentationPipeline:
                     )
                 ),
                 max_output_tokens=self._max_output_tokens,
+                output_schema=_SPEECH_SEGMENT_SCHEMA,
             ),
             lambda content: _parse_output(content, duration_ms),
         )
@@ -705,10 +710,7 @@ def _record_and_resolve_voice_identities(
                 identity_id=voice.identity_id,
                 kind=voice.kind,
                 confidence=voice.confidence,
-                model_reference=ModelReference(
-                    model_id=voice.model_id,
-                    revision=voice.model_revision,
-                ),
+                model_reference=ModelReference(model_id=voice.model_id),
                 enrolled_new=False,
             ),
             association_model_reference=association_model_reference,

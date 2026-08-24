@@ -11,7 +11,11 @@ from mindbridge.application.capabilities import GenerateRequest, Generator, Mode
 from mindbridge.application.entity_resolution import EntityAdjudication, EntityPair
 from mindbridge.application.perception import ResolvedEvidence
 from mindbridge.application.pipelines.evidence import evidence_parts
-from mindbridge.application.pipelines.structured import generate_json, unwrap_json_code_fence
+from mindbridge.application.pipelines.structured import (
+    generate_json,
+    output_schema,
+    unwrap_json_code_fence,
+)
 from mindbridge.core import ModelOutputError
 from mindbridge.prompts import RESOLVE_ENTITIES_PROMPT
 from mindbridge.telemetry import operation_span, set_current_span_attributes
@@ -27,6 +31,9 @@ class _AdjudicationOutput(BaseModel):
     # Required in both directions. A verdict that cannot name what it rested on is not a
     # verdict, and this pair is the one place an unexamined "yes" would fuse two histories.
     discriminating_cue: _Cue
+
+
+_ADJUDICATION_SCHEMA = output_schema("entity_adjudication", _AdjudicationOutput)
 
 
 class EntityResolutionPipeline:
@@ -61,13 +68,13 @@ class EntityResolutionPipeline:
                     )
                 ),
                 max_output_tokens=self._max_output_tokens,
+                output_schema=_ADJUDICATION_SCHEMA,
             ),
             _parse_output,
         )
         set_current_span_attributes(
             {
                 "mindbridge.model.id": result.model_reference.model_id,
-                "mindbridge.model.revision": result.model_reference.revision,
                 "mindbridge.prompt.version": RESOLVE_ENTITIES_PROMPT.version,
                 "mindbridge.entity.same_entity": output.same_entity,
                 "mindbridge.evidence.count": len(evidence),

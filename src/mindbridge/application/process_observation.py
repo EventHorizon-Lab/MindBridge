@@ -34,6 +34,7 @@ from mindbridge.application.ports import (
     Perceiver,
 )
 from mindbridge.core import (
+    ClaimType,
     DatabaseUnavailableError,
     DomainInvariantError,
     Event,
@@ -61,10 +62,15 @@ from mindbridge.media.clipping import (
     cut_generation_proxy,
 )
 from mindbridge.telemetry import (
+    log_fields,
+    logger,
     operation_span,
+    record_output_repairs,
     record_stage_duration,
     set_current_span_attributes,
 )
+
+_LOGGER = logger("mindbridge.application.process_observation")
 
 
 class ProcessObservation:
@@ -144,6 +150,15 @@ class ProcessObservation:
             # so it reads a copy cut to them rather than making the model download the frames it
             # is about to discard. The copies are lent for the length of the call: nothing
             # registers them, so scoping them here is what keeps them from outliving it.
+            # `ClaimType` resolves a listed alias rather than rejecting the observation over
+            # it, which means an aliased claim is indistinguishable from a native one by the
+            # time it lands. The delta across this attempt is the only place the substitution
+            # is still visible, so it is reported next to the event and prompt counts: a
+            # vocabulary that shifts, or one that stops shifting after a prompt change, should
+            # be readable rather than inferred. A worker child runs one attempt at a time, so
+            # the delta is this observation's; a process that perceived concurrently would see
+            # the two attempts' aliases pooled.
+            aliases_before = sum(ClaimType.alias_uses().values())
             async with generation_proxies(
                 tenant_id,
                 evidence,
@@ -180,6 +195,13 @@ class ProcessObservation:
                     "mindbridge.prompt.version": perception.prompt_version,
                 }
             )
+            record_output_repairs(
+                {
+                    "mindbridge.perception.claim_type_alias_count": (
+                        sum(ClaimType.alias_uses().values()) - aliases_before
+                    )
+                }
+            )
             # Clip the grounded event spans, not the whole-file source spans:
             # a vector is only as precise as the span it was cut from.
             embedding_evidence = await resolve_evidence_media(
@@ -202,6 +224,7 @@ class ProcessObservation:
                     events,
                     graph.claims,
                     graph.entities,
+                    graph.memories,
                     self._text_embedder,
                     claim.job.created_at,
                 ),
@@ -236,14 +259,72 @@ class ProcessObservation:
             record_stage_duration("cloud.job_to_searchable_ready", ready_seconds)
             return completed
         except Exception as error:
+            error_code = _processing_error_code(error)
+            # The code is what decides whether Celery retries this attempt or settles it, and
+            # it is written to the job row rather than raised, so without this line the
+            # operator sees a failed observation and has to query the store to learn why.
+            _LOGGER.warning(
+                "observation processing attempt failed",
+                extra=log_fields(
+                    tenant_id=tenant_id,
+                    observation_id=observation_id,
+                    job_id=job_id,
+                    attempt=claim.job.attempt,
+                    error_code=error_code,
+                    error_type=type(error).__name__,
+                    error=str(error),
+                ),
+            )
             await self._store.mark_observation_processing_failed(
                 tenant_id,
                 observation_id,
                 job_id,
                 attempt=claim.job.attempt,
-                error_code=_processing_error_code(error),
+                error_code=error_code,
             )
             raise
+
+
+async def record_unclaimed_processing_failure(
+    store: ObservationProcessingStore,
+    tenant_id: TenantId,
+    observation_id: ObservationId,
+    job_id: JobId,
+    error: Exception,
+) -> None:
+    """Record a failure that happened before `run` above could claim the row.
+
+    `task_acks_late` acks and discards the message of a task that raised, so anything that fails
+    before the claim leaves no trace anywhere: no `failed` row, because the handler that writes
+    one sits after the claim, and no message, because the broker already dropped it. That is the
+    split the 2026-08-21 evaluation ended with -- 479 CUDA out-of-memory errors against ~17
+    `failed` rows and ~318 rows stranded `pending`.
+
+    The claim is taken here only in order to record, and that is the whole design rather than a
+    detail to tidy away later. Claiming up front instead, before the models load, is broken:
+    `run` claims for itself, so a second claim comes back unacquired, `run` returns the row's
+    `RUNNING` state, and the Worker's running-state loop re-delivers the observation 40 times at
+    30 second intervals without ever processing it. Claiming up front is also slower to recover
+    from the failure that ran alongside those out-of-memory errors, a host `global_oom` that
+    kills the child outright: a row already `running` is invisible to `mindbridge jobs
+    --republish` until the 960 second stale window expires, while a row left `pending` is
+    republished immediately. Recording is one write long, so that window never opens.
+
+    An unacquired claim is another delivery's or a finished job's, and is left exactly as found.
+    """
+    claim = await store.claim_observation_processing_job(tenant_id, observation_id, job_id)
+    if not claim.acquired:
+        return
+    await store.mark_observation_processing_failed(
+        tenant_id,
+        observation_id,
+        job_id,
+        attempt=claim.job.attempt,
+        # Not the generic fallthrough: this observation was never perceived, so an operator can
+        # fix the environment and republish it without paying again for a rejection it already
+        # bought. `observation_processing_failed` cannot say that.
+        error_code=_processing_error_code(error, "worker_setup_failed"),
+    )
 
 
 def _referenced_media(
@@ -380,7 +461,10 @@ def _require_grounded_perception(
             raise DomainInvariantError("perceived event does not overlap source evidence")
 
 
-def _processing_error_code(error: Exception) -> str:
+def _processing_error_code(
+    error: Exception,
+    default: str = "observation_processing_failed",
+) -> str:
     if isinstance(error, DatabaseUnavailableError):
         return "database_unavailable"
     if isinstance(error, ModelUnavailableError):
@@ -395,4 +479,4 @@ def _processing_error_code(error: Exception) -> str:
         return "memory_integrity_failed"
     if isinstance(error, DomainInvariantError):
         return "domain_invariant_failed"
-    return "observation_processing_failed"
+    return default

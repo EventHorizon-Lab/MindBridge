@@ -3,6 +3,7 @@
 from datetime import datetime, timezone
 
 import pytest
+from pydantic import BaseModel, ValidationError
 
 from mindbridge.core import (
     Claim,
@@ -28,7 +29,7 @@ from mindbridge.core import (
 NOW = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
 TENANT_ID = TenantId("tenant_01")
 EVIDENCE_ID = EvidenceId("evidence_01")
-MODEL = ModelReference(model_id="Qwen/Qwen3-Omni", revision="2026-08-01")
+MODEL = ModelReference(model_id="Qwen/Qwen3-Omni")
 
 
 def test_derived_records_preserve_provenance() -> None:
@@ -38,7 +39,9 @@ def test_derived_records_preserve_provenance() -> None:
 
     assert event.evidence_ids == (EVIDENCE_ID,)
     assert event.model_reference == MODEL
-    assert embedding.model_reference.revision == "abcdef0"
+    assert embedding.model_reference == ModelReference(
+        model_id="jinaai/jina-embeddings-v5-omni-small"
+    )
 
 
 def test_event_requires_traceable_evidence() -> None:
@@ -97,6 +100,36 @@ def test_claim_rejects_reversed_validity() -> None:
     """World-valid time cannot end before it starts."""
     with pytest.raises(DomainInvariantError, match="valid_to"):
         _claim(valid_to=datetime(2026, 8, 11, 11, 0, tzinfo=timezone.utc))
+
+
+def test_an_observed_action_resolves_to_a_fact_and_is_counted() -> None:
+    """The one vocabulary perception reached for that this enum has no member of.
+
+    Measured on 2026-08-21: `claim_type='action'` 186 times across 134 observations, the only
+    enum violation in the run, each one discarding a whole observation's generated events,
+    entities, and claims. An observed action is a perceptible fact at a time and the claim
+    carries its own validity range, so the label is what the mapping loses.
+    """
+    before = ClaimType.alias_uses().get("action", 0)
+
+    assert ClaimType("action") is ClaimType.FACT
+    assert ClaimType(" Action ") is ClaimType.FACT
+    assert ClaimType.alias_uses()["action"] == before + 2
+    # The alias table is a list, not a coercion: an unlisted value still surfaces, which is
+    # the only reason `action` was ever known about.
+    with pytest.raises(ValueError, match="not a valid ClaimType"):
+        ClaimType("preference")
+
+
+def test_a_pydantic_model_field_resolves_the_same_alias() -> None:
+    """The parse boundary that rejected these claims goes through enum coercion."""
+
+    class _Parsed(BaseModel):
+        claim_type: ClaimType
+
+    assert _Parsed(claim_type="action").claim_type is ClaimType.FACT  # type: ignore[arg-type]
+    with pytest.raises(ValidationError):
+        _Parsed(claim_type="preference")  # type: ignore[arg-type]
 
 
 def test_embedding_dimension_must_match_values() -> None:
@@ -164,11 +197,8 @@ def _embedding(
         object_type=EmbeddedObjectType.EVENT,
         object_id="event_01",
         values=values,
-        model_reference=ModelReference(
-            model_id="jinaai/jina-embeddings-v5-omni-small",
-            revision="abcdef0",
-        ),
-        space_reference=EmbeddingSpaceReference(space_id="jina-v5", revision="space-v1"),
+        model_reference=ModelReference(model_id="jinaai/jina-embeddings-v5-omni-small"),
+        space_reference=EmbeddingSpaceReference(space_id="jina-v5"),
         task="retrieval_document",
         dimension=dimension,
         normalized=True,

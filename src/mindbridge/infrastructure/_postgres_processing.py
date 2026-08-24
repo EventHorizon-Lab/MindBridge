@@ -132,6 +132,10 @@ def _require_output_identity(
         *((EmbeddedObjectType.EVENT, str(event.event_id)) for event in output.events),
         *((EmbeddedObjectType.CLAIM, str(claim.claim_id)) for claim in output.claims),
         *((EmbeddedObjectType.ENTITY, str(entity.entity_id)) for entity in output.entities),
+        # A derived memory is indexed under its own ID because that is the channel recall
+        # searches to produce memory IDs at all; the vector is the one already computed for
+        # the event or claim the memory represents.
+        *((EmbeddedObjectType.MEMORY_RECORD, str(memory.memory_id)) for memory in output.memories),
     }
     if any(
         embedding.object_type is not EmbeddedObjectType.EVIDENCE_SPAN

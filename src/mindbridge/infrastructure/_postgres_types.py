@@ -9,6 +9,9 @@ from psycopg.rows import TupleRow
 from psycopg_pool import AsyncConnectionPool
 
 from mindbridge.core import DatabaseUnavailableError
+from mindbridge.telemetry import log_fields, logger
+
+_LOGGER = logger("mindbridge.infrastructure.postgres")
 
 DatabaseConnection: TypeAlias = AsyncConnection[TupleRow]
 DatabasePool: TypeAlias = AsyncConnectionPool[DatabaseConnection]
@@ -57,4 +60,11 @@ def translate_transient_database_errors() -> Iterator[None]:
             sqlstate.startswith("08") or sqlstate in _TRANSIENT_SQLSTATES
         ):
             raise
+        # The SQLSTATE is the whole diagnosis and the translation discards it: a deadlock, a
+        # statement timeout, and a server restart all reach the caller as one retryable
+        # error, and telling them apart is what decides whether to retune or to page.
+        _LOGGER.warning(
+            "database failure classified as transient",
+            extra=log_fields(sqlstate=sqlstate, error_type=type(error).__name__),
+        )
         raise DatabaseUnavailableError("database is temporarily unavailable") from error

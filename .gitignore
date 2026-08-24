@@ -19,3 +19,7 @@ dist/
 # patterns are unanchored for that reason.
 receipts/
 review-receipts/
+
+# Celery beat writes its schedule database to the working directory it is started from,
+# which for this deployment is the repo root. It is runtime state, not source.
+celerybeat-schedule

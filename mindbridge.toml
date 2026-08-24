@@ -17,17 +17,15 @@ bucket = "mindbridge-media"
 endpoint_url = "http://localhost:9000"
 
 # One search space and one vector width shared by the index and every encoder. Both encoder
-# sections below inherit these three keys, so the deployment states them once.
+# sections below inherit these two keys, so the deployment states them once.
 [embedding]
 dimension = 1024
 space_id = "jinaai/jina-embeddings-v5-omni-small-retrieval-1024"
-space_revision = "omni@12949877f0092093f366c6450340011320152a05"
 
 [generator]
 plugin = "openai"
 endpoint = "http://localhost:8001/v1"
 model_id = "qwen3.8-max"
-model_revision = "deployment-2026-08-11"
 # The Worker sizes its Celery budget from this, so the two have to agree. A perception clip can
 # take 16-25 minutes, which is why the default is not a web timeout.
 request_timeout_seconds = 1800
@@ -36,11 +34,26 @@ request_timeout_seconds = 1800
 plugin = "openai"
 endpoint = "http://localhost:8002/v1"
 model_id = "jinaai/jina-embeddings-v5-omni-small-retrieval"
-model_revision = "12949877f0092093f366c6450340011320152a05"
 
-# The Worker's local image, video, and audio encoder. model_id here is a Hugging Face
-# repository ID; the embedder's model_id above is an endpoint's alias for a served model.
+# The Worker's image, video, and audio encoder. `openai` points it at the embedder endpoint
+# already configured above, which encodes media as well as text -- no second model and no GPU.
+# `jina` loads the model in-process instead: it needs --extra cloud-models, a model_id that is
+# a Hugging Face repository ID, and 3.7 GiB of VRAM in *every* prefork child.
 [media_embedder]
-plugin = "jina"
-model_id = "jinaai/jina-embeddings-v5-omni-small-retrieval"
-model_revision = "12949877f0092093f366c6450340011320152a05"
+plugin = "openai"
+
+# How many jobs one Worker process runs at once, and how much device memory this deployment
+# lets resident encoders occupy. Both are commented out because the shipped defaults -- one job
+# per process, one model copy of headroom -- are the safe ones, and raising either is a
+# deployment's decision. A served media slot is network-bound, so 8 is a reasonable start; the
+# Worker refuses to start when a pool that wide would exceed the budget while an encoder slot
+# names an in-process plugin.
+[worker]
+# concurrency = 8
+# vram_budget_gib = 48
+
+# Unset `level` is INFO; unset `format` gets the readable form on a terminal and the parseable
+# one in a pipe.
+[log]
+# level = "INFO"
+# format = "json"

@@ -127,6 +127,50 @@ first and read the count — a number far larger than expected means something e
 
 The flag reads the object-storage variables, so enable it only where those are configured.
 
+## Job ledger reconciliation
+
+PostgreSQL is the authority for job state; the broker only carries the ID of work already recorded
+there. The two drift apart silently. `task_acks_late=True` acks a message the moment its task
+raises, so any exception outside the worker's `autoretry_for` throws the message away while the row
+stays claimable — the row is still `pending`, and no worker will ever be told about it again.
+
+The symptom is observations that never become searchable while the queue sits empty and the workers
+look idle. Nothing errors, because from each side's own point of view nothing is wrong.
+
+```bash
+mindbridge jobs --tenant-id tenant_01
+mindbridge jobs --tenant-id tenant_01 --republish
+```
+
+Reporting is the default because republishing spends money: every message that lands runs a
+generator. Read `claimable` against `queue_depth`. A non-zero count beside an empty `queue_depth`
+is exactly this divergence; a non-zero count beside a deep queue usually just means the workers
+are behind.
+
+What `--republish` then does depends on the scope, and the report's `withheld` field says which
+happened. Across the whole ledger it publishes only the difference — the queue already holds a
+message for the rest, and duplicating those is not free: the delivery that loses the claim
+re-queues itself every 30 seconds up to 40 times waiting for the winner. Under `--tenant-id` it
+publishes every claimable row and withholds nothing, because the depth counts every tenant's
+messages and cancelling one tenant's stranded rows against another's backlog would repair nothing.
+On a deep queue, then, judge a scoped repair by `claimable` before running it: the messages already
+queued for that tenant will be duplicated.
+
+The same report answers "who is consuming the worker", ordered by `work_seconds` — total worker
+time across every attempt, including the attempt in flight. Both durations and both token counts
+cover every attempt, because a failed attempt held a worker and was billed as surely as a
+successful one. Field-by-field meanings are in the [CLI reference](api/cli.md#mindbridge-jobs).
+
+Two cautions. `--include-failed` is off by default because a deterministic failure republished on a
+timer pays for the same rejection every time — republish `failed` rows once you know why they
+failed, not on a schedule. And kombu publishes with `LPUSH` while the worker consumes with `RPOP`,
+so a republished job waits behind everything already queued: on a deep queue, expect the repair to
+take effect slowly rather than assuming it did not work.
+
+Under row-level security a cross-tenant scan returns no rows rather than failing, so a confined
+role reading "nothing to repair" is the one answer you cannot trust. Pass `--tenant-id`, or use a
+role that can see every tenant; the command refuses rather than guessing.
+
 ## Scheduling
 
 Both commands are one-shot, idempotent, and tenant-scoped. Use the deployment's existing control
@@ -162,9 +206,53 @@ bill into a spike.
 Both commands print one JSON object on stdout. Capture it: it is the record of what the sweep did,
 and the only place the dropped-pair counts appear.
 
+## Logs
+
+Every process writes structured records to stderr with no collector and no configuration. Each
+instrumented operation logs its own duration and outcome as it completes, so the write and read
+paths are attributable from `docker logs` alone.
+
+```bash
+export MINDBRIDGE_LOG_FORMAT=json     # or text for a terminal; unset picks by TTY
+export MINDBRIDGE_LOG_LEVEL=INFO      # WARNING keeps failures and drops the operation stream
+```
+
+```json
+{"level":"INFO","message":"operation success","operation":"mindbridge.recall",
+ "duration_ms":812.4,"self_ms":31.2,"mindbridge.recall.answered":true,
+ "trace_id":"4f1c...","service":"mindbridge-api"}
+```
+
+`duration_ms` is inclusive and `self_ms` excludes nested instrumented operations. Records carry
+IDs and counts, never memory text, prompts, media, or credentials — the same rule the spans
+follow.
+
+Four warnings exist because the condition is otherwise invisible in a working deployment:
+
+| Warning | What it means |
+| --- | --- |
+| `structured output rejected, retrying once` | The model left its output contract and a second generation was paid for. Read `constrained`: a retry that is still constrained repeats the first attempt's arguments, so the bound that failed is what to look at. |
+| `generation proxy skipped, perceiving the untouched source` | Media was silently downgraded; perception still succeeded on the source. |
+| `database failure classified as transient` | Carries the SQLSTATE the retry translation otherwise discards. |
+| `provider request failed` | Carries the status code and whether it was treated as retryable. |
+
+### Finding the bottleneck
+
+```bash
+MINDBRIDGE_TIMING_SUMMARY=1 mindbridge consolidate --tenant tenant_01
+```
+
+One row per operation at exit, ranked by self time, with `calls`, `self_seconds`,
+`total_seconds`, `mean_ms`, `max_ms`, and `self_share`. Rank by self time rather than total:
+by total, the outermost operation always wins because it contains everything.
+
+`mindbridge-bench` emits it at the end of every run without the variable, including a run that
+died halfway — which is when knowing what owned the clock is worth most.
+
 ## Telemetry
 
-OpenTelemetry activates only when a standard OTLP endpoint is configured; otherwise it is a no-op.
+OpenTelemetry activates only when a standard OTLP endpoint is configured; otherwise it is a
+no-op. The logs above do not depend on it.
 
 ```bash
 export OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318
@@ -189,16 +277,19 @@ whole request.
 acknowledgement, cloud job claim and searchable readiness, and recall first-answer and completion
 latency.
 
-Generator spans additionally report media count, JSON retry, time to first token, token usage, and
-the bounded recall phase and round. None of these attributes carry user content or IDs.
+Generator spans additionally report media count, JSON retry, whether decoding was
+schema-constrained, time to first token, token usage, and the bounded recall phase and round.
+None of these attributes carry user content or IDs.
 
 | Signal | Why it matters |
 | --- | --- |
 | Recall first-answer latency | Perceived latency. Measure time to first token, not wall clock — they diverge substantially. |
+| `mindbridge.model.schema_constrained` | False across the fleet means the endpoint refused schema decoding and every structured call is back on prompt-only output. |
 | Job claim → searchable readiness | How stale memory is relative to capture. |
 | Generator JSON retry rate | A rising rate means the model is drifting off its output contract. |
 | `task_broker_unavailable` rate | Observations are being rejected outright. |
 | Job `failed` count | Remember it settles the attempt, not the job. |
+| Claimable rows against queue depth | `mindbridge jobs`. Claimable work beside an empty queue is ledger/broker divergence, not backlog. |
 | Consolidation dropped pairs | From the stdout JSON, not telemetry. Persistent drops mean a page bound is too tight. |
 
 ## Suggested alerts
@@ -210,6 +301,7 @@ the bounded recall phase and round. None of these attributes carry user content 
 | Model degrading | `model_output_invalid` or JSON retry rate rising. |
 | Storage inconsistent | Any `memory_integrity_failed`. This should be zero. |
 | Deletion stalled | Tombstones in `failed`, or in `propagating` beyond your SLA. |
+| Work recorded but not queued | `claimable` non-zero while `queue_depth` is zero. The ledger owes work no worker will be told about. |
 
 `memory_integrity_failed` deserves a page rather than a dashboard. It means stored state is
 inconsistent, which is not a load condition and will not clear on its own.
