@@ -132,10 +132,18 @@ async def resolve_evidence_media(
         raise MemoryIntegrityError("evidence media set is incomplete or ambiguous")
 
     semaphore = asyncio.Semaphore(max_concurrency)
-    clip_media = dict(clip_media or {})
-    # One presign per distinct object, whether it is a source or a substituted clip.
-    to_sign = {item.media_object_id: item for item in media_objects}
-    to_sign.update({item.media_object_id: item for item in clip_media.values()})
+    clips = dict(clip_media or {})
+    attached_by_evidence = {
+        evidence.evidence_id: clips.get(evidence.evidence_id, media_by_id[evidence.media_object_id])
+        for evidence in evidence_spans
+    }
+    # One presign per distinct object that is actually attached. Signing every source as well
+    # doubled the fan-out the moment clips existed, for URLs nothing reads: `resolved` below
+    # looks up the attached object only, so a source every one of whose spans was substituted
+    # was signed and thrown away. A measured video recall resolved 38-40 objects to attach
+    # 18-20 clips. This is bookkeeping, not latency -- one presign is a local signature,
+    # measured at 0.10 ms in-thread and 0.75 ms through `to_thread` at this concurrency.
+    to_sign = {item.media_object_id: item for item in attached_by_evidence.values()}
 
     async def sign(
         media_object: MediaObject,
@@ -149,8 +157,7 @@ async def resolve_evidence_media(
 
     def resolved(evidence: EvidenceSpan) -> ResolvedEvidence:
         source = media_by_id[evidence.media_object_id]
-        clip = clip_media.get(evidence.evidence_id)
-        attached = clip if clip is not None else source
+        attached = attached_by_evidence[evidence.evidence_id]
         download = downloads[attached.media_object_id]
         return ResolvedEvidence(
             evidence_span=evidence,

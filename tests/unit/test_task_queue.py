@@ -9,7 +9,9 @@ from celery.exceptions import (
 
 from mindbridge.core import JobId, ObservationId, TaskBrokerError, TenantId
 from mindbridge.infrastructure.task_queue import (
+    FRESH_WORK_PRIORITY,
     PROCESS_OBSERVATION_TASK,
+    RECOVERED_WORK_PRIORITY,
     CeleryObservationJobPublisher,
     create_task_queue,
 )
@@ -53,6 +55,7 @@ async def test_publisher_sends_only_stable_tenant_and_job_identity(
             }
         },
         task_id="job_process_observation_01",
+        priority=FRESH_WORK_PRIORITY,
     )
 
 
@@ -95,3 +98,19 @@ def test_task_queue_rejects_a_budget_that_cannot_hold_any_work() -> None:
     """A non-positive budget would kill every task instantly instead of bounding it."""
     with pytest.raises(ValueError, match="processing_budget_seconds must be positive"):
         create_task_queue("memory://", processing_budget_seconds=0)
+
+
+def test_repair_outranks_fresh_work_on_a_step_the_transport_actually_walks() -> None:
+    """Repair must be drained first, and only on a step kombu's Redis transport visits.
+
+    Asserted as an ordering rather than as two literals: the whole defect was that recovered
+    work was served last, so a change that swapped the two constants would restore it while
+    leaving any equality check green. The step membership matters because kombu rounds a
+    priority to the nearest configured step, so an unlisted number silently becomes another
+    step's queue and the split quietly stops existing.
+    """
+    kombu_redis_priority_steps = (0, 3, 6, 9)
+
+    assert RECOVERED_WORK_PRIORITY < FRESH_WORK_PRIORITY
+    assert RECOVERED_WORK_PRIORITY in kombu_redis_priority_steps
+    assert FRESH_WORK_PRIORITY in kombu_redis_priority_steps

@@ -6,7 +6,7 @@ the variables themselves see [configuration](configuration.md); for the runtime 
 
 ## Topology
 
-Six process roles. Only the first four are long-running.
+Eight process roles. Only the first six are long-running, and two of those are optional.
 
 | Role | Command | Extras |
 | --- | --- | --- |
@@ -14,6 +14,8 @@ Six process roles. Only the first four are long-running.
 | Jina embedding service | `mindbridge jina serve` | `server` + `cloud-models` |
 | Memory worker | `celery -A mindbridge.celery_app:app worker` | `server` + `media` (+ `cloud-models` only for an in-process media encoder, which brings `media` with it) |
 | MCP (optional) | `mindbridge mcp` | `server` |
+| Consolidation beat (optional) | `celery -A mindbridge.celery_app:app beat` | `server` |
+| Consolidation worker (optional) | `celery -A mindbridge.celery_app:app worker -Q mindbridge_consolidation` | `server` |
 | Consolidation | `mindbridge consolidate --tenant-id ...` | `server` |
 | Lifecycle | `mindbridge lifecycle --tenant-id ...` | `server` |
 
@@ -143,6 +145,15 @@ Point `MINDBRIDGE_EMBEDDER_ENDPOINT` at this service's `/v1` base URL and use th
 the API and worker. `/health` is the readiness probe; `/v1/models` and `/v1/embeddings` follow the
 OpenAI-compatible contract used by MindBridge.
 
+**Running this service separately is the largest measured ingest lever there is.** In the
+2026-08-24 evaluation, moving the encoder out of the worker and into this service took throughput
+from **51 to 489 clips/hour**, and rebuilding the shared broker queue as a round robin so no one
+tenant could occupy the pool took it to **626**. The reason the first number is so low is not the
+GPU: a prefork child holds its own copy of the encoder, so concurrency multiplies device memory
+instead of overlapping anything, and the card measured 1-5% utilised at 93% allocated. With the
+encoder served, the worker holds no model and its concurrency is bounded by this endpoint and the
+connection pool.
+
 ## Memory worker
 
 Shares storage and generator variables with the API. Its text slot reads the same
@@ -231,6 +242,44 @@ Sampling is the cost lever: see
 [media sampling](configuration.md#media-sampling-worker). Frame rate sets the entire write cost
 of a video deployment.
 
+## Separating read and write traffic
+
+Perception and answering compete for one generator endpoint by default, and they starve each
+other badly. Measured in the 2026-08-24 evaluation: per-observation work time went from **74.5 s**
+at one producer to **626.8 s** at nine, median queue wait from **0.7 s to 12 018 s**, and a
+populated recall from **10.8 s idle to 206 s** under the same nine-way contention. The endpoint
+was not down — a trivial completion answered in 0.28 s throughout — it was saturated with
+multimodal perception.
+
+**No configuration change ships for this, because none is needed.** The API, the MCP process, and
+the worker each read `MINDBRIDGE_GENERATOR_*` from their own environment and construct their own
+client, so pointing them at different endpoints is a matter of exporting a different value in
+each unit file:
+
+```bash
+# API and MCP units: the interactive endpoint
+export MINDBRIDGE_GENERATOR_ENDPOINT=https://generator-read.example.com/v1
+
+# Worker units: the batch endpoint
+export MINDBRIDGE_GENERATOR_ENDPOINT=https://generator-write.example.com/v1
+```
+
+The same applies to `MINDBRIDGE_EMBEDDER_*`, and to `MINDBRIDGE_GENERATOR_CONFIG_JSON` when a
+deployment wants different deadlines or retry budgets on the two paths. Both endpoints must serve
+the same generator for answers to be comparable across paths; the embedder additionally has to
+resolve to one embedding space, which the startup probe enforces.
+
+Two things this does *not* fix, so plan around them:
+
+- **One saturated endpoint behind two URLs is still one saturated endpoint.** Split the traffic
+  only when the two URLs reach different capacity.
+- **Ingest has no fairness between tenants.** Every observation goes to one `mindbridge` queue,
+  consumed in order. In the evaluation one benchmark sat five hours at zero coverage purely on
+  queue position — 400 clips behind a frontier advancing at tens of messages per hour — and
+  started processing six minutes after the queue was rebuilt as a round robin across benchmarks.
+  A tenant that bulk-imports will delay every other tenant for as long as its backlog lasts, and
+  nothing in the deployment prevents that. Rate-limit bulk ingest at the caller.
+
 ## Scheduled jobs
 
 Neither sweep needs a broker or a local model. Both are idempotent under concurrent runs, so use
@@ -240,6 +289,23 @@ whatever CronJob, systemd timer, or Celery beat the deployment already has.
 uv run --extra server mindbridge consolidate --tenant-id tenant_01
 uv run --extra server mindbridge lifecycle --tenant-id tenant_01
 ```
+
+**Consolidation is the one you cannot skip.** Nothing above a single clip exists until it runs:
+no Episode, no Claim, no Summary, so recall can only ever return the individual moments a query
+matched. Two variables put it on the Celery beat schedule the worker app already carries:
+
+```bash
+export MINDBRIDGE_CONSOLIDATION_TENANT_IDS=tenant_01,tenant_02
+export MINDBRIDGE_CONSOLIDATION_INTERVAL_SECONDS=3600   # optional, this is the default
+
+celery -A mindbridge.celery_app:app beat --loglevel=INFO
+celery -A mindbridge.celery_app:app worker -Q mindbridge_consolidation --concurrency=1
+```
+
+One tick sweeps one tenant by rotation, and the sweep is routed off the observation queue, so it
+takes at most one concurrent generator call and never a worker slot from ingest. Both processes
+need the same tenant list. The contract, the two off-switches, and what a running sweep costs are
+in [operations](operations.md#built-in-consolidation-schedule).
 
 Each prints one JSON object on stdout — capture it, since it is the record of what the sweep
 actually did.
@@ -325,7 +391,9 @@ and rehearse the restore-then-reconcile path before you need it.
 Honest gaps, so you plan for them rather than discover them:
 
 - **No migration-on-startup.** Apply them yourself, before the rolling restart.
-- **No built-in scheduler.** The sweeps are commands; scheduling is yours.
-- **No per-tenant quotas.** Nothing limits how much one tenant ingests.
+- **Scheduling is built in for consolidation only.** Lifecycle and orphan reclamation are
+  commands; their schedule is yours.
+- **No per-tenant quotas and no ingest fairness.** Nothing limits how much one tenant ingests,
+  and one shared queue serves every tenant in arrival order.
 - **No automatic re-embedding.** Changing embedding space or dimension is a manual rebuild; the
   startup probe only stops you from serving a half-migrated deployment.

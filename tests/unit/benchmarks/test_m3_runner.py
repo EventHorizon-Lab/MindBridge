@@ -505,3 +505,50 @@ def _identity(*, end_ms: int = 1_000) -> IdentityObservationInput:
         model_id="insightface/buffalo_l",
         visual_bbox_xyxy=(0.1, 0.1, 0.5, 0.8),
     )
+
+
+async def test_m3_boundary_cohort_survives_one_question_whose_recall_raises() -> None:
+    """One raising recall used to abort every question sharing its clip boundary."""
+
+    class RecallFailingMemoryApi(RecordingMemoryApi):
+        async def recall(self, request: RecallRequest) -> RecallResult:
+            if request.query.text == "What was visible first?":
+                raise MindBridgeError(
+                    "recall could not be served",
+                    code="internal_error",
+                    status_code=500,
+                    trace_id="trace_recall_error",
+                )
+            return await super().recall(request)
+
+    api = RecallFailingMemoryApi()
+    annotation = _annotation(
+        questions=(
+            M3BenchQuestion(
+                question_id="video_01_Q01",
+                question="What was visible first?",
+                reference_answer="SECRET FIRST ANSWER",
+                question_types=("Visual",),
+                before_clip_index=0,
+            ),
+            M3BenchQuestion(
+                question_id="video_01_Q02",
+                question="What else was visible?",
+                reference_answer="SECRET SECOND ANSWER",
+                question_types=("Visual",),
+                before_clip_index=0,
+            ),
+        )
+    )
+
+    results = await run_m3_video(
+        cast(MindBridge, api),
+        annotation,
+        _prepared_video(),
+        run_id="run_01",
+        poll_interval_seconds=0.001,
+    )
+
+    assert [result.id for result in results] == ["video_01_Q01", "video_01_Q02"]
+    assert [result.mindbridge_error_code for result in results] == ["internal_error", None]
+    assert [result.response for result in results] == ["", "grounded prediction"]

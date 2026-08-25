@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 from celery import Celery
@@ -12,6 +13,8 @@ from mindbridge import jobs_cli
 from mindbridge.core import JobId, ObservationId, TenantId
 from mindbridge.infrastructure._postgres_jobs import ObservationJobAccounting
 from mindbridge.infrastructure.task_queue import (
+    FRESH_WORK_PRIORITY,
+    RECOVERED_WORK_PRIORITY,
     CeleryObservationJobPublisher,
     create_task_queue,
 )
@@ -186,3 +189,27 @@ def _memory_queue(name: str) -> Celery:
     task_queue = create_task_queue("memory://")
     task_queue.conf.task_default_queue = name
     return task_queue
+
+
+async def test_republish_enters_the_queue_ahead_of_the_backlog_it_repairs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A repaired job is published at the priority the transport drains first.
+
+    Six republishes of one job across 84 minutes once moved its attempt count not at all,
+    because each landed behind the same backlog. Pinned on the publish call because that is
+    the only place the choice is made, and a memory transport does not model priority steps.
+    """
+    task_queue = _memory_queue("republish-priority")
+    send_task = Mock()
+    monkeypatch.setattr(task_queue, "send_task", send_task)
+
+    republished = await _republish(
+        task_queue,
+        [(TenantId("tenant_01"), ObservationId("obs_01"), JobId("job_process_obs_01"))],
+        already_queued=0,
+    )
+
+    assert republished == 1, "nothing was published, so the priority assertion would be vacuous"
+    assert send_task.call_args.kwargs["priority"] == RECOVERED_WORK_PRIORITY
+    assert RECOVERED_WORK_PRIORITY < FRESH_WORK_PRIORITY

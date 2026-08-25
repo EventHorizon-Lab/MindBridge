@@ -33,6 +33,23 @@ _HARD_LIMIT_MARGIN_SECONDS = 60.0
 _REDELIVERY_MARGIN_SECONDS = 120.0
 """Kept above the hard limit so the broker never re-delivers a task that is still running."""
 
+FRESH_WORK_PRIORITY = 3
+RECOVERED_WORK_PRIORITY = 0
+"""Where a message enters the queue, so repair is not served behind the backlog it repairs.
+
+kombu's Redis transport publishes with `LPUSH` and consumes with `RPOP`, walking
+`priority_steps = [0, 3, 6, 9]` in order and draining each step before the next. Everything used
+to publish at 0, so a republished job waited behind every message already queued -- while a
+message a dead worker dropped is restored with `RPUSH` and served next. Recovery was the slowest
+thing in the queue and fresh work the fastest, which is backwards: a row being republished is one
+the ledger already owes and has already waited for.
+
+Publishing fresh work at 3 and repair at 0 inverts that without any broker configuration or any
+consumer change -- a worker polls every step of its queue whatever it was started with, so this
+needs no `-Q` and no rolling-restart coordination. The gap between the two steps is unused on
+purpose: 6 and 9 stay free for anything that must yield to both.
+"""
+
 
 class ObservationProcessingTaskMessage(BaseModel):
     """Strict ID-only schema accepted at the Celery trust boundary."""
@@ -102,6 +119,8 @@ class CeleryObservationJobPublisher:
         tenant_id: TenantId,
         observation_id: ObservationId,
         job_id: JobId,
+        *,
+        priority: int = FRESH_WORK_PRIORITY,
     ) -> None:
         """Publish without blocking the API event loop or leaking broker details."""
         try:
@@ -115,6 +134,7 @@ class CeleryObservationJobPublisher:
                 PROCESS_OBSERVATION_TASK,
                 kwargs={"message": message.model_dump(mode="json")},
                 task_id=job_id,
+                priority=priority,
             )
         except OperationalError as error:
             raise TaskBrokerError("observation job delivery failed") from error

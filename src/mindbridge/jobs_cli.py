@@ -37,6 +37,7 @@ from mindbridge.infrastructure._postgres_jobs import (
     unreachable_observation_jobs,
 )
 from mindbridge.infrastructure.task_queue import (
+    RECOVERED_WORK_PRIORITY,
     CeleryObservationJobPublisher,
     create_task_queue,
 )
@@ -115,9 +116,12 @@ async def reconcile(
     withheld = _withheld(depth, len(unreachable), tenant_id=tenant_id)
     return {
         "queue": str(task_queue.conf.task_default_queue),
-        # Read before publishing, because kombu publishes with LPUSH and consumes with RPOP: a
-        # republished job waits behind every message already queued. Six republishes of one job
-        # across 84 minutes moved its attempt count not at all for exactly this reason.
+        # Read before publishing, so the depth describes the queue this repair is deciding
+        # against rather than the one it just changed. A republished job no longer waits behind
+        # the backlog -- it goes to `RECOVERED_WORK_PRIORITY`, which is drained first -- but the
+        # withholding decision still needs the pre-publish depth to be meaningful. Before that
+        # priority split, six republishes of one job across 84 minutes moved its attempt count
+        # not at all, because every one of them landed behind the same backlog.
         "queue_depth": depth,
         "claimable": len(unreachable),
         "withheld": withheld,
@@ -169,11 +173,20 @@ async def _republish(
     Oldest first, because kombu consumes with `RPOP`: the messages still queued are the most
     recently published, so the rows whose message is gone are at the front of this list. Order
     is preserved anyway, because a question can need every observation before its cutoff.
+
+    Published at `RECOVERED_WORK_PRIORITY`, which the transport drains ahead of the fresh work
+    at `FRESH_WORK_PRIORITY`. Repair is work the ledger already owes and has already waited for,
+    so serving it behind a backlog is what made a repair indistinguishable from doing nothing.
     """
     owed = unreachable[: max(len(unreachable) - already_queued, 0)]
     publisher = CeleryObservationJobPublisher(task_queue)
     for tenant_id, observation_id, job_id in owed:
-        await publisher.publish_observation_processing_job(tenant_id, observation_id, job_id)
+        await publisher.publish_observation_processing_job(
+            tenant_id,
+            observation_id,
+            job_id,
+            priority=RECOVERED_WORK_PRIORITY,
+        )
     return len(owed)
 
 

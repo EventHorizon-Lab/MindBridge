@@ -24,6 +24,8 @@ fails to start rather than failing one call an hour later.
 | `MINDBRIDGE_MEDIA_SAMPLING_CONFIG_JSON` | | | ○ | | | |
 | `MINDBRIDGE_WORKER_CONCURRENCY` | | | ○ | | | |
 | `MINDBRIDGE_WORKER_VRAM_BUDGET_GIB` | | | ○ | | | |
+| `MINDBRIDGE_CONSOLIDATION_TENANT_IDS` | | | ○ | | | |
+| `MINDBRIDGE_CONSOLIDATION_INTERVAL_SECONDS` | | | ○ | | | |
 | `MINDBRIDGE_TENANT_API_KEYS_JSON` | ● | | | | | |
 | `MINDBRIDGE_API_KEY` | | | | | | ● |
 | `MINDBRIDGE_AML_*` | ○ | | | | | |
@@ -233,6 +235,27 @@ value.
 non-antipodal candidate and lets fusion and the answer stage do the filtering, which is usually
 right: a similarity floor discards candidates a graph hop or a lexical match would have rescued.
 
+**What raising it buys.** At 0.0 a recall returns exactly `limit` memories whenever the tenant
+holds at least that many, so it has no way to report "I hold nothing about this" — it reports the
+`limit` least dissimilar rows instead. Raising the floor lets recall return fewer rows, and zero
+rows, and an empty recall abstains rather than answering from whatever came back. That is a
+change in what the system can express, not a ranking improvement: on a nine-benchmark evaluation
+a retrieval hit did not predict answer correctness on three of the corpora, so do not expect a
+floor to raise accuracy by putting better rows in the page.
+
+**Where it helps, and where it does not.** Long-horizon, sparsely-covered corpora — hours or days
+of footage where most of the store is unrelated to any one question — are the shape where the
+`limit` least dissimilar rows are actively misleading. On densely covered corpora, where almost
+everything retrieved is at least on topic, a floor only removes candidates fusion was already
+ordering correctly. Leave it at 0.0 unless you have measured your deployment in the first shape,
+and change it one deployment at a time: there is no value that is right for both.
+
+**It only binds the dense channel.** The floor is applied to every vector search. The full-text
+channel fused beside them has no floor of its own — it matches on the query's lexemes ORed
+together plus a substring test, neither of which produces a similarity to compare — so a floored
+text query returns what the vector searches admitted *plus* whatever shares a word with the
+question. A media-only query has no full-text channel and is bounded by the floor alone.
+
 **Startup probe.** The API probes every tenant in `MINDBRIDGE_TENANT_API_KEYS_JSON` and refuses
 to serve when one holds vectors the configured space cannot reach. Pointing a deployment at a new
 embedder without re-embedding therefore fails loudly instead of returning empty recalls. The
@@ -353,6 +376,28 @@ pool builds the media embedder once per child, so:
 Each child also opens its own database pool, so `MINDBRIDGE_DATABASE_MAX_POOL_SIZE` is a
 per-child ceiling here, not a per-deployment one. Values outside 1–32, and anything that is not
 an integer, fail startup rather than being clamped.
+
+## Built-in consolidation schedule
+
+| Variable | Required | Default |
+| --- | --- | --- |
+| `MINDBRIDGE_CONSOLIDATION_TENANT_IDS` | no | unset — no schedule is registered at all |
+| `MINDBRIDGE_CONSOLIDATION_INTERVAL_SECONDS` | no | `3600` |
+
+Read by `celery -A mindbridge.celery_app:app beat` and by the worker that consumes
+`mindbridge_consolidation`; both processes need the same tenant list, because beat's ticks address
+whichever list the worker was given. Leaving `TENANT_IDS` unset registers no schedule and no task,
+so a deployment that has not opted in runs exactly the worker it ran before.
+
+One tick sweeps **one** tenant, chosen by rotation, so the interval is a ceiling on
+consolidation's entire share of the generator rather than a per-tenant cadence — adding tenants
+lengthens the rotation instead of raising load. Scheduled sweeps skip entity resolution, which is
+the only sweep that opens media and spends a generator call per candidate pair; run that from the
+CLI on its own cadence.
+
+Tenants are enumerated from this variable rather than discovered: a tenant that is created and not
+added here silently stops consolidating. See
+[operations](operations.md#built-in-consolidation-schedule).
 
 ## Logs and timings
 

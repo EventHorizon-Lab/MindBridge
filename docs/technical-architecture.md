@@ -358,7 +358,7 @@ PostgreSQL 事务中写入 Event、Entity、EntityMention、Claim、MemoryRecord
 可能过期的地址；重试使用稳定 ID 且不会合并不同的证据集合。跨 Event 实体消歧、Episode
 合并和多次经历归纳属于后续 Consolidation，不在在线写入路径中凭名称猜测。
 
-当前 `perceive_events_v9` 直接吸收 M3-Agent/TaskMem 已验证有效的原子事件、稳定人物 ID、外观变化、
+当前 `perceive_events_v12` 直接吸收 M3-Agent/TaskMem 已验证有效的原子事件、稳定人物 ID、外观变化、
 对话、关系和因果线索要求，但没有照搬其可直接输出 `Equivalence` 的做法：身份关联仍由端侧可撤销
 证据门禁负责。Prompt 还要求推断的意图/关系写出可见或可闻依据并降低 confidence，片段边界不得把
 未完成动作写成完成事实。它还要求先独立盘点视觉变化、语音/环境声、OCR 和身份轨迹，再做跨模态
@@ -1719,7 +1719,7 @@ manifest 才能被引用。
 当前代码的增量证据只作为功能证据，不作为榜单分数：一次 FunASR 调用在 RTX 5090 上贯通 VAD、ASR、
 标点、diarization 与 CAM++ centroid，20 秒音频推理 1.283 秒、峰值 CUDA allocation 1.93 GiB，同一
 centroid 跨两个 Observation 命中同一 AES-GCM 加密设备身份；另有 6 秒、60 次 100ms PCM push 的真实
-在线路径。`answer_from_evidence_v10` 已完成发布文本↔原始媒体 EvidenceSpan 绑定、最终相关 Top-K 内
+在线路径。`answer_from_evidence_v13` 已完成发布文本↔原始媒体 EvidenceSpan 绑定、最终相关 Top-K 内
 newest/oldest 重排、无新增结果时的反思方向切换，以及 Summary 有向下钻与有界单跳父/同父展开；这些
 改动通过生产路径回归，但没有任何完整 split 数字支撑。跨查询 experience memory 与
 Entity/Bridge/Scene/Horizon cue 明确推迟到完整数据证明增益之后，避免为榜单题型预埋旁路。

@@ -93,8 +93,11 @@ searched.
 ### The similarity floor is too high
 
 `MINDBRIDGE_MINIMUM_EMBEDDING_SIMILARITY` defaults to 0.0 for good reason: a floor discards
-candidates that a graph hop or a lexical match would have rescued. If you raised it, lower it back
-and let fusion do the filtering.
+candidates that a graph hop or a lexical match would have rescued. It also binds the dense channel
+only, so a floored text query still returns whatever shares a word with the question. Lowering it
+back is the right move on a densely covered corpus and the wrong one on a long-horizon sparse
+deployment, where returning fewer rows is the point — see
+[Configuration](configuration.md) for which shape yours is.
 
 ### The memory was compressed or cooled
 

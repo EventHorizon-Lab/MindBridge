@@ -197,6 +197,7 @@ SCENARIOS: dict[str, tuple[str, ...]] = {
         "celery_app",
         "cli",
         "consolidation_cli",
+        "consolidation_worker",
         "infrastructure",
         "jina_server",
         "jobs_cli",

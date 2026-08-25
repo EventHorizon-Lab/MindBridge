@@ -9,6 +9,7 @@ import os
 from collections.abc import Callable, Mapping
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
+from time import time
 from typing import Annotated, NoReturn, Protocol
 
 from celery import Celery
@@ -52,6 +53,7 @@ from mindbridge.core import (
     ObservationId,
     TenantId,
 )
+from mindbridge.infrastructure._postgres_jobs import OBSERVATION_JOB_STALE_AFTER_SECONDS
 from mindbridge.infrastructure.postgres import (
     PostgresMemoryStore,
     resolve_database_max_pool_size,
@@ -98,8 +100,33 @@ by its own timeout.
 """
 _RUNNING_RETRY_SECONDS = 30
 _RUNNING_MAX_RETRIES = 40
-_TRANSIENT_MAX_RETRIES = 5
+_TRANSIENT_BACKOFF_MAX_SECONDS = 300
+_TRANSIENT_MAX_RETRIES = 2 * math.ceil(
+    OBSERVATION_JOB_STALE_AFTER_SECONDS / _TRANSIENT_BACKOFF_MAX_SECONDS
+)
+"""A backstop for `_retry_seconds_remaining`, which is what actually ends a transient chain.
+
+Five was the whole budget before, and full jitter draws each delay uniformly below the doubling
+ceiling, so those five attempts spanned at most 1+2+4+8+16 = 31 seconds and about 15 on average
+-- a dependency outage of any real length exhausted them and failed the row on its first
+minute. Counting attempts cannot express "keep trying for a while" because the wall clock a
+count buys depends on queue depth. What is left for the count to do is stop a run of near-zero
+jitter draws from spinning: at the 300 second ceiling and half of it on average, twice the
+ceiling-count is what fits inside one deadline.
+"""
 _RUNNING_RETRIES_HEADER = "mindbridge_running_retries"
+_RETRY_DEADLINE_HEADER = "mindbridge_retry_deadline"
+_RETRY_DEADLINE_SECONDS = float(OBSERVATION_JOB_STALE_AFTER_SECONDS)
+"""How long one delivery chain may keep retrying, in wall clock rather than attempts.
+
+One stale window: past it the row is claimable by any delivery, so a chain that has been
+bouncing that long has nothing left that a fresh claim would not do, and holding the message
+only keeps the work out of the ledger's reach. Retry counts do not bound wall clock at all --
+`countdown` is a minimum and the message goes to the tail of one shared FIFO, so during the
+2026-08-24 evaluation a nominal 1 second backoff took 43 hours and 30 second claim polls
+outlived the rows they were polling by hours. A deadline is the one bound queue depth can only
+shorten.
+"""
 DEFAULT_WORKER_CONCURRENCY = 1
 MAXIMUM_WORKER_CONCURRENCY = 32
 
@@ -609,7 +636,7 @@ def create_worker_app(settings: WorkerSettings) -> Celery:
         ),
         max_retries=_TRANSIENT_MAX_RETRIES,
         retry_backoff=True,
-        retry_backoff_max=300,
+        retry_backoff_max=_TRANSIENT_BACKOFF_MAX_SECONDS,
         retry_jitter=True,
         pydantic=True,
         pydantic_strict=True,
@@ -619,9 +646,16 @@ def create_worker_app(settings: WorkerSettings) -> Celery:
         message: ObservationProcessingTaskMessage,
     ) -> str:
         running_retries = _running_retries(task)
-        task.override_max_retries = running_retries + _TRANSIENT_MAX_RETRIES
+        may_retry = _retry_seconds_remaining(task) > 0
+        # Past the deadline the count is set to the attempts already made, which is how a
+        # `retry()` Celery raises on its own behalf re-raises the original error instead: the
+        # row lands `failed`, where the claim predicate and `mindbridge jobs --republish` can
+        # both still reach it, rather than staying attached to a message that will not finish.
+        task.override_max_retries = (
+            running_retries + _TRANSIENT_MAX_RETRIES if may_retry else task.request.retries
+        )
         state = run_observation_processing(settings, message)
-        if state is JobState.RUNNING:
+        if state is JobState.RUNNING and may_retry:
             headers = dict(task.request.headers or {})
             headers[_RUNNING_RETRIES_HEADER] = running_retries + 1
             task.retry(
@@ -632,6 +666,25 @@ def create_worker_app(settings: WorkerSettings) -> Celery:
         return str(state.value)
 
     return task_queue
+
+
+def _retry_seconds_remaining(task: _RetryingTask) -> float:
+    """Report what is left of this delivery chain's wall-clock retry budget.
+
+    The deadline is stamped on the first delivery and then carried by the message: Celery
+    re-publishes `request.headers` on every retry, including the ones `autoretry_for` raises
+    without consulting this task, which is why it is written back onto the request rather than
+    only passed to the `retry()` call below. A header is caller-supplied data, so a deadline
+    further out than one full budget is treated as absent rather than trusted.
+    """
+    headers = dict(task.request.headers or {})
+    deadline = headers.get(_RETRY_DEADLINE_HEADER)
+    ceiling = time() + _RETRY_DEADLINE_SECONDS
+    if type(deadline) is not float and type(deadline) is not int:
+        deadline = ceiling
+        headers[_RETRY_DEADLINE_HEADER] = deadline
+        task.request.headers = headers
+    return min(float(deadline), ceiling) - time()
 
 
 def _running_retries(task: _RetryingTask) -> int:

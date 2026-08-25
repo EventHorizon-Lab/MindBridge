@@ -228,7 +228,7 @@ Four things worth knowing before acting on those numbers:
 - **Both include the interval still open.** A pending job's wait so far, and a running job's work
   so far. Without that, the tenant holding a worker *right now* would contribute nothing to the
   column the report is sorted by.
-- **An abandoned attempt stops accruing at the stale window** (960 s), whether it is still open
+- **An abandoned attempt stops accruing at the stale window** (2 400 s), whether it is still open
   or has been reclaimed. Past it the claim treats the row as reclaimable, so whatever held it is
   gone; charging it forever would sort every live tenant below a worker that died. The reclaim
   charges it to `work_seconds` alone — an abandoned attempt was running, not queued.

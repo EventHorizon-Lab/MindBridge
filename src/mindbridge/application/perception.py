@@ -23,6 +23,12 @@ MAX_PERCEPTION_ENTITIES = 256
 MAX_PERCEPTION_CLAIMS = 256
 MAX_PERCEIVED_ENTITIES_PER_EVENT = 64
 MAX_PERCEIVED_CLAIMS_PER_EVENT = 64
+MAX_PERCEIVED_COUNT = 10_000
+"""A bound, not a budget: it exists so a placeholder or runaway integer cannot become a memory.
+
+Far above anything one observation window can be counted to, and far below the transcribed
+on-screen numbers -- viewer counts, experience points -- that a claim states as text instead.
+"""
 
 
 def time_ranges_overlap(
@@ -77,6 +83,37 @@ class ResolvedEvidence:
 
 
 @dataclass(frozen=True, slots=True)
+class PerceivedCount:
+    """How many distinct instances of one thing a claim's own window contains.
+
+    Typed, because the prose version does not happen. Across the 7 937 claims and 9 189 events
+    the 2026-08-24 evaluation wrote from six video corpora, not one claim said "exactly N": 175
+    claims and 635 event descriptions instead used "multiple", "several", "various" or "a group
+    of" in the exact position a number would answer a counting question, and the 301 claims that
+    do carry a digit carry transcribed on-screen text (a viewer count, an item's name) rather
+    than anything the model counted. The prompt already asked for exact counts in prose over
+    that whole run.
+
+    `subject` is what was counted, not the entity it belongs to: "small monsters" is a group of
+    instances that never becomes a graph entity, and it is exactly what the questions ask about.
+    The interval the count covers is the claim's own `valid_from_ms`/`valid_to_ms`, so an
+    enumeration is a claim about a window rather than a caption with a number bolted on.
+
+    Optional everywhere, and normally absent. A fabricated integer is strictly worse than none,
+    so nothing here rewards filling it in.
+    """
+
+    subject: str
+    value: int
+
+    def __post_init__(self) -> None:
+        if not self.subject.strip():
+            raise DomainInvariantError("perceived count subject must not be empty")
+        if not 0 <= self.value <= MAX_PERCEIVED_COUNT:
+            raise DomainInvariantError("perceived count value is out of range")
+
+
+@dataclass(frozen=True, slots=True)
 class PerceivedEntity:
     """One named semantic entity grounded by source evidence."""
 
@@ -105,6 +142,7 @@ class PerceivedClaim:
     valid_from_ms: int
     valid_to_ms: int | None
     entity_indices: tuple[int, ...] = ()
+    exact_count: PerceivedCount | None = None
 
     def __post_init__(self) -> None:
         if not self.statement.strip():

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import timedelta
+from functools import partial
 from itertools import groupby
 from pathlib import Path
 from typing import cast
@@ -23,10 +24,12 @@ from mindbridge.benchmarks.egomem_reason import (
 from mindbridge.benchmarks.prompts import EGOMEM_REASON_QUERY_PROMPT
 from mindbridge.benchmarks.runtime import (
     OPTION_LABELS,
+    answer_failure_trace_id,
     benchmark_tenant_id,
     ingest_media,
     multiple_choice_query,
     parse_option_ranking,
+    settle_answers,
 )
 from mindbridge.contracts import (
     ContractModel,
@@ -274,7 +277,8 @@ async def run_egolife_qa(
             await asyncio.gather(*due_clips, return_exceptions=True)
         )
         cutoff = prepared.timeline_origin + timedelta(milliseconds=query_offset_ms)
-        results = await asyncio.gather(
+        cohort = tuple(group)
+        outcomes = await asyncio.gather(
             *(
                 _answer_question(
                     memory,
@@ -286,8 +290,18 @@ async def run_egolife_qa(
                     semaphore,
                     ingest_failures,
                 )
-                for question in group
-            )
+                for question in cohort
+            ),
+            return_exceptions=True,
+        )
+        results = settle_answers(
+            cohort,
+            outcomes,
+            partial(
+                _failed_question_result,
+                subject_id=prepared.subject_id,
+                ingest_failures=ingest_failures,
+            ),
         )
         answers.update((result.id, result) for result in results)
     return tuple(answers[question.question_id] for question in questions)
@@ -351,7 +365,8 @@ async def run_egomem_reason(
             await asyncio.gather(*due_clips, return_exceptions=True)
         )
         cutoff = prepared.timeline_origin + timedelta(milliseconds=query_offset_ms)
-        results = await asyncio.gather(
+        cohort = tuple(group)
+        outcomes = await asyncio.gather(
             *(
                 _answer_egomem_question(
                     memory,
@@ -362,8 +377,14 @@ async def run_egomem_reason(
                     semaphore,
                     ingest_failures,
                 )
-                for question in group
-            )
+                for question in cohort
+            ),
+            return_exceptions=True,
+        )
+        results = settle_answers(
+            cohort,
+            outcomes,
+            partial(_failed_egomem_result, ingest_failures=ingest_failures),
         )
         answers.update((result.example_id, result) for result in results)
     return tuple(answers[question.example_id] for question in questions)
@@ -446,14 +467,12 @@ async def _recall_or_empty(
     except MindBridgeError as error:
         if error.code not in _RECOVERABLE_MODEL_ERRORS:
             raise
-        empty = RecallResult(
-            answer=None,
-            confidence=0.0,
-            memories=(),
-            evidence=(),
-            trace_id=error.trace_id or trace_fallback,
-        )
-        return empty, error.code
+        return _empty_recall(error.trace_id or trace_fallback), error.code
+
+
+def _empty_recall(trace_id: str) -> RecallResult:
+    """The result a question that never got an answer is scored on."""
+    return RecallResult(answer=None, confidence=0.0, memories=(), evidence=(), trace_id=trace_id)
 
 
 async def _answer_question(
@@ -479,6 +498,33 @@ async def _answer_question(
         semaphore,
         trace_fallback=f"trace_model_error_{question.question_id}",
     )
+    return _question_result(question, subject_id, result, error_code, ingest_failures)
+
+
+def _failed_question_result(
+    question: EgoLifeQuestion,
+    error_code: str,
+    *,
+    subject_id: str,
+    ingest_failures: int,
+) -> EgoLifeQuestionResult:
+    """One row for a question whose recall raised, so its cohort still answers all of them."""
+    return _question_result(
+        question,
+        subject_id,
+        _empty_recall(answer_failure_trace_id(question.question_id)),
+        error_code,
+        ingest_failures,
+    )
+
+
+def _question_result(
+    question: EgoLifeQuestion,
+    subject_id: str,
+    result: RecallResult,
+    error_code: str | None,
+    ingest_failures: int,
+) -> EgoLifeQuestionResult:
     ranking = parse_option_ranking(result.answer, question.choices)
     return EgoLifeQuestionResult(
         id=question.question_id,
@@ -519,6 +565,30 @@ async def _answer_egomem_question(
         semaphore,
         trace_fallback=f"trace_model_error_{question.question_id}",
     )
+    return _egomem_result(question, result, error_code, ingest_failures)
+
+
+def _failed_egomem_result(
+    question: EgoMemReasonQuestion,
+    error_code: str,
+    *,
+    ingest_failures: int,
+) -> EgoMemReasonResult:
+    """One row for a question whose recall raised, so its cohort still answers all of them."""
+    return _egomem_result(
+        question,
+        _empty_recall(answer_failure_trace_id(question.question_id)),
+        error_code,
+        ingest_failures,
+    )
+
+
+def _egomem_result(
+    question: EgoMemReasonQuestion,
+    result: RecallResult,
+    error_code: str | None,
+    ingest_failures: int,
+) -> EgoMemReasonResult:
     # An abstaining answerer returns answer=None, which parses to no ranking. Recording that as an
     # explicit non-answer keeps the rest of the run alive; raising here discarded every result,
     # because egomem_cli writes its artifacts only after the whole run returns.

@@ -43,7 +43,8 @@ flowchart TB
     api["API<br/><code>uvicorn mindbridge.server:create_app</code>"]
     mcp["MCP stdio<br/><code>mindbridge mcp</code>"]
     worker["Memory worker<br/><code>celery -A mindbridge.celery_app:app</code>"]
-    cons["Consolidation<br/><code>mindbridge consolidate</code>"]
+    beat["Consolidation beat<br/><code>celery -A mindbridge.celery_app:app beat</code>"]
+    cons["Consolidation<br/><code>mindbridge consolidate</code><br/>or a beat-scheduled worker"]
     life["Lifecycle<br/><code>mindbridge lifecycle</code>"]
   end
 
@@ -62,6 +63,8 @@ flowchart TB
   api --> pg & redis & s3 & gen & emb
   mcp --> pg & s3 & gen & emb
   redis --> worker
+  beat --> redis
+  redis --> cons
   worker --> pg & s3 & gen & emb
   cons --> pg & s3 & gen & emb
   life --> pg & s3
@@ -73,6 +76,7 @@ flowchart TB
 | API | `server` | Stateless; scale horizontally | No |
 | MCP stdio | `server` | One per agent session | No |
 | Memory worker | `server` | One process per queue | No |
+| Consolidation beat | `server` | One per deployment | No |
 | Consolidation | `server` | One scheduled run per tenant | No |
 | Lifecycle | `server` | One scheduled run per tenant | No |
 | Edge sync | `edge` | One per device, one-shot | Yes — on-device identity models |
@@ -157,13 +161,17 @@ against the lexical ranking — with a rank constant of 60. Fusion combines *ran
 scores, because a cosine similarity and a `ts_rank` are not on a comparable scale and averaging
 them produces a number that means nothing.
 
-Two details that matter operationally:
+Three details that matter operationally:
 
 - **Filters apply before ranking, not after.** A time or person filter narrows the candidate
   set rather than trimming an already-ranked list, so a filtered query does not silently return
   fewer results than its limit because the filter ate the top of the ranking.
 - **Visibility is re-checked immediately before answering.** A memory deleted or superseded
   during a long reflection round does not reach the answer.
+- **The hierarchy ranking is empty until consolidation runs.** `memories by hierarchy` walks
+  `contains` edges, which only the Summary sweep writes, so a deployment that never consolidates
+  fuses three rankings rather than four and can answer only from individual moments. See
+  [operations](operations.md#built-in-consolidation-schedule).
 
 `occurred_after` is inclusive and `occurred_before` is **exclusive**. The asymmetry is
 deliberate — it makes adjacent windows tile without overlap — but it does surprise people.
