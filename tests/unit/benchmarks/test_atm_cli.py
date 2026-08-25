@@ -441,8 +441,9 @@ def test_manifest_media_item_count_matches_the_arm_that_actually_ran(tmp_path: P
         mindbridge_confidence=0.9,
         mindbridge_memory_ids=("memory_01",),
         mindbridge_media_object_ids=(),
+        mindbridge_retrieved_evidence_ids=("email202411160004",),
         mindbridge_trace_id="trace_01",
-        retrieved_gold_evidence_count=0,
+        retrieved_gold_evidence_count=1,
     )
     email = AtmEmail(
         email_id="email202411160004",
@@ -496,6 +497,12 @@ def test_manifest_media_item_count_matches_the_arm_that_actually_ran(tmp_path: P
         (tmp_path / "raw-predictions.json.manifest.json").read_text(encoding="utf-8")
     )
     assert raw_manifest["media_item_count"] == 2
+    # The predictions file has to carry the evidence the count was taken over. Serializing
+    # `mindbridge_media_object_ids` here instead reported a positive count beside an empty
+    # list for every sgm question and every email-only question in the raw arm.
+    raw_predictions = json.loads((tmp_path / "raw-predictions.json").read_text(encoding="utf-8"))
+    assert raw_predictions[0]["retrieved_evidence_ids"] == ["email202411160004"]
+    assert raw_predictions[0]["retrieved_gold_evidence_count"] == 1
 
     atm_cli._write_artifacts(
         _arguments("sgm", "sgm-predictions.json"),

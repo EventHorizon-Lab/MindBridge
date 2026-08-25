@@ -162,6 +162,15 @@ async def run_mem_gallery_topic(
         poll_interval_seconds,
         processing_timeout_seconds,
     )
+    ingest_failures += await _register_question_images(
+        memory,
+        topic,
+        tenant_id=tenant_id,
+        device_id=device_id,
+        by_key=by_key,
+        first_sequence=sum(len(session.rounds) for session in topic.sessions),
+        semaphore=semaphore,
+    )
     return await _answer_topic_questions(
         memory,
         topic,
@@ -172,6 +181,64 @@ async def run_mem_gallery_topic(
         request_concurrency,
         ingest_failures,
     )
+
+
+async def _register_question_images(
+    memory: MindBridge,
+    topic: MemGalleryTopic,
+    *,
+    tenant_id: str,
+    device_id: str,
+    by_key: dict[str, MediaObjectInput],
+    first_sequence: int,
+    semaphore: asyncio.Semaphore,
+) -> int:
+    """Make each question's own image resolvable, so an image query can be asked at all.
+
+    Image-as-query is the capability this adapter exists to exercise, and `RecallQuery`
+    resolves `media_object_ids` against the tenant's media store -- an id it cannot find raises
+    `DomainInvariantError` rather than being ignored. Nothing else registers these: the release
+    keeps question images in their own `QA_IMG_*` files, and measured on the pinned corpus all
+    487 image-bearing questions reference one that no dialogue round uses. Without this every
+    one of them aborted its topic after the whole persona had been ingested.
+
+    `observe` is awaited, its processing job is not. The media object and its evidence span are
+    written in the same transaction as the observation, so the id resolves as soon as this
+    returns; waiting for perception would buy nothing a query image needs and would spend a
+    generator call per question image. Registering the image does put a perceived description of
+    it in the tenant, which is the cost of asking a store about an image it does not hold --
+    bounded at roughly two dozen per persona against several hundred dialogue memories, and
+    unavoidable through the public contract.
+    """
+    keys = tuple(
+        dict.fromkeys(
+            question.question_image_path
+            for question in topic.questions
+            if question.question_image_path is not None
+        )
+    )
+    failures = 0
+    for index, key in enumerate(keys):
+        try:
+            async with semaphore:
+                await memory.observe(
+                    ObserveRequest(
+                        tenant_id=tenant_id,
+                        device_id=device_id,
+                        boot_id=MEM_GALLERY_ADAPTER_VERSION,
+                        sequence=first_sequence + index,
+                        sensor=SensorKind.CAMERA,
+                        media_objects=(by_key[key],),
+                        occurred_at=topic.sessions[0].occurred_at,
+                        ended_at=topic.sessions[0].occurred_at,
+                        observed_at=topic.sessions[0].occurred_at,
+                        idempotency_key=f"{MEM_GALLERY_ADAPTER_VERSION}:question-image:{key}",
+                    )
+                )
+        except Exception:
+            # One unregistered image costs its own questions, not the whole persona.
+            failures += 1
+    return failures
 
 
 async def _ingest_topic_sessions(

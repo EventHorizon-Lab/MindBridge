@@ -197,7 +197,7 @@ def _write_artifacts(
                     "answer": result.reference_answer,
                     "prediction": result.prediction,
                     "evidence_ids": list(result.evidence_ids),
-                    "retrieved_evidence_ids": list(result.mindbridge_media_object_ids),
+                    "retrieved_evidence_ids": list(result.mindbridge_retrieved_evidence_ids),
                     "retrieved_gold_evidence_count": result.retrieved_gold_evidence_count,
                     "mindbridge_confidence": result.mindbridge_confidence,
                     "mindbridge_memory_ids": list(result.mindbridge_memory_ids),

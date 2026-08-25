@@ -111,6 +111,53 @@ class RecordingMemoryApi:
         )
 
 
+async def test_mem_gallery_registers_a_question_image_before_querying_with_it() -> None:
+    """`RecallQuery` resolves media ids against the tenant, so an unobserved one aborts.
+
+    Nothing else registers these: the release keeps question images in their own `QA_IMG_*`
+    files and, measured on the pinned corpus, all 487 image-bearing questions name one that no
+    dialogue round uses. Before this every one of them raised
+    `recall query references unknown media` -- after ingesting the whole persona.
+    """
+
+    class UnknownMediaMemoryApi(RecordingMemoryApi):
+        """Refuses a query image it was never handed, exactly as `_resolve_query_media` does."""
+
+        async def recall(self, request: RecallRequest) -> RecallResult:
+            registered = {
+                media.media_object_id
+                for observed in self.observe_requests
+                for media in observed.media_objects
+            }
+            unknown = set(request.query.media_object_ids) - registered
+            if unknown:
+                raise MindBridgeError(
+                    "recall query references unknown media", code="domain_invariant_failed"
+                )
+            return await super().recall(request)
+
+    api = UnknownMediaMemoryApi()
+
+    results = await run_mem_gallery_topic(
+        cast(MindBridge, api), _topic(), run_id="run_01", prepared=_prepared()
+    )
+
+    assert [result.question_id for result in results] == ["Baking:1", "Baking:2"]
+    assert any(
+        "QA_IMG_001" in media.uri
+        for observed in api.observe_requests
+        for media in observed.media_objects
+    ), "the question image was never registered with the tenant"
+    # Registered once, not once per question that references it.
+    assert (
+        sum(
+            "question-image" in (observed.idempotency_key or "")
+            for observed in api.observe_requests
+        )
+        == 1
+    )
+
+
 def _topic() -> MemGalleryTopic:
     return MemGalleryTopic(
         topic="Baking",

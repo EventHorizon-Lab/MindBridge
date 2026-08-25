@@ -1039,6 +1039,26 @@ def test_mem_gallery_adapter_refuses_a_round_carrying_more_than_one_image(
         load_mem_gallery_topic(path)
 
 
+def test_mem_gallery_adapter_refuses_a_round_carrying_more_than_one_caption(
+    tmp_path: Path,
+) -> None:
+    """The caption is refused on the same terms as the image and its id, not guessed at.
+
+    A second image id fails the load; a second caption used to be silently reduced to the
+    first. That asymmetry is the defect -- one field's ambiguity refused, the adjacent one's
+    resolved by taking whichever the release happened to list first.
+    """
+    payload = _mem_gallery_topic_payload()
+    sessions = payload["multi_session_dialogues"]
+    assert isinstance(sessions, list)
+    sessions[0]["dialogues"][1]["image_caption"] = ["shortbread", "a second caption"]
+    path = tmp_path / "two_captions.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="exactly one image"):
+        load_mem_gallery_topic(path)
+
+
 def test_mem_gallery_directory_loader_keeps_sorted_topic_order(tmp_path: Path) -> None:
     directory = tmp_path / "dialog"
     directory.mkdir()

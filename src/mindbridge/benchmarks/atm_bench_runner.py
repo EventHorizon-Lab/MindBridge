@@ -89,6 +89,11 @@ class AtmQuestionResult(ContractModel):
     mindbridge_confidence: float = Field(ge=0.0, le=1.0)
     mindbridge_memory_ids: tuple[Identifier, ...]
     mindbridge_media_object_ids: tuple[Identifier, ...]
+    # Every archive item a recall reached, media and text alike. `mindbridge_media_object_ids`
+    # names only what MindBridge itself observed, and the SGM arm observes nothing -- so without
+    # this field the artifact reported a positive `retrieved_gold_evidence_count` beside an empty
+    # id list, and the count could not be audited from the file that carries it.
+    mindbridge_retrieved_evidence_ids: tuple[Identifier, ...] = ()
     mindbridge_trace_id: Identifier
     retrieved_gold_evidence_count: int = Field(ge=0)
     mindbridge_ingest_failure_count: int = Field(default=0, ge=0)
@@ -278,6 +283,9 @@ async def answer_atm_question(
         mindbridge_confidence=recalled.confidence,
         mindbridge_memory_ids=tuple(item.memory_id for item in recalled.memories),
         mindbridge_media_object_ids=media_object_ids,
+        # Sorted rather than in recall order: this is the set the count above is taken over,
+        # and a set has no order to preserve. Sorting makes two runs' artifacts diffable.
+        mindbridge_retrieved_evidence_ids=tuple(sorted(retrieved_evidence_ids)),
         mindbridge_trace_id=recalled.trace_id,
         retrieved_gold_evidence_count=len(set(question.evidence_ids) & retrieved_evidence_ids),
         mindbridge_ingest_failure_count=ingest_failure_count,

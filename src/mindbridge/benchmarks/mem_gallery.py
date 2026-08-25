@@ -213,7 +213,11 @@ def _round(raw: _RawRound) -> MemGalleryRound:
     images = tuple(raw.input_image)
     identifiers = tuple(raw.image_id)
     captions = tuple(raw.image_caption)
-    if len(images) > 1 or len(identifiers) > 1:
+    if len(images) > 1 or len(identifiers) > 1 or len(captions) > 1:
+        # The caption belongs in this check with the other two. Taking `captions[0]` while
+        # refusing a second image id would guess at exactly the ambiguity the ids are refused
+        # for, and the guess is invisible: a later release revision adding a second caption to a
+        # round would have it dropped without a word. The pinned release has none.
         raise ValueError(f"Mem-Gallery round {raw.round} must carry exactly one image")
     return MemGalleryRound(
         round_id=raw.round,

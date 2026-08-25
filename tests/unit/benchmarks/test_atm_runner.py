@@ -273,6 +273,34 @@ async def test_retrieval_recall_counts_evidence_ids_parsed_from_memory_summaries
 
     assert result.mindbridge_media_object_ids == ()
     assert result.retrieved_gold_evidence_count == 1
+    # The count and the list have to agree, or the diagnostic cannot be audited from the
+    # artifact: the sgm arm reported a positive count beside an empty id list, because the
+    # union the count was taken over was computed and then thrown away.
+    assert "email202411160004" in result.mindbridge_retrieved_evidence_ids
+
+
+async def test_a_failure_that_is_not_the_enumeration_limit_still_propagates() -> None:
+    """The guard is the whole boundary between one unanswerable question and a broken run.
+
+    Widened to a bare `except MindBridgeError`, a dead generator or an unreachable database
+    would come back as an empty prediction with a `mindbridge_failure_reason` on every
+    question -- a run that looks complete and scores zero, which is the shape nobody
+    investigates. Nothing turned red for that change before this test.
+    """
+
+    class BrokenGeneratorMemoryApi(RecordingMemoryApi):
+        async def recall(self, request: RecallRequest) -> RecallResult:
+            raise MindBridgeError("the generator is unreachable", code="model_unavailable")
+
+    with pytest.raises(MindBridgeError) as raised:
+        await answer_atm_question(
+            cast(MindBridge, BrokenGeneratorMemoryApi()),
+            _question(qtype="list_recall"),
+            tenant_id="benchmark_atm_archive_run1",
+            recall_limit=20,
+        )
+
+    assert raised.value.code == "model_unavailable"
 
 
 async def test_enumeration_failure_is_recorded_and_does_not_stop_the_run() -> None:
