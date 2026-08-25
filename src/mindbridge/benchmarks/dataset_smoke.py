@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 from collections.abc import Sequence
 from datetime import datetime, timezone
 from pathlib import Path
@@ -33,6 +32,7 @@ from mindbridge.benchmarks.mem_gallery import (
     MEM_GALLERY_ADAPTER_VERSION,
     MemGalleryTopic,
     load_mem_gallery,
+    mem_gallery_dialog_digest,
 )
 from mindbridge.benchmarks.memlens import MEMLENS_ADAPTER_VERSION, load_memlens
 from mindbridge.benchmarks.mm_lifelong import (
@@ -345,19 +345,14 @@ def _mem_gallery_summary(
 ) -> BenchmarkDatasetSummary:
     """Summarize the whole dialog directory, digesting its files in sorted order.
 
-    The release is twenty files, so the digest covers the concatenation of their own
-    digests: one number that changes if any topic file changes.
+    Shares `mem_gallery_dialog_digest` with the CLI run manifest, so a smoke row and a run
+    cannot silently disagree about which release digest names.
     """
-    digest = hashlib.sha256(
-        "".join(sha256_file(path) for path in sorted(dialog_directory.glob("*.json"))).encode(
-            "utf-8"
-        )
-    ).hexdigest()
     return BenchmarkDatasetSummary(
         benchmark="Mem-Gallery",
         source_repository="Ethan-Bei/Mem-Gallery",
         source_file=f"{dialog_directory.name}/*.json",
-        source_sha256=digest,
+        source_sha256=mem_gallery_dialog_digest(dialog_directory),
         adapter_version=MEM_GALLERY_ADAPTER_VERSION,
         context_count=len(topics),
         memory_item_count=sum(

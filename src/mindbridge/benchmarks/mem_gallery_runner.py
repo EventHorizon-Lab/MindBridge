@@ -59,13 +59,23 @@ class MemGalleryPreparedImages(ContractModel):
     images: tuple[MemGalleryPreparedImage, ...] = Field(min_length=1)
 
     @model_validator(mode="after")
-    def require_unique_images(self) -> MemGalleryPreparedImages:
+    def require_unique_image_keys(self) -> MemGalleryPreparedImages:
+        """Refuse a manifest with an ambiguous lookup path -- `media_object_id` may repeat.
+
+        `by_key` is keyed by `image_key` throughout the runner, so a duplicate `image_key`
+        is the only ambiguity that can actually bite a lookup. A duplicate `media_object_id`
+        is not: the official `image_id` a dialogue image's `media_object_id` must carry
+        (`D1:IMG_001`, say) is release-relative, not archive-unique -- the release repeats it
+        in every topic that happens to number an image the same way (measured on the pinned
+        release: 1,003 image references resolve to only 182 distinct `image_id` values, and
+        `D1:IMG_001` alone appears in all twenty topics). Tenancy is per topic, so those IDs
+        only need to be unique within the one topic that answers a `VS` question with them,
+        never across the whole release -- rejecting a shared one here would refuse staging
+        for every run wider than a single topic, which is `--topic`'s default.
+        """
         keys = tuple(image.image_key for image in self.images)
-        object_ids = tuple(image.media_object.media_object_id for image in self.images)
         if len(set(keys)) != len(keys):
             raise ValueError("Mem-Gallery prepared image keys must be unique")
-        if len(set(object_ids)) != len(object_ids):
-            raise ValueError("Mem-Gallery prepared media_object_ids must be unique")
         return self
 
 

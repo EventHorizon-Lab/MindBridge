@@ -316,6 +316,49 @@ def test_a_run_refuses_to_start_without_every_referenced_image() -> None:
         validate_mem_gallery_images((_topic(),), prepared)
 
 
+def _staged_image(
+    image_key: str, media_object_id: str, sha256_byte: str
+) -> MemGalleryPreparedImage:
+    return MemGalleryPreparedImage(
+        image_key=image_key,
+        media_object=MediaObjectInput(
+            media_object_id=media_object_id,
+            kind=MediaKind.IMAGE,
+            uri=f"s3://mindbridge-media/mem-gallery/{image_key}",
+            sha256=sha256_byte * 64,
+            size_bytes=1,
+            created_at=NOW,
+        ),
+    )
+
+
+def test_prepared_images_allow_a_media_object_id_shared_across_two_topics() -> None:
+    """The official `image_id` is release-relative, not archive-unique: two topics staged
+    into one manifest legitimately share it. Measured on the pinned release, `D1:IMG_001`
+    alone names a different picture in all twenty topics, and 127 of 182 distinct `image_id`
+    values are shared across more than one. `image_key` -- the release-relative path -- is
+    what actually disambiguates the two topics' pictures, and stays required to be unique.
+    """
+    prepared = MemGalleryPreparedImages(
+        images=(
+            _staged_image("Baking/D1_IMG_001.jpg", "D1:IMG_001", "b"),
+            _staged_image("Gardening/D1_IMG_001.jpg", "D1:IMG_001", "c"),
+        )
+    )
+
+    assert len(prepared.images) == 2
+
+
+def test_prepared_images_still_refuse_a_duplicate_image_key() -> None:
+    with pytest.raises(ValueError, match="prepared image keys must be unique"):
+        MemGalleryPreparedImages(
+            images=(
+                _staged_image("Baking/D1_IMG_001.jpg", "D1:IMG_001", "b"),
+                _staged_image("Baking/D1_IMG_001.jpg", "Baking:IMG_002", "c"),
+            )
+        )
+
+
 async def test_sessions_overlap_in_ingest_while_rounds_inside_one_stay_serial() -> None:
     """Sessions carry distinct occurred_at so they may overlap; rounds inside one share it.
 

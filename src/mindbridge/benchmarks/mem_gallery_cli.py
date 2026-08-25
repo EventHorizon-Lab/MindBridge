@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -34,6 +33,7 @@ from mindbridge.benchmarks.mem_gallery import (
     MEM_GALLERY_ADAPTER_VERSION,
     MemGalleryTopic,
     load_mem_gallery,
+    mem_gallery_dialog_digest,
 )
 from mindbridge.benchmarks.mem_gallery_runner import (
     MemGalleryPreparedImages,
@@ -65,6 +65,7 @@ class MemGalleryRunManifest(MediaBenchmarkRunManifest):
     round_count: int = Field(gt=0)
     image_reference_count: int = Field(ge=0)
     question_image_count: int = Field(ge=0)
+    ingest_failure_count: int = Field(ge=0)
 
 
 @dataclass(frozen=True, slots=True)
@@ -149,6 +150,7 @@ def _write_artifacts(
                     "mindbridge_confidence": result.mindbridge_confidence,
                     "mindbridge_memory_ids": list(result.mindbridge_memory_ids),
                     "mindbridge_trace_id": result.mindbridge_trace_id,
+                    "mindbridge_ingest_failure_count": result.mindbridge_ingest_failure_count,
                 }
                 for result in results
             ],
@@ -157,13 +159,20 @@ def _write_artifacts(
         )
         + "\n"
     )
+    # Every result in one topic carries that topic's own ingest failure count, so keying by
+    # topic and summing dedupes them into the run-wide total without needing `_run` to thread
+    # a separate count alongside `results` -- the same count `AtmRunManifest` pins, just
+    # summed across this release's twenty tenants instead of ATM's one.
+    ingest_failure_count = sum(
+        {result.topic: result.mindbridge_ingest_failure_count for result in results}.values()
+    )
     manifest = media_manifest(
         MemGalleryRunManifest,
         arguments,
         deployment,
         runner_version=MEM_GALLERY_RUNNER_VERSION,
         adapter_version=MEM_GALLERY_ADAPTER_VERSION,
-        annotation_sha256=_dialog_digest(arguments.dataset_path),
+        annotation_sha256=mem_gallery_dialog_digest(arguments.dataset_path),
         predictions=predictions,
         dataset_repository="Ethan-Bei/Mem-Gallery",
         evaluator_repository="YuanchenBei/Mem-Gallery",
@@ -187,14 +196,9 @@ def _write_artifacts(
             for question in topic.questions
             if question.question_image_path is not None
         ),
+        ingest_failure_count=ingest_failure_count,
     )
     write_run_artifacts(arguments.output_path, predictions, manifest)
-
-
-def _dialog_digest(dialog_directory: Path) -> str:
-    """Digest the concatenated digests of every topic file, in sorted order."""
-    joined = "".join(sha256_file(path) for path in sorted(dialog_directory.glob("*.json")))
-    return hashlib.sha256(joined.encode("utf-8")).hexdigest()
 
 
 def _parse_arguments(argv: Sequence[str] | None, prog: str | None) -> _Arguments:

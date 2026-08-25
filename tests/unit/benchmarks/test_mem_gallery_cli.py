@@ -342,6 +342,7 @@ def test_manifest_counts_match_the_topics_this_run_actually_answered(tmp_path: P
         mindbridge_media_object_ids=(),
         mindbridge_trace_id="trace_01",
         retrieved_clue_round_count=1,
+        mindbridge_ingest_failure_count=2,
     )
     result_b = MemGalleryQuestionResult(
         question_id="TopicB:1",
@@ -357,6 +358,7 @@ def test_manifest_counts_match_the_topics_this_run_actually_answered(tmp_path: P
         mindbridge_media_object_ids=(),
         mindbridge_trace_id="trace_02",
         retrieved_clue_round_count=0,
+        mindbridge_ingest_failure_count=1,
     )
 
     deployment_path = write_deployment_snapshot(tmp_path)
@@ -397,6 +399,11 @@ def test_manifest_counts_match_the_topics_this_run_actually_answered(tmp_path: P
     assert both_manifest["round_count"] == 4
     assert both_manifest["image_reference_count"] == 1
     assert both_manifest["question_image_count"] == 1
+    # Every result in one topic carries that topic's own count; the run-wide manifest field
+    # sums across topics rather than picking up only one of them.
+    assert both_manifest["ingest_failure_count"] == 3
+    both_predictions = json.loads((tmp_path / "both-predictions.json").read_text(encoding="utf-8"))
+    assert [row["mindbridge_ingest_failure_count"] for row in both_predictions] == [2, 1]
 
     mem_gallery_cli._write_artifacts(
         _arguments("one-predictions.json"),
@@ -411,3 +418,4 @@ def test_manifest_counts_match_the_topics_this_run_actually_answered(tmp_path: P
     assert one_manifest["round_count"] == 3
     assert one_manifest["image_reference_count"] == 1
     assert one_manifest["question_image_count"] == 1
+    assert one_manifest["ingest_failure_count"] == 2
