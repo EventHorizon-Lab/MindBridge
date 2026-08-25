@@ -311,11 +311,14 @@ API. Requires `server` and `cloud-models`.
 
 ```bash
 export MINDBRIDGE_EMBEDDER_API_KEY=replace-with-at-least-32-random-characters
-uv run --extra server --extra cloud-models mindbridge jina serve --host 0.0.0.0
+uv run --extra server --extra cloud-models mindbridge jina serve --host 0.0.0.0 \
+  --media-origin https://media.example.com
 ```
 
 The default port is `8002`; `--device`, `--model-id`, and `--max-concurrency` control the one model
-process. `/health` is public. `/v1/models` and `/v1/embeddings` require the bearer token.
+process. Repeat `--media-origin` for every exact HTTP(S) origin that may serve presigned media;
+remote URLs from any other origin and all redirects are rejected. `/health` is public.
+`/v1/models` and `/v1/embeddings` require the bearer token.
 
 ---
 

@@ -24,7 +24,8 @@ environment on the GPU host:
 ```bash
 uv sync --extra server --extra cloud-models
 export MINDBRIDGE_EMBEDDER_API_KEY=replace-with-at-least-32-random-characters
-uv run --extra server --extra cloud-models mindbridge jina serve --host 0.0.0.0
+uv run --extra server --extra cloud-models mindbridge jina serve --host 0.0.0.0 \
+  --media-origin http://localhost:9000
 ```
 
 ## 1. Install
