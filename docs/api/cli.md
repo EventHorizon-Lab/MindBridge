@@ -17,7 +17,7 @@ uv run --extra server mindbridge lifecycle --help
 
 | Command | Subcommands |
 | --- | --- |
-| `mindbridge` | `consolidate`, `jobs`, `lifecycle`, `mcp`, `jina serve`, `edge sync` |
+| `mindbridge` | `config check`, `consolidate`, `jobs`, `lifecycle`, `mcp`, `jina serve`, `edge sync` |
 | `mindbridge-bench` | `locomo-refined`, `m3`, `egolife`, `egomem`, `egotempo`, `memlens`, `mm-lifelong`, `supermemory`, `video-mme`, `aml` |
 | `mindbridge-bench` support | `score`, `datasets`, `jina`, `bakeoff` |
 
@@ -61,6 +61,31 @@ and names the extra to install rather than printing frames from a missing third-
 writes nothing at all.
 
 ---
+
+## `mindbridge config check`
+
+Reports whether one role's configuration is complete, before that role is started.
+
+```bash
+mindbridge config check --role api
+```
+
+`--role` is required and takes one of `api`, `mcp`, `worker`, `consolidate`, `lifecycle`, or
+`edge-sync` — the six columns of the matrix in [configuration](../configuration.md).
+
+Every missing setting is reported in one pass. Starting a process fails on the first one, so an
+operator missing nine discovered them one restart at a time; this asks the role's own settings
+class what it requires and walks the whole list. Each resolved setting is reported with the
+source that won, `environment` or `mindbridge.toml`.
+
+**No value is ever printed.** A credential is reported as present or missing and nothing more,
+because the same code path handles credentials and structure. If settings are missing and a
+`.env` file is present in the working directory, the report says so — nothing in MindBridge loads
+`.env`, and `uv run --env-file .env` is the usual omission.
+
+Exit status is 0 when the role is ready and 1 when it is not, so a deployment script can gate on
+it. This command is in the core install: it has to run before any extra is present, which is the
+state an operator reaches for it from. A role whose settings class needs an extra says which one.
 
 ## `mindbridge consolidate`
 

@@ -66,26 +66,24 @@ login differ, grant `mindbridge_runtime` to the API login — and never give tha
 
 ## 4. Configure the server
 
+Copy the credential template:
+
 ```bash
-export MINDBRIDGE_DATABASE_URL=postgresql://mindbridge:mindbridge@localhost:5432/mindbridge
-export MINDBRIDGE_TASK_BROKER_URL=redis://localhost:6379/0
-export MINDBRIDGE_OBJECT_STORAGE_BUCKET=mindbridge-media
-export MINDBRIDGE_OBJECT_STORAGE_ENDPOINT_URL=http://localhost:9000
-
-export MINDBRIDGE_GENERATOR_API_KEY=...
-export MINDBRIDGE_GENERATOR_ENDPOINT=https://generator.example.com/v1
-export MINDBRIDGE_GENERATOR_MODEL_ID=qwen3.8-max
-
-export MINDBRIDGE_EMBEDDER_API_KEY=...
-export MINDBRIDGE_EMBEDDER_ENDPOINT=http://localhost:8002/v1
-export MINDBRIDGE_EMBEDDER_MODEL_ID=jinaai/jina-embeddings-v5-omni-small-retrieval
-export MINDBRIDGE_EMBEDDING_SPACE_ID=jina-v5
-
-export MINDBRIDGE_TENANT_API_KEYS_JSON='{"tenant_01":["'"$(openssl rand -hex 24)"'"]}'
-export AWS_DEFAULT_REGION=us-east-1
+cp .env.example .env
 ```
 
-Two of these bite first-time users:
+Fill in the two API keys and generate a tenant key:
+
+```bash
+openssl rand -hex 24
+```
+
+Everything that is not a credential is already in the committed `mindbridge.toml` — endpoints,
+model IDs, the embedding space, and the pool size. Edit that file rather than
+exporting variables. Its `[generator]` and `[embedder]` endpoints point at localhost; change
+them to wherever you serve those models.
+
+Two things bite first-time users:
 
 - **API keys must be at least 32 characters.** A shorter one fails at startup, not at the first
   request. `openssl rand -hex 24` gives 48.
@@ -95,18 +93,22 @@ Two of these bite first-time users:
 Boto3's own chain resolves S3 credentials and region. MindBridge holds no copy of either, so
 `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and `AWS_DEFAULT_REGION` work exactly as they do
 for every other tool on the host. S3-compatible stores that ignore the region still need one
-set.
+set, so add it to `.env` as well.
 
-Print the key you just generated — you need it in step 6:
+Nothing in MindBridge loads `.env` — every deployment target already does it natively. Pass it
+to whatever runs the process, and check the result before starting anything:
 
 ```bash
-python -c "import json,os;print(json.loads(os.environ['MINDBRIDGE_TENANT_API_KEYS_JSON'])['tenant_01'][0])"
+uv run --env-file .env mindbridge config check --role api
 ```
+
+That reports every missing setting in one pass, and names whether each resolved value came from
+the environment or from `mindbridge.toml`. It never prints a value.
 
 ## 5. Run the API
 
 ```bash
-uv run --extra server uvicorn mindbridge.server:create_app --factory
+uv run --env-file .env --extra server uvicorn mindbridge.server:create_app --factory
 ```
 
 ```bash
@@ -183,7 +185,19 @@ memory worker. Point its media slot at the same embedding endpoint you already c
 endpoint embeds video and audio as well as text, so there is no second model and no GPU:
 
 ```bash
-uv run --extra server --extra media celery -A mindbridge.celery_app:app worker --loglevel=INFO
+uv sync --extra server --extra media
+```
+
+The committed `mindbridge.toml` already points the media slot at that endpoint:
+
+```toml
+[media_embedder]
+plugin = "openai"
+```
+
+```bash
+uv run --env-file .env --extra server --extra media \
+  celery -A mindbridge.celery_app:app worker --loglevel=INFO
 ```
 
 The alternative is `MINDBRIDGE_MEDIA_EMBEDDER_PLUGIN=jina`, which loads Jina v5 Omni into the

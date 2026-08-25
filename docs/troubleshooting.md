@@ -28,12 +28,16 @@ requires.
 
 ### `<VARIABLE> must contain valid JSON` / `must contain a JSON object with non-empty keys`
 
-A `*_CONFIG_JSON` value is malformed. Multi-line exports in shell need quoting care:
+A `*_CONFIG_JSON` value is malformed. These variables replace a whole `mindbridge.toml` section
+and are rarely the easier way to write one — a section in the file needs no shell quoting at all.
+If you do set one, check it parses before starting anything:
 
 ```bash
-export MINDBRIDGE_GENERATOR_CONFIG_JSON='{"api_key":"...","endpoint":"https://..."}'
 python -c "import json,os;json.loads(os.environ['MINDBRIDGE_GENERATOR_CONFIG_JSON'])"
 ```
+
+A malformed `mindbridge.toml` reports its own parse position instead, and
+`mindbridge config check --role <role>` surfaces either failure before a process starts.
 
 ### `Extra inputs are not permitted` on a plugin config
 

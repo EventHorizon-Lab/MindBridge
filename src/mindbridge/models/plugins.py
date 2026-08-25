@@ -7,10 +7,39 @@ from importlib.metadata import EntryPoint, entry_points
 from typing import cast
 
 from mindbridge.application.capabilities import Embedder, Generator
-from mindbridge.configuration import copy_plugin_configuration, validate_plugin_name
+from mindbridge.configuration import (
+    MissingConfigurationError,
+    copy_plugin_configuration,
+    validate_plugin_name,
+)
 
 PluginConfig = Mapping[str, object]
 _Factory = Callable[[PluginConfig], object]
+
+
+def validate_generator_configuration(name: str, config: PluginConfig) -> None:
+    """Validate a bundled generator schema without constructing its client."""
+    if name != "openai":
+        return
+    from mindbridge.models.openai import _GeneratorConfig
+
+    if not config.get("api_key"):
+        raise MissingConfigurationError("MINDBRIDGE_GENERATOR_API_KEY")
+    _GeneratorConfig.model_validate(config)
+
+
+def validate_embedder_configuration(name: str, config: PluginConfig) -> None:
+    """Validate a bundled embedder schema without loading a model or client."""
+    if name == "openai":
+        from mindbridge.models.openai import _EmbedderConfig as _OpenAIEmbedderConfig
+
+        if not config.get("api_key"):
+            raise MissingConfigurationError("MINDBRIDGE_EMBEDDER_API_KEY")
+        _OpenAIEmbedderConfig.model_validate(config)
+    elif name == "jina":
+        from mindbridge.models.jina import _EmbedderConfig as _JinaEmbedderConfig
+
+        _JinaEmbedderConfig.model_validate(config)
 
 
 def load_generator(name: str, config: PluginConfig) -> Generator:

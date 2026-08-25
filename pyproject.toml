@@ -12,6 +12,10 @@ license = "Apache-2.0"
 dependencies = [
     "httpx>=0.28,<1",
     "pydantic>=2.10,<3",
+    # mindbridge.configuration reads mindbridge.toml, and every role imports it. tomllib is
+    # 3.11+; the floor is 3.10 because JetPack, RDK, and RKNN edge images still ship it. This
+    # is a runtime dependency, not the dev-group entry tests/test_package.py uses.
+    "tomli>=2,<3; python_version < '3.11'",
 ]
 
 [project.scripts]

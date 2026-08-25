@@ -26,7 +26,7 @@ jobs:
           # said nothing about the benchmark harness, whose own extra could not import it.
           - name: core
             requirement: .
-            probe: configuration contracts core file_integrity prompts sdk
+            probe: config_cli configuration contracts core file_integrity prompts sdk
           - name: edge
             requirement: .[edge]
             probe: edge
