@@ -84,7 +84,14 @@ async def _insert_observation(
 async def _observation_digest(
     connection: DatabaseConnection,
     observation: Observation,
-) -> str:
+) -> str | None:
+    """Return the stored digest, or None when it was written by a retired recipe.
+
+    Migration 0025 nulls this column for observations carrying identity spans, because
+    migration 0021 removed a field from `ObserveRequest` and `_request_digest` hashes the whole
+    request: the digest of a request whose bytes did not change moved. None means "this cannot
+    be compared", which is the one thing a stale digest could not say for itself.
+    """
     cursor = await connection.execute(
         """
         SELECT content_digest FROM observations
@@ -95,7 +102,27 @@ async def _observation_digest(
     row = await cursor.fetchone()
     if row is None:
         raise MemoryIntegrityError("observation disappeared during transaction")
-    return cast(tuple[str], row)[0]
+    return cast(tuple[str | None], row)[0]
+
+
+async def _adopt_observation_digest(
+    connection: DatabaseConnection,
+    observation: Observation,
+    content_digest: str,
+) -> None:
+    """Record what this observation digests under the current recipe.
+
+    Accepting the resend is only half of it. Writing the digest back restores the guard for
+    every later retry of this same device sequence, so the window in which a genuinely
+    different body would be accepted is one resend wide rather than permanent.
+    """
+    await connection.execute(
+        """
+        UPDATE observations SET content_digest = %s
+        WHERE tenant_id = %s AND observation_id = %s AND content_digest IS NULL
+        """,
+        (content_digest, observation.tenant_id, observation.observation_id),
+    )
 
 
 async def _write_media_objects(
@@ -179,7 +206,10 @@ class ObservationWriteOperations(PostgresStoreOperations):
                     observation.tenant_id,
                     observation.observation_id,
                 )
-                if await _observation_digest(connection, observation) != content_digest:
+                stored_digest = await _observation_digest(connection, observation)
+                if stored_digest is None:
+                    await _adopt_observation_digest(connection, observation, content_digest)
+                elif stored_digest != content_digest:
                     raise IdempotencyConflictError(
                         "device sequence already stores different observation content"
                     )

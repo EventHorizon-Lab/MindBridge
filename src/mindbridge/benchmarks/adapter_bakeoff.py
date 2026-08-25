@@ -102,7 +102,11 @@ async def run_adapter_bakeoff(
     """Score every pair with both adapters using the symmetric document side."""
     scores: list[AdapterScore] = []
     for model_id in (retrieval_model_id, text_matching_model_id):
-        embedder = JinaEmbedder.load(model_id=model_id, device=device, dimension=dimension)
+        # This sweep loads whichever repository the caller named, so the bundled model's
+        # pin cannot apply. `None` resolves each repository's default branch.
+        embedder = JinaEmbedder.load(
+            model_id=model_id, revision=None, device=device, dimension=dimension
+        )
         try:
             scores.append(await _score_adapter(embedder, corpus, model_id))
         finally:

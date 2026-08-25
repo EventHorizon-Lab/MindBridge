@@ -16,7 +16,10 @@ from pydantic import (
     StrictFloat,
     StrictInt,
     StringConstraints,
+    model_validator,
 )
+
+from mindbridge.core import without_retired_fields
 
 if sys.version_info >= (3, 11):
     import tomllib
@@ -421,6 +424,21 @@ class PluginConfigModel(BaseModel):
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True, protected_namespaces=())
+
+    @model_validator(mode="before")
+    @classmethod
+    def _ignore_retired_fields(cls, data: object) -> object:
+        """Accept a `*_CONFIG_JSON` object written for the release before migration 0021.
+
+        These objects are hand-written by operators -- `MINDBRIDGE_EMBEDDER_CONFIG_JSON`
+        and its siblings replace the per-field variables rather than being generated from
+        them -- and the previous release required `model_revision` in them. Left strict,
+        `extra="forbid"` turns a leftover key into a process that will not start, while
+        the same leftover name in the fallback environment variables is merely ignored
+        because those are read through `Mapping.get`. Two configuration surfaces
+        disagreeing about the same retired name is the bug; this makes them agree.
+        """
+        return without_retired_fields(data, cls.model_fields)
 
 
 def _reject_json_constant(value: str) -> NoReturn:

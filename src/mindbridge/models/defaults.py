@@ -14,6 +14,7 @@ from mindbridge.core import DEFAULT_EMBEDDING_DIMENSION, EmbeddingSpaceReference
 
 __all__ = [
     "DEFAULT_EMBEDDER_MODEL_ID",
+    "DEFAULT_EMBEDDER_REVISION",
     "DEFAULT_EMBEDDING_DIMENSION",
     "DEFAULT_EMBEDDING_SPACE",
     "DEFAULT_GENERATOR_MODEL_ID",
@@ -37,6 +38,18 @@ supplied MINDBRIDGE_GENERATOR_CONFIG_JSON without this key got a model client al
 inside a task killed at 1080 -- the disagreement the derived budget exists to remove.
 """
 DEFAULT_EMBEDDER_MODEL_ID = "jinaai/jina-embeddings-v5-omni-small-retrieval"
+DEFAULT_EMBEDDER_REVISION = "12949877f0092093f366c6450340011320152a05"
+"""Upstream commit the local Jina encoder loads, and executes remote code from.
+
+Migration 0021 dropped `model_revision` from every table because the recorded value was
+never compared against what the provider served. That argument is about a column. This
+constant is a loader argument: `snapshot_download(revision=...)` and `code_revision` are
+resolved by the Hub against a content-addressed commit, so this is the one place the pin
+was enforced rather than filed. Without it a worker restart resolves the repository's
+default branch, which under `trust_remote_code=True` changes both the weights and the
+Python being executed, with no configuration change and no signal -- and because
+`space_id` does not vary with the checkout, nothing downstream can see that it happened.
+"""
 DEFAULT_EMBEDDING_SPACE = EmbeddingSpaceReference(
     space_id="jinaai/jina-embeddings-v5-omni-small-retrieval-1024",
 )
@@ -110,6 +123,12 @@ def jina_media_embedder_config(source: Mapping[str, str]) -> dict[str, object]:
     """Read the bundled local Jina contract for the Worker's image, video, and audio encoder."""
     config: dict[str, object] = {
         "model_id": source.get("MINDBRIDGE_MEDIA_EMBEDDER_MODEL_ID", DEFAULT_EMBEDDER_MODEL_ID),
+        # Only the local encoder takes a revision, because only the local encoder downloads
+        # anything. The OpenAI-shaped encoder talks to an endpoint that resolves its own
+        # model, so a revision there would be the unread record 0021 removed.
+        "model_revision": source.get(
+            "MINDBRIDGE_MEDIA_EMBEDDER_MODEL_REVISION", DEFAULT_EMBEDDER_REVISION
+        ),
         **_embedding_space_config(source),
     }
     device = optional_environment_value(source, "MINDBRIDGE_MEDIA_EMBEDDER_DEVICE")

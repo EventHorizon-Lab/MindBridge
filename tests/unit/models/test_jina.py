@@ -8,8 +8,8 @@ import pytest
 
 from mindbridge.core import MediaKind, ModelOutputError, ModelReference, ModelUnavailableError
 from mindbridge.models import EmbedRequest, EmbedTask, MediaPart, ModelInput, TextPart
-from mindbridge.models.defaults import require_matryoshka_dimension
-from mindbridge.models.jina import JinaEmbedder
+from mindbridge.models.defaults import DEFAULT_EMBEDDER_REVISION, require_matryoshka_dimension
+from mindbridge.models.jina import JinaEmbedder, _EmbedderConfig
 
 
 class Matrix:
@@ -52,7 +52,14 @@ class RecordingEncoder:
         return Matrix(self.values)
 
 
-def test_jina_loads_the_snapshot_it_downloaded(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_jina_pins_the_weights_and_the_remote_code(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The pin has to reach both the download and the code that gets executed.
+
+    `trust_remote_code=True` means this process runs Python from the model repository, so an
+    unpinned load resolves whatever is on its default branch. Migration 0021 removed the
+    revision *column*, which nothing read; these are loader arguments, which the Hub resolves
+    against a content-addressed commit.
+    """
     calls: list[tuple[str, dict[str, object]]] = []
 
     def sentence_transformer(model_path: str, **kwargs: object) -> RecordingEncoder:
@@ -78,17 +85,71 @@ def test_jina_loads_the_snapshot_it_downloaded(monkeypatch: pytest.MonkeyPatch) 
     assert calls == [
         (
             "snapshot_download",
-            {"repo_id": "jinaai/jina-embeddings-v5-omni-small-retrieval"},
+            {
+                "repo_id": "jinaai/jina-embeddings-v5-omni-small-retrieval",
+                "revision": DEFAULT_EMBEDDER_REVISION,
+            },
         ),
         (
             "/models/pinned",
             {
+                "revision": DEFAULT_EMBEDDER_REVISION,
                 "trust_remote_code": True,
                 "device": "cuda",
-                "model_kwargs": {"modality": "omni"},
+                "model_kwargs": {
+                    "modality": "omni",
+                    "code_revision": DEFAULT_EMBEDDER_REVISION,
+                },
+                "config_kwargs": {"code_revision": DEFAULT_EMBEDDER_REVISION},
             },
         ),
     ]
+
+
+def test_jina_can_load_an_unpinned_repository(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`revision=None` exists for the sweep that names its own repositories.
+
+    The bundled model's pin cannot resolve in someone else's repository, so the bakeoff has to
+    be able to opt out. It has to stay an explicit opt-out: the default is the pin.
+    """
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    def sentence_transformer(model_path: str, **kwargs: object) -> RecordingEncoder:
+        calls.append((model_path, kwargs))
+        return RecordingEncoder([[1.0, 0.0]])
+
+    def snapshot_download(**kwargs: object) -> str:
+        calls.append(("snapshot_download", kwargs))
+        return "/models/unpinned"
+
+    monkeypatch.setattr(
+        "mindbridge.models.jina.import_module",
+        lambda name: (
+            SimpleNamespace(SentenceTransformer=sentence_transformer)
+            if name == "sentence_transformers"
+            else SimpleNamespace(snapshot_download=snapshot_download)
+        ),
+    )
+    monkeypatch.setattr("mindbridge.models.jina.select_torch_device", lambda _device: "cpu")
+
+    JinaEmbedder.load(model_id="someone/else", revision=None, dimension=2)
+
+    assert calls[0] == ("snapshot_download", {"repo_id": "someone/else", "revision": None})
+
+
+def test_the_embedder_plugin_keeps_an_operators_existing_pin() -> None:
+    """`model_revision` in a config object is a pin, so it must not be ignored as retired.
+
+    `PluginConfigModel` ignores the names migration 0021 retired so an operator's existing
+    `*_CONFIG_JSON` does not stop a process from starting. This one name went on meaning
+    something for this plugin, and silently replacing a pin with the default would be a worse
+    failure than the strictness that tolerance relaxes.
+    """
+    config = _EmbedderConfig.model_validate(
+        {"model_revision": "0123456789abcdef0123456789abcdef01234567", "space_revision": "gone"}
+    )
+
+    assert config.model_revision == "0123456789abcdef0123456789abcdef01234567"
 
 
 async def test_jina_uses_distinct_query_and_document_methods() -> None:
