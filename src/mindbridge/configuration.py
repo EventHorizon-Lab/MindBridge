@@ -257,11 +257,16 @@ def _flattened_plugins(
         body = document.get(section)
         if not isinstance(body, dict):
             continue
+        configured = {key: value for key, value in body.items() if key != PLUGIN_SELECTOR_KEY}
         assembled: dict[str, object] = {}
         if section in ENCODER_SECTIONS:
             assembled.update(shared)
-        assembled.update({key: value for key, value in body.items() if key != PLUGIN_SELECTOR_KEY})
-        assembled.update(_overrides(section, assembled, environ))
+        assembled.update(configured)
+        overrides = _overrides(section, assembled, environ)
+        if not configured and not overrides:
+            # A selector-only section chooses a plugin but does not replace its fallback config.
+            continue
+        assembled.update(overrides)
         flattened[variable_name("config_json", section)] = json.dumps(
             assembled, sort_keys=True, allow_nan=False
         )

@@ -173,7 +173,7 @@ class WorkerSettings:
     media_embedder_config: Mapping[str, object] = field(repr=False)
     text_embedder_config: Mapping[str, object] = field(repr=False)
     generator_plugin: str = "openai"
-    media_embedder_plugin: str = "jina"
+    media_embedder_plugin: str = "openai"
     text_embedder_plugin: str = "openai"
     embedding_dimension: int = DEFAULT_EMBEDDING_DIMENSION
     clip_sampling: ClipSampling = field(default_factory=ClipSampling)
@@ -223,7 +223,7 @@ class WorkerSettings:
         """Read the explicit Worker contract and fail before consuming jobs."""
         source = configuration_source(environ)
         generator_plugin = source.get("MINDBRIDGE_GENERATOR_PLUGIN", "openai")
-        media_plugin = source.get("MINDBRIDGE_MEDIA_EMBEDDER_PLUGIN", "jina")
+        media_plugin = source.get("MINDBRIDGE_MEDIA_EMBEDDER_PLUGIN", "openai")
         # The Worker's text encoder must land in the same space the API queries, so it reads the
         # deployment-wide MINDBRIDGE_EMBEDDER_* contract rather than a second set of names.
         text_plugin = source.get("MINDBRIDGE_EMBEDDER_PLUGIN", "openai")
@@ -307,9 +307,13 @@ def _media_embedder_fallback(
     if plugin == "jina":
         return lambda: jina_media_embedder_config(source)
     if plugin == "openai":
-        return lambda: openai_embedder_config(
+        return lambda: plugin_configuration(
             source,
-            request_timeout_seconds=_MODEL_REQUEST_TIMEOUT_SECONDS,
+            "MINDBRIDGE_EMBEDDER_CONFIG_JSON",
+            lambda: openai_embedder_config(
+                source,
+                request_timeout_seconds=_MODEL_REQUEST_TIMEOUT_SECONDS,
+            ),
         )
     return None
 
@@ -402,10 +406,14 @@ class _WorkerRuntime:
         instead of being acked away with its message.
         """
         if self.embedders is None:
-            self.embedders = (
-                load_embedder(settings.media_embedder_plugin, settings.media_embedder_config),
-                load_embedder(settings.text_embedder_plugin, settings.text_embedder_config),
+            media = load_embedder(settings.media_embedder_plugin, settings.media_embedder_config)
+            text = (
+                media
+                if settings.media_embedder_plugin == settings.text_embedder_plugin
+                and settings.media_embedder_config == settings.text_embedder_config
+                else load_embedder(settings.text_embedder_plugin, settings.text_embedder_config)
             )
+            self.embedders = (media, text)
         return self.embedders
 
     def close(self) -> None:
@@ -415,8 +423,12 @@ class _WorkerRuntime:
             self.loop.close()
 
     async def _close_models(self) -> None:
-        for model in self.embedders or ():
-            await close_model(model)
+        if self.embedders is None:
+            return
+        media, text = self.embedders
+        await close_model(media)
+        if text is not media:
+            await close_model(text)
 
 
 _worker_runtime: _WorkerRuntime | None = None
@@ -573,6 +585,8 @@ def create_worker_app(settings: WorkerSettings) -> Celery:
     # the CLI flags, this app's default, and Celery's own CPU-count fallback. `--autoscale` is
     # readable but not yet parsed there, which `_resolved_pool_size` handles. The dispatch UID
     # keeps a re-created app from stacking a second receiver.
+    worker_init.disconnect(dispatch_uid="mindbridge-in-process-model-guard")
+
     @worker_init.connect(weak=False, dispatch_uid="mindbridge-in-process-model-guard")  # type: ignore[untyped-decorator]
     def _guard_in_process_models(sender: object = None, **_kwargs: object) -> None:
         try:

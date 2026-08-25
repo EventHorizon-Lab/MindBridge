@@ -141,11 +141,12 @@ bundled per-field variables or through one explicit JSON object.
 | --- | --- | --- |
 | Generator | `MINDBRIDGE_GENERATOR_PLUGIN` | `openai` |
 | Text embedder | `MINDBRIDGE_EMBEDDER_PLUGIN` | `openai` |
-| Media embedder | `MINDBRIDGE_MEDIA_EMBEDDER_PLUGIN` | `jina` |
+| Media embedder | `MINDBRIDGE_MEDIA_EMBEDDER_PLUGIN` | inherits `MINDBRIDGE_EMBEDDER_PLUGIN` |
 
 `openai` means "any OpenAI-compatible endpoint", including one you serve yourself, and it is the
-recommended value for **all three** slots — media included, where it is not the default. `jina`
-loads the model into the process; see [media embedder](#media-embedder-worker-only) for what that
+default for **all three** slots. `jina`
+loads the model into the process; see
+[optional local media embedder](#optional-local-media-embedder-worker-only) for what that
 costs and when the worker refuses to run it.
 
 ### Generator
@@ -163,7 +164,7 @@ allowance for the encoding and graph write after the model call. Raising it is h
 a slow generator moves both deadlines at once. See
 [deployment](deployment.md#how-long-one-observation-may-take).
 
-### Text embedder
+### Shared embedder
 
 | Variable | Required | Default |
 | --- | --- | --- |
@@ -171,14 +172,13 @@ a slow generator moves both deadlines at once. See
 | `MINDBRIDGE_EMBEDDER_ENDPOINT` | yes | — |
 | `MINDBRIDGE_EMBEDDER_MODEL_ID` | no | `jinaai/jina-embeddings-v5-omni-small-retrieval` |
 
-The worker's text slot deliberately reads these same names rather than a parallel family. It has
-to land in the space the API queries, and a second name is a second thing that can silently
-disagree. A worker that genuinely needs a different endpoint sets a different value for the same
-name — each process has its own environment.
+The default `openai` plugin names the wire adapter, not the model runtime. The committed endpoint
+points to `mindbridge jina serve`, which loads Jina v5 Omni with SentenceTransformers. The API,
+MCP, consolidation jobs, and both worker slots use that one service by default.
 
-### Media embedder (worker only)
+### Optional local media embedder (worker only)
 
-Two shapes, and the recommended one is **not** the default plugin.
+The served shape is the default; the local model is an explicit opt-in.
 
 **Served (recommended).** One variable, because the media slot then reuses the text embedder's
 endpoint — it has to write into the same embedding space anyway:
@@ -187,7 +187,7 @@ endpoint — it has to write into the same embedding space anyway:
 export MINDBRIDGE_MEDIA_EMBEDDER_PLUGIN=openai
 ```
 
-**In-process (`jina`, the default).** Loads the encoder into the worker itself:
+**In-process (`jina`, optional).** Loads the encoder into the worker itself:
 
 | Variable | Required | Default |
 | --- | --- | --- |
@@ -195,15 +195,14 @@ export MINDBRIDGE_MEDIA_EMBEDDER_PLUGIN=openai
 | `MINDBRIDGE_MEDIA_EMBEDDER_DEVICE` | no | automatic selection |
 | `MINDBRIDGE_WORKER_VRAM_BUDGET_GIB` | no | `3.7` — one model copy per child |
 
-`MINDBRIDGE_MEDIA_EMBEDDER_MODEL_ID` is a Hugging Face repository ID; `MINDBRIDGE_EMBEDDER_MODEL_ID`
-is an endpoint-side alias. They frequently hold the same string and are still not the same field
-— do not consolidate them.
+These variables are read only when a `MINDBRIDGE_MEDIA_EMBEDDER_*` override is present. Setting
+`MINDBRIDGE_MEDIA_EMBEDDER_PLUGIN=jina` opts the worker into loading a second, local
+SentenceTransformers model. Without that explicit override, media inherits the shared endpoint.
 
 An explicit `DEVICE` that is unavailable fails rather than silently falling back to CPU.
 
-What the in-process plugin costs, measured on one RTX 5090 against the same model served through
-vLLM, is in [deployment](deployment.md#media-encoder-served-or-in-process): **3.7 GiB of VRAM per
-prefork child**, and 61-198x the wall time per media object. The worker **refuses to start** when a
+The in-process plugin costs **3.7 GiB of resident weights per prefork child** on the measured RTX
+5090. The worker **refuses to start** when a
 pool of more than one child would hold more than `MINDBRIDGE_WORKER_VRAM_BUDGET_GIB`, while either
 embedder slot names `jina`, because a prefork child holds its own copy of the model and
 `--max-memory-per-child` cannot bound VRAM. The pool size is whichever of `--concurrency` and

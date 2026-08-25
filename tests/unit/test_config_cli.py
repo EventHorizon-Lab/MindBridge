@@ -52,6 +52,19 @@ def test_a_complete_configuration_reports_success(
     assert "ready" in capsys.readouterr().out
 
 
+def test_plugin_credentials_missing_from_a_file_backed_config_are_reported(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _without_mindbridge_environment(monkeypatch)
+    _complete(tmp_path, monkeypatch)
+    monkeypatch.delenv("MINDBRIDGE_GENERATOR_API_KEY")
+
+    assert main(["--role", "api"], prog="mindbridge config check") == 1
+    assert "missing  MINDBRIDGE_GENERATOR_API_KEY" in capsys.readouterr().out
+
+
 def test_all_missing_settings_are_reported_in_one_pass(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -123,6 +136,19 @@ def test_the_lifecycle_sweep_needs_a_database_not_only_storage(
     assert "MINDBRIDGE_DATABASE_URL" in capsys.readouterr().out
 
 
+def test_the_normal_lifecycle_sweep_does_not_require_object_storage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _without_mindbridge_environment(monkeypatch)
+    monkeypatch.setenv("MINDBRIDGE_DATABASE_URL", "postgresql://u:p@h/d")
+
+    assert main(["--role", "lifecycle"], prog="mindbridge config check") == 0
+    assert "ready" in capsys.readouterr().out
+
+
 def test_a_source_is_named_for_every_resolved_setting(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -135,7 +161,7 @@ def test_a_source_is_named_for_every_resolved_setting(
 
     reported = capsys.readouterr().out
     assert "MINDBRIDGE_DATABASE_URL  (from environment)" in reported
-    assert "MINDBRIDGE_OBJECT_STORAGE_BUCKET  (from mindbridge.toml)" in reported
+    assert f"MINDBRIDGE_OBJECT_STORAGE_BUCKET  (from {tmp_path / 'mindbridge.toml'})" in reported
 
 
 def test_a_role_whose_extra_is_absent_names_the_extra(monkeypatch: pytest.MonkeyPatch) -> None:

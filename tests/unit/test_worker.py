@@ -3,6 +3,7 @@
 import asyncio
 from collections.abc import Awaitable, Mapping
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import cast
 from unittest.mock import Mock
 
@@ -51,9 +52,11 @@ def test_worker_settings_pin_models_and_redact_credentials() -> None:
     settings = WorkerSettings.from_environment(_environment())
 
     assert settings.generator_config["model_id"] == "qwen3.8-max"
+    assert settings.media_embedder_plugin == settings.text_embedder_plugin == "openai"
     assert settings.media_embedder_config["model_id"] == (
         "jinaai/jina-embeddings-v5-omni-small-retrieval"
     )
+    assert settings.media_embedder_config == settings.text_embedder_config
     assert "database-secret" not in repr(settings)
     assert "broker-secret" not in repr(settings)
     assert "generator-secret" not in repr(settings)
@@ -69,7 +72,7 @@ def test_worker_text_encoder_shares_the_deployment_wide_embedder_contract() -> N
     assert settings.text_embedder_config["dimension"] == settings.media_embedder_config["dimension"]
 
 
-def test_worker_reuses_and_closes_both_embedder_plugins_on_its_own_event_loop(
+def test_worker_reuses_and_closes_the_shared_embedder_on_its_own_event_loop(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Both encoder slots are loaded once per child, not once per delivery.
@@ -111,7 +114,8 @@ def test_worker_reuses_and_closes_both_embedder_plugins_on_its_own_event_loop(
         media_embedder, text_embedder = await runtime.encoders(settings)
         assert isinstance(media_embedder, LoopBoundEmbedder)
         assert isinstance(text_embedder, LoopBoundEmbedder)
-        assert (media_embedder.plugin, text_embedder.plugin) == ("jina", "openai")
+        assert media_embedder is text_embedder
+        assert (media_embedder.plugin, text_embedder.plugin) == ("openai", "openai")
         processing_loops.append(asyncio.get_running_loop())
         return JobState.SUCCEEDED
 
@@ -126,10 +130,10 @@ def test_worker_reuses_and_closes_both_embedder_plugins_on_its_own_event_loop(
     finally:
         worker_module._dispose_worker_runtime()
 
-    # Two deliveries, one load per slot: nothing is re-allocated per observation.
-    assert [plugin for plugin, _loop in creations] == ["jina", "openai"]
+    # Two deliveries, one shared load: nothing is re-allocated per observation.
+    assert [plugin for plugin, _loop in creations] == ["openai"]
     assert processing_loops == [creations[0][1]] * 2
-    assert sorted(closed) == ["jina", "openai"]
+    assert closed == ["openai"]
 
 
 class _RecordingJobStore:
@@ -213,7 +217,7 @@ def test_a_model_load_failure_is_recorded_against_the_row_it_would_have_stranded
     worker_module._dispose_worker_runtime()
     monkeypatch.setattr(worker_module, "load_embedder", load)
     monkeypatch.setattr(worker_module, "PostgresMemoryStore", lambda *_a, **_k: store)
-    settings = WorkerSettings.from_environment(_environment())
+    settings = WorkerSettings.from_environment(_local_media_environment())
     message = ObservationProcessingTaskMessage(**_task_message())
     try:
         with pytest.raises(RuntimeError, match="CUDA out of memory"):
@@ -439,7 +443,7 @@ def test_worker_refuses_to_fork_an_in_process_encoder_into_every_child() -> None
     the card's 32.6 GB while the GPU sat at 1-5% utilisation. `--max-memory-per-child` was set
     and could not help: it bounds resident host memory and cannot bound VRAM.
     """
-    settings = WorkerSettings.from_environment(_environment())
+    settings = WorkerSettings.from_environment(_local_media_environment())
 
     with pytest.raises(ValueError) as failure:
         require_bounded_in_process_models(settings, 6)
@@ -472,13 +476,15 @@ def test_worker_counts_every_in_process_slot_it_names() -> None:
 
 def test_worker_allows_one_child_to_hold_an_in_process_encoder() -> None:
     """One resident copy is the shape the deployment guide recommends, not a defect."""
-    require_bounded_in_process_models(WorkerSettings.from_environment(_environment()), 1)
+    require_bounded_in_process_models(
+        WorkerSettings.from_environment(_local_media_environment()), 1
+    )
 
 
 def test_worker_allows_many_children_when_the_encoder_holds_no_device() -> None:
     """`device=cpu` costs no VRAM, so refusing it cites a budget the run cannot exhaust."""
     settings = WorkerSettings.from_environment(
-        {**_environment(), "MINDBRIDGE_MEDIA_EMBEDDER_DEVICE": "cpu"}
+        {**_local_media_environment(), "MINDBRIDGE_MEDIA_EMBEDDER_DEVICE": "cpu"}
     )
 
     require_bounded_in_process_models(settings, 4)
@@ -486,7 +492,7 @@ def test_worker_allows_many_children_when_the_encoder_holds_no_device() -> None:
 
 def test_worker_allows_many_workers_in_a_pool_that_shares_one_process() -> None:
     """`--pool=threads` runs one process, so its concurrency is not a device budget."""
-    settings = WorkerSettings.from_environment(_environment())
+    settings = WorkerSettings.from_environment(_local_media_environment())
 
     require_bounded_in_process_models(settings, 6, pool="threads")
     require_bounded_in_process_models(settings, 6, pool="solo")
@@ -499,7 +505,7 @@ def test_worker_lets_a_larger_card_declare_the_budget_it_actually_has() -> None:
     able to say so in a number rather than by reaching for a flag the guard cannot see.
     """
     settings = WorkerSettings.from_environment(
-        {**_environment(), "MINDBRIDGE_WORKER_VRAM_BUDGET_GIB": "48"}
+        {**_local_media_environment(), "MINDBRIDGE_WORKER_VRAM_BUDGET_GIB": "48"}
     )
 
     require_bounded_in_process_models(settings, 6)
@@ -525,9 +531,7 @@ def test_worker_rejects_a_vram_budget_that_bounds_nothing(budget: str) -> None:
 
 def test_worker_allows_many_children_when_every_encoder_is_served() -> None:
     """A served encoder leaves no model in any child, so concurrency stops being a GPU budget."""
-    settings = WorkerSettings.from_environment(
-        {**_environment(), "MINDBRIDGE_MEDIA_EMBEDDER_PLUGIN": "openai"}
-    )
+    settings = WorkerSettings.from_environment(_environment())
 
     require_bounded_in_process_models(settings, 12)
 
@@ -548,7 +552,7 @@ def test_worker_startup_refuses_rather_than_logging_and_carrying_on() -> None:
     off app creation. It must raise `SystemExit`: Celery's `Signal.send` catches `Exception`
     from every receiver, logs it, and starts the worker anyway.
     """
-    create_worker_app(WorkerSettings.from_environment(_environment()))
+    create_worker_app(WorkerSettings.from_environment(_local_media_environment()))
 
     with pytest.raises(SystemExit, match="a pool of 4"):
         worker_init.send(sender=_StartingWorker(4))
@@ -560,7 +564,7 @@ def test_worker_startup_reads_the_pool_class_celery_has_not_resolved_yet() -> No
     `pool_cls` is still the flag's own string at `worker_init`; Celery resolves it to a class
     on the line after the signal.
     """
-    create_worker_app(WorkerSettings.from_environment(_environment()))
+    create_worker_app(WorkerSettings.from_environment(_local_media_environment()))
 
     worker_init.send(sender=_StartingWorker(6, pool_cls="threads"))
 
@@ -577,27 +581,56 @@ def test_worker_startup_sees_the_autoscale_ceiling_the_pool_has_not_parsed_yet()
     This drives a real `WorkController` rather than a stand-in, because the ordering it is
     asserting is Celery's, not ours. Building one establishes no broker connection.
     """
-    app = create_worker_app(WorkerSettings.from_environment(_environment()))
+    app = create_worker_app(WorkerSettings.from_environment(_local_media_environment()))
 
     with pytest.raises(SystemExit, match="a pool of 6"):
         app.Worker(autoscale=(6, 1))
 
 
-def test_worker_media_slot_reaches_a_served_encoder_without_new_variables() -> None:
-    """Flipping the media slot to the served path must not need a second family of names.
+def test_worker_media_slot_defaults_to_the_served_encoder_without_new_variables() -> None:
+    """The media slot reaches the served path without a second family of names.
 
     The deployment already has one embedding endpoint, for the text encoder that has to write
     into the same space, so the served media slot reuses it. That keeps the recommended
     configuration one variable away rather than five.
     """
-    settings = WorkerSettings.from_environment(
-        {**_environment(), "MINDBRIDGE_MEDIA_EMBEDDER_PLUGIN": "openai"}
-    )
+    settings = WorkerSettings.from_environment(_environment())
 
     assert settings.media_embedder_config["endpoint"] == "https://text.example.test/v1"
     assert settings.media_embedder_config["api_key"] == "text-embedding-secret"
     assert settings.media_embedder_config["space_id"] == settings.text_embedder_config["space_id"]
     assert "device" not in settings.media_embedder_config
+
+
+def test_worker_media_slot_reuses_the_file_backed_embedder_config(tmp_path: Path) -> None:
+    config = tmp_path / "mindbridge.toml"
+    config.write_text(
+        "[object_storage]\nbucket = 'memory'\n"
+        "[embedding]\ndimension = 1024\nspace_id = 'jina-v5'\n"
+        "[generator]\nendpoint = 'https://generator.example.test/v1'\n"
+        "[embedder]\nendpoint = 'https://text.example.test/v1'\nmodel_id = 'jina-omni'\n"
+        "[media_embedder]\nplugin = 'openai'\n",
+        encoding="utf-8",
+    )
+    settings = WorkerSettings.from_environment(
+        {**_environment(), "MINDBRIDGE_CONFIG_FILE": str(config)}
+    )
+
+    assert settings.media_embedder_config == settings.text_embedder_config
+
+
+def test_worker_can_explicitly_opt_into_the_local_jina_encoder() -> None:
+    settings = WorkerSettings.from_environment(
+        {
+            **_environment(),
+            "MINDBRIDGE_MEDIA_EMBEDDER_PLUGIN": "jina",
+            "MINDBRIDGE_MEDIA_EMBEDDER_DEVICE": "cuda",
+        }
+    )
+
+    assert settings.media_embedder_plugin == "jina"
+    assert settings.media_embedder_config["device"] == "cuda"
+    assert "endpoint" not in settings.media_embedder_config
 
 
 class _RecordingProvider:
@@ -660,11 +693,16 @@ def _environment() -> Mapping[str, str]:
     }
 
 
+def _local_media_environment() -> Mapping[str, str]:
+    return {**_environment(), "MINDBRIDGE_MEDIA_EMBEDDER_PLUGIN": "jina"}
+
+
 def _both_slots_in_process() -> Mapping[str, str]:
     """The 2026-08-21 evaluation's own shape: the bundled local encoder in both slots."""
     return {
         **_environment(),
         "MINDBRIDGE_EMBEDDER_PLUGIN": "jina",
+        "MINDBRIDGE_MEDIA_EMBEDDER_PLUGIN": "jina",
         "MINDBRIDGE_EMBEDDER_CONFIG_JSON": '{"model_id": "jinaai/jina-embeddings-v5-omni-small-retrieval"}',
     }
 

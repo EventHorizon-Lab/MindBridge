@@ -6,11 +6,12 @@ the variables themselves see [configuration](configuration.md); for the runtime 
 
 ## Topology
 
-Five process roles. Only the first three are long-running.
+Six process roles. Only the first four are long-running.
 
 | Role | Command | Extras |
 | --- | --- | --- |
 | API | `uvicorn mindbridge.server:create_app --factory` | `server` |
+| Jina embedding service | `mindbridge jina serve` | `server` + `cloud-models` |
 | Memory worker | `celery -A mindbridge.celery_app:app worker` | `server` + `media` (+ `cloud-models` only for an in-process media encoder, which brings `media` with it) |
 | MCP (optional) | `mindbridge mcp` | `server` |
 | Consolidation | `mindbridge consolidate --tenant-id ...` | `server` |
@@ -22,10 +23,9 @@ packages:
 
 ```bash
 uv sync                                      # Core types and Python SDK
-uv sync --extra edge                         # Any edge host
+uv sync --extra edge                         # Edge sync and identity runtime
 uv sync --extra server                       # API, MCP, scheduled sweeps
-uv sync --extra server --extra cloud-models  # GPU memory worker
-uv sync --extra vllm-server                  # RTX 5090 embedding endpoint (CUDA 12.9)
+uv sync --extra server --extra cloud-models  # Jina SentenceTransformers service
 uv sync --extra benchmarks                   # Benchmark harness
 uv sync --all-extras                         # Every role at once
 ```
@@ -152,95 +152,25 @@ degraded service.
 
 ### Embedding endpoint
 
-The API sends both multimodal recall queries and explicit memory text to one OpenAI-compatible
-Jina v5 Omni pooling endpoint, which encodes each side with its own retrieval prompt. It loads no
-model itself. A self-hosted endpoint can serve the same model through vLLM.
-
-`Qwen3VLAudioModel` is not in vLLM's model registry. The model repo carries its own vLLM
-implementation and registers it as a side effect of the `trust_remote_code` config import, and that
-side effect reaches the API server process but **not** the engine subprocess, which resolves the
-model class again and otherwise falls back to a generic Transformers backend. Registering through
-vLLM's own plugin hook is what covers every process, so bring-up is three steps:
+The API sends multimodal recall queries and explicit memory text to one OpenAI-compatible Jina v5
+Omni endpoint. The bundled service loads the model through SentenceTransformers, preserving its
+native text, image, video, audio, and mixed-input preprocessing:
 
 ```bash
-# 1. Install the matching CUDA compiler/runtime and Python environment.
-sudo apt install cuda-compiler-12-9 libcurand-dev-12-9
-uv sync --extra vllm-server
+export MINDBRIDGE_EMBEDDER_API_KEY=replace-with-at-least-32-random-characters
 
-# 2. Add a plugin vLLM loads in each of its processes, engine subprocess included.
-mkdir -p vllm-jina-omni && cd vllm-jina-omni
-cat > pyproject.toml <<'TOML'
-[project]
-name = "vllm-jina-omni-plugin"
-version = "0"
-dependencies = ["huggingface-hub"]
-
-[project.entry-points."vllm.general_plugins"]
-jina_v5_omni = "vllm_jina_omni_plugin:register"
-TOML
-cat > vllm_jina_omni_plugin.py <<'PYPLUGIN'
-import importlib
-import os
-import sys
-
-
-def register() -> None:
-    from huggingface_hub import hf_hub_download
-
-    path = hf_hub_download(
-        "jinaai/jina-embeddings-v5-omni-small-retrieval", "vllm_qwen3vl_audio.py"
-    )
-    sys.path.insert(0, os.path.dirname(path))
-    importlib.import_module("vllm_qwen3vl_audio")
-PYPLUGIN
-uv pip install --python ../.venv/bin/python .
-cd -
-
-# 3. Serve.
-CUDA_HOME=/usr/local/cuda-12.9 \
-  .venv/bin/vllm serve jinaai/jina-embeddings-v5-omni-small-retrieval \
-  --trust-remote-code \
-  --runner pooling --convert embed \
-  --pooler-config '{"pooling_type":"LAST"}'
+uv run --extra server --extra cloud-models mindbridge jina serve \
+  --host 0.0.0.0 --port 8001 --device cuda \
+  --media-origin https://media.example.com
 ```
 
-Check that it took before trusting the endpoint. The engine process logs `Model architecture
-Qwen3VLAudioModel is already registered, and will be overwritten by
-<...vllm_qwen3vl_audio.Qwen3VLAudioForEmbedding>`, and never logs `no vLLM implementation, falling
-back to Transformers implementation`. The second message means the endpoint is answering from the
-generic backend instead, which is a different encoder.
+Repeat `--media-origin` for every exact object-storage origin that signs media downloads. The
+service downloads those URLs itself with a 64 MiB limit and rejects redirects and every origin
+not named here, so the model never receives an unrestricted remote URL.
 
-Pin the revision in both places or neither. `vllm serve --revision` selects the weights while the
-plugin above downloads plugin code from `main`, and the two revisions of that file do not agree
-about video.
-
-Serve this once and point **every** slot at it, including the worker's media slot. That endpoint
-embeds text, images, video, and audio, so there is no second model to run — see
-[media encoder](#media-encoder-served-or-in-process) for the measured comparison and the one
-version-dependent caveat that goes with it.
-
-Four more things to get right:
-
-- **`--runner pooling` is not optional.** Without it vLLM selects the generate runner and refuses
-  to start on `language_model.lm_head.weight`, a weight an embedding checkpoint does not carry and
-  one the repo's own loader deliberately skips.
-- **Pooler keys move between versions.** The model card's snippet passes `normalize=True`, which
-  0.19 rejects during argument parsing. Read the `PoolerConfig` fields of the version you installed
-  rather than copying the snippet.
-- **Use the `vllm-server` extra rather than an unqualified `uv pip install`.** It pins
-  `vllm==0.27.1+cu129`, Torch 2.13.0, and the matching audio packages from their cu129 indexes.
-  The RTX 5090 reports `sm_120`, so FlashInfer JIT also needs the system CUDA 12.9 compiler and
-  headers installed above; the NVIDIA driver alone does not provide them.
-- **On Blackwell, keep the CUDA compiler aligned with Torch.** A `CUDA_HOME` pointing at 12.8
-  makes FlashInfer reject `sm_120` even when `torch.version.cuda` reports 12.9. If a kernel still
-  fails to compile, add `--attention-backend TRITON_ATTN --mm-encoder-attn-backend TORCH_SDPA`.
-
-Audio needs an upstream fix before the endpoint returns anything for it. The plugin's data parser
-accepts `target_sr` and never forwards it to its base class, so the base resampler is built without
-one and raises `Audio resampling is not supported when target_sr is not provided` before it
-compares any sample rates — a 16 kHz file into a 16 kHz model fails too. Forwarding that keyword to
-`super().__init__` is the whole fix. `--media-io-kwargs '{"audio":{"sampling_rate":16000}}'` does
-not substitute for it: the flag parses and the failure is in the parser, not the IO layer.
+Point `MINDBRIDGE_EMBEDDER_ENDPOINT` at this service's `/v1` base URL and use the same API key in
+the API and worker. `/health` is the readiness probe; `/v1/models` and `/v1/embeddings` follow the
+OpenAI-compatible contract used by MindBridge.
 
 ## Memory worker
 
@@ -273,7 +203,7 @@ Both embedder slots must resolve to one embedding space. The worker compares the
 spaces before processing and fails the job rather than writing media and text vectors that cannot
 be compared.
 
-### Media encoder: served or in-process
+### Optional in-process media encoder
 
 The alternative is the bundled `jina` plugin, which loads Jina v5 Omni into the worker process:
 
@@ -286,28 +216,6 @@ uv run --extra server --extra cloud-models \
   celery -A mindbridge.celery_app:app worker --loglevel=INFO --concurrency=1
 ```
 
-Measured on one RTX 5090, same model and same revision on both sides, the served endpoint being
-the `vllm serve` command above:
-
-| | Served | In-process `cuda` | In-process `cpu` |
-| --- | --- | --- | --- |
-| VRAM held per prefork child | 0 | 3 745 MiB | 0 |
-| Model load per child | none | 3.8 s | — |
-| Video clip, first embed, median of 8 | **0.062 s** | 10.2 s | — |
-| Image, first embed, median of 5 | **0.048 s** | 2.9 s | — |
-| Text, 6 callers × batches of 32 | 600/s | 719/s | 1.8/s |
-| Text, 6 callers × one at a time | **183/s** | 63/s | 3.1/s |
-
-Clips and images are real derived evidence from a nine-benchmark run, 4-22 s and 84-306 KB; the
-text figures are 128 real memory summaries averaging 189 characters.
-
-Read the table as two separate results. Media is where serving wins outright — 61x on images,
-198x on video — though part of the video figure is that the served path samples a fixed frame
-budget (404-416 prompt tokens whether the clip is 4 s or 22 s) while the in-process path samples
-in proportion to clip length. Text is a wash on a GPU, better served when callers arrive one at a
-time, and a rout on a CPU: a local encoder on CPU manages 1.8 documents per second, which is what
-makes an ingest of any size impossible.
-
 **The worker refuses to start when a pool of more than one child would hold more resident encoder
 weight than the deployment allows, while either embedder slot names `jina`.** A prefork child owns
 its plugins, so the model is loaded once per child and six children need about 22 GiB of VRAM. The
@@ -318,31 +226,11 @@ during a nine-benchmark evaluation that combination reached 30.2 of the card's 3
 at 1-5% utilisation, then produced 479 CUDA out-of-memory errors and a kernel `global_oom` on the
 host. Scale in-process encoding with one worker process per assigned GPU at concurrency 1, or serve
 the encoder and stop budgeting VRAM per child. A card that can genuinely hold more copies says so
-in [`MINDBRIDGE_WORKER_VRAM_BUDGET_GIB`](configuration.md#media-embedder-worker-only), which is the
+in
+[`MINDBRIDGE_WORKER_VRAM_BUDGET_GIB`](configuration.md#optional-local-media-embedder-worker-only),
+which is the
 supported way to raise the limit — the estimate it bounds counts resident weights only, so leave
 room for activation memory.
-
-One caveat on switching an existing deployment: **video vectors from the two backends agree only
-to cosine 0.944** (text 0.99994, images 0.985), because they sample different numbers of frames
-from the same clip — neither path honours a per-request frame-rate hint. Re-encode media evidence
-after the switch, or accept that old and new video vectors are not strictly comparable. The
-`space_id` is the same string on both sides, so nothing will stop you.
-
-That table holds for one vLLM version, and the served video path does not survive every version.
-On **0.19.1** — the newest release a CUDA 12.8 driver can run — a served video request is refused
-outright:
-
-```text
-ValueError: Mismatch in `video` token count between text and `input_ids`.
-            Got ids=[496] and text=[748].
-```
-
-raised inside the plugin's own processor while it re-derives the per-frame timestamp expansion.
-The counts are identical on the repo's `main` and on the `12949877` revision, and identical with
-and without the per-request frame-rate and pixel hints, so it is neither the model revision nor the
-request shape. Verify the served media path on the exact version you intend to deploy before
-pointing the worker's media slot at it, and record that version alongside any numbers you measure:
-the same command against two vLLM releases is two different experiments.
 
 ### How long one observation may take
 

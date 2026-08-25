@@ -54,11 +54,11 @@ speaker model，并在 `sentence_info` 中返回 `start/end/text/spk/timestamp`�
 保留自己的领域职责：加密模板、匹配门槛、证据、撤销和云端安全输出。
 
 减重边界必须诚实：FunASR Python 发行本身仍包含 Torch、ModelScope/Transformers 和音频科学计算
-依赖，因此它不进入 Core/SDK/server 的通用 lock。每个平台的设备镜像各自安装与本平台 SDK 匹配的
-Torch/ONNX Runtime、FunASR 和 ModelScope（Jetson 用 JetPack/CUDA 工件，地瓜 RDK 用 OpenExplorer，
-RK 用 RKNN Toolkit，x86 用 OpenVINO 或标准 CUDA/CPU wheel）；`mindbridge[edge]` 只携带同步、安全、
-OpenAI SDK 与可观测边界，不钉死任何一家的加速器 wheel。减掉的是**重复模型栈和 MindBridge 代码**，
-不是把 FunASR 描述成小型纯 Python 包。
+依赖，因此它不进入 Core/SDK/server。`mindbridge[edge]` 在 Linux/Windows x86_64 和 macOS 14+
+Apple Silicon 安装 PyPI 通用模型栈；Linux ARM 镜像各自安装与平台 SDK 匹配的 Torch/ONNX
+Runtime、FunASR 和 ModelScope（Jetson 用 JetPack/CUDA 工件，地瓜 RDK 用 OpenExplorer，RK 用
+RKNN Toolkit）。减掉的是**重复模型栈和 MindBridge 代码**，不是把 FunASR 描述成小型纯 Python
+包。
 
 ## 3. 与 M3-Agent、TaskMem 的差异
 
@@ -211,13 +211,18 @@ speech pipeline，否则顺序复用同一加速器。CPU 承担 SQLite、AES、
 
 - Core/SDK：`uv pip install .`；
 - 任意端侧/机器人编排（Jetson、地瓜 RDK、RK、OpenVINO x86、ARM 主机、dGPU 工作站）：
-  `uv pip install '.[edge]'`——同一个 extra，不按平台分叉；
+  `uv pip install '.[edge]'`；Linux/Windows x86_64 与 macOS 14+ Apple Silicon 主机同时获得通用
+  模型运行栈，Linux ARM 设备保留 JetPack、RKNN、OpenVINO 或 BPU 提供的 wheel；
 - 云服务：`uv pip install '.[server]'`；
-- 本地 Jina GPU Worker：再叠加 `'.[cloud-models]'`；
-- InsightFace、ONNX Runtime、FunASR、ModelScope 和设备 Torch：由目标平台镜像提供。
+- Jina SentenceTransformers 服务：再叠加 `'.[cloud-models]'`；
+- `edge` 在 Linux/Windows x86_64 和 macOS 14+ Apple Silicon 声明 InsightFace、ONNX Runtime、
+  OpenCV、FunASR、ModelScope（由 FunASR 传递安装）、Torch 和 TorchAudio；Linux ARM 厂商镜像
+  自行提供这些模型运行时；Intel macOS 因 PyTorch 2.13 无 wheel 而只安装编排栈；NumPy 因为被
+  MindBridge 直接导入，在所有平台都由 `edge` 声明。
 
-通用 lock 不钉死任何平台的加速器 wheel（Jetson Torch、RKNN Toolkit、OpenVINO runtime、BPU
-工具链都一样）。CI 用独立 venv 对 Core、Edge、Server 分别 build/install，并在
+通用 lock 与发布 wheel 都从 PyPI 解析同一组版本；随包的 `onnxruntime` 是 CPU 人脸 provider，
+CUDA/TensorRT 人脸 provider 仍由平台镜像提供。lock 不包含 Jetson Torch、RKNN Toolkit、OpenVINO
+runtime 或 BPU 工具链。CI 用独立 venv 对 Core、Edge、Server 分别 build/install，并在
 隔离解释器中导入对应入口，防止 Edge 再次拖入 FastAPI、Celery、MCP 或 PostgreSQL。FunASR 安装
 成功还不等于模型路径可用；设备镜像必须在启动验收中真正加载一次模型，并核对**实际生效的
 device/provider**——不能因为进程起得来就认为加速器在工作。

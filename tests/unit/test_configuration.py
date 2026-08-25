@@ -178,6 +178,18 @@ def test_a_plugin_section_becomes_its_config_object() -> None:
     assert "MINDBRIDGE_GENERATOR_PLUGIN" not in flattened
 
 
+def test_a_selector_only_plugin_section_does_not_replace_its_fallback() -> None:
+    flattened = _flattened_plugins(
+        {
+            "embedding": {"dimension": 1024, "space_id": "jina-v5"},
+            "media_embedder": {"plugin": "openai"},
+        },
+        {},
+    )
+
+    assert "MINDBRIDGE_MEDIA_EMBEDDER_CONFIG_JSON" not in flattened
+
+
 def test_an_environment_override_is_read_in_the_type_the_file_declared() -> None:
     flattened = _flattened_plugins(
         {"generator": {"request_timeout_seconds": 1800, "max_retries": 2, "model_id": "a"}},
@@ -318,6 +330,7 @@ def test_the_committed_configuration_file_loads_and_carries_no_credential() -> N
 
     assert resolved["MINDBRIDGE_OBJECT_STORAGE_BUCKET"] == "mindbridge-media"
     assert resolved["MINDBRIDGE_EMBEDDING_DIMENSION"] == "1024"
+    assert "MINDBRIDGE_MEDIA_EMBEDDER_CONFIG_JSON" not in resolved
     # The guard is worth nothing if the shipped file was never run through it.
     assert not CREDENTIAL_VARIABLES & set(resolved)
     named = {

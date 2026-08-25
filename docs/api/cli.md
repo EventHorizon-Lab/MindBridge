@@ -17,15 +17,15 @@ uv run --extra server mindbridge lifecycle --help
 
 | Command | Subcommands |
 | --- | --- |
-| `mindbridge` | `config check`, `consolidate`, `jobs`, `lifecycle`, `mcp`, `edge sync` |
+| `mindbridge` | `config check`, `consolidate`, `jobs`, `lifecycle`, `mcp`, `jina serve`, `edge sync` |
 | `mindbridge-bench` | `locomo-refined`, `m3`, `egolife`, `egomem`, `egotempo`, `memlens`, `mm-lifelong`, `supermemory`, `video-mme`, `aml` |
 | `mindbridge-bench` support | `score`, `datasets`, `jina`, `bakeoff` |
 
 `mindbridge-consolidate`, `mindbridge-lifecycle`, and `mindbridge-mcp` remain as aliases for the
 subcommands of the same name. They route through the same module and report the same codes.
 
-The API and the memory worker are long-running processes started by `uvicorn` and `celery`, not
-subcommands. See [deployment](../deployment.md).
+The API and memory worker are long-running processes started by `uvicorn` and `celery`. The Jina
+embedding service is started by `mindbridge jina serve`. See [deployment](../deployment.md).
 
 ## The shared contract
 
@@ -326,6 +326,24 @@ uv run --extra server mindbridge mcp
 ```
 
 JSON-RPC goes on stdout. Never redirect it. See [MCP tools](mcp.md).
+
+---
+
+## `mindbridge jina serve`
+
+Serves Jina v5 Omni through SentenceTransformers and an authenticated OpenAI-compatible embedding
+API. Requires `server` and `cloud-models`.
+
+```bash
+export MINDBRIDGE_EMBEDDER_API_KEY=replace-with-at-least-32-random-characters
+uv run --extra server --extra cloud-models mindbridge jina serve --host 0.0.0.0 \
+  --media-origin https://media.example.com
+```
+
+The default port is `8002`; `--device`, `--model-id`, and `--max-concurrency` control the one model
+process. Repeat `--media-origin` for every exact HTTP(S) origin that may serve presigned media;
+remote URLs from any other origin and all redirects are rejected. `/health` is public.
+`/v1/models` and `/v1/embeddings` require the bearer token.
 
 ---
 

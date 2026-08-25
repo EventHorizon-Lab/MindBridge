@@ -32,7 +32,7 @@ jobs:
             probe: edge
           - name: server
             requirement: .[server]
-            probe: api application celery_app cli consolidation_cli infrastructure jobs_cli lifecycle_cli models server telemetry worker
+            probe: api application celery_app cli consolidation_cli infrastructure jina_server jobs_cli lifecycle_cli models server telemetry worker
           - name: benchmarks
             requirement: .[benchmarks]
             probe: benchmarks
@@ -88,6 +88,12 @@ jobs:
                   # app from the environment as it loads. Anything that is not a missing
                   # import is configuration, not packaging, so it is not this job's business.
                   pass
+          if os.environ["PROBE"] == "edge":
+              for name in ("cv2", "funasr", "insightface", "numpy", "onnxruntime", "torch", "torchaudio"):
+                  try:
+                      importlib.import_module(name)
+                  except ImportError as error:
+                      failed.append(f"{name}: {error}")
           print(f"imported {len(found) - len(failed)} of {len(found)} modules under {' '.join(wanted)}")
           for line in failed:
               print(f"  FAILED {line}")
@@ -168,7 +174,7 @@ jobs:
           enable-cache: true
 
       - name: Install locked dependencies
-        run: uv sync --frozen --all-groups --extra edge --extra media --extra server
+        run: uv sync --frozen --all-groups --extra media --extra server
 
       - name: Check formatting
         run: uv run --frozen ruff format --check .

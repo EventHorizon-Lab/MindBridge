@@ -18,6 +18,7 @@ from pathlib import Path
 
 from mindbridge.cli import parser
 from mindbridge.configuration import (
+    CONFIG_FILE_VARIABLE,
     CREDENTIAL_VARIABLES,
     DEFAULT_CONFIG_FILE,
     MissingConfigurationError,
@@ -87,6 +88,12 @@ def _imported_probe(role: str) -> Callable[[Mapping[str, str]], object]:
         # Reporting the API as ready without it would name a role that cannot start.
         def _api(source: Mapping[str, str]) -> object:
             settings = Settings.from_environment(source)
+            _validate_models(
+                settings.generator_plugin,
+                settings.generator_config,
+                settings.embedder_plugin,
+                settings.embedder_config,
+            )
             require_rest_authentication(settings)
             return settings
 
@@ -94,27 +101,67 @@ def _imported_probe(role: str) -> Callable[[Mapping[str, str]], object]:
     if role == "mcp":
         from mindbridge.api.runtime import Settings
 
-        return Settings.from_environment
+        def _mcp(source: Mapping[str, str]) -> object:
+            settings = Settings.from_environment(source)
+            _validate_models(
+                settings.generator_plugin,
+                settings.generator_config,
+                settings.embedder_plugin,
+                settings.embedder_config,
+            )
+            return settings
+
+        return _mcp
     if role == "worker":
         from mindbridge.worker import WorkerSettings
 
-        return WorkerSettings.from_environment
+        def _worker(source: Mapping[str, str]) -> object:
+            settings = WorkerSettings.from_environment(source)
+            _validate_models(
+                settings.generator_plugin,
+                settings.generator_config,
+                settings.text_embedder_plugin,
+                settings.text_embedder_config,
+            )
+            _validate_embedder(settings.media_embedder_plugin, settings.media_embedder_config)
+            return settings
+
+        return _worker
     if role == "consolidate":
         from mindbridge.consolidation_cli import ConsolidationSettings
 
-        return ConsolidationSettings.from_environment
+        def _consolidate(source: Mapping[str, str]) -> object:
+            settings = ConsolidationSettings.from_environment(source)
+            _validate_models(
+                settings.generator_plugin,
+                settings.generator_config,
+                settings.embedder_plugin,
+                settings.embedder_config,
+            )
+            return settings
+
+        return _consolidate
     if role == "lifecycle":
-        from mindbridge.infrastructure.s3 import S3MediaAccess
-
-        # The sweep reads MINDBRIDGE_DATABASE_URL at lifecycle_cli.py:134, separately from the
-        # media access it builds only for --reclaim-orphan-clips. Probing the storage alone
-        # would report a lifecycle run as ready with no database configured.
-        def _lifecycle(source: Mapping[str, str]) -> object:
-            require_environment_value(source, "MINDBRIDGE_DATABASE_URL")
-            return S3MediaAccess.from_environment(source)
-
-        return _lifecycle
+        return lambda source: require_environment_value(source, "MINDBRIDGE_DATABASE_URL")
     return lambda source: require_environment_value(source, "MINDBRIDGE_API_KEY")
+
+
+def _validate_models(
+    generator_plugin: str,
+    generator_config: Mapping[str, object],
+    embedder_plugin: str,
+    embedder_config: Mapping[str, object],
+) -> None:
+    from mindbridge.models.plugins import validate_generator_configuration
+
+    validate_generator_configuration(generator_plugin, generator_config)
+    _validate_embedder(embedder_plugin, embedder_config)
+
+
+def _validate_embedder(plugin: str, config: Mapping[str, object]) -> None:
+    from mindbridge.models.plugins import validate_embedder_configuration
+
+    validate_embedder_configuration(plugin, config)
 
 
 def _missing(role: str, resolved: Mapping[str, str]) -> tuple[list[str], str | None]:
@@ -150,7 +197,11 @@ def _report(missing: Sequence[str], resolved: Mapping[str, str], failure: str | 
     for name in sorted(name for name in resolved if name.startswith("MINDBRIDGE_")):
         if name in missing:
             continue
-        origin = "environment" if name in os.environ else DEFAULT_CONFIG_FILE
+        origin = (
+            "environment"
+            if name in os.environ
+            else os.environ.get(CONFIG_FILE_VARIABLE, DEFAULT_CONFIG_FILE)
+        )
         print(f"present  {name}  (from {origin})")
     if failure is not None:
         print(f"invalid  {failure}")
@@ -174,7 +225,13 @@ def main(argv: Sequence[str], *, prog: str) -> int:
     )
     arguments = built.parse_args(list(argv))
     resolved = configuration_source()
-    missing, failure = _missing(arguments.role, resolved)
+    probe_source = dict(os.environ)
+    if (
+        not probe_source.get(CONFIG_FILE_VARIABLE, "").strip()
+        and Path(DEFAULT_CONFIG_FILE).is_file()
+    ):
+        probe_source[CONFIG_FILE_VARIABLE] = DEFAULT_CONFIG_FILE
+    missing, failure = _missing(arguments.role, probe_source)
     _report(missing, resolved, failure)
 
     if missing and Path(".env").is_file():

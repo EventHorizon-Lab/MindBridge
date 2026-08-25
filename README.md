@@ -161,8 +161,8 @@ a fresh same-protocol rerun with a committed manifest. See
 
 ## Contributing
 
-Read [CONTRIBUTING.md](CONTRIBUTING.md). The short version: `uv sync --all-groups --extra edge
---extra media --extra server`, then make `ruff format --check`, `ruff check`, `mypy`, and
+Read [CONTRIBUTING.md](CONTRIBUTING.md). The short version: `uv sync --all-groups --extra media
+--extra server`, then make `ruff format --check`, `ruff check`, `mypy`, and
 `pytest -W error` pass before you open a pull request. Changes touching recall, consolidation,
 or deletion must run the integration suite against a real PostgreSQL rather than letting it skip.
 
