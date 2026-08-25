@@ -16,6 +16,8 @@ async with MindBridge.connect(
     base_url="https://memory.example.com",
     api_key="at-least-32-characters-long",
     timeout_seconds=120.0,
+    retry_attempts=3,
+    retry_backoff_seconds=0.5,
 ) as memory:
     ...
 ```
@@ -26,6 +28,31 @@ the deployment sits behind a gateway that adds the header.
 
 The default timeout is 120 seconds because a recall in `answer` mode does real model work — a
 30-second default would turn normal latency into a client-side error.
+
+### Retrying
+
+The client retries a request up to `retry_attempts` times when the answer says a dependency was
+briefly unable rather than that the request was refused: a transport failure, or `429`, `502`,
+`503`, `504`. A `503 model_unavailable` from an embedder or generator that is restarting is the
+case this exists for — without it, a read the server would have served a second later reaches the
+caller as a terminal error. Every other status is final on the first attempt, because repeating a
+request the server understood and rejected only spends the rejection twice.
+
+Waits use full jitter over a doubling ceiling (`retry_backoff_seconds`, then twice that, and so
+on). The clients that see one model outage all see it at once, so a fixed delay would return them
+together and re-create the load they were waiting out.
+
+**A write is only retried when it names an `idempotency_key`.** The server stores the first
+outcome under that key and returns it again instead of writing twice, so a repeat is safe. Without
+one, a retried `observe` is a second observation — a silent duplicate, which is worse than the
+surfaced error and is the one nobody notices. A `remember_many` batch is retried only if every
+memory in it names a key, because the server applies them individually.
+
+`recall` is retried despite naming no key. It is the read the outage broke, and the duplicate it
+risks is one extra recorded access against the memories it returns, which feeds strength and
+decay — bounded, and directionally honest about having been asked.
+
+Set `retry_attempts=1` to turn retrying off, for a caller that runs its own.
 
 Outside a context manager, close it yourself:
 

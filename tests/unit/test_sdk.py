@@ -491,3 +491,253 @@ def _client(
             transport=httpx.MockTransport(handler),
         )
     )
+
+
+def _retrying_client(
+    handler: Callable[[httpx.Request], httpx.Response],
+    *,
+    delays: list[float],
+    retry_attempts: int = 3,
+) -> MindBridge:
+    """A client whose waits are recorded instead of slept, so retries are testable."""
+
+    async def record(delay: float) -> None:
+        delays.append(delay)
+
+    return MindBridge(
+        httpx.AsyncClient(
+            base_url="https://memory.example.test/",
+            transport=httpx.MockTransport(handler),
+        ),
+        retry_attempts=retry_attempts,
+        retry_backoff_seconds=0.5,
+        sleep=record,
+    )
+
+
+def _memory_body(**extra: object) -> dict[str, object]:
+    body: dict[str, object] = {
+        "memory_id": "memory_01",
+        "memory_type": "semantic",
+        "summary": "The tool is on the bench.",
+        "evidence_ids": [],
+        "occurred_at": "2026-01-01T00:00:00Z",
+        "ended_at": "2026-01-01T00:00:00Z",
+        "created_at": "2026-01-01T00:00:00Z",
+        "verification_status": "attested",
+        "state": "active",
+        "salience": 0.5,
+        "strength": 1.0,
+        "useful_access_count": 0,
+        "positive_feedback_count": 0,
+        "negative_feedback_count": 0,
+        "last_accessed_at": None,
+        "supersedes_memory_id": None,
+        "superseded_at": None,
+        "evidence": [],
+        "trace_id": "trace_01",
+    }
+    body.update(extra)
+    return body
+
+
+def _remember(idempotency_key: str | None) -> RememberRequest:
+    return RememberRequest(
+        tenant_id="tenant_01",
+        summary="The tool is on the bench.",
+        memory_type=MemoryType.SEMANTIC,
+        occurred_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        idempotency_key=idempotency_key,
+    )
+
+
+async def test_a_read_survives_a_dependency_that_is_briefly_unavailable() -> None:
+    """A 503 from a restarting model used to be final for the caller."""
+    statuses = [503, 200]
+    delays: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        status = statuses.pop(0)
+        if status != 200:
+            return httpx.Response(
+                status,
+                json={"code": "model_unavailable", "message": "restarting", "trace_id": "t1"},
+            )
+        return httpx.Response(200, json=_memory_body())
+
+    async with _retrying_client(handler, delays=delays) as memory:
+        result = await memory.get_memory("tenant_01", "memory_01")
+
+    assert result.memory_id == "memory_01"
+    assert statuses == [], "the second attempt never happened"
+    assert len(delays) == 1
+    assert 0.0 <= delays[0] <= 0.5
+
+
+async def test_a_read_survives_a_dropped_connection() -> None:
+    """`httpx.RemoteProtocolError` mid-stream escaped as a terminal transport_error."""
+    attempts = 0
+    delays: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise httpx.RemoteProtocolError("server disconnected", request=request)
+        return httpx.Response(200, json=_memory_body())
+
+    async with _retrying_client(handler, delays=delays) as memory:
+        result = await memory.get_memory("tenant_01", "memory_01")
+
+    assert (attempts, result.memory_id) == (2, "memory_01")
+
+
+async def test_a_write_with_no_idempotency_key_is_never_repeated() -> None:
+    """The whole point of the gate: a duplicate memory is worse than a surfaced error."""
+    attempts = 0
+    delays: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        return httpx.Response(
+            503, json={"code": "model_unavailable", "message": "restarting", "trace_id": "t1"}
+        )
+
+    async with _retrying_client(handler, delays=delays) as memory:
+        with pytest.raises(MindBridgeError) as raised:
+            await memory.remember(_remember(None))
+
+    assert attempts == 1, "an unkeyed write was repeated"
+    assert delays == []
+    assert raised.value.code == "model_unavailable"
+
+
+async def test_a_write_that_names_an_idempotency_key_is_repeated() -> None:
+    """The server stores the first outcome under the key, so a repeat cannot double-write."""
+    statuses = [503, 200]
+    delays: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if statuses.pop(0) != 200:
+            return httpx.Response(
+                503, json={"code": "model_unavailable", "message": "x", "trace_id": "t1"}
+            )
+        return httpx.Response(200, json=_memory_body(status=MemoryWriteStatus.CREATED.value))
+
+    async with _retrying_client(handler, delays=delays) as memory:
+        result = await memory.remember(_remember("write_01"))
+
+    assert (statuses, result.memory_id) == ([], "memory_01")
+
+
+async def test_a_batch_is_repeatable_only_when_every_member_is() -> None:
+    """The server applies members individually, so one unkeyed member spoils the batch."""
+    from mindbridge.contracts import RememberBatchRequest
+    from mindbridge.sdk import _repeat_is_safe
+
+    all_keyed = RememberBatchRequest(memories=(_remember("a"), _remember("b")))
+    one_bare = RememberBatchRequest(memories=(_remember("a"), _remember(None)))
+
+    assert _repeat_is_safe(all_keyed) is True
+    assert _repeat_is_safe(one_bare) is False
+
+
+async def test_a_rejected_request_is_not_repeated() -> None:
+    """A 4xx is a request the server understood; repeating it spends the rejection twice."""
+    attempts = 0
+    delays: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        return httpx.Response(
+            404, json={"code": "not_found", "message": "no such memory", "trace_id": "t1"}
+        )
+
+    async with _retrying_client(handler, delays=delays) as memory:
+        with pytest.raises(MindBridgeError) as raised:
+            await memory.get_memory("tenant_01", "memory_01")
+
+    assert (attempts, delays, raised.value.code) == (1, [], "not_found")
+
+
+async def test_recall_is_repeated_even_though_it_names_no_key() -> None:
+    """Recall is the read the outage broke; it opts in explicitly in `recall`."""
+    statuses = [503, 200]
+    delays: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if statuses.pop(0) != 200:
+            return httpx.Response(
+                503, json={"code": "model_unavailable", "message": "x", "trace_id": "t1"}
+            )
+        return httpx.Response(
+            200,
+            json={
+                "answer": "On the bench.",
+                "confidence": 0.9,
+                "memories": [],
+                "evidence": [],
+                "trace_id": "trace_01",
+            },
+        )
+
+    async with _retrying_client(handler, delays=delays) as memory:
+        result = await memory.recall(
+            RecallRequest(tenant_id="tenant_01", query=RecallQuery(text="Where is the tool?"))
+        )
+
+    assert (statuses, result.answer) == ([], "On the bench.")
+
+
+async def test_the_attempt_budget_is_a_ceiling_and_one_attempt_disables_retrying() -> None:
+    """A caller running its own retry loop must be able to turn this one off."""
+    attempts = 0
+    delays: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        return httpx.Response(
+            503, json={"code": "model_unavailable", "message": "x", "trace_id": "t1"}
+        )
+
+    async with _retrying_client(handler, delays=delays, retry_attempts=3) as memory:
+        with pytest.raises(MindBridgeError):
+            await memory.get_memory("tenant_01", "memory_01")
+    budgeted = attempts
+
+    attempts = 0
+    single: list[float] = []
+    async with _retrying_client(handler, delays=single, retry_attempts=1) as memory:
+        with pytest.raises(MindBridgeError):
+            await memory.get_memory("tenant_01", "memory_01")
+
+    assert (budgeted, len(delays)) == (3, 2)
+    assert (attempts, single) == (1, [])
+
+
+async def test_the_wait_doubles_its_ceiling_between_attempts() -> None:
+    """Full jitter, so one shared outage does not resynchronise every client onto one instant."""
+    delays: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            503, json={"code": "model_unavailable", "message": "x", "trace_id": "t1"}
+        )
+
+    async with _retrying_client(handler, delays=delays, retry_attempts=4) as memory:
+        with pytest.raises(MindBridgeError):
+            await memory.get_memory("tenant_01", "memory_01")
+
+    assert len(delays) == 3, "the retry budget was not spent, so the ceilings below prove nothing"
+    assert all(delay >= 0.0 for delay in delays)
+    assert all(delay <= ceiling for delay, ceiling in zip(delays, (0.5, 1.0, 2.0), strict=True))
+
+
+async def test_a_client_cannot_be_built_with_an_unusable_retry_budget() -> None:
+    with pytest.raises(ValueError, match="retry_attempts"):
+        MindBridge(httpx.AsyncClient(base_url="https://x.test/"), retry_attempts=0)
+    with pytest.raises(ValueError, match="retry_backoff_seconds"):
+        MindBridge(httpx.AsyncClient(base_url="https://x.test/"), retry_backoff_seconds=-1.0)
