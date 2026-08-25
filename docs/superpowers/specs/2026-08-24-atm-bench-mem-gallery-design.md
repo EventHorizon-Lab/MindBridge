@@ -38,8 +38,9 @@ Counted from the pinned releases, not from either README.
 
 Downloaded and checked: every evidence ID in both QA splits resolves — 1,140 image, 81
 video, 430 email references, zero unresolved. Image and video stems do not collide, so one
-stem names exactly one file. Only 430 of the 6,742 emails are ever cited; the rest are the
-archive's distractor mass and are ingested too. Media spans 2022-04-30 to 2025-06-25 and
+stem names exactly one file. Those 430 references resolve to 362 distinct emails — 354 in the main split, 13 in the
+hard one — so 5.4% of the 6,742 emails are ever cited and the rest are the archive's
+distractor mass, ingested all the same. Media spans 2022-04-30 to 2025-06-25 and
 email 2022-01-01 to 2025-07-22 — closer to three and a half years than the advertised four.
 
 Question schema: `id`, `question`, `answer`, `notes`, `evidence_ids`, `qtype`. NIAH pool
