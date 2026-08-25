@@ -79,7 +79,7 @@ flowchart TB
 | Consolidation beat | `server` | One per deployment | No |
 | Consolidation | `server` | One scheduled run per tenant | No |
 | Lifecycle | `server` | One scheduled run per tenant | No |
-| Edge sync | `edge` | One per device, one-shot | Yes — on-device identity models |
+| Edge sync/identity | `edge` | One per device | Yes — on-device identity models |
 
 The API and worker load no model. One SentenceTransformers process owns the Jina weights and
 serves every modality, keeping the application images small and independently scalable.

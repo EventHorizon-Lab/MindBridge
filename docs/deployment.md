@@ -25,7 +25,7 @@ packages:
 
 ```bash
 uv sync                                      # Core types and Python SDK
-uv sync --extra edge                         # Any edge host
+uv sync --extra edge                         # Edge sync and identity runtime
 uv sync --extra server                       # API, MCP, scheduled sweeps
 uv sync --extra server --extra cloud-models  # Jina SentenceTransformers service
 uv sync --extra benchmarks                   # Benchmark harness

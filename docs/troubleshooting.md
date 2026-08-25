@@ -230,14 +230,14 @@ to construct without it, and the upstream loader swallows that `ImportError` and
 processor unset — so the model loads, embeds text happily, and dies on the first frame it is given.
 
 MindBridge now detects the empty processor slot and says so instead. Install the extra, which
-pins `torchvision` from the same CUDA index as torch:
+pins compatible Torch and Torchvision releases together:
 
 ```bash
 uv sync --extra server --extra cloud-models
 ```
 
-A `torchvision` from PyPI links against a different CUDA runtime, so installing it by hand
-generally does not work.
+Do not install a second Torchvision by hand; that can replace the pinned release while leaving
+Torch unchanged.
 
 ### The worker fails every media job
 
