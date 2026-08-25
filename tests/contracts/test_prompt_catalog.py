@@ -23,6 +23,15 @@ _EXPECTED_FINGERPRINTS = {
 }
 _EXPECTED_BENCHMARK_FINGERPRINTS = {
     "atm_bench_query_v1": "db075ed927d575e3fcfd468e481f91f79e1b05e8a83af61d312b686d249a240f",
+    "atm_bench_number_format_v1": (
+        "eb8993f2f4cdb105e3a865b631670d993016c9e5fefaa53fe0c0317c0e1e26fc"
+    ),
+    "atm_bench_list_recall_format_v1": (
+        "93e503847d7e359446907a401446269a9e0245c5fe2de80efbf3dd3e7b441b01"
+    ),
+    "atm_bench_open_end_format_v1": (
+        "31f6be646fde418dea229240c5b7883c08112d3cb782255f18b75ce7a204604c"
+    ),
     "egomem_reason_query_v1": ("be1b4861320908f7575c5b72151bd715f9ac5f3498dfe0de2d8f8dc9faac0bf6"),
     "egotempo_query_v1": "27327bbac7f294f1d6ed16e675bdd8e416ee2c5bca0911967ce68a5c4f60cce8",
     "memlens_query_v1": "0b9b44d0b6c65d9131fb947155bb5a57587bae5d2881504c4dea62b0127a6f2f",

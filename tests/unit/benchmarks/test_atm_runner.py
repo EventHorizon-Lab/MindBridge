@@ -32,16 +32,18 @@ from mindbridge.contracts import (
     RememberRequest,
 )
 from mindbridge.core import JobState, MediaKind, MemoryState, MemoryType, VerificationStatus
+from mindbridge.sdk import MindBridgeError
 
 NOW = datetime(2025, 2, 23, 13, 2, 49, tzinfo=timezone.utc)
 
 
 class RecordingMemoryApi:
-    def __init__(self, *, evidence: tuple[str, ...] = ()) -> None:
+    def __init__(self, *, evidence: tuple[str, ...] = (), enumeration_error: bool = False) -> None:
         self.observe_requests: list[ObserveRequest] = []
         self.remember_requests: list[RememberRequest] = []
         self.recall_requests: list[RecallRequest] = []
         self._evidence = evidence
+        self._enumeration_error = enumeration_error
 
     async def observe(self, request: ObserveRequest) -> ObservationReceipt:
         self.observe_requests.append(request)
@@ -74,6 +76,13 @@ class RecordingMemoryApi:
 
     async def recall(self, request: RecallRequest) -> RecallResult:
         self.recall_requests.append(request)
+        if self._enumeration_error and request.mode is RecallMode.ENUMERATE:
+            raise MindBridgeError(
+                "exact enumeration exceeds 1000 candidates; narrow the recall filters",
+                code="enumeration_limit_exceeded",
+                status_code=422,
+                trace_id="trace_enumeration_failure",
+            )
         return RecallResult(
             answer="£799.74",
             confidence=0.82,
@@ -241,9 +250,62 @@ async def test_retrieval_recall_counts_only_gold_evidence_the_recall_returned() 
 
     assert result.prediction == "£799.74"
     assert result.mindbridge_media_object_ids == ("20250223_130249", "20220430_132212")
-    # One of the two gold evidence items came back; the distractor does not count.
-    assert result.retrieved_gold_evidence_count == 1
+    # Both gold evidence items came back: the media stem via `recall`'s own evidence list,
+    # and the email via the `ID:` head on the recalled memory's summary. The distractor media
+    # object does not count.
+    assert result.retrieved_gold_evidence_count == 2
     assert result.mindbridge_confidence == pytest.approx(0.82)
+
+
+async def test_retrieval_recall_counts_evidence_ids_parsed_from_memory_summaries() -> None:
+    """The sgm arm and every email write land as `remember` text, so `recall`'s own evidence
+    list is empty for them -- unlike the raw arm's media, which comes back through it. This
+    is the sgm-shaped case: an empty `evidence` list whose memories still carry `ID:` heads.
+    """
+    api = RecordingMemoryApi()  # default evidence=() -> recall.evidence is empty
+
+    result = await answer_atm_question(
+        cast(MindBridge, api),
+        _question(evidence_ids=("email202411160004",)),
+        tenant_id="benchmark_atm_archive_run1",
+        recall_limit=20,
+    )
+
+    assert result.mindbridge_media_object_ids == ()
+    assert result.retrieved_gold_evidence_count == 1
+
+
+async def test_enumeration_failure_is_recorded_and_does_not_stop_the_run() -> None:
+    """`RecallMode.ENUMERATE` refuses a filter scope above 1,000 candidates rather than
+    truncating it, and ATM's 6,742 emails alone exceed that. That failure must come back as
+    a result carrying an empty prediction and a machine-readable reason, not an exception --
+    otherwise the first `list_recall` question in a run costs every question after it their
+    prediction too.
+    """
+    api = RecordingMemoryApi(enumeration_error=True)
+
+    enumerated = await answer_atm_question(
+        cast(MindBridge, api),
+        _question(qtype="list_recall"),
+        tenant_id="benchmark_atm_archive_run1",
+        recall_limit=20,
+    )
+    answered = await answer_atm_question(
+        cast(MindBridge, api),
+        _question(qtype="open_end"),
+        tenant_id="benchmark_atm_archive_run1",
+        recall_limit=20,
+    )
+
+    assert enumerated.prediction == ""
+    assert enumerated.mindbridge_failure_reason == "enumeration_limit_exceeded"
+    assert enumerated.retrieved_gold_evidence_count == 0
+    assert enumerated.mindbridge_memory_ids == ()
+    assert enumerated.mindbridge_media_object_ids == ()
+    # The failure costs the enumerated question its prediction, and nothing else: the next
+    # question on the same client still answers normally.
+    assert answered.prediction == "£799.74"
+    assert answered.mindbridge_failure_reason is None
 
 
 def test_raw_arm_refuses_to_start_without_every_cited_media_item() -> None:
@@ -251,8 +313,22 @@ def test_raw_arm_refuses_to_start_without_every_cited_media_item() -> None:
         validate_prepared_atm(
             (_question(evidence_ids=("20250223_130249", "20991231_235959")),),
             _prepared(),
+            (),
             media_source="raw",
         )
 
-    # The SGM arm needs no prepared media at all.
-    validate_prepared_atm((_question(),), None, media_source="sgm")
+    # The SGM arm needs no prepared media at all, as long as its records cover the citation.
+    validate_prepared_atm((_question(),), None, (_sgm_record(),), media_source="sgm")
+
+
+def test_sgm_arm_refuses_to_start_without_every_cited_media_record() -> None:
+    """`--sgm-video` is optional, so an sgm run that omits it must not silently drop every
+    video's evidence -- the mirror image of the raw arm's own `--prepared-media` gap check.
+    """
+    with pytest.raises(ValueError, match="missing ATM-Bench SGM records"):
+        validate_prepared_atm(
+            (_question(evidence_ids=("20250223_130249", "20991231_235959")),),
+            None,
+            (_sgm_record(),),
+            media_source="sgm",
+        )

@@ -109,19 +109,19 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
         raise ValueError("raw ATM-Bench runs require prepared media")
     if arguments.media_source == "sgm" and arguments.sgm_image_path is None:
         raise ValueError("sgm ATM-Bench runs require batch results")
-    validate_prepared_atm(questions, prepared, media_source=arguments.media_source)
-    require_writable_output_pair(arguments.output_path, overwrite=arguments.overwrite)
-    deployment = load_deployment_snapshot(
-        arguments.deployment_config_path,
-        require_worker=arguments.media_source == "raw",
-    )
-    emails = load_atm_emails(arguments.emails_path)
     sgm_records = tuple(
         record
         for path in (arguments.sgm_image_path, arguments.sgm_video_path)
         if path is not None
         for record in load_atm_sgm(path)
     )
+    validate_prepared_atm(questions, prepared, sgm_records, media_source=arguments.media_source)
+    require_writable_output_pair(arguments.output_path, overwrite=arguments.overwrite)
+    deployment = load_deployment_snapshot(
+        arguments.deployment_config_path,
+        require_worker=arguments.media_source == "raw",
+    )
+    emails = load_atm_emails(arguments.emails_path)
     _require_one_clock(prepared, sgm_records, media_source=arguments.media_source)
     report(f"running {len(questions)} questions", quiet=arguments.quiet)
     failures, results = asyncio.run(_run(arguments, questions, prepared, sgm_records, emails))
@@ -202,6 +202,7 @@ def _write_artifacts(
                     "mindbridge_confidence": result.mindbridge_confidence,
                     "mindbridge_memory_ids": list(result.mindbridge_memory_ids),
                     "mindbridge_trace_id": result.mindbridge_trace_id,
+                    "mindbridge_failure_reason": result.mindbridge_failure_reason,
                 }
                 for result in results
             ],

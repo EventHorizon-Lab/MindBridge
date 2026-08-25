@@ -246,6 +246,24 @@ def atm_memory_chunks(block: str, evidence_id: str) -> tuple[str, ...]:
     )
 
 
+def atm_evidence_id_from_block(summary: str) -> str | None:
+    """Read the evidence ID a serialized block's leading `ID: <id>` line names, or None.
+
+    Every SGM and email block -- and every chunk `atm_memory_chunks` splits one into -- opens
+    with exactly this line, for exactly this purpose: `recall`'s own evidence list only ever
+    names media MindBridge itself observed, so it has nothing for an email or an sgm-arm
+    write, both of which land as `remember` text instead. Reading this line back out of a
+    recalled memory's summary is how those two are not simply invisible to retrieval-recall.
+    A summary that does not open with the marker -- e.g. the raw arm's own perception-derived
+    text -- names no evidence and returns None.
+    """
+    first_line, _, _ = summary.partition("\n")
+    if not first_line.startswith("ID: "):
+        return None
+    evidence_id = first_line.removeprefix("ID: ")
+    return evidence_id or None
+
+
 def _questions(path: Path, *, require_pool: bool) -> tuple[AtmBenchQuestion, ...]:
     raw = json.loads(path.read_text(encoding="utf-8"))
     if isinstance(raw, dict):

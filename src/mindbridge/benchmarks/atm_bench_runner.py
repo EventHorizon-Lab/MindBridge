@@ -23,11 +23,12 @@ from mindbridge.benchmarks.atm_bench import (
     AtmQuestionType,
     AtmSgmRecord,
     atm_email_block,
+    atm_evidence_id_from_block,
     atm_evidence_kind,
     atm_memory_chunks,
     atm_sgm_block,
 )
-from mindbridge.benchmarks.prompts import ATM_BENCH_QUERY_PROMPT
+from mindbridge.benchmarks.prompts import ATM_BENCH_QUERY_PROMPT, atm_format_constraint
 from mindbridge.benchmarks.runtime import ingest_media
 from mindbridge.contracts import (
     ContractModel,
@@ -41,17 +42,11 @@ from mindbridge.contracts import (
     RememberRequest,
 )
 from mindbridge.core import MediaKind, MemoryType, SensorKind
-from mindbridge.sdk import MindBridge
+from mindbridge.sdk import MindBridge, MindBridgeError
 
 AtmMediaSource = Literal["raw", "sgm"]
 
-_FORMAT_CONSTRAINTS: dict[str, str] = {
-    "number": "Answer with the number alone, including its unit or currency symbol.",
-    "list_recall": (
-        "Answer with the matching evidence IDs alone, separated by commas, and nothing else."
-    ),
-    "open_end": "Answer concisely, using only what the memories support.",
-}
+_ENUMERATION_LIMIT_EXCEEDED_CODE = "enumeration_limit_exceeded"
 
 
 class AtmPreparedMedia(ContractModel):
@@ -97,6 +92,7 @@ class AtmQuestionResult(ContractModel):
     mindbridge_trace_id: Identifier
     retrieved_gold_evidence_count: int = Field(ge=0)
     mindbridge_ingest_failure_count: int = Field(default=0, ge=0)
+    mindbridge_failure_reason: Identifier | None = Field(default=None)
 
 
 def load_prepared_atm(path: Path) -> AtmPreparedArchive:
@@ -107,19 +103,30 @@ def load_prepared_atm(path: Path) -> AtmPreparedArchive:
 def validate_prepared_atm(
     questions: Sequence[AtmBenchQuestion],
     prepared: AtmPreparedArchive | None,
+    sgm_records: Sequence[AtmSgmRecord],
     *,
     media_source: AtmMediaSource,
 ) -> None:
-    """Refuse a `raw` run that cannot ground every media item its questions cite."""
-    if media_source == "sgm":
-        return
-    available = {item.media_id for item in prepared.media} if prepared is not None else set()
+    """Refuse a run that cannot ground every media item its questions cite.
+
+    A `raw` run's media come from the prepared manifest; an `sgm` run's from the loaded
+    batch-results records. `--sgm-video` is optional, so an sgm run that omits it would
+    otherwise silently drop every video's evidence -- the same shape of gap this already
+    refused a `raw` run for when a stem was missing from `--prepared-media`.
+    """
     required = {
         evidence_id
         for question in questions
         for evidence_id in question.evidence_ids
         if atm_evidence_kind(evidence_id) == "media"
     }
+    if media_source == "sgm":
+        available = {record.media_id for record in sgm_records}
+        missing = required - available
+        if missing:
+            raise ValueError(f"missing ATM-Bench SGM records: {', '.join(sorted(missing))}")
+        return
+    available = {item.media_id for item in prepared.media} if prepared is not None else set()
     missing = required - available
     if missing:
         raise ValueError(f"missing prepared ATM-Bench media: {', '.join(sorted(missing))}")
@@ -211,19 +218,56 @@ async def answer_atm_question(
     recall_limit: int,
     ingest_failure_count: int = 0,
 ) -> AtmQuestionResult:
-    """Ask one question of the whole archive and record what came back."""
+    """Ask one question of the whole archive and record what came back.
+
+    `list_recall` questions enumerate rather than rank, and `RecallMode.ENUMERATE` refuses a
+    filter scope above 1,000 candidates instead of truncating it -- ATM's 6,742 emails alone
+    exceed that in every arm. Solving enumeration at archive scale is out of scope here; what
+    this must not do is let that one question's failure cost every other question its
+    prediction, so the failure is caught and recorded rather than left to propagate out of a
+    run that may already be hours into ingesting the archive.
+    """
     if not 1 <= recall_limit <= 100:
         raise ValueError("recall_limit must be between 1 and 100")
     mode = RecallMode.ENUMERATE if question.qtype == "list_recall" else RecallMode.ANSWER
-    recalled = await memory.recall(
-        RecallRequest(
-            tenant_id=tenant_id,
-            query=RecallQuery(text=_question_query(question)),
-            mode=mode,
-            limit=recall_limit,
+    try:
+        recalled = await memory.recall(
+            RecallRequest(
+                tenant_id=tenant_id,
+                query=RecallQuery(text=_question_query(question)),
+                mode=mode,
+                limit=recall_limit,
+            )
         )
-    )
+    except MindBridgeError as error:
+        if error.code != _ENUMERATION_LIMIT_EXCEEDED_CODE:
+            raise
+        return AtmQuestionResult(
+            question_id=question.question_id,
+            question=question.question,
+            qtype=question.qtype,
+            reference_answer=question.reference_answer,
+            prediction="",
+            evidence_ids=question.evidence_ids,
+            mindbridge_confidence=0.0,
+            mindbridge_memory_ids=(),
+            mindbridge_media_object_ids=(),
+            mindbridge_trace_id=error.trace_id or "unavailable",
+            retrieved_gold_evidence_count=0,
+            mindbridge_ingest_failure_count=ingest_failure_count,
+            mindbridge_failure_reason=error.code,
+        )
     media_object_ids = tuple(item.media_object_id for item in recalled.evidence)
+    # Email and sgm-arm media are written as text, so `recall`'s own evidence list -- which
+    # only ever names media MindBridge itself observed -- has nothing for them. Every block
+    # `atm_memory_chunks` writes begins with the `ID: <evidence_id>` line this reads back, so
+    # a recalled memory's summary still names its source even when `evidence` cannot.
+    text_evidence_ids = {
+        evidence_id
+        for memory_view in recalled.memories
+        if (evidence_id := atm_evidence_id_from_block(memory_view.summary)) is not None
+    }
+    retrieved_evidence_ids = set(media_object_ids) | text_evidence_ids
     return AtmQuestionResult(
         question_id=question.question_id,
         question=question.question,
@@ -235,7 +279,7 @@ async def answer_atm_question(
         mindbridge_memory_ids=tuple(item.memory_id for item in recalled.memories),
         mindbridge_media_object_ids=media_object_ids,
         mindbridge_trace_id=recalled.trace_id,
-        retrieved_gold_evidence_count=len(set(question.evidence_ids) & set(media_object_ids)),
+        retrieved_gold_evidence_count=len(set(question.evidence_ids) & retrieved_evidence_ids),
         mindbridge_ingest_failure_count=ingest_failure_count,
     )
 
@@ -243,7 +287,7 @@ async def answer_atm_question(
 def _question_query(question: AtmBenchQuestion) -> str:
     return ATM_BENCH_QUERY_PROMPT.text.format(
         question=question.question,
-        format_constraint=_FORMAT_CONSTRAINTS[question.qtype],
+        format_constraint=atm_format_constraint(question.qtype),
     )
 
 

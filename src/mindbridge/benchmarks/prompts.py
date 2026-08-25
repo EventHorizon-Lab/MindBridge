@@ -59,6 +59,62 @@ ATM_BENCH_QUERY_PROMPT = PromptSpec(
     text="{question}\n{format_constraint}",
 )
 
+ATM_BENCH_NUMBER_FORMAT_PROMPT = PromptSpec(
+    name="atm_bench_number_format",
+    version="atm_bench_number_format_v1",
+    purpose=(
+        "Ask an ATM-Bench `number` question for a bare, machine-parseable numeric answer. "
+        "MindBridge-authored, not transcribed from ATM-Bench: unlike the Mem-Gallery "
+        "constraints, no released ATM-Bench prompt file names this wording -- the Oracle "
+        "baseline gives every qtype one shared system prompt (`oracle/config.py`'s "
+        "ORACLE_SYSTEM) rather than a `number`-specific instruction of its own."
+    ),
+    used_by="mindbridge.benchmarks.prompts.atm_format_constraint",
+    text="Answer with the number alone, including its unit or currency symbol.",
+)
+
+ATM_BENCH_LIST_RECALL_FORMAT_PROMPT = PromptSpec(
+    name="atm_bench_list_recall_format",
+    version="atm_bench_list_recall_format_v1",
+    purpose=(
+        "Ask an ATM-Bench `list_recall` question for a bare, comma-separated evidence-ID "
+        "answer. MindBridge-authored, not transcribed from ATM-Bench: the Oracle baseline's "
+        "only list-recall wording is one clause inside its shared ORACLE_SYSTEM prompt, not a "
+        "`list_recall`-specific instruction of its own."
+    ),
+    used_by="mindbridge.benchmarks.prompts.atm_format_constraint",
+    text=("Answer with the matching evidence IDs alone, separated by commas, and nothing else."),
+)
+
+ATM_BENCH_OPEN_END_FORMAT_PROMPT = PromptSpec(
+    name="atm_bench_open_end_format",
+    version="atm_bench_open_end_format_v1",
+    purpose=(
+        "Ask an ATM-Bench `open_end` question for a concise, evidence-grounded answer. "
+        "MindBridge-authored, not transcribed from ATM-Bench: the Oracle baseline has no "
+        "`open_end`-specific wording at all, only its shared ORACLE_SYSTEM prompt."
+    ),
+    used_by="mindbridge.benchmarks.prompts.atm_format_constraint",
+    text="Answer concisely, using only what the memories support.",
+)
+
+_ATM_BENCH_CONSTRAINTS = {
+    "number": ATM_BENCH_NUMBER_FORMAT_PROMPT,
+    "list_recall": ATM_BENCH_LIST_RECALL_FORMAT_PROMPT,
+    "open_end": ATM_BENCH_OPEN_END_FORMAT_PROMPT,
+}
+
+
+def atm_format_constraint(qtype: str) -> str:
+    """Return one ATM-Bench question type's format instruction.
+
+    Unlike `mem_gallery_format_constraint`, every one of ATM's three `qtype`s gets an
+    instruction -- there is no "no constraint" case to fall back to -- so an unrecognised
+    qtype is a caller bug and raises `KeyError` rather than silently returning empty text.
+    """
+    return _ATM_BENCH_CONSTRAINTS[qtype].text
+
+
 MEM_GALLERY_QUERY_PROMPT = PromptSpec(
     name="mem_gallery_query",
     version="mem_gallery_query_v1",
@@ -141,6 +197,9 @@ BENCHMARK_PROMPTS = (
     VIDEO_MME_QUERY_PROMPT,
     EGOTEMPO_QUERY_PROMPT,
     ATM_BENCH_QUERY_PROMPT,
+    ATM_BENCH_NUMBER_FORMAT_PROMPT,
+    ATM_BENCH_LIST_RECALL_FORMAT_PROMPT,
+    ATM_BENCH_OPEN_END_FORMAT_PROMPT,
     MEM_GALLERY_QUERY_PROMPT,
     MEM_GALLERY_REFUSAL_PROMPT,
     MEM_GALLERY_CONFLICT_PROMPT,
