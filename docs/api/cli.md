@@ -18,8 +18,8 @@ uv run --extra server mindbridge lifecycle --help
 | Command | Subcommands |
 | --- | --- |
 | `mindbridge` | `config check`, `consolidate`, `jobs`, `lifecycle`, `mcp`, `jina serve`, `edge sync` |
-| `mindbridge-bench` | `locomo-refined`, `m3`, `egolife`, `egomem`, `egotempo`, `memlens`, `mm-lifelong`, `supermemory`, `video-mme`, `video-mme-v2`, `aml` |
-| `mindbridge-bench` support | `score`, `datasets`, `jina`, `bakeoff` |
+| `mindbridge-bench` | `locomo-refined`, `m3`, `egolife`, `egomem`, `egotempo`, `memlens`, `mm-lifelong`, `atm`, `mem-gallery`, `supermemory`, `video-mme`, `video-mme-v2`, `aml` |
+| `mindbridge-bench` support | `suite`, `score`, `datasets`, `jina`, `bakeoff` |
 
 `mindbridge-consolidate`, `mindbridge-lifecycle`, and `mindbridge-mcp` remain as aliases for the
 subcommands of the same name. They route through the same module and report the same codes.
@@ -403,6 +403,8 @@ uv run mindbridge-bench
 | `egotempo` | — | EgoTempo |
 | `memlens` | — | MemLens |
 | `mm-lifelong` | — | MM-Lifelong |
+| `atm` | — | ATM-Bench |
+| `mem-gallery` | — | Mem-Gallery |
 | `supermemory` | — | SuperMemory VQA |
 | `video-mme` | `benchmarks` | Video-MME |
 | `video-mme-v2` | `benchmarks` | Video-MME-v2 |
@@ -410,6 +412,7 @@ uv run mindbridge-bench
 
 | Support command | Extra | Purpose |
 | --- | --- | --- |
+| `suite` | — | Run several of the runners above from one suite file. |
 | `score` | — | Record an official scorer's verdict beside a run. |
 | `datasets` | `benchmarks` | Check every official release parses and pins its digest. |
 | `jina` | `cloud-models` | Check the local Jina Omni embedder answers. |
@@ -417,6 +420,11 @@ uv run mindbridge-bench
 
 Runners drive the production REST API. There is no evaluation-only path, which is the point: a
 benchmark that bypasses the product measures something the product does not do.
+
+`suite` runs several of them in one invocation from a JSON file of tasks, deriving each task's
+`--output` and `--run-id` so two parameterisations of one benchmark cannot share a tenant. It
+continues past a task that fails and records every outcome in `suite-summary.json`. See
+[benchmarking](../benchmarking.md#running-several-benchmarks-in-one-command).
 
 See [benchmarking](../benchmarking.md) for datasets, protocol, and what the numbers license you
 to claim.

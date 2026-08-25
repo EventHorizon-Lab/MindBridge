@@ -101,6 +101,10 @@ RUNNERS: dict[str, Runner] = {
         extra="benchmarks",
     ),
     "aml": Runner("mindbridge.benchmarks.aml.cli", "Replay one offline AML pipeline"),
+    "suite": Runner(
+        "mindbridge.benchmarks.suite",
+        "Run several benchmarks from one suite file",
+    ),
     "score": Runner(
         "mindbridge.benchmarks.official_score",
         "Record an official scorer's verdict beside a run",

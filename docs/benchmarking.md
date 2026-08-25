@@ -83,6 +83,100 @@ Long runs are fragile in a specific way: an upstream hiccup mid-stream can escap
 error, and results land only after the whole run completes. Shard by `--run-id` and run the shards
 in parallel so a failure costs one shard rather than the sweep.
 
+## Running several benchmarks in one command
+
+`mindbridge-bench suite` runs a list of benchmarks in one invocation against one deployment,
+writing each one's predictions and manifest into a shared directory:
+
+```bash
+export MINDBRIDGE_API_KEY=replace-with-a-runtime-secret
+uv run mindbridge-bench suite \
+  --suite benchmarks/suites/released-text.json \
+  --output-dir .benchmarks/results/sweep-001 \
+  --api-base-url http://localhost:8000 \
+  --deployment-config .benchmarks/deployment.json \
+  --run-id sweep-001
+```
+
+A suite file exists because a benchmark's name does not determine its invocation. Every runner
+needs its own release path, and most need a required choice no sweep can guess — ATM-Bench's
+`--split`, MEMLENS's `--context-window`, M3-Bench's `--subset`, a prepared-media manifest produced
+outside MindBridge. The file records one task per invocation:
+
+```json
+{
+  "tasks": [
+    {
+      "name": "locomo-refined",
+      "benchmark": "locomo-refined",
+      "arguments": ["--dataset", ".benchmarks/locomo-refined/data/raw/locomo_refined.json"]
+    },
+    {
+      "name": "m3-robot",
+      "benchmark": "m3",
+      "arguments": [
+        "--dataset", ".benchmarks/m3-agent/data/annotations/robot.json",
+        "--prepared-media", ".benchmarks/m3-prepared-robot.json",
+        "--subset", "robot"
+      ]
+    }
+  ]
+}
+```
+
+`name` is the task's own identity: it names the predictions file — `<name>.jsonl`, or
+`output_name` where a runner emits a JSON array instead — and it is appended to `--run-id`.
+`benchmark` is a row in the `mindbridge-bench` table. `arguments` are that runner's own flags,
+passed through verbatim, so the runner's own parser is what validates them and a flag added to a
+runner needs no change here.
+
+**The sweep derives `--output` and `--run-id` per task, and a suite setting either is refused.**
+The run ID is not cosmetic. A tenant is `<tenant-prefix>_<unit-id>_<run-id>`, so two
+parameterisations of one benchmark — MEMLENS at two context windows, ATM-Bench at both splits —
+share everything but the run ID. Without a per-task one the second task would write into the first
+task's tenants and then answer from its memories.
+
+Every tenant a run writes to has to be in the deployment's `MINDBRIDGE_TENANT_API_KEYS_JSON`
+before the API starts, and these run IDs are ones the sweep makes up. `--dry-run` prints the exact
+invocation behind each task, so they are readable before anything runs:
+
+```bash
+uv run mindbridge-bench suite \
+  --suite benchmarks/suites/released-text.json \
+  --output-dir .benchmarks/results/sweep-001 \
+  --api-base-url http://localhost:8000 \
+  --deployment-config .benchmarks/deployment.json \
+  --run-id sweep-001 \
+  --dry-run
+```
+
+`--api-base-url` and `--deployment-config` are forwarded to every task. So are `--recall-limit`,
+`--request-concurrency`, and `--request-timeout-seconds`, but only when given — otherwise each
+runner keeps the default it declares rather than a copy pinned here that goes stale. They are
+placed before a task's own arguments, so a benchmark needing its own recall budget sets it in the
+task. Flags that exist only on some runners — `--prepared-media`, `--device-id`, and the media
+polling deadlines among them — belong in the task, not on the sweep. `--task` narrows a run to
+named tasks without reordering it.
+
+Tasks run one at a time. Running them concurrently against one deployment would have them
+contending for the same worker and would corrupt every timing the runs report; to use more
+hardware, run separate sweeps with different `--run-id`s against separate deployments.
+
+A task that fails does not stop the sweep, so a benchmark dying four hours in costs its own result
+rather than the others. An interrupt does stop it, and still writes the summary. `--output-dir`
+receives one `suite-summary.json` recording, per task, the derived run ID, the output path, the
+argv behind it, the exit code, how long it took, and whether it produced predictions at all — a
+task that exits 0 without writing them is recorded as failed rather than as a result nobody can
+open. The sweep exits 1 if any task failed and 130 if it was interrupted.
+
+The summary carries no scores. Official scorers run outside MindBridge, and each verdict is
+attached to the run that earned it with `mindbridge-bench score`.
+
+`benchmarks/suites/released-text.json` is committed as a worked example: LoCoMo-Refined, MEMLENS
+32k text-only, and both ATM-Bench splits over the official schema-guided text. Every task in it
+replays released text alone, so it needs no prepared media, runs against a deployment with no
+Worker plugins, and produces a memory-layer claim rather than a multimodal one.
+
 ---
 
 ## Agent Memory Leaderboard offline harness

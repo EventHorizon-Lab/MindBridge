@@ -1,0 +1,64 @@
+{
+  "tasks": [
+    {
+      "name": "locomo-refined",
+      "benchmark": "locomo-refined",
+      "arguments": [
+        "--dataset",
+        ".benchmarks/locomo-refined/data/raw/locomo_refined.json"
+      ]
+    },
+    {
+      "name": "memlens-32k",
+      "benchmark": "memlens",
+      "output_name": "memlens-32k.json",
+      "arguments": [
+        "--dataset",
+        ".benchmarks/memlens/dataset_32k.json",
+        "--agent-subset-index",
+        ".benchmarks/memlens/agent_subset_195.json",
+        "--context-window",
+        "32k",
+        "--text-only"
+      ]
+    },
+    {
+      "name": "atm-main-sgm",
+      "benchmark": "atm",
+      "output_name": "atm-main-sgm.json",
+      "arguments": [
+        "--dataset",
+        ".benchmarks/atm-bench/data/atm-bench/atm-bench.json",
+        "--split",
+        "main",
+        "--media-source",
+        "sgm",
+        "--emails",
+        ".benchmarks/atm-bench/data/raw_memory/email/emails.json",
+        "--sgm-image",
+        ".benchmarks/atm-bench/data/processed_memory/image_batch_results.json",
+        "--sgm-video",
+        ".benchmarks/atm-bench/data/processed_memory/video_batch_results.json"
+      ]
+    },
+    {
+      "name": "atm-hard-sgm",
+      "benchmark": "atm",
+      "output_name": "atm-hard-sgm.json",
+      "arguments": [
+        "--dataset",
+        ".benchmarks/atm-bench/data/atm-bench/atm-bench-hard.json",
+        "--split",
+        "hard",
+        "--media-source",
+        "sgm",
+        "--emails",
+        ".benchmarks/atm-bench/data/raw_memory/email/emails.json",
+        "--sgm-image",
+        ".benchmarks/atm-bench/data/processed_memory/image_batch_results.json",
+        "--sgm-video",
+        ".benchmarks/atm-bench/data/processed_memory/video_batch_results.json"
+      ]
+    }
+  ]
+}

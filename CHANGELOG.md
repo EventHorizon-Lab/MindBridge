@@ -51,8 +51,9 @@ The capabilities present on `master` today:
   durable outbox, and offline recall.
 - OpenTelemetry across REST, model calls, PostgreSQL, S3, and queued jobs, capturing no user
   content.
-- Benchmark harness driving the production API across nine official datasets plus the Agent
-  Memory Leaderboard offline replay.
+- Benchmark harness driving the production API across twelve official datasets plus the Agent
+  Memory Leaderboard offline replay, with `mindbridge-bench suite` running a list of them from one
+  invocation and recording each outcome in a sweep summary.
 - Python 3.10 through 3.14, with the whole quality gate — format, lint, types, tests — run on
   every one of them.
 
