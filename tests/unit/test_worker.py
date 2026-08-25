@@ -22,6 +22,7 @@ from mindbridge.application.evidence_clips import (
     MAX_SAMPLING_FLOOR_MS,
     ClipSampling,
 )
+from mindbridge.consolidation_worker import CONSOLIDATION_QUEUE
 from mindbridge.core import (
     DatabaseUnavailableError,
     JobId,
@@ -38,6 +39,7 @@ from mindbridge.infrastructure.task_queue import (
     PROCESS_OBSERVATION_TASK,
     ObservationProcessingTaskMessage,
     create_task_queue,
+    observation_queues,
 )
 from mindbridge.models.openai import _GeneratorConfig
 from mindbridge.telemetry import TelemetryProviders
@@ -46,6 +48,7 @@ from mindbridge.worker import (
     create_worker_app,
     processing_budget_seconds,
     require_bounded_in_process_models,
+    require_whole_observation_queue_set,
 )
 
 
@@ -956,3 +959,48 @@ def test_worker_will_not_take_a_retry_deadline_a_message_asked_for(
         )
     finally:
         task.pop_request()
+
+
+def test_a_worker_narrowed_to_the_pre_shard_queue_alone_refuses_to_start() -> None:
+    """`-Q mindbridge` leaves every shard unread, and the symptom is silence, not an error.
+
+    The publish succeeds, the ledger says `pending`, and nothing consumes it -- so boot is the
+    only place this can be said out loud. `-Q` is readable here because
+    `WorkController.setup_instance` calls `setup_queues` before it sends `worker_init`.
+    """
+    app = create_worker_app(WorkerSettings.from_environment(_environment()))
+    app.amqp.queues.select(["mindbridge"])
+
+    with pytest.raises(SystemExit, match="would have no consumer"):
+        worker_init.send(sender=_StartingWorker(1))
+
+
+def test_a_worker_that_reads_every_observation_queue_starts() -> None:
+    """The default: no -Q at all, so the app's own queue set is the consume set."""
+    app = create_worker_app(WorkerSettings.from_environment(_environment()))
+
+    assert set(observation_queues()) <= set(app.amqp.queues.consume_from), (
+        "a bare worker does not already cover the shards, so the guard below proves nothing"
+    )
+    worker_init.send(sender=_StartingWorker(1))
+
+
+def test_a_worker_that_reads_none_of_them_is_a_different_role_and_starts() -> None:
+    """The consolidation sweep runs on its own queue; partial coverage is the only mistake."""
+    app = create_worker_app(WorkerSettings.from_environment(_environment()))
+    app.amqp.queues.select([CONSOLIDATION_QUEUE])
+
+    assert not set(observation_queues()) & set(app.amqp.queues.consume_from)
+    worker_init.send(sender=_StartingWorker(1))
+
+
+def test_the_guard_names_every_queue_that_would_go_unread() -> None:
+    """An operator needs the list, not the count: the fix is naming them or dropping -Q."""
+    whole = observation_queues()
+
+    require_whole_observation_queue_set(whole)
+    require_whole_observation_queue_set(["mindbridge_consolidation"])
+    with pytest.raises(ValueError, match="would have no consumer") as raised:
+        require_whole_observation_queue_set(whole[:-2])
+
+    assert all(name in str(raised.value) for name in whole[-2:])

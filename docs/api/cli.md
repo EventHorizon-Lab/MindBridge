@@ -196,14 +196,17 @@ command requires a role that can see every tenant.
 }
 ```
 
-`queue` is the queue the worker actually consumes, `task_default_queue` — **`mindbridge`, not
+`queue` names the queue family the worker consumes, `task_default_queue` — **`mindbridge`, not
 `celery`**. Looking at the wrong queue is how one investigation concluded the queue had been
-destroyed.
+destroyed. Observations are published across a shard set (`mindbridge` plus `mindbridge.0` …
+`mindbridge.7`), all of which a worker started **without `-Q`** consumes; `queue_depth` is the
+sum across the whole set, so it will not match `LLEN mindbridge` on its own.
 
-`queue_depth` is read *before* any repair, so it describes what was found. It matters for
-interpreting a repair rather than just recording one: kombu publishes with `LPUSH` and consumes
-with `RPOP`, so a republished job waits behind every message already queued. Six republishes of
-one job across 84 minutes moved its attempt count not at all, for exactly that reason.
+`queue_depth` is read *before* any repair, so it describes what was found, and `withheld` below
+is decided against that pre-repair number. A republished job no longer waits behind the backlog:
+repair publishes at the priority the transport drains first, so it is served ahead of fresh work
+on every shard. Before that split, six republishes of one job across 84 minutes moved its attempt
+count not at all, because every one of them landed behind the same backlog.
 
 `withheld` is how many claimable rows the repair treated as already carried by the queue:
 `min(claimable, queue_depth)` across the ledger, and `0` under `--tenant-id`. `claimable - withheld`

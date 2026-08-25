@@ -6,7 +6,7 @@ import asyncio
 import json
 import math
 import os
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Collection, Mapping
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
 from time import time
@@ -67,6 +67,7 @@ from mindbridge.infrastructure.task_queue import (
     PROCESS_OBSERVATION_TASK,
     ObservationProcessingTaskMessage,
     create_task_queue,
+    observation_queues,
 )
 from mindbridge.media.clipping import (
     DEFAULT_IMAGE_MAX_PIXELS,
@@ -481,6 +482,31 @@ def processing_budget_seconds(generator_config: Mapping[str, object]) -> float:
     return float(configured) + _POST_MODEL_BUDGET_SECONDS
 
 
+def require_whole_observation_queue_set(consume_from: Collection[str]) -> None:
+    """Refuse a Worker that reads part of the observation queue set but not all of it.
+
+    Observations are published across a shard set so one tenant's backlog cannot starve every
+    other tenant, and every shard is in this app's own queue set -- so a Worker started with no
+    `-Q` reads all of them and needs no coordination. Narrowing it to `-Q mindbridge`, which is
+    the name the queue had before it was sharded and the one an older runbook reaches for, leaves
+    the shards with no consumer. The symptom is not an error: the publish succeeds, the ledger
+    says `pending`, and the work simply never runs -- the same silent shape the in-process model
+    guard below exists to replace.
+
+    Reading *none* of them is a different role rather than a mistake: the consolidation sweep runs
+    that way, on its own queue. Only partial coverage is refused.
+    """
+    selected = set(consume_from)
+    observation = set(observation_queues())
+    missing = tuple(sorted(observation - selected))
+    if missing and observation & selected:
+        raise ValueError(
+            "these observation queues would have no consumer: "
+            + ", ".join(missing)
+            + " -- start the Worker without -Q, or name every observation queue in it"
+        )
+
+
 def require_bounded_in_process_models(
     settings: WorkerSettings,
     concurrency: int,
@@ -608,16 +634,20 @@ def create_worker_app(settings: WorkerSettings) -> Celery:
     # the CLI flags, this app's default, and Celery's own CPU-count fallback. `--autoscale` is
     # readable but not yet parsed there, which `_resolved_pool_size` handles. The dispatch UID
     # keeps a re-created app from stacking a second receiver.
-    worker_init.disconnect(dispatch_uid="mindbridge-in-process-model-guard")
+    worker_init.disconnect(dispatch_uid="mindbridge-worker-startup-guard")
 
-    @worker_init.connect(weak=False, dispatch_uid="mindbridge-in-process-model-guard")  # type: ignore[untyped-decorator]
-    def _guard_in_process_models(sender: object = None, **_kwargs: object) -> None:
+    @worker_init.connect(weak=False, dispatch_uid="mindbridge-worker-startup-guard")  # type: ignore[untyped-decorator]
+    def _guard_worker_startup(sender: object = None, **_kwargs: object) -> None:
         try:
             require_bounded_in_process_models(
                 settings,
                 _resolved_pool_size(sender),
                 pool=getattr(sender, "pool_cls", "prefork"),
             )
+            # `-Q` is resolved before this signal: `WorkController.setup_instance` calls
+            # `setup_queues` first and sends `worker_init` twenty lines later, so unlike
+            # `--autoscale` the selection is readable here rather than merely present.
+            require_whole_observation_queue_set(task_queue.amqp.queues.consume_from)
         except ValueError as error:
             # Celery's `Signal.send` catches `Exception` from every receiver, logs it, and
             # carries on -- so raising `ValueError` here would print a traceback and then start

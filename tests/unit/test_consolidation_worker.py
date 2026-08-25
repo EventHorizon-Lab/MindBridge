@@ -85,7 +85,13 @@ def test_the_sweep_is_routed_off_the_queue_the_observation_worker_consumes() -> 
     # Asserted before anything routes: `task_create_missing_queues` adds a routed queue to the
     # app's queue set the first time a task is routed, so reading this after a route call would
     # measure the test rather than what a worker started with no -Q consumes.
-    assert list(app.amqp.queues.consume_from) == [app.conf.task_default_queue]
+    #
+    # Absence, not an exact set. The observation queues became a shard set, so pinning
+    # `consume_from` to one element pinned an unrelated implementation detail and broke on a
+    # change that preserved this property exactly. What matters here is that a bare observation
+    # worker cannot pick up a sweep; which observation queues it does consume is asserted by
+    # test_task_queue.py, where it is the subject rather than the backdrop.
+    assert CONSOLIDATION_QUEUE not in app.amqp.queues.consume_from
     assert app.conf.task_default_queue != CONSOLIDATION_QUEUE
     routed = app.amqp.router.route({}, CONSOLIDATE_TENANT_TASK)
     assert routed["queue"].name == CONSOLIDATION_QUEUE

@@ -147,6 +147,11 @@ generator. Read `claimable` against `queue_depth`. A non-zero count beside an em
 is exactly this divergence; a non-zero count beside a deep queue usually just means the workers
 are behind.
 
+`queue_depth` is the sum across every queue the worker consumes — `mindbridge` and its eight
+per-tenant shards — not one of them. That is what the withholding arithmetic below subtracts from,
+so a depth covering one shard would withhold an eighth of the backlog and republish the rest as
+duplicates. It also means the number will not match `LLEN mindbridge` on the broker.
+
 What `--republish` then does depends on the scope, and the report's `withheld` field says which
 happened. Across the whole ledger it publishes only the difference — the queue already holds a
 message for the rest, and duplicating those is not free: the delivery that loses the claim
@@ -163,9 +168,9 @@ successful one. Field-by-field meanings are in the [CLI reference](api/cli.md#mi
 
 Two cautions. `--include-failed` is off by default because a deterministic failure republished on a
 timer pays for the same rejection every time — republish `failed` rows once you know why they
-failed, not on a schedule. And kombu publishes with `LPUSH` while the worker consumes with `RPOP`,
-so a republished job waits behind everything already queued: on a deep queue, expect the repair to
-take effect slowly rather than assuming it did not work.
+failed, not on a schedule. And a repair is published at a priority the broker drains ahead of fresh
+work, on the shard it belongs to, so it does not wait behind the backlog it repairs; before that was
+true, six republishes of one job across 84 minutes moved its attempt count not at all.
 
 Under row-level security a cross-tenant scan returns no rows rather than failing, so a confined
 role reading "nothing to repair" is the one answer you cannot trust. Pass `--tenant-id`, or use a
@@ -216,7 +221,7 @@ opens media and spends a generator call per candidate pair, and it stays a delib
 
 | Resource | Shared with ingest? |
 | --- | --- |
-| Celery queue | **No.** The task is routed to `mindbridge_consolidation`; the observation queue is `mindbridge`. A sweep never takes a worker slot or a queue position from an observation. |
+| Celery queue | **No.** The task is routed to `mindbridge_consolidation`; the observation queues are `mindbridge` and its shards, and a worker started with no `-Q` consumes those and not this one. A sweep never takes a worker slot or a queue position from an observation. |
 | Generator endpoint | **Yes.** Episode, Claim, and Summary pages run strictly one after another, so a sweep holds **at most one concurrent generator call** for as long as it runs. |
 | PostgreSQL | Yes. The consolidation worker opens its own pool — count it in `MINDBRIDGE_DATABASE_MAX_POOL_SIZE`, which is per process. |
 | Object storage | Only through entity resolution, which the schedule skips. |

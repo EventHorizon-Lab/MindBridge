@@ -168,6 +168,22 @@ uv run --extra server --extra media \
 No `cloud-models`, no GPU, no torch: with both embedder slots served, the worker loads no model at
 all and its concurrency is bounded by the endpoint and the database rather than by a card.
 
+Note that the command passes no `-Q`. It consumes nine queues that way: `mindbridge` and
+`mindbridge.0` through `mindbridge.7`. **Do not narrow that with `-Q`** — a worker started
+`-Q mindbridge` consumes only the pre-shard queue, and ingest then stops with nothing logged
+anywhere. `-Q` belongs to the consolidation worker, which has a queue of its own.
+
+Observations are published to the shard their tenant id hashes to, because with one queue a single
+tenant's backlog is every other tenant's wait: during the 2026-08-24 evaluation one benchmark spent
+five hours at zero coverage behind 400 clips belonging to another, and median queue wait across the
+run rose from 0.7 s with one producer to 12,018 s with nine. Shards bound that but do not remove
+it — kombu polls the queues round robin, so one tenant can no longer starve every other tenant,
+only the tenants that hash to its own shard. Their number is a constant in the code rather than a
+setting, because a publisher writing to a shard the worker does not consume stops ingest silently.
+
+`mindbridge` itself receives no new work. It stays in the set so that an upgrade drains whatever was
+queued before the shards existed.
+
 `media` is still required, and is easy to lose sight of precisely because serving removes
 everything else. Clip derivation runs in the worker whatever the embedder slots say, and its PyAV,
 Pillow, and SoundFile decoders are declared only in that extra. They are imported lazily, so a

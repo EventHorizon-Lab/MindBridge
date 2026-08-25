@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from typing import Annotated
 
 from celery import Celery
@@ -50,6 +51,64 @@ needs no `-Q` and no rolling-restart coordination. The gap between the two steps
 purpose: 6 and 9 stay free for anything that must yield to both.
 """
 
+OBSERVATION_QUEUE = "mindbridge"
+"""The name observations were published to before the shards, and now their prefix."""
+
+OBSERVATION_QUEUE_SHARDS = 8
+"""How many queues observations spread over, so one tenant cannot hold the whole frontier.
+
+With one queue, queue position is a global resource. During the 2026-08-24 evaluation a single
+benchmark spent five hours at zero coverage behind 400 clips of another tenant's backlog on a
+frontier advancing at tens of messages an hour; operators recovered it by hand, rebuilding the
+queue as a per-benchmark round robin, and the first clip processed six minutes later. Across the
+same run median queue wait went from 0.7 s with one producer to 12,018 s with nine.
+
+Fairness needs nothing but more than one queue: kombu's Redis transport polls with
+`queue_order_strategy = "round_robin"` and rotates the queue it just served to the end of the
+cycle, so each shard's head is reached in turn no matter how deep its neighbours are.
+
+Be clear about the bound this buys. With N shards and T tenants it is not per-tenant fairness --
+two tenants that hash to one shard are still FIFO relative to each other. The true claim is that
+one tenant can no longer starve every other tenant, only its shard-mates.
+
+Eight because the count is not free: every BRPOP passes `len(queues) * len(priority_steps)` keys,
+which is 36 here, and against the nine concurrent producers that caused the incident eight shards
+already leave about one shard-mate per tenant. A count far above the plausible tenant count would
+pay for empty keys on every poll and halve an already small collision rate.
+
+Not an environment variable and not a flag on purpose. A publisher writing to shards its worker
+does not consume stops ingest with nothing raised anywhere, so the two sides read one constant.
+"""
+
+
+def observation_queues() -> tuple[str, ...]:
+    """Every queue an observation worker consumes: the pre-shard queue, then the shards.
+
+    The unsuffixed name stays in the set even though nothing publishes there any more. A
+    deployment upgrading into the shards has messages already sitting on it, and a worker that
+    consumed only the shards would leave that backlog with no consumer at all.
+    """
+    return (
+        OBSERVATION_QUEUE,
+        *(f"{OBSERVATION_QUEUE}.{index}" for index in range(OBSERVATION_QUEUE_SHARDS)),
+    )
+
+
+def observation_shard(tenant_id: str) -> str:
+    """Pick the shard one tenant's observations are published to, stably across processes.
+
+    Stability is the whole point: `hash(str)` is salted per interpreter unless `PYTHONHASHSEED`
+    is set, so the API and `mindbridge jobs` would place the same tenant differently and its work
+    would scatter over every shard run to run -- which is the starvation this is meant to bound.
+    A digest is the same number in every process.
+
+    Drawn out of `observation_queues` rather than formatted again, so the queue published to is
+    by construction one the worker consumes.
+    """
+    shards = observation_queues()[1:]
+    digest = hashlib.blake2b(tenant_id.encode("utf-8"), digest_size=8).digest()
+    return shards[int.from_bytes(digest, "big") % len(shards)]
+
 
 class ObservationProcessingTaskMessage(BaseModel):
     """Strict ID-only schema accepted at the Celery trust boundary."""
@@ -89,8 +148,15 @@ def create_task_queue(
         },
         enable_utc=True,
         task_acks_late=True,
-        task_default_queue="mindbridge",
+        task_default_queue=OBSERVATION_QUEUE,
         task_ignore_result=True,
+        # Declared as a set, not one name, so a worker started with no `-Q` consumes every shard:
+        # with nothing selected, `app.amqp.queues.consume_from` is exactly this mapping. Empty
+        # options mean what Celery would have built for `task_default_queue` on its own -- the
+        # default exchange, routing key equal to the name. `mindbridge_consolidation` is
+        # deliberately absent: `-Q` still reaches it through `task_create_missing_queues`, and an
+        # observation worker must not pick up a sweep.
+        task_queues={name: {} for name in observation_queues()},
         task_publish_retry=True,
         task_publish_retry_policy={
             "interval_start": 0,
@@ -122,7 +188,14 @@ class CeleryObservationJobPublisher:
         *,
         priority: int = FRESH_WORK_PRIORITY,
     ) -> None:
-        """Publish without blocking the API event loop or leaking broker details."""
+        """Publish without blocking the API event loop or leaking broker details.
+
+        Onto the tenant's shard, so one tenant's backlog bounds its shard-mates rather than every
+        other tenant. Priority still dominates the shard: kombu builds its BRPOP key list with
+        priority as the outer loop and queue as the inner one, so repair on any shard is served
+        before fresh work on every shard. A `task.retry()` re-publishes to the `routing_key` and
+        priority it was delivered with, so a retried observation stays on its own shard too.
+        """
         try:
             message = ObservationProcessingTaskMessage(
                 tenant_id=tenant_id,
@@ -135,6 +208,7 @@ class CeleryObservationJobPublisher:
                 kwargs={"message": message.model_dump(mode="json")},
                 task_id=job_id,
                 priority=priority,
+                queue=observation_shard(tenant_id),
             )
         except OperationalError as error:
             raise TaskBrokerError("observation job delivery failed") from error
