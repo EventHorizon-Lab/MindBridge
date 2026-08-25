@@ -1,6 +1,7 @@
 """Checks that an evidence clip really covers its span and nothing else."""
 
 import io
+from fractions import Fraction
 
 import pytest
 
@@ -427,6 +428,84 @@ def _audiovisual_bytes(*, seconds: float, fps: int, width: int, height: int) -> 
         container.mux(video.encode())
         container.mux(audio.encode())
     return buffer.getvalue()
+
+
+def _late_video_audiovisual_bytes(
+    *, seconds: float, video_start: float, fps: int, width: int, height: int
+) -> bytes:
+    """One MP4 whose audio runs from zero but whose video track only starts at `video_start`.
+
+    Not a contrived shape: a capture whose camera warms up after its microphone produces it, and
+    so does any remux that concatenates a silent lead-in. It is the case that separates rebasing
+    the audio from clamping it, because everything before the first video frame has no timestamp
+    left on the clip's own clock.
+    """
+    import av
+
+    buffer = io.BytesIO()
+    with av.open(buffer, mode="w", format="mp4") as container:
+        video = container.add_stream("libx264", rate=fps)
+        video.width, video.height, video.pix_fmt = width, height, "yuv420p"
+        video.time_base = Fraction(1, 1_000)
+        audio = container.add_stream("aac", rate=SAMPLE_RATE)
+        audio.layout = "mono"
+        for index in range(int((seconds - video_start) * fps)):
+            array = numpy.full((height, width, 3), index % 256, dtype="uint8")
+            video_frame = av.VideoFrame.from_ndarray(array, format="rgb24")
+            video_frame.pts = round((video_start + index / fps) * 1_000)
+            video_frame.time_base = video.time_base
+            container.mux(video.encode(video_frame))
+        samples_per_frame = SAMPLE_RATE // fps
+        for index in range(int(seconds * fps)):
+            tone = numpy.sin(
+                2
+                * numpy.pi
+                * 440
+                * numpy.arange(index * samples_per_frame, (index + 1) * samples_per_frame)
+                / SAMPLE_RATE
+            )
+            audio_frame = av.AudioFrame.from_ndarray(
+                (tone * 16_000).astype("int16").reshape(1, -1), format="s16", layout="mono"
+            )
+            audio_frame.sample_rate = SAMPLE_RATE
+            audio_frame.pts = index * samples_per_frame
+            container.mux(audio.encode(audio_frame))
+        container.mux(video.encode())
+        container.mux(audio.encode())
+    return buffer.getvalue()
+
+
+def test_stored_clip_of_a_late_starting_video_keeps_one_timestamp_per_audio_frame() -> None:
+    """Audio ahead of the rebase point is dropped, never pulled back onto timestamp zero.
+
+    Clamping it looks harmless and is not: every frame before the clip's first video frame
+    lands on the same timestamp, and a run of identical timestamps is a non-monotonic MP4.
+    Measured on this shape before the fix, 93 audio frames shared pts 0 -- a file whose own
+    writer accepted it and a stricter demuxer need not.
+    """
+    import av
+
+    source = _late_video_audiovisual_bytes(
+        seconds=5.0, video_start=2.0, fps=10, width=160, height=120
+    )
+
+    # Sampled at the source's own rate on purpose. Below it, the sampler catches up on a
+    # late-starting track by taking consecutive frames, which the encoder then quantises onto
+    # one tick -- a separate, pre-existing interaction that has nothing to do with the audio.
+    clips = cut_clips(
+        source,
+        ClipRequest(kind=MediaKind.VIDEO, start_ms=0, end_ms=5_000, frames_per_second=10.0),
+    )
+
+    with av.open(io.BytesIO(clips[0].content), mode="r") as container:
+        stamps = [
+            frame.pts
+            for frame in container.decode(container.streams.audio[0])
+            if frame.pts is not None
+        ]
+    assert stamps, "the clip carried no audio at all"
+    assert len(set(stamps)) == len(stamps), "audio frames collapsed onto a shared timestamp"
+    assert stamps == sorted(stamps), "audio timestamps are not monotonic"
 
 
 def test_point_audio_span_widens_instead_of_failing_the_job() -> None:

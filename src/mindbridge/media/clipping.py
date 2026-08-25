@@ -192,6 +192,12 @@ def _copy_span_audio(
     passes its first sampled frame's time, because audio left on the source clock would sit
     minutes past a clip that claims to be thirty seconds long, and every player and decoder
     would then read the speech as silence.
+
+    Audio that precedes the rebase point is dropped rather than pulled back to zero. That
+    audio has nowhere to go on the clip's timeline without moving the video with it, and the
+    video's anchor is not free to move: a stored clip whose first frame sits past zero is
+    rejected outright by the mp4 muxer as soon as the sampler has to take consecutive source
+    frames to catch up, which is exactly what a late-starting video track makes it do.
     """
     start_seconds, end_seconds = request.start_ms / 1_000, request.end_ms / 1_000
     if start_seconds > 0:
@@ -202,18 +208,31 @@ def _copy_span_audio(
         if frame.time > end_seconds:
             break
         for resampled in resampler.resample(frame):
-            _shift_audio_frame(resampled, offset_seconds)
-            output.mux(audio.encode(resampled))
+            if _shift_audio_frame(resampled, offset_seconds):
+                output.mux(audio.encode(resampled))
     for resampled in resampler.resample(None):
-        _shift_audio_frame(resampled, offset_seconds)
-        output.mux(audio.encode(resampled))
+        if _shift_audio_frame(resampled, offset_seconds):
+            output.mux(audio.encode(resampled))
     output.mux(audio.encode())
 
 
-def _shift_audio_frame(frame: Any, offset_seconds: float) -> None:  # noqa: ANN401
-    """Rebase one resampled frame onto a clip that starts at zero."""
+def _shift_audio_frame(frame: Any, offset_seconds: float) -> bool:  # noqa: ANN401
+    """Rebase one resampled frame onto a clip that starts at zero; False means drop it.
+
+    Dropping rather than clamping is the whole point. A clamp to zero is not a small error: it
+    puts every frame ahead of the rebase point on one timestamp, and a run of identical
+    timestamps is a non-monotonic mp4 that a stricter demuxer than the one that wrote it may
+    refuse or silently discard. Measured on a source whose video track begins two seconds after
+    its audio, clamping put 93 frames on pts 0.
+
+    What is dropped is the audio between the span's start and the clip's first video frame:
+    at most one source frame interval on an ordinary cut, and everything before the video
+    track begins on a source whose two tracks do not start together. It is a real loss, and
+    the alternative was worse -- see `_copy_span_audio` for why the video's anchor cannot move
+    to keep it.
+    """
     if not offset_seconds or frame.pts is None:
-        return
+        return True
     time_base = frame.time_base
     if time_base:
         ticks_per_second = 1.0 / float(time_base)
@@ -222,11 +241,12 @@ def _shift_audio_frame(frame: Any, offset_seconds: float) -> None:  # noqa: ANN4
     else:
         # Nothing to rebase against; leaving the timestamp alone is better than guessing a rate
         # and shifting the track by an unknown amount.
-        return
-    # Clamp rather than emit a negative pts: the seek above lands on a keyframe at or before the
-    # span, so the first decoded frames can precede it, and a negative timestamp is dropped by
-    # the muxer with no error, which would silently truncate the opening words.
-    frame.pts = max(0, frame.pts - round(offset_seconds * ticks_per_second))
+        return True
+    shifted = frame.pts - round(offset_seconds * ticks_per_second)
+    if shifted < 0:
+        return False
+    frame.pts = shifted
+    return True
 
 
 def audio_windows(start_ms: int, end_ms: int) -> tuple[tuple[int, int], ...]:

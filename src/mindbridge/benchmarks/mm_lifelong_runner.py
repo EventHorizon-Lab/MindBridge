@@ -52,10 +52,27 @@ class MMLifelongPreparedSegment(ContractModel):
     def require_aligned_content(self) -> MMLifelongPreparedSegment:
         if not self.media_objects and self.caption is None:
             raise ValueError("MM-Lifelong segments require media or a caption")
-        if not self.media_objects and self.identity_observations:
-            raise ValueError("MM-Lifelong identity observations require source media")
-        if any(identity.end_ms > self.duration_ms for identity in self.identity_observations):
-            raise ValueError("MM-Lifelong identity observation exceeds its segment")
+        if self.identity_observations:
+            # Against the timed media, not against `duration_ms`. `duration_ms` is a
+            # segment-level number the release supplies independently of what was staged, so a
+            # 600 s segment carrying a 30 s video would otherwise accept a voice span at 500 s,
+            # and a segment carrying only a still image would accept one outright. Both are the
+            # same failure this check exists to stop: a released caption entering as a trusted
+            # edge signal, which `PERCEIVE_EVENTS_PROMPT` will name a person from.
+            timed_ms = max(
+                (
+                    media.duration_ms or 0
+                    for media in self.media_objects
+                    if media.kind in (MediaKind.AUDIO, MediaKind.VIDEO)
+                ),
+                default=0,
+            )
+            if not timed_ms:
+                raise ValueError(
+                    "MM-Lifelong identity observations require timed audio or video media"
+                )
+            if any(identity.end_ms > timed_ms for identity in self.identity_observations):
+                raise ValueError("MM-Lifelong identity observation exceeds its source media")
         media_ids = tuple(item.media_object_id for item in self.media_objects)
         if len(set(media_ids)) != len(media_ids):
             raise ValueError("MM-Lifelong segment media_object_ids must be unique")

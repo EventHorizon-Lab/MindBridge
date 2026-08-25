@@ -161,6 +161,57 @@ def test_mm_lifelong_segment_rejects_voice_identities_without_media() -> None:
         )
 
 
+def test_mm_lifelong_segment_rejects_voice_identities_backed_only_by_a_still_image() -> None:
+    """Media being present is not the same as media that could have carried a voice.
+
+    An image satisfies "this segment has media" while backing no speech at all, so a released
+    caption would enter as a trusted edge transcript through the one channel
+    `PERCEIVE_EVENTS_PROMPT` is told to believe about who spoke.
+    """
+    with pytest.raises(ValidationError):
+        MMLifelongPreparedSegment(
+            segment_id="segment_01",
+            start_seconds=0.0,
+            duration_ms=30_000,
+            media_objects=(_segment_image(),),
+            identity_observations=(_voice(start_ms=1_000, end_ms=5_000),),
+        )
+
+
+def test_mm_lifelong_segment_rejects_a_voice_span_past_its_timed_media() -> None:
+    """`duration_ms` is the release's number for the segment, not for what was staged.
+
+    A segment declaring ten minutes while carrying thirty seconds of video would otherwise
+    accept a transcript at minute eight -- speech with no audio anywhere behind it.
+    """
+    with pytest.raises(ValidationError):
+        MMLifelongPreparedSegment(
+            segment_id="segment_01",
+            start_seconds=0.0,
+            duration_ms=600_000,
+            media_objects=(_segment_media(),),
+            identity_observations=(_voice(start_ms=1_000, end_ms=120_000),),
+        )
+
+
+def _segment_image() -> MediaObjectInput:
+    """A still that nonetheless declares a duration, which nothing forbids it from doing.
+
+    Load-bearing for the test above: without it, an image is rejected only because it has no
+    `duration_ms` to measure a span against, and dropping the audio/video filter from the
+    validator would go unnoticed.
+    """
+    return MediaObjectInput(
+        media_object_id="media_02",
+        kind=MediaKind.IMAGE,
+        uri="s3://bucket/tenants/t/benchmark-media/segment_01.jpg",
+        sha256="b" * 64,
+        size_bytes=512,
+        created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        duration_ms=30_000,
+    )
+
+
 async def test_mm_lifelong_keeps_ingested_segments_when_one_segment_fails() -> None:
     """A segment that cannot be written used to discard the whole timeline behind it."""
 
