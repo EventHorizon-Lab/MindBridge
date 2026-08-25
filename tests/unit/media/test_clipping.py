@@ -107,6 +107,63 @@ def test_video_clip_applies_the_requested_frame_rate_and_pixel_budget() -> None:
     assert stream.codec_context.width * stream.codec_context.height <= 10_000
 
 
+def test_stored_clip_keeps_the_speech_memory_is_supposed_to_hold() -> None:
+    """The stored clip is what the media embedder encodes and the read path attaches, so a
+    video-only clip deletes speech from memory itself rather than from one model call. Measured
+    on a nine-benchmark evaluation: every derived clip was h264-only while its source carried
+    aac, and no question that depended on hearing could be answered from memory."""
+    import av
+
+    source = _audiovisual_bytes(seconds=6.0, fps=10, width=320, height=240)
+
+    clips = cut_clips(
+        source,
+        ClipRequest(kind=MediaKind.VIDEO, start_ms=2_000, end_ms=5_000, frames_per_second=2.0),
+    )
+
+    with av.open(io.BytesIO(clips[0].content), mode="r") as container:
+        assert len(container.streams.audio) == 1
+        samples = sum(frame.samples for frame in container.decode(container.streams.audio[0]))
+    assert samples > SAMPLE_RATE  # over a second of audio survived the re-encode
+
+
+def test_stored_clip_rebases_speech_onto_its_own_clock() -> None:
+    """Unlike the generation proxy, a stored clip restarts at zero. Audio left on the source's
+    clock would sit `start_ms` past a clip that claims to be three seconds long, and the muxer
+    drops those packets silently -- speech would be present in the encoder and absent in the
+    file."""
+    import av
+
+    source = _audiovisual_bytes(seconds=6.0, fps=10, width=320, height=240)
+
+    clips = cut_clips(
+        source,
+        ClipRequest(kind=MediaKind.VIDEO, start_ms=2_000, end_ms=5_000, frames_per_second=2.0),
+    )
+
+    with av.open(io.BytesIO(clips[0].content), mode="r") as container:
+        video = [frame.time for frame in container.decode(container.streams.video[0])]
+    with av.open(io.BytesIO(clips[0].content), mode="r") as container:
+        audio = [frame.time for frame in container.decode(container.streams.audio[0])]
+    assert video[0] == pytest.approx(0.0, abs=0.2)
+    assert audio[0] == pytest.approx(video[0], abs=0.2)
+    assert audio[-1] == pytest.approx(video[-1], abs=0.5)
+
+
+def test_stored_clip_of_a_silent_source_stays_video_only() -> None:
+    import av
+
+    source = _video_bytes(seconds=3.0, fps=10, width=160, height=120)
+
+    clips = cut_clips(
+        source,
+        ClipRequest(kind=MediaKind.VIDEO, start_ms=0, end_ms=3_000, frames_per_second=1.0),
+    )
+
+    with av.open(io.BytesIO(clips[0].content), mode="r") as container:
+        assert not container.streams.audio
+
+
 def test_generation_proxy_keeps_the_speech_the_model_has_to_hear() -> None:
     """Perception reads this copy instead of the source, so dropping its audio track would
     silently take speech away from every question that depends on what was said."""

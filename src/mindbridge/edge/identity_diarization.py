@@ -218,15 +218,27 @@ class FunASRSpeechPipeline:
         self._diarization_confidence = diarization_confidence
 
     @classmethod
-    def load(cls, *, device: str | None = None) -> FunASRSpeechPipeline:
-        """Load the official integrated FunASR pipeline on CUDA when available."""
+    def load(
+        cls,
+        *,
+        device: str | None = None,
+        model_id: str | None = None,
+    ) -> FunASRSpeechPipeline:
+        """Load the official integrated FunASR pipeline on CUDA when available.
+
+        `model_id` overrides the acoustic model. The default is tuned for Mandarin, and a device
+        deployed somewhere else needs its own: measured on an English corpus, the Mandarin
+        checkpoint transcribes the right words with no word boundaries at all
+        ("hellorobotwhathaveyouprepared..."), which is recoverable but plainly not what the
+        speech contained. Language is a property of where the device sits, not of the product.
+        """
         try:
             funasr = __import__("funasr")
         except ImportError as error:
             raise ModelUnavailableError("install FunASR for local speech transcription") from error
         selected_device = select_torch_device(device)
         pipeline = funasr.AutoModel(
-            model=FUNASR_ASR_MODEL_ID,
+            model=model_id or FUNASR_ASR_MODEL_ID,
             vad_model=FUNASR_VAD_MODEL_ID,
             punc_model=FUNASR_PUNCTUATION_MODEL_ID,
             spk_model=CAMPPLUS_MODEL.model_id,
@@ -723,6 +735,28 @@ def _record_and_resolve_voice_identities(
     return tuple(resolved)
 
 
+def _funasr_sentence_text(value: object) -> str | None:
+    """Accept either FunASR sentence shape, because it emits both.
+
+    `sentence_info[i]["text"]` is a plain string on some decode paths and a per-token list on
+    others -- `['哦', '哦', '好', ...]` -- and which one you get varies with the model and the
+    clip, not with the call. Rejecting the list shape discarded every sentence in the clip:
+    measured on this corpus, **25 of 40 clips (62.5%) produced no transcript at all** for that
+    reason alone, which is most of the speech a conversational benchmark depends on.
+
+    Tokens are joined without a separator because these models tokenise Chinese per character;
+    a token that already carries its own spacing keeps it.
+    """
+    if isinstance(value, str):
+        return value.strip() or None
+    if isinstance(value, (list, tuple)) and value:
+        if not all(isinstance(token, str) for token in value):
+            return None
+        joined = "".join(value).strip()
+        return joined or None
+    return None
+
+
 def _funasr_segments(value: object, *, confidence: float) -> tuple[SpeechSegment, ...]:
     if not isinstance(value, list) or len(value) > MAX_SPEECH_SEGMENTS:
         raise ModelOutputError("FunASR returned invalid sentence-level diarization")
@@ -731,15 +765,14 @@ def _funasr_segments(value: object, *, confidence: float) -> tuple[SpeechSegment
         if not isinstance(item, dict):
             raise ModelOutputError("FunASR returned an invalid sentence")
         start, end = item.get("start"), item.get("end")
-        transcript = item.get("text") or item.get("sentence")
+        transcript = _funasr_sentence_text(item.get("text") or item.get("sentence"))
         speaker = item.get("spk")
         if (
             not isinstance(start, (int, float))
             or isinstance(start, bool)
             or not isinstance(end, (int, float))
             or isinstance(end, bool)
-            or not isinstance(transcript, str)
-            or not transcript.strip()
+            or transcript is None
             or (speaker is not None and not isinstance(speaker, (str, int)))
         ):
             raise ModelOutputError("FunASR returned an invalid sentence")

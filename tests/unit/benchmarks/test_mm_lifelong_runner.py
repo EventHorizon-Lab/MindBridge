@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 from typing import cast
 
 import pytest
+from pydantic import ValidationError
 
 from mindbridge import MindBridge
 from mindbridge.benchmarks.mm_lifelong import MMLifelongQuestion
@@ -13,8 +14,21 @@ from mindbridge.benchmarks.mm_lifelong_runner import (
     run_mm_lifelong,
     unofficial_reference_at_n,
 )
-from mindbridge.contracts import MemoryView, RecallRequest, RecallResult, RememberRequest
-from mindbridge.core import MemoryState, MemoryType, VerificationStatus
+from mindbridge.contracts import (
+    IdentityObservationInput,
+    MediaObjectInput,
+    MemoryView,
+    RecallRequest,
+    RecallResult,
+    RememberRequest,
+)
+from mindbridge.core import (
+    IdentityKind,
+    MediaKind,
+    MemoryState,
+    MemoryType,
+    VerificationStatus,
+)
 from mindbridge.sdk import MindBridgeError
 
 ORIGIN = datetime(2026, 1, 1, tzinfo=timezone.utc)
@@ -84,6 +98,67 @@ async def test_mm_lifelong_rejects_timeline_that_cannot_cover_labels() -> None:
 
 def test_mm_lifelong_unofficial_reference_at_n_uses_bucket_jaccard() -> None:
     assert unofficial_reference_at_n(((0.0, 600.0),), ((300.0, 600.0),), 600.0) == 0.5
+
+
+def _voice(*, start_ms: int, end_ms: int) -> IdentityObservationInput:
+    return IdentityObservationInput(
+        identity_id="voice_speaker_a",
+        kind=IdentityKind.VOICE,
+        start_ms=start_ms,
+        end_ms=end_ms,
+        confidence=0.9,
+        model_id="iic_speech_seaco_paraformer",
+        transcript="the streamer explains the route",
+    )
+
+
+def _segment_media() -> MediaObjectInput:
+    return MediaObjectInput(
+        media_object_id="media_01",
+        kind=MediaKind.VIDEO,
+        uri="s3://bucket/tenants/t/benchmark-media/segment_01.mp4",
+        sha256="a" * 64,
+        size_bytes=1_024,
+        created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        duration_ms=30_000,
+    )
+
+
+def test_mm_lifelong_segment_accepts_timed_voice_identities() -> None:
+    """A lifelong corpus is mostly speech; without this channel perception reads a silent clip."""
+    segment = MMLifelongPreparedSegment(
+        segment_id="segment_01",
+        start_seconds=0.0,
+        duration_ms=30_000,
+        media_objects=(_segment_media(),),
+        identity_observations=(_voice(start_ms=1_000, end_ms=5_000),),
+    )
+
+    assert segment.identity_observations[0].transcript == "the streamer explains the route"
+
+
+def test_mm_lifelong_segment_rejects_a_voice_span_past_its_duration() -> None:
+    with pytest.raises(ValidationError):
+        MMLifelongPreparedSegment(
+            segment_id="segment_01",
+            start_seconds=0.0,
+            duration_ms=30_000,
+            media_objects=(_segment_media(),),
+            identity_observations=(_voice(start_ms=1_000, end_ms=31_000),),
+        )
+
+
+def test_mm_lifelong_segment_rejects_voice_identities_without_media() -> None:
+    """A transcript with no media behind it is a released caption wearing an edge signal's
+    clothes, which is exactly the input this evaluation forbids."""
+    with pytest.raises(ValidationError):
+        MMLifelongPreparedSegment(
+            segment_id="segment_01",
+            start_seconds=0.0,
+            duration_ms=30_000,
+            caption="A meeting took place.",
+            identity_observations=(_voice(start_ms=1_000, end_ms=5_000),),
+        )
 
 
 async def test_mm_lifelong_keeps_ingested_segments_when_one_segment_fails() -> None:

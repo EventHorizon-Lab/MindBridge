@@ -21,6 +21,7 @@ from mindbridge.benchmarks.egolife_runner import (
 from mindbridge.benchmarks.egomem_reason import EgoMemReasonQuestion
 from mindbridge.benchmarks.runtime import OPTION_LABELS
 from mindbridge.contracts import (
+    IdentityObservationInput,
     MediaObjectInput,
     ObservationProcessingJobView,
     ObservationReceipt,
@@ -30,7 +31,7 @@ from mindbridge.contracts import (
     RecallResult,
     RememberRequest,
 )
-from mindbridge.core import JobState, MediaKind
+from mindbridge.core import IdentityKind, JobState, MediaKind
 from mindbridge.sdk import MindBridgeError
 
 ORIGIN = datetime(2026, 1, 1, tzinfo=timezone.utc)
@@ -192,6 +193,67 @@ async def test_egolife_binds_released_caption_to_source_video() -> None:
     )
 
     assert api.remember_requests[0].evidence_ids == ("evidence_0",)
+
+
+async def test_egolife_carries_voice_identities_into_the_observation() -> None:
+    """Perception names a person only when the name is seen or heard, so on a conversational
+    corpus the transcript is the only channel a name can arrive on. Nine benchmarks measured
+    zero named housemates across 566 entities while this field went unpopulated."""
+    api = RecordingMemoryApi()
+    voice = IdentityObservationInput(
+        identity_id="voice_speaker_a",
+        kind=IdentityKind.VOICE,
+        start_ms=1_000,
+        end_ms=4_000,
+        confidence=0.9,
+        model_id="iic_speech_seaco_paraformer",
+        transcript="Jake, pass me the salt.",
+    )
+    prepared = EgoLifePreparedStream(
+        subject_id="A1_JAKE",
+        timeline_origin=ORIGIN,
+        clips=(
+            EgoLifePreparedClip(
+                day=1,
+                start_timecode="10000000",
+                media_object=_clip("10000000", "media_0", duration_ms=30_000).media_object,
+                duration_ms=30_000,
+                identity_observations=(voice,),
+            ),
+        ),
+    )
+
+    await run_egolife_qa(
+        cast(MindBridge, api),
+        (_question("q_1", "10004500"),),
+        prepared,
+        run_id="run_01",
+        poll_interval_seconds=0.001,
+    )
+
+    observed = api.observe_requests[0].identity_observations
+    assert [item.transcript for item in observed] == ["Jake, pass me the salt."]
+
+
+def test_prepared_egolife_rejects_a_voice_span_past_its_clip() -> None:
+    with pytest.raises(ValidationError):
+        EgoLifePreparedClip(
+            day=1,
+            start_timecode="10000000",
+            media_object=_clip("10000000", "media_0", duration_ms=30_000).media_object,
+            duration_ms=30_000,
+            identity_observations=(
+                IdentityObservationInput(
+                    identity_id="voice_speaker_a",
+                    kind=IdentityKind.VOICE,
+                    start_ms=1_000,
+                    end_ms=31_000,
+                    confidence=0.9,
+                    model_id="iic_speech_seaco_paraformer",
+                    transcript="past the end",
+                ),
+            ),
+        )
 
 
 async def test_egolife_keeps_released_visual_and_audio_memories_separate() -> None:

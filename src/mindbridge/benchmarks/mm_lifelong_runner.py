@@ -20,6 +20,7 @@ from mindbridge.benchmarks.runtime import (
 from mindbridge.contracts import (
     ContractModel,
     Identifier,
+    IdentityObservationInput,
     MediaObjectInput,
     MemoryView,
     NonEmptyString,
@@ -40,11 +41,18 @@ class MMLifelongPreparedSegment(ContractModel):
     duration_ms: int = Field(gt=0)
     media_objects: tuple[MediaObjectInput, ...] = ()
     caption: NonEmptyString | None = None
+    # Timed voice spans and their transcripts, as an edge device would supply them. A lifelong
+    # corpus is mostly speech, and without these perception is handed a silent clip.
+    identity_observations: tuple[IdentityObservationInput, ...] = Field(default=(), max_length=512)
 
     @model_validator(mode="after")
     def require_aligned_content(self) -> MMLifelongPreparedSegment:
         if not self.media_objects and self.caption is None:
             raise ValueError("MM-Lifelong segments require media or a caption")
+        if not self.media_objects and self.identity_observations:
+            raise ValueError("MM-Lifelong identity observations require source media")
+        if any(identity.end_ms > self.duration_ms for identity in self.identity_observations):
+            raise ValueError("MM-Lifelong identity observation exceeds its segment")
         media_ids = tuple(item.media_object_id for item in self.media_objects)
         if len(set(media_ids)) != len(media_ids):
             raise ValueError("MM-Lifelong segment media_object_ids must be unique")
@@ -236,6 +244,7 @@ async def _ingest_segment(
                     occurred_at=occurred_at,
                     ended_at=ended_at,
                     observed_at=ended_at,
+                    identity_observations=segment.identity_observations,
                     idempotency_key=(
                         f"{MM_LIFELONG_ADAPTER_VERSION}:{prepared.split}:{segment.segment_id}:media"
                     ),
