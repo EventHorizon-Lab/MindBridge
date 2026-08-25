@@ -1465,7 +1465,7 @@ MindBridge 的目标是**在各类权威 Benchmark 上取得工业级 SOTA 的�
 6. 模型、Prompt、索引参数和代码 commit 固定进 run manifest。
 
 可执行适配基线覆盖 LoCoMo-Refined、M3-Agent、Video-MME、EgoLife、EgoTempo、SuperMemory-VQA、
-EgoMemReason、MEMLENS 和 MM-Lifelong 的官方发布。适配器只转换推理所需字段；EgoLife 的
+EgoMemReason、MEMLENS、MM-Lifelong、ATM-Bench 和 Mem-Gallery 的官方发布。适配器只转换推理所需字段；EgoLife 的
 `target_time`、`keywords`、`reason` 与 SuperMemory 的 `answer_evidence` 不进入运行契约。
 媒体通过 Hugging Face Hub 官方客户端获取，仓库不保存数据副本或自研下载器。数据身份由
 `dataset-adapters-smoke.json` 里的源文件 SHA-256 承担。

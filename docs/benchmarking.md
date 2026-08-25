@@ -671,6 +671,122 @@ For the official text-only ablation, add `--text-only`, omit `--prepared-images`
 deployment file without Worker plugins; image placeholders remain `[image]` and no generated image
 caption is injected.
 
+ATM-Bench replays a single person's photo, video, and email archive — 3,759 images, 533 videos,
+and 6,742 emails, of which only 430 are ever named as evidence — against the official `main`
+(1,013 questions) and `hard` (31 questions) splits. The two splits are disjoint: `hard` is not a
+subset of `main`.
+
+The release carries two clocks: an image's `timestamp` is local wall clock and matches its
+filename stem, but a video's is true UTC and can sit an hour off the stem for half the year. The
+adapter reads capture time from the filename stem for every modality instead, so raw media and
+the official schema-guided (SGM) records share one timeline. The runner refuses a `raw` run whose
+staged capture time disagrees with the release's own SGM record for the same item, and refuses a
+staged video that no SGM record gives a duration for.
+
+`--media-source` picks which of ATM's two representations of the archive gets written: `raw`
+(the default) sends the archive's own image and video bytes through MindBridge's own perception;
+`sgm` writes the release's own schema-guided caption text instead, skipping perception entirely.
+Neither is ATM's own "Raw" baseline, which puts the image directly into the answerer's context —
+MindBridge's `raw` arm always goes through structured memory first, so the published column
+comparable to it is ATM's **SGM** column, not its **Raw** column.
+
+`--prepared-media` stages the archive's own bytes for a `raw` run, one entry per item, keyed by
+and required to equal the official `YYYYMMDD_HHMMSS` filename stem:
+
+```json
+{
+  "media": [
+    {
+      "media_id": "20250223_130249",
+      "media_object": {
+        "media_object_id": "20250223_130249",
+        "kind": "image",
+        "uri": "s3://mindbridge-media/atm-bench/20250223_130249.jpg",
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+        "size_bytes": 100686,
+        "created_at": "2025-02-23T13:02:49Z"
+      }
+    }
+  ]
+}
+```
+
+```bash
+uv run mindbridge-bench atm \
+  --dataset .benchmarks/atm-bench/data/atm-bench/atm-bench-hard.json \
+  --split hard \
+  --media-source raw \
+  --emails .benchmarks/atm-bench/data/raw_memory/email/emails.json \
+  --prepared-media .benchmarks/atm-prepared-media.json \
+  --sgm-image .benchmarks/atm-bench/data/processed_memory/image_batch_results.json \
+  --sgm-video .benchmarks/atm-bench/data/processed_memory/video_batch_results.json \
+  --output .benchmarks/results/atm-hard-raw.json \
+  --api-base-url http://localhost:8000 \
+  --deployment-config .benchmarks/deployment.json \
+  --run-id atm-hard-raw-01
+```
+
+`--split` does not filter questions — that is `--dataset`'s job, by pointing at either release
+file — it only records which split the loaded file is, so the manifest cannot silently mislabel a
+run. `--sgm-video` is required on a `raw` run whenever a staged item is a video, since only the SGM
+record carries its duration; `--sgm-image` is not required there but still worth passing, since it
+extends the same clock-agreement guard to staged images. `--question-id` is repeatable and narrows
+a run to specific IDs; omit it for the whole split. The output is a JSON array of `{id, question,
+qtype, answer, prediction, evidence_ids, retrieved_evidence_ids, ...}` objects in the shape the
+official `JingbiaoMei/ATM-Bench` evaluator reads, with MindBridge's own retrieval diagnostics
+appended in fields that evaluator ignores.
+
+Mem-Gallery replays one topic's whole multi-session dialogue as its own tenant, then answers that
+topic's own questions over it — the release is twenty independent personas, and a shared tenant
+would let one persona's memory answer another's question. `--dataset` names the release's
+`data/dialog` directory, not a single file; the runner loads every topic file inside it and
+narrows to `--topic` selections when given.
+
+`--prepared-images` must stage every image the selected topics reference: both the 1,003 images
+embedded in dialogue rounds and the 487 question images asked alongside a query. A missing image
+refuses the run before ingestion starts. Images are keyed by the release's own relative path
+(`image_key`); `media_object_id` is a separate, caller-assigned field, but for a dialogue image it
+must be set to the official `image_id` (for example `D2:IMG_001`) because `VS` ("visual search")
+questions ask the model to name the matching `image_id` directly as its answer, and that ID is
+what ties a retrieved image back to the release's own answer key. Question images carry no
+official ID, so their `media_object_id` may be assigned freely:
+
+```json
+{
+  "images": [
+    {
+      "image_key": "../image/Baking_Dessert_Daily_Life_Skill/D1_IMG_001.jpg",
+      "media_object": {
+        "media_object_id": "D1:IMG_001",
+        "kind": "image",
+        "uri": "s3://mindbridge-media/mem-gallery/Baking_Dessert_Daily_Life_Skill/D1_IMG_001.jpg",
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+        "size_bytes": 123456,
+        "created_at": "2026-08-14T00:00:00Z"
+      }
+    }
+  ]
+}
+```
+
+```bash
+uv run mindbridge-bench mem-gallery \
+  --dataset .benchmarks/mem-gallery/data/dialog \
+  --prepared-images .benchmarks/mem-gallery-prepared-images.json \
+  --topic Baking_Dessert_Daily_Life_Skill \
+  --output .benchmarks/results/mem-gallery-baking.json \
+  --api-base-url http://localhost:8000 \
+  --deployment-config .benchmarks/deployment.json \
+  --run-id mem-gallery-baking-01
+```
+
+`--topic` is repeatable and defaults to all twenty. The output is a JSON array of `{question_id,
+topic, point, question, answer, prediction, clue, retrieved_ids, ...}` objects in the shape the
+official `YuanchenBei/Mem-Gallery` evaluator reads. `point` is the official nine-way task code
+(`FR`, `MR`, `TR`, `VR`, `TTL`, `VS`, `CD`, `KR`, `AR`); scoring is broken out per `point`, and
+`AR` specifically rewards abstaining with the release's own refusal text (`Not mentioned.`), so
+its score is not comparable to the other eight without reading it on its own.
+
 MM-Lifelong prepared segments use the split-wide clock of the official `total_intervals` field.
 `start_seconds` must therefore be a global Day, Week, or Month offset, not a source-video-local
 timestamp. A segment can carry raw audio/video, a pinned caption, or both:

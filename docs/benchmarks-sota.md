@@ -294,6 +294,64 @@ Video-RAG 全面优于 EgoButler。论文指出：83.9 的可答性判别配上 
 **MindBridge 目标**：> 39.6，同时成为第一个超过通用 MLLM 的 agentic 记忆系统。这是九项里"记忆
 系统 vs 大模型"叙事最干净的一项：题目本身要求跨周回溯，而榜单显示现有记忆框架反而更差。
 
+### 3.10 ATM-Bench — 长期个性化指代记忆问答
+
+官方发布 3,759 张图片、533 段视频、6,742 封邮件（其中仅 430 封被引用为证据）组成的个人档案，
+`main` split 1,013 题、`hard` split 31 题两者不相交（`hard` 不是 `main` 的子集）。以下学术榜答题
+模型为 `Qwen3-VL-8B-Instruct-FP8`，judge 为 `gpt-5-mini`（[官方论文](https://arxiv.org/abs/2603.01990)）：
+
+| System | ATM-Bench QS | ATM-Bench Recall@10 | ATM-Bench-Hard QS | Hard Recall@10 |
+| --- | --- | --- | --- | --- |
+| Memexa (DeepSeek-V4-flash judge, not gpt-5-mini) | 68.0 | 79.1 | 47.9 | 44.7 |
+| MemPalace | 56.8 | 76.4 | 9.7 | 28.3 |
+| ATM-RAG (paper's own) | 51.0 | 68.7 | 8.4 | 28.8 |
+| MemoryOS | 47.2 | 59.2 | 13.7 | 32.7 |
+| A-Mem | 44.8 | 66.4 | 9.9 | 31.7 |
+| mem0 | 43.5 | 61.9 | 9.2 | 23.7 |
+| HippoRAG2 | 42.9 | 66.4 | 9.4 | 31.9 |
+| SimpleMem | 27.3 | 23.3 | 3.2 | 7.0 |
+
+通用编程 agent 在 31 题的 hard split 上反而更高——GPT-5.6 Sol（medium）58.8%、Claude Opus 5
+（xhigh）58.4%；同一 split 的 SGM Oracle 上限是 60.5（MiniMax-M3）。这两处对比都不能与上表直接
+并列：Memexa 一行用 DeepSeek-V4-flash 当 judge，不是表头统一的 gpt-5-mini；通用编程 agent 与专门
+的记忆系统也是两种不同的测法，不是同一维度的名次。
+
+表中数字对应官方 leaderboard 的 **SGM**（schema-guided memory，把结构化图文摘要交给答题模型）
+赛道，不是 **Raw**（把原始图像直接放进答题模型上下文）赛道——两条赛道官方分别发布，本文只转载
+前者。这个区分决定了 MindBridge 自己该对齐哪一列：`--media-source raw` 与 ATM 的 Raw 赛道同名，
+但语义不同——`raw` arm 的原始媒体先经过 MindBridge 自己的感知与结构化记忆写入，答题模型看到的是
+检索回的证据而不是像素本身，因此 MindBridge 的 `raw` 与 `sgm` 两条 arm 都只能对齐 ATM 的 SGM
+列，不能对齐 Raw 列。
+
+**评测口径**：MindBridge 走自己的生产写路径（`raw` arm 经 `observe` 触发感知，`sgm` arm 经
+`remember` 写入官方文本），不是把题面或图像直接塞进答题模型的上下文。引用本表数字作对照时必须
+同时点名 MindBridge 一侧实际使用的答题模型与 judge，否则两个数字不可比；MindBridge 目前在
+ATM-Bench 上没有已发布的分数。
+
+### 3.11 Mem-Gallery — 多模态长期对话记忆
+
+官方发布 20 个主题、240 段多会话对话、3,962 轮对话、1,003 张对话图片、1,711 道问题（其中 487
+题带查询图片）。以下学术榜 backbone 为 `Qwen2.5-VL-7B`，共对比 13 个记忆系统
+（[官方论文](https://arxiv.org/abs/2601.03515)）：
+
+| System | F1 | LLM judge |
+| --- | --- | --- |
+| MuRAG (best multimodal) | 0.6966 | 0.8229 |
+| UniversalRAG | 0.6827 | 0.8016 |
+| A-Mem (best textual) | 0.6228 | 0.7431 |
+| Full memory (text) | 0.3625 | — |
+| Full memory (multimodal) | 0.3354 | — |
+
+分任务上还有几个值得单独记录的高点：MuRAG 在 `VS` 任务上以 0.8818 F1 领先、在 `TTL` 任务上以
+0.8177 F1 领先；FIFO 在 `AR` 任务上拿到 1.0000 F1。`AR` 考的是"信息不在对话里时应当拒答"，一个
+敢自由弃答的系统能在这一项直接封顶，所以 `AR` 的分数必须与其余八个任务分开看，不能并入同一个
+平均分。
+
+**评测口径**：MindBridge 走自己的生产写路径（对话经 `remember` 写入、图片经 `observe` 触发感知，
+问题经 `recall` 取证据后再作答），不是把对话原文或图片直接塞进答题模型的上下文。引用本表数字作
+对照时必须同时点名 MindBridge 一侧实际使用的答题模型与 judge，否则两个数字不可比；MindBridge
+目前在 Mem-Gallery 上没有已发布的分数。
+
 ## 4. 达成 SOTA 前必须补齐的工程项
 
 ### 4.1 已落地
