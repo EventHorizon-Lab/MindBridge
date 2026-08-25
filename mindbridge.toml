@@ -52,6 +52,16 @@ plugin = "openai"
 # concurrency = 8
 # vram_budget_gib = 48
 
+# Which tenants the built-in Celery beat schedule sweeps, and how often a tick comes. Commented
+# out because naming no tenant is the off-switch: with this unset, no schedule and no task are
+# registered at all and the observation worker is exactly what it was. One tick sweeps one tenant
+# by rotation, so the interval bounds consolidation's whole share of the generator however many
+# tenants are listed. Nothing above a single clip exists until this runs -- no Episode, no Claim,
+# no Summary -- so a deployment that wants recall to see more than individual moments turns it on.
+[consolidation]
+# tenant_ids = "tenant_01,tenant_02"
+# interval_seconds = 3600
+
 # Unset `level` is INFO; unset `format` gets the readable form on a terminal and the parseable
 # one in a pipe.
 [log]

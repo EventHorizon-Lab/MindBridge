@@ -12,10 +12,15 @@ from mindbridge.benchmarks.locomo_refined import (
     LoCoMoRefinedQuestion,
     LoCoMoRefinedTurn,
 )
-from mindbridge.benchmarks.runtime import benchmark_tenant_id
+from mindbridge.benchmarks.runtime import (
+    answer_failure_trace_id,
+    benchmark_tenant_id,
+    settle_answers,
+)
 from mindbridge.contracts import (
     ContractModel,
     Identifier,
+    NonEmptyString,
     RecallQuery,
     RecallRequest,
     RememberRequest,
@@ -45,6 +50,7 @@ class LoCoMoRefinedPrediction(ContractModel):
     mindbridge_confidence: float = Field(ge=0.0, le=1.0)
     mindbridge_prediction_context: tuple[Identifier, ...]
     mindbridge_trace_id: Identifier
+    mindbridge_error_code: NonEmptyString | None = None
     mindbridge_ingest_failure_count: int = Field(default=0, ge=0)
 
 
@@ -73,21 +79,47 @@ async def run_locomo_refined_conversation(
     dialog_id_by_memory_id = {
         outcome[1]: outcome[0] for outcome in remembered if not isinstance(outcome, BaseException)
     }
-    return tuple(
-        await asyncio.gather(
-            *(
-                _answer_question(
-                    memory,
-                    tenant_id,
-                    question,
-                    dialog_id_by_memory_id,
-                    recall_limit,
-                    semaphore,
-                    ingest_failures,
-                )
-                for question in conversation.questions
+    answers = await asyncio.gather(
+        *(
+            _answer_question(
+                memory,
+                tenant_id,
+                question,
+                dialog_id_by_memory_id,
+                recall_limit,
+                semaphore,
+                ingest_failures,
             )
-        )
+            for question in conversation.questions
+        ),
+        return_exceptions=True,
+    )
+    return settle_answers(
+        conversation.questions,
+        answers,
+        lambda question, code: _failed_prediction(question, code, ingest_failures),
+    )
+
+
+def _failed_prediction(
+    question: LoCoMoRefinedQuestion,
+    error_code: str,
+    ingest_failures: int,
+) -> LoCoMoRefinedPrediction:
+    """Represent a question whose recall raised as the wrong answer the official scorer reads.
+
+    The empty string is how `run_eval.sh` already represents a wrong answer, so the row still
+    scores; `mindbridge_error_code` is what keeps it from being read as an abstention.
+    """
+    return LoCoMoRefinedPrediction(
+        qa_id=question.question_id,
+        predicted_answer="",
+        mindbridge_answered=False,
+        mindbridge_confidence=0.0,
+        mindbridge_prediction_context=(),
+        mindbridge_trace_id=answer_failure_trace_id(question.question_id),
+        mindbridge_error_code=error_code,
+        mindbridge_ingest_failure_count=ingest_failures,
     )
 
 

@@ -132,6 +132,7 @@ KNOWN_SCALAR_KEYS: Mapping[str, tuple[str, ...]] = {
     "object_storage": ("bucket", "endpoint_url", "public_endpoint_url"),
     "embedding": ("dimension", "space_id"),
     "worker": ("concurrency", "vram_budget_gib"),
+    "consolidation": ("tenant_ids", "interval_seconds"),
     "log": ("level", "format"),
     "aml": ("tenant_prefix",),
 }

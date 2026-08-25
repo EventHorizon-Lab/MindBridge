@@ -22,6 +22,7 @@ import asyncio
 import re
 from collections import defaultdict
 from collections.abc import Callable, Iterable
+from functools import partial
 from importlib import import_module
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -31,9 +32,11 @@ from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, TypeAdapter, m
 from mindbridge.benchmarks.prompts import VIDEO_MME_V2_QUERY_PROMPT
 from mindbridge.benchmarks.runtime import (
     PreparedVideo,
+    answer_failure_trace_id,
     benchmark_tenant_id,
     ingest_prepared_video,
     prepared_video_end,
+    settle_answers,
 )
 from mindbridge.contracts import (
     ContractModel,
@@ -345,20 +348,30 @@ async def run_video_mme_v2_group(
     cutoff = prepared_video_end(prepared)
     answers: list[VideoMMEV2QuestionResult] = []
     for offset in range(0, len(annotation.questions), request_concurrency):
-        answers.extend(
-            await asyncio.gather(
-                *(
-                    _answer_question(
-                        memory,
-                        tenant_id,
-                        question,
-                        cutoff,
-                        recall_limit,
-                        semaphore,
-                        ingest_failures,
-                    )
-                    for question in annotation.questions[offset : offset + request_concurrency]
+        cohort = annotation.questions[offset : offset + request_concurrency]
+        answered = await asyncio.gather(
+            *(
+                _answer_question(
+                    memory,
+                    tenant_id,
+                    question,
+                    cutoff,
+                    recall_limit,
+                    semaphore,
+                    ingest_failures,
                 )
+                for question in cohort
+            ),
+            return_exceptions=True,
+        )
+        # A raising recall costs its own question, not the group. `VideoMMEV2GroupResult`
+        # requires all four rows, so an escaping exception took the whole group's rating with
+        # it and then ended the run, because the CLI awaits each group in turn. It matters
+        # more here than in any per-question benchmark: the rating is defined over whole
+        # groups only, so a group short of a row cannot be scored at all.
+        answers.extend(
+            settle_answers(
+                cohort, answered, partial(_failed_result, ingest_failures=ingest_failures)
             )
         )
     return VideoMMEV2GroupResult(
@@ -569,6 +582,29 @@ async def _answer_question(
         memory_ids=tuple(item.memory_id for item in result.memories),
         evidence_ids=tuple(item.evidence_id for item in result.evidence),
         trace_id=result.trace_id,
+        ingest_failures=ingest_failures,
+    )
+
+
+def _failed_result(
+    question: VideoMMEV2Question,
+    error_code: str,
+    *,
+    ingest_failures: int,
+) -> VideoMMEV2QuestionResult:
+    """One row for a question whose recall raised, so its group still scores four of them.
+
+    `response` is empty, which the released scorer counts wrong, and `mindbridge_error_code`
+    is what keeps a transport failure from reading as a model that answered badly.
+    """
+    return _question_result(
+        question,
+        model_answer="",
+        confidence=0.0,
+        memory_ids=(),
+        evidence_ids=(),
+        trace_id=answer_failure_trace_id(question.question_id),
+        error_code=error_code,
         ingest_failures=ingest_failures,
     )
 

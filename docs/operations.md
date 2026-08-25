@@ -147,6 +147,11 @@ generator. Read `claimable` against `queue_depth`. A non-zero count beside an em
 is exactly this divergence; a non-zero count beside a deep queue usually just means the workers
 are behind.
 
+`queue_depth` is the sum across every queue the worker consumes — `mindbridge` and its eight
+per-tenant shards — not one of them. That is what the withholding arithmetic below subtracts from,
+so a depth covering one shard would withhold an eighth of the backlog and republish the rest as
+duplicates. It also means the number will not match `LLEN mindbridge` on the broker.
+
 What `--republish` then does depends on the scope, and the report's `withheld` field says which
 happened. Across the whole ledger it publishes only the difference — the queue already holds a
 message for the rest, and duplicating those is not free: the delivery that loses the claim
@@ -163,9 +168,9 @@ successful one. Field-by-field meanings are in the [CLI reference](api/cli.md#mi
 
 Two cautions. `--include-failed` is off by default because a deterministic failure republished on a
 timer pays for the same rejection every time — republish `failed` rows once you know why they
-failed, not on a schedule. And kombu publishes with `LPUSH` while the worker consumes with `RPOP`,
-so a republished job waits behind everything already queued: on a deep queue, expect the repair to
-take effect slowly rather than assuming it did not work.
+failed, not on a schedule. And a repair is published at a priority the broker drains ahead of fresh
+work, on the shard it belongs to, so it does not wait behind the backlog it repairs; before that was
+true, six republishes of one job across 84 minutes moved its attempt count not at all.
 
 Under row-level security a cross-tenant scan returns no rows rather than failing, so a confined
 role reading "nothing to repair" is the one answer you cannot trust. Pass `--tenant-id`, or use a
@@ -173,8 +178,73 @@ role that can see every tenant; the command refuses rather than guessing.
 
 ## Scheduling
 
-Both commands are one-shot, idempotent, and tenant-scoped. Use the deployment's existing control
-plane.
+Both commands are one-shot, idempotent, and tenant-scoped. Either drive them from the
+deployment's existing control plane, or — for consolidation only — turn on the built-in Celery
+beat schedule below.
+
+### Built-in consolidation schedule
+
+Consolidation is the sweep that has to run for recall to see anything above a single clip: with
+no Episode, Claim, or Summary records, a query can only ever come back with the individual
+moments it matched. A nine-benchmark evaluation produced **zero summary-tier records**, because
+nothing was calling the command.
+
+Two variables turn it on, read by the same Celery app the worker already uses:
+
+```bash
+export MINDBRIDGE_CONSOLIDATION_TENANT_IDS=tenant_01,tenant_02
+export MINDBRIDGE_CONSOLIDATION_INTERVAL_SECONDS=3600   # optional, this is the default
+```
+
+Then run beat, and a worker for the queue the sweep is routed to:
+
+```bash
+celery -A mindbridge.celery_app:app beat --loglevel=INFO
+celery -A mindbridge.celery_app:app worker -Q mindbridge_consolidation --concurrency=1
+```
+
+Both processes need the same two variables: beat decides *when*, the worker decides *which
+tenant*, and they have to agree on the list.
+
+**One tick sweeps one tenant, by rotation.** The interval is therefore a ceiling on
+consolidation's whole share of the generator, not a per-tenant cadence: two tenants at an hour
+each get swept once every two hours. Raising the tenant count never raises the load; it lengthens
+the rotation. The tick's tenant is derived from the clock rather than a stored counter, so beat
+restarts and worker recycles need nothing to stay in step, and a missed tick skips one tenant
+until the rotation comes round again.
+
+The scheduled sweep runs with `--skip-entity-resolution`. Entity resolution is the sweep that
+opens media and spends a generator call per candidate pair, and it stays a deliberate
+`mindbridge consolidate` invocation on its own rarer cadence.
+
+### What a running sweep does to ingest
+
+| Resource | Shared with ingest? |
+| --- | --- |
+| Celery queue | **No.** The task is routed to `mindbridge_consolidation`; the observation queues are `mindbridge` and its shards, and a worker started with no `-Q` consumes those and not this one. A sweep never takes a worker slot or a queue position from an observation. |
+| Generator endpoint | **Yes.** Episode, Claim, and Summary pages run strictly one after another, so a sweep holds **at most one concurrent generator call** for as long as it runs. |
+| PostgreSQL | Yes. The consolidation worker opens its own pool — count it in `MINDBRIDGE_DATABASE_MAX_POOL_SIZE`, which is per process. |
+| Object storage | Only through entity resolution, which the schedule skips. |
+
+For scale: the 2026-08-24 evaluation measured its generator endpoint at 816 / 1010 / 1680 video
+calls per hour at 4 / 12 / 24 concurrent calls. One concurrent call is the smallest share of that
+a background job can take.
+
+Two independent ways to turn it off, and neither needs the API or the observation workers
+restarted:
+
+- Stop the `-Q mindbridge_consolidation` worker. Queued ticks expire after one interval, so
+  nothing accumulates and nothing runs when it comes back.
+- Unset `MINDBRIDGE_CONSOLIDATION_TENANT_IDS` and restart beat. With no tenant list there is no
+  schedule and no task at all.
+
+A sweep still runs under the app-wide Celery task budget, which is sized for one observation. A
+tenant with a large unconsolidated backlog — a first run, or a bulk import — will exceed it and
+be cut off, and because the sweep's cursor lives for one run, the next tick restarts from the
+beginning. Prime such a tenant once from the command line, which has no deadline, and let the
+schedule carry the increment from then on.
+
+### External schedulers
 
 ```yaml
 apiVersion: batch/v1
@@ -204,7 +274,8 @@ Offset the schedules of different tenants. Every tenant sweeping on the hour tur
 bill into a spike.
 
 Both commands print one JSON object on stdout. Capture it: it is the record of what the sweep did,
-and the only place the dropped-pair counts appear.
+and the only place the dropped-pair counts appear. The beat-scheduled sweep has no stdout to
+capture, so it logs the same object as the fields of a `consolidation sweep complete` record.
 
 ## Logs
 

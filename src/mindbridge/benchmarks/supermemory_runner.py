@@ -4,16 +4,19 @@ from __future__ import annotations
 
 import asyncio
 from datetime import timedelta
+from functools import partial
 from itertools import groupby, pairwise
 from pathlib import Path
 
 from pydantic import AwareDatetime, Field, model_validator
 
 from mindbridge.benchmarks.runtime import (
+    answer_failure_trace_id,
     benchmark_tenant_id,
     ingest_media,
     multiple_choice_query,
     parse_option_ranking,
+    settle_answers,
 )
 from mindbridge.benchmarks.supermemory_vqa import (
     SUPERMEMORY_VQA_ADAPTER_VERSION,
@@ -139,6 +142,7 @@ class SuperMemoryQuestionResult(ContractModel):
     mindbridge_memory_ids: tuple[Identifier, ...]
     mindbridge_evidence_ids: tuple[Identifier, ...]
     mindbridge_trace_id: Identifier
+    mindbridge_error_code: NonEmptyString | None = None
     mindbridge_ingest_failure_count: int = Field(default=0, ge=0)
 
     @model_validator(mode="after")
@@ -244,13 +248,20 @@ async def run_supermemory_vqa(
         ingest_failures += _count_ingest_failures(
             await asyncio.gather(*due_segments, return_exceptions=True)
         )
-        results = await asyncio.gather(
+        cohort = tuple(group)
+        outcomes = await asyncio.gather(
             *(
                 _answer_question(
                     memory, tenant_id, question, recall_limit, semaphore, ingest_failures
                 )
-                for question in group
-            )
+                for question in cohort
+            ),
+            return_exceptions=True,
+        )
+        results = settle_answers(
+            cohort,
+            outcomes,
+            partial(_failed_result, ingest_failures=ingest_failures),
         )
         answers.update((result.question_id, result) for result in results)
     return tuple(answers[question.question_id] for question in questions)
@@ -396,6 +407,33 @@ async def _answer_question(
         mindbridge_memory_ids=tuple(item.memory_id for item in result.memories),
         mindbridge_evidence_ids=tuple(item.evidence_id for item in result.evidence),
         mindbridge_trace_id=result.trace_id,
+        mindbridge_ingest_failure_count=ingest_failures,
+    )
+
+
+def _failed_result(
+    question: SuperMemoryQuestion,
+    error_code: str,
+    *,
+    ingest_failures: int,
+) -> SuperMemoryQuestionResult:
+    """One row for a question whose recall raised, so its cohort still answers all of them.
+
+    Not `mindbridge_abstained`: the answerer never got to decide anything, and reading a
+    transport failure as an abstention is what makes an infrastructure outage look like a
+    calibrated refusal.
+    """
+    return SuperMemoryQuestionResult(
+        question_id=question.question_id,
+        predicted_option_index=None,
+        ranked_option_indices=(),
+        model_answer="",
+        mindbridge_abstained=False,
+        mindbridge_confidence=0.0,
+        mindbridge_memory_ids=(),
+        mindbridge_evidence_ids=(),
+        mindbridge_trace_id=answer_failure_trace_id(str(question.question_id)),
+        mindbridge_error_code=error_code,
         mindbridge_ingest_failure_count=ingest_failures,
     )
 

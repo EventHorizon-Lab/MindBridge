@@ -13,6 +13,7 @@ from openai import AsyncOpenAI
 from mindbridge import telemetry
 from mindbridge.application.perception import (
     MAX_PERCEIVED_CLAIMS_PER_EVENT,
+    MAX_PERCEIVED_COUNT,
     MAX_PERCEIVED_ENTITIES_PER_EVENT,
     MAX_PERCEPTION_CLAIMS,
     MAX_PERCEPTION_ENTITIES,
@@ -126,7 +127,7 @@ async def test_perception_pipeline_returns_grounded_event_and_its_model() -> Non
         EvidenceId("evidence_audio"),
     )
     assert result.model_reference.model_id == "qwen3.8-max"
-    assert result.prompt_version == "perceive_events_v11"
+    assert result.prompt_version == "perceive_events_v12"
     assert [entity.canonical_name for entity in result.events[0].entities] == [
         "red tool",
         "toolbox",
@@ -845,3 +846,67 @@ async def test_what_was_discarded_reaches_an_operator_with_no_collector(
 
     assert "mindbridge.perception.over_cap_claim_count=104" in caplog.text
     assert "mindbridge.perception.dropped_claim_count=0" in caplog.text
+
+
+def _counting_event(exact_count: object) -> dict[str, object]:
+    """The MM-Lifelong worked example: an interval a counting question is asked about."""
+    return {
+        "start_ms": 0,
+        "end_ms": 4_000,
+        "description": "The player character fights through a forest clearing.",
+        "salience": 0.6,
+        "evidence_ids": ["evidence_video"],
+        "claims": [
+            {
+                "claim_type": "fact",
+                "statement": "Small monsters attack the player character in the clearing.",
+                "confidence": 0.8,
+                "evidence_ids": ["evidence_video"],
+                "valid_from_ms": 0,
+                "valid_to_ms": 4_000,
+                "exact_count": exact_count,
+            }
+        ],
+    }
+
+
+async def test_a_claim_carries_the_count_its_window_contains() -> None:
+    """The number reaches the record as a number, not as a word inside the sentence.
+
+    "how many small monsters" was answered from a store holding "a large, multi-limbed monster",
+    so the count has to be a value the claim carries about its own interval.
+    """
+    result = await _perceive(
+        {"events": [_counting_event({"subject": "small monsters", "value": 3})]}
+    )
+
+    count = result.events[0].claims[0].exact_count
+    assert count is not None
+    assert (count.subject, count.value) == ("small monsters", 3)
+
+
+async def test_a_claim_without_a_count_stays_countless() -> None:
+    """Absence has to stay expressible, or the schema buys fabricated integers."""
+    result = await _perceive({"events": [_counting_event(None)]})
+
+    assert result.events[0].claims[0].exact_count is None
+
+
+@pytest.mark.parametrize(
+    "exact_count",
+    [
+        {"subject": "small monsters", "value": -1},
+        {"subject": "small monsters", "value": MAX_PERCEIVED_COUNT + 1},
+        {"subject": "   ", "value": 3},
+        {"subject": "small monsters"},
+        {"subject": "small monsters", "value": "several"},
+        "three",
+    ],
+)
+async def test_an_unusable_count_costs_the_count_and_not_the_claim(exact_count: object) -> None:
+    """The element the model got wrong is the element that goes, as everywhere else here."""
+    result = await _perceive({"events": [_counting_event(exact_count)]})
+
+    claim = result.events[0].claims[0]
+    assert claim.exact_count is None
+    assert claim.statement == "Small monsters attack the player character in the clearing."
