@@ -18,7 +18,7 @@ uv run --extra server mindbridge lifecycle --help
 | Command | Subcommands |
 | --- | --- |
 | `mindbridge` | `config check`, `consolidate`, `jobs`, `lifecycle`, `mcp`, `jina serve`, `edge sync` |
-| `mindbridge-bench` | `locomo-refined`, `m3`, `egolife`, `egomem`, `egotempo`, `memlens`, `mm-lifelong`, `supermemory`, `video-mme`, `aml` |
+| `mindbridge-bench` | `locomo-refined`, `m3`, `egolife`, `egomem`, `egotempo`, `memlens`, `mm-lifelong`, `supermemory`, `video-mme`, `video-mme-v2`, `aml` |
 | `mindbridge-bench` support | `score`, `datasets`, `jina`, `bakeoff` |
 
 `mindbridge-consolidate`, `mindbridge-lifecycle`, and `mindbridge-mcp` remain as aliases for the
@@ -402,6 +402,7 @@ uv run mindbridge-bench
 | `mm-lifelong` | — | MM-Lifelong |
 | `supermemory` | — | SuperMemory VQA |
 | `video-mme` | `benchmarks` | Video-MME |
+| `video-mme-v2` | `benchmarks` | Video-MME-v2 |
 | `aml` | — | Agent Memory Leaderboard offline replay |
 
 | Support command | Extra | Purpose |

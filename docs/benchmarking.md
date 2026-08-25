@@ -68,7 +68,7 @@ uv run mindbridge-bench m3 --help
 ```
 
 Most runners need nothing past the core install because they drive the product through its own
-API. `video-mme` and `datasets` need `--extra benchmarks`; `jina` and `bakeoff` load the local
+API. `video-mme`, `video-mme-v2`, and `datasets` need `--extra benchmarks`; `jina` and `bakeoff` load the local
 embedder and need `--extra cloud-models`. A runner whose extra is missing names it and exits
 instead of failing part-way through a run.
 
@@ -248,8 +248,9 @@ curl -s "$MINDBRIDGE_GENERATOR_ENDPOINT/chat/completions" -H "Authorization: Bea
 
 ## Benchmark dataset smoke
 
-LoCoMo-Refined, M3-Bench, Video-MME, EgoLife (EgoLifeQA), EgoTempo, EgoMemReason, MEMLENS,
-MM-Lifelong, and SuperMemory-VQA are consumed through thin adapters over pinned official files. Use Git for code
+LoCoMo-Refined, M3-Bench, Video-MME, Video-MME-v2, EgoLife (EgoLifeQA), EgoTempo, EgoMemReason,
+MEMLENS, MM-Lifelong, and SuperMemory-VQA are consumed through thin adapters over pinned official
+files. Use Git for code
 releases and the Hugging Face CLI for Hub datasets; MindBridge does not ship another downloader:
 
 ```bash
@@ -259,6 +260,11 @@ uvx --from huggingface-hub hf download lmms-eval/Video-MME \
   videomme/test-00000-of-00001.parquet \
   --repo-type dataset \
   --local-dir .benchmarks/video-mme
+uvx --from huggingface-hub hf download MME-Benchmarks/Video-MME-v2 \
+  test.parquet subtitle.zip \
+  --repo-type dataset \
+  --revision 6e4bebb03202e1ddbf3d37703e560e51c5aa2d64 \
+  --local-dir .benchmarks/video-mme-v2
 uvx --from huggingface-hub hf download lmms-lab/EgoLife \
   EgoLifeQA/EgoLifeQA_A1_JAKE.json \
   --repo-type dataset \
@@ -286,6 +292,7 @@ uv run --extra benchmarks mindbridge-bench datasets \
   --m3-robot .benchmarks/m3-agent/data/annotations/robot.json \
   --m3-web .benchmarks/m3-agent/data/annotations/web.json \
   --video-mme .benchmarks/video-mme/videomme/test-00000-of-00001.parquet \
+  --video-mme-v2 .benchmarks/video-mme-v2/test.parquet \
   --egolife .benchmarks/egolife/EgoLifeQA/EgoLifeQA_A1_JAKE.json \
   --egotempo .benchmarks/egotempo/egotempo_openQA.json \
   --egomem .benchmarks/egomem-reason/annotations_public.jsonl \
@@ -756,6 +763,65 @@ uv run --extra benchmarks mindbridge-bench video-mme \
   --transcript-source none \
   --run-id video-mme-001
 ```
+
+### Video-MME-v2
+
+A separate benchmark from Video-MME, not a newer split of it. 800 videos, 3,200 questions, options
+A through H, no short/medium/long bands. Its unit of scoring is a **group**: the four questions over
+one video, scored together.
+
+The runner reuses the prepared-video manifest shape above, keyed on the official numeric `video_id`.
+Media is 97.8 GiB across 40 zips, so acquire it separately from the annotations:
+
+```bash
+uvx --from huggingface-hub hf download MME-Benchmarks/Video-MME-v2 \
+  --include "videos/*" \
+  --repo-type dataset \
+  --revision 6e4bebb03202e1ddbf3d37703e560e51c5aa2d64 \
+  --local-dir .benchmarks/video-mme-v2
+```
+
+Two numbers are reported, reproducing the released `_rating.json` and `_acc.json` cell for cell:
+
+- `metrics.rating` is the leaderboard number, averaged over whole **groups** on a 0-100 scale. A
+  `relevance` group scores on how many of its four are correct, quadratically: one of four is worth
+  6.25, four of four is worth 100. A `logic` group scores on the longest unbroken correct prefix of
+  its dependency chain, so a group that misses question 1 earns nothing for a correct 2 through 4.
+- `metrics.accuracy` is plain per-question accuracy with the same breakdowns.
+
+Both break out by `group_type`, `level`, `second_head`, and `third_head`. Note that the rating's
+taxonomy cells are keyed on each group's **fourth** question, which is what the released scorer
+reads; `level`, `second_head`, and `third_head` all vary inside a group, so the two views key the
+same field differently on purpose.
+
+Scores are on the released 0-100 scale, unlike Video-MME's 0-1 fractions, and the naming of the
+accuracy fields is inverted relative to it: here `overall` counts every question and scores an
+abstention wrong, matching the released `_acc.json`, while `answered_accuracy` is the answered-only
+figure the same script only prints. Quote `rating.overall` against the leaderboard; quote
+`accuracy.overall` only alongside it, because the gap between them is what the benchmark was rebuilt
+to expose.
+
+`--video-id` scopes a run and always carries all four of a video's questions, because a partial
+group has no defined rating. There is deliberately no `--level` counterpart to Video-MME's
+`--duration`: `level` varies between the questions of a group, so filtering on it would either split
+a group or silently mean "groups whose fourth question is level N". `--group-type` is available and
+is safe, being constant across a group. `--transcript-source` behaves as it does for Video-MME:
+
+```bash
+uv run --extra benchmarks mindbridge-bench video-mme-v2 \
+  --dataset .benchmarks/video-mme-v2/test.parquet \
+  --prepared-media .benchmarks/video-mme-v2-prepared.json \
+  --output .benchmarks/results/video-mme-v2.json \
+  --api-base-url http://localhost:8000 \
+  --deployment-config .benchmarks/deployment.json \
+  --transcript-source none \
+  --run-id video-mme-v2-001
+```
+
+The released subtitles are word-level JSONL (`{"text": ..., "start_time": ..., "end_time": ...}`),
+one file per video in `subtitle.zip`. Grouping those words into segment transcripts happens in
+whatever prepares the media manifest; the runner only checks that what it was handed agrees with
+the `--transcript-source` the run declares.
 
 EgoTempo writes the official `V`, `Q`, `QA`, `A`, `C`, and `M` fields. Run its pinned
 `gemini_eval.ipynb` for the released semantic judge rather than substituting a local metric:
