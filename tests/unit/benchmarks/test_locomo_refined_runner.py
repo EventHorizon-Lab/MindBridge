@@ -219,3 +219,60 @@ def _conversation() -> LoCoMoRefinedConversation:
             ),
         ),
     )
+
+
+async def test_locomo_refined_keeps_answers_when_one_question_recall_raises() -> None:
+    """One raising recall used to discard every answer beside it: 65.2% of a run's questions."""
+
+    class FailingRecallApi(RecordingMemoryApi):
+        async def recall(self, request: RecallRequest) -> RecallResult:
+            assert request.query.text is not None
+            if "second" in request.query.text:
+                raise MindBridgeError(
+                    "recall failed",
+                    code="model_unavailable",
+                    status_code=503,
+                    trace_id="trace_recall_error",
+                )
+            return await super().recall(request)
+
+    api = FailingRecallApi()
+    api.answer = "A new course."
+    conversation = _conversation().model_copy(
+        update={
+            "questions": tuple(
+                LoCoMoRefinedQuestion(
+                    question_id=f"conv-26#q000{index}",
+                    question=f"What happened {word}?",
+                    reference_answers=("Hello",),
+                    evidence_dialog_ids=("D1:1",),
+                    category=1,
+                    is_multi_modality=False,
+                )
+                for index, word in enumerate(("first", "second", "third"))
+            )
+        }
+    )
+
+    predictions = await run_locomo_refined_conversation(
+        cast(MindBridge, api), conversation, run_id="run_01"
+    )
+
+    # One row per loaded question, in load order, or the official scorer silently grades a
+    # shorter run than the one that was launched.
+    assert [prediction.qa_id for prediction in predictions] == [
+        "conv-26#q0000",
+        "conv-26#q0001",
+        "conv-26#q0002",
+    ]
+    assert [prediction.mindbridge_error_code for prediction in predictions] == [
+        None,
+        "model_unavailable",
+        None,
+    ]
+    assert [prediction.predicted_answer for prediction in predictions] == [
+        "A new course.",
+        "",
+        "A new course.",
+    ]
+    assert predictions[1].mindbridge_answered is False

@@ -15,8 +15,10 @@ from mindbridge.benchmarks.m3_bench import (
     M3BenchVideo,
 )
 from mindbridge.benchmarks.runtime import (
+    answer_failure_trace_id,
     benchmark_tenant_id,
     ingest_media,
+    settle_answers,
 )
 from mindbridge.contracts import (
     ContractModel,
@@ -342,13 +344,24 @@ async def _answer_questions(
     semaphore: asyncio.Semaphore,
     ingest_failures: int,
 ) -> dict[str, M3OfficialQuestionResult]:
-    results = await asyncio.gather(
+    outcomes = await asyncio.gather(
         *(
             _answer_question(
                 memory, tenant_id, question, cutoff, recall_limit, semaphore, ingest_failures
             )
             for question in questions
-        )
+        ),
+        return_exceptions=True,
+    )
+    results = settle_answers(
+        questions,
+        outcomes,
+        lambda question, code: _failed_result(
+            question,
+            error_code=code,
+            trace_id=answer_failure_trace_id(question.question_id),
+            ingest_failures=ingest_failures,
+        ),
     )
     return {result.id: result for result in results}
 
@@ -383,20 +396,11 @@ async def _answer_question(
             "model_unavailable",
         }:
             raise
-        return M3OfficialQuestionResult(
-            id=question.question_id,
-            question=question.question,
-            answer=question.reference_answer,
-            type=question.question_types,
-            timestamp_seconds=question.timestamp_seconds,
-            before_clip=question.before_clip_index,
-            response="",
-            mindbridge_confidence=0.0,
-            mindbridge_memory_ids=(),
-            mindbridge_evidence_ids=(),
-            mindbridge_trace_id=(error.trace_id or f"trace_model_error_{question.question_id}"),
-            mindbridge_error_code=error.code,
-            mindbridge_ingest_failure_count=ingest_failures,
+        return _failed_result(
+            question,
+            error_code=error.code,
+            trace_id=error.trace_id or f"trace_model_error_{question.question_id}",
+            ingest_failures=ingest_failures,
         )
     return M3OfficialQuestionResult(
         id=question.question_id,
@@ -410,6 +414,31 @@ async def _answer_question(
         mindbridge_memory_ids=tuple(memory.memory_id for memory in result.memories),
         mindbridge_evidence_ids=tuple(evidence.evidence_id for evidence in result.evidence),
         mindbridge_trace_id=result.trace_id,
+        mindbridge_ingest_failure_count=ingest_failures,
+    )
+
+
+def _failed_result(
+    question: M3BenchQuestion,
+    *,
+    error_code: str,
+    trace_id: str,
+    ingest_failures: int,
+) -> M3OfficialQuestionResult:
+    """One row for a question whose recall never returned, carrying why."""
+    return M3OfficialQuestionResult(
+        id=question.question_id,
+        question=question.question,
+        answer=question.reference_answer,
+        type=question.question_types,
+        timestamp_seconds=question.timestamp_seconds,
+        before_clip=question.before_clip_index,
+        response="",
+        mindbridge_confidence=0.0,
+        mindbridge_memory_ids=(),
+        mindbridge_evidence_ids=(),
+        mindbridge_trace_id=trace_id,
+        mindbridge_error_code=error_code,
         mindbridge_ingest_failure_count=ingest_failures,
     )
 

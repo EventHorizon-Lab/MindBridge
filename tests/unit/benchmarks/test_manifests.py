@@ -46,6 +46,7 @@ def test_dataset_adapter_manifest_matches_current_schema() -> None:
         "M3-Bench-robot": 1_276,
         "M3-Bench-web": 3_214,
         "Video-MME": 2_700,
+        "Video-MME-v2": 3_200,
         "EgoLifeQA": 500,
         "EgoTempo": 500,
         "EgoMemReason": 500,

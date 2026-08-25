@@ -17,7 +17,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TypeVar
+from typing import Literal, TypeVar
 
 from pydantic import AwareDatetime, Field
 
@@ -28,10 +28,18 @@ from mindbridge.benchmarks.artifacts import (
     write_text_atomically,
 )
 from mindbridge.benchmarks.cli import parser as build_parser
+from mindbridge.benchmarks.runtime import PreparedVideo
 from mindbridge.contracts import ContractModel, Identifier, NonEmptyString, Sha256Hex
 from mindbridge.models import EmbedTask
 from mindbridge.prompts import ANSWER_FROM_EVIDENCE_PROMPT
 from mindbridge.sdk import MindBridge
+
+TranscriptSource = Literal["none", "asr", "official_subtitles"]
+"""Which official transcript a run ingested, if any.
+
+Both Video-MME releases publish separate with- and without-subtitle columns, so which one a
+number belongs in is not recoverable from the number itself.
+"""
 
 _Item = TypeVar("_Item")
 _Prepared = TypeVar("_Prepared")
@@ -150,6 +158,40 @@ def add_media_arguments(
         help="deadline for one observation to finish processing",
     )
     return parser
+
+
+def add_transcript_source_argument(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    """Require a run to declare which official transcript, if any, it ingested."""
+    parser.add_argument(
+        "--transcript-source",
+        required=True,
+        choices=("none", "asr", "official_subtitles"),
+        help="which official transcript this run ingests, if any",
+    )
+    return parser
+
+
+def require_declared_transcripts(
+    prepared: tuple[PreparedVideo, ...],
+    transcript_source: TranscriptSource,
+) -> None:
+    """Refuse a run whose declared subtitle setting disagrees with its prepared media.
+
+    Shared rather than copied per benchmark: the failure it prevents is a number filed under
+    the wrong leaderboard column, which no later check can detect from the artifact alone.
+    """
+    present = any(
+        segment.transcript is not None for video in prepared for segment in video.segments
+    )
+    if present and transcript_source == "none":
+        raise ValueError(
+            "prepared media carries transcripts; a run declaring no transcript source would "
+            "report a with-subtitles result in the without-subtitles column"
+        )
+    if not present and transcript_source != "none":
+        raise ValueError(
+            f"prepared media carries no transcript, so it cannot be {transcript_source}"
+        )
 
 
 def report(message: str, *, quiet: bool) -> None:

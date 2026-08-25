@@ -93,6 +93,7 @@ from mindbridge.core import (
     VerificationStatus,
     derive_stable_id,
 )
+from mindbridge.infrastructure._postgres_jobs import OBSERVATION_JOB_STALE_AFTER_SECONDS
 from mindbridge.infrastructure.postgres import PostgresMemoryStore
 from mindbridge.media.clipping import ClipRequest, MediaClip, audio_windows
 from mindbridge.models import (
@@ -1819,12 +1820,24 @@ async def _age_running_job(
 ) -> None:
     connection = await AsyncConnection.connect(database_url)
     async with connection:
+        # `created_at` moves with it: a row whose last update precedes its own creation is one
+        # no writer can produce, and `ObservationProcessingJob` rejects it on the read path --
+        # so a fixture shaped that way fails an unacquired claim with an invariant error rather
+        # than the behaviour under test. The interval is read from the window itself, because a
+        # literal here stops ageing the row the moment that constant moves.
         await connection.execute(
             """
-            UPDATE jobs SET updated_at = now() - interval '961 seconds'
+            UPDATE jobs
+            SET created_at = created_at - make_interval(secs => %s),
+                updated_at = now() - make_interval(secs => %s)
             WHERE tenant_id = %s AND job_id = %s
             """,
-            (tenant_id, job_id),
+            (
+                OBSERVATION_JOB_STALE_AFTER_SECONDS + 1,
+                OBSERVATION_JOB_STALE_AFTER_SECONDS + 1,
+                tenant_id,
+                job_id,
+            ),
         )
 
 

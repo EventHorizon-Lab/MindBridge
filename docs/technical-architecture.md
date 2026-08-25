@@ -358,7 +358,7 @@ PostgreSQL 事务中写入 Event、Entity、EntityMention、Claim、MemoryRecord
 可能过期的地址；重试使用稳定 ID 且不会合并不同的证据集合。跨 Event 实体消歧、Episode
 合并和多次经历归纳属于后续 Consolidation，不在在线写入路径中凭名称猜测。
 
-当前 `perceive_events_v9` 直接吸收 M3-Agent/TaskMem 已验证有效的原子事件、稳定人物 ID、外观变化、
+当前 `perceive_events_v12` 直接吸收 M3-Agent/TaskMem 已验证有效的原子事件、稳定人物 ID、外观变化、
 对话、关系和因果线索要求，但没有照搬其可直接输出 `Equivalence` 的做法：身份关联仍由端侧可撤销
 证据门禁负责。Prompt 还要求推断的意图/关系写出可见或可闻依据并降低 confidence，片段边界不得把
 未完成动作写成完成事实。它还要求先独立盘点视觉变化、语音/环境声、OCR 和身份轨迹，再做跨模态
@@ -445,7 +445,7 @@ entry point `mindbridge.generators`、`mindbridge.embedders` 发现；进程只�
 - 同一个模型同时覆盖派生文本和原始媒体，检索两侧不存在跨编码器对齐假设；
 - 支持 retrieval 专用的 query/document 编码；
 - 支持 Matryoshka 截断维度，便于端侧或低成本索引试验；
-- 可以通过 Hugging Face 和 vLLM 生态直接使用，不需要自研加载和 serving。
+- 可以通过 Hugging Face SentenceTransformers 直接加载完整多模态处理链。
 
 首版约定：
 
@@ -458,12 +458,11 @@ entry point `mindbridge.generators`、`mindbridge.embedders` 发现；进程只�
 - 切换模型时创建新向量版本并后台重建，不原地混用不同空间。
 
 生产实现只使用一个编码器 `jina-embeddings-v5-omni-small-retrieval`；query 与 document
-的差别完全由 retrieval prompt
-承担，不由模型承担。编码器仍然分布在不同进程中：Memory Worker 通过 Hugging Face
-`sentence-transformers` 的 `encode_document()` 生成 EvidenceSpan 向量，并通过 vLLM
-OpenAI-compatible endpoint 批量生成 Event/Claim/Summary document 向量；API 通过同一个 endpoint
-生成 query 向量并编码显式记忆。文本请求使用 OpenAI SDK 的 `embeddings.create()`；SDK 尚未声明
-类型的多模态 `messages` 也只通过同一 SDK 的低层 `post()` 发送，不另写 HTTP 客户端。数据库按
+的差别完全由 retrieval prompt 承担，不由模型承担。独立的 `mindbridge jina serve` 进程通过
+SentenceTransformers 的 `encode_query()` 和 `encode_document()` 加载一次模型；API 与 Worker
+通过同一个 OpenAI-compatible endpoint 批量生成所有向量。文本请求使用 OpenAI SDK 的
+`embeddings.create()`；SDK 尚未声明类型的多模态 `input` 也只通过同一 SDK 的低层 `post()`
+发送，不另写 HTTP 客户端。数据库按
 `space_id` 检索、按 `model_id` 保留真实生产者；升级编码器创建新空间并
 重建，不把未经验证的版本混查。API 因此不加载 Jina 权重，模型只存在于 Worker 或独立 serving
 进程。
@@ -1038,7 +1037,8 @@ Tool 是请求/响应语义，在没有真实调用方要求前不为它发明�
 | 模型加载 | `transformers`、`sentence-transformers` | tokenizer、processor、pooling、批处理 |
 | 模型和数据下载 | `huggingface_hub` | 自写下载器、缓存和断点逻辑 |
 | Benchmark 数据 | `datasets`，优先官方 loader | 手工抓取和私有数据格式 |
-| 云端模型 serving | vLLM/OpenAI-compatible server | 自研推理 HTTP 协议 |
+| Jina embedding serving | SentenceTransformers + FastAPI | 自研模型预处理、pooling 和推理 HTTP 协议 |
+| 生成模型 serving | OpenAI-compatible server | 自研推理 HTTP 协议 |
 | 兼容模型调用 | `openai.AsyncOpenAI(base_url=...)` | `requests`/`httpx` 手写供应商接口 |
 | 非 OpenAI-compatible 服务 | 服务官方 SDK | 通用 REST 包装器 |
 | 端侧媒体与推理 | GStreamer/FFmpeg + 平台原生 runtime（ONNX Runtime EP、TensorRT/DeepStream、OpenVINO、RKNN、地瓜 BPU） | 自研解码、帧管线、runtime 和跨平台抽象层 |
@@ -1080,8 +1080,8 @@ OpenAI Adapter 默认省略 `reasoning_effort`，确保非推理模型和不同 
 才通过同一个 `Generator`、同一上下文和 `json_mode=True` 重试一次。正常请求不承担 JSON mode 的
 质量偏移，fallback 也不切换插件、模型或无限重试。
 
-音频内容块保留服务端的真实兼容契约：Qwen Chat 使用 URL 型 `input_audio`，vLLM 多模态
-Embedding 使用 `audio_url`。两者共享 OpenAI SDK 和图像/视频构造，但不把这两个不同的音频
+音频内容块保留服务端的真实兼容契约：Qwen Chat 使用 URL 型 `input_audio`，Jina embedding
+服务使用 `audio_url`。两者共享 OpenAI SDK 和图像/视频构造，但不把这两个不同的音频
 schema 伪装成一个通用格式。
 
 ## 11. 工程实现规范（强制）
@@ -1336,7 +1336,7 @@ Cloud
 ├── PostgreSQL + pgvector
 ├── S3-compatible object storage
 ├── Redis + Celery
-└── model endpoints      # vLLM / provider APIs
+└── model endpoints      # Jina SentenceTransformers / provider APIs
 ```
 
 API 和 Worker 可以使用同一个 Python package、两个进程部署。只有当吞吐、故障域或团队边界证明需要时，才将 ingestion、recall、lifecycle 或 model serving 拆成独立服务。
@@ -1348,20 +1348,20 @@ clip 的 PyAV、Pillow、SoundFile 解码器只声明在这个 extra 里，且�
 `server` 的 Worker 能正常启动、能通过导入探针，然后在第一条带媒体的 observation 上失败；只有
 本地加载 Jina Omni 的 GPU Worker 再叠加 `cloud-models`（它依赖 `mindbridge[media]`，所以会把
 `media` 一并带上）。端侧安装不得因 SQLite 身份或同步能力被迫携带 Celery、MCP、PostgreSQL、
-FastAPI 等服务端栈，子包导入隔离由独立进程测试守护。`edge` 的 Python 依赖只覆盖同步、安全、
-OpenAI SDK 和可观测性；不再为声纹二次解码携带 SoundFile，也不携带 NeMo。InsightFace/ONNX
-Runtime、FunASR/ModelScope 与设备版 Torch 必须使用与目标平台 SDK 匹配的镜像工件（JetPack/CUDA、
-地瓜 OpenExplorer、RKNN Toolkit、OpenVINO 或普通 CUDA/CPU 主机），不能由通用 lockfile 覆盖任何
-平台运行时；`edge` 的通用依赖不钉死任何一家的加速器 wheel。FunASR 自身仍是模型栈而非“轻依赖”，减重来自只维护一套上游
+FastAPI 等服务端栈，子包导入隔离由独立进程测试守护。`edge` 在 Linux/Windows x86_64 和 macOS
+14+ Apple Silicon 安装通用 InsightFace/ONNX Runtime、FunASR/ModelScope 与 Torch/TorchAudio；
+Linux ARM 设备仍使用与 JetPack、OpenExplorer、RKNN、OpenVINO 或 BPU 匹配的镜像工件。随包的
+ONNX Runtime 是 CPU provider，CUDA/TensorRT 人脸 provider 由平台镜像提供。FunASR 自身仍是模型栈
+而非“轻依赖”，减重来自只维护一套上游
 speech runtime、且不把它拖入 Core/SDK/server。llama.cpp 的 FunASR/GGUF 支持适合作为未来
 ASR/VAD 多端运行时候选，但当前没有证据证明它完整覆盖 punctuation、diarization 和 voiceprint，
 因此不能作为这一统一身份管线的透明替换。
 
 Worker 通过 `mindbridge.celery_app:app` 启动，Redis 消息只传
 `tenant_id`、`observation_id`、`job_id`。原始媒体、Evidence 和任务状态均以 PostgreSQL/S3
-为事实来源。每个 prefork child 只加载一个 Jina v5 Omni；默认并发为 1，
-多 GPU 通过每张卡一个 Worker 进程扩展，避免一个模型被 CPU 核数意外复制。API 默认不加载
-Jina 权重；API 与 Worker 在 composition root 按插口直接选择插件，应用层只消费三个能力协议。
+为事实来源。Jina SentenceTransformers 服务独占模型进程；API 与 Worker 默认都通过共享 endpoint
+调用它，不加载 Jina 权重。仅显式选择本地 `jina` 插件时，Worker 才在进程内加载模型，并由启动
+门禁限制 prefork 副本数。API 与 Worker 在 composition root 按插口直接选择插件，应用层只消费三个能力协议。
 Generator、两个 Embedder 和共享空间必须由部署配置固定并写入派生记录；凭证
 只从进程环境或基础设施 secret 注入。
 
@@ -1719,7 +1719,7 @@ manifest 才能被引用。
 当前代码的增量证据只作为功能证据，不作为榜单分数：一次 FunASR 调用在 RTX 5090 上贯通 VAD、ASR、
 标点、diarization 与 CAM++ centroid，20 秒音频推理 1.283 秒、峰值 CUDA allocation 1.93 GiB，同一
 centroid 跨两个 Observation 命中同一 AES-GCM 加密设备身份；另有 6 秒、60 次 100ms PCM push 的真实
-在线路径。`answer_from_evidence_v10` 已完成发布文本↔原始媒体 EvidenceSpan 绑定、最终相关 Top-K 内
+在线路径。`answer_from_evidence_v13` 已完成发布文本↔原始媒体 EvidenceSpan 绑定、最终相关 Top-K 内
 newest/oldest 重排、无新增结果时的反思方向切换，以及 Summary 有向下钻与有界单跳父/同父展开；这些
 改动通过生产路径回归，但没有任何完整 split 数字支撑。跨查询 experience memory 与
 Entity/Bridge/Scene/Horizon cue 明确推迟到完整数据证明增益之后，避免为榜单题型预埋旁路。

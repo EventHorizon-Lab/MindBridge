@@ -19,7 +19,9 @@ from mindbridge.benchmarks.artifacts import (
 from mindbridge.benchmarks.cli_common import (
     MediaArguments,
     MediaBenchmarkRunManifest,
+    TranscriptSource,
     add_media_arguments,
+    add_transcript_source_argument,
     connected_memory,
     core_parser,
     index_prepared,
@@ -27,6 +29,7 @@ from mindbridge.benchmarks.cli_common import (
     media_manifest,
     report,
     report_unit,
+    require_declared_transcripts,
     select_by_id,
     write_run_artifacts,
 )
@@ -47,7 +50,6 @@ from mindbridge.file_integrity import sha256_file
 from mindbridge.prompts import PERCEIVE_EVENTS_PROMPT
 
 VIDEO_MME_RUNNER_VERSION = "video_mme_production_api_v2"
-VideoMMETranscriptSource = Literal["none", "asr", "official_subtitles"]
 
 
 class VideoMMERunManifest(MediaBenchmarkRunManifest):
@@ -64,7 +66,7 @@ class VideoMMERunManifest(MediaBenchmarkRunManifest):
     media_segment_count: int = Field(ge=0)
     transcript_segment_count: int = Field(ge=0)
     durations: tuple[VideoMMEDuration, ...] = Field(min_length=1)
-    transcript_source: VideoMMETranscriptSource
+    transcript_source: TranscriptSource
     metrics: VideoMMEMetrics
 
 
@@ -73,7 +75,7 @@ class _Arguments(MediaArguments):
     prepared_media_path: Path
     video_ids: tuple[str, ...]
     durations: tuple[VideoMMEDuration, ...]
-    transcript_source: VideoMMETranscriptSource
+    transcript_source: TranscriptSource
 
 
 def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
@@ -83,7 +85,7 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
         load_video_mme(arguments.dataset_path), arguments.video_ids, arguments.durations
     )
     prepared = _select_prepared(load_prepared_videos(arguments.prepared_media_path), videos)
-    _require_declared_transcripts(prepared, arguments.transcript_source)
+    require_declared_transcripts(prepared, arguments.transcript_source)
     require_writable_output_pair(arguments.output_path, overwrite=arguments.overwrite)
     deployment = load_deployment_snapshot(
         arguments.deployment_config_path,
@@ -190,25 +192,6 @@ def _select_videos(
     return videos
 
 
-def _require_declared_transcripts(
-    prepared: tuple[PreparedVideo, ...],
-    transcript_source: VideoMMETranscriptSource,
-) -> None:
-    """Refuse a run whose declared subtitle setting disagrees with its prepared media."""
-    present = any(
-        segment.transcript is not None for video in prepared for segment in video.segments
-    )
-    if present and transcript_source == "none":
-        raise ValueError(
-            "prepared media carries transcripts; a run declaring no transcript source would "
-            "report a with-subtitles result in the without-subtitles column"
-        )
-    if not present and transcript_source != "none":
-        raise ValueError(
-            f"prepared media carries no transcript, so it cannot be {transcript_source}"
-        )
-
-
 def _select_prepared(
     prepared: tuple[PreparedVideo, ...], videos: tuple[VideoMMEVideo, ...]
 ) -> tuple[PreparedVideo, ...]:
@@ -242,12 +225,7 @@ def _parse_arguments(argv: Sequence[str] | None, prog: str | None) -> _Arguments
         choices=("short", "medium", "long"),
         help="official duration band to keep; repeatable, default every band",
     )
-    parser.add_argument(
-        "--transcript-source",
-        required=True,
-        choices=("none", "asr", "official_subtitles"),
-        help="which official transcript this run ingests, if any",
-    )
+    add_transcript_source_argument(parser)
     parsed = parser.parse_args(argv)
     return media_arguments(
         _Arguments,

@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import ClassVar
 
 import pytest
+from pydantic import ValidationError
 
 from mindbridge.benchmarks.egolife_qa import load_egolife_qa
 from mindbridge.benchmarks.egomem_reason import load_egomem_reason
@@ -15,6 +16,7 @@ from mindbridge.benchmarks.memlens import load_memlens, load_memlens_agent_subse
 from mindbridge.benchmarks.mm_lifelong import MMLifelongSplit, load_mm_lifelong
 from mindbridge.benchmarks.supermemory_vqa import load_supermemory_vqa
 from mindbridge.benchmarks.video_mme import load_video_mme
+from mindbridge.benchmarks.video_mme_v2 import load_video_mme_v2
 
 
 class _FakeArrowTable:
@@ -172,6 +174,131 @@ def test_video_mme_adapter_loads_official_parquet_rows(
     assert video.source_video_id == "fFjv93ACGo8"
     assert len(video.questions) == 3
     assert video.questions[0].options[2] == "C. Berries."
+
+
+def _video_mme_v2_rows(
+    *,
+    video_id: str = "001",
+    group_type: str = "logic",
+    group_structure: str = "[1,2,3,4]",
+    options: str | None = None,
+    answer: str = "F",
+    count: int = 4,
+) -> list[dict[str, object]]:
+    body = (
+        options
+        if options is not None
+        else "\n".join(f"{label}. Option {label}." for label in "ABCDEFGH")
+    )
+    return [
+        {
+            "video_id": video_id,
+            "url": "https://www.youtube.com/watch?v=AYSYelOQtQI",
+            "group_type": group_type,
+            "group_structure": group_structure,
+            "question_id": f"{video_id}-{index}",
+            "question": f"Question {index}?",
+            "options": body,
+            "answer": answer,
+            "level": "1",
+            "second_head": "Frames & Audio",
+            "third_head": "Visual-Audio Collaborative Reasoning",
+        }
+        for index in range(1, count + 1)
+    ]
+
+
+def test_video_mme_v2_adapter_groups_four_questions_per_video(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    annotation_path = tmp_path / "test.parquet"
+    _FakeParquet.rows = _video_mme_v2_rows() + _video_mme_v2_rows(
+        video_id="002", group_type="relevance", group_structure="4"
+    )
+    monkeypatch.setattr(
+        "mindbridge.benchmarks.video_mme_v2.import_module", lambda name: _FakeParquet
+    )
+
+    groups = load_video_mme_v2(annotation_path)
+
+    assert [group.video_id for group in groups] == ["001", "002"]
+    assert [group.group_type for group in groups] == ["logic", "relevance"]
+    assert [question.position for question in groups[0].questions] == [1, 2, 3, 4]
+    assert groups[0].questions[0].answer == "F"
+    assert groups[0].questions[0].options[5] == "F. Option F."
+
+
+def test_video_mme_v2_adapter_accepts_questions_offering_fewer_than_eight_options(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """58 of the 3,200 official questions offer 2-7 options; a rigid eight rejects the release."""
+    annotation_path = tmp_path / "test.parquet"
+    _FakeParquet.rows = _video_mme_v2_rows(
+        options="A. No.\nB. Yes.\nC. Cannot be determined.", answer="B"
+    )
+    monkeypatch.setattr(
+        "mindbridge.benchmarks.video_mme_v2.import_module", lambda name: _FakeParquet
+    )
+
+    group = load_video_mme_v2(annotation_path)[0]
+
+    assert group.questions[0].options == ("A. No.", "B. Yes.", "C. Cannot be determined.")
+
+
+def test_video_mme_v2_adapter_rejects_an_answer_past_the_last_option(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    annotation_path = tmp_path / "test.parquet"
+    _FakeParquet.rows = _video_mme_v2_rows(options="A. No.\nB. Yes.", answer="H")
+    monkeypatch.setattr(
+        "mindbridge.benchmarks.video_mme_v2.import_module", lambda name: _FakeParquet
+    )
+
+    with pytest.raises(ValidationError, match="past the last option"):
+        load_video_mme_v2(annotation_path)
+
+
+def test_video_mme_v2_adapter_refuses_a_partial_group(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The released scorer slices groups positionally, so a stray row shifts every later group."""
+    annotation_path = tmp_path / "test.parquet"
+    _FakeParquet.rows = _video_mme_v2_rows(count=3)
+    monkeypatch.setattr(
+        "mindbridge.benchmarks.video_mme_v2.import_module", lambda name: _FakeParquet
+    )
+
+    with pytest.raises(ValueError, match="whole groups of 4"):
+        load_video_mme_v2(annotation_path)
+
+
+def test_video_mme_v2_adapter_refuses_a_group_spanning_two_videos(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    annotation_path = tmp_path / "test.parquet"
+    rows = _video_mme_v2_rows()
+    rows[2]["video_id"] = "002"
+    _FakeParquet.rows = rows
+    monkeypatch.setattr(
+        "mindbridge.benchmarks.video_mme_v2.import_module", lambda name: _FakeParquet
+    )
+
+    with pytest.raises(ValueError, match="inconsistent metadata"):
+        load_video_mme_v2(annotation_path)
+
+
+def test_video_mme_v2_adapter_refuses_an_unscorable_logic_structure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Better to refuse at load than to die mid-run once the ingest has already been paid for."""
+    annotation_path = tmp_path / "test.parquet"
+    _FakeParquet.rows = _video_mme_v2_rows(group_structure="[4,3,2,1]")
+    monkeypatch.setattr(
+        "mindbridge.benchmarks.video_mme_v2.import_module", lambda name: _FakeParquet
+    )
+
+    with pytest.raises(ValidationError, match="unknown structure"):
+        load_video_mme_v2(annotation_path)
 
 
 def test_egotempo_adapter_parses_official_clip_boundaries(tmp_path: Path) -> None:

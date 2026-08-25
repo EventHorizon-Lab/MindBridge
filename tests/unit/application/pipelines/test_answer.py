@@ -67,7 +67,7 @@ async def test_answer_pipeline_streams_raw_av_and_validates_answer(
         assert payload["modalities"] == ["text"]
         assert "response_format" not in payload
         assert payload["reasoning_effort"] == "low"
-        assert 'For yes/no questions, answer "Yes" or "No".' in system_prompt
+        assert 'For yes/no questions, answer "Yes" or "No"' in system_prompt
         assert "answer string is not an evidence report" in system_prompt
         assert "different named person does not support" in system_prompt
         assert "Missing evidence is not evidence of" in system_prompt
@@ -100,7 +100,7 @@ async def test_answer_pipeline_streams_raw_av_and_validates_answer(
 
     answerer = _answerer(respond)
     assert answerer.model_reference.model_id == "qwen3.8-max"
-    assert answerer.prompt_version == "answer_from_evidence_v12"
+    assert answerer.prompt_version == "answer_from_evidence_v13"
     assert answerer.occurrence_prompt_version == "select_occurrences_v2"
     evidence = (
         _resolved_evidence(MediaKind.IMAGE, "image.jpg", "media_image", 0),
@@ -698,6 +698,94 @@ async def test_answer_pipeline_keeps_an_abstention_whose_confidence_contradicts_
     assert answer.retrieval_queries == ("blue toolbox",)
 
 
+async def test_every_candidate_reaches_the_model_with_its_own_occurrence_interval() -> None:
+    """The prompt resolves relative time against occurred_at, so each candidate must carry its own.
+
+    A missing or shared timestamp leaves "last week" and "the day before" with nothing to anchor
+    on, and the answer is then produced from wording alone.
+    """
+    candidates: list[list[dict[str, object]]] = []
+
+    async def respond(request: httpx.Request) -> httpx.Response:
+        payload: dict[str, object] = json.loads(request.content)
+        messages = cast(list[dict[str, object]], payload["messages"])
+        user_content = cast(list[dict[str, object]], messages[1]["content"])
+        context = json.loads(
+            cast(str, user_content[0]["text"])
+            .removeprefix("<recall_context>\n")
+            .removesuffix("\n</recall_context>")
+        )
+        candidates.append(cast(list[dict[str, object]], context["candidate_memories"]))
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=_completion_stream('{"answer":"On 4 August","confidence":0.6}'),
+        )
+
+    evidence = (_resolved_evidence(MediaKind.IMAGE, "image.jpg", "media_image", 0),)
+    evidence_ids = (evidence[0].evidence_span.evidence_id,)
+    last_week = NOW - timedelta(days=7)
+    answerer = _answerer(respond)
+    try:
+        await answerer.answer(
+            RecallRequest(
+                tenant_id="tenant_01", query=RecallQuery(text="What did I do last week?")
+            ),
+            (
+                _memory(evidence_ids, ended_at=NOW + timedelta(seconds=30)),
+                _memory(
+                    evidence_ids,
+                    memory_id="memory_02",
+                    occurred_at=last_week,
+                    ended_at=last_week + timedelta(minutes=5),
+                ),
+            ),
+            evidence,
+            query_media=(),
+        )
+    finally:
+        await answerer.close()
+
+    assert len(candidates) == 1
+    assert [
+        (item["memory_id"], item["occurred_at"], item["ended_at"]) for item in candidates[0]
+    ] == [
+        ("memory_01", "2026-08-11T12:00:00+00:00", "2026-08-11T12:00:30+00:00"),
+        ("memory_02", "2026-08-04T12:00:00+00:00", "2026-08-04T12:05:00+00:00"),
+    ]
+
+
+async def test_answer_pipeline_returns_a_low_confidence_answer_rather_than_abstaining() -> None:
+    """Partial support is reported in confidence, and nothing on the read path downgrades it.
+
+    The answer prompt tells the model to commit and lower confidence when the evidence it holds is
+    partial. That instruction is inert unless a low-confidence answer survives intact, so this
+    pins the absence of a confidence gate between the model and the caller.
+    """
+
+    async def respond(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=_completion_stream('{"answer":"Beside the blue toolbox","confidence":0.05}'),
+        )
+
+    answerer = _answerer(respond)
+    evidence = (_resolved_evidence(MediaKind.IMAGE, "image.jpg", "media_image", 0),)
+    try:
+        answer = await answerer.answer(
+            RecallRequest(tenant_id="tenant_01", query=RecallQuery(text="Where is the tool?")),
+            (_memory((evidence[0].evidence_span.evidence_id,)),),
+            evidence,
+            query_media=(),
+        )
+    finally:
+        await answerer.close()
+
+    assert answer.answer == "Beside the blue toolbox"
+    assert answer.confidence == 0.05
+
+
 async def test_answer_pipeline_keeps_an_answer_that_overran_its_output_contract() -> None:
     """An invented key, a third query, a repeat, a blank, and an unknown ordering hint all drop."""
 
@@ -941,15 +1029,18 @@ def _memory(
     evidence_ids: tuple[EvidenceId, ...],
     *,
     verification_status: VerificationStatus = VerificationStatus.VERIFIED,
+    memory_id: str = "memory_01",
+    occurred_at: datetime = NOW,
+    ended_at: datetime = NOW,
 ) -> MemoryRecord:
     return MemoryRecord(
-        memory_id=MemoryId("memory_01"),
+        memory_id=MemoryId(memory_id),
         tenant_id=TenantId("tenant_01"),
         memory_type=MemoryType.EPISODIC,
         summary="The red screwdriver was left beside the blue toolbox.",
         evidence_ids=evidence_ids,
-        occurred_at=NOW,
-        ended_at=NOW,
+        occurred_at=occurred_at,
+        ended_at=ended_at,
         created_at=NOW,
         verification_status=verification_status,
     )

@@ -237,3 +237,38 @@ def _memory() -> MemoryView:
         verification_status=VerificationStatus.ATTESTED,
         state=MemoryState.ACTIVE,
     )
+
+
+async def test_mm_lifelong_keeps_answers_when_one_question_recall_raises() -> None:
+    """One raising recall used to abort every question in the same concurrency window."""
+
+    class RecallFailingMemoryApi(RecordingMemoryApi):
+        async def recall(self, request: RecallRequest) -> RecallResult:
+            if request.query.text == "What happened first?":
+                raise MindBridgeError(
+                    "recall could not be served",
+                    code="internal_error",
+                    status_code=500,
+                    trace_id="trace_recall_error",
+                )
+            return await super().recall(request)
+
+    api = RecallFailingMemoryApi()
+    questions = tuple(
+        _question().model_copy(update={"index": index, "question": text})
+        for index, text in enumerate(("What happened first?", "What happened next?"))
+    )
+
+    results = await run_mm_lifelong(
+        cast(MindBridge, api),
+        questions,
+        _prepared(),
+        run_id="run_01",
+    )
+
+    assert [result.index for result in results] == [0, 1]
+    assert [result.mindbridge_error_code for result in results] == ["internal_error", None]
+    assert results[0].pred.answer == ""
+    assert results[0].pred.intervals == ()
+    assert results[0].mindbridge_unofficial_ref_at_300 == 0.0
+    assert results[1].pred.answer == "A meeting"

@@ -102,7 +102,7 @@ MindBridge ships these adapters:
 | Plugin | Capability | Purpose |
 | --- | --- | --- |
 | `openai` | Generator | OpenAI and OpenAI-compatible multimodal generation |
-| `openai` | Embedder | Aligned query/document OpenAI-compatible embedding endpoints |
+| `openai` | Embedder | Aligned query/document endpoints, including the bundled Jina service |
 | `jina` | Embedder | Local Hugging Face Jina v5 Omni embedding |
 
 Anthropic, Gemini, and local runtimes belong in provider packages using the
@@ -123,9 +123,8 @@ MINDBRIDGE_EMBEDDER_CONFIG_JSON
 The bundled defaults also accept documented provider-specific environment variables so a normal
 deployment does not need inline JSON. A supplied `*_CONFIG_JSON` value is authoritative and does not
 require the bundled provider's variables. Worker and consolidation processes read the same names for
-the same capability slots: the Worker adds only `MINDBRIDGE_MEDIA_EMBEDDER_*` for its local media
-encoder, and its text encoder shares the deployment-wide `MINDBRIDGE_EMBEDDER_*` contract rather than
-owning a second family of names that could disagree about the search space.
+the same capability slots. The Worker uses `MINDBRIDGE_EMBEDDER_*` for both text and media by
+default; `MINDBRIDGE_MEDIA_EMBEDDER_*` is an explicit override for a separate local encoder.
 
 Every bundled fallback is built in one place, `mindbridge.models.defaults`, so a variable is read by
 exactly one function no matter how many processes need it. A plugin author adding a bundled default
@@ -133,9 +132,9 @@ extends that module instead of copying a builder into each process.
 
 A bundled fallback covers credentials and model identity only. Optional settings stay reachable
 through the slot's `*_CONFIG_JSON` object and do not get an environment variable each, so adding a
-knob to a plugin schema does not widen the deployment surface. `MINDBRIDGE_MEDIA_EMBEDDER_DEVICE` is
-the one deliberate exception: it selects hardware rather than model behaviour, and routing it through
-`select_torch_device` turns a missing GPU into a startup failure instead of a silent fall back to CPU.
+knob to a plugin schema does not widen the deployment surface. For the optional local Worker
+encoder, `MINDBRIDGE_MEDIA_EMBEDDER_DEVICE` selects hardware; routing it through
+`select_torch_device` turns a missing GPU into a startup failure instead of silently using CPU.
 
 Both embedding plugins spell the model they load `model_id` in their configuration objects.
 `PluginConfigModel` sets `extra="forbid"`, so a stale key such as `model_revision` fails the

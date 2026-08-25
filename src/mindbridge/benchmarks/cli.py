@@ -93,6 +93,11 @@ RUNNERS: dict[str, Runner] = {
         "Run official Video-MME",
         extra="benchmarks",
     ),
+    "video-mme-v2": Runner(
+        "mindbridge.benchmarks.video_mme_v2_cli",
+        "Run official Video-MME-v2",
+        extra="benchmarks",
+    ),
     "aml": Runner("mindbridge.benchmarks.aml.cli", "Replay one offline AML pipeline"),
     "score": Runner(
         "mindbridge.benchmarks.official_score",

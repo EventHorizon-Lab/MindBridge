@@ -9,10 +9,12 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable, Sequence
+from functools import partial
 
 import httpx
 
 from mindbridge.benchmarks.aml.cases import AmlCase, AmlQuestion, Message, chunk_messages
+from mindbridge.benchmarks.runtime import settle_answers
 
 EmitFn = Callable[[AmlQuestion, Sequence[dict[str, object]]], dict[str, object]]
 
@@ -122,24 +124,46 @@ async def run_case(
             raise outcome
     ingest_failures = _count_ingest_failures(outcomes)
 
-    return list(
-        await asyncio.gather(
-            *(
-                _search_question(
-                    client,
-                    semaphore,
-                    case,
-                    question,
-                    user_id=user_id,
-                    top_k=top_k,
-                    emit=emit,
-                    timeout=timeout,
-                    ingest_failures=ingest_failures,
-                )
-                for question in case.questions
+    searched = await asyncio.gather(
+        *(
+            _search_question(
+                client,
+                semaphore,
+                case,
+                question,
+                user_id=user_id,
+                top_k=top_k,
+                emit=emit,
+                timeout=timeout,
+                ingest_failures=ingest_failures,
             )
+            for question in case.questions
+        ),
+        return_exceptions=True,
+    )
+    # A search that raised costs this case one question, not all of them: the CLI awaits each
+    # case in turn, so an escaping exception used to end the run and discard every case still
+    # in flight. The row is still written, carrying its own empty retrieval and the code, so
+    # the shard holds one row per question and says which of them never reached the server.
+    return list(
+        settle_answers(
+            case.questions,
+            searched,
+            partial(_failed_row, case=case, emit=emit, ingest_failures=ingest_failures),
         )
     )
+
+
+def _failed_row(
+    question: AmlQuestion,
+    error_code: str,
+    *,
+    case: AmlCase,
+    emit: EmitFn,
+    ingest_failures: int,
+) -> dict[str, object]:
+    """The row a question whose search never returned still writes."""
+    return _row(case, question, (), emit=emit, ingest_failures=ingest_failures, error=error_code)
 
 
 def _count_ingest_failures(outcomes: list[BaseException | None]) -> int:
@@ -200,11 +224,25 @@ async def _search_question(
         )
     response.raise_for_status()
     retrieved = response.json().get("data", [])
+    return _row(case, question, retrieved, emit=emit, ingest_failures=ingest_failures)
+
+
+def _row(
+    case: AmlCase,
+    question: AmlQuestion,
+    retrieved: Sequence[dict[str, object]],
+    *,
+    emit: EmitFn,
+    ingest_failures: int,
+    error: str | None = None,
+) -> dict[str, object]:
     row: dict[str, object] = {"id": row_id(case, question), "question": question.question}
     row.update(question.payload)
     row.update(emit(question, retrieved))
     # Written last: a loader payload key of this name must not silently overwrite the diagnostic.
     row["mindbridge_ingest_failure_count"] = ingest_failures
+    if error is not None:
+        row["mindbridge_error_code"] = error
     return row
 
 

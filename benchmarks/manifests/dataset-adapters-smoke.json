@@ -1,5 +1,5 @@
 {
-  "created_at": "2026-08-14T10:23:59.856394Z",
+  "created_at": "2026-08-25T08:59:48.104106Z",
   "datasets": [
     {
       "benchmark": "LoCoMo-Refined",
@@ -40,6 +40,16 @@
       "context_count": 900,
       "memory_item_count": 900,
       "question_count": 2700
+    },
+    {
+      "benchmark": "Video-MME-v2",
+      "source_repository": "MME-Benchmarks/Video-MME-v2",
+      "source_file": "test.parquet",
+      "source_sha256": "8dc7f8c8830aa49dd08a82592f8276899472a145155dde3bea5dd6914a65a9b4",
+      "adapter_version": "video_mme_v2_official_v1",
+      "context_count": 800,
+      "memory_item_count": 800,
+      "question_count": 3200
     },
     {
       "benchmark": "EgoLifeQA",

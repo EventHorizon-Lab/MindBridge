@@ -592,3 +592,76 @@ def _typed_result(question_id: str, question_type: str, *, correct: bool) -> Ego
         mindbridge_evidence_ids=(),
         mindbridge_trace_id=f"trace_{question_id}",
     )
+
+
+class RecallFailingMemoryApi(RecordingMemoryApi):
+    """Fail one question's recall, the way the shared endpoint's gateway timeout does."""
+
+    def __init__(self, failing_question: str) -> None:
+        super().__init__()
+        self.failing_question = failing_question
+
+    async def recall(self, request: RecallRequest) -> RecallResult:
+        assert request.query.text is not None
+        if self.failing_question in request.query.text:
+            raise MindBridgeError(
+                "recall could not be served",
+                code="internal_error",
+                status_code=500,
+                trace_id="trace_recall_error",
+            )
+        return await super().recall(request)
+
+
+async def test_egolife_cohort_survives_one_question_whose_recall_raises() -> None:
+    """One raising recall used to abort every question sharing its cutoff."""
+    api = RecallFailingMemoryApi("the mug")
+    questions = (
+        _question("q_mug", "10010000").model_copy(update={"question": "Who used the mug?"}),
+        _question("q_bowl", "10010000").model_copy(update={"question": "Who used the bowl?"}),
+    )
+
+    results = await run_egolife_qa(
+        cast(MindBridge, api),
+        questions,
+        _prepared_stream(),
+        run_id="run_01",
+        poll_interval_seconds=0.001,
+    )
+
+    assert [result.id for result in results] == ["q_mug", "q_bowl"]
+    assert [result.mindbridge_error_code for result in results] == ["internal_error", None]
+    assert results[0].model_option is None
+    assert results[0].model_answer == ""
+    assert results[1].model_option == "B"
+
+
+async def test_egomem_reason_cohort_survives_one_question_whose_recall_raises() -> None:
+    """EgoMemReason answers its own cohort, so it needs its own settling."""
+    api = RecallFailingMemoryApi("the mug")
+    questions = tuple(
+        EgoMemReasonQuestion(
+            example_id=index + 1,
+            question_id=f"A1_JAKE_{index + 1}",
+            identity="A1_JAKE",
+            query_time="DAY1, 10:01:00",
+            query_offset_ms=36_060_000,
+            question=text,
+            choices=("Choice 0", "Choice 1", "Choice 2", "Choice 3"),
+            query_type="Event Ordering",
+        )
+        for index, text in enumerate(("Who used the mug?", "Who used the bowl?"))
+    )
+
+    results = await run_egomem_reason(
+        cast(MindBridge, api),
+        questions,
+        _prepared_stream(),
+        run_id="run_01",
+        poll_interval_seconds=0.001,
+    )
+
+    assert [result.example_id for result in results] == [1, 2]
+    assert [result.mindbridge_error_code for result in results] == ["internal_error", None]
+    assert results[0].predicted_answer == EGOMEM_REASON_ABSTENTION
+    assert results[1].predicted_answer == "B"

@@ -1,37 +1,76 @@
 # Configuration
 
-Every process is configured entirely through environment variables. There is no config file, and
-credentials are never accepted as CLI flags — so a recorded invocation, a process list, and a
-systemd unit never carry a secret.
+Credentials are configured entirely through environment variables, and are never accepted as a
+CLI flag or read from a file — so a recorded invocation, a process list, a systemd unit, and the
+repository itself never carry a secret. Everything that is not a credential lives in
+`mindbridge.toml`, which is committed, commented, and diffable.
+
+Each setting's environment variable overrides the file, so a container or a CI job changes one
+value without rebuilding anything. `mindbridge config check --role <role>` reports which source
+won for each setting, and every setting a role still needs, in one pass rather than one per
+restart.
+
+A credential key inside `mindbridge.toml` is refused when the file loads, and so is a key no
+reader looks up: a typo that is ignored is a value that silently reverts to its default.
 
 Configuration is validated at startup, not at first request. A deployment with a wrong value
 fails to start rather than failing one call an hour later.
 
 ## Which process reads what
 
-| Variable | API | MCP | Worker | Consolidate | Lifecycle | Edge sync |
-| --- | :-: | :-: | :-: | :-: | :-: | :-: |
-| `MINDBRIDGE_DATABASE_URL` | ● | ● | ● | ● | ● | |
-| `MINDBRIDGE_DATABASE_MAX_POOL_SIZE` | ○ | ○ | ○ | ○ | ○ | |
-| `MINDBRIDGE_TASK_BROKER_URL` | ● | | ● | | | |
-| `MINDBRIDGE_OBJECT_STORAGE_BUCKET` | ● | ● | ● | ● | ◐ | |
-| `MINDBRIDGE_OBJECT_STORAGE_ENDPOINT_URL` | ○ | ○ | ○ | ○ | ○ | |
-| `MINDBRIDGE_OBJECT_STORAGE_PUBLIC_ENDPOINT_URL` | ○ | ○ | ○ | ○ | ○ | |
-| `MINDBRIDGE_GENERATOR_*` | ● | ● | ● | ● | | |
-| `MINDBRIDGE_EMBEDDER_*` | ● | ● | ● | ● | | |
-| `MINDBRIDGE_EMBEDDING_*` | ○ | ○ | ○ | ○ | | |
-| `MINDBRIDGE_MEDIA_EMBEDDER_*` | | | ○ | | | |
-| `MINDBRIDGE_MEDIA_SAMPLING_CONFIG_JSON` | | | ○ | | | |
-| `MINDBRIDGE_WORKER_CONCURRENCY` | | | ○ | | | |
-| `MINDBRIDGE_WORKER_VRAM_BUDGET_GIB` | | | ○ | | | |
-| `MINDBRIDGE_TENANT_API_KEYS_JSON` | ● | | | | | |
-| `MINDBRIDGE_API_KEY` | | | | | | ● |
-| `MINDBRIDGE_AML_*` | ○ | | | | | |
-| `MINDBRIDGE_LOG_LEVEL` | ○ | ○ | ○ | ○ | ○ | ○ |
-| `MINDBRIDGE_LOG_FORMAT` | ○ | ○ | ○ | ○ | ○ | ○ |
-| `MINDBRIDGE_TIMING_SUMMARY` | ○ | ○ | ○ | ○ | ○ | ○ |
+| Variable | Source | API | MCP | Worker | Consolidate | Lifecycle | Edge sync |
+| --- | :-: | :-: | :-: | :-: | :-: | :-: | :-: |
+| `MINDBRIDGE_CONFIG_FILE` | env | ○ | ○ | ○ | ○ | ○ | ○ |
+| `MINDBRIDGE_DATABASE_URL` | env | ● | ● | ● | ● | ● | |
+| `MINDBRIDGE_DATABASE_MAX_POOL_SIZE` | file | ○ | ○ | ○ | ○ | ○ | |
+| `MINDBRIDGE_TASK_BROKER_URL` | env | ● | | ● | | | |
+| `MINDBRIDGE_OBJECT_STORAGE_BUCKET` | file | ● | ● | ● | ● | ◐ | |
+| `MINDBRIDGE_OBJECT_STORAGE_ENDPOINT_URL` | file | ○ | ○ | ○ | ○ | ○ | |
+| `MINDBRIDGE_OBJECT_STORAGE_PUBLIC_ENDPOINT_URL` | file | ○ | ○ | ○ | ○ | ○ | |
+| `MINDBRIDGE_GENERATOR_*` | both | ● | ● | ● | ● | | |
+| `MINDBRIDGE_EMBEDDER_*` | both | ● | ● | ● | ● | | |
+| `MINDBRIDGE_EMBEDDING_*` | file | ○ | ○ | ○ | ○ | | |
+| `MINDBRIDGE_MEDIA_EMBEDDER_*` | file | | | ○ | | | |
+| `MINDBRIDGE_MEDIA_SAMPLING_CONFIG_JSON` | file | | | ○ | | | |
+| `MINDBRIDGE_WORKER_CONCURRENCY` | file | | | ○ | | | |
+| `MINDBRIDGE_WORKER_VRAM_BUDGET_GIB` | file | | | ○ | | | |
+| `MINDBRIDGE_CONSOLIDATION_TENANT_IDS` | file | | | ○ | | | |
+| `MINDBRIDGE_CONSOLIDATION_INTERVAL_SECONDS` | file | | | ○ | | | |
+| `MINDBRIDGE_TENANT_API_KEYS_JSON` | env | ● | | | | | |
+| `MINDBRIDGE_API_KEY` | env | | | | | | ● |
+| `MINDBRIDGE_AML_*` | both | ○ | | | | | |
+| `MINDBRIDGE_LOG_LEVEL` | file | ○ | ○ | ○ | ○ | ○ | ○ |
+| `MINDBRIDGE_LOG_FORMAT` | file | ○ | ○ | ○ | ○ | ○ | ○ |
+| `MINDBRIDGE_TIMING_SUMMARY` | file | ○ | ○ | ○ | ○ | ○ | ○ |
 
 ● required ○ optional ◐ required only with `--reclaim-orphan-clips`
+
+**Source** is where a setting is configured: `file` in `mindbridge.toml`, `env` in the
+environment only, `both` for a group whose API key is a credential and whose remaining keys are
+structure. Every `file` row is also settable from the environment, which overrides the file.
+
+## The configuration file
+
+`mindbridge.toml` is read from the working directory. `MINDBRIDGE_CONFIG_FILE` names a different
+path, and a path it names that is not a file is an error rather than a fall back — there is no
+parent-directory search and no XDG lookup, because a configuration file found somewhere nobody
+named is worse than none at all.
+
+No file at all is not an error either. A deployment that sets everything in the environment
+behaves exactly as it did before this file existed.
+
+| Condition | Behaviour |
+| --- | --- |
+| `MINDBRIDGE_CONFIG_FILE` set, path missing | Error naming the path. |
+| File is not valid TOML | Error naming the file and the parse position. |
+| File contains a credential key | Error naming the key and the variable it belongs in. |
+| File has an unknown section or key | Error naming it. |
+| Both file and environment set a value | The environment wins. `config check` shows which. |
+| No file at all | Not an error. |
+
+A key `k` in section `s` configures `MINDBRIDGE_<S>_<K>`, and a key at the top level configures
+`MINDBRIDGE_<K>`. That derivation is the whole mapping; the tables in this document are written
+from it rather than beside it.
 
 ## Storage
 
@@ -104,11 +143,12 @@ bundled per-field variables or through one explicit JSON object.
 | --- | --- | --- |
 | Generator | `MINDBRIDGE_GENERATOR_PLUGIN` | `openai` |
 | Text embedder | `MINDBRIDGE_EMBEDDER_PLUGIN` | `openai` |
-| Media embedder | `MINDBRIDGE_MEDIA_EMBEDDER_PLUGIN` | `jina` |
+| Media embedder | `MINDBRIDGE_MEDIA_EMBEDDER_PLUGIN` | inherits `MINDBRIDGE_EMBEDDER_PLUGIN` |
 
 `openai` means "any OpenAI-compatible endpoint", including one you serve yourself, and it is the
-recommended value for **all three** slots — media included, where it is not the default. `jina`
-loads the model into the process; see [media embedder](#media-embedder-worker-only) for what that
+default for **all three** slots. `jina`
+loads the model into the process; see
+[optional local media embedder](#optional-local-media-embedder-worker-only) for what that
 costs and when the worker refuses to run it.
 
 ### Generator
@@ -126,7 +166,15 @@ allowance for the encoding and graph write after the model call. Raising it is h
 a slow generator moves both deadlines at once. See
 [deployment](deployment.md#how-long-one-observation-may-take).
 
-### Text embedder
+**It has a ceiling of 1920 seconds, and the worker refuses to start above it.** One delivery may
+stay alive for this timeout plus 480 seconds — the 300-second post-model allowance, the 60-second
+hard-limit margin, and the 120 seconds the broker waits before re-delivering — and the job
+ledger's stale-claim window is a fixed 2400. Past the ceiling the two disagree about the same
+attempt: the delivery is still paying for its model call while the ledger already treats the row
+as reclaimable, so a concurrent delivery or one `mindbridge jobs --republish` buys the same
+observation twice. The boot failure names the largest value that fits.
+
+### Shared embedder
 
 | Variable | Required | Default |
 | --- | --- | --- |
@@ -134,14 +182,13 @@ a slow generator moves both deadlines at once. See
 | `MINDBRIDGE_EMBEDDER_ENDPOINT` | yes | — |
 | `MINDBRIDGE_EMBEDDER_MODEL_ID` | no | `jinaai/jina-embeddings-v5-omni-small-retrieval` |
 
-The worker's text slot deliberately reads these same names rather than a parallel family. It has
-to land in the space the API queries, and a second name is a second thing that can silently
-disagree. A worker that genuinely needs a different endpoint sets a different value for the same
-name — each process has its own environment.
+The default `openai` plugin names the wire adapter, not the model runtime. The committed endpoint
+points to `mindbridge jina serve`, which loads Jina v5 Omni with SentenceTransformers. The API,
+MCP, consolidation jobs, and both worker slots use that one service by default.
 
-### Media embedder (worker only)
+### Optional local media embedder (worker only)
 
-Two shapes, and the recommended one is **not** the default plugin.
+The served shape is the default; the local model is an explicit opt-in.
 
 **Served (recommended).** One variable, because the media slot then reuses the text embedder's
 endpoint — it has to write into the same embedding space anyway:
@@ -150,7 +197,7 @@ endpoint — it has to write into the same embedding space anyway:
 export MINDBRIDGE_MEDIA_EMBEDDER_PLUGIN=openai
 ```
 
-**In-process (`jina`, the default).** Loads the encoder into the worker itself:
+**In-process (`jina`, optional).** Loads the encoder into the worker itself:
 
 | Variable | Required | Default |
 | --- | --- | --- |
@@ -158,15 +205,14 @@ export MINDBRIDGE_MEDIA_EMBEDDER_PLUGIN=openai
 | `MINDBRIDGE_MEDIA_EMBEDDER_DEVICE` | no | automatic selection |
 | `MINDBRIDGE_WORKER_VRAM_BUDGET_GIB` | no | `3.7` — one model copy per child |
 
-`MINDBRIDGE_MEDIA_EMBEDDER_MODEL_ID` is a Hugging Face repository ID; `MINDBRIDGE_EMBEDDER_MODEL_ID`
-is an endpoint-side alias. They frequently hold the same string and are still not the same field
-— do not consolidate them.
+These variables are read only when a `MINDBRIDGE_MEDIA_EMBEDDER_*` override is present. Setting
+`MINDBRIDGE_MEDIA_EMBEDDER_PLUGIN=jina` opts the worker into loading a second, local
+SentenceTransformers model. Without that explicit override, media inherits the shared endpoint.
 
 An explicit `DEVICE` that is unavailable fails rather than silently falling back to CPU.
 
-What the in-process plugin costs, measured on one RTX 5090 against the same model served through
-vLLM, is in [deployment](deployment.md#media-encoder-served-or-in-process): **3.7 GiB of VRAM per
-prefork child**, and 61-198x the wall time per media object. The worker **refuses to start** when a
+The in-process plugin costs **3.7 GiB of resident weights per prefork child** on the measured RTX
+5090. The worker **refuses to start** when a
 pool of more than one child would hold more than `MINDBRIDGE_WORKER_VRAM_BUDGET_GIB`, while either
 embedder slot names `jina`, because a prefork child holds its own copy of the model and
 `--max-memory-per-child` cannot bound VRAM. The pool size is whichever of `--concurrency` and
@@ -190,24 +236,35 @@ backends agree only to cosine **0.944**, because they sample different numbers o
 same clip. Text agrees to 0.99994 and images to 0.985. Re-encode media evidence, or accept that
 old and new video vectors are not strictly comparable.
 
-### Plugin JSON
+### Plugin sections
 
-Every slot accepts one explicit JSON object that **replaces** the per-field variables entirely:
+A plugin's whole configuration is one object, and `mindbridge.toml` is where it is written. Its
+keys are the plugin's own — `reasoning_effort` below belongs to the bundled OpenAI generator, not
+to MindBridge:
 
-```bash
-export MINDBRIDGE_GENERATOR_CONFIG_JSON='{
-  "api_key": "...",
-  "endpoint": "https://generator.example.com/v1",
-  "model_id": "qwen3.8-max",
-  "reasoning_effort": "low"
-}'
+```toml
+[generator]
+plugin = "openai"
+endpoint = "https://generator.example.com/v1"
+model_id = "qwen3.8-max"
+reasoning_effort = "low"
 ```
 
-Also `MINDBRIDGE_EMBEDDER_CONFIG_JSON` and `MINDBRIDGE_MEDIA_EMBEDDER_CONFIG_JSON`.
+Also `[embedder]`, `[media_embedder]`, and `[media_sampling]`. `[embedding]`'s two keys are
+folded into `[embedder]` and `[media_embedder]` when they are read, so one space is stated once.
 
-The rule that keeps this surface bounded: **fallback variables cover credentials and model
-identity only** — what a deployment cannot start without. Every other knob lives in the
-`*_CONFIG_JSON` object. Without that rule, the variable list grows with every setting any plugin
+An individual `MINDBRIDGE_<SECTION>_<KEY>` variable overrides one key of a section, in the type
+the file declared for it: `MINDBRIDGE_GENERATOR_REQUEST_TIMEOUT_SECONDS=900` against a file
+saying `request_timeout_seconds = 1800` resolves to the number 900, not the string. The API key
+arrives by the same mechanism, which is why it never has to appear in the file.
+
+`MINDBRIDGE_GENERATOR_CONFIG_JSON` still exists and still **replaces** the whole section rather
+than merging into it. An opaque object that is half overridden is not something a plugin schema
+can validate, so the environment either supplies the object or overrides its keys one at a time.
+
+The rule that keeps this surface bounded: **a variable exists for a credential or for model
+identity** — what a deployment cannot start without. Every other knob is a key of a section, not
+a variable of its own. Without that rule, the variable list grows with every setting any plugin
 ever gains.
 
 Configs are validated with `extra="forbid"`. An unrecognized key fails startup rather than being
@@ -238,6 +295,27 @@ value.
 `MINIMUM_EMBEDDING_SIMILARITY` accepts −1.0 to 1.0. The default of 0.0 admits every
 non-antipodal candidate and lets fusion and the answer stage do the filtering, which is usually
 right: a similarity floor discards candidates a graph hop or a lexical match would have rescued.
+
+**What raising it buys.** At 0.0 a recall returns exactly `limit` memories whenever the tenant
+holds at least that many, so it has no way to report "I hold nothing about this" — it reports the
+`limit` least dissimilar rows instead. Raising the floor lets recall return fewer rows, and zero
+rows, and an empty recall abstains rather than answering from whatever came back. That is a
+change in what the system can express, not a ranking improvement: on a nine-benchmark evaluation
+a retrieval hit did not predict answer correctness on three of the corpora, so do not expect a
+floor to raise accuracy by putting better rows in the page.
+
+**Where it helps, and where it does not.** Long-horizon, sparsely-covered corpora — hours or days
+of footage where most of the store is unrelated to any one question — are the shape where the
+`limit` least dissimilar rows are actively misleading. On densely covered corpora, where almost
+everything retrieved is at least on topic, a floor only removes candidates fusion was already
+ordering correctly. Leave it at 0.0 unless you have measured your deployment in the first shape,
+and change it one deployment at a time: there is no value that is right for both.
+
+**It only binds the dense channel.** The floor is applied to every vector search. The full-text
+channel fused beside them has no floor of its own — it matches on the query's lexemes ORed
+together plus a substring test, neither of which produces a similarity to compare — so a floored
+text query returns what the vector searches admitted *plus* whatever shares a word with the
+question. A media-only query has no full-text channel and is bounded by the floor alone.
 
 **Startup probe.** The API probes every tenant in `MINDBRIDGE_TENANT_API_KEYS_JSON` and refuses
 to serve when one holds vectors the configured space cannot reach. Pointing a deployment at a new
@@ -275,16 +353,15 @@ call. It is a client credential, not a server one.
 
 ## Media sampling (worker)
 
-`MINDBRIDGE_MEDIA_SAMPLING_CONFIG_JSON` is optional; unset keys keep the defaults shown:
+`[media_sampling]` is optional; unset keys keep the defaults shown:
 
-```bash
-export MINDBRIDGE_MEDIA_SAMPLING_CONFIG_JSON='{
-  "frames_per_second": 1.0,
-  "max_pixels": 200704,
-  "image_max_pixels": 1003520,
-  "generation_proxy": true,
-  "proxy_audio": true
-}'
+```toml
+[media_sampling]
+frames_per_second = 1.0
+max_pixels = 200704
+image_max_pixels = 1003520
+generation_proxy = true
+proxy_audio = true
 ```
 
 An unrecognized key or a value of the wrong type fails startup, and so does a frame rate outside
@@ -359,6 +436,36 @@ pool builds the media embedder once per child, so:
 Each child also opens its own database pool, so `MINDBRIDGE_DATABASE_MAX_POOL_SIZE` is a
 per-child ceiling here, not a per-deployment one. Values outside 1–32, and anything that is not
 an integer, fail startup rather than being clamped.
+
+## Built-in consolidation schedule
+
+| Variable | File key | Required | Default |
+| --- | --- | --- | --- |
+| `MINDBRIDGE_CONSOLIDATION_TENANT_IDS` | `[consolidation] tenant_ids` | no | unset — no schedule is registered at all |
+| `MINDBRIDGE_CONSOLIDATION_INTERVAL_SECONDS` | `[consolidation] interval_seconds` | no | `3600` |
+
+Neither is a credential, so both belong in `mindbridge.toml` and the environment overrides it:
+
+```toml
+[consolidation]
+tenant_ids = "tenant_01,tenant_02"
+interval_seconds = 3600
+```
+
+Read by `celery -A mindbridge.celery_app:app beat` and by the worker that consumes
+`mindbridge_consolidation`; both processes need the same tenant list, because beat's ticks address
+whichever list the worker was given. Leaving `TENANT_IDS` unset registers no schedule and no task,
+so a deployment that has not opted in runs exactly the worker it ran before.
+
+One tick sweeps **one** tenant, chosen by rotation, so the interval is a ceiling on
+consolidation's entire share of the generator rather than a per-tenant cadence — adding tenants
+lengthens the rotation instead of raising load. Scheduled sweeps skip entity resolution, which is
+the only sweep that opens media and spends a generator call per candidate pair; run that from the
+CLI on its own cadence.
+
+Tenants are enumerated from this variable rather than discovered: a tenant that is created and not
+added here silently stops consolidating. See
+[operations](operations.md#built-in-consolidation-schedule).
 
 ## Logs and timings
 

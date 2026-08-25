@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import timedelta
+from functools import partial
 from pathlib import Path
 
 from pydantic import AwareDatetime, Field, model_validator
@@ -14,8 +15,10 @@ from mindbridge.benchmarks.mm_lifelong import (
     MMLifelongSplit,
 )
 from mindbridge.benchmarks.runtime import (
+    answer_failure_trace_id,
     benchmark_tenant_id,
     ingest_media,
+    settle_answers,
 )
 from mindbridge.contracts import (
     ContractModel,
@@ -115,6 +118,7 @@ class MMLifelongQuestionResult(ContractModel):
     mindbridge_memory_ids: tuple[Identifier, ...]
     mindbridge_evidence_ids: tuple[Identifier, ...]
     mindbridge_trace_id: Identifier
+    mindbridge_error_code: NonEmptyString | None = None
     mindbridge_ingest_failure_count: int = Field(default=0, ge=0)
 
 
@@ -180,23 +184,28 @@ async def run_mm_lifelong(
         )
         ingest_failures += _count_ingest_failures(outcomes)
 
-    results = []
+    results: list[MMLifelongQuestionResult] = []
     for offset in range(0, len(questions), request_concurrency):
-        results.extend(
-            await asyncio.gather(
-                *(
-                    _answer_question(
-                        memory,
-                        tenant_id,
-                        question,
-                        prepared,
-                        total_seconds,
-                        recall_limit,
-                        semaphore,
-                        ingest_failures,
-                    )
-                    for question in questions[offset : offset + request_concurrency]
+        cohort = questions[offset : offset + request_concurrency]
+        answered = await asyncio.gather(
+            *(
+                _answer_question(
+                    memory,
+                    tenant_id,
+                    question,
+                    prepared,
+                    total_seconds,
+                    recall_limit,
+                    semaphore,
+                    ingest_failures,
                 )
+                for question in cohort
+            ),
+            return_exceptions=True,
+        )
+        results.extend(
+            settle_answers(
+                cohort, answered, partial(_failed_result, ingest_failures=ingest_failures)
             )
         )
     return tuple(results)
@@ -303,6 +312,31 @@ async def _answer_question(
         mindbridge_memory_ids=tuple(item.memory_id for item in recalled.memories),
         mindbridge_evidence_ids=tuple(item.evidence_id for item in recalled.evidence),
         mindbridge_trace_id=recalled.trace_id,
+        mindbridge_ingest_failure_count=ingest_failures,
+    )
+
+
+def _failed_result(
+    question: MMLifelongQuestion,
+    error_code: str,
+    *,
+    ingest_failures: int,
+) -> MMLifelongQuestionResult:
+    """One row for a question whose recall raised, so its cohort still answers all of them."""
+    return MMLifelongQuestionResult(
+        index=question.index,
+        question=question.question,
+        answer=question.reference_answer,
+        question_type=question.question_type,
+        temporal_certificate=question.temporal_certificate,
+        total_intervals=question.reference_intervals,
+        pred=MMLifelongPrediction(answer="", intervals=()),
+        mindbridge_unofficial_ref_at_300=0.0,
+        mindbridge_confidence=0.0,
+        mindbridge_memory_ids=(),
+        mindbridge_evidence_ids=(),
+        mindbridge_trace_id=answer_failure_trace_id(str(question.index)),
+        mindbridge_error_code=error_code,
         mindbridge_ingest_failure_count=ingest_failures,
     )
 
