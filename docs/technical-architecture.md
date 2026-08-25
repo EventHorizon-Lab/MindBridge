@@ -1348,11 +1348,11 @@ clip 的 PyAV、Pillow、SoundFile 解码器只声明在这个 extra 里，且�
 `server` 的 Worker 能正常启动、能通过导入探针，然后在第一条带媒体的 observation 上失败；只有
 本地加载 Jina Omni 的 GPU Worker 再叠加 `cloud-models`（它依赖 `mindbridge[media]`，所以会把
 `media` 一并带上）。端侧安装不得因 SQLite 身份或同步能力被迫携带 Celery、MCP、PostgreSQL、
-FastAPI 等服务端栈，子包导入隔离由独立进程测试守护。`edge` 的 Python 依赖只覆盖同步、安全、
-OpenAI SDK 和可观测性；不再为声纹二次解码携带 SoundFile，也不携带 NeMo。InsightFace/ONNX
-Runtime、FunASR/ModelScope 与设备版 Torch 必须使用与目标平台 SDK 匹配的镜像工件（JetPack/CUDA、
-地瓜 OpenExplorer、RKNN Toolkit、OpenVINO 或普通 CUDA/CPU 主机），不能由通用 lockfile 覆盖任何
-平台运行时；`edge` 的通用依赖不钉死任何一家的加速器 wheel。FunASR 自身仍是模型栈而非“轻依赖”，减重来自只维护一套上游
+FastAPI 等服务端栈，子包导入隔离由独立进程测试守护。`edge` 在 Linux/Windows x86_64 和 macOS
+14+ Apple Silicon 安装通用 InsightFace/ONNX Runtime、FunASR/ModelScope 与 Torch/TorchAudio；
+Linux ARM 设备仍使用与 JetPack、OpenExplorer、RKNN、OpenVINO 或 BPU 匹配的镜像工件。随包的
+ONNX Runtime 是 CPU provider，CUDA/TensorRT 人脸 provider 由平台镜像提供。FunASR 自身仍是模型栈
+而非“轻依赖”，减重来自只维护一套上游
 speech runtime、且不把它拖入 Core/SDK/server。llama.cpp 的 FunASR/GGUF 支持适合作为未来
 ASR/VAD 多端运行时候选，但当前没有证据证明它完整覆盖 punctuation、diarization 和 voiceprint，
 因此不能作为这一统一身份管线的透明替换。
