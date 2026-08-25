@@ -24,6 +24,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from mindbridge.benchmarks.prepare import PREPARERS
 from mindbridge.benchmarks.releases import missing_inputs, release_for
 
 DEFAULT_BENCHMARKS_ROOT = Path(".benchmarks")
@@ -107,8 +108,6 @@ def _m3(subset: str) -> CatalogTask:
         (
             "--dataset",
             f"{ROOT}/m3-agent/data/annotations/{subset}.json",
-            "--prepared-media",
-            f"{ROOT}/m3-prepared-{subset}.json",
             "--subset",
             subset,
         ),
@@ -183,8 +182,6 @@ TASKS: dict[str, CatalogTask] = {
         (
             "--dataset",
             f"{ROOT}/mem-gallery/data/dialog",
-            "--prepared-images",
-            f"{ROOT}/mem-gallery-prepared-images.json",
         ),
         output_suffix=".json",
     ),
@@ -280,9 +277,9 @@ def task_inputs(names: Sequence[str], *, root: Path) -> dict[str, tuple[Path, ..
 def listing(*, root: Path) -> str:
     """Render every name `--tasks` accepts, and what obtaining it would still take.
 
-    Three states, because they call for three different things: `ready` runs now, `download`
-    runs after a fetch the sweep performs itself, and a named path is one no release supplies —
-    a prepared-media manifest, which is work MindBridge deliberately does not do.
+    Four states, because they call for four different things: `ready` runs now, `download` runs
+    after a fetch the sweep performs itself, `prepare` after it also stages the media, and a
+    named path is a manifest with no producer yet, which has to be made out-of-band.
     """
     lines = [f"groups (--tasks expands these), inputs resolved against {root}:"]
     lines += [f"  {name:<24}{', '.join(members)}" for name, members in GROUPS.items()]
@@ -295,9 +292,13 @@ def listing(*, root: Path) -> str:
 def _state(task: CatalogTask, *, root: Path) -> str:
     """Say what stands between this task and a run."""
     absent = missing_inputs(task.inputs(root=root), root=root)
+    if task.benchmark in PREPARERS:
+        # Its manifest is written per run into the sweep's own output directory, so there is no
+        # file here to find or to have gone stale: what it needs is the staging, every time.
+        return "prepare" if not absent else "download, prepare"
     if not absent:
         return "ready"
     unobtainable = tuple(path for path in absent if release_for(path, root=root) is None)
-    if not unobtainable:
-        return "download"
-    return f"needs {', '.join(str(path) for path in unobtainable)}"
+    if unobtainable:
+        return f"needs {', '.join(str(path) for path in unobtainable)}"
+    return "download"

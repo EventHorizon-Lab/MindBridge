@@ -24,6 +24,7 @@ from mindbridge.benchmarks.atm_cli import AtmSplit
 from mindbridge.benchmarks.cli import INTERRUPT_EXIT_CODE, RUNNERS, USAGE_EXIT_CODE, Runner
 from mindbridge.benchmarks.memlens_cli import MemLensContextWindow
 from mindbridge.benchmarks.mm_lifelong import MMLifelongSplit
+from mindbridge.benchmarks.prepare import PREPARERS, Producer
 from mindbridge.benchmarks.suite import (
     SUMMARY_FILENAME,
     BenchmarkSuite,
@@ -97,6 +98,105 @@ def test_only_the_shared_flags_that_were_given_are_forwarded(
     assert "--recall-limit" not in invocations[0]
     assert "--request-concurrency" not in invocations[0]
     assert "--request-timeout-seconds" not in invocations[0]
+
+
+def test_a_producer_backed_task_gets_a_manifest_path_of_its_own_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A manifest names objects under one run's tenant, so a shared path is unreadable later.
+
+    Shared, the first run's file was found on disk, preparation was skipped as already-done, and
+    the run failed on a manifest describing another run's tenant.
+    """
+    prepared: list[tuple[str, ...]] = []
+    monkeypatch.setitem(
+        TASKS, "stub-task", CatalogTask("stub", ("--dataset", f"{ROOT}/stub/release.json"))
+    )
+    monkeypatch.setitem(
+        PREPARERS,
+        "stub",
+        Producer("--prepared-media", lambda request: prepared.append(request.argv)),
+    )
+    invocations = _stub_benchmark(monkeypatch, writes=True)
+
+    for run in ("run-a", "run-b"):
+        assert _catalog_sweep(tmp_path, run) == 0
+
+    manifests = [_flag_value(argv, "--prepared-media") for argv in invocations]
+    assert manifests == [
+        str(tmp_path / "results" / "run-a" / "run-a-stub-task-prepared.json"),
+        str(tmp_path / "results" / "run-b" / "run-b-stub-task-prepared.json"),
+    ]
+    # Preparation ran for both, because neither found the other's file.
+    assert len(prepared) == 2
+
+
+def test_a_suite_supplying_its_own_manifest_keeps_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Overriding a hand-supplied manifest would silently prepare over the one asked for.
+
+    That path is how a benchmark with no producer gets staged at all, and how a producer-backed
+    one reuses media prepared elsewhere.
+    """
+    prepared: list[tuple[str, ...]] = []
+    monkeypatch.setitem(
+        PREPARERS,
+        "stub",
+        Producer("--prepared-media", lambda request: prepared.append(request.argv)),
+    )
+    invocations = _stub_benchmark(monkeypatch, writes=True)
+    suite = _suite_file(
+        tmp_path,
+        _task("mine", arguments=["--prepared-media", str(tmp_path / "mine.json")]),
+    )
+    (tmp_path / "mine.json").write_text("{}", encoding="utf-8")
+
+    assert _sweep(suite, tmp_path) == 0
+
+    # Once, not twice: appended as well, argparse would keep the sweep's copy and the task's
+    # own would read as ignored rather than refused.
+    assert invocations[0].count("--prepared-media") == 1
+    assert _flag_value(invocations[0], "--prepared-media") == str(tmp_path / "mine.json")
+    assert prepared == []
+
+
+def test_a_preparation_that_fails_is_that_task_and_not_the_sweep(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Staging can fail on credentials or a missing source; the other tasks still deserve a run."""
+
+    def refuse(request: object) -> None:
+        raise RuntimeError("no credentials for the bucket")
+
+    monkeypatch.setitem(
+        TASKS, "stub-task", CatalogTask("stub", ("--dataset", f"{ROOT}/stub/release.json"))
+    )
+    monkeypatch.setitem(PREPARERS, "stub", Producer("--prepared-media", refuse))
+    invocations = _stub_benchmark(monkeypatch, writes=True)
+
+    assert _catalog_sweep(tmp_path, "run-a") == 1
+
+    assert invocations == []
+    summary = _summary(tmp_path / "results" / "run-a")
+    assert summary.tasks[0].status == "failed"
+
+
+def _catalog_sweep(root: Path, run_id: str) -> int:
+    return main(
+        [
+            "--tasks",
+            "stub-task",
+            "--run-id",
+            run_id,
+            "--benchmarks-root",
+            str(root),
+            "--no-download",
+        ]
+    )
 
 
 def test_a_sweep_records_every_task_and_keeps_going_past_one_that_fails(
@@ -400,10 +500,10 @@ def test_an_unknown_catalog_name_says_how_to_find_the_real_ones() -> None:
         task_payloads(["nope"], root=Path("/corpus"))
 
 
-def test_the_listing_says_which_of_three_things_stands_between_a_task_and_a_run(
+def test_the_listing_says_which_of_four_things_stands_between_a_task_and_a_run(
     tmp_path: Path,
 ) -> None:
-    """Ready, one download away, or blocked on work MindBridge does not do — three answers."""
+    """Ready, a download away, a preparation away, or blocked on a manifest with no producer."""
     dataset = tmp_path / "locomo-refined" / "data" / "raw"
     dataset.mkdir(parents=True)
     (dataset / "locomo_refined.json").write_text("[]", encoding="utf-8")
@@ -413,10 +513,10 @@ def test_the_listing_says_which_of_three_things_stands_between_a_task_and_a_run(
     assert lines["locomo-refined"].endswith("ready")
     # Every MEMLENS input comes from a release, so nothing is asked of the operator.
     assert lines["memlens-32k"].endswith("download")
-    # M3-Bench's annotations are downloadable; its prepared media is not, so that is what it
-    # names — the annotation path would be noise next to a file only the operator can produce.
-    assert f"{tmp_path}/m3-prepared-robot.json" in lines["m3-robot"]
-    assert "m3-agent" not in lines["m3-robot"]
+    # M3-Bench's prepared media has a producer, so the sweep will stage it rather than ask.
+    assert lines["m3-robot"].endswith("prepare")
+    # EgoLifeQA's has none yet, so its manifest is named rather than silently promised.
+    assert f"{tmp_path}/egolife-prepared-a1.json" in lines["egolife"]
 
 
 def test_the_catalog_path_needs_no_file_and_derives_where_everything_goes(
@@ -499,8 +599,14 @@ def _stub_benchmark(
 
 
 def _write_predictions(argv: Sequence[str]) -> None:
-    """Write what a real runner writes, so the sweep can see the task produced a result."""
-    Path(_flag_value(argv, "--output")).write_text("{}\n", encoding="utf-8")
+    """Write what a real runner writes, so the sweep can see the task produced a result.
+
+    Creating the directory too, because `write_text_atomically` does and the sweep's default
+    output directory is one it has never had to create itself before.
+    """
+    path = Path(_flag_value(argv, "--output"))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{}\n", encoding="utf-8")
 
 
 def _task(name: str, *, arguments: Sequence[str] = ()) -> dict[str, object]:

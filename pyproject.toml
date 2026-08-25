@@ -49,6 +49,12 @@ benchmarks = [
     # snapshot_download. Imported lazily, so a harness with the corpora already on disk still
     # runs without it; declared here because the import is this subtree's own.
     "huggingface-hub>=0.30,<2",
+    # benchmarks/prepare.py stages the clips it cuts into the deployment's own bucket. Both are
+    # lazy imports reached only when a task's prepared media has to be produced.
+    "boto3>=1.40,<2",
+    # It cuts them with mindbridge.media.clipping, the encoder the product stores evidence with,
+    # rather than a second one that would drift from it.
+    "mindbridge[media]",
 ]
 edge = [
     "boto3>=1.40,<2",

@@ -165,48 +165,55 @@ Downloads are skipped for files already present, so a second sweep fetches nothi
 same one the manual commands in "Benchmark dataset smoke" below produce, so an existing corpus is
 found as-is. `--no-download` refuses to fetch and fails on an absent release instead.
 
-### What cannot be downloaded
+### Prepared media
 
-Media benchmarks need a prepared-media manifest: a JSON file naming clips already uploaded to
-storage, with their durations and identity spans. MindBridge contains no downloader, clipper, or
-uploader for that by design, so no release can supply it and no flag can conjure it. What the
-catalog knows is the file name this page uses — `.benchmarks/m3-prepared-robot.json` and its
-siblings — which is what `--list-tasks` prints when it is absent. Produce it as the per-benchmark
-sections below describe, point `--benchmarks-root` at a tree that has it, or write the task out in
-a `--suite` file.
+Media benchmarks read a prepared-media manifest: a JSON file naming clips already in object
+storage, with their durations and the identity spans over them. A sweep produces that manifest
+itself for the benchmarks below, staging into the deployment's own bucket:
 
-This is why `--tasks all` is not a turnkey full-corpus run: the six text tasks need nothing, and
-the rest need that manifest first.
+| Benchmark | Produced from | Needs |
+| --- | --- | --- |
+| `mem-gallery` | the release's own images | the bucket |
+| `m3-robot`, `m3-web` | the official videos, cut into 30-second clips | the bucket, the videos |
 
-`--suite FILE` runs tasks from a JSON file instead of the catalog, for the cells the catalog does
-not name. `--tasks` then narrows that file rather than the catalog. Nothing is downloaded for a
-suite file: its paths are literal, and guessing which of a task's arguments name files is how a
-tool starts trying to download a `--split` value.
+Two properties are forced rather than chosen, and they are worth knowing before reading a
+manifest.
 
-```json
-{
-  "tasks": [
-    {
-      "name": "video-mme-long-subtitled",
-      "benchmark": "video-mme",
-      "output_name": "video-mme-long-subtitled.json",
-      "arguments": [
-        "--dataset", ".benchmarks/video-mme/videomme/test-00000-of-00001.parquet",
-        "--prepared-media", ".benchmarks/video-mme-prepared-subtitled.json",
-        "--duration", "long",
-        "--transcript-source", "official_subtitles"
-      ]
-    }
-  ]
-}
-```
+**A manifest belongs to one run.** A media URI is accepted only under
+`tenants/<tenant_id>/`, and a benchmark tenant is `<tenant-prefix>_<unit>_<run-id>`. The same
+clips staged under another `--run-id` are unreadable, so preparation happens inside the run
+rather than once beside the corpus. `--limit` is what keeps that affordable: it bounds the units
+prepared as well as the units answered.
 
-`name` is the task's own identity: it names the predictions file — `<name>.jsonl`, or
-`output_name` where a runner emits one JSON array rather than one object per line — and it is
-appended to `--run-id`. `arguments` are that runner's own flags, passed through verbatim, so the
-runner's parser is what validates them and a flag added to a runner needs no change here. Both
-sources go through the same validation: an unknown benchmark, a duplicate task name, or a flag
-the sweep owns is refused before the first task starts.
+**The selection is the runner's own.** Each producer parses the task's arguments with the
+runner's parser and selects with the runner's helper, so it cannot prepare a unit the run will
+skip or miss one the run will read.
+
+Clips are cut by the same encoder the product stores evidence with, audio track included, so
+what a benchmark ingests is what the product would have produced. Preparation is skipped when the
+manifest already exists, and a preparation that fails is that task's failure — the sweep reports
+it and runs the remaining tasks.
+
+Bucket credentials are Boto3's own (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`); the bucket and
+endpoint come from the same `[object_storage]` configuration the deployment reads, so a benchmark
+cannot stage into a bucket the deployment will not look in.
+
+### Prepared media that is still manual
+
+`egolife`, `egomem`, `egotempo`, `mm-lifelong`, `supermemory`, `video-mme`, and `video-mme-v2`
+have no producer yet, and `--list-tasks` names the manifest each one wants. Their manifests are
+not the two shapes above:
+
+- EgoLifeQA, EgoMemReason, and MM-Lifelong encode their own clocks — EgoLifeQA's `DAYn` plus
+  `HHMMSSFF` at the release's 20 FPS, with clips crossing a question's time withheld until a
+  later question. That derivation is the work, not the cutting.
+- EgoTempo's videos are Ego4D, which is licensed separately and cannot be fetched on your behalf.
+- Video-MME ships its videos as 20 zip archives totalling 94 GiB, so a single video cannot be
+  obtained without the archive holding it.
+
+M3-Bench's released memory graphs would give a caption-only manifest with no video at all, which
+is the cheaper released-text arm. They are distributed as Python pickles, and unpickling a
+downloaded file executes whatever it contains, so that path stays a deliberate manual step.
 
 ### Smoke runs
 

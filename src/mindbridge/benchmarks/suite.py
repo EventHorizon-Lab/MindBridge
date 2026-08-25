@@ -47,6 +47,7 @@ from mindbridge.benchmarks.cli_common import (
     report_unit,
     select_by_id,
 )
+from mindbridge.benchmarks.prepare import PREPARERS, PrepareRequest
 from mindbridge.benchmarks.releases import fetch
 from mindbridge.benchmarks.task_catalog import (
     DEFAULT_BENCHMARKS_ROOT,
@@ -212,7 +213,7 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> int:
     _require_writable_outputs(plans, summary_path, overwrite=arguments.overwrite)
     report(f"running {len(plans)} benchmarks", quiet=arguments.quiet)
     started_at = datetime.now(timezone.utc)
-    outcomes = _run_plans(plans, quiet=arguments.quiet)
+    outcomes = _run_plans(plans, arguments)
     summary = SuiteRunSummary(
         suite_sha256=hashlib.sha256(suite.model_dump_json().encode("utf-8")).hexdigest(),
         run_id=arguments.run_id,
@@ -282,8 +283,12 @@ def _load_suite(arguments: _Arguments) -> BenchmarkSuite:
     return BenchmarkSuite(tasks=selected)
 
 
-def _run_plans(plans: tuple[_Plan, ...], *, quiet: bool) -> tuple[SuiteTaskOutcome, ...]:
+def _run_plans(
+    plans: tuple[_Plan, ...],
+    arguments: _Arguments,
+) -> tuple[SuiteTaskOutcome, ...]:
     """Run the planned tasks one at a time, stopping only for an interrupt."""
+    quiet = arguments.quiet
     outcomes: list[SuiteTaskOutcome] = []
     for index, plan in enumerate(plans, start=1):
         report_unit(
@@ -292,7 +297,7 @@ def _run_plans(plans: tuple[_Plan, ...], *, quiet: bool) -> tuple[SuiteTaskOutco
             total=len(plans),
             quiet=quiet,
         )
-        outcome = _run_task(plan)
+        outcome = _run_task_prepared(plan, arguments)
         outcomes.append(outcome)
         report(
             f"{plan.task.name} {outcome.status} in {outcome.duration_seconds:.1f}s",
@@ -302,6 +307,49 @@ def _run_plans(plans: tuple[_Plan, ...], *, quiet: bool) -> tuple[SuiteTaskOutco
             report("interrupted; the remaining benchmarks did not start", quiet=quiet)
             break
     return tuple(outcomes)
+
+
+def _run_task_prepared(plan: _Plan, arguments: _Arguments) -> SuiteTaskOutcome:
+    """Prepare this task's media if it needs it, then run it.
+
+    A preparation that fails is this task's failure, not the sweep's: it produces the same
+    outcome row as a run that died, so the summary says which task could not be staged and the
+    remaining tasks still run.
+    """
+    try:
+        _prepare_task(plan, arguments)
+    except Exception as error:
+        print(f"{PROGRAM} {plan.task.name}: error: {error}", file=sys.stderr)
+        return _outcome(plan, exit_code=1, duration_seconds=0.0)
+    return _run_task(plan)
+
+
+def _prepare_task(plan: _Plan, arguments: _Arguments) -> None:
+    """Produce this task's prepared media, when a producer exists and it is not already there.
+
+    Per task rather than once per sweep: a manifest names objects under the task's own tenant,
+    which the sweep derives from its run ID, so two tasks cannot share one.
+    """
+    producer = PREPARERS.get(plan.task.benchmark)
+    manifest = _prepared_manifest_path(plan)
+    if producer is None or manifest is None or manifest.exists():
+        return
+    report(f"preparing {plan.task.name}", quiet=arguments.quiet)
+    producer.produce(
+        PrepareRequest(
+            argv=plan.arguments,
+            benchmarks_root=arguments.benchmarks_root,
+            quiet=arguments.quiet,
+        )
+    )
+
+
+def _prepared_manifest_path(plan: _Plan) -> Path | None:
+    """The manifest this task reads, read off the argv rather than guessed from the benchmark."""
+    for flag in ("--prepared-media", "--prepared-images"):
+        if flag in plan.arguments:
+            return Path(plan.arguments[plan.arguments.index(flag) + 1])
+    return None
 
 
 def _run_task(plan: _Plan) -> SuiteTaskOutcome:
@@ -321,6 +369,11 @@ def _run_task(plan: _Plan) -> SuiteTaskOutcome:
         )
     except SystemExit as request:
         exit_code = _requested_exit_code(request)
+    return _outcome(plan, exit_code=exit_code, duration_seconds=time.monotonic() - started)
+
+
+def _outcome(plan: _Plan, *, exit_code: int, duration_seconds: float) -> SuiteTaskOutcome:
+    """Record what one task did, whether it got as far as running or not."""
     return SuiteTaskOutcome(
         name=plan.task.name,
         benchmark=plan.task.benchmark,
@@ -329,7 +382,7 @@ def _run_task(plan: _Plan) -> SuiteTaskOutcome:
         arguments=plan.arguments,
         status=_task_status(plan, exit_code),
         exit_code=exit_code,
-        duration_seconds=time.monotonic() - started,
+        duration_seconds=duration_seconds,
     )
 
 
@@ -384,12 +437,35 @@ def _plan(task: SuiteTask, arguments: _Arguments) -> _Plan:
         arguments=(
             *arguments.shared,
             *task.arguments,
+            *_prepared_media_arguments(task, arguments, run_id=run_id),
             "--output",
             str(output_path),
             "--run-id",
             run_id,
         ),
     )
+
+
+def _prepared_media_arguments(
+    task: SuiteTask,
+    arguments: _Arguments,
+    *,
+    run_id: str,
+) -> tuple[str, ...]:
+    """Point a producer-backed task at the manifest this run will write for it.
+
+    The sweep owns this path for the same reason it owns `--run-id`: a manifest names objects
+    under one run's tenant, so a path shared between runs is one a later run cannot read. Left in
+    the catalog, an earlier run's file was found on disk, preparation was skipped as
+    already-done, and the run failed on a manifest describing somebody else's tenant.
+
+    A task that already carries the flag keeps it, which is how a hand-written `--suite` entry
+    supplies a manifest MindBridge cannot produce.
+    """
+    producer = PREPARERS.get(task.benchmark)
+    if producer is None or producer.flag in task.arguments:
+        return ()
+    return (producer.flag, str(arguments.output_dir / f"{run_id}-prepared.json"))
 
 
 def _require_writable_outputs(

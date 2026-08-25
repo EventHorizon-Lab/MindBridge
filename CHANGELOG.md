@@ -56,7 +56,8 @@ The capabilities present on `master` today:
   from one invocation against one deployment, from a shipped task catalog rather than a file you
   write, downloading each official release it needs at a pinned revision and verifying it against
   a committed digest, and records each outcome in a sweep summary. `--limit N` scopes any runner to
-  its first N units for a smoke run.
+  its first N units for a smoke run, and prepared-media manifests are produced for Mem-Gallery
+  and M3-Bench rather than assembled by hand.
 - Python 3.10 through 3.14, with the whole quality gate — format, lint, types, tests — run on
   every one of them.
 

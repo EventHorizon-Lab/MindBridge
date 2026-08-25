@@ -1672,9 +1672,15 @@ all = [
     { name = "uvicorn" },
 ]
 benchmarks = [
+    { name = "av" },
+    { name = "boto3" },
     { name = "huggingface-hub" },
+    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.13'" },
+    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.13'" },
     { name = "opentelemetry-api" },
+    { name = "pillow" },
     { name = "pyarrow" },
+    { name = "soundfile" },
 ]
 cloud-models = [
     { name = "av" },
@@ -1752,6 +1758,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "av", marker = "extra == 'media'", specifier = ">=16,<17" },
+    { name = "boto3", marker = "extra == 'benchmarks'", specifier = ">=1.40,<2" },
     { name = "boto3", marker = "extra == 'edge'", specifier = ">=1.40,<2" },
     { name = "boto3", marker = "extra == 'server'", specifier = ">=1.40,<2" },
     { name = "botocore", marker = "extra == 'edge'", specifier = ">=1.40,<2" },
@@ -1767,6 +1774,7 @@ requires-dist = [
     { name = "mcp", marker = "extra == 'server'", specifier = ">=2,<3" },
     { name = "mcp-types", marker = "extra == 'server'", specifier = ">=2,<3" },
     { name = "mindbridge", extras = ["benchmarks", "cloud-models", "edge", "media", "server"], marker = "extra == 'all'" },
+    { name = "mindbridge", extras = ["media"], marker = "extra == 'benchmarks'" },
     { name = "mindbridge", extras = ["media"], marker = "extra == 'cloud-models'" },
     { name = "numpy", marker = "extra == 'edge'", specifier = ">=1.26,<3" },
     { name = "numpy", marker = "extra == 'media'", specifier = ">=1.26,<3" },
