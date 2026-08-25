@@ -47,9 +47,11 @@ from mindbridge.benchmarks.cli_common import (
     report_unit,
     select_by_id,
 )
+from mindbridge.benchmarks.releases import fetch
 from mindbridge.benchmarks.task_catalog import (
     DEFAULT_BENCHMARKS_ROOT,
     listing,
+    task_inputs,
     task_payloads,
 )
 from mindbridge.contracts import ContractModel, Identifier, NonEmptyString, Sha256Hex
@@ -173,6 +175,7 @@ class _Arguments:
     task_names: tuple[str, ...]
     suite_path: Path | None
     benchmarks_root: Path
+    download: bool
     output_dir: Path
     run_id: str
     shared: tuple[str, ...]
@@ -204,6 +207,7 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> int:
     if arguments.dry_run:
         _print_plan(plans)
         return 0
+    _obtain_releases(arguments)
     summary_path = arguments.output_dir / SUMMARY_FILENAME
     _require_writable_outputs(plans, summary_path, overwrite=arguments.overwrite)
     report(f"running {len(plans)} benchmarks", quiet=arguments.quiet)
@@ -222,6 +226,39 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> int:
     write_text_atomically(summary_path, summary.model_dump_json(indent=2) + "\n")
     report(f"wrote {summary_path}", quiet=arguments.quiet)
     return _sweep_exit_code(outcomes)
+
+
+def _obtain_releases(arguments: _Arguments) -> None:
+    """Download the official files the named tasks read, and name what no release supplies.
+
+    Only for catalog tasks: a `--suite` file carries literal paths whose provenance this command
+    does not know, and guessing which of its arguments are files would be how it started
+    downloading a `--split` value.
+
+    A task whose prepared-media manifest is absent is reported rather than refused. It will fail
+    when its turn comes, with its runner naming the file, and refusing the whole sweep for it
+    would also refuse the tasks that are ready.
+    """
+    if arguments.suite_path is not None or not arguments.download:
+        return
+    inputs = task_inputs(arguments.task_names, root=arguments.benchmarks_root)
+    for name, paths in inputs.items():
+        unobtainable = fetch(
+            paths,
+            root=arguments.benchmarks_root,
+            announce=None if arguments.quiet else _announce,
+        )
+        for path in unobtainable:
+            report(
+                f"{name}: {path} is not part of any official release; prepare it as "
+                "docs/benchmarking.md describes",
+                quiet=arguments.quiet,
+            )
+
+
+def _announce(message: str) -> None:
+    """Say what is being downloaded, so a multi-gigabyte fetch is never silent."""
+    report(message, quiet=False)
 
 
 def _load_suite(arguments: _Arguments) -> BenchmarkSuite:
@@ -480,6 +517,12 @@ def _build_parser(prog: str | None) -> argparse.ArgumentParser:
         help="run the tasks in this JSON file instead of the catalog's; --tasks then narrows it",
     )
     parser.add_argument(
+        "--no-download",
+        dest="download",
+        action="store_false",
+        help="fail on an absent official release instead of downloading it first",
+    )
+    parser.add_argument(
         "--overwrite",
         action="store_true",
         help="replace existing predictions, manifests, and this sweep's summary",
@@ -512,6 +555,7 @@ def _arguments(parser: argparse.ArgumentParser, parsed: argparse.Namespace) -> _
         task_names=names,
         suite_path=parsed.suite,
         benchmarks_root=root,
+        download=parsed.download,
         output_dir=parsed.output_dir or root / "results" / parsed.run_id,
         run_id=parsed.run_id,
         shared=_shared_arguments(parsed, root=root),

@@ -13,12 +13,17 @@ import sys
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from types import ModuleType
+from typing import get_args
 
 import pytest
 from pydantic import ValidationError
 
 from mindbridge import telemetry
+from mindbridge.benchmarks.atm_bench_runner import AtmMediaSource
+from mindbridge.benchmarks.atm_cli import AtmSplit
 from mindbridge.benchmarks.cli import INTERRUPT_EXIT_CODE, RUNNERS, USAGE_EXIT_CODE, Runner
+from mindbridge.benchmarks.memlens_cli import MemLensContextWindow
+from mindbridge.benchmarks.mm_lifelong import MMLifelongSplit
 from mindbridge.benchmarks.suite import (
     SUMMARY_FILENAME,
     BenchmarkSuite,
@@ -337,6 +342,29 @@ def test_every_catalog_task_is_one_the_sweep_can_actually_dispatch() -> None:
         assert all(path.startswith("/corpus/") for path in paths), task.name
 
 
+def test_the_catalog_names_every_value_of_the_choices_that_partition_a_corpus() -> None:
+    """A split with no task is a leaderboard cell `--tasks` silently cannot name.
+
+    The expected values come from each adapter's own `Literal`, not from a list restated here,
+    so a release that grows a split fails this until the catalog carries it.
+    """
+    named = {
+        benchmark: {
+            argument
+            for name, task in TASKS.items()
+            if task.benchmark == benchmark
+            for argument in task.arguments
+        }
+        for benchmark in ("mm-lifelong", "memlens", "atm", "m3")
+    }
+
+    assert set(get_args(MMLifelongSplit)) <= named["mm-lifelong"]
+    assert set(get_args(MemLensContextWindow)) <= named["memlens"]
+    assert set(get_args(AtmSplit)) <= named["atm"]
+    assert set(get_args(AtmMediaSource)) <= named["atm"]
+    assert {"robot", "web"} <= named["m3"]
+
+
 def test_the_released_text_group_needs_no_operator_produced_media() -> None:
     """It is the group whose numbers are a memory-layer claim, which is what makes it citable."""
     suite = BenchmarkSuite.model_validate(
@@ -372,10 +400,10 @@ def test_an_unknown_catalog_name_says_how_to_find_the_real_ones() -> None:
         task_payloads(["nope"], root=Path("/corpus"))
 
 
-def test_the_listing_separates_a_task_whose_inputs_are_present_from_one_missing_them(
+def test_the_listing_says_which_of_three_things_stands_between_a_task_and_a_run(
     tmp_path: Path,
 ) -> None:
-    """`--list-tasks` is the answer to "which of these can I actually run right now"."""
+    """Ready, one download away, or blocked on work MindBridge does not do — three answers."""
     dataset = tmp_path / "locomo-refined" / "data" / "raw"
     dataset.mkdir(parents=True)
     (dataset / "locomo_refined.json").write_text("[]", encoding="utf-8")
@@ -383,9 +411,12 @@ def test_the_listing_separates_a_task_whose_inputs_are_present_from_one_missing_
     lines = {line.split()[0]: line for line in listing(root=tmp_path).splitlines() if line.strip()}
 
     assert lines["locomo-refined"].endswith("ready")
-    # Both of this one's inputs are absent, and it names both rather than only the first.
-    assert f"{tmp_path}/m3-agent/data/annotations/robot.json" in lines["m3-robot"]
+    # Every MEMLENS input comes from a release, so nothing is asked of the operator.
+    assert lines["memlens-32k"].endswith("download")
+    # M3-Bench's annotations are downloadable; its prepared media is not, so that is what it
+    # names — the annotation path would be noise next to a file only the operator can produce.
     assert f"{tmp_path}/m3-prepared-robot.json" in lines["m3-robot"]
+    assert "m3-agent" not in lines["m3-robot"]
 
 
 def test_the_catalog_path_needs_no_file_and_derives_where_everything_goes(

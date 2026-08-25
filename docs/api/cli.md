@@ -412,7 +412,7 @@ uv run mindbridge-bench
 
 | Support command | Extra | Purpose |
 | --- | --- | --- |
-| `suite` | — | Run several of the runners above from one suite file. |
+| `suite` | `benchmarks` | Run several of the runners above by name, downloading what they read. |
 | `score` | — | Record an official scorer's verdict beside a run. |
 | `datasets` | `benchmarks` | Check every official release parses and pins its digest. |
 | `jina` | `cloud-models` | Check the local Jina Omni embedder answers. |
@@ -424,17 +424,20 @@ benchmark that bypasses the product measures something the product does not do.
 Every runner accepts `--limit N` to run only the first N of its own units, which is what makes a
 smoke run cheap enough to iterate on.
 
-`suite` runs several runners in one invocation. `--tasks` names entries in a shipped catalog, so
-the common case needs no file:
+`suite` runs several runners in one invocation. `--tasks` names entries in a shipped catalog and
+each official release is downloaded at a pinned revision if absent, so the common case needs
+neither a file to write nor a corpus to populate first:
 
 ```bash
-uv run mindbridge-bench suite --tasks released-text --run-id sweep-001 --limit 2
-uv run mindbridge-bench suite --list-tasks
+uv run --extra benchmarks mindbridge-bench suite --tasks released-text --run-id sweep-001 --limit 2
+uv run --extra benchmarks mindbridge-bench suite --list-tasks
 ```
 
-Only `--run-id` and the task names have no default. The sweep derives each task's `--output` and
-`--run-id` so two parameterisations of one benchmark cannot share a tenant, continues past a task
-that fails, and records every outcome in `suite-summary.json`. See
+Only `--run-id` and the task names have no default. Downloads are verified against the digests in
+`benchmarks/manifests/dataset-adapters-smoke.json`; prepared-media manifests are the one input no
+release supplies. The sweep derives each task's `--output` and `--run-id` so two parameterisations
+of one benchmark cannot share a tenant, continues past a task that fails, and records every
+outcome in `suite-summary.json`. See
 [benchmarking](../benchmarking.md#running-several-benchmarks-in-one-command).
 
 See [benchmarking](../benchmarking.md) for datasets, protocol, and what the numbers license you

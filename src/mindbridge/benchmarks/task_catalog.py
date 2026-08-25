@@ -24,6 +24,8 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from mindbridge.benchmarks.releases import missing_inputs, release_for
+
 DEFAULT_BENCHMARKS_ROOT = Path(".benchmarks")
 """Where `docs/benchmarking.md` downloads every official release to."""
 
@@ -169,6 +171,7 @@ TASKS: dict[str, CatalogTask] = {
     "memlens-128k": _memlens("128k"),
     "memlens-256k": _memlens("256k"),
     "mm-lifelong-day-test": _mm_lifelong("day_test", "day/test"),
+    "mm-lifelong-week-test": _mm_lifelong("week_test", "week/test"),
     "mm-lifelong-month-train": _mm_lifelong("month_train", "month/train"),
     "mm-lifelong-month-val": _mm_lifelong("month_val", "month/val"),
     "atm-main": _atm("main", media_source="raw"),
@@ -269,13 +272,32 @@ def task_payloads(names: Sequence[str], *, root: Path) -> tuple[dict[str, object
     )
 
 
+def task_inputs(names: Sequence[str], *, root: Path) -> dict[str, tuple[Path, ...]]:
+    """The files each named task reads, keyed by task name."""
+    return {name: TASKS[name].inputs(root=root) for name in expand(names)}
+
+
 def listing(*, root: Path) -> str:
-    """Render every name `--tasks` accepts, and whether its inputs are on this machine."""
+    """Render every name `--tasks` accepts, and what obtaining it would still take.
+
+    Three states, because they call for three different things: `ready` runs now, `download`
+    runs after a fetch the sweep performs itself, and a named path is one no release supplies —
+    a prepared-media manifest, which is work MindBridge deliberately does not do.
+    """
     lines = [f"groups (--tasks expands these), inputs resolved against {root}:"]
     lines += [f"  {name:<24}{', '.join(members)}" for name, members in GROUPS.items()]
     lines += ["", "tasks:"]
     for name, task in TASKS.items():
-        missing = tuple(path for path in task.inputs(root=root) if not path.exists())
-        state = "ready" if not missing else f"missing {', '.join(str(p) for p in missing)}"
-        lines.append(f"  {name:<24}{task.benchmark:<16}{state}")
+        lines.append(f"  {name:<24}{task.benchmark:<16}{_state(task, root=root)}")
     return "\n".join(lines)
+
+
+def _state(task: CatalogTask, *, root: Path) -> str:
+    """Say what stands between this task and a run."""
+    absent = missing_inputs(task.inputs(root=root), root=root)
+    if not absent:
+        return "ready"
+    unobtainable = tuple(path for path in absent if release_for(path, root=root) is None)
+    if not unobtainable:
+        return "download"
+    return f"needs {', '.join(str(path) for path in unobtainable)}"

@@ -45,6 +45,10 @@ benchmarks = [
     # own modules rather than a missing model dependency.
     "opentelemetry-api>=1.44,<2",
     "pyarrow>=18,<26",
+    # benchmarks/releases.py downloads the Hub half of the official releases through
+    # snapshot_download. Imported lazily, so a harness with the corpora already on disk still
+    # runs without it; declared here because the import is this subtree's own.
+    "huggingface-hub>=0.30,<2",
 ]
 edge = [
     "boto3>=1.40,<2",

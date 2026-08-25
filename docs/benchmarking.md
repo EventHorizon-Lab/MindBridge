@@ -87,12 +87,14 @@ in parallel so a failure costs one shard rather than the sweep.
 
 ```bash
 export MINDBRIDGE_API_KEY=replace-with-a-runtime-secret
-uv run mindbridge-bench suite --tasks released-text --run-id sweep-001 --limit 2
+uv run --extra benchmarks mindbridge-bench suite \
+  --tasks released-text --run-id sweep-001 --limit 2
 ```
 
-That runs four benchmarks against one deployment. `--tasks` names entries in a catalog shipped
-with MindBridge, so nothing has to be written first; `--list-tasks` prints every name it accepts
-and whether that task's inputs are on this machine:
+That runs four benchmarks against one deployment, downloading each official release it does not
+already have. Nothing has to be cloned or written first. `--tasks` names entries in a catalog
+shipped with MindBridge; `--list-tasks` prints every name it accepts and what obtaining it would
+still take:
 
 ```bash
 uv run mindbridge-bench suite --list-tasks
@@ -105,10 +107,15 @@ groups (--tasks expands these), inputs resolved against .benchmarks:
 
 tasks:
   locomo-refined          locomo-refined  ready
-  m3-robot                m3              missing .benchmarks/m3-prepared-robot.json
-  memlens-32k             memlens         ready
+  memlens-32k             memlens         download
+  m3-robot                m3              needs .benchmarks/m3-prepared-robot.json
   ...
 ```
+
+Three states, because they need three different things. `ready` runs now. `download` runs after a
+fetch the sweep performs itself. A named path is one no official release supplies — a
+prepared-media manifest, which is the one thing still to do by hand; see "What cannot be
+downloaded" below.
 
 Task names are comma-separated and the flag repeats, so `--tasks m3-robot,m3-web --tasks egolife`
 is three tasks. A group expands to several, and a task named twice still runs once.
@@ -133,14 +140,48 @@ value, which is why MEMLENS appears four times and LoCoMo-Refined once. Optional
 enumerated: a run scoped to Video-MME's `long` band or three Mem-Gallery topics is a task of your
 own, and `--limit` already covers a smoke run.
 
-Prepared-media manifests are the one thing the catalog cannot know. MindBridge does not produce
-them, so each entry names the file `docs/benchmarking.md` uses — `.benchmarks/m3-prepared-robot.json`
-and its siblings. If yours is somewhere else, `--list-tasks` shows the task as missing and prints
-the path it wanted; move the file, point `--benchmarks-root` at your tree, or write the task out
-in a `--suite` file.
+### How releases are obtained
+
+A sweep downloads every file its tasks read and does not already have, then holds each one to a
+digest this repository committed. Three things about that are deliberate.
+
+**Only the files a task reads.** ATM-Bench's Hub repository is 3.2 GB and Mem-Gallery's is
+530 MB, but a run consumes five JSON files and one directory of them. Fetching by declared input
+rather than by repository is the difference between about 40 MB and 302 GB — the media in those
+releases is not something a run can use as a file anyway.
+
+**Pinned.** Each release is fetched at a fixed commit: the revisions this page used to publish as
+`--revision` flags to copy, plus resolved commits for the three Git releases that had none. A
+revision in a table cannot be forgotten the way one in a copy-pasted command can.
+
+**Verified.** Every annotation has a `source_sha256` in
+[benchmarks/manifests/dataset-adapters-smoke.json](../benchmarks/manifests/dataset-adapters-smoke.json),
+recorded when `mindbridge-bench datasets` last ran. A download whose bytes differ stops the run
+and names both digests, because upstream changing a release is exactly the drift that makes two
+scores incomparable. Re-run that smoke and record the new digest before measuring against it.
+
+Downloads are skipped for files already present, so a second sweep fetches nothing.
+`--benchmarks-root` chooses where they land — it defaults to `.benchmarks`, and the layout is the
+same one the manual commands in "Benchmark dataset smoke" below produce, so an existing corpus is
+found as-is. `--no-download` refuses to fetch and fails on an absent release instead.
+
+### What cannot be downloaded
+
+Media benchmarks need a prepared-media manifest: a JSON file naming clips already uploaded to
+storage, with their durations and identity spans. MindBridge contains no downloader, clipper, or
+uploader for that by design, so no release can supply it and no flag can conjure it. What the
+catalog knows is the file name this page uses — `.benchmarks/m3-prepared-robot.json` and its
+siblings — which is what `--list-tasks` prints when it is absent. Produce it as the per-benchmark
+sections below describe, point `--benchmarks-root` at a tree that has it, or write the task out in
+a `--suite` file.
+
+This is why `--tasks all` is not a turnkey full-corpus run: the six text tasks need nothing, and
+the rest need that manifest first.
 
 `--suite FILE` runs tasks from a JSON file instead of the catalog, for the cells the catalog does
-not name. `--tasks` then narrows that file rather than the catalog:
+not name. `--tasks` then narrows that file rather than the catalog. Nothing is downloaded for a
+suite file: its paths are literal, and guessing which of a task's arguments name files is how a
+tool starts trying to download a `--split` value.
 
 ```json
 {
@@ -385,8 +426,12 @@ curl -s "$MINDBRIDGE_GENERATOR_ENDPOINT/chat/completions" -H "Authorization: Bea
 
 LoCoMo-Refined, M3-Bench, Video-MME, Video-MME-v2, EgoLife (EgoLifeQA), EgoTempo, EgoMemReason,
 MEMLENS, MM-Lifelong, SuperMemory-VQA, ATM-Bench, and Mem-Gallery are consumed through thin
-adapters over pinned official files. Use Git for code releases and the Hugging Face CLI for Hub
-datasets; MindBridge does not ship another downloader:
+adapters over pinned official files.
+
+`mindbridge-bench suite --tasks ...` fetches each of these itself, at the same revisions, so the
+commands below are for populating a corpus without running a sweep — a mirror, an offline machine,
+or the whole of a release rather than the files one task reads. They also stay the reference for
+what `--benchmarks-root` is expected to contain.
 
 ```bash
 git clone https://github.com/mem-eval-suite/LoCoMo_refined.git .benchmarks/locomo-refined

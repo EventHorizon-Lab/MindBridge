@@ -54,8 +54,9 @@ The capabilities present on `master` today:
 - Benchmark harness driving the production API across twelve official datasets plus the Agent
   Memory Leaderboard offline replay. `mindbridge-bench suite --tasks a,b,c` runs several of them
   from one invocation against one deployment, from a shipped task catalog rather than a file you
-  write, and records each outcome in a sweep summary. `--limit N` scopes any runner to its first N
-  units for a smoke run.
+  write, downloading each official release it needs at a pinned revision and verifying it against
+  a committed digest, and records each outcome in a sweep summary. `--limit N` scopes any runner to
+  its first N units for a smoke run.
 - Python 3.10 through 3.14, with the whole quality gate — format, lint, types, tests — run on
   every one of them.
 
