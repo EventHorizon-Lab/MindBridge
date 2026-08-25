@@ -136,8 +136,13 @@ native text, image, video, audio, and mixed-input preprocessing:
 export MINDBRIDGE_EMBEDDER_API_KEY=replace-with-at-least-32-random-characters
 
 uv run --extra server --extra cloud-models mindbridge jina serve \
-  --host 0.0.0.0 --port 8001 --device cuda
+  --host 0.0.0.0 --port 8001 --device cuda \
+  --media-origin https://media.example.com
 ```
+
+Repeat `--media-origin` for every exact object-storage origin that signs media downloads. The
+service downloads those URLs itself with a 64 MiB limit and rejects redirects and every origin
+not named here, so the model never receives an unrestricted remote URL.
 
 Point `MINDBRIDGE_EMBEDDER_ENDPOINT` at this service's `/v1` base URL and use the same API key in
 the API and worker. `/health` is the readiness probe; `/v1/models` and `/v1/embeddings` follow the

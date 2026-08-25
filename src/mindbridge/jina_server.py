@@ -3,15 +3,19 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import base64
 import binascii
 import hmac
+import http.client
+import json
 import os
 import tempfile
 from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, cast
+from urllib.parse import SplitResult, urlsplit
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
@@ -35,6 +39,9 @@ from mindbridge.models.defaults import (
 from mindbridge.models.plugins import close_model, load_embedder
 
 _MAX_MEDIA_BYTES = 64 * 1024 * 1024
+_MAX_REQUEST_BYTES = 96 * 1024 * 1024
+_MEDIA_DOWNLOAD_TIMEOUT_SECONDS = 30
+_MediaOrigin = tuple[str, str, int]
 _MEDIA_TYPES = {
     "image_url": MediaKind.IMAGE,
     "video_url": MediaKind.VIDEO,
@@ -56,11 +63,13 @@ def create_app(
     api_key: str,
     embedder_config: Mapping[str, object] | None = None,
     embedder: Embedder | None = None,
+    media_origins: Sequence[str] = (),
 ) -> FastAPI:
     """Build one single-model service; injection keeps contract tests model-free."""
     if not api_key.strip():
         raise ValueError("embedding API key must not be empty")
     config = dict(embedder_config or {})
+    allowed_media_origins = _allowed_media_origins(media_origins)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -91,12 +100,12 @@ def create_app(
     @app.post("/v1/embeddings")
     async def embeddings(request: Request) -> dict[str, object]:
         _authorize(request, api_key)
-        try:
-            payload = await request.json()
-        except ValueError as error:
-            raise HTTPException(status_code=400, detail="request body must be JSON") from error
+        payload = await _request_json(request)
         return await _embedding_response(
-            payload, cast(Embedder, request.app.state.embedder), config
+            payload,
+            cast(Embedder, request.app.state.embedder),
+            config,
+            allowed_media_origins,
         )
 
     return app
@@ -106,6 +115,7 @@ async def _embedding_response(
     payload: object,
     embedder: Embedder,
     config: Mapping[str, object],
+    allowed_media_origins: frozenset[_MediaOrigin],
 ) -> dict[str, object]:
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="request body must be an object")
@@ -118,7 +128,7 @@ async def _embedding_response(
     if payload.get("encoding_format", "float") != "float":
         raise HTTPException(status_code=400, detail="only float encoding is supported")
     try:
-        vectors = await _embed(embedder, payload.get("input"))
+        vectors = await _embed(embedder, payload.get("input"), allowed_media_origins)
     except HTTPException:
         raise
     except RuntimeError as error:
@@ -134,12 +144,18 @@ async def _embedding_response(
     }
 
 
-async def _embed(embedder: Embedder, raw_input: object) -> tuple[tuple[float, ...], ...]:
+async def _embed(
+    embedder: Embedder,
+    raw_input: object,
+    allowed_media_origins: frozenset[_MediaOrigin],
+) -> tuple[tuple[float, ...], ...]:
     with tempfile.TemporaryDirectory(prefix="mindbridge-jina-") as temp_dir:
         directory = Path(temp_dir)
-        parsed = tuple(
-            _model_input(sample, directory, index)
-            for index, sample in enumerate(_samples(raw_input))
+        parsed = await asyncio.to_thread(
+            lambda: tuple(
+                _model_input(sample, directory, index, allowed_media_origins)
+                for index, sample in enumerate(_samples(raw_input))
+            )
         )
         tasks = {task for task, _input in parsed}
         if len(tasks) != 1:
@@ -168,13 +184,16 @@ def _samples(raw_input: object) -> list[object]:
 
 
 def _model_input(
-    sample: object, directory: Path, sample_index: int
+    sample: object,
+    directory: Path,
+    sample_index: int,
+    allowed_media_origins: frozenset[_MediaOrigin],
 ) -> tuple[EmbedTask, ModelInput]:
     media: list[MediaPart]
     if isinstance(sample, str):
         text, media = sample, []
     elif isinstance(sample, list):
-        text, media = _message_parts(sample, directory, sample_index)
+        text, media = _message_parts(sample, directory, sample_index, allowed_media_origins)
     else:
         raise HTTPException(status_code=400, detail="unsupported input sample")
 
@@ -186,7 +205,10 @@ def _model_input(
 
 
 def _message_parts(
-    messages: list[object], directory: Path, sample_index: int
+    messages: list[object],
+    directory: Path,
+    sample_index: int,
+    allowed_media_origins: frozenset[_MediaOrigin],
 ) -> tuple[str, list[MediaPart]]:
     texts: list[str] = []
     media: list[MediaPart] = []
@@ -199,8 +221,14 @@ def _message_parts(
             continue
         if not isinstance(content, list):
             raise HTTPException(status_code=400, detail="invalid message content")
-        for part_index, part in enumerate(content):
-            text, media_part = _message_part(part, directory, sample_index, part_index)
+        for part in content:
+            text, media_part = _message_part(
+                part,
+                directory,
+                sample_index,
+                len(media),
+                allowed_media_origins,
+            )
             if text is not None:
                 texts.append(text)
             if media_part is not None:
@@ -213,6 +241,7 @@ def _message_part(
     directory: Path,
     sample_index: int,
     part_index: int,
+    allowed_media_origins: frozenset[_MediaOrigin],
 ) -> tuple[str | None, MediaPart | None]:
     if not isinstance(part, dict):
         raise HTTPException(status_code=400, detail="invalid content part")
@@ -228,7 +257,13 @@ def _message_part(
     url = _content_url(part, typed_kind)
     return None, MediaPart(
         _MEDIA_TYPES[typed_kind],
-        _materialize_media(url, directory, sample_index, part_index),
+        _materialize_media(
+            url,
+            directory,
+            sample_index,
+            part_index,
+            allowed_media_origins,
+        ),
     )
 
 
@@ -248,22 +283,127 @@ def _content_url(part: dict[str, Any], kind: str) -> str:
     return value
 
 
-def _materialize_media(url: str, directory: Path, sample_index: int, part_index: int) -> str:
+def _materialize_media(
+    url: str,
+    directory: Path,
+    sample_index: int,
+    part_index: int,
+    allowed_media_origins: frozenset[_MediaOrigin],
+) -> str:
     if not url.startswith("data:"):
-        return url
+        data, mime = _download_media(url, allowed_media_origins)
+        return _write_media(data, mime, directory, sample_index, part_index)
     try:
         header, encoded = url.split(",", 1)
         mime = header[5:].split(";", 1)[0]
         if ";base64" not in header:
             raise ValueError
+        if len(encoded) > 4 * ((_MAX_MEDIA_BYTES + 2) // 3):
+            raise HTTPException(status_code=413, detail="media item exceeds 64 MiB")
         data = base64.b64decode(encoded, validate=True)
+    except HTTPException:
+        raise
     except (ValueError, binascii.Error) as error:
         raise HTTPException(status_code=400, detail="invalid media data URI") from error
     if len(data) > _MAX_MEDIA_BYTES:
         raise HTTPException(status_code=413, detail="media item exceeds 64 MiB")
+    return _write_media(data, mime, directory, sample_index, part_index)
+
+
+def _write_media(
+    data: bytes,
+    mime: str,
+    directory: Path,
+    sample_index: int,
+    part_index: int,
+) -> str:
     path = directory / f"media-{sample_index}-{part_index}{_SUFFIXES.get(mime, '.bin')}"
     path.write_bytes(data)
     return str(path)
+
+
+def _allowed_media_origins(values: Sequence[str]) -> frozenset[_MediaOrigin]:
+    origins: set[_MediaOrigin] = set()
+    for value in values:
+        parsed = urlsplit(value)
+        if parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
+            raise ValueError("media origins must not contain a path, query, or fragment")
+        try:
+            origins.add(_remote_origin(parsed))
+        except HTTPException as error:
+            raise ValueError("media origins must be HTTP(S) origins without credentials") from error
+    return frozenset(origins)
+
+
+def _remote_origin(parsed: SplitResult) -> _MediaOrigin:
+    if (
+        parsed.scheme not in {"http", "https"}
+        or parsed.hostname is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.fragment
+    ):
+        raise HTTPException(status_code=400, detail="invalid remote media URL")
+    try:
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail="invalid remote media URL") from error
+    return parsed.scheme, parsed.hostname.lower(), port
+
+
+def _download_media(
+    url: str,
+    allowed_media_origins: frozenset[_MediaOrigin],
+) -> tuple[bytes, str]:
+    parsed = urlsplit(url)
+    origin = _remote_origin(parsed)
+    if origin not in allowed_media_origins:
+        raise HTTPException(status_code=400, detail="remote media origin is not allowed")
+    scheme, hostname, port = origin
+    connection_type = (
+        http.client.HTTPSConnection if scheme == "https" else http.client.HTTPConnection
+    )
+    connection = connection_type(hostname, port, timeout=_MEDIA_DOWNLOAD_TIMEOUT_SECONDS)
+    target = parsed.path or "/"
+    if parsed.query:
+        target = f"{target}?{parsed.query}"
+    try:
+        connection.request("GET", target)
+        response = connection.getresponse()
+        if response.status != 200:
+            raise HTTPException(status_code=502, detail="remote media download failed")
+        if response.length is not None and response.length > _MAX_MEDIA_BYTES:
+            raise HTTPException(status_code=413, detail="media item exceeds 64 MiB")
+        data = response.read(_MAX_MEDIA_BYTES + 1)
+        mime = response.headers.get("Content-Type", "application/octet-stream").split(";", 1)[0]
+    except HTTPException:
+        raise
+    except (OSError, http.client.HTTPException) as error:
+        raise HTTPException(status_code=502, detail="remote media download failed") from error
+    finally:
+        connection.close()
+    if len(data) > _MAX_MEDIA_BYTES:
+        raise HTTPException(status_code=413, detail="media item exceeds 64 MiB")
+    return data, mime
+
+
+async def _request_json(request: Request) -> object:
+    declared = request.headers.get("Content-Length")
+    if declared is not None:
+        try:
+            if int(declared) > _MAX_REQUEST_BYTES:
+                raise HTTPException(status_code=413, detail="request body is too large")
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail="invalid Content-Length") from error
+    body = bytearray()
+    async for chunk in request.stream():
+        if len(body) + len(chunk) > _MAX_REQUEST_BYTES:
+            raise HTTPException(status_code=413, detail="request body is too large")
+        body.extend(chunk)
+    try:
+        return json.loads(body)
+    except (ValueError, UnicodeDecodeError) as error:
+        raise HTTPException(status_code=400, detail="request body must be JSON") from error
 
 
 def _authorize(request: Request, api_key: str) -> None:
@@ -299,7 +439,11 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
         "max_concurrency": options.max_concurrency,
     }
     uvicorn.run(
-        create_app(api_key=api_key, embedder_config=config),
+        create_app(
+            api_key=api_key,
+            embedder_config=config,
+            media_origins=options.media_origin,
+        ),
         host=options.host,
         port=options.port,
         workers=1,
@@ -319,4 +463,11 @@ def _parser(prog: str | None) -> argparse.ArgumentParser:
     built.add_argument("--device", default="cuda")
     built.add_argument("--model-id", default=DEFAULT_EMBEDDER_MODEL_ID)
     built.add_argument("--max-concurrency", type=int, default=1)
+    built.add_argument(
+        "--media-origin",
+        action="append",
+        default=[],
+        metavar="URL",
+        help="HTTP(S) origin allowed for remote media; repeat for multiple object stores",
+    )
     return built
