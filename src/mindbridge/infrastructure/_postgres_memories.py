@@ -241,7 +241,11 @@ LEFT JOIN lexical ON TRUE
 WHERE memory.tenant_id = %(tenant_id)s
   AND (
       %(query)s::text IS NULL
-      OR to_tsvector('mindbridge_text', memory.summary) @@ lexical.lexical_query
+      -- `summary_tsv` is the same expression 0019 indexed, stored by migration 0024 rather
+      -- than recomputed. The substring arm below has no index to serve it, so this filter
+      -- runs over every row of the tenant either way; lexing each summary here and again in
+      -- the ORDER BY was the whole cost of a recall -- 298 ms against 34.6 ms for the column.
+      OR memory.summary_tsv @@ lexical.lexical_query
       -- Substring containment, not a LIKE pattern. The query is caller text, and ILIKE read
       -- its wildcard characters as wildcards, so a one-character query of either returned
       -- the whole tenant ranked only by strength. strpos has no pattern language to escape.
@@ -251,10 +255,7 @@ WHERE memory.tenant_id = %(tenant_id)s
 ORDER BY
     CASE
         WHEN lexical.lexical_query IS NULL THEN 0
-        ELSE ts_rank_cd(
-            to_tsvector('mindbridge_text', memory.summary),
-            lexical.lexical_query
-        )
+        ELSE ts_rank_cd(memory.summary_tsv, lexical.lexical_query)
     END DESC,
     memory.strength DESC,
     memory.occurred_at DESC,
