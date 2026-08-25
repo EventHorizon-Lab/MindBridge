@@ -1,6 +1,7 @@
 """Checks for the deployable observation Worker boundary."""
 
 import asyncio
+import json
 from collections.abc import Awaitable, Mapping
 from datetime import datetime, timezone
 from pathlib import Path
@@ -40,6 +41,7 @@ from mindbridge.infrastructure.task_queue import (
     PROCESS_OBSERVATION_TASK,
     ObservationProcessingTaskMessage,
     create_task_queue,
+    observation_delivery_window_seconds,
     observation_queues,
 )
 from mindbridge.models.openai import _GeneratorConfig
@@ -49,6 +51,7 @@ from mindbridge.worker import (
     create_worker_app,
     processing_budget_seconds,
     require_bounded_in_process_models,
+    require_stale_window_covers_delivery,
     require_whole_observation_queue_set,
 )
 
@@ -1010,6 +1013,55 @@ def test_a_worker_that_reads_none_of_them_is_a_different_role_and_starts() -> No
 
     assert not set(observation_queues()) & set(app.amqp.queues.consume_from)
     worker_init.send(sender=_StartingWorker(1))
+
+
+def test_a_generator_timeout_that_outlives_the_stale_window_refuses_to_start() -> None:
+    """A configurable timeout can push one delivery past a constant the SQL cannot follow.
+
+    At `request_timeout_seconds=2100` a delivery may stay alive for 2 580 s -- 2 100 plus the
+    300 s post-model budget, the 60 s hard-limit margin and the 120 s the broker waits -- while
+    the ledger calls the row reclaimable at 2 400. A concurrent delivery or one
+    `mindbridge jobs --republish` then buys the same observation twice, which is the defect the
+    window was widened to close.
+    """
+    with pytest.raises(ValueError, match="stale-claim window") as raised:
+        require_stale_window_covers_delivery(_settings_with_generator_timeout(2_100))
+
+    # The remedy has to name a value that passes, not just report the overrun.
+    assert "1920 s" in str(raised.value)
+    require_stale_window_covers_delivery(_settings_with_generator_timeout(1_920))
+
+
+def test_the_shipped_generator_timeout_leaves_the_stale_window_covering_it() -> None:
+    """Both shipped values have to pass, or the guard is a boot failure rather than a bound."""
+    settings = (
+        WorkerSettings.from_environment(_environment()),
+        # `mindbridge.toml` ships 1800, which is the value a real deployment runs.
+        _settings_with_generator_timeout(1_800),
+    )
+
+    for one in settings:
+        require_stale_window_covers_delivery(one)
+        assert (
+            observation_delivery_window_seconds(processing_budget_seconds(one.generator_config))
+            <= OBSERVATION_JOB_STALE_AFTER_SECONDS
+        )
+
+
+def _settings_with_generator_timeout(seconds: int) -> WorkerSettings:
+    return WorkerSettings.from_environment(
+        {
+            **_environment(),
+            "MINDBRIDGE_GENERATOR_CONFIG_JSON": json.dumps(
+                {
+                    "api_key": "generator-secret",
+                    "endpoint": "https://generator.example.test/v1",
+                    "model_id": "qwen3.8-max",
+                    "request_timeout_seconds": seconds,
+                }
+            ),
+        }
+    )
 
 
 def test_the_guard_names_every_queue_that_would_go_unread() -> None:

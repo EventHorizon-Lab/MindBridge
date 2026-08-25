@@ -67,6 +67,7 @@ from mindbridge.infrastructure.task_queue import (
     PROCESS_OBSERVATION_TASK,
     ObservationProcessingTaskMessage,
     create_task_queue,
+    observation_delivery_window_seconds,
     observation_queues,
 )
 from mindbridge.media.clipping import (
@@ -511,6 +512,37 @@ def require_whole_observation_queue_set(consume_from: Collection[str]) -> None:
         )
 
 
+def require_stale_window_covers_delivery(settings: WorkerSettings) -> None:
+    """Refuse a Worker whose longest permitted attempt outlives the stale-claim window.
+
+    `OBSERVATION_JOB_STALE_AFTER_SECONDS` is a constant because the claim predicate is SQL, but
+    the length it has to cover is not: it is the generator's configured
+    `request_timeout_seconds` plus the post-model budget, the hard-limit margin, and the
+    re-delivery margin. The bundled 1 800 s generator lands at 2 280 s against a 2 400 s
+    window, and every 100 s added to that timeout eats 100 s of the remaining 120.
+
+    Past it the two disagree about the same attempt: the delivery is still running and paying
+    for its model call, while the ledger already considers the row reclaimable, so a concurrent
+    delivery or one `mindbridge jobs --republish` buys the same observation a second time --
+    the duplicate-work defect the window was widened to close. Refusing at boot is the only
+    place that can say so, because nothing about the running system looks wrong afterwards.
+    """
+    budget = processing_budget_seconds(settings.generator_config)
+    window = observation_delivery_window_seconds(budget)
+    if window <= OBSERVATION_JOB_STALE_AFTER_SECONDS:
+        return
+    # Everything the window adds on top of the one number an operator sets, so the remedy names
+    # a value they can paste rather than an arithmetic they have to redo.
+    overhead = window - (budget - _POST_MODEL_BUDGET_SECONDS)
+    raise ValueError(
+        f"one delivery may stay alive for {window:.0f} s, past the "
+        f"{OBSERVATION_JOB_STALE_AFTER_SECONDS} s stale-claim window, so a live attempt would "
+        "be reclaimable and its observation processed twice -- set the generator's "
+        f"request_timeout_seconds to at most "
+        f"{OBSERVATION_JOB_STALE_AFTER_SECONDS - overhead:.0f} s"
+    )
+
+
 def require_bounded_in_process_models(
     settings: WorkerSettings,
     concurrency: int,
@@ -652,6 +684,7 @@ def create_worker_app(settings: WorkerSettings) -> Celery:
             # `setup_queues` first and sends `worker_init` twenty lines later, so unlike
             # `--autoscale` the selection is readable here rather than merely present.
             require_whole_observation_queue_set(task_queue.amqp.queues.consume_from)
+            require_stale_window_covers_delivery(settings)
         except ValueError as error:
             # Celery's `Signal.send` catches `Exception` from every receiver, logs it, and
             # carries on -- so raising `ValueError` here would print a traceback and then start

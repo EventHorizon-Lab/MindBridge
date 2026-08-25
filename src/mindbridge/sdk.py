@@ -56,18 +56,25 @@ def _repeat_is_safe(request: ContractModel | None) -> bool:
     attempt may have been applied and only its response lost, so the question is what a second
     application would do.
 
-    A request with no body is a read and repeating it changes nothing. A write is safe to repeat
-    only when it names an `idempotency_key`, because the server then stores the first outcome
-    under that key and returns it again instead of writing twice. Without one, retrying `observe`
-    is a second observation -- trading a surfaced error for a silent duplicate, which is the worse
-    of the two and the only one nobody notices. A batch is safe only if every member of it is,
-    since the server applies them individually.
+    A request with no body is a read and repeating it changes nothing. A write is safe when its
+    contract carries `idempotency_key` at all, because that field's documented meaning is "omit
+    it and one is derived from the content": `observe` keys on (tenant, device, boot, sequence)
+    and `remember`, `feedback` and `forget` on a digest of the request minus the key itself, so
+    an identical resend answers `duplicate` with the first outcome rather than writing twice.
+    This function is deliberately asked of the *type* rather than of the value. Requiring a
+    caller-supplied key would have made the retry inert on every default call -- omission is the
+    supported default, and the payload here is serialised once outside the retry loop, so a
+    repeat is byte-identical and lands on the same derived key. A batch is safe only if every
+    member of it is, since the server applies them individually.
+
+    A write whose contract has no such field is not retried, which is what keeps this honest as
+    the API grows: a new endpoint has to state its idempotency before the client will repeat it.
     """
     if request is None:
         return True
     if isinstance(request, RememberBatchRequest):
-        return all(item.idempotency_key is not None for item in request.memories)
-    return getattr(request, "idempotency_key", None) is not None
+        return all(_repeat_is_safe(item) for item in request.memories)
+    return "idempotency_key" in type(request).model_fields
 
 
 class MindBridgeError(RuntimeError):

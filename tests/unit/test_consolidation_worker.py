@@ -3,6 +3,7 @@
 from argparse import Namespace
 from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import cast
 
 import pytest
@@ -102,6 +103,36 @@ def test_the_interval_defaults_to_the_frequent_end_of_the_documented_cadence() -
 
     assert schedule is not None
     assert schedule.interval_seconds == DEFAULT_CONSOLIDATION_INTERVAL_SECONDS
+
+
+def test_the_schedule_is_configurable_from_the_file_the_rest_of_the_deployment_uses(
+    tmp_path: Path,
+) -> None:
+    """Neither variable is a credential, so neither may be environment-only.
+
+    `mindbridge.toml` is where structure lives and the environment overrides it. Reading
+    `os.environ` directly here would have made the schedule the one part of a deployment that
+    the committed, diffable file cannot describe -- and it is the part whose absence produced
+    zero summary-tier records across a whole nine-benchmark evaluation.
+    """
+    config = tmp_path / "mindbridge.toml"
+    config.write_text(
+        '[consolidation]\ntenant_ids = "tenant_01,tenant_02"\ninterval_seconds = 900\n',
+        encoding="utf-8",
+    )
+
+    from_file = consolidation_schedule(_environment(MINDBRIDGE_CONFIG_FILE=str(config)))
+    overridden = consolidation_schedule(
+        _environment(
+            MINDBRIDGE_CONFIG_FILE=str(config),
+            MINDBRIDGE_CONSOLIDATION_INTERVAL_SECONDS="1800",
+        )
+    )
+
+    assert from_file is not None and overridden is not None
+    assert from_file.tenant_ids == (TenantId("tenant_01"), TenantId("tenant_02"))
+    assert from_file.interval_seconds == 900.0
+    assert overridden.interval_seconds == 1_800.0, "the environment has to win over the file"
 
 
 def test_one_tick_sweeps_one_tenant_so_the_interval_bounds_the_whole_fleet() -> None:

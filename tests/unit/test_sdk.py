@@ -592,25 +592,32 @@ async def test_a_read_survives_a_dropped_connection() -> None:
     assert (attempts, result.memory_id) == (2, "memory_01")
 
 
-async def test_a_write_with_no_idempotency_key_is_never_repeated() -> None:
-    """The whole point of the gate: a duplicate memory is worse than a surfaced error."""
-    attempts = 0
+async def test_a_write_with_no_idempotency_key_is_repeated_byte_for_byte() -> None:
+    """Omission is the supported default, and the server keys such a write on its content.
+
+    So the retry has to cover it -- gating on a caller-supplied key made the whole feature
+    inert on every default call. What makes it safe is that the resend is identical: the same
+    body derives the same key, and the server answers `duplicate` with the first outcome
+    instead of writing twice.
+    """
+    statuses = [503, 200]
+    bodies: list[bytes] = []
     delays: list[float] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal attempts
-        attempts += 1
-        return httpx.Response(
-            503, json={"code": "model_unavailable", "message": "restarting", "trace_id": "t1"}
-        )
+        bodies.append(request.content)
+        if statuses.pop(0) != 200:
+            return httpx.Response(
+                503, json={"code": "model_unavailable", "message": "restarting", "trace_id": "t1"}
+            )
+        return httpx.Response(200, json=_memory_body(status=MemoryWriteStatus.CREATED.value))
 
     async with _retrying_client(handler, delays=delays) as memory:
-        with pytest.raises(MindBridgeError) as raised:
-            await memory.remember(_remember(None))
+        result = await memory.remember(_remember(None))
 
-    assert attempts == 1, "an unkeyed write was repeated"
-    assert delays == []
-    assert raised.value.code == "model_unavailable"
+    assert (statuses, result.memory_id) == ([], "memory_01")
+    assert len(bodies) == 2 and bodies[0] == bodies[1], "the resend must derive the same key"
+    assert len(delays) == 1
 
 
 async def test_a_write_that_names_an_idempotency_key_is_repeated() -> None:
@@ -631,16 +638,28 @@ async def test_a_write_that_names_an_idempotency_key_is_repeated() -> None:
     assert (statuses, result.memory_id) == ([], "memory_01")
 
 
-async def test_a_batch_is_repeatable_only_when_every_member_is() -> None:
-    """The server applies members individually, so one unkeyed member spoils the batch."""
+async def test_repeat_safety_is_decided_by_the_contract_not_by_a_supplied_key() -> None:
+    """A write states its idempotency in its schema; one that does not is not repeated.
+
+    That is the property that keeps the gate honest as the API grows -- a new write endpoint
+    has to declare `idempotency_key`, whose documented meaning is "omit it and one is derived
+    from the content", before the client will send it twice. `RecallRequest` declares none and
+    is retried only because `recall()` passes `repeat_is_safe` explicitly, which is a decision
+    about one read rather than a hole in the rule.
+    """
     from mindbridge.contracts import RememberBatchRequest
     from mindbridge.sdk import _repeat_is_safe
 
-    all_keyed = RememberBatchRequest(memories=(_remember("a"), _remember("b")))
-    one_bare = RememberBatchRequest(memories=(_remember("a"), _remember(None)))
-
-    assert _repeat_is_safe(all_keyed) is True
-    assert _repeat_is_safe(one_bare) is False
+    assert _repeat_is_safe(_remember(None)) is True
+    assert _repeat_is_safe(_remember("write_01")) is True
+    assert _repeat_is_safe(RememberBatchRequest(memories=(_remember("a"), _remember(None)))) is True
+    assert "idempotency_key" not in RecallRequest.model_fields
+    assert (
+        _repeat_is_safe(
+            RecallRequest(tenant_id="tenant_01", query=RecallQuery(text="where is the tool?"))
+        )
+        is False
+    )
 
 
 async def test_a_rejected_request_is_not_repeated() -> None:

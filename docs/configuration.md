@@ -166,6 +166,14 @@ allowance for the encoding and graph write after the model call. Raising it is h
 a slow generator moves both deadlines at once. See
 [deployment](deployment.md#how-long-one-observation-may-take).
 
+**It has a ceiling of 1920 seconds, and the worker refuses to start above it.** One delivery may
+stay alive for this timeout plus 480 seconds — the 300-second post-model allowance, the 60-second
+hard-limit margin, and the 120 seconds the broker waits before re-delivering — and the job
+ledger's stale-claim window is a fixed 2400. Past the ceiling the two disagree about the same
+attempt: the delivery is still paying for its model call while the ledger already treats the row
+as reclaimable, so a concurrent delivery or one `mindbridge jobs --republish` buys the same
+observation twice. The boot failure names the largest value that fits.
+
 ### Shared embedder
 
 | Variable | Required | Default |
@@ -431,10 +439,18 @@ an integer, fail startup rather than being clamped.
 
 ## Built-in consolidation schedule
 
-| Variable | Required | Default |
-| --- | --- | --- |
-| `MINDBRIDGE_CONSOLIDATION_TENANT_IDS` | no | unset — no schedule is registered at all |
-| `MINDBRIDGE_CONSOLIDATION_INTERVAL_SECONDS` | no | `3600` |
+| Variable | File key | Required | Default |
+| --- | --- | --- | --- |
+| `MINDBRIDGE_CONSOLIDATION_TENANT_IDS` | `[consolidation] tenant_ids` | no | unset — no schedule is registered at all |
+| `MINDBRIDGE_CONSOLIDATION_INTERVAL_SECONDS` | `[consolidation] interval_seconds` | no | `3600` |
+
+Neither is a credential, so both belong in `mindbridge.toml` and the environment overrides it:
+
+```toml
+[consolidation]
+tenant_ids = "tenant_01,tenant_02"
+interval_seconds = 3600
+```
 
 Read by `celery -A mindbridge.celery_app:app beat` and by the worker that consumes
 `mindbridge_consolidation`; both processes need the same tenant list, because beat's ticks address

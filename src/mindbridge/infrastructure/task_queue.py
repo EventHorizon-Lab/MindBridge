@@ -34,6 +34,20 @@ _HARD_LIMIT_MARGIN_SECONDS = 60.0
 _REDELIVERY_MARGIN_SECONDS = 120.0
 """Kept above the hard limit so the broker never re-delivers a task that is still running."""
 
+
+def observation_delivery_window_seconds(processing_budget_seconds: float) -> float:
+    """The longest a single delivery of one observation may still be alive.
+
+    The budget plus both margins: the soft limit is the budget, the hard kill follows one
+    margin later, and the broker waits another before it hands the message to anybody else.
+    Exposed because a second module has to compare against this -- the stale-claim window in
+    `_postgres_jobs` has to sit above it, or a live attempt is declared abandoned while its
+    worker is still paying for it. Derived here rather than restated there so the two cannot
+    drift apart the way three independent constants already did once.
+    """
+    return processing_budget_seconds + _HARD_LIMIT_MARGIN_SECONDS + _REDELIVERY_MARGIN_SECONDS
+
+
 FRESH_WORK_PRIORITY = 3
 RECOVERED_WORK_PRIORITY = 0
 """Where a message enters the queue, so repair is not served behind the backlog it repairs.
@@ -144,7 +158,9 @@ def create_task_queue(
         broker_connection_retry_on_startup=True,
         broker_connection_timeout=5,
         broker_transport_options={
-            "visibility_timeout": int(hard_limit + _REDELIVERY_MARGIN_SECONDS)
+            "visibility_timeout": int(
+                observation_delivery_window_seconds(processing_budget_seconds)
+            )
         },
         enable_utc=True,
         task_acks_late=True,

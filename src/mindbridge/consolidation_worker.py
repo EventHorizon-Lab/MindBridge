@@ -14,14 +14,13 @@ queue, so the worker running it is a different process from the one consuming ob
 from __future__ import annotations
 
 import asyncio
-import os
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 
 from celery import Celery
 
-from mindbridge.configuration import optional_environment_value
+from mindbridge.configuration import configuration_source, optional_environment_value
 from mindbridge.consolidation_cli import (
     ConsolidationSettings,
     run_sweep,
@@ -78,18 +77,27 @@ class ConsolidationSchedule:
         return self.tenant_ids[tick % len(self.tenant_ids)]
 
 
-def consolidation_schedule(environ: Mapping[str, str]) -> ConsolidationSchedule | None:
+def consolidation_schedule(
+    environ: Mapping[str, str] | None = None,
+) -> ConsolidationSchedule | None:
     """Read the schedule, treating an absent tenant list as "no scheduled consolidation".
 
     Naming the tenants is the on-switch as well as the bound. There is no cross-tenant scan to
     discover them with -- row-level security returns no rows to a confined role rather than
     failing -- and a sweep that ran against every tenant it did find would be the load spike
     this schedule exists to avoid.
+
+    Read through `configuration_source` like every other non-credential setting, so a
+    `[consolidation]` section of `mindbridge.toml` configures it and the environment overrides
+    that. Reading `os.environ` directly here would have made these the only two structural
+    settings in the deployment that a committed file cannot carry, which is exactly the split
+    the file exists to remove.
     """
-    raw_tenants = optional_environment_value(environ, TENANT_IDS_VARIABLE)
+    source = configuration_source(environ)
+    raw_tenants = optional_environment_value(source, TENANT_IDS_VARIABLE)
     if raw_tenants is None:
         return None
-    raw_interval = optional_environment_value(environ, INTERVAL_VARIABLE)
+    raw_interval = optional_environment_value(source, INTERVAL_VARIABLE)
     try:
         interval = (
             DEFAULT_CONSOLIDATION_INTERVAL_SECONDS if raw_interval is None else float(raw_interval)
@@ -109,7 +117,7 @@ def register_consolidation_schedule(
     Returning before registering anything is what keeps a deployment that has not opted in
     identical to the observation worker it already runs.
     """
-    schedule = consolidation_schedule(os.environ if environ is None else environ)
+    schedule = consolidation_schedule(environ)
     if schedule is None:
         return None
     # Read while the app is being built, not on the first tick, so a worker with the schedule
