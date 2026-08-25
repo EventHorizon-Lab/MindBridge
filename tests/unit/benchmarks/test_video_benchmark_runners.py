@@ -387,3 +387,88 @@ def _prepared(video_id: str, *, with_media: bool = False) -> PreparedVideo:
             ),
         ),
     )
+
+
+class RecallFailingMemoryApi(RecordingMemoryApi):
+    """Fails the first question's recall and serves every other request."""
+
+    async def recall(self, request: RecallRequest) -> RecallResult:
+        assert request.query.text is not None
+        if "appears most" in request.query.text or "pick up first" in request.query.text:
+            raise RuntimeError("recall connection dropped")
+        return await super().recall(request)
+
+
+async def test_video_mme_answers_every_question_when_one_recall_raises() -> None:
+    """One raising recall used to discard every answer batched with it."""
+    api = RecallFailingMemoryApi("The best answer is C.")
+    video = VideoMMEVideo(
+        video_id="001",
+        duration="short",
+        domain="Knowledge",
+        sub_category="Humanity & History",
+        source_url="https://www.youtube.com/watch?v=source",
+        source_video_id="source",
+        questions=(
+            VideoMMEQuestion(
+                question_id="001-1",
+                task_type="Counting Problem",
+                question="Which decoration appears most?",
+                options=("A. Apples.", "B. Candles.", "C. Berries.", "D. Equal."),
+                answer="C",
+            ),
+            VideoMMEQuestion(
+                question_id="001-2",
+                task_type="Counting Problem",
+                question="Which decoration appears least?",
+                options=("A. Apples.", "B. Candles.", "C. Berries.", "D. Equal."),
+                answer="C",
+            ),
+        ),
+    )
+
+    result = await run_video_mme_video(
+        cast(MindBridge, api), video, _prepared("001", with_media=True), run_id="run_01"
+    )
+
+    assert [question.question_id for question in result.questions] == ["001-1", "001-2"]
+    # The exception type is the code a non-API failure has left to report.
+    assert [question.mindbridge_error_code for question in result.questions] == [
+        "RuntimeError",
+        None,
+    ]
+    assert [question.response for question in result.questions] == ["", "C"]
+    # The official denominator still counts the failed question rather than losing it.
+    assert evaluate_video_mme((result,)).question_count == 2
+
+
+async def test_egotempo_answers_every_question_when_one_recall_raises() -> None:
+    api = RecallFailingMemoryApi("A spoon.")
+    questions = tuple(
+        EgoTempoQuestion(
+            question_id=f"source_0.0_2.0_{index}",
+            clip_id="source_0.0_2.0",
+            source_video_id="source",
+            clip_start_seconds=0,
+            clip_end_seconds=2,
+            question_type="action-specific object",
+            question=question,
+            reference_answer="A spoon.",
+        )
+        for index, question in enumerate(
+            ("What did the person pick up first?", "What did the person put down?")
+        )
+    )
+
+    results = await run_egotempo_clip(
+        cast(MindBridge, api), questions, _prepared("source_0.0_2.0"), run_id="run_01"
+    )
+
+    assert [result.question_id for result in results] == [
+        "source_0.0_2.0_0",
+        "source_0.0_2.0_1",
+    ]
+    assert [result.mindbridge_error_code for result in results] == ["RuntimeError", None]
+    assert [result.model_answer for result in results] == ["", "A spoon."]
+    # The judge still receives the prompt the question would have been asked with.
+    assert "What did the person pick up first?" in results[0].formatted_prompt

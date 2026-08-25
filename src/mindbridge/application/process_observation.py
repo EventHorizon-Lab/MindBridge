@@ -307,8 +307,8 @@ async def record_unclaimed_processing_failure(
     30 second intervals without ever processing it. Claiming up front is also slower to recover
     from the failure that ran alongside those out-of-memory errors, a host `global_oom` that
     kills the child outright: a row already `running` is invisible to `mindbridge jobs
-    --republish` until the 960 second stale window expires, while a row left `pending` is
-    republished immediately. Recording is one write long, so that window never opens.
+    --republish` until `OBSERVATION_JOB_STALE_AFTER_SECONDS` expires, while a row left `pending`
+    is republished immediately. Recording is one write long, so that window never opens.
 
     An unacquired claim is another delivery's or a finished job's, and is left exactly as found.
     """

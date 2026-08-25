@@ -34,6 +34,8 @@ fails to start rather than failing one call an hour later.
 | `MINDBRIDGE_MEDIA_SAMPLING_CONFIG_JSON` | file | | | ○ | | | |
 | `MINDBRIDGE_WORKER_CONCURRENCY` | file | | | ○ | | | |
 | `MINDBRIDGE_WORKER_VRAM_BUDGET_GIB` | file | | | ○ | | | |
+| `MINDBRIDGE_CONSOLIDATION_TENANT_IDS` | file | | | ○ | | | |
+| `MINDBRIDGE_CONSOLIDATION_INTERVAL_SECONDS` | file | | | ○ | | | |
 | `MINDBRIDGE_TENANT_API_KEYS_JSON` | env | ● | | | | | |
 | `MINDBRIDGE_API_KEY` | env | | | | | | ● |
 | `MINDBRIDGE_AML_*` | both | ○ | | | | | |
@@ -164,6 +166,14 @@ allowance for the encoding and graph write after the model call. Raising it is h
 a slow generator moves both deadlines at once. See
 [deployment](deployment.md#how-long-one-observation-may-take).
 
+**It has a ceiling of 1920 seconds, and the worker refuses to start above it.** One delivery may
+stay alive for this timeout plus 480 seconds — the 300-second post-model allowance, the 60-second
+hard-limit margin, and the 120 seconds the broker waits before re-delivering — and the job
+ledger's stale-claim window is a fixed 2400. Past the ceiling the two disagree about the same
+attempt: the delivery is still paying for its model call while the ledger already treats the row
+as reclaimable, so a concurrent delivery or one `mindbridge jobs --republish` buys the same
+observation twice. The boot failure names the largest value that fits.
+
 ### Shared embedder
 
 | Variable | Required | Default |
@@ -286,6 +296,27 @@ value.
 non-antipodal candidate and lets fusion and the answer stage do the filtering, which is usually
 right: a similarity floor discards candidates a graph hop or a lexical match would have rescued.
 
+**What raising it buys.** At 0.0 a recall returns exactly `limit` memories whenever the tenant
+holds at least that many, so it has no way to report "I hold nothing about this" — it reports the
+`limit` least dissimilar rows instead. Raising the floor lets recall return fewer rows, and zero
+rows, and an empty recall abstains rather than answering from whatever came back. That is a
+change in what the system can express, not a ranking improvement: on a nine-benchmark evaluation
+a retrieval hit did not predict answer correctness on three of the corpora, so do not expect a
+floor to raise accuracy by putting better rows in the page.
+
+**Where it helps, and where it does not.** Long-horizon, sparsely-covered corpora — hours or days
+of footage where most of the store is unrelated to any one question — are the shape where the
+`limit` least dissimilar rows are actively misleading. On densely covered corpora, where almost
+everything retrieved is at least on topic, a floor only removes candidates fusion was already
+ordering correctly. Leave it at 0.0 unless you have measured your deployment in the first shape,
+and change it one deployment at a time: there is no value that is right for both.
+
+**It only binds the dense channel.** The floor is applied to every vector search. The full-text
+channel fused beside them has no floor of its own — it matches on the query's lexemes ORed
+together plus a substring test, neither of which produces a similarity to compare — so a floored
+text query returns what the vector searches admitted *plus* whatever shares a word with the
+question. A media-only query has no full-text channel and is bounded by the floor alone.
+
 **Startup probe.** The API probes every tenant in `MINDBRIDGE_TENANT_API_KEYS_JSON` and refuses
 to serve when one holds vectors the configured space cannot reach. Pointing a deployment at a new
 embedder without re-embedding therefore fails loudly instead of returning empty recalls. The
@@ -405,6 +436,36 @@ pool builds the media embedder once per child, so:
 Each child also opens its own database pool, so `MINDBRIDGE_DATABASE_MAX_POOL_SIZE` is a
 per-child ceiling here, not a per-deployment one. Values outside 1–32, and anything that is not
 an integer, fail startup rather than being clamped.
+
+## Built-in consolidation schedule
+
+| Variable | File key | Required | Default |
+| --- | --- | --- | --- |
+| `MINDBRIDGE_CONSOLIDATION_TENANT_IDS` | `[consolidation] tenant_ids` | no | unset — no schedule is registered at all |
+| `MINDBRIDGE_CONSOLIDATION_INTERVAL_SECONDS` | `[consolidation] interval_seconds` | no | `3600` |
+
+Neither is a credential, so both belong in `mindbridge.toml` and the environment overrides it:
+
+```toml
+[consolidation]
+tenant_ids = "tenant_01,tenant_02"
+interval_seconds = 3600
+```
+
+Read by `celery -A mindbridge.celery_app:app beat` and by the worker that consumes
+`mindbridge_consolidation`; both processes need the same tenant list, because beat's ticks address
+whichever list the worker was given. Leaving `TENANT_IDS` unset registers no schedule and no task,
+so a deployment that has not opted in runs exactly the worker it ran before.
+
+One tick sweeps **one** tenant, chosen by rotation, so the interval is a ceiling on
+consolidation's entire share of the generator rather than a per-tenant cadence — adding tenants
+lengthens the rotation instead of raising load. Scheduled sweeps skip entity resolution, which is
+the only sweep that opens media and spends a generator call per candidate pair; run that from the
+CLI on its own cadence.
+
+Tenants are enumerated from this variable rather than discovered: a tenant that is created and not
+added here silently stops consolidating. See
+[operations](operations.md#built-in-consolidation-schedule).
 
 ## Logs and timings
 

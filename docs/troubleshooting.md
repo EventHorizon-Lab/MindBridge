@@ -97,8 +97,11 @@ searched.
 ### The similarity floor is too high
 
 `MINDBRIDGE_MINIMUM_EMBEDDING_SIMILARITY` defaults to 0.0 for good reason: a floor discards
-candidates that a graph hop or a lexical match would have rescued. If you raised it, lower it back
-and let fusion do the filtering.
+candidates that a graph hop or a lexical match would have rescued. It also binds the dense channel
+only, so a floored text query still returns whatever shares a word with the question. Lowering it
+back is the right move on a densely covered corpus and the wrong one on a long-horizon sparse
+deployment, where returning fewer rows is the point — see
+[Configuration](configuration.md) for which shape yours is.
 
 ### The memory was compressed or cooled
 
@@ -194,9 +197,17 @@ are derived from it and follow automatically.
 
 ### Jobs stay `pending`
 
-Two different causes, and they are told apart by the queue rather than by the rows.
+Three different causes, and they are told apart by the queue rather than by the rows.
 
-**The worker is not consuming.** Check it is running, points at the same
+**The worker is reading only some of the observation queues.** Observations are sharded across
+`mindbridge` and `mindbridge.0` … `mindbridge.7`, and a worker started with no `-Q` reads all of
+them. A worker narrowed to `-Q mindbridge` reads only the pre-shard queue, so everything published
+to a shard has no consumer — the publish succeeds and the row sits `pending` with nothing wrong
+anywhere. The worker now **refuses to start** in that configuration rather than running half-blind,
+so this shows up as a boot failure naming the unread queues; if you are looking at an older worker,
+drop the `-Q`.
+
+**The worker is not consuming at all.** Check it is running, points at the same
 `MINDBRIDGE_TASK_BROKER_URL`, and is installed with the extras it actually needs:
 `--extra server --extra media` at minimum. `media` carries the PyAV, Pillow, and SoundFile
 decoders that cut evidence clips, which the worker does whatever its embedder slots say — without
