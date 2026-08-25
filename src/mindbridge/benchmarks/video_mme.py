@@ -180,7 +180,7 @@ def load_video_mme(annotation_path: Path) -> tuple[VideoMMEVideo, ...]:
         if error.name is not None and not error.name.startswith("pyarrow"):
             raise
         raise RuntimeError(
-            "Video-MME Parquet support requires `uv sync --group benchmarks`"
+            "Video-MME Parquet support requires `uv sync --extra benchmarks`"
         ) from error
     rows = TypeAdapter(list[_RawQuestion]).validate_python(
         parquet.read_table(annotation_path).to_pylist()

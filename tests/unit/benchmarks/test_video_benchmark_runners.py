@@ -1,4 +1,4 @@
-"""Production-contract checks for Video-MME and EgoTempo runners."""
+"""Production-contract checks for Video-MME, Video-MME-v2, and EgoTempo runners."""
 
 from datetime import datetime, timezone
 from typing import cast
@@ -16,6 +16,13 @@ from mindbridge.benchmarks.video_mme import (
     VideoMMEVideoResult,
     evaluate_video_mme,
     run_video_mme_video,
+)
+from mindbridge.benchmarks.video_mme_v2 import (
+    VideoMMEV2Group,
+    VideoMMEV2GroupType,
+    VideoMMEV2Question,
+    evaluate_video_mme_v2,
+    run_video_mme_v2_group,
 )
 from mindbridge.contracts import (
     MediaObjectInput,
@@ -389,12 +396,109 @@ def _prepared(video_id: str, *, with_media: bool = False) -> PreparedVideo:
     )
 
 
+def _video_mme_v2_group(group_type: VideoMMEV2GroupType = "logic") -> VideoMMEV2Group:
+    return VideoMMEV2Group(
+        video_id="001",
+        source_url="https://www.youtube.com/watch?v=source",
+        group_type=group_type,
+        group_structure="[1,2,3,4]" if group_type == "logic" else "4",
+        questions=tuple(
+            VideoMMEV2Question(
+                question_id=f"001-{position}",
+                position=position,
+                question=f"Question {position}?",
+                options=tuple(f"{label}. Option {label}." for label in "ABCDEFGH"),
+                answer="F",
+                level="1",
+                second_head="Frames & Audio",
+                third_head="Visual-Audio Collaborative Reasoning",
+            )
+            for position in range(1, 5)
+        ),
+    )
+
+
+async def test_video_mme_v2_answers_a_whole_group_with_the_eight_option_instruction() -> None:
+    api = RecordingMemoryApi("The best answer is F.")
+
+    result = await run_video_mme_v2_group(
+        cast(MindBridge, api),
+        _video_mme_v2_group(),
+        _prepared("001", with_media=True),
+        run_id="run_01",
+    )
+
+    query = api.recall_requests[0].query.text
+    assert query is not None
+    assert api.remember_requests[0].tenant_id == "benchmark_video_mme_v2_001_run_01"
+    assert "Respond with only the letter (A, B, C, D, E, F, G, or H)" in query
+    assert [question.response for question in result.questions] == ["F", "F", "F", "F"]
+    # Four of four right is the only outcome worth full marks under either group type.
+    assert evaluate_video_mme_v2((result,)).rating.overall == pytest.approx(100.0)
+
+
+async def test_video_mme_v2_scores_zero_for_a_group_it_answered_consistently_wrong() -> None:
+    """The rating, unlike an accuracy, gives nothing back for a uniformly wrong group."""
+    api = RecordingMemoryApi("The best answer is A.")
+
+    result = await run_video_mme_v2_group(
+        cast(MindBridge, api),
+        _video_mme_v2_group(),
+        _prepared("001", with_media=True),
+        run_id="run_01",
+    )
+
+    metrics = evaluate_video_mme_v2((result,))
+    assert metrics.rating.overall == pytest.approx(0.0)
+    assert metrics.accuracy.overall == pytest.approx(0.0)
+    assert metrics.accuracy.answered_count == 4
+
+
+async def test_video_mme_v2_carries_one_ingest_loss_onto_all_four_questions() -> None:
+    """A dropped segment can cost a whole group its rating, not one question its point."""
+    api = SegmentFailingMemoryApi("The best answer is F.")
+
+    result = await run_video_mme_v2_group(
+        cast(MindBridge, api),
+        _video_mme_v2_group(),
+        _prepared_pair("001"),
+        run_id="run_01",
+    )
+
+    assert [request.sequence for request in api.observe_requests] == [1]
+    assert [question.mindbridge_ingest_failure_count for question in result.questions] == [
+        1,
+        1,
+        1,
+        1,
+    ]
+
+
+async def test_video_mme_v2_refuses_prepared_media_for_a_different_video() -> None:
+    api = RecordingMemoryApi("The best answer is F.")
+
+    with pytest.raises(ValueError, match="IDs must match"):
+        await run_video_mme_v2_group(
+            cast(MindBridge, api),
+            _video_mme_v2_group(),
+            _prepared("002", with_media=True),
+            run_id="run_01",
+        )
+
+
 class RecallFailingMemoryApi(RecordingMemoryApi):
-    """Fails the first question's recall and serves every other request."""
+    """Fails the first question's recall of each benchmark and serves every other request.
+
+    One double rather than one per runner: the behaviour under test is the same in all of
+    them -- that a cohort still produces a row per question -- and each fixture's own first
+    question is what identifies it.
+    """
+
+    _FIRST_QUESTIONS = ("appears most", "pick up first", "Question 1?")
 
     async def recall(self, request: RecallRequest) -> RecallResult:
         assert request.query.text is not None
-        if "appears most" in request.query.text or "pick up first" in request.query.text:
+        if any(marker in request.query.text for marker in self._FIRST_QUESTIONS):
             raise RuntimeError("recall connection dropped")
         return await super().recall(request)
 
@@ -440,6 +544,39 @@ async def test_video_mme_answers_every_question_when_one_recall_raises() -> None
     assert [question.response for question in result.questions] == ["", "C"]
     # The official denominator still counts the failed question rather than losing it.
     assert evaluate_video_mme((result,)).question_count == 2
+
+
+async def test_video_mme_v2_scores_a_group_when_one_of_its_recalls_raises() -> None:
+    """A group is the unit of the rating, so losing one row loses the whole group's score.
+
+    Worse than in `video_mme`: `VideoMMEV2GroupResult` requires all four rows, so a raising
+    recall took the group with it and then ended the run, because the CLI awaits each group in
+    turn. The failed question has to survive as a wrong answer carrying its code.
+    """
+    api = RecallFailingMemoryApi("The best answer is F.")
+
+    result = await run_video_mme_v2_group(
+        cast(MindBridge, api),
+        _video_mme_v2_group(),
+        _prepared("001", with_media=True),
+        run_id="run_01",
+    )
+
+    assert [question.position for question in result.questions] == [1, 2, 3, 4]
+    # The exception type is the code a non-API failure has left to report.
+    assert [question.mindbridge_error_code for question in result.questions] == [
+        "RuntimeError",
+        None,
+        None,
+        None,
+    ]
+    assert [question.response for question in result.questions] == ["", "F", "F", "F"]
+    # Three of four correct on a straight chain, broken at the head: the chain scores nothing
+    # past its first wrong answer, which is exactly what the group rating exists to say.
+    metrics = evaluate_video_mme_v2((result,))
+    assert metrics.rating.overall == pytest.approx(0.0)
+    assert metrics.accuracy.question_count == 4
+    assert metrics.accuracy.error_count == 1
 
 
 async def test_egotempo_answers_every_question_when_one_recall_raises() -> None:

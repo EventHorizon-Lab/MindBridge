@@ -39,6 +39,10 @@ from mindbridge.benchmarks.supermemory_vqa import (
     load_supermemory_vqa,
 )
 from mindbridge.benchmarks.video_mme import VIDEO_MME_ADAPTER_VERSION, load_video_mme
+from mindbridge.benchmarks.video_mme_v2 import (
+    VIDEO_MME_V2_ADAPTER_VERSION,
+    load_video_mme_v2,
+)
 from mindbridge.contracts import ContractModel, NonEmptyString, Sha256Hex
 from mindbridge.file_integrity import sha256_file
 
@@ -60,7 +64,7 @@ class DatasetAdapterSmokeResult(ContractModel):
     """Machine-readable proof that the official annotations still parse."""
 
     created_at: AwareDatetime
-    datasets: tuple[BenchmarkDatasetSummary, ...] = Field(min_length=13)
+    datasets: tuple[BenchmarkDatasetSummary, ...] = Field(min_length=14)
     passed: bool
 
 
@@ -70,6 +74,7 @@ def run_dataset_adapter_smoke(
     m3_robot_path: Path,
     m3_web_path: Path,
     video_mme_path: Path,
+    video_mme_v2_path: Path,
     egolife_path: Path,
     egotempo_path: Path,
     egomem_path: Path,
@@ -85,6 +90,7 @@ def run_dataset_adapter_smoke(
     m3_robot = load_m3_bench(m3_robot_path)
     m3_web = load_m3_bench(m3_web_path)
     video_mme = load_video_mme(video_mme_path)
+    video_mme_v2 = load_video_mme_v2(video_mme_v2_path)
     egolife = load_egolife_qa(egolife_path)
     egotempo = load_egotempo(egotempo_path)
     egomem = load_egomem_reason(egomem_path)
@@ -118,6 +124,17 @@ def run_dataset_adapter_smoke(
                 context_count=len(video_mme),
                 memory_item_count=len(video_mme),
                 question_count=sum(len(video.questions) for video in video_mme),
+            ),
+            BenchmarkDatasetSummary(
+                benchmark="Video-MME-v2",
+                source_repository="MME-Benchmarks/Video-MME-v2",
+                source_file=video_mme_v2_path.name,
+                source_sha256=sha256_file(video_mme_v2_path),
+                adapter_version=VIDEO_MME_V2_ADAPTER_VERSION,
+                # One group per video, and the group is the unit the rating averages over.
+                context_count=len(video_mme_v2),
+                memory_item_count=len(video_mme_v2),
+                question_count=sum(len(group.questions) for group in video_mme_v2),
             ),
             BenchmarkDatasetSummary(
                 benchmark="EgoLifeQA",
@@ -221,6 +238,9 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
         "--video-mme", type=Path, required=True, help="official video mme release to parse"
     )
     parser.add_argument(
+        "--video-mme-v2", type=Path, required=True, help="official video mme v2 release to parse"
+    )
+    parser.add_argument(
         "--egolife", type=Path, required=True, help="official egolife release to parse"
     )
     parser.add_argument(
@@ -256,6 +276,7 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
         m3_robot_path=arguments.m3_robot,
         m3_web_path=arguments.m3_web,
         video_mme_path=arguments.video_mme,
+        video_mme_v2_path=arguments.video_mme_v2,
         egolife_path=arguments.egolife,
         egotempo_path=arguments.egotempo,
         egomem_path=arguments.egomem,

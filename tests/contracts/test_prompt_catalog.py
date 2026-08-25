@@ -26,6 +26,7 @@ _EXPECTED_BENCHMARK_FINGERPRINTS = {
     "egotempo_query_v1": "27327bbac7f294f1d6ed16e675bdd8e416ee2c5bca0911967ce68a5c4f60cce8",
     "memlens_query_v1": "0b9b44d0b6c65d9131fb947155bb5a57587bae5d2881504c4dea62b0127a6f2f",
     "video_mme_query_v1": "28b657a26654f73b0d692bcb17de7d160dbb02aab8ad89b2b889edcdc86c4626",
+    "video_mme_v2_query_v1": ("96c676324eb0a2e4b02531f2ea0303980c6033a5b4cb442f17fa1fbab72820c1"),
 }
 
 
