@@ -6,10 +6,10 @@ MindBridge is a Python package under `src/mindbridge/`. Keep domain types in `co
 
 ## Build, Test, and Development Commands
 
-MindBridge supports Python 3.10 through 3.14 and uses `uv` with the checked-in `pyproject.toml` and `uv.lock`. Install the same set CI installs — development groups plus the Edge, media, and Server extras — with:
+MindBridge supports Python 3.10 through 3.14 and uses `uv` with the checked-in `pyproject.toml` and `uv.lock`. Install the same set the CI quality matrix installs — development groups plus the media and Server extras — with:
 
 ```bash
-uv sync --all-groups --extra edge --extra media --extra server
+uv sync --all-groups --extra media --extra server
 ```
 
 `uv sync` is an exact sync: it uninstalls anything the named extras do not cover, so extend this command rather than running a second one for another extra.

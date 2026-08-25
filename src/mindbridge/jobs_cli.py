@@ -37,8 +37,10 @@ from mindbridge.infrastructure._postgres_jobs import (
     unreachable_observation_jobs,
 )
 from mindbridge.infrastructure.task_queue import (
+    RECOVERED_WORK_PRIORITY,
     CeleryObservationJobPublisher,
     create_task_queue,
+    observation_queues,
 )
 from mindbridge.telemetry import configure_telemetry
 
@@ -46,8 +48,9 @@ JOBS_ENVIRONMENT = """environment:
   MINDBRIDGE_DATABASE_URL          PostgreSQL DSN (required). Read from the environment
                                    rather than a flag so the DSN never reaches a process
                                    list or this shell's history.
-  MINDBRIDGE_TASK_BROKER_URL       Celery broker URL (required). The queue read is the
-                                   one the Worker consumes, `task_default_queue`."""
+  MINDBRIDGE_TASK_BROKER_URL       Celery broker URL (required). The depth read covers
+                                   every queue the Worker consumes: `mindbridge` and
+                                   each of its per-tenant shards."""
 
 
 def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
@@ -68,19 +71,27 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
 
 
 def queue_depth(task_queue: Celery) -> int:
-    """Count the messages waiting on the queue the Worker consumes.
+    """Count the messages waiting across every queue the Worker consumes.
 
-    The queue is `task_default_queue`, not `celery`: asking about `celery` during the
-    2026-08-21 evaluation produced a NOT_FOUND that read as "the queue was destroyed". A virtual
-    transport also deletes an empty list rather than keeping it, so NOT_FOUND on the right name
-    means empty, not missing.
+    Summed over `observation_queues`, because that is what `_withheld` subtracts from: the depth
+    has to be the count of messages for this job type ledger-wide. Reading one shard of eight
+    would withhold an eighth of the backlog and republish the rest as duplicates, and a duplicate
+    is not a no-op -- the delivery that loses the claim re-queues itself up to 40 times.
+
+    The names are the Worker's, not `celery`: asking about `celery` during the 2026-08-21
+    evaluation produced a NOT_FOUND that read as "the queue was destroyed". A virtual transport
+    also deletes an empty list rather than keeping it, so NOT_FOUND on a name the Worker consumes
+    means empty, not missing -- which is why an unknown shard contributes zero instead of
+    abandoning the sum.
     """
-    queue = str(task_queue.conf.task_default_queue)
+    depth = 0
     with task_queue.connection_for_read() as connection:
-        try:
-            return int(connection.default_channel.queue_declare(queue=queue, passive=True)[1])
-        except connection.channel_errors:
-            return 0
+        for queue in observation_queues():
+            try:
+                depth += int(connection.default_channel.queue_declare(queue=queue, passive=True)[1])
+            except connection.channel_errors:
+                continue
+    return depth
 
 
 async def reconcile(
@@ -115,9 +126,12 @@ async def reconcile(
     withheld = _withheld(depth, len(unreachable), tenant_id=tenant_id)
     return {
         "queue": str(task_queue.conf.task_default_queue),
-        # Read before publishing, because kombu publishes with LPUSH and consumes with RPOP: a
-        # republished job waits behind every message already queued. Six republishes of one job
-        # across 84 minutes moved its attempt count not at all for exactly this reason.
+        # Read before publishing, so the depth describes the queue this repair is deciding
+        # against rather than the one it just changed. A republished job no longer waits behind
+        # the backlog -- it goes to `RECOVERED_WORK_PRIORITY`, which is drained first -- but the
+        # withholding decision still needs the pre-publish depth to be meaningful. Before that
+        # priority split, six republishes of one job across 84 minutes moved its attempt count
+        # not at all, because every one of them landed behind the same backlog.
         "queue_depth": depth,
         "claimable": len(unreachable),
         "withheld": withheld,
@@ -132,10 +146,12 @@ async def reconcile(
 def _withheld(depth: int, claimable: int, *, tenant_id: TenantId | None) -> int:
     """Count the claimable rows a repair treats as already carried by the queue.
 
-    Ledger-wide the queue depth is that count: the queue carries this job type and nothing else,
-    so `claimable - depth` rows can have no message left. A scoped scan breaks the arithmetic
-    rather than narrowing it -- `claimable` is one tenant's, the depth is every tenant's, and
-    five messages for tenant B would cancel five stranded rows for tenant A and publish nothing.
+    Ledger-wide the queue depth is that count: the queues carry this job type and nothing else,
+    so `claimable - depth` rows can have no message left. That holds only while the depth covers
+    every shard -- a depth short by a shard withholds too little and publishes the difference as
+    duplicates. A scoped scan breaks the arithmetic rather than narrowing it -- `claimable` is one
+    tenant's, the depth is every tenant's, and five messages for tenant B would cancel five
+    stranded rows for tenant A and publish nothing.
     Nothing recovers the missing term: a queue count per tenant needs each message read, which
     for every transport kombu speaks means taking it off the queue.
 
@@ -169,11 +185,20 @@ async def _republish(
     Oldest first, because kombu consumes with `RPOP`: the messages still queued are the most
     recently published, so the rows whose message is gone are at the front of this list. Order
     is preserved anyway, because a question can need every observation before its cutoff.
+
+    Published at `RECOVERED_WORK_PRIORITY`, which the transport drains ahead of the fresh work
+    at `FRESH_WORK_PRIORITY`. Repair is work the ledger already owes and has already waited for,
+    so serving it behind a backlog is what made a repair indistinguishable from doing nothing.
     """
     owed = unreachable[: max(len(unreachable) - already_queued, 0)]
     publisher = CeleryObservationJobPublisher(task_queue)
     for tenant_id, observation_id, job_id in owed:
-        await publisher.publish_observation_processing_job(tenant_id, observation_id, job_id)
+        await publisher.publish_observation_processing_job(
+            tenant_id,
+            observation_id,
+            job_id,
+            priority=RECOVERED_WORK_PRIORITY,
+        )
     return len(owed)
 
 

@@ -38,6 +38,25 @@ VIDEO_MME_QUERY_PROMPT = PromptSpec(
     ),
 )
 
+VIDEO_MME_V2_QUERY_PROMPT = PromptSpec(
+    name="video_mme_v2_query",
+    version="video_mme_v2_query_v1",
+    purpose="Apply the official Video-MME-v2 multiple-choice answer instruction.",
+    used_by="mindbridge.benchmarks.video_mme_v2._answer_question",
+    # The published prompt, minus its "These are the frames of a video." opener: MindBridge
+    # answers from memory rather than from a frame stack handed to a VLM, and claiming frames
+    # that are not in the context is the kind of drift that makes a score unquotable. Note the
+    # released standalone script emits the instruction *after* the question while the README
+    # documents it before; the README wording is the one the benchmark publishes as canonical.
+    # Every question is offered A through H here even where it lists fewer options, because
+    # that is what the official instruction says regardless of the option count.
+    text=(
+        "Select the best answer to the following multiple-choice question based on the video.\n"
+        "Respond with only the letter (A, B, C, D, E, F, G, or H) of the correct option.\n"
+        "Question: {question}\n{options}"
+    ),
+)
+
 EGOTEMPO_QUERY_PROMPT = PromptSpec(
     name="egotempo_query",
     version="egotempo_query_v1",
@@ -195,6 +214,7 @@ BENCHMARK_PROMPTS = (
     EGOMEM_REASON_QUERY_PROMPT,
     MEMLENS_QUERY_PROMPT,
     VIDEO_MME_QUERY_PROMPT,
+    VIDEO_MME_V2_QUERY_PROMPT,
     EGOTEMPO_QUERY_PROMPT,
     ATM_BENCH_QUERY_PROMPT,
     ATM_BENCH_NUMBER_FORMAT_PROMPT,

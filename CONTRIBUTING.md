@@ -24,16 +24,13 @@ authoritative; `pip install -e .` will not reproduce it.
 ```bash
 git clone https://github.com/EventHorizon-Lab/MindBridge.git
 cd MindBridge
-uv sync --all-groups --extra edge --extra media --extra server
+uv sync --all-groups --extra media --extra server
 ```
 
-That is the set CI installs, so the clipping tests run here rather than skipping. `uv sync` is an
-exact sync: to add the local Jina embedder, extend that same command with `--extra cloud-models`
-rather than syncing it alone, which would uninstall everything above. It pulls torch, so skip it
-unless you need it.
-
-For the cu129 vLLM embedding endpoint used by RTX 5090 workstations, also add
-`--extra vllm-server`. This keeps `.venv/bin/vllm` and its matching Torch build in the exact sync.
+That is the set the quality matrix installs, so the clipping tests run here rather than skipping.
+The isolated installability job installs `edge` once and imports its model runtime; add
+`--extra edge` locally only when working on that runtime. `uv sync` is exact: extend the same
+command rather than syncing another extra alone, which would uninstall everything above.
 
 For everything at once — every scenario plus the benchmark harness and the local models:
 
@@ -79,14 +76,21 @@ and `UP`, with a McCabe complexity ceiling of 10 and a 100-character line length
 ### Markdown
 
 Documentation changes must pass the same tool versions CI uses. The pinned Docker images matter —
-`npx markdownlint-cli2` is old enough to miss rules the pinned version enforces:
+`npx markdownlint-cli2` is old enough to miss rules the pinned version enforces. Match CI's lychee
+arguments as well: `--exclude` covers the one host that answers CI egress with 403 (the job carries
+the reasoning), and `./.github/**/*.md` is where the PR and issue templates live.
 
 ```bash
 docker run --rm -v "$PWD:/workdir:ro" davidanson/markdownlint-cli2:v0.23.0 \
   "**/*.md" "!.git/**" "!.venv/**" "!.pytest_cache/**" "!.benchmarks/**"
 docker run --rm -v "$PWD:/input:ro" -w /input lycheeverse/lychee:0.23.0 \
-  --no-progress --root-dir /input './*.md' './docs/**/*.md'
+  --no-progress --root-dir /input \
+  --exclude '^https://penfieldlabs\.substack\.com/' \
+  './*.md' './docs/**/*.md' './.github/**/*.md'
 ```
+
+Re-run before you add a host to that list. A cited site answering 5xx for a few minutes is an
+outage on their end, not a link to exclude — an exclusion stops the gate checking that URL for good.
 
 ### The integration gate
 

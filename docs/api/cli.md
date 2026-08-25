@@ -17,15 +17,15 @@ uv run --extra server mindbridge lifecycle --help
 
 | Command | Subcommands |
 | --- | --- |
-| `mindbridge` | `consolidate`, `jobs`, `lifecycle`, `mcp`, `edge sync` |
-| `mindbridge-bench` | `locomo-refined`, `m3`, `egolife`, `egomem`, `egotempo`, `memlens`, `mm-lifelong`, `supermemory`, `video-mme`, `aml` |
+| `mindbridge` | `config check`, `consolidate`, `jobs`, `lifecycle`, `mcp`, `jina serve`, `edge sync` |
+| `mindbridge-bench` | `locomo-refined`, `m3`, `egolife`, `egomem`, `egotempo`, `memlens`, `mm-lifelong`, `supermemory`, `video-mme`, `video-mme-v2`, `aml` |
 | `mindbridge-bench` support | `score`, `datasets`, `jina`, `bakeoff` |
 
 `mindbridge-consolidate`, `mindbridge-lifecycle`, and `mindbridge-mcp` remain as aliases for the
 subcommands of the same name. They route through the same module and report the same codes.
 
-The API and the memory worker are long-running processes started by `uvicorn` and `celery`, not
-subcommands. See [deployment](../deployment.md).
+The API and memory worker are long-running processes started by `uvicorn` and `celery`. The Jina
+embedding service is started by `mindbridge jina serve`. See [deployment](../deployment.md).
 
 ## The shared contract
 
@@ -61,6 +61,31 @@ and names the extra to install rather than printing frames from a missing third-
 writes nothing at all.
 
 ---
+
+## `mindbridge config check`
+
+Reports whether one role's configuration is complete, before that role is started.
+
+```bash
+mindbridge config check --role api
+```
+
+`--role` is required and takes one of `api`, `mcp`, `worker`, `consolidate`, `lifecycle`, or
+`edge-sync` — the six columns of the matrix in [configuration](../configuration.md).
+
+Every missing setting is reported in one pass. Starting a process fails on the first one, so an
+operator missing nine discovered them one restart at a time; this asks the role's own settings
+class what it requires and walks the whole list. Each resolved setting is reported with the
+source that won, `environment` or `mindbridge.toml`.
+
+**No value is ever printed.** A credential is reported as present or missing and nothing more,
+because the same code path handles credentials and structure. If settings are missing and a
+`.env` file is present in the working directory, the report says so — nothing in MindBridge loads
+`.env`, and `uv run --env-file .env` is the usual omission.
+
+Exit status is 0 when the role is ready and 1 when it is not, so a deployment script can gate on
+it. This command is in the core install: it has to run before any extra is present, which is the
+state an operator reaches for it from. A role whose settings class needs an extra says which one.
 
 ## `mindbridge consolidate`
 
@@ -196,14 +221,17 @@ command requires a role that can see every tenant.
 }
 ```
 
-`queue` is the queue the worker actually consumes, `task_default_queue` — **`mindbridge`, not
+`queue` names the queue family the worker consumes, `task_default_queue` — **`mindbridge`, not
 `celery`**. Looking at the wrong queue is how one investigation concluded the queue had been
-destroyed.
+destroyed. Observations are published across a shard set (`mindbridge` plus `mindbridge.0` …
+`mindbridge.7`), all of which a worker started **without `-Q`** consumes; `queue_depth` is the
+sum across the whole set, so it will not match `LLEN mindbridge` on its own.
 
-`queue_depth` is read *before* any repair, so it describes what was found. It matters for
-interpreting a repair rather than just recording one: kombu publishes with `LPUSH` and consumes
-with `RPOP`, so a republished job waits behind every message already queued. Six republishes of
-one job across 84 minutes moved its attempt count not at all, for exactly that reason.
+`queue_depth` is read *before* any repair, so it describes what was found, and `withheld` below
+is decided against that pre-repair number. A republished job no longer waits behind the backlog:
+repair publishes at the priority the transport drains first, so it is served ahead of fresh work
+on every shard. Before that split, six republishes of one job across 84 minutes moved its attempt
+count not at all, because every one of them landed behind the same backlog.
 
 `withheld` is how many claimable rows the repair treated as already carried by the queue:
 `min(claimable, queue_depth)` across the ledger, and `0` under `--tenant-id`. `claimable - withheld`
@@ -228,7 +256,7 @@ Four things worth knowing before acting on those numbers:
 - **Both include the interval still open.** A pending job's wait so far, and a running job's work
   so far. Without that, the tenant holding a worker *right now* would contribute nothing to the
   column the report is sorted by.
-- **An abandoned attempt stops accruing at the stale window** (960 s), whether it is still open
+- **An abandoned attempt stops accruing at the stale window** (2 400 s), whether it is still open
   or has been reclaimed. Past it the claim treats the row as reclaimable, so whatever held it is
   gone; charging it forever would sort every live tenant below a worker that died. The reclaim
   charges it to `work_seconds` alone — an abandoned attempt was running, not queued.
@@ -304,6 +332,24 @@ JSON-RPC goes on stdout. Never redirect it. See [MCP tools](mcp.md).
 
 ---
 
+## `mindbridge jina serve`
+
+Serves Jina v5 Omni through SentenceTransformers and an authenticated OpenAI-compatible embedding
+API. Requires `server` and `cloud-models`.
+
+```bash
+export MINDBRIDGE_EMBEDDER_API_KEY=replace-with-at-least-32-random-characters
+uv run --extra server --extra cloud-models mindbridge jina serve --host 0.0.0.0 \
+  --media-origin https://media.example.com
+```
+
+The default port is `8002`; `--device`, `--model-id`, and `--max-concurrency` control the one model
+process. Repeat `--media-origin` for every exact HTTP(S) origin that may serve presigned media;
+remote URLs from any other origin and all redirects are rejected. `/health` is public.
+`/v1/models` and `/v1/embeddings` require the bearer token.
+
+---
+
 ## `mindbridge edge sync`
 
 Drains one edge device's observation outbox once. Suitable for systemd restart and backoff
@@ -359,6 +405,7 @@ uv run mindbridge-bench
 | `mm-lifelong` | — | MM-Lifelong |
 | `supermemory` | — | SuperMemory VQA |
 | `video-mme` | `benchmarks` | Video-MME |
+| `video-mme-v2` | `benchmarks` | Video-MME-v2 |
 | `aml` | — | Agent Memory Leaderboard offline replay |
 
 | Support command | Extra | Purpose |

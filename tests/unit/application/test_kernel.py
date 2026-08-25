@@ -1904,8 +1904,12 @@ async def test_media_query_is_signed_for_embedding_instead_of_used_as_a_filter()
     assert resolved.media_url.endswith("?signature=1")
     assert answerer.last_evidence[0].media_url.endswith("?signature=2")
     assert answerer.last_query_media[0].media_url.endswith("?signature=3")
-    assert result.evidence[0].media_url.endswith("?signature=4")
-    assert signer.calls == 4
+    # Three signings, not four: the response hands back the evidence read the answer round
+    # already paid for, because it cites the same spans. Re-reading it signed the same object
+    # a fourth time to shave the recall's own duration off a 35-minute URL lifetime, and cost
+    # a second full resolution -- three pooled queries and one presign per distinct object.
+    assert result.evidence[0].media_url == answerer.last_evidence[0].media_url
+    assert signer.calls == 3
     assert result.memories[0].evidence_ids == (evidence_id,)
 
 

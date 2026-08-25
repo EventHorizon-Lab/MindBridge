@@ -241,7 +241,11 @@ LEFT JOIN lexical ON TRUE
 WHERE memory.tenant_id = %(tenant_id)s
   AND (
       %(query)s::text IS NULL
-      OR to_tsvector('mindbridge_text', memory.summary) @@ lexical.lexical_query
+      -- `summary_tsv` is the same expression 0019 indexed, stored by migration 0024 rather
+      -- than recomputed. The substring arm below has no index to serve it, so this filter
+      -- runs over every row of the tenant either way; lexing each summary here and again in
+      -- the ORDER BY was the whole cost of a recall -- 298 ms against 34.6 ms for the column.
+      OR memory.summary_tsv @@ lexical.lexical_query
       -- Substring containment, not a LIKE pattern. The query is caller text, and ILIKE read
       -- its wildcard characters as wildcards, so a one-character query of either returned
       -- the whole tenant ranked only by strength. strpos has no pattern language to escape.
@@ -251,10 +255,7 @@ WHERE memory.tenant_id = %(tenant_id)s
 ORDER BY
     CASE
         WHEN lexical.lexical_query IS NULL THEN 0
-        ELSE ts_rank_cd(
-            to_tsvector('mindbridge_text', memory.summary),
-            lexical.lexical_query
-        )
+        ELSE ts_rank_cd(memory.summary_tsv, lexical.lexical_query)
     END DESC,
     memory.strength DESC,
     memory.occurred_at DESC,
@@ -384,6 +385,56 @@ ORDER BY dense.depth, dense.root_rank, memory.strength DESC,
 LIMIT %(limit)s
 """
 
+
+def _same_as_aliases_sql(entity_id: str) -> str:
+    """One entity, plus the entities a `same_as` verdict says it already is.
+
+    Entity resolution reached 135 verdicts at precision 1.0 on a real subset, and not one of
+    them could change a retrieval result: `same_as` appeared in no read query in the repository,
+    so the only thing a merge did was stop the adjudicator paying to judge that pair again. Two
+    records the adjudicator declared to be one person stayed two people to recall.
+
+    Both stored directions are searched because the edge is directed by construction and only
+    ever written one way round: `EntityPair` requires `left.entity_id < right.entity_id`, so a
+    partner is a target when this entity sorts first and a source when it sorts second. Following
+    one column would resolve merges for the lexicographically smaller half of every pair and
+    silently not for the other -- a feature that works on half its inputs looks intermittent
+    rather than broken, which is the worse failure.
+
+    Exactly one hop, deliberately. `entity_resolution` never composes A~B and B~C into A~C,
+    because a released clustering that did compose them put 152 of 153 observations of this same
+    video on one character; a recursive walk here would reintroduce that transitive closure at
+    read time, which is the adjudicator's refusal overridden by a join. So a hit on A reaches B
+    and stops. A hit on B reaches both A and C, which is not composition: those are the two
+    verdicts B itself carries. `not_same_as` is never followed -- it records that a pair was
+    inspected and differs, which is the opposite of a reason to merge their results.
+
+    `UNION ALL` rather than `UNION`: a pair is stored once, in one direction, and a relation
+    cannot point an entity at itself, so the three branches are disjoint by construction. The
+    dedup node is per evaluation and this runs once per hit and once per anchor entity -- paying
+    for it cost +1.41 ms against +0.33 ms without, on the same 24-object recall.
+    """
+    return f"""
+        SELECT {entity_id} AS entity_id
+        UNION ALL
+        SELECT merged.target_id
+        FROM relations AS merged
+        WHERE merged.tenant_id = %(tenant_id)s
+          AND merged.source_type = 'entity'
+          AND merged.source_id = {entity_id}
+          AND merged.relation_type = 'same_as'
+          AND merged.target_type = 'entity'
+        UNION ALL
+        SELECT merged.source_id
+        FROM relations AS merged
+        WHERE merged.tenant_id = %(tenant_id)s
+          AND merged.target_type = 'entity'
+          AND merged.target_id = {entity_id}
+          AND merged.relation_type = 'same_as'
+          AND merged.source_type = 'entity'
+    """
+
+
 _SEARCH_MEMORIES_BY_GRAPH_OBJECTS_SQL = f"""
 WITH ranked_objects AS (
     SELECT object_type, object_id, rank
@@ -400,12 +451,13 @@ related_objects AS (
     FROM ranked_objects AS hit
     JOIN LATERAL (
         SELECT relation.source_type AS object_type, relation.source_id AS object_id
-        FROM relations AS relation
-        WHERE relation.tenant_id = %(tenant_id)s
-          AND relation.target_type = 'entity'
-          AND relation.target_id = hit.object_id
-          AND relation.source_type IN ('event', 'claim')
-          AND relation.relation_type IN ('mentions', 'about')
+        FROM ({_same_as_aliases_sql("hit.object_id")}) AS alias
+        JOIN relations AS relation
+          ON relation.tenant_id = %(tenant_id)s
+         AND relation.target_type = 'entity'
+         AND relation.target_id = alias.entity_id
+         AND relation.source_type IN ('event', 'claim')
+         AND relation.relation_type IN ('mentions', 'about')
         ORDER BY relation.created_at DESC, relation.source_type, relation.source_id
         LIMIT %(limit)s
     ) AS mention ON hit.object_type = 'entity'
@@ -439,10 +491,11 @@ related_objects AS (
     JOIN LATERAL (
         SELECT peer.source_type AS object_type, peer.source_id AS object_id
         FROM relations AS anchor
+        JOIN LATERAL ({_same_as_aliases_sql("anchor.target_id")}) AS alias ON true
         JOIN relations AS peer
           ON peer.tenant_id = anchor.tenant_id
          AND peer.target_type = 'entity'
-         AND peer.target_id = anchor.target_id
+         AND peer.target_id = alias.entity_id
          AND peer.relation_type IN ('mentions', 'about')
          AND peer.source_type IN ('event', 'claim')
         WHERE anchor.tenant_id = %(tenant_id)s

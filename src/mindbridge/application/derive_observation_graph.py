@@ -19,6 +19,7 @@ from mindbridge.application.perception import (
     time_ranges_overlap,
 )
 from mindbridge.core import (
+    AnonymousIdentityObservation,
     Claim,
     ClaimId,
     EmbeddedObjectType,
@@ -30,6 +31,7 @@ from mindbridge.core import (
     EntityType,
     Event,
     EvidenceSpan,
+    IdentityScope,
     MemoryId,
     MemoryIntegrityError,
     MemoryRecord,
@@ -347,6 +349,26 @@ def _entity_mentions(
     )
 
 
+def _counted_statement(perceived: PerceivedClaim) -> str:
+    """Fold a claim's exact count into the one text a reader ever sees.
+
+    `PerceivedCount` is typed where the model produces it, but nothing downstream reads a typed
+    number: the answer pipeline is handed `MemoryRecord.summary`, and a claim's memory restates
+    its statement verbatim. A count kept beside the statement would therefore be write-only,
+    which is the failure this change exists to avoid, so it is written into the statement --
+    once, deterministically, rather than hoped for in the sentence the model wrote.
+
+    Rendered as ordinary English on purpose. The statement is also the text that gets embedded,
+    and `key=value` syntax in it would be tokens the query side never produces, while "exactly 3
+    small monsters" is close to how a question about how many small monsters there were is
+    phrased.
+    """
+    count = perceived.exact_count
+    if count is None:
+        return perceived.statement
+    return f"{perceived.statement} (exactly {count.value} {count.subject})"
+
+
 def _claim(
     observation: Observation,
     perception: EventPerception,
@@ -355,6 +377,7 @@ def _claim(
     claim_index: int,
     created_at: datetime,
 ) -> Claim:
+    statement = _counted_statement(perceived)
     return Claim(
         claim_id=ClaimId(
             derive_stable_id(
@@ -362,12 +385,12 @@ def _claim(
                 observation.tenant_id,
                 event.event_id,
                 claim_index,
-                perceived.statement,
+                statement,
             )
         ),
         tenant_id=observation.tenant_id,
         claim_type=perceived.claim_type,
-        statement=perceived.statement,
+        statement=statement,
         evidence_ids=perceived.evidence_ids,
         confidence=perceived.confidence,
         verification_status=VerificationStatus.VERIFIED,
@@ -428,6 +451,29 @@ def _claim_memory(claim: Claim, event: Event) -> MemoryRecord:
     )
 
 
+def _identity_entity_id(
+    observation: Observation,
+    identity: AnonymousIdentityObservation,
+) -> EntityId:
+    """Make a device identity the same person across clips, and an observation-scoped one not.
+
+    A device-scoped pseudonym is the one durable key an anonymous person has: the edge matched
+    this face or voice against its own enrolled gallery, so the same string in next week's clip
+    is the same human, and using it verbatim is what lets recall's co-mention expansion reach
+    the other clips they appear in.
+
+    `IdentityScope.OBSERVATION` states the opposite -- the pseudonym is only safe to reuse
+    inside the observation that produced it, because it is a within-clip diarization or tracking
+    label rather than a match. Using it verbatim made every caller-supplied `speaker_0` one
+    tenant-wide person, silently merging strangers across the corpus, which is worse than having
+    no identity at all: a wrong merge is asserted, and `MENTIONS` edges then join their events.
+    Namespacing it by its observation keeps it stable exactly as far as its scope promises.
+    """
+    if identity.scope is IdentityScope.DEVICE:
+        return EntityId(identity.identity_id)
+    return EntityId(derive_stable_id("identity", observation.observation_id, identity.identity_id))
+
+
 def _identity_graph(
     observation: Observation,
     events: tuple[Event, ...],
@@ -459,7 +505,7 @@ def _identity_graph(
             )
             if not matching_evidence_ids:
                 continue
-            entity_id = EntityId(identity.identity_id)
+            entity_id = _identity_entity_id(observation, identity)
             entities.setdefault(
                 entity_id,
                 Entity(

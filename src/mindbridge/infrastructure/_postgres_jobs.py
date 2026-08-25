@@ -31,7 +31,23 @@ from mindbridge.infrastructure._postgres_types import (
 from mindbridge.telemetry import model_token_usage
 
 PROCESS_OBSERVATION_JOB_TYPE = "process_observation"
-OBSERVATION_JOB_STALE_AFTER_SECONDS = 960
+OBSERVATION_JOB_STALE_AFTER_SECONDS = 2_400
+"""How long a `running` row may go unchanged before another delivery may claim it.
+
+Nothing refreshes `updated_at` during an attempt, so this window is measured against the
+longest attempt the deployment permits, not against a typical one. That length is the Worker's
+own task budget -- the generator's `request_timeout_seconds` plus 300 s, so 2 100 s for the
+bundled 1 800 s generator -- plus the 60 s hard-limit margin and the 120 s the broker adds on
+top of it before it re-delivers. At the previous 960 s a healthy attempt was declared abandoned
+at 16 minutes while its worker was still paying for it: the 2026-08-24 evaluation measured p50
+work of 626.8 s per observation under nine producers, so slow-but-alive rows were routinely
+reclaimable, and every `mindbridge jobs --republish` that touched one bought the same
+observation twice. Nothing can tell a dead worker from a slow one sooner than the longest run a
+live one is allowed, which is why this cannot be tightened to shorten recovery.
+
+Held below `CLIP_RECLAIM_GRACE_SECONDS` (3 600 s), which must stay above it so the orphan-clip
+sweep never robs an attempt this window still considers live.
+"""
 _ERROR_CODE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 JobRow: TypeAlias = tuple[
     str,

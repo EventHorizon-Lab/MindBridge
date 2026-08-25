@@ -11,6 +11,7 @@ from typing import Annotated, TypeVar
 from pydantic import (
     AfterValidator,
     BaseModel,
+    BeforeValidator,
     ConfigDict,
     Field,
     StringConstraints,
@@ -21,12 +22,14 @@ from pydantic import (
 from mindbridge.application.capabilities import GenerateRequest, Generator, ModelInput, TextPart
 from mindbridge.application.perception import (
     MAX_PERCEIVED_CLAIMS_PER_EVENT,
+    MAX_PERCEIVED_COUNT,
     MAX_PERCEIVED_ENTITIES_PER_EVENT,
     MAX_PERCEPTION_CLAIMS,
     MAX_PERCEPTION_ENTITIES,
     MAX_PERCEPTION_EVENTS,
     EventPerception,
     PerceivedClaim,
+    PerceivedCount,
     PerceivedEntity,
     PerceivedEvent,
     ResolvedEvidence,
@@ -116,6 +119,29 @@ _EvidenceIdentifiers = Annotated[
 _EntityIndices = Annotated[
     tuple[Annotated[int, Field(ge=0)], ...], Field(max_length=32), AfterValidator(_deduplicated)
 ]
+_CountSubject = Annotated[
+    str, StringConstraints(strip_whitespace=True, min_length=1, max_length=128)
+]
+
+
+class _CountOutput(BaseModel):
+    model_config = _MODEL_OUTPUT_CONFIG
+
+    subject: _CountSubject
+    value: Annotated[int, Field(ge=0, le=MAX_PERCEIVED_COUNT)]
+
+
+def _usable_count(value: object) -> object:
+    """Drop a malformed count instead of the claim it was attached to.
+
+    Same rule as everywhere else in this module: the element a model got wrong is the element
+    that goes. A claim carrying an unusable count still carries a statement, a window, and its
+    evidence, and losing all of that over an optional field would make adding the field a net
+    loss on exactly the clips it was added for.
+    """
+    if value is None or isinstance(value, _CountOutput):
+        return value
+    return _kept(_CountOutput, value)
 
 
 class _EntityOutput(BaseModel):
@@ -137,6 +163,7 @@ class _ClaimOutput(BaseModel):
     valid_from_ms: Annotated[int, Field(ge=0)]
     valid_to_ms: Annotated[int, Field(ge=0)] | None
     entity_indices: _EntityIndices = ()
+    exact_count: Annotated[_CountOutput | None, BeforeValidator(_usable_count)] = None
 
     @model_validator(mode="after")
     def require_valid_references(self) -> _ClaimOutput:
@@ -263,6 +290,7 @@ class PerceptionPipeline:
                             valid_from_ms=claim.valid_from_ms,
                             valid_to_ms=claim.valid_to_ms,
                             entity_indices=claim.entity_indices,
+                            exact_count=_perceived_count(claim.exact_count),
                         )
                         for claim in event.claims
                     ),
@@ -272,6 +300,12 @@ class PerceptionPipeline:
             model_reference=result.model_reference,
             prompt_version=PERCEIVE_EVENTS_PROMPT.version,
         )
+
+
+def _perceived_count(count: _CountOutput | None) -> PerceivedCount | None:
+    if count is None:
+        return None
+    return PerceivedCount(subject=count.subject, value=count.value)
 
 
 def _context(observation: Observation, evidence: tuple[ResolvedEvidence, ...]) -> str:

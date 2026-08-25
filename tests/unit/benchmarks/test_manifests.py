@@ -46,6 +46,7 @@ def test_dataset_adapter_manifest_matches_current_schema() -> None:
         "M3-Bench-robot": 1_276,
         "M3-Bench-web": 3_214,
         "Video-MME": 2_700,
+        "Video-MME-v2": 3_200,
         "EgoLifeQA": 500,
         "EgoTempo": 500,
         "EgoMemReason": 500,
@@ -192,8 +193,8 @@ def test_jsonl_lines_drops_blank_lines_and_normalises_crlf_and_cr_endings(
     assert [json.loads(line) for line in jsonl_lines(crlf)] == [{"a": 1}, {"a": 2}]
 
 
-def test_dataset_smoke_result_requires_all_sixteen_benchmark_summaries() -> None:
+def test_dataset_smoke_result_requires_all_seventeen_benchmark_summaries() -> None:
     """A benchmark dropped out of the smoke must fail the contract, not pass quietly."""
     from mindbridge.benchmarks.dataset_smoke import DatasetAdapterSmokeResult
 
-    assert DatasetAdapterSmokeResult.model_fields["datasets"].metadata[0].min_length == 16
+    assert DatasetAdapterSmokeResult.model_fields["datasets"].metadata[0].min_length == 17

@@ -131,13 +131,14 @@ class InsightFaceVideoEncoder:
         minimum_embedding_norm: float = 20.0,
         minimum_face_pixels: int = 32,
     ) -> InsightFaceVideoEncoder:
-        """Load InsightFace on CUDA by default, or TensorRT when explicitly requested."""
+        """Load InsightFace with the best ONNX provider available in this environment."""
         try:
             insightface = import_module("insightface.app")
             onnxruntime = import_module("onnxruntime")
         except ImportError as error:
             raise ModelUnavailableError(
-                "install InsightFace, ONNX Runtime, and OpenCV for face inference"
+                "install the edge extra on Linux/Windows x86_64 or Apple Silicon macOS, "
+                "or provide the platform face runtime"
             ) from error
         providers = select_onnx_providers(
             tuple(cast(list[str], onnxruntime.get_available_providers())),
@@ -417,7 +418,10 @@ def _load_opencv() -> ModuleType:
     try:
         return import_module("cv2")
     except ImportError as error:
-        raise ModelUnavailableError("install OpenCV for video identity inference") from error
+        raise ModelUnavailableError(
+            "install the edge extra on Linux/Windows x86_64 or Apple Silicon macOS, "
+            "or provide the platform OpenCV runtime"
+        ) from error
 
 
 def _applied_face_providers(face_analysis: _FaceAnalysis) -> tuple[str, ...]:

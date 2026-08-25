@@ -113,6 +113,15 @@ COMMANDS: dict[tuple[str, ...], Command] = {
         attribute="run_mcp",
         extra="server",
     ),
+    ("config", "check"): Command(
+        "mindbridge.config_cli",
+        "Report whether one role's configuration is complete",
+    ),
+    ("jina", "serve"): Command(
+        "mindbridge.jina_server",
+        "Serve Jina v5 Omni with SentenceTransformers",
+        extra="server --extra cloud-models",
+    ),
     ("edge", "sync"): Command(
         "mindbridge.edge.sync_cli",
         "Drain one edge device's observation outbox once",

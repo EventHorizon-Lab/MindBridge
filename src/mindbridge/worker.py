@@ -5,10 +5,10 @@ from __future__ import annotations
 import asyncio
 import json
 import math
-import os
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Collection, Mapping
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
+from time import time
 from typing import Annotated, NoReturn, Protocol
 
 from celery import Celery
@@ -37,6 +37,7 @@ from mindbridge.configuration import (
     PluginConfigModel,
     PluginInteger,
     PluginNumber,
+    configuration_source,
     copy_plugin_configuration,
     optional_environment_value,
     plugin_configuration,
@@ -52,6 +53,7 @@ from mindbridge.core import (
     ObservationId,
     TenantId,
 )
+from mindbridge.infrastructure._postgres_jobs import OBSERVATION_JOB_STALE_AFTER_SECONDS
 from mindbridge.infrastructure.postgres import (
     PostgresMemoryStore,
     resolve_database_max_pool_size,
@@ -65,6 +67,8 @@ from mindbridge.infrastructure.task_queue import (
     PROCESS_OBSERVATION_TASK,
     ObservationProcessingTaskMessage,
     create_task_queue,
+    observation_delivery_window_seconds,
+    observation_queues,
 )
 from mindbridge.media.clipping import (
     DEFAULT_IMAGE_MAX_PIXELS,
@@ -98,8 +102,33 @@ by its own timeout.
 """
 _RUNNING_RETRY_SECONDS = 30
 _RUNNING_MAX_RETRIES = 40
-_TRANSIENT_MAX_RETRIES = 5
+_TRANSIENT_BACKOFF_MAX_SECONDS = 300
+_TRANSIENT_MAX_RETRIES = 2 * math.ceil(
+    OBSERVATION_JOB_STALE_AFTER_SECONDS / _TRANSIENT_BACKOFF_MAX_SECONDS
+)
+"""A backstop for `_retry_seconds_remaining`, which is what actually ends a transient chain.
+
+Five was the whole budget before, and full jitter draws each delay uniformly below the doubling
+ceiling, so those five attempts spanned at most 1+2+4+8+16 = 31 seconds and about 15 on average
+-- a dependency outage of any real length exhausted them and failed the row on its first
+minute. Counting attempts cannot express "keep trying for a while" because the wall clock a
+count buys depends on queue depth. What is left for the count to do is stop a run of near-zero
+jitter draws from spinning: at the 300 second ceiling and half of it on average, twice the
+ceiling-count is what fits inside one deadline.
+"""
 _RUNNING_RETRIES_HEADER = "mindbridge_running_retries"
+_RETRY_DEADLINE_HEADER = "mindbridge_retry_deadline"
+_RETRY_DEADLINE_SECONDS = float(OBSERVATION_JOB_STALE_AFTER_SECONDS)
+"""How long one delivery chain may keep retrying, in wall clock rather than attempts.
+
+One stale window: past it the row is claimable by any delivery, so a chain that has been
+bouncing that long has nothing left that a fresh claim would not do, and holding the message
+only keeps the work out of the ledger's reach. Retry counts do not bound wall clock at all --
+`countdown` is a minimum and the message goes to the tail of one shared FIFO, so during the
+2026-08-24 evaluation a nominal 1 second backoff took 43 hours and 30 second claim polls
+outlived the rows they were polling by hours. A deadline is the one bound queue depth can only
+shorten.
+"""
 DEFAULT_WORKER_CONCURRENCY = 1
 MAXIMUM_WORKER_CONCURRENCY = 32
 
@@ -173,7 +202,7 @@ class WorkerSettings:
     media_embedder_config: Mapping[str, object] = field(repr=False)
     text_embedder_config: Mapping[str, object] = field(repr=False)
     generator_plugin: str = "openai"
-    media_embedder_plugin: str = "jina"
+    media_embedder_plugin: str = "openai"
     text_embedder_plugin: str = "openai"
     embedding_dimension: int = DEFAULT_EMBEDDING_DIMENSION
     clip_sampling: ClipSampling = field(default_factory=ClipSampling)
@@ -221,9 +250,9 @@ class WorkerSettings:
     @classmethod
     def from_environment(cls, environ: Mapping[str, str] | None = None) -> WorkerSettings:
         """Read the explicit Worker contract and fail before consuming jobs."""
-        source = os.environ if environ is None else environ
+        source = configuration_source(environ)
         generator_plugin = source.get("MINDBRIDGE_GENERATOR_PLUGIN", "openai")
-        media_plugin = source.get("MINDBRIDGE_MEDIA_EMBEDDER_PLUGIN", "jina")
+        media_plugin = source.get("MINDBRIDGE_MEDIA_EMBEDDER_PLUGIN", "openai")
         # The Worker's text encoder must land in the same space the API queries, so it reads the
         # deployment-wide MINDBRIDGE_EMBEDDER_* contract rather than a second set of names.
         text_plugin = source.get("MINDBRIDGE_EMBEDDER_PLUGIN", "openai")
@@ -307,9 +336,13 @@ def _media_embedder_fallback(
     if plugin == "jina":
         return lambda: jina_media_embedder_config(source)
     if plugin == "openai":
-        return lambda: openai_embedder_config(
+        return lambda: plugin_configuration(
             source,
-            request_timeout_seconds=_MODEL_REQUEST_TIMEOUT_SECONDS,
+            "MINDBRIDGE_EMBEDDER_CONFIG_JSON",
+            lambda: openai_embedder_config(
+                source,
+                request_timeout_seconds=_MODEL_REQUEST_TIMEOUT_SECONDS,
+            ),
         )
     return None
 
@@ -402,10 +435,14 @@ class _WorkerRuntime:
         instead of being acked away with its message.
         """
         if self.embedders is None:
-            self.embedders = (
-                load_embedder(settings.media_embedder_plugin, settings.media_embedder_config),
-                load_embedder(settings.text_embedder_plugin, settings.text_embedder_config),
+            media = load_embedder(settings.media_embedder_plugin, settings.media_embedder_config)
+            text = (
+                media
+                if settings.media_embedder_plugin == settings.text_embedder_plugin
+                and settings.media_embedder_config == settings.text_embedder_config
+                else load_embedder(settings.text_embedder_plugin, settings.text_embedder_config)
             )
+            self.embedders = (media, text)
         return self.embedders
 
     def close(self) -> None:
@@ -415,8 +452,12 @@ class _WorkerRuntime:
             self.loop.close()
 
     async def _close_models(self) -> None:
-        for model in self.embedders or ():
-            await close_model(model)
+        if self.embedders is None:
+            return
+        media, text = self.embedders
+        await close_model(media)
+        if text is not media:
+            await close_model(text)
 
 
 _worker_runtime: _WorkerRuntime | None = None
@@ -444,6 +485,62 @@ def processing_budget_seconds(generator_config: Mapping[str, object]) -> float:
     if configured <= 0:
         raise ValueError("generator request_timeout_seconds must be positive")
     return float(configured) + _POST_MODEL_BUDGET_SECONDS
+
+
+def require_whole_observation_queue_set(consume_from: Collection[str]) -> None:
+    """Refuse a Worker that reads part of the observation queue set but not all of it.
+
+    Observations are published across a shard set so one tenant's backlog cannot starve every
+    other tenant, and every shard is in this app's own queue set -- so a Worker started with no
+    `-Q` reads all of them and needs no coordination. Narrowing it to `-Q mindbridge`, which is
+    the name the queue had before it was sharded and the one an older runbook reaches for, leaves
+    the shards with no consumer. The symptom is not an error: the publish succeeds, the ledger
+    says `pending`, and the work simply never runs -- the same silent shape the in-process model
+    guard below exists to replace.
+
+    Reading *none* of them is a different role rather than a mistake: the consolidation sweep runs
+    that way, on its own queue. Only partial coverage is refused.
+    """
+    selected = set(consume_from)
+    observation = set(observation_queues())
+    missing = tuple(sorted(observation - selected))
+    if missing and observation & selected:
+        raise ValueError(
+            "these observation queues would have no consumer: "
+            + ", ".join(missing)
+            + " -- start the Worker without -Q, or name every observation queue in it"
+        )
+
+
+def require_stale_window_covers_delivery(settings: WorkerSettings) -> None:
+    """Refuse a Worker whose longest permitted attempt outlives the stale-claim window.
+
+    `OBSERVATION_JOB_STALE_AFTER_SECONDS` is a constant because the claim predicate is SQL, but
+    the length it has to cover is not: it is the generator's configured
+    `request_timeout_seconds` plus the post-model budget, the hard-limit margin, and the
+    re-delivery margin. The bundled 1 800 s generator lands at 2 280 s against a 2 400 s
+    window, and every 100 s added to that timeout eats 100 s of the remaining 120.
+
+    Past it the two disagree about the same attempt: the delivery is still running and paying
+    for its model call, while the ledger already considers the row reclaimable, so a concurrent
+    delivery or one `mindbridge jobs --republish` buys the same observation a second time --
+    the duplicate-work defect the window was widened to close. Refusing at boot is the only
+    place that can say so, because nothing about the running system looks wrong afterwards.
+    """
+    budget = processing_budget_seconds(settings.generator_config)
+    window = observation_delivery_window_seconds(budget)
+    if window <= OBSERVATION_JOB_STALE_AFTER_SECONDS:
+        return
+    # Everything the window adds on top of the one number an operator sets, so the remedy names
+    # a value they can paste rather than an arithmetic they have to redo.
+    overhead = window - (budget - _POST_MODEL_BUDGET_SECONDS)
+    raise ValueError(
+        f"one delivery may stay alive for {window:.0f} s, past the "
+        f"{OBSERVATION_JOB_STALE_AFTER_SECONDS} s stale-claim window, so a live attempt would "
+        "be reclaimable and its observation processed twice -- set the generator's "
+        f"request_timeout_seconds to at most "
+        f"{OBSERVATION_JOB_STALE_AFTER_SECONDS - overhead:.0f} s"
+    )
 
 
 def require_bounded_in_process_models(
@@ -573,14 +670,21 @@ def create_worker_app(settings: WorkerSettings) -> Celery:
     # the CLI flags, this app's default, and Celery's own CPU-count fallback. `--autoscale` is
     # readable but not yet parsed there, which `_resolved_pool_size` handles. The dispatch UID
     # keeps a re-created app from stacking a second receiver.
-    @worker_init.connect(weak=False, dispatch_uid="mindbridge-in-process-model-guard")  # type: ignore[untyped-decorator]
-    def _guard_in_process_models(sender: object = None, **_kwargs: object) -> None:
+    worker_init.disconnect(dispatch_uid="mindbridge-worker-startup-guard")
+
+    @worker_init.connect(weak=False, dispatch_uid="mindbridge-worker-startup-guard")  # type: ignore[untyped-decorator]
+    def _guard_worker_startup(sender: object = None, **_kwargs: object) -> None:
         try:
             require_bounded_in_process_models(
                 settings,
                 _resolved_pool_size(sender),
                 pool=getattr(sender, "pool_cls", "prefork"),
             )
+            # `-Q` is resolved before this signal: `WorkController.setup_instance` calls
+            # `setup_queues` first and sends `worker_init` twenty lines later, so unlike
+            # `--autoscale` the selection is readable here rather than merely present.
+            require_whole_observation_queue_set(task_queue.amqp.queues.consume_from)
+            require_stale_window_covers_delivery(settings)
         except ValueError as error:
             # Celery's `Signal.send` catches `Exception` from every receiver, logs it, and
             # carries on -- so raising `ValueError` here would print a traceback and then start
@@ -599,7 +703,7 @@ def create_worker_app(settings: WorkerSettings) -> Celery:
         ),
         max_retries=_TRANSIENT_MAX_RETRIES,
         retry_backoff=True,
-        retry_backoff_max=300,
+        retry_backoff_max=_TRANSIENT_BACKOFF_MAX_SECONDS,
         retry_jitter=True,
         pydantic=True,
         pydantic_strict=True,
@@ -609,9 +713,16 @@ def create_worker_app(settings: WorkerSettings) -> Celery:
         message: ObservationProcessingTaskMessage,
     ) -> str:
         running_retries = _running_retries(task)
-        task.override_max_retries = running_retries + _TRANSIENT_MAX_RETRIES
+        may_retry = _retry_seconds_remaining(task) > 0
+        # Past the deadline the count is set to the attempts already made, which is how a
+        # `retry()` Celery raises on its own behalf re-raises the original error instead: the
+        # row lands `failed`, where the claim predicate and `mindbridge jobs --republish` can
+        # both still reach it, rather than staying attached to a message that will not finish.
+        task.override_max_retries = (
+            running_retries + _TRANSIENT_MAX_RETRIES if may_retry else task.request.retries
+        )
         state = run_observation_processing(settings, message)
-        if state is JobState.RUNNING:
+        if state is JobState.RUNNING and may_retry:
             headers = dict(task.request.headers or {})
             headers[_RUNNING_RETRIES_HEADER] = running_retries + 1
             task.retry(
@@ -622,6 +733,25 @@ def create_worker_app(settings: WorkerSettings) -> Celery:
         return str(state.value)
 
     return task_queue
+
+
+def _retry_seconds_remaining(task: _RetryingTask) -> float:
+    """Report what is left of this delivery chain's wall-clock retry budget.
+
+    The deadline is stamped on the first delivery and then carried by the message: Celery
+    re-publishes `request.headers` on every retry, including the ones `autoretry_for` raises
+    without consulting this task, which is why it is written back onto the request rather than
+    only passed to the `retry()` call below. A header is caller-supplied data, so a deadline
+    further out than one full budget is treated as absent rather than trusted.
+    """
+    headers = dict(task.request.headers or {})
+    deadline = headers.get(_RETRY_DEADLINE_HEADER)
+    ceiling = time() + _RETRY_DEADLINE_SECONDS
+    if type(deadline) is not float and type(deadline) is not int:
+        deadline = ceiling
+        headers[_RETRY_DEADLINE_HEADER] = deadline
+        task.request.headers = headers
+    return min(float(deadline), ceiling) - time()
 
 
 def _running_retries(task: _RetryingTask) -> int:

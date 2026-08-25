@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+from functools import partial
 from pathlib import Path
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
@@ -11,9 +12,11 @@ from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validato
 from mindbridge.benchmarks.prompts import EGOTEMPO_QUERY_PROMPT
 from mindbridge.benchmarks.runtime import (
     PreparedVideo,
+    answer_failure_trace_id,
     benchmark_tenant_id,
     ingest_prepared_video,
     prepared_video_end,
+    settle_answers,
 )
 from mindbridge.contracts import (
     ContractModel,
@@ -149,20 +152,25 @@ async def run_egotempo_clip(
     answers: list[EgoTempoQuestionResult] = []
     cutoff = prepared_video_end(prepared)
     for offset in range(0, len(questions), request_concurrency):
-        answers.extend(
-            await asyncio.gather(
-                *(
-                    _answer_question(
-                        memory,
-                        tenant_id,
-                        question,
-                        cutoff,
-                        recall_limit,
-                        semaphore,
-                        ingest_failures,
-                    )
-                    for question in questions[offset : offset + request_concurrency]
+        cohort = questions[offset : offset + request_concurrency]
+        answered = await asyncio.gather(
+            *(
+                _answer_question(
+                    memory,
+                    tenant_id,
+                    question,
+                    cutoff,
+                    recall_limit,
+                    semaphore,
+                    ingest_failures,
                 )
+                for question in cohort
+            ),
+            return_exceptions=True,
+        )
+        answers.extend(
+            settle_answers(
+                cohort, answered, partial(_failed_result, ingest_failures=ingest_failures)
             )
         )
     return tuple(answers)
@@ -239,6 +247,26 @@ async def _answer_question(
         memory_ids=tuple(item.memory_id for item in result.memories),
         evidence_ids=tuple(item.evidence_id for item in result.evidence),
         trace_id=result.trace_id,
+        ingest_failures=ingest_failures,
+    )
+
+
+def _failed_result(
+    question: EgoTempoQuestion,
+    error_code: str,
+    *,
+    ingest_failures: int,
+) -> EgoTempoQuestionResult:
+    """One row for a question whose recall raised, so its cohort still answers all of them."""
+    return _question_result(
+        question,
+        EGOTEMPO_QUERY_PROMPT.text.format(question=question.question),
+        model_answer="",
+        confidence=0.0,
+        memory_ids=(),
+        evidence_ids=(),
+        trace_id=answer_failure_trace_id(question.question_id),
+        error_code=error_code,
         ingest_failures=ingest_failures,
     )
 

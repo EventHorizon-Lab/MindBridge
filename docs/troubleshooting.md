@@ -28,12 +28,16 @@ requires.
 
 ### `<VARIABLE> must contain valid JSON` / `must contain a JSON object with non-empty keys`
 
-A `*_CONFIG_JSON` value is malformed. Multi-line exports in shell need quoting care:
+A `*_CONFIG_JSON` value is malformed. These variables replace a whole `mindbridge.toml` section
+and are rarely the easier way to write one — a section in the file needs no shell quoting at all.
+If you do set one, check it parses before starting anything:
 
 ```bash
-export MINDBRIDGE_GENERATOR_CONFIG_JSON='{"api_key":"...","endpoint":"https://..."}'
 python -c "import json,os;json.loads(os.environ['MINDBRIDGE_GENERATOR_CONFIG_JSON'])"
 ```
+
+A malformed `mindbridge.toml` reports its own parse position instead, and
+`mindbridge config check --role <role>` surfaces either failure before a process starts.
 
 ### `Extra inputs are not permitted` on a plugin config
 
@@ -93,8 +97,11 @@ searched.
 ### The similarity floor is too high
 
 `MINDBRIDGE_MINIMUM_EMBEDDING_SIMILARITY` defaults to 0.0 for good reason: a floor discards
-candidates that a graph hop or a lexical match would have rescued. If you raised it, lower it back
-and let fusion do the filtering.
+candidates that a graph hop or a lexical match would have rescued. It also binds the dense channel
+only, so a floored text query still returns whatever shares a word with the question. Lowering it
+back is the right move on a densely covered corpus and the wrong one on a long-horizon sparse
+deployment, where returning fewer rows is the point — see
+[Configuration](configuration.md) for which shape yours is.
 
 ### The memory was compressed or cooled
 
@@ -190,9 +197,17 @@ are derived from it and follow automatically.
 
 ### Jobs stay `pending`
 
-Two different causes, and they are told apart by the queue rather than by the rows.
+Three different causes, and they are told apart by the queue rather than by the rows.
 
-**The worker is not consuming.** Check it is running, points at the same
+**The worker is reading only some of the observation queues.** Observations are sharded across
+`mindbridge` and `mindbridge.0` … `mindbridge.7`, and a worker started with no `-Q` reads all of
+them. A worker narrowed to `-Q mindbridge` reads only the pre-shard queue, so everything published
+to a shard has no consumer — the publish succeeds and the row sits `pending` with nothing wrong
+anywhere. The worker now **refuses to start** in that configuration rather than running half-blind,
+so this shows up as a boot failure naming the unread queues; if you are looking at an older worker,
+drop the `-Q`.
+
+**The worker is not consuming at all.** Check it is running, points at the same
 `MINDBRIDGE_TASK_BROKER_URL`, and is installed with the extras it actually needs:
 `--extra server --extra media` at minimum. `media` carries the PyAV, Pillow, and SoundFile
 decoders that cut evidence clips, which the worker does whatever its embedder slots say — without
@@ -219,14 +234,14 @@ to construct without it, and the upstream loader swallows that `ImportError` and
 processor unset — so the model loads, embeds text happily, and dies on the first frame it is given.
 
 MindBridge now detects the empty processor slot and says so instead. Install the extra, which
-pins `torchvision` from the same CUDA index as torch:
+pins compatible Torch and Torchvision releases together:
 
 ```bash
 uv sync --extra server --extra cloud-models
 ```
 
-A `torchvision` from PyPI links against a different CUDA runtime, so installing it by hand
-generally does not work.
+Do not install a second Torchvision by hand; that can replace the pinned release while leaving
+Torch unchanged.
 
 ### The worker fails every media job
 

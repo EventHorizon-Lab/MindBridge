@@ -39,10 +39,12 @@ guard was tightened to catch.
 ```mermaid
 flowchart TB
   subgraph proc["Deployable processes"]
+    jina["Jina embedding service<br/><code>mindbridge jina serve</code>"]
     api["API<br/><code>uvicorn mindbridge.server:create_app</code>"]
     mcp["MCP stdio<br/><code>mindbridge mcp</code>"]
     worker["Memory worker<br/><code>celery -A mindbridge.celery_app:app</code>"]
-    cons["Consolidation<br/><code>mindbridge consolidate</code>"]
+    beat["Consolidation beat<br/><code>celery -A mindbridge.celery_app:app beat</code>"]
+    cons["Consolidation<br/><code>mindbridge consolidate</code><br/>or a beat-scheduled worker"]
     life["Lifecycle<br/><code>mindbridge lifecycle</code>"]
   end
 
@@ -54,34 +56,33 @@ flowchart TB
 
   subgraph models["Model endpoints"]
     gen["Generator<br/>OpenAI-compatible"]
-    emb["Embedder<br/>OpenAI-compatible"]
-    local["Media embedder<br/>in-process, GPU"]
+    emb["Jina v5 Omni<br/>SentenceTransformers"]
   end
 
+  jina --> emb
   api --> pg & redis & s3 & gen & emb
   mcp --> pg & s3 & gen & emb
   redis --> worker
-  worker --> pg & s3 & gen & emb & local
+  beat --> redis
+  redis --> cons
+  worker --> pg & s3 & gen & emb
   cons --> pg & s3 & gen & emb
   life --> pg & s3
 ```
 
 | Process | Extra | Scaling unit | Holds a model? |
 | --- | --- | --- | --- |
+| Jina service | `server` + `cloud-models` | One process per GPU | Yes — Jina v5 Omni |
 | API | `server` | Stateless; scale horizontally | No |
 | MCP stdio | `server` | One per agent session | No |
-| Memory worker | `server` + `cloud-models` | One process per GPU | Yes — local media embedder |
+| Memory worker | `server` | One process per queue | No |
+| Consolidation beat | `server` | One per deployment | No |
 | Consolidation | `server` | One scheduled run per tenant | No |
 | Lifecycle | `server` | One scheduled run per tenant | No |
-| Edge sync | `edge` | One per device, one-shot | Yes — on-device identity models |
+| Edge sync/identity | `edge` | One per device | Yes — on-device identity models |
 
-The API loads no model. Both of its model slots are remote endpoints, which is what keeps the
-API image small and lets it scale independently of GPU capacity. Only the worker holds weights
-in-process, and only for the media slot.
-
-Concurrency inside a worker process is the wrong knob: each prefork child owns a full embedding
-model, so one child is the safe default and you scale by adding worker processes bound to
-distinct GPUs.
+The API and worker load no model. One SentenceTransformers process owns the Jina weights and
+serves every modality, keeping the application images small and independently scalable.
 
 ## Write path
 
@@ -103,7 +104,7 @@ sequenceDiagram
   W->>S: read original AV once
   W->>W: perception -> Event / Entity / Claim
   W->>S: cut one derived clip per grounded span
-  W->>W: embed clips locally, text remotely
+  W->>W: send clips and text to the shared embedder
   W->>P: graph + memories + vectors (one transaction)
 ```
 
@@ -160,13 +161,17 @@ against the lexical ranking — with a rank constant of 60. Fusion combines *ran
 scores, because a cosine similarity and a `ts_rank` are not on a comparable scale and averaging
 them produces a number that means nothing.
 
-Two details that matter operationally:
+Three details that matter operationally:
 
 - **Filters apply before ranking, not after.** A time or person filter narrows the candidate
   set rather than trimming an already-ranked list, so a filtered query does not silently return
   fewer results than its limit because the filter ate the top of the ranking.
 - **Visibility is re-checked immediately before answering.** A memory deleted or superseded
   during a long reflection round does not reach the answer.
+- **The hierarchy ranking is empty until consolidation runs.** `memories by hierarchy` walks
+  `contains` edges, which only the Summary sweep writes, so a deployment that never consolidates
+  fuses three rankings rather than four and can answer only from individual moments. See
+  [operations](operations.md#built-in-consolidation-schedule).
 
 `occurred_after` is inclusive and `occurred_before` is **exclusive**. The asymmetry is
 deliberate — it makes adjacent windows tile without overlap — but it does surprise people.
@@ -227,8 +232,8 @@ never in weights. Three slots, selected by plugin name:
 | Slot | Default | Loaded by |
 | --- | --- | --- |
 | Generator | `openai` | API, MCP, worker, consolidation |
-| Embedder (text) | `openai` | API, MCP, worker, consolidation |
-| Media embedder | `jina` | Worker only, in-process |
+| Embedder | `openai` wire adapter to the Jina SentenceTransformers service | API, MCP, worker, consolidation |
+| Media embedder override | inherits Embedder | Worker only |
 
 Plugins resolve through `importlib.metadata` entry points (`mindbridge.generators`,
 `mindbridge.embedders`), so a third-party adapter is installable without a fork. The author

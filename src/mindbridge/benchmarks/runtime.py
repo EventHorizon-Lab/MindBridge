@@ -5,10 +5,12 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import re
+from collections.abc import Callable, Sequence
 from datetime import timedelta
 from decimal import Decimal
 from pathlib import Path
 from time import monotonic
+from typing import TypeVar
 
 from pydantic import AwareDatetime, Field, TypeAdapter, model_validator
 
@@ -22,7 +24,10 @@ from mindbridge.contracts import (
     RememberRequest,
 )
 from mindbridge.core import JobState, MediaKind, MemoryType, SensorKind
-from mindbridge.sdk import MindBridge
+from mindbridge.sdk import MindBridge, MindBridgeError
+
+T = TypeVar("T")
+R = TypeVar("R")
 
 OPTION_LABELS = tuple("ABCDEFGHIJ")
 # The Worker retries a transient failure with `retry_backoff_max=300`, and that redelivery is the
@@ -171,6 +176,53 @@ def _count_ingest_failures(outcomes: list[BaseException | None]) -> int:
     evidence apart from a wrong answer.
     """
     return sum(isinstance(outcome, BaseException) for outcome in outcomes)
+
+
+def settle_answers(
+    questions: Sequence[T],
+    outcomes: Sequence[R | BaseException],
+    failed: Callable[[T, str], R],
+) -> tuple[R, ...]:
+    """Keep one row per question when a member of an answer fan-out raises.
+
+    The ingest fan-outs already survive one bad member; the answer fan-outs did not, so a single
+    recall failure discarded every sibling answer in its cohort -- measured at 65.2% of
+    LoCoMo-Refined's questions and 15 of M3-Bench's. Every question still produces a row and a
+    failed one carries the failure's code, because a shard holding fewer questions than the run
+    loaded, with nothing saying which ones went missing, is the silent truncation this repo has
+    already paid for twice.
+    """
+    settled: list[R] = []
+    for question, outcome in zip(questions, outcomes, strict=True):
+        if not isinstance(outcome, BaseException):
+            settled.append(outcome)
+        elif isinstance(outcome, Exception):
+            settled.append(failed(question, _answer_failure_code(outcome)))
+        else:
+            # Cancellation and interrupts end the whole run; they are not one question's
+            # bad luck, and recording them as an answer would hide a killed run as a scored one.
+            raise outcome
+    return tuple(settled)
+
+
+def answer_failure_trace_id(question_id: str) -> str:
+    """Stand in for the trace a failed answer never received.
+
+    Clipped to the 255-character `Identifier` cap: a validation error raised while building the
+    row that reports a failure would take the cohort down exactly the way the failure itself
+    used to.
+    """
+    return f"trace_answer_error_{question_id}"[:255]
+
+
+def _answer_failure_code(error: Exception) -> str:
+    """Name a failed answer by its API error code, falling back to the exception type.
+
+    Anything reaching here already escaped whatever recoverable-code check the runner applies,
+    so the type name is what a shard has left to distinguish an HTTP transport drop from a
+    contract violation.
+    """
+    return (error.code if isinstance(error, MindBridgeError) else "") or type(error).__name__
 
 
 async def _ingest_prepared_segment(

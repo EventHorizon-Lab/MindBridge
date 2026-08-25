@@ -27,6 +27,8 @@ from uuid import uuid4
 
 from opentelemetry import metrics, trace
 
+from mindbridge.configuration import configuration_source
+
 if TYPE_CHECKING:
     from fastapi import FastAPI
     from opentelemetry.sdk.metrics import MeterProvider
@@ -435,7 +437,7 @@ def configure_logging(
     """
     if not default_service_name.strip():
         raise ValueError("default_service_name must not be empty")
-    source = os.environ if environ is None else environ
+    source = configuration_source() if environ is None else environ
     service_name = source.get("OTEL_SERVICE_NAME", default_service_name).strip()
     if not service_name:
         raise ValueError("OTEL_SERVICE_NAME must not be blank")

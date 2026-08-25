@@ -4,19 +4,21 @@
 >
 > 更新日期：2026-08-25
 >
-> 范围：`src/mindbridge/benchmarks/` 中已有官方适配器的十一个 Benchmark
+> 范围：`src/mindbridge/benchmarks/` 中已有官方适配器的十二个 Benchmark
 >
 > 口径：**学术榜**指论文/官方 leaderboard 上可复现的公开结果；**工业榜**指厂商自测并对外发布的产品分数
 
 ## 1. 结论
 
-十一个 Benchmark 里只有 **LoCoMo-Refined** 和 **Video-MME** 存在真正意义上的工业榜；其余九个是纯
-学术榜，最强系统全部来自论文。这决定了 MindBridge 的超越策略在两条赛道上完全不同：
+十二个 Benchmark 里只有 **LoCoMo-Refined** 和 **Video-MME** 存在真正意义上的工业榜；其余十个是纯
+学术榜，最强系统全部来自论文（Video-MME-v2 的榜由作者收邮件维护，尚不构成工业榜）。这决定了
+MindBridge 的超越策略在两条赛道上完全不同：
 
 | Benchmark | 官方指标 | 学术 SOTA | 工业 SOTA | MindBridge 需越过的线 |
 | --- | --- | --- | --- | --- |
 | LoCoMo-Refined | 4 类 LLM-judge（Qwen3-14B refined prompt） | 无（发布方未收录论文系统） | MemoraX AI 82.65 | 官方 judge 下 > 82.65 |
 | Video-MME | MCQ Accuracy | video-SALMONN 2+ 81.6（含字幕） | Qwen3.8 Max 90.4（含字幕） | 记忆赛道先超 M3-Agent 的 long 61.8 |
+| Video-MME-v2 | 组内非线性 Rating | Gemini-3-Pro 49.4（含字幕） | 无（榜由作者收邮件维护） | 先站上榜，Rating > 39.1 才进前三 |
 | EgoLifeQA | 四选一 Accuracy | EgoGraph 45.8 | 无 | > 45.8（公开集 = A1_JAKE 500 题） |
 | EgoTempo | 开放式 LLM-judge Acc | GPT-4o 42.0（人类 63.2） | 无 | > 42.0，目标逼近 63.2 |
 | M3-Bench | Accuracy（GPT-4o judge） | NS-Mem 34.7 robot / 53.6 web | M3-Agent 30.7 / 48.9（字节 Seed） | > 34.7 robot、> 53.6 web |
@@ -128,6 +130,32 @@ Gemini-Agent 55.1。
 **MindBridge 目标**：不参与"整段视频塞进上下文"的总分竞赛。先在 long 子集的记忆赛道超过 61.8，
 再论证在无字幕设定下摄取一次、多次问答的成本优势。饱和度参见
 [Video-MME-v2](https://arxiv.org/html/2604.05015v1)。
+
+### 3.2.1 Video-MME-v2 — 组内非线性视频理解
+
+800 段视频 / 3,200 题，A–H 八选一，**没有短中长三档**；四题一组，按组打分。分 Level 1/2/3 三层
+认知维度，另有 `second_head`（10 个能力轴，论文雷达图用的就是它）和 `third_head`（33 个细分类）。
+
+官方同时给两个数，[榜单](https://video-mme-v2.netlify.app/#leaderboard)按前者排：
+
+| 名次 | 模型 | Non-Lin Rating（含字幕） | Avg Acc（含字幕） | Rating / Acc |
+| --- | --- | --- | --- | --- |
+| 1 | Gemini-3-Pro | 49.4 | 66.1 | 75% |
+| 2 | Gemini-3-Flash | 42.5 | 61.1 | 70% |
+| 3 | Qwen3.5-397B-A17B-Think (512) | 39.1 | 55.9 | 70% |
+| 4 | MiMo-v2-Omni | 38.6 | 56.1 | 69% |
+
+**Rating / Acc 这一列才是这个 benchmark 的产物**：它衡量"同一组相关问题能不能一起答对"。
+Gemini-3-Pro 约 75%，InternVL3-5-241B-A28B-Instruct 约 56%，LLaVA-Video-7B 只有约 40%——逐题准确率
+接近的两个系统，组内稳定性可以差一倍。这正是 v1 饱和到 90.4 却和真实体验脱节的原因。
+
+**对 MindBridge 的意义**：这是十二个 benchmark 里唯一直接惩罚"部分检索"的口径。已有的端到端评测发现
+部分检索在聚合题上比不检索更差，而 v1 的逐题准确率看不出这件事——组内非线性打分会把它变成明确的扣分。
+
+**MindBridge 目标**：先在无字幕设定下产出一份完整的 800 组 Rating（哪怕很低），确认写入路径能覆盖
+800 段视频；再对着 `second_head` 雷达定位薄弱轴。不要只报 `accuracy.overall`——那正是 v2 想淘汰的数字。
+
+**成本提醒**：媒体 97.8 GiB / 40 个 zip，压缩包和解压后各占一份，规划磁盘时按两倍算。
 
 ### 3.3 EgoLifeQA — 一周第一人称生活记忆
 
@@ -246,7 +274,7 @@ caption），但结论仍然成立：**现有记忆管线相对直读丢失了�
 | 2 | GPT-5 | 14.87 / 0.44 | 15.00 / 0.92 | 15.25 / 0.53 |
 | 3 | Qwen3-VL-235B | 14.33 / 0.06 | 15.63 / 0.80 | 12.44 / 0.79 |
 
-人类：Month 80.4、Week 95.6、Day 99.2。这是九个 Benchmark 里人机差距最大的一个。
+人类：Month 80.4、Week 95.6、Day 99.2。这是十二个 Benchmark 里人机差距最大的一个。
 
 工业榜：无。
 

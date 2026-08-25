@@ -8,6 +8,7 @@ from benchmark_deployment import write_deployment_snapshot
 from pydantic import ValidationError
 
 from mindbridge.benchmarks.artifacts import load_deployment_snapshot
+from mindbridge.benchmarks.cli_common import require_declared_transcripts
 from mindbridge.benchmarks.runtime import PreparedVideo, PreparedVideoSegment
 from mindbridge.benchmarks.video_mme import (
     VideoMMEDuration,
@@ -21,7 +22,6 @@ from mindbridge.benchmarks.video_mme import (
 from mindbridge.benchmarks.video_mme_cli import (
     VideoMMERunManifest,
     _Arguments,
-    _require_declared_transcripts,
     _select_videos,
     _write_artifacts,
 )
@@ -67,12 +67,12 @@ def test_declaring_no_subtitles_while_feeding_transcripts_is_refused() -> None:
     with_transcript = (_prepared("long_1", transcript="spoken words"),)
     without_transcript = (_prepared("long_1", transcript=None),)
 
-    _require_declared_transcripts(without_transcript, "none")
-    _require_declared_transcripts(with_transcript, "official_subtitles")
+    require_declared_transcripts(without_transcript, "none")
+    require_declared_transcripts(with_transcript, "official_subtitles")
     with pytest.raises(ValueError, match="no transcript"):
-        _require_declared_transcripts(with_transcript, "none")
+        require_declared_transcripts(with_transcript, "none")
     with pytest.raises(ValueError, match="carries no transcript"):
-        _require_declared_transcripts(without_transcript, "asr")
+        require_declared_transcripts(without_transcript, "asr")
 
 
 def test_manifest_records_the_transcript_source_behind_the_number(tmp_path: Path) -> None:
