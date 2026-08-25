@@ -76,14 +76,21 @@ and `UP`, with a McCabe complexity ceiling of 10 and a 100-character line length
 ### Markdown
 
 Documentation changes must pass the same tool versions CI uses. The pinned Docker images matter —
-`npx markdownlint-cli2` is old enough to miss rules the pinned version enforces:
+`npx markdownlint-cli2` is old enough to miss rules the pinned version enforces. Match CI's lychee
+arguments as well: `--exclude` covers the one host that answers CI egress with 403 (the job carries
+the reasoning), and `./.github/**/*.md` is where the PR and issue templates live.
 
 ```bash
 docker run --rm -v "$PWD:/workdir:ro" davidanson/markdownlint-cli2:v0.23.0 \
   "**/*.md" "!.git/**" "!.venv/**" "!.pytest_cache/**" "!.benchmarks/**"
 docker run --rm -v "$PWD:/input:ro" -w /input lycheeverse/lychee:0.23.0 \
-  --no-progress --root-dir /input './*.md' './docs/**/*.md'
+  --no-progress --root-dir /input \
+  --exclude '^https://penfieldlabs\.substack\.com/' \
+  './*.md' './docs/**/*.md' './.github/**/*.md'
 ```
+
+Re-run before you add a host to that list. A cited site answering 5xx for a few minutes is an
+outage on their end, not a link to exclude — an exclusion stops the gate checking that URL for good.
 
 ### The integration gate
 
