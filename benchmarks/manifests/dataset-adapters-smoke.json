@@ -1,5 +1,5 @@
 {
-  "created_at": "2026-08-25T08:59:48.104106Z",
+  "created_at": "2026-08-25T11:32:06.120322Z",
   "datasets": [
     {
       "benchmark": "LoCoMo-Refined",
@@ -140,6 +140,36 @@
       "context_count": 10,
       "memory_item_count": 83,
       "question_count": 4853
+    },
+    {
+      "benchmark": "ATM-Bench",
+      "source_repository": "Jingbiao/ATM-Bench",
+      "source_file": "atm-bench.json",
+      "source_sha256": "ab6eaa9df62fb4162e0f5eecd98768a7e3ae721e32d2db2cf227ff41e3295762",
+      "adapter_version": "atm_bench_official_v1",
+      "context_count": 1,
+      "memory_item_count": 1325,
+      "question_count": 1013
+    },
+    {
+      "benchmark": "ATM-Bench-Hard",
+      "source_repository": "Jingbiao/ATM-Bench",
+      "source_file": "atm-bench-hard.json",
+      "source_sha256": "acd35f2a172a9741d970d2cf21184ff0af8d79a8bf59967fc8aa33d619f6af4a",
+      "adapter_version": "atm_bench_official_v1",
+      "context_count": 1,
+      "memory_item_count": 172,
+      "question_count": 31
+    },
+    {
+      "benchmark": "Mem-Gallery",
+      "source_repository": "Ethan-Bei/Mem-Gallery",
+      "source_file": "dialog/*.json",
+      "source_sha256": "fcd47af2b493cd9a7856cb77a622291b5aa9c6dad12b1f3553d8f569e2c5f6b8",
+      "adapter_version": "mem_gallery_official_v1",
+      "context_count": 20,
+      "memory_item_count": 3962,
+      "question_count": 1711
     }
   ],
   "passed": true

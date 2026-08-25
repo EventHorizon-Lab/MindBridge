@@ -56,6 +56,9 @@ def test_dataset_adapter_manifest_matches_current_schema() -> None:
         "MM-Lifelong-month-train": 266,
         "MM-Lifelong-month-val": 623,
         "SuperMemory-VQA": 4_853,
+        "ATM-Bench": 1_013,
+        "ATM-Bench-Hard": 31,
+        "Mem-Gallery": 1_711,
     }
 
 
@@ -188,3 +191,10 @@ def test_jsonl_lines_drops_blank_lines_and_normalises_crlf_and_cr_endings(
     assert jsonl_lines(crlf) == ('{"a": 1}', '{"a": 2}')
     assert jsonl_lines(cr_only) == ('{"a": 3}', '{"a": 4}')
     assert [json.loads(line) for line in jsonl_lines(crlf)] == [{"a": 1}, {"a": 2}]
+
+
+def test_dataset_smoke_result_requires_all_seventeen_benchmark_summaries() -> None:
+    """A benchmark dropped out of the smoke must fail the contract, not pass quietly."""
+    from mindbridge.benchmarks.dataset_smoke import DatasetAdapterSmokeResult
+
+    assert DatasetAdapterSmokeResult.model_fields["datasets"].metadata[0].min_length == 17

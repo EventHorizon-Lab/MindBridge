@@ -8,6 +8,7 @@ from pathlib import Path
 
 from pydantic import AwareDatetime, Field
 
+from mindbridge.benchmarks.atm_bench import ATM_BENCH_ADAPTER_VERSION, load_atm_bench
 from mindbridge.benchmarks.cli import parser as build_parser
 from mindbridge.benchmarks.egolife_qa import EGOLIFE_QA_ADAPTER_VERSION, load_egolife_qa
 from mindbridge.benchmarks.egomem_reason import (
@@ -26,6 +27,12 @@ from mindbridge.benchmarks.m3_bench import (
     M3_BENCH_ADAPTER_VERSION,
     M3BenchVideo,
     load_m3_bench,
+)
+from mindbridge.benchmarks.mem_gallery import (
+    MEM_GALLERY_ADAPTER_VERSION,
+    MemGalleryTopic,
+    load_mem_gallery,
+    mem_gallery_dialog_digest,
 )
 from mindbridge.benchmarks.memlens import MEMLENS_ADAPTER_VERSION, load_memlens
 from mindbridge.benchmarks.mm_lifelong import (
@@ -64,7 +71,7 @@ class DatasetAdapterSmokeResult(ContractModel):
     """Machine-readable proof that the official annotations still parse."""
 
     created_at: AwareDatetime
-    datasets: tuple[BenchmarkDatasetSummary, ...] = Field(min_length=14)
+    datasets: tuple[BenchmarkDatasetSummary, ...] = Field(min_length=17)
     passed: bool
 
 
@@ -84,6 +91,9 @@ def run_dataset_adapter_smoke(
     mm_month_train_path: Path,
     mm_month_val_path: Path,
     supermemory_path: Path,
+    atm_path: Path,
+    atm_hard_path: Path,
+    mem_gallery_dialog_path: Path,
 ) -> DatasetAdapterSmokeResult:
     """Parse every official benchmark annotation release and record its inputs."""
     locomo_refined = load_locomo_refined(locomo_refined_path)
@@ -100,6 +110,9 @@ def run_dataset_adapter_smoke(
     mm_month_train = load_mm_lifelong(mm_month_train_path, "month_train")
     mm_month_val = load_mm_lifelong(mm_month_val_path, "month_val")
     supermemory = load_supermemory_vqa(supermemory_path)
+    atm = load_atm_bench(atm_path)
+    atm_hard = load_atm_bench(atm_hard_path)
+    mem_gallery = load_mem_gallery(mem_gallery_dialog_path)
     return DatasetAdapterSmokeResult(
         created_at=datetime.now(timezone.utc),
         datasets=(
@@ -214,6 +227,31 @@ def run_dataset_adapter_smoke(
                 ),
                 question_count=len(supermemory),
             ),
+            BenchmarkDatasetSummary(
+                benchmark="ATM-Bench",
+                source_repository="Jingbiao/ATM-Bench",
+                source_file=atm_path.name,
+                source_sha256=sha256_file(atm_path),
+                adapter_version=ATM_BENCH_ADAPTER_VERSION,
+                context_count=1,
+                memory_item_count=len(
+                    {evidence for question in atm for evidence in question.evidence_ids}
+                ),
+                question_count=len(atm),
+            ),
+            BenchmarkDatasetSummary(
+                benchmark="ATM-Bench-Hard",
+                source_repository="Jingbiao/ATM-Bench",
+                source_file=atm_hard_path.name,
+                source_sha256=sha256_file(atm_hard_path),
+                adapter_version=ATM_BENCH_ADAPTER_VERSION,
+                context_count=1,
+                memory_item_count=len(
+                    {evidence for question in atm_hard for evidence in question.evidence_ids}
+                ),
+                question_count=len(atm_hard),
+            ),
+            _mem_gallery_summary(mem_gallery_dialog_path, mem_gallery),
         ),
         passed=True,
     )
@@ -270,6 +308,18 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
     parser.add_argument(
         "--supermemory", type=Path, required=True, help="official supermemory release to parse"
     )
+    parser.add_argument(
+        "--atm", type=Path, required=True, help="official ATM-Bench release to parse"
+    )
+    parser.add_argument(
+        "--atm-hard", type=Path, required=True, help="official ATM-Bench-Hard release to parse"
+    )
+    parser.add_argument(
+        "--mem-gallery-dialog",
+        type=Path,
+        required=True,
+        help="official Mem-Gallery data/dialog directory to parse",
+    )
     arguments = parser.parse_args(argv)
     result = run_dataset_adapter_smoke(
         locomo_refined_path=arguments.locomo_refined,
@@ -286,6 +336,9 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
         mm_month_train_path=arguments.mm_month_train,
         mm_month_val_path=arguments.mm_month_val,
         supermemory_path=arguments.supermemory,
+        atm_path=arguments.atm,
+        atm_hard_path=arguments.atm_hard,
+        mem_gallery_dialog_path=arguments.mem_gallery_dialog,
     )
     print(result.model_dump_json(indent=2))
 
@@ -304,6 +357,29 @@ def _m3_summary(
         context_count=len(videos),
         memory_item_count=len(videos),
         question_count=sum(len(video.questions) for video in videos),
+    )
+
+
+def _mem_gallery_summary(
+    dialog_directory: Path,
+    topics: tuple[MemGalleryTopic, ...],
+) -> BenchmarkDatasetSummary:
+    """Summarize the whole dialog directory, digesting its files in sorted order.
+
+    Shares `mem_gallery_dialog_digest` with the CLI run manifest, so a smoke row and a run
+    cannot silently disagree about which release digest names.
+    """
+    return BenchmarkDatasetSummary(
+        benchmark="Mem-Gallery",
+        source_repository="Ethan-Bei/Mem-Gallery",
+        source_file=f"{dialog_directory.name}/*.json",
+        source_sha256=mem_gallery_dialog_digest(dialog_directory),
+        adapter_version=MEM_GALLERY_ADAPTER_VERSION,
+        context_count=len(topics),
+        memory_item_count=sum(
+            len(session.rounds) for topic in topics for session in topic.sessions
+        ),
+        question_count=sum(len(topic.questions) for topic in topics),
     )
 
 

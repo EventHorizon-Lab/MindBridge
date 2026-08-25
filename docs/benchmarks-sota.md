@@ -4,14 +4,15 @@
 >
 > 更新日期：2026-08-25
 >
-> 范围：`src/mindbridge/benchmarks/` 中已有官方适配器的十个 Benchmark
+> 范围：`src/mindbridge/benchmarks/` 中已有官方适配器的十二个 Benchmark
 >
 > 口径：**学术榜**指论文/官方 leaderboard 上可复现的公开结果；**工业榜**指厂商自测并对外发布的产品分数
 
 ## 1. 结论
 
-十个 Benchmark 里只有 **LoCoMo-Refined** 和 **Video-MME** 存在真正意义上的工业榜；其余八个是纯学术榜，
-最强系统全部来自论文（Video-MME-v2 的榜由作者收邮件维护，尚不构成工业榜）。这决定了 MindBridge 的超越策略在两条赛道上完全不同：
+十二个 Benchmark 里只有 **LoCoMo-Refined** 和 **Video-MME** 存在真正意义上的工业榜；其余十个是纯
+学术榜，最强系统全部来自论文（Video-MME-v2 的榜由作者收邮件维护，尚不构成工业榜）。这决定了
+MindBridge 的超越策略在两条赛道上完全不同：
 
 | Benchmark | 官方指标 | 学术 SOTA | 工业 SOTA | MindBridge 需越过的线 |
 | --- | --- | --- | --- | --- |
@@ -25,14 +26,30 @@
 | MM-Lifelong | Acc + Ref@300 | ReMA 18.62 / 18.82 / 16.75 | 无 | > 18.8，Ref@300 > 16.4 |
 | SuperMemory-VQA | QA-Acc / Ans-F1 | Gemini-3-Flash+Video-RAG 61.0 | 无（OSU × Meta Reality Labs 合作构建） | QA-Acc > 61.0 且 Ans-F1 > 83.9 |
 | EgoMemReason | Accuracy | Gemini-3-Flash 39.6 | 无 | > 39.6，且必须提交官方 leaderboard |
+| ATM-Bench | QS + Recall@10（三类题分别精确匹配 / Jaccard / LLM-judge） | MemPalace 56.8 main / MemoryOS 13.7 hard（Memexa 68.0 / 47.9 换了 judge） | 无 | 先与 SGM 列同口径，再设线 |
+| Mem-Gallery | F1 + 五级 LLM-judge | MuRAG 0.6966 F1 / 0.8229 judge | 无 | 先与官方 backbone 同口径，再设线 |
+
+最后两行的"需越过的线"是口径而不是数字，这是刻意的：3.10 / 3.11 两张表各自绑死在
+`Qwen3-VL-8B-Instruct-FP8` + `gpt-5-mini` 和 `Qwen2.5-VL-7B` 一套固定口径上，而 MindBridge 走的是
+自己的写路径和自己的答题模型，从没跑过同一套。在对齐口径之前填一个"> X"，等于先替读者认定两边
+数字可比——那恰好是 3.10 / 3.11 正文明确否认的事。这两项 MindBridge 都还没有已发布的分数。
 
 三个可以立刻看出的结构性机会：
 
 1. **记忆系统在多模态长时记忆上普遍打不过"直接把上下文塞进模型"**。MemLens 上最好的记忆
    agent 是 32.82，同一批题直读 LVLM 是 63.59；EgoMemReason 上最好的 agentic framework 是
-   34.0，纯 MLLM 是 39.6。这正是 MindBridge 的正面战场：证明结构化记忆不是有损压缩。
-2. **MM-Lifelong 的证据定位几乎无人做**。ReMA 的 Ref@300 是 15.46，GPT-5 是 0.44——差两个数量
-   级。MindBridge 的证据优先架构（原始视听跨度是最终证据）天然产出可定位区间。
+   34.0，纯 MLLM 是 39.6；ATM-Bench 的 hard split 把差距拉到全文最大——同 judge 下记忆系统最高
+   只有 13.7，通用编程 agent 是 58.8 / 58.4，SGM Oracle 上限 60.5（按 3.10 的说明，agent 与记忆
+   系统是两种测法，这里只能读数量级，不能读名次）。这正是 MindBridge 的正面战场：证明结构化
+   记忆不是有损压缩。
+
+   这条规律有边界，Mem-Gallery 就是现成的反例：官方表里两行 `Full memory`（0.3625 / 0.3354
+   F1）明显低于检索式的 MuRAG（0.6966）——照官方给的行名读，把全部记忆整个塞给模型在这一项
+   反而垫底。所以"记忆打不过长上下文"要按体裁分开讲，多会话对话上检索本身就是净收益。
+2. **证据定位仍是空档，而且现在有两项在计分**。MM-Lifelong 上 ReMA 的 Ref@300 是 15.46，GPT-5
+   是 0.44——差两个数量级；ATM-Bench 则把 Recall@10 直接列成官方指标，同一批系统从 main 的
+   23.3–79.1 掉到 hard 的 7.0–44.7。MindBridge 的证据优先架构（原始视听跨度是最终证据）天然
+   产出可定位区间，这两项都在正面考它。
 3. **LoCoMo 的旧工业分数已经作废**。92.5/94.7 这类数字来自各家自定的 judge、backbone 和 4 类
    题面。LoCoMo-Refined 用统一的官方 judge 重打了同一批系统预测，EverMemOS、MemOS、MemPalace、
    Mem0 分别掉了 22.07、17.30、15.78、15.56 个百分点——差距本来就在 judge 里，不在系统里。
@@ -132,7 +149,7 @@ Gemini-Agent 55.1。
 Gemini-3-Pro 约 75%，InternVL3-5-241B-A28B-Instruct 约 56%，LLaVA-Video-7B 只有约 40%——逐题准确率
 接近的两个系统，组内稳定性可以差一倍。这正是 v1 饱和到 90.4 却和真实体验脱节的原因。
 
-**对 MindBridge 的意义**：这是十个 benchmark 里唯一直接惩罚"部分检索"的口径。已有的端到端评测发现
+**对 MindBridge 的意义**：这是十二个 benchmark 里唯一直接惩罚"部分检索"的口径。已有的端到端评测发现
 部分检索在聚合题上比不检索更差，而 v1 的逐题准确率看不出这件事——组内非线性打分会把它变成明确的扣分。
 
 **MindBridge 目标**：先在无字幕设定下产出一份完整的 800 组 Rating（哪怕很低），确认写入路径能覆盖
@@ -257,7 +274,7 @@ caption），但结论仍然成立：**现有记忆管线相对直读丢失了�
 | 2 | GPT-5 | 14.87 / 0.44 | 15.00 / 0.92 | 15.25 / 0.53 |
 | 3 | Qwen3-VL-235B | 14.33 / 0.06 | 15.63 / 0.80 | 12.44 / 0.79 |
 
-人类：Month 80.4、Week 95.6、Day 99.2。这是十个 Benchmark 里人机差距最大的一个。
+人类：Month 80.4、Week 95.6、Day 99.2。这是十二个 Benchmark 里人机差距最大的一个。
 
 工业榜：无。
 
@@ -320,6 +337,73 @@ Video-RAG 全面优于 EgoButler。论文指出：83.9 的可答性判别配上 
 
 **MindBridge 目标**：> 39.6，同时成为第一个超过通用 MLLM 的 agentic 记忆系统。这是九项里"记忆
 系统 vs 大模型"叙事最干净的一项：题目本身要求跨周回溯，而榜单显示现有记忆框架反而更差。
+
+### 3.10 ATM-Bench — 长期个性化指代记忆问答
+
+官方发布 3,759 张图片、533 段视频、6,742 封邮件组成的个人档案，`main` split 1,013 题、`hard` split
+31 题两者不相交（`hard` 不是 `main` 的子集）——但两个 split 的证据不是同样不相交：6,742 封邮件里，
+430 次证据引用只对应 362 封不同邮件，占全档案 5.4%：`main` 引用 354 封、`hard` 引用 13 封，其中 5
+封两个 split 都引用过，其余全是照样要摄入的干扰量。以下学术榜答题
+模型为 `Qwen3-VL-8B-Instruct-FP8`，judge 为 `gpt-5-mini`（[官方论文](https://arxiv.org/abs/2603.01990)）：
+
+| System | ATM-Bench QS | ATM-Bench Recall@10 | ATM-Bench-Hard QS | Hard Recall@10 |
+| --- | --- | --- | --- | --- |
+| Memexa (DeepSeek-V4-flash judge, not gpt-5-mini) | 68.0 | 79.1 | 47.9 | 44.7 |
+| MemPalace | 56.8 | 76.4 | 9.7 | 28.3 |
+| ATM-RAG (paper's own) | 51.0 | 68.7 | 8.4 | 28.8 |
+| MemoryOS | 47.2 | 59.2 | 13.7 | 32.7 |
+| A-Mem | 44.8 | 66.4 | 9.9 | 31.7 |
+| mem0 | 43.5 | 61.9 | 9.2 | 23.7 |
+| HippoRAG2 | 42.9 | 66.4 | 9.4 | 31.9 |
+| SimpleMem | 27.3 | 23.3 | 3.2 | 7.0 |
+
+通用编程 agent 在 31 题的 hard split 上反而更高——GPT-5.6 Sol（medium）58.8%、Claude Opus 5
+（xhigh）58.4%；同一 split 的 SGM Oracle 上限是 60.5（MiniMax-M3）。这两处对比都不能与上表直接
+并列：Memexa 一行用 DeepSeek-V4-flash 当 judge，不是表头统一的 gpt-5-mini；通用编程 agent 与专门
+的记忆系统也是两种不同的测法，不是同一维度的名次。
+
+表中数字对应官方 leaderboard 的 **SGM**（schema-guided memory，把结构化图文摘要交给答题模型）
+赛道，不是 **Raw**（把原始图像直接放进答题模型上下文）赛道——两条赛道官方分别发布，本文只转载
+前者。这个区分决定了 MindBridge 自己该对齐哪一列：`--media-source raw` 与 ATM 的 Raw 赛道同名，
+但语义不同——`raw` arm 的原始媒体先经过 MindBridge 自己的感知与结构化记忆写入，答题模型看到的是
+检索回的证据而不是像素本身，因此 MindBridge 的 `raw` 与 `sgm` 两条 arm 都只能对齐 ATM 的 SGM
+列，不能对齐 Raw 列。
+
+工业榜：无——表中每一行都出自论文自己搭的同一套受控评测（同一 answerer、同一 judge），不是
+某厂商自测自发的产品分数；mem0 等系统虽有商业身份，也是被论文拿去跑分，不是自己对外公布成绩，
+按本文档 3.5 节 M3-Agent 的先例，这种情形仍计入学术榜。
+
+**评测口径**：MindBridge 走自己的生产写路径（`raw` arm 经 `observe` 触发感知，`sgm` arm 经
+`remember` 写入官方文本），不是把题面或图像直接塞进答题模型的上下文。引用本表数字作对照时必须
+同时点名 MindBridge 一侧实际使用的答题模型与 judge，否则两个数字不可比；MindBridge 目前在
+ATM-Bench 上没有已发布的分数。
+
+### 3.11 Mem-Gallery — 多模态长期对话记忆
+
+官方发布 20 个主题、240 段多会话对话、3,962 轮对话、1,003 张对话图片、1,711 道问题（其中 487
+题带查询图片）。以下学术榜 backbone 为 `Qwen2.5-VL-7B`，共对比 13 个记忆系统
+（[官方论文](https://arxiv.org/abs/2601.03515)）：
+
+| System | F1 | LLM judge |
+| --- | --- | --- |
+| MuRAG (best multimodal) | 0.6966 | 0.8229 |
+| UniversalRAG | 0.6827 | 0.8016 |
+| A-Mem (best textual) | 0.6228 | 0.7431 |
+| Full memory (text) | 0.3625 | — |
+| Full memory (multimodal) | 0.3354 | — |
+
+分任务上还有几个值得单独记录的高点：MuRAG 在 `VS` 任务上以 0.8818 F1 领先、在 `TTL` 任务上以
+0.8177 F1 领先；FIFO 在 `AR` 任务上拿到 1.0000 F1。`AR` 考的是"信息不在对话里时应当拒答"，一个
+敢自由弃答的系统能在这一项直接封顶，所以 `AR` 的分数必须与其余八个任务分开看，不能并入同一个
+平均分。
+
+工业榜：无——13 个系统全部是论文在同一套受控实验（同一 backbone、同一评测流程）里对比出来
+的结果，不是任何厂商自测自发的产品分数。
+
+**评测口径**：MindBridge 走自己的生产写路径（对话经 `remember` 写入、图片经 `observe` 触发感知，
+问题经 `recall` 取证据后再作答），不是把对话原文或图片直接塞进答题模型的上下文。引用本表数字作
+对照时必须同时点名 MindBridge 一侧实际使用的答题模型与 judge，否则两个数字不可比；MindBridge
+目前在 Mem-Gallery 上没有已发布的分数。
 
 ## 4. 达成 SOTA 前必须补齐的工程项
 
