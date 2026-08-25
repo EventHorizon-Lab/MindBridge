@@ -1,0 +1,438 @@
+"""Production-contract checks for the per-topic Mem-Gallery runner."""
+
+import asyncio
+from datetime import datetime, timedelta, timezone
+from typing import cast
+
+import pytest
+
+from mindbridge import MindBridge
+from mindbridge.benchmarks.mem_gallery import (
+    MemGalleryProfile,
+    MemGalleryQuestion,
+    MemGalleryRound,
+    MemGallerySession,
+    MemGalleryTopic,
+)
+from mindbridge.benchmarks.mem_gallery_runner import (
+    MemGalleryPreparedImage,
+    MemGalleryPreparedImages,
+    run_mem_gallery_topic,
+    validate_mem_gallery_images,
+)
+from mindbridge.contracts import (
+    EvidenceView,
+    MediaObjectInput,
+    MemoryView,
+    ObservationProcessingJobView,
+    ObservationReceipt,
+    ObservationStatus,
+    ObserveRequest,
+    RecallRequest,
+    RecallResult,
+    RememberRequest,
+)
+from mindbridge.core import (
+    JobState,
+    MediaKind,
+    MemoryState,
+    MemoryType,
+    VerificationStatus,
+)
+
+NOW = datetime(2024, 6, 24, tzinfo=timezone.utc)
+
+
+class RecordingMemoryApi:
+    def __init__(self) -> None:
+        self.observe_requests: list[ObserveRequest] = []
+        self.remember_requests: list[RememberRequest] = []
+        self.recall_requests: list[RecallRequest] = []
+
+    async def observe(self, request: ObserveRequest) -> ObservationReceipt:
+        self.observe_requests.append(request)
+        return ObservationReceipt(
+            observation_id="observation_01",
+            processing_job_id="job_01",
+            evidence_ids=("evidence_01",),
+            idempotency_key=request.idempotency_key or "generated",
+            status=ObservationStatus.ACCEPTED,
+            trace_id="trace_observe",
+        )
+
+    async def get_observation_job(
+        self, tenant_id: str, job_id: str
+    ) -> ObservationProcessingJobView:
+        return ObservationProcessingJobView(
+            job_id=job_id,
+            observation_id="observation_01",
+            state=JobState.SUCCEEDED,
+            attempt=1,
+            error_code=None,
+            created_at=NOW,
+            updated_at=NOW,
+            trace_id="trace_job",
+        )
+
+    async def remember(self, request: RememberRequest) -> object:
+        self.remember_requests.append(request)
+        return object()
+
+    async def recall(self, request: RecallRequest) -> RecallResult:
+        self.recall_requests.append(request)
+        return RecallResult(
+            answer="30 litres or more.",
+            confidence=0.7,
+            memories=(
+                MemoryView(
+                    memory_id="memory_01",
+                    memory_type=MemoryType.EPISODIC,
+                    summary="D1:1 User said: Can you tell me the basics?",
+                    evidence_ids=(),
+                    occurred_at=NOW,
+                    ended_at=NOW,
+                    created_at=NOW,
+                    verification_status=VerificationStatus.ATTESTED,
+                    state=MemoryState.ACTIVE,
+                ),
+            ),
+            evidence=(
+                EvidenceView(
+                    evidence_id="evidence_01",
+                    media_object_id="D1:IMG_001",
+                    start_ms=0,
+                    end_ms=0,
+                    media_url="https://example.invalid/signed",
+                    media_url_expires_at=NOW + timedelta(minutes=5),
+                ),
+            ),
+            trace_id="trace_recall",
+        )
+
+
+def _topic() -> MemGalleryTopic:
+    return MemGalleryTopic(
+        topic="Baking",
+        profile=MemGalleryProfile(
+            name="Maya",
+            persona_summary="A librarian who bakes.",
+            traits=("curious",),
+            conversation_style="Earnest.",
+        ),
+        sessions=(
+            MemGallerySession(
+                session_id="D1",
+                occurred_at=NOW,
+                rounds=(
+                    MemGalleryRound(
+                        round_id="D1:1",
+                        user="Can you tell me the basics?",
+                        assistant="Start with a 30 litre oven.",
+                    ),
+                    MemGalleryRound(
+                        round_id="D1:2",
+                        user="What is in this picture?",
+                        assistant="A tray of shortbread.",
+                        image_id="D1:IMG_001",
+                        image_path="../image/Baking/D1_IMG_001.jpg",
+                        image_caption="Pale shortbread fingers.",
+                    ),
+                ),
+            ),
+        ),
+        questions=(
+            MemGalleryQuestion(
+                question_id="Baking:1",
+                point="FR",
+                question="What oven size was recommended?",
+                reference_answer="30 litres or more.",
+                session_ids=("D1",),
+                clue_round_ids=("D1:1",),
+            ),
+            MemGalleryQuestion(
+                question_id="Baking:2",
+                point="VS",
+                question="Which image shows shortbread?",
+                reference_answer="D1:IMG_001",
+                session_ids=("D1",),
+                clue_round_ids=("D1:2",),
+                question_image_path="../image/Baking/QA_IMG_001.jpg",
+                question_image_caption="A tray of biscuits.",
+            ),
+        ),
+    )
+
+
+def _prepared() -> MemGalleryPreparedImages:
+    return MemGalleryPreparedImages(
+        images=(
+            MemGalleryPreparedImage(
+                image_key="../image/Baking/D1_IMG_001.jpg",
+                media_object=MediaObjectInput(
+                    media_object_id="D1:IMG_001",
+                    kind=MediaKind.IMAGE,
+                    uri="s3://mindbridge-media/mem-gallery/Baking/D1_IMG_001.jpg",
+                    sha256="b" * 64,
+                    size_bytes=52_144,
+                    created_at=NOW,
+                ),
+            ),
+            MemGalleryPreparedImage(
+                image_key="../image/Baking/QA_IMG_001.jpg",
+                media_object=MediaObjectInput(
+                    media_object_id="Baking:QA_IMG_001",
+                    kind=MediaKind.IMAGE,
+                    uri="s3://mindbridge-media/mem-gallery/Baking/QA_IMG_001.jpg",
+                    sha256="c" * 64,
+                    size_bytes=41_002,
+                    created_at=NOW,
+                ),
+            ),
+        )
+    )
+
+
+async def test_rounds_are_written_per_speaker_and_images_observed_with_their_round_text() -> None:
+    api = RecordingMemoryApi()
+
+    results = await run_mem_gallery_topic(
+        cast(MindBridge, api),
+        _topic(),
+        run_id="run1",
+        prepared=_prepared(),
+        tenant_prefix="benchmark_mem_gallery",
+        device_id="mem_gallery_conversation",
+        recall_limit=20,
+        request_concurrency=2,
+        poll_interval_seconds=0.01,
+        processing_timeout_seconds=1.0,
+    )
+
+    # One tenant for the whole topic, not one per question.
+    assert {request.tenant_id for request in api.recall_requests} == {
+        request.tenant_id for request in api.remember_requests
+    }
+    # The image round is observed with its official image_id as the media object ID.
+    assert [item.media_object_id for item in api.observe_requests[0].media_objects] == [
+        "D1:IMG_001"
+    ]
+    # Two rounds, two speakers each, and the image round's text is written too.
+    assert len(api.remember_requests) == 4
+    assert all(request.summary.startswith(("D1:1 ", "D1:2 ")) for request in api.remember_requests)
+    assert len(results) == 2
+    # The image's caption is folded into the User turn that introduced it, and only that turn.
+    image_round_user = next(
+        request.summary
+        for request in api.remember_requests
+        if request.summary.startswith("D1:2 User")
+    )
+    image_round_assistant = next(
+        request.summary
+        for request in api.remember_requests
+        if request.summary.startswith("D1:2 Assistant")
+    )
+    assert "Pale shortbread fingers." in image_round_user
+    assert "Pale shortbread fingers." not in image_round_assistant
+
+
+async def test_a_question_image_is_sent_as_a_recall_query_object() -> None:
+    api = RecordingMemoryApi()
+
+    await run_mem_gallery_topic(
+        cast(MindBridge, api),
+        _topic(),
+        run_id="run1",
+        prepared=_prepared(),
+        tenant_prefix="benchmark_mem_gallery",
+        device_id="mem_gallery_conversation",
+        recall_limit=20,
+        request_concurrency=2,
+        poll_interval_seconds=0.01,
+        processing_timeout_seconds=1.0,
+    )
+
+    assert api.recall_requests[0].query.media_object_ids == ()
+    assert api.recall_requests[1].query.media_object_ids == ("Baking:QA_IMG_001",)
+
+
+async def test_official_constraints_are_applied_only_to_ar_cd_and_vs() -> None:
+    api = RecordingMemoryApi()
+
+    await run_mem_gallery_topic(
+        cast(MindBridge, api),
+        _topic(),
+        run_id="run1",
+        prepared=_prepared(),
+        tenant_prefix="benchmark_mem_gallery",
+        device_id="mem_gallery_conversation",
+        recall_limit=20,
+        request_concurrency=2,
+        poll_interval_seconds=0.01,
+        processing_timeout_seconds=1.0,
+    )
+
+    factual_query = api.recall_requests[0].query.text or ""
+    search_query = api.recall_requests[1].query.text or ""
+    assert "Return the image_id" not in factual_query
+    assert "Return the image_id" in search_query
+    # The official wording names the speakers, and the constraint arrives as its own
+    # paragraph rather than trailing the question on one line.
+    assert "between user (Maya) and assistant" in factual_query
+    assert search_query.endswith(
+        "\n\nReturn the image_id of the image(s). If there are "
+        "multiple images, sort them in ascending order and separate "
+        "them by commas. Format example: “D2:IMG_003, "
+        "D2:IMG_010, D10:IMG_002” (for format reference only)."
+    )
+
+
+async def test_clue_recall_counts_rounds_the_recall_actually_returned() -> None:
+    api = RecordingMemoryApi()
+
+    results = await run_mem_gallery_topic(
+        cast(MindBridge, api),
+        _topic(),
+        run_id="run1",
+        prepared=_prepared(),
+        tenant_prefix="benchmark_mem_gallery",
+        device_id="mem_gallery_conversation",
+        recall_limit=20,
+        request_concurrency=2,
+        poll_interval_seconds=0.01,
+        processing_timeout_seconds=1.0,
+    )
+
+    assert results[0].mindbridge_round_ids == ("D1:1",)
+    assert results[0].retrieved_clue_round_count == 1
+    assert results[1].retrieved_clue_round_count == 0
+    assert results[0].mindbridge_confidence == pytest.approx(0.7)
+
+
+def test_a_run_refuses_to_start_without_every_referenced_image() -> None:
+    prepared = MemGalleryPreparedImages(images=_prepared().images[:1])
+
+    with pytest.raises(ValueError, match="missing prepared Mem-Gallery images"):
+        validate_mem_gallery_images((_topic(),), prepared)
+
+
+async def test_sessions_overlap_in_ingest_while_rounds_inside_one_stay_serial() -> None:
+    """Sessions carry distinct occurred_at so they may overlap; rounds inside one share it.
+
+    Mirrors `mindbridge.benchmarks.memlens_runner`'s identical session/turn split and its own
+    `test_memlens_overlaps_sessions_while_keeping_each_session_ordered`. A draft that awaits
+    every round at the top level leaves `request_concurrency` with nothing to bound -- this
+    would still pass every other test in this file, since none of them delay a call, so this
+    is the one test that fails if that wiring is removed.
+    """
+
+    class DelayedMemoryApi(RecordingMemoryApi):
+        async def remember(self, request: RememberRequest) -> object:
+            if request.summary.startswith("D1:1 User"):
+                await asyncio.sleep(0.01)
+            return await super().remember(request)
+
+    api = DelayedMemoryApi()
+    topic = _topic().model_copy(
+        update={
+            "sessions": tuple(
+                MemGallerySession(
+                    session_id=session_id,
+                    occurred_at=NOW - timedelta(days=day),
+                    rounds=(
+                        MemGalleryRound(
+                            round_id=f"{session_id}:1",
+                            user=f"{session_id} question",
+                            assistant=f"{session_id} answer",
+                        ),
+                    ),
+                )
+                for day, session_id in ((2, "D1"), (1, "D2"))
+            ),
+            "questions": (
+                MemGalleryQuestion(
+                    question_id="Baking:1",
+                    point="FR",
+                    question="Did D2 finish first?",
+                    reference_answer="Yes.",
+                    session_ids=("D1", "D2"),
+                ),
+            ),
+        }
+    )
+
+    await run_mem_gallery_topic(
+        cast(MindBridge, api),
+        topic,
+        run_id="run1",
+        prepared=_prepared(),
+        tenant_prefix="benchmark_mem_gallery",
+        device_id="mem_gallery_conversation",
+        recall_limit=20,
+        request_concurrency=2,
+        poll_interval_seconds=0.01,
+        processing_timeout_seconds=1.0,
+    )
+
+    remember_summaries = [request.summary for request in api.remember_requests]
+    # Each session stays internally ordered even though D1's first write was delayed.
+    for session_id in ("D1", "D2"):
+        ordered = [summary for summary in remember_summaries if summary.startswith(session_id)]
+        assert ordered == [
+            f"{session_id}:1 User said: {session_id} question",
+            f"{session_id}:1 Assistant said: {session_id} answer",
+        ]
+    # D2 did not wait behind the delayed D1 round, which is the point of batching sessions.
+    assert remember_summaries[0] == "D2:1 User said: D2 question"
+
+
+async def test_questions_are_answered_concurrently() -> None:
+    """An independent second question must not wait behind a slow first one."""
+
+    class DelayedMemoryApi(RecordingMemoryApi):
+        async def recall(self, request: RecallRequest) -> RecallResult:
+            if request.query.text is not None and "first" in request.query.text:
+                await asyncio.sleep(0.01)
+            return await super().recall(request)
+
+    api = DelayedMemoryApi()
+    topic = _topic().model_copy(
+        update={
+            "questions": (
+                MemGalleryQuestion(
+                    question_id="Baking:1",
+                    point="FR",
+                    question="first question?",
+                    reference_answer="A1.",
+                    session_ids=("D1",),
+                ),
+                MemGalleryQuestion(
+                    question_id="Baking:2",
+                    point="FR",
+                    question="second question?",
+                    reference_answer="A2.",
+                    session_ids=("D1",),
+                ),
+            )
+        }
+    )
+
+    await run_mem_gallery_topic(
+        cast(MindBridge, api),
+        topic,
+        run_id="run1",
+        prepared=_prepared(),
+        tenant_prefix="benchmark_mem_gallery",
+        device_id="mem_gallery_conversation",
+        recall_limit=20,
+        request_concurrency=2,
+        poll_interval_seconds=0.01,
+        processing_timeout_seconds=1.0,
+    )
+
+    # The delayed first question did not block the second: it lands before the first one wakes,
+    # and the slow one only completes afterward -- proving the two ran concurrently rather than
+    # in sequence, where "first" would always be recorded before "second".
+    assert api.recall_requests[0].query.text is not None
+    assert "second" in api.recall_requests[0].query.text
+    assert api.recall_requests[-1].query.text is not None
+    assert "first" in api.recall_requests[-1].query.text
