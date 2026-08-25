@@ -68,7 +68,7 @@ Apply migrations before starting the processes that read the schema they add. Th
 automatic migration on startup, deliberately: a process that migrates on boot turns a rolling
 restart into an uncoordinated schema race.
 
-Four migrations need a decision from you rather than just an apply:
+Five migrations need a decision from you rather than just an apply:
 
 **`0005` — tenant row-level security.** Creates the non-login `mindbridge_runtime` role, grants
 the migration user membership, and enables **forced** RLS on every table carrying a `tenant_id`.
@@ -87,6 +87,14 @@ Resolve those rows explicitly before applying it.
 **`0018` — drops the HNSW vector index.** This looks like a regression and is not. Under RLS the
 planner always has a tenant predicate, so it chose an exact scan and never read the HNSW index —
 which still cost roughly 18× on write and held over a gigabyte. Read plans are unchanged.
+
+**`0024` — stores the recall tsvector.** The only migration here that needs a **window**, not just
+a decision: `ADD COLUMN ... GENERATED` rewrites `memory_records` under `ACCESS EXCLUSIVE`, so every
+read and write of that table blocks for the length of the rewrite — 5.2 s measured on 150 MB, and
+proportional to the largest `memory_records` you hold. Size the window against that table rather
+than against this number, and apply it while the API is drained rather than mid-serve. It also
+drops `memory_records_summary_fts_idx`, which had 0 scans across two complete evaluations because
+the substring arm of the recall query gives the planner nothing to use it for.
 
 ## API
 
