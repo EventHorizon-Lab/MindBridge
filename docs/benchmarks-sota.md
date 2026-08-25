@@ -297,8 +297,9 @@ Video-RAG 全面优于 EgoButler。论文指出：83.9 的可答性判别配上 
 ### 3.10 ATM-Bench — 长期个性化指代记忆问答
 
 官方发布 3,759 张图片、533 段视频、6,742 封邮件组成的个人档案，`main` split 1,013 题、`hard` split
-31 题两者不相交（`hard` 不是 `main` 的子集）。6,742 封邮件里，430 次证据引用只对应 362 封不同邮件
-（`main` 354 封、`hard` 13 封）——占全档案 5.4%，其余全是照样要摄入的干扰量。以下学术榜答题
+31 题两者不相交（`hard` 不是 `main` 的子集）——但两个 split 的证据不是同样不相交：6,742 封邮件里，
+430 次证据引用只对应 362 封不同邮件，占全档案 5.4%：`main` 引用 354 封、`hard` 引用 13 封，其中 5
+封两个 split 都引用过，其余全是照样要摄入的干扰量。以下学术榜答题
 模型为 `Qwen3-VL-8B-Instruct-FP8`，judge 为 `gpt-5-mini`（[官方论文](https://arxiv.org/abs/2603.01990)）：
 
 | System | ATM-Bench QS | ATM-Bench Recall@10 | ATM-Bench-Hard QS | Hard Recall@10 |

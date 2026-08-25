@@ -673,9 +673,10 @@ caption is injected.
 
 ATM-Bench replays a single person's photo, video, and email archive — 3,759 images, 533 videos,
 and 6,742 emails, against the official `main` (1,013 questions) and `hard` (31 questions) splits.
-The two splits are disjoint: `hard` is not a subset of `main`. Of the 6,742 emails, 430 evidence
-references resolve to only 362 distinct emails (354 in `main`, 13 in `hard`) — 5.4% of the
-archive — so the rest is distractor mass that still gets ingested.
+The two splits are disjoint in their questions: `hard` is not a subset of `main`. Their evidence
+is not disjoint the same way — of the 6,742 emails, 430 evidence references resolve to only 362
+distinct emails, 5.4% of the archive: 354 cited from `main`, 13 from `hard`, and 5 of those from
+both splits. The rest of the archive is distractor mass that still gets ingested.
 
 The release carries two clocks: an image's `timestamp` is local wall clock and matches its
 filename stem, but a video's is true UTC and can sit an hour off the stem for half the year. The
