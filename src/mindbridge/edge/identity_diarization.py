@@ -223,7 +223,10 @@ class FunASRSpeechPipeline:
         try:
             funasr = __import__("funasr")
         except ImportError as error:
-            raise ModelUnavailableError("install FunASR for local speech transcription") from error
+            raise ModelUnavailableError(
+                "install the edge extra on Linux/Windows x86_64 or Apple Silicon macOS, "
+                "or provide the platform FunASR runtime"
+            ) from error
         selected_device = select_torch_device(device)
         pipeline = funasr.AutoModel(
             model=FUNASR_ASR_MODEL_ID,
@@ -316,7 +319,10 @@ class FunASRStreamingTranscriber:
         try:
             funasr = __import__("funasr")
         except ImportError as error:
-            raise ModelUnavailableError("install FunASR for native streaming ASR") from error
+            raise ModelUnavailableError(
+                "install the edge extra on Linux/Windows x86_64 or Apple Silicon macOS, "
+                "or provide the platform FunASR runtime"
+            ) from error
         selected_device = select_torch_device(device)
         pipeline = funasr.AutoModel(
             model=FUNASR_STREAMING_ASR_MODEL_ID,

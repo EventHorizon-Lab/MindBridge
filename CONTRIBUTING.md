@@ -24,13 +24,13 @@ authoritative; `pip install -e .` will not reproduce it.
 ```bash
 git clone https://github.com/EventHorizon-Lab/MindBridge.git
 cd MindBridge
-uv sync --all-groups --extra edge --extra media --extra server
+uv sync --all-groups --extra media --extra server
 ```
 
-That is the set CI installs, so the clipping tests run here rather than skipping. `uv sync` is an
-exact sync: to add the local Jina embedder, extend that same command with `--extra cloud-models`
-rather than syncing it alone, which would uninstall everything above. It pulls torch, so skip it
-unless you need it.
+That is the set the quality matrix installs, so the clipping tests run here rather than skipping.
+The isolated installability job installs `edge` once and imports its model runtime; add
+`--extra edge` locally only when working on that runtime. `uv sync` is exact: extend the same
+command rather than syncing another extra alone, which would uninstall everything above.
 
 For everything at once — every scenario plus the benchmark harness and the local models:
 

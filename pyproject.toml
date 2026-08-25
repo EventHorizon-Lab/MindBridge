@@ -53,6 +53,18 @@ edge = [
     "opentelemetry-instrumentation-botocore>=0.65b0,<1",
     "opentelemetry-instrumentation-httpx>=0.65b0,<1",
     "opentelemetry-sdk>=1.44,<2",
+    # identity_diarization.py imports NumPy directly, including on vendor-managed ARM images.
+    "numpy>=1.26,<3",
+    # Linux/Windows x86 and Apple Silicon get the portable identity runtime. Linux ARM devices
+    # keep vendor wheels; PyTorch 2.13 no longer publishes Intel macOS wheels.
+    "funasr>=1.3.19,<2; (sys_platform != 'darwin' and (platform_machine == 'x86_64' or platform_machine == 'AMD64')) or (sys_platform == 'darwin' and platform_machine == 'arm64')",
+    "insightface>=1,<2; (sys_platform != 'darwin' and (platform_machine == 'x86_64' or platform_machine == 'AMD64')) or (sys_platform == 'darwin' and platform_machine == 'arm64')",
+    "onnxruntime>=1.20,<2; (sys_platform != 'darwin' and (platform_machine == 'x86_64' or platform_machine == 'AMD64')) or (sys_platform == 'darwin' and platform_machine == 'arm64')",
+    "opencv-python>=4.10,<6; (sys_platform != 'darwin' and (platform_machine == 'x86_64' or platform_machine == 'AMD64')) or (sys_platform == 'darwin' and platform_machine == 'arm64')",
+    "torch==2.13.0; (sys_platform != 'darwin' and (platform_machine == 'x86_64' or platform_machine == 'AMD64')) or (sys_platform == 'darwin' and platform_machine == 'arm64')",
+    # FunASR documents TorchAudio as part of its runtime but does not declare it itself.
+    # TorchAudio 2.11 uses PyTorch's stable ABI and supports PyTorch 2.11 and newer.
+    "torchaudio==2.11.0; (sys_platform != 'darwin' and (platform_machine == 'x86_64' or platform_machine == 'AMD64')) or (sys_platform == 'darwin' and platform_machine == 'arm64')",
 ]
 server = [
     "boto3>=1.40,<2",
@@ -118,21 +130,13 @@ name = "pypi"
 url = "https://pypi.org/simple"
 default = true
 
-[[tool.uv.index]]
-name = "pytorch-cu129"
-url = "https://download.pytorch.org/whl/cu129"
-explicit = true
-
-[tool.uv.sources]
-torch = { index = "pytorch-cu129" }
-# Torchvision ships one wheel per CUDA build like torch does, and the PyPI wheel links against a
-# different runtime, so it has to resolve from the same index its torch does.
-torchvision = { index = "pytorch-cu129" }
-
 [dependency-groups]
 dev = [
     "boto3-stubs[s3]>=1.40,<2",
+    # The quality matrix exercises edge modules without installing the multi-gigabyte model stack.
+    "cryptography>=45,<51",
     "mypy>=1.15,<3",
+    "packaging>=24,<27",
     "pytest>=8,<10",
     "pytest-asyncio>=0.24,<2",
     "ruff>=0.11,<1",

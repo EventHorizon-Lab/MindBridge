@@ -17,6 +17,9 @@ else:
     # tomli backport, so it is present wherever the dev group that runs this test is.
     import tomli as tomllib
 
+from packaging.markers import default_environment
+from packaging.requirements import Requirement
+
 import mindbridge
 from mindbridge.benchmarks.cli import RUNNERS
 
@@ -216,9 +219,8 @@ UNION_EXTRAS = frozenset({"all"})
 ARTIFACT_EXTRAS = frozenset({"cloud-models"})
 """Extras that carry weights and decoders rather than serving a subtree of their own.
 
-`cloud-models` is reached only through lazy imports -- `models/jina.py` and
-`media/clipping.py` raise `ModelUnavailableError` naming it -- so no module is import-broken
-without it and it owns no scenario.
+They are reached only through lazy imports, so no module is import-broken without them and they
+own no scenario.
 """
 
 PROVIDERS: dict[str, str] = {
@@ -227,13 +229,17 @@ PROVIDERS: dict[str, str] = {
     "botocore": "botocore",
     "celery": "celery",
     "cryptography": "cryptography",
+    "cv2": "opencv-python",
     "fastapi": "fastapi",
+    "funasr": "funasr",
     "httpx": "httpx",
     "huggingface_hub": "huggingface-hub",
+    "insightface": "insightface",
     "mcp": "mcp",
     "mcp_types": "mcp-types",
     "mypy_boto3_s3": "boto3-stubs",
     "numpy": "numpy",
+    "onnxruntime": "onnxruntime",
     "openai": "openai",
     # Longest prefix wins, so the instrumentation and exporter packages are told apart from
     # the API even though they all import as `opentelemetry.*`.
@@ -261,17 +267,8 @@ PROVIDERS: dict[str, str] = {
 }
 """Import name to the distribution that provides it, spelled as `pyproject.toml` spells it."""
 
-PLATFORM_SUPPLIED = frozenset({"cv2", "funasr", "insightface", "onnxruntime"})
-"""Vendor accelerator SDKs that arrive with the platform image, never from an extra.
-
-`docs/edge.md` installs these from JetPack, OpenExplorer, RKNN or OpenVINO. Declaring them
-would pull the generic PyPI wheel over the vendor build on four of the five supported
-platforms, so `edge/identity_inference.py` and `edge/identity_diarization.py` import them
-lazily and raise `ModelUnavailableError` naming the platform requirement.
-"""
-
-RUNTIME_ONLY = frozenset({"torchvision"})
-"""Dependency Jina's Qwen3-VL processor imports itself rather than through MindBridge."""
+RUNTIME_ONLY = frozenset({"torchaudio", "torchvision"})
+"""Dependencies an upstream model runtime imports rather than MindBridge itself."""
 
 
 @cache
@@ -298,13 +295,29 @@ def _base_dependencies() -> tuple[str, ...]:
 
 def _distribution(requirement: str) -> str:
     """The distribution one requirement names, without its extras, marker or version."""
-    return re.split(r"[<>=!~;\[ ]", requirement.strip(), maxsplit=1)[0]
+    return Requirement(requirement).name
 
 
 @cache
-def _declared(extra: str) -> frozenset[str]:
-    """Every distribution a scenario install puts on disk, following self-references."""
-    declared = {_distribution(requirement) for requirement in _base_dependencies()}
+def _declared(
+    extra: str,
+    *,
+    sys_platform: str | None = None,
+    platform_machine: str | None = None,
+) -> frozenset[str]:
+    """Every active direct distribution in a scenario, following self-references."""
+    environment = cast(dict[str, str], default_environment())
+    if sys_platform is not None:
+        environment["sys_platform"] = sys_platform
+    if platform_machine is not None:
+        environment["platform_machine"] = platform_machine
+
+    base = (Requirement(requirement) for requirement in _base_dependencies())
+    declared = {
+        requirement.name
+        for requirement in base
+        if requirement.marker is None or requirement.marker.evaluate(environment)
+    }
     pending = [extra] if extra else []
     seen: set[str] = set()
     while pending:
@@ -314,12 +327,14 @@ def _declared(extra: str) -> frozenset[str]:
             # work today, but a pair of extras naming each other would never terminate.
             continue
         seen.add(current)
-        for requirement in _extras()[current]:
-            name = _distribution(requirement)
-            if name == "mindbridge":
-                pending.extend(re.findall(r"[\w-]+", requirement.partition("[")[2]))
+        for raw_requirement in _extras()[current]:
+            requirement = Requirement(raw_requirement)
+            if requirement.marker is not None and not requirement.marker.evaluate(environment):
                 continue
-            declared.add(name)
+            if requirement.name == "mindbridge":
+                pending.extend(requirement.extras)
+                continue
+            declared.add(requirement.name)
     return frozenset(declared)
 
 
@@ -348,7 +363,6 @@ def _third_party(modules: Iterable[str]) -> set[str]:
         for module in modules
         if module.partition(".")[0] not in sys.stdlib_module_names
         and not module.startswith("mindbridge")
-        and module.partition(".")[0] not in PLATFORM_SUPPLIED
     }
 
 
@@ -464,6 +478,45 @@ def test_the_extra_the_clip_cutter_names_is_the_one_that_provides_its_decoders()
     # And the reason the message matters at all: the extra a worker is otherwise told to install
     # does not carry them, so this failure is reachable from the documented command.
     assert not decoders & {_distribution(item) for item in _extras()["server"]}
+
+
+def test_edge_installs_the_complete_portable_identity_runtime() -> None:
+    model_runtime = {
+        "funasr",
+        "insightface",
+        "onnxruntime",
+        "opencv-python",
+        "torch",
+        "torchaudio",
+    }
+
+    for sys_platform, machine in (
+        ("linux", "x86_64"),
+        ("win32", "AMD64"),
+        ("darwin", "arm64"),
+    ):
+        declared = _declared("edge", sys_platform=sys_platform, platform_machine=machine)
+        assert {"numpy", *model_runtime} <= declared
+
+    vendor_arm = _declared("edge", sys_platform="linux", platform_machine="aarch64")
+    assert "numpy" in vendor_arm
+    assert model_runtime.isdisjoint(vendor_arm)
+
+    intel_mac = _declared("edge", sys_platform="darwin", platform_machine="x86_64")
+    assert "numpy" in intel_mac
+    assert model_runtime.isdisjoint(intel_mac)
+
+
+def test_edge_declares_every_dependency_it_imports_lazily() -> None:
+    declared = _declared("edge", sys_platform="linux", platform_machine="x86_64")
+    missing = sorted(
+        f"{path.relative_to(ROOT)} imports {module}"
+        for path in _modules(SOURCE / "edge")
+        for module in _third_party(_lazily_imported_modules(path))
+        if _provider(module) not in declared
+    )
+
+    assert missing == []
 
 
 def test_relative_imports_resolve_against_the_importing_file() -> None:
