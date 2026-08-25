@@ -34,6 +34,7 @@ from mindbridge.benchmarks.runtime import (
 from mindbridge.contracts import (
     ContractModel,
     Identifier,
+    IdentityObservationInput,
     MediaObjectInput,
     NonEmptyString,
     ObserveRequest,
@@ -68,6 +69,10 @@ class EgoLifePreparedClip(ContractModel):
     media_object: MediaObjectInput | None = None
     caption: NonEmptyString | None = None
     duration_ms: int | None = Field(default=None, gt=0)
+    # Timed voice spans and their transcripts, as an edge device would supply them. Without
+    # these, perception is handed a silent clip and told to name people only when a name is
+    # "seen or heard" -- so on a conversational corpus it can never name anyone.
+    identity_observations: tuple[IdentityObservationInput, ...] = Field(default=(), max_length=512)
 
     @model_validator(mode="after")
     def require_video_with_duration(self) -> EgoLifePreparedClip:
@@ -82,6 +87,16 @@ class EgoLifePreparedClip(ContractModel):
                 raise ValueError("EgoLifeQA clips must have a positive duration_ms")
             if self.duration_ms is not None and self.duration_ms != self.media_object.duration_ms:
                 raise ValueError("EgoLifeQA clip durations must match")
+        if self.media_object is None and self.identity_observations:
+            raise ValueError("EgoLifeQA identity observations require source video")
+        # Annotated because both sources are optional and only their combination is guaranteed
+        # non-None by the branches above; an unannotated `or` chain types as `int | None` and the
+        # comparison below would raise at runtime on the one path mypy could not narrow.
+        span_ms: int = self.duration_ms or (
+            self.media_object.duration_ms or 0 if self.media_object is not None else 0
+        )
+        if any(identity.end_ms > span_ms for identity in self.identity_observations):
+            raise ValueError("EgoLifeQA identity observation exceeds its clip")
         egolife_timecode_offset_ms(self.day, self.start_timecode)
         return self
 
@@ -431,6 +446,7 @@ async def _ingest_clip(
                     occurred_at=occurred_at,
                     ended_at=ended_at,
                     observed_at=ended_at,
+                    identity_observations=clip.identity_observations,
                     idempotency_key=(f"{adapter_version}:{prepared.subject_id}:{source_key}:media"),
                 ),
                 poll_interval_seconds=poll_interval_seconds,

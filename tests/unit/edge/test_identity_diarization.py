@@ -217,6 +217,28 @@ async def test_funasr_streaming_closes_when_inference_is_cancelled(
         release.set()
 
 
+def test_funasr_accepts_a_per_token_sentence_text() -> None:
+    """FunASR emits `text` as a plain string on some decode paths and a per-token list on
+    others. Rejecting the list shape discarded the whole clip: measured on a conversational
+    corpus, 25 of 40 clips produced no transcript at all for this reason alone."""
+    segments = identity_diarization._funasr_segments(
+        [{"start": 0, "end": 1_000, "text": ["哦", "好", "的"], "spk": 0}],
+        confidence=0.8,
+    )
+
+    assert [segment.transcript for segment in segments] == ["哦好的"]
+
+
+def test_funasr_still_rejects_a_sentence_with_no_usable_text() -> None:
+    """The shape widened; the guard did not go away."""
+    for broken in ([], [""], ["ok", 7], None, 12):
+        with pytest.raises(ModelOutputError):
+            identity_diarization._funasr_segments(
+                [{"start": 0, "end": 1_000, "text": broken, "spk": 0}],
+                confidence=0.8,
+            )
+
+
 def test_funasr_marks_overlapping_speakers_unsafe_for_enrollment() -> None:
     segments = identity_diarization._funasr_segments(
         [
