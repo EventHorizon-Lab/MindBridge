@@ -106,6 +106,33 @@ official retrieval ground truth.
 4. ATM runs both media arms at least once, so a later score difference can be attributed.
 5. All five quality gates pass, plus the pinned Markdown and link checks.
 
+### What was actually demonstrated
+
+Criteria 1, 2 and 5 are met. Criteria 3 and 4 are **not**, and this section records that
+rather than letting the list above read as a report of success.
+
+- **Met for the ATM SGM arm.** One subset run completed end to end against a live
+  deployment: 4,292 schema-guided blocks and 6,742 emails written with zero ingest
+  failures, and all 19 questions in the run returned twenty non-empty memory IDs.
+- **Not met for the ATM raw arm.** It ingested real media through perception — six items
+  succeeded, verified in the store — but produced no predictions file, so criterion 4's
+  "both arms at least once" is unmet and no arm-to-arm comparison exists yet.
+- **Not met for Mem-Gallery.** No run has completed. Twenty of its 89 staged images were
+  ingested, and 128 memory records landed, but the recall path never ran to completion.
+  **Image-as-query recall — the most novel capability this work adds, and the reason
+  `RecallQuery.media_object_ids` is cited above — has therefore never executed end to end.**
+
+Both shortfalls were environmental rather than defects in this code: the shared worker fleet
+the runs depended on was torn down and replaced mid-run, and the retry afterwards saturated a
+single-process embedding service. The staging, tenants and commands are all in place, so
+completing them is a matter of machine time rather than more work here.
+
+The runs that did happen were worth more than their artifacts: they surfaced four defects
+that no unit test could have — a recall mode that refuses at archive scale and took the whole
+run down with it, a retrieval diagnostic dead across 37.6% of one split, artifacts unable to
+express a partial ingest failure, and a staging contract the release makes unsatisfiable for
+any multi-topic run. All four are fixed.
+
 ## Approved decisions
 
 | Decision | Choice | Reason |
