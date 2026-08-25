@@ -20,7 +20,7 @@ not be presented as a multimodal result.
 A number may be quoted as a benchmark score only when all four hold:
 
 1. An official complete split, not a subset.
-2. Fixed models, named in the run manifest.
+2. A pinned deployment snapshot of the code and models that answered.
 3. A published run manifest committed alongside the results.
 4. Replayable outputs.
 
@@ -68,7 +68,7 @@ uv run mindbridge-bench m3 --help
 ```
 
 Most runners need nothing past the core install because they drive the product through its own
-API. `video-mme` and `datasets` need `--extra benchmarks`; `jina` and `bakeoff` load the local
+API. `video-mme`, `video-mme-v2`, and `datasets` need `--extra benchmarks`; `jina` and `bakeoff` load the local
 embedder and need `--extra cloud-models`. A runner whose extra is missing names it and exits
 instead of failing part-way through a run.
 
@@ -248,9 +248,10 @@ curl -s "$MINDBRIDGE_GENERATOR_ENDPOINT/chat/completions" -H "Authorization: Bea
 
 ## Benchmark dataset smoke
 
-LoCoMo-Refined, M3-Bench, Video-MME, EgoLife (EgoLifeQA), EgoTempo, EgoMemReason, MEMLENS,
-MM-Lifelong, and SuperMemory-VQA are consumed through thin adapters over pinned official files. Use Git for code
-releases and the Hugging Face CLI for Hub datasets; MindBridge does not ship another downloader:
+LoCoMo-Refined, M3-Bench, Video-MME, Video-MME-v2, EgoLife (EgoLifeQA), EgoTempo, EgoMemReason,
+MEMLENS, MM-Lifelong, SuperMemory-VQA, ATM-Bench, and Mem-Gallery are consumed through thin
+adapters over pinned official files. Use Git for code releases and the Hugging Face CLI for Hub
+datasets; MindBridge does not ship another downloader:
 
 ```bash
 git clone https://github.com/mem-eval-suite/LoCoMo_refined.git .benchmarks/locomo-refined
@@ -259,6 +260,11 @@ uvx --from huggingface-hub hf download lmms-eval/Video-MME \
   videomme/test-00000-of-00001.parquet \
   --repo-type dataset \
   --local-dir .benchmarks/video-mme
+uvx --from huggingface-hub hf download MME-Benchmarks/Video-MME-v2 \
+  test.parquet subtitle.zip \
+  --repo-type dataset \
+  --revision 6e4bebb03202e1ddbf3d37703e560e51c5aa2d64 \
+  --local-dir .benchmarks/video-mme-v2
 uvx --from huggingface-hub hf download lmms-lab/EgoLife \
   EgoLifeQA/EgoLifeQA_A1_JAKE.json \
   --repo-type dataset \
@@ -280,12 +286,21 @@ uvx --from huggingface-hub hf download MM-Lifelong/MM-Lifelong \
   day/test.json week/test.json month/train.json month/val.json \
   --repo-type dataset \
   --local-dir .benchmarks/mm-lifelong
+uvx --from huggingface-hub hf download Jingbiao/ATM-Bench \
+  --repo-type dataset \
+  --revision 78e826dc07e97466b2f54443831ef9a83ab8b27c \
+  --local-dir .benchmarks/atm-bench
+uvx --from huggingface-hub hf download Ethan-Bei/Mem-Gallery \
+  --repo-type dataset \
+  --revision af912daba984e896e253016b7c7e334ef92c2a6f \
+  --local-dir .benchmarks/mem-gallery
 
 uv run --extra benchmarks mindbridge-bench datasets \
   --locomo-refined .benchmarks/locomo-refined/data/raw/locomo_refined.json \
   --m3-robot .benchmarks/m3-agent/data/annotations/robot.json \
   --m3-web .benchmarks/m3-agent/data/annotations/web.json \
   --video-mme .benchmarks/video-mme/videomme/test-00000-of-00001.parquet \
+  --video-mme-v2 .benchmarks/video-mme-v2/test.parquet \
   --egolife .benchmarks/egolife/EgoLifeQA/EgoLifeQA_A1_JAKE.json \
   --egotempo .benchmarks/egotempo/egotempo_openQA.json \
   --egomem .benchmarks/egomem-reason/annotations_public.jsonl \
@@ -294,8 +309,15 @@ uv run --extra benchmarks mindbridge-bench datasets \
   --mm-week .benchmarks/mm-lifelong/week/test.json \
   --mm-month-train .benchmarks/mm-lifelong/month/train.json \
   --mm-month-val .benchmarks/mm-lifelong/month/val.json \
-  --supermemory .benchmarks/supermemory-vqa/data/json/all_qa.json
+  --supermemory .benchmarks/supermemory-vqa/data/json/all_qa.json \
+  --atm .benchmarks/atm-bench/data/atm-bench/atm-bench.json \
+  --atm-hard .benchmarks/atm-bench/data/atm-bench/atm-bench-hard.json \
+  --mem-gallery-dialog .benchmarks/mem-gallery/data/dialog
 ```
+
+Both ATM-Bench and Mem-Gallery are pinned by revision because the digests in this smoke are only
+meaningful against a fixed revision. ATM-Bench is 3.2 GB including the raw media; Mem-Gallery is
+530 MB.
 
 Large M3-Bench media stays outside Git. Acquire it through the official Hugging Face client rather
 than a MindBridge downloader:
@@ -329,17 +351,17 @@ The resulting annotation identity and counts are recorded in
 [benchmarks/manifests/dataset-adapters-smoke.json](../benchmarks/manifests/dataset-adapters-smoke.json).
 
 Run LoCoMo-Refined against the deployed production API. The command writes the official
-`predictions.jsonl` shape and a sidecar manifest containing source, code, model, Prompt,
-retrieval, and output identities. `MINDBRIDGE_API_KEY` identifies the exact benchmark tenant and is never written to the
+`predictions.jsonl` shape and a sidecar manifest containing source, model, Prompt, retrieval, and
+output identities. `MINDBRIDGE_API_KEY` identifies the exact benchmark tenant and is never written to the
 manifest.
 
 Every benchmark also requires a secret-free deployment snapshot. It records the actual capability
-slots, plugin distribution versions, model identities, embedding space, and inference options used by
+slots, plugin distribution versions, models, embedding space, and inference options used by
 the server and Worker. Before inference begins, the runner freezes the validated snapshot and the
 SHA-256 of those same bytes; credential-like keys are rejected.
 This is a run artifact, not a named Profile. For example, save the following as
-`.benchmarks/deployment.json` and replace the distribution versions and model identities with those
-from the deployed processes:
+`.benchmarks/deployment.json` and replace the distribution versions and model IDs with those from
+the deployed processes:
 
 ```json
 {
@@ -485,8 +507,8 @@ Use `--video-id` for a smoke subset. Web video IDs are YouTube IDs, and 14 of th
 as the next option. The runner rejects a `--subset` that does not match the
 official Robot timing fields or their absence from Web. The JSONL uses the official `id`,
 `question`, `answer`, `type`, `before_clip`, and `response` fields and adds MindBridge retrieval
-diagnostics. Its sidecar manifest pins annotation and media hashes, both Omni calls,
-Jina, Prompt versions, retrieval settings, and output hash.
+diagnostics. Its sidecar manifest pins annotation and media hashes, both Omni calls, Jina, Prompt
+versions, retrieval settings, and output hash.
 
 EgoLifeQA uses its official `DAYn` plus `HHMMSSFF` clock, whose final two digits are frame counts at
 the release videos' 20 FPS. Frame counts are carried into later seconds, matching the official
@@ -559,7 +581,7 @@ reports Ans-F1, QA-Acc, and QA-MRR and contains no ground-truth fields:
 When an official question boundary extends past the released MP4 container, keep that segment's
 published transcript and attach only the available media duration. The resulting `EvidenceSpan`
 ends at the real container tail; media may be shorter than its segment but must never exceed it.
-In the official release, 82 of 83 referenced sessions have an MP4; the remaining
+In the released dataset, 82 of 83 referenced sessions have an MP4; the remaining
 `Person_1_session_2_01312026_glasses_1275` session is VRS-only and remains transcript-only unless
 the caller prepares that VRS with the upstream Project Aria tooling.
 
@@ -613,7 +635,7 @@ uv run mindbridge-bench egomem \
 
 MEMLENS follows the official memory-agent protocol: every question gets a fresh tenant, sessions
 are consumed in release order, and the question date is supplied only at answer time. Download
-`release_images.tar.gz` from the same official release for multimodal runs, upload the
+`release_images.tar.gz` from the same dataset release for multimodal runs, upload the
 extracted images with the standard storage tooling, and map official relative paths to immutable
 image objects:
 
@@ -654,6 +676,132 @@ uv run mindbridge-bench memlens \
 For the official text-only ablation, add `--text-only`, omit `--prepared-images`, and use a
 deployment file without Worker plugins; image placeholders remain `[image]` and no generated image
 caption is injected.
+
+ATM-Bench replays a single person's photo, video, and email archive — 3,759 images, 533 videos,
+and 6,742 emails, against the official `main` (1,013 questions) and `hard` (31 questions) splits.
+The two splits are disjoint in their questions: `hard` is not a subset of `main`. Their evidence
+is not disjoint the same way — of the 6,742 emails, 430 evidence references resolve to only 362
+distinct emails, 5.4% of the archive: 354 cited from `main`, 13 from `hard`, and 5 of those from
+both splits. The rest of the archive is distractor mass that still gets ingested.
+
+The release carries two clocks: an image's `timestamp` is local wall clock and matches its
+filename stem, but a video's is true UTC and can sit an hour off the stem for half the year. The
+adapter reads capture time from the filename stem for every modality instead, so raw media and
+the official schema-guided (SGM) records share one timeline. The runner refuses a `raw` run whose
+staged capture time disagrees with the release's own SGM record for the same item, and refuses a
+staged video that no SGM record gives a duration for.
+
+`--media-source` picks which of ATM's two representations of the archive gets written: `raw`
+(the default) sends the archive's own image and video bytes through MindBridge's own perception;
+`sgm` writes the release's own schema-guided caption text instead, skipping perception entirely.
+Neither is ATM's own "Raw" baseline, which puts the image directly into the answerer's context —
+MindBridge's `raw` arm always goes through structured memory first, so the published column
+comparable to it is ATM's **SGM** column, not its **Raw** column.
+
+`--prepared-media` stages the archive's own bytes for a `raw` run, one entry per item, keyed by
+and required to equal the official `YYYYMMDD_HHMMSS` filename stem:
+
+```json
+{
+  "media": [
+    {
+      "media_id": "20250223_130249",
+      "media_object": {
+        "media_object_id": "20250223_130249",
+        "kind": "image",
+        "uri": "s3://mindbridge-media/atm-bench/20250223_130249.jpg",
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+        "size_bytes": 100686,
+        "created_at": "2025-02-23T13:02:49Z"
+      }
+    }
+  ]
+}
+```
+
+```bash
+uv run mindbridge-bench atm \
+  --dataset .benchmarks/atm-bench/data/atm-bench/atm-bench-hard.json \
+  --split hard \
+  --media-source raw \
+  --emails .benchmarks/atm-bench/data/raw_memory/email/emails.json \
+  --prepared-media .benchmarks/atm-prepared-media.json \
+  --sgm-image .benchmarks/atm-bench/data/processed_memory/image_batch_results.json \
+  --sgm-video .benchmarks/atm-bench/data/processed_memory/video_batch_results.json \
+  --output .benchmarks/results/atm-hard-raw.json \
+  --api-base-url http://localhost:8000 \
+  --deployment-config .benchmarks/deployment.json \
+  --run-id atm-hard-raw-01
+```
+
+`--split` does not filter questions — that is `--dataset`'s job, by pointing at either release
+file — it only records which split the loaded file is, so the manifest cannot silently mislabel a
+run. `--sgm-video` is required on a `raw` run whenever a staged item is a video, since only the SGM
+record carries its duration; `--sgm-image` is not required there but still worth passing, since it
+extends the same clock-agreement guard to staged images. `--question-id` is repeatable and narrows
+a run to specific IDs; omit it for the whole split. The output is a JSON array of `{id, question,
+qtype, answer, prediction, evidence_ids, retrieved_evidence_ids, ...}` objects in the shape the
+official `JingbiaoMei/ATM-Bench` evaluator reads, with MindBridge's own retrieval diagnostics
+appended in fields that evaluator ignores. ATM-Bench is scored outside MindBridge the same way;
+record the official evaluator's verdict with `mindbridge-bench score`, described in "Recording an
+official scorer's result" below.
+
+Mem-Gallery replays one topic's whole multi-session dialogue as its own tenant, then answers that
+topic's own questions over it — the release is twenty independent personas, and a shared tenant
+would let one persona's memory answer another's question. `--dataset` names the release's
+`data/dialog` directory, not a single file; the runner loads every topic file inside it and
+narrows to `--topic` selections when given.
+
+`--prepared-images` must stage every image the selected topics reference: both the 1,003 images
+embedded in dialogue rounds and the 487 question images asked alongside a query. A missing image
+refuses the run before ingestion starts. Images are keyed by the release's own relative path
+(`image_key`); `media_object_id` is a separate, caller-assigned field, but for a dialogue image it
+must be set to the official `image_id` (for example `D2:IMG_001`) because `VS` ("visual search")
+questions ask the model to name the matching `image_id` directly as its answer, and that ID is
+what ties a retrieved image back to the release's own answer key. That official ID is
+release-relative, not archive-unique — `D1:IMG_001` alone names a different picture in all twenty
+topics — so `media_object_id` only has to be unique within the one topic that answers a `VS`
+question with it, never across the whole staged manifest; `image_key`, which is always
+topic-prefixed, is what the manifest actually requires to be unique. Question images carry no
+official ID, so their `media_object_id` may be assigned freely:
+
+```json
+{
+  "images": [
+    {
+      "image_key": "../image/Baking_Dessert_Daily_Life_Skill/D1_IMG_001.jpg",
+      "media_object": {
+        "media_object_id": "D1:IMG_001",
+        "kind": "image",
+        "uri": "s3://mindbridge-media/mem-gallery/Baking_Dessert_Daily_Life_Skill/D1_IMG_001.jpg",
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+        "size_bytes": 123456,
+        "created_at": "2026-08-14T00:00:00Z"
+      }
+    }
+  ]
+}
+```
+
+```bash
+uv run mindbridge-bench mem-gallery \
+  --dataset .benchmarks/mem-gallery/data/dialog \
+  --prepared-images .benchmarks/mem-gallery-prepared-images.json \
+  --topic Baking_Dessert_Daily_Life_Skill \
+  --output .benchmarks/results/mem-gallery-baking.json \
+  --api-base-url http://localhost:8000 \
+  --deployment-config .benchmarks/deployment.json \
+  --run-id mem-gallery-baking-01
+```
+
+`--topic` is repeatable and defaults to all twenty. The output is a JSON array of `{question_id,
+topic, point, question, answer, prediction, clue, retrieved_ids, ...}` objects in the shape the
+official `YuanchenBei/Mem-Gallery` evaluator reads. `point` is the official nine-way task code
+(`FR`, `MR`, `TR`, `VR`, `TTL`, `VS`, `CD`, `KR`, `AR`); scoring is broken out per `point`, and
+`AR` specifically rewards abstaining with the release's own refusal text (`Not mentioned.`), so
+its score is not comparable to the other eight without reading it on its own. Mem-Gallery is
+scored outside MindBridge too; record the official evaluator's verdict with
+`mindbridge-bench score`, described in "Recording an official scorer's result" below.
 
 MM-Lifelong prepared segments use the split-wide clock of the official `total_intervals` field.
 `start_seconds` must therefore be a global Day, Week, or Month offset, not a source-video-local
@@ -757,6 +905,65 @@ uv run --extra benchmarks mindbridge-bench video-mme \
   --run-id video-mme-001
 ```
 
+### Video-MME-v2
+
+A separate benchmark from Video-MME, not a newer split of it. 800 videos, 3,200 questions, options
+A through H, no short/medium/long bands. Its unit of scoring is a **group**: the four questions over
+one video, scored together.
+
+The runner reuses the prepared-video manifest shape above, keyed on the official numeric `video_id`.
+Media is 97.8 GiB across 40 zips, so acquire it separately from the annotations:
+
+```bash
+uvx --from huggingface-hub hf download MME-Benchmarks/Video-MME-v2 \
+  --include "videos/*" \
+  --repo-type dataset \
+  --revision 6e4bebb03202e1ddbf3d37703e560e51c5aa2d64 \
+  --local-dir .benchmarks/video-mme-v2
+```
+
+Two numbers are reported, reproducing the released `_rating.json` and `_acc.json` cell for cell:
+
+- `metrics.rating` is the leaderboard number, averaged over whole **groups** on a 0-100 scale. A
+  `relevance` group scores on how many of its four are correct, quadratically: one of four is worth
+  6.25, four of four is worth 100. A `logic` group scores on the longest unbroken correct prefix of
+  its dependency chain, so a group that misses question 1 earns nothing for a correct 2 through 4.
+- `metrics.accuracy` is plain per-question accuracy with the same breakdowns.
+
+Both break out by `group_type`, `level`, `second_head`, and `third_head`. Note that the rating's
+taxonomy cells are keyed on each group's **fourth** question, which is what the released scorer
+reads; `level`, `second_head`, and `third_head` all vary inside a group, so the two views key the
+same field differently on purpose.
+
+Scores are on the released 0-100 scale, unlike Video-MME's 0-1 fractions, and the naming of the
+accuracy fields is inverted relative to it: here `overall` counts every question and scores an
+abstention wrong, matching the released `_acc.json`, while `answered_accuracy` is the answered-only
+figure the same script only prints. Quote `rating.overall` against the leaderboard; quote
+`accuracy.overall` only alongside it, because the gap between them is what the benchmark was rebuilt
+to expose.
+
+`--video-id` scopes a run and always carries all four of a video's questions, because a partial
+group has no defined rating. There is deliberately no `--level` counterpart to Video-MME's
+`--duration`: `level` varies between the questions of a group, so filtering on it would either split
+a group or silently mean "groups whose fourth question is level N". `--group-type` is available and
+is safe, being constant across a group. `--transcript-source` behaves as it does for Video-MME:
+
+```bash
+uv run --extra benchmarks mindbridge-bench video-mme-v2 \
+  --dataset .benchmarks/video-mme-v2/test.parquet \
+  --prepared-media .benchmarks/video-mme-v2-prepared.json \
+  --output .benchmarks/results/video-mme-v2.json \
+  --api-base-url http://localhost:8000 \
+  --deployment-config .benchmarks/deployment.json \
+  --transcript-source none \
+  --run-id video-mme-v2-001
+```
+
+The released subtitles are word-level JSONL (`{"text": ..., "start_time": ..., "end_time": ...}`),
+one file per video in `subtitle.zip`. Grouping those words into segment transcripts happens in
+whatever prepares the media manifest; the runner only checks that what it was handed agrees with
+the `--transcript-source` the run declares.
+
 EgoTempo writes the official `V`, `Q`, `QA`, `A`, `C`, and `M` fields. Run its pinned
 `gemini_eval.ipynb` for the released semantic judge rather than substituting a local metric:
 
@@ -789,10 +996,10 @@ by a previous run.
 
 ## Recording an official scorer's result
 
-LoCoMo-Refined, MM-Lifelong, EgoTempo, and EgoMemReason are scored outside MindBridge. A run manifest is
-written before any of those scorers execute, so it can only pin inputs. Record their output in a
-`*.score.json` sidecar instead, which re-hashes the predictions and refuses numbers that belong to
-a different run:
+ATM-Bench, Mem-Gallery, LoCoMo-Refined, MM-Lifelong, EgoTempo, and EgoMemReason are scored outside
+MindBridge. A run manifest is written before any of those scorers execute, so it can only pin
+inputs. Record their output in a `*.score.json` sidecar instead, which re-hashes the predictions
+and refuses numbers that belong to a different run:
 
 ```bash
 uv run mindbridge-bench score \
@@ -836,7 +1043,7 @@ A checklist for anyone about to quote a number from this harness.
 | Complete official split? | It is a diagnostic run. Say so. |
 | Manifest committed beside the result file? | It is not citable. |
 | Blind-answer control run? | You cannot separate memory from model. |
-| Models named in the manifest? | It is not reproducible. |
+| Deployment snapshot committed with the run? | It is not reproducible. |
 | Released text, or raw audiovisual? | Text-only results are not multimodal results. |
 | Thinking mode confirmed off on the answer endpoint? | The judge may be scoring reasoning traces. |
 

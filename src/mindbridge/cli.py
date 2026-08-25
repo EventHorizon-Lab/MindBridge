@@ -97,6 +97,11 @@ COMMANDS: dict[tuple[str, ...], Command] = {
         "Consolidate one tenant's Episodes, Claims, and Summaries",
         extra="server",
     ),
+    ("jobs",): Command(
+        "mindbridge.jobs_cli",
+        "Report the observation job ledger against the broker, and repair it",
+        extra="server",
+    ),
     ("lifecycle",): Command(
         "mindbridge.lifecycle_cli",
         "Decay and transition one tenant's memory strength",
@@ -107,6 +112,15 @@ COMMANDS: dict[tuple[str, ...], Command] = {
         "Serve the deployable MCP server over stdio",
         attribute="run_mcp",
         extra="server",
+    ),
+    ("config", "check"): Command(
+        "mindbridge.config_cli",
+        "Report whether one role's configuration is complete",
+    ),
+    ("jina", "serve"): Command(
+        "mindbridge.jina_server",
+        "Serve Jina v5 Omni with SentenceTransformers",
+        extra="server --extra cloud-models",
     ),
     ("edge", "sync"): Command(
         "mindbridge.edge.sync_cli",

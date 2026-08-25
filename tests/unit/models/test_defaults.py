@@ -1,7 +1,5 @@
 """Tests for the one place every process reads its bundled plugin contract."""
 
-import pytest
-
 from mindbridge.models import jina as jina_models
 from mindbridge.models import openai as openai_models
 from mindbridge.models.defaults import (
@@ -35,16 +33,6 @@ def test_text_and_media_encoders_agree_on_one_search_space() -> None:
     for key in ("space_id", "dimension"):
         assert text[key] == media[key]
     assert text["dimension"] == 512
-
-
-def test_generator_requires_its_injected_credentials() -> None:
-    """A blank required credential must fail the builder, not reach the provider."""
-    environment = {
-        name: value for name, value in ENVIRONMENT.items() if name != "MINDBRIDGE_GENERATOR_API_KEY"
-    }
-
-    with pytest.raises(ValueError, match="MINDBRIDGE_GENERATOR_API_KEY"):
-        openai_generator_config(environment)
 
 
 def test_optional_settings_are_omitted_rather_than_sent_as_none() -> None:

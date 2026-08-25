@@ -427,6 +427,22 @@ class RememberRequest(ContractModel):
         return self
 
 
+class RememberBatchRequest(ContractModel):
+    """Retain several memories in one call, and so in one encoder round trip."""
+
+    memories: Annotated[
+        tuple[RememberRequest, ...],
+        Field(
+            min_length=1,
+            max_length=100,
+            description=(
+                "The memories to retain, at most 100, each exactly as the single-memory "
+                "request accepts it. Results come back in this order."
+            ),
+        ),
+    ]
+
+
 class FeedbackRequest(ContractModel):
     """Record useful, wrong, missing, or corrected recall feedback."""
 
@@ -777,20 +793,34 @@ class GetMemoryRequest(ContractModel):
 
 
 class EvidenceView(ContractModel):
-    """Precise evidence location safe to expose to a caller."""
+    """Precise evidence location safe to expose to a caller.
+
+    The offsets locate the span inside `media_object_id`. They do not locate it inside
+    `media_url`, which is usually a copy cut for this span alone: that copy's own timeline
+    starts at zero and may carry slightly more than the span, and where no single copy covers
+    the span it is the whole source object instead. Seek with these offsets only into
+    `media_object_id`.
+    """
 
     evidence_id: Identifier = Field(description="Stable ID of this evidence span.")
-    media_object_id: Identifier = Field(description="Media object the span was cut from.")
+    media_object_id: Identifier = Field(
+        description="Media object the span was cut from, and the one the offsets below index.",
+    )
     start_ms: Annotated[
         int,
-        Field(ge=0, description="Span start within that media, in milliseconds."),
+        Field(ge=0, description="Span start within `media_object_id`, in milliseconds."),
     ]
     end_ms: Annotated[
         int,
-        Field(ge=0, description="Span end within that media, in milliseconds."),
+        Field(ge=0, description="Span end within `media_object_id`, in milliseconds."),
     ]
     media_url: NonEmptyString = Field(
-        description="Signed URL for the bytes, so verifying needs no separate storage call.",
+        description=(
+            "Signed URL for this span's bytes, so verifying needs no separate storage call. "
+            "It is a copy cut for the span where one exists, and the whole source object where "
+            "none does; bytes are attached to a generation request only while they are about "
+            "the span, so an answer over a span its source dwarfs was produced without them."
+        ),
     )
     media_url_expires_at: UtcDatetime = Field(
         description="When `media_url` stops working; re-read the memory for a fresh one.",
@@ -836,6 +866,18 @@ class RememberResult(_InspectableMemory):
             "`created` when this request stored the memory, `duplicate` when an earlier write "
             "under the same idempotency key already had. The memory returned is the same "
             "either way, so a retry is safe without being silent."
+        ),
+    )
+
+
+class RememberBatchResult(ContractModel):
+    """One result per requested memory, in request order."""
+
+    memories: tuple[RememberResult, ...] = Field(
+        description=(
+            "One result per requested memory, positionally aligned with the request. Each "
+            "carries its own `created` or `duplicate` status, so a partially resent batch "
+            "reports exactly which of its memories were already stored."
         ),
     )
 

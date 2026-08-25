@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-import os
 from collections.abc import Mapping, Sequence
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
@@ -32,6 +31,7 @@ from mindbridge.application.pipelines import (
 )
 from mindbridge.cli import parser as build_parser
 from mindbridge.configuration import (
+    configuration_source,
     copy_plugin_configuration,
     parse_aware_datetime,
     plugin_configuration,
@@ -55,7 +55,7 @@ from mindbridge.models.defaults import (
     require_matryoshka_dimension,
 )
 from mindbridge.models.plugins import close_model, load_embedder, load_generator
-from mindbridge.telemetry import configure_telemetry
+from mindbridge.telemetry import configure_observability
 
 CONSOLIDATION_ENVIRONMENT = """environment:
   MINDBRIDGE_DATABASE_URL           PostgreSQL DSN (required). Read from the environment
@@ -109,7 +109,7 @@ class ConsolidationSettings:
         environ: Mapping[str, str] | None = None,
     ) -> ConsolidationSettings:
         """Read the documented process contract without requiring API or broker settings."""
-        source = os.environ if environ is None else environ
+        source = configuration_source(environ)
         generator_plugin = source.get("MINDBRIDGE_GENERATOR_PLUGIN", "openai")
         embedder_plugin = source.get("MINDBRIDGE_EMBEDDER_PLUGIN", "openai")
         return cls(
@@ -134,37 +134,53 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
     """Run one tenant sweep using only explicit process configuration."""
     options = _parser(prog).parse_args(argv)
     # Configured after parsing so --help and a rejected flag stay side-effect free.
-    configure_telemetry("mindbridge-consolidation")
-    summary = asyncio.run(
-        _run_postgres_sweep(
-            ConsolidationSettings.from_environment(),
-            TenantId(options.tenant_id),
-            options.evaluated_at or utc_now(),
-            page_size=options.page_size,
-            maximum_gap_seconds=options.maximum_gap_seconds,
-            minimum_similarity=options.minimum_similarity,
-            claim_page_size=options.claim_page_size,
-            claim_maximum_gap_seconds=options.claim_maximum_gap_seconds,
-            claim_minimum_similarity=options.claim_minimum_similarity,
-            summary_page_size=options.summary_page_size,
-            summary_maximum_gap_seconds=options.summary_maximum_gap_seconds,
-            summary_minimum_similarity=options.summary_minimum_similarity,
-            entity_page_size=options.entity_page_size,
-            entity_maximum_gap_seconds=options.entity_maximum_gap_seconds,
-            entity_candidate_limit=options.entity_candidate_limit,
-            entity_minimum_confidence=options.entity_minimum_confidence,
-            entity_evidence_per_side=options.entity_evidence_per_side,
-            entity_maximum_pairs=options.entity_maximum_pairs,
-            # argparse append leaves None when the flag is absent, and the default is a
-            # deliberate choice rather than "all types", so it is spelled out here.
-            entity_types=tuple(
-                EntityType(value) for value in (options.entity_types or [EntityType.PERSON.value])
-            ),
-            entity_readjudicate=options.entity_readjudicate,
-            skip_entity_resolution=options.skip_entity_resolution,
-        )
+    configure_observability("mindbridge-consolidation")
+    summary = asyncio.run(run_sweep(ConsolidationSettings.from_environment(), options))
+    print(json.dumps(summary_dict(summary), sort_keys=True))
+
+
+def sweep_options(argv: Sequence[str]) -> argparse.Namespace:
+    """Parse one sweep's flags, so a scheduled run cannot drift from the documented command.
+
+    The beat schedule reaches a sweep through this rather than through a second set of
+    defaults: `--page-size` and its fifteen siblings are already documented with values, and a
+    parallel copy of them would be the thing that quietly stops matching.
+    """
+    return _parser().parse_args(argv)
+
+
+async def run_sweep(
+    settings: ConsolidationSettings,
+    options: argparse.Namespace,
+) -> ConsolidationSweepSummary:
+    """Run every configured sweep for one tenant at one fixed evaluation instant."""
+    return await _run_postgres_sweep(
+        settings,
+        TenantId(options.tenant_id),
+        options.evaluated_at or utc_now(),
+        page_size=options.page_size,
+        maximum_gap_seconds=options.maximum_gap_seconds,
+        minimum_similarity=options.minimum_similarity,
+        claim_page_size=options.claim_page_size,
+        claim_maximum_gap_seconds=options.claim_maximum_gap_seconds,
+        claim_minimum_similarity=options.claim_minimum_similarity,
+        summary_page_size=options.summary_page_size,
+        summary_maximum_gap_seconds=options.summary_maximum_gap_seconds,
+        summary_minimum_similarity=options.summary_minimum_similarity,
+        entity_page_size=options.entity_page_size,
+        entity_maximum_gap_seconds=options.entity_maximum_gap_seconds,
+        entity_candidate_limit=options.entity_candidate_limit,
+        entity_minimum_confidence=options.entity_minimum_confidence,
+        entity_evidence_per_side=options.entity_evidence_per_side,
+        entity_maximum_pairs=options.entity_maximum_pairs,
+        # argparse append leaves None when the flag is absent, and the default is a
+        # deliberate choice rather than "all types", so it is spelled out here.
+        entity_types=tuple(
+            EntityType(value) for value in (options.entity_types or [EntityType.PERSON.value])
+        ),
+        entity_readjudicate=options.entity_readjudicate,
+        skip_entity_resolution=options.skip_entity_resolution,
     )
-    print(json.dumps(_summary_dict(summary), sort_keys=True))
 
 
 async def _run_postgres_sweep(
@@ -387,7 +403,8 @@ def _parser(prog: str | None = None) -> argparse.ArgumentParser:
     return parser
 
 
-def _summary_dict(summary: ConsolidationSweepSummary) -> dict[str, object]:
+def summary_dict(summary: ConsolidationSweepSummary) -> dict[str, object]:
+    """Render one sweep's totals, printed by the command and logged by the schedule."""
     return {
         "claims": _sweep_dict(summary.claims),
         "episodes": _sweep_dict(summary.episodes),

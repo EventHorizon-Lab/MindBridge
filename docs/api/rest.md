@@ -63,6 +63,7 @@ Branch on `code`, never on `message`. `issues` is populated only for validation 
 | `GET` | `/healthz` | Liveness. Public. |
 | `POST` | `/v1/observations` | Submit one sensor observation. |
 | `POST` | `/v1/memories` | Explicitly retain content. |
+| `POST` | `/v1/memories/batch` | Retain up to 100 memories in one encoder round trip. |
 | `GET` | `/v1/memories/{memory_id}` | Read one memory with signed evidence. |
 | `POST` | `/v1/recall` | Recall and answer. |
 | `POST` | `/v1/feedback` | Record a useful/wrong/missing/correction signal. |
@@ -132,7 +133,7 @@ Anonymous by construction — an `identity_id`, never a face or voice template.
 | `kind` | `face` \| `voice` | Gates `transcript` and `visual_bbox_xyxy`. |
 | `start_ms`, `end_ms` | int ≥ 0 | Milliseconds from the observation's start; must fall inside its span. |
 | `confidence` | 0.0–1.0 | The edge detector's own confidence. |
-| `model_id` | string | Provenance: which edge model produced the span. |
+| `model_id` | string | Provenance: the edge model that produced the span. |
 | `scope` | `device` \| `observation` | Default `device`. |
 | `transcript` | string \| null | `voice` only. All transcripts in one observation ≤ 65,536 characters. |
 | `visual_bbox_xyxy` | 4 floats \| null | `face` only. **0..1 normalized** `(left, top, right, bottom)`, not pixels. Must have positive width and height. |
@@ -190,6 +191,33 @@ claim that later reads as confirmed.
 
 **Errors:** tenant errors, `idempotency_conflict`, `domain_invariant_failed`, embedding errors,
 evidence errors.
+
+---
+
+### `POST /v1/memories/batch`
+
+Retains several memories in one call, and so in one embedder round trip. Returns `201 Created`.
+
+**Request — `RememberBatchRequest`**
+
+| Field | Type | Required | Notes |
+| --- | --- | --- | --- |
+| `memories` | `RememberRequest[]` | yes | 1–100 entries, each exactly as the single write accepts it. |
+
+**Response — `RememberBatchResult`**: `memories`, one `RememberResult` per request **in the order
+sent**, so a caller can pair results with inputs positionally rather than by matching summaries.
+
+Prefer this over a loop whenever more than one memory is on hand. The single-write path spends one
+embedder call per memory, which on a served encoder is a round trip each; here the batch is encoded
+together. Measured on one RTX 5090 against the same model, encoding 128 real memory summaries: 600
+per second in batches of 32 against 183 per second one at a time.
+
+Each entry is validated and applied on its own terms — the same tenant checks, the same
+`idempotency_key` handling, the same `attested`-without-evidence rule as the single write. An entry
+that duplicates an existing key comes back as `duplicate` in its own slot.
+
+**Errors:** as `POST /v1/memories`, plus `domain_invariant_failed` for an empty or over-long
+`memories` array.
 
 ---
 

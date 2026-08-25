@@ -41,6 +41,8 @@ from mindbridge.contracts import (
     ObserveRequest,
     RecallRequest,
     RecallResult,
+    RememberBatchRequest,
+    RememberBatchResult,
     RememberRequest,
     RememberResult,
     ValidationIssue,
@@ -84,6 +86,7 @@ def build_app(
     tenant_authentication = Depends(authenticator)
     _register_request_error_handlers(app)
     _register_runtime_error_handlers(app)
+    _register_remember_routes(app, kernel, authenticator)
     _register_deletion_routes(app, kernel, authenticator)
     register_job_event_routes(app, kernel, authenticator)
 
@@ -109,26 +112,6 @@ def build_app(
     ) -> ObservationReceipt:
         require_tenant(principal, request.tenant_id)
         return await kernel.observe(request)
-
-    @app.post(
-        "/v1/memories",
-        response_model=RememberResult,
-        status_code=status.HTTP_201_CREATED,
-        operation_id="remember",
-        responses=responses(
-            *TENANT_ERRORS,
-            "idempotency_conflict",
-            "domain_invariant_failed",
-            *_EMBEDDING_ERRORS,
-            *_EVIDENCE_ERRORS,
-        ),
-    )
-    async def remember(
-        request: RememberRequest,
-        principal: TenantPrincipal = tenant_authentication,
-    ) -> RememberResult:
-        require_tenant(principal, request.tenant_id)
-        return await kernel.remember(request)
 
     @app.post(
         "/v1/feedback",
@@ -209,6 +192,61 @@ def build_app(
         register_aml_routes(app, kernel, aml_generator, settings=aml_settings)
 
     return app
+
+
+def _register_remember_routes(
+    app: FastAPI,
+    kernel: MemoryKernel,
+    authenticator: TenantApiKeyAuthenticator,
+) -> None:
+    """Expose the single and batch forms of one explicit write over one use case.
+
+    Both are registered here, before the parameterised `/v1/memories/{memory_id}` read: a route
+    for the literal path `batch` has to be matched ahead of the sibling that would otherwise
+    read `batch` as a memory ID.
+    """
+    tenant_authentication = Depends(authenticator)
+    _WRITE_ERRORS = (
+        *TENANT_ERRORS,
+        "idempotency_conflict",
+        "domain_invariant_failed",
+        *_EMBEDDING_ERRORS,
+        *_EVIDENCE_ERRORS,
+    )
+
+    @app.post(
+        "/v1/memories",
+        response_model=RememberResult,
+        status_code=status.HTTP_201_CREATED,
+        operation_id="remember",
+        responses=responses(*_WRITE_ERRORS),
+    )
+    async def remember(
+        request: RememberRequest,
+        principal: TenantPrincipal = tenant_authentication,
+    ) -> RememberResult:
+        require_tenant(principal, request.tenant_id)
+        return await kernel.remember(request)
+
+    @app.post(
+        "/v1/memories/batch",
+        response_model=RememberBatchResult,
+        status_code=status.HTTP_201_CREATED,
+        operation_id="rememberBatch",
+        responses=responses(*_WRITE_ERRORS),
+    )
+    async def remember_batch(
+        request: RememberBatchRequest,
+        principal: TenantPrincipal = tenant_authentication,
+    ) -> RememberBatchResult:
+        """Retain several memories in one call, and so in one encoder round trip.
+
+        The batch settles whole: every write completes before the first failure propagates, so
+        retrying is safe and the memories that already landed come back `duplicate`.
+        """
+        for memory in request.memories:
+            require_tenant(principal, memory.tenant_id)
+        return RememberBatchResult(memories=await kernel.remember(request.memories))
 
 
 def _register_deletion_routes(

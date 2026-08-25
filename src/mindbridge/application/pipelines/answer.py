@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import json
-from typing import Annotated, Literal
+from typing import Annotated, Literal, TypeVar, get_args
 
 from pydantic import (
     BaseModel,
+    BeforeValidator,
     ConfigDict,
     Field,
     StringConstraints,
+    TypeAdapter,
     ValidationError,
     model_validator,
 )
@@ -23,48 +25,134 @@ from mindbridge.application.capabilities import (
     TextPart,
 )
 from mindbridge.application.perception import ResolvedEvidence
-from mindbridge.application.pipelines.evidence import evidence_parts
-from mindbridge.application.pipelines.structured import generate_json, unwrap_json_code_fence
+from mindbridge.application.pipelines.evidence import (
+    DEFAULT_MAX_EVIDENCE_MEDIA_PARTS,
+    evidence_parts,
+)
+from mindbridge.application.pipelines.structured import (
+    generate_json,
+    output_schema,
+    unwrap_json_code_fence,
+)
 from mindbridge.application.ports import GeneratedAnswer, ResolvedQueryMedia
 from mindbridge.contracts import RecallRequest
 from mindbridge.core import MemoryId, MemoryRecord, ModelOutputError
 from mindbridge.prompts import ANSWER_FROM_EVIDENCE_PROMPT, SELECT_OCCURRENCES_PROMPT
 from mindbridge.telemetry import operation_span, set_current_span_attributes
 
+_MODEL_OUTPUT_CONFIG = ConfigDict(extra="ignore", frozen=True)
+"""Everything the prompt asked for, and nothing about what it did not.
+
+Same boundary and same reason as the perception pipeline's: this is a model-output boundary, not
+a trust boundary, and forbidding extras here threw away a finished answer over a key nothing
+reads. On the read path that is measurably the more expensive half -- 14 of 55 M3-Bench robot
+predictions (25.5%) were lost to `model_output_invalid`, more than every wrong answer that
+benchmark made combined, clustered on the widest recall payloads.
+
+A renamed field still fails, because the field it replaced is then missing.
+"""
+
+_TemporalOrder = Literal["relevance", "newest", "oldest"]
+_DEFAULT_TEMPORAL_ORDER: _TemporalOrder = "relevance"
+# What GeneratedAnswer accepts, and what the prompt asks for: at most two follow-up queries.
+_MAX_RETRIEVAL_QUERIES = 2
+
+# Query media is attached as the caller uploaded it. Nothing is substituted for it: a derived clip
+# is cut per evidence span, and an object asked *with* is not a span of anything, so what goes on
+# the wire is a full-resolution source -- ~12.3k prompt tokens against ~1.65k for a clip, and four
+# of them in one call is the measured 60 s gateway timeout. So it is charged what it costs against
+# the one ceiling the whole request shares, rather than a second ceiling of its own: at most three
+# query objects are attached, and each one attached is eight evidence clips that are not.
+QUERY_MEDIA_PART_COST = 8
+
 _NonEmptyAnswer = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 _RetrievalQuery = Annotated[
     str,
     StringConstraints(strip_whitespace=True, min_length=1, max_length=2_048),
 ]
+_Item = TypeVar("_Item")
+
+
+def _valid_items(adapter: TypeAdapter[_Item], value: object) -> tuple[_Item, ...] | object:
+    """Keep the list entries that validate, in the order first mentioned, dropping repeats.
+
+    An entry the model got wrong is one entry, so it costs one entry. Something that is not a
+    list at all is handed on untouched, because the field's own validation is what should judge
+    that.
+    """
+    if not isinstance(value, list):
+        return value
+    kept: list[_Item] = []
+    for item in value:
+        try:
+            kept.append(adapter.validate_python(item))
+        except ValidationError:
+            continue
+    return tuple(dict.fromkeys(kept))
+
+
+_QUERY_ADAPTER: TypeAdapter[str] = TypeAdapter(_RetrievalQuery)
+_MEMORY_ID_ADAPTER: TypeAdapter[str] = TypeAdapter(_NonEmptyAnswer)
+
+
+def _asked_queries(value: object) -> object:
+    """Take the first two distinct follow-up queries and drop the rest.
+
+    A third query, or a repeat of the first, says nothing the first two do not -- and losing the
+    answer they came attached to costs a whole recall, including the queries themselves, which
+    are what a second retrieval round would have used.
+    """
+    kept = _valid_items(_QUERY_ADAPTER, value)
+    return kept[:_MAX_RETRIEVAL_QUERIES] if isinstance(kept, tuple) else kept
+
+
+def _known_temporal_order(value: object) -> object:
+    """Fall back to the documented default rather than losing the answer over its ordering hint."""
+    return value if value in get_args(_TemporalOrder) else _DEFAULT_TEMPORAL_ORDER
 
 
 class _AnswerOutput(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = _MODEL_OUTPUT_CONFIG
 
     answer: _NonEmptyAnswer | None
     confidence: Annotated[float, Field(ge=0.0, le=1.0)]
-    retrieval_queries: Annotated[tuple[_RetrievalQuery, ...], Field(max_length=2)] = ()
-    temporal_order: Literal["relevance", "newest", "oldest"] = "relevance"
+    retrieval_queries: Annotated[tuple[_RetrievalQuery, ...], BeforeValidator(_asked_queries)] = ()
+    temporal_order: Annotated[_TemporalOrder, BeforeValidator(_known_temporal_order)] = (
+        _DEFAULT_TEMPORAL_ORDER
+    )
 
     @model_validator(mode="after")
-    def require_zero_confidence_for_abstention(self) -> _AnswerOutput:
+    def keep_abstention_at_zero_confidence(self) -> _AnswerOutput:
+        """A null answer is an abstention; a confidence contradicting it is the part that is wrong.
+
+        Zeroing it keeps the abstention exactly as the model gave it, which is the reason this is
+        a repair and not a change of answering behaviour. `confidence` is otherwise never
+        rewritten: with an answer present it is a required number carrying meaning of its own, so
+        an out-of-range one is rejected rather than clamped into a calibration nobody reported.
+        """
         if self.answer is None and self.confidence != 0.0:
-            raise ValueError("confidence must be zero when answer is null")
-        if len(set(self.retrieval_queries)) != len(self.retrieval_queries):
-            raise ValueError("retrieval_queries must be unique")
+            return self.model_copy(update={"confidence": 0.0})
         return self
 
 
 class _OccurrenceOutput(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = _MODEL_OUTPUT_CONFIG
 
-    memory_ids: tuple[_NonEmptyAnswer, ...]
+    memory_ids: Annotated[
+        tuple[_NonEmptyAnswer, ...],
+        BeforeValidator(lambda value: _valid_items(_MEMORY_ID_ADAPTER, value)),
+    ]
 
-    @model_validator(mode="after")
-    def require_unique_memory_ids(self) -> _OccurrenceOutput:
-        if len(set(self.memory_ids)) != len(self.memory_ids):
-            raise ValueError("memory_ids must be unique")
-        return self
+
+_OCCURRENCE_SCHEMA = output_schema("occurrence_selection", _OccurrenceOutput)
+"""Occurrence selection is constrained; the answer envelope beside it deliberately is not.
+
+Strict decoding cannot express an optional key, so a schema for `_AnswerOutput` would force
+`retrieval_queries` to be emitted on every recall round. Each query the model volunteers
+buys another reflection round, and another whole generation, so constraining that shape
+would trade a rare parse retry for a routine extra call. `_OccurrenceOutput` carries no
+optional field and no prose, which is why the same treatment is free there.
+"""
 
 
 class AnswerPipeline:
@@ -152,6 +240,7 @@ class OccurrencePipeline:
                     )
                 ),
                 max_output_tokens=self._max_output_tokens,
+                output_schema=_OCCURRENCE_SCHEMA,
             ),
             lambda content: _parse_occurrences(content, candidate_ids),
         )
@@ -183,13 +272,11 @@ def _recall_parts(
             "</recall_context>"
         )
     ]
-    seen_media_object_ids: set[str] = set()
-    for item in query_media:
-        media_object_id = item.media_object.media_object_id
-        seen_media_object_ids.add(media_object_id)
+    attached_query_media = query_media[: DEFAULT_MAX_EVIDENCE_MEDIA_PARTS // QUERY_MEDIA_PART_COST]
+    for item in attached_query_media:
         parts.extend(
             (
-                TextPart(f"Query media_object_id={media_object_id} follows."),
+                TextPart(f"Query media_object_id={item.media_object.media_object_id} follows."),
                 MediaPart(
                     kind=item.media_object.kind,
                     url=item.media_url,
@@ -197,7 +284,20 @@ def _recall_parts(
                 ),
             )
         )
-    parts.extend(evidence_parts(evidence, excluded_media_object_ids=seen_media_object_ids))
+    parts.extend(
+        evidence_parts(
+            evidence,
+            # The id of the object actually attached, which is the clip for every span cut from
+            # this query object and so leaves exactly the evidence a media query asks about in
+            # place. Keying on the signed URL instead let one object presigned twice through.
+            excluded_media_object_ids={
+                item.media_object.media_object_id for item in attached_query_media
+            },
+            max_media_parts=(
+                DEFAULT_MAX_EVIDENCE_MEDIA_PARTS - QUERY_MEDIA_PART_COST * len(attached_query_media)
+            ),
+        )
+    )
     final_input = json.dumps(
         {
             "question": request.query.text,
@@ -269,6 +369,14 @@ def _parse_occurrences(content: str, candidate_ids: set[str]) -> _OccurrenceOutp
         output = _OccurrenceOutput.model_validate_json(unwrap_json_code_fence(content))
     except ValidationError as error:
         raise ModelOutputError("occurrence pipeline returned invalid structured output") from error
-    if not set(output.memory_ids) <= candidate_ids:
-        raise ModelOutputError("occurrence pipeline returned an unknown memory ID")
-    return output
+    # An ID that was never a candidate cannot name an occurrence, so it is dropped rather than
+    # taking the batch's real selections with it. Enumeration verifies memories in batches, and
+    # one invented ID used to fail the whole count.
+    selected = tuple(memory_id for memory_id in output.memory_ids if memory_id in candidate_ids)
+    if len(selected) != len(output.memory_ids):
+        set_current_span_attributes(
+            {
+                "mindbridge.occurrences.dropped_id_count": len(output.memory_ids) - len(selected),
+            }
+        )
+    return output.model_copy(update={"memory_ids": selected})

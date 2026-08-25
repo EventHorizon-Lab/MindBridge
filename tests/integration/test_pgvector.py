@@ -28,13 +28,11 @@ VECTOR_TENANT = TenantId("tenant_vectors")
 pytestmark = pytest.mark.integration
 
 
-async def test_pgvector_separates_embedding_spaces(
+async def test_pgvector_separates_search_spaces(
     store: PostgresMemoryStore,
 ) -> None:
-    """The cloud index retrieves only the requested embedding space."""
-    model = ModelReference(
-        model_id="jinaai/jina-embeddings-v5-omni-small-retrieval",
-    )
+    """The cloud index retrieves only vectors written into the requested space."""
+    model = ModelReference(model_id="jinaai/jina-embeddings-v5-omni-small-retrieval")
     space = EmbeddingSpaceReference(space_id="jina-v5")
     first = _embedding_record(
         embedding_id="embedding_01",
@@ -100,7 +98,7 @@ async def test_pgvector_separates_embedding_spaces(
         EmbeddingSearch(
             tenant_id=VECTOR_TENANT,
             values=first.values,
-            space_reference=EmbeddingSpaceReference(space_id="jina-v4"),
+            space_reference=EmbeddingSpaceReference(space_id="jina-v5-text-matching"),
             document_task="retrieval_document",
             object_types=(EmbeddedObjectType.MEMORY_RECORD,),
             limit=2,
@@ -132,7 +130,7 @@ async def test_unreachable_probe_is_scoped_per_tenant_and_per_object_type(
     # integration test shares, and tenant_vectors already owns fixture vectors.
     tenant_id = TenantId("tenant_space_probe")
     space = EmbeddingSpaceReference(space_id="jina-v5")
-    drifted = EmbeddingSpaceReference(space_id="jina-v4")
+    drifted = EmbeddingSpaceReference(space_id="jina-v5-text-matching")
     model = ModelReference(model_id="jina-omni")
 
     assert await store.unreachable_embedded_object_types(tenant_id, space) == ()
@@ -180,9 +178,7 @@ async def test_pgvector_keeps_one_vector_for_a_re_encoded_entity_name(
     store: PostgresMemoryStore,
 ) -> None:
     """An entity name is re-encoded in later batches, so encoder noise must not fail the write."""
-    model = ModelReference(
-        model_id="jinaai/jina-embeddings-v5-omni-small-retrieval",
-    )
+    model = ModelReference(model_id="jinaai/jina-embeddings-v5-omni-small-retrieval")
     space = EmbeddingSpaceReference(space_id="jina-v5")
     stored = _embedding_record(
         embedding_id="embedding_entity_01",

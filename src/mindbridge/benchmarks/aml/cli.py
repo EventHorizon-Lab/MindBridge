@@ -52,9 +52,9 @@ from mindbridge.benchmarks.cli_common import report, report_unit
 from mindbridge.contracts import ContractModel, Identifier, NonEmptyString, Sha256Hex
 from mindbridge.file_integrity import sha256_file
 
-# The upstream the vendored pipelines under `benchmarks/aml/` came from, whose
-# per-file digests `benchmarks/aml/PINNED.md` records. A constant, not a CLI
-# flag: changing it means re-vendoring, not choosing a value per run.
+# The upstream this benchmark's vendored pipelines come from, recorded in
+# `benchmarks/aml/PINNED.md`. A constant, not a CLI flag: changing it means
+# re-vendoring, not choosing a different value per run.
 _AML_SOURCE_REPOSITORY = "AML-memory/agent-memory-leaderboard"
 
 # Duplicated from `mindbridge.api.aml_contracts.derive_tenant_id` rather than
@@ -412,7 +412,18 @@ async def _run(
                 written_id = str(row["id"])
                 if written_id in existing_ids:
                     continue
-                handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+                # `ensure_ascii=True` here, against this repo's usual
+                # `ensure_ascii=False`: `docs/benchmarking.md` feeds these shards to
+                # the vendored scorers, which are standalone upstream scripts, and to
+                # third-party tooling. A raw U+2028, U+2029 or U+0085 -- the only
+                # three `splitlines()` breaks on that `ensure_ascii=False` emits
+                # unescaped -- shreds a record mid-string in any reader that splits
+                # on Unicode line boundaries. Escaping puts that guarantee on the
+                # write side instead of assuming every reader is fixed. It costs
+                # about 1% here because all seven AML corpora are 0.00% CJK; the
+                # CJK-heavy benchmarks write through their own CLIs, which keep
+                # `ensure_ascii=False` and stay readable.
+                handle.write(json.dumps(row, ensure_ascii=True) + "\n")
                 handle.flush()
                 existing_ids.add(written_id)
 

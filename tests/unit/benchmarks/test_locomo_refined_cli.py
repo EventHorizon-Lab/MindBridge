@@ -55,6 +55,7 @@ def test_locomo_refined_artifacts_pin_source_system_code_and_output(tmp_path: Pa
     assert rows[0]["mindbridge_prediction_context"] == ["D1:1"]
     assert manifest.benchmark == "LoCoMo-Refined"
     assert manifest.source_repository == "mem-eval-suite/LoCoMo_refined"
+    assert manifest.deployment.server_generator.config["model_id"] == "qwen3.8-max"
     assert (
         manifest.runner_version
         == LOCOMO_REFINED_RUNNER_VERSION

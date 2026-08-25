@@ -211,8 +211,7 @@ chunks, each costing one extraction call plus N `remember()` writes.
 
 A run manifest matching the existing benchmark runner convention
 (`source_repository`, `source_sha256`, `deployment`, `run_id`, `tenant_prefix`,
-`recall_limit`, `request_concurrency`),
-written to `benchmarks/manifests/`.
+`recall_limit`, `request_concurrency`), written to `benchmarks/manifests/`.
 
 ## What this cannot tell us
 

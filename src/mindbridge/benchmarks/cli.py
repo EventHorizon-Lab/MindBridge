@@ -87,10 +87,17 @@ RUNNERS: dict[str, Runner] = {
     "egotempo": Runner("mindbridge.benchmarks.egotempo_cli", "Run official EgoTempo"),
     "memlens": Runner("mindbridge.benchmarks.memlens_cli", "Run official MemLens"),
     "mm-lifelong": Runner("mindbridge.benchmarks.mm_lifelong_cli", "Run official MM-Lifelong"),
+    "atm": Runner("mindbridge.benchmarks.atm_cli", "Run official ATM-Bench"),
+    "mem-gallery": Runner("mindbridge.benchmarks.mem_gallery_cli", "Run official Mem-Gallery"),
     "supermemory": Runner("mindbridge.benchmarks.supermemory_cli", "Run official SuperMemory VQA"),
     "video-mme": Runner(
         "mindbridge.benchmarks.video_mme_cli",
         "Run official Video-MME",
+        extra="benchmarks",
+    ),
+    "video-mme-v2": Runner(
+        "mindbridge.benchmarks.video_mme_v2_cli",
+        "Run official Video-MME-v2",
         extra="benchmarks",
     ),
     "aml": Runner("mindbridge.benchmarks.aml.cli", "Replay one offline AML pipeline"),
@@ -171,6 +178,7 @@ def guarded(runner: Runner, arguments: Sequence[str], *, prog: str) -> int:
     the way an incomplete environment does — including for `--help` — and says which extra
     to install instead of printing frames from a missing third-party package.
     """
+    _configure_run_observability()
     try:
         handler = runner.handler()
     except ImportError as error:
@@ -178,7 +186,36 @@ def guarded(runner: Runner, arguments: Sequence[str], *, prog: str) -> int:
         if runner.extra is not None:
             print(f"{prog}: install it with `uv sync --extra {runner.extra}`", file=sys.stderr)
         return 1
-    return invoke(handler, arguments, prog=prog)
+    try:
+        return invoke(handler, arguments, prog=prog)
+    finally:
+        # A benchmark run exists to be measured, so its own cost breakdown is part of the
+        # result rather than an opt-in. Emitted on failure too: a run that died halfway is
+        # exactly when knowing which stage owned the wall clock is worth most.
+        _log_run_timings()
+
+
+def _log_run_timings() -> None:
+    """Emit the ranked per-operation summary this run accumulated, when it is reachable."""
+    try:
+        from mindbridge.telemetry import log_timing_summary
+    except ImportError:  # pragma: no cover - only a benchmarks install without the API
+        return
+    log_timing_summary()
+
+
+def _configure_run_observability() -> None:
+    """Install run logging, or leave the run silent rather than fail on a missing extra.
+
+    Logging only, not the OTLP exporters: the `benchmarks` extra carries the OpenTelemetry
+    API and not the SDK or the instrumentation packages, and a measurement run needs its
+    timings on stderr rather than a collector. A deployment process configures both.
+    """
+    try:
+        from mindbridge.telemetry import configure_logging
+    except ImportError:  # pragma: no cover - only a benchmarks install without the API
+        return
+    configure_logging(PROGRAM)
 
 
 def invoke(handler: Callable[..., object], arguments: Sequence[str], *, prog: str) -> int:

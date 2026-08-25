@@ -8,13 +8,17 @@ import sys
 from collections.abc import Iterable, Mapping
 from functools import cache
 from pathlib import Path
+from typing import Any, cast
 
 if sys.version_info >= (3, 11):
     import tomllib
 else:
-    # tomllib landed in 3.11. On the 3.10 half of the matrix mypy itself requires the
+    # tomllib landed in 3.11. On the 3.10 leg of the matrix mypy itself requires the
     # tomli backport, so it is present wherever the dev group that runs this test is.
     import tomli as tomllib
+
+from packaging.markers import default_environment
+from packaging.requirements import Requirement
 
 import mindbridge
 from mindbridge.benchmarks.cli import RUNNERS
@@ -188,7 +192,19 @@ def _imported_modules(path: Path) -> set[str]:
 # belongs to exactly one of them, so a new module without a scenario fails the partition test
 # below rather than quietly relying on whatever extra a developer happened to have synced.
 SCENARIOS: dict[str, tuple[str, ...]] = {
-    "": ("__init__", "configuration", "contracts", "core", "file_integrity", "prompts", "sdk"),
+    # config_cli is core, not server: `mindbridge config check` has to run on a bare install,
+    # which is exactly the state an operator runs it from. Its heavy imports are deferred into
+    # `_settings_probe`, so nothing but stdlib and the base dependencies loads eagerly.
+    "": (
+        "__init__",
+        "config_cli",
+        "configuration",
+        "contracts",
+        "core",
+        "file_integrity",
+        "prompts",
+        "sdk",
+    ),
     "edge": ("edge",),
     "server": (
         "api",
@@ -196,7 +212,10 @@ SCENARIOS: dict[str, tuple[str, ...]] = {
         "celery_app",
         "cli",
         "consolidation_cli",
+        "consolidation_worker",
         "infrastructure",
+        "jina_server",
+        "jobs_cli",
         "lifecycle_cli",
         "models",
         "server",
@@ -213,9 +232,8 @@ UNION_EXTRAS = frozenset({"all"})
 ARTIFACT_EXTRAS = frozenset({"cloud-models"})
 """Extras that carry weights and decoders rather than serving a subtree of their own.
 
-`cloud-models` is reached only through lazy imports -- `models/jina.py` and
-`media/clipping.py` raise `ModelUnavailableError` naming it -- so no module is import-broken
-without it and it owns no scenario.
+They are reached only through lazy imports, so no module is import-broken without them and they
+own no scenario.
 """
 
 PROVIDERS: dict[str, str] = {
@@ -224,13 +242,17 @@ PROVIDERS: dict[str, str] = {
     "botocore": "botocore",
     "celery": "celery",
     "cryptography": "cryptography",
+    "cv2": "opencv-python",
     "fastapi": "fastapi",
+    "funasr": "funasr",
     "httpx": "httpx",
     "huggingface_hub": "huggingface-hub",
+    "insightface": "insightface",
     "mcp": "mcp",
     "mcp_types": "mcp-types",
     "mypy_boto3_s3": "boto3-stubs",
     "numpy": "numpy",
+    "onnxruntime": "onnxruntime",
     "openai": "openai",
     # Longest prefix wins, so the instrumentation and exporter packages are told apart from
     # the API even though they all import as `opentelemetry.*`.
@@ -248,63 +270,94 @@ PROVIDERS: dict[str, str] = {
     "psycopg_pool": "psycopg",
     "pyarrow": "pyarrow",
     "pydantic": "pydantic",
+    "tomli": "tomli",
     "pytest": "pytest",
     "sentence_transformers": "sentence-transformers",
     "soundfile": "soundfile",
     "starlette": "starlette",
     "torch": "torch",
     "transformers": "transformers",
+    "uvicorn": "uvicorn",
 }
 """Import name to the distribution that provides it, spelled as `pyproject.toml` spells it."""
 
-PLATFORM_SUPPLIED = frozenset({"cv2", "funasr", "insightface", "onnxruntime"})
-"""Vendor accelerator SDKs that arrive with the platform image, never from an extra.
+STDLIB_ABOVE_FLOOR = frozenset({"tomllib"})
+"""Modules the standard library provides above the floor and a backport supplies below it.
 
-`docs/edge.md` installs these from JetPack, OpenExplorer, RKNN or OpenVINO. Declaring them
-would pull the generic PyPI wheel over the vendor build on four of the five supported
-platforms, so `edge/identity_inference.py` and `edge/identity_diarization.py` import them
-lazily and raise `ModelUnavailableError` naming the platform requirement.
+`sys.stdlib_module_names` describes the interpreter running the tests, so a 3.10 run does not
+recognise `tomllib` and reads the version-guarded import in `mindbridge.configuration` as an
+undeclared dependency. Its `tomli` half is declared and named in `PROVIDERS`; this names the
+other half, so one conditional import is not read as two missing ones.
 """
 
-RUNTIME_ONLY = frozenset({"torchvision", "uvicorn"})
-"""Declared dependencies that nothing in this repository imports, and why they stay.
+RUNTIME_ONLY = frozenset({"torchaudio", "torchvision"})
+"""Dependencies an upstream model runtime imports rather than MindBridge itself."""
 
-`uvicorn` is the ASGI server `docs/deployment.md` runs as a command. `torchvision` is loaded
-by Jina Omni's own Qwen3-VL processor, which swallows the ImportError and embeds text-only.
-"""
+
+@cache
+def _pyproject() -> dict[str, Any]:
+    # The annotation is load-bearing, not decoration. mypy checks as the interpreter it runs
+    # on, so which of the two branches above it reads changes with the matrix leg, and
+    # `ignore_missing_imports` makes `loads` return `Any` on any leg where the module it
+    # picked is unresolved -- returning that straight out trips `no-any-return` there.
+    parsed: dict[str, Any] = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    return parsed
 
 
 @cache
 def _extras() -> Mapping[str, list[str]]:
-    pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
-    extras: Mapping[str, list[str]] = pyproject["project"]["optional-dependencies"]
+    extras: Mapping[str, list[str]] = _pyproject()["project"]["optional-dependencies"]
     return extras
 
 
 @cache
 def _base_dependencies() -> tuple[str, ...]:
-    pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
-    declared: list[str] = pyproject["project"]["dependencies"]
+    declared: list[str] = _pyproject()["project"]["dependencies"]
     return tuple(declared)
 
 
 def _distribution(requirement: str) -> str:
     """The distribution one requirement names, without its extras, marker or version."""
-    return re.split(r"[<>=!~;\[ ]", requirement.strip(), maxsplit=1)[0]
+    return Requirement(requirement).name
 
 
 @cache
-def _declared(extra: str) -> frozenset[str]:
-    """Every distribution a scenario install puts on disk, following self-references."""
-    declared = {_distribution(requirement) for requirement in _base_dependencies()}
+def _declared(
+    extra: str,
+    *,
+    sys_platform: str | None = None,
+    platform_machine: str | None = None,
+) -> frozenset[str]:
+    """Every active direct distribution in a scenario, following self-references."""
+    environment = cast(dict[str, str], default_environment())
+    if sys_platform is not None:
+        environment["sys_platform"] = sys_platform
+    if platform_machine is not None:
+        environment["platform_machine"] = platform_machine
+
+    base = (Requirement(requirement) for requirement in _base_dependencies())
+    declared = {
+        requirement.name
+        for requirement in base
+        if requirement.marker is None or requirement.marker.evaluate(environment)
+    }
     pending = [extra] if extra else []
+    seen: set[str] = set()
     while pending:
-        for requirement in _extras()[pending.pop()]:
-            name = _distribution(requirement)
-            if name == "mindbridge":
-                pending.extend(re.findall(r"[\w-]+", requirement.partition("[")[2]))
+        current = pending.pop()
+        if current in seen:
+            # `all` and `cloud-models` both reach `media`. Re-walking it only duplicates
+            # work today, but a pair of extras naming each other would never terminate.
+            continue
+        seen.add(current)
+        for raw_requirement in _extras()[current]:
+            requirement = Requirement(raw_requirement)
+            if requirement.marker is not None and not requirement.marker.evaluate(environment):
                 continue
-            declared.add(name)
+            if requirement.name == "mindbridge":
+                pending.extend(requirement.extras)
+                continue
+            declared.add(requirement.name)
     return frozenset(declared)
 
 
@@ -333,7 +386,8 @@ def _third_party(modules: Iterable[str]) -> set[str]:
         for module in modules
         if module.partition(".")[0] not in sys.stdlib_module_names
         and not module.startswith("mindbridge")
-        and module.partition(".")[0] not in PLATFORM_SUPPLIED
+        and module.partition(".")[0] not in STDLIB_ABOVE_FLOOR
+        and not (module.partition(".")[0] == "tomli" and sys.version_info >= (3, 11))
     }
 
 
@@ -371,6 +425,11 @@ def _eagerly_imported_modules(path: Path) -> frozenset[str]:
 
     Function bodies are deferred until called, and `if TYPE_CHECKING:` blocks never run at
     all -- `mypy_boto3_s3` and the OpenTelemetry SDK types are only ever needed there.
+
+    A `from` import also names first-party modules, not only the package holding them, and a
+    relative one names them without spelling `mindbridge` at all. Both are edges the walk in
+    `_reached_third_party` has to follow: drop either and a scenario reaches a dependency it
+    never declares while the check that exists to catch that stays green.
     """
     modules: set[str] = set()
 
@@ -383,8 +442,14 @@ def _eagerly_imported_modules(path: Path) -> frozenset[str]:
             if isinstance(child, ast.Import):
                 modules.update(alias.name for alias in child.names)
             elif isinstance(child, ast.ImportFrom):
-                if child.level == 0 and child.module is not None:
-                    modules.add(child.module)
+                base = _absolute_import(path, child)
+                if base is None:
+                    continue
+                modules.add(base)
+                if base.startswith("mindbridge"):
+                    # `from mindbridge.x import y` is an edge to `mindbridge.x.y` when y is a
+                    # module; `_import_graph` drops the names that turn out to be symbols.
+                    modules.update(f"{base}.{alias.name}" for alias in child.names)
             else:
                 visit(child)
 
@@ -392,8 +457,126 @@ def _eagerly_imported_modules(path: Path) -> frozenset[str]:
     return frozenset(modules)
 
 
+def _absolute_import(path: Path, node: ast.ImportFrom) -> str | None:
+    """The module a `from ... import` names, with any relative level resolved.
+
+    A relative import is anchored on the importing file's own package, which for a package's
+    `__init__.py` is the package itself and for every other module is its parent.
+    """
+    if node.level == 0:
+        return node.module
+    parts = _module_name(path).split(".")
+    if path.name != "__init__.py":
+        parts.pop()
+    anchor = parts[: max(0, len(parts) - node.level + 1)]
+    if not anchor:
+        return None
+    return ".".join((*anchor, node.module) if node.module else anchor)
+
+
 def _tests_type_checking(test: ast.expr) -> bool:
     return isinstance(test, ast.Name) and test.id == "TYPE_CHECKING"
+
+
+def test_the_extra_the_clip_cutter_names_is_the_one_that_provides_its_decoders() -> None:
+    """A worker installed with `server` alone starts, passes the import probe in this file, and
+    then cannot cut a single clip -- the decoders are imported lazily, so nothing before the first
+    observation says so. That makes the error message the only thing pointing an operator at the
+    fix, and it named `cloud-models` while the decoders had moved to `media`.
+
+    Asserted against the declarations rather than as a string match, so the message cannot drift
+    from where the dependencies actually live.
+    """
+    named = re.findall(
+        r"install MindBridge with the ([a-z-]+) extra",
+        (SOURCE / "media" / "clipping.py").read_text(encoding="utf-8"),
+    )
+    assert named, "the clip cutter must tell an operator which extra to install"
+
+    decoders = {"av", "pillow", "soundfile"}
+    for extra in set(named):
+        provided = {_distribution(item) for item in _extras()[extra]}
+        assert decoders <= provided, (
+            f"clipping.py sends operators to the {extra!r} extra, which declares "
+            f"{sorted(decoders - provided)} nowhere"
+        )
+    # And the reason the message matters at all: the extra a worker is otherwise told to install
+    # does not carry them, so this failure is reachable from the documented command.
+    assert not decoders & {_distribution(item) for item in _extras()["server"]}
+
+
+def test_edge_installs_the_complete_portable_identity_runtime() -> None:
+    model_runtime = {
+        "funasr",
+        "insightface",
+        "onnxruntime",
+        "opencv-python",
+        "torch",
+        "torchaudio",
+    }
+
+    for sys_platform, machine in (
+        ("linux", "x86_64"),
+        ("win32", "AMD64"),
+        ("darwin", "arm64"),
+    ):
+        declared = _declared("edge", sys_platform=sys_platform, platform_machine=machine)
+        assert {"numpy", *model_runtime} <= declared
+
+    vendor_arm = _declared("edge", sys_platform="linux", platform_machine="aarch64")
+    assert "numpy" in vendor_arm
+    assert model_runtime.isdisjoint(vendor_arm)
+
+    intel_mac = _declared("edge", sys_platform="darwin", platform_machine="x86_64")
+    assert "numpy" in intel_mac
+    assert model_runtime.isdisjoint(intel_mac)
+
+
+def test_edge_declares_every_dependency_it_imports_lazily() -> None:
+    declared = _declared("edge", sys_platform="linux", platform_machine="x86_64")
+    missing = sorted(
+        f"{path.relative_to(ROOT)} imports {module}"
+        for path in _modules(SOURCE / "edge")
+        for module in _third_party(_lazily_imported_modules(path))
+        if _provider(module) not in declared
+    )
+
+    assert missing == []
+
+
+def test_relative_imports_resolve_against_the_importing_file() -> None:
+    """`_absolute_import`'s relative branch has no other cover in this suite.
+
+    Nothing under `src/` imports relatively and the checks above only read `src/`, so every
+    call they make takes the `level == 0` path and the resolution never runs. A wrong anchor
+    -- off by one, or forgetting that a package's `__init__.py` is anchored on the package
+    rather than its parent -- would fail nothing without this.
+
+    Each row spells `api/runtime.py`'s real import of `api/mcp.py` and of `telemetry` the
+    relative way, and every expectation is what `importlib._bootstrap._resolve_name` returns
+    for the same package and level.
+    """
+    files = {"module": SOURCE / "api" / "runtime.py", "package": SOURCE / "api" / "__init__.py"}
+    cases = {
+        ("module", "from mindbridge.api.mcp import build_mcp_server"): "mindbridge.api.mcp",
+        ("module", "from .mcp import build_mcp_server"): "mindbridge.api.mcp",
+        ("module", "from ..telemetry import operation_span"): "mindbridge.telemetry",
+        ("module", "from . import mcp"): "mindbridge.api",
+        # A package's `__init__.py` is anchored on the package, not on its parent.
+        ("package", "from .runtime import create_app"): "mindbridge.api.runtime",
+        ("package", "from ..telemetry import operation_span"): "mindbridge.telemetry",
+        # Past the top of the tree resolves to nothing rather than a shorter wrong prefix.
+        ("module", "from ....telemetry import operation_span"): None,
+    }
+
+    resolved = {
+        (shape, source): _absolute_import(
+            files[shape], cast(ast.ImportFrom, ast.parse(source).body[0])
+        )
+        for shape, source in cases
+    }
+
+    assert resolved == cases
 
 
 def _modules(*directories: Path) -> list[Path]:
@@ -419,6 +602,42 @@ def test_scenarios_partition_the_package() -> None:
 
     assert unassigned == set()
     assert set(_extras()) == (set(SCENARIOS) - {""}) | ARTIFACT_EXTRAS | UNION_EXTRAS
+
+
+def test_no_docstring_documents_nothing() -> None:
+    """A string under an assignment documents it; anywhere else it documents nothing.
+
+    This codebase carries 31 of these attribute docstrings and treats the reasoning in them
+    as load-bearing, but the syntax is positional: insert a constant between an assignment
+    and its docstring and the docstring silently detaches, leaving a no-op string expression
+    and an undocumented constant. Neither ruff nor mypy reports it, and nothing reads
+    docstrings at runtime, so the loss is invisible -- which is how one got through review.
+    """
+    orphaned = sorted(
+        f"{path.relative_to(ROOT)}:{node.lineno}"
+        for path in _modules(SOURCE, ROOT / "tests")
+        for scope in _documented_scopes(path)
+        for index, node in enumerate(scope)
+        if index and _is_string_expression(node)
+        if not isinstance(scope[index - 1], ast.Assign | ast.AnnAssign)
+    )
+
+    assert orphaned == []
+
+
+def _documented_scopes(path: Path) -> list[list[ast.stmt]]:
+    """The bodies where a bare string is read as documentation: the module and its classes."""
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    classes = [node for node in ast.walk(tree) if isinstance(node, ast.ClassDef)]
+    return [tree.body, *(node.body for node in classes)]
+
+
+def _is_string_expression(node: ast.stmt) -> bool:
+    return (
+        isinstance(node, ast.Expr)
+        and isinstance(node.value, ast.Constant)
+        and isinstance(node.value.value, str)
+    )
 
 
 def _module_name(path: Path) -> str:

@@ -73,7 +73,7 @@ class AdapterScore(ContractModel):
 
 
 class AdapterBakeoffResult(ContractModel):
-    """Versioned output needed to reproduce an adapter comparison."""
+    """Output needed to reproduce an adapter comparison."""
 
     created_at: AwareDatetime
     corpus_description: NonEmptyString

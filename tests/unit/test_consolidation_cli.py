@@ -36,7 +36,7 @@ from mindbridge.application.summary_consolidation import (
     SummaryCandidateCursor,
     SummaryCandidateRequest,
 )
-from mindbridge.consolidation_cli import ConsolidationSettings, _parser, _summary_dict
+from mindbridge.consolidation_cli import ConsolidationSettings, _parser, summary_dict
 from mindbridge.core import (
     ClaimId,
     EntityId,
@@ -324,10 +324,10 @@ def test_a_skipped_entity_sweep_is_reported_apart_from_one_that_found_nothing() 
         candidate_count=0,
         counts={},
     )
-    ran = _summary_dict(
+    ran = summary_dict(
         ConsolidationSweepSummary(episodes=empty, claims=empty, summaries=empty, entities=empty)
     )
-    skipped = _summary_dict(
+    skipped = summary_dict(
         ConsolidationSweepSummary(episodes=empty, claims=empty, summaries=empty, entities=None)
     )
 

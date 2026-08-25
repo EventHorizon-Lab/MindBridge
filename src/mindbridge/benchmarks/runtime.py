@@ -5,10 +5,12 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import re
+from collections.abc import Callable, Sequence
 from datetime import timedelta
 from decimal import Decimal
 from pathlib import Path
 from time import monotonic
+from typing import TypeVar
 
 from pydantic import AwareDatetime, Field, TypeAdapter, model_validator
 
@@ -22,9 +24,15 @@ from mindbridge.contracts import (
     RememberRequest,
 )
 from mindbridge.core import JobState, MediaKind, MemoryType, SensorKind
-from mindbridge.sdk import MindBridge
+from mindbridge.sdk import MindBridge, MindBridgeError
+
+T = TypeVar("T")
+R = TypeVar("R")
 
 OPTION_LABELS = tuple("ABCDEFGHIJ")
+# The Worker retries a transient failure with `retry_backoff_max=300`, and that redelivery is the
+# only thing that moves a failed row. Twice it leaves room for the claim that follows.
+_FAILED_GRACE_SECONDS = 2 * 300.0
 _ALLOWED_RESPONSE_WORDS = re.compile(
     r"\b(?:answer|best|choice|choices|from|is|option|options|order|rank|ranking|to|worst)\b",
     re.IGNORECASE,
@@ -120,16 +128,22 @@ async def ingest_prepared_video(
     request_concurrency: int,
     poll_interval_seconds: float,
     processing_timeout_seconds: float,
-) -> None:
-    """Ingest one prepared video through the public observation contracts."""
+) -> int:
+    """Ingest one prepared video through the public observation contracts.
+
+    Returns the number of segments that failed, which every question over this video then
+    carries: both callers ingest the whole video before answering anything, so a question that
+    reads a non-zero count is a question asked over incomplete memory.
+    """
     if request_concurrency <= 0:
         raise ValueError("request_concurrency must be positive")
     if poll_interval_seconds <= 0 or processing_timeout_seconds <= 0:
         raise ValueError("poll interval and processing timeout must be positive")
     TypeAdapter(Identifier).validate_python(adapter_version)
     semaphore = asyncio.Semaphore(request_concurrency)
+    failures = 0
     for offset in range(0, len(video.segments), request_concurrency):
-        await asyncio.gather(
+        outcomes = await asyncio.gather(
             *(
                 _ingest_prepared_segment(
                     memory,
@@ -146,8 +160,69 @@ async def ingest_prepared_video(
                 for index, segment in enumerate(
                     video.segments[offset : offset + request_concurrency]
                 )
-            )
+            ),
+            return_exceptions=True,
         )
+        failures += _count_ingest_failures(outcomes)
+    return failures
+
+
+def _count_ingest_failures(outcomes: list[BaseException | None]) -> int:
+    """Count the segments that failed so a single bad segment cannot discard its cohort.
+
+    A bare gather made the first exception the whole video's result, cancelling the siblings
+    that had already succeeded: one failed clip out of 130 gated 187 of EgoLifeQA's 198
+    questions. The count is reported with every prediction, so a run still tells missing
+    evidence apart from a wrong answer.
+    """
+    return sum(isinstance(outcome, BaseException) for outcome in outcomes)
+
+
+def settle_answers(
+    questions: Sequence[T],
+    outcomes: Sequence[R | BaseException],
+    failed: Callable[[T, str], R],
+) -> tuple[R, ...]:
+    """Keep one row per question when a member of an answer fan-out raises.
+
+    The ingest fan-outs already survive one bad member; the answer fan-outs did not, so a single
+    recall failure discarded every sibling answer in its cohort -- measured at 65.2% of
+    LoCoMo-Refined's questions and 15 of M3-Bench's. Every question still produces a row and a
+    failed one carries the failure's code, because a shard holding fewer questions than the run
+    loaded, with nothing saying which ones went missing, is the silent truncation this repo has
+    already paid for twice.
+    """
+    settled: list[R] = []
+    for question, outcome in zip(questions, outcomes, strict=True):
+        if not isinstance(outcome, BaseException):
+            settled.append(outcome)
+        elif isinstance(outcome, Exception):
+            settled.append(failed(question, _answer_failure_code(outcome)))
+        else:
+            # Cancellation and interrupts end the whole run; they are not one question's
+            # bad luck, and recording them as an answer would hide a killed run as a scored one.
+            raise outcome
+    return tuple(settled)
+
+
+def answer_failure_trace_id(question_id: str) -> str:
+    """Stand in for the trace a failed answer never received.
+
+    Clipped to the 255-character `Identifier` cap: a validation error raised while building the
+    row that reports a failure would take the cohort down exactly the way the failure itself
+    used to.
+    """
+    return f"trace_answer_error_{question_id}"[:255]
+
+
+def _answer_failure_code(error: Exception) -> str:
+    """Name a failed answer by its API error code, falling back to the exception type.
+
+    Anything reaching here already escaped whatever recoverable-code check the runner applies,
+    so the type name is what a shard has left to distinguish an HTTP transport drop from a
+    contract violation.
+    """
+    return (error.code if isinstance(error, MindBridgeError) else "") or type(error).__name__
 
 
 async def _ingest_prepared_segment(
@@ -232,14 +307,18 @@ async def wait_for_observation_job(
     *,
     poll_interval_seconds: float = 1.0,
     timeout_seconds: float = 1_800.0,
-    failed_grace_seconds: float = 600.0,
+    failed_grace_seconds: float = _FAILED_GRACE_SECONDS,
 ) -> ObservationProcessingJobView:
     """Wait for durable success while allowing failed attempts to be retried.
 
-    `FAILED` is not terminal: the stale-job sweep reclaims it, moving it back to `RUNNING` with a
-    higher `attempt`, and Celery's backoff caps at 300s. So a failure whose attempt never advances
-    is permanent, and polling it to `timeout_seconds` burns that budget per observation while
-    discarding the `error_code` that says why. Give up early and report the code instead.
+    `FAILED` is not terminal while Celery still intends to retry: the claim predicate accepts a
+    failed row, so the redelivery re-claims it and `attempt` advances. Nothing else moves it --
+    there is no sweep, and `task_acks_late` discards the message the moment the task raises, so
+    an error class outside the Worker's `autoretry_for` is never redelivered at all. An attempt
+    that has not advanced in twice the retry backoff cap is therefore out of retries or of a
+    class nothing will retry, and polling it to `timeout_seconds` burns that budget per
+    observation while discarding the `error_code` that says why. Give up early and report the
+    code instead.
     """
     if poll_interval_seconds <= 0 or timeout_seconds <= 0 or failed_grace_seconds <= 0:
         raise ValueError("poll interval, timeout, and failed grace must be positive")

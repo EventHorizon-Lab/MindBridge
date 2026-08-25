@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from datetime import datetime
+from decimal import Decimal
 from typing import TypeAlias, cast
 
 from psycopg.types.json import Jsonb
@@ -26,9 +28,26 @@ from mindbridge.infrastructure._postgres_types import (
     PostgresStoreOperations,
     tenant_connection,
 )
+from mindbridge.telemetry import model_token_usage
 
 PROCESS_OBSERVATION_JOB_TYPE = "process_observation"
-OBSERVATION_JOB_STALE_AFTER_SECONDS = 960
+OBSERVATION_JOB_STALE_AFTER_SECONDS = 2_400
+"""How long a `running` row may go unchanged before another delivery may claim it.
+
+Nothing refreshes `updated_at` during an attempt, so this window is measured against the
+longest attempt the deployment permits, not against a typical one. That length is the Worker's
+own task budget -- the generator's `request_timeout_seconds` plus 300 s, so 2 100 s for the
+bundled 1 800 s generator -- plus the 60 s hard-limit margin and the 120 s the broker adds on
+top of it before it re-delivers. At the previous 960 s a healthy attempt was declared abandoned
+at 16 minutes while its worker was still paying for it: the 2026-08-24 evaluation measured p50
+work of 626.8 s per observation under nine producers, so slow-but-alive rows were routinely
+reclaimable, and every `mindbridge jobs --republish` that touched one bought the same
+observation twice. Nothing can tell a dead worker from a slow one sooner than the longest run a
+live one is allowed, which is why this cannot be tightened to shorten recovery.
+
+Held below `CLIP_RECLAIM_GRACE_SECONDS` (3 600 s), which must stay above it so the orphan-clip
+sweep never robs an attempt this window still considers live.
+"""
 _ERROR_CODE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 JobRow: TypeAlias = tuple[
     str,
@@ -41,6 +60,191 @@ JobRow: TypeAlias = tuple[
     str,
     list[str],
 ]
+_AccountingRow: TypeAlias = tuple[
+    str,
+    int,
+    int,
+    int,
+    int,
+    int,
+    # The durations are `double precision` and the token sums are `SUM(bigint)`, which is
+    # `numeric`, so the two halves arrive as different Python types.
+    float,
+    float,
+    Decimal,
+    Decimal,
+]
+
+
+@dataclass(frozen=True, slots=True)
+class ObservationJobAccounting:
+    """One tenant's share of the ledger: how many jobs, how long they waited, what they cost.
+
+    Both durations are totals over every attempt, matching the token columns beside them, and
+    both include the interval currently open: a pending job's wait so far, and a running job's
+    work so far. That last part is the point of the summary -- it answers "who is consuming the
+    worker", so the attempt actually holding one has to count. `work_seconds` is time a worker
+    spent, not wall time a job existed for; a job that failed twice and succeeded on the third
+    attempt reports all three.
+    """
+
+    tenant_id: TenantId
+    jobs: int
+    pending: int
+    running: int
+    failed: int
+    succeeded: int
+    queue_wait_seconds: float
+    work_seconds: float
+    input_tokens: int
+    output_tokens: int
+
+
+async def tenant_scope_required(connection: DatabaseConnection) -> bool:
+    """Report whether row-level security confines this role to one tenant at a time.
+
+    `jobs` is FORCE ROW LEVEL SECURITY, so a cross-tenant scan by the runtime role returns no
+    rows rather than failing. A repair tool that reads that as "nothing to repair" is worse than
+    one that refuses, which is why both scans below are only offered to a role that can see
+    every tenant, or to a caller that names the one tenant it means.
+    """
+    cursor = await connection.execute(
+        """
+        SELECT current_setting('is_superuser') = 'on'
+               OR EXISTS (
+                   SELECT 1 FROM pg_roles
+                   WHERE rolname = current_user AND rolbypassrls
+               )
+        """
+    )
+    row = await cursor.fetchone()
+    return not cast(tuple[bool], row)[0]
+
+
+async def unreachable_observation_jobs(
+    connection: DatabaseConnection,
+    *,
+    tenant_id: TenantId | None = None,
+    include_failed: bool = False,
+) -> tuple[tuple[TenantId, ObservationId, JobId], ...]:
+    """List the jobs a worker would still accept a claim for, in the order they arrived.
+
+    This is the claim predicate of `claim_observation_processing_job`, read instead of written:
+    a row matching it is work the ledger still owes, whether or not the broker has a message
+    left for it. A stale `running` row is included because that is what a lost worker leaves
+    behind, and `failed` only on request because a deterministic failure republished on a timer
+    is a paid-for loop.
+
+    The join keeps a job whose observation has since been deleted out of the result: the worker
+    would only fail it again.
+    """
+    cursor = await connection.execute(
+        """
+        SELECT job.tenant_id, job.payload ->> 'observation_id', job.job_id
+        FROM jobs AS job
+        JOIN observations AS observation
+          ON observation.tenant_id = job.tenant_id
+         AND observation.observation_id = job.payload ->> 'observation_id'
+        WHERE job.job_type = %s
+          AND (%s::text IS NULL OR job.tenant_id = %s)
+          AND (
+              job.state = 'pending'
+              OR (%s AND job.state = 'failed')
+              OR (
+                  job.state = 'running'
+                  AND job.updated_at <= now() - make_interval(secs => %s)
+              )
+          )
+        ORDER BY job.created_at, job.job_id
+        """,
+        (
+            PROCESS_OBSERVATION_JOB_TYPE,
+            tenant_id,
+            tenant_id,
+            include_failed,
+            OBSERVATION_JOB_STALE_AFTER_SECONDS,
+        ),
+    )
+    return tuple(
+        (TenantId(tenant), ObservationId(observation), JobId(job))
+        for tenant, observation, job in cast(list[tuple[str, str, str]], await cursor.fetchall())
+    )
+
+
+async def observation_job_accounting(
+    connection: DatabaseConnection,
+    *,
+    tenant_id: TenantId | None = None,
+) -> tuple[ObservationJobAccounting, ...]:
+    """Summarize the ledger per tenant, busiest first, from the duration and cost columns.
+
+    Costs come from migration 0022, durations from 0023. The two are read differently on
+    purpose: a token count is only ever charged when an attempt closes, while a duration has
+    an interval still open that has to be added here to mean anything.
+    """
+    cursor = await connection.execute(
+        """
+        SELECT tenant_id,
+               count(*),
+               count(*) FILTER (WHERE state = 'pending'),
+               count(*) FILTER (WHERE state = 'running'),
+               count(*) FILTER (WHERE state = 'failed'),
+               count(*) FILTER (WHERE state = 'succeeded'),
+               COALESCE(SUM(queue_wait_seconds), 0)
+                   -- A job still pending has done all of its waiting and none of it is recorded
+                   -- yet, because nothing has claimed it to close the interval.
+                   + COALESCE(SUM(
+                       CASE WHEN state = 'pending'
+                       THEN EXTRACT(epoch FROM now() - updated_at) ELSE 0 END
+                   ), 0),
+               COALESCE(SUM(work_seconds), 0)
+                   -- And the attempt in flight, which is the one actually holding a worker. Its
+                   -- share is not in `work_seconds` until it closes, so without this the tenant
+                   -- consuming the worker right now contributes nothing and sorts last.
+                   --
+                   -- Capped at the stale window because past it the claim treats the row as
+                   -- reclaimable: whatever held it is gone, and an uncapped term would let a
+                   -- worker that died grow its tenant's total forever and sort every live
+                   -- tenant below a corpse. Observed while writing the reference for this
+                   -- command -- an abandoned test row was reporting 729 seconds of work.
+                   + COALESCE(SUM(
+                       CASE WHEN state = 'running' AND started_at IS NOT NULL
+                       THEN least(
+                           EXTRACT(epoch FROM now() - started_at),
+                           %s::double precision
+                       )
+                       ELSE 0 END
+                   ), 0),
+               COALESCE(SUM(input_tokens), 0),
+               COALESCE(SUM(output_tokens), 0)
+        FROM jobs
+        WHERE job_type = %s AND (%s::text IS NULL OR tenant_id = %s)
+        GROUP BY tenant_id
+        -- 8 is the work time, which is the answer to "who is consuming the worker".
+        ORDER BY 8 DESC, tenant_id
+        """,
+        (
+            OBSERVATION_JOB_STALE_AFTER_SECONDS,
+            PROCESS_OBSERVATION_JOB_TYPE,
+            tenant_id,
+            tenant_id,
+        ),
+    )
+    return tuple(
+        ObservationJobAccounting(
+            tenant_id=TenantId(row[0]),
+            jobs=row[1],
+            pending=row[2],
+            running=row[3],
+            failed=row[4],
+            succeeded=row[5],
+            queue_wait_seconds=float(row[6]),
+            work_seconds=float(row[7]),
+            input_tokens=int(row[8]),
+            output_tokens=int(row[9]),
+        )
+        for row in cast(list[_AccountingRow], await cursor.fetchall())
+    )
 
 
 def observation_processing_job_id(observation: Observation) -> JobId:
@@ -180,6 +384,11 @@ async def _finish_observation_processing_job_on_connection(
     memory_ids: tuple[MemoryId, ...] | None = None,
 ) -> ObservationProcessingJob:
     _require_expected_job_id(observation_id, job_id)
+    # Whatever the models charged while this attempt ran. The account belongs to the operation
+    # that spent it -- `mindbridge.process_observation` here -- and this is the last moment it
+    # is still open, so it is read rather than passed down through every pipeline in between.
+    # Success and failure both land here, which is the point: a failed attempt was paid for.
+    charged = model_token_usage()
     cursor = await connection.execute(
         """
         UPDATE jobs
@@ -188,6 +397,12 @@ async def _finish_observation_processing_job_on_connection(
                 jsonb_set(payload, '{memory_ids}', %s::jsonb),
                 payload
             ),
+            input_tokens = COALESCE(input_tokens, 0) + %s,
+            output_tokens = COALESCE(output_tokens, 0) + %s,
+            -- Charged on the same principle as the tokens beside it: this attempt's share, added
+            -- as it closes. A failed attempt held the worker as surely as a successful one.
+            work_seconds = COALESCE(work_seconds, 0)
+                + EXTRACT(epoch FROM now() - COALESCE(started_at, updated_at)),
             updated_at = now()
         WHERE tenant_id = %s AND job_id = %s
           AND state = 'running' AND attempt = %s
@@ -200,6 +415,8 @@ async def _finish_observation_processing_job_on_connection(
             state.value,
             error_code,
             Jsonb(list(memory_ids)) if memory_ids is not None else None,
+            charged.get("input", 0),
+            charged.get("output", 0),
             tenant_id,
             job_id,
             attempt,
@@ -288,14 +505,47 @@ class ObservationJobOperations(PostgresStoreOperations):
         observation_id: ObservationId,
         job_id: JobId,
     ) -> ObservationJobClaim:
-        """Atomically claim a ready or stale job without concurrent ownership."""
+        """Atomically claim a ready or stale job without concurrent ownership.
+
+        The claim is also what stamps `started_at`, so the row always separates the wait from
+        the attempt it is currently reporting. A re-claim moves it, because the previous
+        attempt's start describes an attempt the row no longer reports.
+        """
         _require_expected_job_id(observation_id, job_id)
         async with tenant_connection(self._pool, tenant_id) as connection:
             cursor = await connection.execute(
                 """
                 UPDATE jobs
                 SET state = 'running', attempt = attempt + 1,
-                    error_code = NULL, updated_at = now()
+                    error_code = NULL, started_at = now(), updated_at = now(),
+                    -- This attempt's wait, added as it ends rather than derived later: at
+                    -- enqueue `updated_at` equals `created_at`, so on attempt 1 this is the
+                    -- queue wait, and on a retry it is the backoff since the previous attempt
+                    -- closed. `started_at` is overwritten just above, which is exactly why the
+                    -- difference cannot be taken afterwards.
+                    --
+                    -- A stale `running` row is the exception: the previous claim stamped
+                    -- `started_at` and `updated_at` in one statement, so the interval since
+                    -- `updated_at` is the abandoned attempt itself. Charging it here would bill
+                    -- the same seconds to both columns and call time spent running a wait.
+                    queue_wait_seconds = CASE
+                        WHEN state = 'running' THEN COALESCE(queue_wait_seconds, 0)
+                        ELSE COALESCE(queue_wait_seconds, 0)
+                            + EXTRACT(epoch FROM now() - updated_at)
+                    END,
+                    -- A reclaimed stale attempt is abandoned mid-flight and never reaches the
+                    -- completion path, so its work would otherwise go uncharged. Capped at the
+                    -- stale window on the same reasoning the reader uses for the open interval:
+                    -- past it whatever held the row is gone, and this write is permanent, so an
+                    -- uncapped charge would sort every live tenant below a dead worker forever.
+                    work_seconds = CASE
+                        WHEN state = 'running' AND started_at IS NOT NULL
+                        THEN COALESCE(work_seconds, 0) + least(
+                            EXTRACT(epoch FROM now() - started_at),
+                            %s::double precision
+                        )
+                        ELSE COALESCE(work_seconds, 0)
+                    END
                 WHERE tenant_id = %s AND job_id = %s
                   AND job_type = %s AND payload ->> 'observation_id' = %s
                   AND (
@@ -310,6 +560,7 @@ class ObservationJobOperations(PostgresStoreOperations):
                           COALESCE(payload -> 'memory_ids', '[]'::jsonb)
                 """,
                 (
+                    OBSERVATION_JOB_STALE_AFTER_SECONDS,
                     tenant_id,
                     job_id,
                     PROCESS_OBSERVATION_JOB_TYPE,

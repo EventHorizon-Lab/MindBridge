@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from typing import TypeAlias, cast
 
@@ -92,6 +93,7 @@ from mindbridge.core import (
     VerificationStatus,
     derive_stable_id,
 )
+from mindbridge.infrastructure._postgres_jobs import OBSERVATION_JOB_STALE_AFTER_SECONDS
 from mindbridge.infrastructure.postgres import PostgresMemoryStore
 from mindbridge.media.clipping import ClipRequest, MediaClip, audio_windows
 from mindbridge.models import (
@@ -104,9 +106,7 @@ from mindbridge.models import (
 
 NOW = datetime.now(timezone.utc).replace(microsecond=0)
 MODEL = ModelReference(model_id="qwen3.8-max")
-EMBEDDING_MODEL = ModelReference(
-    model_id="jinaai/jina-embeddings-v5-omni-small-retrieval",
-)
+EMBEDDING_MODEL = ModelReference(model_id="jinaai/jina-embeddings-v5-omni-small-retrieval")
 DerivedCounts: TypeAlias = tuple[int, int, int, int, int, int, int, int, int, int, int]
 
 pytestmark = pytest.mark.integration
@@ -164,6 +164,31 @@ class RecordingPerceiver:
         )
 
 
+class ShortEventPerceiver(RecordingPerceiver):
+    """One event too short to sample twice, which is what the clip floor has to widen."""
+
+    async def perceive_events(
+        self,
+        observation: Observation,
+        evidence: tuple[ResolvedEvidence, ...],
+    ) -> EventPerception:
+        perception = await super().perceive_events(observation, evidence)
+        event = perception.events[0]
+        return replace(
+            perception,
+            events=(
+                replace(
+                    event,
+                    start_ms=500,
+                    end_ms=700,
+                    claims=tuple(
+                        replace(claim, valid_from_ms=500, valid_to_ms=700) for claim in event.claims
+                    ),
+                ),
+            ),
+        )
+
+
 class FixedEmbedder:
     """Emit a deterministic unit vector in a configured model dimension."""
 
@@ -185,9 +210,7 @@ class FixedEmbedder:
 
 
 class FixedTextEmbedder:
-    model_reference = ModelReference(
-        model_id="jinaai/jina-embeddings-v5-omni-small-retrieval",
-    )
+    model_reference = ModelReference(model_id="jinaai/jina-embeddings-v5-omni-small-retrieval")
     space_reference = EmbeddingSpaceReference(space_id="jina-v5")
 
     def __init__(self, dimension: int = 1_024) -> None:
@@ -307,7 +330,11 @@ class CoordinatedSummaryConsolidator(RecordingSummaryConsolidator):
         if self.calls == 2:
             self._ready.set()
         await asyncio.wait_for(self._ready.wait(), timeout=2)
-        return consolidation
+        return SummaryConsolidation(
+            summaries=consolidation.summaries,
+            model_reference=ModelReference(model_id="qwen3.8-max"),
+            prompt_version=consolidation.prompt_version,
+        )
 
 
 class DeterministicSigner:
@@ -406,6 +433,9 @@ async def test_processing_commits_provenance_once(
         "red tool",
         "blue toolbox",
     )
+    # Seven vectors, not five: one evidence span, one event, one claim, two named entities,
+    # and one per derived memory. The four encoder inputs asserted above are unchanged, because
+    # a memory's vector is the one already computed for the record it represents.
     assert await _derived_counts(database_url, tenant_id) == (
         1,
         1,
@@ -413,7 +443,7 @@ async def test_processing_commits_provenance_once(
         2,
         2,
         8,
-        5,
+        7,
         3,
         3,
         1,
@@ -509,6 +539,121 @@ async def test_processing_commits_provenance_once(
     )
 
 
+async def test_a_widened_clip_window_commits_alongside_the_span_it_covers(
+    store: PostgresMemoryStore,
+    database_url: str,
+) -> None:
+    """A sub-two-second event is cut as a wider clip, and the store has to accept that.
+
+    At 1 fps such an event used to be cut into a one-frame video the encoder refuses outright,
+    which failed the whole observation 72 times across 105 observations on 2026-08-21. The clip
+    now covers two sampling intervals, so its window is wider than the span it belongs to -- a
+    shape only the real adapter can confirm, since nothing in the fake store carries the
+    constraints that decide it.
+    """
+    tenant_id, observation_id, job_id = await _write_source_observation(store, "tenant_short_event")
+    job = await ProcessObservation(
+        store,
+        ShortEventPerceiver(),
+        FixedEmbedder(),
+        FixedTextEmbedder(),
+        media_url_signer=DeterministicSigner(),
+        clip_cutter=stub_cut,
+        proxy_cutter=stub_proxy_cut,
+    ).run(tenant_id, observation_id, job_id)
+
+    assert job.state is JobState.SUCCEEDED
+    connection = await AsyncConnection.connect(database_url)
+    async with connection:
+        windows = await (
+            await connection.execute(
+                "SELECT clip.start_ms, clip.end_ms, span.start_ms, span.end_ms "
+                "FROM evidence_clips AS clip "
+                "JOIN evidence_spans AS span ON span.tenant_id = clip.tenant_id "
+                "AND span.evidence_id = clip.evidence_id "
+                "WHERE clip.tenant_id = %s",
+                (tenant_id,),
+            )
+        ).fetchall()
+
+    assert windows == [(0, 2_000, 500, 700)]
+
+
+async def test_a_span_cut_into_several_windows_falls_back_to_its_whole_source(
+    store: PostgresMemoryStore,
+    database_url: str,
+) -> None:
+    """A span is not always one clip. `cut_clips` splits audio at `AUDIO_WINDOW_MS`, so a 70 s
+    audio span is stored as three ordinals, and substituting the lowest hands the answer model
+    the first 30 seconds of a span the recall may have matched on a later window -- with nothing
+    in the result saying a tail is missing. The complete source is the honest fallback.
+
+    Not reachable from the evaluation corpus, which is why it needs a test rather than a metric:
+    all 3,285 of its evidence spans were video and every one had a single ordinal.
+    """
+    tenant_id = TenantId("tenant_clip_windows")
+    connection = await AsyncConnection.connect(database_url, autocommit=True)
+    async with connection:
+        await connection.execute("DELETE FROM observations WHERE tenant_id = %s", (tenant_id,))
+        await connection.execute(
+            "INSERT INTO observations (tenant_id, observation_id, device_id, boot_id, sequence,"
+            " sensor, occurred_at, ended_at, observed_at, clock_offset_ms, content_digest)"
+            " VALUES (%s, 'observation_win', 'd', 'b', 1, 'microphone', %s, %s, %s, 0, %s)",
+            (tenant_id, NOW, NOW, NOW, "a" * 64),
+        )
+        for index, media_object_id in enumerate(
+            ("media_src", "media_win_0", "media_win_1", "media_win_2", "media_whole"), start=1
+        ):
+            await connection.execute(
+                "INSERT INTO media_objects (tenant_id, media_object_id, kind, uri, sha256,"
+                " size_bytes, created_at, derived_from_media_object_id)"
+                " VALUES (%s, %s, 'audio', %s, %s, 1024, %s, %s)",
+                (
+                    tenant_id,
+                    media_object_id,
+                    f"s3://bucket/{media_object_id}.m4a",
+                    str(index) * 64,
+                    NOW,
+                    None if media_object_id == "media_src" else "media_src",
+                ),
+            )
+        for evidence_id, end_ms in (("evidence_long", 70_000), ("evidence_short", 20_000)):
+            await connection.execute(
+                "INSERT INTO evidence_spans (tenant_id, evidence_id, observation_id,"
+                " media_object_id, start_ms, end_ms, created_at)"
+                " VALUES (%s, %s, 'observation_win', 'media_src', 0, %s, %s)",
+                (tenant_id, evidence_id, end_ms, NOW),
+            )
+        # The 70 s span as the write path would store it: three windows of 30/30/10.
+        for ordinal, (clip_media, start_ms, end_ms) in enumerate(
+            (
+                ("media_win_0", 0, 30_000),
+                ("media_win_1", 30_000, 60_000),
+                ("media_win_2", 60_000, 70_000),
+            )
+        ):
+            await connection.execute(
+                "INSERT INTO evidence_clips (tenant_id, evidence_id, ordinal, media_object_id,"
+                " start_ms, end_ms, created_at) VALUES (%s, 'evidence_long', %s, %s, %s, %s, %s)",
+                (tenant_id, ordinal, clip_media, start_ms, end_ms, NOW),
+            )
+        await connection.execute(
+            "INSERT INTO evidence_clips (tenant_id, evidence_id, ordinal, media_object_id,"
+            " start_ms, end_ms, created_at)"
+            " VALUES (%s, 'evidence_short', 0, 'media_whole', 0, 20000, %s)",
+            (tenant_id, NOW),
+        )
+
+    attached = await store.read_evidence_clip_media(
+        tenant_id, (EvidenceId("evidence_long"), EvidenceId("evidence_short"))
+    )
+
+    # The span one clip covers is substituted; the span three cover is absent, and an absent
+    # entry is what makes `resolve_evidence_media` attach the source instead.
+    assert set(attached) == {EvidenceId("evidence_short")}
+    assert attached[EvidenceId("evidence_short")].media_object_id == MediaObjectId("media_whole")
+
+
 async def test_processing_rolls_back_derived_records_before_retry(
     store: PostgresMemoryStore,
     database_url: str,
@@ -549,6 +694,9 @@ async def test_processing_rolls_back_derived_records_before_retry(
 
     assert succeeded.state is JobState.SUCCEEDED
     assert succeeded.attempt == 2
+    # Seven vectors, not five: one evidence span, one event, one claim, two named entities,
+    # and one per derived memory. The four encoder inputs asserted above are unchanged, because
+    # a memory's vector is the one already computed for the record it represents.
     assert await _derived_counts(database_url, tenant_id) == (
         1,
         1,
@@ -556,7 +704,7 @@ async def test_processing_rolls_back_derived_records_before_retry(
         2,
         2,
         8,
-        5,
+        7,
         3,
         3,
         1,
@@ -1157,22 +1305,33 @@ async def test_summary_consolidation_is_atomic_recallable_and_retry_safe(
         tuple(MemoryId(match.object_id) for match in matches),
         limit=20,
     )
-    assert [memory.summary for memory in strict_memories] == [
-        "Across the session, a person kept a red tool beside a blue toolbox."
-    ]
+    # This channel used to hold the consolidated summary and nothing else, because `observe()`
+    # wrote no vector for the memories it derived -- so a direct memory lookup could not reach
+    # a single thing the two observations recorded. All five are reachable now: the summary,
+    # plus the event and claim memory from each observation.
+    session_summary = "Across the session, a person kept a red tool beside a blue toolbox."
+    assert sorted(memory.summary for memory in strict_memories) == sorted(
+        [
+            session_summary,
+            "A person places a red tool beside a blue toolbox.",
+            "A person places a red tool beside a blue toolbox.",
+            "The red tool is beside the blue toolbox.",
+            "The red tool is beside the blue toolbox.",
+        ]
+    )
     expanded_memories = await store.search_memories_by_hierarchy(
         RecallRequest(tenant_id=tenant_id, query=RecallQuery(text="repair session")),
         tuple(MemoryId(match.object_id) for match in matches),
         limit=20,
     )
-    assert expanded_memories[0].memory_id == strict_memories[0].memory_id
+    assert expanded_memories[0].summary == session_summary
     assert len(expanded_memories) == 5
     assert {memory.summary for memory in expanded_memories[1:]} == {
         "A person places a red tool beside a blue toolbox.",
         "The red tool is beside the blue toolbox.",
     }
 
-    first_summary_id = strict_memories[0].memory_id
+    first_summary_id = expanded_memories[0].memory_id
     source_memory_ids = tuple(memory.memory_id for memory in expanded_memories[1:])
     bounded_roots = await store.search_memories_by_hierarchy(
         RecallRequest(tenant_id=tenant_id, query=RecallQuery(text="red tool")),
@@ -1226,8 +1385,14 @@ async def test_summary_consolidation_is_atomic_recallable_and_retry_safe(
             limit=20,
         )
     )
-    assert len(rebuilt_matches) == 1
-    rebuilt_summary_id = MemoryId(rebuilt_matches[0].object_id)
+    # The four observation-derived memories keep their own vectors through a summary rebuild,
+    # so the rebuilt summary is the one match that is not one of them.
+    rebuilt_summary_ids = {MemoryId(match.object_id) for match in rebuilt_matches} - set(
+        source_memory_ids
+    )
+    assert len(rebuilt_matches) == len(source_memory_ids) + 1
+    assert len(rebuilt_summary_ids) == 1
+    rebuilt_summary_id = next(iter(rebuilt_summary_ids))
 
     await _forget_memory(
         store,
@@ -1328,9 +1493,7 @@ async def _write_source_observation(
                     start_ms=250,
                     end_ms=2_000,
                     confidence=0.97,
-                    model_reference=ModelReference(
-                        model_id="insightface/buffalo_l",
-                    ),
+                    model_reference=ModelReference(model_id="insightface/buffalo_l"),
                 ),
             )
             if include_identity
@@ -1379,15 +1542,12 @@ def _episode_consolidation(events: tuple[Event, ...]) -> EpisodeConsolidation:
                 salience=0.9,
             ),
         ),
-        model_reference=ModelReference(
-            model_id="qwen3.8-max",
-        ),
+        model_reference=ModelReference(model_id="qwen3.8-max"),
         prompt_version="consolidate_episodes_v1",
     )
 
 
 _SEMANTIC_CLAIM_STATEMENT = "Across two observations, the red tool remained beside the toolbox."
-_SESSION_SUMMARY = "Across the session, a person kept a red tool beside a blue toolbox."
 
 
 def _claim_consolidation(candidates: tuple[ClaimCandidate, ...]) -> ClaimConsolidation:
@@ -1408,9 +1568,7 @@ def _claim_consolidation(candidates: tuple[ClaimCandidate, ...]) -> ClaimConsoli
                 target_claim_id=ordered[2].claim.claim_id,
             ),
         ),
-        model_reference=ModelReference(
-            model_id="qwen3.8-max",
-        ),
+        model_reference=ModelReference(model_id="qwen3.8-max"),
         prompt_version="consolidate_claims_v1",
     )
 
@@ -1424,13 +1582,11 @@ def _summary_consolidation(
             SummaryProposal(
                 source_memory_ids=tuple(candidate.memory.memory_id for candidate in candidates),
                 scope=SummaryScope.SESSION,
-                summary=_SESSION_SUMMARY,
+                summary="Across the session, a person kept a red tool beside a blue toolbox.",
                 salience=0.9,
             ),
         ),
-        model_reference=ModelReference(
-            model_id="qwen3.8-max",
-        ),
+        model_reference=ModelReference(model_id="qwen3.8-max"),
         prompt_version="consolidate_summaries_v1",
     )
 
@@ -1563,7 +1719,13 @@ async def _semantic_claim_counts(
                     (SELECT count(*) FROM semantic_claim),
                     (SELECT count(*) FROM memory_records AS memory
                      WHERE memory.tenant_id = %s
-                       AND memory.summary = %s),
+                       AND memory.memory_id IN (
+                           SELECT relation.target_id FROM relations AS relation
+                           WHERE relation.tenant_id = memory.tenant_id
+                             AND relation.source_type = 'claim'
+                             AND relation.relation_type = 'represented_by'
+                             AND relation.source_id IN (SELECT claim_id FROM semantic_claim)
+                       )),
                     (SELECT count(*) FROM claim_evidence AS link
                      WHERE link.tenant_id = %s
                        AND link.claim_id IN (SELECT claim_id FROM semantic_claim)),
@@ -1575,7 +1737,7 @@ async def _semantic_claim_counts(
                      WHERE relation.tenant_id = %s
                        AND relation.relation_type = 'supersedes')
                 """,
-                (tenant_id, tenant_id, _SEMANTIC_CLAIM_STATEMENT, *((tenant_id,) * 3)),
+                (tenant_id,) * 5,
             )
         ).fetchone()
     return cast(tuple[int, int, int, int, int], row)
@@ -1592,7 +1754,8 @@ async def _summary_counts(
                 """
                 WITH summary AS (
                     SELECT memory_id FROM memory_records
-                    WHERE tenant_id = %s AND summary = %s
+                    WHERE tenant_id = %s
+                      AND memory_id LIKE 'summary-memory%%'
                 )
                 SELECT
                     (SELECT count(*) FROM summary),
@@ -1610,7 +1773,7 @@ async def _summary_counts(
                        AND embedding.object_type = 'memory_record'
                        AND embedding.object_id IN (SELECT memory_id FROM summary))
                 """,
-                (tenant_id, _SESSION_SUMMARY, *((tenant_id,) * 3)),
+                (tenant_id,) * 4,
             )
         ).fetchone()
     return cast(tuple[int, int, int, int], row)
@@ -1657,12 +1820,24 @@ async def _age_running_job(
 ) -> None:
     connection = await AsyncConnection.connect(database_url)
     async with connection:
+        # `created_at` moves with it: a row whose last update precedes its own creation is one
+        # no writer can produce, and `ObservationProcessingJob` rejects it on the read path --
+        # so a fixture shaped that way fails an unacquired claim with an invariant error rather
+        # than the behaviour under test. The interval is read from the window itself, because a
+        # literal here stops ageing the row the moment that constant moves.
         await connection.execute(
             """
-            UPDATE jobs SET updated_at = now() - interval '961 seconds'
+            UPDATE jobs
+            SET created_at = created_at - make_interval(secs => %s),
+                updated_at = now() - make_interval(secs => %s)
             WHERE tenant_id = %s AND job_id = %s
             """,
-            (tenant_id, job_id),
+            (
+                OBSERVATION_JOB_STALE_AFTER_SECONDS + 1,
+                OBSERVATION_JOB_STALE_AFTER_SECONDS + 1,
+                tenant_id,
+                job_id,
+            ),
         )
 
 

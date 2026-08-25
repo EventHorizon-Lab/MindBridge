@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+from functools import partial
 from importlib import import_module
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -13,9 +14,11 @@ from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, TypeAdapter, m
 from mindbridge.benchmarks.prompts import VIDEO_MME_QUERY_PROMPT
 from mindbridge.benchmarks.runtime import (
     PreparedVideo,
+    answer_failure_trace_id,
     benchmark_tenant_id,
     ingest_prepared_video,
     prepared_video_end,
+    settle_answers,
 )
 from mindbridge.contracts import (
     ContractModel,
@@ -100,6 +103,10 @@ class VideoMMEQuestionResult(ContractModel):
     mindbridge_evidence_ids: tuple[Identifier, ...]
     mindbridge_trace_id: Identifier
     mindbridge_error_code: NonEmptyString | None = None
+    # Every question over one video carries the same count, unlike the per-cutoff counts in the
+    # runners that ingest and answer in interleaved cohorts: this runner ingests the whole video
+    # before answering anything, so any failed segment is missing from every answer here.
+    mindbridge_ingest_failure_count: int = Field(default=0, ge=0)
 
 
 class VideoMMEVideoResult(ContractModel):
@@ -173,7 +180,7 @@ def load_video_mme(annotation_path: Path) -> tuple[VideoMMEVideo, ...]:
         if error.name is not None and not error.name.startswith("pyarrow"):
             raise
         raise RuntimeError(
-            "Video-MME Parquet support requires `uv sync --group benchmarks`"
+            "Video-MME Parquet support requires `uv sync --extra benchmarks`"
         ) from error
     rows = TypeAdapter(list[_RawQuestion]).validate_python(
         parquet.read_table(annotation_path).to_pylist()
@@ -214,7 +221,7 @@ async def run_video_mme_video(
     if poll_interval_seconds <= 0 or processing_timeout_seconds <= 0:
         raise ValueError("poll interval and processing timeout must be positive")
     tenant_id = benchmark_tenant_id(tenant_prefix, annotation.video_id, run_id)
-    await ingest_prepared_video(
+    ingest_failures = await ingest_prepared_video(
         memory,
         tenant_id,
         device_id,
@@ -229,12 +236,25 @@ async def run_video_mme_video(
     answers: list[VideoMMEQuestionResult] = []
     cutoff = prepared_video_end(prepared)
     for offset in range(0, len(annotation.questions), request_concurrency):
-        answers.extend(
-            await asyncio.gather(
-                *(
-                    _answer_question(memory, tenant_id, question, cutoff, recall_limit, semaphore)
-                    for question in annotation.questions[offset : offset + request_concurrency]
+        cohort = annotation.questions[offset : offset + request_concurrency]
+        answered = await asyncio.gather(
+            *(
+                _answer_question(
+                    memory,
+                    tenant_id,
+                    question,
+                    cutoff,
+                    recall_limit,
+                    semaphore,
+                    ingest_failures,
                 )
+                for question in cohort
+            ),
+            return_exceptions=True,
+        )
+        answers.extend(
+            settle_answers(
+                cohort, answered, partial(_failed_result, ingest_failures=ingest_failures)
             )
         )
     return VideoMMEVideoResult(
@@ -337,6 +357,7 @@ async def _answer_question(
     cutoff: AwareDatetime,
     recall_limit: int,
     semaphore: asyncio.Semaphore,
+    ingest_failures: int,
 ) -> VideoMMEQuestionResult:
     query = VIDEO_MME_QUERY_PROMPT.text.format(
         question=question.question,
@@ -363,6 +384,7 @@ async def _answer_question(
             evidence_ids=(),
             trace_id=error.trace_id or f"trace_model_error_{question.question_id}",
             error_code=error.code,
+            ingest_failures=ingest_failures,
         )
     return _question_result(
         question,
@@ -371,6 +393,26 @@ async def _answer_question(
         memory_ids=tuple(item.memory_id for item in result.memories),
         evidence_ids=tuple(item.evidence_id for item in result.evidence),
         trace_id=result.trace_id,
+        ingest_failures=ingest_failures,
+    )
+
+
+def _failed_result(
+    question: VideoMMEQuestion,
+    error_code: str,
+    *,
+    ingest_failures: int,
+) -> VideoMMEQuestionResult:
+    """One row for a question whose recall raised, so its cohort still answers all of them."""
+    return _question_result(
+        question,
+        model_answer="",
+        confidence=0.0,
+        memory_ids=(),
+        evidence_ids=(),
+        trace_id=answer_failure_trace_id(question.question_id),
+        error_code=error_code,
+        ingest_failures=ingest_failures,
     )
 
 
@@ -382,6 +424,7 @@ def _question_result(
     memory_ids: tuple[str, ...],
     evidence_ids: tuple[str, ...],
     trace_id: str,
+    ingest_failures: int,
     error_code: str | None = None,
 ) -> VideoMMEQuestionResult:
     option = parse_video_mme_option(model_answer)
@@ -398,4 +441,5 @@ def _question_result(
         mindbridge_evidence_ids=evidence_ids,
         mindbridge_trace_id=trace_id,
         mindbridge_error_code=error_code,
+        mindbridge_ingest_failure_count=ingest_failures,
     )

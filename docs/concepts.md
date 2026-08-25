@@ -227,8 +227,8 @@ encoder that produced it (`model_id`) and the compatibility space it belongs to
 (`MINDBRIDGE_EMBEDDING_SPACE_ID`).
 
 Those are two different facts. Several independently served encoders can write into one
-comparable space; a different encoder may not. Separating them is what allows a re-embedding
-to run while the deployment keeps serving.
+comparable space. Separating them is what allows a re-embedding to run while the deployment keeps
+serving.
 
 The API probes every configured tenant at startup and refuses to serve if one holds vectors the
 configured space cannot reach. Pointing a deployment at a new embedder without re-embedding

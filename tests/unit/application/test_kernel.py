@@ -94,6 +94,7 @@ class InMemoryStore:
         self.memories: dict[str, tuple[str, MemoryRecord]] = {}
         self.evidence: dict[EvidenceId, EvidenceSpan] = {}
         self.media_objects: dict[MediaObjectId, MediaObject] = {}
+        self.evidence_clip_media: dict[EvidenceId, MediaObjectId] = {}
         self.embedding_matches: tuple[EmbeddingMatch, ...] = ()
         self.embedding_searches: list[EmbeddingSearch] = []
         self.graph_memories: dict[tuple[EmbeddedObjectType, str], MemoryId] = {}
@@ -372,6 +373,19 @@ class InMemoryStore:
             if media_object_id in self.media_objects
             and self.media_objects[media_object_id].tenant_id == tenant_id
         )
+
+    async def read_evidence_clip_media(
+        self,
+        tenant_id: TenantId,
+        evidence_ids: tuple[EvidenceId, ...],
+    ) -> dict[EvidenceId, MediaObject]:
+        return {
+            evidence_id: self.media_objects[media_object_id]
+            for evidence_id in evidence_ids
+            if (media_object_id := self.evidence_clip_media.get(evidence_id)) is not None
+            and media_object_id in self.media_objects
+            and self.media_objects[media_object_id].tenant_id == tenant_id
+        }
 
     async def read_observation_processing_job(
         self,
@@ -695,6 +709,9 @@ async def test_observe_keeps_only_anonymous_edge_identity_metadata() -> None:
 
     observation = next(iter(store.observations.values()))[1]
     assert observation.identity_observations[0].identity_id == "person_device_01"
+    assert observation.identity_observations[0].model_reference.model_id == (
+        "insightface/buffalo_l"
+    )
 
 
 async def test_observation_job_status_is_tenant_scoped() -> None:
@@ -1887,8 +1904,12 @@ async def test_media_query_is_signed_for_embedding_instead_of_used_as_a_filter()
     assert resolved.media_url.endswith("?signature=1")
     assert answerer.last_evidence[0].media_url.endswith("?signature=2")
     assert answerer.last_query_media[0].media_url.endswith("?signature=3")
-    assert result.evidence[0].media_url.endswith("?signature=4")
-    assert signer.calls == 4
+    # Three signings, not four: the response hands back the evidence read the answer round
+    # already paid for, because it cites the same spans. Re-reading it signed the same object
+    # a fourth time to shave the recall's own duration off a 35-minute URL lifetime, and cost
+    # a second full resolution -- three pooled queries and one presign per distinct object.
+    assert result.evidence[0].media_url == answerer.last_evidence[0].media_url
+    assert signer.calls == 3
     assert result.memories[0].evidence_ids == (evidence_id,)
 
 

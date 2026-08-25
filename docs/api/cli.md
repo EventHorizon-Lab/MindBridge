@@ -17,15 +17,15 @@ uv run --extra server mindbridge lifecycle --help
 
 | Command | Subcommands |
 | --- | --- |
-| `mindbridge` | `consolidate`, `lifecycle`, `mcp`, `edge sync` |
-| `mindbridge-bench` | `locomo-refined`, `m3`, `egolife`, `egomem`, `egotempo`, `memlens`, `mm-lifelong`, `supermemory`, `video-mme`, `aml` |
+| `mindbridge` | `config check`, `consolidate`, `jobs`, `lifecycle`, `mcp`, `jina serve`, `edge sync` |
+| `mindbridge-bench` | `locomo-refined`, `m3`, `egolife`, `egomem`, `egotempo`, `memlens`, `mm-lifelong`, `supermemory`, `video-mme`, `video-mme-v2`, `aml` |
 | `mindbridge-bench` support | `score`, `datasets`, `jina`, `bakeoff` |
 
 `mindbridge-consolidate`, `mindbridge-lifecycle`, and `mindbridge-mcp` remain as aliases for the
 subcommands of the same name. They route through the same module and report the same codes.
 
-The API and the memory worker are long-running processes started by `uvicorn` and `celery`, not
-subcommands. See [deployment](../deployment.md).
+The API and memory worker are long-running processes started by `uvicorn` and `celery`. The Jina
+embedding service is started by `mindbridge jina serve`. See [deployment](../deployment.md).
 
 ## The shared contract
 
@@ -61,6 +61,31 @@ and names the extra to install rather than printing frames from a missing third-
 writes nothing at all.
 
 ---
+
+## `mindbridge config check`
+
+Reports whether one role's configuration is complete, before that role is started.
+
+```bash
+mindbridge config check --role api
+```
+
+`--role` is required and takes one of `api`, `mcp`, `worker`, `consolidate`, `lifecycle`, or
+`edge-sync` — the six columns of the matrix in [configuration](../configuration.md).
+
+Every missing setting is reported in one pass. Starting a process fails on the first one, so an
+operator missing nine discovered them one restart at a time; this asks the role's own settings
+class what it requires and walks the whole list. Each resolved setting is reported with the
+source that won, `environment` or `mindbridge.toml`.
+
+**No value is ever printed.** A credential is reported as present or missing and nothing more,
+because the same code path handles credentials and structure. If settings are missing and a
+`.env` file is present in the working directory, the report says so — nothing in MindBridge loads
+`.env`, and `uv run --env-file .env` is the usual omission.
+
+Exit status is 0 when the role is ready and 1 when it is not, so a deployment script can gate on
+it. This command is in the core install: it has to run before any extra is present, which is the
+state an operator reaches for it from. A role whose settings class needs an extra says which one.
 
 ## `mindbridge consolidate`
 
@@ -112,6 +137,140 @@ happens. Widening it carries identical risk for much less value.
 
 **Environment:** `MINDBRIDGE_DATABASE_URL` (required), the object-storage variables (source AV
 the generator inspects), and the generator and embedder variables.
+
+---
+
+## `mindbridge jobs`
+
+Reports the observation job ledger against the broker, and repairs the difference. Requires
+`--extra server`.
+
+```bash
+uv run --extra server mindbridge jobs --tenant-id tenant_01
+```
+
+PostgreSQL is the authority for job state; the broker only carries the ID of work already
+recorded there. The two drift apart silently, in both directions. `task_acks_late=True` acks a
+message the moment its task raises, so any exception outside the worker's `autoretry_for` throws
+the message away while the row stays claimable — 479 `torch.OutOfMemoryError` did exactly that
+during one evaluation, leaving rows no worker would ever be told about again. Republishing from
+the ledger repairs any such divergence rather than one exception class at a time.
+
+**Reporting is the default, because republishing spends money:** every message that lands runs a
+generator. `--republish` is the flag that acts.
+
+| Flag | Default | Purpose |
+| --- | --- | --- |
+| `--tenant-id` | all tenants | Restrict the report and the repair to one tenant. Required when row-level security confines the role's reads — see below. |
+| `--include-failed` | off | Also count and republish `failed` rows. |
+| `--republish` | off | Publish one message per claimable row the queue cannot already hold, oldest observation first — `--tenant-id` changes that bound, below. |
+
+`--include-failed` is off because a deterministic failure republished on a timer pays for the
+same rejection every time. A row is *claimable* when a worker would still accept a claim for it:
+`pending`, stale `running` (what a lost worker leaves behind), and `failed` only when asked — and
+its observation still exists, because a job whose observation was deleted would only fail again.
+That last condition is why a tenant can report `pending: 5` with `claimable: 0`.
+
+**Across the whole ledger, `--republish` publishes at most `claimable - queue_depth` rows.** The
+ledger knows a row is owed work but cannot know whether a message for it survives, and no broker
+answers that per message; the count does, since the queue carries this job type and nothing else.
+Without the bound, a `--republish` against a healthy deep backlog duplicates every queued
+message — and a duplicate is not a no-op: the delivery that loses the claim gets `RUNNING` and then
+re-queues itself every 30 seconds up to 40 times waiting for the winner. Oldest first, because the
+messages still queued are the most recently published, so the rows whose message is gone are the
+oldest.
+
+**With `--tenant-id`, nothing is subtracted and every claimable row is published.** That
+subtraction sets one tenant's rows against a queue carrying every tenant's messages: five messages
+for another tenant would cancel five stranded rows for this one and publish nothing at all. The
+missing term cannot be recovered, because no transport counts a queue per tenant without reading
+each message off it. The two mistakes also cost differently — a duplicate costs broker round trips
+and stops on its own, while a strand costs the work until someone notices it a second time. So on a
+deep queue, read `queue_depth` before repairing one tenant: it belongs to the whole queue, and the
+messages it counts for this tenant will be duplicated.
+
+**Scope is not optional under row-level security.** `jobs` is `FORCE ROW LEVEL SECURITY`, so a
+cross-tenant scan by a confined role returns no rows rather than failing — and a repair tool that
+reads that as "nothing to repair" is worse than one that refuses. Without `--tenant-id` the
+command requires a role that can see every tenant.
+
+### What the report means
+
+```json
+{
+  "queue": "mindbridge",
+  "queue_depth": 0,
+  "claimable": 0,
+  "withheld": 0,
+  "include_failed": false,
+  "republished": 0,
+  "tenants": [
+    {
+      "tenant_id": "tenant_01",
+      "jobs": 1,
+      "pending": 0,
+      "running": 0,
+      "failed": 0,
+      "succeeded": 1,
+      "queue_wait_seconds": 0.005,
+      "work_seconds": 0.404,
+      "input_tokens": 0,
+      "output_tokens": 0
+    }
+  ]
+}
+```
+
+`queue` names the queue family the worker consumes, `task_default_queue` — **`mindbridge`, not
+`celery`**. Looking at the wrong queue is how one investigation concluded the queue had been
+destroyed. Observations are published across a shard set (`mindbridge` plus `mindbridge.0` …
+`mindbridge.7`), all of which a worker started **without `-Q`** consumes; `queue_depth` is the
+sum across the whole set, so it will not match `LLEN mindbridge` on its own.
+
+`queue_depth` is read *before* any repair, so it describes what was found, and `withheld` below
+is decided against that pre-repair number. A republished job no longer waits behind the backlog:
+repair publishes at the priority the transport drains first, so it is served ahead of fresh work
+on every shard. Before that split, six republishes of one job across 84 minutes moved its attempt
+count not at all, because every one of them landed behind the same backlog.
+
+`withheld` is how many claimable rows the repair treated as already carried by the queue:
+`min(claimable, queue_depth)` across the ledger, and `0` under `--tenant-id`. `claimable - withheld`
+is what `--republish` publishes, so a repair that published less than it found says so in the
+report rather than leaving the difference to be inferred.
+
+`tenants` is ordered by `work_seconds`, descending — the summary exists to answer *who is
+consuming the worker*.
+
+| Field | Meaning |
+| --- | --- |
+| `jobs`, `pending`, `running`, `failed`, `succeeded` | Row counts by state. |
+| `queue_wait_seconds` | Total time this tenant's jobs spent waiting to be claimed, plus the wait a still-pending job has accrued so far. |
+| `work_seconds` | Total time workers spent on them, **across every attempt**, plus the attempt in flight. |
+| `input_tokens`, `output_tokens` | What the models charged, across every attempt — the generator, plus the embedder when it is a served endpoint rather than a local GPU. |
+
+Four things worth knowing before acting on those numbers:
+
+- **Both durations count every attempt, not the last one.** A job that failed twice and succeeded
+  on the third reports all three, which is what makes them comparable to the token columns beside
+  them — a failed attempt held a worker and was billed as surely as a successful one.
+- **Both include the interval still open.** A pending job's wait so far, and a running job's work
+  so far. Without that, the tenant holding a worker *right now* would contribute nothing to the
+  column the report is sorted by.
+- **An abandoned attempt stops accruing at the stale window** (2 400 s), whether it is still open
+  or has been reclaimed. Past it the claim treats the row as reclaimable, so whatever held it is
+  gone; charging it forever would sort every live tenant below a worker that died. The reclaim
+  charges it to `work_seconds` alone — an abandoned attempt was running, not queued.
+- **`work_seconds` is worker time, not wall time.** A job created an hour ago and processed in two
+  seconds reports two seconds of work and an hour of wait.
+
+The duration and token columns are `null` on a row that last moved before they existed
+(migrations 0022 and 0023), where `0` means measured and that fast. The report does not preserve
+the difference: it sums a tenant's rows, and a `null` contributes nothing, so a tenant whose jobs
+all predate the migrations reports `0` rather than `null`. Read a suspiciously cheap tenant
+against `jobs` — an old ledger, not a fast one.
+
+**Environment:** `MINDBRIDGE_DATABASE_URL` and `MINDBRIDGE_TASK_BROKER_URL`, both required. Read
+from the environment rather than flags so neither reaches a process list or a shell history.
 
 ---
 
@@ -173,6 +332,24 @@ JSON-RPC goes on stdout. Never redirect it. See [MCP tools](mcp.md).
 
 ---
 
+## `mindbridge jina serve`
+
+Serves Jina v5 Omni through SentenceTransformers and an authenticated OpenAI-compatible embedding
+API. Requires `server` and `cloud-models`.
+
+```bash
+export MINDBRIDGE_EMBEDDER_API_KEY=replace-with-at-least-32-random-characters
+uv run --extra server --extra cloud-models mindbridge jina serve --host 0.0.0.0 \
+  --media-origin https://media.example.com
+```
+
+The default port is `8002`; `--device`, `--model-id`, and `--max-concurrency` control the one model
+process. Repeat `--media-origin` for every exact HTTP(S) origin that may serve presigned media;
+remote URLs from any other origin and all redirects are rejected. `/health` is public.
+`/v1/models` and `/v1/embeddings` require the bearer token.
+
+---
+
 ## `mindbridge edge sync`
 
 Drains one edge device's observation outbox once. Suitable for systemd restart and backoff
@@ -228,6 +405,7 @@ uv run mindbridge-bench
 | `mm-lifelong` | — | MM-Lifelong |
 | `supermemory` | — | SuperMemory VQA |
 | `video-mme` | `benchmarks` | Video-MME |
+| `video-mme-v2` | `benchmarks` | Video-MME-v2 |
 | `aml` | — | Agent Memory Leaderboard offline replay |
 
 | Support command | Extra | Purpose |

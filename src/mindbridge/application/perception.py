@@ -23,6 +23,12 @@ MAX_PERCEPTION_ENTITIES = 256
 MAX_PERCEPTION_CLAIMS = 256
 MAX_PERCEIVED_ENTITIES_PER_EVENT = 64
 MAX_PERCEIVED_CLAIMS_PER_EVENT = 64
+MAX_PERCEIVED_COUNT = 10_000
+"""A bound, not a budget: it exists so a placeholder or runaway integer cannot become a memory.
+
+Far above anything one observation window can be counted to, and far below the transcribed
+on-screen numbers -- viewer counts, experience points -- that a claim states as text instead.
+"""
 
 
 def time_ranges_overlap(
@@ -41,10 +47,17 @@ def time_ranges_overlap(
 class ResolvedEvidence:
     """An exact evidence span joined to openable media.
 
-    `media_url` is not always the source object: a deployment may substitute a copy already cut
-    to the sampling a model was going to apply. When it does, the sampling travels with it, so
-    the request can state what the attached bytes are instead of asking the model to resample
-    them at a budget read from an unrelated variable. Both are None for untouched source media.
+    `media_url` is not always the source object: a deployment may substitute a copy cut from it,
+    and `attached_media_object` is that copy when the resolver knows which object it signed. It
+    is None when the request carries `media_object`'s own bytes, and also when a caller swapped
+    in bytes it did not describe -- so a consumer deciding what it is about to send may only draw
+    conclusions from a value that is present.
+
+    `sampled_frames_per_second` and `sampled_max_pixels` state the budget a copy was cut at where
+    the caller knows it, and are None otherwise. They are a description, not a lever: the local
+    embedder path sends nothing but the URL, and the deployment's generation endpoint measurably
+    ignores both (fps 1.0 and 0.5 produced the same 12,282 prompt tokens for one clip). Sending
+    physically smaller bytes is what changes cost, which is what the substitution is for.
     """
 
     evidence_span: EvidenceSpan
@@ -53,14 +66,51 @@ class ResolvedEvidence:
     media_url_expires_at: datetime
     sampled_frames_per_second: float | None = None
     sampled_max_pixels: int | None = None
+    attached_media_object: MediaObject | None = None
 
     def __post_init__(self) -> None:
         if self.evidence_span.tenant_id != self.media_object.tenant_id:
             raise DomainInvariantError("evidence and media tenants must match")
         if self.evidence_span.media_object_id != self.media_object.media_object_id:
             raise DomainInvariantError("evidence must resolve to its referenced media object")
+        if (
+            self.attached_media_object is not None
+            and self.attached_media_object.tenant_id != self.evidence_span.tenant_id
+        ):
+            raise DomainInvariantError("attached media must belong to the evidence tenant")
         require_non_empty(self.media_url, "media_url")
         require_aware_datetime(self.media_url_expires_at, "media_url_expires_at")
+
+
+@dataclass(frozen=True, slots=True)
+class PerceivedCount:
+    """How many distinct instances of one thing a claim's own window contains.
+
+    Typed, because the prose version does not happen. Across the 7 937 claims and 9 189 events
+    the 2026-08-24 evaluation wrote from six video corpora, not one claim said "exactly N": 175
+    claims and 635 event descriptions instead used "multiple", "several", "various" or "a group
+    of" in the exact position a number would answer a counting question, and the 301 claims that
+    do carry a digit carry transcribed on-screen text (a viewer count, an item's name) rather
+    than anything the model counted. The prompt already asked for exact counts in prose over
+    that whole run.
+
+    `subject` is what was counted, not the entity it belongs to: "small monsters" is a group of
+    instances that never becomes a graph entity, and it is exactly what the questions ask about.
+    The interval the count covers is the claim's own `valid_from_ms`/`valid_to_ms`, so an
+    enumeration is a claim about a window rather than a caption with a number bolted on.
+
+    Optional everywhere, and normally absent. A fabricated integer is strictly worse than none,
+    so nothing here rewards filling it in.
+    """
+
+    subject: str
+    value: int
+
+    def __post_init__(self) -> None:
+        if not self.subject.strip():
+            raise DomainInvariantError("perceived count subject must not be empty")
+        if not 0 <= self.value <= MAX_PERCEIVED_COUNT:
+            raise DomainInvariantError("perceived count value is out of range")
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,6 +142,7 @@ class PerceivedClaim:
     valid_from_ms: int
     valid_to_ms: int | None
     entity_indices: tuple[int, ...] = ()
+    exact_count: PerceivedCount | None = None
 
     def __post_init__(self) -> None:
         if not self.statement.strip():

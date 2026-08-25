@@ -34,7 +34,7 @@ from mindbridge.models.openai import OpenAIGenerator, normalize_base_url
 NOW = datetime(2026, 8, 12, 12, 0, tzinfo=timezone.utc)
 
 
-async def test_claim_consolidator_inspects_native_evidence_and_preserves_model_identity() -> None:
+async def test_claim_consolidator_inspects_native_evidence_and_reports_its_model() -> None:
     async def respond(request: httpx.Request) -> httpx.Response:
         payload: dict[str, object] = json.loads(request.content)
         messages = cast(list[dict[str, object]], payload["messages"])
@@ -62,7 +62,7 @@ async def test_claim_consolidator_inspects_native_evidence_and_preserves_model_i
                     }
                 ],
             },
-            fingerprint="claim-serving-01",
+            fingerprint="claim-serving-fingerprint-01",
         )
 
     consolidator = _consolidator(respond)
@@ -78,7 +78,7 @@ async def test_claim_consolidator_inspects_native_evidence_and_preserves_model_i
     )
     assert result.relationships[0].relation_type is RelationType.CONTRADICTS
     assert result.model_reference.model_id == "qwen3.8-max"
-    assert result.prompt_version == "consolidate_claims_v2"
+    assert result.prompt_version == "consolidate_claims_v4"
 
 
 async def test_claim_consolidator_rejects_unknown_and_reversed_relationships() -> None:
@@ -160,7 +160,7 @@ async def test_claim_consolidator_retries_invalid_structure_in_json_mode() -> No
 
     async def respond(request: httpx.Request) -> httpx.Response:
         payload: dict[str, object] = json.loads(request.content)
-        response_formats.append(payload.get("response_format"))
+        response_formats.append(_schema_name(payload))
         return _streaming_response(next(responses))
 
     consolidator = _consolidator(respond)
@@ -170,7 +170,7 @@ async def test_claim_consolidator_retries_invalid_structure_in_json_mode() -> No
         await consolidator.close()
 
     assert result.semantic_claims == ()
-    assert response_formats == [None, {"type": "json_object"}]
+    assert response_formats == ["claim_consolidation", "claim_consolidation"]
 
 
 def _consolidator(
@@ -213,9 +213,7 @@ def _candidates() -> tuple[tuple[ClaimCandidate, ...], tuple[ResolvedEvidence, .
                 valid_from=NOW + timedelta(minutes=index),
                 valid_to=None,
                 created_at=NOW,
-                model_reference=ModelReference(
-                    model_id="qwen3.8-max",
-                ),
+                model_reference=ModelReference(model_id="qwen3.8-max"),
                 prompt_version="perceive_events_v3",
             ),
             entity_ids=(EntityId("person_robot_01"), EntityId("red_tool")),
@@ -267,6 +265,16 @@ def _evidence(index: int, kind: MediaKind) -> ResolvedEvidence:
         media_url=f"https://objects.example.test/clip_{suffix}.{extension}",
         media_url_expires_at=NOW + timedelta(minutes=5),
     )
+
+
+def _schema_name(payload: dict[str, object]) -> str | None:
+    """Return the schema one request constrained decoding to, or None when unconstrained."""
+    response_format = payload.get("response_format")
+    if not isinstance(response_format, dict) or response_format.get("type") != "json_schema":
+        return None
+    schema = cast(dict[str, object], response_format["json_schema"])
+    assert schema["strict"] is True
+    return cast(str, schema["name"])
 
 
 def _streaming_response(payload: object, *, fingerprint: str | None = None) -> httpx.Response:

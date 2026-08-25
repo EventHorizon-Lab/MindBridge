@@ -1,6 +1,7 @@
 """Checks that an evidence clip really covers its span and nothing else."""
 
 import io
+from fractions import Fraction
 
 import pytest
 
@@ -107,6 +108,63 @@ def test_video_clip_applies_the_requested_frame_rate_and_pixel_budget() -> None:
     assert stream.codec_context.width * stream.codec_context.height <= 10_000
 
 
+def test_stored_clip_keeps_the_speech_memory_is_supposed_to_hold() -> None:
+    """The stored clip is what the media embedder encodes and the read path attaches, so a
+    video-only clip deletes speech from memory itself rather than from one model call. Measured
+    on a nine-benchmark evaluation: every derived clip was h264-only while its source carried
+    aac, and no question that depended on hearing could be answered from memory."""
+    import av
+
+    source = _audiovisual_bytes(seconds=6.0, fps=10, width=320, height=240)
+
+    clips = cut_clips(
+        source,
+        ClipRequest(kind=MediaKind.VIDEO, start_ms=2_000, end_ms=5_000, frames_per_second=2.0),
+    )
+
+    with av.open(io.BytesIO(clips[0].content), mode="r") as container:
+        assert len(container.streams.audio) == 1
+        samples = sum(frame.samples for frame in container.decode(container.streams.audio[0]))
+    assert samples > SAMPLE_RATE  # over a second of audio survived the re-encode
+
+
+def test_stored_clip_rebases_speech_onto_its_own_clock() -> None:
+    """Unlike the generation proxy, a stored clip restarts at zero. Audio left on the source's
+    clock would sit `start_ms` past a clip that claims to be three seconds long, and the muxer
+    drops those packets silently -- speech would be present in the encoder and absent in the
+    file."""
+    import av
+
+    source = _audiovisual_bytes(seconds=6.0, fps=10, width=320, height=240)
+
+    clips = cut_clips(
+        source,
+        ClipRequest(kind=MediaKind.VIDEO, start_ms=2_000, end_ms=5_000, frames_per_second=2.0),
+    )
+
+    with av.open(io.BytesIO(clips[0].content), mode="r") as container:
+        video = [frame.time for frame in container.decode(container.streams.video[0])]
+    with av.open(io.BytesIO(clips[0].content), mode="r") as container:
+        audio = [frame.time for frame in container.decode(container.streams.audio[0])]
+    assert video[0] == pytest.approx(0.0, abs=0.2)
+    assert audio[0] == pytest.approx(video[0], abs=0.2)
+    assert audio[-1] == pytest.approx(video[-1], abs=0.5)
+
+
+def test_stored_clip_of_a_silent_source_stays_video_only() -> None:
+    import av
+
+    source = _video_bytes(seconds=3.0, fps=10, width=160, height=120)
+
+    clips = cut_clips(
+        source,
+        ClipRequest(kind=MediaKind.VIDEO, start_ms=0, end_ms=3_000, frames_per_second=1.0),
+    )
+
+    with av.open(io.BytesIO(clips[0].content), mode="r") as container:
+        assert not container.streams.audio
+
+
 def test_generation_proxy_keeps_the_speech_the_model_has_to_hear() -> None:
     """Perception reads this copy instead of the source, so dropping its audio track would
     silently take speech away from every question that depends on what was said."""
@@ -156,10 +214,14 @@ def test_generation_proxy_applies_the_requested_frame_rate_and_pixel_budget() ->
     assert stream.codec_context.width * stream.codec_context.height <= 10_000
 
 
-def test_generation_proxy_refuses_a_span_it_cannot_interleave() -> None:
-    """A sampled video track is sparse next to continuous audio, and past roughly forty frames
-    the MP4 muxer refuses the interleave. It has to raise rather than hand back a file whose
-    audio or video is silently truncated, because the caller's fallback is the source itself."""
+def test_generation_proxy_refuses_a_span_past_its_frame_ceiling() -> None:
+    """Past roughly forty sampled frames the encode fails on the flush that drains the encoder.
+    It has to raise rather than hand back a file whose audio or video is silently truncated,
+    because the caller's fallback is the source itself.
+
+    The cause is not the audio interleave this test used to name -- see
+    `test_dropping_audio_does_not_lift_the_frame_ceiling`, which fails the same way with no
+    audio anywhere."""
     source = _audiovisual_bytes(seconds=60.0, fps=10, width=160, height=120)
 
     with pytest.raises(Exception, match=r"Invalid argument|monotonic"):
@@ -221,6 +283,77 @@ def test_generation_proxy_of_a_silent_source_stays_video_only() -> None:
 
     with av.open(io.BytesIO(proxy.content), mode="r") as container:
         assert not container.streams.audio
+
+
+def test_generation_proxy_drops_audio_when_the_generator_cannot_hear() -> None:
+    """Measured against the evaluation's endpoint, prompt_tokens was identical with and without
+    the track, so a deployment whose generator ignores audio pays an encode and a transfer for
+    bytes nothing reads."""
+    import av
+
+    source = _audiovisual_bytes(seconds=10.0, fps=10, width=160, height=120)
+
+    heard = cut_generation_proxy(
+        source,
+        ClipRequest(kind=MediaKind.VIDEO, start_ms=0, end_ms=10_000, frames_per_second=1.0),
+    )
+    deaf = cut_generation_proxy(
+        source,
+        ClipRequest(
+            kind=MediaKind.VIDEO,
+            start_ms=0,
+            end_ms=10_000,
+            frames_per_second=1.0,
+            include_audio=False,
+        ),
+    )
+
+    with av.open(io.BytesIO(deaf.content), mode="r") as container:
+        assert not container.streams.audio
+        # The picture is untouched: this drops a track, it does not re-sample the video.
+        assert len(list(container.decode(container.streams.video[0]))) >= 8
+    with av.open(io.BytesIO(heard.content), mode="r") as container:
+        assert container.streams.audio
+    assert len(deaf.content) < len(heard.content)
+
+
+def test_dropping_audio_does_not_lift_the_frame_ceiling() -> None:
+    """The ceiling was documented as the MP4 muxer refusing to interleave a sparse video track
+    with continuous audio, which would make audio the thing to give up to cut a longer span.
+    It is not: a silent source cut with `include_audio=False` -- no audio anywhere in the
+    pipeline -- fails at the same frame count an audiovisual one does.
+
+    Pinned as a test because the wrong explanation is the kind that gets acted on: it invites a
+    deployment to disable proxy audio expecting longer spans to start working, and they do not.
+    """
+    silent_source = _video_bytes(seconds=60.0, fps=10, width=160, height=120)
+
+    with pytest.raises(Exception, match=r"Invalid argument|monotonic") as failure:
+        cut_generation_proxy(
+            silent_source,
+            ClipRequest(
+                kind=MediaKind.VIDEO,
+                start_ms=0,
+                end_ms=60_000,
+                frames_per_second=1.0,
+                include_audio=False,
+            ),
+        )
+
+    assert type(failure.value).__module__.startswith("av")
+    # The same silent source inside the ceiling cuts fine, so what binds is the frame count --
+    # not the span length, and not the audio track that is absent from both calls.
+    inside = cut_generation_proxy(
+        silent_source,
+        ClipRequest(
+            kind=MediaKind.VIDEO,
+            start_ms=0,
+            end_ms=30_000,
+            frames_per_second=1.0,
+            include_audio=False,
+        ),
+    )
+    assert inside.content
 
 
 def test_cut_rejects_empty_source_and_backwards_spans() -> None:
@@ -295,6 +428,84 @@ def _audiovisual_bytes(*, seconds: float, fps: int, width: int, height: int) -> 
         container.mux(video.encode())
         container.mux(audio.encode())
     return buffer.getvalue()
+
+
+def _late_video_audiovisual_bytes(
+    *, seconds: float, video_start: float, fps: int, width: int, height: int
+) -> bytes:
+    """One MP4 whose audio runs from zero but whose video track only starts at `video_start`.
+
+    Not a contrived shape: a capture whose camera warms up after its microphone produces it, and
+    so does any remux that concatenates a silent lead-in. It is the case that separates rebasing
+    the audio from clamping it, because everything before the first video frame has no timestamp
+    left on the clip's own clock.
+    """
+    import av
+
+    buffer = io.BytesIO()
+    with av.open(buffer, mode="w", format="mp4") as container:
+        video = container.add_stream("libx264", rate=fps)
+        video.width, video.height, video.pix_fmt = width, height, "yuv420p"
+        video.time_base = Fraction(1, 1_000)
+        audio = container.add_stream("aac", rate=SAMPLE_RATE)
+        audio.layout = "mono"
+        for index in range(int((seconds - video_start) * fps)):
+            array = numpy.full((height, width, 3), index % 256, dtype="uint8")
+            video_frame = av.VideoFrame.from_ndarray(array, format="rgb24")
+            video_frame.pts = round((video_start + index / fps) * 1_000)
+            video_frame.time_base = video.time_base
+            container.mux(video.encode(video_frame))
+        samples_per_frame = SAMPLE_RATE // fps
+        for index in range(int(seconds * fps)):
+            tone = numpy.sin(
+                2
+                * numpy.pi
+                * 440
+                * numpy.arange(index * samples_per_frame, (index + 1) * samples_per_frame)
+                / SAMPLE_RATE
+            )
+            audio_frame = av.AudioFrame.from_ndarray(
+                (tone * 16_000).astype("int16").reshape(1, -1), format="s16", layout="mono"
+            )
+            audio_frame.sample_rate = SAMPLE_RATE
+            audio_frame.pts = index * samples_per_frame
+            container.mux(audio.encode(audio_frame))
+        container.mux(video.encode())
+        container.mux(audio.encode())
+    return buffer.getvalue()
+
+
+def test_stored_clip_of_a_late_starting_video_keeps_one_timestamp_per_audio_frame() -> None:
+    """Audio ahead of the rebase point is dropped, never pulled back onto timestamp zero.
+
+    Clamping it looks harmless and is not: every frame before the clip's first video frame
+    lands on the same timestamp, and a run of identical timestamps is a non-monotonic MP4.
+    Measured on this shape before the fix, 93 audio frames shared pts 0 -- a file whose own
+    writer accepted it and a stricter demuxer need not.
+    """
+    import av
+
+    source = _late_video_audiovisual_bytes(
+        seconds=5.0, video_start=2.0, fps=10, width=160, height=120
+    )
+
+    # Sampled at the source's own rate on purpose. Below it, the sampler catches up on a
+    # late-starting track by taking consecutive frames, which the encoder then quantises onto
+    # one tick -- a separate, pre-existing interaction that has nothing to do with the audio.
+    clips = cut_clips(
+        source,
+        ClipRequest(kind=MediaKind.VIDEO, start_ms=0, end_ms=5_000, frames_per_second=10.0),
+    )
+
+    with av.open(io.BytesIO(clips[0].content), mode="r") as container:
+        stamps = [
+            frame.pts
+            for frame in container.decode(container.streams.audio[0])
+            if frame.pts is not None
+        ]
+    assert stamps, "the clip carried no audio at all"
+    assert len(set(stamps)) == len(stamps), "audio frames collapsed onto a shared timestamp"
+    assert stamps == sorted(stamps), "audio timestamps are not monotonic"
 
 
 def test_point_audio_span_widens_instead_of_failing_the_job() -> None:
@@ -388,3 +599,34 @@ def _image_bytes(*, width: int, height: int) -> bytes:
     buffer = io.BytesIO()
     Image.fromarray(array).save(buffer, format="PNG")
     return buffer.getvalue()
+
+
+def test_a_one_frame_video_clip_is_repeated_rather_than_left_unembeddable() -> None:
+    """`_sampled_window` widens the window asked for, not the frames a source can deliver.
+
+    Two sources still reach the encoder with one frame: one shorter than the widened window,
+    and one whose own frame rate is below the requested sampling. A one-frame video raises
+    `t:1 must be larger than temporal_factor:2` at the embed call and takes the whole
+    observation down with it, so the frame is repeated instead.
+    """
+    import av
+
+    shorter_than_its_window = _video_bytes(seconds=0.5, fps=10, width=160, height=120)
+    slower_than_the_sampling = _video_bytes(seconds=4.0, fps=1, width=160, height=120)
+
+    for source, request in (
+        (
+            shorter_than_its_window,
+            ClipRequest(kind=MediaKind.VIDEO, start_ms=0, end_ms=2_000, frames_per_second=1.0),
+        ),
+        (
+            slower_than_the_sampling,
+            ClipRequest(kind=MediaKind.VIDEO, start_ms=0, end_ms=500, frames_per_second=4.0),
+        ),
+    ):
+        clips = cut_clips(source, request)
+
+        with av.open(io.BytesIO(clips[0].content), mode="r") as container:
+            decoded = list(container.decode(container.streams.video[0]))
+        assert len(decoded) >= 2
+        assert decoded[0].time != decoded[1].time

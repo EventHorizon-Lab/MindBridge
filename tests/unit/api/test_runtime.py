@@ -46,14 +46,6 @@ def test_explicit_plugin_json_does_not_require_bundled_provider_variables() -> N
     assert settings.embedder_config == {"model": "local"}
 
 
-def test_settings_require_generator_credentials_for_bundled_default() -> None:
-    environment = dict(_environment())
-    del environment["MINDBRIDGE_GENERATOR_API_KEY"]
-
-    with pytest.raises(ValueError, match="MINDBRIDGE_GENERATOR_API_KEY"):
-        Settings.from_environment(environment)
-
-
 def test_settings_reject_empty_direct_configuration() -> None:
     with pytest.raises(ValueError, match="database_url"):
         _settings(database_url=" ")

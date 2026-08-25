@@ -48,9 +48,16 @@ encoders aligned without creating multiple Embedder interfaces.
 `Embedder` additionally declares `space_reference`, the search space every vector it produces
 belongs to. Declaring it before the first call is what lets a process that composes more than one
 Embedder reject a mismatch during construction instead of writing vectors that silently never
-match at recall. A plugin that omits `space_reference` fails the capability check at load time: the
-protocol member raises rather than returning a `None` that a subclass would inherit and that would
-make the space guards compare equal and pass vacuously.
+match at recall. A plugin that omits `space_reference` fails at load time: the protocol member
+raises rather than returning a `None` that a subclass would inherit and that would make the space
+guards compare equal and pass vacuously.
+
+That rejection comes from `load_embedder` reading the member, not from the capability check beside
+it. Since Python 3.12 `isinstance` resolves a protocol's members statically instead of reading
+them, so a plugin that subclasses `Embedder` and inherits the raising body satisfies the structural
+check on every version this package supports. Reading the member is what still refuses it, and
+doing so in the loader is what keeps the refusal at load time rather than at whichever call site
+reads the space first.
 
 ## Discovery
 
@@ -95,7 +102,7 @@ MindBridge ships these adapters:
 | Plugin | Capability | Purpose |
 | --- | --- | --- |
 | `openai` | Generator | OpenAI and OpenAI-compatible multimodal generation |
-| `openai` | Embedder | Aligned query/document OpenAI-compatible embedding endpoints |
+| `openai` | Embedder | Aligned query/document endpoints, including the bundled Jina service |
 | `jina` | Embedder | Local Hugging Face Jina v5 Omni embedding |
 
 Anthropic, Gemini, and local runtimes belong in provider packages using the
@@ -116,9 +123,8 @@ MINDBRIDGE_EMBEDDER_CONFIG_JSON
 The bundled defaults also accept documented provider-specific environment variables so a normal
 deployment does not need inline JSON. A supplied `*_CONFIG_JSON` value is authoritative and does not
 require the bundled provider's variables. Worker and consolidation processes read the same names for
-the same capability slots: the Worker adds only `MINDBRIDGE_MEDIA_EMBEDDER_*` for its local media
-encoder, and its text encoder shares the deployment-wide `MINDBRIDGE_EMBEDDER_*` contract rather than
-owning a second family of names that could disagree about the search space.
+the same capability slots. The Worker uses `MINDBRIDGE_EMBEDDER_*` for both text and media by
+default; `MINDBRIDGE_MEDIA_EMBEDDER_*` is an explicit override for a separate local encoder.
 
 Every bundled fallback is built in one place, `mindbridge.models.defaults`, so a variable is read by
 exactly one function no matter how many processes need it. A plugin author adding a bundled default
@@ -126,9 +132,13 @@ extends that module instead of copying a builder into each process.
 
 A bundled fallback covers credentials and model identity only. Optional settings stay reachable
 through the slot's `*_CONFIG_JSON` object and do not get an environment variable each, so adding a
-knob to a plugin schema does not widen the deployment surface. `MINDBRIDGE_MEDIA_EMBEDDER_DEVICE` is
-the one deliberate exception: it selects hardware rather than model behaviour, and routing it through
-`select_torch_device` turns a missing GPU into a startup failure instead of a silent fall back to CPU.
+knob to a plugin schema does not widen the deployment surface. For the optional local Worker
+encoder, `MINDBRIDGE_MEDIA_EMBEDDER_DEVICE` selects hardware; routing it through
+`select_torch_device` turns a missing GPU into a startup failure instead of silently using CPU.
+
+Both embedding plugins spell the model they load `model_id` in their configuration objects.
+`PluginConfigModel` sets `extra="forbid"`, so a stale key such as `model_revision` fails the
+factory at startup rather than being ignored.
 
 Benchmark runners require `--deployment-config`. The referenced JSON records every selected server
 and Worker plugin, its owning Python distribution and version, plus its non-secret resolved

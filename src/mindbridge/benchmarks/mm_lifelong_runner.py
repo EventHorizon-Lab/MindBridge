@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import timedelta
+from functools import partial
 from pathlib import Path
 
 from pydantic import AwareDatetime, Field, model_validator
@@ -14,12 +15,15 @@ from mindbridge.benchmarks.mm_lifelong import (
     MMLifelongSplit,
 )
 from mindbridge.benchmarks.runtime import (
+    answer_failure_trace_id,
     benchmark_tenant_id,
     ingest_media,
+    settle_answers,
 )
 from mindbridge.contracts import (
     ContractModel,
     Identifier,
+    IdentityObservationInput,
     MediaObjectInput,
     MemoryView,
     NonEmptyString,
@@ -40,11 +44,35 @@ class MMLifelongPreparedSegment(ContractModel):
     duration_ms: int = Field(gt=0)
     media_objects: tuple[MediaObjectInput, ...] = ()
     caption: NonEmptyString | None = None
+    # Timed voice spans and their transcripts, as an edge device would supply them. A lifelong
+    # corpus is mostly speech, and without these perception is handed a silent clip.
+    identity_observations: tuple[IdentityObservationInput, ...] = Field(default=(), max_length=512)
 
     @model_validator(mode="after")
     def require_aligned_content(self) -> MMLifelongPreparedSegment:
         if not self.media_objects and self.caption is None:
             raise ValueError("MM-Lifelong segments require media or a caption")
+        if self.identity_observations:
+            # Against the timed media, not against `duration_ms`. `duration_ms` is a
+            # segment-level number the release supplies independently of what was staged, so a
+            # 600 s segment carrying a 30 s video would otherwise accept a voice span at 500 s,
+            # and a segment carrying only a still image would accept one outright. Both are the
+            # same failure this check exists to stop: a released caption entering as a trusted
+            # edge signal, which `PERCEIVE_EVENTS_PROMPT` will name a person from.
+            timed_ms = max(
+                (
+                    media.duration_ms or 0
+                    for media in self.media_objects
+                    if media.kind in (MediaKind.AUDIO, MediaKind.VIDEO)
+                ),
+                default=0,
+            )
+            if not timed_ms:
+                raise ValueError(
+                    "MM-Lifelong identity observations require timed audio or video media"
+                )
+            if any(identity.end_ms > timed_ms for identity in self.identity_observations):
+                raise ValueError("MM-Lifelong identity observation exceeds its source media")
         media_ids = tuple(item.media_object_id for item in self.media_objects)
         if len(set(media_ids)) != len(media_ids):
             raise ValueError("MM-Lifelong segment media_object_ids must be unique")
@@ -107,6 +135,8 @@ class MMLifelongQuestionResult(ContractModel):
     mindbridge_memory_ids: tuple[Identifier, ...]
     mindbridge_evidence_ids: tuple[Identifier, ...]
     mindbridge_trace_id: Identifier
+    mindbridge_error_code: NonEmptyString | None = None
+    mindbridge_ingest_failure_count: int = Field(default=0, ge=0)
 
 
 def load_prepared_mm_lifelong(path: Path) -> MMLifelongPreparedTimeline:
@@ -148,8 +178,9 @@ async def run_mm_lifelong(
 
     tenant_id = benchmark_tenant_id(tenant_prefix, prepared.split, run_id)
     semaphore = asyncio.Semaphore(request_concurrency)
+    ingest_failures = 0
     for offset in range(0, len(prepared.segments), request_concurrency):
-        await asyncio.gather(
+        outcomes = await asyncio.gather(
             *(
                 _ingest_segment(
                     memory,
@@ -165,28 +196,46 @@ async def run_mm_lifelong(
                 for index, segment in enumerate(
                     prepared.segments[offset : offset + request_concurrency]
                 )
-            )
+            ),
+            return_exceptions=True,
         )
+        ingest_failures += _count_ingest_failures(outcomes)
 
-    results = []
+    results: list[MMLifelongQuestionResult] = []
     for offset in range(0, len(questions), request_concurrency):
-        results.extend(
-            await asyncio.gather(
-                *(
-                    _answer_question(
-                        memory,
-                        tenant_id,
-                        question,
-                        prepared,
-                        total_seconds,
-                        recall_limit,
-                        semaphore,
-                    )
-                    for question in questions[offset : offset + request_concurrency]
+        cohort = questions[offset : offset + request_concurrency]
+        answered = await asyncio.gather(
+            *(
+                _answer_question(
+                    memory,
+                    tenant_id,
+                    question,
+                    prepared,
+                    total_seconds,
+                    recall_limit,
+                    semaphore,
+                    ingest_failures,
                 )
+                for question in cohort
+            ),
+            return_exceptions=True,
+        )
+        results.extend(
+            settle_answers(
+                cohort, answered, partial(_failed_result, ingest_failures=ingest_failures)
             )
         )
     return tuple(results)
+
+
+def _count_ingest_failures(outcomes: list[BaseException | None]) -> int:
+    """Count the segments that failed so a single bad segment cannot discard its whole timeline.
+
+    A bare gather made the first exception the whole split's result, throwing away every segment
+    already ingested. The count rides along on every answer, so a run still tells missing evidence
+    apart from a wrong answer.
+    """
+    return sum(isinstance(outcome, BaseException) for outcome in outcomes)
 
 
 async def _ingest_segment(
@@ -221,6 +270,7 @@ async def _ingest_segment(
                     occurred_at=occurred_at,
                     ended_at=ended_at,
                     observed_at=ended_at,
+                    identity_observations=segment.identity_observations,
                     idempotency_key=(
                         f"{MM_LIFELONG_ADAPTER_VERSION}:{prepared.split}:{segment.segment_id}:media"
                     ),
@@ -253,6 +303,7 @@ async def _answer_question(
     total_seconds: float,
     recall_limit: int,
     semaphore: asyncio.Semaphore,
+    ingest_failures: int,
 ) -> MMLifelongQuestionResult:
     async with semaphore:
         recalled = await memory.recall(
@@ -278,6 +329,32 @@ async def _answer_question(
         mindbridge_memory_ids=tuple(item.memory_id for item in recalled.memories),
         mindbridge_evidence_ids=tuple(item.evidence_id for item in recalled.evidence),
         mindbridge_trace_id=recalled.trace_id,
+        mindbridge_ingest_failure_count=ingest_failures,
+    )
+
+
+def _failed_result(
+    question: MMLifelongQuestion,
+    error_code: str,
+    *,
+    ingest_failures: int,
+) -> MMLifelongQuestionResult:
+    """One row for a question whose recall raised, so its cohort still answers all of them."""
+    return MMLifelongQuestionResult(
+        index=question.index,
+        question=question.question,
+        answer=question.reference_answer,
+        question_type=question.question_type,
+        temporal_certificate=question.temporal_certificate,
+        total_intervals=question.reference_intervals,
+        pred=MMLifelongPrediction(answer="", intervals=()),
+        mindbridge_unofficial_ref_at_300=0.0,
+        mindbridge_confidence=0.0,
+        mindbridge_memory_ids=(),
+        mindbridge_evidence_ids=(),
+        mindbridge_trace_id=answer_failure_trace_id(str(question.index)),
+        mindbridge_error_code=error_code,
+        mindbridge_ingest_failure_count=ingest_failures,
     )
 
 

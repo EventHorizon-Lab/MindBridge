@@ -36,6 +36,7 @@ from mindbridge.core import (
     MemoryType,
     VerificationStatus,
 )
+from mindbridge.sdk import MindBridgeError
 
 ORIGIN = datetime(2026, 3, 10, tzinfo=timezone.utc)
 
@@ -267,6 +268,41 @@ def test_supermemory_allows_short_container_tail_but_rejects_overrun() -> None:
         SuperMemoryPreparedSegment.model_validate(payload)
 
 
+async def test_supermemory_answers_later_boundaries_when_one_segment_never_ingests() -> None:
+    """A dead segment used to abort the subject, discarding every segment already ingested."""
+
+    class FailingMemoryApi(RecordingMemoryApi):
+        async def observe(self, request: ObserveRequest) -> ObservationReceipt:
+            if request.sequence == 1:
+                raise MindBridgeError(
+                    "segment could not be observed",
+                    code="model_request_failed",
+                    status_code=502,
+                    trace_id="trace_ingest_error",
+                )
+            return await super().observe(request)
+
+    api = FailingMemoryApi()
+
+    results = await run_supermemory_vqa(
+        cast(MindBridge, api),
+        (
+            _question(1, question_ended_at=ORIGIN),
+            _question(2, question_ended_at=ORIGIN + timedelta(seconds=45)),
+        ),
+        _prepared_subject(),
+        run_id="run_01",
+        poll_interval_seconds=0.001,
+    )
+
+    assert [request.sequence for request in api.observe_requests] == [0]
+    assert "remember:B said the mug was in the sink." in api.calls
+    assert results[1].ranked_option_indices == (2, 0, 3, 1)
+    # The first question was answered before the failure, so it must not inherit it.
+    assert results[0].mindbridge_ingest_failure_count == 0
+    assert results[1].mindbridge_ingest_failure_count == 1
+
+
 def _question(
     question_id: int,
     *,
@@ -378,3 +414,42 @@ def _result(question_id: int, ranking: tuple[int, ...]) -> SuperMemoryQuestionRe
         mindbridge_evidence_ids=(),
         mindbridge_trace_id=f"trace_{question_id}",
     )
+
+
+async def test_supermemory_answers_the_rest_of_a_boundary_when_one_recall_raises() -> None:
+    """One raising recall used to abort every question sharing its question boundary."""
+
+    class RecallFailingMemoryApi(RecordingMemoryApi):
+        async def recall(self, request: RecallRequest) -> RecallResult:
+            assert request.query.text is not None
+            if "the mug" in request.query.text:
+                raise MindBridgeError(
+                    "recall could not be served",
+                    code="internal_error",
+                    status_code=500,
+                    trace_id="trace_recall_error",
+                )
+            return await super().recall(request)
+
+    api = RecallFailingMemoryApi()
+
+    results = await run_supermemory_vqa(
+        cast(MindBridge, api),
+        (
+            _question(1, question_ended_at=ORIGIN),
+            _question(2, question_ended_at=ORIGIN).model_copy(
+                update={"question": "Where did I leave the keys?"}
+            ),
+        ),
+        _prepared_subject(),
+        run_id="run_01",
+        poll_interval_seconds=0.001,
+    )
+
+    assert [result.question_id for result in results] == [1, 2]
+    assert [result.mindbridge_error_code for result in results] == ["internal_error", None]
+    assert results[0].ranked_option_indices == ()
+    assert results[0].predicted_option_index is None
+    # A transport failure is not the answerer declining to answer.
+    assert results[0].mindbridge_abstained is False
+    assert results[1].ranked_option_indices == (2, 0, 3, 1)

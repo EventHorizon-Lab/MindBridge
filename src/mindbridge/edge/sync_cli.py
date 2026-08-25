@@ -4,18 +4,18 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 from collections.abc import Sequence
 from datetime import timedelta
 from pathlib import Path
 
 from mindbridge.cli import parser as build_parser
+from mindbridge.configuration import configuration_source
 from mindbridge.edge.deletion_inbox import SQLiteDeletionInbox
 from mindbridge.edge.outbox import SQLiteObservationOutbox
 from mindbridge.edge.recent_memory import SQLiteRecentMemory
 from mindbridge.edge.sync import EdgeObservationSynchronizer, S3EdgeMediaUploader
 from mindbridge.sdk import MindBridge
-from mindbridge.telemetry import configure_telemetry
+from mindbridge.telemetry import configure_observability
 
 EDGE_ENVIRONMENT = """environment:
   MINDBRIDGE_API_KEY  bearer token for --api-base-url; read from the environment so the
@@ -54,7 +54,7 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
     )
     arguments = parser.parse_args(argv)
     # Configured after parsing so --help and a rejected flag stay side-effect free.
-    configure_telemetry("mindbridge-edge")
+    configure_observability("mindbridge-edge")
     synchronized, pending = asyncio.run(
         _synchronize(
             database_path=arguments.database,
@@ -89,7 +89,7 @@ async def _synchronize(
     )
     memory = MindBridge.connect(
         base_url=api_base_url,
-        api_key=os.environ.get("MINDBRIDGE_API_KEY"),
+        api_key=configuration_source().get("MINDBRIDGE_API_KEY"),
     )
     uploader = S3EdgeMediaUploader(
         bucket,

@@ -68,6 +68,25 @@ class ModelInput:
 
 
 @dataclass(frozen=True, slots=True)
+class OutputSchema:
+    """One named JSON Schema a provider must constrain its decoding to.
+
+    The schema travels as serialized JSON rather than a mapping so a request stays hashable
+    and immutable, and so this port never depends on the validation library the pipeline
+    happened to derive the schema from.
+    """
+
+    name: str
+    json_schema: str
+
+    def __post_init__(self) -> None:
+        if not self.name.strip():
+            raise DomainInvariantError("output schema name must not be blank")
+        if not self.json_schema.strip():
+            raise DomainInvariantError("output schema JSON must not be blank")
+
+
+@dataclass(frozen=True, slots=True)
 class GenerateRequest:
     """One deterministic generation request."""
 
@@ -75,6 +94,14 @@ class GenerateRequest:
     input: ModelInput
     max_output_tokens: int
     json_mode: bool = False
+    output_schema: OutputSchema | None = None
+    """Constrain decoding to this shape, when the provider can.
+
+    A prompt that only describes its output shape is a request the model may answer with a
+    code fence, a preamble, or a renamed field, and every such answer costs a second full
+    generation to discover. Naming the shape moves that from a retry into a decode
+    constraint. `json_mode` stays the weaker fallback for a provider without schema support.
+    """
 
     def __post_init__(self) -> None:
         if not self.system_prompt.strip():
@@ -149,6 +176,10 @@ class Embedder(Protocol):
         """The search space every vector this embedder produces belongs to."""
         # An explicit subclass inherits this body, so raise instead of returning None:
         # a silent None would make the space guards compare equal and pass vacuously.
+        #
+        # Reading the member is the only thing that reaches this: since 3.12 `isinstance`
+        # resolves protocol members statically, so an `isinstance(plugin, Embedder)` passes
+        # for a subclass that inherited this body. `load_embedder` reads it for that reason.
         raise NotImplementedError("an Embedder must declare its embedding space")
 
     async def embed(self, request: EmbedRequest) -> EmbedResult: ...

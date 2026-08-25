@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import PurePosixPath
@@ -14,9 +15,10 @@ import httpx
 import openai
 from openai import AsyncOpenAI, AsyncStream, Omit, omit
 from openai.types.chat import ChatCompletionChunk, ChatCompletionMessageParam
+from openai.types.completion_usage import CompletionUsage
 from openai.types.create_embedding_response import CreateEmbeddingResponse
 from openai.types.shared import ReasoningEffort
-from openai.types.shared_params import ResponseFormatJSONObject
+from openai.types.shared_params import ResponseFormatJSONObject, ResponseFormatJSONSchema
 
 from mindbridge.application.capabilities import (
     Embedding,
@@ -50,11 +52,19 @@ from mindbridge.models.defaults import (
     DEFAULT_GENERATOR_REQUEST_TIMEOUT_SECONDS,
     MatryoshkaDimension,
 )
-from mindbridge.telemetry import operation_span, set_current_span_attributes
+from mindbridge.telemetry import log_fields, logger, operation_span, set_current_span_attributes
 
 DEFAULT_VIDEO_FRAMES_PER_SECOND = 1.0
 DEFAULT_VIDEO_MAX_PIXELS = 200_704
 REASONING_EFFORT_VALUES = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+_LOGGER = logger("mindbridge.models.openai")
+_SCHEMA_REJECTION_MARKERS = ("response_format", "json_schema", "guided", "structured output")
+"""What a provider says when it cannot compile a schema rather than when the request is bad.
+
+A 400 is normally permanent, so an endpoint predating schema support would fail every
+observation outright. Matching its complaint is what turns that into one warning and a
+fallback; the markers are narrow so an ordinary bad request is still reported as one.
+"""
 
 
 class OpenAIGenerator:
@@ -82,6 +92,7 @@ class OpenAIGenerator:
         self._reasoning_effort = reasoning_effort
         self._video_frames_per_second = video_frames_per_second
         self._video_max_pixels = video_max_pixels
+        self._schema_decoding_supported = True
 
     @classmethod
     def connect(
@@ -117,6 +128,7 @@ class OpenAIGenerator:
     @operation_span("mindbridge.model.generate")
     async def generate(self, request: GenerateRequest) -> GenerateResult:
         """Stream one deterministic text result and normalize provider failures."""
+        constrained = request.output_schema is not None and self._schema_decoding_supported
         set_current_span_attributes(
             {
                 "mindbridge.model.id": self._model_reference.model_id,
@@ -125,10 +137,8 @@ class OpenAIGenerator:
                     isinstance(part, MediaPart) for part in request.input.parts
                 ),
                 "mindbridge.model.json_mode": request.json_mode,
+                "mindbridge.model.schema_constrained": constrained,
             }
-        )
-        response_format: ResponseFormatJSONObject | Omit = (
-            {"type": "json_object"} if request.json_mode else omit
         )
         messages = cast(
             list[ChatCompletionMessageParam],
@@ -138,7 +148,6 @@ class OpenAIGenerator:
                     "role": "user",
                     "content": _content_parts(
                         request.input,
-                        for_embedding=False,
                         video_frames_per_second=self._video_frames_per_second,
                         video_max_pixels=self._video_max_pixels,
                     ),
@@ -147,21 +156,7 @@ class OpenAIGenerator:
         )
         request_started_at = perf_counter()
         try:
-            stream = await self._client.chat.completions.create(
-                model=self._model_reference.model_id,
-                messages=messages,
-                modalities=["text"],
-                max_tokens=request.max_output_tokens,
-                response_format=response_format,
-                reasoning_effort=(
-                    self._reasoning_effort if self._reasoning_effort is not None else omit
-                ),
-                temperature=0.0,
-                stream=True,
-                stream_options={"include_usage": True},
-                timeout=self._request_timeout_seconds,
-            )
-            completion = await _consume_completion_stream(stream)
+            completion = await self._complete(request, messages, constrained=constrained)
         except openai.APIError as error:
             _raise_model_error(error, "generation request failed")
         except httpx.HTTPError as error:
@@ -189,6 +184,57 @@ class OpenAIGenerator:
     async def close(self) -> None:
         await self._client.close()
 
+    async def _complete(
+        self,
+        request: GenerateRequest,
+        messages: list[ChatCompletionMessageParam],
+        *,
+        constrained: bool,
+    ) -> _StreamedCompletion:
+        """Stream one completion, degrading once if this endpoint cannot compile a schema."""
+        try:
+            return await self._stream(request, messages, constrained=constrained)
+        except openai.BadRequestError as error:
+            if not constrained or not _rejects_schema_decoding(error):
+                raise
+            # Latched for the process, not retried per call: an endpoint that cannot compile
+            # a schema will not learn to, and paying a rejected request per generation to
+            # rediscover that is the cost this flag exists to avoid.
+            self._schema_decoding_supported = False
+            set_current_span_attributes({"mindbridge.model.schema_constrained": False})
+            _LOGGER.warning(
+                "endpoint rejected schema-constrained decoding, falling back to JSON mode",
+                extra=log_fields(
+                    model_id=self._model_reference.model_id,
+                    schema=request.output_schema.name if request.output_schema else None,
+                    status_code=error.status_code,
+                ),
+            )
+        return await self._stream(request, messages, constrained=False)
+
+    async def _stream(
+        self,
+        request: GenerateRequest,
+        messages: list[ChatCompletionMessageParam],
+        *,
+        constrained: bool,
+    ) -> _StreamedCompletion:
+        stream = await self._client.chat.completions.create(
+            model=self._model_reference.model_id,
+            messages=messages,
+            modalities=["text"],
+            max_tokens=request.max_output_tokens,
+            response_format=_response_format(request, constrained=constrained),
+            reasoning_effort=(
+                self._reasoning_effort if self._reasoning_effort is not None else omit
+            ),
+            temperature=0.0,
+            stream=True,
+            stream_options={"include_usage": True},
+            timeout=self._request_timeout_seconds,
+        )
+        return await _consume_completion_stream(stream)
+
 
 class OpenAIEmbedder:
     """Embed text or media through one OpenAI-compatible Omni endpoint."""
@@ -201,20 +247,14 @@ class OpenAIEmbedder:
         space_reference: EmbeddingSpaceReference,
         dimension: int = 1_024,
         request_timeout_seconds: float = 120.0,
-        video_frames_per_second: float = DEFAULT_VIDEO_FRAMES_PER_SECOND,
-        video_max_pixels: int = DEFAULT_VIDEO_MAX_PIXELS,
     ) -> None:
         if dimension <= 0 or request_timeout_seconds <= 0:
             raise ValueError("dimension and request timeout must be positive")
-        if video_frames_per_second <= 0 or video_max_pixels <= 0:
-            raise ValueError("video sampling values must be positive")
         self._client = client
         self._model_reference = model_reference
         self._space_reference = space_reference
         self._dimension = dimension
         self._request_timeout_seconds = request_timeout_seconds
-        self._video_frames_per_second = video_frames_per_second
-        self._video_max_pixels = video_max_pixels
 
     @classmethod
     def connect(
@@ -227,8 +267,6 @@ class OpenAIEmbedder:
         dimension: int = 1_024,
         request_timeout_seconds: float = 120.0,
         max_retries: int = 2,
-        video_frames_per_second: float = DEFAULT_VIDEO_FRAMES_PER_SECOND,
-        video_max_pixels: int = DEFAULT_VIDEO_MAX_PIXELS,
     ) -> OpenAIEmbedder:
         if any(not value.strip() for value in (api_key, model_id)):
             raise ValueError("embedding credentials and model identities are required")
@@ -245,8 +283,6 @@ class OpenAIEmbedder:
             space_reference=space_reference,
             dimension=dimension,
             request_timeout_seconds=request_timeout_seconds,
-            video_frames_per_second=video_frames_per_second,
-            video_max_pixels=video_max_pixels,
         )
 
     @property
@@ -270,15 +306,25 @@ class OpenAIEmbedder:
         )
         try:
             if all(_text_only(item) is not None for item in request.inputs):
-                vectors = await self._embed_text(request)
+                vectors, charged_tokens = await self._embed_text(request)
             else:
-                vectors = tuple(
-                    await asyncio.gather(
-                        *(self._embed_multimodal(item, request.task) for item in request.inputs)
-                    )
+                encoded = await asyncio.gather(
+                    *(self._embed_multimodal(item, request.task) for item in request.inputs)
                 )
+                vectors = tuple(vector for vector, _ in encoded)
+                charged_tokens = sum(tokens for _, tokens in encoded)
         except openai.APIError as error:
             _raise_model_error(error, "embedding request failed")
+        # Serving the encoder turns embedding into a metered call, so its cost has to reach the
+        # same account generation already reports into. An embedding charges entirely on its
+        # input -- there are no completion tokens to report -- and a multimodal batch is one
+        # request per item, so what lands here is the whole batch's bill.
+        set_current_span_attributes(
+            {
+                "mindbridge.model.input_tokens": charged_tokens,
+                "mindbridge.model.total_tokens": charged_tokens,
+            }
+        )
         return EmbedResult(
             embeddings=tuple(
                 Embedding(
@@ -293,7 +339,10 @@ class OpenAIEmbedder:
     async def close(self) -> None:
         await self._client.close()
 
-    async def _embed_text(self, request: EmbedRequest) -> tuple[tuple[float, ...], ...]:
+    async def _embed_text(
+        self,
+        request: EmbedRequest,
+    ) -> tuple[tuple[tuple[float, ...], ...], int]:
         prefix = "Query: " if request.task is EmbedTask.QUERY else "Document: "
         response = await self._client.embeddings.create(
             input=[prefix + cast(str, _text_only(item)) for item in request.inputs],
@@ -302,30 +351,30 @@ class OpenAIEmbedder:
             encoding_format="float",
             timeout=self._request_timeout_seconds,
         )
-        return _embedding_vectors(
-            response,
-            self._model_reference,
-            dimension=self._dimension,
-            expected_count=len(request.inputs),
+        return (
+            _embedding_vectors(
+                response,
+                self._model_reference,
+                dimension=self._dimension,
+                expected_count=len(request.inputs),
+            ),
+            response.usage.prompt_tokens,
         )
 
     async def _embed_multimodal(
         self,
         input_value: ModelInput,
         task: EmbedTask,
-    ) -> tuple[float, ...]:
+    ) -> tuple[tuple[float, ...], int]:
         response = await self._client.post(
             "/embeddings",
             cast_to=CreateEmbeddingResponse,
             body={
-                "messages": [
+                "input": [
                     {
                         "role": "user",
-                        "content": _content_parts(
-                            _prefixed_embedding_input(input_value, task),
-                            for_embedding=True,
-                            video_frames_per_second=self._video_frames_per_second,
-                            video_max_pixels=self._video_max_pixels,
+                        "content": _embedding_content_parts(
+                            _prefixed_embedding_input(input_value, task)
                         ),
                     }
                 ],
@@ -335,12 +384,15 @@ class OpenAIEmbedder:
             },
             options={"timeout": self._request_timeout_seconds},
         )
-        return _embedding_vectors(
-            response,
-            self._model_reference,
-            dimension=self._dimension,
-            expected_count=1,
-        )[0]
+        return (
+            _embedding_vectors(
+                response,
+                self._model_reference,
+                dimension=self._dimension,
+                expected_count=1,
+            )[0],
+            response.usage.prompt_tokens,
+        )
 
 
 class _GeneratorConfig(PluginConfigModel):
@@ -362,8 +414,6 @@ class _EmbedderConfig(PluginConfigModel):
     dimension: MatryoshkaDimension = DEFAULT_EMBEDDING_DIMENSION
     request_timeout_seconds: PluginNumber = 120.0
     max_retries: PluginInteger = 2
-    video_frames_per_second: PluginNumber = DEFAULT_VIDEO_FRAMES_PER_SECOND
-    video_max_pixels: PluginInteger = DEFAULT_VIDEO_MAX_PIXELS
 
 
 def create_generator(config: Mapping[str, object]) -> OpenAIGenerator:
@@ -392,8 +442,6 @@ def create_embedder(config: Mapping[str, object]) -> OpenAIEmbedder:
         dimension=validated.dimension,
         request_timeout_seconds=validated.request_timeout_seconds,
         max_retries=validated.max_retries,
-        video_frames_per_second=validated.video_frames_per_second,
-        video_max_pixels=validated.video_max_pixels,
     )
 
 
@@ -434,24 +482,34 @@ async def _consume_completion_stream(
     finish_reason: str | None = None
     system_fingerprint: str | None = None
     first_token_at: float | None = None
-    async for chunk in stream:
-        system_fingerprint = system_fingerprint or chunk.system_fingerprint
-        if chunk.usage is not None:
+    charged: CompletionUsage | None = None
+    try:
+        async for chunk in stream:
+            system_fingerprint = system_fingerprint or chunk.system_fingerprint
+            # Kept rather than reported here: the token account accumulates what it is given,
+            # and a server with `continuous_usage_stats` repeats the running total on every
+            # chunk, which would bill the request once per chunk. Each report supersedes the
+            # last, so the final one is the charge.
+            charged = chunk.usage or charged
+            for choice in chunk.choices:
+                if choice.index != 0:
+                    continue
+                if choice.delta.content:
+                    if first_token_at is None:
+                        first_token_at = perf_counter()
+                    parts.append(choice.delta.content)
+                finish_reason = finish_reason or choice.finish_reason
+    finally:
+        # Reported even when the stream drops mid-body: the partial response was still billed,
+        # and the failed attempt carries that charge into its job row.
+        if charged is not None:
             set_current_span_attributes(
                 {
-                    "mindbridge.model.input_tokens": chunk.usage.prompt_tokens,
-                    "mindbridge.model.output_tokens": chunk.usage.completion_tokens,
-                    "mindbridge.model.total_tokens": chunk.usage.total_tokens,
+                    "mindbridge.model.input_tokens": charged.prompt_tokens,
+                    "mindbridge.model.output_tokens": charged.completion_tokens,
+                    "mindbridge.model.total_tokens": charged.total_tokens,
                 }
             )
-        for choice in chunk.choices:
-            if choice.index != 0:
-                continue
-            if choice.delta.content:
-                if first_token_at is None:
-                    first_token_at = perf_counter()
-                parts.append(choice.delta.content)
-            finish_reason = finish_reason or choice.finish_reason
     return _StreamedCompletion(
         text="".join(parts),
         finish_reason=finish_reason,
@@ -463,7 +521,6 @@ async def _consume_completion_stream(
 def _content_parts(
     input_value: ModelInput,
     *,
-    for_embedding: bool,
     video_frames_per_second: float,
     video_max_pixels: int,
 ) -> list[dict[str, object]]:
@@ -482,8 +539,6 @@ def _content_parts(
                     "max_pixels": part.max_pixels or video_max_pixels,
                 }
             )
-        elif for_embedding:
-            content.append({"type": "audio_url", "audio_url": {"url": part.url}})
         else:
             source = part.source_uri or part.url
             suffix = PurePosixPath(urlsplit(source).path).suffix
@@ -497,6 +552,47 @@ def _content_parts(
                 }
             )
     return content
+
+
+def _embedding_content_parts(input_value: ModelInput) -> list[dict[str, object]]:
+    """Render the bundled SentenceTransformers service contract."""
+    content: list[dict[str, object]] = []
+    for part in input_value.parts:
+        if isinstance(part, TextPart):
+            content.append({"type": "text", "text": part.text})
+        else:
+            kind = {
+                MediaKind.IMAGE: "image_url",
+                MediaKind.VIDEO: "video_url",
+                MediaKind.AUDIO: "audio_url",
+            }[part.kind]
+            content.append({"type": kind, kind: {"url": part.url}})
+    return content
+
+
+def _response_format(
+    request: GenerateRequest,
+    *,
+    constrained: bool,
+) -> ResponseFormatJSONSchema | ResponseFormatJSONObject | Omit:
+    """Ask for the strongest output contract this request and endpoint both support."""
+    schema = request.output_schema
+    if constrained and schema is not None:
+        return {
+            "type": "json_schema",
+            "json_schema": {
+                "name": schema.name,
+                "schema": cast(dict[str, object], json.loads(schema.json_schema)),
+                "strict": True,
+            },
+        }
+    return {"type": "json_object"} if request.json_mode or schema is not None else omit
+
+
+def _rejects_schema_decoding(error: openai.BadRequestError) -> bool:
+    """Tell a provider without schema support apart from a request that is simply invalid."""
+    message = str(error).casefold()
+    return any(marker in message for marker in _SCHEMA_REJECTION_MARKERS)
 
 
 def _text_only(input_value: ModelInput) -> str | None:
@@ -543,9 +639,20 @@ def _embedding_vectors(
 
 
 def _raise_model_error(error: openai.APIError, message: str) -> None:
-    if isinstance(error, openai.APIConnectionError) or (
+    transient = isinstance(error, openai.APIConnectionError) or (
         isinstance(error, openai.APIStatusError)
         and (error.status_code in {408, 409, 429} or error.status_code >= 500)
-    ):
+    )
+    # This classification decides whether a long run retries or dies, and both outcomes
+    # otherwise reach the operator as the same one-line message with the status code gone.
+    _LOGGER.warning(
+        "provider request failed",
+        extra=log_fields(
+            error_type=type(error).__name__,
+            status_code=getattr(error, "status_code", None),
+            retryable=transient,
+        ),
+    )
+    if transient:
         raise ModelUnavailableError(message) from error
     raise ModelRequestError(message) from error

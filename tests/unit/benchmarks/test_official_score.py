@@ -160,7 +160,6 @@ def test_the_metric_flag_is_required_so_omitting_it_is_a_usage_error(
             "s.json",
             "--scorer-repository",
             "mem-eval-suite/LoCoMo_refined",
-            "3eb6f2c5",
             "--scorer-command",
             "python evaluation/evaluate.py",
             "--scored-question-count",

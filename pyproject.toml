@@ -7,11 +7,15 @@ name = "mindbridge"
 version = "0.1.0"
 description = "Agentic-native embodied memory as a service"
 readme = "README.md"
-requires-python = ">=3.10,<3.12"
+requires-python = ">=3.10,<3.15"
 license = "Apache-2.0"
 dependencies = [
     "httpx>=0.28,<1",
     "pydantic>=2.10,<3",
+    # mindbridge.configuration reads mindbridge.toml, and every role imports it. tomllib is
+    # 3.11+; the floor is 3.10 because JetPack, RDK, and RKNN edge images still ship it. This
+    # is a runtime dependency, not the dev-group entry tests/test_package.py uses.
+    "tomli>=2,<3; python_version < '3.11'",
 ]
 
 [project.scripts]
@@ -53,6 +57,18 @@ edge = [
     "opentelemetry-instrumentation-botocore>=0.65b0,<1",
     "opentelemetry-instrumentation-httpx>=0.65b0,<1",
     "opentelemetry-sdk>=1.44,<2",
+    # identity_diarization.py imports NumPy directly, including on vendor-managed ARM images.
+    "numpy>=1.26,<3",
+    # Linux/Windows x86 and Apple Silicon get the portable identity runtime. Linux ARM devices
+    # keep vendor wheels; PyTorch 2.13 no longer publishes Intel macOS wheels.
+    "funasr>=1.3.19,<2; (sys_platform != 'darwin' and (platform_machine == 'x86_64' or platform_machine == 'AMD64')) or (sys_platform == 'darwin' and platform_machine == 'arm64')",
+    "insightface>=1,<2; (sys_platform != 'darwin' and (platform_machine == 'x86_64' or platform_machine == 'AMD64')) or (sys_platform == 'darwin' and platform_machine == 'arm64')",
+    "onnxruntime>=1.20,<2; (sys_platform != 'darwin' and (platform_machine == 'x86_64' or platform_machine == 'AMD64')) or (sys_platform == 'darwin' and platform_machine == 'arm64')",
+    "opencv-python>=4.10,<6; (sys_platform != 'darwin' and (platform_machine == 'x86_64' or platform_machine == 'AMD64')) or (sys_platform == 'darwin' and platform_machine == 'arm64')",
+    "torch==2.13.0; (sys_platform != 'darwin' and (platform_machine == 'x86_64' or platform_machine == 'AMD64')) or (sys_platform == 'darwin' and platform_machine == 'arm64')",
+    # FunASR documents TorchAudio as part of its runtime but does not declare it itself.
+    # TorchAudio 2.11 uses PyTorch's stable ABI and supports PyTorch 2.11 and newer.
+    "torchaudio==2.11.0; (sys_platform != 'darwin' and (platform_machine == 'x86_64' or platform_machine == 'AMD64')) or (sys_platform == 'darwin' and platform_machine == 'arm64')",
 ]
 server = [
     "boto3>=1.40,<2",
@@ -91,16 +107,16 @@ media = [
 ]
 cloud-models = [
     "mindbridge[media]",
-    # models/jina.py resolves the model snapshot through huggingface_hub.snapshot_download.
+    # models/jina.py downloads the model snapshot through huggingface_hub.snapshot_download.
     "huggingface-hub>=0.30,<2",
     "opentelemetry-api>=1.44,<2",
     "sentence-transformers>=5.2,<6",
-    "torch==2.9.1",
+    "torch==2.13.0",
     # Jina Omni's image and video processor is a Qwen3-VL processor, and that one refuses to
     # construct without Torchvision. Its loader swallows the ImportError and leaves the
     # processor unset, so an install without this line embeds text and dies on the first
     # frame instead of failing where the dependency is missing.
-    "torchvision==0.24.1",
+    "torchvision==0.28.0",
     "transformers>=5.1,<6",
 ]
 # One token for every scenario at once, for the workstation that plays all the roles and for
@@ -118,21 +134,13 @@ name = "pypi"
 url = "https://pypi.org/simple"
 default = true
 
-[[tool.uv.index]]
-name = "pytorch-cu128"
-url = "https://download.pytorch.org/whl/cu128"
-explicit = true
-
-[tool.uv.sources]
-torch = { index = "pytorch-cu128" }
-# Torchvision ships one wheel per CUDA build like torch does, and the PyPI wheel links against a
-# different runtime, so it has to resolve from the same index its torch does.
-torchvision = { index = "pytorch-cu128" }
-
 [dependency-groups]
 dev = [
     "boto3-stubs[s3]>=1.40,<2",
+    # The quality matrix exercises edge modules without installing the multi-gigabyte model stack.
+    "cryptography>=45,<51",
     "mypy>=1.15,<3",
+    "packaging>=24,<27",
     "pytest>=8,<10",
     "pytest-asyncio>=0.24,<2",
     "ruff>=0.11,<1",
@@ -147,9 +155,10 @@ packages = ["src/mindbridge"]
 [tool.ruff]
 target-version = "py310"
 line-length = 100
-# Vendored verbatim from the Agent Memory Leaderboard, with per-file digests in
-# benchmarks/aml/PINNED.md. Formatting it would break the byte-for-byte match
-# that makes our offline scores comparable to the published ones.
+# Vendored from the Agent Memory Leaderboard at the revision pinned in
+# benchmarks/aml/PINNED.md, which records the one deliberate local delta.
+# Formatting it would add unrecorded deltas on top, and matching upstream's
+# scoring logic is what makes our offline scores comparable to the published ones.
 exclude = ["benchmarks/aml"]
 
 [tool.ruff.lint]
@@ -159,7 +168,12 @@ select = ["ANN", "ASYNC", "B", "C4", "C90", "DTZ", "E4", "E7", "E9", "F", "I", "
 max-complexity = 10
 
 [tool.mypy]
-python_version = "3.10"
+# Deliberately not pinned to the 3.10 floor. Every leg of the CI matrix runs mypy, so each
+# one checks itself, and `ruff`'s own `target-version = "py310"` is what holds the whole tree
+# to syntax the floor can parse. A `python_version` pin below the interpreter also makes mypy
+# refuse stubs that are newer than it: numpy 2.5 (`Requires-Python >=3.12`) writes PEP 695
+# `type` aliases, and reading them as 3.10 ended the run before any of this package's own
+# code was checked.
 strict = true
 files = ["src", "tests"]
 
@@ -176,8 +190,9 @@ module = [
     "PIL",
     "PIL.*",
     "soundfile",
-    # Read by tests/test_package.py on 3.10 only; mypy pins python_version = "3.10",
-    # so the tomllib branch beside it is the one it never sees.
+    # Read by tests/test_package.py on 3.10 only, where the backport is installed. mypy now
+    # checks as the interpreter it runs on, so every other leg reads the `tomllib` branch and
+    # leaves this import unresolved.
     "tomli",
 ]
 ignore_missing_imports = true

@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from mindbridge.application.evidence_clips import (
+    CLIP_RECLAIM_GRACE_SECONDS,
     ClipSampling,
     derive_evidence_clips,
     generation_proxies,
@@ -28,7 +29,13 @@ from mindbridge.core import (
     ObservationId,
     TenantId,
 )
-from mindbridge.media.clipping import ClipRequest, MediaClip, audio_windows
+from mindbridge.infrastructure._postgres_jobs import OBSERVATION_JOB_STALE_AFTER_SECONDS
+from mindbridge.media.clipping import (
+    DEFAULT_VIDEO_MAX_PIXELS,
+    ClipRequest,
+    MediaClip,
+    audio_windows,
+)
 from mindbridge.models import Embedding, EmbedRequest, EmbedResult, EmbedTask, MediaPart
 
 NOW = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
@@ -478,6 +485,30 @@ async def test_generation_proxy_is_cut_at_the_configured_sampling() -> None:
     assert [(item.start_ms, item.end_ms) for item in requests] == [(0, 30_000)]
 
 
+async def test_generation_proxy_carries_the_deployment_s_audio_decision_to_the_cutter() -> None:
+    """A deployment whose generator cannot hear turns `proxy_audio` off; without this the flag
+    would be readable in configuration and have no effect on what is cut, which is the shape of
+    bug that leaves a knob documented and dead."""
+    seen: list[bool] = []
+
+    def record(source: bytes, request: ClipRequest) -> MediaClip:
+        seen.append(request.include_audio)
+        return _shrinking_cut(source, request)
+
+    for proxy_audio in (True, False):
+        async with generation_proxies(
+            TENANT_ID,
+            (_video_evidence("evidence_video_01", 0, 30_000),),
+            store=RecordingStore(),
+            sampling=ClipSampling(proxy_audio=proxy_audio),
+            cut=record,
+            scope="job_01:1",
+        ):
+            pass
+
+    assert seen == [True, False]
+
+
 async def test_generation_proxy_is_dropped_when_it_would_not_shrink_the_source() -> None:
     """Re-encoding media that is already at the sampling budget would cost bytes, not save them."""
     store = RecordingStore()
@@ -499,6 +530,39 @@ async def test_generation_proxy_is_dropped_when_it_would_not_shrink_the_source()
 
     assert store.uploaded == {}
     assert resolved[0].media_url == "https://objects.example.test/media_video_01.mp4"
+
+
+async def test_a_skipped_generation_proxy_says_so_where_an_operator_will_see_it(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Perception still succeeds on the untouched source, so the downgrade is invisible.
+
+    A media path that quietly falls back is the failure mode this project has already paid
+    for once. Recording the reason only as a span attribute means nobody without a collector
+    can tell a working deployment from a degraded one.
+    """
+    store = RecordingStore()
+
+    with caplog.at_level("WARNING", logger="mindbridge.application.evidence_clips"):
+        async with generation_proxies(
+            TENANT_ID,
+            (_video_evidence("evidence_video_01", 0, 30_000),),
+            store=store,
+            sampling=ClipSampling(),
+            cut=_refusing_cut,
+            scope="job_01:1",
+        ) as resolved:
+            pass
+
+    assert resolved[0].media_url == "https://objects.example.test/media_video_01.mp4"
+    (record,) = caplog.records
+    assert record.mindbridge_fields["reason"] == "ValueError"  # type: ignore[attr-defined]
+    assert record.mindbridge_fields["media_object_id"] == "media_video_01"  # type: ignore[attr-defined]
+
+
+def _refusing_cut(source: bytes, request: object) -> MediaClip:
+    """Stand in for the muxer refusing a span it will not interleave."""
+    raise ValueError("cannot interleave a sparse video track with this audio track")
 
 
 async def test_generation_proxy_leaves_non_video_evidence_untouched() -> None:
@@ -900,3 +964,255 @@ async def test_a_stored_audio_clip_declares_no_frame_rate() -> None:
     )
 
     assert embedder.sampling == ((None, None),)
+
+
+async def test_a_span_too_short_to_sample_twice_is_widened_instead_of_failing() -> None:
+    """The defect this closes: 72 clips across 105 observations, and each took its whole
+    observation -- perception included -- down with it. At 1 fps a sub-second event was cut into a
+    one-frame video, and a one-frame video is not a video to a Qwen3-VL encoder: it raised
+    `t:1 must be larger than temporal_factor:2` at the embed call. Two sampling intervals is the
+    shortest window a real decode actually yields two frames from."""
+    store = RecordingStore()
+    embedder = RecordingEmbedder()
+    requests: list[ClipRequest] = []
+
+    def record(source: bytes, request: ClipRequest) -> tuple[MediaClip, ...]:
+        requests.append(request)
+        return (_shrinking_cut(source, request),)
+
+    derived = await derive_evidence_clips(
+        TENANT_ID,
+        (_video_evidence("evidence_video_01", 4_000, 4_400),),
+        store=store,
+        embedder=embedder,
+        sampling=ClipSampling(),
+        created_at=NOW,
+        cut=record,
+    )
+
+    assert [(item.start_ms, item.end_ms) for item in requests] == [(2_400, 4_400)]
+    # What was cut is what is recorded, so the widening is visible rather than implied.
+    assert [(clip.start_ms, clip.end_ms) for clip in derived.clips] == [(2_400, 4_400)]
+
+
+async def test_the_floor_follows_the_configured_frame_rate() -> None:
+    """The floor is two sampling intervals, so it moves with the deployment's frame rate rather
+    than being a fixed number of milliseconds -- until it reaches the wall-clock ceiling, past
+    which it is the sampling that moves instead."""
+    requests: list[ClipRequest] = []
+
+    def record(source: bytes, request: ClipRequest) -> tuple[MediaClip, ...]:
+        requests.append(request)
+        return (_shrinking_cut(source, request),)
+
+    for frames_per_second in (0.5, 4.0):
+        await derive_evidence_clips(
+            TENANT_ID,
+            (_video_evidence("evidence_video_01", 8_000, 8_100),),
+            store=RecordingStore(),
+            embedder=RecordingEmbedder(),
+            sampling=ClipSampling(frames_per_second=frames_per_second),
+            created_at=NOW,
+            cut=record,
+        )
+
+    # Four seconds of window is what 0.5 fps used to buy for a 100 ms event; the ceiling holds
+    # it to two and hands back the frame rate that fills them.
+    assert [(item.start_ms, item.end_ms) for item in requests] == [(6_100, 8_100), (7_600, 8_100)]
+    assert [item.frames_per_second for item in requests] == [1.0, 4.0]
+
+
+async def test_a_span_at_the_start_of_a_source_is_widened_forwards() -> None:
+    """Widening runs backwards by preference, but there is nothing behind the start of a file."""
+    requests: list[ClipRequest] = []
+
+    def record(source: bytes, request: ClipRequest) -> tuple[MediaClip, ...]:
+        requests.append(request)
+        return (_shrinking_cut(source, request),)
+
+    await derive_evidence_clips(
+        TENANT_ID,
+        (_video_evidence("evidence_video_01", 0, 300),),
+        store=RecordingStore(),
+        embedder=RecordingEmbedder(),
+        sampling=ClipSampling(),
+        created_at=NOW,
+        cut=record,
+    )
+
+    assert [(item.start_ms, item.end_ms) for item in requests] == [(0, 2_000)]
+
+
+async def test_a_span_long_enough_to_sample_is_cut_exactly_as_it_stands() -> None:
+    """The floor must not move a span that never needed it."""
+    requests: list[ClipRequest] = []
+
+    def record(source: bytes, request: ClipRequest) -> tuple[MediaClip, ...]:
+        requests.append(request)
+        return (_shrinking_cut(source, request),)
+
+    await derive_evidence_clips(
+        TENANT_ID,
+        (_video_evidence("evidence_video_01", 4_000, 9_000),),
+        store=RecordingStore(),
+        embedder=RecordingEmbedder(),
+        sampling=ClipSampling(),
+        created_at=NOW,
+        cut=record,
+    )
+
+    assert [(item.start_ms, item.end_ms) for item in requests] == [(4_000, 9_000)]
+
+
+async def test_a_short_audio_or_image_span_is_left_where_it_was() -> None:
+    """Frames are a video idea. Audio has its own minimum and an image has no temporal factor at
+    all, so widening either one would only blur what its vector means."""
+    requests: list[ClipRequest] = []
+
+    def record(source: bytes, request: ClipRequest) -> tuple[MediaClip, ...]:
+        requests.append(request)
+        return (_shrinking_cut(source, request),)
+
+    await derive_evidence_clips(
+        TENANT_ID,
+        (_evidence("evidence_audio_01", 4_000, 4_100),),
+        store=RecordingStore(),
+        embedder=RecordingEmbedder(),
+        sampling=ClipSampling(),
+        created_at=NOW,
+        cut=record,
+    )
+
+    assert [(item.start_ms, item.end_ms) for item in requests] == [(4_000, 4_100)]
+
+
+async def test_the_generation_proxy_gets_the_same_floor_as_the_stored_clip() -> None:
+    """The generator is the same family of model as the encoder, so a one-frame proxy is refused
+    the same way -- and there the loss lands on perception, which is the expensive half."""
+    requests: list[ClipRequest] = []
+
+    def record(source: bytes, request: ClipRequest) -> MediaClip:
+        requests.append(request)
+        return _shrinking_cut(source, request)
+
+    async with generation_proxies(
+        TENANT_ID,
+        (_video_evidence("evidence_video_01", 6_000, 6_200),),
+        store=RecordingStore(),
+        sampling=ClipSampling(),
+        cut=record,
+        scope="job_01:1",
+    ):
+        pass
+
+    assert [(item.start_ms, item.end_ms) for item in requests] == [(4_200, 6_200)]
+
+
+async def test_widening_cannot_push_a_proxy_past_the_frame_ceiling() -> None:
+    """The two bounds have to compose: the ceiling is checked against the window that will
+    actually be cut, not the span that was asked for."""
+    store = RecordingStore()
+
+    async with generation_proxies(
+        TENANT_ID,
+        (_video_evidence("evidence_video_01", 39_900, 40_000),),
+        store=store,
+        sampling=ClipSampling(frames_per_second=1.0),
+        cut=_shrinking_cut,
+        scope="job_01:1",
+    ) as resolved:
+        # 100 ms asked for, 2 s cut, still far below the 40-frame ceiling.
+        assert resolved[0].media_url != "https://objects.example.test/media_video_01.mp4"
+    assert store.reads == 1
+
+
+async def test_a_frame_rate_below_the_floor_samples_faster_instead_of_reaching_further() -> None:
+    """The floor is two frames, and two frames is a count, not a length of tape.
+
+    `MINDBRIDGE_MEDIA_SAMPLING_CONFIG_JSON={"frames_per_second":0.2}` is a plausible way to cut
+    token cost, and it used to turn every prompt-v11 event -- 2 to 5 seconds of them -- into a
+    10 second clip, because the floor was two sampling intervals and nothing capped it in wall
+    clock. Recall attaches that clip and the answering model reads ten seconds of context for a
+    two second span. Past the ceiling the clip samples its own window faster rather than
+    reaching further back for frames.
+    """
+    store = RecordingStore()
+    embedder = RecordingEmbedder()
+    requests: list[ClipRequest] = []
+
+    def record(source: bytes, request: ClipRequest) -> tuple[MediaClip, ...]:
+        requests.append(request)
+        return (_shrinking_cut(source, request),)
+
+    derived = await derive_evidence_clips(
+        TENANT_ID,
+        (_video_evidence("evidence_video_01", 4_000, 6_000),),
+        store=store,
+        embedder=embedder,
+        sampling=ClipSampling(frames_per_second=0.2),
+        created_at=NOW,
+        cut=record,
+    )
+
+    assert [(item.start_ms, item.end_ms) for item in requests] == [(4_000, 6_000)]
+    assert [item.frames_per_second for item in requests] == [1.0]
+    assert [(clip.start_ms, clip.end_ms) for clip in derived.clips] == [(4_000, 6_000)]
+    # The rate the bytes were cut at is the rate the encoder has to be told, or it re-samples
+    # the clip down to the single frame the widening exists to avoid.
+    assert embedder.sampling == ((1.0, DEFAULT_VIDEO_MAX_PIXELS),)
+
+
+async def test_the_floor_is_capped_however_short_a_span_is() -> None:
+    """The cap binds on the widening as well as on a span already longer than it."""
+    requests: list[ClipRequest] = []
+
+    def record(source: bytes, request: ClipRequest) -> tuple[MediaClip, ...]:
+        requests.append(request)
+        return (_shrinking_cut(source, request),)
+
+    await derive_evidence_clips(
+        TENANT_ID,
+        (_video_evidence("evidence_video_01", 8_000, 8_100),),
+        store=RecordingStore(),
+        embedder=RecordingEmbedder(),
+        sampling=ClipSampling(frames_per_second=0.2),
+        created_at=NOW,
+        cut=record,
+    )
+
+    assert [(item.start_ms, item.end_ms) for item in requests] == [(6_100, 8_100)]
+    assert [item.frames_per_second for item in requests] == [1.0]
+
+
+async def test_the_generation_proxy_is_capped_and_resampled_with_the_stored_clip() -> None:
+    """A proxy stretched to ten seconds costs the same context, and one sampled too slowly to
+    fill its own window fails perception -- the expensive half -- instead of the embed."""
+    requests: list[ClipRequest] = []
+
+    def record(source: bytes, request: ClipRequest) -> MediaClip:
+        requests.append(request)
+        return _shrinking_cut(source, request)
+
+    async with generation_proxies(
+        TENANT_ID,
+        (_video_evidence("evidence_video_01", 6_000, 6_200),),
+        store=RecordingStore(),
+        sampling=ClipSampling(frames_per_second=0.2),
+        cut=record,
+        scope="job_01:1",
+    ) as resolved:
+        assert resolved[0].sampled_frames_per_second == 1.0
+
+    assert [(item.start_ms, item.end_ms) for item in requests] == [(4_200, 6_200)]
+    assert [item.frames_per_second for item in requests] == [1.0]
+
+
+def test_a_clip_is_never_swept_while_its_attempt_could_still_be_running() -> None:
+    """The sweep's grace has to outlast the window that decides an attempt was abandoned.
+
+    A clip is uploaded before the transaction that registers it, so between those two points it
+    looks exactly like an orphan. Both constants moved independently before this check existed,
+    and the pair that matters -- the ledger's stale window and this grace -- was only ever
+    related in prose.
+    """
+    assert CLIP_RECLAIM_GRACE_SECONDS > OBSERVATION_JOB_STALE_AFTER_SECONDS > 0

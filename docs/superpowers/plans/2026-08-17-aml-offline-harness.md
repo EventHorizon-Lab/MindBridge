@@ -1501,6 +1501,7 @@ cp /tmp/aml-pin/api_config.py benchmarks/aml/
   echo "# Pinned AML evaluation contract"
   echo
   echo "Source: https://github.com/AML-memory/agent-memory-leaderboard"
+  echo "Revision: 5761ed58502d24153115cbdc010e44957cb18c3a"
   echo
   echo '```'
   find benchmarks/aml -name '*.py' | sort | xargs sha256sum

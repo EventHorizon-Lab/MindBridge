@@ -10,6 +10,7 @@ from pydantic import JsonValue, ValidationError
 from mindbridge.benchmarks.artifacts import (
     DeploymentSnapshot,
     PluginSnapshot,
+    jsonl_lines,
     load_deployment_snapshot,
 )
 from mindbridge.benchmarks.dataset_smoke import DatasetAdapterSmokeResult
@@ -45,6 +46,7 @@ def test_dataset_adapter_manifest_matches_current_schema() -> None:
         "M3-Bench-robot": 1_276,
         "M3-Bench-web": 3_214,
         "Video-MME": 2_700,
+        "Video-MME-v2": 3_200,
         "EgoLifeQA": 500,
         "EgoTempo": 500,
         "EgoMemReason": 500,
@@ -54,6 +56,9 @@ def test_dataset_adapter_manifest_matches_current_schema() -> None:
         "MM-Lifelong-month-train": 266,
         "MM-Lifelong-month-val": 623,
         "SuperMemory-VQA": 4_853,
+        "ATM-Bench": 1_013,
+        "ATM-Bench-Hard": 31,
+        "Mem-Gallery": 1_711,
     }
 
 
@@ -166,3 +171,30 @@ def test_deployment_snapshot_and_hash_use_the_same_frozen_bytes(tmp_path: Path) 
 
     assert loaded.snapshot.server_generator.plugin == "openai"
     assert loaded.sha256 == hashlib.sha256(encoded).hexdigest()
+
+
+def test_jsonl_lines_drops_blank_lines_and_normalises_crlf_and_cr_endings(
+    tmp_path: Path,
+) -> None:
+    """The claims the loader tests cannot reach: their fixtures are all LF-only.
+
+    `read_text` reads in universal-newline mode, so splitting on the newline
+    alone still handles CRLF and CR-only corpora and leaves no carriage
+    return behind -- reading the bytes instead would strand one on every
+    line. Blank and whitespace-only lines are dropped, not returned empty.
+    """
+    crlf = tmp_path / "crlf.jsonl"
+    crlf.write_bytes(b'{"a": 1}\r\n\r\n   \r\n{"a": 2}\r\n')
+    cr_only = tmp_path / "cr.jsonl"
+    cr_only.write_bytes(b'{"a": 3}\r{"a": 4}\r')
+
+    assert jsonl_lines(crlf) == ('{"a": 1}', '{"a": 2}')
+    assert jsonl_lines(cr_only) == ('{"a": 3}', '{"a": 4}')
+    assert [json.loads(line) for line in jsonl_lines(crlf)] == [{"a": 1}, {"a": 2}]
+
+
+def test_dataset_smoke_result_requires_all_seventeen_benchmark_summaries() -> None:
+    """A benchmark dropped out of the smoke must fail the contract, not pass quietly."""
+    from mindbridge.benchmarks.dataset_smoke import DatasetAdapterSmokeResult
+
+    assert DatasetAdapterSmokeResult.model_fields["datasets"].metadata[0].min_length == 17

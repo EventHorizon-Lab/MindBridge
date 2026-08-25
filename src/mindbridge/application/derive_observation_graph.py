@@ -19,6 +19,7 @@ from mindbridge.application.perception import (
     time_ranges_overlap,
 )
 from mindbridge.core import (
+    AnonymousIdentityObservation,
     Claim,
     ClaimId,
     EmbeddedObjectType,
@@ -30,6 +31,7 @@ from mindbridge.core import (
     EntityType,
     Event,
     EvidenceSpan,
+    IdentityScope,
     MemoryId,
     MemoryIntegrityError,
     MemoryRecord,
@@ -187,28 +189,70 @@ async def embed_observation_graph(
     events: tuple[Event, ...],
     claims: tuple[Claim, ...],
     entities: tuple[Entity, ...],
+    memories: tuple[MemoryRecord, ...],
     embedder: Embedder,
     created_at: datetime,
 ) -> tuple[EmbeddingRecord, ...]:
-    """Batch event, claim, and named entity text through the selected document encoder."""
-    objects = (
-        tuple((EmbeddedObjectType.EVENT, event.event_id, event.description) for event in events)
-        + tuple((EmbeddedObjectType.CLAIM, claim.claim_id, claim.statement) for claim in claims)
-        + tuple(
-            (EmbeddedObjectType.ENTITY, entity.entity_id, entity.canonical_name)
-            for entity in entities
-            if entity.canonical_name is not None
+    """Batch event, claim, named entity, and memory text through the document encoder.
+
+    Every event and claim is indexed twice: once as itself, and once as the memory that
+    represents it. The second row is what `observe()` never wrote, and its absence is not a
+    lost ranking signal but a dead code path: `recall` searches the MEMORY_RECORD channel on
+    every recall and feeds the memory IDs it returns into `search_memories_by_ids` and
+    `search_memories_by_hierarchy`, which are ID lookups rather than vector searches. With no
+    rows in that channel those two receive an empty ID set and return nothing at all, so two
+    of the four fused retrieval paths -- including every hierarchy summary consolidation
+    built -- contributed nothing on an audiovisual tenant. Measured: 3 336 memories and zero
+    vectors across six audiovisual benchmarks, against ~100% coverage on text tenants where
+    `remember()` writes the row.
+
+    The two rows share one vector rather than encoding the text twice, because a derived
+    memory's summary *is* its record's own text, so a second round trip per memory buys
+    identical numbers at the price of doubling the graph text through the encoder. That is a
+    property of how the memory is built, not a law, so it is checked here against the record
+    that will actually be committed instead of assumed: if a memory ever starts summarising
+    rather than restating, this refuses to label one vector with both meanings.
+    """
+    memory_by_id = {memory.memory_id: memory for memory in memories}
+    inputs: list[tuple[str, tuple[tuple[EmbeddedObjectType, str], ...]]] = []
+    for event in events:
+        inputs.append(
+            (
+                event.description,
+                _shared_with_memory(
+                    (EmbeddedObjectType.EVENT, event.event_id),
+                    event.description,
+                    memory_by_id,
+                    representing_memory_id(event.event_id),
+                ),
+            )
         )
+    for claim in claims:
+        inputs.append(
+            (
+                claim.statement,
+                _shared_with_memory(
+                    (EmbeddedObjectType.CLAIM, claim.claim_id),
+                    claim.statement,
+                    memory_by_id,
+                    representing_memory_id(claim.claim_id),
+                ),
+            )
+        )
+    inputs.extend(
+        (entity.canonical_name, ((EmbeddedObjectType.ENTITY, entity.entity_id),))
+        for entity in entities
+        if entity.canonical_name is not None
     )
-    if not objects:
+    if not inputs:
         return ()
     result = await embedder.embed(
         EmbedRequest(
-            inputs=tuple(ModelInput((TextPart(text),)) for _, _, text in objects),
+            inputs=tuple(ModelInput((TextPart(text),)) for text, _ in inputs),
             task=EmbedTask.DOCUMENT,
         )
     )
-    if len(result.embeddings) != len(objects):
+    if len(result.embeddings) != len(inputs):
         raise MemoryIntegrityError("embedder returned the wrong graph vector count")
     return tuple(
         EmbeddingRecord(
@@ -233,8 +277,24 @@ async def embed_observation_graph(
             normalized=True,
             created_at=created_at,
         )
-        for (object_type, object_id, _), embedding in zip(objects, result.embeddings, strict=True)
+        for (_, objects), embedding in zip(inputs, result.embeddings, strict=True)
+        for object_type, object_id in objects
     )
+
+
+def _shared_with_memory(
+    record: tuple[EmbeddedObjectType, str],
+    text: str,
+    memory_by_id: dict[MemoryId, MemoryRecord],
+    memory_id: MemoryId,
+) -> tuple[tuple[EmbeddedObjectType, str], ...]:
+    """Name both objects one vector stands for, only while both carry the same text."""
+    memory = memory_by_id.get(memory_id)
+    if memory is None or memory.summary != text:
+        raise MemoryIntegrityError(
+            "a memory vector must encode the text of the record it represents"
+        )
+    return (record, (EmbeddedObjectType.MEMORY_RECORD, memory_id))
 
 
 def _perceived_entity(
@@ -289,6 +349,26 @@ def _entity_mentions(
     )
 
 
+def _counted_statement(perceived: PerceivedClaim) -> str:
+    """Fold a claim's exact count into the one text a reader ever sees.
+
+    `PerceivedCount` is typed where the model produces it, but nothing downstream reads a typed
+    number: the answer pipeline is handed `MemoryRecord.summary`, and a claim's memory restates
+    its statement verbatim. A count kept beside the statement would therefore be write-only,
+    which is the failure this change exists to avoid, so it is written into the statement --
+    once, deterministically, rather than hoped for in the sentence the model wrote.
+
+    Rendered as ordinary English on purpose. The statement is also the text that gets embedded,
+    and `key=value` syntax in it would be tokens the query side never produces, while "exactly 3
+    small monsters" is close to how a question about how many small monsters there were is
+    phrased.
+    """
+    count = perceived.exact_count
+    if count is None:
+        return perceived.statement
+    return f"{perceived.statement} (exactly {count.value} {count.subject})"
+
+
 def _claim(
     observation: Observation,
     perception: EventPerception,
@@ -297,6 +377,7 @@ def _claim(
     claim_index: int,
     created_at: datetime,
 ) -> Claim:
+    statement = _counted_statement(perceived)
     return Claim(
         claim_id=ClaimId(
             derive_stable_id(
@@ -304,12 +385,12 @@ def _claim(
                 observation.tenant_id,
                 event.event_id,
                 claim_index,
-                perceived.statement,
+                statement,
             )
         ),
         tenant_id=observation.tenant_id,
         claim_type=perceived.claim_type,
-        statement=perceived.statement,
+        statement=statement,
         evidence_ids=perceived.evidence_ids,
         confidence=perceived.confidence,
         verification_status=VerificationStatus.VERIFIED,
@@ -325,9 +406,20 @@ def _claim(
     )
 
 
+def representing_memory_id(record_id: str) -> MemoryId:
+    """Derive in one place the memory that stands for one event or claim.
+
+    Three callers need it: the builder that creates the memory, the encoder batch that indexes
+    the memory's summary beside its record, and recall, which has to recognise the two hits one
+    shared vector produces. A second copy of this derivation is a silent divergence -- the
+    vector would be filed under a memory ID that nothing stores.
+    """
+    return MemoryId(derive_stable_id("memory", record_id))
+
+
 def _event_memory(event: Event) -> MemoryRecord:
     return MemoryRecord(
-        memory_id=MemoryId(derive_stable_id("memory", event.event_id)),
+        memory_id=representing_memory_id(event.event_id),
         tenant_id=event.tenant_id,
         memory_type=MemoryType.EPISODIC,
         summary=event.description,
@@ -344,7 +436,7 @@ def _event_memory(event: Event) -> MemoryRecord:
 
 def _claim_memory(claim: Claim, event: Event) -> MemoryRecord:
     return MemoryRecord(
-        memory_id=MemoryId(derive_stable_id("memory", claim.claim_id)),
+        memory_id=representing_memory_id(claim.claim_id),
         tenant_id=claim.tenant_id,
         memory_type=MemoryType.SEMANTIC,
         summary=claim.statement,
@@ -357,6 +449,29 @@ def _claim_memory(claim: Claim, event: Event) -> MemoryRecord:
         salience=claim.confidence,
         strength=claim.confidence,
     )
+
+
+def _identity_entity_id(
+    observation: Observation,
+    identity: AnonymousIdentityObservation,
+) -> EntityId:
+    """Make a device identity the same person across clips, and an observation-scoped one not.
+
+    A device-scoped pseudonym is the one durable key an anonymous person has: the edge matched
+    this face or voice against its own enrolled gallery, so the same string in next week's clip
+    is the same human, and using it verbatim is what lets recall's co-mention expansion reach
+    the other clips they appear in.
+
+    `IdentityScope.OBSERVATION` states the opposite -- the pseudonym is only safe to reuse
+    inside the observation that produced it, because it is a within-clip diarization or tracking
+    label rather than a match. Using it verbatim made every caller-supplied `speaker_0` one
+    tenant-wide person, silently merging strangers across the corpus, which is worse than having
+    no identity at all: a wrong merge is asserted, and `MENTIONS` edges then join their events.
+    Namespacing it by its observation keeps it stable exactly as far as its scope promises.
+    """
+    if identity.scope is IdentityScope.DEVICE:
+        return EntityId(identity.identity_id)
+    return EntityId(derive_stable_id("identity", observation.observation_id, identity.identity_id))
 
 
 def _identity_graph(
@@ -390,7 +505,7 @@ def _identity_graph(
             )
             if not matching_evidence_ids:
                 continue
-            entity_id = EntityId(identity.identity_id)
+            entity_id = _identity_entity_id(observation, identity)
             entities.setdefault(
                 entity_id,
                 Entity(

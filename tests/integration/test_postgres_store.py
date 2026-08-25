@@ -53,8 +53,17 @@ from mindbridge.core import (
     TenantId,
     VerificationStatus,
 )
+from mindbridge.infrastructure._postgres_jobs import (
+    OBSERVATION_JOB_STALE_AFTER_SECONDS,
+    observation_job_accounting,
+    tenant_scope_required,
+    unreachable_observation_jobs,
+)
 from mindbridge.infrastructure.postgres import PostgresMemoryStore
+from mindbridge.infrastructure.task_queue import create_task_queue
+from mindbridge.jobs_cli import queue_depth, reconcile
 from mindbridge.models import Embedding, EmbedRequest, EmbedResult
+from mindbridge.telemetry import operation_span, set_current_span_attributes
 
 NOW = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
 
@@ -228,6 +237,9 @@ async def test_migration_installs_complete_phase_zero_schema(database_url: str) 
         19,
         20,
         21,
+        22,
+        23,
+        24,
     ]
 
 
@@ -261,6 +273,66 @@ async def test_access_time_migration_repairs_legacy_clock_rollback(database_url:
 
     assert repaired is not None
     assert repaired[1] == repaired[0]
+
+
+async def test_dropping_model_revisions_dedupes_vectors_and_rewrites_stored_identities(
+    database_url: str,
+) -> None:
+    """The suite's own replay starts empty, so these two branches would never run.
+
+    Both only do work on rows written before migration 0021: two vectors that differed only by
+    revision now collide on the narrowed unique key, and a stored identity span carrying
+    `model_revision` would fail the reader's own contract, which forbids unknown fields.
+    """
+    migration = Path(__file__).parents[2] / "migrations/0021_drop_model_revisions.sql"
+    connection = await AsyncConnection.connect(database_url, autocommit=True)
+    async with connection:
+        await connection.execute("DROP SCHEMA IF EXISTS migration_0021_legacy CASCADE")
+        await connection.execute("CREATE SCHEMA migration_0021_legacy")
+        await connection.execute("SET search_path TO migration_0021_legacy")
+        await connection.execute(
+            """
+            CREATE TABLE events (model_id text, model_revision text);
+            CREATE TABLE claims (model_id text, model_revision text);
+            CREATE TABLE memory_records (model_id text, model_revision text);
+            CREATE TABLE embeddings (
+                tenant_id text NOT NULL,
+                embedding_id text NOT NULL,
+                object_type text NOT NULL,
+                object_id text NOT NULL,
+                model_id text NOT NULL,
+                model_revision text NOT NULL,
+                space_id text NOT NULL,
+                space_revision text NOT NULL,
+                task text NOT NULL,
+                created_at timestamptz NOT NULL,
+                UNIQUE (tenant_id, object_type, object_id, model_id, model_revision, task)
+            );
+            CREATE INDEX embeddings_space_search_idx
+                ON embeddings (tenant_id, space_id, space_revision, task, object_type);
+            CREATE INDEX embeddings_object_lookup_idx
+                ON embeddings (tenant_id, object_type, object_id, space_id, space_revision, task);
+            CREATE TABLE observations (identity_observations jsonb NOT NULL);
+            CREATE TABLE schema_migrations (version integer PRIMARY KEY);
+            INSERT INTO embeddings VALUES
+                ('t', 'first', 'event', 'e', 'm', 'r1', 's', 'r1', 'document', now()),
+                ('t', 'second', 'event', 'e', 'm', 'r2', 's', 'r2', 'document', now() + '1s');
+            INSERT INTO observations VALUES ('[{"model_id": "m", "model_revision": "r1"}]'::jsonb);
+            """,
+            prepare=False,
+        )
+        await connection.execute(migration.read_text(encoding="utf-8"), prepare=False)
+        surviving = await (
+            await connection.execute("SELECT embedding_id FROM embeddings")
+        ).fetchall()
+        identities = await (
+            await connection.execute("SELECT identity_observations FROM observations")
+        ).fetchone()
+        await connection.execute("RESET search_path")
+        await connection.execute("DROP SCHEMA migration_0021_legacy CASCADE")
+
+    assert [cast(tuple[str], row)[0] for row in surviving] == ["first"]
+    assert cast(tuple[list[dict[str, str]]], identities)[0] == [{"model_id": "m"}]
 
 
 async def test_postgres_vertical_path_is_idempotent_and_evidence_first(
@@ -303,6 +375,9 @@ async def test_postgres_vertical_path_is_idempotent_and_evidence_first(
     assert stored_batch.media_objects[0].media_object_id == "media_01"
     assert stored_batch.evidence_spans[0].end_ms == 4_000
     assert stored_batch.observation.identity_observations[0].identity_id == "person_device_01"
+    assert stored_batch.observation.identity_observations[0].model_reference.model_id == (
+        "insightface/buffalo_l"
+    )
     assert await _processing_job_count(database_url, "tenant_roundtrip") == 1
     assert memory.verification_status is VerificationStatus.ATTESTED
     assert result.answer == "The robot put the red screwdriver beside the blue toolbox."
@@ -652,6 +727,387 @@ async def _processing_job_count(database_url: str, tenant_id: str) -> int:
             )
         ).fetchone()
     return cast(tuple[int], row)[0]
+
+
+async def test_job_row_separates_queue_wait_from_work_and_accumulates_cost(
+    store: PostgresMemoryStore,
+    database_url: str,
+) -> None:
+    """created_at and updated_at alone answered neither "how long did it wait" nor "cost"."""
+    receipt = await _kernel(store).observe(_observe_request(tenant_id="tenant_job_cost"))
+    tenant_id = TenantId("tenant_job_cost")
+    observation_id = ObservationId(receipt.observation_id)
+    job_id = JobId(receipt.processing_job_id)
+    empty_output = ObservationProcessingOutput(
+        evidence_spans=(),
+        events=(),
+        entities=(),
+        entity_mentions=(),
+        claims=(),
+        memories=(),
+        relations=(),
+        embeddings=(),
+    )
+
+    async with operation_span("mindbridge.test.first_attempt"):
+        await store.claim_observation_processing_job(tenant_id, observation_id, job_id)
+        set_current_span_attributes(
+            {"mindbridge.model.input_tokens": 120, "mindbridge.model.output_tokens": 8}
+        )
+        await store.mark_observation_processing_failed(
+            tenant_id,
+            observation_id,
+            job_id,
+            attempt=1,
+            error_code="model_output_invalid",
+        )
+    first_attempt = await _job_timing(database_url, tenant_id, job_id)
+    async with operation_span("mindbridge.test.second_attempt"):
+        await store.claim_observation_processing_job(tenant_id, observation_id, job_id)
+        set_current_span_attributes({"mindbridge.model.input_tokens": 30})
+        await store.commit_observation_processing(
+            tenant_id,
+            observation_id,
+            job_id,
+            attempt=2,
+            output=empty_output,
+        )
+    second_attempt = await _job_timing(database_url, tenant_id, job_id)
+
+    started_at, created_at, input_tokens, output_tokens = first_attempt
+    assert started_at is not None and started_at >= created_at
+    assert (input_tokens, output_tokens) == (120, 8)
+    # The retry reports its own wait, and the tokens the failed attempt burned are still owed.
+    assert second_attempt[0] is not None and second_attempt[0] > started_at
+    assert second_attempt[2:] == (150, 8)
+
+
+async def test_the_ledger_scan_finds_only_jobs_a_worker_would_still_claim(
+    store: PostgresMemoryStore,
+    database_url: str,
+) -> None:
+    """The repair has to match the claim: republishing anything else pays for nothing."""
+    kernel = _kernel(store)
+    tenant_id = TenantId("tenant_reconcile")
+    jobs = []
+    for sequence in (1, 2, 3, 4):
+        receipt = await kernel.observe(
+            _observe_request(
+                tenant_id=tenant_id,
+                sequence=sequence,
+                media_object_id=f"media_reconcile_{sequence}",
+            )
+        )
+        jobs.append((ObservationId(receipt.observation_id), JobId(receipt.processing_job_id)))
+    left_pending, failed, stale, succeeded = jobs
+    await store.claim_observation_processing_job(tenant_id, *failed)
+    await store.mark_observation_processing_failed(
+        tenant_id, *failed, attempt=1, error_code="model_output_invalid"
+    )
+    await store.claim_observation_processing_job(tenant_id, *stale)
+    await store.claim_observation_processing_job(tenant_id, *succeeded)
+    await store.commit_observation_processing(
+        tenant_id,
+        *succeeded,
+        attempt=1,
+        output=ObservationProcessingOutput(
+            evidence_spans=(),
+            events=(),
+            entities=(),
+            entity_mentions=(),
+            claims=(),
+            memories=(),
+            relations=(),
+            embeddings=(),
+        ),
+    )
+
+    connection = await AsyncConnection.connect(database_url)
+    async with connection:
+        # What a lost worker leaves behind: still running, but past the window the claim
+        # treats as abandoned. Nothing else in the ledger records that it is unreachable.
+        await connection.execute(
+            """
+            UPDATE jobs SET updated_at = now() - make_interval(secs => %s)
+            WHERE tenant_id = %s AND job_id = %s
+            """,
+            (OBSERVATION_JOB_STALE_AFTER_SECONDS + 60, tenant_id, stale[1]),
+        )
+        # A job whose observation is gone: the worker would only fail it again.
+        await connection.execute(
+            """
+            INSERT INTO jobs (
+                tenant_id, job_id, job_type, state, payload, created_at, updated_at
+            )
+            VALUES (%s, 'job_process_obs_deleted', 'process_observation', 'pending',
+                    '{"observation_id": "obs_deleted"}', now(), now())
+            """,
+            (tenant_id,),
+        )
+        await connection.commit()
+        claimable = await unreachable_observation_jobs(connection, tenant_id=tenant_id)
+        with_failed = await unreachable_observation_jobs(
+            connection, tenant_id=tenant_id, include_failed=True
+        )
+        other_tenant = await unreachable_observation_jobs(
+            connection, tenant_id=TenantId("tenant_job_cost")
+        )
+
+    assert [job_id for _, _, job_id in claimable] == [left_pending[1], stale[1]]
+    assert [job_id for _, _, job_id in with_failed] == [left_pending[1], failed[1], stale[1]]
+    assert [job_id for _, _, job_id in other_tenant] == []
+
+
+async def test_the_reconciler_republishes_what_the_ledger_still_owes(
+    store: PostgresMemoryStore,
+    database_url: str,
+) -> None:
+    """A row with no message behind it is invisible until the two are compared."""
+    tenant_id = TenantId("tenant_republish")
+    await _kernel(store).observe(_observe_request(tenant_id=tenant_id))
+
+    report = await reconcile(
+        database_url,
+        "memory://",
+        tenant_id=tenant_id,
+        include_failed=False,
+        republish=True,
+    )
+    # Counted from the broker, not from the report: an in-process transport shares its queues
+    # by name, so this is the message actually delivered rather than the number claimed.
+    delivered = queue_depth(create_task_queue("memory://"))
+
+    assert delivered == 1
+    assert report["queue"] == "mindbridge"
+    # Zero because the publisher the kernel was given here discards, which is the divergence
+    # this repairs; the depth is read before the repair so it describes what was found.
+    assert (report["queue_depth"], report["claimable"], report["republished"]) == (0, 1, 1)
+    tenants = cast(list[dict[str, object]], report["tenants"])
+    # Split out because it is now a real measured duration rather than a constant: a job that has
+    # only ever waited has its wait counted from `updated_at`, where the previous expression
+    # derived it from a `started_at` that is still NULL until something claims the job -- so this
+    # read 0.0 for every pending job no matter how long it had been queued.
+    waited = cast(float, tenants[0].pop("queue_wait_seconds"))
+    assert waited > 0
+    assert tenants == [
+        {
+            "tenant_id": tenant_id,
+            "jobs": 1,
+            "pending": 1,
+            "running": 0,
+            "failed": 0,
+            "succeeded": 0,
+            "work_seconds": 0.0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+        }
+    ]
+
+
+async def test_the_ledger_charges_the_attempt_in_flight_and_every_attempt_before_it(
+    store: PostgresMemoryStore,
+    database_url: str,
+) -> None:
+    """Two ways the ledger understated worker time, both structural rather than approximate.
+
+    The claim stamps `started_at` and `updated_at` together, so `updated_at - started_at` was
+    exactly zero for a *running* job -- and this summary exists to answer "who is consuming the
+    worker" and orders by that column, so the tenant holding a worker right now contributed
+    nothing and sorted last. A retry then moved `started_at` forward, leaving the difference
+    covering only the final attempt while the token columns beside it counted every attempt.
+
+    Both are pinned by making the first attempt the slow one: under the old expressions the
+    retried tenant's work would collapse to its short second attempt while its "wait" absorbed
+    the long first one, so `wait > work`. It is the other way around.
+    """
+    kernel = _kernel(store)
+    slow_seconds = 0.4
+
+    running_tenant = TenantId("tenant_accounting_running")
+    receipt = await kernel.observe(
+        _observe_request(
+            tenant_id=running_tenant, sequence=1, media_object_id="media_accounting_running"
+        )
+    )
+    running_job = (ObservationId(receipt.observation_id), JobId(receipt.processing_job_id))
+    await store.claim_observation_processing_job(running_tenant, *running_job)
+    await asyncio.sleep(slow_seconds)
+
+    retried_tenant = TenantId("tenant_accounting_retried")
+    receipt = await kernel.observe(
+        _observe_request(
+            tenant_id=retried_tenant, sequence=1, media_object_id="media_accounting_retried"
+        )
+    )
+    retried_job = (ObservationId(receipt.observation_id), JobId(receipt.processing_job_id))
+    await store.claim_observation_processing_job(retried_tenant, *retried_job)
+    await asyncio.sleep(slow_seconds)
+    await store.mark_observation_processing_failed(
+        retried_tenant, *retried_job, attempt=1, error_code="model_output_invalid"
+    )
+    await store.claim_observation_processing_job(retried_tenant, *retried_job)
+    await store.commit_observation_processing(
+        retried_tenant,
+        *retried_job,
+        attempt=2,
+        output=ObservationProcessingOutput(
+            evidence_spans=(),
+            events=(),
+            entities=(),
+            entity_mentions=(),
+            claims=(),
+            relations=(),
+            memories=(),
+            embeddings=(),
+        ),
+    )
+
+    connection = await AsyncConnection.connect(database_url, autocommit=True)
+    async with connection:
+        rows = {row.tenant_id: row for row in await observation_job_accounting(connection)}
+
+    running = rows[running_tenant]
+    assert running.running == 1
+    # The defect: this was 0 for the whole time the job held a worker.
+    assert running.work_seconds >= slow_seconds
+
+    # An abandoned attempt stops accruing at the stale window. Past it the claim treats the row
+    # as reclaimable, so whatever held it is gone; without the cap a worker that died would grow
+    # its tenant's total forever and sort every live tenant below a corpse.
+    abandoned = await AsyncConnection.connect(database_url, autocommit=True)
+    async with abandoned:
+        await abandoned.execute(
+            # `created_at` moves with it: migration 0022's CHECK forbids a start before creation,
+            # which is that constraint doing its job on a hand-built row.
+            "UPDATE jobs SET created_at = now() - make_interval(secs => %s),"
+            " started_at = now() - make_interval(secs => %s) WHERE tenant_id = %s",
+            (
+                OBSERVATION_JOB_STALE_AFTER_SECONDS * 6,
+                OBSERVATION_JOB_STALE_AFTER_SECONDS * 5,
+                running_tenant,
+            ),
+        )
+        stale = {row.tenant_id: row for row in await observation_job_accounting(abandoned)}[
+            running_tenant
+        ]
+    assert stale.work_seconds == pytest.approx(OBSERVATION_JOB_STALE_AFTER_SECONDS, rel=0.01)
+
+    retried = rows[retried_tenant]
+    assert retried.succeeded == 1
+    # Both attempts are charged, not just the last -- which is what makes this consistent with
+    # the token columns, where 0022 already counted every attempt.
+    assert retried.work_seconds >= slow_seconds
+    # And the long first attempt is work, not waiting. Reversed under the old expressions.
+    assert retried.queue_wait_seconds < retried.work_seconds
+
+
+async def test_reclaiming_a_stale_attempt_charges_it_once_and_stops_at_the_stale_window(
+    store: PostgresMemoryStore,
+    database_url: str,
+) -> None:
+    """A dead worker's abandoned interval was written to both duration columns, uncapped.
+
+    The claim's SET list reads the pre-update row, where a running job has `started_at` equal to
+    `updated_at` because the previous claim stamped both in one statement. So the same interval
+    was added to `queue_wait_seconds` and to `work_seconds`, and the wait column absorbed time
+    the job spent running. The reader's cap only guards the interval still open; a reclaim wrote
+    the uncapped value permanently, so `--republish` after a worker died sorted the tenant with
+    the deadest worker first in the summary that answers "who is consuming the worker".
+    """
+    tenant_id = TenantId("tenant_stale_reclaim")
+    receipt = await _kernel(store).observe(
+        _observe_request(tenant_id=tenant_id, media_object_id="media_stale_reclaim")
+    )
+    job = (ObservationId(receipt.observation_id), JobId(receipt.processing_job_id))
+    await store.claim_observation_processing_job(tenant_id, *job)
+
+    connection = await AsyncConnection.connect(database_url, autocommit=True)
+    async with connection:
+        await connection.execute(
+            "SELECT set_config('mindbridge.tenant_id', %s, false)", (tenant_id,)
+        )
+        # Age the claimed row past the stale window, exactly as a worker that died would leave
+        # it. `created_at` moves too because migration 0022 forbids a start before creation.
+        await connection.execute(
+            """
+            UPDATE jobs
+            SET created_at = now() - make_interval(secs => %s),
+                started_at = now() - make_interval(secs => %s),
+                updated_at = now() - make_interval(secs => %s)
+            WHERE tenant_id = %s
+            """,
+            (
+                OBSERVATION_JOB_STALE_AFTER_SECONDS * 3,
+                OBSERVATION_JOB_STALE_AFTER_SECONDS * 2,
+                OBSERVATION_JOB_STALE_AFTER_SECONDS * 2,
+                tenant_id,
+            ),
+        )
+        waited_before = await _job_durations(connection, tenant_id)
+
+        claim = await store.claim_observation_processing_job(tenant_id, *job)
+        wait_seconds, work_seconds = await _job_durations(connection, tenant_id)
+
+    assert claim.acquired and claim.job.attempt == 2
+    # The abandoned attempt was running, not queued, so it owes the wait column nothing.
+    assert wait_seconds == waited_before[0]
+    # And it stops accruing where the reader stops counting it, for the same reason: past the
+    # stale window whatever held it is gone.
+    assert work_seconds == pytest.approx(OBSERVATION_JOB_STALE_AFTER_SECONDS, rel=0.01)
+
+
+async def _job_durations(connection: AsyncConnection, tenant_id: TenantId) -> tuple[float, float]:
+    """Read the columns as written, which is what a reclaim makes permanent."""
+    cursor = await connection.execute(
+        "SELECT queue_wait_seconds, work_seconds FROM jobs WHERE tenant_id = %s", (tenant_id,)
+    )
+    return cast(tuple[float, float], await cursor.fetchone())
+
+
+async def test_a_tenant_confined_role_is_refused_a_ledger_wide_scan(
+    store: PostgresMemoryStore,
+    database_url: str,
+) -> None:
+    """Under FORCE row-level security an unscoped scan reports an empty ledger, not an error."""
+    receipt = await _kernel(store).observe(_observe_request(tenant_id="tenant_rls_scan"))
+    tenant_id = TenantId("tenant_rls_scan")
+
+    connection = await AsyncConnection.connect(database_url)
+    async with connection:
+        await connection.execute("SET ROLE mindbridge_runtime")
+        confined = await tenant_scope_required(connection)
+        blind = await unreachable_observation_jobs(connection)
+        await connection.execute(
+            "SELECT set_config('mindbridge.tenant_id', %s, false)",
+            (tenant_id,),
+        )
+        scoped = await unreachable_observation_jobs(connection, tenant_id=tenant_id)
+        await connection.execute("RESET ROLE")
+        unconfined = await tenant_scope_required(connection)
+
+    assert confined is True
+    assert blind == ()
+    assert [job_id for _, _, job_id in scoped] == [JobId(receipt.processing_job_id)]
+    assert unconfined is False
+
+
+async def _job_timing(
+    database_url: str,
+    tenant_id: str,
+    job_id: str,
+) -> tuple[datetime | None, datetime, int | None, int | None]:
+    connection = await AsyncConnection.connect(database_url)
+    async with connection:
+        row = await (
+            await connection.execute(
+                """
+                SELECT started_at, created_at, input_tokens, output_tokens
+                FROM jobs WHERE tenant_id = %s AND job_id = %s
+                """,
+                (tenant_id, job_id),
+            )
+        ).fetchone()
+    return cast("tuple[datetime | None, datetime, int | None, int | None]", row)
 
 
 def _observe_request(

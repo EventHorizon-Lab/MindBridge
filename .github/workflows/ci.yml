@@ -26,13 +26,13 @@ jobs:
           # said nothing about the benchmark harness, whose own extra could not import it.
           - name: core
             requirement: .
-            probe: configuration contracts core file_integrity prompts sdk
+            probe: config_cli configuration contracts core file_integrity prompts sdk
           - name: edge
             requirement: .[edge]
             probe: edge
           - name: server
             requirement: .[server]
-            probe: api application celery_app cli consolidation_cli infrastructure lifecycle_cli models server telemetry worker
+            probe: api application celery_app cli consolidation_cli consolidation_worker infrastructure jina_server jobs_cli lifecycle_cli models server telemetry worker
           - name: benchmarks
             requirement: .[benchmarks]
             probe: benchmarks
@@ -69,7 +69,12 @@ jobs:
           wanted = tuple(f"mindbridge.{name}" for name in os.environ["PROBE"].split())
           found = sorted(
               name
-              for _, name, _ in pkgutil.walk_packages(mindbridge.__path__, "mindbridge.")
+              # Without `onerror` the walk re-raises anything that is not an ImportError, so
+              # one package whose import reaches configuration would end this step in a
+              # traceback rather than the report below -- the opposite of what the loop decides.
+              for _, name, _ in pkgutil.walk_packages(
+                  mindbridge.__path__, "mindbridge.", onerror=lambda _name: None
+              )
               if any(name == prefix or name.startswith(f"{prefix}.") for prefix in wanted)
           )
           failed = []
@@ -83,7 +88,13 @@ jobs:
                   # app from the environment as it loads. Anything that is not a missing
                   # import is configuration, not packaging, so it is not this job's business.
                   pass
-          print(f"imported {len(found)} modules under {' '.join(wanted)}")
+          if os.environ["PROBE"] == "edge":
+              for name in ("cv2", "funasr", "insightface", "numpy", "onnxruntime", "torch", "torchaudio"):
+                  try:
+                      importlib.import_module(name)
+                  except ImportError as error:
+                      failed.append(f"{name}: {error}")
+          print(f"imported {len(found) - len(failed)} of {len(found)} modules under {' '.join(wanted)}")
           for line in failed:
               print(f"  FAILED {line}")
           if not found:
@@ -148,7 +159,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.10", "3.11"]
+        # Every supported version, floor to ceiling. Each leg runs mypy as well as the tests,
+        # which is what replaces the `python_version` pin the mypy configuration used to carry.
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
 
     steps:
       - name: Check out repository
@@ -161,7 +174,7 @@ jobs:
           enable-cache: true
 
       - name: Install locked dependencies
-        run: uv sync --frozen --all-groups --extra edge --extra media --extra server
+        run: uv sync --frozen --all-groups --extra media --extra server
 
       - name: Check formatting
         run: uv run --frozen ruff format --check .

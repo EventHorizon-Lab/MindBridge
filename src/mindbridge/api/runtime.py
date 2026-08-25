@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import math
-import os
 from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass, field
@@ -20,6 +19,8 @@ from mindbridge.application.kernel import MemoryKernel
 from mindbridge.application.pipelines import AnswerPipeline, OccurrencePipeline
 from mindbridge.cli import parser as build_parser
 from mindbridge.configuration import (
+    MissingConfigurationError,
+    configuration_source,
     copy_plugin_configuration,
     optional_environment_value,
     plugin_configuration,
@@ -53,7 +54,7 @@ from mindbridge.models.plugins import (
     load_embedder,
     load_generator,
 )
-from mindbridge.telemetry import configure_telemetry, instrument_fastapi
+from mindbridge.telemetry import configure_observability, instrument_fastapi
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,7 +110,7 @@ class Settings:
     @classmethod
     def from_environment(cls, environ: Mapping[str, str] | None = None) -> Settings:
         """Read the documented deployment contract and fail before startup."""
-        source = os.environ if environ is None else environ
+        source = configuration_source(environ)
         generator_plugin = source.get("MINDBRIDGE_GENERATOR_PLUGIN", "openai")
         embedder_plugin = source.get("MINDBRIDGE_EMBEDDER_PLUGIN", "openai")
         generator_config = plugin_configuration(
@@ -196,14 +197,25 @@ class _Runtime:
             yield
 
 
+def require_rest_authentication(settings: Settings) -> str:
+    """The tenant key map the REST surface refuses to build without.
+
+    There is no anonymous mode; only `/healthz` is public. `Settings` keeps the field optional
+    because the MCP surface does not read it, so the requirement belongs to this surface -- and
+    it lives in one function so `mindbridge config check` reports it from the same definition
+    `create_app` enforces, rather than from a second copy that could fall behind.
+    """
+    if settings.tenant_api_keys_json is None:
+        raise MissingConfigurationError("MINDBRIDGE_TENANT_API_KEYS_JSON")
+    return settings.tenant_api_keys_json
+
+
 def create_app(settings: Settings | None = None) -> FastAPI:
     """Create the deployable REST application."""
     resolved = settings or Settings.from_environment()
-    if resolved.tenant_api_keys_json is None:
-        raise ValueError("MINDBRIDGE_TENANT_API_KEYS_JSON must be configured for the REST API")
-    authenticator = TenantApiKeyAuthenticator.from_json(resolved.tenant_api_keys_json)
+    authenticator = TenantApiKeyAuthenticator.from_json(require_rest_authentication(resolved))
     runtime = _build_runtime(resolved)
-    telemetry = configure_telemetry("mindbridge-api")
+    telemetry = configure_observability("mindbridge-api")
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
@@ -233,7 +245,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 def create_mcp_server(settings: Settings | None = None) -> MCPServer[None]:
     """Create the deployable MCP server."""
     runtime = _build_runtime(settings or Settings.from_environment())
-    configure_telemetry("mindbridge-mcp")
+    configure_observability("mindbridge-mcp")
 
     @asynccontextmanager
     async def lifespan(_server: MCPServer[None]) -> AsyncIterator[None]:

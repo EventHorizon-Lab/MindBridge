@@ -395,10 +395,10 @@
       },
       "EvidenceView": {
         "additionalProperties": false,
-        "description": "Precise evidence location safe to expose to a caller.",
+        "description": "Precise evidence location safe to expose to a caller.\n\nThe offsets locate the span inside `media_object_id`. They do not locate it inside\n`media_url`, which is usually a copy cut for this span alone: that copy's own timeline\nstarts at zero and may carry slightly more than the span, and where no single copy covers\nthe span it is the whole source object instead. Seek with these offsets only into\n`media_object_id`.",
         "properties": {
           "end_ms": {
-            "description": "Span end within that media, in milliseconds.",
+            "description": "Span end within `media_object_id`, in milliseconds.",
             "minimum": 0.0,
             "title": "End Ms",
             "type": "integer"
@@ -411,14 +411,14 @@
             "type": "string"
           },
           "media_object_id": {
-            "description": "Media object the span was cut from.",
+            "description": "Media object the span was cut from, and the one the offsets below index.",
             "maxLength": 255,
             "minLength": 1,
             "title": "Media Object Id",
             "type": "string"
           },
           "media_url": {
-            "description": "Signed URL for the bytes, so verifying needs no separate storage call.",
+            "description": "Signed URL for this span's bytes, so verifying needs no separate storage call. It is a copy cut for the span where one exists, and the whole source object where none does; bytes are attached to a generation request only while they are about the span, so an answer over a span its source dwarfs was produced without them.",
             "maxLength": 2048,
             "minLength": 1,
             "title": "Media Url",
@@ -431,7 +431,7 @@
             "type": "string"
           },
           "start_ms": {
-            "description": "Span start within that media, in milliseconds.",
+            "description": "Span start within `media_object_id`, in milliseconds.",
             "minimum": 0.0,
             "title": "Start Ms",
             "type": "integer"
@@ -1840,6 +1840,46 @@
         "title": "RecallResult",
         "type": "object"
       },
+      "RememberBatchRequest": {
+        "additionalProperties": false,
+        "description": "Retain several memories in one call, and so in one encoder round trip.",
+        "properties": {
+          "memories": {
+            "description": "The memories to retain, at most 100, each exactly as the single-memory request accepts it. Results come back in this order.",
+            "items": {
+              "$ref": "#/components/schemas/RememberRequest"
+            },
+            "maxItems": 100,
+            "minItems": 1,
+            "title": "Memories",
+            "type": "array"
+          }
+        },
+        "required": [
+          "memories"
+        ],
+        "title": "RememberBatchRequest",
+        "type": "object"
+      },
+      "RememberBatchResult": {
+        "additionalProperties": false,
+        "description": "One result per requested memory, in request order.",
+        "properties": {
+          "memories": {
+            "description": "One result per requested memory, positionally aligned with the request. Each carries its own `created` or `duplicate` status, so a partially resent batch reports exactly which of its memories were already stored.",
+            "items": {
+              "$ref": "#/components/schemas/RememberResult"
+            },
+            "title": "Memories",
+            "type": "array"
+          }
+        },
+        "required": [
+          "memories"
+        ],
+        "title": "RememberBatchResult",
+        "type": "object"
+      },
       "RememberRequest": {
         "additionalProperties": false,
         "description": "Explicitly retain user- or agent-supplied content.",
@@ -3043,6 +3083,110 @@
           }
         ],
         "summary": "Remember"
+      }
+    },
+    "/v1/memories/batch": {
+      "post": {
+        "description": "Retain several memories in one call, and so in one encoder round trip.\n\nThe batch settles whole: every write completes before the first failure propagates, so\nretrying is safe and the memories that already landed come back `duplicate`.",
+        "operationId": "rememberBatch",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RememberBatchRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RememberBatchResult"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "`authentication_required` — a valid bearer API key is required\n\n`authentication_failed` — the bearer API key is invalid"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "`tenant_access_denied` — the authenticated tenant cannot access this resource"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "`idempotency_conflict` — the idempotency key already stores different content"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "`request_validation_failed` — request validation failed\n\n`domain_invariant_failed` — the request is well-formed but violates a memory invariant"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "`memory_integrity_failed` — stored memory is inconsistent"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "`model_request_failed` — memory model rejected its configured request\n\n`model_output_invalid` — memory model returned invalid output"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "`database_unavailable` — memory storage is temporarily unavailable\n\n`model_unavailable` — memory model is unavailable\n\n`object_storage_unavailable` — evidence media is unavailable"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Remember Batch"
       }
     },
     "/v1/memories/{memory_id}": {

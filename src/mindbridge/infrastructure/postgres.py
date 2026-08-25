@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 from collections.abc import Iterable, Mapping
 
 from pgvector.psycopg import register_vector_async
@@ -22,6 +21,7 @@ from mindbridge.application.semantic_claims import (
 from mindbridge.application.summary_consolidation import (
     SummaryWrite,
 )
+from mindbridge.configuration import configuration_source
 from mindbridge.core import (
     DEFAULT_EMBEDDING_DIMENSION,
     DeletionTombstone,
@@ -84,7 +84,7 @@ def resolve_database_max_pool_size(environ: Mapping[str, str] | None = None) -> 
     # variable here rather than in one process's settings is what makes the comment above
     # true for all of them: previously only the API read it, so lowering it left the other
     # three at the default and the deployment still exceeded its server.
-    source = os.environ if environ is None else environ
+    source = configuration_source(environ)
     raw = source.get("MINDBRIDGE_DATABASE_MAX_POOL_SIZE")
     if raw is None:
         return DEFAULT_DATABASE_MAX_POOL_SIZE

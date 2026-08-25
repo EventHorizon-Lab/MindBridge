@@ -66,6 +66,8 @@ def test_m3_artifacts_pin_media_models_code_and_jsonl_output(tmp_path: Path) -> 
     assert prediction["id"] == "video_01_Q01"
     assert prediction["response"] == "A person entered"
     assert manifest.deployment.worker_generator is not None
+    assert manifest.deployment.worker_generator.config["model_id"] == "qwen3.8-omni"
+    assert manifest.deployment.server_generator.config["model_id"] == "qwen3.8-max"
     assert manifest.request_timeout_seconds == 1_800.0
     assert manifest.run_id == "run_01"
     assert manifest.clip_count == 1
@@ -137,6 +139,7 @@ def _write_deployment(path: Path) -> None:
                     "plugin": "openai",
                     "distribution": "mindbridge",
                     "version": "0.1.0",
+                    "config": {"model_id": "qwen3.8-max"},
                 },
                 "server_embedder": {
                     "plugin": "openai",
@@ -148,6 +151,7 @@ def _write_deployment(path: Path) -> None:
                     "plugin": "openai",
                     "distribution": "mindbridge",
                     "version": "0.1.0",
+                    "config": {"model_id": "qwen3.8-omni"},
                 },
                 "worker_media_embedder": {
                     "plugin": "jina",

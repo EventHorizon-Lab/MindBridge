@@ -18,7 +18,11 @@ from mindbridge.application.capabilities import GenerateRequest, Generator, Mode
 from mindbridge.application.episodes import EpisodeConsolidation, EpisodeProposal
 from mindbridge.application.perception import ResolvedEvidence
 from mindbridge.application.pipelines.evidence import evidence_parts
-from mindbridge.application.pipelines.structured import generate_json, unwrap_json_code_fence
+from mindbridge.application.pipelines.structured import (
+    generate_json,
+    output_schema,
+    unwrap_json_code_fence,
+)
 from mindbridge.core import DomainInvariantError, Event, EventId, ModelOutputError
 from mindbridge.prompts import CONSOLIDATE_EPISODES_PROMPT
 from mindbridge.telemetry import operation_span, set_current_span_attributes
@@ -60,6 +64,9 @@ class _ConsolidationOutput(BaseModel):
         return self
 
 
+_EPISODE_CONSOLIDATION_SCHEMA = output_schema("episode_consolidation", _ConsolidationOutput)
+
+
 class EpisodePipeline:
     """Turn a Generator into evidence-first episode verification."""
 
@@ -93,6 +100,7 @@ class EpisodePipeline:
                     )
                 ),
                 max_output_tokens=self._max_output_tokens,
+                output_schema=_EPISODE_CONSOLIDATION_SCHEMA,
             ),
             lambda content: _parse_output(content, events),
         )

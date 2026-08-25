@@ -25,6 +25,7 @@ from mindbridge.contracts import (
     RememberRequest,
 )
 from mindbridge.core import JobState, MediaKind
+from mindbridge.sdk import MindBridgeError
 
 NOW = datetime(2024, 5, 31, 7, 58, tzinfo=timezone.utc)
 
@@ -289,6 +290,53 @@ async def test_memlens_splits_long_turns_without_losing_content() -> None:
     assert len(api.remember_requests) == 3
     assert all(len(request.summary) <= 2_048 for request in api.remember_requests)
     assert sum(request.summary.count("x") for request in api.remember_requests) == 4_000
+
+
+async def test_memlens_keeps_finished_sessions_when_one_session_fails_to_ingest() -> None:
+    """A session that cannot be written used to discard every session written beside it."""
+
+    class FailingMemoryApi(RecordingMemoryApi):
+        async def remember(self, request: RememberRequest) -> object:
+            if "sess_b" in request.summary:
+                raise MindBridgeError(
+                    "session could not be written",
+                    code="model_request_failed",
+                    status_code=502,
+                    trace_id="trace_ingest_error",
+                )
+            return await super().remember(request)
+
+    api = FailingMemoryApi()
+    question = _question().model_copy(
+        update={
+            "question_id": "q_partial",
+            "sessions": tuple(
+                MemLensSession(
+                    session_id=session_id,
+                    occurred_at=NOW - timedelta(days=day),
+                    turns=(
+                        MemLensTurn(turn_id="turn_0", role="user", content=f"{session_id} turn_0"),
+                    ),
+                )
+                for day, session_id in ((3, "sess_a"), (2, "sess_b"), (1, "sess_c"))
+            ),
+        }
+    )
+
+    result = await run_memlens_question(
+        cast(MindBridge, api),
+        question,
+        run_id="run_01",
+        text_only=True,
+        request_concurrency=3,
+    )
+
+    assert [request.summary for request in api.remember_requests] == [
+        'User said: "sess_a turn_0"',
+        'User said: "sess_c turn_0"',
+    ]
+    assert result.prediction == "$260.00"
+    assert result.mindbridge_ingest_failure_count == 1
 
 
 def _question() -> MemLensQuestion:

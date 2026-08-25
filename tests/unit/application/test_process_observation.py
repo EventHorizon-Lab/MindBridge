@@ -1,12 +1,15 @@
 """Vertical unit checks for retry-safe observation processing."""
 
+import logging
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 import pytest
 from consolidation_doubles import RecordingTextEmbedder
 
+from mindbridge import telemetry
 from mindbridge.application import process_observation as process_observation_module
+from mindbridge.application.derive_observation_graph import embed_observation_graph
 from mindbridge.application.evidence_clips import ClipSampling
 from mindbridge.application.observation_processing import (
     ObservationBatch,
@@ -23,6 +26,7 @@ from mindbridge.application.ports import PresignedMediaDownload
 from mindbridge.application.process_observation import (
     ProcessObservation,
     _require_grounded_perception,
+    record_unclaimed_processing_failure,
 )
 from mindbridge.core import (
     AnonymousIdentityObservation,
@@ -42,6 +46,7 @@ from mindbridge.core import (
     MediaObject,
     MediaObjectId,
     MemoryId,
+    MemoryIntegrityError,
     ModelReference,
     ModelRequestError,
     ModelUnavailableError,
@@ -175,9 +180,7 @@ class RecordingPerceiver:
                     ),
                 ),
             ),
-            model_reference=ModelReference(
-                model_id="qwen3.8-max",
-            ),
+            model_reference=ModelReference(model_id="qwen3.8-max"),
             prompt_version="perceive_events_v1",
         )
 
@@ -335,7 +338,28 @@ async def test_processor_builds_event_memory_and_raw_media_embedding_once(
         EmbeddedObjectType.EVENT,
         EmbeddedObjectType.CLAIM,
         EmbeddedObjectType.ENTITY,
+        EmbeddedObjectType.MEMORY_RECORD,
     }
+    # Recall searches the memory channel and turns its hits into memory IDs for two of its
+    # four store lookups, so a derived memory without a vector there is unreachable by half
+    # the fusion. Both rows come out of the four encoder inputs asserted above -- the memory's
+    # summary is its record's own text, so the second row reuses the first row's vector.
+    memory_vectors = {
+        embedding.object_id: embedding.values
+        for embedding in store.output.embeddings
+        if embedding.object_type is EmbeddedObjectType.MEMORY_RECORD
+    }
+    assert set(memory_vectors) == {memory.memory_id for memory in store.output.memories}
+    represented = {
+        embedding.object_id: embedding.values
+        for embedding in store.output.embeddings
+        if embedding.object_type in {EmbeddedObjectType.EVENT, EmbeddedObjectType.CLAIM}
+    }
+    assert {
+        relation.target_id: represented[relation.source_id]
+        for relation in store.output.relations
+        if relation.relation_type is RelationType.REPRESENTED_BY
+    } == memory_vectors
     assert len(store.output.entities) == 3
     assert len(store.output.entity_mentions) == 3
     assert len(store.output.claims) == 1
@@ -373,6 +397,59 @@ class RepeatedEntityPerceiver(RecordingPerceiver):
             claims=(),
         )
         return replace(perception, events=(first, second))
+
+
+class AliasedClaimPerceiver(RecordingPerceiver):
+    """Asks for a claim type by the word the model reaches for, as the real parse does."""
+
+    async def perceive_events(
+        self,
+        observation: Observation,
+        evidence: tuple[ResolvedEvidence, ...],
+    ) -> EventPerception:
+        perception = await super().perceive_events(observation, evidence)
+        event = perception.events[0]
+        return replace(
+            perception,
+            events=(
+                replace(event, claims=(replace(event.claims[0], claim_type=ClaimType("action")),)),
+            ),
+        )
+
+
+async def test_a_resolved_claim_type_alias_stays_visible_for_the_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An aliased claim is indistinguishable from a native one once it lands.
+
+    The attempt's delta is the last point the substitution can be seen, so it is reported
+    beside the event and prompt counts -- a vocabulary that shifts, or that stops shifting
+    after a prompt change, should be readable instead of inferred.
+    """
+    attributes: list[dict[str, str | int | float | bool]] = []
+    monkeypatch.setattr(telemetry, "set_current_span_attributes", attributes.append)
+    store = RecordingProcessingStore()
+
+    with caplog.at_level(logging.WARNING):
+        await _processor(
+            store,
+            AliasedClaimPerceiver(),
+            RecordingEmbedder(),
+            RecordingTextEmbedder(),
+        ).run(TENANT_ID, OBSERVATION_ID, JOB_ID)
+
+    assert store.output is not None
+    assert store.output.claims[0].claim_type is ClaimType.FACT
+    assert [
+        value
+        for attribute in attributes
+        for key, value in attribute.items()
+        if key == "mindbridge.perception.claim_type_alias_count"
+    ] == [1]
+    # And on the deployment that samples a tenth of its traces into no collector, where the
+    # span carrying that number is discarded before anything reads it.
+    assert "mindbridge.perception.claim_type_alias_count=1" in caplog.text
 
 
 class RecasedEntityPerceiver(RecordingPerceiver):
@@ -470,6 +547,73 @@ async def test_processing_output_rejects_a_graph_without_event_memory_link() -> 
 
     with pytest.raises(DomainInvariantError, match="one-to-one"):
         replace(store.output, relations=relations)
+
+
+async def test_processing_output_rejects_a_memory_recall_cannot_look_up() -> None:
+    """The regression that ran a whole evaluation unnoticed has to fail, not go quiet.
+
+    3 336 memories with no MEMORY_RECORD vector across six audiovisual benchmarks broke
+    nothing observable: recall got an empty ID set out of that channel and its two ID-driven
+    store lookups returned nothing. Only a guard turns that back into a failure.
+    """
+    store = RecordingProcessingStore()
+    await _processor(
+        store,
+        RecordingPerceiver(),
+        RecordingEmbedder(),
+        RecordingTextEmbedder(),
+    ).run(TENANT_ID, OBSERVATION_ID, JOB_ID)
+    assert store.output is not None
+    embeddings = tuple(
+        embedding
+        for embedding in store.output.embeddings
+        if not (
+            embedding.object_type is EmbeddedObjectType.MEMORY_RECORD
+            and embedding.object_id == store.output.memories[0].memory_id
+        )
+    )
+
+    with pytest.raises(DomainInvariantError, match="searchable vector"):
+        replace(store.output, embeddings=embeddings)
+
+
+async def test_a_memory_vector_is_refused_when_it_would_encode_another_text() -> None:
+    """One vector stands for a record and its memory only while both carry one text.
+
+    The two rows share a vector because a derived memory restates its record rather than
+    summarising it. The day that stops being true the reused vector is silently stale, so the
+    reuse is checked against the memory that will be committed instead of assumed.
+    """
+    store = RecordingProcessingStore()
+    perceiver = RecordingPerceiver()
+    text_embedder = RecordingTextEmbedder()
+    processor = _processor(store, perceiver, RecordingEmbedder(), text_embedder)
+    await processor.run(TENANT_ID, OBSERVATION_ID, JOB_ID)
+    assert store.output is not None
+    events = store.output.events
+    claims = store.output.claims
+    entities = store.output.entities
+    memories = store.output.memories
+
+    embeddings = await embed_observation_graph(
+        TENANT_ID, events, claims, entities, memories, text_embedder, NOW
+    )
+    # Every memory stays present, so the refusal can only come from the changed text: a
+    # short tuple would trip the missing-memory branch instead and prove nothing.
+    paraphrased = (
+        replace(memories[0], summary="A different summary of the same event."),
+        *memories[1:],
+    )
+
+    assert {
+        embedding.object_id
+        for embedding in embeddings
+        if embedding.object_type is EmbeddedObjectType.MEMORY_RECORD
+    } == {memory.memory_id for memory in memories}
+    with pytest.raises(MemoryIntegrityError, match="text of the record it represents"):
+        await embed_observation_graph(
+            TENANT_ID, events, claims, entities, paraphrased, text_embedder, NOW
+        )
 
 
 async def test_processing_output_rejects_memory_evidence_from_another_record() -> None:
@@ -574,11 +718,58 @@ async def test_processor_records_sanitized_failure_state(
     assert store.job.error_code == error_code
 
 
+async def test_a_failure_before_the_claim_still_reaches_the_ledger() -> None:
+    """A worker that cannot load its models has to say so on the row, not drop the message.
+
+    `task_acks_late` acks and discards a message whose task raised, so anything that fails
+    before the claim above leaves no trace at all: the 2026-08-21 evaluation turned 479 CUDA
+    out-of-memory errors into ~17 `failed` rows and ~318 rows stranded `pending`. The claim is
+    taken here only in order to record -- it is what makes the row this delivery's to fail.
+    """
+    store = RecordingProcessingStore()
+
+    await record_unclaimed_processing_failure(
+        store,
+        TENANT_ID,
+        OBSERVATION_ID,
+        JOB_ID,
+        RuntimeError("CUDA out of memory"),
+    )
+
+    # `worker_setup_failed`, not the generic fallthrough: this observation was never perceived,
+    # so republishing it after the environment is fixed pays for nothing it already paid for.
+    assert (store.job.state, store.job.attempt, store.job.error_code) == (
+        JobState.FAILED,
+        1,
+        "worker_setup_failed",
+    )
+
+
+async def test_a_setup_failure_leaves_a_row_this_delivery_does_not_own_alone() -> None:
+    """Recording is only ever allowed on a row the claim actually handed over.
+
+    A redelivery of a job another worker finished, or one it still holds, must not be stamped
+    failed by a child that never got as far as loading a model.
+    """
+    store = RecordingProcessingStore()
+    store.job = _job(JobState.SUCCEEDED, attempt=1)
+
+    await record_unclaimed_processing_failure(
+        store,
+        TENANT_ID,
+        OBSERVATION_ID,
+        JOB_ID,
+        RuntimeError("CUDA out of memory"),
+    )
+
+    assert store.job.state is JobState.SUCCEEDED
+
+
 def test_processing_rejects_embedders_in_different_search_spaces() -> None:
     """Media and text vectors are compared directly, so one drifted space must fail loudly."""
 
     class DriftedTextEmbedder(RecordingTextEmbedder):
-        space_reference = EmbeddingSpaceReference(space_id="jina-v4")
+        space_reference = EmbeddingSpaceReference(space_id="jina-v5-text-matching")
 
     with pytest.raises(ValueError, match="one search space"):
         _processor(
@@ -629,9 +820,7 @@ def _batch() -> ObservationBatch:
                 start_ms=250,
                 end_ms=2_000,
                 confidence=0.97,
-                model_reference=ModelReference(
-                    model_id="insightface/buffalo_l",
-                ),
+                model_reference=ModelReference(model_id="insightface/buffalo_l"),
             ),
             AnonymousIdentityObservation(
                 identity_id="person_robot_01",
@@ -639,9 +828,7 @@ def _batch() -> ObservationBatch:
                 start_ms=1_500,
                 end_ms=2_500,
                 confidence=0.82,
-                model_reference=ModelReference(
-                    model_id="insightface/buffalo_l",
-                ),
+                model_reference=ModelReference(model_id="insightface/buffalo_l"),
             ),
         ),
     )

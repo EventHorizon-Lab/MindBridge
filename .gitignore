@@ -19,3 +19,12 @@ dist/
 # patterns are unanchored for that reason.
 receipts/
 review-receipts/
+
+# Celery beat writes its schedule database to the working directory it is started from,
+# which for this deployment is the repo root. It is runtime state, not source.
+celerybeat-schedule
+
+# Agent scratch: implementation-plan workspaces (ledgers, task briefs, reports, review diffs).
+# The subagent-driven-development skill assumes this directory is ignored; it holds working
+# notes for one plan and nothing another checkout needs.
+.superpowers/

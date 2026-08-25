@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import os
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -11,7 +10,11 @@ from typing import TYPE_CHECKING
 from urllib.parse import quote, urlsplit
 
 from mindbridge.application.ports import PresignedMediaDownload
-from mindbridge.configuration import optional_environment_value, require_environment_value
+from mindbridge.configuration import (
+    configuration_source,
+    optional_environment_value,
+    require_environment_value,
+)
 from mindbridge.core import MediaObject, MemoryIntegrityError, ObjectStorageError, utc_now
 
 if TYPE_CHECKING:
@@ -120,7 +123,7 @@ class S3MediaAccess:
     @classmethod
     def from_environment(cls, environ: Mapping[str, str] | None = None) -> S3MediaAccess:
         """Build tenant-scoped media access from the documented storage contract."""
-        return cls(object_storage_from_environment(os.environ if environ is None else environ))
+        return cls(object_storage_from_environment(configuration_source(environ)))
 
     async def create_presigned_download(
         self,

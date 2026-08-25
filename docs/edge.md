@@ -9,6 +9,11 @@ gates, and forget semantics are identical everywhere.
 uv sync --extra edge
 ```
 
+On Linux/Windows x86_64 and Apple Silicon with macOS 14+, `edge` includes the sync/storage stack
+plus FunASR, Torch/TorchAudio, InsightFace, ONNX Runtime, and OpenCV. Linux ARM device images keep
+the model wheels supplied by JetPack, RKNN, OpenVINO, or BPU. PyTorch 2.13 has no Intel macOS
+wheel, so Intel Macs get the orchestration stack but must supply a compatible model runtime.
+
 ## What the device owns
 
 | Responsibility | Owner |
@@ -145,13 +150,20 @@ than silently using CPU — a silent CPU fallback turns a capacity problem into 
 
 ## Platform runtimes
 
-Install InsightFace/ONNX Runtime and FunASR/ModelScope from the device image matching the target
-platform SDK — JetPack/CUDA, D-Robotics OpenExplorer, RKNN Toolkit, OpenVINO, or a plain CUDA/CPU
-host.
+Generic Linux/Windows x86_64 and Apple Silicon hosts get InsightFace/ONNX Runtime,
+FunASR/ModelScope, and their Torch runtime from `edge`. The portable `onnxruntime` dependency
+provides CPU face inference; CUDA or TensorRT face providers still come from a platform image.
+JetPack, D-Robotics OpenExplorer, RKNN Toolkit, OpenVINO, and BPU images provide the builds
+matching their platform instead.
 
-The generic `uv.lock` intentionally pins **no** vendor accelerator wheel. ONNX is the default
-portable artifact. Compiled engines (TensorRT, RKNN, OpenVINO IR, BPU `.bin`) are built and cached
-per platform and are never reused across device images.
+The optional annotated active-speaker path also calls the system `ffmpeg` executable and needs a
+build with `drawtext`, `libx264`, and AAC support. This is an operating-system dependency, not a
+Python wheel; the normal platform capture image should provide it.
+
+The lock resolves the same PyPI releases that a built wheel declares, but carries no JetPack,
+RKNN, OpenVINO, or BPU wheel. ONNX is the default portable artifact. Compiled engines (TensorRT,
+RKNN, OpenVINO IR, BPU `.bin`) are built and cached per platform and are never reused across device
+images.
 
 NeMo is not part of the current pipeline.
 
@@ -235,6 +247,10 @@ specifically so a device can never read truncation as completion.
 
 One SQLite file holds three things: the observation outbox, the deletion inbox, and the recent
 memory cache. Mode `0600`, WAL enabled.
+
+Each store operation opens its own connection and closes it again, so a process that runs for weeks
+holds no growing set of descriptors on this file. WAL is what makes that cheap and what lets a
+reader run while a writer commits.
 
 Put it on persistent storage that survives reboot — it is the durability boundary for everything
 captured but not yet acknowledged. Losing it loses observations that the cloud never saw.
