@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import json
 import math
-import os
 from collections.abc import Callable, Collection, Mapping
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
@@ -38,6 +37,7 @@ from mindbridge.configuration import (
     PluginConfigModel,
     PluginInteger,
     PluginNumber,
+    configuration_source,
     copy_plugin_configuration,
     optional_environment_value,
     plugin_configuration,
@@ -249,7 +249,7 @@ class WorkerSettings:
     @classmethod
     def from_environment(cls, environ: Mapping[str, str] | None = None) -> WorkerSettings:
         """Read the explicit Worker contract and fail before consuming jobs."""
-        source = os.environ if environ is None else environ
+        source = configuration_source(environ)
         generator_plugin = source.get("MINDBRIDGE_GENERATOR_PLUGIN", "openai")
         media_plugin = source.get("MINDBRIDGE_MEDIA_EMBEDDER_PLUGIN", "openai")
         # The Worker's text encoder must land in the same space the API queries, so it reads the
@@ -335,9 +335,13 @@ def _media_embedder_fallback(
     if plugin == "jina":
         return lambda: jina_media_embedder_config(source)
     if plugin == "openai":
-        return lambda: openai_embedder_config(
+        return lambda: plugin_configuration(
             source,
-            request_timeout_seconds=_MODEL_REQUEST_TIMEOUT_SECONDS,
+            "MINDBRIDGE_EMBEDDER_CONFIG_JSON",
+            lambda: openai_embedder_config(
+                source,
+                request_timeout_seconds=_MODEL_REQUEST_TIMEOUT_SECONDS,
+            ),
         )
     return None
 

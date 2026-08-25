@@ -3,6 +3,7 @@
 import asyncio
 from collections.abc import Awaitable, Mapping
 from datetime import datetime, timezone
+from pathlib import Path
 from time import time
 from typing import Any, cast
 from unittest.mock import Mock
@@ -608,6 +609,23 @@ def test_worker_media_slot_defaults_to_the_served_encoder_without_new_variables(
     assert settings.media_embedder_config["api_key"] == "text-embedding-secret"
     assert settings.media_embedder_config["space_id"] == settings.text_embedder_config["space_id"]
     assert "device" not in settings.media_embedder_config
+
+
+def test_worker_media_slot_reuses_the_file_backed_embedder_config(tmp_path: Path) -> None:
+    config = tmp_path / "mindbridge.toml"
+    config.write_text(
+        "[object_storage]\nbucket = 'memory'\n"
+        "[embedding]\ndimension = 1024\nspace_id = 'jina-v5'\n"
+        "[generator]\nendpoint = 'https://generator.example.test/v1'\n"
+        "[embedder]\nendpoint = 'https://text.example.test/v1'\nmodel_id = 'jina-omni'\n"
+        "[media_embedder]\nplugin = 'openai'\n",
+        encoding="utf-8",
+    )
+    settings = WorkerSettings.from_environment(
+        {**_environment(), "MINDBRIDGE_CONFIG_FILE": str(config)}
+    )
+
+    assert settings.media_embedder_config == settings.text_embedder_config
 
 
 def test_worker_can_explicitly_opt_into_the_local_jina_encoder() -> None:

@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-import os
 from collections.abc import Mapping, Sequence
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
@@ -32,6 +31,7 @@ from mindbridge.application.pipelines import (
 )
 from mindbridge.cli import parser as build_parser
 from mindbridge.configuration import (
+    configuration_source,
     copy_plugin_configuration,
     parse_aware_datetime,
     plugin_configuration,
@@ -109,7 +109,7 @@ class ConsolidationSettings:
         environ: Mapping[str, str] | None = None,
     ) -> ConsolidationSettings:
         """Read the documented process contract without requiring API or broker settings."""
-        source = os.environ if environ is None else environ
+        source = configuration_source(environ)
         generator_plugin = source.get("MINDBRIDGE_GENERATOR_PLUGIN", "openai")
         embedder_plugin = source.get("MINDBRIDGE_EMBEDDER_PLUGIN", "openai")
         return cls(

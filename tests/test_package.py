@@ -192,7 +192,19 @@ def _imported_modules(path: Path) -> set[str]:
 # belongs to exactly one of them, so a new module without a scenario fails the partition test
 # below rather than quietly relying on whatever extra a developer happened to have synced.
 SCENARIOS: dict[str, tuple[str, ...]] = {
-    "": ("__init__", "configuration", "contracts", "core", "file_integrity", "prompts", "sdk"),
+    # config_cli is core, not server: `mindbridge config check` has to run on a bare install,
+    # which is exactly the state an operator runs it from. Its heavy imports are deferred into
+    # `_settings_probe`, so nothing but stdlib and the base dependencies loads eagerly.
+    "": (
+        "__init__",
+        "config_cli",
+        "configuration",
+        "contracts",
+        "core",
+        "file_integrity",
+        "prompts",
+        "sdk",
+    ),
     "edge": ("edge",),
     "server": (
         "api",
@@ -258,6 +270,7 @@ PROVIDERS: dict[str, str] = {
     "psycopg_pool": "psycopg",
     "pyarrow": "pyarrow",
     "pydantic": "pydantic",
+    "tomli": "tomli",
     "pytest": "pytest",
     "sentence_transformers": "sentence-transformers",
     "soundfile": "soundfile",
@@ -267,6 +280,15 @@ PROVIDERS: dict[str, str] = {
     "uvicorn": "uvicorn",
 }
 """Import name to the distribution that provides it, spelled as `pyproject.toml` spells it."""
+
+STDLIB_ABOVE_FLOOR = frozenset({"tomllib"})
+"""Modules the standard library provides above the floor and a backport supplies below it.
+
+`sys.stdlib_module_names` describes the interpreter running the tests, so a 3.10 run does not
+recognise `tomllib` and reads the version-guarded import in `mindbridge.configuration` as an
+undeclared dependency. Its `tomli` half is declared and named in `PROVIDERS`; this names the
+other half, so one conditional import is not read as two missing ones.
+"""
 
 RUNTIME_ONLY = frozenset({"torchaudio", "torchvision"})
 """Dependencies an upstream model runtime imports rather than MindBridge itself."""
@@ -364,6 +386,8 @@ def _third_party(modules: Iterable[str]) -> set[str]:
         for module in modules
         if module.partition(".")[0] not in sys.stdlib_module_names
         and not module.startswith("mindbridge")
+        and module.partition(".")[0] not in STDLIB_ABOVE_FLOOR
+        and not (module.partition(".")[0] == "tomli" and sys.version_info >= (3, 11))
     }
 
 

@@ -1628,6 +1628,7 @@ source = { editable = "." }
 dependencies = [
     { name = "httpx" },
     { name = "pydantic" },
+    { name = "tomli", marker = "python_full_version < '3.11'" },
 ]
 
 [package.optional-dependencies]
@@ -1793,6 +1794,7 @@ requires-dist = [
     { name = "sentence-transformers", marker = "extra == 'cloud-models'", specifier = ">=5.2,<6" },
     { name = "soundfile", marker = "extra == 'media'", specifier = ">=0.13,<1" },
     { name = "starlette", marker = "extra == 'server'", specifier = ">=0.46,<2" },
+    { name = "tomli", marker = "python_full_version < '3.11'", specifier = ">=2,<3" },
     { name = "torch", marker = "(platform_machine == 'AMD64' and sys_platform != 'darwin' and extra == 'edge') or (platform_machine == 'x86_64' and sys_platform != 'darwin' and extra == 'edge') or (platform_machine == 'arm64' and sys_platform == 'darwin' and extra == 'edge')", specifier = "==2.13.0" },
     { name = "torch", marker = "extra == 'cloud-models'", specifier = "==2.13.0" },
     { name = "torchaudio", marker = "(platform_machine == 'AMD64' and sys_platform != 'darwin' and extra == 'edge') or (platform_machine == 'x86_64' and sys_platform != 'darwin' and extra == 'edge') or (platform_machine == 'arm64' and sys_platform == 'darwin' and extra == 'edge')", specifier = "==2.11.0" },
