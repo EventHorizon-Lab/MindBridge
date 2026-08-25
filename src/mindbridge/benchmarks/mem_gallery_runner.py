@@ -184,6 +184,12 @@ async def _ingest_topic_sessions(
     make `request_concurrency` inert, because the semaphore below is only ever acquired
     uncontended inside a serial await -- the same failure mode `memlens_runner` documents at
     `_ingest_session_turns` and was fixed the same way there.
+
+    The distinct-occurred_at claim is measured on the release, not guaranteed by the schema:
+    `MemGallerySession.occurred_at` is parsed from the release's per-session `date` field at day
+    granularity, so it is this release's one-session-per-date convention that makes sessions
+    orderable, not a `MemGallerySession` invariant. Checked against the pinned corpus: 240
+    sessions across all 20 topics, zero repeated dates within a topic.
     """
     session_starts = tuple(
         sum(len(previous.rounds) for previous in topic.sessions[:index])

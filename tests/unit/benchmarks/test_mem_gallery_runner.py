@@ -39,6 +39,7 @@ from mindbridge.core import (
     MemoryType,
     VerificationStatus,
 )
+from mindbridge.sdk import MindBridgeError
 
 NOW = datetime(2024, 6, 24, tzinfo=timezone.utc)
 
@@ -436,3 +437,103 @@ async def test_questions_are_answered_concurrently() -> None:
     assert "second" in api.recall_requests[0].query.text
     assert api.recall_requests[-1].query.text is not None
     assert "first" in api.recall_requests[-1].query.text
+
+
+async def test_a_failing_round_is_counted_but_other_rounds_still_land() -> None:
+    """A round that cannot be written used to discard every round written beside it."""
+
+    class FailingMemoryApi(RecordingMemoryApi):
+        async def remember(self, request: RememberRequest) -> object:
+            if request.summary.startswith("sess_b:1"):
+                raise MindBridgeError(
+                    "round could not be written",
+                    code="model_request_failed",
+                    status_code=502,
+                    trace_id="trace_ingest_error",
+                )
+            return await super().remember(request)
+
+    api = FailingMemoryApi()
+    topic = _topic().model_copy(
+        update={
+            "sessions": (
+                MemGallerySession(
+                    session_id="sess_a",
+                    occurred_at=NOW - timedelta(days=3),
+                    rounds=(
+                        MemGalleryRound(
+                            round_id="sess_a:1",
+                            user="sess_a question 1",
+                            assistant="sess_a answer 1",
+                        ),
+                    ),
+                ),
+                MemGallerySession(
+                    session_id="sess_b",
+                    occurred_at=NOW - timedelta(days=2),
+                    rounds=(
+                        # This round fails; the next one in the SAME session must still land --
+                        # the guard is per round, not per session.
+                        MemGalleryRound(
+                            round_id="sess_b:1",
+                            user="sess_b question 1",
+                            assistant="sess_b answer 1",
+                        ),
+                        MemGalleryRound(
+                            round_id="sess_b:2",
+                            user="sess_b question 2",
+                            assistant="sess_b answer 2",
+                        ),
+                    ),
+                ),
+                MemGallerySession(
+                    session_id="sess_c",
+                    occurred_at=NOW - timedelta(days=1),
+                    rounds=(
+                        MemGalleryRound(
+                            round_id="sess_c:1",
+                            user="sess_c question 1",
+                            assistant="sess_c answer 1",
+                        ),
+                    ),
+                ),
+            ),
+            "questions": (
+                MemGalleryQuestion(
+                    question_id="Baking:1",
+                    point="FR",
+                    question="Did the other rounds still land?",
+                    reference_answer="Yes.",
+                    session_ids=("sess_a", "sess_b", "sess_c"),
+                ),
+            ),
+        }
+    )
+
+    results = await run_mem_gallery_topic(
+        cast(MindBridge, api),
+        topic,
+        run_id="run1",
+        prepared=_prepared(),
+        tenant_prefix="benchmark_mem_gallery",
+        device_id="mem_gallery_conversation",
+        recall_limit=20,
+        request_concurrency=3,
+        poll_interval_seconds=0.01,
+        processing_timeout_seconds=1.0,
+    )
+
+    # The one failing round is counted...
+    assert results[0].mindbridge_ingest_failure_count == 1
+    # ...but every other round still landed, including the one right after it in sess_b, and
+    # neither of the failing round's own two speaker turns (it raised on the first) leaked through.
+    assert sorted(request.summary for request in api.remember_requests) == sorted(
+        [
+            "sess_a:1 User said: sess_a question 1",
+            "sess_a:1 Assistant said: sess_a answer 1",
+            "sess_b:2 User said: sess_b question 2",
+            "sess_b:2 Assistant said: sess_b answer 2",
+            "sess_c:1 User said: sess_c question 1",
+            "sess_c:1 Assistant said: sess_c answer 1",
+        ]
+    )
