@@ -736,7 +736,9 @@ extends the same clock-agreement guard to staged images. `--question-id` is repe
 a run to specific IDs; omit it for the whole split. The output is a JSON array of `{id, question,
 qtype, answer, prediction, evidence_ids, retrieved_evidence_ids, ...}` objects in the shape the
 official `JingbiaoMei/ATM-Bench` evaluator reads, with MindBridge's own retrieval diagnostics
-appended in fields that evaluator ignores.
+appended in fields that evaluator ignores. ATM-Bench is scored outside MindBridge the same way;
+record the official evaluator's verdict with `mindbridge-bench score`, described in "Recording an
+official scorer's result" below.
 
 Mem-Gallery replays one topic's whole multi-session dialogue as its own tenant, then answers that
 topic's own questions over it — the release is twenty independent personas, and a shared tenant
@@ -750,7 +752,11 @@ refuses the run before ingestion starts. Images are keyed by the release's own r
 (`image_key`); `media_object_id` is a separate, caller-assigned field, but for a dialogue image it
 must be set to the official `image_id` (for example `D2:IMG_001`) because `VS` ("visual search")
 questions ask the model to name the matching `image_id` directly as its answer, and that ID is
-what ties a retrieved image back to the release's own answer key. Question images carry no
+what ties a retrieved image back to the release's own answer key. That official ID is
+release-relative, not archive-unique — `D1:IMG_001` alone names a different picture in all twenty
+topics — so `media_object_id` only has to be unique within the one topic that answers a `VS`
+question with it, never across the whole staged manifest; `image_key`, which is always
+topic-prefixed, is what the manifest actually requires to be unique. Question images carry no
 official ID, so their `media_object_id` may be assigned freely:
 
 ```json
@@ -787,7 +793,9 @@ topic, point, question, answer, prediction, clue, retrieved_ids, ...}` objects i
 official `YuanchenBei/Mem-Gallery` evaluator reads. `point` is the official nine-way task code
 (`FR`, `MR`, `TR`, `VR`, `TTL`, `VS`, `CD`, `KR`, `AR`); scoring is broken out per `point`, and
 `AR` specifically rewards abstaining with the release's own refusal text (`Not mentioned.`), so
-its score is not comparable to the other eight without reading it on its own.
+its score is not comparable to the other eight without reading it on its own. Mem-Gallery is
+scored outside MindBridge too; record the official evaluator's verdict with
+`mindbridge-bench score`, described in "Recording an official scorer's result" below.
 
 MM-Lifelong prepared segments use the split-wide clock of the official `total_intervals` field.
 `start_seconds` must therefore be a global Day, Week, or Month offset, not a source-video-local
@@ -923,10 +931,10 @@ by a previous run.
 
 ## Recording an official scorer's result
 
-LoCoMo-Refined, MM-Lifelong, EgoTempo, and EgoMemReason are scored outside MindBridge. A run manifest is
-written before any of those scorers execute, so it can only pin inputs. Record their output in a
-`*.score.json` sidecar instead, which re-hashes the predictions and refuses numbers that belong to
-a different run:
+ATM-Bench, Mem-Gallery, LoCoMo-Refined, MM-Lifelong, EgoTempo, and EgoMemReason are scored outside
+MindBridge. A run manifest is written before any of those scorers execute, so it can only pin
+inputs. Record their output in a `*.score.json` sidecar instead, which re-hashes the predictions
+and refuses numbers that belong to a different run:
 
 ```bash
 uv run mindbridge-bench score \

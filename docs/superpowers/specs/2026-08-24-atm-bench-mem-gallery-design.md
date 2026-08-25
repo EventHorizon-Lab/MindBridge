@@ -52,7 +52,10 @@ Two facts worth pinning because both are easy to assume wrongly:
 
 - **The hard split is disjoint from the main split.** Intersection of the two ID sets is 0.
   Total question count across both files is 1,044, not 1,013.
-- **`notes` is empty in every one of the 1,013 rows.** The field is carried, never used.
+- **`notes` is empty in every one of the 1,013 main-split rows, but not the hard split's.** 10 of
+  the hard split's 31 rows carry substantive annotator notes explaining why the question is hard
+  (confounding evidence, a renamed hotel, an arithmetic breakdown); the field is not universally
+  unused, only unused where most questions live.
 
 ### Mem-Gallery — `Ethan-Bei/Mem-Gallery` @ `af912daba984e896e253016b7c7e334ef92c2a6f`
 
@@ -249,8 +252,10 @@ twenty in sorted filename order.
 ### Mem-Gallery
 
 1. Operator stages `data/image/<topic>` once, with `media_object_id` set to the official
-   `image_id` (`D2:IMG_003`) — the exact token a `VS` answer has to name. Question images
-   are staged the same way, keyed by their relative path.
+   `image_id` (`D2:IMG_003`) — the exact token a `VS` answer has to name. That ID is unique
+   per topic, not per release: `D1:IMG_001` alone names a different picture in all twenty
+   topics, so the staging contract requires uniqueness only within one topic's images.
+   Question images are staged the same way, keyed by their relative path.
 2. Per topic: one tenant, sessions in release order. A round with no image is one
    `remember` write; a round with an image is one `ingest_media` observation carrying the
    round's text, so the image and the words that surround it land in the same memory. The
@@ -275,12 +280,17 @@ twenty in sorted filename order.
 Both corpora are downloaded at their pinned revisions: 3.2 GB for ATM-Bench, 530 MB for
 Mem-Gallery. Staging is a one-off upload of those bytes.
 
-A full ATM run is 4,292 media observations plus 6,742 email writes, and the emails are the
-same in both arms — worth knowing before assuming the `sgm` arm is cheap. Neither full run
-is planned as part of this change; each subset run targets under two hours of wall clock:
+A full ATM run's `raw` arm is 4,292 media observations plus 6,742 email `remember` calls. The
+`sgm` arm is not cheaper by call count just because it skips perception: writing every
+`batch_results` record as text is 6,042 `remember` calls, not 4,292, because 1,063 of the 4,292
+blocks exceed the 2,048-character summary limit and split into multiple chunks (one into as many
+as 6) — worth knowing before assuming the `sgm` arm is cheap. The same 6,742 email writes happen
+in both arms, and email blocks never chunk (longest measured at 1,355 characters). Neither full
+run is planned as part of this change; each subset run targets under two hours of wall clock:
 
 - ATM subset: the questions selected plus the media they cite, both arms.
-- Mem-Gallery subset: one topic — 15 sessions, about 200 rounds, about 90 images.
+- Mem-Gallery subset: one topic — the worked example's `Baking_Dessert_Daily_Life_Skill`, 15
+  sessions, 262 rounds, 57 images.
 
 Full runs are follow-up work with their own budget: the raw arm's 533 videos are the
 expensive item, and prior measurements in this repository put video perception in the tens
