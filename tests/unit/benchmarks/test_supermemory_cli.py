@@ -61,9 +61,9 @@ def test_supermemory_artifacts_pin_inputs_models_metrics_and_output(tmp_path: Pa
 
 def test_supermemory_selection_is_subject_scoped_and_fail_closed() -> None:
     questions = (_question(1), _question(2, subject=2))
-    assert _select_questions(questions, 1, ()) == (questions[0],)
+    assert _select_questions(questions, 1, (), None) == (questions[0],)
     with pytest.raises(ValueError, match="unknown"):
-        _select_questions(questions, 1, (2,))
+        _select_questions(questions, 1, (2,), None)
 
 
 def _arguments(dataset_path: Path, prepared_path: Path, output_path: Path) -> _Arguments:
@@ -82,6 +82,7 @@ def _arguments(dataset_path: Path, prepared_path: Path, output_path: Path) -> _A
         recall_limit=20,
         request_concurrency=4,
         request_timeout_seconds=1_800.0,
+        limit=None,
         poll_interval_seconds=1.0,
         processing_timeout_seconds=1_800.0,
         question_ids=(),

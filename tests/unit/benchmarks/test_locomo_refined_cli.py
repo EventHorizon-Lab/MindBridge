@@ -141,6 +141,7 @@ def _arguments(dataset_path: Path, output_path: Path) -> _Arguments:
         recall_limit=20,
         request_concurrency=4,
         request_timeout_seconds=1_800.0,
+        limit=None,
         sample_ids=(),
         overwrite=False,
         quiet=True,

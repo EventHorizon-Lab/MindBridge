@@ -31,16 +31,16 @@ NOW = datetime(2026, 8, 25, 12, 0, tzinfo=timezone.utc)
 def test_selection_scopes_a_run_to_whole_groups() -> None:
     groups = (_group("001", "logic"), _group("002", "relevance"))
 
-    assert _select_groups(groups, ("001",), ()) == (groups[0],)
-    assert _select_groups(groups, (), ("relevance",)) == (groups[1],)
-    assert _select_groups(groups, (), ()) == groups
+    assert _select_groups(groups, ("001",), (), None) == (groups[0],)
+    assert _select_groups(groups, (), ("relevance",), None) == (groups[1],)
+    assert _select_groups(groups, (), (), None) == groups
     with pytest.raises(ValueError, match="no Video-MME-v2 groups"):
-        _select_groups((groups[0],), (), ("relevance",))
+        _select_groups((groups[0],), (), ("relevance",), None)
 
 
 def test_selecting_an_unknown_video_is_refused_rather_than_silently_dropped() -> None:
     with pytest.raises(ValueError, match="unknown Video-MME-v2 video IDs: 404"):
-        _select_groups((_group("001", "logic"),), ("404",), ())
+        _select_groups((_group("001", "logic"),), ("404",), (), None)
 
 
 def test_prepared_media_must_cover_every_selected_group() -> None:
@@ -127,6 +127,7 @@ def _arguments(
         recall_limit=20,
         request_concurrency=4,
         request_timeout_seconds=1_800.0,
+        limit=None,
         poll_interval_seconds=1.0,
         processing_timeout_seconds=1_800.0,
         video_ids=(),

@@ -57,10 +57,18 @@ def test_duration_breakdown_does_not_nest_further() -> None:
 def test_selection_scopes_a_run_to_one_official_duration() -> None:
     videos = (_video("long_1", "long"), _video("short_1", "short"))
 
-    assert _select_videos(videos, (), ("long",)) == (videos[0],)
-    assert _select_videos(videos, (), ()) == videos
+    assert _select_videos(videos, (), ("long",), None) == (videos[0],)
+    assert _select_videos(videos, (), (), None) == videos
     with pytest.raises(ValueError, match="no Video-MME videos"):
-        _select_videos((videos[1],), (), ("long",))
+        _select_videos((videos[1],), (), ("long",), None)
+
+
+def test_a_limit_applies_after_the_duration_filter_not_before_it() -> None:
+    """Applied before, `--limit 1 --duration long` truncates to a short video and keeps none."""
+    videos = (_video("short_1", "short"), _video("long_1", "long"))
+
+    assert _select_videos(videos, (), ("long",), 1) == (videos[1],)
+    assert _select_videos(videos, (), (), 1) == (videos[0],)
 
 
 def test_declaring_no_subtitles_while_feeding_transcripts_is_refused() -> None:
@@ -119,6 +127,7 @@ def _arguments(
         recall_limit=20,
         request_concurrency=4,
         request_timeout_seconds=1_800.0,
+        limit=None,
         poll_interval_seconds=1.0,
         processing_timeout_seconds=1_800.0,
         video_ids=(),

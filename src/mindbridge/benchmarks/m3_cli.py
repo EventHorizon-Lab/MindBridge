@@ -77,6 +77,7 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
         arguments.video_ids,
         key=lambda video: video.video_id,
         label="M3-Bench video IDs",
+        limit=arguments.limit,
     )
     _validate_subset(videos, arguments.subset)
     prepared = _prepared_by_video(videos, load_prepared_m3(arguments.prepared_media_path))

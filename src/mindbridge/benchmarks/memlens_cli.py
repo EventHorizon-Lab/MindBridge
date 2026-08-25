@@ -99,7 +99,7 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
         else None
     )
     questions = _select_questions(
-        load_memlens(arguments.dataset_path), subset_ids, arguments.question_ids
+        load_memlens(arguments.dataset_path), subset_ids, arguments.question_ids, arguments.limit
     )
     prepared = (
         load_prepared_memlens(arguments.prepared_images_path)
@@ -216,6 +216,7 @@ def _select_questions(
     questions: tuple[MemLensQuestion, ...],
     subset_ids: tuple[Identifier, ...] | None,
     question_ids: tuple[str, ...],
+    limit: int | None,
 ) -> tuple[MemLensQuestion, ...]:
     available = {question.question_id for question in questions}
     if subset_ids is not None:
@@ -230,6 +231,7 @@ def _select_questions(
         question_ids,
         key=lambda question: question.question_id,
         label="selected MEMLENS question IDs",
+        limit=limit,
     )
     if not questions:
         raise ValueError("MEMLENS selection must not be empty")

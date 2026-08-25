@@ -25,6 +25,7 @@ from mindbridge.benchmarks.cli_common import (
     connected_memory,
     core_parser,
     index_prepared,
+    limit_units,
     media_arguments,
     media_manifest,
     report,
@@ -82,7 +83,10 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
     """Run selected videos and emit the official nested prediction JSON."""
     arguments = _parse_arguments(argv, prog)
     videos = _select_videos(
-        load_video_mme(arguments.dataset_path), arguments.video_ids, arguments.durations
+        load_video_mme(arguments.dataset_path),
+        arguments.video_ids,
+        arguments.durations,
+        arguments.limit,
     )
     prepared = _select_prepared(load_prepared_videos(arguments.prepared_media_path), videos)
     require_declared_transcripts(prepared, arguments.transcript_source)
@@ -178,6 +182,7 @@ def _select_videos(
     videos: tuple[VideoMMEVideo, ...],
     video_ids: tuple[str, ...],
     durations: tuple[VideoMMEDuration, ...],
+    limit: int | None,
 ) -> tuple[VideoMMEVideo, ...]:
     videos = select_by_id(
         videos,
@@ -189,7 +194,7 @@ def _select_videos(
         videos = tuple(video for video in videos if video.duration in set(durations))
     if not videos:
         raise ValueError("no Video-MME videos match the requested IDs and durations")
-    return videos
+    return limit_units(videos, limit, label="Video-MME videos")
 
 
 def _select_prepared(

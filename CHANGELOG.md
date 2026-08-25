@@ -52,8 +52,10 @@ The capabilities present on `master` today:
 - OpenTelemetry across REST, model calls, PostgreSQL, S3, and queued jobs, capturing no user
   content.
 - Benchmark harness driving the production API across twelve official datasets plus the Agent
-  Memory Leaderboard offline replay, with `mindbridge-bench suite` running a list of them from one
-  invocation and recording each outcome in a sweep summary.
+  Memory Leaderboard offline replay. `mindbridge-bench suite --tasks a,b,c` runs several of them
+  from one invocation against one deployment, from a shipped task catalog rather than a file you
+  write, and records each outcome in a sweep summary. `--limit N` scopes any runner to its first N
+  units for a smoke run.
 - Python 3.10 through 3.14, with the whole quality gate — format, lint, types, tests — run on
   every one of them.
 

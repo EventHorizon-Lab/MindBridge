@@ -78,6 +78,7 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
         load_supermemory_vqa(arguments.dataset_path),
         arguments.subject,
         arguments.question_ids,
+        arguments.limit,
     )
     prepared = load_prepared_supermemory(arguments.prepared_media_path)
     require_writable_output_pair(arguments.output_path, overwrite=arguments.overwrite)
@@ -164,6 +165,7 @@ def _select_questions(
     questions: tuple[SuperMemoryQuestion, ...],
     subject: int,
     question_ids: tuple[int, ...],
+    limit: int | None,
 ) -> tuple[SuperMemoryQuestion, ...]:
     if subject <= 0:
         raise ValueError("subject must be positive")
@@ -172,6 +174,7 @@ def _select_questions(
         question_ids,
         key=lambda question: question.question_id,
         label=f"SuperMemory-VQA subject {subject} question IDs",
+        limit=limit,
     )
     if not selected:
         raise ValueError(f"SuperMemory-VQA subject {subject} has no selected questions")

@@ -85,39 +85,75 @@ in parallel so a failure costs one shard rather than the sweep.
 
 ## Running several benchmarks in one command
 
-`mindbridge-bench suite` runs a list of benchmarks in one invocation against one deployment,
-writing each one's predictions and manifest into a shared directory:
-
 ```bash
 export MINDBRIDGE_API_KEY=replace-with-a-runtime-secret
-uv run mindbridge-bench suite \
-  --suite benchmarks/suites/released-text.json \
-  --output-dir .benchmarks/results/sweep-001 \
-  --api-base-url http://localhost:8000 \
-  --deployment-config .benchmarks/deployment.json \
-  --run-id sweep-001
+uv run mindbridge-bench suite --tasks released-text --run-id sweep-001 --limit 2
 ```
 
-A suite file exists because a benchmark's name does not determine its invocation. Every runner
-needs its own release path, and most need a required choice no sweep can guess — ATM-Bench's
-`--split`, MEMLENS's `--context-window`, M3-Bench's `--subset`, a prepared-media manifest produced
-outside MindBridge. The file records one task per invocation:
+That runs four benchmarks against one deployment. `--tasks` names entries in a catalog shipped
+with MindBridge, so nothing has to be written first; `--list-tasks` prints every name it accepts
+and whether that task's inputs are on this machine:
+
+```bash
+uv run mindbridge-bench suite --list-tasks
+```
+
+```text
+groups (--tasks expands these), inputs resolved against .benchmarks:
+  released-text           locomo-refined, memlens-32k, atm-main-sgm, atm-hard-sgm
+  all                     locomo-refined, m3-robot, m3-web, egolife, ...
+
+tasks:
+  locomo-refined          locomo-refined  ready
+  m3-robot                m3              missing .benchmarks/m3-prepared-robot.json
+  memlens-32k             memlens         ready
+  ...
+```
+
+Task names are comma-separated and the flag repeats, so `--tasks m3-robot,m3-web --tasks egolife`
+is three tasks. A group expands to several, and a task named twice still runs once.
+
+Everything else has a default worth having. Only `--run-id` and the task names do not:
+
+| Flag | Default |
+| --- | --- |
+| `--benchmarks-root` | `.benchmarks`, the layout the download commands above create |
+| `--output-dir` | `<benchmarks-root>/results/<run-id>` |
+| `--api-base-url` | `http://localhost:8000` |
+| `--deployment-config` | `<benchmarks-root>/deployment.json` |
+
+The individual runners still require the URL and the deployment file explicitly. They are single
+measurements; this command is the one you reach for while iterating.
+
+### What the catalog holds
+
+One task per required choice. A runner that forces you to pick — ATM-Bench's `--split`, MEMLENS's
+`--context-window`, M3-Bench's `--subset`, Video-MME's `--transcript-source` — gets one entry per
+value, which is why MEMLENS appears four times and LoCoMo-Refined once. Optional filters are not
+enumerated: a run scoped to Video-MME's `long` band or three Mem-Gallery topics is a task of your
+own, and `--limit` already covers a smoke run.
+
+Prepared-media manifests are the one thing the catalog cannot know. MindBridge does not produce
+them, so each entry names the file `docs/benchmarking.md` uses — `.benchmarks/m3-prepared-robot.json`
+and its siblings. If yours is somewhere else, `--list-tasks` shows the task as missing and prints
+the path it wanted; move the file, point `--benchmarks-root` at your tree, or write the task out
+in a `--suite` file.
+
+`--suite FILE` runs tasks from a JSON file instead of the catalog, for the cells the catalog does
+not name. `--tasks` then narrows that file rather than the catalog:
 
 ```json
 {
   "tasks": [
     {
-      "name": "locomo-refined",
-      "benchmark": "locomo-refined",
-      "arguments": ["--dataset", ".benchmarks/locomo-refined/data/raw/locomo_refined.json"]
-    },
-    {
-      "name": "m3-robot",
-      "benchmark": "m3",
+      "name": "video-mme-long-subtitled",
+      "benchmark": "video-mme",
+      "output_name": "video-mme-long-subtitled.json",
       "arguments": [
-        "--dataset", ".benchmarks/m3-agent/data/annotations/robot.json",
-        "--prepared-media", ".benchmarks/m3-prepared-robot.json",
-        "--subset", "robot"
+        "--dataset", ".benchmarks/video-mme/videomme/test-00000-of-00001.parquet",
+        "--prepared-media", ".benchmarks/video-mme-prepared-subtitled.json",
+        "--duration", "long",
+        "--transcript-source", "official_subtitles"
       ]
     }
   ]
@@ -125,38 +161,48 @@ outside MindBridge. The file records one task per invocation:
 ```
 
 `name` is the task's own identity: it names the predictions file — `<name>.jsonl`, or
-`output_name` where a runner emits a JSON array instead — and it is appended to `--run-id`.
-`benchmark` is a row in the `mindbridge-bench` table. `arguments` are that runner's own flags,
-passed through verbatim, so the runner's own parser is what validates them and a flag added to a
-runner needs no change here.
+`output_name` where a runner emits one JSON array rather than one object per line — and it is
+appended to `--run-id`. `arguments` are that runner's own flags, passed through verbatim, so the
+runner's parser is what validates them and a flag added to a runner needs no change here. Both
+sources go through the same validation: an unknown benchmark, a duplicate task name, or a flag
+the sweep owns is refused before the first task starts.
 
-**The sweep derives `--output` and `--run-id` per task, and a suite setting either is refused.**
-The run ID is not cosmetic. A tenant is `<tenant-prefix>_<unit-id>_<run-id>`, so two
-parameterisations of one benchmark — MEMLENS at two context windows, ATM-Bench at both splits —
-share everything but the run ID. Without a per-task one the second task would write into the first
-task's tenants and then answer from its memories.
+### Smoke runs
+
+`--limit N` runs the first N of each benchmark's own units — conversations for LoCoMo-Refined,
+videos for M3-Bench, topics for Mem-Gallery. It is deliberately not a count of questions: what
+one of these runs costs is dominated by ingesting the unit, so limiting the questions inside a
+unit that was ingested anyway saves almost nothing. On LoCoMo-Refined, `--limit 2` is 2 of 10
+conversations and 210 of 1,382 questions. It composes with a benchmark's own ID flags rather
+than competing with them — narrow first, then truncate — and every runner accepts it on its own,
+not only through a sweep.
+
+`--tasks all --limit 1` exercises the whole harness. It is a smoke run, not an evaluation.
+
+### What the sweep owns
+
+**`--output` and `--run-id` are derived per task, and a suite setting either is refused.** The run
+ID is not cosmetic. A tenant is `<tenant-prefix>_<unit-id>_<run-id>`, so two parameterisations of
+one benchmark — MEMLENS at two context windows, ATM-Bench at both splits — share everything but
+the run ID. Without a per-task one the second task would write into the first task's tenants and
+then answer from its memories.
 
 Every tenant a run writes to has to be in the deployment's `MINDBRIDGE_TENANT_API_KEYS_JSON`
 before the API starts, and these run IDs are ones the sweep makes up. `--dry-run` prints the exact
 invocation behind each task, so they are readable before anything runs:
 
 ```bash
-uv run mindbridge-bench suite \
-  --suite benchmarks/suites/released-text.json \
-  --output-dir .benchmarks/results/sweep-001 \
-  --api-base-url http://localhost:8000 \
-  --deployment-config .benchmarks/deployment.json \
-  --run-id sweep-001 \
-  --dry-run
+uv run mindbridge-bench suite --tasks released-text --run-id sweep-001 --dry-run
 ```
 
-`--api-base-url` and `--deployment-config` are forwarded to every task. So are `--recall-limit`,
-`--request-concurrency`, and `--request-timeout-seconds`, but only when given — otherwise each
-runner keeps the default it declares rather than a copy pinned here that goes stale. They are
-placed before a task's own arguments, so a benchmark needing its own recall budget sets it in the
-task. Flags that exist only on some runners — `--prepared-media`, `--device-id`, and the media
-polling deadlines among them — belong in the task, not on the sweep. `--task` narrows a run to
-named tasks without reordering it.
+`--api-base-url` and `--deployment-config` are forwarded to every task. So are `--limit`,
+`--recall-limit`, `--request-concurrency`, and `--request-timeout-seconds`, but only when given —
+otherwise each runner keeps the default it declares rather than a copy pinned here that goes
+stale. They are placed before a task's own arguments, so a benchmark needing its own recall
+budget sets it in the task. Flags that exist only on some runners — `--prepared-media`,
+`--device-id`, and the media polling deadlines among them — belong in the task, not on the sweep.
+
+### What it records
 
 Tasks run one at a time. Running them concurrently against one deployment would have them
 contending for the same worker and would corrupt every timing the runs report; to use more
@@ -171,11 +217,6 @@ open. The sweep exits 1 if any task failed and 130 if it was interrupted.
 
 The summary carries no scores. Official scorers run outside MindBridge, and each verdict is
 attached to the run that earned it with `mindbridge-bench score`.
-
-`benchmarks/suites/released-text.json` is committed as a worked example: LoCoMo-Refined, MEMLENS
-32k text-only, and both ATM-Bench splits over the official schema-guided text. Every task in it
-replays released text alone, so it needs no prepared media, runs against a deployment with no
-Worker plugins, and produces a memory-layer claim rather than a multimodal one.
 
 ---
 

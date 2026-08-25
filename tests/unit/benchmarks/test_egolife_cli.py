@@ -98,6 +98,7 @@ def _arguments(dataset_path: Path, prepared_path: Path, output_path: Path) -> _A
         recall_limit=20,
         request_concurrency=4,
         request_timeout_seconds=1_800.0,
+        limit=None,
         poll_interval_seconds=1.0,
         processing_timeout_seconds=1_800.0,
         question_ids=(),

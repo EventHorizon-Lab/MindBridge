@@ -47,6 +47,11 @@ from mindbridge.benchmarks.cli_common import (
     report_unit,
     select_by_id,
 )
+from mindbridge.benchmarks.task_catalog import (
+    DEFAULT_BENCHMARKS_ROOT,
+    listing,
+    task_payloads,
+)
 from mindbridge.contracts import ContractModel, Identifier, NonEmptyString, Sha256Hex
 
 SUITE_VERSION = "benchmark_suite_v1"
@@ -165,8 +170,9 @@ class SuiteRunSummary(ContractModel):
 class _Arguments:
     """The sweep's own flags, plus the ones it forwards to every task verbatim."""
 
-    suite_path: Path
     task_names: tuple[str, ...]
+    suite_path: Path | None
+    benchmarks_root: Path
     output_dir: Path
     run_id: str
     shared: tuple[str, ...]
@@ -186,17 +192,15 @@ class _Plan:
 
 
 def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> int:
-    """Run every selected benchmark in suite order and record what each of them did."""
-    arguments = _parse_arguments(argv, prog)
-    encoded = arguments.suite_path.read_bytes()
-    suite = BenchmarkSuite.model_validate_json(encoded)
-    selected = select_by_id(
-        suite.tasks,
-        arguments.task_names,
-        key=lambda task: task.name,
-        label="suite task names",
-    )
-    plans = tuple(_plan(task, arguments) for task in selected)
+    """Run every named benchmark in catalog order and record what each of them did."""
+    parser = _build_parser(prog)
+    parsed = parser.parse_args(argv)
+    if parsed.list_tasks:
+        print(listing(root=parsed.benchmarks_root))
+        return 0
+    arguments = _arguments(parser, parsed)
+    suite = _load_suite(arguments)
+    plans = tuple(_plan(task, arguments) for task in suite.tasks)
     if arguments.dry_run:
         _print_plan(plans)
         return 0
@@ -206,7 +210,7 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> int:
     started_at = datetime.now(timezone.utc)
     outcomes = _run_plans(plans, quiet=arguments.quiet)
     summary = SuiteRunSummary(
-        suite_sha256=hashlib.sha256(encoded).hexdigest(),
+        suite_sha256=hashlib.sha256(suite.model_dump_json().encode("utf-8")).hexdigest(),
         run_id=arguments.run_id,
         task_count=len(plans),
         completed_task_count=sum(outcome.status == "completed" for outcome in outcomes),
@@ -218,6 +222,27 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> int:
     write_text_atomically(summary_path, summary.model_dump_json(indent=2) + "\n")
     report(f"wrote {summary_path}", quiet=arguments.quiet)
     return _sweep_exit_code(outcomes)
+
+
+def _load_suite(arguments: _Arguments) -> BenchmarkSuite:
+    """Build the tasks to run, from the catalog or from a suite file.
+
+    Both go through the same model, so a hand-written suite is checked exactly as strictly as a
+    catalog entry: an unknown benchmark, a duplicate name, or a flag the sweep owns is refused
+    before the first task starts either way.
+    """
+    if arguments.suite_path is None:
+        return BenchmarkSuite.model_validate(
+            {"tasks": task_payloads(arguments.task_names, root=arguments.benchmarks_root)}
+        )
+    suite = BenchmarkSuite.model_validate_json(arguments.suite_path.read_bytes())
+    selected = select_by_id(
+        suite.tasks,
+        arguments.task_names,
+        key=lambda task: task.name,
+        label="suite task names",
+    )
+    return BenchmarkSuite(tasks=selected)
 
 
 def _run_plans(plans: tuple[_Plan, ...], *, quiet: bool) -> tuple[SuiteTaskOutcome, ...]:
@@ -381,37 +406,58 @@ def _reject_repeats(values: Iterable[str], message: str) -> None:
         raise ValueError(f"{message}: {', '.join(repeated)}")
 
 
-def _parse_arguments(argv: Sequence[str] | None, prog: str | None) -> _Arguments:
+def _build_parser(prog: str | None) -> argparse.ArgumentParser:
+    """Build the sweep's parser, defaulting everything that has one sensible value.
+
+    Only `--run-id` and the task names have no default. Everything else falls back to the layout
+    `docs/benchmarking.md` sets up, which is what makes a smoke run one line. `--recall-limit` and
+    its neighbours are deliberately left unset rather than copied from `core_parser`: an unset
+    tunable is not forwarded at all, so each runner keeps the default it declares and this command
+    cannot pin a stale copy of one.
+    """
     parser = build_parser(prog=prog, description=__doc__, epilog=BENCHMARK_ENVIRONMENT)
     parser.add_argument(
-        "--suite", type=Path, required=True, help="JSON suite naming the benchmarks to run"
-    )
-    parser.add_argument(
-        "--task",
+        "--tasks",
         action="append",
         default=[],
-        help="suite task to run; repeatable, default the whole suite",
+        metavar="NAME[,NAME...]",
+        help="catalog task or group to run; comma-separated and repeatable",
+    )
+    parser.add_argument(
+        "--list-tasks",
+        action="store_true",
+        help="print every name --tasks accepts, with whether its inputs are present, and exit",
+    )
+    parser.add_argument(
+        "--run-id", help="identifier for this sweep; each task runs under <run-id>-<task name>"
+    )
+    parser.add_argument(
+        "--benchmarks-root",
+        type=Path,
+        default=DEFAULT_BENCHMARKS_ROOT,
+        help="directory the official releases were downloaded into",
     )
     parser.add_argument(
         "--output-dir",
         type=Path,
-        required=True,
-        help="directory each task's predictions and manifest are written to, "
-        f"alongside this sweep's own {SUMMARY_FILENAME}",
+        help="where each task's predictions, manifest, and this sweep's "
+        f"{SUMMARY_FILENAME} are written; defaults to <benchmarks-root>/results/<run-id>",
     )
     parser.add_argument(
-        "--api-base-url", required=True, help="base URL of the deployed MindBridge API to measure"
+        "--api-base-url",
+        default="http://localhost:8000",
+        help="base URL of the deployed MindBridge API to measure",
     )
     parser.add_argument(
         "--deployment-config",
         type=Path,
-        required=True,
-        help="JSON description of the deployment that answered, pinned into every manifest",
+        help="JSON description of the deployment that answered, pinned into every manifest; "
+        "defaults to <benchmarks-root>/deployment.json",
     )
     parser.add_argument(
-        "--run-id",
-        required=True,
-        help="identifier for this sweep; each task runs under <run-id>-<task name>",
+        "--limit",
+        type=int,
+        help="run only the first N of each benchmark's own units, for a smoke run",
     )
     parser.add_argument(
         "--recall-limit",
@@ -429,6 +475,11 @@ def _parse_arguments(argv: Sequence[str] | None, prog: str | None) -> _Arguments
         help="deadline for one request, for every task that does not set its own",
     )
     parser.add_argument(
+        "--suite",
+        type=Path,
+        help="run the tasks in this JSON file instead of the catalog's; --tasks then narrows it",
+    )
+    parser.add_argument(
         "--overwrite",
         action="store_true",
         help="replace existing predictions, manifests, and this sweep's summary",
@@ -444,34 +495,47 @@ def _parse_arguments(argv: Sequence[str] | None, prog: str | None) -> _Arguments
         action="store_true",
         help="suppress the progress lines this sweep and its tasks write to stderr",
     )
-    parsed = parser.parse_args(argv)
+    return parser
+
+
+def _arguments(parser: argparse.ArgumentParser, parsed: argparse.Namespace) -> _Arguments:
+    """Resolve the parsed flags, including the defaults that depend on other flags."""
+    names = tuple(
+        name.strip() for group in parsed.tasks for name in group.split(",") if name.strip()
+    )
+    if not names and parsed.suite is None:
+        parser.error("give --tasks NAME[,NAME...], or --suite FILE; --list-tasks prints the names")
+    if parsed.run_id is None:
+        parser.error("--run-id is required; it is what isolates this sweep's tenants")
+    root = parsed.benchmarks_root
     return _Arguments(
+        task_names=names,
         suite_path=parsed.suite,
-        task_names=tuple(parsed.task),
-        output_dir=parsed.output_dir,
+        benchmarks_root=root,
+        output_dir=parsed.output_dir or root / "results" / parsed.run_id,
         run_id=parsed.run_id,
-        shared=_shared_arguments(parsed),
+        shared=_shared_arguments(parsed, root=root),
         overwrite=parsed.overwrite,
         quiet=parsed.quiet,
         dry_run=parsed.dry_run,
     )
 
 
-def _shared_arguments(parsed: argparse.Namespace) -> tuple[str, ...]:
+def _shared_arguments(parsed: argparse.Namespace, *, root: Path) -> tuple[str, ...]:
     """Collect the flags forwarded to every task, and only the ones that were given.
 
-    An unset tunable is left out rather than defaulted here, so a runner keeps whatever default
-    it declares and the sweep cannot pin a stale copy of one. Media knobs are deliberately
-    absent: `--poll-interval-seconds` and its neighbours exist only on the runners that ingest
-    media, so forwarding them to every task would make a text benchmark reject the sweep.
+    Media knobs are deliberately absent: `--poll-interval-seconds` and its neighbours exist only
+    on the runners that ingest media, so forwarding them to every task would make a text-only
+    benchmark reject the sweep. A task that needs one carries it in its own arguments.
     """
     shared = [
         "--api-base-url",
         parsed.api_base_url,
         "--deployment-config",
-        str(parsed.deployment_config),
+        str(parsed.deployment_config or root / "deployment.json"),
     ]
     for flag, value in (
+        ("--limit", parsed.limit),
         ("--recall-limit", parsed.recall_limit),
         ("--request-concurrency", parsed.request_concurrency),
         ("--request-timeout-seconds", parsed.request_timeout_seconds),

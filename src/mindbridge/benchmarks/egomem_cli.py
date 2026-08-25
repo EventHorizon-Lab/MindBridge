@@ -81,6 +81,7 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
         arguments.example_ids,
         key=lambda question: question.example_id,
         label="EgoMemReason example IDs",
+        limit=arguments.limit,
     )
     prepared = _prepared_by_identity(questions, load_prepared_egomem(arguments.prepared_media_path))
     require_writable_output_pair(arguments.output_path, overwrite=arguments.overwrite)

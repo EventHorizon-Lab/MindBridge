@@ -421,9 +421,20 @@ uv run mindbridge-bench
 Runners drive the production REST API. There is no evaluation-only path, which is the point: a
 benchmark that bypasses the product measures something the product does not do.
 
-`suite` runs several of them in one invocation from a JSON file of tasks, deriving each task's
-`--output` and `--run-id` so two parameterisations of one benchmark cannot share a tenant. It
-continues past a task that fails and records every outcome in `suite-summary.json`. See
+Every runner accepts `--limit N` to run only the first N of its own units, which is what makes a
+smoke run cheap enough to iterate on.
+
+`suite` runs several runners in one invocation. `--tasks` names entries in a shipped catalog, so
+the common case needs no file:
+
+```bash
+uv run mindbridge-bench suite --tasks released-text --run-id sweep-001 --limit 2
+uv run mindbridge-bench suite --list-tasks
+```
+
+Only `--run-id` and the task names have no default. The sweep derives each task's `--output` and
+`--run-id` so two parameterisations of one benchmark cannot share a tenant, continues past a task
+that fails, and records every outcome in `suite-summary.json`. See
 [benchmarking](../benchmarking.md#running-several-benchmarks-in-one-command).
 
 See [benchmarking](../benchmarking.md) for datasets, protocol, and what the numbers license you

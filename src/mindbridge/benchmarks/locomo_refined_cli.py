@@ -85,6 +85,7 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
         arguments.sample_ids,
         key=lambda conversation: conversation.sample_id,
         label="LoCoMo-Refined sample IDs",
+        limit=arguments.limit,
     )
     require_writable_output_pair(arguments.output_path, overwrite=arguments.overwrite)
     deployment = load_deployment_snapshot(arguments.deployment_config_path)

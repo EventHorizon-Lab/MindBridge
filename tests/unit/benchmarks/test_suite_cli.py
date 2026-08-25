@@ -18,7 +18,7 @@ import pytest
 from pydantic import ValidationError
 
 from mindbridge import telemetry
-from mindbridge.benchmarks.cli import INTERRUPT_EXIT_CODE, RUNNERS, Runner
+from mindbridge.benchmarks.cli import INTERRUPT_EXIT_CODE, RUNNERS, USAGE_EXIT_CODE, Runner
 from mindbridge.benchmarks.suite import (
     SUMMARY_FILENAME,
     BenchmarkSuite,
@@ -26,8 +26,7 @@ from mindbridge.benchmarks.suite import (
     SuiteTask,
     main,
 )
-
-SHIPPED_SUITE = Path(__file__).parents[3] / "benchmarks" / "suites" / "released-text.json"
+from mindbridge.benchmarks.task_catalog import ROOT, TASKS, CatalogTask, listing, task_payloads
 
 
 def test_the_dispatcher_can_reach_the_suite_runner() -> None:
@@ -260,7 +259,7 @@ def test_a_named_task_narrows_the_sweep_without_reordering_it(
     invocations = _stub_benchmark(monkeypatch, writes=True)
     suite = _suite_file(tmp_path, _task("first"), _task("second"), _task("third"))
 
-    assert _sweep(suite, tmp_path, "--task", "third", "--task", "first") == 0
+    assert _sweep(suite, tmp_path, "--tasks", "third,first") == 0
 
     assert [_flag_value(argv, "--run-id") for argv in invocations] == [
         "sweep-01-first",
@@ -276,7 +275,7 @@ def test_an_unknown_task_name_is_refused_before_anything_runs(
     suite = _suite_file(tmp_path, _task("first"))
 
     with pytest.raises(ValueError, match="unknown suite task names: absent"):
-        _sweep(suite, tmp_path, "--task", "absent")
+        _sweep(suite, tmp_path, "--tasks", "absent")
 
     assert invocations == []
 
@@ -324,9 +323,25 @@ def test_a_task_name_must_stay_inside_the_output_directory(name: str) -> None:
         SuiteTask.model_validate({"name": name, "benchmark": "locomo-refined"})
 
 
-def test_the_shipped_released_text_suite_matches_the_current_schema() -> None:
-    """A committed suite that no test validates is one that goes stale silently."""
-    suite = BenchmarkSuite.model_validate_json(SHIPPED_SUITE.read_text(encoding="utf-8"))
+def test_every_catalog_task_is_one_the_sweep_can_actually_dispatch() -> None:
+    """The catalog is the surface `--tasks` names, so a typo in it must fail here, not mid-sweep."""
+    suite = BenchmarkSuite.model_validate({"tasks": task_payloads(["all"], root=Path("/corpus"))})
+
+    assert len(suite.tasks) == len(TASKS)
+    assert {task.benchmark for task in suite.tasks} <= set(RUNNERS)
+    # Every dataset path has to come from --benchmarks-root, or the entry has a path baked in
+    # that no flag can move.
+    for task in suite.tasks:
+        paths = [argument for argument in task.arguments if argument.startswith(("/", "."))]
+        assert paths, f"{task.name} names no release"
+        assert all(path.startswith("/corpus/") for path in paths), task.name
+
+
+def test_the_released_text_group_needs_no_operator_produced_media() -> None:
+    """It is the group whose numbers are a memory-layer claim, which is what makes it citable."""
+    suite = BenchmarkSuite.model_validate(
+        {"tasks": task_payloads(["released-text"], root=Path("/corpus"))}
+    )
 
     assert [task.name for task in suite.tasks] == [
         "locomo-refined",
@@ -334,10 +349,94 @@ def test_the_shipped_released_text_suite_matches_the_current_schema() -> None:
         "atm-main-sgm",
         "atm-hard-sgm",
     ]
-    # Every task replays released text alone: no prepared media, so the whole suite runs against
-    # a deployment with no Worker plugins and its numbers stay a memory-layer claim.
     assert all("--prepared-media" not in task.arguments for task in suite.tasks)
     assert all("--prepared-images" not in task.arguments for task in suite.tasks)
+
+
+def test_a_group_and_a_task_naming_the_same_benchmark_run_it_once_in_catalog_order() -> None:
+    """Two names for one task would otherwise become two runs writing the same file."""
+    payloads = task_payloads(["released-text", "locomo-refined", "m3-robot"], root=Path("/corpus"))
+
+    names = [payload["name"] for payload in payloads]
+    assert names == [
+        "locomo-refined",
+        "m3-robot",
+        "memlens-32k",
+        "atm-main-sgm",
+        "atm-hard-sgm",
+    ]
+
+
+def test_an_unknown_catalog_name_says_how_to_find_the_real_ones() -> None:
+    with pytest.raises(ValueError, match=r"unknown task: nope; `--list-tasks`"):
+        task_payloads(["nope"], root=Path("/corpus"))
+
+
+def test_the_listing_separates_a_task_whose_inputs_are_present_from_one_missing_them(
+    tmp_path: Path,
+) -> None:
+    """`--list-tasks` is the answer to "which of these can I actually run right now"."""
+    dataset = tmp_path / "locomo-refined" / "data" / "raw"
+    dataset.mkdir(parents=True)
+    (dataset / "locomo_refined.json").write_text("[]", encoding="utf-8")
+
+    lines = {line.split()[0]: line for line in listing(root=tmp_path).splitlines() if line.strip()}
+
+    assert lines["locomo-refined"].endswith("ready")
+    # Both of this one's inputs are absent, and it names both rather than only the first.
+    assert f"{tmp_path}/m3-agent/data/annotations/robot.json" in lines["m3-robot"]
+    assert f"{tmp_path}/m3-prepared-robot.json" in lines["m3-robot"]
+
+
+def test_the_catalog_path_needs_no_file_and_derives_where_everything_goes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The one-line invocation: task names, a run ID, and a corpus root."""
+    monkeypatch.setitem(
+        TASKS, "stub-task", CatalogTask("stub", ("--dataset", f"{ROOT}/stub/release.json"))
+    )
+    _stub_benchmark(monkeypatch, writes=True)
+
+    assert (
+        main(
+            [
+                "--tasks",
+                "stub-task",
+                "--run-id",
+                "smoke-01",
+                "--benchmarks-root",
+                str(tmp_path),
+                "--limit",
+                "2",
+                "--dry-run",
+            ]
+        )
+        == 0
+    )
+
+    printed = capsys.readouterr().out
+    assert f"--dataset {tmp_path}/stub/release.json" in printed
+    assert "--limit 2" in printed
+    assert f"--output {tmp_path}/results/smoke-01/stub-task.jsonl" in printed
+    assert "--run-id smoke-01-stub-task" in printed
+    assert f"--deployment-config {tmp_path}/deployment.json" in printed
+    assert "--api-base-url http://localhost:8000" in printed
+
+
+def test_naming_no_task_at_all_points_at_the_listing_rather_than_running_everything() -> None:
+    with pytest.raises(SystemExit) as exit_info:
+        main(["--run-id", "smoke-01"])
+
+    assert exit_info.value.code == USAGE_EXIT_CODE
+
+
+def test_a_sweep_without_a_run_id_is_refused_because_it_is_what_isolates_the_tenants() -> None:
+    with pytest.raises(SystemExit) as exit_info:
+        main(["--tasks", "locomo-refined"])
+
+    assert exit_info.value.code == USAGE_EXIT_CODE
 
 
 def _stub_benchmark(
@@ -388,6 +487,7 @@ def _suite_file(directory: Path, *tasks: dict[str, object]) -> Path:
 
 
 def _sweep(suite: Path, output_dir: Path, *extra: str) -> int:
+    """Run a sweep over a hand-written suite file, which is the escape hatch from the catalog."""
     return main(
         [
             "--suite",

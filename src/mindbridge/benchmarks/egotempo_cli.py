@@ -75,6 +75,7 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
         arguments.question_ids,
         key=lambda question: question.question_id,
         label="EgoTempo question IDs",
+        limit=arguments.limit,
     )
     prepared = _select_prepared(load_prepared_videos(arguments.prepared_media_path), questions)
     require_writable_output_pair(arguments.output_path, overwrite=arguments.overwrite)

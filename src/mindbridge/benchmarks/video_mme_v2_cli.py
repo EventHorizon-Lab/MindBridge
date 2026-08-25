@@ -25,6 +25,7 @@ from mindbridge.benchmarks.cli_common import (
     connected_memory,
     core_parser,
     index_prepared,
+    limit_units,
     media_arguments,
     media_manifest,
     report,
@@ -88,7 +89,10 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
     """Run selected groups and emit the official prediction JSON."""
     arguments = _parse_arguments(argv, prog)
     groups = _select_groups(
-        load_video_mme_v2(arguments.dataset_path), arguments.video_ids, arguments.group_types
+        load_video_mme_v2(arguments.dataset_path),
+        arguments.video_ids,
+        arguments.group_types,
+        arguments.limit,
     )
     prepared = _select_prepared(load_prepared_videos(arguments.prepared_media_path), groups)
     require_declared_transcripts(prepared, arguments.transcript_source)
@@ -187,6 +191,7 @@ def _select_groups(
     groups: tuple[VideoMMEV2Group, ...],
     video_ids: tuple[str, ...],
     group_types: tuple[VideoMMEV2GroupType, ...],
+    limit: int | None,
 ) -> tuple[VideoMMEV2Group, ...]:
     """Narrow a run to whole groups, which is the only subset the rating is defined over.
 
@@ -206,7 +211,7 @@ def _select_groups(
         groups = tuple(group for group in groups if group.group_type in set(group_types))
     if not groups:
         raise ValueError("no Video-MME-v2 groups match the requested IDs and group types")
-    return groups
+    return limit_units(groups, limit, label="Video-MME-v2 groups")
 
 
 def _select_prepared(
