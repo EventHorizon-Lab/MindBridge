@@ -235,6 +235,26 @@ def test_the_embedding_space_reaches_every_encoder_from_one_place() -> None:
     assert "space_id" not in json.loads(flattened["MINDBRIDGE_GENERATOR_CONFIG_JSON"])
 
 
+def test_embedding_environment_overrides_reach_every_encoder() -> None:
+    document: dict[str, object] = {
+        "embedding": {"dimension": 1024, "space_id": "from-file"},
+        "embedder": {"endpoint": "https://e/v1"},
+        "media_embedder": {"device": "cuda:0"},
+    }
+    flattened = _flattened_plugins(
+        document,
+        {
+            "MINDBRIDGE_EMBEDDING_DIMENSION": "768",
+            "MINDBRIDGE_EMBEDDING_SPACE_ID": "from-environment",
+        },
+    )
+
+    for section in ("embedder", "media_embedder"):
+        encoded = json.loads(flattened[f"MINDBRIDGE_{section.upper()}_CONFIG_JSON"])
+        assert encoded["dimension"] == 768
+        assert encoded["space_id"] == "from-environment"
+
+
 def test_an_override_of_a_key_the_file_omits_arrives_as_text() -> None:
     flattened = _flattened_plugins(
         {"embedder": {"endpoint": "https://e/v1"}},

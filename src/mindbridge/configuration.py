@@ -251,7 +251,13 @@ def _flattened_plugins(
 ) -> dict[str, str]:
     """Serialise each plugin section into the `*_CONFIG_JSON` its factory reads."""
     space = document.get(EMBEDDING_SECTION)
-    shared = space if isinstance(space, dict) else {}
+    shared = dict(space) if isinstance(space, dict) else {}
+    dimension_variable = variable_name("dimension", EMBEDDING_SECTION)
+    if dimension_variable in environ:
+        shared["dimension"] = int(environ[dimension_variable])
+    space_variable = variable_name("space_id", EMBEDDING_SECTION)
+    if space_variable in environ:
+        shared["space_id"] = environ[space_variable]
     flattened: dict[str, str] = {}
     for section in PLUGIN_SECTIONS:
         body = document.get(section)
