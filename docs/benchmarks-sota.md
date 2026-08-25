@@ -2,16 +2,16 @@
 
 > 状态：目标基线，不代表 MindBridge 已取得任何一项分数
 >
-> 更新日期：2026-08-18
+> 更新日期：2026-08-25
 >
-> 范围：`src/mindbridge/benchmarks/` 中已有官方适配器的九个 Benchmark
+> 范围：`src/mindbridge/benchmarks/` 中已有官方适配器的十一个 Benchmark
 >
 > 口径：**学术榜**指论文/官方 leaderboard 上可复现的公开结果；**工业榜**指厂商自测并对外发布的产品分数
 
 ## 1. 结论
 
-九个 Benchmark 里只有 **LoCoMo-Refined** 和 **Video-MME** 存在真正意义上的工业榜；其余七个是纯学术榜，
-最强系统全部来自论文。这决定了 MindBridge 的超越策略在两条赛道上完全不同：
+十一个 Benchmark 里只有 **LoCoMo-Refined** 和 **Video-MME** 存在真正意义上的工业榜；其余九个是纯
+学术榜，最强系统全部来自论文。这决定了 MindBridge 的超越策略在两条赛道上完全不同：
 
 | Benchmark | 官方指标 | 学术 SOTA | 工业 SOTA | MindBridge 需越过的线 |
 | --- | --- | --- | --- | --- |
@@ -24,14 +24,30 @@
 | MM-Lifelong | Acc + Ref@300 | ReMA 18.62 / 18.82 / 16.75 | 无 | > 18.8，Ref@300 > 16.4 |
 | SuperMemory-VQA | QA-Acc / Ans-F1 | Gemini-3-Flash+Video-RAG 61.0 | 无（OSU × Meta Reality Labs 合作构建） | QA-Acc > 61.0 且 Ans-F1 > 83.9 |
 | EgoMemReason | Accuracy | Gemini-3-Flash 39.6 | 无 | > 39.6，且必须提交官方 leaderboard |
+| ATM-Bench | QS + Recall@10（三类题分别精确匹配 / Jaccard / LLM-judge） | MemPalace 56.8 main / MemoryOS 13.7 hard（Memexa 68.0 / 47.9 换了 judge） | 无 | 先与 SGM 列同口径，再设线 |
+| Mem-Gallery | F1 + 五级 LLM-judge | MuRAG 0.6966 F1 / 0.8229 judge | 无 | 先与官方 backbone 同口径，再设线 |
+
+最后两行的"需越过的线"是口径而不是数字，这是刻意的：3.10 / 3.11 两张表各自绑死在
+`Qwen3-VL-8B-Instruct-FP8` + `gpt-5-mini` 和 `Qwen2.5-VL-7B` 一套固定口径上，而 MindBridge 走的是
+自己的写路径和自己的答题模型，从没跑过同一套。在对齐口径之前填一个"> X"，等于先替读者认定两边
+数字可比——那恰好是 3.10 / 3.11 正文明确否认的事。这两项 MindBridge 都还没有已发布的分数。
 
 三个可以立刻看出的结构性机会：
 
 1. **记忆系统在多模态长时记忆上普遍打不过"直接把上下文塞进模型"**。MemLens 上最好的记忆
    agent 是 32.82，同一批题直读 LVLM 是 63.59；EgoMemReason 上最好的 agentic framework 是
-   34.0，纯 MLLM 是 39.6。这正是 MindBridge 的正面战场：证明结构化记忆不是有损压缩。
-2. **MM-Lifelong 的证据定位几乎无人做**。ReMA 的 Ref@300 是 15.46，GPT-5 是 0.44——差两个数量
-   级。MindBridge 的证据优先架构（原始视听跨度是最终证据）天然产出可定位区间。
+   34.0，纯 MLLM 是 39.6；ATM-Bench 的 hard split 把差距拉到全文最大——同 judge 下记忆系统最高
+   只有 13.7，通用编程 agent 是 58.8 / 58.4，SGM Oracle 上限 60.5（按 3.10 的说明，agent 与记忆
+   系统是两种测法，这里只能读数量级，不能读名次）。这正是 MindBridge 的正面战场：证明结构化
+   记忆不是有损压缩。
+
+   这条规律有边界，Mem-Gallery 就是现成的反例：官方表里两行 `Full memory`（0.3625 / 0.3354
+   F1）明显低于检索式的 MuRAG（0.6966）——照官方给的行名读，把全部记忆整个塞给模型在这一项
+   反而垫底。所以"记忆打不过长上下文"要按体裁分开讲，多会话对话上检索本身就是净收益。
+2. **证据定位仍是空档，而且现在有两项在计分**。MM-Lifelong 上 ReMA 的 Ref@300 是 15.46，GPT-5
+   是 0.44——差两个数量级；ATM-Bench 则把 Recall@10 直接列成官方指标，同一批系统从 main 的
+   23.3–79.1 掉到 hard 的 7.0–44.7。MindBridge 的证据优先架构（原始视听跨度是最终证据）天然
+   产出可定位区间，这两项都在正面考它。
 3. **LoCoMo 的旧工业分数已经作废**。92.5/94.7 这类数字来自各家自定的 judge、backbone 和 4 类
    题面。LoCoMo-Refined 用统一的官方 judge 重打了同一批系统预测，EverMemOS、MemOS、MemPalace、
    Mem0 分别掉了 22.07、17.30、15.78、15.56 个百分点——差距本来就在 judge 里，不在系统里。
