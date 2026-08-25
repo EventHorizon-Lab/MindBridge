@@ -88,6 +88,7 @@ RUNNERS: dict[str, Runner] = {
     "memlens": Runner("mindbridge.benchmarks.memlens_cli", "Run official MemLens"),
     "mm-lifelong": Runner("mindbridge.benchmarks.mm_lifelong_cli", "Run official MM-Lifelong"),
     "atm": Runner("mindbridge.benchmarks.atm_cli", "Run official ATM-Bench"),
+    "mem-gallery": Runner("mindbridge.benchmarks.mem_gallery_cli", "Run official Mem-Gallery"),
     "supermemory": Runner("mindbridge.benchmarks.supermemory_cli", "Run official SuperMemory VQA"),
     "video-mme": Runner(
         "mindbridge.benchmarks.video_mme_cli",
