@@ -257,6 +257,7 @@ def ensure_media(
     root: Path,
     only: Sequence[str] = (),
     announce: Callable[[str], None] | None = None,
+    download: bool = True,
 ) -> Path:
     """Download and extract this media set if absent, and return the directory holding it.
 
@@ -304,10 +305,24 @@ def ensure_media(
     source = RELEASES[media.release]
     patterns = tuple(only) or media.patterns
     destination = root / media.release
+    if not download:
+        # `--no-download` reaches preparation as well as the pre-flight over annotations. A
+        # producer only ever calls this because a file it wants is already missing, so there is
+        # nothing to do but refuse -- and refusing is what keeps the flag honest now that naming
+        # a media task can pull 94 GiB behind 40 MB of annotations the pre-flight did govern.
+        raise ValueError(
+            f"{release} media is absent under {destination} and --no-download was given; "
+            "drop the flag to fetch what the official release supplies"
+        )
     if announce is not None:
+        # Counted rather than listed past a handful: a producer narrowing to the exact files it
+        # is missing passes one pattern per file, and ATM-Bench on an empty corpus is 4,292 of
+        # them -- listing those is 180 KB of one line, which buries the progress it precedes.
+        # "patterns" rather than "paths" because a narrowed fetch is not one file per entry
+        # either way: EgoMemReason asks for 42 globs and gets 32,001 videos.
+        listed = ", ".join(patterns) if len(patterns) <= 4 else f"{len(patterns)} patterns"
         announce(
-            f"fetching {release} media from {source.repository}@{source.revision[:12]}: "
-            f"{', '.join(patterns)}"
+            f"fetching {release} media from {source.repository}@{source.revision[:12]}: {listed}"
         )
     _download_from_hub(source, patterns, destination=destination)
     for pattern in patterns:

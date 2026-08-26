@@ -112,6 +112,7 @@ def prepare_video_mme(request: PrepareRequest) -> None:
                 *VIDEO_MME_MEDIA,
                 f"{video.source_video_id}.mp4",
                 release="video-mme",
+                download=request.download,
             ),
         )
         for video in videos
@@ -159,6 +160,7 @@ def prepare_video_mme_v2(request: PrepareRequest) -> None:
                 *VIDEO_MME_V2_MEDIA,
                 f"{group.video_id}.mp4",
                 release="video-mme-v2",
+                download=request.download,
             ),
         )
         for group in groups
@@ -206,6 +208,7 @@ def prepare_egotempo(request: PrepareRequest) -> None:
                 *EGOTEMPO_MEDIA,
                 f"{clip_id}.mp4",
                 release="egotempo",
+                download=request.download,
             ),
         )
         for clip_id in dict.fromkeys(question.clip_id for question in questions)
@@ -300,7 +303,7 @@ def _require_media_only(transcript_source: TranscriptSource, *, benchmark: str) 
         )
 
 
-def _source(root: Path, *parts: str, release: str) -> Path:
+def _source(root: Path, *parts: str, release: str, download: bool = True) -> Path:
     """Resolve one release-named source file, asking `ensure_media` about an absent one.
 
     Absence is two different problems: a media set that can be fetched may simply not have been,
@@ -311,7 +314,7 @@ def _source(root: Path, *parts: str, release: str) -> Path:
     """
     path = within(root, *parts)
     if not path.exists():
-        ensure_media(release, root=root)
+        ensure_media(release, root=root, download=download)
         if not path.exists():
             raise FileNotFoundError(
                 f"{path} is absent from the {release} media, which is now on disk; the release's "

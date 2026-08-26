@@ -77,11 +77,7 @@ def _memlens(window: str) -> CatalogTask:
 
 
 def _atm(split: str, *, media_source: str) -> CatalogTask:
-    archive = (
-        ("--media-source", "sgm")
-        if media_source == "sgm"
-        else ("--media-source", "raw", "--prepared-media", f"{ROOT}/atm-prepared-media.json")
-    )
+    archive = ("--media-source", "sgm") if media_source == "sgm" else ("--media-source", "raw")
     release = "atm-bench.json" if split == "main" else f"atm-bench-{split}.json"
     return CatalogTask(
         "atm",
@@ -120,8 +116,6 @@ def _mm_lifelong(split: str, release: str) -> CatalogTask:
         (
             "--dataset",
             f"{ROOT}/mm-lifelong/{release}.json",
-            "--prepared-media",
-            f"{ROOT}/mm-lifelong-{split.replace('_', '-')}-prepared.json",
             "--split",
             split,
         ),
@@ -140,8 +134,6 @@ TASKS: dict[str, CatalogTask] = {
         (
             "--dataset",
             f"{ROOT}/egolife/EgoLifeQA/EgoLifeQA_A1_JAKE.json",
-            "--prepared-media",
-            f"{ROOT}/egolife-prepared-a1.json",
         ),
         output_suffix=".json",
     ),
@@ -150,8 +142,6 @@ TASKS: dict[str, CatalogTask] = {
         (
             "--dataset",
             f"{ROOT}/egomem-reason/annotations_public.jsonl",
-            "--prepared-media",
-            f"{ROOT}/egomem-prepared.json",
         ),
         output_suffix=".json",
     ),
@@ -188,8 +178,6 @@ TASKS: dict[str, CatalogTask] = {
         (
             "--dataset",
             f"{ROOT}/supermemory-vqa/data/json/all_qa.json",
-            "--prepared-media",
-            f"{ROOT}/supermemory-prepared-person-1.json",
             "--subject",
             "1",
         ),

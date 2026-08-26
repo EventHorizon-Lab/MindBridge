@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pytest
 
+from mindbridge.benchmarks import releases
 from mindbridge.benchmarks.releases import (
     MEDIA,
     RELEASES,
@@ -44,6 +45,29 @@ def test_every_media_set_names_a_release_the_table_can_reach() -> None:
 def test_a_media_set_is_either_obtainable_or_explained_but_never_both() -> None:
     """Both tables answering to one name would make which behaviour you get depend on lookup order."""
     assert set(MEDIA) & set(UNOBTAINABLE) == set()
+
+
+def test_exactly_these_media_sets_are_the_ones_that_download_themselves() -> None:
+    """Which side of the line a benchmark falls on is what its producer is written against.
+
+    Moving one across is a silent behaviour change for a caller that never sees this file: a
+    producer calls `ensure_media` on an absent file and either gets it or gets an exception, and
+    nothing in the producer's own tests would notice the day that flipped. MM-Lifelong is the
+    live example -- its `video_list.txt` of YouTube and bilibili URLs reads like an instruction
+    to fetch them by hand, but all three of its scales are on the Hub at the pinned revision, and
+    someone acting on that file would move it and break two producers.
+    """
+    assert set(MEDIA) == {
+        "video-mme",
+        "video-mme-v2",
+        "egolife",
+        "mm-lifelong",
+        "supermemory-vqa",
+        "atm-bench",
+        "mem-gallery",
+        "m3-robot",
+    }
+    assert set(UNOBTAINABLE) == {"egotempo", "m3-web"}
 
 
 def test_every_unobtainable_set_says_where_the_operator_must_put_the_files() -> None:
@@ -197,6 +221,35 @@ def test_an_archive_naming_a_path_outside_itself_is_refused(tmp_path: Path) -> N
     assert not (tmp_path.parent / "escaped.mp4").exists()
 
 
+def test_a_fetch_narrowed_to_many_exact_paths_is_announced_as_a_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A producer that narrows to the files it is missing passes one pattern per file.
+
+    ATM-Bench on an empty corpus is 4,292 of them and EgoLife 6,266, so joining them would put
+    hundreds of kilobytes on one line immediately before the transfer they are announcing.
+    """
+    said: list[str] = []
+    _record_downloads(monkeypatch)
+    many = tuple(f"data/raw_memory/image/{index}.jpg" for index in range(5))
+
+    ensure_media("atm-bench", root=tmp_path, only=many, announce=said.append)
+
+    assert said == ["fetching atm-bench media from Jingbiao/ATM-Bench@78e826dc07e9: 5 patterns"]
+
+
+def test_a_fetch_narrowed_to_a_few_paths_still_names_them(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Counting the common case would hide which video a one-unit run is about to spend on."""
+    said: list[str] = []
+    _record_downloads(monkeypatch)
+
+    ensure_media("egolife", root=tmp_path, only=("A1_JAKE/DAY1/*",), announce=said.append)
+
+    assert said == ["fetching egolife media from lmms-lab/EgoLife@143fb319be7a: A1_JAKE/DAY1/*"]
+
+
 def test_extraction_is_announced_with_how_much_of_it_is_left(tmp_path: Path) -> None:
     """A volume takes minutes to unpack; silence there reads as a hang."""
     said: list[str] = []
@@ -246,3 +299,38 @@ def _fake_download(monkeypatch: pytest.MonkeyPatch, archives: dict[str, dict[str
 
 def _never(message: str) -> None:
     raise AssertionError(f"nothing should have been announced, but got: {message}")
+
+
+def test_no_download_refuses_absent_media_rather_than_fetching_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`--no-download` has to reach here, not only the pre-flight over annotations.
+
+    Preparation is where a media benchmark's bytes are actually obtained, so before this the flag
+    governed the 40 MB of annotations and let the 94 GiB behind them through -- a flag named
+    `--no-download` that permits the largest download in the tree. `ensure_media` is only ever
+    called because a file is already missing, so refusing is the whole of the correct behaviour.
+
+    The fetch is replaced rather than trusted not to happen. A regression here does not fail an
+    assertion, it starts Video-MME's 94 GiB against the real Hub -- which is how this test first
+    ran, and it hung rather than failed.
+    """
+
+    def _refuse(*arguments: object, **keywords: object) -> None:
+        raise AssertionError("--no-download must refuse before anything reaches the Hub")
+
+    monkeypatch.setattr(releases, "_download_from_hub", _refuse)
+    with pytest.raises(ValueError, match=r"--no-download was given"):
+        ensure_media("video-mme", root=tmp_path, download=False)
+
+
+def test_no_download_still_reports_an_unobtainable_set_as_unobtainable(tmp_path: Path) -> None:
+    """The flag must not turn a licensing wall into a download complaint.
+
+    `egotempo` can never be fetched by any flag, so the operator's instructions are the useful
+    answer whether or not downloading was permitted; reporting `--no-download` instead would send
+    them to drop a flag that was never what stood in the way.
+    """
+    with pytest.raises(FileNotFoundError, match=r"signed access agreement"):
+        ensure_media("egotempo", root=tmp_path, download=False)

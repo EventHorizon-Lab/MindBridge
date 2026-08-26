@@ -183,6 +183,13 @@ class PrepareRequest:
     argv: tuple[str, ...]
     benchmarks_root: Path
     quiet: bool
+    download: bool = True
+    """Whether a producer may fetch the media it is missing, or must refuse.
+
+    `--no-download` is documented as refusing to fetch rather than fetching, and preparation is
+    where a media benchmark's bytes are actually obtained -- so without this the flag governed
+    the annotations and let the 94 GiB behind them through.
+    """
 
 
 def within(root: Path, *parts: str) -> Path:

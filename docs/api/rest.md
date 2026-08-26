@@ -61,6 +61,7 @@ Branch on `code`, never on `message`. `issues` is populated only for validation 
 | Method | Path | Purpose |
 | --- | --- | --- |
 | `GET` | `/healthz` | Liveness. Public. |
+| `POST` | `/v1/media/uploads` | Get a short-lived signed PUT for one file's bytes. |
 | `POST` | `/v1/observations` | Submit one sensor observation. |
 | `POST` | `/v1/memories` | Explicitly retain content. |
 | `POST` | `/v1/memories/batch` | Retain up to 100 memories in one encoder round trip. |
@@ -87,12 +88,51 @@ Use it for load-balancer liveness, not for readiness gating.
 
 ---
 
+### `POST /v1/media/uploads`
+
+Returns a short-lived presigned `PUT` for one object inside the calling tenant's own prefix, so
+a client can store evidence without holding the deployment's storage credentials. The bytes go
+straight to object storage; they never pass through this API.
+
+The key is derived, not requested: `tenants/<tenant_id>/media/<sha256><suffix>`, the same
+convention the edge writes. Content addressing means a retried upload overwrites one object
+instead of leaving an orphan per attempt, and it is why no field here can name a key.
+
+**Request — `MediaUploadRequest`**
+
+| Field | Type | Required | Notes |
+| --- | --- | --- | --- |
+| `tenant_id` | string | yes | Must be authorized by the key, exactly as for an observation. |
+| `sha256` | 64 hex chars | yes | Digest of the bytes about to be sent; addresses the object. |
+| `size_bytes` | int | yes | 1 – 5 GiB. Signed into the URL, so any other length is refused. |
+| `suffix` | string \| null | no | The file's own extension, from the set `kind` recognizes. Omit for anything else; the key then carries none. |
+
+**Response — `MediaUploadTicket`**
+
+```json
+{
+  "upload_url": "https://objects.example/...&X-Amz-Signature=...",
+  "uri": "s3://<bucket>/tenants/<tenant_id>/media/<sha256>.mp4",
+  "expires_at": "2026-08-11T12:15:00Z",
+  "trace_id": "trace_..."
+}
+```
+
+`PUT` the exact bytes to `upload_url` with `Content-Length: <size_bytes>` and no `Authorization`
+header — the URL is itself a credential, so it must not be logged or handed on — then submit an
+ordinary observation naming `uri`. `mindbridge.sdk`'s `observe_file()` does all three steps.
+
+**Errors:** tenant errors, `object_storage_unavailable`.
+
+---
+
 ### `POST /v1/observations`
 
 Submits one timestamped observation. Returns `202 Accepted`.
 
-The bytes must already be in object storage. MindBridge reads the URI you give it; it does not
-accept an upload.
+The bytes must already be in object storage. MindBridge reads the URI you give it; no request
+body carries bytes. `POST /v1/media/uploads` is how a client that holds a file rather than an
+object key puts them there first.
 
 **Request — `ObserveRequest`**
 

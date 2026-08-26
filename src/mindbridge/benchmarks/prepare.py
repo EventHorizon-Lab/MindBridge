@@ -15,12 +15,19 @@ to ingest objects under a tenant it cannot address.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from mindbridge.benchmarks.cli_common import report, select_by_id
+from mindbridge.benchmarks.cli_common import flag_value, report, select_by_id
+from mindbridge.benchmarks.prepare_archive import prepare_atm
+from mindbridge.benchmarks.prepare_lifelong import prepare_mm_lifelong
+from mindbridge.benchmarks.prepare_streams import (
+    prepare_egolife,
+    prepare_egomem,
+    prepare_supermemory,
+)
 from mindbridge.benchmarks.prepare_video import (
     prepare_egotempo,
     prepare_video_mme,
@@ -146,7 +153,11 @@ def prepare_m3(request: PrepareRequest) -> None:
             # before it looks at the filesystem, and `m3-web` is one -- its 920 videos are the
             # `video_url` of each annotation, not files the release ships. Calling eagerly would
             # therefore fail `--subset web` even where the operator had placed every video.
-            ensure_media(f"m3-{arguments.subset}", root=request.benchmarks_root)
+            ensure_media(
+                f"m3-{arguments.subset}",
+                root=request.benchmarks_root,
+                download=request.download,
+            )
             if not source.exists():
                 raise FileNotFoundError(
                     f"M3-Bench source video {source} is absent; it is part of the "
@@ -184,6 +195,15 @@ class Producer:
 
     flag: str
     produce: Callable[[PrepareRequest], None]
+    applies: Callable[[Sequence[str]], bool] | None = None
+    """Whether this task's arguments describe an arm that reads the manifest at all.
+
+    `PREPARERS` is keyed by benchmark, but ATM-Bench's `sgm` arms ingest the release's own
+    pre-processed captions and never open a prepared-media manifest. Absence of the flag cannot
+    stand in for that: absence is precisely what makes the sweep *append* it, after which
+    `_prepared_manifest_path` reads it back and the producer stages about 3 GB neither arm will
+    read. So an arm that does not want media has to say so, rather than be inferred.
+    """
 
 
 PREPARERS: dict[str, Producer] = {
@@ -192,6 +212,15 @@ PREPARERS: dict[str, Producer] = {
     "video-mme": Producer("--prepared-media", prepare_video_mme),
     "video-mme-v2": Producer("--prepared-media", prepare_video_mme_v2),
     "egotempo": Producer("--prepared-media", prepare_egotempo),
+    "egolife": Producer("--prepared-media", prepare_egolife),
+    "egomem": Producer("--prepared-media", prepare_egomem),
+    "supermemory": Producer("--prepared-media", prepare_supermemory),
+    "mm-lifelong": Producer("--prepared-media", prepare_mm_lifelong),
+    "atm": Producer(
+        "--prepared-media",
+        prepare_atm,
+        applies=lambda argv: flag_value(argv, "--media-source") != "sgm",
+    ),
 }
 """The benchmarks whose prepared media this module can produce.
 

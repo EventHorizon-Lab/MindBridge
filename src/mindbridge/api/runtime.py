@@ -181,6 +181,7 @@ class _Runtime:
     generator: Generator
     embedding_space: EmbeddingSpaceReference
     tenant_ids: tuple[str, ...]
+    media_access: S3MediaAccess
 
     @asynccontextmanager
     async def open(self) -> AsyncIterator[None]:
@@ -226,6 +227,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app = build_app(
         runtime.kernel,
         authenticator=authenticator,
+        media_uploads=runtime.media_access,
         lifespan=lifespan,
         aml=(
             (
@@ -306,4 +308,12 @@ def _build_runtime(settings: Settings) -> _Runtime:
         if settings.tenant_api_keys_json is not None
         else ()
     )
-    return _Runtime(kernel, store, models, generator, embedder.space_reference, tenant_ids)
+    return _Runtime(
+        kernel,
+        store,
+        models,
+        generator,
+        embedder.space_reference,
+        tenant_ids,
+        media_access,
+    )

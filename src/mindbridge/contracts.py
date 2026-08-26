@@ -62,6 +62,30 @@ def _as_utc(value: datetime) -> datetime:
 UtcDatetime = Annotated[AwareDatetime, AfterValidator(_as_utc)]
 
 
+def _require_known_media_suffix(value: str) -> str:
+    """Accept only a container extension the domain already has an opinion about.
+
+    This is the whole of what a caller contributes to an object key it is about to be handed a
+    signature for, so it is a closed set rather than a shape: `..`, an absolute key, and an
+    encoded separator are all excluded by not being in it, and no second sanitizer has to be
+    kept correct as this one grows.
+    """
+    if media_kind_for_suffix(value) is None:
+        raise ValueError("must be a media container extension MindBridge recognizes")
+    return value
+
+
+MediaSuffix = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, to_lower=True, min_length=2, max_length=16),
+    AfterValidator(_require_known_media_suffix),
+]
+# The largest object one signed PUT can carry, which is object storage's own single-request
+# ceiling rather than a policy of this API's: a larger upload has to be a multipart one, and
+# signing a request that can only be refused wastes a round trip to learn that.
+MAX_MEDIA_UPLOAD_BYTES = 5 * 1024**3
+
+
 class ContractModel(BaseModel):
     """Strict immutable base shared by every external contract."""
 
@@ -96,7 +120,9 @@ class MediaObjectInput(ContractModel):
     uri: NonEmptyString = Field(
         description=(
             "Where the bytes already live, as `s3://<bucket>/tenants/<tenant_id>/<key>`. "
-            "MindBridge reads this object; it does not accept an upload."
+            "MindBridge reads this object; no request body ever carries the bytes themselves. "
+            "For a file that is not stored yet, ask `createMediaUpload` for a short-lived "
+            "signed PUT, send the bytes there, and name the `uri` it answers with."
         ),
     )
     sha256: Sha256Hex = Field(
@@ -137,6 +163,70 @@ class MediaObjectInput(ContractModel):
                 f"media kind {self.kind.value} contradicts its {implied.value} URI extension"
             )
         return self
+
+
+class MediaUploadRequest(ContractModel):
+    """Ask where to put one local file so an observation can then refer to it.
+
+    The bytes never travel through this API. It answers with a short-lived signed URL for an
+    object key inside the calling tenant's own prefix, which is the only key it will ever sign:
+    a caller does not name one, it describes the bytes and is told where they go.
+    """
+
+    tenant_id: Identifier = Field(
+        description="Tenant that will own the bytes; must be one this key authorizes.",
+    )
+    sha256: Sha256Hex = Field(
+        description=(
+            "Hex digest of the exact bytes about to be sent. It addresses the object, so "
+            "re-sending the same file lands on the same key and overwrites it instead of "
+            "leaving one orphan per attempt. Pass this same value as "
+            "`MediaObjectInput.sha256`."
+        ),
+    )
+    size_bytes: Annotated[
+        int,
+        Field(
+            ge=1,
+            le=MAX_MEDIA_UPLOAD_BYTES,
+            description=(
+                "Exact byte length of the file. It is signed into the URL, so the upload must "
+                "send this many bytes and object storage refuses any other length."
+            ),
+        ),
+    ]
+    suffix: MediaSuffix | None = Field(
+        default=None,
+        description=(
+            "The file's own container extension, like `.mp4` — the only part of the object key "
+            "a caller influences, and accepted only from the set of extensions MindBridge "
+            "recognizes, since it is what `MediaObjectInput.kind` is checked against. Omit it "
+            "for a container this API does not know: the key then carries no extension, which "
+            "contradicts no `kind`."
+        ),
+    )
+
+
+class MediaUploadTicket(ContractModel):
+    """Short-lived permission to store one file's bytes, and the URI that then names them."""
+
+    upload_url: NonEmptyString = Field(
+        description=(
+            "PUT the exact bytes here, with `Content-Length` set to the requested `size_bytes` "
+            "and no other authentication: this URL carries its own, so it is a credential and "
+            "must not be logged or handed on."
+        ),
+    )
+    uri: NonEmptyString = Field(
+        description="What to pass as `MediaObjectInput.uri` once the PUT has succeeded.",
+    )
+    expires_at: UtcDatetime = Field(
+        description=(
+            "When `upload_url` stops being accepted. Only the start of the upload has to fall "
+            "inside it; ask for another rather than replaying a stale one."
+        ),
+    )
+    trace_id: Identifier = Field(description="Correlates this request with its telemetry.")
 
 
 class IdentityObservationInput(ContractModel):

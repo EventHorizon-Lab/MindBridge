@@ -58,7 +58,7 @@ def client(monkeypatch: pytest.MonkeyPatch) -> _RecordingClient:
     """Point the producers at a bucket double and stop them fetching a release."""
     recorder = _RecordingClient()
     monkeypatch.setattr(prepare_video, "staging", lambda: Staging("bucket", recorder))
-    monkeypatch.setattr(prepare_video, "ensure_media", lambda name, *, root: root / name)
+    monkeypatch.setattr(prepare_video, "ensure_media", lambda name, *, root, **_: root / name)
     return recorder
 
 

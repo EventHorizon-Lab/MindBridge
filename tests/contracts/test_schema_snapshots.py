@@ -13,6 +13,7 @@ from mindbridge.api.auth import TenantApiKeyAuthenticator
 from mindbridge.api.errors import ERRORS, RUNTIME_ERROR_CODES
 from mindbridge.api.mcp import build_mcp_server
 from mindbridge.application.kernel import MemoryKernel
+from mindbridge.application.ports import MediaUploadSigner
 from mindbridge.models import Generator
 
 SNAPSHOT_DIRECTORY = Path(__file__).with_name("snapshots")
@@ -66,6 +67,10 @@ def _built_app() -> FastAPI:
         authenticator=TenantApiKeyAuthenticator(
             {"tenant_01": ("tenant-api-key-000000000000000000",)}
         ),
+        # Built with object storage wired, because that is the app a deployment serves: every
+        # one of them constructs S3MediaAccess. Snapshotting the variant without it would put
+        # the one route that hands out a signature outside the only document this gate reads.
+        media_uploads=cast(MediaUploadSigner, object()),
         aml=(
             AmlSettings(api_key="aml-api-key-0000000000000000000000", tenant_prefix="bench_aml"),
             cast(Generator, object()),

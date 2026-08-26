@@ -33,6 +33,10 @@ from mindbridge.benchmarks.suite import (
     BenchmarkSuite,
     SuiteRunSummary,
     SuiteTask,
+    _Arguments,
+    _Plan,
+    _prepared_manifest_path,
+    _prepared_media_arguments,
     main,
 )
 from mindbridge.benchmarks.task_catalog import ROOT, TASKS, CatalogTask, listing, task_payloads
@@ -649,13 +653,75 @@ def test_an_unknown_catalog_name_says_how_to_find_the_real_ones() -> None:
         task_payloads(["nope"], root=Path("/corpus"))
 
 
+def test_an_arm_that_reads_no_manifest_is_not_staged_for(tmp_path: Path) -> None:
+    """ATM-Bench's `sgm` arms ingest released captions and must not have media staged for them.
+
+    The absence of `--prepared-media` cannot stand in for this. Absence is exactly what makes
+    `_prepared_media_arguments` append the flag, after which `_prepared_manifest_path` reads it
+    back off the appended argv and the producer stages about 3 GB that neither arm opens. So the
+    real catalog entries are used rather than a stub: what is pinned is that `--media-source sgm`
+    reaches the predicate.
+    """
+    arguments = _Arguments(
+        task_names=("atm-main",),
+        suite_path=None,
+        benchmarks_root=Path("/corpus"),
+        download=True,
+        output_dir=tmp_path,
+        run_id="gate",
+        shared=(),
+        media=(),
+        overwrite=False,
+        quiet=True,
+        dry_run=False,
+    )
+    staged = {}
+    for name in ("atm-main", "atm-hard", "atm-main-sgm", "atm-hard-sgm"):
+        catalog = TASKS[name]
+        task = SuiteTask(
+            name=name,
+            benchmark=catalog.benchmark,
+            arguments=catalog.resolved(root=Path("/corpus")),
+        )
+        staged[name] = (task, _prepared_media_arguments(task, arguments))
+
+    assert staged["atm-main"][1], "the raw arm reads a manifest and must be staged for"
+    assert staged["atm-hard"][1], "the raw arm reads a manifest and must be staged for"
+    assert staged["atm-main-sgm"][1] == (), "the sgm arm must not be staged for"
+    assert staged["atm-hard-sgm"][1] == (), "the sgm arm must not be staged for"
+    # And the gate has to leave nothing for `_prepare_task` to key on, which is what makes the
+    # producer no-op rather than merely write somewhere unread.
+    for name in ("atm-main-sgm", "atm-hard-sgm"):
+        task, appended = staged[name]
+        plan = _Plan(
+            task=task,
+            run_id="gate",
+            output_path=tmp_path / "out.json",
+            arguments=tuple(task.arguments) + appended,
+        )
+        assert _prepared_manifest_path(plan) is None
+
+
 def test_the_listing_says_which_of_four_things_stands_between_a_task_and_a_run(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Ready, a download away, a preparation away, or blocked on a manifest with no producer."""
+    """Ready, a download away, a preparation away, or blocked on a manifest with no producer.
+
+    The fourth state is asserted against a task made here rather than against whichever real one
+    happens to lack a producer. Every media benchmark in the catalog now has one, so there is no
+    real example left -- and when there was, this test pinned the state to that task's name and
+    failed the day it gained a producer, which is a fact about the catalog rather than about the
+    listing. A synthetic entry keeps the branch covered whatever the catalog holds.
+    """
     dataset = tmp_path / "locomo-refined" / "data" / "raw"
     dataset.mkdir(parents=True)
     (dataset / "locomo_refined.json").write_text("[]", encoding="utf-8")
+    monkeypatch.setitem(
+        TASKS,
+        "hand-made-task",
+        CatalogTask("stub", ("--prepared-media", f"{ROOT}/hand-made-prepared.json")),
+    )
 
     lines = {line.split()[0]: line for line in listing(root=tmp_path).splitlines() if line.strip()}
 
@@ -664,8 +730,10 @@ def test_the_listing_says_which_of_four_things_stands_between_a_task_and_a_run(
     assert lines["memlens-32k"].endswith("download")
     # M3-Bench's prepared media has a producer, so the sweep will stage it rather than ask.
     assert lines["m3-robot"].endswith("prepare")
-    # EgoLifeQA's has none yet, so its manifest is named rather than silently promised.
-    assert f"{tmp_path}/egolife-prepared-a1.json" in lines["egolife"]
+    # Video-MME's is produced now too, where it used to be named for the operator to supply.
+    assert lines["video-mme"].endswith("prepare")
+    # A manifest no producer writes is named, rather than silently promised.
+    assert f"{tmp_path}/hand-made-prepared.json" in lines["hand-made-task"]
 
 
 def test_the_catalog_path_needs_no_file_and_derives_where_everything_goes(
