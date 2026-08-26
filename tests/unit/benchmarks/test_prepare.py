@@ -14,15 +14,15 @@ from typing import Any, cast
 
 import pytest
 
-from mindbridge.benchmarks.prepare import (
+from mindbridge.benchmarks.prepare import prepare_mem_gallery
+from mindbridge.benchmarks.staging import (
     SEGMENT_SECONDS,
     STAGED_AT,
     PrepareRequest,
-    _key_component,
-    _Staging,
-    _within,
-    prepare_mem_gallery,
+    Staging,
+    key_component,
     video_segments,
+    within,
 )
 from mindbridge.core import MediaKind
 
@@ -42,7 +42,7 @@ class _RecordingClient:
 def test_a_staged_object_lands_under_the_tenant_that_will_read_it() -> None:
     """`tenant_s3_object_key` refuses any other prefix, which is why a manifest is per run."""
     client = _RecordingClient()
-    staging = _Staging("mindbridge-media", client)
+    staging = Staging("mindbridge-media", client)
 
     media_object = staging.stage(
         tenant_id="benchmark_m3_bedroom_01_run-01",
@@ -64,7 +64,7 @@ def test_a_staged_object_lands_under_the_tenant_that_will_read_it() -> None:
 
 def test_two_preparations_of_one_clip_produce_the_same_manifest() -> None:
     """A run manifest pins the prepared manifest's digest, so a wall clock in it would churn."""
-    staging = _Staging("bucket", _RecordingClient())
+    staging = Staging("bucket", _RecordingClient())
 
     first = staging.stage(
         tenant_id="tenant_01",
@@ -132,7 +132,7 @@ def test_mem_gallery_stages_every_image_its_topics_reference_and_nothing_else(
 
     dialog, referenced, unreferenced = _mem_gallery_release(tmp_path)
     client = _RecordingClient()
-    monkeypatch.setattr(prepare, "staging", lambda: _Staging("bucket", client))
+    monkeypatch.setattr(prepare, "staging", lambda: Staging("bucket", client))
     manifest = tmp_path / "prepared.json"
 
     prepare_mem_gallery(
@@ -267,15 +267,15 @@ def test_a_release_cannot_name_a_file_outside_the_corpus(tmp_path: Path, image_k
     dialog.mkdir(parents=True)
 
     with pytest.raises(ValueError, match="outside the corpus"):
-        _within(tmp_path, str(dialog), image_key)
+        within(tmp_path, str(dialog), image_key)
 
 
 def test_a_key_a_release_supplies_stays_one_object_key_component() -> None:
     """A topic is interpolated straight into the S3 key, so it may not carry a separator."""
-    assert _key_component("topic_1", label="topic") == "topic_1"
+    assert key_component("topic_1", label="topic") == "topic_1"
     for hostile in ("a/b", "..", "", "a\\b"):
         with pytest.raises(ValueError, match="one object-key component"):
-            _key_component(hostile, label="topic")
+            key_component(hostile, label="topic")
 
 
 def test_a_legitimate_climbing_key_still_resolves(tmp_path: Path) -> None:
@@ -283,6 +283,6 @@ def test_a_legitimate_climbing_key_still_resolves(tmp_path: Path) -> None:
     dialog = tmp_path / "mem-gallery" / "data" / "dialog"
     dialog.mkdir(parents=True)
 
-    resolved = _within(tmp_path, str(dialog), "../image/topic_1/a.jpg")
+    resolved = within(tmp_path, str(dialog), "../image/topic_1/a.jpg")
 
     assert resolved == (tmp_path / "mem-gallery" / "data" / "image" / "topic_1" / "a.jpg").resolve()

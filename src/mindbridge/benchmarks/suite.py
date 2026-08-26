@@ -48,10 +48,11 @@ from mindbridge.benchmarks.artifacts import require_writable_output_pair, write_
 from mindbridge.benchmarks.cli import INTERRUPT_EXIT_CODE, PROGRAM, RUNNERS, guarded
 from mindbridge.benchmarks.cli import parser as build_parser
 from mindbridge.benchmarks.cli_common import BENCHMARK_ENVIRONMENT, report, select_by_id
-from mindbridge.benchmarks.prepare import PREPARERS, PrepareRequest
+from mindbridge.benchmarks.prepare import PREPARERS
 from mindbridge.benchmarks.releases import fetch, missing_inputs, release_for
 from mindbridge.benchmarks.report import render, render_directory
 from mindbridge.benchmarks.scoring import require_scoring_is_possible
+from mindbridge.benchmarks.staging import PrepareRequest
 from mindbridge.benchmarks.task_catalog import (
     DEFAULT_BENCHMARKS_ROOT,
     listing,
