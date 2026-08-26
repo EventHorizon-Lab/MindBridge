@@ -42,6 +42,7 @@ class _Recorder:
     def __init__(self) -> None:
         self.objects: dict[str, bytes] = {}
         self.fetched: list[tuple[str, tuple[str, ...]]] = []
+        self.may_download: list[bool] = []
 
     def put_object(self, *, Bucket: str, Key: str, Body: bytes) -> None:
         self.objects[f"{Bucket}/{Key}"] = Body
@@ -56,6 +57,7 @@ class _Recorder:
         download: bool = True,
     ) -> Path:
         self.fetched.append((release, tuple(only)))
+        self.may_download.append(download)
         return root / release
 
 
@@ -369,6 +371,26 @@ def test_a_supermemory_recording_with_no_released_mp4_is_prepared_from_its_trans
     assert all(segment.media_objects == () for segment in silent.segments)
     assert silent.segments[0].transcript == "User: Nothing was filmed here."
     assert silent.segments[0].identity_observations == ()
+
+
+def test_no_download_reaches_the_fetch_rather_than_stopping_at_the_annotations(
+    tmp_path: Path,
+    staged: _Recorder,
+) -> None:
+    """`--no-download` is documented as refusing to fetch, and preparation is where media is got.
+
+    A producer that drops the flag on the floor leaves it governing annotations only, so
+    `--no-download` on these two benchmarks still pulls the largest media sets in the table --
+    477 GiB for EgoLife, about 51 GB for one SuperMemory participant. Only the propagation is
+    checked here; refusing is `ensure_media`'s own job and its own test.
+    """
+    _egolife_release(tmp_path, "A1_JAKE", day=1, timecodes=("11100000",), seconds=2)
+    dataset = _egolife_questions(tmp_path, [("DAY1", "11101000")])
+    argv = _egolife_argv(dataset, tmp_path / "prepared.json", tmp_path)
+
+    prepare_egolife(PrepareRequest(argv=argv, benchmarks_root=tmp_path, quiet=True, download=False))
+
+    assert staged.may_download == [False]
 
 
 def test_a_supermemory_recording_starting_after_the_last_question_is_not_prepared(
