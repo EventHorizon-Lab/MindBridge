@@ -404,6 +404,11 @@ def _video_bytes(*, seconds: float, fps: int, width: int, height: int) -> bytes:
     with av.open(buffer, mode="w", format="mp4") as container:
         stream = container.add_stream("libx264", rate=fps)
         stream.width, stream.height, stream.pix_fmt = width, height, "yuv420p"
+        # Single-threaded for the same reason the encoders in src/mindbridge/media/clipping.py
+        # are: libx264 carries AV_CODEC_CAP_OTHER_THREADS, so libavcodec hands the pool to
+        # x264 itself and an unpinned encoder here starts 4 native threads at 160x120 and 14
+        # at 640x480 (measured, PyAV 16.1.0). Test fixtures have no reason to spend them.
+        stream.thread_count, stream.thread_type = 1, "NONE"
         for index in range(int(seconds * fps)):
             array = numpy.full((height, width, 3), index % 256, dtype="uint8")
             frame = av.VideoFrame.from_ndarray(array, format="rgb24")
@@ -421,6 +426,11 @@ def _audiovisual_bytes(*, seconds: float, fps: int, width: int, height: int) -> 
     with av.open(buffer, mode="w", format="mp4") as container:
         video = container.add_stream("libx264", rate=fps)
         video.width, video.height, video.pix_fmt = width, height, "yuv420p"
+        # Single-threaded for the same reason the encoders in src/mindbridge/media/clipping.py
+        # are: libx264 carries AV_CODEC_CAP_OTHER_THREADS, so libavcodec hands the pool to
+        # x264 itself and an unpinned encoder here starts 4 native threads at 160x120 and 14
+        # at 640x480 (measured, PyAV 16.1.0). Test fixtures have no reason to spend them.
+        video.thread_count, video.thread_type = 1, "NONE"
         audio = container.add_stream("aac", rate=SAMPLE_RATE)
         audio.layout = "mono"
         for index in range(int(seconds * fps)):
@@ -464,6 +474,11 @@ def _late_video_audiovisual_bytes(
     with av.open(buffer, mode="w", format="mp4") as container:
         video = container.add_stream("libx264", rate=fps)
         video.width, video.height, video.pix_fmt = width, height, "yuv420p"
+        # Single-threaded for the same reason the encoders in src/mindbridge/media/clipping.py
+        # are: libx264 carries AV_CODEC_CAP_OTHER_THREADS, so libavcodec hands the pool to
+        # x264 itself and an unpinned encoder here starts 4 native threads at 160x120 and 14
+        # at 640x480 (measured, PyAV 16.1.0). Test fixtures have no reason to spend them.
+        video.thread_count, video.thread_type = 1, "NONE"
         video.time_base = Fraction(1, 1_000)
         audio = container.add_stream("aac", rate=SAMPLE_RATE)
         audio.layout = "mono"
