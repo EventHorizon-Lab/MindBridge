@@ -59,7 +59,7 @@ flowchart TB
   end
 
   api --> pg & redis & s3 & gen & jina
-  mcp --> pg & s3 & gen & jina
+  mcp --> pg & redis & s3 & gen & jina
   redis --> worker
   beat --> redis
   redis --> cons

@@ -93,6 +93,7 @@ flowchart LR
     api --> queue --> worker
     beat --> queue --> consolidator
     mcp --> postgres
+    mcp --> queue
     api & mcp & worker & consolidator --> objects
     api & mcp & worker & consolidator --> models
     worker & consolidator --> postgres
@@ -384,9 +385,9 @@ Start from the [documentation index](docs/README.md), or go directly to:
 MindBridge has not published a release. `0.1.0` in `pyproject.toml` is the development version,
 and security fixes currently land on `master`.
 
-Known product gaps include per-tenant quotas/rate limits, automatic re-embedding, retrieval over
-`same_as` entity edges, a complete public benchmark baseline, and storage-schema compatibility
-across migrations. Track the current list in [CHANGELOG.md](CHANGELOG.md#known-gaps).
+Known product gaps include per-tenant quotas/rate limits, automatic re-embedding, retrieval beyond
+one-hop `same_as` entity aliases, a complete public benchmark baseline, and storage-schema
+compatibility across migrations. Track the current list in [CHANGELOG.md](CHANGELOG.md#known-gaps).
 
 ## Contributing and security
 
