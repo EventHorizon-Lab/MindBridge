@@ -134,6 +134,13 @@ async def ingest_prepared_video(
     Returns the number of segments that failed, which every question over this video then
     carries: both callers ingest the whole video before answering anything, so a question that
     reads a non-zero count is a question asked over incomplete memory.
+
+    Every segment is handed to one `gather` and the semaphore is the only thing bounding what is
+    in flight. Awaiting them in batches of `request_concurrency` instead drained the permits to
+    zero at every batch edge, and a batch's wall clock was its slowest member rather than its
+    mean -- costly, because per-clip processing time is heavy tailed. The cost of the eager
+    fan-out is one pending task per segment for the length of the ingest, which is thousands of
+    small tasks on the largest split here and no bigger than the manifest already in memory.
     """
     if request_concurrency <= 0:
         raise ValueError("request_concurrency must be positive")
@@ -141,30 +148,25 @@ async def ingest_prepared_video(
         raise ValueError("poll interval and processing timeout must be positive")
     TypeAdapter(Identifier).validate_python(adapter_version)
     semaphore = asyncio.Semaphore(request_concurrency)
-    failures = 0
-    for offset in range(0, len(video.segments), request_concurrency):
-        outcomes = await asyncio.gather(
-            *(
-                _ingest_prepared_segment(
-                    memory,
-                    tenant_id,
-                    device_id,
-                    video,
-                    segment,
-                    offset + index,
-                    adapter_version,
-                    poll_interval_seconds,
-                    processing_timeout_seconds,
-                    semaphore,
-                )
-                for index, segment in enumerate(
-                    video.segments[offset : offset + request_concurrency]
-                )
-            ),
-            return_exceptions=True,
-        )
-        failures += _count_ingest_failures(outcomes)
-    return failures
+    outcomes = await asyncio.gather(
+        *(
+            _ingest_prepared_segment(
+                memory,
+                tenant_id,
+                device_id,
+                video,
+                segment,
+                index,
+                adapter_version,
+                poll_interval_seconds,
+                processing_timeout_seconds,
+                semaphore,
+            )
+            for index, segment in enumerate(video.segments)
+        ),
+        return_exceptions=True,
+    )
+    return _count_ingest_failures(outcomes)
 
 
 def _count_ingest_failures(outcomes: list[BaseException | None]) -> int:

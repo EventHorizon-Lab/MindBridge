@@ -109,6 +109,7 @@ uv run mindbridge-bench eval --list-tasks
 ```text
 groups (--tasks expands these), inputs resolved against .benchmarks:
   released-text           locomo-refined, memlens-32k, atm-main-sgm, atm-hard-sgm
+  aml                     aml-locomo-refined, aml-longmemeval-s, aml-clbench, ...
   all                     locomo-refined, m3-robot, m3-web, egolife, ...
 
 tasks:
@@ -116,6 +117,8 @@ tasks:
   m3-robot                m3              download, prepare
   egolife                 egolife         needs .benchmarks/egolife-prepared-a1.json
   memlens-32k             memlens         download
+  aml-clbench             aml             download
+  aml-beam                aml             needs .benchmarks/beam/chats
   ...
 ```
 
@@ -266,10 +269,10 @@ uv run mindbridge-bench eval --tasks released-text --run-id sweep-001 --dry-run
 ```
 
 `--api-base-url` and `--deployment-config` are forwarded to every task. So are `--limit`,
-`--recall-limit`, `--request-concurrency`, and `--request-timeout-seconds`, but only when given —
-otherwise each runner keeps the default it declares rather than a copy pinned here that goes
-stale. They are placed before a task's own arguments, so a benchmark needing its own recall
-budget sets it in the task.
+`--recall-limit`, `--request-concurrency`, `--unit-concurrency`, and
+`--request-timeout-seconds`, but only when given — otherwise each runner keeps the default it
+declares rather than a copy pinned here that goes stale. They are placed before a task's own
+arguments, so a benchmark needing its own recall budget sets it in the task.
 
 `--device-id`, `--poll-interval-seconds`, and `--processing-timeout-seconds` are forwarded the
 same way, but only to the tasks whose runner takes them — every benchmark here except
@@ -277,11 +280,36 @@ LoCoMo-Refined, which ingests no media and would reject them. That is what lets 
 text and media raise the processing deadline for the runs it applies to. A flag narrower still,
 `--prepared-media` among them, belongs in the task rather than on the sweep.
 
+### Keeping the worker busy
+
+Two flags decide how much work a run keeps in flight, and the product of them is the number that
+matters:
+
+| Flag | Default | What it bounds |
+| --- | --- | --- |
+| `--request-concurrency` | 4 | in-flight API requests inside one unit |
+| `--unit-concurrency` | 4 | units of the benchmark running at once |
+
+A run holds up to `--unit-concurrency` × `--request-concurrency` requests in flight, so the
+defaults keep 16 outstanding against a Worker whose own concurrency is what bounds GPU memory.
+Raising these does not make the Worker do more at once; it makes it less likely to find its queue
+empty. Set both to 1 for a serial run, which is what to reach for when reading a failure.
+
+`--request-concurrency` alone cannot keep the queue full, and this is worth knowing before tuning
+it: a unit ingests before it answers, and the answer phase never reaches the Worker at all. Past
+the size of one unit's fan-out the flag stops buying anything, because what is left idle is the
+gap between units rather than the room inside one. `--unit-concurrency` is the flag that closes
+that gap — with units overlapping, one unit's answer phase runs against another's ingest.
+
 ### What it records
 
 Tasks run one at a time. Running them concurrently against one deployment would have them
 contending for the same worker and would corrupt every timing the runs report; to use more
 hardware, run separate sweeps with different `--run-id`s against separate deployments.
+
+That is a claim about tasks, not about the work inside one. A task's units — a video, a topic, a
+conversation — overlap, and nothing a run reports is per unit, so there is no per-unit timing for
+them to contaminate. See [Keeping the worker busy](#keeping-the-worker-busy).
 
 A task that fails does not stop the sweep, so a benchmark dying four hours in costs its own result
 rather than the others. An interrupt does stop it, and still writes the summary. `--output-dir`
@@ -424,19 +452,35 @@ Six of AML's seven textual benchmarks. ScriptMem is absent on purpose: its publi
 questions, gold answers, and scoring code, but every `conversation` field contains only a
 `format_example` placeholder — the four source scripts are not distributed, so there is nothing for
 a memory system to retrieve and an offline number would measure nothing. A real submission is
-unaffected; AML runs ScriptMem server-side against its own copy.
+unaffected; AML runs ScriptMem server-side against its own copy. `mindbridge-bench aml
+--benchmark scriptmem` offers the choice and refuses it with that reason, so it reads as a decision
+rather than a typo.
+
+CL-Bench, LongMemEval and PersonaMem-v1 are in the release table, so `mindbridge-bench eval`
+fetches them itself and these commands are only for obtaining them out-of-band. BEAM and
+PersonaMem-v2 are not, and have to be fetched by hand: BEAM's corpus is 200 files discovered by
+glob under `chats/{tier}/{conv}/`, and PersonaMem-v2's `data/` is 3.9 GB of which a run reads one
+history variant. Registering either would make a sweep fetch far more than the task reads, or
+announce a fetch that writes nothing. `--list-tasks` reports both as `needs <path>`.
+
+Pin every one of them. Without `--revision` the same task name means different bytes on different
+days, which is the drift that makes two scores incomparable:
 
 ```bash
 git clone https://github.com/mem-eval-suite/LoCoMo_refined.git .benchmarks/locomo-refined
+git -C .benchmarks/locomo-refined checkout 887091190789e8d6760e70b9edd696539923dc4f
+
 git clone https://github.com/mohammadtavakoli78/BEAM.git .benchmarks/beam
+git -C .benchmarks/beam checkout 3e12035532eb85768f1a7cd779832b650c4b2ef9
+
 uvx --from huggingface-hub hf download xiaowu0162/longmemeval --repo-type dataset \
-  --local-dir .benchmarks/longmemeval
+  --revision 2ec2a557f339b6c0369619b1ed5793734cc87533 --local-dir .benchmarks/longmemeval
 uvx --from huggingface-hub hf download bowen-upenn/PersonaMem-v1 --repo-type dataset \
-  --local-dir .benchmarks/personamem-v1
+  --revision fd7c30f071d5c2ee2a211506783be222d7b6002e --local-dir .benchmarks/personamem-v1
 uvx --from huggingface-hub hf download bowen-upenn/PersonaMem-v2 --repo-type dataset \
-  --local-dir .benchmarks/personamem-v2
+  --revision 0622e56d1cc6f1bc990a5100a6ec4022a60e66a6 --local-dir .benchmarks/personamem-v2
 uvx --from huggingface-hub hf download tencent/CL-bench --repo-type dataset \
-  --local-dir .benchmarks/clbench
+  --revision b28a5832a09b0d96c0cf4c22e90d7c60ede25b80 --local-dir .benchmarks/clbench
 ```
 
 Use `longmemeval_s`. `longmemeval_oracle` ships only each question's gold sessions, so retrieval has
@@ -468,21 +512,57 @@ uv run mindbridge-bench aml \
   --deployment-config .benchmarks/deployment.json \
   --run-id smoke-1 \
   --tenant-prefix bench_aml \
-  --top-k 100 \
-  --concurrency 4
+  --recall-limit 100 \
+  --request-concurrency 4
 ```
 
-`--concurrency` bounds requests in flight across every case, not cases replayed at once: a case
-adds its chunks and searches its questions concurrently, with the add phase completing before any
-of that case's searches run. Each in-flight `/aml/add` can hold up to eight pooled connections while
-it writes, so the server needs roughly `8 x --concurrency` connections -- the default 4 matches the
-default `MINDBRIDGE_DATABASE_MAX_POOL_SIZE` of 32. Raise both together, and raise PostgreSQL's
-`max_connections` to match, or writes queue inside the pool until they time out.
+This runner takes the same flags as every other one -- `--recall-limit`, `--request-concurrency`,
+`--request-timeout-seconds`, `--limit`, `--overwrite`, `--predict-only` -- because that shared
+vocabulary is what lets `eval` dispatch it. `--predict-only` is accepted and does nothing: an AML
+run never scores in-runner, so there is no metric for it to replace. `--overwrite` deletes the
+predictions and manifest rather than truncating them, since a resumed run reads the ids already on
+disk to decide what is left to do.
 
-`--tenant-prefix` has no default and must match the deployment's `MINDBRIDGE_AML_TENANT_PREFIX`. The
-manifest's tenant map is derived client-side from the value you pass, so a mismatch produces a
-manifest recording tenants the server never used. Reruns against an existing `--output` resume, and
-refuse to start if the sidecar manifest disagrees on benchmark, run id, deployment, or recall limit.
+`--overwrite` is refused outright when the sidecar describes *this same run*. Deleting the rows
+does not unwrite the `/aml/add` calls that produced them, and the tenant is derived from
+`--run-id`, so replaying would add every case's memories a second time into a tenant that already
+holds them and score the run against a doubled corpus. Drop the flag to resume where the run
+stopped, or pass a new `--run-id` to measure a clean tenant. `--recall-limit` is also range-checked
+before anything is deleted or ingested: the wire contract accepts 1 to 100, and finding that out
+from a `422` mid-run would already have cost the previous result.
+
+`--request-concurrency` bounds requests in flight across every case, not cases replayed at once: a
+case adds its chunks and searches its questions concurrently, with the add phase completing before
+any of that case's searches run. Each in-flight `/aml/add` can hold up to eight pooled connections
+while it writes, so the server needs roughly `8 x --request-concurrency` connections -- the default
+4 matches the default `MINDBRIDGE_DATABASE_MAX_POOL_SIZE` of 32. Raise both together, and raise
+PostgreSQL's `max_connections` to match, or writes queue inside the pool until they time out.
+
+`--tenant-prefix` must match the deployment's `MINDBRIDGE_AML_TENANT_PREFIX` and defaults to that
+same variable read locally -- unset, with no flag, the run is refused rather than given a literal
+default. The manifest's tenant map is derived client-side from the value you pass, so a mismatch
+produces a manifest recording tenants the server never used. Reruns against an existing `--output`
+resume, and refuse to start if the sidecar manifest disagrees on benchmark, run id, deployment, or
+recall limit.
+
+To run several in one sweep, name them through the catalog instead. `--tasks aml` expands to all
+eight AML tasks and needs no judge configured, because none of them is judged in-runner:
+
+```bash
+uv run mindbridge-bench eval --tasks aml --api-base-url "$MINDBRIDGE_API_BASE_URL"
+```
+
+An interrupted AML task resumes: rerun the sweep with the same `--run-id` and the runner continues
+from the rows already written. The preflight that refuses an existing output exempts AML for that
+reason, and only AML — every other runner writes its predictions once at the end, so an existing
+output there is a finished result. Do not reach for `--overwrite` to get past an interruption; it
+is for replacing a *different* run's output, and the runner refuses it in the resume case.
+
+The tasks are `aml-locomo-refined`, `aml-longmemeval-s`, `aml-clbench`, `aml-personamem-v1-32k`,
+`aml-personamem-v1-128k`, `aml-personamem-v1-1M`, `aml-personamem-v2`, and `aml-beam`. PersonaMem-v1
+appears three times because its context windows are different question sets rather than
+repackagings -- 589, 2727 and 2674 questions over 37, 110 and 33 shared contexts. `aml-beam`
+and `aml-personamem-v2` need their corpora fetched by hand first, per the commands above.
 
 Then score through the vendored pipeline, unmodified:
 

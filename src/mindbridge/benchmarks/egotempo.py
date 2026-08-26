@@ -149,30 +149,25 @@ async def run_egotempo_clip(
         processing_timeout_seconds=processing_timeout_seconds,
     )
     semaphore = asyncio.Semaphore(request_concurrency)
-    answers: list[EgoTempoQuestionResult] = []
     cutoff = prepared_video_end(prepared)
-    for offset in range(0, len(questions), request_concurrency):
-        cohort = questions[offset : offset + request_concurrency]
-        answered = await asyncio.gather(
-            *(
-                _answer_question(
-                    memory,
-                    tenant_id,
-                    question,
-                    cutoff,
-                    recall_limit,
-                    semaphore,
-                    ingest_failures,
-                )
-                for question in cohort
-            ),
-            return_exceptions=True,
-        )
-        answers.extend(
-            settle_answers(
-                cohort, answered, partial(_failed_result, ingest_failures=ingest_failures)
+    answered = await asyncio.gather(
+        *(
+            _answer_question(
+                memory,
+                tenant_id,
+                question,
+                cutoff,
+                recall_limit,
+                semaphore,
+                ingest_failures,
             )
-        )
+            for question in questions
+        ),
+        return_exceptions=True,
+    )
+    answers = settle_answers(
+        questions, answered, partial(_failed_result, ingest_failures=ingest_failures)
+    )
     return tuple(answers)
 
 
