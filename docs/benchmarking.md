@@ -498,6 +498,14 @@ run never scores in-runner, so there is no metric for it to replace. `--overwrit
 predictions and manifest rather than truncating them, since a resumed run reads the ids already on
 disk to decide what is left to do.
 
+`--overwrite` is refused outright when the sidecar describes *this same run*. Deleting the rows
+does not unwrite the `/aml/add` calls that produced them, and the tenant is derived from
+`--run-id`, so replaying would add every case's memories a second time into a tenant that already
+holds them and score the run against a doubled corpus. Drop the flag to resume where the run
+stopped, or pass a new `--run-id` to measure a clean tenant. `--recall-limit` is also range-checked
+before anything is deleted or ingested: the wire contract accepts 1 to 100, and finding that out
+from a `422` mid-run would already have cost the previous result.
+
 `--request-concurrency` bounds requests in flight across every case, not cases replayed at once: a
 case adds its chunks and searches its questions concurrently, with the add phase completing before
 any of that case's searches run. Each in-flight `/aml/add` can hold up to eight pooled connections
@@ -518,6 +526,12 @@ eight AML tasks and needs no judge configured, because none of them is judged in
 ```bash
 uv run mindbridge-bench eval --tasks aml --api-base-url "$MINDBRIDGE_API_BASE_URL"
 ```
+
+An interrupted AML task resumes: rerun the sweep with the same `--run-id` and the runner continues
+from the rows already written. The preflight that refuses an existing output exempts AML for that
+reason, and only AML — every other runner writes its predictions once at the end, so an existing
+output there is a finished result. Do not reach for `--overwrite` to get past an interruption; it
+is for replacing a *different* run's output, and the runner refuses it in the resume case.
 
 The tasks are `aml-locomo-refined`, `aml-longmemeval-s`, `aml-clbench`, `aml-personamem-v1-32k`,
 `aml-personamem-v1-128k`, `aml-personamem-v1-1M`, `aml-personamem-v2`, and `aml-beam`. PersonaMem-v1

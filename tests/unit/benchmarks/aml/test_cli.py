@@ -10,12 +10,14 @@ from pathlib import Path
 import httpx
 import pytest
 
-from mindbridge.api.aml_contracts import derive_tenant_id
+from mindbridge.api.aml_contracts import AmlSearchRequest, derive_tenant_id
 from mindbridge.benchmarks.aml.cases import AmlCase, AmlQuestion
 from mindbridge.benchmarks.aml.cli import (
     BENCHMARKS,
+    MAX_RECALL_LIMIT,
     SCRIPTMEM_BENCHMARK,
     TENANT_PREFIX_VARIABLE,
+    AmlRunManifest,
     _Arguments,
     _require_compatible_existing_manifest,
     _require_nonempty_cases,
@@ -896,3 +898,91 @@ def test_a_rerun_without_overwrite_resumes_instead_of_replaying(
 
     assert output_path.read_text(encoding="utf-8") == rows_after_first
     assert len(seen) == requests_after_first, "a resumed run re-issued requests it had done"
+
+
+def test_the_recall_limit_ceiling_matches_the_wire_contract_and_the_manifest() -> None:
+    """Three copies of one bound, in modules that may not import each other.
+
+    `benchmarks.aml` is forbidden from importing `mindbridge.api`, so the CLI carries its own
+    copy of `AmlSearchRequest.top_k`'s ceiling. A test can import both, and this is the only
+    thing keeping the copy honest.
+    """
+    wire = AmlSearchRequest.model_fields["top_k"].metadata
+    manifest = AmlRunManifest.model_fields["recall_limit"].metadata
+    assert MAX_RECALL_LIMIT in {getattr(item, "le", None) for item in wire}
+    assert MAX_RECALL_LIMIT in {getattr(item, "le", None) for item in manifest}
+
+
+@pytest.mark.parametrize(
+    ("flag", "value", "message"),
+    [
+        ("--recall-limit", "101", "--recall-limit must be between 1 and 100"),
+        ("--recall-limit", "0", "--recall-limit must be between 1 and 100"),
+        ("--request-timeout-seconds", "0", "--request-timeout-seconds must be positive"),
+        ("--request-concurrency", "0", "--request-concurrency must be a positive"),
+    ],
+)
+def test_a_setting_the_deployment_would_refuse_is_caught_before_anything_is_written(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, flag: str, value: str, message: str
+) -> None:
+    """Out-of-range settings must not reach the point where they cost a corpus.
+
+    `--recall-limit 101` parses, so without this the run deletes the previous predictions under
+    `--overwrite`, ingests every case, has each search rejected 422, and only then fails building
+    the manifest -- leaving an invalid predictions file with no sidecar where a result had been.
+    """
+    monkeypatch.setenv("MINDBRIDGE_AML_API_KEY", "token")
+    seen: list[httpx.Request] = []
+    _replaying_client(monkeypatch, seen)
+    output_path = tmp_path / "rows.jsonl"
+    main(_invocation(tmp_path, output_path, "--quiet"))
+    survivor = output_path.read_text(encoding="utf-8")
+    requests_before = len(seen)
+
+    with pytest.raises(ValueError, match=re.escape(message)):
+        main(
+            _invocation(
+                tmp_path, output_path, "--quiet", "--run-id", "run-2", "--overwrite", flag, value
+            )
+        )
+
+    assert output_path.read_text(encoding="utf-8") == survivor
+    assert sidecar_manifest_path(output_path).exists()
+    assert len(seen) == requests_before, "a refused setting still reached the deployment"
+
+
+def test_overwrite_refuses_a_manifest_describing_this_same_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Deleting the rows does not unwrite the `/aml/add` calls that produced them.
+
+    The tenant comes from `--run-id`, so replaying the same run adds every case's memories a
+    second time into a tenant that already holds them, and every later search is scored against
+    a doubled corpus. Nothing in the output records that. Resuming is what this case wants.
+    """
+    monkeypatch.setenv("MINDBRIDGE_AML_API_KEY", "token")
+    seen: list[httpx.Request] = []
+    _replaying_client(monkeypatch, seen)
+    output_path = tmp_path / "rows.jsonl"
+    main(_invocation(tmp_path, output_path, "--quiet"))
+    requests_before = len(seen)
+
+    with pytest.raises(ValueError, match="doubling the corpus"):
+        main(_invocation(tmp_path, output_path, "--quiet", "--overwrite"))
+
+    assert len(seen) == requests_before, "the refused run still re-added its cases"
+
+
+def test_overwrite_still_replaces_a_manifest_from_a_different_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The guard above must not swallow the case `--overwrite` exists for."""
+    monkeypatch.setenv("MINDBRIDGE_AML_API_KEY", "token")
+    _replaying_client(monkeypatch, [])
+    output_path = tmp_path / "rows.jsonl"
+    main(_invocation(tmp_path, output_path, "--quiet"))
+
+    main(_invocation(tmp_path, output_path, "--quiet", "--run-id", "run-2", "--overwrite"))
+
+    manifest = json.loads(sidecar_manifest_path(output_path).read_text(encoding="utf-8"))
+    assert manifest["run_id"] == "run-2"

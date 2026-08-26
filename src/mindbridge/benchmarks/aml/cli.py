@@ -338,10 +338,7 @@ def _require_compatible_existing_manifest(
     so a mismatch fails fast. A first run (no sidecar yet) always passes.
     """
     manifest_path = sidecar_manifest_path(output_path)
-    # `--overwrite` is the operator saying this output is not a resume, so there is
-    # nothing for the sidecar to disagree with -- refusing here would block the one
-    # case the flag exists for, a re-run under a new `--run-id` into the same path.
-    if overwrite or not manifest_path.exists():
+    if not manifest_path.exists():
         return
     existing = AmlRunManifest.model_validate_json(manifest_path.read_bytes())
     disagreements: list[str] = []
@@ -353,6 +350,21 @@ def _require_compatible_existing_manifest(
         disagreements.append("deployment (deployment snapshot differs)")
     if existing.recall_limit != recall_limit:
         disagreements.append(f"recall_limit ({existing.recall_limit} != {recall_limit})")
+    if overwrite and not disagreements:
+        # `--overwrite` cannot mean "start this run over": deleting the rows does not unwrite
+        # the `/aml/add` calls that produced them, and the tenant is derived from `--run-id`, so
+        # re-adding lands in the same tenant and doubles the corpus every later search is scored
+        # against. Silently, and only in the score. Resuming is what this case wants, and it is
+        # what dropping the flag does.
+        raise ValueError(
+            f"{manifest_path} already describes this exact run, and --overwrite would re-add "
+            "every case into a tenant that already holds its memories, doubling the corpus this "
+            "run is then scored against; drop --overwrite to resume where it stopped, or pass a "
+            "new --run-id to measure a clean tenant"
+        )
+    if overwrite:
+        # A manifest from a different run, which is what the flag is for.
+        return
     if disagreements:
         raise ValueError(
             f"existing manifest at {manifest_path} disagrees with this run: "
@@ -578,6 +590,42 @@ def _write_manifest(
     )
 
 
+MAX_RECALL_LIMIT = 100
+"""The largest `--recall-limit` both the wire contract and the manifest accept.
+
+Duplicated from `mindbridge.api.aml_contracts.AmlSearchRequest.top_k` (`ge=1, le=100`) rather
+than imported, for the reason in this module's docstring: nothing under
+`mindbridge.benchmarks.aml` may import `mindbridge.api`. `AmlRunManifest.recall_limit` below
+carries the same bound independently. `tests/unit/benchmarks/aml/test_cli.py` asserts all three
+agree, so the copy cannot drift silently.
+"""
+
+
+def _require_usable_recall_limit(value: int) -> int:
+    """Reject a `--recall-limit` the deployment would refuse, at parse time.
+
+    Both bounds that would otherwise catch this fire too late to be useful. The server rejects
+    every `/aml/search` with `422`, and `AmlRunManifest` raises only once the run is over -- so
+    with `--overwrite` the previous run's predictions are already gone, the add phase has already
+    written a full corpus server-side, and what remains is an invalid predictions file with no
+    sidecar where a finished result used to be. Checked here so nothing is deleted or ingested.
+    """
+    if not 1 <= value <= MAX_RECALL_LIMIT:
+        raise ValueError(f"--recall-limit must be between 1 and {MAX_RECALL_LIMIT}, got {value}")
+    return value
+
+
+def _require_positive_timeout(value: float) -> float:
+    """Reject a `--request-timeout-seconds` the manifest would refuse after the run.
+
+    Same failure shape as `_require_usable_recall_limit`: `AmlRunManifest`'s `Field(gt=0)` is the
+    only other guard, and it runs last.
+    """
+    if value <= 0:
+        raise ValueError(f"--request-timeout-seconds must be positive, got {value}")
+    return value
+
+
 def _require_positive_concurrency(value: int) -> int:
     """Refuse a non-positive `--request-concurrency` before it can hang the run.
 
@@ -638,9 +686,9 @@ def _parse_arguments(argv: Sequence[str] | None, prog: str | None) -> _Arguments
         deployment_config_path=parsed.deployment_config,
         run_id=parsed.run_id,
         tenant_prefix=_require_tenant_prefix(parsed.tenant_prefix),
-        recall_limit=parsed.recall_limit,
+        recall_limit=_require_usable_recall_limit(parsed.recall_limit),
         request_concurrency=_require_positive_concurrency(parsed.request_concurrency),
-        request_timeout_seconds=parsed.request_timeout_seconds,
+        request_timeout_seconds=_require_positive_timeout(parsed.request_timeout_seconds),
         limit=parsed.limit,
         overwrite=parsed.overwrite,
         quiet=parsed.quiet,
