@@ -148,24 +148,31 @@ A sweep downloads every file its tasks read and does not already have, then hold
 digest this repository committed. Three things about that are deliberate.
 
 **Only the files a task reads.** ATM-Bench's Hub repository is 3.2 GB and Mem-Gallery's is
-530 MB, but a run consumes five JSON files and one directory of them. Fetching by declared input
-rather than by repository is the difference between about 40 MB and 302 GB — the media in those
-releases is not something a run can use as a file anyway.
+530 MB, but a run consumes five JSON files and one directory of them — about 40 MB between them,
+against 302 GB of full releases. The media in those releases is not something a run can use as a
+file anyway. MEMLENS is the exception worth planning disk for: its annotation *is* the corpus, so
+its four context windows are 98 MB, 191 MB, 369 MB and 732 MB, and `--tasks all` fetches about
+1.4 GB rather than 40 MB.
 
-**Pinned.** Each release is fetched at a fixed commit: the revisions this page used to publish as
-`--revision` flags to copy, plus resolved commits for the three Git releases that had none. A
-revision in a table cannot be forgotten the way one in a copy-pasted command can.
+**Pinned.** Each release is fetched at a fixed commit — every one of them, asserted by
+`tests/unit/benchmarks/test_releases.py` rather than left to review, because a branch name makes
+one task name mean different bytes on different days and nothing in the run would say so.
 
-**Verified.** Every annotation has a `source_sha256` in
+**Verified where a digest names it.** Most annotations have a `source_sha256` in
 [benchmarks/manifests/dataset-adapters-smoke.json](../benchmarks/manifests/dataset-adapters-smoke.json),
-recorded when `mindbridge-bench datasets` last ran. A download whose bytes differ stops the run
-and names both digests, because upstream changing a release is exactly the drift that makes two
-scores incomparable. Re-run that smoke and record the new digest before measuring against it.
+recorded when `mindbridge-bench datasets` last ran. A download whose bytes differ stops the run,
+names both digests, and **deletes the file** — left in place it would be verified once and then
+skipped as already-present by every later sweep. Re-run that smoke and record the new digest
+before measuring against it. The releases the smoke manifest keys by something other than a file
+name have no digest here and rest on the pin alone; `mindbridge-bench datasets` is what checks a
+corpus already on disk.
 
 Downloads are skipped for files already present, so a second sweep fetches nothing.
 `--benchmarks-root` chooses where they land — it defaults to `.benchmarks`, and the layout is the
 same one the manual commands in "Benchmark dataset smoke" below produce, so an existing corpus is
-found as-is. `--no-download` refuses to fetch and fails on an absent release instead.
+found as-is. `--no-download` refuses to fetch and fails on an absent release instead — before the first task
+starts, not when its turn comes. An absent prepared-media manifest is still only reported, with
+or without the flag, because refusing the sweep for it would refuse the tasks that are ready.
 
 ### Prepared media
 

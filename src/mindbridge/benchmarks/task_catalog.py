@@ -291,7 +291,7 @@ def listing(*, root: Path) -> str:
 
 def _state(task: CatalogTask, *, root: Path) -> str:
     """Say what stands between this task and a run."""
-    absent = missing_inputs(task.inputs(root=root), root=root)
+    absent = missing_inputs(task.inputs(root=root))
     if task.benchmark in PREPARERS:
         # Its manifest is written per run into the sweep's own output directory, so there is no
         # file here to find or to have gone stale: what it needs is the staging, every time.

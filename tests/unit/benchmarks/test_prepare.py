@@ -18,7 +18,9 @@ from mindbridge.benchmarks.prepare import (
     SEGMENT_SECONDS,
     STAGED_AT,
     PrepareRequest,
+    _key_component,
     _Staging,
+    _within,
     prepare_mem_gallery,
     video_segments,
 )
@@ -244,3 +246,43 @@ def _mem_gallery_topic() -> dict[str, Any]:
             }
         ],
     }
+
+
+@pytest.mark.parametrize(
+    "image_key",
+    [
+        "../../../../etc/passwd",
+        "/etc/passwd",
+        "../image/../../../../root/.ssh/id_rsa",
+    ],
+)
+def test_a_release_cannot_name_a_file_outside_the_corpus(tmp_path: Path, image_key: str) -> None:
+    """Mem-Gallery's image keys are relative paths out of annotations this command downloads.
+
+    They legitimately climb -- `../image/<topic>/` -- which is why they are joined at all, so
+    the boundary has to be checked rather than assumed. Unchecked, the path was read and its
+    bytes uploaded into the deployment's bucket, driven entirely by release content.
+    """
+    dialog = tmp_path / "mem-gallery" / "data" / "dialog"
+    dialog.mkdir(parents=True)
+
+    with pytest.raises(ValueError, match="outside the corpus"):
+        _within(tmp_path, str(dialog), image_key)
+
+
+def test_a_key_a_release_supplies_stays_one_object_key_component() -> None:
+    """A topic is interpolated straight into the S3 key, so it may not carry a separator."""
+    assert _key_component("topic_1", label="topic") == "topic_1"
+    for hostile in ("a/b", "..", "", "a\\b"):
+        with pytest.raises(ValueError, match="one object-key component"):
+            _key_component(hostile, label="topic")
+
+
+def test_a_legitimate_climbing_key_still_resolves(tmp_path: Path) -> None:
+    """The guard must not break the shape the release actually uses."""
+    dialog = tmp_path / "mem-gallery" / "data" / "dialog"
+    dialog.mkdir(parents=True)
+
+    resolved = _within(tmp_path, str(dialog), "../image/topic_1/a.jpg")
+
+    assert resolved == (tmp_path / "mem-gallery" / "data" / "image" / "topic_1" / "a.jpg").resolve()

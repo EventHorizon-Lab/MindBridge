@@ -192,6 +192,89 @@ def test_a_preparation_that_fails_is_that_task_and_not_the_sweep(
     assert summary.tasks[0].status == "failed"
 
 
+def test_an_interrupt_while_staging_still_writes_the_summary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Staging is the longest phase outside a runner, so it is where Ctrl-C tends to land.
+
+    `except Exception` does not catch it, so it unwound `main` and the summary was never
+    written -- losing every outcome the sweep had already collected before it.
+    """
+
+    def interrupt(request: object) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setitem(
+        TASKS, "stub-task", CatalogTask("stub", ("--dataset", f"{ROOT}/stub/release.json"))
+    )
+    monkeypatch.setitem(PREPARERS, "stub", Producer("--prepared-media", interrupt))
+    invocations = _stub_benchmark(monkeypatch, writes=True)
+
+    assert _catalog_sweep(tmp_path, "run-i") == INTERRUPT_EXIT_CODE
+
+    assert invocations == []
+    summary = _summary(tmp_path / "results" / "run-i")
+    assert summary.tasks[0].exit_code == INTERRUPT_EXIT_CODE
+
+
+def test_a_task_carrying_the_manifest_flag_as_one_word_keeps_its_own(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`--flag=value` is a spelling argparse accepts, so the sweep has to read it as one.
+
+    Treating it as absent appended the sweep's own derived path, argparse took the later
+    occurrence, and the operator's hand-supplied manifest was silently discarded -- for a
+    manifest naming objects the sweep cannot produce, which is the one case the escape exists
+    for.
+    """
+    supplied = tmp_path / "operator.json"
+    supplied.write_text("{}", encoding="utf-8")
+    monkeypatch.setitem(
+        TASKS,
+        "stub-task",
+        CatalogTask(
+            "stub",
+            ("--dataset", f"{ROOT}/stub/release.json", f"--prepared-media={supplied}"),
+        ),
+    )
+    monkeypatch.setitem(PREPARERS, "stub", Producer("--prepared-media", _never_prepares))
+    invocations = _stub_benchmark(monkeypatch, writes=True)
+
+    assert _catalog_sweep(tmp_path, "run-w") == 0
+
+    argv = invocations[0]
+    assert argv.count("--prepared-media") == 0, argv
+    assert f"--prepared-media={supplied}" in argv
+
+
+def test_no_download_refuses_an_absent_release_rather_than_starting(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The flag says "fail on an absent official release"; it used to do neither.
+
+    Returning before the check meant nothing was fetched and nothing failed, so the sweep ran
+    and each absent corpus surfaced as its own task's failure, hours apart.
+    """
+    monkeypatch.setitem(
+        TASKS,
+        "stub-task",
+        CatalogTask("stub", ("--dataset", f"{ROOT}/locomo-refined/data/raw/locomo_refined.json")),
+    )
+    invocations = _stub_benchmark(monkeypatch, writes=True)
+
+    with pytest.raises(ValueError, match="--no-download"):
+        _catalog_sweep(tmp_path, "run-n")
+
+    assert invocations == []
+
+
+def _never_prepares(request: object) -> None:
+    raise AssertionError("the task supplied its own manifest, so nothing should be prepared")
+
+
 def _catalog_sweep(root: Path, run_id: str) -> int:
     return main(
         [

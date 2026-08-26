@@ -9,6 +9,7 @@ committed manifest, and the rule that turns an input into a download pattern.
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -104,7 +105,7 @@ def test_a_present_input_is_never_refetched(tmp_path: Path) -> None:
     present.parent.mkdir(parents=True)
     present.write_text("[]", encoding="utf-8")
 
-    assert missing_inputs((present,), root=tmp_path) == ()
+    assert missing_inputs((present,)) == ()
     # No announcement means nothing was fetched; a network call here would raise instead.
     assert fetch((present,), root=tmp_path, announce=_never) == ()
 
@@ -124,6 +125,39 @@ def test_a_file_with_no_recorded_digest_is_left_alone(tmp_path: Path) -> None:
     path.write_text("whatever the release says", encoding="utf-8")
 
     _require_recorded_digest(path)
+
+
+def test_every_release_is_pinned_to_a_commit() -> None:
+    """A branch name makes one task name mean different bytes on different days.
+
+    That is the drift two scores cannot survive, and it is invisible: the fetch succeeds, the
+    run succeeds, and only the number moves. A digest catches it for the annotations the smoke
+    manifest keys by file name; for the rest the pin is the only thing that does, so the pin is
+    the property asserted here rather than left to review.
+    """
+    unpinned = {
+        name: release.revision
+        for name, release in RELEASES.items()
+        if not re.fullmatch(r"[0-9a-f]{40}", release.revision)
+    }
+
+    assert unpinned == {}
+
+
+def test_a_download_that_fails_its_digest_is_deleted(tmp_path: Path) -> None:
+    """A rejected file left at its final path is verified once and trusted forever after.
+
+    `missing_inputs` skips what exists, so the next sweep never reaches the check that just
+    failed and measures the drifted corpus in silence. Deleting it is what makes the failure
+    reproducible.
+    """
+    path = tmp_path / "locomo_refined.json"
+    path.write_text("not what upstream published", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="has been deleted"):
+        _require_recorded_digest(path)
+
+    assert not path.exists()
 
 
 def test_task_inputs_name_the_files_each_task_reads() -> None:
