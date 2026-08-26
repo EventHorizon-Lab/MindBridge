@@ -82,6 +82,7 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
         limit=arguments.limit,
     )
     prepared = load_prepared_mm_lifelong(arguments.prepared_media_path)
+    prepared = _timeline_for_run(prepared, questions, limit=arguments.limit)
     require_scoring_is_possible("mm-lifelong", predict_only=arguments.predict_only)
     require_writable_output_pair(arguments.output_path, overwrite=arguments.overwrite)
     deployment = load_deployment_snapshot(
@@ -161,6 +162,53 @@ def _write_artifacts(
         ),
     )
     write_run_artifacts(arguments.output_path, predictions, manifest)
+
+
+def _timeline_for_run(
+    prepared: MMLifelongPreparedTimeline,
+    questions: Sequence[MMLifelongQuestion],
+    *,
+    limit: int | None,
+) -> MMLifelongPreparedTimeline:
+    """Narrow the timeline to the segments the selected questions localize into.
+
+    `--limit` is documented as what makes a smoke run cheap, and for this benchmark it was not:
+    the runner ingests one complete official timeline whatever the limit, so answering one
+    question still ingested every segment of a Month split first.
+
+    Safe to subset because a segment is globally aligned: each carries its own absolute
+    `start_seconds`, so dropping the ones between two kept segments moves nothing. That is what
+    makes this different from truncating a stream -- the localization metric is in absolute
+    seconds, and a relative clock would have silently shifted under it. The timeline's own
+    validator still runs on the result, and `_timeline_end_seconds` reads the last kept segment,
+    which by construction still covers the latest interval any selected question references.
+
+    Only under `--limit`; a full run ingests the whole split, and a limited run's manifest
+    records the smaller `segment_count` that says its numbers came from a scoped timeline. The
+    condition lives here rather than at the call site so that both halves of the rule are one
+    testable thing.
+    """
+    if limit is None:
+        return prepared
+    wanted = tuple(interval for question in questions for interval in question.reference_intervals)
+    kept = tuple(
+        segment
+        for segment in prepared.segments
+        if any(
+            start < segment.start_seconds + segment.duration_ms / 1_000
+            and end > segment.start_seconds
+            for start, end in wanted
+        )
+    )
+    if not kept:
+        raise ValueError(
+            "no prepared MM-Lifelong segment covers the selected questions' reference intervals"
+        )
+    return MMLifelongPreparedTimeline(
+        split=prepared.split,
+        timeline_origin=prepared.timeline_origin,
+        segments=kept,
+    )
 
 
 def _parse_arguments(argv: Sequence[str] | None, prog: str | None) -> _Arguments:

@@ -426,9 +426,13 @@ Every benchmark runner above accepts `--limit N` to run only the first N of its 
 declared metric reports `999`, lmms-eval's bypass sentinel. `aml` is a replay rather than a
 benchmark and takes neither.
 
-`--limit` bounds the units answered. For ATM-Bench and MM-Lifelong the corpus is one shared
-archive per tenant rather than one per unit, so it is ingested in full whatever the limit — the
-flag makes those two cheaper to iterate on, not cheap.
+`--limit` bounds the units answered, and for the two benchmarks whose corpus is one shared
+archive per tenant rather than one per unit it narrows the archive with them: ATM-Bench ingests
+only the items its selected questions cite, including the distractors the release declares for
+each, and MM-Lifelong only the timeline segments those questions localize into. Without the flag
+both ingest everything, unchanged. A limited run's manifest records the smaller `email_count`,
+`media_item_count` or `segment_count`, which is what says its numbers came from a scoped corpus
+and are not a benchmark result.
 
 Seven benchmarks score their own free-text answers by calling a judge model from inside the run,
 which needs `MINDBRIDGE_BENCH_JUDGE_ENDPOINT` set; a judge that cannot be read scores the answer

@@ -323,3 +323,43 @@ async def test_mm_lifelong_keeps_answers_when_one_question_recall_raises() -> No
     assert results[0].pred.intervals == ()
     assert results[0].mindbridge_unofficial_ref_at_300 == 0.0
     assert results[1].pred.answer == "A meeting"
+
+
+def test_a_limited_run_ingests_only_the_segments_its_questions_localize_into() -> None:
+    """`--limit` is what makes a smoke run cheap, and this runner ingested the whole split.
+
+    Subsetting is sound here only because a segment is globally aligned: each carries its own
+    absolute `start_seconds`, so dropping the ones between two kept segments moves nothing. The
+    localization metric is in absolute seconds, and a relative clock would have shifted under it
+    — which is what this asserts by keeping a late segment and checking its start is unchanged.
+    """
+    from mindbridge.benchmarks import mm_lifelong_cli
+
+    prepared = _prepared(segment_count=10)
+    # Segment 1 is 0-600s, segment 5 is 2400-3000s.
+    asked = (
+        _question(reference_intervals=((10.0, 20.0),)),
+        _question(reference_intervals=((2450.0, 2460.0),)),
+    )
+
+    scoped = mm_lifelong_cli._timeline_for_run(prepared, asked, limit=2)
+
+    assert [segment.segment_id for segment in scoped.segments] == ["segment_01", "segment_05"]
+    # The clock is absolute, so the kept late segment still sits where the question expects it.
+    assert scoped.segments[-1].start_seconds == 2_400
+    assert scoped.timeline_origin == prepared.timeline_origin
+
+    # Without the flag the timeline is untouched, so a real run measures what it always did.
+    assert mm_lifelong_cli._timeline_for_run(prepared, asked, limit=None) is prepared
+
+
+def test_a_limited_run_refuses_a_timeline_that_covers_none_of_its_questions() -> None:
+    """Silently ingesting nothing would answer every question from an empty memory."""
+    from mindbridge.benchmarks import mm_lifelong_cli
+
+    with pytest.raises(ValueError, match="no prepared MM-Lifelong segment covers"):
+        mm_lifelong_cli._timeline_for_run(
+            _prepared(segment_count=1),
+            (_question(reference_intervals=((9_000.0, 9_100.0),)),),
+            limit=1,
+        )

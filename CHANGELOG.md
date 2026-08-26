@@ -101,9 +101,16 @@ Called out on their own because these are the changes that cost an operator real
   idempotency claims and identity-bearing observation digests recorded before `0021` (both were
   digested by a recipe that no longer exists, so a byte-identical resend could never match again;
   the reprocess is idempotent), makes `observations.content_digest` nullable, and grants
-  `mindbridge_runtime` SELECT on `schema_migrations`. No manual step. Re-embedding into a second
-  space is restored for memory records; the other object types still derive a space-blind
-  `embedding_id` and collide on the primary key, which the migration comment records.
+  `mindbridge_runtime` SELECT on `schema_migrations`. No manual step. Necessary but not
+  sufficient for re-embedding into a second space — see `0026`, which supplies the rest.
+- **Migration `0026`** adds `embeddings.embedding_id_recipe`, recording which recipe derived each
+  stored `embedding_id`. `embedding_id` now hashes `space_id` in every recipe, and that is what
+  makes re-embedding into a second space actually work for claims, events, entities, evidence
+  spans and consolidated summaries rather than only for memory records: the table is also keyed
+  by `embedding_id`, so widening the unique key alone left the second vector colliding on the
+  primary key. No manual step — the first write to touch a row an older recipe named re-keys it
+  in place, so the first pass after this migration pays one re-encode per object it has not yet
+  seen under its new name. Memory-record vectors keep the IDs they already have.
 
 ### Known gaps
 

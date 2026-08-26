@@ -23,7 +23,6 @@ from mindbridge.core import (
     Claim,
     ClaimId,
     EmbeddedObjectType,
-    EmbeddingId,
     EmbeddingRecord,
     Entity,
     EntityId,
@@ -44,6 +43,7 @@ from mindbridge.core import (
     RelationType,
     TenantId,
     VerificationStatus,
+    derive_embedding_id,
     derive_relation,
     derive_stable_id,
 )
@@ -256,15 +256,13 @@ async def embed_observation_graph(
         raise MemoryIntegrityError("embedder returned the wrong graph vector count")
     return tuple(
         EmbeddingRecord(
-            embedding_id=EmbeddingId(
-                derive_stable_id(
-                    "embedding",
-                    tenant_id,
-                    object_type.value,
-                    object_id,
-                    embedding.model_reference.model_id,
-                    EmbedTask.DOCUMENT.value,
-                )
+            embedding_id=derive_embedding_id(
+                tenant_id,
+                object_type.value,
+                object_id,
+                model_id=embedding.model_reference.model_id,
+                space_id=embedding.space_reference.space_id,
+                task=EmbedTask.DOCUMENT.value,
             ),
             tenant_id=tenant_id,
             object_type=object_type,

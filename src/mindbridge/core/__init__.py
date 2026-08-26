@@ -52,6 +52,7 @@ from mindbridge.core.graph import (
     derive_relation,
 )
 from mindbridge.core.identifiers import (
+    EMBEDDING_ID_RECIPE_VERSION,
     ClaimId,
     DeviceId,
     EmbeddingId,
@@ -67,6 +68,7 @@ from mindbridge.core.identifiers import (
     RelationId,
     TenantId,
     TombstoneId,
+    derive_embedding_id,
     derive_observation_id,
     derive_stable_id,
 )
@@ -99,6 +101,7 @@ from mindbridge.core.memory import (
 __all__ = [
     "DEFAULT_EMBEDDING_DIMENSION",
     "DEFAULT_MEMORY_STRENGTH_POLICY",
+    "EMBEDDING_ID_RECIPE_VERSION",
     "RETIRED_FIELD_NAMES",
     "AnonymousIdentityObservation",
     "Claim",
@@ -169,6 +172,7 @@ __all__ = [
     "VerificationStatus",
     "apply_memory_feedback",
     "calculate_memory_strength",
+    "derive_embedding_id",
     "derive_observation_id",
     "derive_relation",
     "derive_stable_id",

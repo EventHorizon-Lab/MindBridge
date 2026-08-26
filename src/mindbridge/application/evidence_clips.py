@@ -38,7 +38,6 @@ from mindbridge.application.ports import (
 )
 from mindbridge.core import (
     EmbeddedObjectType,
-    EmbeddingId,
     EmbeddingRecord,
     EvidenceClip,
     EvidenceSpan,
@@ -47,6 +46,7 @@ from mindbridge.core import (
     MediaObjectId,
     ModelOutputError,
     TenantId,
+    derive_embedding_id,
     derive_stable_id,
     utc_now,
 )
@@ -522,15 +522,13 @@ async def _embed_stored_clips(
         raise ModelOutputError("embedder returned the wrong evidence clip vector count")
     return tuple(
         EmbeddingRecord(
-            embedding_id=EmbeddingId(
-                derive_stable_id(
-                    "embedding",
-                    tenant_id,
-                    item.evidence.evidence_span.evidence_id,
-                    str(item.ordinal),
-                    embedding.model_reference.model_id,
-                    EmbedTask.DOCUMENT.value,
-                )
+            embedding_id=derive_embedding_id(
+                tenant_id,
+                item.evidence.evidence_span.evidence_id,
+                str(item.ordinal),
+                model_id=embedding.model_reference.model_id,
+                space_id=embedding.space_reference.space_id,
+                task=EmbedTask.DOCUMENT.value,
             ),
             tenant_id=tenant_id,
             object_type=EmbeddedObjectType.EVIDENCE_SPAN,

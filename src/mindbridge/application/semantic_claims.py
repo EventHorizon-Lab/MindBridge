@@ -20,7 +20,6 @@ from mindbridge.core import (
     ClaimId,
     DomainInvariantError,
     EmbeddedObjectType,
-    EmbeddingId,
     EmbeddingRecord,
     EntityId,
     MemoryId,
@@ -33,6 +32,7 @@ from mindbridge.core import (
     RelationType,
     TenantId,
     VerificationStatus,
+    derive_embedding_id,
     derive_relation,
     derive_stable_id,
 )
@@ -374,15 +374,13 @@ def _semantic_claim_write(
         memory=memory,
         relations=relations,
         embedding=EmbeddingRecord(
-            embedding_id=EmbeddingId(
-                derive_stable_id(
-                    "embedding",
-                    claim.tenant_id,
-                    EmbeddedObjectType.CLAIM.value,
-                    claim.claim_id,
-                    embedding.model_reference.model_id,
-                    EmbedTask.DOCUMENT.value,
-                )
+            embedding_id=derive_embedding_id(
+                claim.tenant_id,
+                EmbeddedObjectType.CLAIM.value,
+                claim.claim_id,
+                model_id=embedding.model_reference.model_id,
+                space_id=embedding.space_reference.space_id,
+                task=EmbedTask.DOCUMENT.value,
             ),
             tenant_id=claim.tenant_id,
             object_type=EmbeddedObjectType.CLAIM,
