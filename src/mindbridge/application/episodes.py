@@ -18,7 +18,6 @@ from mindbridge.application.capabilities import (
 from mindbridge.core import (
     DomainInvariantError,
     EmbeddedObjectType,
-    EmbeddingId,
     EmbeddingRecord,
     Event,
     EventHierarchyLevel,
@@ -34,6 +33,7 @@ from mindbridge.core import (
     RelationType,
     TenantId,
     VerificationStatus,
+    derive_embedding_id,
     derive_relation,
     derive_stable_id,
 )
@@ -320,15 +320,13 @@ def _episode_write(
         memory=memory,
         relations=relations,
         embedding=EmbeddingRecord(
-            embedding_id=EmbeddingId(
-                derive_stable_id(
-                    "embedding",
-                    episode.tenant_id,
-                    EmbeddedObjectType.EVENT.value,
-                    episode.event_id,
-                    embedding.model_reference.model_id,
-                    EmbedTask.DOCUMENT.value,
-                )
+            embedding_id=derive_embedding_id(
+                episode.tenant_id,
+                EmbeddedObjectType.EVENT.value,
+                episode.event_id,
+                model_id=embedding.model_reference.model_id,
+                space_id=embedding.space_reference.space_id,
+                task=EmbedTask.DOCUMENT.value,
             ),
             tenant_id=episode.tenant_id,
             object_type=EmbeddedObjectType.EVENT,

@@ -336,7 +336,12 @@ to serve when one holds vectors the configured space cannot reach. Pointing a de
 embedder without re-embedding therefore fails loudly instead of returning empty recalls. The
 probe reports each stranded object type separately, so memory records the server wrote itself
 cannot vouch for evidence, events, and claims the worker wrote in another space. Vectors in
-several spaces are accepted while a re-embedding is in progress.
+several spaces are accepted while a re-embedding is in progress, for every object type: an
+`embedding_id` hashes the space it was produced for, so one object holds one vector per space
+rather than colliding on the primary key. Migration `0026` records which recipe derived each
+stored ID, and the first write to touch a row an older recipe named re-keys it in place — so the
+first pass after that migration pays for one re-encode per object it has not seen under its new
+name, and every pass after it does not.
 
 The stdio MCP process has no configured tenant list and therefore cannot run this probe.
 

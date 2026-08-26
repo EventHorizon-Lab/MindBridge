@@ -3,6 +3,7 @@
 from datetime import datetime, timezone
 
 import pytest
+from pgvector import Vector
 
 from mindbridge.application.ports import EmbeddingSearch
 from mindbridge.core import (
@@ -17,6 +18,7 @@ from mindbridge.core import (
     MemoryIntegrityError,
     ModelReference,
     TenantId,
+    derive_embedding_id,
 )
 from mindbridge.infrastructure._postgres_media import write_media_object
 from mindbridge.infrastructure._postgres_types import tenant_connection
@@ -307,34 +309,37 @@ async def test_pgvector_accepts_a_reencoded_vector_only_when_the_caller_allows_i
 async def test_a_vector_stranded_under_its_old_identifier_is_re_keyed(
     store: PostgresMemoryStore,
 ) -> None:
-    """`embedding_id` is content-addressed, and migration 0021 removed one of its components.
+    """`embedding_id` is content-addressed, so changing what it hashes strands every stored ID.
 
-    Every ID written before that migration is unreachable from the same inputs, while the
-    object key -- tenant, object, model, space, task -- is unchanged. So the writer meets a
-    stored row with equivalent content under a different ID, which is not content drift and
-    must not be reported as it. Re-keying rather than merely tolerating is what stops it
-    recurring: the ID is what `has_embedding` looks up, so a row left under its old name pays
-    for an encode it already has on every future pass.
+    The ID is unreachable from the same inputs while the object key -- tenant, object, model,
+    space, task -- is unchanged, so the writer meets a stored row with equivalent content under
+    a different ID. That is not content drift and must not be reported as it. Re-keying rather
+    than merely tolerating is what stops it recurring: the ID is what `has_embedding` looks up,
+    so a row left under its old name pays for an encode it already has on every future pass.
+
+    The legacy row is inserted with `embedding_id_recipe = 1` rather than written through the
+    store, because that column is what makes it legacy. Simulating it with a backdated
+    `created_at` is what the previous bound did, and `created_at` is caller-supplied.
     """
     model = ModelReference(model_id="jinaai/jina-embeddings-v5-omni-small-retrieval")
     space = EmbeddingSpaceReference(space_id="jina-v5-rekey")
     values = (1.0, 0.0) + (0.0,) * 1_022
     legacy = _embedding_record(
-        embedding_id="embedding_derived_with_a_revision",
+        embedding_id="embedding_derived_by_recipe_one",
         object_id="memory_stranded",
         values=values,
         model=model,
         space=space,
     )
     current = _embedding_record(
-        embedding_id="embedding_derived_without_one",
+        embedding_id="embedding_derived_by_recipe_two",
         object_id="memory_stranded",
         values=values,
         model=model,
         space=space,
     )
 
-    assert await store.write_embedding(legacy) is True
+    await _insert_at_recipe(store, legacy, recipe=1)
     assert await store.has_embedding(VECTOR_TENANT, current.embedding_id) is False
 
     assert await store.write_embedding(current) is False
@@ -361,6 +366,106 @@ async def test_a_vector_stranded_under_its_old_identifier_is_re_keyed(
                 model=model,
                 space=space,
             )
+        )
+
+    # And an ID disagreement on a row already at the current recipe is refused, which is the
+    # half a general amnesty would have thrown away: the row was written by this recipe, so a
+    # different ID for the same object key is not a stranded name.
+    with pytest.raises(DomainInvariantError, match="different vector content"):
+        await store.write_embedding(
+            _embedding_record(
+                embedding_id="embedding_a_fourth_name",
+                object_id="memory_stranded",
+                values=values,
+                model=model,
+                space=space,
+            )
+        )
+
+
+async def test_one_object_holds_a_vector_in_each_space_while_re_embedding(
+    store: PostgresMemoryStore,
+) -> None:
+    """The workflow migration 0025 widened the unique key for, and could not actually run.
+
+    `docs/configuration.md` tells an operator that vectors in several spaces are accepted while
+    a re-embedding is in progress. Widening the key was necessary and not sufficient: the table
+    is also `PRIMARY KEY (tenant_id, embedding_id)`, and five of the six recipes deriving that
+    ID did not hash `space_id`, so the second vector derived the *same* ID, collided on the
+    primary key, and `write_embedding` raised "embedding conflict could not be resolved" --
+    naming a conflict it could not see. A claim is used because `kernel.py`'s memory-record
+    recipe was the one that already worked, and testing that one proves nothing.
+    """
+    model = ModelReference(model_id="jinaai/jina-embeddings-v5-omni-small-retrieval")
+    claim_id = "claim_being_re_embedded"
+    first, second = (
+        _embedding_record(
+            embedding_id=derive_embedding_id(
+                VECTOR_TENANT,
+                EmbeddedObjectType.CLAIM.value,
+                claim_id,
+                model_id=model.model_id,
+                space_id=space_id,
+                task="retrieval_document",
+            ),
+            object_id=claim_id,
+            object_type=EmbeddedObjectType.CLAIM,
+            values=values,
+            model=model,
+            space=EmbeddingSpaceReference(space_id=space_id),
+        )
+        for space_id, values in (
+            ("jina-v5-1024", (1.0, 0.0) + (0.0,) * 1_022),
+            ("jina-v6-1024", (0.0, 1.0) + (0.0,) * 1_022),
+        )
+    )
+
+    assert first.embedding_id != second.embedding_id, "the recipe must vary with space_id"
+    assert await store.write_embedding(first) is True
+    assert await store.write_embedding(second) is True
+
+    async with tenant_connection(store._pool, VECTOR_TENANT) as connection:
+        rows = await (
+            await connection.execute(
+                "SELECT space_id FROM embeddings WHERE tenant_id = %s AND object_id = %s"
+                " ORDER BY space_id",
+                (VECTOR_TENANT, claim_id),
+            )
+        ).fetchall()
+
+    assert [row[0] for row in rows] == ["jina-v5-1024", "jina-v6-1024"]
+
+
+async def _insert_at_recipe(
+    store: PostgresMemoryStore,
+    embedding: EmbeddingRecord,
+    *,
+    recipe: int,
+) -> None:
+    """Store one vector as an older recipe wrote it, which the writer will no longer do."""
+    async with tenant_connection(store._pool, embedding.tenant_id) as connection:
+        await connection.execute(
+            """
+            INSERT INTO embeddings (
+                tenant_id, embedding_id, object_type, object_id, model_id, space_id, task,
+                dimension, normalized, embedding, created_at, embedding_id_recipe
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            (
+                embedding.tenant_id,
+                embedding.embedding_id,
+                embedding.object_type.value,
+                embedding.object_id,
+                embedding.model_reference.model_id,
+                embedding.space_reference.space_id,
+                embedding.task,
+                embedding.dimension,
+                embedding.normalized,
+                Vector(list(embedding.values)),
+                embedding.created_at,
+                recipe,
+            ),
         )
 
 

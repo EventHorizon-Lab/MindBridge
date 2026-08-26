@@ -521,3 +521,44 @@ def test_manifest_media_item_count_matches_the_arm_that_actually_ran(tmp_path: P
         (tmp_path / "sgm-predictions.json.manifest.json").read_text(encoding="utf-8")
     )
     assert sgm_manifest["media_item_count"] == 1
+
+
+def test_a_limited_run_ingests_only_the_archive_its_questions_rest_on() -> None:
+    """`--limit` is what makes a smoke run cheap, and for this benchmark it was not.
+
+    One tenant holds the whole archive and every question is asked of it, so limiting to two
+    questions still ingested 6,742 emails and every schema-guided record first — hours, for two
+    answers. The narrowing is the questions' own `evidence_ids` plus the `niah_evidence_ids`
+    this release built as their distractors, so each selected question keeps the haystack it was
+    written against. A prefix of the archive would have grounded almost none of them.
+    """
+    from mindbridge.benchmarks.atm_bench import AtmBenchQuestion, AtmEmail
+
+    def _email(email_id: str) -> AtmEmail:
+        return AtmEmail(
+            email_id=email_id,
+            occurred_at=datetime(2024, 11, 16, 9, 12, tzinfo=timezone.utc),
+            summary="Hotel",
+            body="Total £799.74.",
+        )
+
+    asked = AtmBenchQuestion(
+        question_id="question_01",
+        question="How much did I pay?",
+        reference_answer="£799.74",
+        qtype="number",
+        evidence_ids=("email_cited",),
+        niah_evidence_ids=("email_distractor", "20250223_130249"),
+    )
+    emails = (_email("email_cited"), _email("email_distractor"), _email("email_unrelated"))
+    records = (_sgm_record(),)
+
+    scoped_emails, scoped_records = atm_cli._archive_for_run((asked,), emails, records, limit=1)
+
+    assert [email.email_id for email in scoped_emails] == ["email_cited", "email_distractor"]
+    assert [record.media_id for record in scoped_records] == [records[0].media_id]
+
+    # Without the flag the archive is untouched, so a real run measures what it always did.
+    full_emails, full_records = atm_cli._archive_for_run((asked,), emails, records, limit=None)
+    assert full_emails == emails
+    assert full_records == records

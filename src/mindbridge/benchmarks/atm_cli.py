@@ -76,7 +76,11 @@ class AtmRunManifest(MediaBenchmarkRunManifest):
     query_prompt_version: NonEmptyString
     question_ids: tuple[Identifier, ...] = Field(min_length=1)
     media_item_count: int = Field(ge=0)
-    email_count: int = Field(gt=0)
+    # `ge` rather than `gt`: a full run always ingests emails, but a `--limit` run narrows the
+    # archive to what its questions cite, and a selected question citing only media cites no
+    # email at all. Refusing that here would have failed the manifest after the run had already
+    # ingested and answered everything.
+    email_count: int = Field(ge=0)
     ingest_failure_count: int = Field(ge=0)
 
 
@@ -126,6 +130,7 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
         require_worker=arguments.media_source == "raw",
     )
     emails = load_atm_emails(arguments.emails_path)
+    emails, sgm_records = _archive_for_run(questions, emails, sgm_records, limit=arguments.limit)
     _require_one_clock(prepared, sgm_records, media_source=arguments.media_source)
     report(f"running {len(questions)} questions", quiet=arguments.quiet)
     failures, results = asyncio.run(_run(arguments, questions, prepared, sgm_records, emails))
@@ -265,6 +270,44 @@ def _write_artifacts(
         ingest_failure_count=failures,
     )
     write_run_artifacts(arguments.output_path, predictions, manifest)
+
+
+def _archive_for_run(
+    questions: Sequence[AtmBenchQuestion],
+    emails: Sequence[AtmEmail],
+    sgm_records: Sequence[AtmSgmRecord],
+    *,
+    limit: int | None,
+) -> tuple[tuple[AtmEmail, ...], tuple[AtmSgmRecord, ...]]:
+    """Narrow the archive to what the selected questions rest on, for a `--limit` run.
+
+    `--limit` is documented as what makes a smoke run cheap to iterate on, and for this
+    benchmark it was not: one tenant holds the whole archive and every question is asked of it,
+    so limiting the questions to two still ingested 6,742 emails and every schema-guided record
+    first. Hours, for two answers.
+
+    The narrowing is the questions' own declaration rather than a prefix. `evidence_ids` is what
+    a correct answer must rest on -- `validate_prepared_atm` already refuses a run that cannot
+    ground it -- and `niah_evidence_ids` is the distractor set this release built for that
+    question, so keeping both preserves the haystack each selected question was written against.
+    A prefix of the archive would instead ground almost no question at all.
+
+    Only under `--limit`. A full run ingests the full archive, unchanged, and a limited run
+    records its smaller `email_count` and `media_item_count` in the manifest, which is what says
+    the number came from a scoped corpus. The condition lives here rather than at the call site
+    so that both halves of the rule are one testable thing.
+    """
+    if limit is None:
+        return tuple(emails), tuple(sgm_records)
+    cited = {
+        evidence_id
+        for question in questions
+        for evidence_id in (*question.evidence_ids, *question.niah_evidence_ids)
+    }
+    return (
+        tuple(email for email in emails if email.email_id in cited),
+        tuple(record for record in sgm_records if record.media_id in cited),
+    )
 
 
 def _require_one_clock(
