@@ -262,7 +262,41 @@ plugin = "openai"
 endpoint = "https://generator.example.com/v1"
 model_id = "qwen3.8-max"
 reasoning_effort = "low"
+audio_mode = "native"
 ```
+
+`audio_mode` declares the selected generator's audio capability; MindBridge does not infer it
+from a model name. Keep the default, `native`, for an Omni model: text, image, video, audio, and
+mixed inputs retain their native content parts. For a video-capable VLM that cannot read audio,
+install the existing FunASR runtime and select transcription:
+
+```bash
+uv sync --extra server --extra edge
+```
+
+```toml
+[generator]
+plugin = "openai"
+endpoint = "https://generator.example.com/v1"
+model_id = "video-vlm"
+audio_mode = "transcribe"
+asr_device = "auto"
+# Override this Mandarin default when the deployment's speech language differs.
+asr_model_id = "iic/speech_seaco_paraformer_large_asr_nat-zh-cn-16k-common-vocab8404-pytorch"
+```
+
+Text and image-only requests do not load FunASR. On the first request containing audio or video,
+MindBridge loads the existing FunASR + CAM++ speech pipeline locally. It replaces audio parts with
+an explicitly untrusted diarized transcript and keeps each video part beside its transcript so the
+VLM still sees the frames. Each speech turn has this stable shape:
+
+```text
+speaker A | 00:00:00.000-00:00:03.250 | first utterance
+speaker B | 00:00:03.400-00:00:05.100 | reply
+```
+
+Speaker letters are local to one media part and assigned by first appearance. Media materialized
+for speech analysis is bounded to 64 MiB per part.
 
 Also `[embedder]`, `[media_embedder]`, and `[media_sampling]`. `[embedding]`'s two keys are
 folded into `[embedder]` and `[media_embedder]` when they are read, so one space is stated once.
