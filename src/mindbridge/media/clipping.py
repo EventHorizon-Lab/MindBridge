@@ -464,8 +464,23 @@ def _clamped_region(
 
 
 def _stream_rate(frames_per_second: float) -> int:
-    """H.264 needs an integral rate; the sampling interval already did the work."""
-    return max(1, round(frames_per_second))
+    """H.264 needs an integral rate, and it has to be at least the sampling rate.
+
+    Rounding is not free here: this rate becomes the encoder's time base, and a tick coarser
+    than the gap between two sampled frames lands both of them on the same timestamp. The mux
+    then refuses the second one -- `av.error.ValueError: [Errno 22] Invalid argument` -- at any
+    frame count, on the first span that crosses a tick boundary rather than on a long one.
+
+    `round` produced exactly that whenever it went down, which Python's round-half-to-even
+    makes look arbitrary from the outside: 2.5 fps declared a rate of 2, whose 500 ms tick
+    collapsed the 400 ms sampling onto ticks 0, 1, 2, 2, and every video clip cut under that
+    setting failed, while 3.5 fps rounded up to 4 and was fine. `ceil` never rounds below the
+    rate it is given, so the tick is never coarser than the interval that feeds it.
+
+    Above the sampling rate is only a finer tick than needed. Frame offsets are stamped on the
+    millisecond timeline from `_MILLISECOND_TIME_BASE`, so this decides resolution, not speed.
+    """
+    return max(1, math.ceil(frames_per_second))
 
 
 # ponytail: av/soundfile/PIL sit in mypy's ignore_missing_imports list, so a Protocol per
