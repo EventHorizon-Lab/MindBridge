@@ -266,6 +266,11 @@ class AudioFallbackGenerator:
     ) -> None:
         if maximum_media_bytes <= 0:
             raise ValueError("ASR media limit must be positive")
+        # The pipeline loads lazily on the first audiovisual request, but whether the requested
+        # engine can run the requested model is two strings -- so answer it now. A worker that
+        # accepts traffic and then fails on the first clip carrying speech is worse than one
+        # that refuses to start.
+        _validate_speech_engine(asr_engine, asr_recipe)
         self._generator = generator
         self._asr_engine = asr_engine
         self._asr_recipe = asr_recipe
@@ -319,6 +324,23 @@ class AudioFallbackGenerator:
                     raise
                 except Exception as error:
                     raise ModelUnavailableError("FunASR transcription failed") from error
+
+
+def _validate_speech_engine(engine: str | None, recipe: FunASRRecipe | str | None) -> None:
+    """Check the engine and recipe name a workable pair, if the edge runtime is installed.
+
+    `audio_mode="transcribe"` documents the `edge` extra as a requirement, but an absent extra
+    stays a first-request failure rather than becoming a new reason not to start: that is the
+    existing contract, and this check is about a misconfigured pair, not a missing install.
+    """
+    try:
+        from mindbridge.edge.identity_diarization import (
+            DEFAULT_FUNASR_RECIPE,
+            validate_speech_engine,
+        )
+    except ImportError:
+        return
+    validate_speech_engine(engine, recipe if recipe is not None else DEFAULT_FUNASR_RECIPE)
 
 
 def _load_speech_analyzer(

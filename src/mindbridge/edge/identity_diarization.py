@@ -690,25 +690,45 @@ def load_speech_analyzer(
     it safe to decide automatically. Across models it is not, so the recipe constrains it: an
     engine is never allowed to quietly transcribe with a model nobody asked for.
     """
-    selected_recipe = resolve_funasr_recipe(recipe)
+    selected_recipe = validate_speech_engine(engine, recipe)
     selected = (
-        (engine or _engine_for_environment(device=device, recipe=selected_recipe)).strip().lower()
+        engine.strip().lower()
+        if engine
+        else _engine_for_environment(device=device, recipe=selected_recipe)
     )
     if selected == "vllm":
-        if not selected_recipe.vllm_servable:
-            raise ValueError(
-                f"the vLLM engine cannot run {selected_recipe.model_id!r}: it implements "
-                "Fun-ASR-Nano's architecture only. Use engine='automodel' for this model, or "
-                "set vllm_servable on a recipe naming Fun-ASR-Nano weights"
-            )
         return FunASRNanoVLLMPipeline.load(
             device=device,
             model_id=selected_recipe.model_id,
             revision=selected_recipe.revision,
         )
-    if selected == "automodel":
-        return FunASRAutoModelPipeline.load(device=device, recipe=selected_recipe)
-    raise ValueError(f"unknown speech engine {selected!r}; pass one of {', '.join(SPEECH_ENGINES)}")
+    return FunASRAutoModelPipeline.load(device=device, recipe=selected_recipe)
+
+
+def validate_speech_engine(
+    engine: str | None,
+    recipe: FunASRRecipe | str = DEFAULT_FUNASR_RECIPE,
+) -> FunASRRecipe:
+    """Refuse an engine and recipe that cannot work together, and return the resolved recipe.
+
+    Whether an engine can serve a recipe is a property of two strings -- no weights, no device,
+    no GPU. So a deployment naming an impossible pair should hear about it while it is starting,
+    not on the first clip that reaches a worker. Kept separate from `load_speech_analyzer` for
+    exactly that: a caller that loads the pipeline lazily still wants the answer eagerly.
+    """
+    selected_recipe = resolve_funasr_recipe(recipe)
+    selected = (engine or "").strip().lower()
+    if selected and selected not in SPEECH_ENGINES:
+        raise ValueError(
+            f"unknown speech engine {selected!r}; pass one of {', '.join(SPEECH_ENGINES)}"
+        )
+    if selected == "vllm" and not selected_recipe.vllm_servable:
+        raise ValueError(
+            f"the vLLM engine cannot run {selected_recipe.model_id!r}: it implements "
+            "Fun-ASR-Nano's architecture only. Use engine='automodel' for this model, or "
+            "set vllm_servable on a recipe naming Fun-ASR-Nano weights"
+        )
+    return selected_recipe
 
 
 def _engine_for_environment(*, device: str | None, recipe: FunASRRecipe) -> str:

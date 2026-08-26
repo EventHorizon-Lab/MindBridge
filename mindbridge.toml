@@ -29,8 +29,12 @@ model_id = "qwen3.8-max"
 # Omni models consume the source audio directly. For a video-capable VLM without audio support,
 # install the `edge` extra and set this to "transcribe"; FunASR + CAM++ then load on first AV use.
 audio_mode = "native"
+# Leave asr_engine unset to resolve it from the device: CUDA with vLLM installed uses "vllm",
+# every other platform uses "automodel". Set it only to pin one against that.
 # asr_engine = "automodel"
-# asr_recipe = "fun-asr-nano"
+# The speech model. "fun-asr-nano" is the default and the only one the vllm engine can serve;
+# "paraformer" is Mandarin-tuned, "sensevoice" is multilingual, and both need "automodel".
+# asr_recipe = "sensevoice"
 # asr_device = "auto"
 # The Worker sizes its Celery budget from this, so the two have to agree. A perception clip can
 # take 16-25 minutes, which is why the default is not a web timeout.

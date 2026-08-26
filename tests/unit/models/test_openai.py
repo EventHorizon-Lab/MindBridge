@@ -477,21 +477,55 @@ async def test_transcribing_generator_carries_its_engine_and_recipe_to_funasr(
     assert arguments["model"] == identity_diarization.FUNASR_ASR_MODEL_ID
     assert arguments["punc_model"] == identity_diarization.FUNASR_PUNCTUATION_MODEL_ID
 
-    # An unusable engine name has to surface here rather than being silently ignored.
-    unknown = create_generator({**config, "asr_engine": "llama.cpp"})
+    # An unusable engine, or an engine that cannot serve the recipe, is refused while the
+    # generator is being built. The pipeline still loads lazily, but a worker that accepts
+    # traffic and then fails on the first clip carrying speech is worse than one that will not
+    # start -- and both answers are known from two strings.
+    with pytest.raises(ValueError, match="unknown speech engine"):
+        create_generator({**config, "asr_engine": "llama.cpp"})
+    with pytest.raises(ValueError, match="cannot run"):
+        create_generator({**config, "asr_engine": "vllm", "asr_recipe": "sensevoice"})
+
+
+async def test_the_shipped_sample_config_can_actually_be_uncommented() -> None:
+    """`mindbridge.toml` is the shipped example, so its commented lines have to work together.
+
+    Two drafts of this block did not: one pinned the engine as a side effect of switching
+    transcription on, and the next paired the vLLM engine with a model it cannot serve. Both
+    read fine and both would have failed for whoever uncommented them.
+    """
+    generator = create_generator(
+        {**_uncommented_sample_generator_config(), "api_key": "unit-test-key"}
+    )
     try:
-        with pytest.raises(ValueError, match="unknown speech engine"):
-            await unknown.generate(
-                GenerateRequest(
-                    system_prompt="Answer from evidence.",
-                    input=ModelInput(
-                        (MediaPart(MediaKind.AUDIO, f"data:audio/wav;base64,{encoded}"),)
-                    ),
-                    max_output_tokens=64,
-                )
-            )
+        assert isinstance(generator, AudioFallbackGenerator)
     finally:
-        await close_model(unknown)
+        await close_model(generator)
+
+
+def _uncommented_sample_generator_config() -> dict[str, object]:
+    """Read `[generator]` from the shipped sample with every commented key switched on."""
+    import re
+
+    import tomllib
+
+    from mindbridge import configuration
+
+    sample = Path("mindbridge.toml").read_text()
+    section = sample[sample.index("[generator]") :]
+    section = section[: section.index("\n[", 1)]
+    commented = re.findall(r"^# ([a-z_]+ = .*)$", section, re.M)
+    assert commented, "the sample lost its commented generator keys; this guard now tests nothing"
+
+    live = sample
+    for line in commented:
+        live = live.replace(f"# {line}", line)
+    live = live.replace('audio_mode = "native"', 'audio_mode = "transcribe"')
+    document = tomllib.loads(live)
+    encoded = (
+        configuration._flattened_scalars(document) | configuration._flattened_plugins(document, {})
+    )["MINDBRIDGE_GENERATOR_CONFIG_JSON"]
+    return cast(dict[str, object], json.loads(encoded))
 
 
 async def test_cumulative_stream_usage_is_charged_once_not_once_per_chunk() -> None:
