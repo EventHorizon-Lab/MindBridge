@@ -1,10 +1,13 @@
-"""Checks for the shared client lifecycle and prepared-media index."""
+"""Checks for the shared client lifecycle, unit scheduling, and prepared-media index."""
 
+import ast
+import asyncio
 from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
 
+from mindbridge.benchmarks import cli_common
 from mindbridge.benchmarks.cli_common import (
     CoreArguments,
     connected_memory,
@@ -14,6 +17,7 @@ from mindbridge.benchmarks.cli_common import (
     limit_units,
     report,
     report_unit,
+    run_units,
     select_by_id,
 )
 from mindbridge.sdk import MindBridge
@@ -221,6 +225,7 @@ def _arguments() -> CoreArguments:
         tenant_prefix="benchmark_test",
         recall_limit=20,
         request_concurrency=4,
+        unit_concurrency=1,
         request_timeout_seconds=1_800.0,
         limit=None,
         overwrite=False,
@@ -247,3 +252,112 @@ def test_quiet_silences_every_progress_line(capsys: pytest.CaptureFixture[str]) 
 
     streams = capsys.readouterr()
     assert (streams.out, streams.err) == ("", "")
+
+
+async def _peak_in_flight(units: int, unit_concurrency: int) -> tuple[int, tuple[int, ...]]:
+    """Run `units` units and report the most that were ever in flight together, plus the order.
+
+    Each unit yields a fixed number of times before returning, which is enough for every sibling
+    a permit is free for to enter first. No wall-clock sleeps, so the peak is deterministic: with
+    the units awaited one at a time it is 1 whatever `unit_concurrency` says.
+    """
+    in_flight = 0
+    peak = 0
+
+    async def run(unit: int) -> int:
+        nonlocal in_flight, peak
+        in_flight += 1
+        peak = max(peak, in_flight)
+        # Later units yield fewer times, so they finish first and the result order is only
+        # right if it comes from the argument order rather than from completion order.
+        for _ in range(2 * (units - unit)):
+            await asyncio.sleep(0)
+        in_flight -= 1
+        return unit
+
+    results = await run_units(
+        tuple(range(units)),
+        label=lambda unit: f"unit {unit}",
+        run=run,
+        unit_concurrency=unit_concurrency,
+        quiet=True,
+    )
+    return peak, results
+
+
+async def test_units_run_together_up_to_their_permit_count() -> None:
+    """A run's ceiling is unit_concurrency times request_concurrency, not one unit's budget.
+
+    Awaiting each unit in turn held the whole run to one unit's own fan-out, and drained it to
+    nothing between units -- and raising --request-concurrency could not lift that, because the
+    ceiling was the loop rather than the flag.
+    """
+    peak, results = await _peak_in_flight(units=6, unit_concurrency=3)
+
+    assert peak == 3, f"only {peak} units were ever in flight; three permits were free"
+    assert results == (0, 1, 2, 3, 4, 5), "results must come back in the order units were given"
+
+
+async def test_unit_concurrency_of_one_still_runs_the_units_one_at_a_time() -> None:
+    """The serial shape stays reachable, which is what an operator drops to when debugging."""
+    peak, results = await _peak_in_flight(units=4, unit_concurrency=1)
+
+    assert peak == 1
+    assert results == (0, 1, 2, 3)
+
+
+async def test_run_units_refuses_a_ceiling_that_would_run_nothing() -> None:
+    with pytest.raises(ValueError, match="unit_concurrency"):
+        await _peak_in_flight(units=2, unit_concurrency=0)
+
+
+async def test_finished_units_are_counted_rather_than_numbered(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """With units overlapping, the progress counter has to mean "done", not "starting".
+
+    Several units are in flight at once, so none of them is "the second"; the completion line is
+    what carries the count, and the start line names the unit without claiming a position.
+    """
+    await run_units(
+        ("a", "b"),
+        label=lambda unit: f"unit {unit}",
+        run=lambda unit: asyncio.sleep(0, result=unit),
+        unit_concurrency=2,
+        quiet=False,
+    )
+
+    err = capsys.readouterr().err
+    assert "starting unit a" in err
+    assert "[1/2] unit " in err
+    assert "[2/2] unit " in err
+
+
+def test_every_runner_forwards_its_own_unit_ceiling() -> None:
+    """No runner may pin its own ceiling, which is the one way to be silently serial.
+
+    `run_units` takes `unit_concurrency` by keyword and typechecks, so a call that omits it does
+    not build -- but a call passing a literal builds fine and quietly ignores the flag. Nine CLIs
+    make this call and only one of them is reachable from a test with a fake client, so this
+    reads the call sites instead. The count is asserted too: a guard that finds nothing to check
+    passes for the wrong reason.
+    """
+    package = Path(cli_common.__file__).parent
+    checked = 0
+    for module in sorted(package.glob("*_cli.py")):
+        tree = ast.parse(module.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            called = getattr(node, "func", None)
+            if not isinstance(node, ast.Call) or getattr(called, "id", None) != "run_units":
+                continue
+            checked += 1
+            passed = {
+                keyword.arg: ast.unparse(keyword.value)
+                for keyword in node.keywords
+                if keyword.arg is not None
+            }
+            assert passed.get("unit_concurrency") == "arguments.unit_concurrency", (
+                f"{module.name} passes unit_concurrency={passed.get('unit_concurrency')!r} "
+                "instead of the run's own ceiling"
+            )
+    assert checked == 9, f"expected nine run_units call sites, read {checked}"

@@ -180,7 +180,6 @@ async def ingest_atm_archive(
                 )
                 for sequence, item in enumerate(staged)
             ),
-            request_concurrency,
         )
     else:
         failures += await _gather_units(
@@ -195,7 +194,6 @@ async def ingest_atm_archive(
                 )
                 for record in sgm_records
             ),
-            request_concurrency,
         )
 
     failures += await _gather_units(
@@ -210,7 +208,6 @@ async def ingest_atm_archive(
             )
             for email in emails
         ),
-        request_concurrency,
     )
     return failures
 
@@ -299,17 +296,15 @@ def _question_query(question: AtmBenchQuestion) -> str:
     )
 
 
-async def _gather_units(
-    units: tuple[Coroutine[object, object, None], ...], request_concurrency: int
-) -> int:
-    """Await coroutines in bounded batches, counting failures instead of raising them."""
-    failures = 0
-    for offset in range(0, len(units), request_concurrency):
-        outcomes = await asyncio.gather(
-            *units[offset : offset + request_concurrency], return_exceptions=True
-        )
-        failures += sum(isinstance(outcome, BaseException) for outcome in outcomes)
-    return failures
+async def _gather_units(units: tuple[Coroutine[object, object, None], ...]) -> int:
+    """Await every coroutine at once, counting failures instead of raising them.
+
+    Unbounded here on purpose: every unit acquires the archive's shared semaphore itself, so that
+    is what caps in-flight requests. Awaiting these in batches of the same size drained the
+    permits to zero at each batch edge, which is a Worker left with nothing queued.
+    """
+    outcomes = await asyncio.gather(*units, return_exceptions=True)
+    return sum(isinstance(outcome, BaseException) for outcome in outcomes)
 
 
 async def _observe_media(

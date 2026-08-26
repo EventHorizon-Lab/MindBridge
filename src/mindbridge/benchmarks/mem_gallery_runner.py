@@ -272,29 +272,24 @@ async def _ingest_topic_sessions(
         sum(len(previous.rounds) for previous in topic.sessions[:index])
         for index in range(len(topic.sessions))
     )
-    failures = 0
-    for offset in range(0, len(topic.sessions), request_concurrency):
-        outcomes = await asyncio.gather(
-            *(
-                _ingest_session_rounds(
-                    memory,
-                    tenant_id,
-                    device_id,
-                    session,
-                    session_starts[offset + index],
-                    by_key,
-                    semaphore,
-                    poll_interval_seconds,
-                    processing_timeout_seconds,
-                )
-                for index, session in enumerate(
-                    topic.sessions[offset : offset + request_concurrency]
-                )
-            ),
-            return_exceptions=True,
-        )
-        failures += sum(outcome if isinstance(outcome, int) else 1 for outcome in outcomes)
-    return failures
+    outcomes = await asyncio.gather(
+        *(
+            _ingest_session_rounds(
+                memory,
+                tenant_id,
+                device_id,
+                session,
+                session_starts[index],
+                by_key,
+                semaphore,
+                poll_interval_seconds,
+                processing_timeout_seconds,
+            )
+            for index, session in enumerate(topic.sessions)
+        ),
+        return_exceptions=True,
+    )
+    return sum(outcome if isinstance(outcome, int) else 1 for outcome in outcomes)
 
 
 async def _ingest_session_rounds(
@@ -404,32 +399,31 @@ async def _answer_topic_questions(
     changes; a bare `asyncio.gather` would still cancel sibling questions on the first failure,
     so outcomes are still collected with `return_exceptions=True` and reduced explicitly.
     """
+    outcomes = await asyncio.gather(
+        *(
+            _answer_question(
+                memory,
+                topic,
+                question,
+                tenant_id=tenant_id,
+                recall_limit=recall_limit,
+                question_image=(
+                    by_key[question.question_image_path]
+                    if question.question_image_path is not None
+                    else None
+                ),
+                semaphore=semaphore,
+                ingest_failure_count=ingest_failure_count,
+            )
+            for question in topic.questions
+        ),
+        return_exceptions=True,
+    )
     results: list[MemGalleryQuestionResult] = []
-    for offset in range(0, len(topic.questions), request_concurrency):
-        outcomes = await asyncio.gather(
-            *(
-                _answer_question(
-                    memory,
-                    topic,
-                    question,
-                    tenant_id=tenant_id,
-                    recall_limit=recall_limit,
-                    question_image=(
-                        by_key[question.question_image_path]
-                        if question.question_image_path is not None
-                        else None
-                    ),
-                    semaphore=semaphore,
-                    ingest_failure_count=ingest_failure_count,
-                )
-                for question in topic.questions[offset : offset + request_concurrency]
-            ),
-            return_exceptions=True,
-        )
-        for outcome in outcomes:
-            if isinstance(outcome, BaseException):
-                raise outcome
-            results.append(outcome)
+    for outcome in outcomes:
+        if isinstance(outcome, BaseException):
+            raise outcome
+        results.append(outcome)
     return tuple(results)
 
 

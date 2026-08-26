@@ -354,6 +354,7 @@ def _arguments(*, predict_only: bool = False) -> CoreArguments:
         tenant_prefix="benchmark_test",
         recall_limit=20,
         request_concurrency=4,
+        unit_concurrency=1,
         request_timeout_seconds=1_800.0,
         limit=None,
         overwrite=False,

@@ -346,34 +346,29 @@ async def run_video_mme_v2_group(
 
     semaphore = asyncio.Semaphore(request_concurrency)
     cutoff = prepared_video_end(prepared)
-    answers: list[VideoMMEV2QuestionResult] = []
-    for offset in range(0, len(annotation.questions), request_concurrency):
-        cohort = annotation.questions[offset : offset + request_concurrency]
-        answered = await asyncio.gather(
-            *(
-                _answer_question(
-                    memory,
-                    tenant_id,
-                    question,
-                    cutoff,
-                    recall_limit,
-                    semaphore,
-                    ingest_failures,
-                )
-                for question in cohort
-            ),
-            return_exceptions=True,
-        )
-        # A raising recall costs its own question, not the group. `VideoMMEV2GroupResult`
-        # requires all four rows, so an escaping exception took the whole group's rating with
-        # it and then ended the run, because the CLI awaits each group in turn. It matters
-        # more here than in any per-question benchmark: the rating is defined over whole
-        # groups only, so a group short of a row cannot be scored at all.
-        answers.extend(
-            settle_answers(
-                cohort, answered, partial(_failed_result, ingest_failures=ingest_failures)
+    answered = await asyncio.gather(
+        *(
+            _answer_question(
+                memory,
+                tenant_id,
+                question,
+                cutoff,
+                recall_limit,
+                semaphore,
+                ingest_failures,
             )
-        )
+            for question in annotation.questions
+        ),
+        return_exceptions=True,
+    )
+    # A raising recall costs its own question, not the group. `VideoMMEV2GroupResult`
+    # requires all four rows, so an escaping exception took the whole group's rating with
+    # it and then ended the run, because the CLI awaits each group in turn. It matters
+    # more here than in any per-question benchmark: the rating is defined over whole
+    # groups only, so a group short of a row cannot be scored at all.
+    answers = settle_answers(
+        annotation.questions, answered, partial(_failed_result, ingest_failures=ingest_failures)
+    )
     return VideoMMEV2GroupResult(
         video_id=annotation.video_id,
         group_type=annotation.group_type,

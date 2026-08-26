@@ -141,30 +141,25 @@ async def ingest_prepared_video(
         raise ValueError("poll interval and processing timeout must be positive")
     TypeAdapter(Identifier).validate_python(adapter_version)
     semaphore = asyncio.Semaphore(request_concurrency)
-    failures = 0
-    for offset in range(0, len(video.segments), request_concurrency):
-        outcomes = await asyncio.gather(
-            *(
-                _ingest_prepared_segment(
-                    memory,
-                    tenant_id,
-                    device_id,
-                    video,
-                    segment,
-                    offset + index,
-                    adapter_version,
-                    poll_interval_seconds,
-                    processing_timeout_seconds,
-                    semaphore,
-                )
-                for index, segment in enumerate(
-                    video.segments[offset : offset + request_concurrency]
-                )
-            ),
-            return_exceptions=True,
-        )
-        failures += _count_ingest_failures(outcomes)
-    return failures
+    outcomes = await asyncio.gather(
+        *(
+            _ingest_prepared_segment(
+                memory,
+                tenant_id,
+                device_id,
+                video,
+                segment,
+                index,
+                adapter_version,
+                poll_interval_seconds,
+                processing_timeout_seconds,
+                semaphore,
+            )
+            for index, segment in enumerate(video.segments)
+        ),
+        return_exceptions=True,
+    )
+    return _count_ingest_failures(outcomes)
 
 
 def _count_ingest_failures(outcomes: list[BaseException | None]) -> int:

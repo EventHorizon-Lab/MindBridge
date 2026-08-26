@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Sequence
 from dataclasses import dataclass
+from itertools import chain
 from pathlib import Path
 from typing import Literal, cast
 
@@ -26,7 +27,7 @@ from mindbridge.benchmarks.cli_common import (
     media_manifest,
     predictions_jsonl,
     report,
-    report_unit,
+    run_units,
     scoring_snapshot,
     select_by_id,
     write_run_artifacts,
@@ -105,29 +106,25 @@ async def _run_videos(
     prepared: dict[str, M3PreparedVideo],
 ) -> tuple[M3OfficialQuestionResult, ...]:
     async with connected_memory(arguments) as memory:
-        results: list[M3OfficialQuestionResult] = []
-        for index, video in enumerate(videos, start=1):
-            report_unit(
-                f"video {video.video_id}",
-                index=index,
-                total=len(videos),
-                quiet=arguments.quiet,
-            )
-            results.extend(
-                await run_m3_video(
-                    memory,
-                    video,
-                    prepared[video.video_id],
-                    run_id=arguments.run_id,
-                    tenant_prefix=arguments.tenant_prefix,
-                    device_id=arguments.device_id,
-                    recall_limit=arguments.recall_limit,
-                    request_concurrency=arguments.request_concurrency,
-                    poll_interval_seconds=arguments.poll_interval_seconds,
-                    processing_timeout_seconds=arguments.processing_timeout_seconds,
-                )
-            )
-        return tuple(results)
+        per_video = await run_units(
+            videos,
+            label=lambda video: f"video {video.video_id}",
+            unit_concurrency=arguments.unit_concurrency,
+            quiet=arguments.quiet,
+            run=lambda video: run_m3_video(
+                memory,
+                video,
+                prepared[video.video_id],
+                run_id=arguments.run_id,
+                tenant_prefix=arguments.tenant_prefix,
+                device_id=arguments.device_id,
+                recall_limit=arguments.recall_limit,
+                request_concurrency=arguments.request_concurrency,
+                poll_interval_seconds=arguments.poll_interval_seconds,
+                processing_timeout_seconds=arguments.processing_timeout_seconds,
+            ),
+        )
+        return tuple(chain.from_iterable(per_video))
 
 
 def _write_artifacts(

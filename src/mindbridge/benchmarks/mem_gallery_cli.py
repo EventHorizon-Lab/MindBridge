@@ -6,6 +6,7 @@ import asyncio
 import json
 from collections.abc import Sequence
 from dataclasses import dataclass
+from itertools import chain
 from pathlib import Path
 from typing import Literal
 
@@ -25,7 +26,7 @@ from mindbridge.benchmarks.cli_common import (
     media_arguments,
     media_manifest,
     report,
-    report_unit,
+    run_units,
     scoring_snapshot,
     select_by_id,
     write_run_artifacts,
@@ -105,26 +106,25 @@ async def _run(
     prepared: MemGalleryPreparedImages,
 ) -> tuple[MemGalleryQuestionResult, ...]:
     async with connected_memory(arguments) as memory:
-        results: list[MemGalleryQuestionResult] = []
-        for index, topic in enumerate(topics, start=1):
-            report_unit(
-                f"topic {topic.topic}", index=index, total=len(topics), quiet=arguments.quiet
-            )
-            results.extend(
-                await run_mem_gallery_topic(
-                    memory,
-                    topic,
-                    run_id=arguments.run_id,
-                    prepared=prepared,
-                    tenant_prefix=arguments.tenant_prefix,
-                    device_id=arguments.device_id,
-                    recall_limit=arguments.recall_limit,
-                    request_concurrency=arguments.request_concurrency,
-                    poll_interval_seconds=arguments.poll_interval_seconds,
-                    processing_timeout_seconds=arguments.processing_timeout_seconds,
-                )
-            )
-        return tuple(results)
+        per_topic = await run_units(
+            topics,
+            label=lambda topic: f"topic {topic.topic}",
+            unit_concurrency=arguments.unit_concurrency,
+            quiet=arguments.quiet,
+            run=lambda topic: run_mem_gallery_topic(
+                memory,
+                topic,
+                run_id=arguments.run_id,
+                prepared=prepared,
+                tenant_prefix=arguments.tenant_prefix,
+                device_id=arguments.device_id,
+                recall_limit=arguments.recall_limit,
+                request_concurrency=arguments.request_concurrency,
+                poll_interval_seconds=arguments.poll_interval_seconds,
+                processing_timeout_seconds=arguments.processing_timeout_seconds,
+            ),
+        )
+        return tuple(chain.from_iterable(per_topic))
 
 
 def _write_artifacts(

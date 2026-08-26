@@ -6,6 +6,7 @@ import asyncio
 import json
 from collections.abc import Sequence
 from dataclasses import dataclass
+from itertools import chain
 from pathlib import Path
 from typing import Literal
 
@@ -26,7 +27,7 @@ from mindbridge.benchmarks.cli_common import (
     media_arguments,
     media_manifest,
     report,
-    report_unit,
+    run_units,
     scoring_snapshot,
     select_by_id,
     write_run_artifacts,
@@ -104,29 +105,25 @@ async def _run(
         questions_by_clip.setdefault(question.clip_id, []).append(question)
     prepared_by_id = {video.video_id: video for video in prepared}
     async with connected_memory(arguments) as memory:
-        unordered: list[EgoTempoQuestionResult] = []
-        for index, (clip_id, clip_questions) in enumerate(questions_by_clip.items(), start=1):
-            report_unit(
-                f"clip {clip_id}",
-                index=index,
-                total=len(questions_by_clip),
-                quiet=arguments.quiet,
-            )
-            unordered.extend(
-                await run_egotempo_clip(
-                    memory,
-                    tuple(clip_questions),
-                    prepared_by_id[clip_id],
-                    run_id=arguments.run_id,
-                    tenant_prefix=arguments.tenant_prefix,
-                    device_id=arguments.device_id,
-                    recall_limit=arguments.recall_limit,
-                    request_concurrency=arguments.request_concurrency,
-                    poll_interval_seconds=arguments.poll_interval_seconds,
-                    processing_timeout_seconds=arguments.processing_timeout_seconds,
-                )
-            )
-        by_id = {result.question_id: result for result in unordered}
+        per_clip = await run_units(
+            tuple(questions_by_clip.items()),
+            label=lambda clip: f"clip {clip[0]}",
+            unit_concurrency=arguments.unit_concurrency,
+            quiet=arguments.quiet,
+            run=lambda clip: run_egotempo_clip(
+                memory,
+                tuple(clip[1]),
+                prepared_by_id[clip[0]],
+                run_id=arguments.run_id,
+                tenant_prefix=arguments.tenant_prefix,
+                device_id=arguments.device_id,
+                recall_limit=arguments.recall_limit,
+                request_concurrency=arguments.request_concurrency,
+                poll_interval_seconds=arguments.poll_interval_seconds,
+                processing_timeout_seconds=arguments.processing_timeout_seconds,
+            ),
+        )
+        by_id = {result.question_id: result for result in chain.from_iterable(per_clip)}
         return tuple(by_id[question.question_id] for question in questions)
 
 
