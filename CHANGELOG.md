@@ -103,6 +103,14 @@ Called out on their own because these are the changes that cost an operator real
   the reprocess is idempotent), makes `observations.content_digest` nullable, and grants
   `mindbridge_runtime` SELECT on `schema_migrations`. No manual step. Necessary but not
   sufficient for re-embedding into a second space — see `0026`, which supplies the rest.
+- **Migration `0027`** adds `embeddings.object_part` and widens the vectors unique key with it,
+  so an object embedded in pieces gets one row per piece. An evidence span longer than the
+  encoder's audio window is cut into several clips of different sound; all of them share one
+  `object_id`, because `recall` reads that column back as an `EvidenceId`, so the second clip
+  used to conflict with the first, be read as content drift, and raise **inside the single
+  transaction that commits an observation's derived records** — one long audio span cost the
+  whole observation, events and claims and memories included, not just its own vector. No manual
+  step and no re-encode: `embedding_id` already hashed the clip ordinal, so no ID changes.
 - **Migration `0026`** adds `embeddings.embedding_id_recipe`, recording which recipe derived each
   stored `embedding_id`. `embedding_id` now hashes `space_id` in every recipe, and that is what
   makes re-embedding into a second space actually work for claims, events, entities, evidence

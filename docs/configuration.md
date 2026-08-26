@@ -338,7 +338,9 @@ probe reports each stranded object type separately, so memory records the server
 cannot vouch for evidence, events, and claims the worker wrote in another space. Vectors in
 several spaces are accepted while a re-embedding is in progress, for every object type: an
 `embedding_id` hashes the space it was produced for, so one object holds one vector per space
-rather than colliding on the primary key. Migration `0026` records which recipe derived each
+rather than colliding on the primary key. One object may also hold several vectors within one
+space, where it is embedded in pieces rather than whole — an evidence span longer than the
+encoder's audio window is cut into clips, and migration `0027` gives each its own row. Migration `0026` records which recipe derived each
 stored ID, and the first write to touch a row an older recipe named re-keys it in place — so the
 first pass after that migration pays for one re-encode per object it has not seen under its new
 name, and every pass after it does not.
