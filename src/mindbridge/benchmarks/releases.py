@@ -340,6 +340,12 @@ def _extract(archive: Path, *, announce: Callable[[str], None] | None) -> None:
     and name their entries `data/<id>.mp4`, Video-MME-v2's sit in `videos/` and name theirs
     `<id>.mp4`, and unpacking each into its own parent is what turns both into the layout the
     module docstring documents.
+
+    Directory entries are skipped rather than written. Neither archived release has one today --
+    both volumes' central directories hold only files -- but the same publisher's `subtitle.zip`
+    in the Video-MME repository does, and unpacking one writes an empty file where a directory
+    belongs, so the entry after it cannot create its parent and a 94 GiB extraction dies partway
+    through with `FileExistsError`.
     """
     root = archive.parent.resolve()
     with zipfile.ZipFile(archive) as volume:
@@ -405,13 +411,29 @@ def _download_from_hub(release: Release, patterns: Sequence[str], *, destination
             "downloading an official release needs huggingface-hub; "
             "install it with `uv sync --extra benchmarks`"
         ) from error
-    snapshot_download(
-        repo_id=release.repository,
-        repo_type="dataset",
-        revision=release.revision,
-        allow_patterns=list(patterns),
-        local_dir=str(destination),
-    )
+    from huggingface_hub.errors import GatedRepoError
+
+    try:
+        snapshot_download(
+            repo_id=release.repository,
+            repo_type="dataset",
+            revision=release.revision,
+            allow_patterns=list(patterns),
+            local_dir=str(destination),
+        )
+    except GatedRepoError as error:
+        # A gated release is the one download failure whose fix is entirely outside this program,
+        # so the message is the whole of the user experience. No token is read or stored here:
+        # `huggingface_hub` already resolves `HF_TOKEN` and the login file itself, and giving the
+        # same credential a second MindBridge-specific name would only add a place to set it
+        # wrongly. Caught before `RepositoryNotFoundError`, which it subclasses -- the other order
+        # reports a dataset the user can see as one that does not exist.
+        raise PermissionError(
+            f"{release.repository} is a gated dataset and this machine is not authorised for it. "
+            f"Accept its terms at https://huggingface.co/datasets/{release.repository}, then "
+            "authorise this machine with `hf auth login` or by exporting HF_TOKEN. Nothing else "
+            "about the run changes; re-run the same command."
+        ) from error
 
 
 def _download_from_git(release: Release, within: str, *, destination: Path) -> None:

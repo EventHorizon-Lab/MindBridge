@@ -13,6 +13,7 @@ import zipfile
 from collections.abc import Sequence
 from pathlib import Path
 
+import httpx
 import pytest
 
 from mindbridge.benchmarks import releases
@@ -213,6 +214,36 @@ def test_an_extraction_cut_off_partway_through_a_file_is_redone(tmp_path: Path) 
     assert truncated.read_bytes() == b"frames"
 
 
+def test_a_directory_entry_in_an_archive_does_not_become_a_zero_byte_file(
+    tmp_path: Path,
+) -> None:
+    """Skipping directory entries is what stops the first real entry failing to make its parent.
+
+    A directory entry has a name ending in `/` and no content, so unpacking it writes an empty
+    *file* where a directory belongs, and the entry that follows cannot create the parent it
+    needs. Against a real archive that is `FileExistsError` partway through, which on a 94 GiB
+    volume means discovering the packaging halfway through the download it follows.
+
+    Neither archived release exercises this today -- I read the central directories of
+    `videos_chunked_20.zip` and `videos/001.zip` at their pins and both hold zero directory
+    entries, so deleting the guard is a no-op against them and no test here would notice.
+    It is kept because the same publisher's `subtitle.zip` in the Video-MME repository *does*
+    carry one (`subtitle/`, 1 of 745), so the packaging style is live rather than hypothetical,
+    and `MEDIA` is a table meant to grow a third archived release cheaply.
+    """
+    archive = tmp_path / "videos_chunked_01.zip"
+    with zipfile.ZipFile(archive, "w") as writing:
+        # Written first, so an implementation that does not skip it creates `data` as a file
+        # before the entry that needs `data` to be a directory.
+        writing.writestr(zipfile.ZipInfo("data/"), b"")
+        writing.writestr("data/one.mp4", b"frames")
+
+    _extract(archive, announce=None)
+
+    assert (tmp_path / "data").is_dir()
+    assert (tmp_path / "data" / "one.mp4").read_bytes() == b"frames"
+
+
 def test_an_archive_naming_a_path_outside_itself_is_refused(tmp_path: Path) -> None:
     """These volumes come from the network, and extraction runs with the operator's own rights.
 
@@ -340,3 +371,38 @@ def test_no_download_still_reports_an_unobtainable_set_as_unobtainable(tmp_path:
     """
     with pytest.raises(FileNotFoundError, match=r"signed access agreement"):
         ensure_media("egotempo", root=tmp_path, download=False)
+
+
+def test_a_gated_release_names_the_terms_to_accept_rather_than_a_missing_repository(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A gated dataset is the one failure whose whole fix lives outside this program.
+
+    `GatedRepoError` subclasses `RepositoryNotFoundError`, so catching the parent first reports a
+    dataset the user can see in their browser as one that does not exist -- and sends them looking
+    for a typo in a name that is correct. The assertion is on the terms URL and the authorisation
+    step, because those two sentences are the entire remedy.
+    """
+    import huggingface_hub
+    from huggingface_hub.errors import GatedRepoError
+
+    def _gated(**_: object) -> None:
+        # Built the way the Hub client raises it: `HfHubHTTPError` requires the response, and a
+        # stub without one raises TypeError instead, which this test would then pass on for the
+        # wrong reason.
+        forbidden = httpx.Response(403, request=httpx.Request("GET", "https://huggingface.co"))
+        raise GatedRepoError("403 Client Error: Forbidden", response=forbidden)
+
+    # Patched on `huggingface_hub` rather than on `releases`: `_download_from_hub` imports the
+    # symbol inside the function body, so a name bound on this module is never the one it calls
+    # and `raising=False` would have hidden that by creating an attribute nothing reads.
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", _gated)
+    monkeypatch.setitem(releases.MEDIA, "gated-probe", releases.Media("video-mme", ("data/*.mp4",)))
+
+    with pytest.raises(PermissionError) as raised:
+        ensure_media("gated-probe", root=tmp_path)
+
+    message = str(raised.value)
+    assert "huggingface.co/datasets/lmms-eval/Video-MME" in message, "names the terms to accept"
+    assert "hf auth login" in message and "HF_TOKEN" in message, "names how to authorise"

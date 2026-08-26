@@ -23,7 +23,7 @@ from mindbridge.benchmarks.prepare_streams import (
     prepare_egomem,
     prepare_supermemory,
 )
-from mindbridge.benchmarks.staging import PrepareRequest, Staging
+from mindbridge.benchmarks.staging import STAGED_AT, PrepareRequest, Staging
 from mindbridge.benchmarks.supermemory_runner import (
     SuperMemoryPreparedSubject,
     SuperMemoryPreparedVideo,
@@ -239,10 +239,16 @@ def test_a_supermemory_segment_carries_its_transcript_as_text_and_as_timed_voice
 
     Both sound events below belong in the segment's text and in no span, and they are there to
     test two different guards. The unattributed one needs only "an identity has to be somebody".
-    The one the release *did* attribute to B is filtered by `kind` alone, and without that check
-    it becomes a voice span whose transcript is `[B laughs]` -- perception handed a bracketed
-    stage direction as something B said. A fixture with only the first sound event cannot tell
-    the two guards apart, and dropping `kind` stayed green until this line existed.
+    The one attributed to B is filtered by `kind` alone, and without that check it becomes a
+    voice span whose transcript is `[B laughs]` -- perception handed a bracketed stage direction
+    as something B said. A fixture with only the first sound event cannot tell the two guards
+    apart, and dropping `kind` stayed green until this line existed.
+
+    Today's bytes do not contain that shape: in the one real transcript on disk, all 21 sound
+    events have a null person and all 183 speech lines have one, so either guard alone suffices
+    against the release as pinned. It is kept because the release's own README makes Gemini
+    authoritative for person labels *and* for bracketed sound events, so the two can meet in one
+    line without any schema change -- and `kind` is the field that says which it is.
     """
     from mindbridge.benchmarks.supermemory_runner import load_prepared_supermemory
 
@@ -257,13 +263,27 @@ def test_a_supermemory_segment_carries_its_transcript_as_text_and_as_timed_voice
     assert "B: He cooks beef." in opening.transcript
     assert "[Papers rustle]" in opening.transcript
     assert "B: [B laughs]" in opening.transcript
+    # The last line of the recording's first 30 seconds runs to 33 s and the one after it starts
+    # at 31 s, so this pair is what puts a span on the clip's own timeline rather than the
+    # recording's: the crossing line is clipped to the media end, and the later one is absent.
     spans = opening.identity_observations
     assert [(span.identity_id, span.start_ms, span.end_ms) for span in spans] == [
-        ("B", 1_000, 3_000)
+        ("B", 1_000, 3_000),
+        ("B", 9_000, 9_000),
+        ("User", 28_000, 30_000),
     ]
     assert spans[0].transcript == "He cooks beef."
     assert spans[0].confidence == 1.0
-    assert spans[0].end_ms <= (opening.media_objects[0].duration_ms or 0)
+    assert all(span.end_ms <= (opening.media_objects[0].duration_ms or 0) for span in spans)
+
+    # And the segment after it: the crossing line resumes at zero rather than at -2000.
+    following = _by_id(load_prepared_supermemory(manifest))[_SUPERMEMORY_FILMED].segments[1]
+    assert [
+        (span.identity_id, span.start_ms, span.end_ms) for span in following.identity_observations
+    ] == [
+        ("User", 0, 3_000),
+        ("B", 1_000, 3_000),
+    ]
 
 
 def test_two_preparations_of_one_supermemory_subject_produce_the_same_manifest(
@@ -285,6 +305,52 @@ def test_two_preparations_of_one_supermemory_subject_produce_the_same_manifest(
     # Named rather than left to byte equality alone: two runs a millisecond apart would agree
     # on a wall clock too, and `STAGED_AT` is what makes them agree a week apart.
     assert b'"created_at": "1970-01-01T00:00:00Z"' in first.read_bytes()
+
+
+def test_repeated_transcript_timings_still_produce_an_acceptable_observation(
+    tmp_path: Path,
+    staged: _Recorder,
+) -> None:
+    """The release gives several lines the same speaker and the same instant, and that is fatal.
+
+    `ObserveRequest` refuses two identity spans sharing `(kind, identity_id, start_ms, end_ms,
+    model_id)`, so one collision rejects the whole observation and that segment's media never
+    reaches memory -- silently, since the manifest itself has no such rule and validates fine.
+    Not hypothetical: the one real transcript on disk has three such groups in 204 lines, all of
+    them zero-length spans carrying different text, one of them three lines deep. The fixture
+    copies that shape. Every line still reaches the segment's own transcript; only the spans are
+    collapsed, which is the field with the constraint.
+    """
+    from mindbridge.benchmarks.supermemory_runner import load_prepared_supermemory
+    from mindbridge.contracts import ObserveRequest
+    from mindbridge.core import SensorKind
+
+    dataset = _supermemory_release(tmp_path)
+    manifest = tmp_path / "prepared.json"
+
+    prepare_supermemory(_request(_supermemory_argv(dataset, manifest, tmp_path), tmp_path))
+
+    opening = _by_id(load_prepared_supermemory(manifest))[_SUPERMEMORY_FILMED].segments[0]
+    assert "B: Yeah." in (opening.transcript or "")
+    assert "B: Uh, yeah, it is done." in (opening.transcript or "")
+    # The dict is what makes the spans unique; the `if identity in spans` beside it only decides
+    # which of the colliding texts survives. Pinned so that cannot flip unnoticed: the release
+    # lists "Yeah." first, so "Yeah." is what the span carries.
+    collided = next(span for span in opening.identity_observations if span.start_ms == 9_000)
+    assert collided.transcript == "Yeah."
+    # The real validator rather than a restatement of its rule, built as `_ingest_segment` does.
+    ObserveRequest(
+        tenant_id="benchmark_supermemory_1_prep-01",
+        device_id="supermemory_glasses",
+        boot_id="supermemory_vqa_official_v3",
+        sequence=0,
+        sensor=SensorKind.CAMERA,
+        media_objects=opening.media_objects,
+        occurred_at=STAGED_AT,
+        ended_at=STAGED_AT + timedelta(milliseconds=opening.duration_ms),
+        observed_at=STAGED_AT + timedelta(milliseconds=opening.duration_ms),
+        identity_observations=opening.identity_observations,
+    )
 
 
 def test_a_supermemory_recording_with_no_released_mp4_is_prepared_from_its_transcript(
@@ -314,7 +380,7 @@ def test_a_supermemory_recording_starting_after_the_last_question_is_not_prepare
     `--limit 1` selects the earlier question, which is what moves the horizon in front of the
     third recording; without the bound the same invocation would prepare all three.
     """
-    from mindbridge.benchmarks.supermemory_runner import load_prepared_supermemory
+    from mindbridge.benchmarks.supermemory_runner import _segment_bounds, load_prepared_supermemory
 
     dataset = _supermemory_release(tmp_path)
     manifest = tmp_path / "prepared.json"
@@ -344,6 +410,15 @@ def test_a_supermemory_recording_starting_after_the_last_question_is_not_prepare
             for media in segment.media_objects:
                 assert media.duration_ms is not None
                 assert 0 < media.duration_ms <= segment.duration_ms
+    # And the recording that IS prepared stops at the question rather than at the end of the
+    # file. The filmed session runs 40 s and the selected question ends at 35 s, so without the
+    # horizon the split would add a segment of media recorded after the question was asked --
+    # the future entering memory, which is the whole point of the causal protocol.
+    filmed = _by_id(prepared)[_SUPERMEMORY_FILMED]
+    assert (
+        _segment_bounds(filmed, filmed.segments[-1])[1]
+        == _selected_supermemory_questions(dataset, limit=1)[0].question_ended_at
+    )
 
 
 def test_a_supermemory_segment_holds_exactly_the_span_its_manifest_declares(
@@ -536,6 +611,10 @@ def _supermemory_release(root: Path) -> Path:
             (1.0, 3.0, "B", "He cooks beef.", "speech", "high"),
             (4.0, 5.0, None, "[Papers rustle]", "sound", "low"),
             (6.0, 7.0, "B", "[B laughs]", "sound", "high"),
+            (9.0, 9.0, "B", "Yeah.", "speech", "low"),
+            (9.0, 9.0, "B", "Uh, yeah, it is done.", "speech", "low"),
+            (28.0, 33.0, "User", "This line runs past the split.", "speech", "medium"),
+            (31.0, 33.0, "B", "This one starts after it.", "speech", "low"),
         ],
     )
     _supermemory_transcript(
@@ -642,12 +721,14 @@ def _by_id(prepared: SuperMemoryPreparedSubject) -> dict[str, SuperMemoryPrepare
     return {video.video_id: video for video in prepared.videos}
 
 
-def _selected_supermemory_questions(dataset: Path) -> tuple[SuperMemoryQuestion, ...]:
+def _selected_supermemory_questions(
+    dataset: Path, *, limit: int | None = None
+) -> tuple[SuperMemoryQuestion, ...]:
     """The runner's own selection for subject 1, which is what the producer prepared for."""
     from mindbridge.benchmarks.supermemory_cli import _select_questions
     from mindbridge.benchmarks.supermemory_vqa import load_supermemory_vqa
 
-    return _select_questions(load_supermemory_vqa(dataset), 1, (), None)
+    return _select_questions(load_supermemory_vqa(dataset), 1, (), limit)
 
 
 def test_a_supermemory_video_start_is_the_release_own_unix_origin(tmp_path: Path) -> None:
