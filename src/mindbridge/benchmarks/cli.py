@@ -79,6 +79,19 @@ class Runner:
     summary: str
     extra: str | None = None
     """The optional dependency group this runner needs, named when its import fails."""
+    resumable: bool = False
+    """Whether an existing output of this runner is a prefix to continue, not a file to refuse.
+
+    Declared here for the same reason `media` is: the sweep resolves every task's plan before it
+    imports any runner. Only `aml` sets it. Its rows are appended per finished case and keyed by
+    id, so a killed run leaves a prefix a rerun continues from -- and re-running a finished case
+    is not merely wasted work, because each `/aml/add` writes new memories and the tenant comes
+    from the run ID, so a replay doubles the corpus the score is measured against.
+
+    Every other runner writes its predictions once, at the end, so an existing output there is a
+    finished result the sweep is right to protect.
+    """
+
     media: bool = False
     """Whether this runner's parser carries the knobs `add_media_arguments` adds.
 
@@ -125,7 +138,9 @@ RUNNERS: dict[str, Runner] = {
         extra="benchmarks",
         media=True,
     ),
-    "aml": Runner("mindbridge.benchmarks.aml.cli", "Replay one offline AML pipeline"),
+    "aml": Runner(
+        "mindbridge.benchmarks.aml.cli", "Replay one offline AML pipeline", resumable=True
+    ),
     "eval": Runner(
         "mindbridge.benchmarks.suite",
         "Run one or more benchmarks by name and print a results table",

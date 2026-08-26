@@ -183,6 +183,13 @@ SCORING: dict[str, BenchmarkScoring] = {
     # EgoMemReason's answers are held out by its leaderboard, which is MMBench's test split in
     # lmms-eval: `metric: submission`, an aggregation that writes the file to upload, no score.
     "egomem": BenchmarkScoring("external", (Metric(SUBMISSION_METRIC),)),
+    # Every AML benchmark, whichever `--benchmark` a task names. `external` because the number
+    # comes from AML's own vendored `answer` and `evaluate` stages -- run against the rows this
+    # writes, not inside the run -- so unlike the judged benchmarks above there is nothing here
+    # to score with and nothing for `--predict-only` to switch off. One entry rather than six
+    # because `SCORING` is keyed as `RUNNERS` is, and all six dispatch through `aml`; the
+    # per-benchmark pipeline is pinned by sha256 in each run's own manifest instead.
+    "aml": BenchmarkScoring("external", (Metric(SUBMISSION_METRIC),)),
 }
 """The `metric_list` of every dispatchable benchmark, keyed as `RUNNERS` keys them.
 

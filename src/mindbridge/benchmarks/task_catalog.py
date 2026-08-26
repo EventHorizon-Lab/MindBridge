@@ -114,6 +114,44 @@ def _m3(subset: str) -> CatalogTask:
     )
 
 
+def _aml(benchmark: str, *datasets: str) -> CatalogTask:
+    """One AML pipeline replayed by the shared `aml` runner.
+
+    Named `aml-*` in `TASKS` for two reasons. `aml-locomo-refined` and `locomo-refined` are the
+    same corpus measured two different ways -- one through AML's vendored answer-and-judge
+    pipeline, one through this repository's own runner -- so they are not interchangeable and a
+    single name would have to pick one silently. And the prefix is what tells a reader of a
+    results table which plane a row came from, which is the only thing that makes two rows over
+    the same dataset comparable or not.
+
+    `--dataset` repeats once per positional argument the benchmark's loader takes, in the order
+    it takes them; `aml/cli.py` refuses a count its loader cannot use.
+    """
+    return CatalogTask(
+        "aml",
+        (
+            "--benchmark",
+            benchmark,
+            *(argument for path in datasets for argument in ("--dataset", path)),
+        ),
+    )
+
+
+def _personamem_v1(window: str) -> CatalogTask:
+    """PersonaMem v1 at one of its three context windows.
+
+    Three tasks rather than one for the reason MEMLENS gets four: the window is a choice the
+    runner cannot default. They are not repackagings of one question set -- 589, 2727 and 2674
+    questions over 37, 110 and 33 shared contexts -- so a single `aml-personamem-v1` would mean
+    whichever window this file happened to name.
+    """
+    return _aml(
+        "personamem-v1",
+        f"{ROOT}/personamem-v1/questions_{window}.csv",
+        f"{ROOT}/personamem-v1/shared_contexts_{window}.jsonl",
+    )
+
+
 def _mm_lifelong(split: str, release: str) -> CatalogTask:
     return CatalogTask(
         "mm-lifelong",
@@ -221,6 +259,28 @@ TASKS: dict[str, CatalogTask] = {
         ),
         output_suffix=".json",
     ),
+    "aml-locomo-refined": _aml(
+        "locomo-refined", f"{ROOT}/locomo-refined/data/raw/locomo_refined.json"
+    ),
+    # `longmemeval_s`, not `_m` or `_oracle`: `_oracle` ships only each question's gold sessions,
+    # so retrieval has nothing to discriminate against, and `_m` is 2.7 GB of the same task.
+    "aml-longmemeval-s": _aml("longmemeval", f"{ROOT}/longmemeval/longmemeval_s"),
+    "aml-clbench": _aml("clbench", f"{ROOT}/clbench/CL-bench.jsonl"),
+    "aml-personamem-v1-32k": _personamem_v1("32k"),
+    "aml-personamem-v1-128k": _personamem_v1("128k"),
+    "aml-personamem-v1-1M": _personamem_v1("1M"),
+    # `benchmark/text`, not `benchmark/multimodal`: the AML board this replays is textual. The
+    # second path is the release root, not its `data/` directory -- each row's
+    # `chat_history_32k_link` is itself `data/chat_history_32k/<file>.json`, so a `data_root`
+    # one level in resolves to `data/data/...` and every persona's history is missing.
+    "aml-personamem-v2": _aml(
+        "personamem-v2",
+        f"{ROOT}/personamem-v2/benchmark/text/benchmark.csv",
+        f"{ROOT}/personamem-v2",
+    ),
+    # The `chats/` root, walked for `*/*/chat.json`; the loader pairs each with the
+    # `probing_questions/probing_questions.json` beside it.
+    "aml-beam": _aml("beam", f"{ROOT}/beam/chats"),
 }
 
 GROUPS: dict[str, tuple[str, ...]] = {
@@ -230,6 +290,7 @@ GROUPS: dict[str, tuple[str, ...]] = {
         "atm-main-sgm",
         "atm-hard-sgm",
     ),
+    "aml": tuple(name for name in TASKS if name.startswith("aml-")),
     "all": tuple(TASKS),
 }
 """Names that expand to several tasks.
@@ -238,6 +299,13 @@ GROUPS: dict[str, tuple[str, ...]] = {
 against a deployment with no Worker plugins and its numbers are a memory-layer claim rather than
 a multimodal one. `all` exists for `--tasks all --limit 1`, which is a smoke run of the harness
 and not an evaluation.
+
+`aml` is every Agent Memory Leaderboard pipeline this harness can replay, which is six of AML's
+seven textual benchmarks. ScriptMem is the seventh and is absent on purpose: its public release
+ships questions, gold answers and the scorer, but every `conversation` field holds only a
+placeholder, so there is no corpus to retrieve from -- `mindbridge-bench aml --benchmark
+scriptmem` says so in full. These are also not leaderboard scores; `docs/benchmarking.md` sets
+out what an offline AML number is and is not.
 """
 
 

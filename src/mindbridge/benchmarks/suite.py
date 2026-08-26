@@ -568,10 +568,24 @@ def _require_writable_outputs(
 
     Each runner makes this check for itself, but only once it is running. Finding out at the
     fourth benchmark that the fifth cannot write is what this exists to prevent.
+
+    A resumable runner is exempt, and so is the summary once the sweep contains one. Every other
+    runner writes its predictions at the end, so an existing output is a finished result; `aml`
+    appends per finished case, so an existing output is a prefix to continue. Refusing it left an
+    interrupted `--run-id`-named sweep with no way forward: rerunning hit this, and adding
+    `--overwrite` to get past it told the runner to discard the very rows that made resuming
+    possible -- then replay them into a tenant that already held their memories. Exempting it
+    loses no safety, because `aml` refuses an output whose manifest disagrees with the run about
+    benchmark, run id, deployment, or recall limit, which is a stricter test than existence.
+
+    The summary describes the interrupted attempt and is rewritten by the sweep that replaces it.
     """
+    resumable = tuple(plan for plan in plans if RUNNERS[plan.task.benchmark].resumable)
     for plan in plans:
+        if RUNNERS[plan.task.benchmark].resumable:
+            continue
         require_writable_output_pair(plan.output_path, overwrite=overwrite)
-    if summary_path.exists() and not overwrite:
+    if summary_path.exists() and not overwrite and not resumable:
         raise FileExistsError(f"output already exists: {summary_path}")
 
 
@@ -580,7 +594,8 @@ def _require_every_task_can_report(plans: Sequence[_Plan], *, predict_only: bool
 
     Each runner makes this check for itself now, but only once it is running -- and a judged task
     that runs to completion and then cannot score writes nothing, so finding out task by task
-    costs every earlier task's predictions. Seventeen of the twenty-two catalog tasks are judged.
+    costs every earlier task's predictions. Seventeen of the thirty catalog tasks are judged; the
+    eight AML tasks are not, because their number comes from a vendored scorer run afterwards.
     """
     for plan in plans:
         require_scoring_is_possible(plan.task.benchmark, predict_only=predict_only)
