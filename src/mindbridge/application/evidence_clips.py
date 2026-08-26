@@ -532,7 +532,12 @@ async def _embed_stored_clips(
             ),
             tenant_id=tenant_id,
             object_type=EmbeddedObjectType.EVIDENCE_SPAN,
+            # The span, because `recall` reads this column back as an `EvidenceId` to load it.
+            # Which clip of that span is `object_part`, and it is the same ordinal the ID above
+            # hashes -- the vectors key needs it because a span cut into several clips is
+            # several different sounds, not one object embedded twice.
             object_id=item.evidence.evidence_span.evidence_id,
+            object_part=item.ordinal,
             values=embedding.values,
             model_reference=embedding.model_reference,
             space_reference=embedding.space_reference,

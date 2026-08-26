@@ -226,3 +226,27 @@ def _memory(
         verification_status=verification_status,
         last_accessed_at=last_accessed_at,
     )
+
+
+def test_an_embedding_cannot_claim_a_negative_part() -> None:
+    """`object_part` is in the vectors unique key, so a nonsense value is a nonsense key.
+
+    Zero means "this object was embedded whole". Anything below it is neither that nor an
+    ordinal, and the column is `smallint NOT NULL` with a non-negative check, so the database
+    would refuse it after the encode had already been paid for.
+    """
+    with pytest.raises(DomainInvariantError, match="object_part must not be negative"):
+        EmbeddingRecord(
+            embedding_id=EmbeddingId("embedding_negative_part"),
+            tenant_id=TenantId("tenant_01"),
+            object_type=EmbeddedObjectType.EVIDENCE_SPAN,
+            object_id="evidence_01",
+            object_part=-1,
+            values=(1.0,) + (0.0,) * 1_023,
+            model_reference=ModelReference(model_id="jina"),
+            space_reference=EmbeddingSpaceReference(space_id="space-a"),
+            task="retrieval_document",
+            dimension=1_024,
+            normalized=True,
+            created_at=datetime(2026, 8, 26, tzinfo=timezone.utc),
+        )

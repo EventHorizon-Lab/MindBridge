@@ -53,7 +53,13 @@ SOURCE = MediaObject(
 
 
 async def test_long_span_becomes_one_stored_clip_and_vector_per_window() -> None:
-    """A span past the encoder window keeps its tail as extra clips and vectors."""
+    """A span past the encoder window keeps its tail as extra clips and vectors.
+
+    Distinct `embedding_id`s were never enough on their own, which is why this test passed while
+    only the first clip could be stored: the vectors table is keyed by the object, and all three
+    clips share one `object_id` because `recall` reads that column back as an `EvidenceId`. Each
+    clip's `object_part` is what makes the row distinct under that key.
+    """
     store = RecordingStore()
     embedder = RecordingEmbedder()
 
@@ -77,11 +83,35 @@ async def test_long_span_becomes_one_stored_clip_and_vector_per_window() -> None
     assert len(derived.embeddings) == 3
     assert {embedding.object_id for embedding in derived.embeddings} == {"evidence_01"}
     assert len({embedding.embedding_id for embedding in derived.embeddings}) == 3
+    # The key each row is stored under, not just the name it carries.
+    assert [embedding.object_part for embedding in derived.embeddings] == [0, 1, 2]
     assert all(
         embedding.object_type is EmbeddedObjectType.EVIDENCE_SPAN
         for embedding in derived.embeddings
     )
     assert embedder.tasks == [EmbedTask.DOCUMENT]
+
+
+async def test_an_object_embedded_whole_carries_no_part() -> None:
+    """`object_part` is only meaningful where an object is cut up; everything else is part zero.
+
+    Asserted because the column is in the vectors unique key: a graph vector that started
+    numbering its parts would stop conflicting with itself and the re-encode guard would go
+    quiet for every object type at once.
+    """
+    store = RecordingStore()
+
+    derived = await derive_evidence_clips(
+        TENANT_ID,
+        (_evidence("evidence_single", 0, 5_000),),
+        store=store,
+        embedder=RecordingEmbedder(),
+        sampling=ClipSampling(),
+        created_at=NOW,
+        cut=_stub_cut,
+    )
+
+    assert [embedding.object_part for embedding in derived.embeddings] == [0]
 
 
 async def test_clip_provenance_and_content_addressed_key() -> None:

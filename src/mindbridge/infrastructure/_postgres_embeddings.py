@@ -73,11 +73,11 @@ async def write_embedding_on_connection(
     cursor = await connection.execute(
         """
         INSERT INTO embeddings (
-            tenant_id, embedding_id, object_type, object_id,
+            tenant_id, embedding_id, object_type, object_id, object_part,
             model_id, space_id, task,
             dimension, normalized, embedding, created_at, embedding_id_recipe
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT DO NOTHING
         RETURNING embedding_id
         """,
@@ -86,6 +86,7 @@ async def write_embedding_on_connection(
             embedding.embedding_id,
             embedding.object_type.value,
             embedding.object_id,
+            embedding.object_part,
             embedding.model_reference.model_id,
             embedding.space_reference.space_id,
             embedding.task,
@@ -108,6 +109,7 @@ async def write_embedding_on_connection(
         WHERE tenant_id = %s
           AND object_type = %s
           AND object_id = %s
+          AND object_part = %s
           AND model_id = %s
           AND space_id = %s
           AND task = %s
@@ -118,6 +120,7 @@ async def write_embedding_on_connection(
             embedding.tenant_id,
             embedding.object_type.value,
             embedding.object_id,
+            embedding.object_part,
             embedding.model_reference.model_id,
             embedding.space_reference.space_id,
             embedding.task,

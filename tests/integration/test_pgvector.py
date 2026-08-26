@@ -1,5 +1,6 @@
 """Integration checks for the versioned pgvector index."""
 
+import math
 from datetime import datetime, timezone
 
 import pytest
@@ -20,6 +21,7 @@ from mindbridge.core import (
     TenantId,
     derive_embedding_id,
 )
+from mindbridge.infrastructure._postgres_embeddings import write_embedding_on_connection
 from mindbridge.infrastructure._postgres_media import write_media_object
 from mindbridge.infrastructure._postgres_types import tenant_connection
 from mindbridge.infrastructure.postgres import PostgresMemoryStore
@@ -436,6 +438,119 @@ async def test_one_object_holds_a_vector_in_each_space_while_re_embedding(
     assert [row[0] for row in rows] == ["jina-v5-1024", "jina-v6-1024"]
 
 
+async def test_every_clip_of_one_evidence_span_is_stored_not_only_the_first(
+    store: PostgresMemoryStore,
+) -> None:
+    """`audio_windows` splits a span over `AUDIO_WINDOW_MS`, so one span is several clips.
+
+    Each is a different sound with a different vector, while `object_id` stays the span --
+    `recall` reads that column straight back as an `EvidenceId`. Under a key without
+    `object_part` the second clip conflicted with the first, was compared against it, and raised
+    as content drift. That raise lands inside `commit_observation_processing`, which writes one
+    observation's derived records in a single transaction, so one 70-second audio span rolled
+    back the entire observation -- its events, claims, entities and memories included.
+    """
+    model = ModelReference(model_id="jinaai/jina-embeddings-v5-omni-small-retrieval")
+    space = EmbeddingSpaceReference(space_id="jina-v5-clips")
+    span = "evidence_span_cut_into_three"
+    clips = tuple(
+        _embedding_record(
+            embedding_id=derive_embedding_id(
+                VECTOR_TENANT,
+                span,
+                str(ordinal),
+                model_id=model.model_id,
+                space_id=space.space_id,
+                task="retrieval_document",
+            ),
+            object_id=span,
+            object_type=EmbeddedObjectType.EVIDENCE_SPAN,
+            object_part=ordinal,
+            values=_unit_vector(ordinal),
+            model=model,
+            space=space,
+        )
+        for ordinal in range(3)
+    )
+
+    # Written the way `commit_observation_processing` writes them: sequentially, one transaction.
+    async with tenant_connection(store._pool, VECTOR_TENANT) as connection:
+        for clip in clips:
+            assert await write_embedding_on_connection(connection, clip) is True
+
+    async with tenant_connection(store._pool, VECTOR_TENANT) as connection:
+        rows = await (
+            await connection.execute(
+                "SELECT object_part FROM embeddings WHERE tenant_id = %s AND object_id = %s"
+                " ORDER BY object_part",
+                (VECTOR_TENANT, span),
+            )
+        ).fetchall()
+
+    assert [row[0] for row in rows] == [0, 1, 2]
+
+    # And the drift guard is per part, not weakened into per span: a different vector for the
+    # clip already stored is still refused.
+    with pytest.raises(DomainInvariantError, match="different vector content"):
+        await store.write_embedding(
+            _embedding_record(
+                embedding_id="embedding_another_name_for_part_one",
+                object_id=span,
+                object_type=EmbeddedObjectType.EVIDENCE_SPAN,
+                object_part=1,
+                values=_unit_vector(99),
+                model=model,
+                space=space,
+            )
+        )
+
+
+async def test_re_writing_one_clip_compares_against_that_clip_not_its_neighbour(
+    store: PostgresMemoryStore,
+) -> None:
+    """The conflict-resolution SELECT has to be exactly the unique key, part included.
+
+    Without `object_part` in it, an idempotent re-write of the second clip matched the *first*
+    clip's row, found a different vector there -- they are different sounds -- and raised drift
+    on a write that was simply repeating itself. Retries do repeat: the whole write path exists
+    to be re-runnable.
+    """
+    model = ModelReference(model_id="jinaai/jina-embeddings-v5-omni-small-retrieval")
+    space = EmbeddingSpaceReference(space_id="jina-v5-retry")
+    span = "evidence_span_retried"
+
+    def clip(ordinal: int) -> EmbeddingRecord:
+        return _embedding_record(
+            embedding_id=derive_embedding_id(
+                VECTOR_TENANT,
+                span,
+                str(ordinal),
+                model_id=model.model_id,
+                space_id=space.space_id,
+                task="retrieval_document",
+            ),
+            object_id=span,
+            object_type=EmbeddedObjectType.EVIDENCE_SPAN,
+            object_part=ordinal,
+            values=_unit_vector(ordinal),
+            model=model,
+            space=space,
+        )
+
+    assert await store.write_embedding(clip(0)) is True
+    assert await store.write_embedding(clip(1)) is True
+
+    # The retry. Same clip, same bytes, so this is a duplicate and not drift.
+    assert await store.write_embedding(clip(1)) is False
+
+
+def _unit_vector(seed: int) -> tuple[float, ...]:
+    """A distinct normalized vector per clip, because each clip is different content."""
+    raw = tuple(math.sin(seed + index) for index in range(1_024))
+    norm = math.sqrt(sum(value * value for value in raw))
+    return tuple(value / norm for value in raw)
+
+
 async def _insert_at_recipe(
     store: PostgresMemoryStore,
     embedding: EmbeddingRecord,
@@ -447,16 +562,18 @@ async def _insert_at_recipe(
         await connection.execute(
             """
             INSERT INTO embeddings (
-                tenant_id, embedding_id, object_type, object_id, model_id, space_id, task,
+                tenant_id, embedding_id, object_type, object_id, object_part,
+                model_id, space_id, task,
                 dimension, normalized, embedding, created_at, embedding_id_recipe
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
             (
                 embedding.tenant_id,
                 embedding.embedding_id,
                 embedding.object_type.value,
                 embedding.object_id,
+                embedding.object_part,
                 embedding.model_reference.model_id,
                 embedding.space_reference.space_id,
                 embedding.task,
@@ -478,6 +595,7 @@ def _embedding_record(
     space: EmbeddingSpaceReference,
     tenant_id: TenantId = VECTOR_TENANT,
     object_type: EmbeddedObjectType = EmbeddedObjectType.MEMORY_RECORD,
+    object_part: int = 0,
     created_at: datetime = NOW,
 ) -> EmbeddingRecord:
     return EmbeddingRecord(
@@ -485,6 +603,7 @@ def _embedding_record(
         tenant_id=tenant_id,
         object_type=object_type,
         object_id=object_id,
+        object_part=object_part,
         values=values,
         model_reference=model,
         space_reference=space,
