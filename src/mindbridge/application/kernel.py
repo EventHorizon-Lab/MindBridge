@@ -130,7 +130,6 @@ class MemoryKernel:
             media_url_signer=media_url_signer,
             embedder=embedder,
             minimum_embedding_similarity=minimum_embedding_similarity,
-            clock=self._clock,
         )
 
     @operation_span("mindbridge.observe")

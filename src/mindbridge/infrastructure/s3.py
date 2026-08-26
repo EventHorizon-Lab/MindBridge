@@ -125,6 +125,18 @@ class S3MediaAccess:
         """Build tenant-scoped media access from the documented storage contract."""
         return cls(object_storage_from_environment(configuration_source(environ)))
 
+    async def close(self) -> None:
+        """Release the SDK connection pools owned by this access adapter."""
+        clients = (
+            (self._client,)
+            if self._signing_client is self._client
+            else (
+                self._client,
+                self._signing_client,
+            )
+        )
+        await asyncio.gather(*(asyncio.to_thread(client.close) for client in clients))
+
     async def create_presigned_download(
         self,
         media_object: MediaObject,

@@ -96,7 +96,11 @@ async def test_runtime_closes_every_model_and_the_store(monkeypatch: pytest.Monk
     monkeypatch.setattr(
         runtime_module, "PostgresMemoryStore", lambda *_arguments, **_options: Store()
     )
-    monkeypatch.setattr(runtime_module, "S3MediaAccess", lambda *_arguments, **_options: object())
+    monkeypatch.setattr(
+        runtime_module,
+        "S3MediaAccess",
+        lambda *_arguments, **_options: Model("s3"),
+    )
     monkeypatch.setattr(
         runtime_module, "create_task_queue", lambda *_arguments, **_keywords: object()
     )
@@ -111,7 +115,7 @@ async def test_runtime_closes_every_model_and_the_store(monkeypatch: pytest.Monk
     async with runtime.open():
         pass
 
-    assert closed == ["store", "embedder", "generator"]
+    assert closed == ["store", "embedder", "generator", "s3"]
 
 
 async def test_startup_rejects_a_space_no_stored_vector_can_match() -> None:

@@ -138,17 +138,17 @@ returned.
 
 `target_type` is `memory_record` (that one memory) or `observation` (the source observation and
 everything derived from it). The receipt reports that erasure was recorded and started;
-`propagation_state` reaches `complete` only when every copy is gone, including on offline
-devices.
+`complete` means deletion finished in central PostgreSQL and object storage. Offline edge devices
+consume the retained tombstone when they reconnect; the receipt is not an acknowledgement from
+those devices.
 
 This is the one tool marked destructive. Clients that gate destructive tools behind confirmation
 will do so here.
 
 ## Errors
 
-Failures report the same stable codes REST does — `code_for` resolves a raised exception to the
-same code the REST handler would publish, so an agent reading `memory_not_found` from MCP and
-from REST is reading one vocabulary. See [the error table](rest.md#error-codes).
+Failures report the same stable envelope and codes REST does, including validation failures and
+an `internal_error` for unexpected exceptions. See [the error table](rest.md#error-codes).
 
 ## Known limitation
 

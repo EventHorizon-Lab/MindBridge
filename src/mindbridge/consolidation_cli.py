@@ -200,6 +200,7 @@ async def _run_postgres_sweep(
     )
     media_access = S3MediaAccess(settings.object_storage)
     async with AsyncExitStack() as resources:
+        resources.push_async_callback(media_access.close)
         generator = load_generator(settings.generator_plugin, settings.generator_config)
         resources.push_async_callback(close_model, generator)
         embedder = load_embedder(settings.embedder_plugin, settings.embedder_config)

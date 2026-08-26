@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import cast
@@ -32,6 +33,9 @@ from mindbridge.contracts import (
     RememberRequest,
 )
 from mindbridge.core import (
+    EmbeddedObjectType,
+    EmbeddingId,
+    EmbeddingRecord,
     EmbeddingSpaceReference,
     FeedbackType,
     IdempotencyConflictError,
@@ -459,6 +463,64 @@ async def test_postgres_occurred_before_excludes_equal_boundary(
     assert [memory.memory_id for memory in memories] == [before.memory_id]
 
 
+async def test_postgres_filtered_recall_widens_past_ineligible_dense_prefix(
+    store: PostgresMemoryStore,
+) -> None:
+    """Four filtered vectors cannot hide the valid fifth result behind the first LIMIT."""
+    tenant_id = TenantId("tenant_filtered_dense_prefix")
+    model = ModelReference(model_id="jina")
+    space = EmbeddingSpaceReference(space_id="jina-v5")
+    memories = tuple(
+        MemoryRecord(
+            memory_id=MemoryId(f"memory_dense_{ordinal}"),
+            tenant_id=tenant_id,
+            memory_type=(MemoryType.SEMANTIC if ordinal < 4 else MemoryType.EPISODIC),
+            summary=f"Dense candidate {ordinal}",
+            evidence_ids=(),
+            occurred_at=NOW,
+            ended_at=NOW,
+            created_at=NOW,
+            verification_status=VerificationStatus.ATTESTED,
+        )
+        for ordinal in range(5)
+    )
+    for ordinal, memory in enumerate(memories):
+        similarity = 1.0 - ordinal / 100
+        await store.write_memory(
+            memory,
+            idempotency_key=f"dense_{ordinal}",
+            content_digest=str(ordinal + 1) * 64,
+        )
+        await store.write_embedding(
+            EmbeddingRecord(
+                embedding_id=EmbeddingId(f"embedding_dense_{ordinal}"),
+                tenant_id=tenant_id,
+                object_type=EmbeddedObjectType.MEMORY_RECORD,
+                object_id=memory.memory_id,
+                values=(similarity, math.sqrt(1.0 - similarity**2)) + (0.0,) * 1_022,
+                model_reference=model,
+                space_reference=space,
+                task="retrieval_document",
+                dimension=1_024,
+                normalized=True,
+                created_at=NOW,
+            )
+        )
+
+    result = await _kernel(store).recall(
+        RecallRequest(
+            tenant_id=tenant_id,
+            query=RecallQuery(text="words absent from every summary"),
+            filters=RecallFilters(memory_types=(MemoryType.EPISODIC,)),
+            mode=RecallMode.SEARCH,
+            include_evidence=False,
+            limit=1,
+        )
+    )
+
+    assert [memory.memory_id for memory in result.memories] == [memories[-1].memory_id]
+
+
 async def test_postgres_round_trips_attested_source_memory(store: PostgresMemoryStore) -> None:
     """Explicit source text survives persistence and can ground a reported answer."""
     kernel = _kernel(store)
@@ -508,8 +570,6 @@ async def test_postgres_round_trips_attested_source_memory(store: PostgresMemory
     assert (
         found.model_copy(
             update={
-                "useful_access_count": 0,
-                "last_accessed_at": None,
                 "trace_id": memory.trace_id,
             }
         )
@@ -518,8 +578,8 @@ async def test_postgres_round_trips_attested_source_memory(store: PostgresMemory
         == MemoryResult.model_validate(memory.model_dump(exclude={"status"}))
     )
     assert found.trace_id.startswith("trace_")
-    assert found.useful_access_count == 1
-    assert found.last_accessed_at == NOW
+    assert found.useful_access_count == 0
+    assert found.last_accessed_at is None
     with pytest.raises(MemoryNotFoundError):
         await kernel.get_memory("other_tenant", memory.memory_id)
 

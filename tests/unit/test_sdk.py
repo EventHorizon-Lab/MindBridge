@@ -82,7 +82,13 @@ async def test_typed_api_error_preserves_retry_information() -> None:
                 "code": "model_unavailable",
                 "message": "memory model is unavailable",
                 "trace_id": "trace_failure",
-                "issues": [],
+                "issues": [
+                    {
+                        "location": ["body", "query"],
+                        "message": "Field required",
+                        "code": "missing",
+                    }
+                ],
             },
         )
 
@@ -101,6 +107,7 @@ async def test_typed_api_error_preserves_retry_information() -> None:
     assert failure.value.status_code == 503
     assert failure.value.code == "model_unavailable"
     assert failure.value.trace_id == "trace_failure"
+    assert failure.value.issues[0].location == ("body", "query")
 
 
 async def test_transport_failure_names_the_underlying_cause() -> None:

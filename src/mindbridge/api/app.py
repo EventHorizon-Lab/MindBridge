@@ -51,7 +51,9 @@ from mindbridge.core import (
     DomainInvariantError,
 )
 from mindbridge.models import Generator
-from mindbridge.telemetry import current_trace_id
+from mindbridge.telemetry import current_trace_id, log_fields, logger
+
+_LOGGER = logger("mindbridge.api.app")
 
 _EMBEDDING_ERRORS: Final[tuple[ErrorCode, ...]] = (
     "model_request_failed",
@@ -90,7 +92,12 @@ def build_app(
     _register_deletion_routes(app, kernel, authenticator)
     register_job_event_routes(app, kernel, authenticator)
 
-    @app.get("/healthz", response_model=HealthResponse, operation_id="health")
+    @app.get(
+        "/healthz",
+        response_model=HealthResponse,
+        operation_id="health",
+        responses=responses("internal_error"),
+    )
     async def health() -> HealthResponse:
         return HealthResponse(trace_id=current_trace_id())
 
@@ -350,7 +357,7 @@ def _register_request_error_handlers(app: FastAPI) -> None:
 
 
 def _register_runtime_error_handlers(app: FastAPI) -> None:
-    """Answer every runtime failure from the one table, so none escapes the envelope."""
+    """Answer known and unexpected failures without leaking their implementation details."""
 
     async def handle(_request: Request, error: Exception) -> JSONResponse:
         # `code_for` walks the MRO, so a subclass of a registered error arrives here and still
@@ -361,3 +368,11 @@ def _register_runtime_error_handlers(app: FastAPI) -> None:
 
     for exception in RUNTIME_ERROR_CODES:
         app.add_exception_handler(exception, handle)
+
+    @app.exception_handler(Exception)
+    async def handle_unexpected(_request: Request, error: Exception) -> JSONResponse:
+        _LOGGER.exception(
+            "unhandled REST request failure",
+            extra=log_fields(error_type=type(error).__name__),
+        )
+        return error_response("internal_error")

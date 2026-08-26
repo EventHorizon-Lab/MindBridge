@@ -212,13 +212,14 @@ The tombstone survives the content and carries a propagation state:
 | State | Meaning |
 | --- | --- |
 | `pending` | Recorded, not yet propagating. |
-| `propagating` | Reaching storage and offline devices. |
-| `complete` | Every copy is gone. |
-| `failed` | Propagation stalled; `error_code` says why. |
+| `propagating` | Reaching central PostgreSQL and object storage. |
+| `complete` | Central deletion finished. |
+| `failed` | Central deletion stalled; `error_code` says why. |
 
-Only `complete` means erased. Tombstones are content-free by construction, so retaining them
-after physical erasure is safe — which is what lets a device that was offline during the
-deletion reconcile when it reconnects, by paging `GET /v1/deletions` from its last cursor.
+`complete` describes central storage only. Tombstones are content-free by construction, so
+retaining them after physical erasure is safe — which is what lets a device that was offline
+during the deletion reconcile when it reconnects, by paging `GET /v1/deletions` from its last
+cursor. The server does not claim that device has already reconnected or acknowledge deletion.
 
 ## Embedding space
 

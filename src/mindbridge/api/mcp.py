@@ -11,6 +11,7 @@ from mcp.server import MCPServer
 from mcp.server.context import CallNext, HandlerResult, ServerMiddleware, ServerRequestContext
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp_types import CallToolResult, TextContent, ToolAnnotations
+from pydantic import ValidationError
 
 from mindbridge.api.errors import code_for, error_body
 from mindbridge.application.kernel import MemoryKernel
@@ -30,7 +31,12 @@ from mindbridge.contracts import (
     RecallResult,
     RememberRequest,
     RememberResult,
+    ValidationIssue,
 )
+from mindbridge.core import DomainInvariantError
+from mindbridge.telemetry import log_fields, logger
+
+_LOGGER = logger("mindbridge.api.mcp")
 
 _READ_ONLY = ToolAnnotations(read_only_hint=True, open_world_hint=False)
 _IDEMPOTENT_WRITE = ToolAnnotations(
@@ -66,7 +72,7 @@ def _flattened(
 
     Two consequences of the fields being top-level rather than nested. Unknown keys reach an
     argument model MCP builds on its own base, which ignores them instead of rejecting them;
-    `_reject_unknown_arguments` restores that check before validation runs, because dropping
+    `_validate_tool_arguments` restores that check before validation runs, because dropping
     a misspelled `mode` or `memory_ids` silently answers a different question than the one
     asked. And MCP JSON-decodes any top-level argument whose annotation is not exactly `str`,
     which every `X | None` string field trips: `idempotency_key="null"` arrives as None, and
@@ -93,13 +99,19 @@ def _flattened(
 
     async def tool(**fields: object) -> _ResultT:
         try:
-            return await handler(model.model_validate(fields))
+            request = model.model_validate(fields)
+        except ValidationError as error:
+            raise ToolError(_validation_error_json(error)) from error
+        try:
+            return await handler(request)
         except Exception as error:
             code = code_for(error)
             if code is None:
-                # A bug stays a bug rather than arriving dressed as a code the contract
-                # promises and an agent might branch on.
-                raise
+                _LOGGER.exception(
+                    "unhandled MCP tool failure",
+                    extra=log_fields(error_type=type(error).__name__),
+                )
+                code = "internal_error"
             # The envelope, not prose. REST returns `{code, message, trace_id}` and the SDK
             # parses it; an agent driving the same kernel needs the code to branch on --
             # `memory_deleted` and `memory_not_found` are one substring apart in prose and a
@@ -115,7 +127,8 @@ def _flattened(
             # middleware layer, so by there the type is gone (measured, not assumed). MCP
             # prefixes this text with "Error executing tool <name>: "; the envelope is the
             # remainder of the line.
-            raise ToolError(error_body(code, message=str(error)).model_dump_json()) from error
+            message = str(error) if isinstance(error, DomainInvariantError) else None
+            raise ToolError(error_body(code, message=message).model_dump_json()) from error
 
     # Resolved rather than reflected: `from __future__ import annotations` leaves every
     # handler's own annotations as strings, and MCP reads this signature verbatim when it
@@ -134,45 +147,48 @@ def _flattened(
     return tool
 
 
-def _reject_unknown_arguments(
-    fields_by_tool: Mapping[str, frozenset[str]],
+def _validate_tool_arguments(
+    models_by_tool: Mapping[str, type[ContractModel]],
 ) -> ServerMiddleware[Any]:
-    """Fault an unknown tool argument instead of letting MCP drop it.
+    """Validate raw tool arguments before MCP can drop or rewrite them.
 
-    `ContractModel` forbids extras, but flattening moves the fields out of it into an
-    argument model MCP generates on a base whose config ignores them, and there is no
-    supported way to tighten that model. Middleware sees the raw params before validation,
-    which is early enough to reject the key rather than answer a different question with it.
+    Flattening moves fields into an MCP-generated model that ignores extras. Middleware sees the
+    original arguments early enough to enforce the shared contract and return its error envelope.
     """
 
-    async def reject_unknown_arguments(
+    async def validate_tool_arguments(
         ctx: ServerRequestContext[Any, Any],
         call_next: CallNext,
     ) -> HandlerResult:
         params = ctx.params if isinstance(ctx.params, dict) else {}
         if ctx.method == "tools/call":
-            known = fields_by_tool.get(str(params.get("name", "")))
+            model = models_by_tool.get(str(params.get("name", "")))
             arguments = params.get("arguments")
-            if known is not None and isinstance(arguments, dict):
-                unknown = sorted(set(arguments) - known)
-                if unknown:
-                    # A tool result rather than a raise: raising here becomes a protocol-level
-                    # "Internal server error", which tells the caller nothing it can correct.
+            if model is not None:
+                try:
+                    model.model_validate(arguments if arguments is not None else {})
+                except ValidationError as error:
                     return CallToolResult(
-                        content=[
-                            TextContent(
-                                type="text",
-                                text=(
-                                    f"unknown arguments: {', '.join(unknown)}. "
-                                    f"This tool accepts: {', '.join(sorted(known))}."
-                                ),
-                            )
-                        ],
+                        content=[TextContent(type="text", text=_validation_error_json(error))],
                         is_error=True,
                     )
         return await call_next(ctx)
 
-    return reject_unknown_arguments
+    return validate_tool_arguments
+
+
+def _validation_error_json(error: ValidationError) -> str:
+    return error_body(
+        "request_validation_failed",
+        issues=tuple(
+            ValidationIssue(
+                location=tuple(str(part) for part in issue["loc"]),
+                message=issue["msg"],
+                code=issue["type"],
+            )
+            for issue in error.errors()
+        ),
+    ).model_dump_json()
 
 
 def build_mcp_server(
@@ -181,14 +197,14 @@ def build_mcp_server(
     lifespan: _McpLifespan | None = None,
 ) -> MCPServer[None]:
     """Expose one memory kernel through typed, agent-friendly MCP tools."""
-    fields_by_tool: dict[str, frozenset[str]] = {}
+    models_by_tool: dict[str, type[ContractModel]] = {}
     server: MCPServer[None] = MCPServer(
         "mindbridge",
         title="MindBridge Memory",
         description="Evidence-grounded embodied Memory as a Service.",
         version="0.1.0",
         lifespan=lifespan,
-        middleware=[_reject_unknown_arguments(fields_by_tool)],
+        middleware=[_validate_tool_arguments(models_by_tool)],
     )
 
     def register(
@@ -197,7 +213,7 @@ def build_mcp_server(
         annotations: ToolAnnotations,
     ) -> None:
         """Publish one tool and record the arguments it accepts, from the one model."""
-        fields_by_tool[handler.__name__] = frozenset(model.model_fields)
+        models_by_tool[handler.__name__] = model
         server.add_tool(_flattened(model, handler), annotations=annotations)
 
     async def memory_observe(request: ObserveRequest) -> ObservationReceipt:
@@ -309,9 +325,9 @@ def build_mcp_server(
         `observation` erases a source observation and everything derived from it. Idempotent
         -- a repeat returns the same tombstone rather than failing.
 
-        Erasure propagates across storage and offline edge devices after this reply, so read
-        `propagation_state` on the receipt instead of assuming `complete`. Confirming that it
-        finished uses the REST deletion routes, which MCP does not mirror.
+        `complete` means deletion finished in central PostgreSQL and object storage. Offline
+        edge devices consume the retained tombstone when they reconnect; this receipt is not
+        an acknowledgement from those devices.
         """
         return await kernel.forget(request)
 

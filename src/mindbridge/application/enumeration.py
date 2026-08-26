@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime
 
 from mindbridge.application.evidence import read_resolved_memory_evidence, sign_query_media
 from mindbridge.application.perception import ResolvedEvidence
@@ -53,13 +51,10 @@ class EnumerateMemories:
         store: MemoryStore,
         verifier: OccurrenceVerifier,
         media_url_signer: MediaUrlSigner,
-        *,
-        clock: Callable[[], datetime],
     ) -> None:
         self._store = store
         self._verifier = verifier
         self._media_url_signer = media_url_signer
-        self._clock = clock
 
     @operation_span("mindbridge.recall.enumerate")
     async def run(
@@ -96,17 +91,21 @@ class EnumerateMemories:
         )
         verified_batches = await self._verify_batches(request, query_media, verifiable)
         selected = tuple(memory for batch in verified_batches for memory in batch.memories)
-        accessed = await self._store.record_memory_accesses(
-            TenantId(request.tenant_id),
-            tuple(memory.memory_id for memory in selected),
-            accessed_at=self._clock(),
+        visible = (
+            await self._store.search_memories_by_ids(
+                request,
+                tuple(memory.memory_id for memory in selected),
+                limit=len(selected),
+            )
+            if selected
+            else ()
         )
         evidence = (
             await read_resolved_memory_evidence(
                 self._store,
                 self._media_url_signer,
                 TenantId(request.tenant_id),
-                accessed,
+                visible,
             )
             if request.include_evidence
             else ()
@@ -115,11 +114,11 @@ class EnumerateMemories:
             {
                 "mindbridge.enumeration.candidate_count": len(candidates),
                 "mindbridge.enumeration.verifiable_count": len(verifiable),
-                "mindbridge.enumeration.occurrence_count": len(accessed),
+                "mindbridge.enumeration.occurrence_count": len(visible),
             }
         )
         return EnumerationResult(
-            memories=accessed,
+            memories=visible,
             evidence=evidence,
         )
 

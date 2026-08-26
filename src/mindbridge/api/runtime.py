@@ -299,7 +299,7 @@ def _build_runtime(settings: Settings) -> _Runtime:
         embedder=embedder,
         minimum_embedding_similarity=settings.minimum_embedding_similarity,
     )
-    models = cast(tuple[object, ...], (generator, embedder))
+    models = cast(tuple[object, ...], (media_access, generator, embedder))
     tenant_ids = (
         TenantApiKeyAuthenticator.from_json(settings.tenant_api_keys_json).tenant_ids
         if settings.tenant_api_keys_json is not None

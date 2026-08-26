@@ -128,7 +128,8 @@ async def test_text_document_embedder_batches_and_restores_index_order() -> None
 async def test_multimodal_query_preserves_native_av_parts() -> None:
     async def respond(request: httpx.Request) -> httpx.Response:
         payload: dict[str, object] = json.loads(request.content)
-        messages = cast(list[dict[str, object]], payload["input"])
+        samples = cast(list[list[dict[str, object]]], payload["input"])
+        messages = samples[0]
         content = cast(list[dict[str, object]], messages[0]["content"])
         assert request.url.path == "/api/v1/embeddings"
         assert payload["model"] == MODEL_ID
@@ -573,15 +574,46 @@ async def test_embedding_reports_its_usage_into_the_token_account() -> None:
 
 
 async def test_multimodal_embedding_charges_the_whole_batch() -> None:
-    """A multimodal batch is one request per item, so the account has to sum them."""
+    """A multimodal batch crosses the wire once and restores provider index order."""
+    requests: list[httpx.Request] = []
+    vectors = (
+        [1.0] + [0.0] * 1_023,
+        [0.0, 1.0] + [0.0] * 1_022,
+        [0.0, 0.0, 1.0] + [0.0] * 1_021,
+    )
 
-    async def respond(_request: httpx.Request) -> httpx.Response:
-        return _embedding_response()
+    async def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        payload: dict[str, object] = json.loads(request.content)
+        samples = cast(list[list[dict[str, object]]], payload["input"])
+        assert len(samples) == 3
+        assert [
+            cast(dict[str, str], cast(list[dict[str, object]], sample[0]["content"])[1][kind])[
+                "url"
+            ]
+            for sample, kind in zip(samples, ("video_url", "image_url", "audio_url"), strict=True)
+        ] == [
+            "https://objects.example.test/media_01",
+            "https://objects.example.test/media_02",
+            "https://objects.example.test/media_03",
+        ]
+        return httpx.Response(
+            200,
+            json={
+                "object": "list",
+                "data": [
+                    {"object": "embedding", "index": index, "embedding": vectors[index]}
+                    for index in (2, 0, 1)
+                ],
+                "model": MODEL_ID,
+                "usage": {"prompt_tokens": 3, "total_tokens": 3},
+            },
+        )
 
     embedder = _embedder(respond)
     try:
         async with operation_span("mindbridge.test.observation"):
-            await embedder.embed(
+            result = await embedder.embed(
                 EmbedRequest(
                     inputs=(
                         ModelInput((_media_part(MediaKind.VIDEO, "01"),)),
@@ -595,7 +627,8 @@ async def test_multimodal_embedding_charges_the_whole_batch() -> None:
     finally:
         await embedder.close()
 
-    # One prompt token per clip in the stub response, three clips.
+    assert len(requests) == 1
+    assert tuple(item.values for item in result.embeddings) == tuple(map(tuple, vectors))
     assert usage == {"input": 3}
 
 

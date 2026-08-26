@@ -29,6 +29,7 @@ from mindbridge.contracts import (
     RememberBatchResult,
     RememberRequest,
     RememberResult,
+    ValidationIssue,
 )
 
 _Response = TypeVar("_Response", bound=ContractModel)
@@ -44,11 +45,13 @@ class MindBridgeError(RuntimeError):
         code: str,
         status_code: int | None = None,
         trace_id: str | None = None,
+        issues: tuple[ValidationIssue, ...] = (),
     ) -> None:
         super().__init__(message)
         self.code = code
         self.status_code = status_code
         self.trace_id = trace_id
+        self.issues = issues
 
 
 @dataclass(frozen=True, slots=True)
@@ -297,7 +300,12 @@ def _streamed_error(payload: str) -> MindBridgeError:
         error = ErrorResponse.model_validate_json(payload)
     except ValidationError:
         return MindBridgeError("MindBridge stream reported an error", code="stream_error")
-    return MindBridgeError(error.message, code=error.code, trace_id=error.trace_id)
+    return MindBridgeError(
+        error.message,
+        code=error.code,
+        trace_id=error.trace_id,
+        issues=error.issues,
+    )
 
 
 def _api_error(response: httpx.Response) -> MindBridgeError:
@@ -314,4 +322,5 @@ def _api_error(response: httpx.Response) -> MindBridgeError:
         code=error.code,
         status_code=response.status_code,
         trace_id=error.trace_id,
+        issues=error.issues,
     )

@@ -253,8 +253,8 @@ status = await memory.get_forget_status("tenant_01", receipt.tombstone_id)
 done = status.propagation_state.value == "complete"
 ```
 
-Only `complete` means every copy is gone, including on devices that were offline when the
-deletion was issued.
+`complete` means deletion finished in central PostgreSQL and object storage. An offline device
+applies the retained tombstone when it reconnects; this status is not an acknowledgement from it.
 
 ## Error handling
 
@@ -269,6 +269,7 @@ except MindBridgeError as error:
     error.code  # stable machine-readable code
     error.status_code  # HTTP status, or None for a transport failure
     error.trace_id  # correlates with your telemetry backend
+    error.issues  # field-level ValidationIssue values, when validation failed
 ```
 
 Branch on `code`, never on the message. Beyond the [server codes](rest.md#error-codes), the

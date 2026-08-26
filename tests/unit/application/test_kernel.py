@@ -31,6 +31,7 @@ from mindbridge.contracts import (
     MemoryWriteStatus,
     ObservationStatus,
     ObserveRequest,
+    RecallFilters,
     RecallMode,
     RecallQuery,
     RecallRequest,
@@ -1344,8 +1345,81 @@ async def test_search_records_complete_latency_without_calling_the_answerer(
     )
 
     assert remembered.memory_id in {memory.memory_id for memory in result.memories}
+    assert all(memory.useful_access_count == 0 for memory in result.memories)
     assert answerer.calls == 0
     assert [stage for stage, _ in stages] == ["recall.search"]
+
+
+async def test_filtered_recall_widens_past_a_full_ineligible_vector_window() -> None:
+    store = InMemoryStore()
+    memories = tuple(
+        MemoryRecord(
+            memory_id=MemoryId(f"memory_dense_{ordinal}"),
+            tenant_id=TenantId("tenant_01"),
+            memory_type=(MemoryType.SEMANTIC if ordinal < 4 else MemoryType.EPISODIC),
+            summary=f"Dense candidate {ordinal}",
+            evidence_ids=(),
+            occurred_at=NOW,
+            ended_at=NOW,
+            created_at=NOW,
+            verification_status=VerificationStatus.ATTESTED,
+        )
+        for ordinal in range(5)
+    )
+    for ordinal, memory in enumerate(memories):
+        await store.write_memory(
+            memory,
+            idempotency_key=f"dense_{ordinal}",
+            content_digest=str(ordinal + 1) * 64,
+        )
+    store.embedding_matches = tuple(
+        EmbeddingMatch(
+            embedding_id=f"embedding_dense_{ordinal}",
+            object_type=EmbeddedObjectType.MEMORY_RECORD,
+            object_id=memory.memory_id,
+            similarity=1.0 - ordinal / 100,
+        )
+        for ordinal, memory in enumerate(memories)
+    )
+
+    result = await _kernel(store, RecordingAnswerer()).recall(
+        RecallRequest(
+            tenant_id="tenant_01",
+            query=RecallQuery(text="words absent from every summary"),
+            filters=RecallFilters(memory_types=(MemoryType.EPISODIC,)),
+            mode=RecallMode.SEARCH,
+            limit=1,
+        )
+    )
+
+    assert [memory.memory_id for memory in result.memories] == [memories[-1].memory_id]
+    assert {search.limit for search in store.embedding_searches} == {4, 8}
+
+
+async def test_filtered_recall_fails_when_dense_ceiling_is_still_full() -> None:
+    store = InMemoryStore()
+    store.embedding_matches = tuple(
+        EmbeddingMatch(
+            embedding_id=f"embedding_filtered_{ordinal}",
+            object_type=EmbeddedObjectType.MEMORY_RECORD,
+            object_id=f"memory_filtered_{ordinal}",
+            similarity=1.0 - ordinal / 10_000,
+        )
+        for ordinal in range(1_001)
+    )
+
+    with pytest.raises(DomainInvariantError, match="narrow recall filters"):
+        await _kernel(store, RecordingAnswerer()).recall(
+            RecallRequest(
+                tenant_id="tenant_01",
+                query=RecallQuery(text="no stored memories"),
+                filters=RecallFilters(memory_types=(MemoryType.EPISODIC,)),
+                mode=RecallMode.SEARCH,
+                limit=1,
+            )
+        )
+
+    assert max(search.limit for search in store.embedding_searches) == 1_000
 
 
 async def test_recall_switches_query_direction_when_reflection_finds_no_new_candidate() -> None:
@@ -1500,18 +1574,29 @@ async def test_recall_reorders_only_visible_candidates_for_an_explicit_latest_qu
 
 
 async def test_recall_discards_an_answer_when_the_final_visibility_barrier_removes_it() -> None:
-    class ForgetBeforeAccessStore(InMemoryStore):
-        async def record_memory_accesses(
-            self,
-            tenant_id: TenantId,
-            memory_ids: tuple[MemoryId, ...],
-            *,
-            accessed_at: datetime,
-        ) -> tuple[MemoryRecord, ...]:
-            return ()
+    store = InMemoryStore()
 
-    store = ForgetBeforeAccessStore()
-    answerer = RecordingAnswerer()
+    class ForgetAfterAnswer(RecordingAnswerer):
+        async def answer(
+            self,
+            request: RecallRequest,
+            memories: tuple[MemoryRecord, ...],
+            evidence: tuple[ResolvedEvidence, ...],
+            *,
+            query_media: tuple[ResolvedQueryMedia, ...],
+            attempted_retrieval_queries: tuple[str, ...] = (),
+        ) -> GeneratedAnswer:
+            generated = await super().answer(
+                request,
+                memories,
+                evidence,
+                query_media=query_media,
+                attempted_retrieval_queries=attempted_retrieval_queries,
+            )
+            store.memories.clear()
+            return generated
+
+    answerer = ForgetAfterAnswer()
     kernel = _kernel(store, answerer)
     await kernel.observe(_observe_request())
     evidence_id = next(iter(store.evidence))
@@ -1584,28 +1669,26 @@ async def test_recall_answers_from_attested_source_memory() -> None:
     assert answerer.calls == 1
 
 
-async def test_recall_records_access_and_reactivates_cold_memory() -> None:
+async def test_recall_exposure_does_not_mark_a_cold_memory_useful() -> None:
     store = InMemoryStore()
     memory = await _kernel(store, RecordingAnswerer()).remember(_remember_request())
     key = next(iter(store.memories))
     digest, stored = store.memories[key]
     store.memories[key] = (digest, replace(stored, state=MemoryState.COLD))
-    accessed_at = NOW + timedelta(minutes=1)
-
     result = await _kernel(
         store,
         RecordingAnswerer(),
-        clock=lambda: accessed_at,
+        clock=lambda: NOW + timedelta(minutes=1),
     ).recall(RecallRequest(tenant_id="tenant_01", query=RecallQuery(text="red screwdriver")))
 
     assert result.memories[0].memory_id == memory.memory_id
-    assert result.memories[0].useful_access_count == 1
-    assert result.memories[0].last_accessed_at == accessed_at
-    assert result.memories[0].state is MemoryState.ACTIVE
+    assert result.memories[0].useful_access_count == 0
+    assert result.memories[0].last_accessed_at is None
+    assert result.memories[0].state is MemoryState.COLD
 
 
-async def test_recall_answers_and_records_access_only_for_returned_memories() -> None:
-    """Hidden fusion candidates cannot support an unverifiable answer or lifecycle signal."""
+async def test_recall_answers_without_rewarding_returned_or_hidden_memories() -> None:
+    """Exposure alone cannot create a usefulness signal for any fusion candidate."""
     store = InMemoryStore()
     answerer = RecordingAnswerer()
     kernel = _kernel(store, answerer)
@@ -1626,6 +1709,7 @@ async def test_recall_answers_and_records_access_only_for_returned_memories() ->
 
     assert [memory.memory_id for memory in result.memories] == [visible.memory_id]
     assert [memory.memory_id for memory in answerer.last_memories] == [visible.memory_id]
+    assert result.memories[0].useful_access_count == 0
     assert (
         await store.read_memory(TenantId("tenant_01"), MemoryId(hidden.memory_id))
     ).useful_access_count == 0
@@ -2005,7 +2089,7 @@ async def test_enumerate_verifies_all_filtered_memories_in_bounded_batches() -> 
         item[0].media_url.endswith("?signature=3") for item in answerer.occurrence_query_media[4:]
     )
     assert answerer.calls == 0
-    assert all(memory.useful_access_count == 1 for memory in result.memories)
+    assert all(memory.useful_access_count == 0 for memory in result.memories)
 
 
 async def test_enumerate_resigns_returned_evidence_after_verification() -> None:
