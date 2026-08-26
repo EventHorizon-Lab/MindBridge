@@ -44,7 +44,7 @@ from mindbridge.benchmarks.locomo_refined_runner import (
     LoCoMoRefinedPrediction,
     run_locomo_refined_conversation,
 )
-from mindbridge.benchmarks.scoring import JudgedAnswer
+from mindbridge.benchmarks.scoring import JudgedAnswer, require_scoring_is_possible
 from mindbridge.contracts import Identifier, NonEmptyString, Sha256Hex
 from mindbridge.file_integrity import sha256_file
 
@@ -89,6 +89,7 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
         label="LoCoMo-Refined sample IDs",
         limit=arguments.limit,
     )
+    require_scoring_is_possible("locomo-refined", predict_only=arguments.predict_only)
     require_writable_output_pair(arguments.output_path, overwrite=arguments.overwrite)
     deployment = load_deployment_snapshot(arguments.deployment_config_path)
     report(f"running {len(conversations)} conversations", quiet=arguments.quiet)

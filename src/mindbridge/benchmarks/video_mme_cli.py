@@ -37,6 +37,7 @@ from mindbridge.benchmarks.cli_common import (
 )
 from mindbridge.benchmarks.prompts import VIDEO_MME_QUERY_PROMPT
 from mindbridge.benchmarks.runtime import PreparedVideo, load_prepared_videos
+from mindbridge.benchmarks.scoring import require_scoring_is_possible
 from mindbridge.benchmarks.video_mme import (
     VIDEO_MME_ADAPTER_VERSION,
     VideoMMEDuration,
@@ -91,6 +92,7 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
     )
     prepared = _select_prepared(load_prepared_videos(arguments.prepared_media_path), videos)
     require_declared_transcripts(prepared, arguments.transcript_source)
+    require_scoring_is_possible("video-mme", predict_only=arguments.predict_only)
     require_writable_output_pair(arguments.output_path, overwrite=arguments.overwrite)
     deployment = load_deployment_snapshot(
         arguments.deployment_config_path,

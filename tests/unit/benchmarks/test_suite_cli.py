@@ -132,10 +132,58 @@ def test_a_producer_backed_task_gets_a_manifest_path_of_its_own_run(
 
     manifests = [_flag_value(argv, "--prepared-media") for argv in invocations]
     assert manifests == [
-        str(tmp_path / "results" / "run-a" / "stub-task" / "prepared.json"),
-        str(tmp_path / "results" / "run-b" / "stub-task" / "prepared.json"),
+        str(tmp_path / "results" / "run-a" / "stub-task" / "run-a-prepared.json"),
+        str(tmp_path / "results" / "run-b" / "stub-task" / "run-b-prepared.json"),
     ]
     # Preparation ran for both, because neither found the other's file.
+    assert len(prepared) == 2
+
+
+def test_two_runs_sharing_an_explicit_output_dir_still_prepare_separately(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The default output directory carries the run ID; `--output-dir` given explicitly does not.
+
+    So the run ID has to be in the file name too. `--overwrite` clears the predictions and the
+    summary but not the prepared manifest, and `_prepare_task` skips a manifest that exists --
+    so a second sweep into the same directory ingested objects staged for the first run's tenant,
+    which its own tenant cannot address. The default path hides this, which is why the test
+    above cannot see it.
+    """
+    shared = tmp_path / "shared"
+    prepared: list[tuple[str, ...]] = []
+    monkeypatch.setitem(
+        TASKS, "stub-task", CatalogTask("stub", ("--dataset", f"{ROOT}/stub/release.json"))
+    )
+    monkeypatch.setitem(
+        PREPARERS,
+        "stub",
+        Producer("--prepared-media", lambda request: prepared.append(request.argv)),
+    )
+    invocations = _stub_benchmark(monkeypatch, writes=True)
+
+    for run in ("run-a", "run-b"):
+        argv = [
+            "--tasks",
+            "stub-task",
+            "--run-id",
+            run,
+            "--benchmarks-root",
+            str(tmp_path),
+            "--output-dir",
+            str(shared),
+            "--no-download",
+        ]
+        if run != "run-a":
+            argv.append("--overwrite")
+        assert main(argv) == 0
+
+    manifests = [_flag_value(argv, "--prepared-media") for argv in invocations]
+    assert manifests == [
+        str(shared / "stub-task" / "run-a-prepared.json"),
+        str(shared / "stub-task" / "run-b-prepared.json"),
+    ]
     assert len(prepared) == 2
 
 

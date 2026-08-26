@@ -50,6 +50,7 @@ from mindbridge.benchmarks.cli_common import BENCHMARK_ENVIRONMENT, report, sele
 from mindbridge.benchmarks.prepare import PREPARERS, PrepareRequest
 from mindbridge.benchmarks.releases import fetch, missing_inputs, release_for
 from mindbridge.benchmarks.report import render, render_directory
+from mindbridge.benchmarks.scoring import require_scoring_is_possible
 from mindbridge.benchmarks.task_catalog import (
     DEFAULT_BENCHMARKS_ROOT,
     listing,
@@ -225,6 +226,7 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> int:
     # otherwise follow is up to 1.4 GB.
     summary_path = arguments.output_dir / SUMMARY_FILENAME
     _require_writable_outputs(plans, summary_path, overwrite=arguments.overwrite)
+    _require_every_task_can_report(plans, predict_only="--predict-only" in arguments.shared)
     _obtain_releases(arguments)
     report(f"running {len(plans)} benchmarks", quiet=arguments.quiet)
     started_at = datetime.now(timezone.utc)
@@ -539,13 +541,20 @@ def _prepared_media_arguments(task: SuiteTask, arguments: _Arguments) -> tuple[s
     the catalog, an earlier run's file was found on disk, preparation was skipped as
     already-done, and the run failed on a manifest describing somebody else's tenant.
 
+    The run ID is in the file name, not only in the default output directory. `--output-dir`
+    given explicitly is the same directory for every run, so without it a second sweep found the
+    first one's `prepared.json`, skipped preparation as already-done, and ingested objects under
+    a tenant it cannot address -- exactly the failure described above, reintroduced by the flag
+    that lets an operator choose where results land.
+
     A task that already carries the flag keeps it, which is how a hand-written `--suite` entry
     supplies a manifest MindBridge cannot produce.
     """
     producer = PREPARERS.get(task.benchmark)
     if producer is None or _flag_value(task.arguments, producer.flag) is not None:
         return ()
-    return (producer.flag, str(arguments.output_dir / task.name / "prepared.json"))
+    manifest = arguments.output_dir / task.name / f"{arguments.run_id}-prepared.json"
+    return (producer.flag, str(manifest))
 
 
 def _require_writable_outputs(
@@ -563,6 +572,17 @@ def _require_writable_outputs(
         require_writable_output_pair(plan.output_path, overwrite=overwrite)
     if summary_path.exists() and not overwrite:
         raise FileExistsError(f"output already exists: {summary_path}")
+
+
+def _require_every_task_can_report(plans: Sequence[_Plan], *, predict_only: bool) -> None:
+    """Refuse the sweep if a judged task has no judge, before the first one starts.
+
+    Each runner makes this check for itself now, but only once it is running -- and a judged task
+    that runs to completion and then cannot score writes nothing, so finding out task by task
+    costs every earlier task's predictions. Seventeen of the twenty-two catalog tasks are judged.
+    """
+    for plan in plans:
+        require_scoring_is_possible(plan.task.benchmark, predict_only=predict_only)
 
 
 def _print_plan(plans: Sequence[_Plan]) -> None:

@@ -41,7 +41,7 @@ from mindbridge.benchmarks.mm_lifelong_runner import (
     load_prepared_mm_lifelong,
     run_mm_lifelong,
 )
-from mindbridge.benchmarks.scoring import JudgedAnswer
+from mindbridge.benchmarks.scoring import JudgedAnswer, require_scoring_is_possible
 from mindbridge.contracts import NonEmptyString, Sha256Hex
 from mindbridge.file_integrity import sha256_file
 from mindbridge.prompts import PERCEIVE_EVENTS_PROMPT
@@ -82,6 +82,7 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
         limit=arguments.limit,
     )
     prepared = load_prepared_mm_lifelong(arguments.prepared_media_path)
+    require_scoring_is_possible("mm-lifelong", predict_only=arguments.predict_only)
     require_writable_output_pair(arguments.output_path, overwrite=arguments.overwrite)
     deployment = load_deployment_snapshot(
         arguments.deployment_config_path,

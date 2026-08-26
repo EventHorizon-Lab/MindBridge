@@ -43,6 +43,7 @@ from mindbridge.benchmarks.egomem_reason import (
     load_egomem_reason,
 )
 from mindbridge.benchmarks.prompts import EGOMEM_REASON_QUERY_PROMPT
+from mindbridge.benchmarks.scoring import require_scoring_is_possible
 from mindbridge.contracts import Identifier, NonEmptyString, Sha256Hex
 from mindbridge.file_integrity import sha256_file
 from mindbridge.prompts import PERCEIVE_EVENTS_PROMPT
@@ -85,6 +86,7 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
         limit=arguments.limit,
     )
     prepared = _prepared_by_identity(questions, load_prepared_egomem(arguments.prepared_media_path))
+    require_scoring_is_possible("egomem", predict_only=arguments.predict_only)
     require_writable_output_pair(arguments.output_path, overwrite=arguments.overwrite)
     deployment = load_deployment_snapshot(
         arguments.deployment_config_path,

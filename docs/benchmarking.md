@@ -334,7 +334,9 @@ export MINDBRIDGE_BENCH_JUDGE_MODEL=gpt-4o-2024-11-20
 
 The model defaults to MM-Vet's own so a number here is comparable to one lmms-eval would produce.
 The endpoint has no default: a judged benchmark with none configured refuses to start rather than
-scoring the whole split zero.
+scoring the whole split zero — checked before the run, and once for the whole sweep, because a
+judged run that finishes and then cannot score writes no predictions at all. The key is optional,
+since a local judge does not want one.
 
 **Three consequences, all of them upstream's and all deliberate:**
 

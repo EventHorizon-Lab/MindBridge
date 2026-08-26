@@ -61,8 +61,24 @@ SUBMISSION_METRIC = "submission"
 """lmms-eval's name for a split whose answers are withheld; its aggregation returns no score."""
 
 JUDGE_METRIC = "llm_judge"
-JUDGE_PATIENCE = 3
-"""MM-Vet's `patience = 3`: three attempts at a parseable score before the 0.0 floor."""
+
+JUDGE_TIMEOUT_SECONDS = 60.0
+"""Deadline for one grading call, which is a 16-token reply and nothing else.
+
+Not `--request-timeout-seconds`. That is the deadline for a benchmark request against the
+deployment under test and defaults to 1800; inherited here, and multiplied by the OpenAI
+client's own retries, one stalled judge call could hold the pass for hours while `_score_one`
+patiently tried again. `JUDGE_PATIENCE` is meant to be the only retry ladder, so the transport
+does none of its own.
+"""
+
+JUDGE_API_KEY_PLACEHOLDER = "not-required"
+"""Sent when no judge key is configured, because a local judge does not want one.
+
+The generator contract requires a non-empty key -- every hosted endpoint needs one -- so an
+unset variable would otherwise fail validation at the end of a finished run rather than reach
+the endpoint that does not check it.
+"""
 
 JUDGE_MODEL_VARIABLE = "MINDBRIDGE_BENCH_JUDGE_MODEL"
 JUDGE_ENDPOINT_VARIABLE = "MINDBRIDGE_BENCH_JUDGE_ENDPOINT"
@@ -98,6 +114,14 @@ _RETRY_INSTRUCTIONS = (
 
 The protocol here has no temperature to raise, so a retry that changed nothing would return the
 same unparseable answer. Escalating the instruction is the lever that remains.
+"""
+
+JUDGE_PATIENCE = len(_RETRY_INSTRUCTIONS)
+"""MM-Vet's `patience = 3`: three attempts at a parseable score before the 0.0 floor.
+
+Derived rather than declared. Written as its own `3` and used to slice the tuple above, raising
+it silently kept three attempts instead of failing, and the slice that joined them never removed
+anything.
 """
 
 _SCORE = re.compile(r"-?\d+(?:\.\d+)?")
@@ -223,15 +247,38 @@ def build_judge(*, request_timeout_seconds: float) -> Generator:
         )
     return create_generator(
         {
-            "api_key": os.environ.get(JUDGE_API_KEY_VARIABLE, ""),
+            "api_key": os.environ.get(JUDGE_API_KEY_VARIABLE, "").strip()
+            or JUDGE_API_KEY_PLACEHOLDER,
             "endpoint": endpoint,
             "model_id": configured_judge_model(),
-            "request_timeout_seconds": request_timeout_seconds,
+            "request_timeout_seconds": min(request_timeout_seconds, JUDGE_TIMEOUT_SECONDS),
+            # `JUDGE_PATIENCE` is the retry ladder; the client adding its own default of two
+            # would make three attempts nine, each on the deadline above.
+            "max_retries": 0,
             # Every value but "none" makes this endpoint emit reasoning tokens first and then stop
             # on length, which arrives here as an unparseable score and burns all three attempts.
             "reasoning_effort": "none",
         }
     )
+
+
+def require_scoring_is_possible(benchmark: str, *, predict_only: bool) -> None:
+    """Refuse a judged run that has no judge, before it ingests or answers anything.
+
+    `build_judge` raises the same refusal, but it is first reached from `scoring_snapshot` after
+    the run has finished and before `write_run_artifacts` -- so an unset endpoint discarded every
+    prediction the run had just paid for, and a sweep did it once per judged task. This is the
+    same check at the only point where it costs nothing, called beside each runner's other
+    refusals and once for the whole sweep.
+    """
+    declared = SCORING.get(benchmark)
+    if predict_only or declared is None or declared.mode != "judge":
+        return
+    if not judge_available():
+        raise ValueError(
+            f"{benchmark} is scored by a judge, so {JUDGE_ENDPOINT_VARIABLE} must be set; pass "
+            "--predict-only to write predictions without a score"
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -293,7 +340,7 @@ async def _score_all(
 
 async def _score_one(answer: JudgedAnswer, *, judge: Generator) -> tuple[float, bool]:
     """Ask the judge up to `JUDGE_PATIENCE` times, then floor to 0.0 as MM-Vet does."""
-    for instruction in _RETRY_INSTRUCTIONS[:JUDGE_PATIENCE]:
+    for instruction in _RETRY_INSTRUCTIONS:
         try:
             result = await judge.generate(
                 GenerateRequest(

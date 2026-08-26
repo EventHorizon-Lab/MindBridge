@@ -29,6 +29,7 @@ from mindbridge.benchmarks.cli_common import (
     select_by_id,
     write_run_artifacts,
 )
+from mindbridge.benchmarks.scoring import require_scoring_is_possible
 from mindbridge.benchmarks.supermemory_runner import (
     SuperMemoryMetrics,
     SuperMemoryPreparedSubject,
@@ -82,6 +83,7 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
         arguments.limit,
     )
     prepared = load_prepared_supermemory(arguments.prepared_media_path)
+    require_scoring_is_possible("supermemory", predict_only=arguments.predict_only)
     require_writable_output_pair(arguments.output_path, overwrite=arguments.overwrite)
     deployment = load_deployment_snapshot(
         arguments.deployment_config_path,

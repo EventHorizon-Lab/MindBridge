@@ -66,7 +66,9 @@ The capabilities present on `master` today:
   match score themselves, the seven whose answers are free text are judged by a model called from
   inside the run, and `--predict-only` reports the `999` bypass sentinel instead. A judge that
   cannot be read scores the answer `0.0` — upstream's behaviour — with the count of floored
-  answers recorded beside the number and printed under the table.
+  answers recorded beside the number and printed under the table. A judged benchmark with no
+  `MINDBRIDGE_BENCH_JUDGE_ENDPOINT` is refused before it ingests anything, not after, because a
+  judged run that finishes and then cannot score writes no predictions at all.
 - Python 3.10 through 3.14, with the whole quality gate — format, lint, types, tests — run on
   every one of them.
 

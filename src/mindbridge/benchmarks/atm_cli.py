@@ -50,7 +50,7 @@ from mindbridge.benchmarks.cli_common import (
 )
 from mindbridge.benchmarks.prompts import ATM_BENCH_QUERY_PROMPT
 from mindbridge.benchmarks.runtime import benchmark_tenant_id
-from mindbridge.benchmarks.scoring import JudgedAnswer
+from mindbridge.benchmarks.scoring import JudgedAnswer, require_scoring_is_possible
 from mindbridge.contracts import Identifier, NonEmptyString, Sha256Hex
 from mindbridge.core import MediaKind
 from mindbridge.file_integrity import sha256_file
@@ -119,6 +119,7 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
         for record in load_atm_sgm(path)
     )
     validate_prepared_atm(questions, prepared, sgm_records, media_source=arguments.media_source)
+    require_scoring_is_possible("atm", predict_only=arguments.predict_only)
     require_writable_output_pair(arguments.output_path, overwrite=arguments.overwrite)
     deployment = load_deployment_snapshot(
         arguments.deployment_config_path,

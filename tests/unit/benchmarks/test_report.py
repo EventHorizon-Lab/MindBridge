@@ -372,6 +372,52 @@ def test_the_bypass_sentinel_is_called_a_sentinel_rather_than_left_to_look_like_
     assert "has not been evaluated" in table
 
 
+def test_a_predict_only_run_does_not_label_a_measured_number_as_the_sentinel(
+    tmp_path: Path,
+) -> None:
+    """`--predict-only` suppresses the declared metric; the runner still pins its own breakdown.
+
+    Labelling both blocks with the one `scoring.mode` printed a real measured accuracy sourced
+    `bypass`, underneath a footer saying the run had not been evaluated. The runner's arithmetic
+    is the runner's whatever scored the headline.
+    """
+    _task(
+        tmp_path,
+        "video-mme",
+        manifest={
+            "scoring": {"mode": "bypass", "metrics": {"bypass": 999.0}},
+            "metrics": {"accuracy": 0.61},
+        },
+    )
+
+    rows = _rows(render(_summary(tmp_path, "video-mme"), directory=tmp_path))
+
+    sentinel = [row for row in rows if "bypass" in row]
+    measured = [row for row in rows if "accuracy" in row]
+    assert sentinel and sentinel[0].strip().endswith("bypass")
+    assert measured and measured[0].strip().endswith("runner"), measured
+
+
+def test_one_unreadable_number_does_not_take_the_whole_table_with_it(tmp_path: Path) -> None:
+    """`json.loads` accepts bare NaN, which a 0/0 category in a hand-made sidecar carries.
+
+    `int(nan)` raises, so one cell aborted `render` before it printed anything -- the failure
+    `_load` is deliberately defensive about, one step further on.
+    """
+    _task(
+        tmp_path,
+        "video-mme",
+        manifest={"scoring": {"mode": "runner", "metrics": {"accuracy": 0.61}}},
+    )
+    sidecar = tmp_path / "video-mme" / "predictions.jsonl.score.json"
+    sidecar.write_text('{"metrics": {"strict_accuracy": NaN}}', encoding="utf-8")
+
+    table = render(_summary(tmp_path, "video-mme"), directory=tmp_path)
+
+    assert "0.6100" in table
+    assert "nan" in table.lower()
+
+
 def test_a_headline_declared_and_also_pinned_in_the_breakdown_is_printed_once(
     tmp_path: Path,
 ) -> None:

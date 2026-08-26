@@ -19,6 +19,7 @@ a newer version still renders, and a manifest's benchmark-specific counts cost n
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -194,16 +195,21 @@ def _manifest_metrics(path: Path) -> Iterator[_Metric]:
 
     `scoring.mode` names the source, so a judge's number is never labelled as an exact match: the
     judge model was MindBridge's choice and a reader has to be able to see that from the table.
+    It names the source of the *declared* block only. The runner's typed breakdown is always the
+    runner's own arithmetic, so it is labelled `runner` whatever mode scored the headline --
+    otherwise a judged benchmark's runner-computed breakdown reads as the judge's, and a
+    `--predict-only` run printed a real measured accuracy in a row sourced `bypass` underneath a
+    footer saying the run had not been evaluated.
     """
     document = _load(path)
     if not document:
         return
     scoring = document.get("scoring")
     scoring = scoring if isinstance(scoring, dict) else {}
-    source = str(scoring.get("mode") or "runner")
+    mode = str(scoring.get("mode") or "runner")
     declared = scoring.get("higher_is_better")
     directions = declared if isinstance(declared, dict) else {}
-    for block in (scoring.get("metrics"), document.get("metrics")):
+    for block, source in ((scoring.get("metrics"), mode), (document.get("metrics"), "runner")):
         if isinstance(block, dict):
             yield from _flatten(block, source=source, directions=directions)
 
@@ -380,7 +386,15 @@ def _duration(seconds: float) -> str:
 
 
 def _value(value: float) -> str:
-    """Print a count as a count and a rate as a rate, without inventing precision for either."""
+    """Print a count as a count and a rate as a rate, without inventing precision for either.
+
+    `int()` is guarded because `json.loads` accepts bare `NaN` and `Infinity`, which a
+    hand-edited or third-party score sidecar carries for a 0/0 category. Unguarded, one such
+    cell raised `ValueError`/`OverflowError` out of `render` and took every other task's numbers
+    with it -- the failure `_load` is deliberately defensive about, one step further on.
+    """
+    if not math.isfinite(value):
+        return str(value)
     return str(int(value)) if value == int(value) and abs(value) >= 1 else f"{value:.4f}"
 
 

@@ -20,10 +20,13 @@ from mindbridge.benchmarks.scoring import (
     BYPASS_METRIC,
     BYPASS_VALUE,
     DEFAULT_JUDGE_MODEL,
+    JUDGE_API_KEY_PLACEHOLDER,
+    JUDGE_API_KEY_VARIABLE,
     JUDGE_ENDPOINT_VARIABLE,
     JUDGE_METRIC,
     JUDGE_MODEL_VARIABLE,
     JUDGE_PATIENCE,
+    JUDGE_TIMEOUT_SECONDS,
     SCORING,
     JudgedAnswer,
     build_judge,
@@ -31,6 +34,7 @@ from mindbridge.benchmarks.scoring import (
     configured_judge_model,
     judge_answers,
     parse_score,
+    require_scoring_is_possible,
 )
 from mindbridge.benchmarks.task_catalog import TASKS
 from mindbridge.core import ModelReference
@@ -282,6 +286,53 @@ def test_an_unconfigured_judge_is_refused_before_a_single_answer_is_scored(
 
     with pytest.raises(ValueError, match=JUDGE_ENDPOINT_VARIABLE):
         build_judge(request_timeout_seconds=60.0)
+
+
+def test_a_judged_benchmark_with_no_judge_is_refused_before_the_run_not_after(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`build_judge`'s refusal is correct and arrives far too late to be useful.
+
+    It is first reached from `scoring_snapshot`, which every runner calls after its own
+    `asyncio.run` has returned and before `write_run_artifacts` -- so an unset endpoint threw
+    away every prediction a finished run had paid for, and a sweep repeated that for each of the
+    seventeen judged tasks. `require_scoring_is_possible` is the same question asked where the
+    answer is still free.
+    """
+    monkeypatch.delenv(JUDGE_ENDPOINT_VARIABLE, raising=False)
+
+    with pytest.raises(ValueError, match=JUDGE_ENDPOINT_VARIABLE):
+        require_scoring_is_possible("locomo-refined", predict_only=False)
+
+    # Nothing to refuse: no judge is needed either way.
+    require_scoring_is_possible("locomo-refined", predict_only=True)
+    require_scoring_is_possible("video-mme", predict_only=False)
+    require_scoring_is_possible("egomem", predict_only=False)
+
+
+def test_the_judge_gets_its_own_deadline_and_no_transport_retries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 16-token grading call must not inherit a benchmark request's 1800-second deadline.
+
+    Inherited, and multiplied by the OpenAI client's own default of two retries, `JUDGE_PATIENCE`
+    became a nine-attempt ladder at half an hour each -- so one stalled judge could hold a pass
+    for hours per answer while `_score_one` patiently tried again.
+    """
+    captured: dict[str, object] = {}
+    monkeypatch.setenv(JUDGE_ENDPOINT_VARIABLE, "https://judge.example/v1")
+    monkeypatch.delenv(JUDGE_API_KEY_VARIABLE, raising=False)
+    monkeypatch.setattr(
+        "mindbridge.models.openai.create_generator",
+        lambda config: captured.update(config) or _ScriptedJudge(["1.0"]),
+    )
+
+    build_judge(request_timeout_seconds=1_800.0)
+
+    assert captured["request_timeout_seconds"] == JUDGE_TIMEOUT_SECONDS
+    assert captured["max_retries"] == 0
+    # A local judge wants no key, and the generator contract requires a non-empty one.
+    assert captured["api_key"] == JUDGE_API_KEY_PLACEHOLDER
 
 
 def test_the_default_judge_is_the_one_mm_vet_uses(monkeypatch: pytest.MonkeyPatch) -> None:

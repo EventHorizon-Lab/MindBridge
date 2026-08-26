@@ -44,7 +44,7 @@ from mindbridge.benchmarks.mem_gallery_runner import (
     validate_mem_gallery_images,
 )
 from mindbridge.benchmarks.prompts import MEM_GALLERY_QUERY_PROMPT
-from mindbridge.benchmarks.scoring import JudgedAnswer
+from mindbridge.benchmarks.scoring import JudgedAnswer, require_scoring_is_possible
 from mindbridge.contracts import Identifier, NonEmptyString, Sha256Hex
 from mindbridge.file_integrity import sha256_file
 from mindbridge.prompts import PERCEIVE_EVENTS_PROMPT
@@ -90,6 +90,7 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
         raise ValueError("Mem-Gallery selection must not be empty")
     prepared = load_prepared_mem_gallery(arguments.prepared_images_path)
     validate_mem_gallery_images(topics, prepared)
+    require_scoring_is_possible("mem-gallery", predict_only=arguments.predict_only)
     require_writable_output_pair(arguments.output_path, overwrite=arguments.overwrite)
     deployment = load_deployment_snapshot(arguments.deployment_config_path, require_worker=True)
     report(f"running {len(topics)} topics", quiet=arguments.quiet)
