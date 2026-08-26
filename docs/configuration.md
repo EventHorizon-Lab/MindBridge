@@ -418,14 +418,15 @@ Four constraints on the proxy, all of which have bitten before:
 - **Video only.** `image_max_pixels` governs stored image clips, not what the model is sent. An
   image reaches the model at full resolution because the request carries no pixel budget for
   images at all.
-- **Its ceiling is a frame count, not a duration.** Past roughly forty sampled frames the encode
-  fails, on the flush that drains the encoder rather than on any one frame. At the 30-second
-  segments every ingest path here uses, anything above about 1.3 fps exceeds it. Raising
-  `frames_per_second` therefore trades the proxy away; lower it, or segment shorter, to keep
-  both. **Turning `proxy_audio` off does not raise this ceiling** — a silent source with the
-  audio disabled fails at the same frame count, so the limit is not the audio interleave it was
-  previously documented as. What has been ruled out, and what has not, is recorded next to
-  `MAX_PROXY_SAMPLED_FRAMES` in `application/evidence_clips.py`.
+- **No frame-count limit.** Raising `frames_per_second` no longer trades the proxy away. Past
+  roughly forty sampled frames the encode used to raise `[Errno 22] Invalid argument`, and a
+  budget of forty frames skipped any span that would exceed it — so at the 30-second segments
+  every ingest path here uses, anything above about 1.3 fps silently lost its proxy. The crash
+  was documented in turn as an audio-interleave limit and as an unidentified one; it was
+  neither. The encoder was being handed timestamps in two different units, that is fixed, and
+  the budget is gone with it. `frames_per_second` is still bounded at the worker's
+  configuration boundary — see `MINDBRIDGE_MEDIA_SAMPLING_CONFIG_JSON` — but by a sanity limit,
+  not by anything the media layer cannot encode.
 - **Best-effort.** A span over budget is skipped before its source is read, and anything the
   encoder or object storage refuses degrades the same way — the observation behaves exactly as
   it did before this knob existed rather than paying for a doomed encode.
