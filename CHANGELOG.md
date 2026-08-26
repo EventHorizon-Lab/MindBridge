@@ -33,6 +33,8 @@ The capabilities present on `master` today:
 - Three recall modes: `answer`, `search`, and `enumerate`, the last failing explicitly rather than
   truncating an oversized scope.
 - Multimodal queries — text, stored media, or both.
+- Explicit native-Omni or lazy FunASR + CAM++ speaker-turn routing for the bundled
+  OpenAI-compatible generator.
 - Grounded follow-up through a strict `memory_ids` scope.
 
 ### Interfaces

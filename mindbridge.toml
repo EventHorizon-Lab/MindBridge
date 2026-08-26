@@ -26,6 +26,11 @@ space_id = "jinaai/jina-embeddings-v5-omni-small-retrieval-1024"
 plugin = "openai"
 endpoint = "http://localhost:8001/v1"
 model_id = "qwen3.8-max"
+# Omni models consume the source audio directly. For a video-capable VLM without audio support,
+# install the `edge` extra and set this to "transcribe"; FunASR + CAM++ then load on first AV use.
+audio_mode = "native"
+# asr_model_id = "iic/speech_seaco_paraformer_large_asr_nat-zh-cn-16k-common-vocab8404-pytorch"
+# asr_device = "auto"
 # The Worker sizes its Celery budget from this, so the two have to agree. A perception clip can
 # take 16-25 minutes, which is why the default is not a web timeout.
 request_timeout_seconds = 1800
