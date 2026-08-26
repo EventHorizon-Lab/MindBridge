@@ -940,10 +940,15 @@ async def test_the_shrink_check_measures_the_source_it_actually_read() -> None:
         assert resolved[0].media_url != "https://objects.example.test/media_video_01.mp4"
 
 
-async def test_a_span_too_long_to_encode_is_skipped_before_it_is_read() -> None:
-    """The muxer ceiling is a frame count, so frames_per_second decides it as much as span
-    length. Paying a full source read and a doomed encode per observation is the whole cost the
-    proxy exists to remove."""
+async def test_a_long_span_is_proxied_rather_than_skipped_for_its_frame_count() -> None:
+    """No frame count skips a proxy any more, and this is what stops the check coming back.
+
+    A 30 s span at 4 fps samples 120 frames. That used to be refused before the source was even
+    read, because the encode raised `[Errno 22] Invalid argument` past ~43 frames -- a defect in
+    how `media/clipping.py` stamped frame timestamps, not a limit of the encoder or the muxer.
+    With it fixed the frame count bounds nothing, so the span has to be read and proxied like
+    any other: `no_smaller_than_source` is the only thing left that declines one.
+    """
     store = RecordingStore()
 
     async with generation_proxies(
@@ -954,8 +959,8 @@ async def test_a_span_too_long_to_encode_is_skipped_before_it_is_read() -> None:
         cut=_shrinking_cut,
         scope="job_01:1",
     ) as resolved:
-        assert resolved[0].media_url == "https://objects.example.test/media_video_01.mp4"
-    assert store.reads == 0
+        assert resolved[0].media_url != "https://objects.example.test/media_video_01.mp4"
+    assert store.reads == 1
 
 
 async def test_the_embedder_is_told_the_sampling_its_clip_was_cut_at() -> None:
@@ -1136,24 +1141,6 @@ async def test_the_generation_proxy_gets_the_same_floor_as_the_stored_clip() -> 
         pass
 
     assert [(item.start_ms, item.end_ms) for item in requests] == [(4_200, 6_200)]
-
-
-async def test_widening_cannot_push_a_proxy_past_the_frame_ceiling() -> None:
-    """The two bounds have to compose: the ceiling is checked against the window that will
-    actually be cut, not the span that was asked for."""
-    store = RecordingStore()
-
-    async with generation_proxies(
-        TENANT_ID,
-        (_video_evidence("evidence_video_01", 39_900, 40_000),),
-        store=store,
-        sampling=ClipSampling(frames_per_second=1.0),
-        cut=_shrinking_cut,
-        scope="job_01:1",
-    ) as resolved:
-        # 100 ms asked for, 2 s cut, still far below the 40-frame ceiling.
-        assert resolved[0].media_url != "https://objects.example.test/media_video_01.mp4"
-    assert store.reads == 1
 
 
 async def test_a_frame_rate_below_the_floor_samples_faster_instead_of_reaching_further() -> None:

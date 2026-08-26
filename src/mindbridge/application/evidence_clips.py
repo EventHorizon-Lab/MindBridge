@@ -66,23 +66,8 @@ _Budget = TypeVar("_Budget", float, int)
 _LOGGER = logger("mindbridge.application.evidence_clips")
 
 
-# Past roughly this many sampled frames the proxy encode fails, on the flush that drains the
-# encoder rather than on any single frame: `av.error.ValueError: [Errno 22] Invalid argument`.
-# Checking it before reading the source turns a doomed full decode and encode into a decision.
-#
-# This was documented as the MP4 muxer refusing to interleave a sparse video track with
-# continuous audio. That is wrong, and measurably so: a silent source cut with
-# `include_audio=False` -- no audio anywhere in the pipeline -- fails at 45 frames exactly as an
-# audiovisual one does, so dropping audio does not buy a single frame. Also ruled out by
-# bisection: timestamp magnitude (45 frames fails across 45 s, 22.5 s and 9 s spans alike),
-# holding frames past their decode container, and the picture type inherited from the source.
-# It reproduces only for frames obtained by decoding a source -- 120 synthetic frames encode
-# fine through the identical loop -- and the mechanism is not yet identified. The number stays
-# where measurement put it; what changed is that it is no longer attributed to a cause that
-# would suggest audio is the thing to give up.
-MAX_PROXY_SAMPLED_FRAMES = 40
-# The other end of the same bound, and the reason `_sampled_window` exists: Qwen3-VL's video
-# processor merges frames in temporal pairs, so anything it is given has to carry at least two.
+# The reason `_sampled_window` exists: Qwen3-VL's video processor merges frames in temporal
+# pairs, so anything it is given has to carry at least two.
 MIN_SAMPLED_FRAMES = 2
 # How far that floor may reach in wall clock, which is not the same bound. Two sampling
 # intervals is a length only once the rate is fixed, and the rate is a deployment setting:
@@ -107,7 +92,6 @@ class ClipSampling:
     # Off for a generator that cannot hear. Measured against the evaluation's endpoint on one
     # 15 s clip: `prompt_tokens` was 1009 whether or not the file carried its audio track, so
     # the track was never ingested, while the file was 336 KiB with it against 212 KiB without.
-    # This does *not* raise the frame ceiling below -- see the note there.
     proxy_audio: bool = True
 
 
@@ -358,17 +342,6 @@ async def _store_generation_proxy(
         max_pixels=sampling.max_pixels,
         include_audio=sampling.proxy_audio,
     )
-    # The ceiling is a frame count, so the frame rate decides it as much as the span does.
-    # Checked before the read because the alternative is paying for a full source download and a
-    # doomed encode on every observation.
-    frames = (request.end_ms - request.start_ms) / 1_000 * request.frames_per_second
-    if frames > MAX_PROXY_SAMPLED_FRAMES:
-        _skipped_proxy(
-            "span_exceeds_frame_ceiling",
-            media_object_id=str(source_object.media_object_id),
-            frames=round(frames),
-        )
-        return None
     async with semaphore:
         try:
             source = await store.read_media(source_object)
@@ -556,7 +529,7 @@ def _sampled_window(
     kind: MediaKind,
     frames_per_second: float,
 ) -> tuple[int, int, float]:
-    """Widen a video span too short to sample twice, as the ceiling narrows one sampled too often.
+    """Widen a video span too short to sample twice, sampling faster instead of reaching further.
 
     The sampler takes a frame at the start of the span and one every interval after it, so a span
     shorter than a single interval yields exactly one frame -- and a one-frame video is not a video
