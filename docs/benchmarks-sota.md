@@ -2,17 +2,20 @@
 
 > 状态：目标基线，不代表 MindBridge 已取得任何一项分数
 >
-> 更新日期：2026-08-25
+> 更新日期：2026-08-26
 >
-> 范围：`src/mindbridge/benchmarks/` 中已有官方适配器的十二个 Benchmark
+> 范围：十二个原生 runner，加 AML 离线 harness 的六条路径；LoCoMo-Refined 重叠后共十七个 Benchmark
 >
-> 口径：**学术榜**指论文/官方 leaderboard 上可复现的公开结果；**工业榜**指厂商自测并对外发布的产品分数
+> 口径：**学术榜**指论文/官方 leaderboard 上可复现的公开结果；**工业榜**指厂商自测并对外发布的产品分数；
+> **产品线**指商业系统被公开统一 harness 第三方复跑的结果，不等同于工业榜
 
 ## 1. 结论
 
-十二个 Benchmark 里只有 **LoCoMo-Refined** 和 **Video-MME** 存在真正意义上的工业榜；其余十个是纯
-学术榜，最强系统全部来自论文（Video-MME-v2 的榜由作者收邮件维护，尚不构成工业榜）。这决定了
-MindBridge 的超越策略在两条赛道上完全不同：
+MindBridge 现在有 18 条评测路径：十二个原生 runner，加 AML 离线 harness 的六条文本路径；
+LoCoMo-Refined 在两边重复，所以是 17 个不同数据集。原生十二项里真正有厂商自报产品榜的仍只有
+**LoCoMo-Refined** 和 **Video-MME**；AML 新增的 LongMemEval-S、BEAM 和 PersonaMem-v1 则已有商业
+记忆产品在公开统一 harness 下的结果。两类数字必须分表，因为 AML 官方固定套件、AML 离线复跑和
+数据集原生论文协议是三种不同测法。
 
 | Benchmark | 官方指标 | 学术 SOTA | 工业 SOTA | MindBridge 需越过的线 |
 | --- | --- | --- | --- | --- |
@@ -21,7 +24,7 @@ MindBridge 的超越策略在两条赛道上完全不同：
 | Video-MME-v2 | 组内非线性 Rating | Gemini-3-Pro 49.4（含字幕） | 无（榜由作者收邮件维护） | 先站上榜，Rating > 39.1 才进前三 |
 | EgoLifeQA | 四选一 Accuracy | EgoGraph 45.8 | 无 | > 45.8（公开集 = A1_JAKE 500 题） |
 | EgoTempo | 开放式 LLM-judge Acc | GPT-4o 42.0（人类 63.2） | 无 | > 42.0，目标逼近 63.2 |
-| M3-Bench | Accuracy（GPT-4o judge） | NS-Mem 34.7 robot / 53.6 web | M3-Agent 30.7 / 48.9（字节 Seed） | > 34.7 robot、> 53.6 web |
+| M3-Bench | Accuracy（GPT-4o judge） | NS-Mem 34.7 robot / 53.6 web | 无（M3-Agent 虽来自字节 Seed，仍是论文实验） | > 34.7 robot、> 53.6 web |
 | MemLens | LLM-judge Acc | Qwen3.5-122B 58.68（直读） | 无 | agent 赛道 > 32.82，真赢要 > 63.59 |
 | MM-Lifelong | Acc + Ref@300 | ReMA 18.62 / 18.82 / 16.75 | 无 | > 18.8，Ref@300 > 16.4 |
 | SuperMemory-VQA | QA-Acc / Ans-F1 | Gemini-3-Flash+Video-RAG 61.0 | 无（OSU × Meta Reality Labs 合作构建） | QA-Acc > 61.0 且 Ans-F1 > 83.9 |
@@ -29,7 +32,24 @@ MindBridge 的超越策略在两条赛道上完全不同：
 | ATM-Bench | QS + Recall@10（三类题分别精确匹配 / Jaccard / LLM-judge） | MemPalace 56.8 main / MemoryOS 13.7 hard（Memexa 68.0 / 47.9 换了 judge） | 无 | 先与 SGM 列同口径，再设线 |
 | Mem-Gallery | F1 + 五级 LLM-judge | MuRAG 0.6966 F1 / 0.8229 judge | 无 | 先与官方 backbone 同口径，再设线 |
 
-最后两行的"需越过的线"是口径而不是数字，这是刻意的：3.10 / 3.11 两张表各自绑死在
+AML 带来的五个新增数据集，其数据集原生协议或公开统一 harness 的当前线是。下表“工业 / 产品”列
+同时容纳厂商自报和第三方复跑，逐行都标口径；它不是前一张表“工业榜”定义的放宽版：
+
+| Benchmark | 可比口径 | 学术 / 模型 SOTA | 工业 / 产品 SOTA | MindBridge 需越过的线 |
+| --- | --- | --- | --- | --- |
+| LongMemEval-S | cleaned 500 题，官方分类 judge Acc | Chronos High 95.60 | Supermemory 95.00（原生自报）；Hindsight 94.60（AMB） | 原生协议 > 95.60；AMB > 94.60 |
+| BEAM | 100K / 500K / 1M / 10M，nugget 平均分（0–1） | LIGHT 0.358 / 0.359 / 0.336 / 0.266 | Hindsight 0.8618 / 0.8009 / 0.7913 / 0.6408（AMB，前三档 RAG、10M single-query） | 四档同 mode、同 harness 全部上报 |
+| CL-Bench | 1,899 任务，rubric solve rate | GPT-5.1 High 23.7 | 无公开产品全量分数 | 官方全量 > 23.7 |
+| PersonaMem-v1 | MCQ exact Acc，必须标 32K / 128K / 1M | MemCoE 57.06 / 47.24（32K / 128K） | Hindsight 86.59（AMB 32K） | AMB 32K > 86.59；1M 先建公开基线 |
+| PersonaMem-v2 | MCQ exact + 开放式 judge Acc | agentic Qwen3-4B 55.2 / 60.7 | MemOS 40.58（第三方统一 harness，MCQ） | 官方双指标 > 55.2 / 60.7 |
+
+AML 自己还是另一张榜。2026-08-26 的 `public_suite_v3` / `official-benchmark-pipelines-v3`
+[官方快照](https://agentmemories.ai/)中，工业榜第一是 **MemoraX 58.02**，学术榜第一是
+**InvMem 45.06**。公开榜只给套件总分与能力类别分，不给逐数据集分；因此 58.02 只能是 AML 套件的
+超越线，不能写成 LongMemEval、BEAM 或 PersonaMem 的 SOTA。
+
+原生十二项总表中 ATM-Bench / Mem-Gallery 两行的"需越过的线"是口径而不是数字，这是刻意的：
+3.10 / 3.11 两张表各自绑死在
 `Qwen3-VL-8B-Instruct-FP8` + `gpt-5-mini` 和 `Qwen2.5-VL-7B` 一套固定口径上，而 MindBridge 走的是
 自己的写路径和自己的答题模型，从没跑过同一套。在对齐口径之前填一个"> X"，等于先替读者认定两边
 数字可比——那恰好是 3.10 / 3.11 正文明确否认的事。这两项 MindBridge 都还没有已发布的分数。
@@ -56,7 +76,7 @@ MindBridge 的超越策略在两条赛道上完全不同：
 
 ## 2. 评测口径警告
 
-在报任何分数之前，这四条必须先落到 runner 里，否则数字无法被外部采信。
+在报任何分数之前，这五条必须先落到 runner 里，否则数字无法被外部采信。
 
 **原始 LoCoMo 的答案键和 judge 都不可用，这正是换成 LoCoMo-Refined 的原因。** 一份公开审计发现
 1,540 题里有 99 题（6.4%）答案键错误，且官方 gpt-4o-mini judge 会接受最多 63% 的"故意写错"答案
@@ -71,13 +91,18 @@ MindBridge 的超越策略在两条赛道上完全不同：
 现在唯一有意义的统一口径是 LoCoMo-Refined 自带的 `Qwen/Qwen3-14B` + refined prompt。
 （历史参考：[Continua 归一化重跑](https://blog.continua.ai/p/the-locomo-fair-fight)、[Dakera 对照表](https://dakera.ai/benchmark/)）
 
-**Video-MME v1 已经饱和。** 官方 leaderboard 最后一次更新是 2025-09-28，前沿模型在含字幕设定下已
-到 90.4；作者自己发布的 Video-MME-v2 用组内非线性打分把 Gemini-3-Pro 打到 49.4（人类 90.7），
-明确指出 v1 的逐题准确率高估了真实能力。MindBridge 报 Video-MME 时应报 **long 子集 + 无字幕 +
-记忆赛道**，而不是总分。
+**Video-MME v1 已经饱和。** 官方学术 leaderboard 最后一次更新是 2025-09-28；另一个 BenchLM
+工业快照里的前沿模型在含字幕设定下已到 90.4。作者自己发布的 Video-MME-v2 用组内非线性打分把
+Gemini-3-Pro 打到 49.4（人类 90.7），明确指出 v1 的逐题准确率高估了真实能力。MindBridge 报
+Video-MME 时应报 **long 子集 + 无字幕 + 记忆赛道**，而不是总分。
 
 **EgoTempo 存在开放式与选择题两套口径。** 官方是开放式生成 + Gemini-1.5-Pro judge（GPT-4o
 42.0，人类 63.2）；TGPO 那条 45.2 是把题目改造成选择题后的结果，两者不可混报。
+
+**AML 离线 harness 不是 AML 官方榜。** 官方提交只允许参赛者实现 Add / Search，固定数据、`top_k`、
+answer model、prompt 和 judge，且 Add / Search 必须使用 `gpt-4o-mini`；MindBridge 离线 harness
+改用公开 upstream split 和本地配置的 answer / judge，只适合比较两个 MindBridge 版本。AML 公开榜的
+58.02 / 45.06、AMB 的逐数据集结果、以及本地 `mindbridge-bench aml` 分数，三者不得互相替代。
 
 ## 3. 逐 Benchmark 详表
 
@@ -124,8 +149,8 @@ MindBridge 的超越策略在两条赛道上完全不同：
 | 2 | Gemini 1.5 Pro | 75.0 | 81.3 | 77.4 |
 | 3 | AdaReTaKe（哈工大 × 华为） | 73.5 | 79.6 | 76.4 |
 
-记忆赛道（VideoMME-long，取自 M3-Agent 论文）：M3-Agent 61.8 > Gemini-GPT4o-Hybrid 56.5 >
-Gemini-Agent 55.1。
+记忆赛道（VideoMME-long，取自 [M3-Agent 论文](https://arxiv.org/abs/2508.09736)）：M3-Agent
+61.8 > Gemini-GPT4o-Hybrid 56.5 > Gemini-Agent 55.1。
 
 **MindBridge 目标**：不参与"整段视频塞进上下文"的总分竞赛。先在 long 子集的记忆赛道超过 61.8，
 再论证在无字幕设定下摄取一次、多次问答的成本优势。饱和度参见
@@ -145,17 +170,19 @@ Gemini-Agent 55.1。
 | 3 | Qwen3.5-397B-A17B-Think (512) | 39.1 | 55.9 | 70% |
 | 4 | MiMo-v2-Omni | 38.6 | 56.1 | 69% |
 
-**Rating / Acc 这一列才是这个 benchmark 的产物**：它衡量"同一组相关问题能不能一起答对"。
+**Rating / Acc 不是官方 leaderboard 指标**，而是本文用官方发布的 Rating 与 Avg Acc 派生的诊断比值：
+它帮助观察"同一组相关问题能不能一起答对"，正式排名和 MindBridge 目标仍只看 Non-Lin Rating。
 Gemini-3-Pro 约 75%，InternVL3-5-241B-A28B-Instruct 约 56%，LLaVA-Video-7B 只有约 40%——逐题准确率
 接近的两个系统，组内稳定性可以差一倍。这正是 v1 饱和到 90.4 却和真实体验脱节的原因。
 
-**对 MindBridge 的意义**：这是十二个 benchmark 里唯一直接惩罚"部分检索"的口径。已有的端到端评测发现
+**对 MindBridge 的意义**：这是原生多模态 runner 里唯一直接惩罚"部分检索"的口径。已有的端到端评测发现
 部分检索在聚合题上比不检索更差，而 v1 的逐题准确率看不出这件事——组内非线性打分会把它变成明确的扣分。
 
 **MindBridge 目标**：先在无字幕设定下产出一份完整的 800 组 Rating（哪怕很低），确认写入路径能覆盖
 800 段视频；再对着 `second_head` 雷达定位薄弱轴。不要只报 `accuracy.overall`——那正是 v2 想淘汰的数字。
 
-**成本提醒**：媒体 97.8 GiB / 40 个 zip，压缩包和解压后各占一份，规划磁盘时按两倍算。
+**成本提醒**：[官方数据仓库](https://huggingface.co/datasets/MME-Benchmarks/Video-MME-v2)的媒体为
+97.8 GiB / 40 个 zip，压缩包和解压后各占一份，规划磁盘时按两倍算。
 
 ### 3.3 EgoLifeQA — 一周第一人称生活记忆
 
@@ -176,7 +203,8 @@ RelationMap 35.2 最低——关系推理是公认短板。
 
 **MindBridge 目标**：平均 > 45.8，并把 RelationMap 单项拉过 35.2（身份原型 + 图镜像正对着这一项）。
 
-> 口径核实（2026-08-17）：`lmms-lab/EgoLife` 的 32,817 个文件里只有一个 EgoLifeQA 标注文件
+> 口径核实（2026-08-17）：[`lmms-lab/EgoLife`](https://huggingface.co/datasets/lmms-lab/EgoLife)
+> 的 32,817 个文件里只有一个 EgoLifeQA 标注文件
 > `EgoLifeQA_A1_JAKE.json`，含 **500 题**，分布为 EventRecall 126、EntityLog 125、
 > RelationMap 125、TaskMaster 63、HabitInsight 61。论文所说的"500 public QA pairs"就是这一个
 > 文件，另外五名参与者的题目未公开发布。因此 MindBridge 现有的单文件跑法**已经是可比全集**，
@@ -230,7 +258,8 @@ NS-Mem 分项（robot）：MD 36.2、MH 31.5、CM 33.8、HU 45.7、GK 26.4。Gen
 
 ### 3.6 MemLens — 多模态长上下文记忆
 
-789 题 / 五种记忆能力（信息抽取、多会话推理、时序推理、知识更新、拒答），四档上下文
+[官方论文](https://arxiv.org/abs/2605.14906)发布 789 题 / 五种记忆能力（信息抽取、多会话推理、
+时序推理、知识更新、拒答），四档上下文
 32K–256K；记忆 agent 在固定的 195 题 canonical 子集上评测。judge 为
 Qwen3-VL-235B-A22B-Instruct（GPT-5.4-mini 复判 κ=0.93）。
 
@@ -274,7 +303,7 @@ caption），但结论仍然成立：**现有记忆管线相对直读丢失了�
 | 2 | GPT-5 | 14.87 / 0.44 | 15.00 / 0.92 | 15.25 / 0.53 |
 | 3 | Qwen3-VL-235B | 14.33 / 0.06 | 15.63 / 0.80 | 12.44 / 0.79 |
 
-人类：Month 80.4、Week 95.6、Day 99.2。这是十二个 Benchmark 里人机差距最大的一个。
+人类：Month 80.4、Week 95.6、Day 99.2。这是已接入 Benchmark 里人机差距最大的一个。
 
 工业榜：无。
 
@@ -335,7 +364,7 @@ Video-RAG 全面优于 EgoButler。论文指出：83.9 的可答性判别配上 
 
 工业榜：无。
 
-**MindBridge 目标**：> 39.6，同时成为第一个超过通用 MLLM 的 agentic 记忆系统。这是十二项里"记忆
+**MindBridge 目标**：> 39.6，同时成为第一个超过通用 MLLM 的 agentic 记忆系统。这是原生多模态项里"记忆
 系统 vs 大模型"叙事最干净的一项：题目本身要求跨周回溯，而榜单显示现有记忆框架反而更差。
 
 ### 3.10 ATM-Bench — 长期个性化指代记忆问答
@@ -357,10 +386,12 @@ Video-RAG 全面优于 EgoButler。论文指出：83.9 的可答性判别配上 
 | HippoRAG2 | 42.9 | 66.4 | 9.4 | 31.9 |
 | SimpleMem | 27.3 | 23.3 | 3.2 | 7.0 |
 
-通用编程 agent 在 31 题的 hard split 上反而更高——GPT-5.6 Sol（medium）58.8%、Claude Opus 5
-（xhigh）58.4%；同一 split 的 SGM Oracle 上限是 60.5（MiniMax-M3）。这两处对比都不能与上表直接
-并列：Memexa 一行用 DeepSeek-V4-flash 当 judge，不是表头统一的 gpt-5-mini；通用编程 agent 与专门
-的记忆系统也是两种不同的测法，不是同一维度的名次。
+[官方实时榜](https://atmbench.github.io/leaderboard.html)上的通用编程 agent 在 31 题 hard split
+反而更高——GPT-5.6 Sol（medium）58.8%、Claude Opus 5（xhigh）58.4%；同一 split 的 SGM Oracle
+上限是 [60.5（MiniMax-M3）](https://github.com/JingbiaoMei/ATM-Bench#-oracle-and-niah-results)；
+同模型另有 **Raw Oracle 61.8**，不是这里引用的 SGM 赛道。这两处对比都不能与上表直接并列：
+Memexa 一行用 DeepSeek-V4-flash 当 judge，不是表头统一的 gpt-5-mini；通用编程 agent 与专门的记忆
+系统也是两种不同的测法，不是同一维度的名次。
 
 表中数字对应官方 leaderboard 的 **SGM**（schema-guided memory，把结构化图文摘要交给答题模型）
 赛道，不是 **Raw**（把原始图像直接放进答题模型上下文）赛道——两条赛道官方分别发布，本文只转载
@@ -404,6 +435,138 @@ ATM-Bench 上没有已发布的分数。
 问题经 `recall` 取证据后再作答），不是把对话原文或图片直接塞进答题模型的上下文。引用本表数字作
 对照时必须同时点名 MindBridge 一侧实际使用的答题模型与 judge，否则两个数字不可比；MindBridge
 目前在 Mem-Gallery 上没有已发布的分数。
+
+### 3.12 Agent Memory Leaderboard — 固定套件总榜
+
+AML 不是第十八个数据集，而是包住多项文本 benchmark 的提交协议。参赛者只实现 Add / Search，平台
+固定数据、`top_k`、answer model、prompt 和 judge；工业榜与学术榜分开。2026-08-26 的
+`public_suite_v3` / `official-benchmark-pipelines-v3` 官方榜前三是：
+
+| 赛道 | 第 1 | 第 2 | 第 3 |
+| --- | --- | --- | --- |
+| [Industry](https://agentmemories.ai/leaderboard?track=industry) | MemoraX 58.02 | MemOS 45.89 | NTES-MEMORY-SMART 44.21 |
+| [Academic](https://agentmemories.ai/leaderboard?track=academic) | InvMem 45.06 | Refind 44.97 | ActiveMemoryIndex 44.84 |
+
+这张榜当前只公开 overall 与能力类别分，`subdataset_scores` 为空，所以不能从 MemoraX 的 58.02 推导
+它在 BEAM、CL-Bench 或 PersonaMem 上分别拿了多少。官方还要求 Add / Search 使用
+`gpt-4o-mini`；MindBridge 离线 harness 允许换模型，只能做版本回归。
+
+**MindBridge 目标**：先用离线六项找退化，再提交官方完整套件。只有官方 industry / academic
+submission 超过 58.02 / 45.06，才能声明越过相应 AML SOTA；离线均分无论多高都不能替代。
+
+### 3.13 LongMemEval-S — 长期交互记忆
+
+[官方数据](https://github.com/xiaowu0162/LongMemEval)的 cleaned S split 有 500 题，平均约 40 个会话、
+115K tokens，覆盖单会话用户 / 助手 / 偏好、多会话、知识更新和时序推理六类，并含 30 道应当拒答的
+题。原生主指标是按题型路由 prompt 的 LLM-judge Accuracy。
+
+**下面三种协议不能纵向排名。** Chronos 是原生分类 judge，Supermemory 是厂商自定 harness，
+Hindsight 是 AMB 统一 harness；表格把它们并列只是为了给每条赛道各自设线，不表示 95.60 > 95.00 >
+94.60 是一次受控实验的名次。
+
+| 系统 | 类型与配置 | Accuracy |
+| --- | --- | --- |
+| [Chronos High](https://arxiv.org/html/2603.16862) | 双日历 + agentic retrieval；Claude Opus 4.6 | **95.60** |
+| [Supermemory](https://supermemory.ai/research/longmembench/) | 厂商原生 harness；GPT-4o | 95.00 |
+| [Hindsight](https://agentmemorybenchmark.ai/) | AMB 统一 harness 当前公开结果 | 94.60 |
+| Chronos Low | 同一架构；GPT-4o | 92.60 |
+
+Chronos 当前最值得复用的不是换了更强 actor，而是结构：原始 turn calendar 保留完整语境，event
+calendar 只结构化带日期范围的事件；查询时先生成题型相关检索指引，再组合 dense retrieval、rerank、
+精确 grep 和多轮工具调用。其 95.60 仍比同论文的 GPT-4o 配置 92.60 高 3 点，所以架构收益与 backbone
+收益必须分别报告。
+
+另一个学术方向是 [TMEM](https://arxiv.org/html/2606.04536v1)：把提炼出的 QA 对在测试时写进 LoRA
+fast weights，而不只写向量库。它在 LongMemEval-S 报的是 token F1 / EM（Qwen3-8B 为 41.87 /
+25.42），不是官方 judge Accuracy，不能拿来与 95.60 排名；但它证明了"参数记忆 + 外部证据"是独立于
+RAG / 摘要的第三条路线。
+
+**MindBridge 目标**：cleaned 500 题、官方分类 judge 下 > 95.60；若走 AMB，则在同一 AMB commit、
+同一生成 / judge 配置下 > 94.60。`longmemeval_oracle` 只含 gold sessions，不得用于 SOTA 声明。
+
+### 3.14 BEAM — 10M-token 多能力记忆
+
+[BEAM 论文](https://arxiv.org/html/2510.27246v2)发布 100 段合成对话、2,000 道 probing questions，
+跨 100K / 500K / 1M / 10M 四档和十种记忆能力；分数是答案覆盖原子 reference nuggets 的平均值，
+不是 binary Accuracy。
+
+论文同口径下，LIGHT（episodic retrieval + working memory + scratchpad）的最佳四档为：
+
+| 100K | 500K | 1M | 10M |
+| --- | --- | --- | --- |
+| 0.358 | 0.359 | 0.336 | 0.266 |
+
+当前公开产品统一复跑里，[AMB](https://github.com/vectorize-io/agent-memory-benchmark) 的 Hindsight
+结果显著更高（与论文统一写成 0–1）：100K 0.8618、500K 0.8009、1M 0.7913、10M 0.6408。
+前三档是 AMB `rag` mode，10M 只有 `single-query` 结果；它们不能拼成一条"同配置四档曲线"。模型、
+answer prompt 和 judge 也不同，因此这些数字只能在 AMB 内与同 mode 的其他 provider 比，不能解释成
+相对 BEAM 论文提升了 0.5。
+
+**MindBridge 目标**：先在同为 `single-query` 的 10M 超过 0.6408，再用同一 commit、mode 和 top-k
+把四档全部跑完并报告衰减。Hindsight 当前跨 mode 的 0.2210 差值不是可比阈值；缺任何一档都不报
+overall。
+
+### 3.15 CL-Bench — 从上下文学习新规则
+
+[官方论文](https://arxiv.org/html/2602.03587v1)含 500 个专家编写 context、1,899 个任务和 31,607 条
+rubric，要求模型学习预训练中不存在的新领域知识、规则、流程和实验规律。官方对每题跑三次，用
+GPT-5.1 verifier 判断全部 rubric 是否满足；当前全量 SOTA 是 **GPT-5.1 High 23.7% solve rate**。
+
+记忆框架目前没有越过模型线。[TMEM](https://arxiv.org/html/2606.04536v1) 在完整 1,899 题上以
+Qwen3-8B 得到 5.16%，同 backbone 的 no-memory 是 4.90%；论文主表的 33.91% 来自为小模型筛出的
+289 题子集，并改用 Qwen3-Max judge。33.91 高于 23.7 只是子集更容易，不能称为 CL-Bench SOTA。
+
+工业榜：没有公开产品在官方 1,899 题协议下的完整分数。
+
+**MindBridge 目标**：完整 1,899 题、官方 rubric 和 verifier 下 > 23.7。AML 离线 pipeline 的本地
+judge 分数只能用于回归；必须额外披露 `oversized_unsliced_question_count`，避免把没切开的 reference
+document 连同问题一起送进 answer model，绕过检索。
+
+### 3.16 PersonaMem-v1 — 演化偏好记忆
+
+[PersonaMem-v1](https://github.com/bowen-upenn/PersonaMem)用 32K / 128K / 1M 三档历史考偏好更新，
+四选一 exact Accuracy，不依赖 LLM judge。当前受控学术实验的记忆框架最高线来自
+[MemCoE](https://aclanthology.org/2026.acl-long.2084/)：
+
+| 方法（Qwen2.5-7B） | 32K | 128K |
+| --- | --- | --- |
+| MemCoE | **57.06** | **47.24** |
+| MemAgent | 53.58 | 43.59 |
+| LightMem | 50.72 | 39.93 |
+| Mem0 | 48.53 | 39.67 |
+| RAG | 48.67 | 38.90 |
+| Full context | 34.36 | 25.05 |
+
+MemCoE 先从对比反馈中归纳稳定的 memory guideline，确定"如何组织记忆"，再用 guideline-aligned RL
+学习每一轮"具体写什么、删什么、更新什么"。它比一次性固定 schema 更接近 MindBridge 的
+consolidation policy，也说明偏好更新不能只靠相似度检索。
+
+产品线的最高公开统一结果是 [AMB](https://agentmemorybenchmark.ai/) 上 Hindsight 32K 的
+**86.59**，但当前工件只有 589 题的 32K `rag` run，尚无同 harness 的 128K / 1M 完整曲线；不能用
+86.59 替换 MemCoE 的论文表，也不能把它外推到更长档位。
+
+**MindBridge 目标**：AMB 32K 同口径 > 86.59，同时补齐 128K / 1M；原生协议则至少超过 MemCoE 的
+57.06 / 47.24。当前没有可比的 1M SOTA，MindBridge 的第一个完整 1M run 只能叫公开基线，不能写
+“超过 SOTA”。每个分数必须带 context 档位，三档不得求一个无定义的平均数。
+
+### 3.17 PersonaMem-v2 — 隐式 persona 与可遗忘偏好
+
+[PersonaMem-v2 论文](https://arxiv.org/html/2512.06688v1)把偏好扩展到隐式、反刻板、敏感信息、医疗
+背景和 ask-to-forget 等情形。论文的 agentic Qwen3-4B 每 5K tokens 更新一次不超过 2K tokens 的
+人类可读 memory，在 32K 历史上达到 **55.2% MCQ exact Accuracy / 60.7% 开放式 judge Accuracy**；
+同 backbone 的 full-context GRPO 是 53.8 / 56.0，GPT-5-Chat 是 45.6 / 46.2。
+
+工业产品在第三方统一 harness 下仍低于论文 agent。[OmniMemEval](https://github.com/MemTensor/OmniMemEval/blob/main/docs/user_memory/results.md)
+使用同一份 5,000 题公开 `benchmark/text`，固定 `gpt-4.1-mini` answer model 和 rule-matching
+Accuracy 后，MemOS 40.58、Supermemory 39.64、Hindsight 37.98；这是产品横向线，不是论文开放式
+分数。
+
+MindBridge AML loader 使用公开 `benchmark/text` 的 5,000 行 / 200 persona 子集；论文描述的完整语料
+是 1,000 persona、20K+ 偏好和 300+ scenario。前者的离线分数不能冒充后者的完整论文结果。
+
+**MindBridge 目标**：公开子集先在 OmniMemEval 同口径超过 MemOS 40.58；若要声称超过论文 SOTA，
+必须在论文完整 MCQ / open-ended 双协议下同时 > 55.2 / 60.7，并单列 ask-to-forget，证明删除后不会
+从摘要、图边或旧向量中复活。
 
 ## 4. 达成 SOTA 前必须补齐的工程项
 
@@ -451,7 +614,16 @@ sidecar 会重新计算 predictions 的 sha256，与 manifest 里的不一致就
 
 **EgoMemReason 提交 leaderboard。** `egomem_cli` 输出的 `[{example_id, predicted_answer}]` 与官方
 要求的提交格式完全一致，直接上传即可；回收到的准确率用上面的 sidecar 记录。注意官方 2026-07-14 的
-`e406eb1` 做过一次选项字母重排，README 钉的 `7e58150` 是其之后的 head，已包含重排。
+`e406eb1` 做过一次选项字母重排，README 钉的
+[`7e58150`](https://huggingface.co/datasets/Ted412/EgoMemReason/tree/7e581505b9dce0e85193a27ae689ff899d0bc507)
+是其之后的 head，已包含重排。
+
+**AML 官方提交。** 离线六项只做版本回归。要越过 3.12 的线，必须部署同一套生产 Add / Search
+endpoint，按 AML 的 `gpt-4o-mini` 约束提交完整 fixed suite；记录官方 suite / pipeline 版本和赛道，
+不得把本地 answer / judge 的均分上传成官方结果。
+
+**BEAM 与 PersonaMem 长度档位补齐。** BEAM 必须用同一 mode 跑 100K / 500K / 1M / 10M；
+PersonaMem-v1 必须分别跑 32K / 128K / 1M。只跑最短档的 smoke test 不参与 SOTA 对比。
 
 ## 5. 反 reward hacking 约束
 
@@ -467,6 +639,12 @@ sidecar 会重新计算 predictions 的 sha256，与 manifest 里的不一致就
   `unanswered_question_count` 就是用来看这件事的。
 - EgoLifeQA / EgoMemReason 是四选一。**利用选项文本长度或分布先验**属于题面识别，禁止。
 - Video-MME 的字幕设定。**在声称无字幕的设定下偷用字幕轨**，禁止。
+- AML 官方赛道只允许 Add / Search。**按 benchmark 名切换索引、top-k、prompt 或模型**，以及在 Add
+  阶段读取后续问题，都属于数据集专用旁路，禁止。
+- CL-Bench 的 reference document 若没有正确切出，answer model 会直接看见本应经检索获得的知识。
+  `oversized_unsliced_question_count` 必须为 0；非零 run 只能诊断，不能报榜。
+- PersonaMem-v2 的 ask-to-forget 不是普通知识更新。删除后仍从旧摘要、图边、缓存或向量副本召回，
+  即使总体 Accuracy 更高也算协议失败；该类必须单列并保留删除审计证据。
 
 任何一项 SOTA 声明都必须附带：官方数据来源、工件 hash、judge 模型与版本、backbone 模型、上下文
 档位，以及可复现的 manifest（沿用 `benchmarks/manifests/` 的既有格式）。
