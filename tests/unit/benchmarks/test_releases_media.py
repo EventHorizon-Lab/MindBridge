@@ -113,6 +113,38 @@ def test_asking_for_a_media_set_that_does_not_exist_lists_the_ones_that_do(
     assert "m3-web" in message, "the unobtainable sets are keys a producer can legitimately try"
 
 
+def test_the_pin_and_the_narrowing_both_reach_the_hub_client(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every other test here replaces `_download_from_hub`, so none of them can see this.
+
+    A double that accepts an argument and drops it is a fixture lying about the world, and the
+    argument being dropped here would be the pin -- the one property this module exists to hold,
+    since a branch name makes one task name mean different bytes on different days. `MEDIA` being
+    pinned and the pin reaching the Hub client are two halves, and the table test only proves the
+    first. Faked one level deeper for that reason: at `snapshot_download` rather than at the
+    function that calls it, which is the only level where the request itself is observable.
+    """
+    import huggingface_hub
+
+    asked: list[dict[str, object]] = []
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", lambda **kwargs: asked.append(kwargs))
+
+    ensure_media("egolife", root=tmp_path, only=("A1_JAKE/DAY1/*",))
+
+    assert asked == [
+        {
+            "repo_id": "lmms-lab/EgoLife",
+            "repo_type": "dataset",
+            # Compared against the table rather than a copied literal: a second copy of the
+            # revision here would agree with a table that had been changed to a branch.
+            "revision": RELEASES["egolife"].revision,
+            "allow_patterns": ["A1_JAKE/DAY1/*"],
+            "local_dir": str(tmp_path / "egolife"),
+        }
+    ]
+
+
 def test_a_whole_media_set_is_fetched_into_its_release_directory(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
