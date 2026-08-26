@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
+from stub_judge import stub_judge  # noqa: F401 - autouse within this module
 
 from mindbridge.benchmarks.artifacts import (
     load_deployment_snapshot,
@@ -144,6 +145,7 @@ def _arguments(dataset_path: Path, output_path: Path) -> _Arguments:
         limit=None,
         sample_ids=(),
         overwrite=False,
+        predict_only=False,
         quiet=True,
     )
 

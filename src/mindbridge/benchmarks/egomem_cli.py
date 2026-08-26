@@ -27,6 +27,7 @@ from mindbridge.benchmarks.cli_common import (
     media_manifest,
     report,
     report_unit,
+    scoring_snapshot,
     select_by_id,
     write_run_artifacts,
 )
@@ -157,10 +158,14 @@ def _write_artifacts(
         + "\n"
     )
     streams = tuple(prepared.values())
+    # EgoMemReason withholds its answers, which is MMBench's test split upstream: the run emits
+    # what a leaderboard would read and declares `submission` rather than reporting a score.
+    scoring = scoring_snapshot("egomem", arguments)
     manifest = media_manifest(
         EgoMemRunManifest,
         arguments,
         deployment,
+        scoring=scoring,
         runner_version=EGOMEM_RUNNER_VERSION,
         adapter_version=EGOMEM_REASON_ADAPTER_VERSION,
         annotation_sha256=sha256_file(arguments.dataset_path),

@@ -224,6 +224,7 @@ def _arguments() -> CoreArguments:
         request_timeout_seconds=1_800.0,
         limit=None,
         overwrite=False,
+        predict_only=False,
         quiet=True,
     )
 

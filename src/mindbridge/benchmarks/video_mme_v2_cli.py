@@ -31,6 +31,7 @@ from mindbridge.benchmarks.cli_common import (
     report,
     report_unit,
     require_declared_transcripts,
+    scoring_snapshot,
     select_by_id,
     write_run_artifacts,
 )
@@ -160,10 +161,20 @@ def _write_artifacts(
         + "\n"
     )
     segments = tuple(segment for video in prepared for segment in video.segments)
+    metrics = evaluate_video_mme_v2(results)
+    scoring = scoring_snapshot(
+        "video-mme-v2",
+        arguments,
+        metrics={
+            "rating.overall": metrics.rating.overall,
+            "accuracy.overall": metrics.accuracy.overall,
+        },
+    )
     manifest = media_manifest(
         VideoMMEV2RunManifest,
         arguments,
         deployment,
+        scoring=scoring,
         runner_version=VIDEO_MME_V2_RUNNER_VERSION,
         adapter_version=VIDEO_MME_V2_ADAPTER_VERSION,
         annotation_sha256=sha256_file(arguments.dataset_path),
@@ -182,7 +193,7 @@ def _write_artifacts(
         transcript_segment_count=sum(segment.transcript is not None for segment in segments),
         group_types=tuple(dict.fromkeys(group.group_type for group in groups)),
         transcript_source=arguments.transcript_source,
-        metrics=evaluate_video_mme_v2(results),
+        metrics=metrics,
     )
     write_run_artifacts(arguments.output_path, predictions, manifest)
 

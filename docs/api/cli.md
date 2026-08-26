@@ -422,7 +422,12 @@ Runners drive the production REST API. There is no evaluation-only path, which i
 benchmark that bypasses the product measures something the product does not do.
 
 Every runner accepts `--limit N` to run only the first N of its own units, which is what makes a
-smoke run cheap enough to iterate on.
+smoke run cheap enough to iterate on, and `--predict-only` to write predictions without scoring
+them — no judge is contacted and every metric reports `999`, lmms-eval's bypass sentinel.
+
+Seven benchmarks score their own free-text answers by calling a judge model from inside the run,
+which needs `MINDBRIDGE_BENCH_JUDGE_ENDPOINT` set; a judge that cannot be read scores the answer
+`0.0`. See [benchmarking](../benchmarking.md#scoring-and-what-copying-lmms-eval-costs).
 
 `eval` runs one or more runners in one invocation. `--tasks` names entries in a shipped catalog
 and each official release is downloaded at a pinned revision if absent, so the common case needs

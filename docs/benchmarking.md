@@ -294,11 +294,68 @@ not scored: memlens-32k — these are scored outside MindBridge; attach the resu
   mindbridge-bench score --predictions ... --manifest ... ...
 ```
 
-Nothing in that table is measured by the sweep, which is why it can be printed at all. `runner`
-is a number the benchmark's own runner pinned in its manifest — the four whose official protocol
-is exact match score themselves. `official` is a number `mindbridge-bench score` attached after
-an external scorer ran. `not scored` is neither, and says so rather than showing a blank that
-reads like a zero. The summary file itself still carries no scores.
+The column after Metric is lmms-eval's `↑`/`↓`: which direction is good, declared with the
+metric rather than left to the reader. `Source` says who produced the number, and there are four:
+
+| Source | Who | Benchmarks |
+| --- | --- | --- |
+| `runner` | exact option match, computed locally with no network call | EgoLifeQA, SuperMemory-VQA, Video-MME, Video-MME-v2 |
+| `judge` | a judge model, called from inside the run | LoCoMo-Refined, M3-Bench, MEMLENS, ATM-Bench, Mem-Gallery, EgoTempo, MM-Lifelong |
+| `official` | an external scorer, attached afterwards by `mindbridge-bench score` | any run that has been scored |
+| `bypass` | nothing; `--predict-only` was passed | — |
+
+`not scored` is a completed run with none of the four yet, which is EgoMemReason permanently — its
+answers are held out by its leaderboard — and every judged benchmark run under `--predict-only`.
+
+## Scoring, and what copying lmms-eval costs
+
+Which of those four applies is declared per benchmark in `src/mindbridge/benchmarks/scoring.py`,
+the way lmms-eval declares a `metric_list` per task. That table is the whole policy: a runner
+names its benchmark and hands over either the numbers it computed or the answers a judge has to
+read, and never decides who scores it.
+
+**Free-text benchmarks are judged inside the run.** Seven of them pair a natural-language gold
+answer with a natural-language prediction, so correctness is a judgement rather than a
+comparison. lmms-eval makes that call in-framework — MM-Vet calls `gpt-4o-2024-11-20` from inside
+`process_results` — and so does this. Configure it with:
+
+```bash
+export MINDBRIDGE_BENCH_JUDGE_ENDPOINT=https://your-endpoint/v1
+export MINDBRIDGE_BENCH_JUDGE_API_KEY=replace-with-a-runtime-secret
+export MINDBRIDGE_BENCH_JUDGE_MODEL=gpt-4o-2024-11-20
+```
+
+The model defaults to MM-Vet's own so a number here is comparable to one lmms-eval would produce.
+The endpoint has no default: a judged benchmark with none configured refuses to start rather than
+scoring the whole split zero.
+
+**Three consequences, all of them upstream's and all deliberate:**
+
+- **A judge that cannot be read scores the answer `0.0`.** Three attempts, each with a stricter
+  instruction, then the floor. So an upstream outage reports as a low benchmark score, not as a
+  failed run. The one thing added here is the tally beside it: `scoring.judge_failure_count`
+  records how many answers were floored, and the results table prints it under the table as *a
+  floor, not a measurement*. Without that count a run whose judge was down is afterwards
+  indistinguishable from a run that answered badly.
+- **The judge is MindBridge's choice, not the benchmark's.** Two runs under different judges are
+  not comparable to each other, and neither is comparable to a leaderboard. `judge_model` is
+  recorded in every manifest for exactly this reason. An official number still comes only from
+  the benchmark's own scorer through `mindbridge-bench score`, which lands as `official`.
+- **`--predict-only` reports `999`.** lmms-eval's `bypass_agg` returns that literal, in the same
+  column as a real accuracy, and so does this. It is a sentinel, not a score; the table says so
+  underneath. Use it to write predictions with no judge configured at all:
+
+```bash
+uv run --extra benchmarks mindbridge-bench eval --tasks released-text --predict-only
+```
+
+One departure worth naming: MM-Vet escalates `temperature += 0.5` between attempts, and
+`GenerateRequest` here carries no temperature — generation is deliberately deterministic. Retrying
+an identical request would return an identical unparseable answer, so the retry escalates the
+*instruction* instead. Same patience, same floor.
+
+The sweep summary file itself still carries no scores; every number above lives in the manifest or
+the score sidecar of the task that produced it.
 
 Most benchmarks here are in that third state until their official scorer has run, which happens
 after the sweep has exited. `--report` renders the same table again from a directory an earlier

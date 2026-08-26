@@ -529,6 +529,9 @@ text, or media.
 | --- | --- | --- |
 | `MINDBRIDGE_AML_API_KEY` | unset | Enables `POST /aml/add` and `/aml/search`. Leave off in production. |
 | `MINDBRIDGE_AML_TENANT_PREFIX` | `bench_aml` | Tenant prefix the AML harness generates under. |
+| `MINDBRIDGE_BENCH_JUDGE_ENDPOINT` | unset | OpenAI-compatible endpoint the judge is called on. Required by the seven benchmarks whose answers are free text; `--predict-only` runs them without one. |
+| `MINDBRIDGE_BENCH_JUDGE_API_KEY` | unset | Bearer token for that endpoint. Environment-only, so a recorded invocation never carries it. |
+| `MINDBRIDGE_BENCH_JUDGE_MODEL` | `gpt-4o-2024-11-20` | Judge model, defaulting to the one lmms-eval's MM-Vet task uses. Recorded in every manifest it scores: two runs under different judges are not comparable. |
 
 ## Development and test
 

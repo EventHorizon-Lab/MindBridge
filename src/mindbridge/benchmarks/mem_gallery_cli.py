@@ -26,6 +26,7 @@ from mindbridge.benchmarks.cli_common import (
     media_manifest,
     report,
     report_unit,
+    scoring_snapshot,
     select_by_id,
     write_run_artifacts,
 )
@@ -43,6 +44,7 @@ from mindbridge.benchmarks.mem_gallery_runner import (
     validate_mem_gallery_images,
 )
 from mindbridge.benchmarks.prompts import MEM_GALLERY_QUERY_PROMPT
+from mindbridge.benchmarks.scoring import JudgedAnswer
 from mindbridge.contracts import Identifier, NonEmptyString, Sha256Hex
 from mindbridge.file_integrity import sha256_file
 from mindbridge.prompts import PERCEIVE_EVENTS_PROMPT
@@ -167,10 +169,18 @@ def _write_artifacts(
     ingest_failure_count = sum(
         {result.topic: result.mindbridge_ingest_failure_count for result in results}.values()
     )
+    scoring = scoring_snapshot(
+        "mem-gallery",
+        arguments,
+        answers=tuple(
+            JudgedAnswer(row.question, row.reference_answer, row.prediction) for row in results
+        ),
+    )
     manifest = media_manifest(
         MemGalleryRunManifest,
         arguments,
         deployment,
+        scoring=scoring,
         runner_version=MEM_GALLERY_RUNNER_VERSION,
         adapter_version=MEM_GALLERY_ADAPTER_VERSION,
         annotation_sha256=mem_gallery_dialog_digest(arguments.dataset_path),

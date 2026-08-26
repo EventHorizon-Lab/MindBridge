@@ -642,6 +642,12 @@ def _build_parser(prog: str | None) -> argparse.ArgumentParser:
         help="replace existing predictions, manifests, and this sweep's summary",
     )
     parser.add_argument(
+        "--predict-only",
+        action="store_true",
+        help="write every task's predictions without scoring them; no judge is contacted and "
+        "each metric reports lmms-eval's bypass sentinel",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="print the invocation each task would run, then exit without running any",
@@ -734,6 +740,8 @@ def _shared_arguments(parsed: argparse.Namespace, *, root: Path) -> tuple[str, .
             shared.extend((flag, str(value)))
     if parsed.overwrite:
         shared.append("--overwrite")
+    if parsed.predict_only:
+        shared.append("--predict-only")
     if parsed.quiet:
         shared.append("--quiet")
     return tuple(shared)

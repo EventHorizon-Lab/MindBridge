@@ -25,6 +25,7 @@ from mindbridge.benchmarks.cli_common import (
     media_arguments,
     media_manifest,
     report,
+    scoring_snapshot,
     select_by_id,
     write_run_artifacts,
 )
@@ -139,10 +140,21 @@ def _write_artifacts(
         )
         + "\n"
     )
+    scoring = scoring_snapshot(
+        "supermemory",
+        arguments,
+        metrics={
+            "qa_accuracy": metrics.qa_accuracy,
+            "qa_mean_reciprocal_rank": metrics.qa_mean_reciprocal_rank,
+            "answerability_precision": metrics.answerability_precision,
+            "answerability_recall": metrics.answerability_recall,
+        },
+    )
     manifest = media_manifest(
         SuperMemoryRunManifest,
         arguments,
         deployment,
+        scoring=scoring,
         runner_version=SUPERMEMORY_RUNNER_VERSION,
         adapter_version=SUPERMEMORY_VQA_ADAPTER_VERSION,
         annotation_sha256=sha256_file(arguments.dataset_path),

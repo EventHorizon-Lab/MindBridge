@@ -19,7 +19,7 @@ a newer version still renders, and a manifest's benchmark-specific counts cost n
 from __future__ import annotations
 
 import json
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -27,6 +27,7 @@ from pydantic import BaseModel, ConfigDict
 
 from mindbridge.benchmarks.artifacts import sidecar_manifest_path
 from mindbridge.benchmarks.official_score import score_sidecar_path
+from mindbridge.benchmarks.scoring import BYPASS_VALUE
 
 METRIC_ROW_LIMIT = 12
 """Most metric rows one task contributes before the rest are summarised as a count.
@@ -36,6 +37,9 @@ numbers for a single task -- a terminal summary that long is a file, not a summa
 ordered shallowest first, so what a cap drops is always a breakdown cell and never the headline
 figure the breakdown decomposes.
 """
+
+HIGHER_IS_BETTER_SYMBOLS = {True: "↑", False: "↓"}
+"""lmms-eval's own mapping, for the unnamed column between Metric and Value."""
 
 _UNSCORED = "not scored"
 _ABSENT = "—"
@@ -71,6 +75,12 @@ class _Metric:
     value: float
     source: str
     depth: int
+    direction: str = ""
+    """`↑`, `↓`, or blank -- lmms-eval's `HIGHER_IS_BETTER_SYMBOLS`, for the column beside Metric.
+
+    Blank rather than a guess where the manifest declares nothing: `bypass` points nowhere, and a
+    breakdown cell inherits no direction of its own from the headline it decomposes.
+    """
 
 
 def render(summary_json: str | bytes, *, directory: Path) -> str:
@@ -78,9 +88,9 @@ def render(summary_json: str | bytes, *, directory: Path) -> str:
     summary = _Summary.model_validate_json(summary_json)
     rows = [cell for task in summary.tasks for cell in _task_rows(task, directory=directory)]
     table = _table(
-        ("Task", "Benchmark", "Status", "Wall", "Metric", "Value", "Source"),
+        ("Task", "Benchmark", "Status", "Wall", "Metric", "", "Value", "Source"),
         rows,
-        right=(5,),
+        right=(6,),
     )
     return "\n".join((table, "", *_footer(summary, directory=directory)))
 
@@ -100,22 +110,22 @@ def _task_rows(task: _Outcome, *, directory: Path) -> tuple[tuple[str, ...], ...
     identity = (task.name, task.benchmark, task.status, _duration(task.duration_seconds))
     if not shown:
         empty = _UNSCORED if task.status == "completed" else _ABSENT
-        return ((*identity, _ABSENT, _ABSENT, empty),)
+        return ((*identity, _ABSENT, "", _ABSENT, empty),)
     rows: list[tuple[str, ...]] = [(*identity, *_metric_cells(shown[0]))]
     rows += [("", "", "", "", *_metric_cells(metric)) for metric in shown[1:]]
     dropped = len(metrics) - len(shown)
     if dropped:
-        rows.append(("", "", "", "", f"+{dropped} more, in the artifacts", _ABSENT, _ABSENT))
+        rows.append(("", "", "", "", f"+{dropped} more, in the artifacts", "", _ABSENT, _ABSENT))
     return tuple(rows)
 
 
-def _metric_cells(metric: _Metric) -> tuple[str, str, str]:
-    """Render one metric's three cells, labelled by its own path inside the artifact.
+def _metric_cells(metric: _Metric) -> tuple[str, str, str, str]:
+    """Render one metric's cells, labelled by its own path inside the artifact.
 
     The dotted path rather than the leaf name alone, so `by_duration.long.accuracy` cannot be
     mistaken for the overall figure and can be found again in the manifest by searching for it.
     """
-    return (metric.label, _value(metric.value), metric.source)
+    return (metric.label, metric.direction, _value(metric.value), metric.source)
 
 
 def _task_metrics(task: _Outcome, *, directory: Path) -> tuple[_Metric, ...]:
@@ -123,9 +133,26 @@ def _task_metrics(task: _Outcome, *, directory: Path) -> tuple[_Metric, ...]:
     predictions = _resolve(task, directory=directory)
     if predictions is None:
         return ()
-    runner = _sorted(_manifest_metrics(sidecar_manifest_path(predictions)))
+    run = _sorted(_manifest_metrics(sidecar_manifest_path(predictions)))
     official = _sorted(_score_metrics(score_sidecar_path(predictions)))
-    return (*runner, *official)
+    return _deduplicated((*run, *official))
+
+
+def _deduplicated(metrics: Sequence[_Metric]) -> tuple[_Metric, ...]:
+    """Keep one row per label, the first one, which is the declared headline.
+
+    A self-scoring benchmark records its headline twice: once flat under `scoring.metrics`, where
+    it carries the direction it points in, and once inside the typed breakdown its runner pins.
+    Reading both is what makes the breakdown visible; printing `accuracy` twice would make the
+    table look like the run disagreed with itself.
+    """
+    seen: set[str] = set()
+    kept: list[_Metric] = []
+    for metric in metrics:
+        if metric.label not in seen:
+            seen.add(metric.label)
+            kept.append(metric)
+    return tuple(kept)
 
 
 def _sorted(metrics: Iterable[_Metric]) -> tuple[_Metric, ...]:
@@ -159,11 +186,26 @@ def _resolve(task: _Outcome, *, directory: Path) -> Path | None:
 
 
 def _manifest_metrics(path: Path) -> Iterator[_Metric]:
-    """Read the metrics a runner scored itself, if this benchmark's runner scores itself."""
+    """Read what the run itself recorded, and who in the run recorded it.
+
+    Two places, in this order. `scoring.metrics` is the declared `metric_list` -- the headline
+    figure plus the direction it points in -- and `metrics` is the typed breakdown a self-scoring
+    runner pins beside it. The declared one comes first so its direction survives deduplication.
+
+    `scoring.mode` names the source, so a judge's number is never labelled as an exact match: the
+    judge model was MindBridge's choice and a reader has to be able to see that from the table.
+    """
     document = _load(path)
-    metrics = document.get("metrics") if document else None
-    if isinstance(metrics, dict):
-        yield from _flatten(metrics, source="runner")
+    if not document:
+        return
+    scoring = document.get("scoring")
+    scoring = scoring if isinstance(scoring, dict) else {}
+    source = str(scoring.get("mode") or "runner")
+    declared = scoring.get("higher_is_better")
+    directions = declared if isinstance(declared, dict) else {}
+    for block in (scoring.get("metrics"), document.get("metrics")):
+        if isinstance(block, dict):
+            yield from _flatten(block, source=source, directions=directions)
 
 
 def _score_metrics(path: Path) -> Iterator[_Metric]:
@@ -171,7 +213,7 @@ def _score_metrics(path: Path) -> Iterator[_Metric]:
     document = _load(path)
     metrics = document.get("metrics") if document else None
     if isinstance(metrics, dict):
-        yield from _flatten(metrics, source="official")
+        yield from _flatten(metrics, source="official", directions={})
 
 
 def _load(path: Path) -> dict[str, object] | None:
@@ -193,6 +235,7 @@ def _flatten(
     value: object,
     *,
     source: str,
+    directions: Mapping[str, object],
     prefix: str = "",
     depth: int = 0,
 ) -> Iterator[_Metric]:
@@ -212,7 +255,13 @@ def _flatten(
     if isinstance(value, (int, float)):
         indent = max(depth - 1, 0)
         if not (_is_count(prefix) and indent >= 2):
-            yield _Metric(label=prefix, value=float(value), source=source, depth=indent)
+            yield _Metric(
+                label=prefix,
+                value=float(value),
+                source=source,
+                depth=indent,
+                direction=_direction(prefix, directions),
+            )
         return
     entries: Iterable[tuple[str, object]] = ()
     if isinstance(value, dict):
@@ -220,7 +269,25 @@ def _flatten(
     elif isinstance(value, list):
         entries = ((_name(item, index), item) for index, item in enumerate(value))
     for key, item in entries:
-        yield from _flatten(item, source=source, prefix=_join(prefix, key), depth=depth + 1)
+        yield from _flatten(
+            item,
+            source=source,
+            directions=directions,
+            prefix=_join(prefix, key),
+            depth=depth + 1,
+        )
+
+
+def _direction(label: str, directions: Mapping[str, object]) -> str:
+    """Which way this metric points, when the run declared it, and blank when it did not.
+
+    Counts are never given an arrow even where a declaration would supply one: `question_count`
+    going up says the run covered more of the release, not that it did better.
+    """
+    declared = directions.get(label)
+    if declared is None or _is_count(label):
+        return ""
+    return HIGHER_IS_BETTER_SYMBOLS.get(bool(declared), "")
 
 
 def _name(item: object, index: int) -> str:
@@ -256,16 +323,52 @@ def _footer(summary: _Summary, *, directory: Path) -> tuple[str, ...]:
         for task in summary.tasks
         if task.status == "completed" and not _task_metrics(task, directory=directory)
     )
+    lines = [headline, *_caveats(summary, directory=directory)]
     if not unscored:
-        return (headline,)
+        return tuple(lines)
     names = ", ".join(task.name for task in unscored)
     example = _resolve(unscored[0], directory=directory) or Path(unscored[0].output_path)
-    return (
-        headline,
-        f"{_UNSCORED}: {names} — these are scored outside MindBridge; attach the result with",
-        f"  mindbridge-bench score --predictions {example} --manifest "
-        f"{sidecar_manifest_path(example)} ...",
+    lines.append(
+        f"{_UNSCORED}: {names} — these are scored outside MindBridge; attach the result with"
     )
+    lines.append(
+        f"  mindbridge-bench score --predictions {example} --manifest "
+        f"{sidecar_manifest_path(example)} ..."
+    )
+    return tuple(lines)
+
+
+def _caveats(summary: _Summary, *, directory: Path) -> tuple[str, ...]:
+    """Say which numbers above are floors or sentinels rather than measurements.
+
+    Both cases are invisible in the value itself, which is the cost of copying lmms-eval here. A
+    judge that could not be read scores the answer 0.0, so a run with an unreachable judge reports
+    a low score rather than an error; `bypass` reports 999, which is not a score at all. Neither is
+    recoverable from the column, so it is said in words underneath.
+    """
+    lines: list[str] = []
+    for task in summary.tasks:
+        scoring = _scoring(task, directory=directory)
+        failures = scoring.get("judge_failure_count")
+        if isinstance(failures, int) and failures > 0:
+            lines.append(
+                f"{task.name}: {failures} answers scored 0.0 because the judge could not be "
+                f"read — a floor, not a measurement (judge {scoring.get('judge_model')})"
+            )
+        if scoring.get("mode") == "bypass":
+            lines.append(
+                f"{task.name}: --predict-only, so {int(BYPASS_VALUE)} is lmms-eval's bypass "
+                "sentinel and this run has not been evaluated"
+            )
+    return tuple(lines)
+
+
+def _scoring(task: _Outcome, *, directory: Path) -> dict[str, object]:
+    """Read one task's `scoring` block, or an empty one where the manifest has none."""
+    predictions = _resolve(task, directory=directory)
+    document = _load(sidecar_manifest_path(predictions)) if predictions else None
+    scoring = document.get("scoring") if document else None
+    return scoring if isinstance(scoring, dict) else {}
 
 
 def _duration(seconds: float) -> str:

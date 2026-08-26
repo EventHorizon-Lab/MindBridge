@@ -30,6 +30,7 @@ from mindbridge.benchmarks.cli_common import (
     predictions_jsonl,
     report,
     report_unit,
+    scoring_snapshot,
     select_by_id,
     write_run_artifacts,
 )
@@ -43,6 +44,7 @@ from mindbridge.benchmarks.locomo_refined_runner import (
     LoCoMoRefinedPrediction,
     run_locomo_refined_conversation,
 )
+from mindbridge.benchmarks.scoring import JudgedAnswer
 from mindbridge.contracts import Identifier, NonEmptyString, Sha256Hex
 from mindbridge.file_integrity import sha256_file
 
@@ -131,10 +133,27 @@ def _write_artifacts(
         question.category for conversation in conversations for question in conversation.questions
     )
     rows = predictions_jsonl(predictions)
+    # A refined question may accept several phrasings, and handing the judge only the first
+    # would mark a correct answer wrong. MM-Vet spells the same thing `<OR>` inside its ground
+    # truth; the vendored pipeline's one-answer limit is its own and does not apply here.
+    asked = tuple(question for conversation in conversations for question in conversation.questions)
+    scoring = scoring_snapshot(
+        "locomo-refined",
+        arguments,
+        answers=tuple(
+            JudgedAnswer(
+                question.question,
+                " OR ".join(question.reference_answers),
+                prediction.predicted_answer,
+            )
+            for question, prediction in zip(asked, predictions, strict=True)
+        ),
+    )
     manifest = core_manifest(
         LoCoMoRefinedRunManifest,
         arguments,
         deployment,
+        scoring=scoring,
         runner_version=LOCOMO_REFINED_RUNNER_VERSION,
         adapter_version=LOCOMO_REFINED_ADAPTER_VERSION,
         predictions=rows,

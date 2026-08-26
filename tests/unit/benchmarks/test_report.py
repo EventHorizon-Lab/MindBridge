@@ -271,3 +271,123 @@ def _rows(table: str) -> list[str]:
     lines = table.splitlines()
     body = lines[lines.index(next(line for line in lines if line.startswith("─"))) + 1 :]
     return list(body[: body.index("")])
+
+
+def test_a_declared_metric_carries_the_arrow_saying_which_way_it_points(tmp_path: Path) -> None:
+    """lmms-eval prints `↑`/`↓` beside the metric; a bare number does not say what good means."""
+    _task(
+        tmp_path,
+        "video-mme",
+        manifest={
+            "scoring": {
+                "mode": "runner",
+                "metrics": {"accuracy": 0.61, "error_rate": 0.04},
+                "higher_is_better": {"accuracy": True, "error_rate": False},
+            }
+        },
+    )
+
+    rows = _rows(render(_summary(tmp_path, "video-mme"), directory=tmp_path))
+
+    assert [row for row in rows if "accuracy" in row and "↑" in row]
+    assert [row for row in rows if "error_rate" in row and "↓" in row]
+
+
+def test_a_count_gets_no_arrow_even_where_a_direction_was_declared(tmp_path: Path) -> None:
+    """`question_count` rising says the run covered more of the release, not that it did better."""
+    _task(
+        tmp_path,
+        "video-mme",
+        manifest={
+            "scoring": {
+                "mode": "runner",
+                "metrics": {"question_count": 900},
+                "higher_is_better": {"question_count": True},
+            }
+        },
+    )
+
+    rows = _rows(render(_summary(tmp_path, "video-mme"), directory=tmp_path))
+
+    assert "question_count" in rows[0]
+    assert "↑" not in rows[0]
+
+
+def test_a_judged_number_is_not_labelled_as_an_exact_match(tmp_path: Path) -> None:
+    """The judge model was MindBridge's choice, which a reader has to see from the table."""
+    _task(
+        tmp_path,
+        "locomo-refined",
+        manifest={
+            "scoring": {
+                "mode": "judge",
+                "metrics": {"llm_judge": 0.58},
+                "judge_model": "gpt-4o-2024-11-20",
+            }
+        },
+    )
+
+    rows = _rows(render(_summary(tmp_path, "locomo-refined"), directory=tmp_path))
+
+    assert rows[0].endswith("judge")
+    assert "runner" not in rows[0]
+
+
+def test_a_judge_that_could_not_be_read_is_named_under_the_table(tmp_path: Path) -> None:
+    """The floored answers are 0.0 in the mean, and nothing in the column can show that."""
+    _task(
+        tmp_path,
+        "locomo-refined",
+        manifest={
+            "scoring": {
+                "mode": "judge",
+                "metrics": {"llm_judge": 0.31},
+                "judge_model": "gpt-4o-2024-11-20",
+                "judge_failure_count": 47,
+            }
+        },
+    )
+
+    table = render(_summary(tmp_path, "locomo-refined"), directory=tmp_path)
+
+    assert "47 answers scored 0.0" in table
+    assert "a floor, not a measurement" in table
+    assert "gpt-4o-2024-11-20" in table
+
+
+def test_the_bypass_sentinel_is_called_a_sentinel_rather_than_left_to_look_like_a_score(
+    tmp_path: Path,
+) -> None:
+    """999 sits in the same column as an accuracy, which is exactly why it needs saying."""
+    _task(
+        tmp_path,
+        "memlens-32k",
+        manifest={"scoring": {"mode": "bypass", "metrics": {"bypass": 999.0}}},
+    )
+
+    table = render(_summary(tmp_path, "memlens-32k"), directory=tmp_path)
+
+    assert "999" in table
+    assert "--predict-only" in table
+    assert "has not been evaluated" in table
+
+
+def test_a_headline_declared_and_also_pinned_in_the_breakdown_is_printed_once(
+    tmp_path: Path,
+) -> None:
+    """Two rows for one number would read as the run disagreeing with itself."""
+    _task(
+        tmp_path,
+        "video-mme",
+        manifest={
+            "scoring": {"mode": "runner", "metrics": {"accuracy": 0.61}},
+            "metrics": {"accuracy": 0.61, "by_duration": {"long": {"accuracy": 0.49}}},
+        },
+    )
+
+    rows = _rows(render(_summary(tmp_path, "video-mme"), directory=tmp_path))
+
+    # The first row carries the task identity before its metric, so match on the cell instead.
+    headline = [row for row in rows if "accuracy" in row and "by_duration" not in row]
+    assert len(headline) == 1, headline
+    assert [row for row in rows if "by_duration.long.accuracy" in row]

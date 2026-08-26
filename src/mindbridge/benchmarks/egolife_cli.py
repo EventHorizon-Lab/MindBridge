@@ -25,6 +25,7 @@ from mindbridge.benchmarks.cli_common import (
     media_arguments,
     media_manifest,
     report,
+    scoring_snapshot,
     select_by_id,
     write_run_artifacts,
 )
@@ -138,10 +139,12 @@ def _write_artifacts(
         )
         + "\n"
     )
+    scoring = scoring_snapshot("egolife", arguments, metrics={"accuracy": metrics.accuracy})
     manifest = media_manifest(
         EgoLifeRunManifest,
         arguments,
         deployment,
+        scoring=scoring,
         runner_version=EGOLIFE_RUNNER_VERSION,
         adapter_version=EGOLIFE_QA_ADAPTER_VERSION,
         annotation_sha256=sha256_file(arguments.dataset_path),

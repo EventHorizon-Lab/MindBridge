@@ -61,7 +61,12 @@ The capabilities present on `master` today:
   prints it again for an earlier run, which is how a benchmark scored afterwards reports without
   running twice. `--limit N` scopes any runner to its first N units for a smoke run, the media
   ingest deadlines reach every task whose runner accepts them, and prepared-media manifests are
-  produced for Mem-Gallery and M3-Bench rather than assembled by hand.
+  produced for Mem-Gallery and M3-Bench rather than assembled by hand. Scoring follows
+  lmms-eval's contract: each benchmark declares who scores it, the four whose protocol is exact
+  match score themselves, the seven whose answers are free text are judged by a model called from
+  inside the run, and `--predict-only` reports the `999` bypass sentinel instead. A judge that
+  cannot be read scores the answer `0.0` — upstream's behaviour — with the count of floored
+  answers recorded beside the number and printed under the table.
 - Python 3.10 through 3.14, with the whole quality gate — format, lint, types, tests — run on
   every one of them.
 

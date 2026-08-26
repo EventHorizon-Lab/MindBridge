@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
+from stub_judge import stub_judge  # noqa: F401 - autouse within this module
 
 from mindbridge.benchmarks.artifacts import load_deployment_snapshot
 from mindbridge.benchmarks.m3_bench import M3BenchQuestion, M3BenchVideo
@@ -128,6 +129,7 @@ def _arguments(dataset_path: Path, prepared_path: Path, output_path: Path) -> _A
         processing_timeout_seconds=1_800.0,
         video_ids=(),
         overwrite=False,
+        predict_only=False,
         quiet=True,
     )
 

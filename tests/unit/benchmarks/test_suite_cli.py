@@ -814,3 +814,27 @@ def test_each_task_is_announced_with_a_rule_so_its_output_can_be_found_in_the_st
     assert len(banners) == 2
     assert banners[0].startswith("[1/2] first · stub · sweep-01-first ")
     assert banners[1].startswith("[2/2] second · stub · sweep-01-second ")
+
+
+def test_predict_only_reaches_every_task_so_a_sweep_needs_no_judge(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Seven runners now contact a judge to score themselves; this is the flag that says not to."""
+    invocations = _stub_benchmark(monkeypatch, writes=True)
+    suite = _suite_file(tmp_path, _task("first"), _task("second"))
+
+    assert _sweep(suite, tmp_path, "--predict-only") == 0
+
+    assert all("--predict-only" in argv for argv in invocations)
+
+
+def test_a_sweep_that_did_not_ask_for_it_does_not_forward_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    invocations = _stub_benchmark(monkeypatch, writes=True)
+
+    assert _sweep(_suite_file(tmp_path, _task("only")), tmp_path) == 0
+
+    assert "--predict-only" not in invocations[0]

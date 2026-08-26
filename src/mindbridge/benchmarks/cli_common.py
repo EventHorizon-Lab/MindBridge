@@ -12,7 +12,7 @@ import argparse
 import hashlib
 import os
 import sys
-from collections.abc import AsyncIterator, Callable, Iterable, Sequence
+from collections.abc import AsyncIterator, Callable, Iterable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -29,6 +29,15 @@ from mindbridge.benchmarks.artifacts import (
 )
 from mindbridge.benchmarks.cli import parser as build_parser
 from mindbridge.benchmarks.runtime import PreparedVideo
+from mindbridge.benchmarks.scoring import (
+    SCORING,
+    JudgedAnswer,
+    ScoringMode,
+    build_judge,
+    bypass_metrics,
+    configured_judge_model,
+    judge_answers,
+)
 from mindbridge.contracts import ContractModel, Identifier, NonEmptyString, Sha256Hex
 from mindbridge.models import EmbedTask
 from mindbridge.prompts import ANSWER_FROM_EVIDENCE_PROMPT
@@ -65,6 +74,7 @@ class CoreArguments:
     limit: int | None
     overwrite: bool
     quiet: bool
+    predict_only: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,6 +145,12 @@ def core_parser(
     )
     parser.add_argument(
         "--overwrite", action="store_true", help="replace existing predictions and manifest"
+    )
+    parser.add_argument(
+        "--predict-only",
+        action="store_true",
+        help="write predictions without scoring them; every metric reports lmms-eval's bypass "
+        "sentinel instead, and no judge is contacted",
     )
     parser.add_argument(
         "-q",
@@ -255,7 +271,30 @@ def _core_values(parsed: argparse.Namespace) -> dict[str, object]:
         "limit": parsed.limit,
         "overwrite": parsed.overwrite,
         "quiet": parsed.quiet,
+        "predict_only": parsed.predict_only,
     }
+
+
+class ScoringSnapshot(ContractModel):
+    """Who scored this run and what they found -- lmms-eval's `metric_list`, recorded per run.
+
+    Every run carries one, including a run nobody scored: `mode` says which of the four ways
+    produced the numbers, so a reader never has to infer it from whether a field is present.
+    `higher_is_better` travels with them for the same reason lmms-eval's `metric_list` declares
+    it -- a bare number does not say which direction is good.
+    """
+
+    mode: ScoringMode
+    metrics: dict[str, float] = Field(default_factory=dict)
+    higher_is_better: dict[str, bool] = Field(default_factory=dict)
+    judge_model: NonEmptyString | None = None
+    judge_failure_count: int = Field(default=0, ge=0)
+    """Answers the judge could not score, floored to 0.0 and counted rather than only logged.
+
+    Upstream logs each one and keeps no tally, so a run whose judge was unreachable is afterwards
+    indistinguishable from a run that answered badly. This is the count that separates them; the
+    0.0 floor itself is unchanged.
+    """
 
 
 class BenchmarkRunManifest(ContractModel):
@@ -267,6 +306,7 @@ class BenchmarkRunManifest(ContractModel):
     """
 
     benchmark: NonEmptyString
+    scoring: ScoringSnapshot
     runner_version: NonEmptyString
     adapter_version: NonEmptyString
     deployment: DeploymentSnapshot
@@ -289,6 +329,50 @@ class MediaBenchmarkRunManifest(BenchmarkRunManifest):
     device_id: Identifier
     poll_interval_seconds: float = Field(gt=0)
     processing_timeout_seconds: float = Field(gt=0)
+
+
+def scoring_snapshot(
+    benchmark: str,
+    arguments: CoreArguments,
+    *,
+    answers: Sequence[JudgedAnswer] = (),
+    metrics: Mapping[str, float] | None = None,
+) -> ScoringSnapshot:
+    """Score this run the way its benchmark declares, and record who did it.
+
+    One entry point for all four modes, so a runner names its benchmark and hands over either the
+    numbers it computed itself or the answers a judge has to read, and never decides the policy.
+    `--predict-only` short-circuits every mode, which is what `override_metric("bypass")` does
+    upstream: no judge is contacted and no declared metric is computed.
+    """
+    declared = SCORING[benchmark]
+    if arguments.predict_only:
+        return ScoringSnapshot(mode="bypass", metrics=bypass_metrics())
+    if declared.mode != "judge":
+        return ScoringSnapshot(
+            mode=declared.mode,
+            metrics=dict(metrics or {}),
+            higher_is_better=declared.higher_is_better(),
+        )
+    report(f"judging {len(answers)} answers with {configured_judge_model()}", quiet=arguments.quiet)
+    outcome = judge_answers(
+        answers,
+        judge=build_judge(request_timeout_seconds=arguments.request_timeout_seconds),
+        concurrency=arguments.request_concurrency,
+    )
+    if outcome.failure_count:
+        report(
+            f"{outcome.failure_count} of {len(answers)} answers scored 0.0 because the judge "
+            "could not be read; that is a floor, not a measurement",
+            quiet=arguments.quiet,
+        )
+    return ScoringSnapshot(
+        mode="judge",
+        metrics={**outcome.metrics, **dict(metrics or {})},
+        higher_is_better=declared.higher_is_better(),
+        judge_model=configured_judge_model(),
+        judge_failure_count=outcome.failure_count,
+    )
 
 
 def predictions_jsonl(results: Sequence[ContractModel]) -> str:
