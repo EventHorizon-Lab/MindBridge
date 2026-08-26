@@ -734,6 +734,11 @@ def test_the_listing_says_which_of_four_things_stands_between_a_task_and_a_run(
     assert lines["video-mme"].endswith("prepare")
     # A manifest no producer writes is named, rather than silently promised.
     assert f"{tmp_path}/hand-made-prepared.json" in lines["hand-made-task"]
+    # And an arm whose producer declines it must not be promised a staging the sweep will skip:
+    # the listing exists to say what a run will do, so it has to agree with what a run does.
+    assert lines["atm-main"].endswith("download, prepare")
+    assert lines["atm-main-sgm"].endswith("download"), "the sgm arm stages nothing"
+    assert not lines["atm-hard-sgm"].endswith("prepare"), "the sgm arm stages nothing"
 
 
 def test_the_catalog_path_needs_no_file_and_derives_where_everything_goes(

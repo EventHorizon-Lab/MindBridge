@@ -274,7 +274,12 @@ def listing(*, root: Path) -> str:
 def _state(task: CatalogTask, *, root: Path) -> str:
     """Say what stands between this task and a run."""
     absent = missing_inputs(task.inputs(root=root))
-    if task.benchmark in PREPARERS:
+    producer = PREPARERS.get(task.benchmark)
+    # `applies` is asked here for the same reason the sweep asks it: a producer is registered per
+    # benchmark, and ATM-Bench's `sgm` arms are the one case where that is coarser than the truth.
+    # Reporting `prepare` for them would promise a staging the sweep then correctly declines --
+    # the listing exists to say what a run will do, so it has to agree with what a run does.
+    if producer is not None and (producer.applies is None or producer.applies(task.arguments)):
         # Its manifest is written per run into the sweep's own output directory, so there is no
         # file here to find or to have gone stale: what it needs is the staging, every time.
         return "prepare" if not absent else "download, prepare"
