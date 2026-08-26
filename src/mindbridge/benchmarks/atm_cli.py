@@ -97,6 +97,7 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
         arguments.question_ids,
         key=lambda question: question.question_id,
         label="selected ATM-Bench question IDs",
+        limit=arguments.limit,
     )
     if not questions:
         raise ValueError("ATM-Bench selection must not be empty")

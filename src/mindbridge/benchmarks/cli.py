@@ -56,9 +56,17 @@ class HelpFormatter(argparse.ArgumentDefaultsHelpFormatter, argparse.RawDescript
     """Keep an epilog's own line breaks while still printing every default worth printing."""
 
     def _get_help_string(self, action: argparse.Action) -> str | None:
-        """Print a default only where one exists to fall back to."""
+        """Print a default only where one exists to fall back to.
+
+        A `store_false` flag is excluded because its stored default describes the flag's
+        *absence*: `--no-download` would otherwise read "fail on an absent official release
+        instead of downloading it first (default: True)", telling an operator that refusing to
+        fetch is what happens by default, which is the opposite of both the behaviour and the
+        help text it is appended to.
+        """
+        inverted = isinstance(action, argparse._StoreFalseAction)
         uninformative = action.default is None or action.default == [] or action.default is False
-        if action.required or uninformative:
+        if action.required or uninformative or inverted:
             return action.help
         return super()._get_help_string(action)
 
@@ -101,6 +109,10 @@ RUNNERS: dict[str, Runner] = {
         extra="benchmarks",
     ),
     "aml": Runner("mindbridge.benchmarks.aml.cli", "Replay one offline AML pipeline"),
+    "suite": Runner(
+        "mindbridge.benchmarks.suite",
+        "Run several benchmarks from one suite file",
+    ),
     "score": Runner(
         "mindbridge.benchmarks.official_score",
         "Record an official scorer's verdict beside a run",

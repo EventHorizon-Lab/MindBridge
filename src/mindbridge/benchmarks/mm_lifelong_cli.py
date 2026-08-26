@@ -77,6 +77,7 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
         arguments.question_indices,
         key=lambda question: question.index,
         label="MM-Lifelong question indices",
+        limit=arguments.limit,
     )
     prepared = load_prepared_mm_lifelong(arguments.prepared_media_path)
     require_writable_output_pair(arguments.output_path, overwrite=arguments.overwrite)

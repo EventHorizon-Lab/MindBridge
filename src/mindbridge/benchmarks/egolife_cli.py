@@ -78,6 +78,7 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
         arguments.question_ids,
         key=lambda question: question.question_id,
         label="EgoLifeQA question IDs",
+        limit=arguments.limit,
     )
     prepared = load_prepared_egolife(arguments.prepared_media_path)
     require_writable_output_pair(arguments.output_path, overwrite=arguments.overwrite)

@@ -82,6 +82,7 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
         arguments.topics,
         key=lambda topic: topic.topic,
         label="selected Mem-Gallery topics",
+        limit=arguments.limit,
     )
     if not topics:
         raise ValueError("Mem-Gallery selection must not be empty")

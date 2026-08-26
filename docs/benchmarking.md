@@ -83,6 +83,196 @@ Long runs are fragile in a specific way: an upstream hiccup mid-stream can escap
 error, and results land only after the whole run completes. Shard by `--run-id` and run the shards
 in parallel so a failure costs one shard rather than the sweep.
 
+## Running several benchmarks in one command
+
+```bash
+export MINDBRIDGE_API_KEY=replace-with-a-runtime-secret
+uv run --extra benchmarks mindbridge-bench suite \
+  --tasks released-text --run-id sweep-001 --limit 2
+```
+
+That runs four benchmarks against one deployment, downloading each official release it does not
+already have. Nothing has to be cloned or written first. `--tasks` names entries in a catalog
+shipped with MindBridge; `--list-tasks` prints every name it accepts and what obtaining it would
+still take:
+
+```bash
+uv run mindbridge-bench suite --list-tasks
+```
+
+```text
+groups (--tasks expands these), inputs resolved against .benchmarks:
+  released-text           locomo-refined, memlens-32k, atm-main-sgm, atm-hard-sgm
+  all                     locomo-refined, m3-robot, m3-web, egolife, ...
+
+tasks:
+  locomo-refined          locomo-refined  ready
+  memlens-32k             memlens         download
+  m3-robot                m3              needs .benchmarks/m3-prepared-robot.json
+  ...
+```
+
+Three states, because they need three different things. `ready` runs now. `download` runs after a
+fetch the sweep performs itself. A named path is one no official release supplies — a
+prepared-media manifest, which is the one thing still to do by hand; see "What cannot be
+downloaded" below.
+
+Task names are comma-separated and the flag repeats, so `--tasks m3-robot,m3-web --tasks egolife`
+is three tasks. A group expands to several, and a task named twice still runs once.
+
+Everything else has a default worth having. Only `--run-id` and the task names do not:
+
+| Flag | Default |
+| --- | --- |
+| `--benchmarks-root` | `.benchmarks`, the layout the download commands above create |
+| `--output-dir` | `<benchmarks-root>/results/<run-id>` |
+| `--api-base-url` | `http://localhost:8000` |
+| `--deployment-config` | `<benchmarks-root>/deployment.json` |
+
+The individual runners still require the URL and the deployment file explicitly. They are single
+measurements; this command is the one you reach for while iterating.
+
+### What the catalog holds
+
+One task per required choice. A runner that forces you to pick — ATM-Bench's `--split`, MEMLENS's
+`--context-window`, M3-Bench's `--subset`, Video-MME's `--transcript-source` — gets one entry per
+value, which is why MEMLENS appears four times and LoCoMo-Refined once. Optional filters are not
+enumerated: a run scoped to Video-MME's `long` band or three Mem-Gallery topics is a task of your
+own, and `--limit` already covers a smoke run.
+
+### How releases are obtained
+
+A sweep downloads every file its tasks read and does not already have, then holds each one to a
+digest this repository committed. Three things about that are deliberate.
+
+**Only the files a task reads.** ATM-Bench's Hub repository is 3.2 GB and Mem-Gallery's is
+530 MB, but a run consumes five JSON files and one directory of them — about 40 MB between them,
+against 302 GB of full releases. The media in those releases is not something a run can use as a
+file anyway. MEMLENS is the exception worth planning disk for: its annotation *is* the corpus, so
+its four context windows are 98 MB, 191 MB, 369 MB and 732 MB, and `--tasks all` fetches about
+1.4 GB rather than 40 MB.
+
+**Pinned.** Each release is fetched at a fixed commit — every one of them, asserted by
+`tests/unit/benchmarks/test_releases.py` rather than left to review, because a branch name makes
+one task name mean different bytes on different days and nothing in the run would say so.
+
+**Verified where a digest names it.** Most annotations have a `source_sha256` in
+[benchmarks/manifests/dataset-adapters-smoke.json](../benchmarks/manifests/dataset-adapters-smoke.json),
+recorded when `mindbridge-bench datasets` last ran. A download whose bytes differ stops the run,
+names both digests, and **deletes the file** — left in place it would be verified once and then
+skipped as already-present by every later sweep. Re-run that smoke and record the new digest
+before measuring against it. The releases the smoke manifest keys by something other than a file
+name have no digest here and rest on the pin alone; `mindbridge-bench datasets` is what checks a
+corpus already on disk.
+
+Downloads are skipped for files already present, so a second sweep fetches nothing.
+`--benchmarks-root` chooses where they land — it defaults to `.benchmarks`, and the layout is the
+same one the manual commands in "Benchmark dataset smoke" below produce, so an existing corpus is
+found as-is. `--no-download` refuses to fetch and fails on an absent release instead — before the first task
+starts, not when its turn comes. An absent prepared-media manifest is still only reported, with
+or without the flag, because refusing the sweep for it would refuse the tasks that are ready.
+
+### Prepared media
+
+Media benchmarks read a prepared-media manifest: a JSON file naming clips already in object
+storage, with their durations and the identity spans over them. A sweep produces that manifest
+itself for the benchmarks below, staging into the deployment's own bucket:
+
+| Benchmark | Produced from | Needs |
+| --- | --- | --- |
+| `mem-gallery` | the release's own images | the bucket |
+| `m3-robot`, `m3-web` | the official videos, cut into 30-second clips | the bucket, the videos |
+
+Two properties are forced rather than chosen, and they are worth knowing before reading a
+manifest.
+
+**A manifest belongs to one run.** A media URI is accepted only under
+`tenants/<tenant_id>/`, and a benchmark tenant is `<tenant-prefix>_<unit>_<run-id>`. The same
+clips staged under another `--run-id` are unreadable, so preparation happens inside the run
+rather than once beside the corpus. `--limit` is what keeps that affordable: it bounds the units
+prepared as well as the units answered.
+
+**The selection is the runner's own.** Each producer parses the task's arguments with the
+runner's parser and selects with the runner's helper, so it cannot prepare a unit the run will
+skip or miss one the run will read.
+
+Clips are cut by the same encoder the product stores evidence with, audio track included, so
+what a benchmark ingests is what the product would have produced. Preparation is skipped when the
+manifest already exists, and a preparation that fails is that task's failure — the sweep reports
+it and runs the remaining tasks.
+
+Bucket credentials are Boto3's own (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`); the bucket and
+endpoint come from the same `[object_storage]` configuration the deployment reads, so a benchmark
+cannot stage into a bucket the deployment will not look in.
+
+### Prepared media that is still manual
+
+`egolife`, `egomem`, `egotempo`, `mm-lifelong`, `supermemory`, `video-mme`, and `video-mme-v2`
+have no producer yet, and `--list-tasks` names the manifest each one wants. Their manifests are
+not the two shapes above:
+
+- EgoLifeQA, EgoMemReason, and MM-Lifelong encode their own clocks — EgoLifeQA's `DAYn` plus
+  `HHMMSSFF` at the release's 20 FPS, with clips crossing a question's time withheld until a
+  later question. That derivation is the work, not the cutting.
+- EgoTempo's videos are Ego4D, which is licensed separately and cannot be fetched on your behalf.
+- Video-MME ships its videos as 20 zip archives totalling 94 GiB, so a single video cannot be
+  obtained without the archive holding it.
+
+M3-Bench's released memory graphs would give a caption-only manifest with no video at all, which
+is the cheaper released-text arm. They are distributed as Python pickles, and unpickling a
+downloaded file executes whatever it contains, so that path stays a deliberate manual step.
+
+### Smoke runs
+
+`--limit N` runs the first N of each benchmark's own units — conversations for LoCoMo-Refined,
+videos for M3-Bench, topics for Mem-Gallery. It is deliberately not a count of questions: what
+one of these runs costs is dominated by ingesting the unit, so limiting the questions inside a
+unit that was ingested anyway saves almost nothing. On LoCoMo-Refined, `--limit 2` is 2 of 10
+conversations and 210 of 1,382 questions. It composes with a benchmark's own ID flags rather
+than competing with them — narrow first, then truncate — and every runner accepts it on its own,
+not only through a sweep.
+
+`--tasks all --limit 1` exercises the whole harness. It is a smoke run, not an evaluation.
+
+### What the sweep owns
+
+**`--output` and `--run-id` are derived per task, and a suite setting either is refused.** The run
+ID is not cosmetic. A tenant is `<tenant-prefix>_<unit-id>_<run-id>`, so two parameterisations of
+one benchmark — MEMLENS at two context windows, ATM-Bench at both splits — share everything but
+the run ID. Without a per-task one the second task would write into the first task's tenants and
+then answer from its memories.
+
+Every tenant a run writes to has to be in the deployment's `MINDBRIDGE_TENANT_API_KEYS_JSON`
+before the API starts, and these run IDs are ones the sweep makes up. `--dry-run` prints the exact
+invocation behind each task, so they are readable before anything runs:
+
+```bash
+uv run mindbridge-bench suite --tasks released-text --run-id sweep-001 --dry-run
+```
+
+`--api-base-url` and `--deployment-config` are forwarded to every task. So are `--limit`,
+`--recall-limit`, `--request-concurrency`, and `--request-timeout-seconds`, but only when given —
+otherwise each runner keeps the default it declares rather than a copy pinned here that goes
+stale. They are placed before a task's own arguments, so a benchmark needing its own recall
+budget sets it in the task. Flags that exist only on some runners — `--prepared-media`,
+`--device-id`, and the media polling deadlines among them — belong in the task, not on the sweep.
+
+### What it records
+
+Tasks run one at a time. Running them concurrently against one deployment would have them
+contending for the same worker and would corrupt every timing the runs report; to use more
+hardware, run separate sweeps with different `--run-id`s against separate deployments.
+
+A task that fails does not stop the sweep, so a benchmark dying four hours in costs its own result
+rather than the others. An interrupt does stop it, and still writes the summary. `--output-dir`
+receives one `suite-summary.json` recording, per task, the derived run ID, the output path, the
+argv behind it, the exit code, how long it took, and whether it produced predictions at all — a
+task that exits 0 without writing them is recorded as failed rather than as a result nobody can
+open. The sweep exits 1 if any task failed and 130 if it was interrupted.
+
+The summary carries no scores. Official scorers run outside MindBridge, and each verdict is
+attached to the run that earned it with `mindbridge-bench score`.
+
 ---
 
 ## Agent Memory Leaderboard offline harness
@@ -250,8 +440,12 @@ curl -s "$MINDBRIDGE_GENERATOR_ENDPOINT/chat/completions" -H "Authorization: Bea
 
 LoCoMo-Refined, M3-Bench, Video-MME, Video-MME-v2, EgoLife (EgoLifeQA), EgoTempo, EgoMemReason,
 MEMLENS, MM-Lifelong, SuperMemory-VQA, ATM-Bench, and Mem-Gallery are consumed through thin
-adapters over pinned official files. Use Git for code releases and the Hugging Face CLI for Hub
-datasets; MindBridge does not ship another downloader:
+adapters over pinned official files.
+
+`mindbridge-bench suite --tasks ...` fetches each of these itself, at the same revisions, so the
+commands below are for populating a corpus without running a sweep — a mirror, an offline machine,
+or the whole of a release rather than the files one task reads. They also stay the reference for
+what `--benchmarks-root` is expected to contain.
 
 ```bash
 git clone https://github.com/mem-eval-suite/LoCoMo_refined.git .benchmarks/locomo-refined

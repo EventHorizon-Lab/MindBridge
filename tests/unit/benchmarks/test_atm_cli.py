@@ -469,6 +469,7 @@ def test_manifest_media_item_count_matches_the_arm_that_actually_ran(tmp_path: P
             recall_limit=20,
             request_concurrency=4,
             request_timeout_seconds=1_800.0,
+            limit=None,
             overwrite=False,
             quiet=True,
             device_id="atm_archive",

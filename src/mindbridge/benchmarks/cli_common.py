@@ -62,6 +62,7 @@ class CoreArguments:
     recall_limit: int
     request_concurrency: int
     request_timeout_seconds: float
+    limit: int | None
     overwrite: bool
     quiet: bool
 
@@ -125,6 +126,12 @@ def core_parser(
     )
     parser.add_argument(
         "--request-timeout-seconds", type=float, default=1_800.0, help="deadline for one request"
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        help="run only the first N of this benchmark's own units, for a smoke run; "
+        "applied after any explicit selection",
     )
     parser.add_argument(
         "--overwrite", action="store_true", help="replace existing predictions and manifest"
@@ -245,6 +252,7 @@ def _core_values(parsed: argparse.Namespace) -> dict[str, object]:
         "recall_limit": parsed.recall_limit,
         "request_concurrency": parsed.request_concurrency,
         "request_timeout_seconds": parsed.request_timeout_seconds,
+        "limit": parsed.limit,
         "overwrite": parsed.overwrite,
         "quiet": parsed.quiet,
     }
@@ -398,25 +406,51 @@ def select_by_id(
     *,
     key: Callable[[_Item], _Key],
     label: str,
+    limit: int | None = None,
 ) -> tuple[_Item, ...]:
     """Narrow an official release to the requested units, in the order the release lists them.
 
     `label` names the unit the way the benchmark's own operator does — "EgoMemReason example IDs",
     "MM-Lifelong question indices" — because that text is what someone reads when a run refuses to
     start. Empty `requested` means the whole release, which is how every runner spells "no subset".
+
+    `limit` truncates whatever the selection produced, so `--limit` composes with a benchmark's own
+    ID flags rather than competing with them. It is deliberately a count of this benchmark's own
+    units and not of questions: what a run of one of these costs is dominated by ingesting the
+    unit, so limiting questions inside a unit that was ingested anyway saves almost nothing.
     """
     wanted = tuple(requested)
-    if not wanted:
+    selected = items
+    if wanted:
+        if len(set(wanted)) != len(wanted):
+            raise ValueError(f"{label} must not contain duplicates")
+        unique = set(wanted)
+        selected = tuple(item for item in items if key(item) in unique)
+        missing = unique - {key(item) for item in selected}
+        if missing:
+            formatted = ", ".join(str(item) for item in sorted(missing))
+            raise ValueError(f"unknown {label}: {formatted}")
+    return limit_units(selected, limit, label=label)
+
+
+def limit_units(
+    items: tuple[_Item, ...],
+    limit: int | None,
+    *,
+    label: str,
+) -> tuple[_Item, ...]:
+    """Keep the first `limit` units of a selection, refusing a limit that would select nothing.
+
+    Separate from `select_by_id` because two benchmarks filter again after selecting by ID —
+    Video-MME by duration band, Video-MME-v2 by group type — and a limit applied before that
+    filter is a limit on the wrong set: `--limit 2 --duration long` would truncate to the first
+    two videos of any band and then quite possibly keep none of them.
+    """
+    if limit is None:
         return items
-    if len(set(wanted)) != len(wanted):
-        raise ValueError(f"{label} must not contain duplicates")
-    unique = set(wanted)
-    selected = tuple(item for item in items if key(item) in unique)
-    missing = unique - {key(item) for item in selected}
-    if missing:
-        formatted = ", ".join(str(item) for item in sorted(missing))
-        raise ValueError(f"unknown {label}: {formatted}")
-    return selected
+    if limit < 1:
+        raise ValueError(f"--limit must be a positive count of {label}")
+    return items[:limit]
 
 
 def index_prepared(
