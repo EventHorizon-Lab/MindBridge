@@ -30,9 +30,10 @@ uv run --extra server mindbridge mcp
 }
 ```
 
-The stdio process connects to the database directly and has no configured tenant list, so it
-does **not** run the embedding-space startup probe the REST API runs. Pointing it at a
-deployment mid-re-embedding will not be caught for you.
+The stdio process does not require the REST API's tenant key map for authentication. If
+`MINDBRIDGE_TENANT_API_KEYS_JSON` is configured, however, the shared runtime uses its tenant IDs
+for the same embedding-space startup probe as REST. Without the map there are no tenants to
+probe, so an incompatible embedding space is not caught at startup.
 
 Deploy remote MCP only behind authenticated process or gateway isolation. The shipped command
 exposes stdio deliberately rather than an unauthenticated HTTP listener.

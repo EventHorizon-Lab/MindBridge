@@ -414,8 +414,10 @@ uv run --extra server mindbridge mcp
 Deploy remote MCP only behind authenticated process or gateway isolation. The shipped command
 exposes stdio deliberately rather than an unauthenticated HTTP listener.
 
-The stdio process has no configured tenant list, so it cannot run the embedding-space startup
-probe. It will not catch a mid-re-embedding deployment for you.
+The stdio process does not require the REST API's tenant key map for authentication. Configure
+`MINDBRIDGE_TENANT_API_KEYS_JSON` when it should probe those tenants' embedding spaces at
+startup; without the map, it has no tenants to probe and will not catch an incompatible
+mid-re-embedding deployment.
 
 ## Security posture
 

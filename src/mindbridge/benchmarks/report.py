@@ -1,12 +1,10 @@
 """Render one sweep's results as a table, out of the artifacts that sweep already wrote.
 
 Nothing here measures anything, which is the whole reason it can print numbers at all. Every
-figure in the table was written by a runner into its own manifest -- the four benchmarks whose
-official protocol is exact-match, so their runner can score themselves -- or by
-`mindbridge-bench score` into a sidecar after an external scorer ran. The `source` column says
-which of the two a row came from, so a number read off this table can be traced to the artifact
-that claims it. A task with neither is printed as `not scored`, which is the state most
-benchmarks here are in until their official scorer has been run against the predictions.
+figure in the table was written into a run manifest by a runner or judge, or into a score sidecar
+by `mindbridge-bench score` after an external scorer ran. The `source` column preserves that
+provenance; a `bypass` value is identified as an unevaluated sentinel below the table. A task with
+no recorded metric is printed as `not scored` until its external result is attached.
 
 The table is built from serialized JSON rather than from the summary object the sweep holds in
 memory, so the sweep's own final table and `--report` on the same directory afterwards are the

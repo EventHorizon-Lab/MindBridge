@@ -1,4 +1,4 @@
-"""Scheduled evidence-verified Episode, Claim, and Summary consolidation."""
+"""Evidence-verified Episode, Claim, Summary, and entity consolidation."""
 
 from __future__ import annotations
 
@@ -143,7 +143,7 @@ def sweep_options(argv: Sequence[str]) -> argparse.Namespace:
     """Parse one sweep's flags, so a scheduled run cannot drift from the documented command.
 
     The beat schedule reaches a sweep through this rather than through a second set of
-    defaults: `--page-size` and its fifteen siblings are already documented with values, and a
+    defaults: `--page-size` and its companion flags are already documented with values, and a
     parallel copy of them would be the thing that quietly stops matching.
     """
     return _parser().parse_args(argv)

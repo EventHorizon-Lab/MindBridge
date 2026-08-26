@@ -94,7 +94,7 @@ class Command:
 COMMANDS: dict[tuple[str, ...], Command] = {
     ("consolidate",): Command(
         "mindbridge.consolidation_cli",
-        "Consolidate one tenant's Episodes, Claims, and Summaries",
+        "Consolidate one tenant's Episodes, Claims, Summaries, and entities",
         extra="server",
     ),
     ("jobs",): Command(

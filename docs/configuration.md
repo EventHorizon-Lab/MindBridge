@@ -346,7 +346,9 @@ stored ID, and the first write to touch a row an older recipe named re-keys it i
 first pass after that migration pays for one re-encode per object it has not seen under its new
 name, and every pass after it does not.
 
-The stdio MCP process has no configured tenant list and therefore cannot run this probe.
+The stdio MCP process does not require the tenant key map for authentication. When
+`MINDBRIDGE_TENANT_API_KEYS_JSON` is present, the shared runtime uses its tenant IDs for this
+probe; when it is absent, MCP has no tenants to probe at startup.
 
 ## Authentication
 

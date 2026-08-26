@@ -1,8 +1,10 @@
 # 端侧人物一致性感知与 FunASR 收敛决策
 
+> 文档性质：截至 2026-08-26 的实现与决策快照；研究链接提供选型背景，不代表持续更新的 SOTA 排名
+>
 > 状态：Phase 3 可执行基线，目标端侧平台真值验收前不得宣称人物一致性 SOTA
 >
-> 更新日期：2026-08-17
+> 更新日期：2026-08-26
 >
 > 范围：原生视听流、人脸、VAD/ASR/标点/diarization、声纹、face↔voice 和端侧遗忘
 
@@ -25,10 +27,11 @@ ASR/turn 融合器、波形临时文件和独立 ERes2NetV2 重推理，开发�
 pipeline 和设备校准阈值。NeMo/Sortformer 不再是安装依赖；只有带真值的相同硬件 bake-off 证明其
 DER/false-link 收益足以覆盖额外依赖和编排成本时，才作为质量挑战者重新评估。
 
-这条链路的选型标准里包含**全平台可用**：MindBridge 的 Edge 不限定 Jetson，同一套身份感知必须能跑在
+这条链路的产品目标包含**全平台可用**：MindBridge 的 Edge 不限定 Jetson，同一套身份感知最终需要覆盖
 地瓜 RDK、Rockchip RK、Intel/OpenVINO x86、通用 ARM 主机，以及把 4090/5090/A100 直接当作“端”的
-GPU 主机上。InsightFace 与 FunASR 之所以是默认，正因为它们都有 ONNX/GGUF 可移植路径；平台差异只
-允许出现在 runtime 与编译工件上，bbox 归一化、embedding 维度、身份门禁和遗忘语义在所有平台完全
+GPU 主机。当前交付基线是 InsightFace ONNX Runtime 与 FunASR `AutoModel`，`edge` extra 只声明标准
+x86_64 和 Apple Silicon 环境；RDK、RK 与其他 ARM/NPU 仍是待验收目标，不是已支持平台。平台差异只
+允许出现在 runtime 与编译工件上，bbox 归一化、embedding 维度、身份门禁和遗忘语义在所有平台保持
 一致。任何只能在单一厂商 SDK 上成立的做法都不进默认路径。
 
 这不表示 FunASR 已经包办所有实时语义。在线 Paraformer 的 partial transcript 是 provisional；
@@ -159,9 +162,10 @@ FunASR 当前结果没有可解释的逐 turn diarization probability，因此�
 
 ### 5.3 llama.cpp 多端路径
 
-[llama.cpp](https://github.com/ggml-org/llama.cpp) 及其 FunASR/GGUF 生态让 ASR/VAD 在 x86、ARM、
-Apple 和全部非 CUDA 设备上共享一个轻运行时，是**全平台 Edge 目标下最重要的候选**：Torch + CUDA
-在地瓜 RDK、RK 和部分 x86 NPU 平台上要么装不上，要么代价过高，而 GGUF 权重可以直接落地。
+[llama.cpp](https://github.com/ggml-org/llama.cpp) 与社区 FunASR/GGUF 转换路径可能让 ASR/VAD 在
+x86、ARM、Apple 和非 CUDA 设备上共享更轻的运行时，是**全平台 Edge 目标下的重要候选**。当前代码
+尚未集成这条路径；它用于评估 Torch/FunASR 基线难以部署的 RDK、RK 和部分 x86 NPU 平台，而不是
+已交付能力。
 
 但它现在仍不是默认路径，也不被包装成抽象 provider：没有上游证据证明同一运行时完整返回
 MindBridge 所需的 punctuation、稳定 diarization 和 CAM++ centroid。先在低算力 NPU 与纯 CPU 平台上
