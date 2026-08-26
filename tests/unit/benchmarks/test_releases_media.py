@@ -165,12 +165,18 @@ def test_a_volume_held_in_a_subdirectory_unpacks_into_that_subdirectory(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The other release packages itself the other way round, and this is the only case that can
-    tell "beside the volume" apart from "at the release root".
+    tell "beside the volume" apart from "into the release directory".
 
     Video-MME-v2 keeps its 40 volumes in `videos/` and names their entries `<nnn>.mp4` with no
-    directory of their own, where Video-MME does the reverse. Unpacking both into the release
-    root would leave 800 videos loose beside `test.parquet` instead of under `videos/`, which
-    every Video-MME-v2 test would still pass because that release's own volumes sit at the root.
+    directory of their own, where Video-MME does the reverse. Extracting into the release
+    directory instead would leave 800 videos loose beside `test.parquet` rather than under
+    `videos/` -- and every *Video-MME* test would still pass, because that release keeps its
+    volumes at the release root, where the two destinations are the same directory.
+
+    Measured rather than argued: an implementation extracting into the release directory fails
+    this test and only this test. Note that moving the base up one level unconditionally is a
+    different, cruder bug that several tests catch, so catching *that* would not have shown the
+    exclusivity this docstring claims.
     """
     _fake_download(monkeypatch, {"videos/001.zip": {"001.mp4": b"frames"}})
 
