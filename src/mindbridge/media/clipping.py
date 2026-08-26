@@ -272,25 +272,28 @@ def scaled_size(width: int, height: int, max_pixels: int) -> tuple[int, int]:
 
 def _cut_audio(source: bytes, request: ClipRequest) -> tuple[MediaClip, ...]:
     soundfile = cast(Any, _import("soundfile"))
-    samples, sample_rate = soundfile.read(io.BytesIO(source), dtype="float32", always_2d=True)
     clips = []
-    for window_start, window_end in audio_windows(request.start_ms, request.end_ms):
-        first = min(len(samples), int(window_start * sample_rate / 1_000))
-        last = min(len(samples), int(window_end * sample_rate / 1_000))
-        if last <= first:
-            last = min(len(samples), first + int(MINIMUM_CLIP_MS * sample_rate / 1_000))
-        if last <= first:
-            continue
-        buffer = io.BytesIO()
-        soundfile.write(buffer, samples[first:last], sample_rate, format="WAV", subtype="PCM_16")
-        clips.append(
-            MediaClip(
-                content=buffer.getvalue(),
-                suffix=".wav",
-                start_ms=window_start,
-                end_ms=window_end,
+    with soundfile.SoundFile(io.BytesIO(source)) as audio:
+        sample_rate = audio.samplerate
+        for window_start, window_end in audio_windows(request.start_ms, request.end_ms):
+            first = min(len(audio), int(window_start * sample_rate / 1_000))
+            last = min(len(audio), int(window_end * sample_rate / 1_000))
+            if last <= first:
+                last = min(len(audio), first + int(MINIMUM_CLIP_MS * sample_rate / 1_000))
+            if last <= first:
+                continue
+            audio.seek(first)
+            samples = audio.read(last - first, dtype="float32", always_2d=True)
+            buffer = io.BytesIO()
+            soundfile.write(buffer, samples, sample_rate, format="WAV", subtype="PCM_16")
+            clips.append(
+                MediaClip(
+                    content=buffer.getvalue(),
+                    suffix=".wav",
+                    start_ms=window_start,
+                    end_ms=window_end,
+                )
             )
-        )
     if not clips:
         raise DomainInvariantError("audio span selected no samples from its source")
     return tuple(clips)
@@ -398,7 +401,7 @@ def _cut_video(source: bytes, request: ClipRequest) -> MediaClip:
 
 
 def _sample_video_frames(source: bytes, request: ClipRequest) -> list[Any]:
-    """Keep one frame per requested interval inside the span, decoding once."""
+    """Keep one resized frame per requested interval inside the span, decoding once."""
     av = cast(Any, _import("av"))
     interval_seconds = 1.0 / request.frames_per_second
     start_seconds, end_seconds = request.start_ms / 1_000, request.end_ms / 1_000
@@ -434,12 +437,20 @@ def _sample_video_frames(source: bytes, request: ClipRequest) -> list[Any]:
             if frame.time > end_seconds:
                 # A zero-width span still deserves the frame it points at.
                 if not frames:
-                    frames.append(frame)
+                    frames.append(_resized_video_frame(frame, request.max_pixels))
                 break
             if frame.time + 1e-9 >= next_sample_seconds:
-                frames.append(frame)
+                frames.append(_resized_video_frame(frame, request.max_pixels))
                 next_sample_seconds += interval_seconds
     return frames
+
+
+def _resized_video_frame(frame: Any, max_pixels: int) -> Any:  # noqa: ANN401
+    """Shrink one selected frame before retaining it for encode."""
+    width, height = scaled_size(frame.width, frame.height, max_pixels)
+    # Keeping full-resolution frames until encode made peak RSS scale with source pixels x
+    # sample count. Reformat while the decoder owns the only raw-frame reference instead.
+    return frame.reformat(width=width, height=height, format="yuv420p")
 
 
 def _clamped_region(

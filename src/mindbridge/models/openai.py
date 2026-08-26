@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -308,17 +307,13 @@ class OpenAIEmbedder:
             if all(_text_only(item) is not None for item in request.inputs):
                 vectors, charged_tokens = await self._embed_text(request)
             else:
-                encoded = await asyncio.gather(
-                    *(self._embed_multimodal(item, request.task) for item in request.inputs)
-                )
-                vectors = tuple(vector for vector, _ in encoded)
-                charged_tokens = sum(tokens for _, tokens in encoded)
+                vectors, charged_tokens = await self._embed_multimodal(request)
         except openai.APIError as error:
             _raise_model_error(error, "embedding request failed")
         # Serving the encoder turns embedding into a metered call, so its cost has to reach the
         # same account generation already reports into. An embedding charges entirely on its
-        # input -- there are no completion tokens to report -- and a multimodal batch is one
-        # request per item, so what lands here is the whole batch's bill.
+        # input -- there are no completion tokens to report -- so what lands here is the whole
+        # batch's bill.
         set_current_span_attributes(
             {
                 "mindbridge.model.input_tokens": charged_tokens,
@@ -363,20 +358,22 @@ class OpenAIEmbedder:
 
     async def _embed_multimodal(
         self,
-        input_value: ModelInput,
-        task: EmbedTask,
-    ) -> tuple[tuple[float, ...], int]:
+        request: EmbedRequest,
+    ) -> tuple[tuple[tuple[float, ...], ...], int]:
         response = await self._client.post(
             "/embeddings",
             cast_to=CreateEmbeddingResponse,
             body={
                 "input": [
-                    {
-                        "role": "user",
-                        "content": _embedding_content_parts(
-                            _prefixed_embedding_input(input_value, task)
-                        ),
-                    }
+                    [
+                        {
+                            "role": "user",
+                            "content": _embedding_content_parts(
+                                _prefixed_embedding_input(input_value, request.task)
+                            ),
+                        }
+                    ]
+                    for input_value in request.inputs
                 ],
                 "model": self._model_reference.model_id,
                 "dimensions": self._dimension,
@@ -389,8 +386,8 @@ class OpenAIEmbedder:
                 response,
                 self._model_reference,
                 dimension=self._dimension,
-                expected_count=1,
-            )[0],
+                expected_count=len(request.inputs),
+            ),
             response.usage.prompt_tokens,
         )
 

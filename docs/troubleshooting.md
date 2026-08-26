@@ -297,15 +297,15 @@ cadence with `--skip-entity-resolution` on frequent runs. See
 
 ### `propagation_state` is not `complete`
 
-Only `complete` means every copy is gone. `propagating` is normal briefly. `failed` carries an
-`error_code`, usually object storage being unreachable — the tombstone is marked failed and the
-error re-raised rather than swallowed.
+`complete` means central PostgreSQL and object-storage deletion finished. `propagating` is normal
+briefly. `failed` carries an `error_code`, usually object storage being unreachable — the
+tombstone is marked failed and the error re-raised rather than swallowed.
 
 ### An offline device still holds deleted content
 
-That device has not synced. Deletion reconciles when it runs `mindbridge edge sync --tenant-id`,
-which pulls tombstones before submitting. Cache rows are removed **before** the cursor advances,
-so an interruption re-processes rather than skips.
+Central `complete` does not acknowledge an offline device. Deletion reconciles when that device
+runs `mindbridge edge sync --tenant-id`, which pulls tombstones before submitting. Cache rows are
+removed **before** the cursor advances, so an interruption re-processes rather than skips.
 
 ### A restore reintroduced deleted content
 

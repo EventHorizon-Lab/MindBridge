@@ -11,6 +11,7 @@ from mindbridge.media.clipping import (
     DEFAULT_VIDEO_MAX_PIXELS,
     MINIMUM_CLIP_MS,
     ClipRequest,
+    _sample_video_frames,
     audio_windows,
     cut_clips,
     cut_generation_proxy,
@@ -163,6 +164,23 @@ def test_stored_clip_of_a_silent_source_stays_video_only() -> None:
 
     with av.open(io.BytesIO(clips[0].content), mode="r") as container:
         assert not container.streams.audio
+
+
+def test_sampled_video_frames_are_resized_before_they_are_retained() -> None:
+    """Peak memory must follow the output budget, not every sampled source frame's pixels."""
+    source = _video_bytes(seconds=3.0, fps=10, width=640, height=480)
+    request = ClipRequest(
+        kind=MediaKind.VIDEO,
+        start_ms=0,
+        end_ms=3_000,
+        frames_per_second=2.0,
+        max_pixels=10_000,
+    )
+
+    sampled = _sample_video_frames(source, request)
+
+    assert len(sampled) >= 5
+    assert all(frame.width * frame.height <= request.max_pixels for frame in sampled)
 
 
 def test_generation_proxy_keeps_the_speech_the_model_has_to_hear() -> None:

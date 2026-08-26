@@ -292,7 +292,7 @@
                 "type": "null"
               }
             ],
-            "description": "When erasure finished propagating, or null while it has not.",
+            "description": "When central deletion finished, or null while it has not.",
             "title": "Completed At"
           },
           "error_code": {
@@ -311,7 +311,7 @@
           },
           "propagation_state": {
             "$ref": "#/components/schemas/DeletionPropagationState",
-            "description": "How far erasure has reached across storage and offline edge devices. Only `complete` means every copy is gone."
+            "description": "How far erasure has reached in central PostgreSQL and object storage. `complete` means central deletion finished; offline edge devices apply this retained tombstone when they reconnect."
           },
           "requested_at": {
             "description": "When erasure was requested.",
@@ -633,7 +633,7 @@
       },
       "ForgetReceipt": {
         "additionalProperties": false,
-        "description": "Deletion result returned by one command or status lookup.",
+        "description": "Central deletion result returned by one command or status lookup.",
         "properties": {
           "completed_at": {
             "anyOf": [
@@ -645,7 +645,7 @@
                 "type": "null"
               }
             ],
-            "description": "When erasure finished propagating, or null while it has not.",
+            "description": "When central deletion finished, or null while it has not.",
             "title": "Completed At"
           },
           "error_code": {
@@ -664,7 +664,7 @@
           },
           "propagation_state": {
             "$ref": "#/components/schemas/DeletionPropagationState",
-            "description": "How far erasure has reached across storage and offline edge devices. Only `complete` means every copy is gone."
+            "description": "How far erasure has reached in central PostgreSQL and object storage. `complete` means central deletion finished; offline edge devices apply this retained tombstone when they reconnect."
           },
           "requested_at": {
             "description": "When erasure was requested.",
@@ -2239,6 +2239,16 @@
             },
             "description": "`request_validation_failed` — request validation failed\n\n`domain_invariant_failed` — the request is well-formed but violates a memory invariant"
           },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "`internal_error` — the request failed for a reason the server did not anticipate"
+          },
           "502": {
             "content": {
               "application/json": {
@@ -2312,6 +2322,16 @@
             },
             "description": "`request_validation_failed` — request validation failed"
           },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "`internal_error` — the request failed for a reason the server did not anticipate"
+          },
           "502": {
             "content": {
               "application/json": {
@@ -2354,6 +2374,16 @@
               }
             },
             "description": "Successful Response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "`internal_error` — the request failed for a reason the server did not anticipate"
           }
         },
         "summary": "Health"
@@ -2445,6 +2475,16 @@
               }
             },
             "description": "`request_validation_failed` — request validation failed\n\n`domain_invariant_failed` — the request is well-formed but violates a memory invariant"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "`internal_error` — the request failed for a reason the server did not anticipate"
           },
           "503": {
             "content": {
@@ -2542,6 +2582,16 @@
               }
             },
             "description": "`request_validation_failed` — request validation failed"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "`internal_error` — the request failed for a reason the server did not anticipate"
           },
           "503": {
             "content": {
@@ -2654,7 +2704,7 @@
                 }
               }
             },
-            "description": "`memory_integrity_failed` — stored memory is inconsistent"
+            "description": "`internal_error` — the request failed for a reason the server did not anticipate\n\n`memory_integrity_failed` — stored memory is inconsistent"
           },
           "502": {
             "content": {
@@ -2759,6 +2809,16 @@
             },
             "description": "`request_validation_failed` — request validation failed"
           },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "`internal_error` — the request failed for a reason the server did not anticipate"
+          },
           "503": {
             "content": {
               "application/json": {
@@ -2855,6 +2915,16 @@
               }
             },
             "description": "`request_validation_failed` — request validation failed"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "`internal_error` — the request failed for a reason the server did not anticipate"
           },
           "503": {
             "content": {
@@ -3054,7 +3124,7 @@
                 }
               }
             },
-            "description": "`memory_integrity_failed` — stored memory is inconsistent"
+            "description": "`internal_error` — the request failed for a reason the server did not anticipate\n\n`memory_integrity_failed` — stored memory is inconsistent"
           },
           "502": {
             "content": {
@@ -3158,7 +3228,7 @@
                 }
               }
             },
-            "description": "`memory_integrity_failed` — stored memory is inconsistent"
+            "description": "`internal_error` — the request failed for a reason the server did not anticipate\n\n`memory_integrity_failed` — stored memory is inconsistent"
           },
           "502": {
             "content": {
@@ -3285,7 +3355,7 @@
                 }
               }
             },
-            "description": "`memory_integrity_failed` — stored memory is inconsistent"
+            "description": "`internal_error` — the request failed for a reason the server did not anticipate\n\n`memory_integrity_failed` — stored memory is inconsistent"
           },
           "503": {
             "content": {
@@ -3370,6 +3440,16 @@
             },
             "description": "`request_validation_failed` — request validation failed\n\n`domain_invariant_failed` — the request is well-formed but violates a memory invariant"
           },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "`internal_error` — the request failed for a reason the server did not anticipate"
+          },
           "503": {
             "content": {
               "application/json": {
@@ -3451,7 +3531,7 @@
                 }
               }
             },
-            "description": "`memory_integrity_failed` — stored memory is inconsistent"
+            "description": "`internal_error` — the request failed for a reason the server did not anticipate\n\n`memory_integrity_failed` — stored memory is inconsistent"
           },
           "502": {
             "content": {

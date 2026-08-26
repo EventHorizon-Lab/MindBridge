@@ -372,14 +372,15 @@ everything derived from it, including identity samples the edge learned from tha
 | --- | --- |
 | `tombstone_id` | Stable ID of this deletion barrier; usable as a cursor. |
 | `target_type`, `target_id` | What was erased. |
-| `propagation_state` | `pending` \| `propagating` \| `complete` \| `failed`. |
+| `propagation_state` | `pending` \| `propagating` \| `complete` \| `failed`; `complete` covers central PostgreSQL and object storage. |
 | `requested_at` | |
 | `completed_at` | Null while propagation is incomplete. |
 | `error_code` | Why propagation stalled, or null. |
 | `trace_id` | |
 
-**Only `complete` means every copy is gone.** A `200` here means the deletion was recorded and
-started, not that it finished.
+`complete` means deletion finished in central PostgreSQL and object storage. Offline edge devices
+apply the retained tombstone when they reconnect; this response is not an acknowledgement from
+those devices. A non-`complete` `200` means central deletion was recorded but did not finish.
 
 **Errors:** tenant errors, `forget_target_not_found`, `idempotency_conflict`,
 `object_storage_unavailable`. Erasing the bytes is part of the command; a failure to reach them
@@ -477,9 +478,9 @@ cannot reach a caller without also reaching the published contract.
 | `task_broker_unavailable` | 503 | Observation processing is temporarily unavailable. |
 
 Every authenticated `/v1` operation can return `authentication_required`,
-`authentication_failed`, `tenant_access_denied`, `request_validation_failed`, and
-`database_unavailable` whatever else it does. Per-endpoint sections above name only the codes
-that endpoint adds.
+`authentication_failed`, `tenant_access_denied`, `request_validation_failed`,
+`database_unavailable`, and `internal_error` whatever else it does. Per-endpoint sections above
+name only the codes that endpoint adds.
 
 ### Retry guidance
 

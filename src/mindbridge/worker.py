@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import math
 from collections.abc import Callable, Collection, Mapping
 from contextlib import AsyncExitStack
@@ -22,7 +21,7 @@ from celery.signals import (
 )
 from pydantic import Field, StrictBool
 
-from mindbridge.application.capabilities import Embedder
+from mindbridge.application.capabilities import Embedder, Generator
 from mindbridge.application.evidence_clips import (
     MAX_PROXY_SAMPLED_FRAMES,
     MAX_SAMPLING_FLOOR_MS,
@@ -157,8 +156,8 @@ downstream is the difference between a refusal naming the variable and a decode 
 does nothing.
 """
 
-_SINGLE_PROCESS_POOLS = ("thread", "solo", "gevent", "eventlet")
-"""Celery pools that run one process, where concurrency buys no second copy of a model."""
+_SUPPORTED_WORKER_POOLS = ("prefork", "solo")
+"""Celery pools compatible with the child-owned synchronous Worker runtime."""
 
 
 _worker_telemetry: TelemetryProviders | None = None
@@ -400,10 +399,14 @@ def _clip_sampling_from_environment(source: Mapping[str, str]) -> ClipSampling:
 
 @dataclass(slots=True)
 class _WorkerRuntime:
-    """One event loop and both encoder models owned by a prefork Worker child."""
+    """One event loop and all reusable clients owned by a prefork Worker child."""
 
     loop: asyncio.AbstractEventLoop
     embedders: tuple[Embedder, Embedder] | None = None
+    store: PostgresMemoryStore | None = None
+    generator: Generator | None = None
+    media_access: S3MediaAccess | None = None
+    resources: AsyncExitStack = field(default_factory=AsyncExitStack, init=False, repr=False)
 
     def run(self, settings: WorkerSettings, message: ObservationProcessingTaskMessage) -> JobState:
         task = self.loop.create_task(
@@ -436,32 +439,58 @@ class _WorkerRuntime:
         """
         if self.embedders is None:
             media = load_embedder(settings.media_embedder_plugin, settings.media_embedder_config)
-            text = (
-                media
-                if settings.media_embedder_plugin == settings.text_embedder_plugin
-                and settings.media_embedder_config == settings.text_embedder_config
-                else load_embedder(settings.text_embedder_plugin, settings.text_embedder_config)
-            )
+            try:
+                text = (
+                    media
+                    if settings.media_embedder_plugin == settings.text_embedder_plugin
+                    and settings.media_embedder_config == settings.text_embedder_config
+                    else load_embedder(settings.text_embedder_plugin, settings.text_embedder_config)
+                )
+            except BaseException:
+                await close_model(media)
+                raise
             self.embedders = (media, text)
+            self.resources.push_async_callback(close_model, media)
+            if text is not media:
+                self.resources.push_async_callback(close_model, text)
         return self.embedders
+
+    async def memory_store(self, settings: WorkerSettings) -> PostgresMemoryStore:
+        """Open one database pool per child instead of rebuilding it for every delivery."""
+        if self.store is None:
+            store = PostgresMemoryStore(
+                settings.database_url,
+                embedding_dimension=settings.embedding_dimension,
+                max_pool_size=resolve_database_max_pool_size(),
+            )
+            await store.open()
+            self.store = store
+            self.resources.push_async_callback(store.close)
+        return self.store
+
+    def generation_model(self, settings: WorkerSettings) -> Generator:
+        """Keep the provider client and its learned capability state for the child lifetime."""
+        if self.generator is None:
+            self.generator = load_generator(settings.generator_plugin, settings.generator_config)
+            self.resources.push_async_callback(close_model, self.generator)
+        return self.generator
+
+    def media_url_signer(self, settings: WorkerSettings) -> S3MediaAccess:
+        """Reuse the S3 connection pools used to sign and materialize derived media."""
+        if self.media_access is None:
+            self.media_access = S3MediaAccess(settings.object_storage)
+            self.resources.push_async_callback(self.media_access.close)
+        return self.media_access
 
     def close(self) -> None:
         try:
-            self.loop.run_until_complete(self._close_models())
+            self.loop.run_until_complete(self.resources.aclose())
         finally:
             self.loop.close()
 
-    async def _close_models(self) -> None:
-        if self.embedders is None:
-            return
-        media, text = self.embedders
-        await close_model(media)
-        if text is not media:
-            await close_model(text)
-
 
 _worker_runtime: _WorkerRuntime | None = None
-_worker_runtime_key: str | None = None
+_worker_runtime_settings: WorkerSettings | None = None
 
 
 def processing_budget_seconds(generator_config: Mapping[str, object]) -> float:
@@ -557,16 +586,19 @@ def require_bounded_in_process_models(
     reported this until the allocator failed hours in -- 479 CUDA out-of-memory errors and a
     kernel `global_oom` on the host.
 
-    Only a configuration that really holds device memory in more than one process is refused: a
-    pool that shares one process holds one copy however wide it runs, and an encoder pinned to
-    `device=cpu` holds no VRAM at all. What is left is measured against a budget the deployment
-    can raise, because a guard that refuses valid configurations and offers no way to say yes
-    gets routed around -- and the route is a flag this cannot see.
+    The child runtime drives one event loop synchronously, so pools that can invoke it from
+    concurrent greenlets or threads are refused even when they would hold only one model copy.
+    Of the supported pools, only a prefork configuration that really holds device memory in more
+    than one process needs the VRAM check; an encoder pinned to `device=cpu` holds no VRAM at all.
+    What is left is measured against a budget the deployment can raise, because a guard that
+    refuses valid configurations and offers no way to say yes gets routed around -- and the route
+    is a flag this cannot see.
 
     Refusing costs no capability. One worker process per assigned GPU at concurrency 1 is what
     the deployment guide already recommends for scaling, and a served encoder removes the
     resident model from every child, which is both faster and unbounded by the card.
     """
+    pool_name = _require_supported_worker_pool(pool)
     slots = tuple(
         f"{variable}={plugin}"
         for variable, plugin, config in (
@@ -583,7 +615,7 @@ def require_bounded_in_process_models(
         )
         if plugin in _IN_PROCESS_EMBEDDER_PLUGINS and _holds_device_memory(config)
     )
-    if concurrency <= 1 or not slots or not _pool_forks_children(pool):
+    if concurrency <= 1 or not slots or "solo" in pool_name:
         return
     # Every named slot is cached for the life of the child, so a child holding two of them
     # holds two copies -- which is the evaluation's own configuration.
@@ -615,14 +647,29 @@ def _holds_device_memory(config: Mapping[str, object]) -> bool:
     return not isinstance(device, str) or device.strip().lower() != "cpu"
 
 
-def _pool_forks_children(pool: object) -> bool:
-    """Only a process pool gives every child its own copy of an in-process model.
+def _require_supported_worker_pool(pool: object) -> str:
+    """Return a supported pool name or refuse a runtime shape that can enter concurrently.
 
-    Celery has not resolved `pool_cls` to a class yet when `worker_init` fires, so this reads a
-    name. Anything unrecognised counts as forking, which errs towards refusing.
+    Celery has not always resolved `pool_cls` to a class when `worker_init` fires, so both the CLI
+    alias and a resolved class module are accepted. An allowlist keeps a future pool implementation
+    from sharing the runtime until its concurrency semantics have been reviewed explicitly.
     """
     name = (pool if isinstance(pool, str) else getattr(pool, "__module__", "")).lower()
-    return not any(single in name for single in _SINGLE_PROCESS_POOLS)
+    supported_pool = next(
+        (
+            supported
+            for supported in _SUPPORTED_WORKER_POOLS
+            if name == supported or name.startswith(f"celery.concurrency.{supported}")
+        ),
+        None,
+    )
+    if supported_pool is None:
+        shown = name or type(pool).__name__
+        raise ValueError(
+            f"worker pool {shown!r} is unsupported; use prefork or solo because the Worker "
+            "runtime owns one synchronous event loop per process"
+        )
+    return supported_pool
 
 
 def _resolved_pool_size(sender: object) -> int:
@@ -790,70 +837,49 @@ async def _process_observation_once(
     row it touched, when `pending` is what `mindbridge jobs --republish` picks up once the schema
     is fixed.
     """
-    store = PostgresMemoryStore(
-        settings.database_url,
-        embedding_dimension=settings.embedding_dimension,
-        max_pool_size=resolve_database_max_pool_size(),
-    )
-    async with AsyncExitStack() as resources:
-        await store.open()
-        resources.push_async_callback(store.close)
-        try:
-            media_embedder, text_embedder = await runtime.encoders(settings)
-            generator = load_generator(settings.generator_plugin, settings.generator_config)
-            resources.push_async_callback(close_model, generator)
-            processor = ProcessObservation(
-                store,
-                PerceptionPipeline(generator),
-                media_embedder,
-                text_embedder,
-                media_url_signer=S3MediaAccess(settings.object_storage),
-                clip_sampling=settings.clip_sampling,
-            )
-        except Exception as error:
-            await record_unclaimed_processing_failure(
-                store,
-                tenant_id,
-                observation_id,
-                job_id,
-                error,
-            )
-            raise
-        job = await processor.run(tenant_id, observation_id, job_id)
+    store = await runtime.memory_store(settings)
+    try:
+        media_embedder, text_embedder = await runtime.encoders(settings)
+        generator = runtime.generation_model(settings)
+        processor = ProcessObservation(
+            store,
+            PerceptionPipeline(generator),
+            media_embedder,
+            text_embedder,
+            media_url_signer=runtime.media_url_signer(settings),
+            clip_sampling=settings.clip_sampling,
+        )
+    except Exception as error:
+        await record_unclaimed_processing_failure(
+            store,
+            tenant_id,
+            observation_id,
+            job_id,
+            error,
+        )
+        raise
+    job = await processor.run(tenant_id, observation_id, job_id)
     return job.state
 
 
 def _get_worker_runtime(settings: WorkerSettings) -> _WorkerRuntime:
-    global _worker_runtime, _worker_runtime_key
-    # ponytail: one frozen pair of models per worker process; split queues when more are needed.
-    key = _worker_model_key(settings)
+    global _worker_runtime, _worker_runtime_settings
+    # ponytail: one frozen resource set per worker process; split queues when more are needed.
     if _worker_runtime is not None:
-        if _worker_runtime_key != key:
-            raise RuntimeError("worker embedder plugin configuration changed after initialization")
+        if _worker_runtime_settings != settings:
+            raise RuntimeError("worker configuration changed after runtime initialization")
         return _worker_runtime
     runtime = _WorkerRuntime(asyncio.new_event_loop())
     _worker_runtime = runtime
-    _worker_runtime_key = key
+    _worker_runtime_settings = settings
     return runtime
 
 
-def _worker_model_key(settings: WorkerSettings) -> str:
-    """Name the exact pair of plugins a child froze, so a changed one is caught not ignored."""
-    return json.dumps(
-        [
-            [settings.media_embedder_plugin, settings.media_embedder_config],
-            [settings.text_embedder_plugin, settings.text_embedder_config],
-        ],
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-
-
 def _dispose_worker_runtime() -> None:
-    global _worker_runtime, _worker_runtime_key
+    global _worker_runtime, _worker_runtime_settings
     runtime = _worker_runtime
     _worker_runtime = None
-    _worker_runtime_key = None
+    _worker_runtime_settings = None
     if runtime is not None:
         runtime.close()
 

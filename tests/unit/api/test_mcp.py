@@ -142,7 +142,10 @@ async def test_mcp_rejects_an_unknown_argument() -> None:
     assert result.is_error is True
     reported = result.content[0]
     assert isinstance(reported, TextContent)
-    assert "unknown arguments: Mode" in reported.text
+    envelope = json.loads(reported.text[reported.text.index("{") :])
+    assert envelope["code"] == "request_validation_failed"
+    assert envelope["issues"][0]["location"] == ["Mode"]
+    assert envelope["issues"][0]["code"] == "extra_forbidden"
 
 
 async def test_mcp_calls_shared_kernel_and_returns_structured_output() -> None:
@@ -231,7 +234,9 @@ async def test_mcp_enforces_cross_field_contract_rules() -> None:
     assert result.is_error is True
     reported = result.content[0]
     assert isinstance(reported, TextContent)
-    assert "missing feedback must not provide memory_id" in reported.text
+    envelope = json.loads(reported.text[reported.text.index("{") :])
+    assert envelope["code"] == "request_validation_failed"
+    assert "missing feedback must not provide memory_id" in envelope["issues"][0]["message"]
 
 
 def _memory_view(summary: str, memory_type: MemoryType) -> MemoryResult:
@@ -278,16 +283,11 @@ async def test_mcp_errors_carry_the_code_and_trace_id_rest_callers_get() -> None
     # remainder, so a caller recovers it without depending on that prefix's wording.
     envelope = json.loads(reported.text[reported.text.index("{") :])
     assert envelope["code"] == "memory_deleted"
-    assert envelope["message"] == "memory has been explicitly forgotten"
+    assert envelope["message"] == "memory content was explicitly deleted"
     assert envelope["trace_id"]
 
 
-async def test_mcp_leaves_an_unmapped_failure_alone() -> None:
-    """Only contract failures get the envelope; a bug stays a bug.
-
-    Dressing an unexpected exception as a contract code would tell an agent to branch on a
-    failure mode the contract never promised, and would hide the defect behind a tidy code.
-    """
+async def test_mcp_sanitizes_an_unmapped_failure_as_internal_error() -> None:
 
     class BrokenKernel(StubKernel):
         async def get_memory(self, tenant_id: str, memory_id: str) -> MemoryResult:
@@ -304,5 +304,8 @@ async def test_mcp_leaves_an_unmapped_failure_alone() -> None:
     assert result.is_error is True
     reported = result.content[0]
     assert isinstance(reported, TextContent)
-    assert "a genuine bug" in reported.text
-    assert "{" not in reported.text
+    envelope = json.loads(reported.text[reported.text.index("{") :])
+    assert envelope["code"] == "internal_error"
+    assert envelope["message"] == "the request failed for a reason the server did not anticipate"
+    assert envelope["trace_id"]
+    assert "a genuine bug" not in reported.text

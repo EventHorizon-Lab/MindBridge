@@ -44,6 +44,22 @@ def test_every_documented_status_is_one_the_error_table_can_produce() -> None:
                 assert reference == envelope, f"{method.upper()} {path} {status_code}"
 
 
+def test_every_operation_documents_unexpected_errors() -> None:
+    for path, operations in _built_app().openapi()["paths"].items():
+        for method, operation in operations.items():
+            response = operation["responses"]["500"]
+            assert "`internal_error`" in response["description"], f"{method.upper()} {path}"
+
+
+def test_complete_deletion_only_claims_central_storage() -> None:
+    schema = _built_app().openapi()["components"]["schemas"]["DeletionTombstoneView"]
+    description = schema["properties"]["propagation_state"]["description"]
+
+    assert "central PostgreSQL and object storage" in description
+    assert "offline edge devices apply" in description
+    assert "every copy" not in description
+
+
 def _built_app() -> FastAPI:
     return build_app(
         cast(MemoryKernel, object()),

@@ -180,3 +180,21 @@ def test_media_access_defaults_to_the_shared_lifetime() -> None:
     """The default is the whole fix, so nothing may quietly shorten it per construction."""
     access = S3MediaAccess(STORAGE, clock=lambda: NOW)
     assert access._url_lifetime_seconds == _DEFAULT_URL_LIFETIME_SECONDS
+
+
+async def test_media_access_closes_each_owned_client_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A distinct public signing endpoint owns a second SDK connection pool."""
+    access = S3MediaAccess(
+        ObjectStorageEnvironment(
+            bucket="memory",
+            endpoint_url="http://objects.internal:9000",
+            public_endpoint_url="https://objects.example.test",
+        )
+    )
+    closed: list[str] = []
+    monkeypatch.setattr(access._client, "close", lambda: closed.append("direct"))
+    monkeypatch.setattr(access._signing_client, "close", lambda: closed.append("signing"))
+
+    await access.close()
+
+    assert sorted(closed) == ["direct", "signing"]

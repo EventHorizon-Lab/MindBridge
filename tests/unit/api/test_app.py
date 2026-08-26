@@ -1,5 +1,6 @@
 """Tests for the thin FastAPI protocol adapter."""
 
+import asyncio
 import json
 from collections.abc import AsyncIterator
 from datetime import datetime, timedelta, timezone
@@ -10,6 +11,7 @@ from fastapi.testclient import TestClient
 
 from mindbridge.api.app import build_app
 from mindbridge.api.auth import TenantApiKeyAuthenticator
+from mindbridge.api.events import _job_events
 from mindbridge.application.kernel import MemoryKernel
 from mindbridge.contracts import (
     DeletionListRequest,
@@ -394,6 +396,36 @@ def test_job_event_stream_rejects_a_missing_or_foreign_job_before_streaming() ->
     assert foreign.status_code == 403
 
 
+async def test_job_event_stream_waits_for_pending_read_to_cancel_before_closing() -> None:
+    started = asyncio.Event()
+    closed = asyncio.Event()
+
+    class PendingStreamKernel(StubKernel):
+        async def watch_observation_job(
+            self,
+            tenant_id: str,
+            job_id: str,
+            *,
+            after_updated_at: datetime | None = None,
+        ) -> AsyncIterator[ObservationProcessingJobView]:
+            try:
+                started.set()
+                await asyncio.Future[None]()
+                yield cast(ObservationProcessingJobView, object())  # pragma: no cover
+            finally:
+                closed.set()
+
+    events = _job_events(cast(MemoryKernel, PendingStreamKernel()), "tenant_01", "job_01", None)
+    pending: asyncio.Future[str] = asyncio.ensure_future(events.__anext__())
+    await started.wait()
+
+    pending.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await pending
+    assert closed.is_set()
+
+
 def _sse_events(body: str) -> list[dict[str, str]]:
     """Parse framed events, dropping keepalive comments."""
     events: list[dict[str, str]] = []
@@ -639,6 +671,26 @@ def test_runtime_errors_use_sanitized_stable_envelopes(
     assert str(error) not in response.text
 
 
+def test_unexpected_errors_use_the_internal_envelope_and_are_logged(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    error = RuntimeError("private implementation detail")
+    with caplog.at_level("ERROR", logger="mindbridge.api.app"):
+        response = _client(
+            FailingKernel(error),
+            raise_server_exceptions=False,
+        ).post(
+            "/v1/recall",
+            json={"tenant_id": "tenant_01", "query": {"text": "question"}},
+        )
+
+    assert response.status_code == 500
+    assert response.json()["code"] == "internal_error"
+    assert response.json()["trace_id"]
+    assert str(error) not in response.text
+    assert any(record.exc_info is not None for record in caplog.records)
+
+
 class FailingKernel(StubKernel):
     """Raises one sanitized runtime category from the shared recall route."""
 
@@ -650,11 +702,16 @@ class FailingKernel(StubKernel):
         raise self._error
 
 
-def _client(stub: StubKernel | None = None) -> TestClient:
+def _client(
+    stub: StubKernel | None = None,
+    *,
+    raise_server_exceptions: bool = True,
+) -> TestClient:
     kernel = cast(MemoryKernel, stub or StubKernel())
     return TestClient(
         build_app(kernel, authenticator=_authenticator()),
         headers={"Authorization": f"Bearer {TENANT_API_KEY}"},
+        raise_server_exceptions=raise_server_exceptions,
     )
 
 

@@ -379,8 +379,9 @@ inconsistent, which is not a load condition and will not clear on its own.
 
 ## Drills worth rehearsing
 
-**Deletion propagation.** Issue a `forget()`, then confirm `propagation_state` reaches `complete`
-and that an offline device reconciles on reconnect. Only `complete` means every copy is gone.
+**Deletion propagation.** Issue a `forget()`, confirm `propagation_state` reaches central
+`complete`, then separately confirm that an offline device reconciles on reconnect. The central
+state is not a device acknowledgement.
 
 **Restore-then-reconcile.** A backup that outlives a deletion reintroduces deleted content on
 restore. Tombstones are content-free and survive the content precisely so a restore can be
