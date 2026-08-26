@@ -134,6 +134,7 @@ def _arguments(
         durations=("long",),
         transcript_source="none",
         overwrite=False,
+        predict_only=False,
         quiet=True,
     )
 

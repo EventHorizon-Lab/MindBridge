@@ -25,6 +25,7 @@ from mindbridge.benchmarks.cli_common import (
     media_manifest,
     predictions_jsonl,
     report,
+    scoring_snapshot,
     select_by_id,
     write_run_artifacts,
 )
@@ -40,6 +41,7 @@ from mindbridge.benchmarks.mm_lifelong_runner import (
     load_prepared_mm_lifelong,
     run_mm_lifelong,
 )
+from mindbridge.benchmarks.scoring import JudgedAnswer, require_scoring_is_possible
 from mindbridge.contracts import NonEmptyString, Sha256Hex
 from mindbridge.file_integrity import sha256_file
 from mindbridge.prompts import PERCEIVE_EVENTS_PROMPT
@@ -80,6 +82,7 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
         limit=arguments.limit,
     )
     prepared = load_prepared_mm_lifelong(arguments.prepared_media_path)
+    require_scoring_is_possible("mm-lifelong", predict_only=arguments.predict_only)
     require_writable_output_pair(arguments.output_path, overwrite=arguments.overwrite)
     deployment = load_deployment_snapshot(
         arguments.deployment_config_path,
@@ -123,10 +126,24 @@ def _write_artifacts(
     if tuple(result.index for result in results) != tuple(question.index for question in questions):
         raise ValueError("MM-Lifelong predictions must match annotation question order")
     predictions = predictions_jsonl(results)
+    scoring = scoring_snapshot(
+        "mm-lifelong",
+        arguments,
+        answers=tuple(JudgedAnswer(row.question, row.answer, row.pred.answer) for row in results),
+        # The interval half is numeric and the runner already computes it, but it is not the
+        # released Ref@N -- `unofficial_reference_at_n` says why -- so it travels under the name
+        # that says so rather than as the benchmark's own metric.
+        metrics={
+            "unofficial_reference_at_300": (
+                sum(row.mindbridge_unofficial_ref_at_300 for row in results) / len(results)
+            )
+        },
+    )
     manifest = media_manifest(
         MMLifelongRunManifest,
         arguments,
         deployment,
+        scoring=scoring,
         runner_version=MM_LIFELONG_RUNNER_VERSION,
         adapter_version=MM_LIFELONG_ADAPTER_VERSION,
         annotation_sha256=sha256_file(arguments.dataset_path),

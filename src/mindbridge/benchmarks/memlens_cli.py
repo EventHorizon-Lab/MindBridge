@@ -26,6 +26,7 @@ from mindbridge.benchmarks.cli_common import (
     media_manifest,
     report,
     report_unit,
+    scoring_snapshot,
     select_by_id,
     write_run_artifacts,
 )
@@ -43,6 +44,7 @@ from mindbridge.benchmarks.memlens_runner import (
     validate_memlens_images,
 )
 from mindbridge.benchmarks.prompts import MEMLENS_QUERY_PROMPT
+from mindbridge.benchmarks.scoring import JudgedAnswer, require_scoring_is_possible
 from mindbridge.contracts import Identifier, NonEmptyString, Sha256Hex
 from mindbridge.file_integrity import sha256_file
 from mindbridge.prompts import PERCEIVE_EVENTS_PROMPT
@@ -111,6 +113,7 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
             raise ValueError("text-only MEMLENS runs must omit prepared images")
     elif prepared is None:
         raise ValueError("multimodal MEMLENS runs require prepared images")
+    require_scoring_is_possible("memlens", predict_only=arguments.predict_only)
     require_writable_output_pair(arguments.output_path, overwrite=arguments.overwrite)
     deployment = load_deployment_snapshot(
         arguments.deployment_config_path,
@@ -173,10 +176,18 @@ def _write_artifacts(
         )
         + "\n"
     )
+    scoring = scoring_snapshot(
+        "memlens",
+        arguments,
+        answers=tuple(
+            JudgedAnswer(row.question, row.reference_answer, row.prediction) for row in results
+        ),
+    )
     manifest = media_manifest(
         MemLensRunManifest,
         arguments,
         deployment,
+        scoring=scoring,
         runner_version=MEMLENS_RUNNER_VERSION,
         adapter_version=MEMLENS_ADAPTER_VERSION,
         annotation_sha256=sha256_file(arguments.dataset_path),

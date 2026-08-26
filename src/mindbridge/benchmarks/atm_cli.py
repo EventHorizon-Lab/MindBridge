@@ -44,11 +44,13 @@ from mindbridge.benchmarks.cli_common import (
     media_manifest,
     report,
     report_unit,
+    scoring_snapshot,
     select_by_id,
     write_run_artifacts,
 )
 from mindbridge.benchmarks.prompts import ATM_BENCH_QUERY_PROMPT
 from mindbridge.benchmarks.runtime import benchmark_tenant_id
+from mindbridge.benchmarks.scoring import JudgedAnswer, require_scoring_is_possible
 from mindbridge.contracts import Identifier, NonEmptyString, Sha256Hex
 from mindbridge.core import MediaKind
 from mindbridge.file_integrity import sha256_file
@@ -117,6 +119,7 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
         for record in load_atm_sgm(path)
     )
     validate_prepared_atm(questions, prepared, sgm_records, media_source=arguments.media_source)
+    require_scoring_is_possible("atm", predict_only=arguments.predict_only)
     require_writable_output_pair(arguments.output_path, overwrite=arguments.overwrite)
     deployment = load_deployment_snapshot(
         arguments.deployment_config_path,
@@ -212,10 +215,18 @@ def _write_artifacts(
         )
         + "\n"
     )
+    scoring = scoring_snapshot(
+        "atm",
+        arguments,
+        answers=tuple(
+            JudgedAnswer(row.question, row.reference_answer, row.prediction) for row in results
+        ),
+    )
     manifest = media_manifest(
         AtmRunManifest,
         arguments,
         deployment,
+        scoring=scoring,
         runner_version=ATM_BENCH_RUNNER_VERSION,
         adapter_version=ATM_BENCH_ADAPTER_VERSION,
         annotation_sha256=sha256_file(arguments.dataset_path),

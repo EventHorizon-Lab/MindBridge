@@ -364,7 +364,7 @@ PREPARERS: dict[str, Producer] = {
 """The benchmarks whose prepared media this module can produce.
 
 A benchmark absent from this table still needs its manifest made out-of-band, and
-`mindbridge-bench suite --list-tasks` says so by naming the file it wants.
+`mindbridge-bench eval --list-tasks` says so by naming the file it wants.
 """
 
 

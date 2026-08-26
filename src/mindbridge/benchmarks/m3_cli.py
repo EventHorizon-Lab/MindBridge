@@ -27,6 +27,7 @@ from mindbridge.benchmarks.cli_common import (
     predictions_jsonl,
     report,
     report_unit,
+    scoring_snapshot,
     select_by_id,
     write_run_artifacts,
 )
@@ -38,6 +39,7 @@ from mindbridge.benchmarks.m3_runner import (
     load_prepared_m3,
     run_m3_video,
 )
+from mindbridge.benchmarks.scoring import JudgedAnswer, require_scoring_is_possible
 from mindbridge.contracts import Identifier, NonEmptyString, Sha256Hex
 from mindbridge.file_integrity import sha256_file
 from mindbridge.prompts import PERCEIVE_EVENTS_PROMPT
@@ -81,6 +83,7 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
     )
     _validate_subset(videos, arguments.subset)
     prepared = _prepared_by_video(videos, load_prepared_m3(arguments.prepared_media_path))
+    require_scoring_is_possible("m3", predict_only=arguments.predict_only)
     require_writable_output_pair(arguments.output_path, overwrite=arguments.overwrite)
     deployment = load_deployment_snapshot(
         arguments.deployment_config_path,
@@ -141,10 +144,16 @@ def _write_artifacts(
         clip.media_object is not None for video in videos for clip in prepared[video.video_id].clips
     )
     predictions = predictions_jsonl(results)
+    scoring = scoring_snapshot(
+        "m3",
+        arguments,
+        answers=tuple(JudgedAnswer(row.question, row.answer, row.response) for row in results),
+    )
     manifest = media_manifest(
         M3RunManifest,
         arguments,
         deployment,
+        scoring=scoring,
         runner_version=M3_RUNNER_VERSION,
         adapter_version=M3_BENCH_ADAPTER_VERSION,
         annotation_sha256=sha256_file(arguments.dataset_path),

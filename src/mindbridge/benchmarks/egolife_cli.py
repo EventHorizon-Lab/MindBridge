@@ -25,6 +25,7 @@ from mindbridge.benchmarks.cli_common import (
     media_arguments,
     media_manifest,
     report,
+    scoring_snapshot,
     select_by_id,
     write_run_artifacts,
 )
@@ -41,6 +42,7 @@ from mindbridge.benchmarks.egolife_runner import (
     load_prepared_egolife,
     run_egolife_qa,
 )
+from mindbridge.benchmarks.scoring import require_scoring_is_possible
 from mindbridge.contracts import Identifier, NonEmptyString, Sha256Hex
 from mindbridge.file_integrity import sha256_file
 from mindbridge.prompts import PERCEIVE_EVENTS_PROMPT
@@ -81,6 +83,7 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
         limit=arguments.limit,
     )
     prepared = load_prepared_egolife(arguments.prepared_media_path)
+    require_scoring_is_possible("egolife", predict_only=arguments.predict_only)
     require_writable_output_pair(arguments.output_path, overwrite=arguments.overwrite)
     deployment = load_deployment_snapshot(
         arguments.deployment_config_path,
@@ -138,10 +141,12 @@ def _write_artifacts(
         )
         + "\n"
     )
+    scoring = scoring_snapshot("egolife", arguments, metrics={"accuracy": metrics.accuracy})
     manifest = media_manifest(
         EgoLifeRunManifest,
         arguments,
         deployment,
+        scoring=scoring,
         runner_version=EGOLIFE_RUNNER_VERSION,
         adapter_version=EGOLIFE_QA_ADAPTER_VERSION,
         annotation_sha256=sha256_file(arguments.dataset_path),

@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 from benchmark_deployment import write_deployment_snapshot
+from stub_judge import stub_judge  # noqa: F401 - autouse within this module
 
 from mindbridge.benchmarks import atm_cli
 from mindbridge.benchmarks.atm_bench import AtmSgmRecord
@@ -471,6 +472,7 @@ def test_manifest_media_item_count_matches_the_arm_that_actually_ran(tmp_path: P
             request_timeout_seconds=1_800.0,
             limit=None,
             overwrite=False,
+            predict_only=False,
             quiet=True,
             device_id="atm_archive",
             poll_interval_seconds=1.0,

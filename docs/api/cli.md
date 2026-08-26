@@ -19,7 +19,7 @@ uv run --extra server mindbridge lifecycle --help
 | --- | --- |
 | `mindbridge` | `config check`, `consolidate`, `jobs`, `lifecycle`, `mcp`, `jina serve`, `edge sync` |
 | `mindbridge-bench` | `locomo-refined`, `m3`, `egolife`, `egomem`, `egotempo`, `memlens`, `mm-lifelong`, `atm`, `mem-gallery`, `supermemory`, `video-mme`, `video-mme-v2`, `aml` |
-| `mindbridge-bench` support | `suite`, `score`, `datasets`, `jina`, `bakeoff` |
+| `mindbridge-bench` support | `eval`, `score`, `datasets`, `jina`, `bakeoff` |
 
 `mindbridge-consolidate`, `mindbridge-lifecycle`, and `mindbridge-mcp` remain as aliases for the
 subcommands of the same name. They route through the same module and report the same codes.
@@ -412,7 +412,7 @@ uv run mindbridge-bench
 
 | Support command | Extra | Purpose |
 | --- | --- | --- |
-| `suite` | `benchmarks` | Run several of the runners above by name, downloading what they read. |
+| `eval` | `benchmarks` | Run one or more of the runners above by name, downloading what they read. |
 | `score` | — | Record an official scorer's verdict beside a run. |
 | `datasets` | `benchmarks` | Check every official release parses and pins its digest. |
 | `jina` | `cloud-models` | Check the local Jina Omni embedder answers. |
@@ -421,23 +421,49 @@ uv run mindbridge-bench
 Runners drive the production REST API. There is no evaluation-only path, which is the point: a
 benchmark that bypasses the product measures something the product does not do.
 
-Every runner accepts `--limit N` to run only the first N of its own units, which is what makes a
-smoke run cheap enough to iterate on.
+Every benchmark runner above accepts `--limit N` to run only the first N of its own units, and
+`--predict-only` to write predictions without scoring them — no judge is contacted and every
+declared metric reports `999`, lmms-eval's bypass sentinel. `aml` is a replay rather than a
+benchmark and takes neither.
 
-`suite` runs several runners in one invocation. `--tasks` names entries in a shipped catalog and
-each official release is downloaded at a pinned revision if absent, so the common case needs
+`--limit` bounds the units answered. For ATM-Bench and MM-Lifelong the corpus is one shared
+archive per tenant rather than one per unit, so it is ingested in full whatever the limit — the
+flag makes those two cheaper to iterate on, not cheap.
+
+Seven benchmarks score their own free-text answers by calling a judge model from inside the run,
+which needs `MINDBRIDGE_BENCH_JUDGE_ENDPOINT` set; a judge that cannot be read scores the answer
+`0.0`. See [benchmarking](../benchmarking.md#scoring-and-what-copying-lmms-eval-costs).
+
+`eval` runs one or more runners in one invocation. `--tasks` names entries in a shipped catalog
+and each official release is downloaded at a pinned revision if absent, so the common case needs
 neither a file to write nor a corpus to populate first:
 
 ```bash
-uv run --extra benchmarks mindbridge-bench suite --tasks released-text --run-id sweep-001 --limit 2
-uv run --extra benchmarks mindbridge-bench suite --list-tasks
+uv run --extra benchmarks mindbridge-bench eval --tasks released-text --limit 2
 ```
 
-Only `--run-id` and the task names have no default. Downloads are verified against the digests in
+```bash
+uv run --extra benchmarks mindbridge-bench eval --list-tasks
+```
+
+The task names are the only thing with no default; `--run-id` falls back to `sweep-<UTC
+timestamp>`. Pass it explicitly for any task reading a prepared-media manifest you staged
+yourself: the manifest's object URIs are only readable under the tenant its run ID derives, so
+that ID has to be the one you staged for. Downloads are pinned to a commit and, where the smoke
+manifest names a digest for them, verified against
 `benchmarks/manifests/dataset-adapters-smoke.json`; prepared-media manifests are the one input no
-release supplies. The sweep derives each task's `--output` and `--run-id` so two parameterisations
-of one benchmark cannot share a tenant, continues past a task that fails, and records every
-outcome in `suite-summary.json`. See
+release supplies.
+
+`--suite FILE` is the escape hatch for a task the catalog does not name — a JSON file of
+`{"tasks": [{"name": ..., "benchmark": ..., "arguments": [...]}]}`, validated exactly as strictly
+as a catalog entry, with `--tasks` narrowing it. Nothing is downloaded for a suite file, because
+its paths are literal and guessing which of a task's arguments are files is how a tool starts
+fetching a `--split` value. The sweep gives each task a directory of its own under `--output-dir` and
+derives its `--run-id`, so two parameterisations of one benchmark cannot share a tenant. It
+continues past a task that fails, records every outcome in `suite-summary.json`, and prints a
+results table on stdout naming, per task, the numbers its manifest and score sidecar carry and
+which of the two each came from. `--report DIR` prints that table again for a directory an
+earlier run wrote, which is how a benchmark scored afterwards gets its numbers on screen. See
 [benchmarking](../benchmarking.md#running-several-benchmarks-in-one-command).
 
 See [benchmarking](../benchmarking.md) for datasets, protocol, and what the numbers license you

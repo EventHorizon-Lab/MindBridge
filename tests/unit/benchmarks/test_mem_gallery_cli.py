@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 from benchmark_deployment import write_deployment_snapshot
+from stub_judge import stub_judge  # noqa: F401 - autouse within this module
 
 from mindbridge.benchmarks import mem_gallery_cli
 
@@ -379,6 +380,7 @@ def test_manifest_counts_match_the_topics_this_run_actually_answered(tmp_path: P
             request_timeout_seconds=1_800.0,
             limit=None,
             overwrite=False,
+            predict_only=False,
             quiet=True,
             device_id="mem_gallery_conversation",
             poll_interval_seconds=1.0,

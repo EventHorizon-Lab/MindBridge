@@ -79,6 +79,15 @@ class Runner:
     summary: str
     extra: str | None = None
     """The optional dependency group this runner needs, named when its import fails."""
+    media: bool = False
+    """Whether this runner's parser carries the knobs `add_media_arguments` adds.
+
+    Declared rather than discovered because a sweep resolves every task's argv before it imports
+    any runner, and importing eleven modules to ask each one would give up the lazy dispatch that
+    keeps `--help` cheap. Positive rather than a list of the text-only runners: one added here
+    without the flag silently misses a forwarded knob, where a text-only runner missing from a
+    negative list would be handed `--device-id` and fail its task outright.
+    """
 
     def handler(self) -> Callable[..., object]:
         """Import the module this runner lives in and return its entry point."""
@@ -89,29 +98,37 @@ RUNNERS: dict[str, Runner] = {
     "locomo-refined": Runner(
         "mindbridge.benchmarks.locomo_refined_cli", "Run official LoCoMo-Refined"
     ),
-    "m3": Runner("mindbridge.benchmarks.m3_cli", "Run official M3-Bench"),
-    "egolife": Runner("mindbridge.benchmarks.egolife_cli", "Run official EgoLifeQA"),
-    "egomem": Runner("mindbridge.benchmarks.egomem_cli", "Run official EgoMemReason"),
-    "egotempo": Runner("mindbridge.benchmarks.egotempo_cli", "Run official EgoTempo"),
-    "memlens": Runner("mindbridge.benchmarks.memlens_cli", "Run official MemLens"),
-    "mm-lifelong": Runner("mindbridge.benchmarks.mm_lifelong_cli", "Run official MM-Lifelong"),
-    "atm": Runner("mindbridge.benchmarks.atm_cli", "Run official ATM-Bench"),
-    "mem-gallery": Runner("mindbridge.benchmarks.mem_gallery_cli", "Run official Mem-Gallery"),
-    "supermemory": Runner("mindbridge.benchmarks.supermemory_cli", "Run official SuperMemory VQA"),
+    "m3": Runner("mindbridge.benchmarks.m3_cli", "Run official M3-Bench", media=True),
+    "egolife": Runner("mindbridge.benchmarks.egolife_cli", "Run official EgoLifeQA", media=True),
+    "egomem": Runner("mindbridge.benchmarks.egomem_cli", "Run official EgoMemReason", media=True),
+    "egotempo": Runner("mindbridge.benchmarks.egotempo_cli", "Run official EgoTempo", media=True),
+    "memlens": Runner("mindbridge.benchmarks.memlens_cli", "Run official MemLens", media=True),
+    "mm-lifelong": Runner(
+        "mindbridge.benchmarks.mm_lifelong_cli", "Run official MM-Lifelong", media=True
+    ),
+    "atm": Runner("mindbridge.benchmarks.atm_cli", "Run official ATM-Bench", media=True),
+    "mem-gallery": Runner(
+        "mindbridge.benchmarks.mem_gallery_cli", "Run official Mem-Gallery", media=True
+    ),
+    "supermemory": Runner(
+        "mindbridge.benchmarks.supermemory_cli", "Run official SuperMemory VQA", media=True
+    ),
     "video-mme": Runner(
         "mindbridge.benchmarks.video_mme_cli",
         "Run official Video-MME",
         extra="benchmarks",
+        media=True,
     ),
     "video-mme-v2": Runner(
         "mindbridge.benchmarks.video_mme_v2_cli",
         "Run official Video-MME-v2",
         extra="benchmarks",
+        media=True,
     ),
     "aml": Runner("mindbridge.benchmarks.aml.cli", "Replay one offline AML pipeline"),
-    "suite": Runner(
+    "eval": Runner(
         "mindbridge.benchmarks.suite",
-        "Run several benchmarks from one suite file",
+        "Run one or more benchmarks by name and print a results table",
     ),
     "score": Runner(
         "mindbridge.benchmarks.official_score",

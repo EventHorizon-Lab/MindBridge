@@ -31,11 +31,13 @@ from mindbridge.benchmarks.cli_common import (
     report,
     report_unit,
     require_declared_transcripts,
+    scoring_snapshot,
     select_by_id,
     write_run_artifacts,
 )
 from mindbridge.benchmarks.prompts import VIDEO_MME_V2_QUERY_PROMPT
 from mindbridge.benchmarks.runtime import PreparedVideo, load_prepared_videos
+from mindbridge.benchmarks.scoring import require_scoring_is_possible
 from mindbridge.benchmarks.video_mme_v2 import (
     GROUP_SIZE,
     VIDEO_MME_V2_ADAPTER_VERSION,
@@ -96,6 +98,7 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
     )
     prepared = _select_prepared(load_prepared_videos(arguments.prepared_media_path), groups)
     require_declared_transcripts(prepared, arguments.transcript_source)
+    require_scoring_is_possible("video-mme-v2", predict_only=arguments.predict_only)
     require_writable_output_pair(arguments.output_path, overwrite=arguments.overwrite)
     deployment = load_deployment_snapshot(
         arguments.deployment_config_path,
@@ -160,10 +163,20 @@ def _write_artifacts(
         + "\n"
     )
     segments = tuple(segment for video in prepared for segment in video.segments)
+    metrics = evaluate_video_mme_v2(results)
+    scoring = scoring_snapshot(
+        "video-mme-v2",
+        arguments,
+        metrics={
+            "rating.overall": metrics.rating.overall,
+            "accuracy.overall": metrics.accuracy.overall,
+        },
+    )
     manifest = media_manifest(
         VideoMMEV2RunManifest,
         arguments,
         deployment,
+        scoring=scoring,
         runner_version=VIDEO_MME_V2_RUNNER_VERSION,
         adapter_version=VIDEO_MME_V2_ADAPTER_VERSION,
         annotation_sha256=sha256_file(arguments.dataset_path),
@@ -182,7 +195,7 @@ def _write_artifacts(
         transcript_segment_count=sum(segment.transcript is not None for segment in segments),
         group_types=tuple(dict.fromkeys(group.group_type for group in groups)),
         transcript_source=arguments.transcript_source,
-        metrics=evaluate_video_mme_v2(results),
+        metrics=metrics,
     )
     write_run_artifacts(arguments.output_path, predictions, manifest)
 
