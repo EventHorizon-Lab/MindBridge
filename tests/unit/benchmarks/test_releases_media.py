@@ -9,6 +9,9 @@ interrupted halfway through 94 GiB.
 
 from __future__ import annotations
 
+import hashlib
+import sys
+import types
 import zipfile
 from collections.abc import Sequence
 from pathlib import Path
@@ -18,6 +21,7 @@ import pytest
 
 from mindbridge.benchmarks import releases
 from mindbridge.benchmarks.releases import (
+    ACQUIRERS,
     MEDIA,
     RELEASES,
     UNOBTAINABLE,
@@ -89,16 +93,27 @@ def test_media_that_ships_as_archives_is_the_only_media_named_by_a_zip_pattern()
     assert archived == {"video-mme", "video-mme-v2"}
 
 
-def test_asking_for_media_no_download_can_obtain_says_so_and_says_what_to_do(
+def test_asking_for_media_nothing_can_obtain_says_so_and_says_what_to_do(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Ego4D is behind a signed agreement; discovering that as an absent file wastes the run."""
-    with pytest.raises(FileNotFoundError) as caught:
-        ensure_media("egotempo", root=tmp_path, announce=_never)
+    """A set with no acquirer refuses by name, rather than being discovered as an absent file.
 
-    message = str(caught.value)
-    assert "ego4d-data.org" in message
-    assert "<benchmarks-root>/egotempo/videos/<clip_id>.mp4" in message
+    Asserted against an entry made here rather than a real one: both real entries now have an
+    acquirer, so `ensure_media` dispatches for them and this branch has no live example -- but a
+    set added to `UNOBTAINABLE` before anyone writes its acquirer is exactly the state this arm
+    is for, and it is one commit away at any time.
+    """
+    monkeypatch.setitem(
+        releases.UNOBTAINABLE,
+        "probe",
+        "nothing can fetch it; put it in <benchmarks-root>/probe/videos/<clip_id>.mp4 yourself",
+    )
+
+    with pytest.raises(FileNotFoundError) as caught:
+        ensure_media("probe", root=tmp_path, announce=_never)
+
+    assert "<benchmarks-root>/probe/videos/<clip_id>.mp4" in str(caught.value)
 
 
 def test_asking_for_a_media_set_that_does_not_exist_lists_the_ones_that_do(
@@ -397,12 +412,42 @@ def test_no_download_refuses_absent_media_rather_than_fetching_it(
 def test_no_download_still_reports_an_unobtainable_set_as_unobtainable(tmp_path: Path) -> None:
     """The flag must not turn a licensing wall into a download complaint.
 
-    `egotempo` can never be fetched by any flag, so the operator's instructions are the useful
-    answer whether or not downloading was permitted; reporting `--no-download` instead would send
-    them to drop a flag that was never what stood in the way.
+    Telling an operator to drop `--no-download` implies that dropping it would work. Without an
+    Ego4D signature it would not, so the flag cannot be the whole message -- which is what this
+    asserted before anything could acquire these two, by reporting the wall and not the flag.
+
+    Both now, because after `ACQUIRERS` exactly one of the two facts is knowable. The flag is
+    certain and the signature is not, and finding out would mean probing for a credential inside
+    the one flag that says not to go and look. Naming only the wall would send an operator who
+    does hold the CLI and the credential off to fetch 920 videos by hand that dropping the flag
+    would have fetched for them, so the fix is not to choose.
     """
-    with pytest.raises(FileNotFoundError, match=r"signed access agreement"):
+    with pytest.raises(FileNotFoundError, match=r"signed access agreement") as caught:
         ensure_media("egotempo", root=tmp_path, download=False)
+
+    message = str(caught.value)
+    assert "--no-download" in message, "the flag that refused is the operator's own doing"
+    assert "ego4d-data.org" in message, "and the wall it may not be enough to lift"
+
+
+def test_no_download_still_reports_a_set_with_no_acquirer_as_unobtainable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A set nothing can obtain is not waiting on permission to download.
+
+    The other arm of the same rule, kept because both real entries now have an acquirer: a row
+    added to `UNOBTAINABLE` before its acquirer exists must report the wall alone, since here
+    dropping the flag really would change nothing.
+    """
+    monkeypatch.setitem(
+        releases.UNOBTAINABLE, "probe", "nobody can fetch it; see <benchmarks-root>"
+    )
+
+    with pytest.raises(FileNotFoundError, match=r"nobody can fetch it") as caught:
+        ensure_media("probe", root=tmp_path, download=False)
+
+    assert "--no-download" not in str(caught.value), "no flag is what stands in the way here"
 
 
 def test_a_gated_release_names_the_terms_to_accept_rather_than_a_missing_repository(
@@ -438,3 +483,274 @@ def test_a_gated_release_names_the_terms_to_accept_rather_than_a_missing_reposit
     message = str(raised.value)
     assert "huggingface.co/datasets/lmms-eval/Video-MME" in message, "names the terms to accept"
     assert "hf auth login" in message and "HF_TOKEN" in message, "names how to authorise"
+
+
+def test_every_acquired_media_set_is_named_by_the_three_tables_it_has_to_agree_with() -> None:
+    """An acquired set is a row in `ACQUIRERS`, a fallback in `UNOBTAINABLE`, and not in `MEDIA`.
+
+    All three, or the dispatch is silently wrong in a way no producer can see. Missing from
+    `UNOBTAINABLE`, `_acquire` raises `KeyError` from inside its own error path -- the operator
+    loses the one sentence that would have unblocked them, at the moment they need it. Present in
+    `MEDIA` as well, which behaviour you get depends on which table is consulted first.
+    """
+    assert set(ACQUIRERS) == {"egotempo", "m3-web"}
+    assert set(ACQUIRERS) <= set(UNOBTAINABLE), "an acquisition with no manual fallback"
+    assert set(ACQUIRERS) & set(MEDIA) == set()
+    for name, acquirer in ACQUIRERS.items():
+        assert acquirer.release in RELEASES, f"{name} lands in a directory no release owns"
+        assert acquirer.annotations, f"{name} declares no annotation, so it has no input"
+        for annotation in acquirer.annotations:
+            assert annotation.split("/")[0] in RELEASES, f"{name} reads {annotation}"
+
+
+def test_the_annotation_an_acquirer_reads_is_one_a_catalog_task_already_declares() -> None:
+    """`ACQUIRERS` restates a path the catalog also spells, and this is what holds the two together.
+
+    It has to be restated: `releases` cannot import the catalog, because the catalog imports the
+    producers and the producers import `releases`. So the duplication is real, and a drifted copy
+    would be a fetch of the wrong file followed by an acquirer reading an absent one -- which is
+    the failure the fetch was added to prevent. Asserted against the catalog's own declared
+    inputs rather than against a literal, so moving a dataset path fails here.
+    """
+    from mindbridge.benchmarks.task_catalog import TASKS
+
+    root = Path("/corpus")
+    declared = {path for task in TASKS.values() for path in task.inputs(root=root)}
+
+    for name, acquirer in ACQUIRERS.items():
+        for annotation in acquirer.annotations:
+            assert root / annotation in declared, f"{name} reads {annotation}, which no task does"
+
+
+def test_an_acquired_media_set_is_handed_to_its_acquirer_with_the_units_it_asked_for(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The whole point of the seam: `ensure_media` dispatches instead of refusing.
+
+    `only` is asserted because it is not a nicety here. `m3-web` is 920 live URLs and EgoTempo is
+    one Ego4D span per clip, so an acquirer handed no narrowing at all does the entire release to
+    satisfy a `--limit 1` run. The corpus root is passed rather than the release directory, which
+    is the same contract `Media` has: the acquirer joins its own layout.
+    """
+    seen: list[dict[str, object]] = []
+    _install_acquirer(monkeypatch, tmp_path, acquire=lambda **kwargs: seen.append(kwargs))
+
+    destination = ensure_media("egotempo", root=tmp_path, only=("videos/one.mp4",))
+
+    assert destination == tmp_path / "egotempo"
+    assert seen == [{"root": tmp_path, "only": ("videos/one.mp4",), "announce": None}]
+
+
+def test_the_annotation_an_acquirer_reads_is_on_disk_before_it_is_called(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An acquirer's inputs are inside a release file, so the file is a precondition of calling it.
+
+    The sweep fetches annotations in its own pre-flight, but only for catalog tasks and only for
+    the path in argv -- while an acquirer opens the path it derives itself. `--suite`, a bare
+    runner invocation, and a `--dataset` pointing elsewhere all reach a producer without it, so
+    the ordering is asserted here, where every one of those paths goes through.
+
+    The acquirer reads the file rather than checking that it exists, because that is what its real
+    body does with it: recording the order alone would pass on a fetch that wrote the bytes after
+    the call.
+    """
+    order: list[str] = []
+    body = '{"annotations": []}'
+    # The recorded digest is moved to these bytes rather than switched off, so the fetch this test
+    # asserts the ordering of is the same fetch that verifies -- see the test below for what the
+    # verification does when they disagree.
+    monkeypatch.setitem(
+        releases.RECORDED_DIGESTS,
+        "egotempo_openQA.json",
+        hashlib.sha256(body.encode("utf-8")).hexdigest(),
+    )
+
+    def write_annotation(release: Release, within: str, *, destination: Path) -> None:
+        order.append(f"fetched {within}")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(body, encoding="utf-8")
+
+    def acquire(*, root: Path, only: Sequence[str], announce: object) -> None:
+        order.append((root / "egotempo" / "egotempo_openQA.json").read_text(encoding="utf-8"))
+
+    monkeypatch.setattr(releases, "_download_from_git", write_annotation)
+    _install_acquirer(monkeypatch, tmp_path, acquire=acquire, annotation=False)
+
+    ensure_media("egotempo", root=tmp_path)
+
+    assert order == ["fetched egotempo_openQA.json", body]
+
+
+def test_a_drifted_annotation_stops_the_acquisition_rather_than_driving_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The annotation is where every URL and every clip span comes from, so its bytes decide 920
+    downloads. Fetching it through `fetch` rather than checking that it exists is what puts the
+    recorded digest in front of them: upstream changing the release stops the run here instead of
+    acquiring a corpus that no longer matches the questions anyone will be scored on."""
+    reached: list[dict[str, object]] = []
+
+    def write_other_bytes(release: Release, within: str, *, destination: Path) -> None:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text("upstream rewrote this", encoding="utf-8")
+
+    monkeypatch.setattr(releases, "_download_from_git", write_other_bytes)
+    _install_acquirer(
+        monkeypatch, tmp_path, acquire=lambda **kwargs: reached.append(kwargs), annotation=False
+    )
+
+    with pytest.raises(ValueError, match=r"hashed to .*, not the .* recorded in"):
+        ensure_media("egotempo", root=tmp_path)
+
+    assert reached == [], "a drifted annotation must not reach the acquirer at all"
+
+
+def test_an_acquirer_that_is_not_installed_falls_back_to_doing_it_by_hand(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A prerequisite this package does not depend on is absent as an `ImportError`.
+
+    `yt-dlp`, the Ego4D CLI, or the acquirer module itself in an installation that predates it.
+    None of those is a broken build, and all three leave the operator in exactly the position
+    `UNOBTAINABLE` was written for -- so the sentence is the fallback rather than a traceback
+    about an import. Chained, so `MINDBRIDGE_TRACEBACK=1` still names the module.
+    """
+    _install_acquirer(monkeypatch, tmp_path, module="mindbridge.benchmarks.acquire_nothing")
+
+    with pytest.raises(FileNotFoundError) as caught:
+        ensure_media("egotempo", root=tmp_path)
+
+    message = str(caught.value)
+    assert "ego4d-data.org" in message, "the manual instruction is the fallback"
+    assert "<benchmarks-root>/egotempo/videos/<clip_id>.mp4" in message, "and its destination"
+    assert isinstance(caught.value.__cause__, ImportError)
+
+
+def test_a_prerequisite_missing_inside_the_acquisition_is_still_a_missing_prerequisite(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An acquirer's third-party tool is not necessarily imported at its module scope.
+
+    The Ego4D one imports the `ego4d` CLI inside `acquire`, after checking whether the corpus is
+    already cut -- so on an install without it the `ImportError` comes from the call, not from
+    `import_module`. Caught only around the import, the ordinary missing-prerequisite case fell
+    into the generic arm and read as an unexpected failure rather than as the thing to install.
+    """
+
+    def missing_tool(**_: object) -> None:
+        raise ImportError("no module named 'ego4d'; install it with `uv pip install ego4d`")
+
+    _install_acquirer(monkeypatch, tmp_path, acquire=missing_tool)
+
+    with pytest.raises(FileNotFoundError) as caught:
+        ensure_media("egotempo", root=tmp_path)
+
+    message = str(caught.value)
+    assert "cannot be acquired here" in message, "the missing-prerequisite arm, not the generic one"
+    assert "uv pip install ego4d" in message, "and what to install"
+    assert "ego4d-data.org" in message
+
+
+def test_an_acquisition_that_fails_says_what_failed_as_well_as_what_to_do(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A missing credential and a dead URL both surface inside the acquisition, not before it.
+
+    Both sentences are needed and neither is enough: what went wrong is the only thing that says
+    whether to retry, and the manual instruction is the only thing that says what to do if not.
+    """
+
+    def refuse(**_: object) -> None:
+        raise RuntimeError("no Ego4D credential in ~/.aws/credentials")
+
+    _install_acquirer(monkeypatch, tmp_path, acquire=refuse)
+
+    with pytest.raises(FileNotFoundError) as caught:
+        ensure_media("egotempo", root=tmp_path)
+
+    message = str(caught.value)
+    assert "no Ego4D credential" in message, "what actually went wrong"
+    assert "ego4d-data.org" in message, "and what to do about it"
+    assert isinstance(caught.value.__cause__, RuntimeError)
+
+
+def test_an_interrupted_acquisition_stays_an_interrupt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """920 downloads is where a sweep gets interrupted, and `suite` turns that into a summary.
+
+    Reduced to `FileNotFoundError` here, `_run_task_prepared` would report the task as failed,
+    `_run_plans` would carry on into the next benchmark, and the operator's Ctrl-C would start
+    the next acquisition instead of stopping the sweep.
+    """
+
+    def interrupt(**_: object) -> None:
+        raise KeyboardInterrupt
+
+    _install_acquirer(monkeypatch, tmp_path, acquire=interrupt)
+
+    with pytest.raises(KeyboardInterrupt):
+        ensure_media("egotempo", root=tmp_path)
+
+
+def test_no_download_refuses_an_acquisition_before_it_reaches_the_acquirer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`--no-download` governs the largest fetch in the tree, which is now an acquisition.
+
+    Refused before the import and before the annotation fetch, which is what makes the flag hold
+    where the acquirer is not installed at all -- and what keeps a flag named `--no-download`
+    from performing the pinned download of an annotation on its way to refusing. What the message
+    says is the neighbouring test's subject; this one is that nothing happened.
+    """
+    _install_acquirer(
+        monkeypatch,
+        tmp_path,
+        acquire=lambda **_: pytest.fail("--no-download must refuse before the acquirer runs"),
+    )
+    monkeypatch.setattr(
+        releases,
+        "fetch",
+        lambda *_, **__: pytest.fail("--no-download must refuse before the annotation fetch"),
+    )
+
+    with pytest.raises(FileNotFoundError, match=r"--no-download was given"):
+        ensure_media("egotempo", root=tmp_path, download=False, announce=_never)
+
+
+def _install_acquirer(
+    monkeypatch: pytest.MonkeyPatch,
+    root: Path,
+    *,
+    acquire: object = None,
+    module: str = "mindbridge_probe_acquirer",
+    annotation: bool = True,
+) -> None:
+    """Register an acquirer for `egotempo` that is this test rather than the Ego4D CLI.
+
+    The real key rather than a synthetic one, because `_acquire` reads `UNOBTAINABLE[release]`
+    for its fallback and a made-up key would raise `KeyError` from inside the error path -- which
+    is a thing worth failing on, and is asserted by the table test rather than papered over here.
+
+    The annotation is written by default so `fetch` finds it present and no test that is about
+    something else reaches the network. `annotation=False` is for the one test that is about the
+    fetch itself.
+    """
+    if annotation:
+        path = root / "egotempo" / "egotempo_openQA.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{}", encoding="utf-8")
+    if acquire is not None:
+        probe = types.ModuleType(module)
+        probe.acquire = acquire  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, module, probe)
+    monkeypatch.setitem(
+        releases.ACQUIRERS,
+        "egotempo",
+        releases.Acquirer(
+            release="egotempo",
+            module=module,
+            annotations=ACQUIRERS["egotempo"].annotations,
+        ),
+    )

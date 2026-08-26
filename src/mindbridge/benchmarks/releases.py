@@ -65,10 +65,13 @@ producers build source files from, so they are the contract rather than an illus
   does not live in its benchmark's own release: the annotations are a Git repository and the
   videos are a Hub dataset, which is why `Media` names a release rather than assuming one.
 
-Two media sets cannot be fetched at all, and `UNOBTAINABLE` says so by name rather than letting a
-producer discover it as an absent file. `egotempo` is Ego4D, behind a signed access agreement no
-unattended download can accept; `m3-web` is 920 YouTube URLs carried in the annotation. Both raise
-naming the destination the operator has to fill in themselves.
+**And two media sets no snapshot supplies.** `egotempo` is Ego4D, behind a signed access
+agreement no `snapshot_download` can accept; `m3-web` is 920 YouTube URLs carried in the
+annotation rather than files. Neither is in `MEDIA`, because neither is a pattern against a
+pinned repository -- they are obtained by talking to something else, which is what `ACQUIRERS`
+dispatches to. `UNOBTAINABLE` keeps the sentence saying how to do it by hand, and that sentence
+is what an operator gets when the acquisition cannot run: no Ego4D credential, no `yt-dlp`,
+no acquirer module installed at all.
 """
 
 from __future__ import annotations
@@ -77,6 +80,7 @@ import shutil
 import zipfile
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
+from importlib import import_module
 from pathlib import Path
 
 from mindbridge.file_integrity import sha256_file
@@ -162,6 +166,58 @@ MEDIA: dict[str, Media] = {
 }
 """Where a producer's source files come from, for the media sets something can fetch."""
 
+
+@dataclass(frozen=True, slots=True)
+class Acquirer:
+    """One media set no pinned snapshot supplies, and the module that obtains it another way."""
+
+    release: str
+    """The directory it lands in under the corpus root, exactly as `Media.release` is."""
+    module: str
+    """Imported when it is needed, exposing `acquire(*, root, only, announce) -> None`.
+
+    Imported lazily, and by name rather than at module scope, for two reasons. An acquirer needs
+    third-party tools this package does not depend on -- `yt-dlp`, the Ego4D CLI -- so importing
+    one eagerly would make every `mindbridge-bench` invocation fail on a corpus that never asks
+    for it. And an acquirer reads the release's annotations, so it imports the adapters that
+    parse them, which import this module.
+    """
+    annotations: tuple[str, ...]
+    """The release files the acquirer reads, relative to the corpus root, fetched before it runs.
+
+    An acquirer's inputs are not files at all -- they are URLs and clip spans carried *inside* an
+    annotation -- so the annotation is a precondition rather than a convenience. `_acquire`
+    passes these through `fetch`, which is already the pinned download plus the recorded-digest
+    check, so an acquirer is handed verified bytes or the run stops. Doing it here rather than
+    trusting the caller matters: the sweep's own pre-flight covers only catalog tasks, so
+    `--suite`, a bare runner invocation, and a `--dataset` pointing somewhere else all reach a
+    producer without it. Every entry has to be a path some catalog task declares, which
+    `tests/unit/benchmarks/test_releases_media.py` asserts, since this module cannot import the
+    catalog -- the catalog imports the producers, and the producers import this.
+    """
+
+
+ACQUIRERS: dict[str, Acquirer] = {
+    "egotempo": Acquirer(
+        release="egotempo",
+        module="mindbridge.benchmarks.acquire_ego4d",
+        annotations=("egotempo/egotempo_openQA.json",),
+    ),
+    "m3-web": Acquirer(
+        release="m3-bench",
+        module="mindbridge.benchmarks.acquire_youtube",
+        annotations=("m3-agent/data/annotations/web.json",),
+    ),
+}
+"""How the two media sets `MEDIA` cannot describe are obtained.
+
+Keyed by media set, like `MEDIA`, and disjoint from it: a set is either a pattern against a
+pinned repository or an acquisition, never both, or which one you get would depend on lookup
+order. Every key here is also in `UNOBTAINABLE`, which is the fallback rather than a duplicate --
+an acquisition has prerequisites outside this program, and the sentence there is what an operator
+gets when one of them is absent.
+"""
+
 UNOBTAINABLE: dict[str, str] = {
     "egotempo": (
         "its videos are Ego4D, which is released under a signed access agreement no unattended "
@@ -175,11 +231,16 @@ UNOBTAINABLE: dict[str, str] = {
         "<benchmarks-root>/m3-bench/videos/web/<video_id>.mp4"
     ),
 }
-"""Media that has to be acquired by hand, and the sentence saying how.
+"""How to obtain each acquired media set by hand, for when the acquisition cannot run.
 
-Named rather than omitted. A media set absent from both tables is a typo in a producer and says
+Named rather than omitted. A media set absent from every table is a typo in a producer and says
 so; one absent from `MEDIA` alone would be indistinguishable from a fetch that quietly found
 nothing, which is the failure this whole module is arranged to make impossible.
+
+These two used to be a refusal and nothing else. `ACQUIRERS` now runs first, so this is the
+fallback: the acquirer module is not installed, its third-party tool is not, or the credential it
+needs is not. Every sentence names the destination it would have written, because that is the
+only instruction an operator gets and a producer looks for exactly that path afterwards.
 """
 
 RECORDED_DIGESTS: dict[str, str] = {
@@ -278,14 +339,26 @@ def ensure_media(
     `only` narrows the fetch to particular repository paths, which is what keeps a `--limit 2` run
     off the 477 GiB of EgoLife it will not read. It is refused for a media set that ships as
     archives: a video's bytes live inside one opaque multi-gigabyte volume with no published index
-    of which, so the honest answer to "just this video" there is all of them.
+    of which, so the honest answer to "just this video" there is all of them. An acquired set
+    takes the same paths, relative to its own directory, and narrowing one is not an optimisation
+    there: `--limit 1` over `m3-web` without it is 920 YouTube downloads to cut one video.
 
     Whether a specific unit arrived is the caller's to check. This says the media set was fetched;
     a producer that then cannot find one video knows which video and which unit wanted it, and
     says so far better than anything here could. Call it when the file a producer wants is absent
-    rather than before every producer: a set in `UNOBTAINABLE` raises on the way in, so calling it
-    unconditionally would refuse a corpus the operator had already filled in by hand.
+    rather than before every producer: an acquired set costs the whole acquisition, so calling it
+    unconditionally would re-derive a corpus the operator had already filled in by hand.
     """
+    acquirer = ACQUIRERS.get(release)
+    if acquirer is not None:
+        return _acquire(
+            acquirer,
+            release,
+            root=root,
+            only=only,
+            announce=announce,
+            download=download,
+        )
     unobtainable = UNOBTAINABLE.get(release)
     if unobtainable is not None:
         raise FileNotFoundError(
@@ -329,6 +402,86 @@ def ensure_media(
         if pattern.endswith(".zip"):
             for archive in sorted(destination.glob(pattern)):
                 _extract(archive, announce=announce)
+    return destination
+
+
+def _acquire(
+    acquirer: Acquirer,
+    release: str,
+    *,
+    root: Path,
+    only: Sequence[str],
+    announce: Callable[[str], None] | None,
+    download: bool,
+) -> Path:
+    """Obtain one media set by talking to something other than the release, and say where it went.
+
+    Three things happen in this order, and the order is the contract:
+
+    **Refuse first.** `--no-download` means this program does not go and get bytes, and an
+    acquisition is the largest way it could -- 920 YouTube videos, or every Ego4D clip a split
+    names. Refused before the import so the flag holds even where the acquirer is not installed.
+
+    The refusal carries the manual instruction as well as the flag, which is the one place two
+    blocking facts are true at once and only one of them is knowable. The flag is certain: it
+    forbids this. Whether dropping it would be enough is not, and cannot be without probing for
+    an Ego4D signature, which is exactly what `--no-download` says not to do. Naming the flag
+    alone would imply that dropping it is sufficient and send an operator with no signature down
+    a dead end; naming the wall alone would send one who has the CLI and the credential off to
+    download 920 videos by hand that this program would have fetched for them. So both.
+
+    **Then the annotations.** An acquirer's inputs are inside a release file: the URL of each
+    `m3-web` video and the span of each EgoTempo clip. `fetch` is what puts that file on disk,
+    pinned and checked against its recorded digest, and it does nothing when the file is already
+    there. The sweep's own pre-flight does this too, for catalog tasks -- but only for the path in
+    argv, while an acquirer opens the path it derives itself, so `--suite`, a bare runner
+    invocation, and a `--dataset` pointing elsewhere all arrive here without it.
+
+    **Then the module.** Imported by name so that a corpus which never asks for these two sets
+    never needs `yt-dlp`, an Ego4D credential, or the module at all. An `ImportError` is not a
+    broken build, it is the ordinary case of a prerequisite this package does not depend on, so it
+    falls back to the sentence `UNOBTAINABLE` keeps for exactly that -- as does a failure inside
+    the acquisition itself, which is where a missing credential or a dead URL surfaces. Both chain
+    the original, so `MINDBRIDGE_TRACEBACK=1` still shows what actually went wrong. `Exception`
+    rather than `BaseException`: an interrupt during a long acquisition has to reach
+    `suite._run_task_prepared`, which turns it into an outcome and still writes the summary.
+    """
+    destination = root / acquirer.release
+    if not download:
+        raise FileNotFoundError(
+            f"{release} media is absent under {destination} and --no-download was given, so "
+            f"nothing here will go and get it. Dropping the flag acquires it, which needs: "
+            f"{UNOBTAINABLE[release]}"
+        )
+    unsupplied = fetch(
+        [root / name for name in acquirer.annotations],
+        root=root,
+        announce=announce,
+    )
+    if unsupplied:
+        raise FileNotFoundError(
+            f"{release} acquisition reads {', '.join(str(path) for path in unsupplied)}, which no "
+            "release in this table supplies; ACQUIRERS names the wrong annotation"
+        )
+    if announce is not None:
+        listed = ", ".join(only) if 0 < len(only) <= 4 else f"{len(only) or 'every'} unit"
+        announce(f"acquiring {release} media with {acquirer.module}: {listed}")
+    try:
+        module = import_module(acquirer.module)
+        module.acquire(root=root, only=tuple(only), announce=announce)
+    except ImportError as error:
+        # One try around both, because an acquirer's third-party tool is not necessarily imported
+        # at its module scope: the Ego4D one imports the `ego4d` CLI inside `acquire`, after it has
+        # checked whether the corpus is already cut, so an install that lacks it raises from the
+        # call rather than from the import. Catching it only around the import put the ordinary
+        # missing-prerequisite case in the generic arm below.
+        raise FileNotFoundError(
+            f"{release} media cannot be acquired here ({error}): {UNOBTAINABLE[release]}"
+        ) from error
+    except Exception as error:
+        raise FileNotFoundError(
+            f"{release} media could not be acquired ({error!r}): {UNOBTAINABLE[release]}"
+        ) from error
     return destination
 
 
