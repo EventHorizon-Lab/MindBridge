@@ -136,8 +136,8 @@ def prepare_m3(request: PrepareRequest) -> None:
     )
     # The runner's own check, run here too. Selecting the same way it does is not the same as
     # accepting the same input: `--subset web` pointed at `robot.json` selects fine and is then
-    # refused by the runner, so without this a producer cuts and uploads every video -- about
-    # 2 GB each -- before anything says the subset is wrong.
+    # refused by the runner, so without this a producer cuts and uploads every video -- the robot
+    # split averages 1.2 GB a file -- before anything says the subset is wrong.
     _validate_subset(videos, arguments.subset)
     target = staging()
     prepared: list[M3PreparedVideo] = []
@@ -156,7 +156,7 @@ def prepare_m3(request: PrepareRequest) -> None:
             # the release ships -- so an eager call would re-derive a corpus the operator had
             # already filled in, and an unnarrowed one would fetch all 920 to cut the one this
             # run selected. `m3-robot` had the same second problem against the Hub: `--limit 1`
-            # pulled all 100 robot videos, about 200 GB, to read 2 GB of it.
+            # pulled all 100 robot videos, 117 GiB, to read one of them.
             ensure_media(
                 f"m3-{arguments.subset}",
                 root=request.benchmarks_root,
@@ -165,15 +165,24 @@ def prepare_m3(request: PrepareRequest) -> None:
                 download=request.download,
             )
             if not source.exists():
-                # The two subsets are three orders of magnitude apart, and one message for both
-                # was wrong about whichever one you were running. `robot` is 100 Hub files at
-                # about 2 GB each, measured from the pinned revision; `web` is 920 web sources
-                # at about 20 MB, measured from the release's own URLs, so the figure that reads
-                # as "give up, you have no disk for this" belongs only to the first.
-                whole = "100 files of about 2 GB" if arguments.subset == "robot" else "920 web"
+                # A size per subset, because they are an order apart and one figure for both
+                # was wrong about whichever one you were running. `robot` is 100 Hub files
+                # totalling 117 GiB, from `repo_info(files_metadata=True)` at the pinned
+                # revision: mean 1.2 GiB but a range of 0.28 to 3.13, so no single per-file
+                # figure describes it and the total is the number worth quoting. An earlier
+                # "about 2 GB each" here was 1.7x high. `web` is 920 downloads of about
+                # 100 MB, measured from real ones at the 360p the acquirer selects -- an earlier
+                # 20 MB here came from `yt-dlp`'s `filesize_approx`, which is bitrate times
+                # duration and was 26x low on a video that arrived as 712 MB. Do not restate a
+                # figure from that field.
+                whole = (
+                    "100 files totalling 117 GiB"
+                    if arguments.subset == "robot"
+                    else "920 downloads of about 100 MB"
+                )
                 raise FileNotFoundError(
                     f"M3-Bench source video {source} is absent; the {arguments.subset} subset is "
-                    f"{whole} sources of the ByteDance-Seed/M3-Bench release"
+                    f"{whole} from the ByteDance-Seed/M3-Bench release"
                 )
         tenant_id = benchmark_tenant_id(arguments.tenant_prefix, video.video_id, arguments.run_id)
         clips = tuple(

@@ -261,13 +261,46 @@ is the prerequisite, not the automation.
 - **`m3-web`** — its 920 videos are web sources the release distributes as the `video_url` of each
   entry in `m3-agent/data/annotations/web.json` rather than as files, so the sweep downloads them
   with `yt-dlp` into `<benchmarks-root>/m3-bench/videos/web/<video_id>.mp4`. Each annotation key is
-  the YouTube ID, so the file name needs no template. The whole split is about 18 GB and takes
-  **8–15 hours** at the default pacing; a `--limit`ed run asks for only the videos it will read.
+  the YouTube ID, so the file name needs no template — though many of those IDs begin with a
+  hyphen, so inspecting the corpus by hand needs `./-4OBcRHX1Bc.mp4` or a `--` first. **Budget
+  roughly 90 GB and about 20 hours of wall clock for the whole split**; a `--limit`ed run asks for
+  only the videos it will read.
 
 Both are narrowed per unit, so `--tasks m3-web --limit 1` acquires one video rather than 920.
 `MINDBRIDGE_BENCH_YOUTUBE_SLEEP_SECONDS` (default `30`) is the wait before each download, jittered
 up to twice that, with metadata requests paced at a quarter of it. Raising it is the only lever
 against YouTube's bot detection, and a value that is not a number is refused rather than defaulted.
+
+**Those figures are measured, and estimating them was 30x wrong.** The constraint is YouTube's
+per-connection bandwidth, about 0.85 MB/s, not the pacing: the sleeps are 1–2% of the total, so
+**raising the pacing is nearly free and lowering it buys nearly nothing.** Treat that variable as
+insurance against being cut off, not as a throughput dial. And do not size this from `yt-dlp`'s
+`filesize_approx` — it is bitrate times duration, meaningless for the fragmented DASH formats
+YouTube serves, and it read 26x low on a video that arrived as 712 MB.
+
+**`--format-sort res:360` is why 90 GB and not 550 GB, and it is not a quality compromise.** The
+release's sources are 1920x1080, and taking the best available measured 596 MB and 496 seconds per
+video across three real downloads — about 550 GB and five days for the split. But every stored clip
+is capped at `DEFAULT_VIDEO_MAX_PIXELS`, **200,704 pixels**: a staged clip measures 596x336, so
+roughly 94% of a 1080p download is discarded before anything reaches the bucket. 640x360 is 230,400
+pixels, still above that ceiling, so a 360p download and a 1080p one are scaled to the same
+596x336 clip while the download is about six times smaller. Not byte-identical — the scaler is fed
+a different source, so clip digests differ across the change — but the same clip at the same size,
+which is all the encoder and the model ever see. Do not "fix" the sort key back to best-available:
+it would cost five days and change no dimension of what gets staged.
+
+**That is a coupling, and it only holds while `DEFAULT_VIDEO_MAX_PIXELS` stays at or below
+230,400.** Raise the ceiling above it and 360p becomes the binding limit instead: clips would be
+upscaled from a source that no longer carries the detail, and the repair is re-downloading the
+corpus. `tests/unit/benchmarks/test_acquire_youtube.py` reads that constant and fails if it rises,
+because nothing else would surface it — but if you are the one raising it, the corpus is what you
+have to plan for.
+
+**A dead video does not report the same way twice.** One removed entry answered `Private video.
+Sign in if you've been granted access` on two attempts and `Please sign in.` on two more, minutes
+apart, for the same URL — so a run must recognise a login wall by more than one wording or it
+mistakes the second phrasing for the address itself being blocked, and stops on videos it should
+walk past.
 
 **An out-of-date `yt-dlp` presents as HTTP 403 from YouTube, and 412 from bilibili.** That looks
 exactly like bot detection and cannot be fixed by pacing, which is why the acquirer prefers

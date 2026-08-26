@@ -11,9 +11,9 @@ not a fact any score depends on -- would put a three-and-a-half-year archive at 
 be refused for it. So each object carries `atm_capture_time` of its own stem, which is where
 `AtmSgmRecord.occurred_at` comes from as well, and which is as deterministic as a constant.
 
-**The bytes are staged as they are.** `prepare_m3` cuts because one M3-Bench video is 2 GB and
-its schema wants 30-second clips; ATM's videos run for seconds and its schema wants exactly one
-object per archive item, keyed by the official stem. Re-encoding a 3-second video at the
+**The bytes are staged as they are.** `prepare_m3` cuts because an M3-Bench robot video averages
+1.2 GB and its schema wants 30-second clips; ATM's videos run for seconds and its schema wants
+exactly one object per archive item, keyed by the official stem. Re-encoding a 3-second video at the
 deployment's one frame per second would replace it with three stills, and an image has no span
 to cut at all.
 

@@ -14,6 +14,11 @@ silently mute while every count said 920 of 920.
 Video IDs here are `v0`, `v1`, ... because `load_m3_bench` returns the annotation sorted by ID.
 The acquisition order is therefore that sort and not the JSON's own order, which is worth naming:
 a test that assumed otherwise would pass or fail on the names it happened to choose.
+
+One note for anyone who does verify this against real URLs, since the throwaway harness that did
+so lives in a scratch directory and will not survive: `pgrep -f yt-dlp` and `pkill -f yt-dlp`
+match the shell running them, because the pattern is in their own command line. Killing a stuck
+download that way kills the caller instead. Split the literal, or match on the PID.
 """
 
 from __future__ import annotations
@@ -117,6 +122,37 @@ def test_the_argv_paces_every_download_and_records_it_beside_the_videos(
     assert "--no-playlist" in command
     # The URL is release-supplied text, so it arrives after `--` and cannot become a flag.
     assert command[-2:] == ("--", "https://www.youtube.com/watch?v=v0")
+
+
+def test_the_acquired_resolution_still_exceeds_what_the_clipper_keeps() -> None:
+    """The `res:360` download cap is only correct while the pipeline discards more than it keeps.
+
+    This is the guard on a coupling whose repair costs a five-day re-download. `_options` caps the
+    download at 640x360 = 230,400 pixels because `cut_clips` reduces every stored frame to
+    `DEFAULT_VIDEO_MAX_PIXELS`, so the cap does not change the dimensions of the clips it produces
+    -- but only while the ceiling stays under it. Dimensions, not digests: a clip cut from a 360p
+    source and one cut from 1080p both land at 596x336 and hash differently. Asserted against the constant and against the sort key rather than
+    against a literal, so lowering the cap fails here too.
+    """
+    from mindbridge.media.clipping import DEFAULT_VIDEO_MAX_PIXELS
+
+    sort = _argument(acquire_youtube._options(Path("/corpus"), 0.0), "--format-sort")
+    capped = next((key for key in sort.split(",") if key.startswith("res:")), None)
+    assert capped is not None, (
+        f"--format-sort is {sort!r} and no longer caps the resolution, so an acquisition takes "
+        "the largest format offered -- measured at about 549 GB and 5.3 days for the 920 videos, "
+        "against 90 GB and 20 hours capped, for clips the clipper renders at the same dimensions"
+    )
+    height = int(capped.removeprefix("res:"))
+
+    assert height * (height * 16 // 9) >= DEFAULT_VIDEO_MAX_PIXELS, (
+        f"downloads are capped at {capped} but the clipper now keeps "
+        f"{DEFAULT_VIDEO_MAX_PIXELS} pixels per frame, so the acquired corpus is lower "
+        "resolution than the pipeline can use and every clip cut from it is upscaled from "
+        "less detail than it asks for. Raise the cap in `_options` -- and note that the "
+        "corpus already on disk has to be re-acquired to benefit, which measured at about "
+        "five days for the 920 videos"
+    )
 
 
 def test_the_pacing_is_configurable_and_an_unreadable_setting_is_refused(
@@ -350,7 +386,7 @@ def test_nothing_usable_at_all_raises_rather_than_reporting_a_finished_acquisiti
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """`prepare_m3`'s own message would blame the 2 GB Hub release, which the web split is not."""
+    """`prepare_m3`'s own message would blame the 117 GiB Hub release, which the web split is not."""
     _prepared(
         tmp_path,
         monkeypatch,

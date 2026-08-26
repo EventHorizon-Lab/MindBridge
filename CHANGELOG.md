@@ -141,12 +141,16 @@ Called out on their own because these are the changes that cost an operator real
 Called out because both were invisible until a real run was watched rather than a test read.
 
 - **A `--limit 1` M3-Bench run fetched the whole subset.** `prepare_m3` was the one producer that
-  asked `ensure_media` for its media set without narrowing it, so cutting one 2 GB robot video
-  downloaded all 100 of them — about 200 GB — and the same call would have asked an acquirer for
+  asked `ensure_media` for its media set without narrowing it, so cutting one robot video
+  downloaded all 100 of them — 117 GiB — and the same call would have asked an acquirer for
   all 920 web videos. It now names the single file it is missing, which is what the other producers
-  already did. The absent-media message is split-aware too: the robot half is 100 files of about
-  2 GB, the web half about 20 MB each, and one figure for both overstated the web split by roughly
-  a hundredfold — enough to read as "you have no disk for this" and stop.
+  already did. The absent-media message is split-aware too: the robot half is 100 files totalling
+  117 GiB and the web half 920 downloads of about 100 MB, so one figure for both was wrong by an
+  order of magnitude about whichever split you were running. Both numbers are measured — the first
+  from `repo_info(files_metadata=True)` at the pinned revision, the second from real downloads.
+  Neither came from `yt-dlp`'s `filesize_approx`, which is bitrate times duration and read 26x low
+  on a video that arrived as 712 MB. The robot split is quoted as a total rather than per file
+  because its range is 0.28 to 3.13 GiB, so no single per-file figure describes it.
 - **Those fetches were also silent.** `prepare_m3` and the Video-MME/EgoTempo `_source` helper
   passed no `announce`, so a 712 MB acquisition and a multi-gigabyte Hub download ran to completion
   with nothing on stderr. Both now report, and both honour `--quiet`.

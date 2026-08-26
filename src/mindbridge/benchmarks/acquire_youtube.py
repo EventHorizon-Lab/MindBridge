@@ -51,6 +51,23 @@ because a file it wants is already missing -- attributes the specific absent vid
 What does raise is the two cases where continuing is pointless: nothing usable was obtained at
 all, or enough consecutive failures of the kind that is *not* about a particular video that the
 address is plainly being refused.
+
+**What a full acquisition costs, measured.** Three videos were acquired for real: 712.9 MB /
+1726 s, 862.7 MB / 2504 s, and 212.7 MB / 1357 s, all 1920x1080 sources. Extrapolated over 920
+entries that was about **549 GB and 5.3 days**, which is close enough to "nobody will ever run
+this" to be a defect. The `res:360` cap in `_options` is what brings it to roughly **90 GB and
+20 hours**; both numbers are here so the trade is visible rather than implied by a sort key.
+
+It is **bandwidth-bound, not pacing-bound**. Those three averaged 496 s each at roughly
+0.85 MB/s from YouTube, and the 5-10 s sleeps before each download are 1-2% of that -- so raising
+`MINDBRIDGE_BENCH_YOUTUBE_SLEEP_SECONDS` costs almost nothing in wall clock, and lowering it buys
+almost nothing either. Pacing is insurance against being cut off, not a throughput dial.
+
+Do **not** estimate any of this from `yt-dlp --print '%(filesize_approx)s'`. It is computed from
+bitrate and duration, and against the fragmented formats YouTube serves it under-reported two of
+those three videos by 26x and 21x -- 27.9 MB predicted against 712.9 MB actual -- while being
+accurate for the third. Two independent runs of the same URL produced the same 712,908,634 bytes,
+so the bytes are stable; it is the prediction that is not.
 """
 
 from __future__ import annotations
@@ -148,6 +165,12 @@ the third must not, or the only signal that matters would be suppressed by the t
 it. `please sign in` is in this list on evidence rather than on reading: a probe of the first six
 annotation URLs had five succeed and the sixth answer exactly that, from the same address in the
 same minute, which is as direct as "this is about the video" gets.
+
+Expect variants when adding to this list, and do not trust one observation. That same URL answered
+`Private video. Sign in if you've been granted access` on two runs and `Please sign in.` on two
+others, minutes apart, with nothing changed. A marker list built from a single probe per failure
+mode is therefore incomplete by construction -- which is survivable only because an unrecognised
+reason errs towards stopping the run rather than towards ignoring it.
 """
 
 _TIMEOUT_SECONDS = 3_600.0
@@ -341,12 +364,26 @@ def _options(destination: Path, sleep_seconds: float) -> tuple[str, ...]:
         "%(id)s.%(ext)s",
         "--download-archive",
         str(destination / ARCHIVE_NAME),
-        # Prefer formats that are already MP4, force a merge into MP4, and remux anything that
-        # still is not. All three, because the layout names `<video_id>.mp4` exactly: the sort
-        # alone leaves WebM where no MP4 is offered, and `--merge-output-format` only governs the
-        # container of a merge that happens. Remuxing does not re-encode.
+        # Cap the resolution first, then prefer formats that are already MP4, force a merge into
+        # MP4, and remux anything that still is not. The last three, because the layout names
+        # `<video_id>.mp4` exactly: the sort alone leaves WebM where no MP4 is offered, and
+        # `--merge-output-format` only governs the container of a merge that happens. Remuxing
+        # does not re-encode.
+        #
+        # `res:360` is measured, not chosen for taste. Every source sampled from this annotation
+        # is 1920x1080, and `mindbridge.media.clipping` reduces every frame it stores to
+        # `DEFAULT_VIDEO_MAX_PIXELS` -- 200,704 -- so a 1080p source is stored as 596x336 and
+        # about 94% of what was downloaded is discarded by the only thing that reads it. At
+        # 640x360 = 230,400 the source still exceeds that ceiling, so a stored clip keeps the same
+        # 596x336 dimensions -- the same dimensions, not the same bytes: a different source feeds
+        # the scaler, and every staged clip carries its own sha256, so manifest digests do differ
+        # across this cap even though nothing about a clip's size or content does. The download is
+        # 4-9x smaller: two sampled videos went from 862.7 MB and 212.7 MB to 99.5 MB and
+        # 50.8 MB. `test_acquire_youtube.py` fails if
+        # `DEFAULT_VIDEO_MAX_PIXELS` ever rises past 230,400, because at that point this cap
+        # silently becomes the limiting factor and the repair is re-downloading the whole corpus.
         "--format-sort",
-        "ext:mp4:m4a",
+        "res:360,ext:mp4:m4a",
         "--merge-output-format",
         "mp4",
         "--remux-video",
