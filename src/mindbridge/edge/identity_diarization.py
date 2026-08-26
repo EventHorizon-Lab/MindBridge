@@ -258,6 +258,11 @@ class FunASRRecipe:
     # whatever code the repository holds at load time. Pin this for a deployment that has
     # measured a specific checkpoint.
     revision: str | None = None
+    # Whether `FunASRNanoVLLMPipeline` can serve these weights. Declared rather than inferred
+    # from the model id, because whether a checkpoint is Fun-ASR-Nano's architecture is not
+    # derivable from its name -- a local conversion or a fork of those weights is servable and
+    # a Paraformer checkpoint is not, and both are just strings.
+    vllm_servable: bool = False
 
     def __post_init__(self) -> None:
         if not self.model_id.strip():
@@ -306,6 +311,7 @@ FUNASR_RECIPES: Mapping[str, FunASRRecipe] = {
         model_id=FUNASR_NANO_MODEL_ID,
         vad_max_single_segment_ms=30_000,
         trust_remote_code=True,
+        vllm_servable=True,
     ),
     # Character timestamps and a punctuation model: the only composition here that reaches
     # upstream's `punc_segment` diarization, so turns break on punctuation rather than on VAD.
@@ -471,6 +477,7 @@ class FunASRNanoVLLMPipeline:
         *,
         device: str | None = None,
         model_id: str = FUNASR_NANO_MODEL_ID,
+        revision: str | None = None,
         hub: str = "ms",
         vad_model: str = FUNASR_VAD_MODEL_ID,
         speaker_model: str = CAMPPLUS_MODEL.model_id,
@@ -478,6 +485,14 @@ class FunASRNanoVLLMPipeline:
         max_model_len: int = 4_096,
     ) -> FunASRNanoVLLMPipeline:
         """Load the vLLM engine plus the VAD and speaker models it has to be wrapped in."""
+        # Upstream's `from_pretrained` forwards a revision to ModelScope's snapshot download and
+        # drops it on the HuggingFace path. Dropping a pin quietly is how an unreviewed
+        # checkpoint gets loaded under `trust_remote_code`, so refuse the combination instead.
+        if revision is not None and hub not in {"ms", "modelscope"}:
+            raise ValueError(
+                "the Fun-ASR-Nano vLLM engine can only pin a revision on the ModelScope hub; "
+                "upstream's HuggingFace path ignores it"
+            )
         try:
             funasr = __import__("funasr")
             inference_vllm = __import__(
@@ -502,6 +517,7 @@ class FunASRNanoVLLMPipeline:
             dtype="bf16",
             max_model_len=max_model_len,
             gpu_memory_utilization=gpu_memory_utilization,
+            **({"revision": revision} if revision is not None else {}),
         )
         return cls(
             cast(_FunASRNanoEngine, engine),
@@ -667,31 +683,55 @@ def load_speech_analyzer(
 ) -> SpeechAnalyzer:
     """Pick the inference engine for this device, or take the one named.
 
-    Left unset this resolves by environment: a CUDA device with vLLM installed gets `vllm`,
-    and everything else gets `automodel`. Both fill the whole `SpeechAnalysis` contract, so
-    the choice is throughput and span precision rather than capability -- which is why it can
-    be made from the environment at all.
+    Left unset this resolves from the device and the recipe together: a CUDA host with vLLM
+    installed, asked for the Fun-ASR-Nano weights that engine serves, gets `vllm`; everything
+    else gets `automodel`. Both fill the whole `SpeechAnalysis` contract, so within one model
+    the choice is throughput and span precision rather than capability -- which is what makes
+    it safe to decide automatically. Across models it is not, so the recipe constrains it: an
+    engine is never allowed to quietly transcribe with a model nobody asked for.
     """
-    selected = (engine or _engine_for_environment(device=device)).strip().lower()
+    selected_recipe = resolve_funasr_recipe(recipe)
+    selected = (
+        (engine or _engine_for_environment(device=device, recipe=selected_recipe)).strip().lower()
+    )
     if selected == "vllm":
-        return FunASRNanoVLLMPipeline.load(device=device)
+        if not selected_recipe.vllm_servable:
+            raise ValueError(
+                f"the vLLM engine cannot run {selected_recipe.model_id!r}: it implements "
+                "Fun-ASR-Nano's architecture only. Use engine='automodel' for this model, or "
+                "set vllm_servable on a recipe naming Fun-ASR-Nano weights"
+            )
+        return FunASRNanoVLLMPipeline.load(
+            device=device,
+            model_id=selected_recipe.model_id,
+            revision=selected_recipe.revision,
+        )
     if selected == "automodel":
-        return FunASRAutoModelPipeline.load(device=device, recipe=recipe)
+        return FunASRAutoModelPipeline.load(device=device, recipe=selected_recipe)
     raise ValueError(f"unknown speech engine {selected!r}; pass one of {', '.join(SPEECH_ENGINES)}")
 
 
-def _engine_for_environment(*, device: str | None) -> str:
-    """CUDA with vLLM installed goes to vLLM; every other platform goes to `AutoModel`.
+def _engine_for_environment(*, device: str | None, recipe: FunASRRecipe) -> str:
+    """CUDA with vLLM installed, running the weights it serves, goes to vLLM; else `AutoModel`.
 
-    vLLM has to be actually importable, not merely wanted: it is a deliberate install, and
+    The recipe decides as much as the hardware does. This engine implements Fun-ASR-Nano's
+    architecture only, so a host configured for Paraformer or SenseVoice gets `AutoModel`
+    however much CUDA it has: choosing otherwise would transcribe with a different model, and
+    a different language profile, than the deployment asked for. Silently substituting a model
+    is the failure a recipe exists to prevent, and an automatic choice is the last place it
+    should be reintroduced.
+
+    vLLM also has to be actually importable, not merely wanted: it is a deliberate install, so
     treating its presence as the signal keeps a GPU host that never installed it on the
-    portable path instead of failing at load. Nothing here reaches for an engine that cannot
-    produce speaker centroids -- both of these do, so resolving from the environment can only
-    change throughput, never whether the device can still answer who spoke.
+    portable path instead of failing at load.
     """
     # `select_torch_device` raises when an accelerator is demanded and missing, which is the
     # module's standing rule: a silent CPU fallback turns capacity into a latency mystery.
-    if select_torch_device(device).startswith("cuda") and find_spec("vllm") is not None:
+    if (
+        recipe.vllm_servable
+        and select_torch_device(device).startswith("cuda")
+        and find_spec("vllm") is not None
+    ):
         return "vllm"
     return "automodel"
 

@@ -555,9 +555,13 @@ SenseVoice 不预测 timestamp，上游自动降级到 `vad_segment`，标点无
 即被拒绝，而不是在几 GiB 权重加载并推理之后。默认 recipe 需要 `trust_remote_code=True`，未钉
 revision 时上游解析成 `master`，因此 `FunASRRecipe.revision` 留给已实测某个 checkpoint 的部署去钉。
 
-引擎由环境选，模型由 recipe 选，两件事分开。`load_speech_analyzer()` 不指定引擎时按环境解析：装了
-vLLM 的 CUDA 设备用 vLLM，其余平台用 `AutoModel`。**引擎能自动选，前提是两个引擎都填满整个契约**
-——都产 CAM++ centroid，所以自动解析只会改吞吐和 span 精度，不会改「这台设备还答不答得出谁在说话」。
+引擎由环境和 recipe 共同决定。`load_speech_analyzer()` 不指定引擎时：装了 vLLM 的 CUDA 设备、
+且 recipe 声明了 `vllm_servable` 时用 vLLM，其余用 `AutoModel`。**引擎能自动选，前提是候选都填满
+整个契约**——都产 CAM++ centroid，所以在同一个模型内自动解析只会改吞吐和 span 精度。但跨模型不成立：
+vLLM 引擎只实现 Fun-ASR-Nano 的架构，配了 Paraformer 或 SenseVoice 的主机无论多少 CUDA 都走
+`AutoModel`，否则就是用另一个模型、另一套语言画像去转写运维配置的那个模型——**而「悄悄换掉模型」
+正是 recipe 存在要防的事，自动选择是最不该把它放回来的地方**。是否可由 vLLM 服务由 recipe 声明
+（`vllm_servable`）而不是从 model id 猜：一个 checkpoint 是不是那个架构，从名字推不出来。
 vLLM 必须真的 importable 才算：装它是刻意行为，所以以「装了」为信号；没装 vLLM 的 GPU 主机留在
 `AutoModel` 上，而不是在 load 时报错。显式 `engine="vllm"` 落在无 CUDA 的设备上会响亮失败——本模块
 的既定规则是显式加速器请求不是建议。

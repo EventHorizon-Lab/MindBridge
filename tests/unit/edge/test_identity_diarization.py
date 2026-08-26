@@ -1092,13 +1092,91 @@ def test_engine_selection_follows_the_environment(
         identity_diarization.load_speech_analyzer(engine="llama.cpp")
 
 
-def _stub_engines(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_engine_selection_never_substitutes_a_different_model_for_the_one_asked_for(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The vLLM engine serves Fun-ASR-Nano's weights. Picking it for a Paraformer or SenseVoice
+    recipe would quietly transcribe with a different model -- a different language profile --
+    than the operator configured, which is the exact silent substitution a recipe exists to
+    prevent. So the recipe constrains the automatic choice, and an explicit engine that cannot
+    run the recipe is refused rather than honoured halfway.
+    """
+    loaded: dict[str, object] = {}
+    _stub_engines(monkeypatch, loaded=loaded)
+    monkeypatch.setattr(identity_diarization, "select_torch_device", lambda _device: "cuda")
+    monkeypatch.setattr(identity_diarization, "find_spec", lambda _name: object())
+
+    def engine_for(**kwargs: object) -> str:
+        return type(identity_diarization.load_speech_analyzer(**kwargs)).__name__  # type: ignore[arg-type]
+
+    # CUDA, vLLM installed, and the default Nano recipe: the fast path applies.
+    assert engine_for() == "FunASRNanoVLLMPipeline"
+    assert loaded["model"] == identity_diarization.FUNASR_NANO_MODEL_ID
+
+    # Same host, a different model asked for: AutoModel, because vLLM cannot run it.
+    assert engine_for(recipe="paraformer") == "FunASRAutoModelPipeline"
+    assert engine_for(recipe="sensevoice") == "FunASRAutoModelPipeline"
+
+    # Naming the engine anyway is an error, not a silent model swap.
+    with pytest.raises(ValueError, match="cannot run"):
+        identity_diarization.load_speech_analyzer(engine="vllm", recipe="sensevoice")
+
+    # A declared recipe can say these are Nano weights under another name -- a local
+    # conversion, say -- and then both the id and the pin have to reach the engine. The id is
+    # deliberately not the registry's, so forwarding it is observable rather than shadowed by
+    # the loader's own default.
+    local = FunASRRecipe(
+        model_id="/opt/funasr/fun-asr-nano-2512",
+        vad_max_single_segment_ms=30_000,
+        trust_remote_code=True,
+        revision="v1.0.0",
+        vllm_servable=True,
+    )
+    assert engine_for(recipe=local) == "FunASRNanoVLLMPipeline"
+    assert loaded["model"] == "/opt/funasr/fun-asr-nano-2512"
+    assert loaded["revision"] == "v1.0.0"
+
+    # And a recipe that never claimed servability is refused however Nano-like it looks.
+    undeclared = FunASRRecipe(
+        model_id=identity_diarization.FUNASR_NANO_MODEL_ID,
+        vad_max_single_segment_ms=30_000,
+        trust_remote_code=True,
+    )
+    assert engine_for(recipe=undeclared) == "FunASRAutoModelPipeline"
+
+
+def test_nano_vllm_refuses_to_drop_a_revision_pin_it_cannot_honour(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Upstream's `from_pretrained` forwards a revision to ModelScope and drops it on the
+    HuggingFace path. Dropping a pin silently is how an unreviewed checkpoint gets loaded under
+    `trust_remote_code`, so the combination is refused instead.
+    """
+    _stub_engines(monkeypatch)
+    monkeypatch.setattr(identity_diarization, "select_torch_device", lambda _device: "cuda")
+
+    with pytest.raises(ValueError, match="ModelScope"):
+        identity_diarization.FunASRNanoVLLMPipeline.load(device="cuda", hub="hf", revision="v1")
+
+
+def _stub_engines(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    loaded: dict[str, object] | None = None,
+) -> None:
     """Let the selector build either backend without any real weights."""
+
+    def from_pretrained(**kwargs: object) -> _StubNanoEngine:
+        if loaded is not None:
+            loaded.clear()
+            loaded.update(kwargs)
+        return _StubNanoEngine([])
+
     inference_vllm = ModuleType("funasr.models.fun_asr_nano.inference_vllm")
     inference_vllm.FunASRNanoVLLM = type(  # type: ignore[attr-defined]
         "_Engine",
         (),
-        {"from_pretrained": staticmethod(lambda **_kwargs: _StubNanoEngine([]))},
+        {"from_pretrained": staticmethod(from_pretrained)},
     )
     funasr = ModuleType("funasr")
     funasr.AutoModel = lambda **_kwargs: _StubFunASRPipeline([])  # type: ignore[attr-defined]

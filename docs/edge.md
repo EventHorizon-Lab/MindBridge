@@ -167,12 +167,19 @@ speech = load_speech_analyzer(engine="automodel", recipe="sensevoice")
 | `automodel` | anywhere the `edge` extra installs | per VAD span | the recipe's segmentation |
 | `vllm` | CUDA only | batched across VAD spans | CTC character alignment |
 
-Both engines fill the whole contract, including CAM++ centroids, so resolving from the
-environment can only change throughput and span precision — never whether the device can still
-answer who spoke. That is the reason this choice is safe to make automatically.
+Both engines fill the whole contract, including CAM++ centroids, so *within one model* resolving
+from the environment can only change throughput and span precision — never whether the device can
+still answer who spoke. Across models it would change the transcript, so the recipe constrains the
+choice too: the vLLM engine implements Fun-ASR-Nano's architecture only, and a host configured for
+`paraformer` or `sensevoice` gets `automodel` however much CUDA it has. Naming
+`engine="vllm"` for a model it cannot serve is refused rather than honoured with a different model.
 
-vLLM has to be importable, not merely wanted: installing it is deliberate, so its presence is the
-signal. A GPU host that never installed it stays on `automodel` rather than failing at load.
+Servability is declared on the recipe (`vllm_servable`), not inferred from the model id — whether
+a checkpoint is that architecture does not follow from its name, so a local conversion of those
+weights can opt in and a Paraformer checkpoint cannot be mistaken for one.
+
+vLLM also has to be importable, not merely wanted: installing it is deliberate, so its presence is
+the signal. A GPU host that never installed it stays on `automodel` rather than failing at load.
 Naming `engine="vllm"` on a device without CUDA fails loudly — an explicit accelerator request is
 not a suggestion here.
 
@@ -182,11 +189,11 @@ A recipe is the composition, not just the model id, because a FunASR model id al
 whether the checkpoint predicts timestamps or punctuates its own output — and those answers decide
 whether timed speech and speaker centroids can be produced at all:
 
-| Recipe | Model | VAD | Punctuation | Speaker turns split on |
-| --- | --- | --- | --- | --- |
-| `fun-asr-nano` (default) | Fun-ASR-Nano | FSMN-VAD, 30 s ceiling | the model's own | VAD spans |
-| `paraformer` | SeACo-Paraformer (Mandarin) | FSMN-VAD | CT-Transformer | punctuation |
-| `sensevoice` | SenseVoiceSmall | FSMN-VAD, 30 s ceiling | none — nothing to align it to | VAD spans |
+| Recipe | Model | VAD | Punctuation | Speaker turns split on | vLLM |
+| --- | --- | --- | --- | --- | --- |
+| `fun-asr-nano` (default) | Fun-ASR-Nano | FSMN-VAD, 30 s ceiling | the model's own | VAD spans | yes |
+| `paraformer` | SeACo-Paraformer (Mandarin) | FSMN-VAD | CT-Transformer | punctuation | no |
+| `sensevoice` | SenseVoiceSmall | FSMN-VAD, 30 s ceiling | none — nothing to align it to | VAD spans | no |
 
 Every recipe composes CAM++ for the centroid, because a voiceprint has nothing to match against
 without it. A model MindBridge has not measured is enabled by declaring its own recipe, which is
@@ -200,7 +207,9 @@ speech = load_speech_analyzer(
 
 The default recipe runs with `trust_remote_code=True`, which FunASR needs for Fun-ASR-Nano, and
 an unset revision resolves upstream to `master`. Pin `revision=` once a deployment has measured a
-checkpoint.
+checkpoint; it reaches both engines. The vLLM engine can only honour a pin on the ModelScope hub —
+upstream's HuggingFace path ignores it — so that combination is refused rather than silently
+unpinned.
 
 ### Streaming
 
