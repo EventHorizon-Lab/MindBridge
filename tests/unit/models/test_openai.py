@@ -425,6 +425,75 @@ async def test_generator_factory_selects_native_or_transcribed_audio() -> None:
         await close_model(fallback)
 
 
+async def test_transcribing_generator_carries_its_engine_and_recipe_to_funasr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`audio_mode="transcribe"` is a whole speech pipeline behind two config keys. Without
+    this, `asr_engine` and `asr_recipe` could be dropped on the floor and every existing test
+    would still pass -- the transcription test only sets `asr_device`.
+    """
+    arguments: dict[str, object] = {}
+
+    class Pipeline:
+        def generate(self, **_kwargs: object) -> list[dict[str, object]]:
+            return [{"text": ""}]
+
+    def auto_model(**kwargs: object) -> Pipeline:
+        arguments.update(kwargs)
+        return Pipeline()
+
+    funasr = ModuleType("funasr")
+    funasr.AutoModel = auto_model  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "funasr", funasr)
+    monkeypatch.setattr(identity_diarization, "select_torch_device", lambda _device: "cpu")
+
+    config = {
+        "api_key": "unit-test-key",
+        "endpoint": "https://generator.example.test/v1",
+        "model_id": "video-vlm",
+        "audio_mode": "transcribe",
+        "asr_engine": "automodel",
+        "asr_recipe": "paraformer",
+        "asr_device": "cpu",
+    }
+    generator = create_generator(config)
+    encoded = base64.b64encode(b"media").decode("ascii")
+    try:
+        await generator.generate(
+            GenerateRequest(
+                system_prompt="Answer from evidence.",
+                input=ModelInput((MediaPart(MediaKind.AUDIO, f"data:audio/wav;base64,{encoded}"),)),
+                max_output_tokens=64,
+            )
+        )
+    except Exception:
+        # The HTTP call is not the subject; the recipe reaching FunASR is.
+        pass
+    finally:
+        await close_model(generator)
+
+    # The named recipe, not the default: `paraformer` is the only one carrying a punctuation
+    # model, so its presence proves the composition travelled rather than just a model id.
+    assert arguments["model"] == identity_diarization.FUNASR_ASR_MODEL_ID
+    assert arguments["punc_model"] == identity_diarization.FUNASR_PUNCTUATION_MODEL_ID
+
+    # An unusable engine name has to surface here rather than being silently ignored.
+    unknown = create_generator({**config, "asr_engine": "llama.cpp"})
+    try:
+        with pytest.raises(ValueError, match="unknown speech engine"):
+            await unknown.generate(
+                GenerateRequest(
+                    system_prompt="Answer from evidence.",
+                    input=ModelInput(
+                        (MediaPart(MediaKind.AUDIO, f"data:audio/wav;base64,{encoded}"),)
+                    ),
+                    max_output_tokens=64,
+                )
+            )
+    finally:
+        await close_model(unknown)
+
+
 async def test_cumulative_stream_usage_is_charged_once_not_once_per_chunk() -> None:
     """A server sending usage on every chunk multiplied the recorded bill by the chunk count.
 
