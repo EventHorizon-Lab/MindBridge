@@ -6,9 +6,12 @@ import asyncio
 import base64
 import json
 import mimetypes
+import re
 import subprocess
 import tempfile
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
+from importlib.util import find_spec
 from itertools import pairwise
 from pathlib import Path
 from typing import Annotated, Protocol, cast
@@ -65,13 +68,25 @@ from mindbridge.prompts import (
 )
 
 FUNASR_ASR_MODEL_ID = "iic/speech_seaco_paraformer_large_asr_nat-zh-cn-16k-common-vocab8404-pytorch"
+FUNASR_SENSEVOICE_MODEL_ID = "iic/SenseVoiceSmall"
+FUNASR_NANO_MODEL_ID = "FunAudioLLM/Fun-ASR-Nano-2512"
 FUNASR_STREAMING_ASR_MODEL_ID = (
     "iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-online"
 )
 FUNASR_VAD_MODEL_ID = "iic/speech_fsmn_vad_zh-cn-16k-common-pytorch"
 FUNASR_PUNCTUATION_MODEL_ID = "iic/punc_ct-transformer_zh-cn-common-vad_realtime-vocab272727"
 _PARALLEL_MODEL_MINIMUM_FREE_CUDA_BYTES = 8 * 1024 * 1024 * 1024
-
+_SPEECH_SAMPLE_RATE = 16_000
+# Upstream clusters CAM++ chunks at this threshold in both its own server and AutoModel.
+_SPEAKER_CLUSTER_MERGE_THRESHOLD = 0.78
+# Spans this short carry too few CAM++ chunks to place a speaker, so upstream drops them
+# (`len(seg_audio) > sr * 0.3`, exclusive -- matched here so the two agree at the boundary).
+_MINIMUM_TRANSCRIBED_SPAN_MS = 300
+# Model special tokens: SenseVoice tags language, emotion and event inline
+# (`<|zh|><|NEUTRAL|><|Speech|><|woitn|>`) and upstream strips them at the edge of its own
+# server rather than inside the model, so every consumer has to do it. Left in, they reach
+# the claim text as if someone had said them.
+_MODEL_SPECIAL_TOKEN = re.compile(r"<\|[^|]*\|>")
 _Transcript = Annotated[
     str, StringConstraints(strip_whitespace=True, min_length=1, max_length=4096)
 ]
@@ -188,12 +203,141 @@ class _FunASRPipeline(Protocol):
     def generate(self, **kwargs: object) -> list[dict[str, object]]: ...
 
 
+class _Waveform(Protocol):
+    """A decoded waveform, narrowed to the one thing the speech path does with it."""
+
+    def __getitem__(self, span: slice) -> object: ...
+
+
+class _FunASRNanoEngine(Protocol):
+    def generate(
+        self,
+        *,
+        inputs: list[object],
+        **kwargs: object,
+    ) -> list[dict[str, object]]: ...
+
+
 @dataclass(frozen=True, slots=True)
 class SpeechAnalysis:
-    """One integrated FunASR result with timed speech and local speaker centroids."""
+    """Timed speech plus local speaker centroids, whatever backend produced them."""
 
     segments: tuple[SpeechSegment, ...]
     speaker_embeddings: tuple[SpeakerEmbeddingSample, ...]
+
+
+class SpeechAnalyzer(Protocol):
+    """The whole speech contract the identity path needs, with no backend in it.
+
+    Both FunASR backends normalize to this: the portable `AutoModel` composition and the
+    Fun-ASR-Nano vLLM engine. A third one only has to return timed spans and the speaker
+    centroids those spans belong to.
+    """
+
+    async def analyze_file(self, media_path: Path) -> SpeechAnalysis: ...
+
+
+@dataclass(frozen=True, slots=True)
+class FunASRRecipe:
+    """One FunASR model plus the models it needs composed around it.
+
+    A FunASR model id alone does not say whether the checkpoint predicts timestamps, whether
+    it punctuates its own output, or how upstream will then choose to segment speakers -- and
+    those three answers differ per model while deciding whether `SpeechAnalysis` can be filled
+    at all. Naming the composition is what makes a swap a configuration change instead of a
+    silent downgrade, so a model MindBridge has not measured has to declare one.
+    """
+
+    model_id: str
+    vad_model: str = FUNASR_VAD_MODEL_ID
+    speaker_model: str = CAMPPLUS_MODEL.model_id
+    punctuation_model: str | None = None
+    vad_max_single_segment_ms: int | None = None
+    trust_remote_code: bool = False
+    # Upstream resolves an unset revision to "master", so a `trust_remote_code` model runs
+    # whatever code the repository holds at load time. Pin this for a deployment that has
+    # measured a specific checkpoint.
+    revision: str | None = None
+
+    def __post_init__(self) -> None:
+        if not self.model_id.strip():
+            raise ValueError("FunASR recipe needs a model id")
+        # Refuse here rather than after loading several GiB of weights and reading an empty
+        # result: without VAD upstream never runs `inference_with_vad`, so there is no
+        # `sentence_info` to time speech by, and without a speaker model there is no centroid,
+        # which is the only thing a voiceprint can be matched against.
+        if not self.vad_model.strip() or not self.speaker_model.strip():
+            raise ValueError(
+                "MindBridge speech analysis needs a VAD model for timed spans and a speaker "
+                "model for voiceprint centroids"
+            )
+        if self.vad_max_single_segment_ms is not None and self.vad_max_single_segment_ms <= 0:
+            raise ValueError("FunASR VAD segment ceiling must be positive")
+
+    def auto_model_arguments(self) -> dict[str, object]:
+        """Spell the recipe as upstream `AutoModel` keywords."""
+        arguments: dict[str, object] = {
+            "model": self.model_id,
+            "vad_model": self.vad_model,
+            "spk_model": self.speaker_model,
+        }
+        if self.punctuation_model is not None:
+            arguments["punc_model"] = self.punctuation_model
+        if self.vad_max_single_segment_ms is not None:
+            arguments["vad_kwargs"] = {"max_single_segment_time": self.vad_max_single_segment_ms}
+        if self.trust_remote_code:
+            arguments["trust_remote_code"] = True
+        if self.revision is not None:
+            arguments["model_revision"] = self.revision
+        return arguments
+
+
+DEFAULT_FUNASR_RECIPE = "fun-asr-nano"
+
+FUNASR_RECIPES: Mapping[str, FunASRRecipe] = {
+    # The default. Fun-ASR-Nano punctuates its own output and emits CTC timestamps, so upstream
+    # skips the punctuation model on its own (`punc_model is not None and "timestamps" not in
+    # result`) and converts the dict timestamps to the list shape the rest of the pipeline
+    # reads. Because punctuation never runs, `spk_mode` degrades to `vad_segment`: the text
+    # carries the model's own punctuation, but the turn boundaries come from VAD, so the 30s
+    # ceiling is what bounds a turn. `FunASRNanoVLLMPipeline` serves these same weights with
+    # batched decoding and tighter bounds when a device has the CUDA headroom for vLLM.
+    "fun-asr-nano": FunASRRecipe(
+        model_id=FUNASR_NANO_MODEL_ID,
+        vad_max_single_segment_ms=30_000,
+        trust_remote_code=True,
+    ),
+    # Character timestamps and a punctuation model: the only composition here that reaches
+    # upstream's `punc_segment` diarization, so turns break on punctuation rather than on VAD.
+    # Tuned for Mandarin -- measured on an English corpus this checkpoint transcribes the
+    # right words with no word boundaries at all ("hellorobotwhathaveyouprepared..."), which
+    # is recoverable but plainly not what the speech contained. Language is a property of
+    # where the device sits, not of the product.
+    "paraformer": FunASRRecipe(
+        model_id=FUNASR_ASR_MODEL_ID,
+        punctuation_model=FUNASR_PUNCTUATION_MODEL_ID,
+    ),
+    # SenseVoice predicts no timestamps, so upstream logs a warning and degrades to
+    # `vad_segment` diarization; punctuation cannot be aligned to anything and would only
+    # cost a model load, so VAD spans become the turns and the 30s ceiling bounds them.
+    "sensevoice": FunASRRecipe(
+        model_id=FUNASR_SENSEVOICE_MODEL_ID,
+        vad_max_single_segment_ms=30_000,
+    ),
+}
+
+
+def resolve_funasr_recipe(recipe: FunASRRecipe | str) -> FunASRRecipe:
+    """Accept a measured recipe name, or a declared one for a model we have not measured."""
+    if isinstance(recipe, FunASRRecipe):
+        return recipe
+    try:
+        return FUNASR_RECIPES[recipe]
+    except KeyError as error:
+        raise ValueError(
+            f"unknown FunASR recipe {recipe!r}; pass one of "
+            f"{', '.join(sorted(FUNASR_RECIPES))} or a FunASRRecipe declaring the composition"
+        ) from error
 
 
 _ACTIVE_SPEAKER_SCHEMA = output_schema("active_speaker_match", _ActiveSpeakerOutput)
@@ -201,8 +345,15 @@ _ACTIVE_SPEAKER_SCHEMA = output_schema("active_speaker_match", _ActiveSpeakerOut
 _SPEECH_SEGMENT_SCHEMA = output_schema("speech_segmentation", _DiarizationOutput)
 
 
-class FunASRSpeechPipeline:
-    """Run upstream VAD, ASR, punctuation, diarization, and speaker embedding once."""
+class FunASRAutoModelPipeline:
+    """Run one FunASR `AutoModel` composition: VAD, ASR, punctuation, diarization, centroids.
+
+    This is the portable backend, and it is the generic one: upstream's `AutoModel` already
+    normalizes across checkpoints -- it converts Fun-ASR-Nano's dict timestamps to the list
+    shape, skips punctuation for models that punctuate themselves, and degrades speaker
+    segmentation from `punc_segment` to `vad_segment` for models that predict no timestamps.
+    What it does not do is choose the composition, which is what `FunASRRecipe` carries.
+    """
 
     def __init__(
         self,
@@ -222,16 +373,10 @@ class FunASRSpeechPipeline:
         cls,
         *,
         device: str | None = None,
-        model_id: str | None = None,
-    ) -> FunASRSpeechPipeline:
-        """Load the official integrated FunASR pipeline on CUDA when available.
-
-        `model_id` overrides the acoustic model. The default is tuned for Mandarin, and a device
-        deployed somewhere else needs its own: measured on an English corpus, the Mandarin
-        checkpoint transcribes the right words with no word boundaries at all
-        ("hellorobotwhathaveyouprepared..."), which is recoverable but plainly not what the
-        speech contained. Language is a property of where the device sits, not of the product.
-        """
+        recipe: FunASRRecipe | str = DEFAULT_FUNASR_RECIPE,
+    ) -> FunASRAutoModelPipeline:
+        """Load a named recipe, or a declared one, on CUDA when available."""
+        selected_recipe = resolve_funasr_recipe(recipe)
         try:
             funasr = __import__("funasr")
         except ImportError as error:
@@ -241,10 +386,7 @@ class FunASRSpeechPipeline:
             ) from error
         selected_device = select_torch_device(device)
         pipeline = funasr.AutoModel(
-            model=model_id or FUNASR_ASR_MODEL_ID,
-            vad_model=FUNASR_VAD_MODEL_ID,
-            punc_model=FUNASR_PUNCTUATION_MODEL_ID,
-            spk_model=CAMPPLUS_MODEL.model_id,
+            **selected_recipe.auto_model_arguments(),
             device=selected_device,
             disable_update=True,
             disable_pbar=True,
@@ -272,7 +414,10 @@ class FunASRSpeechPipeline:
         text = result.get("text")
         if not isinstance(text, str):
             raise ModelOutputError("FunASR returned invalid transcription text")
-        if not text.strip():
+        # Silence is not the same shape in every model: Paraformer returns an empty string,
+        # while SenseVoice still tags the span (`<|zh|><|NEUTRAL|><|Speech|><|woitn|>`). Both
+        # mean nobody spoke, so both have to reach the empty result rather than the error below.
+        if not _MODEL_SPECIAL_TOKEN.sub("", text).strip():
             return SpeechAnalysis(segments=(), speaker_embeddings=())
         segments = _funasr_segments(
             result.get("sentence_info"),
@@ -284,6 +429,271 @@ class FunASRSpeechPipeline:
             segments=segments,
             speaker_embeddings=_funasr_speaker_embeddings(result.get("spk_embedding_center")),
         )
+
+
+class FunASRNanoVLLMPipeline:
+    """Serve Fun-ASR-Nano on vLLM, then add the speaker evidence the engine cannot produce.
+
+    The engine only transcribes: it takes audio arrays and returns text with CTC character
+    timestamps, with no VAD, no speaker labels and no centroids. So this composes what
+    upstream's own server composes around it -- FSMN-VAD to find the spans to batch, and CAM++
+    to cluster them -- with one deliberate difference. Upstream's `attach_speaker_labels`
+    computes the CAM++ embeddings, keeps only the `SPK{n}` labels and drops the vectors;
+    MindBridge's voiceprint memory is built on exactly those per-speaker centroids, so this
+    asks `postprocess` for the centers as well. Everything after that is the shared
+    normalization, byte for byte the same functions the `AutoModel` backend goes through.
+    """
+
+    def __init__(
+        self,
+        engine: _FunASRNanoEngine,
+        vad_pipeline: _FunASRPipeline,
+        speaker_pipeline: _FunASRPipeline,
+        *,
+        device: str,
+        diarization_confidence: float = 0.8,
+        max_new_tokens: int = 500,
+    ) -> None:
+        if not 0.0 <= diarization_confidence <= 1.0:
+            raise ValueError("diarization confidence must be between zero and one")
+        if max_new_tokens <= 0:
+            raise ValueError("Fun-ASR-Nano token budget must be positive")
+        self._engine = engine
+        self._vad_pipeline = vad_pipeline
+        self._speaker_pipeline = speaker_pipeline
+        self.device = device
+        self._diarization_confidence = diarization_confidence
+        self._max_new_tokens = max_new_tokens
+
+    @classmethod
+    def load(
+        cls,
+        *,
+        device: str | None = None,
+        model_id: str = FUNASR_NANO_MODEL_ID,
+        hub: str = "ms",
+        vad_model: str = FUNASR_VAD_MODEL_ID,
+        speaker_model: str = CAMPPLUS_MODEL.model_id,
+        gpu_memory_utilization: float = 0.5,
+        max_model_len: int = 4_096,
+    ) -> FunASRNanoVLLMPipeline:
+        """Load the vLLM engine plus the VAD and speaker models it has to be wrapped in."""
+        try:
+            funasr = __import__("funasr")
+            inference_vllm = __import__(
+                "funasr.models.fun_asr_nano.inference_vllm",
+                fromlist=["FunASRNanoVLLM"],
+            )
+        except ImportError as error:
+            raise ModelUnavailableError(
+                "install the edge extra plus vLLM, or use FunASRAutoModelPipeline with the "
+                "'fun-asr-nano' recipe, which runs the same model on the portable runtime"
+            ) from error
+        selected_device = select_torch_device(device)
+        if not selected_device.startswith("cuda"):
+            raise ModelUnavailableError(
+                "the Fun-ASR-Nano vLLM engine needs CUDA; use FunASRAutoModelPipeline with "
+                "the 'fun-asr-nano' recipe on CPU-only devices"
+            )
+        engine = inference_vllm.FunASRNanoVLLM.from_pretrained(
+            model=model_id,
+            hub=hub,
+            device=selected_device,
+            dtype="bf16",
+            max_model_len=max_model_len,
+            gpu_memory_utilization=gpu_memory_utilization,
+        )
+        return cls(
+            cast(_FunASRNanoEngine, engine),
+            cast(
+                _FunASRPipeline,
+                funasr.AutoModel(
+                    model=vad_model,
+                    device=selected_device,
+                    disable_update=True,
+                    disable_pbar=True,
+                ),
+            ),
+            cast(
+                _FunASRPipeline,
+                funasr.AutoModel(
+                    model=speaker_model,
+                    device=selected_device,
+                    disable_update=True,
+                    disable_pbar=True,
+                ),
+            ),
+            device=selected_device,
+        )
+
+    async def analyze_file(self, media_path: Path) -> SpeechAnalysis:
+        """Keep the edge loop responsive while local GPU inference runs."""
+        return await asyncio.to_thread(self._analyze_file, media_path)
+
+    def _analyze_file(self, media_path: Path) -> SpeechAnalysis:
+        media_path = media_path.resolve(strict=True)
+        audio = _load_speech_waveform(media_path)
+        spans = self._speech_spans(audio)
+        if not spans:
+            return SpeechAnalysis(segments=(), speaker_embeddings=())
+        results = self._engine.generate(
+            inputs=[audio[_sample_index(start) : _sample_index(end)] for start, end in spans],
+            max_new_tokens=self._max_new_tokens,
+            # The engine runs in prompt-embeds mode, where any other value crashes the CUDA
+            # kernel (upstream issue #2948). Passed explicitly so it reads as a constraint
+            # rather than a default nobody chose.
+            repetition_penalty=1.0,
+        )
+        if len(results) != len(spans):
+            raise ModelOutputError("Fun-ASR-Nano returned an invalid transcription batch")
+        sentences = _nano_sentences(results, spans)
+        if not sentences:
+            return SpeechAnalysis(segments=(), speaker_embeddings=())
+        centroids = self._label_speakers(audio, sentences)
+        return SpeechAnalysis(
+            segments=_funasr_segments(sentences, confidence=self._diarization_confidence),
+            speaker_embeddings=_funasr_speaker_embeddings(centroids),
+        )
+
+    def _speech_spans(self, audio: _Waveform) -> tuple[tuple[int, int], ...]:
+        """Ask FSMN-VAD which millisecond spans to batch through the engine.
+
+        Upstream's server falls back to the whole clip when VAD finds nothing, because a
+        caller who posted a file asked for it to be transcribed. Here an empty VAD result is
+        the answer: nobody spoke, and inventing a span over silence would enter the memory as
+        speech.
+        """
+        output = self._vad_pipeline.generate(input=audio, fs=_SPEECH_SAMPLE_RATE)
+        if len(output) != 1:
+            raise ModelOutputError("FunASR VAD returned an invalid batch")
+        value = output[0].get("value")
+        if value is None:
+            return ()
+        if not isinstance(value, list) or len(value) > MAX_SPEECH_SEGMENTS:
+            raise ModelOutputError("FunASR VAD returned invalid speech spans")
+        spans = []
+        for span in value:
+            if (
+                not isinstance(span, (list, tuple))
+                or len(span) < 2
+                or not all(
+                    isinstance(edge, (int, float)) and not isinstance(edge, bool)
+                    for edge in span[:2]
+                )
+            ):
+                raise ModelOutputError("FunASR VAD returned an invalid speech span")
+            start, end = round(span[0]), round(span[1])
+            if end - start > _MINIMUM_TRANSCRIBED_SPAN_MS:
+                spans.append((start, end))
+        return tuple(spans)
+
+    def _label_speakers(
+        self,
+        audio: _Waveform,
+        sentences: list[dict[str, object]],
+    ) -> object:
+        """Cluster CAM++ chunks with upstream's own primitives and keep the centroids.
+
+        `sentences` is mutated in place with the `spk` key, exactly as upstream's
+        `distribute_spk` does inside `AutoModel`, so both backends hand the normalizer the
+        same sentence shape.
+        """
+        torch = __import__("torch")
+        numpy = __import__("numpy")
+        campplus = __import__(
+            "funasr.models.campplus.utils",
+            fromlist=["distribute_spk", "postprocess", "sv_chunk"],
+        )
+        cluster_backend = __import__(
+            "funasr.models.campplus.cluster_backend",
+            fromlist=["ClusterBackend"],
+        )
+        # `sv_chunk` works in seconds and returns chunks in input order. That order is left
+        # alone: `postprocess` pairs `segments[i]` with `labels[i]`, and the labels come back
+        # in chunk order, so sorting the chunks without reordering the embeddings would
+        # mislabel them. VAD spans are already chronological, so there is nothing to sort.
+        chunks = campplus.sv_chunk(
+            [
+                [
+                    cast(int, sentence["start"]) / 1_000,
+                    cast(int, sentence["end"]) / 1_000,
+                    audio[
+                        _sample_index(cast(int, sentence["start"])) : _sample_index(
+                            cast(int, sentence["end"])
+                        )
+                    ],
+                ]
+                for sentence in sentences
+            ],
+            fs=_SPEECH_SAMPLE_RATE,
+        )
+        if not chunks:
+            return None
+        embeddings = torch.cat(
+            [
+                result["spk_embedding"]
+                for result in self._speaker_pipeline.generate(
+                    input=[chunk[2] for chunk in chunks],
+                    cache={},
+                    is_final=True,
+                )
+            ],
+            dim=0,
+        )
+        labels = numpy.asarray(
+            cluster_backend.ClusterBackend(merge_thr=_SPEAKER_CLUSTER_MERGE_THRESHOLD).to(
+                self.device
+            )(embeddings.cpu(), oracle_num=None)
+        )
+        timeline, centroids = campplus.postprocess(
+            chunks,
+            None,
+            labels,
+            embeddings.detach().cpu().numpy(),
+            return_spk_center=True,
+        )
+        campplus.distribute_spk(sentences, timeline)
+        return centroids
+
+
+SPEECH_ENGINES = ("automodel", "vllm")
+
+
+def load_speech_analyzer(
+    *,
+    engine: str | None = None,
+    device: str | None = None,
+    recipe: FunASRRecipe | str = DEFAULT_FUNASR_RECIPE,
+) -> SpeechAnalyzer:
+    """Pick the inference engine for this device, or take the one named.
+
+    Left unset this resolves by environment: a CUDA device with vLLM installed gets `vllm`,
+    and everything else gets `automodel`. Both fill the whole `SpeechAnalysis` contract, so
+    the choice is throughput and span precision rather than capability -- which is why it can
+    be made from the environment at all.
+    """
+    selected = (engine or _engine_for_environment(device=device)).strip().lower()
+    if selected == "vllm":
+        return FunASRNanoVLLMPipeline.load(device=device)
+    if selected == "automodel":
+        return FunASRAutoModelPipeline.load(device=device, recipe=recipe)
+    raise ValueError(f"unknown speech engine {selected!r}; pass one of {', '.join(SPEECH_ENGINES)}")
+
+
+def _engine_for_environment(*, device: str | None) -> str:
+    """CUDA with vLLM installed goes to vLLM; every other platform goes to `AutoModel`.
+
+    vLLM has to be actually importable, not merely wanted: it is a deliberate install, and
+    treating its presence as the signal keeps a GPU host that never installed it on the
+    portable path instead of failing at load. Nothing here reaches for an engine that cannot
+    produce speaker centroids -- both of these do, so resolving from the environment can only
+    change throughput, never whether the device can still answer who spoke.
+    """
+    # `select_torch_device` raises when an accelerator is demanded and missing, which is the
+    # module's standing rule: a silent CPU fallback turns capacity into a latency mystery.
+    if select_torch_device(device).startswith("cuda") and find_spec("vllm") is not None:
+        return "vllm"
+    return "automodel"
 
 
 @dataclass(frozen=True, slots=True)
@@ -326,8 +736,18 @@ class FunASRStreamingTranscriber:
         self._lock = asyncio.Lock()
 
     @classmethod
-    def load(cls, *, device: str | None = None) -> FunASRStreamingTranscriber:
-        """Load the causal Paraformer checkpoint only when live ASR is needed."""
+    def load(
+        cls,
+        *,
+        device: str | None = None,
+        model_id: str = FUNASR_STREAMING_ASR_MODEL_ID,
+    ) -> FunASRStreamingTranscriber:
+        """Load a causal checkpoint only when live ASR is needed.
+
+        `model_id` has to name an online/streaming FunASR checkpoint. Streaming is not a
+        capability every FunASR model has -- SenseVoice and Fun-ASR-Nano have no causal
+        variant -- so this stays a separate load rather than something a recipe can turn on.
+        """
         try:
             funasr = __import__("funasr")
         except ImportError as error:
@@ -337,7 +757,7 @@ class FunASRStreamingTranscriber:
             ) from error
         selected_device = select_torch_device(device)
         pipeline = funasr.AutoModel(
-            model=FUNASR_STREAMING_ASR_MODEL_ID,
+            model=model_id,
             device=selected_device,
             disable_update=True,
             disable_pbar=True,
@@ -543,7 +963,7 @@ async def recognize_identities_in_av_segment(
     duration_ms: int,
     memory: SQLiteIdentityMemory,
     face_encoder: InsightFaceVideoEncoder,
-    speech_pipeline: FunASRSpeechPipeline,
+    speech_pipeline: SpeechAnalyzer,
     thresholds: IdentityMatchingThresholds,
     active_speaker_matcher: ActiveSpeakerMatcher | None = None,
     face_samples_per_second: float | None = None,
@@ -782,6 +1202,13 @@ def _funasr_segments(value: object, *, confidence: float) -> tuple[SpeechSegment
             or (speaker is not None and not isinstance(speaker, (str, int)))
         ):
             raise ModelOutputError("FunASR returned an invalid sentence")
+        # A sentence that is nothing but model special tokens is a VAD span the model heard no
+        # speech in, which SenseVoice reports constantly. Dropping the span is right; treating
+        # it as a malformed result would lose every other sentence in the clip with it, and a
+        # missing or blank `text` still does raise above.
+        transcript = _MODEL_SPECIAL_TOKEN.sub("", transcript).strip()
+        if not transcript:
+            continue
         start_ms, end_ms = round(start), round(end)
         try:
             segments.append(
@@ -790,7 +1217,7 @@ def _funasr_segments(value: object, *, confidence: float) -> tuple[SpeechSegment
                     start_ms=start_ms,
                     end_ms=end_ms,
                     confidence=confidence,
-                    transcript=transcript.strip(),
+                    transcript=transcript,
                     speaker_label=str(speaker).strip() if speaker is not None else None,
                 )
             )
@@ -832,6 +1259,69 @@ def _funasr_speaker_embeddings(value: object) -> tuple[SpeakerEmbeddingSample, .
         )
     except (TypeError, ValueError) as error:
         raise ModelOutputError("FunASR returned invalid speaker centroids") from error
+
+
+def _sample_index(milliseconds: int) -> int:
+    return int(milliseconds * _SPEECH_SAMPLE_RATE / 1_000)
+
+
+def _load_speech_waveform(media_path: Path) -> _Waveform:
+    """Decode to 16 kHz mono through FunASR's own loader.
+
+    Reusing it keeps the two backends on identical preprocessing -- the `AutoModel` path hands
+    the file to this same function internally -- and inherits its torchaudio/soundfile/ffmpeg
+    fallback chain, so no decoder becomes a MindBridge dependency.
+    """
+    load_utils = __import__("funasr.utils.load_utils", fromlist=["load_audio_text_image_video"])
+    waveform = load_utils.load_audio_text_image_video(str(media_path), fs=_SPEECH_SAMPLE_RATE)
+    return cast(_Waveform, waveform.detach().cpu().numpy())
+
+
+def _nano_sentences(
+    results: list[dict[str, object]],
+    spans: tuple[tuple[int, int], ...],
+) -> list[dict[str, object]]:
+    """Put the engine's per-span text back on the clip's timeline.
+
+    Fun-ASR-Nano is handed one VAD span at a time, so its CTC timestamps are relative to that
+    span. Where they survived the forced alignment they are preferred over the VAD edges,
+    which are padded: they are what the model actually heard, and they keep this backend's
+    spans as tight as the `AutoModel` path's.
+    """
+    sentences: list[dict[str, object]] = []
+    for result, (span_start, span_end) in zip(results, spans, strict=True):
+        text = result.get("text")
+        if not isinstance(text, str):
+            raise ModelOutputError("Fun-ASR-Nano returned invalid transcription text")
+        if not _MODEL_SPECIAL_TOKEN.sub("", text).strip():
+            continue
+        start, end = span_start, span_end
+        timestamps = result.get("timestamps")
+        if isinstance(timestamps, list) and timestamps:
+            aligned = _nano_span(timestamps, span_start, span_end)
+            if aligned is not None:
+                start, end = aligned
+        sentences.append({"start": start, "end": end, "text": text})
+    return sentences
+
+
+def _nano_span(timestamps: list[object], span_start: int, span_end: int) -> tuple[int, int] | None:
+    """Clamp the CTC character alignment into the VAD span it was measured inside."""
+    edges = []
+    for item in timestamps:
+        if not isinstance(item, dict):
+            return None
+        start, end = item.get("start_time"), item.get("end_time")
+        if not isinstance(start, (int, float)) or not isinstance(end, (int, float)):
+            return None
+        edges.append((float(start), float(end)))
+    if not edges:
+        return None
+    start = span_start + round(min(edge[0] for edge in edges) * 1_000)
+    end = span_start + round(max(edge[1] for edge in edges) * 1_000)
+    start = min(max(start, span_start), span_end)
+    end = min(max(end, start), span_end)
+    return (start, end) if end > start else (span_start, span_end)
 
 
 def _pcm16_float32(pcm16: bytes) -> object:

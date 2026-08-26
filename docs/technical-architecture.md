@@ -430,7 +430,7 @@ entry point `mindbridge.generators`、`mindbridge.embedders` 发现；进程只�
 | 端侧跨模态近期召回 | `jina-embeddings-v5-omni-nano-retrieval` | 算力充裕的端侧主机（Jetson / RDK / RK / OpenVINO x86 / dGPU），可选 |
 | 人脸检测、跟踪与表征 | SCRFD-2.5GF-KPS + ArcFace R50；YuNet + SFace 为轻量生态对照 | 端侧 |
 | 流式 ASR | FunASR causal Paraformer，官方 cache 与 600ms 模型窗口 | 端侧 |
-| VAD、质量 ASR、标点、diarization | 一个 FunASR `AutoModel` 组合官方 VAD、ASR、punc、speaker model | 端侧 |
+| VAD、质量 ASR、标点、diarization | CUDA 上 Fun-ASR-Nano vLLM；其余平台 FunASR `AutoModel` recipe（默认 Fun-ASR-Nano）组合官方 VAD、ASR、punc、speaker model | 端侧 |
 | 声纹表征 | 上述 FunASR 调用直接返回 CAM++ speaker centroid（`iic/speech_campplus_sv_zh-cn_16k-common`）；ERes2NetV2 作为质量挑战者再 bake-off | 端侧 |
 | 活跃说话人与 face↔voice | LR-ASD + 多 Observation 可撤销证据；GateFusion 为质量挑战者 | 端侧 |
 | 最终回答和证据核验 | 能直接读取候选图像、视频和音频的冻结 Omni/VLM | 云端 |
@@ -540,6 +540,34 @@ ASR、FSMN-VAD、CT-Transformer punctuation 和 CAM++ speaker model 在一次 `g
 返回带毫秒边界、标点、speaker label 的 `sentence_info`，并通过 `return_spk_center` 返回每个
 speaker 的 192 维 centroid。MindBridge 删除了自维护的 NeMo turn 融合、波形二次解码和声纹模型
 二次推理；模型网络、聚类和预处理全部复用上游。
+
+MindBridge 适配的是 FunASR 能力，不是某一个 FunASR 模型。`recognize_identities_in_av_segment()`
+只接受 `SpeechAnalyzer` 契约——带时间范围的语音段加上这些语音段所属的 speaker centroid——由后端
+归一化到它：`FunASRAutoModelPipeline` 走通用 `AutoModel`，`FunASRNanoVLLMPipeline` 走 Fun-ASR-Nano
+的 vLLM 批量路径。这与 FunASR 官方服务同构：Nano 用 vLLM，SenseVoice/Paraformer 回退到 `AutoModel`，
+并不是所有模型都跑在 vLLM 上。
+
+模型之间的差别由 `FunASRRecipe` 声明，而不是由一个 model id 暗示：默认的 Fun-ASR-Nano 自带标点和
+CTC timestamp，上游因此跳过 punc（并因此把 `spk_mode` 降到 `vad_segment`，文本带模型自己的标点，
+但 turn 边界来自 VAD）；SeACo-Paraformer 预测字级 timestamp 因此能走 `punc_segment` 分句；
+SenseVoice 不预测 timestamp，上游自动降级到 `vad_segment`，标点无处对齐所以不加载。三个 recipe
+都必须组合 CAM++——没有 centroid 声纹就无可比对，所以缺 VAD 或缺 speaker model 的 recipe 在构造时
+即被拒绝，而不是在几 GiB 权重加载并推理之后。默认 recipe 需要 `trust_remote_code=True`，未钉
+revision 时上游解析成 `master`，因此 `FunASRRecipe.revision` 留给已实测某个 checkpoint 的部署去钉。
+
+引擎由环境选，模型由 recipe 选，两件事分开。`load_speech_analyzer()` 不指定引擎时按环境解析：装了
+vLLM 的 CUDA 设备用 vLLM，其余平台用 `AutoModel`。**引擎能自动选，前提是两个引擎都填满整个契约**
+——都产 CAM++ centroid，所以自动解析只会改吞吐和 span 精度，不会改「这台设备还答不答得出谁在说话」。
+vLLM 必须真的 importable 才算：装它是刻意行为，所以以「装了」为信号；没装 vLLM 的 GPU 主机留在
+`AutoModel` 上，而不是在 load 时报错。显式 `engine="vllm"` 落在无 CUDA 的设备上会响亮失败——本模块
+的既定规则是显式加速器请求不是建议。
+
+llama.cpp/GGUF 路径**已评估、不采纳**：上游明确写着 standalone GGUF 二进制不实现 CAM++ embedding 与
+聚类，接进来只能让低算力平台静默失去跨 observation 的人物一致性，详见 `docs/edge-identity-sota.md`
+第 5.3 节。
+
+流式不进 recipe 也不进引擎选择：SenseVoice 和 Fun-ASR-Nano 都没有 causal 变体，
+`FunASRStreamingTranscriber` 仍需单独的在线 checkpoint。
 
 `recognize_identities_in_av_segment()` 将同步 video/audio sidecar 串成一个可等待入口；
 `auto` 在 CUDA 可用时选择 GPU，并核对模型实际 device/provider，显式要求 GPU 却静默回落会立即
@@ -1365,9 +1393,9 @@ FastAPI 等服务端栈，子包导入隔离由独立进程测试守护。`edge`
 Linux ARM 设备仍使用与 JetPack、OpenExplorer、RKNN、OpenVINO 或 BPU 匹配的镜像工件。随包的
 ONNX Runtime 是 CPU provider，CUDA/TensorRT 人脸 provider 由平台镜像提供。FunASR 自身仍是模型栈
 而非“轻依赖”，减重来自只维护一套上游
-speech runtime、且不把它拖入 Core/SDK/server。llama.cpp 的 FunASR/GGUF 支持适合作为未来
-ASR/VAD 多端运行时候选，但当前没有证据证明它完整覆盖 punctuation、diarization 和 voiceprint，
-因此不能作为这一统一身份管线的透明替换。
+speech runtime、且不把它拖入 Core/SDK/server。上游 `runtime/llama.cpp/` 的 FunASR/GGUF 路径运行期
+不需要 Python ML 栈，对难部署平台很有吸引力，但**不是这条统一身份管线的透明替换**：上游明确写着
+standalone GGUF 二进制不实现 CAM++ speaker embedding 与聚类，所以它给不出声纹，已评估不采纳。
 
 Worker 通过 `mindbridge.celery_app:app` 启动，Redis 消息只传
 `tenant_id`、`observation_id`、`job_id`。原始媒体、Evidence 和任务状态均以 PostgreSQL/S3
@@ -1770,6 +1798,8 @@ Entity/Bridge/Scene/Horizon cue 明确推迟到完整数据证明增益之后，
 | ADR-009 | Code is the Product：可读性、简洁性、类型和测试作为合并门禁，行数不是产出 | 首次实现需投入工具配置和评审成本 | 不重审；工程质量是产品能力的一部分 |
 | ADR-010 | face↔voice 只由可审计 ASD 证据跨 Observation 累积并可撤销解析 | 首次绑定更慢，低证据场景保持两个匿名 ID | 同条件实验证明替代方法在 false-link、撤销和部署成本上稳定更优 |
 | ADR-011 | 端侧语音默认收敛到 FunASR 在线 ASR + Event-close 统一质量管线，不保留 NeMo 并行栈 | 实时 partial 暂不提供稳定 speaker label | 带真值 replay 证明另一上游栈在同资源下显著降低 DER/false-link，且收益覆盖依赖和编排成本 |
+| ADR-012 | 适配 FunASR 能力而非某个 FunASR 模型：上层固定 `SpeechAnalyzer` 契约，模型由 `FunASRRecipe` 声明、引擎由环境选（CUDA 用 Nano vLLM，其余平台用 `AutoModel`） | 多一层归一化；两个引擎的 turn 边界精度不同（vLLM 用 CTC 对齐更紧） | 实测证明某个引擎在所有目标平台上都够用，因而不再需要选择 |
+| ADR-013 | 不采纳 llama.cpp/GGUF 引擎，非 CUDA 平台一律用 `AutoModel` | 难部署平台仍需 Torch/FunASR 栈，无法享受单二进制与量化权重 | 上游在 GGUF 二进制里实现 CAM++ embedding 与聚类；届时它是一个薄适配器，`SpeechAnalyzer` 契约已是那个位置 |
 | ADR-012 | 模型扩展只使用 Generator、Embedder；供应商是 Adapter，任务是应用管线。原 `Reranker` 插口因零实现而删除 | 破坏旧任务专用类，插件必须遵守严格协议；重排能力回归时需要一次显式协议新增 | 出现无法由两种 I/O 语义表达、且已有真实实现的新能力（重排是首个候选） |
 
 ## 18. 待实测后锁定的参数

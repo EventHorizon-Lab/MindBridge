@@ -138,12 +138,75 @@ partial = await streaming_asr.push_pcm16(pcm16_chunk, is_final=is_last_audio_chu
 ```
 
 The partial transcript is provisional. The platform capture stack still owns the bounded rolling
-fragment; when its event gate closes, `FunASRSpeechPipeline` performs VAD, quality ASR,
-punctuation, diarization, and CAM++ centroid extraction in one upstream call.
+fragment; when its event gate closes, a speech backend performs VAD, quality ASR, punctuation,
+diarization, and CAM++ centroid extraction.
 
 `recognize_identities_in_av_segment()` combines that result with InsightFace and the optional
 provider-neutral audiovisual active-speaker pipeline, then returns only cloud-safe intervals ready
 for `enqueue_captured_media()`.
+
+## Choosing a speech engine
+
+`recognize_identities_in_av_segment()` takes any `SpeechAnalyzer` — the contract is timed speech
+spans plus the speaker centroids those spans belong to, and nothing about which model or engine
+produced them. `load_speech_analyzer()` picks one:
+
+```python
+from mindbridge.edge.identity_diarization import load_speech_analyzer
+
+# Resolves by environment: CUDA with vLLM installed → vllm, every other platform → automodel.
+speech = load_speech_analyzer(device="auto")
+
+# Or name one.
+speech = load_speech_analyzer(engine="vllm", device="cuda")
+speech = load_speech_analyzer(engine="automodel", recipe="sensevoice")
+```
+
+| Engine | Runs on | Batching | Speaker turns bounded by |
+| --- | --- | --- | --- |
+| `automodel` | anywhere the `edge` extra installs | per VAD span | the recipe's segmentation |
+| `vllm` | CUDA only | batched across VAD spans | CTC character alignment |
+
+Both engines fill the whole contract, including CAM++ centroids, so resolving from the
+environment can only change throughput and span precision — never whether the device can still
+answer who spoke. That is the reason this choice is safe to make automatically.
+
+vLLM has to be importable, not merely wanted: installing it is deliberate, so its presence is the
+signal. A GPU host that never installed it stays on `automodel` rather than failing at load.
+Naming `engine="vllm"` on a device without CUDA fails loudly — an explicit accelerator request is
+not a suggestion here.
+
+### AutoModel recipes
+
+A recipe is the composition, not just the model id, because a FunASR model id alone does not say
+whether the checkpoint predicts timestamps or punctuates its own output — and those answers decide
+whether timed speech and speaker centroids can be produced at all:
+
+| Recipe | Model | VAD | Punctuation | Speaker turns split on |
+| --- | --- | --- | --- | --- |
+| `fun-asr-nano` (default) | Fun-ASR-Nano | FSMN-VAD, 30 s ceiling | the model's own | VAD spans |
+| `paraformer` | SeACo-Paraformer (Mandarin) | FSMN-VAD | CT-Transformer | punctuation |
+| `sensevoice` | SenseVoiceSmall | FSMN-VAD, 30 s ceiling | none — nothing to align it to | VAD spans |
+
+Every recipe composes CAM++ for the centroid, because a voiceprint has nothing to match against
+without it. A model MindBridge has not measured is enabled by declaring its own recipe, which is
+refused if it drops VAD or the speaker model:
+
+```python
+speech = load_speech_analyzer(
+    recipe=FunASRRecipe(model_id="iic/SenseVoiceSmall", vad_max_single_segment_ms=30_000),
+)
+```
+
+The default recipe runs with `trust_remote_code=True`, which FunASR needs for Fun-ASR-Nano, and
+an unset revision resolves upstream to `master`. Pin `revision=` once a deployment has measured a
+checkpoint.
+
+### Streaming
+
+Streaming is deliberately not part of a recipe or an engine choice. It is a separate load because
+it is not a capability every FunASR model has — neither SenseVoice nor Fun-ASR-Nano publishes a
+causal variant, so `FunASRStreamingTranscriber.load()` needs a checkpoint that does.
 
 `device="auto"` selects an available accelerator. An explicit accelerator request **fails** rather
 than silently using CPU — a silent CPU fallback turns a capacity problem into a latency mystery.
