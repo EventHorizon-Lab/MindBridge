@@ -189,6 +189,16 @@ max-complexity = 10
 # code was checked.
 strict = true
 files = ["src", "tests"]
+# pytest identifies conftest files by name, so the session watchdog in tests/conftest.py and the
+# database fixtures in tests/integration/conftest.py are both the module `conftest` to mypy's
+# path-to-module mapping. That is a hard error which stops the run before anything is checked.
+# The documented resolutions all cost more than the file is worth: `explicit_package_bases` with
+# the repository root as a base renames `src/mindbridge/...` too and, once `mypy_path` is set to
+# keep that working, stops sibling test helpers like `stub_judge` from resolving (measured: 1717
+# and 47 errors respectively), and `__init__.py` files change how pytest imports the tree to fix
+# a problem that is only mypy's. Excluding the smaller file is the contained option; it is 15
+# lines of stdlib calls with no project types in it.
+exclude = ["^tests/conftest\\.py$"]
 
 [[tool.mypy.overrides]]
 module = [
