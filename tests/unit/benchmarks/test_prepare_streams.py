@@ -235,9 +235,14 @@ def test_a_supermemory_segment_carries_its_transcript_as_text_and_as_timed_voice
     """The released MP4s have no audio track, so the aligned transcript is the only speech.
 
     Perception is told to name people only when a name is seen or heard; handed silent video and
-    no spans, it can never name anyone on a corpus whose questions are about what B said. The
-    sound event below belongs in the segment's text and not in a span -- an identity has to be
-    somebody -- which is what separates these two assertions from each other.
+    no spans, it can never name anyone on a corpus whose questions are about what B said.
+
+    Both sound events below belong in the segment's text and in no span, and they are there to
+    test two different guards. The unattributed one needs only "an identity has to be somebody".
+    The one the release *did* attribute to B is filtered by `kind` alone, and without that check
+    it becomes a voice span whose transcript is `[B laughs]` -- perception handed a bracketed
+    stage direction as something B said. A fixture with only the first sound event cannot tell
+    the two guards apart, and dropping `kind` stayed green until this line existed.
     """
     from mindbridge.benchmarks.supermemory_runner import load_prepared_supermemory
 
@@ -251,6 +256,7 @@ def test_a_supermemory_segment_carries_its_transcript_as_text_and_as_timed_voice
     assert opening.transcript is not None
     assert "B: He cooks beef." in opening.transcript
     assert "[Papers rustle]" in opening.transcript
+    assert "B: [B laughs]" in opening.transcript
     spans = opening.identity_observations
     assert [(span.identity_id, span.start_ms, span.end_ms) for span in spans] == [
         ("B", 1_000, 3_000)
@@ -529,6 +535,7 @@ def _supermemory_release(root: Path) -> Path:
         [
             (1.0, 3.0, "B", "He cooks beef.", "speech", "high"),
             (4.0, 5.0, None, "[Papers rustle]", "sound", "low"),
+            (6.0, 7.0, "B", "[B laughs]", "sound", "high"),
         ],
     )
     _supermemory_transcript(
