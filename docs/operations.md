@@ -310,7 +310,7 @@ Four warnings exist because the condition is otherwise invisible in a working de
 ### Finding the bottleneck
 
 ```bash
-MINDBRIDGE_TIMING_SUMMARY=1 mindbridge consolidate --tenant tenant_01
+MINDBRIDGE_TIMING_SUMMARY=1 mindbridge consolidate --tenant-id tenant_01
 ```
 
 One row per operation at exit, ranked by self time, with `calls`, `self_seconds`,
@@ -322,8 +322,9 @@ died halfway — which is when knowing what owned the clock is worth most.
 
 ## Telemetry
 
-OpenTelemetry activates only when a standard OTLP endpoint is configured; otherwise it is a
-no-op. The logs above do not depend on it.
+OpenTelemetry activates per signal. The default OTLP exporter is a no-op without an endpoint;
+`console` emits locally without a collector, and `none` disables the signal. The logs above do
+not depend on it.
 
 ```bash
 export OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318

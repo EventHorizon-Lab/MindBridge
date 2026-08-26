@@ -200,8 +200,9 @@ The task budget expired mid-model-call. A soft-limit overrun is retried as thoug
 transient, so an observation that legitimately needs longer never finishes — it repeats the same
 generator call, paying for each one, until the retries run out. Nothing is written either way.
 
-Raise `request_timeout_seconds` in `MINDBRIDGE_GENERATOR_CONFIG_JSON`; the worker's Celery limits
-are derived from it and follow automatically.
+Raise `request_timeout_seconds` in the `[generator]` section of `mindbridge.toml`; the
+worker's Celery limits are derived from it and follow automatically. A complete
+`MINDBRIDGE_GENERATOR_CONFIG_JSON` object remains available for fileless deployments.
 
 ### Jobs stay `pending`
 
@@ -275,8 +276,9 @@ default `max_connections` of 100. Size it across your whole deployment, not per 
 
 ### Ingest is too expensive
 
-Frame rate sets the entire write cost: one clip cut, one encoder call, one stored object per
-sampled window. Lower `frames_per_second` in `MINDBRIDGE_MEDIA_SAMPLING_CONFIG_JSON` first.
+Frame rate sets the entire video write cost: one clip cut, one encoder call, and one stored object
+per sampled window. Lower `frames_per_second` in the `[media_sampling]` section of
+`mindbridge.toml` first.
 
 Above roughly 1.3 fps at 30-second segments, the generation proxy also stops working — past about
 forty sampled frames its encode fails on the flush that drains the encoder. Raising frame rate

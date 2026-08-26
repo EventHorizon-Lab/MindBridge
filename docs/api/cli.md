@@ -416,7 +416,7 @@ uv run mindbridge-bench
 | `score` | — | Record an official scorer's verdict beside a run. |
 | `datasets` | `benchmarks` | Check every official release parses and pins its digest. |
 | `jina` | `cloud-models` | Check the local Jina Omni embedder answers. |
-| `bakeoff` | — | Compare candidate adapters on one prepared corpus. |
+| `bakeoff` | `cloud-models` | Compare candidate adapters on one prepared corpus. |
 
 Runners drive the production REST API. There is no evaluation-only path, which is the point: a
 benchmark that bypasses the product measures something the product does not do.

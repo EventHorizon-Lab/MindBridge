@@ -84,7 +84,9 @@ including identity samples the edge learned from that source. Tombstones are con
 construction and survive physical erasure, so an offline device can reconcile on reconnect and a
 restore can be reconciled against them.
 
-Only `propagation_state: complete` means every copy is gone.
+`propagation_state: complete` means deletion finished in central PostgreSQL and object storage.
+It is not an acknowledgement from an offline edge device; verify that device's tombstone
+reconciliation separately.
 
 Two obligations that must be planned together: a backup outliving a deletion reintroduces deleted
 content on restore. Decide your backup retention window and your deletion propagation window at

@@ -1,12 +1,14 @@
 # MindBridge 技术实现架构
 
-> 状态：RTX 5090 实测基线（Phase 3 效果优化中）
-> 版本：0.8
-> 更新日期：2026-08-17
+> 状态：当前实现架构与 Phase 3 路线图；尚未交付的内容在 §16.1 单独列出
+> 版本：0.9
+> 更新日期：2026-08-26
 
 ## 1. 文档目的
 
-本文定义 MindBridge 的首版技术实现架构、核心数据模型、端云边界、模型与检索策略、API、部署方式和评测路线。它是后续代码实现、Benchmark、技术选型和架构评审的共同基线。
+本文记录 MindBridge 的技术实现架构、核心数据模型、端云边界、模型与检索策略、API、部署方式和评测路线。
+当前可运行行为以 `src/mindbridge/`、`migrations/`、契约快照和面向使用者的专题文档为准；本文中的
+产品目标与 Phase 规划不应被读成已经发布的能力。
 
 MindBridge 不是机器人、Agent 或大模型。MindBridge 是**记忆本身**：一个 Agentic Native、Embodied、Multimodal-first 的 Memory-as-a-Service（MaaS）系统。
 
@@ -75,9 +77,9 @@ MindBridge 的职责边界是从连续感知信号到可引用记忆；Agent 只
 ```mermaid
 flowchart LR
     subgraph DEVICE["Edge Runtime · Jetson / RDK / RK / OpenVINO / dGPU Host"]
-        SENSOR["Camera · Microphone · Gaze · IMU · Robot State"]
+        SENSOR["Camera · Microphone"]
         CAPTURE["GStreamer Capture (DeepStream optional)\nclock sync · decode · rolling buffer"]
-        GATE["Event Gate\nVAD · scene change · motion · gaze"]
+        GATE["Event Gate\nVAD · scene change · motion"]
         IDENTITY["Local Identity\nface · diarization · voiceprint"]
         EDGE_MEMORY["SQLite Recent Memory\nmanifest · prototypes · outbox"]
         EDGE_OMNI["Optional Local Omni Embedding\nJina v5 Omni Nano"]
@@ -128,7 +130,7 @@ flowchart LR
 | 端侧负责 | 云端负责 |
 | --- | --- |
 | 连续采集、硬件时间戳和滚动缓存 | 原始证据的长期对象存储 |
-| VAD、场景变化、运动、注视等事件门控 | 重型 Omni/VLM 理解与证据重看 |
+| VAD、场景变化和运动等事件门控 | 重型 Omni/VLM 理解与证据重看 |
 | 人脸、说话人分离和声纹身份 | 全局实体消歧与跨时间关系构建 |
 | 设备域近期记忆和断网 Outbox | 统一多模态 Embedding 和长期索引 |
 | 隐私策略、脱敏和上传决策 | 记忆合并、强化、纠错、沉淀与遗忘 |
@@ -184,8 +186,7 @@ Timeline / Person
             └── EvidenceSpan / SubEvent
                 ├── video frames
                 ├── audio span
-                ├── OCR / ASR
-                └── gaze / IMU / robot state
+                └── OCR / ASR
 ```
 
 该结构吸收 Qwen Video Memory 的层级下钻思路和 M3-Agent 的实体中心多模态图，但以持续流式经历而不是单个静态视频为基本场景。
@@ -269,22 +270,25 @@ SQLite 只保存继续采集和近期召回必需的信息：
 sequenceDiagram
     participant S as Sensor
     participant E as Edge Runtime
+    participant O as Object Storage
     participant C as Cloud Ingestion
+    participant Q as Redis / Celery
     participant W as Memory Worker
-    participant M as Memory Kernel
+    participant P as PostgreSQL
 
-    S->>E: timestamped video/audio/gaze/state
+    S->>E: timestamped video/audio
     E->>E: decode, rolling buffer, VAD/scene/motion gate
     E->>E: local face/voice identity and privacy policy
-    E->>C: manifest + idempotency key
-    C-->>E: accepted offsets / upload URLs
-    E->>C: resumable media and observation batch
-    C->>W: durable job
+    E->>O: upload tenant-scoped media
+    E->>C: manifest + media URI + idempotency key
+    C->>P: observation + evidence + durable job
+    C->>Q: enqueue tenant/observation/job IDs
+    C-->>E: 202 receipt + processing_job_id
+    Q->>W: deliver identifiers
+    W->>O: read source / write derived clips
     W->>W: adaptive segmentation + Omni perception
     W->>W: keyframes, ASR/OCR, AV embedding
-    W->>M: events + entities + claims + evidence
-    M->>M: deduplicate, link, version, persist
-    M-->>E: sync watermark and optional recent-memory delta
+    W->>P: one transaction: graph + vectors + job state
 ```
 
 采集热路径现在接受两种不落盘的原生输入：GStreamer/OpenCV appsink 的 BGR frame 直接进入
@@ -309,7 +313,7 @@ PCM，并用异步锁提供背压；frame 与音频 offset 均以当前 Observat
 
 固定长度切片只能作为推理输入上限，不能直接等同于记忆边界。首版采用：
 
-1. VAD、镜头变化、运动状态、注视变化、人物进入/离开和机器人任务状态产生候选边界；
+1. VAD、镜头变化、运动状态和 Omni 感知结果产生候选边界；
 2. 合并极短片段，避免每帧形成一个 Event；
 3. 对过长片段按可配置的 `max_analysis_window` 切分，并保留重叠区；
 4. Omni 模型判断语义边界并将相邻片段合并为 Event/Episode；
@@ -625,7 +629,8 @@ flowchart LR
 ### 7.2 查询步骤
 
 1. 解析查询中的时间、人物、地点、物体、事件类型和预期答案形式；媒体查询直接进入 Omni 分析。
-2. 并行执行跨模态稠密、文本稠密、全文、时间和实体检索。
+2. 用一个跨模态查询向量并行搜索 EvidenceSpan、MemoryRecord 和 Event/Claim/Entity 三个对象通道；
+   查询含文本时同时执行 PostgreSQL 全文检索。
 3. 使用 Reciprocal Rank Fusion（RRF）合并不同分值空间的结果，避免训练融合模型。
 4. 沿 `before/after`、`same_episode`、`mentions`、`supports` 等关系展开少量邻居。
 5. 用冻结 Omni/VLM 查看候选证据，而不是只看摘要。
@@ -640,9 +645,9 @@ PostgreSQL FTS、结构化过滤、RRF 和原始视听证据重看。Event/Claim
 稠密与稀疏召回。向量检索走的是**单租户内的精确扫描**，不是近似检索：RLS 给每条查询注入
 `tenant_id` 谓词，`embeddings_space_search_idx` 又以 `tenant_id` 开头，所以 planner 总能直达
 一个租户的向量并精确排序——迁移 0018 因此删掉了从没被读过的 HNSW 索引。代价是耗时随**单个**
-租户的向量数线性增长（1,000 行约 5 ms，11,000 行约 51 ms）。事务内仍然启用 `strict_order`
-iterative scan：没有 HNSW 索引时它是空操作，但只要某个超大租户重新加回该索引，带过滤的检索
-就仍能返回完整的 LIMIT 而不是静默变少——这才是部署要求 pgvector 0.8+ 的真正原因。
+租户的向量数线性增长（1,000 行约 5 ms，11,000 行约 51 ms）。事务内仍然设置 `strict_order`
+iterative scan；当前没有 HNSW 索引，因此该设置是空操作。项目镜像与 CI 固定并测试 pgvector
+0.8.2；只有未来为超大租户重新引入 HNSW 时，才需要同时验证过滤后的 iterative scan 行为和版本要求。
 稠密命中的 Event/Claim 会在 PostgreSQL 内做一次
 有界关系展开：直接覆盖 `asserts`、`contains`、`same_episode`、`supports`、`contradicts`、
 `supersedes`、`before` 和 `after` 的双向邻居；经 `mentions/about` 共享 Entity 的邻居，每个命中
@@ -727,7 +732,7 @@ MindBridge 的学习对象是记忆状态：
 
 但**参数本身不能在请求路径上自适应**，理由有两条，且第一条比泄漏更早生效：
 
-1. **可复现性。** 九个 benchmark runner 都走同一个 `recall` 路径。参数若在线更新，第 N 题的检索就
+1. **可复现性。** 十二个官方 benchmark runner 都走同一个 `recall` 路径。参数若在线更新，第 N 题的检索就
    依赖第 1..N-1 题，分数变成运行顺序的函数，直接违反 §14.2.1 的可重放 manifest 要求。
 2. **被明令禁止的变体只差一步。** §2.2 与 benchmark 反 reward hacking 约束禁止"按题型统计规律调节
    拒答率"，而"按查询类型学到的阈值"字面上就是这件事。
@@ -907,23 +912,24 @@ MindBridge 对外只暴露少量稳定语义：
 | 提交有用、错误、遗漏或纠正 | `record_feedback(request)` | `POST /v1/feedback` | `memory_feedback` |
 | 显式遗忘某段内容或范围 | `forget(request)` | `POST /v1/forget` | `memory_forget` |
 | 读取一次 Observation 处理状态 | `get_observation_job(tenant_id, job_id)` | `GET /v1/jobs/{job_id}` | `memory_job` |
-| 跟随一次 Observation 处理进度 | `watch_observation_job(...)` | `GET /v1/jobs/{job_id}/events` | 不提供 |
+| 跟随一次 Observation 处理进度 | `stream_observation_job(...)` | `GET /v1/jobs/{job_id}/events` | 不提供 |
 
-HTTP、Python 和 MCP 共享同一层 use case，不各自复制业务逻辑。**进度流**只出现在 REST 面：MCP
+Python SDK 调用 REST；REST 与 MCP 把同一套 Pydantic 契约转换到同一个应用内核，不复制领域逻辑。
+**进度流**只出现在 REST 面：MCP
 Tool 是请求/响应语义，在没有真实调用方要求前不为它发明一套流式约定。但状态**读取**本身就是
 请求/响应，所以 `memory_job` 存在——否则 `memory_observe` 交回的 `processing_job_id` 在 MCP 面
 无法兑换，调用方只能盲目重试 Recall，而那正是本文在 REST 面明确劝阻的做法。
 
-三个协议面的参数形状一致：MCP Tool 的入参就是契约自身的字段，不额外包一层 `request` 对象。
+REST、SDK 与 MCP 使用同一套契约字段；MCP Tool 的入参就是契约自身的字段，不额外包一层 `request` 对象。
 契约的每一个字段都带 `description`，因此跨字段规则（哪种 `feedback_type` 需要哪个字段、
 `observe` 对它并不负责上传的媒体有什么要求）出现在调用方读到的 schema 里，而不是只能靠失败
 一次才发现。
 
 `get_memory` 返回扁平的 `MemoryResult`：它保留 `MemoryView` 字段、请求 `trace_id`，并直接附带
 短期签名的 `EvidenceView`；Recall 内嵌的记忆仍使用不重复 Trace 和 URL 的 `MemoryView`。
-`remember` 返回 `RememberResult`——在 `MemoryResult` 之上多一个 `status`（`created` /
-`duplicate`），与 `observe` 的 `ObservationStatus` 对称：幂等重试本来就该是安全的，但不该是
-静默的。
+`RememberResult` 与 `MemoryResult` 是共享可检查记忆字段的同级类型；只有前者带 `status`
+（`created` / `duplicate`）。它与 `observe` 的 `ObservationStatus` 对称：幂等重试本来就该是
+安全的，但不该是静默的。
 
 ### 9.2 `recall` 最小请求
 
@@ -1178,11 +1184,12 @@ async def forget(request: ForgetRequest) -> ForgetReceipt: ...
 | `api` | 协议转换、鉴权、输入验证、调用 use case | SQL、Prompt、Embedding、记忆合并规则 |
 | `core` | 领域类型、规则和领域错误 | 导入 FastAPI、OpenAI、Transformers、数据库驱动 |
 | `application` | 用例、任务管线和外部端口 | 复制 Adapter、直接处理 HTTP/SQL |
-| `models` | 三个能力协议、插件加载与供应商 Adapter | 决定记忆是否合并、保留或删除 |
+| `models` | `Generator`、`Embedder` 两个能力协议、插件加载与供应商 Adapter | 决定记忆是否合并、保留或删除 |
 | `edge` | 采集、身份、近期记忆和同步 | 知晓云端数据库内部结构 |
 | infrastructure adapter | PostgreSQL、S3、Redis、SDK 细节 | 向上泄漏供应商响应对象 |
 
-依赖只能由外向内：协议和基础设施依赖核心，核心不反向依赖框架。API、Worker 和 MCP 必须调用同一个 use case，禁止维护三套实现。
+依赖只能由外向内：协议和基础设施依赖核心，核心不反向依赖框架。REST 与 MCP 调用同一个应用内核，
+Worker 调用共享的应用管线；协议 Adapter 中禁止复制领域实现。
 
 禁止出现：
 
@@ -1331,15 +1338,20 @@ Edge
     └── sync client
 
 Cloud
-├── mindbridge-api       # REST + MCP，共享 use cases
-├── mindbridge-worker    # ingestion、perception、embedding、lifecycle
+├── REST API             # `uvicorn mindbridge.server:create_app --factory`
+├── MCP server           # 可选的独立 stdio 进程
+├── Celery worker        # ingestion、perception、embedding
+├── Celery beat + consolidation worker  # 可选内置调度与独立队列
+├── scheduled commands   # consolidate、lifecycle、job cleanup
 ├── PostgreSQL + pgvector
 ├── S3-compatible object storage
 ├── Redis + Celery
 └── model endpoints      # Jina SentenceTransformers / provider APIs
 ```
 
-API 和 Worker 可以使用同一个 Python package、两个进程部署。只有当吞吐、故障域或团队边界证明需要时，才将 ingestion、recall、lifecycle 或 model serving 拆成独立服务。
+这些角色来自同一个 Python package，但分别运行；MCP 和计划任务按部署需要启用。Consolidation 可由
+CLI 外部调度，也可启用内置 Celery beat，并在 `mindbridge_consolidation` 专用队列运行。只有当吞吐、
+故障域或团队边界证明需要时，才进一步拆分 ingestion、recall、lifecycle 或 model serving。
 
 基础安装只包含 Core 领域类型、Pydantic 契约和 Python SDK。任意端侧主机——Jetson、地瓜 RDK、
 Rockchip RK、OpenVINO x86、ARM 主机或直接充当“端”的 4090/5090/A100——都安装同一个 `edge`
@@ -1361,13 +1373,14 @@ Worker 通过 `mindbridge.celery_app:app` 启动，Redis 消息只传
 `tenant_id`、`observation_id`、`job_id`。原始媒体、Evidence 和任务状态均以 PostgreSQL/S3
 为事实来源。Jina SentenceTransformers 服务独占模型进程；API 与 Worker 默认都通过共享 endpoint
 调用它，不加载 Jina 权重。仅显式选择本地 `jina` 插件时，Worker 才在进程内加载模型，并由启动
-门禁限制 prefork 副本数。API 与 Worker 在 composition root 按插口直接选择插件，应用层只消费三个能力协议。
+门禁限制 prefork 副本数。API 与 Worker 在 composition root 按插口直接选择插件，应用层只消费
+`Generator` 和 `Embedder` 两个能力协议。
 Generator、两个 Embedder 和共享空间必须由部署配置固定并写入派生记录；凭证
 只从进程环境或基础设施 secret 注入。
 
 ### 12.2 推荐代码边界
 
-未来实现代码时保持最少的稳定模块：
+当前代码保持以下稳定模块边界：
 
 ```text
 src/mindbridge/
@@ -1627,11 +1640,12 @@ observe receipt
 
 对外的进度出口是 `GET /v1/jobs/{job_id}/events`：它把上述内部链路的可见结果收敛成一条可恢复的
 job 状态事件流，供前端和调用方在写入完成前就看到进展，而不需要轮询。它跟随的是 job 状态机，
-不是 Span；Trace 仍然是排查因果的主路径。整条流由 `mindbridge.watch_observation_job` 一个
+不是 Span；Trace 仍然是排查因果的主路径。应用内的整条流由 `mindbridge.watch_observation_job` 一个
 Span 覆盖，不为每次轮询各开一个 Span。
 
-运行时只读取标准 `OTEL_*` 环境变量；设置 common 或 signal-specific
-`OTEL_EXPORTER_OTLP_*_ENDPOINT` 才启用，否则保持 no-op。API、MCP、Worker、Edge Sync 和
+运行时只读取标准 `OTEL_*` 环境变量。OTLP exporter 只有在设置 common 或 signal-specific
+`OTEL_EXPORTER_OTLP_*_ENDPOINT` 后启用；显式选择 `console` exporter 不需要 Collector，均未配置时
+保持 no-op。API、MCP、Worker、Edge Sync 和
 Lifecycle 与 Episode Consolidator 使用不同的默认 `service.name`。FastAPI server context 通过
 HTTPX 传播到模型/API，
 并通过 Celery header 传播到 prefork Worker；Worker 的 SDK 与 BatchSpanProcessor 必须在

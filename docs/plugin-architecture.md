@@ -90,10 +90,9 @@ Factories receive one JSON-compatible mapping, reject unknown keys, validate cre
 identity, and return the requested runtime-checkable protocol. Entry-point names are trimmed
 lowercase text. Missing, duplicate, or wrong-capability plugins fail during process construction.
 
-An adapter that owns network or model resources may provide `close()`. Composition roots call it on
-shutdown and support both synchronous and asynchronous implementations. Provider failures must be
-normalized to MindBridge's `ModelUnavailableError`, `ModelRequestError`, or `ModelOutputError` at
-the adapter boundary.
+An adapter that owns network or model resources may provide asynchronous `close()`. Composition
+roots await it on shutdown. Provider failures must be normalized to MindBridge's
+`ModelUnavailableError`, `ModelRequestError`, or `ModelOutputError` at the adapter boundary.
 
 ## Bundled adapters
 
@@ -110,31 +109,39 @@ same entry points. Adding one does not add a new MindBridge pipeline or public t
 
 ## Configuration
 
-There is no Profile abstraction. Each process selects plugins and passes their configuration
-directly. The server uses:
+There is no Profile abstraction. Each process selects plugins and passes one validated
+configuration object per slot. `mindbridge.toml` is the normal source:
 
-```text
-MINDBRIDGE_GENERATOR_PLUGIN
-MINDBRIDGE_GENERATOR_CONFIG_JSON
-MINDBRIDGE_EMBEDDER_PLUGIN
-MINDBRIDGE_EMBEDDER_CONFIG_JSON
+```toml
+[generator]
+plugin = "openai"
+endpoint = "https://generator.example.com/v1"
+model_id = "qwen3.8-max"
+request_timeout_seconds = 1800
+
+[embedder]
+plugin = "openai"
+endpoint = "https://embeddings.example.com/v1"
+model_id = "jinaai/jina-embeddings-v5-omni-small-retrieval"
 ```
 
-The bundled defaults also accept documented provider-specific environment variables so a normal
-deployment does not need inline JSON. A supplied `*_CONFIG_JSON` value is authoritative and does not
-require the bundled provider's variables. Worker and consolidation processes read the same names for
-the same capability slots. The Worker uses `MINDBRIDGE_EMBEDDER_*` for both text and media by
-default; `MINDBRIDGE_MEDIA_EMBEDDER_*` is an explicit override for a separate local encoder.
+Credentials stay in the environment. Individual
+`MINDBRIDGE_<SECTION>_<KEY>` values override file keys, while a supplied `*_CONFIG_JSON` value
+replaces the entire section for a fileless deployment. Worker and consolidation processes read
+the same names for the same capability slots. The Worker uses `MINDBRIDGE_EMBEDDER_*` for both
+text and media by default; `MINDBRIDGE_MEDIA_EMBEDDER_*` is an explicit override for a separate
+local encoder.
 
 Every bundled fallback is built in one place, `mindbridge.models.defaults`, so a variable is read by
 exactly one function no matter how many processes need it. A plugin author adding a bundled default
 extends that module instead of copying a builder into each process.
 
-A bundled fallback covers credentials and model identity only. Optional settings stay reachable
-through the slot's `*_CONFIG_JSON` object and do not get an environment variable each, so adding a
-knob to a plugin schema does not widen the deployment surface. For the optional local Worker
-encoder, `MINDBRIDGE_MEDIA_EMBEDDER_DEVICE` selects hardware; routing it through
-`select_torch_device` turns a missing GPU into a startup failure instead of silently using CPU.
+A bundled fallback covers credentials and model identity only. Optional settings belong in the
+slot's TOML section; the layered loader serializes that section into the same object factories
+already consume. This keeps plugins unaware of deployment files and avoids a new hand-written
+environment fallback for every knob. For the optional local Worker encoder,
+`MINDBRIDGE_MEDIA_EMBEDDER_DEVICE` selects hardware; routing it through `select_torch_device`
+turns a missing GPU into a startup failure instead of silently using CPU.
 
 Both embedding plugins spell the model they load `model_id` in their configuration objects.
 `PluginConfigModel` sets `extra="forbid"`, so an unrecognized key fails the factory at startup

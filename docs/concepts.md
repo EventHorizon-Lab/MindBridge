@@ -95,7 +95,7 @@ that produced it, a `salience`, and its time span.
 
 Events form a two-level hierarchy through `hierarchy_level`:
 
-- `event` — directly perceived, one grounded span of recording.
+- `event` — directly perceived, grounded in one or more recording spans.
 - `episode` — a consolidated parent that atomically claims child events.
 
 `status` moves through `candidate → active → superseded`. Consolidation writes atomically, so a
