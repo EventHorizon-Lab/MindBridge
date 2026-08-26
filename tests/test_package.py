@@ -248,6 +248,7 @@ PROVIDERS: dict[str, str] = {
     "httpx": "httpx",
     "huggingface_hub": "huggingface-hub",
     "insightface": "insightface",
+    "librosa": "librosa",
     "mcp": "mcp",
     "mcp_types": "mcp-types",
     "mypy_boto3_s3": "boto3-stubs",
