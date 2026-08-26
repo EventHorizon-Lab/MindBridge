@@ -27,6 +27,7 @@ from mindbridge.benchmarks.cli_common import (
     media_manifest,
     report,
     report_unit,
+    scoring_snapshot,
     select_by_id,
     write_run_artifacts,
 )
@@ -42,6 +43,7 @@ from mindbridge.benchmarks.egomem_reason import (
     load_egomem_reason,
 )
 from mindbridge.benchmarks.prompts import EGOMEM_REASON_QUERY_PROMPT
+from mindbridge.benchmarks.scoring import require_scoring_is_possible
 from mindbridge.contracts import Identifier, NonEmptyString, Sha256Hex
 from mindbridge.file_integrity import sha256_file
 from mindbridge.prompts import PERCEIVE_EVENTS_PROMPT
@@ -81,8 +83,10 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
         arguments.example_ids,
         key=lambda question: question.example_id,
         label="EgoMemReason example IDs",
+        limit=arguments.limit,
     )
     prepared = _prepared_by_identity(questions, load_prepared_egomem(arguments.prepared_media_path))
+    require_scoring_is_possible("egomem", predict_only=arguments.predict_only)
     require_writable_output_pair(arguments.output_path, overwrite=arguments.overwrite)
     deployment = load_deployment_snapshot(
         arguments.deployment_config_path,
@@ -156,10 +160,14 @@ def _write_artifacts(
         + "\n"
     )
     streams = tuple(prepared.values())
+    # EgoMemReason withholds its answers, which is MMBench's test split upstream: the run emits
+    # what a leaderboard would read and declares `submission` rather than reporting a score.
+    scoring = scoring_snapshot("egomem", arguments)
     manifest = media_manifest(
         EgoMemRunManifest,
         arguments,
         deployment,
+        scoring=scoring,
         runner_version=EGOMEM_RUNNER_VERSION,
         adapter_version=EGOMEM_REASON_ADAPTER_VERSION,
         annotation_sha256=sha256_file(arguments.dataset_path),

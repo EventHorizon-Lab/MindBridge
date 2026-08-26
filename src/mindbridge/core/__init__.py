@@ -1,12 +1,14 @@
 """Stable domain vocabulary for MindBridge memory."""
 
 from mindbridge.core._validation import (
+    RETIRED_FIELD_NAMES,
     require_aware_datetime,
     require_bounded_count,
     require_non_empty,
     require_probability,
     require_similarity,
     utc_now,
+    without_retired_fields,
 )
 from mindbridge.core.errors import (
     DatabaseUnavailableError,
@@ -50,6 +52,7 @@ from mindbridge.core.graph import (
     derive_relation,
 )
 from mindbridge.core.identifiers import (
+    EMBEDDING_ID_RECIPE_VERSION,
     ClaimId,
     DeviceId,
     EmbeddingId,
@@ -65,6 +68,7 @@ from mindbridge.core.identifiers import (
     RelationId,
     TenantId,
     TombstoneId,
+    derive_embedding_id,
     derive_observation_id,
     derive_stable_id,
 )
@@ -97,6 +101,8 @@ from mindbridge.core.memory import (
 __all__ = [
     "DEFAULT_EMBEDDING_DIMENSION",
     "DEFAULT_MEMORY_STRENGTH_POLICY",
+    "EMBEDDING_ID_RECIPE_VERSION",
+    "RETIRED_FIELD_NAMES",
     "AnonymousIdentityObservation",
     "Claim",
     "ClaimId",
@@ -166,6 +172,7 @@ __all__ = [
     "VerificationStatus",
     "apply_memory_feedback",
     "calculate_memory_strength",
+    "derive_embedding_id",
     "derive_observation_id",
     "derive_relation",
     "derive_stable_id",
@@ -177,4 +184,5 @@ __all__ = [
     "require_probability",
     "require_similarity",
     "utc_now",
+    "without_retired_fields",
 ]

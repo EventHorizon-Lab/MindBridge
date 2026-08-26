@@ -57,7 +57,6 @@ from mindbridge.core import (
     DeletionTombstone,
     DeviceId,
     EmbeddedObjectType,
-    EmbeddingId,
     EmbeddingRecord,
     EvidenceId,
     EvidenceSpan,
@@ -76,6 +75,7 @@ from mindbridge.core import (
     TenantId,
     TombstoneId,
     VerificationStatus,
+    derive_embedding_id,
     derive_observation_id,
     derive_stable_id,
     utc_now,
@@ -564,15 +564,14 @@ class MemoryKernel:
                 "mindbridge.embedding.dimension": embedding.dimension,
             }
         )
-        embedding_id = EmbeddingId(
-            derive_stable_id(
-                "embedding",
-                memory.tenant_id,
-                memory.memory_id,
-                embedding.model_reference.model_id,
-                embedding.space_reference.space_id,
-                EmbedTask.DOCUMENT.value,
-            )
+        # Identity unchanged: this recipe already hashed `space_id`, so every memory-record
+        # vector already on disk keeps the ID it was written under and needs no re-key.
+        embedding_id = derive_embedding_id(
+            memory.tenant_id,
+            memory.memory_id,
+            model_id=embedding.model_reference.model_id,
+            space_id=embedding.space_reference.space_id,
+            task=EmbedTask.DOCUMENT.value,
         )
         if skip_existing and await self._embedding_index.has_embedding(
             memory.tenant_id, embedding_id

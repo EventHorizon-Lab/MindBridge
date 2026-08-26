@@ -477,11 +477,23 @@ class SQLiteObservationOutbox:
     @staticmethod
     def _backfill_observation_media(connection: sqlite3.Connection) -> None:
         rows = connection.execute(
-            "SELECT request_json, media_files_json FROM edge_observation_outbox"
+            "SELECT outbox_id, request_json, media_files_json FROM edge_observation_outbox"
         ).fetchall()
         for row in rows:
             request = ObserveRequest.model_validate_json(row["request_json"])
             media_files = _MEDIA_FILES.validate_json(row["media_files_json"])
+            # A payload spooled before migration 0021 still carries the retired field names.
+            # `ContractModel` ignores them, which is what lets this parse at all -- and this
+            # method runs over every row from `_initialize`, so without that a device with one
+            # stale queued observation could not construct its outbox. Writing the parsed
+            # request back makes that tolerance a one-time repair rather than something the
+            # reader has to keep doing for the life of the device.
+            current = request.model_dump_json()
+            if current != row["request_json"]:
+                connection.execute(
+                    "UPDATE edge_observation_outbox SET request_json = ? WHERE outbox_id = ?",
+                    (current, row["outbox_id"]),
+                )
             observation_id = derive_observation_id(
                 request.tenant_id,
                 request.device_id,

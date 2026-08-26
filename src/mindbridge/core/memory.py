@@ -303,11 +303,24 @@ class EmbeddingRecord:
     dimension: int
     normalized: bool
     created_at: datetime
+    object_part: int = 0
+    """Which part of `object_id` this vector encodes, when one object is embedded in pieces.
+
+    Zero for an object embedded whole, which is every type but one. An evidence span is cut into
+    encoder-sized clips before it is embedded -- `audio_windows` splits anything longer than
+    `AUDIO_WINDOW_MS`, so a 70-second span becomes three -- and each clip is a different sound
+    with a different vector. Without this the vectors table held one row per span, so the second
+    clip conflicted with the first, was read as content drift, and raised inside the
+    single-transaction commit that writes an observation's derived records: one long audio span
+    cost the whole observation, not just its own vector.
+    """
 
     def __post_init__(self) -> None:
         require_non_empty(self.embedding_id, "embedding_id")
         require_non_empty(self.tenant_id, "tenant_id")
         require_non_empty(self.object_id, "object_id")
+        if self.object_part < 0:
+            raise DomainInvariantError("object_part must not be negative")
         require_non_empty(self.task, "task")
         require_aware_datetime(self.created_at, "created_at")
         if self.dimension <= 0:

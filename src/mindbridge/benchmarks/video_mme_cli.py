@@ -19,19 +19,25 @@ from mindbridge.benchmarks.artifacts import (
 from mindbridge.benchmarks.cli_common import (
     MediaArguments,
     MediaBenchmarkRunManifest,
+    TranscriptSource,
     add_media_arguments,
+    add_transcript_source_argument,
     connected_memory,
     core_parser,
     index_prepared,
+    limit_units,
     media_arguments,
     media_manifest,
     report,
     report_unit,
+    require_declared_transcripts,
+    scoring_snapshot,
     select_by_id,
     write_run_artifacts,
 )
 from mindbridge.benchmarks.prompts import VIDEO_MME_QUERY_PROMPT
 from mindbridge.benchmarks.runtime import PreparedVideo, load_prepared_videos
+from mindbridge.benchmarks.scoring import require_scoring_is_possible
 from mindbridge.benchmarks.video_mme import (
     VIDEO_MME_ADAPTER_VERSION,
     VideoMMEDuration,
@@ -47,7 +53,6 @@ from mindbridge.file_integrity import sha256_file
 from mindbridge.prompts import PERCEIVE_EVENTS_PROMPT
 
 VIDEO_MME_RUNNER_VERSION = "video_mme_production_api_v2"
-VideoMMETranscriptSource = Literal["none", "asr", "official_subtitles"]
 
 
 class VideoMMERunManifest(MediaBenchmarkRunManifest):
@@ -64,7 +69,7 @@ class VideoMMERunManifest(MediaBenchmarkRunManifest):
     media_segment_count: int = Field(ge=0)
     transcript_segment_count: int = Field(ge=0)
     durations: tuple[VideoMMEDuration, ...] = Field(min_length=1)
-    transcript_source: VideoMMETranscriptSource
+    transcript_source: TranscriptSource
     metrics: VideoMMEMetrics
 
 
@@ -73,17 +78,21 @@ class _Arguments(MediaArguments):
     prepared_media_path: Path
     video_ids: tuple[str, ...]
     durations: tuple[VideoMMEDuration, ...]
-    transcript_source: VideoMMETranscriptSource
+    transcript_source: TranscriptSource
 
 
 def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
     """Run selected videos and emit the official nested prediction JSON."""
     arguments = _parse_arguments(argv, prog)
     videos = _select_videos(
-        load_video_mme(arguments.dataset_path), arguments.video_ids, arguments.durations
+        load_video_mme(arguments.dataset_path),
+        arguments.video_ids,
+        arguments.durations,
+        arguments.limit,
     )
     prepared = _select_prepared(load_prepared_videos(arguments.prepared_media_path), videos)
-    _require_declared_transcripts(prepared, arguments.transcript_source)
+    require_declared_transcripts(prepared, arguments.transcript_source)
+    require_scoring_is_possible("video-mme", predict_only=arguments.predict_only)
     require_writable_output_pair(arguments.output_path, overwrite=arguments.overwrite)
     deployment = load_deployment_snapshot(
         arguments.deployment_config_path,
@@ -148,10 +157,20 @@ def _write_artifacts(
         + "\n"
     )
     segments = tuple(segment for video in prepared for segment in video.segments)
+    metrics = evaluate_video_mme(results)
+    scoring = scoring_snapshot(
+        "video-mme",
+        arguments,
+        metrics={
+            "accuracy": metrics.accuracy,
+            "strict_accuracy": metrics.strict_accuracy,
+        },
+    )
     manifest = media_manifest(
         VideoMMERunManifest,
         arguments,
         deployment,
+        scoring=scoring,
         runner_version=VIDEO_MME_RUNNER_VERSION,
         adapter_version=VIDEO_MME_ADAPTER_VERSION,
         annotation_sha256=sha256_file(arguments.dataset_path),
@@ -167,7 +186,7 @@ def _write_artifacts(
         transcript_segment_count=sum(segment.transcript is not None for segment in segments),
         durations=tuple(dict.fromkeys(video.duration for video in videos)),
         transcript_source=arguments.transcript_source,
-        metrics=evaluate_video_mme(results),
+        metrics=metrics,
     )
     write_run_artifacts(arguments.output_path, predictions, manifest)
 
@@ -176,6 +195,7 @@ def _select_videos(
     videos: tuple[VideoMMEVideo, ...],
     video_ids: tuple[str, ...],
     durations: tuple[VideoMMEDuration, ...],
+    limit: int | None,
 ) -> tuple[VideoMMEVideo, ...]:
     videos = select_by_id(
         videos,
@@ -187,26 +207,7 @@ def _select_videos(
         videos = tuple(video for video in videos if video.duration in set(durations))
     if not videos:
         raise ValueError("no Video-MME videos match the requested IDs and durations")
-    return videos
-
-
-def _require_declared_transcripts(
-    prepared: tuple[PreparedVideo, ...],
-    transcript_source: VideoMMETranscriptSource,
-) -> None:
-    """Refuse a run whose declared subtitle setting disagrees with its prepared media."""
-    present = any(
-        segment.transcript is not None for video in prepared for segment in video.segments
-    )
-    if present and transcript_source == "none":
-        raise ValueError(
-            "prepared media carries transcripts; a run declaring no transcript source would "
-            "report a with-subtitles result in the without-subtitles column"
-        )
-    if not present and transcript_source != "none":
-        raise ValueError(
-            f"prepared media carries no transcript, so it cannot be {transcript_source}"
-        )
+    return limit_units(videos, limit, label="Video-MME videos")
 
 
 def _select_prepared(
@@ -242,12 +243,7 @@ def _parse_arguments(argv: Sequence[str] | None, prog: str | None) -> _Arguments
         choices=("short", "medium", "long"),
         help="official duration band to keep; repeatable, default every band",
     )
-    parser.add_argument(
-        "--transcript-source",
-        required=True,
-        choices=("none", "asr", "official_subtitles"),
-        help="which official transcript this run ingests, if any",
-    )
+    add_transcript_source_argument(parser)
     parsed = parser.parse_args(argv)
     return media_arguments(
         _Arguments,

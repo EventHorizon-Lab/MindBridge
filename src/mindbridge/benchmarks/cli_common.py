@@ -12,12 +12,12 @@ import argparse
 import hashlib
 import os
 import sys
-from collections.abc import AsyncIterator, Callable, Iterable, Sequence
+from collections.abc import AsyncIterator, Callable, Iterable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TypeVar
+from typing import Literal, TypeVar
 
 from pydantic import AwareDatetime, Field
 
@@ -28,10 +28,27 @@ from mindbridge.benchmarks.artifacts import (
     write_text_atomically,
 )
 from mindbridge.benchmarks.cli import parser as build_parser
+from mindbridge.benchmarks.runtime import PreparedVideo
+from mindbridge.benchmarks.scoring import (
+    SCORING,
+    JudgedAnswer,
+    ScoringMode,
+    build_judge,
+    bypass_metrics,
+    configured_judge_model,
+    judge_answers,
+)
 from mindbridge.contracts import ContractModel, Identifier, NonEmptyString, Sha256Hex
 from mindbridge.models import EmbedTask
 from mindbridge.prompts import ANSWER_FROM_EVIDENCE_PROMPT
 from mindbridge.sdk import MindBridge
+
+TranscriptSource = Literal["none", "asr", "official_subtitles"]
+"""Which official transcript a run ingested, if any.
+
+Both Video-MME releases publish separate with- and without-subtitle columns, so which one a
+number belongs in is not recoverable from the number itself.
+"""
 
 _Item = TypeVar("_Item")
 _Prepared = TypeVar("_Prepared")
@@ -54,8 +71,10 @@ class CoreArguments:
     recall_limit: int
     request_concurrency: int
     request_timeout_seconds: float
+    limit: int | None
     overwrite: bool
     quiet: bool
+    predict_only: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,7 +138,19 @@ def core_parser(
         "--request-timeout-seconds", type=float, default=1_800.0, help="deadline for one request"
     )
     parser.add_argument(
+        "--limit",
+        type=int,
+        help="run only the first N of this benchmark's own units, for a smoke run; "
+        "applied after any explicit selection",
+    )
+    parser.add_argument(
         "--overwrite", action="store_true", help="replace existing predictions and manifest"
+    )
+    parser.add_argument(
+        "--predict-only",
+        action="store_true",
+        help="write predictions without scoring them; every metric reports lmms-eval's bypass "
+        "sentinel instead, and no judge is contacted",
     )
     parser.add_argument(
         "-q",
@@ -150,6 +181,40 @@ def add_media_arguments(
         help="deadline for one observation to finish processing",
     )
     return parser
+
+
+def add_transcript_source_argument(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    """Require a run to declare which official transcript, if any, it ingested."""
+    parser.add_argument(
+        "--transcript-source",
+        required=True,
+        choices=("none", "asr", "official_subtitles"),
+        help="which official transcript this run ingests, if any",
+    )
+    return parser
+
+
+def require_declared_transcripts(
+    prepared: tuple[PreparedVideo, ...],
+    transcript_source: TranscriptSource,
+) -> None:
+    """Refuse a run whose declared subtitle setting disagrees with its prepared media.
+
+    Shared rather than copied per benchmark: the failure it prevents is a number filed under
+    the wrong leaderboard column, which no later check can detect from the artifact alone.
+    """
+    present = any(
+        segment.transcript is not None for video in prepared for segment in video.segments
+    )
+    if present and transcript_source == "none":
+        raise ValueError(
+            "prepared media carries transcripts; a run declaring no transcript source would "
+            "report a with-subtitles result in the without-subtitles column"
+        )
+    if not present and transcript_source != "none":
+        raise ValueError(
+            f"prepared media carries no transcript, so it cannot be {transcript_source}"
+        )
 
 
 def report(message: str, *, quiet: bool) -> None:
@@ -203,9 +268,33 @@ def _core_values(parsed: argparse.Namespace) -> dict[str, object]:
         "recall_limit": parsed.recall_limit,
         "request_concurrency": parsed.request_concurrency,
         "request_timeout_seconds": parsed.request_timeout_seconds,
+        "limit": parsed.limit,
         "overwrite": parsed.overwrite,
         "quiet": parsed.quiet,
+        "predict_only": parsed.predict_only,
     }
+
+
+class ScoringSnapshot(ContractModel):
+    """Who scored this run and what they found -- lmms-eval's `metric_list`, recorded per run.
+
+    Every run carries one, including a run nobody scored: `mode` says which of the four ways
+    produced the numbers, so a reader never has to infer it from whether a field is present.
+    `higher_is_better` travels with them for the same reason lmms-eval's `metric_list` declares
+    it -- a bare number does not say which direction is good.
+    """
+
+    mode: ScoringMode
+    metrics: dict[str, float] = Field(default_factory=dict)
+    higher_is_better: dict[str, bool] = Field(default_factory=dict)
+    judge_model: NonEmptyString | None = None
+    judge_failure_count: int = Field(default=0, ge=0)
+    """Answers the judge could not score, floored to 0.0 and counted rather than only logged.
+
+    Upstream logs each one and keeps no tally, so a run whose judge was unreachable is afterwards
+    indistinguishable from a run that answered badly. This is the count that separates them; the
+    0.0 floor itself is unchanged.
+    """
 
 
 class BenchmarkRunManifest(ContractModel):
@@ -217,6 +306,7 @@ class BenchmarkRunManifest(ContractModel):
     """
 
     benchmark: NonEmptyString
+    scoring: ScoringSnapshot
     runner_version: NonEmptyString
     adapter_version: NonEmptyString
     deployment: DeploymentSnapshot
@@ -239,6 +329,50 @@ class MediaBenchmarkRunManifest(BenchmarkRunManifest):
     device_id: Identifier
     poll_interval_seconds: float = Field(gt=0)
     processing_timeout_seconds: float = Field(gt=0)
+
+
+def scoring_snapshot(
+    benchmark: str,
+    arguments: CoreArguments,
+    *,
+    answers: Sequence[JudgedAnswer] = (),
+    metrics: Mapping[str, float] | None = None,
+) -> ScoringSnapshot:
+    """Score this run the way its benchmark declares, and record who did it.
+
+    One entry point for all four modes, so a runner names its benchmark and hands over either the
+    numbers it computed itself or the answers a judge has to read, and never decides the policy.
+    `--predict-only` short-circuits every mode, which is what `override_metric("bypass")` does
+    upstream: no judge is contacted and no declared metric is computed.
+    """
+    declared = SCORING[benchmark]
+    if arguments.predict_only:
+        return ScoringSnapshot(mode="bypass", metrics=bypass_metrics())
+    if declared.mode != "judge":
+        return ScoringSnapshot(
+            mode=declared.mode,
+            metrics=dict(metrics or {}),
+            higher_is_better=declared.higher_is_better(),
+        )
+    report(f"judging {len(answers)} answers with {configured_judge_model()}", quiet=arguments.quiet)
+    outcome = judge_answers(
+        answers,
+        judge=build_judge(request_timeout_seconds=arguments.request_timeout_seconds),
+        concurrency=arguments.request_concurrency,
+    )
+    if outcome.failure_count:
+        report(
+            f"{outcome.failure_count} of {len(answers)} answers scored 0.0 because the judge "
+            "could not be read; that is a floor, not a measurement",
+            quiet=arguments.quiet,
+        )
+    return ScoringSnapshot(
+        mode="judge",
+        metrics={**outcome.metrics, **dict(metrics or {})},
+        higher_is_better=declared.higher_is_better(),
+        judge_model=configured_judge_model(),
+        judge_failure_count=outcome.failure_count,
+    )
 
 
 def predictions_jsonl(results: Sequence[ContractModel]) -> str:
@@ -356,25 +490,51 @@ def select_by_id(
     *,
     key: Callable[[_Item], _Key],
     label: str,
+    limit: int | None = None,
 ) -> tuple[_Item, ...]:
     """Narrow an official release to the requested units, in the order the release lists them.
 
     `label` names the unit the way the benchmark's own operator does — "EgoMemReason example IDs",
     "MM-Lifelong question indices" — because that text is what someone reads when a run refuses to
     start. Empty `requested` means the whole release, which is how every runner spells "no subset".
+
+    `limit` truncates whatever the selection produced, so `--limit` composes with a benchmark's own
+    ID flags rather than competing with them. It is deliberately a count of this benchmark's own
+    units and not of questions: what a run of one of these costs is dominated by ingesting the
+    unit, so limiting questions inside a unit that was ingested anyway saves almost nothing.
     """
     wanted = tuple(requested)
-    if not wanted:
+    selected = items
+    if wanted:
+        if len(set(wanted)) != len(wanted):
+            raise ValueError(f"{label} must not contain duplicates")
+        unique = set(wanted)
+        selected = tuple(item for item in items if key(item) in unique)
+        missing = unique - {key(item) for item in selected}
+        if missing:
+            formatted = ", ".join(str(item) for item in sorted(missing))
+            raise ValueError(f"unknown {label}: {formatted}")
+    return limit_units(selected, limit, label=label)
+
+
+def limit_units(
+    items: tuple[_Item, ...],
+    limit: int | None,
+    *,
+    label: str,
+) -> tuple[_Item, ...]:
+    """Keep the first `limit` units of a selection, refusing a limit that would select nothing.
+
+    Separate from `select_by_id` because two benchmarks filter again after selecting by ID —
+    Video-MME by duration band, Video-MME-v2 by group type — and a limit applied before that
+    filter is a limit on the wrong set: `--limit 2 --duration long` would truncate to the first
+    two videos of any band and then quite possibly keep none of them.
+    """
+    if limit is None:
         return items
-    if len(set(wanted)) != len(wanted):
-        raise ValueError(f"{label} must not contain duplicates")
-    unique = set(wanted)
-    selected = tuple(item for item in items if key(item) in unique)
-    missing = unique - {key(item) for item in selected}
-    if missing:
-        formatted = ", ".join(str(item) for item in sorted(missing))
-        raise ValueError(f"unknown {label}: {formatted}")
-    return selected
+    if limit < 1:
+        raise ValueError(f"--limit must be a positive count of {label}")
+    return items[:limit]
 
 
 def index_prepared(

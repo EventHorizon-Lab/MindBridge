@@ -6,6 +6,7 @@ from pgvector import Vector
 
 from mindbridge.application.ports import EmbeddingMatch, EmbeddingSearch
 from mindbridge.core import (
+    EMBEDDING_ID_RECIPE_VERSION,
     DomainInvariantError,
     EmbeddedObjectType,
     EmbeddingId,
@@ -72,11 +73,11 @@ async def write_embedding_on_connection(
     cursor = await connection.execute(
         """
         INSERT INTO embeddings (
-            tenant_id, embedding_id, object_type, object_id,
+            tenant_id, embedding_id, object_type, object_id, object_part,
             model_id, space_id, task,
-            dimension, normalized, embedding, created_at
+            dimension, normalized, embedding, created_at, embedding_id_recipe
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT DO NOTHING
         RETURNING embedding_id
         """,
@@ -85,6 +86,7 @@ async def write_embedding_on_connection(
             embedding.embedding_id,
             embedding.object_type.value,
             embedding.object_id,
+            embedding.object_part,
             embedding.model_reference.model_id,
             embedding.space_reference.space_id,
             embedding.task,
@@ -92,6 +94,7 @@ async def write_embedding_on_connection(
             embedding.normalized,
             vector,
             embedding.created_at,
+            EMBEDDING_ID_RECIPE_VERSION,
         ),
     )
     if await cursor.fetchone() is not None:
@@ -100,11 +103,13 @@ async def write_embedding_on_connection(
         """
         SELECT embedding_id,
                normalized,
-               1 - (embedding <=> %s) >= %s
+               1 - (embedding <=> %s) >= %s,
+               embedding_id_recipe
         FROM embeddings
         WHERE tenant_id = %s
           AND object_type = %s
           AND object_id = %s
+          AND object_part = %s
           AND model_id = %s
           AND space_id = %s
           AND task = %s
@@ -115,6 +120,7 @@ async def write_embedding_on_connection(
             embedding.tenant_id,
             embedding.object_type.value,
             embedding.object_id,
+            embedding.object_part,
             embedding.model_reference.model_id,
             embedding.space_reference.space_id,
             embedding.task,
@@ -123,7 +129,7 @@ async def write_embedding_on_connection(
     row = await cursor.fetchone()
     if row is None:
         raise MemoryIntegrityError("embedding conflict could not be resolved")
-    existing_id, normalized, same_values = cast(tuple[str, bool, bool], row)
+    existing_id, normalized, same_values, stored_recipe = cast(tuple[str, bool, bool, int], row)
     # Two independent reasons a differing vector can be legitimate, each known at a
     # different layer. An entity's embedding_id hashes the casefolded name the vector
     # encodes, so any stored vector for that ID encodes the same text and re-encoding it is
@@ -132,13 +138,70 @@ async def write_embedding_on_connection(
     # comparison's tolerance -- that is a property of the object type, true everywhere.
     # `allow_reencoding` is the same guarantee arrived at per call site, for IDs whose text
     # is pinned upstream. Anything else re-encoding into a different vector is content drift.
-    if (
-        existing_id == embedding.embedding_id
-        and normalized == embedding.normalized
-        and (same_values or allow_reencoding or embedding.object_type is EmbeddedObjectType.ENTITY)
+    if normalized != embedding.normalized or not (
+        same_values or allow_reencoding or embedding.object_type is EmbeddedObjectType.ENTITY
     ):
-        return False
-    raise DomainInvariantError("embedding version already stores different vector content")
+        raise DomainInvariantError("embedding version already stores different vector content")
+    if existing_id != embedding.embedding_id:
+        await _adopt_embedding_id(connection, embedding, existing_id, stored_recipe=stored_recipe)
+    return False
+
+
+async def _adopt_embedding_id(
+    connection: DatabaseConnection,
+    embedding: EmbeddingRecord,
+    existing_id: str,
+    *,
+    stored_recipe: int,
+) -> None:
+    """Re-key a stored vector whose ID an older `derive_embedding_id` recipe produced.
+
+    `embedding_id` is content-addressed, so changing what it hashes makes every ID already
+    written unreachable from the same inputs -- while the object key this row was just matched
+    on, tenant and object and model and space and task, is unchanged. A row carrying an ID an
+    older recipe produced, with equivalent content, is not drift; it is that row still under
+    its old name.
+
+    Re-keying rather than tolerating the mismatch is what makes it stop happening: the ID is
+    what `has_embedding` looks up, so a row left under its old name fails the `skip_existing`
+    check on every future pass and pays for an encode it already has. Healing one row the
+    first time anything touches it is cheaper than rewriting the column for every tenant in a
+    migration, and does not require reproducing a Python digest in SQL.
+
+    `stored_recipe` is what keeps this from becoming a general amnesty, and it is a fact the
+    writer recorded rather than one inferred here. Two things were wrong with inferring it from
+    `created_at < applied_at(0021)`: that timestamp is supplied by the caller -- `kernel.py`
+    passes the memory's own creation time, not the write's -- so a replayed or backfilled record
+    could claim the amnesty and have a real content disagreement silently re-keyed; and a bound
+    naming one migration cannot survive a second recipe change without another number beside it.
+    A row already at the current recipe is refused exactly as it always was.
+    """
+    if stored_recipe >= EMBEDDING_ID_RECIPE_VERSION:
+        raise DomainInvariantError("embedding version already stores different vector content")
+    cursor = await connection.execute(
+        """
+        UPDATE embeddings
+        SET embedding_id = %s, embedding_id_recipe = %s
+        WHERE tenant_id = %s AND embedding_id = %s
+          AND embedding_id_recipe < %s
+          AND NOT EXISTS (
+                  SELECT 1 FROM embeddings AS claimed
+                  WHERE claimed.tenant_id = %s AND claimed.embedding_id = %s
+              )
+        RETURNING embedding_id
+        """,
+        (
+            embedding.embedding_id,
+            EMBEDDING_ID_RECIPE_VERSION,
+            embedding.tenant_id,
+            existing_id,
+            EMBEDDING_ID_RECIPE_VERSION,
+            embedding.tenant_id,
+            embedding.embedding_id,
+        ),
+    )
+    if await cursor.fetchone() is None:
+        raise DomainInvariantError("embedding version already stores different vector content")
 
 
 async def search_embeddings(

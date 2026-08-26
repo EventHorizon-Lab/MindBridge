@@ -1,10 +1,12 @@
 """Checks for the deployable observation Worker boundary."""
 
 import asyncio
+import json
 from collections.abc import Awaitable, Mapping
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import cast
+from time import time
+from typing import Any, cast
 from unittest.mock import AsyncMock, Mock
 
 import pytest
@@ -22,6 +24,7 @@ from mindbridge.application.evidence_clips import (
     MAX_SAMPLING_FLOOR_MS,
     ClipSampling,
 )
+from mindbridge.consolidation_worker import CONSOLIDATION_QUEUE
 from mindbridge.core import (
     DatabaseUnavailableError,
     JobId,
@@ -33,9 +36,13 @@ from mindbridge.core import (
     ObservationProcessingJob,
     TenantId,
 )
+from mindbridge.infrastructure._postgres_jobs import OBSERVATION_JOB_STALE_AFTER_SECONDS
 from mindbridge.infrastructure.task_queue import (
     PROCESS_OBSERVATION_TASK,
     ObservationProcessingTaskMessage,
+    create_task_queue,
+    observation_delivery_window_seconds,
+    observation_queues,
 )
 from mindbridge.models.openai import _GeneratorConfig
 from mindbridge.telemetry import TelemetryProviders
@@ -44,6 +51,8 @@ from mindbridge.worker import (
     create_worker_app,
     processing_budget_seconds,
     require_bounded_in_process_models,
+    require_stale_window_covers_delivery,
+    require_whole_observation_queue_set,
 )
 
 
@@ -327,7 +336,9 @@ def test_worker_task_calls_shared_use_case_with_ids_only(
         ObjectStorageError,
         SoftTimeLimitExceeded,
     )
-    assert task.max_retries == 5
+    # Attempts, not the budget: `_retry_seconds_remaining` is what ends a transient chain, and
+    # this count only stops near-zero jitter draws from spinning inside that deadline.
+    assert task.max_retries == 16
 
 
 def test_worker_retries_an_observation_owned_by_another_delivery(
@@ -347,11 +358,12 @@ def test_worker_retries_an_observation_owned_by_another_delivery(
     with pytest.raises(Retry, match="still running"):
         task.run(_task_message())
 
-    retry.assert_called_once_with(
-        countdown=30,
-        max_retries=40,
-        headers={"mindbridge_running_retries": 1},
-    )
+    called = dict(retry.call_args.kwargs)
+    headers = dict(called.pop("headers"))
+    assert called == {"countdown": 30, "max_retries": 40}
+    assert headers["mindbridge_running_retries"] == 1
+    # Carried on the message, because that is the only bound a deep queue cannot stretch.
+    assert 0 < headers["mindbridge_retry_deadline"] - time() <= 2_400
 
 
 def test_worker_preserves_transient_retry_after_running_waits(
@@ -849,3 +861,248 @@ def test_the_prefork_child_reports_its_timings_before_it_exits(
     worker_module._close_worker_runtime()
 
     assert flushed == [1]
+
+
+def test_a_running_row_is_not_reclaimable_until_its_own_delivery_could_have_ended() -> None:
+    """A healthy slow attempt must not read as abandoned; reclaiming one pays for it twice.
+
+    Nothing refreshes `updated_at` while an attempt runs, so the ledger's stale window is the
+    only thing separating "the worker died" from "the worker is still going". It therefore has
+    to outlast the longest delivery the deployment permits, which is the broker's own
+    re-delivery window, itself derived from the same task budget.
+    """
+    budget = processing_budget_seconds({})
+    queue = create_task_queue("memory://", processing_budget_seconds=budget)
+    redelivery = queue.conf.broker_transport_options["visibility_timeout"]
+
+    assert redelivery > budget > 0
+    assert redelivery < OBSERVATION_JOB_STALE_AFTER_SECONDS
+
+
+def test_worker_stops_retrying_a_claim_it_has_chased_past_the_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bouncing off another delivery's claim has to end on the clock, not on a retry count.
+
+    Each poll re-enters the same shared FIFO, so 40 nominal 30-second waits spanned 43 hours
+    during the 2026-08-24 evaluation. Once the deadline passes the row is reclaimable by any
+    delivery, and this one gives it back instead of holding a message that will not finish.
+    """
+    monkeypatch.setattr(
+        worker_module,
+        "run_observation_processing",
+        lambda *_arguments: JobState.RUNNING,
+    )
+    app = create_worker_app(WorkerSettings.from_environment(_environment()))
+    task = cast(Task, app.tasks[PROCESS_OBSERVATION_TASK])
+    retry = Mock(side_effect=Retry("still running"))
+    monkeypatch.setattr(task, "retry", retry)
+    message = _task_message()
+    task.push_request(
+        id="delivery_01",
+        retries=3,
+        headers={
+            "mindbridge_running_retries": 3,
+            "mindbridge_retry_deadline": time() - 1,
+        },
+        called_directly=False,
+        is_eager=True,
+        args=(message,),
+        kwargs={},
+    )
+    try:
+        assert task.run(message) == "running"
+    finally:
+        task.pop_request()
+
+    retry.assert_not_called()
+    # And the next transient failure is not retried either: the same deadline governs both.
+    assert task.override_max_retries == 3
+
+
+def test_worker_keeps_retrying_a_transient_failure_while_the_deadline_holds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dependency outage outlives five attempts; the budget it has to fit in is wall clock.
+
+    Full jitter draws each backoff below the doubling ceiling, so the five attempts this task
+    used to allow spanned at most 31 seconds -- an outage of any real length failed the row in
+    its first minute.
+    """
+
+    def run(*_arguments: object) -> JobState:
+        raise DatabaseUnavailableError("database unavailable")
+
+    monkeypatch.setattr(worker_module, "run_observation_processing", run)
+    app = create_worker_app(WorkerSettings.from_environment(_environment()))
+    task = cast(Task, app.tasks[PROCESS_OBSERVATION_TASK])
+    message = _task_message()
+    task.push_request(
+        id="delivery_01",
+        retries=6,
+        headers={"mindbridge_retry_deadline": time() + 60},
+        called_directly=False,
+        is_eager=True,
+        args=(message,),
+        kwargs={},
+    )
+    try:
+        with pytest.raises(Retry):
+            task.run(message)
+    finally:
+        task.pop_request()
+
+
+def test_worker_gives_a_transient_failure_back_to_the_ledger_after_the_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Past the deadline the original error is raised, which is what marks the row `failed`.
+
+    A failed row is claimable and `mindbridge jobs --republish --include-failed` reaches it; a
+    message still bouncing is reachable by nothing.
+    """
+
+    def run(*_arguments: object) -> JobState:
+        raise DatabaseUnavailableError("database unavailable")
+
+    monkeypatch.setattr(worker_module, "run_observation_processing", run)
+    app = create_worker_app(WorkerSettings.from_environment(_environment()))
+    task = cast(Task, app.tasks[PROCESS_OBSERVATION_TASK])
+    message = _task_message()
+    task.push_request(
+        id="delivery_01",
+        retries=1,
+        headers={"mindbridge_retry_deadline": time() - 1},
+        called_directly=False,
+        is_eager=True,
+        args=(message,),
+        kwargs={},
+    )
+    try:
+        with pytest.raises(DatabaseUnavailableError):
+            task.run(message)
+    finally:
+        task.pop_request()
+
+
+def test_worker_will_not_take_a_retry_deadline_a_message_asked_for(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Headers are caller-supplied, so a deadline beyond one budget is treated as absent."""
+    monkeypatch.setattr(
+        worker_module,
+        "run_observation_processing",
+        lambda *_arguments: JobState.SUCCEEDED,
+    )
+    app = create_worker_app(WorkerSettings.from_environment(_environment()))
+    task = cast(Task, app.tasks[PROCESS_OBSERVATION_TASK])
+    message = _task_message()
+    task.push_request(
+        id="delivery_01",
+        retries=0,
+        headers={"mindbridge_retry_deadline": time() + 86_400},
+        called_directly=False,
+        is_eager=True,
+        args=(message,),
+        kwargs={},
+    )
+    try:
+        assert worker_module._retry_seconds_remaining(cast(Any, task)) <= (
+            OBSERVATION_JOB_STALE_AFTER_SECONDS
+        )
+    finally:
+        task.pop_request()
+
+
+def test_a_worker_narrowed_to_the_pre_shard_queue_alone_refuses_to_start() -> None:
+    """`-Q mindbridge` leaves every shard unread, and the symptom is silence, not an error.
+
+    The publish succeeds, the ledger says `pending`, and nothing consumes it -- so boot is the
+    only place this can be said out loud. `-Q` is readable here because
+    `WorkController.setup_instance` calls `setup_queues` before it sends `worker_init`.
+    """
+    app = create_worker_app(WorkerSettings.from_environment(_environment()))
+    app.amqp.queues.select(["mindbridge"])
+
+    with pytest.raises(SystemExit, match="would have no consumer"):
+        worker_init.send(sender=_StartingWorker(1))
+
+
+def test_a_worker_that_reads_every_observation_queue_starts() -> None:
+    """The default: no -Q at all, so the app's own queue set is the consume set."""
+    app = create_worker_app(WorkerSettings.from_environment(_environment()))
+
+    assert set(observation_queues()) <= set(app.amqp.queues.consume_from), (
+        "a bare worker does not already cover the shards, so the guard below proves nothing"
+    )
+    worker_init.send(sender=_StartingWorker(1))
+
+
+def test_a_worker_that_reads_none_of_them_is_a_different_role_and_starts() -> None:
+    """The consolidation sweep runs on its own queue; partial coverage is the only mistake."""
+    app = create_worker_app(WorkerSettings.from_environment(_environment()))
+    app.amqp.queues.select([CONSOLIDATION_QUEUE])
+
+    assert not set(observation_queues()) & set(app.amqp.queues.consume_from)
+    worker_init.send(sender=_StartingWorker(1))
+
+
+def test_a_generator_timeout_that_outlives_the_stale_window_refuses_to_start() -> None:
+    """A configurable timeout can push one delivery past a constant the SQL cannot follow.
+
+    At `request_timeout_seconds=2100` a delivery may stay alive for 2 580 s -- 2 100 plus the
+    300 s post-model budget, the 60 s hard-limit margin and the 120 s the broker waits -- while
+    the ledger calls the row reclaimable at 2 400. A concurrent delivery or one
+    `mindbridge jobs --republish` then buys the same observation twice, which is the defect the
+    window was widened to close.
+    """
+    with pytest.raises(ValueError, match="stale-claim window") as raised:
+        require_stale_window_covers_delivery(_settings_with_generator_timeout(2_100))
+
+    # The remedy has to name a value that passes, not just report the overrun.
+    assert "1920 s" in str(raised.value)
+    require_stale_window_covers_delivery(_settings_with_generator_timeout(1_920))
+
+
+def test_the_shipped_generator_timeout_leaves_the_stale_window_covering_it() -> None:
+    """Both shipped values have to pass, or the guard is a boot failure rather than a bound."""
+    settings = (
+        WorkerSettings.from_environment(_environment()),
+        # `mindbridge.toml` ships 1800, which is the value a real deployment runs.
+        _settings_with_generator_timeout(1_800),
+    )
+
+    for one in settings:
+        require_stale_window_covers_delivery(one)
+        assert (
+            observation_delivery_window_seconds(processing_budget_seconds(one.generator_config))
+            <= OBSERVATION_JOB_STALE_AFTER_SECONDS
+        )
+
+
+def _settings_with_generator_timeout(seconds: int) -> WorkerSettings:
+    return WorkerSettings.from_environment(
+        {
+            **_environment(),
+            "MINDBRIDGE_GENERATOR_CONFIG_JSON": json.dumps(
+                {
+                    "api_key": "generator-secret",
+                    "endpoint": "https://generator.example.test/v1",
+                    "model_id": "qwen3.8-max",
+                    "request_timeout_seconds": seconds,
+                }
+            ),
+        }
+    )
+
+
+def test_the_guard_names_every_queue_that_would_go_unread() -> None:
+    """An operator needs the list, not the count: the fix is naming them or dropping -Q."""
+    whole = observation_queues()
+
+    require_whole_observation_queue_set(whole)
+    require_whole_observation_queue_set(["mindbridge_consolidation"])
+    with pytest.raises(ValueError, match="would have no consumer") as raised:
+        require_whole_observation_queue_set(whole[:-2])
+
+    assert all(name in str(raised.value) for name in whole[-2:])

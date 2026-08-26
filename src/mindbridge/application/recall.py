@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from dataclasses import dataclass, replace
+from datetime import datetime
 from time import perf_counter
 from typing import Literal
 
@@ -17,7 +19,7 @@ from mindbridge.application.capabilities import (
 )
 from mindbridge.application.derive_observation_graph import representing_memory_id
 from mindbridge.application.enumeration import EnumerateMemories
-from mindbridge.application.evidence import read_resolved_memory_evidence, sign_query_media
+from mindbridge.application.evidence import read_resolved_evidence, sign_query_media
 from mindbridge.application.perception import ResolvedEvidence
 from mindbridge.application.ports import (
     Answerer,
@@ -69,7 +71,11 @@ _UNANSWERED = GeneratedAnswer(answer=None, confidence=0.0)
 
 @dataclass(frozen=True, slots=True)
 class _AnswerWave:
-    """One candidate ranking and the most recent answer produced from it."""
+    """One candidate ranking and an answer produced from it.
+
+    Every round replaces this with its own, so during reflection it is the most recent round's.
+    `_kept_answer` decides which one the recall finally reports.
+    """
 
     ranked: tuple[MemoryRecord, ...]
     visible: tuple[MemoryRecord, ...]
@@ -80,7 +86,12 @@ class _AnswerWave:
 
     @property
     def temporal_order(self) -> Literal["relevance", "newest", "oldest"]:
-        """Follow the newest answer, because later rounds see more evidence."""
+        """Follow the newest answer, because later rounds see more evidence.
+
+        Read only while reflection is running, where `generated` is always the newest round's.
+        How the question wants its candidates ordered is a property of the question, which every
+        round sees in full, so it is not subject to `_kept_answer`.
+        """
         return self.generated.temporal_order
 
 
@@ -97,6 +108,7 @@ class RecallMemories:
         media_url_signer: MediaUrlSigner,
         embedder: Embedder,
         minimum_embedding_similarity: float,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._store = store
         self._answerer = answerer
@@ -158,6 +170,7 @@ class RecallMemories:
         """Answer, then spend a bounded budget on temporal and retrieval reflection."""
         wave = await self._answer_round(request, wave, query_media, phase="initial")
         record_stage_duration("recall.first_answer", max(0.0, perf_counter() - started_at))
+        kept = wave
         reordered = order_memory_candidates(wave.visible, wave.temporal_order)
         if _memory_ids(reordered) != _memory_ids(wave.visible):
             wave = await self._answer_round(
@@ -166,6 +179,7 @@ class RecallMemories:
                 query_media,
                 phase="temporal_reorder",
             )
+            kept = _kept_answer(kept, wave)
         seen_queries = {request.query.text.casefold()} if request.query.text is not None else set()
         for _ in range(_MAXIMUM_RETRIEVAL_REFINEMENTS):
             followup_queries = tuple(
@@ -190,7 +204,8 @@ class RecallMemories:
                 query_media,
                 phase="reflection",
             )
-        return wave
+            kept = _kept_answer(kept, wave)
+        return _reported_wave(wave, kept)
 
     async def _answer_round(
         self,
@@ -208,6 +223,7 @@ class RecallMemories:
             attempted_retrieval_queries=wave.attempted_queries,
             phase=phase,
             round_number=wave.round_count + 1,
+            already_resolved=wave.evidence,
         )
         return replace(
             wave,
@@ -225,8 +241,16 @@ class RecallMemories:
         *,
         limit: int,
     ) -> _AnswerWave:
-        """Fuse extra retrieval waves into the current ranking without losing relevance order."""
-        followup_rankings = await asyncio.gather(
+        """Fuse extra retrieval waves into the current ranking without losing relevance order.
+
+        A follow-up wave is one more opinion about an already-answerable ranking, so one that
+        fails is one opinion missing, not a failed recall: the answer of the round that asked
+        for it is already in hand, and dropping it costs the whole recall including that
+        answer. Only a wave that raised is dropped, and how many did is on the span. A
+        `BaseException` that is not an `Exception` is a cancellation of this recall rather than
+        a failure of one wave, so it still propagates.
+        """
+        waves = await asyncio.gather(
             *(
                 self._retrieve_candidates(
                     request.model_copy(
@@ -241,8 +265,19 @@ class RecallMemories:
                     limit=limit,
                 )
                 for query in followup_queries
-            )
+            ),
+            return_exceptions=True,
         )
+        for outcome in waves:
+            if isinstance(outcome, BaseException) and not isinstance(outcome, Exception):
+                raise outcome
+        followup_rankings = tuple(
+            outcome for outcome in waves if not isinstance(outcome, BaseException)
+        )
+        if len(followup_rankings) != len(waves):
+            set_current_span_attributes(
+                {"mindbridge.recall.followup_failure_count": (len(waves) - len(followup_rankings))}
+            )
         refined = fuse_memory_rankings((*followup_rankings, wave.ranked), limit=limit)
         visible = order_memory_candidates(
             await self._refresh_visible_candidates(request, refined),
@@ -272,6 +307,7 @@ class RecallMemories:
             response_evidence = await self._read_evidence(
                 request,
                 answer_memories if request.mode is not RecallMode.SEARCH else visible_memories,
+                already_resolved=answer_evidence,
             )
         set_current_span_attributes(
             {
@@ -317,6 +353,7 @@ class RecallMemories:
         attempted_retrieval_queries: tuple[str, ...] = (),
         phase: Literal["initial", "temporal_reorder", "reflection"],
         round_number: int,
+        already_resolved: tuple[ResolvedEvidence, ...] = (),
     ) -> tuple[GeneratedAnswer, tuple[ResolvedEvidence, ...]]:
         set_current_span_attributes(
             {
@@ -325,7 +362,11 @@ class RecallMemories:
             }
         )
         grounded = self._grounded_memories(candidates)
-        evidence = await self._read_evidence(request, grounded) if grounded else ()
+        evidence = (
+            await self._read_evidence(request, grounded, already_resolved=already_resolved)
+            if grounded
+            else ()
+        )
         answer_query_media = await sign_query_media(
             tuple(item.media_object for item in query_media),
             self._media_url_signer,
@@ -559,17 +600,88 @@ class RecallMemories:
         self,
         request: RecallRequest,
         memories: tuple[MemoryRecord, ...],
+        *,
+        already_resolved: tuple[ResolvedEvidence, ...] = (),
     ) -> tuple[ResolvedEvidence, ...]:
-        return await read_resolved_memory_evidence(
+        """Resolve the spans these memories cite, reusing a read this recall already paid for.
+
+        Reordering candidates does not change which spans they cite, so the temporal round and
+        the response both ask for a set an earlier round already read: one recall used to pay
+        for the same three pooled queries and the same presign per object up to five times.
+        Spans and media objects are immutable rows, so the only part of a re-read that can
+        differ is the signature on each URL, and a signature outlives a recall by an order of
+        magnitude -- 35 minutes against a measured 57-184 s. Order is restored from the
+        memories asking, so a reused read is the tuple a re-read would have returned.
+        """
+        evidence_ids = tuple(
+            dict.fromkeys(evidence_id for memory in memories for evidence_id in memory.evidence_ids)
+        )
+        resolved_by_id = {item.evidence_span.evidence_id: item for item in already_resolved}
+        if len(resolved_by_id) == len(evidence_ids) and all(
+            evidence_id in resolved_by_id for evidence_id in evidence_ids
+        ):
+            set_current_span_attributes({"mindbridge.recall.evidence_reused": True})
+            return tuple(resolved_by_id[evidence_id] for evidence_id in evidence_ids)
+        return await read_resolved_evidence(
             self._store,
             self._media_url_signer,
             TenantId(request.tenant_id),
-            memories,
+            evidence_ids,
         )
 
 
 def _memory_ids(memories: tuple[MemoryRecord, ...]) -> tuple[MemoryId, ...]:
     return tuple(memory.memory_id for memory in memories)
+
+
+def _kept_answer(previous: _AnswerWave, current: _AnswerWave) -> _AnswerWave:
+    """Decide which round's answer a recall reports once reflection has run.
+
+    Rounds are independent verdicts, not revisions. No round is shown an earlier round's
+    answer, and reflection re-ranks rather than extends: `_merge_followup_candidates` fuses
+    the follow-up waves with the current ranking under the same candidate limit, so a
+    follow-up can push the memory that supported an answer out of the set the next round is
+    given. Overwriting the answer with that round's abstention made reflecting strictly worse
+    than not reflecting -- the recall returned "no supported answer" about candidates it no
+    longer held, having already produced a supported one about the ones it did.
+
+    So an answering round wins outright, newest first, for the reason `_AnswerWave`'s
+    `temporal_order` follows the newest round: it read the most. An abstaining round wins only
+    over another abstention, or when it still held every memory the answering round did --
+    that is the case where abstaining is a judgement about the same evidence rather than about
+    its absence, and there it is the later and better-informed judgement.
+
+    Deliberately not a comparison of `confidence` between rounds: an abstention is already
+    pinned to 0.0 by the answer pipeline, so ranking rounds by confidence would be the same
+    rule dressed as a threshold, and any threshold between two answered rounds would be a
+    number with nothing behind it.
+    """
+    if current.generated.answer is not None or previous.generated.answer is None:
+        return current
+    return (
+        current
+        if set(_memory_ids(previous.visible)) <= set(_memory_ids(current.visible))
+        else previous
+    )
+
+
+def _reported_wave(wave: _AnswerWave, kept: _AnswerWave) -> _AnswerWave:
+    """Report the kept round's answer beside the candidates and evidence it answered from.
+
+    Retrieval keeps advancing from the newest round -- `ranked`, `attempted_queries` and
+    `round_count` describe the work the recall actually did and stay as they are. What moves
+    with the answer is the trio that has to agree with it, so a caller is never handed an
+    answer grounded in memories the response does not contain, and `_build_result` re-checks
+    visibility against the set that answer was made from.
+    """
+    if kept is wave:
+        return wave
+    return replace(
+        wave,
+        generated=kept.generated,
+        evidence=kept.evidence,
+        visible=kept.visible,
+    )
 
 
 def _without_shared_vector_credit(

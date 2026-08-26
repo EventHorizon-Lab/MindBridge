@@ -25,6 +25,7 @@ from mindbridge.benchmarks.cli_common import (
     media_manifest,
     predictions_jsonl,
     report,
+    scoring_snapshot,
     select_by_id,
     write_run_artifacts,
 )
@@ -40,6 +41,7 @@ from mindbridge.benchmarks.mm_lifelong_runner import (
     load_prepared_mm_lifelong,
     run_mm_lifelong,
 )
+from mindbridge.benchmarks.scoring import JudgedAnswer, require_scoring_is_possible
 from mindbridge.contracts import NonEmptyString, Sha256Hex
 from mindbridge.file_integrity import sha256_file
 from mindbridge.prompts import PERCEIVE_EVENTS_PROMPT
@@ -77,8 +79,11 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
         arguments.question_indices,
         key=lambda question: question.index,
         label="MM-Lifelong question indices",
+        limit=arguments.limit,
     )
     prepared = load_prepared_mm_lifelong(arguments.prepared_media_path)
+    prepared = _timeline_for_run(prepared, questions, limit=arguments.limit)
+    require_scoring_is_possible("mm-lifelong", predict_only=arguments.predict_only)
     require_writable_output_pair(arguments.output_path, overwrite=arguments.overwrite)
     deployment = load_deployment_snapshot(
         arguments.deployment_config_path,
@@ -122,10 +127,24 @@ def _write_artifacts(
     if tuple(result.index for result in results) != tuple(question.index for question in questions):
         raise ValueError("MM-Lifelong predictions must match annotation question order")
     predictions = predictions_jsonl(results)
+    scoring = scoring_snapshot(
+        "mm-lifelong",
+        arguments,
+        answers=tuple(JudgedAnswer(row.question, row.answer, row.pred.answer) for row in results),
+        # The interval half is numeric and the runner already computes it, but it is not the
+        # released Ref@N -- `unofficial_reference_at_n` says why -- so it travels under the name
+        # that says so rather than as the benchmark's own metric.
+        metrics={
+            "unofficial_reference_at_300": (
+                sum(row.mindbridge_unofficial_ref_at_300 for row in results) / len(results)
+            )
+        },
+    )
     manifest = media_manifest(
         MMLifelongRunManifest,
         arguments,
         deployment,
+        scoring=scoring,
         runner_version=MM_LIFELONG_RUNNER_VERSION,
         adapter_version=MM_LIFELONG_ADAPTER_VERSION,
         annotation_sha256=sha256_file(arguments.dataset_path),
@@ -143,6 +162,53 @@ def _write_artifacts(
         ),
     )
     write_run_artifacts(arguments.output_path, predictions, manifest)
+
+
+def _timeline_for_run(
+    prepared: MMLifelongPreparedTimeline,
+    questions: Sequence[MMLifelongQuestion],
+    *,
+    limit: int | None,
+) -> MMLifelongPreparedTimeline:
+    """Narrow the timeline to the segments the selected questions localize into.
+
+    `--limit` is documented as what makes a smoke run cheap, and for this benchmark it was not:
+    the runner ingests one complete official timeline whatever the limit, so answering one
+    question still ingested every segment of a Month split first.
+
+    Safe to subset because a segment is globally aligned: each carries its own absolute
+    `start_seconds`, so dropping the ones between two kept segments moves nothing. That is what
+    makes this different from truncating a stream -- the localization metric is in absolute
+    seconds, and a relative clock would have silently shifted under it. The timeline's own
+    validator still runs on the result, and `_timeline_end_seconds` reads the last kept segment,
+    which by construction still covers the latest interval any selected question references.
+
+    Only under `--limit`; a full run ingests the whole split, and a limited run's manifest
+    records the smaller `segment_count` that says its numbers came from a scoped timeline. The
+    condition lives here rather than at the call site so that both halves of the rule are one
+    testable thing.
+    """
+    if limit is None:
+        return prepared
+    wanted = tuple(interval for question in questions for interval in question.reference_intervals)
+    kept = tuple(
+        segment
+        for segment in prepared.segments
+        if any(
+            start < segment.start_seconds + segment.duration_ms / 1_000
+            and end > segment.start_seconds
+            for start, end in wanted
+        )
+    )
+    if not kept:
+        raise ValueError(
+            "no prepared MM-Lifelong segment covers the selected questions' reference intervals"
+        )
+    return MMLifelongPreparedTimeline(
+        split=prepared.split,
+        timeline_origin=prepared.timeline_origin,
+        segments=kept,
+    )
 
 
 def _parse_arguments(argv: Sequence[str] | None, prog: str | None) -> _Arguments:

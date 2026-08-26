@@ -21,6 +21,7 @@ from mindbridge.benchmarks.egolife_runner import (
 from mindbridge.benchmarks.egomem_reason import EgoMemReasonQuestion
 from mindbridge.benchmarks.runtime import OPTION_LABELS
 from mindbridge.contracts import (
+    IdentityObservationInput,
     MediaObjectInput,
     ObservationProcessingJobView,
     ObservationReceipt,
@@ -30,7 +31,7 @@ from mindbridge.contracts import (
     RecallResult,
     RememberRequest,
 )
-from mindbridge.core import JobState, MediaKind
+from mindbridge.core import IdentityKind, JobState, MediaKind
 from mindbridge.sdk import MindBridgeError
 
 ORIGIN = datetime(2026, 1, 1, tzinfo=timezone.utc)
@@ -192,6 +193,67 @@ async def test_egolife_binds_released_caption_to_source_video() -> None:
     )
 
     assert api.remember_requests[0].evidence_ids == ("evidence_0",)
+
+
+async def test_egolife_carries_voice_identities_into_the_observation() -> None:
+    """Perception names a person only when the name is seen or heard, so on a conversational
+    corpus the transcript is the only channel a name can arrive on. Nine benchmarks measured
+    zero named housemates across 566 entities while this field went unpopulated."""
+    api = RecordingMemoryApi()
+    voice = IdentityObservationInput(
+        identity_id="voice_speaker_a",
+        kind=IdentityKind.VOICE,
+        start_ms=1_000,
+        end_ms=4_000,
+        confidence=0.9,
+        model_id="iic_speech_seaco_paraformer",
+        transcript="Jake, pass me the salt.",
+    )
+    prepared = EgoLifePreparedStream(
+        subject_id="A1_JAKE",
+        timeline_origin=ORIGIN,
+        clips=(
+            EgoLifePreparedClip(
+                day=1,
+                start_timecode="10000000",
+                media_object=_clip("10000000", "media_0", duration_ms=30_000).media_object,
+                duration_ms=30_000,
+                identity_observations=(voice,),
+            ),
+        ),
+    )
+
+    await run_egolife_qa(
+        cast(MindBridge, api),
+        (_question("q_1", "10004500"),),
+        prepared,
+        run_id="run_01",
+        poll_interval_seconds=0.001,
+    )
+
+    observed = api.observe_requests[0].identity_observations
+    assert [item.transcript for item in observed] == ["Jake, pass me the salt."]
+
+
+def test_prepared_egolife_rejects_a_voice_span_past_its_clip() -> None:
+    with pytest.raises(ValidationError):
+        EgoLifePreparedClip(
+            day=1,
+            start_timecode="10000000",
+            media_object=_clip("10000000", "media_0", duration_ms=30_000).media_object,
+            duration_ms=30_000,
+            identity_observations=(
+                IdentityObservationInput(
+                    identity_id="voice_speaker_a",
+                    kind=IdentityKind.VOICE,
+                    start_ms=1_000,
+                    end_ms=31_000,
+                    confidence=0.9,
+                    model_id="iic_speech_seaco_paraformer",
+                    transcript="past the end",
+                ),
+            ),
+        )
 
 
 async def test_egolife_keeps_released_visual_and_audio_memories_separate() -> None:
@@ -530,3 +592,76 @@ def _typed_result(question_id: str, question_type: str, *, correct: bool) -> Ego
         mindbridge_evidence_ids=(),
         mindbridge_trace_id=f"trace_{question_id}",
     )
+
+
+class RecallFailingMemoryApi(RecordingMemoryApi):
+    """Fail one question's recall, the way the shared endpoint's gateway timeout does."""
+
+    def __init__(self, failing_question: str) -> None:
+        super().__init__()
+        self.failing_question = failing_question
+
+    async def recall(self, request: RecallRequest) -> RecallResult:
+        assert request.query.text is not None
+        if self.failing_question in request.query.text:
+            raise MindBridgeError(
+                "recall could not be served",
+                code="internal_error",
+                status_code=500,
+                trace_id="trace_recall_error",
+            )
+        return await super().recall(request)
+
+
+async def test_egolife_cohort_survives_one_question_whose_recall_raises() -> None:
+    """One raising recall used to abort every question sharing its cutoff."""
+    api = RecallFailingMemoryApi("the mug")
+    questions = (
+        _question("q_mug", "10010000").model_copy(update={"question": "Who used the mug?"}),
+        _question("q_bowl", "10010000").model_copy(update={"question": "Who used the bowl?"}),
+    )
+
+    results = await run_egolife_qa(
+        cast(MindBridge, api),
+        questions,
+        _prepared_stream(),
+        run_id="run_01",
+        poll_interval_seconds=0.001,
+    )
+
+    assert [result.id for result in results] == ["q_mug", "q_bowl"]
+    assert [result.mindbridge_error_code for result in results] == ["internal_error", None]
+    assert results[0].model_option is None
+    assert results[0].model_answer == ""
+    assert results[1].model_option == "B"
+
+
+async def test_egomem_reason_cohort_survives_one_question_whose_recall_raises() -> None:
+    """EgoMemReason answers its own cohort, so it needs its own settling."""
+    api = RecallFailingMemoryApi("the mug")
+    questions = tuple(
+        EgoMemReasonQuestion(
+            example_id=index + 1,
+            question_id=f"A1_JAKE_{index + 1}",
+            identity="A1_JAKE",
+            query_time="DAY1, 10:01:00",
+            query_offset_ms=36_060_000,
+            question=text,
+            choices=("Choice 0", "Choice 1", "Choice 2", "Choice 3"),
+            query_type="Event Ordering",
+        )
+        for index, text in enumerate(("Who used the mug?", "Who used the bowl?"))
+    )
+
+    results = await run_egomem_reason(
+        cast(MindBridge, api),
+        questions,
+        _prepared_stream(),
+        run_id="run_01",
+        poll_interval_seconds=0.001,
+    )
+
+    assert [result.example_id for result in results] == [1, 2]
+    assert [result.mindbridge_error_code for result in results] == ["internal_error", None]
+    assert results[0].predicted_answer == EGOMEM_REASON_ABSTENTION
+    assert results[1].predicted_answer == "B"

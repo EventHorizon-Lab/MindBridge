@@ -7,8 +7,8 @@ the decision log and the constraints each decision accepts, is
 
 ## Code layout
 
-MindBridge is a modular monolith with one asynchronous worker. Dependencies point inward, and
-the import direction is enforced rather than merely documented.
+MindBridge is a modular monolith with separate asynchronous worker roles. Dependencies point
+inward, and the import direction is enforced rather than merely documented.
 
 ```text
 src/mindbridge/
@@ -24,10 +24,10 @@ src/mindbridge/
 
 Two rules are load-bearing:
 
-**One kernel, three protocol faces.** `application.kernel.MemoryKernel` holds every use case.
-REST, MCP, and the Python SDK are translation layers over it, sharing schemas generated from the
-same Pydantic contracts. A behaviour cannot be available over one protocol and missing from
-another by accident.
+**One kernel, two protocol adapters.** `application.kernel.MemoryKernel` holds the public use
+cases. REST and MCP translate the same Pydantic contracts into it; the Python SDK calls REST.
+REST-only transport features such as SSE job progress remain explicit instead of being simulated
+over MCP.
 
 **`benchmarks/` is a leaf.** It may call only the public SDK and contracts. This is why
 `mindbridge` and `mindbridge-bench` are separate binaries — a single command tree would have to
@@ -43,7 +43,8 @@ flowchart TB
     api["API<br/><code>uvicorn mindbridge.server:create_app</code>"]
     mcp["MCP stdio<br/><code>mindbridge mcp</code>"]
     worker["Memory worker<br/><code>celery -A mindbridge.celery_app:app</code>"]
-    cons["Consolidation<br/><code>mindbridge consolidate</code>"]
+    beat["Consolidation beat<br/><code>celery -A mindbridge.celery_app:app beat</code>"]
+    cons["Consolidation<br/><code>mindbridge consolidate</code><br/>or a beat-scheduled worker"]
     life["Lifecycle<br/><code>mindbridge lifecycle</code>"]
   end
 
@@ -53,17 +54,17 @@ flowchart TB
     s3[("Object storage")]
   end
 
-  subgraph models["Model endpoints"]
+  subgraph models["External model endpoints"]
     gen["Generator<br/>OpenAI-compatible"]
-    emb["Jina v5 Omni<br/>SentenceTransformers"]
   end
 
-  jina --> emb
-  api --> pg & redis & s3 & gen & emb
-  mcp --> pg & s3 & gen & emb
+  api --> pg & redis & s3 & gen & jina
+  mcp --> pg & redis & s3 & gen & jina
   redis --> worker
-  worker --> pg & s3 & gen & emb
-  cons --> pg & s3 & gen & emb
+  beat --> redis
+  redis --> cons
+  worker --> pg & s3 & gen & jina
+  cons --> pg & s3 & gen & jina
   life --> pg & s3
 ```
 
@@ -72,13 +73,15 @@ flowchart TB
 | Jina service | `server` + `cloud-models` | One process per GPU | Yes — Jina v5 Omni |
 | API | `server` | Stateless; scale horizontally | No |
 | MCP stdio | `server` | One per agent session | No |
-| Memory worker | `server` | One process per queue | No |
+| Memory worker | `server` + `media` | One process per queue | No, unless the local Jina plugin is selected. |
+| Consolidation beat | `server` | One per deployment | No |
 | Consolidation | `server` | One scheduled run per tenant | No |
 | Lifecycle | `server` | One scheduled run per tenant | No |
 | Edge sync/identity | `edge` | One per device | Yes — on-device identity models |
 
-The API and worker load no model. One SentenceTransformers process owns the Jina weights and
-serves every modality, keeping the application images small and independently scalable.
+In the recommended served path, the API and workers load no model: one SentenceTransformers
+process owns the Jina weights and serves every modality. Selecting the local Jina plugin is an
+explicit Worker-only opt-in that loads one model copy per process.
 
 ## Write path
 
@@ -97,9 +100,9 @@ sequenceDiagram
   A->>Q: enqueue processing job
   A-->>D: 202 receipt + processing_job_id
   W->>Q: claim job
-  W->>S: read original AV once
+  W->>S: build generation proxy (when enabled)
   W->>W: perception -> Event / Entity / Claim
-  W->>S: cut one derived clip per grounded span
+  W->>S: reread source; cut span-sized derived clips
   W->>W: send clips and text to the shared embedder
   W->>P: graph + memories + vectors (one transaction)
 ```
@@ -110,11 +113,13 @@ yet when that receipt returns. Callers poll `GET /v1/jobs/{job_id}` or follow th
 
 Three properties of the worker stage are worth knowing before you tune it:
 
-- **The original AV is read once.** Perception, clip derivation, and embedding all work from
-  that one pass rather than re-fetching.
-- **One clip per grounded span.** Each vector covers the event's own slice of the recording, not
-  the whole file. Frame rate therefore sets the entire write cost of a video deployment: one cut,
-  one encoder call, one stored object per sampled window.
+- **Source reads are explicit.** With the generation proxy enabled, the worker reads a video once
+  to build the model-sized proxy and again after perception to derive evidence clips. With it
+  disabled or skipped, the model reads the signed source and the worker reads it once for clip
+  derivation.
+- **Clips follow grounded spans.** Image and video spans produce one derived clip; audio longer
+  than the encoder's 30-second window is split so its tail is not lost. Each vector therefore
+  covers a span-sized window instead of the whole source.
 - **Clips are uploaded before the transaction that registers them.** An interrupted attempt can
   leave an object no record references. Clip keys are content-addressed so a retry cannot
   multiply it, and `mindbridge lifecycle --reclaim-orphan-clips` deletes what is already there.
@@ -157,13 +162,17 @@ against the lexical ranking — with a rank constant of 60. Fusion combines *ran
 scores, because a cosine similarity and a `ts_rank` are not on a comparable scale and averaging
 them produces a number that means nothing.
 
-Two details that matter operationally:
+Three details that matter operationally:
 
 - **Filters apply before ranking, not after.** A time or person filter narrows the candidate
   set rather than trimming an already-ranked list, so a filtered query does not silently return
   fewer results than its limit because the filter ate the top of the ranking.
 - **Visibility is re-checked immediately before answering.** A memory deleted or superseded
   during a long reflection round does not reach the answer.
+- **The hierarchy ranking is empty until consolidation runs.** `memories by hierarchy` walks
+  `contains` edges, which only the Summary sweep writes, so a deployment that never consolidates
+  fuses three rankings rather than four and can answer only from individual moments. See
+  [operations](operations.md#built-in-consolidation-schedule).
 
 `occurred_after` is inclusive and `occurred_before` is **exclusive**. The asymmetry is
 deliberate — it makes adjacent windows tile without overlap — but it does surprise people.
@@ -270,9 +279,10 @@ published contract. The full list is in [the REST reference](api/rest.md#error-c
 
 ## Observability
 
-OpenTelemetry activates only when a standard OTLP endpoint is configured; without one it is a
-no-op. The official FastAPI, HTTPX, psycopg, Celery, and Botocore instrumentations propagate W3C
-context across REST, model calls, PostgreSQL, S3, and queued jobs.
+OpenTelemetry activates per signal. The default OTLP exporter is a no-op without an endpoint;
+`console` emits without a collector, and `none` disables the signal. The official FastAPI,
+HTTPX, psycopg, Celery, and Botocore instrumentations propagate W3C context across REST, model
+calls, PostgreSQL, S3, and queued jobs.
 
 MindBridge captures no authorization headers, request bodies, prompts, memory text, or media in
 telemetry. Response `trace_id` values take the form `trace_<32-hex W3C trace ID>`, so the suffix

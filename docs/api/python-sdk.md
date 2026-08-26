@@ -16,6 +16,8 @@ async with MindBridge.connect(
     base_url="https://memory.example.com",
     api_key="at-least-32-characters-long",
     timeout_seconds=120.0,
+    retry_attempts=3,
+    retry_backoff_seconds=0.5,
 ) as memory:
     ...
 ```
@@ -26,6 +28,39 @@ the deployment sits behind a gateway that adds the header.
 
 The default timeout is 120 seconds because a recall in `answer` mode does real model work — a
 30-second default would turn normal latency into a client-side error.
+
+### Retrying
+
+The client retries a request up to `retry_attempts` times when the answer says a dependency was
+briefly unable rather than that the request was refused: a transport failure, or `429`, `502`,
+`503`, `504`. A `503 model_unavailable` from an embedder or generator that is restarting is the
+case this exists for — without it, a read the server would have served a second later reaches the
+caller as a terminal error. Every other status is final on the first attempt, because repeating a
+request the server understood and rejected only spends the rejection twice.
+
+Waits use full jitter over a doubling ceiling (`retry_backoff_seconds`, then twice that, and so
+on). The clients that see one model outage all see it at once, so a fixed delay would return them
+together and re-create the load they were waiting out.
+
+**A write is retried when its request carries `idempotency_key` — supplied or not.** That field's
+contract is what makes the repeat safe: omit it and the server derives one from the content, so an
+identical resend answers `duplicate` with the first outcome instead of writing twice. `observe`
+keys on `(tenant_id, device_id, boot_id, sequence)`; `remember`, `record_feedback`, and `forget`
+key on a digest of the request. The client serialises the body once and re-sends those same bytes,
+so a retry always lands on the same key. A `remember_many` batch is covered the same way, member
+by member.
+
+Supplying a key is still worth doing when the caller wants *its own* notion of the same write —
+two calls that differ in some field you consider incidental collapse onto one memory under a
+shared key, where content-derived keys would keep them apart.
+
+`recall` is retried despite carrying no such field. It is the read the outage broke, and the
+duplicate it risks is one extra recorded access against the memories it returns, which feeds
+strength and decay — bounded, and directionally honest about having been asked. A future write
+endpoint that declares no idempotency is not retried at all, which is the rule rather than an
+exception to it.
+
+Set `retry_attempts=1` to turn retrying off, for a caller that runs its own.
 
 Outside a context manager, close it yourself:
 
@@ -105,8 +140,10 @@ assert len(written) == len(summaries)
 Measured on one RTX 5090 against the same model, encoding 128 real memory summaries: 600 per
 second in batches of 32 against 183 per second one at a time.
 
-Verifying an answer needs no second call to storage: `result.evidence` already carries signed
-`media_url`s pointing at the exact `start_ms`–`end_ms` slice of the original recording.
+Verifying an answer needs no second call to storage: `result.evidence` carries exact
+`start_ms`–`end_ms` pointers into the original recording plus signed `media_url`s covering
+those spans. A URL normally addresses a derived clip whose own timeline starts at zero and may
+extend beyond the cited interval.
 
 ### Grounded follow-up
 

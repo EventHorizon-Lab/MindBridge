@@ -48,8 +48,10 @@ class ClipRequest:
     max_pixels: int = DEFAULT_VIDEO_MAX_PIXELS
     image_max_pixels: int = DEFAULT_IMAGE_MAX_PIXELS
     region: tuple[int, int, int, int] | None = None
-    # Evidence keeps a video's track so Jina can fuse audio and frames. A generation proxy may
-    # disable it when its generator cannot hear and would only pay to encode and transfer it.
+    # Read by both the generation proxy and the stored clip. A generator that ignores the track
+    # pays for it twice, in the encode and in the transfer -- but the stored clip is what the
+    # embedder encodes and the read path attaches, so dropping it there deletes speech from
+    # memory rather than merely from one model call.
     include_audio: bool = True
 
     def __post_init__(self) -> None:
@@ -181,9 +183,22 @@ def _copy_span_audio(
     source: Any,  # noqa: ANN401
     audio: Any,  # noqa: ANN401
     resampler: Any,  # noqa: ANN401
-    timeline_origin_seconds: float = 0.0,
+    offset_seconds: float = 0.0,
 ) -> None:
-    """Pass the span's audio through on the output video's timeline."""
+    """Copy the span's audio so speech lines up with the frames above it.
+
+    `offset_seconds` is what the video track already subtracted from its own timestamps. A
+    generation proxy keeps the source's clock and passes 0; a stored clip restarts at zero and
+    passes its first sampled frame's time, because audio left on the source clock would sit
+    minutes past a clip that claims to be thirty seconds long, and every player and decoder
+    would then read the speech as silence.
+
+    Audio that precedes the rebase point is dropped rather than pulled back to zero. That
+    audio has nowhere to go on the clip's timeline without moving the video with it, and the
+    video's anchor is not free to move: a stored clip whose first frame sits past zero is
+    rejected outright by the mp4 muxer as soon as the sampler has to take consecutive source
+    frames to catch up, which is exactly what a late-starting video track makes it do.
+    """
     start_seconds, end_seconds = request.start_ms / 1_000, request.end_ms / 1_000
     if start_seconds > 0:
         container.seek(int(start_seconds * 1_000_000), backward=True)
@@ -193,18 +208,45 @@ def _copy_span_audio(
         if frame.time > end_seconds:
             break
         for resampled in resampler.resample(frame):
-            _shift_audio_timeline(resampled, timeline_origin_seconds)
-            output.mux(audio.encode(resampled))
+            if _shift_audio_frame(resampled, offset_seconds):
+                output.mux(audio.encode(resampled))
     for resampled in resampler.resample(None):
-        _shift_audio_timeline(resampled, timeline_origin_seconds)
-        output.mux(audio.encode(resampled))
+        if _shift_audio_frame(resampled, offset_seconds):
+            output.mux(audio.encode(resampled))
     output.mux(audio.encode())
 
 
-def _shift_audio_timeline(frame: Any, origin_seconds: float) -> None:  # noqa: ANN401
-    """Rebase an audio frame while preserving its encoder time base."""
-    if origin_seconds and frame.pts is not None and frame.time_base is not None:
-        frame.pts -= round(origin_seconds / float(frame.time_base))
+def _shift_audio_frame(frame: Any, offset_seconds: float) -> bool:  # noqa: ANN401
+    """Rebase one resampled frame onto a clip that starts at zero; False means drop it.
+
+    Dropping rather than clamping is the whole point. A clamp to zero is not a small error: it
+    puts every frame ahead of the rebase point on one timestamp, and a run of identical
+    timestamps is a non-monotonic mp4 that a stricter demuxer than the one that wrote it may
+    refuse or silently discard. Measured on a source whose video track begins two seconds after
+    its audio, clamping put 93 frames on pts 0.
+
+    What is dropped is the audio between the span's start and the clip's first video frame:
+    at most one source frame interval on an ordinary cut, and everything before the video
+    track begins on a source whose two tracks do not start together. It is a real loss, and
+    the alternative was worse -- see `_copy_span_audio` for why the video's anchor cannot move
+    to keep it.
+    """
+    if not offset_seconds or frame.pts is None:
+        return True
+    time_base = frame.time_base
+    if time_base:
+        ticks_per_second = 1.0 / float(time_base)
+    elif frame.sample_rate:
+        ticks_per_second = float(frame.sample_rate)
+    else:
+        # Nothing to rebase against; leaving the timestamp alone is better than guessing a rate
+        # and shifting the track by an unknown amount.
+        return True
+    shifted = frame.pts - round(offset_seconds * ticks_per_second)
+    if shifted < 0:
+        return False
+    frame.pts = shifted
+    return True
 
 
 def audio_windows(start_ms: int, end_ms: int) -> tuple[tuple[int, int], ...]:
@@ -278,23 +320,30 @@ def _cut_image(source: bytes, request: ClipRequest) -> MediaClip:
 
 
 def _cut_video(source: bytes, request: ClipRequest) -> MediaClip:
+    """Cut one stored evidence clip, carrying the source's audio track when it has one.
+
+    The clip keeps its audio because this is the object the read path attaches and the media
+    embedder encodes. Cutting it video-only silently removed speech from memory itself: an
+    omni-modal embedder was handed a silent file, so nothing a person said could ever influence
+    retrieval, and an audio-capable reader was handed the same silence. The generation proxy has
+    always kept its track; the stored clip is the copy that outlives the model call, so it is the
+    one that decides what the memory contains.
+    """
     av = cast(Any, _import("av"))
     sampled = _sample_video_frames(source, request)
     if not sampled:
         raise DomainInvariantError("video span selected no frames from its source")
     width, height = scaled_size(sampled[0].width, sampled[0].height, request.max_pixels)
     buffer = io.BytesIO()
-    start_seconds = request.start_ms / 1_000
+    first_seconds = sampled[0].time or 0.0
     with (
-        av.open(io.BytesIO(source)) as source_container,
-        av.open(buffer, mode="w", format="mp4") as output,
+        av.open(io.BytesIO(source)) as origin,
+        av.open(buffer, mode="w", format="mp4") as container,
     ):
         source_audio = (
-            source_container.streams.audio[0]
-            if request.include_audio and source_container.streams.audio
-            else None
+            origin.streams.audio[0] if request.include_audio and origin.streams.audio else None
         )
-        stream = output.add_stream("libx264", rate=_stream_rate(request.frames_per_second))
+        stream = container.add_stream("libx264", rate=_stream_rate(request.frames_per_second))
         stream.width, stream.height, stream.pix_fmt = width, height, "yuv420p"
         # Single-threaded for the same reason the decode side is, and set here because the
         # decode setting does not reach it: libx264 carries AV_CODEC_CAP_OTHER_THREADS, so
@@ -310,12 +359,14 @@ def _cut_video(source: bytes, request: ClipRequest) -> MediaClip:
         # integer would make a fractional-fps clip play back at the wrong speed
         # and disagree with the duration recorded for it.
         stream.time_base = _MILLISECOND_TIME_BASE
-        audio, resampler = _proxy_audio_stream(av, output, source_audio)
+        # Declared before the first packet: libavformat writes the container header on that
+        # packet and rejects a stream added afterwards.
+        audio, resampler = _proxy_audio_stream(av, container, source_audio)
         for frame in sampled:
             resized = frame.reformat(width=width, height=height, format="yuv420p")
-            resized.pts = round(((frame.time or start_seconds) - start_seconds) * 1_000)
+            resized.pts = round(((frame.time or 0.0) - first_seconds) * 1_000)
             resized.time_base = stream.time_base
-            output.mux(stream.encode(resized))
+            container.mux(stream.encode(resized))
         if len(sampled) == 1:
             # `_sampled_window` widens the window a span is cut from, which cannot help a source
             # that is shorter than the widened window or whose own frame rate is below the
@@ -326,22 +377,20 @@ def _cut_video(source: bytes, request: ClipRequest) -> MediaClip:
             repeated = sampled[0].reformat(width=width, height=height, format="yuv420p")
             # Two sampling intervals on, because whatever reads this clip samples it at the same
             # rate: one interval is the instant a frame served late already misses.
-            repeated.pts = round(
-                ((sampled[0].time or start_seconds) - start_seconds) * 1_000
-                + 2_000 / request.frames_per_second
-            )
+            repeated.pts = round(2_000 / request.frames_per_second)
             repeated.time_base = stream.time_base
-            output.mux(stream.encode(repeated))
-        output.mux(stream.encode())
+            container.mux(stream.encode(repeated))
+        container.mux(stream.encode())
         if source_audio is not None:
+            # Rebased onto the clip's own clock, because the video above starts at zero.
             _copy_span_audio(
-                source_container,
-                output,
+                origin,
+                container,
                 request,
                 source=source_audio,
                 audio=audio,
                 resampler=resampler,
-                timeline_origin_seconds=start_seconds,
+                offset_seconds=first_seconds,
             )
     return MediaClip(
         content=buffer.getvalue(),

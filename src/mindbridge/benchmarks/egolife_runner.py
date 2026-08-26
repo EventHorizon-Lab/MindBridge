@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import timedelta
+from functools import partial
 from itertools import groupby
 from pathlib import Path
 from typing import cast
@@ -23,14 +24,17 @@ from mindbridge.benchmarks.egomem_reason import (
 from mindbridge.benchmarks.prompts import EGOMEM_REASON_QUERY_PROMPT
 from mindbridge.benchmarks.runtime import (
     OPTION_LABELS,
+    answer_failure_trace_id,
     benchmark_tenant_id,
     ingest_media,
     multiple_choice_query,
     parse_option_ranking,
+    settle_answers,
 )
 from mindbridge.contracts import (
     ContractModel,
     Identifier,
+    IdentityObservationInput,
     MediaObjectInput,
     NonEmptyString,
     ObserveRequest,
@@ -65,6 +69,10 @@ class EgoLifePreparedClip(ContractModel):
     media_object: MediaObjectInput | None = None
     caption: NonEmptyString | None = None
     duration_ms: int | None = Field(default=None, gt=0)
+    # Timed voice spans and their transcripts, as an edge device would supply them. Without
+    # these, perception is handed a silent clip and told to name people only when a name is
+    # "seen or heard" -- so on a conversational corpus it can never name anyone.
+    identity_observations: tuple[IdentityObservationInput, ...] = Field(default=(), max_length=512)
 
     @model_validator(mode="after")
     def require_video_with_duration(self) -> EgoLifePreparedClip:
@@ -79,6 +87,16 @@ class EgoLifePreparedClip(ContractModel):
                 raise ValueError("EgoLifeQA clips must have a positive duration_ms")
             if self.duration_ms is not None and self.duration_ms != self.media_object.duration_ms:
                 raise ValueError("EgoLifeQA clip durations must match")
+        if self.media_object is None and self.identity_observations:
+            raise ValueError("EgoLifeQA identity observations require source video")
+        # Annotated because both sources are optional and only their combination is guaranteed
+        # non-None by the branches above; an unannotated `or` chain types as `int | None` and the
+        # comparison below would raise at runtime on the one path mypy could not narrow.
+        span_ms: int = self.duration_ms or (
+            self.media_object.duration_ms or 0 if self.media_object is not None else 0
+        )
+        if any(identity.end_ms > span_ms for identity in self.identity_observations):
+            raise ValueError("EgoLifeQA identity observation exceeds its clip")
         egolife_timecode_offset_ms(self.day, self.start_timecode)
         return self
 
@@ -274,7 +292,8 @@ async def run_egolife_qa(
             await asyncio.gather(*due_clips, return_exceptions=True)
         )
         cutoff = prepared.timeline_origin + timedelta(milliseconds=query_offset_ms)
-        results = await asyncio.gather(
+        cohort = tuple(group)
+        outcomes = await asyncio.gather(
             *(
                 _answer_question(
                     memory,
@@ -286,8 +305,18 @@ async def run_egolife_qa(
                     semaphore,
                     ingest_failures,
                 )
-                for question in group
-            )
+                for question in cohort
+            ),
+            return_exceptions=True,
+        )
+        results = settle_answers(
+            cohort,
+            outcomes,
+            partial(
+                _failed_question_result,
+                subject_id=prepared.subject_id,
+                ingest_failures=ingest_failures,
+            ),
         )
         answers.update((result.id, result) for result in results)
     return tuple(answers[question.question_id] for question in questions)
@@ -351,7 +380,8 @@ async def run_egomem_reason(
             await asyncio.gather(*due_clips, return_exceptions=True)
         )
         cutoff = prepared.timeline_origin + timedelta(milliseconds=query_offset_ms)
-        results = await asyncio.gather(
+        cohort = tuple(group)
+        outcomes = await asyncio.gather(
             *(
                 _answer_egomem_question(
                     memory,
@@ -362,8 +392,14 @@ async def run_egomem_reason(
                     semaphore,
                     ingest_failures,
                 )
-                for question in group
-            )
+                for question in cohort
+            ),
+            return_exceptions=True,
+        )
+        results = settle_answers(
+            cohort,
+            outcomes,
+            partial(_failed_egomem_result, ingest_failures=ingest_failures),
         )
         answers.update((result.example_id, result) for result in results)
     return tuple(answers[question.example_id] for question in questions)
@@ -410,6 +446,7 @@ async def _ingest_clip(
                     occurred_at=occurred_at,
                     ended_at=ended_at,
                     observed_at=ended_at,
+                    identity_observations=clip.identity_observations,
                     idempotency_key=(f"{adapter_version}:{prepared.subject_id}:{source_key}:media"),
                 ),
                 poll_interval_seconds=poll_interval_seconds,
@@ -446,14 +483,12 @@ async def _recall_or_empty(
     except MindBridgeError as error:
         if error.code not in _RECOVERABLE_MODEL_ERRORS:
             raise
-        empty = RecallResult(
-            answer=None,
-            confidence=0.0,
-            memories=(),
-            evidence=(),
-            trace_id=error.trace_id or trace_fallback,
-        )
-        return empty, error.code
+        return _empty_recall(error.trace_id or trace_fallback), error.code
+
+
+def _empty_recall(trace_id: str) -> RecallResult:
+    """The result a question that never got an answer is scored on."""
+    return RecallResult(answer=None, confidence=0.0, memories=(), evidence=(), trace_id=trace_id)
 
 
 async def _answer_question(
@@ -479,6 +514,33 @@ async def _answer_question(
         semaphore,
         trace_fallback=f"trace_model_error_{question.question_id}",
     )
+    return _question_result(question, subject_id, result, error_code, ingest_failures)
+
+
+def _failed_question_result(
+    question: EgoLifeQuestion,
+    error_code: str,
+    *,
+    subject_id: str,
+    ingest_failures: int,
+) -> EgoLifeQuestionResult:
+    """One row for a question whose recall raised, so its cohort still answers all of them."""
+    return _question_result(
+        question,
+        subject_id,
+        _empty_recall(answer_failure_trace_id(question.question_id)),
+        error_code,
+        ingest_failures,
+    )
+
+
+def _question_result(
+    question: EgoLifeQuestion,
+    subject_id: str,
+    result: RecallResult,
+    error_code: str | None,
+    ingest_failures: int,
+) -> EgoLifeQuestionResult:
     ranking = parse_option_ranking(result.answer, question.choices)
     return EgoLifeQuestionResult(
         id=question.question_id,
@@ -519,6 +581,30 @@ async def _answer_egomem_question(
         semaphore,
         trace_fallback=f"trace_model_error_{question.question_id}",
     )
+    return _egomem_result(question, result, error_code, ingest_failures)
+
+
+def _failed_egomem_result(
+    question: EgoMemReasonQuestion,
+    error_code: str,
+    *,
+    ingest_failures: int,
+) -> EgoMemReasonResult:
+    """One row for a question whose recall raised, so its cohort still answers all of them."""
+    return _egomem_result(
+        question,
+        _empty_recall(answer_failure_trace_id(question.question_id)),
+        error_code,
+        ingest_failures,
+    )
+
+
+def _egomem_result(
+    question: EgoMemReasonQuestion,
+    result: RecallResult,
+    error_code: str | None,
+    ingest_failures: int,
+) -> EgoMemReasonResult:
     # An abstaining answerer returns answer=None, which parses to no ranking. Recording that as an
     # explicit non-answer keeps the rest of the run alive; raising here discarded every result,
     # because egomem_cli writes its artifacts only after the whole run returns.

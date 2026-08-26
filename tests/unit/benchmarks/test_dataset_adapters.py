@@ -1,20 +1,35 @@
 """Schema checks for official memory benchmark adapters."""
 
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import ClassVar
 
 import pytest
+from pydantic import ValidationError
 
+from mindbridge.benchmarks.atm_bench import (
+    atm_email_block,
+    atm_evidence_kind,
+    atm_memory_chunks,
+    atm_sgm_block,
+    load_atm_bench,
+    load_atm_emails,
+    load_atm_niah_pool,
+    load_atm_sgm,
+)
 from mindbridge.benchmarks.egolife_qa import load_egolife_qa
 from mindbridge.benchmarks.egomem_reason import load_egomem_reason
 from mindbridge.benchmarks.egotempo import load_egotempo
 from mindbridge.benchmarks.locomo_refined import load_locomo_refined
 from mindbridge.benchmarks.m3_bench import load_m3_bench
+from mindbridge.benchmarks.mem_gallery import load_mem_gallery, load_mem_gallery_topic
 from mindbridge.benchmarks.memlens import load_memlens, load_memlens_agent_subset
 from mindbridge.benchmarks.mm_lifelong import MMLifelongSplit, load_mm_lifelong
 from mindbridge.benchmarks.supermemory_vqa import load_supermemory_vqa
 from mindbridge.benchmarks.video_mme import load_video_mme
+from mindbridge.benchmarks.video_mme_v2 import load_video_mme_v2
+from mindbridge.core import MediaKind
 
 
 class _FakeArrowTable:
@@ -172,6 +187,131 @@ def test_video_mme_adapter_loads_official_parquet_rows(
     assert video.source_video_id == "fFjv93ACGo8"
     assert len(video.questions) == 3
     assert video.questions[0].options[2] == "C. Berries."
+
+
+def _video_mme_v2_rows(
+    *,
+    video_id: str = "001",
+    group_type: str = "logic",
+    group_structure: str = "[1,2,3,4]",
+    options: str | None = None,
+    answer: str = "F",
+    count: int = 4,
+) -> list[dict[str, object]]:
+    body = (
+        options
+        if options is not None
+        else "\n".join(f"{label}. Option {label}." for label in "ABCDEFGH")
+    )
+    return [
+        {
+            "video_id": video_id,
+            "url": "https://www.youtube.com/watch?v=AYSYelOQtQI",
+            "group_type": group_type,
+            "group_structure": group_structure,
+            "question_id": f"{video_id}-{index}",
+            "question": f"Question {index}?",
+            "options": body,
+            "answer": answer,
+            "level": "1",
+            "second_head": "Frames & Audio",
+            "third_head": "Visual-Audio Collaborative Reasoning",
+        }
+        for index in range(1, count + 1)
+    ]
+
+
+def test_video_mme_v2_adapter_groups_four_questions_per_video(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    annotation_path = tmp_path / "test.parquet"
+    _FakeParquet.rows = _video_mme_v2_rows() + _video_mme_v2_rows(
+        video_id="002", group_type="relevance", group_structure="4"
+    )
+    monkeypatch.setattr(
+        "mindbridge.benchmarks.video_mme_v2.import_module", lambda name: _FakeParquet
+    )
+
+    groups = load_video_mme_v2(annotation_path)
+
+    assert [group.video_id for group in groups] == ["001", "002"]
+    assert [group.group_type for group in groups] == ["logic", "relevance"]
+    assert [question.position for question in groups[0].questions] == [1, 2, 3, 4]
+    assert groups[0].questions[0].answer == "F"
+    assert groups[0].questions[0].options[5] == "F. Option F."
+
+
+def test_video_mme_v2_adapter_accepts_questions_offering_fewer_than_eight_options(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """58 of the 3,200 official questions offer 2-7 options; a rigid eight rejects the release."""
+    annotation_path = tmp_path / "test.parquet"
+    _FakeParquet.rows = _video_mme_v2_rows(
+        options="A. No.\nB. Yes.\nC. Cannot be determined.", answer="B"
+    )
+    monkeypatch.setattr(
+        "mindbridge.benchmarks.video_mme_v2.import_module", lambda name: _FakeParquet
+    )
+
+    group = load_video_mme_v2(annotation_path)[0]
+
+    assert group.questions[0].options == ("A. No.", "B. Yes.", "C. Cannot be determined.")
+
+
+def test_video_mme_v2_adapter_rejects_an_answer_past_the_last_option(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    annotation_path = tmp_path / "test.parquet"
+    _FakeParquet.rows = _video_mme_v2_rows(options="A. No.\nB. Yes.", answer="H")
+    monkeypatch.setattr(
+        "mindbridge.benchmarks.video_mme_v2.import_module", lambda name: _FakeParquet
+    )
+
+    with pytest.raises(ValidationError, match="past the last option"):
+        load_video_mme_v2(annotation_path)
+
+
+def test_video_mme_v2_adapter_refuses_a_partial_group(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The released scorer slices groups positionally, so a stray row shifts every later group."""
+    annotation_path = tmp_path / "test.parquet"
+    _FakeParquet.rows = _video_mme_v2_rows(count=3)
+    monkeypatch.setattr(
+        "mindbridge.benchmarks.video_mme_v2.import_module", lambda name: _FakeParquet
+    )
+
+    with pytest.raises(ValueError, match="whole groups of 4"):
+        load_video_mme_v2(annotation_path)
+
+
+def test_video_mme_v2_adapter_refuses_a_group_spanning_two_videos(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    annotation_path = tmp_path / "test.parquet"
+    rows = _video_mme_v2_rows()
+    rows[2]["video_id"] = "002"
+    _FakeParquet.rows = rows
+    monkeypatch.setattr(
+        "mindbridge.benchmarks.video_mme_v2.import_module", lambda name: _FakeParquet
+    )
+
+    with pytest.raises(ValueError, match="inconsistent metadata"):
+        load_video_mme_v2(annotation_path)
+
+
+def test_video_mme_v2_adapter_refuses_an_unscorable_logic_structure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Better to refuse at load than to die mid-run once the ingest has already been paid for."""
+    annotation_path = tmp_path / "test.parquet"
+    _FakeParquet.rows = _video_mme_v2_rows(group_structure="[4,3,2,1]")
+    monkeypatch.setattr(
+        "mindbridge.benchmarks.video_mme_v2.import_module", lambda name: _FakeParquet
+    )
+
+    with pytest.raises(ValidationError, match="unknown structure"):
+        load_video_mme_v2(annotation_path)
 
 
 def test_egotempo_adapter_parses_official_clip_boundaries(tmp_path: Path) -> None:
@@ -557,3 +697,376 @@ def _supermemory_question(
         "is_answerable": True,
         "answer_evidence": {"text": "SECRET ANSWER EVIDENCE"},
     }
+
+
+def _atm_question(**overrides: object) -> dict[str, object]:
+    question = {
+        "id": "1defb7d5-aab4-4244-8b3c-971a36376b04",
+        "question": "How much did I pay for accommodation for BMVC 2024?",
+        "answer": "£799.74",
+        "notes": "",
+        "evidence_ids": ["email202411160004", "20250223_130249"],
+        "qtype": "number",
+    }
+    return question | overrides
+
+
+def test_atm_bench_adapter_reads_questions_and_classifies_evidence(tmp_path: Path) -> None:
+    dataset_path = tmp_path / "atm-bench.json"
+    dataset_path.write_text(json.dumps([_atm_question()]), encoding="utf-8")
+
+    questions = load_atm_bench(dataset_path)
+
+    assert len(questions) == 1
+    assert questions[0].question_id == "1defb7d5-aab4-4244-8b3c-971a36376b04"
+    assert questions[0].qtype == "number"
+    assert questions[0].evidence_ids == ("email202411160004", "20250223_130249")
+    assert questions[0].niah_evidence_ids == ()
+    assert atm_evidence_kind("email202411160004") == "email"
+    assert atm_evidence_kind("20250223_130249") == "media"
+
+
+def test_atm_bench_adapter_refuses_duplicate_ids_and_missing_evidence(tmp_path: Path) -> None:
+    duplicated = tmp_path / "duplicated.json"
+    duplicated.write_text(json.dumps([_atm_question(), _atm_question()]), encoding="utf-8")
+    with pytest.raises(ValueError, match="duplicate question IDs"):
+        load_atm_bench(duplicated)
+
+    empty_evidence = tmp_path / "empty_evidence.json"
+    empty_evidence.write_text(json.dumps([_atm_question(evidence_ids=[])]), encoding="utf-8")
+    with pytest.raises(ValueError):
+        load_atm_bench(empty_evidence)
+
+    empty_release = tmp_path / "empty.json"
+    empty_release.write_text("[]", encoding="utf-8")
+    with pytest.raises(ValueError, match="must not be empty"):
+        load_atm_bench(empty_release)
+
+
+def test_atm_niah_pool_requires_every_gold_evidence_in_the_pool(tmp_path: Path) -> None:
+    complete = tmp_path / "niah25.json"
+    complete.write_text(
+        json.dumps(
+            [
+                _atm_question(
+                    niah_evidence_ids=[
+                        "email202411160004",
+                        "20250223_130249",
+                        "20220430_132212",
+                    ]
+                )
+            ]
+        ),
+        encoding="utf-8",
+    )
+    pool = load_atm_niah_pool(complete)
+    assert len(pool[0].niah_evidence_ids) == 3
+
+    truncated = tmp_path / "broken.json"
+    truncated.write_text(
+        json.dumps([_atm_question(niah_evidence_ids=["20250223_130249"])]),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="pool must contain every gold evidence"):
+        load_atm_niah_pool(truncated)
+
+
+def test_atm_email_adapter_reads_naive_timestamps_as_utc(tmp_path: Path) -> None:
+    emails_path = tmp_path / "emails.json"
+    emails_path.write_text(
+        json.dumps(
+            [
+                {
+                    "id": "email202411160004",
+                    "timestamp": "2024-11-16 09:12:00",
+                    "short_summary": "Hotel confirmation",
+                    "detail": "Total £799.74 for four nights.",
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    emails = load_atm_emails(emails_path)
+
+    assert emails[0].email_id == "email202411160004"
+    assert emails[0].occurred_at == datetime(2024, 11, 16, 9, 12, tzinfo=timezone.utc)
+    assert emails[0].summary == "Hotel confirmation"
+
+
+def test_atm_email_block_reproduces_the_official_field_order(tmp_path: Path) -> None:
+    emails_path = tmp_path / "emails.json"
+    emails_path.write_text(
+        json.dumps(
+            [
+                {
+                    "id": "email202411160004",
+                    "timestamp": "2024-11-16 09:12:00",
+                    "short_summary": "Hotel confirmation",
+                    "detail": "Total £799.74 for four nights.",
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    block = atm_email_block(load_atm_emails(emails_path)[0])
+
+    assert block.splitlines() == [
+        "ID: email202411160004",
+        "Timestamp: 2024-11-16 09:12:00",
+        "Summary: Hotel confirmation",
+        "Detail: Total £799.74 for four nights.",
+    ]
+
+
+def test_atm_sgm_adapter_takes_capture_time_from_the_stem_not_the_timestamp(
+    tmp_path: Path,
+) -> None:
+    batch_path = tmp_path / "video_batch_results.json"
+    batch_path.write_text(
+        json.dumps(
+            [
+                {
+                    "video_path": "data/raw_memory/video/20220502_172850.mp4",
+                    "timestamp": "2022-05-02 16:28:54+00:00",
+                    "location_name": "Fellows' Garden, Cambridge, United Kingdom",
+                    "city": "Cambridge, United Kingdom",
+                    "short_caption": "A blackbird forages on a lawn.",
+                    "caption": "A solitary blackbird moves across a green lawn.",
+                    "ocr_text": "",
+                    "tags": ["blackbird", "garden"],
+                    "duration": 3.300756,
+                    "file_size": 790569,
+                    "entities": [{"entity": "bird", "type": "other"}],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    records = load_atm_sgm(batch_path)
+
+    assert records[0].media_id == "20220502_172850"
+    assert records[0].media_kind is MediaKind.VIDEO
+    # The stem is local wall clock; the record's own timestamp is UTC and an hour earlier.
+    assert records[0].occurred_at == datetime(2022, 5, 2, 17, 28, 50, tzinfo=timezone.utc)
+    assert records[0].duration_seconds == pytest.approx(3.300756)
+    assert records[0].size_bytes == 790569
+    assert records[0].tags == ("blackbird", "garden")
+
+
+def test_atm_sgm_adapter_tolerates_a_disambiguated_media_stem(tmp_path: Path) -> None:
+    # 28 of the release's 3,759 real image filenames carry a disambiguating suffix that its
+    # export tooling appends to a duplicate capture, e.g. `20221212_115316_001.jpg` or
+    # `20220627_155122(0).jpg`. Only the leading 15 characters are the timestamp.
+    batch_path = tmp_path / "image_batch_results.json"
+    batch_path.write_text(
+        json.dumps(
+            [
+                {
+                    "image_path": "data/raw_memory/image/20221212_115316_001.jpg",
+                    "timestamp": "2022-12-12 11:53:16",
+                    "location_name": "",
+                    "city": "",
+                    "short_caption": "",
+                    "caption": "",
+                    "ocr_text": "",
+                    "tags": [],
+                    "file_size": 12_345,
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    records = load_atm_sgm(batch_path)
+
+    assert records[0].media_id == "20221212_115316_001"
+    assert records[0].occurred_at == datetime(2022, 12, 12, 11, 53, 16, tzinfo=timezone.utc)
+
+
+def test_atm_sgm_block_reproduces_the_official_field_order(tmp_path: Path) -> None:
+    batch_path = tmp_path / "image_batch_results.json"
+    batch_path.write_text(
+        json.dumps(
+            [
+                {
+                    "image_path": "data/raw_memory/image/20220703_210745.jpg",
+                    "timestamp": "2022-07-03 21:07:45",
+                    "location_name": "West Quay Road, Southampton, United Kingdom",
+                    "city": "Southampton, United Kingdom",
+                    "short_caption": "A small airplane against a clear sky.",
+                    "caption": "A solitary small aircraft streaks across a cloudless sky.",
+                    "ocr_text": "There is no text visible in the image.",
+                    "tags": ["airplane", "sky"],
+                    "file_size": 100686,
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    block = atm_sgm_block(load_atm_sgm(batch_path)[0])
+
+    assert block.splitlines() == [
+        "ID: 20220703_210745",
+        "Type: image",
+        "Timestamp: 2022-07-03 21:07:45",
+        "Location: West Quay Road, Southampton, United Kingdom",
+        "Short Caption: A small airplane against a clear sky.",
+        "Caption: A solitary small aircraft streaks across a cloudless sky.",
+        "OCR: There is no text visible in the image.",
+        "Tags: airplane, sky",
+    ]
+
+
+def test_atm_memory_chunks_keep_every_chunk_addressable_and_within_the_limit() -> None:
+    short_block = "ID: 20220703_210745\nType: image\n"
+    assert atm_memory_chunks(short_block, "20220703_210745") == (short_block,)
+
+    long_block = "ID: 20220703_210745\n" + "x" * 9_000
+    chunks = atm_memory_chunks(long_block, "20220703_210745")
+
+    assert len(chunks) == 5
+    assert all(len(chunk) <= 2_048 for chunk in chunks)
+    assert all(chunk.startswith("ID: 20220703_210745\n") for chunk in chunks)
+    assert "Part 1/5" in chunks[0]
+
+
+def _mem_gallery_topic_payload() -> dict[str, object]:
+    return {
+        "character_profile": {
+            "name": "Maya",
+            "persona_summary": "A part-time librarian who took up baking.",
+            "traits": ["curious", "earnest"],
+            "conversation_style": "Inquisitive and earnest.",
+        },
+        "multi_session_dialogues": [
+            {
+                "session_id": "D1",
+                "date": "2024-06-24",
+                "dialogues": [
+                    {
+                        "round": "D1:1",
+                        "user": "Can you tell me the basics of handmade baking?",
+                        "assistant": "Start with an oven of 30 litres or more.",
+                    },
+                    {
+                        "round": "D1:2",
+                        "user": "What is in this picture?",
+                        "assistant": "A tray of shortbread.",
+                        "image_id": ["D1:IMG_001"],
+                        "input_image": ["../image/Baking/D1_IMG_001.jpg"],
+                        "image_caption": ["A tray of pale shortbread fingers."],
+                    },
+                ],
+            }
+        ],
+        "human-annotated QAs": [
+            {
+                "point": "FR",
+                "question": "What oven size was recommended?",
+                "answer": "30 litres or more.",
+                "session_id": ["D1"],
+                "clue": ["D1:1"],
+            },
+            {
+                "point": "TTL",
+                "question": "What species of plant is shown in the picture?",
+                "question_image": "../image/Baking/QA_IMG_001.jpg",
+                "answer": "Foxglove",
+                "session_id": ["D1"],
+                "clue": ["D1:2"],
+                "image_caption": "Cluster of purple bell-shaped flowers.",
+            },
+        ],
+    }
+
+
+def test_mem_gallery_adapter_reads_sessions_rounds_and_question_images(tmp_path: Path) -> None:
+    topic_path = tmp_path / "Baking_Dessert_Daily_Life_Skill.json"
+    topic_path.write_text(json.dumps(_mem_gallery_topic_payload()), encoding="utf-8")
+
+    topic = load_mem_gallery_topic(topic_path)
+
+    assert topic.topic == "Baking_Dessert_Daily_Life_Skill"
+    assert topic.profile.name == "Maya"
+    assert topic.sessions[0].session_id == "D1"
+    assert topic.sessions[0].occurred_at == datetime(2024, 6, 24, tzinfo=timezone.utc)
+    assert topic.sessions[0].rounds[0].image_id is None
+    assert topic.sessions[0].rounds[1].image_id == "D1:IMG_001"
+    assert topic.sessions[0].rounds[1].image_path == "../image/Baking/D1_IMG_001.jpg"
+    assert topic.questions[0].question_id == "Baking_Dessert_Daily_Life_Skill:1"
+    assert topic.questions[0].point == "FR"
+    assert topic.questions[0].clue_round_ids == ("D1:1",)
+    assert topic.questions[1].question_image_path == "../image/Baking/QA_IMG_001.jpg"
+    assert topic.questions[1].question_image_caption == "Cluster of purple bell-shaped flowers."
+
+
+def test_mem_gallery_adapter_refuses_unknown_points_and_dangling_clues(tmp_path: Path) -> None:
+    unknown_point = _mem_gallery_topic_payload()
+    qas = unknown_point["human-annotated QAs"]
+    assert isinstance(qas, list)
+    qas[0]["point"] = "ZZ"
+    unknown_path = tmp_path / "unknown.json"
+    unknown_path.write_text(json.dumps(unknown_point), encoding="utf-8")
+    with pytest.raises(ValueError, match="unknown Mem-Gallery point"):
+        load_mem_gallery_topic(unknown_path)
+
+    dangling = _mem_gallery_topic_payload()
+    dangling_qas = dangling["human-annotated QAs"]
+    assert isinstance(dangling_qas, list)
+    dangling_qas[0]["clue"] = ["D9:7"]
+    dangling_path = tmp_path / "dangling.json"
+    dangling_path.write_text(json.dumps(dangling), encoding="utf-8")
+    with pytest.raises(ValueError, match="clue names an unknown round"):
+        load_mem_gallery_topic(dangling_path)
+
+
+def test_mem_gallery_adapter_refuses_a_round_carrying_more_than_one_image(
+    tmp_path: Path,
+) -> None:
+    payload = _mem_gallery_topic_payload()
+    sessions = payload["multi_session_dialogues"]
+    assert isinstance(sessions, list)
+    sessions[0]["dialogues"][1]["input_image"] = ["a.jpg", "b.jpg"]
+    sessions[0]["dialogues"][1]["image_id"] = ["D1:IMG_001", "D1:IMG_002"]
+    path = tmp_path / "two_images.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="exactly one image"):
+        load_mem_gallery_topic(path)
+
+
+def test_mem_gallery_adapter_refuses_a_round_carrying_more_than_one_caption(
+    tmp_path: Path,
+) -> None:
+    """The caption is refused on the same terms as the image and its id, not guessed at.
+
+    A second image id fails the load; a second caption used to be silently reduced to the
+    first. That asymmetry is the defect -- one field's ambiguity refused, the adjacent one's
+    resolved by taking whichever the release happened to list first.
+    """
+    payload = _mem_gallery_topic_payload()
+    sessions = payload["multi_session_dialogues"]
+    assert isinstance(sessions, list)
+    sessions[0]["dialogues"][1]["image_caption"] = ["shortbread", "a second caption"]
+    path = tmp_path / "two_captions.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="exactly one image"):
+        load_mem_gallery_topic(path)
+
+
+def test_mem_gallery_directory_loader_keeps_sorted_topic_order(tmp_path: Path) -> None:
+    directory = tmp_path / "dialog"
+    directory.mkdir()
+    for name in ("Zebra_Topic", "Apple_Topic"):
+        (directory / f"{name}.json").write_text(
+            json.dumps(_mem_gallery_topic_payload()), encoding="utf-8"
+        )
+
+    topics = load_mem_gallery(directory)
+
+    assert tuple(topic.topic for topic in topics) == ("Apple_Topic", "Zebra_Topic")

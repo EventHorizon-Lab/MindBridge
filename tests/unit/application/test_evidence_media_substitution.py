@@ -123,6 +123,29 @@ async def test_two_spans_of_one_recording_attach_both_clips() -> None:
     assert attached == ["https://cdn.example/clip_c1?sig=x", "https://cdn.example/clip_c2?sig=x"]
 
 
+async def test_only_the_object_that_is_attached_is_signed() -> None:
+    """Signing the source too was work for a URL nothing reads once a clip stands in for it.
+
+    A measured video recall resolved 38-40 media objects to attach 18-20 clips: every source was
+    signed alongside the clip that replaced it. The one span with no clip keeps its source signed,
+    because there the source is what is attached.
+    """
+    sources = (_media("source_j1"), _media("source_j2"))
+    substituted = _span("evidence_j1", "source_j1")
+    plain = _span("evidence_j2", "source_j2")
+    clip = _media("clip_j1", derived_from="source_j1")
+    signer = _Signer()
+
+    await resolve_evidence_media(
+        (substituted, plain),
+        sources,
+        signer,
+        clip_media={substituted.evidence_id: clip},
+    )
+
+    assert sorted(signer.signed) == ["clip_j1", "source_j2"]
+
+
 def test_identical_bytes_are_attached_once() -> None:
     source = _media("source_d")
     span = _span("evidence_d", "source_d")

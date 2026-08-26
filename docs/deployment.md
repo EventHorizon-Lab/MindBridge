@@ -6,7 +6,7 @@ the variables themselves see [configuration](configuration.md); for the runtime 
 
 ## Topology
 
-Six process roles. Only the first four are long-running.
+Eight process roles. Only the first six are long-running, and two of those are optional.
 
 | Role | Command | Extras |
 | --- | --- | --- |
@@ -14,6 +14,8 @@ Six process roles. Only the first four are long-running.
 | Jina embedding service | `mindbridge jina serve` | `server` + `cloud-models` |
 | Memory worker | `celery -A mindbridge.celery_app:app worker` | `server` + `media` (+ `cloud-models` only for an in-process media encoder, which brings `media` with it) |
 | MCP (optional) | `mindbridge mcp` | `server` |
+| Consolidation beat (optional) | `celery -A mindbridge.celery_app:app beat` | `server` |
+| Consolidation worker (optional) | `celery -A mindbridge.celery_app:app worker -Q mindbridge_consolidation` | `server` |
 | Consolidation | `mindbridge consolidate --tenant-id ...` | `server` |
 | Lifecycle | `mindbridge lifecycle --tenant-id ...` | `server` |
 
@@ -44,9 +46,10 @@ python -m pip install '.[all]'
 
 ## Datastores
 
-PostgreSQL 18 with pgvector 0.8 or newer. Filtered recall relies on pgvector iterative scans, so
-this is a hard floor, not a preference. Redis is the task broker. Object storage is S3 or any
-S3-compatible store.
+PostgreSQL 18 with pgvector; the development and CI image pins pgvector 0.8.2. Current retrieval
+uses exact per-tenant vector scans. Migration `0018` records the HNSW index and
+`hnsw.iterative_scan` setting to restore if a tenant grows large enough to need approximate
+search. Redis is the task broker. Object storage is S3 or any S3-compatible store.
 
 The checked-in `compose.yaml` pins the development versions:
 
@@ -68,7 +71,7 @@ Apply migrations before starting the processes that read the schema they add. Th
 automatic migration on startup, deliberately: a process that migrates on boot turns a rolling
 restart into an uncoordinated schema race.
 
-Four migrations need a decision from you rather than just an apply:
+Six migrations need a decision from you rather than just an apply:
 
 **`0005` — tenant row-level security.** Creates the non-login `mindbridge_runtime` role, grants
 the migration user membership, and enables **forced** RLS on every table carrying a `tenant_id`.
@@ -87,6 +90,27 @@ Resolve those rows explicitly before applying it.
 **`0018` — drops the HNSW vector index.** This looks like a regression and is not. Under RLS the
 planner always has a tenant predicate, so it chose an exact scan and never read the HNSW index —
 which still cost roughly 18× on write and held over a gigabyte. Read plans are unchanged.
+
+**`0024` — stores the recall tsvector.** The only migration here that needs a **window**, not just
+a decision: `ADD COLUMN ... GENERATED` rewrites `memory_records` under `ACCESS EXCLUSIVE`, so every
+read and write of that table blocks for the length of the rewrite — 5.2 s measured on 150 MB, and
+proportional to the largest `memory_records` you hold. Size the window against that table rather
+than against this number, and apply it while the API is drained rather than mid-serve. It also
+drops `memory_records_summary_fts_idx`, which had 0 scans across two complete evaluations because
+the substring arm of the recall query gives the planner nothing to use it for.
+
+**`0025` — repairs two things `0021` left behind.** It deletes every `observe` row in
+`idempotency_keys`. `0021` removed a field from `ObserveRequest`, which changed the digest of a
+request whose bytes did not change, while the idempotency key itself stayed stable — so a device
+retrying an observation the server already accepted got `409` forever instead of `DUPLICATE`. The
+digest cannot be recomputed here without reproducing one serializer's escaping rules in SQL, so
+the claims go instead: losing one costs a reprocess, and the reprocess is idempotent because the
+write still dedupes on the derived `observation_id`. **Any `observe` retry in flight across the
+upgrade is reprocessed rather than deduplicated by its key.** It also widens the `embeddings`
+unique key to include `space_id`, which `0021` dropped along with the revision; without it one
+object cannot hold vectors in two spaces, so the re-embedding described under `0007` fails with
+`embedding conflict could not be resolved`. Widening a key cannot make existing rows collide, so
+there is nothing to resolve before applying it.
 
 ## API
 
@@ -172,6 +196,15 @@ Point `MINDBRIDGE_EMBEDDER_ENDPOINT` at this service's `/v1` base URL and use th
 the API and worker. `/health` is the readiness probe; `/v1/models` and `/v1/embeddings` follow the
 OpenAI-compatible contract used by MindBridge.
 
+**Running this service separately is the largest measured ingest lever there is.** In the
+2026-08-24 evaluation, moving the encoder out of the worker and into this service took throughput
+from **51 to 489 clips/hour**, and rebuilding the shared broker queue as a round robin so no one
+tenant could occupy the pool took it to **626**. The reason the first number is so low is not the
+GPU: a prefork child holds its own copy of the encoder, so concurrency multiplies device memory
+instead of overlapping anything, and the card measured 1-5% utilised at 93% allocated. With the
+encoder served, the worker holds no model and its concurrency is bounded by this endpoint and the
+connection pool.
+
 ## Memory worker
 
 Shares storage and generator variables with the API. Its text slot reads the same
@@ -190,6 +223,22 @@ uv run --extra server --extra media \
 
 No `cloud-models`, no GPU, no torch: with both embedder slots served, the worker loads no model at
 all and its concurrency is bounded by the endpoint and the database rather than by a card.
+
+Note that the command passes no `-Q`. It consumes nine queues that way: `mindbridge` and
+`mindbridge.0` through `mindbridge.7`. **Do not narrow that with `-Q`** — a worker started
+`-Q mindbridge` consumes only the pre-shard queue, and ingest then stops with nothing logged
+anywhere. `-Q` belongs to the consolidation worker, which has a queue of its own.
+
+Observations are published to the shard their tenant id hashes to, because with one queue a single
+tenant's backlog is every other tenant's wait: during the 2026-08-24 evaluation one benchmark spent
+five hours at zero coverage behind 400 clips belonging to another, and median queue wait across the
+run rose from 0.7 s with one producer to 12,018 s with nine. Shards bound that but do not remove
+it — kombu polls the queues round robin, so one tenant can no longer starve every other tenant,
+only the tenants that hash to its own shard. Their number is a constant in the code rather than a
+setting, because a publisher writing to a shard the worker does not consume stops ingest silently.
+
+`mindbridge` itself receives no new work. It stays in the set so that an upgrade drains whatever was
+queued before the shards existed.
 
 `media` is still required, and is easy to lose sight of precisely because serving removes
 everything else. Clip derivation runs in the worker whatever the embedder slots say, and its PyAV,
@@ -219,9 +268,10 @@ uv run --extra server --extra cloud-models \
 **The worker refuses to start when a pool of more than one child would hold more resident encoder
 weight than the deployment allows, while either embedder slot names `jina`.** A prefork child owns
 its plugins, so the model is loaded once per child and six children need about 22 GiB of VRAM. The
-pool size is whatever Celery settles on, from `--concurrency` or from `--autoscale`; a pool that
-shares one process, `--pool=threads` or `solo`, holds one copy however wide it runs and is not
-refused. `--max-memory-per-child` bounds resident host memory and structurally cannot bound VRAM;
+pool size is whatever Celery settles on, from `--concurrency` or from `--autoscale`. Only
+`prefork` and `solo` are supported; thread and greenlet pools are refused because the worker
+runtime owns one synchronous event loop per process. `solo` holds one model copy.
+`--max-memory-per-child` bounds resident host memory and structurally cannot bound VRAM;
 during a nine-benchmark evaluation that combination reached 30.2 of the card's 32.6 GB with the GPU
 at 1-5% utilisation, then produced 479 CUDA out-of-memory errors and a kernel `global_oom` on the
 host. Scale in-process encoding with one worker process per assigned GPU at concurrency 1, or serve
@@ -255,13 +305,52 @@ task limit expires first, the overrun is retried as though it were transient and
 paid for again until the retries run out. Nothing is written either way. Set the generator's
 deadline to what its slowest clip actually needs and let the budget follow.
 
-The worker inspects original AV once, writes evidence-grounded Event/Entity/Claim records
-atomically, and cuts one derived clip per grounded span before encoding it locally. Event and
-Claim text is batched through the remote embedder.
+The worker writes evidence-grounded Event/Entity/Claim records atomically and derives clips from
+their grounded spans before encoding them. With generation proxies enabled, video is read once to
+build the proxy and again after perception for evidence clips; long audio spans may produce
+several 30-second clips. Event and Claim text is batched through the remote embedder.
 
 Sampling is the cost lever: see
 [media sampling](configuration.md#media-sampling-worker). Frame rate sets the entire write cost
 of a video deployment.
+
+## Separating read and write traffic
+
+Perception and answering compete for one generator endpoint by default, and they starve each
+other badly. Measured in the 2026-08-24 evaluation: per-observation work time went from **74.5 s**
+at one producer to **626.8 s** at nine, median queue wait from **0.7 s to 12 018 s**, and a
+populated recall from **10.8 s idle to 206 s** under the same nine-way contention. The endpoint
+was not down — a trivial completion answered in 0.28 s throughout — it was saturated with
+multimodal perception.
+
+**No configuration change ships for this, because none is needed.** The API, the MCP process, and
+the worker each read `MINDBRIDGE_GENERATOR_*` from their own environment and construct their own
+client, so pointing them at different endpoints is a matter of exporting a different value in
+each unit file:
+
+```bash
+# API and MCP units: the interactive endpoint
+export MINDBRIDGE_GENERATOR_ENDPOINT=https://generator-read.example.com/v1
+
+# Worker units: the batch endpoint
+export MINDBRIDGE_GENERATOR_ENDPOINT=https://generator-write.example.com/v1
+```
+
+The same applies to `MINDBRIDGE_EMBEDDER_*`, and to `MINDBRIDGE_GENERATOR_CONFIG_JSON` when a
+deployment wants different deadlines or retry budgets on the two paths. Both endpoints must serve
+the same generator for answers to be comparable across paths; the embedder additionally has to
+resolve to one embedding space, which the startup probe enforces.
+
+Two things this does *not* fix, so plan around them:
+
+- **One saturated endpoint behind two URLs is still one saturated endpoint.** Split the traffic
+  only when the two URLs reach different capacity.
+- **Ingest has no fairness between tenants.** Every observation goes to one `mindbridge` queue,
+  consumed in order. In the evaluation one benchmark sat five hours at zero coverage purely on
+  queue position — 400 clips behind a frontier advancing at tens of messages per hour — and
+  started processing six minutes after the queue was rebuilt as a round robin across benchmarks.
+  A tenant that bulk-imports will delay every other tenant for as long as its backlog lasts, and
+  nothing in the deployment prevents that. Rate-limit bulk ingest at the caller.
 
 ## Scheduled jobs
 
@@ -272,6 +361,23 @@ whatever CronJob, systemd timer, or Celery beat the deployment already has.
 uv run --extra server mindbridge consolidate --tenant-id tenant_01
 uv run --extra server mindbridge lifecycle --tenant-id tenant_01
 ```
+
+**Consolidation is the one you cannot skip.** Nothing above a single clip exists until it runs:
+no Episode, no Claim, no Summary, so recall can only ever return the individual moments a query
+matched. Two variables put it on the Celery beat schedule the worker app already carries:
+
+```bash
+export MINDBRIDGE_CONSOLIDATION_TENANT_IDS=tenant_01,tenant_02
+export MINDBRIDGE_CONSOLIDATION_INTERVAL_SECONDS=3600   # optional, this is the default
+
+celery -A mindbridge.celery_app:app beat --loglevel=INFO
+celery -A mindbridge.celery_app:app worker -Q mindbridge_consolidation --concurrency=1
+```
+
+One tick sweeps one tenant by rotation, and the sweep is routed off the observation queue, so it
+takes at most one concurrent generator call and never a worker slot from ingest. Both processes
+need the same tenant list. The contract, the two off-switches, and what a running sweep costs are
+in [operations](operations.md#built-in-consolidation-schedule).
 
 Each prints one JSON object on stdout — capture it, since it is the record of what the sweep
 actually did.
@@ -357,7 +463,9 @@ and rehearse the restore-then-reconcile path before you need it.
 Honest gaps, so you plan for them rather than discover them:
 
 - **No migration-on-startup.** Apply them yourself, before the rolling restart.
-- **No built-in scheduler.** The sweeps are commands; scheduling is yours.
-- **No per-tenant quotas.** Nothing limits how much one tenant ingests.
+- **Scheduling is built in for consolidation only.** Lifecycle and orphan reclamation are
+  commands; their schedule is yours.
+- **No per-tenant quotas and no ingest fairness.** Nothing limits how much one tenant ingests,
+  and one shared queue serves every tenant in arrival order.
 - **No automatic re-embedding.** Changing embedding space or dimension is a manual rebuild; the
   startup probe only stops you from serving a half-migrated deployment.

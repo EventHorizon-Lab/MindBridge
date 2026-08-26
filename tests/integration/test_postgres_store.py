@@ -10,9 +10,13 @@ from typing import cast
 
 import pytest
 from psycopg import AsyncConnection
+from psycopg.errors import UniqueViolation
 
 from mindbridge.application.kernel import MemoryKernel
-from mindbridge.application.observation_processing import ObservationProcessingOutput
+from mindbridge.application.observation_processing import (
+    ObservationBatch,
+    ObservationProcessingOutput,
+)
 from mindbridge.application.perception import ResolvedEvidence
 from mindbridge.application.ports import (
     GeneratedAnswer,
@@ -33,6 +37,7 @@ from mindbridge.contracts import (
     RememberRequest,
 )
 from mindbridge.core import (
+    DeviceId,
     EmbeddedObjectType,
     EmbeddingId,
     EmbeddingRecord,
@@ -45,6 +50,7 @@ from mindbridge.core import (
     JobState,
     MediaKind,
     MediaObject,
+    MediaObjectId,
     MemoryId,
     MemoryIntegrityError,
     MemoryNotFoundError,
@@ -52,6 +58,7 @@ from mindbridge.core import (
     MemoryState,
     MemoryType,
     ModelReference,
+    Observation,
     ObservationId,
     SensorKind,
     TenantId,
@@ -243,6 +250,10 @@ async def test_migration_installs_complete_phase_zero_schema(database_url: str) 
         21,
         22,
         23,
+        24,
+        25,
+        26,
+        27,
     ]
 
 
@@ -336,6 +347,264 @@ async def test_dropping_model_revisions_dedupes_vectors_and_rewrites_stored_iden
 
     assert [cast(tuple[str], row)[0] for row in surviving] == ["first"]
     assert cast(tuple[list[dict[str, str]]], identities)[0] == [{"model_id": "m"}]
+
+
+async def test_widening_the_embedding_key_restores_space_coexistence(
+    database_url: str,
+) -> None:
+    """Migration 0021 left `space_id` out of the key that replaced the revision-keyed one.
+
+    The revision was what let one object hold two vectors while a re-embedding ran, which
+    `docs/configuration.md` and `docs/troubleshooting.md` both document as supported. Without
+    `space_id` in the key those two rows collide, so this asserts the second space is accepted
+    and that the widened key still rejects a genuine duplicate within one space.
+    """
+    migration = Path(__file__).parents[2] / (
+        "migrations/0025_embedding_space_key_and_stale_digests.sql"
+    )
+    connection = await AsyncConnection.connect(database_url, autocommit=True)
+    async with connection:
+        await connection.execute("DROP SCHEMA IF EXISTS migration_0025_legacy CASCADE")
+        await connection.execute("CREATE SCHEMA migration_0025_legacy")
+        await connection.execute("SET search_path TO migration_0025_legacy")
+        await connection.execute(
+            """
+            CREATE TABLE embeddings (
+                tenant_id text NOT NULL,
+                embedding_id text NOT NULL,
+                object_type text NOT NULL,
+                object_id text NOT NULL,
+                model_id text NOT NULL,
+                space_id text NOT NULL,
+                task text NOT NULL,
+                created_at timestamptz NOT NULL,
+                -- Production's primary key, without which this table cannot show what the
+                -- widened unique key does and does not buy: `embedding_id` is derived, and
+                -- only the recipe in `kernel.py` hashes `space_id`, so for every other object
+                -- type the second vector arrives under the same ID and collides here rather
+                -- than on the key this migration widens.
+                PRIMARY KEY (tenant_id, embedding_id),
+                CONSTRAINT embeddings_object_model_task_key
+                    UNIQUE (tenant_id, object_type, object_id, model_id, task)
+            );
+            CREATE TABLE idempotency_keys (
+                tenant_id text NOT NULL,
+                operation text NOT NULL,
+                idempotency_key text NOT NULL,
+                content_digest text NOT NULL,
+                created_at timestamptz NOT NULL
+            );
+            CREATE TABLE observations (
+                observation_id text NOT NULL,
+                identity_observations jsonb NOT NULL,
+                content_digest char(64) NOT NULL,
+                ingested_at timestamptz NOT NULL
+            );
+            CREATE TABLE schema_migrations (
+                version integer PRIMARY KEY,
+                applied_at timestamptz NOT NULL DEFAULT now()
+            );
+            INSERT INTO schema_migrations VALUES (21, now());
+            INSERT INTO embeddings VALUES
+                ('t', 'first', 'memory_record', 'm1', 'model', 'space-v1', 'document', now()),
+                ('t', 'claim-hash', 'claim', 'c1', 'model', 'space-v1', 'document', now());
+            INSERT INTO idempotency_keys VALUES
+                ('t', 'observe', 'key-1', 'stale', now() - interval '1 day'),
+                ('t', 'observe', 'key-3', 'still-valid', now() + interval '1 day'),
+                ('t', 'remember', 'key-2', 'still-valid', now() - interval '1 day');
+            INSERT INTO observations VALUES
+                ('with_spans', '[{"model_id": "m"}]'::jsonb, repeat('a', 64),
+                 now() - interval '1 day'),
+                ('spans_after_0021', '[{"model_id": "m"}]'::jsonb, repeat('c', 64),
+                 now() + interval '1 day'),
+                ('without_spans', '[]'::jsonb, repeat('b', 64), now() - interval '1 day');
+            """,
+            prepare=False,
+        )
+        await connection.execute(migration.read_text(encoding="utf-8"), prepare=False)
+
+        # The state the narrowed key made impossible: one object, two spaces, mid-re-embed.
+        await connection.execute(
+            """
+            INSERT INTO embeddings VALUES
+                ('t', 'second', 'memory_record', 'm1', 'model', 'space-v2', 'document', now())
+            """,
+            prepare=False,
+        )
+        spaces = await (
+            await connection.execute(
+                "SELECT space_id FROM embeddings WHERE object_id = 'm1' ORDER BY space_id"
+            )
+        ).fetchall()
+        duplicate_rejected = False
+        try:
+            await connection.execute(
+                """
+                INSERT INTO embeddings VALUES
+                    ('t', 'third', 'memory_record', 'm1', 'model', 'space-v2', 'document', now())
+                """,
+                prepare=False,
+            )
+        except UniqueViolation:
+            duplicate_rejected = True
+        # The half the widened key does not reach. A claim's `embedding_id` recipe
+        # (`semantic_claims.py`) hashes tenant, object type, object id, model and task but not
+        # `space_id`, so re-embedding it under a second space derives the same ID and collides
+        # on the primary key instead. Asserted so the limitation cannot be mistaken for fixed.
+        space_blind_recipe_still_collides = False
+        try:
+            await connection.execute(
+                """
+                INSERT INTO embeddings VALUES
+                    ('t', 'claim-hash', 'claim', 'c1', 'model', 'space-v2', 'document', now())
+                """,
+                prepare=False,
+            )
+        except UniqueViolation:
+            space_blind_recipe_still_collides = True
+        claims = await (
+            await connection.execute("SELECT operation FROM idempotency_keys")
+        ).fetchall()
+        digests = await (
+            await connection.execute("SELECT observation_id, content_digest FROM observations")
+        ).fetchall()
+        await connection.execute("RESET search_path")
+        await connection.execute("DROP SCHEMA migration_0025_legacy CASCADE")
+
+    assert [cast(tuple[str], row)[0] for row in spaces] == ["space-v1", "space-v2"]
+    assert duplicate_rejected
+    assert space_blind_recipe_still_collides
+    # An `observe` claim recorded before 0021 can never match again and is dropped; one recorded
+    # after it digests what the current recipe digests, and a `remember` claim never moved.
+    assert sorted(cast(tuple[str], row)[0] for row in claims) == ["observe", "remember"]
+    # Only an observation that both carries identity spans -- where the removed field lived --
+    # and predates 0021 loses its digest. One without spans digests exactly what it always did,
+    # and one written after 0021 already carries a digest the current recipe reproduces, so
+    # nulling it would open a window for a different body to be accepted as a duplicate.
+    assert dict(cast(list[tuple[str, str | None]], digests)) == {
+        "with_spans": None,
+        "spans_after_0021": "c" * 64,
+        "without_spans": "b" * 64,
+    }
+
+
+def test_every_migration_version_is_claimed_by_exactly_one_file() -> None:
+    """Two files claiming one version merge cleanly and then break the apply, silently.
+
+    Filenames differing anywhere but the number do not conflict in git, so two branches can
+    each add `00NN_*.sql` and both survive a merge. The runner globs and sorts, so the first
+    one applies and commits and the second aborts on work already done -- and the documented
+    apply loop has no `set -e`, so it prints that error, continues, and exits 0. The version
+    list above cannot see it, because it asserts the set of versions reached, not that each
+    was reached once. This is the assertion that can.
+    """
+    directory = Path(__file__).parents[2] / "migrations"
+    numbers = [path.name[:4] for path in sorted(directory.glob("[0-9][0-9][0-9][0-9]_*.sql"))]
+
+    assert sorted(set(numbers)) == numbers
+
+
+async def test_a_resend_digested_by_the_retired_recipe_is_accepted_once(
+    database_url: str,
+) -> None:
+    """Migration 0021 moved the digest of a request whose bytes did not change.
+
+    `_request_digest` hashes the whole `ObserveRequest`, so removing a field from it changed the
+    digest while `Observation.idempotency_key` -- which hashes only device, boot and sequence --
+    stayed stable. A device retrying an observation the server already accepted therefore failed
+    the digest comparison and got a conflict forever, for a byte-identical resend. This drives
+    the real store: a NULL digest is accepted once and written back, so the very next genuinely
+    different body for that sequence is refused again rather than the guard being dropped.
+    """
+    store = PostgresMemoryStore(database_url, max_pool_size=2)
+    await store.open()
+    try:
+        first = await store.write_observation(
+            _stale_digest_batch(),
+            idempotency_key="stale_digest_first",
+            content_digest=f"{0xA:064x}",
+        )
+        assert first.created is True
+
+        # Exactly what migration 0025 does to a row the retired recipe digested.
+        connection = await AsyncConnection.connect(database_url, autocommit=True)
+        async with connection:
+            await connection.execute(
+                "UPDATE observations SET content_digest = NULL WHERE observation_id = %s",
+                (STALE_DIGEST_OBSERVATION,),
+            )
+
+        resend = await store.write_observation(
+            _stale_digest_batch(),
+            idempotency_key="stale_digest_resent",
+            content_digest=f"{0xB:064x}",
+        )
+        assert resend.created is False
+        assert resend.observation.observation_id == STALE_DIGEST_OBSERVATION
+
+        with pytest.raises(IdempotencyConflictError, match="different observation content"):
+            await store.write_observation(
+                _stale_digest_batch(),
+                idempotency_key="stale_digest_third",
+                content_digest=f"{0xC:064x}",
+            )
+    finally:
+        await store.close()
+
+
+STALE_DIGEST_TENANT = TenantId("tenant_stale_digest")
+STALE_DIGEST_OBSERVATION = ObservationId("observation_stale_digest")
+
+
+def _stale_digest_batch() -> ObservationBatch:
+    media_object_id = MediaObjectId("media_stale_digest")
+    return ObservationBatch(
+        media_objects=(
+            MediaObject(
+                media_object_id=media_object_id,
+                tenant_id=STALE_DIGEST_TENANT,
+                kind=MediaKind.VIDEO,
+                uri="s3://memory/tenants/tenant_stale_digest/clip.mp4",
+                sha256=f"{9:064x}",
+                size_bytes=100,
+                created_at=NOW,
+                duration_ms=4_000,
+            ),
+        ),
+        observation=Observation(
+            observation_id=STALE_DIGEST_OBSERVATION,
+            tenant_id=STALE_DIGEST_TENANT,
+            device_id=DeviceId("device_01"),
+            boot_id="boot_01",
+            sequence=1,
+            sensor=SensorKind.CAMERA,
+            media_object_ids=(media_object_id,),
+            occurred_at=NOW,
+            ended_at=NOW + timedelta(seconds=4),
+            observed_at=NOW,
+            clock_offset_ms=0,
+        ),
+        evidence_spans=(),
+    )
+
+
+async def test_the_runtime_role_can_read_the_migration_ledger(database_url: str) -> None:
+    """The re-key bound reads `schema_migrations`, and the runtime role is not the owner.
+
+    Migration 0005 grants per-table access only to tables carrying a `tenant_id`, and this one
+    has none, so `write_embedding_on_connection` would fail with "permission denied for table
+    schema_migrations" in any deployment while every test here passed -- the fixture connects
+    as the owner. That is the gap this asserts against, so it switches role explicitly.
+    """
+    connection = await AsyncConnection.connect(database_url, autocommit=True)
+    async with connection:
+        await connection.execute("SET ROLE mindbridge_runtime")
+        row = await (
+            await connection.execute("SELECT applied_at FROM schema_migrations WHERE version = 21")
+        ).fetchone()
+        await connection.execute("RESET ROLE")
+
+    assert row is not None
 
 
 async def test_postgres_vertical_path_is_idempotent_and_evidence_first(

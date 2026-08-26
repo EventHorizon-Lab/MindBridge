@@ -37,6 +37,7 @@ from mindbridge.core import (
     SensorKind,
     VerificationStatus,
     media_kind_for_suffix,
+    without_retired_fields,
 )
 
 NonEmptyString = Annotated[
@@ -65,6 +66,22 @@ class ContractModel(BaseModel):
     """Strict immutable base shared by every external contract."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _ignore_retired_fields(cls, data: object) -> object:
+        """Accept a payload from a writer that predates migration 0021.
+
+        `extra="forbid"` makes removing a field from a request contract as breaking as
+        adding a required one, and neither this API's path nor its schema snapshot
+        expresses a version. The edge package ships and upgrades independently of the
+        server, and in a rolling upgrade the server goes first, so a device still on the
+        previous release posts `identity_observations[].model_revision` to an upgraded
+        `/v1/observe`. It also re-reads its own spooled `ObserveRequest` payloads, which
+        were serialized by that same release. The field is gone because nothing reads it,
+        which is exactly why ignoring it is right and 422 is not.
+        """
+        return without_retired_fields(data, cls.model_fields)
 
 
 class MediaObjectInput(ContractModel):

@@ -45,8 +45,9 @@ uv sync --extra server
 docker compose up -d postgres redis
 ```
 
-The compose file pins `pgvector/pgvector:0.8.2-pg18-trixie`. Filtered recall relies on pgvector
-iterative scans, so 0.8 or newer is a hard requirement rather than a preference.
+The compose file pins `pgvector/pgvector:0.8.2-pg18-trixie`, the development version exercised
+by CI and the migrations. Current retrieval scans vectors exactly within one tenant; migration
+`0018` records when and how to restore HNSW for a tenant large enough to need it.
 
 ## 3. Apply the migrations
 

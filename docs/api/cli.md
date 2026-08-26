@@ -18,8 +18,8 @@ uv run --extra server mindbridge lifecycle --help
 | Command | Subcommands |
 | --- | --- |
 | `mindbridge` | `config check`, `consolidate`, `jobs`, `lifecycle`, `mcp`, `jina serve`, `edge sync` |
-| `mindbridge-bench` | `locomo-refined`, `m3`, `egolife`, `egomem`, `egotempo`, `memlens`, `mm-lifelong`, `supermemory`, `video-mme`, `aml` |
-| `mindbridge-bench` support | `score`, `datasets`, `jina`, `bakeoff` |
+| `mindbridge-bench` | `locomo-refined`, `m3`, `egolife`, `egomem`, `egotempo`, `memlens`, `mm-lifelong`, `atm`, `mem-gallery`, `supermemory`, `video-mme`, `video-mme-v2`, `aml` |
+| `mindbridge-bench` support | `eval`, `score`, `datasets`, `jina`, `bakeoff` |
 
 `mindbridge-consolidate`, `mindbridge-lifecycle`, and `mindbridge-mcp` remain as aliases for the
 subcommands of the same name. They route through the same module and report the same codes.
@@ -221,14 +221,17 @@ command requires a role that can see every tenant.
 }
 ```
 
-`queue` is the queue the worker actually consumes, `task_default_queue` — **`mindbridge`, not
+`queue` names the queue family the worker consumes, `task_default_queue` — **`mindbridge`, not
 `celery`**. Looking at the wrong queue is how one investigation concluded the queue had been
-destroyed.
+destroyed. Observations are published across a shard set (`mindbridge` plus `mindbridge.0` …
+`mindbridge.7`), all of which a worker started **without `-Q`** consumes; `queue_depth` is the
+sum across the whole set, so it will not match `LLEN mindbridge` on its own.
 
-`queue_depth` is read *before* any repair, so it describes what was found. It matters for
-interpreting a repair rather than just recording one: kombu publishes with `LPUSH` and consumes
-with `RPOP`, so a republished job waits behind every message already queued. Six republishes of
-one job across 84 minutes moved its attempt count not at all, for exactly that reason.
+`queue_depth` is read *before* any repair, so it describes what was found, and `withheld` below
+is decided against that pre-repair number. A republished job no longer waits behind the backlog:
+repair publishes at the priority the transport drains first, so it is served ahead of fresh work
+on every shard. Before that split, six republishes of one job across 84 minutes moved its attempt
+count not at all, because every one of them landed behind the same backlog.
 
 `withheld` is how many claimable rows the repair treated as already carried by the queue:
 `min(claimable, queue_depth)` across the ledger, and `0` under `--tenant-id`. `claimable - withheld`
@@ -253,7 +256,7 @@ Four things worth knowing before acting on those numbers:
 - **Both include the interval still open.** A pending job's wait so far, and a running job's work
   so far. Without that, the tenant holding a worker *right now* would contribute nothing to the
   column the report is sorted by.
-- **An abandoned attempt stops accruing at the stale window** (960 s), whether it is still open
+- **An abandoned attempt stops accruing at the stale window** (2 400 s), whether it is still open
   or has been reclaimed. Past it the claim treats the row as reclaimable, so whatever held it is
   gone; charging it forever would sort every live tenant below a worker that died. The reclaim
   charges it to `work_seconds` alone — an abandoned attempt was running, not queued.
@@ -400,19 +403,72 @@ uv run mindbridge-bench
 | `egotempo` | — | EgoTempo |
 | `memlens` | — | MemLens |
 | `mm-lifelong` | — | MM-Lifelong |
+| `atm` | — | ATM-Bench |
+| `mem-gallery` | — | Mem-Gallery |
 | `supermemory` | — | SuperMemory VQA |
 | `video-mme` | `benchmarks` | Video-MME |
+| `video-mme-v2` | `benchmarks` | Video-MME-v2 |
 | `aml` | — | Agent Memory Leaderboard offline replay |
 
 | Support command | Extra | Purpose |
 | --- | --- | --- |
+| `eval` | `benchmarks` | Run one or more of the runners above by name, downloading what they read. |
 | `score` | — | Record an official scorer's verdict beside a run. |
 | `datasets` | `benchmarks` | Check every official release parses and pins its digest. |
 | `jina` | `cloud-models` | Check the local Jina Omni embedder answers. |
-| `bakeoff` | — | Compare candidate adapters on one prepared corpus. |
+| `bakeoff` | `cloud-models` | Compare candidate adapters on one prepared corpus. |
 
 Runners drive the production REST API. There is no evaluation-only path, which is the point: a
 benchmark that bypasses the product measures something the product does not do.
+
+Every benchmark runner above accepts `--limit N` to run only the first N of its own units, and
+`--predict-only` to write predictions without scoring them — no judge is contacted and every
+declared metric reports `999`, lmms-eval's bypass sentinel. `aml` is a replay rather than a
+benchmark and takes neither.
+
+`--limit` bounds the units answered, and for the two benchmarks whose corpus is one shared
+archive per tenant rather than one per unit it narrows the archive with them: ATM-Bench ingests
+only the items its selected questions cite, including the distractors the release declares for
+each, and MM-Lifelong only the timeline segments those questions localize into. Without the flag
+both ingest everything, unchanged. A limited run's manifest records the smaller `email_count`,
+`media_item_count` or `segment_count`, which is what says its numbers came from a scoped corpus
+and are not a benchmark result.
+
+Seven benchmarks score their own free-text answers by calling a judge model from inside the run,
+which needs `MINDBRIDGE_BENCH_JUDGE_ENDPOINT` set; a judge that cannot be read scores the answer
+`0.0`. See [benchmarking](../benchmarking.md#scoring-and-what-copying-lmms-eval-costs).
+
+`eval` runs one or more runners in one invocation. `--tasks` names entries in a shipped catalog
+and each official release is downloaded at a pinned revision if absent, so the common case needs
+neither a file to write nor a corpus to populate first:
+
+```bash
+uv run --extra benchmarks mindbridge-bench eval --tasks released-text --limit 2
+```
+
+```bash
+uv run --extra benchmarks mindbridge-bench eval --list-tasks
+```
+
+The task names are the only thing with no default; `--run-id` falls back to `sweep-<UTC
+timestamp>`. Pass it explicitly for any task reading a prepared-media manifest you staged
+yourself: the manifest's object URIs are only readable under the tenant its run ID derives, so
+that ID has to be the one you staged for. Downloads are pinned to a commit and, where the smoke
+manifest names a digest for them, verified against
+`benchmarks/manifests/dataset-adapters-smoke.json`; prepared-media manifests are the one input no
+release supplies.
+
+`--suite FILE` is the escape hatch for a task the catalog does not name — a JSON file of
+`{"tasks": [{"name": ..., "benchmark": ..., "arguments": [...]}]}`, validated exactly as strictly
+as a catalog entry, with `--tasks` narrowing it. Nothing is downloaded for a suite file, because
+its paths are literal and guessing which of a task's arguments are files is how a tool starts
+fetching a `--split` value. The sweep gives each task a directory of its own under `--output-dir` and
+derives its `--run-id`, so two parameterisations of one benchmark cannot share a tenant. It
+continues past a task that fails, records every outcome in `suite-summary.json`, and prints a
+results table on stdout naming, per task, the numbers its manifest and score sidecar carry and
+which of the two each came from. `--report DIR` prints that table again for a directory an
+earlier run wrote, which is how a benchmark scored afterwards gets its numbers on screen. See
+[benchmarking](../benchmarking.md#running-several-benchmarks-in-one-command).
 
 See [benchmarking](../benchmarking.md) for datasets, protocol, and what the numbers license you
 to claim.

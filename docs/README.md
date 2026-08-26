@@ -4,7 +4,8 @@ Start with the path that matches what you are doing.
 
 ## I want to try it
 
-1. [Quickstart](quickstart.md) — a local stack answering recalls in about fifteen minutes.
+1. [Quickstart](quickstart.md) — a local stack answering recalls once its model and object-store
+   dependencies are available.
 2. [Concepts](concepts.md) — what an Observation, Event, Claim, and Memory each are.
 3. [Python SDK](api/python-sdk.md) — the client you will actually write against.
 
@@ -34,7 +35,7 @@ Start with the path that matches what you are doing.
 | --- | --- |
 | [Contributing](../CONTRIBUTING.md) | Setup, quality gates, review standards. |
 | [Architecture](architecture.md) | Code layout, write and read paths, boundaries. |
-| [Technical architecture](technical-architecture.md) | The full design specification (Chinese). |
+| [Technical architecture](technical-architecture.md) | Architecture decisions and implementation roadmap (Chinese). |
 | [Plugin architecture](plugin-architecture.md) | Writing a generator or embedder adapter. |
 | [AGENTS.md](../AGENTS.md) | Repository conventions, for people and agents alike. |
 
@@ -51,9 +52,22 @@ Read [the stance](benchmarking.md#the-stance) before quoting any number.
 ## Reference
 
 - [System architecture diagram](architecture-diagram.html)
-- [Design specifications](superpowers/specs/) and [implementation plans](superpowers/plans/)
+- [Design specifications](superpowers/specs/) and [implementation plans](superpowers/plans/) —
+  historical snapshots; their commands and constraints may no longer describe `master`.
 - [Security policy](../SECURITY.md)
 - [Changelog](../CHANGELOG.md)
+
+## Sources of truth
+
+Use the narrowest current source for the question:
+
+- Public request, response, and error shapes come from `mindbridge.contracts`, the generated
+  OpenAPI document, and the MCP contract snapshots.
+- Executable commands and defaults come from each command's `--help`.
+- Runtime behavior and deployment requirements come from [Architecture](architecture.md),
+  [Configuration](configuration.md), and [Deployment](deployment.md).
+- [Technical architecture](technical-architecture.md) records decisions, measured rationale, and
+  roadmap items. Its phase tables distinguish shipped behavior from target design.
 
 ## Conventions in these documents
 

@@ -25,9 +25,11 @@ from mindbridge.benchmarks.cli_common import (
     media_arguments,
     media_manifest,
     report,
+    scoring_snapshot,
     select_by_id,
     write_run_artifacts,
 )
+from mindbridge.benchmarks.scoring import require_scoring_is_possible
 from mindbridge.benchmarks.supermemory_runner import (
     SuperMemoryMetrics,
     SuperMemoryPreparedSubject,
@@ -78,8 +80,10 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
         load_supermemory_vqa(arguments.dataset_path),
         arguments.subject,
         arguments.question_ids,
+        arguments.limit,
     )
     prepared = load_prepared_supermemory(arguments.prepared_media_path)
+    require_scoring_is_possible("supermemory", predict_only=arguments.predict_only)
     require_writable_output_pair(arguments.output_path, overwrite=arguments.overwrite)
     deployment = load_deployment_snapshot(
         arguments.deployment_config_path,
@@ -138,10 +142,21 @@ def _write_artifacts(
         )
         + "\n"
     )
+    scoring = scoring_snapshot(
+        "supermemory",
+        arguments,
+        metrics={
+            "qa_accuracy": metrics.qa_accuracy,
+            "qa_mean_reciprocal_rank": metrics.qa_mean_reciprocal_rank,
+            "answerability_precision": metrics.answerability_precision,
+            "answerability_recall": metrics.answerability_recall,
+        },
+    )
     manifest = media_manifest(
         SuperMemoryRunManifest,
         arguments,
         deployment,
+        scoring=scoring,
         runner_version=SUPERMEMORY_RUNNER_VERSION,
         adapter_version=SUPERMEMORY_VQA_ADAPTER_VERSION,
         annotation_sha256=sha256_file(arguments.dataset_path),
@@ -164,6 +179,7 @@ def _select_questions(
     questions: tuple[SuperMemoryQuestion, ...],
     subject: int,
     question_ids: tuple[int, ...],
+    limit: int | None,
 ) -> tuple[SuperMemoryQuestion, ...]:
     if subject <= 0:
         raise ValueError("subject must be positive")
@@ -172,6 +188,7 @@ def _select_questions(
         question_ids,
         key=lambda question: question.question_id,
         label=f"SuperMemory-VQA subject {subject} question IDs",
+        limit=limit,
     )
     if not selected:
         raise ValueError(f"SuperMemory-VQA subject {subject} has no selected questions")

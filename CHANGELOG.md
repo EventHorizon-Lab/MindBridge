@@ -51,8 +51,24 @@ The capabilities present on `master` today:
   durable outbox, and offline recall.
 - OpenTelemetry across REST, model calls, PostgreSQL, S3, and queued jobs, capturing no user
   content.
-- Benchmark harness driving the production API across nine official datasets plus the Agent
-  Memory Leaderboard offline replay.
+- Benchmark harness driving the production API across twelve official datasets plus the Agent
+  Memory Leaderboard offline replay. `mindbridge-bench eval --tasks a,b,c` runs several of them
+  from one invocation against one deployment, from a shipped task catalog rather than a file you
+  write, downloading each official release it needs at a pinned revision and verifying it against
+  a committed digest. Task names are the only argument with no default. Each task writes into a
+  directory of its own, and the sweep ends by printing a results table naming, per task, the
+  numbers its manifest and score sidecar carry and which of the two each came from; `--report DIR`
+  prints it again for an earlier run, which is how a benchmark scored afterwards reports without
+  running twice. `--limit N` scopes any runner to its first N units for a smoke run, the media
+  ingest deadlines reach every task whose runner accepts them, and prepared-media manifests are
+  produced for Mem-Gallery and M3-Bench rather than assembled by hand. Scoring follows
+  lmms-eval's contract: each benchmark declares who scores it, the four whose protocol is exact
+  match score themselves, the seven whose answers are free text are judged by a model called from
+  inside the run, and `--predict-only` reports the `999` bypass sentinel instead. A judge that
+  cannot be read scores the answer `0.0` — upstream's behaviour — with the count of floored
+  answers recorded beside the number and printed under the table. A judged benchmark with no
+  `MINDBRIDGE_BENCH_JUDGE_ENDPOINT` is refused before it ingests anything, not after, because a
+  judged run that finishes and then cannot score writes no predictions at all.
 - Python 3.10 through 3.14, with the whole quality gate — format, lint, types, tests — run on
   every one of them.
 
@@ -65,14 +81,44 @@ Called out on their own because these are the changes that cost an operator real
   and both embedding-space indexes without those columns, deletes the later of any two vectors that
   differed only by revision, and strips the retired key from stored identity spans.
 - **Removed environment variables:** `MINDBRIDGE_GENERATOR_MODEL_REVISION`, which was *required*,
-  plus the optional `MINDBRIDGE_EMBEDDER_MODEL_REVISION`,
-  `MINDBRIDGE_MEDIA_EMBEDDER_MODEL_REVISION`, and `MINDBRIDGE_EMBEDDING_SPACE_REVISION`. A
-  `*_CONFIG_JSON` object still naming `model_revision` or `space_revision` fails startup rather
-  than ignoring the key.
-- **`POST /v1/observations` no longer accepts `model_revision`** inside `identity_observations`,
-  and the same field is gone from the `observe` MCP tool. It was a required field, and unknown
-  fields are rejected, so a device still sending it now gets `request_validation_failed` — upgrade
-  the edge alongside the server.
+  plus the optional `MINDBRIDGE_EMBEDDER_MODEL_REVISION` and
+  `MINDBRIDGE_EMBEDDING_SPACE_REVISION`.
+- **`MINDBRIDGE_MEDIA_EMBEDDER_MODEL_REVISION` is back**, optional, and it is the one of these
+  names that was not merely a record: it pins the commit the local Jina encoder downloads and
+  therefore which remote code executes under `trust_remote_code=True`. Unset, the pin is resolved
+  from the model id — the bundled commit for the bundled repository, and nothing for a repository
+  you named yourself, which that commit could not resolve against. Change it and change
+  `MINDBRIDGE_EMBEDDING_SPACE_ID` with it; nothing else can see that the encoder moved.
+- **A `*_CONFIG_JSON` object naming a retired name no longer fails startup.** `model_revision`,
+  `space_revision`, and `association_model_revision` are ignored where the plugin does not declare
+  them; every other unrecognized key still fails the factory. Where a plugin does declare one — the
+  local Jina encoder's `model_revision` — the operator's value is kept rather than defaulted.
+- **`POST /v1/observations` accepts and ignores `model_revision`** inside `identity_observations`,
+  and so does the `observe` MCP tool, so a rolling upgrade that moves the server first does not
+  422 the fleet behind it. Removing a field is not the same as forbidding it. Any *other* unknown
+  field is still `request_validation_failed`.
+- **Migration `0025`** widens the `embeddings` unique key with `space_id`, clears `observe`
+  idempotency claims and identity-bearing observation digests recorded before `0021` (both were
+  digested by a recipe that no longer exists, so a byte-identical resend could never match again;
+  the reprocess is idempotent), makes `observations.content_digest` nullable, and grants
+  `mindbridge_runtime` SELECT on `schema_migrations`. No manual step. Necessary but not
+  sufficient for re-embedding into a second space — see `0026`, which supplies the rest.
+- **Migration `0027`** adds `embeddings.object_part` and widens the vectors unique key with it,
+  so an object embedded in pieces gets one row per piece. An evidence span longer than the
+  encoder's audio window is cut into several clips of different sound; all of them share one
+  `object_id`, because `recall` reads that column back as an `EvidenceId`, so the second clip
+  used to conflict with the first, be read as content drift, and raise **inside the single
+  transaction that commits an observation's derived records** — one long audio span cost the
+  whole observation, events and claims and memories included, not just its own vector. No manual
+  step and no re-encode: `embedding_id` already hashed the clip ordinal, so no ID changes.
+- **Migration `0026`** adds `embeddings.embedding_id_recipe`, recording which recipe derived each
+  stored `embedding_id`. `embedding_id` now hashes `space_id` in every recipe, and that is what
+  makes re-embedding into a second space actually work for claims, events, entities, evidence
+  spans and consolidated summaries rather than only for memory records: the table is also keyed
+  by `embedding_id`, so widening the unique key alone left the second vector colliding on the
+  primary key. No manual step — the first write to touch a row an older recipe named re-keys it
+  in place, so the first pass after this migration pays one re-encode per object it has not yet
+  seen under its new name. Memory-record vectors keep the IDs they already have.
 
 ### Known gaps
 
@@ -80,7 +126,8 @@ Called out on their own because these are the changes that cost an operator real
   [benchmarking](docs/benchmarking.md#current-baseline-status).
 - No per-tenant quotas or rate limiting.
 - No automatic re-embedding when embedding space or dimension changes.
-- Retrieval does not traverse `same_as` entity edges yet.
+- Retrieval follows direct `same_as` entity aliases but deliberately does not compute transitive
+  closure.
 - Storage schema compatibility is not guaranteed across migrations.
 
 ---

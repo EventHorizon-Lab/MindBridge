@@ -34,6 +34,8 @@ fails to start rather than failing one call an hour later.
 | `MINDBRIDGE_MEDIA_SAMPLING_CONFIG_JSON` | file | | | ○ | | | |
 | `MINDBRIDGE_WORKER_CONCURRENCY` | file | | | ○ | | | |
 | `MINDBRIDGE_WORKER_VRAM_BUDGET_GIB` | file | | | ○ | | | |
+| `MINDBRIDGE_CONSOLIDATION_TENANT_IDS` | file | | | ○ | | | |
+| `MINDBRIDGE_CONSOLIDATION_INTERVAL_SECONDS` | file | | | ○ | | | |
 | `MINDBRIDGE_TENANT_API_KEYS_JSON` | env | ● | | | | | |
 | `MINDBRIDGE_API_KEY` | env | | | | | | ● |
 | `MINDBRIDGE_AML_*` | both | ○ | | | | | |
@@ -164,6 +166,14 @@ allowance for the encoding and graph write after the model call. Raising it is h
 a slow generator moves both deadlines at once. See
 [deployment](deployment.md#how-long-one-observation-may-take).
 
+**It has a ceiling of 1920 seconds, and the worker refuses to start above it.** One delivery may
+stay alive for this timeout plus 480 seconds — the 300-second post-model allowance, the 60-second
+hard-limit margin, and the 120 seconds the broker waits before re-delivering — and the job
+ledger's stale-claim window is a fixed 2400. Past the ceiling the two disagree about the same
+attempt: the delivery is still paying for its model call while the ledger already treats the row
+as reclaimable, so a concurrent delivery or one `mindbridge jobs --republish` buys the same
+observation twice. The boot failure names the largest value that fits.
+
 ### Shared embedder
 
 | Variable | Required | Default |
@@ -192,12 +202,25 @@ export MINDBRIDGE_MEDIA_EMBEDDER_PLUGIN=openai
 | Variable | Required | Default |
 | --- | --- | --- |
 | `MINDBRIDGE_MEDIA_EMBEDDER_MODEL_ID` | no | `jinaai/jina-embeddings-v5-omni-small-retrieval` |
+| `MINDBRIDGE_MEDIA_EMBEDDER_MODEL_REVISION` | no | `12949877f0092093f366c6450340011320152a05` |
 | `MINDBRIDGE_MEDIA_EMBEDDER_DEVICE` | no | automatic selection |
 | `MINDBRIDGE_WORKER_VRAM_BUDGET_GIB` | no | `3.7` — one model copy per child |
 
 These variables are read only when a `MINDBRIDGE_MEDIA_EMBEDDER_*` override is present. Setting
 `MINDBRIDGE_MEDIA_EMBEDDER_PLUGIN=jina` opts the worker into loading a second, local
 SentenceTransformers model. Without that explicit override, media inherits the shared endpoint.
+
+`MODEL_REVISION` is the upstream commit this plugin downloads and, because it loads with
+`trust_remote_code=True`, the commit whose Python it executes. It is a loader argument rather
+than a record: the Hub resolves it against a content-addressed commit, so unset it and a worker
+restart silently picks up whatever is on the repository's default branch — new weights and new
+code, with no configuration change. Only the in-process plugin takes it. The endpoint-backed
+plugin talks to a server that resolves its own model, so there is nothing for MindBridge to pin.
+
+Changing this value is a deliberate act, and it needs `MINDBRIDGE_EMBEDDING_SPACE_ID` changed
+with it. Vectors are comparable only within a space, `SPACE_ID` is what declares that
+boundary, and it does not vary with the checkout — so a new revision written under the old
+`SPACE_ID` puts two encoders' output in one cosine search with nothing able to report it.
 
 An explicit `DEVICE` that is unavailable fails rather than silently falling back to CPU.
 
@@ -206,9 +229,10 @@ The in-process plugin costs **3.7 GiB of resident weights per prefork child** on
 pool of more than one child would hold more than `MINDBRIDGE_WORKER_VRAM_BUDGET_GIB`, while either
 embedder slot names `jina`, because a prefork child holds its own copy of the model and
 `--max-memory-per-child` cannot bound VRAM. The pool size is whichever of `--concurrency` and
-`--autoscale` is larger; a pool that shares one process (`--pool=threads`, `solo`) holds one copy
-however wide it runs, and `MINDBRIDGE_MEDIA_EMBEDDER_DEVICE=cpu` holds no VRAM at all, so neither
-is refused.
+`--autoscale` is larger. Only `prefork` and `solo` are supported: `solo` holds one copy,
+while thread and greenlet pools are refused because the worker runtime owns one synchronous event
+loop per process. `MINDBRIDGE_MEDIA_EMBEDDER_DEVICE=cpu` holds no VRAM and is exempt from the
+device-memory calculation.
 
 `MINDBRIDGE_WORKER_VRAM_BUDGET_GIB` defaults to **3.7 GiB, one model copy per child**, which is
 what keeps a second resident copy a decision rather than an accident. Raise it on a card that can
@@ -259,7 +283,8 @@ ever gains.
 
 Configs are validated with `extra="forbid"`. An unrecognized key fails startup rather than being
 ignored, which is the difference between "that setting had no effect" and "that setting was
-never applied and nobody noticed".
+never applied and nobody noticed". The three names migration `0021` retired are the one closed
+exception, described in [plugin-architecture.md](plugin-architecture.md).
 
 Anthropic, Gemini, local runtimes, and experimental adapters need no OpenAI-specific variables —
 set the plugin name and provide its JSON. See [plugin-architecture.md](plugin-architecture.md).
@@ -286,12 +311,40 @@ value.
 non-antipodal candidate and lets fusion and the answer stage do the filtering, which is usually
 right: a similarity floor discards candidates a graph hop or a lexical match would have rescued.
 
+**What raising it buys.** At 0.0 a recall returns exactly `limit` memories whenever the tenant
+holds at least that many, so it has no way to report "I hold nothing about this" — it reports the
+`limit` least dissimilar rows instead. Raising the floor lets recall return fewer rows, and zero
+rows, and an empty recall abstains rather than answering from whatever came back. That is a
+change in what the system can express, not a ranking improvement: on a nine-benchmark evaluation
+a retrieval hit did not predict answer correctness on three of the corpora, so do not expect a
+floor to raise accuracy by putting better rows in the page.
+
+**Where it helps, and where it does not.** Long-horizon, sparsely-covered corpora — hours or days
+of footage where most of the store is unrelated to any one question — are the shape where the
+`limit` least dissimilar rows are actively misleading. On densely covered corpora, where almost
+everything retrieved is at least on topic, a floor only removes candidates fusion was already
+ordering correctly. Leave it at 0.0 unless you have measured your deployment in the first shape,
+and change it one deployment at a time: there is no value that is right for both.
+
+**It only binds the dense channel.** The floor is applied to every vector search. The full-text
+channel fused beside them has no floor of its own — it matches on the query's lexemes ORed
+together plus a substring test, neither of which produces a similarity to compare — so a floored
+text query returns what the vector searches admitted *plus* whatever shares a word with the
+question. A media-only query has no full-text channel and is bounded by the floor alone.
+
 **Startup probe.** The API probes every tenant in `MINDBRIDGE_TENANT_API_KEYS_JSON` and refuses
 to serve when one holds vectors the configured space cannot reach. Pointing a deployment at a new
 embedder without re-embedding therefore fails loudly instead of returning empty recalls. The
 probe reports each stranded object type separately, so memory records the server wrote itself
 cannot vouch for evidence, events, and claims the worker wrote in another space. Vectors in
-several spaces are accepted while a re-embedding is in progress.
+several spaces are accepted while a re-embedding is in progress, for every object type: an
+`embedding_id` hashes the space it was produced for, so one object holds one vector per space
+rather than colliding on the primary key. One object may also hold several vectors within one
+space, where it is embedded in pieces rather than whole — an evidence span longer than the
+encoder's audio window is cut into clips, and migration `0027` gives each its own row. Migration `0026` records which recipe derived each
+stored ID, and the first write to touch a row an older recipe named re-keys it in place — so the
+first pass after that migration pays for one re-encode per object it has not seen under its new
+name, and every pass after it does not.
 
 The stdio MCP process has no configured tenant list and therefore cannot run this probe.
 
@@ -406,6 +459,36 @@ Each child also opens its own database pool, so `MINDBRIDGE_DATABASE_MAX_POOL_SI
 per-child ceiling here, not a per-deployment one. Values outside 1–32, and anything that is not
 an integer, fail startup rather than being clamped.
 
+## Built-in consolidation schedule
+
+| Variable | File key | Required | Default |
+| --- | --- | --- | --- |
+| `MINDBRIDGE_CONSOLIDATION_TENANT_IDS` | `[consolidation] tenant_ids` | no | unset — no schedule is registered at all |
+| `MINDBRIDGE_CONSOLIDATION_INTERVAL_SECONDS` | `[consolidation] interval_seconds` | no | `3600` |
+
+Neither is a credential, so both belong in `mindbridge.toml` and the environment overrides it:
+
+```toml
+[consolidation]
+tenant_ids = "tenant_01,tenant_02"
+interval_seconds = 3600
+```
+
+Read by `celery -A mindbridge.celery_app:app beat` and by the worker that consumes
+`mindbridge_consolidation`; both processes need the same tenant list, because beat's ticks address
+whichever list the worker was given. Leaving `TENANT_IDS` unset registers no schedule and no task,
+so a deployment that has not opted in runs exactly the worker it ran before.
+
+One tick sweeps **one** tenant, chosen by rotation, so the interval is a ceiling on
+consolidation's entire share of the generator rather than a per-tenant cadence — adding tenants
+lengthens the rotation instead of raising load. Scheduled sweeps skip entity resolution, which is
+the only sweep that opens media and spends a generator call per candidate pair; run that from the
+CLI on its own cadence.
+
+Tenants are enumerated from this variable rather than discovered: a tenant that is created and not
+added here silently stops consolidating. See
+[operations](operations.md#built-in-consolidation-schedule).
+
 ## Logs and timings
 
 Every process writes structured logs to stderr. This is unconditional and needs no collector:
@@ -468,6 +551,9 @@ text, or media.
 | --- | --- | --- |
 | `MINDBRIDGE_AML_API_KEY` | unset | Enables `POST /aml/add` and `/aml/search`. Leave off in production. |
 | `MINDBRIDGE_AML_TENANT_PREFIX` | `bench_aml` | Tenant prefix the AML harness generates under. |
+| `MINDBRIDGE_BENCH_JUDGE_ENDPOINT` | unset | OpenAI-compatible endpoint the judge is called on. Required by the seven benchmarks whose answers are free text; `--predict-only` runs them without one. |
+| `MINDBRIDGE_BENCH_JUDGE_API_KEY` | unset | Bearer token for that endpoint. Environment-only, so a recorded invocation never carries it. |
+| `MINDBRIDGE_BENCH_JUDGE_MODEL` | `gpt-4o-2024-11-20` | Judge model, defaulting to the one lmms-eval's MM-Vet task uses. Recorded in every manifest it scores: two runs under different judges are not comparable. |
 
 ## Development and test
 

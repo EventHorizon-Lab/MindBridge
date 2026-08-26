@@ -45,6 +45,16 @@ benchmarks = [
     # own modules rather than a missing model dependency.
     "opentelemetry-api>=1.44,<2",
     "pyarrow>=18,<26",
+    # benchmarks/releases.py downloads the Hub half of the official releases through
+    # snapshot_download. Imported lazily, so a harness with the corpora already on disk still
+    # runs without it; declared here because the import is this subtree's own.
+    "huggingface-hub>=0.30,<2",
+    # benchmarks/prepare.py stages the clips it cuts into the deployment's own bucket. Both are
+    # lazy imports reached only when a task's prepared media has to be produced.
+    "boto3>=1.40,<2",
+    # It cuts them with mindbridge.media.clipping, the encoder the product stores evidence with,
+    # rather than a second one that would drift from it.
+    "mindbridge[media]",
 ]
 edge = [
     "boto3>=1.40,<2",
@@ -189,6 +199,10 @@ module = [
     # ModelUnavailableError without them; its tests skip rather than fail collection.
     "av",
     "av.*",
+    # Same shape one extra over: the quality matrix installs `media` and `server`, not
+    # `benchmarks`, so the Hub client benchmarks/releases.py downloads releases with is absent
+    # while every leg still type-checks the module that imports it.
+    "huggingface_hub",
     "numpy",
     "PIL",
     "PIL.*",

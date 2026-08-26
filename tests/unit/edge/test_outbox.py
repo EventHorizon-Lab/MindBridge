@@ -1,5 +1,6 @@
 """Durability and idempotency checks for the Jetson SQLite outbox."""
 
+import json
 import sqlite3
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
@@ -8,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from mindbridge.contracts import (
+    IdentityObservationInput,
     MediaObjectInput,
     ObservationReceipt,
     ObservationStatus,
@@ -15,6 +17,7 @@ from mindbridge.contracts import (
 )
 from mindbridge.core import (
     IdempotencyConflictError,
+    IdentityKind,
     MediaKind,
     MemoryIntegrityError,
     SensorKind,
@@ -159,6 +162,55 @@ def test_polled_processing_job_yields_to_unpolled_work(tmp_path: Path) -> None:
 
     assert first.processing_job_id == "job_01"
     assert outbox.pending_processing_jobs(limit=1)[0].processing_job_id == "job_02"
+
+
+def test_a_device_upgraded_with_a_stale_spooled_payload_can_still_open_its_outbox(
+    tmp_path: Path,
+) -> None:
+    """A queued observation written before migration 0021 must not brick the device.
+
+    `_backfill_observation_media` re-parses every row from `_initialize`, so one payload
+    carrying a retired field name is not one skipped item -- it is an outbox that cannot be
+    constructed, on a device holding captures nothing else can recover. The rewrite is the
+    other half: tolerating the old shape forever would make that tolerance load-bearing for
+    the life of the device.
+    """
+    media_path = tmp_path / "clip.mp4"
+    media_path.write_bytes(b"video")
+    database_path = tmp_path / "edge.db"
+    outbox = SQLiteObservationOutbox(database_path, clock=lambda: NOW)
+    request = _request().model_copy(
+        update={
+            "identity_observations": (
+                IdentityObservationInput(
+                    identity_id="person_01",
+                    kind=IdentityKind.VOICE,
+                    start_ms=0,
+                    end_ms=1_000,
+                    confidence=0.9,
+                    model_id="iic/speech_campplus_sv_zh-cn_16k-common",
+                ),
+            )
+        }
+    )
+    assert outbox.enqueue(request, (_file(media_path),)) is True
+
+    spooled = json.loads(request.model_dump_json())
+    spooled["identity_observations"][0]["model_revision"] = "v2.0.2"
+    with closing(sqlite3.connect(database_path)) as connection:
+        connection.execute(
+            "UPDATE edge_observation_outbox SET request_json = ?", (json.dumps(spooled),)
+        )
+        connection.commit()
+
+    restarted = SQLiteObservationOutbox(database_path, clock=lambda: NOW)
+
+    item = restarted.next_pending()
+    assert item is not None
+    assert item.request == request
+    with closing(sqlite3.connect(database_path)) as connection:
+        stored = connection.execute("SELECT request_json FROM edge_observation_outbox").fetchone()
+    assert "model_revision" not in stored[0]
 
 
 def _request() -> ObserveRequest:

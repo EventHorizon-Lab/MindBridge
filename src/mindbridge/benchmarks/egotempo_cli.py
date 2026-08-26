@@ -27,6 +27,7 @@ from mindbridge.benchmarks.cli_common import (
     media_manifest,
     report,
     report_unit,
+    scoring_snapshot,
     select_by_id,
     write_run_artifacts,
 )
@@ -39,6 +40,7 @@ from mindbridge.benchmarks.egotempo import (
 )
 from mindbridge.benchmarks.prompts import EGOTEMPO_QUERY_PROMPT
 from mindbridge.benchmarks.runtime import PreparedVideo, load_prepared_videos
+from mindbridge.benchmarks.scoring import JudgedAnswer, require_scoring_is_possible
 from mindbridge.contracts import Identifier, NonEmptyString, Sha256Hex
 from mindbridge.file_integrity import sha256_file
 from mindbridge.prompts import PERCEIVE_EVENTS_PROMPT
@@ -75,8 +77,10 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
         arguments.question_ids,
         key=lambda question: question.question_id,
         label="EgoTempo question IDs",
+        limit=arguments.limit,
     )
     prepared = _select_prepared(load_prepared_videos(arguments.prepared_media_path), questions)
+    require_scoring_is_possible("egotempo", predict_only=arguments.predict_only)
     require_writable_output_pair(arguments.output_path, overwrite=arguments.overwrite)
     deployment = load_deployment_snapshot(
         arguments.deployment_config_path,
@@ -146,10 +150,18 @@ def _write_artifacts(
         + "\n"
     )
     segments = tuple(segment for video in prepared for segment in video.segments)
+    scoring = scoring_snapshot(
+        "egotempo",
+        arguments,
+        answers=tuple(
+            JudgedAnswer(row.question, row.reference_answer, row.model_answer) for row in results
+        ),
+    )
     manifest = media_manifest(
         EgoTempoRunManifest,
         arguments,
         deployment,
+        scoring=scoring,
         runner_version=EGOTEMPO_RUNNER_VERSION,
         adapter_version=EGOTEMPO_ADAPTER_VERSION,
         annotation_sha256=sha256_file(arguments.dataset_path),

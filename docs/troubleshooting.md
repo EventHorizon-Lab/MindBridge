@@ -45,9 +45,16 @@ Plugin configs use `extra="forbid"`. An unrecognized key fails startup rather th
 because "that setting had no effect" is a much worse outcome to debug than a failed boot. Check
 the key against the plugin's documented fields.
 
-After upgrading past migration `0021` the usual culprits are `model_revision` and
-`space_revision`, which no longer exist on any plugin. Delete them from your `*_CONFIG_JSON`
-objects; `model_id` and `space_id` still carry the identity they were paired with.
+Names retired by migration `0021` are the exception: `model_revision`, `space_revision`, and
+`association_model_revision` are ignored rather than refused, because removing a field is not the
+same as forbidding it and an operator's object written for the previous release still has to load.
+A typo is still a failed boot.
+
+One of those names went on meaning something, so do **not** delete it blindly. The local Jina
+encoder declares `model_revision`, where it pins the commit `snapshot_download` resolves and
+therefore which remote code runs under `trust_remote_code=True`. Dropping it from
+`MINDBRIDGE_MEDIA_EMBEDDER_CONFIG_JSON` replaces your pin with the bundled default. Delete
+`space_revision`, which nothing reads; keep `model_revision` where the local encoder is the plugin.
 
 ### `embedding dimension must be one of 32, 64, 128, 256, 512, 768, 1024`
 
@@ -97,8 +104,11 @@ searched.
 ### The similarity floor is too high
 
 `MINDBRIDGE_MINIMUM_EMBEDDING_SIMILARITY` defaults to 0.0 for good reason: a floor discards
-candidates that a graph hop or a lexical match would have rescued. If you raised it, lower it back
-and let fusion do the filtering.
+candidates that a graph hop or a lexical match would have rescued. It also binds the dense channel
+only, so a floored text query still returns whatever shares a word with the question. Lowering it
+back is the right move on a densely covered corpus and the wrong one on a long-horizon sparse
+deployment, where returning fewer rows is the point — see
+[Configuration](configuration.md) for which shape yours is.
 
 ### The memory was compressed or cooled
 
@@ -168,15 +178,16 @@ and `attempt`.
 | `object_storage_unavailable` | Media could not be read. Check the URI, credentials, and endpoint. |
 | `memory_integrity_failed` | Stored state is inconsistent. Investigate; this should be zero. |
 
-### `request_validation_failed` naming `model_revision` on observe
+### An edge device still sends `model_revision` inside `identity_observations`
 
-An edge device older than migration `0021` is still sending `model_revision` inside
-`identity_observations`. The field used to be required and is now rejected, because request
-contracts refuse unknown fields rather than dropping them silently — the alternative is a device
-believing it recorded provenance the server threw away.
+Nothing to do. A device older than migration `0021` still sends the field, and the server ignores
+it: the three names that migration retired are dropped before validation rather than refused, so a
+rolling upgrade that moves the server first does not 422 the fleet behind it. The field has no
+replacement — `model_id` alone records which edge model produced a span — so upgrading the device
+changes nothing observable and is not urgent.
 
-Upgrade the device. There is no server-side setting to accept the old shape, and the field has no
-replacement: `model_id` alone now records which edge model produced a span.
+A device sending some *other* unknown field still gets `request_validation_failed`, which is the
+strictness this exemption is deliberately narrow to preserve.
 
 ### `task_broker_unavailable` on observe
 
@@ -189,14 +200,23 @@ The task budget expired mid-model-call. A soft-limit overrun is retried as thoug
 transient, so an observation that legitimately needs longer never finishes — it repeats the same
 generator call, paying for each one, until the retries run out. Nothing is written either way.
 
-Raise `request_timeout_seconds` in `MINDBRIDGE_GENERATOR_CONFIG_JSON`; the worker's Celery limits
-are derived from it and follow automatically.
+Raise `request_timeout_seconds` in the `[generator]` section of `mindbridge.toml`; the
+worker's Celery limits are derived from it and follow automatically. A complete
+`MINDBRIDGE_GENERATOR_CONFIG_JSON` object remains available for fileless deployments.
 
 ### Jobs stay `pending`
 
-Two different causes, and they are told apart by the queue rather than by the rows.
+Three different causes, and they are told apart by the queue rather than by the rows.
 
-**The worker is not consuming.** Check it is running, points at the same
+**The worker is reading only some of the observation queues.** Observations are sharded across
+`mindbridge` and `mindbridge.0` … `mindbridge.7`, and a worker started with no `-Q` reads all of
+them. A worker narrowed to `-Q mindbridge` reads only the pre-shard queue, so everything published
+to a shard has no consumer — the publish succeeds and the row sits `pending` with nothing wrong
+anywhere. The worker now **refuses to start** in that configuration rather than running half-blind,
+so this shows up as a boot failure naming the unread queues; if you are looking at an older worker,
+drop the `-Q`.
+
+**The worker is not consuming at all.** Check it is running, points at the same
 `MINDBRIDGE_TASK_BROKER_URL`, and is installed with the extras it actually needs:
 `--extra server --extra media` at minimum. `media` carries the PyAV, Pillow, and SoundFile
 decoders that cut evidence clips, which the worker does whatever its embedder slots say — without
@@ -256,8 +276,9 @@ default `max_connections` of 100. Size it across your whole deployment, not per 
 
 ### Ingest is too expensive
 
-Frame rate sets the entire write cost: one clip cut, one encoder call, one stored object per
-sampled window. Lower `frames_per_second` in `MINDBRIDGE_MEDIA_SAMPLING_CONFIG_JSON` first.
+Frame rate sets the entire video write cost: one clip cut, one encoder call, and one stored object
+per sampled window. Lower `frames_per_second` in the `[media_sampling]` section of
+`mindbridge.toml` first.
 
 Above roughly 1.3 fps at 30-second segments, the generation proxy also stops working — past about
 forty sampled frames its encode fails on the flush that drains the encoder. Raising frame rate

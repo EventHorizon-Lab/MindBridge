@@ -8,7 +8,10 @@ import pytest
 from mindbridge.benchmarks.cli_common import (
     CoreArguments,
     connected_memory,
+    core_arguments,
+    core_parser,
     index_prepared,
+    limit_units,
     report,
     report_unit,
     select_by_id,
@@ -105,6 +108,69 @@ def test_select_by_id_reports_integer_units_in_numeric_order() -> None:
         )
 
 
+def test_limit_keeps_the_first_units_of_a_release() -> None:
+    """`--limit` is what makes a smoke run of any of these cheap enough to iterate on."""
+    items = (_Prepared("first"), _Prepared("second"), _Prepared("third"))
+
+    selected = select_by_id(items, (), key=lambda i: i.unit_id, label="units", limit=2)
+
+    assert selected == items[:2]
+
+
+def test_limit_composes_with_an_explicit_selection_rather_than_competing_with_it() -> None:
+    """Truncating after selection is what lets `--limit 1 --sample-id X --sample-id Y` mean X."""
+    items = (_Prepared("first"), _Prepared("second"), _Prepared("third"))
+
+    selected = select_by_id(
+        items, ("third", "second"), key=lambda i: i.unit_id, label="units", limit=1
+    )
+
+    assert selected == (items[1],)
+
+
+@pytest.mark.parametrize("limit", [0, -1])
+def test_a_limit_that_would_select_nothing_is_refused(limit: int) -> None:
+    """An empty selection reaches the manifest as a run of nothing rather than as a mistake."""
+    items = (_Prepared("first"),)
+
+    with pytest.raises(ValueError, match="--limit must be a positive count of units"):
+        select_by_id(items, (), key=lambda i: i.unit_id, label="units", limit=limit)
+
+
+def test_limit_units_truncates_a_set_a_benchmark_filtered_after_selecting() -> None:
+    """Video-MME filters by duration after selecting, so its limit is applied there instead.
+
+    Applied before that filter, `--limit 2 --duration long` truncates to the first two videos of
+    any band and can then keep none of them.
+    """
+    items = (_Prepared("first"), _Prepared("second"))
+
+    assert limit_units(items, None, label="units") == items
+    assert limit_units(items, 1, label="units") == items[:1]
+    with pytest.raises(ValueError, match="positive count of units"):
+        limit_units(items, 0, label="units")
+
+
+def test_the_shared_parser_carries_the_limit_through_to_every_runner() -> None:
+    """Every benchmark CLI builds on `core_parser`, so this is the wiring all twelve share."""
+    parser = core_parser(tenant_prefix="benchmark_probe")
+    required = [
+        "--dataset",
+        "release.json",
+        "--output",
+        "out.jsonl",
+        "--api-base-url",
+        "http://localhost:8000",
+        "--deployment-config",
+        "deployment.json",
+        "--run-id",
+        "probe",
+    ]
+
+    assert core_arguments(CoreArguments, parser.parse_args([*required, "--limit", "3"])).limit == 3
+    assert core_arguments(CoreArguments, parser.parse_args(required)).limit is None
+
+
 def test_index_prepared_keys_every_prepared_unit() -> None:
     prepared = (_Prepared("second"), _Prepared("first"))
 
@@ -156,7 +222,9 @@ def _arguments() -> CoreArguments:
         recall_limit=20,
         request_concurrency=4,
         request_timeout_seconds=1_800.0,
+        limit=None,
         overwrite=False,
+        predict_only=False,
         quiet=True,
     )
 

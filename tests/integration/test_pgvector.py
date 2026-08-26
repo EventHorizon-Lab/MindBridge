@@ -1,8 +1,10 @@
 """Integration checks for the versioned pgvector index."""
 
+import math
 from datetime import datetime, timezone
 
 import pytest
+from pgvector import Vector
 
 from mindbridge.application.ports import EmbeddingSearch
 from mindbridge.core import (
@@ -17,7 +19,9 @@ from mindbridge.core import (
     MemoryIntegrityError,
     ModelReference,
     TenantId,
+    derive_embedding_id,
 )
+from mindbridge.infrastructure._postgres_embeddings import write_embedding_on_connection
 from mindbridge.infrastructure._postgres_media import write_media_object
 from mindbridge.infrastructure._postgres_types import tenant_connection
 from mindbridge.infrastructure.postgres import PostgresMemoryStore
@@ -241,12 +245,18 @@ async def test_pgvector_accepts_a_reencoded_vector_only_when_the_caller_allows_i
     """
     model = ModelReference(model_id="jina")
     space = EmbeddingSpaceReference(space_id="jina-v5")
+    # Written after this database was migrated, which is what makes the last assertion below
+    # about the guard rather than about the one-time re-key: only a row predating migration
+    # 0021 can have had its ID derived by the recipe that migration changed. The session
+    # fixture applies every migration before any test body runs, so this is ordered, not raced.
+    written_after_0021 = datetime.now(timezone.utc)
     stored = _embedding_record(
         embedding_id="embedding_memory_reencode",
         object_id="memory_reencode",
         values=(1.0,) + (0.0,) * 1_023,
         model=model,
         space=space,
+        created_at=written_after_0021,
     )
     # 0.999 93 against the stored vector: the measured drift from encoding one text alone
     # versus mid-batch, and well outside the identical-replay tolerance.
@@ -281,7 +291,9 @@ async def test_pgvector_accepts_a_reencoded_vector_only_when_the_caller_allows_i
     )
     # What the flag does NOT forgive: a row whose stored embedding_id is a different
     # version. embedding_id is not part of the unique key, so this is the case where the
-    # same object really is indexed under another version, and it still refuses.
+    # same object really is indexed under another version, and it still refuses. The stored
+    # row here postdates migration 0021, so it is not eligible for the one-time re-key that
+    # heals IDs derived by the recipe 0021 changed.
     with pytest.raises(DomainInvariantError, match="different vector content"):
         await store.write_embedding(
             _embedding_record(
@@ -290,8 +302,287 @@ async def test_pgvector_accepts_a_reencoded_vector_only_when_the_caller_allows_i
                 values=reencoded.values,
                 model=model,
                 space=space,
+                created_at=written_after_0021,
             ),
             allow_reencoding=True,
+        )
+
+
+async def test_a_vector_stranded_under_its_old_identifier_is_re_keyed(
+    store: PostgresMemoryStore,
+) -> None:
+    """`embedding_id` is content-addressed, so changing what it hashes strands every stored ID.
+
+    The ID is unreachable from the same inputs while the object key -- tenant, object, model,
+    space, task -- is unchanged, so the writer meets a stored row with equivalent content under
+    a different ID. That is not content drift and must not be reported as it. Re-keying rather
+    than merely tolerating is what stops it recurring: the ID is what `has_embedding` looks up,
+    so a row left under its old name pays for an encode it already has on every future pass.
+
+    The legacy row is inserted with `embedding_id_recipe = 1` rather than written through the
+    store, because that column is what makes it legacy. Simulating it with a backdated
+    `created_at` is what the previous bound did, and `created_at` is caller-supplied.
+    """
+    model = ModelReference(model_id="jinaai/jina-embeddings-v5-omni-small-retrieval")
+    space = EmbeddingSpaceReference(space_id="jina-v5-rekey")
+    values = (1.0, 0.0) + (0.0,) * 1_022
+    legacy = _embedding_record(
+        embedding_id="embedding_derived_by_recipe_one",
+        object_id="memory_stranded",
+        values=values,
+        model=model,
+        space=space,
+    )
+    current = _embedding_record(
+        embedding_id="embedding_derived_by_recipe_two",
+        object_id="memory_stranded",
+        values=values,
+        model=model,
+        space=space,
+    )
+
+    await _insert_at_recipe(store, legacy, recipe=1)
+    assert await store.has_embedding(VECTOR_TENANT, current.embedding_id) is False
+
+    assert await store.write_embedding(current) is False
+
+    # Healed, and healed exactly once: one row, under the name the current recipe derives.
+    assert await store.has_embedding(VECTOR_TENANT, current.embedding_id) is True
+    assert await store.has_embedding(VECTOR_TENANT, legacy.embedding_id) is False
+    async with tenant_connection(store._pool, VECTOR_TENANT) as connection:
+        row = await (
+            await connection.execute(
+                "SELECT count(*) FROM embeddings WHERE tenant_id = %s AND object_id = %s",
+                (VECTOR_TENANT, "memory_stranded"),
+            )
+        ).fetchone()
+    assert row is not None and row[0] == 1
+
+    # A genuinely different vector under the same object key is still drift, not a re-key.
+    with pytest.raises(DomainInvariantError, match="different vector content"):
+        await store.write_embedding(
+            _embedding_record(
+                embedding_id="embedding_third_name",
+                object_id="memory_stranded",
+                values=(0.0, 1.0) + (0.0,) * 1_022,
+                model=model,
+                space=space,
+            )
+        )
+
+    # And an ID disagreement on a row already at the current recipe is refused, which is the
+    # half a general amnesty would have thrown away: the row was written by this recipe, so a
+    # different ID for the same object key is not a stranded name.
+    with pytest.raises(DomainInvariantError, match="different vector content"):
+        await store.write_embedding(
+            _embedding_record(
+                embedding_id="embedding_a_fourth_name",
+                object_id="memory_stranded",
+                values=values,
+                model=model,
+                space=space,
+            )
+        )
+
+
+async def test_one_object_holds_a_vector_in_each_space_while_re_embedding(
+    store: PostgresMemoryStore,
+) -> None:
+    """The workflow migration 0025 widened the unique key for, and could not actually run.
+
+    `docs/configuration.md` tells an operator that vectors in several spaces are accepted while
+    a re-embedding is in progress. Widening the key was necessary and not sufficient: the table
+    is also `PRIMARY KEY (tenant_id, embedding_id)`, and five of the six recipes deriving that
+    ID did not hash `space_id`, so the second vector derived the *same* ID, collided on the
+    primary key, and `write_embedding` raised "embedding conflict could not be resolved" --
+    naming a conflict it could not see. A claim is used because `kernel.py`'s memory-record
+    recipe was the one that already worked, and testing that one proves nothing.
+    """
+    model = ModelReference(model_id="jinaai/jina-embeddings-v5-omni-small-retrieval")
+    claim_id = "claim_being_re_embedded"
+    first, second = (
+        _embedding_record(
+            embedding_id=derive_embedding_id(
+                VECTOR_TENANT,
+                EmbeddedObjectType.CLAIM.value,
+                claim_id,
+                model_id=model.model_id,
+                space_id=space_id,
+                task="retrieval_document",
+            ),
+            object_id=claim_id,
+            object_type=EmbeddedObjectType.CLAIM,
+            values=values,
+            model=model,
+            space=EmbeddingSpaceReference(space_id=space_id),
+        )
+        for space_id, values in (
+            ("jina-v5-1024", (1.0, 0.0) + (0.0,) * 1_022),
+            ("jina-v6-1024", (0.0, 1.0) + (0.0,) * 1_022),
+        )
+    )
+
+    assert first.embedding_id != second.embedding_id, "the recipe must vary with space_id"
+    assert await store.write_embedding(first) is True
+    assert await store.write_embedding(second) is True
+
+    async with tenant_connection(store._pool, VECTOR_TENANT) as connection:
+        rows = await (
+            await connection.execute(
+                "SELECT space_id FROM embeddings WHERE tenant_id = %s AND object_id = %s"
+                " ORDER BY space_id",
+                (VECTOR_TENANT, claim_id),
+            )
+        ).fetchall()
+
+    assert [row[0] for row in rows] == ["jina-v5-1024", "jina-v6-1024"]
+
+
+async def test_every_clip_of_one_evidence_span_is_stored_not_only_the_first(
+    store: PostgresMemoryStore,
+) -> None:
+    """`audio_windows` splits a span over `AUDIO_WINDOW_MS`, so one span is several clips.
+
+    Each is a different sound with a different vector, while `object_id` stays the span --
+    `recall` reads that column straight back as an `EvidenceId`. Under a key without
+    `object_part` the second clip conflicted with the first, was compared against it, and raised
+    as content drift. That raise lands inside `commit_observation_processing`, which writes one
+    observation's derived records in a single transaction, so one 70-second audio span rolled
+    back the entire observation -- its events, claims, entities and memories included.
+    """
+    model = ModelReference(model_id="jinaai/jina-embeddings-v5-omni-small-retrieval")
+    space = EmbeddingSpaceReference(space_id="jina-v5-clips")
+    span = "evidence_span_cut_into_three"
+    clips = tuple(
+        _embedding_record(
+            embedding_id=derive_embedding_id(
+                VECTOR_TENANT,
+                span,
+                str(ordinal),
+                model_id=model.model_id,
+                space_id=space.space_id,
+                task="retrieval_document",
+            ),
+            object_id=span,
+            object_type=EmbeddedObjectType.EVIDENCE_SPAN,
+            object_part=ordinal,
+            values=_unit_vector(ordinal),
+            model=model,
+            space=space,
+        )
+        for ordinal in range(3)
+    )
+
+    # Written the way `commit_observation_processing` writes them: sequentially, one transaction.
+    async with tenant_connection(store._pool, VECTOR_TENANT) as connection:
+        for clip in clips:
+            assert await write_embedding_on_connection(connection, clip) is True
+
+    async with tenant_connection(store._pool, VECTOR_TENANT) as connection:
+        rows = await (
+            await connection.execute(
+                "SELECT object_part FROM embeddings WHERE tenant_id = %s AND object_id = %s"
+                " ORDER BY object_part",
+                (VECTOR_TENANT, span),
+            )
+        ).fetchall()
+
+    assert [row[0] for row in rows] == [0, 1, 2]
+
+    # And the drift guard is per part, not weakened into per span: a different vector for the
+    # clip already stored is still refused.
+    with pytest.raises(DomainInvariantError, match="different vector content"):
+        await store.write_embedding(
+            _embedding_record(
+                embedding_id="embedding_another_name_for_part_one",
+                object_id=span,
+                object_type=EmbeddedObjectType.EVIDENCE_SPAN,
+                object_part=1,
+                values=_unit_vector(99),
+                model=model,
+                space=space,
+            )
+        )
+
+
+async def test_re_writing_one_clip_compares_against_that_clip_not_its_neighbour(
+    store: PostgresMemoryStore,
+) -> None:
+    """The conflict-resolution SELECT has to be exactly the unique key, part included.
+
+    Without `object_part` in it, an idempotent re-write of the second clip matched the *first*
+    clip's row, found a different vector there -- they are different sounds -- and raised drift
+    on a write that was simply repeating itself. Retries do repeat: the whole write path exists
+    to be re-runnable.
+    """
+    model = ModelReference(model_id="jinaai/jina-embeddings-v5-omni-small-retrieval")
+    space = EmbeddingSpaceReference(space_id="jina-v5-retry")
+    span = "evidence_span_retried"
+
+    def clip(ordinal: int) -> EmbeddingRecord:
+        return _embedding_record(
+            embedding_id=derive_embedding_id(
+                VECTOR_TENANT,
+                span,
+                str(ordinal),
+                model_id=model.model_id,
+                space_id=space.space_id,
+                task="retrieval_document",
+            ),
+            object_id=span,
+            object_type=EmbeddedObjectType.EVIDENCE_SPAN,
+            object_part=ordinal,
+            values=_unit_vector(ordinal),
+            model=model,
+            space=space,
+        )
+
+    assert await store.write_embedding(clip(0)) is True
+    assert await store.write_embedding(clip(1)) is True
+
+    # The retry. Same clip, same bytes, so this is a duplicate and not drift.
+    assert await store.write_embedding(clip(1)) is False
+
+
+def _unit_vector(seed: int) -> tuple[float, ...]:
+    """A distinct normalized vector per clip, because each clip is different content."""
+    raw = tuple(math.sin(seed + index) for index in range(1_024))
+    norm = math.sqrt(sum(value * value for value in raw))
+    return tuple(value / norm for value in raw)
+
+
+async def _insert_at_recipe(
+    store: PostgresMemoryStore,
+    embedding: EmbeddingRecord,
+    *,
+    recipe: int,
+) -> None:
+    """Store one vector as an older recipe wrote it, which the writer will no longer do."""
+    async with tenant_connection(store._pool, embedding.tenant_id) as connection:
+        await connection.execute(
+            """
+            INSERT INTO embeddings (
+                tenant_id, embedding_id, object_type, object_id, object_part,
+                model_id, space_id, task,
+                dimension, normalized, embedding, created_at, embedding_id_recipe
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            (
+                embedding.tenant_id,
+                embedding.embedding_id,
+                embedding.object_type.value,
+                embedding.object_id,
+                embedding.object_part,
+                embedding.model_reference.model_id,
+                embedding.space_reference.space_id,
+                embedding.task,
+                embedding.dimension,
+                embedding.normalized,
+                Vector(list(embedding.values)),
+                embedding.created_at,
+                recipe,
+            ),
         )
 
 
@@ -304,19 +595,22 @@ def _embedding_record(
     space: EmbeddingSpaceReference,
     tenant_id: TenantId = VECTOR_TENANT,
     object_type: EmbeddedObjectType = EmbeddedObjectType.MEMORY_RECORD,
+    object_part: int = 0,
+    created_at: datetime = NOW,
 ) -> EmbeddingRecord:
     return EmbeddingRecord(
         embedding_id=EmbeddingId(embedding_id),
         tenant_id=tenant_id,
         object_type=object_type,
         object_id=object_id,
+        object_part=object_part,
         values=values,
         model_reference=model,
         space_reference=space,
         task="retrieval_document",
         dimension=1_024,
         normalized=True,
-        created_at=NOW,
+        created_at=created_at,
     )
 
 
