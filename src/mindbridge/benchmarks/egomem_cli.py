@@ -6,6 +6,7 @@ import asyncio
 import json
 from collections.abc import Sequence
 from dataclasses import dataclass
+from itertools import chain
 from pathlib import Path
 from typing import Literal
 
@@ -26,7 +27,7 @@ from mindbridge.benchmarks.cli_common import (
     media_arguments,
     media_manifest,
     report,
-    report_unit,
+    run_units,
     scoring_snapshot,
     select_by_id,
     write_run_artifacts,
@@ -106,21 +107,15 @@ async def _run(
     prepared: dict[str, EgoLifePreparedStream],
 ) -> tuple[EgoMemReasonResult, ...]:
     async with connected_memory(arguments) as memory:
-        by_example_id: dict[int, EgoMemReasonResult] = {}
         identities = tuple(dict.fromkeys(question.identity for question in questions))
-        for index, identity in enumerate(identities, start=1):
-            report_unit(
-                f"identity {identity}",
-                index=index,
-                total=len(identities),
-                quiet=arguments.quiet,
-            )
-            identity_questions = tuple(
-                question for question in questions if question.identity == identity
-            )
-            results = await run_egomem_reason(
+        per_identity = await run_units(
+            identities,
+            label=lambda identity: f"identity {identity}",
+            unit_concurrency=arguments.unit_concurrency,
+            quiet=arguments.quiet,
+            run=lambda identity: run_egomem_reason(
                 memory,
-                identity_questions,
+                tuple(question for question in questions if question.identity == identity),
                 prepared[identity],
                 run_id=arguments.run_id,
                 tenant_prefix=arguments.tenant_prefix,
@@ -129,8 +124,9 @@ async def _run(
                 request_concurrency=arguments.request_concurrency,
                 poll_interval_seconds=arguments.poll_interval_seconds,
                 processing_timeout_seconds=arguments.processing_timeout_seconds,
-            )
-            by_example_id.update((result.example_id, result) for result in results)
+            ),
+        )
+        by_example_id = {result.example_id: result for result in chain.from_iterable(per_identity)}
         return tuple(by_example_id[question.example_id] for question in questions)
 
 

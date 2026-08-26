@@ -269,10 +269,10 @@ uv run mindbridge-bench eval --tasks released-text --run-id sweep-001 --dry-run
 ```
 
 `--api-base-url` and `--deployment-config` are forwarded to every task. So are `--limit`,
-`--recall-limit`, `--request-concurrency`, and `--request-timeout-seconds`, but only when given —
-otherwise each runner keeps the default it declares rather than a copy pinned here that goes
-stale. They are placed before a task's own arguments, so a benchmark needing its own recall
-budget sets it in the task.
+`--recall-limit`, `--request-concurrency`, `--unit-concurrency`, and
+`--request-timeout-seconds`, but only when given — otherwise each runner keeps the default it
+declares rather than a copy pinned here that goes stale. They are placed before a task's own
+arguments, so a benchmark needing its own recall budget sets it in the task.
 
 `--device-id`, `--poll-interval-seconds`, and `--processing-timeout-seconds` are forwarded the
 same way, but only to the tasks whose runner takes them — every benchmark here except
@@ -280,11 +280,36 @@ LoCoMo-Refined, which ingests no media and would reject them. That is what lets 
 text and media raise the processing deadline for the runs it applies to. A flag narrower still,
 `--prepared-media` among them, belongs in the task rather than on the sweep.
 
+### Keeping the worker busy
+
+Two flags decide how much work a run keeps in flight, and the product of them is the number that
+matters:
+
+| Flag | Default | What it bounds |
+| --- | --- | --- |
+| `--request-concurrency` | 4 | in-flight API requests inside one unit |
+| `--unit-concurrency` | 4 | units of the benchmark running at once |
+
+A run holds up to `--unit-concurrency` × `--request-concurrency` requests in flight, so the
+defaults keep 16 outstanding against a Worker whose own concurrency is what bounds GPU memory.
+Raising these does not make the Worker do more at once; it makes it less likely to find its queue
+empty. Set both to 1 for a serial run, which is what to reach for when reading a failure.
+
+`--request-concurrency` alone cannot keep the queue full, and this is worth knowing before tuning
+it: a unit ingests before it answers, and the answer phase never reaches the Worker at all. Past
+the size of one unit's fan-out the flag stops buying anything, because what is left idle is the
+gap between units rather than the room inside one. `--unit-concurrency` is the flag that closes
+that gap — with units overlapping, one unit's answer phase runs against another's ingest.
+
 ### What it records
 
 Tasks run one at a time. Running them concurrently against one deployment would have them
 contending for the same worker and would corrupt every timing the runs report; to use more
 hardware, run separate sweeps with different `--run-id`s against separate deployments.
+
+That is a claim about tasks, not about the work inside one. A task's units — a video, a topic, a
+conversation — overlap, and nothing a run reports is per unit, so there is no per-unit timing for
+them to contaminate. See [Keeping the worker busy](#keeping-the-worker-busy).
 
 A task that fails does not stop the sweep, so a benchmark dying four hours in costs its own result
 rather than the others. An interrupt does stop it, and still writes the summary. `--output-dir`

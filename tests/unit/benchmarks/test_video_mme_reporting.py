@@ -126,6 +126,7 @@ def _arguments(
         device_id="video_mme_camera",
         recall_limit=20,
         request_concurrency=4,
+        unit_concurrency=1,
         request_timeout_seconds=1_800.0,
         limit=None,
         poll_interval_seconds=1.0,

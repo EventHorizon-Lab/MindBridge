@@ -25,7 +25,7 @@ from mindbridge.benchmarks.cli_common import (
     media_arguments,
     media_manifest,
     report,
-    report_unit,
+    run_units,
     scoring_snapshot,
     select_by_id,
     write_run_artifacts,
@@ -132,30 +132,25 @@ async def _run(
 ) -> tuple[MemLensQuestionResult, ...]:
     validate_memlens_images(questions, prepared, text_only=arguments.text_only)
     async with connected_memory(arguments) as memory:
-        results = []
-        for index, question in enumerate(questions, start=1):
-            report_unit(
-                f"question {question.question_id}",
-                index=index,
-                total=len(questions),
-                quiet=arguments.quiet,
-            )
-            results.append(
-                await run_memlens_question(
-                    memory,
-                    question,
-                    run_id=arguments.run_id,
-                    prepared_images=prepared,
-                    text_only=arguments.text_only,
-                    tenant_prefix=arguments.tenant_prefix,
-                    device_id=arguments.device_id,
-                    recall_limit=arguments.recall_limit,
-                    request_concurrency=arguments.request_concurrency,
-                    poll_interval_seconds=arguments.poll_interval_seconds,
-                    processing_timeout_seconds=arguments.processing_timeout_seconds,
-                )
-            )
-        return tuple(results)
+        return await run_units(
+            questions,
+            label=lambda question: f"question {question.question_id}",
+            unit_concurrency=arguments.unit_concurrency,
+            quiet=arguments.quiet,
+            run=lambda question: run_memlens_question(
+                memory,
+                question,
+                run_id=arguments.run_id,
+                prepared_images=prepared,
+                text_only=arguments.text_only,
+                tenant_prefix=arguments.tenant_prefix,
+                device_id=arguments.device_id,
+                recall_limit=arguments.recall_limit,
+                request_concurrency=arguments.request_concurrency,
+                poll_interval_seconds=arguments.poll_interval_seconds,
+                processing_timeout_seconds=arguments.processing_timeout_seconds,
+            ),
+        )
 
 
 def _write_artifacts(

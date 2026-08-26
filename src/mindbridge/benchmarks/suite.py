@@ -701,6 +701,11 @@ def _build_parser(prog: str | None) -> argparse.ArgumentParser:
         help="in-flight API requests per unit, for every task that does not set its own",
     )
     parser.add_argument(
+        "--unit-concurrency",
+        type=int,
+        help="units of one benchmark run at once, for every task that does not set its own",
+    )
+    parser.add_argument(
         "--request-timeout-seconds",
         type=float,
         help="deadline for one request, for every task that does not set its own",
@@ -828,6 +833,7 @@ def _shared_arguments(parsed: argparse.Namespace, *, root: Path) -> tuple[str, .
         ("--limit", parsed.limit),
         ("--recall-limit", parsed.recall_limit),
         ("--request-concurrency", parsed.request_concurrency),
+        ("--unit-concurrency", parsed.unit_concurrency),
         ("--request-timeout-seconds", parsed.request_timeout_seconds),
     ):
         if value is not None:
