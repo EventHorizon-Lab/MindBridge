@@ -54,6 +54,22 @@ DEFAULT_EMBEDDING_SPACE = EmbeddingSpaceReference(
     space_id="jinaai/jina-embeddings-v5-omni-small-retrieval-1024",
 )
 
+
+def embedder_revision_for(model_id: str, revision: str | None) -> str | None:
+    """The commit to load `model_id` at: an explicit pin, else the bundled pin only if it fits.
+
+    `DEFAULT_EMBEDDER_REVISION` is a commit of `DEFAULT_EMBEDDER_MODEL_ID`. Applying it to a
+    repository an operator named instead resolves a sha that repository does not contain, so
+    `snapshot_download` raises `RevisionNotFoundError` naming a value that appears nowhere in
+    their configuration. Every path that turns a model id into a download resolves the pin
+    here, so naming another repository cannot inherit a pin belonging to this one, and the
+    bundled model cannot lose its pin by a caller forgetting to pass it.
+    """
+    if revision is not None:
+        return revision
+    return DEFAULT_EMBEDDER_REVISION if model_id == DEFAULT_EMBEDDER_MODEL_ID else None
+
+
 # Jina v5 trains these Matryoshka prefixes; any other width is an untrained
 # truncation, so a deployment may pick from this set but not invent a size.
 MATRYOSHKA_DIMENSIONS = (32, 64, 128, 256, 512, 768, 1_024)
@@ -123,14 +139,16 @@ def jina_media_embedder_config(source: Mapping[str, str]) -> dict[str, object]:
     """Read the bundled local Jina contract for the Worker's image, video, and audio encoder."""
     config: dict[str, object] = {
         "model_id": source.get("MINDBRIDGE_MEDIA_EMBEDDER_MODEL_ID", DEFAULT_EMBEDDER_MODEL_ID),
-        # Only the local encoder takes a revision, because only the local encoder downloads
-        # anything. The OpenAI-shaped encoder talks to an endpoint that resolves its own
-        # model, so a revision there would be the unread record 0021 removed.
-        "model_revision": source.get(
-            "MINDBRIDGE_MEDIA_EMBEDDER_MODEL_REVISION", DEFAULT_EMBEDDER_REVISION
-        ),
         **_embedding_space_config(source),
     }
+    # Only the local encoder takes a revision, because only the local encoder downloads
+    # anything. The OpenAI-shaped encoder talks to an endpoint that resolves its own model,
+    # so a revision there would be the unread record 0021 removed. Absent, the pin is
+    # resolved from the model id rather than defaulted here, so overriding only
+    # MINDBRIDGE_MEDIA_EMBEDDER_MODEL_ID does not pin another repository to this one's commit.
+    revision = optional_environment_value(source, "MINDBRIDGE_MEDIA_EMBEDDER_MODEL_REVISION")
+    if revision is not None:
+        config["model_revision"] = revision
     device = optional_environment_value(source, "MINDBRIDGE_MEDIA_EMBEDDER_DEVICE")
     if device is not None:
         config["device"] = device

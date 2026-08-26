@@ -282,7 +282,8 @@ ever gains.
 
 Configs are validated with `extra="forbid"`. An unrecognized key fails startup rather than being
 ignored, which is the difference between "that setting had no effect" and "that setting was
-never applied and nobody noticed".
+never applied and nobody noticed". The three names migration `0021` retired are the one closed
+exception, described in [plugin-architecture.md](plugin-architecture.md).
 
 Anthropic, Gemini, local runtimes, and experimental adapters need no OpenAI-specific variables —
 set the plugin name and provide its JSON. See [plugin-architecture.md](plugin-architecture.md).

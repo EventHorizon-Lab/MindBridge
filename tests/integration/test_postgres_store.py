@@ -372,6 +372,12 @@ async def test_widening_the_embedding_key_restores_space_coexistence(
                 space_id text NOT NULL,
                 task text NOT NULL,
                 created_at timestamptz NOT NULL,
+                -- Production's primary key, without which this table cannot show what the
+                -- widened unique key does and does not buy: `embedding_id` is derived, and
+                -- only the recipe in `kernel.py` hashes `space_id`, so for every other object
+                -- type the second vector arrives under the same ID and collides here rather
+                -- than on the key this migration widens.
+                PRIMARY KEY (tenant_id, embedding_id),
                 CONSTRAINT embeddings_object_model_task_key
                     UNIQUE (tenant_id, object_type, object_id, model_id, task)
             );
@@ -379,22 +385,33 @@ async def test_widening_the_embedding_key_restores_space_coexistence(
                 tenant_id text NOT NULL,
                 operation text NOT NULL,
                 idempotency_key text NOT NULL,
-                content_digest text NOT NULL
+                content_digest text NOT NULL,
+                created_at timestamptz NOT NULL
             );
             CREATE TABLE observations (
                 observation_id text NOT NULL,
                 identity_observations jsonb NOT NULL,
-                content_digest char(64) NOT NULL
+                content_digest char(64) NOT NULL,
+                ingested_at timestamptz NOT NULL
             );
-            CREATE TABLE schema_migrations (version integer PRIMARY KEY);
+            CREATE TABLE schema_migrations (
+                version integer PRIMARY KEY,
+                applied_at timestamptz NOT NULL DEFAULT now()
+            );
+            INSERT INTO schema_migrations VALUES (21, now());
             INSERT INTO embeddings VALUES
-                ('t', 'first', 'memory_record', 'm1', 'model', 'space-v1', 'document', now());
+                ('t', 'first', 'memory_record', 'm1', 'model', 'space-v1', 'document', now()),
+                ('t', 'claim-hash', 'claim', 'c1', 'model', 'space-v1', 'document', now());
             INSERT INTO idempotency_keys VALUES
-                ('t', 'observe', 'key-1', 'stale'),
-                ('t', 'remember', 'key-2', 'still-valid');
+                ('t', 'observe', 'key-1', 'stale', now() - interval '1 day'),
+                ('t', 'observe', 'key-3', 'still-valid', now() + interval '1 day'),
+                ('t', 'remember', 'key-2', 'still-valid', now() - interval '1 day');
             INSERT INTO observations VALUES
-                ('with_spans', '[{"model_id": "m"}]'::jsonb, repeat('a', 64)),
-                ('without_spans', '[]'::jsonb, repeat('b', 64));
+                ('with_spans', '[{"model_id": "m"}]'::jsonb, repeat('a', 64),
+                 now() - interval '1 day'),
+                ('spans_after_0021', '[{"model_id": "m"}]'::jsonb, repeat('c', 64),
+                 now() + interval '1 day'),
+                ('without_spans', '[]'::jsonb, repeat('b', 64), now() - interval '1 day');
             """,
             prepare=False,
         )
@@ -424,6 +441,21 @@ async def test_widening_the_embedding_key_restores_space_coexistence(
             )
         except UniqueViolation:
             duplicate_rejected = True
+        # The half the widened key does not reach. A claim's `embedding_id` recipe
+        # (`semantic_claims.py`) hashes tenant, object type, object id, model and task but not
+        # `space_id`, so re-embedding it under a second space derives the same ID and collides
+        # on the primary key instead. Asserted so the limitation cannot be mistaken for fixed.
+        space_blind_recipe_still_collides = False
+        try:
+            await connection.execute(
+                """
+                INSERT INTO embeddings VALUES
+                    ('t', 'claim-hash', 'claim', 'c1', 'model', 'space-v2', 'document', now())
+                """,
+                prepare=False,
+            )
+        except UniqueViolation:
+            space_blind_recipe_still_collides = True
         claims = await (
             await connection.execute("SELECT operation FROM idempotency_keys")
         ).fetchall()
@@ -435,12 +467,17 @@ async def test_widening_the_embedding_key_restores_space_coexistence(
 
     assert [cast(tuple[str], row)[0] for row in spaces] == ["space-v1", "space-v2"]
     assert duplicate_rejected
-    # An `observe` digest can never match again; a `remember` digest still digests what it did.
-    assert [cast(tuple[str], row)[0] for row in claims] == ["remember"]
-    # Only the observation carrying identity spans loses its digest: that is where the removed
-    # field lived, so an observation without them digests exactly what it always did.
+    assert space_blind_recipe_still_collides
+    # An `observe` claim recorded before 0021 can never match again and is dropped; one recorded
+    # after it digests what the current recipe digests, and a `remember` claim never moved.
+    assert sorted(cast(tuple[str], row)[0] for row in claims) == ["observe", "remember"]
+    # Only an observation that both carries identity spans -- where the removed field lived --
+    # and predates 0021 loses its digest. One without spans digests exactly what it always did,
+    # and one written after 0021 already carries a digest the current recipe reproduces, so
+    # nulling it would open a window for a different body to be accepted as a duplicate.
     assert dict(cast(list[tuple[str, str | None]], digests)) == {
         "with_spans": None,
+        "spans_after_0021": "c" * 64,
         "without_spans": "b" * 64,
     }
 

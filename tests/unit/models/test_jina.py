@@ -8,7 +8,13 @@ import pytest
 
 from mindbridge.core import MediaKind, ModelOutputError, ModelReference, ModelUnavailableError
 from mindbridge.models import EmbedRequest, EmbedTask, MediaPart, ModelInput, TextPart
-from mindbridge.models.defaults import DEFAULT_EMBEDDER_REVISION, require_matryoshka_dimension
+from mindbridge.models.defaults import (
+    DEFAULT_EMBEDDER_MODEL_ID,
+    DEFAULT_EMBEDDER_REVISION,
+    embedder_revision_for,
+    jina_media_embedder_config,
+    require_matryoshka_dimension,
+)
 from mindbridge.models.jina import JinaEmbedder, _EmbedderConfig
 
 
@@ -107,10 +113,12 @@ def test_jina_pins_the_weights_and_the_remote_code(monkeypatch: pytest.MonkeyPat
 
 
 def test_jina_can_load_an_unpinned_repository(monkeypatch: pytest.MonkeyPatch) -> None:
-    """`revision=None` exists for the sweep that names its own repositories.
+    """Another repository is loaded unpinned, because this pin could not resolve against it.
 
-    The bundled model's pin cannot resolve in someone else's repository, so the bakeoff has to
-    be able to opt out. It has to stay an explicit opt-out: the default is the pin.
+    `DEFAULT_EMBEDDER_REVISION` is a commit of `DEFAULT_EMBEDDER_MODEL_ID`. Applying it to a
+    repository the caller named instead is a `RevisionNotFoundError` at load, naming a sha that
+    appears nowhere in their configuration -- so the pin is resolved from the model id rather
+    than defaulted onto whatever repository turns up.
     """
     calls: list[tuple[str, dict[str, object]]] = []
 
@@ -132,9 +140,28 @@ def test_jina_can_load_an_unpinned_repository(monkeypatch: pytest.MonkeyPatch) -
     )
     monkeypatch.setattr("mindbridge.models.jina.select_torch_device", lambda _device: "cpu")
 
-    JinaEmbedder.load(model_id="someone/else", revision=None, dimension=2)
+    JinaEmbedder.load(model_id="someone/else", dimension=2)
 
     assert calls[0] == ("snapshot_download", {"repo_id": "someone/else", "revision": None})
+
+
+def test_an_overridden_model_id_alone_does_not_inherit_the_bundled_pin() -> None:
+    """One variable pointing the encoder at another repository must not pin it to this one's sha.
+
+    `MINDBRIDGE_MEDIA_EMBEDDER_MODEL_ID` and `MINDBRIDGE_MEDIA_EMBEDDER_MODEL_REVISION` are
+    documented as two independent optional variables. Defaulting the second onto whatever the
+    first names made setting only the first a worker that cannot start.
+    """
+    named_elsewhere = jina_media_embedder_config(
+        {"MINDBRIDGE_MEDIA_EMBEDDER_MODEL_ID": "jinaai/jina-embeddings-v4"}
+    )
+    validated = _EmbedderConfig.model_validate(named_elsewhere)
+
+    assert embedder_revision_for(validated.model_id, validated.model_revision) is None
+    assert embedder_revision_for(DEFAULT_EMBEDDER_MODEL_ID, None) == DEFAULT_EMBEDDER_REVISION
+    assert embedder_revision_for("jinaai/jina-embeddings-v4", "deadbeef" * 5) == "deadbeef" * 5, (
+        "an explicit pin always wins, whichever repository it is for"
+    )
 
 
 def test_the_embedder_plugin_keeps_an_operators_existing_pin() -> None:

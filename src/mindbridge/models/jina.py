@@ -26,10 +26,10 @@ from mindbridge.models._vectors import validate_embedding_vector
 from mindbridge.models.compute import select_torch_device
 from mindbridge.models.defaults import (
     DEFAULT_EMBEDDER_MODEL_ID,
-    DEFAULT_EMBEDDER_REVISION,
     DEFAULT_EMBEDDING_DIMENSION,
     DEFAULT_EMBEDDING_SPACE,
     MatryoshkaDimension,
+    embedder_revision_for,
 )
 from mindbridge.telemetry import operation_span, set_current_span_attributes
 
@@ -134,7 +134,7 @@ class JinaEmbedder:
         cls,
         *,
         model_id: str = DEFAULT_EMBEDDER_MODEL_ID,
-        revision: str | None = DEFAULT_EMBEDDER_REVISION,
+        revision: str | None = None,
         device: str | None = None,
         space_reference: EmbeddingSpaceReference = DEFAULT_EMBEDDING_SPACE,
         dimension: int = DEFAULT_EMBEDDING_DIMENSION,
@@ -142,12 +142,13 @@ class JinaEmbedder:
     ) -> JinaEmbedder:
         """Load a pinned upstream model without exposing training operations.
 
-        `revision` defaults to the pin for `DEFAULT_EMBEDDER_MODEL_ID`, so the safe thing is
-        what a caller gets for free. `None` means "resolve the repository's default branch"
-        and exists for the one caller that sweeps arbitrary repositories, where a pin for a
-        different repository could not resolve. Anything loading the bundled model in a
-        deployment goes through `create_embedder`, which always supplies a pin.
+        `revision` unset resolves through `embedder_revision_for`, which supplies the bundled
+        pin for `DEFAULT_EMBEDDER_MODEL_ID` and nothing for any other repository -- so the
+        safe thing is what a caller gets for free, and a caller sweeping arbitrary
+        repositories cannot inherit a pin that could not resolve against them. Passing a
+        revision explicitly always wins.
         """
+        revision = embedder_revision_for(model_id, revision)
         try:
             module = import_module("sentence_transformers")
             hub_module = import_module("huggingface_hub")
@@ -248,8 +249,10 @@ class _EmbedderConfig(PluginConfigModel):
     # migration 0021 and the value still means the same thing here. `PluginConfigModel`
     # ignores that name where nothing declares it, so an operator's existing
     # MINDBRIDGE_MEDIA_EMBEDDER_CONFIG_JSON keeps pinning what it always pinned instead of
-    # being silently replaced by this default.
-    model_revision: PluginText = DEFAULT_EMBEDDER_REVISION
+    # being silently replaced by this default. Unset means "resolve the pin from the model
+    # id", which is the bundled commit for the bundled repository and nothing for another --
+    # not "load the default branch of whatever repository this is".
+    model_revision: PluginText | None = None
     device: PluginText | None = None
     space_id: PluginText = DEFAULT_EMBEDDING_SPACE.space_id
     dimension: MatryoshkaDimension = DEFAULT_EMBEDDING_DIMENSION

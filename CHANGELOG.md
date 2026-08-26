@@ -65,14 +65,29 @@ Called out on their own because these are the changes that cost an operator real
   and both embedding-space indexes without those columns, deletes the later of any two vectors that
   differed only by revision, and strips the retired key from stored identity spans.
 - **Removed environment variables:** `MINDBRIDGE_GENERATOR_MODEL_REVISION`, which was *required*,
-  plus the optional `MINDBRIDGE_EMBEDDER_MODEL_REVISION`,
-  `MINDBRIDGE_MEDIA_EMBEDDER_MODEL_REVISION`, and `MINDBRIDGE_EMBEDDING_SPACE_REVISION`. A
-  `*_CONFIG_JSON` object still naming `model_revision` or `space_revision` fails startup rather
-  than ignoring the key.
-- **`POST /v1/observations` no longer accepts `model_revision`** inside `identity_observations`,
-  and the same field is gone from the `observe` MCP tool. It was a required field, and unknown
-  fields are rejected, so a device still sending it now gets `request_validation_failed` — upgrade
-  the edge alongside the server.
+  plus the optional `MINDBRIDGE_EMBEDDER_MODEL_REVISION` and
+  `MINDBRIDGE_EMBEDDING_SPACE_REVISION`.
+- **`MINDBRIDGE_MEDIA_EMBEDDER_MODEL_REVISION` is back**, optional, and it is the one of these
+  names that was not merely a record: it pins the commit the local Jina encoder downloads and
+  therefore which remote code executes under `trust_remote_code=True`. Unset, the pin is resolved
+  from the model id — the bundled commit for the bundled repository, and nothing for a repository
+  you named yourself, which that commit could not resolve against. Change it and change
+  `MINDBRIDGE_EMBEDDING_SPACE_ID` with it; nothing else can see that the encoder moved.
+- **A `*_CONFIG_JSON` object naming a retired name no longer fails startup.** `model_revision`,
+  `space_revision`, and `association_model_revision` are ignored where the plugin does not declare
+  them; every other unrecognized key still fails the factory. Where a plugin does declare one — the
+  local Jina encoder's `model_revision` — the operator's value is kept rather than defaulted.
+- **`POST /v1/observations` accepts and ignores `model_revision`** inside `identity_observations`,
+  and so does the `observe` MCP tool, so a rolling upgrade that moves the server first does not
+  422 the fleet behind it. Removing a field is not the same as forbidding it. Any *other* unknown
+  field is still `request_validation_failed`.
+- **Migration `0025`** widens the `embeddings` unique key with `space_id`, clears `observe`
+  idempotency claims and identity-bearing observation digests recorded before `0021` (both were
+  digested by a recipe that no longer exists, so a byte-identical resend could never match again;
+  the reprocess is idempotent), makes `observations.content_digest` nullable, and grants
+  `mindbridge_runtime` SELECT on `schema_migrations`. No manual step. Re-embedding into a second
+  space is restored for memory records; the other object types still derive a space-blind
+  `embedding_id` and collide on the primary key, which the migration comment records.
 
 ### Known gaps
 

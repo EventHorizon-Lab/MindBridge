@@ -7,7 +7,9 @@ rolling upgrade, where the server goes first -- `/v1/observe` bodies from a devi
 the previous release. These tests pin the tolerance and, just as importantly, pin its limit.
 """
 
+import re
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
@@ -15,6 +17,7 @@ from pydantic import ValidationError
 from mindbridge.configuration import PluginConfigModel, PluginText
 from mindbridge.contracts import IdentityObservationInput, ObserveRequest
 from mindbridge.core import RETIRED_FIELD_NAMES
+from mindbridge.edge.identity_schema import _TABLES_RETIRED_WITH_THEIR_REVISION_COLUMN
 
 
 def _identity_span(**extra: object) -> dict[str, object]:
@@ -100,9 +103,20 @@ def test_a_plugin_config_keeps_a_retired_name_it_does_declare() -> None:
     )
 
 
-def test_every_retired_name_is_one_migration_0021_actually_dropped() -> None:
-    """Keeps the list from growing into a general-purpose escape from `extra="forbid"`."""
-    assert (
-        frozenset({"model_revision", "space_revision", "association_model_revision"})
-        == RETIRED_FIELD_NAMES
+def test_every_tolerated_name_was_actually_retired_somewhere() -> None:
+    """Keeps the list from growing into a general-purpose escape from `extra="forbid"`.
+
+    Read off the two places a retirement is recorded rather than restated as literals here: a
+    copy of the constant cannot tell whether a name in it was ever a field, which is exactly
+    the way this list would quietly become an amnesty. Migration 0021 names the two PostgreSQL
+    columns it drops; `identity_schema` names the two the edge SQLite store dropped with their
+    tables. Their union is the closed set, and a name added to `RETIRED_FIELD_NAMES` without a
+    retirement behind it fails here.
+    """
+    migration = (Path(__file__).parents[2] / "migrations/0021_drop_model_revisions.sql").read_text(
+        encoding="utf-8"
     )
+    dropped_columns = set(re.findall(r"DROP COLUMN (\w+)", migration))
+    retired_on_edge = {column for _table, column in _TABLES_RETIRED_WITH_THEIR_REVISION_COLUMN}
+
+    assert frozenset(dropped_columns | retired_on_edge) == RETIRED_FIELD_NAMES
