@@ -264,40 +264,65 @@ async def run_units(
     Results come back in the order `units` were given, which several runners require: their
     predictions have to line up with the official annotation's own order.
 
-    A unit that raises ends the run, as the serial `await` did, and the siblings are cancelled
-    and waited out before it does. Neither half is what `gather` gives on its own. With
-    `return_exceptions=False` it propagates the first exception but leaves the siblings running
-    -- they then reach a client `connected_memory` has already closed, from tasks nobody awaits,
-    and any unit that had already submitted observations leaves the Worker processing for a run
-    that will write nothing. With `return_exceptions=True` every remaining unit runs to
-    completion first, which is worse: a run whose first unit fails would ingest the whole corpus
-    before saying so. `TaskGroup` does exactly this, and is 3.11; the floor here is 3.10.
+    A unit that raises ends the run, as the serial `await` did, and no unit starts after it: the
+    ones already running are cancelled and waited out, and the ones still queued are never
+    dequeued. All three parts have to be built, because none of them is what `gather` over one
+    task per unit gives.
+
+    `gather(return_exceptions=False)` propagates the first exception but leaves the siblings
+    running. They then reach a client `connected_memory` has already closed, from tasks nobody
+    awaits, and any unit that had already submitted observations leaves the Worker processing for
+    a run that will write nothing. `gather(return_exceptions=True)` is worse: every remaining
+    unit runs to completion before it reports, so a run whose first unit failed would ingest the
+    whole corpus before saying so.
+
+    Bounding with a semaphore instead of a worker count has the same hole in a subtler place.
+    Leaving the failing unit's `async with` releases its permit, and the release wakes a queued
+    unit before `gather`'s done callback reaches the cancel: measured, one queued unit started
+    and got past its first await, which for every runner here is the observation POST. A
+    successful sibling releasing its permit after the failure does it too, so holding just the
+    failed permit would not close it. Workers pulling from a shared iterator have nothing to
+    release and check the failure before each unit, so a failed run stops dequeuing.
+
+    `TaskGroup` does all of this, and is 3.11; the floor here is 3.10.
     """
     if unit_concurrency <= 0:
         raise ValueError("unit_concurrency must be positive")
-    gate = asyncio.Semaphore(unit_concurrency)
+    queued = iter(range(len(units)))
+    results: dict[int, _Out] = {}
     completed = 0
+    failed = False
 
-    async def one(unit: _Unit) -> _Out:
-        nonlocal completed
-        async with gate:
+    async def worker() -> None:
+        nonlocal completed, failed
+        # One shared iterator, advanced without awaiting, so no two workers take the same unit.
+        for index in queued:
+            if failed:
+                return
+            unit = units[index]
             report(f"starting {label(unit)}", quiet=quiet)
-            result = await run(unit)
-        completed += 1
-        report_unit(label(unit), index=completed, total=len(units), quiet=quiet)
-        return result
+            try:
+                results[index] = await run(unit)
+            except BaseException:
+                failed = True
+                raise
+            completed += 1
+            report_unit(label(unit), index=completed, total=len(units), quiet=quiet)
 
-    tasks = [asyncio.create_task(one(unit)) for unit in units]
+    workers = [asyncio.create_task(worker()) for _ in range(min(unit_concurrency, len(units)))]
     try:
-        return tuple(await asyncio.gather(*tasks))
+        await asyncio.gather(*workers)
     except BaseException:
         # `BaseException` because an interrupt has to clean up too: a Ctrl-C during a sweep is
         # the likeliest way this path is reached, and leaving units in flight through it is how
         # the summary ends up written while requests are still going out.
-        for task in tasks:
+        for task in workers:
             task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.gather(*workers, return_exceptions=True)
         raise
+    # Keyed by position rather than appended, because a worker finishing early must not move a
+    # later unit's prediction ahead of it: several runners require release order.
+    return tuple(results[index] for index in range(len(units)))
 
 
 _ArgumentsT = TypeVar("_ArgumentsT", bound=CoreArguments)

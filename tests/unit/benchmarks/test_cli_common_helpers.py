@@ -382,14 +382,21 @@ async def test_a_failing_unit_takes_its_siblings_down_before_it_returns() -> Non
     the cancel-and-wait is really there.
     """
     started: list[int] = []
+    reached_the_api: list[int] = []
     finished: list[int] = []
     cancelled: list[int] = []
 
     async def run(unit: int) -> int:
         started.append(unit)
+        # Every unit gets far enough to be cancellable, so the failure lands while three units
+        # are in flight rather than before the other workers have taken theirs.
+        await asyncio.sleep(0)
         if unit == 0:
             raise RuntimeError("unit 0 died")
         try:
+            # Stands in for the observation POST that opens every runner's ingest: reaching it
+            # is what enqueues Worker processing for a run that will write nothing.
+            reached_the_api.append(unit)
             for _turn in range(50):
                 await asyncio.sleep(0)
             finished.append(unit)
@@ -412,4 +419,10 @@ async def test_a_failing_unit_takes_its_siblings_down_before_it_returns() -> Non
         f"started {sorted(started)} but only {sorted(cancelled)} had unwound by the time "
         "run_units returned"
     )
-    assert 5 not in started, "a unit still waiting for a permit must never start"
+    # The three that were already in flight are the only ones allowed to have started. A queued
+    # unit reaching `run` at all is the defect: bounding with a semaphore, the failing unit's
+    # released permit woke unit 3 and it got as far as the API before the cancel landed.
+    assert sorted(started) == [0, 1, 2], (
+        f"a unit queued behind the ceiling started after the failure: {sorted(started)}"
+    )
+    assert 3 not in reached_the_api, "a queued unit reached the API after the run had failed"
