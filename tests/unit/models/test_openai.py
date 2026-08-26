@@ -2,6 +2,7 @@
 
 import base64
 import json
+import re
 import sys
 from collections.abc import AsyncIterator, Callable, Coroutine
 from pathlib import Path
@@ -13,6 +14,7 @@ import pytest
 from openai import AsyncOpenAI
 
 import mindbridge.edge.identity_diarization as identity_diarization
+from mindbridge import configuration
 from mindbridge.application.capabilities import OutputSchema
 from mindbridge.core import (
     EmbeddingSpaceReference,
@@ -487,7 +489,7 @@ async def test_transcribing_generator_carries_its_engine_and_recipe_to_funasr(
         create_generator({**config, "asr_engine": "vllm", "asr_recipe": "sensevoice"})
 
 
-async def test_the_shipped_sample_config_can_actually_be_uncommented() -> None:
+async def test_the_shipped_sample_config_can_actually_be_uncommented(tmp_path: Path) -> None:
     """`mindbridge.toml` is the shipped example, so its commented lines have to work together.
 
     Two drafts of this block did not: one pinned the engine as a side effect of switching
@@ -495,7 +497,7 @@ async def test_the_shipped_sample_config_can_actually_be_uncommented() -> None:
     read fine and both would have failed for whoever uncommented them.
     """
     generator = create_generator(
-        {**_uncommented_sample_generator_config(), "api_key": "unit-test-key"}
+        {**_uncommented_sample_generator_config(tmp_path), "api_key": "unit-test-key"}
     )
     try:
         assert isinstance(generator, AudioFallbackGenerator)
@@ -503,15 +505,14 @@ async def test_the_shipped_sample_config_can_actually_be_uncommented() -> None:
         await close_model(generator)
 
 
-def _uncommented_sample_generator_config() -> dict[str, object]:
-    """Read `[generator]` from the shipped sample with every commented key switched on."""
-    import re
+def _uncommented_sample_generator_config(directory: Path) -> dict[str, object]:
+    """Read `[generator]` from the shipped sample with every commented key switched on.
 
-    import tomllib
-
-    from mindbridge import configuration
-
-    sample = Path("mindbridge.toml").read_text()
+    Parsed by `mindbridge.configuration` rather than by a TOML library imported here: it already
+    carries the `tomli` backport that the floor of the version matrix needs, and going through
+    the real loader is the point of the exercise anyway.
+    """
+    sample = Path("mindbridge.toml").read_text(encoding="utf-8")
     section = sample[sample.index("[generator]") :]
     section = section[: section.index("\n[", 1)]
     commented = re.findall(r"^# ([a-z_]+ = .*)$", section, re.M)
@@ -521,7 +522,11 @@ def _uncommented_sample_generator_config() -> dict[str, object]:
     for line in commented:
         live = live.replace(f"# {line}", line)
     live = live.replace('audio_mode = "native"', 'audio_mode = "transcribe"')
-    document = tomllib.loads(live)
+    located = directory / "mindbridge.toml"
+    located.write_text(live, encoding="utf-8")
+
+    document = configuration._configuration_document({}, located)
+    assert document is not None
     encoded = (
         configuration._flattened_scalars(document) | configuration._flattened_plugins(document, {})
     )["MINDBRIDGE_GENERATOR_CONFIG_JSON"]
