@@ -229,9 +229,10 @@ The in-process plugin costs **3.7 GiB of resident weights per prefork child** on
 pool of more than one child would hold more than `MINDBRIDGE_WORKER_VRAM_BUDGET_GIB`, while either
 embedder slot names `jina`, because a prefork child holds its own copy of the model and
 `--max-memory-per-child` cannot bound VRAM. The pool size is whichever of `--concurrency` and
-`--autoscale` is larger; a pool that shares one process (`--pool=threads`, `solo`) holds one copy
-however wide it runs, and `MINDBRIDGE_MEDIA_EMBEDDER_DEVICE=cpu` holds no VRAM at all, so neither
-is refused.
+`--autoscale` is larger. Only `prefork` and `solo` are supported: `solo` holds one copy,
+while thread and greenlet pools are refused because the worker runtime owns one synchronous event
+loop per process. `MINDBRIDGE_MEDIA_EMBEDDER_DEVICE=cpu` holds no VRAM and is exempt from the
+device-memory calculation.
 
 `MINDBRIDGE_WORKER_VRAM_BUDGET_GIB` defaults to **3.7 GiB, one model copy per child**, which is
 what keeps a second resident copy a decision rather than an accident. Raise it on a card that can

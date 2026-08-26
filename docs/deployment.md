@@ -46,9 +46,10 @@ python -m pip install '.[all]'
 
 ## Datastores
 
-PostgreSQL 18 with pgvector 0.8 or newer. Filtered recall relies on pgvector iterative scans, so
-this is a hard floor, not a preference. Redis is the task broker. Object storage is S3 or any
-S3-compatible store.
+PostgreSQL 18 with pgvector; the development and CI image pins pgvector 0.8.2. Current retrieval
+uses exact per-tenant vector scans. Migration `0018` records the HNSW index and
+`hnsw.iterative_scan` setting to restore if a tenant grows large enough to need approximate
+search. Redis is the task broker. Object storage is S3 or any S3-compatible store.
 
 The checked-in `compose.yaml` pins the development versions:
 
@@ -267,9 +268,10 @@ uv run --extra server --extra cloud-models \
 **The worker refuses to start when a pool of more than one child would hold more resident encoder
 weight than the deployment allows, while either embedder slot names `jina`.** A prefork child owns
 its plugins, so the model is loaded once per child and six children need about 22 GiB of VRAM. The
-pool size is whatever Celery settles on, from `--concurrency` or from `--autoscale`; a pool that
-shares one process, `--pool=threads` or `solo`, holds one copy however wide it runs and is not
-refused. `--max-memory-per-child` bounds resident host memory and structurally cannot bound VRAM;
+pool size is whatever Celery settles on, from `--concurrency` or from `--autoscale`. Only
+`prefork` and `solo` are supported; thread and greenlet pools are refused because the worker
+runtime owns one synchronous event loop per process. `solo` holds one model copy.
+`--max-memory-per-child` bounds resident host memory and structurally cannot bound VRAM;
 during a nine-benchmark evaluation that combination reached 30.2 of the card's 32.6 GB with the GPU
 at 1-5% utilisation, then produced 479 CUDA out-of-memory errors and a kernel `global_oom` on the
 host. Scale in-process encoding with one worker process per assigned GPU at concurrency 1, or serve
@@ -303,9 +305,10 @@ task limit expires first, the overrun is retried as though it were transient and
 paid for again until the retries run out. Nothing is written either way. Set the generator's
 deadline to what its slowest clip actually needs and let the budget follow.
 
-The worker inspects original AV once, writes evidence-grounded Event/Entity/Claim records
-atomically, and cuts one derived clip per grounded span before encoding it locally. Event and
-Claim text is batched through the remote embedder.
+The worker writes evidence-grounded Event/Entity/Claim records atomically and derives clips from
+their grounded spans before encoding them. With generation proxies enabled, video is read once to
+build the proxy and again after perception for evidence clips; long audio spans may produce
+several 30-second clips. Event and Claim text is batched through the remote embedder.
 
 Sampling is the cost lever: see
 [media sampling](configuration.md#media-sampling-worker). Frame rate sets the entire write cost

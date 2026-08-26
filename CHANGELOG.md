@@ -126,7 +126,8 @@ Called out on their own because these are the changes that cost an operator real
   [benchmarking](docs/benchmarking.md#current-baseline-status).
 - No per-tenant quotas or rate limiting.
 - No automatic re-embedding when embedding space or dimension changes.
-- Retrieval does not traverse `same_as` entity edges yet.
+- Retrieval follows direct `same_as` entity aliases but deliberately does not compute transitive
+  closure.
 - Storage schema compatibility is not guaranteed across migrations.
 
 ---

@@ -140,8 +140,10 @@ assert len(written) == len(summaries)
 Measured on one RTX 5090 against the same model, encoding 128 real memory summaries: 600 per
 second in batches of 32 against 183 per second one at a time.
 
-Verifying an answer needs no second call to storage: `result.evidence` already carries signed
-`media_url`s pointing at the exact `start_ms`–`end_ms` slice of the original recording.
+Verifying an answer needs no second call to storage: `result.evidence` carries exact
+`start_ms`–`end_ms` pointers into the original recording plus signed `media_url`s covering
+those spans. A URL normally addresses a derived clip whose own timeline starts at zero and may
+extend beyond the cited interval.
 
 ### Grounded follow-up
 
