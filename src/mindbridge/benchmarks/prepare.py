@@ -18,6 +18,7 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from functools import partial
 from pathlib import Path
 
 from mindbridge.benchmarks.cli_common import flag_value, report, select_by_id
@@ -149,19 +150,30 @@ def prepare_m3(request: PrepareRequest) -> None:
             / f"{video.video_id}.mp4"
         )
         if not source.exists():
-            # On absence rather than up front. `ensure_media` refuses an unobtainable media set
-            # before it looks at the filesystem, and `m3-web` is one -- its 920 videos are the
-            # `video_url` of each annotation, not files the release ships. Calling eagerly would
-            # therefore fail `--subset web` even where the operator had placed every video.
+            # On absence rather than up front, and narrowed to the one video that is missing.
+            # Both halves matter here and neither is an optimisation. `m3-web` is acquired rather
+            # than downloaded -- its 920 videos are the `video_url` of each annotation, not files
+            # the release ships -- so an eager call would re-derive a corpus the operator had
+            # already filled in, and an unnarrowed one would fetch all 920 to cut the one this
+            # run selected. `m3-robot` had the same second problem against the Hub: `--limit 1`
+            # pulled all 100 robot videos, about 200 GB, to read 2 GB of it.
             ensure_media(
                 f"m3-{arguments.subset}",
                 root=request.benchmarks_root,
+                only=(f"videos/{arguments.subset}/{video.video_id}.mp4",),
+                announce=None if request.quiet else partial(report, quiet=False),
                 download=request.download,
             )
             if not source.exists():
+                # The two subsets are three orders of magnitude apart, and one message for both
+                # was wrong about whichever one you were running. `robot` is 100 Hub files at
+                # about 2 GB each, measured from the pinned revision; `web` is 920 web sources
+                # at about 20 MB, measured from the release's own URLs, so the figure that reads
+                # as "give up, you have no disk for this" belongs only to the first.
+                whole = "100 files of about 2 GB" if arguments.subset == "robot" else "920 web"
                 raise FileNotFoundError(
-                    f"M3-Bench source video {source} is absent; it is part of the "
-                    "ByteDance-Seed/M3-Bench release and about 2 GB per video"
+                    f"M3-Bench source video {source} is absent; the {arguments.subset} subset is "
+                    f"{whole} sources of the ByteDance-Seed/M3-Bench release"
                 )
         tenant_id = benchmark_tenant_id(arguments.tenant_prefix, video.video_id, arguments.run_id)
         clips = tuple(

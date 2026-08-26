@@ -27,6 +27,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from datetime import datetime, timezone
+from functools import partial
 from pathlib import Path
 
 from mindbridge.benchmarks.cli_common import (
@@ -113,6 +114,7 @@ def prepare_video_mme(request: PrepareRequest) -> None:
                 f"{video.source_video_id}.mp4",
                 release="video-mme",
                 download=request.download,
+                quiet=request.quiet,
             ),
         )
         for video in videos
@@ -161,6 +163,7 @@ def prepare_video_mme_v2(request: PrepareRequest) -> None:
                 f"{group.video_id}.mp4",
                 release="video-mme-v2",
                 download=request.download,
+                quiet=request.quiet,
             ),
         )
         for group in groups
@@ -209,6 +212,8 @@ def prepare_egotempo(request: PrepareRequest) -> None:
                 f"{clip_id}.mp4",
                 release="egotempo",
                 download=request.download,
+                narrow=True,
+                quiet=request.quiet,
             ),
         )
         for clip_id in dict.fromkeys(question.clip_id for question in questions)
@@ -303,18 +308,37 @@ def _require_media_only(transcript_source: TranscriptSource, *, benchmark: str) 
         )
 
 
-def _source(root: Path, *parts: str, release: str, download: bool = True) -> Path:
+def _source(
+    root: Path,
+    *parts: str,
+    release: str,
+    download: bool = True,
+    narrow: bool = False,
+    quiet: bool = True,
+) -> Path:
     """Resolve one release-named source file, asking `ensure_media` about an absent one.
 
     Absence is two different problems: a media set that can be fetched may simply not have been,
-    and one that is license-gated never will be. Both answers are written in `ensure_media` --
-    it downloads the first and raises the operator's own instructions for the second -- so this
-    asks it rather than keeping a second copy that would drift from the destination those
-    instructions name.
+    and one that is acquired from somewhere other than the release may need a prerequisite this
+    machine does not have. Both answers are written in `ensure_media` -- it obtains the first and
+    raises the operator's own instructions for the second -- so this asks it rather than keeping a
+    second copy that would drift from the destination those instructions name.
+
+    `narrow` asks for this file alone rather than the whole media set, which is what an acquired
+    set needs: EgoTempo's clips come out of Ego4D one span at a time, so an unnarrowed call means
+    every clip the split names. It is off by default because it cannot be used here at all for the
+    two archived releases -- `ensure_media` refuses `only` for those, since no index says which
+    multi-gigabyte volume holds which video -- and Video-MME comes through this same helper.
     """
     path = within(root, *parts)
     if not path.exists():
-        ensure_media(release, root=root, download=download)
+        ensure_media(
+            release,
+            root=root,
+            only=("/".join(parts[1:]),) if narrow else (),
+            announce=None if quiet else partial(report, quiet=False),
+            download=download,
+        )
         if not path.exists():
             raise FileNotFoundError(
                 f"{path} is absent from the {release} media, which is now on disk; the release's "

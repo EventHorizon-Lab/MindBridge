@@ -286,3 +286,94 @@ def test_a_legitimate_climbing_key_still_resolves(tmp_path: Path) -> None:
     resolved = within(tmp_path, str(dialog), "../image/topic_1/a.jpg")
 
     assert resolved == (tmp_path / "mem-gallery" / "data" / "image" / "topic_1" / "a.jpg").resolve()
+
+
+def test_m3_asks_for_the_one_video_it_is_missing_rather_than_the_whole_subset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A `--limit 1` run must not pay for the other 99 videos, or the other 919.
+
+    Two different costs behind one call. `m3-robot` is a Hub download of about 2 GB per video, so
+    an unnarrowed fetch to cut one was roughly 200 GB; `m3-web` is acquired one live URL at a
+    time, so the same call is 920 downloads. Both come out of the same line, which is why this
+    asserts the narrowing rather than the fetch: the producer knows exactly which file is absent,
+    and `ensure_media` takes paths relative to the release directory.
+    """
+    from mindbridge.benchmarks import prepare
+    from mindbridge.benchmarks.prepare import prepare_m3
+
+    asked: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        prepare, "ensure_media", lambda name, **kwargs: asked.append({"release": name, **kwargs})
+    )
+    monkeypatch.setattr(prepare, "staging", lambda: Staging("bucket", _RecordingClient()))
+    dataset = _m3_release(tmp_path)
+
+    with pytest.raises(FileNotFoundError, match=r"videos/robot/video_02\.mp4|is absent"):
+        prepare_m3(
+            PrepareRequest(
+                argv=(
+                    "--dataset",
+                    str(dataset),
+                    "--subset",
+                    "robot",
+                    "--prepared-media",
+                    str(tmp_path / "prepared.json"),
+                    "--output",
+                    str(tmp_path / "out.jsonl"),
+                    "--api-base-url",
+                    "http://localhost:8000",
+                    "--deployment-config",
+                    str(tmp_path / "deployment.json"),
+                    "--run-id",
+                    "prep-01",
+                    "--limit",
+                    "1",
+                ),
+                benchmarks_root=tmp_path,
+                quiet=False,
+            )
+        )
+
+    assert [{key: value for key, value in call.items() if key != "announce"} for call in asked] == [
+        {
+            "release": "m3-robot",
+            "root": tmp_path,
+            "only": ("videos/robot/video_01.mp4",),
+            "download": True,
+        }
+    ], "the fetch names the one selected video, and no other"
+    # And it says so out loud. This producer passed no `announce` at all, so a 712 MB `m3-web`
+    # acquisition and a 2 GB Hub download both ran to completion with nothing on stderr -- found
+    # by running the real command, not by any test here, which is why one exists now.
+    assert callable(asked[0]["announce"]), "a multi-gigabyte fetch must not be silent"
+
+
+def _m3_release(root: Path) -> Path:
+    """Two videos' worth of annotation, in the release's own `robot.json` shape."""
+    import json
+
+    dataset = root / "m3-agent" / "data" / "annotations" / "robot.json"
+    dataset.parent.mkdir(parents=True)
+    dataset.write_text(
+        json.dumps(
+            {
+                f"video_{index:02d}": {
+                    "video_path": f"videos/robot/video_{index:02d}.mp4",
+                    "qa_list": [
+                        {
+                            "question_id": f"video_{index:02d}_Q01",
+                            "question": "What happened?",
+                            "answer": "a robot moved",
+                            "type": ["Temporal"],
+                            "timestamp": "00:10",
+                            "before_clip": 0,
+                        }
+                    ],
+                }
+                for index in (1, 2)
+            }
+        ),
+        encoding="utf-8",
+    )
+    return dataset

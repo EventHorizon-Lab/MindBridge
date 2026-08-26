@@ -123,9 +123,9 @@ def prepare_atm(request: PrepareRequest) -> None:
     }
     absent = tuple(media_id for media_id, path in sources.items() if not path.exists())
     if absent:
-        # On absence rather than eagerly, because `ensure_media` refuses a media set it cannot
-        # obtain before it looks at the disk -- so an operator who placed the files by hand would
-        # be turned away by the fetch they do not need. Named file by file for the same reason
+        # On absence rather than eagerly, because `ensure_media` re-derives an acquired media
+        # set before it looks at the disk -- so an operator who placed the files by hand would pay
+        # again for the fetch they do not need. Named file by file for the same reason
         # `--limit` exists: a scoped run wants a handful of the 3.1 GB of raw media, and the
         # paths are the release's own, already refused by `_source` if one of them climbs.
         ensure_media(

@@ -261,9 +261,10 @@ def _egolife_sources(
     """
     days = range(1, horizon_ms // 86_400_000 + 2)
     # Eager, and deliberately not behind `if not <source>.exists():` the way the producers of
-    # fetchable-or-not media are. That form exists only because `ensure_media` refuses an
-    # `UNOBTAINABLE` set before it looks at the filesystem, so an eager call there fails a
-    # correctly hand-placed corpus; neither release here is one. Eager buys two things instead:
+    # acquired media are. That form exists only because `ensure_media` re-derives an `ACQUIRERS`
+    # set -- 920 YouTube downloads, or every Ego4D clip a split names -- before it looks at the
+    # filesystem, so an eager call there re-pays for a correctly hand-placed corpus; neither
+    # release here is one. Eager buys two things instead:
     # a day here is a 30-second grid *with recording gaps*, so which file names exist is only
     # knowable after the fetch and per-day `is_dir()` would skip a half-fetched day and silently
     # shorten the stream -- a wrong score with no error -- and the Hub client's ETag comparison
@@ -350,10 +351,11 @@ def prepare_supermemory(request: PrepareRequest) -> None:
             f"no SuperMemory-VQA recording of subject {arguments.subject} starts before "
             f"{horizon.isoformat()}, which is when its last selected question ends"
         )
-    # Eager, like `_egolife_sources` and unlike the producers whose media may be `UNOBTAINABLE`:
-    # those call on absence only because `ensure_media` refuses an unfetchable set before it looks
-    # at the filesystem, which would fail a correctly hand-placed corpus. This release is
-    # fetchable, and calling every run is what lets the Hub client's ETag comparison repair a
+    # Eager, like `_egolife_sources` and unlike the producers whose media is acquired rather than
+    # downloaded: those call on absence only because `ensure_media` re-derives an `ACQUIRERS` set
+    # before it looks at the filesystem, which would re-pay for a correctly hand-placed corpus.
+    # This release is a pinned snapshot, and calling every run is what lets the ETag comparison
+    # repair a
     # recording truncated by an interrupted transfer. On absence that file is present, so it is
     # never repaired, `media_duration_ms` under-reports it, and the manifest comes out quietly
     # short -- which is a wrong score rather than a failure.

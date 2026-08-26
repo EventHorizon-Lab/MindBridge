@@ -122,8 +122,8 @@ def prepare_mm_lifelong(request: PrepareRequest) -> None:
     needed = _needed_videos(offsets, scoped)
     absent = _absent_videos(request.benchmarks_root, arguments.split, needed)
     if absent:
-        # On absence rather than eagerly, because `ensure_media` refuses a media set it cannot
-        # obtain before it looks at the disk. Narrowed to what this run reads, which is what
+        # On absence rather than eagerly, because `ensure_media` re-derives an acquired media
+        # set before it looks at the disk. Narrowed to what this run reads, which is what
         # keeps a one-question smoke run off the release's 189 GB of video.
         ensure_media(
             MM_LIFELONG_RELEASE,

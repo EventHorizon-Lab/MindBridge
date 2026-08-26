@@ -222,6 +222,49 @@ def test_egotempo_prepares_one_clip_per_question_group_the_run_will_ingest(
     }
 
 
+def test_egotempo_asks_its_acquirer_for_the_clips_it_is_missing_and_no_others(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """EgoTempo's clips are acquired from Ego4D one span at a time, so an unnarrowed ask is
+    every clip the split names -- tens of terabytes to prepare the one this run selected.
+
+    Video-MME goes through the same `_source` helper and must not narrow: its media ships as 20
+    opaque archives with no index of which holds which video, and `ensure_media` refuses `only`
+    for those. So the narrowing is per call site, and this pins the EgoTempo one.
+    """
+    asked: list[dict[str, object]] = []
+    monkeypatch.setattr(prepare_video, "staging", lambda: Staging("bucket", _RecordingClient()))
+    monkeypatch.setattr(
+        prepare_video,
+        "ensure_media",
+        lambda name, **kwargs: asked.append({"release": name, **kwargs}),
+    )
+    dataset = _egotempo_release(tmp_path)
+    for clip in ("ego4d-uid_10.0_75.0", "ego4d-uid_0.0_20.0"):
+        (tmp_path / "egotempo" / "videos" / f"{clip}.mp4").unlink()
+
+    with pytest.raises(FileNotFoundError):
+        prepare_video.prepare_egotempo(
+            _request(
+                _egotempo_argv(dataset, tmp_path / "prepared.json", tmp_path, "--limit", "1"),
+                tmp_path,
+            )
+        )
+
+    assert asked == [
+        {
+            "release": "egotempo",
+            "root": tmp_path,
+            "only": ("videos/ego4d-uid_10.0_75.0.mp4",),
+            "download": True,
+            # `--quiet` reaches the fetch as well as the producer's own progress, which is the
+            # other half of the wiring the m3 test pins: this request is quiet, so nothing here
+            # may announce.
+            "announce": None,
+        }
+    ]
+
+
 def _request(argv: tuple[str, ...], root: Path) -> PrepareRequest:
     return PrepareRequest(argv=argv, benchmarks_root=root, quiet=True)
 
