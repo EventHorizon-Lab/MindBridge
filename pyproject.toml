@@ -189,16 +189,6 @@ max-complexity = 10
 # code was checked.
 strict = true
 files = ["src", "tests"]
-# pytest identifies conftest files by name, so the session watchdog in tests/conftest.py and the
-# database fixtures in tests/integration/conftest.py are both the module `conftest` to mypy's
-# path-to-module mapping. That is a hard error which stops the run before anything is checked.
-# The documented resolutions all cost more than the file is worth: `explicit_package_bases` with
-# the repository root as a base renames `src/mindbridge/...` too and, once `mypy_path` is set to
-# keep that working, stops sibling test helpers like `stub_judge` from resolving (measured: 1717
-# and 47 errors respectively), and `__init__.py` files change how pytest imports the tree to fix
-# a problem that is only mypy's. Excluding the smaller file is the contained option; it is 15
-# lines of stdlib calls with no project types in it.
-exclude = ["^tests/conftest\\.py$"]
 
 [[tool.mypy.overrides]]
 module = [
@@ -226,6 +216,30 @@ ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 addopts = ["--strict-config", "--strict-markers", "-ra"]
+# `tests/unit` deadlocks intermittently (measured ~1 run in 39). A hang otherwise consumes a CI
+# slot until something external notices and leaves nothing behind to diagnose, so the two runs
+# that matter most produce the least evidence. These two lines arm pytest's own watchdog: it
+# dumps every thread's stack and ends the process non-zero. The stacks are the point.
+#
+# A previous attempt armed `faulthandler.dump_traceback_later(..., exit=True)` from a session
+# fixture in `tests/conftest.py`, on the belief that this ini option "did not fire". Re-measured
+# on pytest 9.1.1 against a real deadlock, that is wrong in both directions:
+#   - The option does fire; it dumped at the budget every time. What it did not do was *exit*,
+#     because terminating is gated behind `faulthandler_exit_on_timeout`, a separate ini that
+#     defaults to false. Setting only the timeout dumps and then hangs forever.
+#   - The hand-armed version exited correctly but dumped **0 lines** under the default
+#     `capture=fd` that CI uses, i.e. it threw away the very evidence it existed to collect.
+#     `dump_traceback_later` binds the fd of `sys.stderr` at arm time, which inside a fixture is
+#     pytest's capture temp file, and `exit=True` calls `_exit()` before pytest can restore or
+#     report it. Only `-s` recovered the dump, and CI does not pass `-s`.
+# The plugin avoids that by stashing `os.dup(stderr_fileno)` in `pytest_configure`, before capture
+# starts. So these two lines strictly dominate the fixture and it was deleted.
+#
+# The budget is per test (the plugin arms in `pytest_runtest_protocol`), not per session, and is
+# far above any healthy test here -- the full suite is ~20s for ~1545 tests. Override per run with
+# `-o faulthandler_timeout=N`; 0 disables. Neither form covers a hang during collection.
+faulthandler_timeout = "300"
+faulthandler_exit_on_timeout = true
 testpaths = ["tests"]
 asyncio_mode = "auto"
 markers = [
