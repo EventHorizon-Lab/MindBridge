@@ -273,3 +273,21 @@ def test_jina_accepts_a_model_that_carries_its_media_processor(
 ) -> None:
     """The guard rejects an empty processor slot, not every model it cannot introspect."""
     assert _load_with(OmniEncoder(object()), monkeypatch) is not None
+
+
+def test_jina_refuses_to_start_without_its_audio_decoder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Missing audio support must fail readiness, not the first production audio request."""
+
+    def import_dependency(name: str) -> object:
+        if name == "sentence_transformers":
+            return SimpleNamespace(SentenceTransformer=lambda *_a, **_k: OmniEncoder(object()))
+        if name == "huggingface_hub":
+            return SimpleNamespace(snapshot_download=lambda **_k: "/models/pinned")
+        raise ImportError(name)
+
+    monkeypatch.setattr("mindbridge.models.jina.import_module", import_dependency)
+
+    with pytest.raises(ModelUnavailableError, match="cloud-models"):
+        JinaEmbedder.load(dimension=2)

@@ -108,6 +108,33 @@ def test_video_clip_applies_the_requested_frame_rate_and_pixel_budget() -> None:
     assert stream.codec_context.width * stream.codec_context.height <= 10_000
 
 
+def test_video_evidence_clip_keeps_speech_aligned_with_its_frames() -> None:
+    """Jina auto-fuses a video's audio only when the derived MP4 still carries the track."""
+    import av
+
+    source = _audiovisual_bytes(seconds=6.0, fps=10, width=320, height=240)
+
+    clip = cut_clips(
+        source,
+        ClipRequest(
+            kind=MediaKind.VIDEO,
+            start_ms=2_000,
+            end_ms=5_000,
+            frames_per_second=2.0,
+            max_pixels=10_000,
+        ),
+    )[0]
+
+    with av.open(io.BytesIO(clip.content), mode="r") as container:
+        assert {stream.type for stream in container.streams} == {"video", "audio"}
+        video = [frame.time for frame in container.decode(container.streams.video[0])]
+    with av.open(io.BytesIO(clip.content), mode="r") as container:
+        audio = [frame.time for frame in container.decode(container.streams.audio[0])]
+    assert video[0] == pytest.approx(audio[0], abs=0.2)
+    assert video[-1] == pytest.approx(audio[-1], abs=0.2)
+    assert video[0] == pytest.approx(0.0, abs=0.2)
+
+
 def test_sampled_video_frames_are_resized_before_they_are_retained() -> None:
     """Peak memory must follow the output budget, not every sampled source frame's pixels."""
     source = _video_bytes(seconds=3.0, fps=10, width=640, height=480)

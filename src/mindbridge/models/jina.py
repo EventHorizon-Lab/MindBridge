@@ -140,6 +140,7 @@ class JinaEmbedder:
         try:
             module = import_module("sentence_transformers")
             hub_module = import_module("huggingface_hub")
+            import_module("librosa")
         except ImportError as error:
             raise ModelUnavailableError(
                 "install MindBridge with the cloud-models extra to load Jina Omni"

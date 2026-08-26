@@ -109,6 +109,9 @@ cloud-models = [
     "mindbridge[media]",
     # models/jina.py downloads the model snapshot through huggingface_hub.snapshot_download.
     "huggingface-hub>=0.30,<2",
+    # Jina Omni loads file-backed audio through librosa. Without it the service starts and
+    # embeds text/images/video, then fails only when the first audio evidence reaches it.
+    "librosa>=0.11,<2",
     "opentelemetry-api>=1.44,<2",
     "sentence-transformers>=5.2,<6",
     "torch==2.13.0",
