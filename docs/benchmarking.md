@@ -122,7 +122,7 @@ tasks:
 Four states, because they need four different things. `ready` runs now. `download` runs after a
 fetch the sweep performs itself. `prepare` means the sweep will stage media into the deployment's
 bucket. A named path is a prepared-media manifest with no producer yet and must be supplied by the
-operator; see "Prepared media that is still manual" below. States can be combined, as in
+operator, which no catalog task now needs. States can be combined, as in
 `download, prepare`.
 
 Task names are comma-separated and the flag repeats, so `--tasks m3-robot,m3-web --tasks egolife`
@@ -158,10 +158,11 @@ digest this repository committed. Three things about that are deliberate.
 
 **Only the files a task reads.** ATM-Bench's Hub repository is 3.2 GB and Mem-Gallery's is
 530 MB, but a run consumes five JSON files and one directory of them — about 40 MB between them,
-against 302 GB of full releases. The media in those releases is not something a run can use as a
-file anyway. MEMLENS is the exception worth planning disk for: its annotation *is* the corpus, so
-its four context windows are 98 MB, 191 MB, 369 MB and 732 MB, and `--tasks all` fetches about
-1.4 GB rather than 40 MB.
+against 302 GB of full releases. Media is fetched separately and only for a task that stages it,
+narrowed to the units `--limit` selects where the release allows narrowing — a `--limit 1` EgoLife
+run takes one day rather than the release's 477 GiB. MEMLENS is the exception worth planning disk
+for among the annotations: its annotation *is* the corpus, so its four context windows are 98 MB,
+191 MB, 369 MB and 732 MB, and `--tasks all` fetches about 1.4 GB rather than 40 MB.
 
 **Pinned.** Each release is fetched at a fixed commit — every one of them, asserted by
 `tests/unit/benchmarks/test_releases.py` rather than left to review, because a branch name makes
@@ -190,10 +191,28 @@ Media benchmarks read a prepared-media manifest: a JSON file naming clips alread
 storage, with their durations and the identity spans over them. A sweep produces that manifest
 itself for the benchmarks below, staging into the deployment's own bucket:
 
-| Benchmark | Produced from | Needs |
+| Benchmark | Produced from | Media obtained by |
 | --- | --- | --- |
-| `mem-gallery` | the release's own images | the bucket |
-| `m3-robot`, `m3-web` | the official videos, cut into 30-second clips | the bucket, the videos |
+| `mem-gallery` | the release's own images | the sweep |
+| `m3-robot` | the official videos, cut into 30-second clips | the sweep |
+| `m3-web` | the official videos, cut into 30-second clips | you — see below |
+| `video-mme`, `video-mme-v2` | the official videos, cut into 30-second segments | the sweep |
+| `egotempo` | the pre-trimmed clip each question names | you — see below |
+| `egolife` | the release's own 30-second clips, staged verbatim | the sweep |
+| `egomem` | EgoLife's clips, on EgoMemReason's own horizons | the sweep |
+| `supermemory` | the official recordings, cut to each question's horizon | the sweep |
+| `mm-lifelong` | the official videos on the split-wide clock | the sweep |
+| `atm-main`, `atm-hard` | the release's own image and video archive | the sweep |
+
+ATM-Bench's `sgm` arms are absent deliberately: they ingest the release's pre-processed captions
+and open no manifest, so nothing is staged for them. That is declared rather than inferred from
+the flag being absent — absence is what makes the sweep *add* the flag, which would have staged
+about 3 GB neither arm reads.
+
+EgoLife's clips are staged as the release published them rather than re-cut. They are already the
+30-second split both shapes want, and they carry an AAC track that a re-encode is the documented
+way to lose. SuperMemory-VQA's recordings carry no audio at all — that is the public release, not
+the clipper.
 
 Two properties are forced rather than chosen, and they are worth knowing before reading a
 manifest.
@@ -217,18 +236,23 @@ Bucket credentials are Boto3's own (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`
 endpoint come from the same `[object_storage]` configuration the deployment reads, so a benchmark
 cannot stage into a bucket the deployment will not look in.
 
-### Prepared media that is still manual
+### Media the sweep cannot fetch
 
-`egolife`, `egomem`, `egotempo`, `mm-lifelong`, `supermemory`, `video-mme`, and `video-mme-v2`
-have no producer yet, and `--list-tasks` names the manifest each one wants. Their manifests are
-not the two shapes above:
+Naming a task fetches the media it reads, at the revision `releases.py` pins, with no size cap and
+no prompt — Video-MME's 20 archives are 94 GiB and the sweep will take all of them. Two media sets
+are the exception, and both say so with the instruction rather than failing vaguely:
 
-- EgoLifeQA, EgoMemReason, and MM-Lifelong encode their own clocks — EgoLifeQA's `DAYn` plus
-  `HHMMSSFF` at the release's 20 FPS, with clips crossing a question's time withheld until a
-  later question. That derivation is the work, not the cutting.
-- EgoTempo's videos are Ego4D, which is licensed separately and cannot be fetched on your behalf.
-- Video-MME ships its videos as 20 zip archives totalling 94 GiB, so a single video cannot be
-  obtained without the archive holding it.
+- **`egotempo`** — its videos are Ego4D, released under a signed access agreement no unattended
+  download can accept. Request access, fetch each question's `source_video_id` with the `ego4d`
+  CLI, and cut `clip_start_seconds..clip_end_seconds` into
+  `<benchmarks-root>/egotempo/videos/<clip_id>.mp4`. The producer wants that trimmed clip, and its
+  name is the `clip_id` because the runner requires the prepared `video_id` to equal it.
+- **`m3-web`** — its 920 videos are web sources the release distributes as the `video_url` of each
+  entry in `m3-agent/data/annotations/web.json` rather than as files. Download them yourself into
+  `<benchmarks-root>/m3-bench/videos/web/<video_id>.mp4`.
+
+`--no-download` refuses both the annotation fetch and the media fetch rather than performing
+either, so it fails on an absent release instead of quietly obtaining 94 GiB.
 
 M3-Bench's released memory graphs would give a caption-only manifest with no video at all, which
 is the cheaper released-text arm. They are distributed as Python pickles, and unpickling a
@@ -629,8 +653,8 @@ Both ATM-Bench and Mem-Gallery are pinned by revision because the digests in thi
 meaningful against a fixed revision. ATM-Bench is 3.2 GB including the raw media; Mem-Gallery is
 530 MB.
 
-Large M3-Bench media stays outside Git. Acquire it through the official Hugging Face client rather
-than a MindBridge downloader:
+Large M3-Bench media stays outside Git. A sweep naming `m3-robot` fetches it, so this is for
+populating a corpus ahead of time — a mirror, or an offline machine:
 
 ```bash
 uvx --from huggingface-hub hf download ByteDance-Seed/M3-Bench \
@@ -647,8 +671,9 @@ uvx --from huggingface-hub hf download ByteDance-Seed/M3-Bench \
   --local-dir .benchmarks/m3-bench
 ```
 
-Acquire the released SuperMemory-VQA RGB videos the same way; raw audio is not part of the public
-release:
+The released SuperMemory-VQA RGB videos are fetched the same way, and a sweep naming
+`supermemory-subject-1` narrows the fetch to the recordings its questions reach. Raw audio is not
+part of the public release, so these files carry no audio track at all:
 
 ```bash
 uvx --from huggingface-hub hf download OSU-AIoT-MLSys-Lab/SuperMemory-VQA \

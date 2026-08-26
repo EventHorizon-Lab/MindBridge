@@ -175,9 +175,12 @@ def test_egomem_bounds_each_identity_by_its_own_last_question_not_by_the_latest_
     """`run_egomem_reason` replays one wearer at a time and refuses another's stream.
 
     So a wearer whose last question is early gains nothing from a later wearer's: clips past its
-    own query time are uploads no run ingests. The later wearer is asked first here on purpose --
-    with it second, one horizon carried across both identities produces the right answer anyway
-    and the ablation measures nothing.
+    own query time are uploads no run ingests. The later wearer is asked first on purpose, and
+    that ordering buys exactly one bug shape: an implementation seeding each identity from the
+    running maximum instead of from its own questions. Asked second, that leak returns the right
+    answer and nothing notices. One horizon shared by everyone is caught in either order --
+    measured rather than assumed, because an early sweep reported this as a survivor for an
+    unrelated reason and the ordering got the credit.
     """
     from mindbridge.benchmarks.egolife_runner import load_prepared_egomem
 

@@ -39,7 +39,10 @@ The capabilities present on `master` today:
 
 - REST API with a generated OpenAPI document and a closed error-code contract.
 - Official MCP server over stdio with seven tools, sharing the REST schemas.
-- Typed asynchronous Python SDK in the base package, with resumable job-progress streaming.
+- Typed asynchronous Python SDK in the base package, with resumable job-progress streaming, and
+  `observe_file()` for a local path: it hashes the file, takes a presigned upload signed only into
+  the caller's own tenant prefix, sends the bytes to object storage directly rather than through
+  the API, and observes the resulting URI.
 - `mindbridge` and `mindbridge-bench` command trees with a documented exit-status contract.
 
 ### Platform
@@ -60,8 +63,11 @@ The capabilities present on `master` today:
   numbers its manifest and score sidecar carry and which of the two each came from; `--report DIR`
   prints it again for an earlier run, which is how a benchmark scored afterwards reports without
   running twice. `--limit N` scopes any runner to its first N units for a smoke run, the media
-  ingest deadlines reach every task whose runner accepts them, and prepared-media manifests are
-  produced for Mem-Gallery and M3-Bench rather than assembled by hand. Scoring follows
+  ingest deadlines reach every task whose runner accepts them, and naming a task obtains what it
+  reads: the annotations, the media behind them, and the prepared-media manifest, staged into the
+  deployment's own bucket per run. Ego4D and M3-Bench's web videos are the two media sets no
+  unattended download can accept, and they print the operator's own instructions rather than
+  failing vaguely; `--no-download` refuses both fetches instead of performing either. Scoring follows
   lmms-eval's contract: each benchmark declares who scores it, the four whose protocol is exact
   match score themselves, the seven whose answers are free text are judged by a model called from
   inside the run, and `--predict-only` reports the `999` bypass sentinel instead. A judge that
