@@ -9,13 +9,22 @@ Three properties are deliberate.
 
 **Only the files a task actually reads.** ATM-Bench's Hub repository is 3.2 GB and Mem-Gallery's
 is 530 MB, but the questions, emails, and schema-guided text a run consumes are five JSON files
-and one directory. Fetching by declared input rather than by repository is the difference between
-40 MB and 302 GB.
+and one directory -- about 40 MB between them, against 302 GB of full releases. Fetching by
+declared input rather than by repository is what makes that the difference. MEMLENS is the one
+release where the annotation is itself large: its four context windows are 98 MB, 191 MB,
+369 MB and 732 MB, so `--tasks all` fetches about 1.4 GB rather than 40 MB.
 
-**Pinned, and verified against a digest this repository already committed.** Every annotation
-here has a `source_sha256` in `benchmarks/manifests/dataset-adapters-smoke.json`, recorded when
-`mindbridge-bench datasets` last ran. A fetch that produces different bytes is upstream drift,
-and the run stops rather than quietly measuring a different corpus.
+**Pinned to a commit, every one of them.** A branch name would make the same task name mean
+different bytes on different days, which is the drift that makes two scores incomparable, so
+`test_releases.py` asserts that every revision here is a 40-character commit. That is what
+fixes the corpus; the digests below are the second line.
+
+**Verified where a digest exists.** Most annotations here have a `source_sha256` in
+`benchmarks/manifests/dataset-adapters-smoke.json`, recorded when `mindbridge-bench datasets`
+last ran; a fetch producing other bytes stops the run and the file is deleted rather than left
+to be trusted next time. The rest are covered by the pin alone -- the smoke manifest keys them
+by something other than a file name, listed under `RECORDED_DIGESTS` -- and
+`mindbridge-bench datasets` is what checks a corpus already on disk.
 
 **No media.** The releases hold videos and audio that a run cannot use as files anyway: the
 runners read prepared-media manifests naming objects already in storage, and MindBridge contains
@@ -25,12 +34,12 @@ out-of-band; what this saves it is the annotation download, not the preparation.
 
 from __future__ import annotations
 
-import hashlib
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-_HUB_URL = "https://huggingface.co"
+from mindbridge.file_integrity import sha256_file
+
 _RAW_URL = "https://raw.githubusercontent.com"
 _CHUNK_BYTES = 1 << 20
 
@@ -64,16 +73,18 @@ RELEASES: dict[str, Release] = {
         "7022ba77b4d89f51cf34e499767995ccd5c90c7a",
         hub=False,
     ),
-    "video-mme": Release("lmms-eval/Video-MME", "main"),
+    "video-mme": Release("lmms-eval/Video-MME", "ead1408f75b618502df9a1d8e0950166bf0a2a0b"),
     "video-mme-v2": Release(
         "MME-Benchmarks/Video-MME-v2",
         "6e4bebb03202e1ddbf3d37703e560e51c5aa2d64",
     ),
-    "egolife": Release("lmms-lab/EgoLife", "main"),
-    "supermemory-vqa": Release("OSU-AIoT-MLSys-Lab/SuperMemory-VQA", "main"),
-    "egomem-reason": Release("Ted412/EgoMemReason", "main"),
-    "memlens": Release("xiyuRenBill/MEMLENS", "main"),
-    "mm-lifelong": Release("MM-Lifelong/MM-Lifelong", "main"),
+    "egolife": Release("lmms-lab/EgoLife", "143fb319be7aa5ae210c936bf4f0f3a86092afb0"),
+    "supermemory-vqa": Release(
+        "OSU-AIoT-MLSys-Lab/SuperMemory-VQA", "1d228e0f10049a8a84c458dded2aa25b1e21ce8f"
+    ),
+    "egomem-reason": Release("Ted412/EgoMemReason", "7e581505b9dce0e85193a27ae689ff899d0bc507"),
+    "memlens": Release("xiyuRenBill/MEMLENS", "afa101a1907cc37db40b50d649547964387b96b7"),
+    "mm-lifelong": Release("MM-Lifelong/MM-Lifelong", "248aa82039a574e63a2e524746a7cd8f32330443"),
     "atm-bench": Release("Jingbiao/ATM-Bench", "78e826dc07e97466b2f54443831ef9a83ab8b27c"),
     "mem-gallery": Release("Ethan-Bei/Mem-Gallery", "af912daba984e896e253016b7c7e334ef92c2a6f"),
 }
@@ -122,7 +133,7 @@ def release_for(path: Path, *, root: Path) -> tuple[str, str] | None:
     return parts[0], "/".join(parts[1:])
 
 
-def missing_inputs(inputs: Iterable[Path], *, root: Path) -> tuple[Path, ...]:
+def missing_inputs(inputs: Iterable[Path]) -> tuple[Path, ...]:
     """The declared inputs that are not on disk, in the order they were declared."""
     return tuple(path for path in inputs if not path.exists())
 
@@ -135,7 +146,7 @@ def fetch(inputs: Sequence[Path], *, root: Path, announce: object = None) -> tup
     """
     unobtainable: list[Path] = []
     wanted: dict[str, list[tuple[str, Path]]] = {}
-    for path in missing_inputs(inputs, root=root):
+    for path in missing_inputs(inputs):
         located = release_for(path, root=root)
         if located is None:
             unobtainable.append(path)
@@ -220,19 +231,28 @@ def _download_from_git(release: Release, within: str, *, destination: Path) -> N
 
 
 def _require_recorded_digest(path: Path) -> None:
-    """Refuse a download whose bytes are not the ones this repository recorded."""
+    """Refuse a download whose bytes are not the ones this repository recorded.
+
+    The rejected file is deleted. Leaving it at its final path meant a drifted release was
+    verified exactly once: the next sweep's `missing_inputs` saw the file present, excluded it
+    from `members`, never reached this check, and measured the drifted corpus with no signal.
+    Removing it makes the next run fetch again, which is the only outcome that can either
+    succeed or fail the same way twice.
+
+    A file with no recorded digest is accepted. That is safe only because every release is
+    pinned to a commit -- `test_releases.py` asserts it -- so its bytes are fixed even where no
+    digest names them; `RECORDED_DIGESTS` covers the annotations the smoke manifest keys by
+    file name, and the module docstring says which are deliberately absent.
+    """
     recorded = RECORDED_DIGESTS.get(path.name)
     if recorded is None or not path.exists():
         return
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        while chunk := handle.read(_CHUNK_BYTES):
-            digest.update(chunk)
-    actual = digest.hexdigest()
+    actual = sha256_file(path)
     if actual != recorded:
+        path.unlink()
         raise ValueError(
-            f"{path} hashes to {actual}, not the {recorded} recorded in "
-            "benchmarks/manifests/dataset-adapters-smoke.json; upstream changed the release, so "
-            "re-run `mindbridge-bench datasets` and record the new digest before measuring "
-            "against it"
+            f"{path} hashed to {actual}, not the {recorded} recorded in "
+            "benchmarks/manifests/dataset-adapters-smoke.json, and has been deleted; upstream "
+            "changed the release, so re-run `mindbridge-bench datasets` and record the new "
+            "digest before measuring against it"
         )

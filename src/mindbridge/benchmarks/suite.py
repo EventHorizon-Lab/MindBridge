@@ -48,7 +48,7 @@ from mindbridge.benchmarks.cli_common import (
     select_by_id,
 )
 from mindbridge.benchmarks.prepare import PREPARERS, PrepareRequest
-from mindbridge.benchmarks.releases import fetch
+from mindbridge.benchmarks.releases import fetch, missing_inputs, release_for
 from mindbridge.benchmarks.task_catalog import (
     DEFAULT_BENCHMARKS_ROOT,
     listing,
@@ -208,9 +208,11 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> int:
     if arguments.dry_run:
         _print_plan(plans)
         return 0
-    _obtain_releases(arguments)
+    # Output check before the download: refusing a sweep costs nothing, and the fetch it would
+    # otherwise follow is up to 1.4 GB.
     summary_path = arguments.output_dir / SUMMARY_FILENAME
     _require_writable_outputs(plans, summary_path, overwrite=arguments.overwrite)
+    _obtain_releases(arguments)
     report(f"running {len(plans)} benchmarks", quiet=arguments.quiet)
     started_at = datetime.now(timezone.utc)
     outcomes = _run_plans(plans, arguments)
@@ -239,16 +241,38 @@ def _obtain_releases(arguments: _Arguments) -> None:
     A task whose prepared-media manifest is absent is reported rather than refused. It will fail
     when its turn comes, with its runner naming the file, and refusing the whole sweep for it
     would also refuse the tasks that are ready.
+
+    `--no-download` suppresses the fetch, not the check, and it refuses exactly what the fetch
+    would have obtained. Returning early instead meant the flag documented as "fail on an absent
+    official release" neither downloaded nor failed: the sweep started and each absent corpus
+    surfaced as its own task's failure, hours apart, which is the shape
+    `_require_writable_outputs` exists to avoid for outputs. An absent operator artifact is
+    still only reported, with or without the flag, for the reason above.
     """
-    if arguments.suite_path is not None or not arguments.download:
+    if arguments.suite_path is not None:
         return
     inputs = task_inputs(arguments.task_names, root=arguments.benchmarks_root)
     for name, paths in inputs.items():
-        unobtainable = fetch(
-            paths,
-            root=arguments.benchmarks_root,
-            announce=None if arguments.quiet else _announce,
-        )
+        if not arguments.download:
+            absent = missing_inputs(paths)
+            refusable = tuple(
+                path
+                for path in absent
+                if release_for(path, root=arguments.benchmarks_root) is not None
+            )
+            if refusable:
+                listed = ", ".join(str(path) for path in refusable)
+                raise ValueError(
+                    f"{name}: {listed} is absent and --no-download was given; drop the flag to "
+                    "fetch what an official release supplies"
+                )
+            unobtainable = tuple(path for path in absent if path not in refusable)
+        else:
+            unobtainable = fetch(
+                paths,
+                root=arguments.benchmarks_root,
+                announce=None if arguments.quiet else _announce,
+            )
         for path in unobtainable:
             report(
                 f"{name}: {path} is not part of any official release; prepare it as "
@@ -316,11 +340,24 @@ def _run_task_prepared(plan: _Plan, arguments: _Arguments) -> SuiteTaskOutcome:
     outcome row as a run that died, so the summary says which task could not be staged and the
     remaining tasks still run.
     """
+    started = time.monotonic()
     try:
         _prepare_task(plan, arguments)
+    except KeyboardInterrupt:
+        # Staging is the longest phase outside a runner -- a full decode and re-encode, or
+        # thousands of uploads -- so it is where an interrupt is most likely to land. Letting
+        # `BaseException` through unwinds `main` and the summary is never written, losing every
+        # outcome the sweep had already collected. Reported as this task's interrupt instead, so
+        # `_run_plans` breaks and the summary is written exactly as for a runner.
+        print(f"{PROGRAM} {plan.task.name}: interrupted while preparing media", file=sys.stderr)
+        return _outcome(
+            plan,
+            exit_code=INTERRUPT_EXIT_CODE,
+            duration_seconds=time.monotonic() - started,
+        )
     except Exception as error:
         print(f"{PROGRAM} {plan.task.name}: error: {error}", file=sys.stderr)
-        return _outcome(plan, exit_code=1, duration_seconds=0.0)
+        return _outcome(plan, exit_code=1, duration_seconds=time.monotonic() - started)
     return _run_task(plan)
 
 
@@ -344,11 +381,32 @@ def _prepare_task(plan: _Plan, arguments: _Arguments) -> None:
     )
 
 
+def _flag_value(arguments: Sequence[str], flag: str) -> str | None:
+    """The value argparse would take for `flag`, in either spelling, or None if it is absent.
+
+    `flag in arguments` misses `--flag=value`, which argparse accepts and which the sweep's own
+    owned-flag check already splits on. Missing it meant a `--suite` entry spelled that way was
+    read as not carrying the flag, so the sweep appended its own derived path, argparse took the
+    later occurrence, and the operator's hand-supplied manifest was silently discarded.
+    """
+    value: str | None = None
+    for index, argument in enumerate(arguments):
+        name, separator, inline = argument.partition("=")
+        if name != flag:
+            continue
+        if separator:
+            value = inline
+        elif index + 1 < len(arguments):
+            value = arguments[index + 1]
+    return value
+
+
 def _prepared_manifest_path(plan: _Plan) -> Path | None:
     """The manifest this task reads, read off the argv rather than guessed from the benchmark."""
     for flag in ("--prepared-media", "--prepared-images"):
-        if flag in plan.arguments:
-            return Path(plan.arguments[plan.arguments.index(flag) + 1])
+        value = _flag_value(plan.arguments, flag)
+        if value is not None:
+            return Path(value)
     return None
 
 
@@ -463,7 +521,7 @@ def _prepared_media_arguments(
     supplies a manifest MindBridge cannot produce.
     """
     producer = PREPARERS.get(task.benchmark)
-    if producer is None or producer.flag in task.arguments:
+    if producer is None or _flag_value(task.arguments, producer.flag) is not None:
         return ()
     return (producer.flag, str(arguments.output_dir / f"{run_id}-prepared.json"))
 

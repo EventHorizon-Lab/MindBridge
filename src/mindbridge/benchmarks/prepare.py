@@ -186,6 +186,35 @@ class PrepareRequest:
     quiet: bool
 
 
+def _within(root: Path, *parts: str) -> Path:
+    """Resolve a path a release names, refusing one that leaves the corpus root.
+
+    Mem-Gallery's image keys are relative paths out of its own annotations -- `../image/<topic>/`,
+    which is why the join is needed at all -- and this command now downloads those annotations
+    itself. A key of `../../../../etc/passwd` would otherwise be read and uploaded into the
+    deployment's bucket, so the release gets to name a file inside the corpus and nothing else.
+    """
+    resolved = (root / Path(*parts)).resolve()
+    corpus = root.resolve()
+    if not resolved.is_relative_to(corpus):
+        raise ValueError(
+            f"{'/'.join(parts)} resolves to {resolved}, outside the corpus at {corpus}; "
+            "a release may only name files inside it"
+        )
+    return resolved
+
+
+def _key_component(value: str, *, label: str) -> str:
+    """Refuse a release-supplied string that would not stay one component of an object key.
+
+    A topic containing `/` or `..` is interpolated straight into the S3 key otherwise, which
+    writes outside the prefix the manifest claims and can silently collide across topics.
+    """
+    if not value or value in {".", ".."} or "/" in value or "\\" in value:
+        raise ValueError(f"{label} {value!r} is not usable as one object-key component")
+    return value
+
+
 M3_TIMELINE_ORIGIN = datetime(2000, 1, 1, tzinfo=timezone.utc)
 """M3-Bench annotations are relative to the start of their own video, so the origin is arbitrary.
 
@@ -211,9 +240,12 @@ def prepare_mem_gallery(request: PrepareRequest) -> None:
         label="selected Mem-Gallery topics",
         limit=arguments.limit,
     )
+    if not topics:
+        raise ValueError("Mem-Gallery selection must not be empty")
     target = staging()
     images: list[MemGalleryPreparedImage] = []
     for topic in topics:
+        topic_key = _key_component(topic.topic, label="Mem-Gallery topic")
         tenant_id = benchmark_tenant_id(arguments.tenant_prefix, topic.topic, arguments.run_id)
         references = _mem_gallery_references(topic)
         report(
@@ -221,13 +253,13 @@ def prepare_mem_gallery(request: PrepareRequest) -> None:
             quiet=request.quiet,
         )
         for image_key, media_object_id in references.items():
-            path = (arguments.dataset_path / image_key).resolve()
+            path = _within(request.benchmarks_root, str(arguments.dataset_path), image_key)
             images.append(
                 MemGalleryPreparedImage(
                     image_key=image_key,
                     media_object=target.stage(
                         tenant_id=tenant_id,
-                        key=f"mem-gallery/{topic.topic}/{path.name}",
+                        key=f"mem-gallery/{topic_key}/{path.name}",
                         content=path.read_bytes(),
                         kind=MediaKind.IMAGE,
                         media_object_id=media_object_id,
@@ -260,7 +292,7 @@ def _mem_gallery_references(topic: object) -> dict[str, str]:
 def prepare_m3(request: PrepareRequest) -> None:
     """Cut each selected official video into the 30-second clips M3-Bench's schema requires."""
     from mindbridge.benchmarks.m3_bench import load_m3_bench
-    from mindbridge.benchmarks.m3_cli import _parse_arguments
+    from mindbridge.benchmarks.m3_cli import _parse_arguments, _validate_subset
     from mindbridge.benchmarks.m3_runner import M3PreparedClip, M3PreparedVideo
 
     arguments = _parse_arguments(list(request.argv), None)
@@ -271,6 +303,11 @@ def prepare_m3(request: PrepareRequest) -> None:
         label="M3-Bench video IDs",
         limit=arguments.limit,
     )
+    # The runner's own check, run here too. Selecting the same way it does is not the same as
+    # accepting the same input: `--subset web` pointed at `robot.json` selects fine and is then
+    # refused by the runner, so without this a producer cuts and uploads every video -- about
+    # 2 GB each -- before anything says the subset is wrong.
+    _validate_subset(videos, arguments.subset)
     target = staging()
     prepared: list[M3PreparedVideo] = []
     for video in videos:
