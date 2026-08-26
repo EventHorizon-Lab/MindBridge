@@ -1,6 +1,9 @@
 """Contract checks for the SentenceTransformers Jina service."""
 
+import asyncio
 import base64
+import threading
+import time
 
 import httpx
 import pytest
@@ -94,6 +97,39 @@ async def test_service_batches_text_and_rejects_the_removed_messages_shape() -> 
     assert len(embedder.requests[0].inputs) == 2
     assert removed_shape.status_code == 400
     assert malformed.status_code == 400
+
+
+async def test_service_adaptively_batches_concurrent_requests() -> None:
+    embedder = _FakeEmbedder()
+    app = create_app(
+        api_key="test-key",
+        embedder_config={"model_id": "test-model", "dimension": 32},
+        embedder=embedder,
+        batch_wait_ms=50,
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        responses = await asyncio.gather(
+            client.post(
+                "/v1/embeddings",
+                headers={"Authorization": "Bearer test-key"},
+                json={"model": "test-model", "dimensions": 32, "input": "Query: first"},
+            ),
+            client.post(
+                "/v1/embeddings",
+                headers={"Authorization": "Bearer test-key"},
+                json={
+                    "model": "test-model",
+                    "dimensions": 32,
+                    "input": ["Query: second", "Query: third"],
+                },
+            ),
+        )
+
+    assert [len(response.json()["data"]) for response in responses] == [1, 2]
+    assert len(embedder.requests) == 1
+    assert len(embedder.requests[0].inputs) == 3
 
 
 async def test_service_accepts_omni_input_and_materializes_data_uris() -> None:
@@ -290,6 +326,79 @@ async def test_service_downloads_allowlisted_media_with_a_bounded_reader(
     assert response.status_code == 200
     assert requests == [("media.example", 443, 30, "GET", "/object.png?signature=1")]
     assert embedder.media_contents == [b"remote"]
+
+
+async def test_service_materializes_video_inputs_concurrently(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lock = threading.Lock()
+    active = 0
+    peak = 0
+
+    class Response:
+        status = 200
+        length = 5
+
+        def __init__(self) -> None:
+            self.headers = {"Content-Type": "video/mp4"}
+
+        def read(self, _amount: int) -> bytes:
+            nonlocal active, peak
+            with lock:
+                active += 1
+                peak = max(peak, active)
+            time.sleep(0.05)
+            with lock:
+                active -= 1
+            return b"video"
+
+    class Connection:
+        def __init__(self, _host: str, _port: int, *, timeout: int) -> None:
+            assert timeout == 30
+
+        def request(self, _method: str, _target: str) -> None:
+            return None
+
+        def getresponse(self) -> Response:
+            return Response()
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr("http.client.HTTPSConnection", Connection)
+    embedder = _FakeEmbedder()
+    app = create_app(
+        api_key="test-key",
+        embedder_config={"model_id": "test-model", "dimension": 32},
+        embedder=embedder,
+        media_origins=("https://media.example",),
+    )
+    sample = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "video_url",
+                    "video_url": {"url": "https://media.example/video.mp4"},
+                }
+            ],
+        }
+    ]
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.post(
+            "/v1/embeddings",
+            headers={"Authorization": "Bearer test-key"},
+            json={
+                "model": "test-model",
+                "dimensions": 32,
+                "input": [sample, sample],
+            },
+        )
+
+    assert response.status_code == 200
+    assert peak == 2
 
 
 async def test_service_rejects_an_oversized_body(

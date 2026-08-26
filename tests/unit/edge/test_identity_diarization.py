@@ -108,6 +108,29 @@ async def test_funasr_returns_integrated_timed_speech_and_speaker_centroids(
     ]
 
 
+async def test_funasr_adaptively_batches_concurrent_gpu_calls(tmp_path: Path) -> None:
+    class Pipeline:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.batch_sizes: list[int] = []
+
+        def generate(self, **kwargs: object) -> list[dict[str, object]]:
+            self.calls += 1
+            inputs = cast(list[str], kwargs["input"])
+            self.batch_sizes.append(len(inputs))
+            return [{"text": ""} for _input in inputs]
+
+    media = tmp_path / "clip.wav"
+    media.write_bytes(b"placeholder")
+    upstream = Pipeline()
+    pipeline = FunASRSpeechPipeline(upstream, device="cuda", batch_wait_ms=50)
+
+    await asyncio.gather(pipeline.analyze_file(media), pipeline.analyze_file(media))
+
+    assert upstream.calls == 1
+    assert upstream.batch_sizes == [2]
+
+
 def test_funasr_loads_registered_integrated_speaker_model(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
