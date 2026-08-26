@@ -139,8 +139,13 @@ def test_the_pin_and_the_narrowing_both_reach_the_hub_client(
     pinned and the pin reaching the Hub client are two halves, and the table test only proves the
     first. Faked one level deeper for that reason: at `snapshot_download` rather than at the
     function that calls it, which is the only level where the request itself is observable.
+
+    Skipped rather than failed without the Hub client: the quality matrix installs `media` and
+    `server`, not `benchmarks`, so this import is absent on every CI leg -- and a hard import here
+    turned the whole run red while the local gate, run in a venv that happened to carry it, stayed
+    green.
     """
-    import huggingface_hub
+    huggingface_hub = pytest.importorskip("huggingface_hub")
 
     asked: list[dict[str, object]] = []
     monkeypatch.setattr(huggingface_hub, "snapshot_download", lambda **kwargs: asked.append(kwargs))
@@ -460,9 +465,13 @@ def test_a_gated_release_names_the_terms_to_accept_rather_than_a_missing_reposit
     dataset the user can see in their browser as one that does not exist -- and sends them looking
     for a typo in a name that is correct. The assertion is on the terms URL and the authorisation
     step, because those two sentences are the entire remedy.
+
+    Skipped rather than failed without the Hub client, for the same reason as the pin test above.
+    `huggingface_hub.errors` is asked for by name because an `importorskip` of the package does not
+    establish that the submodule imports.
     """
-    import huggingface_hub
-    from huggingface_hub.errors import GatedRepoError
+    huggingface_hub = pytest.importorskip("huggingface_hub")
+    GatedRepoError = pytest.importorskip("huggingface_hub.errors").GatedRepoError
 
     def _gated(**_: object) -> None:
         # Built the way the Hub client raises it: `HfHubHTTPError` requires the response, and a

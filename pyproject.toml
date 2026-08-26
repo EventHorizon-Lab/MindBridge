@@ -201,8 +201,11 @@ module = [
     "av.*",
     # Same shape one extra over: the quality matrix installs `media` and `server`, not
     # `benchmarks`, so the Hub client benchmarks/releases.py downloads releases with is absent
-    # while every leg still type-checks the module that imports it.
+    # while every leg still type-checks the module that imports it. The submodule pattern is
+    # needed as well as the bare name: `releases.py` reads `GatedRepoError` out of
+    # `huggingface_hub.errors`, and an override for a package does not cover what is under it.
     "huggingface_hub",
+    "huggingface_hub.*",
     "numpy",
     "PIL",
     "PIL.*",
