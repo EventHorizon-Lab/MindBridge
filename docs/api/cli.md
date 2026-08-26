@@ -451,12 +451,13 @@ uv run --extra benchmarks mindbridge-bench eval --list-tasks
 ```
 
 The task names are the only thing with no default; `--run-id` falls back to `sweep-<UTC
-timestamp>`. Pass it explicitly for any task reading a prepared-media manifest you staged
-yourself: the manifest's object URIs are only readable under the tenant its run ID derives, so
-that ID has to be the one you staged for. Downloads are pinned to a commit and, where the smoke
-manifest names a digest for them, verified against
-`benchmarks/manifests/dataset-adapters-smoke.json`; prepared-media manifests are the one input no
-release supplies.
+timestamp>`. Pass it explicitly for any task using a prepared-media manifest you staged yourself:
+the manifest's object URIs are only readable under the tenant its run ID derives, so that ID has
+to be the one you staged for. Downloads are pinned to a commit and, where the smoke manifest
+names a digest for them, verified against
+`benchmarks/manifests/dataset-adapters-smoke.json`. Releases do not contain prepared-media
+manifests: `eval` creates them for M3-Bench and Mem-Gallery, while tasks without a preparer report
+the exact manifest path you must stage.
 
 `--suite FILE` is the escape hatch for a task the catalog does not name — a JSON file of
 `{"tasks": [{"name": ..., "benchmark": ..., "arguments": [...]}]}`, validated exactly as strictly

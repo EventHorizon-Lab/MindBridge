@@ -8,10 +8,10 @@ is why MEMLENS appears four times and LoCoMo-Refined once. Optional filters are 
 topics is a task of your own, spelled in a `--suite` file or handed straight to the runner.
 
 Paths are written against `--benchmarks-root`, which defaults to the `.benchmarks/` layout
-`docs/benchmarking.md` tells you to download into. Prepared-media manifests are the exception
-worth knowing: MindBridge does not produce them, so what the table holds is the file name that
-document uses. If yours is named something else, `--list-tasks` shows the task as missing and
-prints the path it wanted. The three MM-Lifelong manifests extend the one documented name
+`docs/benchmarking.md` documents. Benchmarks registered in `PREPARERS` get a run-specific
+prepared-media manifest automatically. For the others, the table holds the documented file name;
+if yours is named differently, `--list-tasks` shows the task as missing and prints the path it
+wanted. The three MM-Lifelong manifests extend the one documented name
 (`mm-lifelong-month-val-prepared.json`) to its other splits.
 
 A task in this table is not a claim that the run is citable. It fixes the release and the

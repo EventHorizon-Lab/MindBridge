@@ -84,8 +84,9 @@ def _imported_probe(role: str) -> Callable[[Mapping[str, str]], object]:
     if role == "api":
         from mindbridge.api.runtime import Settings, require_rest_authentication
 
-        # The tenant key map is optional on Settings because the MCP surface does not read it.
-        # Reporting the API as ready without it would name a role that cannot start.
+        # The tenant key map is optional on Settings because MCP does not require REST
+        # authentication. Reporting the API as ready without it would name a role that cannot
+        # start.
         def _api(source: Mapping[str, str]) -> object:
             settings = Settings.from_environment(source)
             _validate_models(

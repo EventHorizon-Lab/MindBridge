@@ -201,9 +201,10 @@ def require_rest_authentication(settings: Settings) -> str:
     """The tenant key map the REST surface refuses to build without.
 
     There is no anonymous mode; only `/healthz` is public. `Settings` keeps the field optional
-    because the MCP surface does not read it, so the requirement belongs to this surface -- and
-    it lives in one function so `mindbridge config check` reports it from the same definition
-    `create_app` enforces, rather than from a second copy that could fall behind.
+    because MCP does not require REST authentication. When the map is present, the shared runtime
+    still uses its tenant IDs for the embedding-space startup probe. The REST requirement lives in
+    one function so `mindbridge config check` reports it from the same definition `create_app`
+    enforces, rather than from a second copy that could fall behind.
     """
     if settings.tenant_api_keys_json is None:
         raise MissingConfigurationError("MINDBRIDGE_TENANT_API_KEYS_JSON")

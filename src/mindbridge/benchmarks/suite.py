@@ -2,13 +2,14 @@
 
 A suite file exists because a benchmark's name does not determine its invocation. Every runner
 needs its own release path, and most need a required choice no sweep can guess -- ATM-Bench's
-`--split`, MEMLENS's `--context-window`, M3-Bench's `--subset`, the prepared-media manifest an
-operator produced outside MindBridge. The suite records one task per invocation; the sweep
-supplies only the flags every runner shares.
+`--split`, MEMLENS's `--context-window`, or M3-Bench's `--subset`. Some media tasks also need a
+prepared-media manifest: the sweep produces it when a preparer exists and otherwise names the
+missing path. The suite records one task per invocation; the sweep supplies only the flags every
+runner shares.
 
 The sweep owns two of those per task, so a suite may not set them. `--output` is a directory of
-the task's own inside `--output-dir`, so a fifteen-task sweep is fifteen directories rather than
-sixty files sharing one. `--run-id` is the sweep's ID plus the task's name, which is not
+the task's own inside `--output-dir`, so every task's artifacts stay together rather than sharing
+one flat directory. `--run-id` is the sweep's ID plus the task's name, which is not
 cosmetic: a tenant is derived from `--tenant-prefix`, the unit ID, and `--run-id`, and a
 benchmark run twice in one sweep -- MEMLENS at two context windows, ATM-Bench at both splits --
 shares the first two. Without a per-task run ID the second task would write into the first
@@ -23,9 +24,9 @@ Each task's predictions and manifest are written by its runner, unchanged. Nothi
 anything -- an official scorer's verdict is attached to one run by `mindbridge-bench score`, and
 a sweep summary carrying numbers would be claiming what no runner here measured. The table this
 prints when it finishes is not that claim: it reads the numbers back out of each task's own
-manifest and score sidecar and names which of the two every row came from. `--report DIR` prints
-the same table for a directory an earlier sweep wrote, which is how a run scored afterwards --
-most of them are -- gets its numbers on screen without being run again.
+manifest and score sidecar and names the source of every row. `--report DIR` prints the same
+table for a directory an earlier sweep wrote, so a run scored afterwards can be reported without
+being run again.
 """
 
 from __future__ import annotations
@@ -122,8 +123,8 @@ class SuiteTask(ContractModel):
 
         A directory per task rather than a file per task because a task writes more than its
         predictions: a sidecar manifest, a prepared-media manifest where it needs one, and a
-        score sidecar later. Flat, a fifteen-task sweep was sixty files whose only grouping was
-        a shared name prefix; here everything one benchmark produced is one `ls` away.
+        score sidecar later. In a flat layout those files only share a name prefix; here
+        everything one benchmark produced is one `ls` away.
         """
         return Path(self.name) / (self.output_name or "predictions.jsonl")
 

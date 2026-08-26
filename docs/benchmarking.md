@@ -67,9 +67,15 @@ uv run mindbridge-bench
 uv run mindbridge-bench m3 --help
 ```
 
-Most runners need nothing past the core install because they drive the product through its own
-API. `video-mme`, `video-mme-v2`, and `datasets` need `--extra benchmarks`; `jina` and `bakeoff` load the local
-embedder and need `--extra cloud-models`. A runner whose extra is missing names it and exits
+The dispatcher exposes twelve official runners: `locomo-refined`, `m3`, `egolife`, `egomem`,
+`egotempo`, `memlens`, `mm-lifelong`, `atm`, `mem-gallery`, `supermemory`, `video-mme`, and
+`video-mme-v2`. `aml` is a separate offline replay harness; `eval`, `score`, `datasets`, `jina`,
+and `bakeoff` support those runs.
+
+Most individual runners need nothing past the core install because they drive the product through
+its own API. `video-mme`, `video-mme-v2`, and `datasets` need `--extra benchmarks`; use that extra
+for `eval` when it must download releases or prepare media. `jina` and `bakeoff` load the local
+embedder and need `--extra cloud-models`. A command whose extra is missing names it and exits
 instead of failing part-way through a run.
 
 Runners need a live API and a bearer token in `MINDBRIDGE_API_KEY`. Every generated tenant ID must
@@ -90,10 +96,11 @@ export MINDBRIDGE_API_KEY=replace-with-a-runtime-secret
 uv run --extra benchmarks mindbridge-bench eval --tasks released-text --limit 2
 ```
 
-That runs four benchmarks against one deployment, downloading each official release it does not
+That runs four catalog tasks across three benchmark families — LoCoMo-Refined, MEMLENS 32K, and
+both ATM-Bench SGM splits — against one deployment, downloading each official release it does not
 already have. Nothing has to be cloned or written first. `--tasks` names entries in a catalog
 shipped with MindBridge; `--list-tasks` prints every name it accepts and what obtaining it would
-still take:
+still take. The current `all` group expands to 22 task invocations across the twelve runners:
 
 ```bash
 uv run mindbridge-bench eval --list-tasks
@@ -105,16 +112,18 @@ groups (--tasks expands these), inputs resolved against .benchmarks:
   all                     locomo-refined, m3-robot, m3-web, egolife, ...
 
 tasks:
-  locomo-refined          locomo-refined  ready
+  locomo-refined          locomo-refined  download
+  m3-robot                m3              download, prepare
+  egolife                 egolife         needs .benchmarks/egolife-prepared-a1.json
   memlens-32k             memlens         download
-  m3-robot                m3              needs .benchmarks/m3-prepared-robot.json
   ...
 ```
 
-Three states, because they need three different things. `ready` runs now. `download` runs after a
-fetch the sweep performs itself. A named path is one no official release supplies — a
-prepared-media manifest, which is the one thing still to do by hand; see "What cannot be
-downloaded" below.
+Four states, because they need four different things. `ready` runs now. `download` runs after a
+fetch the sweep performs itself. `prepare` means the sweep will stage media into the deployment's
+bucket. A named path is a prepared-media manifest with no producer yet and must be supplied by the
+operator; see "Prepared media that is still manual" below. States can be combined, as in
+`download, prepare`.
 
 Task names are comma-separated and the flag repeats, so `--tasks m3-robot,m3-web --tasks egolife`
 is three tasks. A group expands to several, and a task named twice still runs once.
@@ -170,9 +179,10 @@ corpus already on disk.
 Downloads are skipped for files already present, so a second sweep fetches nothing.
 `--benchmarks-root` chooses where they land — it defaults to `.benchmarks`, and the layout is the
 same one the manual commands in "Benchmark dataset smoke" below produce, so an existing corpus is
-found as-is. `--no-download` refuses to fetch and fails on an absent release instead — before the first task
-starts, not when its turn comes. An absent prepared-media manifest is still only reported, with
-or without the flag, because refusing the sweep for it would refuse the tasks that are ready.
+found as-is. `--no-download` refuses to fetch and fails on an absent release instead — before the
+first task starts, not when its turn comes. A missing manual prepared-media manifest is reported
+but does not prevent unrelated ready tasks from running; producer-backed tasks prepare their own
+run-specific manifest.
 
 ### Prepared media
 
@@ -239,9 +249,9 @@ not only through a sweep.
 ### What the sweep owns
 
 **`--output` and `--run-id` are derived per task, and a suite setting either is refused.** Each
-task writes into a directory of its own — `<output-dir>/<task>/predictions.jsonl` and the
-manifest, prepared media, and score beside it — so a fifteen-task sweep is fifteen directories
-rather than sixty files sharing a name prefix. The run
+task writes into a directory of its own: `predictions.jsonl` for line-oriented runners or
+`predictions.json` for array-based runners, with the manifest, prepared media, and score beside
+it. This keeps a 22-task `all` sweep in 22 directories instead of one flat artifact pile. The run
 ID is not cosmetic. A tenant is `<tenant-prefix>_<unit-id>_<run-id>`, so two parameterisations of
 one benchmark — MEMLENS at two context windows, ATM-Bench at both splits — share everything but
 the run ID. Without a per-task one the second task would write into the first task's tenants and
@@ -292,12 +302,12 @@ video-mme       Video-MME       completed  41:02  accuracy                      
                                                   strict_accuracy               0.6000  runner
                                                   question_count                   900  runner
                                                   by_duration.long.accuracy     0.4900  runner
-locomo-refined  LoCoMo-Refined  completed  08:03  llm_judge                     0.5810  official
-memlens-32k     MEMLENS         completed  18:03  —                                  —  not scored
+locomo-refined  LoCoMo-Refined  completed  08:03  llm_judge                     0.5810  judge
+egomem          EgoMemReason    completed  18:03  —                                  —  not scored
 atm-main-sgm    ATM-Bench       failed     00:03  —                                  —  —
 
 sweep-20260826-141233: 4 tasks · 3 completed · 1 failed · 1:07:08 total
-not scored: memlens-32k — these are scored outside MindBridge; attach the result with
+not scored: egomem — these are scored outside MindBridge; attach the result with
   mindbridge-bench score --predictions ... --manifest ... ...
 ```
 
@@ -311,8 +321,9 @@ metric rather than left to the reader. `Source` says who produced the number, an
 | `official` | an external scorer, attached afterwards by `mindbridge-bench score` | any run that has been scored |
 | `bypass` | nothing; `--predict-only` was passed | — |
 
-`not scored` is a completed run with none of the four yet, which is EgoMemReason permanently — its
-answers are held out by its leaderboard — and every judged benchmark run under `--predict-only`.
+`not scored` is a completed run with neither an in-run metric nor an official score sidecar. That
+is the normal EgoMemReason state because its answers are held out by its leaderboard. A judged run
+under `--predict-only` is different: it reports the visible `bypass=999` sentinel.
 
 ## Scoring, and what copying lmms-eval costs
 
@@ -336,7 +347,8 @@ The model defaults to MM-Vet's own so a number here is comparable to one lmms-ev
 The endpoint has no default: a judged benchmark with none configured refuses to start rather than
 scoring the whole split zero — checked before the run, and once for the whole sweep, because a
 judged run that finishes and then cannot score writes no predictions at all. The key is optional,
-since a local judge does not want one.
+since a local judge does not want one. Seventeen of the current 22 catalog tasks use this judge, so
+`--tasks all` requires it unless `--predict-only` is set.
 
 **Three consequences, all of them upstream's and all deliberate:**
 
@@ -366,9 +378,9 @@ an identical request would return an identical unparseable answer, so the retry 
 The sweep summary file itself still carries no scores; every number above lives in the manifest or
 the score sidecar of the task that produced it.
 
-Most benchmarks here are in that third state until their official scorer has run, which happens
-after the sweep has exited. `--report` renders the same table again from a directory an earlier
-run wrote, so those numbers reach the screen without running anything twice:
+Runner and MindBridge-judge metrics are available when a task completes. An official scorer still
+runs after the sweep, and `--report` renders the table again from a directory an earlier run wrote,
+so an attached official number reaches the screen without running anything twice:
 
 ```bash
 uv run mindbridge-bench eval --report .benchmarks/results/sweep-20260826-141233
@@ -730,10 +742,11 @@ is fed straight to `./scripts/run_eval.sh` in a LoCoMo-Refined checkout; retriev
 IDs ride along in the `mindbridge_prediction_context` field that evaluator ignores.
 LoCoMo-Refined is CC BY-NC 4.0, so the corpus itself is not licensed for commercial use.
 
-Run M3-Bench through the same deployed API after the official videos have been split into
-30-second clips with FFmpeg and uploaded with the standard S3 tooling. MindBridge does not contain
-a second media downloader, clipper, or uploader. `--prepared-media` is a JSON array that records
-the already-addressable objects:
+Run M3-Bench through the same deployed API. The `eval` sweep cuts selected official videos into
+30-second clips with MindBridge's production media encoder, uploads them into the deployment's
+bucket, and writes a run-specific manifest automatically. The individual `m3` runner performs no
+preparation; when invoked directly, `--prepared-media` must point to a JSON array of already
+addressable objects:
 
 ```json
 [
@@ -746,7 +759,7 @@ the already-addressable objects:
         "media_object": {
           "media_object_id": "m3_bedroom_01_0",
           "kind": "video",
-          "uri": "s3://mindbridge-media/tenants/benchmark_m3_bedroom_01/0.mp4",
+          "uri": "s3://mindbridge-media/tenants/benchmark_m3_bedroom_01_m3-robot-001/0.mp4",
           "sha256": "<64 lowercase hexadecimal characters>",
           "size_bytes": 12345678,
           "created_at": "2026-08-11T00:00:00Z",
@@ -826,7 +839,7 @@ memory:
       "media_object": {
         "media_object_id": "egolife_a1_day1_11100000",
         "kind": "video",
-        "uri": "s3://mindbridge-media/egolife/day1/11100000.mp4",
+        "uri": "s3://mindbridge-media/tenants/benchmark_egolife_A1_JAKE_egolife-a1-001/day1/11100000.mp4",
         "sha256": "<64 hexadecimal characters>",
         "size_bytes": 14379440,
         "created_at": "2026-08-12T00:00:00Z",
@@ -945,7 +958,7 @@ image objects:
       "media_object": {
         "media_object_id": "memlens_2658faf8f6e6",
         "kind": "image",
-        "uri": "s3://mindbridge-media/memlens/2658faf8f6e6.jpg",
+        "uri": "s3://mindbridge-media/tenants/benchmark_memlens_question-001_memlens-32k-001/2658faf8f6e6.jpg",
         "sha256": "<64 hexadecimal characters>",
         "size_bytes": 123456,
         "created_at": "2026-08-14T00:00:00Z"
@@ -1007,7 +1020,7 @@ and required to equal the official `YYYYMMDD_HHMMSS` filename stem:
       "media_object": {
         "media_object_id": "20250223_130249",
         "kind": "image",
-        "uri": "s3://mindbridge-media/atm-bench/20250223_130249.jpg",
+        "uri": "s3://mindbridge-media/tenants/benchmark_atm_archive_atm-hard-raw-01/20250223_130249.jpg",
         "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
         "size_bytes": 100686,
         "created_at": "2025-02-23T13:02:49Z"
@@ -1050,16 +1063,17 @@ would let one persona's memory answer another's question. `--dataset` names the 
 `data/dialog` directory, not a single file; the runner loads every topic file inside it and
 narrows to `--topic` selections when given.
 
-`--prepared-images` must stage every image the selected topics reference: both the 1,003 images
-embedded in dialogue rounds and the 487 question images asked alongside a query. A missing image
-refuses the run before ingestion starts. Images are keyed by the release's own relative path
-(`image_key`); `media_object_id` is a separate, caller-assigned field, but for a dialogue image it
-must be set to the official `image_id` (for example `D2:IMG_001`) because `VS` ("visual search")
-questions ask the model to name the matching `image_id` directly as its answer, and that ID is
-what ties a retrieved image back to the release's own answer key. That official ID is
-release-relative, not archive-unique — `D1:IMG_001` alone names a different picture in all twenty
-topics — so `media_object_id` only has to be unique within the one topic that answers a `VS`
-question with it, never across the whole staged manifest; `image_key`, which is always
+The `eval` sweep stages every image selected topics reference and writes `--prepared-images`
+automatically. A direct `mem-gallery` invocation must supply that manifest itself. It covers both
+the 1,003 images embedded in dialogue rounds and the 487 question images asked alongside a query;
+a missing image refuses the run before ingestion starts. Images are keyed by the release's own
+relative path (`image_key`); `media_object_id` is a separate, caller-assigned field, but for a
+dialogue image it must be set to the official `image_id` (for example `D2:IMG_001`) because `VS`
+("visual search") questions ask the model to name the matching `image_id` directly as its answer,
+and that ID is what ties a retrieved image back to the release's own answer key. That official ID
+is release-relative, not archive-unique — `D1:IMG_001` alone names a different picture in all
+twenty topics — so `media_object_id` only has to be unique within the one topic that answers a
+`VS` question with it, never across the whole staged manifest; `image_key`, which is always
 topic-prefixed, is what the manifest actually requires to be unique. Question images carry no
 official ID, so their `media_object_id` may be assigned freely:
 
@@ -1071,7 +1085,7 @@ official ID, so their `media_object_id` may be assigned freely:
       "media_object": {
         "media_object_id": "D1:IMG_001",
         "kind": "image",
-        "uri": "s3://mindbridge-media/mem-gallery/Baking_Dessert_Daily_Life_Skill/D1_IMG_001.jpg",
+        "uri": "s3://mindbridge-media/tenants/benchmark_mem_gallery_Baking_Dessert_Daily_Life_Skill_mem-gallery-baking-01/D1_IMG_001.jpg",
         "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
         "size_bytes": 123456,
         "created_at": "2026-08-14T00:00:00Z"
@@ -1118,7 +1132,7 @@ timestamp. A segment can carry raw audio/video, a pinned caption, or both:
         {
           "media_object_id": "mm_lifelong_14_00000",
           "kind": "video",
-          "uri": "s3://mindbridge-media/mm-lifelong/14/00000.mp4",
+          "uri": "s3://mindbridge-media/tenants/benchmark_mm_lifelong_month_val_mm-lifelong-month-val-001/14/00000.mp4",
           "sha256": "<64 hexadecimal characters>",
           "size_bytes": 12345678,
           "created_at": "2026-08-14T00:00:00Z",
@@ -1167,7 +1181,7 @@ a transcript, or both:
           {
             "media_object_id": "video-mme-001-0000",
             "kind": "video",
-            "uri": "s3://mindbridge-media/video-mme/001/0000.mp4",
+            "uri": "s3://mindbridge-media/tenants/benchmark_video_mme_001_video-mme-001/0000.mp4",
             "sha256": "<64 hexadecimal characters>",
             "size_bytes": 12345678,
             "created_at": "2026-08-14T00:00:00Z",
@@ -1294,10 +1308,12 @@ by a previous run.
 
 ## Recording an official scorer's result
 
-ATM-Bench, Mem-Gallery, LoCoMo-Refined, MM-Lifelong, EgoTempo, and EgoMemReason are scored outside
-MindBridge. A run manifest is written before any of those scorers execute, so it can only pin
-inputs. Record their output in a `*.score.json` sidecar instead, which re-hashes the predictions
-and refuses numbers that belong to a different run:
+Use `mindbridge-bench score` whenever an official evaluator or leaderboard produces a verdict
+outside MindBridge. This includes attaching an EgoMemReason leaderboard result and replacing a
+MindBridge-selected judge score with the benchmark's own protocol for a citable comparison. The
+run manifest is written before an external scorer executes, so it can only pin inputs. The score
+command records the verdict in a `*.score.json` sidecar, re-hashes the predictions, and refuses
+numbers that belong to a different run:
 
 ```bash
 uv run mindbridge-bench score \

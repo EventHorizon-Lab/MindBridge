@@ -45,7 +45,7 @@ Start with the path that matches what you are doing.
 | --- | --- |
 | [Benchmarking](benchmarking.md) | Running the harness, and what its numbers mean. |
 | [SOTA baselines](benchmarks-sota.md) | Comparison targets per benchmark. |
-| [Edge identity](edge-identity-sota.md) | On-device model selection and validation. |
+| [Edge identity](edge-identity-sota.md) | Dated implementation status, model selection, and validation gates. |
 
 Read [the stance](benchmarking.md#the-stance) before quoting any number.
 
