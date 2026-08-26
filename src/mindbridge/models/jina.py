@@ -29,6 +29,7 @@ from mindbridge.models.defaults import (
     DEFAULT_EMBEDDING_DIMENSION,
     DEFAULT_EMBEDDING_SPACE,
     MatryoshkaDimension,
+    embedder_revision_for,
 )
 from mindbridge.telemetry import operation_span, set_current_span_attributes
 
@@ -62,9 +63,11 @@ class _SentenceTransformerFactory(Protocol):
         self,
         model_name_or_path: str,
         *,
+        revision: str | None,
         trust_remote_code: bool,
         device: str | None,
-        model_kwargs: dict[str, str],
+        model_kwargs: dict[str, str | None],
+        config_kwargs: dict[str, str | None],
     ) -> _SentenceEncoder: ...
 
 
@@ -131,12 +134,21 @@ class JinaEmbedder:
         cls,
         *,
         model_id: str = DEFAULT_EMBEDDER_MODEL_ID,
+        revision: str | None = None,
         device: str | None = None,
         space_reference: EmbeddingSpaceReference = DEFAULT_EMBEDDING_SPACE,
         dimension: int = DEFAULT_EMBEDDING_DIMENSION,
         max_concurrency: int = 1,
     ) -> JinaEmbedder:
-        """Load the upstream model without exposing training operations."""
+        """Load a pinned upstream model without exposing training operations.
+
+        `revision` unset resolves through `embedder_revision_for`, which supplies the bundled
+        pin for `DEFAULT_EMBEDDER_MODEL_ID` and nothing for any other repository -- so the
+        safe thing is what a caller gets for free, and a caller sweeping arbitrary
+        repositories cannot inherit a pin that could not resolve against them. Passing a
+        revision explicitly always wins.
+        """
+        revision = embedder_revision_for(model_id, revision)
         try:
             module = import_module("sentence_transformers")
             hub_module = import_module("huggingface_hub")
@@ -149,13 +161,19 @@ class JinaEmbedder:
             module.SentenceTransformer,
         )
         snapshot_download = cast(Callable[..., str], hub_module.snapshot_download)
-        model_path = snapshot_download(repo_id=model_id)
+        model_path = snapshot_download(repo_id=model_id, revision=revision)
         selected_device = select_torch_device(device)
+        # `code_revision` pins the remote code separately from the weights, and it has to be
+        # set on both: `sentence_transformers` forwards one to the module implementation and
+        # the other to the config. Under `trust_remote_code=True` this is what decides which
+        # third-party Python this process executes.
         encoder = sentence_transformer(
             model_path,
+            revision=revision,
             trust_remote_code=True,
             device=selected_device,
-            model_kwargs={"modality": "omni"},
+            model_kwargs={"modality": "omni", "code_revision": revision},
+            config_kwargs={"code_revision": revision},
         )
         if _media_processor_missing(encoder):
             raise ModelUnavailableError(_MISSING_PROCESSOR)
@@ -227,6 +245,14 @@ class JinaEmbedder:
 
 class _EmbedderConfig(PluginConfigModel):
     model_id: PluginText = DEFAULT_EMBEDDER_MODEL_ID
+    # Spelled `model_revision` because that is the name a deployment configured before
+    # migration 0021 and the value still means the same thing here. `PluginConfigModel`
+    # ignores that name where nothing declares it, so an operator's existing
+    # MINDBRIDGE_MEDIA_EMBEDDER_CONFIG_JSON keeps pinning what it always pinned instead of
+    # being silently replaced by this default. Unset means "resolve the pin from the model
+    # id", which is the bundled commit for the bundled repository and nothing for another --
+    # not "load the default branch of whatever repository this is".
+    model_revision: PluginText | None = None
     device: PluginText | None = None
     space_id: PluginText = DEFAULT_EMBEDDING_SPACE.space_id
     dimension: MatryoshkaDimension = DEFAULT_EMBEDDING_DIMENSION
@@ -238,6 +264,7 @@ def create_embedder(config: Mapping[str, object]) -> JinaEmbedder:
     validated = _EmbedderConfig.model_validate(config)
     return JinaEmbedder.load(
         model_id=validated.model_id,
+        revision=validated.model_revision,
         device=validated.device,
         space_reference=EmbeddingSpaceReference(space_id=validated.space_id),
         dimension=validated.dimension,

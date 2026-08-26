@@ -102,6 +102,11 @@ async def run_adapter_bakeoff(
     """Score every pair with both adapters using the symmetric document side."""
     scores: list[AdapterScore] = []
     for model_id in (retrieval_model_id, text_matching_model_id):
+        # This sweep loads whichever repository the caller named, and `load` resolves the pin
+        # from the model id: the bundled repository still gets its commit -- which is the
+        # default of `--retrieval-model-id`, so the common invocation stays pinned under
+        # `trust_remote_code=True` -- and any other repository, which that commit could not
+        # resolve against, gets its default branch.
         embedder = JinaEmbedder.load(model_id=model_id, device=device, dimension=dimension)
         try:
             scores.append(await _score_adapter(embedder, corpus, model_id))

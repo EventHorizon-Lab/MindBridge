@@ -241,12 +241,18 @@ async def test_pgvector_accepts_a_reencoded_vector_only_when_the_caller_allows_i
     """
     model = ModelReference(model_id="jina")
     space = EmbeddingSpaceReference(space_id="jina-v5")
+    # Written after this database was migrated, which is what makes the last assertion below
+    # about the guard rather than about the one-time re-key: only a row predating migration
+    # 0021 can have had its ID derived by the recipe that migration changed. The session
+    # fixture applies every migration before any test body runs, so this is ordered, not raced.
+    written_after_0021 = datetime.now(timezone.utc)
     stored = _embedding_record(
         embedding_id="embedding_memory_reencode",
         object_id="memory_reencode",
         values=(1.0,) + (0.0,) * 1_023,
         model=model,
         space=space,
+        created_at=written_after_0021,
     )
     # 0.999 93 against the stored vector: the measured drift from encoding one text alone
     # versus mid-batch, and well outside the identical-replay tolerance.
@@ -281,7 +287,9 @@ async def test_pgvector_accepts_a_reencoded_vector_only_when_the_caller_allows_i
     )
     # What the flag does NOT forgive: a row whose stored embedding_id is a different
     # version. embedding_id is not part of the unique key, so this is the case where the
-    # same object really is indexed under another version, and it still refuses.
+    # same object really is indexed under another version, and it still refuses. The stored
+    # row here postdates migration 0021, so it is not eligible for the one-time re-key that
+    # heals IDs derived by the recipe 0021 changed.
     with pytest.raises(DomainInvariantError, match="different vector content"):
         await store.write_embedding(
             _embedding_record(
@@ -290,8 +298,69 @@ async def test_pgvector_accepts_a_reencoded_vector_only_when_the_caller_allows_i
                 values=reencoded.values,
                 model=model,
                 space=space,
+                created_at=written_after_0021,
             ),
             allow_reencoding=True,
+        )
+
+
+async def test_a_vector_stranded_under_its_old_identifier_is_re_keyed(
+    store: PostgresMemoryStore,
+) -> None:
+    """`embedding_id` is content-addressed, and migration 0021 removed one of its components.
+
+    Every ID written before that migration is unreachable from the same inputs, while the
+    object key -- tenant, object, model, space, task -- is unchanged. So the writer meets a
+    stored row with equivalent content under a different ID, which is not content drift and
+    must not be reported as it. Re-keying rather than merely tolerating is what stops it
+    recurring: the ID is what `has_embedding` looks up, so a row left under its old name pays
+    for an encode it already has on every future pass.
+    """
+    model = ModelReference(model_id="jinaai/jina-embeddings-v5-omni-small-retrieval")
+    space = EmbeddingSpaceReference(space_id="jina-v5-rekey")
+    values = (1.0, 0.0) + (0.0,) * 1_022
+    legacy = _embedding_record(
+        embedding_id="embedding_derived_with_a_revision",
+        object_id="memory_stranded",
+        values=values,
+        model=model,
+        space=space,
+    )
+    current = _embedding_record(
+        embedding_id="embedding_derived_without_one",
+        object_id="memory_stranded",
+        values=values,
+        model=model,
+        space=space,
+    )
+
+    assert await store.write_embedding(legacy) is True
+    assert await store.has_embedding(VECTOR_TENANT, current.embedding_id) is False
+
+    assert await store.write_embedding(current) is False
+
+    # Healed, and healed exactly once: one row, under the name the current recipe derives.
+    assert await store.has_embedding(VECTOR_TENANT, current.embedding_id) is True
+    assert await store.has_embedding(VECTOR_TENANT, legacy.embedding_id) is False
+    async with tenant_connection(store._pool, VECTOR_TENANT) as connection:
+        row = await (
+            await connection.execute(
+                "SELECT count(*) FROM embeddings WHERE tenant_id = %s AND object_id = %s",
+                (VECTOR_TENANT, "memory_stranded"),
+            )
+        ).fetchone()
+    assert row is not None and row[0] == 1
+
+    # A genuinely different vector under the same object key is still drift, not a re-key.
+    with pytest.raises(DomainInvariantError, match="different vector content"):
+        await store.write_embedding(
+            _embedding_record(
+                embedding_id="embedding_third_name",
+                object_id="memory_stranded",
+                values=(0.0, 1.0) + (0.0,) * 1_022,
+                model=model,
+                space=space,
+            )
         )
 
 
@@ -304,6 +373,7 @@ def _embedding_record(
     space: EmbeddingSpaceReference,
     tenant_id: TenantId = VECTOR_TENANT,
     object_type: EmbeddedObjectType = EmbeddedObjectType.MEMORY_RECORD,
+    created_at: datetime = NOW,
 ) -> EmbeddingRecord:
     return EmbeddingRecord(
         embedding_id=EmbeddingId(embedding_id),
@@ -316,7 +386,7 @@ def _embedding_record(
         task="retrieval_document",
         dimension=1_024,
         normalized=True,
-        created_at=NOW,
+        created_at=created_at,
     )
 
 

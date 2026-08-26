@@ -137,8 +137,13 @@ encoder, `MINDBRIDGE_MEDIA_EMBEDDER_DEVICE` selects hardware; routing it through
 `select_torch_device` turns a missing GPU into a startup failure instead of silently using CPU.
 
 Both embedding plugins spell the model they load `model_id` in their configuration objects.
-`PluginConfigModel` sets `extra="forbid"`, so a stale key such as `model_revision` fails the
-factory at startup rather than being ignored.
+`PluginConfigModel` sets `extra="forbid"`, so an unrecognized key fails the factory at startup
+rather than being ignored — with one closed exception: the three names migration `0021` retired
+(`model_revision`, `space_revision`, `association_model_revision`) are ignored where the plugin
+does not declare them, so an operator's object written for the previous release still loads. Where
+a plugin *does* declare one, it is kept: the local Jina encoder's `model_revision` pins the commit
+it downloads and executes, and silently replacing that with a default would be worse than the
+strictness being relaxed.
 
 Benchmark runners require `--deployment-config`. The referenced JSON records every selected server
 and Worker plugin, its owning Python distribution and version, plus its non-secret resolved

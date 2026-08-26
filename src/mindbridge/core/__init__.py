@@ -1,12 +1,14 @@
 """Stable domain vocabulary for MindBridge memory."""
 
 from mindbridge.core._validation import (
+    RETIRED_FIELD_NAMES,
     require_aware_datetime,
     require_bounded_count,
     require_non_empty,
     require_probability,
     require_similarity,
     utc_now,
+    without_retired_fields,
 )
 from mindbridge.core.errors import (
     DatabaseUnavailableError,
@@ -97,6 +99,7 @@ from mindbridge.core.memory import (
 __all__ = [
     "DEFAULT_EMBEDDING_DIMENSION",
     "DEFAULT_MEMORY_STRENGTH_POLICY",
+    "RETIRED_FIELD_NAMES",
     "AnonymousIdentityObservation",
     "Claim",
     "ClaimId",
@@ -177,4 +180,5 @@ __all__ = [
     "require_probability",
     "require_similarity",
     "utc_now",
+    "without_retired_fields",
 ]

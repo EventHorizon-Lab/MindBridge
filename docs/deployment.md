@@ -70,7 +70,7 @@ Apply migrations before starting the processes that read the schema they add. Th
 automatic migration on startup, deliberately: a process that migrates on boot turns a rolling
 restart into an uncoordinated schema race.
 
-Five migrations need a decision from you rather than just an apply:
+Six migrations need a decision from you rather than just an apply:
 
 **`0005` — tenant row-level security.** Creates the non-login `mindbridge_runtime` role, grants
 the migration user membership, and enables **forced** RLS on every table carrying a `tenant_id`.
@@ -97,6 +97,19 @@ proportional to the largest `memory_records` you hold. Size the window against t
 than against this number, and apply it while the API is drained rather than mid-serve. It also
 drops `memory_records_summary_fts_idx`, which had 0 scans across two complete evaluations because
 the substring arm of the recall query gives the planner nothing to use it for.
+
+**`0025` — repairs two things `0021` left behind.** It deletes every `observe` row in
+`idempotency_keys`. `0021` removed a field from `ObserveRequest`, which changed the digest of a
+request whose bytes did not change, while the idempotency key itself stayed stable — so a device
+retrying an observation the server already accepted got `409` forever instead of `DUPLICATE`. The
+digest cannot be recomputed here without reproducing one serializer's escaping rules in SQL, so
+the claims go instead: losing one costs a reprocess, and the reprocess is idempotent because the
+write still dedupes on the derived `observation_id`. **Any `observe` retry in flight across the
+upgrade is reprocessed rather than deduplicated by its key.** It also widens the `embeddings`
+unique key to include `space_id`, which `0021` dropped along with the revision; without it one
+object cannot hold vectors in two spaces, so the re-embedding described under `0007` fails with
+`embedding conflict could not be resolved`. Widening a key cannot make existing rows collide, so
+there is nothing to resolve before applying it.
 
 ## API
 

@@ -45,9 +45,16 @@ Plugin configs use `extra="forbid"`. An unrecognized key fails startup rather th
 because "that setting had no effect" is a much worse outcome to debug than a failed boot. Check
 the key against the plugin's documented fields.
 
-After upgrading past migration `0021` the usual culprits are `model_revision` and
-`space_revision`, which no longer exist on any plugin. Delete them from your `*_CONFIG_JSON`
-objects; `model_id` and `space_id` still carry the identity they were paired with.
+Names retired by migration `0021` are the exception: `model_revision`, `space_revision`, and
+`association_model_revision` are ignored rather than refused, because removing a field is not the
+same as forbidding it and an operator's object written for the previous release still has to load.
+A typo is still a failed boot.
+
+One of those names went on meaning something, so do **not** delete it blindly. The local Jina
+encoder declares `model_revision`, where it pins the commit `snapshot_download` resolves and
+therefore which remote code runs under `trust_remote_code=True`. Dropping it from
+`MINDBRIDGE_MEDIA_EMBEDDER_CONFIG_JSON` replaces your pin with the bundled default. Delete
+`space_revision`, which nothing reads; keep `model_revision` where the local encoder is the plugin.
 
 ### `embedding dimension must be one of 32, 64, 128, 256, 512, 768, 1024`
 
@@ -171,15 +178,16 @@ and `attempt`.
 | `object_storage_unavailable` | Media could not be read. Check the URI, credentials, and endpoint. |
 | `memory_integrity_failed` | Stored state is inconsistent. Investigate; this should be zero. |
 
-### `request_validation_failed` naming `model_revision` on observe
+### An edge device still sends `model_revision` inside `identity_observations`
 
-An edge device older than migration `0021` is still sending `model_revision` inside
-`identity_observations`. The field used to be required and is now rejected, because request
-contracts refuse unknown fields rather than dropping them silently — the alternative is a device
-believing it recorded provenance the server threw away.
+Nothing to do. A device older than migration `0021` still sends the field, and the server ignores
+it: the three names that migration retired are dropped before validation rather than refused, so a
+rolling upgrade that moves the server first does not 422 the fleet behind it. The field has no
+replacement — `model_id` alone records which edge model produced a span — so upgrading the device
+changes nothing observable and is not urgent.
 
-Upgrade the device. There is no server-side setting to accept the old shape, and the field has no
-replacement: `model_id` alone now records which edge model produced a span.
+A device sending some *other* unknown field still gets `request_validation_failed`, which is the
+strictness this exemption is deliberately narrow to preserve.
 
 ### `task_broker_unavailable` on observe
 

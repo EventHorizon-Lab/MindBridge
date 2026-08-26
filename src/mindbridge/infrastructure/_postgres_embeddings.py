@@ -132,13 +132,62 @@ async def write_embedding_on_connection(
     # comparison's tolerance -- that is a property of the object type, true everywhere.
     # `allow_reencoding` is the same guarantee arrived at per call site, for IDs whose text
     # is pinned upstream. Anything else re-encoding into a different vector is content drift.
-    if (
-        existing_id == embedding.embedding_id
-        and normalized == embedding.normalized
-        and (same_values or allow_reencoding or embedding.object_type is EmbeddedObjectType.ENTITY)
+    if normalized != embedding.normalized or not (
+        same_values or allow_reencoding or embedding.object_type is EmbeddedObjectType.ENTITY
     ):
-        return False
-    raise DomainInvariantError("embedding version already stores different vector content")
+        raise DomainInvariantError("embedding version already stores different vector content")
+    if existing_id != embedding.embedding_id:
+        await _adopt_embedding_id(connection, embedding, existing_id)
+    return False
+
+
+async def _adopt_embedding_id(
+    connection: DatabaseConnection,
+    embedding: EmbeddingRecord,
+    existing_id: str,
+) -> None:
+    """Re-key a stored vector whose ID was derived by a recipe that no longer exists.
+
+    `embedding_id` is content-addressed, and migration 0021 removed one of the components it
+    hashed. Every ID written before that migration is therefore unreachable from the same
+    inputs, while the object key this row was just matched on -- tenant, object, model, space
+    and task -- is unchanged. So a row written before 0021 with equivalent content under a
+    different ID is not drift; it is that row still carrying its old name.
+
+    Re-keying rather than tolerating the mismatch is what makes it stop happening: the ID is
+    what `has_embedding` looks up, so a row left under its old name fails the `skip_existing`
+    check on every future pass and pays for an encode it already has. Healing one row the
+    first time anything touches it is cheaper than rewriting the column for every tenant in a
+    migration, and does not require reproducing a Python digest in SQL.
+
+    The `applied_at` bound is what keeps this from becoming a general amnesty. An ID mismatch
+    used to mean "this object is indexed under another model revision", which was worth
+    refusing, and it was the revision inside the ID that made it mean that. Restricting the
+    re-key to rows older than 0021 heals exactly the event that stranded them and leaves any
+    later disagreement raising the same error it always did -- including on a database new
+    enough that no row predates 0021, where nothing is eligible and the guard is untouched.
+    """
+    cursor = await connection.execute(
+        """
+        UPDATE embeddings SET embedding_id = %s
+        WHERE tenant_id = %s AND embedding_id = %s
+          AND created_at < (SELECT applied_at FROM schema_migrations WHERE version = 21)
+          AND NOT EXISTS (
+                  SELECT 1 FROM embeddings AS claimed
+                  WHERE claimed.tenant_id = %s AND claimed.embedding_id = %s
+              )
+        RETURNING embedding_id
+        """,
+        (
+            embedding.embedding_id,
+            embedding.tenant_id,
+            existing_id,
+            embedding.tenant_id,
+            embedding.embedding_id,
+        ),
+    )
+    if await cursor.fetchone() is None:
+        raise DomainInvariantError("embedding version already stores different vector content")
 
 
 async def search_embeddings(

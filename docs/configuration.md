@@ -202,12 +202,25 @@ export MINDBRIDGE_MEDIA_EMBEDDER_PLUGIN=openai
 | Variable | Required | Default |
 | --- | --- | --- |
 | `MINDBRIDGE_MEDIA_EMBEDDER_MODEL_ID` | no | `jinaai/jina-embeddings-v5-omni-small-retrieval` |
+| `MINDBRIDGE_MEDIA_EMBEDDER_MODEL_REVISION` | no | `12949877f0092093f366c6450340011320152a05` |
 | `MINDBRIDGE_MEDIA_EMBEDDER_DEVICE` | no | automatic selection |
 | `MINDBRIDGE_WORKER_VRAM_BUDGET_GIB` | no | `3.7` — one model copy per child |
 
 These variables are read only when a `MINDBRIDGE_MEDIA_EMBEDDER_*` override is present. Setting
 `MINDBRIDGE_MEDIA_EMBEDDER_PLUGIN=jina` opts the worker into loading a second, local
 SentenceTransformers model. Without that explicit override, media inherits the shared endpoint.
+
+`MODEL_REVISION` is the upstream commit this plugin downloads and, because it loads with
+`trust_remote_code=True`, the commit whose Python it executes. It is a loader argument rather
+than a record: the Hub resolves it against a content-addressed commit, so unset it and a worker
+restart silently picks up whatever is on the repository's default branch — new weights and new
+code, with no configuration change. Only the in-process plugin takes it. The endpoint-backed
+plugin talks to a server that resolves its own model, so there is nothing for MindBridge to pin.
+
+Changing this value is a deliberate act, and it needs `MINDBRIDGE_EMBEDDING_SPACE_ID` changed
+with it. Vectors are comparable only within a space, `SPACE_ID` is what declares that
+boundary, and it does not vary with the checkout — so a new revision written under the old
+`SPACE_ID` puts two encoders' output in one cosine search with nothing able to report it.
 
 An explicit `DEVICE` that is unavailable fails rather than silently falling back to CPU.
 
@@ -269,7 +282,8 @@ ever gains.
 
 Configs are validated with `extra="forbid"`. An unrecognized key fails startup rather than being
 ignored, which is the difference between "that setting had no effect" and "that setting was
-never applied and nobody noticed".
+never applied and nobody noticed". The three names migration `0021` retired are the one closed
+exception, described in [plugin-architecture.md](plugin-architecture.md).
 
 Anthropic, Gemini, local runtimes, and experimental adapters need no OpenAI-specific variables —
 set the plugin name and provide its JSON. See [plugin-architecture.md](plugin-architecture.md).
