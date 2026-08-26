@@ -52,7 +52,7 @@ from mindbridge.models.defaults import (
     DEFAULT_EMBEDDING_DIMENSION,
     openai_embedder_config,
     openai_generator_config,
-    require_matryoshka_dimension,
+    require_embedding_dimension,
 )
 from mindbridge.models.plugins import close_model, load_embedder, load_generator
 from mindbridge.telemetry import configure_observability
@@ -209,7 +209,7 @@ async def _run_postgres_sweep(
 ) -> ConsolidationSweepSummary:
     store = PostgresMemoryStore(
         settings.database_url,
-        embedding_dimension=require_matryoshka_dimension(
+        embedding_dimension=require_embedding_dimension(
             int(cast(int, settings.embedder_config.get("dimension", DEFAULT_EMBEDDING_DIMENSION)))
         ),
         max_pool_size=resolve_database_max_pool_size(),

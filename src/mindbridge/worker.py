@@ -78,9 +78,9 @@ from mindbridge.models.defaults import (
     DEFAULT_EMBEDDING_DIMENSION,
     DEFAULT_GENERATOR_REQUEST_TIMEOUT_SECONDS,
     embedding_dimension_from_environment,
-    jina_media_embedder_config,
     openai_embedder_config,
     openai_generator_config,
+    sentence_transformers_media_embedder_config,
 )
 from mindbridge.models.plugins import close_model, load_embedder, load_generator
 from mindbridge.telemetry import (
@@ -134,7 +134,7 @@ MAXIMUM_WORKER_CONCURRENCY = 32
 # ponytail: an allowlist of plugin names, because a plugin cannot be asked whether it holds a
 # device. Give `Embedder` a "runs in this process" property if a third-party local plugin ever
 # needs to be covered by the guard below.
-_IN_PROCESS_EMBEDDER_PLUGINS = frozenset({"jina"})
+_IN_PROCESS_EMBEDDER_PLUGINS = frozenset({"jina", "sentence-transformers"})
 
 _IN_PROCESS_EMBEDDER_VRAM_GIB = 3.7
 _IN_PROCESS_EMBEDDER_RSS_GIB = 1.4
@@ -332,8 +332,8 @@ def _media_embedder_fallback(
     the same embedding space. Reusing it makes the served media slot one variable rather than
     five, which matters because it is the configuration that keeps a model out of every child.
     """
-    if plugin == "jina":
-        return lambda: jina_media_embedder_config(source)
+    if plugin in {"jina", "sentence-transformers"}:
+        return lambda: sentence_transformers_media_embedder_config(source)
     if plugin == "openai":
         return lambda: plugin_configuration(
             source,

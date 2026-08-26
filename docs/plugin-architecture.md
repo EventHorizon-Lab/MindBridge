@@ -102,10 +102,17 @@ MindBridge ships these adapters:
 | --- | --- | --- |
 | `openai` | Generator | OpenAI and OpenAI-compatible multimodal generation |
 | `openai` | Embedder | Aligned query/document endpoints, including the bundled Jina service |
-| `jina` | Embedder | Local Hugging Face Jina v5 Omni embedding |
+| `sentence-transformers` | Embedder | Local SentenceTransformers text or multimodal models |
+| `jina` | Embedder | Compatibility alias for `sentence-transformers` |
 
-Anthropic, Gemini, and local runtimes belong in provider packages using the
-same entry points. Adding one does not add a new MindBridge pipeline or public task API.
+The local adapter passes standard single-modality values, multimodal dictionaries, and message
+inputs to the model. It checks `model.supports()` before inference and accepts only the model's
+native dimension or a dimension explicitly advertised in its Matryoshka metadata. Jina v5 Omni
+remains the default model; its current custom SentenceTransformers module has one isolated legacy
+multipart-input compatibility path.
+
+Anthropic, Gemini, and other runtimes belong in provider packages using the same entry points.
+Adding one does not add a new MindBridge pipeline or public task API.
 
 ## Configuration
 

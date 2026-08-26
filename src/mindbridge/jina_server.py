@@ -1,4 +1,4 @@
-"""Authenticated SentenceTransformers serving for the bundled Jina Omni model."""
+"""Authenticated serving for local SentenceTransformers embedding models."""
 
 from __future__ import annotations
 
@@ -30,7 +30,7 @@ from mindbridge.application.capabilities import (
 )
 from mindbridge.cli import parser as build_parser
 from mindbridge.configuration import require_environment_value
-from mindbridge.core import MediaKind
+from mindbridge.core import MediaKind, ModelRequestError
 from mindbridge.models.defaults import (
     DEFAULT_EMBEDDER_MODEL_ID,
     DEFAULT_EMBEDDING_DIMENSION,
@@ -73,7 +73,7 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        loaded = embedder or load_embedder("jina", config)
+        loaded = embedder or load_embedder("sentence-transformers", config)
         app.state.embedder = loaded
         try:
             yield
@@ -81,7 +81,7 @@ def create_app(
             if embedder is None:
                 await close_model(loaded)
 
-    app = FastAPI(title="MindBridge Jina Omni embedding service", lifespan=lifespan)
+    app = FastAPI(title="MindBridge SentenceTransformers embedding service", lifespan=lifespan)
     if embedder is not None:
         app.state.embedder = embedder
 
@@ -131,6 +131,8 @@ async def _embedding_response(
         vectors = await _embed(embedder, payload.get("input"), allowed_media_origins)
     except HTTPException:
         raise
+    except ModelRequestError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
     except RuntimeError as error:
         raise HTTPException(status_code=503, detail="embedding failed") from error
     return {
@@ -149,7 +151,7 @@ async def _embed(
     raw_input: object,
     allowed_media_origins: frozenset[_MediaOrigin],
 ) -> tuple[tuple[float, ...], ...]:
-    with tempfile.TemporaryDirectory(prefix="mindbridge-jina-") as temp_dir:
+    with tempfile.TemporaryDirectory(prefix="mindbridge-sentence-transformers-") as temp_dir:
         directory = Path(temp_dir)
         parsed = await asyncio.to_thread(
             lambda: tuple(
@@ -428,16 +430,20 @@ def _dimension(config: Mapping[str, object]) -> int:
 
 
 def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
-    """Load one pinned model and serve the embedding contract."""
+    """Load one SentenceTransformers model and serve the embedding contract."""
     options = _parser(prog).parse_args(argv)
     api_key = require_environment_value(os.environ, "MINDBRIDGE_EMBEDDER_API_KEY")
     config: dict[str, object] = {
         "model_id": options.model_id,
-        "space_id": DEFAULT_EMBEDDING_SPACE.space_id,
-        "dimension": DEFAULT_EMBEDDING_DIMENSION,
+        "space_id": options.embedding_space_id,
+        "dimension": options.embedding_dimension,
         "device": options.device,
         "max_concurrency": options.max_concurrency,
     }
+    if options.model_revision is not None:
+        config["model_revision"] = options.model_revision
+    if options.trust_remote_code is not None:
+        config["trust_remote_code"] = options.trust_remote_code
     uvicorn.run(
         create_app(
             api_key=api_key,
@@ -453,7 +459,7 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
 def _parser(prog: str | None) -> argparse.ArgumentParser:
     built = build_parser(
         prog=prog,
-        description="Serve Jina v5 Omni with SentenceTransformers.",
+        description="Serve a SentenceTransformers embedding model (Jina Omni by default).",
         epilog=(
             "environment:\n  MINDBRIDGE_EMBEDDER_API_KEY  bearer token required by /v1/* routes"
         ),
@@ -462,6 +468,23 @@ def _parser(prog: str | None) -> argparse.ArgumentParser:
     built.add_argument("--port", type=int, default=8002)
     built.add_argument("--device", default="cuda")
     built.add_argument("--model-id", default=DEFAULT_EMBEDDER_MODEL_ID)
+    built.add_argument("--model-revision")
+    built.add_argument(
+        "--trust-remote-code",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="allow model repository code; enabled by default only for bundled Jina Omni",
+    )
+    built.add_argument(
+        "--embedding-space-id",
+        default=DEFAULT_EMBEDDING_SPACE.space_id,
+        help="new models or revisions must use a new space and re-encode existing vectors",
+    )
+    built.add_argument(
+        "--embedding-dimension",
+        type=int,
+        default=DEFAULT_EMBEDDING_DIMENSION,
+    )
     built.add_argument("--max-concurrency", type=int, default=1)
     built.add_argument(
         "--media-origin",

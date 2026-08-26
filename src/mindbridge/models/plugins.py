@@ -31,15 +31,23 @@ def validate_generator_configuration(name: str, config: PluginConfig) -> None:
 def validate_embedder_configuration(name: str, config: PluginConfig) -> None:
     """Validate a bundled embedder schema without loading a model or client."""
     if name == "openai":
+        from mindbridge.models.defaults import require_distinct_embedding_space
         from mindbridge.models.openai import _EmbedderConfig as _OpenAIEmbedderConfig
 
         if not config.get("api_key"):
             raise MissingConfigurationError("MINDBRIDGE_EMBEDDER_API_KEY")
-        _OpenAIEmbedderConfig.model_validate(config)
-    elif name == "jina":
-        from mindbridge.models.jina import _EmbedderConfig as _JinaEmbedderConfig
+        openai_config = _OpenAIEmbedderConfig.model_validate(config)
+        require_distinct_embedding_space(openai_config.model_id, openai_config.space_id)
+    elif name in {"jina", "sentence-transformers"}:
+        from mindbridge.models.defaults import require_distinct_embedding_space
+        from mindbridge.models.jina import _EmbedderConfig as _SentenceTransformersConfig
 
-        _JinaEmbedderConfig.model_validate(config)
+        local_config = _SentenceTransformersConfig.model_validate(config)
+        require_distinct_embedding_space(
+            local_config.model_id,
+            local_config.space_id,
+            model_revision=local_config.model_revision,
+        )
 
 
 def load_generator(name: str, config: PluginConfig) -> Generator:

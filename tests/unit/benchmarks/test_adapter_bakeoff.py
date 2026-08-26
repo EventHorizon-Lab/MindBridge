@@ -17,7 +17,7 @@ from mindbridge.benchmarks.adapter_bakeoff import (
 )
 from mindbridge.core import EmbeddingSpaceReference, ModelReference
 from mindbridge.models import Embedding, EmbedRequest, EmbedResult
-from mindbridge.models.jina import JinaEmbedder
+from mindbridge.models.jina import SentenceTransformersEmbedder
 
 CORPUS_PATH = Path(__file__).parents[3] / "benchmarks" / "adapter-bakeoff-pairs.json"
 
@@ -74,7 +74,9 @@ async def test_score_adapter_reports_production_threshold_outcomes() -> None:
         "d-restated": 0.90,  # similarity ~0.62 -> missed merge at both thresholds
     }
 
-    score = await _score_adapter(cast(JinaEmbedder, _AngleEmbedder(angles)), corpus, "unit-model")
+    score = await _score_adapter(
+        cast(SentenceTransformersEmbedder, _AngleEmbedder(angles)), corpus, "unit-model"
+    )
 
     assert _outcome(score, 0.7).false_merge_rate_contradiction == pytest.approx(1.0)
     assert _outcome(score, 0.7).false_merge_rate_unrelated == pytest.approx(0.0)

@@ -16,7 +16,7 @@ from mindbridge.benchmarks.cli import parser as build_parser
 from mindbridge.benchmarks.runtime import dot_product
 from mindbridge.contracts import ContractModel
 from mindbridge.models import EmbedRequest, EmbedTask, ModelInput, TextPart
-from mindbridge.models.jina import JinaEmbedder
+from mindbridge.models.jina import SentenceTransformersEmbedder
 
 QUERY = "Where did the robot put the red screwdriver?"
 RELEVANT_DOCUMENT = "The robot put the red screwdriver beside the blue toolbox."
@@ -45,7 +45,7 @@ class JinaSmokeResult(ContractModel):
 
 async def run_jina_smoke(*, device: str) -> JinaSmokeResult:
     """Load the model and compare one relevant and irrelevant document."""
-    embedder = JinaEmbedder.load(device=device)
+    embedder = SentenceTransformersEmbedder.load(device=device)
     query_result = await embedder.embed(
         EmbedRequest(
             inputs=(ModelInput((TextPart(QUERY),)),),

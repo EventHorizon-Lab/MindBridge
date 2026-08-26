@@ -11,7 +11,7 @@ Eight process roles. Only the first six are long-running, and two of those are o
 | Role | Command | Extras |
 | --- | --- | --- |
 | API | `uvicorn mindbridge.server:create_app --factory` | `server` |
-| Jina embedding service | `mindbridge jina serve` | `server` + `cloud-models` |
+| Embedding service | `mindbridge sentence-transformers serve` | `server` + `cloud-models` |
 | Memory worker | `celery -A mindbridge.celery_app:app worker` | `server` + `media` (+ `cloud-models` only for an in-process media encoder, which brings `media` with it) |
 | MCP (optional) | `mindbridge mcp` | `server` |
 | Consolidation beat (optional) | `celery -A mindbridge.celery_app:app beat` | `server` |
@@ -27,7 +27,7 @@ packages:
 uv sync                                      # Core types and Python SDK
 uv sync --extra edge                         # Edge sync and identity runtime
 uv sync --extra server                       # API, MCP, scheduled sweeps
-uv sync --extra server --extra cloud-models  # Jina SentenceTransformers service
+uv sync --extra server --extra cloud-models  # SentenceTransformers service (Jina by default)
 uv sync --extra benchmarks                   # Benchmark harness
 uv sync --all-extras                         # Every role at once
 ```
@@ -183,7 +183,7 @@ native text, image, video, audio, and mixed-input preprocessing:
 ```bash
 export MINDBRIDGE_EMBEDDER_API_KEY=replace-with-at-least-32-random-characters
 
-uv run --extra server --extra cloud-models mindbridge jina serve \
+uv run --extra server --extra cloud-models mindbridge sentence-transformers serve \
   --host 0.0.0.0 --port 8001 --device cuda \
   --media-origin https://media.example.com
 ```
@@ -195,6 +195,24 @@ not named here, so the model never receives an unrestricted remote URL.
 Point `MINDBRIDGE_EMBEDDER_ENDPOINT` at this service's `/v1` base URL and use the same API key in
 the API and worker. `/health` is the readiness probe; `/v1/models` and `/v1/embeddings` follow the
 OpenAI-compatible contract used by MindBridge.
+
+To serve another supported model, also name a new vector space and the model's native or advertised
+Matryoshka dimension, for example:
+
+```bash
+uv run --extra server --extra cloud-models mindbridge sentence-transformers serve \
+  --model-id Qwen/Qwen3-VL-Embedding-2B \
+  --embedding-space-id qwen3-vl-embedding-2b-v1 \
+  --embedding-dimension 2048 \
+  --host 0.0.0.0 --port 8001 --device cuda \
+  --media-origin https://media.example.com
+```
+
+The adapter batches text, image, video, and standard multimodal dict/message inputs, but validates
+them against the loaded model. Qwen3-VL, for example, does not advertise audio, so audio requests
+fail before inference. A model or revision change is a migration: create another `space_id`,
+re-encode existing objects into it, then move every MindBridge process to that space. Do not point
+new weights at an old space.
 
 **Running this service separately is the largest measured ingest lever there is.** In the
 2026-08-24 evaluation, moving the encoder out of the worker and into this service took throughput
@@ -254,11 +272,12 @@ be compared.
 
 ### Optional in-process media encoder
 
-The alternative is the bundled `jina` plugin, which loads Jina v5 Omni into the worker process:
+The alternative is the bundled `sentence-transformers` plugin, which loads Jina v5 Omni by
+default into the worker process:
 
 ```bash
 uv sync --extra server --extra cloud-models
-export MINDBRIDGE_MEDIA_EMBEDDER_PLUGIN=jina
+export MINDBRIDGE_MEDIA_EMBEDDER_PLUGIN=sentence-transformers
 export MINDBRIDGE_MEDIA_EMBEDDER_DEVICE=cuda
 
 uv run --extra server --extra cloud-models \
@@ -266,7 +285,8 @@ uv run --extra server --extra cloud-models \
 ```
 
 **The worker refuses to start when a pool of more than one child would hold more resident encoder
-weight than the deployment allows, while either embedder slot names `jina`.** A prefork child owns
+weight than the deployment allows, while either embedder slot names `sentence-transformers` or
+`jina`.** A prefork child owns
 its plugins, so the model is loaded once per child and six children need about 22 GiB of VRAM. The
 pool size is whatever Celery settles on, from `--concurrency` or from `--autoscale`. Only
 `prefork` and `solo` are supported; thread and greenlet pools are refused because the worker

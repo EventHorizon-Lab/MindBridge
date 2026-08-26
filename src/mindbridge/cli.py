@@ -119,7 +119,12 @@ COMMANDS: dict[tuple[str, ...], Command] = {
     ),
     ("jina", "serve"): Command(
         "mindbridge.jina_server",
-        "Serve Jina v5 Omni with SentenceTransformers",
+        "Serve Jina v5 Omni through SentenceTransformers",
+        extra="server --extra cloud-models",
+    ),
+    ("sentence-transformers", "serve"): Command(
+        "mindbridge.jina_server",
+        "Serve a SentenceTransformers embedding model",
         extra="server --extra cloud-models",
     ),
     ("edge", "sync"): Command(

@@ -371,7 +371,7 @@
         <rect x="880" y="658" width="300" height="48" rx="6" fill="#0f172a"/>
         <rect x="880" y="658" width="300" height="48" rx="6" fill="rgba(30, 41, 59, 0.7)" stroke="#94a3b8" stroke-width="1.2"/>
         <text x="1030" y="676" fill="white" font-size="9.5" font-weight="600" text-anchor="middle">Embedder</text>
-        <text x="1030" y="690" fill="#94a3b8" font-size="7.5" text-anchor="middle">entry points: jina · openai</text>
+        <text x="1030" y="690" fill="#94a3b8" font-size="7.5" text-anchor="middle">entry points: sentence-transformers · jina · openai</text>
         <text x="1030" y="701" fill="#64748b" font-size="7" text-anchor="middle">声明 space_reference，API/Worker 双侧校验可达</text>
 
         <text x="870" y="731" fill="#64748b" font-size="7" text-anchor="middle">models/plugins.py 按 Python entry point 惰性发现 · 任务语义留在 MindBridge，供应商只写 Adapter · 不做 SFT / LoRA / RL</text>
@@ -498,7 +498,7 @@
 
     <footer>
       事实来源：<code>src/mindbridge/</code> · <code>migrations/</code> · 契约快照 · PostgreSQL 18 + pgvector 0.8.2 · Redis 8 · Python 3.10–3.14<br>
-      部署粒度按进程切分：<code>uv sync --extra edge</code>（端）· <code>--extra server</code>（API / MCP / 调度）· <code>--extra server --extra media</code>（Worker）· <code>--extra server --extra cloud-models</code>（Jina SentenceTransformers 服务）
+      部署粒度按进程切分：<code>uv sync --extra edge</code>（端）· <code>--extra server</code>（API / MCP / 调度）· <code>--extra server --extra media</code>（Worker）· <code>--extra server --extra cloud-models</code>（SentenceTransformers 服务，默认 Jina）
     </footer>
 
   </div>

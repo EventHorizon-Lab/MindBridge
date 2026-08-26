@@ -24,8 +24,9 @@ from pydantic import AwareDatetime, Field
 from mindbridge.benchmarks.cli import parser as build_parser
 from mindbridge.benchmarks.runtime import dot_product
 from mindbridge.contracts import ContractModel, NonEmptyString
+from mindbridge.core import EmbeddingSpaceReference
 from mindbridge.models import EmbedRequest, EmbedTask, ModelInput, TextPart
-from mindbridge.models.jina import JinaEmbedder
+from mindbridge.models.jina import SentenceTransformersEmbedder
 
 PairLabel = Literal["paraphrase", "contradiction", "unrelated"]
 
@@ -107,7 +108,12 @@ async def run_adapter_bakeoff(
         # default of `--retrieval-model-id`, so the common invocation stays pinned under
         # `trust_remote_code=True` -- and any other repository, which that commit could not
         # resolve against, gets its default branch.
-        embedder = JinaEmbedder.load(model_id=model_id, device=device, dimension=dimension)
+        embedder = SentenceTransformersEmbedder.load(
+            model_id=model_id,
+            device=device,
+            space_reference=EmbeddingSpaceReference(space_id=f"{model_id}-{dimension}"),
+            dimension=dimension,
+        )
         try:
             scores.append(await _score_adapter(embedder, corpus, model_id))
         finally:
@@ -134,7 +140,7 @@ async def run_adapter_bakeoff(
 
 
 async def _score_adapter(
-    embedder: JinaEmbedder,
+    embedder: SentenceTransformersEmbedder,
     corpus: PairCorpus,
     model_id: str,
 ) -> AdapterScore:

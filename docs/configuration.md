@@ -146,8 +146,8 @@ bundled per-field variables or through one explicit JSON object.
 | Media embedder | `MINDBRIDGE_MEDIA_EMBEDDER_PLUGIN` | inherits `MINDBRIDGE_EMBEDDER_PLUGIN` |
 
 `openai` means "any OpenAI-compatible endpoint", including one you serve yourself, and it is the
-default for **all three** slots. `jina`
-loads the model into the process; see
+default for **all three** slots. `sentence-transformers` loads a local model into the process;
+`jina` remains its compatibility alias. See
 [optional local media embedder](#optional-local-media-embedder-worker-only) for what that
 costs and when the worker refuses to run it.
 
@@ -183,7 +183,7 @@ observation twice. The boot failure names the largest value that fits.
 | `MINDBRIDGE_EMBEDDER_MODEL_ID` | no | `jinaai/jina-embeddings-v5-omni-small-retrieval` |
 
 The default `openai` plugin names the wire adapter, not the model runtime. The committed endpoint
-points to `mindbridge jina serve`, which loads Jina v5 Omni with SentenceTransformers. The API,
+points to `mindbridge sentence-transformers serve`, which loads Jina v5 Omni by default. The API,
 MCP, consolidation jobs, and both worker slots use that one service by default.
 
 ### Optional local media embedder (worker only)
@@ -197,7 +197,7 @@ endpoint — it has to write into the same embedding space anyway:
 export MINDBRIDGE_MEDIA_EMBEDDER_PLUGIN=openai
 ```
 
-**In-process (`jina`, optional).** Loads the encoder into the worker itself:
+**In-process (`sentence-transformers`, optional).** Loads the encoder into the worker itself:
 
 | Variable | Required | Default |
 | --- | --- | --- |
@@ -207,15 +207,15 @@ export MINDBRIDGE_MEDIA_EMBEDDER_PLUGIN=openai
 | `MINDBRIDGE_WORKER_VRAM_BUDGET_GIB` | no | `3.7` — one model copy per child |
 
 These variables are read only when a `MINDBRIDGE_MEDIA_EMBEDDER_*` override is present. Setting
-`MINDBRIDGE_MEDIA_EMBEDDER_PLUGIN=jina` opts the worker into loading a second, local
-SentenceTransformers model. Without that explicit override, media inherits the shared endpoint.
+`MINDBRIDGE_MEDIA_EMBEDDER_PLUGIN=sentence-transformers` opts the worker into loading a second,
+local model. Without that explicit override, media inherits the shared endpoint. The old `jina`
+plugin name selects the same adapter.
 
-`MODEL_REVISION` is the upstream commit this plugin downloads and, because it loads with
-`trust_remote_code=True`, the commit whose Python it executes. It is a loader argument rather
-than a record: the Hub resolves it against a content-addressed commit, so unset it and a worker
-restart silently picks up whatever is on the repository's default branch — new weights and new
-code, with no configuration change. Only the in-process plugin takes it. The endpoint-backed
-plugin talks to a server that resolves its own model, so there is nothing for MindBridge to pin.
+`MODEL_REVISION` is the upstream commit this plugin loads. Bundled Jina Omni also defaults
+`trust_remote_code` to `true` and pins that code to the same commit. Other models default it to
+`false`; a model that needs repository code must opt in with `trust_remote_code=true` in the
+`[media_embedder]` object or `MINDBRIDGE_MEDIA_EMBEDDER_CONFIG_JSON`. Only the local plugin takes a
+revision. The endpoint-backed plugin talks to a server that resolves its own model.
 
 Changing this value is a deliberate act, and it needs `MINDBRIDGE_EMBEDDING_SPACE_ID` changed
 with it. Vectors are comparable only within a space, `SPACE_ID` is what declares that
@@ -227,7 +227,8 @@ An explicit `DEVICE` that is unavailable fails rather than silently falling back
 The in-process plugin costs **3.7 GiB of resident weights per prefork child** on the measured RTX
 5090. The worker **refuses to start** when a
 pool of more than one child would hold more than `MINDBRIDGE_WORKER_VRAM_BUDGET_GIB`, while either
-embedder slot names `jina`, because a prefork child holds its own copy of the model and
+embedder slot names `sentence-transformers` or `jina`, because a prefork child holds its own copy
+of the model and
 `--max-memory-per-child` cannot bound VRAM. The pool size is whichever of `--concurrency` and
 `--autoscale` is larger. Only `prefork` and `solo` are supported: `solo` holds one copy,
 while thread and greenlet pools are refused because the worker runtime owns one synchronous event
@@ -302,10 +303,12 @@ separate from the encoder's own identity because several independently served en
 into one comparable space.
 
 `EMBEDDING_DIMENSION` is one width shared by the pgvector column and every encoder in the
-deployment. It accepts only widths Jina v5 was trained to truncate to — 32, 64, 128, 256, 512,
-768, 1024 — because any other value is an untrained truncation that quietly degrades recall.
-Changing it requires re-embedding, so set it once per deployment and give every process the same
-value.
+deployment. The local adapter accepts the selected model's native width, or a smaller width only
+when that exact value appears in the model's advertised Matryoshka dimensions. Changing the model,
+revision, or dimension requires a new `SPACE_ID` and re-encoding every searchable object; the
+bundled default space is rejected with any other model or revision. Give every process the same
+new values. Startup refuses tenants that still have an object type only in the old space, so a
+model switch cannot silently turn recall empty.
 
 `MINIMUM_EMBEDDING_SIMILARITY` accepts −1.0 to 1.0. The default of 0.0 admits every
 non-antipodal candidate and lets fusion and the answer stage do the filtering, which is usually

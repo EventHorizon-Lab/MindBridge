@@ -1,4 +1,4 @@
-"""Local Jina adapter for MindBridge's atomic embedding capability."""
+"""Local SentenceTransformers adapter for MindBridge's embedding capability."""
 
 from __future__ import annotations
 
@@ -7,11 +7,14 @@ from collections.abc import Callable, Mapping
 from importlib import import_module
 from typing import Protocol, cast
 
+from pydantic import StrictBool
+
 from mindbridge.application.capabilities import (
     Embedding,
     EmbedRequest,
     EmbedResult,
     EmbedTask,
+    MediaPart,
     ModelInput,
     TextPart,
 )
@@ -20,6 +23,7 @@ from mindbridge.core import (
     EmbeddingSpaceReference,
     ModelOutputError,
     ModelReference,
+    ModelRequestError,
     ModelUnavailableError,
 )
 from mindbridge.models._vectors import validate_embedding_vector
@@ -28,8 +32,9 @@ from mindbridge.models.defaults import (
     DEFAULT_EMBEDDER_MODEL_ID,
     DEFAULT_EMBEDDING_DIMENSION,
     DEFAULT_EMBEDDING_SPACE,
-    MatryoshkaDimension,
+    EmbeddingDimension,
     embedder_revision_for,
+    require_distinct_embedding_space,
 )
 from mindbridge.telemetry import operation_span, set_current_span_attributes
 
@@ -39,13 +44,17 @@ class _EmbeddingMatrix(Protocol):
 
 
 class _SentenceEncoder(Protocol):
+    def supports(self, modality: str | tuple[str, ...]) -> bool: ...
+
+    def get_sentence_embedding_dimension(self) -> int | None: ...
+
     def encode_query(
         self,
         sentences: list[object],
         *,
         convert_to_numpy: bool,
         normalize_embeddings: bool,
-        truncate_dim: int,
+        truncate_dim: int | None,
     ) -> _EmbeddingMatrix: ...
 
     def encode_document(
@@ -54,7 +63,7 @@ class _SentenceEncoder(Protocol):
         *,
         convert_to_numpy: bool,
         normalize_embeddings: bool,
-        truncate_dim: int,
+        truncate_dim: int | None,
     ) -> _EmbeddingMatrix: ...
 
 
@@ -66,29 +75,21 @@ class _SentenceTransformerFactory(Protocol):
         revision: str | None,
         trust_remote_code: bool,
         device: str | None,
-        model_kwargs: dict[str, str | None],
-        config_kwargs: dict[str, str | None],
+        model_kwargs: dict[str, str | None] | None,
+        config_kwargs: dict[str, str | None] | None,
     ) -> _SentenceEncoder: ...
 
 
 _ABSENT = object()
-"""Distinguishes an upstream that never had a processor slot from one whose slot is empty."""
-
+_JINA_MODALITIES = frozenset({"text", "image", "video", "audio", "message"})
 _MISSING_PROCESSOR = (
-    "the Jina Omni image and video processor did not load, so this model can only embed text; "
-    "install MindBridge with the cloud-models extra so Torchvision is present"
+    "the model's image and video processor did not load, so it can only embed text; "
+    "install MindBridge with the cloud-models extra"
 )
 
 
 def _media_processor_missing(encoder: object) -> bool:
-    """Report an upstream module whose processor slot exists but was left empty.
-
-    Jina builds that processor inside a bare `except Exception` and assigns `None` on failure, so
-    a missing Torchvision produces a model that loads, embeds text, and then raises
-    `TypeError: 'NoneType' object is not callable` on the first frame -- after a perception call
-    has already been paid for. An absent attribute is not a failure: a future upstream may hold
-    the processor somewhere else, and guessing wrong must not refuse a working model.
-    """
+    """Catch Jina's swallowed optional-dependency failure during readiness."""
     try:
         modules = list(iter(encoder))  # type: ignore[call-overload]
     except TypeError:
@@ -96,8 +97,8 @@ def _media_processor_missing(encoder: object) -> bool:
     return any(getattr(module, "processor", _ABSENT) is None for module in modules)
 
 
-class JinaEmbedder:
-    """Async-safe query/document encoder for text, image, video, and audio."""
+class SentenceTransformersEmbedder:
+    """Async-safe SentenceTransformers query/document encoder."""
 
     def __init__(
         self,
@@ -106,6 +107,7 @@ class JinaEmbedder:
         *,
         space_reference: EmbeddingSpaceReference = DEFAULT_EMBEDDING_SPACE,
         dimension: int = DEFAULT_EMBEDDING_DIMENSION,
+        truncate_dim: int | None = None,
         max_concurrency: int = 1,
     ) -> None:
         if dimension <= 0:
@@ -116,17 +118,11 @@ class JinaEmbedder:
         self._model_reference = model_reference
         self._space_reference = space_reference
         self._dimension = dimension
+        self._truncate_dim = truncate_dim
+        self._legacy_jina_input = model_reference.model_id == DEFAULT_EMBEDDER_MODEL_ID
         self._document_semaphore = asyncio.Semaphore(max_concurrency)
-        # A query is one short string a caller is waiting on; a document batch is bulk work
-        # nobody is watching. Sharing one semaphore made an interactive recall queue behind
-        # whatever ingest was running: an empty recall, with no memories and no generation at
-        # all, took 57-71 s against a 12.4 s idle baseline during the 2026-08-21 evaluation.
-        # The query lane is its own single slot rather than a reservation out of
-        # `max_concurrency`, because that value defaults to 1 and carving a slot out of it
-        # would leave documents none. Its price is a ceiling of `max_concurrency + 1`
-        # concurrent encodes wherever one process both queries and ingests -- one encode's
-        # worth of activation memory beyond what the Worker's VRAM guard estimates, which
-        # counts resident weights only and says so.
+        # Interactive recall must not queue behind bulk document encoding. The extra query
+        # slot costs one encode's activation memory beyond the resident-model worker guard.
         self._query_semaphore = asyncio.Semaphore(1)
 
     @classmethod
@@ -135,54 +131,51 @@ class JinaEmbedder:
         *,
         model_id: str = DEFAULT_EMBEDDER_MODEL_ID,
         revision: str | None = None,
+        trust_remote_code: bool | None = None,
         device: str | None = None,
         space_reference: EmbeddingSpaceReference = DEFAULT_EMBEDDING_SPACE,
         dimension: int = DEFAULT_EMBEDDING_DIMENSION,
         max_concurrency: int = 1,
-    ) -> JinaEmbedder:
-        """Load a pinned upstream model without exposing training operations.
-
-        `revision` unset resolves through `embedder_revision_for`, which supplies the bundled
-        pin for `DEFAULT_EMBEDDER_MODEL_ID` and nothing for any other repository -- so the
-        safe thing is what a caller gets for free, and a caller sweeping arbitrary
-        repositories cannot inherit a pin that could not resolve against them. Passing a
-        revision explicitly always wins.
-        """
+    ) -> SentenceTransformersEmbedder:
+        """Load one model and validate its vector and modality metadata."""
         revision = embedder_revision_for(model_id, revision)
+        require_distinct_embedding_space(
+            model_id,
+            space_reference.space_id,
+            model_revision=revision,
+        )
+        trusted = (
+            model_id == DEFAULT_EMBEDDER_MODEL_ID
+            if trust_remote_code is None
+            else trust_remote_code
+        )
         try:
             module = import_module("sentence_transformers")
-            hub_module = import_module("huggingface_hub")
-            import_module("librosa")
         except ImportError as error:
             raise ModelUnavailableError(
-                "install MindBridge with the cloud-models extra to load Jina Omni"
+                "install MindBridge with the cloud-models extra to load SentenceTransformers"
             ) from error
-        sentence_transformer = cast(
-            _SentenceTransformerFactory,
-            module.SentenceTransformer,
+        sentence_transformer = cast(_SentenceTransformerFactory, module.SentenceTransformer)
+        code_kwargs: dict[str, str | None] | None = (
+            {"code_revision": revision} if trusted and revision is not None else None
         )
-        snapshot_download = cast(Callable[..., str], hub_module.snapshot_download)
-        model_path = snapshot_download(repo_id=model_id, revision=revision)
-        selected_device = select_torch_device(device)
-        # `code_revision` pins the remote code separately from the weights, and it has to be
-        # set on both: `sentence_transformers` forwards one to the module implementation and
-        # the other to the config. Under `trust_remote_code=True` this is what decides which
-        # third-party Python this process executes.
         encoder = sentence_transformer(
-            model_path,
+            model_id,
             revision=revision,
-            trust_remote_code=True,
-            device=selected_device,
-            model_kwargs={"modality": "omni", "code_revision": revision},
-            config_kwargs={"code_revision": revision},
+            trust_remote_code=trusted,
+            device=select_torch_device(device),
+            model_kwargs=code_kwargs,
+            config_kwargs=code_kwargs,
         )
-        if _media_processor_missing(encoder):
+        if model_id == DEFAULT_EMBEDDER_MODEL_ID and _media_processor_missing(encoder):
             raise ModelUnavailableError(_MISSING_PROCESSOR)
+        truncate_dim = _validated_truncate_dim(encoder, dimension)
         return cls(
             encoder,
             ModelReference(model_id=model_id),
             space_reference=space_reference,
             dimension=dimension,
+            truncate_dim=truncate_dim,
             max_concurrency=max_concurrency,
         )
 
@@ -193,7 +186,7 @@ class JinaEmbedder:
 
     @operation_span("mindbridge.model.embed")
     async def embed(self, request: EmbedRequest) -> EmbedResult:
-        """Encode a homogeneous query or document batch."""
+        """Encode a query or document batch through the official task methods."""
         is_query = request.task is EmbedTask.QUERY
         encode = self._encoder.encode_query if is_query else self._encoder.encode_document
         vectors = await self._encode(
@@ -220,6 +213,7 @@ class JinaEmbedder:
     ) -> tuple[tuple[float, ...], ...]:
         if not inputs:
             return ()
+        prepared = [self._model_input(item) for item in inputs]
         set_current_span_attributes(
             {
                 "mindbridge.model.id": self._model_reference.model_id,
@@ -231,10 +225,10 @@ class JinaEmbedder:
         async with semaphore:
             matrix = await asyncio.to_thread(
                 encode,
-                cast(list[object], [_jina_input(item) for item in inputs]),
+                prepared,
                 convert_to_numpy=True,
                 normalize_embeddings=True,
-                truncate_dim=self._dimension,
+                truncate_dim=self._truncate_dim,
             )
         vectors = tuple(tuple(float(value) for value in row) for row in matrix.tolist())
         if len(vectors) != len(inputs):
@@ -243,29 +237,59 @@ class JinaEmbedder:
             validate_embedding_vector(vector, self._dimension)
         return vectors
 
+    def _model_input(self, input_value: ModelInput) -> object:
+        modalities = tuple(_part_modality(part) for part in input_value.parts)
+        for modality in set(modalities):
+            if not self._supports(modality):
+                raise ModelRequestError(
+                    f"model {self._model_reference.model_id!r} does not support {modality} input"
+                )
+        values = tuple(_part_value(part) for part in input_value.parts)
+        if len(values) == 1:
+            return (
+                values[0]
+                if self._legacy_jina_input or modalities[0] == "text"
+                else {modalities[0]: values[0]}
+            )
+        if self._legacy_jina_input:
+            return values
+        compound = tuple(sorted(set(modalities)))
+        if len(compound) == len(modalities) and self._supports(compound):
+            return dict(zip(modalities, values, strict=True))
+        if not self._supports("message"):
+            raise ModelRequestError(
+                f"model {self._model_reference.model_id!r} cannot combine these input parts"
+            )
+        return [{"role": "user", "content": [_message_part(part) for part in input_value.parts]}]
+
+    def _supports(self, modality: str | tuple[str, ...]) -> bool:
+        if self._legacy_jina_input:
+            requested = (modality,) if isinstance(modality, str) else modality
+            return all(item in _JINA_MODALITIES for item in requested)
+        return self._encoder.supports(modality)
+
+
+# Compatibility for code that imported the original provider-specific class directly.
+JinaEmbedder = SentenceTransformersEmbedder
+
 
 class _EmbedderConfig(PluginConfigModel):
     model_id: PluginText = DEFAULT_EMBEDDER_MODEL_ID
-    # Spelled `model_revision` because that is the name a deployment configured before
-    # migration 0021 and the value still means the same thing here. `PluginConfigModel`
-    # ignores that name where nothing declares it, so an operator's existing
-    # MINDBRIDGE_MEDIA_EMBEDDER_CONFIG_JSON keeps pinning what it always pinned instead of
-    # being silently replaced by this default. Unset means "resolve the pin from the model
-    # id", which is the bundled commit for the bundled repository and nothing for another --
-    # not "load the default branch of whatever repository this is".
     model_revision: PluginText | None = None
+    trust_remote_code: StrictBool | None = None
     device: PluginText | None = None
     space_id: PluginText = DEFAULT_EMBEDDING_SPACE.space_id
-    dimension: MatryoshkaDimension = DEFAULT_EMBEDDING_DIMENSION
+    dimension: EmbeddingDimension = DEFAULT_EMBEDDING_DIMENSION
     max_concurrency: PluginInteger = 1
 
 
-def create_embedder(config: Mapping[str, object]) -> JinaEmbedder:
-    """Entry-point factory for the bundled local Jina model."""
+def create_embedder(config: Mapping[str, object]) -> SentenceTransformersEmbedder:
+    """Entry-point factory for local SentenceTransformers models."""
     validated = _EmbedderConfig.model_validate(config)
-    return JinaEmbedder.load(
+    return SentenceTransformersEmbedder.load(
         model_id=validated.model_id,
         revision=validated.model_revision,
+        trust_remote_code=validated.trust_remote_code,
         device=validated.device,
         space_reference=EmbeddingSpaceReference(space_id=validated.space_id),
         dimension=validated.dimension,
@@ -273,8 +297,55 @@ def create_embedder(config: Mapping[str, object]) -> JinaEmbedder:
     )
 
 
-def _jina_input(input_value: ModelInput) -> str | tuple[str, ...]:
-    values = tuple(
-        part.text if isinstance(part, TextPart) else part.url for part in input_value.parts
+def _validated_truncate_dim(encoder: _SentenceEncoder, requested: int) -> int | None:
+    native = encoder.get_sentence_embedding_dimension()
+    if native is None or native <= 0:
+        raise ModelUnavailableError("the model does not declare its native embedding dimension")
+    if requested == native:
+        return None
+    trained = _model_config_value(encoder, "matryoshka_dimensions")
+    is_matryoshka = _model_config_value(encoder, "is_matryoshka")
+    if (
+        requested > native
+        or is_matryoshka is not True
+        or not isinstance(trained, (list, tuple))
+        or requested not in trained
+    ):
+        raise ModelUnavailableError(
+            f"model native dimension is {native}; requested dimension {requested} is not an "
+            "advertised Matryoshka dimension"
+        )
+    return requested
+
+
+def _model_config_value(encoder: _SentenceEncoder, name: str) -> object:
+    try:
+        first = encoder[0]  # type: ignore[index]
+    except (IndexError, KeyError, TypeError):
+        first = None
+    candidates = (
+        getattr(encoder, "config", None),
+        getattr(first, "config", None),
+        getattr(getattr(first, "auto_model", None), "config", None),
+        getattr(getattr(first, "model", None), "config", None),
     )
-    return values[0] if len(values) == 1 else values
+    for config in candidates:
+        for source in (config, getattr(config, "text_config", None)):
+            value = getattr(source, name, _ABSENT)
+            if value is not _ABSENT:
+                return value
+    return None
+
+
+def _part_modality(part: TextPart | MediaPart) -> str:
+    return "text" if isinstance(part, TextPart) else part.kind.value
+
+
+def _part_value(part: TextPart | MediaPart) -> str:
+    return part.text if isinstance(part, TextPart) else part.url
+
+
+def _message_part(part: TextPart | MediaPart) -> dict[str, str]:
+    if isinstance(part, TextPart):
+        return {"type": "text", "text": part.text}
+    return {"type": part.kind.value, part.kind.value: part.url}
