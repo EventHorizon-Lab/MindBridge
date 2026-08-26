@@ -264,9 +264,14 @@ async def run_units(
     Results come back in the order `units` were given, which several runners require: their
     predictions have to line up with the official annotation's own order.
 
-    A unit that raises still ends the run, exactly as the serial `await` did. `gather` cancels
-    the siblings first, which changes nothing an operator can observe: no runner writes anything
-    until every unit has returned, so an escaping exception lost the whole run either way.
+    A unit that raises ends the run, as the serial `await` did, and the siblings are cancelled
+    and waited out before it does. Neither half is what `gather` gives on its own. With
+    `return_exceptions=False` it propagates the first exception but leaves the siblings running
+    -- they then reach a client `connected_memory` has already closed, from tasks nobody awaits,
+    and any unit that had already submitted observations leaves the Worker processing for a run
+    that will write nothing. With `return_exceptions=True` every remaining unit runs to
+    completion first, which is worse: a run whose first unit fails would ingest the whole corpus
+    before saying so. `TaskGroup` does exactly this, and is 3.11; the floor here is 3.10.
     """
     if unit_concurrency <= 0:
         raise ValueError("unit_concurrency must be positive")
@@ -282,7 +287,17 @@ async def run_units(
         report_unit(label(unit), index=completed, total=len(units), quiet=quiet)
         return result
 
-    return tuple(await asyncio.gather(*(one(unit) for unit in units)))
+    tasks = [asyncio.create_task(one(unit)) for unit in units]
+    try:
+        return tuple(await asyncio.gather(*tasks))
+    except BaseException:
+        # `BaseException` because an interrupt has to clean up too: a Ctrl-C during a sweep is
+        # the likeliest way this path is reached, and leaving units in flight through it is how
+        # the summary ends up written while requests are still going out.
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
 
 
 _ArgumentsT = TypeVar("_ArgumentsT", bound=CoreArguments)

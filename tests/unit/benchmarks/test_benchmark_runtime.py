@@ -197,9 +197,13 @@ async def test_prepared_ingest_keeps_its_permits_busy_past_the_first_cohort() ->
     )
 
     assert failures == 0
-    observed_before_the_slow_one_finished = api.log.index("done job_0001")
+    # The slow job is the first one observed, because `gather` starts its members in argument
+    # order and the first three take the only permits. Asserted rather than assumed: without it
+    # a renamed job-id scheme would surface as a bare ValueError out of `index` below.
+    assert api.log[0] == "observe job_0001", f"the slow job was not observed first: {api.log[:3]}"
+    assert "done job_0001" in api.log, "the slow segment never finished; nothing to measure"
     started_before_then = sum(
-        entry.startswith("observe") for entry in api.log[:observed_before_the_slow_one_finished]
+        entry.startswith("observe") for entry in api.log[: api.log.index("done job_0001")]
     )
     assert started_before_then > concurrency, (
         f"only {started_before_then} segments were in flight before the slow one finished; "

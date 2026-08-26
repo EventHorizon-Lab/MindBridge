@@ -134,6 +134,13 @@ async def ingest_prepared_video(
     Returns the number of segments that failed, which every question over this video then
     carries: both callers ingest the whole video before answering anything, so a question that
     reads a non-zero count is a question asked over incomplete memory.
+
+    Every segment is handed to one `gather` and the semaphore is the only thing bounding what is
+    in flight. Awaiting them in batches of `request_concurrency` instead drained the permits to
+    zero at every batch edge, and a batch's wall clock was its slowest member rather than its
+    mean -- costly, because per-clip processing time is heavy tailed. The cost of the eager
+    fan-out is one pending task per segment for the length of the ingest, which is thousands of
+    small tasks on the largest split here and no bigger than the manifest already in memory.
     """
     if request_concurrency <= 0:
         raise ValueError("request_concurrency must be positive")

@@ -327,10 +327,19 @@ async def test_finished_units_are_counted_rather_than_numbered(
         quiet=False,
     )
 
-    err = capsys.readouterr().err
-    assert "starting unit a" in err
-    assert "[1/2] unit " in err
-    assert "[2/2] unit " in err
+    lines = capsys.readouterr().err.splitlines()
+    assert sorted(line for line in lines if line.startswith("starting")) == [
+        "starting unit a",
+        "starting unit b",
+    ]
+    # Which unit finishes first is not fixed, so the counters are asserted against the set of
+    # units rather than an order. Pinning only the `[n/2]` prefixes would pass on a regression
+    # that printed one unit's label on both lines.
+    counted = sorted(line for line in lines if line.startswith("["))
+    assert counted == ["[1/2] unit a", "[2/2] unit b"] or counted == [
+        "[1/2] unit b",
+        "[2/2] unit a",
+    ], counted
 
 
 def test_every_runner_forwards_its_own_unit_ceiling() -> None:
@@ -361,3 +370,46 @@ def test_every_runner_forwards_its_own_unit_ceiling() -> None:
                 "instead of the run's own ceiling"
             )
     assert checked == 9, f"expected nine run_units call sites, read {checked}"
+
+
+async def test_a_failing_unit_takes_its_siblings_down_before_it_returns() -> None:
+    """Nothing may still be in flight once `run_units` raises.
+
+    The caller's next move is `connected_memory`'s `finally`, which closes the client. A sibling
+    still running past that reaches a closed client from a task nobody awaits -- and a sibling
+    that had already submitted observations leaves the Worker processing for a run that will
+    never write predictions. Plain `gather` does not cancel siblings, so this is the check that
+    the cancel-and-wait is really there.
+    """
+    started: list[int] = []
+    finished: list[int] = []
+    cancelled: list[int] = []
+
+    async def run(unit: int) -> int:
+        started.append(unit)
+        if unit == 0:
+            raise RuntimeError("unit 0 died")
+        try:
+            for _turn in range(50):
+                await asyncio.sleep(0)
+            finished.append(unit)
+        except asyncio.CancelledError:
+            cancelled.append(unit)
+            raise
+        return unit
+
+    with pytest.raises(RuntimeError, match="unit 0 died"):
+        await run_units(
+            tuple(range(6)),
+            label=lambda unit: f"unit {unit}",
+            run=run,
+            unit_concurrency=3,
+            quiet=True,
+        )
+
+    assert not finished, f"units {finished} ran to completion after the run had already failed"
+    assert sorted(cancelled) == sorted(unit for unit in started if unit != 0), (
+        f"started {sorted(started)} but only {sorted(cancelled)} had unwound by the time "
+        "run_units returned"
+    )
+    assert 5 not in started, "a unit still waiting for a permit must never start"
