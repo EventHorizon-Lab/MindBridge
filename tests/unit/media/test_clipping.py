@@ -698,3 +698,58 @@ def test_a_one_frame_video_clip_is_repeated_rather_than_left_unembeddable() -> N
             decoded = list(container.decode(container.streams.video[0]))
         assert len(decoded) >= 2
         assert decoded[0].time != decoded[1].time
+
+
+def test_stream_rate_never_declares_a_rate_below_its_sampling() -> None:
+    """The encoder time base is 1/rate, so a rate under the sampling rate is a tick too coarse
+    to hold two sampled frames apart -- see `_stream_rate` for what that costs.
+
+    Pinned across the halves specifically: Python rounds them to even, so `round` sent 2.5 down
+    and 3.5 up, and nothing at the call site hints that those two behave differently.
+    """
+    for frames_per_second in (0.25, 0.75, 1.0, 1.5, 2.4, 2.5, 3.5, 4.5, 7.5, 19.0):
+        assert _stream_rate(frames_per_second) >= frames_per_second
+
+    # Still integral, and still at least one however slow the sampling is.
+    assert _stream_rate(0.25) == 1
+    assert isinstance(_stream_rate(2.5), int)
+
+
+def test_fractional_frame_rates_that_round_down_still_cut() -> None:
+    """A sampling rate the stream rate rounded *down* from failed every cut it was used for.
+
+    Not a long-span failure: the tick is 1/rate, so the frames collide as soon as the span
+    crosses one tick boundary, and 2.5 fps -- a 400 ms sampling declared as a 500 ms tick --
+    put frames 2 and 3 on the same timestamp and lost the clip at 21 frames. It was reachable
+    straight from configuration, which caps `frames_per_second` at 20 and accepts every
+    fractional value under it, so this was a whole deployment cutting no video at all.
+
+    Every span here stays well under the ~43 sampled frames where a separate defect in the
+    encode loop's own timeline used to take over, so what fails when this regresses is the
+    rate and nothing else.
+    """
+    import av
+
+    source = _video_bytes(seconds=60.0, fps=10, width=160, height=120)
+
+    for frames_per_second in (2.4, 2.5, 4.5):
+        request = ClipRequest(
+            kind=MediaKind.VIDEO,
+            start_ms=0,
+            end_ms=8_000,
+            frames_per_second=frames_per_second,
+        )
+        sampled = _sample_video_frames(source, request)
+        assert 2 <= len(sampled) < 43
+
+        clips = cut_clips(source, request)
+
+        with av.open(io.BytesIO(clips[0].content), mode="r") as container:
+            decoded = list(container.decode(container.streams.video[0]))
+        assert len(decoded) == len(sampled)
+        times = [frame.time for frame in decoded]
+        # Distinctness is the defect itself. A rate below the sampling does not drop a frame,
+        # it hands two of them one timestamp -- so "it did not raise" is not enough to say the
+        # tick is fine, and neither is the count on its own.
+        assert len(set(times)) == len(times), f"{frames_per_second} fps collapsed two frames"
+        assert times == sorted(times)
