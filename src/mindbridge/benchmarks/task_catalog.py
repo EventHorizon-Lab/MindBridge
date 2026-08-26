@@ -160,8 +160,6 @@ TASKS: dict[str, CatalogTask] = {
         (
             "--dataset",
             f"{ROOT}/egotempo/egotempo_openQA.json",
-            "--prepared-media",
-            f"{ROOT}/egotempo-prepared.json",
         ),
         output_suffix=".json",
     ),
@@ -202,8 +200,6 @@ TASKS: dict[str, CatalogTask] = {
         (
             "--dataset",
             f"{ROOT}/video-mme/videomme/test-00000-of-00001.parquet",
-            "--prepared-media",
-            f"{ROOT}/video-mme-prepared.json",
             "--transcript-source",
             "none",
         ),
@@ -214,8 +210,6 @@ TASKS: dict[str, CatalogTask] = {
         (
             "--dataset",
             f"{ROOT}/video-mme-v2/test.parquet",
-            "--prepared-media",
-            f"{ROOT}/video-mme-v2-prepared.json",
             "--transcript-source",
             "none",
         ),

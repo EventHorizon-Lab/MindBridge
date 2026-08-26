@@ -21,6 +21,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from mindbridge.benchmarks.cli_common import report, select_by_id
+from mindbridge.benchmarks.prepare_video import (
+    prepare_egotempo,
+    prepare_video_mme,
+    prepare_video_mme_v2,
+)
+from mindbridge.benchmarks.releases import ensure_media
 from mindbridge.benchmarks.runtime import benchmark_tenant_id
 from mindbridge.benchmarks.staging import (
     PrepareRequest,
@@ -136,10 +142,16 @@ def prepare_m3(request: PrepareRequest) -> None:
             / f"{video.video_id}.mp4"
         )
         if not source.exists():
-            raise FileNotFoundError(
-                f"M3-Bench source video {source} is absent; it is part of the "
-                "ByteDance-Seed/M3-Bench release and about 2 GB per video"
-            )
+            # On absence rather than up front. `ensure_media` refuses an unobtainable media set
+            # before it looks at the filesystem, and `m3-web` is one -- its 920 videos are the
+            # `video_url` of each annotation, not files the release ships. Calling eagerly would
+            # therefore fail `--subset web` even where the operator had placed every video.
+            ensure_media(f"m3-{arguments.subset}", root=request.benchmarks_root)
+            if not source.exists():
+                raise FileNotFoundError(
+                    f"M3-Bench source video {source} is absent; it is part of the "
+                    "ByteDance-Seed/M3-Bench release and about 2 GB per video"
+                )
         tenant_id = benchmark_tenant_id(arguments.tenant_prefix, video.video_id, arguments.run_id)
         clips = tuple(
             M3PreparedClip(
@@ -177,6 +189,9 @@ class Producer:
 PREPARERS: dict[str, Producer] = {
     "mem-gallery": Producer("--prepared-images", prepare_mem_gallery),
     "m3": Producer("--prepared-media", prepare_m3),
+    "video-mme": Producer("--prepared-media", prepare_video_mme),
+    "video-mme-v2": Producer("--prepared-media", prepare_video_mme_v2),
+    "egotempo": Producer("--prepared-media", prepare_egotempo),
 }
 """The benchmarks whose prepared media this module can produce.
 
