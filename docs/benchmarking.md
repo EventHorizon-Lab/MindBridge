@@ -114,16 +114,23 @@ groups (--tasks expands these), inputs resolved against .benchmarks:
 tasks:
   locomo-refined          locomo-refined  download
   m3-robot                m3              download, prepare
-  egolife                 egolife         needs .benchmarks/egolife-prepared-a1.json
+  m3-web                  m3              download, acquire, prepare
+  egolife                 egolife         download, prepare
   memlens-32k             memlens         download
   ...
 ```
 
-Four states, because they need four different things. `ready` runs now. `download` runs after a
-fetch the sweep performs itself. `prepare` means the sweep will stage media into the deployment's
-bucket. A named path is a prepared-media manifest with no producer yet and must be supplied by the
-operator, which no catalog task now needs. States can be combined, as in
-`download, prepare`.
+The stages are named in the order the sweep performs them. `ready` runs now. `download` is a fetch
+of the pinned official release the sweep performs itself. `acquire` is media that comes from
+outside the release — Ego4D behind its signed agreement, or 920 YouTube URLs — and is the one
+stage with a prerequisite this machine may not hold; see [Media no snapshot
+supplies](#media-no-snapshot-supplies). `prepare` means the sweep will stage media into the
+deployment's bucket. A named path is a prepared-media manifest with no producer yet and must be
+supplied by the operator, which no catalog task now needs.
+
+The listing reads the tables and the filesystem and nothing else: it never downloads, never
+imports an acquirer, and never checks a credential, so it stays instant and safe to run before
+deciding to spend an evening.
 
 Task names are comma-separated and the flag repeats, so `--tasks m3-robot,m3-web --tasks egolife`
 is three tasks. A group expands to several, and a task named twice still runs once.
@@ -195,9 +202,9 @@ itself for the benchmarks below, staging into the deployment's own bucket:
 | --- | --- | --- |
 | `mem-gallery` | the release's own images | the sweep |
 | `m3-robot` | the official videos, cut into 30-second clips | the sweep |
-| `m3-web` | the official videos, cut into 30-second clips | you — see below |
+| `m3-web` | the official videos, cut into 30-second clips | the sweep — see below |
 | `video-mme`, `video-mme-v2` | the official videos, cut into 30-second segments | the sweep |
-| `egotempo` | the pre-trimmed clip each question names | you — see below |
+| `egotempo` | the pre-trimmed clip each question names | the sweep — see below |
 | `egolife` | the release's own 30-second clips, staged verbatim | the sweep |
 | `egomem` | EgoLife's clips, on EgoMemReason's own horizons | the sweep |
 | `supermemory` | the official recordings, cut to each question's horizon | the sweep |
@@ -236,23 +243,43 @@ Bucket credentials are Boto3's own (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`
 endpoint come from the same `[object_storage]` configuration the deployment reads, so a benchmark
 cannot stage into a bucket the deployment will not look in.
 
-### Media the sweep cannot fetch
+### Media no snapshot supplies
 
 Naming a task fetches the media it reads, at the revision `releases.py` pins, with no size cap and
 no prompt — Video-MME's 20 archives are 94 GiB and the sweep will take all of them. Two media sets
-are the exception, and both say so with the instruction rather than failing vaguely:
+are not files in a pinned repository at all, so the sweep obtains them a different way. It still
+obtains them: `--list-tasks` marks these two `acquire` rather than `download`, and the difference
+is the prerequisite, not the automation.
 
 - **`egotempo`** — its videos are Ego4D, released under a signed access agreement no unattended
-  download can accept. Request access, fetch each question's `source_video_id` with the `ego4d`
-  CLI, and cut `clip_start_seconds..clip_end_seconds` into
-  `<benchmarks-root>/egotempo/videos/<clip_id>.mp4`. The producer wants that trimmed clip, and its
-  name is the `clip_id` because the runner requires the prepared `video_id` to equal it.
+  download can accept, so **you need Ego4D access before this can run**. Request it at
+  <https://ego4d-data.org>, then let the sweep fetch each question's `source_video_id` with the
+  `ego4d` CLI and cut `clip_start_seconds..clip_end_seconds` into
+  `<benchmarks-root>/egotempo/videos/<clip_id>.mp4`. The name is the `clip_id` because the runner
+  requires the prepared `video_id` to equal it. Without the agreement the run stops with those
+  same instructions, which is also what to follow to place the clips by hand.
 - **`m3-web`** — its 920 videos are web sources the release distributes as the `video_url` of each
-  entry in `m3-agent/data/annotations/web.json` rather than as files. Download them yourself into
-  `<benchmarks-root>/m3-bench/videos/web/<video_id>.mp4`.
+  entry in `m3-agent/data/annotations/web.json` rather than as files, so the sweep downloads them
+  with `yt-dlp` into `<benchmarks-root>/m3-bench/videos/web/<video_id>.mp4`. Each annotation key is
+  the YouTube ID, so the file name needs no template. The whole split is about 18 GB and takes
+  **8–15 hours** at the default pacing; a `--limit`ed run asks for only the videos it will read.
 
-`--no-download` refuses both the annotation fetch and the media fetch rather than performing
-either, so it fails on an absent release instead of quietly obtaining 94 GiB.
+Both are narrowed per unit, so `--tasks m3-web --limit 1` acquires one video rather than 920.
+`MINDBRIDGE_BENCH_YOUTUBE_SLEEP_SECONDS` (default `30`) is the wait before each download, jittered
+up to twice that, with metadata requests paced at a quarter of it. Raising it is the only lever
+against YouTube's bot detection, and a value that is not a number is refused rather than defaulted.
+
+**An out-of-date `yt-dlp` presents as HTTP 403 from YouTube, and 412 from bilibili.** That looks
+exactly like bot detection and cannot be fixed by pacing, which is why the acquirer prefers
+`uvx yt-dlp@latest` and why its failure message distinguishes the two by whether anything
+succeeded first — a stale binary fails on the very first video. Recent versions also warn that no
+JavaScript runtime was found and that some formats may be missing; installing `deno` silences it.
+
+`--no-download` refuses the annotation fetch, the media fetch, and the acquisition rather than
+performing any of them, so it fails on an absent release instead of quietly obtaining 94 GiB. For
+the two sets above it names both the flag and the prerequisite, because only one of those is
+knowable without going and looking: the flag is certain, and whether you hold an Ego4D signature
+is not.
 
 M3-Bench's released memory graphs would give a caption-only manifest with no video at all, which
 is the cheaper released-text arm. They are distributed as Python pickles, and unpickling a

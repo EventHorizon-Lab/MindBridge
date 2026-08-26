@@ -43,6 +43,10 @@ The capabilities present on `master` today:
   `observe_file()` for a local path: it hashes the file, takes a presigned upload signed only into
   the caller's own tenant prefix, sends the bytes to object storage directly rather than through
   the API, and observes the resulting URI.
+- `mindbridge observe <path> --tenant-id <id>` for the same thing from a shell, so handing
+  MindBridge a file already on disk needs neither a Python script nor three `curl` calls in the
+  right order. It prints the receipt as JSON, and its `processing_job_id` is the reminder that the
+  observation is stored while the memory derived from it does not exist yet.
 - `mindbridge` and `mindbridge-bench` command trees with a documented exit-status contract.
 
 ### Platform
@@ -65,9 +69,15 @@ The capabilities present on `master` today:
   running twice. `--limit N` scopes any runner to its first N units for a smoke run, the media
   ingest deadlines reach every task whose runner accepts them, and naming a task obtains what it
   reads: the annotations, the media behind them, and the prepared-media manifest, staged into the
-  deployment's own bucket per run. Ego4D and M3-Bench's web videos are the two media sets no
-  unattended download can accept, and they print the operator's own instructions rather than
-  failing vaguely; `--no-download` refuses both fetches instead of performing either. Scoring follows
+  deployment's own bucket per run — **every task in the catalog, with no exception left for the
+  operator to fill in.** Ego4D and M3-Bench's web videos are the two media sets no pinned snapshot
+  supplies, so they are acquired rather than downloaded: the sweep drives the `ego4d` CLI for the
+  first and `yt-dlp` for the second, narrowed to the units the run selected, and `--list-tasks`
+  marks those two `acquire` so the prerequisite is visible before the run rather than minutes into
+  it. When a prerequisite is genuinely absent — no Ego4D signature, no `yt-dlp`, no acquirer
+  installed — the operator's own instructions are still what gets printed, now alongside what
+  actually failed. `--no-download` refuses the annotation fetch, the media fetch, and the
+  acquisition instead of performing any of them. Scoring follows
   lmms-eval's contract: each benchmark declares who scores it, the four whose protocol is exact
   match score themselves, the seven whose answers are free text are judged by a model called from
   inside the run, and `--predict-only` reports the `999` bypass sentinel instead. A judge that
@@ -125,6 +135,21 @@ Called out on their own because these are the changes that cost an operator real
   primary key. No manual step — the first write to touch a row an older recipe named re-keys it
   in place, so the first pass after this migration pays one re-encode per object it has not yet
   seen under its new name. Memory-record vectors keep the IDs they already have.
+
+### Two harness costs that were being paid silently
+
+Called out because both were invisible until a real run was watched rather than a test read.
+
+- **A `--limit 1` M3-Bench run fetched the whole subset.** `prepare_m3` was the one producer that
+  asked `ensure_media` for its media set without narrowing it, so cutting one 2 GB robot video
+  downloaded all 100 of them — about 200 GB — and the same call would have asked an acquirer for
+  all 920 web videos. It now names the single file it is missing, which is what the other producers
+  already did. The absent-media message is split-aware too: the robot half is 100 files of about
+  2 GB, the web half about 20 MB each, and one figure for both overstated the web split by roughly
+  a hundredfold — enough to read as "you have no disk for this" and stop.
+- **Those fetches were also silent.** `prepare_m3` and the Video-MME/EgoTempo `_source` helper
+  passed no `announce`, so a 712 MB acquisition and a multi-gigabyte Hub download ran to completion
+  with nothing on stderr. Both now report, and both honour `--quiet`.
 
 ### Known gaps
 

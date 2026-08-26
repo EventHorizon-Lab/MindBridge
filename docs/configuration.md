@@ -389,9 +389,10 @@ proxy_audio = true
 ```
 
 An unrecognized key or a value of the wrong type fails startup, and so does a frame rate outside
-`0 < fps <= 20`. The upper bound is the media layer's own: past 20 fps every span widened to the
-sampling floor exceeds the proxy frame ceiling below, so the knob would silently switch off the
-feature it is tuning. `Infinity` is well-formed JSON and is refused here rather than downstream.
+`0 < fps <= 20`. That upper bound is a sanity limit, not a media-layer ceiling: the frame-count
+ceiling it used to be derived from is fixed and gone. What only the bound still catches is a
+finite literal that overflows — `1e400` is well-formed JSON, becomes `inf`, and would otherwise
+reach the encoder as a frame rate. `Infinity` and `NaN` are refused before this, by the parser.
 
 **Frame rate sets the entire write cost of a video deployment** — one clip cut, one encoder call,
 and one stored object per sampled window. It is the first thing to change if ingest is too
