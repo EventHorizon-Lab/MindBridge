@@ -65,8 +65,9 @@ Four properties worth knowing before you tune it:
 `--entity-type` defaults to `person` only. That is where the fragmentation is; widening it carries
 identical risk for much less value.
 
-Retrieval does not traverse `same_as` yet. The edge is written for the graph and for agents
-reading it.
+Retrieval follows direct `same_as` aliases in either stored direction for entity hits and graph
+neighbors. It deliberately stops after one hop, preserving the pairwise verdict rule instead of
+inventing transitive closure.
 
 **This is the only sweep that opens media and spends a generator call per candidate pair.** If
 consolidation cost is a problem, this is why. Split the cadence:

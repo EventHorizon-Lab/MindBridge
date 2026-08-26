@@ -128,8 +128,9 @@ B and C implies nothing about A and C. The cue the judge's verdict rested on is 
 `entity_resolution_verdicts` beside the confidence, so a merge that turns out wrong can be read
 back rather than guessed at.
 
-Retrieval does not traverse `same_as` yet. The edge is written for the graph and for agents
-reading it.
+Retrieval follows direct `same_as` aliases in either stored direction for entity hits and graph
+neighbors. It deliberately stops after one hop, preserving the pairwise verdict rule instead of
+inventing transitive closure.
 
 ## Claim
 
