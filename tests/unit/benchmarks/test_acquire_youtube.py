@@ -131,8 +131,9 @@ def test_the_acquired_resolution_still_exceeds_what_the_clipper_keeps() -> None:
     download at 640x360 = 230,400 pixels because `cut_clips` reduces every stored frame to
     `DEFAULT_VIDEO_MAX_PIXELS`, so the cap does not change the dimensions of the clips it produces
     -- but only while the ceiling stays under it. Dimensions, not digests: a clip cut from a 360p
-    source and one cut from 1080p both land at 596x336 and hash differently. Asserted against the constant and against the sort key rather than
-    against a literal, so lowering the cap fails here too.
+    source and one cut from 1080p both land at 596x336 and hash differently. Asserted against the
+    constant and against the sort key rather than against a literal, so lowering the cap fails
+    here too.
     """
     from mindbridge.media.clipping import DEFAULT_VIDEO_MAX_PIXELS
 
@@ -386,7 +387,7 @@ def test_nothing_usable_at_all_raises_rather_than_reporting_a_finished_acquisiti
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """`prepare_m3`'s own message would blame the 117 GiB Hub release, which the web split is not."""
+    """`prepare_m3`'s message would blame the 117 GiB Hub release, which the web split is not."""
     _prepared(
         tmp_path,
         monkeypatch,

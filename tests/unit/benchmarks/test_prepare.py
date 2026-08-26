@@ -294,7 +294,8 @@ def test_m3_asks_for_the_one_video_it_is_missing_rather_than_the_whole_subset(
     """A `--limit 1` run must not pay for the other 99 videos, or the other 919.
 
     Two different costs behind one call. `m3-robot` is a Hub download averaging 1.2 GiB a video, so
-    an unnarrowed fetch to cut one was the whole 117 GiB split; `m3-web` is acquired one live URL at a
+    an unnarrowed fetch to cut one was the whole 117 GiB split; `m3-web` is acquired one live URL
+    at a
     time, so the same call is 920 downloads. Both come out of the same line, which is why this
     asserts the narrowing rather than the fetch: the producer knows exactly which file is absent,
     and `ensure_media` takes paths relative to the release directory.
@@ -344,7 +345,8 @@ def test_m3_asks_for_the_one_video_it_is_missing_rather_than_the_whole_subset(
         }
     ], "the fetch names the one selected video, and no other"
     # And it says so out loud. This producer passed no `announce` at all, so a 712 MB `m3-web`
-    # acquisition and a multi-gigabyte Hub download both ran to completion with nothing on stderr -- found
+    # acquisition and a multi-gigabyte Hub download both ran to completion with nothing on
+    # stderr -- found
     # by running the real command, not by any test here, which is why one exists now.
     assert callable(asked[0]["announce"]), "a multi-gigabyte fetch must not be silent"
 

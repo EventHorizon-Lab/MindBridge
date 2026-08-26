@@ -48,7 +48,7 @@ def test_every_media_set_names_a_release_the_table_can_reach() -> None:
 
 
 def test_a_media_set_is_either_obtainable_or_explained_but_never_both() -> None:
-    """Both tables answering to one name would make which behaviour you get depend on lookup order."""
+    """Two tables answering to one name would make the behaviour depend on lookup order."""
     assert set(MEDIA) & set(UNOBTAINABLE) == set()
 
 
@@ -76,7 +76,7 @@ def test_exactly_these_media_sets_are_the_ones_that_download_themselves() -> Non
 
 
 def test_every_unobtainable_set_says_where_the_operator_must_put_the_files() -> None:
-    """An error that only says "not available" leaves the corpus in exactly the state it found it."""
+    """An error that only says "not available" leaves the corpus exactly as it found it."""
     for name, reason in UNOBTAINABLE.items():
         assert "<benchmarks-root>/" in reason, f"{name} does not name a destination"
 
