@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
+from contextlib import suppress
 from datetime import datetime, timedelta, timezone
 
 from fastapi import Depends, FastAPI, Request
@@ -41,7 +42,7 @@ def register_job_event_routes(
                 ),
                 "content": {"text/event-stream": {"schema": {"type": "string"}}},
             },
-            **responses(*TENANT_ERRORS, "job_not_found", "internal_error"),
+            **responses(*TENANT_ERRORS, "job_not_found"),
         },
     )
     async def stream_observation_job(
@@ -105,7 +106,9 @@ async def _job_events(
                 yield _error_frame(error)
                 return
             finally:
-                upcoming.cancel()
+                if upcoming.cancel():
+                    with suppress(asyncio.CancelledError):
+                        await upcoming
             yield _job_frame(view)
     finally:
         await views.aclose()

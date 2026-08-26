@@ -54,7 +54,6 @@ from mindbridge.core import (
     ModelOutputError,
     TenantId,
     VerificationStatus,
-    utc_now,
 )
 from mindbridge.telemetry import (
     current_trace_id,
@@ -64,6 +63,9 @@ from mindbridge.telemetry import (
 )
 
 _MAXIMUM_RETRIEVAL_REFINEMENTS = 2
+# EmbeddingSearch already validates this ceiling. Filtered recall widens only to this bounded
+# prefix so one selective request cannot turn the exact pgvector scan into an unbounded read.
+_MAXIMUM_DENSE_CANDIDATES = 1_000
 _UNANSWERED = GeneratedAnswer(answer=None, confidence=0.0)
 
 
@@ -114,12 +116,10 @@ class RecallMemories:
         self._media_url_signer = media_url_signer
         self._embedder = embedder
         self._minimum_embedding_similarity = minimum_embedding_similarity
-        self._clock = clock or utc_now
         self._enumerate = EnumerateMemories(
             store,
             occurrence_verifier,
             media_url_signer,
-            clock=self._clock,
         )
 
     @operation_span("mindbridge.recall")
@@ -294,12 +294,8 @@ class RecallMemories:
         *,
         started_at: float,
     ) -> RecallResult:
-        """Charge the recall against memory strength and return only still-visible content."""
-        visible_memories = await self._store.record_memory_accesses(
-            TenantId(request.tenant_id),
-            _memory_ids(wave.visible),
-            accessed_at=self._clock(),
-        )
+        """Return only content that remains visible without treating exposure as useful."""
+        visible_memories = await self._refresh_visible_candidates(request, wave.visible)
         generated = wave.generated
         answer_evidence = wave.evidence
         if _memory_ids(visible_memories) != _memory_ids(wave.visible):
@@ -496,74 +492,88 @@ class RecallMemories:
         if len(embedded.embeddings) != 1:
             raise ModelOutputError("embedder returned the wrong query vector count")
         query_embedding = embedded.embeddings[0]
-        searches = {
-            object_type: EmbeddingSearch(
+        search_limit = limit
+        while True:
+            searches = {
+                object_type: EmbeddingSearch(
+                    tenant_id=TenantId(request.tenant_id),
+                    values=query_embedding.values,
+                    space_reference=query_embedding.space_reference,
+                    document_task=EmbedTask.DOCUMENT.value,
+                    object_types=(object_type,),
+                    limit=search_limit,
+                    minimum_similarity=self._minimum_embedding_similarity,
+                )
+                for object_type in (
+                    EmbeddedObjectType.EVIDENCE_SPAN,
+                    EmbeddedObjectType.MEMORY_RECORD,
+                )
+            }
+            graph_search = EmbeddingSearch(
                 tenant_id=TenantId(request.tenant_id),
                 values=query_embedding.values,
                 space_reference=query_embedding.space_reference,
                 document_task=EmbedTask.DOCUMENT.value,
-                object_types=(object_type,),
-                limit=limit,
+                object_types=(
+                    EmbeddedObjectType.EVENT,
+                    EmbeddedObjectType.CLAIM,
+                    EmbeddedObjectType.ENTITY,
+                ),
+                limit=search_limit,
                 minimum_similarity=self._minimum_embedding_similarity,
             )
-            for object_type in (
-                EmbeddedObjectType.EVIDENCE_SPAN,
-                EmbeddedObjectType.MEMORY_RECORD,
+            evidence_matches, memory_matches, graph_matches = await asyncio.gather(
+                self._embedding_index.search_embeddings(searches[EmbeddedObjectType.EVIDENCE_SPAN]),
+                self._embedding_index.search_embeddings(searches[EmbeddedObjectType.MEMORY_RECORD]),
+                self._embedding_index.search_embeddings(graph_search),
             )
-        }
-        graph_search = EmbeddingSearch(
-            tenant_id=TenantId(request.tenant_id),
-            values=query_embedding.values,
-            space_reference=query_embedding.space_reference,
-            document_task=EmbedTask.DOCUMENT.value,
-            object_types=(
-                EmbeddedObjectType.EVENT,
-                EmbeddedObjectType.CLAIM,
-                EmbeddedObjectType.ENTITY,
-            ),
-            limit=limit,
-            minimum_similarity=self._minimum_embedding_similarity,
-        )
-        evidence_matches, memory_matches, graph_matches = await asyncio.gather(
-            self._embedding_index.search_embeddings(searches[EmbeddedObjectType.EVIDENCE_SPAN]),
-            self._embedding_index.search_embeddings(searches[EmbeddedObjectType.MEMORY_RECORD]),
-            self._embedding_index.search_embeddings(graph_search),
-        )
-        evidence_ids = tuple(
-            dict.fromkeys(EvidenceId(match.object_id) for match in evidence_matches)
-        )
-        memory_ids = tuple(dict.fromkeys(MemoryId(match.object_id) for match in memory_matches))
-        (
-            evidence_memories,
-            direct_memories,
-            hierarchy_memories,
-            graph_memories,
-        ) = await asyncio.gather(
-            self._store.search_memories_by_evidence(request, evidence_ids, limit=limit),
-            self._store.search_memories_by_ids(request, memory_ids, limit=limit),
-            self._store.search_memories_by_hierarchy(request, memory_ids, limit=limit),
-            self._store.search_memories_by_graph_objects(
-                request,
-                graph_matches,
-                limit=limit,
-            ),
-        )
-        set_current_span_attributes(
-            {
-                "mindbridge.recall.evidence_match_count": len(evidence_matches),
-                "mindbridge.recall.memory_match_count": len(memory_matches),
-                "mindbridge.recall.graph_match_count": len(graph_matches),
-            }
-        )
-        return fuse_memory_rankings(
+            evidence_ids = tuple(
+                dict.fromkeys(EvidenceId(match.object_id) for match in evidence_matches)
+            )
+            memory_ids = tuple(dict.fromkeys(MemoryId(match.object_id) for match in memory_matches))
             (
                 evidence_memories,
-                graph_memories,
-                _without_shared_vector_credit(direct_memories, graph_memories, graph_matches),
+                direct_memories,
                 hierarchy_memories,
-            ),
-            limit=limit,
-        )
+                graph_memories,
+            ) = await asyncio.gather(
+                self._store.search_memories_by_evidence(request, evidence_ids, limit=limit),
+                self._store.search_memories_by_ids(request, memory_ids, limit=limit),
+                self._store.search_memories_by_hierarchy(request, memory_ids, limit=limit),
+                self._store.search_memories_by_graph_objects(
+                    request,
+                    graph_matches,
+                    limit=limit,
+                ),
+            )
+            memories = fuse_memory_rankings(
+                (
+                    evidence_memories,
+                    graph_memories,
+                    _without_shared_vector_credit(direct_memories, graph_memories, graph_matches),
+                    hierarchy_memories,
+                ),
+                limit=limit,
+            )
+            channels = (evidence_matches, memory_matches, graph_matches)
+            if (
+                request.filters == RecallFilters()
+                or len(memories) >= limit
+                or all(len(matches) < search_limit for matches in channels)
+            ):
+                set_current_span_attributes(
+                    {
+                        "mindbridge.recall.evidence_match_count": len(evidence_matches),
+                        "mindbridge.recall.memory_match_count": len(memory_matches),
+                        "mindbridge.recall.graph_match_count": len(graph_matches),
+                    }
+                )
+                return memories
+            if search_limit >= _MAXIMUM_DENSE_CANDIDATES:
+                raise DomainInvariantError(
+                    "filtered semantic recall exceeds 1000 dense candidates; narrow recall filters"
+                )
+            search_limit = min(search_limit * 2, _MAXIMUM_DENSE_CANDIDATES)
 
     @operation_span("mindbridge.recall.resolve_query_media")
     async def _resolve_query_media(

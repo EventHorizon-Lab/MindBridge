@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from time import time
 from typing import Any, cast
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from celery import Task
@@ -96,6 +96,19 @@ def test_worker_reuses_and_closes_the_shared_embedder_on_its_own_event_loop(
     creations: list[tuple[str, asyncio.AbstractEventLoop]] = []
     processing_loops: list[asyncio.AbstractEventLoop] = []
     closed: list[str] = []
+    resource_loops: list[asyncio.AbstractEventLoop] = []
+    store_instance = Mock()
+    store_instance.open = AsyncMock(
+        side_effect=lambda: resource_loops.append(asyncio.get_running_loop())
+    )
+    store_instance.close = AsyncMock(side_effect=lambda: closed.append("store"))
+    generator_instance = Mock()
+    generator_instance.close = AsyncMock(side_effect=lambda: closed.append("generator"))
+    media_access_instance = Mock()
+    media_access_instance.close = AsyncMock(side_effect=lambda: closed.append("s3"))
+    store_factory = Mock(return_value=store_instance)
+    generator_factory = Mock(return_value=generator_instance)
+    media_access_factory = Mock(return_value=media_access_instance)
 
     class LoopBoundEmbedder:
         def __init__(self, plugin: str) -> None:
@@ -117,10 +130,10 @@ def test_worker_reuses_and_closes_the_shared_embedder_on_its_own_event_loop(
         runtime: worker_module._WorkerRuntime,
         *_identifiers: object,
     ) -> JobState:
-        # The stand-in asks for the encoders where the real delivery does, inside the store it
-        # has open: that is what makes an out-of-memory error there a recorded failure rather
-        # than a dropped message.
+        await runtime.memory_store(settings)
         media_embedder, text_embedder = await runtime.encoders(settings)
+        runtime.generation_model(settings)
+        runtime.media_url_signer(settings)
         assert isinstance(media_embedder, LoopBoundEmbedder)
         assert isinstance(text_embedder, LoopBoundEmbedder)
         assert media_embedder is text_embedder
@@ -130,6 +143,9 @@ def test_worker_reuses_and_closes_the_shared_embedder_on_its_own_event_loop(
 
     worker_module._dispose_worker_runtime()
     monkeypatch.setattr(worker_module, "load_embedder", load)
+    monkeypatch.setattr(worker_module, "load_generator", generator_factory)
+    monkeypatch.setattr(worker_module, "PostgresMemoryStore", store_factory)
+    monkeypatch.setattr(worker_module, "S3MediaAccess", media_access_factory)
     monkeypatch.setattr(worker_module, "_process_observation_once", process)
     settings = WorkerSettings.from_environment(_environment())
     message = ObservationProcessingTaskMessage(**_task_message())
@@ -141,8 +157,15 @@ def test_worker_reuses_and_closes_the_shared_embedder_on_its_own_event_loop(
 
     # Two deliveries, one shared load: nothing is re-allocated per observation.
     assert [plugin for plugin, _loop in creations] == ["openai"]
+    assert (
+        store_factory.call_count
+        == generator_factory.call_count
+        == media_access_factory.call_count
+        == 1
+    )
+    assert resource_loops == [creations[0][1]]
     assert processing_loops == [creations[0][1]] * 2
-    assert closed == ["openai"]
+    assert closed == ["s3", "generator", "openai", "store"]
 
 
 class _RecordingJobStore:
@@ -502,12 +525,20 @@ def test_worker_allows_many_children_when_the_encoder_holds_no_device() -> None:
     require_bounded_in_process_models(settings, 4)
 
 
-def test_worker_allows_many_workers_in_a_pool_that_shares_one_process() -> None:
-    """`--pool=threads` runs one process, so its concurrency is not a device budget."""
+def test_worker_allows_solo_to_hold_one_in_process_encoder() -> None:
+    """Solo enters the child-owned event loop serially and holds one encoder copy."""
     settings = WorkerSettings.from_environment(_local_media_environment())
 
-    require_bounded_in_process_models(settings, 6, pool="threads")
     require_bounded_in_process_models(settings, 6, pool="solo")
+
+
+@pytest.mark.parametrize("pool", ["threads", "gevent", "eventlet", "unknown", "threads-prefork"])
+def test_worker_rejects_pools_that_can_enter_the_runtime_concurrently(pool: str) -> None:
+    """One synchronous event loop cannot be driven by concurrent threads or greenlets."""
+    settings = WorkerSettings.from_environment(_environment())
+
+    with pytest.raises(ValueError, match="use prefork or solo"):
+        require_bounded_in_process_models(settings, 1, pool=pool)
 
 
 def test_worker_lets_a_larger_card_declare_the_budget_it_actually_has() -> None:
@@ -571,14 +602,15 @@ def test_worker_startup_refuses_rather_than_logging_and_carrying_on() -> None:
 
 
 def test_worker_startup_reads_the_pool_class_celery_has_not_resolved_yet() -> None:
-    """One process holds one copy however wide it runs, so boot must not refuse it.
+    """The unresolved CLI alias must still be rejected before Celery starts its pool.
 
     `pool_cls` is still the flag's own string at `worker_init`; Celery resolves it to a class
     on the line after the signal.
     """
     create_worker_app(WorkerSettings.from_environment(_local_media_environment()))
 
-    worker_init.send(sender=_StartingWorker(6, pool_cls="threads"))
+    with pytest.raises(SystemExit, match="use prefork or solo"):
+        worker_init.send(sender=_StartingWorker(6, pool_cls="threads"))
 
 
 def test_worker_startup_sees_the_autoscale_ceiling_the_pool_has_not_parsed_yet() -> None:

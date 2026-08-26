@@ -37,6 +37,7 @@ AML_ERRORS: Final[tuple[ErrorCode, ...]] = (
     "authentication_failed",
     "request_validation_failed",
     "database_unavailable",
+    "internal_error",
 )
 """What both leaderboard operations return whatever else they do.
 

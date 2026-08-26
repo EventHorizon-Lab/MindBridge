@@ -576,13 +576,14 @@ class DeletionTombstoneView(ContractModel):
     target_id: Identifier = Field(description="Which memory or observation was erased.")
     propagation_state: DeletionPropagationState = Field(
         description=(
-            "How far erasure has reached across storage and offline edge devices. Only "
-            "`complete` means every copy is gone."
+            "How far erasure has reached in central PostgreSQL and object storage. `complete` "
+            "means central deletion finished; offline edge devices apply this retained "
+            "tombstone when they reconnect."
         ),
     )
     requested_at: UtcDatetime = Field(description="When erasure was requested.")
     completed_at: UtcDatetime | None = Field(
-        description="When erasure finished propagating, or null while it has not.",
+        description="When central deletion finished, or null while it has not.",
     )
     error_code: Identifier | None = Field(
         description="Why propagation stalled, or null when it has not.",
@@ -590,7 +591,7 @@ class DeletionTombstoneView(ContractModel):
 
 
 class ForgetReceipt(DeletionTombstoneView):
-    """Deletion result returned by one command or status lookup."""
+    """Central deletion result returned by one command or status lookup."""
 
     trace_id: Identifier = Field(description="Correlates this request with its telemetry.")
 

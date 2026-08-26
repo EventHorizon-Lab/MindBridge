@@ -164,6 +164,7 @@ TENANT_ERRORS: Final[tuple[ErrorCode, ...]] = (
     "tenant_access_denied",
     "request_validation_failed",
     "database_unavailable",
+    "internal_error",
 )
 """What every authenticated `/v1` operation can return whatever else it does.
 
