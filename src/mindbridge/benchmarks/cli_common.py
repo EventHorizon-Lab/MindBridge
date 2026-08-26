@@ -97,14 +97,32 @@ BENCHMARK_ENVIRONMENT = """environment:
 
 def core_parser(
     *,
-    tenant_prefix: str,
+    tenant_prefix: str | None,
     prog: str | None = None,
     description: str | None = None,
+    epilog: str | None = None,
+    dataset_action: Literal["store", "append"] = "store",
+    dataset_help: str = "official dataset release to replay",
 ) -> argparse.ArgumentParser:
-    """Build the parser every benchmark CLI starts from."""
-    parser = build_parser(prog=prog, description=description, epilog=BENCHMARK_ENVIRONMENT)
+    """Build the parser every benchmark CLI starts from.
+
+    `dataset_action="append"` is for the one runner whose loader takes more than one path:
+    `mindbridge-bench aml` dispatches to six loaders taking one or two positional files
+    each, so its `--dataset` repeats. It is a knob here rather than a parser of its own
+    because the sweep forwards the same shared flags to every task, and a second
+    declaration of them is the drift that made `aml` undispatchable from `eval` in the
+    first place -- it accepted none of `--limit`, `--recall-limit`,
+    `--request-concurrency`, `--overwrite`, or `--predict-only`.
+    """
+    parser = build_parser(
+        prog=prog, description=description, epilog=epilog or BENCHMARK_ENVIRONMENT
+    )
     parser.add_argument(
-        "--dataset", type=Path, required=True, help="official dataset release to replay"
+        "--dataset",
+        type=Path,
+        action=dataset_action,
+        required=True,
+        help=dataset_help,
     )
     parser.add_argument(
         "-o",
@@ -126,7 +144,9 @@ def core_parser(
         "--run-id", required=True, help="identifier isolating this run's tenants from every other"
     )
     parser.add_argument(
-        "--tenant-prefix", default=tenant_prefix, help="prefix for the tenants this run writes to"
+        "--tenant-prefix",
+        default=tenant_prefix,
+        help="prefix for the tenants this run writes to",
     )
     parser.add_argument(
         "--recall-limit", type=int, default=20, help="memories to retrieve per question"

@@ -580,7 +580,8 @@ def _require_every_task_can_report(plans: Sequence[_Plan], *, predict_only: bool
 
     Each runner makes this check for itself now, but only once it is running -- and a judged task
     that runs to completion and then cannot score writes nothing, so finding out task by task
-    costs every earlier task's predictions. Seventeen of the twenty-two catalog tasks are judged.
+    costs every earlier task's predictions. Seventeen of the thirty catalog tasks are judged; the
+    eight AML tasks are not, because their number comes from a vendored scorer run afterwards.
     """
     for plan in plans:
         require_scoring_is_possible(plan.task.benchmark, predict_only=predict_only)

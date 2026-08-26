@@ -14,11 +14,14 @@ from mindbridge.api.aml_contracts import derive_tenant_id
 from mindbridge.benchmarks.aml.cases import AmlCase, AmlQuestion
 from mindbridge.benchmarks.aml.cli import (
     BENCHMARKS,
+    SCRIPTMEM_BENCHMARK,
+    TENANT_PREFIX_VARIABLE,
     _Arguments,
     _require_compatible_existing_manifest,
     _require_nonempty_cases,
     _run,
     _write_manifest,
+    main,
 )
 from mindbridge.benchmarks.aml.driver import eval_user_id
 from mindbridge.benchmarks.artifacts import load_deployment_snapshot, sidecar_manifest_path
@@ -278,9 +281,11 @@ def test_manifest_carries_source_deployment_and_tenant_mapping(tmp_path: Path) -
         deployment_config_path=deployment_path,
         run_id="run-1",
         tenant_prefix="bench_aml",
-        top_k=10,
-        concurrency=2,
+        recall_limit=10,
+        request_concurrency=2,
         request_timeout_seconds=600.0,
+        limit=None,
+        overwrite=False,
         quiet=True,
     )
     deployment = load_deployment_snapshot(deployment_path)
@@ -356,9 +361,11 @@ def test_write_manifest_counts_oversized_unsliced_questions_from_output_rows(
         deployment_config_path=deployment_path,
         run_id="run-1",
         tenant_prefix="bench_aml",
-        top_k=10,
-        concurrency=2,
+        recall_limit=10,
+        request_concurrency=2,
         request_timeout_seconds=600.0,
+        limit=None,
+        overwrite=False,
         quiet=True,
     )
     deployment = load_deployment_snapshot(deployment_path)
@@ -405,9 +412,11 @@ def _arguments(
         "deployment_config_path": deployment_path,
         "run_id": "run-1",
         "tenant_prefix": "bench_aml",
-        "top_k": 10,
-        "concurrency": 2,
+        "recall_limit": 10,
+        "request_concurrency": 2,
         "request_timeout_seconds": 600.0,
+        "limit": None,
+        "overwrite": False,
         "quiet": True,
     }
     fields.update(overrides)
@@ -451,7 +460,7 @@ def test_require_compatible_existing_manifest_allows_a_matching_resume(tmp_path:
     [
         ("run_id", {"run_id": "run-2"}),
         ("benchmark", {"benchmark": "longmemeval"}),
-        ("recall_limit", {"top_k": 20}),
+        ("recall_limit", {"recall_limit": 20}),
     ],
 )
 def test_require_compatible_existing_manifest_refuses_a_mismatched_resume(
@@ -478,7 +487,7 @@ def test_require_compatible_existing_manifest_refuses_a_mismatched_resume(
             benchmark=second_run.benchmark,
             run_id=second_run.run_id,
             deployment=deployment.snapshot,
-            recall_limit=second_run.top_k,
+            recall_limit=second_run.recall_limit,
         )
 
 
@@ -618,3 +627,272 @@ async def test_run_writes_shards_that_a_splitlines_reader_cannot_shred(tmp_path:
     # Escaping must not lose the character: it has to survive the round trip.
     decoded = [json.loads(line) for line in newline_rows]
     assert all(_SHARD_SEPARATOR in row["retrieved_context"] for row in decoded), decoded[0]
+
+
+# --- Dispatchability from `mindbridge-bench eval` ------------------------------------------
+#
+# Every flag below exists because the sweep forwards it to each task unconditionally. Before
+# these, `aml` was in `RUNNERS` but reachable only by hand: the catalog named no task for it,
+# and had one been added, `_shared_arguments` would have handed the runner five flags its own
+# parser rejected. These check the two halves that could regress independently -- that the
+# shared vocabulary is accepted, and that the two flags with real behaviour behind them do it.
+
+
+def _replaying_client(monkeypatch: pytest.MonkeyPatch, seen: list[httpx.Request]) -> None:
+    """Point `main()` at a mock deployment that answers every add and search."""
+    handler = _handler(seen)
+    original = httpx.AsyncClient
+
+    def build(*args: object, **kwargs: object) -> httpx.AsyncClient:
+        kwargs["transport"] = httpx.MockTransport(handler)
+        return original(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr("mindbridge.benchmarks.aml.cli.httpx.AsyncClient", build)
+
+
+def _corpus(tmp_path: Path, conversation_count: int) -> Path:
+    """Write a LongMemEval-shaped release with one question per conversation."""
+    dataset_path = tmp_path / "longmemeval_s"
+    dataset_path.write_text(
+        json.dumps(
+            [
+                {
+                    "question_id": f"q{index}",
+                    "question": "What happened?",
+                    "answer": "something",
+                    "question_type": "single-session-user",
+                    "question_date": "2023/05/20 (Sat) 02:21",
+                    "haystack_dates": ["2023/05/20 (Sat) 02:21"],
+                    "haystack_session_ids": [f"s{index}"],
+                    "haystack_sessions": [
+                        [{"role": "user", "content": f"conversation {index}"}],
+                    ],
+                    "answer_session_ids": [f"s{index}"],
+                }
+                for index in range(conversation_count)
+            ]
+        ),
+        encoding="utf-8",
+    )
+    return dataset_path
+
+
+def _invocation(tmp_path: Path, output_path: Path, *extra: str) -> list[str]:
+    return [
+        "--benchmark",
+        "longmemeval",
+        "--dataset",
+        str(_corpus(tmp_path, 3)),
+        "--output",
+        str(output_path),
+        "--api-base-url",
+        "http://test",
+        "--deployment-config",
+        str(_deployment_path(tmp_path)),
+        "--run-id",
+        "run-1",
+        "--tenant-prefix",
+        "bench_aml",
+        *extra,
+    ]
+
+
+def test_the_flags_the_sweep_forwards_to_every_task_are_all_accepted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`_shared_arguments` sends these to every runner, so rejecting one fails the task.
+
+    Listed literally rather than imported from `suite._shared_arguments`: the point is that
+    both halves independently agree on the same spelling, which a shared constant would assert
+    by construction and therefore not check at all.
+    """
+    monkeypatch.setenv("MINDBRIDGE_AML_API_KEY", "token")
+    _replaying_client(monkeypatch, [])
+    output_path = tmp_path / "rows.jsonl"
+
+    main(
+        _invocation(
+            tmp_path,
+            output_path,
+            "--recall-limit",
+            "5",
+            "--request-concurrency",
+            "2",
+            "--request-timeout-seconds",
+            "30",
+            "--predict-only",
+            "--quiet",
+            "--limit",
+            "1",
+        )
+    )
+
+    manifest = json.loads(sidecar_manifest_path(output_path).read_text(encoding="utf-8"))
+    assert manifest["recall_limit"] == 5
+    assert manifest["request_concurrency"] == 2
+    assert manifest["request_timeout_seconds"] == 30.0
+
+
+def test_limit_replays_only_the_first_cases(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`--tasks all --limit 1` is the harness smoke run, and it has to cost one case.
+
+    Asserted on the rows written rather than on the parsed value, because the way this fails
+    is by being accepted and then ignored -- the whole 500-case corpus replayed under a flag
+    that promised one.
+    """
+    monkeypatch.setenv("MINDBRIDGE_AML_API_KEY", "token")
+    seen: list[httpx.Request] = []
+    _replaying_client(monkeypatch, seen)
+    output_path = tmp_path / "rows.jsonl"
+
+    main(_invocation(tmp_path, output_path, "--limit", "1", "--quiet"))
+
+    rows = [json.loads(line) for line in output_path.read_text(encoding="utf-8").splitlines()]
+    assert [row["id"] for row in rows] == ["q0"]
+    assert sum(1 for request in seen if request.url.path == "/aml/search") == 1
+
+
+def test_limit_below_one_is_refused_rather_than_selecting_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("MINDBRIDGE_AML_API_KEY", "token")
+    _replaying_client(monkeypatch, [])
+
+    with pytest.raises(ValueError, match="--limit must be a positive count"):
+        main(_invocation(tmp_path, tmp_path / "rows.jsonl", "--limit", "0"))
+
+
+def test_overwrite_discards_an_earlier_run_instead_of_resuming_into_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The flag has to delete, not truncate: `_run` resumes off the ids already on disk.
+
+    Left in place, an "overwriting" run would skip exactly the cases it was asked to redo, and
+    `_require_compatible_existing_manifest` would refuse the new `--run-id` outright.
+    """
+    monkeypatch.setenv("MINDBRIDGE_AML_API_KEY", "token")
+    seen: list[httpx.Request] = []
+    _replaying_client(monkeypatch, seen)
+    output_path = tmp_path / "rows.jsonl"
+    main(_invocation(tmp_path, output_path, "--quiet"))
+    first = json.loads(sidecar_manifest_path(output_path).read_text(encoding="utf-8"))
+    searches_before = sum(1 for request in seen if request.url.path == "/aml/search")
+
+    main(_invocation(tmp_path, output_path, "--quiet", "--run-id", "run-2", "--overwrite"))
+
+    rows = [json.loads(line) for line in output_path.read_text(encoding="utf-8").splitlines()]
+    second = json.loads(sidecar_manifest_path(output_path).read_text(encoding="utf-8"))
+    assert first["run_id"] == "run-1" and second["run_id"] == "run-2"
+    # Every case replayed again, and each row is present exactly once rather than appended to
+    # the first run's three.
+    assert [row["id"] for row in rows] == ["q0", "q1", "q2"]
+    assert sum(1 for request in seen if request.url.path == "/aml/search") == searches_before * 2
+
+
+def test_a_second_run_without_overwrite_still_refuses_a_mismatched_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The guard `--overwrite` steps around must still be there when it is not passed."""
+    monkeypatch.setenv("MINDBRIDGE_AML_API_KEY", "token")
+    _replaying_client(monkeypatch, [])
+    output_path = tmp_path / "rows.jsonl"
+    main(_invocation(tmp_path, output_path, "--quiet"))
+
+    with pytest.raises(ValueError, match="run_id"):
+        main(_invocation(tmp_path, output_path, "--quiet", "--run-id", "run-2"))
+
+
+def test_the_tenant_prefix_falls_back_to_the_variable_the_deployment_reads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The sweep never passes `--tenant-prefix`, so without this no AML task could run."""
+    monkeypatch.setenv("MINDBRIDGE_AML_API_KEY", "token")
+    monkeypatch.setenv(TENANT_PREFIX_VARIABLE, "bench_from_environment")
+    _replaying_client(monkeypatch, [])
+    output_path = tmp_path / "rows.jsonl"
+    invocation = _invocation(tmp_path, output_path, "--quiet")
+    del invocation[invocation.index("--tenant-prefix") : invocation.index("--tenant-prefix") + 2]
+
+    main(invocation)
+
+    manifest = json.loads(sidecar_manifest_path(output_path).read_text(encoding="utf-8"))
+    assert manifest["tenant_prefix"] == "bench_from_environment"
+
+
+def test_an_unset_tenant_prefix_is_still_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The default is that one variable and nothing else -- never a literal fallback."""
+    monkeypatch.setenv("MINDBRIDGE_AML_API_KEY", "token")
+    monkeypatch.delenv(TENANT_PREFIX_VARIABLE, raising=False)
+    _replaying_client(monkeypatch, [])
+    invocation = _invocation(tmp_path, tmp_path / "rows.jsonl", "--quiet")
+    del invocation[invocation.index("--tenant-prefix") : invocation.index("--tenant-prefix") + 2]
+
+    with pytest.raises(ValueError, match=TENANT_PREFIX_VARIABLE):
+        main(invocation)
+
+
+def test_scriptmem_is_offered_and_refused_with_the_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A missing choice reads as a typo; the corpus being a placeholder is the actual reason."""
+    monkeypatch.setenv("MINDBRIDGE_AML_API_KEY", "token")
+    invocation = _invocation(tmp_path, tmp_path / "rows.jsonl")
+    invocation[invocation.index("--benchmark") + 1] = SCRIPTMEM_BENCHMARK
+
+    with pytest.raises(ValueError, match="format_example"):
+        main(invocation)
+
+
+def test_scriptmem_is_not_a_runnable_benchmark() -> None:
+    """Offering the choice must not make it dispatchable: there is no loader behind it."""
+    assert SCRIPTMEM_BENCHMARK not in BENCHMARKS
+
+
+def test_overwrite_keeps_the_earlier_run_when_the_new_one_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Discarding has to come after every refusal, not beside the guard that motivates it.
+
+    `--overwrite` with an unset credential is a plausible mistake, and destroying the previous
+    run's predictions to then fail without producing any of its own is the worst outcome
+    available: the operator loses a finished run and gains nothing.
+    """
+    monkeypatch.setenv("MINDBRIDGE_AML_API_KEY", "token")
+    _replaying_client(monkeypatch, [])
+    output_path = tmp_path / "rows.jsonl"
+    main(_invocation(tmp_path, output_path, "--quiet"))
+    survivor = output_path.read_text(encoding="utf-8")
+
+    monkeypatch.delenv("MINDBRIDGE_AML_API_KEY")
+    with pytest.raises(ValueError, match="MINDBRIDGE_AML_API_KEY"):
+        main(_invocation(tmp_path, output_path, "--quiet", "--run-id", "run-2", "--overwrite"))
+
+    assert output_path.read_text(encoding="utf-8") == survivor
+    assert sidecar_manifest_path(output_path).exists()
+
+
+def test_a_rerun_without_overwrite_resumes_instead_of_replaying(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without the flag, finished cases must survive and cost nothing a second time.
+
+    `run_case` is not idempotent -- each `/aml/add` writes new memories -- so replaying a
+    finished case duplicates the corpus server-side, not just the output rows. This is the
+    guarantee that makes `--overwrite` a flag rather than the default.
+    """
+    monkeypatch.setenv("MINDBRIDGE_AML_API_KEY", "token")
+    seen: list[httpx.Request] = []
+    _replaying_client(monkeypatch, seen)
+    output_path = tmp_path / "rows.jsonl"
+    main(_invocation(tmp_path, output_path, "--quiet"))
+    rows_after_first = output_path.read_text(encoding="utf-8")
+    requests_after_first = len(seen)
+
+    main(_invocation(tmp_path, output_path, "--quiet"))
+
+    assert output_path.read_text(encoding="utf-8") == rows_after_first
+    assert len(seen) == requests_after_first, "a resumed run re-issued requests it had done"

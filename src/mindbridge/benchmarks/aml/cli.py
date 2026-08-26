@@ -8,7 +8,6 @@ stays usable against a real deployed server rather than only an in-process one.
 
 from __future__ import annotations
 
-import argparse
 import asyncio
 import hashlib
 import json
@@ -47,8 +46,7 @@ from mindbridge.benchmarks.artifacts import (
     sidecar_manifest_path,
     write_text_atomically,
 )
-from mindbridge.benchmarks.cli import parser as build_parser
-from mindbridge.benchmarks.cli_common import report, report_unit
+from mindbridge.benchmarks.cli_common import core_parser, limit_units, report, report_unit
 from mindbridge.contracts import ContractModel, Identifier, NonEmptyString, Sha256Hex
 from mindbridge.file_integrity import sha256_file
 
@@ -135,7 +133,51 @@ class BenchmarkSpec:
 
 AML_ENVIRONMENT = """environment:
   MINDBRIDGE_AML_API_KEY  bearer token for --api-base-url; required, read from the
-                          environment so a recorded invocation never carries it"""
+                          environment so a recorded invocation never carries it
+  MINDBRIDGE_AML_TENANT_PREFIX
+                          default for --tenant-prefix; the same variable the deployment
+                          derives its half of the mapping from, so setting it once makes
+                          the two agree by construction"""
+
+TENANT_PREFIX_VARIABLE = "MINDBRIDGE_AML_TENANT_PREFIX"
+"""Where `--tenant-prefix` falls back to, and the only default it has.
+
+`--tenant-prefix` deliberately had no default at all (Important 3, task-13 review): the
+deployment derives its half of the tenant mapping from its own
+`MINDBRIDGE_AML_TENANT_PREFIX`, nothing on the AML wire contract confirms the two agree,
+and a literal default here would let an operator silently inherit a value the deployment
+does not share. That reasoning is unchanged -- which is why the fallback is *that same
+variable* rather than a constant. Unset, with no flag, is still a refusal.
+
+It exists because `mindbridge-bench eval` forwards a fixed set of flags to every task and
+`--tenant-prefix` is not one of them, so without a default no AML task could be swept.
+Putting the value in the task catalog instead would have been a hardcoded default wearing
+a different hat.
+"""
+
+SCRIPTMEM_BENCHMARK = "scriptmem"
+"""AML's seventh textual benchmark: a `--benchmark` choice that always refuses.
+
+Offered rather than omitted so the refusal below is what an operator gets, and so
+`--help` lists the same seven benchmarks AML's own board does.
+"""
+
+SCRIPTMEM_UNSUPPORTED = (
+    "scriptmem is not runnable offline: its public release ships questions, gold answers "
+    "and the scorer, but every `conversation` field in data/public/conversations.jsonl and "
+    "data/raw/*.json holds only a {'format_example': ...} placeholder -- the four source "
+    "scripts are not distributed, so there is no corpus to ingest and a score would measure "
+    "retrieval over synthetic filler. A real AML submission is unaffected; the platform runs "
+    "ScriptMem server-side against its own copy."
+)
+"""Why the seventh AML benchmark is absent, said where an operator meets it.
+
+Named and refused rather than merely missing from `BENCHMARKS`. Left out, `--benchmark
+scriptmem` was an argparse "invalid choice" indistinguishable from a typo, and the reason
+lived only in `docs/superpowers/specs/2026-08-17-aml-dataset-schemas.md`. An operator who
+has the real scripts is not blocked by anything here except a loader; one who does not is
+owed the reason rather than a silent gap.
+"""
 
 
 BENCHMARKS: dict[str, BenchmarkSpec] = {
@@ -233,9 +275,11 @@ class _Arguments:
     deployment_config_path: Path
     run_id: str
     tenant_prefix: str
-    top_k: int
-    concurrency: int
+    recall_limit: int
+    request_concurrency: int
     request_timeout_seconds: float
+    limit: int | None
+    overwrite: bool
     quiet: bool
 
 
@@ -249,15 +293,25 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
         benchmark=arguments.benchmark,
         run_id=arguments.run_id,
         deployment=deployment.snapshot,
-        recall_limit=arguments.top_k,
+        recall_limit=arguments.recall_limit,
+        overwrite=arguments.overwrite,
     )
     cases = spec.load(arguments.dataset_paths)
     _require_nonempty_cases(
         cases, benchmark=arguments.benchmark, dataset_paths=arguments.dataset_paths
     )
+    # After `_require_nonempty_cases`, so a `--dataset` pointed at the wrong directory is still
+    # reported as the wrong path rather than as an empty selection the limit happened to produce.
+    cases = limit_units(cases, arguments.limit, label=f"{arguments.benchmark} cases")
     api_key = os.environ.get("MINDBRIDGE_AML_API_KEY")
     if not api_key:
         raise ValueError("MINDBRIDGE_AML_API_KEY must be set")
+    # Last thing before the first write, and deliberately after every refusal above. Discarding
+    # earlier -- next to the manifest check that motivates it -- meant an `--overwrite` run with
+    # an unset API key or a mistyped `--dataset` destroyed the previous run's predictions and
+    # then failed without producing any of its own.
+    if arguments.overwrite:
+        _discard_previous_run(arguments.output_path)
     tenant_ids = asyncio.run(_connect_and_run(arguments, spec, cases, api_key))
     _write_manifest(arguments, deployment, tenant_ids)
 
@@ -269,6 +323,7 @@ def _require_compatible_existing_manifest(
     run_id: str,
     deployment: DeploymentSnapshot,
     recall_limit: int,
+    overwrite: bool = False,
 ) -> None:
     """Refuse to resume into an `--output` whose sidecar manifest disagrees
     with this run's identity (Important 1, task-13 review).
@@ -283,7 +338,10 @@ def _require_compatible_existing_manifest(
     so a mismatch fails fast. A first run (no sidecar yet) always passes.
     """
     manifest_path = sidecar_manifest_path(output_path)
-    if not manifest_path.exists():
+    # `--overwrite` is the operator saying this output is not a resume, so there is
+    # nothing for the sidecar to disagree with -- refusing here would block the one
+    # case the flag exists for, a re-run under a new `--run-id` into the same path.
+    if overwrite or not manifest_path.exists():
         return
     existing = AmlRunManifest.model_validate_json(manifest_path.read_bytes())
     disagreements: list[str] = []
@@ -300,6 +358,23 @@ def _require_compatible_existing_manifest(
             f"existing manifest at {manifest_path} disagrees with this run: "
             + "; ".join(disagreements)
         )
+
+
+def _discard_previous_run(output_path: Path) -> None:
+    """Throw away an earlier run's rows and manifest so this one starts from nothing.
+
+    Every other runner's `--overwrite` replaces its predictions; this one appends, because a
+    resumed AML run must not re-issue `/aml/add` for a case it already finished. Those are not
+    in conflict, but only if `--overwrite` deletes rather than truncates-in-place: `_run`
+    resumes off the ids already in the file, so leaving the rows there would make an
+    "overwriting" run skip exactly the cases it was asked to redo.
+
+    The manifest goes with them. Left behind, `_require_compatible_existing_manifest` would
+    still refuse the very run `--overwrite` exists to allow -- a re-run under a new `--run-id`
+    into the same output path, which is the whole reason an operator reaches for the flag.
+    """
+    output_path.unlink(missing_ok=True)
+    sidecar_manifest_path(output_path).unlink(missing_ok=True)
 
 
 def _require_nonempty_cases(
@@ -338,8 +413,8 @@ async def _connect_and_run(
             cases,
             run_id=arguments.run_id,
             benchmark=arguments.benchmark,
-            top_k=arguments.top_k,
-            concurrency=arguments.concurrency,
+            top_k=arguments.recall_limit,
+            concurrency=arguments.request_concurrency,
             output_path=arguments.output_path,
             tenant_prefix=arguments.tenant_prefix,
             request_timeout_seconds=arguments.request_timeout_seconds,
@@ -488,8 +563,8 @@ def _write_manifest(
         deployment_sha256=deployment.sha256,
         run_id=arguments.run_id,
         tenant_prefix=arguments.tenant_prefix,
-        recall_limit=arguments.top_k,
-        request_concurrency=arguments.concurrency,
+        recall_limit=arguments.recall_limit,
+        request_concurrency=arguments.request_concurrency,
         request_timeout_seconds=arguments.request_timeout_seconds,
         question_count=question_count,
         oversized_unsliced_question_count=oversized_unsliced_question_count,
@@ -503,105 +578,71 @@ def _write_manifest(
     )
 
 
-def _positive_int(raw: str) -> int:
-    """Argparse `type=` for `--concurrency`: reject non-positive values at
-    parse time (Minor 4, task-13 review). `asyncio.Semaphore(0)` blocks
-    forever with no output and no error, and the `Field(gt=0)` that would
-    otherwise catch it only runs once at manifest-write time -- after the
-    run has already hung.
+def _require_positive_concurrency(value: int) -> int:
+    """Refuse a non-positive `--request-concurrency` before it can hang the run.
+
+    `asyncio.Semaphore(0)` blocks forever with no output and no error, and the `Field(gt=0)`
+    that would otherwise catch it only runs at manifest-write time -- after the run has
+    already hung (Minor 4, task-13 review). Checked after parsing rather than as argparse
+    `type=`, because the flag is declared once in `core_parser` for every runner and this is
+    the only one that deadlocks rather than merely misbehaves on zero.
     """
-    value = int(raw)
     if value <= 0:
-        raise argparse.ArgumentTypeError(f"must be a positive integer, got {value}")
+        raise ValueError(f"--request-concurrency must be a positive integer, got {value}")
     return value
 
 
+def _require_tenant_prefix(parsed_value: str | None) -> str:
+    """Resolve `--tenant-prefix`, or refuse the run naming both ways to supply it."""
+    resolved = parsed_value or os.environ.get(TENANT_PREFIX_VARIABLE)
+    if not resolved:
+        raise ValueError(
+            f"--tenant-prefix is required; pass it or set {TENANT_PREFIX_VARIABLE} to the "
+            "prefix the deployment derives its own tenants from"
+        )
+    return resolved
+
+
+def _require_supported_benchmark(name: str) -> str:
+    """Say why ScriptMem is absent, rather than letting it read as a typo."""
+    if name == SCRIPTMEM_BENCHMARK:
+        raise ValueError(SCRIPTMEM_UNSUPPORTED)
+    return name
+
+
 def _parse_arguments(argv: Sequence[str] | None, prog: str | None) -> _Arguments:
-    parser = build_parser(
+    parser = core_parser(
+        # `None`, not "": there is no default to fall back to here, and an empty string is a
+        # value -- the shared help formatter would print `(default: )` and the resolution below
+        # would be unreachable. `_require_tenant_prefix` supplies the environment fallback or
+        # refuses.
+        tenant_prefix=None,
         prog=prog,
         description="Run one Agent Memory Leaderboard benchmark against a deployed API.",
         epilog=AML_ENVIRONMENT,
+        dataset_action="append",
+        dataset_help="one per positional argument the benchmark's loader takes, in order",
     )
     parser.add_argument(
         "--benchmark",
         required=True,
-        choices=sorted(BENCHMARKS),
+        choices=sorted((*BENCHMARKS, SCRIPTMEM_BENCHMARK)),
         help="which AML pipeline to replay",
-    )
-    parser.add_argument(
-        "--dataset",
-        type=Path,
-        action="append",
-        default=[],
-        required=True,
-        help="one per positional argument the benchmark's loader takes, in order",
-    )
-    parser.add_argument(
-        "-o",
-        "--output",
-        type=Path,
-        required=True,
-        help="JSONL rows to append to; a resumed run keeps the rows already there",
-    )
-    parser.add_argument(
-        "--api-base-url", required=True, help="base URL of the deployed MindBridge API"
-    )
-    parser.add_argument(
-        "--deployment-config",
-        type=Path,
-        required=True,
-        help="JSON description of the deployment that answered",
-    )
-    parser.add_argument(
-        "--run-id", required=True, help="identifier this run's tenants and manifest are pinned to"
-    )
-    # No default: the server derives its half of the same mapping from its
-    # own `MINDBRIDGE_AML_TENANT_PREFIX` (see `AmlRunManifest`'s
-    # `client_derived_tenant_ids` docstring), which nothing on the wire
-    # confirms. A default here would let an operator silently inherit a
-    # value the deployment may not share; requiring it explicitly forces
-    # that choice to be made on purpose (Important 3, task-13 review).
-    parser.add_argument(
-        "--tenant-prefix",
-        required=True,
-        help="prefix the deployment agrees on; deliberately has no default",
-    )
-    parser.add_argument("--top-k", type=int, default=20, help="memories to retrieve per question")
-    parser.add_argument(
-        "--concurrency",
-        type=_positive_int,
-        default=4,
-        help=(
-            "requests in flight across every case; raising it needs "
-            "MINDBRIDGE_DATABASE_MAX_POOL_SIZE raised with it (see README)"
-        ),
-    )
-    # Matches `cli_common.core_parser`'s `--request-timeout-seconds`, threaded
-    # through to `driver.run_case` instead of that module's hardcoded
-    # `timeout=600.0` on every `/aml/add` and `/aml/search` call (Cheap 5,
-    # final review, 2026-08-17), and pinned in the manifest like every other
-    # benchmark runner already pins it.
-    parser.add_argument(
-        "--request-timeout-seconds", type=float, default=600.0, help="deadline for one request"
-    )
-    parser.add_argument(
-        "-q",
-        "--quiet",
-        action="store_true",
-        help="suppress the progress lines this replay writes to stderr",
     )
     parsed = parser.parse_args(argv)
     return _Arguments(
-        benchmark=parsed.benchmark,
+        benchmark=_require_supported_benchmark(parsed.benchmark),
         dataset_paths=tuple(parsed.dataset),
         output_path=parsed.output,
         api_base_url=parsed.api_base_url,
         deployment_config_path=parsed.deployment_config,
         run_id=parsed.run_id,
-        tenant_prefix=parsed.tenant_prefix,
-        top_k=parsed.top_k,
-        concurrency=parsed.concurrency,
+        tenant_prefix=_require_tenant_prefix(parsed.tenant_prefix),
+        recall_limit=parsed.recall_limit,
+        request_concurrency=_require_positive_concurrency(parsed.request_concurrency),
         request_timeout_seconds=parsed.request_timeout_seconds,
+        limit=parsed.limit,
+        overwrite=parsed.overwrite,
         quiet=parsed.quiet,
     )
 
