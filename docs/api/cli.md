@@ -19,7 +19,7 @@ uv run --extra server mindbridge lifecycle --help
 | --- | --- |
 | `mindbridge` | `config check`, `consolidate`, `jobs`, `lifecycle`, `mcp`, `jina serve`, `edge sync` |
 | `mindbridge-bench` | `locomo-refined`, `m3`, `egolife`, `egomem`, `egotempo`, `memlens`, `mm-lifelong`, `atm`, `mem-gallery`, `supermemory`, `video-mme`, `video-mme-v2`, `aml` |
-| `mindbridge-bench` support | `suite`, `score`, `datasets`, `jina`, `bakeoff` |
+| `mindbridge-bench` support | `eval`, `score`, `datasets`, `jina`, `bakeoff` |
 
 `mindbridge-consolidate`, `mindbridge-lifecycle`, and `mindbridge-mcp` remain as aliases for the
 subcommands of the same name. They route through the same module and report the same codes.
@@ -412,7 +412,7 @@ uv run mindbridge-bench
 
 | Support command | Extra | Purpose |
 | --- | --- | --- |
-| `suite` | `benchmarks` | Run several of the runners above by name, downloading what they read. |
+| `eval` | `benchmarks` | Run one or more of the runners above by name, downloading what they read. |
 | `score` | — | Record an official scorer's verdict beside a run. |
 | `datasets` | `benchmarks` | Check every official release parses and pins its digest. |
 | `jina` | `cloud-models` | Check the local Jina Omni embedder answers. |
@@ -424,20 +424,27 @@ benchmark that bypasses the product measures something the product does not do.
 Every runner accepts `--limit N` to run only the first N of its own units, which is what makes a
 smoke run cheap enough to iterate on.
 
-`suite` runs several runners in one invocation. `--tasks` names entries in a shipped catalog and
-each official release is downloaded at a pinned revision if absent, so the common case needs
+`eval` runs one or more runners in one invocation. `--tasks` names entries in a shipped catalog
+and each official release is downloaded at a pinned revision if absent, so the common case needs
 neither a file to write nor a corpus to populate first:
 
 ```bash
-uv run --extra benchmarks mindbridge-bench suite --tasks released-text --run-id sweep-001 --limit 2
-uv run --extra benchmarks mindbridge-bench suite --list-tasks
+uv run --extra benchmarks mindbridge-bench eval --tasks released-text --limit 2
 ```
 
-Only `--run-id` and the task names have no default. Downloads are verified against the digests in
-`benchmarks/manifests/dataset-adapters-smoke.json`; prepared-media manifests are the one input no
-release supplies. The sweep derives each task's `--output` and `--run-id` so two parameterisations
-of one benchmark cannot share a tenant, continues past a task that fails, and records every
-outcome in `suite-summary.json`. See
+```bash
+uv run --extra benchmarks mindbridge-bench eval --list-tasks
+```
+
+The task names are the only thing with no default; `--run-id` falls back to `sweep-<UTC
+timestamp>`, which is unique and therefore isolating. Downloads are verified against the digests
+in `benchmarks/manifests/dataset-adapters-smoke.json`; prepared-media manifests are the one input
+no release supplies. The sweep gives each task a directory of its own under `--output-dir` and
+derives its `--run-id`, so two parameterisations of one benchmark cannot share a tenant. It
+continues past a task that fails, records every outcome in `suite-summary.json`, and prints a
+results table on stdout naming, per task, the numbers its manifest and score sidecar carry and
+which of the two each came from. `--report DIR` prints that table again for a directory an
+earlier run wrote, which is how a benchmark scored afterwards gets its numbers on screen. See
 [benchmarking](../benchmarking.md#running-several-benchmarks-in-one-command).
 
 See [benchmarking](../benchmarking.md) for datasets, protocol, and what the numbers license you

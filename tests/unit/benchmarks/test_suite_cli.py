@@ -1,4 +1,4 @@
-"""Sweep behaviour for the multi-benchmark `suite` runner.
+"""Sweep behaviour for the multi-benchmark `eval` runner.
 
 Each benchmark's own arguments are covered where that benchmark's CLI is. What is checked here
 is what the sweep adds: the invocation it builds per task, the isolation it derives, and what it
@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import sys
 from collections.abc import Callable, Sequence
 from pathlib import Path
@@ -19,11 +20,13 @@ import pytest
 from pydantic import ValidationError
 
 from mindbridge import telemetry
+from mindbridge.benchmarks.artifacts import sidecar_manifest_path
 from mindbridge.benchmarks.atm_bench_runner import AtmMediaSource
 from mindbridge.benchmarks.atm_cli import AtmSplit
 from mindbridge.benchmarks.cli import INTERRUPT_EXIT_CODE, RUNNERS, USAGE_EXIT_CODE, Runner
 from mindbridge.benchmarks.memlens_cli import MemLensContextWindow
 from mindbridge.benchmarks.mm_lifelong import MMLifelongSplit
+from mindbridge.benchmarks.official_score import score_sidecar_path
 from mindbridge.benchmarks.prepare import PREPARERS, Producer
 from mindbridge.benchmarks.suite import (
     SUMMARY_FILENAME,
@@ -36,8 +39,9 @@ from mindbridge.benchmarks.task_catalog import ROOT, TASKS, CatalogTask, listing
 
 
 def test_the_dispatcher_can_reach_the_suite_runner() -> None:
-    assert RUNNERS["suite"].module == "mindbridge.benchmarks.suite"
-    assert RUNNERS["suite"].extra is None
+    assert RUNNERS["eval"].module == "mindbridge.benchmarks.suite"
+    assert RUNNERS["eval"].extra is None
+    assert "suite" not in RUNNERS, "the sweep is spelled `eval`; `suite` is the task-list file"
 
 
 def test_each_task_gets_its_own_run_id_and_output_so_one_benchmark_can_run_twice(
@@ -61,7 +65,10 @@ def test_each_task_gets_its_own_run_id_and_output_so_one_benchmark_can_run_twice
     run_ids = [_flag_value(argv, "--run-id") for argv in invocations]
     outputs = [_flag_value(argv, "--output") for argv in invocations]
     assert run_ids == ["sweep-01-first", "sweep-01-second"]
-    assert outputs == [str(tmp_path / "first.jsonl"), str(tmp_path / "second.jsonl")]
+    assert outputs == [
+        str(tmp_path / "first" / "predictions.jsonl"),
+        str(tmp_path / "second" / "predictions.jsonl"),
+    ]
     assert [_flag_value(argv, "--split") for argv in invocations] == ["main", "hard"]
 
 
@@ -125,8 +132,8 @@ def test_a_producer_backed_task_gets_a_manifest_path_of_its_own_run(
 
     manifests = [_flag_value(argv, "--prepared-media") for argv in invocations]
     assert manifests == [
-        str(tmp_path / "results" / "run-a" / "run-a-stub-task-prepared.json"),
-        str(tmp_path / "results" / "run-b" / "run-b-stub-task-prepared.json"),
+        str(tmp_path / "results" / "run-a" / "stub-task" / "prepared.json"),
+        str(tmp_path / "results" / "run-b" / "stub-task" / "prepared.json"),
     ]
     # Preparation ran for both, because neither found the other's file.
     assert len(prepared) == 2
@@ -308,7 +315,9 @@ def test_each_task_reports_its_own_cost_rather_than_the_sweep_so_far(
     monkeypatch.setattr(telemetry, "_timings", {})
 
     def handler(argv: Sequence[str], *, prog: str) -> int:
-        @telemetry.operation_span(f"mindbridge.test.{Path(_flag_value(argv, '--output')).stem}")
+        label = Path(_flag_value(argv, "--output")).parent.name
+
+        @telemetry.operation_span(f"mindbridge.test.{label}")
         async def instrumented() -> None:
             return None
 
@@ -331,9 +340,10 @@ def test_a_sweep_refuses_to_start_when_any_of_its_outputs_already_exists(
     """Each runner makes this check for itself, but only once it is already running."""
     invocations = _stub_benchmark(monkeypatch, writes=True)
     suite = _suite_file(tmp_path, _task("first"), _task("second"))
-    (tmp_path / "second.jsonl").write_text("earlier run", encoding="utf-8")
+    (tmp_path / "second").mkdir()
+    (tmp_path / "second" / "predictions.jsonl").write_text("earlier run", encoding="utf-8")
 
-    with pytest.raises(FileExistsError, match=r"second\.jsonl"):
+    with pytest.raises(FileExistsError, match=r"second/predictions\.jsonl"):
         _sweep(suite, tmp_path)
 
     assert invocations == []
@@ -399,8 +409,8 @@ def test_a_suite_may_not_set_the_flags_the_sweep_derives(flag: str) -> None:
         SuiteTask.model_validate({"name": "x", "benchmark": "locomo-refined", "arguments": [flag]})
 
 
-def test_two_tasks_may_not_share_a_name_or_a_predictions_file() -> None:
-    """Sharing either is silent: one tenant for two tasks, or one file for two results."""
+def test_two_tasks_may_not_share_a_name() -> None:
+    """Sharing one is silent: two tasks land in one tenant and answer from each other."""
     with pytest.raises(ValidationError, match="suite task names must be unique: twice"):
         BenchmarkSuite.model_validate(
             {
@@ -410,15 +420,23 @@ def test_two_tasks_may_not_share_a_name_or_a_predictions_file() -> None:
                 ]
             }
         )
-    with pytest.raises(ValidationError, match=r"must not share a predictions file: shared\.json"):
-        BenchmarkSuite.model_validate(
-            {
-                "tasks": [
-                    {"name": "a", "benchmark": "locomo-refined", "output_name": "shared.json"},
-                    {"name": "b", "benchmark": "locomo-refined", "output_name": "shared.json"},
-                ]
-            }
-        )
+
+
+def test_one_output_name_used_twice_is_two_files_because_each_task_has_its_own_directory() -> None:
+    """What used to need a second uniqueness check the task directory now makes impossible."""
+    suite = BenchmarkSuite.model_validate(
+        {
+            "tasks": [
+                {"name": "a", "benchmark": "locomo-refined", "output_name": "shared.json"},
+                {"name": "b", "benchmark": "locomo-refined", "output_name": "shared.json"},
+            ]
+        }
+    )
+
+    assert [str(task.predictions_path()) for task in suite.tasks] == [
+        "a/shared.json",
+        "b/shared.json",
+    ]
 
 
 @pytest.mark.parametrize("name", ["../escape", "sub/dir", ".hidden", ""])
@@ -550,7 +568,7 @@ def test_the_catalog_path_needs_no_file_and_derives_where_everything_goes(
     printed = capsys.readouterr().out
     assert f"--dataset {tmp_path}/stub/release.json" in printed
     assert "--limit 2" in printed
-    assert f"--output {tmp_path}/results/smoke-01/stub-task.jsonl" in printed
+    assert f"--output {tmp_path}/results/smoke-01/stub-task/predictions.jsonl" in printed
     assert "--run-id smoke-01-stub-task" in printed
     assert f"--deployment-config {tmp_path}/deployment.json" in printed
     assert "--api-base-url http://localhost:8000" in printed
@@ -563,11 +581,24 @@ def test_naming_no_task_at_all_points_at_the_listing_rather_than_running_everyth
     assert exit_info.value.code == USAGE_EXIT_CODE
 
 
-def test_a_sweep_without_a_run_id_is_refused_because_it_is_what_isolates_the_tenants() -> None:
-    with pytest.raises(SystemExit) as exit_info:
-        main(["--tasks", "locomo-refined"])
+def test_a_sweep_without_a_run_id_gets_a_timestamped_one_that_still_isolates_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """`--tasks` alone is the whole invocation; what the run ID has to be is unique, not named."""
+    monkeypatch.setitem(
+        TASKS, "stub-task", CatalogTask("stub", ("--dataset", f"{ROOT}/stub/release.json"))
+    )
+    _stub_benchmark(monkeypatch, writes=True)
 
-    assert exit_info.value.code == USAGE_EXIT_CODE
+    assert main(["--tasks", "stub-task", "--benchmarks-root", str(tmp_path), "--dry-run"]) == 0
+
+    printed = capsys.readouterr().out
+    derived = re.search(r"--run-id (sweep-\d{8}-\d{6})-stub-task", printed)
+    assert derived, printed
+    # The output directory is derived from the same ID, so a rerun never meets its own files.
+    assert f"--output {tmp_path}/results/{derived.group(1)}/stub-task/predictions.jsonl" in printed
 
 
 def _stub_benchmark(
@@ -575,6 +606,7 @@ def _stub_benchmark(
     *,
     writes: bool = True,
     handler: Callable[..., object] | None = None,
+    media: bool = False,
 ) -> list[tuple[str, ...]]:
     """Register one dispatchable stand-in benchmark and record the argv it is called with."""
     invocations: list[tuple[str, ...]] = []
@@ -593,7 +625,7 @@ def _stub_benchmark(
     monkeypatch.setitem(
         RUNNERS,
         "stub",
-        Runner("mindbridge_stub_benchmark", "Stub benchmark", extra=None),
+        Runner("mindbridge_stub_benchmark", "Stub benchmark", extra=None, media=media),
     )
     return invocations
 
@@ -650,3 +682,135 @@ def _summary(output_dir: Path) -> SuiteRunSummary:
 
 def _flag_value(argv: Sequence[str], flag: str) -> str:
     return argv[argv.index(flag) + 1]
+
+
+def test_the_media_knobs_reach_the_runners_that_take_them_and_no_others(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Handing `--device-id` to a text-only runner is an argparse error that fails its task.
+
+    Which is why the sweep would not forward them at all, and a media sweep could not raise its
+    processing timeout without a hand-written suite file.
+    """
+    ingesting = _stub_benchmark(monkeypatch, writes=True, media=True)
+    monkeypatch.setitem(
+        RUNNERS, "text", Runner("mindbridge_stub_benchmark", "Stub benchmark", media=False)
+    )
+    suite = _suite_file(
+        tmp_path,
+        _task("ingesting"),
+        {"name": "textual", "benchmark": "text", "arguments": ["--dataset", "release.json"]},
+    )
+
+    assert _sweep(suite, tmp_path, "--processing-timeout-seconds", "3600") == 0
+
+    media, textual = ingesting
+    assert _flag_value(media, "--processing-timeout-seconds") == "3600.0"
+    assert "--processing-timeout-seconds" not in textual
+    # The universal flags still reach both, which is what makes this a distinction and not a split.
+    assert "--api-base-url" in media
+    assert "--api-base-url" in textual
+
+
+def test_an_unset_media_knob_is_not_forwarded_either(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A sweep that defaulted these would pin a stale copy of each runner's own default."""
+    invocations = _stub_benchmark(monkeypatch, writes=True, media=True)
+
+    assert _sweep(_suite_file(tmp_path, _task("plain")), tmp_path) == 0
+
+    assert "--device-id" not in invocations[0]
+    assert "--poll-interval-seconds" not in invocations[0]
+    assert "--processing-timeout-seconds" not in invocations[0]
+
+
+@pytest.mark.parametrize("name", sorted({task.benchmark for task in TASKS.values()}))
+def test_each_runner_takes_the_media_knobs_exactly_when_the_dispatcher_says_it_does(
+    name: str,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """`Runner.media` is a declaration the sweep trusts before it has imported anything.
+
+    Wrong in one direction the knob is silently dropped from a media task; wrong in the other a
+    text-only task dies on an unrecognised argument mid-sweep. A parser's own `--help` is the
+    complete list of what it accepts, so asking each runner for it is what keeps the declaration
+    honest. Parametrised over every benchmark the catalog can name, which includes the one
+    text-only runner, so the assertion cannot pass against a table that is all True.
+    """
+    with pytest.raises(SystemExit):
+        RUNNERS[name].handler()(["--help"], prog="probe")
+
+    accepted = "--device-id" in capsys.readouterr().out
+    assert accepted is RUNNERS[name].media
+
+
+def test_a_finished_sweep_prints_a_table_naming_every_task_and_where_its_numbers_came_from(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The sweep's own stdout, so a run's result does not have to be dug out of two JSON files."""
+
+    def handler(argv: Sequence[str], *, prog: str) -> int:
+        _write_predictions(argv)
+        output = Path(_flag_value(argv, "--output"))
+        if output.parent.name == "scored":
+            sidecar_manifest_path(output).write_text(
+                json.dumps({"metrics": {"accuracy": 0.5}}), encoding="utf-8"
+            )
+        return 0
+
+    _stub_benchmark(monkeypatch, handler=handler)
+    suite = _suite_file(tmp_path, _task("scored"), _task("bare"))
+
+    assert _sweep(suite, tmp_path) == 0
+
+    printed = capsys.readouterr().out
+    assert "accuracy" in printed
+    assert "0.5000" in printed
+    assert "runner" in printed
+    assert "not scored" in printed, "a task with no numbers has to say so, not print nothing"
+    assert "mindbridge-bench score" in printed, "and name what would give it one"
+
+
+def test_the_table_can_be_reprinted_later_because_most_benchmarks_are_scored_afterwards(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """An official scorer runs after the sweep, so its numbers can never be in the sweep's own table."""
+    _stub_benchmark(monkeypatch, writes=True)
+    assert _sweep(_suite_file(tmp_path, _task("later")), tmp_path) == 0
+    assert "not scored" in capsys.readouterr().out
+
+    score_sidecar_path(tmp_path / "later" / "predictions.jsonl").write_text(
+        json.dumps({"metrics": {"llm_judge": 0.61}}), encoding="utf-8"
+    )
+
+    assert main(["--report", str(tmp_path)]) == 0
+
+    printed = capsys.readouterr().out
+    assert "llm_judge" in printed
+    assert "0.6100" in printed
+    assert "official" in printed
+    assert "not scored" not in printed
+
+
+def test_each_task_is_announced_with_a_rule_so_its_output_can_be_found_in_the_stream(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Runners write their own `[i/n]` progress, so without a boundary a sweep is one long stream."""
+    _stub_benchmark(monkeypatch, writes=True)
+    suite = _suite_file(tmp_path, _task("first"), _task("second"))
+
+    assert _sweep(suite, tmp_path) == 0
+
+    banners = [line for line in capsys.readouterr().err.splitlines() if "─" in line]
+    assert len(banners) == 2
+    assert banners[0].startswith("[1/2] first · stub · sweep-01-first ")
+    assert banners[1].startswith("[2/2] second · stub · sweep-01-second ")

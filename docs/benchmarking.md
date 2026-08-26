@@ -87,8 +87,7 @@ in parallel so a failure costs one shard rather than the sweep.
 
 ```bash
 export MINDBRIDGE_API_KEY=replace-with-a-runtime-secret
-uv run --extra benchmarks mindbridge-bench suite \
-  --tasks released-text --run-id sweep-001 --limit 2
+uv run --extra benchmarks mindbridge-bench eval --tasks released-text --limit 2
 ```
 
 That runs four benchmarks against one deployment, downloading each official release it does not
@@ -97,7 +96,7 @@ shipped with MindBridge; `--list-tasks` prints every name it accepts and what ob
 still take:
 
 ```bash
-uv run mindbridge-bench suite --list-tasks
+uv run mindbridge-bench eval --list-tasks
 ```
 
 ```text
@@ -120,14 +119,17 @@ downloaded" below.
 Task names are comma-separated and the flag repeats, so `--tasks m3-robot,m3-web --tasks egolife`
 is three tasks. A group expands to several, and a task named twice still runs once.
 
-Everything else has a default worth having. Only `--run-id` and the task names do not:
+Everything else has a default worth having. Only the task names do not:
 
 | Flag | Default |
 | --- | --- |
+| `--run-id` | `sweep-<UTC timestamp>` — unique, so it isolates tenants and never meets its own output |
 | `--benchmarks-root` | `.benchmarks`, the layout the download commands above create |
 | `--output-dir` | `<benchmarks-root>/results/<run-id>` |
 | `--api-base-url` | `http://localhost:8000` |
 | `--deployment-config` | `<benchmarks-root>/deployment.json` |
+
+Name `--run-id` yourself when the run has to be found again by name rather than by date.
 
 The individual runners still require the URL and the deployment file explicitly. They are single
 measurements; this command is the one you reach for while iterating.
@@ -229,7 +231,10 @@ not only through a sweep.
 
 ### What the sweep owns
 
-**`--output` and `--run-id` are derived per task, and a suite setting either is refused.** The run
+**`--output` and `--run-id` are derived per task, and a suite setting either is refused.** Each
+task writes into a directory of its own — `<output-dir>/<task>/predictions.jsonl` and the
+manifest, prepared media, and score beside it — so a fifteen-task sweep is fifteen directories
+rather than sixty files sharing a name prefix. The run
 ID is not cosmetic. A tenant is `<tenant-prefix>_<unit-id>_<run-id>`, so two parameterisations of
 one benchmark — MEMLENS at two context windows, ATM-Bench at both splits — share everything but
 the run ID. Without a per-task one the second task would write into the first task's tenants and
@@ -240,15 +245,20 @@ before the API starts, and these run IDs are ones the sweep makes up. `--dry-run
 invocation behind each task, so they are readable before anything runs:
 
 ```bash
-uv run mindbridge-bench suite --tasks released-text --run-id sweep-001 --dry-run
+uv run mindbridge-bench eval --tasks released-text --run-id sweep-001 --dry-run
 ```
 
 `--api-base-url` and `--deployment-config` are forwarded to every task. So are `--limit`,
 `--recall-limit`, `--request-concurrency`, and `--request-timeout-seconds`, but only when given —
 otherwise each runner keeps the default it declares rather than a copy pinned here that goes
 stale. They are placed before a task's own arguments, so a benchmark needing its own recall
-budget sets it in the task. Flags that exist only on some runners — `--prepared-media`,
-`--device-id`, and the media polling deadlines among them — belong in the task, not on the sweep.
+budget sets it in the task.
+
+`--device-id`, `--poll-interval-seconds`, and `--processing-timeout-seconds` are forwarded the
+same way, but only to the tasks whose runner takes them — every benchmark here except
+LoCoMo-Refined, which ingests no media and would reject them. That is what lets one sweep mixing
+text and media raise the processing deadline for the runs it applies to. A flag narrower still,
+`--prepared-media` among them, belongs in the task rather than on the sweep.
 
 ### What it records
 
@@ -263,8 +273,43 @@ argv behind it, the exit code, how long it took, and whether it produced predict
 task that exits 0 without writing them is recorded as failed rather than as a result nobody can
 open. The sweep exits 1 if any task failed and 130 if it was interrupted.
 
-The summary carries no scores. Official scorers run outside MindBridge, and each verdict is
-attached to the run that earned it with `mindbridge-bench score`.
+### What it prints
+
+When the sweep finishes it writes a results table to stdout — the run's output, so `-q`, which
+silences progress on stderr, leaves it alone:
+
+```text
+Task            Benchmark       Status     Wall   Metric                         Value  Source
+──────────────────────────────────────────────────────────────────────────────────────────────
+video-mme       Video-MME       completed  41:02  accuracy                      0.6129  runner
+                                                  strict_accuracy               0.6000  runner
+                                                  question_count                   900  runner
+                                                  by_duration.long.accuracy     0.4900  runner
+locomo-refined  LoCoMo-Refined  completed  08:03  llm_judge                     0.5810  official
+memlens-32k     MEMLENS         completed  18:03  —                                  —  not scored
+atm-main-sgm    ATM-Bench       failed     00:03  —                                  —  —
+
+sweep-20260826-141233: 4 tasks · 3 completed · 1 failed · 1:07:08 total
+not scored: memlens-32k — these are scored outside MindBridge; attach the result with
+  mindbridge-bench score --predictions ... --manifest ... ...
+```
+
+Nothing in that table is measured by the sweep, which is why it can be printed at all. `runner`
+is a number the benchmark's own runner pinned in its manifest — the four whose official protocol
+is exact match score themselves. `official` is a number `mindbridge-bench score` attached after
+an external scorer ran. `not scored` is neither, and says so rather than showing a blank that
+reads like a zero. The summary file itself still carries no scores.
+
+Most benchmarks here are in that third state until their official scorer has run, which happens
+after the sweep has exited. `--report` renders the same table again from a directory an earlier
+run wrote, so those numbers reach the screen without running anything twice:
+
+```bash
+uv run mindbridge-bench eval --report .benchmarks/results/sweep-20260826-141233
+```
+
+It reads the artifacts beside each task's predictions, so a results directory copied off the
+machine that produced it renders the same way there.
 
 ---
 
@@ -435,7 +480,7 @@ LoCoMo-Refined, M3-Bench, Video-MME, Video-MME-v2, EgoLife (EgoLifeQA), EgoTempo
 MEMLENS, MM-Lifelong, SuperMemory-VQA, ATM-Bench, and Mem-Gallery are consumed through thin
 adapters over pinned official files.
 
-`mindbridge-bench suite --tasks ...` fetches each of these itself, at the same revisions, so the
+`mindbridge-bench eval --tasks ...` fetches each of these itself, at the same revisions, so the
 commands below are for populating a corpus without running a sweep — a mirror, an offline machine,
 or the whole of a release rather than the files one task reads. They also stay the reference for
 what `--benchmarks-root` is expected to contain.
@@ -1190,9 +1235,9 @@ and refuses numbers that belong to a different run:
 
 ```bash
 uv run mindbridge-bench score \
-  --predictions .benchmarks/results/locomo-refined.jsonl \
-  --manifest .benchmarks/results/locomo-refined.jsonl.manifest.json \
-  --scorer-output .benchmarks/results/locomo-refined-scorer-summary.json \
+  --predictions .benchmarks/results/sweep-001/locomo-refined/predictions.jsonl \
+  --manifest .benchmarks/results/sweep-001/locomo-refined/predictions.jsonl.manifest.json \
+  --scorer-output .benchmarks/results/sweep-001/locomo-refined/scorer-summary.json \
   --scorer-repository mem-eval-suite/LoCoMo_refined \
   --scorer-command "./scripts/run_eval.sh --metrics llm f1 bleu --llm-judge refined" \
   --judge-model Qwen/Qwen3-14B \
@@ -1200,6 +1245,10 @@ uv run mindbridge-bench score \
   --scored-question-count 1382 \
   --metric llm=82.65
 ```
+
+The sidecar lands beside the predictions, which is where the results table looks for it:
+`mindbridge-bench eval --report .benchmarks/results/sweep-001` then prints that `llm` figure
+against the run, attributed to the official scorer.
 
 `--judge-model` and `--answer-backbone` are the fields that make two LoCoMo-Refined numbers
 comparable or not: the official judge is `Qwen/Qwen3-14B` under the `refined` prompt, and

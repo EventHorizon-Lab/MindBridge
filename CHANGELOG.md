@@ -52,12 +52,16 @@ The capabilities present on `master` today:
 - OpenTelemetry across REST, model calls, PostgreSQL, S3, and queued jobs, capturing no user
   content.
 - Benchmark harness driving the production API across twelve official datasets plus the Agent
-  Memory Leaderboard offline replay. `mindbridge-bench suite --tasks a,b,c` runs several of them
+  Memory Leaderboard offline replay. `mindbridge-bench eval --tasks a,b,c` runs several of them
   from one invocation against one deployment, from a shipped task catalog rather than a file you
   write, downloading each official release it needs at a pinned revision and verifying it against
-  a committed digest, and records each outcome in a sweep summary. `--limit N` scopes any runner to
-  its first N units for a smoke run, and prepared-media manifests are produced for Mem-Gallery
-  and M3-Bench rather than assembled by hand.
+  a committed digest. Task names are the only argument with no default. Each task writes into a
+  directory of its own, and the sweep ends by printing a results table naming, per task, the
+  numbers its manifest and score sidecar carry and which of the two each came from; `--report DIR`
+  prints it again for an earlier run, which is how a benchmark scored afterwards reports without
+  running twice. `--limit N` scopes any runner to its first N units for a smoke run, the media
+  ingest deadlines reach every task whose runner accepts them, and prepared-media manifests are
+  produced for Mem-Gallery and M3-Bench rather than assembled by hand.
 - Python 3.10 through 3.14, with the whole quality gate — format, lint, types, tests — run on
   every one of them.
 

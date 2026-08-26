@@ -6,8 +6,9 @@ needs its own release path, and most need a required choice no sweep can guess -
 operator produced outside MindBridge. The suite records one task per invocation; the sweep
 supplies only the flags every runner shares.
 
-The sweep owns two of those per task, so a suite may not set them. `--output` is `--output-dir`
-plus the task's own file name. `--run-id` is the sweep's ID plus the task's name, which is not
+The sweep owns two of those per task, so a suite may not set them. `--output` is a directory of
+the task's own inside `--output-dir`, so a fifteen-task sweep is fifteen directories rather than
+sixty files sharing one. `--run-id` is the sweep's ID plus the task's name, which is not
 cosmetic: a tenant is derived from `--tenant-prefix`, the unit ID, and `--run-id`, and a
 benchmark run twice in one sweep -- MEMLENS at two context windows, ATM-Bench at both splits --
 shares the first two. Without a per-task run ID the second task would write into the first
@@ -20,7 +21,11 @@ the predictions with the exit code and the argv behind it.
 
 Each task's predictions and manifest are written by its runner, unchanged. Nothing here scores
 anything -- an official scorer's verdict is attached to one run by `mindbridge-bench score`, and
-a sweep summary carrying numbers would be claiming what no runner here measured.
+a sweep summary carrying numbers would be claiming what no runner here measured. The table this
+prints when it finishes is not that claim: it reads the numbers back out of each task's own
+manifest and score sidecar and names which of the two every row came from. `--report DIR` prints
+the same table for a directory an earlier sweep wrote, which is how a run scored afterwards --
+most of them are -- gets its numbers on screen without being run again.
 """
 
 from __future__ import annotations
@@ -41,14 +46,10 @@ from pydantic import AwareDatetime, Field, StringConstraints, model_validator
 from mindbridge.benchmarks.artifacts import require_writable_output_pair, write_text_atomically
 from mindbridge.benchmarks.cli import INTERRUPT_EXIT_CODE, PROGRAM, RUNNERS, guarded
 from mindbridge.benchmarks.cli import parser as build_parser
-from mindbridge.benchmarks.cli_common import (
-    BENCHMARK_ENVIRONMENT,
-    report,
-    report_unit,
-    select_by_id,
-)
+from mindbridge.benchmarks.cli_common import BENCHMARK_ENVIRONMENT, report, select_by_id
 from mindbridge.benchmarks.prepare import PREPARERS, PrepareRequest
 from mindbridge.benchmarks.releases import fetch
+from mindbridge.benchmarks.report import render, render_directory
 from mindbridge.benchmarks.task_catalog import (
     DEFAULT_BENCHMARKS_ROOT,
     listing,
@@ -62,6 +63,9 @@ SUITE_VERSION = "benchmark_suite_v1"
 
 SUMMARY_FILENAME = "suite-summary.json"
 """What the sweep's own artifact is called inside `--output-dir`."""
+
+_RULE_WIDTH = 78
+"""How wide a task's banner rule is drawn, short enough to survive an 80-column terminal."""
 
 SWEEP_OWNED_FLAGS = frozenset({"-o", "--output", "--run-id"})
 """Flags the sweep derives per task.
@@ -91,7 +95,7 @@ class SuiteTask(ContractModel):
     the runner's own parser is what validates them.
     """
     output_name: _TaskName | None = None
-    """Overrides the default `<name>.jsonl`, which is wrong for the runners emitting JSON."""
+    """Overrides the default `predictions.jsonl`, which is wrong for the runners emitting JSON."""
 
     @model_validator(mode="after")
     def require_a_dispatchable_invocation(self) -> SuiteTask:
@@ -112,9 +116,15 @@ class SuiteTask(ContractModel):
             )
         return self
 
-    def predictions_name(self) -> str:
-        """Name this task's predictions file inside the sweep's output directory."""
-        return self.output_name or f"{self.name}.jsonl"
+    def predictions_path(self) -> Path:
+        """Locate this task's predictions, in a directory of its own under the sweep's.
+
+        A directory per task rather than a file per task because a task writes more than its
+        predictions: a sidecar manifest, a prepared-media manifest where it needs one, and a
+        score sidecar later. Flat, a fifteen-task sweep was sixty files whose only grouping was
+        a shared name prefix; here everything one benchmark produced is one `ls` away.
+        """
+        return Path(self.name) / (self.output_name or "predictions.jsonl")
 
 
 class BenchmarkSuite(ContractModel):
@@ -123,18 +133,16 @@ class BenchmarkSuite(ContractModel):
     tasks: tuple[SuiteTask, ...] = Field(min_length=1)
 
     @model_validator(mode="after")
-    def require_tasks_that_cannot_overwrite_each_other(self) -> BenchmarkSuite:
-        """Refuse a suite in which two tasks share a run ID or a predictions file.
+    def require_uniquely_named_tasks(self) -> BenchmarkSuite:
+        """Refuse a suite in which two tasks share a name.
 
-        Both are silent when they happen and expensive to detect afterwards: shared run IDs put
-        two tasks in one tenant, and a shared file leaves only the last task's predictions with
-        every earlier task still reported as having produced a result.
+        It is silent when it happens and expensive to detect afterwards: a run ID is derived from
+        the name, so two tasks called the same thing land in one tenant and answer from each
+        other's memories. One check covers the outputs too, now that each task writes inside a
+        directory named after it -- distinct names are distinct directories, so two tasks can no
+        longer collide on a predictions file however they are spelled.
         """
         _reject_repeats((task.name for task in self.tasks), "suite task names must be unique")
-        _reject_repeats(
-            (task.predictions_name() for task in self.tasks),
-            "suite tasks must not share a predictions file",
-        )
         return self
 
 
@@ -180,6 +188,8 @@ class _Arguments:
     output_dir: Path
     run_id: str
     shared: tuple[str, ...]
+    media: tuple[str, ...]
+    """Forwarded only to the tasks whose runner declares it accepts them."""
     overwrite: bool
     quiet: bool
     dry_run: bool
@@ -201,6 +211,9 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> int:
     parsed = parser.parse_args(argv)
     if parsed.list_tasks:
         print(listing(root=parsed.benchmarks_root))
+        return 0
+    if parsed.report is not None:
+        print(render_directory(parsed.report))
         return 0
     arguments = _arguments(parser, parsed)
     suite = _load_suite(arguments)
@@ -226,6 +239,10 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> int:
     )
     write_text_atomically(summary_path, summary.model_dump_json(indent=2) + "\n")
     report(f"wrote {summary_path}", quiet=arguments.quiet)
+    # The results table is the run's output, not its progress, so it goes to stdout and `--quiet`
+    # leaves it alone. Rendered from the bytes just written rather than from `summary` in memory,
+    # so this and a later `--report` on the same directory cannot disagree about the same run.
+    print(render(summary_path.read_bytes(), directory=arguments.output_dir))
     return _sweep_exit_code(outcomes)
 
 
@@ -291,12 +308,7 @@ def _run_plans(
     quiet = arguments.quiet
     outcomes: list[SuiteTaskOutcome] = []
     for index, plan in enumerate(plans, start=1):
-        report_unit(
-            f"{plan.task.benchmark} as {plan.task.name}",
-            index=index,
-            total=len(plans),
-            quiet=quiet,
-        )
+        _announce_task(plan, index=index, total=len(plans), quiet=quiet)
         outcome = _run_task_prepared(plan, arguments)
         outcomes.append(outcome)
         report(
@@ -307,6 +319,20 @@ def _run_plans(
             report("interrupted; the remaining benchmarks did not start", quiet=quiet)
             break
     return tuple(outcomes)
+
+
+def _announce_task(plan: _Plan, *, index: int, total: int, quiet: bool) -> None:
+    """Mark where one benchmark's output begins, inside a stream of every runner's own progress.
+
+    A sweep's stderr is its tasks' stderr with nothing between them: fifteen runners each counting
+    their own units towards fifteen different totals, and a `[3/12]` that belongs to whichever one
+    is speaking. The rule is what makes the boundary findable scrolling back through four hours of
+    that. The derived run ID goes on it because every tenant it names has to be authorized in the
+    deployment before the API starts, and this is where a running sweep says what it derived.
+    """
+    label = f"[{index}/{total}] {plan.task.name} · {plan.task.benchmark} · {plan.run_id}"
+    report("", quiet=quiet)
+    report(f"{label} {'─' * max(_RULE_WIDTH - len(label), 3)}", quiet=quiet)
 
 
 def _run_task_prepared(plan: _Plan, arguments: _Arguments) -> SuiteTaskOutcome:
@@ -429,15 +455,16 @@ def _sweep_exit_code(outcomes: Sequence[SuiteTaskOutcome]) -> int:
 def _plan(task: SuiteTask, arguments: _Arguments) -> _Plan:
     """Resolve one task's invocation, with the flags the sweep owns appended last."""
     run_id = f"{arguments.run_id}-{task.name}"
-    output_path = arguments.output_dir / task.predictions_name()
+    output_path = arguments.output_dir / task.predictions_path()
     return _Plan(
         task=task,
         run_id=run_id,
         output_path=output_path,
         arguments=(
             *arguments.shared,
+            *(arguments.media if RUNNERS[task.benchmark].media else ()),
             *task.arguments,
-            *_prepared_media_arguments(task, arguments, run_id=run_id),
+            *_prepared_media_arguments(task, arguments),
             "--output",
             str(output_path),
             "--run-id",
@@ -446,12 +473,7 @@ def _plan(task: SuiteTask, arguments: _Arguments) -> _Plan:
     )
 
 
-def _prepared_media_arguments(
-    task: SuiteTask,
-    arguments: _Arguments,
-    *,
-    run_id: str,
-) -> tuple[str, ...]:
+def _prepared_media_arguments(task: SuiteTask, arguments: _Arguments) -> tuple[str, ...]:
     """Point a producer-backed task at the manifest this run will write for it.
 
     The sweep owns this path for the same reason it owns `--run-id`: a manifest names objects
@@ -465,7 +487,7 @@ def _prepared_media_arguments(
     producer = PREPARERS.get(task.benchmark)
     if producer is None or producer.flag in task.arguments:
         return ()
-    return (producer.flag, str(arguments.output_dir / f"{run_id}-prepared.json"))
+    return (producer.flag, str(arguments.output_dir / task.name / "prepared.json"))
 
 
 def _require_writable_outputs(
@@ -542,7 +564,9 @@ def _build_parser(prog: str | None) -> argparse.ArgumentParser:
         help="print every name --tasks accepts, with whether its inputs are present, and exit",
     )
     parser.add_argument(
-        "--run-id", help="identifier for this sweep; each task runs under <run-id>-<task name>"
+        "--run-id",
+        help="identifier for this sweep; each task runs under <run-id>-<task name>. "
+        "Defaults to sweep-<UTC timestamp>, which is unique and therefore isolating",
     )
     parser.add_argument(
         "--benchmarks-root",
@@ -588,6 +612,20 @@ def _build_parser(prog: str | None) -> argparse.ArgumentParser:
         help="deadline for one request, for every task that does not set its own",
     )
     parser.add_argument(
+        "--device-id",
+        help="device identity to ingest as, for every media task that does not set its own",
+    )
+    parser.add_argument(
+        "--poll-interval-seconds",
+        type=float,
+        help="delay between processing-status polls, for every media task not setting its own",
+    )
+    parser.add_argument(
+        "--processing-timeout-seconds",
+        type=float,
+        help="deadline for one observation to finish processing, for every media task",
+    )
+    parser.add_argument(
         "--suite",
         type=Path,
         help="run the tasks in this JSON file instead of the catalog's; --tasks then narrows it",
@@ -609,6 +647,13 @@ def _build_parser(prog: str | None) -> argparse.ArgumentParser:
         help="print the invocation each task would run, then exit without running any",
     )
     parser.add_argument(
+        "--report",
+        type=Path,
+        metavar="DIR",
+        help=f"print the results table for a directory holding a {SUMMARY_FILENAME}, then exit; "
+        "how a run scored after the fact gets its numbers on screen without running again",
+    )
+    parser.add_argument(
         "-q",
         "--quiet",
         action="store_true",
@@ -624,30 +669,55 @@ def _arguments(parser: argparse.ArgumentParser, parsed: argparse.Namespace) -> _
     )
     if not names and parsed.suite is None:
         parser.error("give --tasks NAME[,NAME...], or --suite FILE; --list-tasks prints the names")
-    if parsed.run_id is None:
-        parser.error("--run-id is required; it is what isolates this sweep's tenants")
     root = parsed.benchmarks_root
+    run_id = parsed.run_id or _default_run_id()
     return _Arguments(
         task_names=names,
         suite_path=parsed.suite,
         benchmarks_root=root,
         download=parsed.download,
-        output_dir=parsed.output_dir or root / "results" / parsed.run_id,
-        run_id=parsed.run_id,
+        output_dir=parsed.output_dir or root / "results" / run_id,
+        run_id=run_id,
         shared=_shared_arguments(parsed, root=root),
+        media=_media_arguments(parsed),
         overwrite=parsed.overwrite,
         quiet=parsed.quiet,
         dry_run=parsed.dry_run,
     )
 
 
-def _shared_arguments(parsed: argparse.Namespace, *, root: Path) -> tuple[str, ...]:
-    """Collect the flags forwarded to every task, and only the ones that were given.
+def _default_run_id() -> str:
+    """Name a sweep nobody named, uniquely enough that it isolates its own tenants.
 
-    Media knobs are deliberately absent: `--poll-interval-seconds` and its neighbours exist only
-    on the runners that ingest media, so forwarding them to every task would make a text-only
-    benchmark reject the sweep. A task that needs one carries it in its own arguments.
+    A tenant is derived from the run ID, so the only thing this has to guarantee is that two
+    sweeps never share one; a UTC timestamp does that and sorts, which a random suffix would not.
+    It also gives each sweep its own `--output-dir`, so a rerun no longer meets its predecessor's
+    files and no longer needs `--overwrite` to get past them.
     """
+    return datetime.now(timezone.utc).strftime("sweep-%Y%m%d-%H%M%S")
+
+
+def _media_arguments(parsed: argparse.Namespace) -> tuple[str, ...]:
+    """Collect the ingest-and-wait knobs, for the tasks whose runner declares it takes them.
+
+    Separate from the shared flags because these exist only on the eleven runners that ingest
+    media; handing `--device-id` to LoCoMo-Refined is an argparse error that would fail its task.
+    `Runner.media` is where that distinction is declared, so a sweep mixing text and media
+    benchmarks raises one timeout for the ones it applies to and leaves the other alone.
+    """
+    media: list[str] = []
+    for flag, value in (
+        ("--device-id", parsed.device_id),
+        ("--poll-interval-seconds", parsed.poll_interval_seconds),
+        ("--processing-timeout-seconds", parsed.processing_timeout_seconds),
+    ):
+        if value is not None:
+            media.extend((flag, str(value)))
+    return tuple(media)
+
+
+def _shared_arguments(parsed: argparse.Namespace, *, root: Path) -> tuple[str, ...]:
+    """Collect the flags forwarded to every task, and only the ones that were given."""
     shared = [
         "--api-base-url",
         parsed.api_base_url,

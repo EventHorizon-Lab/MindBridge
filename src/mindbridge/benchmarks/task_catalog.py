@@ -1,4 +1,4 @@
-"""The tasks `mindbridge-bench suite --tasks` can name, and where each release is expected.
+"""The tasks `mindbridge-bench eval --tasks` can name, and where each release is expected.
 
 Every entry here is a benchmark plus the choices its runner requires and cannot default:
 ATM-Bench's `--split`, MEMLENS's `--context-window`, M3-Bench's `--subset`, Video-MME's
@@ -263,7 +263,7 @@ def task_payloads(names: Sequence[str], *, root: Path) -> tuple[dict[str, object
             "name": name,
             "benchmark": TASKS[name].benchmark,
             "arguments": TASKS[name].resolved(root=root),
-            "output_name": f"{name}{TASKS[name].output_suffix}",
+            "output_name": f"predictions{TASKS[name].output_suffix}",
         }
         for name in expand(names)
     )
