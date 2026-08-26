@@ -702,6 +702,53 @@ def test_an_arm_that_reads_no_manifest_is_not_staged_for(tmp_path: Path) -> None
         assert _prepared_manifest_path(plan) is None
 
 
+def test_a_producer_backed_task_never_also_names_its_manifest_in_the_catalog() -> None:
+    """Registering a producer requires removing the static manifest path, and this is the guard.
+
+    Two failures at once if it comes back, and neither is visible from the producer's own tests.
+    `_prepared_media_arguments` substitutes a per-run path only for a task that does not already
+    carry the flag, so a catalog entry naming one defeats the substitution -- and on the second
+    run `_prepare_task` finds the first run's file, skips preparation as already-done, and leaves
+    the run ingesting objects under a tenant it cannot address. Checked over the whole table
+    rather than for the four text tasks, because the trap is what happens when a *new* producer
+    is registered for a benchmark whose catalog entry still names the file it used to need.
+    """
+    for name, task in TASKS.items():
+        producer = PREPARERS.get(task.benchmark)
+        if producer is None:
+            continue
+        if producer.applies is not None and not producer.applies(task.arguments):
+            continue
+        assert producer.flag not in task.arguments, (
+            f"{name} names {producer.flag} in the catalog and has a producer; the sweep's "
+            "per-run path cannot replace it, and run 2 would reuse run 1's manifest"
+        )
+        assert not any(argument.startswith(f"{producer.flag}=") for argument in task.arguments)
+
+
+def test_every_acquired_media_set_is_labelled_by_the_task_that_needs_it() -> None:
+    """`--list-tasks` reads which media is acquired off the task's own arguments, not a second
+    table. That derivation is a convention -- a media set is named for its benchmark, or for its
+    benchmark and the argument that partitions it -- and this is what fails when a third acquired
+    set does not follow it, instead of that set going quietly unlabelled in the listing."""
+    from mindbridge.benchmarks.releases import ACQUIRERS
+    from mindbridge.benchmarks.task_catalog import _acquired_media
+
+    labelled = {_acquired_media(task) for task in TASKS.values()} - {None}
+
+    assert labelled == set(ACQUIRERS)
+
+
+def test_only_the_tasks_whose_media_is_acquired_are_labelled_as_acquiring() -> None:
+    """The label has to be narrower than the benchmark: `m3-robot` is a Hub download and
+    `m3-web` is 920 live URLs, and they are the same runner with one argument between them."""
+    from mindbridge.benchmarks.task_catalog import _acquired_media
+
+    acquired = {name for name, task in TASKS.items() if _acquired_media(task) is not None}
+
+    assert acquired == {"egotempo", "m3-web"}
+
+
 def test_the_listing_says_which_of_four_things_stands_between_a_task_and_a_run(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -739,6 +786,13 @@ def test_the_listing_says_which_of_four_things_stands_between_a_task_and_a_run(
     assert lines["atm-main"].endswith("download, prepare")
     assert lines["atm-main-sgm"].endswith("download"), "the sgm arm stages nothing"
     assert not lines["atm-hard-sgm"].endswith("prepare"), "the sgm arm stages nothing"
+    # Media that comes from outside the release is named as such. `download, prepare` is true of
+    # these two as well now, and it is the wrong promise: one needs an Ego4D signature the
+    # operator may not hold and the other 920 live URLs, so an operator planning an evening's
+    # sweep learns it here rather than minutes into the run.
+    assert lines["egotempo"].endswith("download, acquire, prepare")
+    assert lines["m3-web"].endswith("download, acquire, prepare")
+    assert "acquire" not in lines["m3-robot"], "the same runner, and this half is a download"
 
 
 def test_the_catalog_path_needs_no_file_and_derives_where_everything_goes(
