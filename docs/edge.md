@@ -183,7 +183,7 @@ the signal. A GPU host that never installed it stays on `automodel` rather than 
 Naming `engine="vllm"` on a device without CUDA fails loudly — an explicit accelerator request is
 not a suggestion here.
 
-### AutoModel recipes
+### Recipes
 
 A recipe is the composition, not just the model id, because a FunASR model id alone does not say
 whether the checkpoint predicts timestamps or punctuates its own output — and those answers decide
@@ -205,9 +205,17 @@ speech = load_speech_analyzer(
 )
 ```
 
-The default recipe runs with `trust_remote_code=True`, which FunASR needs for Fun-ASR-Nano, and
-an unset revision resolves upstream to `master`. Pin `revision=` once a deployment has measured a
-checkpoint; it reaches both engines. The vLLM engine can only honour a pin on the ModelScope hub —
+The recipe reaches both engines — the same VAD model, VAD ceiling, speaker model and revision
+apply whether the clip is decoded by `automodel` or by `vllm`. That is what makes resolving the
+engine from the environment safe; a field only one engine reads would be a composition that
+applies on GPU hosts and not on CPU ones.
+
+No shipped recipe sets `trust_remote_code`, and none needs to: FunASR registers each of these
+architectures natively, Fun-ASR-Nano included, and the published checkpoint's `config.yaml` names
+exactly that registered class. The flag is not free — under it FunASR pip-installs a downloaded
+`requirements.txt` into the running environment and imports downloaded Python. Declare it only on
+a recipe whose fork genuinely needs it, and pin `revision=` when you do, because an unset revision
+resolves upstream to `master`. The vLLM engine can only honour a pin on the ModelScope hub —
 upstream's HuggingFace path ignores it — so that combination is refused rather than silently
 unpinned.
 

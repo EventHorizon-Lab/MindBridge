@@ -307,10 +307,15 @@ FUNASR_RECIPES: Mapping[str, FunASRRecipe] = {
     # carries the model's own punctuation, but the turn boundaries come from VAD, so the 30s
     # ceiling is what bounds a turn. `FunASRNanoVLLMPipeline` serves these same weights with
     # batched decoding and tighter bounds when a device has the CUDA headroom for vLLM.
+    # `trust_remote_code` is deliberately off. Upstream registers this architecture natively
+    # -- `funasr/models/fun_asr_nano/model.py` carries `@tables.register("model_classes",
+    # "FunASRNano")` as far back as 1.3.19, this project's declared floor, and the published
+    # checkpoint's `config.yaml` names exactly that class -- so the flag buys nothing here. It
+    # costs plenty: upstream pip-installs a downloaded `requirements.txt` into the live venv
+    # and imports downloaded code, against an unpinned revision that resolves to "master".
     "fun-asr-nano": FunASRRecipe(
         model_id=FUNASR_NANO_MODEL_ID,
         vad_max_single_segment_ms=30_000,
-        trust_remote_code=True,
         vllm_servable=True,
     ),
     # Character timestamps and a punctuation model: the only composition here that reaches
@@ -476,19 +481,26 @@ class FunASRNanoVLLMPipeline:
         cls,
         *,
         device: str | None = None,
-        model_id: str = FUNASR_NANO_MODEL_ID,
-        revision: str | None = None,
+        recipe: FunASRRecipe | str = DEFAULT_FUNASR_RECIPE,
         hub: str = "ms",
-        vad_model: str = FUNASR_VAD_MODEL_ID,
-        speaker_model: str = CAMPPLUS_MODEL.model_id,
         gpu_memory_utilization: float = 0.5,
         max_model_len: int = 4_096,
     ) -> FunASRNanoVLLMPipeline:
-        """Load the vLLM engine plus the VAD and speaker models it has to be wrapped in."""
+        """Load the vLLM engine plus the VAD and speaker models it has to be wrapped in.
+
+        Takes the same `FunASRRecipe` the `AutoModel` backend does, because the engine is
+        chosen from the environment (`find_spec("vllm")` and a CUDA device) rather than by the
+        operator. Spelling the composition as loose keyword defaults here meant the recipe's
+        VAD ceiling, speaker encoder and revision applied on CPU and were replaced by this
+        method's own defaults on CUDA -- the same deployment, two compositions, decided by
+        which host picked up the clip. What stays a keyword is what the recipe does not
+        describe: `hub` and the two vLLM allocation knobs are properties of the runtime.
+        """
+        selected_recipe = validate_speech_engine("vllm", recipe)
         # Upstream's `from_pretrained` forwards a revision to ModelScope's snapshot download and
         # drops it on the HuggingFace path. Dropping a pin quietly is how an unreviewed
         # checkpoint gets loaded under `trust_remote_code`, so refuse the combination instead.
-        if revision is not None and hub not in {"ms", "modelscope"}:
+        if selected_recipe.revision is not None and hub not in {"ms", "modelscope"}:
             raise ValueError(
                 "the Fun-ASR-Nano vLLM engine can only pin a revision on the ModelScope hub; "
                 "upstream's HuggingFace path ignores it"
@@ -511,29 +523,42 @@ class FunASRNanoVLLMPipeline:
                 "the 'fun-asr-nano' recipe on CPU-only devices"
             )
         engine = inference_vllm.FunASRNanoVLLM.from_pretrained(
-            model=model_id,
+            model=selected_recipe.model_id,
             hub=hub,
             device=selected_device,
             dtype="bf16",
             max_model_len=max_model_len,
             gpu_memory_utilization=gpu_memory_utilization,
-            **({"revision": revision} if revision is not None else {}),
+            **(
+                {"revision": selected_recipe.revision}
+                if selected_recipe.revision is not None
+                else {}
+            ),
         )
         return cls(
             cast(_FunASRNanoEngine, engine),
             cast(
                 _FunASRPipeline,
                 funasr.AutoModel(
-                    model=vad_model,
+                    model=selected_recipe.vad_model,
                     device=selected_device,
                     disable_update=True,
                     disable_pbar=True,
+                    # `AutoModel` folds `vad_kwargs` into the VAD model's own constructor, so
+                    # loading FSMN-VAD as the primary model takes the same key flat. Omitted,
+                    # FSMN-VAD applies its own 60s default and the recipe's ceiling silently
+                    # doubles -- one clip, two different sets of turns, per engine.
+                    **(
+                        {"max_single_segment_time": selected_recipe.vad_max_single_segment_ms}
+                        if selected_recipe.vad_max_single_segment_ms is not None
+                        else {}
+                    ),
                 ),
             ),
             cast(
                 _FunASRPipeline,
                 funasr.AutoModel(
-                    model=speaker_model,
+                    model=selected_recipe.speaker_model,
                     device=selected_device,
                     disable_update=True,
                     disable_pbar=True,
@@ -697,11 +722,7 @@ def load_speech_analyzer(
         else _engine_for_environment(device=device, recipe=selected_recipe)
     )
     if selected == "vllm":
-        return FunASRNanoVLLMPipeline.load(
-            device=device,
-            model_id=selected_recipe.model_id,
-            revision=selected_recipe.revision,
-        )
+        return FunASRNanoVLLMPipeline.load(device=device, recipe=selected_recipe)
     return FunASRAutoModelPipeline.load(device=device, recipe=selected_recipe)
 
 
@@ -867,7 +888,11 @@ class FunASRStreamingTranscriber:
         )
         if len(output) != 1 or not isinstance(output[0].get("text"), str):
             raise ModelOutputError("FunASR returned an invalid streaming transcription")
-        return cast(str, output[0]["text"])
+        # Same normalization as both batch engines. `model_id` is a parameter now, so the
+        # checkpoint behind this can be one that tags its output (`<|zh|><|NEUTRAL|>`), and a
+        # live caption would render the tags as if someone had said them. Not stripped of
+        # whitespace: deltas are concatenated, so a leading space is word spacing.
+        return _MODEL_SPECIAL_TOKEN.sub("", cast(str, output[0]["text"]))
 
 
 class VisualActiveSpeakerPipeline:
@@ -1251,7 +1276,17 @@ def _funasr_segments(value: object, *, confidence: float) -> tuple[SpeechSegment
         if not isinstance(item, dict):
             raise ModelOutputError("FunASR returned an invalid sentence")
         start, end = item.get("start"), item.get("end")
-        transcript = _funasr_sentence_text(item.get("text") or item.get("sentence"))
+        raw_text = item.get("text") or item.get("sentence")
+        # Silence has a shape, and it is not a malformed result. Every recipe without a
+        # punctuation model degrades to upstream's `vad_segment` mode, which emits one entry
+        # per VAD span carrying the model's raw output with no empty-text filter, so a span
+        # nobody spoke in arrives as `""`. Dropping it before the guard below is what
+        # upstream's own `_vad_segment_sentences` does; letting it reach the guard raised and
+        # discarded every other sentence in the clip -- and only on the engines that have no
+        # punctuation model, so the same clip transcribed on CUDA and failed on CPU.
+        if isinstance(raw_text, str) and not _MODEL_SPECIAL_TOKEN.sub("", raw_text).strip():
+            continue
+        transcript = _funasr_sentence_text(raw_text)
         speaker = item.get("spk")
         if (
             not isinstance(start, (int, float))
@@ -1262,10 +1297,10 @@ def _funasr_segments(value: object, *, confidence: float) -> tuple[SpeechSegment
             or (speaker is not None and not isinstance(speaker, (str, int)))
         ):
             raise ModelOutputError("FunASR returned an invalid sentence")
-        # A sentence that is nothing but model special tokens is a VAD span the model heard no
-        # speech in, which SenseVoice reports constantly. Dropping the span is right; treating
-        # it as a malformed result would lose every other sentence in the clip with it, and a
-        # missing or blank `text` still does raise above.
+        # The same for the per-token list shape, which reaches here rather than the check
+        # above: `["<|zh|>"]` is a VAD span the model heard no speech in. A `text` that is
+        # neither a string nor a list of them still raises -- that is a shape we do not
+        # understand, not a silent span.
         transcript = _MODEL_SPECIAL_TOKEN.sub("", transcript).strip()
         if not transcript:
             continue

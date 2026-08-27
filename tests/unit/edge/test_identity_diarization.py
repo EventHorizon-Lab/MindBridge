@@ -142,13 +142,16 @@ def test_funasr_loads_registered_integrated_speaker_model(
     # The default is Fun-ASR-Nano on `AutoModel`. Asserted here because a default nothing
     # names is a default nothing notices changing.
     assert arguments["model"] == identity_diarization.FUNASR_NANO_MODEL_ID
-    assert arguments["trust_remote_code"] is True
+    # Off, and asserted rather than merely absent from the recipe: under this flag upstream
+    # pip-installs a downloaded requirements.txt into the live venv and imports downloaded
+    # code. Fun-ASR-Nano needs none of it -- funasr registers the architecture natively.
+    assert "trust_remote_code" not in arguments
     assert arguments["vad_kwargs"] == {"max_single_segment_time": 30_000}
     # Fun-ASR-Nano punctuates its own output, so loading a punctuation model would only cost
     # weights: upstream skips it whenever the result already carries timestamps.
     assert "punc_model" not in arguments
-    # Unpinned by default, which is upstream's "master". `trust_remote_code` is on for this
-    # model, so a deployment that has measured a checkpoint should pin it.
+    # Unpinned by default, which is upstream's "master". Safe only because no downloaded code
+    # runs; a deployment that has measured a checkpoint should still pin it.
     assert "model_revision" not in arguments
 
 
@@ -699,7 +702,7 @@ def test_funasr_recipes_compose_each_model_the_way_upstream_does() -> None:
     assert "punc_model" not in sensevoice
     assert sensevoice["vad_kwargs"] == {"max_single_segment_time": 30_000}
     assert "punc_model" not in nano
-    assert nano["trust_remote_code"] is True
+    assert "trust_remote_code" not in nano
     # Every recipe still has to satisfy the contract, whatever else it drops.
     for arguments in (paraformer, sensevoice, nano):
         assert arguments["vad_model"] and arguments["spk_model"] == CAMPPLUS_MODEL.model_id
@@ -1156,13 +1159,131 @@ def test_nano_vllm_refuses_to_drop_a_revision_pin_it_cannot_honour(
     monkeypatch.setattr(identity_diarization, "select_torch_device", lambda _device: "cuda")
 
     with pytest.raises(ValueError, match="ModelScope"):
-        identity_diarization.FunASRNanoVLLMPipeline.load(device="cuda", hub="hf", revision="v1")
+        identity_diarization.FunASRNanoVLLMPipeline.load(
+            device="cuda",
+            hub="hf",
+            recipe=FunASRRecipe(
+                model_id=identity_diarization.FUNASR_NANO_MODEL_ID,
+                revision="v1",
+                vllm_servable=True,
+            ),
+        )
+
+
+def test_nano_vllm_composes_the_recipe_rather_than_its_own_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """This engine is chosen by the environment -- CUDA plus an importable vLLM -- so any
+    composition it does not read is a composition that applies on one host and not another.
+    The VAD ceiling is the sharp one: left off, FSMN-VAD applies its own 60000ms default, so
+    the recipe's 30s turn ceiling silently doubles on exactly the hosts that have a GPU.
+    """
+    auto_models: list[dict[str, object]] = []
+    _stub_engines(monkeypatch, auto_models=auto_models)
+    monkeypatch.setattr(identity_diarization, "select_torch_device", lambda _device: "cuda")
+
+    identity_diarization.FunASRNanoVLLMPipeline.load(device="cuda")
+
+    shipped = FUNASR_RECIPES["fun-asr-nano"]
+    vad, speaker = auto_models
+    assert vad["model"] == shipped.vad_model
+    assert vad["max_single_segment_time"] == shipped.vad_max_single_segment_ms == 30_000
+    assert speaker["model"] == shipped.speaker_model
+
+    # Declared models that are deliberately not the registry's, so forwarding them is
+    # observable rather than the loader's old defaults happening to agree with the recipe.
+    auto_models.clear()
+    identity_diarization.FunASRNanoVLLMPipeline.load(
+        device="cuda",
+        recipe=FunASRRecipe(
+            model_id="/opt/funasr/nano-local",
+            vad_model="/opt/funasr/vad-local",
+            speaker_model="/opt/funasr/speaker-local",
+            vad_max_single_segment_ms=12_000,
+            vllm_servable=True,
+        ),
+    )
+    vad, speaker = auto_models
+    assert vad["model"] == "/opt/funasr/vad-local"
+    assert vad["max_single_segment_time"] == 12_000
+    assert speaker["model"] == "/opt/funasr/speaker-local"
+
+    # An unset ceiling means upstream's, and is left off rather than passed as None -- which
+    # FSMN-VAD would then compare frame counts against.
+    auto_models.clear()
+    identity_diarization.FunASRNanoVLLMPipeline.load(
+        device="cuda",
+        recipe=FunASRRecipe(model_id="/opt/funasr/nano-local", vllm_servable=True),
+    )
+    assert "max_single_segment_time" not in auto_models[0]
+
+    # And loading the engine directly is refused for a recipe it cannot serve, the same way
+    # the selector refuses it -- one guard, not one per entry point.
+    with pytest.raises(ValueError, match="cannot run"):
+        identity_diarization.FunASRNanoVLLMPipeline.load(device="cuda", recipe="sensevoice")
+
+
+def test_funasr_keeps_the_clip_when_one_vad_span_held_no_speech() -> None:
+    """Every recipe without a punctuation model degrades to upstream's `vad_segment` mode,
+    which emits one entry per VAD span carrying the model's raw text under `sentence` and
+    applies no empty-text filter of its own. Treating that `""` as a malformed result threw
+    away every other sentence in the segment -- and only on the backends that have no
+    punctuation model, so the same clip transcribed on CUDA and raised on CPU.
+    """
+    segments = identity_diarization._funasr_segments(
+        [
+            {"start": 0, "end": 1_000, "sentence": "First.", "spk": 0},
+            {"start": 1_000, "end": 2_000, "sentence": "", "spk": 0},
+            {"start": 2_000, "end": 3_000, "sentence": "   ", "spk": 1},
+            {"start": 3_000, "end": 4_000, "text": "<|zh|><|NEUTRAL|><|Speech|>", "spk": 1},
+            {"start": 4_000, "end": 5_000, "sentence": "Second.", "spk": 1},
+        ],
+        confidence=0.8,
+    )
+
+    assert [segment.transcript for segment in segments] == ["First.", "Second."]
+
+
+def test_no_shipped_recipe_runs_downloaded_code() -> None:
+    """Under `trust_remote_code` upstream pip-installs a downloaded requirements.txt into the
+    live venv and imports downloaded `model.py`, resolved against "master" when no revision is
+    pinned -- so an upstream edit changes what executes on every device. No shipped model
+    needs it: funasr registers each of these architectures natively, Fun-ASR-Nano included
+    (`@tables.register("model_classes", "FunASRNano")`, present at 1.3.19, this project's
+    declared floor), and that checkpoint's own config.yaml names exactly that class. The field
+    stays on the recipe for an operator whose fork genuinely needs it.
+    """
+    for name, recipe in FUNASR_RECIPES.items():
+        assert recipe.trust_remote_code is False, name
+        assert "trust_remote_code" not in recipe.auto_model_arguments(), name
+
+
+async def test_funasr_streaming_strips_model_special_tokens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The streaming checkpoint is a parameter now, so it can be one that tags its output the
+    way SenseVoice does. Left in, a live caption reads the tags out as if someone said them.
+    """
+
+    class Pipeline:
+        def generate(self, **_kwargs: object) -> list[dict[str, object]]:
+            return [{"text": "<|zh|><|NEUTRAL|><|Speech|> hello"}]
+
+    monkeypatch.setattr(identity_diarization, "_pcm16_float32", lambda _pcm16: object())
+    transcriber = FunASRStreamingTranscriber(Pipeline(), device="cuda")
+
+    result = await transcriber.push_pcm16(bytes(19_200), is_final=True)
+
+    # Tags go, whitespace stays: these are deltas that get concatenated, so the leading space
+    # is word spacing and a `.strip()` here would silently join two words.
+    assert result.text == " hello"
 
 
 def _stub_engines(
     monkeypatch: pytest.MonkeyPatch,
     *,
     loaded: dict[str, object] | None = None,
+    auto_models: list[dict[str, object]] | None = None,
 ) -> None:
     """Let the selector build either backend without any real weights."""
 
@@ -1178,8 +1299,14 @@ def _stub_engines(
         (),
         {"from_pretrained": staticmethod(from_pretrained)},
     )
+
+    def auto_model(**kwargs: object) -> _StubFunASRPipeline:
+        if auto_models is not None:
+            auto_models.append(kwargs)
+        return _StubFunASRPipeline([])
+
     funasr = ModuleType("funasr")
-    funasr.AutoModel = lambda **_kwargs: _StubFunASRPipeline([])  # type: ignore[attr-defined]
+    funasr.AutoModel = auto_model  # type: ignore[attr-defined]
     for name, module in (
         ("funasr", funasr),
         ("funasr.models", ModuleType("funasr.models")),
