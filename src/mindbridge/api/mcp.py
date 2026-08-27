@@ -43,6 +43,7 @@ from mindbridge.types import (
     Blob,
     ContentInput,
     MemoryRecord,
+    MemoryType,
     Modality,
     SearchHit,
 )
@@ -75,6 +76,12 @@ _Filename = Annotated[
 ]
 _Source = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=8_192)]
 _READ_ONLY = ToolAnnotations(read_only_hint=True, open_world_hint=False)
+_RETRIEVAL = ToolAnnotations(
+    read_only_hint=False,
+    destructive_hint=False,
+    idempotent_hint=False,
+    open_world_hint=False,
+)
 _IDEMPOTENT_WRITE = ToolAnnotations(
     read_only_hint=False,
     destructive_hint=False,
@@ -88,9 +95,9 @@ _DELETE = ToolAnnotations(
     open_world_hint=False,
 )
 _TOOL_ARGUMENTS = {
-    "add_memory": frozenset({"content", "occurred_at", "metadata"}),
-    "search_memories": frozenset({"query", "limit"}),
-    "ask_memory": frozenset({"question", "limit"}),
+    "add_memory": frozenset({"content", "occurred_at", "metadata", "memory_type"}),
+    "search_memories": frozenset({"query", "limit", "memory_type", "reference_at"}),
+    "ask_memory": frozenset({"question", "limit", "memory_type", "reference_at"}),
     "get_memory": frozenset({"memory_id"}),
     "delete_memory": frozenset({"memory_id"}),
 }
@@ -189,6 +196,7 @@ class MemoryResult(BaseModel):
     id: str
     content: str
     modality: Modality
+    memory_type: MemoryType
     assets: tuple[AssetResult, ...]
     created_at: AwareDatetime
     occurred_at: AwareDatetime | None
@@ -228,6 +236,7 @@ def build_mcp_server(memory: Memory | AsyncMemory) -> MCPServer[None]:
         content: _Content,
         occurred_at: AwareDatetime | None = None,
         metadata: dict[str, JsonValue] | None = None,
+        memory_type: MemoryType = MemoryType.SEMANTIC,
     ) -> MemoryResult:
         """Store one memory and return its stable record."""
         record = cast(
@@ -238,27 +247,52 @@ def build_mcp_server(memory: Memory | AsyncMemory) -> MCPServer[None]:
                 _content_input(content),
                 occurred_at=occurred_at,
                 metadata=metadata,
+                memory_type=memory_type,
             ),
         )
         return _memory_result(record)
 
-    @server.tool(annotations=_READ_ONLY)
+    @server.tool(annotations=_RETRIEVAL)
     @_stable_errors
-    async def search_memories(query: _Content, limit: _Limit = 10) -> SearchResult:
+    async def search_memories(
+        query: _Content,
+        limit: _Limit = 10,
+        memory_type: MemoryType | None = None,
+        reference_at: AwareDatetime | None = None,
+    ) -> SearchResult:
         """Find the most relevant local memories."""
         hits = cast(
             tuple[SearchHit, ...],
-            await _invoke(memory, "search", _content_input(query), limit=limit),
+            await _invoke(
+                memory,
+                "search",
+                _content_input(query),
+                limit=limit,
+                memory_type=memory_type,
+                reference_at=reference_at,
+            ),
         )
         return SearchResult(hits=tuple(_search_hit_result(hit) for hit in hits))
 
-    @server.tool(annotations=_READ_ONLY)
+    @server.tool(annotations=_RETRIEVAL)
     @_stable_errors
-    async def ask_memory(question: _Content, limit: _Limit = 5) -> AnswerResponse:
+    async def ask_memory(
+        question: _Content,
+        limit: _Limit = 5,
+        memory_type: MemoryType | None = None,
+        reference_at: AwareDatetime | None = None,
+    ) -> AnswerResponse:
         """Answer only from retrieved local memories."""
         result = cast(
             AnswerResult,
-            await _invoke(memory, "ask", _content_input(question), limit=limit),
+            await _invoke(
+                memory,
+                "ask",
+                _content_input(question),
+                limit=limit,
+                memory_type=memory_type,
+                reference_at=reference_at,
+            ),
         )
         return AnswerResponse(
             answer=result.answer,
@@ -346,6 +380,7 @@ def _memory_result(record: MemoryRecord) -> MemoryResult:
         id=record.id,
         content=record.content,
         modality=record.modality,
+        memory_type=record.memory_type,
         assets=tuple(_asset_result(asset) for asset in record.assets),
         created_at=record.created_at,
         occurred_at=record.occurred_at,
@@ -358,6 +393,7 @@ def _search_hit_result(hit: SearchHit) -> SearchHitResult:
         id=hit.id,
         content=hit.content,
         modality=hit.modality,
+        memory_type=hit.memory_type,
         assets=tuple(_asset_result(asset) for asset in hit.assets),
         score=hit.score,
         created_at=hit.created_at,

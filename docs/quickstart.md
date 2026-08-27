@@ -163,9 +163,10 @@ Routing follows declared capabilities, never a model-name heuristic:
 - If no valid route exists, MindBridge raises `ModelError` instead of ignoring content.
 
 One memory currently produces one aggregate embedding. There is no automatic chunking, separate
-vector per asset, or reranker. With the built-in `data` transport, one embedding or generation call
-may contain at most 64 MiB of aggregate raw media before base64 expansion. Use trusted co-located
-`file` transport or a streaming custom backend for larger video.
+vector per asset, or learned reranker. Temporal and decay ranking are deterministic. With the
+built-in `data` transport, one embedding or generation call may contain at most 64 MiB of aggregate
+raw media before base64 expansion. Use trusted co-located `file` transport or a streaming custom
+backend for larger video.
 
 `transcription_space` is also part of the directory's durable compatibility identity. Keep it
 stable for one ASR model and transcript-affecting preprocessing recipe. To change that recipe,
@@ -213,22 +214,39 @@ normalization, retrieval-side methods, and input recipe. Changing any component 
 `data_dir` and re-encoding the source content. `reindex()` is intentionally not a model migration:
 it rebuilds Zvec from the vectors already stored in SQLite.
 
-## Add event time and metadata
+## Add a memory role, event time, and metadata
 
-`occurred_at` is optional and must include a timezone:
+`MemoryType.SEMANTIC` is the default. Use episodic for situated experiences and procedural for
+reusable instructions. `occurred_at` is optional and must include a timezone:
 
 ```python
 from datetime import datetime, timezone
 
+from mindbridge import MemoryType
+
 record = memory.add(
     "The deployment completed.",
+    memory_type=MemoryType.EPISODIC,
     occurred_at=datetime(2026, 8, 27, 9, 30, tzinfo=timezone.utc),
     metadata={"source": "release-log"},
 )
 ```
 
-Identity covers normalized text, ordered asset content, event time, and canonical metadata.
-Adding the same logical record returns the existing record without another model call.
+Identity covers normalized text, ordered asset content, memory role, event time, and canonical
+metadata. Adding the same logical record returns the existing record without another model call.
+
+Resolve relative dates against an explicit clock when a reproducible answer matters:
+
+```python
+hits = memory.search(
+    "What happened last week?",
+    memory_type=MemoryType.EPISODIC,
+    reference_at=datetime(2026, 8, 27, 12, tzinfo=timezone.utc),
+)
+```
+
+See [memory types, temporal reasoning, and decay](memory-types-time-and-decay.md) for recognized
+expressions, optional decay, and exact limits.
 
 ## Add a batch
 
@@ -239,7 +257,8 @@ records = memory.add_many(
     [
         "The staging region is eu-west-1.",
         ["Production dashboard", Path("./production.png")],
-    ]
+    ],
+    memory_type=MemoryType.PROCEDURAL,
 )
 ```
 

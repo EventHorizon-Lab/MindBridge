@@ -7,6 +7,8 @@ MindBridge is an embedded multimodal memory library for text, image, video, audi
 
 - [Quick start](quickstart.md) — install, add text and media, retrieve, and upgrade.
 - [Core concepts](concepts.md) — content, assets, identity, isolation, models, and indexing.
+- [Memory types, time, and decay](memory-types-time-and-decay.md) — cognitive roles, temporal
+  retrieval, decay, research basis, and limits.
 - [Configuration](configuration.md) — endpoints, capabilities, durable model spaces, and media policy.
 
 ## APIs

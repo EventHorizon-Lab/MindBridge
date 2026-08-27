@@ -20,9 +20,10 @@ from mindbridge.infrastructure.local._lock import DataDirectoryLock
 from mindbridge.models.base import SpeechAnalysis
 from mindbridge.types import SpeakerSegment
 
-_SCHEMA_VERSION = 4
+_SCHEMA_VERSION = 5
 _SQLITE_PARAMETER_BATCH = 900
 _MEMORY_MODALITIES = frozenset({"text", "image", "video", "audio", "omni"})
+_MEMORY_TYPES = frozenset({"semantic", "episodic", "procedural"})
 _ASSET_MODALITIES = frozenset({"image", "video", "audio"})
 _SHA256_HEX_LENGTH = 64
 _MEDIA_TYPE = re.compile(r"[!#$&^_.+0-9A-Za-z-]+/[!#$&^_.+0-9A-Za-z-]+\Z")
@@ -133,15 +134,19 @@ CREATE TABLE speech_segments (
 CREATE INDEX speech_segments_speaker_idx ON speech_segments (speaker_id);
 """
 
-_SCHEMA_V4 = f"""
+_SCHEMA_V5 = f"""
 BEGIN IMMEDIATE;
 
 CREATE TABLE memory_records (
     memory_id TEXT PRIMARY KEY,
     content TEXT NOT NULL,
     modality TEXT NOT NULL CHECK (modality IN ('text', 'image', 'video', 'audio', 'omni')),
+    memory_type TEXT NOT NULL DEFAULT 'semantic'
+        CHECK (memory_type IN ('semantic', 'episodic', 'procedural')),
     metadata_json TEXT NOT NULL,
     occurred_at TEXT,
+    last_accessed_at TEXT,
+    access_count INTEGER NOT NULL DEFAULT 0 CHECK (access_count BETWEEN 0 AND 20),
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL CHECK (updated_at >= created_at)
 );
@@ -186,7 +191,7 @@ CREATE INDEX search_index_queue_order_idx
 
 {_INDEX_TRIGGERS}
 
-PRAGMA user_version = 4;
+PRAGMA user_version = 5;
 COMMIT;
 """
 
@@ -329,11 +334,16 @@ class StoredMemory:
     updated_at: datetime
     occurred_at: datetime | None = None
     modality: str = "text"
+    memory_type: str = "semantic"
     assets: tuple[StoredAsset, ...] = ()
+    last_accessed_at: datetime | None = None
+    access_count: int = 0
 
     def __post_init__(self) -> None:
         _require_identifier(self.memory_id, "memory_id")
         object.__setattr__(self, "modality", _modality(self.modality, asset=False))
+        if self.memory_type not in _MEMORY_TYPES:
+            raise ValueError("memory_type must be semantic, episodic, or procedural")
         if not isinstance(self.assets, tuple) or not all(
             isinstance(asset, StoredAsset) for asset in self.assets
         ):
@@ -352,6 +362,9 @@ class StoredMemory:
         _require_aware(self.updated_at, "updated_at")
         if self.occurred_at is not None:
             _require_aware(self.occurred_at, "occurred_at")
+        if self.last_accessed_at is not None:
+            _require_aware(self.last_accessed_at, "last_accessed_at")
+        _access_count(self.access_count)
         if self.updated_at < self.created_at:
             raise ValueError("updated_at must not precede created_at")
 
@@ -406,6 +419,14 @@ class IndexDocument:
     embedding: StoredEmbedding
     content: str
     metadata_json: str
+    memory_type: str = "semantic"
+    occurred_at: datetime | None = None
+
+    def __post_init__(self) -> None:
+        if self.memory_type not in _MEMORY_TYPES:
+            raise ValueError("memory_type must be semantic, episodic, or procedural")
+        if self.occurred_at is not None:
+            _require_aware(self.occurred_at, "occurred_at")
 
 
 class LocalStore:
@@ -484,8 +505,8 @@ class LocalStore:
         with self._read_transaction() as connection:
             row = connection.execute(
                 """
-                SELECT memory_id, content, modality, metadata_json,
-                       occurred_at, created_at, updated_at
+                SELECT memory_id, content, modality, memory_type, metadata_json,
+                       occurred_at, last_accessed_at, access_count, created_at, updated_at
                 FROM memory_records
                 WHERE memory_id = ?
                 """,
@@ -510,8 +531,8 @@ class LocalStore:
                 rows.extend(
                     connection.execute(
                         f"""
-                        SELECT memory_id, content, modality, metadata_json,
-                               occurred_at, created_at, updated_at
+                        SELECT memory_id, content, modality, memory_type, metadata_json,
+                               occurred_at, last_accessed_at, access_count, created_at, updated_at
                         FROM memory_records
                         WHERE memory_id IN ({placeholders})
                         """,
@@ -553,8 +574,8 @@ class LocalStore:
         with self._read_transaction() as connection:
             rows = connection.execute(
                 f"""
-                SELECT memory_id, content, modality, metadata_json,
-                       occurred_at, created_at, updated_at
+                SELECT memory_id, content, modality, memory_type, metadata_json,
+                       occurred_at, last_accessed_at, access_count, created_at, updated_at
                 FROM memory_records
                 {where}
                 ORDER BY created_at DESC, memory_id DESC
@@ -571,6 +592,35 @@ class LocalStore:
             )
             for row in rows
         )
+
+    def reinforce_memories(self, memory_ids: Sequence[str], *, accessed_at: datetime) -> int:
+        """Record one bounded retrieval reinforcement for each existing memory."""
+        unique_ids = tuple(dict.fromkeys(memory_ids))
+        if not unique_ids:
+            return 0
+        for memory_id in unique_ids:
+            _require_identifier(memory_id, "memory_id")
+        _require_aware(accessed_at, "accessed_at")
+        accessed_text = _datetime_text(accessed_at)
+        changed = 0
+        with self._transaction() as connection:
+            for offset in range(0, len(unique_ids), _SQLITE_PARAMETER_BATCH):
+                batch = unique_ids[offset : offset + _SQLITE_PARAMETER_BATCH]
+                placeholders = ", ".join("?" for _memory_id in batch)
+                cursor = connection.execute(
+                    f"""
+                    UPDATE memory_records
+                    SET access_count = MIN(access_count + 1, 20),
+                        last_accessed_at = CASE
+                            WHEN last_accessed_at IS NULL OR last_accessed_at < ? THEN ?
+                            ELSE last_accessed_at
+                        END
+                    WHERE memory_id IN ({placeholders})
+                    """,
+                    (accessed_text, accessed_text, *batch),
+                )
+                changed += cursor.rowcount
+        return changed
 
     def delete_memory(self, memory_id: str) -> bool:
         """Delete a memory; cascading embedding triggers enqueue index deletions."""
@@ -907,7 +957,7 @@ class LocalStore:
                         f"""
                         SELECT e.embedding_id, e.memory_id, e.object_part, e.model_id, e.space_id,
                                e.task, e.dimension, e.normalized, e.vector, e.created_at,
-                               m.content, m.metadata_json
+                               m.content, m.metadata_json, m.memory_type, m.occurred_at
                         FROM embeddings AS e
                         JOIN memory_records AS m ON m.memory_id = e.memory_id
                         WHERE e.embedding_id IN ({placeholders})
@@ -921,6 +971,8 @@ class LocalStore:
                 embedding=_embedding_from_row(row),
                 content=_row_text(row, "content"),
                 metadata_json=_row_text(row, "metadata_json"),
+                memory_type=_row_text(row, "memory_type"),
+                occurred_at=_optional_datetime_from_row(row, "occurred_at"),
             )
             by_id[document.embedding.embedding_id] = document
         return tuple(by_id[embedding_id] for embedding_id in embedding_ids if embedding_id in by_id)
@@ -1036,6 +1088,9 @@ class LocalStore:
             if version == 3:
                 _migrate_v3(connection)
             version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+            if version == 4:
+                _migrate_v4(connection)
+            version = int(connection.execute("PRAGMA user_version").fetchone()[0])
             tables = _table_names(connection)
             if version != _SCHEMA_VERSION:
                 raise UnsupportedSchemaError(
@@ -1128,7 +1183,7 @@ class LocalStore:
     ) -> bool:
         existing = connection.execute(
             """
-            SELECT content, modality, metadata_json
+            SELECT content, modality, memory_type, metadata_json, occurred_at
             FROM memory_records
             WHERE memory_id = ?
             """,
@@ -1150,18 +1205,21 @@ class LocalStore:
         index_content_changed = existing is not None and (
             _row_text(existing, "content") != memory.content
             or _row_text(existing, "modality") != memory.modality
+            or _row_text(existing, "memory_type") != memory.memory_type
             or _row_text(existing, "metadata_json") != memory.metadata_json
+            or existing["occurred_at"] != _optional_datetime_text(memory.occurred_at)
             or existing_asset_ids != supplied_asset_ids
         )
         connection.execute(
             """
             INSERT INTO memory_records (
-                memory_id, content, modality, metadata_json,
-                occurred_at, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                memory_id, content, modality, memory_type, metadata_json,
+                occurred_at, last_accessed_at, access_count, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT (memory_id) DO UPDATE SET
                 content = excluded.content,
                 modality = excluded.modality,
+                memory_type = excluded.memory_type,
                 metadata_json = excluded.metadata_json,
                 occurred_at = excluded.occurred_at,
                 updated_at = excluded.updated_at
@@ -1170,8 +1228,11 @@ class LocalStore:
                 memory.memory_id,
                 memory.content,
                 memory.modality,
+                memory.memory_type,
                 memory.metadata_json,
                 _optional_datetime_text(memory.occurred_at),
+                _optional_datetime_text(memory.last_accessed_at),
+                memory.access_count,
                 _datetime_text(memory.created_at),
                 _datetime_text(memory.updated_at),
             ),
@@ -1510,7 +1571,7 @@ def _create_schema(
     if existing_tables:
         raise UnsupportedSchemaError("local data directory contains an unversioned SQLite schema")
     try:
-        connection.executescript(_SCHEMA_V4)
+        connection.executescript(_SCHEMA_V5)
     except BaseException:
         if connection.in_transaction:
             connection.rollback()
@@ -1556,6 +1617,36 @@ def _migrate_v3(connection: sqlite3.Connection) -> None:
         raise
 
 
+def _migrate_v4(connection: sqlite3.Connection) -> None:
+    try:
+        columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(memory_records)")}
+        connection.execute("BEGIN IMMEDIATE")
+        if "memory_type" not in columns:
+            connection.execute(
+                """
+                ALTER TABLE memory_records
+                ADD COLUMN memory_type TEXT NOT NULL DEFAULT 'semantic'
+                    CHECK (memory_type IN ('semantic', 'episodic', 'procedural'))
+                """
+            )
+        if "last_accessed_at" not in columns:
+            connection.execute("ALTER TABLE memory_records ADD COLUMN last_accessed_at TEXT")
+        if "access_count" not in columns:
+            connection.execute(
+                """
+                ALTER TABLE memory_records
+                ADD COLUMN access_count INTEGER NOT NULL DEFAULT 0
+                    CHECK (access_count BETWEEN 0 AND 20)
+                """
+            )
+        connection.execute("PRAGMA user_version = 5")
+        connection.commit()
+    except BaseException:
+        if connection.in_transaction:
+            connection.rollback()
+        raise
+
+
 def _memory_from_row(
     row: sqlite3.Row,
     *,
@@ -1565,12 +1656,21 @@ def _memory_from_row(
         memory_id=_row_text(row, "memory_id"),
         content=_row_text(row, "content"),
         modality=_row_text(row, "modality"),
+        memory_type=_row_text(row, "memory_type"),
         assets=assets,
         metadata_json=_row_text(row, "metadata_json"),
         occurred_at=_optional_datetime_from_row(row, "occurred_at"),
+        last_accessed_at=_optional_datetime_from_row(row, "last_accessed_at"),
+        access_count=int(row["access_count"]),
         created_at=_parse_datetime(_row_text(row, "created_at")),
         updated_at=_parse_datetime(_row_text(row, "updated_at")),
     )
+
+
+def _access_count(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 20:
+        raise ValueError("access_count must be between zero and twenty")
+    return value
 
 
 def _asset_from_row(row: sqlite3.Row) -> StoredAsset:

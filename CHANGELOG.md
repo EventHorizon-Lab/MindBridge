@@ -21,6 +21,12 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   allowlists, per-hop public-IP connection pinning, exact/family MIME validation, and
   reference-counted cleanup.
 - Zvec 0.7 dense cosine HNSW, full-text search, and reciprocal-rank hybrid retrieval.
+- First-class semantic, episodic, and procedural memory roles across Python, REST, MCP, SQLite,
+  Zvec filtering, grounded evidence, and stable return values.
+- Event-time temporal retrieval with explicit reference clocks, deterministic English/Chinese
+  calendar expressions, bounded fallback retrieval, and query-time reranking.
+- Opt-in non-destructive memory decay with bounded SQLite access reinforcement and no background
+  worker or new dependency.
 - Crash-recoverable index replay and rebuild from SQLite without re-embedding stored content.
 - A resource-oriented REST API under `/v1`, five typed MCP stdio tools, and small lifecycle CLIs.
 - One ordered multimodal contract across Python, REST, and MCP; response assets expose stable
@@ -35,7 +41,8 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   across recordings.
 - Named local speaker registration and optional batched vLLM decoding without dropping FSMN-VAD,
   CAM++ diarization, or stable identity matching.
-- Local SQLite schema v4 adds optional speaker names; existing schema versions migrate in place.
+- Local SQLite schema v5 adds memory roles and bounded retrieval access state; existing schema
+  versions migrate in place. Older Zvec recipes rebuild automatically from SQLite embeddings.
 - Physical benchmark isolation plus local-index and LoCoMo-Refined runners.
 - `mindbridge eval` with pinned adapters for twelve long-memory benchmark families, adaptive
   batching, resumable automatic media acquisition and video preparation, causal manifests,
@@ -63,8 +70,8 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 - The first authoritative non-empty name for a CAS digest is reused when identical bytes later
   arrive under a different filename.
 - Server deployments use exactly one process worker per directory.
-- The supported product slice is aggregate text and media memory. Each memory currently owns one
-  embedding; metadata is payload, not filtering or authorization.
+- The supported product slice is typed aggregate text and media memory. Each memory currently owns
+  one embedding; metadata and memory role are payload/retrieval controls, not authorization.
 
 ### Removed
 
@@ -91,7 +98,8 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 
 - No chat-message arrays, large-file wire upload endpoint, update route, metadata filter,
   distributed writer, or runtime plugin registry.
-- No automatic chunking, multiple embeddings per memory, per-asset retrieval, or reranking stage.
+- No automatic role extraction, episode consolidation, procedure execution, chunking, multiple
+  embeddings per memory, per-asset retrieval, or learned reranking stage.
 - No in-place re-embedding or retranscription when a persisted embedding/transcription space or
   dimension changes; create a new directory and re-encode source content instead.
 - Built-in `data` transport accepts at most 64 MiB of aggregate raw media per embedding or

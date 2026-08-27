@@ -9,11 +9,13 @@ import hashlib
 import json
 import math
 import os
+import re
+import shutil
 import unicodedata
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from threading import Condition, RLock
 from typing import Protocol, cast
@@ -66,6 +68,7 @@ from mindbridge.types import (
     ContentAtom,
     ContentInput,
     MemoryRecord,
+    MemoryType,
     Modality,
     Page,
     SearchHit,
@@ -73,9 +76,19 @@ from mindbridge.types import (
 )
 
 _DOCUMENT_TASK = EmbedTask.DOCUMENT.value
-_INDEX_RECIPE = "zvec-0.7:hnsw-cosine-m50-efc500:fts-standard-lowercase:single-vector-v2"
+_INDEX_RECIPE = (
+    "zvec-0.7:hnsw-cosine-m50-efc500:fts-standard-lowercase:type-time-filters:single-vector-v3"
+)
+_LEGACY_INDEX_RECIPES = frozenset(
+    {"zvec-0.7:hnsw-cosine-m50-efc500:fts-standard-lowercase:single-vector-v2"}
+)
 _OUTBOX_BATCH_SIZE = 256
 _REINDEX_PAGE_SIZE = 256
+_RERANK_CANDIDATES = 50
+_RANK_FLOOR = 0.3
+_RANK_CEILING = 1.5
+_DECAY_REINFORCEMENT_LIMIT = 20
+_ISO_DATE = re.compile(r"(?<!\d)(\d{4}-\d{2}-\d{2})(?!\d)")
 _MAX_CONTENT_PARTS = 128
 _MAX_TEXT_CHARACTERS = 65_536
 _MAX_METADATA_BYTES = 262_144
@@ -132,6 +145,9 @@ class _Index(Protocol):
         limit: int = 10,
         space_id: str | None = None,
         task: str | None = None,
+        memory_type: str | None = None,
+        occurred_from: datetime | None = None,
+        occurred_until: datetime | None = None,
         ef: int | None = None,
         exact: bool = False,
     ) -> tuple[IndexHit, ...]: ...
@@ -145,6 +161,9 @@ class _Index(Protocol):
         candidate_limit: int | None = None,
         space_id: str | None = None,
         task: str | None = None,
+        memory_type: str | None = None,
+        occurred_from: datetime | None = None,
+        occurred_until: datetime | None = None,
         ef: int | None = None,
         exact: bool = False,
     ) -> tuple[IndexHit, ...]: ...
@@ -182,6 +201,7 @@ class _PreparedMemory:
     content: _PreparedContent
     metadata_json: str
     occurred_at: datetime | None
+    memory_type: MemoryType
 
 
 @dataclass(slots=True)
@@ -221,6 +241,7 @@ class Memory:
         self._pending_asset_cleanup: dict[str, StoredAsset] = {}
         self._speaker_similarity = _unit_interval(speaker_similarity, "speaker_similarity")
         self._speaker_margin = _unit_interval(speaker_margin, "speaker_margin")
+        self._decay_half_life = _decay_half_life(self.config.decay_half_life_days)
 
         self._store = _open_store(self.data_dir)
         try:
@@ -279,8 +300,8 @@ class Memory:
             self._collect_orphan_assets(scan_physical=True)
             index_path = self.data_dir / "zvec"
             index_missing = not index_path.exists()
-            self._ensure_store_metadata()
-            if index_missing:
+            index_rebuild = self._ensure_store_metadata(index_path)
+            if index_missing or index_rebuild:
                 with _translate_storage_errors("checkpoint a missing search index"):
                     self._store.queue_all_embeddings()
         except BaseException:
@@ -318,6 +339,7 @@ class Memory:
         *,
         occurred_at: datetime | None = None,
         metadata: Mapping[str, object] | None = None,
+        memory_type: MemoryType = MemoryType.SEMANTIC,
     ) -> MemoryRecord:
         """Add one native or mixed-modal memory and return its stable record."""
         with self._operation() as assets:
@@ -325,12 +347,19 @@ class Memory:
                 self._prepare_content(content, assets),
                 occurred_at=occurred_at,
                 metadata=metadata,
+                memory_type=memory_type,
             )
             return self._add_prepared((prepared,), operation=assets)[0]
 
-    def add_many(self, contents: Sequence[ContentInput]) -> tuple[MemoryRecord, ...]:
+    def add_many(
+        self,
+        contents: Sequence[ContentInput],
+        *,
+        memory_type: MemoryType = MemoryType.SEMANTIC,
+    ) -> tuple[MemoryRecord, ...]:
         """Add memories in one model batch and one SQLite transaction."""
         with self._operation() as assets:
+            normalized_memory_type = _memory_type(memory_type)
             if isinstance(contents, (str, bytes, Path, URL, Blob, AssetRef)):
                 raise ValidationError("contents must be a sequence of memory inputs")
             prepared = tuple(
@@ -338,6 +367,7 @@ class Memory:
                     self._prepare_content(content, assets),
                     occurred_at=None,
                     metadata=None,
+                    memory_type=normalized_memory_type,
                 )
                 for content in contents
             )
@@ -345,30 +375,60 @@ class Memory:
                 return ()
             return self._add_prepared(prepared, operation=assets)
 
-    def search(self, query: ContentInput, *, limit: int = 10) -> tuple[SearchHit, ...]:
+    def search(
+        self,
+        query: ContentInput,
+        *,
+        limit: int = 10,
+        memory_type: MemoryType | None = None,
+        reference_at: datetime | None = None,
+    ) -> tuple[SearchHit, ...]:
         """Return ranked memories for a native or mixed-modal query."""
         with self._operation() as assets:
             _limit(limit, maximum=100)
             prepared = self._prepare_content(query, assets)
+            reference = _reference_at(reference_at) or datetime.now(timezone.utc)
             hits = self._search_prepared(
                 prepared,
                 limit=limit,
                 operation=assets,
+                memory_type=_optional_memory_type(memory_type),
+                reference_at=reference,
+                temporal_range=_temporal_range(prepared.text, reference),
             )
             self._persist_transcripts(assets)
             return hits
 
-    def ask(self, question: ContentInput, *, limit: int = 5) -> AnswerResult:
+    def ask(
+        self,
+        question: ContentInput,
+        *,
+        limit: int = 5,
+        memory_type: MemoryType | None = None,
+        reference_at: datetime | None = None,
+    ) -> AnswerResult:
         """Answer a native or mixed-modal question only from retrieved memories."""
         with self._operation() as assets:
             _limit(limit, maximum=100)
             prepared = self._prepare_content(question, assets)
+            reference = _reference_at(reference_at) or datetime.now(timezone.utc)
+            temporal_range = _temporal_range(prepared.text, reference)
             hits = self._search_prepared(
                 prepared,
                 limit=limit,
                 operation=assets,
+                memory_type=_optional_memory_type(memory_type),
+                reference_at=reference,
+                temporal_range=temporal_range,
             )
-            routed_question = self._route_generation(prepared, assets)
+            routed_question = self._route_generation(
+                (
+                    _with_reference_time(prepared, reference)
+                    if reference_at is not None or temporal_range is not None
+                    else prepared
+                ),
+                assets,
+            )
             routed_hits = self._route_generation_hits(hits, assets) if hits else ()
             self._persist_transcripts(assets)
             result = self._answer(routed_question, routed_hits)
@@ -677,6 +737,7 @@ class Memory:
                     memory_id=memory.memory_id,
                     content=memory.content.text,
                     modality=memory.content.modality.value,
+                    memory_type=memory.memory_type.value,
                     assets=memory.content.assets,
                     metadata_json=memory.metadata_json,
                     occurred_at=memory.occurred_at,
@@ -744,41 +805,108 @@ class Memory:
         *,
         limit: int,
         operation: _OperationAssets,
+        memory_type: MemoryType | None,
+        reference_at: datetime,
+        temporal_range: tuple[datetime, datetime] | None,
     ) -> tuple[SearchHit, ...]:
         prepared = self._embedding_content(prepared, operation)
         model_input = self._route_embedding(prepared)
         vector = self._embed((model_input,), task=EmbedTask.QUERY)[0]
+        rerank = temporal_range is not None or self._decay_half_life is not None
+        candidate_limit = max(_RERANK_CANDIDATES, limit * 3) if rerank else limit
         with self._write_lock:
             self._drain_outbox()
             with _translate_index_errors("search memories"):
-                if model_input.text:
-                    index_hits = self._index.hybrid_search(
-                        model_input.text,
-                        vector,
-                        limit=limit,
-                        space_id=self._space_id,
-                        task=_DOCUMENT_TASK,
-                    )
-                else:
-                    index_hits = self._index.search(
-                        vector,
-                        limit=limit,
-                        space_id=self._space_id,
-                        task=_DOCUMENT_TASK,
+                preferred = self._index_candidates(
+                    model_input,
+                    vector,
+                    limit=candidate_limit,
+                    memory_type=memory_type,
+                    occurred_from=None if temporal_range is None else temporal_range[0],
+                    occurred_until=None if temporal_range is None else temporal_range[1],
+                )
+                index_hits = preferred
+                if temporal_range is not None and len(preferred) < candidate_limit:
+                    index_hits = _merge_index_hits(
+                        preferred,
+                        self._index_candidates(
+                            model_input,
+                            vector,
+                            limit=candidate_limit,
+                            memory_type=memory_type,
+                        ),
                     )
             if not index_hits:
                 return ()
             with _translate_storage_errors("hydrate search results"):
                 memories = self._store.read_memories(tuple(hit.id for hit in index_hits))
+            if memory_type is not None:
+                memories = tuple(
+                    memory for memory in memories if memory.memory_type == memory_type.value
+                )
+            relevance = {hit.id: hit.relevance for hit in index_hits}
+            ranked = [
+                (
+                    memory,
+                    _ranked_relevance(
+                        memory,
+                        relevance[memory.memory_id],
+                        reference_at=reference_at,
+                        temporal_range=temporal_range,
+                        decay_half_life=self._decay_half_life,
+                    ),
+                    _in_time_range(memory.occurred_at, temporal_range),
+                )
+                for memory in memories
+            ]
+            ranked.sort(key=lambda item: (item[2], item[1]), reverse=True)
+            visible = ranked[:limit]
             self._lease_assets(
-                tuple(asset for memory in memories for asset in memory.assets),
+                tuple(asset for memory, _score, _matched in visible for asset in memory.assets),
                 operation.leased,
             )
             operation.persisted.update(
-                asset.asset_id for memory in memories for asset in memory.assets
+                asset.asset_id for memory, _score, _matched in visible for asset in memory.assets
             )
-        relevance = {hit.id: hit.relevance for hit in index_hits}
-        return tuple(self._search_hit(memory, relevance[memory.memory_id]) for memory in memories)
+            if self._decay_half_life is not None and visible:
+                with _translate_storage_errors("reinforce retrieved memories"):
+                    self._store.reinforce_memories(
+                        tuple(memory.memory_id for memory, _score, _matched in visible),
+                        accessed_at=datetime.now(timezone.utc),
+                    )
+        return tuple(self._search_hit(memory, score) for memory, score, _matched in visible)
+
+    def _index_candidates(
+        self,
+        model_input: ModelInput,
+        vector: Sequence[float],
+        *,
+        limit: int,
+        memory_type: MemoryType | None,
+        occurred_from: datetime | None = None,
+        occurred_until: datetime | None = None,
+    ) -> tuple[IndexHit, ...]:
+        memory_type_value = None if memory_type is None else memory_type.value
+        if model_input.text:
+            return self._index.hybrid_search(
+                model_input.text,
+                vector,
+                limit=limit,
+                space_id=self._space_id,
+                task=_DOCUMENT_TASK,
+                memory_type=memory_type_value,
+                occurred_from=occurred_from,
+                occurred_until=occurred_until,
+            )
+        return self._index.search(
+            vector,
+            limit=limit,
+            space_id=self._space_id,
+            task=_DOCUMENT_TASK,
+            memory_type=memory_type_value,
+            occurred_from=occurred_from,
+            occurred_until=occurred_until,
+        )
 
     def _route_embedding(self, prepared: _PreparedContent) -> ModelInput:
         value = self._resolved_model_input(prepared)
@@ -1041,6 +1169,7 @@ class Memory:
             metadata=_metadata_from_json(memory.metadata_json),
             assets=tuple(self._asset_ref(asset) for asset in memory.assets),
             modality=Modality(memory.modality),
+            memory_type=MemoryType(memory.memory_type),
         )
 
     def _search_hit(self, memory: StoredMemory, relevance: float) -> SearchHit:
@@ -1053,6 +1182,7 @@ class Memory:
             metadata=_metadata_from_json(memory.metadata_json),
             assets=tuple(self._asset_ref(asset) for asset in memory.assets),
             modality=Modality(memory.modality),
+            memory_type=MemoryType(memory.memory_type),
         )
 
     def _asset_ref(self, asset: StoredAsset) -> AssetRef:
@@ -1222,7 +1352,7 @@ class Memory:
             last = memories[-1]
             after = (last.created_at, last.memory_id)
 
-    def _ensure_store_metadata(self) -> None:
+    def _ensure_store_metadata(self, index_path: Path) -> bool:
         expected = {
             _STORE_METADATA_KEYS["model"]: self._embedding_model,
             _STORE_METADATA_KEYS["space"]: self._space_id,
@@ -1230,16 +1360,29 @@ class Memory:
             _STORE_METADATA_KEYS["dimension"]: str(self._embedding_dimension),
             _STORE_METADATA_KEYS["index"]: _INDEX_RECIPE,
         }
+        rebuild_index = False
         with _translate_storage_errors("validate local store metadata"):
             for key, value in expected.items():
                 stored = self._store.get_metadata(key)
                 if stored is None:
-                    self._store.set_metadata(key, value)
-                elif stored != value:
+                    if key == _STORE_METADATA_KEYS["index"] and index_path.exists():
+                        rebuild_index = True
+                    else:
+                        self._store.set_metadata(key, value)
+                elif stored == value:
+                    continue
+                elif key == _STORE_METADATA_KEYS["index"] and stored in _LEGACY_INDEX_RECIPES:
+                    rebuild_index = True
+                else:
                     raise StorageError(
                         f"local store metadata mismatch for {key}: expected {value!r}, "
                         f"found {stored!r}"
                     )
+            if rebuild_index:
+                if index_path.exists():
+                    shutil.rmtree(index_path)
+                self._store.set_metadata(_STORE_METADATA_KEYS["index"], _INDEX_RECIPE)
+        return rebuild_index
 
     def _close_models_and_store(self, *, include_embedder: bool = True) -> None:
         resources: tuple[_Closable, ...] = (self._transcriber, self._models, self._store)
@@ -1353,25 +1496,59 @@ class AsyncMemory:
         *,
         occurred_at: datetime | None = None,
         metadata: Mapping[str, object] | None = None,
+        memory_type: MemoryType = MemoryType.SEMANTIC,
     ) -> MemoryRecord:
         return await asyncio.to_thread(
             self._memory.add,
             content,
             occurred_at=occurred_at,
             metadata=metadata,
+            memory_type=memory_type,
         )
 
     async def add_many(
         self,
         contents: Sequence[ContentInput],
+        *,
+        memory_type: MemoryType = MemoryType.SEMANTIC,
     ) -> tuple[MemoryRecord, ...]:
-        return await asyncio.to_thread(self._memory.add_many, contents)
+        return await asyncio.to_thread(
+            self._memory.add_many,
+            contents,
+            memory_type=memory_type,
+        )
 
-    async def search(self, query: ContentInput, *, limit: int = 10) -> tuple[SearchHit, ...]:
-        return await asyncio.to_thread(self._memory.search, query, limit=limit)
+    async def search(
+        self,
+        query: ContentInput,
+        *,
+        limit: int = 10,
+        memory_type: MemoryType | None = None,
+        reference_at: datetime | None = None,
+    ) -> tuple[SearchHit, ...]:
+        return await asyncio.to_thread(
+            self._memory.search,
+            query,
+            limit=limit,
+            memory_type=memory_type,
+            reference_at=reference_at,
+        )
 
-    async def ask(self, question: ContentInput, *, limit: int = 5) -> AnswerResult:
-        return await asyncio.to_thread(self._memory.ask, question, limit=limit)
+    async def ask(
+        self,
+        question: ContentInput,
+        *,
+        limit: int = 5,
+        memory_type: MemoryType | None = None,
+        reference_at: datetime | None = None,
+    ) -> AnswerResult:
+        return await asyncio.to_thread(
+            self._memory.ask,
+            question,
+            limit=limit,
+            memory_type=memory_type,
+            reference_at=reference_at,
+        )
 
     async def get(self, memory_id: str) -> MemoryRecord:
         return await asyncio.to_thread(self._memory.get, memory_id)
@@ -1418,17 +1595,22 @@ def _prepare_memory(
     *,
     occurred_at: datetime | None,
     metadata: Mapping[str, object] | None,
+    memory_type: MemoryType,
 ) -> _PreparedMemory:
     normalized_occurred_at = _occurred_at(occurred_at)
+    normalized_memory_type = _memory_type(memory_type)
     metadata_json = _metadata_json(metadata)
+    identity: dict[str, object] = {
+        "parts": content.canonical_parts,
+        "metadata": json.loads(metadata_json),
+        "occurred_at": (
+            None if normalized_occurred_at is None else _datetime_text(normalized_occurred_at)
+        ),
+    }
+    if normalized_memory_type is not MemoryType.SEMANTIC:
+        identity["memory_type"] = normalized_memory_type.value
     payload = json.dumps(
-        {
-            "parts": content.canonical_parts,
-            "metadata": json.loads(metadata_json),
-            "occurred_at": (
-                None if normalized_occurred_at is None else _datetime_text(normalized_occurred_at)
-            ),
-        },
+        identity,
         ensure_ascii=False,
         allow_nan=False,
         sort_keys=True,
@@ -1439,6 +1621,7 @@ def _prepare_memory(
         content=content,
         metadata_json=metadata_json,
         occurred_at=normalized_occurred_at,
+        memory_type=normalized_memory_type,
     )
 
 
@@ -1707,6 +1890,191 @@ def _occurred_at(value: datetime | None) -> datetime | None:
     if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
         raise ValidationError("occurred_at must include a timezone")
     return value.astimezone(timezone.utc)
+
+
+def _reference_at(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
+        raise ValidationError("reference_at must include a timezone")
+    return value
+
+
+def _memory_type(value: object) -> MemoryType:
+    if not isinstance(value, MemoryType):
+        raise ValidationError("memory_type must be a MemoryType value")
+    return value
+
+
+def _optional_memory_type(value: object) -> MemoryType | None:
+    return None if value is None else _memory_type(value)
+
+
+def _with_reference_time(content: _PreparedContent, reference_at: datetime) -> _PreparedContent:
+    note = f"Reference time for relative dates: {reference_at.isoformat(timespec='microseconds')}"
+    return replace(content, text=f"{content.text}\n\n{note}" if content.text else note)
+
+
+def _merge_index_hits(
+    preferred: Sequence[IndexHit],
+    fallback: Sequence[IndexHit],
+) -> tuple[IndexHit, ...]:
+    merged = {hit.id: hit for hit in preferred}
+    for hit in fallback:
+        merged.setdefault(hit.id, hit)
+    return tuple(merged.values())
+
+
+def _in_time_range(
+    occurred_at: datetime | None,
+    temporal_range: tuple[datetime, datetime] | None,
+) -> bool:
+    return (
+        occurred_at is not None
+        and temporal_range is not None
+        and temporal_range[0] <= occurred_at < temporal_range[1]
+    )
+
+
+def _ranked_relevance(
+    memory: StoredMemory,
+    relevance: float,
+    *,
+    reference_at: datetime,
+    temporal_range: tuple[datetime, datetime] | None,
+    decay_half_life: timedelta | None,
+) -> float:
+    score = relevance
+    if temporal_range is not None:
+        score *= (
+            _RANK_CEILING if _in_time_range(memory.occurred_at, temporal_range) else _RANK_FLOOR
+        )
+    if decay_half_life is not None:
+        accessed_at = memory.last_accessed_at
+        anchor = memory.occurred_at or memory.updated_at
+        access_count = 0
+        if accessed_at is not None and accessed_at <= reference_at:
+            anchor = accessed_at
+            access_count = memory.access_count
+        age = max(0.0, (reference_at - anchor).total_seconds())
+        strength = 1.0 + math.log2(1.0 + min(access_count, _DECAY_REINFORCEMENT_LIMIT))
+        retention = 2.0 ** (-age / (decay_half_life.total_seconds() * strength))
+        score *= _RANK_FLOOR + (_RANK_CEILING - _RANK_FLOOR) * retention
+    return score
+
+
+def _temporal_range(text: str, reference_at: datetime) -> tuple[datetime, datetime] | None:
+    try:
+        return _parse_temporal_range(text, reference_at)
+    except (OverflowError, ValueError):
+        raise ValidationError("temporal expression exceeds the supported date range") from None
+
+
+def _parse_temporal_range(  # noqa: C901 - ordered phrases are clearer as one parser
+    text: str,
+    reference_at: datetime,
+) -> tuple[datetime, datetime] | None:
+    if not text:
+        return None
+    dates = []
+    for value in _ISO_DATE.findall(text):
+        try:
+            dates.append(date.fromisoformat(value))
+        except ValueError:
+            continue
+    if dates:
+        return _date_range(min(dates), max(dates), reference_at)
+
+    normalized = text.casefold()
+    relative_day = re.search(r"(?<!\d)(\d{1,5})\s*天前", normalized) or re.search(
+        r"\b(\d{1,5})\s+days?\s+ago\b", normalized
+    )
+    if relative_day is not None:
+        days = int(relative_day.group(1))
+        if days <= 36_500:
+            target = reference_at.date() - timedelta(days=days)
+            return _date_range(target, target, reference_at)
+
+    rolling = re.search(r"(?:过去|最近)\s*(\d{1,5})\s*天", normalized) or re.search(
+        r"\b(?:past|last)\s+(\d{1,5})\s+days?\b", normalized
+    )
+    if rolling is not None:
+        days = int(rolling.group(1))
+        if 0 < days <= 36_500:
+            return reference_at - timedelta(days=days), reference_at
+
+    if _contains(normalized, "day before yesterday", "前天"):
+        target = reference_at.date() - timedelta(days=2)
+        return _date_range(target, target, reference_at)
+    if _contains(normalized, "yesterday", "昨天"):
+        target = reference_at.date() - timedelta(days=1)
+        return _date_range(target, target, reference_at)
+    if _contains(normalized, "day after tomorrow", "后天"):
+        target = reference_at.date() + timedelta(days=2)
+        return _date_range(target, target, reference_at)
+    if _contains(normalized, "tomorrow", "明天"):
+        target = reference_at.date() + timedelta(days=1)
+        return _date_range(target, target, reference_at)
+    if _contains(normalized, "today", "今天"):
+        target = reference_at.date()
+        return _date_range(target, target, reference_at)
+
+    day_start = _day_start(reference_at.date(), reference_at)
+    week_start = day_start - timedelta(days=reference_at.weekday())
+    if _contains(normalized, "last week", "上周", "上星期"):
+        return week_start - timedelta(days=7), week_start
+    if _contains(normalized, "this week", "本周", "这周", "本星期"):
+        return week_start, week_start + timedelta(days=7)
+    if _contains(normalized, "next week", "下周", "下星期"):
+        return week_start + timedelta(days=7), week_start + timedelta(days=14)
+    if _contains(normalized, "past week", "过去一周", "最近一周"):
+        return reference_at - timedelta(days=7), reference_at
+
+    month_start = day_start.replace(day=1)
+    if _contains(normalized, "last month", "上个月", "上月"):
+        return _shift_month(month_start, -1), month_start
+    if _contains(normalized, "this month", "这个月", "本月"):
+        return month_start, _shift_month(month_start, 1)
+    if _contains(normalized, "next month", "下个月", "下月"):
+        return _shift_month(month_start, 1), _shift_month(month_start, 2)
+
+    year_start = day_start.replace(month=1, day=1)
+    if _contains(normalized, "last year", "去年"):
+        return year_start.replace(year=year_start.year - 1), year_start
+    if _contains(normalized, "this year", "今年"):
+        return year_start, year_start.replace(year=year_start.year + 1)
+    if _contains(normalized, "next year", "明年"):
+        return (
+            year_start.replace(year=year_start.year + 1),
+            year_start.replace(year=year_start.year + 2),
+        )
+    return None
+
+
+def _contains(text: str, *phrases: str) -> bool:
+    return any(phrase in text for phrase in phrases)
+
+
+def _day_start(value: date, reference_at: datetime) -> datetime:
+    return datetime.combine(value, time.min, tzinfo=reference_at.tzinfo)
+
+
+def _date_range(first: date, last: date, reference_at: datetime) -> tuple[datetime, datetime]:
+    return _day_start(first, reference_at), _day_start(last + timedelta(days=1), reference_at)
+
+
+def _shift_month(value: datetime, months: int) -> datetime:
+    year, month = divmod(value.year * 12 + value.month - 1 + months, 12)
+    return value.replace(year=year, month=month + 1)
+
+
+def _decay_half_life(days: float | None) -> timedelta | None:
+    if days is None:
+        return None
+    try:
+        return timedelta(days=days)
+    except OverflowError:
+        raise ValidationError("decay_half_life_days is too large") from None
 
 
 def _identifier(value: object, name: str) -> str:

@@ -26,6 +26,7 @@ from mindbridge.types import (
     Blob,
     ContentInput,
     MemoryRecord,
+    MemoryType,
     Modality,
     Page,
     SearchHit,
@@ -56,10 +57,11 @@ class FakeMemory:
         *,
         occurred_at: datetime | None = None,
         metadata: Mapping[str, object] | None = None,
+        memory_type: MemoryType = MemoryType.SEMANTIC,
     ) -> MemoryRecord:
         self._fail()
         copied_metadata = dict(metadata or {})
-        self.calls.append(("add", content, occurred_at, copied_metadata))
+        self.calls.append(("add", content, occurred_at, copied_metadata, memory_type))
         return _record(
             "memory_1",
             content if isinstance(content, str) else "Multimodal memory.",
@@ -67,28 +69,49 @@ class FakeMemory:
             metadata=copied_metadata,
             assets=() if isinstance(content, str) else (ASSET,),
             modality=Modality.TEXT if isinstance(content, str) else Modality.IMAGE,
+            memory_type=memory_type,
         )
 
-    def add_many(self, contents: Sequence[ContentInput]) -> tuple[MemoryRecord, ...]:
+    def add_many(
+        self,
+        contents: Sequence[ContentInput],
+        *,
+        memory_type: MemoryType = MemoryType.SEMANTIC,
+    ) -> tuple[MemoryRecord, ...]:
         self._fail()
         copied = tuple(contents)
-        self.calls.append(("add_many", copied))
+        self.calls.append(("add_many", copied, memory_type))
         return tuple(
             _record(
                 f"batch_{index}",
                 content if isinstance(content, str) else "Multimodal memory.",
+                memory_type=memory_type,
             )
             for index, content in enumerate(copied)
         )
 
-    def search(self, query: ContentInput, *, limit: int = 10) -> tuple[SearchHit, ...]:
+    def search(
+        self,
+        query: ContentInput,
+        *,
+        limit: int = 10,
+        memory_type: MemoryType | None = None,
+        reference_at: datetime | None = None,
+    ) -> tuple[SearchHit, ...]:
         self._fail()
-        self.calls.append(("search", query, limit))
+        self.calls.append(("search", query, limit, memory_type, reference_at))
         return (_hit(),)
 
-    def ask(self, question: ContentInput, *, limit: int = 10) -> AnswerResult:
+    def ask(
+        self,
+        question: ContentInput,
+        *,
+        limit: int = 10,
+        memory_type: MemoryType | None = None,
+        reference_at: datetime | None = None,
+    ) -> AnswerResult:
         self._fail()
-        self.calls.append(("ask", question, limit))
+        self.calls.append(("ask", question, limit, memory_type, reference_at))
         return AnswerResult(answer="The toolbox is blue.", hits=(_hit(),))
 
     def get(self, memory_id: str) -> MemoryRecord:
@@ -126,21 +149,32 @@ def test_resource_routes_map_the_public_memory_values() -> None:
                 "content": "  The toolbox is blue.  ",
                 "occurred_at": NOW.isoformat(),
                 "metadata": {"room": "workshop"},
+                "memory_type": "episodic",
             },
         )
         batch = client.post(
             "/v1/memories/batch",
-            json={"contents": [" first ", "second"]},
+            json={"contents": [" first ", "second"], "memory_type": "procedural"},
         )
         page = client.get("/v1/memories", params={"limit": 2, "cursor": "before"})
         found = client.get("/v1/memories/memory_1")
         searched = client.post(
             "/v1/memories/search",
-            json={"query": " toolbox ", "limit": 3},
+            json={
+                "query": " toolbox ",
+                "limit": 3,
+                "memory_type": "episodic",
+                "reference_at": NOW.isoformat(),
+            },
         )
         answered = client.post(
             "/v1/answers",
-            json={"question": " What color is it? ", "limit": 4},
+            json={
+                "question": " What color is it? ",
+                "limit": 4,
+                "memory_type": "procedural",
+                "reference_at": NOW.isoformat(),
+            },
         )
         deleted = client.delete("/v1/memories/memory_1")
         openapi = client.get("/openapi.json").json()
@@ -148,8 +182,10 @@ def test_resource_routes_map_the_public_memory_values() -> None:
     assert health.json() == {"status": "ok"}
     assert created.status_code == 201
     assert created.json()["content"] == "The toolbox is blue."
+    assert created.json()["memory_type"] == "episodic"
     assert created.json()["metadata"] == {"room": "workshop"}
     assert [record["content"] for record in batch.json()["memories"]] == ["first", "second"]
+    assert {record["memory_type"] for record in batch.json()["memories"]} == {"procedural"}
     assert page.json()["next_cursor"] == "next"
     assert found.json()["id"] == "memory_1"
     assert searched.json()["hits"][0]["score"] == 0.9
@@ -157,12 +193,12 @@ def test_resource_routes_map_the_public_memory_values() -> None:
     assert deleted.status_code == 204
     assert deleted.content == b""
     assert memory.calls == [
-        ("add", "The toolbox is blue.", NOW, {"room": "workshop"}),
-        ("add_many", ("first", "second")),
+        ("add", "The toolbox is blue.", NOW, {"room": "workshop"}, MemoryType.EPISODIC),
+        ("add_many", ("first", "second"), MemoryType.PROCEDURAL),
         ("list", 2, "before"),
         ("get", "memory_1"),
-        ("search", "toolbox", 3),
-        ("ask", "What color is it?", 4),
+        ("search", "toolbox", 3, MemoryType.EPISODIC, NOW),
+        ("ask", "What color is it?", 4, MemoryType.PROCEDURAL, NOW),
         ("delete", "memory_1"),
     ]
     assert memory.close_count == 0
@@ -462,11 +498,13 @@ def _record(
     metadata: Mapping[str, object] | None = None,
     assets: tuple[AssetRef, ...] = (),
     modality: Modality = Modality.TEXT,
+    memory_type: MemoryType = MemoryType.SEMANTIC,
 ) -> MemoryRecord:
     return MemoryRecord(
         id=memory_id,
         content=content,
         modality=modality,
+        memory_type=memory_type,
         assets=assets,
         created_at=NOW,
         occurred_at=occurred_at,

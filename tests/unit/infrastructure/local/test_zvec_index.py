@@ -145,6 +145,54 @@ def test_dense_index_accepts_media_only_document_without_text(tmp_path: Path) ->
         assert index.search((1.0, 0.0), exact=True)[0].id == "embedding_media"
 
 
+def test_type_and_event_time_filters_apply_to_dense_and_hybrid_search(tmp_path: Path) -> None:
+    _require_zvec()
+    start = datetime(2026, 8, 17, tzinfo=timezone.utc)
+    until = datetime(2026, 8, 24, tzinfo=timezone.utc)
+    documents = [
+        _document(
+            "episodic_match",
+            "project review",
+            (1.0, 0.0),
+            memory_type="episodic",
+            occurred_at=datetime(2026, 8, 20, tzinfo=timezone.utc),
+        ),
+        _document(
+            "episodic_late",
+            "project review",
+            (1.0, 0.0),
+            memory_type="episodic",
+            occurred_at=datetime(2026, 8, 26, tzinfo=timezone.utc),
+        ),
+        _document(
+            "semantic_match",
+            "project review",
+            (1.0, 0.0),
+            occurred_at=datetime(2026, 8, 20, tzinfo=timezone.utc),
+        ),
+    ]
+    with ZvecIndex(tmp_path / "index", dimension=2) as index:
+        index.upsert(documents)
+        dense = index.search(
+            (1.0, 0.0),
+            memory_type="episodic",
+            occurred_from=start,
+            occurred_until=until,
+            exact=True,
+        )
+        hybrid = index.hybrid_search(
+            "project review",
+            (1.0, 0.0),
+            memory_type="episodic",
+            occurred_from=start,
+            occurred_until=until,
+            exact=True,
+        )
+
+    assert tuple(hit.id for hit in dense) == ("episodic_match",)
+    assert tuple(hit.id for hit in hybrid) == ("episodic_match",)
+
+
 def test_open_rejects_an_incompatible_schema(tmp_path: Path) -> None:
     _require_zvec()
     path = tmp_path / "index"
@@ -183,6 +231,8 @@ def _document(
     *,
     space_id: str = "default-space",
     task: str = "document",
+    memory_type: str = "semantic",
+    occurred_at: datetime | None = None,
 ) -> IndexDocument:
     return IndexDocument(
         embedding=StoredEmbedding(
@@ -197,6 +247,8 @@ def _document(
         ),
         content=content,
         metadata_json="{}",
+        memory_type=memory_type,
+        occurred_at=occurred_at,
     )
 
 
