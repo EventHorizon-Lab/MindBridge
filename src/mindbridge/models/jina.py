@@ -8,16 +8,19 @@ from importlib import import_module
 from typing import Protocol, cast
 
 from mindbridge.application.capabilities import (
+    ALL_MEDIA_KINDS,
     Embedding,
     EmbedRequest,
     EmbedResult,
     EmbedTask,
     ModelInput,
     TextPart,
+    require_supported_media,
 )
 from mindbridge.configuration import PluginConfigModel, PluginInteger, PluginText
 from mindbridge.core import (
     EmbeddingSpaceReference,
+    MediaKind,
     ModelOutputError,
     ModelReference,
     ModelUnavailableError,
@@ -191,9 +194,16 @@ class JinaEmbedder:
         """Declare the search space this model's vectors belong to."""
         return self._space_reference
 
+    @property
+    def supported_media_kinds(self) -> frozenset[MediaKind]:
+        """Jina Omni accepts every MindBridge media kind."""
+        return ALL_MEDIA_KINDS
+
     @operation_span("mindbridge.model.embed")
     async def embed(self, request: EmbedRequest) -> EmbedResult:
         """Encode a homogeneous query or document batch."""
+        for input_value in request.inputs:
+            require_supported_media(input_value, self.supported_media_kinds, "Embedder")
         is_query = request.task is EmbedTask.QUERY
         encode = self._encoder.encode_query if is_query else self._encoder.encode_document
         vectors = await self._encode(

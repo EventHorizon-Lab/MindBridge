@@ -185,6 +185,14 @@ class IdentityObservationInput(ContractModel):
             "one observation together may not exceed 65,536 characters."
         ),
     )
+    transcript_media_object_id: Identifier | None = Field(
+        default=None,
+        description=(
+            "Media object whose audio produced `transcript`. It must belong to the same "
+            "observation and be audio or video. Omit only for legacy single-audio input, where "
+            "MindBridge can infer the source without ambiguity."
+        ),
+    )
     visual_bbox_xyxy: (
         tuple[
             Annotated[float, Field(ge=0.0, le=1.0, allow_inf_nan=False)],
@@ -213,6 +221,8 @@ class IdentityObservationInput(ContractModel):
                 raise ValueError("visual_bbox_xyxy must have positive width and height")
         if self.transcript is not None and self.kind is not IdentityKind.VOICE:
             raise ValueError("transcript is only valid for voice identities")
+        if self.transcript_media_object_id is not None and self.transcript is None:
+            raise ValueError("transcript_media_object_id requires a transcript")
         return self
 
 
@@ -235,6 +245,14 @@ class ObserveRequest(ContractModel):
         ),
     ]
     sensor: SensorKind = Field(description="Which sensor produced this observation.")
+    text: NonEmptyString | None = Field(
+        default=None,
+        description=(
+            "Caller text that belongs to this media observation, such as an instruction, "
+            "caption, or device context. Omit for media-only input; use `remember` for text "
+            "without evidence media."
+        ),
+    )
     media_objects: Annotated[
         tuple[MediaObjectInput, ...],
         Field(
@@ -294,6 +312,7 @@ class ObserveRequest(ContractModel):
             raise ValueError("media duration exceeds source observation")
         if any(identity.end_ms > duration_ms for identity in self.identity_observations):
             raise ValueError("identity observation exceeds source duration")
+        _require_transcript_media_sources(self.identity_observations, self.media_objects)
         if (
             sum(len(identity.transcript or "") for identity in self.identity_observations)
             > _MAXIMUM_IDENTITY_TRANSCRIPT_CHARACTERS
@@ -312,6 +331,24 @@ class ObserveRequest(ContractModel):
         if len(set(keys)) != len(keys):
             raise ValueError("identity observations must not contain duplicates")
         return self
+
+
+def _require_transcript_media_sources(
+    identities: tuple[IdentityObservationInput, ...],
+    media_objects: tuple[MediaObjectInput, ...],
+) -> None:
+    media_by_id = {media.media_object_id: media for media in media_objects}
+    for identity in identities:
+        source_id = identity.transcript_media_object_id
+        if source_id is None:
+            continue
+        source = media_by_id.get(source_id)
+        if source is None:
+            raise ValueError("identity transcript media must belong to the observation")
+        if source.kind not in {MediaKind.AUDIO, MediaKind.VIDEO}:
+            raise ValueError("identity transcript media must contain audio")
+        if source.duration_ms is not None and identity.end_ms > source.duration_ms:
+            raise ValueError("identity transcript exceeds its source media duration")
 
 
 class ObservationStatus(str, Enum):

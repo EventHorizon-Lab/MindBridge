@@ -79,6 +79,7 @@ class LocalIdentityMatch:
         start_ms: int,
         end_ms: int,
         transcript: str | None = None,
+        transcript_media_object_id: str | None = None,
         visual_bbox_xyxy: tuple[float, float, float, float] | None = None,
     ) -> IdentityObservationInput:
         """Create the cloud-safe interval without exposing the local embedding."""
@@ -91,6 +92,7 @@ class LocalIdentityMatch:
             model_id=self.model_reference.model_id,
             scope=IdentityScope.DEVICE,
             transcript=transcript,
+            transcript_media_object_id=transcript_media_object_id,
             visual_bbox_xyxy=visual_bbox_xyxy,
         )
 

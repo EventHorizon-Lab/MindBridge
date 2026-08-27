@@ -19,7 +19,13 @@ from pydantic import (
     model_validator,
 )
 
-from mindbridge.application.capabilities import GenerateRequest, Generator, ModelInput, TextPart
+from mindbridge.application.capabilities import (
+    GenerateRequest,
+    Generator,
+    ModelInput,
+    TextPart,
+    declared_supported_media_kinds,
+)
 from mindbridge.application.perception import (
     MAX_PERCEIVED_CLAIMS_PER_EVENT,
     MAX_PERCEIVED_COUNT,
@@ -33,6 +39,8 @@ from mindbridge.application.perception import (
     PerceivedEntity,
     PerceivedEvent,
     ResolvedEvidence,
+    overlapping_transcript_segments,
+    resolve_transcript_segments,
     time_ranges_overlap,
 )
 from mindbridge.application.pipelines.evidence import evidence_parts
@@ -47,8 +55,10 @@ from mindbridge.core import (
     EntityType,
     EvidenceId,
     EvidenceSpan,
+    MediaKind,
     ModelOutputError,
     Observation,
+    UnsupportedModalityError,
 )
 from mindbridge.prompts import PERCEIVE_EVENTS_PROMPT
 from mindbridge.telemetry import (
@@ -235,33 +245,25 @@ class PerceptionPipeline:
         evidence: tuple[ResolvedEvidence, ...],
     ) -> EventPerception:
         _require_observation_evidence(observation, evidence)
+        model_input, route = _generation_input(self._generator, observation, evidence)
         output, result = await generate_json(
             self._generator,
             GenerateRequest(
                 system_prompt=PERCEIVE_EVENTS_PROMPT.text,
-                input=ModelInput(
-                    (
-                        TextPart(
-                            f"<observation_context>\n{_context(observation, evidence)}\n"
-                            "</observation_context>"
-                        ),
-                        *evidence_parts(evidence),
-                        TextPart(
-                            "<final_task>Produce the grounded events JSON for the observation "
-                            "and media above.</final_task>"
-                        ),
-                    )
-                ),
+                input=model_input,
                 max_output_tokens=self._max_output_tokens,
                 output_schema=_PERCEPTION_SCHEMA,
             ),
             lambda content: _parse_output(content, observation, evidence),
         )
+        if route == "asr_vlm":
+            _require_transcript_grounding(output, observation, evidence)
         set_current_span_attributes(
             {
                 "mindbridge.model.id": result.model_reference.model_id,
                 "mindbridge.prompt.version": PERCEIVE_EVENTS_PROMPT.version,
                 "mindbridge.evidence.count": len(evidence),
+                "mindbridge.model.route": route,
             }
         )
         return EventPerception(
@@ -316,6 +318,7 @@ def _context(observation: Observation, evidence: tuple[ResolvedEvidence, ...]) -
                 (observation.ended_at - observation.occurred_at).total_seconds() * 1000
             ),
             "sensor": observation.sensor.value,
+            "text": observation.text,
             "identity_observations": [
                 {
                     "identity_id": identity.identity_id,
@@ -326,6 +329,7 @@ def _context(observation: Observation, evidence: tuple[ResolvedEvidence, ...]) -
                     "model_id": identity.model_reference.model_id,
                     "scope": identity.scope.value,
                     "transcript": identity.transcript,
+                    "transcript_media_object_id": identity.transcript_media_object_id,
                     "visual_bbox_xyxy": identity.visual_bbox_xyxy,
                 }
                 for identity in observation.identity_observations
@@ -344,6 +348,88 @@ def _context(observation: Observation, evidence: tuple[ResolvedEvidence, ...]) -
         ensure_ascii=False,
         separators=(",", ":"),
     )
+
+
+def _generation_input(
+    generator: Generator,
+    observation: Observation,
+    evidence: tuple[ResolvedEvidence, ...],
+) -> tuple[ModelInput, str]:
+    """Choose native media or the existing timestamped-ASR fallback before inference."""
+    media_kinds = {item.media_object.kind for item in evidence}
+    unsupported = media_kinds - declared_supported_media_kinds(generator)
+    fallback: tuple[TextPart, ...] = ()
+    if unsupported:
+        media_objects = tuple(
+            {item.media_object.media_object_id: item.media_object for item in evidence}.values()
+        )
+        transcripts = resolve_transcript_segments(observation, media_objects)
+        missing_audio_transcript = any(
+            not overlapping_transcript_segments(
+                transcripts,
+                item.media_object.media_object_id,
+                item.evidence_span.start_ms,
+                item.evidence_span.end_ms,
+            )
+            for item in evidence
+            if item.media_object.kind is MediaKind.AUDIO
+        )
+        if unsupported != {MediaKind.AUDIO} or missing_audio_transcript:
+            names = ", ".join(sorted(kind.value for kind in unsupported))
+            raise UnsupportedModalityError(
+                f"configured Generator does not support media kind(s): {names}; "
+                "audio fallback requires a source-linked timestamped ASR transcript for "
+                "every audio evidence span"
+            )
+        fallback = (
+            TextPart(
+                "<audio_route>The Generator cannot accept audio. Treat the timestamped voice "
+                "transcripts in observation_context as the audio representation and keep "
+                "grounding claims in the original audio evidence spans.</audio_route>"
+            ),
+        )
+    route = "asr_vlm" if unsupported else "native_omni" if MediaKind.AUDIO in media_kinds else "vl"
+    return (
+        ModelInput(
+            (
+                TextPart(
+                    f"<observation_context>\n{_context(observation, evidence)}\n"
+                    "</observation_context>"
+                ),
+                *evidence_parts(evidence, excluded_media_kinds=unsupported),
+                *fallback,
+                TextPart(
+                    "<final_task>Produce the grounded events JSON for the observation and "
+                    "media above.</final_task>"
+                ),
+            )
+        ),
+        route,
+    )
+
+
+def _require_transcript_grounding(
+    output: _PerceptionOutput,
+    observation: Observation,
+    evidence: tuple[ResolvedEvidence, ...],
+) -> None:
+    media_objects = tuple(
+        {item.media_object.media_object_id: item.media_object for item in evidence}.values()
+    )
+    transcripts = resolve_transcript_segments(observation, media_objects)
+    evidence_by_id = {str(item.evidence_span.evidence_id): item for item in evidence}
+    for event in output.events:
+        for evidence_id in event.evidence_ids:
+            item = evidence_by_id[evidence_id]
+            if item.media_object.kind is MediaKind.AUDIO and not overlapping_transcript_segments(
+                transcripts,
+                item.media_object.media_object_id,
+                event.start_ms,
+                event.end_ms,
+            ):
+                raise ModelOutputError(
+                    "VLM event citing audio is outside its source-linked ASR transcript"
+                )
 
 
 def _parse_output(

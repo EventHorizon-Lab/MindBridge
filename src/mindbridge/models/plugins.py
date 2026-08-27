@@ -6,7 +6,11 @@ from collections.abc import Callable, Mapping
 from importlib.metadata import EntryPoint, entry_points
 from typing import cast
 
-from mindbridge.application.capabilities import Embedder, Generator
+from mindbridge.application.capabilities import (
+    Embedder,
+    Generator,
+    declared_supported_media_kinds,
+)
 from mindbridge.configuration import (
     MissingConfigurationError,
     copy_plugin_configuration,
@@ -44,7 +48,9 @@ def validate_embedder_configuration(name: str, config: PluginConfig) -> None:
 
 def load_generator(name: str, config: PluginConfig) -> Generator:
     """Load only the selected generation plugin."""
-    return cast(Generator, _load("mindbridge.generators", name, config, Generator))
+    generator = cast(Generator, _load("mindbridge.generators", name, config, Generator))
+    _ = declared_supported_media_kinds(generator)
+    return generator
 
 
 def load_embedder(name: str, config: PluginConfig) -> Embedder:
@@ -56,6 +62,7 @@ def load_embedder(name: str, config: PluginConfig) -> Embedder:
     # -- before 3.12 it raised from there instead. Doing it here keeps the rejection at load
     # time on all of them, rather than at whichever call site reads the space first.
     _ = embedder.space_reference
+    _ = declared_supported_media_kinds(embedder)
     return embedder
 
 

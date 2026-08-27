@@ -40,6 +40,7 @@ ObservationRow: TypeAlias = tuple[
     datetime,
     datetime,
     int,
+    str | None,
     object,
 ]
 
@@ -61,7 +62,8 @@ async def read_observation(
     cursor = await connection.execute(
         """
         SELECT observation_id, tenant_id, device_id, boot_id, sequence, sensor,
-               occurred_at, ended_at, observed_at, clock_offset_ms, identity_observations
+               occurred_at, ended_at, observed_at, clock_offset_ms, input_text,
+               identity_observations
         FROM observations
         WHERE tenant_id = %s AND observation_id = %s
         """,
@@ -97,6 +99,7 @@ def _observation_from_row(
         ended_at,
         observed_at,
         clock_offset_ms,
+        input_text,
         identity_observations,
     ) = row
     return Observation(
@@ -111,6 +114,7 @@ def _observation_from_row(
         ended_at=ended_at,
         observed_at=observed_at,
         clock_offset_ms=clock_offset_ms,
+        text=input_text,
         identity_observations=_identity_observations_from_json(identity_observations),
     )
 
@@ -130,6 +134,11 @@ def _identity_observations_from_json(value: object) -> tuple[AnonymousIdentityOb
             model_reference=ModelReference(model_id=item.model_id),
             scope=item.scope,
             transcript=item.transcript,
+            transcript_media_object_id=(
+                MediaObjectId(item.transcript_media_object_id)
+                if item.transcript_media_object_id is not None
+                else None
+            ),
             visual_bbox_xyxy=item.visual_bbox_xyxy,
         )
         for item in inputs

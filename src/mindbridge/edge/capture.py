@@ -113,7 +113,7 @@ def enqueue_captured_media(
         ended_at=ended_at,
         observed_at=observed_at,
         clock_offset_ms=clock_offset_ms,
-        identity_observations=identity_observations,
+        identity_observations=_link_transcripts(identity_observations, tuple(media_inputs)),
         idempotency_key=derive_stable_id(
             "edge_observation",
             tenant_id,
@@ -127,3 +127,22 @@ def enqueue_captured_media(
         tuple(media_files),
     )
     return request
+
+
+def _link_transcripts(
+    identities: tuple[IdentityObservationInput, ...],
+    media: tuple[MediaObjectInput, ...],
+) -> tuple[IdentityObservationInput, ...]:
+    """Link ASR output to the synchronized audio object without overriding caller provenance."""
+    source = next(
+        (item for item in media if item.kind is MediaKind.AUDIO),
+        next((item for item in media if item.kind is MediaKind.VIDEO), None),
+    )
+    if source is None:
+        return identities
+    return tuple(
+        item.model_copy(update={"transcript_media_object_id": source.media_object_id})
+        if item.transcript is not None and item.transcript_media_object_id is None
+        else item
+        for item in identities
+    )

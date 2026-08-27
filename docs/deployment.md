@@ -132,6 +132,7 @@ space_id = "jina-v5"
 plugin = "openai"
 endpoint = "https://generator.example.com/v1"
 model_id = "qwen3.8-max"
+supported_media_kinds = ["image", "video"]
 
 [embedder]
 plugin = "openai"
@@ -294,6 +295,7 @@ follow. A slow deployment raises one value and the budget follows:
 endpoint = "https://generator.example.com/v1"
 model_id = "qwen3.8-max"
 request_timeout_seconds = 1800
+supported_media_kinds = ["image", "video"]
 ```
 
 Omitting the key is fine: the bundled generator's own default of 1800 seconds applies, and the

@@ -227,8 +227,10 @@ def build_mcp_server(
         Rejected combinations: `ended_at` before `occurred_at`; a repeated `media_object_id`;
         a media `duration_ms` longer than the observation's own span; an identity span with
         `end_ms` past that span or `start_ms` after its own `end_ms`; `transcript` on anything
-        but a `voice` identity; `visual_bbox_xyxy` on anything but a `face` identity, or one
-        whose 0..1 normalized corners have no positive width and height.
+        but a `voice` identity; a transcript source outside this observation or on image media;
+        `visual_bbox_xyxy` on anything but a `face` identity, or one whose 0..1 normalized
+        corners have no positive width and height. Multiple audio objects require each
+        transcript to name its source with `transcript_media_object_id` for model fallback.
 
         `status` returns `duplicate` when a retry matched an earlier `idempotency_key`.
         Deriving memory from raw media outlives this request, so no memory exists yet when

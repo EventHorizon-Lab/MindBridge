@@ -21,6 +21,7 @@ class RecordingTextEmbedder:
 
     def __init__(self) -> None:
         self.documents: tuple[str, ...] = ()
+        self.requests: list[tuple[str, ...]] = []
 
     async def embed(self, request: EmbedRequest) -> EmbedResult:
         self.documents = tuple(
@@ -29,6 +30,7 @@ class RecordingTextEmbedder:
             for part in input_value.parts
             if isinstance(part, TextPart)
         )
+        self.requests.append(self.documents)
         return EmbedResult(
             tuple(
                 Embedding(

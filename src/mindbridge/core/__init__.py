@@ -25,6 +25,7 @@ from mindbridge.core.errors import (
     ModelUnavailableError,
     ObjectStorageError,
     TaskBrokerError,
+    UnsupportedModalityError,
 )
 from mindbridge.core.evidence import (
     EvidenceClip,
@@ -169,6 +170,7 @@ __all__ = [
     "TaskBrokerError",
     "TenantId",
     "TombstoneId",
+    "UnsupportedModalityError",
     "VerificationStatus",
     "apply_memory_feedback",
     "calculate_memory_strength",

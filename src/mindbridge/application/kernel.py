@@ -623,6 +623,7 @@ def _build_observation(request: ObserveRequest) -> Observation:
         ended_at=request.ended_at,
         observed_at=request.observed_at,
         clock_offset_ms=request.clock_offset_ms,
+        text=request.text,
         identity_observations=tuple(
             AnonymousIdentityObservation(
                 identity_id=item.identity_id,
@@ -633,6 +634,11 @@ def _build_observation(request: ObserveRequest) -> Observation:
                 model_reference=ModelReference(model_id=item.model_id),
                 scope=item.scope,
                 transcript=item.transcript,
+                transcript_media_object_id=(
+                    MediaObjectId(item.transcript_media_object_id)
+                    if item.transcript_media_object_id is not None
+                    else None
+                ),
                 visual_bbox_xyxy=item.visual_bbox_xyxy,
             )
             for item in request.identity_observations
@@ -711,5 +717,14 @@ def _deletion_view(tombstone: DeletionTombstone) -> DeletionTombstoneView:
 
 def _request_digest(request: ContractModel) -> str:
     payload = request.model_dump(mode="json", exclude={"idempotency_key"})
+    if isinstance(request, ObserveRequest):
+        # Adding an optional field must not turn a byte-identical retry from an older edge
+        # release into an idempotency conflict. Non-null values remain part of the digest.
+        if payload["text"] is None:
+            del payload["text"]
+        identities = cast(list[dict[str, object]], payload["identity_observations"])
+        for identity in identities:
+            if identity["transcript_media_object_id"] is None:
+                del identity["transcript_media_object_id"]
     canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()

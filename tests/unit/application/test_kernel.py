@@ -1,6 +1,8 @@
 """Vertical tests for the shared observe, remember, and recall path."""
 
 import asyncio
+import hashlib
+import json
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
@@ -9,7 +11,11 @@ from typing import cast
 import pytest
 
 from mindbridge.application import recall as recall_module
-from mindbridge.application.kernel import _MAX_CONCURRENT_MEMORY_WRITES, MemoryKernel
+from mindbridge.application.kernel import (
+    _MAX_CONCURRENT_MEMORY_WRITES,
+    MemoryKernel,
+    _request_digest,
+)
 from mindbridge.application.observation_processing import ObservationBatch
 from mindbridge.application.perception import ResolvedEvidence
 from mindbridge.application.ports import (
@@ -691,9 +697,22 @@ async def test_observe_is_retry_safe() -> None:
     ]
 
 
+def test_new_optional_observation_fields_preserve_the_legacy_digest_when_absent() -> None:
+    request = _observe_request()
+    legacy_payload = request.model_dump(mode="json", exclude={"idempotency_key", "text"})
+    for identity in legacy_payload["identity_observations"]:
+        identity.pop("transcript_media_object_id")
+    canonical = json.dumps(
+        legacy_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+
+    assert _request_digest(request) == hashlib.sha256(canonical.encode()).hexdigest()
+
+
 async def test_observe_keeps_only_anonymous_edge_identity_metadata() -> None:
     store = InMemoryStore()
     request = _observe_request(
+        text="focus on the caller's caption",
         identity_observations=(
             IdentityObservationInput(
                 identity_id="person_device_01",
@@ -703,12 +722,13 @@ async def test_observe_keeps_only_anonymous_edge_identity_metadata() -> None:
                 confidence=0.91,
                 model_id="insightface/buffalo_l",
             ),
-        )
+        ),
     )
 
     await _kernel(store, RecordingAnswerer()).observe(request)
 
     observation = next(iter(store.observations.values()))[1]
+    assert observation.text == "focus on the caller's caption"
     assert observation.identity_observations[0].identity_id == "person_device_01"
     assert observation.identity_observations[0].model_reference.model_id == (
         "insightface/buffalo_l"
@@ -2182,6 +2202,7 @@ def _observe_request(
     *,
     sequence: int = 1,
     idempotency_key: str | None = None,
+    text: str | None = None,
     identity_observations: tuple[IdentityObservationInput, ...] = (),
 ) -> ObserveRequest:
     return ObserveRequest(
@@ -2190,6 +2211,7 @@ def _observe_request(
         boot_id="boot_01",
         sequence=sequence,
         sensor=SensorKind.CAMERA,
+        text=text,
         media_objects=(
             MediaObjectInput(
                 media_object_id="media_01",

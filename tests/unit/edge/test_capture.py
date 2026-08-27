@@ -172,6 +172,15 @@ def test_synchronized_audio_sidecar_shares_one_observation(tmp_path: Path) -> No
     video_path.write_bytes(b"same bytes")
     audio_path.write_bytes(b"same bytes")
     outbox = SQLiteObservationOutbox(tmp_path / "edge.db", clock=lambda: NOW)
+    transcript = IdentityObservationInput(
+        identity_id="speaker_01",
+        kind=IdentityKind.VOICE,
+        start_ms=0,
+        end_ms=1_000,
+        confidence=0.9,
+        model_id="funasr/sensevoice",
+        transcript="pass the tool",
+    )
 
     request = enqueue_captured_media(
         outbox,
@@ -185,11 +194,14 @@ def test_synchronized_audio_sidecar_shares_one_observation(tmp_path: Path) -> No
         occurred_at=NOW,
         ended_at=NOW + timedelta(seconds=30),
         observed_at=NOW + timedelta(seconds=31),
+        identity_observations=(transcript,),
     )
 
     assert [item.kind.value for item in request.media_objects] == ["video", "audio"]
     assert len({item.media_object_id for item in request.media_objects}) == 2
     assert {item.duration_ms for item in request.media_objects} == {30_000}
+    audio = next(item for item in request.media_objects if item.kind is MediaKind.AUDIO)
+    assert request.identity_observations[0].transcript_media_object_id == audio.media_object_id
     queued = outbox.next_pending()
     assert queued is not None
     assert [item.local_path for item in queued.media_files] == [

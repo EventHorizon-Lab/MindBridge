@@ -45,6 +45,19 @@ Each capability has one operation. `ModelInput` carries an ordered combination o
 producing model and compatible search-space references; this keeps asymmetric query/document
 encoders aligned without creating multiple Embedder interfaces.
 
+Every model adapter also exposes `supported_media_kinds: frozenset[MediaKind]`. Text support is
+part of both base capabilities; the set declares which of image, video, and audio may accompany
+it. The plugin loader reads and validates this member at startup, and bundled adapters check every
+request before a provider call. An empty set is text-only, image plus video is VL, and all three is
+Omni. Model names are never used as a capability heuristic.
+
+The Worker treats that declaration as a routing boundary, not only a rejection guard. If the
+media Embedder omits audio and an observation already contains timestamped transcripts linked to
+their source objects, visual clips keep their native media path while audio clip windows use the
+same VL Embedder's text path. The separate text Embedder must still declare the same search space
+for graph retrieval; missing or ambiguous transcript ownership is rejected before either
+incompatible call.
+
 `Embedder` additionally declares `space_reference`, the search space every vector it produces
 belongs to. Declaring it before the first call is what lets a process that composes more than one
 Embedder reject a mismatch during construction instead of writing vectors that silently never
@@ -89,6 +102,8 @@ def create_generator(config: Mapping[str, object]) -> Generator:
 Factories receive one JSON-compatible mapping, reject unknown keys, validate credentials and model
 identity, and return the requested runtime-checkable protocol. Entry-point names are trimmed
 lowercase text. Missing, duplicate, or wrong-capability plugins fail during process construction.
+Factories must return an adapter whose `supported_media_kinds` is a `frozenset` of `MediaKind`
+values; omitting it fails plugin loading.
 
 An adapter that owns network or model resources may provide asynchronous `close()`. Composition
 roots await it on shutdown. Provider failures must be normalized to MindBridge's
@@ -118,11 +133,13 @@ plugin = "openai"
 endpoint = "https://generator.example.com/v1"
 model_id = "qwen3.8-max"
 request_timeout_seconds = 1800
+supported_media_kinds = ["image", "video"]
 
 [embedder]
 plugin = "openai"
 endpoint = "https://embeddings.example.com/v1"
 model_id = "jinaai/jina-embeddings-v5-omni-small-retrieval"
+supported_media_kinds = ["image", "video", "audio"]
 ```
 
 Credentials stay in the environment. Individual

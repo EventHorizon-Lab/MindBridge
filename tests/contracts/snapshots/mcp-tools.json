@@ -816,7 +816,7 @@
       "openWorldHint": false,
       "readOnlyHint": false
     },
-    "description": "Store one timestamped multimodal observation and return its durable job ID.\n\nPreconditions this tool cannot do for you: every `media_objects[*].uri` must already\nbe readable at `s3://<bucket>/tenants/<tenant_id>/<key>`, with `sha256` and\n`size_bytes` matching those exact bytes. This is the first-party device path. An Agent\nholding content rather than stored media objects wants `memory_remember` instead.\n\nRejected combinations: `ended_at` before `occurred_at`; a repeated `media_object_id`;\na media `duration_ms` longer than the observation's own span; an identity span with\n`end_ms` past that span or `start_ms` after its own `end_ms`; `transcript` on anything\nbut a `voice` identity; `visual_bbox_xyxy` on anything but a `face` identity, or one\nwhose 0..1 normalized corners have no positive width and height.\n\n`status` returns `duplicate` when a retry matched an earlier `idempotency_key`.\nDeriving memory from raw media outlives this request, so no memory exists yet when\nthis receipt returns: read the returned `processing_job_id` with `memory_job` until it\nreaches `succeeded`, then use the `memory_ids` it carries.",
+    "description": "Store one timestamped multimodal observation and return its durable job ID.\n\nPreconditions this tool cannot do for you: every `media_objects[*].uri` must already\nbe readable at `s3://<bucket>/tenants/<tenant_id>/<key>`, with `sha256` and\n`size_bytes` matching those exact bytes. This is the first-party device path. An Agent\nholding content rather than stored media objects wants `memory_remember` instead.\n\nRejected combinations: `ended_at` before `occurred_at`; a repeated `media_object_id`;\na media `duration_ms` longer than the observation's own span; an identity span with\n`end_ms` past that span or `start_ms` after its own `end_ms`; `transcript` on anything\nbut a `voice` identity; a transcript source outside this observation or on image media;\n`visual_bbox_xyxy` on anything but a `face` identity, or one whose 0..1 normalized\ncorners have no positive width and height. Multiple audio objects require each\ntranscript to name its source with `transcript_media_object_id` for model fallback.\n\n`status` returns `duplicate` when a retry matched an earlier `idempotency_key`.\nDeriving memory from raw media outlives this request, so no memory exists yet when\nthis receipt returns: read the returned `processing_job_id` with `memory_job` until it\nreaches `succeeded`, then use the `memory_ids` it carries.",
     "inputSchema": {
       "$defs": {
         "IdentityKind": {
@@ -888,6 +888,21 @@
               "default": null,
               "description": "What was said in this span. Valid only when `kind` is `voice`; all transcripts in one observation together may not exceed 65,536 characters.",
               "title": "Transcript"
+            },
+            "transcript_media_object_id": {
+              "anyOf": [
+                {
+                  "maxLength": 255,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Media object whose audio produced `transcript`. It must belong to the same observation and be audio or video. Omit only for legacy single-audio input, where MindBridge can infer the source without ambiguity.",
+              "title": "Transcript Media Object Id"
             },
             "visual_bbox_xyxy": {
               "anyOf": [
@@ -1128,6 +1143,21 @@
           "minLength": 1,
           "title": "Tenant Id",
           "type": "string"
+        },
+        "text": {
+          "anyOf": [
+            {
+              "maxLength": 2048,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Caller text that belongs to this media observation, such as an instruction, caption, or device context. Omit for media-only input; use `remember` for text without evidence media.",
+          "title": "Text"
         }
       },
       "required": [

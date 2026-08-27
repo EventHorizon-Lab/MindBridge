@@ -36,7 +36,7 @@ from mindbridge.media.clipping import (
     MediaClip,
     audio_windows,
 )
-from mindbridge.models import Embedding, EmbedRequest, EmbedResult, EmbedTask, MediaPart
+from mindbridge.models import Embedding, EmbedRequest, EmbedResult, EmbedTask, MediaPart, TextPart
 
 NOW = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
 TENANT_ID = TenantId("tenant_01")
@@ -90,6 +90,30 @@ async def test_long_span_becomes_one_stored_clip_and_vector_per_window() -> None
         for embedding in derived.embeddings
     )
     assert embedder.tasks == [EmbedTask.DOCUMENT]
+
+
+async def test_transcript_embedding_skips_clip_windows_without_speech() -> None:
+    store = RecordingStore()
+    embedder = RecordingEmbedder()
+
+    derived = await derive_evidence_clips(
+        TENANT_ID,
+        (_evidence("evidence_01", 0, 70_000),),
+        store=store,
+        embedder=embedder,
+        sampling=ClipSampling(),
+        created_at=NOW,
+        cut=_stub_cut,
+        embedding_text=lambda _span, start_ms, _end_ms: {
+            0: "first spoken window",
+            60_000: "last spoken window",
+        }.get(start_ms),
+    )
+
+    assert len(derived.clips) == 3
+    assert [item.object_part for item in derived.embeddings] == [0, 2]
+    assert embedder.texts == ["first spoken window", "last spoken window"]
+    assert embedder.urls == []
 
 
 async def test_an_object_embedded_whole_carries_no_part() -> None:
@@ -263,6 +287,7 @@ class RecordingEmbedder:
         self.tasks: list[EmbedTask] = []
         self.urls: list[str] = []
         self.sampling: tuple[tuple[float | None, int | None], ...] = ()
+        self.texts: list[str] = []
 
     async def embed(self, request: EmbedRequest) -> EmbedResult:
         self.tasks.append(request.task)
@@ -277,6 +302,12 @@ class RecordingEmbedder:
             for input_value in request.inputs
             for part in input_value.parts
             if isinstance(part, MediaPart)
+        )
+        self.texts.extend(
+            part.text
+            for input_value in request.inputs
+            for part in input_value.parts
+            if isinstance(part, TextPart)
         )
         return EmbedResult(
             tuple(

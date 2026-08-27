@@ -16,6 +16,7 @@ from mindbridge.core import (
     ModelReference,
     ModelRequestError,
     ModelUnavailableError,
+    UnsupportedModalityError,
 )
 from mindbridge.models import (
     EmbedRequest,
@@ -29,6 +30,29 @@ from mindbridge.models.openai import OpenAIEmbedder, OpenAIGenerator, normalize_
 from mindbridge.telemetry import model_token_usage, operation_span
 
 MODEL_ID = "jinaai/jina-embeddings-v5-omni-small-retrieval"
+
+
+async def test_generator_rejects_unsupported_media_before_calling_the_provider() -> None:
+    async def unexpected(_request: httpx.Request) -> httpx.Response:
+        raise AssertionError("provider must not be called")
+
+    generator = _generator(
+        unexpected,
+        supported_media_kinds=frozenset({MediaKind.IMAGE, MediaKind.VIDEO}),
+    )
+    try:
+        with pytest.raises(UnsupportedModalityError, match="audio"):
+            await generator.generate(
+                GenerateRequest(
+                    system_prompt="Transcribe evidence.",
+                    input=ModelInput(
+                        (MediaPart(MediaKind.AUDIO, "https://objects.test/audio.wav"),)
+                    ),
+                    max_output_tokens=32,
+                )
+            )
+    finally:
+        await generator.close()
 
 
 async def test_text_query_uses_typed_embedding_sdk() -> None:
@@ -443,6 +467,8 @@ def _schema_request() -> GenerateRequest:
 
 def _generator(
     handler: Callable[[httpx.Request], Coroutine[None, None, httpx.Response]],
+    *,
+    supported_media_kinds: frozenset[MediaKind] = frozenset(MediaKind),
 ) -> OpenAIGenerator:
     return OpenAIGenerator(
         AsyncOpenAI(
@@ -452,6 +478,7 @@ def _generator(
             max_retries=0,
         ),
         ModelReference(model_id="qwen3.8-max"),
+        supported_media_kinds=supported_media_kinds,
     )
 
 

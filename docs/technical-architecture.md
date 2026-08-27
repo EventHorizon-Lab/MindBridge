@@ -582,7 +582,8 @@ MindBridge 只维护一个设备本地身份记忆边界：
 9. 通过门禁的 voice 在后续上传时解析为对应 face pseudonym，同时保留 `kind=voice` 和声纹模型
    provenance；禁止仅按时间重叠或 LLM 单次输出建立等价关系；
 10. 云端 `ObserveRequest.identity_observations` 只包含匿名 `identity_id`、`face|voice`、
-   时间区间、置信度和模型版本，Schema 明确禁止额外 embedding 字段；
+   时间区间、置信度、模型版本、可选 transcript 及其来源媒体 ID，Schema 明确禁止额外
+   embedding 字段；
 11. Worker 按时间重叠把匿名身份写成 `person` Entity 和 EvidenceSpan 级
    `entity_mentions`，因此 `RecallFilters.person_ids` 走生产检索路径；
 12. Observation 或 identity tombstone 在端侧同一事务中删除加密样本和关联证据，防止遗忘后
@@ -1420,7 +1421,7 @@ tests/
 ## 13. 安全与隐私边界
 
 1. 人脸和声纹模板默认仅存在于设备加密存储中；云端只接收设备域匿名 `identity_id`、模态、
-   时间区间、模型版本和置信度，不接收生物 embedding。
+   时间区间、模型版本、置信度、可选 transcript 及其来源媒体 ID，不接收生物 embedding。
 2. 跨设备身份合并必须是显式策略，不能通过通用 Omni 相似度自动完成。
 3. 原始媒体上传前执行设备/租户的隐私策略；可选择裁剪、模糊、静音或仅上传事件摘要。
 4. 端云通信使用 TLS，媒体对象和数据库使用静态加密；密钥不写入配置文件或日志。

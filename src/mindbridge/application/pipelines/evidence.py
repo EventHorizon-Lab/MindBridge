@@ -10,7 +10,7 @@ from mindbridge.application.capabilities import (
     TextPart,
 )
 from mindbridge.application.perception import ResolvedEvidence
-from mindbridge.core import MediaObjectId
+from mindbridge.core import MediaKind, MediaObjectId
 from mindbridge.media.clipping import AUDIO_WINDOW_MS
 
 # Measured against the deployment's endpoint (qwen3.8-27b, vLLM, 262k ctx) with the derived
@@ -37,6 +37,7 @@ def evidence_parts(
     evidence: tuple[ResolvedEvidence, ...],
     *,
     excluded_media_object_ids: Collection[MediaObjectId] = (),
+    excluded_media_kinds: Collection[MediaKind] = (),
     max_media_parts: int = DEFAULT_MAX_EVIDENCE_MEDIA_PARTS,
 ) -> tuple[InputPart, ...]:
     """Label and attach each distinct set of evidence bytes at most once.
@@ -58,9 +59,12 @@ def evidence_parts(
         raise ValueError("max_media_parts must not be negative")
     parts: list[InputPart] = []
     excluded = set(excluded_media_object_ids)
+    excluded_kinds = set(excluded_media_kinds)
     attached_ids: set[MediaObjectId] = set()
     for item in evidence:
         attached = item.attached_media_object or item.media_object
+        if item.media_object.kind in excluded_kinds:
+            continue
         if attached.media_object_id in excluded or attached.media_object_id in attached_ids:
             continue
         if not _is_about_the_span(item):

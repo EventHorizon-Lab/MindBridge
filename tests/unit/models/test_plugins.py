@@ -9,16 +9,30 @@ import pytest
 
 import mindbridge.models.openai as openai_models
 import mindbridge.models.plugins as plugins
+from mindbridge.core import MediaKind
 from mindbridge.models import Embedder, EmbedRequest, EmbedResult, GenerateRequest, GenerateResult
 
 
 class _Generator:
+    @property
+    def supported_media_kinds(self) -> frozenset[MediaKind]:
+        return frozenset(MediaKind)
+
+    async def generate(self, request: GenerateRequest) -> GenerateResult:
+        raise AssertionError(f"not invoked by discovery: {request}")
+
+
+class _UndeclaredGenerator:
     async def generate(self, request: GenerateRequest) -> GenerateResult:
         raise AssertionError(f"not invoked by discovery: {request}")
 
 
 class _SpacelessEmbedder(Embedder):
     """An embedder published without type checking: it never declares its space."""
+
+    @property
+    def supported_media_kinds(self) -> frozenset[MediaKind]:
+        return frozenset(MediaKind)
 
     async def embed(self, request: EmbedRequest) -> EmbedResult:
         raise AssertionError(f"not invoked by discovery: {request}")
@@ -70,6 +84,15 @@ def test_loader_rejects_the_wrong_capability(monkeypatch: pytest.MonkeyPatch) ->
 
     with pytest.raises(TypeError, match="Generator"):
         plugins.load_generator("wrong", {})
+
+
+def test_loader_rejects_a_generator_without_a_modality_declaration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_points(monkeypatch, _Point("undeclared", lambda _config: _UndeclaredGenerator()))
+
+    with pytest.raises(TypeError, match="supported_media_kinds"):
+        plugins.load_generator("undeclared", {})
 
 
 def test_loader_rejects_non_json_configuration(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -124,9 +147,15 @@ def _embedder_config(**changes: object) -> dict[str, object]:
 
 
 def test_bundled_embedder_factory_accepts_a_complete_configuration() -> None:
-    embedder = openai_models.create_embedder(_embedder_config(request_timeout_seconds=30))
+    embedder = openai_models.create_embedder(
+        _embedder_config(
+            request_timeout_seconds=30,
+            supported_media_kinds=["image", "video"],
+        )
+    )
 
     assert embedder.space_reference.space_id == "space"
+    assert embedder.supported_media_kinds == frozenset({MediaKind.IMAGE, MediaKind.VIDEO})
 
 
 @pytest.mark.parametrize(

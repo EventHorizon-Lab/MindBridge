@@ -194,6 +194,7 @@ class FixedEmbedder:
 
     model_reference = EMBEDDING_MODEL
     space_reference = EmbeddingSpaceReference(space_id="jina-v5")
+    supported_media_kinds = frozenset(MediaKind)
 
     def __init__(self, dimension: int = 1_024) -> None:
         self.dimension = dimension

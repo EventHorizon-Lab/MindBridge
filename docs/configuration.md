@@ -174,6 +174,17 @@ attempt: the delivery is still paying for its model call while the ledger alread
 as reclaimable, so a concurrent delivery or one `mindbridge jobs --republish` buys the same
 observation twice. The boot failure names the largest value that fits.
 
+The bundled `openai` Generator and Embedder also accept `supported_media_kinds`. Set it to the
+media content blocks the selected endpoint actually accepts: `[]` for text-only,
+`["image", "video"]` for VL, or `["image", "video", "audio"]` for Omni. Text is always
+supported. The default is all three for backward compatibility. A narrower declaration makes an
+unsupported request fail locally as `unsupported_modality_route`; during observation perception,
+audio alone may be represented by source-linked timestamped edge ASR transcripts for a VLM. The
+Worker applies the same capability declaration independently to evidence embedding: a VL-only
+media Embedder keeps visual embeddings native and sends each audio clip's overlapping transcript
+segments through its own text route. Media and text Embedders must still name the same
+`space_reference`, because evidence and graph vectors meet in recall.
+
 ### Shared embedder
 
 | Variable | Required | Default |
@@ -262,6 +273,7 @@ plugin = "openai"
 endpoint = "https://generator.example.com/v1"
 model_id = "qwen3.8-max"
 reasoning_effort = "low"
+supported_media_kinds = ["image", "video"]
 ```
 
 Also `[embedder]`, `[media_embedder]`, and `[media_sampling]`. `[embedding]`'s two keys are

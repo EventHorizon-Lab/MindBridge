@@ -28,6 +28,7 @@ from mindbridge.application.capabilities import (
     EmbedTask,
     MediaPart,
     ModelInput,
+    TextPart,
 )
 from mindbridge.application.perception import ResolvedEvidence
 from mindbridge.application.ports import (
@@ -151,8 +152,9 @@ async def derive_evidence_clips(
     created_at: datetime,
     max_concurrency: int = 4,
     cut: Callable[[bytes, ClipRequest], tuple[MediaClip, ...]] = cut_clips,
+    embedding_text: Callable[[EvidenceSpan, int, int], str | None] | None = None,
 ) -> DerivedEvidenceClips:
-    """Cut, store, and embed every window of every span exactly once.
+    """Cut and store every window, embedding each window with a faithful representation.
 
     Work is grouped per source object so one file is read once and its bytes are
     released as soon as its clips are uploaded; peak memory is therefore bounded
@@ -187,7 +189,15 @@ async def derive_evidence_clips(
             "mindbridge.evidence.clip_count": len(stored),
         }
     )
-    embeddings = await _embed_stored_clips(tenant_id, stored, store, embedder, created_at, sampling)
+    embeddings = await _embed_stored_clips(
+        tenant_id,
+        stored,
+        store,
+        embedder,
+        created_at,
+        sampling,
+        embedding_text,
+    )
     return DerivedEvidenceClips(
         media_objects=tuple(item.media_object for item in _unique_by_media_object(stored)),
         clips=tuple(
@@ -485,40 +495,55 @@ async def _embed_stored_clips(
     embedder: Embedder,
     created_at: datetime,
     sampling: ClipSampling,
+    embedding_text: Callable[[EvidenceSpan, int, int], str | None] | None,
 ) -> tuple[EmbeddingRecord, ...]:
-    """Sign immediately before encoding so no URL ages during the upload phase."""
+    """Encode clip media or its derived text, signing only media immediately before use."""
     if not stored:
         return ()
-    unique = _unique_by_media_object(stored)
-    signed = await asyncio.gather(
-        *(store.create_presigned_download(item.media_object) for item in unique)
-    )
-    urls = {
-        item.media_object.media_object_id: download.download_url
-        for item, download in zip(unique, signed, strict=True)
-    }
+    if embedding_text is None:
+        embedding_items = stored
+        unique = _unique_by_media_object(stored)
+        signed = await asyncio.gather(
+            *(store.create_presigned_download(item.media_object) for item in unique)
+        )
+        urls = {
+            item.media_object.media_object_id: download.download_url
+            for item, download in zip(unique, signed, strict=True)
+        }
+        inputs = tuple(
+            ModelInput(
+                (
+                    MediaPart(
+                        kind=item.media_object.kind,
+                        url=urls[item.media_object.media_object_id],
+                        source_uri=item.media_object.uri,
+                        frames_per_second=_video_only(
+                            item.frames_per_second, item.media_object.kind
+                        ),
+                        max_pixels=_video_only(sampling.max_pixels, item.media_object.kind),
+                    ),
+                )
+            )
+            for item in embedding_items
+        )
+    else:
+        text_items = tuple(
+            (item, text)
+            for item in stored
+            if (text := embedding_text(item.evidence.evidence_span, item.start_ms, item.end_ms))
+            is not None
+        )
+        if not text_items:
+            return ()
+        embedding_items = tuple(item for item, _ in text_items)
+        inputs = tuple(ModelInput((TextPart(text),)) for _, text in text_items)
     result = await embedder.embed(
         EmbedRequest(
-            inputs=tuple(
-                ModelInput(
-                    (
-                        MediaPart(
-                            kind=item.media_object.kind,
-                            url=urls[item.media_object.media_object_id],
-                            source_uri=item.media_object.uri,
-                            frames_per_second=_video_only(
-                                item.frames_per_second, item.media_object.kind
-                            ),
-                            max_pixels=_video_only(sampling.max_pixels, item.media_object.kind),
-                        ),
-                    )
-                )
-                for item in stored
-            ),
+            inputs=inputs,
             task=EmbedTask.DOCUMENT,
         )
     )
-    if len(result.embeddings) != len(stored):
+    if len(result.embeddings) != len(embedding_items):
         raise ModelOutputError("embedder returned the wrong evidence clip vector count")
     return tuple(
         EmbeddingRecord(
@@ -546,7 +571,7 @@ async def _embed_stored_clips(
             normalized=True,
             created_at=created_at,
         )
-        for item, embedding in zip(stored, result.embeddings, strict=True)
+        for item, embedding in zip(embedding_items, result.embeddings, strict=True)
     )
 
 

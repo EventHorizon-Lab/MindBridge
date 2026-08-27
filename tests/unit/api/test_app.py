@@ -51,6 +51,7 @@ from mindbridge.core import (
     ModelUnavailableError,
     ObjectStorageError,
     TaskBrokerError,
+    UnsupportedModalityError,
     VerificationStatus,
 )
 
@@ -649,6 +650,7 @@ def test_openapi_exposes_stable_operation_ids() -> None:
         (DatabaseUnavailableError("database detail"), 503, "database_unavailable"),
         (ModelUnavailableError("provider detail"), 503, "model_unavailable"),
         (ModelRequestError("provider detail"), 502, "model_request_failed"),
+        (UnsupportedModalityError("route detail"), 422, "unsupported_modality_route"),
         (ModelOutputError("raw output"), 502, "model_output_invalid"),
         (ObjectStorageError("bucket detail"), 503, "object_storage_unavailable"),
         (TaskBrokerError("redis detail"), 503, "task_broker_unavailable"),

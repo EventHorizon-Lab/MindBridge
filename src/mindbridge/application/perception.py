@@ -7,13 +7,18 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from mindbridge.core import (
+    AnonymousIdentityObservation,
     ClaimType,
     DomainInvariantError,
     EntityType,
     EvidenceId,
     EvidenceSpan,
+    IdentityKind,
+    MediaKind,
     MediaObject,
+    MediaObjectId,
     ModelReference,
+    Observation,
     require_aware_datetime,
     require_non_empty,
 )
@@ -41,6 +46,50 @@ def time_ranges_overlap(
     if left_start_ms == left_end_ms or right_start_ms == right_end_ms:
         return left_start_ms <= right_end_ms and right_start_ms <= left_end_ms
     return left_start_ms < right_end_ms and right_start_ms < left_end_ms
+
+
+def resolve_transcript_segments(
+    observation: Observation,
+    media_objects: tuple[MediaObject, ...],
+) -> dict[MediaObjectId, tuple[AnonymousIdentityObservation, ...]]:
+    """Resolve each transcript to one source, inferring only an unambiguous legacy audio."""
+    audio_ids = {item.media_object_id for item in media_objects if item.kind is MediaKind.AUDIO}
+    inferred_audio_id = next(iter(audio_ids)) if len(audio_ids) == 1 else None
+    grouped: dict[MediaObjectId, list[AnonymousIdentityObservation]] = {}
+    for identity in observation.identity_observations:
+        if identity.kind is not IdentityKind.VOICE or identity.transcript is None:
+            continue
+        source_id = identity.transcript_media_object_id or inferred_audio_id
+        if source_id is not None:
+            grouped.setdefault(source_id, []).append(identity)
+    return {
+        source_id: tuple(
+            sorted(
+                segments,
+                key=lambda item: (
+                    item.start_ms,
+                    item.end_ms,
+                    item.identity_id,
+                    item.model_reference.model_id,
+                ),
+            )
+        )
+        for source_id, segments in grouped.items()
+    }
+
+
+def overlapping_transcript_segments(
+    segments_by_media: dict[MediaObjectId, tuple[AnonymousIdentityObservation, ...]],
+    media_object_id: MediaObjectId,
+    start_ms: int,
+    end_ms: int,
+) -> tuple[AnonymousIdentityObservation, ...]:
+    """Return source-owned transcript segments intersecting one exact evidence window."""
+    return tuple(
+        item
+        for item in segments_by_media.get(media_object_id, ())
+        if time_ranges_overlap(item.start_ms, item.end_ms, start_ms, end_ms)
+    )
 
 
 @dataclass(frozen=True, slots=True)

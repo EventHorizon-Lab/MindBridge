@@ -2,11 +2,21 @@
 
 import pytest
 
-from mindbridge.application.capabilities import Embedder, Embedding, EmbedRequest, EmbedResult
+from mindbridge.application.capabilities import (
+    Embedder,
+    Embedding,
+    EmbedRequest,
+    EmbedResult,
+    MediaPart,
+    ModelInput,
+    require_supported_media,
+)
 from mindbridge.core import (
     DomainInvariantError,
     EmbeddingSpaceReference,
+    MediaKind,
     ModelReference,
+    UnsupportedModalityError,
 )
 
 
@@ -37,3 +47,12 @@ def test_an_embedder_without_a_space_fails_the_capability_check() -> None:
     incomplete = Incomplete()  # type: ignore[abstract]
     with pytest.raises(NotImplementedError, match="declare its embedding space"):
         _ = incomplete.space_reference
+
+
+def test_media_capability_rejects_an_unsupported_part_before_inference() -> None:
+    with pytest.raises(UnsupportedModalityError, match="audio"):
+        require_supported_media(
+            ModelInput((MediaPart(MediaKind.AUDIO, "https://objects.test/audio.wav"),)),
+            frozenset({MediaKind.IMAGE, MediaKind.VIDEO}),
+            "Generator",
+        )

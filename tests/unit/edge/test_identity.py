@@ -220,7 +220,14 @@ def test_face_voice_association_requires_repeatable_unambiguous_evidence(tmp_pat
 
     resolved = _resolve(memory, voice)
     assert resolved.identity_id == face.identity_id
-    assert resolved.to_observation_input(start_ms=0, end_ms=1_000).kind is IdentityKind.VOICE
+    cloud_voice = resolved.to_observation_input(
+        start_ms=0,
+        end_ms=1_000,
+        transcript="pass the tool",
+        transcript_media_object_id="audio_01",
+    )
+    assert cloud_voice.kind is IdentityKind.VOICE
+    assert cloud_voice.transcript_media_object_id == "audio_01"
 
     memory.record_face_voice_evidence(
         _association_evidence(

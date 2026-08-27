@@ -34,6 +34,7 @@ from mindbridge.core import (
     ModelUnavailableError,
     ObjectStorageError,
     TaskBrokerError,
+    UnsupportedModalityError,
 )
 from mindbridge.telemetry import current_trace_id
 
@@ -52,6 +53,7 @@ ErrorCode = Literal[
     "memory_integrity_failed",
     "model_output_invalid",
     "model_request_failed",
+    "unsupported_modality_route",
     "database_unavailable",
     "model_unavailable",
     "object_storage_unavailable",
@@ -136,6 +138,10 @@ ERRORS: Final[dict[ErrorCode, ApiError]] = {
         status.HTTP_502_BAD_GATEWAY,
         "memory model rejected its configured request",
     ),
+    "unsupported_modality_route": ApiError(
+        status.HTTP_422_UNPROCESSABLE_CONTENT,
+        "the configured model route does not support the supplied modalities",
+    ),
     "database_unavailable": ApiError(
         status.HTTP_503_SERVICE_UNAVAILABLE,
         "memory storage is temporarily unavailable",
@@ -180,6 +186,7 @@ RUNTIME_ERROR_CODES: Final[dict[type[Exception], ErrorCode]] = {
     MemoryDeletedError: "memory_deleted",
     MemoryIntegrityError: "memory_integrity_failed",
     ModelOutputError: "model_output_invalid",
+    UnsupportedModalityError: "unsupported_modality_route",
     ModelRequestError: "model_request_failed",
     DatabaseUnavailableError: "database_unavailable",
     ModelUnavailableError: "model_unavailable",

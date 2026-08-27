@@ -33,8 +33,9 @@ rather than a port.
 
 This is the part worth reading twice.
 
-**Leaves the device:** anonymous identity IDs, time ranges, optional voice transcripts, identity
-scope, normalized face bounding boxes, and the media the deployment chose to upload.
+**Leaves the device:** anonymous identity IDs, time ranges, optional voice transcripts and their
+source media IDs, identity scope, normalized face bounding boxes, and the media the deployment
+chose to upload.
 
 **Never leaves the device:** raw face and voice embeddings, and the device encryption key.
 

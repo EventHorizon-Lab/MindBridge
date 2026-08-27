@@ -3,6 +3,7 @@
 import json
 import logging
 from collections.abc import Callable, Coroutine
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from typing import cast
 
@@ -38,6 +39,7 @@ from mindbridge.core import (
     ObservationId,
     SensorKind,
     TenantId,
+    UnsupportedModalityError,
 )
 from mindbridge.models.openai import OpenAIGenerator, normalize_base_url
 
@@ -133,6 +135,172 @@ async def test_perception_pipeline_returns_grounded_event_and_its_model() -> Non
         "toolbox",
     ]
     assert result.events[0].claims[0].entity_indices == (0, 1)
+
+
+async def test_vlm_route_uses_timestamped_asr_instead_of_sending_audio() -> None:
+    async def respond(request: httpx.Request) -> httpx.Response:
+        payload: dict[str, object] = json.loads(request.content)
+        messages = cast(list[dict[str, object]], payload["messages"])
+        content = cast(list[dict[str, object]], messages[1]["content"])
+
+        assert {item["type"] for item in content} >= {"text", "video_url"}
+        assert "input_audio" not in {item["type"] for item in content}
+        joined_text = "\n".join(
+            cast(str, item["text"]) for item in content if item["type"] == "text"
+        )
+        assert '"text":"focus on the spoken instruction"' in joined_text
+        assert '"transcript":"put the red tool beside the toolbox"' in joined_text
+        assert "timestamped voice transcripts" in joined_text
+        return _streaming_response(
+            {
+                "events": [
+                    {
+                        "start_ms": 0,
+                        "end_ms": 4_000,
+                        "description": "A person gives a spoken instruction while handling tools.",
+                        "salience": 0.8,
+                        "evidence_ids": ["evidence_video", "evidence_audio"],
+                    }
+                ]
+            }
+        )
+
+    observation = replace(
+        _observation(),
+        text="focus on the spoken instruction",
+        identity_observations=(
+            *_observation().identity_observations,
+            AnonymousIdentityObservation(
+                identity_id="speaker_device_01",
+                kind=IdentityKind.VOICE,
+                start_ms=0,
+                end_ms=4_000,
+                confidence=0.9,
+                model_reference=ModelReference(model_id="FunAudioLLM/SenseVoiceSmall"),
+                transcript="put the red tool beside the toolbox",
+                transcript_media_object_id=MediaObjectId("media_audio"),
+            ),
+        ),
+    )
+    perceiver = _perceiver(
+        respond,
+        supported_media_kinds=frozenset({MediaKind.IMAGE, MediaKind.VIDEO}),
+    )
+    try:
+        result = await perceiver.perceive_events(
+            observation,
+            (
+                _evidence(MediaKind.VIDEO, "clip.mp4", "video"),
+                _evidence(MediaKind.AUDIO, "clip.wav", "audio"),
+            ),
+        )
+    finally:
+        await perceiver.close()
+
+    assert result.events[0].evidence_ids == (
+        EvidenceId("evidence_video"),
+        EvidenceId("evidence_audio"),
+    )
+
+
+async def test_vlm_route_refuses_a_second_audio_without_its_own_transcript() -> None:
+    async def unexpected(_request: httpx.Request) -> httpx.Response:
+        raise AssertionError("provider must not be called")
+
+    observation = replace(
+        _observation(),
+        media_object_ids=(MediaObjectId("media_audio"), MediaObjectId("media_audio_second")),
+        identity_observations=(
+            AnonymousIdentityObservation(
+                identity_id="speaker_device_01",
+                kind=IdentityKind.VOICE,
+                start_ms=0,
+                end_ms=4_000,
+                confidence=0.9,
+                model_reference=ModelReference(model_id="FunAudioLLM/SenseVoiceSmall"),
+                transcript="only the first source was transcribed",
+                transcript_media_object_id=MediaObjectId("media_audio"),
+            ),
+        ),
+    )
+    perceiver = _perceiver(
+        unexpected,
+        supported_media_kinds=frozenset({MediaKind.IMAGE, MediaKind.VIDEO}),
+    )
+    try:
+        with pytest.raises(UnsupportedModalityError, match="every audio evidence span"):
+            await perceiver.perceive_events(
+                observation,
+                (
+                    _evidence(MediaKind.AUDIO, "clip.wav", "audio"),
+                    _evidence(MediaKind.AUDIO, "clip-second.wav", "audio_second"),
+                ),
+            )
+    finally:
+        await perceiver.close()
+
+
+async def test_vlm_route_refuses_audio_without_an_asr_transcript() -> None:
+    async def unexpected(_request: httpx.Request) -> httpx.Response:
+        raise AssertionError("provider must not be called")
+
+    perceiver = _perceiver(
+        unexpected,
+        supported_media_kinds=frozenset({MediaKind.IMAGE, MediaKind.VIDEO}),
+    )
+    try:
+        with pytest.raises(UnsupportedModalityError, match="timestamped ASR transcript"):
+            await perceiver.perceive_events(
+                _observation(),
+                (_evidence(MediaKind.AUDIO, "clip.wav", "audio"),),
+            )
+    finally:
+        await perceiver.close()
+
+
+async def test_vlm_route_refuses_audio_event_outside_its_transcript_time() -> None:
+    async def respond(_request: httpx.Request) -> httpx.Response:
+        return _streaming_response(
+            {
+                "events": [
+                    {
+                        "start_ms": 2_000,
+                        "end_ms": 3_000,
+                        "description": "An ungrounded audio event.",
+                        "salience": 0.5,
+                        "evidence_ids": ["evidence_audio"],
+                    }
+                ]
+            }
+        )
+
+    observation = replace(
+        _observation(),
+        identity_observations=(
+            AnonymousIdentityObservation(
+                identity_id="speaker_device_01",
+                kind=IdentityKind.VOICE,
+                start_ms=0,
+                end_ms=1_000,
+                confidence=0.9,
+                model_reference=ModelReference(model_id="FunAudioLLM/SenseVoiceSmall"),
+                transcript="speech ends before the event",
+                transcript_media_object_id=MediaObjectId("media_audio"),
+            ),
+        ),
+    )
+    perceiver = _perceiver(
+        respond,
+        supported_media_kinds=frozenset({MediaKind.IMAGE, MediaKind.VIDEO}),
+    )
+    try:
+        with pytest.raises(ModelOutputError, match="outside its source-linked ASR"):
+            await perceiver.perceive_events(
+                observation,
+                (_evidence(MediaKind.AUDIO, "clip.wav", "audio"),),
+            )
+    finally:
+        await perceiver.close()
 
 
 async def test_perception_pipeline_retries_invalid_output_once_in_json_mode() -> None:
@@ -509,6 +677,8 @@ async def test_perception_pipeline_rejects_output_whose_every_event_was_dropped(
 
 def _perceiver(
     handler: Callable[[httpx.Request], Coroutine[None, None, httpx.Response]],
+    *,
+    supported_media_kinds: frozenset[MediaKind] = frozenset(MediaKind),
 ) -> "_PerceptionHarness":
     http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     client = AsyncOpenAI(
@@ -521,6 +691,7 @@ def _perceiver(
         OpenAIGenerator(
             client,
             ModelReference(model_id="qwen3.8-max"),
+            supported_media_kinds=supported_media_kinds,
         )
     )
 

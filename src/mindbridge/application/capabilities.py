@@ -12,7 +12,10 @@ from mindbridge.core import (
     EmbeddingSpaceReference,
     MediaKind,
     ModelReference,
+    UnsupportedModalityError,
 )
+
+ALL_MEDIA_KINDS = frozenset(MediaKind)
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,6 +68,33 @@ class ModelInput:
     def __post_init__(self) -> None:
         if not self.parts:
             raise DomainInvariantError("model input must contain at least one part")
+
+
+def require_supported_media(
+    input_value: ModelInput,
+    supported_media_kinds: frozenset[MediaKind],
+    capability: str,
+) -> None:
+    """Fail before a provider call when one model input contains unsupported media."""
+    unsupported = sorted(
+        {
+            part.kind.value
+            for part in input_value.parts
+            if isinstance(part, MediaPart) and part.kind not in supported_media_kinds
+        }
+    )
+    if unsupported:
+        raise UnsupportedModalityError(
+            f"configured {capability} does not support media kind(s): {', '.join(unsupported)}"
+        )
+
+
+def declared_supported_media_kinds(capability: object) -> frozenset[MediaKind]:
+    """Read and validate the modality declaration required from a loaded model adapter."""
+    value = getattr(capability, "supported_media_kinds", None)
+    if not isinstance(value, frozenset) or any(not isinstance(kind, MediaKind) for kind in value):
+        raise TypeError("a model adapter must declare supported_media_kinds as MediaKind values")
+    return value
 
 
 @dataclass(frozen=True, slots=True)

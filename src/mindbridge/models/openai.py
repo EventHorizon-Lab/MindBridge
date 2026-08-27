@@ -20,6 +20,7 @@ from openai.types.shared import ReasoningEffort
 from openai.types.shared_params import ResponseFormatJSONObject, ResponseFormatJSONSchema
 
 from mindbridge.application.capabilities import (
+    ALL_MEDIA_KINDS,
     Embedding,
     EmbedRequest,
     EmbedResult,
@@ -29,6 +30,7 @@ from mindbridge.application.capabilities import (
     MediaPart,
     ModelInput,
     TextPart,
+    require_supported_media,
 )
 from mindbridge.configuration import (
     PluginConfigModel,
@@ -78,6 +80,7 @@ class OpenAIGenerator:
         reasoning_effort: ReasoningEffort = None,
         video_frames_per_second: float = DEFAULT_VIDEO_FRAMES_PER_SECOND,
         video_max_pixels: int = DEFAULT_VIDEO_MAX_PIXELS,
+        supported_media_kinds: frozenset[MediaKind] = ALL_MEDIA_KINDS,
     ) -> None:
         if request_timeout_seconds <= 0:
             raise ValueError("request timeout must be positive")
@@ -85,12 +88,17 @@ class OpenAIGenerator:
             raise ValueError("video sampling values must be positive")
         if reasoning_effort is not None and reasoning_effort not in REASONING_EFFORT_VALUES:
             raise ValueError("reasoning effort is not supported")
+        if not isinstance(supported_media_kinds, frozenset) or any(
+            not isinstance(kind, MediaKind) for kind in supported_media_kinds
+        ):
+            raise ValueError("supported media kinds must be a frozenset of MediaKind values")
         self._client = client
         self._model_reference = model_reference
         self._request_timeout_seconds = request_timeout_seconds
         self._reasoning_effort = reasoning_effort
         self._video_frames_per_second = video_frames_per_second
         self._video_max_pixels = video_max_pixels
+        self._supported_media_kinds = supported_media_kinds
         self._schema_decoding_supported = True
 
     @classmethod
@@ -105,6 +113,7 @@ class OpenAIGenerator:
         reasoning_effort: ReasoningEffort = None,
         video_frames_per_second: float = DEFAULT_VIDEO_FRAMES_PER_SECOND,
         video_max_pixels: int = DEFAULT_VIDEO_MAX_PIXELS,
+        supported_media_kinds: frozenset[MediaKind] = ALL_MEDIA_KINDS,
     ) -> OpenAIGenerator:
         if any(not value.strip() for value in (api_key, model_id)):
             raise ValueError("API key and model ID are required")
@@ -122,11 +131,18 @@ class OpenAIGenerator:
             reasoning_effort=reasoning_effort,
             video_frames_per_second=video_frames_per_second,
             video_max_pixels=video_max_pixels,
+            supported_media_kinds=supported_media_kinds,
         )
+
+    @property
+    def supported_media_kinds(self) -> frozenset[MediaKind]:
+        """Declare which OpenAI-compatible content blocks this endpoint accepts."""
+        return self._supported_media_kinds
 
     @operation_span("mindbridge.model.generate")
     async def generate(self, request: GenerateRequest) -> GenerateResult:
         """Stream one deterministic text result and normalize provider failures."""
+        require_supported_media(request.input, self._supported_media_kinds, "Generator")
         constrained = request.output_schema is not None and self._schema_decoding_supported
         set_current_span_attributes(
             {
@@ -246,14 +262,20 @@ class OpenAIEmbedder:
         space_reference: EmbeddingSpaceReference,
         dimension: int = 1_024,
         request_timeout_seconds: float = 120.0,
+        supported_media_kinds: frozenset[MediaKind] = ALL_MEDIA_KINDS,
     ) -> None:
         if dimension <= 0 or request_timeout_seconds <= 0:
             raise ValueError("dimension and request timeout must be positive")
+        if not isinstance(supported_media_kinds, frozenset) or any(
+            not isinstance(kind, MediaKind) for kind in supported_media_kinds
+        ):
+            raise ValueError("supported media kinds must be a frozenset of MediaKind values")
         self._client = client
         self._model_reference = model_reference
         self._space_reference = space_reference
         self._dimension = dimension
         self._request_timeout_seconds = request_timeout_seconds
+        self._supported_media_kinds = supported_media_kinds
 
     @classmethod
     def connect(
@@ -266,6 +288,7 @@ class OpenAIEmbedder:
         dimension: int = 1_024,
         request_timeout_seconds: float = 120.0,
         max_retries: int = 2,
+        supported_media_kinds: frozenset[MediaKind] = ALL_MEDIA_KINDS,
     ) -> OpenAIEmbedder:
         if any(not value.strip() for value in (api_key, model_id)):
             raise ValueError("embedding credentials and model identities are required")
@@ -282,6 +305,7 @@ class OpenAIEmbedder:
             space_reference=space_reference,
             dimension=dimension,
             request_timeout_seconds=request_timeout_seconds,
+            supported_media_kinds=supported_media_kinds,
         )
 
     @property
@@ -289,11 +313,18 @@ class OpenAIEmbedder:
         """Declare the search space both aligned endpoints write into."""
         return self._space_reference
 
+    @property
+    def supported_media_kinds(self) -> frozenset[MediaKind]:
+        """Declare which multimodal embedding blocks this endpoint accepts."""
+        return self._supported_media_kinds
+
     @operation_span("mindbridge.model.embed")
     async def embed(self, request: EmbedRequest) -> EmbedResult:
         """Encode a homogeneous batch without exposing provider request shapes."""
         if not request.inputs:
             return EmbedResult(embeddings=())
+        for input_value in request.inputs:
+            require_supported_media(input_value, self._supported_media_kinds, "Embedder")
         set_current_span_attributes(
             {
                 "mindbridge.model.id": self._model_reference.model_id,
@@ -401,6 +432,7 @@ class _GeneratorConfig(PluginConfigModel):
     reasoning_effort: PluginText | None = None
     video_frames_per_second: PluginNumber = DEFAULT_VIDEO_FRAMES_PER_SECOND
     video_max_pixels: PluginInteger = DEFAULT_VIDEO_MAX_PIXELS
+    supported_media_kinds: frozenset[MediaKind] = ALL_MEDIA_KINDS
 
 
 class _EmbedderConfig(PluginConfigModel):
@@ -411,6 +443,7 @@ class _EmbedderConfig(PluginConfigModel):
     dimension: MatryoshkaDimension = DEFAULT_EMBEDDING_DIMENSION
     request_timeout_seconds: PluginNumber = 120.0
     max_retries: PluginInteger = 2
+    supported_media_kinds: frozenset[MediaKind] = ALL_MEDIA_KINDS
 
 
 def create_generator(config: Mapping[str, object]) -> OpenAIGenerator:
@@ -425,6 +458,7 @@ def create_generator(config: Mapping[str, object]) -> OpenAIGenerator:
         reasoning_effort=cast(ReasoningEffort, validated.reasoning_effort),
         video_frames_per_second=validated.video_frames_per_second,
         video_max_pixels=validated.video_max_pixels,
+        supported_media_kinds=validated.supported_media_kinds,
     )
 
 
@@ -439,6 +473,7 @@ def create_embedder(config: Mapping[str, object]) -> OpenAIEmbedder:
         dimension=validated.dimension,
         request_timeout_seconds=validated.request_timeout_seconds,
         max_retries=validated.max_retries,
+        supported_media_kinds=validated.supported_media_kinds,
     )
 
 

@@ -196,6 +196,66 @@ def test_observe_accepts_only_bounded_anonymous_identity_metadata() -> None:
         transcript="spoken words",
     )
     assert voice.transcript == "spoken words"
+    with pytest.raises(ValidationError, match="requires a transcript"):
+        IdentityObservationInput.model_validate(
+            {**identity.model_dump(), "transcript_media_object_id": "media_01"}
+        )
+
+
+def test_observe_requires_transcript_media_to_be_owned_and_audio_bearing() -> None:
+    audio = MediaObjectInput(
+        media_object_id="audio_01",
+        kind=MediaKind.AUDIO,
+        uri="s3://memories/audio.wav",
+        sha256="b" * 64,
+        size_bytes=100,
+        duration_ms=1_000,
+        created_at=NOW,
+    )
+    voice = IdentityObservationInput(
+        identity_id="speaker_device_01",
+        kind=IdentityKind.VOICE,
+        start_ms=0,
+        end_ms=500,
+        confidence=0.9,
+        model_id="funasr/sensevoice",
+        transcript="spoken words",
+        transcript_media_object_id="audio_01",
+    )
+
+    assert _observe_request(
+        ended_at=NOW + timedelta(seconds=1), media_objects=(audio,), identity_observations=(voice,)
+    )
+    with pytest.raises(ValidationError, match="must belong"):
+        _observe_request(
+            ended_at=NOW + timedelta(seconds=1),
+            media_objects=(audio,),
+            identity_observations=(
+                voice.model_copy(update={"transcript_media_object_id": "audio_missing"}),
+            ),
+        )
+    image = audio.model_copy(
+        update={
+            "media_object_id": "image_01",
+            "kind": MediaKind.IMAGE,
+            "uri": "s3://memories/image.png",
+            "duration_ms": None,
+        }
+    )
+    with pytest.raises(ValidationError, match="must contain audio"):
+        _observe_request(
+            ended_at=NOW + timedelta(seconds=1),
+            media_objects=(image,),
+            identity_observations=(
+                voice.model_copy(update={"transcript_media_object_id": "image_01"}),
+            ),
+        )
+
+
+def test_observe_accepts_text_alongside_media() -> None:
+    request = _observe_request().model_copy(update={"text": "a caller-provided caption"})
+
+    assert request.text == "a caller-provided caption"
 
 
 def test_request_collections_reject_unbounded_fanout() -> None:

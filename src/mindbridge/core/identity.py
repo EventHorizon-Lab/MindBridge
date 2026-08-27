@@ -6,6 +6,7 @@ from enum import Enum
 
 from mindbridge.core._validation import require_non_empty
 from mindbridge.core.errors import DomainInvariantError
+from mindbridge.core.identifiers import MediaObjectId
 from mindbridge.core.memory import ModelReference
 
 
@@ -35,6 +36,7 @@ class AnonymousIdentityObservation:
     model_reference: ModelReference
     scope: IdentityScope = IdentityScope.DEVICE
     transcript: str | None = None
+    transcript_media_object_id: MediaObjectId | None = None
     visual_bbox_xyxy: tuple[float, float, float, float] | None = None
 
     def __post_init__(self) -> None:
@@ -48,6 +50,7 @@ class AnonymousIdentityObservation:
                 raise DomainInvariantError("identity transcript requires a voice identity")
             if not self.transcript.strip() or self.transcript != self.transcript.strip():
                 raise DomainInvariantError("identity transcript must not be blank or padded")
+        _require_transcript_media(self.transcript, self.transcript_media_object_id)
         if self.visual_bbox_xyxy is not None:
             if self.kind is not IdentityKind.FACE:
                 raise DomainInvariantError("visual bounding boxes require a face identity")
@@ -60,3 +63,14 @@ class AnonymousIdentityObservation:
                 or bottom <= top
             ):
                 raise DomainInvariantError("visual bounding box must be normalized xyxy")
+
+
+def _require_transcript_media(
+    transcript: str | None,
+    media_object_id: MediaObjectId | None,
+) -> None:
+    if media_object_id is None:
+        return
+    if transcript is None:
+        raise DomainInvariantError("transcript media requires an identity transcript")
+    require_non_empty(media_object_id, "transcript_media_object_id")

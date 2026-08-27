@@ -613,7 +613,10 @@ async def test_postgres_vertical_path_is_idempotent_and_evidence_first(
 ) -> None:
     """The production store runs observe, remember, and recall without a side path."""
     kernel = _kernel(store)
-    request = _observe_request(tenant_id="tenant_roundtrip")
+    request = _observe_request(
+        tenant_id="tenant_roundtrip",
+        text="focus on the caller's caption",
+    )
 
     first = await kernel.observe(request)
     retry = await kernel.observe(request)
@@ -644,6 +647,7 @@ async def test_postgres_vertical_path_is_idempotent_and_evidence_first(
     assert job.state is JobState.PENDING
     assert job.observation_id == first.observation_id
     assert stored_batch.observation.observation_id == first.observation_id
+    assert stored_batch.observation.text == "focus on the caller's caption"
     assert stored_batch.media_objects[0].media_object_id == "media_01"
     assert stored_batch.evidence_spans[0].end_ms == 4_000
     assert stored_batch.observation.identity_observations[0].identity_id == "person_device_01"
@@ -1444,6 +1448,7 @@ def _observe_request(
     sequence: int = 1,
     media_object_id: str = "media_01",
     idempotency_key: str | None = None,
+    text: str | None = None,
 ) -> ObserveRequest:
     return ObserveRequest(
         tenant_id=tenant_id,
@@ -1451,6 +1456,7 @@ def _observe_request(
         boot_id="boot_01",
         sequence=sequence,
         sensor=SensorKind.CAMERA,
+        text=text,
         media_objects=(
             MediaObjectInput(
                 media_object_id=media_object_id,

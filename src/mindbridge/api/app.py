@@ -150,6 +150,7 @@ def build_app(
         responses=responses(
             *TENANT_ERRORS,
             "enumeration_limit_exceeded",
+            "unsupported_modality_route",
             *_EMBEDDING_ERRORS,
             *_EVIDENCE_ERRORS,
         ),

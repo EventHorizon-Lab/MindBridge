@@ -103,6 +103,7 @@ accept an upload.
 | `boot_id` | string | yes | Changes on every device restart, so `sequence` need not survive one. |
 | `sequence` | int ≥ 0 | yes | Monotonic within one `boot_id`; orders and deduplicates. |
 | `sensor` | `camera` \| `microphone` | yes | The only two sensors that can carry required evidence. |
+| `text` | string \| null | no | Caller text paired with this evidence; use `remember` for text without media. |
 | `media_objects` | `MediaObjectInput[]` | yes | 1–8 items, no repeated `media_object_id`. |
 | `occurred_at` | datetime | yes | When the observed events began. |
 | `ended_at` | datetime | yes | Must not precede `occurred_at`. |
@@ -136,6 +137,7 @@ Anonymous by construction — an `identity_id`, never a face or voice template.
 | `model_id` | string | Provenance: the edge model that produced the span. |
 | `scope` | `device` \| `observation` | Default `device`. |
 | `transcript` | string \| null | `voice` only. All transcripts in one observation ≤ 65,536 characters. |
+| `transcript_media_object_id` | string \| null | Audio or video object that produced `transcript`. Required to disambiguate multiple audio sources; one explicit audio source can be inferred for legacy payloads. |
 | `visual_bbox_xyxy` | 4 floats \| null | `face` only. **0..1 normalized** `(left, top, right, bottom)`, not pixels. Must have positive width and height. |
 
 Pixels here are a real and previously shipped bug: a detector that leaks pixel coordinates makes

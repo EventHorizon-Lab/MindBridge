@@ -24,6 +24,7 @@ _SHA256_HEX_LENGTH = 64
 _SIGNED_INT64_MAX = 2**63 - 1
 _SIGNED_INT32_MIN = -(2**31)
 _SIGNED_INT32_MAX = 2**31 - 1
+_MAX_OBSERVATION_TEXT_CHARACTERS = 2_048
 
 
 class MediaKind(str, Enum):
@@ -138,6 +139,7 @@ class Observation:
     ended_at: datetime
     observed_at: datetime
     clock_offset_ms: int = 0
+    text: str | None = None
     identity_observations: tuple[AnonymousIdentityObservation, ...] = ()
 
     def __post_init__(self) -> None:
@@ -152,6 +154,10 @@ class Observation:
             raise DomainInvariantError("sequence must fit a non-negative signed 64-bit integer")
         if not _SIGNED_INT32_MIN <= self.clock_offset_ms <= _SIGNED_INT32_MAX:
             raise DomainInvariantError("clock_offset_ms must fit a signed 32-bit integer")
+        if self.text is not None:
+            require_non_empty(self.text, "text")
+            if len(self.text) > _MAX_OBSERVATION_TEXT_CHARACTERS:
+                raise DomainInvariantError("observation text exceeds the character limit")
         if not self.media_object_ids:
             raise DomainInvariantError("an observation must reference at least one media object")
         if len(set(self.media_object_ids)) != len(self.media_object_ids):
@@ -161,6 +167,7 @@ class Observation:
         duration_ms = round((self.ended_at - self.occurred_at).total_seconds() * 1_000)
         if any(identity.end_ms > duration_ms for identity in self.identity_observations):
             raise DomainInvariantError("identity observation exceeds its source observation")
+        _require_identity_transcript_media(self.identity_observations, self.media_object_ids)
         identity_keys = [
             (
                 identity.kind,
@@ -181,6 +188,18 @@ class Observation:
         canonical = json.dumps(components, ensure_ascii=False, separators=(",", ":"))
         digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
         return f"observation_{digest}"
+
+
+def _require_identity_transcript_media(
+    identities: tuple[AnonymousIdentityObservation, ...],
+    media_object_ids: tuple[MediaObjectId, ...],
+) -> None:
+    if any(
+        identity.transcript_media_object_id is not None
+        and identity.transcript_media_object_id not in media_object_ids
+        for identity in identities
+    ):
+        raise DomainInvariantError("identity transcript media must belong to its observation")
 
 
 @dataclass(frozen=True, slots=True)

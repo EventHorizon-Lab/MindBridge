@@ -34,6 +34,162 @@ over MCP.
 reference benchmark modules by string to route to them, which is exactly the loophole the AST
 guard was tightened to catch.
 
+## Multimodal routing and portability
+
+MindBridge is one public memory system for text, image, video, audio, and mixed input, with model
+and hardware choices made at deployment boundaries rather than exposed as provider-specific
+product APIs. **The software routing target is substantially, but not universally, implemented as
+of 2026-08-27.** Text-only writes, mixed observation text, declared model capabilities, native
+VL/Omni requests, source-linked ASR-to-VLM perception, and ASR-text evidence embedding for a
+VL-only Embedder are executable. Server-side ASR for raw cloud audio, audio-track discovery inside
+video containers, per-request model selection, and several claimed hardware adapters remain
+outside the current implementation.
+
+### Current implementation
+
+| Requirement | Status | What the current runtime actually does |
+| --- | --- | --- |
+| Recall with text, image, video, audio, or a mixture | Shipped, capability-gated | `RecallQuery` accepts text, up to eight stored media IDs, or both. The recall path signs those objects, creates one ordered `ModelInput`, and sends it to one Embedder. Text also enables PostgreSQL full-text search. Answering sends query media and recalled evidence to the configured Generator. Bundled adapters reject undeclared media before their provider call. Recall has no on-demand ASR fallback, and query media must already belong to the tenant. |
+| Write image, video, audio, or mixed media | Shipped | `ObserveRequest` accepts one to eight media objects, and perception routes every resolved object according to Generator capabilities. Supported derived clips go to the media Embedder. If that Embedder is VL-only, source-linked audio transcript windows use its text route instead. Graph and memory text use the text Embedder, and both embedders must declare the same search space. |
+| Write text alone, or text plus media | Shipped across the public write surface | `remember()` is the text-only path. `ObserveRequest.text` persists caller text beside one to eight evidence objects and perception receives it in `observation_context`. An Observation intentionally remains evidence-bearing and therefore still requires media; MindBridge does not manufacture evidence for text-only memories. |
+| Select a text, VL, or Omni path from input and model capabilities | Shipped for observation writes and capability-gated elsewhere | Every loaded Generator and Embedder adapter declares `supported_media_kinds`. The bundled adapters validate every `ModelInput` before inference. The OpenAI Embedder uses its text call for text-only input and its multimodal wire shape otherwise. Perception selects native VL, native Omni, or ASR-to-VLM; observation processing independently selects native media embedding or same-space transcript embedding. Recall validates unsupported raw query media rather than manufacturing a transcript. |
+| Use native Omni when the configured Generator accepts AV | Shipped | With `supported_media_kinds = ["image", "video", "audio"]`, perception preserves the original ordered parts and the bundled Generator serializes them for its OpenAI-compatible endpoint. Capability comes from configuration, never a model-name guess. |
+| Fall back from a VLM-only Generator to ASR + VL/text embedding + VLM | Shipped for already-transcribed observations | With Generator and media Embedder `supported_media_kinds = ["image", "video"]`, perception omits only explicit audio blocks and sends source-linked transcript context to the VLM. Visual clips retain native VL embeddings; each audio clip is sent to that VL Embedder as only the transcript segments overlapping its time window. Original audio clips and evidence spans remain authoritative provenance. Missing, ambiguous, or non-overlapping transcript ownership fails as `unsupported_modality_route` before an incompatible model call. A generic server Transcriber is not shipped. |
+| Let operators replace models without forking product pipelines | Shipped with limits | Python entry points select Generator and Embedder adapters, and each process can point at a different endpoint. The bundled set is one OpenAI-compatible Generator plus OpenAI-wire and local Jina Embedders. Model selection is per deployment process, not per request, and a third-party adapter still has to implement the current wire-neutral protocol. |
+| Run cloud-only or cloud-edge | Shipped, with route-dependent ASR | API, Worker, stores, and model endpoints can all run in the cloud; edge capture is optional. The edge package supplies FunASR transcripts, capture handoff, encrypted identity state, an offline outbox, sync, and deletion reconciliation. A cloud-only deployment can use native audio-capable models today; a VLM-only cloud deployment must supply timestamped transcripts until a server Transcriber exists. Cloud-only still needs PostgreSQL, Redis, and S3-compatible storage. |
+| Run unchanged on Jetson, RDK, RK, OpenVINO, generic ARM, or dGPU | Architecture boundary only for several targets | The common edge contracts are vendor-neutral. Bundled local Jina selects Torch CPU/CUDA, and portable identity code selects available ONNX Runtime CPU/CUDA/TensorRT providers. Ready-to-run and measured RDK BPU, RKNN, OpenVINO, and complete Jetson capture/runtime adapters remain validation work, as recorded in the [technical architecture roadmap](technical-architecture.md#16-实施路线图). |
+
+The important distinction is **multimodal representation versus multimodal routing**.
+`ModelInput` solves representation. It deliberately has no `OmniInput` subtype: Omni is one way
+to execute a combination of parts, not another kind of user data. Capability declarations now
+prove whether a configured adapter accepts those parts. Perception owns generation fallback and
+observation processing owns evidence-embedding fallback; both use the same source-linked
+timestamped transcript index. No general planner claims a fallback for data it cannot derive.
+
+### Routing contract and remaining target
+
+MindBridge forms a profile from the explicit input parts: text, image, video, and audio. The
+remaining target is to inspect media manifests so a video with an audible track counts as visual
+**and** audio even when both tracks share one container. Today that case must arrive as a separate
+audio object or a timestamped transcript. No route may silently discard a declared part to fit a
+model.
+
+| Input profile | Preferred generation path | Embedding path | Valid fallback |
+| --- | --- | --- | --- |
+| Text | Text-capable Generator | Text Embedder | None needed; a VLM or Omni model may satisfy the text capability. |
+| Text + image or silent video | VLM | VL or Omni Embedder over the supplied parts | A text-only model is not a faithful fallback. Fail if no visual-capable Generator is configured. |
+| Audio, with optional text | Audio-capable Omni Generator | Native audio embedding | Use a source-linked timestamped transcript with a text-capable Generator and the VL Embedder's text route. Preserve the original audio as evidence. |
+| Visual + audio, with optional text | Omni Generator over the original AV and text | Native embeddings for accepted media clips | Send visual parts, caller text, and source-linked transcript to a VLM. Keep native VL embeddings for visual clips and feed the matching audio transcript windows through the same VL Embedder as text. |
+
+```mermaid
+flowchart TD
+  input["Public input<br/>text · image · video · audio"] --> inspect["Normalize one input profile<br/>text · visual · audio tracks"]
+
+  inspect --> audio{"Audio present?"}
+  audio -->|no| visual{"Visual present?"}
+  visual -->|no| text["Text route<br/>text-capable Generator"]
+  visual -->|yes| vl["VL route<br/>visual + text → VLM"]
+  audio -->|yes| native{"Generator accepts<br/>the full profile?"}
+  native -->|yes| omni["Omni route<br/>original AV + text → Omni"]
+  native -->|no| asr{"Source-linked timestamped<br/>transcript available?"}
+  asr -->|no| fail["unsupported_modality_route"]
+  asr -->|yes| transcript["Transcript segments<br/>overlapping audio evidence"]
+  transcript --> fallback["Fallback route<br/>visual + text + transcript → VLM"]
+
+  inspect --> embed{"Embedder accepts<br/>the original profile?"}
+  embed -->|yes| native_embed["Native VL/Omni embedding"]
+  embed -->|no| reduced{"A faithful reduced<br/>profile exists?"}
+  reduced -->|yes| reduced_embed["VL/text embedding<br/>with derived transcript"]
+  reduced -->|no| fail
+
+  classDef input fill:#e8f1ff,stroke:#2457a7,color:#102a43;
+  classDef route fill:#e8f7ee,stroke:#26834a,color:#12351f;
+  classDef decision fill:#fff6dd,stroke:#a66b00,color:#4d3200;
+  classDef error fill:#fdecec,stroke:#b42318,color:#5a0c08;
+  class input,inspect input;
+  class text,vl,omni,transcript,fallback,native_embed,reduced_embed route;
+  class audio,visual,native,asr,embed,reduced decision;
+  class fail error;
+```
+
+Generation and embedding are planned independently because a deployment may have a VLM
+Generator and an Omni Embedder, or the reverse. The planner chooses the path before any provider
+call; a provider error is not capability discovery and must not trigger an unrecorded switch of
+model or evidence.
+
+The capability contract is:
+
+- A Generator adapter declares its accepted media parts in `supported_media_kinds`; text support
+  is part of the base capability. The adapter remains responsible for provider-specific blocks.
+- An Embedder declares the same media set in addition to its `space_reference`. Every document and
+  query vector that can meet must still land in one declared space.
+- A generic Transcriber capability is added only with the first portable or server-side
+  implementation. It must return timestamped text with model provenance and source spans. Until
+  then, only explicitly supplied edge voice transcripts are eligible for fallback.
+- Perception composes the declared Generator capability with those transcripts. Provider names do
+  not create duplicate Perception, Recall, or Answer pipelines.
+- `IdentityObservationInput.transcript_media_object_id` binds ASR output to the audio or video
+  object that produced it. A missing link is inferred only when the observation has exactly one
+  explicit audio object; multiple audio sources require explicit links. Generation events and
+  evidence-embedding clips must overlap the linked transcript time range. A clip window with no
+  speech keeps its evidence clip but gets no fabricated text vector.
+- An unsupported combination fails with `unsupported_modality_route` before the incompatible
+  adapter call. Derived transcripts are representations of original audio, never replacement
+  evidence.
+
+### Model, provider, and hardware freedom
+
+The public contracts must depend on semantic parts and evidence references, not on CUDA tensors,
+provider SDK objects, or vendor model names. Deployment configuration selects adapters and model
+IDs. Python entry points remain the extension mechanism; OpenAI-compatible APIs are one adapter
+family rather than the definition of compatibility.
+
+Prefer existing open interfaces at each boundary:
+
+| Boundary | Preferred contract | Portability consequence |
+| --- | --- | --- |
+| Agent and application clients | REST + OpenAPI, Python SDK, MCP | Clients do not change with the model provider or hardware placement. |
+| Model plugins | Python entry points and MindBridge capability types | Local runtimes and official provider SDKs can coexist without provider branches in application code. |
+| Served generation and embedding | OpenAI-compatible APIs where the endpoint truly supports the required content blocks | Common text calls are reusable; audio/video extensions must stay explicit because their request shapes are not universal standards. |
+| Media | Addressable image/audio/video objects, S3-compatible storage, FFmpeg/PyAV decoding | Cloud and edge processes exchange durable media references rather than device memory. |
+| Persistence and messaging | PostgreSQL + pgvector, Redis + Celery | The memory kernel is independent of a GPU vendor and model-serving topology. |
+| Telemetry | OpenTelemetry and W3C trace context | Local and hosted components share one trace without a proprietary observer. |
+| Edge inference | Platform-native runtimes behind the same normalized output contracts | TensorRT/DeepStream, ONNX Runtime, OpenVINO, RKNN, and BPU adapters may differ internally; evidence spans, identities, outbox records, and deletion semantics may not. |
+
+Three deployment shapes must remain valid:
+
+1. **Cloud-only:** clients place media in object storage and call the public API; API, workers,
+   databases, and model endpoints run in cloud infrastructure. Edge identity is absent unless the
+   client supplies equivalent anonymous metadata.
+2. **Cloud-edge:** the device captures media, optionally performs ASR/identity/event gating, and
+   syncs through the durable outbox; cloud workers perform global perception, retrieval, and
+   consolidation.
+3. **Locally served models:** a cloud or edge host runs selected Generator/Embedder adapters near
+   its accelerator while the same application contracts remain intact. This is an extension seam,
+   not yet a turnkey fully offline MindBridge deployment.
+
+Model freedom currently means **operator-selected models per process**. Per-request or per-tenant
+model selection is not part of this target: it would change reproducibility, capacity isolation,
+and embedding-space migration semantics, and should be added only for a concrete product need.
+
+### Completion gates
+
+The remaining completion gates are explicit so shipped routing is not confused with universal
+routing:
+
+1. **Shipped:** the public write surface accepts text-only, media-only, and mixed input while
+   preserving provenance and idempotency.
+2. **Shipped:** contract and processing tests cover native Omni, source-linked ASR-to-VLM,
+   VL/text reduced evidence embedding, multi-audio ambiguity rejection, and rejection without ASR.
+3. **Partial:** a VLM-only edge deployment processes AV through timestamped ASR without dropping
+   original audio. A VLM-only cloud deployment cannot yet derive that transcript itself.
+4. **Shipped:** unsupported combinations fail before the incompatible provider call and name the
+   missing capability.
+5. **Open:** cloud-only and cloud-edge integration tests must cover every claimed route; each
+   claimed hardware family also needs a
+   real-device report for capture, runtime, memory, throughput, power, disconnect recovery, and
+   deletion propagation. A portable interface alone is not hardware support.
+
 ## Process topology
 
 ```mermaid
@@ -103,7 +259,7 @@ sequenceDiagram
   W->>S: build generation proxy (when enabled)
   W->>W: perception -> Event / Entity / Claim
   W->>S: reread source; cut span-sized derived clips
-  W->>W: send clips and text to the shared embedder
+  W->>W: embed native clips or matching ASR windows in one vector space
   W->>P: graph + memories + vectors (one transaction)
 ```
 
@@ -119,7 +275,9 @@ Three properties of the worker stage are worth knowing before you tune it:
   derivation.
 - **Clips follow grounded spans.** Image and video spans produce one derived clip; audio longer
   than the encoder's 30-second window is split so its tail is not lost. Each vector therefore
-  covers a span-sized window instead of the whole source.
+  covers a span-sized window instead of the whole source. With a VL-only media Embedder, audio
+  windows use only overlapping source-linked transcript segments; silent windows are stored as
+  evidence but are not assigned made-up text vectors.
 - **Clips are uploaded before the transaction that registers them.** An interrupted attempt can
   leave an object no record references. Clip keys are content-addressed so a retry cannot
   multiply it, and `mindbridge lifecycle --reclaim-orphan-clips` deletes what is already there.
@@ -228,7 +386,7 @@ resolves region and credentials exactly as it does for every other tool on the h
 ## Model boundary
 
 Models are frozen. Learning happens in the memory layer — feedback, consolidation, strength —
-never in weights. Three slots, selected by plugin name:
+never in weights. Three slots are currently shipped, selected by plugin name:
 
 | Slot | Default | Loaded by |
 | --- | --- | --- |
@@ -240,6 +398,11 @@ Plugins resolve through `importlib.metadata` entry points (`mindbridge.generator
 `mindbridge.embedders`), so a third-party adapter is installable without a fork. The author
 contract is in [plugin-architecture.md](plugin-architecture.md).
 
+Each loaded adapter declares `supported_media_kinds`, and the bundled adapters validate it before
+provider calls. The optional Transcriber composition and remaining routing limits are specified in
+[multimodal routing and portability](#multimodal-routing-and-portability). Capabilities must not be
+inferred from a model name.
+
 The worker's text slot deliberately reuses `MINDBRIDGE_EMBEDDER_*` rather than owning a parallel
 variable family. It has to land in the space the API queries; a second name is a second thing
 that can silently disagree. A worker that genuinely needs a different endpoint sets a different
@@ -247,14 +410,16 @@ value for the same name, since each process has its own environment.
 
 ## Edge boundary
 
-The edge is platform-neutral — Jetson, RDK, RK, OpenVINO x86, generic ARM, or a workstation
-where the "edge" is a 4090. Only the capture backend and inference runtime change; the
-observation timeline, identity gates, and forget semantics are identical everywhere.
+The edge **code boundary** is platform-neutral — Jetson, RDK, RK, OpenVINO x86, generic ARM, or a
+workstation where the "edge" is a 4090. Only the capture backend and inference runtime may change;
+the observation timeline, identity gates, and forget semantics are identical everywhere. This is
+an adapter contract, not a claim that every named backend is already shipped or validated; see the
+[current portability status](#current-implementation).
 
 What crosses the boundary is deliberately narrow. The device sends anonymous identity IDs, time
-ranges, optional transcripts, identity scope, and normalized face boxes. **Raw face and voice
-embeddings and the device encryption key never leave it** — they are AES-256-GCM encrypted in a
-local SQLite store keyed from the device TPM or secret manager.
+ranges, optional transcripts with source media IDs, identity scope, and normalized face boxes.
+**Raw face and voice embeddings and the device encryption key never leave it** — they are
+AES-256-GCM encrypted in a local SQLite store keyed from the device TPM or secret manager.
 
 Deletion reconciles in the other direction: an offline device pages `GET /v1/deletions` from its
 last cursor on reconnect, and removes matching cache rows and identity samples before advancing

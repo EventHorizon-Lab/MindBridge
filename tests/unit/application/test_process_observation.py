@@ -57,9 +57,10 @@ from mindbridge.core import (
     RelationType,
     SensorKind,
     TenantId,
+    UnsupportedModalityError,
 )
 from mindbridge.media.clipping import ClipRequest, MediaClip, audio_windows
-from mindbridge.models import Embedding, EmbedRequest, EmbedResult, MediaPart
+from mindbridge.models import Embedding, EmbedRequest, EmbedResult, MediaPart, TextPart
 
 NOW = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
 TENANT_ID = TenantId("tenant_01")
@@ -70,8 +71,14 @@ JOB_ID = JobId("job_process_observation_01")
 class RecordingProcessingStore:
     """Strict fake for one durable processing attempt."""
 
-    def __init__(self, *, claimed_at: datetime = NOW) -> None:
+    def __init__(
+        self,
+        *,
+        claimed_at: datetime = NOW,
+        batch: ObservationBatch | None = None,
+    ) -> None:
         self._claimed_at = claimed_at
+        self._batch = batch
         self.job = _job(JobState.PENDING, attempt=0)
         self.output: ObservationProcessingOutput | None = None
 
@@ -95,7 +102,7 @@ class RecordingProcessingStore:
         tenant_id: TenantId,
         observation_id: ObservationId,
     ) -> ObservationBatch:
-        return _batch()
+        return self._batch or _batch()
 
     async def commit_observation_processing(
         self,
@@ -189,9 +196,11 @@ class RecordingEmbedder:
     """Proves raw signed media, not a caption, reaches Jina document encoding."""
 
     space_reference = EmbeddingSpaceReference(space_id="jina-v5")
+    supported_media_kinds = frozenset(MediaKind)
 
     def __init__(self) -> None:
         self.documents: tuple[str, ...] = ()
+        self.texts: tuple[str, ...] = ()
 
     async def embed(self, request: EmbedRequest) -> EmbedResult:
         self.documents = tuple(
@@ -199,6 +208,12 @@ class RecordingEmbedder:
             for input_value in request.inputs
             for part in input_value.parts
             if isinstance(part, MediaPart)
+        )
+        self.texts = tuple(
+            part.text
+            for input_value in request.inputs
+            for part in input_value.parts
+            if isinstance(part, TextPart)
         )
         return EmbedResult(
             tuple(
@@ -696,6 +711,10 @@ def test_event_perception_rejects_an_unbounded_detail_fanout() -> None:
         (DatabaseUnavailableError("database detail"), "database_unavailable"),
         (ModelUnavailableError("secret provider detail"), "model_unavailable"),
         (ModelRequestError("secret provider detail"), "model_request_failed"),
+        (
+            UnsupportedModalityError("secret provider detail"),
+            "unsupported_modality_route",
+        ),
     ],
 )
 async def test_processor_records_sanitized_failure_state(
@@ -778,6 +797,132 @@ def test_processing_rejects_embedders_in_different_search_spaces() -> None:
             RecordingEmbedder(),
             DriftedTextEmbedder(),
         )
+
+
+async def test_vl_embedder_indexes_audio_from_only_its_overlapping_transcript() -> None:
+    audio_id = MediaObjectId("media_01")
+    batch = _audio_batch(
+        (audio_id,),
+        (
+            AnonymousIdentityObservation(
+                identity_id="speaker_01",
+                kind=IdentityKind.VOICE,
+                start_ms=1_000,
+                end_ms=2_000,
+                confidence=0.9,
+                model_reference=ModelReference(model_id="funasr/sensevoice"),
+                transcript="pass the red wrench",
+                transcript_media_object_id=audio_id,
+            ),
+        ),
+    )
+    store = RecordingProcessingStore(batch=batch)
+    perceiver = RecordingPerceiver()
+    media_embedder = RecordingEmbedder()
+    media_embedder.supported_media_kinds = frozenset({MediaKind.IMAGE, MediaKind.VIDEO})
+    text_embedder = RecordingTextEmbedder()
+
+    await _processor(store, perceiver, media_embedder, text_embedder).run(
+        TENANT_ID, OBSERVATION_ID, JOB_ID
+    )
+
+    assert media_embedder.documents == ()
+    assert media_embedder.texts == ("pass the red wrench",)
+    assert ("pass the red wrench",) not in text_embedder.requests
+    assert store.output is not None
+    evidence_embeddings = [
+        item
+        for item in store.output.embeddings
+        if item.object_type is EmbeddedObjectType.EVIDENCE_SPAN
+    ]
+    assert len(evidence_embeddings) == 1
+    assert evidence_embeddings[0].model_reference.model_id == "jina-omni"
+    assert store.output.media_objects[0].kind is MediaKind.AUDIO
+
+
+async def test_vl_embedder_refuses_ambiguous_legacy_transcript_sources() -> None:
+    audio_ids = (MediaObjectId("media_01"), MediaObjectId("media_02"))
+    batch = _audio_batch(
+        audio_ids,
+        (
+            AnonymousIdentityObservation(
+                identity_id="speaker_01",
+                kind=IdentityKind.VOICE,
+                start_ms=0,
+                end_ms=4_000,
+                confidence=0.9,
+                model_reference=ModelReference(model_id="funasr/sensevoice"),
+                transcript="this source is intentionally unspecified",
+            ),
+        ),
+    )
+    store = RecordingProcessingStore(batch=batch)
+    perceiver = RecordingPerceiver()
+    media_embedder = RecordingEmbedder()
+    media_embedder.supported_media_kinds = frozenset({MediaKind.IMAGE, MediaKind.VIDEO})
+
+    with pytest.raises(UnsupportedModalityError, match="source-linked timestamped ASR"):
+        await _processor(
+            store,
+            perceiver,
+            media_embedder,
+            RecordingTextEmbedder(),
+        ).run(TENANT_ID, OBSERVATION_ID, JOB_ID)
+
+    assert perceiver.calls == 0
+    assert store.job.error_code == "unsupported_modality_route"
+
+
+async def test_vl_embedder_keeps_two_audio_sources_transcripts_separate() -> None:
+    audio_ids = (MediaObjectId("media_01"), MediaObjectId("media_02"))
+    identities = tuple(
+        AnonymousIdentityObservation(
+            identity_id=f"speaker_{index}",
+            kind=IdentityKind.VOICE,
+            start_ms=0,
+            end_ms=4_000,
+            confidence=0.9,
+            model_reference=ModelReference(model_id="funasr/sensevoice"),
+            transcript=f"source {index}",
+            transcript_media_object_id=media_id,
+        )
+        for index, media_id in enumerate(audio_ids, start=1)
+    )
+
+    class TwoAudioPerceiver(RecordingPerceiver):
+        async def perceive_events(
+            self,
+            observation: Observation,
+            evidence: tuple[ResolvedEvidence, ...],
+        ) -> EventPerception:
+            self.calls += 1
+            return EventPerception(
+                events=tuple(
+                    PerceivedEvent(
+                        start_ms=0,
+                        end_ms=4_000,
+                        description=f"Speech from source {index}.",
+                        salience=0.8,
+                        evidence_ids=(EvidenceId(f"evidence_{index:02d}"),),
+                    )
+                    for index in (1, 2)
+                ),
+                model_reference=ModelReference(model_id="qwen3.8-max"),
+                prompt_version="perceive_events_v1",
+            )
+
+    store = RecordingProcessingStore(batch=_audio_batch(audio_ids, identities))
+    media_embedder = RecordingEmbedder()
+    media_embedder.supported_media_kinds = frozenset({MediaKind.IMAGE, MediaKind.VIDEO})
+
+    await _processor(
+        store,
+        TwoAudioPerceiver(),
+        media_embedder,
+        RecordingTextEmbedder(),
+    ).run(TENANT_ID, OBSERVATION_ID, JOB_ID)
+
+    assert media_embedder.texts == ("source 1", "source 2")
 
 
 def _processor(
@@ -865,6 +1010,46 @@ def _batch() -> ObservationBatch:
                 end_ms=4_000,
                 created_at=NOW,
             ),
+        ),
+    )
+
+
+def _audio_batch(
+    media_ids: tuple[MediaObjectId, ...],
+    identities: tuple[AnonymousIdentityObservation, ...],
+) -> ObservationBatch:
+    observation = replace(
+        _batch().observation,
+        sensor=SensorKind.MICROPHONE,
+        media_object_ids=media_ids,
+        identity_observations=identities,
+    )
+    return ObservationBatch(
+        media_objects=tuple(
+            MediaObject(
+                media_object_id=media_id,
+                tenant_id=TENANT_ID,
+                kind=MediaKind.AUDIO,
+                uri=f"s3://memory/tenants/tenant_01/{media_id}.wav",
+                sha256=f"{index:064x}",
+                size_bytes=100,
+                created_at=NOW,
+                duration_ms=4_000,
+            )
+            for index, media_id in enumerate(media_ids, start=1)
+        ),
+        observation=observation,
+        evidence_spans=tuple(
+            EvidenceSpan(
+                evidence_id=EvidenceId(f"evidence_{index:02d}" if index > 1 else "evidence_01"),
+                tenant_id=TENANT_ID,
+                observation_id=OBSERVATION_ID,
+                media_object_id=media_id,
+                start_ms=0,
+                end_ms=4_000,
+                created_at=NOW,
+            )
+            for index, media_id in enumerate(media_ids, start=1)
         ),
     )
 

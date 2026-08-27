@@ -858,6 +858,20 @@
             "description": "What was said in this span. Valid only when `kind` is `voice`; all transcripts in one observation together may not exceed 65,536 characters.",
             "title": "Transcript"
           },
+          "transcript_media_object_id": {
+            "anyOf": [
+              {
+                "maxLength": 255,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Media object whose audio produced `transcript`. It must belong to the same observation and be audio or video. Omit only for legacy single-audio input, where MindBridge can infer the source without ambiguity.",
+            "title": "Transcript Media Object Id"
+          },
           "visual_bbox_xyxy": {
             "anyOf": [
               {
@@ -1597,6 +1611,20 @@
             "minLength": 1,
             "title": "Tenant Id",
             "type": "string"
+          },
+          "text": {
+            "anyOf": [
+              {
+                "maxLength": 2048,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Caller text that belongs to this media observation, such as an instruction, caption, or device context. Omit for media-only input; use `remember` for text without evidence media.",
+            "title": "Text"
           }
         },
         "required": [
@@ -3521,7 +3549,7 @@
                 }
               }
             },
-            "description": "`request_validation_failed` — request validation failed\n\n`enumeration_limit_exceeded` — the enumerate scope exceeds the bound; narrow the filters"
+            "description": "`request_validation_failed` — request validation failed\n\n`enumeration_limit_exceeded` — the enumerate scope exceeds the bound; narrow the filters\n\n`unsupported_modality_route` — the configured model route does not support the supplied modalities"
           },
           "500": {
             "content": {

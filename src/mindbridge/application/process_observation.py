@@ -10,6 +10,7 @@ from time import perf_counter
 
 from mindbridge.application.capabilities import (
     Embedder,
+    declared_supported_media_kinds,
 )
 from mindbridge.application.derive_observation_graph import (
     derive_observation_graph,
@@ -18,6 +19,7 @@ from mindbridge.application.derive_observation_graph import (
 from mindbridge.application.evidence import resolve_evidence_media
 from mindbridge.application.evidence_clips import (
     ClipSampling,
+    DerivedEvidenceClips,
     derive_evidence_clips,
     generation_proxies,
 )
@@ -26,6 +28,8 @@ from mindbridge.application.perception import (
     EventPerception,
     PerceivedEvent,
     ResolvedEvidence,
+    overlapping_transcript_segments,
+    resolve_transcript_segments,
     time_ranges_overlap,
 )
 from mindbridge.application.ports import (
@@ -34,6 +38,7 @@ from mindbridge.application.ports import (
     Perceiver,
 )
 from mindbridge.core import (
+    AnonymousIdentityObservation,
     ClaimType,
     DatabaseUnavailableError,
     DomainInvariantError,
@@ -43,7 +48,9 @@ from mindbridge.core import (
     EvidenceSpan,
     JobId,
     JobState,
+    MediaKind,
     MediaObject,
+    MediaObjectId,
     MemoryIntegrityError,
     ModelOutputError,
     ModelRequestError,
@@ -53,6 +60,7 @@ from mindbridge.core import (
     ObservationId,
     ObservationProcessingJob,
     TenantId,
+    UnsupportedModalityError,
     derive_stable_id,
 )
 from mindbridge.media.clipping import (
@@ -96,6 +104,7 @@ class ProcessObservation:
         self._store = store
         self._perceiver = perceiver
         self._media_embedder = media_embedder
+        self._media_supported_kinds = declared_supported_media_kinds(media_embedder)
         self._text_embedder = text_embedder
         self._media_url_signer = media_url_signer
         self._clip_sampling = clip_sampling or ClipSampling()
@@ -141,6 +150,12 @@ class ProcessObservation:
 
         try:
             batch = await self._store.read_observation_batch(tenant_id, observation_id)
+            transcript_segments = _require_embedding_route(
+                batch.observation,
+                batch.media_objects,
+                batch.evidence_spans,
+                self._media_supported_kinds,
+            )
             evidence = await resolve_evidence_media(
                 batch.evidence_spans,
                 batch.media_objects,
@@ -209,15 +224,51 @@ class ProcessObservation:
                 _referenced_media(batch.media_objects, event_evidence),
                 self._media_url_signer,
             )
-            derived_clips, graph_embeddings = await asyncio.gather(
+            native_evidence = tuple(
+                item
+                for item in embedding_evidence
+                if item.media_object.kind in self._media_supported_kinds
+            )
+            transcript_evidence = tuple(
+                item
+                for item in embedding_evidence
+                if item.media_object.kind not in self._media_supported_kinds
+            )
+            set_current_span_attributes(
+                {
+                    "mindbridge.embedding.route": (
+                        "native_and_asr_text"
+                        if native_evidence and transcript_evidence
+                        else "asr_text"
+                        if transcript_evidence
+                        else "native"
+                    )
+                }
+            )
+            native_clips, transcript_clips, graph_embeddings = await asyncio.gather(
                 derive_evidence_clips(
                     tenant_id,
-                    embedding_evidence,
+                    native_evidence,
                     store=self._media_url_signer,
                     embedder=self._media_embedder,
                     sampling=self._clip_sampling,
                     created_at=claim.job.created_at,
                     cut=self._clip_cutter,
+                ),
+                derive_evidence_clips(
+                    tenant_id,
+                    transcript_evidence,
+                    store=self._media_url_signer,
+                    embedder=self._media_embedder,
+                    sampling=self._clip_sampling,
+                    created_at=claim.job.created_at,
+                    cut=self._clip_cutter,
+                    embedding_text=lambda span, start_ms, end_ms: _transcript_text(
+                        transcript_segments,
+                        span,
+                        start_ms,
+                        end_ms,
+                    ),
                 ),
                 embed_observation_graph(
                     tenant_id,
@@ -229,6 +280,7 @@ class ProcessObservation:
                     claim.job.created_at,
                 ),
             )
+            derived_clips = _merge_derived_clips(native_clips, transcript_clips)
             output = ObservationProcessingOutput(
                 evidence_spans=event_evidence,
                 events=events,
@@ -334,6 +386,65 @@ def _referenced_media(
     """Keep only the media the given spans point at, as the resolver requires."""
     required = {span.media_object_id for span in spans}
     return tuple(item for item in media_objects if item.media_object_id in required)
+
+
+def _require_embedding_route(
+    observation: Observation,
+    media_objects: tuple[MediaObject, ...],
+    evidence_spans: tuple[EvidenceSpan, ...],
+    supported_media_kinds: frozenset[MediaKind],
+) -> dict[MediaObjectId, tuple[AnonymousIdentityObservation, ...]]:
+    """Validate reduced audio embedding before perception or an incompatible model call."""
+    unsupported = {item.kind for item in media_objects} - supported_media_kinds
+    if unsupported and unsupported != {MediaKind.AUDIO}:
+        names = ", ".join(sorted(kind.value for kind in unsupported))
+        raise UnsupportedModalityError(
+            f"configured Embedder does not support media kind(s): {names}"
+        )
+    transcripts = resolve_transcript_segments(observation, media_objects)
+    media_by_id = {item.media_object_id: item for item in media_objects}
+    if unsupported and any(
+        media_by_id[span.media_object_id].kind is MediaKind.AUDIO
+        and not overlapping_transcript_segments(
+            transcripts,
+            span.media_object_id,
+            span.start_ms,
+            span.end_ms,
+        )
+        for span in evidence_spans
+    ):
+        raise UnsupportedModalityError(
+            "configured Embedder does not support audio; transcript embedding requires a "
+            "source-linked timestamped ASR transcript for every audio evidence span"
+        )
+    return transcripts
+
+
+def _transcript_text(
+    segments_by_media: dict[MediaObjectId, tuple[AnonymousIdentityObservation, ...]],
+    span: EvidenceSpan,
+    start_ms: int,
+    end_ms: int,
+) -> str | None:
+    segments = overlapping_transcript_segments(
+        segments_by_media,
+        span.media_object_id,
+        start_ms,
+        end_ms,
+    )
+    text = "\n".join(item.transcript for item in segments if item.transcript is not None)
+    return text or None
+
+
+def _merge_derived_clips(
+    left: DerivedEvidenceClips,
+    right: DerivedEvidenceClips,
+) -> DerivedEvidenceClips:
+    return DerivedEvidenceClips(
+        media_objects=left.media_objects + right.media_objects,
+        clips=left.clips + right.clips,
+        embeddings=left.embeddings + right.embeddings,
+    )
 
 
 def _ground_events(
@@ -471,6 +582,8 @@ def _processing_error_code(
         return "model_unavailable"
     if isinstance(error, ModelOutputError):
         return "model_output_invalid"
+    if isinstance(error, UnsupportedModalityError):
+        return "unsupported_modality_route"
     if isinstance(error, ModelRequestError):
         return "model_request_failed"
     if isinstance(error, ObjectStorageError):

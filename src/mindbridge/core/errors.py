@@ -49,6 +49,10 @@ class ModelRequestError(RuntimeError):
     """Raised when retrying an unchanged model request cannot succeed."""
 
 
+class UnsupportedModalityError(ModelRequestError):
+    """Raised before inference when a configured model cannot accept an input modality."""
+
+
 class ModelOutputError(RuntimeError):
     """Raised when model output violates its declared contract."""
 

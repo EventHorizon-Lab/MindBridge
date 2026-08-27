@@ -42,9 +42,9 @@ async def _insert_observation(
         INSERT INTO observations (
             tenant_id, observation_id, device_id, boot_id, sequence, sensor,
             occurred_at, ended_at, observed_at, clock_offset_ms,
-            identity_observations, content_digest
+            input_text, identity_observations, content_digest
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT DO NOTHING
         RETURNING observation_id
         """,
@@ -59,6 +59,7 @@ async def _insert_observation(
             observation.ended_at,
             observation.observed_at,
             observation.clock_offset_ms,
+            observation.text,
             Jsonb(
                 [
                     {
@@ -70,6 +71,7 @@ async def _insert_observation(
                         "model_id": identity.model_reference.model_id,
                         "scope": identity.scope.value,
                         "transcript": identity.transcript,
+                        "transcript_media_object_id": identity.transcript_media_object_id,
                         "visual_bbox_xyxy": identity.visual_bbox_xyxy,
                     }
                     for identity in observation.identity_observations
