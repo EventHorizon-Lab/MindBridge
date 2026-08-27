@@ -3,9 +3,10 @@
 Fast, local multimodal memory for Python agents.
 
 MindBridge gives an application one small `Memory` object for durable text, image, video, and
-audio memory, dense/hybrid retrieval, and grounded answers. SQLite and a content-addressed store
-are authoritative; Zvec is a rebuildable local search index. There is no database service, queue
-worker, object store, or account hierarchy to configure.
+audio memory, explicit semantic/episodic/procedural roles, temporal retrieval, optional soft
+decay, and grounded answers. SQLite and a content-addressed store are authoritative; Zvec is a
+rebuildable local search index. There is no database service, queue worker, object store, or
+account hierarchy to configure.
 
 ## Quick start
 
@@ -120,19 +121,29 @@ stored embeddings without embedding historical content again. Keep the complete 
 backing up or moving a memory. On POSIX, opening a directory enforces top-level mode `0700`.
 
 Each memory currently has one aggregate embedding. A routed query with text uses hybrid
-dense/full-text search; a pure-media query uses dense search. Text and ordered media are routed
-according to model capabilities. MindBridge does not yet create chunks, per-asset vectors, or a
-reranking stage.
+dense/full-text search; a pure-media query uses dense search. Memory type and event-time filters
+are pushed into Zvec and rechecked against SQLite. Detected temporal expressions and optional
+decay apply a deterministic query-time rerank. MindBridge does not yet create chunks, per-asset
+vectors, or a learned reranking stage.
 
 ## Python API
 
 The synchronous surface is deliberately small:
 
 ```python
-record = memory.add(content, metadata={"source": "notes"})
-records = memory.add_many(["first", Path("second.png")])
-hits = memory.search(query, limit=10)
-answer = memory.ask(question, limit=5)
+from mindbridge import MemoryType
+
+record = memory.add(
+    content,
+    metadata={"source": "notes"},
+    memory_type=MemoryType.SEMANTIC,
+)
+records = memory.add_many(
+    ["first", Path("second.png")],
+    memory_type=MemoryType.EPISODIC,
+)
+hits = memory.search(query, limit=10, memory_type=MemoryType.EPISODIC)
+answer = memory.ask(question, limit=5, reference_at=None)
 turns = memory.speech(record.id)  # timed text and stable local speaker_id values
 if turns and turns[0].speaker_id:
     memory.register_speaker(turns[0].speaker_id, "Ada")
@@ -217,8 +228,8 @@ Each directory also persists `transcription_space`, the stable ID for its ASR mo
 transcript-affecting recipe, and refuses a different value at startup. The built-in `data` transport
 limits each embedding or generation call to 64 MiB of aggregate raw media; trusted co-located
 `file` transport or a streaming custom backend is the path for larger video. A grounded answer
-sends retrieved content, timestamps, metadata, and media to the generation endpoint, limits their
-serialized text evidence to 4 MiB, and sends each distinct binary asset once.
+sends retrieved content, memory type, timestamps, metadata, and media to the generation endpoint,
+limits serialized text evidence to 4 MiB, and sends each distinct binary asset once.
 
 Capabilities are explicit. Configure only the modalities each operation actually accepts. When
 embedding or generation does not support audio, MindBridge transcribes it and sends the transcript
@@ -260,6 +271,7 @@ organize paths in the harness; they are not fields in the product API or storage
 
 - [Get started](docs/quickstart.md)
 - [Core concepts](docs/concepts.md)
+- [Memory types, temporal reasoning, and decay](docs/memory-types-time-and-decay.md)
 - [Architecture](docs/architecture.md)
 - [Configuration](docs/configuration.md)
 - [Python API](docs/api/python-sdk.md)

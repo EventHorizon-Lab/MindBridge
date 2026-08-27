@@ -30,8 +30,8 @@ flowchart LR
 | `Memory` | Content normalization, capability routing, identity, orchestration, public errors |
 | `AsyncMemory` | `asyncio.to_thread` facade over the same synchronous core |
 | `AssetStore` | Safe Path/URL/Blob ingestion, public-IP connection pinning, immutable SHA-256 files |
-| `LocalStore` | SQLite records, assets, embeddings, biometric identities, transactions, outbox |
-| `ZvecIndex` | Dense, full-text, and reciprocal-rank hybrid retrieval |
+| `LocalStore` | SQLite records, roles/times, assets, FP32 embeddings, biometric identities, outbox |
+| `ZvecIndex` | Dense/full-text hybrid retrieval plus role and event-time filters |
 | `EmbeddingBackend` | Embedding capabilities, stable model/space identity, query/document batches |
 | `ModelBackend` | Combined cloud embedding compatibility, grounded generation, and transcription |
 | `SpeechBackend` | Timed transcription, diarization, and stable speech-space identity |
@@ -149,9 +149,10 @@ remain exclusive.
 ## Read consistency
 
 Search drains pending index work and prepares one aggregate query embedding. A routed query with
-text uses Zvec hybrid search; a pure-media query uses dense search. MindBridge then hydrates records
-and ordered asset descriptors from SQLite, preserves ranking, and drops candidates missing from
-authoritative state.
+text uses Zvec hybrid search; a pure-media query uses dense search. Optional role and detected
+event-time filters reduce candidates. MindBridge then hydrates records and ordered assets from
+SQLite, rechecks those constraints, and drops candidates missing from authoritative state.
+Temporal intent and enabled decay over-fetch a bounded pool and apply a deterministic rerank.
 
 Listing bypasses Zvec and reads newest records directly from SQLite with an opaque keyset cursor
 over `(created_at, id)`.
@@ -163,6 +164,7 @@ the source media nor another historical model call:
 
 - Pending outbox work is replayed at open and before dependent operations.
 - If `zvec/` is absent, startup checkpoints all embeddings before creating the replacement index.
+- A recognized older index recipe is discarded and rebuilt automatically after SQLite migration.
 - `reindex()` replaces the derived collection from SQLite in bounded batches.
 - `optimize()` compacts and flushes staged Zvec state.
 
@@ -176,5 +178,6 @@ live in the `local` extra; InsightFace, ONNX Runtime, and OpenCV live in `face`;
 in `server`; and MCP lives in `mcp`. Importing MindBridge does not import those optional runtimes.
 
 The current retrieval unit is one memory and one aggregate embedding. The architecture does not
-claim content chunking, multiple vectors per memory, or reranking. For table and flow details, read
-[technical architecture](technical-architecture.md).
+claim content chunking, multiple vectors per memory, autonomous consolidation, or learned
+reranking. For table and flow details, read [technical architecture](technical-architecture.md)
+and [memory types, temporal reasoning, and decay](memory-types-time-and-decay.md).

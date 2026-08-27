@@ -34,6 +34,7 @@ from mindbridge.types import (
     Blob,
     ContentInput,
     MemoryRecord,
+    MemoryType,
     Modality,
     Page,
     SearchHit,
@@ -142,20 +143,26 @@ class MemoryCreate(_RequestModel):
     content: _Content
     occurred_at: AwareDatetime | None = None
     metadata: dict[str, JsonValue] = Field(default_factory=dict)
+    memory_type: MemoryType = MemoryType.SEMANTIC
 
 
 class MemoryBatchCreate(_RequestModel):
     contents: Annotated[list[_Content], Field(min_length=1, max_length=100)]
+    memory_type: MemoryType = MemoryType.SEMANTIC
 
 
 class QueryRequest(_RequestModel):
     query: _Content
     limit: _Limit = 10
+    memory_type: MemoryType | None = None
+    reference_at: AwareDatetime | None = None
 
 
 class AnswerRequest(_RequestModel):
     question: _Content
     limit: _Limit = 5
+    memory_type: MemoryType | None = None
+    reference_at: AwareDatetime | None = None
 
 
 class _ResponseModel(BaseModel):
@@ -175,6 +182,7 @@ class MemoryResponse(_ResponseModel):
     id: str
     content: str
     modality: Modality
+    memory_type: MemoryType
     assets: tuple[AssetResponse, ...] = ()
     created_at: AwareDatetime
     occurred_at: AwareDatetime | None = None
@@ -214,13 +222,33 @@ class _Memory(Protocol):
         *,
         occurred_at: datetime | None = None,
         metadata: Mapping[str, object] | None = None,
+        memory_type: MemoryType = MemoryType.SEMANTIC,
     ) -> MemoryRecord: ...
 
-    def add_many(self, contents: Sequence[ContentInput]) -> tuple[MemoryRecord, ...]: ...
+    def add_many(
+        self,
+        contents: Sequence[ContentInput],
+        *,
+        memory_type: MemoryType = MemoryType.SEMANTIC,
+    ) -> tuple[MemoryRecord, ...]: ...
 
-    def search(self, query: ContentInput, *, limit: int = 10) -> tuple[SearchHit, ...]: ...
+    def search(
+        self,
+        query: ContentInput,
+        *,
+        limit: int = 10,
+        memory_type: MemoryType | None = None,
+        reference_at: datetime | None = None,
+    ) -> tuple[SearchHit, ...]: ...
 
-    def ask(self, question: ContentInput, *, limit: int = 10) -> AnswerResult: ...
+    def ask(
+        self,
+        question: ContentInput,
+        *,
+        limit: int = 10,
+        memory_type: MemoryType | None = None,
+        reference_at: datetime | None = None,
+    ) -> AnswerResult: ...
 
     def get(self, memory_id: str) -> MemoryRecord: ...
 
@@ -357,6 +385,7 @@ def create_app(  # noqa: C901 - route declarations are clearer together
             _content_input(request.content),
             occurred_at=request.occurred_at,
             metadata=request.metadata,
+            memory_type=request.memory_type,
         )
         return MemoryResponse.model_validate(record)
 
@@ -371,7 +400,8 @@ def create_app(  # noqa: C901 - route declarations are clearer together
         return MemoryBatchResponse.model_validate(
             {
                 "memories": current_service().add_many(
-                    tuple(_content_input(content) for content in request.contents)
+                    tuple(_content_input(content) for content in request.contents),
+                    memory_type=request.memory_type,
                 )
             }
         )
@@ -396,7 +426,14 @@ def create_app(  # noqa: C901 - route declarations are clearer together
     )
     def search_memories(request: QueryRequest) -> SearchResponse:
         return SearchResponse.model_validate(
-            {"hits": current_service().search(_content_input(request.query), limit=request.limit)}
+            {
+                "hits": current_service().search(
+                    _content_input(request.query),
+                    limit=request.limit,
+                    memory_type=request.memory_type,
+                    reference_at=request.reference_at,
+                )
+            }
         )
 
     @router.get(
@@ -426,7 +463,12 @@ def create_app(  # noqa: C901 - route declarations are clearer together
     )
     def answer(request: AnswerRequest) -> AnswerResponse:
         return AnswerResponse.model_validate(
-            current_service().ask(_content_input(request.question), limit=request.limit)
+            current_service().ask(
+                _content_input(request.question),
+                limit=request.limit,
+                memory_type=request.memory_type,
+                reference_at=request.reference_at,
+            )
         )
 
     app.include_router(router)

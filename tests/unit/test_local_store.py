@@ -157,7 +157,7 @@ def test_schema_is_local_and_enforces_foreign_keys(tmp_path: Path) -> None:
                     "SELECT sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY name"
                 )
             )
-            assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+            assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
             assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
             assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
         assert "tenant" not in schema.casefold()
@@ -220,9 +220,11 @@ def test_schema_v1_is_migrated_atomically_with_text_modality(tmp_path: Path) -> 
         assert legacy is not None
         assert legacy.content == "legacy text"
         assert legacy.modality == "text"
+        assert legacy.memory_type == "semantic"
+        assert legacy.access_count == 0
         assert legacy.assets == ()
         with closing(sqlite3.connect(store.database_path)) as connection:
-            assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+            assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
             assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
 
 
@@ -245,7 +247,7 @@ def test_schema_v2_is_migrated_without_losing_memories(tmp_path: Path) -> None:
     with LocalStore(tmp_path) as store:
         assert store.read_memory("preserved") is not None
         with closing(sqlite3.connect(store.database_path)) as connection:
-            assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+            assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
             assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
 
 
@@ -291,7 +293,7 @@ def test_schema_v3_adds_optional_speaker_names(tmp_path: Path) -> None:
                 WHERE identity_id = 'speaker_legacy'
                 """
             ).fetchone()
-            assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+            assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
         assert identity == ("speaker_legacy", None)
         assert profile == ("voice", "cam++:legacy")
 
@@ -368,6 +370,8 @@ def test_memory_embedding_and_outbox_round_trip(tmp_path: Path) -> None:
         assert stored_memory is not None
         assert stored_memory.metadata_json == '{"priority":2,"room":"workshop"}'
         assert stored_memory.occurred_at == memory.occurred_at
+        assert stored_memory.memory_type == "semantic"
+        assert stored_memory.access_count == 0
         stored_embedding = store.read_embedding(embedding.embedding_id)
         assert stored_embedding is not None
         assert stored_embedding.values == pytest.approx(embedding.values)
@@ -389,6 +393,8 @@ def test_memory_embedding_and_outbox_round_trip(tmp_path: Path) -> None:
         document = store.read_index_document(embedding.embedding_id)
         assert document is not None
         assert document.content == changed.content
+        assert document.memory_type == "semantic"
+        assert document.occurred_at == changed.occurred_at
         assert document.embedding.embedding_id == embedding.embedding_id
 
         assert store.acknowledge_index_operations(changed_operation) == 1
@@ -408,6 +414,22 @@ def test_memory_embedding_and_outbox_round_trip(tmp_path: Path) -> None:
 
     with pytest.raises(LocalStoreClosedError, match="closed"):
         store.read_memory(memory.memory_id)
+
+
+def test_retrieval_reinforcement_is_bounded_and_monotonic(tmp_path: Path) -> None:
+    first_access = datetime(2026, 8, 27, 12, tzinfo=timezone.utc)
+    later_access = first_access + timedelta(hours=1)
+    with LocalStore(tmp_path) as store:
+        store.write_memory(_memory())
+        for _attempt in range(25):
+            assert store.reinforce_memories(("memory-1",), accessed_at=first_access) == 1
+        assert store.reinforce_memories(("memory-1",), accessed_at=later_access) == 1
+        assert store.reinforce_memories(("memory-1",), accessed_at=first_access) == 1
+
+        reinforced = store.read_memory("memory-1")
+        assert reinforced is not None
+        assert reinforced.access_count == 20
+        assert reinforced.last_accessed_at == later_access
 
 
 def test_memory_and_embeddings_commit_atomically(tmp_path: Path) -> None:

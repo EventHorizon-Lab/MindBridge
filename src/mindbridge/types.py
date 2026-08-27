@@ -28,6 +28,14 @@ class Modality(str, Enum):
     OMNI = "omni"
 
 
+class MemoryType(str, Enum):
+    """The cognitive role a memory serves for an agent."""
+
+    SEMANTIC = "semantic"
+    EPISODIC = "episodic"
+    PROCEDURAL = "procedural"
+
+
 @dataclass(frozen=True, slots=True)
 class URL:
     """One HTTPS source with an optional expected media type or top-level range."""
@@ -321,6 +329,7 @@ class MemoryRecord:
     metadata: Mapping[str, object] = field(default_factory=dict, hash=False)
     assets: tuple[AssetRef, ...] = ()
     modality: Modality = Modality.TEXT
+    memory_type: MemoryType = MemoryType.SEMANTIC
 
     def __post_init__(self) -> None:
         _text(self.id, "id")
@@ -328,6 +337,8 @@ class MemoryRecord:
         _require_aware(self.occurred_at, "occurred_at")
         if not isinstance(self.modality, Modality):
             raise ValidationError("memory modality is invalid")
+        if not isinstance(self.memory_type, MemoryType):
+            raise ValidationError("memory_type is invalid")
         assets = _assets(self.assets, self.modality)
         if not isinstance(self.content, str) or (not self.content.strip() and not assets):
             raise ValidationError("memory must contain content or media assets")
@@ -347,6 +358,7 @@ class SearchHit:
     metadata: Mapping[str, object] = field(default_factory=dict, hash=False)
     assets: tuple[AssetRef, ...] = ()
     modality: Modality = Modality.TEXT
+    memory_type: MemoryType = MemoryType.SEMANTIC
 
     def __post_init__(self) -> None:
         _text(self.id, "id")
@@ -356,6 +368,8 @@ class SearchHit:
             raise ValidationError("score must be between zero and one")
         if not isinstance(self.modality, Modality):
             raise ValidationError("memory modality is invalid")
+        if not isinstance(self.memory_type, MemoryType):
+            raise ValidationError("memory_type is invalid")
         assets = _assets(self.assets, self.modality)
         if not isinstance(self.content, str) or (not self.content.strip() and not assets):
             raise ValidationError("memory must contain content or media assets")

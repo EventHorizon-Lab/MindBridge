@@ -47,10 +47,12 @@ Stores one stable text or multimodal record.
 | `content` | string or ordered content parts | yes | — |
 | `occurred_at` | timezone-aware ISO 8601 datetime or null | no | null |
 | `metadata` | JSON object or null | no | null |
+| `memory_type` | `semantic`, `episodic`, or `procedural` | no | `semantic` |
 
-The structured result contains `id`, `content`, `modality`, `assets`, `created_at`, `occurred_at`,
-and `metadata`. Asset results contain safe metadata but never a local path. Repeating canonical
-input returns the existing record. The tool is marked as a non-destructive, idempotent write.
+The structured result contains `id`, `content`, `modality`, `memory_type`, `assets`, `created_at`,
+`occurred_at`, and `metadata`. Asset results contain safe metadata but never a local path. Repeating
+canonical input returns the existing record. The tool is marked as a non-destructive, idempotent
+write.
 
 Example arguments:
 
@@ -64,6 +66,7 @@ Example arguments:
       "media_type": "video/mp4"
     }
   ],
+  "memory_type": "episodic",
   "metadata": {"source": "review"}
 }
 ```
@@ -76,9 +79,13 @@ Searches local memories.
 | --- | --- | --- | --- |
 | `query` | string or ordered content parts | yes | — |
 | `limit` | integer from 1 through 100 | no | 10 |
+| `memory_type` | one memory role or null | no | null |
+| `reference_at` | timezone-aware ISO 8601 datetime or null | no | current UTC |
 
 The result is `{"hits": [...]}`. Each hit contains memory fields plus `score`. Routed queries with
-text use hybrid dense/full-text retrieval; pure media uses dense retrieval. The tool is read-only.
+text use hybrid dense/full-text retrieval; pure media uses dense retrieval. Relative temporal
+expressions resolve against `reference_at`. Search is conservatively marked non-read-only because
+enabled decay reinforces returned memories.
 
 ### `ask_memory`
 
@@ -88,11 +95,14 @@ Answers only from retrieved local memories.
 | --- | --- | --- | --- |
 | `question` | string or ordered content parts | yes | — |
 | `limit` | integer from 1 through 100 | no | 5 |
+| `memory_type` | one memory role or null | no | null |
+| `reference_at` | timezone-aware ISO 8601 datetime or null | no | current UTC |
 
-The result contains `answer` and the exact grounding `hits`. The tool is read-only. The built-in
-outbound answer request serializes each distinct question/evidence asset once even if several hits
-refer to it. It also sends each hit's content, `occurred_at`, `created_at`, and metadata to the
-configured generation endpoint.
+The result contains `answer` and the exact grounding `hits`. Like search, the tool is marked
+non-read-only because decay can reinforce returned memories. The built-in outbound answer request
+serializes each distinct question/evidence asset once even if several hits refer to it. It also
+sends each hit's content, `memory_type`, `occurred_at`, `created_at`, and metadata to the configured
+generation endpoint.
 
 ### `get_memory`
 
@@ -150,7 +160,7 @@ and closes its own `Memory`.
 
 MCP mirrors the five common single-record agent operations. Batch addition, listing, reindexing,
 and optimization remain Python or CLI operations. There is no large-file upload tool, local-path
-input, logical scope, chunking option, per-asset vector control, or reranker option. The built-in
-`data` model transport separately rejects embedding or generation calls above 64 MiB of aggregate
-raw media, and built-in answer text evidence is limited to 4 MiB. Larger video needs co-located
-`file` transport or a custom streaming/upload backend.
+input, logical scope, chunking option, per-asset vector control, or learned reranker option. The
+built-in `data` model transport separately rejects embedding or generation calls above 64 MiB of
+aggregate raw media, and built-in answer text evidence is limited to 4 MiB. Larger video needs
+co-located `file` transport or a custom streaming/upload backend.

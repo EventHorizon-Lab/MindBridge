@@ -6,6 +6,7 @@ import math
 import os
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
+from datetime import timedelta
 from typing import Literal
 from urllib.parse import urlsplit, urlunsplit
 
@@ -39,6 +40,7 @@ class Config:
     transcription_space: str | None = None
     embedding_dimension: int = DEFAULT_EMBEDDING_DIMENSION
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS
+    decay_half_life_days: float | None = None
     media_transport: Literal["data", "file"] = "data"
     allowed_url_hosts: frozenset[str] = frozenset()
     capabilities: ModelCapabilities = DEFAULT_CAPABILITIES
@@ -68,6 +70,7 @@ class Config:
         timeout = float(self.timeout_seconds)
         if not math.isfinite(timeout) or timeout <= 0:
             raise ValidationError("timeout_seconds must be a positive number")
+        decay_half_life_days = _decay_days(self.decay_half_life_days)
         if self.media_transport not in {"data", "file"}:
             raise ValidationError("media_transport must be 'data' or 'file'")
         allowed_url_hosts = _hosts(self.allowed_url_hosts)
@@ -98,6 +101,11 @@ class Config:
             ),
         )
         object.__setattr__(self, "timeout_seconds", timeout)
+        object.__setattr__(
+            self,
+            "decay_half_life_days",
+            decay_half_life_days,
+        )
         object.__setattr__(self, "allowed_url_hosts", allowed_url_hosts)
         object.__setattr__(
             self,
@@ -163,6 +171,10 @@ class Config:
                 source.get("MINDBRIDGE_TIMEOUT_SECONDS"),
                 DEFAULT_TIMEOUT_SECONDS,
                 "MINDBRIDGE_TIMEOUT_SECONDS",
+            ),
+            decay_half_life_days=_optional_number(
+                source.get("MINDBRIDGE_DECAY_HALF_LIFE_DAYS"),
+                "MINDBRIDGE_DECAY_HALF_LIFE_DAYS",
             ),
             media_transport=_transport(source.get("MINDBRIDGE_MEDIA_TRANSPORT", "data")),
             allowed_url_hosts=_hosts_from_environment(source.get("MINDBRIDGE_ALLOWED_URL_HOSTS")),
@@ -242,6 +254,27 @@ def _number(value: str | None, default: float, name: str) -> float:
         return float(value)
     except (TypeError, ValueError):
         raise ValidationError(f"{name} must be a positive number") from None
+
+
+def _optional_number(value: str | None, name: str) -> float | None:
+    return None if value is None else _number(value, 0.0, name)
+
+
+def _decay_days(value: object | None) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise ValidationError("decay_half_life_days must be a positive number or None")
+    days = float(value)
+    if not math.isfinite(days) or days <= 0:
+        raise ValidationError("decay_half_life_days must be a positive number or None")
+    try:
+        duration = timedelta(days=days)
+    except OverflowError:
+        raise ValidationError("decay_half_life_days is too large") from None
+    if duration <= timedelta(0):
+        raise ValidationError("decay_half_life_days is too small")
+    return days
 
 
 def _transport(value: str) -> Literal["data", "file"]:

@@ -21,6 +21,12 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   allowlists, per-hop public-IP connection pinning, exact/family MIME validation, and
   reference-counted cleanup.
 - Zvec 0.7 dense cosine HNSW, full-text search, and reciprocal-rank hybrid retrieval.
+- First-class semantic, episodic, and procedural memory roles across Python, REST, MCP, SQLite,
+  Zvec filtering, grounded evidence, and stable return values.
+- Event-time temporal retrieval with explicit reference clocks, deterministic English/Chinese
+  calendar expressions, bounded fallback retrieval, and query-time reranking.
+- Opt-in non-destructive memory decay with bounded SQLite access reinforcement and no background
+  worker or new dependency.
 - Crash-recoverable index replay and rebuild from SQLite without re-embedding stored content.
 - A resource-oriented REST API under `/v1`, five typed MCP stdio tools, and small lifecycle CLIs.
 - One ordered multimodal contract across Python, REST, and MCP; response assets expose stable
@@ -39,8 +45,9 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   observations, calibrated cosine matching, and a narrow `FaceBackend` seam.
 - One local face/voice identity registry with naming and explicit confirmed identity merges;
   `SpeakerSegment` retains its existing fields and exposes unified identity aliases.
-- Local SQLite schema v5 stores modality-specific biometric profiles and migrates existing v4
-  speakers, names, and cached turns in place.
+- Local SQLite schema v6 adds memory roles, bounded retrieval access state, and modality-specific
+  biometric profiles; existing v1-v5 schemas migrate in place. Older Zvec recipes rebuild
+  automatically from SQLite embeddings.
 - Physical benchmark isolation plus local-index and LoCoMo-Refined runners.
 - Enforced POSIX `0700` data directories and `0600` database/lock files, fork-use rejection,
   bounded public input, REST body limits, pre-body bearer authentication, and TLS requirements for
@@ -65,8 +72,8 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 - The first authoritative non-empty name for a CAS digest is reused when identical bytes later
   arrive under a different filename.
 - Server deployments use exactly one process worker per directory.
-- The supported product slice is aggregate text and media memory. Each memory currently owns one
-  embedding; metadata is payload, not filtering or authorization.
+- The supported product slice is typed aggregate text and media memory. Each memory currently owns
+  one embedding; metadata and memory role are payload/retrieval controls, not authorization.
 
 ### Removed
 
@@ -93,7 +100,8 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 
 - No chat-message arrays, large-file wire upload endpoint, update route, metadata filter,
   distributed writer, or runtime plugin registry.
-- No automatic chunking, multiple embeddings per memory, per-asset retrieval, or reranking stage.
+- No automatic role extraction, episode consolidation, procedure execution, chunking, multiple
+  embeddings per memory, per-asset retrieval, or learned reranking stage.
 - No in-place re-embedding or retranscription when a persisted embedding/transcription space or
   dimension changes; create a new directory and re-encode source content instead.
 - No automatic face-to-voice linking, face tracking, liveness, or anti-spoofing; applications merge

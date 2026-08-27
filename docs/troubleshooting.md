@@ -173,7 +173,8 @@ embedded Zvec/CAS boundary. See [deployment](deployment.md#why-one-worker-is-man
 
 Inspect `AnswerResult.hits` or REST/MCP `hits`. Confirm relevant memories were stored, the query
 capabilities match its modality, and the embedding space is correct. Then improve the input text or
-media. There is no server-side metadata filter, chunking control, per-asset vector, or reranker to
-tune in the current release.
+media. There is no server-side metadata filter, chunking control, per-asset vector, or learned
+reranker to tune in the current release. For a temporal query, also inspect `occurred_at`,
+`memory_type`, and the effective `reference_at`.
 
 For backup and recovery, see [operations](operations.md).

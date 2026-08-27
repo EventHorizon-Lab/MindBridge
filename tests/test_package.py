@@ -52,6 +52,7 @@ def test_full_modal_contract_is_exported_from_the_package_root() -> None:
         "AssetRef",
         "ContentAtom",
         "ContentInput",
+        "MemoryType",
         "Modality",
         "EmbeddingBackend",
         "FaceBackend",

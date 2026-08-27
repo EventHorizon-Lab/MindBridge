@@ -87,6 +87,7 @@ upstream to non-commercial research; use appropriately licensed weights for prod
 | `OPENAI_API_KEY` | unset | Fallback credential for OpenAI-compatible model operations |
 | `OPENAI_BASE_URL` | `https://api.openai.com/v1` | Fallback OpenAI-compatible base URL |
 | `MINDBRIDGE_TIMEOUT_SECONDS` | `120` | HTTP timeout in seconds |
+| `MINDBRIDGE_DECAY_HALF_LIFE_DAYS` | unset | Positive decay half-life; unset disables decay |
 | `MINDBRIDGE_MEDIA_TRANSPORT` | `data` | Send model media as `data` URLs or local `file` URLs |
 | `MINDBRIDGE_ALLOWED_URL_HOSTS` | empty | Comma-separated HTTPS hosts allowed for media ingestion |
 
@@ -105,6 +106,12 @@ normalizes each URL to one trailing `/v1`.
 
 A key is not required merely to open a directory or call `get`, `list`, or `delete`. The first
 operation that needs an unconfigured model credential raises `ModelError`.
+
+Memory decay is a local retrieval setting and adds no model call. When enabled, MindBridge records
+bounded access reinforcement in SQLite and applies a soft search-time factor; it never deletes or
+filters a durable record. See
+[memory types, temporal reasoning, and decay](memory-types-time-and-decay.md) for the formula and
+side effects.
 
 ### OpenAI-compatible models and capabilities
 
@@ -271,8 +278,9 @@ the aggregate covers every submitted sample. For an answer call, one distinct as
 only once even when the question and multiple hits refer to it.
 
 For `answer`, the built-in backend also limits the serialized question and grounding evidence to
-4 MiB. That evidence includes each hit's content, `occurred_at`, `created_at`, metadata, and asset
-IDs. Lower `limit` or use a custom backend when a workload intentionally needs a larger context.
+4 MiB. That evidence includes each hit's content, `memory_type`, `occurred_at`, `created_at`,
+metadata, and asset IDs. Lower `limit` or use a custom backend when a workload intentionally needs
+a larger context.
 
 Use `file` only with a trusted co-located model server that can read MindBridge's local `file:` URLs.
 It avoids inline encoding and is appropriate for larger video. A custom `ModelBackend` can instead
