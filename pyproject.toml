@@ -154,7 +154,9 @@ dev = [
     "cryptography>=45,<51",
     "mypy>=1.15,<3",
     "packaging>=24,<27",
-    "pytest>=8,<10",
+    # `faulthandler_exit_on_timeout` is read under `--strict-config`, which errors on an ini
+    # key the installed pytest does not define, so the floor has to be a release that has it.
+    "pytest>=9.1,<10",
     "pytest-asyncio>=0.24,<2",
     "ruff>=0.11,<1",
     # tests/test_package.py reads this file; tomllib is 3.11+. mypy also requires the
@@ -189,16 +191,6 @@ max-complexity = 10
 # code was checked.
 strict = true
 files = ["src", "tests"]
-# pytest identifies conftest files by name, so the session watchdog in tests/conftest.py and the
-# database fixtures in tests/integration/conftest.py are both the module `conftest` to mypy's
-# path-to-module mapping. That is a hard error which stops the run before anything is checked.
-# The documented resolutions all cost more than the file is worth: `explicit_package_bases` with
-# the repository root as a base renames `src/mindbridge/...` too and, once `mypy_path` is set to
-# keep that working, stops sibling test helpers like `stub_judge` from resolving (measured: 1717
-# and 47 errors respectively), and `__init__.py` files change how pytest imports the tree to fix
-# a problem that is only mypy's. Excluding the smaller file is the contained option; it is 15
-# lines of stdlib calls with no project types in it.
-exclude = ["^tests/conftest\\.py$"]
 
 [[tool.mypy.overrides]]
 module = [
@@ -228,6 +220,21 @@ ignore_missing_imports = true
 addopts = ["--strict-config", "--strict-markers", "-ra"]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+# A hung run costs a CI slot until something external notices and leaves nothing behind to
+# diagnose. These two are pytest's own answer and need no conftest: the plugin arms
+# `faulthandler.dump_traceback_later` per test with `file=` bound to a stderr it dup'd before
+# capture redirected fd 2, so the dump actually reaches the operator, and it re-arms in
+# `pytest_runtest_protocol`, so it survives the unconditional `cancel_dump_traceback_later()`
+# that its own `pytest_exception_interact` hook runs after any failure.
+#
+# `faulthandler_exit_on_timeout` is the load-bearing half. It defaults to false, which is why
+# `faulthandler_timeout` alone looks like it "did not fire": it dumps and lets the run continue
+# to hang. Both are required for a hang to end the process non-zero.
+#
+# The budget is per test, not per session, so it can sit far below a session ceiling: the whole
+# unit suite is ~12s and CI's slowest leg is under two minutes.
+faulthandler_timeout = 300
+faulthandler_exit_on_timeout = true
 markers = [
     "integration: requires an external PostgreSQL test database",
 ]

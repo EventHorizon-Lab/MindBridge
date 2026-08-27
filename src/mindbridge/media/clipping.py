@@ -414,9 +414,11 @@ def _sample_video_frames(source: bytes, request: ClipRequest) -> list[Any]:
         # chasing the interaction. What that interaction is has never been established: the
         # original note here blamed the OpenMP runtime torchvision loads, because the Worker cuts
         # clips in the same process as the local embedder, but nobody caught that hang in the act
-        # and no dump was kept. A later hang of the same shape in `tests/unit` -- 98 threads in
-        # futex_wait -- was dumped live and had libx264 mapped with no libgomp, libiomp5 or
+        # and no dump was kept. A later hang of the same shape in `tests/unit` -- 33 threads in
+        # the pytest child -- was dumped live and had libx264 mapped with no libgomp, libiomp5 or
         # libtorch_cpu anywhere in the process, so OpenMP cannot be the mechanism for that one.
+        # (The 98 in the first note counted a process that had imported numpy, where 32 of them
+        # are OpenBLAS's pool, idle from import; it is not encoders accumulating.)
         # Treat the pin as a measure that works, not as evidence for a cause.
         # This is not free: a 30s 720p source decodes in 1.7s here against 0.35s with AUTO, and
         # the gap widens with resolution.
