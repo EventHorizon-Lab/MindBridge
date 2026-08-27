@@ -258,42 +258,44 @@ class MindBridge:
                 suffix=suffix if resolved_kind is implied_kind else None,
             )
         )
-        await self._upload(ticket.upload_url, file_path, size_bytes)
         started_at = occurred_at or datetime.fromtimestamp(status.st_mtime, tz=timezone.utc)
-        return await self.observe(
-            ObserveRequest(
-                tenant_id=tenant_id,
-                device_id=device_id,
-                boot_id=boot_id,
-                # Derived from the digest so two different files cannot collide onto one
-                # observation: the ID the server derives is a function of exactly
-                # (tenant, device, boot, sequence), and a fixed default would make every file
-                # after the first a conflicting write against the first one's key.
-                sequence=int(sha256[:15], 16) if sequence is None else sequence,
-                sensor=sensor
-                or (
-                    SensorKind.MICROPHONE if resolved_kind is MediaKind.AUDIO else SensorKind.CAMERA
+        # Built before the bytes go anywhere. `occurred_at` and `created_at` are `AwareDatetime`,
+        # so a naive instant is refused here; refusing it after the upload means a
+        # multi-gigabyte PUT has completed and left an object no observation ever names, which
+        # nothing reclaims. Signing the ticket first is unavoidable -- the request carries
+        # `ticket.uri` -- but a signature costs nothing if this raises.
+        request = ObserveRequest(
+            tenant_id=tenant_id,
+            device_id=device_id,
+            boot_id=boot_id,
+            # Derived from the digest so two different files cannot collide onto one
+            # observation: the ID the server derives is a function of exactly
+            # (tenant, device, boot, sequence), and a fixed default would make every file
+            # after the first a conflicting write against the first one's key.
+            sequence=int(sha256[:15], 16) if sequence is None else sequence,
+            sensor=sensor
+            or (SensorKind.MICROPHONE if resolved_kind is MediaKind.AUDIO else SensorKind.CAMERA),
+            media_objects=(
+                MediaObjectInput(
+                    media_object_id=sha256,
+                    kind=resolved_kind,
+                    uri=ticket.uri,
+                    sha256=sha256,
+                    size_bytes=size_bytes,
+                    created_at=started_at,
+                    # Left unknown rather than guessed: nothing here decoded the file, and
+                    # claiming the observation's own span as a playable length is a lie
+                    # about the media that the evidence span already covers honestly.
+                    duration_ms=None,
                 ),
-                media_objects=(
-                    MediaObjectInput(
-                        media_object_id=sha256,
-                        kind=resolved_kind,
-                        uri=ticket.uri,
-                        sha256=sha256,
-                        size_bytes=size_bytes,
-                        created_at=started_at,
-                        # Left unknown rather than guessed: nothing here decoded the file, and
-                        # claiming the observation's own span as a playable length is a lie
-                        # about the media that the evidence span already covers honestly.
-                        duration_ms=None,
-                    ),
-                ),
-                occurred_at=started_at,
-                ended_at=ended_at or started_at,
-                observed_at=started_at,
-                idempotency_key=idempotency_key,
-            )
+            ),
+            occurred_at=started_at,
+            ended_at=ended_at or started_at,
+            observed_at=started_at,
+            idempotency_key=idempotency_key,
         )
+        await self._upload(ticket.upload_url, file_path, size_bytes)
+        return await self.observe(request)
 
     async def remember(self, request: RememberRequest) -> RememberResult:
         """Retain one explicit memory, reporting whether this call is what created it."""

@@ -36,6 +36,22 @@ OBSERVE_ENVIRONMENT = """environment:
                       credential never reaches a process list or a shell history"""
 
 
+def _aware_datetime(value: str) -> datetime:
+    """Parse an ISO 8601 instant and refuse one carrying no UTC offset.
+
+    `ObserveRequest.occurred_at` and `MediaObjectInput.created_at` are `AwareDatetime`, so a
+    naive value is rejected -- but only once the request is built, which used to be after the
+    file had been uploaded. `--help` calls this ISO 8601 and `datetime.fromisoformat` accepts a
+    naive string happily, so the whole upload was spent before the contract refused it.
+    """
+    parsed = datetime.fromisoformat(value)
+    if parsed.tzinfo is None:
+        raise argparse.ArgumentTypeError(
+            f"{value!r} has no UTC offset; give one, for example {value}+00:00"
+        )
+    return parsed
+
+
 def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
     """Upload one file and observe it, printing the receipt the API answered with."""
     parser = build_parser(prog=prog, description=__doc__, epilog=OBSERVE_ENVIRONMENT)
@@ -54,13 +70,13 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
     )
     parser.add_argument(
         "--occurred-at",
-        type=datetime.fromisoformat,
+        type=_aware_datetime,
         help="when the recording starts, ISO 8601. Defaults to the file's modification time, "
         "which is stable across a repeat where a clock read would not be",
     )
     parser.add_argument(
         "--ended-at",
-        type=datetime.fromisoformat,
+        type=_aware_datetime,
         help="when the recording ends, ISO 8601. Nothing here decodes the file, so a duration "
         "left unsaid makes the observation cover an instant",
     )

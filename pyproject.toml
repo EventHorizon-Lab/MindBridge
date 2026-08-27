@@ -52,6 +52,10 @@ benchmarks = [
     # benchmarks/prepare.py stages the clips it cuts into the deployment's own bucket. Both are
     # lazy imports reached only when a task's prepared media has to be produced.
     "boto3>=1.40,<2",
+    # benchmarks/acquire_ego4d.py imports botocore.exceptions by name, so the dependency is this
+    # subtree's rather than a detail of boto3's tree -- the same reason the edge extra names it.
+    # It resolves today only because server/edge happen to declare it.
+    "botocore>=1.40,<2",
     # It cuts them with mindbridge.media.clipping, the encoder the product stores evidence with,
     # rather than a second one that would drift from it.
     "mindbridge[media]",

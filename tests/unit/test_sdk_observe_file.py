@@ -9,6 +9,7 @@ from typing import Any
 
 import httpx
 import pytest
+from pydantic import ValidationError
 
 from mindbridge.core import MediaKind, SensorKind
 from mindbridge.sdk import _UPLOAD_CHUNK_BYTES, MindBridge, MindBridgeError, _file_chunks
@@ -331,3 +332,28 @@ async def test_closing_releases_the_upload_pool_as_well(tmp_path: Path) -> None:
 
     assert client._upload_client is not None
     assert client._upload_client.is_closed
+
+
+async def test_a_request_the_contract_rejects_costs_no_upload(tmp_path: Path) -> None:
+    """The bytes are the expensive part, so nothing may be sent for a request that cannot pass.
+
+    `occurred_at` is an `AwareDatetime`. A naive one is refused -- but if it is refused only
+    once the request is built, and the request is built after the PUT, then a multi-gigabyte
+    upload has already completed and left an object in the bucket that no observation names.
+    Nothing sweeps `media/`, so that object is permanent.
+    """
+    deployment = FakeDeployment()
+    path = media_file(tmp_path)
+
+    async with deployment.client() as client:
+        with pytest.raises(ValidationError):
+            await client.observe_file(
+                path,
+                tenant_id="tenant_01",
+                occurred_at=datetime(2026, 8, 11, 12, 0),  # noqa: DTZ001 -- naive on purpose
+            )
+
+    # The signature is cheap and unavoidable (the request has to carry the returned URI); the
+    # transfer is not, and it is what must not have happened.
+    assert deployment.uploads == []
+    assert deployment.sent("/v1/observations") == []

@@ -187,3 +187,29 @@ def test_a_tenant_is_required_because_nothing_here_can_default_one(
         observe_cli.main([str(path)])
 
     assert client.calls == []
+
+
+@pytest.mark.parametrize("flag", ["--occurred-at", "--ended-at"])
+def test_a_timestamp_without_an_offset_is_refused_before_anything_uploads(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], flag: str
+) -> None:
+    """`--help` says ISO 8601, and `fromisoformat` takes a naive string; the contract does not.
+
+    Both fields land on `AwareDatetime`, so a naive value was always going to be rejected. The
+    only question is whether it is rejected here or after the file has been uploaded.
+    """
+    path = tmp_path / "clip.mp4"
+    path.write_bytes(b"\x00")
+
+    with pytest.raises(SystemExit) as exit_info:
+        observe_cli.main([str(path), "--tenant-id", "tenant_01", flag, "2026-08-01T10:00:00"])
+
+    assert exit_info.value.code == 2
+    assert "no UTC offset" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("flag", ["--occurred-at", "--ended-at"])
+def test_a_timestamp_with_an_offset_is_accepted(flag: str) -> None:
+    assert observe_cli._aware_datetime("2026-08-01T10:00:00+00:00") == datetime(
+        2026, 8, 1, 10, 0, tzinfo=timezone.utc
+    )

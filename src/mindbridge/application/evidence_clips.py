@@ -76,6 +76,26 @@ MIN_SAMPLED_FRAMES = 2
 # model then read. Past this the clip samples its own window faster instead, which lands the
 # same two frames on a span that still means what it says. The number is the floor the default
 # 1 fps already produces: that is the widening evidence resolution was measured against.
+MAX_PROXY_RESIDENT_FRAMES = 1_200
+"""A resident-memory bound on one proxy cut, checked before the source is read.
+
+Not the ceiling this file used to carry. That one was 40 frames and was there because the
+encode failed past it; the cause was `cut_generation_proxy` re-reading `stream.time_base` after
+libavformat had replaced it, it is fixed, and proxies of many hundreds of frames now cut
+cleanly. Nothing about encoding needs a limit any more.
+
+What still has no limit is memory. `_sample_video_frames` accumulates every reformatted frame
+in one list, and the window here spans `min(start)` to `max(end)` over one source -- so an
+observation with events at both ends of a long recording asks for the whole recording. At the
+`DEFAULT_VIDEO_MAX_PIXELS` cap a yuv420p frame is 200_704 * 1.5 = 0.30 MB, so a 30-minute span
+is 1_800 frames (0.54 GB) at the 1 fps default and 36_000 frames (10.8 GB) at the 20 fps the
+configuration still permits -- in the Worker process that is also holding the source bytes and
+the embedder. 1_200 frames is 0.36 GB, well above any real evidence span and far below that.
+
+Skipping degrades to the untouched source, which is what every other failure here does.
+"""
+
+
 MAX_SAMPLING_FLOOR_MS = 2_000
 
 
@@ -342,6 +362,16 @@ async def _store_generation_proxy(
         max_pixels=sampling.max_pixels,
         include_audio=sampling.proxy_audio,
     )
+    # Before the read, because the alternative is paying for a full source download and a
+    # multi-gigabyte decode to discover the span was never going to fit.
+    frames = (request.end_ms - request.start_ms) / 1_000 * request.frames_per_second
+    if frames > MAX_PROXY_RESIDENT_FRAMES:
+        _skipped_proxy(
+            "span_exceeds_resident_frame_budget",
+            media_object_id=str(source_object.media_object_id),
+            frames=round(frames),
+        )
+        return None
     async with semaphore:
         try:
             source = await store.read_media(source_object)
