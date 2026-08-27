@@ -185,12 +185,20 @@ export MINDBRIDGE_EMBEDDER_API_KEY=replace-with-at-least-32-random-characters
 
 uv run --extra server --extra cloud-models mindbridge jina serve \
   --host 0.0.0.0 --port 8001 --device cuda \
+  --max-concurrency 1 --max-batch-inputs 32 --batch-wait-ms 2 \
+  --media-io-concurrency 8 \
   --media-origin https://media.example.com
 ```
 
 Repeat `--media-origin` for every exact object-storage origin that signs media downloads. The
 service downloads those URLs itself with a 64 MiB limit and rejects redirects and every origin
 not named here, so the model never receives an unrestricted remote URL.
+
+The defaults above keep one document encode active on the GPU, combine concurrent requests for
+up to 2 ms or 32 inputs, and materialize up to eight media inputs concurrently. Keep
+`--max-concurrency 1` when FunASR shares the card: a second independent Jina encode reduced the
+measured end-to-end throughput by 14.5% and nearly doubled ASR p95 instead of increasing useful
+GPU work. The query lane remains independent so recall does not queue behind bulk ingest.
 
 Point `MINDBRIDGE_EMBEDDER_ENDPOINT` at this service's `/v1` base URL and use the same API key in
 the API and worker. `/health` is the readiness probe; `/v1/models` and `/v1/embeddings` follow the

@@ -11,8 +11,10 @@ import http.client
 import json
 import os
 import tempfile
+from collections import deque
 from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 from urllib.parse import SplitResult, urlsplit
@@ -23,6 +25,7 @@ from fastapi import FastAPI, HTTPException, Request
 from mindbridge.application.capabilities import (
     Embedder,
     EmbedRequest,
+    EmbedResult,
     EmbedTask,
     MediaPart,
     ModelInput,
@@ -30,7 +33,7 @@ from mindbridge.application.capabilities import (
 )
 from mindbridge.cli import parser as build_parser
 from mindbridge.configuration import require_environment_value
-from mindbridge.core import MediaKind
+from mindbridge.core import EmbeddingSpaceReference, MediaKind
 from mindbridge.models.defaults import (
     DEFAULT_EMBEDDER_MODEL_ID,
     DEFAULT_EMBEDDING_DIMENSION,
@@ -41,6 +44,9 @@ from mindbridge.models.plugins import close_model, load_embedder
 _MAX_MEDIA_BYTES = 64 * 1024 * 1024
 _MAX_REQUEST_BYTES = 96 * 1024 * 1024
 _MEDIA_DOWNLOAD_TIMEOUT_SECONDS = 30
+_DEFAULT_MAX_BATCH_INPUTS = 32
+_DEFAULT_BATCH_WAIT_MS = 2.0
+_DEFAULT_MEDIA_IO_CONCURRENCY = 8
 _MediaOrigin = tuple[str, str, int]
 _MEDIA_TYPES = {
     "image_url": MediaKind.IMAGE,
@@ -58,23 +64,171 @@ _SUFFIXES = {
 }
 
 
+@dataclass(slots=True)
+class _PendingEmbed:
+    request: EmbedRequest
+    result: asyncio.Future[EmbedResult]
+
+
+class _AdaptiveBatchingEmbedder:
+    """Coalesce concurrent requests while keeping query and document lanes independent."""
+
+    def __init__(
+        self,
+        embedder: Embedder,
+        *,
+        max_batch_inputs: int,
+        batch_wait_ms: float,
+    ) -> None:
+        if max_batch_inputs <= 0:
+            raise ValueError("max batch inputs must be positive")
+        if batch_wait_ms < 0:
+            raise ValueError("batch wait must not be negative")
+        self._embedder = embedder
+        self._max_batch_inputs = max_batch_inputs
+        self._batch_wait_seconds = batch_wait_ms / 1_000
+        self._queues = {task: deque[_PendingEmbed]() for task in EmbedTask}
+        self._workers: dict[EmbedTask, asyncio.Task[None]] = {}
+
+    @property
+    def space_reference(self) -> EmbeddingSpaceReference:
+        return self._embedder.space_reference
+
+    async def embed(self, request: EmbedRequest) -> EmbedResult:
+        if not request.inputs:
+            return await self._embedder.embed(request)
+        result: asyncio.Future[EmbedResult] = asyncio.get_running_loop().create_future()
+        self._queues[request.task].append(_PendingEmbed(request, result))
+        worker = self._workers.get(request.task)
+        if worker is None or worker.done():
+            self._workers[request.task] = asyncio.create_task(self._serve(request.task))
+        return await result
+
+    async def _serve(self, task: EmbedTask) -> None:
+        queue = self._queues[task]
+        try:
+            while queue:
+                batch = self._take_batch(queue)
+                input_count = sum(len(item.request.inputs) for item in batch)
+                if input_count < self._max_batch_inputs and not queue and self._batch_wait_seconds:
+                    await asyncio.sleep(self._batch_wait_seconds)
+                    batch.extend(
+                        self._take_batch(queue, available=self._max_batch_inputs - input_count)
+                    )
+                batch = [item for item in batch if not item.result.cancelled()]
+                if batch:
+                    await self._embed_batch(task, batch)
+        finally:
+            self._workers.pop(task, None)
+
+    def _take_batch(
+        self,
+        queue: deque[_PendingEmbed],
+        *,
+        available: int | None = None,
+    ) -> list[_PendingEmbed]:
+        remaining = self._max_batch_inputs if available is None else available
+        batch: list[_PendingEmbed] = []
+        while queue:
+            pending = queue[0]
+            if pending.result.cancelled():
+                queue.popleft()
+                continue
+            size = len(pending.request.inputs)
+            if size > remaining and (batch or available is not None):
+                break
+            batch.append(queue.popleft())
+            remaining -= size
+            if remaining <= 0:
+                break
+        return batch
+
+    async def _embed_batch(self, task: EmbedTask, batch: list[_PendingEmbed]) -> None:
+        inputs = tuple(input_value for item in batch for input_value in item.request.inputs)
+        try:
+            result = await self._embedder.embed(EmbedRequest(inputs=inputs, task=task))
+            if len(result.embeddings) != len(inputs):
+                raise RuntimeError("embedder returned the wrong adaptive batch size")
+        except asyncio.CancelledError:
+            for item in batch:
+                item.result.cancel()
+            raise
+        except Exception as error:
+            # A batch is this server's scheduling artefact, not something any caller asked for,
+            # so one caller's input must not fail the others. Attribute the failure by re-running
+            # each request alone; a single-input batch has nobody else to blame and stops the
+            # recursion. This also recovers the common batch-wide case -- an OOM caused by the
+            # merged size -- because the retries are small enough to fit.
+            if len(batch) == 1:
+                item = batch[0]
+                if not item.result.done():
+                    item.result.set_exception(error)
+                return
+            for item in batch:
+                await self._embed_batch(task, [item])
+            return
+        offset = 0
+        for item in batch:
+            size = len(item.request.inputs)
+            if not item.result.done():
+                item.result.set_result(EmbedResult(result.embeddings[offset : offset + size]))
+            offset += size
+
+
+def _reject_unusable_options(
+    *,
+    api_key: str,
+    media_io_concurrency: int,
+    max_batch_inputs: int,
+    batch_wait_ms: float,
+) -> None:
+    """Reject the flags before `lifespan` loads the model.
+
+    The batching embedder validates its own two arguments, but `lifespan` builds it only after
+    `load_embedder` has put several GiB of weights on the GPU -- so `--max-batch-inputs 0` used
+    to download and load a model and then die. Checked here, `create_app` refuses first.
+    """
+    if not api_key.strip():
+        raise ValueError("embedding API key must not be empty")
+    if media_io_concurrency <= 0:
+        raise ValueError("media I/O concurrency must be positive")
+    if max_batch_inputs <= 0:
+        raise ValueError("maximum batch inputs must be positive")
+    if batch_wait_ms < 0:
+        raise ValueError("batch wait must not be negative")
+
+
 def create_app(
     *,
     api_key: str,
     embedder_config: Mapping[str, object] | None = None,
     embedder: Embedder | None = None,
     media_origins: Sequence[str] = (),
+    max_batch_inputs: int = _DEFAULT_MAX_BATCH_INPUTS,
+    batch_wait_ms: float = _DEFAULT_BATCH_WAIT_MS,
+    media_io_concurrency: int = _DEFAULT_MEDIA_IO_CONCURRENCY,
 ) -> FastAPI:
     """Build one single-model service; injection keeps contract tests model-free."""
-    if not api_key.strip():
-        raise ValueError("embedding API key must not be empty")
+    _reject_unusable_options(
+        api_key=api_key,
+        media_io_concurrency=media_io_concurrency,
+        max_batch_inputs=max_batch_inputs,
+        batch_wait_ms=batch_wait_ms,
+    )
     config = dict(embedder_config or {})
     allowed_media_origins = _allowed_media_origins(media_origins)
+
+    def serving(loaded: Embedder) -> _AdaptiveBatchingEmbedder:
+        return _AdaptiveBatchingEmbedder(
+            loaded,
+            max_batch_inputs=max_batch_inputs,
+            batch_wait_ms=batch_wait_ms,
+        )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         loaded = embedder or load_embedder("jina", config)
-        app.state.embedder = loaded
+        app.state.embedder = serving(loaded)
         try:
             yield
         finally:
@@ -82,8 +236,9 @@ def create_app(
                 await close_model(loaded)
 
     app = FastAPI(title="MindBridge Jina Omni embedding service", lifespan=lifespan)
+    app.state.media_io_slots = asyncio.Semaphore(media_io_concurrency)
     if embedder is not None:
-        app.state.embedder = embedder
+        app.state.embedder = serving(embedder)
 
     @app.get("/health")
     async def health() -> dict[str, str]:
@@ -106,6 +261,7 @@ def create_app(
             cast(Embedder, request.app.state.embedder),
             config,
             allowed_media_origins,
+            cast(asyncio.Semaphore, request.app.state.media_io_slots),
         )
 
     return app
@@ -116,6 +272,7 @@ async def _embedding_response(
     embedder: Embedder,
     config: Mapping[str, object],
     allowed_media_origins: frozenset[_MediaOrigin],
+    media_io_slots: asyncio.Semaphore,
 ) -> dict[str, object]:
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="request body must be an object")
@@ -128,7 +285,12 @@ async def _embedding_response(
     if payload.get("encoding_format", "float") != "float":
         raise HTTPException(status_code=400, detail="only float encoding is supported")
     try:
-        vectors = await _embed(embedder, payload.get("input"), allowed_media_origins)
+        vectors = await _embed(
+            embedder,
+            payload.get("input"),
+            allowed_media_origins,
+            media_io_slots,
+        )
     except HTTPException:
         raise
     except RuntimeError as error:
@@ -148,13 +310,22 @@ async def _embed(
     embedder: Embedder,
     raw_input: object,
     allowed_media_origins: frozenset[_MediaOrigin],
+    media_io_slots: asyncio.Semaphore,
 ) -> tuple[tuple[float, ...], ...]:
     with tempfile.TemporaryDirectory(prefix="mindbridge-jina-") as temp_dir:
         directory = Path(temp_dir)
-        parsed = await asyncio.to_thread(
-            lambda: tuple(
-                _model_input(sample, directory, index, allowed_media_origins)
-                for index, sample in enumerate(_samples(raw_input))
+        parsed = tuple(
+            await asyncio.gather(
+                *(
+                    _materialize_input(
+                        sample,
+                        directory,
+                        index,
+                        allowed_media_origins,
+                        media_io_slots,
+                    )
+                    for index, sample in enumerate(_samples(raw_input))
+                )
             )
         )
         tasks = {task for task, _input in parsed}
@@ -167,6 +338,23 @@ async def _embed(
             )
         )
         return tuple(item.values for item in result.embeddings)
+
+
+async def _materialize_input(
+    sample: object,
+    directory: Path,
+    sample_index: int,
+    allowed_media_origins: frozenset[_MediaOrigin],
+    media_io_slots: asyncio.Semaphore,
+) -> tuple[EmbedTask, ModelInput]:
+    async with media_io_slots:
+        return await asyncio.to_thread(
+            _model_input,
+            sample,
+            directory,
+            sample_index,
+            allowed_media_origins,
+        )
 
 
 def _samples(raw_input: object) -> list[object]:
@@ -443,6 +631,9 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
             api_key=api_key,
             embedder_config=config,
             media_origins=options.media_origin,
+            max_batch_inputs=options.max_batch_inputs,
+            batch_wait_ms=options.batch_wait_ms,
+            media_io_concurrency=options.media_io_concurrency,
         ),
         host=options.host,
         port=options.port,
@@ -463,6 +654,13 @@ def _parser(prog: str | None) -> argparse.ArgumentParser:
     built.add_argument("--device", default="cuda")
     built.add_argument("--model-id", default=DEFAULT_EMBEDDER_MODEL_ID)
     built.add_argument("--max-concurrency", type=int, default=1)
+    built.add_argument("--max-batch-inputs", type=int, default=_DEFAULT_MAX_BATCH_INPUTS)
+    built.add_argument("--batch-wait-ms", type=float, default=_DEFAULT_BATCH_WAIT_MS)
+    built.add_argument(
+        "--media-io-concurrency",
+        type=int,
+        default=_DEFAULT_MEDIA_IO_CONCURRENCY,
+    )
     built.add_argument(
         "--media-origin",
         action="append",
