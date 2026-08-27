@@ -15,6 +15,7 @@ import pytest
 import mindbridge.memory as memory_module
 from mindbridge.config import Config
 from mindbridge.exceptions import (
+    IdentityNotFoundError,
     IndexUnavailableError,
     MemoryNotFoundError,
     ModelError,
@@ -34,6 +35,9 @@ from mindbridge.infrastructure.local.zvec_index import IndexHit
 from mindbridge.memory import AsyncMemory, Memory
 from mindbridge.models.base import (
     EmbedTask,
+    FaceAnalysis,
+    FaceDetection,
+    FaceEmbedding,
     ModelCapabilities,
     ModelInput,
     SpeakerEmbedding,
@@ -148,6 +152,30 @@ class _FakeSpeech:
             SpeechAnalysis(
                 turns=(SpeechTurn(0, 900, "spoken red wrench", "0"),),
                 speakers=(SpeakerEmbedding("0", (1.0, 0.0)),),
+            )
+            for _asset in batch
+        )
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _FakeFace:
+    capabilities = frozenset({Modality.IMAGE, Modality.VIDEO})
+    model_id = "insightface/buffalo_l"
+    space_id = "insightface:buffalo_l:test"
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[AssetRef, ...]] = []
+        self.closed = False
+
+    def analyze(self, assets: Sequence[AssetRef]) -> tuple[FaceAnalysis, ...]:
+        batch = tuple(assets)
+        self.calls.append(batch)
+        return tuple(
+            FaceAnalysis(
+                detections=(FaceDetection("0", (0.1, 0.1, 0.9, 0.9), 0.98),),
+                faces=(FaceEmbedding("0", (1.0, 0.0)),),
             )
             for _asset in batch
         )
@@ -399,6 +427,47 @@ def test_default_speech_is_lazy_and_recognizes_a_speaker_across_recordings(
         assert len(transcriber.calls) == 2
 
     assert transcriber.closed is True
+
+
+def test_face_and_voice_recognition_use_one_mergeable_identity_registry(
+    tmp_path: Path,
+) -> None:
+    face_recognizer = _FakeFace()
+    transcriber = _FakeSpeech()
+
+    with Memory(
+        tmp_path,
+        _config(),
+        models=_FakeModels(),
+        embedder=_FakeEmbedder(),
+        transcriber=transcriber,
+        face_recognizer=face_recognizer,
+    ) as memory:
+        record = memory.add(
+            [
+                Blob(b"portrait", "image/png", "portrait.png"),
+                Blob(b"voice", "audio/wav", "voice.wav"),
+            ]
+        )
+        assert face_recognizer.calls == []
+        face = memory.faces(record.id)[0]
+        voice = memory.speech(record.id)[0]
+        assert face.identity_id != voice.identity_id
+        assert face.identity_score is None
+        assert voice.identity_id is not None
+
+        memory.register_identity(face.identity_id, "Alice")
+        memory.merge_identities(face.identity_id, voice.identity_id)
+        assert memory.faces(record.id)[0].identity_name == "Alice"
+        merged_voice = memory.speech(record.id)[0]
+        assert merged_voice.identity_id == face.identity_id
+        assert merged_voice.identity_name == "Alice"
+        with pytest.raises(IdentityNotFoundError):
+            memory.register_identity("identity_missing", "Nobody")
+        with pytest.raises(IdentityNotFoundError):
+            memory.merge_identities(face.identity_id, "identity_missing")
+
+    assert face_recognizer.closed is True
 
 
 def test_add_many_deduplicates_one_model_and_store_batch(

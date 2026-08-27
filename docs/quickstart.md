@@ -1,14 +1,15 @@
 # Quick start
 
 This guide takes a clean Python project from installation to durable multimodal retrieval.
-MindBridge runs in your process. Embedding and speech analysis are local by default; generation
-may use a configured remote endpoint.
+MindBridge runs in your process. Embedding, speech analysis, and optional face recognition are
+local; generation may use a configured remote endpoint.
 
 ## Requirements
 
 - Python 3.10 through 3.14.
 - A writable local directory.
 - The `local` extra for default Jina v5 Omni embedding and FunASR speech analysis.
+- The `face` extra only when calling local InsightFace recognition.
 - An OpenAI-compatible endpoint only when the workload uses `ask`.
 
 Text needs embeddings for `add` and `search`, plus generation for `ask`.
@@ -25,6 +26,12 @@ Or with `pip`:
 
 ```bash
 python -m pip install "mindbridge[local]"
+```
+
+For face recognition, install both local surfaces:
+
+```bash
+uv add "mindbridge[local,face]"
 ```
 
 Set the shared model credential when using grounded generation:
@@ -182,6 +189,19 @@ if turns and turns[0].speaker_id:
     memory.register_speaker(turns[0].speaker_id, "Ada")
     assert memory.speech(record.id)[0].speaker_name == "Ada"
 ```
+
+Call `memory.faces(record.id)` for every image/video asset. It returns normalized `bbox_xyxy`
+coordinates and a stable local `identity_id`; video results also carry sampled time ranges. Face
+and voice embeddings occupy different vector spaces, so confirm the association before merging:
+
+```python
+faces = memory.faces(record.id)
+if faces and turns and turns[0].identity_id:
+    memory.merge_identities(faces[0].identity_id, turns[0].identity_id)
+    memory.register_identity(faces[0].identity_id, "Ada")
+```
+
+The merge moves both modality profiles and all cached observations under the first, canonical ID.
 
 ## Choose another Sentence Transformers model
 

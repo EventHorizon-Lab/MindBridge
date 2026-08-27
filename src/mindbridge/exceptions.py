@@ -21,7 +21,13 @@ class MemoryNotFoundError(MindBridgeError, LookupError):
     code = "memory_not_found"
 
 
-class SpeakerNotFoundError(MindBridgeError, LookupError):
+class IdentityNotFoundError(MindBridgeError, LookupError):
+    """Raised when a local biometric identity does not exist."""
+
+    code = "identity_not_found"
+
+
+class SpeakerNotFoundError(IdentityNotFoundError):
     """Raised when a local speaker identity does not exist."""
 
     code = "speaker_not_found"

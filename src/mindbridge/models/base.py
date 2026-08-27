@@ -196,6 +196,105 @@ class SpeechBackend(Protocol):
     def close(self) -> None: ...
 
 
+@dataclass(frozen=True, slots=True)
+class FaceDetection:
+    """One normalized face box emitted by a face backend."""
+
+    face_label: str
+    bbox_xyxy: tuple[float, float, float, float]
+    detection_score: float
+    start_ms: int | None = None
+    end_ms: int | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.face_label, str) or not self.face_label.strip():
+            raise ValidationError("face detection label must not be blank")
+        bbox = tuple(self.bbox_xyxy)
+        if len(bbox) != 4 or any(
+            isinstance(value, bool)
+            or not isinstance(value, int | float)
+            or not math.isfinite(float(value))
+            or not 0.0 <= value <= 1.0
+            for value in bbox
+        ):
+            raise ValidationError("face detection bbox_xyxy must contain normalized coordinates")
+        if bbox[2] <= bbox[0] or bbox[3] <= bbox[1]:
+            raise ValidationError("face detection bbox_xyxy must have positive area")
+        if (
+            isinstance(self.detection_score, bool)
+            or not isinstance(self.detection_score, int | float)
+            or not math.isfinite(float(self.detection_score))
+            or not 0.0 <= self.detection_score <= 1.0
+        ):
+            raise ValidationError("face detection score must be between zero and one")
+        if (self.start_ms is None) != (self.end_ms is None) or (
+            self.start_ms is not None
+            and (
+                isinstance(self.start_ms, bool)
+                or not isinstance(self.start_ms, int)
+                or isinstance(self.end_ms, bool)
+                or not isinstance(self.end_ms, int)
+                or self.start_ms < 0
+                or self.end_ms <= self.start_ms
+            )
+        ):
+            raise ValidationError("face detection time range must be absent or positive")
+        object.__setattr__(self, "face_label", self.face_label.strip())
+        object.__setattr__(self, "bbox_xyxy", bbox)
+
+
+@dataclass(frozen=True, slots=True)
+class FaceEmbedding:
+    """One backend-local face label and its recognition embedding."""
+
+    face_label: str
+    values: tuple[float, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.face_label, str) or not self.face_label.strip():
+            raise ValidationError("face embedding label must not be blank")
+        values = tuple(self.values)
+        if not values or any(not math.isfinite(value) for value in values):
+            raise ValidationError("face embedding must contain finite values")
+        object.__setattr__(self, "face_label", self.face_label.strip())
+        object.__setattr__(self, "values", values)
+
+
+@dataclass(frozen=True, slots=True)
+class FaceAnalysis:
+    """Face detections and recognition embeddings for one visual asset."""
+
+    detections: tuple[FaceDetection, ...]
+    faces: tuple[FaceEmbedding, ...]
+
+    def __post_init__(self) -> None:
+        detections, faces = tuple(self.detections), tuple(self.faces)
+        if any(not isinstance(value, FaceDetection) for value in detections) or any(
+            not isinstance(value, FaceEmbedding) for value in faces
+        ):
+            raise ValidationError("face analysis contains invalid values")
+        object.__setattr__(self, "detections", detections)
+        object.__setattr__(self, "faces", faces)
+
+
+@runtime_checkable
+class FaceBackend(Protocol):
+    """One thread-safe face analyzer with a stable recognition recipe."""
+
+    @property
+    def capabilities(self) -> frozenset[Modality]: ...
+
+    @property
+    def model_id(self) -> str: ...
+
+    @property
+    def space_id(self) -> str: ...
+
+    def analyze(self, assets: Sequence[AssetRef]) -> tuple[FaceAnalysis, ...]: ...
+
+    def close(self) -> None: ...
+
+
 @runtime_checkable
 class ModelBackend(Protocol):
     """The complete model surface consumed by Memory.

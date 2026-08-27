@@ -35,7 +35,12 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   across recordings.
 - Named local speaker registration and optional batched vLLM decoding without dropping FSMN-VAD,
   CAM++ diarization, or stable identity matching.
-- Local SQLite schema v4 adds optional speaker names; existing schema versions migrate in place.
+- Lazy InsightFace `buffalo_l` face recognition through ONNX Runtime, with normalized image/video
+  observations, calibrated cosine matching, and a narrow `FaceBackend` seam.
+- One local face/voice identity registry with naming and explicit confirmed identity merges;
+  `SpeakerSegment` retains its existing fields and exposes unified identity aliases.
+- Local SQLite schema v5 stores modality-specific biometric profiles and migrates existing v4
+  speakers, names, and cached turns in place.
 - Physical benchmark isolation plus local-index and LoCoMo-Refined runners.
 - Enforced POSIX `0700` data directories and `0600` database/lock files, fork-use rejection,
   bounded public input, REST body limits, pre-body bearer authentication, and TLS requirements for
@@ -48,8 +53,9 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 - Isolation is now one physical `data_dir` per application or benchmark unit. There is no hidden
   default scope or logical partition inside a store.
 - The primary developer flow is `Memory()` → `add()` → `search()` or `ask()`.
-- The base dependency set is `httpx`, `pydantic`, and `zvec`; FastAPI/Uvicorn and MCP are optional
-  extras. Sentence Transformers and local media decoders live in the optional `local` extra.
+- The base dependency set is `httpx`, `pydantic`, and `zvec`; FastAPI/Uvicorn, MCP, and InsightFace
+  are optional extras. Sentence Transformers and speech media decoders remain in `local`, while
+  InsightFace, ONNX Runtime, and OpenCV are isolated in `face`.
 - Local embedding spaces are derived from adapter recipe, immutable model revision, effective
   native/Matryoshka dimension, normalization, and query/document semantics.
 - SQLite commits before Zvec changes. Zvec is disposable, and only successfully flushed outbox
@@ -90,6 +96,8 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 - No automatic chunking, multiple embeddings per memory, per-asset retrieval, or reranking stage.
 - No in-place re-embedding or retranscription when a persisted embedding/transcription space or
   dimension changes; create a new directory and re-encode source content instead.
+- No automatic face-to-voice linking, face tracking, liveness, or anti-spoofing; applications merge
+  identities only after independent confirmation.
 - Built-in `data` transport accepts at most 64 MiB of aggregate raw media per embedding or
   generation call; answer requests emit one binary part per distinct asset and accept at most 4 MiB
   of serialized text evidence. Larger video requires co-located `file` transport or a custom

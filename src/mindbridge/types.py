@@ -169,13 +169,68 @@ class SpeakerSegment:
             if len(name) > 255 or not name.isprintable():
                 raise ValidationError("speaker_name must be at most 255 printable characters")
             object.__setattr__(self, "speaker_name", name)
-        if self.identity_score is not None and (
-            isinstance(self.identity_score, bool)
-            or not isinstance(self.identity_score, int | float)
-            or not math.isfinite(float(self.identity_score))
-            or not 0.0 <= self.identity_score <= 1.0
+        _optional_score(self.identity_score, "identity_score")
+
+    @property
+    def identity_id(self) -> str | None:
+        """Return the unified identity ID; ``speaker_id`` remains as a compatibility alias."""
+        return self.speaker_id
+
+    @property
+    def identity_name(self) -> str | None:
+        """Return the unified identity name; ``speaker_name`` remains as a compatibility alias."""
+        return self.speaker_name
+
+
+@dataclass(frozen=True, slots=True)
+class FaceMatch:
+    """One detected face linked to a stable local biometric identity."""
+
+    asset_id: str
+    bbox_xyxy: tuple[float, float, float, float]
+    detection_score: float
+    identity_id: str
+    identity_name: str | None = None
+    identity_score: float | None = None
+    start_ms: int | None = None
+    end_ms: int | None = None
+
+    def __post_init__(self) -> None:
+        if _SHA256.fullmatch(self.asset_id) is None:
+            raise ValidationError("face match asset_id must be a SHA-256 identifier")
+        bbox = tuple(self.bbox_xyxy)
+        if len(bbox) != 4 or any(
+            isinstance(value, bool)
+            or not isinstance(value, int | float)
+            or not math.isfinite(float(value))
+            or not 0.0 <= value <= 1.0
+            for value in bbox
         ):
-            raise ValidationError("identity_score must be between zero and one")
+            raise ValidationError("face bbox_xyxy must contain four normalized coordinates")
+        left, top, right, bottom = bbox
+        if right <= left or bottom <= top:
+            raise ValidationError("face bbox_xyxy must have positive area")
+        if (self.start_ms is None) != (self.end_ms is None) or (
+            self.start_ms is not None
+            and (
+                isinstance(self.start_ms, bool)
+                or not isinstance(self.start_ms, int)
+                or isinstance(self.end_ms, bool)
+                or not isinstance(self.end_ms, int)
+                or self.start_ms < 0
+                or self.end_ms <= self.start_ms
+            )
+        ):
+            raise ValidationError("face time range must be absent or positive")
+        object.__setattr__(self, "bbox_xyxy", bbox)
+        object.__setattr__(self, "identity_id", _text(self.identity_id, "identity_id"))
+        if self.identity_name is not None:
+            name = _text(self.identity_name, "identity_name")
+            if len(name) > 255 or not name.isprintable():
+                raise ValidationError("identity_name must be at most 255 printable characters")
+            object.__setattr__(self, "identity_name", name)
+        _optional_score(self.detection_score, "detection_score", required=True)
+        _optional_score(self.identity_score, "identity_score")
 
 
 def _metadata(value: Mapping[str, object]) -> Mapping[str, object]:
@@ -190,6 +245,18 @@ def _text(value: object, name: str) -> str:
 
 def _optional_text(value: object | None, name: str) -> str | None:
     return None if value is None else _text(value, name)
+
+
+def _optional_score(value: object | None, name: str, *, required: bool = False) -> None:
+    if value is None and not required:
+        return
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int | float)
+        or not math.isfinite(float(value))
+        or not 0.0 <= value <= 1.0
+    ):
+        raise ValidationError(f"{name} must be between zero and one")
 
 
 def _media_type(value: object) -> str:

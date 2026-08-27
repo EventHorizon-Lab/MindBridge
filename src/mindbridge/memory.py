@@ -21,6 +21,7 @@ from urllib.parse import urlsplit
 
 from mindbridge.config import Config
 from mindbridge.exceptions import (
+    IdentityNotFoundError,
     IndexUnavailableError,
     MemoryNotFoundError,
     MindBridgeError,
@@ -49,6 +50,8 @@ from mindbridge.infrastructure.local.zvec_index import IndexHit, ZvecIndex
 from mindbridge.models.base import (
     EmbeddingBackend,
     EmbedTask,
+    FaceAnalysis,
+    FaceBackend,
     ModelBackend,
     ModelCapabilities,
     ModelInput,
@@ -56,6 +59,7 @@ from mindbridge.models.base import (
     SpeechBackend,
 )
 from mindbridge.models.funasr import FunASRTranscriber
+from mindbridge.models.insightface import InsightFaceRecognizer
 from mindbridge.models.jina import JinaOmniEmbedder
 from mindbridge.models.openai_http import OpenAIHTTP
 from mindbridge.types import (
@@ -65,6 +69,7 @@ from mindbridge.types import (
     Blob,
     ContentAtom,
     ContentInput,
+    FaceMatch,
     MemoryRecord,
     Modality,
     Page,
@@ -112,6 +117,7 @@ _MEDIA_TYPES = {
     ".webp": "image/webp",
 }
 _STORE_METADATA_KEYS = {
+    "face": "face.space_id",
     "model": "embedding.model_id",
     "space": "embedding.space_id",
     "transcription": "transcription.space_id",
@@ -205,6 +211,9 @@ class Memory:
         models: ModelBackend | None = None,
         embedder: EmbeddingBackend | None = None,
         transcriber: SpeechBackend | None = None,
+        face_recognizer: FaceBackend | None = None,
+        face_similarity: float = 0.4,
+        face_margin: float = 0.05,
         speaker_similarity: float = 0.78,
         speaker_margin: float = 0.05,
     ) -> None:
@@ -219,8 +228,11 @@ class Memory:
         self._closing = False
         self._closed = True
         self._pending_asset_cleanup: dict[str, StoredAsset] = {}
+        self._face_similarity = _unit_interval(face_similarity, "face_similarity")
+        self._face_margin = _unit_interval(face_margin, "face_margin")
         self._speaker_similarity = _unit_interval(speaker_similarity, "speaker_similarity")
         self._speaker_margin = _unit_interval(speaker_margin, "speaker_margin")
+        self._face_recognizer: FaceBackend | None = None
 
         self._store = _open_store(self.data_dir)
         try:
@@ -244,6 +256,7 @@ class Memory:
                 self._models,
                 use_models=models is not None,
             )
+            self._face_recognizer = _open_face_recognizer(face_recognizer)
         except BaseException:
             self._close_models_and_store()
             raise
@@ -253,6 +266,7 @@ class Memory:
             transcription_capabilities, self._transcription_space = _transcription_contract(
                 self._transcriber
             )
+            self._face_capabilities, self._face_space = _face_contract(self._face_recognizer)
             if self._embedder is self._models:
                 (
                     embedding_capabilities,
@@ -443,6 +457,76 @@ class Memory:
                 registered = self._store.register_speaker(normalized_id, normalized_name)
             if not registered:
                 raise SpeakerNotFoundError(f"speaker does not exist: {normalized_id}")
+
+    def faces(self, memory_id: str) -> tuple[FaceMatch, ...]:
+        """Detect faces and resolve stable local identities."""
+        with self._operation() as operation:
+            normalized_id = _identifier(memory_id, "memory_id")
+            with self._write_lock, _translate_storage_errors("read face memory"):
+                memory = self._store.read_memory(normalized_id)
+            if memory is None:
+                raise MemoryNotFoundError(f"memory does not exist: {normalized_id}")
+            face_assets = tuple(
+                {
+                    asset.asset_id: asset
+                    for asset in memory.assets
+                    if asset.modality in {"image", "video"}
+                }.values()
+            )
+            if not face_assets:
+                return ()
+            unsupported = {
+                Modality(asset.modality)
+                for asset in face_assets
+                if Modality(asset.modality) not in self._face_capabilities
+            }
+            if unsupported:
+                names = ", ".join(sorted(modality.value for modality in unsupported))
+                raise ModelError(f"configured face model does not support: {names}")
+            self._lease_assets(face_assets, operation.leased)
+            cached: dict[str, tuple[FaceMatch, ...]] = {}
+            missing = []
+            with _translate_storage_errors("read cached face recognition"):
+                for asset in face_assets:
+                    matches = self._store.read_faces(asset.asset_id, space_id=self._face_space)
+                    if matches is None:
+                        missing.append(asset)
+                    else:
+                        cached[asset.asset_id] = matches
+            if missing:
+                analyses = self._analyze_faces(tuple(self._asset_ref(asset) for asset in missing))
+                recognizer = cast(FaceBackend, self._face_recognizer)
+                with self._write_lock, _translate_storage_errors("persist face recognition"):
+                    for asset, analysis in zip(missing, analyses, strict=True):
+                        cached[asset.asset_id] = self._store.write_faces(
+                            asset.asset_id,
+                            analysis,
+                            model_id=recognizer.model_id,
+                            space_id=self._face_space,
+                            minimum_similarity=self._face_similarity,
+                            minimum_margin=self._face_margin,
+                        )
+            return tuple(match for asset in face_assets for match in cached[asset.asset_id])
+
+    def register_identity(self, identity_id: str, name: str) -> None:
+        """Assign or replace a human-readable name for any face or voice identity."""
+        normalized_id = _identifier(identity_id, "identity_id")
+        normalized_name = _identity_name(name)
+        with self._operation(), self._write_lock:
+            with _translate_storage_errors("register identity"):
+                registered = self._store.register_identity(normalized_id, normalized_name)
+            if not registered:
+                raise IdentityNotFoundError(f"identity does not exist: {normalized_id}")
+
+    def merge_identities(self, identity_id: str, duplicate_id: str) -> None:
+        """Merge a confirmed duplicate face or voice identity into one canonical identity."""
+        normalized_id = _identifier(identity_id, "identity_id")
+        normalized_duplicate = _identifier(duplicate_id, "duplicate_id")
+        with self._operation(), self._write_lock:
+            with _translate_storage_errors("merge identities"):
+                merged = self._store.merge_identities(normalized_id, normalized_duplicate)
+            if not merged:
+                raise IdentityNotFoundError("one or more identities do not exist")
 
     def list(self, *, limit: int = 100, cursor: str | None = None) -> Page:
         """List newest memories with an opaque stable keyset cursor."""
@@ -995,6 +1079,23 @@ class Memory:
             raise ModelError("speech model returned invalid output")
         return tuple(analyses)
 
+    def _analyze_faces(
+        self,
+        assets: Sequence[AssetRef],
+    ) -> tuple[FaceAnalysis, ...]:
+        recognizer = cast(FaceBackend, self._face_recognizer)
+        try:
+            analyses = recognizer.analyze(assets)
+        except MindBridgeError:
+            raise
+        except Exception as error:
+            raise ModelError("failed to analyze face input") from error
+        if len(analyses) != len(assets) or any(
+            not isinstance(analysis, FaceAnalysis) for analysis in analyses
+        ):
+            raise ModelError("face model returned invalid output")
+        return tuple(analyses)
+
     def _resolved_model_input(self, prepared: _PreparedContent) -> ModelInput:
         return ModelInput(
             text=prepared.text,
@@ -1224,6 +1325,7 @@ class Memory:
 
     def _ensure_store_metadata(self) -> None:
         expected = {
+            _STORE_METADATA_KEYS["face"]: self._face_space,
             _STORE_METADATA_KEYS["model"]: self._embedding_model,
             _STORE_METADATA_KEYS["space"]: self._space_id,
             _STORE_METADATA_KEYS["transcription"]: self._transcription_space,
@@ -1242,7 +1344,12 @@ class Memory:
                     )
 
     def _close_models_and_store(self, *, include_embedder: bool = True) -> None:
-        resources: tuple[_Closable, ...] = (self._transcriber, self._models, self._store)
+        resources: tuple[_Closable, ...] = (
+            *((self._face_recognizer,) if self._face_recognizer is not None else ()),
+            self._transcriber,
+            self._models,
+            self._store,
+        )
         if include_embedder:
             resources = (self._embedder, *resources)
         for resource in _unique_resources(resources):
@@ -1253,6 +1360,7 @@ class Memory:
         failures: builtins.list[Exception] = []
         resources: tuple[_Closable, ...] = (
             self._embedder,
+            cast(FaceBackend, self._face_recognizer),
             self._transcriber,
             self._models,
             self._index,
@@ -1328,6 +1436,9 @@ class AsyncMemory:
         models: ModelBackend | None = None,
         embedder: EmbeddingBackend | None = None,
         transcriber: SpeechBackend | None = None,
+        face_recognizer: FaceBackend | None = None,
+        face_similarity: float = 0.4,
+        face_margin: float = 0.05,
         speaker_similarity: float = 0.78,
         speaker_margin: float = 0.05,
     ) -> None:
@@ -1337,6 +1448,9 @@ class AsyncMemory:
             models=models,
             embedder=embedder,
             transcriber=transcriber,
+            face_recognizer=face_recognizer,
+            face_similarity=face_similarity,
+            face_margin=face_margin,
             speaker_similarity=speaker_similarity,
             speaker_margin=speaker_margin,
         )
@@ -1378,6 +1492,15 @@ class AsyncMemory:
 
     async def speech(self, memory_id: str) -> tuple[SpeakerSegment, ...]:
         return await asyncio.to_thread(self._memory.speech, memory_id)
+
+    async def faces(self, memory_id: str) -> tuple[FaceMatch, ...]:
+        return await asyncio.to_thread(self._memory.faces, memory_id)
+
+    async def register_identity(self, identity_id: str, name: str) -> None:
+        await asyncio.to_thread(self._memory.register_identity, identity_id, name)
+
+    async def merge_identities(self, identity_id: str, duplicate_id: str) -> None:
+        await asyncio.to_thread(self._memory.merge_identities, identity_id, duplicate_id)
 
     async def register_speaker(self, speaker_id: str, name: str) -> None:
         await asyncio.to_thread(self._memory.register_speaker, speaker_id, name)
@@ -1556,6 +1679,15 @@ def _open_transcriber(
         raise ModelError("failed to open the speech model") from error
 
 
+def _open_face_recognizer(face_recognizer: FaceBackend | None) -> FaceBackend:
+    try:
+        return InsightFaceRecognizer() if face_recognizer is None else face_recognizer
+    except MindBridgeError:
+        raise
+    except Exception as error:
+        raise ModelError("failed to open the face model") from error
+
+
 def _model_contract(models: ModelBackend) -> ModelCapabilities:
     capabilities = models.capabilities
     if not isinstance(capabilities, ModelCapabilities):
@@ -1581,6 +1713,19 @@ def _transcription_contract(
         transcriber.transcription_space,
         "transcription space",
     )
+
+
+def _face_contract(recognizer: FaceBackend | None) -> tuple[frozenset[Modality], str]:
+    if recognizer is None or not isinstance(recognizer, FaceBackend):
+        raise ValidationError("face_recognizer must implement FaceBackend")
+    capabilities = recognizer.capabilities
+    if not isinstance(capabilities, frozenset) or any(
+        not isinstance(modality, Modality) for modality in capabilities
+    ):
+        raise ValidationError("face_recognizer.capabilities must be a frozenset of modalities")
+    if not capabilities or capabilities - {Modality.IMAGE, Modality.VIDEO}:
+        raise ValidationError("face_recognizer must support image, video, or both")
+    return capabilities, _model_text(recognizer.space_id, "face space")
 
 
 def _combined_embedding_contract(
@@ -1716,9 +1861,13 @@ def _identifier(value: object, name: str) -> str:
 
 
 def _speaker_name(value: object) -> str:
-    name = _text(value, "speaker name")
+    return _identity_name(value, label="speaker name")
+
+
+def _identity_name(value: object, *, label: str = "identity name") -> str:
+    name = _text(value, label)
     if len(name) > 255 or not name.isprintable():
-        raise ValidationError("speaker name must be at most 255 printable characters")
+        raise ValidationError(f"{label} must be at most 255 printable characters")
     return name
 
 

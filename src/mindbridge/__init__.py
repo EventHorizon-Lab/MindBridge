@@ -2,6 +2,7 @@
 
 from mindbridge.config import Config
 from mindbridge.exceptions import (
+    IdentityNotFoundError,
     IndexUnavailableError,
     MemoryNotFoundError,
     MindBridgeError,
@@ -14,6 +15,10 @@ from mindbridge.memory import AsyncMemory, Memory
 from mindbridge.models.base import (
     EmbeddingBackend,
     EmbedTask,
+    FaceAnalysis,
+    FaceBackend,
+    FaceDetection,
+    FaceEmbedding,
     ModelBackend,
     ModelCapabilities,
     ModelInput,
@@ -28,6 +33,11 @@ from mindbridge.models.funasr import (
     FunASRRecipe,
     FunASRTranscriber,
 )
+from mindbridge.models.insightface import (
+    DEFAULT_INSIGHTFACE_MODEL,
+    DEFAULT_INSIGHTFACE_MODEL_REVISION,
+    InsightFaceRecognizer,
+)
 from mindbridge.models.jina import JinaOmniEmbedder
 from mindbridge.models.openai_http import OpenAIHTTP
 from mindbridge.models.sentence_transformers import SentenceTransformersEmbedder
@@ -38,6 +48,7 @@ from mindbridge.types import (
     Blob,
     ContentAtom,
     ContentInput,
+    FaceMatch,
     MemoryRecord,
     Modality,
     Page,
@@ -48,6 +59,8 @@ from mindbridge.types import (
 __all__ = [
     "DEFAULT_FUNASR_MODEL_ID",
     "DEFAULT_FUNASR_RECIPE",
+    "DEFAULT_INSIGHTFACE_MODEL",
+    "DEFAULT_INSIGHTFACE_MODEL_REVISION",
     "URL",
     "AnswerResult",
     "AssetRef",
@@ -58,9 +71,16 @@ __all__ = [
     "ContentInput",
     "EmbedTask",
     "EmbeddingBackend",
+    "FaceAnalysis",
+    "FaceBackend",
+    "FaceDetection",
+    "FaceEmbedding",
+    "FaceMatch",
     "FunASRRecipe",
     "FunASRTranscriber",
+    "IdentityNotFoundError",
     "IndexUnavailableError",
+    "InsightFaceRecognizer",
     "JinaOmniEmbedder",
     "Memory",
     "MemoryNotFoundError",

@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from mindbridge.exceptions import (
+    IdentityNotFoundError,
     IndexUnavailableError,
     MemoryNotFoundError,
     MindBridgeError,
@@ -20,10 +21,12 @@ from mindbridge.types import (
     AnswerResult,
     AssetRef,
     Blob,
+    FaceMatch,
     MemoryRecord,
     Modality,
     Page,
     SearchHit,
+    SpeakerSegment,
 )
 
 NOW = datetime(2026, 8, 27, tzinfo=timezone.utc)
@@ -125,21 +128,47 @@ def test_answer_and_page_reuse_the_public_values() -> None:
     assert Page(items=(memory,), next_cursor="cursor_1").items == (memory,)
 
 
+def test_face_and_speaker_results_share_identity_fields() -> None:
+    face = FaceMatch(
+        asset_id="a" * 64,
+        bbox_xyxy=(0.1, 0.2, 0.4, 0.8),
+        detection_score=0.98,
+        identity_id="identity_1",
+        identity_name="Alice",
+    )
+    voice = SpeakerSegment(
+        asset_id="b" * 64,
+        start_ms=0,
+        end_ms=1_000,
+        text="hello",
+        speaker_id=face.identity_id,
+        speaker_name=face.identity_name,
+    )
+
+    assert voice.identity_id == face.identity_id
+    assert voice.identity_name == face.identity_name
+    with pytest.raises(ValidationError, match="positive area"):
+        FaceMatch("a" * 64, (0.2, 0.2, 0.1, 0.8), 0.9, "identity_1")
+
+
 def test_public_exceptions_have_stable_categories() -> None:
     assert issubclass(ValidationError, MindBridgeError)
     assert issubclass(ValidationError, ValueError)
     assert issubclass(MemoryNotFoundError, MindBridgeError)
     assert issubclass(MemoryNotFoundError, LookupError)
+    assert issubclass(IdentityNotFoundError, LookupError)
     assert issubclass(IndexUnavailableError, StorageError)
     assert {
         ValidationError.code,
         MemoryNotFoundError.code,
+        IdentityNotFoundError.code,
         ModelError.code,
         StorageError.code,
         IndexUnavailableError.code,
     } == {
         "validation_error",
         "memory_not_found",
+        "identity_not_found",
         "model_error",
         "storage_error",
         "index_unavailable",

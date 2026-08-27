@@ -30,8 +30,8 @@ SCRIPTS = cast(dict[str, str], PROJECT["scripts"])
 def test_base_import_does_not_load_optional_protocols() -> None:
     code = (
         "import json, sys; import mindbridge; "
-        "blocked = {'fastapi', 'mcp', 'sentence_transformers', 'torch', "
-        "'transformers', 'uvicorn', 'vllm'}; "
+        "blocked = {'cv2', 'fastapi', 'insightface', 'mcp', 'onnxruntime', "
+        "'sentence_transformers', 'torch', 'transformers', 'uvicorn', 'vllm'}; "
         "print(json.dumps(sorted(blocked.intersection(sys.modules))))"
     )
     result = subprocess.run(
@@ -54,6 +54,10 @@ def test_full_modal_contract_is_exported_from_the_package_root() -> None:
         "ContentInput",
         "Modality",
         "EmbeddingBackend",
+        "FaceBackend",
+        "FaceMatch",
+        "IdentityNotFoundError",
+        "InsightFaceRecognizer",
         "JinaOmniEmbedder",
         "ModelBackend",
         "ModelCapabilities",
@@ -107,6 +111,7 @@ def test_dependency_surface_is_exact() -> None:
     assert {_name(item) for item in DEPENDENCIES} == {"httpx", "pydantic", "zvec"}
     assert {extra: {_name(item) for item in items} for extra, items in EXTRAS.items()} == {
         "local": {"funasr", "librosa", "numpy", "sentence-transformers", "soundfile"},
+        "face": {"insightface"},
         "vllm": {"vllm"},
         "server": {"fastapi", "starlette", "uvicorn"},
         "mcp": {"mcp"},

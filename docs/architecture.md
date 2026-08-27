@@ -16,6 +16,8 @@ flowchart LR
     Models --> Generate[Generation endpoint]
     Normalize --> Speech[SpeechBackend]
     Speech --> ASR[FunASR or custom speech analysis]
+    Normalize --> Face[FaceBackend]
+    Face --> InsightFace[InsightFace or custom face analysis]
     Normalize --> SQLite[SQLite authority]
     SQLite --> Outbox[Durable index outbox]
     Outbox --> Zvec[Zvec hybrid projection]
@@ -28,12 +30,14 @@ flowchart LR
 | `Memory` | Content normalization, capability routing, identity, orchestration, public errors |
 | `AsyncMemory` | `asyncio.to_thread` facade over the same synchronous core |
 | `AssetStore` | Safe Path/URL/Blob ingestion, public-IP connection pinning, immutable SHA-256 files |
-| `LocalStore` | SQLite schema, transactions, records, asset references, FP32 embeddings, outbox |
+| `LocalStore` | SQLite records, assets, embeddings, biometric identities, transactions, outbox |
 | `ZvecIndex` | Dense, full-text, and reciprocal-rank hybrid retrieval |
 | `EmbeddingBackend` | Embedding capabilities, stable model/space identity, query/document batches |
 | `ModelBackend` | Combined cloud embedding compatibility, grounded generation, and transcription |
 | `SpeechBackend` | Timed transcription, diarization, and stable speech-space identity |
 | `FunASRTranscriber` | Lazy Fun-ASR-Nano with AutoModel/vLLM, FSMN-VAD, and CAM++ |
+| `FaceBackend` | Face boxes and embeddings with a stable recognition-space identity |
+| `InsightFaceRecognizer` | Lazy upstream InsightFace model pack through ONNX Runtime |
 | `JinaOmniEmbedder` | Pinned default model and isolated Jina tuple/remote-code compatibility |
 | `SentenceTransformersEmbedder` | Standard multimodal dict/message input and model capability discovery |
 | FastAPI adapter | Optional `/v1` JSON transport, body limit, bearer authentication |
@@ -85,10 +89,11 @@ Embedding is local Jina v5 Omni by default. Another standard Sentence Transforme
 through `embedder=`; Qwen3-VL uses its native dict/message contract and advertised capabilities.
 A combined cloud `ModelBackend` can still own embedding and transcription when passed explicitly
 without `embedder=` or `transcriber=`. Generation uses OpenAI-compatible HTTP by default; speech
-uses local FunASR by default.
-Both embedding `space_id` and `transcription_space` are persisted in SQLite. A different active
-value fails at startup so vectors, cached transcripts, and add-time ASR-derived text never mix
-semantic recipes in one directory.
+uses local FunASR by default, and `faces` uses a lazy InsightFace `buffalo_l` adapter.
+Embedding, transcription, and face-recognition space IDs are persisted in SQLite. A different
+active value fails at startup so vectors and cached analyses never mix semantic recipes in one
+directory. Face and voice profiles share one identity row only after an explicit confirmed merge;
+their modality-specific vectors are never compared.
 
 The built-in `data` transport limits each embedding or generation request to 64 MiB of aggregate
 raw media before base64 expansion. Answer construction includes a distinct asset's binary part only
@@ -166,9 +171,9 @@ not authoritative.
 
 ## Dependency boundary
 
-The core package depends on HTTPX, Pydantic, and Zvec. Sentence Transformers and media decoders
-live in the `local` extra, FastAPI/Uvicorn in `server`, and MCP in `mcp`. Importing MindBridge does
-not import Torch, Transformers, Sentence Transformers, or either protocol stack.
+The core package depends on HTTPX, Pydantic, and Zvec. Sentence Transformers and speech decoders
+live in the `local` extra; InsightFace, ONNX Runtime, and OpenCV live in `face`; FastAPI/Uvicorn live
+in `server`; and MCP lives in `mcp`. Importing MindBridge does not import those optional runtimes.
 
 The current retrieval unit is one memory and one aggregate embedding. The architecture does not
 claim content chunking, multiple vectors per memory, or reranking. For table and flow details, read

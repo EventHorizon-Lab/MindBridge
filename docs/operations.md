@@ -1,7 +1,7 @@
 # Operations
 
 MindBridge has no separate database or worker fleet to operate. Operational state is one local
-directory plus the selected embedding, generation, and speech backends.
+directory plus the selected embedding, generation, speech, and face backends.
 
 ## Health
 
@@ -52,8 +52,9 @@ Restore only while the target process is stopped:
 When `zvec/` is absent, startup queues every authoritative embedding and rebuilds the index without
 re-embedding historical content. A configuration metadata mismatch stops startup; use the
 embedding model, vector-space ID, dimension, and recipe that created the store.
-Restore the original `transcription_space` as well. It identifies the ASR model and
-transcript-affecting recipe used by cached transcripts and add-time derived text; a mismatch fails startup.
+Restore the original transcription and face recognition spaces as well. They identify the recipes
+used by cached transcripts, add-time derived text, and biometric observations; a mismatch fails
+startup.
 
 ## Rebuild and optimize
 
@@ -91,6 +92,7 @@ Track at least:
 - Free bytes and inodes on the containing filesystem.
 - Add and search latency.
 - Embedding, generation, and transcription latency/failures separately.
+- Face detection/recognition latency, rejected low-quality faces, and false-match audits.
 - Raw media bytes per built-in embedding/generation call; `data` transport rejects aggregates over
   64 MiB before base64 expansion.
 - Remote media download failures and rejected hosts.

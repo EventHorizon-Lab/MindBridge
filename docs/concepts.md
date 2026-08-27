@@ -80,7 +80,8 @@ not see one another's memories, give them different directories and apply filesy
 
 SQLite and the content-addressed asset files are authoritative. SQLite stores records, asset
 descriptors and relationships, FP32 embeddings, the embedding/index recipe, and a durable outbox
-of index work. A successful SQLite commit survives even if Zvec cannot be updated immediately.
+of index work. It also stores face/voice identity profiles and cached observations. A successful
+SQLite commit survives even if Zvec cannot be updated immediately.
 
 Zvec is a rebuildable hybrid-search projection. Search gets ranked candidate IDs from Zvec and
 hydrates complete records from SQLite. An index ID that no longer exists in SQLite is discarded.
@@ -91,11 +92,12 @@ model endpoint for historical content.
 
 ## Capability-driven model routing
 
-The default composition has three independent operations:
+The default composition has four independent operations:
 
 - Local Jina v5 Omni embedding for stored memories and search queries.
 - Generation for grounded answers.
 - Local Fun-ASR-Nano transcription, FSMN-VAD diarization, and CAM++ speaker encoding.
+- Optional local InsightFace detection and ArcFace encoding for image/video identity.
 
 Each operation declares the atomic modalities it accepts. MindBridge routes from capabilities,
 not model names:
@@ -117,10 +119,16 @@ changing the embedding space. The store also persists `transcription_space`, whi
 ASR model and transcript-affecting preprocessing recipe. Reopening with a different value fails
 before use so cached transcripts and add-time derived text cannot silently mix recipes.
 
-FunASR's `SPK0` labels are local to one asset. `Memory.speech` matches their normalized CAM++
-centroids to stable local `speaker_id` values inside the physical data directory. A first
-observation enrolls an identity; only later matches carry an `identity_score`. Applications may
-attach a display name with `register_speaker`; the biometric vector remains local.
+FunASR's `SPK0` labels and InsightFace frame labels are local to one analysis. `Memory.speech`
+matches normalized CAM++ centroids and `Memory.faces` matches normalized ArcFace embeddings to
+stable IDs in one local identity registry. A first observation enrolls an identity; only later
+matches carry an `identity_score`. `SpeakerSegment.identity_id` exposes the shared ID while the
+existing `speaker_id` name remains supported.
+
+Face and voice vectors occupy unrelated spaces and are never compared. After an application has
+independent evidence that they represent the same person, `merge_identities` moves both profiles
+and cached observations under one canonical ID. `register_identity` assigns its display name. Raw
+biometric vectors remain inside the physical data directory.
 
 ## Retrieval and grounded answers
 

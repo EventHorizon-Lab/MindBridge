@@ -3,6 +3,10 @@
 from mindbridge.models.base import (
     EmbeddingBackend,
     EmbedTask,
+    FaceAnalysis,
+    FaceBackend,
+    FaceDetection,
+    FaceEmbedding,
     ModelBackend,
     ModelCapabilities,
     ModelInput,
@@ -22,6 +26,11 @@ from mindbridge.models.funasr import (
     FunASRRecipe,
     FunASRTranscriber,
 )
+from mindbridge.models.insightface import (
+    DEFAULT_INSIGHTFACE_MODEL,
+    DEFAULT_INSIGHTFACE_MODEL_REVISION,
+    InsightFaceRecognizer,
+)
 from mindbridge.models.jina import (
     DEFAULT_JINA_DIMENSION,
     DEFAULT_JINA_MODEL_ID,
@@ -38,13 +47,20 @@ __all__ = [
     "DEFAULT_FUNASR_SPEAKER_REVISION",
     "DEFAULT_FUNASR_VAD_MODEL_ID",
     "DEFAULT_FUNASR_VAD_REVISION",
+    "DEFAULT_INSIGHTFACE_MODEL",
+    "DEFAULT_INSIGHTFACE_MODEL_REVISION",
     "DEFAULT_JINA_DIMENSION",
     "DEFAULT_JINA_MODEL_ID",
     "DEFAULT_JINA_REVISION",
     "EmbedTask",
     "EmbeddingBackend",
+    "FaceAnalysis",
+    "FaceBackend",
+    "FaceDetection",
+    "FaceEmbedding",
     "FunASRRecipe",
     "FunASRTranscriber",
+    "InsightFaceRecognizer",
     "JinaOmniEmbedder",
     "ModelBackend",
     "ModelCapabilities",

@@ -12,11 +12,20 @@ from mindbridge import (
     ContentInput,
     DEFAULT_FUNASR_MODEL_ID,
     DEFAULT_FUNASR_RECIPE,
+    DEFAULT_INSIGHTFACE_MODEL,
+    DEFAULT_INSIGHTFACE_MODEL_REVISION,
     EmbeddingBackend,
     EmbedTask,
+    FaceAnalysis,
+    FaceBackend,
+    FaceDetection,
+    FaceEmbedding,
+    FaceMatch,
     FunASRRecipe,
     FunASRTranscriber,
+    IdentityNotFoundError,
     IndexUnavailableError,
+    InsightFaceRecognizer,
     JinaOmniEmbedder,
     Memory,
     MemoryNotFoundError,
@@ -109,6 +118,9 @@ Memory(
     models: ModelBackend | None = None,
     embedder: EmbeddingBackend | None = None,
     transcriber: SpeechBackend | None = None,
+    face_recognizer: FaceBackend | None = None,
+    face_similarity: float = 0.4,
+    face_margin: float = 0.05,
     speaker_similarity: float = 0.78,
     speaker_margin: float = 0.05,
 )
@@ -116,11 +128,12 @@ Memory(
 
 Construction acquires exclusive ownership of `data_dir`, opens SQLite, the asset store, and Zvec,
 validates durable compatibility metadata, and replays pending index work. By default, embedding is
-pinned Jina v5 Omni, speech is local Fun-ASR-Nano, and generation uses OpenAI-compatible HTTP.
-Passing `embedder` or `transcriber` replaces only that operation. Passing `models` without either
-narrower backend uses that combined backend for all three operations. The two speaker thresholds
-calibrate CAM++ cosine matching; ambiguous matches enroll a new anonymous identity. `Memory` owns
-and closes each distinct supplied backend once.
+pinned Jina v5 Omni, speech is local Fun-ASR-Nano, face recognition is a lazy InsightFace
+`buffalo_l` adapter, and generation uses OpenAI-compatible HTTP. Passing `embedder`, `transcriber`,
+or `face_recognizer` replaces only that operation. Passing `models` without either embedding or
+speech backend uses that combined backend for those operations. Face and speaker threshold pairs
+calibrate cosine matching; a weak or ambiguous match enrolls a new anonymous identity. `Memory`
+owns and closes each distinct supplied backend once.
 
 ### `add`
 
@@ -213,6 +226,39 @@ first enrolled and is a cosine score on later recognition. `Memory.speech` never
 voiceprints. Repeated calls for the same asset and speech space do not run inference again. A
 combined backend that only implements plain `transcribe` can provide ASR fallback but raises
 `ModelError` here because it has no speaker evidence.
+
+`SpeakerSegment.identity_id` and `identity_name` expose the same values under the unified identity
+vocabulary; `speaker_id` and `speaker_name` remain supported.
+
+### `faces`
+
+```python
+memory.faces(memory_id: str) -> tuple[FaceMatch, ...]
+```
+
+Lazily analyzes every image/video asset with the configured `FaceBackend` and caches its result.
+Each match contains `asset_id`, normalized `bbox_xyxy`, `detection_score`, stable `identity_id`,
+optional `identity_name`, and optional cosine `identity_score`. Video matches additionally contain
+`start_ms` and `end_ms`; image matches leave them `None`. Raw face embeddings are never returned.
+
+### `register_identity`
+
+```python
+memory.register_identity(identity_id: str, name: str) -> None
+```
+
+Assigns or replaces the name of any face or voice identity. Unknown IDs raise
+`IdentityNotFoundError`; names must be non-empty, printable, and at most 255 characters.
+
+### `merge_identities`
+
+```python
+memory.merge_identities(identity_id: str, duplicate_id: str) -> None
+```
+
+Moves all profiles and cached observations from `duplicate_id` into the first, canonical identity.
+Use it only after application or user confirmation: face and voice embeddings use independent
+spaces and are never compared or auto-linked. Unknown IDs raise `IdentityNotFoundError`.
 
 ### `register_speaker`
 
@@ -446,6 +492,37 @@ build for you.
 `SpeechBackend` is the narrower custom seam for timed turns and speaker centroids. Its `space_id`
 must change whenever ASR, VAD, diarization, speaker encoding, or preprocessing changes.
 
+## InsightFace backend
+
+Install `mindbridge[face]`. `InsightFaceRecognizer` delegates detection, alignment, and ArcFace
+encoding to the upstream InsightFace model zoo and ONNX Runtime:
+
+```python
+face = InsightFaceRecognizer(
+    model="buffalo_l",
+    device="auto",
+    model_root=None,
+    detection_size=None,
+    minimum_detection_score=0.6,
+    minimum_embedding_norm=20.0,
+    minimum_face_pixels=32,
+    samples_per_second=1.0,
+    maximum_samples=256,
+)
+memory = Memory(
+    "./data/identity",
+    face_recognizer=face,
+    face_similarity=0.4,
+    face_margin=0.05,
+)
+```
+
+The adapter loads on the first `faces` call. `device="auto"` prefers an available CUDA execution
+provider and otherwise uses CPU; explicit `cpu`, `cuda`, and `tensorrt` values fail if the requested
+provider is unavailable. Sampling and quality controls are part of `space_id`, so changing them
+requires a new data directory. `FaceBackend` is the custom seam for alternate implementations and
+must return paired `FaceDetection` and `FaceEmbedding` values.
+
 ## Custom model backend
 
 `ModelBackend` is the complete public model seam:
@@ -487,7 +564,8 @@ Catch `MindBridgeError` for every supported operational failure, or a specific s
 | --- | --- |
 | `ValidationError` | Content, asset, metadata, cursor, time, or limit is invalid |
 | `MemoryNotFoundError` | `get` could not find the requested memory ID |
-| `ModelError` | Capability routing, embedding, generation, or transcription failed |
+| `IdentityNotFoundError` | Identity registration or merge referenced an unknown ID |
+| `ModelError` | Capability routing, embedding, generation, speech, or face analysis failed |
 | `StorageError` | Directory, lock, CAS, SQLite, schema, or durable state failed |
 | `IndexUnavailableError` | Zvec could not open, mutate, flush, or search |
 

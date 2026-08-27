@@ -16,13 +16,13 @@ The file can remain after shutdown. Ownership is the operating-system lock, not 
 
 ## Store metadata mismatch
 
-Symptom: startup raises `StorageError` mentioning an embedding, transcription, or index metadata
-key.
+Symptom: startup raises `StorageError` mentioning an embedding, transcription, face, or index
+metadata key.
 
-The active embedding model, vector-space ID, dimension, transcription space, or index recipe
-differs from the values that created the store. Restore the original configuration, or create a new
-directory and re-ingest. Editing SQLite metadata would mix incompatible vectors or transcripts and
-is unsupported.
+The active embedding model, vector-space ID, dimension, transcription space, face space, or index
+recipe differs from the values that created the store. Restore the original configuration, or
+create a new directory and re-ingest. Editing SQLite metadata would mix incompatible vectors or
+cached analyses and is unsupported.
 
 Local adapters derive a new `space_id` when adapter, model, immutable revision, dimension, or input
 recipe changes. Use that adapter with a new data directory and re-encode source content. For an
@@ -37,8 +37,8 @@ Symptom: startup reports an unsupported version, unversioned schema, or missing 
 
 Confirm the path belongs to this MindBridge release and was not pointed at an unrelated SQLite
 database. Restore a known-good complete backup. Do not edit `PRAGMA user_version` or manually
-create tables. The supported v1 and v2 local-schema migrations run automatically; old PostgreSQL data
-does not.
+create tables. Supported v1 through v4 local-schema migrations run automatically; old PostgreSQL
+data does not.
 
 ## Model operation failed
 
@@ -52,12 +52,18 @@ Check the failing operation independently:
 | Combined HTTP embedding | `MINDBRIDGE_EMBEDDING_*` | `/v1/embeddings` |
 | Generation | `MINDBRIDGE_GENERATION_*` | `/v1/chat/completions` |
 | Transcription | `MINDBRIDGE_TRANSCRIPTION_*` | `/v1/audio/transcriptions` |
+| Face recognition | local InsightFace/ONNX Runtime | `FaceAnalysis.get` |
 
 HTTP operation-specific variables fall back to `OPENAI_API_KEY` and `OPENAI_BASE_URL`. For local
 embedding, confirm `mindbridge[local]` is installed, the immutable model revision is available,
 device memory is sufficient, media decoders are installed, and the requested dimension is native
 or advertised as Matryoshka-trained. All backends must return one finite vector of the declared
 dimension per input.
+
+For face analysis, confirm `mindbridge[face]` is installed, the requested InsightFace pack is
+available, OpenCV decodes the media, and the requested ONNX execution provider is active. Low
+detection score, embedding norm, or face size is filtered rather than enrolled; calibrate those
+controls on representative inputs.
 
 MindBridge sanitizes provider response bodies and credentials. Reproduce the request directly
 against a non-production endpoint when provider diagnostics are required.

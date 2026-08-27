@@ -23,6 +23,13 @@ credential only when using the default grounded-answer backend:
 export OPENAI_API_KEY="your-api-key"
 ```
 
+Add `face` when the application calls `Memory.faces`; it installs InsightFace, ONNX Runtime, and
+OpenCV without adding them to the base SDK:
+
+```bash
+uv add "mindbridge[local,face]"
+```
+
 A text-only use case stays a three-line flow; it is one native route, not a product limitation:
 
 ```python
@@ -129,6 +136,10 @@ answer = memory.ask(question, limit=5)
 turns = memory.speech(record.id)  # timed text and stable local speaker_id values
 if turns and turns[0].speaker_id:
     memory.register_speaker(turns[0].speaker_id, "Ada")
+faces = memory.faces(record.id)  # normalized boxes and stable local identity_id values
+if faces and turns and turns[0].identity_id:
+    memory.merge_identities(faces[0].identity_id, turns[0].identity_id)
+    memory.register_identity(faces[0].identity_id, "Ada")
 record = memory.get(record.id)
 page = memory.list(limit=100, cursor=None)
 deleted = memory.delete(record.id)
@@ -136,10 +147,12 @@ memory.reindex()
 memory.optimize()
 ```
 
-`speech` lazily runs Fun-ASR-Nano, VAD, and CAM++ the first time an audio/video asset needs speech
-analysis. CAM++ centroids stay in the same SQLite directory and match speakers across recordings.
-Register an opaque `speaker_id` once to receive `speaker_name` on later and cached turns; biometric
-vectors never leave the local store.
+`speech` lazily runs Fun-ASR-Nano, VAD, and CAM++ while `faces` lazily runs InsightFace SCRFD and
+ArcFace. Both enroll opaque IDs in one SQLite identity registry, and biometric vectors never leave
+the local store. Face and voice embeddings are not directly comparable, so
+`merge_identities(canonical, duplicate)` is deliberately explicit and should follow application or
+user confirmation. Existing `speaker_id` and `speaker_name` fields remain aliases for the shared
+identity on `SpeakerSegment`.
 
 `AsyncMemory` exposes the same operations with `await`. See the
 [Python API reference](docs/api/python-sdk.md) for exact values, routing, and failures.
@@ -213,7 +226,7 @@ together with any supported image or video input. Native audio-capable models re
 directly. Routing is based on declared capabilities, never guessed from a model name.
 
 One `Memory` instance may call a backend concurrently. Custom `EmbeddingBackend`, `SpeechBackend`,
-and `ModelBackend` implementations must therefore be thread-safe until `close()`.
+`FaceBackend`, and `ModelBackend` implementations must therefore be thread-safe until `close()`.
 
 Model ID, immutable revision, effective dimension, normalization, query/document semantics, and
 input recipe determine `space_id`. Switching any of them creates a different space. Re-encode
@@ -222,6 +235,12 @@ content into a new `data_dir`; `reindex()` only rebuilds Zvec from the existing 
 The [default Jina model weights](https://huggingface.co/jinaai/jina-embeddings-v5-omni-small-retrieval)
 use CC BY-NC 4.0. Applications whose use is not compatible with that license should inject another
 Sentence Transformers model or cloud backend.
+
+Face recognition defaults to InsightFace `buffalo_l`, the upstream auto-downloadable pack combining
+SCRFD/RetinaFace-class detection with ArcFace recognition. The adapter also accepts other upstream
+model-pack names for measured CPU, GPU, or quality trade-offs. InsightFace code is MIT, but its
+[pretrained model packs are restricted to non-commercial research](https://github.com/deepinsight/insightface/blob/master/python-package/README.md#license);
+production deployments must supply appropriately licensed weights.
 
 See [configuration](docs/configuration.md) for every variable and custom backend guidance.
 

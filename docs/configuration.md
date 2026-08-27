@@ -1,8 +1,9 @@
 # Configuration
 
-MindBridge separates embedding, generation, and speech analysis. `Memory()` uses pinned Jina v5
-Omni embedding and Fun-ASR-Nano speech locally by default; `Config` controls the OpenAI-compatible
-generation/combined backend, media policy, and timeouts.
+MindBridge separates embedding, generation, speech analysis, and face recognition. `Memory()` uses
+pinned Jina v5 Omni embedding, Fun-ASR-Nano speech, and a lazy InsightFace adapter locally by
+default; `Config` controls the OpenAI-compatible generation/combined backend, media policy, and
+timeouts.
 
 ## Embedding backends
 
@@ -35,6 +36,45 @@ method and emits only standard dict/message input. `JinaOmniEmbedder` is separat
 pinned Jina model currently uses a provider-specific tuple contract and remote model code.
 MindBridge restores Sentence Transformers' global methods after loading Jina so a Qwen instance
 in the same process remains standard.
+
+## Face recognition
+
+Install `mindbridge[face]` only when calling `Memory.faces`. The default
+`InsightFaceRecognizer(model="buffalo_l")` uses the upstream detection, alignment, ArcFace, model
+download, and ONNX Runtime execution paths. No MindBridge-specific face network is trained or
+packaged.
+
+The [official InsightFace model zoo](https://github.com/deepinsight/insightface/blob/master/model_zoo/README.md)
+supports several useful operating points:
+
+| Model pack | Choose when |
+| --- | --- |
+| `buffalo_l` | Default; robust 10GF detector plus ResNet-50 recognition and automatic download |
+| `buffalo_m` | Faster 2.5GF detection with the same ResNet-50 recognition model |
+| `buffalo_s` | CPU/edge latency or package size matters more than peak accuracy |
+| `antelopev2` | Quality-first ResNet-100 recognition justifies a larger, manually supplied pack |
+
+`buffalo_l` is the default because end-to-end identity quality depends on detection as well as the
+recognizer, and it is the upstream default pack. Select another pack only after measuring the
+target cameras and hardware. Pass `model_root=` to use a pre-provisioned upstream model directory
+for offline startup; give custom weights a distinct `model` pack name so their durable identity
+cannot collide with an upstream pack.
+
+`device="auto"` prefers an available CUDA ONNX execution provider, then CPU. Explicit `cpu`,
+`cuda`, or `tensorrt` placement fails when that provider is unavailable. Follow the
+[ONNX Runtime provider installation guidance](https://onnxruntime.ai/docs/get-started/with-python.html)
+so only the intended CPU or GPU distribution supplies the `onnxruntime` module.
+
+The recognizer exposes calibration controls for `detection_size`, minimum detection score, raw
+embedding norm, minimum face pixels, video samples per second, and maximum sampled frames.
+`face_similarity` and `face_margin` on `Memory` control identity matching. The default similarity
+of `0.4` follows the
+[InsightFace cosine-verification baseline](https://github.com/deepinsight/insightface/blob/master/server/docs/user-guide.md),
+but production thresholds must be calibrated on representative cameras, demographics, and
+false-match costs.
+
+InsightFace code is MIT. Its pretrained packs, including automatic downloads, are limited by
+upstream to non-commercial research; use appropriately licensed weights for production.
 
 ## Environment variables
 
@@ -259,6 +299,7 @@ On first open, SQLite records:
 
 - Embedding model identifier and explicit vector-space identifier.
 - Transcription-space identifier.
+- Face-recognition space identifier.
 - Embedding dimension.
 - Zvec index recipe.
 
@@ -270,6 +311,8 @@ of those inputs changes. Re-encode into a new directory instead of editing the s
 rule applies to `transcription_space`: it identifies the ASR model and all
 transcript-affecting preprocessing, language, prompting, or decoding choices. A directory fails fast if the
 active value changes, because cached transcripts and add-time derived text must use one recipe.
+The face space similarly covers the InsightFace model pack, detection/quality filters, and video
+sampling recipe so cached observations cannot mix incompatible settings.
 
 The generation model, URL allowlist, media transport, and HTTP timeout can change without
 invalidating stored embeddings or transcript caches.

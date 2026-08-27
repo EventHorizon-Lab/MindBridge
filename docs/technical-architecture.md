@@ -14,7 +14,9 @@ src/mindbridge/
 ├── types.py                       # content and result values
 ├── api/                           # optional REST and MCP transports
 ├── models/
-│   ├── base.py                    # public embedding and combined-model protocols
+│   ├── base.py                    # public embedding, speech, face, and combined protocols
+│   ├── funasr.py                  # FunASR/VAD/CAM++ speech adapter
+│   ├── insightface.py             # InsightFace/ONNX Runtime face adapter
 │   ├── sentence_transformers.py   # standard multimodal embedding adapter
 │   ├── jina.py                    # pinned Jina Omni compatibility adapter
 │   └── openai_http.py             # OpenAI-compatible combined backend
@@ -37,7 +39,7 @@ Construction resolves the path and acquires `.mindbridge.lock` without waiting. 
 ownership maps to `StorageError`. After locking, MindBridge:
 
 1. Enforces POSIX mode `0700` on the top-level directory and opens or creates `state.sqlite3`.
-2. Migrates the supported text schema to the multimodal schema when required.
+2. Migrates supported schemas through v5, including speaker profiles into unified identities.
 3. Validates required tables and stored embedding/index metadata.
 4. Opens the content-addressed asset store.
 5. Checkpoints all embeddings if the Zvec directory is missing.
@@ -88,9 +90,12 @@ Writes use `BEGIN IMMEDIATE`. The multimodal schema contains:
 | `memory_assets` | Ordered memory-to-asset relationships |
 | `embeddings` | FP32 vector, model, space, task, dimension, normalization, object part |
 | `speech_analyses` | Completed ASR recipe and transcript per media asset |
-| `speech_segments` | Timed transcript turns linked to local speaker identities |
-| `speaker_identities` | Optional name, CAM++ centroid, and observation count per local speaker |
-| `store_metadata` | Embedding, transcription, and index compatibility identity |
+| `speech_segments` | Timed transcript turns linked to unified local identities |
+| `face_analyses` | Completed InsightFace recipe per image/video asset |
+| `face_observations` | Normalized boxes/times linked to unified local identities |
+| `identities` | Opaque identity ID and optional display name |
+| `identity_profiles` | Per-identity face/voice model space, FP32 centroid, observation count |
+| `store_metadata` | Embedding, transcription, face, and index compatibility identity |
 | `search_index_queue` | Ordered `upsert` and `delete` operations awaiting Zvec flush |
 
 Foreign keys cascade record deletion to relationships and embeddings. An asset descriptor/file is
@@ -154,9 +159,16 @@ choice that can change transcript text; changing it requires a new directory and
 The default speech route is FunASR `AutoModel` composed from Fun-ASR-Nano, FSMN-VAD, and CAM++;
 the explicit vLLM route batch-decodes the same VAD spans before the same CAM++ clustering.
 `Memory.speech` stores timed turns and matches normalized CAM++ centroids within one physical
-directory. `SPK0`-style labels are asset-local and are never treated as identities. The first
-observation enrolls an opaque `speaker_id`; later clear cosine matches reuse it.
-`Memory.register_speaker` attaches a display name without exposing the stored voiceprint.
+directory. The lazy InsightFace route uses an upstream model pack for detection/alignment and
+ArcFace encoding; `Memory.faces` samples video, stores normalized boxes, and matches the normalized
+vectors in the same registry. Backend labels are asset-local and are never treated as identities.
+The first observation enrolls an opaque identity ID; later clear cosine matches reuse it.
+
+Face and voice profiles are matched only within their own kind and space. An explicit
+`Memory.merge_identities` transaction combines confirmed duplicate profiles, rewrites speech and
+face observations, preserves a canonical name, and removes the duplicate row. This is the only
+cross-modal association path. `register_identity` attaches a display name without exposing either
+biometric vector; `register_speaker` remains the voice-specific compatibility method.
 
 ## Asset transport to models
 
@@ -223,7 +235,8 @@ Internal failures do not leak adapter exceptions through the public API:
 | Invalid content, metadata, asset source, cursor, time, or limit | `ValidationError` |
 | Missing memory ID in `get` | `MemoryNotFoundError` |
 | Missing or contradictory opaque asset reference | `ValidationError` |
-| Capability routing, embedding, transcription, or generation | `ModelError` |
+| Capability routing, embedding, face/speech analysis, or generation | `ModelError` |
+| Unknown identity during registration or merge | `IdentityNotFoundError` |
 | Directory, schema, lock, CAS, SQLite, or durable metadata | `StorageError` |
 | Zvec open, mutation, flush, rebuild, or query | `IndexUnavailableError` |
 

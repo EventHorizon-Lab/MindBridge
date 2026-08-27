@@ -35,6 +35,9 @@ The default Jina embedder runs through Sentence Transformers on the device selec
 `JinaOmniEmbedder.load(device=...)`. A standard model such as Qwen3-VL uses
 `SentenceTransformersEmbedder`. Fun-ASR-Nano, FSMN-VAD, and CAM++ run locally by default;
 generation can run remotely, on a gateway, or locally through a compatible server such as vLLM.
+The optional `face` extra runs InsightFace through an available ONNX Runtime CPU, CUDA, or
+TensorRT provider. `buffalo_s` is the smallest built-in model-pack choice; keep `buffalo_l` when
+camera quality makes detection accuracy more important than the lower-compute detector.
 
 The built-in `data` transport caps aggregate raw media at 64 MiB per embedding or generation call
 before base64 expansion. For larger video on a device, use `file` transport with a trusted local
@@ -54,16 +57,19 @@ one directory; changing it is a fail-fast compatibility event and requires a new
 ## Capture and network boundaries
 
 MindBridge accepts completed files and bytes; it does not own cameras, microphones, streaming
-capture, face identity, or sensor drivers. It does provide local voice identity with optional names
-for completed audio/video assets; the application still decides when capture is complete.
+capture, liveness/anti-spoofing, or sensor drivers. It provides local face and voice identity with
+optional names for completed media assets; the application still decides when capture is complete
+and when cross-modal evidence is strong enough to merge two identities.
 
 HTTPS media download is disabled until exact public hostnames are configured. Edge applications
 usually prefer `Path` or `Blob` so ingestion does not depend on external storage. If URLs are
 enabled, apply outbound firewall policy in addition to `MINDBRIDGE_ALLOWED_URL_HOSTS`.
 
-Apply disk encryption, device access control, and retention rules according to the sensitivity of
-stored media, transcript text, metadata, and embeddings. Separate applications or benchmark jobs
-use separate data directories; metadata is not isolation.
+Apply disk encryption, device access control, consent, and retention rules according to the
+sensitivity of stored media, transcript text, metadata, and biometric embeddings. Separate
+applications or benchmark jobs use separate data directories; metadata is not isolation.
 
-The current retrieval unit remains one memory and one aggregate embedding. Budget and measure that
-path; do not assume automatic frame sampling, audio segmentation, per-asset vectors, or reranking.
+The current retrieval unit remains one memory and one aggregate embedding. Face recognition samples
+video at its configured rate, but retrieval does not create per-frame vectors. Budget and measure
+that path; do not assume streaming tracking, audio segmentation, per-asset retrieval vectors, or
+reranking.

@@ -13,6 +13,7 @@ from pathlib import Path
 
 import pytest
 
+import mindbridge.infrastructure.local.store as store_module
 from mindbridge.infrastructure.local import (
     DataDirectoryInUseError,
     LocalStore,
@@ -21,7 +22,14 @@ from mindbridge.infrastructure.local import (
     StoredEmbedding,
     StoredMemory,
 )
-from mindbridge.models.base import SpeakerEmbedding, SpeechAnalysis, SpeechTurn
+from mindbridge.models.base import (
+    FaceAnalysis,
+    FaceDetection,
+    FaceEmbedding,
+    SpeakerEmbedding,
+    SpeechAnalysis,
+    SpeechTurn,
+)
 
 
 def _attempt_store_open(data_dir: str, sender: Connection) -> None:
@@ -149,7 +157,7 @@ def test_schema_is_local_and_enforces_foreign_keys(tmp_path: Path) -> None:
                     "SELECT sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY name"
                 )
             )
-            assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+            assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
             assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
             assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
         assert "tenant" not in schema.casefold()
@@ -214,7 +222,7 @@ def test_schema_v1_is_migrated_atomically_with_text_modality(tmp_path: Path) -> 
         assert legacy.modality == "text"
         assert legacy.assets == ()
         with closing(sqlite3.connect(store.database_path)) as connection:
-            assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+            assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
             assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
 
 
@@ -224,9 +232,12 @@ def test_schema_v2_is_migrated_without_losing_memories(tmp_path: Path) -> None:
     with closing(sqlite3.connect(tmp_path / "state.sqlite3")) as connection:
         connection.executescript(
             """
+            DROP TABLE face_observations;
+            DROP TABLE face_analyses;
             DROP TABLE speech_segments;
-            DROP TABLE speaker_identities;
             DROP TABLE speech_analyses;
+            DROP TABLE identity_profiles;
+            DROP TABLE identities;
             PRAGMA user_version = 2;
             """
         )
@@ -234,7 +245,7 @@ def test_schema_v2_is_migrated_without_losing_memories(tmp_path: Path) -> None:
     with LocalStore(tmp_path) as store:
         assert store.read_memory("preserved") is not None
         with closing(sqlite3.connect(store.database_path)) as connection:
-            assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+            assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
             assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
 
 
@@ -245,18 +256,104 @@ def test_schema_v3_adds_optional_speaker_names(tmp_path: Path) -> None:
     with closing(sqlite3.connect(tmp_path / "state.sqlite3")) as connection:
         connection.executescript(
             """
+            DROP TABLE face_observations;
+            DROP TABLE face_analyses;
+            DROP TABLE speech_segments;
+            DROP TABLE speech_analyses;
+            DROP TABLE identity_profiles;
+            DROP TABLE identities;
+            """
+        )
+        connection.executescript(store_module._SPEECH_SCHEMA_V4)
+        connection.executescript(
+            """
             ALTER TABLE speaker_identities DROP COLUMN name;
+            INSERT INTO speaker_identities (
+                speaker_id, model_id, space_id, dimension, centroid,
+                observations, created_at, updated_at
+            ) VALUES (
+                'speaker_legacy', 'cam++', 'cam++:legacy', 2,
+                X'0000803F00000000', 1,
+                '2026-08-27T01:02:03.000000Z', '2026-08-27T01:02:03.000000Z'
+            );
             PRAGMA user_version = 3;
             """
         )
 
     with LocalStore(tmp_path) as store:
         with closing(sqlite3.connect(store.database_path)) as connection:
-            columns = {
-                row[1] for row in connection.execute("PRAGMA table_info(speaker_identities)")
-            }
-            assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
-        assert "name" in columns
+            identity = connection.execute(
+                "SELECT identity_id, name FROM identities WHERE identity_id = 'speaker_legacy'"
+            ).fetchone()
+            profile = connection.execute(
+                """
+                SELECT kind, space_id FROM identity_profiles
+                WHERE identity_id = 'speaker_legacy'
+                """
+            ).fetchone()
+            assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert identity == ("speaker_legacy", None)
+        assert profile == ("voice", "cam++:legacy")
+
+
+def test_schema_v4_preserves_named_speaker_turns_as_identities(tmp_path: Path) -> None:
+    audio = _asset(b"legacy voice", modality="audio", mime_type="audio/wav", name="voice.wav")
+    memory = replace(_memory("legacy"), content="", modality="audio", assets=(audio,))
+    with LocalStore(tmp_path) as store:
+        store.write_memory(memory)
+    with closing(sqlite3.connect(tmp_path / "state.sqlite3")) as connection:
+        connection.executescript(
+            """
+            DROP TABLE face_observations;
+            DROP TABLE face_analyses;
+            DROP TABLE speech_segments;
+            DROP TABLE speech_analyses;
+            DROP TABLE identity_profiles;
+            DROP TABLE identities;
+            """
+        )
+        connection.executescript(store_module._SPEECH_SCHEMA_V4)
+        connection.execute(
+            """
+            INSERT INTO speaker_identities (
+                speaker_id, name, model_id, space_id, dimension, centroid,
+                observations, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, 2, ?, 1, ?, ?)
+            """,
+            (
+                "speaker_legacy",
+                "Ada",
+                "cam++",
+                "cam++:legacy",
+                bytes.fromhex("0000803F00000000"),
+                "2026-08-27T01:02:03.000000Z",
+                "2026-08-27T01:02:03.000000Z",
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO speech_analyses (asset_id, model_id, space_id, transcript, created_at)
+            VALUES (?, 'cam++', 'cam++:legacy', 'hello', '2026-08-27T01:02:03.000000Z')
+            """,
+            (audio.asset_id,),
+        )
+        connection.execute(
+            """
+            INSERT INTO speech_segments (
+                asset_id, position, start_ms, end_ms, transcript, speaker_id, identity_score
+            ) VALUES (?, 0, 0, 1000, 'hello', 'speaker_legacy', 0.9)
+            """,
+            (audio.asset_id,),
+        )
+        connection.execute("PRAGMA user_version = 4")
+        connection.commit()
+
+    with LocalStore(tmp_path) as store:
+        turns = store.read_speech(audio.asset_id, space_id="cam++:legacy")
+        assert turns is not None
+        assert turns[0].identity_id == "speaker_legacy"
+        assert turns[0].identity_name == "Ada"
+        assert turns[0].identity_score == pytest.approx(0.9)
 
 
 def test_memory_embedding_and_outbox_round_trip(tmp_path: Path) -> None:
@@ -441,6 +538,67 @@ def test_speech_identity_is_stable_across_assets(tmp_path: Path) -> None:
         assert renamed is not None and renamed[0].speaker_name == "Alicia"
         assert store.register_speaker("speaker_missing", "Nobody") is False
         assert store.read_asset(second.asset_id) == replace(second, transcript="hello again")
+
+
+def test_face_and_voice_profiles_share_mergeable_identities(tmp_path: Path) -> None:
+    group = _asset(b"group photo")
+    portrait = _asset(b"portrait")
+    voice = _asset(b"voice", modality="audio", mime_type="audio/wav", name="voice.wav")
+    memories = (
+        replace(_memory("group"), content="", modality="image", assets=(group,)),
+        replace(_memory("portrait"), content="", modality="image", assets=(portrait,)),
+        replace(_memory("voice"), content="", modality="audio", assets=(voice,)),
+    )
+
+    with LocalStore(tmp_path) as store:
+        store.write_memories(memories)
+        group_faces = store.write_faces(
+            group.asset_id,
+            FaceAnalysis(
+                detections=(
+                    FaceDetection("alice", (0.1, 0.1, 0.4, 0.8), 0.98),
+                    FaceDetection("bob", (0.6, 0.1, 0.9, 0.8), 0.97),
+                ),
+                faces=(
+                    FaceEmbedding("alice", (1.0, 0.0)),
+                    FaceEmbedding("bob", (0.0, 1.0)),
+                ),
+            ),
+            model_id="insightface/buffalo_l",
+            space_id="insightface:buffalo_l:test",
+        )
+        portrait_faces = store.write_faces(
+            portrait.asset_id,
+            FaceAnalysis(
+                detections=(FaceDetection("alice", (0.2, 0.1, 0.8, 0.9), 0.96),),
+                faces=(FaceEmbedding("alice", (0.99, 0.1)),),
+            ),
+            model_id="insightface/buffalo_l",
+            space_id="insightface:buffalo_l:test",
+        )
+        voice_segments = store.write_speech(
+            voice.asset_id,
+            SpeechAnalysis(
+                turns=(SpeechTurn(0, 1_000, "hello", "0"),),
+                speakers=(SpeakerEmbedding("0", (1.0, 0.0)),),
+            ),
+            model_id="cam++",
+            space_id="cam++:test",
+        )
+
+        alice_id = group_faces[0].identity_id
+        voice_id = voice_segments[0].identity_id
+        assert group_faces[1].identity_id != alice_id
+        assert portrait_faces[0].identity_id == alice_id
+        assert voice_id is not None and voice_id != alice_id
+        assert store.register_identity(alice_id, "Alice") is True
+        assert store.merge_identities(alice_id, voice_id) is True
+
+        cached_voice = store.read_speech(voice.asset_id, space_id="cam++:test")
+        cached_face = store.read_faces(portrait.asset_id, space_id="insightface:buffalo_l:test")
+        assert cached_voice is not None and cached_voice[0].identity_id == alice_id
+        assert cached_voice[0].identity_name == "Alice"
+        assert cached_face is not None and cached_face[0].identity_name == "Alice"
 
 
 def test_memory_hydration_uses_one_wal_snapshot(
