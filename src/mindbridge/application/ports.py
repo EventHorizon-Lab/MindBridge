@@ -94,6 +94,15 @@ class PresignedMediaDownload:
 
 
 @dataclass(frozen=True, slots=True)
+class PresignedMediaUpload:
+    """A short-lived PUT URL for one tenant-owned object that does not exist yet."""
+
+    upload_url: str
+    uri: str
+    expires_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
 class ResolvedQueryMedia:
     """One tenant-owned query object with short-lived model access."""
 
@@ -403,6 +412,19 @@ class MediaUrlSigner(Protocol):
         self,
         media_object: MediaObject,
     ) -> PresignedMediaDownload: ...
+
+
+class MediaUploadSigner(Protocol):
+    """Permission to store one object, granted without lending out storage credentials."""
+
+    async def create_presigned_upload(
+        self,
+        tenant_id: str,
+        *,
+        sha256: str,
+        suffix: str | None,
+        size_bytes: int,
+    ) -> PresignedMediaUpload: ...
 
 
 class DerivedMediaStore(MediaUrlSigner, Protocol):

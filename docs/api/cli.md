@@ -17,7 +17,7 @@ uv run --extra server mindbridge lifecycle --help
 
 | Command | Subcommands |
 | --- | --- |
-| `mindbridge` | `config check`, `consolidate`, `jobs`, `lifecycle`, `mcp`, `jina serve`, `edge sync` |
+| `mindbridge` | `config check`, `consolidate`, `jobs`, `lifecycle`, `mcp`, `observe`, `jina serve`, `edge sync` |
 | `mindbridge-bench` | `locomo-refined`, `m3`, `egolife`, `egomem`, `egotempo`, `memlens`, `mm-lifelong`, `atm`, `mem-gallery`, `supermemory`, `video-mme`, `video-mme-v2`, `aml` |
 | `mindbridge-bench` support | `eval`, `score`, `datasets`, `jina`, `bakeoff` |
 
@@ -320,6 +320,38 @@ then stay empty.
 
 ---
 
+## `mindbridge observe`
+
+Stores one local file as evidence and observes it, in one command. This is the answer to "can it
+take a file I already have" — the three steps are a digest, a presigned upload, and an observation
+naming the object, and neither `curl` nor a hand-written script should be assembling them.
+
+```bash
+export MINDBRIDGE_API_KEY=...
+uv run mindbridge observe ./kitchen.mp4 --tenant-id tenant_01
+```
+
+```json
+{"observation_id": "...", "processing_job_id": "...", "evidence_ids": [], "status": "accepted"}
+```
+
+The receipt goes to stdout as JSON, so the next command can read the IDs out of it rather than
+out of prose. **A `processing_job_id` means the observation is stored and the memory derived from
+it does not exist yet**; `mindbridge jobs` is what reports that job.
+
+`--kind` is read from the extension and only has to be passed for a container this API does not
+recognize. The timestamps default to the file's modification time, which is stable across a repeat
+where a clock read would not be — so observing the same unchanged file twice answers `duplicate`
+rather than storing a second copy. Pass `--occurred-at` and `--ended-at` together for anything
+with a duration: nothing here decodes the media, so left alone the observation covers an instant.
+`--sequence` defaults to a value derived from the digest, which is what keeps two different files
+from colliding onto one observation ID.
+
+It needs no extra. The credential is read from `MINDBRIDGE_API_KEY` and has no flag, so it stays
+out of the process list and out of shell history.
+
+---
+
 ## `mindbridge mcp`
 
 Serves the MCP server over stdio. Requires `--extra server`.
@@ -340,13 +372,17 @@ API. Requires `server` and `cloud-models`.
 ```bash
 export MINDBRIDGE_EMBEDDER_API_KEY=replace-with-at-least-32-random-characters
 uv run --extra server --extra cloud-models mindbridge jina serve --host 0.0.0.0 \
+  --max-concurrency 1 --max-batch-inputs 32 --batch-wait-ms 2 \
+  --media-io-concurrency 8 \
   --media-origin https://media.example.com
 ```
 
 The default port is `8002`; `--device`, `--model-id`, and `--max-concurrency` control the one model
-process. Repeat `--media-origin` for every exact HTTP(S) origin that may serve presigned media;
-remote URLs from any other origin and all redirects are rejected. `/health` is public.
-`/v1/models` and `/v1/embeddings` require the bearer token.
+process. `--max-batch-inputs` and `--batch-wait-ms` control adaptive request batching;
+`--media-io-concurrency` overlaps bounded media downloads and temporary-file writes so the next
+batch is ready before the current GPU encode finishes. Repeat `--media-origin` for every exact
+HTTP(S) origin that may serve presigned media; remote URLs from any other origin and all redirects
+are rejected. `/health` is public. `/v1/models` and `/v1/embeddings` require the bearer token.
 
 ---
 

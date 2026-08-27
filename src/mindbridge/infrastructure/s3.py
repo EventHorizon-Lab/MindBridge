@@ -6,16 +6,24 @@ import asyncio
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from string import hexdigits
 from typing import TYPE_CHECKING
 from urllib.parse import quote, urlsplit
 
-from mindbridge.application.ports import PresignedMediaDownload
+from mindbridge.application.ports import PresignedMediaDownload, PresignedMediaUpload
 from mindbridge.configuration import (
     configuration_source,
     optional_environment_value,
     require_environment_value,
 )
-from mindbridge.core import MediaObject, MemoryIntegrityError, ObjectStorageError, utc_now
+from mindbridge.contracts import MAX_MEDIA_UPLOAD_BYTES
+from mindbridge.core import (
+    MediaObject,
+    MemoryIntegrityError,
+    ObjectStorageError,
+    media_kind_for_suffix,
+    utc_now,
+)
 
 if TYPE_CHECKING:
     from mypy_boto3_s3 import S3Client
@@ -30,6 +38,15 @@ if TYPE_CHECKING:
 # this has to raise the lifetime with it, and _MAX_URL_LIFETIME_SECONDS is the ceiling.
 _DEFAULT_URL_LIFETIME_SECONDS = 2_100
 _MAX_URL_LIFETIME_SECONDS = 3_600
+
+# A signed upload has no such reader: it is answered to the client that is already holding the
+# file and about to send it, so it can be short. S3 checks the expiry when the PUT arrives
+# rather than while its body streams, so this bounds how long the grant can be sat on, not how
+# long an upload may take.
+_UPLOAD_URL_LIFETIME_SECONDS = 900
+_SHA256_HEX_LENGTH = 64
+MEDIA_KEY_PREFIX = "media/"
+"""Where an uploaded original lives inside its tenant prefix, as `edge.capture` also writes it."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -143,16 +160,51 @@ class S3MediaAccess:
     ) -> PresignedMediaDownload:
         """Sign a GET only after validating bucket and tenant ownership."""
         object_key = self._tenant_object_key(media_object)
-        expires_at = self._expires_at()
+        expires_at = self._expires_at(self._url_lifetime_seconds)
         download_url = await self._presign(
             "get_object",
             {"Bucket": self._bucket, "Key": object_key},
             "GET",
+            self._url_lifetime_seconds,
         )
         return PresignedMediaDownload(
             download_url=download_url,
             expires_at=expires_at,
         )
+
+    async def create_presigned_upload(
+        self,
+        tenant_id: str,
+        *,
+        sha256: str,
+        suffix: str | None,
+        size_bytes: int,
+    ) -> PresignedMediaUpload:
+        """Sign a PUT for the one key these bytes belong at, and for no other.
+
+        This is the only way bytes enter the deployment without its storage credentials, so the
+        caller describes them and is told where they go rather than naming a key: the key is
+        derived here by `tenant_media_upload_uri` and then re-read out of the finished URI by
+        `tenant_s3_object_key`, the same check every read path applies, so what gets signed is
+        what that check returns and nothing else. `ContentLength` is signed with it, which is
+        what makes the size bound refusable by object storage rather than advisory -- a PUT of
+        any other length fails the signature.
+        """
+        if not 1 <= size_bytes <= MAX_MEDIA_UPLOAD_BYTES:
+            raise InvalidMediaLocationError(
+                f"upload size must be between 1 and {MAX_MEDIA_UPLOAD_BYTES} bytes"
+            )
+        uri = tenant_media_upload_uri(self._bucket, tenant_id, sha256=sha256, suffix=suffix)
+        object_key = tenant_s3_object_key(self._bucket, tenant_id, uri)
+        lifetime_seconds = min(self._url_lifetime_seconds, _UPLOAD_URL_LIFETIME_SECONDS)
+        expires_at = self._expires_at(lifetime_seconds)
+        upload_url = await self._presign(
+            "put_object",
+            {"Bucket": self._bucket, "Key": object_key, "ContentLength": size_bytes},
+            "PUT",
+            lifetime_seconds,
+        )
+        return PresignedMediaUpload(upload_url=upload_url, uri=uri, expires_at=expires_at)
 
     async def read_media(self, media_object: MediaObject) -> bytes:
         """Fetch immutable bytes so a derived clip can be cut from them."""
@@ -246,6 +298,7 @@ class S3MediaAccess:
         operation: str,
         parameters: dict[str, object],
         http_method: str,
+        lifetime_seconds: int,
     ) -> str:
         from botocore.exceptions import BotoCoreError, ClientError
 
@@ -254,7 +307,7 @@ class S3MediaAccess:
                 self._signing_client.generate_presigned_url,
                 operation,
                 Params=parameters,
-                ExpiresIn=self._url_lifetime_seconds,
+                ExpiresIn=lifetime_seconds,
                 HttpMethod=http_method,
             )
         except (BotoCoreError, ClientError) as error:
@@ -263,11 +316,45 @@ class S3MediaAccess:
     def _tenant_object_key(self, media_object: MediaObject) -> str:
         return tenant_s3_object_key(self._bucket, media_object.tenant_id, media_object.uri)
 
-    def _expires_at(self) -> datetime:
+    def _expires_at(self, lifetime_seconds: int) -> datetime:
         now = self._clock()
         if now.utcoffset() is None:
             raise ValueError("clock must return a timezone-aware datetime")
-        return now + timedelta(seconds=self._url_lifetime_seconds)
+        return now + timedelta(seconds=lifetime_seconds)
+
+
+def tenant_media_upload_uri(
+    bucket: str,
+    tenant_id: str,
+    *,
+    sha256: str,
+    suffix: str | None,
+) -> str:
+    """Name the one object these bytes belong at, inside this tenant's own prefix.
+
+    The key is `tenants/<tenant_id>/media/<sha256><suffix>`, which is exactly what
+    `edge.capture` writes, so the same file arriving from a device and from an SDK client is
+    one object rather than two. Content addressing is not cosmetic here: a retried upload
+    overwrites the same object instead of leaving an orphan per attempt, the reason
+    `upload_media` gives for the same rule.
+
+    Everything a caller contributes is bounded before it reaches the key. The digest is
+    checked to be 64 hex characters, the extension is accepted only from the closed set the
+    domain recognizes, and the tenant is percent-encoded -- so a `..`, an absolute key, or an
+    encoded separator cannot appear in a key this returns. An unrecognized container is
+    rejected rather than passed through: its suffix would be arbitrary caller text, and an
+    object key needs no extension at all to be read back.
+    """
+    if len(sha256) != _SHA256_HEX_LENGTH or not all(char in hexdigits for char in sha256):
+        raise InvalidMediaLocationError("upload key must be addressed by a sha-256 digest")
+    if suffix is not None and media_kind_for_suffix(suffix) is None:
+        raise InvalidMediaLocationError("upload suffix must be a recognized media extension")
+    tenant_prefix = f"tenants/{quote(tenant_id, safe='')}/"
+    # Both halves are lowered for one reason: the key is an identity, and the same bytes named
+    # `.MP4` by one client and `.mp4` by another have to be one object rather than two.
+    return (
+        f"s3://{bucket}/{tenant_prefix}{MEDIA_KEY_PREFIX}{sha256.lower()}{(suffix or '').lower()}"
+    )
 
 
 def tenant_s3_object_key(bucket: str, tenant_id: str, uri: str) -> str:

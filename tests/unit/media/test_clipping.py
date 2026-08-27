@@ -12,6 +12,7 @@ from mindbridge.media.clipping import (
     MINIMUM_CLIP_MS,
     ClipRequest,
     _sample_video_frames,
+    _stream_rate,
     audio_windows,
     cut_clips,
     cut_generation_proxy,
@@ -232,25 +233,13 @@ def test_generation_proxy_applies_the_requested_frame_rate_and_pixel_budget() ->
     assert stream.codec_context.width * stream.codec_context.height <= 10_000
 
 
-def test_generation_proxy_refuses_a_span_past_its_frame_ceiling() -> None:
-    """Past roughly forty sampled frames the encode fails on the flush that drains the encoder.
-    It has to raise rather than hand back a file whose audio or video is silently truncated,
-    because the caller's fallback is the source itself.
-
-    The cause is not the audio interleave this test used to name -- see
-    `test_dropping_audio_does_not_lift_the_frame_ceiling`, which fails the same way with no
-    audio anywhere."""
-    source = _audiovisual_bytes(seconds=60.0, fps=10, width=160, height=120)
-
-    with pytest.raises(Exception, match=r"Invalid argument|monotonic"):
-        cut_generation_proxy(
-            source,
-            ClipRequest(kind=MediaKind.VIDEO, start_ms=0, end_ms=60_000, frames_per_second=1.0),
-        )
-
-
 def test_generation_proxy_covers_the_span_length_observations_actually_use() -> None:
-    """Every ingest path in the repo segments video well inside the ceiling above."""
+    """The span length every ingest path in the repo actually produces, at the default rate.
+
+    Kept as its own case now that `test_stored_clip_has_no_frame_ceiling` covers the long
+    spans: this is the shape `SEGMENT_SECONDS` yields, and it is the one every ingest path
+    depends on whatever else moves around it.
+    """
     import av
 
     source = _audiovisual_bytes(seconds=30.0, fps=10, width=160, height=120)
@@ -335,43 +324,104 @@ def test_generation_proxy_drops_audio_when_the_generator_cannot_hear() -> None:
     assert len(deaf.content) < len(heard.content)
 
 
-def test_dropping_audio_does_not_lift_the_frame_ceiling() -> None:
-    """The ceiling was documented as the MP4 muxer refusing to interleave a sparse video track
-    with continuous audio, which would make audio the thing to give up to cut a longer span.
-    It is not: a silent source cut with `include_audio=False` -- no audio anywhere in the
-    pipeline -- fails at the same frame count an audiovisual one does.
+def test_stored_clip_has_no_frame_ceiling() -> None:
+    """A span of 43 or more sampled frames used to fail, and the frame count was the only thing
+    that decided it: 42 frames encoded, 43 raised `[Errno 22] Invalid argument` out of the flush
+    that drains the encoder, whatever the span length, the offset or the frame rate that
+    produced them.
 
-    Pinned as a test because the wrong explanation is the kind that gets acted on: it invites a
-    deployment to disable proxy audio expecting longer spans to start working, and they do not.
+    It was read as a limit of the encoder or the MP4 muxer. It was neither. `stream.time_base`
+    is a proposal libavformat overwrites with the container's timescale when it writes the
+    header, the header goes out on the first `mux`, and libx264 holds `rc_lookahead` frames --
+    40 by default -- before it emits a first packet. A loop that re-read that attribute per
+    frame therefore stamped the first ~40 frames in milliseconds and the rest in 1/16000ths,
+    handed x264 timestamps that no longer rose, and got back a packet whose pts sat behind its
+    dts. Stamping from the constant instead removes the bound rather than documenting it.
+
+    `cut_clips` is where this mattered most. The generation-proxy path at least had a guard
+    -- a frame budget that skipped the span, since removed with the defect -- while the
+    stored-clip path every observation and every benchmark producer goes through had none, and
+    only stayed clear of the failure because `SEGMENT_SECONDS` is 30.
     """
-    silent_source = _video_bytes(seconds=60.0, fps=10, width=160, height=120)
+    import av
 
-    with pytest.raises(Exception, match=r"Invalid argument|monotonic") as failure:
-        cut_generation_proxy(
-            silent_source,
-            ClipRequest(
-                kind=MediaKind.VIDEO,
-                start_ms=0,
-                end_ms=60_000,
-                frames_per_second=1.0,
-                include_audio=False,
-            ),
+    source = _audiovisual_bytes(seconds=60.0, fps=10, width=160, height=120)
+
+    for start_ms, end_ms, frames_per_second in (
+        # One frame either side of where it used to break, then far enough past it that a
+        # ceiling merely moved rather than removed would still be caught.
+        (0, 42_000, 1.0),
+        (0, 43_000, 1.0),
+        (10_000, 53_000, 1.0),
+        (0, 60_000, 0.75),
+        (0, 60_000, 1.0),
+        (0, 60_000, 4.0),
+    ):
+        request = ClipRequest(
+            kind=MediaKind.VIDEO,
+            start_ms=start_ms,
+            end_ms=end_ms,
+            frames_per_second=frames_per_second,
         )
+        sampled = _sample_video_frames(source, request)
+        # The sampler snaps to real source frames, so the expected timeline is the one those
+        # frames carry, rebased to zero -- not the nominal 1/frames_per_second grid.
+        first = sampled[0].time or 0.0
+        expected = [(frame.time or 0.0) - first for frame in sampled]
+        assert len(expected) >= 43
 
-    assert type(failure.value).__module__.startswith("av")
-    # The same silent source inside the ceiling cuts fine, so what binds is the frame count --
-    # not the span length, and not the audio track that is absent from both calls.
-    inside = cut_generation_proxy(
-        silent_source,
-        ClipRequest(
+        clips = cut_clips(source, request)
+
+        with av.open(io.BytesIO(clips[0].content), mode="r") as container:
+            decoded = list(container.decode(container.streams.video[0]))
+        # Not just "it did not raise". Half the frames landing on a 16x wrong timeline is the
+        # same defect one step short of the muxer noticing it, so every frame has to come back
+        # on the offset it went in on, in order. The tolerance is the clip's own tick: H.264
+        # takes an integral rate, so a 0.75 fps clip cannot express 1.4 s any finer than 1 s --
+        # a separate limit, and one 16x too small a timestamp clears by a wide margin.
+        tick_seconds = 1.0 / _stream_rate(frames_per_second)
+        assert len(decoded) == len(expected)
+        assert [frame.time for frame in decoded] == sorted(frame.time for frame in decoded), (
+            "frames came back out of order"
+        )
+        for rendered, offset_seconds in zip(decoded, expected, strict=True):
+            assert rendered.time == pytest.approx(offset_seconds, abs=tick_seconds)
+
+
+def test_generation_proxy_has_no_frame_ceiling_with_or_without_audio() -> None:
+    """The same defect, on the path that carried the guard.
+
+    Both cases are kept because the ceiling was once documented as the MP4 muxer refusing to
+    interleave a sparse video track with continuous audio, and a deployment acting on that
+    would turn `proxy_audio` off to buy longer spans. Audio was never the cause: a silent
+    source cut with `include_audio=False` failed at the same frame count, and now neither
+    fails. The proxy keeps the source's absolute clock, so its frames start at the span.
+    """
+    import av
+
+    audiovisual = _audiovisual_bytes(seconds=60.0, fps=10, width=160, height=120)
+    silent = _video_bytes(seconds=60.0, fps=10, width=160, height=120)
+
+    for source, include_audio in ((audiovisual, True), (silent, False)):
+        request = ClipRequest(
             kind=MediaKind.VIDEO,
             start_ms=0,
-            end_ms=30_000,
+            end_ms=60_000,
             frames_per_second=1.0,
-            include_audio=False,
-        ),
-    )
-    assert inside.content
+            include_audio=include_audio,
+        )
+        sampled = _sample_video_frames(source, request)
+        expected = [frame.time or 0.0 for frame in sampled]
+        assert len(expected) > 42
+
+        proxy = cut_generation_proxy(source, request)
+
+        with av.open(io.BytesIO(proxy.content), mode="r") as container:
+            assert bool(container.streams.audio) is include_audio
+            decoded = list(container.decode(container.streams.video[0]))
+        assert len(decoded) == len(expected)
+        for rendered, offset_seconds in zip(decoded, expected, strict=True):
+            assert rendered.time == pytest.approx(offset_seconds, abs=1.0 / _stream_rate(1.0))
 
 
 def test_cut_rejects_empty_source_and_backwards_spans() -> None:
@@ -404,6 +454,11 @@ def _video_bytes(*, seconds: float, fps: int, width: int, height: int) -> bytes:
     with av.open(buffer, mode="w", format="mp4") as container:
         stream = container.add_stream("libx264", rate=fps)
         stream.width, stream.height, stream.pix_fmt = width, height, "yuv420p"
+        # Single-threaded for the same reason the encoders in src/mindbridge/media/clipping.py
+        # are: libx264 carries AV_CODEC_CAP_OTHER_THREADS, so libavcodec hands the pool to
+        # x264 itself and an unpinned encoder here starts 4 native threads at 160x120 and 14
+        # at 640x480 (measured, PyAV 16.1.0). Test fixtures have no reason to spend them.
+        stream.thread_count, stream.thread_type = 1, "NONE"
         for index in range(int(seconds * fps)):
             array = numpy.full((height, width, 3), index % 256, dtype="uint8")
             frame = av.VideoFrame.from_ndarray(array, format="rgb24")
@@ -421,6 +476,11 @@ def _audiovisual_bytes(*, seconds: float, fps: int, width: int, height: int) -> 
     with av.open(buffer, mode="w", format="mp4") as container:
         video = container.add_stream("libx264", rate=fps)
         video.width, video.height, video.pix_fmt = width, height, "yuv420p"
+        # Single-threaded for the same reason the encoders in src/mindbridge/media/clipping.py
+        # are: libx264 carries AV_CODEC_CAP_OTHER_THREADS, so libavcodec hands the pool to
+        # x264 itself and an unpinned encoder here starts 4 native threads at 160x120 and 14
+        # at 640x480 (measured, PyAV 16.1.0). Test fixtures have no reason to spend them.
+        video.thread_count, video.thread_type = 1, "NONE"
         audio = container.add_stream("aac", rate=SAMPLE_RATE)
         audio.layout = "mono"
         for index in range(int(seconds * fps)):
@@ -464,6 +524,11 @@ def _late_video_audiovisual_bytes(
     with av.open(buffer, mode="w", format="mp4") as container:
         video = container.add_stream("libx264", rate=fps)
         video.width, video.height, video.pix_fmt = width, height, "yuv420p"
+        # Single-threaded for the same reason the encoders in src/mindbridge/media/clipping.py
+        # are: libx264 carries AV_CODEC_CAP_OTHER_THREADS, so libavcodec hands the pool to
+        # x264 itself and an unpinned encoder here starts 4 native threads at 160x120 and 14
+        # at 640x480 (measured, PyAV 16.1.0). Test fixtures have no reason to spend them.
+        video.thread_count, video.thread_type = 1, "NONE"
         video.time_base = Fraction(1, 1_000)
         audio = container.add_stream("aac", rate=SAMPLE_RATE)
         audio.layout = "mono"
@@ -648,3 +713,66 @@ def test_a_one_frame_video_clip_is_repeated_rather_than_left_unembeddable() -> N
             decoded = list(container.decode(container.streams.video[0]))
         assert len(decoded) >= 2
         assert decoded[0].time != decoded[1].time
+
+
+def test_stream_rate_never_declares_a_rate_below_its_sampling() -> None:
+    """The encoder time base is 1/rate, so a rate under the sampling rate is a tick too coarse
+    to hold two sampled frames apart -- see `_stream_rate` for what that costs.
+
+    Pinned across the halves specifically: Python rounds them to even, so `round` sent 2.5 down
+    and 3.5 up, and nothing at the call site hints that those two behave differently.
+    """
+    for frames_per_second in (0.25, 0.75, 1.0, 1.5, 2.4, 2.5, 3.5, 4.5, 7.5, 19.0):
+        assert _stream_rate(frames_per_second) >= frames_per_second
+
+    # Still integral, and still at least one however slow the sampling is.
+    assert _stream_rate(0.25) == 1
+    assert isinstance(_stream_rate(2.5), int)
+
+
+def test_fractional_frame_rates_that_round_down_still_cut() -> None:
+    """A sampling rate the stream rate rounded *down* from failed every cut it was used for.
+
+    Not a long-span failure: the tick is 1/rate, so the frames collide as soon as the span
+    crosses one tick boundary, and 2.5 fps -- a 400 ms sampling declared as a 500 ms tick --
+    put frames 2 and 3 on the same timestamp and lost the clip at 21 frames. It was reachable
+    straight from configuration, which caps `frames_per_second` at 20 and accepts every
+    fractional value under it, so this was a whole deployment cutting no video at all.
+
+    Every span here stays well under the ~43 sampled frames where a separate defect in the
+    encode loop's own timeline used to take over, so what fails when this regresses is the
+    rate and nothing else.
+
+    Swept rather than sampled at the three rates the report happened to name. Raising the rate
+    to `ceil` leaves 2.7 through 3.9 broken on this very source, so a tuple of `(2.4, 2.5,
+    4.5)` passes against an encoder that still collapses a third of its inputs -- the whole
+    decimal range is the invariant, and it costs 0.3 s to say so.
+    """
+    import av
+
+    source = _video_bytes(seconds=60.0, fps=10, width=160, height=120)
+
+    # 2.0 to 5.0 keeps every span under the 43-frame ceiling on an 8 s window while covering
+    # both sides of each integer, which is where a rate-derived tick goes wrong.
+    for tenths in range(20, 51):
+        frames_per_second = tenths / 10
+        request = ClipRequest(
+            kind=MediaKind.VIDEO,
+            start_ms=0,
+            end_ms=8_000,
+            frames_per_second=frames_per_second,
+        )
+        sampled = _sample_video_frames(source, request)
+        assert 2 <= len(sampled) < 43
+
+        clips = cut_clips(source, request)
+
+        with av.open(io.BytesIO(clips[0].content), mode="r") as container:
+            decoded = list(container.decode(container.streams.video[0]))
+        assert len(decoded) == len(sampled)
+        times = [frame.time for frame in decoded]
+        # Distinctness is the defect itself. A rate below the sampling does not drop a frame,
+        # it hands two of them one timestamp -- so "it did not raise" is not enough to say the
+        # tick is fine, and neither is the count on its own.
+        assert len(set(times)) == len(times), f"{frames_per_second} fps collapsed two frames"
+        assert times == sorted(times)

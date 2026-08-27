@@ -22,11 +22,7 @@ from celery.signals import (
 from pydantic import Field, StrictBool
 
 from mindbridge.application.capabilities import Embedder, Generator
-from mindbridge.application.evidence_clips import (
-    MAX_PROXY_SAMPLED_FRAMES,
-    MAX_SAMPLING_FLOOR_MS,
-    ClipSampling,
-)
+from mindbridge.application.evidence_clips import ClipSampling
 from mindbridge.application.pipelines import PerceptionPipeline
 from mindbridge.application.process_observation import (
     ProcessObservation,
@@ -145,15 +141,22 @@ memory, per loaded copy, before any activation memory. The 2026-08-21 evaluation
 4.3-4.8 GB each and reached 30.2 of the card's 32.6 GB with the GPU at 1-5% utilisation.
 """
 
-_MAX_SAMPLING_FRAMES_PER_SECOND = MAX_PROXY_SAMPLED_FRAMES / (MAX_SAMPLING_FLOOR_MS / 1_000)
-"""The rate past which the sampling knob silently switches off the feature it is tuning.
+_MAX_SAMPLING_FRAMES_PER_SECOND = 20.0
+"""A sanity bound on the sampling rate, enforced where the value enters the process.
 
-`MAX_SAMPLING_FLOOR_MS` is the longest window a span is widened to before sampling, and
-`MAX_PROXY_SAMPLED_FRAMES` is the most frames a generation proxy may carry, so above their
-quotient every span at least that long -- which is every perceived event, 2 to 5 seconds of
-them -- exceeds the ceiling and has its proxy skipped. Bounding the rate here rather than
-downstream is the difference between a refusal naming the variable and a decode that silently
-does nothing.
+It is not derived from anything. It used to be `MAX_PROXY_SAMPLED_FRAMES` over
+`MAX_SAMPLING_FLOOR_MS`, and stood between a deployment and a rate that would silently skip
+every generation proxy; that budget is gone, and the number is kept only because it is what
+deployments already run under.
+
+It still has a job that is not arbitrary, though not the one recorded here before. The bound
+was documented as what rejects `Infinity` and `NaN`; measured, it is not. `plugin_configuration`
+parses this variable with `parse_constant=_reject_json_constant`, so both literals are refused
+before pydantic sees them, bound or no bound. What only the bound catches is a finite literal
+that overflows: `1e400` is valid JSON, becomes `inf` in Python, passes `gt=0`, and without an
+upper bound reaches `ClipSampling.frames_per_second` as `inf`. Absurd finite rates go the same
+way -- `1e9` was accepted -- and `_stream_rate` would hand that to libx264 as an integral H.264
+frame rate. Raise it if a deployment has a real reason; do not remove it.
 """
 
 _SUPPORTED_WORKER_POOLS = ("prefork", "solo")
@@ -354,12 +357,12 @@ class _MediaSamplingConfig(PluginConfigModel):
     silently mean something else.
     """
 
-    # The upper bound is also what rejects `Infinity`, which `json.loads` accepts and `gt=0`
-    # admitted: the value used to reach the media layer as a frame rate and be caught there by a
-    # downstream invariant instead of at the boundary it entered through. `allow_inf_nan=False`
-    # is not carried beside it because it is inert -- measured on this field, the bound rejects
-    # both `Infinity` and `NaN` with the identical message either way. Removing the bound is what
-    # would let them back in, which is what the parametrized refusals pin.
+    # The upper bound is load-bearing beyond the rate itself: `1e400` is valid JSON, overflows
+    # to `inf`, and `gt=0` admits it, so without `le=` an infinite frame rate reaches the media
+    # layer and is caught -- if at all -- by a downstream invariant rather than at the boundary
+    # it entered through. It is *not* what rejects the `Infinity` and `NaN` literals, which this
+    # comment used to claim: `plugin_configuration` refuses those at the parser. `1e400` is the
+    # case that pins this bound, and it is in the parametrized refusals for that reason.
     frames_per_second: Annotated[
         PluginNumber,
         Field(gt=0, le=_MAX_SAMPLING_FRAMES_PER_SECOND),
