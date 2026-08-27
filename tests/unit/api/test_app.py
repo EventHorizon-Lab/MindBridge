@@ -1,724 +1,484 @@
-"""Tests for the thin FastAPI protocol adapter."""
+"""Focused contract checks for the local FastAPI adapter."""
 
-import asyncio
+import base64
+import inspect
 import json
-from collections.abc import AsyncIterator
-from datetime import datetime, timedelta, timezone
-from typing import cast
+from collections.abc import Mapping, Sequence
+from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
+from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 
-from mindbridge.api.app import build_app
-from mindbridge.api.auth import TenantApiKeyAuthenticator
-from mindbridge.api.events import _job_events
-from mindbridge.application.kernel import MemoryKernel
-from mindbridge.contracts import (
-    DeletionListRequest,
-    DeletionPage,
-    DeletionTombstoneView,
-    FeedbackReceipt,
-    FeedbackRequest,
-    ForgetReceipt,
-    ForgetRequest,
-    MemoryResult,
-    MemoryWriteStatus,
-    ObservationProcessingJobView,
-    ObservationReceipt,
-    ObservationStatus,
-    ObserveRequest,
-    RecallRequest,
-    RecallResult,
-    RememberRequest,
-    RememberResult,
-)
-from mindbridge.core import (
-    DatabaseUnavailableError,
-    DeletionPropagationState,
-    DomainInvariantError,
-    EnumerationLimitExceededError,
-    FeedbackType,
-    ForgetTargetNotFoundError,
-    ForgetTargetType,
-    JobNotFoundError,
-    JobState,
-    MemoryIntegrityError,
+from mindbridge.api.app import create_app
+from mindbridge.exceptions import (
+    IndexUnavailableError,
     MemoryNotFoundError,
-    MemoryState,
-    MemoryType,
-    ModelOutputError,
-    ModelRequestError,
-    ModelUnavailableError,
-    ObjectStorageError,
-    TaskBrokerError,
-    VerificationStatus,
+    ModelError,
+    StorageError,
+    ValidationError,
+)
+from mindbridge.types import (
+    URL,
+    AnswerResult,
+    AssetRef,
+    Blob,
+    ContentInput,
+    MemoryRecord,
+    Modality,
+    Page,
+    SearchHit,
 )
 
-NOW = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
-TENANT_API_KEY = "tenant-01-test-key-00000000000000"
-OTHER_TENANT_API_KEY = "other-tenant-test-key-00000000000"
+NOW = datetime(2026, 8, 27, 12, 0, tzinfo=timezone.utc)
+API_KEY = "one-private-api-key"
+ASSET = AssetRef(
+    id="asset_image",
+    modality=Modality.IMAGE,
+    media_type="image/png",
+    size_bytes=3,
+    sha256="a" * 64,
+    name="frame.png",
+    path=Path("/private/mindbridge/assets/frame.png"),
+)
 
 
-class StubKernel:
-    """Protocol stub keeping adapter tests independent from persistence."""
+class FakeMemory:
+    def __init__(self, failure: Exception | None = None) -> None:
+        self.calls: list[tuple[object, ...]] = []
+        self.close_count = 0
+        self.failure = failure
 
-    def __init__(self) -> None:
-        self.batch_sizes: list[int] = []
-
-    async def observe(self, request: ObserveRequest) -> ObservationReceipt:
-        return ObservationReceipt(
-            observation_id="observation_01",
-            processing_job_id="job_process_observation_01",
-            idempotency_key=request.idempotency_key or "derived-key",
-            status=ObservationStatus.ACCEPTED,
-            trace_id="trace_observe",
-        )
-
-    async def remember(
+    def add(
         self,
-        request: RememberRequest | tuple[RememberRequest, ...],
-    ) -> RememberResult | tuple[RememberResult, ...]:
-        if isinstance(request, tuple):
-            self.batch_sizes.append(len(request))
-            results = [cast(RememberResult, await self.remember(item)) for item in request]
-            return tuple(results)
-        if request.summary == "invalid":
-            raise DomainInvariantError("invalid memory")
-        return RememberResult(
-            status=MemoryWriteStatus.CREATED,
-            memory_id="memory_01",
-            memory_type=request.memory_type,
-            summary=request.summary,
-            evidence_ids=(),
-            occurred_at=request.occurred_at,
-            ended_at=request.ended_at or request.occurred_at,
-            created_at=NOW,
-            verification_status=VerificationStatus.UNVERIFIED,
-            state=MemoryState.ACTIVE,
-            trace_id="trace_remember",
-        )
-
-    async def record_feedback(self, request: FeedbackRequest) -> FeedbackReceipt:
-        return FeedbackReceipt(
-            feedback_id="feedback_01",
-            feedback_type=request.feedback_type,
-            memory_id=request.memory_id,
-            corrected_memory_id=None,
-            resulting_state=(MemoryState.STRENGTHENED if request.memory_id is not None else None),
-            resulting_strength=1.5 if request.memory_id is not None else None,
-            created_at=NOW,
-            trace_id="trace_feedback",
-        )
-
-    async def forget(self, request: ForgetRequest) -> ForgetReceipt:
-        return ForgetReceipt(
-            tombstone_id="tombstone_01",
-            target_type=request.target_type,
-            target_id=request.target_id,
-            propagation_state=DeletionPropagationState.COMPLETE,
-            requested_at=NOW,
-            completed_at=NOW,
-            error_code=None,
-            trace_id="trace_forget",
-        )
-
-    async def get_forget_status(self, tenant_id: str, tombstone_id: str) -> ForgetReceipt:
-        if tenant_id != "tenant_01":
-            raise ForgetTargetNotFoundError("missing")
-        return ForgetReceipt(
-            tombstone_id=tombstone_id,
-            target_type=ForgetTargetType.MEMORY_RECORD,
-            target_id="memory_01",
-            propagation_state=DeletionPropagationState.COMPLETE,
-            requested_at=NOW,
-            completed_at=NOW,
-            error_code=None,
-            trace_id="trace_forget_status",
-        )
-
-    async def list_deletions(self, request: DeletionListRequest) -> DeletionPage:
-        return DeletionPage(
-            items=(
-                DeletionTombstoneView(
-                    tombstone_id="tombstone_01",
-                    target_type=ForgetTargetType.MEMORY_RECORD,
-                    target_id="memory_01",
-                    propagation_state=DeletionPropagationState.COMPLETE,
-                    requested_at=NOW,
-                    completed_at=NOW,
-                    error_code=None,
-                ),
-            ),
-            next_cursor=None,
-            trace_id="trace_deletion_page",
-        )
-
-    async def recall(self, request: RecallRequest) -> RecallResult:
-        return RecallResult(
-            answer=None,
-            confidence=0.0,
-            memories=(),
-            evidence=(),
-            trace_id="trace_recall",
-        )
-
-    async def get_observation_job(
-        self,
-        tenant_id: str,
-        job_id: str,
-    ) -> ObservationProcessingJobView:
-        if job_id != "job_01":
-            raise JobNotFoundError("missing")
-        return ObservationProcessingJobView(
-            job_id=job_id,
-            observation_id="observation_01",
-            state=JobState.SUCCEEDED,
-            attempt=1,
-            error_code=None,
-            memory_ids=("memory_01",),
-            created_at=NOW,
-            updated_at=NOW,
-            trace_id="trace_job",
-        )
-
-    async def watch_observation_job(
-        self,
-        tenant_id: str,
-        job_id: str,
+        content: ContentInput,
         *,
-        after_updated_at: datetime | None = None,
-    ) -> AsyncIterator[ObservationProcessingJobView]:
-        for state, moment in (
-            (JobState.RUNNING, NOW),
-            (JobState.SUCCEEDED, NOW + timedelta(seconds=1)),
-        ):
-            if after_updated_at is not None and moment <= after_updated_at:
-                continue
-            yield ObservationProcessingJobView(
-                job_id=job_id,
-                observation_id="observation_01",
-                state=state,
-                attempt=1,
-                error_code=None,
-                memory_ids=("memory_01",) if state is JobState.SUCCEEDED else (),
-                created_at=NOW,
-                updated_at=moment,
-                trace_id="trace_job_stream",
-            )
-
-    async def get_memory(self, tenant_id: str, memory_id: str) -> MemoryResult:
-        if memory_id != "memory_01":
-            raise MemoryNotFoundError("missing")
-        return MemoryResult(
-            memory_id=memory_id,
-            memory_type=MemoryType.EPISODIC,
-            summary="remembered event",
-            evidence_ids=(),
-            occurred_at=NOW,
-            ended_at=NOW,
-            created_at=NOW,
-            verification_status=VerificationStatus.ATTESTED,
-            state=MemoryState.ACTIVE,
-            trace_id="trace_get_memory",
+        occurred_at: datetime | None = None,
+        metadata: Mapping[str, object] | None = None,
+    ) -> MemoryRecord:
+        self._fail()
+        copied_metadata = dict(metadata or {})
+        self.calls.append(("add", content, occurred_at, copied_metadata))
+        return _record(
+            "memory_1",
+            content if isinstance(content, str) else "Multimodal memory.",
+            occurred_at=occurred_at,
+            metadata=copied_metadata,
+            assets=() if isinstance(content, str) else (ASSET,),
+            modality=Modality.TEXT if isinstance(content, str) else Modality.IMAGE,
         )
 
+    def add_many(self, contents: Sequence[ContentInput]) -> tuple[MemoryRecord, ...]:
+        self._fail()
+        copied = tuple(contents)
+        self.calls.append(("add_many", copied))
+        return tuple(
+            _record(
+                f"batch_{index}",
+                content if isinstance(content, str) else "Multimodal memory.",
+            )
+            for index, content in enumerate(copied)
+        )
 
-def test_recall_route_uses_shared_contract() -> None:
-    """REST request and response shapes are the same Pydantic contracts."""
-    client = _client()
+    def search(self, query: ContentInput, *, limit: int = 10) -> tuple[SearchHit, ...]:
+        self._fail()
+        self.calls.append(("search", query, limit))
+        return (_hit(),)
 
-    response = client.post(
-        "/v1/recall",
-        json={"tenant_id": "tenant_01", "query": {"media_object_ids": ["media_01"]}},
-    )
+    def ask(self, question: ContentInput, *, limit: int = 10) -> AnswerResult:
+        self._fail()
+        self.calls.append(("ask", question, limit))
+        return AnswerResult(answer="The toolbox is blue.", hits=(_hit(),))
 
-    assert response.status_code == 200
-    assert response.json()["trace_id"] == "trace_recall"
+    def get(self, memory_id: str) -> MemoryRecord:
+        self._fail()
+        self.calls.append(("get", memory_id))
+        return _record(memory_id, "The toolbox is blue.")
 
+    def list(self, *, limit: int = 50, cursor: str | None = None) -> Page:
+        self._fail()
+        self.calls.append(("list", limit, cursor))
+        return Page(items=(_record("memory_1", "The toolbox is blue."),), next_cursor="next")
 
-def test_feedback_route_uses_shared_contract() -> None:
-    response = _client().post(
-        "/v1/feedback",
-        json={
-            "tenant_id": "tenant_01",
-            "feedback_type": FeedbackType.USEFUL,
-            "memory_id": "memory_01",
-        },
-    )
+    def delete(self, memory_id: str) -> bool:
+        self._fail()
+        self.calls.append(("delete", memory_id))
+        return True
 
-    assert response.status_code == 201
-    assert response.json()["resulting_state"] == "strengthened"
-    assert response.json()["trace_id"] == "trace_feedback"
+    def close(self) -> None:
+        self.close_count += 1
 
-
-def test_forget_routes_share_typed_progress_contract() -> None:
-    client = _client()
-    forgotten = client.post(
-        "/v1/forget",
-        json={
-            "tenant_id": "tenant_01",
-            "target_type": "memory_record",
-            "target_id": "memory_01",
-        },
-    )
-    status_response = client.get(
-        "/v1/deletions/tombstone_01",
-        params={"tenant_id": "tenant_01"},
-    )
-    page = client.get("/v1/deletions", params={"tenant_id": "tenant_01"})
-
-    assert forgotten.status_code == 200
-    assert forgotten.json()["propagation_state"] == "complete"
-    assert status_response.json()["trace_id"] == "trace_forget_status"
-    assert page.json()["items"][0]["tombstone_id"] == "tombstone_01"
+    def _fail(self) -> None:
+        if self.failure is not None:
+            raise self.failure
 
 
-def test_job_route_is_tenant_scoped_and_returns_not_found() -> None:
-    client = _client()
+def test_resource_routes_map_the_public_memory_values() -> None:
+    memory = FakeMemory()
+    app = create_app(memory=memory)
 
-    found = client.get("/v1/jobs/job_01", params={"tenant_id": "tenant_01"})
-    missing = client.get("/v1/jobs/missing", params={"tenant_id": "tenant_01"})
+    with TestClient(app) as client:
+        health = client.get("/healthz")
+        created = client.post(
+            "/v1/memories",
+            json={
+                "content": "  The toolbox is blue.  ",
+                "occurred_at": NOW.isoformat(),
+                "metadata": {"room": "workshop"},
+            },
+        )
+        batch = client.post(
+            "/v1/memories/batch",
+            json={"contents": [" first ", "second"]},
+        )
+        page = client.get("/v1/memories", params={"limit": 2, "cursor": "before"})
+        found = client.get("/v1/memories/memory_1")
+        searched = client.post(
+            "/v1/memories/search",
+            json={"query": " toolbox ", "limit": 3},
+        )
+        answered = client.post(
+            "/v1/answers",
+            json={"question": " What color is it? ", "limit": 4},
+        )
+        deleted = client.delete("/v1/memories/memory_1")
+        openapi = client.get("/openapi.json").json()
 
-    assert found.status_code == 200
-    assert found.json()["state"] == "succeeded"
-    assert missing.status_code == 404
-    assert missing.json()["code"] == "job_not_found"
-
-
-def test_job_event_stream_sends_one_complete_view_per_change() -> None:
-    client = _client()
-
-    response = client.get("/v1/jobs/job_01/events", params={"tenant_id": "tenant_01"})
-
-    assert response.status_code == 200
-    assert response.headers["content-type"].startswith("text/event-stream")
-    assert response.headers["cache-control"] == "no-store"
-    events = _sse_events(response.text)
-    assert [event["event"] for event in events] == ["job", "job"]
-    assert [event["id"] for event in events] == [
-        str(_expected_event_id(NOW)),
-        str(_expected_event_id(NOW + timedelta(seconds=1))),
+    assert health.json() == {"status": "ok"}
+    assert created.status_code == 201
+    assert created.json()["content"] == "The toolbox is blue."
+    assert created.json()["metadata"] == {"room": "workshop"}
+    assert [record["content"] for record in batch.json()["memories"]] == ["first", "second"]
+    assert page.json()["next_cursor"] == "next"
+    assert found.json()["id"] == "memory_1"
+    assert searched.json()["hits"][0]["score"] == 0.9
+    assert answered.json()["answer"] == "The toolbox is blue."
+    assert deleted.status_code == 204
+    assert deleted.content == b""
+    assert memory.calls == [
+        ("add", "The toolbox is blue.", NOW, {"room": "workshop"}),
+        ("add_many", ("first", "second")),
+        ("list", 2, "before"),
+        ("get", "memory_1"),
+        ("search", "toolbox", 3),
+        ("ask", "What color is it?", 4),
+        ("delete", "memory_1"),
     ]
-    assert [json.loads(event["data"])["state"] for event in events] == ["running", "succeeded"]
-    # Each event carries the whole view, which is what makes resuming from one ID correct.
-    assert json.loads(events[-1]["data"])["memory_ids"] == ["memory_01"]
+    assert memory.close_count == 0
+    serialized_schema = json.dumps(openapi)
+    assert all(name not in serialized_schema for name in ("tenant_id", "user_id", "run_id"))
 
 
-def test_job_event_stream_reports_a_failure_the_contract_has_no_word_for() -> None:
-    """A stream that just stops is byte-identical to one that finished.
+def test_ordered_content_parts_map_to_public_inputs_without_exposing_asset_paths() -> None:
+    memory = FakeMemory()
+    image_data = base64.b64encode(b"png").decode()
+    audio_data = base64.b64encode(b"wav").decode()
 
-    `translate_transient_database_errors` re-raises a psycopg error whose sqlstate it does not
-    recognise, and only two exception types were caught, so anything else ended the response
-    body after the 200 -- and `aiter_lines` completing normally is exactly what a settled job
-    looks like. The caller was told the opposite of what happened. `internal_error` is the
-    honest answer: it still names the failure and still carries a `trace_id`.
-    """
-
-    class BrokenStreamKernel(StubKernel):
-        async def watch_observation_job(
-            self,
-            tenant_id: str,
-            job_id: str,
-            *,
-            after_updated_at: datetime | None = None,
-        ) -> AsyncIterator[ObservationProcessingJobView]:
-            raise RuntimeError("connection died mid-stream")
-            yield  # pragma: no cover - unreachable, present to keep this a generator
-
-    response = _client(BrokenStreamKernel()).get(
-        "/v1/jobs/job_01/events", params={"tenant_id": "tenant_01"}
-    )
-
-    assert response.status_code == 200
-    events = _sse_events(response.text)
-    assert [event["event"] for event in events] == ["error"]
-    assert json.loads(events[0]["data"])["code"] == "internal_error"
-    assert json.loads(events[0]["data"])["trace_id"]
-
-
-def test_job_event_stream_names_a_mapped_failure_as_the_routes_do() -> None:
-    """A code the contract does have arrives as that code, not as a generic one."""
-
-    class UnavailableStreamKernel(StubKernel):
-        async def watch_observation_job(
-            self,
-            tenant_id: str,
-            job_id: str,
-            *,
-            after_updated_at: datetime | None = None,
-        ) -> AsyncIterator[ObservationProcessingJobView]:
-            raise DatabaseUnavailableError("storage went away")
-            yield  # pragma: no cover - unreachable, present to keep this a generator
-
-    response = _client(UnavailableStreamKernel()).get(
-        "/v1/jobs/job_01/events", params={"tenant_id": "tenant_01"}
-    )
-
-    events = _sse_events(response.text)
-    assert [event["event"] for event in events] == ["error"]
-    assert json.loads(events[0]["data"])["code"] == "database_unavailable"
-
-
-def test_job_event_stream_resumes_after_the_last_received_event() -> None:
-    client = _client()
-
-    response = client.get(
-        "/v1/jobs/job_01/events",
-        params={"tenant_id": "tenant_01"},
-        headers={"Last-Event-ID": str(_expected_event_id(NOW))},
-    )
-
-    events = _sse_events(response.text)
-    assert [json.loads(event["data"])["state"] for event in events] == ["succeeded"]
-
-
-def test_job_event_stream_ignores_an_unusable_last_event_id() -> None:
-    client = _client()
-
-    response = client.get(
-        "/v1/jobs/job_01/events",
-        params={"tenant_id": "tenant_01"},
-        headers={"Last-Event-ID": "not-a-number"},
-    )
-
-    assert response.status_code == 200
-    assert len(_sse_events(response.text)) == 2
-
-
-def test_job_event_stream_rejects_a_missing_or_foreign_job_before_streaming() -> None:
-    client = _client()
-
-    missing = client.get("/v1/jobs/missing/events", params={"tenant_id": "tenant_01"})
-    foreign = client.get("/v1/jobs/job_01/events", params={"tenant_id": "tenant_02"})
-
-    assert missing.status_code == 404
-    assert missing.json()["code"] == "job_not_found"
-    assert foreign.status_code == 403
-
-
-async def test_job_event_stream_waits_for_pending_read_to_cancel_before_closing() -> None:
-    started = asyncio.Event()
-    closed = asyncio.Event()
-
-    class PendingStreamKernel(StubKernel):
-        async def watch_observation_job(
-            self,
-            tenant_id: str,
-            job_id: str,
-            *,
-            after_updated_at: datetime | None = None,
-        ) -> AsyncIterator[ObservationProcessingJobView]:
-            try:
-                started.set()
-                await asyncio.Future[None]()
-                yield cast(ObservationProcessingJobView, object())  # pragma: no cover
-            finally:
-                closed.set()
-
-    events = _job_events(cast(MemoryKernel, PendingStreamKernel()), "tenant_01", "job_01", None)
-    pending: asyncio.Future[str] = asyncio.ensure_future(events.__anext__())
-    await started.wait()
-
-    pending.cancel()
-
-    with pytest.raises(asyncio.CancelledError):
-        await pending
-    assert closed.is_set()
-
-
-def _sse_events(body: str) -> list[dict[str, str]]:
-    """Parse framed events, dropping keepalive comments."""
-    events: list[dict[str, str]] = []
-    for block in body.split("\n\n"):
-        fields = {
-            name: value.strip()
-            for name, _, value in (line.partition(":") for line in block.splitlines())
-            if name
-        }
-        if "event" in fields:
-            events.append(fields)
-    return events
-
-
-def _expected_event_id(moment: datetime) -> int:
-    """Pin the wire format independently of the implementation."""
-    return (moment - datetime(1970, 1, 1, tzinfo=timezone.utc)) // timedelta(microseconds=1)
-
-
-def test_memory_routes_are_tenant_scoped_and_traced() -> None:
-    client = _client()
-
-    created = client.post(
-        "/v1/memories",
-        json={
-            "tenant_id": "tenant_01",
-            "summary": "remembered event",
-            "memory_type": "episodic",
-            "occurred_at": NOW.isoformat(),
-        },
-    )
-    found = client.get("/v1/memories/memory_01", params={"tenant_id": "tenant_01"})
-    missing = client.get("/v1/memories/missing", params={"tenant_id": "tenant_01"})
+    with TestClient(create_app(memory=memory)) as client:
+        created = client.post(
+            "/v1/memories",
+            json={
+                "content": [
+                    {"type": "input_text", "text": "  At the station.  "},
+                    {
+                        "type": "input_image",
+                        "image_url": "https://media.example/frame.png",
+                    },
+                    {
+                        "type": "input_file",
+                        "file_data": audio_data,
+                        "media_type": "audio/wav",
+                        "filename": "note.wav",
+                    },
+                    {
+                        "type": "input_file",
+                        "file_id": "asset_existing",
+                        "media_type": "video/mp4",
+                    },
+                    {"type": "input_image", "file_id": "asset_existing_image"},
+                ]
+            },
+        )
+        searched = client.post(
+            "/v1/memories/search",
+            json={
+                "query": [
+                    {
+                        "type": "input_image",
+                        "image_url": f"data:image/png;base64,{image_data}",
+                    }
+                ]
+            },
+        )
+        answered = client.post(
+            "/v1/answers",
+            json={
+                "question": [
+                    {
+                        "type": "input_file",
+                        "file_url": "https://media.example/clip.mp4",
+                        "media_type": "video/mp4",
+                        "filename": "clip.mp4",
+                    }
+                ]
+            },
+        )
+        openapi = client.get("/openapi.json").json()
 
     assert created.status_code == 201
-    assert created.json()["trace_id"] == "trace_remember"
-    assert found.status_code == 200
-    assert found.json()["memory_id"] == "memory_01"
-    assert found.json()["evidence"] == []
-    assert found.json()["trace_id"] == "trace_get_memory"
-    assert missing.status_code == 404
-    assert missing.json()["code"] == "memory_not_found"
-
-
-def _memory(summary: str, tenant_id: str = "tenant_01") -> dict[str, str]:
-    return {
-        "tenant_id": tenant_id,
-        "summary": summary,
-        "memory_type": "episodic",
-        "occurred_at": NOW.isoformat(),
-    }
-
-
-def test_batch_remember_reaches_the_kernel_as_one_call() -> None:
-    """The batch has to arrive as a batch, which is the only reason it exists.
-
-    The kernel's batch form costs one encoder round trip instead of N, and every face was
-    single-item: MEMLENS's graded set alone would have needed 24 624 of them.
-    """
-    stub = StubKernel()
-    client = _client(stub)
-
-    response = client.post(
-        "/v1/memories/batch",
-        json={"memories": [_memory("first"), _memory("second"), _memory("third")]},
-    )
-
-    assert response.status_code == 201
-    assert stub.batch_sizes == [3]
-    assert [item["summary"] for item in response.json()["memories"]] == [
-        "first",
-        "second",
-        "third",
+    assert searched.status_code == answered.status_code == 200
+    added = memory.calls[0][1]
+    assert isinstance(added, tuple)
+    assert added[0] == "At the station."
+    assert added[1] == URL("https://media.example/frame.png", "image/*")
+    assert added[2] == Blob(b"wav", "audio/wav", "note.wav")
+    assert added[3] == AssetRef(id="asset_existing", media_type="video/mp4")
+    assert added[4] == AssetRef(id="asset_existing_image", modality=Modality.IMAGE)
+    assert memory.calls[1][1] == (Blob(b"png", "image/png"),)
+    assert memory.calls[2][1] == (URL("https://media.example/clip.mp4", "video/mp4", "clip.mp4"),)
+    body = created.json()
+    assert body["content"] == "Multimodal memory."
+    assert body["modality"] == "image"
+    assert body["assets"] == [
+        {
+            "id": "asset_image",
+            "modality": "image",
+            "media_type": "image/png",
+            "size_bytes": 3,
+            "sha256": "a" * 64,
+            "name": "frame.png",
+        }
     ]
-
-
-def test_batch_remember_is_tenant_scoped_per_memory() -> None:
-    """One authorized memory must not carry an unauthorized one into the store with it."""
-    stub = StubKernel()
-
-    response = _client(stub).post(
-        "/v1/memories/batch",
-        json={"memories": [_memory("mine"), _memory("theirs", tenant_id="third_tenant")]},
-    )
-
-    assert response.status_code == 403
-    assert response.json()["code"] == "tenant_access_denied"
-    assert stub.batch_sizes == []
-
-
-def test_batch_remember_bounds_and_requires_its_batch() -> None:
-    """An empty batch is a caller mistake, and an unbounded one is an unbounded encoder call."""
-    client = _client()
-
-    empty = client.post("/v1/memories/batch", json={"memories": []})
-    too_many = client.post(
-        "/v1/memories/batch",
-        json={"memories": [_memory(f"memory {index}") for index in range(101)]},
-    )
-
-    assert empty.status_code == 422
-    assert too_many.status_code == 422
-    assert empty.json()["code"] == "request_validation_failed"
-
-
-def test_batch_path_is_not_read_as_a_memory_id() -> None:
-    """`/v1/memories/batch` has a parameterised sibling that would happily match `batch`."""
-    response = _client().get("/v1/memories/batch", params={"tenant_id": "tenant_01"})
-
-    # The GET has no batch form, so the parameterised read still owns that method.
-    assert response.status_code == 404
-    assert response.json()["code"] == "memory_not_found"
-
-
-def test_validation_errors_have_trace_and_field_location() -> None:
-    """Malformed requests fail predictably without entering the kernel."""
-    response = _client().post(
-        "/v1/recall",
-        json={"tenant_id": "tenant_01", "query": {}, "unknown": True},
-    )
-
-    body = response.json()
-    assert response.status_code == 422
-    assert body["trace_id"].startswith("trace_")
-    assert {issue["location"][-1] for issue in body["issues"]} == {"query", "unknown"}
-
-
-def test_api_requires_a_valid_bearer_key() -> None:
-    app = build_app(cast(MemoryKernel, StubKernel()), authenticator=_authenticator())
-    client = TestClient(app)
-
-    missing = client.post(
-        "/v1/recall",
-        json={"tenant_id": "tenant_01", "query": {"text": "question"}},
-    )
-    invalid = client.post(
-        "/v1/recall",
-        headers={"Authorization": "Bearer invalid"},
-        json={"tenant_id": "tenant_01", "query": {"text": "question"}},
-    )
-
-    assert missing.status_code == 401
-    assert missing.headers["WWW-Authenticate"] == "Bearer"
-    assert missing.json()["code"] == "authentication_required"
-    assert invalid.status_code == 401
-    assert invalid.json()["code"] == "authentication_failed"
-    assert "Bearer invalid" not in invalid.text
-
-
-def test_api_rejects_cross_tenant_requests() -> None:
-    client = _client()
-    body_response = client.post(
-        "/v1/recall",
-        json={"tenant_id": "other_tenant", "query": {"text": "question"}},
-    )
-    query_response = client.get(
-        "/v1/memories/memory_01",
-        params={"tenant_id": "other_tenant"},
-    )
-
-    assert body_response.status_code == 403
-    assert query_response.status_code == 403
-    assert body_response.json()["code"] == "tenant_access_denied"
-
-
-def test_domain_errors_use_stable_envelope() -> None:
-    """Domain failures remain transport-neutral and machine-readable."""
-    response = _client().post(
-        "/v1/memories",
-        json={
-            "tenant_id": "tenant_01",
-            "summary": "invalid",
-            "memory_type": MemoryType.EPISODIC,
-            "occurred_at": NOW.isoformat(),
-        },
-    )
-
-    assert response.status_code == 422
-    assert response.json()["code"] == "domain_invariant_failed"
-
-
-def test_enumeration_limit_has_an_actionable_stable_error_code() -> None:
-    response = _client(
-        FailingKernel(
-            EnumerationLimitExceededError(
-                "exact enumeration exceeds 1000 candidates; narrow the recall filters"
-            )
-        )
-    ).post(
-        "/v1/recall",
-        json={"tenant_id": "tenant_01", "query": {"text": "count everything"}},
-    )
-
-    assert response.status_code == 422
-    assert response.json()["code"] == "enumeration_limit_exceeded"
-
-
-def test_openapi_exposes_stable_operation_ids() -> None:
-    """Agent tooling can derive deterministic operations from OpenAPI."""
-    paths = _client().get("/openapi.json").json()["paths"]
-
-    assert paths["/v1/observations"]["post"]["operationId"] == "observe"
-    assert paths["/v1/memories"]["post"]["operationId"] == "remember"
-    assert paths["/v1/memories/{memory_id}"]["get"]["operationId"] == "getMemory"
-    assert paths["/v1/feedback"]["post"]["operationId"] == "recordFeedback"
-    assert paths["/v1/forget"]["post"]["operationId"] == "forget"
-    assert paths["/v1/deletions/{tombstone_id}"]["get"]["operationId"] == "getForgetStatus"
-    assert paths["/v1/deletions"]["get"]["operationId"] == "listDeletions"
-    assert paths["/v1/recall"]["post"]["operationId"] == "recall"
-    assert paths["/v1/jobs/{job_id}"]["get"]["operationId"] == "getObservationJob"
-    assert paths["/v1/jobs/{job_id}/events"]["get"]["operationId"] == "streamObservationJob"
-    assert (
-        "text/event-stream"
-        in paths["/v1/jobs/{job_id}/events"]["get"]["responses"]["200"]["content"]
-    )
+    assert "path" not in openapi["components"]["schemas"]["AssetResponse"]["properties"]
 
 
 @pytest.mark.parametrize(
-    ("error", "expected_status", "expected_code"),
+    "content",
     [
-        (DatabaseUnavailableError("database detail"), 503, "database_unavailable"),
-        (ModelUnavailableError("provider detail"), 503, "model_unavailable"),
-        (ModelRequestError("provider detail"), 502, "model_request_failed"),
-        (ModelOutputError("raw output"), 502, "model_output_invalid"),
-        (ObjectStorageError("bucket detail"), 503, "object_storage_unavailable"),
-        (TaskBrokerError("redis detail"), 503, "task_broker_unavailable"),
-        (MemoryIntegrityError("row detail"), 500, "memory_integrity_failed"),
+        [],
+        [{"type": "input_text", "text": "memory", "unknown": True}],
+        [
+            {
+                "type": "input_image",
+                "image_url": "https://media.example/frame.png",
+                "detail": "high",
+            }
+        ],
+        [
+            {
+                "type": "input_image",
+                "image_url": "https://media.example/frame.png",
+                "file_id": "asset_image",
+            }
+        ],
+        [{"type": "input_image", "image_url": "http://media.example/frame.png"}],
+        [{"type": "input_file", "file_url": "file:///etc/passwd"}],
+        [{"type": "input_file", "file_data": "not-base64", "media_type": "audio/wav"}],
+        [{"type": "input_file", "file_data": "d2F2"}],
+        [{"type": "input_file", "file_id": "asset_pdf", "media_type": "application/pdf"}],
+        [{"type": "input_file", "path": "/etc/passwd"}],
     ],
 )
-def test_runtime_errors_use_sanitized_stable_envelopes(
-    error: RuntimeError,
+def test_content_parts_reject_ambiguous_or_untrusted_sources_before_memory(
+    content: object,
+) -> None:
+    memory = FakeMemory()
+
+    with TestClient(create_app(memory=memory)) as client:
+        response = client.post("/v1/memories", json={"content": content})
+
+    assert response.status_code == 422
+    assert response.json()["code"] == "validation_error"
+    assert memory.calls == []
+
+
+def test_memory_routes_are_sync_for_fastapi_threadpool_execution() -> None:
+    app = create_app(memory=FakeMemory())
+    endpoints = [
+        route.endpoint
+        for route in app.routes
+        if isinstance(route, APIRoute) and route.path.startswith("/v1/")
+    ]
+
+    assert endpoints
+    assert all(not inspect.iscoroutinefunction(endpoint) for endpoint in endpoints)
+
+
+@pytest.mark.parametrize("field", ["tenant_id", "user_id", "run_id"])
+def test_old_isolation_fields_are_rejected_without_echoing_values(field: str) -> None:
+    with TestClient(create_app(memory=FakeMemory())) as client:
+        response = client.post(
+            "/v1/memories",
+            json={"content": "safe memory", field: "private-isolation-value"},
+        )
+
+    body = response.json()
+    assert response.status_code == 422
+    assert set(body) == {"code", "message", "trace_id", "issues"}
+    assert body["code"] == "validation_error"
+    assert body["issues"][0]["location"][-1] == field
+    assert body["trace_id"].startswith("trace_")
+    assert "private-isolation-value" not in response.text
+
+
+@pytest.mark.parametrize(
+    ("path", "payload", "field"),
+    [
+        ("/v1/memories", {"content": "   "}, "content"),
+        (
+            "/v1/memories",
+            {"content": "memory", "occurred_at": "2026-08-27T12:00:00"},
+            "occurred_at",
+        ),
+        ("/v1/memories/batch", {"contents": []}, "contents"),
+        ("/v1/memories/search", {"query": "memory", "limit": 101}, "limit"),
+    ],
+)
+def test_request_boundaries_are_strict(
+    path: str,
+    payload: dict[str, object],
+    field: str,
+) -> None:
+    with TestClient(create_app(memory=FakeMemory())) as client:
+        response = client.post(path, json=payload)
+
+    assert response.status_code == 422
+    assert field in response.json()["issues"][0]["location"]
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_status", "expected_code", "detail_is_public"),
+    [
+        (ValidationError("content is invalid"), 422, "validation_error", True),
+        (MemoryNotFoundError("memory is missing"), 404, "memory_not_found", True),
+        (ModelError("provider secret"), 502, "model_error", False),
+        (StorageError("database path"), 503, "storage_error", False),
+        (IndexUnavailableError("native detail"), 503, "index_unavailable", False),
+    ],
+)
+def test_public_errors_use_one_sanitized_envelope(
+    failure: Exception,
     expected_status: int,
     expected_code: str,
+    detail_is_public: bool,
 ) -> None:
-    """Dependency details cannot leak through the public Agent contract."""
-    response = _client(FailingKernel(error)).post(
-        "/v1/recall",
-        json={"tenant_id": "tenant_01", "query": {"text": "question"}},
-    )
+    with TestClient(create_app(memory=FakeMemory(failure))) as client:
+        response = client.get("/v1/memories/memory_1")
 
     assert response.status_code == expected_status
     assert response.json()["code"] == expected_code
-    assert str(error) not in response.text
+    assert (str(failure) in response.text) is detail_is_public
 
 
-def test_unexpected_errors_use_the_internal_envelope_and_are_logged(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    error = RuntimeError("private implementation detail")
-    with caplog.at_level("ERROR", logger="mindbridge.api.app"):
-        response = _client(
-            FailingKernel(error),
-            raise_server_exceptions=False,
-        ).post(
-            "/v1/recall",
-            json={"tenant_id": "tenant_01", "query": {"text": "question"}},
+def test_unexpected_and_framework_errors_keep_the_flat_envelope() -> None:
+    app = create_app(memory=FakeMemory(RuntimeError("private implementation detail")))
+    with TestClient(app, raise_server_exceptions=False) as client:
+        failed = client.get("/v1/memories/memory_1")
+        missing = client.get("/v1/does-not-exist")
+
+    assert failed.status_code == 500
+    assert failed.json()["code"] == "internal_error"
+    assert "private implementation detail" not in failed.text
+    assert missing.status_code == 404
+    assert missing.json()["code"] == "not_found"
+    assert set(missing.json()) == {"code", "message", "trace_id", "issues"}
+
+
+def test_optional_api_key_protects_v1_but_not_health() -> None:
+    app = create_app(memory=FakeMemory(), api_key=API_KEY)
+    with TestClient(app) as client:
+        health = client.get("/healthz")
+        missing = client.get("/v1/memories")
+        invalid = client.get(
+            "/v1/memories",
+            headers={"Authorization": "Bearer wrong"},
+        )
+        allowed = client.get(
+            "/v1/memories",
+            headers={"Authorization": f"Bearer {API_KEY}"},
         )
 
-    assert response.status_code == 500
-    assert response.json()["code"] == "internal_error"
-    assert response.json()["trace_id"]
-    assert str(error) not in response.text
-    assert any(record.exc_info is not None for record in caplog.records)
+    assert health.status_code == 200
+    assert missing.status_code == invalid.status_code == 401
+    assert missing.headers["WWW-Authenticate"] == "Bearer"
+    assert invalid.json()["code"] == "authentication_error"
+    assert API_KEY not in invalid.text
+    assert allowed.status_code == 200
 
 
-class FailingKernel(StubKernel):
-    """Raises one sanitized runtime category from the shared recall route."""
+def test_authentication_and_size_limits_run_before_body_parsing() -> None:
+    memory = FakeMemory()
+    app = create_app(memory=memory, api_key=API_KEY)
 
-    def __init__(self, error: Exception) -> None:
-        super().__init__()
-        self._error = error
+    with TestClient(app) as client:
+        unauthenticated = client.post("/v1/memories", content=b"{")
+        oversized = client.post(
+            "/v1/memories",
+            content=b"",
+            headers={
+                "Authorization": f"Bearer {API_KEY}",
+                "Content-Length": str(8 * 1024 * 1024 + 1),
+            },
+        )
 
-    async def recall(self, request: RecallRequest) -> RecallResult:
-        raise self._error
+    assert unauthenticated.status_code == 401
+    assert unauthenticated.json()["code"] == "authentication_error"
+    assert oversized.status_code == 413
+    assert oversized.json()["code"] == "request_too_large"
+    assert memory.calls == []
 
 
-def _client(
-    stub: StubKernel | None = None,
+def test_lifespan_closes_only_a_factory_owned_memory(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    owned = FakeMemory()
+    open_count = 0
+
+    def create_memory(*, data_dir: str | Path) -> FakeMemory:
+        nonlocal open_count
+        assert Path(data_dir) == tmp_path
+        open_count += 1
+        return owned
+
+    monkeypatch.setattr("mindbridge.memory.Memory", create_memory)
+    app = create_app(data_dir=tmp_path)
+    assert open_count == 0
+
+    with TestClient(app) as client:
+        assert client.get("/healthz").status_code == 200
+        assert open_count == 1
+        assert owned.close_count == 0
+
+    assert owned.close_count == 1
+
+
+def _record(
+    memory_id: str,
+    content: str,
     *,
-    raise_server_exceptions: bool = True,
-) -> TestClient:
-    kernel = cast(MemoryKernel, stub or StubKernel())
-    return TestClient(
-        build_app(kernel, authenticator=_authenticator()),
-        headers={"Authorization": f"Bearer {TENANT_API_KEY}"},
-        raise_server_exceptions=raise_server_exceptions,
+    occurred_at: datetime | None = None,
+    metadata: Mapping[str, object] | None = None,
+    assets: tuple[AssetRef, ...] = (),
+    modality: Modality = Modality.TEXT,
+) -> MemoryRecord:
+    return MemoryRecord(
+        id=memory_id,
+        content=content,
+        modality=modality,
+        assets=assets,
+        created_at=NOW,
+        occurred_at=occurred_at,
+        metadata=metadata or {},
     )
 
 
-def _authenticator() -> TenantApiKeyAuthenticator:
-    return TenantApiKeyAuthenticator(
-        {
-            "tenant_01": (TENANT_API_KEY,),
-            "other_tenant": (OTHER_TENANT_API_KEY,),
-        }
+def _hit() -> SearchHit:
+    return SearchHit(
+        id="memory_1",
+        content="The toolbox is blue.",
+        score=0.9,
+        modality=Modality.TEXT,
+        created_at=NOW,
     )

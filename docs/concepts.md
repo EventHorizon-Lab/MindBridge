@@ -1,250 +1,150 @@
-# Concepts
+# Core concepts
 
-MindBridge stores seven kinds of record. They exist separately because they answer different
-questions and fail differently: collapsing them into one "document" table is what makes an
-answer impossible to verify and a deletion impossible to complete.
+MindBridge deliberately has fewer moving parts than a memory service. Six concepts explain its
+public behavior.
 
-```mermaid
-flowchart TD
-  obs["Observation<br/><i>what a device submitted</i>"]
-  media["MediaObject<br/><i>immutable bytes + sha256</i>"]
-  ev["EvidenceSpan<br/><i>(media, start_ms, end_ms)</i>"]
-  event["Event<br/><i>what happened</i>"]
-  ent["Entity<br/><i>who or what</i>"]
-  claim["Claim<br/><i>what is true, and when</i>"]
-  mem["MemoryRecord<br/><i>the unit of recall</i>"]
+## Content and modality
 
-  obs --> media --> ev
-  ev --> event
-  event -->|mentions| ent
-  event --> claim
-  event --> mem
-  claim --> mem
-  ev -.->|grounds| mem
-  ev -.->|grounds| claim
-```
+Python uses one `ContentInput` contract for `add`, `search`, and `ask`: one `str`, `Path`, `URL`,
+`Blob`, or `AssetRef`, or an ordered sequence of those atoms.
 
-Solid arrows are derivation. Dotted arrows are grounding — the reason a derived record can be
-checked against what the sensor actually recorded.
+| Atom | Boundary |
+| --- | --- |
+| `str` | Normalized non-blank text |
+| `Path` | Local regular media file copied into MindBridge |
+| `URL` | HTTPS media fetched only from an allowed host |
+| `Blob` | Immutable inline image, video, or audio bytes |
+| `AssetRef` | Opaque reference to an asset in the same store |
 
-## Tenant
+REST and MCP translate `input_text`, `input_image`, and `input_file` parts into these values. They
+do not accept local paths.
 
-The isolation boundary. Every table carrying a `tenant_id` has **forced** row-level security
-enabled by migration `0005`, and every store transaction sets exactly one tenant locally. This
-is not filtering in application code that a missing `WHERE` clause could defeat; the database
-refuses to return another tenant's rows even to a query that asks for them.
+Every stored record has an explicit `Modality`: `text`, `image`, `video`, `audio`, or `omni`.
+Text does not make a single-media input omni. No media is text; one media family keeps that family;
+two or more media families are omni.
 
-An API key is bound to an explicit tenant allowlist. Requests naming a `tenant_id` outside that
-allowlist are rejected with `tenant_access_denied` regardless of whether the row exists.
+## Memory record and assets
 
-## Observation
-
-One timestamped capture from one sensor: `device_id`, `boot_id`, `sequence`, `sensor`, and the
-media it refers to. Only two sensors are admissible — `camera` and `microphone` — because those
-are the two that can carry the image, video, or audio evidence every observation is required to
-have.
-
-Three timestamps, deliberately distinct:
+`MemoryRecord` contains:
 
 | Field | Meaning |
 | --- | --- |
-| `occurred_at` | When the observed events began. |
-| `ended_at` | When they ended. Must not precede `occurred_at`. |
-| `observed_at` | When the device recorded them, which may trail `ended_at`. |
+| `id` | Stable SHA-256 memory identity |
+| `content` | Normalized text, plus audio transcript text persisted only by add-time embedding fallback |
+| `modality` | Persisted modality; response layers do not recompute it |
+| `assets` | Ordered, resolved `AssetRef` values |
+| `created_at` | Time the record was first stored |
+| `occurred_at` | Optional timezone-aware event time |
+| `metadata` | Detached JSON application payload |
 
-`clock_offset_ms` records known device clock skew, so a drifting edge clock stays reconcilable
-rather than silently corrupting the timeline. `(boot_id, sequence)` orders and deduplicates
-without requiring the counter to survive a restart.
+An asset is immutable media stored by SHA-256. Its public descriptor contains ID, modality, MIME
+type, byte size, digest, and optional name. Python also receives the local resolved path so a model
+backend can read the file. REST and MCP never expose that path.
 
-No request body carries bytes. The device puts them in object storage first, then submits an
-observation that refers to them; a client without storage credentials asks
-`POST /v1/media/uploads` for a short-lived signed PUT into its own tenant prefix and does the
-same.
+A Python caller may pass an opaque `AssetRef(id=...)` to reuse existing bytes. MindBridge resolves
+it through authoritative SQLite. The reference is rejected when it does not exist or its modality
+hint contradicts the stored descriptor.
 
-## MediaObject
+## Stable identity and idempotency
 
-An immutable reference to bytes that already exist: `uri`, `sha256`, `size_bytes`, `kind`, and
-optional `duration_ms`. The URI must take the tenant-safe shape
-`s3://<bucket>/tenants/<tenant_id>/<key>`; anything else is refused before it can become a path
-traversal.
+Before hashing, MindBridge canonicalizes text, ordered asset digests, event time, and JSON metadata.
+Equivalent logical input has the same memory ID. Repeating an add returns the existing record
+without storing the same bytes or embedding the record again.
 
-`kind` drives all downstream modality routing, so it is cross-checked against the URI extension
-when the extension is recognized. Declaring `video` and pointing at a `.wav` fails at the
-boundary rather than as a decode error in a worker three minutes later. Extensionless keys are
-normal and imply nothing.
+The asset store separately de-duplicates identical media bytes by SHA-256. Multiple memories can
+reference one immutable file. Deleting a memory removes a media file only after its final record
+reference is gone. The optional name is digest-level CAS metadata, not per-reference metadata: the
+first authoritative non-empty name is reused when identical bytes later arrive with another name.
 
-Derived clips carry `derived_from_media_object_id`, which is what makes them rebuildable and
-therefore safe for the lifecycle sweep to purge.
+## Data directory
 
-## EvidenceSpan
+A `data_dir` is the complete durability and isolation boundary for one `Memory`:
 
-The load-bearing concept. An `EvidenceSpan` is `(media_object_id, start_ms, end_ms)` — a
-precise, replayable location inside an original recording.
-
-Every derived record that claims to be verified must reference at least one. The domain layer
-enforces this directly: constructing a `Claim` or a `MemoryRecord` with
-`verification_status = verified` and no `evidence_ids` raises `DomainInvariantError`. There is
-no path by which the system produces a verified assertion it cannot point at the proof for.
-
-Callers receive evidence as an `EvidenceView` carrying a short-lived signed `media_url`, so
-verifying an answer needs no second call to private storage.
-
-## Event
-
-What happened, derived from one or more observations by a perception model that inspected the
-original AV. An Event carries its own `evidence_ids`, the `model_reference` and `prompt_version`
-that produced it, a `salience`, and its time span.
-
-Events form a two-level hierarchy through `hierarchy_level`:
-
-- `event` — directly perceived, grounded in one or more recording spans.
-- `episode` — a consolidated parent that atomically claims child events.
-
-`status` moves through `candidate → active → superseded`. Consolidation writes atomically, so a
-child cannot be claimed by two parents.
-
-## Entity
-
-Who or what an event involves: `person`, `object`, `place`, `device`, `organization`, or
-`topic`.
-
-A named entity is keyed by `(tenant, entity_type, casefolded name)`, so every event mentioning
-that name shares one graph node. Casefolding is applied before the key is derived and the
-casefolded form is what gets stored — keeping the perceived casing would make the row depend on
-which clip happened to arrive first.
-
-One consequence is deliberate and worth knowing: **two different people with the same name merge.**
-Splitting them is an evidence problem, deferred until a real corpus shows the false merges rather
-than guessed at in advance.
-
-Perception names what it sees once per clip, so the same person can accumulate a different name
-in every clip. Identical names already collapse and the edge identity signal keeps anonymous
-people stable, which leaves one real problem: the same entity described two different ways.
-Entity consolidation pairs same-type entities, reopens spans of each one's original recording,
-and asks the generator to judge that pair alone.
-
-A verdict is recorded only when the judge reached one — a confident `same_as`, or a confident
-`not_same_as` so the pair is not paid for again. Anything else leaves the pair unjudged for a
-later sweep. Verdicts are **pairwise and never composed**: `same_as` between A and B and between
-B and C implies nothing about A and C. The cue the judge's verdict rested on is stored in
-`entity_resolution_verdicts` beside the confidence, so a merge that turns out wrong can be read
-back rather than guessed at.
-
-Retrieval follows direct `same_as` aliases in either stored direction for entity hits and graph
-neighbors. It deliberately stops after one hop, preserving the pairwise verdict rule instead of
-inventing transitive closure.
-
-## Claim
-
-A versioned assertion: `fact`, `state`, `intent`, or `relation`. Claims carry validity time
-(`valid_from`, `valid_to`) separately from creation time, which is what lets "the toolbox is on
-the workbench" stop being true without being deleted.
-
-`verification_status` distinguishes three genuinely different things:
-
-| Status | Meaning |
-| --- | --- |
-| `verified` | Original media was inspected. Requires evidence. |
-| `attested` | The writer asserted it. Nothing inspected it. |
-| `unverified` | Neither. |
-
-Conflicting claims produce durable `contradicts` and `supersedes` edges rather than a silent
-overwrite. Supersession also versions the `MemoryRecord` that represents the claim.
-
-## MemoryRecord
-
-The unit of recall — what `recall()` returns and what feedback and forgetting address. Six
-types, distinguished by the role the content serves:
-
-| Type | Role |
-| --- | --- |
-| `episodic` | Something that happened at a time. |
-| `semantic` | A durable fact. |
-| `procedural` | How to do something. |
-| `prospective` | A future intention. |
-| `working` | Short-lived task state. |
-| `perceptual` | A raw sensory detail. |
-
-A memory also carries the lifecycle counters that make its ranking explainable:
-`strength`, `salience`, `useful_access_count`, `positive_feedback_count`,
-`negative_feedback_count`, `last_accessed_at`. Corrections version rather than overwrite, linked
-by `supersedes_memory_id` and `superseded_at`.
-
-## Relations
-
-The graph layer, as typed edges between events, entities, claims, and memories:
-
-`represented_by`, `mentions`, `asserts`, `about`, `contains`, `supports`, `contradicts`,
-`supersedes`, `same_as`, `not_same_as`, `same_episode`, `before`, `after`.
-
-Recall expands a bounded number of hops across these edges and fuses the result with dense and
-lexical retrieval, which is how a query reaches a memory whose text never matched it.
-
-## Lifecycle
-
-Memories decay on an explicit, inspectable schedule rather than by model judgement. Four states:
-
-```mermaid
-stateDiagram-v2
-  [*] --> active
-  active --> strengthened: strength >= --strengthen-at
-  strengthened --> active: strength falls back
-  active --> cold: strength < --cold-below
-  cold --> active: recalled usefully again
-  cold --> compressed: strength <= --compress-below
-  compressed --> [*]: rebuildable clips dropped
+```text
+data_dir/
+├── state.sqlite3
+├── assets/
+├── .mindbridge.lock
+└── zvec/
 ```
 
-Strength rises with useful access and positive feedback, falls with negative feedback and idle
-time. Every coefficient is a CLI flag on `mindbridge lifecycle`, not a model weight, so
-retention policy and hardware cadence can be calibrated without touching code. The default
-`--age-decay-weight` of 0.005 cools a memory of median salience after 100 unused days.
+Exactly one live instance may own a directory. Ownership is enforced across threads, instances,
+and processes. Independent directories can run concurrently without sharing records, assets,
+embeddings, or indexes. On POSIX, opening a directory sets its top-level mode to `0700`, including
+for an existing path.
 
-`compressed` drops rebuildable derived clips while keeping the record and its pointers into the
-original recording. It is a storage reduction, not a deletion.
+There is no logical scoping layer inside a directory. If two applications or benchmark cases must
+not see one another's memories, give them different directories and apply filesystem permissions.
 
-## Forgetting
+## Authority and search projection
 
-Deletion is a durable, transitive operation, not a row removal. `forget()` writes a
-`DeletionTombstone` naming either one `memory_record` or an entire `observation` — the latter
-erasing everything derived from it, including identity samples the edge learned from that
-source.
+SQLite and the content-addressed asset files are authoritative. SQLite stores records, asset
+descriptors and relationships, FP32 embeddings, the embedding/index recipe, and a durable outbox
+of index work. A successful SQLite commit survives even if Zvec cannot be updated immediately.
 
-The tombstone survives the content and carries a propagation state:
+Zvec is a rebuildable hybrid-search projection. Search gets ranked candidate IDs from Zvec and
+hydrates complete records from SQLite. An index ID that no longer exists in SQLite is discarded.
 
-| State | Meaning |
-| --- | --- |
-| `pending` | Recorded, not yet propagating. |
-| `propagating` | Reaching central PostgreSQL and object storage. |
-| `complete` | Central deletion finished. |
-| `failed` | Central deletion stalled; `error_code` says why. |
+Deleting `zvec/` while MindBridge is closed is recoverable. The next open checkpoints rebuild work
+before creating the collection, then reconstructs it from stored embeddings without calling the
+model endpoint for historical content.
 
-`complete` describes central storage only. Tombstones are content-free by construction, so
-retaining them after physical erasure is safe — which is what lets a device that was offline
-during the deletion reconcile when it reconnects, by paging `GET /v1/deletions` from its last
-cursor. The server does not claim that device has already reconnected or acknowledge deletion.
+## Capability-driven model routing
 
-## Embedding space
+The default composition has three independent operations:
 
-A vector is meaningless without knowing what produced it, so every embedding carries both the
-encoder that produced it (`model_id`) and the compatibility space it belongs to
-(`MINDBRIDGE_EMBEDDING_SPACE_ID`).
+- Local Jina v5 Omni embedding for stored memories and search queries.
+- Generation for grounded answers.
+- Local Fun-ASR-Nano transcription, FSMN-VAD diarization, and CAM++ speaker encoding.
 
-Those are two different facts. Several independently served encoders can write into one
-comparable space. Separating them is what allows a re-embedding to run while the deployment keeps
-serving.
+Each operation declares the atomic modalities it accepts. MindBridge routes from capabilities,
+not model names:
 
-The API probes every configured tenant at startup and refuses to serve if one holds vectors the
-configured space cannot reach. Pointing a deployment at a new embedder without re-embedding
-therefore fails loudly instead of returning empty recalls. Vectors in several spaces are
-accepted while a migration is in progress.
+1. Natively supported media remains in the model input.
+2. If embedding does not support audio, audio is transcribed and removed; its transcript is added
+   to the text while supported image and video parts remain.
+3. Generation uses the same fallback, allowing a visual-language model to receive ASR text plus
+   retained visual evidence.
+4. If the remaining input is unsupported, the operation fails with `ModelError`.
 
-`MINDBRIDGE_EMBEDDING_DIMENSION` is one width shared by the pgvector column and every encoder in
-the deployment. It defaults to 1024 and accepts only widths Jina v5 was trained to truncate to:
-32, 64, 128, 256, 512, 768, 1024. Changing it requires re-embedding.
+An audio-only input therefore becomes transcript-only when fallback is required. A video or image
+is not silently discarded merely to reach a text model.
 
-## Where to go next
+Stored embeddings belong to one adapter recipe, model, immutable revision, dimension, vector
+space, and index recipe. Local adapters derive `space_id` from those values. MindBridge refuses to
+open a directory with incompatible settings. Use a new directory and re-encode source content when
+changing the embedding space. The store also persists `transcription_space`, which identifies the
+ASR model and transcript-affecting preprocessing recipe. Reopening with a different value fails
+before use so cached transcripts and add-time derived text cannot silently mix recipes.
 
-- [Architecture](architecture.md) — how these records are written and read at runtime.
-- [REST API](api/rest.md) — the wire representation of each one.
-- [Operations](operations.md) — running consolidation and lifecycle against them.
+FunASR's `SPK0` labels are local to one asset. `Memory.speech` matches their normalized CAM++
+centroids to stable local `speaker_id` values inside the physical data directory. A first
+observation enrolls an identity; only later matches carry an `identity_score`. Applications may
+attach a display name with `register_speaker`; the biometric vector remains local.
+
+## Retrieval and grounded answers
+
+`search` uses Zvec dense plus full-text retrieval when the routed query contains text. A pure-media
+query uses dense retrieval only. Each hydrated hit has a score from 0 through 1; scores rank results
+within a request and are not stable global probabilities.
+
+`ask` retrieves evidence first and routes those hits, including retained media, to generation.
+Generation-time ASR can cache an asset transcript, but it does not rewrite an existing record's
+`content`. `AnswerResult` contains the answer and source hits for display or grounding audits. The
+built-in backend sends one binary content part per distinct asset in an answer request, even when
+the question or several hits refer to it.
+
+Operations on one instance may overlap remote model calls. MindBridge serializes the shorter
+SQLite commit/outbox and Zvec access sections that must observe one coherent local state.
+
+The current retrieval ceiling is intentionally explicit: one memory has one aggregate embedding.
+MindBridge does not yet chunk content, create one vector per asset, or rerank candidates.
+With built-in `data` transport, each embedding or generation call also has a 64 MiB aggregate raw
+media ceiling before base64 encoding; co-located `file` transport or a streaming custom backend is
+the large-video path.
+
+## Metadata is not isolation
+
+Metadata is useful for provenance, display, or application logic. It is not a server-side filter,
+permission rule, or ownership boundary. Do not put secrets in metadata unless the complete data
+directory is protected appropriately.

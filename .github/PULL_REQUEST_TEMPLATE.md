@@ -2,40 +2,41 @@
 
 ## What changed
 
-<!-- What this does, and why. Link the issue if there is one. -->
+<!-- Explain the change and link the issue. -->
 
 ## Why
 
-<!-- The problem being solved. If it was a bug, say what the root cause was. -->
+<!-- Describe the problem and, for a bug, the root cause. -->
 
 ## Validation
 
-<!-- Commands you actually ran and what happened. "Tests pass" is not validation. -->
+<!-- List commands actually run and their results. State any skips. -->
 
 ```text
 uv run ruff format --check .
 uv run ruff check .
 uv run mypy
 uv run pytest -W error
+git diff --check
 ```
 
 - [ ] Quality gates pass
-- [ ] Re-ran the gates after merging the base branch
-- [ ] Integration suite ran against a real PostgreSQL (`MINDBRIDGE_REQUIRE_INTEGRATION=1`), or
-      this change cannot affect recall, consolidation, or deletion
-- [ ] New behaviour has a test that fails when the behaviour regresses — verified by breaking it
-- [ ] Markdown lint and link check pass, if documentation changed
+- [ ] New behavior has a regression test that was verified to fail without the change
+- [ ] Local-store tests use distinct temporary `data_dir` paths
+- [ ] Retrieval or index changes include relevant recall and performance evidence
+- [ ] Markdown lint and link checks pass, if documentation changed
 
-## Operator impact
+## Product and operator impact
 
-- [ ] New or changed environment variables — documented in `docs/configuration.md`
-- [ ] New migration — number re-checked after merging base
-- [ ] New dependency — justified below
-- [ ] Public contract changed (`mindbridge.contracts`, REST, MCP, CLI, entry points)
+- [ ] Public Python, REST, MCP, CLI, or benchmark contract changed
+- [ ] SQLite schema, Zvec recipe, rebuild, backup, or restore behavior changed
+- [ ] Environment variable or model configuration changed
+- [ ] Base, `server`, or `mcp` dependency surface changed
+- [ ] Deployment ownership or single-process behavior changed
 - [ ] None of the above
 
-<!-- If any box above is checked, describe what an operator has to do. -->
+<!-- Describe upgrade steps, data compatibility, reindexing, and rollback for checked items. -->
 
 ## Follow-up
 
-<!-- Anything deliberately left out of scope. -->
+<!-- Record anything deliberately left out of scope. -->

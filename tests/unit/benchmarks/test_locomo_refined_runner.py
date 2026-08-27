@@ -1,174 +1,134 @@
-"""Production-contract checks for the LoCoMo-Refined runner."""
+"""Public-API checks for the isolated LoCoMo-Refined runner."""
 
+from __future__ import annotations
+
+from collections.abc import Mapping
 from datetime import datetime, timezone
+from inspect import signature
 from typing import cast
 
 import pytest
+from pydantic import ValidationError
 
-from mindbridge import MindBridge
+from mindbridge import AnswerResult, AsyncMemory, MemoryRecord, ModelError, SearchHit
 from mindbridge.benchmarks.locomo_refined import (
     LoCoMoRefinedConversation,
     LoCoMoRefinedQuestion,
     LoCoMoRefinedTurn,
 )
 from mindbridge.benchmarks.locomo_refined_runner import run_locomo_refined_conversation
-from mindbridge.contracts import (
-    MemoryView,
-    RecallRequest,
-    RecallResult,
-    RememberRequest,
-)
-from mindbridge.core import MemoryState, VerificationStatus
-from mindbridge.sdk import MindBridgeError
 
 NOW = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
 
 
-class RecordingMemoryApi:
+class _RecordingMemory:
     def __init__(self) -> None:
-        self.remember_requests: list[RememberRequest] = []
-        self.recall_requests: list[RecallRequest] = []
-        self.memories: list[MemoryView] = []
-        self.answer: str | None = None
+        self.add_requests: list[tuple[str, datetime | None, Mapping[str, object] | None]] = []
+        self.ask_requests: list[tuple[str, int]] = []
+        self.records: list[MemoryRecord] = []
+        self.answer = "A new course."
+        self.scores: tuple[float, ...] = ()
 
-    async def remember(self, request: RememberRequest) -> MemoryView:
-        self.remember_requests.append(request)
-        memory = MemoryView(
-            memory_id=f"memory_{len(self.remember_requests)}",
-            memory_type=request.memory_type,
-            summary=request.summary,
-            evidence_ids=(),
-            occurred_at=request.occurred_at,
-            ended_at=request.ended_at or request.occurred_at,
+    async def add(
+        self,
+        content: str,
+        *,
+        occurred_at: datetime | None = None,
+        metadata: Mapping[str, object] | None = None,
+    ) -> MemoryRecord:
+        self.add_requests.append((content, occurred_at, metadata))
+        dialog_id = None if metadata is None else metadata.get("dialog_id")
+        assert isinstance(dialog_id, str)
+        record = MemoryRecord(
+            id=f"memory:{dialog_id}",
+            content=content,
             created_at=NOW,
-            verification_status=VerificationStatus.ATTESTED,
-            state=MemoryState.ACTIVE,
+            occurred_at=occurred_at,
+            metadata=metadata or {},
         )
-        self.memories.append(memory)
-        return memory
+        self.records.append(record)
+        return record
 
-    async def recall(self, request: RecallRequest) -> RecallResult:
-        self.recall_requests.append(request)
-        return RecallResult(
-            answer=self.answer,
-            confidence=0.0 if self.answer is None else 0.9,
-            memories=tuple(self.memories[:1]),
-            evidence=(),
-            trace_id="trace_locomo_refined",
+    async def ask(self, question: str, *, limit: int = 5) -> AnswerResult:
+        self.ask_requests.append((question, limit))
+        hits = tuple(
+            SearchHit(
+                id=record.id,
+                content=record.content,
+                score=score,
+                created_at=record.created_at,
+                occurred_at=record.occurred_at,
+                metadata=record.metadata,
+            )
+            for record, score in zip(self.records, self.scores, strict=False)
         )
+        return AnswerResult(answer=self.answer, hits=hits)
 
 
-async def test_locomo_refined_uses_only_source_turns_and_questions_in_api_requests() -> None:
-    api = RecordingMemoryApi()
-    conversation = LoCoMoRefinedConversation(
-        sample_id="conv-26",
-        turns=(
-            LoCoMoRefinedTurn(
-                dialog_id="D1:1",
-                speaker="Caroline",
-                text="I started a new course.",
-                occurred_at=NOW,
-                image_caption="a classroom at sunrise",
-            ),
-        ),
-        questions=(
-            LoCoMoRefinedQuestion(
-                question_id="conv-26#q0000",
-                question="What did Caroline start?",
-                reference_answers=("SECRET REFERENCE ANSWER",),
-                evidence_dialog_ids=("D1:1",),
-                category=2,
-                is_multi_modality=False,
-            ),
-        ),
-    )
+async def test_runner_uses_only_public_add_and_ask_without_gold_or_identity_fields() -> None:
+    memory = _RecordingMemory()
+    memory.scores = (0.73,)
+    conversation = _conversation(reference_answer="SECRET REFERENCE ANSWER")
 
     predictions = await run_locomo_refined_conversation(
-        cast(MindBridge, api), conversation, run_id="run_01"
+        cast(AsyncMemory, memory), conversation, recall_limit=17
     )
 
-    assert api.remember_requests[0].summary == (
+    content, occurred_at, metadata = memory.add_requests[0]
+    assert content == (
         'Caroline said: "I started a new course."\n'
         'Caroline shared an image described as: "a classroom at sunrise"'
     )
-    assert api.remember_requests[0].idempotency_key == "locomo_refined_v1:conv-26:D1:1"
-    assert api.recall_requests[0].query.text == "What did Caroline start?"
-    assert "SECRET REFERENCE ANSWER" not in api.remember_requests[0].model_dump_json()
-    assert "SECRET REFERENCE ANSWER" not in api.recall_requests[0].model_dump_json()
-    # The official evaluator joins on `qa_id` alone, so the row must carry the release's own
-    # id and nothing that would leak the gold answer back into the scored artifact.
+    assert occurred_at == NOW
+    assert metadata == {
+        "benchmark": "locomo-refined",
+        "sample_id": "conv-26",
+        "dialog_id": "D1:1",
+    }
+    assert metadata is not None
+    assert {"tenant", "tenant_id", "user", "user_id", "run", "run_id"}.isdisjoint(metadata)
+    assert memory.ask_requests == [("What did Caroline start?", 17)]
+    assert "SECRET REFERENCE ANSWER" not in repr(memory.add_requests)
+    assert "SECRET REFERENCE ANSWER" not in repr(memory.ask_requests)
+    assert {"run", "run_id", "tenant_prefix", "tenant_id", "user", "user_id"}.isdisjoint(
+        signature(run_locomo_refined_conversation).parameters
+    )
     assert predictions[0].qa_id == "conv-26#q0000"
-    assert predictions[0].predicted_answer == ""
-    assert predictions[0].mindbridge_answered is False
-    assert predictions[0].mindbridge_prediction_context == ("D1:1",)
-    assert predictions[0].mindbridge_trace_id == "trace_locomo_refined"
-
-
-async def test_locomo_refined_writes_the_recalled_answer_as_the_prediction() -> None:
-    api = RecordingMemoryApi()
-    api.answer = "A new course."
-
-    predictions = await run_locomo_refined_conversation(
-        cast(MindBridge, api), _conversation(), run_id="run_01"
-    )
-
     assert predictions[0].predicted_answer == "A new course."
-    assert predictions[0].mindbridge_answered is True
+    assert predictions[0].mindbridge_prediction_context == ("D1:1",)
+    assert predictions[0].mindbridge_confidence == pytest.approx(0.73)
+    serialized = predictions[0].model_dump()
+    assert "mindbridge_trace_id" not in serialized
+    assert not any("tenant" in key for key in serialized)
+    assert "SECRET REFERENCE ANSWER" not in predictions[0].model_dump_json()
 
 
-async def test_locomo_refined_rejects_unbounded_or_empty_request_pool() -> None:
-    with pytest.raises(ValueError, match="positive"):
-        await run_locomo_refined_conversation(
-            cast(MindBridge, RecordingMemoryApi()),
-            _conversation(),
-            run_id="run_01",
-            request_concurrency=0,
-        )
+async def test_confidence_is_zero_when_ask_returns_no_hits() -> None:
+    memory = _RecordingMemory()
+
+    prediction = (
+        await run_locomo_refined_conversation(cast(AsyncMemory, memory), _conversation())
+    )[0]
+
+    assert prediction.mindbridge_confidence == 0.0
+    assert prediction.mindbridge_prediction_context == ()
 
 
-async def test_locomo_refined_uses_the_same_recall_budget_for_every_question_wording() -> None:
-    api = RecordingMemoryApi()
-    conversation = _conversation().model_copy(
-        update={
-            "questions": (
-                LoCoMoRefinedQuestion(
-                    question_id="conv-26#q0000",
-                    question="Would Caroline likely enjoy another course?",
-                    reference_answers=("Yes",),
-                    evidence_dialog_ids=("D1:1",),
-                    category=3,
-                    is_multi_modality=False,
-                ),
-            )
-        }
-    )
+async def test_one_failed_turn_does_not_discard_the_other_turns() -> None:
+    class _FailingMemory(_RecordingMemory):
+        async def add(
+            self,
+            content: str,
+            *,
+            occurred_at: datetime | None = None,
+            metadata: Mapping[str, object] | None = None,
+        ) -> MemoryRecord:
+            if metadata is not None and metadata.get("dialog_id") == "D1:2":
+                raise ModelError("turn could not be embedded")
+            return await super().add(content, occurred_at=occurred_at, metadata=metadata)
 
-    await run_locomo_refined_conversation(
-        cast(MindBridge, api),
-        conversation,
-        run_id="run_01",
-        recall_limit=20,
-    )
-
-    assert api.recall_requests[0].limit == 20
-
-
-async def test_locomo_refined_keeps_stored_turns_when_one_turn_fails_to_remember() -> None:
-    """A turn that cannot be written used to discard every turn written beside it."""
-
-    class FailingMemoryApi(RecordingMemoryApi):
-        async def remember(self, request: RememberRequest) -> MemoryView:
-            if request.idempotency_key == "locomo_refined_v1:conv-26:D1:2":
-                raise MindBridgeError(
-                    "turn could not be written",
-                    code="model_request_failed",
-                    status_code=502,
-                    trace_id="trace_ingest_error",
-                )
-            return await super().remember(request)
-
-    api = FailingMemoryApi()
-    api.answer = "A new course."
+    memory = _FailingMemory()
+    memory.scores = (0.4, 0.8)
     conversation = _conversation().model_copy(
         update={
             "turns": tuple(
@@ -183,68 +143,31 @@ async def test_locomo_refined_keeps_stored_turns_when_one_turn_fails_to_remember
         }
     )
 
-    predictions = await run_locomo_refined_conversation(
-        cast(MindBridge, api), conversation, run_id="run_01"
-    )
+    prediction = (await run_locomo_refined_conversation(cast(AsyncMemory, memory), conversation))[0]
 
-    assert [request.summary for request in api.remember_requests] == [
-        'Caroline said: "turn D1:1"',
-        'Caroline said: "turn D1:3"',
-    ]
-    assert predictions[0].predicted_answer == "A new course."
-    # The surviving turns must still resolve to their own dialog ids, not shift onto the dead one.
-    assert predictions[0].mindbridge_prediction_context == ("D1:1",)
-    assert predictions[0].mindbridge_ingest_failure_count == 1
+    assert [record.metadata["dialog_id"] for record in memory.records] == ["D1:1", "D1:3"]
+    assert prediction.mindbridge_prediction_context == ("D1:1", "D1:3")
+    assert prediction.mindbridge_confidence == pytest.approx(0.8)
+    assert prediction.mindbridge_ingest_failure_count == 1
 
 
-def _conversation() -> LoCoMoRefinedConversation:
-    return LoCoMoRefinedConversation(
-        sample_id="conv-26",
-        turns=(
-            LoCoMoRefinedTurn(
-                dialog_id="D1:1",
-                speaker="Caroline",
-                text="Hello",
-                occurred_at=NOW,
-            ),
-        ),
-        questions=(
-            LoCoMoRefinedQuestion(
-                question_id="conv-26#q0000",
-                question="What happened?",
-                reference_answers=("Hello",),
-                evidence_dialog_ids=("D1:1",),
-                category=1,
-                is_multi_modality=False,
-            ),
-        ),
-    )
+async def test_one_failed_question_keeps_other_predictions_and_stable_error_codes() -> None:
+    class _FailingMemory(_RecordingMemory):
+        async def ask(self, question: str, *, limit: int = 5) -> AnswerResult:
+            if "second" in question:
+                raise ModelError("model unavailable")
+            if "third" in question:
+                raise RuntimeError("unexpected failure")
+            return await super().ask(question, limit=limit)
 
-
-async def test_locomo_refined_keeps_answers_when_one_question_recall_raises() -> None:
-    """One raising recall used to discard every answer beside it: 65.2% of a run's questions."""
-
-    class FailingRecallApi(RecordingMemoryApi):
-        async def recall(self, request: RecallRequest) -> RecallResult:
-            assert request.query.text is not None
-            if "second" in request.query.text:
-                raise MindBridgeError(
-                    "recall failed",
-                    code="model_unavailable",
-                    status_code=503,
-                    trace_id="trace_recall_error",
-                )
-            return await super().recall(request)
-
-    api = FailingRecallApi()
-    api.answer = "A new course."
+    memory = _FailingMemory()
     conversation = _conversation().model_copy(
         update={
             "questions": tuple(
                 LoCoMoRefinedQuestion(
-                    question_id=f"conv-26#q000{index}",
+                    question_id=f"conv-26#q{index:04d}",
                     question=f"What happened {word}?",
-                    reference_answers=("Hello",),
+                    reference_answers=("GOLD",),
                     evidence_dialog_ids=("D1:1",),
                     category=1,
                     is_multi_modality=False,
@@ -254,12 +177,8 @@ async def test_locomo_refined_keeps_answers_when_one_question_recall_raises() ->
         }
     )
 
-    predictions = await run_locomo_refined_conversation(
-        cast(MindBridge, api), conversation, run_id="run_01"
-    )
+    predictions = await run_locomo_refined_conversation(cast(AsyncMemory, memory), conversation)
 
-    # One row per loaded question, in load order, or the official scorer silently grades a
-    # shorter run than the one that was launched.
     assert [prediction.qa_id for prediction in predictions] == [
         "conv-26#q0000",
         "conv-26#q0001",
@@ -267,12 +186,57 @@ async def test_locomo_refined_keeps_answers_when_one_question_recall_raises() ->
     ]
     assert [prediction.mindbridge_error_code for prediction in predictions] == [
         None,
-        "model_unavailable",
-        None,
+        "model_error",
+        "RuntimeError",
     ]
     assert [prediction.predicted_answer for prediction in predictions] == [
         "A new course.",
         "",
-        "A new course.",
+        "",
     ]
-    assert predictions[1].mindbridge_answered is False
+
+
+async def test_runner_rejects_invalid_concurrency_or_recall_limits() -> None:
+    memory = cast(AsyncMemory, _RecordingMemory())
+    with pytest.raises(ValueError, match="positive"):
+        await run_locomo_refined_conversation(memory, _conversation(), request_concurrency=0)
+    with pytest.raises(ValueError, match="between 1 and 100"):
+        await run_locomo_refined_conversation(memory, _conversation(), recall_limit=101)
+
+
+def test_dataset_values_are_strict_and_frozen() -> None:
+    conversation = _conversation()
+
+    with pytest.raises(ValidationError):
+        LoCoMoRefinedConversation(
+            sample_id=cast(str, 26),
+            turns=conversation.turns,
+            questions=conversation.questions,
+        )
+    with pytest.raises(ValidationError):
+        conversation.sample_id = "another"
+
+
+def _conversation(*, reference_answer: str = "Hello") -> LoCoMoRefinedConversation:
+    return LoCoMoRefinedConversation(
+        sample_id="conv-26",
+        turns=(
+            LoCoMoRefinedTurn(
+                dialog_id="D1:1",
+                speaker="Caroline",
+                text="I started a new course.",
+                occurred_at=NOW,
+                image_caption="a classroom at sunrise",
+            ),
+        ),
+        questions=(
+            LoCoMoRefinedQuestion(
+                question_id="conv-26#q0000",
+                question="What did Caroline start?",
+                reference_answers=(reference_answer,),
+                evidence_dialog_ids=("D1:1",),
+                category=2,
+                is_multi_modality=False,
+            ),
+        ),
+    )

@@ -1,391 +1,361 @@
-"""Local SentenceTransformers adapter for MindBridge's embedding capability."""
+"""Pinned adapter for Jina v5 Omni's legacy Sentence Transformers input contract."""
 
 from __future__ import annotations
 
-import asyncio
-from collections.abc import Callable, Mapping
+import threading
+from collections.abc import Callable, Sequence
 from importlib import import_module
+from importlib.util import find_spec
+from types import MethodType
 from typing import Protocol, cast
 
-from pydantic import StrictBool
-
-from mindbridge.application.capabilities import (
-    Embedding,
-    EmbedRequest,
-    EmbedResult,
-    EmbedTask,
-    MediaPart,
-    ModelInput,
-    TextPart,
+from mindbridge.exceptions import ModelError, ValidationError
+from mindbridge.models.base import EmbedTask, ModelInput
+from mindbridge.models.sentence_transformers import (
+    _ST_LOCK,
+    SentenceTransformersEmbedder,
+    _EmbeddingMatrix,
+    _optional_text,
+    _parts,
+    _positive_integer,
+    _recipe_space,
+    _SentenceEncoder,
+    _SentenceTransformerFactory,
+    _vectors,
 )
-from mindbridge.configuration import PluginConfigModel, PluginInteger, PluginText
-from mindbridge.core import (
-    EmbeddingSpaceReference,
-    ModelOutputError,
-    ModelReference,
-    ModelRequestError,
-    ModelUnavailableError,
-)
-from mindbridge.models._vectors import validate_embedding_vector
-from mindbridge.models.compute import select_torch_device
-from mindbridge.models.defaults import (
-    DEFAULT_EMBEDDER_MODEL_ID,
-    DEFAULT_EMBEDDING_DIMENSION,
-    DEFAULT_EMBEDDING_SPACE,
-    EmbeddingDimension,
-    embedder_revision_for,
-    require_distinct_embedding_space,
-)
-from mindbridge.telemetry import operation_span, set_current_span_attributes
+from mindbridge.types import Modality
+
+DEFAULT_JINA_MODEL_ID = "jinaai/jina-embeddings-v5-omni-small-retrieval"
+DEFAULT_JINA_REVISION = "1f9ba7a04283c80cecdfe7a98f9d9c6f09796ffb"
+DEFAULT_JINA_DIMENSION = 1024
+_JINA_RECIPE = "jina-v5-omni-typed-text-tuple-v2"
+_JINA_CAPABILITIES = frozenset({Modality.TEXT, Modality.IMAGE, Modality.VIDEO, Modality.AUDIO})
+_JINA_DIMENSIONS = frozenset({32, 64, 128, 256, 512, 1024})
+_ENCODE_METHODS = ("encode", "encode_query", "encode_document")
+_jina_methods: dict[str, Callable[..., object]] | None = None
 
 
-class _EmbeddingMatrix(Protocol):
-    def tolist(self) -> list[list[float]]: ...
+class _Text:
+    """Keep application text out of Jina's URL/path media autodetection."""
+
+    __slots__ = ("value",)
+
+    def __init__(self, value: str) -> None:
+        self.value = value
+
+    def __str__(self) -> str:
+        return self.value
 
 
-class _SentenceEncoder(Protocol):
-    def supports(self, modality: str | tuple[str, ...]) -> bool: ...
-
-    def get_sentence_embedding_dimension(self) -> int | None: ...
-
-    def encode_query(
-        self,
-        sentences: list[object],
-        *,
-        convert_to_numpy: bool,
-        normalize_embeddings: bool,
-        truncate_dim: int | None,
-    ) -> _EmbeddingMatrix: ...
-
-    def encode_document(
-        self,
-        sentences: list[object],
-        *,
-        convert_to_numpy: bool,
-        normalize_embeddings: bool,
-        truncate_dim: int | None,
-    ) -> _EmbeddingMatrix: ...
-
-
-class _SentenceTransformerFactory(Protocol):
+class _TextEncoder(Protocol):
     def __call__(
         self,
-        model_name_or_path: str,
+        sentences: list[object],
         *,
-        revision: str | None,
-        trust_remote_code: bool,
-        device: str | None,
-        model_kwargs: dict[str, str | None] | None,
-        config_kwargs: dict[str, str | None] | None,
-    ) -> _SentenceEncoder: ...
+        batch_size: int,
+        convert_to_numpy: bool,
+        normalize_embeddings: bool,
+        truncate_dim: int | None,
+    ) -> _EmbeddingMatrix: ...
 
 
-_ABSENT = object()
-_JINA_MODALITIES = frozenset({"text", "image", "video", "audio", "message"})
-_MISSING_PROCESSOR = (
-    "the model's image and video processor did not load, so it can only embed text; "
-    "install MindBridge with the cloud-models extra"
-)
+class JinaOmniEmbedder:
+    """Deferred default backend for the pinned Jina Omni embedding model."""
 
-
-def _media_processor_missing(encoder: object) -> bool:
-    """Catch Jina's swallowed optional-dependency failure during readiness."""
-    try:
-        modules = list(iter(encoder))  # type: ignore[call-overload]
-    except TypeError:
-        return False
-    return any(getattr(module, "processor", _ABSENT) is None for module in modules)
-
-
-def _first_module(encoder: object) -> object:
-    """The input module, where SentenceTransformers keeps a model's modality metadata."""
-    try:
-        return encoder[0]  # type: ignore[index]
-    except (IndexError, KeyError, TypeError):
-        return None
-
-
-def _legacy_omni_encoder(encoder: object) -> bool:
-    """Report an encoder whose input module predates the SentenceTransformers modality API.
-
-    Jina Omni is one: it declares no `modalities`, so `supports()` -- which reads
-    `getattr(self[0], "modalities", ["text"])` -- calls it text-only, and it takes bare strings
-    and tuples rather than modality-keyed dicts. This is read off the loaded object because the
-    same weights arrive under a mirror, a local snapshot directory, or the non-retrieval
-    repository name; comparing the configured model id against one string turned every one of
-    those into a worker that started clean and then refused images at request time.
-    """
-    first = _first_module(encoder)
-    return (
-        getattr(first, "modalities", None) is None
-        and getattr(first, "processor", _ABSENT) is not _ABSENT
+    __slots__ = (
+        "_backend",
+        "_batch_size",
+        "_closed",
+        "_device",
+        "_dimension",
+        "_lock",
+        "_space_id",
     )
-
-
-class SentenceTransformersEmbedder:
-    """Async-safe SentenceTransformers query/document encoder."""
 
     def __init__(
         self,
-        encoder: _SentenceEncoder,
-        model_reference: ModelReference,
         *,
-        space_reference: EmbeddingSpaceReference = DEFAULT_EMBEDDING_SPACE,
-        dimension: int = DEFAULT_EMBEDDING_DIMENSION,
-        truncate_dim: int | None = None,
-        max_concurrency: int = 1,
+        dimension: int = DEFAULT_JINA_DIMENSION,
+        device: str | None = None,
+        batch_size: int = 32,
     ) -> None:
-        if dimension <= 0:
-            raise ValueError("dimension must be positive")
-        if max_concurrency <= 0:
-            raise ValueError("max_concurrency must be positive")
-        self._encoder = encoder
-        self._model_reference = model_reference
-        self._space_reference = space_reference
-        self._dimension = dimension
-        self._truncate_dim = truncate_dim
-        self._legacy_jina_input = _legacy_omni_encoder(encoder)
-        self._document_semaphore = asyncio.Semaphore(max_concurrency)
-        # Interactive recall must not queue behind bulk document encoding. The extra query
-        # slot costs one encode's activation memory beyond the resident-model worker guard.
-        self._query_semaphore = asyncio.Semaphore(1)
+        self._dimension = _jina_dimension(dimension)
+        self._device = _optional_text(device, "device")
+        self._batch_size = _positive_integer(batch_size, "batch_size")
+        _require_local_extra()
+        self._space_id = _recipe_space(
+            _JINA_RECIPE,
+            DEFAULT_JINA_MODEL_ID,
+            DEFAULT_JINA_REVISION,
+            self._dimension,
+        )
+        self._lock = threading.Lock()
+        self._backend: _LoadedJinaOmniEmbedder | None = None
+        self._closed = False
 
     @classmethod
     def load(
         cls,
         *,
-        model_id: str = DEFAULT_EMBEDDER_MODEL_ID,
-        revision: str | None = None,
-        trust_remote_code: bool | None = None,
+        dimension: int = DEFAULT_JINA_DIMENSION,
         device: str | None = None,
-        space_reference: EmbeddingSpaceReference = DEFAULT_EMBEDDING_SPACE,
-        dimension: int = DEFAULT_EMBEDDING_DIMENSION,
-        max_concurrency: int = 1,
-    ) -> SentenceTransformersEmbedder:
-        """Load one model and validate its vector and modality metadata."""
-        revision = embedder_revision_for(model_id, revision)
-        require_distinct_embedding_space(
-            model_id,
-            space_reference.space_id,
-            model_revision=revision,
-        )
-        trusted = (
-            model_id == DEFAULT_EMBEDDER_MODEL_ID
-            if trust_remote_code is None
-            else trust_remote_code
-        )
-        if trusted and revision is None:
-            # Opting in runs this repository's Python in every worker on every restart, so
-            # without a commit the code being executed is whatever its default branch holds
-            # that minute -- a change with no configuration change and no signal. Only the
-            # bundled model is trusted by default, and it always resolves its bundled pin.
-            raise ValueError(
-                f"trust_remote_code executes code from {model_id!r}, so it requires a pinned "
-                "model_revision"
-            )
-        try:
-            module = import_module("sentence_transformers")
-            hub_module = import_module("huggingface_hub")
-            import_module("librosa")
-        except ImportError as error:
-            raise ModelUnavailableError(
-                "install MindBridge with the cloud-models extra to load SentenceTransformers"
-            ) from error
-        sentence_transformer = cast(_SentenceTransformerFactory, module.SentenceTransformer)
-        snapshot_download = cast(Callable[..., str], hub_module.snapshot_download)
-        # Downloading the pin ourselves is what pins the weights. `revision` handed to
-        # SentenceTransformer reaches a custom module's `load` as a keyword that module is free
-        # to ignore, and the bundled one -- `load(cls, input_path, **kwargs)` -- does ignore it,
-        # leaving `from_pretrained` to resolve the bare repository id against its default
-        # branch. A local snapshot directory has no branch left to drift to. `code_revision`
-        # pins the remote code separately and has to be set on both kwargs, because
-        # `sentence_transformers` forwards one to the module and the other to the config.
-        model_path = snapshot_download(repo_id=model_id, revision=revision)
-        code_kwargs: dict[str, str | None] | None = {"code_revision": revision} if trusted else None
-        encoder = sentence_transformer(
-            model_path,
-            revision=revision,
-            trust_remote_code=trusted,
-            device=select_torch_device(device),
-            model_kwargs=code_kwargs,
-            config_kwargs=code_kwargs,
-        )
-        if _legacy_omni_encoder(encoder) and _media_processor_missing(encoder):
-            raise ModelUnavailableError(_MISSING_PROCESSOR)
-        truncate_dim = _validated_truncate_dim(encoder, dimension)
-        return cls(
-            encoder,
-            ModelReference(model_id=model_id),
-            space_reference=space_reference,
-            dimension=dimension,
-            truncate_dim=truncate_dim,
-            max_concurrency=max_concurrency,
-        )
+        batch_size: int = 32,
+    ) -> JinaOmniEmbedder:
+        """Construct the public backend and load its pinned weights immediately."""
+        backend = cls(dimension=dimension, device=device, batch_size=batch_size)
+        with backend._lock:
+            backend._ensure_loaded()
+        return backend
 
     @property
-    def space_reference(self) -> EmbeddingSpaceReference:
-        """Declare the search space this model's vectors belong to."""
-        return self._space_reference
+    def capabilities(self) -> frozenset[Modality]:
+        return _JINA_CAPABILITIES
 
-    @operation_span("mindbridge.model.embed")
-    async def embed(self, request: EmbedRequest) -> EmbedResult:
-        """Encode a query or document batch through the official task methods."""
-        is_query = request.task is EmbedTask.QUERY
-        encode = self._encoder.encode_query if is_query else self._encoder.encode_document
-        vectors = await self._encode(
-            request.inputs,
-            encode,
-            self._query_semaphore if is_query else self._document_semaphore,
-        )
-        return EmbedResult(
-            embeddings=tuple(
-                Embedding(
-                    values=vector,
-                    model_reference=self._model_reference,
-                    space_reference=self._space_reference,
-                )
-                for vector in vectors
-            )
-        )
+    @property
+    def model_id(self) -> str:
+        return DEFAULT_JINA_MODEL_ID
 
-    async def _encode(
+    @property
+    def space_id(self) -> str:
+        return self._space_id
+
+    @property
+    def dimension(self) -> int:
+        return self._dimension
+
+    def embed(
         self,
-        inputs: tuple[ModelInput, ...],
-        encode: Callable[..., _EmbeddingMatrix],
-        semaphore: asyncio.Semaphore,
+        inputs: Sequence[ModelInput],
+        task: EmbedTask = EmbedTask.DOCUMENT,
     ) -> tuple[tuple[float, ...], ...]:
-        if not inputs:
-            return ()
-        prepared = [self._model_input(item) for item in inputs]
-        set_current_span_attributes(
-            {
-                "mindbridge.model.id": self._model_reference.model_id,
-                "mindbridge.embedding.space_id": self._space_reference.space_id,
-                "mindbridge.embedding.dimension": self._dimension,
-                "mindbridge.embedding.input_count": len(inputs),
-            }
-        )
-        async with semaphore:
-            matrix = await asyncio.to_thread(
-                encode,
-                prepared,
-                convert_to_numpy=True,
-                normalize_embeddings=True,
-                truncate_dim=self._truncate_dim,
-            )
-        vectors = tuple(tuple(float(value) for value in row) for row in matrix.tolist())
-        if len(vectors) != len(inputs):
-            raise ModelOutputError("embedding batch size does not match its inputs")
-        for vector in vectors:
-            validate_embedding_vector(vector, self._dimension)
-        return vectors
+        batch, selected_task = _request(inputs, task)
+        with self._lock:
+            if self._closed:
+                raise ModelError("embedding backend is closed")
+            if not batch:
+                return ()
+            backend = self._ensure_loaded()
+        return backend.embed(batch, selected_task)
 
-    def _model_input(self, input_value: ModelInput) -> object:
-        modalities = tuple(_part_modality(part) for part in input_value.parts)
-        for modality in set(modalities):
-            if not self._supports(modality):
-                raise ModelRequestError(
-                    f"model {self._model_reference.model_id!r} does not support {modality} input"
+    def close(self) -> None:
+        """Close loaded weights without turning an unused backend into a model load."""
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            if self._backend is not None:
+                self._backend.close()
+
+    def _ensure_loaded(self) -> _LoadedJinaOmniEmbedder:
+        if self._backend is None:
+            self._backend = _load_jina(
+                dimension=self._dimension,
+                device=self._device,
+                batch_size=self._batch_size,
+            )
+        return self._backend
+
+
+class _LoadedJinaOmniEmbedder(SentenceTransformersEmbedder):
+    """Loaded Jina encoder with its legacy tuple methods isolated to one instance."""
+
+    _input_recipe = _JINA_RECIPE
+
+    def __init__(
+        self,
+        encoder: _SentenceEncoder,
+        *,
+        text_encode: _TextEncoder,
+        dimension: int,
+        batch_size: int = 32,
+    ) -> None:
+        if _media_processor_missing(encoder):
+            raise ModelError(
+                "Jina Omni's media processor is unavailable; install MindBridge with the "
+                "local extra"
+            )
+        super().__init__(
+            encoder,
+            model_id=DEFAULT_JINA_MODEL_ID,
+            revision=DEFAULT_JINA_REVISION,
+            dimension=dimension,
+            batch_size=batch_size,
+        )
+        self._text_encode = text_encode
+
+    def _discover_capabilities(self) -> frozenset[Modality]:
+        return _JINA_CAPABILITIES
+
+    def _prepare(self, value: ModelInput) -> object:
+        values = tuple(
+            _Text(part) if modality == Modality.TEXT.value else part
+            for modality, part in _parts(value)
+        )
+        return values[0] if len(values) == 1 else values
+
+    def embed(
+        self,
+        inputs: Sequence[ModelInput],
+        task: EmbedTask = EmbedTask.DOCUMENT,
+    ) -> tuple[tuple[float, ...], ...]:
+        batch, selected_task = _request(inputs, task)
+        if not batch:
+            return super().embed(batch, selected_task)
+        text = tuple((index, value) for index, value in enumerate(batch) if not value.assets)
+        media = tuple((index, value) for index, value in enumerate(batch) if value.assets)
+        vectors: dict[int, tuple[float, ...]] = {}
+        if text:
+            prefix = "Query: " if selected_task is EmbedTask.QUERY else "Document: "
+            prepared: list[object] = [{"text": prefix + value.text} for _, value in text]
+            with self._lock:
+                if self._closed:
+                    raise ModelError("embedding backend is closed")
+                try:
+                    matrix = self._text_encode(
+                        prepared,
+                        convert_to_numpy=True,
+                        normalize_embeddings=True,
+                        truncate_dim=self._truncate_dim,
+                        batch_size=self._batch_size,
+                    )
+                except Exception:
+                    raise ModelError("embedding model failed") from None
+            vectors.update(
+                zip(
+                    (index for index, _ in text),
+                    _vectors(matrix, len(text), self._dimension),
+                    strict=True,
                 )
-        values = tuple(_part_value(part) for part in input_value.parts)
-        if len(values) == 1:
-            return (
-                values[0]
-                if self._legacy_jina_input or modalities[0] == "text"
-                else {modalities[0]: values[0]}
             )
-        if self._legacy_jina_input:
-            return values
-        compound = tuple(sorted(set(modalities)))
-        if len(compound) == len(modalities) and self._supports(compound):
-            return dict(zip(modalities, values, strict=True))
-        if not self._supports("message"):
-            raise ModelRequestError(
-                f"model {self._model_reference.model_id!r} cannot combine these input parts"
+        if media:
+            media_vectors = super().embed(
+                tuple(value for _, value in media),
+                selected_task,
             )
-        return [{"role": "user", "content": [_message_part(part) for part in input_value.parts]}]
-
-    def _supports(self, modality: str | tuple[str, ...]) -> bool:
-        if self._legacy_jina_input:
-            requested = (modality,) if isinstance(modality, str) else modality
-            return all(item in _JINA_MODALITIES for item in requested)
-        return self._encoder.supports(modality)
+            vectors.update(zip((index for index, _ in media), media_vectors, strict=True))
+        return tuple(vectors[index] for index in range(len(batch)))
 
 
-# Compatibility for code that imported the original provider-specific class directly.
-JinaEmbedder = SentenceTransformersEmbedder
-
-
-class _EmbedderConfig(PluginConfigModel):
-    model_id: PluginText = DEFAULT_EMBEDDER_MODEL_ID
-    model_revision: PluginText | None = None
-    trust_remote_code: StrictBool | None = None
-    device: PluginText | None = None
-    space_id: PluginText = DEFAULT_EMBEDDING_SPACE.space_id
-    dimension: EmbeddingDimension = DEFAULT_EMBEDDING_DIMENSION
-    max_concurrency: PluginInteger = 1
-
-
-def create_embedder(config: Mapping[str, object]) -> SentenceTransformersEmbedder:
-    """Entry-point factory for local SentenceTransformers models."""
-    validated = _EmbedderConfig.model_validate(config)
-    return SentenceTransformersEmbedder.load(
-        model_id=validated.model_id,
-        revision=validated.model_revision,
-        trust_remote_code=validated.trust_remote_code,
-        device=validated.device,
-        space_reference=EmbeddingSpaceReference(space_id=validated.space_id),
-        dimension=validated.dimension,
-        max_concurrency=validated.max_concurrency,
-    )
-
-
-def _validated_truncate_dim(encoder: _SentenceEncoder, requested: int) -> int | None:
-    native = encoder.get_sentence_embedding_dimension()
-    if native is None or native <= 0:
-        raise ModelUnavailableError("the model does not declare its native embedding dimension")
-    if requested == native:
-        return None
-    trained = _model_config_value(encoder, "matryoshka_dimensions")
-    is_matryoshka = _model_config_value(encoder, "is_matryoshka")
-    if (
-        requested > native
-        or is_matryoshka is not True
-        or not isinstance(trained, (list, tuple))
-        or requested not in trained
-    ):
-        raise ModelUnavailableError(
-            f"model native dimension is {native}; requested dimension {requested} is not an "
-            "advertised Matryoshka dimension"
+def _load_jina(
+    *,
+    dimension: int,
+    device: str | None,
+    batch_size: int,
+) -> _LoadedJinaOmniEmbedder:
+    try:
+        module = import_module("sentence_transformers")
+        hub = import_module("huggingface_hub")
+        import_module("librosa")
+        factory = cast(_SentenceTransformerFactory, module.SentenceTransformer)
+        download = cast(Callable[..., str], hub.snapshot_download)
+    except (AttributeError, ImportError):
+        raise ModelError(
+            "Jina Omni is unavailable; install MindBridge with the local extra"
+        ) from None
+    try:
+        model_path = download(
+            repo_id=DEFAULT_JINA_MODEL_ID,
+            revision=DEFAULT_JINA_REVISION,
         )
-    return requested
-
-
-def _model_config_value(encoder: _SentenceEncoder, name: str) -> object:
-    first = _first_module(encoder)
-    candidates = (
-        getattr(encoder, "config", None),
-        getattr(first, "config", None),
-        getattr(getattr(first, "auto_model", None), "config", None),
-        getattr(getattr(first, "model", None), "config", None),
+        code_kwargs = {"code_revision": DEFAULT_JINA_REVISION}
+        sentence_transformer = module.SentenceTransformer
+        with _ST_LOCK:
+            original = {
+                name: cast(Callable[..., object], getattr(sentence_transformer, name))
+                for name in _ENCODE_METHODS
+            }
+            if getattr(original["encode"], "_omni_audio_patched", False):
+                raise ModelError("Sentence Transformers was modified before Jina loaded")
+            try:
+                encoder = factory(
+                    model_path,
+                    revision=DEFAULT_JINA_REVISION,
+                    trust_remote_code=True,
+                    device=device,
+                    model_kwargs=code_kwargs,
+                    config_kwargs=code_kwargs,
+                )
+                _bind_jina_methods(encoder, sentence_transformer, original)
+            finally:
+                for name, method in original.items():
+                    setattr(sentence_transformer, name, method)
+    except ModelError:
+        raise
+    except Exception:
+        raise ModelError("failed to load the pinned Jina Omni model") from None
+    text_encode = cast(_TextEncoder, MethodType(original["encode"], encoder))
+    return _LoadedJinaOmniEmbedder(
+        encoder,
+        text_encode=text_encode,
+        dimension=dimension,
+        batch_size=batch_size,
     )
-    for config in candidates:
-        for source in (config, getattr(config, "text_config", None)):
-            value = getattr(source, name, _ABSENT)
-            if value is not _ABSENT:
-                return value
-    return None
 
 
-def _part_modality(part: TextPart | MediaPart) -> str:
-    return "text" if isinstance(part, TextPart) else part.kind.value
+def _media_processor_missing(encoder: object) -> bool:
+    try:
+        first = encoder[0]  # type: ignore[index]
+    except (IndexError, KeyError, TypeError):
+        return True
+    return getattr(first, "processor", None) is None
 
 
-def _part_value(part: TextPart | MediaPart) -> str:
-    return part.text if isinstance(part, TextPart) else part.url
+def _request(
+    inputs: Sequence[ModelInput],
+    task: EmbedTask,
+) -> tuple[tuple[ModelInput, ...], EmbedTask]:
+    if isinstance(inputs, (str, bytes)):
+        raise ValidationError("inputs must be a sequence of ModelInput values")
+    try:
+        batch = tuple(inputs)
+    except TypeError:
+        raise ValidationError("inputs must be a sequence of ModelInput values") from None
+    if any(not isinstance(value, ModelInput) for value in batch):
+        raise ValidationError("inputs must be a sequence of ModelInput values")
+    try:
+        selected_task = EmbedTask(task)
+    except (TypeError, ValueError):
+        raise ValidationError("embedding task is invalid") from None
+    return batch, selected_task
 
 
-def _message_part(part: TextPart | MediaPart) -> dict[str, str]:
-    if isinstance(part, TextPart):
-        return {"type": "text", "text": part.text}
-    return {"type": part.kind.value, part.kind.value: part.url}
+def _jina_dimension(value: object) -> int:
+    dimension = _positive_integer(value, "dimension")
+    if dimension not in _JINA_DIMENSIONS:
+        choices = ", ".join(str(item) for item in sorted(_JINA_DIMENSIONS))
+        raise ValidationError(f"dimension must be one of: {choices}")
+    return dimension
+
+
+def _require_local_extra() -> None:
+    try:
+        missing = next(
+            (
+                module
+                for module in ("sentence_transformers", "huggingface_hub", "librosa")
+                if find_spec(module) is None
+            ),
+            None,
+        )
+    except (ImportError, ValueError):
+        missing = "local dependencies"
+    if missing is not None:
+        raise ModelError("Jina Omni is unavailable; install MindBridge with the local extra")
+
+
+def _bind_jina_methods(
+    encoder: _SentenceEncoder,
+    sentence_transformer: object,
+    original: dict[str, Callable[..., object]],
+) -> None:
+    global _jina_methods
+    patched = {
+        name: cast(Callable[..., object], getattr(sentence_transformer, name))
+        for name in _ENCODE_METHODS
+    }
+    if any(patched[name] is not original[name] for name in _ENCODE_METHODS):
+        _jina_methods = patched
+    if _jina_methods is None:
+        raise ModelError("the pinned Jina model did not install its embedding methods")
+    for name, method in _jina_methods.items():
+        setattr(encoder, name, MethodType(method, encoder))

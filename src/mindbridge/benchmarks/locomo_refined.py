@@ -19,31 +19,41 @@ from typing import Annotated
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, StringConstraints, TypeAdapter
 
-from mindbridge.contracts import ContractModel, Identifier, NonEmptyString
-
 LOCOMO_REFINED_ADAPTER_VERSION = "locomo_refined_v1"
 _SESSION_TIME_FORMAT = "%I:%M %p on %d %B, %Y"
-_BenchmarkSource = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+_Identifier = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=255),
+]
+_Text = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=2_048),
+]
+_Source = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 
 
-class LoCoMoRefinedTurn(ContractModel):
+class LoCoMoRefinedTurn(BaseModel):
     """One original dialogue turn retained as benchmark source memory."""
 
-    dialog_id: Identifier
-    speaker: NonEmptyString
-    text: NonEmptyString
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    dialog_id: _Identifier
+    speaker: _Text
+    text: _Text
     occurred_at: AwareDatetime
-    image_sources: tuple[_BenchmarkSource, ...] = ()
-    image_caption: NonEmptyString | None = None
+    image_sources: tuple[_Source, ...] = ()
+    image_caption: _Text | None = None
 
 
-class LoCoMoRefinedQuestion(ContractModel):
+class LoCoMoRefinedQuestion(BaseModel):
     """One official QA item with its source dialogue references."""
 
-    question_id: Identifier
-    question: NonEmptyString
-    reference_answers: tuple[NonEmptyString, ...] = Field(min_length=1)
-    evidence_dialog_ids: tuple[Identifier, ...]
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    question_id: _Identifier
+    question: _Text
+    reference_answers: tuple[_Text, ...] = Field(min_length=1)
+    evidence_dialog_ids: tuple[_Identifier, ...]
     # LoCoMo-Refined dropped LoCoMo's adversarial category 5 outright, so there is no
     # abstention protocol left to model and no four-versus-five-category ambiguity in
     # what a reported score covers.
@@ -51,16 +61,18 @@ class LoCoMoRefinedQuestion(ContractModel):
     is_multi_modality: bool
 
 
-class LoCoMoRefinedConversation(ContractModel):
+class LoCoMoRefinedConversation(BaseModel):
     """One complete long-horizon conversation and its evaluation questions."""
 
-    sample_id: Identifier
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    sample_id: _Identifier
     turns: tuple[LoCoMoRefinedTurn, ...] = Field(min_length=1)
     questions: tuple[LoCoMoRefinedQuestion, ...] = Field(min_length=1)
 
 
 class _RawTurn(BaseModel):
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="ignore", frozen=True, strict=True)
 
     speaker: str
     dia_id: str
@@ -70,7 +82,7 @@ class _RawTurn(BaseModel):
 
 
 class _RawQuestion(BaseModel):
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="ignore", frozen=True, strict=True)
 
     question: str
     # Always a list in this release; the six numeric golds ("2022", "3") are published as
@@ -82,7 +94,7 @@ class _RawQuestion(BaseModel):
 
 
 class _RawConversationRecord(BaseModel):
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="ignore", frozen=True, strict=True)
 
     sample_id: str
     conversation: dict[str, object]

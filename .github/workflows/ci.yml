@@ -3,7 +3,8 @@ name: CI
 on:
   pull_request:
   push:
-    branches: [master]
+    branches:
+      - master
 
 permissions:
   contents: read
@@ -20,25 +21,37 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # `probe` names the modules each install is responsible for, and
-          # tests/test_package.py holds these rows to the same table the declaration checks
-          # use. One module per scenario was not enough: importing `mindbridge.api.runtime`
-          # said nothing about the benchmark harness, whose own extra could not import it.
-          - name: core
+          - name: base
             requirement: .
-            probe: config_cli configuration contracts core file_integrity observe_cli prompts sdk
-          - name: edge
-            requirement: .[edge]
-            probe: edge
+            probe: >-
+              mindbridge
+              mindbridge.cli
+              mindbridge.benchmarks
+              mindbridge.benchmarks.isolation
+              mindbridge.benchmarks.local_index_benchmark
+              mindbridge.config
+              mindbridge.exceptions
+              mindbridge.infrastructure.local
+              mindbridge.memory
+              mindbridge.models.openai_http
+              mindbridge.sdk
+              mindbridge.types
           - name: server
             requirement: .[server]
-            probe: api application celery_app cli consolidation_cli consolidation_worker infrastructure jina_server jobs_cli lifecycle_cli models server telemetry worker
-          - name: benchmarks
-            requirement: .[benchmarks]
-            probe: benchmarks
-          - name: media
-            requirement: .[media]
-            probe: media
+            probe: >-
+              mindbridge.api
+              mindbridge.api.app
+              mindbridge.api.auth
+              mindbridge.api.errors
+              mindbridge.server
+          - name: local
+            requirement: .[local]
+            probe: >-
+              mindbridge.models.jina
+              mindbridge.models.sentence_transformers
+          - name: mcp
+            requirement: .[mcp]
+            probe: mindbridge.api.mcp
     steps:
       - name: Check out repository
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
@@ -54,55 +67,19 @@ jobs:
           uv venv .install-venv
           uv pip install --python .install-venv/bin/python --strict '${{ matrix.requirement }}'
 
-      - name: Import everything the install is responsible for
+      - name: Import supported modules
         env:
           PROBE: ${{ matrix.probe }}
         run: |
-          .install-venv/bin/python -I - <<'PROBE_SCRIPT'
+          .install-venv/bin/python -I - <<'PY'
           import importlib
           import os
-          import pkgutil
-          import sys
 
-          import mindbridge
-
-          wanted = tuple(f"mindbridge.{name}" for name in os.environ["PROBE"].split())
-          found = sorted(
-              name
-              # Without `onerror` the walk re-raises anything that is not an ImportError, so
-              # one package whose import reaches configuration would end this step in a
-              # traceback rather than the report below -- the opposite of what the loop decides.
-              for _, name, _ in pkgutil.walk_packages(
-                  mindbridge.__path__, "mindbridge.", onerror=lambda _name: None
-              )
-              if any(name == prefix or name.startswith(f"{prefix}.") for prefix in wanted)
-          )
-          failed = []
-          for name in found:
-              try:
-                  importlib.import_module(name)
-              except ImportError as error:
-                  failed.append(f"{name}: {error}")
-              except Exception:
-                  # Importing a module runs it, and the worker entry point builds its Celery
-                  # app from the environment as it loads. Anything that is not a missing
-                  # import is configuration, not packaging, so it is not this job's business.
-                  pass
-          if os.environ["PROBE"] == "edge":
-              for name in ("cv2", "funasr", "insightface", "numpy", "onnxruntime", "torch", "torchaudio"):
-                  try:
-                      importlib.import_module(name)
-                  except ImportError as error:
-                      failed.append(f"{name}: {error}")
-          print(f"imported {len(found) - len(failed)} of {len(found)} modules under {' '.join(wanted)}")
-          for line in failed:
-              print(f"  FAILED {line}")
-          if not found:
-              # A probe that matched nothing reports success while checking nothing, which is
-              # how a renamed module would leave this job green.
-              sys.exit("probe matched no modules")
-          sys.exit(bool(failed))
-          PROBE_SCRIPT
+          modules = os.environ["PROBE"].split()
+          for module in modules:
+              importlib.import_module(module)
+          print(f"imported {len(modules)} supported modules")
+          PY
 
   documentation:
     name: Documentation
@@ -119,18 +96,14 @@ jobs:
             !.git/**
             !.venv/**
             !.pytest_cache/**
+            !.benchmarks/**
 
-      # Substack answers CI egress with 403, so the LoCoMo audit cited in
-      # docs/benchmarks-sota.md has never been verifiable from here -- Documentation has been
-      # red since that citation landed in 818da3b. Excluding the one host keeps every other
-      # link checked; `--accept 403` would have let a genuinely forbidden URL through anywhere.
       - name: Check documentation links
         uses: lycheeverse/lychee-action@8646ba30535128ac92d33dfc9133794bfdd9b411 # v2.8.0
         with:
           args: >-
             --no-progress
             --root-dir "${{ github.workspace }}"
-            --exclude '^https://penfieldlabs\.substack\.com/'
             './*.md'
             './docs/**/*.md'
             './.github/**/*.md'
@@ -140,29 +113,15 @@ jobs:
   quality:
     name: Python ${{ matrix.python-version }}
     runs-on: ubuntu-latest
-    env:
-      MINDBRIDGE_TEST_DATABASE_URL: postgresql://mindbridge:mindbridge_test@localhost:5432/mindbridge_test
-    services:
-      postgres:
-        image: pgvector/pgvector:0.8.2-pg18-trixie
-        env:
-          POSTGRES_DB: mindbridge_test
-          POSTGRES_USER: mindbridge
-          POSTGRES_PASSWORD: mindbridge_test
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U mindbridge -d mindbridge_test"
-          --health-interval 2s
-          --health-timeout 3s
-          --health-retries 20
     strategy:
       fail-fast: false
       matrix:
-        # Every supported version, floor to ceiling. Each leg runs mypy as well as the tests,
-        # which is what replaces the `python_version` pin the mypy configuration used to carry.
-        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
-
+        python-version:
+          - "3.10"
+          - "3.11"
+          - "3.12"
+          - "3.13"
+          - "3.14"
     steps:
       - name: Check out repository
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
@@ -174,7 +133,7 @@ jobs:
           enable-cache: true
 
       - name: Install locked dependencies
-        run: uv sync --frozen --all-groups --extra media --extra server
+        run: uv sync --frozen --all-groups --all-extras
 
       - name: Check formatting
         run: uv run --frozen ruff format --check .

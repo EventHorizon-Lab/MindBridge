@@ -1,34 +1,57 @@
-"""Public model capabilities and plugin discovery."""
+"""Model contracts and optional local embedding and speech adapters."""
 
-from mindbridge.application.capabilities import (
-    Embedder,
-    Embedding,
-    EmbedRequest,
-    EmbedResult,
+from mindbridge.models.base import (
+    EmbeddingBackend,
     EmbedTask,
-    GenerateRequest,
-    GenerateResult,
-    Generator,
-    InputPart,
-    MediaPart,
+    ModelBackend,
+    ModelCapabilities,
     ModelInput,
-    TextPart,
+    SpeakerEmbedding,
+    SpeechAnalysis,
+    SpeechBackend,
+    SpeechTurn,
 )
-from mindbridge.models.plugins import load_embedder, load_generator
+from mindbridge.models.funasr import (
+    DEFAULT_FUNASR_MODEL_ID,
+    DEFAULT_FUNASR_MODEL_REVISION,
+    DEFAULT_FUNASR_RECIPE,
+    DEFAULT_FUNASR_SPEAKER_MODEL_ID,
+    DEFAULT_FUNASR_SPEAKER_REVISION,
+    DEFAULT_FUNASR_VAD_MODEL_ID,
+    DEFAULT_FUNASR_VAD_REVISION,
+    FunASRRecipe,
+    FunASRTranscriber,
+)
+from mindbridge.models.jina import (
+    DEFAULT_JINA_DIMENSION,
+    DEFAULT_JINA_MODEL_ID,
+    DEFAULT_JINA_REVISION,
+    JinaOmniEmbedder,
+)
+from mindbridge.models.sentence_transformers import SentenceTransformersEmbedder
 
 __all__ = [
-    "EmbedRequest",
-    "EmbedResult",
+    "DEFAULT_FUNASR_MODEL_ID",
+    "DEFAULT_FUNASR_MODEL_REVISION",
+    "DEFAULT_FUNASR_RECIPE",
+    "DEFAULT_FUNASR_SPEAKER_MODEL_ID",
+    "DEFAULT_FUNASR_SPEAKER_REVISION",
+    "DEFAULT_FUNASR_VAD_MODEL_ID",
+    "DEFAULT_FUNASR_VAD_REVISION",
+    "DEFAULT_JINA_DIMENSION",
+    "DEFAULT_JINA_MODEL_ID",
+    "DEFAULT_JINA_REVISION",
     "EmbedTask",
-    "Embedder",
-    "Embedding",
-    "GenerateRequest",
-    "GenerateResult",
-    "Generator",
-    "InputPart",
-    "MediaPart",
+    "EmbeddingBackend",
+    "FunASRRecipe",
+    "FunASRTranscriber",
+    "JinaOmniEmbedder",
+    "ModelBackend",
+    "ModelCapabilities",
     "ModelInput",
-    "TextPart",
-    "load_embedder",
-    "load_generator",
+    "SentenceTransformersEmbedder",
+    "SpeakerEmbedding",
+    "SpeechAnalysis",
+    "SpeechBackend",
+    "SpeechTurn",
 ]

@@ -1,376 +1,173 @@
 # Troubleshooting
 
-Symptoms, what they actually indicate, and what to do. Most MindBridge failures are loud on
-purpose — a refusal at startup is preferred over a degraded service that looks healthy.
+Start with the public exception or REST/MCP error code, then inspect the matching boundary.
+MindBridge fails early rather than opening unsafe durable state or silently dropping media.
 
-## The server will not start
+## Data directory is already in use
 
-Startup validates configuration eagerly. Each refusal below is a deliberate gate.
+Symptom: constructing `Memory` raises `StorageError` saying the directory is already in use.
 
-### `MINDBRIDGE_TENANT_API_KEYS_JSON must be configured for the REST API`
+1. Resolve `data_dir` to an absolute path and inspect every process or test fixture.
+2. Close the existing `Memory` before opening another owner.
+3. Give concurrent applications and benchmark cases different directories.
+4. Do not delete `.mindbridge.lock` while an owner may still run.
 
-There is no anonymous mode. Set the variable, mapping each tenant to a list of keys:
+The file can remain after shutdown. Ownership is the operating-system lock, not file presence.
 
-```bash
-export MINDBRIDGE_TENANT_API_KEYS_JSON='{"tenant_01":["at-least-32-random-characters"]}'
-```
+## Store metadata mismatch
 
-### `API keys must be strings of at least 32 characters`
+Symptom: startup raises `StorageError` mentioning an embedding, transcription, or index metadata
+key.
 
-Keys shorter than 32 characters are rejected at startup rather than at first request.
-`openssl rand -hex 24` produces 48.
+The active embedding model, vector-space ID, dimension, transcription space, or index recipe
+differs from the values that created the store. Restore the original configuration, or create a new
+directory and re-ingest. Editing SQLite metadata would mix incompatible vectors or transcripts and
+is unsupported.
 
-### `<VARIABLE> must be configured`
+Local adapters derive a new `space_id` when adapter, model, immutable revision, dimension, or input
+recipe changes. Use that adapter with a new data directory and re-encode source content. For an
+explicit combined HTTP backend, set a new `MINDBRIDGE_EMBEDDING_SPACE` as well.
+Likewise, change `MINDBRIDGE_TRANSCRIPTION_SPACE` and use a new directory whenever the ASR model,
+preprocessing, language, prompt, or decoding recipe can change transcript text. Do not reuse one
+directory merely because the transcription endpoint accepts the new model.
 
-A required variable is missing or blank. Blank counts as missing — an empty string is not a
-value. See [configuration](configuration.md#which-process-reads-what) for what each process
-requires.
+## Unsupported SQLite schema
 
-### `<VARIABLE> must contain valid JSON` / `must contain a JSON object with non-empty keys`
+Symptom: startup reports an unsupported version, unversioned schema, or missing tables.
 
-A `*_CONFIG_JSON` value is malformed. These variables replace a whole `mindbridge.toml` section
-and are rarely the easier way to write one — a section in the file needs no shell quoting at all.
-If you do set one, check it parses before starting anything:
+Confirm the path belongs to this MindBridge release and was not pointed at an unrelated SQLite
+database. Restore a known-good complete backup. Do not edit `PRAGMA user_version` or manually
+create tables. The supported v1 and v2 local-schema migrations run automatically; old PostgreSQL data
+does not.
 
-```bash
-python -c "import json,os;json.loads(os.environ['MINDBRIDGE_GENERATOR_CONFIG_JSON'])"
-```
+## Model operation failed
 
-A malformed `mindbridge.toml` reports its own parse position instead, and
-`mindbridge config check --role <role>` surfaces either failure before a process starts.
+Python raises `ModelError`; REST returns 502; MCP returns `model_error`.
 
-### `Extra inputs are not permitted` on a plugin config
+Check the failing operation independently:
 
-Plugin configs use `extra="forbid"`. An unrecognized key fails startup rather than being ignored,
-because "that setting had no effect" is a much worse outcome to debug than a failed boot. Check
-the key against the plugin's documented fields.
+| Operation | URL/key variables | Route |
+| --- | --- | --- |
+| Default embedding | local Sentence Transformers runtime | `encode_query` / `encode_document` |
+| Combined HTTP embedding | `MINDBRIDGE_EMBEDDING_*` | `/v1/embeddings` |
+| Generation | `MINDBRIDGE_GENERATION_*` | `/v1/chat/completions` |
+| Transcription | `MINDBRIDGE_TRANSCRIPTION_*` | `/v1/audio/transcriptions` |
 
-Names retired by migration `0021` are the exception: `model_revision`, `space_revision`, and
-`association_model_revision` are ignored rather than refused, because removing a field is not the
-same as forbidding it and an operator's object written for the previous release still has to load.
-A typo is still a failed boot.
+HTTP operation-specific variables fall back to `OPENAI_API_KEY` and `OPENAI_BASE_URL`. For local
+embedding, confirm `mindbridge[local]` is installed, the immutable model revision is available,
+device memory is sufficient, media decoders are installed, and the requested dimension is native
+or advertised as Matryoshka-trained. All backends must return one finite vector of the declared
+dimension per input.
 
-One of those names went on meaning something, so do **not** delete it blindly. The local Jina
-encoder declares `model_revision`, where it pins the commit `snapshot_download` resolves and
-therefore which remote code runs under `trust_remote_code=True`. Dropping it from
-`MINDBRIDGE_MEDIA_EMBEDDER_CONFIG_JSON` replaces your pin with the bundled default. Delete
-`space_revision`, which nothing reads; keep `model_revision` where the local encoder is the plugin.
+MindBridge sanitizes provider response bodies and credentials. Reproduce the request directly
+against a non-production endpoint when provider diagnostics are required.
 
-### `embedding dimension must be one of 32, 64, 128, 256, 512, 768, 1024`
+If the error says inline model media exceeds 64 MiB, the aggregate raw media for one built-in
+embedding or generation call exceeded the `data` transport boundary. A large video should use
+`file` transport with a trusted co-located backend, or a custom backend that streams/uploads files.
+Splitting it into multiple memories changes retrieval semantics and is not an automatic feature.
 
-`MINDBRIDGE_EMBEDDING_DIMENSION` accepts only widths Jina v5 was trained to truncate to. Any other
-value is an untrained truncation that silently degrades recall quality.
+## Configured model does not support a modality
 
-### Startup refuses, naming stranded object types
+Symptom: `ModelError` says embedding, generation, or transcription does not support an input
+modality.
 
-The embedding-space probe found a tenant holding vectors the configured space cannot reach. This
-is the guard that stops a changed embedder from turning every recall into an empty result.
+The generic Sentence Transformers adapter discovers embedding support from the model; it cannot be
+enabled with an environment variable. For HTTP generation/transcription or a combined HTTP
+embedding backend, capability lists describe the endpoint rather than enabling a model feature.
 
-Either restore the previous `MINDBRIDGE_EMBEDDING_SPACE_ID` / `_DIMENSION`, or
-complete the re-embedding. Vectors in several spaces are accepted **while** a migration is in
-progress, so a partial rebuild is not itself the problem.
+Audio fallback requires transcription support. When embedding/generation lacks audio, MindBridge
+uses transcript text and retains supported image/video parts. It will not remove an unsupported
+image or video to force a fallback. Choose a VLM/omni backend or a different input.
 
-The probe reports each object type separately — memory records the API wrote and evidence, events,
-and claims the worker wrote can be stranded independently, which usually points at the worker's
-embedder configuration having drifted from the API's.
+## Remote media URL is rejected
 
-## Recall returns nothing
+Check all of these conditions:
 
-### Nothing has been derived yet
+- The URL uses HTTPS and has no credentials or fragment.
+- Its exact hostname is listed in `MINDBRIDGE_ALLOWED_URL_HOSTS`.
+- Every redirect remains on an allowed hostname.
+- DNS resolves only to public addresses.
+- The connection can reach the validated public IP while using the original hostname for TLS SNI.
+- Response `Content-Type` exactly matches a concrete MIME hint, or matches the requested media
+  family when using `image/*`, `video/*`, or `audio/*`.
+- Content length and streamed bytes remain within the ingestion limit.
 
-`observe()` returns before memory exists. Check the job:
+The default host allowlist is empty. `localhost`, private IPs, link-local addresses, wildcard
+hosts, and `file:` URLs are intentionally rejected. Prefer Python `Path` for local media.
 
-```bash
-curl -s "localhost:8000/v1/jobs/$JOB_ID?tenant_id=tenant_01" -H "Authorization: Bearer $KEY"
-```
+## Local media is rejected or missing
 
-`pending` means the worker has not claimed it — is the worker running, and pointed at the same
-broker? `running` means wait. `succeeded` carries `memory_ids`; read those directly instead of
-searching for what was just written.
+`Path` must identify a regular readable file. MindBridge avoids following a final symlink where the
+platform supports that open flag. If MIME type cannot be inferred from a common suffix, use
+`Blob(data, media_type, name)` or `URL` with an explicit media type.
 
-### The time filter excluded it
+After ingestion, records refer to the immutable copy under `data_dir/assets`, not the source path.
+If a returned record exists but its CAS file is missing or has the wrong size, restore the complete
+data directory from backup. Reindex cannot reconstruct original media bytes.
 
-`occurred_before` is **exclusive** while `occurred_after` is inclusive. A memory occurring exactly
-at `occurred_before` is excluded. This is the single most common off-by-one here.
+If identical bytes were added under different filenames, seeing the first authoritative non-empty
+CAS name on every returned reference is expected. Names belong to the digest, not to each memory;
+use record text or metadata for per-memory labels.
 
-Also check that `occurred_at` means what you think: it is when the content is *about*, not when it
-was written.
+On POSIX, startup forces the top-level `data_dir` mode to `0700`. If a group account loses access,
+run the service under the owning account or choose a correctly owned directory; do not depend on a
+group-writable shared store.
 
-### `memory_ids` scoped it away
+## Index unavailable
 
-`memory_ids` is a strict scope, not a ranking hint. If it is set, nothing outside that set is
-searched.
+Python raises `IndexUnavailableError`; REST returns 503.
 
-### The similarity floor is too high
+Confirm the process can write `data_dir/zvec`, the filesystem has free space, and no other process
+owns the directory. If derived state is damaged:
 
-`MINDBRIDGE_MINIMUM_EMBEDDING_SIMILARITY` defaults to 0.0 for good reason: a floor discards
-candidates that a graph hop or a lexical match would have rescued. It also binds the dense channel
-only, so a floored text query still returns whatever shares a word with the question. Lowering it
-back is the right move on a densely covered corpus and the wrong one on a long-horizon sparse
-deployment, where returning fewer rows is the point — see
-[Configuration](configuration.md) for which shape yours is.
+1. Stop MindBridge.
+2. Back up the complete data directory, including SQLite and assets.
+3. Move `zvec/` aside; do not alter SQLite or `assets/`.
+4. Start MindBridge once and allow bounded rebuild from stored embeddings.
+5. Verify known text and media searches before discarding the old index copy.
 
-### The memory was compressed or cooled
+Do not remove `zvec/` while an instance is running.
 
-Check `state` on records you expect. A `compressed` memory has dropped its rebuildable clips.
-Review your `--compress-below` and `--age-decay-weight` settings — see
-[operations](operations.md#lifecycle).
+## Add raised after the model succeeded
 
-### Vectors are in a different space
+An add can commit authoritative SQLite/CAS state and then fail while flushing Zvec. The call raises
+because the record is not yet searchable, but its ID and embedding remain durable. Repair the index
+condition and retry the same logical input. Pending work is replayed without another historical
+embedding call.
 
-If the API starts but recall is empty across the board, and the startup probe passed, confirm the
-worker writes into the space the API queries. The worker compares its own two slots and fails a
-job on mismatch, but it cannot detect that both of its slots disagree with the API's.
+## A deleted result appears in Zvec
 
-## Answers are wrong or unsupported
+Public search hydrates candidates from SQLite and drops stale IDs, so a deleted record must not be
+returned even if derived state is temporarily stale. If it appears through the public API, capture
+a minimal reproduction and MindBridge version; do not query Zvec directly as a product read path.
 
-### `answer` is null
+## Invalid cursor
 
-Abstention is a result, not a failure. MindBridge returns null when nothing supports an answer.
-Check `memories` — if it is empty, the problem is retrieval; if it is populated but `answer` is
-null, the evidence did not support a conclusion.
+List cursors are opaque keyset values. Pass `Page.next_cursor` back unchanged. A trimmed, decoded,
+re-encoded, or constructed cursor raises `ValidationError` or REST 422.
 
-Do not tune abstention thresholds by reflex. When this was last investigated, abstention tracked
-evidence availability closely — far higher when no evidence had been retrieved than when it had —
-and confidence was monotonically calibrated. The bottleneck was retrieval coverage, not the
-threshold. Check which of the two you actually have before changing anything: count how often
-`memories` comes back empty.
+## REST request fails before reaching Memory
 
-### Confidence is high but the answer is wrong
+- `401 authentication_error`: send `Authorization: Bearer <MINDBRIDGE_API_KEY>`.
+- `413 request_too_large`: keep JSON below 8 MiB or ingest large media through Python `Path` or an
+  allowed HTTPS URL. The later built-in `data` model call still has a separate 64 MiB raw aggregate
+  ceiling.
+- `422 validation_error`: inspect `issues`; local paths, unknown fields, ambiguous media sources,
+  invalid base64, and naive datetimes are rejected.
 
-Pull the evidence. `RecallResult.evidence` carries a signed URL to media covering the cited
-`start_ms`–`end_ms` span: normally a clip derived for that span, whose own timeline starts at
-zero and which may run wider than the cited range, and otherwise the whole source object. Play
-it from the start rather than seeking to `start_ms`, and it tells you immediately whether
-retrieval or perception failed — which is the entire reason evidence is attached rather than
-referenced.
+The inbound service key is not a model provider key. `/healthz` requires neither.
 
-Then record it, so the lifecycle layer learns:
+## Multiple server workers fail
 
-```python
-await memory.record_feedback(
-    FeedbackRequest(
-        tenant_id="tenant_01",
-        feedback_type=FeedbackType.CORRECTION,
-        memory_id=wrong_memory_id,
-        correction_summary="What it should have said.",
-    )
-)
-```
+Run exactly one Uvicorn/Gunicorn process for a data directory. Separate processes cannot share the
+embedded Zvec/CAS boundary. See [deployment](deployment.md#why-one-worker-is-mandatory).
 
-### Duplicate people in results
+## Ask has no useful evidence
 
-Perception names what it sees once per clip, so the same person accumulates a fresh name per clip.
-Run entity resolution — see [operations](operations.md#entity-resolution). Note that verdicts are
-pairwise and never composed, so A=B and B=C does not merge A and C.
+Inspect `AnswerResult.hits` or REST/MCP `hits`. Confirm relevant memories were stored, the query
+capabilities match its modality, and the embedding space is correct. Then improve the input text or
+media. There is no server-side metadata filter, chunking control, per-asset vector, or reranker to
+tune in the current release.
 
-## Jobs fail or stall
-
-### `state: failed`
-
-`failed` settles the **attempt**, not the job. The stale-job sweep can retry it. Read `error_code`
-and `attempt`.
-
-| `error_code` | Meaning |
-| --- | --- |
-| `model_unavailable` | The generator or embedder endpoint is down. |
-| `model_output_invalid` | The model returned something unusable. Persistent means it drifted off contract. |
-| `object_storage_unavailable` | Media could not be read. Check the URI, credentials, and endpoint. |
-| `memory_integrity_failed` | Stored state is inconsistent. Investigate; this should be zero. |
-
-### An edge device still sends `model_revision` inside `identity_observations`
-
-Nothing to do. A device older than migration `0021` still sends the field, and the server ignores
-it: the three names that migration retired are dropped before validation rather than refused, so a
-rolling upgrade that moves the server first does not 422 the fleet behind it. The field has no
-replacement — `model_id` alone records which edge model produced a span — so upgrading the device
-changes nothing observable and is not urgent.
-
-A device sending some *other* unknown field still gets `request_validation_failed`, which is the
-strictness this exemption is deliberately narrow to preserve.
-
-### `task_broker_unavailable` on observe
-
-Redis is unreachable from the API. Nothing is half-written — the transaction and the enqueue are
-ordered so a broker failure rejects the request outright.
-
-### The same observation is retried until it gives up
-
-The task budget expired mid-model-call. A soft-limit overrun is retried as though it were
-transient, so an observation that legitimately needs longer never finishes — it repeats the same
-generator call, paying for each one, until the retries run out. Nothing is written either way.
-
-Raise `request_timeout_seconds` in the `[generator]` section of `mindbridge.toml`; the
-worker's Celery limits are derived from it and follow automatically. A complete
-`MINDBRIDGE_GENERATOR_CONFIG_JSON` object remains available for fileless deployments.
-
-### Jobs stay `pending`
-
-Three different causes, and they are told apart by the queue rather than by the rows.
-
-**The worker is reading only some of the observation queues.** Observations are sharded across
-`mindbridge` and `mindbridge.0` … `mindbridge.7`, and a worker started with no `-Q` reads all of
-them. A worker narrowed to `-Q mindbridge` reads only the pre-shard queue, so everything published
-to a shard has no consumer — the publish succeeds and the row sits `pending` with nothing wrong
-anywhere. The worker now **refuses to start** in that configuration rather than running half-blind,
-so this shows up as a boot failure naming the unread queues; if you are looking at an older worker,
-drop the `-Q`.
-
-**The worker is not consuming at all.** Check it is running, points at the same
-`MINDBRIDGE_TASK_BROKER_URL`, and is installed with the extras it actually needs:
-`--extra server --extra media` at minimum. `media` carries the PyAV, Pillow, and SoundFile
-decoders that cut evidence clips, which the worker does whatever its embedder slots say — without
-it the process starts fine and fails the first observation that carries media. Add
-`--extra cloud-models` only for an in-process encoder, which brings `media` with it.
-
-**Or the message is gone and the row is not.** `task_acks_late=True` acks a message the moment its
-task raises, so any exception outside the worker's `autoretry_for` discards the message while the
-row stays claimable. The row will sit `pending` forever because nothing will tell a worker about it
-again. The tell is a non-zero `claimable` beside an empty `queue_depth`:
-
-```bash
-mindbridge jobs --tenant-id tenant_01
-mindbridge jobs --tenant-id tenant_01 --republish
-```
-
-Reporting is the default because each republished message runs a generator. See
-[operations](operations.md#job-ledger-reconciliation).
-
-### `TypeError: 'NoneType' object is not callable` on the first frame
-
-Torchvision is missing. Jina Omni's image and video processor is a Qwen3-VL processor that refuses
-to construct without it, and the upstream loader swallows that `ImportError` and leaves the
-processor unset — so the model loads, embeds text happily, and dies on the first frame it is given.
-
-MindBridge now detects the empty processor slot and says so instead. Install the extra, which
-pins compatible Torch and Torchvision releases together:
-
-```bash
-uv sync --extra server --extra cloud-models
-```
-
-Do not install a second Torchvision by hand; that can replace the pinned release while leaving
-Torch unchanged.
-
-### The worker fails every media job
-
-The two embedder slots resolved to different embedding spaces. The worker compares them before
-processing and fails rather than writing media and text vectors that cannot be compared. Align
-`MINDBRIDGE_MEDIA_EMBEDDER_*` and `MINDBRIDGE_EMBEDDER_*` on one space.
-
-## Performance
-
-### Recalls are slow
-
-Use `mode="search"` where you do not need a generated answer. It skips the generator entirely and
-is substantially cheaper.
-
-Measure time to first token rather than wall clock. They diverge a lot here, and wall clock will
-mislead you about what a user experiences.
-
-### Connection pool exhaustion
-
-One recall peaks near ten PostgreSQL connections. `MINDBRIDGE_DATABASE_MAX_POOL_SIZE` defaults to
-32 and is read by **every** process that opens a pool — four processes at 32 ask for 128 against a
-default `max_connections` of 100. Size it across your whole deployment, not per process.
-
-### Ingest is too expensive
-
-Frame rate sets the entire video write cost: one clip cut, one encoder call, and one stored object
-per sampled window. Lower `frames_per_second` in the `[media_sampling]` section of
-`mindbridge.toml` first.
-
-Raising the frame rate no longer trades the generation proxy away. It used to: past about forty
-sampled frames the encode failed on the flush that drains the encoder, and a budget of forty frames
-skipped any span over it, so above roughly 1.3 fps at 30-second segments the proxy silently stopped
-working. The crash was documented in turn as the MP4 muxer refusing to interleave a sparse video
-track with continuous audio and then as unidentified; it was neither — the encoder was being handed
-timestamps in two different units. That is fixed and the budget is gone with it, so the only reason
-left to lower the frame rate is the cost above.
-
-If your generator ignores audio, `proxy_audio: false` is still worth setting — it is a smaller
-file to encode and transfer, just not a longer one.
-
-### Consolidation is expensive
-
-Entity resolution is why: it opens media and spends a generator call per candidate pair. Split the
-cadence with `--skip-entity-resolution` on frequent runs. See
-[operations](operations.md#entity-resolution).
-
-## Deletion
-
-### `propagation_state` is not `complete`
-
-`complete` means central PostgreSQL and object-storage deletion finished. `propagating` is normal
-briefly. `failed` carries an `error_code`, usually object storage being unreachable — the
-tombstone is marked failed and the error re-raised rather than swallowed.
-
-### An offline device still holds deleted content
-
-Central `complete` does not acknowledge an offline device. Deletion reconciles when that device
-runs `mindbridge edge sync --tenant-id`, which pulls tombstones before submitting. Cache rows are
-removed **before** the cursor advances, so an interruption re-processes rather than skips.
-
-### A restore reintroduced deleted content
-
-Expected, and the reason tombstones are content-free and outlive the content. Reconcile the
-restored data against the tombstone list. Rehearse this before you need it — see
-[operations](operations.md#drills-worth-rehearsing).
-
-## Development
-
-### Tests pass but never touched PostgreSQL
-
-Without `MINDBRIDGE_TEST_DATABASE_URL` the whole integration suite — Golden Recall included —
-skips silently. A green run may have exercised nothing.
-
-```bash
-export MINDBRIDGE_TEST_DATABASE_URL=postgresql://mindbridge:mindbridge@localhost:5432/mindbridge_test
-MINDBRIDGE_REQUIRE_INTEGRATION=1 uv run pytest -W error
-```
-
-With `MINDBRIDGE_REQUIRE_INTEGRATION=1`, a missing database fails the run instead of skipping it.
-
-### The test fixture refuses to rebuild the database
-
-Its name must end in `_test`. This guard exists to stop a mistyped DSN from dropping a real
-database.
-
-### A CLI failure prints one line and no traceback
-
-That is the contract. Set `MINDBRIDGE_TRACEBACK=1` to get the frames back.
-
-### A command says an extra is missing
-
-```bash
-uv sync --extra server   # or edge, media, cloud-models
-```
-
-The import happens inside the same guard as the run, so a missing extra fails the way an
-incomplete environment does — including for `--help` — instead of printing frames from a
-third-party package.
-
-## Reading the logs
-
-Every process writes structured records to stderr with no collector needed, so the first place to
-look is the process output rather than a dashboard:
-
-```bash
-MINDBRIDGE_LOG_FORMAT=text MINDBRIDGE_LOG_LEVEL=DEBUG mindbridge mcp
-```
-
-Each instrumented operation logs its own `duration_ms` and `outcome` on completion, and every
-record carries `trace_id` when a span is active — so the ID from a failing response greps
-straight to the operations behind it. Four warnings name conditions that are otherwise invisible
-in a deployment that looks healthy: a structured-output retry, a silently downgraded generation
-proxy, a transient database failure with its SQLSTATE, and a provider error with its status code.
-[Operations](operations.md) lists them.
-
-To find where a slow run spends its time, set `MINDBRIDGE_TIMING_SUMMARY=1` and read the ranked
-per-operation summary at exit. `mindbridge-bench` prints it for every run without the variable.
-
-## Getting help
-
-Include the `trace_id` from the failing response. It maps directly onto the OTLP backend and
-identifies the whole request, and it appears in the logs above, so timings and span attributes
-are both reachable from it. None of it contains user content.
+For backup and recovery, see [operations](operations.md).

@@ -1,222 +1,329 @@
-# Quickstart
+# Quick start
 
-A local MindBridge that accepts writes and answers recalls, in about fifteen minutes. This path
-uses explicit `remember()` writes; ingesting real audio and video additionally needs the memory
-worker, which is covered in [deployment](deployment.md).
+This guide takes a clean Python project from installation to durable multimodal retrieval.
+MindBridge runs in your process. Embedding and speech analysis are local by default; generation
+may use a configured remote endpoint.
 
-## Before you start
+## Requirements
 
-| Requirement | Why |
-| --- | --- |
-| Python 3.10 – 3.14 | 3.10 is the floor because JetPack, RDK, and RKNN edge images still ship it. |
-| [uv](https://docs.astral.sh/uv/) | The lockfile is authoritative; `pip` will not reproduce it. |
-| Docker with Compose | Runs the pinned PostgreSQL 18 + pgvector and Redis. |
-| An OpenAI-compatible **generator** endpoint | Answers recalls and judges consolidation candidates. |
-| An OpenAI-compatible **embedder** endpoint | Encodes queries, text, and — if you ingest media — images, video, and audio. Must serve Jina v5 Omni or another model at the dimension you configure. |
-| S3-compatible object storage | Holds evidence media. MinIO is fine locally; AWS S3 needs no endpoint URL. |
+- Python 3.10 through 3.14.
+- A writable local directory.
+- The `local` extra for default Jina v5 Omni embedding and FunASR speech analysis.
+- An OpenAI-compatible endpoint only when the workload uses `ask`.
 
-MindBridge loads no model in-process on the API path. Both model slots are remote endpoints you
-point it at, so this quickstart needs somewhere to point.
+Text needs embeddings for `add` and `search`, plus generation for `ask`.
 
-You can serve the reference embedder with the bundled SentenceTransformers service. In a separate
-environment on the GPU host:
+## Install
+
+With `uv`:
 
 ```bash
-uv sync --extra server --extra cloud-models
-export MINDBRIDGE_EMBEDDER_API_KEY=replace-with-at-least-32-random-characters
-uv run --extra server --extra cloud-models mindbridge sentence-transformers serve \
-  --host 0.0.0.0 \
-  --media-origin http://localhost:9000
+uv add "mindbridge[local]"
 ```
 
-## 1. Install
+Or with `pip`:
 
 ```bash
-git clone https://github.com/EventHorizon-Lab/MindBridge.git
-cd MindBridge
-uv sync --extra server
+python -m pip install "mindbridge[local]"
 ```
 
-`--extra server` pulls FastAPI, psycopg, Celery, and the MCP server. It deliberately excludes
-`cloud-models`, which carries torch — the API does not need it.
-
-## 2. Start the datastores
+Set the shared model credential when using grounded generation:
 
 ```bash
-docker compose up -d postgres redis
+export OPENAI_API_KEY="your-api-key"
 ```
 
-The compose file pins `pgvector/pgvector:0.8.2-pg18-trixie`, the development version exercised
-by CI and the migrations. Current retrieval scans vectors exactly within one tenant; migration
-`0018` records when and how to restore HNSW for a tenant large enough to need it.
+Install the base `mindbridge` package without `local` only when injecting cloud embedding and
+transcription backends.
 
-## 3. Apply the migrations
+## Create a text memory
 
-Numbered SQL, applied in order, to a fresh database:
+The shortest valid program is:
+
+```python
+from mindbridge import Memory
+
+with Memory() as memory:
+    memory.add("The design review starts at 14:00 UTC.")
+    print(memory.search("When is the design review?"))
+```
+
+`Memory()` creates `.mindbridge/` in the current working directory. Production code should choose
+the path explicitly:
+
+```python
+from mindbridge import Memory
+
+with Memory(data_dir="./data/product-assistant") as memory:
+    record = memory.add(
+        "Nora prefers weekly summaries on Friday.",
+        metadata={"source": "preferences"},
+    )
+    print(record.id, record.modality)
+```
+
+## Add media
+
+The default Jina embedder accepts text, image, video, and audio natively. Before calling `ask`,
+declare capabilities that match the generator. Local FunASR handles audio fallback:
 
 ```bash
-for migration in migrations/*.sql; do
-  docker compose exec -T postgres psql -v ON_ERROR_STOP=1 -U mindbridge -d mindbridge < "$migration"
-done
+export MINDBRIDGE_GENERATION_MODALITIES=text,image,video
+export MINDBRIDGE_ALLOWED_URL_HOSTS=media.example
 ```
 
-Migration `0005` is the one to understand before you deviate: it creates a non-login
-`mindbridge_runtime` role and turns on **forced** row-level security for every table carrying a
-`tenant_id`. Each store transaction sets one tenant locally. If your migration user and your API
-login differ, grant `mindbridge_runtime` to the API login — and never give that login
-`SUPERUSER` or `BYPASSRLS`, which would silently disable tenant isolation.
+Python has five content atoms:
 
-## 4. Configure the server
+```python
+from pathlib import Path
 
-Copy the credential template:
+from mindbridge import AssetRef, Blob, URL
 
-```bash
-cp .env.example .env
+text = "The prototype shown during the review"
+local_file = Path("./prototype.png")
+inline_file = Blob(
+    Path("./review.wav").read_bytes(),
+    media_type="audio/wav",
+    name="review.wav",
+)
+remote_file = URL("https://media.example/demo.mp4", media_type="video/mp4")
+existing_file = AssetRef(id="0" * 64)  # Replace with record.assets[n].id.
 ```
 
-Fill in the two API keys and generate a tenant key:
+`Path` is copied into the local content-addressed asset store; changing or deleting the source
+file later does not change the memory. `Blob` requires non-empty bytes and a concrete image,
+video, or audio MIME type. `URL` requires HTTPS and an expected MIME type; redirects and the
+downloaded `Content-Type` are validated before storage, and each connection is pinned to a verified
+public DNS result. An `AssetRef` is resolved only inside the same `data_dir` and fails if its ID or
+optional modality hint does not match SQLite.
 
-```bash
-openssl rand -hex 24
+Pass one atom or an ordered sequence to `add`:
+
+```python
+record = memory.add(
+    [
+        "The prototype shown during the review",
+        Path("./prototype.png"),
+        Blob(
+            Path("./review.wav").read_bytes(),
+            media_type="audio/wav",
+            name="review.wav",
+        ),
+    ]
+)
+
+print(record.content)
+print(record.modality)  # Modality.OMNI: image + audio
+print(record.assets[0].id)
 ```
 
-Everything that is not a credential is already in the committed `mindbridge.toml` — endpoints,
-model IDs, the embedding space, and the pool size. Edit that file rather than
-exporting variables. Its `[generator]` and `[embedder]` endpoints point at localhost; change
-them to wherever you serve those models.
+Atom order contributes to stable memory identity, and `record.assets` preserves media order. Text
+parts are joined in order for the aggregate model input. A record with no media is `text`; a record
+with one media family is `image`, `video`, or `audio`, even when it also has text; two or more media
+families produce `omni`. Identical media bytes share one CAS descriptor, including its first
+authoritative non-empty name; filenames are not per-memory labels.
 
-Two things bite first-time users:
+## Retrieve and answer across modalities
 
-- **API keys must be at least 32 characters.** A shorter one fails at startup, not at the first
-  request. `openssl rand -hex 24` gives 48.
-- **`MINDBRIDGE_TENANT_API_KEYS_JSON` is required.** The REST factory refuses to build without
-  it. There is no anonymous mode; only `/healthz` is public.
+`search` and `ask` accept the same content values:
 
-Boto3's own chain resolves S3 credentials and region. MindBridge holds no copy of either, so
-`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and `AWS_DEFAULT_REGION` work exactly as they do
-for every other tool on the host. S3-compatible stores that ignore the region still need one
-set, so add it to `.env` as well.
+```python
+hits = memory.search(
+    ["Find the prototype with this layout", Path("./query-layout.png")],
+    limit=5,
+)
+for hit in hits:
+    print(hit.score, hit.modality, hit.content, hit.assets)
 
-Nothing in MindBridge loads `.env` — every deployment target already does it natively. Pass it
-to whatever runs the process, and check the result before starting anything:
-
-```bash
-uv run --env-file .env mindbridge config check --role api
+result = memory.ask(
+    ["What changed between the stored prototype and this image?", Path("./latest.png")],
+    limit=5,
+)
+print(result.answer)
+print(result.hits)
 ```
 
-That reports every missing setting in one pass, and names whether each resolved value came from
-the environment or from `mindbridge.toml`. It never prints a value.
+A routed query containing text combines dense and full-text signals in Zvec; a pure-media query
+uses dense search. MindBridge then hydrates ranked records and assets from SQLite. `ask` returns
+the generated answer and source hits selected for grounding.
+If there are no hits, the default backend answers that it does not know.
 
-## 5. Run the API
+## Understand model routing
 
-```bash
-uv run --env-file .env --extra server uvicorn mindbridge.server:create_app --factory
+Routing follows declared capabilities, never a model-name heuristic:
+
+- The default Jina embedding adapter receives text, image, video, audio, and mixed input natively.
+- Any model operation that supports the input modality receives it natively.
+- When embedding does not support audio, MindBridge transcribes the audio, removes the audio part,
+  and embeds the transcript together with any still-supported image or video parts.
+- Generation follows the same rule. A visual-language model without audio receives ASR text plus
+  the retained image or video evidence.
+- Audio-only input becomes transcript-only after this fallback; visual parts are never dropped to
+  force an unsupported fallback.
+- If no valid route exists, MindBridge raises `ModelError` instead of ignoring content.
+
+One memory currently produces one aggregate embedding. There is no automatic chunking, separate
+vector per asset, or reranker. With the built-in `data` transport, one embedding or generation call
+may contain at most 64 MiB of aggregate raw media before base64 expansion. Use trusted co-located
+`file` transport or a streaming custom backend for larger video.
+
+`transcription_space` is also part of the directory's durable compatibility identity. Keep it
+stable for one ASR model and transcript-affecting preprocessing recipe. To change that recipe,
+allocate a new directory and re-ingest rather than editing stored metadata.
+
+Call `memory.speech(record.id)` to get timed `SpeakerSegment` values. The first recording enrolls
+an opaque local `speaker_id`; later recordings with a clear CAM++ match reuse that ID. Analysis is
+lazy and cached in SQLite. Assign a name after enrollment; registration also updates already
+cached recordings:
+
+```python
+turns = memory.speech(record.id)
+if turns and turns[0].speaker_id:
+    memory.register_speaker(turns[0].speaker_id, "Ada")
+    assert memory.speech(record.id)[0].speaker_name == "Ada"
 ```
 
-```bash
-curl -s localhost:8000/healthz
+## Choose another Sentence Transformers model
+
+Qwen3-VL-Embedding uses the generic adapter and standard multimodal dict/message inputs:
+
+```python
+from pathlib import Path
+
+from mindbridge import Memory, SentenceTransformersEmbedder
+
+qwen = SentenceTransformersEmbedder.load(
+    "Qwen/Qwen3-VL-Embedding-2B",
+    revision="9f2f7e710d6d81056aa5c0a4f04764fec6bb7bda",
+    device="cuda",
+    batch_size=1,
+)
+
+with Memory("./data/qwen", embedder=qwen) as memory:
+    memory.add(["Prototype", Path("./prototype.png")])
 ```
 
-`/healthz` reports liveness only. It deliberately makes no claim about PostgreSQL, Redis, or the
-model endpoints — a health check that lies about its dependencies is worse than one that does
-not mention them.
+The generic adapter asks the loaded model which atomic modalities it supports. Qwen3-VL supports
+text, image, video, and their combinations; it does not advertise audio, so MindBridge uses the ASR
+fallback described above. Its native 2B vector dimension is 2048. A smaller dimension is accepted
+only when the loaded model exposes machine-readable Matryoshka metadata for that dimension.
 
-Startup runs one check that is easy to misread as a failure: for every tenant in
-`MINDBRIDGE_TENANT_API_KEYS_JSON`, it probes whether that tenant already holds vectors the
-configured embedding space cannot reach, and refuses to serve if so. That is what stops a
-changed embedder from turning every recall into a silent empty result. On a fresh database it
-passes trivially.
+Every adapter derives `space_id` from its type, model, immutable revision, effective dimension,
+normalization, retrieval-side methods, and input recipe. Changing any component requires a new
+`data_dir` and re-encoding the source content. `reindex()` is intentionally not a model migration:
+it rebuilds Zvec from the vectors already stored in SQLite.
 
-## 6. Write and recall
+## Add event time and metadata
+
+`occurred_at` is optional and must include a timezone:
+
+```python
+from datetime import datetime, timezone
+
+record = memory.add(
+    "The deployment completed.",
+    occurred_at=datetime(2026, 8, 27, 9, 30, tzinfo=timezone.utc),
+    metadata={"source": "release-log"},
+)
+```
+
+Identity covers normalized text, ordered asset content, event time, and canonical metadata.
+Adding the same logical record returns the existing record without another model call.
+
+## Add a batch
+
+`add_many` accepts the same content contract, with no per-item event time or metadata:
+
+```python
+records = memory.add_many(
+    [
+        "The staging region is eu-west-1.",
+        ["Production dashboard", Path("./production.png")],
+    ]
+)
+```
+
+New items are embedded in one model batch and committed in one SQLite transaction. Returned
+records match input order; duplicate inputs can repeat the same ID.
+
+## Read, list, and delete
+
+```python
+record = memory.get(record.id)
+
+page = memory.list(limit=50)
+while page.next_cursor is not None:
+    page = memory.list(limit=50, cursor=page.next_cursor)
+
+deleted = memory.delete(record.id)
+deleted_again = memory.delete(record.id)
+assert deleted is True
+assert deleted_again is False
+```
+
+Deleting the last reference to an asset removes its SQLite descriptor and content-addressed file.
+List cursors are opaque; store and return them unchanged.
+
+## Use the async API
+
+`AsyncMemory` is a thin asynchronous facade over the same local core:
 
 ```python
 import asyncio
-from datetime import datetime, timezone
+from pathlib import Path
 
-from mindbridge import MemoryType, MindBridge, RecallQuery, RecallRequest, RememberRequest
-
-API_KEY = "the key printed in step 4"
+from mindbridge import AsyncMemory
 
 
 async def main() -> None:
-    async with MindBridge.connect(base_url="http://localhost:8000", api_key=API_KEY) as memory:
-        written = await memory.remember(
-            RememberRequest(
-                tenant_id="tenant_01",
-                summary="The red screwdriver went into the blue toolbox on the workbench.",
-                memory_type=MemoryType.EPISODIC,
-                occurred_at=datetime.now(timezone.utc),
-            )
-        )
-        print(written.status, written.memory_id)
-
-        result = await memory.recall(
-            RecallRequest(
-                tenant_id="tenant_01",
-                query=RecallQuery(text="Where did the red screwdriver end up?"),
-            )
-        )
-        print(result.answer)
-        print(result.confidence, [m.memory_id for m in result.memories])
+    async with AsyncMemory(data_dir="./data/async-assistant") as memory:
+        await memory.add(["Incident recording", Path("./incident.wav")])
+        hits = await memory.search("What happened during the incident?")
+        print(hits)
 
 
 asyncio.run(main())
 ```
 
-`written.status` is `created` the first time and `duplicate` on an identical resend. Retries are
-safe without being silent: omit `idempotency_key` and one is derived from the content, so the
-second call returns the same memory rather than a second copy.
+Do not create separate synchronous and asynchronous owners for the same path.
+Concurrent calls on the one owner may overlap remote model work; MindBridge briefly serializes
+SQLite commit/outbox and Zvec access where consistency requires it.
 
-Writing more than one memory at a time? Use `memory.remember_many([...])` (up to 100, `POST
-/v1/memories/batch`). It costs one encoder round trip for the whole batch instead of one each, and
-returns a result per memory in request order — each with its own `created` or `duplicate` status.
+## Isolate applications and benchmarks
 
-The same call over HTTP:
+The directory is the isolation boundary:
 
-```bash
-curl -s localhost:8000/v1/recall \
-  -H "Authorization: Bearer $API_KEY" \
-  -H 'Content-Type: application/json' \
-  -d '{"tenant_id":"tenant_01","query":{"text":"Where did the red screwdriver end up?"}}'
+```python
+from mindbridge import Memory
+
+with (
+    Memory("./data/experiment-a") as experiment_a,
+    Memory("./data/experiment-b") as experiment_b,
+):
+    experiment_a.add("Only A can retrieve this.")
+    assert experiment_b.search("Only A") == ()
 ```
 
-## What you have not exercised yet
+A second owner of the same path fails immediately. Parallel benchmark cases must each allocate a
+different leaf directory; a run label belongs in the path, never in a product request field. On
+POSIX, opening each directory enforces owner-only mode `0700`.
 
-This quickstart never ran the perception path. To ingest actual audio and video you need the
-memory worker. Point its media slot at the same embedding endpoint you already configured — that
-endpoint embeds video and audio as well as text, so there is no second model and no GPU:
+## Upgrading from the service-based release
 
-```bash
-uv sync --extra server --extra media
-```
+This is a breaking upgrade, not an in-place PostgreSQL migration.
 
-The committed `mindbridge.toml` already points the media slot at that endpoint:
+- There is no server-side account hierarchy or logical store scope.
+- Former tenant, user, and run fields are rejected by Python, REST, and MCP.
+- The old PostgreSQL schema is not opened or converted automatically.
+- Background workers, Redis, and S3 configuration no longer apply.
+- SQLite, local content-addressed assets, and Zvec now live under one `data_dir`.
 
-```toml
-[media_embedder]
-plugin = "openai"
-```
+Export the content, event time, metadata, and source media you intend to keep. Allocate one new
+directory for each genuinely separate memory domain, then ingest through the new public API.
+MindBridge generates new embeddings and a fresh Zvec index.
 
-```bash
-uv run --env-file .env --extra server --extra media \
-  celery -A mindbridge.celery_app:app worker --loglevel=INFO
-```
+Do not encode an old scope identifier into metadata and treat it as isolation. Metadata is payload,
+not an authorization boundary.
 
-The alternative is `MINDBRIDGE_MEDIA_EMBEDDER_PLUGIN=jina`, which loads Jina v5 Omni into the
-worker process and needs `--extra cloud-models` and a GPU. It holds 3.7 GiB of VRAM in **every**
-prefork child, so the worker refuses to start when a pool of more than one child would exceed
-`MINDBRIDGE_WORKER_VRAM_BUDGET_GIB`, whether the pool comes from `--concurrency` or `--autoscale`.
-[Deployment](deployment.md#optional-in-process-media-encoder) covers that opt-in path.
-
-`POST /v1/observations` then returns a `processing_job_id`; memory does not exist when that
-receipt returns. Poll `GET /v1/jobs/{job_id}` until `succeeded`, or follow it as a stream. See
-[deployment](deployment.md#memory-worker).
-
-## Next
-
-- [Concepts](concepts.md) — what an Observation, Event, Claim, and Memory each are, and why
-  those are four things rather than one.
-- [REST API](api/rest.md) — every endpoint and the full error-code table.
-- [Configuration](configuration.md) — the rest of the variables and what breaks without them.
-- [Troubleshooting](troubleshooting.md) — if the server refused to start or recall came back
-  empty.
+Next, read [core concepts](concepts.md), [configuration](configuration.md), or the
+[MCP API](api/mcp.md).

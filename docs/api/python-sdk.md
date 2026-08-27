@@ -1,373 +1,510 @@
-# Python SDK
+# Python API
 
-`mindbridge.MindBridge` is a small asynchronous client over the [REST contract](rest.md). It
-ships in the base package — `uv add mindbridge` with no extras — because an application that
-only *calls* MindBridge should not pull in FastAPI, psycopg, or torch.
-
-Every request and response type is importable from the top-level package, so the first call
-costs one import rather than two.
-
-## Connecting
+The supported Python surface is exported from `mindbridge`:
 
 ```python
-from mindbridge import MindBridge
-
-async with MindBridge.connect(
-    base_url="https://memory.example.com",
-    api_key="at-least-32-characters-long",
-    timeout_seconds=120.0,
-    retry_attempts=3,
-    retry_backoff_seconds=0.5,
-) as memory:
-    ...
-```
-
-`connect()` validates eagerly: a blank `base_url`, a blank `api_key`, or a non-positive timeout
-raises `ValueError` at construction rather than at first use. `api_key` may be `None` only if
-the deployment sits behind a gateway that adds the header.
-
-The default timeout is 120 seconds because a recall in `answer` mode does real model work — a
-30-second default would turn normal latency into a client-side error.
-
-### Retrying
-
-The client retries a request up to `retry_attempts` times when the answer says a dependency was
-briefly unable rather than that the request was refused: a transport failure, or `429`, `502`,
-`503`, `504`. A `503 model_unavailable` from an embedder or generator that is restarting is the
-case this exists for — without it, a read the server would have served a second later reaches the
-caller as a terminal error. Every other status is final on the first attempt, because repeating a
-request the server understood and rejected only spends the rejection twice.
-
-Waits use full jitter over a doubling ceiling (`retry_backoff_seconds`, then twice that, and so
-on). The clients that see one model outage all see it at once, so a fixed delay would return them
-together and re-create the load they were waiting out.
-
-**A write is retried when its request carries `idempotency_key` — supplied or not.** That field's
-contract is what makes the repeat safe: omit it and the server derives one from the content, so an
-identical resend answers `duplicate` with the first outcome instead of writing twice. `observe`
-keys on `(tenant_id, device_id, boot_id, sequence)`; `remember`, `record_feedback`, and `forget`
-key on a digest of the request. The client serialises the body once and re-sends those same bytes,
-so a retry always lands on the same key. A `remember_many` batch is covered the same way, member
-by member.
-
-Supplying a key is still worth doing when the caller wants *its own* notion of the same write —
-two calls that differ in some field you consider incidental collapse onto one memory under a
-shared key, where content-derived keys would keep them apart.
-
-`recall` is retried despite carrying no such field. It is the read the outage broke, and the
-duplicate it risks is one extra recorded access against the memories it returns, which feeds
-strength and decay — bounded, and directionally honest about having been asked. A future write
-endpoint that declares no idempotency is not retried at all, which is the rule rather than an
-exception to it.
-
-Set `retry_attempts=1` to turn retrying off, for a caller that runs its own.
-
-Outside a context manager, close it yourself:
-
-```python
-memory = MindBridge.connect(base_url=..., api_key=...)
-try:
-    ...
-finally:
-    await memory.close()
-```
-
-## Methods
-
-| Method | REST equivalent |
-| --- | --- |
-| `observe(request)` | `POST /v1/observations` |
-| `remember(request)` | `POST /v1/memories` |
-| `remember_many(requests)` | `POST /v1/memories/batch` |
-| `recall(request)` | `POST /v1/recall` |
-| `get_memory(tenant_id, memory_id)` | `GET /v1/memories/{memory_id}` |
-| `record_feedback(request)` | `POST /v1/feedback` |
-| `forget(request)` | `POST /v1/forget` |
-| `get_forget_status(tenant_id, tombstone_id)` | `GET /v1/deletions/{tombstone_id}` |
-| `list_deletions(request)` | `GET /v1/deletions` |
-| `get_observation_job(tenant_id, job_id)` | `GET /v1/jobs/{job_id}` |
-| `stream_observation_job(tenant_id, job_id, *, last_event_id=None)` | `GET /v1/jobs/{job_id}/events` |
-| `close()` | — |
-
-## Writing and recalling
-
-```python
-from datetime import datetime, timezone
-
-from mindbridge import MemoryType, RecallQuery, RecallRequest, RememberRequest
-
-written = await memory.remember(
-    RememberRequest(
-        tenant_id="tenant_01",
-        summary="The red screwdriver went into the blue toolbox on the workbench.",
-        memory_type=MemoryType.EPISODIC,
-        occurred_at=datetime.now(timezone.utc),
-    )
-)
-assert written.status.value in {"created", "duplicate"}
-
-result = await memory.recall(
-    RecallRequest(
-        tenant_id="tenant_01",
-        query=RecallQuery(text="Where did the red screwdriver end up?"),
-    )
+from mindbridge import (
+    AnswerResult,
+    AssetRef,
+    AsyncMemory,
+    Blob,
+    Config,
+    ContentInput,
+    DEFAULT_FUNASR_MODEL_ID,
+    DEFAULT_FUNASR_RECIPE,
+    EmbeddingBackend,
+    EmbedTask,
+    FunASRRecipe,
+    FunASRTranscriber,
+    IndexUnavailableError,
+    JinaOmniEmbedder,
+    Memory,
+    MemoryNotFoundError,
+    MemoryRecord,
+    MindBridgeError,
+    Modality,
+    ModelBackend,
+    ModelCapabilities,
+    ModelError,
+    ModelInput,
+    OpenAIHTTP,
+    Page,
+    SearchHit,
+    SentenceTransformersEmbedder,
+    SpeakerEmbedding,
+    SpeakerNotFoundError,
+    SpeakerSegment,
+    SpeechAnalysis,
+    SpeechBackend,
+    SpeechTurn,
+    StorageError,
+    URL,
+    ValidationError,
 )
 ```
 
-`result.answer` is `None` when nothing supports an answer. That is a correct outcome, not an
-error — check it rather than assuming a string.
+## Content values
 
-Holding more than one memory? Hand over all of them. `remember_many` takes up to 100 requests and
-returns one `RememberResult` per request **in the order sent**, each with its own `created` or
-`duplicate` status — the server encodes the whole batch in one call to its embedder instead of one
-call each:
+`ContentInput` is one content atom or an ordered sequence of atoms:
 
 ```python
-written = await memory.remember_many(
+ContentAtom = str | pathlib.Path | URL | Blob | AssetRef
+ContentInput = ContentAtom | Sequence[ContentAtom]
+```
+
+Strings are text, never filesystem paths. Use `Path` explicitly for a local file.
+An ordered Python input may contain at most 128 atoms. REST and MCP use the tighter wire limit of
+16 parts.
+
+`Path` must identify a readable regular file. MindBridge infers image/video/audio MIME only from a
+common deterministic suffix; use `Blob` when a suffix is unavailable or ambiguous.
+
+### `URL`
+
+```python
+URL(
+    value: str,
+    media_type: str | None = None,
+    name: str | None = None,
+)
+```
+
+Only HTTPS without credentials or fragments is accepted. The hostname must appear in
+`Config.allowed_url_hosts`. A concrete media type or family hint such as `image/*` is checked
+against the downloaded `Content-Type`. When omitted, MindBridge only infers common deterministic
+filename suffixes; otherwise it raises `ValidationError`. MindBridge resolves the hostname, rejects
+any non-public result, pins the connection to a verified public IP while preserving TLS SNI and the
+HTTP host, and repeats that validation for every redirect. A concrete MIME hint must match exactly;
+a family hint must match the corresponding image, video, or audio family.
+
+### `Blob`
+
+```python
+Blob(data: bytes, media_type: str, name: str | None = None)
+```
+
+Bytes must be non-empty and `media_type` must be a concrete image, video, or audio MIME type.
+
+### `AssetRef`
+
+```python
+AssetRef(id: str, modality: Modality | None = None)
+```
+
+This short form reuses an asset already stored in the same data directory. MindBridge resolves
+the complete descriptor from SQLite and verifies an optional modality hint. Records and hits
+return resolved references with `media_type`, `size_bytes`, `sha256`, `name`, and local `path`.
+
+An asset name belongs to the content digest, not to an individual memory-to-asset relationship.
+When the same bytes arrive under different names, the first authoritative non-empty CAS name is
+returned for every reference. Put a per-memory label in text or metadata instead.
+
+## `Memory`
+
+```python
+Memory(
+    data_dir: str | pathlib.Path = ".mindbridge",
+    config: Config | None = None,
+    *,
+    models: ModelBackend | None = None,
+    embedder: EmbeddingBackend | None = None,
+    transcriber: SpeechBackend | None = None,
+    speaker_similarity: float = 0.78,
+    speaker_margin: float = 0.05,
+)
+```
+
+Construction acquires exclusive ownership of `data_dir`, opens SQLite, the asset store, and Zvec,
+validates durable compatibility metadata, and replays pending index work. By default, embedding is
+pinned Jina v5 Omni, speech is local Fun-ASR-Nano, and generation uses OpenAI-compatible HTTP.
+Passing `embedder` or `transcriber` replaces only that operation. Passing `models` without either
+narrower backend uses that combined backend for all three operations. The two speaker thresholds
+calibrate CAM++ cosine matching; ambiguous matches enroll a new anonymous identity. `Memory` owns
+and closes each distinct supplied backend once.
+
+### `add`
+
+```python
+memory.add(
+    content: ContentInput,
+    *,
+    occurred_at: datetime | None = None,
+    metadata: Mapping[str, object] | None = None,
+) -> MemoryRecord
+```
+
+Adds text, media, or ordered combinations. Text atoms are normalized and limited to 65,536
+characters. `occurred_at` must be timezone-aware. Metadata must be JSON-compatible and its
+canonical UTF-8 form may not exceed 262,144 bytes.
+
+Local paths, inline bytes, and allowed HTTPS sources are copied into immutable content-addressed
+storage before the record is committed. One aggregate model input produces one embedding. If the
+stable ID already exists, `add` returns the stored record without retranscribing or embedding it.
+Path and URL inputs still have to be read to establish their content digest; pass an existing
+`AssetRef` when the bytes are already stored.
+
+If SQLite commits but Zvec flush fails, `add` raises `IndexUnavailableError` while leaving the
+record, assets, embedding, and pending operation durable. Retrying the same input is safe.
+
+### `add_many`
+
+```python
+memory.add_many(contents: Sequence[ContentInput]) -> tuple[MemoryRecord, ...]
+```
+
+Adds a batch with no per-item event time or metadata. A single ordered multimodal item must be
+nested inside the outer batch:
+
+```python
+from pathlib import Path
+
+records = memory.add_many(
     [
-        RememberRequest(
-            tenant_id="tenant_01",
-            summary=summary,
-            memory_type=MemoryType.SEMANTIC,
-            occurred_at=datetime.now(timezone.utc),
-        )
-        for summary in summaries
+        "plain text",
+        ["caption", Path("image.png")],
     ]
 )
-assert len(written) == len(summaries)
 ```
 
-Measured on one RTX 5090 against the same model, encoding 128 real memory summaries: 600 per
-second in batches of 32 against 183 per second one at a time.
+Empty input returns an empty tuple. Output matches input order and length; duplicates may return
+the same ID. New items are routed, embedded in one model batch, and stored atomically.
 
-Verifying an answer needs no second call to storage: `result.evidence` carries exact
-`start_ms`–`end_ms` pointers into the original recording plus signed `media_url`s covering
-those spans. A URL normally addresses a derived clip whose own timeline starts at zero and may
-extend beyond the cited interval.
-
-### Grounded follow-up
-
-Pass IDs from a previous result to scope the next question to exactly those memories:
+### `search`
 
 ```python
-follow_up = await memory.recall(
-    RecallRequest(
-        tenant_id="tenant_01",
-        query=RecallQuery(text="Was anyone else in the room?"),
-        memory_ids=tuple(m.memory_id for m in result.memories[:5]),
-    )
-)
+memory.search(query: ContentInput, *, limit: int = 10) -> tuple[SearchHit, ...]
 ```
 
-`memory_ids` is a strict scope, not a ranking hint. Tenant, lifecycle, deletion, and evidence
-checks still apply, but nothing outside that set is searched.
+Runs dense plus full-text hybrid retrieval when the routed query contains text, and dense-only
+retrieval for a pure-media routed query. `limit` is from 1 through 100. Multimodal queries follow
+the same capability routing as stored memories. Results are hydrated from SQLite in ranked order;
+stale derived-index IDs are omitted.
 
-### Searching without answering
+### `ask`
 
 ```python
-from mindbridge import RecallMode
-
-hits = await memory.recall(
-    RecallRequest(
-        tenant_id="tenant_01",
-        query=RecallQuery(text="workbench"),
-        mode=RecallMode.SEARCH,
-        limit=50,
-    )
-)
+memory.ask(question: ContentInput, *, limit: int = 5) -> AnswerResult
 ```
 
-`search` skips the generator entirely. Use it when you want ranked memories and intend to do
-your own reasoning — it is substantially cheaper and lower-latency than `answer`.
+Retrieves up to `limit` memories and asks the configured generation backend to answer only from
+those hits. Question and evidence assets are preserved when supported. Audio fallback contributes
+ASR text while supported image/video evidence remains available to a VLM. The built-in backend
+serializes each distinct question/evidence asset once in the outbound answer request, even if
+several hits refer to the same digest.
 
-### Recalling by media
+### `get`
 
 ```python
-result = await memory.recall(
-    RecallRequest(
-        tenant_id="tenant_01",
-        query=RecallQuery(media_object_ids=("media_a1b2",)),
-    )
-)
+memory.get(memory_id: str) -> MemoryRecord
 ```
 
-Text and media are not privileged relative to each other. Either alone is a valid query, and
-supplying both encodes them as one query vector.
+Returns one record and resolved assets. A missing ID raises `MemoryNotFoundError`.
 
-## Observing, and following the job
-
-`observe()` returns as soon as the observation is durable. The memory does not exist yet.
+### `speech`
 
 ```python
-receipt = await memory.observe(request)
-print(receipt.status, receipt.processing_job_id)
+memory.speech(memory_id: str) -> tuple[SpeakerSegment, ...]
 ```
 
-Poll:
+Lazily analyzes every audio/video asset in the memory with the configured `SpeechBackend` and
+caches the result. Each segment contains `asset_id`, `start_ms`, `end_ms`, `text`, a stable local
+`speaker_id`, optional `speaker_name`, and `identity_score`. The score is `None` when the speaker is
+first enrolled and is a cosine score on later recognition. `Memory.speech` never returns raw CAM++
+voiceprints. Repeated calls for the same asset and speech space do not run inference again. A
+combined backend that only implements plain `transcribe` can provide ASR fallback but raises
+`ModelError` here because it has no speaker evidence.
+
+### `register_speaker`
 
 ```python
-job = await memory.get_observation_job("tenant_01", receipt.processing_job_id)
-if job.state.value == "succeeded":
-    for memory_id in job.memory_ids:
-        ...
+memory.register_speaker(speaker_id: str, name: str) -> None
 ```
 
-Or stream, which is usually what you want — deriving memory from raw media takes far longer than
-the request that submitted it:
+Assigns or replaces the human-readable name for an enrolled local speaker. Names are returned on
+both new and cached `SpeakerSegment` values. Unknown IDs raise `SpeakerNotFoundError`; names must be
+non-empty, printable, and at most 255 characters.
+
+### `list`
 
 ```python
-async for event in memory.stream_observation_job("tenant_01", receipt.processing_job_id):
-    print(event.job.state, event.job.attempt)
-    last_seen = event.event_id
+memory.list(*, limit: int = 100, cursor: str | None = None) -> Page
 ```
 
-Every event carries the complete job view, so resuming after a dropped connection needs only the
-last ID:
+Lists newest records first. Pass `Page.next_cursor` unchanged to retrieve the next stable keyset
+page. A malformed cursor raises `ValidationError`.
+
+### `delete`
 
 ```python
-async for event in memory.stream_observation_job("tenant_01", job_id, last_event_id=last_seen):
-    ...
+memory.delete(memory_id: str) -> bool
 ```
 
-Two things to internalise about the stream:
+Deletes the SQLite record, embedding, asset relationships, and derived index entry. It removes a
+CAS file only when no other memory references it. Returns `True` when the record existed and
+`False` for a repeated delete.
 
-- **`failed` settles the attempt, not the job.** The stale-job sweep can retry it later. Do not
-  treat `failed` as terminal unless you have decided it is.
-- **Intermediate states are coalesced.** You always observe the newer state, but not necessarily
-  every `attempt`. Reconnecting is your decision; the server does not do it for you.
-
-## Feedback
+### `reindex`
 
 ```python
-from mindbridge import FeedbackRequest, FeedbackType
-
-await memory.record_feedback(
-    FeedbackRequest(
-        tenant_id="tenant_01",
-        feedback_type=FeedbackType.CORRECTION,
-        memory_id=result.memories[0].memory_id,
-        correction_summary="It was the green screwdriver, not the red one.",
-    )
-)
+memory.reindex() -> int
 ```
 
-A correction writes a new version that supersedes the original; the receipt returns it as
-`corrected_memory_id`. Nothing is overwritten.
+Rebuilds Zvec from authoritative SQLite embeddings and returns the number of indexed memories. It
+does not call the embedding model or reread source URLs/files.
 
-When recall found nothing usable, report it against the recall rather than a memory:
+### `optimize`
 
 ```python
-await memory.record_feedback(
-    FeedbackRequest(
-        tenant_id="tenant_01",
-        feedback_type=FeedbackType.MISSING,
-        recall_trace_id=result.trace_id,
-    )
-)
+memory.optimize() -> None
 ```
 
-This is why `RecallResult.trace_id` is worth keeping: it is the handle that ties a retrieval
-failure back to what was asked.
+Optimizes and flushes the Zvec collection. This can be I/O intensive.
 
-## Forgetting
+### `close`
 
 ```python
-from mindbridge import ForgetRequest, ForgetTargetType
-
-receipt = await memory.forget(
-    ForgetRequest(
-        tenant_id="tenant_01",
-        target_type=ForgetTargetType.OBSERVATION,
-        target_id="obs_...",
-    )
-)
+memory.close() -> None
 ```
 
-The receipt reports that erasure was recorded and started. Poll for completion:
+Closes model, Zvec, SQLite, and lock resources. Repeated calls are harmless. Using a closed
+or post-fork instance raises `StorageError`.
 
-```python
-status = await memory.get_forget_status("tenant_01", receipt.tombstone_id)
-done = status.propagation_state.value == "complete"
-```
+## Modality routing
 
-`complete` means deletion finished in central PostgreSQL and object storage. An offline device
-applies the retained tombstone when it reconnects; this status is not an acknowledgement from it.
+Input modality is derived from media families:
 
-## Error handling
-
-Every failure raises `MindBridgeError`:
-
-```python
-from mindbridge import MindBridgeError
-
-try:
-    result = await memory.recall(request)
-except MindBridgeError as error:
-    error.code  # stable machine-readable code
-    error.status_code  # HTTP status, or None for a transport failure
-    error.trace_id  # correlates with your telemetry backend
-    error.issues  # field-level ValidationIssue values, when validation failed
-```
-
-Branch on `code`, never on the message. Beyond the [server codes](rest.md#error-codes), the
-client itself produces four:
-
-| Code | Meaning |
+| Input | Modality |
 | --- | --- |
-| `transport_error` | The request never got an answer — wrong address, nothing listening, or timed out. `status_code` is `None`. |
-| `http_error` | Non-success response whose body was not a parseable error envelope. |
-| `invalid_response` | A success response that failed contract validation. Usually a version skew between client and server. |
-| `stream_error` | The job stream reported a failure whose payload could not be parsed. |
+| No media assets | `Modality.TEXT` |
+| Only image-family media, with or without text | `Modality.IMAGE` |
+| Only video-family media, with or without text | `Modality.VIDEO` |
+| Only audio-family media, with or without text | `Modality.AUDIO` |
+| Two or more media families | `Modality.OMNI` |
 
-A minimal retry policy that matches how the server actually fails:
+The configured `ModelCapabilities` drives each operation. Unsupported audio can fall back through
+`transcribe`: audio is removed from that model call, transcript text is added, and supported image
+or video atoms remain. MindBridge never guesses from model names or silently drops unsupported
+visual media.
+
+## `AsyncMemory`
+
+`AsyncMemory` has the same constructor, operations, defaults, and return types. Every operation is
+awaitable, and lifecycle uses `async with`:
 
 ```python
-import asyncio
+from pathlib import Path
 
-RETRYABLE = {
-    "transport_error",
-    "database_unavailable",
-    "model_unavailable",
-    "object_storage_unavailable",
-    "task_broker_unavailable",
-}
+from mindbridge import AsyncMemory
 
 
-async def with_retry(call, attempts: int = 3):
-    for attempt in range(attempts):
-        try:
-            return await call()
-        except MindBridgeError as error:
-            if error.code not in RETRYABLE or attempt == attempts - 1:
-                raise
-            await asyncio.sleep(2**attempt)
+async def remember() -> None:
+    async with AsyncMemory("./data/async") as memory:
+        record = await memory.add(["Handoff recording", Path("handoff.wav")])
+        hits = await memory.search("When is handoff?")
+        await memory.delete(record.id)
+        print(hits)
 ```
 
-Retrying a write is safe: idempotency keys are derived from content when omitted, so a duplicate
-submission returns the original record rather than creating a second one.
+It delegates to one synchronous core with `asyncio.to_thread`; it is not a separate storage mode.
+Do not open synchronous and asynchronous owners for the same directory. Concurrent calls on one
+instance may overlap remote model work. SQLite commit/outbox and Zvec access use short serialized
+critical sections so local state and derived search remain consistent.
 
-## Types
+## Return values
 
-Everything importable from `mindbridge`:
+All return values are frozen, slotted dataclasses. Metadata is copied into a detached mapping.
 
-**Requests** — `ObserveRequest`, `RememberRequest`, `RecallRequest`, `RecallQuery`,
-`RecallFilters`, `FeedbackRequest`, `ForgetRequest`, `DeletionListRequest`, `GetMemoryRequest`,
-`GetObservationJobRequest`, `MediaObjectInput`, `IdentityObservationInput`.
+### `MemoryRecord`
 
-**Responses** — `ObservationReceipt`, `ObservationProcessingJobView`, `RememberResult`,
-`MemoryResult`, `MemoryView`, `RecallResult`, `EvidenceView`, `FeedbackReceipt`, `ForgetReceipt`,
-`DeletionPage`, `DeletionTombstoneView`, `HealthResponse`, `ErrorResponse`, `ValidationIssue`.
+```python
+MemoryRecord(
+    id: str,
+    content: str,
+    created_at: datetime,
+    occurred_at: datetime | None,
+    metadata: Mapping[str, object],
+    assets: tuple[AssetRef, ...],
+    modality: Modality,
+)
+```
 
-**Enums** — `MemoryType`, `MemoryState`, `MemoryWriteStatus`, `ObservationStatus`, `JobState`,
-`RecallMode`, `FeedbackType`, `ForgetTargetType`, `DeletionPropagationState`,
-`VerificationStatus`, `MediaKind`, `SensorKind`, `IdentityKind`, `IdentityScope`.
+`content` is the normalized textual component and may be empty for native media-only input. It
+includes transcript text only when add-time embedding fallback required ASR. A later
+generation-time fallback may cache an asset transcript but does not rewrite the existing record.
+`modality` is persisted and returned directly.
 
-**Client** — `MindBridge`, `MindBridgeError`, `ObservationJobEvent`.
+### `SearchHit`
 
-All contracts are frozen Pydantic models with `extra="forbid"`. A misspelled field is a
-construction error, not a value silently dropped on the wire.
+`SearchHit` has the record fields plus `score: float`, constrained to the inclusive range 0
+through 1.
 
-`RememberResult` and `MemoryResult` are **siblings**, not parent and child. A write result
-carries `status`, which a read has no value for; making it a subclass would let it pass wherever
-a read result is accepted and silently drop that field on serialization. Annotate each position
-with the one it actually receives.
+### `AnswerResult`
+
+```python
+AnswerResult(answer: str, hits: tuple[SearchHit, ...])
+```
+
+### `Page`
+
+```python
+Page(items: tuple[MemoryRecord, ...], next_cursor: str | None)
+```
+
+## Embedding backends
+
+`EmbeddingBackend` is the narrow public embedding seam:
+
+```python
+class EmbeddingBackend(Protocol):
+    capabilities: frozenset[Modality]
+    model_id: str
+    space_id: str
+    dimension: int
+
+    def embed(
+        self,
+        inputs: Sequence[ModelInput],
+        task: EmbedTask = EmbedTask.DOCUMENT,
+    ) -> tuple[tuple[float, ...], ...]: ...
+
+    def close(self) -> None: ...
+```
+
+Calls may overlap across threads. An implementation must preserve input order, return one finite
+vector of the declared dimension per input, and remain thread-safe until `close()`.
+
+`JinaOmniEmbedder()` declares the fixed default model and immutable revision without loading its
+weights. The first non-empty embedding call loads them; use `load()` when startup must fail eagerly:
+
+```python
+JinaOmniEmbedder.load(
+    *,
+    dimension: int = 1024,
+    device: str | None = None,
+    batch_size: int = 32,
+) -> JinaOmniEmbedder
+```
+
+It declares text, image, video, and audio. The pinned model accepts dimensions `32`, `64`, `128`,
+`256`, `512`, and `1024`; another value fails before inference. Jina's legacy tuple conversion and
+remote-code isolation exist only in this adapter.
+
+`SentenceTransformersEmbedder.load` loads any standard model at an immutable commit:
+
+```python
+SentenceTransformersEmbedder.load(
+    model_id: str,
+    *,
+    revision: str,
+    dimension: int | None = None,
+    device: str | None = None,
+    batch_size: int = 32,
+) -> SentenceTransformersEmbedder
+```
+
+It discovers atomic capabilities with `supports()`, uses a dict for unique multimodal parts and a
+standard message for repeated parts, and calls `encode_query` or `encode_document` once per batch.
+It never applies Jina model arguments or tuple serialization. For Qwen3-VL-Embedding-2B, use
+revision `9f2f7e710d6d81056aa5c0a4f04764fec6bb7bda`; the model advertises text, image, video, and
+message, but not audio.
+
+Both adapters derive `space_id`; it cannot be overridden. The recipe includes adapter type, model,
+revision, effective dimension, normalization, retrieval-side methods, and serialization. A change
+therefore fails against an existing directory instead of mixing vectors. Re-encode source content
+into a new directory. `reindex()` does not re-embed.
+
+## FunASR speech backend
+
+`FunASRTranscriber` defaults to the portable FunASR `AutoModel` engine. Its
+`DEFAULT_FUNASR_RECIPE` composes pinned Fun-ASR-Nano, FSMN-VAD, and CAM++ revisions, with a
+30-second VAD segment ceiling and `trust_remote_code=False`. Construct a different `FunASRRecipe`
+to swap that composition.
+
+For high-throughput CUDA inference, pin the vLLM build matching the machine's NVIDIA driver, then
+install `mindbridge[local,vllm]` and select it explicitly:
+
+```python
+speech = FunASRTranscriber(
+    engine="vllm",
+    device="cuda",
+    gpu_memory_utilization=0.5,
+    tensor_parallel_size=1,
+    vllm_dtype="bf16",
+)
+memory = Memory("./data/vllm", transcriber=speech)
+```
+
+The vLLM route batches all FSMN-VAD spans in one decode and then runs CAM++ clustering, so timed
+speaker identity is preserved. `max_model_len`, `max_new_tokens`, and `vllm_dtype` tune decoding
+and hardware compatibility. Engine and transcript-affecting settings are part of `space_id`; use a
+new data directory when they change. `device="auto"` prefers CUDA and otherwise uses CPU, but
+`engine="vllm"` requires CUDA.
+Use the [FunASR vLLM installation guide](https://github.com/modelscope/FunASR/blob/main/docs/vllm_guide.md)
+to select a vLLM/Torch/CUDA combination; the optional extra deliberately does not choose a driver
+build for you.
+
+`SpeechBackend` is the narrower custom seam for timed turns and speaker centroids. Its `space_id`
+must change whenever ASR, VAD, diarization, speaker encoding, or preprocessing changes.
+
+## Custom model backend
+
+`ModelBackend` is the complete public model seam:
+
+```python
+class ModelBackend(Protocol):
+    capabilities: ModelCapabilities
+    embedding_model: str
+    embedding_space: str
+    transcription_space: str
+    embedding_dimension: int
+
+    def embed(
+        self,
+        inputs: Sequence[ModelInput],
+        task: EmbedTask = EmbedTask.DOCUMENT,
+    ) -> tuple[tuple[float, ...], ...]: ...
+
+    def answer(
+        self,
+        question: ModelInput,
+        hits: Sequence[SearchHit],
+    ) -> AnswerResult: ...
+
+    def transcribe(self, assets: Sequence[AssetRef]) -> tuple[str, ...]: ...
+
+    def close(self) -> None: ...
+```
+
+Pass an implementation with `Memory(..., models=backend)`. Compatible vLLM/OpenAI deployments can
+use `OpenAIHTTP(Config(...))` as that combined backend. Calls may overlap across threads, so a
+custom backend must be thread-safe until `close()`. See [configuration](../configuration.md).
+
+## Exceptions
+
+Catch `MindBridgeError` for every supported operational failure, or a specific subclass:
+
+| Exception | Meaning |
+| --- | --- |
+| `ValidationError` | Content, asset, metadata, cursor, time, or limit is invalid |
+| `MemoryNotFoundError` | `get` could not find the requested memory ID |
+| `ModelError` | Capability routing, embedding, generation, or transcription failed |
+| `StorageError` | Directory, lock, CAS, SQLite, schema, or durable state failed |
+| `IndexUnavailableError` | Zvec could not open, mutate, flush, or search |
+
+`IndexUnavailableError` is also a `StorageError`. Internal HTTPX, SQLite, filesystem, Pydantic, and
+Zvec exceptions do not cross the public boundary.
+
+## Current limits
+
+There is no public update method, server-side metadata filter, logical account scope, automatic
+chunking, per-asset embedding, or reranking stage. One memory produces one aggregate embedding.
+Allocate a separate `data_dir` for each independent memory domain.
+
+For `Config(media_transport="data")`, the built-in backend limits aggregate raw media to 64 MiB
+per embedding or generation call, before base64 expansion. Use `file` only with a trusted
+co-located backend that can read the local asset paths, or provide a streaming/file-upload custom
+backend for large video. Provider limits may be lower.
+
+The built-in backend limits serialized answer text evidence to 4 MiB. The outbound generation
+request includes the question plus each hit's content, `occurred_at`, `created_at`, metadata, and
+asset references. Choose model endpoints with an appropriate data-retention policy.

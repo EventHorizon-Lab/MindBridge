@@ -1,429 +1,565 @@
-"""FastAPI adapter for the shared MindBridge use cases."""
+"""Thin synchronous FastAPI adapter for one local ``Memory`` instance."""
 
 from __future__ import annotations
 
-from typing import Annotated, Final
+import base64
+import binascii
+from collections.abc import AsyncIterator, Mapping, Sequence
+from contextlib import asynccontextmanager
+from datetime import datetime
+from pathlib import Path
+from typing import Annotated, Literal, Protocol, TypeAlias, cast
+from urllib.parse import urlsplit
 
-from fastapi import Depends, FastAPI, Query, Request, status
-from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
-from starlette.types import Lifespan
-
-from mindbridge.api.aml import AmlSettings, register_aml_routes
-from mindbridge.api.auth import (
-    AuthenticationError,
-    TenantApiKeyAuthenticator,
-    TenantPrincipal,
-    require_tenant,
+from fastapi import APIRouter, Depends, FastAPI, Query, Response, status
+from fastapi import Path as PathParameter
+from pydantic import (
+    AwareDatetime,
+    BaseModel,
+    ConfigDict,
+    Field,
+    JsonValue,
+    StringConstraints,
+    model_validator,
 )
-from mindbridge.api.errors import (
-    RUNTIME_ERROR_CODES,
-    TENANT_ERRORS,
-    ErrorCode,
-    code_for,
-    error_response,
-    responses,
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
+
+from mindbridge.api.auth import ApiKeyAuthenticator
+from mindbridge.api.errors import error_response, error_responses, register_error_handlers
+from mindbridge.exceptions import StorageError
+from mindbridge.types import (
+    URL,
+    AnswerResult,
+    AssetRef,
+    Blob,
+    ContentInput,
+    MemoryRecord,
+    Modality,
+    Page,
+    SearchHit,
 )
-from mindbridge.api.events import register_job_event_routes
-from mindbridge.application.kernel import MemoryKernel
-from mindbridge.application.ports import MediaUploadSigner
-from mindbridge.contracts import (
-    DeletionListRequest,
-    DeletionPage,
-    FeedbackReceipt,
-    FeedbackRequest,
-    ForgetReceipt,
-    ForgetRequest,
-    HealthResponse,
-    Identifier,
-    MediaUploadRequest,
-    MediaUploadTicket,
-    MemoryResult,
-    ObservationProcessingJobView,
-    ObservationReceipt,
-    ObserveRequest,
-    RecallRequest,
-    RecallResult,
-    RememberBatchRequest,
-    RememberBatchResult,
-    RememberRequest,
-    RememberResult,
-    ValidationIssue,
-)
-from mindbridge.core import (
-    DomainInvariantError,
-)
-from mindbridge.models import Generator
-from mindbridge.telemetry import current_trace_id, log_fields, logger
 
-_LOGGER = logger("mindbridge.api.app")
-
-_EMBEDDING_ERRORS: Final[tuple[ErrorCode, ...]] = (
-    "model_request_failed",
-    "model_output_invalid",
-    "model_unavailable",
-)
-"""What any operation that encodes a vector before answering the caller can return."""
-
-_EVIDENCE_ERRORS: Final[tuple[ErrorCode, ...]] = (
-    "memory_integrity_failed",
-    "object_storage_unavailable",
-)
-"""What any operation that resolves a memory's evidence into signed URLs can return.
-
-Reading a memory is not only a database read: `read_resolved_memory_evidence` signs a
-download per media object, so object storage is on the request path of every route that
-returns evidence, not only of the one that erases it. Naming the pair once is what stops a
-route from being written without them -- listing them per route is how `getMemory` came to
-document a 503 it cannot return and omit the two it can.
-"""
+_MAX_TEXT_CHARACTERS = 65_536
+_MAX_REQUEST_BODY_BYTES = 8 * 1024 * 1024
+_Text = Annotated[
+    str,
+    StringConstraints(
+        strip_whitespace=True,
+        min_length=1,
+        max_length=_MAX_TEXT_CHARACTERS,
+    ),
+]
+_Limit = Annotated[int, Field(strict=True, ge=1, le=100)]
+_MemoryId = Annotated[str, PathParameter(min_length=1)]
+_PartId = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=255)]
+_MediaType = Annotated[
+    str,
+    StringConstraints(
+        strip_whitespace=True,
+        to_lower=True,
+        pattern=r"^[a-z0-9!#$&^_.+-]+/(?:\*|[a-z0-9!#$&^_.+-]+)$",
+    ),
+]
+_Filename = Annotated[
+    str,
+    StringConstraints(
+        strip_whitespace=True,
+        min_length=1,
+        max_length=255,
+        pattern=r"^[^/\\\x00-\x1f\x7f]+$",
+    ),
+]
+_Source = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=8_192)]
 
 
-def build_app(
-    kernel: MemoryKernel,
+class _RequestModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class _InputText(_RequestModel):
+    type: Literal["input_text"]
+    text: _Text
+
+
+class _InputImage(_RequestModel):
+    type: Literal["input_image"]
+    image_url: _Source | None = None
+    file_id: _PartId | None = None
+
+    @model_validator(mode="after")
+    def require_one_source(self) -> _InputImage:
+        _one_source(image_url=self.image_url, file_id=self.file_id)
+        if self.image_url is not None:
+            _validate_url_or_data(self.image_url)
+            if self.image_url.startswith("data:"):
+                media_type, _data = _decode_data_url(self.image_url)
+                if not media_type.startswith("image/"):
+                    raise ValueError("input_image data must have an image media type")
+        return self
+
+
+class _InputFile(_RequestModel):
+    type: Literal["input_file"]
+    file_url: _Source | None = None
+    file_data: str | None = None
+    file_id: _PartId | None = None
+    media_type: _MediaType | None = None
+    filename: _Filename | None = None
+
+    @model_validator(mode="after")
+    def require_one_source(self) -> _InputFile:
+        _one_source(file_url=self.file_url, file_data=self.file_data, file_id=self.file_id)
+        if self.media_type is not None and self.media_type.split("/", 1)[0] not in {
+            "image",
+            "video",
+            "audio",
+        }:
+            raise ValueError("media_type must be image, video, or audio")
+        if self.file_url is not None:
+            _validate_url_or_data(self.file_url)
+            if self.file_url.startswith("data:") and self.media_type is not None:
+                embedded_type, _data = _decode_data_url(self.file_url)
+                if not _media_type_matches(self.media_type, embedded_type):
+                    raise ValueError("media_type contradicts the data URL")
+        if self.file_data is not None:
+            if self.media_type is None:
+                raise ValueError("media_type is required with file_data")
+            if self.media_type.endswith("/*"):
+                raise ValueError("file_data requires a concrete media_type")
+            _decode_base64(self.file_data)
+        return self
+
+
+_InputPart: TypeAlias = Annotated[
+    _InputText | _InputImage | _InputFile,
+    Field(discriminator="type"),
+]
+_Parts = Annotated[tuple[_InputPart, ...], Field(min_length=1, max_length=16)]
+_Content: TypeAlias = _Text | _Parts
+
+
+class MemoryCreate(_RequestModel):
+    content: _Content
+    occurred_at: AwareDatetime | None = None
+    metadata: dict[str, JsonValue] = Field(default_factory=dict)
+
+
+class MemoryBatchCreate(_RequestModel):
+    contents: Annotated[list[_Content], Field(min_length=1, max_length=100)]
+
+
+class QueryRequest(_RequestModel):
+    query: _Content
+    limit: _Limit = 10
+
+
+class AnswerRequest(_RequestModel):
+    question: _Content
+    limit: _Limit = 5
+
+
+class _ResponseModel(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+
+class AssetResponse(_ResponseModel):
+    id: str
+    modality: Modality
+    media_type: str
+    size_bytes: int
+    sha256: str
+    name: str | None = None
+
+
+class MemoryResponse(_ResponseModel):
+    id: str
+    content: str
+    modality: Modality
+    assets: tuple[AssetResponse, ...] = ()
+    created_at: AwareDatetime
+    occurred_at: AwareDatetime | None = None
+    metadata: dict[str, JsonValue]
+
+
+class SearchHitResponse(MemoryResponse):
+    score: Annotated[float, Field(ge=0.0, le=1.0)]
+
+
+class MemoryBatchResponse(_ResponseModel):
+    memories: tuple[MemoryResponse, ...]
+
+
+class SearchResponse(_ResponseModel):
+    hits: tuple[SearchHitResponse, ...]
+
+
+class AnswerResponse(_ResponseModel):
+    answer: str
+    hits: tuple[SearchHitResponse, ...]
+
+
+class PageResponse(_ResponseModel):
+    items: tuple[MemoryResponse, ...]
+    next_cursor: str | None = None
+
+
+class HealthResponse(BaseModel):
+    status: Literal["ok"] = "ok"
+
+
+class _Memory(Protocol):
+    def add(
+        self,
+        content: ContentInput,
+        *,
+        occurred_at: datetime | None = None,
+        metadata: Mapping[str, object] | None = None,
+    ) -> MemoryRecord: ...
+
+    def add_many(self, contents: Sequence[ContentInput]) -> tuple[MemoryRecord, ...]: ...
+
+    def search(self, query: ContentInput, *, limit: int = 10) -> tuple[SearchHit, ...]: ...
+
+    def ask(self, question: ContentInput, *, limit: int = 10) -> AnswerResult: ...
+
+    def get(self, memory_id: str) -> MemoryRecord: ...
+
+    def list(self, *, limit: int = 50, cursor: str | None = None) -> Page: ...
+
+    def delete(self, memory_id: str) -> bool: ...
+
+    def close(self) -> None: ...
+
+
+class _RequestGate:
+    """Authenticate and bound `/v1` requests before framework body parsing."""
+
+    def __init__(self, app: ASGIApp, *, authenticator: ApiKeyAuthenticator | None) -> None:
+        self.app = app
+        self.authenticator = authenticator
+
+    async def __call__(  # noqa: C901 - the request gate is clearest as one linear check
+        self, scope: Scope, receive: Receive, send: Send
+    ) -> None:
+        if scope["type"] != "http" or not _is_api_path(str(scope.get("path", ""))):
+            await self.app(scope, receive, send)
+            return
+
+        headers = _headers(scope)
+        if self.authenticator is not None and not self.authenticator.accepts_header(
+            _one_header(headers, b"authorization")
+        ):
+            await error_response(
+                status.HTTP_401_UNAUTHORIZED,
+                "authentication_error",
+                "a valid bearer API key is required",
+                headers={"WWW-Authenticate": "Bearer"},
+            )(scope, receive, send)
+            return
+
+        content_length = _content_length(headers)
+        if content_length is not None and content_length > _MAX_REQUEST_BODY_BYTES:
+            await _request_too_large()(scope, receive, send)
+            return
+
+        body = bytearray()
+        while True:
+            message = await receive()
+            if message["type"] == "http.disconnect":
+                return
+            if message["type"] != "http.request":
+                continue
+            body.extend(message.get("body", b""))
+            if len(body) > _MAX_REQUEST_BODY_BYTES:
+                await _request_too_large()(scope, receive, send)
+                return
+            if not message.get("more_body", False):
+                break
+
+        replayed = False
+
+        async def replay() -> Message:
+            nonlocal replayed
+            if replayed:
+                return await receive()
+            replayed = True
+            return {"type": "http.request", "body": bytes(body), "more_body": False}
+
+        await self.app(scope, replay, send)
+
+
+def create_app(  # noqa: C901 - route declarations are clearer together
     *,
-    authenticator: TenantApiKeyAuthenticator,
-    media_uploads: MediaUploadSigner | None = None,
-    lifespan: Lifespan[FastAPI] | None = None,
-    aml: tuple[AmlSettings, Generator] | None = None,
+    memory: _Memory | None = None,
+    data_dir: str | Path = ".mindbridge",
+    api_key: str | None = None,
 ) -> FastAPI:
-    """Create a side-effect-free REST adapter around one memory kernel.
+    """Create one API process; its ``Memory`` instance is its isolation boundary."""
+    authenticator = ApiKeyAuthenticator(api_key) if api_key is not None else None
+    owns_memory = memory is None
+    service = memory
 
-    `media_uploads` is what makes `createMediaUpload` reachable, and so what lets a client
-    that holds a file rather than an object key store one; a build without it serves the rest
-    of the surface unchanged.
-    """
-    app = FastAPI(title="MindBridge", version="0.1.0", lifespan=lifespan)
-    tenant_authentication = Depends(authenticator)
-    _register_request_error_handlers(app)
-    _register_runtime_error_handlers(app)
-    _register_remember_routes(app, kernel, authenticator)
-    _register_deletion_routes(app, kernel, authenticator)
-    register_job_event_routes(app, kernel, authenticator)
-    if media_uploads is not None:
-        _register_media_upload_route(app, media_uploads, authenticator)
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        nonlocal service
+        if owns_memory:
+            from mindbridge.memory import Memory
+
+            service = Memory(data_dir=data_dir)
+        try:
+            yield
+        finally:
+            if owns_memory and service is not None:
+                service.close()
+                service = None
+
+    def current_service() -> _Memory:
+        if service is None:
+            raise StorageError("the MindBridge API has not started")
+        return service
+
+    app = FastAPI(title="MindBridge", version="0.2.0", lifespan=lifespan)
+    register_error_handlers(app)
+    app.add_middleware(_RequestGate, authenticator=authenticator)
+    router = APIRouter(prefix="/v1")
+    if authenticator is not None:
+        router.dependencies.append(Depends(authenticator))
+    authentication_errors = (status.HTTP_401_UNAUTHORIZED,) if authenticator is not None else ()
+    standard_statuses = (
+        *authentication_errors,
+        status.HTTP_413_CONTENT_TOO_LARGE,
+        status.HTTP_422_UNPROCESSABLE_CONTENT,
+        status.HTTP_503_SERVICE_UNAVAILABLE,
+        status.HTTP_500_INTERNAL_SERVER_ERROR,
+    )
+    standard_errors = error_responses(*standard_statuses)
+    model_errors = error_responses(*standard_statuses, status.HTTP_502_BAD_GATEWAY)
+    not_found_errors = error_responses(*standard_statuses, status.HTTP_404_NOT_FOUND)
 
     @app.get(
         "/healthz",
         response_model=HealthResponse,
         operation_id="health",
-        responses=responses("internal_error"),
+        responses=error_responses(status.HTTP_500_INTERNAL_SERVER_ERROR),
     )
-    async def health() -> HealthResponse:
-        return HealthResponse(trace_id=current_trace_id())
+    def health() -> HealthResponse:
+        return HealthResponse()
 
-    @app.post(
-        "/v1/observations",
-        response_model=ObservationReceipt,
-        status_code=status.HTTP_202_ACCEPTED,
-        operation_id="observe",
-        responses=responses(
-            *TENANT_ERRORS,
-            "idempotency_conflict",
-            "domain_invariant_failed",
-            "task_broker_unavailable",
-        ),
-    )
-    async def observe(
-        request: ObserveRequest,
-        principal: TenantPrincipal = tenant_authentication,
-    ) -> ObservationReceipt:
-        require_tenant(principal, request.tenant_id)
-        return await kernel.observe(request)
-
-    @app.post(
-        "/v1/feedback",
-        response_model=FeedbackReceipt,
+    @router.post(
+        "/memories",
+        response_model=MemoryResponse,
         status_code=status.HTTP_201_CREATED,
-        operation_id="recordFeedback",
-        responses=responses(
-            *TENANT_ERRORS,
-            "memory_not_found",
-            "memory_deleted",
-            "idempotency_conflict",
-            "domain_invariant_failed",
-            # A correction writes a new memory version, so it encodes one before replying.
-            *_EMBEDDING_ERRORS,
-            *_EVIDENCE_ERRORS,
-        ),
+        operation_id="createMemory",
+        responses=model_errors,
     )
-    async def record_feedback(
-        request: FeedbackRequest,
-        principal: TenantPrincipal = tenant_authentication,
-    ) -> FeedbackReceipt:
-        require_tenant(principal, request.tenant_id)
-        return await kernel.record_feedback(request)
+    def create_memory(request: MemoryCreate) -> MemoryResponse:
+        record = current_service().add(
+            _content_input(request.content),
+            occurred_at=request.occurred_at,
+            metadata=request.metadata,
+        )
+        return MemoryResponse.model_validate(record)
 
-    @app.post(
-        "/v1/recall",
-        response_model=RecallResult,
-        operation_id="recall",
-        responses=responses(
-            *TENANT_ERRORS,
-            "enumeration_limit_exceeded",
-            *_EMBEDDING_ERRORS,
-            *_EVIDENCE_ERRORS,
-        ),
+    @router.post(
+        "/memories/batch",
+        response_model=MemoryBatchResponse,
+        status_code=status.HTTP_201_CREATED,
+        operation_id="createMemories",
+        responses=model_errors,
     )
-    async def recall(
-        request: RecallRequest,
-        principal: TenantPrincipal = tenant_authentication,
-    ) -> RecallResult:
-        require_tenant(principal, request.tenant_id)
-        return await kernel.recall(request)
+    def create_memories(request: MemoryBatchCreate) -> MemoryBatchResponse:
+        return MemoryBatchResponse.model_validate(
+            {
+                "memories": current_service().add_many(
+                    tuple(_content_input(content) for content in request.contents)
+                )
+            }
+        )
 
-    @app.get(
-        "/v1/memories/{memory_id}",
-        response_model=MemoryResult,
+    @router.get(
+        "/memories",
+        response_model=PageResponse,
+        operation_id="listMemories",
+        responses=standard_errors,
+    )
+    def list_memories(
+        limit: Annotated[int, Query(ge=1, le=100)] = 50,
+        cursor: Annotated[str | None, Query(min_length=1)] = None,
+    ) -> PageResponse:
+        return PageResponse.model_validate(current_service().list(limit=limit, cursor=cursor))
+
+    @router.post(
+        "/memories/search",
+        response_model=SearchResponse,
+        operation_id="searchMemories",
+        responses=model_errors,
+    )
+    def search_memories(request: QueryRequest) -> SearchResponse:
+        return SearchResponse.model_validate(
+            {"hits": current_service().search(_content_input(request.query), limit=request.limit)}
+        )
+
+    @router.get(
+        "/memories/{memory_id}",
+        response_model=MemoryResponse,
         operation_id="getMemory",
-        responses=responses(
-            *TENANT_ERRORS,
-            "memory_not_found",
-            "memory_deleted",
-            *_EVIDENCE_ERRORS,
-        ),
+        responses=not_found_errors,
     )
-    async def get_memory(
-        memory_id: Identifier,
-        tenant_id: Identifier,
-        principal: TenantPrincipal = tenant_authentication,
-    ) -> MemoryResult:
-        require_tenant(principal, tenant_id)
-        return await kernel.get_memory(tenant_id, memory_id)
+    def get_memory(memory_id: _MemoryId) -> MemoryResponse:
+        return MemoryResponse.model_validate(current_service().get(memory_id))
 
-    @app.get(
-        "/v1/jobs/{job_id}",
-        response_model=ObservationProcessingJobView,
-        operation_id="getObservationJob",
-        responses=responses(*TENANT_ERRORS, "job_not_found"),
+    @router.delete(
+        "/memories/{memory_id}",
+        status_code=status.HTTP_204_NO_CONTENT,
+        operation_id="deleteMemory",
+        responses=standard_errors,
     )
-    async def get_observation_job(
-        job_id: Identifier,
-        tenant_id: Identifier,
-        principal: TenantPrincipal = tenant_authentication,
-    ) -> ObservationProcessingJobView:
-        require_tenant(principal, tenant_id)
-        return await kernel.get_observation_job(tenant_id, job_id)
+    def delete_memory(memory_id: _MemoryId) -> Response:
+        current_service().delete(memory_id)
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
 
-    if aml is not None:
-        aml_settings, aml_generator = aml
-        register_aml_routes(app, kernel, aml_generator, settings=aml_settings)
+    @router.post(
+        "/answers",
+        response_model=AnswerResponse,
+        operation_id="answer",
+        responses=model_errors,
+    )
+    def answer(request: AnswerRequest) -> AnswerResponse:
+        return AnswerResponse.model_validate(
+            current_service().ask(_content_input(request.question), limit=request.limit)
+        )
 
+    app.include_router(router)
     return app
 
 
-def _register_media_upload_route(
-    app: FastAPI,
-    media_uploads: MediaUploadSigner,
-    authenticator: TenantApiKeyAuthenticator,
-) -> None:
-    """Expose the one way bytes enter storage without the deployment lending out credentials.
-
-    The signature is minted for a key the server derives inside the caller's own tenant prefix,
-    so the tenant this resolves is the whole of the authorization: it is resolved exactly as
-    `observe` resolves it, from the same bearer principal and through the same `require_tenant`,
-    because a second and weaker way to name a tenant here would be a way to be signed into
-    another one's prefix.
-    """
-    tenant_authentication = Depends(authenticator)
-
-    @app.post(
-        "/v1/media/uploads",
-        response_model=MediaUploadTicket,
-        operation_id="createMediaUpload",
-        responses=responses(*TENANT_ERRORS, "object_storage_unavailable"),
-    )
-    async def create_media_upload(
-        request: MediaUploadRequest,
-        principal: TenantPrincipal = tenant_authentication,
-    ) -> MediaUploadTicket:
-        require_tenant(principal, request.tenant_id)
-        upload = await media_uploads.create_presigned_upload(
-            request.tenant_id,
-            sha256=request.sha256,
-            suffix=request.suffix,
-            size_bytes=request.size_bytes,
-        )
-        return MediaUploadTicket(
-            upload_url=upload.upload_url,
-            uri=upload.uri,
-            expires_at=upload.expires_at,
-            trace_id=current_trace_id(),
-        )
-
-
-def _register_remember_routes(
-    app: FastAPI,
-    kernel: MemoryKernel,
-    authenticator: TenantApiKeyAuthenticator,
-) -> None:
-    """Expose the single and batch forms of one explicit write over one use case.
-
-    Both are registered here, before the parameterised `/v1/memories/{memory_id}` read: a route
-    for the literal path `batch` has to be matched ahead of the sibling that would otherwise
-    read `batch` as a memory ID.
-    """
-    tenant_authentication = Depends(authenticator)
-    _WRITE_ERRORS = (
-        *TENANT_ERRORS,
-        "idempotency_conflict",
-        "domain_invariant_failed",
-        *_EMBEDDING_ERRORS,
-        *_EVIDENCE_ERRORS,
-    )
-
-    @app.post(
-        "/v1/memories",
-        response_model=RememberResult,
-        status_code=status.HTTP_201_CREATED,
-        operation_id="remember",
-        responses=responses(*_WRITE_ERRORS),
-    )
-    async def remember(
-        request: RememberRequest,
-        principal: TenantPrincipal = tenant_authentication,
-    ) -> RememberResult:
-        require_tenant(principal, request.tenant_id)
-        return await kernel.remember(request)
-
-    @app.post(
-        "/v1/memories/batch",
-        response_model=RememberBatchResult,
-        status_code=status.HTTP_201_CREATED,
-        operation_id="rememberBatch",
-        responses=responses(*_WRITE_ERRORS),
-    )
-    async def remember_batch(
-        request: RememberBatchRequest,
-        principal: TenantPrincipal = tenant_authentication,
-    ) -> RememberBatchResult:
-        """Retain several memories in one call, and so in one encoder round trip.
-
-        The batch settles whole: every write completes before the first failure propagates, so
-        retrying is safe and the memories that already landed come back `duplicate`.
-        """
-        for memory in request.memories:
-            require_tenant(principal, memory.tenant_id)
-        return RememberBatchResult(memories=await kernel.remember(request.memories))
-
-
-def _register_deletion_routes(
-    app: FastAPI,
-    kernel: MemoryKernel,
-    authenticator: TenantApiKeyAuthenticator,
-) -> None:
-    """Expose command, status, and edge propagation over one shared use case."""
-    tenant_authentication = Depends(authenticator)
-
-    @app.post(
-        "/v1/forget",
-        response_model=ForgetReceipt,
-        operation_id="forget",
-        responses=responses(
-            *TENANT_ERRORS,
-            "forget_target_not_found",
-            "idempotency_conflict",
-            # Erasing the bytes is part of the command, and a failure to reach them is
-            # reported rather than swallowed: the tombstone is marked failed and re-raised.
-            "object_storage_unavailable",
-        ),
-    )
-    async def forget(
-        request: ForgetRequest,
-        principal: TenantPrincipal = tenant_authentication,
-    ) -> ForgetReceipt:
-        require_tenant(principal, request.tenant_id)
-        return await kernel.forget(request)
-
-    @app.get(
-        "/v1/deletions",
-        response_model=DeletionPage,
-        operation_id="listDeletions",
-        # A cursor from another tenant, or one whose tombstone is gone, is a domain failure
-        # rather than an empty page: an edge device must not read truncation as completion.
-        responses=responses(*TENANT_ERRORS, "domain_invariant_failed"),
-    )
-    async def list_deletions(
-        tenant_id: Identifier,
-        cursor: Identifier | None = None,
-        limit: Annotated[int, Query(ge=1, le=100)] = 100,
-        principal: TenantPrincipal = tenant_authentication,
-    ) -> DeletionPage:
-        require_tenant(principal, tenant_id)
-        return await kernel.list_deletions(
-            DeletionListRequest(tenant_id=tenant_id, cursor=cursor, limit=limit)
-        )
-
-    @app.get(
-        "/v1/deletions/{tombstone_id}",
-        response_model=ForgetReceipt,
-        operation_id="getForgetStatus",
-        responses=responses(*TENANT_ERRORS, "forget_target_not_found"),
-    )
-    async def get_forget_status(
-        tombstone_id: Identifier,
-        tenant_id: Identifier,
-        principal: TenantPrincipal = tenant_authentication,
-    ) -> ForgetReceipt:
-        require_tenant(principal, tenant_id)
-        return await kernel.get_forget_status(tenant_id, tombstone_id)
-
-
-def _register_request_error_handlers(app: FastAPI) -> None:
-    @app.exception_handler(AuthenticationError)
-    async def handle_authentication_error(
-        _request: Request,
-        error: AuthenticationError,
-    ) -> JSONResponse:
-        response = error_response(error.code)
-        if response.status_code == status.HTTP_401_UNAUTHORIZED:
-            response.headers["WWW-Authenticate"] = "Bearer"
-        return response
-
-    @app.exception_handler(RequestValidationError)
-    async def handle_request_validation(
-        _request: Request,
-        error: RequestValidationError,
-    ) -> JSONResponse:
-        return error_response(
-            "request_validation_failed",
-            issues=tuple(
-                ValidationIssue(
-                    location=tuple(str(part) for part in issue["loc"]),
-                    message=issue["msg"],
-                    code=issue["type"],
+def _content_input(content: _Content) -> ContentInput:
+    if isinstance(content, str):
+        return content
+    atoms: list[str | URL | Blob | AssetRef] = []
+    for part in content:
+        if isinstance(part, _InputText):
+            atoms.append(part.text)
+        elif isinstance(part, _InputImage):
+            if part.file_id is not None:
+                atoms.append(AssetRef(id=part.file_id, modality=Modality.IMAGE))
+            else:
+                atoms.append(
+                    _url_or_blob(cast(str, part.image_url), media_type="image/*", name=None)
                 )
-                for issue in error.errors()
-            ),
-        )
+        elif part.file_id is not None:
+            atoms.append(_file_reference(part.file_id, part.media_type))
+        elif part.file_data is not None:
+            atoms.append(
+                Blob(
+                    data=_decode_base64(part.file_data),
+                    media_type=cast(str, part.media_type),
+                    name=part.filename,
+                )
+            )
+        else:
+            atoms.append(
+                _url_or_blob(
+                    cast(str, part.file_url),
+                    media_type=part.media_type,
+                    name=part.filename,
+                )
+            )
+    return tuple(atoms)
 
-    @app.exception_handler(DomainInvariantError)
-    async def handle_domain_error(
-        _request: Request,
-        error: DomainInvariantError,
-    ) -> JSONResponse:
-        # The mapping decides, here and on the other two faces. `or` covers only the case of
-        # this handler being registered for something outside `DOMAIN_INVARIANT_ERROR_CODES`.
-        return error_response(code_for(error) or "domain_invariant_failed", message=str(error))
+
+def _file_reference(file_id: str, media_type: str | None) -> AssetRef:
+    if media_type is None:
+        return AssetRef(id=file_id)
+    if media_type.endswith("/*"):
+        return AssetRef(id=file_id, modality=Modality(media_type.split("/", 1)[0]))
+    return AssetRef(id=file_id, media_type=media_type)
 
 
-def _register_runtime_error_handlers(app: FastAPI) -> None:
-    """Answer known and unexpected failures without leaking their implementation details."""
+def _url_or_blob(
+    value: str,
+    *,
+    media_type: str | None = None,
+    name: str | None,
+) -> URL | Blob:
+    if value.startswith("data:"):
+        embedded_type, data = _decode_data_url(value)
+        if media_type is not None and not _media_type_matches(media_type, embedded_type):
+            raise ValueError("media_type contradicts the data URL")
+        return Blob(data=data, media_type=embedded_type, name=name)
+    return URL(value=value, media_type=media_type, name=name)
 
-    async def handle(_request: Request, error: Exception) -> JSONResponse:
-        # `code_for` walks the MRO, so a subclass of a registered error arrives here and still
-        # resolves. Registration is what guarantees a row, so a miss is a wiring bug here.
-        code = code_for(error)
-        assert code is not None, f"no error code is mapped for {type(error).__name__}"
-        return error_response(code)
 
-    for exception in RUNTIME_ERROR_CODES:
-        app.add_exception_handler(exception, handle)
+def _one_source(**sources: object) -> None:
+    if sum(source is not None for source in sources.values()) != 1:
+        raise ValueError(f"exactly one of {', '.join(sources)} is required")
 
-    @app.exception_handler(Exception)
-    async def handle_unexpected(_request: Request, error: Exception) -> JSONResponse:
-        _LOGGER.exception(
-            "unhandled REST request failure",
-            extra=log_fields(error_type=type(error).__name__),
-        )
-        return error_response("internal_error")
+
+def _media_type_matches(expected: str, actual: str) -> bool:
+    return expected == actual or (
+        expected.endswith("/*") and expected.split("/", 1)[0] == actual.split("/", 1)[0]
+    )
+
+
+def _validate_url_or_data(value: str) -> None:
+    if value.startswith("data:"):
+        _decode_data_url(value)
+        return
+    parsed = urlsplit(value)
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.fragment
+    ):
+        raise ValueError("source must be an HTTPS URL without credentials or a fragment")
+
+
+def _decode_data_url(value: str) -> tuple[str, bytes]:
+    header, separator, payload = value.partition(",")
+    if not separator or not header.endswith(";base64"):
+        raise ValueError("data URL must contain base64 media bytes")
+    media_type = header.removeprefix("data:").removesuffix(";base64").lower()
+    if not media_type or "/" not in media_type:
+        raise ValueError("data URL must declare a media type")
+    return media_type, _decode_base64(payload)
+
+
+def _decode_base64(value: str) -> bytes:
+    try:
+        return base64.b64decode(value, validate=True)
+    except (binascii.Error, ValueError) as error:
+        raise ValueError("file_data must be valid base64") from error
+
+
+def _headers(scope: Scope) -> list[tuple[bytes, bytes]]:
+    return list(scope.get("headers", []))
+
+
+def _one_header(headers: Sequence[tuple[bytes, bytes]], name: bytes) -> bytes | None:
+    values = [value for key, value in headers if key.lower() == name]
+    return values[0] if len(values) == 1 else None
+
+
+def _content_length(headers: Sequence[tuple[bytes, bytes]]) -> int | None:
+    raw = _one_header(headers, b"content-length")
+    if raw is None:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        return None
+    return value if value >= 0 else None
+
+
+def _is_api_path(path: str) -> bool:
+    return path == "/v1" or path.startswith("/v1/")
+
+
+def _request_too_large() -> Response:
+    return error_response(
+        status.HTTP_413_CONTENT_TOO_LARGE,
+        "request_too_large",
+        f"request body must not exceed {_MAX_REQUEST_BODY_BYTES} bytes",
+    )

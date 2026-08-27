@@ -1,1 +1,0 @@
-"""MindBridge application use cases."""

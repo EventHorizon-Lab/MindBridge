@@ -1,180 +1,97 @@
 # Changelog
 
-All notable changes to MindBridge are recorded here.
-
-The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
-aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) from 1.0.0 onward.
-
-Until then: the REST contract, the Python SDK, and the MCP tool surface are stable enough to
-build against, but the storage schema still changes through numbered migrations and carries no
-compatibility promise across them.
+All notable changes to MindBridge are recorded here. The format follows
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/). MindBridge is pre-1.0, so minor releases
+may contain breaking changes.
 
 ## Unreleased
 
-Nothing has been released yet. `0.1.0` in `pyproject.toml` is the development version.
+This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` design.
 
-The capabilities present on `master` today:
+### Added
 
-### Memory
+- A direct `Memory()` API with `add`, `add_many`, `search`, `ask`, `get`, `list`, `delete`,
+  `reindex`, and `optimize`.
+- An `AsyncMemory` facade with the same operations and return values.
+- Frozen, slotted public content/result types for text, image, video, audio, and omni memories,
+  plus a stable `MindBridgeError` exception hierarchy.
+- SQLite as the authoritative local store for records, canonical FP32 embeddings, compatibility
+  metadata, and a durable Zvec outbox.
+- Content-addressed local media storage with safe Path/Blob ingestion, explicit HTTPS host
+  allowlists, per-hop public-IP connection pinning, exact/family MIME validation, and
+  reference-counted cleanup.
+- Zvec 0.7 dense cosine HNSW, full-text search, and reciprocal-rank hybrid retrieval.
+- Crash-recoverable index replay and rebuild from SQLite without re-embedding stored content.
+- A resource-oriented REST API under `/v1`, five typed MCP stdio tools, and small lifecycle CLIs.
+- One ordered multimodal contract across Python, REST, and MCP; response assets expose stable
+  metadata without leaking local paths over wire protocols.
+- Independent embedding, generation, and transcription endpoints, explicit model capabilities,
+  durable transcription-space identity, capability-driven ASR plus visual-language fallback, and a
+  public `ModelBackend` seam.
+- A narrow `EmbeddingBackend` seam, default pinned Jina v5 Omni adapter, and generic Sentence
+  Transformers adapter using standard multimodal dict/message inputs for models such as Qwen3-VL.
+- A narrow `SpeechBackend` seam and default lazy FunASR composition: pinned Fun-ASR-Nano,
+  FSMN-VAD, CAM++ diarization, timed transcripts, and SQLite-backed anonymous speaker recognition
+  across recordings.
+- Named local speaker registration and optional batched vLLM decoding without dropping FSMN-VAD,
+  CAM++ diarization, or stable identity matching.
+- Local SQLite schema v4 adds optional speaker names; existing schema versions migrate in place.
+- Physical benchmark isolation plus local-index and LoCoMo-Refined runners.
+- Enforced POSIX `0700` data directories and `0600` database/lock files, fork-use rejection,
+  bounded public input, REST body limits, pre-body bearer authentication, and TLS requirements for
+  non-loopback CLI binds.
+- Typed Jina text inputs so URL- or path-shaped application text cannot trigger the model's remote
+  media downloader or bypass MindBridge asset validation.
 
-- Evidence-grounded write path: observations derive Event, Entity, and Claim records from original
-  audio and video, with millisecond-accurate `EvidenceSpan` pointers back into the recording.
-- Six memory types (`episodic`, `semantic`, `procedural`, `prospective`, `working`, `perceptual`)
-  with explainable lifecycle: strength, salience, decay, and hot/cold/compressed transitions.
-- Consolidation sweeps for Episode, Claim, Summary, and cross-clip entity resolution.
-- Feedback that versions rather than overwrites: `useful`, `wrong`, `missing`, and `correction`.
-- Transitive, durable `forget()` with content-free tombstones that offline devices reconcile
-  against.
+### Changed
 
-### Retrieval
+- Isolation is now one physical `data_dir` per application or benchmark unit. There is no hidden
+  default scope or logical partition inside a store.
+- The primary developer flow is `Memory()` → `add()` → `search()` or `ask()`.
+- The base dependency set is `httpx`, `pydantic`, and `zvec`; FastAPI/Uvicorn and MCP are optional
+  extras. Sentence Transformers and local media decoders live in the optional `local` extra.
+- Local embedding spaces are derived from adapter recipe, immutable model revision, effective
+  native/Matryoshka dimension, normalization, and query/document semantics.
+- SQLite commits before Zvec changes. Zvec is disposable, and only successfully flushed outbox
+  operations are acknowledged.
+- Remote model work may run concurrently; only the short SQLite commit/outbox and Zvec critical
+  sections serialize within one `Memory`.
+- The first authoritative non-empty name for a CAS digest is reused when identical bytes later
+  arrive under a different filename.
+- Server deployments use exactly one process worker per directory.
+- The supported product slice is aggregate text and media memory. Each memory currently owns one
+  embedding; metadata is payload, not filtering or authorization.
 
-- Two-stage reciprocal rank fusion across evidence, memory, graph, and hierarchy rankings, then
-  against PostgreSQL full-text search.
-- Three recall modes: `answer`, `search`, and `enumerate`, the last failing explicitly rather than
-  truncating an oversized scope.
-- Multimodal queries — text, stored media, or both.
-- Explicit native-Omni or lazy FunASR + CAM++ speaker-turn routing for the bundled
-  OpenAI-compatible generator.
-- Grounded follow-up through a strict `memory_ids` scope.
+### Removed
 
-### Interfaces
+- Tenant, user, run, and implicit-scope fields from Python, REST, MCP, schemas, and storage.
+- PostgreSQL, pgvector, numbered SQL migrations, row-level security, and database integration
+  setup.
+- Celery, Redis, S3, background consolidation, service workers, and telemetry infrastructure.
+- Legacy observation, lifecycle, graph, evidence, edge identity, specialized media-pipeline,
+  plugin-registry, and service-specific multimodal APIs.
+- Benchmark runners coupled to those removed service and specialized media stacks.
 
-- REST API with a generated OpenAPI document and a closed error-code contract.
-- Official MCP server over stdio with seven tools, sharing the REST schemas.
-- Typed asynchronous Python SDK in the base package, with resumable job-progress streaming, and
-  `observe_file()` for a local path: it hashes the file, takes a presigned upload signed only into
-  the caller's own tenant prefix, sends the bytes to object storage directly rather than through
-  the API, and observes the resulting URI.
-- `mindbridge observe <path> --tenant-id <id>` for the same thing from a shell, so handing
-  MindBridge a file already on disk needs neither a Python script nor three `curl` calls in the
-  right order. It prints the receipt as JSON, and its `processing_job_id` is the reminder that the
-  observation is stored while the memory derived from it does not exist yet.
-- `mindbridge` and `mindbridge-bench` command trees with a documented exit-status contract.
+### Upgrade notes
 
-### Platform
+- Existing PostgreSQL data is not converted automatically. Export the source text, metadata,
+  event time, and source media, then ingest into a new local directory.
+- Old Python signatures, REST routes, MCP tools, CLI commands, and environment variables are not
+  compatibility-shimmed.
+- Keep only the model variables documented in [configuration](docs/configuration.md); choose a
+  separate `data_dir` for every independent memory domain.
+- Do not point `Memory` at an old database directory. Start with an empty path and keep the former
+  deployment available until retrieval has been validated.
 
-- Multi-tenant isolation through forced PostgreSQL row-level security plus API-key allowlists.
-- Model plugin architecture over `importlib.metadata` entry points; models are frozen.
-- Embedding spaces with a startup probe that refuses to serve a stranded tenant.
-- Platform-neutral edge path with on-device anonymous identity, an encrypted local store, a
-  durable outbox, and offline recall.
-- OpenTelemetry across REST, model calls, PostgreSQL, S3, and queued jobs, capturing no user
-  content.
-- Benchmark harness driving the production API across twelve official datasets plus the Agent
-  Memory Leaderboard offline replay. `mindbridge-bench eval --tasks a,b,c` runs several of them
-  from one invocation against one deployment, from a shipped task catalog rather than a file you
-  write, downloading each official release it needs at a pinned revision and verifying it against
-  a committed digest. Task names are the only argument with no default. Each task writes into a
-  directory of its own, and the sweep ends by printing a results table naming, per task, the
-  numbers its manifest and score sidecar carry and which of the two each came from; `--report DIR`
-  prints it again for an earlier run, which is how a benchmark scored afterwards reports without
-  running twice. `--limit N` scopes any runner to its first N units for a smoke run, the media
-  ingest deadlines reach every task whose runner accepts them, and naming a task obtains what it
-  reads: the annotations, the media behind them, and the prepared-media manifest, staged into the
-  deployment's own bucket per run — **every task in the catalog, with no exception left for the
-  operator to fill in.** Ego4D and M3-Bench's web videos are the two media sets no pinned snapshot
-  supplies, so they are acquired rather than downloaded: the sweep drives the `ego4d` CLI for the
-  first and `yt-dlp` for the second, narrowed to the units the run selected, and `--list-tasks`
-  marks those two `acquire` so the prerequisite is visible before the run rather than minutes into
-  it. When a prerequisite is genuinely absent — no Ego4D signature, no `yt-dlp`, no acquirer
-  installed — the operator's own instructions are still what gets printed, now alongside what
-  actually failed. `--no-download` refuses the annotation fetch, the media fetch, and the
-  acquisition instead of performing any of them. Scoring follows
-  lmms-eval's contract: each benchmark declares who scores it, the four whose protocol is exact
-  match score themselves, the seven whose answers are free text are judged by a model called from
-  inside the run, and `--predict-only` reports the `999` bypass sentinel instead. A judge that
-  cannot be read scores the answer `0.0` — upstream's behaviour — with the count of floored
-  answers recorded beside the number and printed under the table. A judged benchmark with no
-  `MINDBRIDGE_BENCH_JUDGE_ENDPOINT` is refused before it ingests anything, not after, because a
-  judged run that finishes and then cannot score writes no predictions at all.
-- Python 3.10 through 3.14, with the whole quality gate — format, lint, types, tests — run on
-  every one of them.
+### Current limits
 
-### Upgrading an existing deployment
-
-Called out on their own because these are the changes that cost an operator real work.
-
-- **Migration `0021`** drops `model_revision` from `events`, `claims`, `memory_records`, and
-  `embeddings`, and `space_revision` from `embeddings`. No manual step: it recreates the unique key
-  and both embedding-space indexes without those columns, deletes the later of any two vectors that
-  differed only by revision, and strips the retired key from stored identity spans.
-- **Removed environment variables:** `MINDBRIDGE_GENERATOR_MODEL_REVISION`, which was *required*,
-  plus the optional `MINDBRIDGE_EMBEDDER_MODEL_REVISION` and
-  `MINDBRIDGE_EMBEDDING_SPACE_REVISION`.
-- **`MINDBRIDGE_MEDIA_EMBEDDER_MODEL_REVISION` is back**, optional, and it is the one of these
-  names that was not merely a record: it pins the commit the local Jina encoder downloads and
-  therefore which remote code executes under `trust_remote_code=True`. Unset, the pin is resolved
-  from the model id — the bundled commit for the bundled repository, and nothing for a repository
-  you named yourself, which that commit could not resolve against. Change it and change
-  `MINDBRIDGE_EMBEDDING_SPACE_ID` with it; nothing else can see that the encoder moved.
-- **A `*_CONFIG_JSON` object naming a retired name no longer fails startup.** `model_revision`,
-  `space_revision`, and `association_model_revision` are ignored where the plugin does not declare
-  them; every other unrecognized key still fails the factory. Where a plugin does declare one — the
-  local Jina encoder's `model_revision` — the operator's value is kept rather than defaulted.
-- **`POST /v1/observations` accepts and ignores `model_revision`** inside `identity_observations`,
-  and so does the `observe` MCP tool, so a rolling upgrade that moves the server first does not
-  422 the fleet behind it. Removing a field is not the same as forbidding it. Any *other* unknown
-  field is still `request_validation_failed`.
-- **Migration `0025`** widens the `embeddings` unique key with `space_id`, clears `observe`
-  idempotency claims and identity-bearing observation digests recorded before `0021` (both were
-  digested by a recipe that no longer exists, so a byte-identical resend could never match again;
-  the reprocess is idempotent), makes `observations.content_digest` nullable, and grants
-  `mindbridge_runtime` SELECT on `schema_migrations`. No manual step. Necessary but not
-  sufficient for re-embedding into a second space — see `0026`, which supplies the rest.
-- **Migration `0027`** adds `embeddings.object_part` and widens the vectors unique key with it,
-  so an object embedded in pieces gets one row per piece. An evidence span longer than the
-  encoder's audio window is cut into several clips of different sound; all of them share one
-  `object_id`, because `recall` reads that column back as an `EvidenceId`, so the second clip
-  used to conflict with the first, be read as content drift, and raise **inside the single
-  transaction that commits an observation's derived records** — one long audio span cost the
-  whole observation, events and claims and memories included, not just its own vector. No manual
-  step and no re-encode: `embedding_id` already hashed the clip ordinal, so no ID changes.
-- **Migration `0026`** adds `embeddings.embedding_id_recipe`, recording which recipe derived each
-  stored `embedding_id`. `embedding_id` now hashes `space_id` in every recipe, and that is what
-  makes re-embedding into a second space actually work for claims, events, entities, evidence
-  spans and consolidated summaries rather than only for memory records: the table is also keyed
-  by `embedding_id`, so widening the unique key alone left the second vector colliding on the
-  primary key. No manual step — the first write to touch a row an older recipe named re-keys it
-  in place, so the first pass after this migration pays one re-encode per object it has not yet
-  seen under its new name. Memory-record vectors keep the IDs they already have.
-
-### Two harness costs that were being paid silently
-
-Called out because both were invisible until a real run was watched rather than a test read.
-
-- **A `--limit 1` M3-Bench run fetched the whole subset.** `prepare_m3` was the one producer that
-  asked `ensure_media` for its media set without narrowing it, so cutting one robot video
-  downloaded all 100 of them — 117 GiB — and the same call would have asked an acquirer for
-  all 920 web videos. It now names the single file it is missing, which is what the other producers
-  already did. The absent-media message is split-aware too: the robot half is 100 files totalling
-  117 GiB and the web half 920 downloads of about 100 MB, so one figure for both was wrong by an
-  order of magnitude about whichever split you were running. Both numbers are measured — the first
-  from `repo_info(files_metadata=True)` at the pinned revision, the second from real downloads.
-  Neither came from `yt-dlp`'s `filesize_approx`, which is bitrate times duration and read 26x low
-  on a video that arrived as 712 MB. The robot split is quoted as a total rather than per file
-  because its range is 0.28 to 3.13 GiB, so no single per-file figure describes it.
-- **Those fetches were also silent.** `prepare_m3` and the Video-MME/EgoTempo `_source` helper
-  passed no `announce`, so a 712 MB acquisition and a multi-gigabyte Hub download ran to completion
-  with nothing on stderr. Both now report, and both honour `--quiet`.
-
-### Known gaps
-
-- No complete public-benchmark baseline currently stands. See
-  [benchmarking](docs/benchmarking.md#current-baseline-status).
-- No per-tenant quotas or rate limiting.
-- No automatic re-embedding when embedding space or dimension changes.
-- Retrieval follows direct `same_as` entity aliases but deliberately does not compute transitive
-  closure.
-- Storage schema compatibility is not guaranteed across migrations.
-
----
-
-## Conventions
-
-Each release records changes under **Added**, **Changed**, **Deprecated**, **Removed**, **Fixed**,
-and **Security** as they apply.
-
-Two kinds of entry always get called out explicitly, because they cost operators real work:
-
-- **Migrations.** Named by number, with any manual step spelled out.
-- **Configuration changes.** New, renamed, or removed environment variables.
+- No chat-message arrays, large-file wire upload endpoint, update route, metadata filter,
+  distributed writer, or runtime plugin registry.
+- No automatic chunking, multiple embeddings per memory, per-asset retrieval, or reranking stage.
+- No in-place re-embedding or retranscription when a persisted embedding/transcription space or
+  dimension changes; create a new directory and re-encode source content instead.
+- Built-in `data` transport accepts at most 64 MiB of aggregate raw media per embedding or
+  generation call; answer requests emit one binary part per distinct asset and accept at most 4 MiB
+  of serialized text evidence. Larger video requires co-located `file` transport or a custom
+  streaming/upload backend.
+- No built-in user authentication, rate limiting, quotas, or secure-erasure guarantee.

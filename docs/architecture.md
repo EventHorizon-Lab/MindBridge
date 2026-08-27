@@ -1,291 +1,175 @@
 # Architecture
 
-How MindBridge is put together at runtime, and why the boundaries fall where they do. For the
-domain vocabulary, read [concepts](concepts.md) first. The full design specification, including
-the decision log and the constraints each decision accepts, is
-[docs/technical-architecture.md](technical-architecture.md) (Chinese).
+MindBridge is an embedded library, not a distributed memory service. The process that imports
+`Memory` owns persistence, media materialization, indexing, and model calls for one directory.
 
-## Code layout
-
-MindBridge is a modular monolith with separate asynchronous worker roles. Dependencies point
-inward, and the import direction is enforced rather than merely documented.
-
-```text
-src/mindbridge/
-├── core/            Domain types and invariants. Imports nothing from the layers below.
-├── application/     Use cases and ports. The memory kernel lives here.
-├── infrastructure/  PostgreSQL, S3, Celery adapters.
-├── models/          Generator and embedder plugin adapters.
-├── api/             REST, MCP, and auth. Protocol translation only.
-├── edge/            On-device capture, identity, outbox, sync.
-├── media/           Lazy-loaded AV decoders.
-└── benchmarks/      Evaluation harness. A leaf: no product module may import it.
-```
-
-Two rules are load-bearing:
-
-**One kernel, two protocol adapters.** `application.kernel.MemoryKernel` holds the public use
-cases. REST and MCP translate the same Pydantic contracts into it; the Python SDK calls REST.
-REST-only transport features such as SSE job progress remain explicit instead of being simulated
-over MCP.
-
-**`benchmarks/` is a leaf.** It may call only the public SDK and contracts. This is why
-`mindbridge` and `mindbridge-bench` are separate binaries — a single command tree would have to
-reference benchmark modules by string to route to them, which is exactly the loophole the AST
-guard was tightened to catch.
-
-## Process topology
+## Components
 
 ```mermaid
-flowchart TB
-  subgraph proc["Deployable processes"]
-    jina["SentenceTransformers service (Jina default)<br/><code>mindbridge sentence-transformers serve</code>"]
-    api["API<br/><code>uvicorn mindbridge.server:create_app</code>"]
-    mcp["MCP stdio<br/><code>mindbridge mcp</code>"]
-    worker["Memory worker<br/><code>celery -A mindbridge.celery_app:app</code>"]
-    beat["Consolidation beat<br/><code>celery -A mindbridge.celery_app:app beat</code>"]
-    cons["Consolidation<br/><code>mindbridge consolidate</code><br/>or a beat-scheduled worker"]
-    life["Lifecycle<br/><code>mindbridge lifecycle</code>"]
-  end
-
-  subgraph data["Stores"]
-    pg[("PostgreSQL 18<br/>+ pgvector 0.8")]
-    redis[("Redis")]
-    s3[("Object storage")]
-  end
-
-  subgraph models["External model endpoints"]
-    gen["Generator<br/>OpenAI-compatible"]
-  end
-
-  api --> pg & redis & s3 & gen & jina
-  mcp --> pg & redis & s3 & gen & jina
-  redis --> worker
-  beat --> redis
-  redis --> cons
-  worker --> pg & s3 & gen & jina
-  cons --> pg & s3 & gen & jina
-  life --> pg & s3
+flowchart LR
+    App[Application] --> API[Memory, REST, or MCP]
+    API --> Normalize[Content normalization and routing]
+    Normalize --> Assets[Content-addressed asset store]
+    Normalize --> Embedder[EmbeddingBackend]
+    Embedder --> Embed[Sentence Transformers or cloud embedding]
+    Normalize --> Models[ModelBackend]
+    Models --> Generate[Generation endpoint]
+    Normalize --> Speech[SpeechBackend]
+    Speech --> ASR[FunASR or custom speech analysis]
+    Normalize --> SQLite[SQLite authority]
+    SQLite --> Outbox[Durable index outbox]
+    Outbox --> Zvec[Zvec hybrid projection]
+    Zvec --> API
+    SQLite --> API
 ```
 
-| Process | Extra | Scaling unit | Holds a model? |
-| --- | --- | --- | --- |
-| Jina service | `server` + `cloud-models` | One process per GPU | Yes — Jina v5 Omni |
-| API | `server` | Stateless; scale horizontally | No |
-| MCP stdio | `server` | One per agent session | No |
-| Memory worker | `server` + `media` | One process per queue | No, unless the local Jina plugin is selected. |
-| Consolidation beat | `server` | One per deployment | No |
-| Consolidation | `server` | One scheduled run per tenant | No |
-| Lifecycle | `server` | One scheduled run per tenant | No |
-| Edge sync/identity | `edge` | One per device | Yes — on-device identity models |
+| Component | Responsibility |
+| --- | --- |
+| `Memory` | Content normalization, capability routing, identity, orchestration, public errors |
+| `AsyncMemory` | `asyncio.to_thread` facade over the same synchronous core |
+| `AssetStore` | Safe Path/URL/Blob ingestion, public-IP connection pinning, immutable SHA-256 files |
+| `LocalStore` | SQLite schema, transactions, records, asset references, FP32 embeddings, outbox |
+| `ZvecIndex` | Dense, full-text, and reciprocal-rank hybrid retrieval |
+| `EmbeddingBackend` | Embedding capabilities, stable model/space identity, query/document batches |
+| `ModelBackend` | Combined cloud embedding compatibility, grounded generation, and transcription |
+| `SpeechBackend` | Timed transcription, diarization, and stable speech-space identity |
+| `FunASRTranscriber` | Lazy Fun-ASR-Nano with AutoModel/vLLM, FSMN-VAD, and CAM++ |
+| `JinaOmniEmbedder` | Pinned default model and isolated Jina tuple/remote-code compatibility |
+| `SentenceTransformersEmbedder` | Standard multimodal dict/message input and model capability discovery |
+| FastAPI adapter | Optional `/v1` JSON transport, body limit, bearer authentication |
+| MCP adapter | Optional five-tool stdio transport with strict argument allowlists |
 
-In the recommended served path, the API and workers load no model: one SentenceTransformers
-process owns the Jina weights and serves every modality. Selecting the local Jina plugin is an
-explicit Worker-only opt-in that loads one model copy per process.
+Python, REST, and MCP call the same local core. Protocol adapters translate wire parts; they do not
+reimplement modality, identity, storage, or retrieval rules.
 
-## Write path
+## Isolation boundary
 
-```mermaid
-sequenceDiagram
-  participant D as Device
-  participant S as Object storage
-  participant A as API
-  participant Q as Redis
-  participant W as Worker
-  participant P as PostgreSQL
+One physical `data_dir` belongs to one live `Memory` instance. An operating-system file lock is
+held for its lifetime, so a second instance or process fails at construction rather than racing
+SQLite, the CAS, or Zvec. On POSIX, opening the directory enforces top-level mode `0700`; an
+existing broader mode is tightened rather than preserved.
 
-  D->>S: upload media
-  D->>A: POST /v1/observations
-  A->>P: observation + media + evidence (one transaction)
-  A->>Q: enqueue processing job
-  A-->>D: 202 receipt + processing_job_id
-  W->>Q: claim job
-  W->>S: build generation proxy (when enabled)
-  W->>W: perception -> Event / Entity / Claim
-  W->>S: reread source; cut span-sized derived clips
-  W->>W: send clips and text to the shared embedder
-  W->>P: graph + memories + vectors (one transaction)
-```
+Independent directories are the only supported isolation mechanism:
 
-`observe()` is synchronous only up to durability. It registers the observation, its media, and
-its evidence spans in one transaction, enqueues the job, and returns — memory does not exist
-yet when that receipt returns. Callers poll `GET /v1/jobs/{job_id}` or follow the SSE stream.
+1. Parallel benchmark cases allocate separate leaf directories.
+2. A REST or MCP deployment uses one process per directory.
+3. Applications that require distinct memory domains use distinct paths.
 
-Three properties of the worker stage are worth knowing before you tune it:
+There is no tenant, user, run, or hidden scope key inside SQLite or Zvec. Metadata is not an
+authorization boundary.
 
-- **Source reads are explicit.** With the generation proxy enabled, the worker reads a video once
-  to build the model-sized proxy and again after perception to derive evidence clips. With it
-  disabled or skipped, the model reads the signed source and the worker reads it once for clip
-  derivation.
-- **Clips follow grounded spans.** Image and video spans produce one derived clip; audio longer
-  than the encoder's 30-second window is split so its tail is not lost. Each vector therefore
-  covers a span-sized window instead of the whole source.
-- **Clips are uploaded before the transaction that registers them.** An interrupted attempt can
-  leave an object no record references. Clip keys are content-addressed so a retry cannot
-  multiply it, and `mindbridge lifecycle --reclaim-orphan-clips` deletes what is already there.
+## Content and model routing
 
-### Idempotency
-
-Every write accepts an `idempotency_key`, and derives one from the content when it is omitted.
-An identical resend answers `duplicate` with the original record rather than storing a second
-copy. A *different* body under a key already in use fails with `idempotency_conflict` rather
-than silently overwriting.
-
-## Read path
+The core first turns `str`, `Path`, `URL`, `Blob`, and `AssetRef` atoms into normalized text and
+resolved immutable assets. It computes modality from media families, then routes each model
+operation from `ModelCapabilities`.
 
 ```mermaid
 flowchart TD
-  q["RecallRequest"] --> scope{"memory_ids given?"}
-  scope -->|yes| direct["Strict ID scope<br/>no search"]
-  scope -->|no| embed["Embed query<br/>text + media -> one vector"]
-
-  embed --> v1["vector: evidence_span"]
-  embed --> v2["vector: memory_record"]
-  embed --> v3["vector: event / claim / entity"]
-
-  v1 --> m1["memories by evidence"]
-  v2 --> m2["memories by ID"]
-  v2 --> m3["memories by hierarchy"]
-  v3 --> m4["memories by graph"]
-
-  m1 & m2 & m3 & m4 --> rrf1["RRF fuse"]
-  lex["PostgreSQL full-text<br/>(when query has text)"] --> rrf2
-  rrf1 --> rrf2["RRF fuse"]
-  rrf2 --> ans["Answer rounds<br/>bounded reflection budget"]
-  direct --> ans
-  ans --> vis["Re-check deletion, supersession,<br/>filters immediately before answering"]
-  vis --> out["RecallResult + signed evidence"]
+    Input[Normalized text and assets] --> Native{Operation supports every atom?}
+    Native -->|yes| Call[Call operation with native media]
+    Native -->|no| Audio{Unsupported atoms are audio?}
+    Audio -->|no| Fail[Raise ModelError]
+    Audio -->|yes| ASR[Transcribe audio]
+    ASR --> Merge[Add transcript and retain supported image/video]
+    Merge --> Supported{Remaining input supported?}
+    Supported -->|yes| Call
+    Supported -->|no| Fail
 ```
 
-Reciprocal rank fusion is applied twice — once across the four structure-derived rankings, once
-against the lexical ranking — with a rank constant of 60. Fusion combines *ranks*, never raw
-scores, because a cosine similarity and a `ts_rank` are not on a comparable scale and averaging
-them produces a number that means nothing.
+This is capability-driven, not a model-name heuristic. A visual-language model without audio
+support receives ASR text plus retained visual parts. Native audio-capable operations receive the
+original audio. Audio-only input becomes transcript-only only when fallback is required.
 
-Three details that matter operationally:
+Embedding is local Jina v5 Omni by default. Another standard Sentence Transformers model plugs in
+through `embedder=`; Qwen3-VL uses its native dict/message contract and advertised capabilities.
+A combined cloud `ModelBackend` can still own embedding and transcription when passed explicitly
+without `embedder=` or `transcriber=`. Generation uses OpenAI-compatible HTTP by default; speech
+uses local FunASR by default.
+Both embedding `space_id` and `transcription_space` are persisted in SQLite. A different active
+value fails at startup so vectors, cached transcripts, and add-time ASR-derived text never mix
+semantic recipes in one directory.
 
-- **Filters apply before ranking, not after.** A time or person filter narrows the candidate
-  set rather than trimming an already-ranked list, so a filtered query does not silently return
-  fewer results than its limit because the filter ate the top of the ranking.
-- **Visibility is re-checked immediately before answering.** A memory deleted or superseded
-  during a long reflection round does not reach the answer.
-- **The hierarchy ranking is empty until consolidation runs.** `memories by hierarchy` walks
-  `contains` edges, which only the Summary sweep writes, so a deployment that never consolidates
-  fuses three rankings rather than four and can answer only from individual moments. See
-  [operations](operations.md#built-in-consolidation-schedule).
+The built-in `data` transport limits each embedding or generation request to 64 MiB of aggregate
+raw media before base64 expansion. Answer construction includes a distinct asset's binary part only
+once, even when multiple hits reference it. Trusted co-located deployments can use `file` transport;
+large-video integrations can implement streaming or provider-native upload in `ModelBackend`.
 
-`occurred_after` is inclusive and `occurred_before` is **exclusive**. The asymmetry is
-deliberate — it makes adjacent windows tile without overlap — but it does surprise people.
+## Write consistency
 
-### Recall modes
+An add follows this order:
 
-| Mode | Behaviour |
-| --- | --- |
-| `answer` | Reasons over retrieved memories and fills `answer`. The default. |
-| `search` | Ranks and returns memories; `answer` stays null. |
-| `enumerate` | Scans the complete structured-filter scope for count and timeline questions, verifies candidates against original media in bounded generator batches, and returns every occurrence chronologically. |
+```mermaid
+sequenceDiagram
+    participant A as Application
+    participant M as Memory
+    participant C as Asset CAS
+    participant E as Model backend
+    participant S as SQLite
+    participant Z as Zvec
 
-`enumerate` fails with `enumeration_limit_exceeded` above 1,000 candidates rather than silently
-truncating. A count that quietly drops its tail is worse than no count.
+    A->>M: add(content)
+    M->>C: materialize or resolve assets
+    C-->>M: ordered immutable descriptors
+    M->>S: look up stable memory ID
+    alt record already exists
+        S-->>M: existing record and assets
+    else new record
+        M->>E: embed one aggregate ModelInput
+        E-->>M: one vector
+        M->>S: transaction(record, assets, vector, outbox)
+        S-->>M: committed
+    end
+    M->>Z: apply current outbox state
+    M->>Z: flush
+    M->>S: acknowledge exact operations
+    M-->>A: MemoryRecord
+```
 
-## Connection budget
+SQLite commits before Zvec changes. The outbox is acknowledged only after a successful index
+flush. If indexing fails after commit, the call can raise `IndexUnavailableError` even though the
+record, asset references, and embedding are durable. Retrying the same idempotent add or reopening
+after repair drains pending work without duplicating the record.
 
-One recall peaks near ten PostgreSQL connections: a lexical search runs concurrently with three
-vector searches, then four memory searches, and a reflection round runs several such waves at
-once. `MINDBRIDGE_DATABASE_MAX_POOL_SIZE` defaults to 32 for that reason — a value near ten
-would let a single recall occupy the entire pool. The pool still opens one connection eagerly,
-so a higher ceiling costs nothing until load asks for it. Keep it under the server's own
-`max_connections`.
+CAS bytes are installed atomically by digest. SQLite owns whether a file is referenced; deletion
+removes the file only after its final memory relationship is gone. Asset display names are also
+digest-level metadata: the first authoritative non-empty name wins when the same bytes arrive under
+different names.
 
-## Storage
+Potentially slow model calls happen outside the local write lock, so concurrent operations may
+overlap remote inference. MindBridge serializes only the SQLite commit/outbox and Zvec critical
+sections needed to preserve local consistency; maintenance operations such as reindex and optimize
+remain exclusive.
 
-PostgreSQL is the only primary store. Schema changes go through numbered SQL in `migrations/`,
-applied in order.
+## Read consistency
 
-**Row-level security is forced, not advisory.** Migration `0005` creates the non-login
-`mindbridge_runtime` role and enables forced RLS on every table carrying a `tenant_id`; each
-store transaction sets one tenant locally. Granting the API login `SUPERUSER` or `BYPASSRLS`
-disables tenant isolation completely, so don't.
+Search drains pending index work and prepares one aggregate query embedding. A routed query with
+text uses Zvec hybrid search; a pure-media query uses dense search. MindBridge then hydrates records
+and ordered asset descriptors from SQLite, preserves ranking, and drops candidates missing from
+authoritative state.
 
-One index decision is worth recording because it looks like a regression: migration `0018` drops
-the HNSW vector index. Under RLS the planner always has a tenant predicate available — RLS
-injects `tenant_id`, and `embeddings_space_search_idx` leads with it — so it reached one tenant's
-vectors directly and never read the HNSW index at all. Measured on 200,000 vectors across 40
-tenants through the real `mindbridge_runtime` role: 0 scans, 1,196 MB occupied, while the btree
-served all 25 scans from 1,648 kB. It was not free either — maintaining the graph on insert cost
-18.8×.
+Listing bypasses Zvec and reads newest records directly from SQLite with an opaque keyset cursor
+over `(created_at, id)`.
 
-This is a consequence of the multi-tenant shape, not a claim that approximate search is useless.
-Exact scan cost grows linearly with **one tenant's** vector count — roughly 5 ms at 1,000 rows
-and 51 ms at 11,000 — so a deployment that ever concentrates millions of vectors in a single
-tenant should add the index back. The migration file carries the exact `CREATE INDEX` to use and
-the `hnsw.iterative_scan` setting that must stay alongside it.
+## Recovery model
 
-Object storage holds original media and derived clips under
-`s3://<bucket>/tenants/<tenant_id>/<key>`. MindBridge owns no region setting; Boto3's own chain
-resolves region and credentials exactly as it does for every other tool on the host.
+SQLite stores authoritative FP32 embeddings and CAS descriptors, so index recovery needs neither
+the source media nor another historical model call:
 
-## Model boundary
+- Pending outbox work is replayed at open and before dependent operations.
+- If `zvec/` is absent, startup checkpoints all embeddings before creating the replacement index.
+- `reindex()` replaces the derived collection from SQLite in bounded batches.
+- `optimize()` compacts and flushes staged Zvec state.
 
-Models are frozen. Learning happens in the memory layer — feedback, consolidation, strength —
-never in weights. Three slots, selected by plugin name:
+Backups must include both `state.sqlite3` and `assets/`; `zvec/` is useful for faster restore but is
+not authoritative.
 
-| Slot | Default | Loaded by |
-| --- | --- | --- |
-| Generator | `openai` | API, MCP, worker, consolidation |
-| Embedder | `openai` wire adapter to the Jina SentenceTransformers service | API, MCP, worker, consolidation |
-| Media embedder override | inherits Embedder | Worker only |
+## Dependency boundary
 
-Plugins resolve through `importlib.metadata` entry points (`mindbridge.generators`,
-`mindbridge.embedders`), so a third-party adapter is installable without a fork. The author
-contract is in [plugin-architecture.md](plugin-architecture.md).
+The core package depends on HTTPX, Pydantic, and Zvec. Sentence Transformers and media decoders
+live in the `local` extra, FastAPI/Uvicorn in `server`, and MCP in `mcp`. Importing MindBridge does
+not import Torch, Transformers, Sentence Transformers, or either protocol stack.
 
-The worker's text slot deliberately reuses `MINDBRIDGE_EMBEDDER_*` rather than owning a parallel
-variable family. It has to land in the space the API queries; a second name is a second thing
-that can silently disagree. A worker that genuinely needs a different endpoint sets a different
-value for the same name, since each process has its own environment.
-
-## Edge boundary
-
-The edge is platform-neutral — Jetson, RDK, RK, OpenVINO x86, generic ARM, or a workstation
-where the "edge" is a 4090. Only the capture backend and inference runtime change; the
-observation timeline, identity gates, and forget semantics are identical everywhere.
-
-What crosses the boundary is deliberately narrow. The device sends anonymous identity IDs, time
-ranges, optional transcripts, identity scope, and normalized face boxes. **Raw face and voice
-embeddings and the device encryption key never leave it** — they are AES-256-GCM encrypted in a
-local SQLite store keyed from the device TPM or secret manager.
-
-Deletion reconciles in the other direction: an offline device pages `GET /v1/deletions` from its
-last cursor on reconnect, and removes matching cache rows and identity samples before advancing
-it.
-
-See [edge deployment](edge.md).
-
-## Failure behaviour
-
-| Failure | What happens |
-| --- | --- |
-| Embedding space mismatch at startup | API refuses to serve, naming each stranded object type. Not a silent empty recall. |
-| Broker unreachable | `observe()` returns `task_broker_unavailable` (503). Nothing is half-written. |
-| Worker job fails | Job records `failed` with an `error_code`. The stale-job sweep can retry it, so `failed` settles the *attempt*, not the job. |
-| Model returns unusable output | `model_output_invalid` (502), distinct from `model_request_failed` and `model_unavailable`. |
-| Stored state inconsistent | `memory_integrity_failed` (500) rather than a bare unhandled 500. |
-| Media proxy encode fails | Degrades to the pre-proxy behaviour rather than failing the observation. |
-
-Every code in that table is in one table in `api/errors.py`, from which both the raise sites and
-the OpenAPI document are generated. A code cannot reach a caller without also reaching the
-published contract. The full list is in [the REST reference](api/rest.md#error-codes).
-
-## Observability
-
-OpenTelemetry activates per signal. The default OTLP exporter is a no-op without an endpoint;
-`console` emits without a collector, and `none` disables the signal. The official FastAPI,
-HTTPX, psycopg, Celery, and Botocore instrumentations propagate W3C context across REST, model
-calls, PostgreSQL, S3, and queued jobs.
-
-MindBridge captures no authorization headers, request bodies, prompts, memory text, or media in
-telemetry. Response `trace_id` values take the form `trace_<32-hex W3C trace ID>`, so the suffix
-maps directly onto the configured backend.
-
-See [operations](operations.md#telemetry).
+The current retrieval unit is one memory and one aggregate embedding. The architecture does not
+claim content chunking, multiple vectors per memory, or reranking. For table and flow details, read
+[technical architecture](technical-architecture.md).

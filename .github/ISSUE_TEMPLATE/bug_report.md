@@ -1,6 +1,6 @@
 ---
 name: Bug report
-about: Something behaves differently from what the documentation says
+about: Something behaves differently from the documented local-memory contract
 title: ''
 labels: bug
 assignees: ''
@@ -8,16 +8,15 @@ assignees: ''
 
 ## What happened
 
-<!-- Observed behaviour. Include the `trace_id` from a failing response if you have one — it
-identifies the whole request in telemetry and carries no user content. -->
+<!-- Describe the observed behavior. Include the `trace_id` from a REST error when available. -->
 
 ## What you expected
 
-<!-- And where the documentation says so, if it does. -->
+<!-- Link the contract or documentation that describes the expected behavior. -->
 
 ## Reproduction
 
-<!-- The smallest sequence that reproduces it. -->
+<!-- Use a fresh data_dir when possible and provide the smallest complete example. -->
 
 ```python
 
@@ -27,15 +26,18 @@ identifies the whole request in telemetry and carries no user content. -->
 
 - MindBridge version or commit:
 - Python version:
-- Extras installed (`server`, `edge`, `media`, `cloud-models`):
-- PostgreSQL and pgvector versions:
-- Component (API / worker / edge / SDK / MCP / CLI):
-- Deployment (local, Docker, Kubernetes, edge device):
+- Operating system and architecture:
+- Install surface (`base`, `server`, or `mcp`):
+- Component (`Memory`, `AsyncMemory`, REST, MCP, CLI, or benchmark):
+- Data directory state (new, existing, restored, or rebuilt):
+- Filesystem type:
+- Another process or instance using the same `data_dir` (yes or no):
+- Zvec version:
+- Model base URL, embedding model, and dimension (never include credentials):
 
 ## Logs
 
-<!-- Set MINDBRIDGE_TRACEBACK=1 for full frames behind a CLI failure.
-     Redact credentials, memory content, and media URIs. -->
+<!-- Redact credentials, memory content, metadata, and local paths that identify users. -->
 
 ```text
 

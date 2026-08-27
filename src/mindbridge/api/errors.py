@@ -1,269 +1,150 @@
-"""The one REST error contract: every code, its HTTP status, and what it tells a caller.
-
-`app.py` and `events.py` build their responses from this table, and every route documents
-itself from the same entries. A code therefore cannot reach a caller without also reaching
-the OpenAPI document, which is what makes that document the contract rather than a partial
-description of the success path. Adding an error means adding one row here.
-
-The tables also name the failure for the faces that are not REST: `code_for` is what lets the
-job stream and the MCP tools report a failure by the same code REST would, instead of each
-deciding for itself. One mapping, three renderers.
-"""
+"""Stable HTTP errors for the small public API."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, Final, Literal
+import logging
+from collections.abc import Mapping
+from typing import Any
+from uuid import uuid4
 
-from fastapi import status
+from fastapi import FastAPI, Request, status
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+from starlette.exceptions import HTTPException
 
-from mindbridge.contracts import ErrorResponse, ValidationIssue
-from mindbridge.core import (
-    DatabaseUnavailableError,
-    DomainInvariantError,
-    EnumerationLimitExceededError,
-    ForgetTargetNotFoundError,
-    IdempotencyConflictError,
-    JobNotFoundError,
-    MemoryDeletedError,
-    MemoryIntegrityError,
+from mindbridge.api.auth import AuthenticationError
+from mindbridge.exceptions import (
+    IndexUnavailableError,
     MemoryNotFoundError,
-    ModelOutputError,
-    ModelRequestError,
-    ModelUnavailableError,
-    ObjectStorageError,
-    TaskBrokerError,
+    MindBridgeError,
+    ModelError,
+    StorageError,
+    ValidationError,
 )
-from mindbridge.telemetry import current_trace_id
 
-ErrorCode = Literal[
-    "authentication_required",
-    "authentication_failed",
-    "tenant_access_denied",
-    "forget_target_not_found",
-    "memory_not_found",
-    "job_not_found",
-    "idempotency_conflict",
-    "memory_deleted",
-    "request_validation_failed",
-    "domain_invariant_failed",
-    "enumeration_limit_exceeded",
-    "memory_integrity_failed",
-    "model_output_invalid",
-    "model_request_failed",
-    "database_unavailable",
-    "model_unavailable",
-    "object_storage_unavailable",
-    "task_broker_unavailable",
-    "internal_error",
-]
-"""The closed set of error codes, so a misspelling is a type error rather than a KeyError.
-
-`ERRORS` is keyed by this, and every function that takes a code takes this: `error_response`
-runs inside an exception handler, where an unknown key would turn a documented 4xx into an
-unhandled 500. `test_every_documented_error_code_is_a_real_code` covers the other direction,
-a member with no row.
-"""
+_LOGGER = logging.getLogger(__name__)
 
 
-@dataclass(frozen=True, slots=True)
-class ApiError:
-    """One error code's status and the sentence a caller can act on.
+class ErrorIssue(BaseModel):
+    """One invalid request field."""
 
-    `description` is the response `message` wherever the cause carries no detail of its own;
-    the handlers that do have one pass it to `error_response` instead.
-    """
-
-    status_code: int
-    description: str
+    location: tuple[str | int, ...]
+    message: str
+    type: str
 
 
-ERRORS: Final[dict[ErrorCode, ApiError]] = {
-    "authentication_required": ApiError(
-        status.HTTP_401_UNAUTHORIZED,
-        "a valid bearer API key is required",
-    ),
-    "authentication_failed": ApiError(
-        status.HTTP_401_UNAUTHORIZED,
-        "the bearer API key is invalid",
-    ),
-    "tenant_access_denied": ApiError(
-        status.HTTP_403_FORBIDDEN,
-        "the authenticated tenant cannot access this resource",
-    ),
-    "forget_target_not_found": ApiError(
-        status.HTTP_404_NOT_FOUND,
-        "forget target or deletion tombstone does not exist",
-    ),
-    "memory_not_found": ApiError(
-        status.HTTP_404_NOT_FOUND,
-        "memory does not exist",
-    ),
-    "job_not_found": ApiError(
-        status.HTTP_404_NOT_FOUND,
-        "observation processing job does not exist",
-    ),
-    "idempotency_conflict": ApiError(
-        status.HTTP_409_CONFLICT,
-        "the idempotency key already stores different content",
-    ),
-    "memory_deleted": ApiError(
-        status.HTTP_410_GONE,
-        "memory content was explicitly deleted",
-    ),
-    "request_validation_failed": ApiError(
-        status.HTTP_422_UNPROCESSABLE_CONTENT,
-        "request validation failed",
-    ),
-    "domain_invariant_failed": ApiError(
-        status.HTTP_422_UNPROCESSABLE_CONTENT,
-        "the request is well-formed but violates a memory invariant",
-    ),
-    "enumeration_limit_exceeded": ApiError(
-        status.HTTP_422_UNPROCESSABLE_CONTENT,
-        "the enumerate scope exceeds the bound; narrow the filters",
-    ),
-    "memory_integrity_failed": ApiError(
-        status.HTTP_500_INTERNAL_SERVER_ERROR,
-        "stored memory is inconsistent",
-    ),
-    "model_output_invalid": ApiError(
-        status.HTTP_502_BAD_GATEWAY,
-        "memory model returned invalid output",
-    ),
-    "model_request_failed": ApiError(
-        status.HTTP_502_BAD_GATEWAY,
-        "memory model rejected its configured request",
-    ),
-    "database_unavailable": ApiError(
-        status.HTTP_503_SERVICE_UNAVAILABLE,
-        "memory storage is temporarily unavailable",
-    ),
-    "model_unavailable": ApiError(
-        status.HTTP_503_SERVICE_UNAVAILABLE,
-        "memory model is unavailable",
-    ),
-    "object_storage_unavailable": ApiError(
-        status.HTTP_503_SERVICE_UNAVAILABLE,
-        "evidence media is unavailable",
-    ),
-    "internal_error": ApiError(
-        status.HTTP_500_INTERNAL_SERVER_ERROR,
-        "the request failed for a reason the server did not anticipate",
-    ),
-    "task_broker_unavailable": ApiError(
-        status.HTTP_503_SERVICE_UNAVAILABLE,
-        "observation processing is temporarily unavailable",
-    ),
-}
+class ErrorEnvelope(BaseModel):
+    """The only error shape emitted by the REST API."""
 
-TENANT_ERRORS: Final[tuple[ErrorCode, ...]] = (
-    "authentication_required",
-    "authentication_failed",
-    "tenant_access_denied",
-    "request_validation_failed",
-    "database_unavailable",
-    "internal_error",
-)
-"""What every authenticated `/v1` operation can return whatever else it does.
-
-Each route spreads this and then names only the codes its own use case adds, so the document
-distinguishes "this operation can 404" from "every operation shares an auth failure".
-"""
+    code: str
+    message: str
+    trace_id: str
+    issues: tuple[ErrorIssue, ...] = ()
 
 
-RUNTIME_ERROR_CODES: Final[dict[type[Exception], ErrorCode]] = {
-    ForgetTargetNotFoundError: "forget_target_not_found",
-    MemoryNotFoundError: "memory_not_found",
-    JobNotFoundError: "job_not_found",
-    MemoryDeletedError: "memory_deleted",
-    MemoryIntegrityError: "memory_integrity_failed",
-    ModelOutputError: "model_output_invalid",
-    ModelRequestError: "model_request_failed",
-    DatabaseUnavailableError: "database_unavailable",
-    ModelUnavailableError: "model_unavailable",
-    ObjectStorageError: "object_storage_unavailable",
-    TaskBrokerError: "task_broker_unavailable",
-}
-"""Every failure the app answers without reading anything off the exception itself.
-
-One row registers the handler and names the code, so an error class and its published code
-cannot be added apart. Subclasses are covered: Starlette dispatches by MRO and the handler
-looks the code up the same way.
-"""
+def error_responses(*status_codes: int) -> dict[int | str, dict[str, Any]]:
+    """Expose the shared error envelope in OpenAPI."""
+    return {code: {"model": ErrorEnvelope} for code in status_codes}
 
 
-DOMAIN_INVARIANT_ERROR_CODES: Final[dict[type[Exception], ErrorCode]] = {
-    IdempotencyConflictError: "idempotency_conflict",
-    EnumerationLimitExceededError: "enumeration_limit_exceeded",
-    DomainInvariantError: "domain_invariant_failed",
-}
-"""The failures whose message is the caller's, so the handler passes `str(error)` through."""
+def register_error_handlers(app: FastAPI) -> None:
+    """Make framework, public, and unexpected failures share one envelope."""
 
-_ALL_ERROR_CODES: Final[dict[type[Exception], ErrorCode]] = {
-    **RUNTIME_ERROR_CODES,
-    **DOMAIN_INVARIANT_ERROR_CODES,
-}
+    @app.exception_handler(AuthenticationError)
+    async def authentication_error(_request: Request, _error: AuthenticationError) -> JSONResponse:
+        return error_response(
+            status.HTTP_401_UNAUTHORIZED,
+            "authentication_error",
+            "a valid bearer API key is required",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
+    @app.exception_handler(RequestValidationError)
+    async def request_validation_error(
+        _request: Request,
+        error: RequestValidationError,
+    ) -> JSONResponse:
+        issues = tuple(
+            ErrorIssue(
+                location=tuple(issue["loc"]),
+                message=issue["msg"],
+                type=issue["type"],
+            )
+            for issue in error.errors()
+        )
+        return error_response(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            ValidationError.code,
+            "request validation failed",
+            issues=issues,
+        )
 
-def code_for(error: BaseException) -> ErrorCode | None:
-    """Name the code this failure reports, or None if no row in the contract claims it.
+    @app.exception_handler(HTTPException)
+    async def http_error(_request: Request, error: HTTPException) -> JSONResponse:
+        code, message = _http_error(error.status_code)
+        return error_response(error.status_code, code, message, headers=error.headers)
 
-    Walks the MRO for the same reason the REST handler does -- a subclass of a mapped error is
-    still that error -- and is shared so the streaming and MCP faces cannot drift from REST on
-    what a failure is called. None means "nothing here has a word for this", which each face
-    answers in its own terms rather than inventing a code.
-    """
-    return next(
-        (
-            _ALL_ERROR_CODES[ancestor]
-            for ancestor in type(error).__mro__
-            if ancestor in _ALL_ERROR_CODES
-        ),
-        None,
-    )
+    @app.exception_handler(MindBridgeError)
+    async def public_error(_request: Request, error: MindBridgeError) -> JSONResponse:
+        status_code, message = _public_error(error)
+        return error_response(status_code, error.code, message)
 
-
-def error_body(
-    code: ErrorCode,
-    *,
-    message: str | None = None,
-    issues: tuple[ValidationIssue, ...] = (),
-) -> ErrorResponse:
-    """Build the envelope every face sends, so only the wrapper around it differs."""
-    return ErrorResponse(
-        code=code,
-        message=message or ERRORS[code].description,
-        trace_id=current_trace_id(),
-        issues=issues,
-    )
-
-
-def responses(*codes: ErrorCode) -> dict[int | str, dict[str, Any]]:
-    """Document the exact codes one operation returns, grouped under their shared statuses.
-
-    Returning `ErrorResponse` as the model for each status is what puts the envelope into
-    `components.schemas`; without it a generated client parses no error at all.
-    """
-    grouped: dict[int, list[ErrorCode]] = {}
-    for code in codes:
-        grouped.setdefault(ERRORS[code].status_code, []).append(code)
-    return {
-        status_code: {
-            "model": ErrorResponse,
-            "description": "\n\n".join(f"`{code}` — {ERRORS[code].description}" for code in group),
-        }
-        for status_code, group in sorted(grouped.items())
-    }
+    @app.exception_handler(Exception)
+    async def unexpected_error(_request: Request, error: Exception) -> JSONResponse:
+        trace_id = _trace_id()
+        _LOGGER.error("unhandled API error", exc_info=error, extra={"trace_id": trace_id})
+        return error_response(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            "internal_error",
+            "the request failed unexpectedly",
+            trace_id=trace_id,
+        )
 
 
 def error_response(
-    code: ErrorCode,
+    status_code: int,
+    code: str,
+    message: str,
     *,
-    message: str | None = None,
-    issues: tuple[ValidationIssue, ...] = (),
+    issues: tuple[ErrorIssue, ...] = (),
+    headers: Mapping[str, str] | None = None,
+    trace_id: str | None = None,
 ) -> JSONResponse:
-    """Render one error, taking its status from the same row the OpenAPI document reads."""
-    body = error_body(code, message=message, issues=issues)
-    return JSONResponse(status_code=ERRORS[code].status_code, content=body.model_dump())
+    body = ErrorEnvelope(
+        code=code,
+        message=message,
+        trace_id=trace_id or _trace_id(),
+        issues=issues,
+    )
+    return JSONResponse(
+        status_code=status_code,
+        content=body.model_dump(mode="json"),
+        headers=headers,
+    )
+
+
+def _public_error(error: MindBridgeError) -> tuple[int, str]:
+    if isinstance(error, ValidationError):
+        return status.HTTP_422_UNPROCESSABLE_CONTENT, str(error) or "input is invalid"
+    if isinstance(error, MemoryNotFoundError):
+        return status.HTTP_404_NOT_FOUND, str(error) or "memory does not exist"
+    if isinstance(error, ModelError):
+        return status.HTTP_502_BAD_GATEWAY, "model operation failed"
+    if isinstance(error, IndexUnavailableError):
+        return status.HTTP_503_SERVICE_UNAVAILABLE, "memory index is unavailable"
+    if isinstance(error, StorageError):
+        return status.HTTP_503_SERVICE_UNAVAILABLE, "memory storage is unavailable"
+    return status.HTTP_500_INTERNAL_SERVER_ERROR, "the request failed unexpectedly"
+
+
+def _http_error(status_code: int) -> tuple[str, str]:
+    if status_code == status.HTTP_404_NOT_FOUND:
+        return "not_found", "route does not exist"
+    if status_code == status.HTTP_405_METHOD_NOT_ALLOWED:
+        return "method_not_allowed", "method is not allowed for this route"
+    return "http_error", "the HTTP request could not be completed"
+
+
+def _trace_id() -> str:
+    return f"trace_{uuid4().hex}"

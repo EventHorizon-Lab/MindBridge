@@ -1,59 +1,36 @@
 # Contributing to MindBridge
 
-Thanks for considering a contribution. This document covers setup, the quality gates, and the
-standards a change is reviewed against.
-
-Repository conventions that apply to automated agents as well as people are in
-[AGENTS.md](AGENTS.md); this file is the human-facing expansion of it.
+Thanks for helping improve MindBridge. This guide covers local setup, quality gates, storage
+invariants, and review expectations. Automated contributors must also follow
+[AGENTS.md](AGENTS.md).
 
 ## Setup
 
-MindBridge supports Python 3.10 through 3.14, and CI runs the whole gate on every one of
-them. 3.10 is the compatibility floor because several edge platform images — JetPack,
-D-Robotics RDK, Rockchip RKNN — still ship it. The ceiling is the newest release the matrix
-covers, so raising it means adding a leg and reading what it says, not editing one number.
-
-Test 3.14 against a released build. A `uv` old enough to offer only `3.14.0b3` fails the whole
-suite at collection — b3's private `typing._eval_type` has no `prefer_fwd_module` parameter, which
-Pydantic passes — and that says nothing about this tree. `uv python install 3.14` on a current uv,
-or a conda-forge `python=3.14.x`, both work.
-
-The project uses [uv](https://docs.astral.sh/uv/) with a checked-in `uv.lock`. That lockfile is
-authoritative; `pip install -e .` will not reproduce it.
+MindBridge supports Python 3.10 through 3.14. The project uses
+[uv](https://docs.astral.sh/uv/) and the checked-in `uv.lock`.
 
 ```bash
 git clone https://github.com/EventHorizon-Lab/MindBridge.git
 cd MindBridge
-uv sync --all-groups --extra media --extra server
-```
-
-That is the set the quality matrix installs, so the clipping tests run here rather than skipping.
-The isolated installability job installs `edge` once and imports its model runtime; add
-`--extra edge` locally only when working on that runtime. `uv sync` is exact: extend the same
-command rather than syncing another extra alone, which would uninstall everything above.
-
-For everything at once — every scenario plus the benchmark harness and the local models:
-
-```bash
 uv sync --all-groups --all-extras
 ```
 
-### A database for the tests that need one
+For core and REST work without the optional MCP transport:
 
 ```bash
-docker compose up -d postgres redis
-for migration in migrations/*.sql; do
-  docker compose exec -T postgres psql -v ON_ERROR_STOP=1 -U mindbridge -d mindbridge < "$migration"
-done
-docker compose exec postgres createdb -U mindbridge mindbridge_test
-export MINDBRIDGE_TEST_DATABASE_URL=postgresql://mindbridge:mindbridge@localhost:5432/mindbridge_test
+uv sync --all-groups --extra local --extra server
 ```
 
-The integration fixture refuses to rebuild a database whose name does not end in `_test`.
+`uv sync` is exact. Add extras to the same command instead of running a second, narrower sync that
+would remove packages from the first environment.
+
+No external database, cache, queue, or object store is required. Unit tests allocate isolated
+temporary SQLite and Zvec directories. Integration tests that contact a real model endpoint are
+marked `integration` and require credentials for that endpoint.
 
 ## Quality gates
 
-These four must pass, and they are exactly what CI runs:
+Run all required gates before submitting:
 
 ```bash
 uv run ruff format --check .
@@ -63,22 +40,19 @@ uv run pytest -W error
 git diff --check
 ```
 
-`mypy` runs in **strict** mode over `src` and `tests`, targeting whichever interpreter invokes
-it rather than a pinned version, so each matrix leg checks the branches its own version takes.
-Ruff's `target-version = "py310"` is what holds the tree to syntax the floor can parse.
+Mypy runs in strict mode over `src` and `tests`. Ruff holds the project to Python 3.10 syntax and
+formats Python code blocks inside Markdown. Pytest treats warnings as errors.
 
-Ruff enforces `ANN`, `ASYNC`, `B`, `C4`, `C90`, `DTZ`, `E4`, `E7`, `E9`, `F`, `I`, `RUF`, `SIM`,
-and `UP`, with a McCabe complexity ceiling of 10 and a 100-character line length.
+Run a focused test while iterating, then run the complete gate before handoff. For example:
 
-`ANN401` bans `Any` in signatures. When you genuinely need to accept a structural type, write a
-`Protocol` shim rather than reaching for `Any`.
+```bash
+uv run pytest -W error tests/unit/test_memory_api.py
+uv run pytest -W error tests/unit/api
+```
 
 ### Markdown
 
-Documentation changes must pass the same tool versions CI uses. The pinned Docker images matter —
-`npx markdownlint-cli2` is old enough to miss rules the pinned version enforces. Match CI's lychee
-arguments as well: `--exclude` covers the one host that answers CI egress with 403 (the job carries
-the reasoning), and `./.github/**/*.md` is where the PR and issue templates live.
+Documentation changes must pass the same pinned tools and arguments as CI:
 
 ```bash
 docker run --rm -v "$PWD:/workdir:ro" davidanson/markdownlint-cli2:v0.23.0 \
@@ -89,146 +63,91 @@ docker run --rm -v "$PWD:/input:ro" -w /input lycheeverse/lychee:0.23.0 \
   './*.md' './docs/**/*.md' './.github/**/*.md'
 ```
 
-Re-run before you add a host to that list. A cited site answering 5xx for a few minutes is an
-outage on their end, not a link to exclude — an exclusion stops the gate checking that URL for good.
+Do not add a host exclusion for a transient outage. Fix invalid local links and replace links that
+no longer identify a stable source.
 
-### The integration gate
+## Test standards
 
-This is the one that catches people out.
+New behavior needs the smallest test that proves the intended contract can fail:
 
-Without `MINDBRIDGE_TEST_DATABASE_URL`, the **entire** integration suite skips — including
-`tests/benchmarks/golden_recall.json`, the deterministic retrieval gate that exercises dense
-evidence recall, exact text recall, temporal exclusion, and unsupported-query abstention through
-the production kernel and the PostgreSQL/pgvector path.
+| Kind | Location | Purpose |
+| --- | --- | --- |
+| Unit | `tests/unit/` | Local logic and adapter behavior |
+| Contract | `tests/contracts/` | Stable public values and schemas |
+| Integration | `tests/integration/` | Explicit real-service boundaries |
+| Benchmark | `tests/benchmarks/` | Deterministic quality fixtures |
 
-A green `pytest` run may therefore never have touched the production store. Any change affecting
-recall, consolidation, or deletion must be validated with the gate that turns a missing database
-into a failure:
+Every local store test must use a distinct temporary directory. When testing concurrency, assert
+that the same directory rejects a second owner and that different directories operate in parallel.
+Never simulate isolation by adding a hidden scope field.
 
-```bash
-MINDBRIDGE_REQUIRE_INTEGRATION=1 uv run pytest -W error
+Warnings fail the suite. Close `Memory`, SQLite, Zvec, and HTTP resources deterministically by
+using their context managers or an explicit `close()`.
+
+There is no numeric coverage threshold. A new test should fail when the implementation is
+deliberately broken; assertions that only restate the implementation are not useful evidence.
+
+## Architecture rules
+
+The supported local path is intentionally direct:
+
+```text
+Memory -> SQLite transaction -> durable outbox -> Zvec flush
+       -> model HTTP endpoint
 ```
 
-CI provides a PostgreSQL service and sets `MINDBRIDGE_TEST_DATABASE_URL`, so the integration
-suite does run there. It does not currently set `MINDBRIDGE_REQUIRE_INTEGRATION=1`, which means a
-misconfigured service would degrade to a skip rather than a failure — run the required form
-locally rather than relying on CI to catch it.
+- SQLite owns memory records, canonical embeddings, configuration metadata, and pending index
+  operations.
+- Zvec is a disposable search projection. It must be rebuildable from SQLite.
+- A failed Zvec write must leave its outbox work pending.
+- Stored embedding identity or dimension changes must fail at open time rather than mixing spaces.
+- One data directory has one live owner. Server deployments use one worker.
+- Metadata is payload, never an isolation or authorization mechanism.
 
-Run the gates again **after** merging your base branch, not only before. A clean merge can still
-produce a broken tree: two branches each adding migration `00NN` merge without a conflict and
-collide on the primary key at apply time.
+Keep the public API small. Reuse existing values and errors before adding layers. Do not introduce
+a repository interface, worker service, compatibility shim, or provider registry without a current
+public use case that cannot be expressed by the existing boundary.
 
-## Standards
+Benchmark packages are leaves: no product module may import them. Dataset and behavior runners use
+the public SDK. The local-index microbenchmark is the narrow exception that measures the storage
+adapters directly.
 
-### Tests
+## Public contracts
 
-pytest with pytest-asyncio in auto mode. New behaviour needs the smallest test that fails when
-the behaviour regresses:
+Stable Python imports are re-exported from `mindbridge`. Stable REST routes are under `/v1`, with
+one error envelope documented in [the REST reference](docs/api/rest.md). The MCP adapter exposes
+five tools documented in [the MCP reference](docs/api/mcp.md). Update tests and docs in the same
+change whenever any surface changes.
 
-| Kind | Location | For |
-| --- | --- | --- |
-| Unit | `tests/unit/` | Local logic. |
-| Contract | `tests/contracts/` | Public schemas. |
-| Integration | `tests/integration/` | PostgreSQL and pgvector paths. Mark `pytest.mark.integration`. |
-| Benchmark fixtures | `tests/benchmarks/` | Deterministic recall gates. |
+The embedded release is a breaking line from the former service architecture. Do not restore
+removed scoping parameters, service configuration, or compatibility aliases. Applications that
+need separate memory domains allocate separate directories or separate processes.
 
-`pytest -W error` is how CI runs, so a warning is a failure. The one that catches people is
-SQLite: `with sqlite3.connect(...)` ends the transaction on exit and leaves the handle open, which
-3.13 and later report as a `ResourceWarning`. Wrap it — `with closing(sqlite3.connect(path)) as
-connection, connection:` — or use `mindbridge.edge._sqlite.connect`, which does both.
+## Documentation style
 
-There is no numeric coverage threshold. There is a stronger requirement: **prove the test can
-fail.** Break the code deliberately and watch it go red before you trust it. Assertions that
-restate the implementation, ablations that are secretly no-ops, and barriers too weak to catch the
-race they name have all shipped here and passed review. A test that cannot fail is worse than no
-test, because it reads as coverage.
-
-### Module boundaries
-
-Dependencies point inward: `core` → `application` → `infrastructure`/`models` → `api`.
-
-`benchmarks/` is a leaf. It may call only the public SDK and contracts, and **no product module may
-import it**. An AST guard enforces this, including against string references — which is why
-`mindbridge` and `mindbridge-bench` are separate console scripts. The duplicated argument parser on
-the benchmarks side is the price of that rule; do not consolidate it.
-
-### Naming and style
-
-Follow the surrounding code. Match its comment density, naming, and idiom rather than importing a
-different house style into one file.
-
-Comments should explain *why*, not *what*. The existing codebase is unusually good about this —
-several comments record a constraint discovered the hard way, and those are load-bearing. Do not
-delete a comment because it looks like prose.
-
-Markdown: short sections, descriptive headings, fenced code blocks for multi-line examples,
-backticks for commands and paths. UTF-8, LF endings, trailing newline.
-
-### Public contracts
-
-Everything in `mindbridge.contracts` is a published contract shared by REST, MCP, and the Python
-SDK. Changing one changes all three.
-
-Entry points in `pyproject.toml` are a documented external contract too. If you change packaging,
-**verify the built artifact** — `[project.scripts]` entries are written into `entry_points.txt`
-independently of build `exclude` rules, so it is entirely possible to produce six green CI jobs and
-a wheel that raises `ModuleNotFoundError` on install.
-
-An OpenAPI snapshot test records drift. Note what it does and does not do: it *records* drift, it
-does not *prevent* it. An invariant that matters needs a guard beyond the snapshot.
-
-### Migrations
-
-Numbered SQL in `migrations/`, applied in order, never edited once merged. Take the next free
-number — and re-check it after merging your base branch, since two branches can each take `00NN`
-and merge cleanly.
-
-New tenant-scoped tables must satisfy the RLS gate, which checks for exact set equality against the
-expected policy set. Copy the pattern from `0015` rather than improvising.
+Use short sections, descriptive headings, fenced code blocks for multi-line examples, and backticks
+for commands and paths. Use UTF-8, LF endings, and a trailing newline. Examples must be executable
+against the current public API. Keep `docs/README.md` current when adding, renaming, or removing a
+page.
 
 ## Pull requests
 
-Commits use a concise imperative subject: `Add contributor guide`, not `added contributor guide`
-or `feat: contributor guide`. Keep each commit focused.
+Use a concise imperative commit subject such as `Add index recovery test`. A pull request should:
 
-A pull request should say what changed and why, list the validation actually performed, and link
-relevant issues. Call out new dependencies, configuration, and follow-up work explicitly.
-Screenshots only for visible UI changes.
+- Explain what changed and why.
+- List the exact validation performed and any skips.
+- Link the relevant issue.
+- Call out new dependencies, configuration, schema changes, or follow-up work.
+- Include screenshots only for a visible interface change.
 
-"Validation performed" means commands you ran and their outcome. If the integration suite skipped,
-say so — an unstated skip reads as a pass.
+## Reporting issues
 
-### Review will reject
+Open an issue with the MindBridge version, expected behavior, actual behavior, and the smallest
+reproduction. Include the REST `trace_id` when available; it identifies a failing request without
+containing memory content.
 
-- `Any` in a signature where a `Protocol` would do.
-- A test that cannot fail.
-- Recall, consolidation, or deletion changes with no integration evidence.
-- A product module importing `benchmarks/`.
-- New configuration surface that could have been a `*_CONFIG_JSON` key. Fallback environment
-  variables are reserved for credentials and model identity.
-- Silent failure. Refuse loudly instead: a wrong configuration should fail startup, not degrade a
-  request an hour later.
-- Deleting a rationale comment along with the code it explained.
-
-## Reporting bugs
-
-Open an issue with the version, what you expected, what happened, and the smallest reproduction
-you have. Include the `trace_id` from a failing response if there is one — it identifies the whole
-request in telemetry and carries no user content.
-
-**Security vulnerabilities do not go in the issue tracker.** See [SECURITY.md](SECURITY.md).
-
-## Proposing changes
-
-For anything structural, open an issue first. Design documents live in `docs/superpowers/specs/`
-and plans in `docs/superpowers/plans/`; a substantial change is easier to review with one of those
-in front of it than as a large diff.
-
-Reversing a decision in [the ADR log](docs/technical-architecture.md#17-关键架构决策记录) is an
-architecture change. Those decisions each name the cost they accept and the condition that would
-justify revisiting them — argue against the condition, not around it.
+Report security vulnerabilities through [SECURITY.md](SECURITY.md), not the public issue tracker.
 
 ## License
 
-By contributing you agree that your contributions are licensed under the
-[Apache License 2.0](LICENSE).
+Contributions are licensed under the [Apache License 2.0](LICENSE).

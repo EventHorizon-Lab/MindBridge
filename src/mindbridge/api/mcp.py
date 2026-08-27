@@ -1,43 +1,79 @@
-"""Official MCP adapter for the shared MindBridge memory use cases."""
+"""Minimal MCP tools backed by one local memory boundary."""
 
 from __future__ import annotations
 
-import inspect
+import asyncio
+import base64
+import binascii
+import json
+import logging
 from collections.abc import Awaitable, Callable, Mapping
-from contextlib import AbstractAsyncContextManager
-from typing import Annotated, Any, TypeVar, get_type_hints
+from functools import wraps
+from pathlib import Path
+from typing import Annotated, Any, Literal, ParamSpec, TypeAlias, TypeVar, cast
+from urllib.parse import urlsplit
 
 from mcp.server import MCPServer
 from mcp.server.context import CallNext, HandlerResult, ServerMiddleware, ServerRequestContext
 from mcp.server.mcpserver.exceptions import ToolError
-from mcp_types import CallToolResult, TextContent, ToolAnnotations
-from pydantic import ValidationError
-
-from mindbridge.api.errors import code_for, error_body
-from mindbridge.application.kernel import MemoryKernel
-from mindbridge.contracts import (
-    ContractModel,
-    FeedbackReceipt,
-    FeedbackRequest,
-    ForgetReceipt,
-    ForgetRequest,
-    GetMemoryRequest,
-    GetObservationJobRequest,
-    MemoryResult,
-    ObservationProcessingJobView,
-    ObservationReceipt,
-    ObserveRequest,
-    RecallRequest,
-    RecallResult,
-    RememberRequest,
-    RememberResult,
-    ValidationIssue,
+from mcp.types import CallToolResult, TextContent, ToolAnnotations
+from pydantic import (
+    AwareDatetime,
+    BaseModel,
+    ConfigDict,
+    Field,
+    JsonValue,
+    StringConstraints,
+    model_validator,
 )
-from mindbridge.core import DomainInvariantError
-from mindbridge.telemetry import log_fields, logger
 
-_LOGGER = logger("mindbridge.api.mcp")
+from mindbridge import AsyncMemory, Memory
+from mindbridge.exceptions import (
+    IndexUnavailableError,
+    MemoryNotFoundError,
+    MindBridgeError,
+    ModelError,
+    StorageError,
+    ValidationError,
+)
+from mindbridge.types import (
+    URL,
+    AnswerResult,
+    AssetRef,
+    Blob,
+    ContentInput,
+    MemoryRecord,
+    Modality,
+    SearchHit,
+)
 
+_LOGGER = logging.getLogger(__name__)
+_MAX_INLINE_MEDIA_BYTES = 8 * 1024 * 1024
+_Text = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=65_536),
+]
+_Identifier = Annotated[str, StringConstraints(min_length=1, pattern=r"^\S(?:.*\S)?$")]
+_Limit = Annotated[int, Field(strict=True, ge=1, le=100)]
+_PartId = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=255)]
+_MediaType = Annotated[
+    str,
+    StringConstraints(
+        strip_whitespace=True,
+        to_lower=True,
+        pattern=r"^[a-z0-9!#$&^_.+-]+/(?:\*|[a-z0-9!#$&^_.+-]+)$",
+    ),
+]
+_Filename = Annotated[
+    str,
+    StringConstraints(
+        strip_whitespace=True,
+        min_length=1,
+        max_length=255,
+        pattern=r"^[^/\\\x00-\x1f\x7f]+$",
+    ),
+]
+_Source = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=8_192)]
 _READ_ONLY = ToolAnnotations(read_only_hint=True, open_world_hint=False)
 _IDEMPOTENT_WRITE = ToolAnnotations(
     read_only_hint=False,
@@ -45,292 +81,461 @@ _IDEMPOTENT_WRITE = ToolAnnotations(
     idempotent_hint=True,
     open_world_hint=False,
 )
-_DESTRUCTIVE_WRITE = ToolAnnotations(
+_DELETE = ToolAnnotations(
     read_only_hint=False,
     destructive_hint=True,
     idempotent_hint=True,
     open_world_hint=False,
 )
-_McpLifespan = Callable[[MCPServer[None]], AbstractAsyncContextManager[None]]
+_TOOL_ARGUMENTS = {
+    "add_memory": frozenset({"content", "occurred_at", "metadata"}),
+    "search_memories": frozenset({"query", "limit"}),
+    "ask_memory": frozenset({"question", "limit"}),
+    "get_memory": frozenset({"memory_id"}),
+    "delete_memory": frozenset({"memory_id"}),
+}
+_STABLE_ERROR_CODES = frozenset(
+    {
+        "index_unavailable",
+        "internal_error",
+        "memory_not_found",
+        "mindbridge_error",
+        "model_error",
+        "storage_error",
+        "validation_error",
+    }
+)
 
-_RequestT = TypeVar("_RequestT", bound=ContractModel)
-_ResultT = TypeVar("_ResultT", bound=ContractModel)
-
-
-def _flattened(
-    model: type[_RequestT],
-    handler: Callable[[_RequestT], Awaitable[_ResultT]],
-) -> Callable[..., Awaitable[_ResultT]]:
-    """Publish `model`'s own fields as the tool's arguments instead of nesting them.
-
-    MCP derives a tool's input schema from its function signature, so a handler that takes one
-    model parameter publishes `{"request": {...}}` and rejects the flat object a caller
-    reaches for first. Synthesizing the signature from `model.model_fields` keeps the contract
-    single-sourced -- constraints, defaults, nested models, and cross-field validators all
-    still come from the same Pydantic model REST and Python use -- while the published
-    arguments match every other face of the API.
-
-    Two consequences of the fields being top-level rather than nested. Unknown keys reach an
-    argument model MCP builds on its own base, which ignores them instead of rejecting them;
-    `_validate_tool_arguments` restores that check before validation runs, because dropping
-    a misspelled `mode` or `memory_ids` silently answers a different question than the one
-    asked. And MCP JSON-decodes any top-level argument whose annotation is not exactly `str`,
-    which every `X | None` string field trips: `idempotency_key="null"` arrives as None, and
-    `correction_summary="123"` fails as a non-string. That one is not fixable from here -- the
-    check reads the field's own annotation -- so callers must send those values as JSON
-    strings only when they mean them as JSON.
-    """
-    parameters = [
-        # `Annotated[..., field]` already carries requiredness and the default, including
-        # `default_factory`; a `default=` here would only restate it, and wrongly for the
-        # factory case, where `field.default` is `PydanticUndefined`.
-        inspect.Parameter(
-            name,
-            inspect.Parameter.KEYWORD_ONLY,
-            annotation=Annotated[field.annotation, field],
-        )
-        for name, field in model.model_fields.items()
-    ]
-    if len(inspect.signature(handler).parameters) != 1:
-        # MCP finds `Context` and resolved parameters through `__annotations__`, which cannot
-        # describe the synthesized signature. Such a handler would register clean and fail on
-        # its first call, so refuse it here instead.
-        raise TypeError(f"{handler.__name__} must take exactly one contract parameter")
-
-    async def tool(**fields: object) -> _ResultT:
-        try:
-            request = model.model_validate(fields)
-        except ValidationError as error:
-            raise ToolError(_validation_error_json(error)) from error
-        try:
-            return await handler(request)
-        except Exception as error:
-            code = code_for(error)
-            if code is None:
-                _LOGGER.exception(
-                    "unhandled MCP tool failure",
-                    extra=log_fields(error_type=type(error).__name__),
-                )
-                code = "internal_error"
-            # The envelope, not prose. REST returns `{code, message, trace_id}` and the SDK
-            # parses it; an agent driving the same kernel needs the code to branch on --
-            # `memory_deleted` and `memory_not_found` are one substring apart in prose and a
-            # different decision in practice -- and the `trace_id` to correlate with telemetry.
-            # These tools' own descriptions promise codes.
-            #
-            # Here, and as text, because this is the only place and channel that work.
-            # Returning a `CallToolResult` from the body is passed through by `convert_result`
-            # but has its `structured_content` validated against the tool's *success* output
-            # model, which an error body is not; `MCPError` would report a JSON-RPC protocol
-            # failure, which a memory that does not exist is not; and middleware is too late --
-            # MCP converts a raised exception into `CallToolResult(is_error=True)` before the
-            # middleware layer, so by there the type is gone (measured, not assumed). MCP
-            # prefixes this text with "Error executing tool <name>: "; the envelope is the
-            # remainder of the line.
-            message = str(error) if isinstance(error, DomainInvariantError) else None
-            raise ToolError(error_body(code, message=message).model_dump_json()) from error
-
-    # Resolved rather than reflected: `from __future__ import annotations` leaves every
-    # handler's own annotations as strings, and MCP reads this signature verbatim when it
-    # decides whether the tool has a structured output schema.
-    tool.__signature__ = inspect.Signature(  # type: ignore[attr-defined]
-        parameters,
-        return_annotation=get_type_hints(handler)["return"],
-    )
-    tool.__name__ = handler.__name__
-    # Dedented rather than copied: a handler's docstring is published verbatim as the tool's
-    # description, and 3.13 strips the indentation of every line but the first at compile
-    # time. Copying it would make the contract an agent reads depend on the interpreter this
-    # process happens to run -- the snapshot in tests/contracts caught exactly that. FastAPI
-    # already normalizes the same way for the REST descriptions beside these.
-    tool.__doc__ = inspect.cleandoc(handler.__doc__ or "")
-    return tool
+_P = ParamSpec("_P")
+_T = TypeVar("_T")
 
 
-def _validate_tool_arguments(
-    models_by_tool: Mapping[str, type[ContractModel]],
-) -> ServerMiddleware[Any]:
-    """Validate raw tool arguments before MCP can drop or rewrite them.
-
-    Flattening moves fields into an MCP-generated model that ignores extras. Middleware sees the
-    original arguments early enough to enforce the shared contract and return its error envelope.
-    """
-
-    async def validate_tool_arguments(
-        ctx: ServerRequestContext[Any, Any],
-        call_next: CallNext,
-    ) -> HandlerResult:
-        params = ctx.params if isinstance(ctx.params, dict) else {}
-        if ctx.method == "tools/call":
-            model = models_by_tool.get(str(params.get("name", "")))
-            arguments = params.get("arguments")
-            if model is not None:
-                try:
-                    model.model_validate(arguments if arguments is not None else {})
-                except ValidationError as error:
-                    return CallToolResult(
-                        content=[TextContent(type="text", text=_validation_error_json(error))],
-                        is_error=True,
-                    )
-        return await call_next(ctx)
-
-    return validate_tool_arguments
+class _InputModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
 
 
-def _validation_error_json(error: ValidationError) -> str:
-    return error_body(
-        "request_validation_failed",
-        issues=tuple(
-            ValidationIssue(
-                location=tuple(str(part) for part in issue["loc"]),
-                message=issue["msg"],
-                code=issue["type"],
-            )
-            for issue in error.errors()
-        ),
-    ).model_dump_json()
+class _InputText(_InputModel):
+    type: Literal["input_text"]
+    text: _Text
 
 
-def build_mcp_server(
-    kernel: MemoryKernel,
-    *,
-    lifespan: _McpLifespan | None = None,
-) -> MCPServer[None]:
-    """Expose one memory kernel through typed, agent-friendly MCP tools."""
-    models_by_tool: dict[str, type[ContractModel]] = {}
+class _InputImage(_InputModel):
+    type: Literal["input_image"]
+    image_url: _Source | None = None
+    file_id: _PartId | None = None
+
+    @model_validator(mode="after")
+    def require_one_source(self) -> _InputImage:
+        _one_source(image_url=self.image_url, file_id=self.file_id)
+        if self.image_url is not None:
+            _validate_url_or_data(self.image_url)
+            if self.image_url.startswith("data:"):
+                media_type, _data = _decode_data_url(self.image_url)
+                if not media_type.startswith("image/"):
+                    raise ValueError("input_image data must have an image media type")
+        return self
+
+
+class _InputFile(_InputModel):
+    type: Literal["input_file"]
+    file_url: _Source | None = None
+    file_data: str | None = None
+    file_id: _PartId | None = None
+    media_type: _MediaType | None = None
+    filename: _Filename | None = None
+
+    @model_validator(mode="after")
+    def require_one_source(self) -> _InputFile:
+        _one_source(file_url=self.file_url, file_data=self.file_data, file_id=self.file_id)
+        if self.media_type is not None and self.media_type.split("/", 1)[0] not in {
+            "image",
+            "video",
+            "audio",
+        }:
+            raise ValueError("media_type must be image, video, or audio")
+        if self.file_url is not None:
+            _validate_url_or_data(self.file_url)
+            if self.file_url.startswith("data:") and self.media_type is not None:
+                embedded_type, _data = _decode_data_url(self.file_url)
+                if not _media_type_matches(self.media_type, embedded_type):
+                    raise ValueError("media_type contradicts the data URL")
+        if self.file_data is not None:
+            if self.media_type is None:
+                raise ValueError("media_type is required with file_data")
+            if self.media_type.endswith("/*"):
+                raise ValueError("file_data requires a concrete media_type")
+            _decode_base64(self.file_data)
+        return self
+
+
+_InputPart: TypeAlias = Annotated[
+    _InputText | _InputImage | _InputFile,
+    Field(discriminator="type"),
+]
+_Parts = Annotated[tuple[_InputPart, ...], Field(min_length=1, max_length=16)]
+_Content: TypeAlias = _Text | _Parts
+
+
+class AssetResult(BaseModel):
+    id: str
+    modality: Modality
+    media_type: str
+    size_bytes: int
+    sha256: str
+    name: str | None = None
+
+
+class MemoryResult(BaseModel):
+    id: str
+    content: str
+    modality: Modality
+    assets: tuple[AssetResult, ...]
+    created_at: AwareDatetime
+    occurred_at: AwareDatetime | None
+    metadata: dict[str, JsonValue]
+
+
+class SearchHitResult(MemoryResult):
+    score: Annotated[float, Field(ge=0.0, le=1.0)]
+
+
+class SearchResult(BaseModel):
+    hits: tuple[SearchHitResult, ...]
+
+
+class AnswerResponse(BaseModel):
+    answer: str
+    hits: tuple[SearchHitResult, ...]
+
+
+class DeleteResult(BaseModel):
+    deleted: bool
+
+
+def build_mcp_server(memory: Memory | AsyncMemory) -> MCPServer[None]:
+    """Expose five typed agent tools without taking ownership of ``memory``."""
     server: MCPServer[None] = MCPServer(
         "mindbridge",
         title="MindBridge Memory",
-        description="Evidence-grounded embodied Memory as a Service.",
-        version="0.1.0",
-        lifespan=lifespan,
-        middleware=[_validate_tool_arguments(models_by_tool)],
+        description="Fast local memory for agents.",
+        version="0.2.0",
+        middleware=[cast(ServerMiddleware[Any], _strict_tool_arguments)],
     )
 
-    def register(
-        model: type[_RequestT],
-        handler: Callable[[_RequestT], Awaitable[_ResultT]],
-        annotations: ToolAnnotations,
-    ) -> None:
-        """Publish one tool and record the arguments it accepts, from the one model."""
-        models_by_tool[handler.__name__] = model
-        server.add_tool(_flattened(model, handler), annotations=annotations)
+    @server.tool(annotations=_IDEMPOTENT_WRITE)
+    @_stable_errors
+    async def add_memory(
+        content: _Content,
+        occurred_at: AwareDatetime | None = None,
+        metadata: dict[str, JsonValue] | None = None,
+    ) -> MemoryResult:
+        """Store one memory and return its stable record."""
+        record = cast(
+            MemoryRecord,
+            await _invoke(
+                memory,
+                "add",
+                _content_input(content),
+                occurred_at=occurred_at,
+                metadata=metadata,
+            ),
+        )
+        return _memory_result(record)
 
-    async def memory_observe(request: ObserveRequest) -> ObservationReceipt:
-        """Store one timestamped multimodal observation and return its durable job ID.
+    @server.tool(annotations=_READ_ONLY)
+    @_stable_errors
+    async def search_memories(query: _Content, limit: _Limit = 10) -> SearchResult:
+        """Find the most relevant local memories."""
+        hits = cast(
+            tuple[SearchHit, ...],
+            await _invoke(memory, "search", _content_input(query), limit=limit),
+        )
+        return SearchResult(hits=tuple(_search_hit_result(hit) for hit in hits))
 
-        Preconditions this tool cannot do for you: every `media_objects[*].uri` must already
-        be readable at `s3://<bucket>/tenants/<tenant_id>/<key>`, with `sha256` and
-        `size_bytes` matching those exact bytes. This is the first-party device path. An Agent
-        holding content rather than stored media objects wants `memory_remember` instead.
+    @server.tool(annotations=_READ_ONLY)
+    @_stable_errors
+    async def ask_memory(question: _Content, limit: _Limit = 5) -> AnswerResponse:
+        """Answer only from retrieved local memories."""
+        result = cast(
+            AnswerResult,
+            await _invoke(memory, "ask", _content_input(question), limit=limit),
+        )
+        return AnswerResponse(
+            answer=result.answer,
+            hits=tuple(_search_hit_result(hit) for hit in result.hits),
+        )
 
-        Rejected combinations: `ended_at` before `occurred_at`; a repeated `media_object_id`;
-        a media `duration_ms` longer than the observation's own span; an identity span with
-        `end_ms` past that span or `start_ms` after its own `end_ms`; `transcript` on anything
-        but a `voice` identity; `visual_bbox_xyxy` on anything but a `face` identity, or one
-        whose 0..1 normalized corners have no positive width and height.
+    @server.tool(annotations=_READ_ONLY)
+    @_stable_errors
+    async def get_memory(memory_id: _Identifier) -> MemoryResult:
+        """Read one memory by its stable identifier."""
+        record = cast(MemoryRecord, await _invoke(memory, "get", memory_id))
+        return _memory_result(record)
 
-        `status` returns `duplicate` when a retry matched an earlier `idempotency_key`.
-        Deriving memory from raw media outlives this request, so no memory exists yet when
-        this receipt returns: read the returned `processing_job_id` with `memory_job` until it
-        reaches `succeeded`, then use the `memory_ids` it carries.
-        """
-        return await kernel.observe(request)
-
-    register(ObserveRequest, memory_observe, _IDEMPOTENT_WRITE)
-
-    async def memory_remember(request: RememberRequest) -> RememberResult:
-        """Retain one explicit memory, preserving evidence and temporal provenance.
-
-        Choose `memory_type` by the role the content will serve: `episodic` for something
-        that happened at a time, `semantic` for a durable fact, `procedural` for how to do
-        something, `prospective` for a future intention, `working` for short-lived task
-        state, `perceptual` for a raw sensory detail.
-
-        `ended_at` defaults to `occurred_at` and must not precede it. `evidence_ids` must
-        already exist and must not repeat. Omitting `idempotency_key` derives one from the
-        content, so an identical retry returns the same memory rather than a second copy --
-        and says so: `status` is `created` only when this call is what stored it.
-        """
-        return await kernel.remember(request)
-
-    register(RememberRequest, memory_remember, _IDEMPOTENT_WRITE)
-
-    async def memory_recall(request: RecallRequest) -> RecallResult:
-        """Recall relevant memories and return inspectable evidence with the answer.
-
-        `query` needs `text`, `media_object_ids`, or both -- neither modality is privileged.
-
-        `mode` selects what work is done. `answer` reasons over the retrieved memories and
-        fills `answer`. `search` ranks and returns memories with `answer` left null. Use
-        `enumerate` for count and timeline questions: it scans the complete structured-filter
-        scope and verifies each candidate against original media, and fails with
-        `enumeration_limit_exceeded` rather than silently truncating an oversized scope.
-
-        For a grounded follow-up, pass IDs from a previous result in `memory_ids`; they become
-        the strict candidate scope instead of a ranking hint. `filters` applies before
-        ranking, and `occurred_before` must not precede `occurred_after`.
-        """
-        return await kernel.recall(request)
-
-    register(RecallRequest, memory_recall, _READ_ONLY)
-
-    async def memory_get(request: GetMemoryRequest) -> MemoryResult:
-        """Read one tenant-owned memory by its stable identifier.
-
-        Evidence arrives with the memory as short-lived signed URLs, so verifying an answer
-        needs no second storage call. A memory erased through `memory_forget` fails as
-        deleted rather than as missing, which distinguishes "was removed" from "never was".
-        """
-        return await kernel.get_memory(request.tenant_id, request.memory_id)
-
-    register(GetMemoryRequest, memory_get, _READ_ONLY)
-
-    async def memory_job(request: GetObservationJobRequest) -> ObservationProcessingJobView:
-        """Read how far one observation's processing has got.
-
-        `memory_observe` returns a `processing_job_id` because deriving memory from raw media
-        outlives the request that submitted it. This resolves that ID. Once `state` is
-        `succeeded`, `memory_ids` names exactly what the observation produced, so the derived
-        memories can be read directly rather than searched for.
-
-        `failed` settles this attempt, not the job: a stale-job sweep can retry it, and
-        `attempt` counts how often it has been claimed. Following every intermediate state as
-        a stream is REST-only; this tool answers one read at a time.
-        """
-        return await kernel.get_observation_job(request.tenant_id, request.job_id)
-
-    register(GetObservationJobRequest, memory_job, _READ_ONLY)
-
-    async def memory_feedback(request: FeedbackRequest) -> FeedbackReceipt:
-        """Record a useful, wrong, missing, or correction signal for future recall.
-
-        Which fields are required depends on `feedback_type`, and the wrong combination is
-        rejected rather than ignored. `missing` reports that a recall returned nothing
-        usable: it needs `recall_trace_id` -- the `trace_id` from that recall -- and must omit
-        `memory_id`. `useful`, `wrong`, and `correction` each judge one memory and need
-        `memory_id`. Only `correction` may carry `correction_summary`, and it must.
-
-        A correction supersedes the original with a new version rather than editing it, so the
-        receipt names both the `corrected_memory_id` and the original's resulting state.
-        """
-        return await kernel.record_feedback(request)
-
-    register(FeedbackRequest, memory_feedback, _IDEMPOTENT_WRITE)
-
-    async def memory_forget(request: ForgetRequest) -> ForgetReceipt:
-        """Recoverably erase one exact memory or source observation and its derivatives.
-
-        `target_type` decides what `target_id` names: `memory_record` erases that one memory,
-        `observation` erases a source observation and everything derived from it. Idempotent
-        -- a repeat returns the same tombstone rather than failing.
-
-        `complete` means deletion finished in central PostgreSQL and object storage. Offline
-        edge devices consume the retained tombstone when they reconnect; this receipt is not
-        an acknowledgement from those devices.
-        """
-        return await kernel.forget(request)
-
-    register(ForgetRequest, memory_forget, _DESTRUCTIVE_WRITE)
+    @server.tool(annotations=_DELETE)
+    @_stable_errors
+    async def delete_memory(memory_id: _Identifier) -> DeleteResult:
+        """Idempotently delete one memory."""
+        deleted = cast(bool, await _invoke(memory, "delete", memory_id))
+        return DeleteResult(deleted=deleted)
 
     return server
+
+
+def run_mcp(data_dir: str | Path = ".mindbridge") -> None:
+    """Run the local MCP server over stdio and close its owned memory."""
+    memory = Memory(data_dir=data_dir)
+    try:
+        build_mcp_server(memory).run("stdio")
+    finally:
+        memory.close()
+
+
+async def _invoke(
+    memory: Memory | AsyncMemory,
+    method: str,
+    *args: object,
+    **kwargs: object,
+) -> object:
+    operation = getattr(memory, method)
+    if isinstance(memory, AsyncMemory):
+        return await cast(Callable[..., Awaitable[object]], operation)(*args, **kwargs)
+    return await asyncio.to_thread(cast(Callable[..., object], operation), *args, **kwargs)
+
+
+def _stable_errors(
+    operation: Callable[_P, Awaitable[_T]],
+) -> Callable[_P, Awaitable[_T]]:
+    @wraps(operation)
+    async def guarded(*args: _P.args, **kwargs: _P.kwargs) -> _T:
+        try:
+            return await operation(*args, **kwargs)
+        except Exception as error:
+            raise ToolError(_error_json(error)) from None
+
+    return guarded
+
+
+async def _strict_tool_arguments(
+    context: ServerRequestContext[Any, Any],
+    call_next: CallNext,
+) -> HandlerResult:
+    params = context.params or {}
+    if context.method == "tools/call":
+        allowed = _TOOL_ARGUMENTS.get(str(params.get("name", "")))
+        if allowed is None:
+            return _error_result("validation_error", "tool does not exist")
+        arguments = params.get("arguments")
+        if isinstance(arguments, Mapping):
+            unknown = set(arguments).difference(allowed)
+            if unknown:
+                return _error_result("validation_error", "tool arguments contain unknown fields")
+    result = await call_next(context)
+    if (
+        context.method == "tools/call"
+        and isinstance(result, dict)
+        and result.get("isError") is True
+        and not _has_error_code(result)
+    ):
+        return _error_result("validation_error", "tool arguments are invalid")
+    return result
+
+
+def _memory_result(record: MemoryRecord) -> MemoryResult:
+    return MemoryResult(
+        id=record.id,
+        content=record.content,
+        modality=record.modality,
+        assets=tuple(_asset_result(asset) for asset in record.assets),
+        created_at=record.created_at,
+        occurred_at=record.occurred_at,
+        metadata=cast(dict[str, JsonValue], dict(record.metadata)),
+    )
+
+
+def _search_hit_result(hit: SearchHit) -> SearchHitResult:
+    return SearchHitResult(
+        id=hit.id,
+        content=hit.content,
+        modality=hit.modality,
+        assets=tuple(_asset_result(asset) for asset in hit.assets),
+        score=hit.score,
+        created_at=hit.created_at,
+        occurred_at=hit.occurred_at,
+        metadata=cast(dict[str, JsonValue], dict(hit.metadata)),
+    )
+
+
+def _asset_result(asset: AssetRef) -> AssetResult:
+    if (
+        asset.modality is None
+        or asset.media_type is None
+        or asset.size_bytes is None
+        or asset.sha256 is None
+    ):
+        raise ValidationError("stored asset metadata is incomplete")
+    return AssetResult(
+        id=asset.id,
+        modality=asset.modality,
+        media_type=asset.media_type,
+        size_bytes=asset.size_bytes,
+        sha256=asset.sha256,
+        name=asset.name,
+    )
+
+
+def _content_input(content: _Content) -> ContentInput:
+    if isinstance(content, str):
+        return content
+    atoms: list[str | URL | Blob | AssetRef] = []
+    for part in content:
+        if isinstance(part, _InputText):
+            atoms.append(part.text)
+        elif isinstance(part, _InputImage):
+            if part.file_id is not None:
+                atoms.append(AssetRef(id=part.file_id, modality=Modality.IMAGE))
+            else:
+                atoms.append(
+                    _url_or_blob(cast(str, part.image_url), media_type="image/*", name=None)
+                )
+        elif part.file_id is not None:
+            atoms.append(_file_reference(part.file_id, part.media_type))
+        elif part.file_data is not None:
+            atoms.append(
+                Blob(
+                    data=_decode_base64(part.file_data),
+                    media_type=cast(str, part.media_type),
+                    name=part.filename,
+                )
+            )
+        else:
+            atoms.append(
+                _url_or_blob(
+                    cast(str, part.file_url),
+                    media_type=part.media_type,
+                    name=part.filename,
+                )
+            )
+    return tuple(atoms)
+
+
+def _file_reference(file_id: str, media_type: str | None) -> AssetRef:
+    if media_type is None:
+        return AssetRef(id=file_id)
+    if media_type.endswith("/*"):
+        return AssetRef(id=file_id, modality=Modality(media_type.split("/", 1)[0]))
+    return AssetRef(id=file_id, media_type=media_type)
+
+
+def _url_or_blob(
+    value: str,
+    *,
+    media_type: str | None = None,
+    name: str | None,
+) -> URL | Blob:
+    if value.startswith("data:"):
+        embedded_type, data = _decode_data_url(value)
+        if media_type is not None and not _media_type_matches(media_type, embedded_type):
+            raise ValueError("media_type contradicts the data URL")
+        return Blob(data=data, media_type=embedded_type, name=name)
+    return URL(value=value, media_type=media_type, name=name)
+
+
+def _one_source(**sources: object) -> None:
+    if sum(source is not None for source in sources.values()) != 1:
+        raise ValueError(f"exactly one of {', '.join(sources)} is required")
+
+
+def _media_type_matches(expected: str, actual: str) -> bool:
+    return expected == actual or (
+        expected.endswith("/*") and expected.split("/", 1)[0] == actual.split("/", 1)[0]
+    )
+
+
+def _validate_url_or_data(value: str) -> None:
+    if value.startswith("data:"):
+        _decode_data_url(value)
+        return
+    parsed = urlsplit(value)
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.fragment
+    ):
+        raise ValueError("source must be an HTTPS URL without credentials or a fragment")
+
+
+def _decode_data_url(value: str) -> tuple[str, bytes]:
+    header, separator, payload = value.partition(",")
+    if not separator or not header.endswith(";base64"):
+        raise ValueError("data URL must contain base64 media bytes")
+    media_type = header.removeprefix("data:").removesuffix(";base64").lower()
+    if not media_type or "/" not in media_type:
+        raise ValueError("data URL must declare a media type")
+    return media_type, _decode_base64(payload)
+
+
+def _decode_base64(value: str) -> bytes:
+    maximum_encoded = 4 * ((_MAX_INLINE_MEDIA_BYTES + 2) // 3)
+    if len(value) > maximum_encoded:
+        raise ValueError(f"inline media must not exceed {_MAX_INLINE_MEDIA_BYTES} bytes")
+    try:
+        data = base64.b64decode(value, validate=True)
+    except (binascii.Error, ValueError) as error:
+        raise ValueError("file_data must be valid base64") from error
+    if len(data) > _MAX_INLINE_MEDIA_BYTES:
+        raise ValueError(f"inline media must not exceed {_MAX_INLINE_MEDIA_BYTES} bytes")
+    return data
+
+
+def _error_json(error: Exception) -> str:
+    code, message = _error_details(error)
+    return json.dumps({"code": code, "message": message}, separators=(",", ":"))
+
+
+def _error_details(error: Exception) -> tuple[str, str]:
+    if isinstance(error, ValidationError):
+        return error.code, str(error) or "input is invalid"
+    if isinstance(error, MemoryNotFoundError):
+        return error.code, str(error) or "memory does not exist"
+    if isinstance(error, ModelError):
+        return error.code, "model operation failed"
+    if isinstance(error, IndexUnavailableError):
+        return error.code, "memory index is unavailable"
+    if isinstance(error, StorageError):
+        return error.code, "memory storage is unavailable"
+    if isinstance(error, MindBridgeError):
+        return error.code, "memory operation failed"
+    _LOGGER.exception("unhandled MCP tool error")
+    return "internal_error", "the memory operation failed unexpectedly"
+
+
+def _error_result(code: str, message: str) -> CallToolResult:
+    return CallToolResult(
+        content=[TextContent(type="text", text=json.dumps({"code": code, "message": message}))],
+        is_error=True,
+    )
+
+
+def _has_error_code(result: Mapping[str, object]) -> bool:
+    content = result.get("content")
+    if not isinstance(content, list):
+        return False
+    for item in content:
+        if not isinstance(item, Mapping) or not isinstance(item.get("text"), str):
+            continue
+        text = item["text"]
+        try:
+            envelope: object = json.loads(text[text.index("{") :])
+        except (ValueError, json.JSONDecodeError):
+            continue
+        if (
+            isinstance(envelope, dict)
+            and set(envelope) == {"code", "message"}
+            and envelope.get("code") in _STABLE_ERROR_CODES
+            and isinstance(envelope.get("message"), str)
+        ):
+            return True
+    return False

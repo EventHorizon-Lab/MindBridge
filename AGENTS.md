@@ -1,20 +1,33 @@
 # Repository Guidelines
 
-## Project Structure & Module Organization
+## Project structure
 
-MindBridge is a Python package under `src/mindbridge/`. Keep domain types in `core/`, use cases and ports in `application/`, external adapters in `infrastructure/` and `models/`, protocol entry points in `api/`, Jetson/robot code in `edge/`, and official dataset adapters plus their runners in `benchmarks/`. `benchmarks/` may only call the public SDK and contracts; no product module may import it. Tests live in `tests/unit/`, `tests/contracts/`, and `tests/integration/`; deterministic benchmark fixtures live in `tests/benchmarks/`. Numbered PostgreSQL migrations are in `migrations/`, reproducibility manifests are in `benchmarks/manifests/`, and documentation is in `docs/`, indexed by `docs/README.md`. Keep root files limited to project-wide documentation, dependency, deployment, and tooling configuration.
+MindBridge is a Python package under `src/mindbridge/`.
 
-## Build, Test, and Development Commands
+- Keep public values and exceptions in small top-level modules such as `types.py` and
+  `exceptions.py`.
+- Keep the developer-facing orchestration in `memory.py`.
+- Keep durable local storage and search adapters in `infrastructure/local/`.
+- Keep model clients in `models/` and protocol adapters in `api/`.
+- Keep benchmark harnesses in `benchmarks/` or `src/mindbridge/benchmarks/`.
+- Keep tests in `tests/unit/`, `tests/contracts/`, `tests/integration/`, and
+  `tests/benchmarks/`.
+- Keep user documentation in `docs/`, indexed by `docs/README.md`.
 
-MindBridge supports Python 3.10 through 3.14 and uses `uv` with the checked-in `pyproject.toml` and `uv.lock`. Install the same set the CI quality matrix installs — development groups plus the media and Server extras — with:
+Product modules must not import benchmark modules. Dataset and behavior benchmarks should call the
+public SDK. A narrowly scoped storage microbenchmark may use the local adapters when its purpose is
+to measure SQLite or Zvec directly; do not let that exception become an alternate product API.
+
+## Build and test
+
+MindBridge supports Python 3.10 through 3.14 and uses `uv` with `pyproject.toml` and `uv.lock`.
+Install every development group and optional surface with:
 
 ```bash
-uv sync --all-groups --extra media --extra server
+uv sync --all-groups --all-extras
 ```
 
-`uv sync` is an exact sync: it uninstalls anything the named extras do not cover, so extend this command rather than running a second one for another extra.
-
-Run the required quality gates before submitting changes:
+Run the required quality gates before submitting a change:
 
 ```bash
 uv run ruff format --check .
@@ -24,19 +37,59 @@ uv run pytest -W error
 git diff --check
 ```
 
-Markdown changes must also pass the pinned Markdown and link-check commands documented in
-`CONTRIBUTING.md`. Note that `ruff format` also formats Python code blocks inside Markdown, so a
-documentation change can fail the formatting gate. Deployment-specific installation commands are
-in `docs/deployment.md`, and PostgreSQL integration setup is in `CONTRIBUTING.md`.
+Documentation changes must also pass the pinned Markdown and link commands in
+`CONTRIBUTING.md`. Ruff formats Python code blocks in Markdown, so documentation examples are part
+of the formatting gate.
 
-## Coding Style & Naming Conventions
+## Storage and isolation rules
 
-Use UTF-8 text, LF line endings, and a trailing newline. Write Markdown with short sections, descriptive headings, fenced code blocks for multi-line examples, and backticks for commands and paths. Prefer clear, conventional names: uppercase names for standard root documents (for example, `CONTRIBUTING.md`) and the chosen language's established naming rules for source files. Avoid generated artifacts and editor-specific settings unless the project explicitly adopts them.
+One physical `data_dir` is one running MindBridge instance. Never introduce logical account,
+request, or benchmark scope into the product contract as a substitute for physical isolation.
+Parallel tests and benchmark cases must each allocate a distinct temporary directory.
 
-## Testing Guidelines
+SQLite is authoritative for records, embeddings, store metadata, and the durable search-index
+outbox. Zvec is derived and rebuildable. A durable write must commit SQLite before changing Zvec,
+and an outbox operation must be acknowledged only after the Zvec flush succeeds.
 
-Tests use pytest with pytest-asyncio. New behavior should include the smallest test that fails when the behavior regresses: unit tests for local logic, contract tests for public schemas, and integration tests for PostgreSQL/pgvector paths. Mark database-dependent tests with `pytest.mark.integration`; configure their disposable database as documented in `CONTRIBUTING.md`. `tests/benchmarks/golden_recall.json` is the deterministic production-path recall gate. It only runs with `MINDBRIDGE_TEST_DATABASE_URL` configured, so any change to recall, consolidation, or deletion must be validated with `MINDBRIDGE_REQUIRE_INTEGRATION=1 uv run pytest -W error`, which turns a missing database into a failure instead of a skip. There is no numeric coverage threshold, but all required quality gates above must pass. Documentation changes should also be checked for accurate commands, valid relative links, and readable rendered Markdown.
+Do not add a database service, worker queue, or object store for behavior the embedded runtime can
+provide directly. New dependencies need a demonstrated public requirement and must live in the
+narrowest relevant optional extra.
 
-## Commit & Pull Request Guidelines
+## Coding style
 
-Use a concise, imperative commit subject such as `Add contributor guide`, and keep each commit focused. Pull requests should explain what changed and why, list validation performed, and link relevant issues. Include screenshots only for visible UI changes, and call out new dependencies, configuration, or follow-up work explicitly.
+Use UTF-8, LF endings, and a trailing newline. Prefer deletion and reuse over compatibility layers
+or speculative abstractions. Keep names conventional, public contracts explicit, and comments
+focused on constraints that are not obvious from the code.
+
+Use `apply_patch` for hand edits. Preserve unrelated work in a dirty tree. Do not run destructive
+Git commands to discard another contributor's changes.
+
+## Tests
+
+New behavior needs the smallest test that fails when it regresses:
+
+- Unit tests for local behavior and failure mapping.
+- Contract tests for stable Python and REST values.
+- Integration tests only for real external model services.
+- Benchmark tests for deterministic isolation and metric calculation.
+
+Use a fresh `tmp_path` for every local store. Test that a second owner of the same directory fails
+immediately and that different directories work concurrently. Retrieval tests must verify that
+SQLite hydration drops stale Zvec IDs and that a missing index rebuilds without re-embedding
+stored content.
+
+## Public contracts
+
+The supported Python imports come from `mindbridge`; the supported HTTP surface is under `/v1`,
+and the supported MCP surface is the five tools in `mindbridge.api.mcp`. Changing a signature,
+response type, exception, endpoint, tool schema, error code, on-disk schema, or console entry point
+is a breaking change and needs tests and documentation in the same patch.
+
+The product API has no implicit scoping identifiers. Metadata is application data, not an access
+control or isolation boundary.
+
+## Commits and pull requests
+
+Use a concise imperative commit subject such as `Document local deployment`. Keep each commit
+focused. Pull requests should explain what changed and why, list the validation actually run, and
+call out dependency, configuration, schema, or compatibility changes.

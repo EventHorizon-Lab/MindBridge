@@ -1,189 +1,242 @@
-"""Reproducible LoCoMo-Refined runner against a deployed MindBridge API.
-
-Writes `predictions.jsonl` in the shape `mem-eval-suite/LoCoMo_refined` scores
-directly: one `{"qa_id", "predicted_answer"}` object per line, ready for that
-repository's `./scripts/run_eval.sh`.
-"""
+"""Run isolated LoCoMo-Refined conversations and write official predictions."""
 
 from __future__ import annotations
 
+import argparse
 import asyncio
-from collections import Counter
+import hashlib
+import json
+import os
+import platform
 from collections.abc import Sequence
 from dataclasses import dataclass
-from itertools import chain
-from typing import Literal
+from importlib import metadata
+from pathlib import Path
+from tempfile import NamedTemporaryFile
 
-from pydantic import Field
-
-from mindbridge.benchmarks.artifacts import (
-    LoadedDeployment,
-    load_deployment_snapshot,
-    require_writable_output_pair,
-)
-from mindbridge.benchmarks.cli_common import (
-    BenchmarkRunManifest,
-    CoreArguments,
-    connected_memory,
-    core_arguments,
-    core_manifest,
-    core_parser,
-    predictions_jsonl,
-    report,
-    run_units,
-    scoring_snapshot,
-    select_by_id,
-    write_run_artifacts,
-)
+from mindbridge import AsyncMemory, Config
+from mindbridge.benchmarks.isolation import BenchmarkRun
 from mindbridge.benchmarks.locomo_refined import (
     LOCOMO_REFINED_ADAPTER_VERSION,
     LoCoMoRefinedConversation,
     load_locomo_refined,
 )
 from mindbridge.benchmarks.locomo_refined_runner import (
-    LOCOMO_REFINED_PREDICTION_KEY,
     LoCoMoRefinedPrediction,
     run_locomo_refined_conversation,
 )
-from mindbridge.benchmarks.scoring import JudgedAnswer, require_scoring_is_possible
-from mindbridge.contracts import Identifier, NonEmptyString, Sha256Hex
-from mindbridge.file_integrity import sha256_file
 
-LOCOMO_REFINED_RUNNER_VERSION = "locomo_refined_production_api_v1"
-
-
-class LoCoMoRefinedRunManifest(BenchmarkRunManifest):
-    """Immutable dataset, deployment, code, and output identity for one run."""
-
-    benchmark: Literal["LoCoMo-Refined"] = "LoCoMo-Refined"
-    source_repository: NonEmptyString
-    source_sha256: Sha256Hex
-    prediction_key: NonEmptyString
-    sample_ids: tuple[Identifier, ...] = Field(min_length=1)
-    memory_item_count: int = Field(gt=0)
-    question_count: int = Field(gt=0)
-    # Rows whose recall produced no answer at all, written as an empty
-    # `predicted_answer`. LoCoMo-Refined has no adversarial category and therefore no
-    # gold abstention, so these are plain misses rather than a second protocol -- but a
-    # run whose score is dragged down by silence rather than by wrong answers is a
-    # different diagnosis, and only this count separates the two.
-    unanswered_question_count: int = Field(ge=0)
-    # LoCoMo's four-versus-five-category ambiguity is gone with the adversarial split, so
-    # these counts no longer decide whether two numbers are comparable. They stay because
-    # the refined release is deliberately uneven across categories (802 of 1,382 questions
-    # are category 4), which a subset run can skew without saying so.
-    category_question_counts: dict[int, int] = Field(min_length=1)
+LOCOMO_REFINED_RUNNER_VERSION = "locomo_refined_local_v2"
 
 
 @dataclass(frozen=True, slots=True)
-class _Arguments(CoreArguments):
-    sample_ids: tuple[str, ...]
+class _Arguments:
+    dataset: Path
+    output: Path
+    data_root: Path
+    run_id: str
+    limit: int | None
+    unit_concurrency: int
+    request_concurrency: int
+    recall_limit: int
+    overwrite: bool
+    resume: bool
 
 
-def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
-    """Run selected official conversations and emit predictions plus a manifest."""
+def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> int:
+    """Run selected conversations with one physical memory directory per conversation."""
     arguments = _parse_arguments(argv, prog)
-    conversations = select_by_id(
-        load_locomo_refined(arguments.dataset_path),
-        arguments.sample_ids,
-        key=lambda conversation: conversation.sample_id,
-        label="LoCoMo-Refined sample IDs",
-        limit=arguments.limit,
+    _require_writable(arguments.output, overwrite=arguments.overwrite)
+    conversations = load_locomo_refined(arguments.dataset)
+    if arguments.limit is not None:
+        conversations = conversations[: arguments.limit]
+    if not conversations:
+        raise ValueError("LoCoMo-Refined dataset contains no conversations to run")
+
+    run = BenchmarkRun(
+        arguments.data_root,
+        "locomo-refined",
+        arguments.run_id,
+        resume=arguments.resume,
     )
-    require_scoring_is_possible("locomo-refined", predict_only=arguments.predict_only)
-    require_writable_output_pair(arguments.output_path, overwrite=arguments.overwrite)
-    deployment = load_deployment_snapshot(arguments.deployment_config_path)
-    report(f"running {len(conversations)} conversations", quiet=arguments.quiet)
-    predictions = asyncio.run(_run_conversations(arguments, conversations))
-    _write_artifacts(arguments, conversations, predictions, deployment)
-    report(f"wrote {arguments.output_path}", quiet=arguments.quiet)
+    predictions, unit_dirs = asyncio.run(_run_conversations(arguments, conversations, run))
+    _write_artifacts(arguments, conversations, predictions, run, unit_dirs)
+    return 0
 
 
 async def _run_conversations(
     arguments: _Arguments,
     conversations: tuple[LoCoMoRefinedConversation, ...],
-) -> tuple[LoCoMoRefinedPrediction, ...]:
-    async with connected_memory(arguments) as memory:
-        per_conversation = await run_units(
-            conversations,
-            label=lambda conversation: f"conversation {conversation.sample_id}",
-            unit_concurrency=arguments.unit_concurrency,
-            quiet=arguments.quiet,
-            run=lambda conversation: run_locomo_refined_conversation(
+    run: BenchmarkRun,
+) -> tuple[tuple[LoCoMoRefinedPrediction, ...], tuple[Path, ...]]:
+    unit_dirs = tuple(run.unit_dir(conversation.sample_id) for conversation in conversations)
+    semaphore = asyncio.Semaphore(arguments.unit_concurrency)
+
+    async def run_one(
+        conversation: LoCoMoRefinedConversation,
+        data_dir: Path,
+    ) -> tuple[LoCoMoRefinedPrediction, ...]:
+        async with semaphore, AsyncMemory(data_dir=data_dir) as memory:
+            return await run_locomo_refined_conversation(
                 memory,
                 conversation,
-                run_id=arguments.run_id,
-                tenant_prefix=arguments.tenant_prefix,
                 recall_limit=arguments.recall_limit,
                 request_concurrency=arguments.request_concurrency,
-            ),
-        )
-        return tuple(chain.from_iterable(per_conversation))
+            )
+
+    tasks = [
+        asyncio.create_task(run_one(conversation, data_dir))
+        for conversation, data_dir in zip(conversations, unit_dirs, strict=True)
+    ]
+    try:
+        grouped = await asyncio.gather(*tasks)
+    except BaseException:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+    return tuple(prediction for group in grouped for prediction in group), unit_dirs
 
 
 def _write_artifacts(
     arguments: _Arguments,
     conversations: tuple[LoCoMoRefinedConversation, ...],
     predictions: tuple[LoCoMoRefinedPrediction, ...],
-    deployment: LoadedDeployment,
+    run: BenchmarkRun,
+    unit_dirs: tuple[Path, ...],
 ) -> None:
-    categories = Counter(
-        question.category for conversation in conversations for question in conversation.questions
+    question_count = sum(len(conversation.questions) for conversation in conversations)
+    if len(predictions) != question_count or len(unit_dirs) != len(conversations):
+        raise RuntimeError("benchmark results do not match the loaded conversations")
+    _require_writable(arguments.output, overwrite=arguments.overwrite)
+
+    rows = "".join(
+        json.dumps(
+            prediction.model_dump(mode="json"),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+        for prediction in predictions
+    ).encode("utf-8")
+    config = Config.from_environment()
+    manifest = {
+        "adapter_version": LOCOMO_REFINED_ADAPTER_VERSION,
+        "benchmark": "locomo-refined",
+        "conversation_count": len(conversations),
+        "dataset_sha256": _sha256_file(arguments.dataset),
+        "embedding_dimension": config.embedding_dimension,
+        "embedding_model": config.embedding_model,
+        "generation_model": config.generation_model,
+        "limit": arguments.limit,
+        "mindbridge_version": metadata.version("mindbridge"),
+        "platform": platform.platform(),
+        "predictions_sha256": hashlib.sha256(rows).hexdigest(),
+        "python_version": platform.python_version(),
+        "question_count": question_count,
+        "recall_limit": arguments.recall_limit,
+        "relative_layout": {
+            "run": run.relative_layout.as_posix(),
+            "units": {
+                conversation.sample_id: data_dir.relative_to(run.data_root).as_posix()
+                for conversation, data_dir in zip(conversations, unit_dirs, strict=True)
+            },
+        },
+        "request_concurrency": arguments.request_concurrency,
+        "run_id": arguments.run_id,
+        "runner_version": LOCOMO_REFINED_RUNNER_VERSION,
+        "turn_count": sum(len(conversation.turns) for conversation in conversations),
+        "unanswered_count": sum(not prediction.mindbridge_answered for prediction in predictions),
+        "unit_concurrency": arguments.unit_concurrency,
+        "zvec_version": metadata.version("zvec"),
+    }
+    manifest_bytes = (
+        json.dumps(manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+    _atomic_replace(
+        (
+            (arguments.output, rows),
+            (_manifest_path(arguments.output), manifest_bytes),
+        )
     )
-    rows = predictions_jsonl(predictions)
-    # A refined question may accept several phrasings, and handing the judge only the first
-    # would mark a correct answer wrong. MM-Vet spells the same thing `<OR>` inside its ground
-    # truth; the vendored pipeline's one-answer limit is its own and does not apply here.
-    asked = tuple(question for conversation in conversations for question in conversation.questions)
-    scoring = scoring_snapshot(
-        "locomo-refined",
-        arguments,
-        answers=tuple(
-            JudgedAnswer(
-                question.question,
-                " OR ".join(question.reference_answers),
-                prediction.predicted_answer,
-            )
-            for question, prediction in zip(asked, predictions, strict=True)
-        ),
-    )
-    manifest = core_manifest(
-        LoCoMoRefinedRunManifest,
-        arguments,
-        deployment,
-        scoring=scoring,
-        runner_version=LOCOMO_REFINED_RUNNER_VERSION,
-        adapter_version=LOCOMO_REFINED_ADAPTER_VERSION,
-        predictions=rows,
-        source_repository="mem-eval-suite/LoCoMo_refined",
-        source_sha256=sha256_file(arguments.dataset_path),
-        prediction_key=LOCOMO_REFINED_PREDICTION_KEY,
-        sample_ids=tuple(conversation.sample_id for conversation in conversations),
-        memory_item_count=sum(len(conversation.turns) for conversation in conversations),
-        question_count=len(predictions),
-        unanswered_question_count=sum(
-            not prediction.mindbridge_answered for prediction in predictions
-        ),
-        category_question_counts=dict(sorted(categories.items())),
-    )
-    write_run_artifacts(arguments.output_path, rows, manifest)
 
 
 def _parse_arguments(argv: Sequence[str] | None, prog: str | None) -> _Arguments:
-    parser = core_parser(tenant_prefix="benchmark_locomo_refined", prog=prog, description=__doc__)
-    parser.add_argument(
-        "--sample-id",
-        action="append",
-        default=[],
-        help="official conversation to run; repeatable, default the whole release",
-    )
+    parser = argparse.ArgumentParser(prog=prog, description=__doc__)
+    parser.add_argument("--dataset", type=Path, required=True)
+    parser.add_argument("-o", "--output", type=Path, required=True)
+    parser.add_argument("--data-root", type=Path, required=True)
+    parser.add_argument("--run-id", required=True)
+    parser.add_argument("--limit", type=_positive_int)
+    parser.add_argument("--unit-concurrency", type=_positive_int, default=4)
+    parser.add_argument("--request-concurrency", type=_positive_int, default=4)
+    parser.add_argument("--recall-limit", type=_positive_int, default=20)
+    parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--resume", action="store_true")
     parsed = parser.parse_args(argv)
-    return core_arguments(
-        _Arguments,
-        parsed,
-        sample_ids=tuple(parsed.sample_id),
+    return _Arguments(
+        dataset=parsed.dataset,
+        output=parsed.output,
+        data_root=parsed.data_root,
+        run_id=parsed.run_id,
+        limit=parsed.limit,
+        unit_concurrency=parsed.unit_concurrency,
+        request_concurrency=parsed.request_concurrency,
+        recall_limit=parsed.recall_limit,
+        overwrite=parsed.overwrite,
+        resume=parsed.resume,
     )
+
+
+def _require_writable(output: Path, *, overwrite: bool) -> None:
+    if overwrite:
+        return
+    for path in (output, _manifest_path(output)):
+        if path.exists():
+            raise FileExistsError(f"benchmark artifact already exists: {path}")
+
+
+def _manifest_path(output: Path) -> Path:
+    return output.with_suffix(output.suffix + ".manifest.json")
+
+
+def _atomic_replace(files: tuple[tuple[Path, bytes], ...]) -> None:
+    files[0][0].parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    temporary: list[tuple[Path, Path]] = []
+    try:
+        for target, content in files:
+            with NamedTemporaryFile(
+                mode="wb",
+                dir=target.parent,
+                prefix=f".{target.name}.",
+                delete=False,
+            ) as stream:
+                stream.write(content)
+                stream.flush()
+                os.fsync(stream.fileno())
+                temporary.append((Path(stream.name), target))
+        for source, target in temporary:
+            os.replace(source, target)
+    finally:
+        for source, _target in temporary:
+            source.unlink(missing_ok=True)
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("value must be a positive integer")
+    return parsed
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

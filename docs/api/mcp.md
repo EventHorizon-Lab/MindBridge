@@ -1,159 +1,156 @@
-# MCP tools
+# MCP API
 
-MindBridge speaks the official Model Context Protocol over stdio, exposing the same production
-kernel that serves REST. Tool input and structured output schemas are generated from the same
-Pydantic contracts, so an agent and an application see one contract rather than two that drift.
+The optional MCP adapter exposes five typed tools over one local `Memory` through stdio.
+
+## Install and run
 
 ```bash
-uv run --extra server mindbridge mcp
+uv add "mindbridge[local,mcp]"
+mindbridge mcp --data-dir /var/lib/mindbridge/assistant
 ```
 
-## Client configuration
+The equivalent standalone entry point is:
 
-```json
-{
-  "mcpServers": {
-    "mindbridge": {
-      "command": "uv",
-      "args": ["run", "--extra", "server", "mindbridge", "mcp"],
-      "env": {
-        "MINDBRIDGE_DATABASE_URL": "postgresql://...",
-        "MINDBRIDGE_TASK_BROKER_URL": "redis://localhost:6379/0",
-        "MINDBRIDGE_OBJECT_STORAGE_BUCKET": "mindbridge-media",
-        "MINDBRIDGE_GENERATOR_API_KEY": "...",
-        "MINDBRIDGE_GENERATOR_ENDPOINT": "https://generator.example.com/v1",
-        "MINDBRIDGE_EMBEDDER_API_KEY": "...",
-        "MINDBRIDGE_EMBEDDER_ENDPOINT": "https://embeddings.example.com/v1"
-      }
-    }
-  }
-}
+```bash
+mindbridge-mcp --data-dir /var/lib/mindbridge/assistant
 ```
 
-The stdio process does not require the REST API's tenant key map for authentication. If
-`MINDBRIDGE_TENANT_API_KEYS_JSON` is configured, however, the shared runtime uses its tenant IDs
-for the same embedding-space startup probe as REST. Without the map there are no tenants to
-probe, so an incompatible embedding space is not caught at startup.
+The MCP process owns the directory until it exits. Do not run REST, another MCP process, or a
+Python `Memory` against the same path concurrently.
 
-Deploy remote MCP only behind authenticated process or gateway isolation. The shipped command
-exposes stdio deliberately rather than an unauthenticated HTTP listener.
+## Multimodal content
+
+`content`, `query`, and `question` accept a non-blank string or 1 through 16 ordered parts:
+
+- `{"type":"input_text","text":"..."}`
+- `{"type":"input_image","image_url":"https://..."}`
+- `{"type":"input_image","file_id":"..."}`
+- `{"type":"input_file","file_url":"https://...","media_type":"video/mp4"}`
+- `{"type":"input_file","file_data":"<base64>","media_type":"audio/wav"}`
+- `{"type":"input_file","file_id":"..."}`
+
+Source fields are mutually exclusive. HTTPS URLs require an explicitly allowed hostname. Inline
+base64 is length-checked before decoding and byte-checked afterward; `file_data` has an 8 MiB
+decoded ceiling, while URL/data source strings have a tighter 8,192-character schema limit. Local
+paths, `file:` URLs, unknown nested fields, and `input_image.detail` are rejected. Use the Python
+API for direct `Path` input. Each HTTPS redirect is independently resolved and connected through a
+verified public IP; concrete MIME hints match exactly and family hints match only that family.
 
 ## Tools
 
-| Tool | Kind | Purpose |
-| --- | --- | --- |
-| `memory_observe` | idempotent write | Store one timestamped multimodal observation. |
-| `memory_remember` | idempotent write | Retain one explicit memory. |
-| `memory_recall` | read-only | Recall memories and answer with inspectable evidence. |
-| `memory_get` | read-only | Read one memory by ID. |
-| `memory_job` | read-only | Read how far one observation's processing has got. |
-| `memory_feedback` | idempotent write | Record useful / wrong / missing / correction. |
-| `memory_forget` | **destructive** | Erase one memory or source observation. |
+### `add_memory`
 
-Each carries MCP tool annotations, so a client can gate on them: reads are marked
-`read_only_hint`, writes `idempotent_hint`, and `memory_forget` additionally
-`destructive_hint`. All tools are `open_world_hint: false` — they touch one tenant's memory, not
-the internet.
+Stores one stable text or multimodal record.
 
-## Argument shape
+| Argument | Type | Required | Default |
+| --- | --- | --- | --- |
+| `content` | string or ordered content parts | yes | — |
+| `occurred_at` | timezone-aware ISO 8601 datetime or null | no | null |
+| `metadata` | JSON object or null | no | null |
 
-Each tool takes the contract's **own fields** as its arguments rather than one nested `request`
-object:
+The structured result contains `id`, `content`, `modality`, `assets`, `created_at`, `occurred_at`,
+and `metadata`. Asset results contain safe metadata but never a local path. Repeating canonical
+input returns the existing record. The tool is marked as a non-destructive, idempotent write.
+
+Example arguments:
 
 ```json
 {
-  "name": "memory_recall",
-  "arguments": {
-    "tenant_id": "tenant_01",
-    "query": {"text": "Where did I leave the red screwdriver?"},
-    "mode": "answer",
-    "limit": 20
-  }
+  "content": [
+    {"type": "input_text", "text": "Design review recording"},
+    {
+      "type": "input_file",
+      "file_url": "https://media.example/review.mp4",
+      "media_type": "video/mp4"
+    }
+  ],
+  "metadata": {"source": "review"}
 }
 ```
 
-Every field carries a description, so the cross-field rules an agent would otherwise discover by
-failing a call — which `feedback_type` needs which field, what `observe` requires of media it did
-not upload — are in the schema it reads before calling.
+### `search_memories`
 
-**Unknown arguments are faulted, not dropped.** A middleware layer compares supplied argument
-names against the contract's fields and rejects anything unrecognized. Silently discarding a
-misspelled argument would answer a different question than the one asked, and the agent would
-have no way to know.
+Searches local memories.
 
-## Tool notes
+| Argument | Type | Required | Default |
+| --- | --- | --- | --- |
+| `query` | string or ordered content parts | yes | — |
+| `limit` | integer from 1 through 100 | no | 10 |
 
-### `memory_observe`
+The result is `{"hits": [...]}`. Each hit contains memory fields plus `score`. Routed queries with
+text use hybrid dense/full-text retrieval; pure media uses dense retrieval. The tool is read-only.
 
-Returns `observation_id`, `processing_job_id`, `evidence_ids`, `idempotency_key`, `status`, and
-`trace_id`. Memory does not exist when it returns; exchange the `processing_job_id` through
-`memory_job`.
+### `ask_memory`
 
-Media must already be in object storage at `s3://<bucket>/tenants/<tenant_id>/<key>`, with a
-matching SHA-256. MCP does not upload bytes.
+Answers only from retrieved local memories.
 
-### `memory_recall`
+| Argument | Type | Required | Default |
+| --- | --- | --- | --- |
+| `question` | string or ordered content parts | yes | — |
+| `limit` | integer from 1 through 100 | no | 5 |
 
-Modes are `answer` (default), `search`, and `enumerate`. Returns the answer, a confidence, the
-memories it rests on, and signed evidence URLs — so the agent can verify rather than trust.
+The result contains `answer` and the exact grounding `hits`. The tool is read-only. The built-in
+outbound answer request serializes each distinct question/evidence asset once even if several hits
+refer to it. It also sends each hit's content, `occurred_at`, `created_at`, and metadata to the
+configured generation endpoint.
 
-`start_ms`–`end_ms` locate the span inside the original recording, and `media_url` is signed
-media *covering* that span rather than a byte-exact cut of it: normally a clip derived for the
-span, whose own timeline starts at zero and which may run wider than the cited range, and
-otherwise the whole source object. Play the bytes; do not seek to `start_ms` inside them.
+### `get_memory`
 
-For a grounded follow-up, pass `memory_ids` from the previous result. It is a strict scope.
+Reads one record by stable ID.
 
-`answer` is null when nothing supports one. An agent should treat that as "MindBridge does not
-know", not as an error to retry.
+| Argument | Type | Required |
+| --- | --- | --- |
+| `memory_id` | non-blank, trimmed string | yes |
 
-### `memory_get`
+The structured result is one memory record. The tool is read-only.
 
-Takes `tenant_id` and `memory_id`. Returns the memory with signed `EvidenceView`s attached, so
-an agent does not need a second private-storage call to inspect the source.
+### `delete_memory`
 
-### `memory_job`
+Idempotently deletes one record.
 
-Takes `tenant_id` and `job_id`. This tool exists so the `processing_job_id` that
-`memory_observe` hands back is redeemable on the MCP face — without it an agent could only retry
-recall blindly, which is exactly what the REST documentation tells callers not to do.
+| Argument | Type | Required |
+| --- | --- | --- |
+| `memory_id` | non-blank, trimmed string | yes |
 
-Following every intermediate state as a *stream* stays REST-only. MCP tools are
-request/response, and inventing a streaming convention before a caller needs one would be
-inventing a contract to maintain.
+The result is `{"deleted":true}` or `{"deleted":false}`. The tool is marked destructive and
+idempotent.
 
-### `memory_feedback`
+## Validation and errors
 
-Which arguments are required depends on `feedback_type`:
+Only the five documented tool names and their exact top-level arguments are accepted. Unknown,
+tenant, user, and run fields are rejected rather than silently ignored.
 
-| `feedback_type` | Requires |
-| --- | --- |
-| `useful`, `wrong` | `memory_id` |
-| `correction` | `memory_id` and `correction_summary` |
-| `missing` | `recall_trace_id` (and **not** `memory_id`) |
+Tool failures expose a compact JSON object in the MCP error result:
 
-`missing` judges a recall rather than a memory, which is why it takes the `trace_id` the recall
-returned.
+```json
+{"code":"validation_error","message":"tool arguments are invalid"}
+```
 
-### `memory_forget`
+Stable codes include `validation_error`, `memory_not_found`, `model_error`, `storage_error`,
+`index_unavailable`, and `internal_error`. Provider responses, credentials, filesystem paths, and
+native-index details are not included.
 
-`target_type` is `memory_record` (that one memory) or `observation` (the source observation and
-everything derived from it). The receipt reports that erasure was recorded and started;
-`complete` means deletion finished in central PostgreSQL and object storage. Offline edge devices
-consume the retained tombstone when they reconnect; the receipt is not an acknowledgement from
-those devices.
+## Programmatic adapter
 
-This is the one tool marked destructive. Clients that gate destructive tools behind confirmation
-will do so here.
+Applications embedding MCP may pass an existing synchronous or asynchronous memory:
 
-## Errors
+```python
+from mindbridge import Memory
+from mindbridge.api.mcp import build_mcp_server
 
-Failures report the same stable envelope and codes REST does, including validation failures and
-an `internal_error` for unexpected exceptions. See [the error table](rest.md#error-codes).
+with Memory("./data/agent") as memory:
+    server = build_mcp_server(memory)
+    server.run("stdio")
+```
 
-## Known limitation
+`build_mcp_server` does not take ownership of the supplied instance. `run_mcp(data_dir)` creates
+and closes its own `Memory`.
 
-`mcp` 2.0 flattens the contract's fields into tool arguments, and its `pre_parse_json` step
-consumes string values for `X | None` fields before MindBridge's validator sees them. Optional
-string arguments therefore behave slightly differently over MCP than over REST. This is upstream
-and not currently fixable from this side; if it affects you, use REST for that call.
+## Current limits
+
+MCP mirrors the five common single-record agent operations. Batch addition, listing, reindexing,
+and optimization remain Python or CLI operations. There is no large-file upload tool, local-path
+input, logical scope, chunking option, per-asset vector control, or reranker option. The built-in
+`data` model transport separately rejects embedding or generation calls above 64 MiB of aggregate
+raw media, and built-in answer text evidence is limited to 4 MiB. Larger video needs co-located
+`file` transport or a custom streaming/upload backend.
