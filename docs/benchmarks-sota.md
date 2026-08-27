@@ -13,7 +13,7 @@
 
 MindBridge 现在有 18 条评测路径：十二个原生 runner，加 AML 离线 harness 的六条文本路径；
 LoCoMo-Refined 在两边重复，所以是 17 个不同数据集。原生十二项里真正有厂商自报产品榜的仍只有
-**LoCoMo-Refined** 和 **Video-MME**；AML 新增的 LongMemEval-S、BEAM 和 PersonaMem-v1 则已有商业
+**LoCoMo-Refined** 和 **Video-MME**；AML 新增的 LongMemEval-S、BEAM、PersonaMem-v1 和 PersonaMem-v2 则已有商业
 记忆产品在公开统一 harness 下的结果。两类数字必须分表，因为 AML 官方固定套件、AML 离线复跑和
 数据集原生论文协议是三种不同测法。
 
@@ -32,8 +32,8 @@ LoCoMo-Refined 在两边重复，所以是 17 个不同数据集。原生十二�
 | ATM-Bench | QS + Recall@10（三类题分别精确匹配 / Jaccard / LLM-judge） | MemPalace 56.8 main / MemoryOS 13.7 hard（Memexa 68.0 / 47.9 换了 judge） | 无 | 先与 SGM 列同口径，再设线 |
 | Mem-Gallery | F1 + 五级 LLM-judge | MuRAG 0.6966 F1 / 0.8229 judge | 无 | 先与官方 backbone 同口径，再设线 |
 
-AML 带来的五个新增数据集，其数据集原生协议或公开统一 harness 的当前线是。下表“工业 / 产品”列
-同时容纳厂商自报和第三方复跑，逐行都标口径；它不是前一张表“工业榜”定义的放宽版：
+AML 带来的五个新增数据集，其数据集原生协议或公开统一 harness 的当前线如下。下表"工业 / 产品"列
+同时容纳厂商自报和第三方复跑，逐行都标口径；它不是前一张表"工业榜"定义的放宽版：
 
 | Benchmark | 可比口径 | 学术 / 模型 SOTA | 工业 / 产品 SOTA | MindBridge 需越过的线 |
 | --- | --- | --- | --- | --- |
@@ -547,7 +547,7 @@ consolidation policy，也说明偏好更新不能只靠相似度检索。
 
 **MindBridge 目标**：AMB 32K 同口径 > 86.59，同时补齐 128K / 1M；原生协议则至少超过 MemCoE 的
 57.06 / 47.24。当前没有可比的 1M SOTA，MindBridge 的第一个完整 1M run 只能叫公开基线，不能写
-“超过 SOTA”。每个分数必须带 context 档位，三档不得求一个无定义的平均数。
+"超过 SOTA"。每个分数必须带 context 档位，三档不得求一个无定义的平均数。
 
 ### 3.17 PersonaMem-v2 — 隐式 persona 与可遗忘偏好
 
