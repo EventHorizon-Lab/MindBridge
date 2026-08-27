@@ -43,7 +43,7 @@ from mindbridge.benchmarks.cli_common import (
     media_arguments,
     media_manifest,
     report,
-    report_unit,
+    run_units,
     scoring_snapshot,
     select_by_id,
     write_run_artifacts,
@@ -161,24 +161,20 @@ async def _run(
             poll_interval_seconds=arguments.poll_interval_seconds,
             processing_timeout_seconds=arguments.processing_timeout_seconds,
         )
-        results = []
-        for index, question in enumerate(questions, start=1):
-            report_unit(
-                f"question {question.question_id}",
-                index=index,
-                total=len(questions),
-                quiet=arguments.quiet,
-            )
-            results.append(
-                await answer_atm_question(
-                    memory,
-                    question,
-                    tenant_id=tenant_id,
-                    recall_limit=arguments.recall_limit,
-                    ingest_failure_count=failures,
-                )
-            )
-    return failures, tuple(results)
+        results = await run_units(
+            questions,
+            label=lambda question: f"question {question.question_id}",
+            unit_concurrency=arguments.unit_concurrency,
+            quiet=arguments.quiet,
+            run=lambda question: answer_atm_question(
+                memory,
+                question,
+                tenant_id=tenant_id,
+                recall_limit=arguments.recall_limit,
+                ingest_failure_count=failures,
+            ),
+        )
+    return failures, results
 
 
 def _write_artifacts(

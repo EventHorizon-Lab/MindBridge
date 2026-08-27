@@ -158,7 +158,6 @@ async def run_mem_gallery_topic(
         device_id,
         by_key,
         semaphore,
-        request_concurrency,
         poll_interval_seconds,
         processing_timeout_seconds,
     )
@@ -178,7 +177,6 @@ async def run_mem_gallery_topic(
         by_key,
         recall_limit,
         semaphore,
-        request_concurrency,
         ingest_failures,
     )
 
@@ -248,7 +246,6 @@ async def _ingest_topic_sessions(
     device_id: str,
     by_key: dict[str, MediaObjectInput],
     semaphore: asyncio.Semaphore,
-    request_concurrency: int,
     poll_interval_seconds: float,
     processing_timeout_seconds: float,
 ) -> int:
@@ -257,10 +254,10 @@ async def _ingest_topic_sessions(
     Sessions run concurrently; rounds inside one session must not. Every round of a session
     shares that session's occurred_at, so nothing but insertion order records which round came
     first -- reordering them rewrites the dialogue. Distinct sessions carry distinct occurred_at,
-    so their relative order survives batching. Awaiting each round at the top level would also
-    make `request_concurrency` inert, because the semaphore below is only ever acquired
-    uncontended inside a serial await -- the same failure mode `memlens_runner` documents at
-    `_ingest_session_turns` and was fixed the same way there.
+    so nothing about their relative order depends on the order they are ingested in. Awaiting
+    each round at the top level would also make the semaphore inert, because it would only ever
+    be acquired uncontended inside a serial await -- the same failure mode `memlens_runner`
+    documents at `_ingest_session_turns` and was fixed the same way there.
 
     The distinct-occurred_at claim is measured on the release, not guaranteed by the schema:
     `MemGallerySession.occurred_at` is parsed from the release's per-session `date` field at day
@@ -272,29 +269,24 @@ async def _ingest_topic_sessions(
         sum(len(previous.rounds) for previous in topic.sessions[:index])
         for index in range(len(topic.sessions))
     )
-    failures = 0
-    for offset in range(0, len(topic.sessions), request_concurrency):
-        outcomes = await asyncio.gather(
-            *(
-                _ingest_session_rounds(
-                    memory,
-                    tenant_id,
-                    device_id,
-                    session,
-                    session_starts[offset + index],
-                    by_key,
-                    semaphore,
-                    poll_interval_seconds,
-                    processing_timeout_seconds,
-                )
-                for index, session in enumerate(
-                    topic.sessions[offset : offset + request_concurrency]
-                )
-            ),
-            return_exceptions=True,
-        )
-        failures += sum(outcome if isinstance(outcome, int) else 1 for outcome in outcomes)
-    return failures
+    outcomes = await asyncio.gather(
+        *(
+            _ingest_session_rounds(
+                memory,
+                tenant_id,
+                device_id,
+                session,
+                session_starts[index],
+                by_key,
+                semaphore,
+                poll_interval_seconds,
+                processing_timeout_seconds,
+            )
+            for index, session in enumerate(topic.sessions)
+        ),
+        return_exceptions=True,
+    )
+    return sum(outcome if isinstance(outcome, int) else 1 for outcome in outcomes)
 
 
 async def _ingest_session_rounds(
@@ -393,7 +385,6 @@ async def _answer_topic_questions(
     by_key: dict[str, MediaObjectInput],
     recall_limit: int,
     semaphore: asyncio.Semaphore,
-    request_concurrency: int,
     ingest_failure_count: int,
 ) -> tuple[MemGalleryQuestionResult, ...]:
     """Answer every question concurrently; each is independent of every other.
@@ -401,35 +392,35 @@ async def _answer_topic_questions(
     A question's own failure has no tolerance path -- there is no way to report a missing
     prediction as anything other than an incomplete run -- so any exception here is re-raised
     exactly as an unguarded `await memory.recall(...)` would propagate one. Only the scheduling
-    changes; a bare `asyncio.gather` would still cancel sibling questions on the first failure,
-    so outcomes are still collected with `return_exceptions=True` and reduced explicitly.
+    changes. `return_exceptions=True` is what makes that re-raise deliberate rather than a race:
+    a bare `gather` propagates the first failure while leaving its siblings running, so the topic
+    would raise with recalls still in flight against a client the caller is about to close.
     """
+    outcomes = await asyncio.gather(
+        *(
+            _answer_question(
+                memory,
+                topic,
+                question,
+                tenant_id=tenant_id,
+                recall_limit=recall_limit,
+                question_image=(
+                    by_key[question.question_image_path]
+                    if question.question_image_path is not None
+                    else None
+                ),
+                semaphore=semaphore,
+                ingest_failure_count=ingest_failure_count,
+            )
+            for question in topic.questions
+        ),
+        return_exceptions=True,
+    )
     results: list[MemGalleryQuestionResult] = []
-    for offset in range(0, len(topic.questions), request_concurrency):
-        outcomes = await asyncio.gather(
-            *(
-                _answer_question(
-                    memory,
-                    topic,
-                    question,
-                    tenant_id=tenant_id,
-                    recall_limit=recall_limit,
-                    question_image=(
-                        by_key[question.question_image_path]
-                        if question.question_image_path is not None
-                        else None
-                    ),
-                    semaphore=semaphore,
-                    ingest_failure_count=ingest_failure_count,
-                )
-                for question in topic.questions[offset : offset + request_concurrency]
-            ),
-            return_exceptions=True,
-        )
-        for outcome in outcomes:
-            if isinstance(outcome, BaseException):
-                raise outcome
-            results.append(outcome)
+    for outcome in outcomes:
+        if isinstance(outcome, BaseException):
+            raise outcome
+        results.append(outcome)
     return tuple(results)
 
 

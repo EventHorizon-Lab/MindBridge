@@ -1,17 +1,33 @@
 """Checks for shared production benchmark runtime behavior."""
 
 import asyncio
+from datetime import datetime, timezone
+from typing import cast
 
 import pytest
 
+from mindbridge import MindBridge
 from mindbridge.benchmarks.runtime import (
+    PreparedVideo,
+    PreparedVideoSegment,
     answer_failure_trace_id,
     benchmark_tenant_id,
+    ingest_prepared_video,
     multiple_choice_query,
     parse_option_ranking,
     settle_answers,
 )
+from mindbridge.contracts import (
+    MediaObjectInput,
+    ObservationProcessingJobView,
+    ObservationReceipt,
+    ObservationStatus,
+    ObserveRequest,
+)
+from mindbridge.core import JobState, MediaKind
 from mindbridge.sdk import MindBridgeError
+
+_ORIGIN = datetime(2026, 1, 1, tzinfo=timezone.utc)
 
 
 def test_benchmark_tenant_requires_an_isolated_run_id() -> None:
@@ -82,3 +98,114 @@ def test_settle_answers_rejects_outcomes_that_do_not_line_up_with_their_question
 
 def test_answer_failure_trace_id_stays_inside_the_identifier_limit() -> None:
     assert len(answer_failure_trace_id("q" * 400)) == 255
+
+
+class _SlowFirstSegmentApi:
+    """Answer every job immediately except the first, and log the order things happened in.
+
+    The first segment's job stays RUNNING for a fixed number of polls. That is what separates a
+    fan-out that streams from one that stops at a cohort boundary: under a bounded stream the
+    permits its fast siblings release are taken by segments further down the video, so a later
+    segment is observed while the slow one is still in flight. Under a cohort barrier no segment
+    outside the first cohort can be observed until every member of it, the slow one included,
+    has finished.
+    """
+
+    def __init__(self, *, slow_polls: int) -> None:
+        self.slow_polls = slow_polls
+        self.log: list[str] = []
+        self._polls: dict[str, int] = {}
+        self._observed = 0
+
+    async def observe(self, request: ObserveRequest) -> ObservationReceipt:
+        self._observed += 1
+        job_id = f"job_{self._observed:04d}"
+        self.log.append(f"observe {job_id}")
+        return ObservationReceipt(
+            observation_id=f"obs_{self._observed:04d}",
+            processing_job_id=job_id,
+            idempotency_key=request.idempotency_key or "key_1",
+            status=ObservationStatus.ACCEPTED,
+            trace_id="trace_observe",
+        )
+
+    async def get_observation_job(
+        self, tenant_id: str, job_id: str
+    ) -> ObservationProcessingJobView:
+        self._polls[job_id] = self._polls.get(job_id, 0) + 1
+        running = job_id == "job_0001" and self._polls[job_id] <= self.slow_polls
+        if not running:
+            self.log.append(f"done {job_id}")
+        return ObservationProcessingJobView(
+            job_id=job_id,
+            observation_id="obs_0001",
+            state=JobState.RUNNING if running else JobState.SUCCEEDED,
+            attempt=1,
+            error_code=None,
+            created_at=_ORIGIN,
+            updated_at=_ORIGIN,
+            trace_id="trace_job",
+        )
+
+
+def _prepared_video(segments: int) -> PreparedVideo:
+    return PreparedVideo(
+        video_id="video_1",
+        timeline_origin=_ORIGIN,
+        segments=tuple(
+            PreparedVideoSegment(
+                segment_id=f"segment_{index:04d}",
+                start_seconds=float(index * 30),
+                duration_ms=30_000,
+                media_objects=(
+                    MediaObjectInput(
+                        media_object_id=f"object_{index:04d}",
+                        kind=MediaKind.VIDEO,
+                        uri=f"s3://bucket/object_{index:04d}.mp4",
+                        sha256=f"{index:064x}",
+                        size_bytes=1_024,
+                        created_at=_ORIGIN,
+                        duration_ms=30_000,
+                    ),
+                ),
+            )
+            for index in range(segments)
+        ),
+    )
+
+
+async def test_prepared_ingest_keeps_its_permits_busy_past_the_first_cohort() -> None:
+    """One slow segment must not stall the ones a permit is free for.
+
+    The fan-out is bounded by `request_concurrency` permits and nothing else. Chunking the
+    segments into cohorts of that size instead drains the permits to zero at every cohort
+    boundary, so a video's in-flight count sawtooths between the ceiling and one -- against a
+    Worker whose queue only stays full while the permits do.
+    """
+    concurrency = 3
+    api = _SlowFirstSegmentApi(slow_polls=8)
+
+    failures = await ingest_prepared_video(
+        cast(MindBridge, api),
+        "tenant_1",
+        "device_1",
+        _prepared_video(12),
+        adapter_version="adapter_v1",
+        request_concurrency=concurrency,
+        poll_interval_seconds=0.001,
+        processing_timeout_seconds=30.0,
+    )
+
+    assert failures == 0
+    # The slow job is the first one observed, because `gather` starts its members in argument
+    # order and the first three take the only permits. Asserted rather than assumed: without it
+    # a renamed job-id scheme would surface as a bare ValueError out of `index` below.
+    assert api.log[0] == "observe job_0001", f"the slow job was not observed first: {api.log[:3]}"
+    assert "done job_0001" in api.log, "the slow segment never finished; nothing to measure"
+    started_before_then = sum(
+        entry.startswith("observe") for entry in api.log[: api.log.index("done job_0001")]
+    )
+    assert started_before_then > concurrency, (
+        f"only {started_before_then} segments were in flight before the slow one finished; "
+        f"a stream bounded by {concurrency} permits reaches further than one cohort"
+    )

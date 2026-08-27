@@ -81,6 +81,7 @@ def _arguments(dataset_path: Path, prepared_path: Path, output_path: Path) -> _A
         device_id="supermemory_glasses",
         recall_limit=20,
         request_concurrency=4,
+        unit_concurrency=1,
         request_timeout_seconds=1_800.0,
         limit=None,
         poll_interval_seconds=1.0,

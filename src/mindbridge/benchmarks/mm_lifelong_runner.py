@@ -178,9 +178,8 @@ async def run_mm_lifelong(
 
     tenant_id = benchmark_tenant_id(tenant_prefix, prepared.split, run_id)
     semaphore = asyncio.Semaphore(request_concurrency)
-    ingest_failures = 0
-    for offset in range(0, len(prepared.segments), request_concurrency):
-        outcomes = await asyncio.gather(
+    ingest_failures = _count_ingest_failures(
+        await asyncio.gather(
             *(
                 _ingest_segment(
                     memory,
@@ -188,44 +187,36 @@ async def run_mm_lifelong(
                     device_id,
                     prepared,
                     segment,
-                    offset + index,
+                    index,
                     poll_interval_seconds,
                     processing_timeout_seconds,
                     semaphore,
                 )
-                for index, segment in enumerate(
-                    prepared.segments[offset : offset + request_concurrency]
-                )
+                for index, segment in enumerate(prepared.segments)
             ),
             return_exceptions=True,
         )
-        ingest_failures += _count_ingest_failures(outcomes)
+    )
 
-    results: list[MMLifelongQuestionResult] = []
-    for offset in range(0, len(questions), request_concurrency):
-        cohort = questions[offset : offset + request_concurrency]
-        answered = await asyncio.gather(
-            *(
-                _answer_question(
-                    memory,
-                    tenant_id,
-                    question,
-                    prepared,
-                    total_seconds,
-                    recall_limit,
-                    semaphore,
-                    ingest_failures,
-                )
-                for question in cohort
-            ),
-            return_exceptions=True,
-        )
-        results.extend(
-            settle_answers(
-                cohort, answered, partial(_failed_result, ingest_failures=ingest_failures)
+    answered = await asyncio.gather(
+        *(
+            _answer_question(
+                memory,
+                tenant_id,
+                question,
+                prepared,
+                total_seconds,
+                recall_limit,
+                semaphore,
+                ingest_failures,
             )
-        )
-    return tuple(results)
+            for question in questions
+        ),
+        return_exceptions=True,
+    )
+    return settle_answers(
+        questions, answered, partial(_failed_result, ingest_failures=ingest_failures)
+    )
 
 
 def _count_ingest_failures(outcomes: list[BaseException | None]) -> int:

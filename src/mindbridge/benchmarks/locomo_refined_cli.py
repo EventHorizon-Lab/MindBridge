@@ -11,6 +11,7 @@ import asyncio
 from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass
+from itertools import chain
 from typing import Literal
 
 from pydantic import Field
@@ -29,7 +30,7 @@ from mindbridge.benchmarks.cli_common import (
     core_parser,
     predictions_jsonl,
     report,
-    report_unit,
+    run_units,
     scoring_snapshot,
     select_by_id,
     write_run_artifacts,
@@ -103,25 +104,21 @@ async def _run_conversations(
     conversations: tuple[LoCoMoRefinedConversation, ...],
 ) -> tuple[LoCoMoRefinedPrediction, ...]:
     async with connected_memory(arguments) as memory:
-        predictions: list[LoCoMoRefinedPrediction] = []
-        for index, conversation in enumerate(conversations, start=1):
-            report_unit(
-                f"conversation {conversation.sample_id}",
-                index=index,
-                total=len(conversations),
-                quiet=arguments.quiet,
-            )
-            predictions.extend(
-                await run_locomo_refined_conversation(
-                    memory,
-                    conversation,
-                    run_id=arguments.run_id,
-                    tenant_prefix=arguments.tenant_prefix,
-                    recall_limit=arguments.recall_limit,
-                    request_concurrency=arguments.request_concurrency,
-                )
-            )
-        return tuple(predictions)
+        per_conversation = await run_units(
+            conversations,
+            label=lambda conversation: f"conversation {conversation.sample_id}",
+            unit_concurrency=arguments.unit_concurrency,
+            quiet=arguments.quiet,
+            run=lambda conversation: run_locomo_refined_conversation(
+                memory,
+                conversation,
+                run_id=arguments.run_id,
+                tenant_prefix=arguments.tenant_prefix,
+                recall_limit=arguments.recall_limit,
+                request_concurrency=arguments.request_concurrency,
+            ),
+        )
+        return tuple(chain.from_iterable(per_conversation))
 
 
 def _write_artifacts(

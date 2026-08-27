@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Mapping
-from dataclasses import dataclass
-from pathlib import PurePosixPath
+from dataclasses import dataclass, replace
+from html import escape
+from pathlib import Path, PurePosixPath
+from tempfile import TemporaryDirectory
 from time import perf_counter
-from typing import cast
+from typing import TYPE_CHECKING, Literal, cast
 from urllib.parse import urlsplit, urlunsplit
+from urllib.request import urlopen
 
 import httpx
 import openai
@@ -27,6 +31,7 @@ from mindbridge.application.capabilities import (
     EmbedTask,
     GenerateRequest,
     GenerateResult,
+    Generator,
     MediaPart,
     ModelInput,
     TextPart,
@@ -55,8 +60,16 @@ from mindbridge.models.defaults import (
 )
 from mindbridge.telemetry import log_fields, logger, operation_span, set_current_span_attributes
 
+if TYPE_CHECKING:
+    from mindbridge.edge.identity_diarization import FunASRSpeechPipeline, SpeechAnalysis
+
 DEFAULT_VIDEO_FRAMES_PER_SECOND = 1.0
 DEFAULT_VIDEO_MAX_PIXELS = 200_704
+DEFAULT_ASR_MAXIMUM_MEDIA_BYTES = 64 * 1024 * 1024
+_MEDIA_DOWNLOAD_TIMEOUT_SECONDS = 300.0
+_MEDIA_SUFFIXES = frozenset(
+    {".aac", ".flac", ".m4a", ".mkv", ".mov", ".mp3", ".mp4", ".ogg", ".wav", ".webm"}
+)
 REASONING_EFFORT_VALUES = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
 _LOGGER = logger("mindbridge.models.openai")
 _SCHEMA_REJECTION_MARKERS = ("response_format", "json_schema", "guided", "structured output")
@@ -251,6 +264,173 @@ class OpenAIGenerator:
         return await _consume_completion_stream(stream)
 
 
+class AudioFallbackGenerator:
+    """Diarize AV for a VLM while leaving native Omni generation untouched."""
+
+    def __init__(
+        self,
+        generator: OpenAIGenerator,
+        *,
+        asr_model_id: str | None = None,
+        asr_device: str | None = None,
+        maximum_media_bytes: int = DEFAULT_ASR_MAXIMUM_MEDIA_BYTES,
+    ) -> None:
+        if maximum_media_bytes <= 0:
+            raise ValueError("ASR media limit must be positive")
+        self._generator = generator
+        self._asr_model_id = asr_model_id
+        self._asr_device = asr_device
+        self._maximum_media_bytes = maximum_media_bytes
+        self._pipeline: FunASRSpeechPipeline | None = None
+        # ponytail: one local model lock; use one worker per device if ASR throughput matters.
+        self._pipeline_lock = asyncio.Lock()
+
+    @property
+    def supported_media_kinds(self) -> frozenset[MediaKind]:
+        """Accept audio by transcribing it, while preserving the VLM's other limits."""
+        return self._generator.supported_media_kinds | frozenset({MediaKind.AUDIO})
+
+    async def generate(self, request: GenerateRequest) -> GenerateResult:
+        if not any(
+            isinstance(part, MediaPart) and part.kind in {MediaKind.AUDIO, MediaKind.VIDEO}
+            for part in request.input.parts
+        ):
+            return await self._generator.generate(request)
+
+        parts: list[TextPart | MediaPart] = []
+        for part in request.input.parts:
+            if not isinstance(part, MediaPart) or part.kind not in {
+                MediaKind.AUDIO,
+                MediaKind.VIDEO,
+            }:
+                parts.append(part)
+                continue
+            transcript = await self._transcribe(part)
+            if part.kind is MediaKind.VIDEO:
+                parts.append(part)
+            parts.append(_asr_transcript_part(part, transcript))
+        return await self._generator.generate(replace(request, input=ModelInput(tuple(parts))))
+
+    async def close(self) -> None:
+        await self._generator.close()
+
+    async def _transcribe(self, part: MediaPart) -> str:
+        suffix = _media_suffix(part)
+        with TemporaryDirectory(prefix="mindbridge-asr-") as directory:
+            path = Path(directory, f"input{suffix}")
+            data = await asyncio.to_thread(_read_media, part.url, self._maximum_media_bytes)
+            await asyncio.to_thread(path.write_bytes, data)
+            async with self._pipeline_lock:
+                if self._pipeline is None:
+                    self._pipeline = await asyncio.to_thread(
+                        _load_funasr,
+                        self._asr_model_id,
+                        self._asr_device,
+                    )
+                try:
+                    return _speaker_transcript(await self._pipeline.analyze_file(path))
+                except ModelOutputError:
+                    raise
+                except Exception as error:
+                    raise ModelUnavailableError("FunASR transcription failed") from error
+
+
+def _load_funasr(model_id: str | None, device: str | None) -> FunASRSpeechPipeline:
+    try:
+        from mindbridge.edge.identity_diarization import FunASRSpeechPipeline
+    except ImportError as error:
+        raise ModelUnavailableError(
+            "install MindBridge with the edge extra to use generator audio_mode='transcribe'"
+        ) from error
+    try:
+        return FunASRSpeechPipeline.load(device=device, model_id=model_id)
+    except ModelUnavailableError:
+        raise
+    except Exception as error:
+        raise ModelUnavailableError("FunASR could not be loaded") from error
+
+
+def _speaker_transcript(analysis: SpeechAnalysis) -> str:
+    speakers: dict[str | None, str] = {}
+    lines = []
+    for segment in analysis.segments:
+        speaker = speakers.setdefault(segment.speaker_label, _speaker_name(len(speakers)))
+        lines.append(
+            f"speaker {speaker} | {_timestamp(segment.start_ms)}-{_timestamp(segment.end_ms)} | "
+            f"{segment.transcript}"
+        )
+    return "\n".join(lines)
+
+
+def _speaker_name(index: int) -> str:
+    return chr(ord("A") + index) if index < 26 else f"S{index + 1}"
+
+
+def _timestamp(milliseconds: int) -> str:
+    hours, remainder = divmod(milliseconds, 3_600_000)
+    minutes, remainder = divmod(remainder, 60_000)
+    seconds, millis = divmod(remainder, 1_000)
+    return f"{hours:02}:{minutes:02}:{seconds:02}.{millis:03}"
+
+
+def _asr_transcript_part(part: MediaPart, transcript: str) -> TextPart:
+    source = escape(part.source_uri or part.kind.value, quote=True)
+    content = escape(transcript or "[no speech detected]")
+    return TextPart(
+        f'<asr_transcript source_uri="{source}" trust="untrusted">{content}</asr_transcript>'
+    )
+
+
+def _media_suffix(part: MediaPart) -> str:
+    suffix = PurePosixPath(urlsplit(part.source_uri or part.url).path).suffix.lower()
+    if suffix in _MEDIA_SUFFIXES:
+        return suffix
+    return ".mp4" if part.kind is MediaKind.VIDEO else ".wav"
+
+
+def _read_media(url: str, maximum_bytes: int) -> bytes:
+    location = urlsplit(url)
+    if not location.scheme:
+        try:
+            return _read_bounded_file(Path(url), maximum_bytes)
+        except (OSError, ValueError) as error:
+            raise ModelRequestError("local ASR media could not be read") from error
+    if (
+        location.scheme not in {"data", "file", "http", "https"}
+        or (location.scheme in {"http", "https"} and not location.netloc)
+        or (location.scheme == "file" and location.netloc not in {"", "localhost"})
+        or location.username is not None
+        or location.password is not None
+        or location.fragment
+        or (location.scheme == "file" and location.query)
+        or (location.scheme == "data" and len(url) > 4 * ((maximum_bytes + 2) // 3) + 256)
+    ):
+        raise ModelRequestError("ASR media must use data, file, HTTP, or HTTPS")
+    try:
+        with urlopen(url, timeout=_MEDIA_DOWNLOAD_TIMEOUT_SECONDS) as response:
+            declared = response.headers.get("content-length")
+            if declared is not None and int(declared) > maximum_bytes:
+                raise ModelRequestError(f"ASR media exceeds {maximum_bytes} bytes")
+            data = cast(bytes, response.read(maximum_bytes + 1))
+    except ModelRequestError:
+        raise
+    except (OSError, ValueError) as error:
+        failure = (
+            ModelUnavailableError if location.scheme in {"http", "https"} else ModelRequestError
+        )
+        raise failure("ASR media could not be read") from error
+    if len(data) > maximum_bytes:
+        raise ModelRequestError(f"ASR media exceeds {maximum_bytes} bytes")
+    return data
+
+
+def _read_bounded_file(path: Path, maximum_bytes: int) -> bytes:
+    resolved = path.resolve(strict=True)
+    if not resolved.is_file() or resolved.stat().st_size > maximum_bytes:
+        raise ValueError("media is not a bounded regular file")
+    return resolved.read_bytes()
+
+
 class OpenAIEmbedder:
     """Embed text or media through one OpenAI-compatible Omni endpoint."""
 
@@ -433,6 +613,9 @@ class _GeneratorConfig(PluginConfigModel):
     video_frames_per_second: PluginNumber = DEFAULT_VIDEO_FRAMES_PER_SECOND
     video_max_pixels: PluginInteger = DEFAULT_VIDEO_MAX_PIXELS
     supported_media_kinds: frozenset[MediaKind] = ALL_MEDIA_KINDS
+    audio_mode: Literal["native", "transcribe"] = "native"
+    asr_model_id: PluginText | None = None
+    asr_device: PluginText | None = None
 
 
 class _EmbedderConfig(PluginConfigModel):
@@ -446,10 +629,10 @@ class _EmbedderConfig(PluginConfigModel):
     supported_media_kinds: frozenset[MediaKind] = ALL_MEDIA_KINDS
 
 
-def create_generator(config: Mapping[str, object]) -> OpenAIGenerator:
+def create_generator(config: Mapping[str, object]) -> Generator:
     """Entry-point factory for the bundled OpenAI-compatible generator."""
     validated = _GeneratorConfig.model_validate(config)
-    return OpenAIGenerator.connect(
+    generator = OpenAIGenerator.connect(
         api_key=validated.api_key,
         endpoint=validated.endpoint,
         model_id=validated.model_id,
@@ -459,6 +642,13 @@ def create_generator(config: Mapping[str, object]) -> OpenAIGenerator:
         video_frames_per_second=validated.video_frames_per_second,
         video_max_pixels=validated.video_max_pixels,
         supported_media_kinds=validated.supported_media_kinds,
+    )
+    if validated.audio_mode == "native":
+        return generator
+    return AudioFallbackGenerator(
+        generator,
+        asr_model_id=validated.asr_model_id,
+        asr_device=validated.asr_device,
     )
 
 

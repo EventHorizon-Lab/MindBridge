@@ -53,6 +53,8 @@ Conventional retrieval pipelines lose the properties embodied systems need:
 - Dense evidence/memory/graph retrieval fused with PostgreSQL full-text search.
 - `answer`, `search`, and bounded `enumerate` recall modes, including text and stored-media
   queries.
+- Native Omni generation or lazy FunASR + CAM++ speaker-turn transcription for video-capable
+  generators without audio support.
 - Feedback, versioned corrections, explainable lifecycle transitions, and transitive deletion.
 - Forced PostgreSQL row-level security plus bearer keys bound to tenant allowlists.
 - REST/OpenAPI, an async Python SDK, seven MCP tools over stdio, and operational CLIs.

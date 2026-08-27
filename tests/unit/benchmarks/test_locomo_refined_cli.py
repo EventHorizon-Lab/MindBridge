@@ -1,13 +1,16 @@
 """Artifact and selection checks for the reproducible LoCoMo-Refined CLI."""
 
+import asyncio
 import hashlib
 import json
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 from stub_judge import stub_judge  # noqa: F401 - autouse within this module
 
+from mindbridge.benchmarks import locomo_refined_cli
 from mindbridge.benchmarks.artifacts import (
     load_deployment_snapshot,
     require_writable_output_pair,
@@ -141,6 +144,7 @@ def _arguments(dataset_path: Path, output_path: Path) -> _Arguments:
         tenant_prefix="benchmark_locomo_refined",
         recall_limit=20,
         request_concurrency=4,
+        unit_concurrency=1,
         request_timeout_seconds=1_800.0,
         limit=None,
         sample_ids=(),
@@ -175,9 +179,9 @@ def _write_deployment(path: Path) -> None:
     )
 
 
-def _conversation() -> LoCoMoRefinedConversation:
+def _conversation(sample_id: str = "conv-26") -> LoCoMoRefinedConversation:
     return LoCoMoRefinedConversation(
-        sample_id="conv-26",
+        sample_id=sample_id,
         turns=(
             LoCoMoRefinedTurn(
                 dialog_id="D1:1",
@@ -188,7 +192,7 @@ def _conversation() -> LoCoMoRefinedConversation:
         ),
         questions=(
             LoCoMoRefinedQuestion(
-                question_id="conv-26#q0000",
+                question_id=f"{sample_id}#q0000",
                 question="What happened?",
                 reference_answers=("Hello",),
                 evidence_dialog_ids=("D1:1",),
@@ -197,3 +201,43 @@ def _conversation() -> LoCoMoRefinedConversation:
             ),
         ),
     )
+
+
+async def test_the_cli_hands_its_unit_ceiling_to_the_scheduler(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The wiring probe for `run_units`: a runner that never passes the flag on is serial anyway.
+
+    Nine CLIs make the same call, and a helper that schedules correctly proves nothing about any
+    of them -- `--unit-concurrency` reaching `run_units` is the part that decides whether a run
+    holds its ceiling. One CLI is checked here because the other eight are the same three lines,
+    and a wrong one of them fails to typecheck rather than quietly running one unit at a time.
+    """
+    in_flight = 0
+    peak = 0
+
+    async def fake_conversation(
+        memory: object, conversation: LoCoMoRefinedConversation, **_: object
+    ) -> tuple[LoCoMoRefinedPrediction, ...]:
+        nonlocal in_flight, peak
+        in_flight += 1
+        peak = max(peak, in_flight)
+        for _turn in range(4):
+            await asyncio.sleep(0)
+        in_flight -= 1
+        return (_prediction(f"{conversation.sample_id}#q0000", "Hello"),)
+
+    monkeypatch.setattr(locomo_refined_cli, "run_locomo_refined_conversation", fake_conversation)
+    arguments = replace(
+        _arguments(tmp_path / "dataset.json", tmp_path / "predictions.jsonl"),
+        unit_concurrency=3,
+    )
+    conversations = tuple(_conversation(sample_id=f"conv-{index}") for index in range(6))
+
+    predictions = await locomo_refined_cli._run_conversations(arguments, conversations)
+
+    assert peak == 3, f"the CLI ran {peak} conversation(s) at once with a ceiling of three"
+    assert tuple(prediction.qa_id for prediction in predictions) == tuple(
+        f"conv-{index}#q0000" for index in range(6)
+    ), "predictions must stay in release order however the conversations finished"

@@ -377,6 +377,7 @@ def test_manifest_counts_match_the_topics_this_run_actually_answered(tmp_path: P
             tenant_prefix="benchmark_mem_gallery",
             recall_limit=20,
             request_concurrency=4,
+            unit_concurrency=1,
             request_timeout_seconds=1_800.0,
             limit=None,
             overwrite=False,
