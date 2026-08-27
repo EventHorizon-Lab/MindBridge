@@ -109,21 +109,31 @@ uv run mindbridge-bench eval --list-tasks
 ```text
 groups (--tasks expands these), inputs resolved against .benchmarks:
   released-text           locomo-refined, memlens-32k, atm-main-sgm, atm-hard-sgm
+  aml                     aml-locomo-refined, aml-longmemeval-s, aml-clbench, ...
   all                     locomo-refined, m3-robot, m3-web, egolife, ...
 
 tasks:
   locomo-refined          locomo-refined  download
   m3-robot                m3              download, prepare
-  egolife                 egolife         needs .benchmarks/egolife-prepared-a1.json
+  m3-web                  m3              download, acquire, prepare
+  egolife                 egolife         download, prepare
   memlens-32k             memlens         download
+  aml-clbench             aml             download
+  aml-beam                aml             needs .benchmarks/beam/chats
   ...
 ```
 
-Four states, because they need four different things. `ready` runs now. `download` runs after a
-fetch the sweep performs itself. `prepare` means the sweep will stage media into the deployment's
-bucket. A named path is a prepared-media manifest with no producer yet and must be supplied by the
-operator; see "Prepared media that is still manual" below. States can be combined, as in
-`download, prepare`.
+The stages are named in the order the sweep performs them. `ready` runs now. `download` is a fetch
+of the pinned official release the sweep performs itself. `acquire` is media that comes from
+outside the release — Ego4D behind its signed agreement, or 920 YouTube URLs — and is the one
+stage with a prerequisite this machine may not hold; see [Media no snapshot
+supplies](#media-no-snapshot-supplies). `prepare` means the sweep will stage media into the
+deployment's bucket. A named path is a prepared-media manifest with no producer yet and must be
+supplied by the operator, which no catalog task now needs.
+
+The listing reads the tables and the filesystem and nothing else: it never downloads, never
+imports an acquirer, and never checks a credential, so it stays instant and safe to run before
+deciding to spend an evening.
 
 Task names are comma-separated and the flag repeats, so `--tasks m3-robot,m3-web --tasks egolife`
 is three tasks. A group expands to several, and a task named twice still runs once.
@@ -158,10 +168,11 @@ digest this repository committed. Three things about that are deliberate.
 
 **Only the files a task reads.** ATM-Bench's Hub repository is 3.2 GB and Mem-Gallery's is
 530 MB, but a run consumes five JSON files and one directory of them — about 40 MB between them,
-against 302 GB of full releases. The media in those releases is not something a run can use as a
-file anyway. MEMLENS is the exception worth planning disk for: its annotation *is* the corpus, so
-its four context windows are 98 MB, 191 MB, 369 MB and 732 MB, and `--tasks all` fetches about
-1.4 GB rather than 40 MB.
+against 302 GB of full releases. Media is fetched separately and only for a task that stages it,
+narrowed to the units `--limit` selects where the release allows narrowing — a `--limit 1` EgoLife
+run takes one day rather than the release's 477 GiB. MEMLENS is the exception worth planning disk
+for among the annotations: its annotation *is* the corpus, so its four context windows are 98 MB,
+191 MB, 369 MB and 732 MB, and `--tasks all` fetches about 1.4 GB rather than 40 MB.
 
 **Pinned.** Each release is fetched at a fixed commit — every one of them, asserted by
 `tests/unit/benchmarks/test_releases.py` rather than left to review, because a branch name makes
@@ -190,10 +201,28 @@ Media benchmarks read a prepared-media manifest: a JSON file naming clips alread
 storage, with their durations and the identity spans over them. A sweep produces that manifest
 itself for the benchmarks below, staging into the deployment's own bucket:
 
-| Benchmark | Produced from | Needs |
+| Benchmark | Produced from | Media obtained by |
 | --- | --- | --- |
-| `mem-gallery` | the release's own images | the bucket |
-| `m3-robot`, `m3-web` | the official videos, cut into 30-second clips | the bucket, the videos |
+| `mem-gallery` | the release's own images | the sweep |
+| `m3-robot` | the official videos, cut into 30-second clips | the sweep |
+| `m3-web` | the official videos, cut into 30-second clips | the sweep — see below |
+| `video-mme`, `video-mme-v2` | the official videos, cut into 30-second segments | the sweep |
+| `egotempo` | the pre-trimmed clip each question names | the sweep — see below |
+| `egolife` | the release's own 30-second clips, staged verbatim | the sweep |
+| `egomem` | EgoLife's clips, on EgoMemReason's own horizons | the sweep |
+| `supermemory` | the official recordings, cut to each question's horizon | the sweep |
+| `mm-lifelong` | the official videos on the split-wide clock | the sweep |
+| `atm-main`, `atm-hard` | the release's own image and video archive | the sweep |
+
+ATM-Bench's `sgm` arms are absent deliberately: they ingest the release's pre-processed captions
+and open no manifest, so nothing is staged for them. That is declared rather than inferred from
+the flag being absent — absence is what makes the sweep *add* the flag, which would have staged
+about 3 GB neither arm reads.
+
+EgoLife's clips are staged as the release published them rather than re-cut. They are already the
+30-second split both shapes want, and they carry an AAC track that a re-encode is the documented
+way to lose. SuperMemory-VQA's recordings carry no audio at all — that is the public release, not
+the clipper.
 
 Two properties are forced rather than chosen, and they are worth knowing before reading a
 manifest.
@@ -217,18 +246,76 @@ Bucket credentials are Boto3's own (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`
 endpoint come from the same `[object_storage]` configuration the deployment reads, so a benchmark
 cannot stage into a bucket the deployment will not look in.
 
-### Prepared media that is still manual
+### Media no snapshot supplies
 
-`egolife`, `egomem`, `egotempo`, `mm-lifelong`, `supermemory`, `video-mme`, and `video-mme-v2`
-have no producer yet, and `--list-tasks` names the manifest each one wants. Their manifests are
-not the two shapes above:
+Naming a task fetches the media it reads, at the revision `releases.py` pins, with no size cap and
+no prompt — Video-MME's 20 archives are 94 GiB and the sweep will take all of them. Two media sets
+are not files in a pinned repository at all, so the sweep obtains them a different way. It still
+obtains them: `--list-tasks` marks these two `acquire` rather than `download`, and the difference
+is the prerequisite, not the automation.
 
-- EgoLifeQA, EgoMemReason, and MM-Lifelong encode their own clocks — EgoLifeQA's `DAYn` plus
-  `HHMMSSFF` at the release's 20 FPS, with clips crossing a question's time withheld until a
-  later question. That derivation is the work, not the cutting.
-- EgoTempo's videos are Ego4D, which is licensed separately and cannot be fetched on your behalf.
-- Video-MME ships its videos as 20 zip archives totalling 94 GiB, so a single video cannot be
-  obtained without the archive holding it.
+- **`egotempo`** — its videos are Ego4D, released under a signed access agreement no unattended
+  download can accept, so **you need Ego4D access before this can run**. Request it at
+  <https://ego4d-data.org>, then let the sweep fetch each question's `source_video_id` with the
+  `ego4d` CLI and cut `clip_start_seconds..clip_end_seconds` into
+  `<benchmarks-root>/egotempo/videos/<clip_id>.mp4`. The name is the `clip_id` because the runner
+  requires the prepared `video_id` to equal it. Without the agreement the run stops with those
+  same instructions, which is also what to follow to place the clips by hand.
+- **`m3-web`** — its 920 videos are web sources the release distributes as the `video_url` of each
+  entry in `m3-agent/data/annotations/web.json` rather than as files, so the sweep downloads them
+  with `yt-dlp` into `<benchmarks-root>/m3-bench/videos/web/<video_id>.mp4`. Each annotation key is
+  the YouTube ID, so the file name needs no template — though many of those IDs begin with a
+  hyphen, so inspecting the corpus by hand needs `./-4OBcRHX1Bc.mp4` or a `--` first. **Budget
+  roughly 90 GB and about 20 hours of wall clock for the whole split**; a `--limit`ed run asks for
+  only the videos it will read.
+
+Both are narrowed per unit, so `--tasks m3-web --limit 1` acquires one video rather than 920.
+`MINDBRIDGE_BENCH_YOUTUBE_SLEEP_SECONDS` (default `30`) is the wait before each download, jittered
+up to twice that, with metadata requests paced at a quarter of it. Raising it is the only lever
+against YouTube's bot detection, and a value that is not a number is refused rather than defaulted.
+
+**Those figures are measured, and estimating them was 30x wrong.** The constraint is YouTube's
+per-connection bandwidth, about 0.85 MB/s, not the pacing: the sleeps are 1–2% of the total, so
+**raising the pacing is nearly free and lowering it buys nearly nothing.** Treat that variable as
+insurance against being cut off, not as a throughput dial. And do not size this from `yt-dlp`'s
+`filesize_approx` — it is bitrate times duration, meaningless for the fragmented DASH formats
+YouTube serves, and it read 26x low on a video that arrived as 712 MB.
+
+**`--format-sort res:360` is why 90 GB and not 550 GB, and it is not a quality compromise.** The
+release's sources are 1920x1080, and taking the best available measured 596 MB and 496 seconds per
+video across three real downloads — about 550 GB and five days for the split. But every stored clip
+is capped at `DEFAULT_VIDEO_MAX_PIXELS`, **200,704 pixels**: a staged clip measures 596x336, so
+roughly 94% of a 1080p download is discarded before anything reaches the bucket. 640x360 is 230,400
+pixels, still above that ceiling, so a 360p download and a 1080p one are scaled to the same
+596x336 clip while the download is about six times smaller. Not byte-identical — the scaler is fed
+a different source, so clip digests differ across the change — but the same clip at the same size,
+which is all the encoder and the model ever see. Do not "fix" the sort key back to best-available:
+it would cost five days and change no dimension of what gets staged.
+
+**That is a coupling, and it only holds while `DEFAULT_VIDEO_MAX_PIXELS` stays at or below
+230,400.** Raise the ceiling above it and 360p becomes the binding limit instead: clips would be
+upscaled from a source that no longer carries the detail, and the repair is re-downloading the
+corpus. `tests/unit/benchmarks/test_acquire_youtube.py` reads that constant and fails if it rises,
+because nothing else would surface it — but if you are the one raising it, the corpus is what you
+have to plan for.
+
+**A dead video does not report the same way twice.** One removed entry answered `Private video.
+Sign in if you've been granted access` on two attempts and `Please sign in.` on two more, minutes
+apart, for the same URL — so a run must recognise a login wall by more than one wording or it
+mistakes the second phrasing for the address itself being blocked, and stops on videos it should
+walk past.
+
+**An out-of-date `yt-dlp` presents as HTTP 403 from YouTube, and 412 from bilibili.** That looks
+exactly like bot detection and cannot be fixed by pacing, which is why the acquirer prefers
+`uvx yt-dlp@latest` and why its failure message distinguishes the two by whether anything
+succeeded first — a stale binary fails on the very first video. Recent versions also warn that no
+JavaScript runtime was found and that some formats may be missing; installing `deno` silences it.
+
+`--no-download` refuses the annotation fetch, the media fetch, and the acquisition rather than
+performing any of them, so it fails on an absent release instead of quietly obtaining 94 GiB. For
+the two sets above it names both the flag and the prerequisite, because only one of those is
+knowable without going and looking: the flag is certain, and whether you hold an Ego4D signature
+is not.
 
 M3-Bench's released memory graphs would give a caption-only manifest with no video at all, which
 is the cheaper released-text arm. They are distributed as Python pickles, and unpickling a
@@ -266,10 +353,10 @@ uv run mindbridge-bench eval --tasks released-text --run-id sweep-001 --dry-run
 ```
 
 `--api-base-url` and `--deployment-config` are forwarded to every task. So are `--limit`,
-`--recall-limit`, `--request-concurrency`, and `--request-timeout-seconds`, but only when given —
-otherwise each runner keeps the default it declares rather than a copy pinned here that goes
-stale. They are placed before a task's own arguments, so a benchmark needing its own recall
-budget sets it in the task.
+`--recall-limit`, `--request-concurrency`, `--unit-concurrency`, and
+`--request-timeout-seconds`, but only when given — otherwise each runner keeps the default it
+declares rather than a copy pinned here that goes stale. They are placed before a task's own
+arguments, so a benchmark needing its own recall budget sets it in the task.
 
 `--device-id`, `--poll-interval-seconds`, and `--processing-timeout-seconds` are forwarded the
 same way, but only to the tasks whose runner takes them — every benchmark here except
@@ -277,11 +364,36 @@ LoCoMo-Refined, which ingests no media and would reject them. That is what lets 
 text and media raise the processing deadline for the runs it applies to. A flag narrower still,
 `--prepared-media` among them, belongs in the task rather than on the sweep.
 
+### Keeping the worker busy
+
+Two flags decide how much work a run keeps in flight, and the product of them is the number that
+matters:
+
+| Flag | Default | What it bounds |
+| --- | --- | --- |
+| `--request-concurrency` | 4 | in-flight API requests inside one unit |
+| `--unit-concurrency` | 4 | units of the benchmark running at once |
+
+A run holds up to `--unit-concurrency` × `--request-concurrency` requests in flight, so the
+defaults keep 16 outstanding against a Worker whose own concurrency is what bounds GPU memory.
+Raising these does not make the Worker do more at once; it makes it less likely to find its queue
+empty. Set both to 1 for a serial run, which is what to reach for when reading a failure.
+
+`--request-concurrency` alone cannot keep the queue full, and this is worth knowing before tuning
+it: a unit ingests before it answers, and the answer phase never reaches the Worker at all. Past
+the size of one unit's fan-out the flag stops buying anything, because what is left idle is the
+gap between units rather than the room inside one. `--unit-concurrency` is the flag that closes
+that gap — with units overlapping, one unit's answer phase runs against another's ingest.
+
 ### What it records
 
 Tasks run one at a time. Running them concurrently against one deployment would have them
 contending for the same worker and would corrupt every timing the runs report; to use more
 hardware, run separate sweeps with different `--run-id`s against separate deployments.
+
+That is a claim about tasks, not about the work inside one. A task's units — a video, a topic, a
+conversation — overlap, and nothing a run reports is per unit, so there is no per-unit timing for
+them to contaminate. See [Keeping the worker busy](#keeping-the-worker-busy).
 
 A task that fails does not stop the sweep, so a benchmark dying four hours in costs its own result
 rather than the others. An interrupt does stop it, and still writes the summary. `--output-dir`
@@ -424,19 +536,35 @@ Six of AML's seven textual benchmarks. ScriptMem is absent on purpose: its publi
 questions, gold answers, and scoring code, but every `conversation` field contains only a
 `format_example` placeholder — the four source scripts are not distributed, so there is nothing for
 a memory system to retrieve and an offline number would measure nothing. A real submission is
-unaffected; AML runs ScriptMem server-side against its own copy.
+unaffected; AML runs ScriptMem server-side against its own copy. `mindbridge-bench aml
+--benchmark scriptmem` offers the choice and refuses it with that reason, so it reads as a decision
+rather than a typo.
+
+CL-Bench, LongMemEval and PersonaMem-v1 are in the release table, so `mindbridge-bench eval`
+fetches them itself and these commands are only for obtaining them out-of-band. BEAM and
+PersonaMem-v2 are not, and have to be fetched by hand: BEAM's corpus is 200 files discovered by
+glob under `chats/{tier}/{conv}/`, and PersonaMem-v2's `data/` is 3.9 GB of which a run reads one
+history variant. Registering either would make a sweep fetch far more than the task reads, or
+announce a fetch that writes nothing. `--list-tasks` reports both as `needs <path>`.
+
+Pin every one of them. Without `--revision` the same task name means different bytes on different
+days, which is the drift that makes two scores incomparable:
 
 ```bash
 git clone https://github.com/mem-eval-suite/LoCoMo_refined.git .benchmarks/locomo-refined
+git -C .benchmarks/locomo-refined checkout 887091190789e8d6760e70b9edd696539923dc4f
+
 git clone https://github.com/mohammadtavakoli78/BEAM.git .benchmarks/beam
+git -C .benchmarks/beam checkout 3e12035532eb85768f1a7cd779832b650c4b2ef9
+
 uvx --from huggingface-hub hf download xiaowu0162/longmemeval --repo-type dataset \
-  --local-dir .benchmarks/longmemeval
+  --revision 2ec2a557f339b6c0369619b1ed5793734cc87533 --local-dir .benchmarks/longmemeval
 uvx --from huggingface-hub hf download bowen-upenn/PersonaMem-v1 --repo-type dataset \
-  --local-dir .benchmarks/personamem-v1
+  --revision fd7c30f071d5c2ee2a211506783be222d7b6002e --local-dir .benchmarks/personamem-v1
 uvx --from huggingface-hub hf download bowen-upenn/PersonaMem-v2 --repo-type dataset \
-  --local-dir .benchmarks/personamem-v2
+  --revision 0622e56d1cc6f1bc990a5100a6ec4022a60e66a6 --local-dir .benchmarks/personamem-v2
 uvx --from huggingface-hub hf download tencent/CL-bench --repo-type dataset \
-  --local-dir .benchmarks/clbench
+  --revision b28a5832a09b0d96c0cf4c22e90d7c60ede25b80 --local-dir .benchmarks/clbench
 ```
 
 Use `longmemeval_s`. `longmemeval_oracle` ships only each question's gold sessions, so retrieval has
@@ -468,21 +596,57 @@ uv run mindbridge-bench aml \
   --deployment-config .benchmarks/deployment.json \
   --run-id smoke-1 \
   --tenant-prefix bench_aml \
-  --top-k 100 \
-  --concurrency 4
+  --recall-limit 100 \
+  --request-concurrency 4
 ```
 
-`--concurrency` bounds requests in flight across every case, not cases replayed at once: a case
-adds its chunks and searches its questions concurrently, with the add phase completing before any
-of that case's searches run. Each in-flight `/aml/add` can hold up to eight pooled connections while
-it writes, so the server needs roughly `8 x --concurrency` connections -- the default 4 matches the
-default `MINDBRIDGE_DATABASE_MAX_POOL_SIZE` of 32. Raise both together, and raise PostgreSQL's
-`max_connections` to match, or writes queue inside the pool until they time out.
+This runner takes the same flags as every other one -- `--recall-limit`, `--request-concurrency`,
+`--request-timeout-seconds`, `--limit`, `--overwrite`, `--predict-only` -- because that shared
+vocabulary is what lets `eval` dispatch it. `--predict-only` is accepted and does nothing: an AML
+run never scores in-runner, so there is no metric for it to replace. `--overwrite` deletes the
+predictions and manifest rather than truncating them, since a resumed run reads the ids already on
+disk to decide what is left to do.
 
-`--tenant-prefix` has no default and must match the deployment's `MINDBRIDGE_AML_TENANT_PREFIX`. The
-manifest's tenant map is derived client-side from the value you pass, so a mismatch produces a
-manifest recording tenants the server never used. Reruns against an existing `--output` resume, and
-refuse to start if the sidecar manifest disagrees on benchmark, run id, deployment, or recall limit.
+`--overwrite` is refused outright when the sidecar describes *this same run*. Deleting the rows
+does not unwrite the `/aml/add` calls that produced them, and the tenant is derived from
+`--run-id`, so replaying would add every case's memories a second time into a tenant that already
+holds them and score the run against a doubled corpus. Drop the flag to resume where the run
+stopped, or pass a new `--run-id` to measure a clean tenant. `--recall-limit` is also range-checked
+before anything is deleted or ingested: the wire contract accepts 1 to 100, and finding that out
+from a `422` mid-run would already have cost the previous result.
+
+`--request-concurrency` bounds requests in flight across every case, not cases replayed at once: a
+case adds its chunks and searches its questions concurrently, with the add phase completing before
+any of that case's searches run. Each in-flight `/aml/add` can hold up to eight pooled connections
+while it writes, so the server needs roughly `8 x --request-concurrency` connections -- the default
+4 matches the default `MINDBRIDGE_DATABASE_MAX_POOL_SIZE` of 32. Raise both together, and raise
+PostgreSQL's `max_connections` to match, or writes queue inside the pool until they time out.
+
+`--tenant-prefix` must match the deployment's `MINDBRIDGE_AML_TENANT_PREFIX` and defaults to that
+same variable read locally -- unset, with no flag, the run is refused rather than given a literal
+default. The manifest's tenant map is derived client-side from the value you pass, so a mismatch
+produces a manifest recording tenants the server never used. Reruns against an existing `--output`
+resume, and refuse to start if the sidecar manifest disagrees on benchmark, run id, deployment, or
+recall limit.
+
+To run several in one sweep, name them through the catalog instead. `--tasks aml` expands to all
+eight AML tasks and needs no judge configured, because none of them is judged in-runner:
+
+```bash
+uv run mindbridge-bench eval --tasks aml --api-base-url "$MINDBRIDGE_API_BASE_URL"
+```
+
+An interrupted AML task resumes: rerun the sweep with the same `--run-id` and the runner continues
+from the rows already written. The preflight that refuses an existing output exempts AML for that
+reason, and only AML — every other runner writes its predictions once at the end, so an existing
+output there is a finished result. Do not reach for `--overwrite` to get past an interruption; it
+is for replacing a *different* run's output, and the runner refuses it in the resume case.
+
+The tasks are `aml-locomo-refined`, `aml-longmemeval-s`, `aml-clbench`, `aml-personamem-v1-32k`,
+`aml-personamem-v1-128k`, `aml-personamem-v1-1M`, `aml-personamem-v2`, and `aml-beam`. PersonaMem-v1
+appears three times because its context windows are different question sets rather than
+repackagings -- 589, 2727 and 2674 questions over 37, 110 and 33 shared contexts. `aml-beam`
+and `aml-personamem-v2` need their corpora fetched by hand first, per the commands above.
 
 Then score through the vendored pipeline, unmodified:
 
@@ -629,8 +793,8 @@ Both ATM-Bench and Mem-Gallery are pinned by revision because the digests in thi
 meaningful against a fixed revision. ATM-Bench is 3.2 GB including the raw media; Mem-Gallery is
 530 MB.
 
-Large M3-Bench media stays outside Git. Acquire it through the official Hugging Face client rather
-than a MindBridge downloader:
+Large M3-Bench media stays outside Git. A sweep naming `m3-robot` fetches it, so this is for
+populating a corpus ahead of time — a mirror, or an offline machine:
 
 ```bash
 uvx --from huggingface-hub hf download ByteDance-Seed/M3-Bench \
@@ -647,8 +811,9 @@ uvx --from huggingface-hub hf download ByteDance-Seed/M3-Bench \
   --local-dir .benchmarks/m3-bench
 ```
 
-Acquire the released SuperMemory-VQA RGB videos the same way; raw audio is not part of the public
-release:
+The released SuperMemory-VQA RGB videos are fetched the same way, and a sweep naming
+`supermemory-subject-1` narrows the fetch to the recordings its questions reach. Raw audio is not
+part of the public release, so these files carry no audio track at all:
 
 ```bash
 uvx --from huggingface-hub hf download OSU-AIoT-MLSys-Lab/SuperMemory-VQA \

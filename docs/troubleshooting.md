@@ -280,11 +280,13 @@ Frame rate sets the entire video write cost: one clip cut, one encoder call, and
 per sampled window. Lower `frames_per_second` in the `[media_sampling]` section of
 `mindbridge.toml` first.
 
-Above roughly 1.3 fps at 30-second segments, the generation proxy also stops working — past about
-forty sampled frames its encode fails on the flush that drains the encoder. Raising frame rate
-therefore trades the proxy away as well. This was documented as the MP4 muxer refusing to
-interleave a sparse video track with continuous audio; it is not, and so turning `proxy_audio`
-off buys no frames. Lower the frame rate or segment shorter.
+Raising the frame rate no longer trades the generation proxy away. It used to: past about forty
+sampled frames the encode failed on the flush that drains the encoder, and a budget of forty frames
+skipped any span over it, so above roughly 1.3 fps at 30-second segments the proxy silently stopped
+working. The crash was documented in turn as the MP4 muxer refusing to interleave a sparse video
+track with continuous audio and then as unidentified; it was neither — the encoder was being handed
+timestamps in two different units. That is fixed and the budget is gone with it, so the only reason
+left to lower the frame rate is the cost above.
 
 If your generator ignores audio, `proxy_audio: false` is still worth setting — it is a smaller
 file to encode and transfer, just not a longer one.

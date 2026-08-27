@@ -149,9 +149,8 @@ async def run_memlens_question(
         sum(len(previous.turns) for previous in question.sessions[:index])
         for index in range(len(question.sessions))
     )
-    ingest_failures = 0
-    for offset in range(0, len(question.sessions), request_concurrency):
-        outcomes = await asyncio.gather(
+    ingest_failures = _count_ingest_failures(
+        await asyncio.gather(
             *(
                 _ingest_session_turns(
                     memory,
@@ -159,20 +158,18 @@ async def run_memlens_question(
                     device_id,
                     question.question_id,
                     session,
-                    session_starts[offset + index],
+                    session_starts[index],
                     image_by_source,
                     text_only,
                     poll_interval_seconds,
                     processing_timeout_seconds,
                     semaphore,
                 )
-                for index, session in enumerate(
-                    question.sessions[offset : offset + request_concurrency]
-                )
+                for index, session in enumerate(question.sessions)
             ),
             return_exceptions=True,
         )
-        ingest_failures += _count_ingest_failures(outcomes)
+    )
 
     async with semaphore:
         recalled = await memory.recall(

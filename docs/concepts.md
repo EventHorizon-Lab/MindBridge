@@ -56,8 +56,10 @@ Three timestamps, deliberately distinct:
 rather than silently corrupting the timeline. `(boot_id, sequence)` orders and deduplicates
 without requiring the counter to survive a restart.
 
-MindBridge does not accept an upload. The device puts bytes in object storage first, then
-submits an observation that refers to them.
+No request body carries bytes. The device puts them in object storage first, then submits an
+observation that refers to them; a client without storage credentials asks
+`POST /v1/media/uploads` for a short-lived signed PUT into its own tenant prefix and does the
+same.
 
 ## MediaObject
 

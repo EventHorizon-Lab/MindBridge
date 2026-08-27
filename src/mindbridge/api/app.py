@@ -26,6 +26,7 @@ from mindbridge.api.errors import (
 )
 from mindbridge.api.events import register_job_event_routes
 from mindbridge.application.kernel import MemoryKernel
+from mindbridge.application.ports import MediaUploadSigner
 from mindbridge.contracts import (
     DeletionListRequest,
     DeletionPage,
@@ -35,6 +36,8 @@ from mindbridge.contracts import (
     ForgetRequest,
     HealthResponse,
     Identifier,
+    MediaUploadRequest,
+    MediaUploadTicket,
     MemoryResult,
     ObservationProcessingJobView,
     ObservationReceipt,
@@ -80,10 +83,16 @@ def build_app(
     kernel: MemoryKernel,
     *,
     authenticator: TenantApiKeyAuthenticator,
+    media_uploads: MediaUploadSigner | None = None,
     lifespan: Lifespan[FastAPI] | None = None,
     aml: tuple[AmlSettings, Generator] | None = None,
 ) -> FastAPI:
-    """Create a side-effect-free REST adapter around one memory kernel."""
+    """Create a side-effect-free REST adapter around one memory kernel.
+
+    `media_uploads` is what makes `createMediaUpload` reachable, and so what lets a client
+    that holds a file rather than an object key store one; a build without it serves the rest
+    of the surface unchanged.
+    """
     app = FastAPI(title="MindBridge", version="0.1.0", lifespan=lifespan)
     tenant_authentication = Depends(authenticator)
     _register_request_error_handlers(app)
@@ -91,6 +100,8 @@ def build_app(
     _register_remember_routes(app, kernel, authenticator)
     _register_deletion_routes(app, kernel, authenticator)
     register_job_event_routes(app, kernel, authenticator)
+    if media_uploads is not None:
+        _register_media_upload_route(app, media_uploads, authenticator)
 
     @app.get(
         "/healthz",
@@ -199,6 +210,46 @@ def build_app(
         register_aml_routes(app, kernel, aml_generator, settings=aml_settings)
 
     return app
+
+
+def _register_media_upload_route(
+    app: FastAPI,
+    media_uploads: MediaUploadSigner,
+    authenticator: TenantApiKeyAuthenticator,
+) -> None:
+    """Expose the one way bytes enter storage without the deployment lending out credentials.
+
+    The signature is minted for a key the server derives inside the caller's own tenant prefix,
+    so the tenant this resolves is the whole of the authorization: it is resolved exactly as
+    `observe` resolves it, from the same bearer principal and through the same `require_tenant`,
+    because a second and weaker way to name a tenant here would be a way to be signed into
+    another one's prefix.
+    """
+    tenant_authentication = Depends(authenticator)
+
+    @app.post(
+        "/v1/media/uploads",
+        response_model=MediaUploadTicket,
+        operation_id="createMediaUpload",
+        responses=responses(*TENANT_ERRORS, "object_storage_unavailable"),
+    )
+    async def create_media_upload(
+        request: MediaUploadRequest,
+        principal: TenantPrincipal = tenant_authentication,
+    ) -> MediaUploadTicket:
+        require_tenant(principal, request.tenant_id)
+        upload = await media_uploads.create_presigned_upload(
+            request.tenant_id,
+            sha256=request.sha256,
+            suffix=request.suffix,
+            size_bytes=request.size_bytes,
+        )
+        return MediaUploadTicket(
+            upload_url=upload.upload_url,
+            uri=upload.uri,
+            expires_at=upload.expires_at,
+            trace_id=current_trace_id(),
+        )
 
 
 def _register_remember_routes(

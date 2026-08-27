@@ -47,11 +47,17 @@ from pydantic import AwareDatetime, Field, StringConstraints, model_validator
 from mindbridge.benchmarks.artifacts import require_writable_output_pair, write_text_atomically
 from mindbridge.benchmarks.cli import INTERRUPT_EXIT_CODE, PROGRAM, RUNNERS, guarded
 from mindbridge.benchmarks.cli import parser as build_parser
-from mindbridge.benchmarks.cli_common import BENCHMARK_ENVIRONMENT, report, select_by_id
-from mindbridge.benchmarks.prepare import PREPARERS, PrepareRequest
+from mindbridge.benchmarks.cli_common import (
+    BENCHMARK_ENVIRONMENT,
+    flag_value,
+    report,
+    select_by_id,
+)
+from mindbridge.benchmarks.prepare import PREPARERS
 from mindbridge.benchmarks.releases import fetch, missing_inputs, release_for
 from mindbridge.benchmarks.report import render, render_directory
 from mindbridge.benchmarks.scoring import require_scoring_is_possible
+from mindbridge.benchmarks.staging import PrepareRequest
 from mindbridge.benchmarks.task_catalog import (
     DEFAULT_BENCHMARKS_ROOT,
     listing,
@@ -406,34 +412,15 @@ def _prepare_task(plan: _Plan, arguments: _Arguments) -> None:
             argv=plan.arguments,
             benchmarks_root=arguments.benchmarks_root,
             quiet=arguments.quiet,
+            download=arguments.download,
         )
     )
-
-
-def _flag_value(arguments: Sequence[str], flag: str) -> str | None:
-    """The value argparse would take for `flag`, in either spelling, or None if it is absent.
-
-    `flag in arguments` misses `--flag=value`, which argparse accepts and which the sweep's own
-    owned-flag check already splits on. Missing it meant a `--suite` entry spelled that way was
-    read as not carrying the flag, so the sweep appended its own derived path, argparse took the
-    later occurrence, and the operator's hand-supplied manifest was silently discarded.
-    """
-    value: str | None = None
-    for index, argument in enumerate(arguments):
-        name, separator, inline = argument.partition("=")
-        if name != flag:
-            continue
-        if separator:
-            value = inline
-        elif index + 1 < len(arguments):
-            value = arguments[index + 1]
-    return value
 
 
 def _prepared_manifest_path(plan: _Plan) -> Path | None:
     """The manifest this task reads, read off the argv rather than guessed from the benchmark."""
     for flag in ("--prepared-media", "--prepared-images"):
-        value = _flag_value(plan.arguments, flag)
+        value = flag_value(plan.arguments, flag)
         if value is not None:
             return Path(value)
     return None
@@ -552,7 +539,12 @@ def _prepared_media_arguments(task: SuiteTask, arguments: _Arguments) -> tuple[s
     supplies a manifest MindBridge cannot produce.
     """
     producer = PREPARERS.get(task.benchmark)
-    if producer is None or _flag_value(task.arguments, producer.flag) is not None:
+    if producer is None or flag_value(task.arguments, producer.flag) is not None:
+        return ()
+    if producer.applies is not None and not producer.applies(task.arguments):
+        # Gated here rather than in `_prepare_task`, because this is the call that creates the
+        # thing `_prepare_task` keys on: withhold the flag and the manifest path is never
+        # appended, `_prepared_manifest_path` answers None, and preparation no-ops for free.
         return ()
     manifest = arguments.output_dir / task.name / f"{arguments.run_id}-prepared.json"
     return (producer.flag, str(manifest))
@@ -568,10 +560,24 @@ def _require_writable_outputs(
 
     Each runner makes this check for itself, but only once it is running. Finding out at the
     fourth benchmark that the fifth cannot write is what this exists to prevent.
+
+    A resumable runner is exempt, and so is the summary once the sweep contains one. Every other
+    runner writes its predictions at the end, so an existing output is a finished result; `aml`
+    appends per finished case, so an existing output is a prefix to continue. Refusing it left an
+    interrupted `--run-id`-named sweep with no way forward: rerunning hit this, and adding
+    `--overwrite` to get past it told the runner to discard the very rows that made resuming
+    possible -- then replay them into a tenant that already held their memories. Exempting it
+    loses no safety, because `aml` refuses an output whose manifest disagrees with the run about
+    benchmark, run id, deployment, or recall limit, which is a stricter test than existence.
+
+    The summary describes the interrupted attempt and is rewritten by the sweep that replaces it.
     """
+    resumable = tuple(plan for plan in plans if RUNNERS[plan.task.benchmark].resumable)
     for plan in plans:
+        if RUNNERS[plan.task.benchmark].resumable:
+            continue
         require_writable_output_pair(plan.output_path, overwrite=overwrite)
-    if summary_path.exists() and not overwrite:
+    if summary_path.exists() and not overwrite and not resumable:
         raise FileExistsError(f"output already exists: {summary_path}")
 
 
@@ -580,7 +586,8 @@ def _require_every_task_can_report(plans: Sequence[_Plan], *, predict_only: bool
 
     Each runner makes this check for itself now, but only once it is running -- and a judged task
     that runs to completion and then cannot score writes nothing, so finding out task by task
-    costs every earlier task's predictions. Seventeen of the twenty-two catalog tasks are judged.
+    costs every earlier task's predictions. Seventeen of the thirty catalog tasks are judged; the
+    eight AML tasks are not, because their number comes from a vendored scorer run afterwards.
     """
     for plan in plans:
         require_scoring_is_possible(plan.task.benchmark, predict_only=predict_only)
@@ -684,6 +691,11 @@ def _build_parser(prog: str | None) -> argparse.ArgumentParser:
         "--request-concurrency",
         type=int,
         help="in-flight API requests per unit, for every task that does not set its own",
+    )
+    parser.add_argument(
+        "--unit-concurrency",
+        type=int,
+        help="units of one benchmark run at once, for every task that does not set its own",
     )
     parser.add_argument(
         "--request-timeout-seconds",
@@ -813,6 +825,7 @@ def _shared_arguments(parsed: argparse.Namespace, *, root: Path) -> tuple[str, .
         ("--limit", parsed.limit),
         ("--recall-limit", parsed.recall_limit),
         ("--request-concurrency", parsed.request_concurrency),
+        ("--unit-concurrency", parsed.unit_concurrency),
         ("--request-timeout-seconds", parsed.request_timeout_seconds),
     ):
         if value is not None:

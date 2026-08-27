@@ -17,7 +17,7 @@ import pytest
 from mindbridge.benchmarks.releases import (
     RECORDED_DIGESTS,
     RELEASES,
-    _pattern,
+    _patterns,
     _require_recorded_digest,
     fetch,
     missing_inputs,
@@ -60,6 +60,22 @@ def test_every_recorded_digest_matches_the_committed_dataset_smoke() -> None:
     assert set(recorded) - set(RECORDED_DIGESTS) == UNKEYED_BY_FILE_NAME
 
 
+OPERATOR_FETCHED = {"beam", "personamem-v2"}
+"""Release directories a task reads from that `RELEASES` deliberately does not supply.
+
+Both break the rule `releases.py` opens with -- fetch only the files a task reads. BEAM's
+corpus is 200 files under `chats/{tier}/{conv}/` found by glob, and a Git release here is
+streamed one declared file at a time with no way to expand a pattern; PersonaMem-v2's `data/`
+is 3.9 GB of which a run reads one history variant, and the path the loader takes is the root.
+Registering either would make the sweep announce a fetch, write nothing usable, and fail the
+task afterwards. Unregistered, `--list-tasks` reports them as `needs <path>` and
+`docs/benchmarking.md` carries the pinned command.
+
+Enumerated rather than inferred so adding a task whose release nobody can fetch fails here
+instead of at the point someone tries to run it.
+"""
+
+
 def test_every_release_a_task_reads_from_is_one_the_table_can_obtain() -> None:
     """A catalog entry pointing at a release with no source is a task that can never run."""
     root = Path("/corpus")
@@ -67,15 +83,28 @@ def test_every_release_a_task_reads_from_is_one_the_table_can_obtain() -> None:
         for path in task.inputs(root=root):
             located = release_for(path, root=root)
             if located is None:
-                # The only inputs without a release are the manifests an operator produces, and
-                # those sit directly under the root rather than inside a release directory.
-                assert path.parent == root, f"{name} reads {path} from no known release"
+                # Inputs without a release are the manifests an operator produces, which sit
+                # directly under the root rather than inside a release directory, and the two
+                # corpora above, which sit inside one this table deliberately omits.
+                assert path.parent == root or path.relative_to(root).parts[0] in OPERATOR_FETCHED, (
+                    f"{name} reads {path} from no known release"
+                )
                 continue
             assert located[0] in RELEASES
 
 
-def test_every_declared_input_is_a_file_or_the_one_directory_that_is_not() -> None:
-    """`_pattern` tells the two apart by extension, so an extensionless file would break it."""
+def test_every_operator_fetched_release_is_one_no_task_can_download() -> None:
+    """The exemption above has to stay an exemption, not a hole a real release falls into."""
+    assert OPERATOR_FETCHED.isdisjoint(RELEASES)
+
+
+def test_a_declared_input_without_an_extension_is_offered_as_both_file_and_directory() -> None:
+    """Both readings are real, so `_patterns` asks for both rather than guessing one.
+
+    Guessing directory -- correct while Mem-Gallery's `data/dialog` was the only such input --
+    turned LongMemEval's extensionless `longmemeval_s` file into `longmemeval_s/*`, which
+    matched nothing, downloaded nothing, and still succeeded.
+    """
     extensionless = {
         str(path)
         for task in TASKS.values()
@@ -83,9 +112,17 @@ def test_every_declared_input_is_a_file_or_the_one_directory_that_is_not() -> No
         if not path.suffix
     }
 
-    assert extensionless == {"/corpus/mem-gallery/data/dialog"}
-    assert _pattern("data/dialog") == "data/dialog/*"
-    assert _pattern("data/atm-bench/atm-bench.json") == "data/atm-bench/atm-bench.json"
+    assert extensionless == {
+        "/corpus/mem-gallery/data/dialog",
+        "/corpus/longmemeval/longmemeval_s",
+        # The release root itself: PersonaMem-v2's per-row history links are already
+        # `data/chat_history_32k/<file>.json`, so the loader resolves them against this.
+        "/corpus/personamem-v2",
+        "/corpus/beam/chats",
+    }
+    assert _patterns("data/dialog") == ("data/dialog", "data/dialog/*")
+    assert _patterns("longmemeval_s") == ("longmemeval_s", "longmemeval_s/*")
+    assert _patterns("data/atm-bench/atm-bench.json") == ("data/atm-bench/atm-bench.json",)
 
 
 def test_an_operator_produced_manifest_is_reported_rather_than_downloaded(

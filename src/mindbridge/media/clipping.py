@@ -33,6 +33,19 @@ AUDIO_WINDOW_MS = 30_000
 # shortest clip the encoders can still read instead of failing the job.
 MINIMUM_CLIP_MS = 200
 # Millisecond ticks keep sampled frame offsets exact in the container.
+#
+# Stamped on every frame from this constant, never by reading the stream back. `time_base` on
+# an output stream is a proposal, not a setting: libavformat replaces it with the container's
+# own timescale when it writes the header, and mp4 chose 1/16000 here. The header goes out on
+# the first `mux`, and libx264 buffers `rc_lookahead` frames -- 40 at the default preset --
+# before it emits a first packet, so a loop that re-read `stream.time_base` each iteration
+# stamped everything up to that point in milliseconds and everything after it in 1/16000ths.
+# The same integers then meant 16x different times, x264 was handed pts that no longer rose,
+# and it eventually emitted a packet whose pts sat behind its dts: `av.error.ValueError:
+# [Errno 22] Invalid argument` out of the flush, for any span of 43 or more sampled frames.
+# That was read as a frame ceiling for a long time. It is not one -- with the units held
+# constant, 3 000 frames encode -- and no encoder setting lifts it, because `bf=0`,
+# `rc-lookahead=0` and `tune=zerolatency` only move which frame writes the header.
 _MILLISECOND_TIME_BASE = Fraction(1, 1_000)
 DEFAULT_IMAGE_MAX_PIXELS = 1_003_520
 
@@ -109,11 +122,9 @@ def cut_generation_proxy(source: bytes, request: ClipRequest) -> MediaClip:
     file itself was 336 KiB with audio against 212 KiB without. A deployment whose generator
     ignores audio is paying an encode and a transfer for nothing.
 
-    ponytail: the ceiling is sampled frame count, not span length, and dropping the audio does
-    not lift it -- a silent source cut with `include_audio=False` fails at the same 45 frames.
-    See `MAX_PROXY_SAMPLED_FRAMES` for what has and has not been ruled out. This raises rather
-    than returning a truncated file, and callers treat the proxy as best-effort and fall back
-    to the source.
+    There is no sampled-frame ceiling here. The one that was measured at 40-45 frames was this
+    function stamping frames from `video.time_base` after libavformat had already replaced it
+    -- see `_MILLISECOND_TIME_BASE`. Nothing bounds the frame count of a proxy any more.
     """
     if not source:
         raise DomainInvariantError("source media must not be empty")
@@ -142,13 +153,17 @@ def cut_generation_proxy(source: bytes, request: ClipRequest) -> MediaClip:
         video.thread_count = 1
         video.thread_type = "NONE"
         video.time_base = _MILLISECOND_TIME_BASE
+        # `stream.time_base` does not reach the encoder: PyAV leaves the codec context on
+        # 1/rate, so packets come out quantised to the declared rate no matter what the
+        # stream says. The tick has to be set here or the millisecond timeline is fiction.
+        video.codec_context.time_base = _MILLISECOND_TIME_BASE
         audio, resampler = _proxy_audio_stream(av, output, source_audio)
         for frame in sampled:
             resized = frame.reformat(width=width, height=height, format="yuv420p")
             # Absolute, unlike _cut_video: this copy stands in for the whole source in a call
             # whose prompt counts milliseconds from the observation's start.
             resized.pts = round((frame.time or 0.0) * 1_000)
-            resized.time_base = video.time_base
+            resized.time_base = _MILLISECOND_TIME_BASE
             output.mux(video.encode(resized))
         output.mux(video.encode())
         if source_audio is not None:
@@ -359,13 +374,16 @@ def _cut_video(source: bytes, request: ClipRequest) -> MediaClip:
         # integer would make a fractional-fps clip play back at the wrong speed
         # and disagree with the duration recorded for it.
         stream.time_base = _MILLISECOND_TIME_BASE
+        # Same reason as the proxy encoder: the codec context keeps its own time base, and
+        # that is the one the encoder quantises to.
+        stream.codec_context.time_base = _MILLISECOND_TIME_BASE
         # Declared before the first packet: libavformat writes the container header on that
         # packet and rejects a stream added afterwards.
         audio, resampler = _proxy_audio_stream(av, container, source_audio)
         for frame in sampled:
             resized = frame.reformat(width=width, height=height, format="yuv420p")
             resized.pts = round(((frame.time or 0.0) - first_seconds) * 1_000)
-            resized.time_base = stream.time_base
+            resized.time_base = _MILLISECOND_TIME_BASE
             container.mux(stream.encode(resized))
         if len(sampled) == 1:
             # `_sampled_window` widens the window a span is cut from, which cannot help a source
@@ -378,7 +396,7 @@ def _cut_video(source: bytes, request: ClipRequest) -> MediaClip:
             # Two sampling intervals on, because whatever reads this clip samples it at the same
             # rate: one interval is the instant a frame served late already misses.
             repeated.pts = round(2_000 / request.frames_per_second)
-            repeated.time_base = stream.time_base
+            repeated.time_base = _MILLISECOND_TIME_BASE
             container.mux(stream.encode(repeated))
         container.mux(stream.encode())
         if source_audio is not None:
@@ -409,11 +427,17 @@ def _sample_video_frames(source: bytes, request: ClipRequest) -> list[Any]:
     next_sample_seconds = start_seconds
     with av.open(io.BytesIO(source)) as container:
         stream = container.streams.video[0]
-        # Single-threaded on purpose. FFmpeg frame threading intermittently deadlocks against
-        # the OpenMP runtime torchvision loads, and the Worker cuts clips in the same process as
-        # the local embedder, so AUTO hung raw-media jobs until their Celery time limit. It
-        # reproduced roughly one run in three, which is why the cheap fix is to not start the
-        # pool at all rather than to order the imports.
+        # Single-threaded on purpose. AUTO hung raw-media jobs in the Worker until their Celery
+        # time limit, roughly one run in three, and not starting the pool at all was cheaper than
+        # chasing the interaction. What that interaction is has never been established: the
+        # original note here blamed the OpenMP runtime torchvision loads, because the Worker cuts
+        # clips in the same process as the local embedder, but nobody caught that hang in the act
+        # and no dump was kept. A later hang of the same shape in `tests/unit` -- 33 threads in
+        # the pytest child -- was dumped live and had libx264 mapped with no libgomp, libiomp5 or
+        # libtorch_cpu anywhere in the process, so OpenMP cannot be the mechanism for that one.
+        # (The 98 in the first note counted a process that had imported numpy, where 32 of them
+        # are OpenBLAS's pool, idle from import; it is not encoders accumulating.)
+        # Treat the pin as a measure that works, not as evidence for a cause.
         # This is not free: a 30s 720p source decodes in 1.7s here against 0.35s with AUTO, and
         # the gap widens with resolution.
         stream.thread_type = "NONE"
@@ -464,8 +488,34 @@ def _clamped_region(
 
 
 def _stream_rate(frames_per_second: float) -> int:
-    """H.264 needs an integral rate; the sampling interval already did the work."""
-    return max(1, round(frames_per_second))
+    """H.264 needs an integral rate, and it has to be at least the sampling rate.
+
+    Rounding is not free here: this rate becomes the encoder's time base, and a tick coarser
+    than the gap between two sampled frames lands both of them on the same timestamp. The mux
+    then refuses the second one -- `av.error.ValueError: [Errno 22] Invalid argument` -- at any
+    frame count, on the first span that crosses a tick boundary rather than on a long one.
+
+    `round` produced exactly that whenever it went down, which Python's round-half-to-even
+    makes look arbitrary from the outside: 2.5 fps declared a rate of 2, whose 500 ms tick
+    collapsed the 400 ms sampling onto ticks 0, 1, 2, 2, and every video clip cut under that
+    setting failed, while 3.5 fps rounded up to 4 and was fine.
+
+    `ceil` narrows that but does not close it, so do not read this rate as the tick. The gap
+    between two kept frames is not `1 / frames_per_second`: `_sample_video_frames` serves each
+    wanted instant with the first source frame at or after it, so the real gap is snapped to
+    the source frame grid and can fall to a single source frame period -- 100 ms on a 10 fps
+    source, well under the 333 ms that `ceil(2.8) == 3` would imply. 2.8 fps raised the same
+    `[Errno 22]` with `ceil` in place, and 2.7 wrote two frames onto one timestamp without
+    raising at all.
+
+    What actually decides the tick is the encoder's own time base, set to
+    `_MILLISECOND_TIME_BASE` on the codec context at both encode sites. Assigning
+    `stream.time_base` alone does not reach it -- PyAV leaves the codec context on 1/rate --
+    which is why the millisecond timeline had to be declared twice. With the tick on
+    milliseconds this rate is only declared framerate metadata: it decides playback speed, not
+    which offsets survive.
+    """
+    return max(1, math.ceil(frames_per_second))
 
 
 # ponytail: av/soundfile/PIL sit in mypy's ignore_missing_imports list, so a Protocol per

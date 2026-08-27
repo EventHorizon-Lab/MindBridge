@@ -203,6 +203,12 @@ SCENARIOS: dict[str, tuple[str, ...]] = {
         "contracts",
         "core",
         "file_integrity",
+        # observe_cli is core for the same reason config_cli is: `mindbridge observe` is how an
+        # operator hands MindBridge a file they already have, and needing an extra to do it would
+        # put an install step in front of the one command that exists to remove install steps. It
+        # is a thin front end over `sdk.observe_file`, which is core too, and it imports `sdk`
+        # inside the call so `mindbridge --help` does not pay for httpx.
+        "observe_cli",
         "prompts",
         "sdk",
     ),

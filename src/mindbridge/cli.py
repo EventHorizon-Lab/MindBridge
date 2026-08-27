@@ -107,6 +107,10 @@ COMMANDS: dict[tuple[str, ...], Command] = {
         "Decay and transition one tenant's memory strength",
         extra="server",
     ),
+    ("observe",): Command(
+        "mindbridge.observe_cli",
+        "Store one local file as evidence and observe it",
+    ),
     ("mcp",): Command(
         "mindbridge.server",
         "Serve the deployable MCP server over stdio",

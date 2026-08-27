@@ -985,7 +985,7 @@
             "type": "integer"
           },
           "uri": {
-            "description": "Where the bytes already live, as `s3://<bucket>/tenants/<tenant_id>/<key>`. MindBridge reads this object; it does not accept an upload.",
+            "description": "Where the bytes already live, as `s3://<bucket>/tenants/<tenant_id>/<key>`. MindBridge reads this object; no request body ever carries the bytes themselves. For a file that is not stored yet, ask `createMediaUpload` for a short-lived signed PUT, send the bytes there, and name the `uri` it answers with.",
             "maxLength": 2048,
             "minLength": 1,
             "title": "Uri",
@@ -1001,6 +1001,94 @@
           "created_at"
         ],
         "title": "MediaObjectInput",
+        "type": "object"
+      },
+      "MediaUploadRequest": {
+        "additionalProperties": false,
+        "description": "Ask where to put one local file so an observation can then refer to it.\n\nThe bytes never travel through this API. It answers with a short-lived signed URL for an\nobject key inside the calling tenant's own prefix, which is the only key it will ever sign:\na caller does not name one, it describes the bytes and is told where they go.",
+        "properties": {
+          "sha256": {
+            "description": "Hex digest of the exact bytes about to be sent. It addresses the object, so re-sending the same file lands on the same key and overwrites it instead of leaving one orphan per attempt. Pass this same value as `MediaObjectInput.sha256`.",
+            "pattern": "^[0-9a-fA-F]{64}$",
+            "title": "Sha256",
+            "type": "string"
+          },
+          "size_bytes": {
+            "description": "Exact byte length of the file. It is signed into the URL, so the upload must send this many bytes and object storage refuses any other length.",
+            "maximum": 5368709120.0,
+            "minimum": 1.0,
+            "title": "Size Bytes",
+            "type": "integer"
+          },
+          "suffix": {
+            "anyOf": [
+              {
+                "maxLength": 16,
+                "minLength": 2,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The file's own container extension, like `.mp4` — the only part of the object key a caller influences, and accepted only from the set of extensions MindBridge recognizes, since it is what `MediaObjectInput.kind` is checked against. Omit it for a container this API does not know: the key then carries no extension, which contradicts no `kind`.",
+            "title": "Suffix"
+          },
+          "tenant_id": {
+            "description": "Tenant that will own the bytes; must be one this key authorizes.",
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Tenant Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "tenant_id",
+          "sha256",
+          "size_bytes"
+        ],
+        "title": "MediaUploadRequest",
+        "type": "object"
+      },
+      "MediaUploadTicket": {
+        "additionalProperties": false,
+        "description": "Short-lived permission to store one file's bytes, and the URI that then names them.",
+        "properties": {
+          "expires_at": {
+            "description": "When `upload_url` stops being accepted. Only the start of the upload has to fall inside it; ask for another rather than replaying a stale one.",
+            "format": "date-time",
+            "title": "Expires At",
+            "type": "string"
+          },
+          "trace_id": {
+            "description": "Correlates this request with its telemetry.",
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Trace Id",
+            "type": "string"
+          },
+          "upload_url": {
+            "description": "PUT the exact bytes here, with `Content-Length` set to the requested `size_bytes` and no other authentication: this URL carries its own, so it is a credential and must not be logged or handed on.",
+            "maxLength": 2048,
+            "minLength": 1,
+            "title": "Upload Url",
+            "type": "string"
+          },
+          "uri": {
+            "description": "What to pass as `MediaObjectInput.uri` once the PUT has succeeded.",
+            "maxLength": 2048,
+            "minLength": 1,
+            "title": "Uri",
+            "type": "string"
+          }
+        },
+        "required": [
+          "upload_url",
+          "uri",
+          "expires_at",
+          "trace_id"
+        ],
+        "title": "MediaUploadTicket",
         "type": "object"
       },
       "MemoryResult": {
@@ -3050,6 +3138,89 @@
           }
         ],
         "summary": "Stream Observation Job"
+      }
+    },
+    "/v1/media/uploads": {
+      "post": {
+        "operationId": "createMediaUpload",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MediaUploadRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MediaUploadTicket"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "`authentication_required` — a valid bearer API key is required\n\n`authentication_failed` — the bearer API key is invalid"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "`tenant_access_denied` — the authenticated tenant cannot access this resource"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "`request_validation_failed` — request validation failed"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "`internal_error` — the request failed for a reason the server did not anticipate"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "`database_unavailable` — memory storage is temporarily unavailable\n\n`object_storage_unavailable` — evidence media is unavailable"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Create Media Upload"
       }
     },
     "/v1/memories": {

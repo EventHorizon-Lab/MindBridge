@@ -19,11 +19,7 @@ from pydantic import ValidationError
 
 import mindbridge.worker as worker_module
 from mindbridge.application.capabilities import Embedder, EmbedRequest, EmbedResult
-from mindbridge.application.evidence_clips import (
-    MAX_PROXY_SAMPLED_FRAMES,
-    MAX_SAMPLING_FLOOR_MS,
-    ClipSampling,
-)
+from mindbridge.application.evidence_clips import ClipSampling
 from mindbridge.consolidation_worker import CONSOLIDATION_QUEUE
 from mindbridge.core import (
     DatabaseUnavailableError,
@@ -47,6 +43,7 @@ from mindbridge.infrastructure.task_queue import (
 from mindbridge.models.openai import _GeneratorConfig
 from mindbridge.telemetry import TelemetryProviders
 from mindbridge.worker import (
+    _MAX_SAMPLING_FRAMES_PER_SECOND,
     WorkerSettings,
     create_worker_app,
     processing_budget_seconds,
@@ -414,24 +411,23 @@ def test_worker_reads_media_sampling_from_the_environment() -> None:
     assert settings.clip_sampling.proxy_audio is False
 
 
-def test_worker_accepts_the_highest_rate_a_generation_proxy_can_still_carry() -> None:
-    """The bound is the media layer's own ceiling, so the rate that reaches it must pass.
+def test_worker_accepts_the_highest_sampling_rate_the_bound_allows() -> None:
+    """The bound is inclusive, so the rate sitting exactly on it has to start the worker.
 
-    `MAX_PROXY_SAMPLED_FRAMES` over `MAX_SAMPLING_FLOOR_MS`: 40 frames across the 2 s window a
-    short span is widened to. Reading both from `evidence_clips` rather than restating 20.0 is
-    what keeps this from drifting when either constant is measured again.
+    Read from `worker` rather than restated, so moving the number moves this with it. It is a
+    sanity bound now, not a derived one -- it was `MAX_PROXY_SAMPLED_FRAMES` over
+    `MAX_SAMPLING_FLOOR_MS` until the generation proxy's frame budget was removed.
     """
     settings = WorkerSettings.from_environment(
         {
             **_environment(),
             "MINDBRIDGE_MEDIA_SAMPLING_CONFIG_JSON": (
-                '{"frames_per_second": %s}'
-                % (MAX_PROXY_SAMPLED_FRAMES / (MAX_SAMPLING_FLOOR_MS / 1_000))
+                f'{{"frames_per_second": {_MAX_SAMPLING_FRAMES_PER_SECOND}}}'
             ),
         }
     )
 
-    assert settings.clip_sampling.frames_per_second == 20.0
+    assert settings.clip_sampling.frames_per_second == _MAX_SAMPLING_FRAMES_PER_SECOND
 
 
 def test_worker_media_sampling_defaults_keep_the_documented_encoder_budget() -> None:
@@ -450,13 +446,13 @@ def test_worker_media_sampling_defaults_keep_the_documented_encoder_budget() -> 
         '{"frames_per_second": "0.5"}',
         '{"max_pixels": 1.5}',
         '{"frames_per_second": 0}',
-        # `json.loads` parses these out of the environment variable, and `gt=0` admitted the
-        # first: it reached the media layer as a frame rate and was caught by a downstream
-        # invariant rather than by the boundary it entered through.
+        # Refused at the parser, by `parse_constant`, before the field is reached at all.
         '{"frames_per_second": Infinity}',
         '{"frames_per_second": NaN}',
-        # Past 20 fps the generation proxy is skipped for every event long enough to be widened
-        # to the sampling floor, so the knob would switch off the feature it is tuning.
+        # These two are what the field's own upper bound is for. `1e400` is valid JSON that
+        # overflows to `inf` and passes `gt=0`, so it is the case that fails if `le=` is ever
+        # dropped; `20.5` pins the edge itself.
+        '{"frames_per_second": 1e400}',
         '{"frames_per_second": 20.5}',
     ],
 )
@@ -464,7 +460,8 @@ def test_worker_rejects_a_malformed_media_sampling_knob(config: str) -> None:
     """A typo in an optional tuning knob must fail startup, not silently mean something else.
     `"false"` is a truthy string, and a quoted or floating pixel count would reach a budget
     comparison as the wrong type. A rate can also be well-formed and still mean nothing the
-    media layer can serve: `Infinity`, and anything past the proxy frame ceiling."""
+    media layer can serve: `Infinity`, a literal that overflows to it, and anything past the
+    sampling bound."""
     with pytest.raises(ValueError):
         WorkerSettings.from_environment(
             {**_environment(), "MINDBRIDGE_MEDIA_SAMPLING_CONFIG_JSON": config}

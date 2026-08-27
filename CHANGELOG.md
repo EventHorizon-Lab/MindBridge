@@ -33,13 +33,22 @@ The capabilities present on `master` today:
 - Three recall modes: `answer`, `search`, and `enumerate`, the last failing explicitly rather than
   truncating an oversized scope.
 - Multimodal queries — text, stored media, or both.
+- Explicit native-Omni or lazy FunASR + CAM++ speaker-turn routing for the bundled
+  OpenAI-compatible generator.
 - Grounded follow-up through a strict `memory_ids` scope.
 
 ### Interfaces
 
 - REST API with a generated OpenAPI document and a closed error-code contract.
 - Official MCP server over stdio with seven tools, sharing the REST schemas.
-- Typed asynchronous Python SDK in the base package, with resumable job-progress streaming.
+- Typed asynchronous Python SDK in the base package, with resumable job-progress streaming, and
+  `observe_file()` for a local path: it hashes the file, takes a presigned upload signed only into
+  the caller's own tenant prefix, sends the bytes to object storage directly rather than through
+  the API, and observes the resulting URI.
+- `mindbridge observe <path> --tenant-id <id>` for the same thing from a shell, so handing
+  MindBridge a file already on disk needs neither a Python script nor three `curl` calls in the
+  right order. It prints the receipt as JSON, and its `processing_job_id` is the reminder that the
+  observation is stored while the memory derived from it does not exist yet.
 - `mindbridge` and `mindbridge-bench` command trees with a documented exit-status contract.
 
 ### Platform
@@ -60,8 +69,17 @@ The capabilities present on `master` today:
   numbers its manifest and score sidecar carry and which of the two each came from; `--report DIR`
   prints it again for an earlier run, which is how a benchmark scored afterwards reports without
   running twice. `--limit N` scopes any runner to its first N units for a smoke run, the media
-  ingest deadlines reach every task whose runner accepts them, and prepared-media manifests are
-  produced for Mem-Gallery and M3-Bench rather than assembled by hand. Scoring follows
+  ingest deadlines reach every task whose runner accepts them, and naming a task obtains what it
+  reads: the annotations, the media behind them, and the prepared-media manifest, staged into the
+  deployment's own bucket per run — **every task in the catalog, with no exception left for the
+  operator to fill in.** Ego4D and M3-Bench's web videos are the two media sets no pinned snapshot
+  supplies, so they are acquired rather than downloaded: the sweep drives the `ego4d` CLI for the
+  first and `yt-dlp` for the second, narrowed to the units the run selected, and `--list-tasks`
+  marks those two `acquire` so the prerequisite is visible before the run rather than minutes into
+  it. When a prerequisite is genuinely absent — no Ego4D signature, no `yt-dlp`, no acquirer
+  installed — the operator's own instructions are still what gets printed, now alongside what
+  actually failed. `--no-download` refuses the annotation fetch, the media fetch, and the
+  acquisition instead of performing any of them. Scoring follows
   lmms-eval's contract: each benchmark declares who scores it, the four whose protocol is exact
   match score themselves, the seven whose answers are free text are judged by a model called from
   inside the run, and `--predict-only` reports the `999` bypass sentinel instead. A judge that
@@ -119,6 +137,25 @@ Called out on their own because these are the changes that cost an operator real
   primary key. No manual step — the first write to touch a row an older recipe named re-keys it
   in place, so the first pass after this migration pays one re-encode per object it has not yet
   seen under its new name. Memory-record vectors keep the IDs they already have.
+
+### Two harness costs that were being paid silently
+
+Called out because both were invisible until a real run was watched rather than a test read.
+
+- **A `--limit 1` M3-Bench run fetched the whole subset.** `prepare_m3` was the one producer that
+  asked `ensure_media` for its media set without narrowing it, so cutting one robot video
+  downloaded all 100 of them — 117 GiB — and the same call would have asked an acquirer for
+  all 920 web videos. It now names the single file it is missing, which is what the other producers
+  already did. The absent-media message is split-aware too: the robot half is 100 files totalling
+  117 GiB and the web half 920 downloads of about 100 MB, so one figure for both was wrong by an
+  order of magnitude about whichever split you were running. Both numbers are measured — the first
+  from `repo_info(files_metadata=True)` at the pinned revision, the second from real downloads.
+  Neither came from `yt-dlp`'s `filesize_approx`, which is bitrate times duration and read 26x low
+  on a video that arrived as 712 MB. The robot split is quoted as a total rather than per file
+  because its range is 0.28 to 3.13 GiB, so no single per-file figure describes it.
+- **Those fetches were also silent.** `prepare_m3` and the Video-MME/EgoTempo `_source` helper
+  passed no `announce`, so a 712 MB acquisition and a multi-gigabyte Hub download ran to completion
+  with nothing on stderr. Both now report, and both honour `--quiet`.
 
 ### Known gaps
 

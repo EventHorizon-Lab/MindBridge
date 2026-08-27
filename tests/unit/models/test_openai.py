@@ -1,13 +1,20 @@
 """Contract tests for the bundled OpenAI-compatible adapters."""
 
+import base64
 import json
+import re
+import sys
 from collections.abc import AsyncIterator, Callable, Coroutine
+from pathlib import Path
+from types import ModuleType
 from typing import cast
 
 import httpx
 import pytest
 from openai import AsyncOpenAI
 
+import mindbridge.edge.identity_diarization as identity_diarization
+from mindbridge import configuration
 from mindbridge.application.capabilities import OutputSchema
 from mindbridge.core import (
     EmbeddingSpaceReference,
@@ -17,6 +24,7 @@ from mindbridge.core import (
     ModelRequestError,
     ModelUnavailableError,
 )
+from mindbridge.edge.identity_inference import CAMPPLUS_MODEL
 from mindbridge.models import (
     EmbedRequest,
     EmbedTask,
@@ -25,7 +33,14 @@ from mindbridge.models import (
     ModelInput,
     TextPart,
 )
-from mindbridge.models.openai import OpenAIEmbedder, OpenAIGenerator, normalize_base_url
+from mindbridge.models.openai import (
+    AudioFallbackGenerator,
+    OpenAIEmbedder,
+    OpenAIGenerator,
+    create_generator,
+    normalize_base_url,
+)
+from mindbridge.models.plugins import close_model
 from mindbridge.telemetry import model_token_usage, operation_span
 
 MODEL_ID = "jinaai/jina-embeddings-v5-omni-small-retrieval"
@@ -298,6 +313,224 @@ async def test_generation_reports_the_configured_model_not_the_serving_fingerpri
 
     assert result.text == "on the workbench"
     assert result.model_reference == ModelReference(model_id="qwen3.8-max")
+
+
+async def test_vlm_fallback_lazily_transcribes_av_and_preserves_video(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loaded = 0
+    transcribed: list[str] = []
+    requests: list[list[dict[str, object]]] = []
+
+    class Pipeline:
+        def generate(self, **kwargs: object) -> list[dict[str, object]]:
+            path = Path(cast(str, kwargs["input"]))
+            transcribed.append(path.suffix)
+            assert path.read_bytes() == b"media"
+            assert kwargs["return_spk_res"] is True
+            assert kwargs["return_spk_center"] is True
+            assert kwargs["sentence_timestamp"] is True
+            return [
+                {
+                    "text": "hello there. goodbye. again.",
+                    "sentence_info": [
+                        {"start": 0, "end": 800, "text": "hello there.", "spk": 0},
+                        {"start": 1_000, "end": 1_900, "text": "goodbye.", "spk": 1},
+                        {"start": 2_000, "end": 2_500, "text": "again.", "spk": 0},
+                    ],
+                    "spk_embedding_center": [[1.0, 0.0], [0.0, 1.0]],
+                }
+            ]
+
+    def auto_model(**kwargs: object) -> Pipeline:
+        nonlocal loaded
+        loaded += 1
+        assert kwargs["device"] == "cpu"
+        assert kwargs["spk_model"] == CAMPPLUS_MODEL.model_id
+        return Pipeline()
+
+    funasr = ModuleType("funasr")
+    funasr.AutoModel = auto_model  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "funasr", funasr)
+    monkeypatch.setattr(identity_diarization, "select_torch_device", lambda _device: "cpu")
+
+    async def respond(request: httpx.Request) -> httpx.Response:
+        payload = cast(dict[str, object], json.loads(request.content))
+        messages = cast(list[dict[str, object]], payload["messages"])
+        requests.append(cast(list[dict[str, object]], messages[1]["content"]))
+        return _completion_response("serving-fingerprint-01")
+
+    encoded = base64.b64encode(b"media").decode("ascii")
+    generator = AudioFallbackGenerator(_generator(respond), asr_device="cpu")
+    try:
+        await generator.generate(
+            GenerateRequest(
+                system_prompt="Answer from evidence.",
+                input=ModelInput((TextPart("text only"),)),
+                max_output_tokens=64,
+            )
+        )
+        assert loaded == 0
+        await generator.generate(
+            GenerateRequest(
+                system_prompt="Answer from evidence.",
+                input=ModelInput(
+                    (
+                        TextPart("inspect this audiovisual input"),
+                        MediaPart(
+                            MediaKind.VIDEO,
+                            f"data:video/mp4;base64,{encoded}",
+                            source_uri="s3://memory/clip.mp4",
+                        ),
+                        MediaPart(
+                            MediaKind.AUDIO,
+                            f"data:audio/wav;base64,{encoded}",
+                            source_uri="s3://memory/clip.wav",
+                        ),
+                    )
+                ),
+                max_output_tokens=64,
+            )
+        )
+    finally:
+        await generator.close()
+
+    assert loaded == 1
+    assert transcribed == [".mp4", ".wav"]
+    assert [part["type"] for part in requests[0]] == ["text"]
+    assert [part["type"] for part in requests[1]] == ["text", "video_url", "text", "text"]
+    transcript_parts = [part for part in requests[1] if part["type"] == "text"][1:]
+    assert all("asr_transcript" in cast(str, part["text"]) for part in transcript_parts)
+    assert all(
+        "speaker A | 00:00:00.000-00:00:00.800 | hello there." in cast(str, part["text"])
+        and "speaker B | 00:00:01.000-00:00:01.900 | goodbye." in cast(str, part["text"])
+        and "speaker A | 00:00:02.000-00:00:02.500 | again." in cast(str, part["text"])
+        for part in transcript_parts
+    )
+
+
+async def test_generator_factory_selects_native_or_transcribed_audio() -> None:
+    config = {
+        "api_key": "unit-test-key",
+        "endpoint": "https://generator.example.test/v1",
+        "model_id": "test-model",
+    }
+    native = create_generator(config)
+    fallback = create_generator({**config, "audio_mode": "transcribe"})
+    try:
+        assert isinstance(native, OpenAIGenerator)
+        assert isinstance(fallback, AudioFallbackGenerator)
+        with pytest.raises(ValueError, match="audio_mode"):
+            create_generator({**config, "audio_mode": "guess"})
+    finally:
+        await close_model(native)
+        await close_model(fallback)
+
+
+async def test_transcribing_generator_carries_its_engine_and_recipe_to_funasr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`audio_mode="transcribe"` is a whole speech pipeline behind two config keys. Without
+    this, `asr_engine` and `asr_recipe` could be dropped on the floor and every existing test
+    would still pass -- the transcription test only sets `asr_device`.
+    """
+    arguments: dict[str, object] = {}
+
+    class Pipeline:
+        def generate(self, **_kwargs: object) -> list[dict[str, object]]:
+            return [{"text": ""}]
+
+    def auto_model(**kwargs: object) -> Pipeline:
+        arguments.update(kwargs)
+        return Pipeline()
+
+    funasr = ModuleType("funasr")
+    funasr.AutoModel = auto_model  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "funasr", funasr)
+    monkeypatch.setattr(identity_diarization, "select_torch_device", lambda _device: "cpu")
+
+    config = {
+        "api_key": "unit-test-key",
+        "endpoint": "https://generator.example.test/v1",
+        "model_id": "video-vlm",
+        "audio_mode": "transcribe",
+        "asr_engine": "automodel",
+        "asr_recipe": "paraformer",
+        "asr_device": "cpu",
+    }
+    generator = create_generator(config)
+    encoded = base64.b64encode(b"media").decode("ascii")
+    try:
+        await generator.generate(
+            GenerateRequest(
+                system_prompt="Answer from evidence.",
+                input=ModelInput((MediaPart(MediaKind.AUDIO, f"data:audio/wav;base64,{encoded}"),)),
+                max_output_tokens=64,
+            )
+        )
+    except Exception:
+        # The HTTP call is not the subject; the recipe reaching FunASR is.
+        pass
+    finally:
+        await close_model(generator)
+
+    # The named recipe, not the default: `paraformer` is the only one carrying a punctuation
+    # model, so its presence proves the composition travelled rather than just a model id.
+    assert arguments["model"] == identity_diarization.FUNASR_ASR_MODEL_ID
+    assert arguments["punc_model"] == identity_diarization.FUNASR_PUNCTUATION_MODEL_ID
+
+    # An unusable engine, or an engine that cannot serve the recipe, is refused while the
+    # generator is being built. The pipeline still loads lazily, but a worker that accepts
+    # traffic and then fails on the first clip carrying speech is worse than one that will not
+    # start -- and both answers are known from two strings.
+    with pytest.raises(ValueError, match="unknown speech engine"):
+        create_generator({**config, "asr_engine": "llama.cpp"})
+    with pytest.raises(ValueError, match="cannot run"):
+        create_generator({**config, "asr_engine": "vllm", "asr_recipe": "sensevoice"})
+
+
+async def test_the_shipped_sample_config_can_actually_be_uncommented(tmp_path: Path) -> None:
+    """`mindbridge.toml` is the shipped example, so its commented lines have to work together.
+
+    Two drafts of this block did not: one pinned the engine as a side effect of switching
+    transcription on, and the next paired the vLLM engine with a model it cannot serve. Both
+    read fine and both would have failed for whoever uncommented them.
+    """
+    generator = create_generator(
+        {**_uncommented_sample_generator_config(tmp_path), "api_key": "unit-test-key"}
+    )
+    try:
+        assert isinstance(generator, AudioFallbackGenerator)
+    finally:
+        await close_model(generator)
+
+
+def _uncommented_sample_generator_config(directory: Path) -> dict[str, object]:
+    """Read `[generator]` from the shipped sample with every commented key switched on.
+
+    Parsed by `mindbridge.configuration` rather than by a TOML library imported here: it already
+    carries the `tomli` backport that the floor of the version matrix needs, and going through
+    the real loader is the point of the exercise anyway.
+    """
+    sample = Path("mindbridge.toml").read_text(encoding="utf-8")
+    section = sample[sample.index("[generator]") :]
+    section = section[: section.index("\n[", 1)]
+    commented = re.findall(r"^# ([a-z_]+ = .*)$", section, re.M)
+    assert commented, "the sample lost its commented generator keys; this guard now tests nothing"
+
+    live = sample
+    for line in commented:
+        live = live.replace(f"# {line}", line)
+    live = live.replace('audio_mode = "native"', 'audio_mode = "transcribe"')
+    located = directory / "mindbridge.toml"
+    located.write_text(live, encoding="utf-8")
+
+    document = configuration._configuration_document({}, located)
+    assert document is not None
+    encoded = (
+        configuration._flattened_scalars(document) | configuration._flattened_plugins(document, {})
+    )["MINDBRIDGE_GENERATOR_CONFIG_JSON"]
+    return cast(dict[str, object], json.loads(encoded))
 
 
 async def test_cumulative_stream_usage_is_charged_once_not_once_per_chunk() -> None:

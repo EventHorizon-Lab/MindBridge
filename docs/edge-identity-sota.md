@@ -16,7 +16,7 @@ MindBridge 当前默认链路只保留一套语音生态：
 | --- | --- | --- |
 | 原生视频流 | GStreamer appsink（DeepStream 可选）→ `InsightFaceVideoEncoder.encode_frame()` | 直接接受带毫秒时间戳的 BGR frame，不重新打开视频；采集后端可替换，帧契约不变 |
 | 原生音频流 | 16 kHz mono PCM16 → FunASR causal Paraformer | 任意输入 chunk；内部使用官方 600ms 窗口和 cache |
-| Event-close 语音理解 | 一个 FunASR `AutoModel` 组合 ASR + VAD + punctuation + speaker model | 一次推理返回 transcript、毫秒 sentence、speaker label 和 centroid |
+| Event-close 语音理解 | `SpeechAnalyzer` 契约 + 两个 FunASR 引擎：CUDA 上的 Nano vLLM，其余平台的 `AutoModel`（默认 Fun-ASR-Nano） | 契约只要求带时间范围的语音段和 speaker centroid；换模型是换 recipe，换引擎是换环境，都不换管线；两个引擎都产 centroid，所以引擎可由环境自动选 |
 | 人脸 | InsightFace SCRFD + ArcFace | 在各目标端侧平台上再比较检测器档位；模板留在设备 |
 | 声纹 | FunASR 返回的 CAM++ speaker centroid | 不再二次解码波形或重复加载 speaker encoder |
 | 活跃说话人 | 带 face anchor 且保留音轨的 Omni/VLM 复核 | 只产出可撤销证据；LR-ASD 仍是本地质量候选 |
@@ -160,18 +160,31 @@ FunASR 当前结果没有可解释的逐 turn diarization probability，因此�
 校准旋钮，不是模型置信度。重叠段会封顶为 0.5，只保留 observation-scoped transcript；不能让一个
 全局 centroid 因混叠音频污染长期声纹。
 
-### 5.3 llama.cpp 多端路径
+### 5.3 llama.cpp 多端路径：已评估，不采纳
 
-[llama.cpp](https://github.com/ggml-org/llama.cpp) 与社区 FunASR/GGUF 转换路径可能让 ASR/VAD 在
-x86、ARM、Apple 和非 CUDA 设备上共享更轻的运行时，是**全平台 Edge 目标下的重要候选**。当前代码
-尚未集成这条路径；它用于评估 Torch/FunASR 基线难以部署的 RDK、RK 和部分 x86 NPU 平台，而不是
-已交付能力。
+[llama.cpp](https://github.com/ggml-org/llama.cpp) 路径确实存在，而且是上游正式提供的
+（`runtime/llama.cpp/`）：Fun-ASR-Nano、SenseVoiceSmall 和 Paraformer 三个模型都有 GGUF 导出脚本、
+预转权重和 ggml 实现的 SAN-M encoder，单一静态二进制、量化权重（Nano 全量化约 1.3 GB）、运行期不需要
+Python。上游验证也很扎实：encoder cosine 1.000000、kaldi fbank cosine 1.000000、端到端 CER 与
+PyTorch 相差 0.02%。对「Torch/FunASR 基线难以部署的平台」这个诉求，它看起来正是答案。
 
-但它现在仍不是默认路径，也不被包装成抽象 provider：没有上游证据证明同一运行时完整返回
-MindBridge 所需的 punctuation、稳定 diarization 和 CAM++ centroid。先在低算力 NPU 与纯 CPU 平台上
-比较 WER、RTF、内存与功耗；真正通过后再加一个薄适配器，不能为了未来可能性预建 factory/registry。
-在此之前，非 CUDA 平台的语音路径按“先跑通 ONNX Runtime + FunASR，再评估 llama.cpp 替换在线
-front-end”的顺序推进。
+**但它不能进这条管线，原因是能力缺口而不是工程量。** 上游 README 明确写着：standalone llama.cpp /
+GGUF 二进制**既没有实现 CAM++ speaker embedding，也没有实现 speaker 聚类**；`--vad` 只切语音，不给
+speaker 标签，要 speaker 就回去用 `AutoModel(spk_model="cam++")` 或 vLLM 服务。也就是说这条路径给得出
+带时间轴的转写和模型自带标点，唯独给不出声纹。
+
+而声纹不是这条管线的可选项，是它的目的：`SpeechAnalysis` 要的是「带时间范围的语音段 **加上这些语音段
+所属的 speaker centroid**」，`FunASRRecipe` 甚至在构造时就拒绝缺 speaker model 的组合。一个产不出
+centroid 的引擎接进来，只能让每个 segment 退成 observation 作用域，即在低算力平台上静默关掉跨
+observation 的人物一致性——而低算力平台恰恰是最需要「这是同一个人」的家用与巡检场景。用一个默认就
+削掉核心能力的引擎去换部署便利，不是取舍，是把问题挪到看不见的地方。
+
+（本文档上一版写的怀疑因此被证实了一半：「没有上游证据证明同一运行时完整覆盖 punctuation、
+diarization 和 CAM++ centroid」——punctuation 和时间轴有了，centroid 没有。）
+
+因此非 CUDA 平台的语音路径就是 `AutoModel`：慢一些，但每个平台都能跑，而且回答得出「谁在说话」。
+重新评估这条路径的条件是明确的：**上游在 GGUF 二进制里实现 CAM++ embedding 与聚类**。届时它是一个薄
+适配器，不需要为它预留任何抽象——`SpeechAnalyzer` 契约已经是那个位置。
 
 ## 6. face↔voice 闭环
 

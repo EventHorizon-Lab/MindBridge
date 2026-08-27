@@ -233,30 +233,25 @@ async def run_video_mme_video(
     )
 
     semaphore = asyncio.Semaphore(request_concurrency)
-    answers: list[VideoMMEQuestionResult] = []
     cutoff = prepared_video_end(prepared)
-    for offset in range(0, len(annotation.questions), request_concurrency):
-        cohort = annotation.questions[offset : offset + request_concurrency]
-        answered = await asyncio.gather(
-            *(
-                _answer_question(
-                    memory,
-                    tenant_id,
-                    question,
-                    cutoff,
-                    recall_limit,
-                    semaphore,
-                    ingest_failures,
-                )
-                for question in cohort
-            ),
-            return_exceptions=True,
-        )
-        answers.extend(
-            settle_answers(
-                cohort, answered, partial(_failed_result, ingest_failures=ingest_failures)
+    answered = await asyncio.gather(
+        *(
+            _answer_question(
+                memory,
+                tenant_id,
+                question,
+                cutoff,
+                recall_limit,
+                semaphore,
+                ingest_failures,
             )
-        )
+            for question in annotation.questions
+        ),
+        return_exceptions=True,
+    )
+    answers = settle_answers(
+        annotation.questions, answered, partial(_failed_result, ingest_failures=ingest_failures)
+    )
     return VideoMMEVideoResult(
         video_id=annotation.video_id,
         duration=annotation.duration,

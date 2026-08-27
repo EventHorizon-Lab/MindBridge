@@ -53,6 +53,10 @@ benchmarks = [
     # benchmarks/prepare.py stages the clips it cuts into the deployment's own bucket. Both are
     # lazy imports reached only when a task's prepared media has to be produced.
     "boto3>=1.40,<2",
+    # benchmarks/acquire_ego4d.py imports botocore.exceptions by name, so the dependency is this
+    # subtree's rather than a detail of boto3's tree -- the same reason the edge extra names it.
+    # It resolves today only because server/edge happen to declare it.
+    "botocore>=1.40,<2",
     # It cuts them with mindbridge.media.clipping, the encoder the product stores evidence with,
     # rather than a second one that would drift from it.
     "mindbridge[media]",
@@ -158,7 +162,9 @@ dev = [
     "cryptography>=45,<51",
     "mypy>=1.15,<3",
     "packaging>=24,<27",
-    "pytest>=8,<10",
+    # `faulthandler_exit_on_timeout` is read under `--strict-config`, which errors on an ini
+    # key the installed pytest does not define, so the floor has to be a release that has it.
+    "pytest>=9.1,<10",
     "pytest-asyncio>=0.24,<2",
     "ruff>=0.11,<1",
     # tests/test_package.py reads this file; tomllib is 3.11+. mypy also requires the
@@ -205,8 +211,11 @@ module = [
     "av.*",
     # Same shape one extra over: the quality matrix installs `media` and `server`, not
     # `benchmarks`, so the Hub client benchmarks/releases.py downloads releases with is absent
-    # while every leg still type-checks the module that imports it.
+    # while every leg still type-checks the module that imports it. The submodule pattern is
+    # needed as well as the bare name: `releases.py` reads `GatedRepoError` out of
+    # `huggingface_hub.errors`, and an override for a package does not cover what is under it.
     "huggingface_hub",
+    "huggingface_hub.*",
     "numpy",
     "PIL",
     "PIL.*",
@@ -220,6 +229,33 @@ ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 addopts = ["--strict-config", "--strict-markers", "-ra"]
+# `tests/unit` deadlocks intermittently (measured ~1 run in 39). A hang otherwise consumes a CI
+# slot until something external notices and leaves nothing behind to diagnose, so the two runs
+# that matter most produce the least evidence. These two lines arm pytest's own watchdog: it
+# dumps every thread's stack and ends the process non-zero. The stacks are the point.
+#
+# A previous attempt armed `faulthandler.dump_traceback_later(..., exit=True)` from a session
+# fixture in `tests/conftest.py`, on the belief that this ini option "did not fire". Re-measured
+# on pytest 9.1.1 against a real deadlock, that is wrong in both directions:
+#   - The option does fire; it dumped at the budget every time. What it did not do was *exit*,
+#     because terminating is gated behind `faulthandler_exit_on_timeout`, a separate ini that
+#     defaults to false. Setting only the timeout dumps and then hangs forever.
+#   - The hand-armed version exited correctly but dumped **0 lines** under the default
+#     `capture=fd` that CI uses, i.e. it threw away the very evidence it existed to collect.
+#     `dump_traceback_later` binds the fd of `sys.stderr` at arm time, which inside a fixture is
+#     pytest's capture temp file, and `exit=True` calls `_exit()` before pytest can restore or
+#     report it. Only `-s` recovered the dump, and CI does not pass `-s`.
+# The plugin avoids that by stashing `os.dup(stderr_fileno)` in `pytest_configure`, before capture
+# starts, and it re-arms in `pytest_runtest_protocol`, so it also survives the unconditional
+# `cancel_dump_traceback_later()` its own `pytest_exception_interact` hook runs after any
+# failure -- which silently disarmed the session fixture for the rest of the run. So these two
+# lines strictly dominate the fixture and it was deleted.
+#
+# The budget is per test (the plugin arms in `pytest_runtest_protocol`), not per session, and is
+# far above any healthy test here -- the full suite is ~20s for ~1545 tests. Override per run with
+# `-o faulthandler_timeout=N`; 0 disables. Neither form covers a hang during collection.
+faulthandler_timeout = 300
+faulthandler_exit_on_timeout = true
 testpaths = ["tests"]
 asyncio_mode = "auto"
 markers = [
