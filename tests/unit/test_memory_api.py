@@ -34,6 +34,7 @@ from mindbridge.infrastructure.local.zvec_index import IndexHit
 from mindbridge.memory import AsyncMemory, Memory
 from mindbridge.models.base import (
     EmbedTask,
+    ModelBackend,
     ModelCapabilities,
     ModelInput,
     SpeakerEmbedding,
@@ -602,6 +603,64 @@ def test_data_directories_are_isolated_and_metadata_changes_fail_fast(tmp_path: 
             _config(),
             models=_FakeModels(transcription_space="different-asr"),
         )
+
+
+def _http_backend(base_url: str) -> tuple[Config, ModelBackend]:
+    import httpx
+
+    from mindbridge.models.openai_http import OpenAIHTTP
+
+    config = Config(
+        api_key="k",
+        embedding_base_url=base_url,
+        embedding_model="embed-model",
+        embedding_dimension=2,
+        capabilities=ModelCapabilities(
+            embedding=frozenset({Modality.TEXT}),
+            generation=frozenset({Modality.TEXT}),
+            transcription=frozenset({Modality.AUDIO}),
+        ),
+    )
+    transport = httpx.MockTransport(
+        lambda _request: httpx.Response(200, json={"data": [{"index": 0, "embedding": [1.0, 0.0]}]})
+    )
+    return config, OpenAIHTTP(config, client=httpx.Client(transport=transport))
+
+
+def test_endpoint_is_guarded_as_metadata_not_by_changing_the_space_recipe(
+    tmp_path: Path,
+) -> None:
+    """Guard the endpoint with its own key so existing directories still open.
+
+    The space identifier is documented in `docs/configuration.md` and already persisted in
+    `store_metadata`, so folding the endpoint into it would refuse to open every directory
+    written with the published default. A separate key is simply absent there, so the first
+    open records it, and only a later endpoint change trips the guard.
+    """
+    first_config, first_backend = _http_backend("https://a.example.test")
+    with Memory(tmp_path, first_config, models=first_backend) as memory:
+        memory.add("one")
+
+    with LocalStore(tmp_path) as store:
+        assert store.get_metadata("embedding.endpoint") == "https://a.example.test/v1"
+        space = store.get_metadata("embedding.space_id")
+    # The space itself stays endpoint-free, so it matches what the docs publish.
+    assert space == "embed-model:2:l2-v1"
+
+    # Repointing the endpoint behind the same model alias now fails fast and says why.
+    second_config, second_backend = _http_backend("https://b.example.test")
+    assert second_config.embedding_space == first_config.embedding_space
+    with pytest.raises(StorageError, match=r"embedding\.endpoint"):
+        Memory(tmp_path, second_config, models=second_backend)
+
+    # A directory written before the key existed has no such row; it must open and gain one.
+    with LocalStore(tmp_path) as store:
+        assert store.delete_metadata("embedding.endpoint") is True
+    third_config, third_backend = _http_backend("https://a.example.test")
+    with Memory(tmp_path, third_config, models=third_backend) as reopened:
+        assert reopened.list().items
+    with LocalStore(tmp_path) as store:
+        assert store.get_metadata("embedding.endpoint") == "https://a.example.test/v1"
 
 
 def test_invalid_zvec_embedding_space_cannot_poison_store_metadata(tmp_path: Path) -> None:

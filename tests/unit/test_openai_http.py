@@ -137,13 +137,13 @@ def test_multimodal_embedding_preserves_asset_order_and_maps_url_parts(
     assert result[0] == pytest.approx((0.6, 0.8))
 
 
-def test_default_space_recipes_separate_endpoints_serving_one_model_alias() -> None:
-    """Repointing an endpoint must change the derived space, not pass the store guard.
+def test_derived_spaces_keep_their_documented_shape_across_endpoints() -> None:
+    """The derived space identifiers are a documented default and a persisted on-disk value.
 
-    A model alias served by different weights is the likeliest swap, and the embedding space
-    is the only thing standing between that and two geometries in one collection. The
-    transcription space is stronger still: it is a durable transcript cache key and the
-    speaker-identity partition key.
+    Repointing an endpoint must not change them: `docs/configuration.md` publishes both
+    shapes, and an existing data directory has the old value in `store_metadata`, so folding
+    the endpoint in here would lock every such directory shut instead of guarding it. The
+    endpoint is guarded as its own store-metadata value — see the Memory-level test.
     """
     hosted = Config.from_environment({})
     local = Config.from_environment(
@@ -153,18 +153,11 @@ def test_default_space_recipes_separate_endpoints_serving_one_model_alias() -> N
         }
     )
 
-    assert hosted.embedding_model == local.embedding_model
-    assert hosted.transcription_model == local.transcription_model
-    assert hosted.embedding_space != local.embedding_space
-    assert hosted.transcription_space != local.transcription_space
-    # An explicit space still wins, so an operator can declare two endpoints equivalent.
-    pinned = Config.from_environment(
-        {
-            "MINDBRIDGE_EMBEDDING_BASE_URL": "http://127.0.0.1:8002/v1",
-            "MINDBRIDGE_EMBEDDING_SPACE": "shared-space-v1",
-        }
-    )
-    assert pinned.embedding_space == "shared-space-v1"
+    assert hosted.embedding_space == local.embedding_space
+    assert hosted.transcription_space == local.transcription_space
+    assert hosted.embedding_space == f"{hosted.embedding_model}:{hosted.embedding_dimension}:l2-v1"
+    assert hosted.transcription_space == f"{hosted.transcription_model}:asr-v1"
+    assert hosted.embedding_base_url != local.embedding_base_url
 
 
 def test_blank_environment_values_mean_unset_not_empty() -> None:

@@ -118,6 +118,10 @@ _STORE_METADATA_KEYS = {
     "transcription": "transcription.space_id",
     "dimension": "embedding.dimension",
     "index": "index.recipe",
+    # Recorded only for endpoint-backed models, and absent from a directory written before
+    # this key existed, so `_ensure_store_metadata` fills it in rather than refusing to open.
+    "embedding_endpoint": "embedding.endpoint",
+    "transcription_endpoint": "transcription.endpoint",
 }
 
 
@@ -1261,6 +1265,18 @@ class Memory:
             _STORE_METADATA_KEYS["dimension"]: str(self._embedding_dimension),
             _STORE_METADATA_KEYS["index"]: _INDEX_RECIPE,
         }
+        # A model alias served by different weights at a different endpoint is the swap the
+        # space recipe cannot see. Only record it for backends whose vectors actually depend
+        # on a configured URL: a local embedder would otherwise trip on an unrelated change
+        # to `OPENAI_BASE_URL`, which it never reads.
+        if isinstance(self._embedder, OpenAIHTTP):
+            expected[_STORE_METADATA_KEYS["embedding_endpoint"]] = str(
+                self.config.embedding_base_url
+            )
+        if isinstance(self._transcriber, OpenAIHTTP):
+            expected[_STORE_METADATA_KEYS["transcription_endpoint"]] = str(
+                self.config.transcription_base_url
+            )
         with _translate_storage_errors("validate local store metadata"):
             for key, value in expected.items():
                 stored = self._store.get_metadata(key)

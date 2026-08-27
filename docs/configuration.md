@@ -261,6 +261,7 @@ On first open, SQLite records:
 - Transcription-space identifier.
 - Embedding dimension.
 - Zvec index recipe.
+- Embedding and transcription endpoint, for endpoint-backed models only.
 
 Later opens compare the active backend/configuration with these values. A mismatch fails at
 startup to prevent mixed vector spaces. Local adapters derive `space_id` from adapter recipe,
@@ -270,6 +271,13 @@ of those inputs changes. Re-encode into a new directory instead of editing the s
 rule applies to `transcription_space`: it identifies the ASR model and all
 transcript-affecting preprocessing, language, prompting, or decoding choices. A directory fails fast if the
 active value changes, because cached transcripts and add-time derived text must use one recipe.
+
+The space identifiers cannot see one swap: the same model alias served by different weights at a
+different endpoint. So the resolved embedding and transcription base URLs are recorded separately,
+and only for models that read them — a local embedder never does, and is unaffected by an unrelated
+change to `OPENAI_BASE_URL`. A directory written before these keys existed simply gains them on its
+next open. Declare two endpoints equivalent by setting `MINDBRIDGE_EMBEDDING_SPACE` or
+`MINDBRIDGE_TRANSCRIPTION_SPACE` explicitly, which keeps full control of the identity.
 
 The generation model, URL allowlist, media transport, and HTTP timeout can change without
 invalidating stored embeddings or transcript caches.

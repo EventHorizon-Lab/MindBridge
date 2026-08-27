@@ -13,7 +13,6 @@ from mindbridge.benchmarks.locomo_refined import (
     LoCoMoRefinedQuestion,
     LoCoMoRefinedTurn,
 )
-from mindbridge.models.openai_http import UNKNOWN_ANSWER
 
 LOCOMO_REFINED_PREDICTION_KEY = "predicted_answer"
 
@@ -126,9 +125,12 @@ async def _answer_question(
     return LoCoMoRefinedPrediction(
         qa_id=question.question_id,
         predicted_answer=result.answer,
-        # `AnswerResult` rejects a blank answer, so truthiness is always true. A refusal is
-        # the model emitting the grounded-abstention sentence, which is what this counts.
-        mindbridge_answered=result.answer.strip() != UNKNOWN_ANSWER,
+        # `AnswerResult` rejects a blank answer, so truthiness would always be true. Ground
+        # this in the public contract instead: an answer with no retrieved evidence behind it
+        # is an abstention for any backend, whatever wording that backend chose. A backend
+        # that refuses despite having hits still reads as answered here, which is why the
+        # confidence and context columns stay in the row for a scorer to inspect.
+        mindbridge_answered=bool(result.hits),
         mindbridge_confidence=max((hit.score for hit in result.hits), default=0.0),
         mindbridge_prediction_context=tuple(
             dialog_id_by_memory_id[hit.id]

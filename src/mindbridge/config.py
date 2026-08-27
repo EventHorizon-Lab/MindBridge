@@ -80,16 +80,16 @@ class Config:
         object.__setattr__(self, "api_key", api_key)
         object.__setattr__(self, "base_url", base_url)
         object.__setattr__(self, "embedding_model", embedding_model)
+        # The endpoint is deliberately absent from this recipe: it is a documented default and
+        # an existing data directory has it persisted, so folding it in here would lock every
+        # such directory shut. `Memory` records the endpoint as its own store-metadata value.
         object.__setattr__(
             self,
             "embedding_space",
             (
                 _text(self.embedding_space, "embedding_space")
                 if self.embedding_space is not None
-                # The endpoint belongs in the recipe: a model alias served by different
-                # weights is the swap most likely to happen, and without it the store
-                # metadata guard compares two different spaces and finds them equal.
-                else (f"{embedding_model}:{self.embedding_dimension}:{embedding_base_url}:l2-v1")
+                else f"{embedding_model}:{self.embedding_dimension}:l2-v1"
             ),
         )
         object.__setattr__(self, "generation_model", generation_model)
@@ -105,10 +105,7 @@ class Config:
             (
                 _text(self.transcription_space, "transcription_space")
                 if self.transcription_space is not None
-                # This one is a durable cache key and the speaker-identity partition key,
-                # so leaving the endpoint out lets a second stack serving the same model
-                # alias read the first stack's transcripts and centroids as its own.
-                else (f"{transcription_model}:{transcription_base_url}:asr-v1")
+                else f"{transcription_model}:asr-v1"
             ),
         )
         object.__setattr__(self, "timeout_seconds", timeout)

@@ -19,10 +19,10 @@ The file can remain after shutdown. Ownership is the operating-system lock, not 
 Symptom: startup raises `StorageError` mentioning an embedding, transcription, or index metadata
 key.
 
-The active embedding model, vector-space ID, dimension, transcription space, or index recipe
-differs from the values that created the store. Restore the original configuration, or create a new
-directory and re-ingest. Editing SQLite metadata would mix incompatible vectors or transcripts and
-is unsupported.
+The active embedding model, vector-space ID, dimension, transcription space, index recipe, or
+model endpoint differs from the values that created the store. Restore the original configuration,
+or create a new directory and re-ingest. Editing SQLite metadata would mix incompatible vectors or
+transcripts and is unsupported.
 
 Local adapters derive a new `space_id` when adapter, model, immutable revision, dimension, or input
 recipe changes. Use that adapter with a new data directory and re-encode source content. For an
@@ -30,6 +30,11 @@ explicit combined HTTP backend, set a new `MINDBRIDGE_EMBEDDING_SPACE` as well.
 Likewise, change `MINDBRIDGE_TRANSCRIPTION_SPACE` and use a new directory whenever the ASR model,
 preprocessing, language, prompt, or decoding recipe can change transcript text. Do not reuse one
 directory merely because the transcription endpoint accepts the new model.
+
+A mismatch naming `embedding.endpoint` or `transcription.endpoint` means the model alias is
+unchanged but its endpoint moved, so the weights behind it may differ. Point the endpoint back, or
+use a new directory. If the two endpoints genuinely serve identical weights, say so by setting an
+explicit `MINDBRIDGE_EMBEDDING_SPACE` or `MINDBRIDGE_TRANSCRIPTION_SPACE`.
 
 ## Unsupported SQLite schema
 
