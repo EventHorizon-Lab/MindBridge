@@ -9,10 +9,11 @@ or manifest field is one edit instead of nine.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import hashlib
 import os
 import sys
-from collections.abc import AsyncIterator, Callable, Iterable, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -51,6 +52,8 @@ number belongs in is not recoverable from the number itself.
 """
 
 _Item = TypeVar("_Item")
+_Unit = TypeVar("_Unit")
+_Out = TypeVar("_Out")
 _Prepared = TypeVar("_Prepared")
 # Benchmarks key prepared units either by string ID or by integer index, and the two sort
 # differently: constraining the variable keeps `sorted` numeric so a missing EgoMemReason
@@ -70,6 +73,7 @@ class CoreArguments:
     tenant_prefix: str
     recall_limit: int
     request_concurrency: int
+    unit_concurrency: int
     request_timeout_seconds: float
     limit: int | None
     overwrite: bool
@@ -97,14 +101,32 @@ BENCHMARK_ENVIRONMENT = """environment:
 
 def core_parser(
     *,
-    tenant_prefix: str,
+    tenant_prefix: str | None,
     prog: str | None = None,
     description: str | None = None,
+    epilog: str | None = None,
+    dataset_action: Literal["store", "append"] = "store",
+    dataset_help: str = "official dataset release to replay",
 ) -> argparse.ArgumentParser:
-    """Build the parser every benchmark CLI starts from."""
-    parser = build_parser(prog=prog, description=description, epilog=BENCHMARK_ENVIRONMENT)
+    """Build the parser every benchmark CLI starts from.
+
+    `dataset_action="append"` is for the one runner whose loader takes more than one path:
+    `mindbridge-bench aml` dispatches to six loaders taking one or two positional files
+    each, so its `--dataset` repeats. It is a knob here rather than a parser of its own
+    because the sweep forwards the same shared flags to every task, and a second
+    declaration of them is the drift that made `aml` undispatchable from `eval` in the
+    first place -- it accepted none of `--limit`, `--recall-limit`,
+    `--request-concurrency`, `--overwrite`, or `--predict-only`.
+    """
+    parser = build_parser(
+        prog=prog, description=description, epilog=epilog or BENCHMARK_ENVIRONMENT
+    )
     parser.add_argument(
-        "--dataset", type=Path, required=True, help="official dataset release to replay"
+        "--dataset",
+        type=Path,
+        action=dataset_action,
+        required=True,
+        help=dataset_help,
     )
     parser.add_argument(
         "-o",
@@ -126,13 +148,22 @@ def core_parser(
         "--run-id", required=True, help="identifier isolating this run's tenants from every other"
     )
     parser.add_argument(
-        "--tenant-prefix", default=tenant_prefix, help="prefix for the tenants this run writes to"
+        "--tenant-prefix",
+        default=tenant_prefix,
+        help="prefix for the tenants this run writes to",
     )
     parser.add_argument(
         "--recall-limit", type=int, default=20, help="memories to retrieve per question"
     )
     parser.add_argument(
         "--request-concurrency", type=int, default=4, help="in-flight API requests per unit"
+    )
+    parser.add_argument(
+        "--unit-concurrency",
+        type=int,
+        default=4,
+        help="units of this benchmark run at once; the run holds up to "
+        "--unit-concurrency times --request-concurrency requests in flight",
     )
     parser.add_argument(
         "--request-timeout-seconds", type=float, default=1_800.0, help="deadline for one request"
@@ -224,8 +255,94 @@ def report(message: str, *, quiet: bool) -> None:
 
 
 def report_unit(label: str, *, index: int, total: int, quiet: bool) -> None:
-    """Announce one unit before it runs, which is the only output a long run gives."""
+    """Announce one finished unit, which is the only progress a long run gives.
+
+    `index` counts units that have completed, not the position of the one being started: units
+    overlap, so at any moment several are in flight and no single one of them is "the third".
+    """
     report(f"[{index}/{total}] {label}", quiet=quiet)
+
+
+async def run_units(
+    units: Sequence[_Unit],
+    *,
+    label: Callable[[_Unit], str],
+    run: Callable[[_Unit], Awaitable[_Out]],
+    unit_concurrency: int,
+    quiet: bool,
+) -> tuple[_Out, ...]:
+    """Run this benchmark's units with `unit_concurrency` of them in flight, in release order.
+
+    Awaiting each unit in turn -- which is what every runner used to do -- capped a whole run at
+    `--request-concurrency` in-flight requests, because that is a unit's own budget and only one
+    unit was ever spending it. Worse, the cap was not reachable for the whole of a unit either: a
+    unit ingests before it answers, and its answer phase touches no Worker at all, so the queue
+    the GPUs feed from drained once per unit and again at the end of every unit. Raising
+    `--request-concurrency` could not fix it -- past the size of one unit's fan-out the flag
+    bought nothing, because the ceiling was the serial loop and not the flag.
+
+    Results come back in the order `units` were given, which several runners require: their
+    predictions have to line up with the official annotation's own order.
+
+    A unit that raises ends the run, as the serial `await` did, and no unit starts after it: the
+    ones already running are cancelled and waited out, and the ones still queued are never
+    dequeued. All three parts have to be built, because none of them is what `gather` over one
+    task per unit gives.
+
+    `gather(return_exceptions=False)` propagates the first exception but leaves the siblings
+    running. They then reach a client `connected_memory` has already closed, from tasks nobody
+    awaits, and any unit that had already submitted observations leaves the Worker processing for
+    a run that will write nothing. `gather(return_exceptions=True)` is worse: every remaining
+    unit runs to completion before it reports, so a run whose first unit failed would ingest the
+    whole corpus before saying so.
+
+    Bounding with a semaphore instead of a worker count has the same hole in a subtler place.
+    Leaving the failing unit's `async with` releases its permit, and the release wakes a queued
+    unit before `gather`'s done callback reaches the cancel: measured, one queued unit started
+    and got past its first await, which for every runner here is the observation POST. A
+    successful sibling releasing its permit after the failure does it too, so holding just the
+    failed permit would not close it. Workers pulling from a shared iterator have nothing to
+    release and check the failure before each unit, so a failed run stops dequeuing.
+
+    `TaskGroup` does all of this, and is 3.11; the floor here is 3.10.
+    """
+    if unit_concurrency <= 0:
+        raise ValueError("unit_concurrency must be positive")
+    queued = iter(range(len(units)))
+    results: dict[int, _Out] = {}
+    completed = 0
+    failed = False
+
+    async def worker() -> None:
+        nonlocal completed, failed
+        # One shared iterator, advanced without awaiting, so no two workers take the same unit.
+        for index in queued:
+            if failed:
+                return
+            unit = units[index]
+            report(f"starting {label(unit)}", quiet=quiet)
+            try:
+                results[index] = await run(unit)
+            except BaseException:
+                failed = True
+                raise
+            completed += 1
+            report_unit(label(unit), index=completed, total=len(units), quiet=quiet)
+
+    workers = [asyncio.create_task(worker()) for _ in range(min(unit_concurrency, len(units)))]
+    try:
+        await asyncio.gather(*workers)
+    except BaseException:
+        # `BaseException` because an interrupt has to clean up too: a Ctrl-C during a sweep is
+        # the likeliest way this path is reached, and leaving units in flight through it is how
+        # the summary ends up written while requests are still going out.
+        for task in workers:
+            task.cancel()
+        await asyncio.gather(*workers, return_exceptions=True)
+        raise
+    # Keyed by position rather than appended, because a worker finishing early must not move a
+    # later unit's prediction ahead of it: several runners require release order.
+    return tuple(results[index] for index in range(len(units)))
 
 
 _ArgumentsT = TypeVar("_ArgumentsT", bound=CoreArguments)
@@ -267,6 +384,7 @@ def _core_values(parsed: argparse.Namespace) -> dict[str, object]:
         "tenant_prefix": parsed.tenant_prefix,
         "recall_limit": parsed.recall_limit,
         "request_concurrency": parsed.request_concurrency,
+        "unit_concurrency": parsed.unit_concurrency,
         "request_timeout_seconds": parsed.request_timeout_seconds,
         "limit": parsed.limit,
         "overwrite": parsed.overwrite,
@@ -317,6 +435,12 @@ class BenchmarkRunManifest(ContractModel):
     tenant_prefix: Identifier
     recall_limit: int = Field(gt=0, le=100)
     request_concurrency: int = Field(gt=0)
+    unit_concurrency: int = Field(default=1, gt=0)
+    """How many of this benchmark's units were in flight together.
+
+    Defaulted rather than required so a manifest written before units could overlap still parses,
+    and to 1 rather than to today's default because that is what those runs actually did.
+    """
     request_timeout_seconds: float = Field(gt=0)
     predictions_sha256: Sha256Hex
     completed_at: AwareDatetime
@@ -447,6 +571,7 @@ def _core_manifest_values(
         "tenant_prefix": arguments.tenant_prefix,
         "recall_limit": arguments.recall_limit,
         "request_concurrency": arguments.request_concurrency,
+        "unit_concurrency": arguments.unit_concurrency,
         "request_timeout_seconds": arguments.request_timeout_seconds,
         "predictions_sha256": hashlib.sha256(predictions.encode("utf-8")).hexdigest(),
         "completed_at": datetime.now(timezone.utc),

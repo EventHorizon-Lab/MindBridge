@@ -742,12 +742,20 @@ def test_fractional_frame_rates_that_round_down_still_cut() -> None:
     Every span here stays well under the ~43 sampled frames where a separate defect in the
     encode loop's own timeline used to take over, so what fails when this regresses is the
     rate and nothing else.
+
+    Swept rather than sampled at the three rates the report happened to name. Raising the rate
+    to `ceil` leaves 2.7 through 3.9 broken on this very source, so a tuple of `(2.4, 2.5,
+    4.5)` passes against an encoder that still collapses a third of its inputs -- the whole
+    decimal range is the invariant, and it costs 0.3 s to say so.
     """
     import av
 
     source = _video_bytes(seconds=60.0, fps=10, width=160, height=120)
 
-    for frames_per_second in (2.4, 2.5, 4.5):
+    # 2.0 to 5.0 keeps every span under the 43-frame ceiling on an 8 s window while covering
+    # both sides of each integer, which is where a rate-derived tick goes wrong.
+    for tenths in range(20, 51):
+        frames_per_second = tenths / 10
         request = ClipRequest(
             kind=MediaKind.VIDEO,
             start_ms=0,

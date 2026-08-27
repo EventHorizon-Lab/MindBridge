@@ -484,6 +484,84 @@ def test_a_sweep_refuses_to_start_when_any_of_its_outputs_already_exists(
     assert invocations == []
 
 
+def test_a_sweep_lets_a_resumable_runner_continue_its_own_partial_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An interrupted `aml` task has to be resumable, and `--overwrite` is not the way.
+
+    `aml` appends rows per finished case and skips a case whose rows are already there, so an
+    existing output is a prefix to continue. Refused by this preflight, an interrupted
+    `--run-id`-named sweep had no way forward: rerunning hit the refusal, and `--overwrite` told
+    the runner to delete the rows that made resuming possible -- then replay every case into a
+    tenant that already held its memories, doubling the corpus the score is measured against.
+    """
+    invocations = _stub_benchmark(monkeypatch, writes=True, resumable=True)
+    suite = _suite_file(tmp_path, _task("first"))
+    (tmp_path / "first").mkdir()
+    (tmp_path / "first" / "predictions.jsonl").write_text("interrupted prefix\n", encoding="utf-8")
+
+    assert _sweep(suite, tmp_path) == 0
+
+    assert len(invocations) == 1, "the resumable task never ran"
+    assert "--overwrite" not in invocations[0]
+
+
+def test_a_sweep_still_refuses_a_non_resumable_runners_existing_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The exemption is per runner. Everything else writes once, so its output is a result."""
+    invocations = _stub_benchmark(monkeypatch, writes=True, resumable=False)
+    suite = _suite_file(tmp_path, _task("first"))
+    (tmp_path / "first").mkdir()
+    (tmp_path / "first" / "predictions.jsonl").write_text("finished run", encoding="utf-8")
+
+    with pytest.raises(FileExistsError, match=r"first/predictions\.jsonl"):
+        _sweep(suite, tmp_path)
+
+    assert invocations == []
+
+
+def test_a_resumable_sweep_rewrites_the_interrupted_attempts_summary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exempting the task alone is not enough: the summary would block the rerun by itself.
+
+    The file on disk describes the attempt that was interrupted, and the sweep replacing it is
+    the one that finishes the work, so it is rewritten rather than protected.
+    """
+    invocations = _stub_benchmark(monkeypatch, writes=True, resumable=True)
+    suite = _suite_file(tmp_path, _task("first"))
+    (tmp_path / SUMMARY_FILENAME).write_text("interrupted attempt", encoding="utf-8")
+
+    assert _sweep(suite, tmp_path) == 0
+
+    assert len(invocations) == 1
+    assert json.loads((tmp_path / SUMMARY_FILENAME).read_text(encoding="utf-8"))["task_count"] == 1
+
+
+def test_a_sweep_of_only_non_resumable_runners_still_protects_its_summary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The summary exemption is scoped to sweeps that contain something worth resuming."""
+    invocations = _stub_benchmark(monkeypatch, writes=True, resumable=False)
+    suite = _suite_file(tmp_path, _task("first"))
+    (tmp_path / SUMMARY_FILENAME).write_text("a finished sweep", encoding="utf-8")
+
+    with pytest.raises(FileExistsError, match=SUMMARY_FILENAME):
+        _sweep(suite, tmp_path)
+
+    assert invocations == []
+
+
+def test_only_aml_declares_itself_resumable() -> None:
+    """Setting this on a runner that rewrites its output would silently disable a real guard."""
+    assert {name for name, runner in RUNNERS.items() if runner.resumable} == {"aml"}
+
+
 def test_a_dry_run_prints_each_invocation_and_runs_nothing(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -865,6 +943,7 @@ def _stub_benchmark(
     writes: bool = True,
     handler: Callable[..., object] | None = None,
     media: bool = False,
+    resumable: bool = False,
 ) -> list[tuple[str, ...]]:
     """Register one dispatchable stand-in benchmark and record the argv it is called with."""
     invocations: list[tuple[str, ...]] = []
@@ -883,7 +962,13 @@ def _stub_benchmark(
     monkeypatch.setitem(
         RUNNERS,
         "stub",
-        Runner("mindbridge_stub_benchmark", "Stub benchmark", extra=None, media=media),
+        Runner(
+            "mindbridge_stub_benchmark",
+            "Stub benchmark",
+            extra=None,
+            media=media,
+            resumable=resumable,
+        ),
     )
     return invocations
 

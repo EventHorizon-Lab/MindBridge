@@ -136,6 +136,27 @@ RELEASES: dict[str, Release] = {
     "mm-lifelong": Release("MM-Lifelong/MM-Lifelong", "248aa82039a574e63a2e524746a7cd8f32330443"),
     "atm-bench": Release("Jingbiao/ATM-Bench", "78e826dc07e97466b2f54443831ef9a83ab8b27c"),
     "mem-gallery": Release("Ethan-Bei/Mem-Gallery", "af912daba984e896e253016b7c7e334ef92c2a6f"),
+    # The AML text corpora. Three of the six, because the other two cannot be obtained by the
+    # rule at the top of this docstring -- only the files a task reads -- and registering them
+    # anyway would make the sweep fetch, then fail, mid-run:
+    #
+    #   beam            mohammadtavakoli78/BEAM@3e12035532eb85768f1a7cd779832b650c4b2ef9
+    #                   200 files under chats/{tier}/{conv}/, discovered by glob. Git releases
+    #                   here are streamed one declared file at a time from raw.githubusercontent,
+    #                   which cannot expand a pattern, and the repository is 695 MB against the
+    #                   ~30 MB a run reads.
+    #   personamem-v2   bowen-upenn/PersonaMem-v2@0622e56d1cc6f1bc990a5100a6ec4022a60e66a6
+    #                   `data/` is 3.9 GB across five history variants and the loader reads one
+    #                   of them, but the path it is handed is the root, so the declared input
+    #                   cannot be narrowed without changing the loader's signature.
+    #
+    # Both stay operator-fetched, pinned in `docs/benchmarking.md`; `--list-tasks` reports them
+    # as `needs <path>`, which is the state that exists for exactly this.
+    "clbench": Release("tencent/CL-bench", "b28a5832a09b0d96c0cf4c22e90d7c60ede25b80"),
+    "longmemeval": Release("xiaowu0162/longmemeval", "2ec2a557f339b6c0369619b1ed5793734cc87533"),
+    "personamem-v1": Release(
+        "bowen-upenn/PersonaMem-v1", "fd7c30f071d5c2ee2a211506783be222d7b6002e"
+    ),
 }
 
 
@@ -530,7 +551,7 @@ def _fetch_release(
 ) -> None:
     """Obtain one release's absent files, then hold them to their recorded digest."""
     release = RELEASES[name]
-    patterns = tuple(sorted({_pattern(within) for within, _ in members}))
+    patterns = tuple(sorted({pattern for within, _ in members for pattern in _patterns(within)}))
     if callable(announce):
         kind = "hub" if release.hub else "git"
         announce(
@@ -546,14 +567,21 @@ def _fetch_release(
         _require_recorded_digest(path)
 
 
-def _pattern(within: str) -> str:
-    """Turn one declared input into a download pattern.
+def _patterns(within: str) -> tuple[str, ...]:
+    """Turn one declared input into the download patterns that can supply it.
 
-    A path with no suffix is a directory of the release -- Mem-Gallery's `data/dialog` is the only
-    one today -- and every file these adapters read carries an extension, which the release test
-    asserts rather than trusts.
+    A path with a suffix is a file and names itself. A path without one is ambiguous, and both
+    readings exist in the catalog: Mem-Gallery's `data/dialog` is a directory, LongMemEval's
+    `longmemeval_s` is a 266 MB extension-less file. So a suffix-less input asks for both, and
+    whichever the release actually holds is what matches -- `allow_patterns` is a filter over the
+    repository's own listing, so the reading that is wrong selects nothing rather than failing.
+
+    Guessing "directory" for everything without a suffix, which is what this did while
+    Mem-Gallery was the only such input, made `longmemeval_s` resolve to `longmemeval_s/*`: it
+    matched no file in the repository, `snapshot_download` succeeded having written nothing, and
+    the task then failed on an absent dataset the sweep had just reported as fetched.
     """
-    return within if Path(within).suffix else f"{within}/*"
+    return (within,) if Path(within).suffix else (within, f"{within}/*")
 
 
 def _download_from_hub(release: Release, patterns: Sequence[str], *, destination: Path) -> None:

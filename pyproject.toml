@@ -158,7 +158,9 @@ dev = [
     "cryptography>=45,<51",
     "mypy>=1.15,<3",
     "packaging>=24,<27",
-    "pytest>=8,<10",
+    # `faulthandler_exit_on_timeout` is read under `--strict-config`, which errors on an ini
+    # key the installed pytest does not define, so the floor has to be a release that has it.
+    "pytest>=9.1,<10",
     "pytest-asyncio>=0.24,<2",
     "ruff>=0.11,<1",
     # tests/test_package.py reads this file; tomllib is 3.11+. mypy also requires the
@@ -240,12 +242,15 @@ addopts = ["--strict-config", "--strict-markers", "-ra"]
 #     pytest's capture temp file, and `exit=True` calls `_exit()` before pytest can restore or
 #     report it. Only `-s` recovered the dump, and CI does not pass `-s`.
 # The plugin avoids that by stashing `os.dup(stderr_fileno)` in `pytest_configure`, before capture
-# starts. So these two lines strictly dominate the fixture and it was deleted.
+# starts, and it re-arms in `pytest_runtest_protocol`, so it also survives the unconditional
+# `cancel_dump_traceback_later()` its own `pytest_exception_interact` hook runs after any
+# failure -- which silently disarmed the session fixture for the rest of the run. So these two
+# lines strictly dominate the fixture and it was deleted.
 #
 # The budget is per test (the plugin arms in `pytest_runtest_protocol`), not per session, and is
 # far above any healthy test here -- the full suite is ~20s for ~1545 tests. Override per run with
 # `-o faulthandler_timeout=N`; 0 disables. Neither form covers a hang during collection.
-faulthandler_timeout = "300"
+faulthandler_timeout = 300
 faulthandler_exit_on_timeout = true
 testpaths = ["tests"]
 asyncio_mode = "auto"

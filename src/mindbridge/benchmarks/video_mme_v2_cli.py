@@ -29,8 +29,8 @@ from mindbridge.benchmarks.cli_common import (
     media_arguments,
     media_manifest,
     report,
-    report_unit,
     require_declared_transcripts,
+    run_units,
     scoring_snapshot,
     select_by_id,
     write_run_artifacts,
@@ -118,31 +118,24 @@ async def _run(
     prepared: tuple[PreparedVideo, ...],
 ) -> tuple[VideoMMEV2GroupResult, ...]:
     async with connected_memory(arguments) as memory:
-        results: list[VideoMMEV2GroupResult] = []
-        for index, (group, prepared_video) in enumerate(
-            zip(groups, prepared, strict=True), start=1
-        ):
-            report_unit(
-                f"group {group.video_id} ({group.group_type})",
-                index=index,
-                total=len(groups),
-                quiet=arguments.quiet,
-            )
-            results.append(
-                await run_video_mme_v2_group(
-                    memory,
-                    group,
-                    prepared_video,
-                    run_id=arguments.run_id,
-                    tenant_prefix=arguments.tenant_prefix,
-                    device_id=arguments.device_id,
-                    recall_limit=arguments.recall_limit,
-                    request_concurrency=arguments.request_concurrency,
-                    poll_interval_seconds=arguments.poll_interval_seconds,
-                    processing_timeout_seconds=arguments.processing_timeout_seconds,
-                )
-            )
-        return tuple(results)
+        return await run_units(
+            tuple(zip(groups, prepared, strict=True)),
+            label=lambda pair: f"group {pair[0].video_id} ({pair[0].group_type})",
+            unit_concurrency=arguments.unit_concurrency,
+            quiet=arguments.quiet,
+            run=lambda pair: run_video_mme_v2_group(
+                memory,
+                pair[0],
+                pair[1],
+                run_id=arguments.run_id,
+                tenant_prefix=arguments.tenant_prefix,
+                device_id=arguments.device_id,
+                recall_limit=arguments.recall_limit,
+                request_concurrency=arguments.request_concurrency,
+                poll_interval_seconds=arguments.poll_interval_seconds,
+                processing_timeout_seconds=arguments.processing_timeout_seconds,
+            ),
+        )
 
 
 def _write_artifacts(
