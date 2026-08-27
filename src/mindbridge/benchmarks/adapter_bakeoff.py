@@ -97,19 +97,26 @@ async def run_adapter_bakeoff(
     corpus: PairCorpus,
     retrieval_model_id: str,
     text_matching_model_id: str,
+    retrieval_model_revision: str | None = None,
+    text_matching_model_revision: str | None = None,
     device: str,
     dimension: int,
 ) -> AdapterBakeoffResult:
     """Score every pair with both adapters using the symmetric document side."""
     scores: list[AdapterScore] = []
-    for model_id in (retrieval_model_id, text_matching_model_id):
-        # This sweep loads whichever repository the caller named, and `load` resolves the pin
-        # from the model id: the bundled repository still gets its commit -- which is the
-        # default of `--retrieval-model-id`, so the common invocation stays pinned under
-        # `trust_remote_code=True` -- and any other repository, which that commit could not
-        # resolve against, gets its default branch.
+    for model_id, revision in (
+        (retrieval_model_id, retrieval_model_revision),
+        (text_matching_model_id, text_matching_model_revision),
+    ):
+        # Both adapters keep their weights behind repository code, so this sweep opts into
+        # executing it, and `load` accepts that opt-in only against a commit. It resolves the
+        # bundled pin for the bundled repository -- the default of `--retrieval-model-id` --
+        # while any other one, which that commit could not resolve against, has to be pinned
+        # by the caller through the matching `--*-model-revision`.
         embedder = SentenceTransformersEmbedder.load(
             model_id=model_id,
+            revision=revision,
+            trust_remote_code=True,
             device=device,
             space_reference=EmbeddingSpaceReference(space_id=f"{model_id}-{dimension}"),
             dimension=dimension,
@@ -241,6 +248,14 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
         default="jinaai/jina-embeddings-v5-omni-small-text-matching",
         help="Hugging Face repository of the text-matching adapter",
     )
+    parser.add_argument(
+        "--retrieval-model-revision",
+        help="commit to load the retrieval adapter at; the bundled repository resolves its own",
+    )
+    parser.add_argument(
+        "--text-matching-model-revision",
+        help="commit to load the text-matching adapter at; required, it carries no bundled pin",
+    )
     parser.add_argument("--device", default="cuda", help="torch device to load both adapters on")
     parser.add_argument(
         "--dimension", type=int, default=1_024, help="Matryoshka dimension to compare at"
@@ -253,6 +268,8 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
             corpus=corpus,
             retrieval_model_id=arguments.retrieval_model_id,
             text_matching_model_id=arguments.text_matching_model_id,
+            retrieval_model_revision=arguments.retrieval_model_revision,
+            text_matching_model_revision=arguments.text_matching_model_revision,
             device=arguments.device,
             dimension=arguments.dimension,
         )

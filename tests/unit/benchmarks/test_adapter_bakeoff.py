@@ -14,6 +14,7 @@ from mindbridge.benchmarks.adapter_bakeoff import (
     _best_threshold,
     _roc_auc,
     _score_adapter,
+    run_adapter_bakeoff,
 )
 from mindbridge.core import EmbeddingSpaceReference, ModelReference
 from mindbridge.models import Embedding, EmbedRequest, EmbedResult
@@ -85,6 +86,62 @@ async def test_score_adapter_reports_production_threshold_outcomes() -> None:
     assert score.mean_contradiction_similarity > score.mean_unrelated_similarity
     # Paraphrase 0.62 sits below contradiction 0.83, so ranking is partly inverted.
     assert score.contradiction_auc == pytest.approx(0.5)
+
+
+async def test_the_bakeoff_opts_both_adapters_into_their_repository_code(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both Jina adapters keep their weights behind repository code.
+
+    Loading them without `trust_remote_code` leaves transformers refusing the config with
+    "requires you to execute the configuration file", after the corpus has been read and the
+    device chosen -- and no CI job installs this extra, so nothing else would report it.
+    """
+    loads: list[dict[str, object]] = []
+
+    class _Loader:
+        @staticmethod
+        def load(**kwargs: object) -> _AngleEmbedder:
+            loads.append(kwargs)
+            return _AngleEmbedder(
+                {
+                    "a": 0.0,
+                    "a-restated": 0.0,
+                    "b": 0.0,
+                    "b-negated": 0.60,
+                    "c": 0.0,
+                    "c-unrelated": 1.4,
+                    "d": 0.0,
+                    "d-restated": 0.90,
+                }
+            )
+
+    monkeypatch.setattr(
+        "mindbridge.benchmarks.adapter_bakeoff.SentenceTransformersEmbedder", _Loader
+    )
+
+    await run_adapter_bakeoff(
+        corpus=PairCorpus(
+            description="unit corpus",
+            pairs=(
+                LabeledPair(left="a", right="a-restated", label="paraphrase"),
+                LabeledPair(left="b", right="b-negated", label="contradiction"),
+                LabeledPair(left="c", right="c-unrelated", label="unrelated"),
+                LabeledPair(left="d", right="d-restated", label="paraphrase"),
+            ),
+        ),
+        retrieval_model_id="jinaai/jina-embeddings-v5-omni-small-retrieval",
+        text_matching_model_id="jinaai/jina-embeddings-v5-omni-small-text-matching",
+        text_matching_model_revision="0123456789abcdef0123456789abcdef01234567",
+        device="cpu",
+        dimension=1_024,
+    )
+
+    assert [load["trust_remote_code"] for load in loads] == [True, True]
+    assert [load["revision"] for load in loads] == [
+        None,
+        "0123456789abcdef0123456789abcdef01234567",
+    ]
 
 
 def _outcome(score: AdapterScore, threshold: float) -> ThresholdOutcome:

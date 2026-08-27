@@ -97,6 +97,31 @@ def _media_processor_missing(encoder: object) -> bool:
     return any(getattr(module, "processor", _ABSENT) is None for module in modules)
 
 
+def _first_module(encoder: object) -> object:
+    """The input module, where SentenceTransformers keeps a model's modality metadata."""
+    try:
+        return encoder[0]  # type: ignore[index]
+    except (IndexError, KeyError, TypeError):
+        return None
+
+
+def _legacy_omni_encoder(encoder: object) -> bool:
+    """Report an encoder whose input module predates the SentenceTransformers modality API.
+
+    Jina Omni is one: it declares no `modalities`, so `supports()` -- which reads
+    `getattr(self[0], "modalities", ["text"])` -- calls it text-only, and it takes bare strings
+    and tuples rather than modality-keyed dicts. This is read off the loaded object because the
+    same weights arrive under a mirror, a local snapshot directory, or the non-retrieval
+    repository name; comparing the configured model id against one string turned every one of
+    those into a worker that started clean and then refused images at request time.
+    """
+    first = _first_module(encoder)
+    return (
+        getattr(first, "modalities", None) is None
+        and getattr(first, "processor", _ABSENT) is not _ABSENT
+    )
+
+
 class SentenceTransformersEmbedder:
     """Async-safe SentenceTransformers query/document encoder."""
 
@@ -119,7 +144,7 @@ class SentenceTransformersEmbedder:
         self._space_reference = space_reference
         self._dimension = dimension
         self._truncate_dim = truncate_dim
-        self._legacy_jina_input = model_reference.model_id == DEFAULT_EMBEDDER_MODEL_ID
+        self._legacy_jina_input = _legacy_omni_encoder(encoder)
         self._document_semaphore = asyncio.Semaphore(max_concurrency)
         # Interactive recall must not queue behind bulk document encoding. The extra query
         # slot costs one encode's activation memory beyond the resident-model worker guard.
@@ -149,25 +174,43 @@ class SentenceTransformersEmbedder:
             if trust_remote_code is None
             else trust_remote_code
         )
+        if trusted and revision is None:
+            # Opting in runs this repository's Python in every worker on every restart, so
+            # without a commit the code being executed is whatever its default branch holds
+            # that minute -- a change with no configuration change and no signal. Only the
+            # bundled model is trusted by default, and it always resolves its bundled pin.
+            raise ValueError(
+                f"trust_remote_code executes code from {model_id!r}, so it requires a pinned "
+                "model_revision"
+            )
         try:
             module = import_module("sentence_transformers")
+            hub_module = import_module("huggingface_hub")
+            import_module("librosa")
         except ImportError as error:
             raise ModelUnavailableError(
                 "install MindBridge with the cloud-models extra to load SentenceTransformers"
             ) from error
         sentence_transformer = cast(_SentenceTransformerFactory, module.SentenceTransformer)
-        code_kwargs: dict[str, str | None] | None = (
-            {"code_revision": revision} if trusted and revision is not None else None
-        )
+        snapshot_download = cast(Callable[..., str], hub_module.snapshot_download)
+        # Downloading the pin ourselves is what pins the weights. `revision` handed to
+        # SentenceTransformer reaches a custom module's `load` as a keyword that module is free
+        # to ignore, and the bundled one -- `load(cls, input_path, **kwargs)` -- does ignore it,
+        # leaving `from_pretrained` to resolve the bare repository id against its default
+        # branch. A local snapshot directory has no branch left to drift to. `code_revision`
+        # pins the remote code separately and has to be set on both kwargs, because
+        # `sentence_transformers` forwards one to the module and the other to the config.
+        model_path = snapshot_download(repo_id=model_id, revision=revision)
+        code_kwargs: dict[str, str | None] | None = {"code_revision": revision} if trusted else None
         encoder = sentence_transformer(
-            model_id,
+            model_path,
             revision=revision,
             trust_remote_code=trusted,
             device=select_torch_device(device),
             model_kwargs=code_kwargs,
             config_kwargs=code_kwargs,
         )
-        if model_id == DEFAULT_EMBEDDER_MODEL_ID and _media_processor_missing(encoder):
+        if _legacy_omni_encoder(encoder) and _media_processor_missing(encoder):
             raise ModelUnavailableError(_MISSING_PROCESSOR)
         truncate_dim = _validated_truncate_dim(encoder, dimension)
         return cls(
@@ -319,10 +362,7 @@ def _validated_truncate_dim(encoder: _SentenceEncoder, requested: int) -> int | 
 
 
 def _model_config_value(encoder: _SentenceEncoder, name: str) -> object:
-    try:
-        first = encoder[0]  # type: ignore[index]
-    except (IndexError, KeyError, TypeError):
-        first = None
+    first = _first_module(encoder)
     candidates = (
         getattr(encoder, "config", None),
         getattr(first, "config", None),

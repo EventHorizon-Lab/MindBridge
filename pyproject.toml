@@ -118,8 +118,16 @@ media = [
 ]
 cloud-models = [
     "mindbridge[media]",
+    # models/jina.py downloads the pinned model snapshot through huggingface_hub.
+    "huggingface-hub>=0.30,<2",
+    # Jina Omni loads file-backed audio through librosa. Declared directly rather than through
+    # `sentence-transformers[audio]`, whose `transformers[audio]` half drags in pyctcdecode and
+    # its `numpy<2` pin: that resolves the whole workspace down to numpy 1.26, which has no
+    # wheels for 3.13 or 3.14 and so builds from source or fails on any image without a
+    # compiler. Nothing here decodes CTC beam search.
+    "librosa>=0.11,<2",
     "opentelemetry-api>=1.44,<2",
-    "sentence-transformers[image,audio,video]>=5.5.1,<6",
+    "sentence-transformers[image,video]>=5.5.1,<6",
     "torch==2.13.0",
     # Jina Omni's image and video processor is a Qwen3-VL processor, and that one refuses to
     # construct without Torchvision. Its loader swallows the ImportError and leaves the

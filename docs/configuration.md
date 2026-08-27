@@ -214,8 +214,11 @@ plugin name selects the same adapter.
 `MODEL_REVISION` is the upstream commit this plugin loads. Bundled Jina Omni also defaults
 `trust_remote_code` to `true` and pins that code to the same commit. Other models default it to
 `false`; a model that needs repository code must opt in with `trust_remote_code=true` in the
-`[media_embedder]` object or `MINDBRIDGE_MEDIA_EMBEDDER_CONFIG_JSON`. Only the local plugin takes a
-revision. The endpoint-backed plugin talks to a server that resolves its own model.
+`[media_embedder]` object or `MINDBRIDGE_MEDIA_EMBEDDER_CONFIG_JSON` **and pin it with
+`MODEL_REVISION`** — the opt-in executes that repository's Python on every worker start, so
+without a commit it re-reads whatever its default branch holds. Loading refuses that pair.
+Only the local plugin takes a revision. The endpoint-backed plugin talks to a server that
+resolves its own model.
 
 Changing this value is a deliberate act, and it needs `MINDBRIDGE_EMBEDDING_SPACE_ID` changed
 with it. Vectors are comparable only within a space, `SPACE_ID` is what declares that

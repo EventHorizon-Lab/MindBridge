@@ -473,7 +473,11 @@ def _parser(prog: str | None) -> argparse.ArgumentParser:
         "--trust-remote-code",
         action=argparse.BooleanOptionalAction,
         default=None,
-        help="allow model repository code; enabled by default only for bundled Jina Omni",
+        help=(
+            "allow model repository code; requires --model-revision, because the opt-in "
+            "executes that repository's Python on every worker start. Enabled by default "
+            "only for bundled Jina Omni, which resolves its own pin"
+        ),
     )
     built.add_argument(
         "--embedding-space-id",
