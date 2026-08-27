@@ -3,6 +3,179 @@
 Benchmark correctness starts with storage isolation. MindBridge has no logical benchmark scope, so
 every concurrently executing unit must own a different physical data directory.
 
+## Evaluation command
+
+Install the local model runtime and Parquet/download support:
+
+```bash
+uv sync --extra local --extra benchmarks
+```
+
+`mindbridge eval` follows the task-selection shape used by `lmms-eval`:
+
+```bash
+mindbridge eval --tasks list
+
+mindbridge eval \
+  --model mindbridge \
+  --model-args pretrained=gpt-5-mini \
+  --tasks locomo-refined,video-mme \
+  --batch-size auto \
+  --limit 10 \
+  --seed 42
+```
+
+Missing annotations and media are downloaded by default. Public releases use immutable Git or
+Hugging Face revisions; annotations are also checked against a published SHA-256 when available.
+ZIP volumes are extracted with traversal/link checks and resume at the first missing or truncated
+entry. `--limit` and `--offset` narrow downloads when the release exposes individual files;
+Video-MME v1 is the exception because its 94 GiB release has no public video-to-volume index.
+Archives stay beside extracted files so later runs do not download them again.
+The `all` group is intentionally unbounded and spans hundreds of gigabytes; use `--limit` and
+individual task groups for smoke runs, and budget both archive and extracted sizes.
+
+Automatic preparation uses `ffmpeg` and `ffprobe` to cache deterministic 30-second, 1 fps,
+at-most-640×360 clips under `.benchmarks/.prepared/`. M3-Bench web videos use `yt-dlp` (resolved
+through `uvx` when available) with conservative request pacing. EgoTempo uses the official
+Ego4D CLI and therefore still requires an accepted Ego4D agreement plus AWS credentials;
+the command performs every step after that one-time authorization. Set
+`MINDBRIDGE_BENCH_YOUTUBE_SLEEP_SECONDS` to tune M3 pacing.
+
+Pass `--no-download` for a fully offline run. Existing extracted archives and prepared clips are
+reused. A task/media override also remains available for an operator-managed corpus:
+
+```bash
+mindbridge eval \
+  --tasks video-mme \
+  --task-data video-mme=/datasets/video-mme/test.parquet \
+  --media-root video-mme=/datasets/video-mme/videos \
+  --allow-unverified-data
+```
+
+`--allow-unverified-data` is required when an override does not match the catalog digest. That
+choice is recorded by the resulting dataset digest, so it is visible rather than silently mixed
+with the pinned task.
+
+The catalog covers these benchmark families:
+
+| Task or group | Concrete tasks |
+| --- | --- |
+| `locomo-refined` | LoCoMo-Refined |
+| `m3-bench` | robot and web |
+| `video-mme`, `video-mme-v2` | Video-MME and Video-MME-v2 |
+| `egolife`, `egomem`, `egotempo` | EgoLifeQA A1/Jake, EgoMemReason, and EgoTempo |
+| `memlens` | 32K, 64K, 128K, and 256K on the released 195-question agent subset |
+| `mm-lifelong` | day test, week test, month train, and month validation |
+| `supermemory-vqa` | subject 1 |
+| `atm-bench` | main and hard, each with raw-media and `-sgm` representations |
+| `mem-gallery` | all released topics |
+
+`all` expands to every concrete task in fixed catalog order. Multiple names and wildcard patterns
+are de-duplicated and run in catalog order. As in `lmms-eval`, `--limit` accepts `-1`, an absolute
+count, or a fraction and `--offset` starts from a later document. Video-MME-v2 keeps whole
+four-question groups because its official rating is defined at that boundary.
+
+LoCoMo-Refined and MemLens use their released caption/text tracks. Mem-Gallery is multimodal and
+requires its dialogue and question images; ATM-Bench exposes raw-media and schema-guided-memory
+tasks separately so their scores are never mixed.
+
+## Prepared media and causal evaluation
+
+The default downloader prepares long video streams and writes the effective versioned manifest
+into the result directory. Supply `--media-manifest` only to replace that generated view with an
+operator-prepared one; relative paths are resolved from the manifest file:
+
+```json
+{
+  "version": 1,
+  "tasks": {
+    "egolifeqa": {
+      "units": {
+        "A1_JAKE": [
+          {
+            "path": "clips/jake-day1-0000.mp4",
+            "source_id": "jake-day1-0000",
+            "start_seconds": 0,
+            "end_seconds": 30
+          }
+        ]
+      }
+    }
+  }
+}
+```
+
+Run it with `--media-manifest prepared-media.json`. A part may contain `text` instead of `path`,
+or both. EgoLifeQA, EgoMemReason, SuperMemory-VQA, and timestamped M3-Bench questions reject
+untimestamped media. The runner adds only parts whose `end_seconds` is at or before the query
+cutoff, preventing future observations from leaking into an answer. M3-Bench uses seconds from the
+start of its video, EgoLifeQA and EgoMemReason use seconds from their release's day-one origin, and
+SuperMemory-VQA uses Unix UTC seconds; manifest intervals must use the matching time base.
+
+Prepared clips keep video I/O bounded. Video-MME/v2, M3-Bench, EgoTempo, MM-Lifelong, and
+SuperMemory-VQA are physically segmented; released EgoLife 30-second clips are reused. ATM's raw
+videos are already only seconds long and Mem-Gallery uses images. `--batch-size auto` uses a
+conservative media batch and a
+larger text batch, capped by `--max-batch-size`; a failed batch is bisected until it fits or the
+individual item is reported as failed. `--unit-concurrency` runs physically isolated
+units in parallel, while `--request-concurrency` bounds answer calls inside each unit. One shared
+Jina/FunASR model pool is reused across those stores, so weights are not loaded once per case.
+
+For large media sent to a local OpenAI-compatible endpoint, set
+`--model-args media_transport=file`. Remote endpoints normally require the default inline data
+transport and its 64 MiB per-request safety limit, making prepared clips important.
+
+## Reproducibility and result trust
+
+An evaluation fixes and records the dataset repository, revision, annotation, auxiliary,
+manifest, and resolved-memory digests, adapter version,
+MindBridge/Zvec/Python versions, generation model and endpoint, pinned Jina revision, batch sizes,
+retrieval limit, and seed. Generation requests use the run seed and temperature `0`. The endpoint
+must support OpenAI-compatible `seed` and `temperature` fields; model providers can still change
+weights behind an unversioned model name, so use an immutable model identifier for publishable
+runs.
+
+Every run writes atomically to its output directory:
+
+- `samples.jsonl` contains predictions, parsed options, scores, retrieval diagnostics, failures,
+  and optional prompts/references from `--log-samples`.
+- `results.json` contains pins, aggregate metrics, a SHA-256 of the samples, cluster-robust
+  standard errors, and deterministic cluster-bootstrap 95% confidence intervals.
+
+The core `lmms-eval` response-cache path shape is supported. A directory keeps a shared
+`cache.db`, writes each run to `runs/<run-id>/cache.db`, and merges successful deterministic
+answers into the shared cache when the run closes:
+
+```bash
+mindbridge eval \
+  --tasks video-mme \
+  --use_cache .benchmarks/response-cache \
+  --output_path .benchmarks/results/video-mme
+```
+
+Questions are clustered by independent memory unit, not treated as independent observations.
+Confidence intervals and regression significance are `null` when a task has fewer than two
+independent units; the runner does not manufacture precision from questions sharing one memory.
+Multiple-choice tasks use exact option scoring; Video-MME-v2 also reports its grouped nonlinear
+rating, and SuperMemory-VQA reports answerability precision/recall. Free-text token F1 is marked
+`official_metric: false`; EgoMemReason is submission-only. Do not present those diagnostic values
+as official leaderboard scores.
+
+Compare identical samples against a prior run and optionally fail CI only on a statistically
+supported regression:
+
+```bash
+mindbridge eval \
+  --tasks locomo-refined \
+  --compare .benchmarks/results/baseline \
+  --fail-on-regression \
+  --regression-threshold 0.01
+```
+
+The comparison validates the dataset digest, joins by stable sample ID, and reports paired
+cluster-bootstrap confidence intervals plus win/tie/loss counts. Any answer error or incomplete
+ingest also makes the command fail instead of quietly lowering a score.
+
 ## Isolation contract
 
 Use one hierarchy under a disposable root:

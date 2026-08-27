@@ -238,6 +238,19 @@ See [configuration](docs/configuration.md) for every variable and custom backend
 
 ## Benchmark isolation
 
+Run the pinned evaluation catalog with an `lmms-eval`-style task selector:
+
+```bash
+mindbridge eval --tasks list
+mindbridge eval --model mindbridge --tasks locomo-refined --seed 42
+```
+
+LoCoMo-Refined, M3-Bench, Video-MME/v2, EgoLifeQA, EgoMemReason, EgoTempo, MemLens,
+MM-Lifelong, SuperMemory-VQA, ATM-Bench, and Mem-Gallery are supported. Results include
+cluster-aware uncertainty and paired baseline comparisons. Missing pinned annotations and media
+download automatically; long videos are prepared into reusable bounded clips. EgoTempo is the one
+credentialed exception and needs prior Ego4D access. See [benchmarking](docs/benchmarking.md).
+
 Isolation is physical, not logical. Concurrent benchmark tasks must never share a `data_dir`:
 
 ```text

@@ -73,13 +73,41 @@ class _TranscriptionResponse(BaseModel):
 class OpenAIHTTP:
     """Serve embedding, generation, and transcription through independent endpoints."""
 
-    __slots__ = ("_client", "_config", "_owns_client")
+    __slots__ = (
+        "_client",
+        "_config",
+        "_generation_seed",
+        "_generation_temperature",
+        "_owns_client",
+    )
 
-    def __init__(self, config: Config, *, client: httpx.Client | None = None) -> None:
+    def __init__(
+        self,
+        config: Config,
+        *,
+        client: httpx.Client | None = None,
+        generation_seed: int | None = None,
+        generation_temperature: float | None = None,
+    ) -> None:
         if not isinstance(config, Config):
             raise ValidationError("config must be a Config value")
+        if generation_seed is not None and (
+            isinstance(generation_seed, bool)
+            or not isinstance(generation_seed, int)
+            or not 0 <= generation_seed < 2**63
+        ):
+            raise ValidationError("generation_seed must be an integer between 0 and 2^63 - 1")
+        if generation_temperature is not None and (
+            isinstance(generation_temperature, bool)
+            or not isinstance(generation_temperature, int | float)
+            or not math.isfinite(generation_temperature)
+            or not 0 <= generation_temperature <= 2
+        ):
+            raise ValidationError("generation_temperature must be between zero and two")
         self._config = config
         self._client = client or httpx.Client()
+        self._generation_seed = generation_seed
+        self._generation_temperature = generation_temperature
         self._owns_client = client is None
 
     @property
@@ -208,17 +236,18 @@ class OpenAIHTTP:
             if assets
             else text_parts[0]
         )
-        response = self._post_json(
-            "generation",
-            "chat/completions",
-            {
-                "model": self._config.generation_model,
-                "messages": [
-                    {"role": "system", "content": _GROUNDED_SYSTEM_PROMPT},
-                    {"role": "user", "content": content},
-                ],
-            },
-        )
+        payload: dict[str, object] = {
+            "model": self._config.generation_model,
+            "messages": [
+                {"role": "system", "content": _GROUNDED_SYSTEM_PROMPT},
+                {"role": "user", "content": content},
+            ],
+        }
+        if self._generation_seed is not None:
+            payload["seed"] = self._generation_seed
+        if self._generation_temperature is not None:
+            payload["temperature"] = self._generation_temperature
+        response = self._post_json("generation", "chat/completions", payload)
         try:
             body = _ChatResponse.model_validate_json(response.content)
         except PydanticValidationError:

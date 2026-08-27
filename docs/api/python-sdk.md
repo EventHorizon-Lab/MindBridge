@@ -504,6 +504,9 @@ Pass an implementation with `Memory(..., models=backend)`. Compatible vLLM/OpenA
 use `OpenAIHTTP(Config(...))` as that combined backend. Calls may overlap across threads, so a
 custom backend must be thread-safe until `close()`. See [configuration](../configuration.md).
 
+`OpenAIHTTP` also accepts optional `generation_seed` and `generation_temperature` keyword
+arguments. They are omitted from normal requests unless set; reproducible evaluation sets both.
+
 ## Exceptions
 
 Catch `MindBridgeError` for every supported operational failure, or a specific subclass:
