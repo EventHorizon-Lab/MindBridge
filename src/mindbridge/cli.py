@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Mapping, Sequence
 from importlib.metadata import version
 from pathlib import Path
 
@@ -42,16 +42,26 @@ def parser(
     return built
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+ExtensionHandler = Callable[[Sequence[str], str], int]
+
+
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    extensions: Mapping[str, tuple[str, ExtensionHandler]] | None = None,
+) -> int:
     """Run one product command under the documented exit-code contract."""
     arguments = list(sys.argv[1:] if argv is None else argv)
-    root = _root_parser()
+    available = extensions or {}
+    root = _root_parser({name: extension[0] for name, extension in available.items()})
     if not arguments:
         root.print_help()
         return 0
 
     command = arguments[0]
     try:
+        if command in available:
+            return available[command][1](arguments[1:], f"mindbridge {command}")
         options = root.parse_args(arguments)
         command = options.command
         if command == "serve":
@@ -85,7 +95,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
 
 
-def _root_parser() -> argparse.ArgumentParser:
+def _root_parser(extensions: Mapping[str, str] | None = None) -> argparse.ArgumentParser:
     root = parser(prog="mindbridge", description=_DESCRIPTION)
     commands = root.add_subparsers(dest="command", required=True)
 
@@ -104,6 +114,8 @@ def _root_parser() -> argparse.ArgumentParser:
 
     mcp = commands.add_parser("mcp", help="serve MCP over stdio")
     _data_dir_argument(mcp)
+    for name, summary in (extensions or {}).items():
+        commands.add_parser(name, help=summary)
     return root
 
 

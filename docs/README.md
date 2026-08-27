@@ -25,7 +25,7 @@ MindBridge is an embedded multimodal memory library for text, image, video, audi
 - [Deployment](deployment.md) — one-process embedded and REST deployment.
 - [Operations](operations.md) — backup, restore, rebuild, and observability.
 - [Troubleshooting](troubleshooting.md) — startup, asset, model, and index failures.
-- [Benchmarking](benchmarking.md) — physical isolation and local-index metrics.
+- [Benchmarking](benchmarking.md) — evaluation tasks, uncertainty, isolation, and local-index metrics.
 
 ## Scope notes
 

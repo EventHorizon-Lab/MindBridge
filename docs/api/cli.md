@@ -86,6 +86,34 @@ mindbridge-mcp --data-dir /var/lib/mindbridge/assistant
 The MCP process becomes the only owner of that directory until it exits. See the
 [MCP reference](mcp.md).
 
+## Evaluate benchmarks
+
+Install the local and benchmark extras, inspect the pinned catalog, then select tasks in the same
+style as `lmms-eval`:
+
+```bash
+uv add "mindbridge[local,benchmarks]"
+mindbridge eval --tasks list
+mindbridge eval \
+  --model mindbridge \
+  --model-args pretrained=gpt-5-mini \
+  --tasks locomo-refined,video-mme \
+  --batch-size auto \
+  --seed 42
+```
+
+The command downloads pinned annotations and selected media by default, resumes safe archive
+extraction, and caches optimized 30-second video segments. M3 web media uses `yt-dlp`; EgoTempo
+uses the official Ego4D CLI after the operator has accepted its access agreement and configured
+AWS credentials. Use `--no-download` offline, `--media-root TASK=PATH` for an existing corpus, or
+`--media-manifest PATH` for prepared causal segments. Core `lmms-eval` forms including task/group
+lists, wildcard task selection, fractional `--limit`, `--offset`, `auto:N` batching, four seeds,
+deterministic `--gen_kwargs`, and layered SQLite `--use_cache` are accepted. The command writes
+`results.json` and `samples.jsonl` under
+`.benchmarks/results/<UTC-run-id>/` unless `--output-path` is given. See
+[benchmarking](../benchmarking.md) for every supported task, manifest schema, confidence
+intervals, paired comparisons, and reproducibility rules.
+
 ## Local-index benchmark
 
 Choose an empty directory:
