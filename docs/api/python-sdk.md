@@ -21,6 +21,7 @@ from mindbridge import (
     Memory,
     MemoryNotFoundError,
     MemoryRecord,
+    MemoryType,
     MindBridgeError,
     Modality,
     ModelBackend,
@@ -130,12 +131,14 @@ memory.add(
     *,
     occurred_at: datetime | None = None,
     metadata: Mapping[str, object] | None = None,
+    memory_type: MemoryType = MemoryType.SEMANTIC,
 ) -> MemoryRecord
 ```
 
 Adds text, media, or ordered combinations. Text atoms are normalized and limited to 65,536
-characters. `occurred_at` must be timezone-aware. Metadata must be JSON-compatible and its
-canonical UTF-8 form may not exceed 262,144 bytes.
+characters. `occurred_at` must be timezone-aware. `memory_type` is semantic, episodic, or
+procedural; it is persisted, returned, and included in stable identity. Metadata must be
+JSON-compatible and its canonical UTF-8 form may not exceed 262,144 bytes.
 
 Local paths, inline bytes, and allowed HTTPS sources are copied into immutable content-addressed
 storage before the record is committed. One aggregate model input produces one embedding. If the
@@ -149,7 +152,11 @@ record, assets, embedding, and pending operation durable. Retrying the same inpu
 ### `add_many`
 
 ```python
-memory.add_many(contents: Sequence[ContentInput]) -> tuple[MemoryRecord, ...]
+memory.add_many(
+    contents: Sequence[ContentInput],
+    *,
+    memory_type: MemoryType = MemoryType.SEMANTIC,
+) -> tuple[MemoryRecord, ...]
 ```
 
 Adds a batch with no per-item event time or metadata. A single ordered multimodal item must be
@@ -166,31 +173,48 @@ records = memory.add_many(
 )
 ```
 
-Empty input returns an empty tuple. Output matches input order and length; duplicates may return
-the same ID. New items are routed, embedded in one model batch, and stored atomically.
+Empty input returns an empty tuple. One `memory_type` applies to the complete batch. Output matches
+input order and length; duplicates may return the same ID. New items are routed, embedded in one
+model batch, and stored atomically.
 
 ### `search`
 
 ```python
-memory.search(query: ContentInput, *, limit: int = 10) -> tuple[SearchHit, ...]
+memory.search(
+    query: ContentInput,
+    *,
+    limit: int = 10,
+    memory_type: MemoryType | None = None,
+    reference_at: datetime | None = None,
+) -> tuple[SearchHit, ...]
 ```
 
 Runs dense plus full-text hybrid retrieval when the routed query contains text, and dense-only
-retrieval for a pure-media routed query. `limit` is from 1 through 100. Multimodal queries follow
-the same capability routing as stored memories. Results are hydrated from SQLite in ranked order;
-stale derived-index IDs are omitted.
+retrieval for a pure-media routed query. `limit` is from 1 through 100. `memory_type` is an optional
+hard role filter. `reference_at` must be timezone-aware and resolves ISO/common English or Chinese
+relative calendar expressions; current UTC is the default. Multimodal queries follow the same
+capability routing as stored memories. Type and event-time constraints are pushed into Zvec and
+rechecked while results are hydrated from SQLite; stale or contradictory derived-index IDs are
+omitted. Temporal intent and enabled decay rerank a bounded candidate pool.
 
 ### `ask`
 
 ```python
-memory.ask(question: ContentInput, *, limit: int = 5) -> AnswerResult
+memory.ask(
+    question: ContentInput,
+    *,
+    limit: int = 5,
+    memory_type: MemoryType | None = None,
+    reference_at: datetime | None = None,
+) -> AnswerResult
 ```
 
 Retrieves up to `limit` memories and asks the configured generation backend to answer only from
-those hits. Question and evidence assets are preserved when supported. Audio fallback contributes
-ASR text while supported image/video evidence remains available to a VLM. The built-in backend
-serializes each distinct question/evidence asset once in the outbound answer request, even if
-several hits refer to the same digest.
+those hits. Role filtering and temporal reference semantics match `search`; a resolved reference
+time is also sent to generation. Question and evidence assets are preserved when supported. Audio
+fallback contributes ASR text while supported image/video evidence remains available to a VLM.
+The built-in backend serializes each distinct question/evidence asset once in the outbound answer
+request, even if several hits refer to the same digest.
 
 ### `get`
 
@@ -325,18 +349,19 @@ MemoryRecord(
     metadata: Mapping[str, object],
     assets: tuple[AssetRef, ...],
     modality: Modality,
+    memory_type: MemoryType,
 )
 ```
 
 `content` is the normalized textual component and may be empty for native media-only input. It
 includes transcript text only when add-time embedding fallback required ASR. A later
 generation-time fallback may cache an asset transcript but does not rewrite the existing record.
-`modality` is persisted and returned directly.
+`modality` and `memory_type` are persisted and returned directly.
 
 ### `SearchHit`
 
 `SearchHit` has the record fields plus `score: float`, constrained to the inclusive range 0
-through 1.
+through 1. A score can include temporal and decay factors and is not a stable probability.
 
 ### `AnswerResult`
 
@@ -497,8 +522,11 @@ Zvec exceptions do not cross the public boundary.
 ## Current limits
 
 There is no public update method, server-side metadata filter, logical account scope, automatic
-chunking, per-asset embedding, or reranking stage. One memory produces one aggregate embedding.
-Allocate a separate `data_dir` for each independent memory domain.
+classification/consolidation, executable procedure runtime, automatic chunking, per-asset
+embedding, or learned reranker. One memory produces one aggregate embedding. Allocate a separate
+`data_dir` for each independent memory domain. See
+[memory types, temporal reasoning, and decay](../memory-types-time-and-decay.md) for the supported
+deterministic layer.
 
 For `Config(media_transport="data")`, the built-in backend limits aggregate raw media to 64 MiB
 per embedding or generation call, before base64 expansion. Use `file` only with a trusted
@@ -506,5 +534,5 @@ co-located backend that can read the local asset paths, or provide a streaming/f
 backend for large video. Provider limits may be lower.
 
 The built-in backend limits serialized answer text evidence to 4 MiB. The outbound generation
-request includes the question plus each hit's content, `occurred_at`, `created_at`, metadata, and
-asset references. Choose model endpoints with an appropriate data-retention policy.
+request includes the question plus each hit's content, `memory_type`, `occurred_at`, `created_at`,
+metadata, and asset references. Choose model endpoints with an appropriate data-retention policy.

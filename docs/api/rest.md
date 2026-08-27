@@ -105,6 +105,7 @@ A memory response keeps textual content and adds explicit modality and safe asse
   "id": "sha256-memory-id",
   "content": "The prototype after the review",
   "modality": "image",
+  "memory_type": "episodic",
   "assets": [
     {
       "id": "sha256-asset-id",
@@ -122,7 +123,8 @@ A memory response keeps textual content and adds explicit modality and safe asse
 ```
 
 `modality` is persisted by the core and is one of `text`, `image`, `video`, `audio`, or `omni`.
-Asset filesystem paths are never serialized.
+`memory_type` is `semantic`, `episodic`, or `procedural`. Asset filesystem paths are never
+serialized.
 
 ## Endpoints
 
@@ -154,13 +156,15 @@ Content-Type: application/json
       "image_url": "https://media.example/prototype.png"
     }
   ],
+  "memory_type": "episodic",
   "occurred_at": "2026-08-27T09:00:00Z",
   "metadata": {"source": "design-review"}
 }
 ```
 
-`occurred_at` and `metadata` are optional. Response `201` is one memory object. Repeating the same
-canonical input returns the existing record without another model call.
+`occurred_at`, `metadata`, and `memory_type` are optional; memory type defaults to `semantic`.
+Response `201` is one memory object. Repeating the same canonical input returns the existing record
+without another model call.
 
 ### Create a batch
 
@@ -180,12 +184,14 @@ Content-Type: application/json
         "file_id": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
       }
     ]
-  ]
+  ],
+  "memory_type": "procedural"
 }
 ```
 
-`contents` has 1 through 100 items. Response `201` is `{"memories": [...]}` in input order. The
-batch contract has no per-item event time or metadata.
+`contents` has 1 through 100 items. One optional `memory_type` applies to the complete batch and
+defaults to `semantic`. Response `201` is `{"memories": [...]}` in input order. The batch contract
+has no per-item event time or metadata.
 
 ### Search memories
 
@@ -203,13 +209,16 @@ Content-Type: application/json
       "file_id": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
     }
   ],
-  "limit": 10
+  "limit": 10,
+  "memory_type": "episodic",
+  "reference_at": "2026-08-27T12:00:00Z"
 }
 ```
 
-`limit` defaults to 10 and ranges from 1 through 100. Response `200` is
-`{"hits": [...]}`; each hit has the memory fields plus `score`. A routed query containing text
-uses hybrid dense/full-text retrieval; pure media uses dense retrieval.
+`limit` defaults to 10 and ranges from 1 through 100. `memory_type` optionally filters one role.
+`reference_at` resolves relative date expressions and must include a timezone; current UTC is the
+default. Response `200` is `{"hits": [...]}`; each hit has the memory fields plus `score`. A routed
+query containing text uses hybrid dense/full-text retrieval; pure media uses dense retrieval.
 
 ### Answer from memories
 
@@ -220,8 +229,10 @@ Content-Type: application/json
 
 ```json
 {
-  "question": "What changed in the latest prototype?",
-  "limit": 5
+  "question": "What changed last week?",
+  "limit": 5,
+  "memory_type": "episodic",
+  "reference_at": "2026-08-27T12:00:00Z"
 }
 ```
 
@@ -234,9 +245,10 @@ Content-Type: application/json
 }
 ```
 
-`hits` are the exact search results used to ground the answer. The outbound generation request
-includes their content, `occurred_at`, `created_at`, metadata, and media. In the built-in model
-request, a distinct question/evidence asset is serialized once even when multiple hits refer to it.
+`memory_type` and `reference_at` have the same semantics as search. `hits` are the exact search
+results used to ground the answer. The outbound generation request includes their content,
+`memory_type`, `occurred_at`, `created_at`, metadata, and media. In the built-in model request, a
+distinct question/evidence asset is serialized once even when multiple hits refer to it.
 
 ### Get a memory
 
@@ -305,8 +317,8 @@ messages intentionally avoid provider, local path, or native-index details.
 ## Current limits
 
 The REST API has no local-path input, large-file upload endpoint, update route, metadata filter,
-logical scope parameter, chunking contract, per-asset vectors, or reranker. Use Python `Path` or an
-allowed HTTPS `URL` for media too large to place in one JSON request. The built-in `data` model
+logical scope parameter, chunking contract, per-asset vectors, or learned reranker. Use Python
+`Path` or an allowed HTTPS `URL` for media too large to place in one JSON request. The built-in `data` model
 transport separately rejects embedding or generation calls above 64 MiB of aggregate raw media;
 answer text evidence is limited to 4 MiB. Large video requires trusted co-located `file` transport
 or a custom streaming/upload backend.

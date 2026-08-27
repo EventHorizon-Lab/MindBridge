@@ -37,7 +37,7 @@ Construction resolves the path and acquires `.mindbridge.lock` without waiting. 
 ownership maps to `StorageError`. After locking, MindBridge:
 
 1. Enforces POSIX mode `0700` on the top-level directory and opens or creates `state.sqlite3`.
-2. Migrates the supported text schema to the multimodal schema when required.
+2. Migrates supported schemas through SQLite schema v5 when required.
 3. Validates required tables and stored embedding/index metadata.
 4. Opens the content-addressed asset store.
 5. Checkpoints all embeddings if the Zvec directory is missing.
@@ -83,7 +83,7 @@ Writes use `BEGIN IMMEDIATE`. The multimodal schema contains:
 
 | Table | Authoritative content |
 | --- | --- |
-| `memory_records` | Text, persisted modality, canonical metadata, event and creation times |
+| `memory_records` | Text, modality, memory role, metadata, event/access times, bounded access count |
 | `media_assets` | SHA-256 descriptor, MIME, modality, size, relative CAS path, optional transcript |
 | `memory_assets` | Ordered memory-to-asset relationships |
 | `embeddings` | FP32 vector, model, space, task, dimension, normalization, object part |
@@ -109,9 +109,11 @@ For each add, MindBridge:
 3. Resolves `AssetRef` through SQLite and materializes Path, Blob, and allowed URL atoms into CAS.
 4. Infers Path/URL media type only from a deterministic common suffix when no explicit hint exists.
 5. Derives modality from the set of media families.
-6. Converts timezone-aware event time to UTC microsecond precision.
-7. Serializes metadata as sorted compact JSON and rejects non-finite or unsupported values.
-8. Hashes canonical text, ordered asset digests, event time, and metadata into the memory ID.
+6. Validates the semantic, episodic, or procedural memory role.
+7. Converts timezone-aware event time to UTC microsecond precision.
+8. Serializes metadata as sorted compact JSON and rejects non-finite or unsupported values.
+9. Hashes canonical text, ordered asset digests, event time, metadata, and any non-default role
+   into the memory ID; omitting the default semantic marker preserves existing semantic IDs.
 
 The same bytes have one asset ID regardless of source. Memory identity preserves asset order. A
 duplicate memory is detected before embedding or transcription; source Path/URL bytes still must be
@@ -206,13 +208,19 @@ second process still cannot own the directory.
 
 Vectors are normalized before persistence. When routed query text is non-empty, hybrid search sends
 that text and the normalized aggregate vector to Zvec so it can fuse dense and lexical candidates.
-A pure-media query uses dense vector search. Both paths are constrained to the stored vector space
-and retrieval task, then hydrate authoritative records and assets in ranked order. Public scores
-are clamped to `[0, 1]`; stale IDs are removed.
+A pure-media query uses dense vector search. Both paths are constrained to the stored vector space,
+retrieval task, optional memory role, and detected event-time range. SQLite hydration rechecks role
+and event time, so a stale or corrupted derived field cannot authorize a hit.
+
+Temporal or decay ranking over-fetches at least 50 candidates or three times the requested limit.
+Temporal matches rank before fallback candidates. Optional decay uses the latest access, event, or
+update time and a bounded access-strength factor; only returned hits receive durable reinforcement.
+Public scores are clamped to `[0, 1]`; stale IDs are removed. The exact parser and formula are in
+[memory types, temporal reasoning, and decay](memory-types-time-and-decay.md).
 
 There is currently no chunking, multiple embeddings per memory, metadata-filter pushdown, or
-reranker. Quality and latency work must measure the one-memory/one-vector contract instead of
-claiming an unimplemented pipeline.
+learned reranker. Quality and latency work must measure the one-memory/one-vector contract instead
+of claiming an unimplemented pipeline.
 
 ## Failure mapping
 
@@ -232,5 +240,6 @@ All inherit `MindBridgeError`. REST and MCP map them to stable sanitized envelop
 ## Deliberate non-goals
 
 The embedded v0.2 architecture does not provide distributed writers, logical account partitions,
-background consolidation, server-side metadata filters, automatic media chunking, per-asset
-vectors, a reranker, or a runtime plugin registry. New layers require a measured public use case.
+automatic role extraction, background consolidation, executable procedural memories, server-side
+metadata filters, automatic media chunking, per-asset vectors, a learned reranker, or a runtime
+plugin registry. New layers require a measured public use case.
