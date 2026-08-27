@@ -59,7 +59,11 @@ from mindbridge.models.defaults import (
 from mindbridge.telemetry import log_fields, logger, operation_span, set_current_span_attributes
 
 if TYPE_CHECKING:
-    from mindbridge.edge.identity_diarization import FunASRSpeechPipeline, SpeechAnalysis
+    from mindbridge.edge.identity_diarization import (
+        FunASRRecipe,
+        SpeechAnalysis,
+        SpeechAnalyzer,
+    )
 
 DEFAULT_VIDEO_FRAMES_PER_SECOND = 1.0
 DEFAULT_VIDEO_MAX_PIXELS = 200_704
@@ -255,17 +259,24 @@ class AudioFallbackGenerator:
         self,
         generator: OpenAIGenerator,
         *,
-        asr_model_id: str | None = None,
+        asr_engine: str | None = None,
+        asr_recipe: FunASRRecipe | str | None = None,
         asr_device: str | None = None,
         maximum_media_bytes: int = DEFAULT_ASR_MAXIMUM_MEDIA_BYTES,
     ) -> None:
         if maximum_media_bytes <= 0:
             raise ValueError("ASR media limit must be positive")
+        # The pipeline loads lazily on the first audiovisual request, but whether the requested
+        # engine can run the requested model is two strings -- so answer it now. A worker that
+        # accepts traffic and then fails on the first clip carrying speech is worse than one
+        # that refuses to start.
+        _validate_speech_engine(asr_engine, asr_recipe)
         self._generator = generator
-        self._asr_model_id = asr_model_id
+        self._asr_engine = asr_engine
+        self._asr_recipe = asr_recipe
         self._asr_device = asr_device
         self._maximum_media_bytes = maximum_media_bytes
-        self._pipeline: FunASRSpeechPipeline | None = None
+        self._pipeline: SpeechAnalyzer | None = None
         # ponytail: one local model lock; use one worker per device if ASR throughput matters.
         self._pipeline_lock = asyncio.Lock()
 
@@ -302,8 +313,9 @@ class AudioFallbackGenerator:
             async with self._pipeline_lock:
                 if self._pipeline is None:
                     self._pipeline = await asyncio.to_thread(
-                        _load_funasr,
-                        self._asr_model_id,
+                        _load_speech_analyzer,
+                        self._asr_engine,
+                        self._asr_recipe,
                         self._asr_device,
                     )
                 try:
@@ -314,16 +326,50 @@ class AudioFallbackGenerator:
                     raise ModelUnavailableError("FunASR transcription failed") from error
 
 
-def _load_funasr(model_id: str | None, device: str | None) -> FunASRSpeechPipeline:
+def _validate_speech_engine(engine: str | None, recipe: FunASRRecipe | str | None) -> None:
+    """Check the engine and recipe name a workable pair, if the edge runtime is installed.
+
+    `audio_mode="transcribe"` documents the `edge` extra as a requirement, but an absent extra
+    stays a first-request failure rather than becoming a new reason not to start: that is the
+    existing contract, and this check is about a misconfigured pair, not a missing install.
+    """
     try:
-        from mindbridge.edge.identity_diarization import FunASRSpeechPipeline
+        from mindbridge.edge.identity_diarization import (
+            DEFAULT_FUNASR_RECIPE,
+            validate_speech_engine,
+        )
+    except ImportError:
+        return
+    validate_speech_engine(engine, recipe if recipe is not None else DEFAULT_FUNASR_RECIPE)
+
+
+def _load_speech_analyzer(
+    engine: str | None,
+    recipe: FunASRRecipe | str | None,
+    device: str | None,
+) -> SpeechAnalyzer:
+    """Take whichever FunASR engine this device resolves to.
+
+    A recipe rather than a bare model id, because a FunASR model id alone does not say whether
+    the checkpoint predicts timestamps or punctuates its own output, and switching speech
+    language means switching model -- which is the documented reason to touch this at all.
+    """
+    try:
+        from mindbridge.edge.identity_diarization import (
+            DEFAULT_FUNASR_RECIPE,
+            load_speech_analyzer,
+        )
     except ImportError as error:
         raise ModelUnavailableError(
             "install MindBridge with the edge extra to use generator audio_mode='transcribe'"
         ) from error
     try:
-        return FunASRSpeechPipeline.load(device=device, model_id=model_id)
-    except ModelUnavailableError:
+        return load_speech_analyzer(
+            engine=engine,
+            device=device,
+            recipe=recipe if recipe is not None else DEFAULT_FUNASR_RECIPE,
+        )
+    except (ModelUnavailableError, ValueError):
         raise
     except Exception as error:
         raise ModelUnavailableError("FunASR could not be loaded") from error
@@ -577,7 +623,8 @@ class _GeneratorConfig(PluginConfigModel):
     video_frames_per_second: PluginNumber = DEFAULT_VIDEO_FRAMES_PER_SECOND
     video_max_pixels: PluginInteger = DEFAULT_VIDEO_MAX_PIXELS
     audio_mode: Literal["native", "transcribe"] = "native"
-    asr_model_id: PluginText | None = None
+    asr_engine: PluginText | None = None
+    asr_recipe: PluginText | None = None
     asr_device: PluginText | None = None
 
 
@@ -608,7 +655,8 @@ def create_generator(config: Mapping[str, object]) -> Generator:
         return generator
     return AudioFallbackGenerator(
         generator,
-        asr_model_id=validated.asr_model_id,
+        asr_engine=validated.asr_engine,
+        asr_recipe=validated.asr_recipe,
         asr_device=validated.asr_device,
     )
 

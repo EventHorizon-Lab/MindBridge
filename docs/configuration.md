@@ -281,12 +281,24 @@ endpoint = "https://generator.example.com/v1"
 model_id = "video-vlm"
 audio_mode = "transcribe"
 asr_device = "auto"
-# Override this Mandarin default when the deployment's speech language differs.
-asr_model_id = "iic/speech_seaco_paraformer_large_asr_nat-zh-cn-16k-common-vocab8404-pytorch"
 ```
 
+`asr_engine` and `asr_recipe` select the speech engine and model, and both default sensibly:
+the engine resolves from the device (CUDA with vLLM installed uses `vllm`, every other platform
+uses `automodel`) and the recipe defaults to `fun-asr-nano`. Set `asr_recipe` when the
+deployment's speech language calls for another model — `paraformer` is Mandarin-tuned,
+`sensevoice` and `fun-asr-nano` are multilingual. A recipe names a composition rather than only a
+model id, because a FunASR model id alone does not say whether the checkpoint predicts timestamps
+or punctuates its own output; see [Edge](edge.md) for the recipe table and for declaring one for a
+model MindBridge has not measured.
+
+The pair is checked while the generator is built, not when the first clip arrives: `vllm` can only
+serve `fun-asr-nano`, so `asr_engine = "vllm"` with any other recipe refuses to start rather than
+accepting traffic it will fail on. The speech models themselves still load lazily on the first
+audiovisual request.
+
 Text and image-only requests do not load FunASR. On the first request containing audio or video,
-MindBridge loads the existing FunASR + CAM++ speech pipeline locally. It replaces audio parts with
+MindBridge loads the FunASR + CAM++ speech pipeline locally. It replaces audio parts with
 an explicitly untrusted diarized transcript and keeps each video part beside its transcript so the
 VLM still sees the frames. Each speech turn has this stable shape:
 
