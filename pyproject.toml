@@ -16,11 +16,15 @@ dependencies = [
 ]
 
 [project.scripts]
-mindbridge = "mindbridge.cli:main"
+mindbridge = "mindbridge.benchmarks.cli:product_main"
 mindbridge-bench = "mindbridge.benchmarks.cli:main"
 mindbridge-mcp = "mindbridge.cli:mcp"
 
 [project.optional-dependencies]
+benchmarks = [
+    "huggingface-hub>=0.30,<2",
+    "pyarrow>=18,<26",
+]
 local = [
     # Avoid transformers[audio]: pyctcdecode pins NumPy 1.x, which has no Python 3.13/3.14
     # wheels. Jina only needs librosa and soundfile for its native audio path.
@@ -87,6 +91,9 @@ files = ["src", "tests"]
 module = [
     # Installed and imported only on Python 3.10.
     "tomli",
+    # Optional benchmark download client, imported lazily.
+    "huggingface_hub",
+    "huggingface_hub.*",
 ]
 ignore_missing_imports = true
 

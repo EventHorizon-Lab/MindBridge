@@ -219,6 +219,29 @@ def test_answer_serializes_temporal_and_metadata_evidence() -> None:
     assert answer.answer == "It arrived on August 26."
 
 
+def test_answer_can_pin_sampling_for_reproducible_evaluation() -> None:
+    def respond(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        assert payload["seed"] == 17
+        assert payload["temperature"] == 0.0
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {"index": 0, "message": {"content": "Pinned."}, "finish_reason": "stop"}
+                ]
+            },
+        )
+
+    hit = SearchHit(id="memory_1", content="evidence", score=0.9, created_at=NOW)
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        answer = OpenAIHTTP(
+            _config(), client=client, generation_seed=17, generation_temperature=0.0
+        ).answer("What?", (hit,))
+
+    assert answer.answer == "Pinned."
+
+
 def test_answer_rejects_an_oversized_grounding_payload(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -37,6 +37,10 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   CAM++ diarization, or stable identity matching.
 - Local SQLite schema v4 adds optional speaker names; existing schema versions migrate in place.
 - Physical benchmark isolation plus local-index and LoCoMo-Refined runners.
+- `mindbridge eval` with pinned adapters for twelve long-memory benchmark families, adaptive
+  batching, resumable automatic media acquisition and video preparation, causal manifests,
+  deterministic sampling and response caching, cluster-aware confidence intervals, and paired
+  regression comparisons.
 - Enforced POSIX `0700` data directories and `0600` database/lock files, fork-use rejection,
   bounded public input, REST body limits, pre-body bearer authentication, and TLS requirements for
   non-loopback CLI binds.

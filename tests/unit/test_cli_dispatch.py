@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import ModuleType
 
 import pytest
 import uvicorn
@@ -10,6 +11,7 @@ import uvicorn
 import mindbridge
 from mindbridge import cli, server
 from mindbridge.api import mcp as mcp_adapter
+from mindbridge.benchmarks import cli as benchmark_cli
 
 
 class _FakeMemory:
@@ -88,6 +90,26 @@ def test_cli_dispatches_only_the_local_product_surface(
         assert command in help_text
     for removed in ("consolidate", "lifecycle", "jobs"):
         assert removed not in help_text
+
+
+def test_console_entry_point_adds_eval_lazily(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    calls: list[tuple[tuple[str, ...], str | None]] = []
+    module = ModuleType("evaluation")
+
+    def evaluation(argv: tuple[str, ...], *, prog: str | None = None) -> int:
+        calls.append((tuple(argv), prog))
+        return 0
+
+    module.main = evaluation  # type: ignore[attr-defined]
+    monkeypatch.setattr(benchmark_cli, "import_module", lambda _name: module)
+
+    assert benchmark_cli.product_main(["eval", "--tasks", "locomo-refined"]) == 0
+    assert calls == [(("--tasks", "locomo-refined"), "mindbridge eval")]
+    assert benchmark_cli.product_main([]) == 0
+    assert "eval" in capsys.readouterr().out
 
 
 def test_server_requires_authentication_before_a_non_loopback_bind(

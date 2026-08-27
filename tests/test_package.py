@@ -106,6 +106,7 @@ def test_console_script_targets_exist() -> None:
 def test_dependency_surface_is_exact() -> None:
     assert {_name(item) for item in DEPENDENCIES} == {"httpx", "pydantic", "zvec"}
     assert {extra: {_name(item) for item in items} for extra, items in EXTRAS.items()} == {
+        "benchmarks": {"huggingface-hub", "pyarrow"},
         "local": {"funasr", "librosa", "numpy", "sentence-transformers", "soundfile"},
         "vllm": {"vllm"},
         "server": {"fastapi", "starlette", "uvicorn"},
