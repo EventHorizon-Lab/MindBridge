@@ -423,9 +423,10 @@ proxy_audio = true
 ```
 
 An unrecognized key or a value of the wrong type fails startup, and so does a frame rate outside
-`0 < fps <= 20`. The upper bound is the media layer's own: past 20 fps every span widened to the
-sampling floor exceeds the proxy frame ceiling below, so the knob would silently switch off the
-feature it is tuning. `Infinity` is well-formed JSON and is refused here rather than downstream.
+`0 < fps <= 20`. That upper bound is a sanity limit, not a media-layer ceiling: the frame-count
+ceiling it used to be derived from is fixed and gone. What only the bound still catches is a
+finite literal that overflows — `1e400` is well-formed JSON, becomes `inf`, and would otherwise
+reach the encoder as a frame rate. `Infinity` and `NaN` are refused before this, by the parser.
 
 **Frame rate sets the entire write cost of a video deployment** — one clip cut, one encoder call,
 and one stored object per sampled window. It is the first thing to change if ingest is too
@@ -452,14 +453,15 @@ Four constraints on the proxy, all of which have bitten before:
 - **Video only.** `image_max_pixels` governs stored image clips, not what the model is sent. An
   image reaches the model at full resolution because the request carries no pixel budget for
   images at all.
-- **Its ceiling is a frame count, not a duration.** Past roughly forty sampled frames the encode
-  fails, on the flush that drains the encoder rather than on any one frame. At the 30-second
-  segments every ingest path here uses, anything above about 1.3 fps exceeds it. Raising
-  `frames_per_second` therefore trades the proxy away; lower it, or segment shorter, to keep
-  both. **Turning `proxy_audio` off does not raise this ceiling** — a silent source with the
-  audio disabled fails at the same frame count, so the limit is not the audio interleave it was
-  previously documented as. What has been ruled out, and what has not, is recorded next to
-  `MAX_PROXY_SAMPLED_FRAMES` in `application/evidence_clips.py`.
+- **No frame-count limit.** Raising `frames_per_second` no longer trades the proxy away. Past
+  roughly forty sampled frames the encode used to raise `[Errno 22] Invalid argument`, and a
+  budget of forty frames skipped any span that would exceed it — so at the 30-second segments
+  every ingest path here uses, anything above about 1.3 fps silently lost its proxy. The crash
+  was documented in turn as an audio-interleave limit and as an unidentified one; it was
+  neither. The encoder was being handed timestamps in two different units, that is fixed, and
+  the budget is gone with it. `frames_per_second` is still bounded at the worker's
+  configuration boundary — see `MINDBRIDGE_MEDIA_SAMPLING_CONFIG_JSON` — but by a sanity limit,
+  not by anything the media layer cannot encode.
 - **Best-effort.** A span over budget is skipped before its source is read, and anything the
   encoder or object storage refuses degrades the same way — the observation behaves exactly as
   it did before this knob existed rather than paying for a doomed encode.
@@ -587,6 +589,7 @@ text, or media.
 | --- | --- | --- |
 | `MINDBRIDGE_AML_API_KEY` | unset | Enables `POST /aml/add` and `/aml/search`. Leave off in production. |
 | `MINDBRIDGE_AML_TENANT_PREFIX` | `bench_aml` | Tenant prefix the AML harness generates under. |
+| `MINDBRIDGE_BENCH_YOUTUBE_SLEEP_SECONDS` | `30` | Wait before each YouTube download, jittered. The only knob standing between a multi-hour corpus acquisition and being cut off partway; lowering it buys very little wall clock. |
 | `MINDBRIDGE_BENCH_JUDGE_ENDPOINT` | unset | OpenAI-compatible endpoint the judge is called on. Required by the seven benchmarks whose answers are free text; `--predict-only` runs them without one. |
 | `MINDBRIDGE_BENCH_JUDGE_API_KEY` | unset | Bearer token for that endpoint. Environment-only, so a recorded invocation never carries it. |
 | `MINDBRIDGE_BENCH_JUDGE_MODEL` | `gpt-4o-2024-11-20` | Judge model, defaulting to the one lmms-eval's MM-Vet task uses. Recorded in every manifest it scores: two runs under different judges are not comparable. |

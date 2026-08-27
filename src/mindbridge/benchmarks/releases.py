@@ -26,16 +26,61 @@ to be trusted next time. The rest are covered by the pin alone -- the smoke mani
 by something other than a file name, listed under `RECORDED_DIGESTS` -- and
 `mindbridge-bench datasets` is what checks a corpus already on disk.
 
-**No media.** The releases hold videos and audio that a run cannot use as files anyway: the
-runners read prepared-media manifests naming objects already in storage, and MindBridge contains
-no clipper or uploader by design. So a media benchmark still needs that manifest produced
-out-of-band; what this saves it is the annotation download, not the preparation.
+**Media too, now that something reads it.** This table used to stop at annotations, because a
+run consumed prepared-media manifests naming objects already in storage and nothing in the tree
+could produce one. The `prepare_*` producers changed that: they cut clips from the release's own
+source files, so the source files have to be on disk, and `ensure_media` is what puts them there.
+It is deliberately unbounded -- `--tasks video-mme` on an empty corpus downloads 94 GiB of
+archives and extracts 95 GB out of them without asking -- because a size gate on an operation
+whose whole purpose is "naming a task is enough" only moves the manual step rather than removing
+it. Budget roughly twice a release's media size while archives are involved: the volumes are kept
+after extraction, since deleting them is what would make the next run download them again.
+
+Where each benchmark's media lands, relative to `--benchmarks-root`. These are the paths the
+producers build source files from, so they are the contract rather than an illustration:
+
+- `video-mme` -- `video-mme/data/<youtube_id>.mp4`, 900 files. That is the annotation's
+  `source_video_id` (the parquet's `videoID`), **not** its `video_id`, which is an ordinal.
+- `video-mme-v2` -- `video-mme-v2/videos/<nnn>.mp4`, 800 files, `001` through `800` zero-padded
+  to three digits, which is that release's `video_id` verbatim.
+- `egolife` -- `egolife/<A#_NAME>/DAY<n>/DAY<n>_<A#_NAME>_<HHMMSSFF>.mp4` for the six identities
+  `A1_JAKE`, `A2_ALICE`, `A3_TASHA`, `A4_LUCIA`, `A5_KATRINA`, `A6_SHURE`. Note the file name
+  leads with the day and the *directory* leads with the identity; the release's caption sidecars
+  under `EgoLifeCap/` use the opposite order, so a name copied from one does not open the other.
+- `egomem-reason` -- no media of its own. Its questions carry an `identity` and a `query_time`
+  naming EgoLife streams, so its producer asks for `egolife` and the two benchmarks share one
+  copy rather than each holding 477 GiB.
+- `mm-lifelong` -- `mm-lifelong/videos/day/0.mp4`, `mm-lifelong/videos/month/<n>.mp4` for 1..23,
+  and `mm-lifelong/videos/week/day<n>/DAY<n>_A1_JAKE_<HHMMSSFF>.mp4`. The week scale is EgoLife
+  A1_JAKE, re-published here byte for byte, and the release's `video_list.txt` is where its
+  videos came from rather than how to get them -- all three scales are on the Hub at the pinned
+  revision, so nothing here needs `yt-dlp`.
+- `supermemory-vqa` -- `supermemory-vqa/data/video/Person_<n>/<session>.mp4`, 82 files. The
+  release's much larger `data/mps` and `data/raw` are Aria sensor streams no runner opens.
+- `atm-bench` -- `atm-bench/data/raw_memory/image/<timestamp>.jpg` and
+  `atm-bench/data/raw_memory/video/<timestamp>.mp4`.
+- `mem-gallery` -- `mem-gallery/data/image/<topic>/<image_key>.jpg`, named relative to the
+  dialogue file that references them.
+- `m3-robot` -- `m3-bench/videos/robot/<video_id>.mp4`, 100 files. It is the one media set that
+  does not live in its benchmark's own release: the annotations are a Git repository and the
+  videos are a Hub dataset, which is why `Media` names a release rather than assuming one.
+
+**And two media sets no snapshot supplies.** `egotempo` is Ego4D, behind a signed access
+agreement no `snapshot_download` can accept; `m3-web` is 920 YouTube URLs carried in the
+annotation rather than files. Neither is in `MEDIA`, because neither is a pattern against a
+pinned repository -- they are obtained by talking to something else, which is what `ACQUIRERS`
+dispatches to. `UNOBTAINABLE` keeps the sentence saying how to do it by hand, and that sentence
+is what an operator gets when the acquisition cannot run: no Ego4D credential, no `yt-dlp`,
+no acquirer module installed at all.
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+import shutil
+import zipfile
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
+from importlib import import_module
 from pathlib import Path
 
 from mindbridge.file_integrity import sha256_file
@@ -68,6 +113,10 @@ RELEASES: dict[str, Release] = {
         "0e3e41939bd8a0b66d756e7b7eb8d5fe9992da5c",
         hub=False,
     ),
+    "m3-bench": Release("ByteDance-Seed/M3-Bench", "2672152eee36b25ccb38fdbc3b72135347adbb63"),
+    # M3-Bench is the only release here no task declares a file from: its annotations ship in the
+    # `m3-agent` Git repository above and only its videos live on the Hub. It is a release all the
+    # same, and putting its pin anywhere but this table is how the two would drift apart.
     "egotempo": Release(
         "google-research-datasets/egotempo",
         "7022ba77b4d89f51cf34e499767995ccd5c90c7a",
@@ -109,6 +158,111 @@ RELEASES: dict[str, Release] = {
         "bowen-upenn/PersonaMem-v1", "fd7c30f071d5c2ee2a211506783be222d7b6002e"
     ),
 }
+
+
+@dataclass(frozen=True, slots=True)
+class Media:
+    """One benchmark's source media: the release holding it, and which of its files those are."""
+
+    release: str
+    patterns: tuple[str, ...]
+    """Matched with `fnmatch` against repository paths, so `*` crosses `/` as the Hub client does.
+
+    A pattern ending in `.zip` names an archive to unpack rather than a file to keep, which is
+    what tells `ensure_media` the media is packaged rather than loose.
+    """
+
+
+MEDIA: dict[str, Media] = {
+    # Keyed by media set rather than by release: `m3-robot` and `m3-web` are two halves of one
+    # benchmark that are acquired in completely different ways, and only one of them is here.
+    "video-mme": Media("video-mme", ("videos_chunked_*.zip",)),
+    "video-mme-v2": Media("video-mme-v2", ("videos/*.zip",)),
+    "egolife": Media("egolife", ("A?_*/DAY*/*.mp4",)),
+    "mm-lifelong": Media("mm-lifelong", ("videos/*",)),
+    "supermemory-vqa": Media("supermemory-vqa", ("data/video/*",)),
+    "atm-bench": Media("atm-bench", ("data/raw_memory/image/*", "data/raw_memory/video/*")),
+    "mem-gallery": Media("mem-gallery", ("data/image/*",)),
+    "m3-robot": Media("m3-bench", ("videos/robot/*",)),
+}
+"""Where a producer's source files come from, for the media sets something can fetch."""
+
+
+@dataclass(frozen=True, slots=True)
+class Acquirer:
+    """One media set no pinned snapshot supplies, and the module that obtains it another way."""
+
+    release: str
+    """The directory it lands in under the corpus root, exactly as `Media.release` is."""
+    module: str
+    """Imported when it is needed, exposing `acquire(*, root, only, announce) -> None`.
+
+    Imported lazily, and by name rather than at module scope, for two reasons. An acquirer needs
+    third-party tools this package does not depend on -- `yt-dlp`, the Ego4D CLI -- so importing
+    one eagerly would make every `mindbridge-bench` invocation fail on a corpus that never asks
+    for it. And an acquirer reads the release's annotations, so it imports the adapters that
+    parse them, which import this module.
+    """
+    annotations: tuple[str, ...]
+    """The release files the acquirer reads, relative to the corpus root, fetched before it runs.
+
+    An acquirer's inputs are not files at all -- they are URLs and clip spans carried *inside* an
+    annotation -- so the annotation is a precondition rather than a convenience. `_acquire`
+    passes these through `fetch`, which is already the pinned download plus the recorded-digest
+    check, so an acquirer is handed verified bytes or the run stops. Doing it here rather than
+    trusting the caller matters: the sweep's own pre-flight covers only catalog tasks, so
+    `--suite`, a bare runner invocation, and a `--dataset` pointing somewhere else all reach a
+    producer without it. Every entry has to be a path some catalog task declares, which
+    `tests/unit/benchmarks/test_releases_media.py` asserts, since this module cannot import the
+    catalog -- the catalog imports the producers, and the producers import this.
+    """
+
+
+ACQUIRERS: dict[str, Acquirer] = {
+    "egotempo": Acquirer(
+        release="egotempo",
+        module="mindbridge.benchmarks.acquire_ego4d",
+        annotations=("egotempo/egotempo_openQA.json",),
+    ),
+    "m3-web": Acquirer(
+        release="m3-bench",
+        module="mindbridge.benchmarks.acquire_youtube",
+        annotations=("m3-agent/data/annotations/web.json",),
+    ),
+}
+"""How the two media sets `MEDIA` cannot describe are obtained.
+
+Keyed by media set, like `MEDIA`, and disjoint from it: a set is either a pattern against a
+pinned repository or an acquisition, never both, or which one you get would depend on lookup
+order. Every key here is also in `UNOBTAINABLE`, which is the fallback rather than a duplicate --
+an acquisition has prerequisites outside this program, and the sentence there is what an operator
+gets when one of them is absent.
+"""
+
+UNOBTAINABLE: dict[str, str] = {
+    "egotempo": (
+        "its videos are Ego4D, which is released under a signed access agreement no unattended "
+        "download can accept; request access at https://ego4d-data.org, fetch each question's "
+        "source_video_id with the ego4d CLI, and cut clip_start_seconds..clip_end_seconds out of "
+        "it into <benchmarks-root>/egotempo/videos/<clip_id>.mp4"
+    ),
+    "m3-web": (
+        "its 920 videos are web sources the release distributes as the video_url of each entry "
+        "in m3-agent/data/annotations/web.json rather than as files; download them yourself into "
+        "<benchmarks-root>/m3-bench/videos/web/<video_id>.mp4"
+    ),
+}
+"""How to obtain each acquired media set by hand, for when the acquisition cannot run.
+
+Named rather than omitted. A media set absent from every table is a typo in a producer and says
+so; one absent from `MEDIA` alone would be indistinguishable from a fetch that quietly found
+nothing, which is the failure this whole module is arranged to make impossible.
+
+These two used to be a refusal and nothing else. `ACQUIRERS` now runs first, so this is the
+fallback: the acquirer module is not installed, its third-party tool is not, or the credential it
+needs is not. Every sentence names the destination it would have written, because that is the
+only instruction an operator gets and a producer looks for exactly that path afterwards.
+"""
 
 RECORDED_DIGESTS: dict[str, str] = {
     # Copied from `benchmarks/manifests/dataset-adapters-smoke.json`, keyed by the file name that
@@ -179,6 +333,215 @@ def fetch(inputs: Sequence[Path], *, root: Path, announce: object = None) -> tup
     return tuple(unobtainable)
 
 
+def ensure_media(
+    release: str,
+    *,
+    root: Path,
+    only: Sequence[str] = (),
+    announce: Callable[[str], None] | None = None,
+    download: bool = True,
+) -> Path:
+    """Download and extract this media set if absent, and return the directory holding it.
+
+    The return is the release's own directory under the corpus root -- `<root>/video-mme`, and
+    `<root>/m3-bench` for `m3-robot` -- not the innermost directory the files sit in. Producers
+    join the rest themselves from the layout the module docstring fixes, because that layout is
+    per-benchmark and a caller that has to know `data/<youtube_id>.mp4` anyway gains nothing from
+    being handed `data` instead.
+
+    Idempotent, and idempotent cheaply enough to call on every run. The Hub client compares each
+    file's recorded ETag against what is already in `<destination>/.cache` and transfers nothing
+    when they agree, and extraction skips an entry whose target already exists at the archive's
+    own length. Length rather than a marker file, because interruption is the case that matters:
+    a partly-written entry is shorter than its header says and gets redone, while a `.incomplete`
+    download is simply lost -- the Hub client picks a new name for each attempt, so an interrupted
+    4 GiB volume is 4 GiB to fetch again no matter what this function does.
+
+    `only` narrows the fetch to particular repository paths, which is what keeps a `--limit 2` run
+    off the 477 GiB of EgoLife it will not read. It is refused for a media set that ships as
+    archives: a video's bytes live inside one opaque multi-gigabyte volume with no published index
+    of which, so the honest answer to "just this video" there is all of them. An acquired set
+    takes the same paths, relative to its own directory, and narrowing one is not an optimisation
+    there: `--limit 1` over `m3-web` without it is 920 YouTube downloads to cut one video.
+
+    Whether a specific unit arrived is the caller's to check. This says the media set was fetched;
+    a producer that then cannot find one video knows which video and which unit wanted it, and
+    says so far better than anything here could. Call it when the file a producer wants is absent
+    rather than before every producer: an acquired set costs the whole acquisition, so calling it
+    unconditionally would re-derive a corpus the operator had already filled in by hand.
+    """
+    acquirer = ACQUIRERS.get(release)
+    if acquirer is not None:
+        return _acquire(
+            acquirer,
+            release,
+            root=root,
+            only=only,
+            announce=announce,
+            download=download,
+        )
+    unobtainable = UNOBTAINABLE.get(release)
+    if unobtainable is not None:
+        raise FileNotFoundError(
+            f"{release} media cannot be downloaded automatically: {unobtainable}"
+        )
+    media = MEDIA.get(release)
+    if media is None:
+        known = ", ".join(sorted([*MEDIA, *UNOBTAINABLE]))
+        raise KeyError(f"no media is registered for {release!r}; the table holds {known}")
+    archived = any(pattern.endswith(".zip") for pattern in media.patterns)
+    if only and archived:
+        raise ValueError(
+            f"{release} media ships as {len(media.patterns)} archive patterns and no index says "
+            "which archive holds which file, so it cannot be narrowed to "
+            f"{', '.join(only)}; call ensure_media without `only`"
+        )
+    source = RELEASES[media.release]
+    patterns = tuple(only) or media.patterns
+    destination = root / media.release
+    if not download:
+        # `--no-download` reaches preparation as well as the pre-flight over annotations. A
+        # producer only ever calls this because a file it wants is already missing, so there is
+        # nothing to do but refuse -- and refusing is what keeps the flag honest now that naming
+        # a media task can pull 94 GiB behind 40 MB of annotations the pre-flight did govern.
+        raise ValueError(
+            f"{release} media is absent under {destination} and --no-download was given; "
+            "drop the flag to fetch what the official release supplies"
+        )
+    if announce is not None:
+        # Counted rather than listed past a handful: a producer narrowing to the exact files it
+        # is missing passes one pattern per file, and ATM-Bench on an empty corpus is 4,292 of
+        # them -- listing those is 180 KB of one line, which buries the progress it precedes.
+        # "patterns" rather than "paths" because a narrowed fetch is not one file per entry
+        # either way: EgoMemReason asks for 42 globs and gets 32,001 videos.
+        listed = ", ".join(patterns) if len(patterns) <= 4 else f"{len(patterns)} patterns"
+        announce(
+            f"fetching {release} media from {source.repository}@{source.revision[:12]}: {listed}"
+        )
+    _download_from_hub(source, patterns, destination=destination)
+    for pattern in patterns:
+        if pattern.endswith(".zip"):
+            for archive in sorted(destination.glob(pattern)):
+                _extract(archive, announce=announce)
+    return destination
+
+
+def _acquire(
+    acquirer: Acquirer,
+    release: str,
+    *,
+    root: Path,
+    only: Sequence[str],
+    announce: Callable[[str], None] | None,
+    download: bool,
+) -> Path:
+    """Obtain one media set by talking to something other than the release, and say where it went.
+
+    Three things happen in this order, and the order is the contract:
+
+    **Refuse first.** `--no-download` means this program does not go and get bytes, and an
+    acquisition is the largest way it could -- 920 YouTube videos, or every Ego4D clip a split
+    names. Refused before the import so the flag holds even where the acquirer is not installed.
+
+    The refusal carries the manual instruction as well as the flag, which is the one place two
+    blocking facts are true at once and only one of them is knowable. The flag is certain: it
+    forbids this. Whether dropping it would be enough is not, and cannot be without probing for
+    an Ego4D signature, which is exactly what `--no-download` says not to do. Naming the flag
+    alone would imply that dropping it is sufficient and send an operator with no signature down
+    a dead end; naming the wall alone would send one who has the CLI and the credential off to
+    download 920 videos by hand that this program would have fetched for them. So both.
+
+    **Then the annotations.** An acquirer's inputs are inside a release file: the URL of each
+    `m3-web` video and the span of each EgoTempo clip. `fetch` is what puts that file on disk,
+    pinned and checked against its recorded digest, and it does nothing when the file is already
+    there. The sweep's own pre-flight does this too, for catalog tasks -- but only for the path in
+    argv, while an acquirer opens the path it derives itself, so `--suite`, a bare runner
+    invocation, and a `--dataset` pointing elsewhere all arrive here without it.
+
+    **Then the module.** Imported by name so that a corpus which never asks for these two sets
+    never needs `yt-dlp`, an Ego4D credential, or the module at all. An `ImportError` is not a
+    broken build, it is the ordinary case of a prerequisite this package does not depend on, so it
+    falls back to the sentence `UNOBTAINABLE` keeps for exactly that -- as does a failure inside
+    the acquisition itself, which is where a missing credential or a dead URL surfaces. Both chain
+    the original, so `MINDBRIDGE_TRACEBACK=1` still shows what actually went wrong. `Exception`
+    rather than `BaseException`: an interrupt during a long acquisition has to reach
+    `suite._run_task_prepared`, which turns it into an outcome and still writes the summary.
+    """
+    destination = root / acquirer.release
+    if not download:
+        raise FileNotFoundError(
+            f"{release} media is absent under {destination} and --no-download was given, so "
+            f"nothing here will go and get it. Dropping the flag acquires it, which needs: "
+            f"{UNOBTAINABLE[release]}"
+        )
+    unsupplied = fetch(
+        [root / name for name in acquirer.annotations],
+        root=root,
+        announce=announce,
+    )
+    if unsupplied:
+        raise FileNotFoundError(
+            f"{release} acquisition reads {', '.join(str(path) for path in unsupplied)}, which no "
+            "release in this table supplies; ACQUIRERS names the wrong annotation"
+        )
+    if announce is not None:
+        listed = ", ".join(only) if 0 < len(only) <= 4 else f"{len(only) or 'every'} unit"
+        announce(f"acquiring {release} media with {acquirer.module}: {listed}")
+    try:
+        module = import_module(acquirer.module)
+        module.acquire(root=root, only=tuple(only), announce=announce)
+    except ImportError as error:
+        # One try around both, because an acquirer's third-party tool is not necessarily imported
+        # at its module scope: the Ego4D one imports the `ego4d` CLI inside `acquire`, after it has
+        # checked whether the corpus is already cut, so an install that lacks it raises from the
+        # call rather than from the import. Catching it only around the import put the ordinary
+        # missing-prerequisite case in the generic arm below.
+        raise FileNotFoundError(
+            f"{release} media cannot be acquired here ({error}): {UNOBTAINABLE[release]}"
+        ) from error
+    except Exception as error:
+        raise FileNotFoundError(
+            f"{release} media could not be acquired ({error!r}): {UNOBTAINABLE[release]}"
+        ) from error
+    return destination
+
+
+def _extract(archive: Path, *, announce: Callable[[str], None] | None) -> None:
+    """Unpack one archive beside itself, leaving entries that are already there alone.
+
+    Beside itself rather than into a fixed directory because both releases that need this put the
+    structure they want in one place or the other: Video-MME's volumes sit at the repository root
+    and name their entries `data/<id>.mp4`, Video-MME-v2's sit in `videos/` and name theirs
+    `<id>.mp4`, and unpacking each into its own parent is what turns both into the layout the
+    module docstring documents.
+
+    Directory entries are skipped rather than written. Neither archived release has one today --
+    both volumes' central directories hold only files -- but the same publisher's `subtitle.zip`
+    in the Video-MME repository does, and unpacking one writes an empty file where a directory
+    belongs, so the entry after it cannot create its parent and a 94 GiB extraction dies partway
+    through with `FileExistsError`.
+    """
+    root = archive.parent.resolve()
+    with zipfile.ZipFile(archive) as volume:
+        entries = [entry for entry in volume.infolist() if not entry.is_dir()]
+        pending = []
+        for entry in entries:
+            target = archive.parent / entry.filename
+            if not target.resolve().is_relative_to(root):
+                raise ValueError(f"{archive} holds {entry.filename}, which escapes {root}")
+            if target.exists() and target.stat().st_size == entry.file_size:
+                continue
+            pending.append((entry, target))
+        if not pending:
+            return
+        if announce is not None:
+            announce(f"extracting {len(pending)} of {len(entries)} files from {archive.name}")
+        for entry, target in pending:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with volume.open(entry) as reading, target.open("wb") as writing:
+                shutil.copyfileobj(reading, writing, _CHUNK_BYTES)
+
+
 def _fetch_release(
     name: str,
     members: Sequence[tuple[str, Path]],
@@ -229,13 +592,29 @@ def _download_from_hub(release: Release, patterns: Sequence[str], *, destination
             "downloading an official release needs huggingface-hub; "
             "install it with `uv sync --extra benchmarks`"
         ) from error
-    snapshot_download(
-        repo_id=release.repository,
-        repo_type="dataset",
-        revision=release.revision,
-        allow_patterns=list(patterns),
-        local_dir=str(destination),
-    )
+    from huggingface_hub.errors import GatedRepoError
+
+    try:
+        snapshot_download(
+            repo_id=release.repository,
+            repo_type="dataset",
+            revision=release.revision,
+            allow_patterns=list(patterns),
+            local_dir=str(destination),
+        )
+    except GatedRepoError as error:
+        # A gated release is the one download failure whose fix is entirely outside this program,
+        # so the message is the whole of the user experience. No token is read or stored here:
+        # `huggingface_hub` already resolves `HF_TOKEN` and the login file itself, and giving the
+        # same credential a second MindBridge-specific name would only add a place to set it
+        # wrongly. Caught before `RepositoryNotFoundError`, which it subclasses -- the other order
+        # reports a dataset the user can see as one that does not exist.
+        raise PermissionError(
+            f"{release.repository} is a gated dataset and this machine is not authorised for it. "
+            f"Accept its terms at https://huggingface.co/datasets/{release.repository}, then "
+            "authorise this machine with `hf auth login` or by exporting HF_TOKEN. Nothing else "
+            "about the run changes; re-run the same command."
+        ) from error
 
 
 def _download_from_git(release: Release, within: str, *, destination: Path) -> None:

@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from mindbridge.benchmarks.prepare import PREPARERS
-from mindbridge.benchmarks.releases import missing_inputs, release_for
+from mindbridge.benchmarks.releases import ACQUIRERS, missing_inputs, release_for
 
 DEFAULT_BENCHMARKS_ROOT = Path(".benchmarks")
 """Where `docs/benchmarking.md` downloads every official release to."""
@@ -77,11 +77,7 @@ def _memlens(window: str) -> CatalogTask:
 
 
 def _atm(split: str, *, media_source: str) -> CatalogTask:
-    archive = (
-        ("--media-source", "sgm")
-        if media_source == "sgm"
-        else ("--media-source", "raw", "--prepared-media", f"{ROOT}/atm-prepared-media.json")
-    )
+    archive = ("--media-source", "sgm") if media_source == "sgm" else ("--media-source", "raw")
     release = "atm-bench.json" if split == "main" else f"atm-bench-{split}.json"
     return CatalogTask(
         "atm",
@@ -158,8 +154,6 @@ def _mm_lifelong(split: str, release: str) -> CatalogTask:
         (
             "--dataset",
             f"{ROOT}/mm-lifelong/{release}.json",
-            "--prepared-media",
-            f"{ROOT}/mm-lifelong-{split.replace('_', '-')}-prepared.json",
             "--split",
             split,
         ),
@@ -178,8 +172,6 @@ TASKS: dict[str, CatalogTask] = {
         (
             "--dataset",
             f"{ROOT}/egolife/EgoLifeQA/EgoLifeQA_A1_JAKE.json",
-            "--prepared-media",
-            f"{ROOT}/egolife-prepared-a1.json",
         ),
         output_suffix=".json",
     ),
@@ -188,8 +180,6 @@ TASKS: dict[str, CatalogTask] = {
         (
             "--dataset",
             f"{ROOT}/egomem-reason/annotations_public.jsonl",
-            "--prepared-media",
-            f"{ROOT}/egomem-prepared.json",
         ),
         output_suffix=".json",
     ),
@@ -198,8 +188,6 @@ TASKS: dict[str, CatalogTask] = {
         (
             "--dataset",
             f"{ROOT}/egotempo/egotempo_openQA.json",
-            "--prepared-media",
-            f"{ROOT}/egotempo-prepared.json",
         ),
         output_suffix=".json",
     ),
@@ -228,8 +216,6 @@ TASKS: dict[str, CatalogTask] = {
         (
             "--dataset",
             f"{ROOT}/supermemory-vqa/data/json/all_qa.json",
-            "--prepared-media",
-            f"{ROOT}/supermemory-prepared-person-1.json",
             "--subject",
             "1",
         ),
@@ -240,8 +226,6 @@ TASKS: dict[str, CatalogTask] = {
         (
             "--dataset",
             f"{ROOT}/video-mme/videomme/test-00000-of-00001.parquet",
-            "--prepared-media",
-            f"{ROOT}/video-mme-prepared.json",
             "--transcript-source",
             "none",
         ),
@@ -252,8 +236,6 @@ TASKS: dict[str, CatalogTask] = {
         (
             "--dataset",
             f"{ROOT}/video-mme-v2/test.parquet",
-            "--prepared-media",
-            f"{ROOT}/video-mme-v2-prepared.json",
             "--transcript-source",
             "none",
         ),
@@ -345,9 +327,15 @@ def task_inputs(names: Sequence[str], *, root: Path) -> dict[str, tuple[Path, ..
 def listing(*, root: Path) -> str:
     """Render every name `--tasks` accepts, and what obtaining it would still take.
 
-    Four states, because they call for four different things: `ready` runs now, `download` runs
-    after a fetch the sweep performs itself, `prepare` after it also stages the media, and a
-    named path is a manifest with no producer yet, which has to be made out-of-band.
+    The stages are named in the order the sweep performs them, because they call for different
+    things: `ready` runs now, `download` is a fetch of the official release the sweep performs
+    itself, `acquire` is media that comes from outside the release and may need a prerequisite
+    this machine does not hold, `prepare` is the staging, and a named path is a manifest with no
+    producer yet, which has to be made out-of-band.
+
+    Side-effect-free and fast on purpose. Nothing here downloads, imports an acquirer, or asks
+    whether a credential is present -- `--list-tasks` is what an operator runs *before* deciding
+    to spend an evening, so it reads the tables and the filesystem and nothing else.
     """
     lines = [f"groups (--tasks expands these), inputs resolved against {root}:"]
     lines += [f"  {name:<24}{', '.join(members)}" for name, members in GROUPS.items()]
@@ -360,13 +348,48 @@ def listing(*, root: Path) -> str:
 def _state(task: CatalogTask, *, root: Path) -> str:
     """Say what stands between this task and a run."""
     absent = missing_inputs(task.inputs(root=root))
-    if task.benchmark in PREPARERS:
+    producer = PREPARERS.get(task.benchmark)
+    # `applies` is asked here for the same reason the sweep asks it: a producer is registered per
+    # benchmark, and ATM-Bench's `sgm` arms are the one case where that is coarser than the truth.
+    # Reporting `prepare` for them would promise a staging the sweep then correctly declines --
+    # the listing exists to say what a run will do, so it has to agree with what a run does.
+    if producer is not None and (producer.applies is None or producer.applies(task.arguments)):
         # Its manifest is written per run into the sweep's own output directory, so there is no
         # file here to find or to have gone stale: what it needs is the staging, every time.
-        return "prepare" if not absent else "download, prepare"
+        # `acquire` is called out separately because the difference is the operator's to plan
+        # for: a download the sweep performs is a matter of time and disk, while EgoTempo's
+        # videos are Ego4D behind a signature this machine may not hold and M3-Bench's web half
+        # is 920 live URLs. Promising `download, prepare` for those and then failing minutes into
+        # a sweep is the surprise this listing exists to remove.
+        stages = ("download",) if absent else ()
+        if _acquired_media(task) is not None:
+            stages = (*stages, "acquire")
+        return ", ".join((*stages, "prepare"))
     if not absent:
         return "ready"
     unobtainable = tuple(path for path in absent if release_for(path, root=root) is None)
     if unobtainable:
         return f"needs {', '.join(str(path) for path in unobtainable)}"
     return "download"
+
+
+def _acquired_media(task: CatalogTask) -> str | None:
+    """The acquired media set preparing this task would ask for, or None if it asks for none.
+
+    Derived from the task rather than declared beside the producer, because the mapping already
+    exists in the producers' own calls: a media set is named for its benchmark, or for its
+    benchmark and the argument that partitions it -- `ensure_media(f"m3-{subset}")` is the only
+    case of the second, and `--subset web` is that argument, sitting right there in the argv.
+    A second declaration would say the same thing in a place that can disagree with `ACQUIRERS`.
+
+    Sound rather than clever: the only keys it can match are the ones `ACQUIRERS` holds, so a
+    false positive would need a benchmark called `egotempo` or a task passing the literal `web`
+    to the `m3` runner, which are the two right answers.
+
+    ponytail: string join over the task's own arguments, for a table with two rows. A third
+    acquired set whose name does not follow that convention turns
+    `test_every_acquired_media_set_is_labelled_by_the_task_that_needs_it` red rather than going
+    silently unlabelled; declare it on `Producer` if that ever happens.
+    """
+    candidates = (task.benchmark, *(f"{task.benchmark}-{value}" for value in task.arguments))
+    return next((name for name in candidates if name in ACQUIRERS), None)

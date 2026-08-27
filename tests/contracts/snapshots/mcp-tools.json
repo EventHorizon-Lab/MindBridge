@@ -1007,7 +1007,7 @@
               "type": "integer"
             },
             "uri": {
-              "description": "Where the bytes already live, as `s3://<bucket>/tenants/<tenant_id>/<key>`. MindBridge reads this object; it does not accept an upload.",
+              "description": "Where the bytes already live, as `s3://<bucket>/tenants/<tenant_id>/<key>`. MindBridge reads this object; no request body ever carries the bytes themselves. For a file that is not stored yet, ask `createMediaUpload` for a short-lived signed PUT, send the bytes there, and name the `uri` it answers with.",
               "maxLength": 2048,
               "minLength": 1,
               "title": "Uri",

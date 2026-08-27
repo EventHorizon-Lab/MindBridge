@@ -7,6 +7,7 @@ import pytest
 
 from mindbridge.application.evidence_clips import (
     CLIP_RECLAIM_GRACE_SECONDS,
+    MAX_PROXY_RESIDENT_FRAMES,
     ClipSampling,
     derive_evidence_clips,
     generation_proxies,
@@ -940,10 +941,15 @@ async def test_the_shrink_check_measures_the_source_it_actually_read() -> None:
         assert resolved[0].media_url != "https://objects.example.test/media_video_01.mp4"
 
 
-async def test_a_span_too_long_to_encode_is_skipped_before_it_is_read() -> None:
-    """The muxer ceiling is a frame count, so frames_per_second decides it as much as span
-    length. Paying a full source read and a doomed encode per observation is the whole cost the
-    proxy exists to remove."""
+async def test_a_long_span_is_proxied_rather_than_skipped_for_its_frame_count() -> None:
+    """No frame count skips a proxy any more, and this is what stops the check coming back.
+
+    A 30 s span at 4 fps samples 120 frames. That used to be refused before the source was even
+    read, because the encode raised `[Errno 22] Invalid argument` past ~43 frames -- a defect in
+    how `media/clipping.py` stamped frame timestamps, not a limit of the encoder or the muxer.
+    With it fixed the frame count bounds nothing, so the span has to be read and proxied like
+    any other: `no_smaller_than_source` is the only thing left that declines one.
+    """
     store = RecordingStore()
 
     async with generation_proxies(
@@ -954,8 +960,8 @@ async def test_a_span_too_long_to_encode_is_skipped_before_it_is_read() -> None:
         cut=_shrinking_cut,
         scope="job_01:1",
     ) as resolved:
-        assert resolved[0].media_url == "https://objects.example.test/media_video_01.mp4"
-    assert store.reads == 0
+        assert resolved[0].media_url != "https://objects.example.test/media_video_01.mp4"
+    assert store.reads == 1
 
 
 async def test_the_embedder_is_told_the_sampling_its_clip_was_cut_at() -> None:
@@ -1138,24 +1144,6 @@ async def test_the_generation_proxy_gets_the_same_floor_as_the_stored_clip() -> 
     assert [(item.start_ms, item.end_ms) for item in requests] == [(4_200, 6_200)]
 
 
-async def test_widening_cannot_push_a_proxy_past_the_frame_ceiling() -> None:
-    """The two bounds have to compose: the ceiling is checked against the window that will
-    actually be cut, not the span that was asked for."""
-    store = RecordingStore()
-
-    async with generation_proxies(
-        TENANT_ID,
-        (_video_evidence("evidence_video_01", 39_900, 40_000),),
-        store=store,
-        sampling=ClipSampling(frames_per_second=1.0),
-        cut=_shrinking_cut,
-        scope="job_01:1",
-    ) as resolved:
-        # 100 ms asked for, 2 s cut, still far below the 40-frame ceiling.
-        assert resolved[0].media_url != "https://objects.example.test/media_video_01.mp4"
-    assert store.reads == 1
-
-
 async def test_a_frame_rate_below_the_floor_samples_faster_instead_of_reaching_further() -> None:
     """The floor is two frames, and two frames is a count, not a length of tape.
 
@@ -1246,3 +1234,71 @@ def test_a_clip_is_never_swept_while_its_attempt_could_still_be_running() -> Non
     related in prose.
     """
     assert CLIP_RECLAIM_GRACE_SECONDS > OBSERVATION_JOB_STALE_AFTER_SECONDS > 0
+
+
+LONG_VIDEO_SOURCE = MediaObject(
+    media_object_id=MediaObjectId("media_video_long"),
+    tenant_id=TENANT_ID,
+    kind=MediaKind.VIDEO,
+    uri="s3://memory/tenants/tenant_01/media_video_long.mp4",
+    sha256="c" * 64,
+    size_bytes=4_000_000_000,
+    created_at=NOW,
+    duration_ms=1_800_000,
+)
+
+
+async def test_a_span_too_large_to_hold_in_memory_is_skipped_before_the_source_is_read(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The proxy window is min(start)..max(end) over one source, so it can be the whole recording.
+
+    `_sample_video_frames` accumulates every reformatted frame in one list. At the default
+    max-pixels cap a yuv420p frame is 0.30 MB, so a 30-minute recording is 0.54 GB at the 1 fps
+    default and 10.8 GB at the 20 fps configuration still allows -- inside the Worker that also
+    holds the source bytes and the embedder. Two events at opposite ends of one recording are
+    all it takes.
+
+    Checked before the read, so a doomed span costs neither the download nor the decode.
+    """
+    store = RecordingStore()
+
+    with caplog.at_level("WARNING", logger="mindbridge.application.evidence_clips"):
+        async with generation_proxies(
+            TENANT_ID,
+            (
+                _video_evidence("evidence_video_01", 0, 1_000, media=LONG_VIDEO_SOURCE),
+                _video_evidence("evidence_video_02", 1_799_000, 1_800_000, media=LONG_VIDEO_SOURCE),
+            ),
+            store=store,
+            sampling=ClipSampling(),
+            cut=_shrinking_cut,
+            scope="job_01:1",
+        ) as resolved:
+            pass
+
+    # Not read, not decoded, not uploaded -- the point of checking before the read.
+    assert store.reads == 0
+    assert store.uploaded == {}
+    # And perception still runs, on the untouched source.
+    assert resolved[0].media_url == "https://objects.example.test/media_video_long.mp4"
+    (record,) = caplog.records
+    assert record.mindbridge_fields["reason"] == "span_exceeds_resident_frame_budget"  # type: ignore[attr-defined]
+    assert record.mindbridge_fields["frames"] > MAX_PROXY_RESIDENT_FRAMES  # type: ignore[attr-defined]
+
+
+async def test_a_span_within_the_budget_still_cuts_a_proxy() -> None:
+    """The bound must not be so tight that ordinary evidence stops getting a proxy."""
+    store = RecordingStore()
+
+    async with generation_proxies(
+        TENANT_ID,
+        (_video_evidence("evidence_video_01", 0, 30_000),),
+        store=store,
+        sampling=ClipSampling(),
+        cut=_shrinking_cut,
+        scope="job_01:1",
+    ) as resolved:
+        assert store.reads == 1
+        assert len(store.uploaded) == 1
+        assert resolved[0].media_url != "https://objects.example.test/media_video_01.mp4"

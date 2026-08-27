@@ -680,3 +680,23 @@ def index_prepared(
         formatted = ", ".join(str(item) for item in sorted(missing))
         raise ValueError(f"missing prepared {label}: {formatted}")
     return by_key
+
+
+def flag_value(arguments: Sequence[str], flag: str) -> str | None:
+    """The value argparse would take for `flag`, in either spelling, or None if it is absent.
+
+    `flag in arguments` misses `--flag=value`, which argparse accepts and which the sweep's own
+    owned-flag check already splits on. Missing it meant a `--suite` entry spelled that way was
+    read as not carrying the flag, so the sweep appended its own derived path, argparse took the
+    later occurrence, and the operator's hand-supplied manifest was silently discarded.
+    """
+    value: str | None = None
+    for index, argument in enumerate(arguments):
+        name, separator, inline = argument.partition("=")
+        if name != flag:
+            continue
+        if separator:
+            value = inline
+        elif index + 1 < len(arguments):
+            value = arguments[index + 1]
+    return value
