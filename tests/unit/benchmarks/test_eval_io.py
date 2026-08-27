@@ -11,10 +11,11 @@ from pathlib import Path
 import pytest
 
 from mindbridge.benchmarks.download import acquire_media
-from mindbridge.benchmarks.eval_adapters import MediaResolver
+from mindbridge.benchmarks.eval_adapters import MediaResolver, load_task
 from mindbridge.benchmarks.eval_cache import CachedAnswer, ResponseCache
 from mindbridge.benchmarks.prepare_media import (
     _lifelong_manifest,
+    _m3_manifest,
     _segment_video,
     _selected_patterns,
 )
@@ -68,6 +69,93 @@ def test_release_media_paths_cannot_escape_the_media_root(tmp_path: Path) -> Non
 
     with pytest.raises(FileNotFoundError, match="media not found"):
         MediaResolver("fixture", media, None, None).path(str(outside))
+
+
+def test_m3_timestamp_drives_preparation_without_before_clip(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    dataset = tmp_path / "robot.json"
+    dataset.write_text(
+        json.dumps(
+            {
+                "room": {
+                    "video_path": "room.mp4",
+                    "qa_list": [
+                        {
+                            "question": "Where?",
+                            "answer": "There.",
+                            "question_id": "q1",
+                            "type": ["recall"],
+                            "timestamp": "00:10",
+                        }
+                    ],
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    media = tmp_path / "media"
+    media.mkdir()
+    (media / "room.mp4").write_bytes(b"video")
+    observed: list[float] = []
+
+    monkeypatch.setattr("mindbridge.benchmarks.prepare_media._duration", lambda _path: 60.0)
+
+    def segment(
+        _source: Path, boundaries: tuple[float, ...], cache: Path, _announce: object
+    ) -> tuple[tuple[float, float, Path], ...]:
+        observed.extend(boundaries)
+        return ((0.0, boundaries[-1], cache / "segment.mp4"),)
+
+    monkeypatch.setattr("mindbridge.benchmarks.prepare_media._segment_video", segment)
+    _m3_manifest(dataset, media, tmp_path / "cache", None, 0, None)
+
+    assert observed == [10.0]
+
+
+def test_evaluation_digest_tracks_media_root_content(tmp_path: Path) -> None:
+    dataset = tmp_path / "robot.json"
+    dataset.write_text(
+        json.dumps(
+            {
+                "room": {
+                    "video_path": "room.mp4",
+                    "qa_list": [
+                        {
+                            "question": "Where?",
+                            "answer": "There.",
+                            "question_id": "q1",
+                            "type": ["recall"],
+                        }
+                    ],
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    media = tmp_path / "media"
+    media.mkdir()
+    video = media / "room.mp4"
+    video.write_bytes(b"first video")
+    spec = TASKS["m3-bench-robot"]
+    first = load_task(
+        spec,
+        root=tmp_path,
+        dataset_path=dataset,
+        media_root=media,
+        verify_digest=False,
+    )
+
+    video.write_bytes(b"second video")
+    second = load_task(
+        spec,
+        root=tmp_path,
+        dataset_path=dataset,
+        media_root=media,
+        verify_digest=False,
+    )
+
+    assert first.evaluation_sha256 != second.evaluation_sha256
 
 
 def test_response_cache_merges_run_shards_into_the_shared_cache(tmp_path: Path) -> None:

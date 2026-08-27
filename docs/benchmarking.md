@@ -127,8 +127,8 @@ transport and its 64 MiB per-request safety limit, making prepared clips importa
 
 ## Reproducibility and result trust
 
-An evaluation fixes and records the dataset repository, revision, annotation/auxiliary/manifest
-digests, adapter version,
+An evaluation fixes and records the dataset repository, revision, annotation, auxiliary,
+manifest, and resolved-memory digests, adapter version,
 MindBridge/Zvec/Python versions, generation model and endpoint, pinned Jina revision, batch sizes,
 retrieval limit, and seed. Generation requests use the run seed and temperature `0`. The endpoint
 must support OpenAI-compatible `seed` and `temperature` fields; model providers can still change

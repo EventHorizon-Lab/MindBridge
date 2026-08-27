@@ -219,12 +219,7 @@ def _m3_manifest(
     units: dict[str, list[dict[str, object]]] = {}
     for video in _selected(load_m3_bench(dataset), limit, offset):
         source = _find_media(media_root, video.video_path, f"{video.video_id}.mp4")
-        cutoffs = tuple(
-            float((question.before_clip_index + 1) * _SEGMENT_SECONDS)
-            if question.before_clip_index is not None
-            else None
-            for question in video.questions
-        )
+        cutoffs = tuple(question.cutoff_seconds for question in video.questions)
         duration = _duration(source)
         causal_cutoffs = tuple(value for value in cutoffs if value is not None)
         horizon = (

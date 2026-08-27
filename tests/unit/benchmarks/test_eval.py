@@ -163,7 +163,6 @@ def test_causal_task_requires_timestamped_prepared_media(tmp_path: Path) -> None
                             "question_id": "q1",
                             "type": ["recall"],
                             "timestamp": "00:10",
-                            "before_clip": 0,
                         }
                     ],
                 },
@@ -221,8 +220,9 @@ def test_causal_task_requires_timestamped_prepared_media(tmp_path: Path) -> None
         verify_digest=False,
     )
     assert loaded.units[0].memories[0].end_seconds == 9
-    assert loaded.units[0].questions[0].cutoff_seconds == 30
+    assert loaded.units[0].questions[0].cutoff_seconds == 10
     assert "media_manifest" in loaded.input_sha256
+    assert "memory" in loaded.input_sha256
 
 
 def test_egotempo_limit_counts_questions_not_shared_video_units(tmp_path: Path) -> None:

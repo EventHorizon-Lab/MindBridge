@@ -962,8 +962,7 @@ def test_generation_never_silently_drops_visual_evidence(tmp_path: Path) -> None
 def test_memory_rejects_oversized_and_recursive_input_before_model_work(tmp_path: Path) -> None:
     models = _FakeModels()
     nested: dict[str, object] = {}
-    for _depth in range(1_100):
-        nested = {"nested": nested}
+    nested["nested"] = nested
 
     with Memory(tmp_path, _config(), models=models) as memory:
         with pytest.raises(ValidationError, match="65536"):

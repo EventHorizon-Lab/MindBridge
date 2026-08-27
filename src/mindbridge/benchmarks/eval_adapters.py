@@ -371,6 +371,7 @@ def load_task(
             separators=(",", ":"),
         ).encode()
         inputs["media_manifest"] = hashlib.sha256(encoded).hexdigest()
+    inputs["memory"] = _memory_digest(units)
     return LoadedTask(spec, dataset, digest, units, inputs)
 
 
@@ -387,6 +388,36 @@ def dataset_digest(path: Path) -> str:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _memory_digest(units: Sequence[EvalUnit]) -> str:
+    file_digests: dict[Path, str] = {}
+
+    def identity(value: str | Path) -> tuple[str, ...]:
+        if isinstance(value, str):
+            return ("text", hashlib.sha256(value.encode("utf-8")).hexdigest())
+        path = value.resolve()
+        if path not in file_digests:
+            file_digests[path] = dataset_digest(path)
+        return ("file", path.name, file_digests[path])
+
+    payload = tuple(
+        (
+            unit.unit_id,
+            tuple(
+                (
+                    memory.source_id,
+                    memory.start_seconds,
+                    memory.end_seconds,
+                    tuple(identity(content) for content in memory.content),
+                )
+                for memory in unit.memories
+            ),
+        )
+        for unit in units
+    )
+    encoded = json.dumps(payload, allow_nan=False, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _locomo(
@@ -450,11 +481,7 @@ def _m3(
                 question.question_id,
                 (_free_text_prompt(question.question),),
                 (question.reference_answer,),
-                cutoff_seconds=(
-                    float((question.before_clip_index + 1) * 30)
-                    if question.before_clip_index is not None
-                    else None
-                ),
+                cutoff_seconds=question.cutoff_seconds,
                 metadata={"question_types": question.question_types},
             )
             for question in video.questions

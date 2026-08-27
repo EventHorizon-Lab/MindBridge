@@ -21,6 +21,13 @@ class M3BenchQuestion(ContractModel):
     timestamp_seconds: int | None = Field(default=None, ge=0)
     before_clip_index: int | None = Field(default=None, ge=0)
 
+    @property
+    def cutoff_seconds(self) -> int | None:
+        """Return the official causal boundary, preferring its clip index when present."""
+        if self.before_clip_index is not None:
+            return (self.before_clip_index + 1) * 30
+        return self.timestamp_seconds
+
 
 class M3BenchVideo(ContractModel):
     """One long-video source and all questions evaluated against its memory."""
