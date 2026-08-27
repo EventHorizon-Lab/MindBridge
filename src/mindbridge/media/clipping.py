@@ -416,11 +416,17 @@ def _sample_video_frames(source: bytes, request: ClipRequest) -> list[Any]:
     next_sample_seconds = start_seconds
     with av.open(io.BytesIO(source)) as container:
         stream = container.streams.video[0]
-        # Single-threaded on purpose. FFmpeg frame threading intermittently deadlocks against
-        # the OpenMP runtime torchvision loads, and the Worker cuts clips in the same process as
-        # the local embedder, so AUTO hung raw-media jobs until their Celery time limit. It
-        # reproduced roughly one run in three, which is why the cheap fix is to not start the
-        # pool at all rather than to order the imports.
+        # Single-threaded on purpose. AUTO hung raw-media jobs in the Worker until their Celery
+        # time limit, roughly one run in three, and not starting the pool at all was cheaper than
+        # chasing the interaction. What that interaction is has never been established: the
+        # original note here blamed the OpenMP runtime torchvision loads, because the Worker cuts
+        # clips in the same process as the local embedder, but nobody caught that hang in the act
+        # and no dump was kept. A later hang of the same shape in `tests/unit` -- 33 threads in
+        # the pytest child -- was dumped live and had libx264 mapped with no libgomp, libiomp5 or
+        # libtorch_cpu anywhere in the process, so OpenMP cannot be the mechanism for that one.
+        # (The 98 in the first note counted a process that had imported numpy, where 32 of them
+        # are OpenBLAS's pool, idle from import; it is not encoders accumulating.)
+        # Treat the pin as a measure that works, not as evidence for a cause.
         # This is not free: a 30s 720p source decodes in 1.7s here against 0.35s with AUTO, and
         # the gap widens with resolution.
         stream.thread_type = "NONE"
