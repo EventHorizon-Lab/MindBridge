@@ -41,6 +41,7 @@ from mindbridge.types import (
 
 _MAX_TEXT_CHARACTERS = 65_536
 _MAX_REQUEST_BODY_BYTES = 8 * 1024 * 1024
+_MAX_INLINE_MEDIA_BYTES = 8 * 1024 * 1024
 _Text = Annotated[
     str,
     StringConstraints(
@@ -241,7 +242,7 @@ class _RequestGate:
     async def __call__(  # noqa: C901 - the request gate is clearest as one linear check
         self, scope: Scope, receive: Receive, send: Send
     ) -> None:
-        if scope["type"] != "http" or not _is_api_path(str(scope.get("path", ""))):
+        if scope["type"] != "http" or not _is_api_path(_application_path(scope)):
             await self.app(scope, receive, send)
             return
 
@@ -527,10 +528,18 @@ def _decode_data_url(value: str) -> tuple[str, bytes]:
 
 
 def _decode_base64(value: str) -> bytes:
+    # The same documented field must accept the same size here as over MCP, and this bound
+    # must not depend on the request-body middleware having matched the path.
+    maximum_encoded = 4 * ((_MAX_INLINE_MEDIA_BYTES + 2) // 3)
+    if len(value) > maximum_encoded:
+        raise ValueError(f"inline media must not exceed {_MAX_INLINE_MEDIA_BYTES} bytes")
     try:
-        return base64.b64decode(value, validate=True)
+        data = base64.b64decode(value, validate=True)
     except (binascii.Error, ValueError) as error:
         raise ValueError("file_data must be valid base64") from error
+    if len(data) > _MAX_INLINE_MEDIA_BYTES:
+        raise ValueError(f"inline media must not exceed {_MAX_INLINE_MEDIA_BYTES} bytes")
+    return data
 
 
 def _headers(scope: Scope) -> list[tuple[bytes, bytes]]:
@@ -551,6 +560,19 @@ def _content_length(headers: Sequence[tuple[bytes, bytes]]) -> int | None:
     except ValueError:
         return None
     return value if value >= 0 else None
+
+
+def _application_path(scope: Scope) -> str:
+    """Return the path the router will match, independent of any mount or proxy prefix.
+
+    The raw ASGI ``path`` includes ``root_path``, so comparing it against ``/v1`` would skip
+    the gate entirely behind ``--root-path`` and drop the request-body bound with it.
+    """
+    path = str(scope.get("path", ""))
+    root_path = str(scope.get("root_path", ""))
+    if root_path and path.startswith(root_path):
+        return path[len(root_path) :] or "/"
+    return path
 
 
 def _is_api_path(path: str) -> bool:

@@ -228,6 +228,9 @@ class _LoadedJinaOmniEmbedder(SentenceTransformersEmbedder):
                 )
             )
         if media:
+            # No manual prefix here: `super().embed` dispatches to the encoder's own
+            # `encode_query` / `encode_document`, which apply the asymmetry themselves. Only
+            # the raw `_text_encode` path above has to spell the instruction out.
             media_vectors = super().embed(
                 tuple(value for _, value in media),
                 selected_task,

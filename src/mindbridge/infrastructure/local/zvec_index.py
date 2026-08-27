@@ -251,11 +251,20 @@ class ZvecIndex:
         collection = cast(Any, self._require_collection())
         collection.destroy()
         self._collection = None
-        self._collection = self._zvec.create_and_open(
-            str(self.path),
-            schema=self._schema,
-            option=self._zvec.CollectionOption(read_only=False, enable_mmap=True),
-        )
+        try:
+            self._collection = self._zvec.create_and_open(
+                str(self.path),
+                schema=self._schema,
+                option=self._zvec.CollectionOption(read_only=False, enable_mmap=True),
+            )
+        except BaseException as error:
+            # The old collection is already gone, so say how to recover instead of leaving
+            # every later call to report the misleading "index is closed".
+            raise ZvecWriteError(
+                f"Zvec collection at {self.path} was destroyed but could not be recreated; "
+                "remove that directory and reopen the store to rebuild it from SQLite"
+            ) from error
+        self._validate_schema(cast(Any, self._collection).schema)
 
         count = 0
         batch: list[IndexDocument] = []

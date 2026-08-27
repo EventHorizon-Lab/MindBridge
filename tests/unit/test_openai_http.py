@@ -137,6 +137,109 @@ def test_multimodal_embedding_preserves_asset_order_and_maps_url_parts(
     assert result[0] == pytest.approx((0.6, 0.8))
 
 
+def test_default_space_recipes_separate_endpoints_serving_one_model_alias() -> None:
+    """Repointing an endpoint must change the derived space, not pass the store guard.
+
+    A model alias served by different weights is the likeliest swap, and the embedding space
+    is the only thing standing between that and two geometries in one collection. The
+    transcription space is stronger still: it is a durable transcript cache key and the
+    speaker-identity partition key.
+    """
+    hosted = Config.from_environment({})
+    local = Config.from_environment(
+        {
+            "MINDBRIDGE_EMBEDDING_BASE_URL": "http://127.0.0.1:8002/v1",
+            "MINDBRIDGE_TRANSCRIPTION_BASE_URL": "http://127.0.0.1:8003/v1",
+        }
+    )
+
+    assert hosted.embedding_model == local.embedding_model
+    assert hosted.transcription_model == local.transcription_model
+    assert hosted.embedding_space != local.embedding_space
+    assert hosted.transcription_space != local.transcription_space
+    # An explicit space still wins, so an operator can declare two endpoints equivalent.
+    pinned = Config.from_environment(
+        {
+            "MINDBRIDGE_EMBEDDING_BASE_URL": "http://127.0.0.1:8002/v1",
+            "MINDBRIDGE_EMBEDDING_SPACE": "shared-space-v1",
+        }
+    )
+    assert pinned.embedding_space == "shared-space-v1"
+
+
+def test_blank_environment_values_mean_unset_not_empty() -> None:
+    """A blank variable is how a shell and a compose file clear a setting.
+
+    Parsing `MINDBRIDGE_EMBEDDING_MODALITIES=""` as "supports nothing" builds a Config whose
+    first `add()` blames the model for a capability the operator never meant to remove.
+    """
+    blanked = Config.from_environment(
+        {
+            "MINDBRIDGE_EMBEDDING_MODALITIES": "",
+            "MINDBRIDGE_EMBEDDING_MODEL": "",
+            "MINDBRIDGE_EMBEDDING_DIMENSION": "",
+            "MINDBRIDGE_MEDIA_TRANSPORT": "",
+            "MINDBRIDGE_EMBEDDING_SPACE": "",
+        }
+    )
+    default = Config.from_environment({})
+
+    assert blanked.capabilities.embedding == default.capabilities.embedding
+    assert blanked.embedding_model == default.embedding_model
+    assert blanked.embedding_dimension == default.embedding_dimension
+    assert blanked.media_transport == default.media_transport
+    assert blanked.embedding_space == default.embedding_space
+
+
+def test_audio_wire_format_ignores_an_arbitrary_filename_suffix() -> None:
+    """A caller-supplied name may end in any dot segment; only the media type is validated."""
+    assert openai_backend._audio_format("call.2026-08-27", "audio/wav") == "wav"
+    assert openai_backend._audio_format("meeting notes v1.2", "audio/wav") == "wav"
+    assert openai_backend._audio_format("recording", "audio/mpeg") == "mp3"
+    assert openai_backend._audio_format("clip.m4a", "audio/mp4") == "m4a"
+
+
+def test_text_encoding_does_not_depend_on_what_else_shares_the_batch(tmp_path: Path) -> None:
+    """One input's wire form must be decided by that input, never by its batch neighbours.
+
+    A text item encoded as a chat-message list because an image rode along lands in a
+    different geometry from the same text encoded alone, while both are stored under one
+    space_id and queries are always embedded alone.
+    """
+    image = _asset(tmp_path, "image", Modality.IMAGE, "image/png", b"image")
+    payloads: list[object] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        inputs = cast(list[object], payload["input"])
+        payloads.extend(inputs)
+        return httpx.Response(
+            200,
+            json={
+                "data": [{"index": index, "embedding": [3.0, 4.0]} for index in range(len(inputs))]
+            },
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        model = OpenAIHTTP(_config(media_transport="file"), client=client)
+        model.embed((ModelInput(text="shared note"),), EmbedTask.DOCUMENT)
+        alone = list(payloads)
+        payloads.clear()
+        vectors = model.embed(
+            (
+                ModelInput(text="shared note"),
+                ModelInput(text="with media", assets=(image,)),
+            ),
+            EmbedTask.DOCUMENT,
+        )
+        batched = list(payloads)
+
+    assert alone == ["shared note"]
+    assert "shared note" in batched
+    assert len(vectors) == 2
+    assert all(vector == pytest.approx((0.6, 0.8)) for vector in vectors)
+
+
 def test_answer_maps_native_hit_media_and_abstains_without_hits(tmp_path: Path) -> None:
     image = _asset(tmp_path, "image", Modality.IMAGE, "image/png", b"image")
     requests: list[httpx.Request] = []

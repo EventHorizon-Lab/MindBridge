@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from importlib import metadata
 from pathlib import Path
 from tempfile import NamedTemporaryFile
+from typing import cast
 
 from mindbridge import AsyncMemory, Config
 from mindbridge.benchmarks.isolation import BenchmarkRun
@@ -88,13 +89,22 @@ async def _run_conversations(
         asyncio.create_task(run_one(conversation, data_dir))
         for conversation, data_dir in zip(conversations, unit_dirs, strict=True)
     ]
-    try:
-        grouped = await asyncio.gather(*tasks)
-    except BaseException:
-        for task in tasks:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        raise
+    # Let every conversation finish before deciding the run failed. Cancelling siblings on the
+    # first error discards the completed model calls of every other conversation, which is the
+    # most expensive thing this harness can throw away.
+    outcomes = await asyncio.gather(*tasks, return_exceptions=True)
+    for outcome in outcomes:
+        if isinstance(outcome, BaseException) and not isinstance(outcome, Exception):
+            raise outcome
+    failures = tuple(
+        (conversation.sample_id, outcome)
+        for conversation, outcome in zip(conversations, outcomes, strict=True)
+        if isinstance(outcome, Exception)
+    )
+    if failures:
+        names = ", ".join(sample_id for sample_id, _error in failures)
+        raise RuntimeError(f"conversations failed: {names}") from failures[0][1]
+    grouped = cast("tuple[tuple[LoCoMoRefinedPrediction, ...], ...]", outcomes)
     return tuple(prediction for group in grouped for prediction in group), unit_dirs
 
 
@@ -130,7 +140,7 @@ def _write_artifacts(
         "embedding_model": config.embedding_model,
         "generation_model": config.generation_model,
         "limit": arguments.limit,
-        "mindbridge_version": metadata.version("mindbridge"),
+        "mindbridge_version": _installed_version("mindbridge"),
         "platform": platform.platform(),
         "predictions_sha256": hashlib.sha256(rows).hexdigest(),
         "python_version": platform.python_version(),
@@ -149,7 +159,7 @@ def _write_artifacts(
         "turn_count": sum(len(conversation.turns) for conversation in conversations),
         "unanswered_count": sum(not prediction.mindbridge_answered for prediction in predictions),
         "unit_concurrency": arguments.unit_concurrency,
-        "zvec_version": metadata.version("zvec"),
+        "zvec_version": _installed_version("zvec"),
     }
     manifest_bytes = (
         json.dumps(manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
@@ -160,6 +170,14 @@ def _write_artifacts(
             (_manifest_path(arguments.output), manifest_bytes),
         )
     )
+
+
+def _installed_version(distribution: str) -> str | None:
+    """Record a distribution version without discarding a finished run over its metadata."""
+    try:
+        return metadata.version(distribution)
+    except metadata.PackageNotFoundError:
+        return None
 
 
 def _parse_arguments(argv: Sequence[str] | None, prog: str | None) -> _Arguments:

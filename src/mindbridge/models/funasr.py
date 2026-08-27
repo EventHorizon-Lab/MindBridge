@@ -187,6 +187,7 @@ class FunASRTranscriber:
         self._tensor_parallel_size = tensor_parallel_size
         self._vllm_dtype = normalized_dtype
         self._runtime_selection: tuple[str, str] | None = None
+        self._space_id: str | None = None
         self._pipeline: _Pipeline | _VLLMPipeline | None = None
         # ponytail: FunASR inference is serialized per loaded model; relax only after its
         # AutoModel composition demonstrates thread safety and concurrent throughput gains.
@@ -203,6 +204,14 @@ class FunASRTranscriber:
 
     @property
     def space_id(self) -> str:
+        # `isinstance(..., SpeechBackend)` evaluates this getter on Python 3.10 and 3.11, and
+        # Memory checks it inside a write path, so it must be cheap and computed once.
+        if self._space_id is not None:
+            return self._space_id
+        self._space_id = self._compute_space_id()
+        return self._space_id
+
+    def _compute_space_id(self) -> str:
         engine, _device = self._runtime()
         configuration: dict[str, object] = {
             "engine": engine,
@@ -485,7 +494,7 @@ def _speech_spans(pipeline: _Pipeline, audio: _Waveform) -> tuple[tuple[int, int
         start, end = round(span[0]), round(span[1])
         if start < 0 or end <= start:
             raise ModelError("FunASR VAD returned an invalid speech span")
-        if end - start > _MINIMUM_SPAN_MS:
+        if end - start >= _MINIMUM_SPAN_MS:
             spans.append((start, end))
     if any(current[0] < previous[1] for previous, current in pairwise(spans)):
         raise ModelError("FunASR VAD speech spans overlap or are not chronological")

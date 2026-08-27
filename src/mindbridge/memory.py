@@ -79,6 +79,7 @@ _REINDEX_PAGE_SIZE = 256
 _MAX_CONTENT_PARTS = 128
 _MAX_TEXT_CHARACTERS = 65_536
 _MAX_METADATA_BYTES = 262_144
+_MAX_METADATA_DEPTH = 64
 _MEDIA_TYPES = {
     ".aac": "audio/aac",
     ".avi": "video/x-msvideo",
@@ -121,6 +122,9 @@ _STORE_METADATA_KEYS = {
 
 
 class _Index(Protocol):
+    @property
+    def doc_count(self) -> int: ...
+
     def upsert(self, documents: Sequence[IndexDocument]) -> None: ...
 
     def delete(self, ids: Sequence[str]) -> None: ...
@@ -247,6 +251,13 @@ class Memory:
         except BaseException:
             self._close_models_and_store()
             raise
+        # Classify the transcriber once. `isinstance` against a runtime-checkable Protocol
+        # whose members are properties evaluates those getters on Python 3.10 and 3.11 but
+        # not on 3.12+, so repeating the check would give a version-dependent result and run
+        # backend probes inside read and write paths.
+        self._speech: SpeechBackend | None = (
+            self._transcriber if isinstance(self._transcriber, SpeechBackend) else None
+        )
 
         try:
             model_capabilities = _model_contract(self._models)
@@ -278,11 +289,9 @@ class Memory:
             )
             self._collect_orphan_assets(scan_physical=True)
             index_path = self.data_dir / "zvec"
-            index_missing = not index_path.exists()
             self._ensure_store_metadata()
-            if index_missing:
-                with _translate_storage_errors("checkpoint a missing search index"):
-                    self._store.queue_all_embeddings()
+            with _translate_storage_errors("count stored vectors"):
+                stored_vectors = self._store.count_embeddings()
         except BaseException:
             self._close_models_and_store()
             raise
@@ -292,14 +301,15 @@ class Memory:
                 index_path,
                 dimension=self._embedding_dimension,
             )
-        except Exception as error:
+        except BaseException as error:
             self._close_models_and_store()
-            raise IndexUnavailableError("failed to open the local search index") from error
+            if isinstance(error, Exception):
+                raise IndexUnavailableError("failed to open the local search index") from error
+            raise
 
         self._closed = False
         try:
-            with self._write_lock:
-                self._drain_outbox()
+            self._reconcile_index(stored_vectors)
         except BaseException:
             self._closed = True
             self._close_resources()
@@ -402,7 +412,7 @@ class Memory:
             )
             if not speech_assets:
                 return ()
-            if not isinstance(self._transcriber, SpeechBackend):
+            if self._speech is None:
                 raise ModelError(
                     "configured transcription backend does not provide speaker recognition"
                 )
@@ -427,7 +437,7 @@ class Memory:
                         cached[asset.asset_id] = self._store.write_speech(
                             asset.asset_id,
                             analysis,
-                            model_id=self._transcriber.model_id,
+                            model_id=self._speech.model_id,
                             space_id=self._transcription_space,
                             minimum_similarity=self._speaker_similarity,
                             minimum_margin=self._speaker_margin,
@@ -510,7 +520,11 @@ class Memory:
                     self._cleanup_pending_assets()
                 except Exception as error:
                     failures.append(error)
-                failures.extend(self._close_resources())
+                finally:
+                    # Releasing the store and its directory lock must survive an interrupted
+                    # cleanup; `_closed` is set below either way, so a retried close() is a
+                    # no-op and this is the only chance to give the lock back.
+                    failures.extend(self._close_resources())
         finally:
             with self._lifecycle:
                 self._closed = True
@@ -927,14 +941,14 @@ class Memory:
             by_id = {asset.asset_id: asset for asset in audio}
             refs = tuple(self._asset_ref(by_id[asset_id]) for asset_id in missing)
             try:
-                if isinstance(self._transcriber, SpeechBackend):
+                if self._speech is not None:
                     analyses = self._analyze_speech(refs)
                     generated = tuple(
                         "\n".join(turn.text for turn in analysis.turns) for analysis in analyses
                     )
                     operation.speech_updates.update(zip(missing, analyses, strict=True))
                 else:
-                    generated = self._transcriber.transcribe(refs)
+                    generated = cast(ModelBackend, self._transcriber).transcribe(refs)
             except MindBridgeError:
                 raise
             except Exception as error:
@@ -966,12 +980,12 @@ class Memory:
             with self._write_lock, _translate_storage_errors("cache audio transcripts"):
                 if updates:
                     self._store.set_asset_transcripts(updates)
-                if speech and isinstance(self._transcriber, SpeechBackend):
+                if speech and self._speech is not None:
                     for asset_id, analysis in speech:
                         self._store.write_speech(
                             asset_id,
                             analysis,
-                            model_id=self._transcriber.model_id,
+                            model_id=self._speech.model_id,
                             space_id=self._transcription_space,
                             minimum_similarity=self._speaker_similarity,
                             minimum_margin=self._speaker_margin,
@@ -981,10 +995,10 @@ class Memory:
         self,
         assets: Sequence[AssetRef],
     ) -> tuple[SpeechAnalysis, ...]:
-        if not isinstance(self._transcriber, SpeechBackend):
+        if self._speech is None:
             raise ModelError("configured transcription backend cannot analyze speakers")
         try:
-            analyses = self._transcriber.analyze(assets)
+            analyses = self._speech.analyze(assets)
         except MindBridgeError:
             raise
         except Exception as error:
@@ -1110,15 +1124,17 @@ class Memory:
                 if asset_id in persisted and asset_id not in unreferenced:
                     remaining = index + 1
                     continue
+                if asset_id in unreferenced:
+                    # Drop the metadata row before the bytes. The reverse order leaves a
+                    # memory pointing at a file that no longer exists whenever the asset
+                    # became referenced in between, and that memory can never be read again.
+                    with _translate_storage_errors("delete orphaned media metadata"):
+                        if not self._store.delete_asset_if_unreferenced(asset_id):
+                            remaining = index + 1
+                            continue
                 deleted = self._assets.delete_if_unleased(unreferenced.get(asset_id, asset))
                 if not deleted:
                     self._queue_asset_cleanup((asset,))
-                    remaining = index + 1
-                    continue
-                if asset_id in unreferenced:
-                    with _translate_storage_errors("delete orphaned media metadata"):
-                        if not self._store.delete_asset_if_unreferenced(asset_id):
-                            raise StorageError("orphaned media became referenced during cleanup")
                 remaining = index + 1
         except AssetStoreError as error:
             self._queue_asset_cleanup(assets[remaining:])
@@ -1158,6 +1174,21 @@ class Memory:
                 raise StorageError("failed to delete orphaned media") from error
             with _translate_storage_errors("delete orphaned media metadata"):
                 self._store.delete_asset_if_unreferenced(asset.asset_id)
+
+    def _reconcile_index(self, stored_vectors: int) -> None:
+        """Requeue every vector when the derived index has fallen behind SQLite.
+
+        A missing directory is not the only way that happens: a restored backup or a partial
+        copy leaves a readable collection holding fewer vectors, and without this check every
+        query would answer with silence and no error.
+        """
+        with self._write_lock:
+            with _translate_index_errors("inspect the search index"):
+                indexed_vectors = self._index.doc_count
+            if indexed_vectors < stored_vectors:
+                with _translate_storage_errors("checkpoint an incomplete search index"):
+                    self._store.queue_all_embeddings()
+            self._drain_outbox()
 
     def _drain_outbox(self) -> None:
         """Apply current SQLite truth, then acknowledge the exact durable operation batch."""
@@ -1216,7 +1247,7 @@ class Memory:
             if not memories:
                 return
             with _translate_storage_errors("hydrate memories for reindexing"):
-                yield from self._store.read_index_documents(
+                yield from self._store.read_index_documents_for_memories(
                     tuple(memory.memory_id for memory in memories)
                 )
             last = memories[-1]
@@ -1342,6 +1373,9 @@ class AsyncMemory:
         )
 
     async def __aenter__(self) -> AsyncMemory:
+        # Match `Memory.__enter__`: entering a closed instance must fail here, not on the
+        # first operation inside the block.
+        self._memory._require_open()
         return self
 
     async def __aexit__(self, *_error: object) -> None:
@@ -1659,6 +1693,27 @@ def _unique_resources(resources: Sequence[_Closable]) -> tuple[_Closable, ...]:
     return tuple(unique)
 
 
+def _require_bounded_depth(value: object) -> None:
+    """Reject nesting explicitly instead of relying on the interpreter to run out of stack.
+
+    `json.dumps` raised `RecursionError` on deep input up to Python 3.13, so the serializer
+    doubled as the depth guard. Python 3.14 raised its recursion headroom and serializes the
+    same input happily, which left arbitrarily deep metadata reaching storage on the newest
+    supported interpreter.
+    """
+    pending: builtins.list[tuple[object, int]] = [(value, 0)]
+    while pending:
+        current, depth = pending.pop()
+        if depth > _MAX_METADATA_DEPTH:
+            raise ValidationError(
+                f"metadata must not nest more than {_MAX_METADATA_DEPTH} levels deep"
+            )
+        if isinstance(current, Mapping):
+            pending.extend((item, depth + 1) for item in current.values())
+        elif isinstance(current, (list, tuple)):
+            pending.extend((item, depth + 1) for item in current)
+
+
 def _metadata_json(metadata: Mapping[str, object] | None) -> str:
     if metadata is None:
         return "{}"
@@ -1667,6 +1722,7 @@ def _metadata_json(metadata: Mapping[str, object] | None) -> str:
     copied = dict(metadata)
     if any(not isinstance(key, str) or not key.strip() for key in copied):
         raise ValidationError("metadata keys must be non-empty strings")
+    _require_bounded_depth(copied)
     try:
         serialized = json.dumps(
             copied,

@@ -37,7 +37,9 @@ vllm = [
 ]
 server = [
     "fastapi>=0.116,<1",
-    "starlette>=0.46,<2",
+    # 0.48 renamed the status constants the API layer uses (HTTP_413_CONTENT_TOO_LARGE,
+    # HTTP_422_UNPROCESSABLE_CONTENT); an older resolution imports but cannot build the app.
+    "starlette>=0.48,<2",
     "uvicorn>=0.35,<1",
 ]
 mcp = [

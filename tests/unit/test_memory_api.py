@@ -186,6 +186,10 @@ class _FakeIndex:
         cls.documents_by_path.clear()
         cls.instances.clear()
 
+    @property
+    def doc_count(self) -> int:
+        return len(self.documents)
+
     def upsert(self, documents: Sequence[IndexDocument]) -> None:
         self.upsert_calls.append(tuple(document.embedding.embedding_id for document in documents))
         for document in documents:
@@ -490,6 +494,32 @@ def test_keyset_pages_reindex_optimize_and_missing_index_recovery(tmp_path: Path
         assert reopened.search("one")
         assert reopened_models.embed_batches == [("one",)]
         assert len(models.embed_batches) == embed_calls
+
+
+def test_a_readable_but_incomplete_index_is_repopulated_without_re_embedding(
+    tmp_path: Path,
+) -> None:
+    """A present-but-behind index must be detected, not trusted because its path exists.
+
+    A restored backup or a partial copy leaves a readable collection holding fewer vectors
+    than SQLite. Keying recovery on the directory existing alone would answer every later
+    query with silence, with no error and no way for a caller to notice.
+    """
+    models = _FakeModels()
+    with Memory(tmp_path, _config(), models=models) as memory:
+        memory.add_many(("one", "two"))
+    embed_calls = len(models.embed_batches)
+
+    # The directory survives; its contents do not. `_FakeIndex` keys documents by path, so
+    # clearing that mapping is the in-memory equivalent of an emptied collection on disk.
+    _FakeIndex.documents_by_path[str((tmp_path / "zvec").resolve())] = {}
+
+    reopened_models = _FakeModels()
+    with Memory(tmp_path, _config(), models=reopened_models) as reopened:
+        assert reopened.search("one")
+        assert reopened_models.embed_batches == [("one",)]
+        assert len(models.embed_batches) == embed_calls
+        assert reopened._index.doc_count == 2
 
 
 def test_missing_index_checkpoint_precedes_collection_creation(
@@ -970,8 +1000,12 @@ def test_memory_rejects_oversized_and_recursive_input_before_model_work(tmp_path
             memory.add("x" * 65_537)
         with pytest.raises(ValidationError, match="262144"):
             memory.add("valid", metadata={"blob": "x" * 262_144})
-        with pytest.raises(ValidationError, match="JSON-compatible"):
+        # Depth is bounded explicitly rather than by whatever the interpreter's recursion
+        # headroom happens to be: Python 3.14 serializes this input without complaint.
+        with pytest.raises(ValidationError, match="64 levels deep"):
             memory.add("valid", metadata=nested)
+        with pytest.raises(ValidationError, match="JSON-compatible"):
+            memory.add("valid", metadata={"unserializable": object()})
 
     assert models.embed_batches == []
 

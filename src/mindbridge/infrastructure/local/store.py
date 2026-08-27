@@ -925,6 +925,49 @@ class LocalStore:
             by_id[document.embedding.embedding_id] = document
         return tuple(by_id[embedding_id] for embedding_id in embedding_ids if embedding_id in by_id)
 
+    def read_index_documents_for_memories(
+        self,
+        memory_ids: Sequence[str],
+    ) -> tuple[IndexDocument, ...]:
+        """Hydrate every index payload owned by these memories, keyed by memory rather than
+        by vector.
+
+        A full rebuild must cover each memory's vectors whatever their embedding IDs are; the
+        schema allows several parts per memory, so resolving by embedding ID would silently
+        omit any vector whose ID is not also a memory ID.
+        """
+        if not memory_ids:
+            return ()
+        for memory_id in memory_ids:
+            _require_identifier(memory_id, "memory_id")
+        rows = []
+        with self._connection() as connection:
+            for offset in range(0, len(memory_ids), _SQLITE_PARAMETER_BATCH):
+                batch = memory_ids[offset : offset + _SQLITE_PARAMETER_BATCH]
+                placeholders = ", ".join("?" for _memory_id in batch)
+                rows.extend(
+                    connection.execute(
+                        f"""
+                        SELECT e.embedding_id, e.memory_id, e.object_part, e.model_id, e.space_id,
+                               e.task, e.dimension, e.normalized, e.vector, e.created_at,
+                               m.content, m.metadata_json
+                        FROM embeddings AS e
+                        JOIN memory_records AS m ON m.memory_id = e.memory_id
+                        WHERE e.memory_id IN ({placeholders})
+                        ORDER BY e.memory_id, e.object_part, e.embedding_id
+                        """,
+                        tuple(batch),
+                    ).fetchall()
+                )
+        return tuple(
+            IndexDocument(
+                embedding=_embedding_from_row(row),
+                content=_row_text(row, "content"),
+                metadata_json=_row_text(row, "metadata_json"),
+            )
+            for row in rows
+        )
+
     def pending_index_operations(self, *, limit: int = 100) -> tuple[IndexOperation, ...]:
         """Read queued mutations without acknowledging them."""
         if not 1 <= limit <= 10_000:
@@ -967,6 +1010,12 @@ class LocalStore:
                 ),
             )
         return cursor.rowcount
+
+    def count_embeddings(self) -> int:
+        """Return how many vectors a coherent search index must hold."""
+        with self._connection() as connection:
+            row = connection.execute("SELECT count(*) AS total FROM embeddings").fetchone()
+        return int(row["total"])
 
     def queue_all_embeddings(self) -> int:
         """Append one upsert per vector for a full search-index rebuild."""
@@ -1410,7 +1459,18 @@ class LocalStore:
                 key=lambda item: (-item[1], item[0]),
             )
             best = ranked[0] if ranked else None
-            ambiguous = len(ranked) > 1 and ranked[0][1] - ranked[1][1] < minimum_margin
+            # A runner-up that would itself be accepted into the winner is the same voice from
+            # another recording, not a rival. Enrolling a third identity there resolves nothing
+            # and leaves one more near-duplicate for the next sample to tie against.
+            ambiguous = (
+                len(ranked) > 1
+                and ranked[0][1] - ranked[1][1] < minimum_margin
+                and _identities_are_distinct(
+                    existing[ranked[0][0]][0],
+                    existing[ranked[1][0]][0],
+                    minimum_similarity,
+                )
+            )
             if best is None or best[1] < minimum_similarity or ambiguous:
                 speaker_id = f"speaker_{uuid.uuid4().hex}"
                 connection.execute(
@@ -1646,6 +1706,16 @@ def _normalized_vector(values: Sequence[float], name: str) -> tuple[float, ...]:
     if magnitude == 0.0:
         raise ValueError(f"{name} must not be a zero vector")
     return tuple(value / magnitude for value in normalized)
+
+
+def _identities_are_distinct(
+    first: Sequence[float],
+    second: Sequence[float],
+    minimum_similarity: float,
+) -> bool:
+    """Report whether two stored centroids are rival speakers rather than one voice twice."""
+    similarity = math.fsum(a * b for a, b in zip(first, second, strict=True))
+    return similarity < minimum_similarity
 
 
 def _datetime_text(value: datetime) -> str:

@@ -28,6 +28,23 @@ _StrictIndex = Annotated[int, Field(strict=True, ge=0)]
 _StrictFloat = Annotated[float, Field(strict=True, allow_inf_nan=False)]
 _Operation = Literal["embedding", "generation", "transcription"]
 _MAX_INLINE_MODEL_BYTES = 64 * 1024 * 1024
+_AUDIO_FORMATS = frozenset(
+    {
+        "aac",
+        "flac",
+        "m4a",
+        "mp3",
+        "mp4",
+        "mpeg",
+        "mpga",
+        "oga",
+        "ogg",
+        "opus",
+        "pcm",
+        "wav",
+        "webm",
+    }
+)
 _MAX_GROUNDED_TEXT_BYTES = 4 * 1024 * 1024
 
 
@@ -137,6 +154,24 @@ class OpenAIHTTP:
         _require_consistent_assets(embedding_assets)
         _require_inline_size(embedding_assets, self._config.media_transport)
 
+        # One input's wire encoding must not depend on what else shares its batch, or the same
+        # text embeds differently as a document than as a query and lands in the wrong space.
+        text_only = tuple(index for index, value in enumerate(batch) if not value.assets)
+        with_assets = tuple(index for index, value in enumerate(batch) if value.assets)
+        ordered: list[tuple[float, ...] | None] = [None] * len(batch)
+        for group in (text_only, with_assets):
+            if not group:
+                continue
+            values = tuple(batch[index] for index in group)
+            vectors = self._embed_group(values)
+            for index, vector in zip(group, vectors, strict=True):
+                ordered[index] = vector
+        if any(vector is None for vector in ordered):
+            raise ModelError("embedding response was invalid")
+        return tuple(vector for vector in ordered if vector is not None)
+
+    def _embed_group(self, batch: Sequence[ModelInput]) -> tuple[tuple[float, ...], ...]:
+        """Encode one shape-homogeneous group so the payload form is per-input, not per-batch."""
         payload: dict[str, object] = {
             "input": (
                 [value.text for value in batch]
@@ -159,6 +194,8 @@ class OpenAIHTTP:
             if item.index >= len(batch) or ordered[item.index] is not None:
                 raise ModelError("embedding response was invalid")
             ordered[item.index] = _normalized(item.embedding, self.embedding_dimension)
+        if any(vector is None for vector in ordered):
+            raise ModelError("embedding response was invalid")
         return tuple(vector for vector in ordered if vector is not None)
 
     def answer(
@@ -493,11 +530,12 @@ def _asset_data(asset: AssetRef) -> str:
 
 
 def _audio_format(name: str, media_type: str) -> str:
-    suffix = Path(name).suffix.removeprefix(".").lower()
-    if suffix:
-        return suffix
     subtype = media_type.split("/", 1)[1].removeprefix("x-")
-    return "mp3" if subtype == "mpeg" else subtype
+    declared = "mp3" if subtype == "mpeg" else subtype
+    # A filename is caller-supplied and may carry any trailing dot segment ("call.2026-08-27"),
+    # so it refines the validated media type only when it names a real container.
+    suffix = Path(name).suffix.removeprefix(".").lower()
+    return suffix if suffix in _AUDIO_FORMATS else declared
 
 
 def _resolved_asset(asset: AssetRef) -> tuple[Modality, str, Path]:

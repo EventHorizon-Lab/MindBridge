@@ -101,6 +101,7 @@ _STABLE_ERROR_CODES = frozenset(
         "memory_not_found",
         "mindbridge_error",
         "model_error",
+        "speaker_not_found",
         "storage_error",
         "validation_error",
     }

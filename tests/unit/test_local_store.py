@@ -388,6 +388,59 @@ def test_media_assets_round_trip_in_order_and_cache_transcript(tmp_path: Path) -
         assert store.set_asset_transcript("f" * 64, "missing") is False
 
 
+def test_a_tie_between_two_fragments_of_one_voice_does_not_mint_a_third(
+    tmp_path: Path,
+) -> None:
+    """A near-tie between two fragments of one voice must resolve, not fragment further.
+
+    Two labels in a single analysis always enrol separately, so near-duplicate identities are
+    reachable. Without the distinctness clause every later tie between them mints a fresh
+    identity, leaving one more near-duplicate for the next sample to tie against.
+    """
+    first = _asset(b"two voices", modality="audio", mime_type="audio/wav", name="a.wav")
+    second = _asset(b"one voice again", modality="audio", mime_type="audio/wav", name="b.wav")
+    memories = (
+        replace(_memory("a"), content="", modality="audio", assets=(first,)),
+        replace(_memory("b"), content="", modality="audio", assets=(second,)),
+    )
+
+    with LocalStore(tmp_path) as store:
+        store.write_memories(memories)
+        # Two labels at cosine 0.99 of each other: separate identities only because one
+        # analysis cannot assign both labels to the same speaker.
+        enrolled = store.write_speech(
+            first.asset_id,
+            SpeechAnalysis(
+                turns=(SpeechTurn(0, 800, "hello", "0"), SpeechTurn(800, 1_600, "hello", "1")),
+                speakers=(
+                    SpeakerEmbedding("0", (1.0, 0.0)),
+                    SpeakerEmbedding("1", (0.99, 0.1411)),
+                ),
+            ),
+            model_id="cam++",
+            space_id="cam++:test",
+            minimum_similarity=0.9,
+            minimum_margin=0.02,
+        )
+        # A sample equidistant from both: its top-two margin is far under `minimum_margin`.
+        tied = store.write_speech(
+            second.asset_id,
+            SpeechAnalysis(
+                turns=(SpeechTurn(0, 900, "hello once more", "0"),),
+                speakers=(SpeakerEmbedding("0", (0.99749, 0.07073)),),
+            ),
+            model_id="cam++",
+            space_id="cam++:test",
+            minimum_similarity=0.9,
+            minimum_margin=0.02,
+        )
+
+    enrolled_ids = {segment.speaker_id for segment in enrolled}
+    assert len(enrolled_ids) == 2
+    assert tied[0].speaker_id in enrolled_ids
+    assert tied[0].identity_score is not None
+
+
 def test_speech_identity_is_stable_across_assets(tmp_path: Path) -> None:
     first = _asset(b"first voice", modality="audio", mime_type="audio/wav", name="first.wav")
     second = _asset(

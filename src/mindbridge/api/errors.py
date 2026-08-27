@@ -19,6 +19,7 @@ from mindbridge.exceptions import (
     MemoryNotFoundError,
     MindBridgeError,
     ModelError,
+    SpeakerNotFoundError,
     StorageError,
     ValidationError,
 )
@@ -129,6 +130,8 @@ def _public_error(error: MindBridgeError) -> tuple[int, str]:
         return status.HTTP_422_UNPROCESSABLE_CONTENT, str(error) or "input is invalid"
     if isinstance(error, MemoryNotFoundError):
         return status.HTTP_404_NOT_FOUND, str(error) or "memory does not exist"
+    if isinstance(error, SpeakerNotFoundError):
+        return status.HTTP_404_NOT_FOUND, str(error) or "speaker does not exist"
     if isinstance(error, ModelError):
         return status.HTTP_502_BAD_GATEWAY, "model operation failed"
     if isinstance(error, IndexUnavailableError):

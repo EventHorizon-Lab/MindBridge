@@ -13,6 +13,7 @@ from mindbridge.benchmarks.locomo_refined import (
     LoCoMoRefinedQuestion,
     LoCoMoRefinedTurn,
 )
+from mindbridge.models.openai_http import UNKNOWN_ANSWER
 
 LOCOMO_REFINED_PREDICTION_KEY = "predicted_answer"
 
@@ -125,7 +126,9 @@ async def _answer_question(
     return LoCoMoRefinedPrediction(
         qa_id=question.question_id,
         predicted_answer=result.answer,
-        mindbridge_answered=bool(result.answer),
+        # `AnswerResult` rejects a blank answer, so truthiness is always true. A refusal is
+        # the model emitting the grounded-abstention sentence, which is what this counts.
+        mindbridge_answered=result.answer.strip() != UNKNOWN_ANSWER,
         mindbridge_confidence=max((hit.score for hit in result.hits), default=0.0),
         mindbridge_prediction_context=tuple(
             dialog_id_by_memory_id[hit.id]

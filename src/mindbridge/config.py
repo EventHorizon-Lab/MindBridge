@@ -74,6 +74,9 @@ class Config:
         if not isinstance(self.capabilities, ModelCapabilities):
             raise ValidationError("capabilities must be a ModelCapabilities value")
 
+        embedding_base_url = (
+            base_url if self.embedding_base_url is None else _base_url(self.embedding_base_url)
+        )
         object.__setattr__(self, "api_key", api_key)
         object.__setattr__(self, "base_url", base_url)
         object.__setattr__(self, "embedding_model", embedding_model)
@@ -83,18 +86,29 @@ class Config:
             (
                 _text(self.embedding_space, "embedding_space")
                 if self.embedding_space is not None
-                else f"{embedding_model}:{self.embedding_dimension}:l2-v1"
+                # The endpoint belongs in the recipe: a model alias served by different
+                # weights is the swap most likely to happen, and without it the store
+                # metadata guard compares two different spaces and finds them equal.
+                else (f"{embedding_model}:{self.embedding_dimension}:{embedding_base_url}:l2-v1")
             ),
         )
         object.__setattr__(self, "generation_model", generation_model)
         object.__setattr__(self, "transcription_model", transcription_model)
+        transcription_base_url = (
+            base_url
+            if self.transcription_base_url is None
+            else _base_url(self.transcription_base_url)
+        )
         object.__setattr__(
             self,
             "transcription_space",
             (
                 _text(self.transcription_space, "transcription_space")
                 if self.transcription_space is not None
-                else f"{transcription_model}:asr-v1"
+                # This one is a durable cache key and the speaker-identity partition key,
+                # so leaving the endpoint out lets a second stack serving the same model
+                # alias read the first stack's transcripts and centroids as its own.
+                else (f"{transcription_model}:{transcription_base_url}:asr-v1")
             ),
         )
         object.__setattr__(self, "timeout_seconds", timeout)
@@ -104,11 +118,7 @@ class Config:
             "embedding_api_key",
             _key(self.embedding_api_key, "embedding_api_key") or api_key,
         )
-        object.__setattr__(
-            self,
-            "embedding_base_url",
-            base_url if self.embedding_base_url is None else _base_url(self.embedding_base_url),
-        )
+        object.__setattr__(self, "embedding_base_url", embedding_base_url)
         object.__setattr__(
             self,
             "generation_api_key",
@@ -124,36 +134,29 @@ class Config:
             "transcription_api_key",
             _key(self.transcription_api_key, "transcription_api_key") or api_key,
         )
-        object.__setattr__(
-            self,
-            "transcription_base_url",
-            (
-                base_url
-                if self.transcription_base_url is None
-                else _base_url(self.transcription_base_url)
-            ),
-        )
+        object.__setattr__(self, "transcription_base_url", transcription_base_url)
 
     @classmethod
     def from_environment(cls, environ: Mapping[str, str] | None = None) -> Config:
         """Read explicit model settings without requiring keys for storage-only use."""
         source = os.environ if environ is None else environ
         return cls(
-            api_key=source.get("OPENAI_API_KEY"),
-            base_url=source.get("OPENAI_BASE_URL", DEFAULT_OPENAI_BASE_URL),
-            embedding_api_key=source.get("MINDBRIDGE_EMBEDDING_API_KEY"),
-            embedding_base_url=source.get("MINDBRIDGE_EMBEDDING_BASE_URL"),
-            generation_api_key=source.get("MINDBRIDGE_GENERATION_API_KEY"),
-            generation_base_url=source.get("MINDBRIDGE_GENERATION_BASE_URL"),
-            transcription_api_key=source.get("MINDBRIDGE_TRANSCRIPTION_API_KEY"),
-            transcription_base_url=source.get("MINDBRIDGE_TRANSCRIPTION_BASE_URL"),
-            embedding_model=source.get("MINDBRIDGE_EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL),
-            embedding_space=source.get("MINDBRIDGE_EMBEDDING_SPACE"),
-            generation_model=source.get("MINDBRIDGE_GENERATION_MODEL", DEFAULT_GENERATION_MODEL),
-            transcription_model=source.get(
-                "MINDBRIDGE_TRANSCRIPTION_MODEL", DEFAULT_TRANSCRIPTION_MODEL
-            ),
-            transcription_space=source.get("MINDBRIDGE_TRANSCRIPTION_SPACE"),
+            api_key=_setting(source, "OPENAI_API_KEY"),
+            base_url=_setting(source, "OPENAI_BASE_URL") or DEFAULT_OPENAI_BASE_URL,
+            embedding_api_key=_setting(source, "MINDBRIDGE_EMBEDDING_API_KEY"),
+            embedding_base_url=_setting(source, "MINDBRIDGE_EMBEDDING_BASE_URL"),
+            generation_api_key=_setting(source, "MINDBRIDGE_GENERATION_API_KEY"),
+            generation_base_url=_setting(source, "MINDBRIDGE_GENERATION_BASE_URL"),
+            transcription_api_key=_setting(source, "MINDBRIDGE_TRANSCRIPTION_API_KEY"),
+            transcription_base_url=_setting(source, "MINDBRIDGE_TRANSCRIPTION_BASE_URL"),
+            embedding_model=_setting(source, "MINDBRIDGE_EMBEDDING_MODEL")
+            or DEFAULT_EMBEDDING_MODEL,
+            embedding_space=_setting(source, "MINDBRIDGE_EMBEDDING_SPACE"),
+            generation_model=_setting(source, "MINDBRIDGE_GENERATION_MODEL")
+            or DEFAULT_GENERATION_MODEL,
+            transcription_model=_setting(source, "MINDBRIDGE_TRANSCRIPTION_MODEL")
+            or DEFAULT_TRANSCRIPTION_MODEL,
+            transcription_space=_setting(source, "MINDBRIDGE_TRANSCRIPTION_SPACE"),
             embedding_dimension=_integer(
                 source.get("MINDBRIDGE_EMBEDDING_DIMENSION"),
                 DEFAULT_EMBEDDING_DIMENSION,
@@ -184,6 +187,21 @@ class Config:
                 ),
             ),
         )
+
+
+def _setting(source: Mapping[str, str], name: str) -> str | None:
+    """Read one environment value, treating a blank string as absent."""
+    value = source.get(name)
+    return None if _unset(value) else value
+
+
+def _unset(value: str | None) -> bool:
+    """Report whether an environment value is absent.
+
+    A blank string is how a shell, `docker run -e` and a compose file clear a variable, so it
+    must mean "use the default" rather than "an empty setting".
+    """
+    return value is None or not value.strip()
 
 
 def _text(value: object, name: str) -> str:
@@ -227,7 +245,7 @@ def _base_url(value: object) -> str:
 
 
 def _integer(value: str | None, default: int, name: str) -> int:
-    if value is None:
+    if value is None or _unset(value):
         return default
     try:
         return int(value)
@@ -236,7 +254,7 @@ def _integer(value: str | None, default: int, name: str) -> int:
 
 
 def _number(value: str | None, default: float, name: str) -> float:
-    if value is None:
+    if value is None or _unset(value):
         return default
     try:
         return float(value)
@@ -245,6 +263,8 @@ def _number(value: str | None, default: float, name: str) -> float:
 
 
 def _transport(value: str) -> Literal["data", "file"]:
+    if _unset(value):
+        return "data"
     if value not in {"data", "file"}:
         raise ValidationError("MINDBRIDGE_MEDIA_TRANSPORT must be 'data' or 'file'")
     return "data" if value == "data" else "file"
@@ -284,7 +304,7 @@ def _modalities(
     default: frozenset[Modality],
     name: str,
 ) -> frozenset[Modality]:
-    if value is None:
+    if value is None or _unset(value):
         return default
     try:
         parsed = {Modality(item.strip().lower()) for item in value.split(",") if item.strip()}
