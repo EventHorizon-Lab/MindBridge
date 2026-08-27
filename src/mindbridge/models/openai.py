@@ -54,7 +54,8 @@ from mindbridge.models.defaults import (
     DEFAULT_EMBEDDING_DIMENSION,
     DEFAULT_GENERATOR_MODEL_ID,
     DEFAULT_GENERATOR_REQUEST_TIMEOUT_SECONDS,
-    MatryoshkaDimension,
+    EmbeddingDimension,
+    require_distinct_embedding_space,
 )
 from mindbridge.telemetry import log_fields, logger, operation_span, set_current_span_attributes
 
@@ -633,7 +634,7 @@ class _EmbedderConfig(PluginConfigModel):
     endpoint: PluginText
     model_id: PluginText
     space_id: PluginText
-    dimension: MatryoshkaDimension = DEFAULT_EMBEDDING_DIMENSION
+    dimension: EmbeddingDimension = DEFAULT_EMBEDDING_DIMENSION
     request_timeout_seconds: PluginNumber = 120.0
     max_retries: PluginInteger = 2
 
@@ -664,6 +665,7 @@ def create_generator(config: Mapping[str, object]) -> Generator:
 def create_embedder(config: Mapping[str, object]) -> OpenAIEmbedder:
     """Entry-point factory for the OpenAI-compatible Omni embedder."""
     validated = _EmbedderConfig.model_validate(config)
+    require_distinct_embedding_space(validated.model_id, validated.space_id)
     return OpenAIEmbedder.connect(
         api_key=validated.api_key,
         endpoint=validated.endpoint,

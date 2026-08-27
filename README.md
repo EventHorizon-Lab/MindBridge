@@ -274,6 +274,7 @@ mindbridge
 ├── lifecycle
 ├── mcp
 ├── jina serve
+├── sentence-transformers serve
 └── edge sync
 ```
 

@@ -461,9 +461,10 @@ entry point `mindbridge.generators`、`mindbridge.embedders` 发现；进程只�
   `dimension`、`normalized` 和 `created_at`；
 - 切换模型时创建新向量版本并后台重建，不原地混用不同空间。
 
-生产实现只使用一个编码器 `jina-embeddings-v5-omni-small-retrieval`；query 与 document
-的差别完全由 retrieval prompt 承担，不由模型承担。独立的 `mindbridge jina serve` 进程通过
-SentenceTransformers 的 `encode_query()` 和 `encode_document()` 加载一次模型；API 与 Worker
+默认生产实现使用编码器 `jina-embeddings-v5-omni-small-retrieval`；query 与 document
+的差别完全由 retrieval prompt 承担，不由模型承担。独立的
+`mindbridge sentence-transformers serve` 进程通过 SentenceTransformers 的
+`encode_query()` 和 `encode_document()` 加载一次模型；API 与 Worker
 通过同一个 OpenAI-compatible endpoint 批量生成所有向量。文本请求使用 OpenAI SDK 的
 `embeddings.create()`；SDK 尚未声明类型的多模态 `input` 也只通过同一 SDK 的低层 `post()`
 发送，不另写 HTTP 客户端。数据库按
@@ -1403,9 +1404,10 @@ standalone GGUF 二进制不实现 CAM++ speaker embedding 与聚类，所以它
 
 Worker 通过 `mindbridge.celery_app:app` 启动，Redis 消息只传
 `tenant_id`、`observation_id`、`job_id`。原始媒体、Evidence 和任务状态均以 PostgreSQL/S3
-为事实来源。Jina SentenceTransformers 服务独占模型进程；API 与 Worker 默认都通过共享 endpoint
-调用它，不加载 Jina 权重。仅显式选择本地 `jina` 插件时，Worker 才在进程内加载模型，并由启动
-门禁限制 prefork 副本数。API 与 Worker 在 composition root 按插口直接选择插件，应用层只消费
+为事实来源。SentenceTransformers 服务独占模型进程，默认加载 Jina；API 与 Worker 默认都通过
+共享 endpoint 调用它，不加载模型权重。仅显式选择本地 `sentence-transformers`（或兼容别名
+`jina`）插件时，Worker 才在进程内加载模型，并由启动门禁限制 prefork 副本数。API 与 Worker
+在 composition root 按插口直接选择插件，应用层只消费
 `Generator` 和 `Embedder` 两个能力协议。
 Generator、两个 Embedder 和共享空间必须由部署配置固定并写入派生记录；凭证
 只从进程环境或基础设施 secret 注入。

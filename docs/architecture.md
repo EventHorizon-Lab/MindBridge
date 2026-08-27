@@ -39,7 +39,7 @@ guard was tightened to catch.
 ```mermaid
 flowchart TB
   subgraph proc["Deployable processes"]
-    jina["Jina embedding service<br/><code>mindbridge jina serve</code>"]
+    jina["SentenceTransformers service (Jina default)<br/><code>mindbridge sentence-transformers serve</code>"]
     api["API<br/><code>uvicorn mindbridge.server:create_app</code>"]
     mcp["MCP stdio<br/><code>mindbridge mcp</code>"]
     worker["Memory worker<br/><code>celery -A mindbridge.celery_app:app</code>"]

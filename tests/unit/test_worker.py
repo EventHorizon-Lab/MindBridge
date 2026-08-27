@@ -660,16 +660,19 @@ def test_worker_media_slot_reuses_the_file_backed_embedder_config(tmp_path: Path
     assert settings.media_embedder_config == settings.text_embedder_config
 
 
-def test_worker_can_explicitly_opt_into_the_local_jina_encoder() -> None:
+@pytest.mark.parametrize("plugin", ["sentence-transformers", "jina"])
+def test_worker_can_explicitly_opt_into_the_local_sentence_transformers_encoder(
+    plugin: str,
+) -> None:
     settings = WorkerSettings.from_environment(
         {
             **_environment(),
-            "MINDBRIDGE_MEDIA_EMBEDDER_PLUGIN": "jina",
+            "MINDBRIDGE_MEDIA_EMBEDDER_PLUGIN": plugin,
             "MINDBRIDGE_MEDIA_EMBEDDER_DEVICE": "cuda",
         }
     )
 
-    assert settings.media_embedder_plugin == "jina"
+    assert settings.media_embedder_plugin == plugin
     assert settings.media_embedder_config["device"] == "cuda"
     assert "endpoint" not in settings.media_embedder_config
 

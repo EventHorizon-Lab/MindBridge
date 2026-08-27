@@ -19,6 +19,7 @@ else:
 
 from packaging.markers import default_environment
 from packaging.requirements import Requirement
+from packaging.version import Version
 
 import mindbridge
 from mindbridge.benchmarks.cli import RUNNERS
@@ -764,6 +765,24 @@ def test_no_extra_declares_a_dependency_nothing_uses() -> None:
     )
 
     assert unused == []
+
+
+def test_no_dependency_drags_the_whole_lock_back_to_numpy_1() -> None:
+    """One transitive `numpy<2` cap re-resolves numpy for every scenario at once.
+
+    `sentence-transformers[audio]` is such a cap: the `transformers[audio]` half of it brings
+    pyctcdecode, which pins `numpy<2.0.0`, and a universal resolution has to satisfy that
+    everywhere -- so numpy collapsed from 2.2/2.4 onto 1.26.4 for `media`, `edge`, and the
+    benchmarks too. 1.26.4 publishes no wheel for 3.13 or 3.14, so that leg builds it from
+    source and any image without a C toolchain cannot `uv sync` at all.
+    """
+    locked: dict[str, Any] = tomllib.loads((ROOT / "uv.lock").read_text(encoding="utf-8"))
+    numpy = sorted(
+        package["version"] for package in locked["package"] if package["name"] == "numpy"
+    )
+
+    assert numpy != []
+    assert [version for version in numpy if Version(version).major < 2] == []
 
 
 def test_the_installability_matrix_probes_every_scenario() -> None:

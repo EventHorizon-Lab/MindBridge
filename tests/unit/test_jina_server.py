@@ -9,6 +9,7 @@ import time
 
 import httpx
 import pytest
+import uvicorn
 from anyio import Path as AsyncPath
 
 from mindbridge import jina_server
@@ -498,6 +499,41 @@ async def test_service_rejects_oversized_base64_before_decoding(
         )
 
     assert response.status_code == 413
+
+
+def test_cli_passes_generic_model_identity_and_space(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+    monkeypatch.setenv("MINDBRIDGE_EMBEDDER_API_KEY", "test-key")
+    monkeypatch.setattr(
+        jina_server,
+        "create_app",
+        lambda **kwargs: captured.update(kwargs) or object(),
+    )
+    monkeypatch.setattr(uvicorn, "run", lambda *_args, **_kwargs: None)
+
+    jina_server.main(
+        [
+            "--model-id",
+            "Qwen/Qwen3-VL-Embedding-2B",
+            "--model-revision",
+            "model-commit",
+            "--embedding-space-id",
+            "qwen-vl-v1",
+            "--embedding-dimension",
+            "2048",
+            "--trust-remote-code",
+        ]
+    )
+
+    assert captured["embedder_config"] == {
+        "model_id": "Qwen/Qwen3-VL-Embedding-2B",
+        "model_revision": "model-commit",
+        "trust_remote_code": True,
+        "space_id": "qwen-vl-v1",
+        "dimension": 2048,
+        "device": "cuda",
+        "max_concurrency": 1,
+    }
 
 
 class _PoisonEmbedder(_FakeEmbedder):

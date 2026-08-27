@@ -19,13 +19,13 @@ __all__ = [
     "DEFAULT_EMBEDDING_SPACE",
     "DEFAULT_GENERATOR_MODEL_ID",
     "DEFAULT_GENERATOR_REQUEST_TIMEOUT_SECONDS",
-    "MATRYOSHKA_DIMENSIONS",
-    "MatryoshkaDimension",
+    "EmbeddingDimension",
     "embedding_dimension_from_environment",
-    "jina_media_embedder_config",
     "openai_embedder_config",
     "openai_generator_config",
-    "require_matryoshka_dimension",
+    "require_distinct_embedding_space",
+    "require_embedding_dimension",
+    "sentence_transformers_media_embedder_config",
 ]
 
 DEFAULT_GENERATOR_MODEL_ID = "qwen3.8-max"
@@ -70,27 +70,35 @@ def embedder_revision_for(model_id: str, revision: str | None) -> str | None:
     return DEFAULT_EMBEDDER_REVISION if model_id == DEFAULT_EMBEDDER_MODEL_ID else None
 
 
-# Jina v5 trains these Matryoshka prefixes; any other width is an untrained
-# truncation, so a deployment may pick from this set but not invent a size.
-MATRYOSHKA_DIMENSIONS = (32, 64, 128, 256, 512, 768, 1_024)
-
-
-def require_matryoshka_dimension(dimension: int) -> int:
-    """Reject vector widths the encoder was never trained to truncate to."""
-    if dimension not in MATRYOSHKA_DIMENSIONS:
-        supported = ", ".join(str(value) for value in MATRYOSHKA_DIMENSIONS)
-        raise ValueError(f"embedding dimension must be one of {supported}")
+def require_embedding_dimension(dimension: int) -> int:
+    """Require a usable vector width; the selected model validates whether it can produce it."""
+    if dimension <= 0:
+        raise ValueError("embedding dimension must be positive")
     return dimension
 
 
-MatryoshkaDimension = Annotated[PluginInteger, AfterValidator(require_matryoshka_dimension)]
+EmbeddingDimension = Annotated[PluginInteger, AfterValidator(require_embedding_dimension)]
 
 
 def embedding_dimension_from_environment(source: Mapping[str, str]) -> int:
     """One deployment-wide vector width shared by the index and every encoder."""
-    return require_matryoshka_dimension(
+    return require_embedding_dimension(
         int(source.get("MINDBRIDGE_EMBEDDING_DIMENSION", str(DEFAULT_EMBEDDING_DIMENSION)))
     )
+
+
+def require_distinct_embedding_space(
+    model_id: str,
+    space_id: str,
+    *,
+    model_revision: str | None = None,
+) -> None:
+    """Refuse to write another encoder or revision into the bundled Jina vector space."""
+    revision = embedder_revision_for(model_id, model_revision)
+    if space_id == DEFAULT_EMBEDDING_SPACE.space_id and (
+        model_id != DEFAULT_EMBEDDER_MODEL_ID or revision != DEFAULT_EMBEDDER_REVISION
+    ):
+        raise ValueError("a non-default embedding model or revision requires a new space_id")
 
 
 # Every process that loads a bundled plugin builds its fallback configuration here, so each
@@ -135,8 +143,10 @@ def openai_embedder_config(
     return config
 
 
-def jina_media_embedder_config(source: Mapping[str, str]) -> dict[str, object]:
-    """Read the bundled local Jina contract for the Worker's image, video, and audio encoder."""
+def sentence_transformers_media_embedder_config(
+    source: Mapping[str, str],
+) -> dict[str, object]:
+    """Read the local SentenceTransformers contract for the Worker's media encoder."""
     config: dict[str, object] = {
         "model_id": source.get("MINDBRIDGE_MEDIA_EMBEDDER_MODEL_ID", DEFAULT_EMBEDDER_MODEL_ID),
         **_embedding_space_config(source),

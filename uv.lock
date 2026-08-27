@@ -1691,7 +1691,7 @@ all = [
     { name = "pillow" },
     { name = "psycopg", extra = ["binary", "pool"] },
     { name = "pyarrow" },
-    { name = "sentence-transformers" },
+    { name = "sentence-transformers", extra = ["image", "video"] },
     { name = "soundfile" },
     { name = "starlette" },
     { name = "torch" },
@@ -1703,6 +1703,7 @@ all = [
 benchmarks = [
     { name = "av" },
     { name = "boto3" },
+    { name = "botocore" },
     { name = "huggingface-hub" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.13'" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.13'" },
@@ -1720,7 +1721,7 @@ cloud-models = [
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.13'" },
     { name = "opentelemetry-api" },
     { name = "pillow" },
-    { name = "sentence-transformers" },
+    { name = "sentence-transformers", extra = ["image", "video"] },
     { name = "soundfile" },
     { name = "torch" },
     { name = "torchvision" },
@@ -1792,6 +1793,7 @@ requires-dist = [
     { name = "boto3", marker = "extra == 'benchmarks'", specifier = ">=1.40,<2" },
     { name = "boto3", marker = "extra == 'edge'", specifier = ">=1.40,<2" },
     { name = "boto3", marker = "extra == 'server'", specifier = ">=1.40,<2" },
+    { name = "botocore", marker = "extra == 'benchmarks'", specifier = ">=1.40,<2" },
     { name = "botocore", marker = "extra == 'edge'", specifier = ">=1.40,<2" },
     { name = "botocore", marker = "extra == 'server'", specifier = ">=1.40,<2" },
     { name = "celery", extras = ["redis"], marker = "extra == 'server'", specifier = ">=5.6,<6" },
@@ -1833,7 +1835,7 @@ requires-dist = [
     { name = "psycopg", extras = ["binary", "pool"], marker = "extra == 'server'", specifier = ">=3.2,<4" },
     { name = "pyarrow", marker = "extra == 'benchmarks'", specifier = ">=18,<26" },
     { name = "pydantic", specifier = ">=2.10,<3" },
-    { name = "sentence-transformers", marker = "extra == 'cloud-models'", specifier = ">=5.2,<6" },
+    { name = "sentence-transformers", extras = ["image", "video"], marker = "extra == 'cloud-models'", specifier = ">=5.5.1,<6" },
     { name = "soundfile", marker = "extra == 'media'", specifier = ">=0.13,<1" },
     { name = "starlette", marker = "extra == 'server'", specifier = ">=0.46,<2" },
     { name = "tomli", marker = "python_full_version < '3.11'", specifier = ">=2,<3" },
@@ -1852,7 +1854,7 @@ dev = [
     { name = "cryptography", specifier = ">=45,<51" },
     { name = "mypy", specifier = ">=1.15,<3" },
     { name = "packaging", specifier = ">=24,<27" },
-    { name = "pytest", specifier = ">=8,<10" },
+    { name = "pytest", specifier = ">=9.1,<10" },
     { name = "pytest-asyncio", specifier = ">=0.24,<2" },
     { name = "ruff", specifier = ">=0.11,<1" },
     { name = "tomli", marker = "python_full_version < '3.11'", specifier = ">=2,<3" },
@@ -4464,6 +4466,14 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/e8/c8/f63d99e354532f5b83e735dd1e001bda92495fbfde934f65d924abf2b071/sentence_transformers-5.7.0-py3-none-any.whl", hash = "sha256:b78141da3d8137e70d965866e2ca43190b9266f3d4d8752e250ded75e7136730", size = 611333, upload-time = "2026-08-06T12:12:31.881Z" },
 ]
 
+[package.optional-dependencies]
+image = [
+    { name = "transformers", extra = ["vision"] },
+]
+video = [
+    { name = "transformers", extra = ["video"] },
+]
+
 [[package]]
 name = "sentencepiece"
 version = "0.2.2"
@@ -5027,6 +5037,15 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/a6/3f/d89353267d511e18f137dfd7769d07837350c11b88408ce1dfe2e93e56c7/transformers-5.15.0.tar.gz", hash = "sha256:bbf98f57b2ddd7c4ecbccfa2c0069017aa6fd01cc204bd50cbc0eeadcf2a13b8", size = 9377983, upload-time = "2026-08-10T10:27:23.261Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/d8/43/81355710a4c84e9420e11a86d41a5364deb561f2ef36dfdf254a07371bbb/transformers-5.15.0-py3-none-any.whl", hash = "sha256:d7f007736f67749ae9490c4f8cb5d30b452ae2d68c8675e50ba8d63ea7feb107", size = 11749280, upload-time = "2026-08-10T10:27:20.416Z" },
+]
+
+[package.optional-dependencies]
+video = [
+    { name = "av" },
+]
+vision = [
+    { name = "pillow" },
+    { name = "torchvision" },
 ]
 
 [[package]]
