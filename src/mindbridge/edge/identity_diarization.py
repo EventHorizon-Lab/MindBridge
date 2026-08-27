@@ -8,7 +8,6 @@ import json
 import mimetypes
 import subprocess
 import tempfile
-from collections import deque
 from dataclasses import dataclass, replace
 from itertools import pairwise
 from pathlib import Path
@@ -197,12 +196,6 @@ class SpeechAnalysis:
     speaker_embeddings: tuple[SpeakerEmbeddingSample, ...]
 
 
-@dataclass(slots=True)
-class _PendingSpeechAnalysis:
-    media_path: Path
-    result: asyncio.Future[SpeechAnalysis]
-
-
 _ACTIVE_SPEAKER_SCHEMA = output_schema("active_speaker_match", _ActiveSpeakerOutput)
 
 _SPEECH_SEGMENT_SCHEMA = output_schema("speech_segmentation", _DiarizationOutput)
@@ -217,20 +210,12 @@ class FunASRSpeechPipeline:
         *,
         device: str,
         diarization_confidence: float = 0.8,
-        max_batch_files: int = 32,
-        batch_wait_ms: float = 2.0,
     ) -> None:
         if not 0.0 <= diarization_confidence <= 1.0:
             raise ValueError("diarization confidence must be between zero and one")
-        if max_batch_files <= 0 or batch_wait_ms < 0:
-            raise ValueError("FunASR batch settings are invalid")
         self._pipeline = pipeline
         self.device = device
         self._diarization_confidence = diarization_confidence
-        self._max_batch_files = max_batch_files
-        self._batch_wait_seconds = batch_wait_ms / 1_000
-        self._pending: deque[_PendingSpeechAnalysis] = deque()
-        self._worker: asyncio.Task[None] | None = None
 
     @classmethod
     def load(
@@ -238,8 +223,6 @@ class FunASRSpeechPipeline:
         *,
         device: str | None = None,
         model_id: str | None = None,
-        max_batch_files: int = 32,
-        batch_wait_ms: float = 2.0,
     ) -> FunASRSpeechPipeline:
         """Load the official integrated FunASR pipeline on CUDA when available.
 
@@ -266,63 +249,16 @@ class FunASRSpeechPipeline:
             disable_update=True,
             disable_pbar=True,
         )
-        return cls(
-            cast(_FunASRPipeline, pipeline),
-            device=selected_device,
-            max_batch_files=max_batch_files,
-            batch_wait_ms=batch_wait_ms,
-        )
+        return cls(cast(_FunASRPipeline, pipeline), device=selected_device)
 
     async def analyze_file(self, media_path: Path) -> SpeechAnalysis:
-        """Coalesce concurrent files into one synchronized FunASR GPU call."""
-        resolved = await asyncio.to_thread(media_path.resolve, strict=True)
-        result: asyncio.Future[SpeechAnalysis] = asyncio.get_running_loop().create_future()
-        self._pending.append(_PendingSpeechAnalysis(resolved, result))
-        if self._worker is None or self._worker.done():
-            self._worker = asyncio.create_task(self._serve())
-        return await result
+        """Keep the edge loop responsive while local GPU inference runs."""
+        return await asyncio.to_thread(self._analyze_file, media_path)
 
-    async def _serve(self) -> None:
-        try:
-            while self._pending:
-                batch = [self._pending.popleft()]
-                if not self._pending and self._batch_wait_seconds:
-                    await asyncio.sleep(self._batch_wait_seconds)
-                while self._pending and len(batch) < self._max_batch_files:
-                    batch.append(self._pending.popleft())
-                await self._complete_batch(batch)
-        finally:
-            self._worker = None
-
-    async def _complete_batch(self, batch: list[_PendingSpeechAnalysis]) -> None:
-        batch = [item for item in batch if not item.result.cancelled()]
-        if not batch:
-            return
-        try:
-            analyses = await asyncio.to_thread(
-                self._analyze_files,
-                tuple(item.media_path for item in batch),
-            )
-        except asyncio.CancelledError:
-            for item in batch:
-                item.result.cancel()
-            raise
-        except Exception as error:
-            for item in batch:
-                if not item.result.done():
-                    item.result.set_exception(error)
-            return
-        for item, analysis in zip(batch, analyses, strict=True):
-            if not item.result.done():
-                item.result.set_result(analysis)
-
-    def _analyze_files(self, media_paths: tuple[Path, ...]) -> tuple[SpeechAnalysis, ...]:
+    def _analyze_file(self, media_path: Path) -> SpeechAnalysis:
+        media_path = media_path.resolve(strict=True)
         output = self._pipeline.generate(
-            input=(
-                str(media_paths[0])
-                if len(media_paths) == 1
-                else [str(media_path) for media_path in media_paths]
-            ),
+            input=str(media_path),
             batch_size_s=300,
             return_raw_text=True,
             sentence_timestamp=True,
@@ -330,11 +266,9 @@ class FunASRSpeechPipeline:
             return_spk_center=True,
             disable_pbar=True,
         )
-        if len(output) != len(media_paths):
+        if len(output) != 1:
             raise ModelOutputError("FunASR returned an invalid transcription batch")
-        return tuple(self._analysis(result) for result in output)
-
-    def _analysis(self, result: dict[str, object]) -> SpeechAnalysis:
+        result = output[0]
         text = result.get("text")
         if not isinstance(text, str):
             raise ModelOutputError("FunASR returned invalid transcription text")

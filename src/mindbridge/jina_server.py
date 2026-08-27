@@ -154,9 +154,18 @@ class _AdaptiveBatchingEmbedder:
                 item.result.cancel()
             raise
         except Exception as error:
-            for item in batch:
+            # A batch is this server's scheduling artefact, not something any caller asked for,
+            # so one caller's input must not fail the others. Attribute the failure by re-running
+            # each request alone; a single-input batch has nobody else to blame and stops the
+            # recursion. This also recovers the common batch-wide case -- an OOM caused by the
+            # merged size -- because the retries are small enough to fit.
+            if len(batch) == 1:
+                item = batch[0]
                 if not item.result.done():
                     item.result.set_exception(error)
+                return
+            for item in batch:
+                await self._embed_batch(task, [item])
             return
         offset = 0
         for item in batch:
@@ -164,6 +173,29 @@ class _AdaptiveBatchingEmbedder:
             if not item.result.done():
                 item.result.set_result(EmbedResult(result.embeddings[offset : offset + size]))
             offset += size
+
+
+def _reject_unusable_options(
+    *,
+    api_key: str,
+    media_io_concurrency: int,
+    max_batch_inputs: int,
+    batch_wait_ms: float,
+) -> None:
+    """Reject the flags before `lifespan` loads the model.
+
+    The batching embedder validates its own two arguments, but `lifespan` builds it only after
+    `load_embedder` has put several GiB of weights on the GPU -- so `--max-batch-inputs 0` used
+    to download and load a model and then die. Checked here, `create_app` refuses first.
+    """
+    if not api_key.strip():
+        raise ValueError("embedding API key must not be empty")
+    if media_io_concurrency <= 0:
+        raise ValueError("media I/O concurrency must be positive")
+    if max_batch_inputs <= 0:
+        raise ValueError("maximum batch inputs must be positive")
+    if batch_wait_ms < 0:
+        raise ValueError("batch wait must not be negative")
 
 
 def create_app(
@@ -177,10 +209,12 @@ def create_app(
     media_io_concurrency: int = _DEFAULT_MEDIA_IO_CONCURRENCY,
 ) -> FastAPI:
     """Build one single-model service; injection keeps contract tests model-free."""
-    if not api_key.strip():
-        raise ValueError("embedding API key must not be empty")
-    if media_io_concurrency <= 0:
-        raise ValueError("media I/O concurrency must be positive")
+    _reject_unusable_options(
+        api_key=api_key,
+        media_io_concurrency=media_io_concurrency,
+        max_batch_inputs=max_batch_inputs,
+        batch_wait_ms=batch_wait_ms,
+    )
     config = dict(embedder_config or {})
     allowed_media_origins = _allowed_media_origins(media_origins)
 
