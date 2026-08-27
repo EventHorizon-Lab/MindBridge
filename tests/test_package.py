@@ -111,7 +111,7 @@ def test_dependency_surface_is_exact() -> None:
     assert {_name(item) for item in DEPENDENCIES} == {"httpx", "pydantic", "zvec"}
     assert {extra: {_name(item) for item in items} for extra, items in EXTRAS.items()} == {
         "local": {"funasr", "librosa", "numpy", "sentence-transformers", "soundfile"},
-        "face": {"insightface"},
+        "face": {"insightface", "onnxruntime"},
         "vllm": {"vllm"},
         "server": {"fastapi", "starlette", "uvicorn"},
         "mcp": {"mcp"},

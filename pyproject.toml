@@ -33,6 +33,8 @@ local = [
 ]
 face = [
     "insightface>=1.0.1,<2",
+    # ONNX Runtime 1.24+ declares Python 3.10 but publishes no Python 3.10 wheels.
+    "onnxruntime>=1.23.2,<1.24; python_version < '3.11'",
 ]
 vllm = [
     "vllm>=0.19.1,<1; sys_platform == 'linux' and platform_machine == 'x86_64'",

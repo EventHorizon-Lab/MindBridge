@@ -403,24 +403,25 @@ class Memory:
         """Transcribe speech and resolve stable local speaker identities."""
         with self._operation() as operation:
             normalized_id = _identifier(memory_id, "memory_id")
-            with self._write_lock, _translate_storage_errors("read speech memory"):
-                memory = self._store.read_memory(normalized_id)
-            if memory is None:
-                raise MemoryNotFoundError(f"memory does not exist: {normalized_id}")
-            speech_assets = tuple(
-                {
-                    asset.asset_id: asset
-                    for asset in memory.assets
-                    if asset.modality in {"audio", "video"}
-                }.values()
-            )
-            if not speech_assets:
-                return ()
-            if not isinstance(self._transcriber, SpeechBackend):
-                raise ModelError(
-                    "configured transcription backend does not provide speaker recognition"
+            with self._write_lock:
+                with _translate_storage_errors("read speech memory"):
+                    memory = self._store.read_memory(normalized_id)
+                if memory is None:
+                    raise MemoryNotFoundError(f"memory does not exist: {normalized_id}")
+                speech_assets = tuple(
+                    {
+                        asset.asset_id: asset
+                        for asset in memory.assets
+                        if asset.modality in {"audio", "video"}
+                    }.values()
                 )
-            self._lease_assets(speech_assets, operation.leased)
+                if not speech_assets:
+                    return ()
+                if not isinstance(self._transcriber, SpeechBackend):
+                    raise ModelError(
+                        "configured transcription backend does not provide speaker recognition"
+                    )
+                self._lease_assets(speech_assets, operation.leased)
             operation.persisted.update(asset.asset_id for asset in speech_assets)
             cached: dict[str, tuple[SpeakerSegment, ...]] = {}
             missing = []
@@ -462,28 +463,29 @@ class Memory:
         """Detect faces and resolve stable local identities."""
         with self._operation() as operation:
             normalized_id = _identifier(memory_id, "memory_id")
-            with self._write_lock, _translate_storage_errors("read face memory"):
-                memory = self._store.read_memory(normalized_id)
-            if memory is None:
-                raise MemoryNotFoundError(f"memory does not exist: {normalized_id}")
-            face_assets = tuple(
-                {
-                    asset.asset_id: asset
-                    for asset in memory.assets
-                    if asset.modality in {"image", "video"}
-                }.values()
-            )
-            if not face_assets:
-                return ()
-            unsupported = {
-                Modality(asset.modality)
-                for asset in face_assets
-                if Modality(asset.modality) not in self._face_capabilities
-            }
-            if unsupported:
-                names = ", ".join(sorted(modality.value for modality in unsupported))
-                raise ModelError(f"configured face model does not support: {names}")
-            self._lease_assets(face_assets, operation.leased)
+            with self._write_lock:
+                with _translate_storage_errors("read face memory"):
+                    memory = self._store.read_memory(normalized_id)
+                if memory is None:
+                    raise MemoryNotFoundError(f"memory does not exist: {normalized_id}")
+                face_assets = tuple(
+                    {
+                        asset.asset_id: asset
+                        for asset in memory.assets
+                        if asset.modality in {"image", "video"}
+                    }.values()
+                )
+                if not face_assets:
+                    return ()
+                unsupported = {
+                    Modality(asset.modality)
+                    for asset in face_assets
+                    if Modality(asset.modality) not in self._face_capabilities
+                }
+                if unsupported:
+                    names = ", ".join(sorted(modality.value for modality in unsupported))
+                    raise ModelError(f"configured face model does not support: {names}")
+                self._lease_assets(face_assets, operation.leased)
             cached: dict[str, tuple[FaceMatch, ...]] = {}
             missing = []
             with _translate_storage_errors("read cached face recognition"):

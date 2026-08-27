@@ -470,6 +470,85 @@ def test_face_and_voice_recognition_use_one_mergeable_identity_registry(
     assert face_recognizer.closed is True
 
 
+@pytest.mark.parametrize(
+    ("method_name", "content"),
+    (
+        ("faces", Blob(b"portrait", "image/png", "portrait.png")),
+        ("speech", Blob(b"voice", "audio/wav", "voice.wav")),
+    ),
+)
+def test_media_analysis_leases_assets_before_concurrent_delete(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    method_name: str,
+    content: Blob,
+) -> None:
+    with Memory(
+        tmp_path,
+        _config(),
+        models=_FakeModels(),
+        embedder=_FakeEmbedder(),
+        transcriber=_FakeSpeech(),
+        face_recognizer=_FakeFace(),
+    ) as memory:
+        record = memory.add(content)
+        lease_started = Event()
+        continue_lease = Event()
+        delete_entered_store = Event()
+        original_lease = memory._lease_assets
+        original_delete = memory._store.delete_memory_with_assets
+
+        def blocking_lease(
+            assets: Sequence[StoredAsset],
+            leased: list[StoredAsset],
+        ) -> None:
+            lease_started.set()
+            assert continue_lease.wait(5)
+            original_lease(assets, leased)
+
+        def observed_delete(memory_id: str) -> tuple[bool, tuple[StoredAsset, ...]]:
+            delete_entered_store.set()
+            return original_delete(memory_id)
+
+        monkeypatch.setattr(memory, "_lease_assets", blocking_lease)
+        monkeypatch.setattr(memory._store, "delete_memory_with_assets", observed_delete)
+        results: list[object] = []
+        errors: list[BaseException] = []
+        deleted: list[bool] = []
+
+        def analyze() -> None:
+            try:
+                matches = (
+                    memory.faces(record.id) if method_name == "faces" else memory.speech(record.id)
+                )
+                results.extend(matches)
+            except BaseException as error:
+                errors.append(error)
+
+        def delete() -> None:
+            try:
+                deleted.append(memory.delete(record.id))
+            except BaseException as error:
+                errors.append(error)
+
+        analysis_thread = Thread(target=analyze)
+        delete_thread = Thread(target=delete)
+        analysis_thread.start()
+        assert lease_started.wait(2)
+        delete_thread.start()
+        delete_raced_ahead = delete_entered_store.wait(0.2)
+        continue_lease.set()
+        analysis_thread.join(5)
+        delete_thread.join(5)
+
+        assert delete_raced_ahead is False
+        assert not analysis_thread.is_alive()
+        assert not delete_thread.is_alive()
+        assert errors == []
+        assert results
+        assert deleted == [True]
+
+
 def test_add_many_deduplicates_one_model_and_store_batch(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1030,9 +1109,8 @@ def test_generation_never_silently_drops_visual_evidence(tmp_path: Path) -> None
 
 def test_memory_rejects_oversized_and_recursive_input_before_model_work(tmp_path: Path) -> None:
     models = _FakeModels()
-    nested: dict[str, object] = {}
-    for _depth in range(1_100):
-        nested = {"nested": nested}
+    recursive: dict[str, object] = {}
+    recursive["nested"] = recursive
 
     with Memory(tmp_path, _config(), models=models) as memory:
         with pytest.raises(ValidationError, match="65536"):
@@ -1040,7 +1118,7 @@ def test_memory_rejects_oversized_and_recursive_input_before_model_work(tmp_path
         with pytest.raises(ValidationError, match="262144"):
             memory.add("valid", metadata={"blob": "x" * 262_144})
         with pytest.raises(ValidationError, match="JSON-compatible"):
-            memory.add("valid", metadata=nested)
+            memory.add("valid", metadata=recursive)
 
     assert models.embed_batches == []
 
