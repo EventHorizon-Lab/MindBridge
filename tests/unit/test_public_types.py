@@ -21,6 +21,7 @@ from mindbridge.types import (
     AssetRef,
     Blob,
     MemoryRecord,
+    MemoryType,
     Modality,
     Page,
     SearchHit,
@@ -38,6 +39,7 @@ def test_memory_record_metadata_is_detached_and_serializable() -> None:
     metadata["source"] = "microphone"
 
     assert memory.metadata == {"source": "camera"}
+    assert memory.memory_type is MemoryType.SEMANTIC
     memory.metadata["source"] = "local edit"  # type: ignore[index]
     assert asdict(memory)["metadata"] == {"source": "local edit"}
     assert pickle.loads(pickle.dumps(memory)) == memory
@@ -46,15 +48,29 @@ def test_memory_record_metadata_is_detached_and_serializable() -> None:
 
 
 def test_search_hit_is_flat_and_rejects_invalid_scores() -> None:
-    hit = SearchHit(id="memory_1", content="A red screwdriver.", score=0.9, created_at=NOW)
+    hit = SearchHit(
+        id="memory_1",
+        content="A red screwdriver.",
+        score=0.9,
+        created_at=NOW,
+        memory_type=MemoryType.EPISODIC,
+    )
 
     assert hit.id == "memory_1"
     assert hit.content == "A red screwdriver."
+    assert hit.memory_type is MemoryType.EPISODIC
     assert not hasattr(hit, "memory")
     with pytest.raises(ValidationError, match="between zero and one"):
         SearchHit(id="memory_1", content="A red screwdriver.", score=float("nan"), created_at=NOW)
     with pytest.raises(ValidationError, match="between zero and one"):
         SearchHit(id="memory_1", content="A red screwdriver.", score=1.1, created_at=NOW)
+    with pytest.raises(ValidationError, match="memory_type"):
+        MemoryRecord(
+            id="memory_1",
+            content="A red screwdriver.",
+            created_at=NOW,
+            memory_type="episodic",  # type: ignore[arg-type]
+        )
 
 
 def test_media_inputs_are_explicit_immutable_values(tmp_path: Path) -> None:

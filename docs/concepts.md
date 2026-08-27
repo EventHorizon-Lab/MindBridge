@@ -1,7 +1,7 @@
 # Core concepts
 
-MindBridge deliberately has fewer moving parts than a memory service. Six concepts explain its
-public behavior.
+MindBridge deliberately has fewer moving parts than a memory service. The concepts below explain
+its public behavior.
 
 ## Content and modality
 
@@ -32,6 +32,7 @@ two or more media families are omni.
 | `id` | Stable SHA-256 memory identity |
 | `content` | Normalized text, plus audio transcript text persisted only by add-time embedding fallback |
 | `modality` | Persisted modality; response layers do not recompute it |
+| `memory_type` | Semantic, episodic, or procedural cognitive role |
 | `assets` | Ordered, resolved `AssetRef` values |
 | `created_at` | Time the record was first stored |
 | `occurred_at` | Optional timezone-aware event time |
@@ -45,11 +46,22 @@ A Python caller may pass an opaque `AssetRef(id=...)` to reuse existing bytes. M
 it through authoritative SQLite. The reference is rejected when it does not exist or its modality
 hint contradicts the stored descriptor.
 
+## Memory roles
+
+`MemoryType.SEMANTIC` stores facts and stable knowledge and is the default.
+`MemoryType.EPISODIC` stores situated experiences; pair it with `occurred_at` when event time is
+known. `MemoryType.PROCEDURAL` stores reusable instructions, examples, and routines. Procedural
+records are grounding evidence and are never executed by MindBridge.
+
+The role is explicit caller input, persisted in SQLite and Zvec, returned on records and hits, and
+available as a search filter. MindBridge does not run another model call to infer or rewrite it.
+See [memory types, temporal reasoning, and decay](memory-types-time-and-decay.md).
+
 ## Stable identity and idempotency
 
-Before hashing, MindBridge canonicalizes text, ordered asset digests, event time, and JSON metadata.
-Equivalent logical input has the same memory ID. Repeating an add returns the existing record
-without storing the same bytes or embedding the record again.
+Before hashing, MindBridge canonicalizes text, ordered asset digests, memory role, event time, and
+JSON metadata. Equivalent logical input has the same memory ID. Repeating an add returns the
+existing record without storing the same bytes or embedding the record again.
 
 The asset store separately de-duplicates identical media bytes by SHA-256. Multiple memories can
 reference one immutable file. Deleting a memory removes a media file only after its final record
@@ -78,9 +90,10 @@ not see one another's memories, give them different directories and apply filesy
 
 ## Authority and search projection
 
-SQLite and the content-addressed asset files are authoritative. SQLite stores records, asset
-descriptors and relationships, FP32 embeddings, the embedding/index recipe, and a durable outbox
-of index work. A successful SQLite commit survives even if Zvec cannot be updated immediately.
+SQLite and the content-addressed asset files are authoritative. SQLite stores records, memory
+roles, event/access times, asset descriptors and relationships, FP32 embeddings, the
+embedding/index recipe, and a durable outbox of index work. A successful SQLite commit survives
+even if Zvec cannot be updated immediately.
 
 Zvec is a rebuildable hybrid-search projection. Search gets ranked candidate IDs from Zvec and
 hydrates complete records from SQLite. An index ID that no longer exists in SQLite is discarded.
@@ -125,8 +138,10 @@ attach a display name with `register_speaker`; the biometric vector remains loca
 ## Retrieval and grounded answers
 
 `search` uses Zvec dense plus full-text retrieval when the routed query contains text. A pure-media
-query uses dense retrieval only. Each hydrated hit has a score from 0 through 1; scores rank results
-within a request and are not stable global probabilities.
+query uses dense retrieval only. Type filters and detected event-time ranges are pushed into Zvec
+and rechecked after SQLite hydration. Temporal intent and optional decay over-fetch a bounded pool
+and rerank it. Each hydrated hit has a score from 0 through 1; scores rank results within a request
+and are not stable global probabilities.
 
 `ask` retrieves evidence first and routes those hits, including retained media, to generation.
 Generation-time ASR can cache an asset transcript, but it does not rewrite an existing record's
@@ -138,7 +153,7 @@ Operations on one instance may overlap remote model calls. MindBridge serializes
 SQLite commit/outbox and Zvec access sections that must observe one coherent local state.
 
 The current retrieval ceiling is intentionally explicit: one memory has one aggregate embedding.
-MindBridge does not yet chunk content, create one vector per asset, or rerank candidates.
+MindBridge does not yet chunk content, create one vector per asset, or use a learned reranker.
 With built-in `data` transport, each embedding or generation call also has a 64 MiB aggregate raw
 media ceiling before base64 encoding; co-located `file` transport or a streaming custom backend is
 the large-video path.

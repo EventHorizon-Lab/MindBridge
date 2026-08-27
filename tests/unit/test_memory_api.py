@@ -40,7 +40,7 @@ from mindbridge.models.base import (
     SpeechAnalysis,
     SpeechTurn,
 )
-from mindbridge.types import AnswerResult, AssetRef, Blob, Modality, SearchHit
+from mindbridge.types import AnswerResult, AssetRef, Blob, MemoryType, Modality, SearchHit
 
 ALL_INPUT_MODALITIES = frozenset({Modality.TEXT, Modality.IMAGE, Modality.VIDEO, Modality.AUDIO})
 
@@ -203,6 +203,9 @@ class _FakeIndex:
         limit: int = 10,
         space_id: str | None = None,
         task: str | None = None,
+        memory_type: str | None = None,
+        occurred_from: datetime | None = None,
+        occurred_until: datetime | None = None,
         ef: int | None = None,
         exact: bool = False,
     ) -> tuple[IndexHit, ...]:
@@ -215,6 +218,7 @@ class _FakeIndex:
             for document_id, document in self.documents.items()
             if (space_id is None or document.embedding.space_id == space_id)
             and (task is None or document.embedding.task == task)
+            and self._matches_time_and_type(document, memory_type, occurred_from, occurred_until)
         )[:limit]
 
     def hybrid_search(
@@ -226,6 +230,9 @@ class _FakeIndex:
         candidate_limit: int | None = None,
         space_id: str | None = None,
         task: str | None = None,
+        memory_type: str | None = None,
+        occurred_from: datetime | None = None,
+        occurred_until: datetime | None = None,
         ef: int | None = None,
         exact: bool = False,
     ) -> tuple[IndexHit, ...]:
@@ -241,10 +248,34 @@ class _FakeIndex:
                 continue
             if task is not None and embedding.task != task:
                 continue
+            if not self._matches_time_and_type(
+                document, memory_type, occurred_from, occurred_until
+            ):
+                continue
             content_terms = set(document.content.casefold().split())
             relevance = 1.0 if query_terms & content_terms else 0.5
             hits.append(IndexHit(id=document_id, relevance=relevance))
         return tuple(sorted(hits, key=lambda hit: (-hit.relevance, hit.id))[:limit])
+
+    @staticmethod
+    def _matches_time_and_type(
+        document: IndexDocument | None,
+        memory_type: str | None,
+        occurred_from: datetime | None,
+        occurred_until: datetime | None,
+    ) -> bool:
+        if memory_type is None and occurred_from is None and occurred_until is None:
+            return True
+        if document is None or (memory_type is not None and document.memory_type != memory_type):
+            return False
+        if occurred_from is None and occurred_until is None:
+            return True
+        occurred_at = document.occurred_at
+        return (
+            occurred_at is not None
+            and (occurred_from is None or occurred_at >= occurred_from)
+            and (occurred_until is None or occurred_at < occurred_until)
+        )
 
     def flush(self) -> None:
         if self.fail_next_flush:
@@ -286,12 +317,17 @@ def _fake_index(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(memory_module, "ZvecIndex", _FakeIndex)
 
 
-def _config(*, model: str = "fake-embedding") -> Config:
+def _config(
+    *,
+    model: str = "fake-embedding",
+    decay_half_life_days: float | None = None,
+) -> Config:
     return Config(
         base_url="https://models.example.test/v1",
         embedding_model=model,
         generation_model="fake-generation",
         embedding_dimension=2,
+        decay_half_life_days=decay_half_life_days,
     )
 
 
@@ -328,6 +364,76 @@ def test_crud_search_ask_and_stable_duplicate(tmp_path: Path) -> None:
 
     assert models.closed is True
     assert models.close_calls == 1
+
+
+def test_memory_types_are_stable_and_filterable(tmp_path: Path) -> None:
+    with Memory(tmp_path, _config(), models=_FakeModels()) as memory:
+        semantic = memory.add("shared instruction")
+        assert memory.add("shared instruction", memory_type=MemoryType.SEMANTIC) == semantic
+        episodic = memory.add("shared instruction", memory_type=MemoryType.EPISODIC)
+        procedural = memory.add("shared instruction", memory_type=MemoryType.PROCEDURAL)
+        _FakeIndex.instances[-1].hits_override = tuple(
+            IndexHit(id=record.id, relevance=1.0) for record in (semantic, procedural, episodic)
+        )
+
+        assert len({semantic.id, episodic.id, procedural.id}) == 3
+        assert semantic.memory_type is MemoryType.SEMANTIC
+        assert memory.search("shared", memory_type=MemoryType.EPISODIC)[0].id == episodic.id
+        assert memory.search("shared", memory_type=MemoryType.PROCEDURAL)[0].id == procedural.id
+        with pytest.raises(ValidationError, match="MemoryType"):
+            memory.add("invalid type", memory_type="episodic")  # type: ignore[arg-type]
+
+
+def test_relative_time_prefers_event_time_and_routes_the_reference(tmp_path: Path) -> None:
+    reference = datetime(2026, 8, 27, 12, tzinfo=timezone.utc)
+    models = _FakeModels()
+    with Memory(tmp_path, _config(), models=models) as memory:
+        previous = memory.add(
+            "项目评审发生了",
+            occurred_at=datetime(2026, 8, 20, 9, tzinfo=timezone.utc),
+            memory_type=MemoryType.EPISODIC,
+        )
+        memory.add(
+            "项目评审发生了",
+            occurred_at=datetime(2026, 8, 26, 9, tzinfo=timezone.utc),
+            memory_type=MemoryType.EPISODIC,
+        )
+
+        answer = memory.ask(
+            "上周发生了什么?",
+            limit=1,
+            memory_type=MemoryType.EPISODIC,
+            reference_at=reference,
+        )
+
+    assert answer.hits[0].id == previous.id
+    assert "Reference time for relative dates: 2026-08-27T12:00:00.000000Z" in (
+        models.answer_calls[-1][0].text
+    )
+
+
+def test_decay_reranks_softly_and_reinforces_only_returned_hits(tmp_path: Path) -> None:
+    reference = datetime(2026, 8, 27, 12, tzinfo=timezone.utc)
+    with Memory(
+        tmp_path,
+        _config(decay_half_life_days=7),
+        models=_FakeModels(),
+    ) as memory:
+        memory.add(
+            "shared memory old",
+            occurred_at=datetime(2026, 7, 1, tzinfo=timezone.utc),
+        )
+        fresh = memory.add(
+            "shared memory fresh",
+            occurred_at=datetime(2026, 8, 27, 11, tzinfo=timezone.utc),
+        )
+        assert memory.search("shared memory", limit=1, reference_at=reference)[0].id == fresh.id
+
+    with LocalStore(tmp_path) as store:
+        stored = store.read_memory(fresh.id)
+        assert stored is not None
+        assert stored.access_count == 1
+        assert stored.last_accessed_at is not None
 
 
 def test_explicit_embedder_owns_embedding_and_models_own_generation(tmp_path: Path) -> None:
@@ -511,6 +617,20 @@ def test_missing_index_checkpoint_precedes_collection_creation(
     monkeypatch.setattr(memory_module, "ZvecIndex", _FakeIndex)
     with Memory(tmp_path, _config(), models=_FakeModels()):
         assert set(_FakeIndex.instances[-1].documents) == {record.id for record in records}
+
+
+def test_legacy_index_recipe_is_rebuilt_from_sqlite(tmp_path: Path) -> None:
+    with Memory(tmp_path, _config(), models=_FakeModels()) as memory:
+        record = memory.add("preserved episodic memory", memory_type=MemoryType.EPISODIC)
+    with LocalStore(tmp_path) as store:
+        store.set_metadata(
+            "index.recipe",
+            "zvec-0.7:hnsw-cosine-m50-efc500:fts-standard-lowercase:single-vector-v2",
+        )
+
+    with Memory(tmp_path, _config(), models=_FakeModels()):
+        document = _FakeIndex.instances[-1].documents[record.id]
+        assert document.memory_type == "episodic"
 
 
 def test_interrupted_reindex_is_completed_from_durable_sqlite(tmp_path: Path) -> None:

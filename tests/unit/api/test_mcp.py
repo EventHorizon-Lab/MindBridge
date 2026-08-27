@@ -28,6 +28,7 @@ from mindbridge.types import (
     Blob,
     ContentInput,
     MemoryRecord,
+    MemoryType,
     Modality,
     SearchHit,
 )
@@ -56,26 +57,42 @@ class FakeMemory:
         *,
         occurred_at: datetime | None = None,
         metadata: Mapping[str, object] | None = None,
+        memory_type: MemoryType = MemoryType.SEMANTIC,
     ) -> MemoryRecord:
         self._fail()
         copied_metadata = dict(metadata or {})
-        self.calls.append(("add", content, occurred_at, copied_metadata))
+        self.calls.append(("add", content, occurred_at, copied_metadata, memory_type))
         return _record(
             content=content if isinstance(content, str) else "Multimodal memory.",
             occurred_at=occurred_at,
             metadata=copied_metadata,
             modality=Modality.TEXT if isinstance(content, str) else Modality.IMAGE,
             assets=() if isinstance(content, str) else (ASSET,),
+            memory_type=memory_type,
         )
 
-    def search(self, query: ContentInput, *, limit: int = 10) -> tuple[SearchHit, ...]:
+    def search(
+        self,
+        query: ContentInput,
+        *,
+        limit: int = 10,
+        memory_type: MemoryType | None = None,
+        reference_at: datetime | None = None,
+    ) -> tuple[SearchHit, ...]:
         self._fail()
-        self.calls.append(("search", query, limit))
+        self.calls.append(("search", query, limit, memory_type, reference_at))
         return (_hit(),)
 
-    def ask(self, question: ContentInput, *, limit: int = 5) -> AnswerResult:
+    def ask(
+        self,
+        question: ContentInput,
+        *,
+        limit: int = 5,
+        memory_type: MemoryType | None = None,
+        reference_at: datetime | None = None,
+    ) -> AnswerResult:
         self._fail()
-        self.calls.append(("ask", question, limit))
+        self.calls.append(("ask", question, limit, memory_type, reference_at))
         return AnswerResult(answer="The toolbox is blue.", hits=(_hit(),))
 
     def get(self, memory_id: str) -> MemoryRecord:
@@ -110,14 +127,18 @@ async def test_mcp_publishes_only_the_five_flat_local_tools() -> None:
         "delete_memory",
     }
     assert {name: set(tool.input_schema["properties"]) for name, tool in tools.items()} == {
-        "add_memory": {"content", "occurred_at", "metadata"},
-        "search_memories": {"query", "limit"},
-        "ask_memory": {"question", "limit"},
+        "add_memory": {"content", "occurred_at", "metadata", "memory_type"},
+        "search_memories": {"query", "limit", "memory_type", "reference_at"},
+        "ask_memory": {"question", "limit", "memory_type", "reference_at"},
         "get_memory": {"memory_id"},
         "delete_memory": {"memory_id"},
     }
     assert tools["get_memory"].annotations is not None
     assert tools["get_memory"].annotations.read_only_hint is True
+    assert tools["search_memories"].annotations is not None
+    assert tools["search_memories"].annotations.read_only_hint is False
+    assert tools["ask_memory"].annotations is not None
+    assert tools["ask_memory"].annotations.read_only_hint is False
     assert tools["delete_memory"].annotations is not None
     assert tools["delete_memory"].annotations.destructive_hint is True
     published = json.dumps({name: tool.input_schema for name, tool in tools.items()})
@@ -135,10 +156,25 @@ async def test_mcp_returns_structured_results_and_does_not_close_injected_memory
                 "content": "  The toolbox is blue.  ",
                 "occurred_at": NOW.isoformat(),
                 "metadata": {"room": "workshop"},
+                "memory_type": "episodic",
             },
         )
-        searched = await client.call_tool("search_memories", {"query": " toolbox "})
-        answered = await client.call_tool("ask_memory", {"question": " What color? "})
+        searched = await client.call_tool(
+            "search_memories",
+            {
+                "query": " toolbox ",
+                "memory_type": "episodic",
+                "reference_at": NOW.isoformat(),
+            },
+        )
+        answered = await client.call_tool(
+            "ask_memory",
+            {
+                "question": " What color? ",
+                "memory_type": "procedural",
+                "reference_at": NOW.isoformat(),
+            },
+        )
         found = await client.call_tool("get_memory", {"memory_id": "memory_1"})
         deleted = await client.call_tool("delete_memory", {"memory_id": "memory_1"})
 
@@ -147,6 +183,7 @@ async def test_mcp_returns_structured_results_and_does_not_close_injected_memory
         "id": "memory_1",
         "content": "The toolbox is blue.",
         "modality": "text",
+        "memory_type": "episodic",
         "assets": [],
         "created_at": NOW.isoformat().replace("+00:00", "Z"),
         "occurred_at": NOW.isoformat().replace("+00:00", "Z"),
@@ -160,9 +197,9 @@ async def test_mcp_returns_structured_results_and_does_not_close_injected_memory
     assert found.structured_content["id"] == "memory_1"
     assert deleted.structured_content == {"deleted": True}
     assert memory.calls == [
-        ("add", "The toolbox is blue.", NOW, {"room": "workshop"}),
-        ("search", "toolbox", 10),
-        ("ask", "What color?", 5),
+        ("add", "The toolbox is blue.", NOW, {"room": "workshop"}, MemoryType.EPISODIC),
+        ("search", "toolbox", 10, MemoryType.EPISODIC, NOW),
+        ("ask", "What color?", 5, MemoryType.PROCEDURAL, NOW),
         ("get", "memory_1"),
         ("delete", "memory_1"),
     ]
@@ -412,11 +449,13 @@ def _record(
     metadata: Mapping[str, object] | None = None,
     modality: Modality = Modality.TEXT,
     assets: tuple[AssetRef, ...] = (),
+    memory_type: MemoryType = MemoryType.SEMANTIC,
 ) -> MemoryRecord:
     return MemoryRecord(
         id=memory_id,
         content=content,
         modality=modality,
+        memory_type=memory_type,
         assets=assets,
         created_at=NOW,
         occurred_at=occurred_at,

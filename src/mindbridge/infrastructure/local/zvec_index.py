@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from importlib import import_module
 from pathlib import Path
 from types import ModuleType
@@ -14,10 +15,15 @@ from mindbridge.infrastructure.local.store import IndexDocument
 
 _COLLECTION_NAME = "mindbridge_memory_index"
 _CONTENT_FIELD = "content"
+_MEMORY_TYPE_FIELD = "memory_type"
+_OCCURRED_AT_FIELD = "occurred_at"
 _SPACE_FIELD = "space_id"
 _TASK_FIELD = "task"
 _VECTOR_FIELD = "embedding"
-_SCALAR_FIELDS = frozenset({_CONTENT_FIELD, _SPACE_FIELD, _TASK_FIELD})
+_SCALAR_FIELDS = frozenset(
+    {_CONTENT_FIELD, _MEMORY_TYPE_FIELD, _OCCURRED_AT_FIELD, _SPACE_FIELD, _TASK_FIELD}
+)
+_MISSING_OCCURRED_AT = -(2**63)
 _HNSW_M = 50
 _HNSW_EF_CONSTRUCTION = 500
 _DEFAULT_EF_SEARCH = 300
@@ -113,12 +119,15 @@ class ZvecIndex:
             self._validate_vector(embedding.values)
             _filter_literal(embedding.space_id, _SPACE_FIELD)
             _filter_literal(embedding.task, _TASK_FIELD)
+            _filter_literal(document.memory_type, _MEMORY_TYPE_FIELD)
             ids.append(embedding.embedding_id)
             docs.append(
                 self._zvec.Doc(
                     id=embedding.embedding_id,
                     fields={
                         _CONTENT_FIELD: document.content,
+                        _MEMORY_TYPE_FIELD: document.memory_type,
+                        _OCCURRED_AT_FIELD: _timestamp(document.occurred_at),
                         _SPACE_FIELD: embedding.space_id,
                         _TASK_FIELD: embedding.task,
                     },
@@ -147,6 +156,9 @@ class ZvecIndex:
         limit: int = 10,
         space_id: str | None = None,
         task: str | None = None,
+        memory_type: str | None = None,
+        occurred_from: datetime | None = None,
+        occurred_until: datetime | None = None,
         ef: int | None = None,
         exact: bool = False,
     ) -> tuple[IndexHit, ...]:
@@ -156,6 +168,9 @@ class ZvecIndex:
             limit=limit,
             space_id=space_id,
             task=task,
+            memory_type=memory_type,
+            occurred_from=occurred_from,
+            occurred_until=occurred_until,
             ef=ef,
             exact=exact,
         )
@@ -176,6 +191,9 @@ class ZvecIndex:
         candidate_limit: int | None = None,
         space_id: str | None = None,
         task: str | None = None,
+        memory_type: str | None = None,
+        occurred_from: datetime | None = None,
+        occurred_until: datetime | None = None,
         ef: int | None = None,
         exact: bool = False,
     ) -> tuple[IndexHit, ...]:
@@ -192,12 +210,21 @@ class ZvecIndex:
         if candidates < limit:
             raise ValueError("candidate_limit must not be smaller than limit")
 
-        filter_expression = _filter_expression(space_id=space_id, task=task)
+        filter_expression = _filter_expression(
+            space_id=space_id,
+            task=task,
+            memory_type=memory_type,
+            occurred_from=occurred_from,
+            occurred_until=occurred_until,
+        )
         dense = self._dense_query(
             values,
             limit=candidates,
             space_id=space_id,
             task=task,
+            memory_type=memory_type,
+            occurred_from=occurred_from,
+            occurred_until=occurred_until,
             ef=ef,
             exact=exact,
         )
@@ -288,6 +315,9 @@ class ZvecIndex:
         limit: int,
         space_id: str | None,
         task: str | None,
+        memory_type: str | None,
+        occurred_from: datetime | None,
+        occurred_until: datetime | None,
         ef: int | None,
         exact: bool,
     ) -> list[object]:
@@ -307,7 +337,13 @@ class ZvecIndex:
                     ),
                 ),
                 topk=limit,
-                filter=_filter_expression(space_id=space_id, task=task),
+                filter=_filter_expression(
+                    space_id=space_id,
+                    task=task,
+                    memory_type=memory_type,
+                    occurred_from=occurred_from,
+                    occurred_until=occurred_until,
+                ),
                 include_vector=False,
                 output_fields=[],
             ),
@@ -325,6 +361,18 @@ class ZvecIndex:
                         tokenizer_name="standard",
                         filters=["lowercase"],
                     ),
+                ),
+                self._zvec.FieldSchema(
+                    name=_MEMORY_TYPE_FIELD,
+                    data_type=self._zvec.DataType.STRING,
+                    nullable=False,
+                    index_param=self._zvec.InvertIndexParam(),
+                ),
+                self._zvec.FieldSchema(
+                    name=_OCCURRED_AT_FIELD,
+                    data_type=self._zvec.DataType.INT64,
+                    nullable=False,
+                    index_param=self._zvec.InvertIndexParam(),
                 ),
                 self._zvec.FieldSchema(
                     name=_SPACE_FIELD,
@@ -371,7 +419,7 @@ class ZvecIndex:
             or tuple(content.index_param.filters) != ("lowercase",)
         ):
             _schema_mismatch("content FTS field differs")
-        for name in (_SPACE_FIELD, _TASK_FIELD):
+        for name in (_MEMORY_TYPE_FIELD, _SPACE_FIELD, _TASK_FIELD):
             field = fields[name]
             if (
                 field.data_type != self._zvec.DataType.STRING
@@ -380,6 +428,14 @@ class ZvecIndex:
                 or field.index_param.type != self._zvec.IndexType.INVERT
             ):
                 _schema_mismatch(f"{name} filter field differs")
+        occurred_at = fields[_OCCURRED_AT_FIELD]
+        if (
+            occurred_at.data_type != self._zvec.DataType.INT64
+            or occurred_at.nullable
+            or occurred_at.index_param is None
+            or occurred_at.index_param.type != self._zvec.IndexType.INVERT
+        ):
+            _schema_mismatch(f"{_OCCURRED_AT_FIELD} filter field differs")
 
         vectors = {vector.name: vector for vector in native_schema.vectors}
         if vectors.keys() != {_VECTOR_FIELD}:
@@ -443,12 +499,27 @@ def _load_zvec() -> ModuleType:
         ) from error
 
 
-def _filter_expression(*, space_id: str | None, task: str | None) -> str | None:
+def _filter_expression(
+    *,
+    space_id: str | None = None,
+    task: str | None = None,
+    memory_type: str | None = None,
+    occurred_from: datetime | None = None,
+    occurred_until: datetime | None = None,
+) -> str | None:
     clauses = []
     if space_id is not None:
         clauses.append(f"{_SPACE_FIELD} = {_filter_literal(space_id, _SPACE_FIELD)}")
     if task is not None:
         clauses.append(f"{_TASK_FIELD} = {_filter_literal(task, _TASK_FIELD)}")
+    if memory_type is not None:
+        clauses.append(f"{_MEMORY_TYPE_FIELD} = {_filter_literal(memory_type, _MEMORY_TYPE_FIELD)}")
+    if occurred_from is not None:
+        clauses.append(f"{_OCCURRED_AT_FIELD} >= {_timestamp(occurred_from)}")
+    if occurred_until is not None:
+        clauses.append(f"{_OCCURRED_AT_FIELD} < {_timestamp(occurred_until)}")
+    if occurred_from is not None and occurred_until is not None and occurred_until <= occurred_from:
+        raise ValueError("occurred_until must be later than occurred_from")
     return " AND ".join(clauses) or None
 
 
@@ -458,6 +529,15 @@ def _filter_literal(value: str, name: str) -> str:
     if "'" in value or "\\" in value or any(ord(character) < 32 for character in value):
         raise ValueError(f"{name} contains characters unsupported by Zvec filters")
     return f"'{value}'"
+
+
+def _timestamp(value: datetime | None) -> int:
+    if value is None:
+        return _MISSING_OCCURRED_AT
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError("occurred_at filters must include a timezone")
+    delta = value.astimezone(timezone.utc) - datetime(1970, 1, 1, tzinfo=timezone.utc)
+    return (delta.days * 86_400 + delta.seconds) * 1_000_000 + delta.microseconds
 
 
 def _required_score(doc: object) -> float:

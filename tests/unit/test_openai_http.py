@@ -36,6 +36,7 @@ def test_config_resolves_independent_endpoints_keys_and_explicit_capabilities() 
             "MINDBRIDGE_TRANSCRIPTION_SPACE": "speech-recipe-v2",
             "MINDBRIDGE_EMBEDDING_DIMENSION": "2",
             "MINDBRIDGE_TIMEOUT_SECONDS": "3.5",
+            "MINDBRIDGE_DECAY_HALF_LIFE_DAYS": "30",
             "MINDBRIDGE_MEDIA_TRANSPORT": "file",
             "MINDBRIDGE_ALLOWED_URL_HOSTS": "media.example.test, CDN.EXAMPLE.TEST. ",
             "MINDBRIDGE_EMBEDDING_MODALITIES": "omni",
@@ -54,6 +55,7 @@ def test_config_resolves_independent_endpoints_keys_and_explicit_capabilities() 
     assert config.transcription_space == "speech-recipe-v2"
     assert config.embedding_dimension == 2
     assert config.timeout_seconds == 3.5
+    assert config.decay_half_life_days == 30.0
     assert config.media_transport == "file"
     assert config.allowed_url_hosts == {"media.example.test", "cdn.example.test"}
     assert config.capabilities.embedding == ALL_MODALITIES
@@ -63,6 +65,12 @@ def test_config_resolves_independent_endpoints_keys_and_explicit_capabilities() 
     assert "embed-secret" not in repr(config)
     with pytest.raises(ValidationError):
         Config.from_environment({"MINDBRIDGE_EMBEDDING_DIMENSION": "many"})
+    with pytest.raises(ValidationError, match="positive number"):
+        Config.from_environment({"MINDBRIDGE_DECAY_HALF_LIFE_DAYS": "0"})
+    with pytest.raises(ValidationError, match="too small"):
+        Config(decay_half_life_days=1e-20)
+    with pytest.raises(ValidationError, match="too large"):
+        Config(decay_half_life_days=1e308)
     with pytest.raises(ValidationError, match="hostnames"):
         Config(allowed_url_hosts=frozenset({"https://media.example.test"}))
     with pytest.raises(ValidationError, match="ports"):
@@ -188,6 +196,7 @@ def test_answer_serializes_temporal_and_metadata_evidence() -> None:
         assert hit == {
             "id": "memory_1",
             "content": "The red parcel arrived.",
+            "memory_type": "semantic",
             "occurred_at": occurred_at.isoformat(),
             "created_at": NOW.isoformat(),
             "metadata": {"dialog": "delivery", "turn": 7},
