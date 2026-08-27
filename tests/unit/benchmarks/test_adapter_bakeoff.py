@@ -119,6 +119,11 @@ async def test_the_bakeoff_opts_both_adapters_into_their_repository_code(
     monkeypatch.setattr(
         "mindbridge.benchmarks.adapter_bakeoff.SentenceTransformersEmbedder", _Loader
     )
+    # The manifest records torch and sentence-transformers versions, and neither is installed on
+    # any CI leg -- CI syncs `--extra media --extra server`, not `cloud-models`. Stubbing the
+    # lookup keeps this test *running* there rather than skipping, which matters because the
+    # defect it guards can only ever be caught by a test, never by the bakeoff running in CI.
+    monkeypatch.setattr("mindbridge.benchmarks.adapter_bakeoff.version", lambda _name: "0.0.0-test")
 
     await run_adapter_bakeoff(
         corpus=PairCorpus(
