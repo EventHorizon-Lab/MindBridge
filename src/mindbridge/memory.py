@@ -1911,7 +1911,7 @@ def _optional_memory_type(value: object) -> MemoryType | None:
 
 
 def _with_reference_time(content: _PreparedContent, reference_at: datetime) -> _PreparedContent:
-    note = f"Reference time for relative dates: {_datetime_text(reference_at)}"
+    note = f"Reference time for relative dates: {reference_at.isoformat(timespec='microseconds')}"
     return replace(content, text=f"{content.text}\n\n{note}" if content.text else note)
 
 

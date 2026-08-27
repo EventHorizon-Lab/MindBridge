@@ -385,7 +385,7 @@ def test_memory_types_are_stable_and_filterable(tmp_path: Path) -> None:
 
 
 def test_relative_time_prefers_event_time_and_routes_the_reference(tmp_path: Path) -> None:
-    reference = datetime(2026, 8, 27, 12, tzinfo=timezone.utc)
+    reference = datetime(2026, 8, 27, 0, 30, tzinfo=timezone(timedelta(hours=14)))
     models = _FakeModels()
     with Memory(tmp_path, _config(), models=models) as memory:
         previous = memory.add(
@@ -407,7 +407,7 @@ def test_relative_time_prefers_event_time_and_routes_the_reference(tmp_path: Pat
         )
 
     assert answer.hits[0].id == previous.id
-    assert "Reference time for relative dates: 2026-08-27T12:00:00.000000Z" in (
+    assert "Reference time for relative dates: 2026-08-27T00:30:00.000000+14:00" in (
         models.answer_calls[-1][0].text
     )
 
@@ -427,7 +427,9 @@ def test_decay_reranks_softly_and_reinforces_only_returned_hits(tmp_path: Path) 
             "shared memory fresh",
             occurred_at=datetime(2026, 8, 27, 11, tzinfo=timezone.utc),
         )
-        assert memory.search("shared memory", limit=1, reference_at=reference)[0].id == fresh.id
+        hit = memory.search("shared memory", limit=1, reference_at=reference)[0]
+        assert hit.id == fresh.id
+        assert hit.score == 1.0
 
     with LocalStore(tmp_path) as store:
         stored = store.read_memory(fresh.id)
@@ -1081,9 +1083,8 @@ def test_generation_never_silently_drops_visual_evidence(tmp_path: Path) -> None
 
 def test_memory_rejects_oversized_and_recursive_input_before_model_work(tmp_path: Path) -> None:
     models = _FakeModels()
-    nested: dict[str, object] = {}
-    for _depth in range(1_100):
-        nested = {"nested": nested}
+    recursive: dict[str, object] = {}
+    recursive["recursive"] = recursive
 
     with Memory(tmp_path, _config(), models=models) as memory:
         with pytest.raises(ValidationError, match="65536"):
@@ -1091,7 +1092,7 @@ def test_memory_rejects_oversized_and_recursive_input_before_model_work(tmp_path
         with pytest.raises(ValidationError, match="262144"):
             memory.add("valid", metadata={"blob": "x" * 262_144})
         with pytest.raises(ValidationError, match="JSON-compatible"):
-            memory.add("valid", metadata=nested)
+            memory.add("valid", metadata=recursive)
 
     assert models.embed_batches == []
 
