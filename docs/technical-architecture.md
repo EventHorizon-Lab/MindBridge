@@ -147,17 +147,18 @@ For each operation, routing compares input atomic modalities with `ModelCapabili
 
 Transcripts can be retained with authoritative asset metadata so repeated use need not invoke ASR
 again. Add-time embedding fallback persists derived transcript text in `memory_records.content`.
-Generation-time fallback caches the asset transcript but does not rewrite an existing record's
-content. Neither fallback changes the persisted media modality. SQLite stores the backend's
+Grounded generation with a `SpeechBackend` persists timed turns and identity matches, then adds the
+complete identity fields to model-only evidence without rewriting an existing record's content.
+Neither route changes the persisted media modality. SQLite stores the backend's
 `transcription_space` beside the embedding/index recipe and rejects a different value at startup.
 The identifier must change with any ASR model, preprocessing, language, prompting, or decoding
 choice that can change transcript text; changing it requires a new directory and re-ingestion.
 
 The default speech route is FunASR `AutoModel` composed from Fun-ASR-Nano, FSMN-VAD, and CAM++;
 the explicit vLLM route batch-decodes the same VAD spans before the same CAM++ clustering.
-`Memory.speech` stores timed turns and matches normalized CAM++ centroids within one physical
-directory. `SPK0`-style labels are asset-local and are never treated as identities. The first
-observation enrolls an opaque `speaker_id`; later clear cosine matches reuse it.
+`Memory.speech` and `Memory.ask` store timed turns and match normalized CAM++ centroids within one
+physical directory. `SPK0`-style labels are asset-local and are never treated as identities. The
+first observation enrolls an opaque `speaker_id`; later clear cosine matches reuse it.
 `Memory.register_speaker` attaches a display name without exposing the stored voiceprint.
 
 ## Asset transport to models

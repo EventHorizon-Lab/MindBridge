@@ -79,7 +79,9 @@ flowchart TD
 
 This is capability-driven, not a model-name heuristic. A visual-language model without audio
 support receives ASR text plus retained visual parts. Native audio-capable operations receive the
-original audio. Audio-only input becomes transcript-only only when fallback is required.
+original audio. Audio-only input becomes transcript-only only when fallback is required. Grounded
+generation with a `SpeechBackend` additionally receives timed segments, stable local speaker IDs,
+registered names, and identity scores for supported audio/video.
 
 Embedding is local Jina v5 Omni by default. Another standard Sentence Transformers model plugs in
 through `embedder=`; Qwen3-VL uses its native dict/message contract and advertised capabilities.

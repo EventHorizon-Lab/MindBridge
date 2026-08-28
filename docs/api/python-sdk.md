@@ -238,6 +238,10 @@ voiceprints. Repeated calls for the same asset and speech space do not run infer
 combined backend that only implements plain `transcribe` can provide ASR fallback but raises
 `ModelError` here because it has no speaker evidence.
 
+`ask` uses this same identity cache for supported audio/video in the question and retrieved hits.
+Generation receives every segment's timing, transcript, stable `speaker_id`, current
+`speaker_name`, and `identity_score`; the public `AnswerResult.hits` remain unchanged.
+
 ### `register_speaker`
 
 ```python
@@ -307,8 +311,10 @@ Input modality is derived from media families:
 
 The configured `ModelCapabilities` drives each operation. Unsupported audio can fall back through
 `transcribe`: audio is removed from that model call, transcript text is added, and supported image
-or video atoms remain. MindBridge never guesses from model names or silently drops unsupported
-visual media.
+or video atoms remain. When the configured transcriber is a `SpeechBackend`, grounded generation
+uses its full speaker analysis for supported audio/video regardless of whether generation accepts
+the native media. MindBridge never guesses from model names or silently drops unsupported visual
+media.
 
 ## `AsyncMemory`
 
@@ -448,10 +454,11 @@ into a new directory. `reindex()` does not re-embed.
 30-second VAD segment ceiling and `trust_remote_code=False`. Construct a different `FunASRRecipe`
 to swap that composition.
 
-For audio-to-text fallback, `Memory` uses `FunASRTranscriber.transcribe()` and skips CAM++ speaker
-embedding and clustering; `Memory.speech()` still calls `analyze()` for timed speaker evidence. If
-the embedder accepts audio but generation does not, `ask()` overlaps question transcription with
-query embedding and retrieval before invoking the generation model.
+Embedding-only audio-to-text fallback uses `FunASRTranscriber.transcribe()` and skips CAM++ speaker
+embedding and clustering. `Memory.speech()` and `Memory.ask()` call `analyze()` for timed identity
+evidence. When the embedder accepts a question's audio/video natively, `ask()` overlaps its complete
+speech analysis with query embedding and retrieval before invoking generation. If embedding needs
+the transcript, the one complete analysis runs first and its transcript is reused.
 
 For high-throughput CUDA inference, pin the vLLM build matching the machine's NVIDIA driver, then
 install `mindbridge[local,vllm]` and select it explicitly:

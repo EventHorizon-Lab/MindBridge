@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import sqlite3
@@ -1103,11 +1104,11 @@ def test_vlm_generation_transcribes_audio_once_and_keeps_video(tmp_path: Path) -
         assert len(models.transcribe_calls) == 1
 
 
-def test_vlm_generation_skips_speaker_analysis_until_speech_is_requested(
+def test_vlm_generation_recognizes_complete_speaker_identity_in_parallel(
     tmp_path: Path,
 ) -> None:
     query_started = Event()
-    transcript_started = Event()
+    identity_started = Event()
 
     class ParallelModels(_FakeModels):
         def embed(
@@ -1117,38 +1118,84 @@ def test_vlm_generation_skips_speaker_analysis_until_speech_is_requested(
         ) -> tuple[tuple[float, ...], ...]:
             if task is EmbedTask.QUERY:
                 query_started.set()
-                assert transcript_started.wait(timeout=1)
+                assert identity_started.wait(timeout=1)
             return super().embed(inputs, task)
 
-    class TranscriptSpeech(_FakeSpeech):
+    class IdentitySpeech(_FakeSpeech):
         def __init__(self) -> None:
             super().__init__()
-            self.transcribe_calls: list[tuple[AssetRef, ...]] = []
+            self.expect_parallel = False
 
-        def transcribe(self, assets: Sequence[AssetRef]) -> tuple[str, ...]:
-            batch = tuple(assets)
-            self.transcribe_calls.append(batch)
-            transcript_started.set()
-            assert query_started.wait(timeout=1)
-            return tuple("spoken red wrench" for _asset in batch)
+        def analyze(self, assets: Sequence[AssetRef]) -> tuple[SpeechAnalysis, ...]:
+            if self.expect_parallel:
+                identity_started.set()
+                assert query_started.wait(timeout=1)
+            return super().analyze(assets)
+
+        def transcribe(self, _assets: Sequence[AssetRef]) -> tuple[str, ...]:
+            raise AssertionError("answer generation must retain complete speaker identity")
 
     capabilities = ModelCapabilities(
         embedding=ALL_INPUT_MODALITIES,
-        generation=frozenset({Modality.TEXT}),
-        transcription=frozenset({Modality.AUDIO}),
+        generation=frozenset({Modality.TEXT, Modality.VIDEO}),
+        transcription=frozenset({Modality.AUDIO, Modality.VIDEO}),
     )
     models = ParallelModels(capabilities=capabilities)
-    speech = TranscriptSpeech()
+    speech = IdentitySpeech()
 
     with Memory(tmp_path, _config(), models=models, transcriber=speech) as memory:
-        record = memory.add(("red audio", Blob(b"audio", "audio/wav", "audio.wav")))
-        memory.ask(("what was said?", AssetRef(record.assets[0].id)))
+        record = memory.add(
+            (
+                "red recording",
+                Blob(b"stored audio", "audio/wav", "stored.wav"),
+                Blob(b"stored video", "video/mp4", "stored.mp4"),
+            )
+        )
+        enrolled = memory.speech(record.id)
+        speaker_id = enrolled[0].speaker_id
+        assert speaker_id is not None
+        assert {segment.speaker_id for segment in enrolled} == {speaker_id}
+        memory.register_speaker(speaker_id, "Alice")
 
-        assert len(speech.transcribe_calls) == 1
-        assert speech.calls == []
+        speech.expect_parallel = True
+        result = memory.ask(
+            ("red: who is speaking?", Blob(b"query audio", "audio/wav", "query.wav"))
+        )
 
-        memory.speech(record.id)
-        assert len(speech.calls) == 1
+        routed_question, routed_hits = models.answer_calls[-1]
+        question_evidence = [
+            json.loads(line)
+            for line in routed_question.text.splitlines()
+            if line.startswith('{"asset_id":')
+        ]
+        hit_evidence = [
+            json.loads(line)
+            for line in routed_hits[0].content.splitlines()
+            if line.startswith('{"asset_id":')
+        ]
+        assert len(question_evidence) == 1
+        assert question_evidence[0]["segments"] == [
+            {
+                "start_ms": 0,
+                "end_ms": 900,
+                "text": "spoken red wrench",
+                "speaker_id": speaker_id,
+                "speaker_name": "Alice",
+                "identity_score": 1.0,
+            }
+        ]
+        assert len(hit_evidence) == 2
+        assert all(
+            evidence["segments"][0]["speaker_id"] == speaker_id
+            and evidence["segments"][0]["speaker_name"] == "Alice"
+            for evidence in hit_evidence
+        )
+        assert routed_question.modalities == {Modality.TEXT}
+        assert routed_hits[0].modality is Modality.VIDEO
+        assert {asset.modality for asset in routed_hits[0].assets} == {Modality.VIDEO}
+        assert "[speech identities:" not in result.hits[0].content
+        assert memory._store.read_asset(question_evidence[0]["asset_id"]) is None
+        assert len(speech.calls) == 2
 
 
 def test_invalid_long_transcript_is_not_persisted(tmp_path: Path) -> None:

@@ -94,6 +94,49 @@ def test_default_funasr_recipe_transcribes_without_speakers_and_analyzes_them(
         transcriber.analyze((asset,))
 
 
+def test_silent_video_returns_empty_speech_without_loading_models(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    video = tmp_path / "silent.mp4"
+    video.write_bytes(b"fake silent video")
+    opened: list[str] = []
+
+    class Container:
+        streams = SimpleNamespace(audio=())
+
+        def close(self) -> None:
+            pass
+
+    def open_video(path: str) -> Container:
+        opened.append(path)
+        return Container()
+
+    def import_module(name: str) -> object:
+        if name == "av":
+            return SimpleNamespace(open=open_video)
+        raise AssertionError(f"silent video unexpectedly loaded {name}")
+
+    monkeypatch.setattr(funasr_module, "import_module", import_module)
+    digest = sha256(video.read_bytes()).hexdigest()
+    asset = AssetRef(
+        digest,
+        modality=Modality.VIDEO,
+        media_type="video/mp4",
+        size_bytes=video.stat().st_size,
+        sha256=digest,
+        name=video.name,
+        path=video,
+    )
+    transcriber = FunASRTranscriber()
+
+    assert transcriber.transcribe((asset,)) == ("",)
+    analysis = transcriber.analyze((asset,))[0]
+    assert analysis.turns == ()
+    assert analysis.speakers == ()
+    assert opened == [str(video.resolve()), str(video.resolve())]
+
+
 def test_vllm_batches_vad_spans_and_keeps_speaker_centroids(  # noqa: C901
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

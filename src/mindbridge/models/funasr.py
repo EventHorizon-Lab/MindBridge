@@ -223,10 +223,20 @@ class FunASRTranscriber:
         with self._lock:
             if self._closed:
                 raise ModelError("FunASR transcriber is closed")
+            selected = tuple(
+                (index, asset) for index, asset in enumerate(batch) if _has_audio_stream(asset)
+            )
+            if not selected:
+                return tuple(SpeechAnalysis(turns=(), speakers=()) for _asset in batch)
             pipeline = self._load()
+            selected_assets = tuple(asset for _index, asset in selected)
             if isinstance(pipeline, _VLLMPipeline):
-                return self._analyze_vllm(pipeline, batch)
-            return tuple(self._analyze_one(pipeline, asset) for asset in batch)
+                analyses = self._analyze_vllm(pipeline, selected_assets)
+            else:
+                analyses = tuple(self._analyze_one(pipeline, asset) for asset in selected_assets)
+            by_index = dict(zip((index for index, _asset in selected), analyses, strict=True))
+            empty = SpeechAnalysis(turns=(), speakers=())
+            return tuple(by_index.get(index, empty) for index in range(len(batch)))
 
     def transcribe(self, assets: Sequence[AssetRef]) -> tuple[str, ...]:
         """Transcribe media without running speaker diarization."""
@@ -234,10 +244,21 @@ class FunASRTranscriber:
         with self._lock:
             if self._closed:
                 raise ModelError("FunASR transcriber is closed")
+            selected = tuple(
+                (index, asset) for index, asset in enumerate(batch) if _has_audio_stream(asset)
+            )
+            if not selected:
+                return tuple("" for _asset in batch)
             pipeline = self._load()
+            selected_assets = tuple(asset for _index, asset in selected)
             if isinstance(pipeline, _VLLMPipeline):
-                return self._transcribe_vllm(pipeline, batch)
-            return tuple(self._transcribe_one(pipeline, asset) for asset in batch)
+                transcripts = self._transcribe_vllm(pipeline, selected_assets)
+            else:
+                transcripts = tuple(
+                    self._transcribe_one(pipeline, asset) for asset in selected_assets
+                )
+            by_index = dict(zip((index for index, _asset in selected), transcripts, strict=True))
+            return tuple(by_index.get(index, "") for index in range(len(batch)))
 
     def close(self) -> None:
         with self._lock:
@@ -540,6 +561,30 @@ def _load_waveform(asset: AssetRef) -> _Waveform:
     if callable(detach):
         waveform = detach().cpu().numpy()
     return cast(_Waveform, waveform)
+
+
+def _has_audio_stream(asset: AssetRef) -> bool:
+    if asset.modality is not Modality.VIDEO:
+        return True
+    path = asset.path
+    if path is None:
+        raise ValidationError("speech asset path is missing")
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError:
+        raise ValidationError("speech asset path does not exist") from None
+    try:
+        av = import_module("av")
+    except ImportError:
+        return True
+    try:
+        container = av.open(str(resolved))
+    except Exception:
+        return True
+    try:
+        return bool(container.streams.audio)
+    finally:
+        container.close()
 
 
 def _speech_spans(pipeline: _Pipeline, audio: _Waveform) -> tuple[tuple[int, int], ...]:

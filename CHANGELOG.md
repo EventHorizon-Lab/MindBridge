@@ -61,8 +61,9 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   model batches.
 - The OpenAI-compatible generation adapter consumes SSE completions internally so TTFT can be
   measured without changing the completed `AnswerResult`, REST, or MCP response contracts.
-- Audio questions overlap transcript fallback with native query retrieval, and the default FunASR
-  fallback skips speaker inference until `speech()` requests diarization.
+- Speech identity analysis for audio/video questions overlaps native query retrieval. Grounded
+  answers receive timed turns, stable local speaker IDs, registered names, and match confidence;
+  transcript-only inference remains limited to embedding fallback.
 - Isolation is now one physical `data_dir` per application or benchmark unit. There is no hidden
   default scope or logical partition inside a store.
 - The primary developer flow is `Memory()` → `add()` → `search()` or `ask()`.

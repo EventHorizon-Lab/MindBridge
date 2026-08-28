@@ -147,10 +147,11 @@ memory.reindex()
 memory.optimize()
 ```
 
-`speech` lazily runs Fun-ASR-Nano, VAD, and CAM++ the first time an audio/video asset needs speech
-analysis. CAM++ centroids stay in the same SQLite directory and match speakers across recordings.
-Register an opaque `speaker_id` once to receive `speaker_name` on later and cached turns; biometric
-vectors never leave the local store.
+`speech` and grounded `ask` lazily run Fun-ASR-Nano, VAD, and CAM++ the first time an audio/video
+asset needs speech analysis. CAM++ centroids stay in the same SQLite directory and match speakers
+across recordings. Register an opaque `speaker_id` once to receive `speaker_name` on later and
+cached turns; biometric vectors never leave the local store. `ask` gives generation the complete
+timed identity evidence, including the stable ID, registered name, and match score.
 
 `AsyncMemory` exposes the same operations with `await`. See the
 [Python API reference](docs/api/python-sdk.md) for exact values, routing, and failures.
@@ -221,7 +222,9 @@ limits serialized text evidence to 4 MiB, and sends each distinct binary asset o
 Capabilities are explicit. Configure only the modalities each operation actually accepts. When
 embedding or generation does not support audio, MindBridge transcribes it and sends the transcript
 together with any supported image or video input. Native audio-capable models receive audio
-directly. Routing is based on declared capabilities, never guessed from a model name.
+directly. With a `SpeechBackend`, grounded answers also resolve identities for supported audio and
+video even when generation accepts the native media. Routing is based on declared capabilities,
+never guessed from a model name.
 
 One `Memory` instance may call a backend concurrently. Custom `EmbeddingBackend`, `SpeechBackend`,
 and `ModelBackend` implementations must therefore be thread-safe until `close()`.
