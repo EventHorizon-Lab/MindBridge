@@ -5,7 +5,9 @@ from __future__ import annotations
 import base64
 import json
 import math
+import time
 from collections.abc import Sequence
+from contextlib import suppress
 from pathlib import Path
 from typing import Annotated, Literal, cast
 
@@ -62,6 +64,26 @@ class _ChatResponse(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     choices: list[_Choice]
+
+
+class _Delta(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    content: str | None = None
+
+
+class _StreamChoice(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    index: _StrictIndex
+    delta: _Delta
+    finish_reason: str | None = None
+
+
+class _ChatChunk(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    choices: list[_StreamChoice]
 
 
 class _TranscriptionResponse(BaseModel):
@@ -247,19 +269,7 @@ class OpenAIHTTP:
             payload["seed"] = self._generation_seed
         if self._generation_temperature is not None:
             payload["temperature"] = self._generation_temperature
-        response = self._post_json("generation", "chat/completions", payload)
-        try:
-            body = _ChatResponse.model_validate_json(response.content)
-        except PydanticValidationError:
-            raise ModelError("generation response was invalid") from None
-        if (
-            len(body.choices) != 1
-            or body.choices[0].index != 0
-            or body.choices[0].finish_reason in {"content_filter", "length"}
-            or not body.choices[0].message.content.strip()
-        ):
-            raise ModelError("generation response was invalid")
-        return AnswerResult(answer=body.choices[0].message.content.strip(), hits=grounded)
+        return AnswerResult(answer=self._generate(payload), hits=grounded)
 
     def transcribe(self, assets: Sequence[AssetRef]) -> tuple[str, ...]:
         """Transcribe resolved audio/video assets in input order."""
@@ -313,6 +323,50 @@ class OpenAIHTTP:
         _require_success(response, operation)
         return response
 
+    def _generate(self, payload: dict[str, object]) -> str:
+        api_key, base_url = self._endpoint("generation")
+        streamed = {**payload, "stream": True}
+        started = time.perf_counter()
+        ttft: float | None = None
+        failed = True
+        try:
+            try:
+                with self._client.stream(
+                    "POST",
+                    f"{base_url}/chat/completions",
+                    headers={"Authorization": f"Bearer {api_key}"},
+                    json=streamed,
+                    timeout=self._config.timeout_seconds,
+                ) as response:
+                    _require_success(response, "generation")
+                    if "text/event-stream" in response.headers.get("content-type", ""):
+                        answer, ttft = _streamed_answer(response, started)
+                    else:
+                        response.read()
+                        answer = _completed_answer(response.content)
+            except httpx.HTTPError:
+                raise ModelError("generation request failed") from None
+            failed = False
+            return answer
+        finally:
+            duration = time.perf_counter() - started
+            with suppress(Exception):
+                self._observe_generation(
+                    ttft_seconds=ttft,
+                    duration_seconds=duration,
+                    failed=failed,
+                )
+
+    def _observe_generation(
+        self,
+        *,
+        ttft_seconds: float | None,
+        duration_seconds: float,
+        failed: bool,
+    ) -> None:
+        """Receive private per-call timing without changing the model result contract."""
+        del ttft_seconds, duration_seconds, failed
+
     def _endpoint(self, operation: _Operation) -> tuple[str, str]:
         api_key = cast(str | None, getattr(self._config, f"{operation}_api_key"))
         base_url = cast(str | None, getattr(self._config, f"{operation}_base_url"))
@@ -327,6 +381,61 @@ class OpenAIHTTP:
 def _require_success(response: httpx.Response, operation: str) -> None:
     if not response.is_success:
         raise ModelError(f"{operation} request failed with HTTP {response.status_code}")
+
+
+def _completed_answer(content: bytes) -> str:
+    try:
+        body = _ChatResponse.model_validate_json(content)
+    except PydanticValidationError:
+        raise ModelError("generation response was invalid") from None
+    if len(body.choices) != 1:
+        raise ModelError("generation response was invalid")
+    choice = body.choices[0]
+    return _validated_answer(choice.index, choice.message.content, choice.finish_reason)
+
+
+def _streamed_answer(  # noqa: C901 - SSE validation is clearer in one pass
+    response: httpx.Response,
+    started: float,
+) -> tuple[str, float | None]:
+    parts: list[str] = []
+    ttft: float | None = None
+    completed = False
+    for line in response.iter_lines():
+        if not line.startswith("data:"):
+            continue
+        data = line.removeprefix("data:").strip()
+        if data == "[DONE]":
+            completed = True
+            break
+        try:
+            chunk = _ChatChunk.model_validate_json(data)
+        except PydanticValidationError:
+            raise ModelError("generation response was invalid") from None
+        if not chunk.choices:
+            continue
+        if len(chunk.choices) != 1:
+            raise ModelError("generation response was invalid")
+        choice = chunk.choices[0]
+        if choice.index != 0 or choice.finish_reason in {"content_filter", "length"}:
+            raise ModelError("generation response was invalid")
+        if choice.finish_reason is not None:
+            completed = True
+        content = choice.delta.content
+        if content:
+            if ttft is None:
+                ttft = time.perf_counter() - started
+            parts.append(content)
+    if not completed:
+        raise ModelError("generation response was invalid")
+    return _validated_answer(0, "".join(parts), None), ttft
+
+
+def _validated_answer(index: int, content: str, finish_reason: str | None) -> str:
+    answer = content.strip()
+    if index != 0 or finish_reason in {"content_filter", "length"} or not answer:
+        raise ModelError("generation response was invalid")
+    return answer
 
 
 def _require_capabilities(

@@ -166,6 +166,11 @@ The built-in backend calls:
 | Generation | `POST /v1/chat/completions` |
 | Transcription | `POST /v1/audio/transcriptions` |
 
+Generation requests ask the provider for an SSE stream and consume it into the existing completed
+`AnswerResult`. This preserves the Python, REST, and MCP response contracts while allowing
+benchmarks to distinguish provider time-to-first-content-token from full generation time. A
+provider that returns a normal JSON completion remains supported, but has no observable TTFT.
+
 It can point directly at OpenAI-compatible deployments, including a vLLM deployment when that
 deployment exposes the required compatible routes and content-part shapes. To make that combined
 backend own embedding as well as generation and transcription, pass it as `models` and omit

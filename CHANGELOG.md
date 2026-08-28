@@ -56,6 +56,11 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 
 ### Changed
 
+- Concurrent single-memory adds may share one durable Zvec outbox flush after their authoritative
+  SQLite commits, and the default Jina adapter coalesces same-task concurrent calls into bounded
+  model batches.
+- The OpenAI-compatible generation adapter consumes SSE completions internally so TTFT can be
+  measured without changing the completed `AnswerResult`, REST, or MCP response contracts.
 - Isolation is now one physical `data_dir` per application or benchmark unit. There is no hidden
   default scope or logical partition inside a store.
 - The primary developer flow is `Memory()` → `add()` → `search()` or `ask()`.

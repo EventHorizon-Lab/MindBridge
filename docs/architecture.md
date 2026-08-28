@@ -137,9 +137,10 @@ digest-level metadata: the first authoritative non-empty name wins when the same
 different names.
 
 Potentially slow model calls happen outside the local write lock, so concurrent operations may
-overlap remote inference. MindBridge serializes only the SQLite commit/outbox and Zvec critical
-sections needed to preserve local consistency; maintenance operations such as reindex and optimize
-remain exclusive.
+overlap remote inference. SQLite commits use independent WAL connections; their durable outbox
+operations can accumulate before the serialized Zvec projection, letting concurrent adds share a
+flush. Zvec mutation/search and maintenance operations such as reindex and optimize remain
+exclusive where required for local consistency.
 
 ## Read consistency
 

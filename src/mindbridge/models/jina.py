@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import math
 import threading
+import time
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass, field
 from importlib import import_module
 from importlib.util import find_spec
 from types import MethodType
@@ -32,6 +35,7 @@ _JINA_RECIPE = "jina-v5-omni-typed-text-tuple-v2"
 _JINA_CAPABILITIES = frozenset({Modality.TEXT, Modality.IMAGE, Modality.VIDEO, Modality.AUDIO})
 _JINA_DIMENSIONS = frozenset({32, 64, 128, 256, 512, 1024})
 _ENCODE_METHODS = ("encode", "encode_query", "encode_document")
+_DEFAULT_BATCH_WAIT_MS = 2.0
 _jina_methods: dict[str, Callable[..., object]] | None = None
 
 
@@ -59,17 +63,30 @@ class _TextEncoder(Protocol):
     ) -> _EmbeddingMatrix: ...
 
 
+@dataclass(slots=True)
+class _EmbeddingRequest:
+    inputs: tuple[ModelInput, ...]
+    task: EmbedTask
+    done: threading.Event = field(default_factory=threading.Event)
+    result: tuple[tuple[float, ...], ...] | None = None
+    error: BaseException | None = None
+
+
 class JinaOmniEmbedder:
     """Deferred default backend for the pinned Jina Omni embedding model."""
 
     __slots__ = (
         "_backend",
         "_batch_size",
+        "_batch_wait_seconds",
         "_closed",
+        "_closing",
+        "_condition",
         "_device",
         "_dimension",
-        "_lock",
+        "_pending",
         "_space_id",
+        "_worker",
     )
 
     def __init__(
@@ -78,10 +95,12 @@ class JinaOmniEmbedder:
         dimension: int = DEFAULT_JINA_DIMENSION,
         device: str | None = None,
         batch_size: int = 32,
+        batch_wait_ms: float = _DEFAULT_BATCH_WAIT_MS,
     ) -> None:
         self._dimension = _jina_dimension(dimension)
         self._device = _optional_text(device, "device")
         self._batch_size = _positive_integer(batch_size, "batch_size")
+        self._batch_wait_seconds = _batch_wait_ms(batch_wait_ms) / 1_000
         _require_local_extra()
         self._space_id = _recipe_space(
             _JINA_RECIPE,
@@ -89,8 +108,11 @@ class JinaOmniEmbedder:
             DEFAULT_JINA_REVISION,
             self._dimension,
         )
-        self._lock = threading.Lock()
+        self._condition = threading.Condition()
+        self._pending: list[_EmbeddingRequest] = []
+        self._worker: threading.Thread | None = None
         self._backend: _LoadedJinaOmniEmbedder | None = None
+        self._closing = False
         self._closed = False
 
     @classmethod
@@ -100,10 +122,16 @@ class JinaOmniEmbedder:
         dimension: int = DEFAULT_JINA_DIMENSION,
         device: str | None = None,
         batch_size: int = 32,
+        batch_wait_ms: float = _DEFAULT_BATCH_WAIT_MS,
     ) -> JinaOmniEmbedder:
         """Construct the public backend and load its pinned weights immediately."""
-        backend = cls(dimension=dimension, device=device, batch_size=batch_size)
-        with backend._lock:
+        backend = cls(
+            dimension=dimension,
+            device=device,
+            batch_size=batch_size,
+            batch_wait_ms=batch_wait_ms,
+        )
+        with backend._condition:
             backend._ensure_loaded()
         return backend
 
@@ -129,22 +157,100 @@ class JinaOmniEmbedder:
         task: EmbedTask = EmbedTask.DOCUMENT,
     ) -> tuple[tuple[float, ...], ...]:
         batch, selected_task = _request(inputs, task)
-        with self._lock:
-            if self._closed:
+        with self._condition:
+            if self._closing or self._closed:
                 raise ModelError("embedding backend is closed")
             if not batch:
                 return ()
-            backend = self._ensure_loaded()
-        return backend.embed(batch, selected_task)
+            request = _EmbeddingRequest(batch, selected_task)
+            self._pending.append(request)
+            if self._worker is None:
+                self._worker = threading.Thread(
+                    target=self._run,
+                    name="mindbridge-jina-batcher",
+                    daemon=True,
+                )
+                self._worker.start()
+            self._condition.notify()
+        request.done.wait()
+        if request.error is not None:
+            raise request.error
+        if request.result is None:
+            raise ModelError("embedding model failed")
+        return request.result
 
     def close(self) -> None:
         """Close loaded weights without turning an unused backend into a model load."""
-        with self._lock:
+        with self._condition:
             if self._closed:
                 return
-            self._closed = True
+            if self._closing:
+                while self._closing:
+                    self._condition.wait()
+                return
+            self._closing = True
+            worker = self._worker
+            self._condition.notify_all()
+        if worker is not None and worker is not threading.current_thread():
+            worker.join()
+        try:
             if self._backend is not None:
                 self._backend.close()
+        finally:
+            with self._condition:
+                self._closed = True
+                self._closing = False
+                self._condition.notify_all()
+
+    def _run(self) -> None:
+        while True:
+            with self._condition:
+                while not self._pending and not self._closing:
+                    self._condition.wait()
+                if not self._pending:
+                    return
+                task = self._pending[0].task
+                deadline = time.monotonic() + self._batch_wait_seconds
+                while not self._closing and self._pending_size(task) < self._batch_size:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    self._condition.wait(remaining)
+                requests = self._take_batch(task)
+            try:
+                backend = self._ensure_loaded()
+                vectors = backend.embed(
+                    tuple(value for request in requests for value in request.inputs),
+                    task,
+                )
+                offset = 0
+                for request in requests:
+                    end = offset + len(request.inputs)
+                    request.result = vectors[offset:end]
+                    offset = end
+            except BaseException as error:
+                for request in requests:
+                    request.error = error
+            finally:
+                for request in requests:
+                    request.done.set()
+
+    def _pending_size(self, task: EmbedTask) -> int:
+        return sum(len(request.inputs) for request in self._pending if request.task is task)
+
+    def _take_batch(self, task: EmbedTask) -> list[_EmbeddingRequest]:
+        selected: list[_EmbeddingRequest] = []
+        remaining: list[_EmbeddingRequest] = []
+        size = 0
+        for request in self._pending:
+            request_size = len(request.inputs)
+            if request.task is task and (not selected or size + request_size <= self._batch_size):
+                selected.append(request)
+                size += request_size
+            else:
+                remaining.append(request)
+        self._pending = remaining
+        return selected
 
     def _ensure_loaded(self) -> _LoadedJinaOmniEmbedder:
         if self._backend is None:
@@ -325,6 +431,17 @@ def _jina_dimension(value: object) -> int:
         choices = ", ".join(str(item) for item in sorted(_JINA_DIMENSIONS))
         raise ValidationError(f"dimension must be one of: {choices}")
     return dimension
+
+
+def _batch_wait_ms(value: object) -> float:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int | float)
+        or not math.isfinite(float(value))
+        or not 0 <= float(value) <= 100
+    ):
+        raise ValidationError("batch_wait_ms must be between zero and 100")
+    return float(value)
 
 
 def _require_local_extra() -> None:

@@ -541,7 +541,9 @@ class Memory:
                 self._store.queue_all_embeddings()
             with _translate_index_errors("rebuild the search index"):
                 count = self._index.rebuild(self._index_documents(), batch_size=_REINDEX_PAGE_SIZE)
-            self._acknowledge_outbox()
+            # Adds may commit SQLite while the rebuild owns the Zvec boundary. Replay instead of
+            # blindly acknowledging so records committed after its SQLite scan cannot be lost.
+            self._drain_outbox()
             return count
 
     def optimize(self) -> None:
@@ -759,23 +761,13 @@ class Memory:
                 )
                 for memory, vector in zip(missing, vectors, strict=True)
             )
+        if stored_memories:
+            # SQLite is authoritative and uses one WAL connection per transaction. Commit before
+            # taking the index lock so concurrent writers can accumulate one durable outbox batch
+            # and share the expensive Zvec flush.
+            with _translate_storage_errors("write memories"):
+                self._store.write_memories(stored_memories, stored_embeddings)
         with self._write_lock:
-            if stored_memories:
-                candidate_ids = tuple(memory.memory_id for memory in stored_memories)
-                with _translate_storage_errors("recheck existing memories"):
-                    concurrent = self._store.read_memories(candidate_ids)
-                concurrent_ids = {memory.memory_id for memory in concurrent}
-                writes = tuple(
-                    memory for memory in stored_memories if memory.memory_id not in concurrent_ids
-                )
-                embeddings = tuple(
-                    embedding
-                    for embedding in stored_embeddings
-                    if embedding.memory_id not in concurrent_ids
-                )
-                if writes:
-                    with _translate_storage_errors("write memories"):
-                        self._store.write_memories(writes, embeddings)
             self._drain_outbox()
             with _translate_storage_errors("hydrate written memories"):
                 authoritative = self._store.read_memories(ordered_ids)
@@ -1322,18 +1314,6 @@ class Memory:
                     self._index.upsert(documents)
                 self._index.flush()
             with _translate_storage_errors("acknowledge the search-index outbox"):
-                acknowledged = self._store.acknowledge_index_operations(operations)
-            if acknowledged != len(operations):
-                raise StorageError("search-index outbox changed while it was being acknowledged")
-
-    def _acknowledge_outbox(self) -> None:
-        """Acknowledge rebuild checkpoints after the full index is durable."""
-        while True:
-            with _translate_storage_errors("read the rebuilt search-index checkpoint"):
-                operations = self._store.pending_index_operations(limit=_OUTBOX_BATCH_SIZE)
-            if not operations:
-                return
-            with _translate_storage_errors("acknowledge the rebuilt search-index checkpoint"):
                 acknowledged = self._store.acknowledge_index_operations(operations)
             if acknowledged != len(operations):
                 raise StorageError("search-index outbox changed while it was being acknowledged")

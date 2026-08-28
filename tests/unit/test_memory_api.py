@@ -4,6 +4,7 @@ import os
 import shutil
 import sqlite3
 from collections.abc import Iterable, Iterator, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -568,6 +569,83 @@ def test_outbox_bounds_index_batches(tmp_path: Path) -> None:
         memory.add_many(tuple(f"memory {index}" for index in range(600)))
 
     assert [len(batch) for batch in _FakeIndex.instances[-1].upsert_calls] == [256, 256, 88]
+
+
+def test_concurrent_adds_share_one_durable_index_flush(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    original = LocalStore.write_memories
+    committed = Barrier(2)
+
+    def synchronized_write(
+        store: LocalStore,
+        memories: Iterable[StoredMemory],
+        embeddings: Iterable[StoredEmbedding] = (),
+    ) -> tuple[bool, ...]:
+        result = original(store, memories, embeddings)
+        committed.wait(timeout=3)
+        return result
+
+    monkeypatch.setattr(LocalStore, "write_memories", synchronized_write)
+    with (
+        Memory(tmp_path, _config(), models=_FakeModels()) as memory,
+        ThreadPoolExecutor(max_workers=2) as pool,
+    ):
+        records = tuple(pool.map(memory.add, ("first concurrent", "second concurrent")))
+
+    assert len(records) == 2
+    assert len(_FakeIndex.instances[-1].upsert_calls) == 1
+    assert set(_FakeIndex.instances[-1].upsert_calls[0]) == {record.id for record in records}
+
+
+def test_reindex_replays_an_add_committed_after_its_sqlite_scan(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    snapshot_taken = Event()
+    add_committed = Event()
+    original_rebuild = _FakeIndex.rebuild
+    original_write = LocalStore.write_memories
+
+    def paused_rebuild(
+        index: _FakeIndex,
+        documents: Iterable[IndexDocument],
+        *,
+        batch_size: int = 1_024,
+        optimize_concurrency: int = 0,
+    ) -> int:
+        snapshot = tuple(documents)
+        snapshot_taken.set()
+        assert add_committed.wait(timeout=3)
+        return original_rebuild(
+            index,
+            snapshot,
+            batch_size=batch_size,
+            optimize_concurrency=optimize_concurrency,
+        )
+
+    def tracked_write(
+        store: LocalStore,
+        memories: Iterable[StoredMemory],
+        embeddings: Iterable[StoredEmbedding] = (),
+    ) -> tuple[bool, ...]:
+        result = original_write(store, memories, embeddings)
+        add_committed.set()
+        return result
+
+    with Memory(tmp_path, _config(), models=_FakeModels()) as memory:
+        existing = memory.add("existing")
+        monkeypatch.setattr(_FakeIndex, "rebuild", paused_rebuild)
+        monkeypatch.setattr(LocalStore, "write_memories", tracked_write)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            reindexed = pool.submit(memory.reindex)
+            assert snapshot_taken.wait(timeout=3)
+            added = pool.submit(memory.add, "committed during rebuild")
+            assert reindexed.result(timeout=3) == 1
+            new = added.result(timeout=3)
+
+        assert set(_FakeIndex.instances[-1].documents) == {existing.id, new.id}
 
 
 def test_keyset_pages_reindex_optimize_and_missing_index_recovery(tmp_path: Path) -> None:

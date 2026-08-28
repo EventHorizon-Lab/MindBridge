@@ -266,6 +266,44 @@ def test_first_public_embed_loads_once_across_threads(
     assert encoder.batch_sizes == [11, 11]
 
 
+def test_public_jina_microbatches_concurrent_calls_by_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    second = [0.0, 1.0, *(0.0 for _ in range(30))]
+    encoder = LegacyEncoder([UNIT_32, second], native_dimension=32)
+    loaded = jina._LoadedJinaOmniEmbedder(
+        encoder,
+        text_encode=encoder.encode,
+        dimension=32,
+        batch_size=8,
+    )
+    monkeypatch.setattr(jina, "find_spec", lambda _name: SimpleNamespace())
+    monkeypatch.setattr(jina, "_load_jina", lambda **_kwargs: loaded)
+    backend = JinaOmniEmbedder.load(
+        dimension=32,
+        device="cpu",
+        batch_size=8,
+        batch_wait_ms=50,
+    )
+    start = threading.Barrier(3)
+
+    def embed(text: str) -> tuple[tuple[float, ...], ...]:
+        start.wait(timeout=3)
+        return backend.embed((ModelInput(text=text),), EmbedTask.DOCUMENT)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(embed, "first")
+        second_result = pool.submit(embed, "second")
+        start.wait(timeout=3)
+        results = (first.result(timeout=3), second_result.result(timeout=3))
+    backend.close()
+
+    assert {result[0] for result in results} == {VECTOR_32, tuple(second)}
+    assert len(encoder.calls) == 1
+    assert len(encoder.calls[0][1]) == 2
+    assert encoder.batch_sizes == [8]
+
+
 class PatchingSentenceTransformer(LegacyEncoder):
     patch_on_init: ClassVar[bool] = True
     instances: ClassVar[list[PatchingSentenceTransformer]] = []
@@ -497,6 +535,8 @@ def test_jina_fails_readiness_without_processor_or_audio_decoder(
     monkeypatch.setattr(jina, "import_module", missing)
     with pytest.raises(ValidationError, match="batch_size"):
         JinaOmniEmbedder.load(dimension=32, batch_size=0)
+    with pytest.raises(ValidationError, match="batch_wait_ms"):
+        JinaOmniEmbedder.load(dimension=32, batch_wait_ms=101)
     with pytest.raises(ModelError, match="local extra"):
         JinaOmniEmbedder.load(dimension=32)
 

@@ -407,12 +407,15 @@ JinaOmniEmbedder.load(
     dimension: int = 1024,
     device: str | None = None,
     batch_size: int = 32,
+    batch_wait_ms: float = 2.0,
 ) -> JinaOmniEmbedder
 ```
 
 It declares text, image, video, and audio. The pinned model accepts dimensions `32`, `64`, `128`,
 `256`, `512`, and `1024`; another value fails before inference. Jina's legacy tuple conversion and
-remote-code isolation exist only in this adapter.
+remote-code isolation exist only in this adapter. Concurrent calls with the same retrieval task are
+coalesced up to `batch_size`; `batch_wait_ms` is the maximum collection window and may be set to
+zero for latency-first workloads.
 
 `SentenceTransformersEmbedder.load` loads any standard model at an immutable commit:
 
