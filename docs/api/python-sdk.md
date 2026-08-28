@@ -448,6 +448,11 @@ into a new directory. `reindex()` does not re-embed.
 30-second VAD segment ceiling and `trust_remote_code=False`. Construct a different `FunASRRecipe`
 to swap that composition.
 
+For audio-to-text fallback, `Memory` uses `FunASRTranscriber.transcribe()` and skips CAM++ speaker
+embedding and clustering; `Memory.speech()` still calls `analyze()` for timed speaker evidence. If
+the embedder accepts audio but generation does not, `ask()` overlaps question transcription with
+query embedding and retrieval before invoking the generation model.
+
 For high-throughput CUDA inference, pin the vLLM build matching the machine's NVIDIA driver, then
 install `mindbridge[local,vllm]` and select it explicitly:
 

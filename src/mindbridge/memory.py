@@ -13,9 +13,11 @@ import re
 import shutil
 import unicodedata
 from collections.abc import Iterable, Iterator, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, replace
 from datetime import date, datetime, time, timedelta, timezone
+from functools import partial
 from pathlib import Path
 from threading import Condition, RLock
 from typing import Protocol, cast
@@ -413,7 +415,8 @@ class Memory:
             prepared = self._prepare_content(question, assets)
             reference = _reference_at(reference_at) or datetime.now(timezone.utc)
             temporal_range = _temporal_range(prepared.text, reference)
-            hits = self._search_prepared(
+            search = partial(
+                self._search_prepared,
                 prepared,
                 limit=limit,
                 operation=assets,
@@ -421,6 +424,18 @@ class Memory:
                 reference_at=reference,
                 temporal_range=temporal_range,
             )
+            audio = tuple(asset for asset in prepared.assets if asset.modality == "audio")
+            if (
+                any(asset.transcript is None for asset in audio)
+                and Modality.AUDIO in self._capabilities.embedding
+                and Modality.AUDIO not in self._capabilities.generation
+            ):
+                with ThreadPoolExecutor(max_workers=1) as executor:
+                    transcripts = executor.submit(self._cache_audio_transcripts, audio, assets)
+                    hits = search()
+                    transcripts.result()
+            else:
+                hits = search()
             routed_question = self._route_generation(
                 (
                     _with_reference_time(prepared, reference)
@@ -1047,14 +1062,15 @@ class Memory:
             by_id = {asset.asset_id: asset for asset in audio}
             refs = tuple(self._asset_ref(by_id[asset_id]) for asset_id in missing)
             try:
-                if isinstance(self._transcriber, SpeechBackend):
+                transcribe = getattr(self._transcriber, "transcribe", None)
+                if callable(transcribe):
+                    generated = transcribe(refs)
+                else:
                     analyses = self._analyze_speech(refs)
                     generated = tuple(
                         "\n".join(turn.text for turn in analysis.turns) for analysis in analyses
                     )
                     operation.speech_updates.update(zip(missing, analyses, strict=True))
-                else:
-                    generated = self._transcriber.transcribe(refs)
             except MindBridgeError:
                 raise
             except Exception as error:

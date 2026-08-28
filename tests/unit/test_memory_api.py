@@ -1103,6 +1103,54 @@ def test_vlm_generation_transcribes_audio_once_and_keeps_video(tmp_path: Path) -
         assert len(models.transcribe_calls) == 1
 
 
+def test_vlm_generation_skips_speaker_analysis_until_speech_is_requested(
+    tmp_path: Path,
+) -> None:
+    query_started = Event()
+    transcript_started = Event()
+
+    class ParallelModels(_FakeModels):
+        def embed(
+            self,
+            inputs: Sequence[ModelInput],
+            task: EmbedTask = EmbedTask.DOCUMENT,
+        ) -> tuple[tuple[float, ...], ...]:
+            if task is EmbedTask.QUERY:
+                query_started.set()
+                assert transcript_started.wait(timeout=1)
+            return super().embed(inputs, task)
+
+    class TranscriptSpeech(_FakeSpeech):
+        def __init__(self) -> None:
+            super().__init__()
+            self.transcribe_calls: list[tuple[AssetRef, ...]] = []
+
+        def transcribe(self, assets: Sequence[AssetRef]) -> tuple[str, ...]:
+            batch = tuple(assets)
+            self.transcribe_calls.append(batch)
+            transcript_started.set()
+            assert query_started.wait(timeout=1)
+            return tuple("spoken red wrench" for _asset in batch)
+
+    capabilities = ModelCapabilities(
+        embedding=ALL_INPUT_MODALITIES,
+        generation=frozenset({Modality.TEXT}),
+        transcription=frozenset({Modality.AUDIO}),
+    )
+    models = ParallelModels(capabilities=capabilities)
+    speech = TranscriptSpeech()
+
+    with Memory(tmp_path, _config(), models=models, transcriber=speech) as memory:
+        record = memory.add(("red audio", Blob(b"audio", "audio/wav", "audio.wav")))
+        memory.ask(("what was said?", AssetRef(record.assets[0].id)))
+
+        assert len(speech.transcribe_calls) == 1
+        assert speech.calls == []
+
+        memory.speech(record.id)
+        assert len(speech.calls) == 1
+
+
 def test_invalid_long_transcript_is_not_persisted(tmp_path: Path) -> None:
     class LongTranscriptModels(_FakeModels):
         def transcribe(self, assets: Sequence[AssetRef]) -> tuple[str, ...]:
