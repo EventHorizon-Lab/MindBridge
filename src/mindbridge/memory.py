@@ -19,9 +19,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from threading import Condition, RLock
 from typing import Protocol, cast
-from urllib.parse import urlsplit
 
-from mindbridge.config import Config
 from mindbridge.exceptions import (
     IndexUnavailableError,
     MemoryNotFoundError,
@@ -33,11 +31,9 @@ from mindbridge.exceptions import (
 )
 from mindbridge.infrastructure.local._lock import DataDirectoryInUseError
 from mindbridge.infrastructure.local.assets import (
-    AssetDownloadError,
     AssetStore,
     AssetStoreError,
     AssetTooLargeError,
-    UnsafeAssetUrlError,
 )
 from mindbridge.infrastructure.local.store import (
     IndexDocument,
@@ -51,17 +47,14 @@ from mindbridge.infrastructure.local.zvec_index import IndexHit, ZvecIndex
 from mindbridge.models.base import (
     EmbeddingBackend,
     EmbedTask,
-    ModelBackend,
-    ModelCapabilities,
+    GenerationBackend,
     ModelInput,
     SpeechAnalysis,
     SpeechBackend,
+    TranscriptionBackend,
+    _modalities,
 )
-from mindbridge.models.funasr import FunASRTranscriber
-from mindbridge.models.jina import JinaOmniEmbedder
-from mindbridge.models.openai_http import OpenAIHTTP
 from mindbridge.types import (
-    URL,
     AnswerResult,
     AssetRef,
     Blob,
@@ -88,6 +81,7 @@ _RERANK_CANDIDATES = 50
 _RANK_FLOOR = 0.3
 _RANK_CEILING = 1.5
 _DECAY_REINFORCEMENT_LIMIT = 20
+_NO_TRANSCRIPTION_SPACE = "none:asr-v1"
 _ISO_DATE = re.compile(r"(?<!\d)(\d{4}-\d{2}-\d{2})(?!\d)")
 _MAX_CONTENT_PARTS = 128
 _MAX_TEXT_CHARACTERS = 65_536
@@ -220,17 +214,14 @@ class Memory:
     def __init__(
         self,
         data_dir: str | Path = ".mindbridge",
-        config: Config | None = None,
         *,
-        models: ModelBackend | None = None,
-        embedder: EmbeddingBackend | None = None,
-        transcriber: SpeechBackend | None = None,
+        embedder: EmbeddingBackend,
+        answerer: GenerationBackend | None = None,
+        transcriber: SpeechBackend | TranscriptionBackend | None = None,
+        decay_half_life_days: float | None = None,
         speaker_similarity: float = 0.78,
         speaker_margin: float = 0.05,
     ) -> None:
-        if config is not None and not isinstance(config, Config):
-            raise ValidationError("config must be a Config value")
-        self.config = config or Config.from_environment()
         self.data_dir = Path(data_dir).expanduser().resolve()
         self._owner_pid = os.getpid()
         self._write_lock = RLock()
@@ -241,62 +232,26 @@ class Memory:
         self._pending_asset_cleanup: dict[str, StoredAsset] = {}
         self._speaker_similarity = _unit_interval(speaker_similarity, "speaker_similarity")
         self._speaker_margin = _unit_interval(speaker_margin, "speaker_margin")
-        self._decay_half_life = _decay_half_life(self.config.decay_half_life_days)
+        self._decay_half_life = _decay_half_life(decay_half_life_days)
 
         self._store = _open_store(self.data_dir)
-        try:
-            self._models = _open_models(self.config, models)
-            self._transcriber: SpeechBackend | ModelBackend = self._models
-        except BaseException:
-            self._store.close()
-            raise
-        try:
-            self._embedder = _open_embedder(
-                embedder,
-                self._models,
-                use_models=models is not None,
-            )
-        except BaseException:
-            self._close_models_and_store(include_embedder=False)
-            raise
-        try:
-            self._transcriber = _open_transcriber(
-                transcriber,
-                self._models,
-                use_models=models is not None,
-            )
-        except BaseException:
-            self._close_models_and_store()
-            raise
+        self._embedder = embedder
+        self._answerer = answerer
+        self._transcriber = transcriber
 
         try:
-            model_capabilities = _model_contract(self._models)
-            transcription_capabilities, self._transcription_space = _transcription_contract(
-                self._transcriber
-            )
-            if self._embedder is self._models:
-                (
-                    embedding_capabilities,
-                    self._embedding_model,
-                    self._space_id,
-                    self._embedding_dimension,
-                ) = _combined_embedding_contract(self._models, model_capabilities)
-            else:
-                (
-                    embedding_capabilities,
-                    self._embedding_model,
-                    self._space_id,
-                    self._embedding_dimension,
-                ) = _embedding_contract(cast(EmbeddingBackend, self._embedder))
-            self._capabilities = ModelCapabilities(
-                embedding=embedding_capabilities,
-                generation=model_capabilities.generation,
-                transcription=transcription_capabilities,
-            )
-            self._assets = AssetStore(
-                self.data_dir,
-                allowed_url_hosts=self.config.allowed_url_hosts,
-            )
+            (
+                self._embedding_capabilities,
+                self._embedding_model,
+                self._space_id,
+                self._embedding_dimension,
+            ) = _embedding_contract(self._embedder)
+            self._generation_capabilities = _generation_contract(self._answerer)
+            (
+                self._transcription_capabilities,
+                self._transcription_space,
+            ) = _transcription_contract(self._transcriber)
+            self._assets = AssetStore(self.data_dir)
             self._collect_orphan_assets(scan_physical=True)
             index_path = self.data_dir / "zvec"
             index_missing = not index_path.exists()
@@ -360,7 +315,7 @@ class Memory:
         """Add memories in one model batch and one SQLite transaction."""
         with self._operation() as assets:
             normalized_memory_type = _memory_type(memory_type)
-            if isinstance(contents, (str, bytes, Path, URL, Blob, AssetRef)):
+            if isinstance(contents, (str, bytes, Path, Blob, AssetRef)):
                 raise ValidationError("contents must be a sequence of memory inputs")
             prepared = tuple(
                 _prepare_memory(
@@ -410,6 +365,8 @@ class Memory:
         """Answer a native or mixed-modal question only from retrieved memories."""
         with self._operation() as assets:
             _limit(limit, maximum=100)
+            if self._answerer is None:
+                raise ModelError("answer backend is not configured")
             prepared = self._prepare_content(question, assets)
             reference = _reference_at(reference_at) or datetime.now(timezone.utc)
             temporal_range = _temporal_range(prepared.text, reference)
@@ -487,7 +444,7 @@ class Memory:
                         cached[asset.asset_id] = self._store.write_speech(
                             asset.asset_id,
                             analysis,
-                            model_id=self._transcriber.model_id,
+                            model_id=self._transcriber.transcription_model,
                             space_id=self._transcription_space,
                             minimum_similarity=self._speaker_similarity,
                             minimum_margin=self._speaker_margin,
@@ -634,23 +591,13 @@ class Memory:
                     name=atom.name,
                     lease=True,
                 )
-            elif isinstance(atom, URL):
-                name = atom.name or Path(urlsplit(atom.value).path).name or None
-                modality, media_type = _media_hint(name, atom.media_type)
-                candidate = self._assets.materialize_url(
-                    atom.value,
-                    modality=modality.value,
-                    mime_type=media_type,
-                    name=atom.name,
-                    lease=True,
-                )
             elif isinstance(atom, AssetRef):
                 return self._resolve_asset_reference(atom, operation)
             else:
                 raise ValidationError("content contains an unsupported input value")
         except MindBridgeError:
             raise
-        except (AssetDownloadError, AssetTooLargeError, UnsafeAssetUrlError, OSError, ValueError):
+        except (AssetTooLargeError, OSError, ValueError):
             raise ValidationError("media input could not be safely materialized") from None
         except AssetStoreError as error:
             raise StorageError("failed to materialize media input") from error
@@ -715,11 +662,11 @@ class Memory:
         stored_memories: tuple[StoredMemory, ...] = ()
         stored_embeddings: tuple[StoredEmbedding, ...] = ()
         if missing:
-            if Modality.AUDIO not in self._capabilities.embedding:
+            if Modality.AUDIO not in self._embedding_capabilities:
                 for memory in missing:
                     _fallback_unsupported(
                         memory.content,
-                        self._capabilities.embedding,
+                        self._embedding_capabilities,
                         "embedding",
                     )
                 self._cache_audio_transcripts(
@@ -910,7 +857,7 @@ class Memory:
 
     def _route_embedding(self, prepared: _PreparedContent) -> ModelInput:
         value = self._resolved_model_input(prepared)
-        missing = value.modalities - self._capabilities.embedding
+        missing = value.modalities - self._embedding_capabilities
         if not missing:
             return value
         if missing <= {Modality.AUDIO}:
@@ -918,7 +865,7 @@ class Memory:
             assets = tuple(asset for asset in value.assets if asset.modality is not Modality.AUDIO)
             if text or assets:
                 routed = ModelInput(text=text, assets=assets)
-                missing = routed.modalities - self._capabilities.embedding
+                missing = routed.modalities - self._embedding_capabilities
                 if not missing:
                     return routed
         names = ", ".join(sorted(modality.value for modality in missing))
@@ -931,7 +878,7 @@ class Memory:
     ) -> _PreparedContent:
         unsupported = _fallback_unsupported(
             prepared,
-            self._capabilities.embedding,
+            self._embedding_capabilities,
             "embedding",
         )
         return (
@@ -947,13 +894,13 @@ class Memory:
     ) -> ModelInput:
         unsupported = _fallback_unsupported(
             prepared,
-            self._capabilities.generation,
+            self._generation_capabilities,
             "generation",
         )
         if Modality.AUDIO in unsupported:
             prepared = self._with_audio_transcripts(prepared, operation)
         value = self._resolved_model_input(prepared)
-        unsupported = value.modalities - self._capabilities.generation
+        unsupported = value.modalities - self._generation_capabilities
         if not unsupported:
             return value
         text = _derived_text(value.text, prepared.assets)
@@ -963,7 +910,7 @@ class Memory:
                 text=text,
                 assets=assets,
             )
-            if not routed.modalities - self._capabilities.generation:
+            if not routed.modalities - self._generation_capabilities:
                 return routed
         names = ", ".join(sorted(modality.value for modality in unsupported))
         raise ModelError(f"configured generation model does not support: {names}")
@@ -991,11 +938,11 @@ class Memory:
                     canonical_parts=(),
                 )
             )
-        if Modality.AUDIO not in self._capabilities.generation:
+        if Modality.AUDIO not in self._generation_capabilities:
             for prepared in prepared_hits:
                 _fallback_unsupported(
                     prepared,
-                    self._capabilities.generation,
+                    self._generation_capabilities,
                     "generation",
                 )
             self._cache_audio_transcripts(
@@ -1048,7 +995,7 @@ class Memory:
             )
         )
         if missing:
-            if Modality.AUDIO not in self._capabilities.transcription:
+            if Modality.AUDIO not in self._transcription_capabilities:
                 raise ModelError(
                     "audio fallback requires a transcription model with audio capability"
                 )
@@ -1062,6 +1009,8 @@ class Memory:
                     )
                     operation.speech_updates.update(zip(missing, analyses, strict=True))
                 else:
+                    if self._transcriber is None:
+                        raise ModelError("audio fallback requires a transcription backend")
                     generated = self._transcriber.transcribe(refs)
             except MindBridgeError:
                 raise
@@ -1099,7 +1048,7 @@ class Memory:
                         self._store.write_speech(
                             asset_id,
                             analysis,
-                            model_id=self._transcriber.model_id,
+                            model_id=self._transcriber.transcription_model,
                             space_id=self._transcription_space,
                             minimum_similarity=self._speaker_similarity,
                             minimum_margin=self._speaker_margin,
@@ -1150,8 +1099,10 @@ class Memory:
         question: ModelInput,
         hits: Sequence[SearchHit],
     ) -> AnswerResult:
+        if self._answerer is None:
+            raise ModelError("answer backend is not configured")
         try:
-            result = self._models.answer(question, hits)
+            result = self._answerer.answer(question, hits)
         except MindBridgeError:
             raise
         except Exception as error:
@@ -1384,20 +1335,23 @@ class Memory:
                 self._store.set_metadata(_STORE_METADATA_KEYS["index"], _INDEX_RECIPE)
         return rebuild_index
 
-    def _close_models_and_store(self, *, include_embedder: bool = True) -> None:
-        resources: tuple[_Closable, ...] = (self._transcriber, self._models, self._store)
-        if include_embedder:
-            resources = (self._embedder, *resources)
+    def _close_models_and_store(self) -> None:
+        resources = _present_resources(
+            self._embedder,
+            self._transcriber,
+            self._answerer,
+            self._store,
+        )
         for resource in _unique_resources(resources):
             with suppress(Exception):
                 resource.close()
 
     def _close_resources(self) -> builtins.list[Exception]:
         failures: builtins.list[Exception] = []
-        resources: tuple[_Closable, ...] = (
+        resources = _present_resources(
             self._embedder,
             self._transcriber,
-            self._models,
+            self._answerer,
             self._index,
             self._store,
         )
@@ -1466,20 +1420,20 @@ class AsyncMemory:
     def __init__(
         self,
         data_dir: str | Path = ".mindbridge",
-        config: Config | None = None,
         *,
-        models: ModelBackend | None = None,
-        embedder: EmbeddingBackend | None = None,
-        transcriber: SpeechBackend | None = None,
+        embedder: EmbeddingBackend,
+        answerer: GenerationBackend | None = None,
+        transcriber: SpeechBackend | TranscriptionBackend | None = None,
+        decay_half_life_days: float | None = None,
         speaker_similarity: float = 0.78,
         speaker_margin: float = 0.05,
     ) -> None:
         self._memory = Memory(
             data_dir=data_dir,
-            config=config,
-            models=models,
             embedder=embedder,
+            answerer=answerer,
             transcriber=transcriber,
+            decay_half_life_days=decay_half_life_days,
             speaker_similarity=speaker_similarity,
             speaker_margin=speaker_margin,
         )
@@ -1576,7 +1530,7 @@ class AsyncMemory:
 
 
 def _content_atoms(content: ContentInput) -> tuple[ContentAtom, ...]:
-    if isinstance(content, (str, Path, URL, Blob, AssetRef)):
+    if isinstance(content, (str, Path, Blob, AssetRef)):
         return (content,)
     if isinstance(content, bytes) or not isinstance(content, Sequence):
         raise ValidationError("content must be text, media, or an ordered sequence of them")
@@ -1585,7 +1539,7 @@ def _content_atoms(content: ContentInput) -> tuple[ContentAtom, ...]:
         raise ValidationError("content must not be empty")
     if len(atoms) > _MAX_CONTENT_PARTS:
         raise ValidationError(f"content must not exceed {_MAX_CONTENT_PARTS} parts")
-    if any(not isinstance(atom, (str, Path, URL, Blob, AssetRef)) for atom in atoms):
+    if any(not isinstance(atom, (str, Path, Blob, AssetRef)) for atom in atoms):
         raise ValidationError("content contains an unsupported input value")
     return atoms
 
@@ -1698,105 +1652,33 @@ def _open_store(data_dir: Path) -> LocalStore:
         raise StorageError("failed to open the local memory store") from error
 
 
-def _open_models(config: Config, models: ModelBackend | None) -> ModelBackend:
-    try:
-        return OpenAIHTTP(config) if models is None else models
-    except MindBridgeError:
-        raise
-    except Exception as error:
-        raise ModelError("failed to open the configured models") from error
-
-
-def _open_embedder(
-    embedder: EmbeddingBackend | None,
-    models: ModelBackend,
-    *,
-    use_models: bool,
-) -> EmbeddingBackend | ModelBackend:
-    try:
-        if embedder is not None:
-            return embedder
-        return models if use_models else JinaOmniEmbedder()
-    except MindBridgeError:
-        raise
-    except Exception as error:
-        raise ModelError("failed to open the embedding model") from error
-
-
-def _open_transcriber(
-    transcriber: SpeechBackend | None,
-    models: ModelBackend,
-    *,
-    use_models: bool,
-) -> SpeechBackend | ModelBackend:
-    try:
-        if transcriber is not None:
-            return transcriber
-        return models if use_models else FunASRTranscriber()
-    except MindBridgeError:
-        raise
-    except Exception as error:
-        raise ModelError("failed to open the speech model") from error
-
-
-def _model_contract(models: ModelBackend) -> ModelCapabilities:
-    capabilities = models.capabilities
-    if not isinstance(capabilities, ModelCapabilities):
-        raise ValidationError("models.capabilities must be a ModelCapabilities value")
-    return capabilities
-
-
 def _transcription_contract(
-    transcriber: SpeechBackend | ModelBackend,
+    transcriber: SpeechBackend | TranscriptionBackend | None,
 ) -> tuple[frozenset[Modality], str]:
-    if isinstance(transcriber, SpeechBackend):
-        capabilities = transcriber.capabilities
-        if not isinstance(capabilities, frozenset):
-            raise ValidationError("transcriber.capabilities must be a frozenset")
-        normalized = ModelCapabilities(
-            embedding=frozenset(),
-            generation=frozenset(),
-            transcription=capabilities,
-        ).transcription
-        return normalized, _model_text(transcriber.space_id, "transcription space")
-    model_capabilities = _model_contract(transcriber)
-    return model_capabilities.transcription, _model_text(
+    if transcriber is None:
+        return frozenset(), _NO_TRANSCRIPTION_SPACE
+    return _modalities(transcriber.transcription_capabilities, "transcription"), _model_text(
         transcriber.transcription_space,
         "transcription space",
     )
 
 
-def _combined_embedding_contract(
-    models: ModelBackend,
-    capabilities: ModelCapabilities,
-) -> tuple[frozenset[Modality], str, str, int]:
-    space = _embedding_space(models.embedding_space)
+def _generation_contract(answerer: GenerationBackend | None) -> frozenset[Modality]:
     return (
-        capabilities.embedding,
-        _model_text(models.embedding_model, "embedding model"),
-        space,
-        _positive_dimension(models.embedding_dimension, "models.embedding_dimension"),
+        frozenset()
+        if answerer is None
+        else _modalities(answerer.generation_capabilities, "generation")
     )
 
 
 def _embedding_contract(
     embedder: EmbeddingBackend,
 ) -> tuple[frozenset[Modality], str, str, int]:
-    capabilities = embedder.capabilities
-    if not isinstance(capabilities, frozenset) or any(
-        not isinstance(modality, Modality) for modality in capabilities
-    ):
-        raise ValidationError("embedder.capabilities must be a frozenset of modalities")
-    normalized = ModelCapabilities(
-        embedding=capabilities,
-        generation=frozenset(),
-        transcription=frozenset(),
-    ).embedding
     return (
-        normalized,
-        _model_text(embedder.model_id, "embedding model"),
-        _embedding_space(embedder.space_id),
-        _positive_dimension(embedder.dimension, "embedder.dimension"),
+        _modalities(embedder.embedding_capabilities, "embedding"),
+        _model_text(embedder.embedding_model, "embedding model"),
+        _embedding_space(embedder.embedding_space),
+        _positive_dimension(embedder.embedding_dimension, "embedder.embedding_dimension"),
     )
 
 
@@ -1840,6 +1722,10 @@ def _unique_resources(resources: Sequence[_Closable]) -> tuple[_Closable, ...]:
         seen.add(identity)
         unique.append(resource)
     return tuple(unique)
+
+
+def _present_resources(*resources: _Closable | None) -> tuple[_Closable, ...]:
+    return tuple(resource for resource in resources if resource is not None)
 
 
 def _metadata_json(metadata: Mapping[str, object] | None) -> str:

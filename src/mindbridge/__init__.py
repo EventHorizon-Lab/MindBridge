@@ -1,6 +1,5 @@
 """Fast local multimodal memory for Python agents."""
 
-from mindbridge.config import Config
 from mindbridge.exceptions import (
     IndexUnavailableError,
     MemoryNotFoundError,
@@ -14,13 +13,13 @@ from mindbridge.memory import AsyncMemory, Memory
 from mindbridge.models.base import (
     EmbeddingBackend,
     EmbedTask,
-    ModelBackend,
-    ModelCapabilities,
+    GenerationBackend,
     ModelInput,
     SpeakerEmbedding,
     SpeechAnalysis,
     SpeechBackend,
     SpeechTurn,
+    TranscriptionBackend,
 )
 from mindbridge.models.funasr import (
     DEFAULT_FUNASR_MODEL_ID,
@@ -29,10 +28,9 @@ from mindbridge.models.funasr import (
     FunASRTranscriber,
 )
 from mindbridge.models.jina import JinaOmniEmbedder
-from mindbridge.models.openai_http import OpenAIHTTP
+from mindbridge.models.openai_sdk import OpenAIModels
 from mindbridge.models.sentence_transformers import SentenceTransformersEmbedder
 from mindbridge.types import (
-    URL,
     AnswerResult,
     AssetRef,
     Blob,
@@ -49,18 +47,17 @@ from mindbridge.types import (
 __all__ = [
     "DEFAULT_FUNASR_MODEL_ID",
     "DEFAULT_FUNASR_RECIPE",
-    "URL",
     "AnswerResult",
     "AssetRef",
     "AsyncMemory",
     "Blob",
-    "Config",
     "ContentAtom",
     "ContentInput",
     "EmbedTask",
     "EmbeddingBackend",
     "FunASRRecipe",
     "FunASRTranscriber",
+    "GenerationBackend",
     "IndexUnavailableError",
     "JinaOmniEmbedder",
     "Memory",
@@ -69,11 +66,9 @@ __all__ = [
     "MemoryType",
     "MindBridgeError",
     "Modality",
-    "ModelBackend",
-    "ModelCapabilities",
     "ModelError",
     "ModelInput",
-    "OpenAIHTTP",
+    "OpenAIModels",
     "Page",
     "SearchHit",
     "SentenceTransformersEmbedder",
@@ -84,5 +79,6 @@ __all__ = [
     "SpeechBackend",
     "SpeechTurn",
     "StorageError",
+    "TranscriptionBackend",
     "ValidationError",
 ]

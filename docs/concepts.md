@@ -5,14 +5,13 @@ its public behavior.
 
 ## Content and modality
 
-Python uses one `ContentInput` contract for `add`, `search`, and `ask`: one `str`, `Path`, `URL`,
-`Blob`, or `AssetRef`, or an ordered sequence of those atoms.
+Python uses one `ContentInput` contract for `add`, `search`, and `ask`: one `str`, `Path`, `Blob`,
+or `AssetRef`, or an ordered sequence of those atoms.
 
 | Atom | Boundary |
 | --- | --- |
 | `str` | Normalized non-blank text |
 | `Path` | Local regular media file copied into MindBridge |
-| `URL` | HTTPS media fetched only from an allowed host |
 | `Blob` | Immutable inline image, video, or audio bytes |
 | `AssetRef` | Opaque reference to an asset in the same store |
 
@@ -104,7 +103,7 @@ model endpoint for historical content.
 
 ## Capability-driven model routing
 
-The default composition has three independent operations:
+A typical composition has three independent operations:
 
 - Local Jina v5 Omni embedding for stored memories and search queries.
 - Generation for grounded answers.
@@ -124,7 +123,7 @@ An audio-only input therefore becomes transcript-only when fallback is required.
 is not silently discarded merely to reach a text model.
 
 Stored embeddings belong to one adapter recipe, model, immutable revision, dimension, vector
-space, and index recipe. Local adapters derive `space_id` from those values. MindBridge refuses to
+space, and index recipe. Local adapters derive `embedding_space` from those values. MindBridge refuses to
 open a directory with incompatible settings. Use a new directory and re-encode source content when
 changing the embedding space. The store also persists `transcription_space`, which identifies the
 ASR model and transcript-affecting preprocessing recipe. Reopening with a different value fails
@@ -153,10 +152,9 @@ Operations on one instance may overlap remote model calls. MindBridge serializes
 SQLite commit/outbox and Zvec access sections that must observe one coherent local state.
 
 The current retrieval ceiling is intentionally explicit: one memory has one aggregate embedding.
-MindBridge does not yet chunk content, create one vector per asset, or use a learned reranker.
-With built-in `data` transport, each embedding or generation call also has a 64 MiB aggregate raw
-media ceiling before base64 encoding; co-located `file` transport or a streaming custom backend is
-the large-video path.
+MindBridge does not yet chunk content, create one vector per asset, or use a learned reranker. The
+OpenAI adapter inlines at most 64 MiB of raw media per embedding or generation call. A
+provider-specific upload adapter is the large-video path.
 
 ## Metadata is not isolation
 

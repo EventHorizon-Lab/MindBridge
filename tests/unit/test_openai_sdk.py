@@ -1,89 +1,36 @@
-"""Focused checks for the dependency-light default model backend."""
+"""Focused checks for the official-SDK model adapter."""
 
+import base64
 import json
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal, cast
+from typing import cast
 
-import httpx
+import httpx2 as httpx
 import pytest
+from openai import OpenAI
 
-import mindbridge.models.openai_http as openai_backend
-from mindbridge.config import Config
-from mindbridge.exceptions import ModelError, ValidationError
-from mindbridge.models.base import EmbedTask, ModelBackend, ModelCapabilities, ModelInput
-from mindbridge.models.openai_http import UNKNOWN_ANSWER, OpenAIHTTP
+import mindbridge.models.openai_sdk as openai_backend
+from mindbridge.exceptions import ModelError
+from mindbridge.models.base import (
+    EmbeddingBackend,
+    EmbedTask,
+    GenerationBackend,
+    ModelInput,
+    TranscriptionBackend,
+)
+from mindbridge.models.openai_sdk import UNKNOWN_ANSWER, OpenAIModels
 from mindbridge.types import AssetRef, Modality, SearchHit
 
 NOW = datetime(2026, 8, 27, tzinfo=timezone.utc)
 ALL_MODALITIES = frozenset({Modality.TEXT, Modality.IMAGE, Modality.VIDEO, Modality.AUDIO})
 
 
-def test_config_resolves_independent_endpoints_keys_and_explicit_capabilities() -> None:
-    config = Config.from_environment(
-        {
-            "OPENAI_API_KEY": "common",
-            "OPENAI_BASE_URL": "https://common.example.test/v1/v1/",
-            "MINDBRIDGE_EMBEDDING_API_KEY": "embed-secret",
-            "MINDBRIDGE_EMBEDDING_BASE_URL": "https://embed.example.test/api",
-            "MINDBRIDGE_GENERATION_BASE_URL": "https://generate.example.test",
-            "MINDBRIDGE_TRANSCRIPTION_API_KEY": "speech-secret",
-            "MINDBRIDGE_TRANSCRIPTION_BASE_URL": "https://speech.example.test",
-            "MINDBRIDGE_EMBEDDING_MODEL": "embed-model",
-            "MINDBRIDGE_EMBEDDING_SPACE": "shared-space-v1",
-            "MINDBRIDGE_GENERATION_MODEL": "answer-model",
-            "MINDBRIDGE_TRANSCRIPTION_MODEL": "speech-model",
-            "MINDBRIDGE_TRANSCRIPTION_SPACE": "speech-recipe-v2",
-            "MINDBRIDGE_EMBEDDING_DIMENSION": "2",
-            "MINDBRIDGE_TIMEOUT_SECONDS": "3.5",
-            "MINDBRIDGE_DECAY_HALF_LIFE_DAYS": "30",
-            "MINDBRIDGE_MEDIA_TRANSPORT": "file",
-            "MINDBRIDGE_ALLOWED_URL_HOSTS": "media.example.test, CDN.EXAMPLE.TEST. ",
-            "MINDBRIDGE_EMBEDDING_MODALITIES": "omni",
-            "MINDBRIDGE_GENERATION_MODALITIES": "text,image",
-            "MINDBRIDGE_TRANSCRIPTION_MODALITIES": "audio,video",
-        }
-    )
-
-    assert config.embedding_api_key == "embed-secret"
-    assert config.generation_api_key == "common"
-    assert config.transcription_api_key == "speech-secret"
-    assert config.embedding_base_url == "https://embed.example.test/api/v1"
-    assert config.generation_base_url == "https://generate.example.test/v1"
-    assert config.transcription_base_url == "https://speech.example.test/v1"
-    assert config.embedding_space == "shared-space-v1"
-    assert config.transcription_space == "speech-recipe-v2"
-    assert config.embedding_dimension == 2
-    assert config.timeout_seconds == 3.5
-    assert config.decay_half_life_days == 30.0
-    assert config.media_transport == "file"
-    assert config.allowed_url_hosts == {"media.example.test", "cdn.example.test"}
-    assert config.capabilities.embedding == ALL_MODALITIES
-    assert config.capabilities.generation == {Modality.TEXT, Modality.IMAGE}
-    assert config.capabilities.transcription == {Modality.AUDIO, Modality.VIDEO}
-    assert "api_key=" not in repr(config)
-    assert "embed-secret" not in repr(config)
-    with pytest.raises(ValidationError):
-        Config.from_environment({"MINDBRIDGE_EMBEDDING_DIMENSION": "many"})
-    with pytest.raises(ValidationError, match="positive number"):
-        Config.from_environment({"MINDBRIDGE_DECAY_HALF_LIFE_DAYS": "0"})
-    with pytest.raises(ValidationError, match="too small"):
-        Config(decay_half_life_days=1e-20)
-    with pytest.raises(ValidationError, match="too large"):
-        Config(decay_half_life_days=1e308)
-    with pytest.raises(ValidationError, match="hostnames"):
-        Config(allowed_url_hosts=frozenset({"https://media.example.test"}))
-    with pytest.raises(ValidationError, match="ports"):
-        Config(allowed_url_hosts=frozenset({"media.example.test:443"}))
-    with pytest.raises(ValidationError, match="atomic"):
-        ModelCapabilities(frozenset({Modality.OMNI}), frozenset(), frozenset())
-
-
 def test_text_embedding_keeps_standard_batch_shape_and_restores_order() -> None:
     def respond(request: httpx.Request) -> httpx.Response:
         payload = json.loads(request.content)
-        assert request.url == "https://embed.example.test/v1/embeddings"
-        assert request.headers["Authorization"] == "Bearer embed-secret"
+        assert request.url == "https://sdk.example.test/v1/embeddings"
+        assert request.headers["Authorization"] == "Bearer sdk-secret"
         assert payload == {
             "input": ["first", "second"],
             "model": "embed-model",
@@ -101,18 +48,20 @@ def test_text_embedding_keeps_standard_batch_shape_and_restores_order() -> None:
         )
 
     with httpx.Client(transport=httpx.MockTransport(respond)) as client:
-        model = OpenAIHTTP(_config(), client=client)
+        model = _model(_sdk_client(client))
         first, second = model.embed(
             (ModelInput(text="first"), ModelInput(text="second")), EmbedTask.QUERY
         )
 
-    assert isinstance(model, ModelBackend)
+    assert isinstance(model, EmbeddingBackend)
+    assert isinstance(model, GenerationBackend)
+    assert isinstance(model, TranscriptionBackend)
     assert model.embedding_space == "shared-space-v1"
     assert first == pytest.approx((0.6, 0.8))
     assert second == pytest.approx((0.0, 1.0))
 
 
-def test_multimodal_embedding_preserves_asset_order_and_maps_url_parts(
+def test_multimodal_embedding_preserves_asset_order_and_inlines_media(
     tmp_path: Path,
 ) -> None:
     image = _asset(tmp_path, "image", Modality.IMAGE, "image/png", b"image")
@@ -133,11 +82,14 @@ def test_multimodal_embedding_preserves_asset_order_and_maps_url_parts(
             kind = cast(str, part["type"])
             path = asset.path
             assert path is not None
-            assert cast(dict[str, str], part[kind])["url"] == path.resolve().as_uri()
+            expected = base64.b64encode(path.read_bytes()).decode()
+            assert cast(dict[str, str], part[kind])["url"] == (
+                f"data:{asset.media_type};base64,{expected}"
+            )
         return httpx.Response(200, json={"data": [{"index": 0, "embedding": [3, 4]}]})
 
     with httpx.Client(transport=httpx.MockTransport(respond)) as client:
-        result = OpenAIHTTP(_config(media_transport="file"), client=client).embed(
+        result = _model(_sdk_client(client)).embed(
             (ModelInput(text="remember", assets=(image, video, audio)),),
             EmbedTask.DOCUMENT,
         )
@@ -151,8 +103,8 @@ def test_answer_maps_native_hit_media_and_abstains_without_hits(tmp_path: Path) 
 
     def respond(request: httpx.Request) -> httpx.Response:
         requests.append(request)
-        assert request.url == "https://generate.example.test/v1/chat/completions"
-        assert request.headers["Authorization"] == "Bearer generation-secret"
+        assert request.url == "https://sdk.example.test/v1/chat/completions"
+        assert request.headers["Authorization"] == "Bearer sdk-secret"
         payload = json.loads(request.content)
         content = payload["messages"][1]["content"]
         assert [part["type"] for part in content] == ["text", "text", "image_url"]
@@ -178,7 +130,7 @@ def test_answer_maps_native_hit_media_and_abstains_without_hits(tmp_path: Path) 
         modality=Modality.IMAGE,
     )
     with httpx.Client(transport=httpx.MockTransport(respond)) as client:
-        model = OpenAIHTTP(_config(media_transport="file"), client=client)
+        model = _model(_sdk_client(client))
         assert model.answer(ModelInput(text="Unknown?"), ()).answer == UNKNOWN_ANSWER
         result = model.answer(ModelInput(text="Where is the cat?"), (hit,))
 
@@ -223,7 +175,7 @@ def test_answer_serializes_temporal_and_metadata_evidence() -> None:
         metadata={"dialog": "delivery", "turn": 7},
     )
     with httpx.Client(transport=httpx.MockTransport(respond)) as client:
-        answer = OpenAIHTTP(_config(), client=client).answer("When did it arrive?", (hit,))
+        answer = _model(_sdk_client(client)).answer("When did it arrive?", (hit,))
 
     assert answer.answer == "It arrived on August 26."
 
@@ -244,9 +196,9 @@ def test_answer_can_pin_sampling_for_reproducible_evaluation() -> None:
 
     hit = SearchHit(id="memory_1", content="evidence", score=0.9, created_at=NOW)
     with httpx.Client(transport=httpx.MockTransport(respond)) as client:
-        answer = OpenAIHTTP(
-            _config(), client=client, generation_seed=17, generation_temperature=0.0
-        ).answer("What?", (hit,))
+        answer = _model(_sdk_client(client), generation_seed=17, generation_temperature=0.0).answer(
+            "What?", (hit,)
+        )
 
     assert answer.answer == "Pinned."
 
@@ -260,9 +212,9 @@ def test_answer_rejects_an_oversized_grounding_payload(
         score=0.9,
         created_at=NOW,
     )
-    monkeypatch.setattr("mindbridge.models.openai_http._MAX_GROUNDED_TEXT_BYTES", 1)
+    monkeypatch.setattr("mindbridge.models.openai_sdk._MAX_GROUNDED_TEXT_BYTES", 1)
     with httpx.Client() as client:
-        model = OpenAIHTTP(_config(), client=client)
+        model = _model(_sdk_client(client))
         with pytest.raises(ModelError, match="4 MiB"):
             model.answer("What happened?", (hit,))
 
@@ -287,7 +239,7 @@ def test_multimodal_answer_budgets_the_final_text_parts(
     text_parts = openai_backend._answer_text_parts(question, hits)
     actual_bytes = sum(len(part.encode()) for part in text_parts)
     monkeypatch.setattr(
-        "mindbridge.models.openai_http._MAX_GROUNDED_TEXT_BYTES",
+        "mindbridge.models.openai_sdk._MAX_GROUNDED_TEXT_BYTES",
         actual_bytes - 1,
     )
 
@@ -303,7 +255,7 @@ def test_multimodal_answer_budgets_the_final_text_parts(
         httpx.Client(transport=httpx.MockTransport(unexpected_request)) as client,
         pytest.raises(ModelError, match="4 MiB"),
     ):
-        OpenAIHTTP(_config(media_transport="data"), client=client).answer(question, hits)
+        _model(_sdk_client(client)).answer(question, hits)
 
 
 def test_answer_uses_standard_inline_audio_part(tmp_path: Path) -> None:
@@ -338,7 +290,7 @@ def test_answer_uses_standard_inline_audio_part(tmp_path: Path) -> None:
         modality=Modality.AUDIO,
     )
     with httpx.Client(transport=httpx.MockTransport(respond)) as client:
-        answer = OpenAIHTTP(_config(), client=client).answer(ModelInput(text="What?"), (hit,))
+        answer = _model(_sdk_client(client)).answer(ModelInput(text="What?"), (hit,))
 
     assert answer.answer == "A greeting is audible."
 
@@ -377,9 +329,9 @@ def test_answer_sends_shared_media_once_and_bounds_inline_bytes(
         )
 
     with httpx.Client(transport=httpx.MockTransport(respond)) as client:
-        model = OpenAIHTTP(_config(), client=client)
+        model = _model(_sdk_client(client))
         assert model.answer(ModelInput(text="What?", assets=(image,)), hits).answer == "grounded"
-        monkeypatch.setattr("mindbridge.models.openai_http._MAX_INLINE_MODEL_BYTES", 1)
+        monkeypatch.setattr("mindbridge.models.openai_sdk._MAX_INLINE_MODEL_BYTES", 1)
         with pytest.raises(ModelError, match="64 MiB"):
             model.answer(ModelInput(text="What?", assets=(image,)), hits)
 
@@ -388,8 +340,8 @@ def test_transcription_uses_its_own_endpoint_key_and_multipart_file(tmp_path: Pa
     audio = _asset(tmp_path, "audio", Modality.AUDIO, "audio/wav", b"speech")
 
     def respond(request: httpx.Request) -> httpx.Response:
-        assert request.url == "https://speech.example.test/v1/audio/transcriptions"
-        assert request.headers["Authorization"] == "Bearer transcription-secret"
+        assert request.url == "https://sdk.example.test/v1/audio/transcriptions"
+        assert request.headers["Authorization"] == "Bearer sdk-secret"
         assert request.headers["Content-Type"].startswith("multipart/form-data;")
         body = request.read()
         assert b"speech-model" in body
@@ -398,7 +350,7 @@ def test_transcription_uses_its_own_endpoint_key_and_multipart_file(tmp_path: Pa
         return httpx.Response(200, json={"text": "hello there"})
 
     with httpx.Client(transport=httpx.MockTransport(respond)) as client:
-        result = OpenAIHTTP(_config(), client=client).transcribe((audio,))
+        result = _model(_sdk_client(client)).transcribe((audio,))
 
     assert result == ("hello there",)
 
@@ -420,7 +372,7 @@ def test_embedding_rejects_invalid_response_indices_or_dimensions(
         httpx.Client(transport=httpx.MockTransport(respond)) as client,
         pytest.raises(ModelError, match="invalid"),
     ):
-        OpenAIHTTP(_config(), client=client).embed((ModelInput(text="first"),) * 2)
+        _model(_sdk_client(client)).embed((ModelInput(text="first"),) * 2)
 
 
 @pytest.mark.parametrize("network_error", [False, True])
@@ -437,50 +389,56 @@ def test_provider_failures_do_not_leak_key_or_body(network_error: bool) -> None:
         httpx.Client(transport=httpx.MockTransport(respond)) as client,
         pytest.raises(ModelError) as failure,
     ):
-        OpenAIHTTP(_config(embedding_api_key=secret), client=client).embed((private_body,))
+        _model(_sdk_client(client, api_key=secret)).embed((private_body,))
 
     assert secret not in str(failure.value)
     assert private_body not in str(failure.value)
 
 
-def test_missing_key_and_unsupported_modality_fail_before_http(tmp_path: Path) -> None:
-    model = OpenAIHTTP(Config.from_environment({}))
+def test_missing_client_and_unsupported_modality_fail_before_http(tmp_path: Path) -> None:
+    model = OpenAIModels()
     image = _asset(tmp_path, "image", Modality.IMAGE, "image/png", b"image")
-    try:
-        assert model.embed(()) == ()
-        with pytest.raises(ModelError, match="MINDBRIDGE_EMBEDDING_API_KEY"):
-            model.embed((ModelInput(text="remember this"),))
-        with pytest.raises(ModelError, match="does not support: image"):
-            model.embed((ModelInput(assets=(image,)),))
-    finally:
-        model.close()
+    assert model.embed(()) == ()
+    with pytest.raises(ModelError, match="embedding SDK client is not configured"):
+        model.embed((ModelInput(text="remember this"),))
+    with pytest.raises(ModelError, match="does not support: image"):
+        model.embed((ModelInput(assets=(image,)),))
 
 
-def _config(
+def test_adapter_does_not_close_the_caller_owned_sdk_client() -> None:
+    with httpx.Client() as transport:
+        client = _sdk_client(transport)
+        _model(client).close()
+        assert client.is_closed() is False
+
+
+def _model(
+    client: OpenAI,
     *,
-    media_transport: Literal["data", "file"] = "data",
-    embedding_api_key: str = "embed-secret",
-) -> Config:
-    return Config(
-        base_url="https://common.example.test",
-        embedding_api_key=embedding_api_key,
-        embedding_base_url="https://embed.example.test",
-        generation_api_key="generation-secret",
-        generation_base_url="https://generate.example.test",
-        transcription_api_key="transcription-secret",
-        transcription_base_url="https://speech.example.test",
+    generation_seed: int | None = None,
+    generation_temperature: float | None = None,
+) -> OpenAIModels:
+    return OpenAIModels(
+        client,
         embedding_model="embed-model",
         embedding_space="shared-space-v1",
         generation_model="answer-model",
         transcription_model="speech-model",
         embedding_dimension=2,
-        timeout_seconds=5,
-        media_transport=media_transport,
-        capabilities=ModelCapabilities(
-            embedding=ALL_MODALITIES,
-            generation=ALL_MODALITIES,
-            transcription=frozenset({Modality.AUDIO, Modality.VIDEO}),
-        ),
+        embedding_capabilities=ALL_MODALITIES,
+        generation_capabilities=ALL_MODALITIES,
+        transcription_capabilities=frozenset({Modality.AUDIO, Modality.VIDEO}),
+        generation_seed=generation_seed,
+        generation_temperature=generation_temperature,
+    )
+
+
+def _sdk_client(client: httpx.Client, *, api_key: str = "sdk-secret") -> OpenAI:
+    return OpenAI(
+        api_key=api_key,
+        base_url="https://sdk.example.test/v1",
+        http_client=client,
+        max_retries=0,
     )
 
 

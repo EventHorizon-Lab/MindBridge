@@ -18,9 +18,7 @@ from mindbridge.types import AssetRef, Modality
 _ATOMIC_MODALITIES = (Modality.TEXT, Modality.IMAGE, Modality.VIDEO, Modality.AUDIO)
 _STANDARD_RECIPE = "sentence-transformers-standard-input-v1"
 _COMMIT = re.compile(r"[0-9a-f]{40}\Z")
-# Jina remote code temporarily patches the SentenceTransformer class while loading. Keep model
-# construction serialized, then capture instance methods so independent models can infer in
-# parallel after the class is restored.
+# Some trust-remote-code models mutate shared Sentence Transformers state while importing.
 _ST_LOCK = threading.RLock()
 
 
@@ -125,19 +123,19 @@ class SentenceTransformersEmbedder:
             )
 
     @property
-    def capabilities(self) -> frozenset[Modality]:
+    def embedding_capabilities(self) -> frozenset[Modality]:
         return self._capabilities
 
     @property
-    def model_id(self) -> str:
+    def embedding_model(self) -> str:
         return self._model_id
 
     @property
-    def space_id(self) -> str:
+    def embedding_space(self) -> str:
         return self._space_id
 
     @property
-    def dimension(self) -> int:
+    def embedding_dimension(self) -> int:
         return self._dimension
 
     def embed(

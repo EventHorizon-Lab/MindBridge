@@ -16,7 +16,6 @@ from mindbridge.exceptions import (
     ValidationError,
 )
 from mindbridge.types import (
-    URL,
     AnswerResult,
     AssetRef,
     Blob,
@@ -74,20 +73,16 @@ def test_search_hit_is_flat_and_rejects_invalid_scores() -> None:
 
 
 def test_media_inputs_are_explicit_immutable_values(tmp_path: Path) -> None:
-    source = URL("https://media.example.test/cat", media_type="image/*", name="cat")
     blob = Blob(b"image", "image/png", name="cat.png")
     opaque = AssetRef(id="asset_1", modality=Modality.IMAGE)
     resolved = _asset(tmp_path, "asset_1", Modality.IMAGE, "image/png")
 
-    assert source.media_type == "image/*"
     assert blob.media_type == "image/png"
     assert "data=" not in repr(blob)
     assert not opaque.is_resolved
     assert resolved.is_resolved
     assert str(resolved.path) not in repr(resolved)
     assert pickle.loads(pickle.dumps(resolved)) == resolved
-    with pytest.raises(ValidationError, match="HTTPS"):
-        URL("http://media.example.test/cat")
     with pytest.raises(ValidationError, match="media_type"):
         Blob(b"image", "image/*")
 

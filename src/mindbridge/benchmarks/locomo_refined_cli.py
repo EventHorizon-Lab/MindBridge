@@ -14,7 +14,7 @@ from importlib import metadata
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
-from mindbridge import AsyncMemory, Config
+from mindbridge.benchmarks.eval import _BackendPool
 from mindbridge.benchmarks.isolation import BenchmarkRun
 from mindbridge.benchmarks.locomo_refined import (
     LOCOMO_REFINED_ADAPTER_VERSION,
@@ -25,6 +25,8 @@ from mindbridge.benchmarks.locomo_refined_runner import (
     LoCoMoRefinedPrediction,
     run_locomo_refined_conversation,
 )
+from mindbridge.benchmarks.model_config import ModelConfig
+from mindbridge.models.jina import DEFAULT_JINA_DIMENSION, DEFAULT_JINA_MODEL_ID
 
 LOCOMO_REFINED_RUNNER_VERSION = "locomo_refined_local_v2"
 
@@ -71,12 +73,19 @@ async def _run_conversations(
 ) -> tuple[tuple[LoCoMoRefinedPrediction, ...], tuple[Path, ...]]:
     unit_dirs = tuple(run.unit_dir(conversation.sample_id) for conversation in conversations)
     semaphore = asyncio.Semaphore(arguments.unit_concurrency)
+    pool = _BackendPool(
+        ModelConfig.from_environment(),
+        device=None,
+        batch_size=32,
+        needs_speech=False,
+        seed=0,
+    )
 
     async def run_one(
         conversation: LoCoMoRefinedConversation,
         data_dir: Path,
     ) -> tuple[LoCoMoRefinedPrediction, ...]:
-        async with semaphore, AsyncMemory(data_dir=data_dir) as memory:
+        async with semaphore, pool.memory(data_dir) as memory:
             return await run_locomo_refined_conversation(
                 memory,
                 conversation,
@@ -89,12 +98,15 @@ async def _run_conversations(
         for conversation, data_dir in zip(conversations, unit_dirs, strict=True)
     ]
     try:
-        grouped = await asyncio.gather(*tasks)
-    except BaseException:
-        for task in tasks:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        raise
+        try:
+            grouped = await asyncio.gather(*tasks)
+        except BaseException:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+    finally:
+        pool.close()
     return tuple(prediction for group in grouped for prediction in group), unit_dirs
 
 
@@ -120,14 +132,14 @@ def _write_artifacts(
         + "\n"
         for prediction in predictions
     ).encode("utf-8")
-    config = Config.from_environment()
+    config = ModelConfig.from_environment()
     manifest = {
         "adapter_version": LOCOMO_REFINED_ADAPTER_VERSION,
         "benchmark": "locomo-refined",
         "conversation_count": len(conversations),
         "dataset_sha256": _sha256_file(arguments.dataset),
-        "embedding_dimension": config.embedding_dimension,
-        "embedding_model": config.embedding_model,
+        "embedding_dimension": DEFAULT_JINA_DIMENSION,
+        "embedding_model": DEFAULT_JINA_MODEL_ID,
         "generation_model": config.generation_model,
         "limit": arguments.limit,
         "mindbridge_version": metadata.version("mindbridge"),

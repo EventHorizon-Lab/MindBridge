@@ -20,9 +20,12 @@ With image embedding capability configured, use an explicit local directory and 
 ```python
 from pathlib import Path
 
-from mindbridge import Memory
+from mindbridge import JinaOmniEmbedder, Memory
 
-with Memory("/var/lib/device-agent/memory") as memory:
+with Memory(
+    "/var/lib/device-agent/memory",
+    embedder=JinaOmniEmbedder(),
+) as memory:
     memory.add(["Calibration frame", Path("/var/lib/device-agent/capture/frame.png")])
 ```
 
@@ -31,19 +34,19 @@ under `assets/`. On POSIX, opening the store enforces `0700` on the top-level da
 
 ## Models on or near the device
 
-The default Jina embedder runs through Sentence Transformers on the device selected by
+The Jina embedder runs through Sentence Transformers on the device selected by
 `JinaOmniEmbedder.load(device=...)`. A standard model such as Qwen3-VL uses
-`SentenceTransformersEmbedder`. Fun-ASR-Nano, FSMN-VAD, and CAM++ run locally by default;
-generation can run remotely, on a gateway, or locally through a compatible server such as vLLM.
+`SentenceTransformersEmbedder`. `FunASRTranscriber` delegates Fun-ASR-Nano, FSMN-VAD, and CAM++
+execution to `funasr.AutoModel`. Generation runs through a separately supplied adapter and provider
+client.
 
-The built-in `data` transport caps aggregate raw media at 64 MiB per embedding or generation call
-before base64 expansion. For larger video on a device, use `file` transport with a trusted local
-model server that can read the CAS, or implement a custom backend with native file streaming.
+The OpenAI adapter inlines at most 64 MiB of raw media per embedding or generation call. For larger
+video on a device, use a provider-specific adapter with its native upload or streaming mechanism.
 
 For another embedding runtime, implement `EmbeddingBackend` and pass it through
-`Memory(..., embedder=backend)`. A combined cloud implementation uses `models=backend` without an
-explicit embedder. MindBridge does not ship a plugin registry, GPU scheduler, or quantization
-policy.
+`Memory(..., embedder=backend)`. Generation and transcription use independent `answerer=` and
+`transcriber=` arguments. MindBridge does not ship a provider registry, GPU scheduler, or
+quantization policy.
 
 Declare exact capabilities. A visual-language model without native audio can receive transcript
 text plus retained image/video assets when the transcription operation supports the audio. If a
@@ -57,9 +60,9 @@ MindBridge accepts completed files and bytes; it does not own cameras, microphon
 capture, face identity, or sensor drivers. It does provide local voice identity with optional names
 for completed audio/video assets; the application still decides when capture is complete.
 
-HTTPS media download is disabled until exact public hostnames are configured. Edge applications
-usually prefer `Path` or `Blob` so ingestion does not depend on external storage. If URLs are
-enabled, apply outbound firewall policy in addition to `MINDBRIDGE_ALLOWED_URL_HOSTS`.
+Edge applications usually prefer `Path` or `Blob` so ingestion does not depend on external
+storage. Fetch remote media in application code, where the platform's existing HTTP client,
+credential, firewall, and retry policy already apply.
 
 Apply disk encryption, device access control, and retention rules according to the sensitivity of
 stored media, transcript text, metadata, and embeddings. Separate applications or benchmark jobs

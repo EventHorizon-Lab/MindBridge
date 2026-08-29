@@ -13,7 +13,6 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from starlette.exceptions import HTTPException
 
-from mindbridge.api.auth import AuthenticationError
 from mindbridge.exceptions import (
     IndexUnavailableError,
     MemoryNotFoundError,
@@ -50,15 +49,6 @@ def error_responses(*status_codes: int) -> dict[int | str, dict[str, Any]]:
 
 def register_error_handlers(app: FastAPI) -> None:
     """Make framework, public, and unexpected failures share one envelope."""
-
-    @app.exception_handler(AuthenticationError)
-    async def authentication_error(_request: Request, _error: AuthenticationError) -> JSONResponse:
-        return error_response(
-            status.HTTP_401_UNAUTHORIZED,
-            "authentication_error",
-            "a valid bearer API key is required",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
 
     @app.exception_handler(RequestValidationError)
     async def request_validation_error(

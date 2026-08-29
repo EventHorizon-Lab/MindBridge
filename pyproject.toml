@@ -10,20 +10,20 @@ readme = "README.md"
 requires-python = ">=3.10,<3.15"
 license = "Apache-2.0"
 dependencies = [
-    "httpx>=0.28,<1",
     "pydantic>=2.10,<3",
     "zvec>=0.7,<0.8",
 ]
 
 [project.scripts]
-mindbridge = "mindbridge.benchmarks.cli:product_main"
 mindbridge-bench = "mindbridge.benchmarks.cli:main"
-mindbridge-mcp = "mindbridge.cli:mcp"
 
 [project.optional-dependencies]
 benchmarks = [
     "huggingface-hub>=0.30,<2",
     "pyarrow>=18,<26",
+]
+openai = [
+    "openai>=3,<4",
 ]
 local = [
     # Avoid transformers[audio]: pyctcdecode pins NumPy 1.x, which has no Python 3.13/3.14
@@ -34,10 +34,6 @@ local = [
     "numpy>=2,<3; python_version >= '3.13'",
     "sentence-transformers[image,video]>=5.7,<6",
     "soundfile>=0.13,<1",
-]
-vllm = [
-    "vllm>=0.19.1,<1; sys_platform == 'linux' and platform_machine == 'x86_64'",
-    "vllm>=0.19.1,<1; sys_platform == 'linux' and platform_machine == 'aarch64'",
 ]
 server = [
     "fastapi>=0.116,<1",

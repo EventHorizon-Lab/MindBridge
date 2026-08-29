@@ -17,8 +17,7 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   plus a stable `MindBridgeError` exception hierarchy.
 - SQLite as the authoritative local store for records, canonical FP32 embeddings, compatibility
   metadata, and a durable Zvec outbox.
-- Content-addressed local media storage with safe Path/Blob ingestion, explicit HTTPS host
-  allowlists, per-hop public-IP connection pinning, exact/family MIME validation, and
+- Content-addressed local media storage with safe `Path`/`Blob` ingestion, MIME validation, and
   reference-counted cleanup.
 - Zvec 0.7 dense cosine HNSW, full-text search, and reciprocal-rank hybrid retrieval.
 - First-class semantic, episodic, and procedural memory roles across Python, REST, MCP, SQLite,
@@ -28,29 +27,30 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 - Opt-in non-destructive memory decay with bounded SQLite access reinforcement and no background
   worker or new dependency.
 - Crash-recoverable index replay and rebuild from SQLite without re-embedding stored content.
-- A resource-oriented REST API under `/v1`, five typed MCP stdio tools, and small lifecycle CLIs.
+- An optional resource-oriented REST API under `/v1` and five typed MCP stdio tools over a
+  caller-supplied `Memory`.
 - One ordered multimodal contract across Python, REST, and MCP; response assets expose stable
   metadata without leaking local paths over wire protocols.
-- Independent embedding, generation, and transcription endpoints, explicit model capabilities,
-  durable transcription-space identity, capability-driven ASR plus visual-language fallback, and a
-  public `ModelBackend` seam.
-- A narrow `EmbeddingBackend` seam, default pinned Jina v5 Omni adapter, and generic Sentence
+- Independent embedding, generation, and transcription backends with narrow operation-specific
+  protocols, explicit capabilities, durable transcription-space identity, and capability-driven
+  ASR plus visual-language fallback.
+- A narrow `EmbeddingBackend` seam, pinned Jina v5 Omni adapter, and generic Sentence
   Transformers adapter using standard multimodal dict/message inputs for models such as Qwen3-VL.
-- A narrow `SpeechBackend` seam and default lazy FunASR composition: pinned Fun-ASR-Nano,
+- A narrow `SpeechBackend` seam and lazy FunASR composition through `funasr.AutoModel`: pinned
+  Fun-ASR-Nano,
   FSMN-VAD, CAM++ diarization, timed transcripts, and SQLite-backed anonymous speaker recognition
   across recordings.
-- Named local speaker registration and optional batched vLLM decoding without dropping FSMN-VAD,
-  CAM++ diarization, or stable identity matching.
+- Named local speaker registration without a second inference engine or provider compatibility
+  layer inside MindBridge.
 - Local SQLite schema v5 adds memory roles and bounded retrieval access state; existing schema
   versions migrate in place. Older Zvec recipes rebuild automatically from SQLite embeddings.
 - Physical benchmark isolation plus local-index and LoCoMo-Refined runners.
-- `mindbridge eval` with pinned adapters for twelve long-memory benchmark families, adaptive
+- `mindbridge-bench eval` with pinned adapters for twelve long-memory benchmark families, adaptive
   batching, resumable automatic media acquisition and video preparation, causal manifests,
   deterministic sampling and response caching, cluster-aware confidence intervals, and paired
   regression comparisons.
 - Enforced POSIX `0700` data directories and `0600` database/lock files, fork-use rejection,
-  bounded public input, REST body limits, pre-body bearer authentication, and TLS requirements for
-  non-loopback CLI binds.
+  bounded public input, and REST body limits.
 - Typed Jina text inputs so URL- or path-shaped application text cannot trigger the model's remote
   media downloader or bypass MindBridge asset validation.
 
@@ -58,9 +58,14 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 
 - Isolation is now one physical `data_dir` per application or benchmark unit. There is no hidden
   default scope or logical partition inside a store.
-- The primary developer flow is `Memory()` → `add()` → `search()` or `ask()`.
-- The base dependency set is `httpx`, `pydantic`, and `zvec`; FastAPI/Uvicorn and MCP are optional
-  extras. Sentence Transformers and local media decoders live in the optional `local` extra.
+- The primary developer flow explicitly supplies an embedding backend:
+  `Memory(embedder=...)` → `add()` → `search()` or `ask()`.
+- The base dependency set is `pydantic` and `zvec`; FastAPI/Uvicorn and MCP are optional
+  extras. The official OpenAI SDK lives in `openai`; Sentence Transformers and local media decoders
+  live in `local`.
+- Model authentication, HTTP transport, retries, timeouts, and compatible endpoint handling now
+  belong to caller-owned official OpenAI SDK clients. Remote REST authentication and TLS belong to
+  the deployment gateway or host application.
 - Local embedding spaces are derived from adapter recipe, immutable model revision, effective
   native/Matryoshka dimension, normalization, and query/document semantics.
 - SQLite commits before Zvec changes. Zvec is disposable, and only successfully flushed outbox
@@ -75,6 +80,9 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 
 ### Removed
 
+- The custom OpenAI HTTP client, single-key REST authenticator, and CLI TLS termination.
+- The generic product CLI/server, legacy `mindbridge.sdk` re-export, URL downloader, provider
+  credential configuration, combined `ModelBackend`, and custom FunASR vLLM compatibility path.
 - Tenant, user, run, and implicit-scope fields from Python, REST, MCP, schemas, and storage.
 - PostgreSQL, pgvector, numbered SQL migrations, row-level security, and database integration
   setup.
@@ -89,8 +97,9 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   event time, and source media, then ingest into a new local directory.
 - Old Python signatures, REST routes, MCP tools, CLI commands, and environment variables are not
   compatibility-shimmed.
-- Keep only the model variables documented in [configuration](docs/configuration.md); choose a
-  separate `data_dir` for every independent memory domain.
+- Construct provider SDK clients and operation adapters explicitly; choose a separate `data_dir`
+  for every independent memory domain. Benchmark-only model variables are documented in
+  [configuration](docs/configuration.md).
 - Do not point `Memory` at an old database directory. Start with an empty path and keep the former
   deployment available until retrieval has been validated.
 
@@ -102,8 +111,7 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   embeddings per memory, per-asset retrieval, or learned reranking stage.
 - No in-place re-embedding or retranscription when a persisted embedding/transcription space or
   dimension changes; create a new directory and re-encode source content instead.
-- Built-in `data` transport accepts at most 64 MiB of aggregate raw media per embedding or
-  generation call; answer requests emit one binary part per distinct asset and accept at most 4 MiB
-  of serialized text evidence. Larger video requires co-located `file` transport or a custom
-  streaming/upload backend.
+- The OpenAI adapter inlines at most 64 MiB of aggregate raw media per embedding or generation
+  call; answer requests emit one binary part per distinct asset and accept at most 4 MiB of
+  serialized text evidence. Use a provider-specific upload adapter for larger media.
 - No built-in user authentication, rate limiting, quotas, or secure-erasure guarantee.

@@ -10,7 +10,6 @@ from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import TypeAlias
-from urllib.parse import urlsplit
 
 from mindbridge.exceptions import ValidationError
 
@@ -34,34 +33,6 @@ class MemoryType(str, Enum):
     SEMANTIC = "semantic"
     EPISODIC = "episodic"
     PROCEDURAL = "procedural"
-
-
-@dataclass(frozen=True, slots=True)
-class URL:
-    """One HTTPS source with an optional expected media type or top-level range."""
-
-    value: str
-    media_type: str | None = None
-    name: str | None = None
-
-    def __post_init__(self) -> None:
-        value = _text(self.value, "URL value")
-        try:
-            parsed = urlsplit(value)
-            _ = parsed.port
-        except ValueError:
-            raise ValidationError("URL value must be an HTTPS URL") from None
-        if (
-            parsed.scheme != "https"
-            or not parsed.hostname
-            or parsed.username is not None
-            or parsed.password is not None
-            or parsed.fragment
-        ):
-            raise ValidationError("URL value must be an HTTPS URL without credentials")
-        object.__setattr__(self, "value", value)
-        object.__setattr__(self, "media_type", _optional_url_media_type(self.media_type))
-        object.__setattr__(self, "name", _optional_text(self.name, "URL name"))
 
 
 @dataclass(frozen=True, slots=True)
@@ -137,7 +108,7 @@ class AssetRef:
         )
 
 
-ContentAtom: TypeAlias = str | Path | URL | Blob | AssetRef
+ContentAtom: TypeAlias = str | Path | Blob | AssetRef
 ContentInput: TypeAlias = ContentAtom | Sequence[ContentAtom]
 
 
@@ -215,14 +186,6 @@ def _media_type(value: object) -> str:
 
 def _optional_media_type(value: object | None) -> str | None:
     return None if value is None else _media_type(value)
-
-
-def _optional_url_media_type(value: object | None) -> str | None:
-    if value is None:
-        return None
-    if isinstance(value, str) and value.strip().lower() in {"image/*", "video/*", "audio/*"}:
-        return value.strip().lower()
-    return _media_type(value)
 
 
 def _require_matching_media_type(modality: Modality, media_type: str) -> None:

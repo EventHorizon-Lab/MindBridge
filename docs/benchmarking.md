@@ -8,15 +8,15 @@ every concurrently executing unit must own a different physical data directory.
 Install the local model runtime and Parquet/download support:
 
 ```bash
-uv sync --extra local --extra benchmarks
+uv sync --extra local --extra openai --extra benchmarks
 ```
 
-`mindbridge eval` follows the task-selection shape used by `lmms-eval`:
+`mindbridge-bench eval` follows the task-selection shape used by `lmms-eval`:
 
 ```bash
-mindbridge eval --tasks list
+mindbridge-bench eval --tasks list
 
-mindbridge eval \
+mindbridge-bench eval \
   --model mindbridge \
   --model-args pretrained=gpt-5-mini \
   --tasks locomo-refined,video-mme \
@@ -45,7 +45,7 @@ Pass `--no-download` for a fully offline run. Existing extracted archives and pr
 reused. A task/media override also remains available for an operator-managed corpus:
 
 ```bash
-mindbridge eval \
+mindbridge-bench eval \
   --tasks video-mme \
   --task-data video-mme=/datasets/video-mme/test.parquet \
   --media-root video-mme=/datasets/video-mme/videos \
@@ -121,9 +121,9 @@ individual item is reported as failed. `--unit-concurrency` runs physically isol
 units in parallel, while `--request-concurrency` bounds answer calls inside each unit. One shared
 Jina/FunASR model pool is reused across those stores, so weights are not loaded once per case.
 
-For large media sent to a local OpenAI-compatible endpoint, set
-`--model-args media_transport=file`. Remote endpoints normally require the default inline data
-transport and its 64 MiB per-request safety limit, making prepared clips important.
+The benchmark's OpenAI adapter inlines at most 64 MiB of raw media per request, making prepared
+clips important. A benchmark against larger media needs a provider-specific harness adapter with
+that provider's native upload mechanism.
 
 ## Reproducibility and result trust
 
@@ -147,7 +147,7 @@ The core `lmms-eval` response-cache path shape is supported. A directory keeps a
 answers into the shared cache when the run closes:
 
 ```bash
-mindbridge eval \
+mindbridge-bench eval \
   --tasks video-mme \
   --use_cache .benchmarks/response-cache \
   --output_path .benchmarks/results/video-mme
@@ -165,7 +165,7 @@ Compare identical samples against a prior run and optionally fail CI only on a s
 supported regression:
 
 ```bash
-mindbridge eval \
+mindbridge-bench eval \
   --tasks locomo-refined \
   --compare .benchmarks/results/baseline \
   --fail-on-regression \
@@ -194,14 +194,14 @@ stored as hidden product fields, or used to filter a shared database.
 `BenchmarkRun` creates collision-safe path components and atomically allocates unit directories:
 
 ```python
-from mindbridge import Memory
+from mindbridge import JinaOmniEmbedder, Memory
 from mindbridge.benchmarks.isolation import BenchmarkRun
 
 run = BenchmarkRun(".benchmarks", "retrieval", "trial-001")
 
 for case_id in ("case-a", "case-b"):
     data_dir = run.unit_dir(case_id)
-    with Memory(data_dir) as memory:
+    with Memory(data_dir, embedder=JinaOmniEmbedder()) as memory:
         memory.add(f"Evidence for {case_id}")
 ```
 

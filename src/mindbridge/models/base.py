@@ -58,24 +58,6 @@ class ModelInput:
         return frozenset(value for value in values if value is not None)
 
 
-@dataclass(frozen=True, slots=True)
-class ModelCapabilities:
-    """Explicit input modalities supported by each model operation."""
-
-    embedding: frozenset[Modality]
-    generation: frozenset[Modality]
-    transcription: frozenset[Modality]
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "embedding", _modalities(self.embedding, "embedding"))
-        object.__setattr__(self, "generation", _modalities(self.generation, "generation"))
-        object.__setattr__(
-            self,
-            "transcription",
-            _modalities(self.transcription, "transcription"),
-        )
-
-
 def _modalities(
     values: Iterable[Modality],
     name: str,
@@ -96,16 +78,16 @@ class EmbeddingBackend(Protocol):
     """One thread-safe embedding model with a stable vector-space recipe."""
 
     @property
-    def capabilities(self) -> frozenset[Modality]: ...
+    def embedding_capabilities(self) -> frozenset[Modality]: ...
 
     @property
-    def model_id(self) -> str: ...
+    def embedding_model(self) -> str: ...
 
     @property
-    def space_id(self) -> str: ...
+    def embedding_space(self) -> str: ...
 
     @property
-    def dimension(self) -> int: ...
+    def embedding_dimension(self) -> int: ...
 
     def embed(
         self,
@@ -183,13 +165,13 @@ class SpeechBackend(Protocol):
     """One thread-safe speech analyzer with a stable recognition recipe."""
 
     @property
-    def capabilities(self) -> frozenset[Modality]: ...
+    def transcription_capabilities(self) -> frozenset[Modality]: ...
 
     @property
-    def model_id(self) -> str: ...
+    def transcription_model(self) -> str: ...
 
     @property
-    def space_id(self) -> str: ...
+    def transcription_space(self) -> str: ...
 
     def analyze(self, assets: Sequence[AssetRef]) -> tuple[SpeechAnalysis, ...]: ...
 
@@ -197,34 +179,29 @@ class SpeechBackend(Protocol):
 
 
 @runtime_checkable
-class ModelBackend(Protocol):
-    """The complete model surface consumed by Memory.
-
-    Calls may overlap across threads; implementations must be thread-safe until ``close``.
-    """
+class GenerationBackend(Protocol):
+    """One thread-safe grounded-answer adapter over a provider SDK."""
 
     @property
-    def capabilities(self) -> ModelCapabilities: ...
+    def generation_capabilities(self) -> frozenset[Modality]: ...
+
+    def answer(self, question: ModelInput, hits: Sequence[SearchHit]) -> AnswerResult: ...
+
+    def close(self) -> None: ...
+
+
+@runtime_checkable
+class TranscriptionBackend(Protocol):
+    """One thread-safe plain-transcription adapter over a provider SDK."""
 
     @property
-    def embedding_model(self) -> str: ...
+    def transcription_capabilities(self) -> frozenset[Modality]: ...
 
     @property
-    def embedding_space(self) -> str: ...
+    def transcription_model(self) -> str: ...
 
     @property
     def transcription_space(self) -> str: ...
-
-    @property
-    def embedding_dimension(self) -> int: ...
-
-    def embed(
-        self,
-        inputs: Sequence[ModelInput],
-        task: EmbedTask = EmbedTask.DOCUMENT,
-    ) -> tuple[tuple[float, ...], ...]: ...
-
-    def answer(self, question: ModelInput, hits: Sequence[SearchHit]) -> AnswerResult: ...
 
     def transcribe(self, assets: Sequence[AssetRef]) -> tuple[str, ...]: ...
 

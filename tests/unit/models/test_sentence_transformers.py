@@ -109,7 +109,7 @@ def test_standard_dict_and_message_inputs_are_batched(tmp_path: Path) -> None:
     )
 
     assert isinstance(embedder, EmbeddingBackend)
-    assert embedder.capabilities == {
+    assert embedder.embedding_capabilities == {
         Modality.TEXT,
         Modality.IMAGE,
         Modality.VIDEO,
@@ -154,6 +154,59 @@ def test_query_and_document_methods_remain_distinct() -> None:
     assert [call[0] for call in encoder.calls] == ["query", "document"]
     with pytest.raises(ValidationError, match="task"):
         embedder.embed(batch, "classification")  # type: ignore[arg-type]
+
+
+def test_instance_encode_isolated_from_class_level_remote_patch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class DelegatingEncoder(RecordingEncoder):
+        def encode(
+            self,
+            sentences: list[object],
+            *,
+            batch_size: int,
+            convert_to_numpy: bool,
+            normalize_embeddings: bool,
+            truncate_dim: int | None,
+        ) -> Matrix:
+            del convert_to_numpy, normalize_embeddings
+            self.batch_sizes.append(batch_size)
+            self.calls.append(("native", sentences, truncate_dim))
+            return Matrix(self.values)
+
+        def encode_query(
+            self,
+            sentences: list[object],
+            *,
+            batch_size: int,
+            convert_to_numpy: bool,
+            normalize_embeddings: bool,
+            truncate_dim: int | None,
+        ) -> Matrix:
+            return self.encode(
+                sentences,
+                batch_size=batch_size,
+                convert_to_numpy=convert_to_numpy,
+                normalize_embeddings=normalize_embeddings,
+                truncate_dim=truncate_dim,
+            )
+
+        encode_document = encode_query
+
+    encoder = DelegatingEncoder([[1.0, 0.0]])
+    embedder = SentenceTransformersEmbedder(
+        encoder,
+        model_id="org/text",
+        revision=REVISION,
+    )
+
+    def contaminated(*_args: object, **_kwargs: object) -> Matrix:
+        raise AssertionError("class-level provider patch leaked into a generic encoder")
+
+    monkeypatch.setattr(DelegatingEncoder, "encode", contaminated)
+
+    assert embedder.embed((ModelInput(text="memory"),)) == ((1.0, 0.0),)
+    assert encoder.calls[0][0] == "native"
 
 
 def test_capabilities_are_checked_before_model_execution(tmp_path: Path) -> None:
@@ -210,11 +263,11 @@ def test_native_or_advertised_matryoshka_dimensions_define_the_space() -> None:
         dimension=2,
     )
 
-    assert native.dimension == 4
-    assert short.dimension == 2
-    assert short.space_id == same.space_id
-    assert native.space_id != short.space_id
-    assert short.space_id != other_revision.space_id
+    assert native.embedding_dimension == 4
+    assert short.embedding_dimension == 2
+    assert short.embedding_space == same.embedding_space
+    assert native.embedding_space != short.embedding_space
+    assert short.embedding_space != other_revision.embedding_space
     assert short.embed((ModelInput(text="document"),))[0] == pytest.approx((0.6, 0.8))
     assert short_encoder.calls[0][2] == 2
     with pytest.raises(ModelError, match="advertised Matryoshka"):
@@ -266,7 +319,7 @@ def test_standard_loader_passes_the_immutable_revision_directly(
         batch_size=9,
     )
 
-    assert loaded.model_id == "org/custom"
+    assert loaded.embedding_model == "org/custom"
     assert calls == [
         (
             "org/custom",

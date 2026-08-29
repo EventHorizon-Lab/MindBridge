@@ -11,9 +11,9 @@ import pytest
 from mcp import Client
 from mcp.types import CallToolResult, TextContent
 
-from mindbridge import AsyncMemory, Memory
+from mindbridge import Memory
 from mindbridge.api import mcp as mcp_adapter
-from mindbridge.api.mcp import build_mcp_server, run_mcp
+from mindbridge.api.mcp import build_mcp_server
 from mindbridge.exceptions import (
     IndexUnavailableError,
     MemoryNotFoundError,
@@ -22,7 +22,6 @@ from mindbridge.exceptions import (
     ValidationError,
 )
 from mindbridge.types import (
-    URL,
     AnswerResult,
     AssetRef,
     Blob,
@@ -209,6 +208,7 @@ async def test_mcp_returns_structured_results_and_does_not_close_injected_memory
 async def test_mcp_maps_ordered_openai_parts_and_returns_safe_asset_metadata() -> None:
     memory = FakeMemory()
     audio_data = base64.b64encode(b"wav").decode()
+    image_data = base64.b64encode(b"png").decode()
 
     async with Client(build_mcp_server(cast(Memory, memory))) as client:
         result = await client.call_tool(
@@ -218,7 +218,7 @@ async def test_mcp_maps_ordered_openai_parts_and_returns_safe_asset_metadata() -
                     {"type": "input_text", "text": "  At the station.  "},
                     {
                         "type": "input_image",
-                        "image_url": "https://media.example/frame.png",
+                        "image_url": f"data:image/png;base64,{image_data}",
                     },
                     {
                         "type": "input_file",
@@ -241,7 +241,7 @@ async def test_mcp_maps_ordered_openai_parts_and_returns_safe_asset_metadata() -
     assert isinstance(added, tuple)
     assert added == (
         "At the station.",
-        URL("https://media.example/frame.png", "image/*"),
+        Blob(b"png", "image/png"),
         Blob(b"wav", "audio/wav", "note.wav"),
         AssetRef(id="asset_existing", media_type="video/mp4"),
         AssetRef(id="asset_existing_image", modality=Modality.IMAGE),
@@ -321,26 +321,6 @@ async def test_mcp_bounds_inline_media_before_memory(
     assert memory.calls == []
 
 
-async def test_mcp_accepts_the_public_async_memory_facade() -> None:
-    class FakeAsyncMemory(AsyncMemory):
-        def __init__(self) -> None:
-            self.memory_ids: list[str] = []
-
-        async def get(self, memory_id: str) -> MemoryRecord:
-            self.memory_ids.append(memory_id)
-            return _record(memory_id=memory_id)
-
-    memory = FakeAsyncMemory()
-
-    async with Client(build_mcp_server(memory)) as client:
-        result = await client.call_tool("get_memory", {"memory_id": "async_memory"})
-
-    assert result.is_error is False
-    assert result.structured_content is not None
-    assert result.structured_content["id"] == "async_memory"
-    assert memory.memory_ids == ["async_memory"]
-
-
 @pytest.mark.parametrize("field", ["unknown", "tenant_id", "user_id", "run_id"])
 async def test_mcp_rejects_unknown_and_old_isolation_arguments(field: str) -> None:
     async with Client(build_mcp_server(cast(Memory, FakeMemory()))) as client:
@@ -415,30 +395,6 @@ async def test_mcp_errors_have_stable_codes_without_private_details(
     assert result.is_error is True
     assert _error_envelope(result)["code"] == expected_code
     assert (str(failure) in text) is detail_is_public
-
-
-def test_run_mcp_closes_its_owned_memory_even_when_stdio_stops(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    memory = FakeMemory()
-
-    class StoppedServer:
-        def run(self, transport: str) -> None:
-            assert transport == "stdio"
-            raise RuntimeError("stdio stopped")
-
-    def create_memory(*, data_dir: str | Path) -> FakeMemory:
-        assert Path(data_dir) == tmp_path
-        return memory
-
-    monkeypatch.setattr(mcp_adapter, "Memory", create_memory)
-    monkeypatch.setattr(mcp_adapter, "build_mcp_server", lambda _memory: StoppedServer())
-
-    with pytest.raises(RuntimeError, match="stdio stopped"):
-        run_mcp(tmp_path)
-
-    assert memory.close_count == 1
 
 
 def _record(

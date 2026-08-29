@@ -27,21 +27,6 @@ RUNNERS: dict[str, tuple[str, str]] = {
 }
 
 
-def product_main(argv: Sequence[str] | None = None) -> int:
-    """Expose evaluation beside product commands without reversing the package dependency."""
-    from mindbridge import cli as product_cli
-
-    def evaluation(arguments: Sequence[str], prog: str) -> int:
-        handler = import_module(RUNNERS["eval"][0]).main
-        result = handler(arguments, prog=prog)
-        return result if isinstance(result, int) else 0
-
-    return product_cli.main(
-        argv,
-        extensions={"eval": (RUNNERS["eval"][1], evaluation)},
-    )
-
-
 def installed_version() -> str:
     return version("mindbridge")
 
