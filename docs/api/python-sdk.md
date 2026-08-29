@@ -2,6 +2,10 @@
 
 Supported public imports come from `mindbridge`.
 
+`Memory` is MindBridge's canonical execution plane. `AsyncMemory`, REST, MCP, and the required
+product CLI must dispatch to these same domain operations rather than implement parallel routing,
+storage, defaults, or errors.
+
 ## Content values
 
 ```python

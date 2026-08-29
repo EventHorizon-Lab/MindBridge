@@ -1,6 +1,7 @@
 # MindBridge
 
-Fast, embedded multimodal memory for Python agents.
+MindBridge is an Agentic Native Embodied Memory System: fast, embedded multimodal memory for
+machines that see, hear, and act.
 
 MindBridge owns three things: memory semantics, retrieval orchestration, and durable local
 consistency. Applications construct model adapters explicitly. Provider SDKs and deployment
@@ -131,7 +132,7 @@ A durable write commits SQLite before updating Zvec. Outbox work is acknowledged
 Zvec flush succeeds. Missing or stale index data is rebuilt and hydrated from SQLite without
 re-embedding stored content. Concurrent record commits may share one serialized outbox flush.
 
-## REST and MCP adapters
+## Shared execution plane
 
 Both adapters require a caller-constructed memory:
 
@@ -148,12 +149,16 @@ build_mcp_server(memory).run("stdio")
 ```
 
 They do not own or close `memory`. `create_app` is unauthenticated; put it behind the application's
-gateway or ASGI middleware. There is no generic product CLI because provider construction and
-lifecycle belong to the host application.
+gateway or ASGI middleware. The Python SDK, REST, and MCP therefore share one execution plane rather
+than implementing memory behavior separately.
+
+A product CLI with the same SDK-derived capabilities is required but not implemented in the current
+release. It must reuse or address the same application-composed `Memory`, never invent another
+provider configuration or open a directory already owned by another process.
 
 ## Benchmarks
 
-The only console command is the benchmark dispatcher:
+The currently shipped console command is the benchmark dispatcher:
 
 ```bash
 mindbridge-bench --help
@@ -166,11 +171,13 @@ Every benchmark unit receives a separate physical directory. See
 
 ## Documentation
 
+- [Product goals and design principles](docs/design-principles.md)
 - [Quick start](docs/quickstart.md)
 - [Python API](docs/api/python-sdk.md)
+- [MCP API](docs/api/mcp.md) and [command-line status](docs/api/cli.md)
 - [Configuration and composition](docs/configuration.md)
 - [Architecture](docs/architecture.md)
-- [REST](docs/api/rest.md) and [MCP](docs/api/mcp.md)
+- [REST API](docs/api/rest.md)
 - [Deployment](docs/deployment.md) and [operations](docs/operations.md)
 
 The pinned default Jina model weights are licensed CC BY-NC 4.0. Inject another embedding backend

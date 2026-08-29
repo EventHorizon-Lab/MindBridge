@@ -13,6 +13,38 @@ Application
     └── Zvec (derived projection)
 ```
 
+## Shared execution plane
+
+`Memory` is the canonical execution plane and the Python SDK exposes it directly. REST, MCP, and the
+required product CLI are interfaces over the same application-composed instance, not separate
+implementations of memory behavior.
+
+```text
+Developer / Agent
+├── Python SDK ─────────────────────────┐
+├── REST adapter ───────────────────────┤
+├── MCP adapter ────────────────────────┤
+└── product CLI (required, pending) ────┤
+                                        v
+                         application-composed Memory
+                   validation · routing · retrieval · consistency
+                                        |
+                           models · SQLite/CAS · Zvec
+```
+
+Interface code may decode transport values, call a public operation, and encode its result. It must
+not own a second provider configuration, modality router, retrieval pipeline, persistence path, or
+error taxonomy. SDK behavior is the capability baseline; MCP and CLI schemas project the same
+operations with transport-appropriate types and side-effect annotations.
+
+One execution plane does not allow several processes to open one `data_dir`. An embedded interface
+calls its process-owned `Memory`. A CLI addressing an already running owner must reach that owner
+through a supported transport rather than opening the directory again. In both cases, the operation
+executes exactly once in the owning `Memory`.
+
+The current release already follows this rule for Python, REST, and MCP. The product CLI is required
+by the architecture but is not implemented yet.
+
 ## Responsibility boundary
 
 MindBridge owns:
@@ -87,8 +119,10 @@ closing adapters and storage.
 not normalized by MindBridge; a custom adapter can use the provider's native client where its
 contract permits.
 
-## Optional protocol adapters
+## Protocol interfaces
 
 `create_app(memory=...)` and `build_mcp_server(memory)` expose an existing memory. They never
 construct providers or own the memory lifecycle. FastAPI and MCP own sync/async request dispatch;
-deployment infrastructure supplies auth and transport policy.
+deployment infrastructure supplies auth and transport policy. The product CLI must follow the same
+boundary: reuse the shared execution plane and own only command decoding, output formatting, and
+dispatch.
