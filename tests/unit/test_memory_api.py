@@ -7,7 +7,7 @@ import shutil
 import sqlite3
 from collections.abc import Iterable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -698,7 +698,7 @@ def test_failed_speech_index_add_rolls_back_identity_state(tmp_path: Path) -> No
         with pytest.raises(ModelError, match="embed memory input"):
             memory.add(Blob(b"failed speech", "audio/wav", "failed.wav"))
 
-        with sqlite3.connect(tmp_path / "state.sqlite3") as connection:
+        with closing(sqlite3.connect(tmp_path / "state.sqlite3")) as connection:
             counts = tuple(
                 connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
                 for table in (
@@ -721,7 +721,7 @@ def test_failed_speech_index_add_restores_matched_identity(tmp_path: Path) -> No
         index_speech=True,
     ) as memory:
         memory.add(Blob(b"first speech", "audio/wav", "first.wav"))
-        with sqlite3.connect(tmp_path / "state.sqlite3") as connection:
+        with closing(sqlite3.connect(tmp_path / "state.sqlite3")) as connection:
             before = connection.execute(
                 "SELECT centroid, observations, updated_at FROM speaker_identities"
             ).fetchone()
@@ -730,7 +730,7 @@ def test_failed_speech_index_add_restores_matched_identity(tmp_path: Path) -> No
         with pytest.raises(ModelError, match="embed memory input"):
             memory.add(Blob(b"second speech", "audio/wav", "second.wav"))
 
-        with sqlite3.connect(tmp_path / "state.sqlite3") as connection:
+        with closing(sqlite3.connect(tmp_path / "state.sqlite3")) as connection:
             after = connection.execute(
                 "SELECT centroid, observations, updated_at FROM speaker_identities"
             ).fetchone()
