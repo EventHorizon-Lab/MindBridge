@@ -5,17 +5,24 @@ from __future__ import annotations
 import json
 from argparse import ArgumentTypeError
 from collections.abc import Sequence
+from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
 
 import pytest
 
-from mindbridge import AnswerResult, AsyncMemory
+import mindbridge.benchmarks.eval as eval_module
+from mindbridge import AnswerResult, AssetRef, AsyncMemory, MemoryType, Modality
 from mindbridge.benchmarks.eval import (
     MemoryFactory,
     SampleResult,
+    _answer_many,
+    _BorrowedSpeechBackend,
+    _cache_namespace,
     _ingest,
     _model_config,
+    _ref_at_n,
     _run_identifier,
     _seed_values,
     _video_mme_v2_rating,
@@ -36,8 +43,10 @@ from mindbridge.benchmarks.eval_statistics import (
     summarize,
 )
 from mindbridge.benchmarks.isolation import BenchmarkRun
+from mindbridge.benchmarks.model_config import ModelConfig
 from mindbridge.benchmarks.task_catalog import TASKS, TaskSpec, expand
 from mindbridge.benchmarks.video_mme_v2 import score_group_answers
+from mindbridge.models.base import SpeechAnalysis
 
 
 def test_catalog_covers_requested_benchmarks_and_aliases() -> None:
@@ -132,6 +141,55 @@ def test_video_mme_v2_rating_uses_the_official_zero_to_one_hundred_scale() -> No
     ) == pytest.approx(100 / 3)
 
 
+def test_mm_lifelong_ref_at_300_uses_official_quantized_iou() -> None:
+    assert _ref_at_n(
+        ((300.0, 600.0), (900.0, 1_200.0)),
+        ((450.0, 750.0),),
+        total_seconds=1_500.0,
+        bucket_size=300.0,
+    ) == pytest.approx(50.0)
+
+
+def test_benchmark_speech_backend_skips_video_without_an_audio_stream(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    silent = tmp_path / "silent.mp4"
+    audible = tmp_path / "audible.mp4"
+    silent.write_bytes(b"silent")
+    audible.write_bytes(b"audible")
+    calls: list[tuple[AssetRef, ...]] = []
+
+    class Backend:
+        def analyze(self, assets: Sequence[AssetRef]) -> tuple[SpeechAnalysis, ...]:
+            calls.append(tuple(assets))
+            return tuple(SpeechAnalysis((), ()) for _asset in assets)
+
+    monkeypatch.setattr(eval_module, "_has_audio", lambda path: path == audible)
+    backend = _BorrowedSpeechBackend(Backend())
+    assets = (
+        AssetRef("a" * 64, Modality.VIDEO, "video/mp4", 6, "a" * 64, path=silent),
+        AssetRef("b" * 64, Modality.VIDEO, "video/mp4", 7, "b" * 64, path=audible),
+    )
+
+    assert backend.analyze(assets) == (SpeechAnalysis((), ()), SpeechAnalysis((), ()))
+    assert calls == [(assets[1],)]
+
+
+def test_response_cache_namespace_changes_with_result_schema(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    arguments = cast(
+        eval_module._Arguments,
+        SimpleNamespace(device=None, seed=7, gen_kwargs="{}", recall_limit=8),
+    )
+    before = _cache_namespace(arguments, ModelConfig(), {"text": 1})
+
+    monkeypatch.setattr(eval_module, "EVAL_SCHEMA_VERSION", eval_module.EVAL_SCHEMA_VERSION + 1)
+
+    assert _cache_namespace(arguments, ModelConfig(), {"text": 1}) != before
+
+
 def test_model_base_url_override_replaces_environment_operation_urls(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -140,6 +198,65 @@ def test_model_base_url_override_replaces_environment_operation_urls(
     config = _model_config("mindbridge", "base_url=https://new.example/v1")
 
     assert config.generation_base_url == "https://new.example/v1"
+
+
+@pytest.mark.asyncio
+async def test_memlens_question_date_is_a_reference_clock_not_query_text(tmp_path: Path) -> None:
+    dataset = tmp_path / "memlens.json"
+    dataset.write_text(
+        json.dumps(
+            [
+                {
+                    "question_id": "q1",
+                    "question_type": "preference",
+                    "question": "What is my favorite color?",
+                    "answer": "Blue.",
+                    "question_date": "2025/01/15 (Wed) 10:00",
+                    "haystack_dates": ["2025/01/14 (Tue) 09:00"],
+                    "haystack_sessions": [
+                        [{"role": "user", "content": "My favorite color is blue."}]
+                    ],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    auxiliary = tmp_path / "memlens" / "agent_subset_195.json"
+    auxiliary.parent.mkdir()
+    auxiliary.write_text(
+        json.dumps({"n_questions": 1, "question_ids": ["q1"]}),
+        encoding="utf-8",
+    )
+    loaded = load_task(
+        TASKS["memlens-32k"],
+        root=tmp_path,
+        dataset_path=dataset,
+        verify_digest=False,
+    )
+    question = loaded.units[0].questions[0]
+    observed: list[datetime | None] = []
+
+    class Memory:
+        async def ask(
+            self,
+            _question: object,
+            *,
+            limit: int,
+            reference_at: datetime | None = None,
+        ) -> AnswerResult:
+            assert limit == 5
+            observed.append(reference_at)
+            return AnswerResult("Blue.")
+
+    await _answer_many(
+        cast(AsyncMemory, Memory()),
+        (question,),
+        request_concurrency=1,
+        recall_limit=5,
+    )
+
+    assert "Question date:" not in str(question.content[0])
+    assert observed == [datetime(2025, 1, 15, 10, tzinfo=timezone.utc)]
 
 
 def test_run_identifier_cannot_escape_the_default_output_root() -> None:
@@ -275,25 +392,54 @@ class _FakeMemory:
     def __init__(self, events: list[str]) -> None:
         self.events = events
 
-    async def add_many(self, contents: Sequence[object]) -> tuple[object, ...]:
+    async def add_many(
+        self,
+        contents: Sequence[object],
+        **_kwargs: object,
+    ) -> tuple[object, ...]:
         self.events.extend(f"add:{content}" for content in contents)
         return ()
 
-    async def add(self, content: object) -> object:
+    async def add(self, content: object, **_kwargs: object) -> object:
         self.events.append(f"add:{content}")
         return object()
 
-    async def ask(self, question: object, *, limit: int) -> AnswerResult:
+    async def ask(
+        self,
+        question: object,
+        *,
+        limit: int,
+        reference_at: datetime | None = None,
+    ) -> AnswerResult:
+        del reference_at
         self.events.append(f"ask:{question}:{limit}")
         return AnswerResult("A")
 
 
 class _BatchLimitedMemory(_FakeMemory):
-    async def add_many(self, contents: Sequence[object]) -> tuple[object, ...]:
+    async def add_many(
+        self,
+        contents: Sequence[object],
+        **_kwargs: object,
+    ) -> tuple[object, ...]:
         self.events.append(f"batch:{len(contents)}")
         if len(contents) > 2:
             raise RuntimeError("batch too large")
         return ()
+
+
+class _ProvenanceMemory(_FakeMemory):
+    def __init__(self, events: list[str]) -> None:
+        super().__init__(events)
+        self.kwargs: dict[str, object] = {}
+
+    async def add_many(
+        self,
+        contents: Sequence[object],
+        **kwargs: object,
+    ) -> tuple[object, ...]:
+        self.kwargs = kwargs
+        return await super().add_many(contents)
 
 
 @pytest.mark.asyncio
@@ -304,6 +450,21 @@ async def test_ingest_bisects_a_failed_batch_without_losing_items() -> None:
 
     assert await _ingest(cast(AsyncMemory, memory), items, batch_size=4) == 0
     assert events == ["batch:4", "batch:2", "batch:2"]
+
+
+@pytest.mark.asyncio
+async def test_ingest_preserves_event_time_and_source_interval() -> None:
+    occurred = datetime(2026, 8, 20, 9, tzinfo=timezone.utc)
+    memory = _ProvenanceMemory([])
+    item = MemoryItem("clip-1", ("event",), 10.0, 20.0, occurred)
+
+    assert await _ingest(cast(AsyncMemory, memory), (item,), batch_size=1) == 0
+    assert memory.kwargs == {
+        "occurred_at": (occurred,),
+        "occurred_end": (None,),
+        "metadata": ({"source_id": "clip-1", "start_seconds": 10.0, "end_seconds": 20.0},),
+        "memory_type": MemoryType.EPISODIC,
+    }
 
 
 class _FakeContext:

@@ -33,6 +33,9 @@ Memory(
     embedder: EmbeddingBackend,
     answerer: GenerationBackend | None = None,
     transcriber: SpeechBackend | TranscriptionBackend | None = None,
+    index_speech: bool = False,
+    minimum_relevance: float = 0.55,
+    ambiguity_margin: float = 0.01,
     decay_half_life_days: float | None = None,
     speaker_similarity: float = 0.78,
     speaker_margin: float = 0.05,
@@ -42,6 +45,14 @@ Memory(
 `embedder` is required. `Memory` validates adapter capabilities and durable space identity before
 opening Zvec. It closes supplied adapters when the memory closes; provider clients owned by an
 adapter may remain caller-owned, as documented by that adapter.
+
+`index_speech=True` requires a speech-capable backend to analyze supported audio/video during
+`add`. Its transcript, stable speaker IDs, and names already registered at add time become stored,
+retrievable text. The default keeps speech analysis lazy.
+
+`minimum_relevance` rejects weak dense evidence, while `ambiguity_margin` returns no hits when the
+top two dense confidences are effectively tied and the winner has neither a lexical nor temporal
+anchor. Both are calibrated `[0, 1]` values and may be set to `0` to disable that gate.
 
 Use `Memory` as a context manager:
 
@@ -58,15 +69,24 @@ with Memory("./data/example", embedder=JinaOmniEmbedder()) as memory:
 record = memory.add(
     content,
     occurred_at=None,
+    occurred_end=None,
     metadata=None,
     memory_type=MemoryType.SEMANTIC,
 )
-records = memory.add_many(contents, memory_type=MemoryType.SEMANTIC)
+records = memory.add_many(
+    contents,
+    occurred_at=(first_time, second_time),
+    occurred_end=(first_end, second_end),
+    metadata=({"source_id": "first"}, {"source_id": "second"}),
+    memory_type=MemoryType.SEMANTIC,
+)
 ```
 
-`occurred_at` must be timezone-aware. Metadata must be a JSON-compatible mapping with non-empty
-string keys. `add_many` batches model and storage work; duplicate inputs return the same stable
-record in their original positions.
+Event times must be timezone-aware. `occurred_end`, when present, requires `occurred_at` and must be
+later than it. Metadata must be a JSON-compatible mapping with non-empty string keys. For
+`add_many`, the optional event-time and metadata sequences must contain one value per content; this
+preserves per-record provenance without losing batched model/storage work. Duplicate inputs return
+the same stable record in their original positions.
 
 ### Retrieve and answer
 
@@ -91,6 +111,21 @@ configured answerer. It raises `ModelError` when no answerer is configured.
 `reference_at` controls relative-date interpretation and decay reranking. It must be
 timezone-aware; the current UTC time is used when omitted.
 
+Composite records are indexed with an aggregate vector and de-duplicated vectors for each text or
+media atom. Text longer than 2,048 characters also receives overlapping contextual retrieval keys;
+the complete record remains the returned evidence. Search over-fetches candidates and keeps the
+maximum part score for each record. Weak or unresolved tied evidence can therefore return `()`.
+
+### Feedback
+
+```python
+updated = memory.reinforce((hit.id,))
+```
+
+Call `reinforce` only after explicit positive feedback. Retrieval itself never changes access
+strength. Confirmations provide a small bounded ranking boost even without decay and also slow
+decay when it is enabled. The return value is the number of existing, distinct memories updated.
+
 ### Read, list, and delete
 
 ```python
@@ -113,6 +148,8 @@ memory.register_speaker(speaker_id, "Ada")
 `SpeakerSegment` values contain time bounds, transcript text, opaque local speaker ID, optional
 registered name, and optional identity score. Grounded `ask` calls reuse this cache and pass the
 complete timed identity evidence to the answerer without changing the returned source hits.
+With `index_speech=True`, registering or renaming a speaker also re-embeds every existing memory
+that contains that identity, so name queries work for recordings captured before registration.
 
 ### Index maintenance
 
@@ -121,8 +158,8 @@ count = memory.reindex()
 memory.optimize()
 ```
 
-`reindex` rebuilds the disposable Zvec projection from SQLite embeddings. It never calls the
-embedder. `optimize` compacts the current index.
+`reindex` rebuilds the disposable Zvec projection from every stored embedding and returns the
+number of memories rebuilt. It never calls the embedder. `optimize` compacts the current index.
 
 ## AsyncMemory
 

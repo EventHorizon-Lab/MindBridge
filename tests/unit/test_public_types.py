@@ -2,7 +2,7 @@
 
 import pickle
 from dataclasses import FrozenInstanceError, asdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -126,6 +126,22 @@ def test_records_preserve_persisted_media_modality_and_allow_empty_derived_text(
 def test_public_values_reject_naive_times() -> None:
     with pytest.raises(ValidationError, match="timezone"):
         MemoryRecord(id="memory_1", content="memory", created_at=NOW.replace(tzinfo=None))
+    with pytest.raises(ValidationError, match="later than occurred_at"):
+        MemoryRecord(
+            id="memory_1",
+            content="memory",
+            created_at=NOW,
+            occurred_at=NOW,
+            occurred_end=NOW,
+        )
+    record = MemoryRecord(
+        id="memory_1",
+        content="memory",
+        created_at=NOW,
+        occurred_at=NOW,
+        occurred_end=NOW + timedelta(minutes=5),
+    )
+    assert record.occurred_end == NOW + timedelta(minutes=5)
 
 
 def test_answer_and_page_reuse_the_public_values() -> None:

@@ -20,7 +20,7 @@ from mindbridge.infrastructure.local._lock import DataDirectoryLock
 from mindbridge.models.base import SpeechAnalysis
 from mindbridge.types import SpeakerSegment
 
-_SCHEMA_VERSION = 5
+_SCHEMA_VERSION = 6
 _SQLITE_PARAMETER_BATCH = 900
 _MEMORY_MODALITIES = frozenset({"text", "image", "video", "audio", "omni"})
 _MEMORY_TYPES = frozenset({"semantic", "episodic", "procedural"})
@@ -134,7 +134,7 @@ CREATE TABLE speech_segments (
 CREATE INDEX speech_segments_speaker_idx ON speech_segments (speaker_id);
 """
 
-_SCHEMA_V5 = f"""
+_SCHEMA_V6 = f"""
 BEGIN IMMEDIATE;
 
 CREATE TABLE memory_records (
@@ -145,6 +145,9 @@ CREATE TABLE memory_records (
         CHECK (memory_type IN ('semantic', 'episodic', 'procedural')),
     metadata_json TEXT NOT NULL,
     occurred_at TEXT,
+    occurred_end TEXT CHECK (
+        occurred_end IS NULL OR (occurred_at IS NOT NULL AND occurred_end > occurred_at)
+    ),
     last_accessed_at TEXT,
     access_count INTEGER NOT NULL DEFAULT 0 CHECK (access_count BETWEEN 0 AND 20),
     created_at TEXT NOT NULL,
@@ -191,7 +194,16 @@ CREATE INDEX search_index_queue_order_idx
 
 {_INDEX_TRIGGERS}
 
-PRAGMA user_version = 5;
+PRAGMA user_version = 6;
+COMMIT;
+"""
+
+_MIGRATE_V5_TO_V6 = """
+BEGIN IMMEDIATE;
+ALTER TABLE memory_records ADD COLUMN occurred_end TEXT CHECK (
+    occurred_end IS NULL OR (occurred_at IS NOT NULL AND occurred_end > occurred_at)
+);
+PRAGMA user_version = 6;
 COMMIT;
 """
 
@@ -333,6 +345,7 @@ class StoredMemory:
     created_at: datetime
     updated_at: datetime
     occurred_at: datetime | None = None
+    occurred_end: datetime | None = None
     modality: str = "text"
     memory_type: str = "semantic"
     assets: tuple[StoredAsset, ...] = ()
@@ -360,8 +373,7 @@ class StoredMemory:
         object.__setattr__(self, "metadata_json", _canonical_object_json(self.metadata_json))
         _require_aware(self.created_at, "created_at")
         _require_aware(self.updated_at, "updated_at")
-        if self.occurred_at is not None:
-            _require_aware(self.occurred_at, "occurred_at")
+        _require_interval(self.occurred_at, self.occurred_end)
         if self.last_accessed_at is not None:
             _require_aware(self.last_accessed_at, "last_accessed_at")
         _access_count(self.access_count)
@@ -421,12 +433,39 @@ class IndexDocument:
     metadata_json: str
     memory_type: str = "semantic"
     occurred_at: datetime | None = None
+    occurred_end: datetime | None = None
 
     def __post_init__(self) -> None:
         if self.memory_type not in _MEMORY_TYPES:
             raise ValueError("memory_type must be semantic, episodic, or procedural")
-        if self.occurred_at is not None:
-            _require_aware(self.occurred_at, "occurred_at")
+        _require_interval(self.occurred_at, self.occurred_end)
+
+
+@dataclass(frozen=True, slots=True)
+class _SpeakerIdentityState:
+    speaker_id: str
+    name: str | None
+    model_id: str
+    space_id: str
+    dimension: int
+    centroid: bytes
+    observations: int
+    created_at: str
+    updated_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class _SpeakerIdentityChange:
+    speaker_id: str
+    previous: _SpeakerIdentityState | None
+
+
+@dataclass(frozen=True, slots=True)
+class SpeechRollback:
+    """Internal undo token for an unreferenced speech analysis."""
+
+    asset_id: str
+    identities: tuple[_SpeakerIdentityChange, ...]
 
 
 class LocalStore:
@@ -499,6 +538,26 @@ class LocalStore:
                 self._write_embedding(connection, embedding)
         return created_flags
 
+    def replace_memory_embeddings(
+        self,
+        memories: Iterable[StoredMemory],
+        embeddings: Iterable[StoredEmbedding],
+    ) -> None:
+        """Atomically replace every vector belonging to supplied existing memories."""
+        supplied_memories, supplied_embeddings, supplied_by_memory = _prepare_write_batch(
+            memories,
+            embeddings,
+        )
+        if not supplied_memories:
+            return
+        with self._transaction() as connection:
+            self._replace_memory_embeddings(
+                connection,
+                supplied_memories,
+                supplied_embeddings,
+                supplied_by_memory,
+            )
+
     def read_memory(self, memory_id: str) -> StoredMemory | None:
         """Return one memory, or none when it does not exist."""
         _require_identifier(memory_id, "memory_id")
@@ -506,7 +565,8 @@ class LocalStore:
             row = connection.execute(
                 """
                 SELECT memory_id, content, modality, memory_type, metadata_json,
-                       occurred_at, last_accessed_at, access_count, created_at, updated_at
+                       occurred_at, occurred_end, last_accessed_at, access_count,
+                       created_at, updated_at
                 FROM memory_records
                 WHERE memory_id = ?
                 """,
@@ -532,7 +592,8 @@ class LocalStore:
                     connection.execute(
                         f"""
                         SELECT memory_id, content, modality, memory_type, metadata_json,
-                               occurred_at, last_accessed_at, access_count, created_at, updated_at
+                               occurred_at, occurred_end, last_accessed_at, access_count,
+                               created_at, updated_at
                         FROM memory_records
                         WHERE memory_id IN ({placeholders})
                         """,
@@ -575,7 +636,8 @@ class LocalStore:
             rows = connection.execute(
                 f"""
                 SELECT memory_id, content, modality, memory_type, metadata_json,
-                       occurred_at, last_accessed_at, access_count, created_at, updated_at
+                       occurred_at, occurred_end, last_accessed_at, access_count,
+                       created_at, updated_at
                 FROM memory_records
                 {where}
                 ORDER BY created_at DESC, memory_id DESC
@@ -759,6 +821,27 @@ class LocalStore:
         minimum_margin: float = 0.05,
     ) -> tuple[SpeakerSegment, ...]:
         """Persist one analysis and match its CAM++ centroids to local identities."""
+        segments, _rollback = self.write_speech_reversible(
+            asset_id,
+            analysis,
+            model_id=model_id,
+            space_id=space_id,
+            minimum_similarity=minimum_similarity,
+            minimum_margin=minimum_margin,
+        )
+        return segments
+
+    def write_speech_reversible(
+        self,
+        asset_id: str,
+        analysis: SpeechAnalysis,
+        *,
+        model_id: str,
+        space_id: str,
+        minimum_similarity: float = 0.78,
+        minimum_margin: float = 0.05,
+    ) -> tuple[tuple[SpeakerSegment, ...], SpeechRollback | None]:
+        """Persist speech and return an undo token when this call created the analysis."""
         _sha256(asset_id)
         _require_identifier(model_id, "speech model_id")
         _require_identifier(space_id, "speech space_id")
@@ -796,7 +879,7 @@ class LocalStore:
                 (asset_id, space_id),
             ).fetchone()
             if cached is not None:
-                return self._read_speech(connection, asset_id)
+                return self._read_speech(connection, asset_id), None
             if (
                 connection.execute(
                     "SELECT 1 FROM media_assets WHERE asset_id = ?",
@@ -806,7 +889,7 @@ class LocalStore:
             ):
                 raise ValueError("speech analysis requires a stored media asset")
 
-            identities = self._match_speakers(
+            identities, identity_changes = self._match_speakers(
                 connection,
                 normalized,
                 model_id=model_id,
@@ -847,12 +930,115 @@ class LocalStore:
                 "UPDATE media_assets SET transcript = ? WHERE asset_id = ?",
                 (transcript, asset_id),
             )
-            return self._read_speech(connection, asset_id)
+            return self._read_speech(connection, asset_id), SpeechRollback(
+                asset_id,
+                identity_changes,
+            )
 
-    def register_speaker(self, speaker_id: str, name: str) -> bool:
-        """Assign or replace the display name for one local speaker identity."""
+    def rollback_speech(self, rollback: SpeechRollback) -> bool:
+        """Undo one new analysis while its asset is still unreferenced by a memory."""
+        if not isinstance(rollback, SpeechRollback):
+            raise ValueError("rollback must be a SpeechRollback value")
+        with self._transaction() as connection:
+            if (
+                connection.execute(
+                    "SELECT 1 FROM memory_assets WHERE asset_id = ? LIMIT 1",
+                    (rollback.asset_id,),
+                ).fetchone()
+                is not None
+            ):
+                return False
+            deleted = connection.execute(
+                "DELETE FROM speech_analyses WHERE asset_id = ?",
+                (rollback.asset_id,),
+            )
+            if deleted.rowcount == 0:
+                return False
+            for change in reversed(rollback.identities):
+                previous = change.previous
+                if previous is None:
+                    removed = connection.execute(
+                        """
+                        DELETE FROM speaker_identities
+                        WHERE speaker_id = ?
+                          AND NOT EXISTS (
+                              SELECT 1 FROM speech_segments WHERE speaker_id = ?
+                          )
+                        """,
+                        (change.speaker_id, change.speaker_id),
+                    )
+                    if removed.rowcount != 1:
+                        raise RuntimeError("new speaker identity could not be rolled back")
+                    continue
+                connection.execute(
+                    """
+                    INSERT INTO speaker_identities (
+                        speaker_id, name, model_id, space_id, dimension, centroid,
+                        observations, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT (speaker_id) DO UPDATE SET
+                        name = excluded.name,
+                        model_id = excluded.model_id,
+                        space_id = excluded.space_id,
+                        dimension = excluded.dimension,
+                        centroid = excluded.centroid,
+                        observations = excluded.observations,
+                        created_at = excluded.created_at,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        previous.speaker_id,
+                        previous.name,
+                        previous.model_id,
+                        previous.space_id,
+                        previous.dimension,
+                        previous.centroid,
+                        previous.observations,
+                        previous.created_at,
+                        previous.updated_at,
+                    ),
+                )
+            return True
+
+    def speaker_memory_ids(self, speaker_id: str) -> tuple[str, ...] | None:
+        """Return memories containing a speaker, or none when the identity is unknown."""
+        _require_identifier(speaker_id, "speaker_id")
+        with self._connection() as connection:
+            if (
+                connection.execute(
+                    "SELECT 1 FROM speaker_identities WHERE speaker_id = ?",
+                    (speaker_id,),
+                ).fetchone()
+                is None
+            ):
+                return None
+            rows = connection.execute(
+                """
+                SELECT DISTINCT ma.memory_id
+                FROM speech_segments AS s
+                JOIN memory_assets AS ma ON ma.asset_id = s.asset_id
+                WHERE s.speaker_id = ?
+                ORDER BY ma.memory_id
+                """,
+                (speaker_id,),
+            ).fetchall()
+        return tuple(_row_text(row, "memory_id") for row in rows)
+
+    def register_speaker(
+        self,
+        speaker_id: str,
+        name: str,
+        *,
+        memories: Iterable[StoredMemory] = (),
+        embeddings: Iterable[StoredEmbedding] = (),
+    ) -> bool:
+        """Assign a display name and atomically replace affected indexed memories."""
         _require_identifier(speaker_id, "speaker_id")
         normalized_name = _speaker_name(name)
+        supplied_memories, supplied_embeddings, supplied_by_memory = _prepare_write_batch(
+            memories,
+            embeddings,
+        )
         now = _datetime_text(datetime.now(timezone.utc))
         with self._transaction() as connection:
             cursor = connection.execute(
@@ -862,6 +1048,14 @@ class LocalStore:
                 WHERE speaker_id = ?
                 """,
                 (normalized_name, now, speaker_id),
+            )
+            if cursor.rowcount == 0:
+                return False
+            self._replace_memory_embeddings(
+                connection,
+                supplied_memories,
+                supplied_embeddings,
+                supplied_by_memory,
             )
         return cursor.rowcount > 0
 
@@ -964,7 +1158,8 @@ class LocalStore:
                         f"""
                         SELECT e.embedding_id, e.memory_id, e.object_part, e.model_id, e.space_id,
                                e.task, e.dimension, e.normalized, e.vector, e.created_at,
-                               m.content, m.metadata_json, m.memory_type, m.occurred_at
+                               m.content, m.metadata_json, m.memory_type,
+                               m.occurred_at, m.occurred_end
                         FROM embeddings AS e
                         JOIN memory_records AS m ON m.memory_id = e.memory_id
                         WHERE e.embedding_id IN ({placeholders})
@@ -974,15 +1169,46 @@ class LocalStore:
                 )
         by_id: dict[str, IndexDocument] = {}
         for row in rows:
-            document = IndexDocument(
-                embedding=_embedding_from_row(row),
-                content=_row_text(row, "content"),
-                metadata_json=_row_text(row, "metadata_json"),
-                memory_type=_row_text(row, "memory_type"),
-                occurred_at=_optional_datetime_from_row(row, "occurred_at"),
-            )
+            document = _index_document_from_row(row)
             by_id[document.embedding.embedding_id] = document
         return tuple(by_id[embedding_id] for embedding_id in embedding_ids if embedding_id in by_id)
+
+    def read_memory_index_documents(
+        self,
+        memory_ids: Sequence[str],
+    ) -> tuple[IndexDocument, ...]:
+        """Hydrate every embedding for each memory, preserving memory and part order."""
+        if not memory_ids:
+            return ()
+        for memory_id in memory_ids:
+            _require_identifier(memory_id, "memory_id")
+        rows = []
+        with self._connection() as connection:
+            for offset in range(0, len(memory_ids), _SQLITE_PARAMETER_BATCH):
+                batch = memory_ids[offset : offset + _SQLITE_PARAMETER_BATCH]
+                placeholders = ", ".join("?" for _memory_id in batch)
+                rows.extend(
+                    connection.execute(
+                        f"""
+                        SELECT e.embedding_id, e.memory_id, e.object_part, e.model_id, e.space_id,
+                               e.task, e.dimension, e.normalized, e.vector, e.created_at,
+                               m.content, m.metadata_json, m.memory_type,
+                               m.occurred_at, m.occurred_end
+                        FROM embeddings AS e
+                        JOIN memory_records AS m ON m.memory_id = e.memory_id
+                        WHERE e.memory_id IN ({placeholders})
+                        ORDER BY e.object_part, e.embedding_id
+                        """,
+                        tuple(batch),
+                    ).fetchall()
+                )
+        by_memory: dict[str, list[IndexDocument]] = {}
+        for row in rows:
+            document = _index_document_from_row(row)
+            by_memory.setdefault(document.embedding.memory_id, []).append(document)
+        return tuple(
+            document for memory_id in memory_ids for document in by_memory.get(memory_id, ())
+        )
 
     def pending_index_operations(self, *, limit: int = 100) -> tuple[IndexOperation, ...]:
         """Read queued mutations without acknowledging them."""
@@ -1098,6 +1324,9 @@ class LocalStore:
             if version == 4:
                 _migrate_v4(connection)
             version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+            if version == 5:
+                _migrate_v5(connection)
+            version = int(connection.execute("PRAGMA user_version").fetchone()[0])
             tables = _table_names(connection)
             if version != _SCHEMA_VERSION:
                 raise UnsupportedSchemaError(
@@ -1181,6 +1410,34 @@ class LocalStore:
             ),
         )
 
+    def _replace_memory_embeddings(
+        self,
+        connection: sqlite3.Connection,
+        memories: Sequence[StoredMemory],
+        embeddings: Sequence[StoredEmbedding],
+        embedding_ids: dict[str, set[str]],
+    ) -> None:
+        for memory in memories:
+            if (
+                connection.execute(
+                    "SELECT 1 FROM memory_records WHERE memory_id = ?",
+                    (memory.memory_id,),
+                ).fetchone()
+                is None
+            ):
+                raise ValueError("replacement embeddings require an existing memory")
+            connection.execute(
+                "DELETE FROM embeddings WHERE memory_id = ?",
+                (memory.memory_id,),
+            )
+            self._write_memory(
+                connection,
+                memory,
+                supplied_embedding_ids=embedding_ids[memory.memory_id],
+            )
+        for embedding in embeddings:
+            self._write_embedding(connection, embedding)
+
     def _write_memory(
         self,
         connection: sqlite3.Connection,
@@ -1190,7 +1447,7 @@ class LocalStore:
     ) -> bool:
         existing = connection.execute(
             """
-            SELECT content, modality, memory_type, metadata_json, occurred_at
+            SELECT content, modality, memory_type, metadata_json, occurred_at, occurred_end
             FROM memory_records
             WHERE memory_id = ?
             """,
@@ -1215,20 +1472,22 @@ class LocalStore:
             or _row_text(existing, "memory_type") != memory.memory_type
             or _row_text(existing, "metadata_json") != memory.metadata_json
             or existing["occurred_at"] != _optional_datetime_text(memory.occurred_at)
+            or existing["occurred_end"] != _optional_datetime_text(memory.occurred_end)
             or existing_asset_ids != supplied_asset_ids
         )
         connection.execute(
             """
             INSERT INTO memory_records (
                 memory_id, content, modality, memory_type, metadata_json,
-                occurred_at, last_accessed_at, access_count, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                occurred_at, occurred_end, last_accessed_at, access_count, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT (memory_id) DO UPDATE SET
                 content = excluded.content,
                 modality = excluded.modality,
                 memory_type = excluded.memory_type,
                 metadata_json = excluded.metadata_json,
                 occurred_at = excluded.occurred_at,
+                occurred_end = excluded.occurred_end,
                 updated_at = excluded.updated_at
             """,
             (
@@ -1238,6 +1497,7 @@ class LocalStore:
                 memory.memory_type,
                 memory.metadata_json,
                 _optional_datetime_text(memory.occurred_at),
+                _optional_datetime_text(memory.occurred_end),
                 _optional_datetime_text(memory.last_accessed_at),
                 memory.access_count,
                 _datetime_text(memory.created_at),
@@ -1441,31 +1701,50 @@ class LocalStore:
         minimum_similarity: float,
         minimum_margin: float,
         now: datetime,
-    ) -> dict[str, tuple[str, float | None]]:
+    ) -> tuple[
+        dict[str, tuple[str, float | None]],
+        tuple[_SpeakerIdentityChange, ...],
+    ]:
         if not speakers:
-            return {}
+            return {}, ()
         dimension = len(next(iter(speakers.values())))
         rows = connection.execute(
             """
-            SELECT speaker_id, centroid, observations, created_at
+            SELECT speaker_id, name, model_id, space_id, dimension, centroid,
+                   observations, created_at, updated_at
             FROM speaker_identities
             WHERE space_id = ? AND dimension = ?
             ORDER BY speaker_id
             """,
             (space_id, dimension),
         ).fetchall()
-        existing = {
-            _row_text(row, "speaker_id"): (
-                _normalized_vector(
-                    _unpack_vector(_row_blob(row, "centroid"), dimension),
-                    "stored speaker centroid",
-                ),
-                int(row["observations"]),
+        states = {
+            _row_text(row, "speaker_id"): _SpeakerIdentityState(
+                speaker_id=_row_text(row, "speaker_id"),
+                name=None if row["name"] is None else _row_text(row, "name"),
+                model_id=_row_text(row, "model_id"),
+                space_id=_row_text(row, "space_id"),
+                dimension=int(row["dimension"]),
+                centroid=_row_blob(row, "centroid"),
+                observations=int(row["observations"]),
+                created_at=_row_text(row, "created_at"),
+                updated_at=_row_text(row, "updated_at"),
             )
             for row in rows
         }
+        existing = {
+            speaker_id: (
+                _normalized_vector(
+                    _unpack_vector(state.centroid, dimension),
+                    "stored speaker centroid",
+                ),
+                state.observations,
+            )
+            for speaker_id, state in states.items()
+        }
         claimed: set[str] = set()
         matches: dict[str, tuple[str, float | None]] = {}
+        changes: list[_SpeakerIdentityChange] = []
         for label, centroid in sorted(speakers.items()):
             # ponytail: local speaker populations use a linear scan; add a vector index only
             # after profiling shows identity matching matters beside model inference.
@@ -1481,6 +1760,7 @@ class LocalStore:
             ambiguous = len(ranked) > 1 and ranked[0][1] - ranked[1][1] < minimum_margin
             if best is None or best[1] < minimum_similarity or ambiguous:
                 speaker_id = f"speaker_{uuid.uuid4().hex}"
+                changes.append(_SpeakerIdentityChange(speaker_id, None))
                 connection.execute(
                     """
                     INSERT INTO speaker_identities (
@@ -1502,6 +1782,7 @@ class LocalStore:
                 matches[label] = (speaker_id, None)
             else:
                 speaker_id, score = best
+                changes.append(_SpeakerIdentityChange(speaker_id, states[speaker_id]))
                 previous, observations = existing[speaker_id]
                 updated = _normalized_vector(
                     tuple(
@@ -1526,7 +1807,7 @@ class LocalStore:
                 existing[speaker_id] = (updated, observations + 1)
                 matches[label] = (speaker_id, max(0.0, min(1.0, score)))
             claimed.add(matches[label][0])
-        return matches
+        return matches, tuple(changes)
 
     def _require_open(self) -> None:
         if self._closed:
@@ -1578,7 +1859,7 @@ def _create_schema(
     if existing_tables:
         raise UnsupportedSchemaError("local data directory contains an unversioned SQLite schema")
     try:
-        connection.executescript(_SCHEMA_V5)
+        connection.executescript(_SCHEMA_V6)
     except BaseException:
         if connection.in_transaction:
             connection.rollback()
@@ -1654,6 +1935,19 @@ def _migrate_v4(connection: sqlite3.Connection) -> None:
         raise
 
 
+def _migrate_v5(connection: sqlite3.Connection) -> None:
+    try:
+        columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(memory_records)")}
+        if "occurred_end" not in columns:
+            connection.executescript(_MIGRATE_V5_TO_V6)
+        else:
+            connection.execute("PRAGMA user_version = 6")
+    except BaseException:
+        if connection.in_transaction:
+            connection.rollback()
+        raise
+
+
 def _memory_from_row(
     row: sqlite3.Row,
     *,
@@ -1667,6 +1961,7 @@ def _memory_from_row(
         assets=assets,
         metadata_json=_row_text(row, "metadata_json"),
         occurred_at=_optional_datetime_from_row(row, "occurred_at"),
+        occurred_end=_optional_datetime_from_row(row, "occurred_end"),
         last_accessed_at=_optional_datetime_from_row(row, "last_accessed_at"),
         access_count=int(row["access_count"]),
         created_at=_parse_datetime(_row_text(row, "created_at")),
@@ -1709,6 +2004,17 @@ def _embedding_from_row(row: sqlite3.Row) -> StoredEmbedding:
         values=_unpack_vector(vector, dimension),
         normalized=bool(int(row["normalized"])),
         created_at=_parse_datetime(_row_text(row, "created_at")),
+    )
+
+
+def _index_document_from_row(row: sqlite3.Row) -> IndexDocument:
+    return IndexDocument(
+        embedding=_embedding_from_row(row),
+        content=_row_text(row, "content"),
+        metadata_json=_row_text(row, "metadata_json"),
+        memory_type=_row_text(row, "memory_type"),
+        occurred_at=_optional_datetime_from_row(row, "occurred_at"),
+        occurred_end=_optional_datetime_from_row(row, "occurred_end"),
     )
 
 
@@ -1782,6 +2088,15 @@ def _optional_datetime_from_row(row: sqlite3.Row, column: str) -> datetime | Non
 def _require_aware(value: datetime, name: str) -> None:
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError(f"{name} must be timezone-aware")
+
+
+def _require_interval(start: datetime | None, end: datetime | None) -> None:
+    if start is not None:
+        _require_aware(start, "occurred_at")
+    if end is not None:
+        _require_aware(end, "occurred_end")
+        if start is None or end <= start:
+            raise ValueError("occurred_end must be later than occurred_at")
 
 
 def _require_identifier(value: str, name: str) -> None:

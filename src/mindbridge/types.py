@@ -198,6 +198,13 @@ def _require_aware(value: datetime | None, name: str) -> None:
         raise ValidationError(f"{name} must include a timezone")
 
 
+def _require_interval(start: datetime | None, end: datetime | None) -> None:
+    _require_aware(start, "occurred_at")
+    _require_aware(end, "occurred_end")
+    if end is not None and (start is None or end <= start):
+        raise ValidationError("occurred_end must be later than occurred_at")
+
+
 def _assets(value: Sequence[AssetRef], modality: Modality) -> tuple[AssetRef, ...]:
     assets = tuple(value)
     if any(not isinstance(asset, AssetRef) or not asset.is_resolved for asset in assets):
@@ -222,6 +229,7 @@ class MemoryRecord:
     content: str
     created_at: datetime
     occurred_at: datetime | None = None
+    occurred_end: datetime | None = None
     metadata: Mapping[str, object] = field(default_factory=dict, hash=False)
     assets: tuple[AssetRef, ...] = ()
     modality: Modality = Modality.TEXT
@@ -230,7 +238,7 @@ class MemoryRecord:
     def __post_init__(self) -> None:
         _text(self.id, "id")
         _require_aware(self.created_at, "created_at")
-        _require_aware(self.occurred_at, "occurred_at")
+        _require_interval(self.occurred_at, self.occurred_end)
         if not isinstance(self.modality, Modality):
             raise ValidationError("memory modality is invalid")
         if not isinstance(self.memory_type, MemoryType):
@@ -251,6 +259,7 @@ class SearchHit:
     score: float
     created_at: datetime
     occurred_at: datetime | None = None
+    occurred_end: datetime | None = None
     metadata: Mapping[str, object] = field(default_factory=dict, hash=False)
     assets: tuple[AssetRef, ...] = ()
     modality: Modality = Modality.TEXT
@@ -259,7 +268,7 @@ class SearchHit:
     def __post_init__(self) -> None:
         _text(self.id, "id")
         _require_aware(self.created_at, "created_at")
-        _require_aware(self.occurred_at, "occurred_at")
+        _require_interval(self.occurred_at, self.occurred_end)
         if not math.isfinite(self.score) or not 0.0 <= self.score <= 1.0:
             raise ValidationError("score must be between zero and one")
         if not isinstance(self.modality, Modality):

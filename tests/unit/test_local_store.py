@@ -70,12 +70,15 @@ def _memory(
         created_at=now,
         updated_at=now,
         occurred_at=now - timedelta(hours=1),
+        occurred_end=now - timedelta(minutes=30),
     )
 
 
 def _embedding(
     embedding_id: str = "embedding-1",
     memory_id: str = "memory-1",
+    *,
+    object_part: int = 0,
 ) -> StoredEmbedding:
     return StoredEmbedding(
         embedding_id=embedding_id,
@@ -85,6 +88,7 @@ def _embedding(
         space_id="test-space",
         task="retrieval.document",
         created_at=datetime(2026, 8, 27, 1, 2, 3, tzinfo=timezone.utc),
+        object_part=object_part,
         normalized=True,
     )
 
@@ -149,7 +153,7 @@ def test_schema_is_local_and_enforces_foreign_keys(tmp_path: Path) -> None:
                     "SELECT sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY name"
                 )
             )
-            assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+            assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
             assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
             assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
         assert "tenant" not in schema.casefold()
@@ -216,7 +220,7 @@ def test_schema_v1_is_migrated_atomically_with_text_modality(tmp_path: Path) -> 
         assert legacy.access_count == 0
         assert legacy.assets == ()
         with closing(sqlite3.connect(store.database_path)) as connection:
-            assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+            assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
             assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
 
 
@@ -236,7 +240,7 @@ def test_schema_v2_is_migrated_without_losing_memories(tmp_path: Path) -> None:
     with LocalStore(tmp_path) as store:
         assert store.read_memory("preserved") is not None
         with closing(sqlite3.connect(store.database_path)) as connection:
-            assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+            assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
             assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
 
 
@@ -257,8 +261,27 @@ def test_schema_v3_adds_optional_speaker_names(tmp_path: Path) -> None:
             columns = {
                 row[1] for row in connection.execute("PRAGMA table_info(speaker_identities)")
             }
-            assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+            assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
         assert "name" in columns
+
+
+@pytest.mark.skipif(sqlite3.sqlite_version_info < (3, 35), reason="DROP COLUMN needs SQLite 3.35")
+def test_schema_v5_adds_optional_event_end(tmp_path: Path) -> None:
+    with LocalStore(tmp_path):
+        pass
+    with closing(sqlite3.connect(tmp_path / "state.sqlite3")) as connection:
+        connection.executescript(
+            """
+            ALTER TABLE memory_records DROP COLUMN occurred_end;
+            PRAGMA user_version = 5;
+            """
+        )
+
+    with LocalStore(tmp_path) as store:
+        with closing(sqlite3.connect(store.database_path)) as connection:
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(memory_records)")}
+            assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert "occurred_end" in columns
 
 
 def test_memory_embedding_and_outbox_round_trip(tmp_path: Path) -> None:
@@ -273,6 +296,7 @@ def test_memory_embedding_and_outbox_round_trip(tmp_path: Path) -> None:
         assert stored_memory is not None
         assert stored_memory.metadata_json == '{"priority":2,"room":"workshop"}'
         assert stored_memory.occurred_at == memory.occurred_at
+        assert stored_memory.occurred_end == memory.occurred_end
         assert stored_memory.memory_type == "semantic"
         assert stored_memory.access_count == 0
         stored_embedding = store.read_embedding(embedding.embedding_id)
@@ -298,6 +322,7 @@ def test_memory_embedding_and_outbox_round_trip(tmp_path: Path) -> None:
         assert document.content == changed.content
         assert document.memory_type == "semantic"
         assert document.occurred_at == changed.occurred_at
+        assert document.occurred_end == changed.occurred_end
         assert document.embedding.embedding_id == embedding.embedding_id
 
         assert store.acknowledge_index_operations(changed_operation) == 1
@@ -317,6 +342,22 @@ def test_memory_embedding_and_outbox_round_trip(tmp_path: Path) -> None:
 
     with pytest.raises(LocalStoreClosedError, match="closed"):
         store.read_memory(memory.memory_id)
+
+
+def test_read_memory_index_documents_returns_every_part_in_order(tmp_path: Path) -> None:
+    memory = _memory()
+    aggregate = _embedding(memory_id=memory.memory_id)
+    child = _embedding("embedding-2", memory.memory_id, object_part=1)
+
+    with LocalStore(tmp_path) as store:
+        store.write_memory(memory, (child, aggregate))
+
+        documents = store.read_memory_index_documents((memory.memory_id, "missing"))
+
+    assert [document.embedding.embedding_id for document in documents] == [
+        aggregate.embedding_id,
+        child.embedding_id,
+    ]
 
 
 def test_retrieval_reinforcement_is_bounded_and_monotonic(tmp_path: Path) -> None:

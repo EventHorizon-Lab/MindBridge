@@ -10,10 +10,10 @@ workers, or logical scopes.
 | Capability | Current support | Deliberate boundary |
 | --- | --- | --- |
 | Semantic memory | `MemoryType.SEMANTIC`, the default | The caller classifies content; MindBridge does not extract facts automatically |
-| Episodic memory | `MemoryType.EPISODIC` plus optional `occurred_at` | No automatic episode segmentation or reflection |
+| Episodic memory | `MemoryType.EPISODIC` plus optional `occurred_at`/`occurred_end` | No automatic episode segmentation or reflection |
 | Procedural memory | `MemoryType.PROCEDURAL` for instructions and reusable routines | Stored procedures are evidence, not executable code |
 | Temporal reasoning | ISO dates and common English/Chinese relative calendar expressions | No unrestricted natural-language temporal theorem prover |
-| Memory decay | Optional search-time soft reranking with bounded retrieval reinforcement | No automatic deletion, archival, or rewriting |
+| Memory decay | Optional search-time soft reranking with explicit bounded reinforcement | No automatic deletion, archival, rewriting, or reinforcement from mere retrieval |
 
 Before these contracts were added, MindBridge had semantic similarity retrieval and persisted
 `occurred_at`, but every record was otherwise untyped, event time did not affect retrieval, and no
@@ -35,6 +35,7 @@ with Memory(
         "The deployment failed because the token had expired.",
         memory_type=MemoryType.EPISODIC,
         occurred_at=datetime(2026, 8, 20, 9, tzinfo=timezone.utc),
+        occurred_end=datetime(2026, 8, 20, 9, 5, tzinfo=timezone.utc),
     )
     memory.add(
         "Refresh the token, retry once, then escalate.",
@@ -48,15 +49,17 @@ with Memory(
     )
 ```
 
-`add_many(..., memory_type=...)` applies one role to the complete batch. `search` and `ask` accept
-an optional role filter. A different non-semantic role produces a different stable identity for
-otherwise identical content; the default semantic identity remains compatible with records made
-before this feature.
+`add_many(..., occurred_at=(...), occurred_end=(...), metadata=(...), memory_type=...)` preserves
+per-record time and metadata while applying one role to the complete batch. `search` and `ask`
+accept an optional role filter. A different non-semantic role produces a different stable identity
+for otherwise identical content; an omitted end preserves the former instant-event identity.
 
 ## Temporal retrieval
 
-`occurred_at` is semantic event time. `created_at` remains storage time and is not substituted for
-an absent event time during temporal matching.
+`occurred_at` is semantic event start time. `occurred_end` is an optional exclusive end and must be
+later than the start. `created_at` remains storage time and is not substituted for an absent event
+time during temporal matching. A stored interval matches a query interval when they overlap;
+instant events use a one-microsecond internal extent.
 
 `reference_at` resolves relative expressions in its timezone. When omitted, MindBridge uses the
 current UTC time. The deterministic parser recognizes:
@@ -67,10 +70,10 @@ current UTC time. The deterministic parser recognizes:
 - last, this, or next month and year, including common Chinese equivalents;
 - `N days ago`, `N 天前`, and rolling `past N days`, `过去 N 天`, or `最近 N 天`.
 
-For a detected temporal expression, Zvec first retrieves candidates inside the event-time range.
-MindBridge also fetches a bounded fallback pool so a sparse or missing timeline does not turn into
-an unexplained empty result. SQLite then rechecks event times, ranks matched events first, applies
-the normal relevance score, and hydrates only authoritative records. `ask` passes the resolved
+For a detected temporal expression, Zvec retrieves both an in-range pool and a global pool.
+MindBridge collapses them by record, then multiplies semantic relevance by a smooth temporal factor:
+`1.5` inside the range, decaying toward `0.3` with distance outside it. This keeps nearby evidence
+available when event boundaries are noisy without losing in-range recall. `ask` passes the resolved
 reference time to the generation model so relative-date wording is not interpreted against the
 provider's clock.
 
@@ -89,17 +92,21 @@ never filtered or deleted by decay.
 For each candidate:
 
 ```text
+confirmation_factor = 1 + 0.05 * log2(1 + min(access_count, 20))
 anchor = last_accessed_at or occurred_at or updated_at
 strength = 1 + log2(1 + min(access_count, 20))
 retention = 2 ^ (-age / (half_life * strength))
 decay_factor = 0.3 + 1.2 * retention
-adjusted_score = relevance * decay_factor
+adjusted_score = relevance * confirmation_factor * decay_factor
 ```
 
-Only returned hits are reinforced. SQLite caps `access_count` at 20 and moves
-`last_accessed_at` forward using the real retrieval time; a simulated `reference_at` never writes a
-future access timestamp. Reinforcement can change later ranking, so MCP search and answer tools are
-conservatively marked as non-read-only. Disabling decay leaves access history unused.
+The confirmation factor applies even when decay is disabled. Feedback recorded after a historical
+`reference_at` is ignored for that query, so evaluation cannot leak future confirmation backward.
+
+Search never reinforces a hit by itself. After an application observes positive feedback, it may
+call `memory.reinforce((memory_id, ...))`. SQLite de-duplicates the IDs, caps `access_count` at 20,
+and advances `last_accessed_at` using the real feedback time. This prevents accidental retrieval
+from creating a self-reinforcing ranking loop.
 
 ## Research basis and architecture decision
 
@@ -114,6 +121,12 @@ The design follows the smallest common mechanism supported by the literature:
   curve and strengthens memories after recall.
 - [LongMemEval](https://arxiv.org/abs/2410.10813) treats temporal reasoning as a distinct long-term
   memory ability and motivates time-aware query restriction.
+- [MERIT](https://choi-yeeun.github.io/MERIT/) uses multiple retrieval keys, max-over-key scoring,
+  and temporal neighbors for long egocentric video memory; MindBridge applies the same inexpensive
+  late-interaction shape to caller-supplied text/media atoms.
+- [MemLens](https://arxiv.org/abs/2605.14906) shows that compressing visual evidence into text can
+  destroy information needed at answer time, motivating retrieval over durable raw media instead
+  of caption-only storage.
 - [TReMu](https://aclanthology.org/2025.findings-acl.972/) and
   [Temporal Semantic Memory](https://aclanthology.org/2026.findings-acl.1496/) show why an event
   timeline and semantic event time matter more than dialogue or storage order.
@@ -126,10 +139,10 @@ The design follows the smallest common mechanism supported by the literature:
   [temporal reasoning](https://docs.mem0.ai/platform/features/temporal-reasoning), and
   [soft memory decay](https://docs.mem0.ai/platform/features/memory-decay).
 
-MindBridge adopts explicit type, event, and access fields plus query-time filtering/reranking. It
+MindBridge adopts explicit type, event, and access fields plus query-time retrieval/reranking. It
 does not adopt a graph database, autonomous consolidation agents, an LLM classification call, or a
 procedure executor. Those layers would add new failure modes and dependencies without a measured
-requirement in the embedded SDK. Add them only when a benchmark shows that typed aggregate
+requirement in the embedded SDK. Add them only when a benchmark shows that typed max-over-part
 retrieval cannot meet a concrete workload.
 
 Memory type and metadata are not isolation controls. One physical `data_dir` remains one memory

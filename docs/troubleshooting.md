@@ -39,8 +39,9 @@ directory. Do not add a logical tenant or request field to work around the lock.
 ## Store metadata mismatch
 
 The directory was opened with a different embedding model, embedding space, dimension,
-transcription space, or incompatible index recipe. Use the original adapter recipe or ingest the
-source content into a new directory. `reindex()` cannot change stored vectors or transcripts.
+transcription space, or unknown index recipe. Known older retrieval-key recipes migrate by
+re-embedding automatically; other mismatches require the original adapter or a new directory.
+`reindex()` itself cannot change stored vectors or transcripts.
 
 ## Missing or damaged Zvec index
 
@@ -66,9 +67,10 @@ a transcriber for audio fallback. MindBridge does not silently remove image or v
 
 ## Media exceeds 64 MiB for a model call
 
-The OpenAI adapter bounds aggregate inline media. Use a provider-specific adapter that uploads or
-streams large assets through that provider's SDK. MindBridge does not expose local `file://` paths
-as a compatibility transport.
+The OpenAI adapter bounds aggregate inline media. Answer generation keeps ranked evidence assets
+that fit and falls back to their text; an oversized question asset or embedding input still fails.
+Use a provider-specific adapter that uploads or streams large assets through that provider's SDK.
+MindBridge does not expose local `file://` paths as a compatibility transport.
 
 ## REST returns 422 for media
 

@@ -7,6 +7,7 @@ import json
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Literal, TypeAlias, TypeVar, cast
 
@@ -49,6 +50,8 @@ class MemoryItem:
     content: tuple[str | Path, ...]
     start_seconds: float = 0.0
     end_seconds: float | None = None
+    occurred_at: datetime | None = None
+    occurred_end: datetime | None = None
 
     def __post_init__(self) -> None:
         if not self.source_id.strip() or not self.content:
@@ -62,6 +65,17 @@ class MemoryItem:
             )
         ):
             raise ValueError("memory item interval is invalid")
+        if self.occurred_at is not None and (
+            self.occurred_at.tzinfo is None or self.occurred_at.utcoffset() is None
+        ):
+            raise ValueError("memory item event time must include a timezone")
+        if self.occurred_end is not None and (
+            self.occurred_end.tzinfo is None
+            or self.occurred_end.utcoffset() is None
+            or self.occurred_at is None
+            or self.occurred_end <= self.occurred_at
+        ):
+            raise ValueError("memory item event end must follow a timezone-aware event time")
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,6 +89,7 @@ class EvalQuestion:
     score_kind: ScoreKind = "text"
     cutoff_seconds: float | None = None
     metadata: Mapping[str, object] = field(default_factory=dict)
+    reference_at: datetime | None = None
 
     def __post_init__(self) -> None:
         if not self.question_id.strip() or not self.content:
@@ -89,6 +104,10 @@ class EvalQuestion:
             not math.isfinite(self.cutoff_seconds) or self.cutoff_seconds < 0
         ):
             raise ValueError("question cutoff must be a non-negative finite number")
+        if self.reference_at is not None and (
+            self.reference_at.tzinfo is None or self.reference_at.utcoffset() is None
+        ):
+            raise ValueError("question reference time must include a timezone")
 
 
 @dataclass(frozen=True, slots=True)
@@ -409,6 +428,8 @@ def _memory_digest(units: Sequence[EvalUnit]) -> str:
                     memory.source_id,
                     memory.start_seconds,
                     memory.end_seconds,
+                    (None if memory.occurred_at is None else memory.occurred_at.isoformat()),
+                    (None if memory.occurred_end is None else memory.occurred_end.isoformat()),
                     tuple(identity(content) for content in memory.content),
                 )
                 for memory in unit.memories
@@ -443,6 +464,7 @@ def _locomo(
                         else ""
                     ),
                 ),
+                occurred_at=turn.occurred_at,
             )
             for turn in conversation.turns
         )
@@ -709,13 +731,12 @@ def _memlens(
                         if image.caption
                     ),
                 ),
+                occurred_at=session.occurred_at,
             )
             for session in question.sessions
             for turn in session.turns
         )
-        prompt = MEMLENS_QUERY_PROMPT.text.format(
-            question_date=question.question_date.isoformat(), question=question.question
-        )
+        prompt = MEMLENS_QUERY_PROMPT.text.format(question=question.question)
         units.append(
             EvalUnit(
                 question.question_id,
@@ -729,6 +750,7 @@ def _memlens(
                             "question_type": question.question_type,
                             "question_subtype": question.question_subtype,
                         },
+                        reference_at=question.question_date,
                     ),
                 ),
             )
@@ -838,7 +860,7 @@ def _atm(
 
     email_path = root / spec.auxiliary[0]
     memories = [
-        MemoryItem(email.email_id, (chunk,))
+        MemoryItem(email.email_id, (chunk,), occurred_at=email.occurred_at)
         for email in load_atm_emails(email_path)
         for chunk in atm_memory_chunks(atm_email_block(email), email.email_id)
     ]
@@ -846,7 +868,7 @@ def _atm(
         image_path, video_path = (root / item for item in spec.auxiliary[1:])
         for record in (*load_atm_sgm(image_path), *load_atm_sgm(video_path)):
             memories.extend(
-                MemoryItem(record.media_id, (chunk,))
+                MemoryItem(record.media_id, (chunk,), occurred_at=record.occurred_at)
                 for chunk in atm_memory_chunks(atm_sgm_block(record), record.media_id)
             )
     else:
@@ -916,7 +938,11 @@ def _gallery_memory(
     image: Path | None = None
     if round_.image_path:
         image = media.path(round_.image_path)
-    return MemoryItem(round_.round_id, (text,) if image is None else (text, image))
+    return MemoryItem(
+        round_.round_id,
+        (text,) if image is None else (text, image),
+        occurred_at=session.occurred_at,
+    )
 
 
 def _gallery_question(

@@ -29,12 +29,11 @@ EGOMEM_REASON_QUERY_PROMPT = PromptSpec(
 
 MEMLENS_QUERY_PROMPT = PromptSpec(
     name="memlens_query",
-    version="memlens_query_v1",
-    purpose="Add MEMLENS question time and its required abstention response.",
+    version="memlens_query_v2",
+    purpose="Add the required MEMLENS abstention response.",
     used_by="mindbridge.benchmarks.memlens_runner._question_query",
     text=(
-        "Question date: {question_date}\n{question}\n\n"
-        'If the memories are insufficient, answer exactly "Insufficient information".'
+        '{question}\n\nIf the memories are insufficient, answer exactly "Insufficient information".'
     ),
 )
 

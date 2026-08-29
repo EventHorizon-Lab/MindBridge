@@ -56,13 +56,14 @@ Stores one stable text or multimodal record.
 | --- | --- | --- | --- |
 | `content` | string or ordered content parts | yes | — |
 | `occurred_at` | timezone-aware ISO 8601 datetime or null | no | null |
+| `occurred_end` | timezone-aware ISO 8601 datetime or null | no | null |
 | `metadata` | JSON object or null | no | null |
 | `memory_type` | `semantic`, `episodic`, or `procedural` | no | `semantic` |
 
 The structured result contains `id`, `content`, `modality`, `memory_type`, `assets`, `created_at`,
-`occurred_at`, and `metadata`. Asset results contain safe metadata but never a local path. Repeating
-canonical input returns the existing record. The tool is marked as a non-destructive, idempotent
-write.
+`occurred_at`, `occurred_end`, and `metadata`. An event end requires a start and must be later than
+it. Asset results contain safe metadata but never a local path. Repeating canonical input returns
+the existing record. The tool is marked as a non-destructive, idempotent write.
 
 Example arguments:
 
@@ -95,7 +96,8 @@ Searches local memories.
 The result is `{"hits": [...]}`. Each hit contains memory fields plus `score`. Routed queries with
 text use hybrid dense/full-text retrieval; pure media uses dense retrieval. Relative temporal
 expressions resolve against `reference_at`. Search is conservatively marked non-read-only because
-enabled decay reinforces returned memories.
+it may drain durable index work or populate transcript caches; it never reinforces a hit merely for
+being returned.
 
 ### `ask_memory`
 
@@ -109,10 +111,11 @@ Answers only from retrieved local memories.
 | `reference_at` | timezone-aware ISO 8601 datetime or null | no | current UTC |
 
 The result contains `answer` and the exact grounding `hits`. Like search, the tool is marked
-non-read-only because decay can reinforce returned memories. The built-in outbound answer request
-serializes each distinct question/evidence asset once even if several hits refer to it. It also
-sends each hit's content, `memory_type`, `occurred_at`, `created_at`, and metadata to the configured
-generation endpoint.
+non-read-only because retrieval may maintain local caches/index state. The built-in outbound answer
+request serializes each distinct question/evidence asset once even if several hits refer to it. It
+reserves the raw-media budget for question assets, keeps ranked evidence media that fits, and
+retains overflow hits as text when possible. It also sends each hit's content, `memory_type`,
+`occurred_at`, `occurred_end`, `created_at`, and metadata to the configured generation endpoint.
 
 ### `get_memory`
 
@@ -198,5 +201,6 @@ annotations.
 
 There is no large-file upload tool, local-path input, logical scope, chunking option, per-asset
 vector control, or learned reranker option. The OpenAI adapter inlines at most 64 MiB of raw media
-per embedding or generation call, and answer text evidence is limited to 4 MiB. Use a
+per embedding or generation call; generation admits
+ranked evidence within that budget. Answer text evidence is limited to 4 MiB. Use a
 provider-specific upload adapter for larger media.

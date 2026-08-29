@@ -54,16 +54,18 @@ class FakeMemory:
         content: ContentInput,
         *,
         occurred_at: datetime | None = None,
+        occurred_end: datetime | None = None,
         metadata: Mapping[str, object] | None = None,
         memory_type: MemoryType = MemoryType.SEMANTIC,
     ) -> MemoryRecord:
         self._fail()
         copied_metadata = dict(metadata or {})
-        self.calls.append(("add", content, occurred_at, copied_metadata, memory_type))
+        self.calls.append(("add", content, occurred_at, occurred_end, copied_metadata, memory_type))
         return _record(
             "memory_1",
             content if isinstance(content, str) else "Multimodal memory.",
             occurred_at=occurred_at,
+            occurred_end=occurred_end,
             metadata=copied_metadata,
             assets=() if isinstance(content, str) else (ASSET,),
             modality=Modality.TEXT if isinstance(content, str) else Modality.IMAGE,
@@ -191,7 +193,14 @@ def test_resource_routes_map_the_public_memory_values() -> None:
     assert deleted.status_code == 204
     assert deleted.content == b""
     assert memory.calls == [
-        ("add", "The toolbox is blue.", NOW, {"room": "workshop"}, MemoryType.EPISODIC),
+        (
+            "add",
+            "The toolbox is blue.",
+            NOW,
+            None,
+            {"room": "workshop"},
+            MemoryType.EPISODIC,
+        ),
         ("add_many", ("first", "second"), MemoryType.PROCEDURAL),
         ("list", 2, "before"),
         ("get", "memory_1"),
@@ -444,6 +453,7 @@ def _record(
     content: str,
     *,
     occurred_at: datetime | None = None,
+    occurred_end: datetime | None = None,
     metadata: Mapping[str, object] | None = None,
     assets: tuple[AssetRef, ...] = (),
     modality: Modality = Modality.TEXT,
@@ -457,6 +467,7 @@ def _record(
         assets=assets,
         created_at=NOW,
         occurred_at=occurred_at,
+        occurred_end=occurred_end,
         metadata=metadata or {},
     )
 

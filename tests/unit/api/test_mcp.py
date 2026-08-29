@@ -55,15 +55,17 @@ class FakeMemory:
         content: ContentInput,
         *,
         occurred_at: datetime | None = None,
+        occurred_end: datetime | None = None,
         metadata: Mapping[str, object] | None = None,
         memory_type: MemoryType = MemoryType.SEMANTIC,
     ) -> MemoryRecord:
         self._fail()
         copied_metadata = dict(metadata or {})
-        self.calls.append(("add", content, occurred_at, copied_metadata, memory_type))
+        self.calls.append(("add", content, occurred_at, occurred_end, copied_metadata, memory_type))
         return _record(
             content=content if isinstance(content, str) else "Multimodal memory.",
             occurred_at=occurred_at,
+            occurred_end=occurred_end,
             metadata=copied_metadata,
             modality=Modality.TEXT if isinstance(content, str) else Modality.IMAGE,
             assets=() if isinstance(content, str) else (ASSET,),
@@ -126,7 +128,7 @@ async def test_mcp_publishes_only_the_five_flat_local_tools() -> None:
         "delete_memory",
     }
     assert {name: set(tool.input_schema["properties"]) for name, tool in tools.items()} == {
-        "add_memory": {"content", "occurred_at", "metadata", "memory_type"},
+        "add_memory": {"content", "occurred_at", "occurred_end", "metadata", "memory_type"},
         "search_memories": {"query", "limit", "memory_type", "reference_at"},
         "ask_memory": {"question", "limit", "memory_type", "reference_at"},
         "get_memory": {"memory_id"},
@@ -186,6 +188,7 @@ async def test_mcp_returns_structured_results_and_does_not_close_injected_memory
         "assets": [],
         "created_at": NOW.isoformat().replace("+00:00", "Z"),
         "occurred_at": NOW.isoformat().replace("+00:00", "Z"),
+        "occurred_end": None,
         "metadata": {"room": "workshop"},
     }
     assert searched.structured_content is not None
@@ -196,7 +199,14 @@ async def test_mcp_returns_structured_results_and_does_not_close_injected_memory
     assert found.structured_content["id"] == "memory_1"
     assert deleted.structured_content == {"deleted": True}
     assert memory.calls == [
-        ("add", "The toolbox is blue.", NOW, {"room": "workshop"}, MemoryType.EPISODIC),
+        (
+            "add",
+            "The toolbox is blue.",
+            NOW,
+            None,
+            {"room": "workshop"},
+            MemoryType.EPISODIC,
+        ),
         ("search", "toolbox", 10, MemoryType.EPISODIC, NOW),
         ("ask", "What color?", 5, MemoryType.PROCEDURAL, NOW),
         ("get", "memory_1"),
@@ -402,6 +412,7 @@ def _record(
     memory_id: str = "memory_1",
     content: str = "The toolbox is blue.",
     occurred_at: datetime | None = None,
+    occurred_end: datetime | None = None,
     metadata: Mapping[str, object] | None = None,
     modality: Modality = Modality.TEXT,
     assets: tuple[AssetRef, ...] = (),
@@ -415,6 +426,7 @@ def _record(
         assets=assets,
         created_at=NOW,
         occurred_at=occurred_at,
+        occurred_end=occurred_end,
         metadata=metadata or {},
     )
 

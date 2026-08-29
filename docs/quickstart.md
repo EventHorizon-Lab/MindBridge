@@ -58,14 +58,16 @@ with Memory(
     "./data/speech",
     embedder=JinaOmniEmbedder(),
     transcriber=FunASRTranscriber(),
+    index_speech=True,
 ) as memory:
     record = memory.add(Path("./meeting.wav"))
     turns = memory.speech(record.id)
 ```
 
-Speech analysis is lazy. FunASR owns model execution; MindBridge maps its timed turns and speaker
-centroids into durable memory semantics. When an answerer is configured, `ask` reuses that identity
-cache as grounding evidence while returning the original source hits.
+Speech analysis is lazy by default; this example opts into add-time indexing so transcript and
+identity text can be retrieved. FunASR owns model execution; MindBridge maps its timed turns and
+speaker centroids into durable memory semantics. When an answerer is configured, `ask` reuses that
+identity cache as grounding evidence while returning the original source hits.
 
 ## Add a provider answerer
 

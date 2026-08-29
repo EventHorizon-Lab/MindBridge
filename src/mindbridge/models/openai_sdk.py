@@ -6,6 +6,7 @@ import base64
 import json
 import math
 from collections.abc import Sequence
+from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast
 
@@ -216,6 +217,7 @@ class OpenAIModels:
         grounded = tuple(hits)
         if any(not isinstance(hit, SearchHit) for hit in grounded):
             raise ValidationError("hits must contain SearchHit values")
+        grounded = _fit_grounding_media(question_input, grounded)
         if not grounded:
             return AnswerResult(answer=UNKNOWN_ANSWER)
 
@@ -428,6 +430,7 @@ def _hit_payload(hit: SearchHit) -> dict[str, object]:
         "content": hit.content,
         "memory_type": hit.memory_type.value,
         "occurred_at": None if hit.occurred_at is None else hit.occurred_at.isoformat(),
+        "occurred_end": None if hit.occurred_end is None else hit.occurred_end.isoformat(),
         "created_at": hit.created_at.isoformat(),
         "metadata": dict(hit.metadata),
     }
@@ -469,6 +472,25 @@ def _require_consistent_assets(assets: Sequence[AssetRef]) -> tuple[AssetRef, ..
         if existing != asset:
             raise ModelError("one asset ID has conflicting media descriptors")
     return tuple(unique.values())
+
+
+def _fit_grounding_media(
+    question: ModelInput,
+    hits: Sequence[SearchHit],
+) -> tuple[SearchHit, ...]:
+    seen = {asset.id for asset in question.assets}
+    used = sum(cast(int, asset.size_bytes) for asset in question.assets)
+    selected = []
+    for hit in hits:
+        new_assets = tuple(asset for asset in hit.assets if asset.id not in seen)
+        size = sum(cast(int, asset.size_bytes) for asset in new_assets)
+        if used + size <= _MAX_INLINE_MODEL_BYTES:
+            selected.append(hit)
+            seen.update(asset.id for asset in new_assets)
+            used += size
+        elif hit.content.strip():
+            selected.append(replace(hit, assets=(), modality=Modality.TEXT))
+    return tuple(selected)
 
 
 def _input_parts(

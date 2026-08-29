@@ -11,7 +11,7 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 ### Added
 
 - A direct `Memory()` API with `add`, `add_many`, `search`, `ask`, `get`, `list`, `delete`,
-  `reindex`, and `optimize`.
+  `reinforce`, `reindex`, and `optimize`.
 - An `AsyncMemory` facade with the same operations and return values.
 - Frozen, slotted public content/result types for text, image, video, audio, and omni memories,
   plus a stable `MindBridgeError` exception hierarchy.
@@ -22,10 +22,17 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 - Zvec 0.7 dense cosine HNSW, full-text search, and reciprocal-rank hybrid retrieval.
 - First-class semantic, episodic, and procedural memory roles across Python, REST, MCP, SQLite,
   Zvec filtering, grounded evidence, and stable return values.
-- Event-time temporal retrieval with explicit reference clocks, deterministic English/Chinese
-  calendar expressions, bounded fallback retrieval, and query-time reranking.
-- Opt-in non-destructive memory decay with bounded SQLite access reinforcement and no background
-  worker or new dependency.
+- Event-time interval retrieval with `occurred_at`/`occurred_end`, overlap filters, explicit
+  reference clocks, deterministic English/Chinese calendar expressions, bounded fallback
+  retrieval, and query-time reranking.
+- Opt-in non-destructive memory decay with explicit, bounded SQLite reinforcement and no
+  background worker or new dependency.
+- Aggregate-plus-atomic embeddings for composite memories, bounded overlapping keys for long text,
+  max-over-part retrieval, unconditional candidate over-fetch, and soft temporal reranking.
+- Configurable weak-evidence and top-two ambiguity gates so retrieval and grounded answers may
+  return no evidence instead of replacing model priors with an unrelated high-confidence asset.
+- Per-record event-time and metadata sequences on `add_many`, retaining one embedding batch and one
+  SQLite transaction.
 - Crash-recoverable index replay and rebuild from SQLite without re-embedding stored content.
 - An optional resource-oriented REST API under `/v1` and five typed MCP stdio tools over a
   caller-supplied `Memory`.
@@ -42,8 +49,11 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   across recordings.
 - Named local speaker registration without a second inference engine or provider compatibility
   layer inside MindBridge.
-- Local SQLite schema v5 adds memory roles and bounded retrieval access state; existing schema
-  versions migrate in place. Older Zvec recipes rebuild automatically from SQLite embeddings.
+- Opt-in add-time speech indexing so transcripts, stable speaker IDs, and known names participate
+  in dense and lexical retrieval.
+- Local SQLite schema v6 adds event ends on top of memory roles and bounded retrieval access state;
+  existing schema versions migrate in place. Older retrieval recipes re-embed from authoritative
+  records before rebuilding Zvec, with the recipe marker committed only after success.
 - Physical benchmark isolation plus local-index and LoCoMo-Refined runners.
 - `mindbridge-bench eval` with pinned adapters for twelve long-memory benchmark families, adaptive
   batching, resumable automatic media acquisition and video preparation, causal manifests,
@@ -61,6 +71,8 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 - Speech identity analysis for audio/video questions overlaps native query retrieval. Grounded
   answers receive timed turns, stable local speaker IDs, registered names, and match confidence;
   transcript-only inference remains limited to embedding fallback.
+- Registering or renaming a speaker now atomically refreshes existing add-time speech text and
+  vectors, so recordings made before registration are retrievable by the new name.
 - Isolation is now one physical `data_dir` per application or benchmark unit. There is no hidden
   default scope or logical partition inside a store.
 - The primary developer flow explicitly supplies an embedding backend:
@@ -80,8 +92,15 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 - The first authoritative non-empty name for a CAS digest is reused when identical bytes later
   arrive under a different filename.
 - Server deployments use exactly one process worker per directory.
-- The supported product slice is typed aggregate text and media memory. Each memory currently owns
-  one embedding; metadata and memory role are payload/retrieval controls, not authorization.
+- Composite memories retain an aggregate vector plus de-duplicated text and media vectors. Search
+  collapses vector hits to the parent memory by maximum relevance; metadata and memory role remain
+  payload/retrieval controls, not authorization.
+- Retrieval no longer reinforces every returned hit. Applications call `reinforce()` only after
+  observing positive feedback; that explicit confirmation now supplies a bounded ranking boost
+  with or without decay and never leaks past a historical query reference.
+- The end-to-end benchmark runner enables speech indexing for media tasks, preserves episodic
+  source/time metadata, records exact retrieved intervals, reports official MM-Lifelong Ref@300,
+  and uses a new cache namespace so pre-change answers cannot mask retrieval changes.
 
 ### Removed
 
@@ -112,11 +131,12 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 
 - No chat-message arrays, large-file wire upload endpoint, update route, metadata filter,
   distributed writer, or runtime plugin registry.
-- No automatic role extraction, episode consolidation, procedure execution, chunking, multiple
-  embeddings per memory, per-asset retrieval, or learned reranking stage.
+- No automatic role extraction, episode consolidation, procedure execution, long-media
+  segmentation, generated semantic keys, or learned reranking stage.
 - No in-place re-embedding or retranscription when a persisted embedding/transcription space or
   dimension changes; create a new directory and re-encode source content instead.
-- The OpenAI adapter inlines at most 64 MiB of aggregate raw media per embedding or generation
-  call; answer requests emit one binary part per distinct asset and accept at most 4 MiB of
-  serialized text evidence. Use a provider-specific upload adapter for larger media.
+- The OpenAI adapter inlines at most 64 MiB of raw media per embedding or generation call. Answer
+  requests reserve that budget for question media, keep top-ranked evidence media that fits, and
+  retain overflow hits as text when possible. They accept at most 4 MiB of serialized text
+  evidence. Use a provider-specific upload adapter for larger media.
 - No built-in user authentication, rate limiting, quotas, or secure-erasure guarantee.

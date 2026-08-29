@@ -14,6 +14,9 @@ Memory(
     embedder=embedder,
     answerer=None,
     transcriber=None,
+    index_speech=False,
+    minimum_relevance=0.55,
+    ambiguity_margin=0.01,
     decay_half_life_days=None,
     speaker_similarity=0.78,
     speaker_margin=0.05,
@@ -24,6 +27,10 @@ Memory(
   contracts.
 - `answerer` is optional. `ask()` raises `ModelError` when it is absent.
 - `transcriber` is optional. Configure it when audio fallback or `speech()` is required.
+- `index_speech` opts a configured `SpeechBackend` into add-time transcript and speaker-identity
+  indexing; the default leaves analysis lazy.
+- `minimum_relevance` drops weak dense evidence; `ambiguity_margin` drops unresolved top-two ties
+  unless the winner has a lexical or temporal anchor. Set either to `0` to disable that gate.
 - `decay_half_life_days` controls query-time soft decay; `None` disables it.
 - Speaker thresholds are local matching semantics, not provider settings.
 

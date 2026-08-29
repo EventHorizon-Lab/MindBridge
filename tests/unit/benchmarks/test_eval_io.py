@@ -12,7 +12,7 @@ import pytest
 
 from mindbridge.benchmarks.download import acquire_media
 from mindbridge.benchmarks.eval_adapters import MediaResolver, load_task
-from mindbridge.benchmarks.eval_cache import CachedAnswer, ResponseCache
+from mindbridge.benchmarks.eval_cache import CachedAnswer, EvidenceInterval, ResponseCache
 from mindbridge.benchmarks.prepare_media import (
     _lifelong_manifest,
     _m3_manifest,
@@ -159,7 +159,12 @@ def test_evaluation_digest_tracks_media_root_content(tmp_path: Path) -> None:
 
 
 def test_response_cache_merges_run_shards_into_the_shared_cache(tmp_path: Path) -> None:
-    answer = CachedAnswer("A", 0.75, ("memory-1",))
+    answer = CachedAnswer(
+        "A",
+        0.75,
+        ("memory-1",),
+        (EvidenceInterval("memory-1", "clip-1", 300.0, 420.0),),
+    )
     first = ResponseCache(tmp_path / "responses", "run-a", "namespace")
     first.put("task", "unit", "question", answer)
     assert first.get("task", "unit", "question") == answer
@@ -215,6 +220,8 @@ def test_video_segment_cache_repairs_an_interrupted_entry(
     monkeypatch.setattr("mindbridge.benchmarks.prepare_media._executable", lambda _name: "ffmpeg")
 
     def run(command: tuple[str, ...] | list[str], _source: Path) -> None:
+        assert "0:a:0?" in command
+        assert command[command.index("-c:a") + 1] == "aac"
         output = Path(command[-1])
         for index in range(2):
             Path(str(output).replace("%05d", f"{index:05d}")).write_bytes(b"segment")

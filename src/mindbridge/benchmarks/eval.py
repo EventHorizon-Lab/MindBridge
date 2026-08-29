@@ -23,12 +23,15 @@ from typing import Protocol, cast
 
 from mindbridge import (
     DEFAULT_FUNASR_MODEL_ID,
+    AssetRef,
     AsyncMemory,
     FunASRTranscriber,
     JinaOmniEmbedder,
+    MemoryType,
     MindBridgeError,
     Modality,
     OpenAIModels,
+    SearchHit,
 )
 from mindbridge.benchmarks.download import acquire_inputs
 from mindbridge.benchmarks.eval_adapters import (
@@ -39,7 +42,7 @@ from mindbridge.benchmarks.eval_adapters import (
     load_media_manifest,
     load_task,
 )
-from mindbridge.benchmarks.eval_cache import CachedAnswer, ResponseCache
+from mindbridge.benchmarks.eval_cache import CachedAnswer, EvidenceInterval, ResponseCache
 from mindbridge.benchmarks.eval_statistics import (
     ScoredValue,
     exact_match,
@@ -50,22 +53,27 @@ from mindbridge.benchmarks.eval_statistics import (
 )
 from mindbridge.benchmarks.isolation import BenchmarkRun
 from mindbridge.benchmarks.model_config import ModelConfig
-from mindbridge.benchmarks.prepare_media import prepare_task_media
+from mindbridge.benchmarks.prepare_media import _has_audio, prepare_task_media
 from mindbridge.benchmarks.task_catalog import (
     DEFAULT_BENCHMARKS_ROOT,
     TASKS,
     expand,
     listing,
 )
-from mindbridge.models.base import EmbeddingBackend, GenerationBackend, SpeechBackend
+from mindbridge.models.base import (
+    EmbeddingBackend,
+    GenerationBackend,
+    SpeechAnalysis,
+    SpeechBackend,
+)
 from mindbridge.models.jina import (
     DEFAULT_JINA_DIMENSION,
     DEFAULT_JINA_MODEL_ID,
     DEFAULT_JINA_REVISION,
 )
 
-EVAL_SCHEMA_VERSION = 1
-EVAL_RUNNER_VERSION = "mindbridge_eval_local_v1"
+EVAL_SCHEMA_VERSION = 3
+EVAL_RUNNER_VERSION = "mindbridge_eval_local_v3"
 DEFAULT_BOOTSTRAP_SAMPLES = 2_000
 _RESULTS_FILE = "results.json"
 _SAMPLES_FILE = "samples.jsonl"
@@ -145,6 +153,8 @@ class SampleResult:
     cached: bool = False
     prompt: tuple[str, ...] | None = None
     references: tuple[str, ...] | None = None
+    evidence: tuple[EvidenceInterval, ...] = ()
+    ref_at_300: float | None = None
 
     @property
     def sample_id(self) -> str:
@@ -167,6 +177,8 @@ class SampleResult:
             "latency_ms": self.latency_ms,
             "confidence": self.confidence,
             "memory_ids": self.memory_ids,
+            "evidence": tuple(item.json() for item in self.evidence),
+            "ref_at_300": self.ref_at_300,
             "ingest_failure_count": self.ingest_failure_count,
             "error_code": self.error_code,
             "cached": self.cached,
@@ -194,6 +206,7 @@ class _AnswerOutcome:
     latency_ms: float
     confidence: float
     memory_ids: tuple[str, ...]
+    evidence: tuple[EvidenceInterval, ...]
     cached: bool = False
 
 
@@ -208,6 +221,25 @@ class _BorrowedBackend:
 
     def close(self) -> None:
         return None
+
+
+class _BorrowedSpeechBackend(_BorrowedBackend):
+    """Skip visual-only videos before lending the shared speech backend."""
+
+    def analyze(self, assets: Sequence[AssetRef]) -> tuple[SpeechAnalysis, ...]:
+        selected = tuple(
+            asset.modality is not Modality.VIDEO or asset.path is None or _has_audio(asset.path)
+            for asset in assets
+        )
+        audible = tuple(asset for asset, include in zip(assets, selected, strict=True) if include)
+        generated = () if not audible else cast(SpeechBackend, self._backend).analyze(audible)
+        if len(generated) != len(audible):
+            raise RuntimeError("speech backend returned the wrong number of analyses")
+        pending = iter(generated)
+        return tuple(
+            next(pending) if include else SpeechAnalysis(turns=(), speakers=())
+            for include in selected
+        )
 
 
 class _BackendPool:
@@ -244,7 +276,7 @@ class _BackendPool:
         self._answerer = cast(GenerationBackend, _BorrowedBackend(self.models))
         self._embedder = cast(EmbeddingBackend, _BorrowedBackend(self.embedder))
         self._transcriber = (
-            cast(SpeechBackend, _BorrowedBackend(self.transcriber))
+            cast(SpeechBackend, _BorrowedSpeechBackend(self.transcriber))
             if self.transcriber is not None
             else None
         )
@@ -255,6 +287,7 @@ class _BackendPool:
             embedder=self._embedder,
             answerer=self._answerer,
             transcriber=self._transcriber,
+            index_speech=self._transcriber is not None,
         )
 
     def close(self) -> None:
@@ -595,6 +628,7 @@ def _cached_results(
                 0.0,
                 answer.confidence,
                 answer.memory_ids,
+                answer.evidence,
                 cached=True,
             )
             results[question.question_id] = _sample(
@@ -641,7 +675,12 @@ def _cache_outcome(
         _cache_task(task),
         unit.unit_id,
         question.question_id,
-        CachedAnswer(outcome.prediction, outcome.confidence, outcome.memory_ids),
+        CachedAnswer(
+            outcome.prediction,
+            outcome.confidence,
+            outcome.memory_ids,
+            outcome.evidence,
+        ),
     )
 
 
@@ -654,14 +693,26 @@ async def _ingest(
     async def add_chunk(chunk: Sequence[MemoryItem]) -> int:
         contents = tuple(_memory_content(item) for item in chunk)
         try:
-            await memory.add_many(contents)
+            await memory.add_many(
+                contents,
+                occurred_at=tuple(item.occurred_at for item in chunk),
+                occurred_end=tuple(item.occurred_end for item in chunk),
+                metadata=tuple(_memory_metadata(item) for item in chunk),
+                memory_type=MemoryType.EPISODIC,
+            )
             return 0
         except Exception:
             if len(chunk) > 1:
                 middle = len(chunk) // 2
                 return await add_chunk(chunk[:middle]) + await add_chunk(chunk[middle:])
         try:
-            await memory.add(contents[0])
+            await memory.add(
+                contents[0],
+                occurred_at=chunk[0].occurred_at,
+                occurred_end=chunk[0].occurred_end,
+                metadata=_memory_metadata(chunk[0]),
+                memory_type=MemoryType.EPISODIC,
+            )
         except Exception:
             return 1
         return 0
@@ -686,12 +737,17 @@ async def _answer_many(
     async def answer(question: EvalQuestion) -> _AnswerOutcome:
         started = time.perf_counter()
         async with semaphore:
-            result = await memory.ask(_content(question.content), limit=recall_limit)
+            result = await memory.ask(
+                _content(question.content),
+                limit=recall_limit,
+                reference_at=question.reference_at,
+            )
         return _AnswerOutcome(
             result.answer,
             (time.perf_counter() - started) * 1_000,
             max((hit.score for hit in result.hits), default=0.0),
             tuple(hit.id for hit in result.hits),
+            tuple(_evidence(hit) for hit in result.hits),
         )
 
     return tuple(
@@ -710,14 +766,23 @@ def _sample(
     log_samples: bool,
 ) -> SampleResult:
     memory_ids: tuple[str, ...]
+    evidence: tuple[EvidenceInterval, ...]
     if isinstance(outcome, BaseException):
-        prediction, latency_ms, confidence, memory_ids, cached = "", 0.0, 0.0, (), False
+        prediction, latency_ms, confidence, memory_ids, evidence, cached = (
+            "",
+            0.0,
+            0.0,
+            (),
+            (),
+            False,
+        )
         error_code = _error_code(outcome)
     else:
         prediction = outcome.prediction
         latency_ms = outcome.latency_ms
         confidence = outcome.confidence
         memory_ids = outcome.memory_ids
+        evidence = outcome.evidence
         cached = outcome.cached
         error_code = None
     choices = tuple(
@@ -745,6 +810,8 @@ def _sample(
         metadata=question.metadata,
         prompt=tuple(str(part) for part in question.content) if log_samples else None,
         references=question.references if log_samples else None,
+        evidence=evidence,
+        ref_at_300=_reference_grounding(task, unit, question, evidence),
     )
 
 
@@ -760,6 +827,85 @@ def _score(
     if question.score_kind == "choice":
         return float(parsed_choice == question.expected_choice), None
     return token_f1(prediction, question.references), exact_match(prediction, question.references)
+
+
+def _evidence(hit: SearchHit) -> EvidenceInterval:
+    source_id = hit.metadata.get("source_id")
+    start = hit.metadata.get("start_seconds")
+    end = hit.metadata.get("end_seconds")
+    return EvidenceInterval(
+        hit.id,
+        source_id if isinstance(source_id, str) else None,
+        _optional_seconds(start),
+        _optional_seconds(end),
+    )
+
+
+def _optional_seconds(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    number = float(value)
+    return number if math.isfinite(number) and number >= 0 else None
+
+
+def _reference_grounding(
+    task: LoadedTask,
+    unit: EvalUnit,
+    question: EvalQuestion,
+    evidence: Sequence[EvidenceInterval],
+) -> float | None:
+    if task.spec.benchmark != "MM-Lifelong":
+        return None
+    reference = question.metadata.get("reference_intervals")
+    ends = tuple(item.end_seconds for item in unit.memories if item.end_seconds is not None)
+    if not isinstance(reference, Sequence) or isinstance(reference, str | bytes) or not ends:
+        return None
+    try:
+        expected = tuple((float(interval[0]), float(interval[1])) for interval in reference)
+    except (IndexError, TypeError, ValueError):
+        return None
+    predicted = tuple(
+        (item.start_seconds, item.end_seconds)
+        for item in evidence
+        if item.start_seconds is not None and item.end_seconds is not None
+    )
+    return _ref_at_n(predicted, expected, total_seconds=max(ends), bucket_size=300.0)
+
+
+def _ref_at_n(
+    predicted: Sequence[tuple[float, float]],
+    expected: Sequence[tuple[float, float]],
+    *,
+    total_seconds: float,
+    bucket_size: float,
+) -> float:
+    """Official MM-Lifelong quantized temporal IoU."""
+    if not math.isfinite(total_seconds) or total_seconds <= 0:
+        raise ValueError("total_seconds must be positive and finite")
+    if not math.isfinite(bucket_size) or bucket_size <= 0:
+        raise ValueError("bucket_size must be positive and finite")
+
+    def buckets(intervals: Sequence[tuple[float, float]]) -> set[int]:
+        values: set[int] = set()
+        for start, end in intervals:
+            start = max(0.0, start)
+            end = min(total_seconds, end)
+            if start >= end:
+                continue
+            first = int(start // bucket_size)
+            last = int(end // bucket_size)
+            values.update(range(first, last + 1))
+        return values
+
+    predicted_buckets = buckets(predicted)
+    expected_buckets = buckets(expected)
+    if not predicted_buckets and not expected_buckets:
+        return 0.0
+    return (
+        100.0
+        * len(predicted_buckets & expected_buckets)
+        / len(predicted_buckets | expected_buckets)
+    )
 
 
 def _parsed_choice(task_name: str, prediction: str, choices: Sequence[str]) -> str | None:
@@ -943,6 +1089,21 @@ def _metrics(
         )
     if task.spec.name == "supermemory-vqa" and scored:
         values["answerability"] = _answerability(samples)
+    reference_scores = tuple(
+        ScoredValue(sample.sample_id, sample.unit_id, sample.ref_at_300)
+        for sample in samples
+        if sample.ref_at_300 is not None
+    )
+    if reference_scores:
+        values["ref_at_300"] = {
+            "official_metric": True,
+            **summarize(
+                reference_scores,
+                seed=seed,
+                bootstrap_samples=arguments.bootstrap_samples,
+                clamp=(0.0, 100.0),
+            ),
+        }
     return values
 
 
@@ -1561,6 +1722,16 @@ def _memory_content(item: MemoryItem) -> str | tuple[str | Path, ...]:
     return cast(str, parts[0]) if len(parts) == 1 else parts
 
 
+def _memory_metadata(item: MemoryItem) -> dict[str, object]:
+    values: dict[str, object] = {
+        "source_id": item.source_id,
+        "start_seconds": item.start_seconds,
+    }
+    if item.end_seconds is not None:
+        values["end_seconds"] = item.end_seconds
+    return values
+
+
 def _memory_end(item: MemoryItem) -> float:
     return math.inf if item.end_seconds is None else item.end_seconds
 
@@ -1579,6 +1750,7 @@ def _cache_namespace(
 ) -> str:
     payload = {
         "runner": EVAL_RUNNER_VERSION,
+        "schema": EVAL_SCHEMA_VERSION,
         "model": config.generation_model,
         "base_url": config.generation_base_url,
         "embedding_model": DEFAULT_JINA_MODEL_ID,

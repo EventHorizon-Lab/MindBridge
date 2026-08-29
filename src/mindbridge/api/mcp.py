@@ -90,7 +90,7 @@ _DELETE = ToolAnnotations(
     open_world_hint=False,
 )
 _TOOL_ARGUMENTS = {
-    "add_memory": frozenset({"content", "occurred_at", "metadata", "memory_type"}),
+    "add_memory": frozenset({"content", "occurred_at", "occurred_end", "metadata", "memory_type"}),
     "search_memories": frozenset({"query", "limit", "memory_type", "reference_at"}),
     "ask_memory": frozenset({"question", "limit", "memory_type", "reference_at"}),
     "get_memory": frozenset({"memory_id"}),
@@ -195,6 +195,7 @@ class MemoryResult(BaseModel):
     assets: tuple[AssetResult, ...]
     created_at: AwareDatetime
     occurred_at: AwareDatetime | None
+    occurred_end: AwareDatetime | None
     metadata: dict[str, JsonValue]
 
 
@@ -230,6 +231,7 @@ def build_mcp_server(memory: Memory) -> MCPServer[None]:
     def add_memory(
         content: _Content,
         occurred_at: AwareDatetime | None = None,
+        occurred_end: AwareDatetime | None = None,
         metadata: dict[str, JsonValue] | None = None,
         memory_type: MemoryType = MemoryType.SEMANTIC,
     ) -> MemoryResult:
@@ -237,6 +239,7 @@ def build_mcp_server(memory: Memory) -> MCPServer[None]:
         record = memory.add(
             _content_input(content),
             occurred_at=occurred_at,
+            occurred_end=occurred_end,
             metadata=metadata,
             memory_type=memory_type,
         )
@@ -341,6 +344,7 @@ def _memory_result(record: MemoryRecord) -> MemoryResult:
         assets=tuple(_asset_result(asset) for asset in record.assets),
         created_at=record.created_at,
         occurred_at=record.occurred_at,
+        occurred_end=record.occurred_end,
         metadata=cast(dict[str, JsonValue], dict(record.metadata)),
     )
 
@@ -355,6 +359,7 @@ def _search_hit_result(hit: SearchHit) -> SearchHitResult:
         score=hit.score,
         created_at=hit.created_at,
         occurred_at=hit.occurred_at,
+        occurred_end=hit.occurred_end,
         metadata=cast(dict[str, JsonValue], dict(hit.metadata)),
     )
 
