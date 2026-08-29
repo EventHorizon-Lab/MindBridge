@@ -129,7 +129,7 @@ data_dir/
 
 A durable write commits SQLite before updating Zvec. Outbox work is acknowledged only after the
 Zvec flush succeeds. Missing or stale index data is rebuilt and hydrated from SQLite without
-re-embedding stored content.
+re-embedding stored content. Concurrent record commits may share one serialized outbox flush.
 
 ## REST and MCP adapters
 

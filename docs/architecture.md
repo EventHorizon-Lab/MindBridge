@@ -64,8 +64,9 @@ normalize -> materialize CAS -> model work -> SQLite transaction
                                       acknowledge outbox
 ```
 
-SQLite commits before Zvec changes. A failed index operation remains in the outbox and is replayed
-when the owner recovers. Zvec never becomes authoritative.
+SQLite commits before Zvec changes. Concurrent record commits may accumulate one outbox batch;
+Zvec mutation, flush, and acknowledgement remain serialized. A failed index operation stays in the
+outbox and is replayed when the owner recovers. Zvec never becomes authoritative.
 
 ## Read consistency
 
@@ -78,8 +79,9 @@ embeddings without re-embedding content.
 One physical directory is one memory domain and one live owner. There are no account, tenant,
 request, or benchmark scope identifiers in the product API. Metadata is application data.
 
-Provider work may overlap across calls. SQLite write/outbox and Zvec sections are short serialized
-critical sections. `close()` waits for active operations before closing adapters and storage.
+Provider work and independent SQLite record commits may overlap across calls. Outbox replay and
+Zvec access are short serialized critical sections. `close()` waits for active operations before
+closing adapters and storage.
 
 `AsyncMemory` uses threads around this synchronous embedded core. Provider-specific async APIs are
 not normalized by MindBridge; a custom adapter can use the provider's native client where its

@@ -688,6 +688,13 @@ class LocalStore:
         by_id = {_row_text(row, "asset_id"): _asset_from_row(row) for row in rows}
         return tuple(by_id[asset_id] for asset_id in asset_ids if asset_id in by_id)
 
+    def write_asset(self, asset: StoredAsset) -> None:
+        """Persist one media descriptor without attaching it to a memory."""
+        if not isinstance(asset, StoredAsset):
+            raise ValueError("asset must be a StoredAsset value")
+        with self._transaction() as connection:
+            self._write_asset(connection, asset)
+
     def read_unreferenced_assets(
         self,
         asset_ids: Sequence[str],

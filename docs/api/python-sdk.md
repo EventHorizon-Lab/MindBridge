@@ -107,7 +107,8 @@ memory.register_speaker(speaker_id, "Ada")
 
 `speech` lazily analyzes stored audio or video through a configured `SpeechBackend`. Returned
 `SpeakerSegment` values contain time bounds, transcript text, opaque local speaker ID, optional
-registered name, and optional identity score.
+registered name, and optional identity score. Grounded `ask` calls reuse this cache and pass the
+complete timed identity evidence to the answerer without changing the returned source hits.
 
 ### Index maintenance
 

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import sqlite3
 from collections.abc import Iterable, Iterator, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -592,6 +594,83 @@ def test_outbox_bounds_index_batches(tmp_path: Path) -> None:
     assert [len(batch) for batch in _FakeIndex.instances[-1].upsert_calls] == [256, 256, 88]
 
 
+def test_concurrent_adds_share_one_durable_index_flush(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    original = LocalStore.write_memories
+    committed = Barrier(2)
+
+    def synchronized_write(
+        store: LocalStore,
+        memories: Iterable[StoredMemory],
+        embeddings: Iterable[StoredEmbedding] = (),
+    ) -> tuple[bool, ...]:
+        result = original(store, memories, embeddings)
+        committed.wait(timeout=3)
+        return result
+
+    monkeypatch.setattr(LocalStore, "write_memories", synchronized_write)
+    with (
+        _memory(tmp_path, _FakeModels()) as memory,
+        ThreadPoolExecutor(max_workers=2) as pool,
+    ):
+        records = tuple(pool.map(memory.add, ("first concurrent", "second concurrent")))
+
+    assert len(records) == 2
+    assert len(_FakeIndex.instances[-1].upsert_calls) == 1
+    assert set(_FakeIndex.instances[-1].upsert_calls[0]) == {record.id for record in records}
+
+
+def test_reindex_replays_an_add_committed_after_its_sqlite_scan(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    snapshot_taken = Event()
+    add_committed = Event()
+    original_rebuild = _FakeIndex.rebuild
+    original_write = LocalStore.write_memories
+
+    def paused_rebuild(
+        index: _FakeIndex,
+        documents: Iterable[IndexDocument],
+        *,
+        batch_size: int = 1_024,
+        optimize_concurrency: int = 0,
+    ) -> int:
+        snapshot = tuple(documents)
+        snapshot_taken.set()
+        assert add_committed.wait(timeout=3)
+        return original_rebuild(
+            index,
+            snapshot,
+            batch_size=batch_size,
+            optimize_concurrency=optimize_concurrency,
+        )
+
+    def tracked_write(
+        store: LocalStore,
+        memories: Iterable[StoredMemory],
+        embeddings: Iterable[StoredEmbedding] = (),
+    ) -> tuple[bool, ...]:
+        result = original_write(store, memories, embeddings)
+        add_committed.set()
+        return result
+
+    with _memory(tmp_path, _FakeModels()) as memory:
+        existing = memory.add("existing")
+        monkeypatch.setattr(_FakeIndex, "rebuild", paused_rebuild)
+        monkeypatch.setattr(LocalStore, "write_memories", tracked_write)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            reindexed = pool.submit(memory.reindex)
+            assert snapshot_taken.wait(timeout=3)
+            added = pool.submit(memory.add, "committed during rebuild")
+            assert reindexed.result(timeout=3) == 1
+            new = added.result(timeout=3)
+
+        assert set(_FakeIndex.instances[-1].documents) == {existing.id, new.id}
+
+
 def test_keyset_pages_reindex_optimize_and_missing_index_recovery(tmp_path: Path) -> None:
     models = _FakeModels()
     memory = _memory(tmp_path, models)
@@ -1041,6 +1120,100 @@ def test_vlm_generation_transcribes_audio_once_and_keeps_video(tmp_path: Path) -
 
         memory.ask(question)
         assert len(models.transcribe_calls) == 1
+
+
+def test_vlm_generation_recognizes_complete_speaker_identity_in_parallel(
+    tmp_path: Path,
+) -> None:
+    query_started = Event()
+    identity_started = Event()
+
+    class ParallelModels(_FakeModels):
+        def embed(
+            self,
+            inputs: Sequence[ModelInput],
+            task: EmbedTask = EmbedTask.DOCUMENT,
+        ) -> tuple[tuple[float, ...], ...]:
+            if task is EmbedTask.QUERY:
+                query_started.set()
+                assert identity_started.wait(timeout=1)
+            return super().embed(inputs, task)
+
+    class IdentitySpeech(_FakeSpeech):
+        def __init__(self) -> None:
+            super().__init__()
+            self.expect_parallel = False
+
+        def analyze(self, assets: Sequence[AssetRef]) -> tuple[SpeechAnalysis, ...]:
+            if self.expect_parallel:
+                identity_started.set()
+                assert query_started.wait(timeout=1)
+            return super().analyze(assets)
+
+        def transcribe(self, _assets: Sequence[AssetRef]) -> tuple[str, ...]:
+            raise AssertionError("answer generation must retain complete speaker identity")
+
+    capabilities = _Capabilities(
+        embedding=ALL_INPUT_MODALITIES,
+        generation=frozenset({Modality.TEXT, Modality.VIDEO}),
+        transcription=frozenset({Modality.AUDIO, Modality.VIDEO}),
+    )
+    models = ParallelModels(capabilities=capabilities)
+    speech = IdentitySpeech()
+
+    with _memory(tmp_path, models, transcriber=speech) as memory:
+        record = memory.add(
+            (
+                "red recording",
+                Blob(b"stored audio", "audio/wav", "stored.wav"),
+                Blob(b"stored video", "video/mp4", "stored.mp4"),
+            )
+        )
+        enrolled = memory.speech(record.id)
+        speaker_id = enrolled[0].speaker_id
+        assert speaker_id is not None
+        assert {segment.speaker_id for segment in enrolled} == {speaker_id}
+        memory.register_speaker(speaker_id, "Alice")
+
+        speech.expect_parallel = True
+        result = memory.ask(
+            ("red: who is speaking?", Blob(b"query audio", "audio/wav", "query.wav"))
+        )
+
+        routed_question, routed_hits = models.answer_calls[-1]
+        question_evidence = [
+            json.loads(line)
+            for line in routed_question.text.splitlines()
+            if line.startswith('{"asset_id":')
+        ]
+        hit_evidence = [
+            json.loads(line)
+            for line in routed_hits[0].content.splitlines()
+            if line.startswith('{"asset_id":')
+        ]
+        assert len(question_evidence) == 1
+        assert question_evidence[0]["segments"] == [
+            {
+                "start_ms": 0,
+                "end_ms": 900,
+                "text": "spoken red wrench",
+                "speaker_id": speaker_id,
+                "speaker_name": "Alice",
+                "identity_score": 1.0,
+            }
+        ]
+        assert len(hit_evidence) == 2
+        assert all(
+            evidence["segments"][0]["speaker_id"] == speaker_id
+            and evidence["segments"][0]["speaker_name"] == "Alice"
+            for evidence in hit_evidence
+        )
+        assert routed_question.modalities == {Modality.TEXT}
+        assert routed_hits[0].modality is Modality.VIDEO
+        assert {asset.modality for asset in routed_hits[0].assets} == {Modality.VIDEO}
+        assert "[speech identities:" not in result.hits[0].content
+        assert memory._store.read_asset(question_evidence[0]["asset_id"]) is None
+        assert len(speech.calls) == 2
 
 
 def test_invalid_long_transcript_is_not_persisted(tmp_path: Path) -> None:

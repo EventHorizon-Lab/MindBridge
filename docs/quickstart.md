@@ -64,7 +64,8 @@ with Memory(
 ```
 
 Speech analysis is lazy. FunASR owns model execution; MindBridge maps its timed turns and speaker
-centroids into durable memory semantics.
+centroids into durable memory semantics. When an answerer is configured, `ask` reuses that identity
+cache as grounding evidence while returning the original source hits.
 
 ## Add a provider answerer
 

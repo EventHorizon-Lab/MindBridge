@@ -76,8 +76,8 @@ For every durable mutation:
 5. Flush Zvec.
 6. Acknowledge the exact SQLite outbox batch.
 
-Interrupted work remains durable. Startup drains it. Reindexing builds from SQLite, flushes the
-replacement index, then clears durable checkpoints.
+Interrupted work remains durable. Startup drains it. Reindexing builds from SQLite, then replays
+the outbox so a record committed after the rebuild scan is not lost from the projection.
 
 ## Provider boundary
 
@@ -90,9 +90,9 @@ installed runtimes. MindBridge retains only validation and mapping needed by its
 
 ## Threading and lifecycle
 
-`Memory` allows model calls outside its storage lock. SQLite mutation, outbox replay, and Zvec
-access are serialized. CAS leases prevent temporary query media from being removed while another
-operation is using it.
+`Memory` allows model calls and independent SQLite record commits outside its index lock. Outbox
+replay and Zvec access are serialized; several committed writes may therefore share one flush. CAS
+leases prevent temporary query media from being removed while another operation is using it.
 
 Closing starts a lifecycle barrier, rejects new calls, waits for active calls, and closes each
 unique adapter or storage resource once. Forked processes must create a new instance and distinct
