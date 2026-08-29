@@ -19,17 +19,16 @@ from datetime import datetime, timezone
 from importlib import metadata
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from typing import Literal, Protocol, cast
+from typing import Protocol, cast
 
 from mindbridge import (
+    DEFAULT_FUNASR_MODEL_ID,
     AsyncMemory,
-    Config,
     FunASRTranscriber,
     JinaOmniEmbedder,
     MindBridgeError,
     Modality,
-    ModelCapabilities,
-    OpenAIHTTP,
+    OpenAIModels,
 )
 from mindbridge.benchmarks.download import acquire_inputs
 from mindbridge.benchmarks.eval_adapters import (
@@ -50,6 +49,7 @@ from mindbridge.benchmarks.eval_statistics import (
     token_f1,
 )
 from mindbridge.benchmarks.isolation import BenchmarkRun
+from mindbridge.benchmarks.model_config import ModelConfig
 from mindbridge.benchmarks.prepare_media import prepare_task_media
 from mindbridge.benchmarks.task_catalog import (
     DEFAULT_BENCHMARKS_ROOT,
@@ -57,7 +57,7 @@ from mindbridge.benchmarks.task_catalog import (
     expand,
     listing,
 )
-from mindbridge.models.base import EmbeddingBackend, ModelBackend, SpeechBackend
+from mindbridge.models.base import EmbeddingBackend, GenerationBackend, SpeechBackend
 from mindbridge.models.jina import (
     DEFAULT_JINA_DIMENSION,
     DEFAULT_JINA_MODEL_ID,
@@ -215,7 +215,7 @@ class _BackendPool:
 
     def __init__(
         self,
-        config: Config,
+        config: ModelConfig,
         *,
         device: str | None,
         batch_size: int,
@@ -223,14 +223,25 @@ class _BackendPool:
         seed: int,
     ) -> None:
         self.config = config
-        self.models = OpenAIHTTP(
-            config,
+        try:
+            from openai import OpenAI
+        except ImportError:
+            raise RuntimeError("benchmark execution requires mindbridge[openai]") from None
+        self.client = OpenAI(
+            api_key=config.generation_api_key,
+            base_url=config.generation_base_url,
+            timeout=config.timeout_seconds,
+        )
+        self.models = OpenAIModels(
+            generation_client=self.client,
+            generation_model=config.generation_model,
+            generation_capabilities=config.generation_capabilities,
             generation_seed=seed,
             generation_temperature=0.0,
         )
         self.embedder = JinaOmniEmbedder(device=device, batch_size=batch_size)
         self.transcriber = FunASRTranscriber(device=device or "auto") if needs_speech else None
-        self._models = cast(ModelBackend, _BorrowedBackend(self.models))
+        self._answerer = cast(GenerationBackend, _BorrowedBackend(self.models))
         self._embedder = cast(EmbeddingBackend, _BorrowedBackend(self.embedder))
         self._transcriber = (
             cast(SpeechBackend, _BorrowedBackend(self.transcriber))
@@ -241,14 +252,13 @@ class _BackendPool:
     def memory(self, data_dir: Path) -> AsyncMemory:
         return AsyncMemory(
             data_dir=data_dir,
-            config=self.config,
-            models=self._models,
             embedder=self._embedder,
+            answerer=self._answerer,
             transcriber=self._transcriber,
         )
 
     def close(self) -> None:
-        resources = (self.transcriber, self.embedder, self.models)
+        resources = (self.transcriber, self.embedder, self.client)
         for resource in resources:
             if resource is not None:
                 with suppress(Exception):
@@ -336,7 +346,7 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> int:
 def _execute(
     loaded: Sequence[LoadedTask],
     arguments: _Arguments,
-    config: Config,
+    config: ModelConfig,
     batch_sizes: Mapping[str, int],
 ) -> tuple[tuple[SampleResult, ...], float]:
     needs_speech = any(
@@ -400,7 +410,7 @@ async def _run_all(
     for task in tasks:
         if not arguments.quiet:
             print(
-                f"mindbridge eval: running {task.spec.name} ({len(task.units)} units)",
+                f"mindbridge-bench eval: running {task.spec.name} ({len(task.units)} units)",
                 file=sys.stderr,
             )
         run = BenchmarkRun(
@@ -766,7 +776,7 @@ def _parsed_choice(task_name: str, prediction: str, choices: Sequence[str]) -> s
 
 def _results(
     arguments: _Arguments,
-    config: Config,
+    config: ModelConfig,
     tasks: Sequence[LoadedTask],
     samples: Sequence[SampleResult],
     duration_seconds: float,
@@ -848,13 +858,12 @@ def _results(
             "generation_model": config.generation_model,
             "generation_base_url": config.generation_base_url,
             "generation_modalities": sorted(
-                modality.value for modality in config.capabilities.generation
+                modality.value for modality in config.generation_capabilities
             ),
             "generation_seed": arguments.seed,
             "generation_temperature": 0.0,
             "generation_kwargs": arguments.gen_kwargs,
-            "transcription_model": config.transcription_model,
-            "media_transport": config.media_transport,
+            "transcription_model": DEFAULT_FUNASR_MODEL_ID,
             "timeout_seconds": config.timeout_seconds,
         },
         "environment": {
@@ -1243,7 +1252,7 @@ def _json_bytes(value: object, *, pretty: bool = False) -> bytes:
 
 
 def _announce(message: str) -> None:
-    print(f"mindbridge eval: {message}", file=sys.stderr)
+    print(f"mindbridge-bench eval: {message}", file=sys.stderr)
 
 
 def _table(results: Mapping[str, object]) -> str:
@@ -1420,16 +1429,14 @@ def _arguments(parser: argparse.ArgumentParser, parsed: argparse.Namespace) -> _
     )
 
 
-def _model_config(model: str, arguments: str) -> Config:
+def _model_config(model: str, arguments: str) -> ModelConfig:
     if model != "mindbridge":
         raise ValueError("model must be mindbridge")
-    config = Config.from_environment()
+    config = ModelConfig.from_environment()
     allowed = {
         "base_url",
         "generation_model",
-        "media_transport",
         "timeout_seconds",
-        "transcription_model",
     }
     aliases = {"pretrained": "generation_model", "model": "generation_model"}
     for item in (part.strip() for part in arguments.split(",") if part.strip()):
@@ -1442,7 +1449,7 @@ def _model_config(model: str, arguments: str) -> Config:
     return config
 
 
-def _evaluation_config(config: Config, tasks: Sequence[LoadedTask]) -> Config:
+def _evaluation_config(config: ModelConfig, tasks: Sequence[LoadedTask]) -> ModelConfig:
     required = {Modality.TEXT}
     required.update(
         modality
@@ -1462,35 +1469,23 @@ def _evaluation_config(config: Config, tasks: Sequence[LoadedTask]) -> Config:
         if isinstance(atom, Path)
         and (modality := _MODALITY_BY_SUFFIX.get(atom.suffix.casefold())) is not None
     )
-    capabilities = config.capabilities
     return replace(
         config,
-        capabilities=ModelCapabilities(
-            embedding=capabilities.embedding,
-            generation=frozenset((*capabilities.generation, *required)),
-            transcription=capabilities.transcription,
-        ),
+        generation_capabilities=frozenset((*config.generation_capabilities, *required)),
     )
 
 
-def _replace_config(config: Config, key: str, value: str) -> Config:
+def _replace_config(config: ModelConfig, key: str, value: str) -> ModelConfig:
     if key == "base_url":
         return replace(
             config,
-            base_url=value,
-            embedding_base_url=value,
             generation_base_url=value,
-            transcription_base_url=value,
         )
     if key == "generation_model":
         return replace(config, generation_model=value)
-    if key == "media_transport":
-        if value not in {"data", "file"}:
-            raise ValueError("media_transport must be data or file")
-        return replace(config, media_transport=cast(Literal["data", "file"], value))
     if key == "timeout_seconds":
         return replace(config, timeout_seconds=float(value))
-    return replace(config, transcription_model=value)
+    raise AssertionError(f"unhandled model setting: {key}")
 
 
 def _batch_size(arguments: _Arguments, task: LoadedTask) -> int:
@@ -1579,15 +1574,16 @@ def _task_seed(seed: int, task: str) -> int:
     return int.from_bytes(digest[:8], "big")
 
 
-def _cache_namespace(arguments: _Arguments, config: Config, batch_sizes: Mapping[str, int]) -> str:
+def _cache_namespace(
+    arguments: _Arguments, config: ModelConfig, batch_sizes: Mapping[str, int]
+) -> str:
     payload = {
         "runner": EVAL_RUNNER_VERSION,
         "model": config.generation_model,
         "base_url": config.generation_base_url,
         "embedding_model": DEFAULT_JINA_MODEL_ID,
         "embedding_revision": DEFAULT_JINA_REVISION,
-        "transcription_model": config.transcription_model,
-        "media_transport": config.media_transport,
+        "transcription_model": DEFAULT_FUNASR_MODEL_ID,
         "device": arguments.device or "auto",
         "seed": arguments.seed,
         "gen_kwargs": arguments.gen_kwargs,

@@ -2,16 +2,13 @@
 
 from __future__ import annotations
 
-import asyncio
 import base64
 import binascii
 import json
 import logging
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Callable, Mapping
 from functools import wraps
-from pathlib import Path
 from typing import Annotated, Any, Literal, ParamSpec, TypeAlias, TypeVar, cast
-from urllib.parse import urlsplit
 
 from mcp.server import MCPServer
 from mcp.server.context import CallNext, HandlerResult, ServerMiddleware, ServerRequestContext
@@ -27,7 +24,7 @@ from pydantic import (
     model_validator,
 )
 
-from mindbridge import AsyncMemory, Memory
+from mindbridge import Memory
 from mindbridge.exceptions import (
     IndexUnavailableError,
     MemoryNotFoundError,
@@ -37,8 +34,6 @@ from mindbridge.exceptions import (
     ValidationError,
 )
 from mindbridge.types import (
-    URL,
-    AnswerResult,
     AssetRef,
     Blob,
     ContentInput,
@@ -135,7 +130,7 @@ class _InputImage(_InputModel):
     def require_one_source(self) -> _InputImage:
         _one_source(image_url=self.image_url, file_id=self.file_id)
         if self.image_url is not None:
-            _validate_url_or_data(self.image_url)
+            _validate_data_url(self.image_url)
             if self.image_url.startswith("data:"):
                 media_type, _data = _decode_data_url(self.image_url)
                 if not media_type.startswith("image/"):
@@ -161,7 +156,7 @@ class _InputFile(_InputModel):
         }:
             raise ValueError("media_type must be image, video, or audio")
         if self.file_url is not None:
-            _validate_url_or_data(self.file_url)
+            _validate_data_url(self.file_url)
             if self.file_url.startswith("data:") and self.media_type is not None:
                 embedded_type, _data = _decode_data_url(self.file_url)
                 if not _media_type_matches(self.media_type, embedded_type):
@@ -220,7 +215,7 @@ class DeleteResult(BaseModel):
     deleted: bool
 
 
-def build_mcp_server(memory: Memory | AsyncMemory) -> MCPServer[None]:
+def build_mcp_server(memory: Memory) -> MCPServer[None]:
     """Expose five typed agent tools without taking ownership of ``memory``."""
     server: MCPServer[None] = MCPServer(
         "mindbridge",
@@ -232,67 +227,52 @@ def build_mcp_server(memory: Memory | AsyncMemory) -> MCPServer[None]:
 
     @server.tool(annotations=_IDEMPOTENT_WRITE)
     @_stable_errors
-    async def add_memory(
+    def add_memory(
         content: _Content,
         occurred_at: AwareDatetime | None = None,
         metadata: dict[str, JsonValue] | None = None,
         memory_type: MemoryType = MemoryType.SEMANTIC,
     ) -> MemoryResult:
         """Store one memory and return its stable record."""
-        record = cast(
-            MemoryRecord,
-            await _invoke(
-                memory,
-                "add",
-                _content_input(content),
-                occurred_at=occurred_at,
-                metadata=metadata,
-                memory_type=memory_type,
-            ),
+        record = memory.add(
+            _content_input(content),
+            occurred_at=occurred_at,
+            metadata=metadata,
+            memory_type=memory_type,
         )
         return _memory_result(record)
 
     @server.tool(annotations=_RETRIEVAL)
     @_stable_errors
-    async def search_memories(
+    def search_memories(
         query: _Content,
         limit: _Limit = 10,
         memory_type: MemoryType | None = None,
         reference_at: AwareDatetime | None = None,
     ) -> SearchResult:
         """Find the most relevant local memories."""
-        hits = cast(
-            tuple[SearchHit, ...],
-            await _invoke(
-                memory,
-                "search",
-                _content_input(query),
-                limit=limit,
-                memory_type=memory_type,
-                reference_at=reference_at,
-            ),
+        hits = memory.search(
+            _content_input(query),
+            limit=limit,
+            memory_type=memory_type,
+            reference_at=reference_at,
         )
         return SearchResult(hits=tuple(_search_hit_result(hit) for hit in hits))
 
     @server.tool(annotations=_RETRIEVAL)
     @_stable_errors
-    async def ask_memory(
+    def ask_memory(
         question: _Content,
         limit: _Limit = 5,
         memory_type: MemoryType | None = None,
         reference_at: AwareDatetime | None = None,
     ) -> AnswerResponse:
         """Answer only from retrieved local memories."""
-        result = cast(
-            AnswerResult,
-            await _invoke(
-                memory,
-                "ask",
-                _content_input(question),
-                limit=limit,
-                memory_type=memory_type,
-                reference_at=reference_at,
-            ),
+        result = memory.ask(
+            _content_input(question),
+            limit=limit,
+            memory_type=memory_type,
+            reference_at=reference_at,
         )
         return AnswerResponse(
             answer=result.answer,
@@ -301,49 +281,26 @@ def build_mcp_server(memory: Memory | AsyncMemory) -> MCPServer[None]:
 
     @server.tool(annotations=_READ_ONLY)
     @_stable_errors
-    async def get_memory(memory_id: _Identifier) -> MemoryResult:
+    def get_memory(memory_id: _Identifier) -> MemoryResult:
         """Read one memory by its stable identifier."""
-        record = cast(MemoryRecord, await _invoke(memory, "get", memory_id))
-        return _memory_result(record)
+        return _memory_result(memory.get(memory_id))
 
     @server.tool(annotations=_DELETE)
     @_stable_errors
-    async def delete_memory(memory_id: _Identifier) -> DeleteResult:
+    def delete_memory(memory_id: _Identifier) -> DeleteResult:
         """Idempotently delete one memory."""
-        deleted = cast(bool, await _invoke(memory, "delete", memory_id))
-        return DeleteResult(deleted=deleted)
+        return DeleteResult(deleted=memory.delete(memory_id))
 
     return server
 
 
-def run_mcp(data_dir: str | Path = ".mindbridge") -> None:
-    """Run the local MCP server over stdio and close its owned memory."""
-    memory = Memory(data_dir=data_dir)
-    try:
-        build_mcp_server(memory).run("stdio")
-    finally:
-        memory.close()
-
-
-async def _invoke(
-    memory: Memory | AsyncMemory,
-    method: str,
-    *args: object,
-    **kwargs: object,
-) -> object:
-    operation = getattr(memory, method)
-    if isinstance(memory, AsyncMemory):
-        return await cast(Callable[..., Awaitable[object]], operation)(*args, **kwargs)
-    return await asyncio.to_thread(cast(Callable[..., object], operation), *args, **kwargs)
-
-
 def _stable_errors(
-    operation: Callable[_P, Awaitable[_T]],
-) -> Callable[_P, Awaitable[_T]]:
+    operation: Callable[_P, _T],
+) -> Callable[_P, _T]:
     @wraps(operation)
-    async def guarded(*args: _P.args, **kwargs: _P.kwargs) -> _T:
+    def guarded(*args: _P.args, **kwargs: _P.kwargs) -> _T:
         try:
-            return await operation(*args, **kwargs)
+            return operation(*args, **kwargs)
         except Exception as error:
             raise ToolError(_error_json(error)) from None
 
@@ -423,7 +380,7 @@ def _asset_result(asset: AssetRef) -> AssetResult:
 def _content_input(content: _Content) -> ContentInput:
     if isinstance(content, str):
         return content
-    atoms: list[str | URL | Blob | AssetRef] = []
+    atoms: list[str | Blob | AssetRef] = []
     for part in content:
         if isinstance(part, _InputText):
             atoms.append(part.text)
@@ -431,9 +388,7 @@ def _content_input(content: _Content) -> ContentInput:
             if part.file_id is not None:
                 atoms.append(AssetRef(id=part.file_id, modality=Modality.IMAGE))
             else:
-                atoms.append(
-                    _url_or_blob(cast(str, part.image_url), media_type="image/*", name=None)
-                )
+                atoms.append(_data_blob(cast(str, part.image_url), media_type="image/*", name=None))
         elif part.file_id is not None:
             atoms.append(_file_reference(part.file_id, part.media_type))
         elif part.file_data is not None:
@@ -446,7 +401,7 @@ def _content_input(content: _Content) -> ContentInput:
             )
         else:
             atoms.append(
-                _url_or_blob(
+                _data_blob(
                     cast(str, part.file_url),
                     media_type=part.media_type,
                     name=part.filename,
@@ -463,18 +418,16 @@ def _file_reference(file_id: str, media_type: str | None) -> AssetRef:
     return AssetRef(id=file_id, media_type=media_type)
 
 
-def _url_or_blob(
+def _data_blob(
     value: str,
     *,
     media_type: str | None = None,
     name: str | None,
-) -> URL | Blob:
-    if value.startswith("data:"):
-        embedded_type, data = _decode_data_url(value)
-        if media_type is not None and not _media_type_matches(media_type, embedded_type):
-            raise ValueError("media_type contradicts the data URL")
-        return Blob(data=data, media_type=embedded_type, name=name)
-    return URL(value=value, media_type=media_type, name=name)
+) -> Blob:
+    embedded_type, data = _decode_data_url(value)
+    if media_type is not None and not _media_type_matches(media_type, embedded_type):
+        raise ValueError("media_type contradicts the data URL")
+    return Blob(data=data, media_type=embedded_type, name=name)
 
 
 def _one_source(**sources: object) -> None:
@@ -488,19 +441,10 @@ def _media_type_matches(expected: str, actual: str) -> bool:
     )
 
 
-def _validate_url_or_data(value: str) -> None:
-    if value.startswith("data:"):
-        _decode_data_url(value)
-        return
-    parsed = urlsplit(value)
-    if (
-        parsed.scheme != "https"
-        or parsed.hostname is None
-        or parsed.username is not None
-        or parsed.password is not None
-        or parsed.fragment
-    ):
-        raise ValueError("source must be an HTTPS URL without credentials or a fragment")
+def _validate_data_url(value: str) -> None:
+    if not value.startswith("data:"):
+        raise ValueError("remote URLs are not accepted; fetch media before calling MindBridge")
+    _decode_data_url(value)
 
 
 def _decode_data_url(value: str) -> tuple[str, bytes]:

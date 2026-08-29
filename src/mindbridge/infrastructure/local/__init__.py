@@ -2,11 +2,9 @@
 
 from mindbridge.infrastructure.local._lock import DataDirectoryInUseError
 from mindbridge.infrastructure.local.assets import (
-    AssetDownloadError,
     AssetStore,
     AssetStoreError,
     AssetTooLargeError,
-    UnsafeAssetUrlError,
 )
 from mindbridge.infrastructure.local.store import (
     IndexDocument,
@@ -20,7 +18,6 @@ from mindbridge.infrastructure.local.store import (
 )
 
 __all__ = [
-    "AssetDownloadError",
     "AssetStore",
     "AssetStoreError",
     "AssetTooLargeError",
@@ -32,6 +29,5 @@ __all__ = [
     "StoredAsset",
     "StoredEmbedding",
     "StoredMemory",
-    "UnsafeAssetUrlError",
     "UnsupportedSchemaError",
 ]

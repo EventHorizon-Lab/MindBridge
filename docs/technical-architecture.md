@@ -1,248 +1,108 @@
 # Technical architecture
 
-This page documents the embedded v0.2 durability, media, model-routing, and retrieval invariants.
-It is intended for maintainers and operators diagnosing local state.
-
-## Package boundaries
+## Package layout
 
 ```text
 src/mindbridge/
-├── __init__.py                    # stable public exports
-├── config.py                      # endpoints, capabilities, and URL policy
-├── exceptions.py                 # stable public failures
-├── memory.py                      # synchronous core and async facade
-├── types.py                       # content and result values
-├── api/                           # optional REST and MCP transports
+├── memory.py                    # public orchestration and consistency
+├── types.py                     # stable values
+├── exceptions.py                # stable failures
 ├── models/
-│   ├── base.py                    # public embedding and combined-model protocols
-│   ├── sentence_transformers.py   # standard multimodal embedding adapter
-│   ├── jina.py                    # pinned Jina Omni compatibility adapter
-│   └── openai_http.py             # OpenAI-compatible combined backend
-└── infrastructure/local/
-    ├── _lock.py                   # cross-process directory ownership
-    ├── assets.py                  # immutable media CAS and safe URL fetch
-    ├── store.py                   # authoritative SQLite state
-    └── zvec_index.py              # disposable hybrid-search projection
+│   ├── base.py                  # narrow operation protocols
+│   ├── openai_sdk.py            # caller-owned official SDK adapter
+│   ├── sentence_transformers.py # generic local embedding adapter
+│   ├── jina.py                  # pinned Jina specialization
+│   └── funasr.py                # official AutoModel speech mapping
+├── infrastructure/local/
+│   ├── store.py                 # authoritative SQLite state and outbox
+│   ├── assets.py                # local content-addressed media
+│   └── zvec_index.py            # rebuildable search projection
+├── api/
+│   ├── app.py                   # optional REST adapter
+│   └── mcp.py                   # optional MCP adapter
+└── benchmarks/                  # public-SDK behavior runners
 ```
 
-The public orchestration depends directly on these local adapters. A custom embedder or combined
-model implements one public protocol; there is no provider registry or dynamic plugin factory.
-SQLite and Zvec do not
-need speculative repository interfaces because the product currently supports one local storage
-path.
+Product modules never import benchmark modules.
 
-## Data directory lifecycle
+## Content normalization
 
-Construction resolves the path and acquires `.mindbridge.lock` without waiting. Failure to acquire
-ownership maps to `StorageError`. After locking, MindBridge:
+Python content atoms are `str`, `Path`, `Blob`, and `AssetRef`. Strings are always text. Paths and
+blobs are copied into the CAS before a model sees them. Asset references are resolved against
+SQLite in the same directory.
 
-1. Enforces POSIX mode `0700` on the top-level directory and opens or creates `state.sqlite3`.
-2. Migrates supported schemas through SQLite schema v5 when required.
-3. Validates required tables and stored embedding/index metadata.
-4. Opens the content-addressed asset store.
-5. Checkpoints all embeddings if the Zvec directory is missing.
-6. Opens or creates `zvec/` and drains durable index work.
+REST and MCP decode base64 data URLs into `Blob` values and map stored IDs to `AssetRef`. HTTP(S)
+URLs and server filesystem paths are rejected. This keeps network fetch behavior out of the
+product and prevents protocol callers from selecting local files.
 
-`close()` waits for active operations, then closes the model backend, Zvec, SQLite, and filesystem
-lock. It is idempotent. Operations after close or from a forked child raise `StorageError`.
+Canonical input order, normalized text, content digests, metadata, event time, and memory type
+produce a stable memory ID. Identical media bytes share a CAS object.
 
-## On-disk layout
+## Model routing
 
-```text
-data_dir/
-├── .mindbridge.lock
-├── state.sqlite3
-├── state.sqlite3-wal             # present during WAL activity
-├── assets/
-│   └── ab/
-│       └── abcdef...             # SHA-256 content address
-└── zvec/
-```
+Each operation validates atomic modality sets from its adapter:
 
-The top-level directory is forced to owner-only mode `0700` on POSIX, including when it already
-exists; SQLite and lock files use `0600`. A source `Path` is validated as a regular file, opened
-without following a final symlink where the platform supports that flag, streamed through SHA-256,
-and atomically installed. URL downloads are streamed with a byte limit. For each hop, MindBridge
-resolves the exact allowlisted hostname, rejects the hop if any result is non-public, and connects
-to a verified public IP while retaining the original host for HTTP and TLS SNI. Redirects repeat the
-entire check. A concrete expected MIME must match response `Content-Type` exactly; a family range
-matches only that image, video, or audio family.
+- Embedding routing uses `embedding_capabilities` and stores document vectors in the declared
+  embedding space.
+- Generation routing uses `generation_capabilities` and never drops unsupported visual evidence.
+- Audio unsupported by embedding or generation may be replaced with a transcript when a
+  transcriber exists.
+- `speech()` requires `SpeechBackend` because plain transcription has no timing or speaker data.
 
-## SQLite authority
+Jina application text is wrapped as a non-string text value before its remote model code receives
+it. This prevents path- or URL-shaped application text from being reclassified as media. Real
+media is always a resolved local CAS path.
 
-Every connection enables:
+## Durable schema
 
-```text
-foreign_keys = ON
-journal_mode = WAL
-synchronous = FULL
-busy_timeout = 30000
-```
+SQLite stores:
 
-Writes use `BEGIN IMMEDIATE`. The multimodal schema contains:
+- Memory records, memory type, timestamps, metadata, and access reinforcement.
+- Asset descriptors, transcript cache, speech turns, speaker centroids, and names.
+- Normalized FP32 embeddings with model, space, task, and dimension.
+- Store metadata for embedding identity, transcription space, and index recipe.
+- Ordered pending index operations.
 
-| Table | Authoritative content |
-| --- | --- |
-| `memory_records` | Text, modality, memory role, metadata, event/access times, bounded access count |
-| `media_assets` | SHA-256 descriptor, MIME, modality, size, relative CAS path, optional transcript |
-| `memory_assets` | Ordered memory-to-asset relationships |
-| `embeddings` | FP32 vector, model, space, task, dimension, normalization, object part |
-| `speech_analyses` | Completed ASR recipe and transcript per media asset |
-| `speech_segments` | Timed transcript turns linked to local speaker identities |
-| `speaker_identities` | Optional name, CAM++ centroid, and observation count per local speaker |
-| `store_metadata` | Embedding, transcription, and index compatibility identity |
-| `search_index_queue` | Ordered `upsert` and `delete` operations awaiting Zvec flush |
+Foreign keys and transactions keep records, assets, embeddings, and outbox changes atomic.
 
-Foreign keys cascade record deletion to relationships and embeddings. An asset descriptor/file is
-garbage-collected only when it is no longer referenced. SQLite triggers append index operations
-when embeddings change.
+## Index protocol
 
-Memory pages are ordered by `(created_at DESC, memory_id DESC)`. The public cursor encodes the last
-pair with a version marker and is not a general query token.
+For every durable mutation:
 
-## Content normalization and identity
+1. Commit SQLite data and an outbox operation.
+2. Read a bounded outbox batch.
+3. Hydrate current SQLite truth for the affected embedding IDs.
+4. Upsert current documents and delete missing documents in Zvec.
+5. Flush Zvec.
+6. Acknowledge the exact SQLite outbox batch.
 
-For each add, MindBridge:
+Interrupted work remains durable. Startup drains it. Reindexing builds from SQLite, then replays
+the outbox so a record committed after the rebuild scan is not lost from the projection.
 
-1. Flattens one atom or an ordered atom sequence without treating `str` as a filesystem path.
-2. Trims and NFC-normalizes text atoms.
-3. Resolves `AssetRef` through SQLite and materializes Path, Blob, and allowed URL atoms into CAS.
-4. Infers Path/URL media type only from a deterministic common suffix when no explicit hint exists.
-5. Derives modality from the set of media families.
-6. Validates the semantic, episodic, or procedural memory role.
-7. Converts timezone-aware event time to UTC microsecond precision.
-8. Serializes metadata as sorted compact JSON and rejects non-finite or unsupported values.
-9. Hashes canonical text, ordered asset digests, event time, metadata, and any non-default role
-   into the memory ID; omitting the default semantic marker preserves existing semantic IDs.
+## Provider boundary
 
-The same bytes have one asset ID regardless of source. Memory identity preserves asset order. A
-duplicate memory is detected before embedding or transcription; source Path/URL bytes still must be
-read to establish their digest unless the caller supplies an existing `AssetRef`. Asset `name` is
-stored once per digest, not per relationship. The first authoritative non-empty name is returned
-when later inputs supply a different name for the same bytes.
+`OpenAIModels` receives already-constructed SDK clients. It supplies model IDs and semantic
+payloads to SDK methods, validates returned shapes, and maps failures to `ModelError`. It does not
+read keys, create transports, normalize base URLs, implement retries, or close clients.
 
-## Model input and fallback
+`SentenceTransformersEmbedder` and `FunASRTranscriber` similarly delegate inference to their
+installed runtimes. MindBridge retains only validation and mapping needed by its public semantics.
 
-One memory or query becomes one `ModelInput(text, assets)`. The current release stores one
-aggregate document embedding at object part zero; the schema field does not imply a public
-multi-vector feature.
+## Threading and lifecycle
 
-Embedding uses `EmbedTask.DOCUMENT` for memories and `EmbedTask.QUERY` for queries. The generic
-Sentence Transformers adapter maps these to `encode_document` and `encode_query`, builds standard
-multimodal dict/message values, and submits one ordered model batch. The Jina adapter alone maps
-inputs to the pinned model's legacy tuple form. The OpenAI-compatible shape has no task field, so
-it validates the task locally but does not serialize it.
+`Memory` allows model calls and independent SQLite record commits outside its index lock. Outbox
+replay and Zvec access are serialized; several committed writes may therefore share one flush. CAS
+leases prevent temporary query media from being removed while another operation is using it.
 
-Local `space_id` is a digest of adapter recipe, model ID, immutable revision, effective native or
-advertised Matryoshka dimension, normalization, and retrieval-side methods. It is not manually
-overridable. A changed model contract must target a new directory and re-encode; `reindex()` only
-rebuilds the derived Zvec collection from authoritative stored vectors.
+Closing starts a lifecycle barrier, rejects new calls, waits for active calls, and closes each
+unique adapter or storage resource once. Forked processes must create a new instance and distinct
+directory.
 
-For each operation, routing compares input atomic modalities with `ModelCapabilities`:
+## Trust boundaries
 
-- Fully supported input goes directly to the operation.
-- Unsupported audio is transcribed when transcription supports it. Transcript text replaces that
-  audio for the current call; supported image/video assets remain.
-- The reduced input is validated again. Any remaining unsupported modality raises `ModelError`.
-
-Transcripts can be retained with authoritative asset metadata so repeated use need not invoke ASR
-again. Add-time embedding fallback persists derived transcript text in `memory_records.content`.
-Grounded generation with a `SpeechBackend` persists timed turns and identity matches, then adds the
-complete identity fields to model-only evidence without rewriting an existing record's content.
-Neither route changes the persisted media modality. SQLite stores the backend's
-`transcription_space` beside the embedding/index recipe and rejects a different value at startup.
-The identifier must change with any ASR model, preprocessing, language, prompting, or decoding
-choice that can change transcript text; changing it requires a new directory and re-ingestion.
-
-The default speech route is FunASR `AutoModel` composed from Fun-ASR-Nano, FSMN-VAD, and CAM++;
-the explicit vLLM route batch-decodes the same VAD spans before the same CAM++ clustering.
-`Memory.speech` and `Memory.ask` store timed turns and match normalized CAM++ centroids within one
-physical directory. `SPK0`-style labels are asset-local and are never treated as identities. The
-first observation enrolls an opaque `speaker_id`; later clear cosine matches reuse it.
-`Memory.register_speaker` attaches a display name without exposing the stored voiceprint.
-
-## Asset transport to models
-
-`MINDBRIDGE_MEDIA_TRANSPORT=data` sends resolved assets as base64 data URLs. `file` sends local
-`file:` URLs for a trusted co-located backend. Generation uses standard content parts and the
-OpenAI-compatible input-audio shape where applicable. Transcription uses multipart upload to
-`/audio/transcriptions`.
-
-For built-in `data` transport, an embedding or generation call is rejected when the aggregate raw
-size of its media exceeds 64 MiB, before base64 expansion. Batch embedding counts the media across
-the whole call. Answer construction de-duplicates by asset ID, so the binary part for a shared asset
-appears once even when the question and several hits refer to it. The `file` transport avoids inline
-encoding for a co-located model; provider-native upload or streaming belongs in a custom backend.
-
-The transport choice is separate from ingestion. A remote source is always fetched, validated,
-and stored locally before a model sees it; model adapters never receive an untrusted remote URL
-directly from the caller.
-
-## Durable index outbox
-
-The outbox is a synchronous recovery boundary, not a background-worker queue. Under the write
-lock, each drain:
-
-1. Reads at most 256 ordered operations to bound vector memory.
-2. Keeps the last operation per embedding ID within that batch.
-3. Reads current SQLite documents for retained IDs.
-4. Deletes absent IDs and upserts present documents in Zvec.
-5. Flushes Zvec.
-6. Deletes the exact original operation rows from SQLite.
-
-Any index failure occurs before acknowledgement. Replaying is safe because desired state comes
-from current SQLite truth. Reindex streams SQLite documents in bounded pages rather than loading
-the complete corpus.
-
-## Concurrency boundary
-
-The lifecycle counter allows operations on one instance to overlap, and model work runs outside
-`Memory`'s write lock. SQLite commits use independent WAL connections and may complete
-concurrently before the index boundary; their durable outbox rows are then coalesced so one Zvec
-flush can cover several writes. Zvec mutation/search and outbox acknowledgement remain serialized
-under the lock so a reader cannot observe a partially applied projection. `reindex()`, `optimize()`,
-deletion, close, and asset cleanup acquire the same boundary where required. Jina inference uses a
-small bounded collection window to combine concurrent calls with the same query/document task into
-one model batch. Its remote module temporarily patches Sentence Transformers only during loading;
-MindBridge binds those methods to the Jina instance and restores the class before releasing the
-process-global load lock. A second process still cannot own the directory.
-
-## Retrieval
-
-Vectors are normalized before persistence. When routed query text is non-empty, hybrid search sends
-that text and the normalized aggregate vector to Zvec so it can fuse dense and lexical candidates.
-A pure-media query uses dense vector search. Both paths are constrained to the stored vector space,
-retrieval task, optional memory role, and detected event-time range. SQLite hydration rechecks role
-and event time, so a stale or corrupted derived field cannot authorize a hit.
-
-Temporal or decay ranking over-fetches at least 50 candidates or three times the requested limit.
-Temporal matches rank before fallback candidates. Optional decay uses the latest access, event, or
-update time and a bounded access-strength factor; only returned hits receive durable reinforcement.
-Public scores are clamped to `[0, 1]`; stale IDs are removed. The exact parser and formula are in
-[memory types, temporal reasoning, and decay](memory-types-time-and-decay.md).
-
-There is currently no chunking, multiple embeddings per memory, metadata-filter pushdown, or
-learned reranker. Quality and latency work must measure the one-memory/one-vector contract instead
-of claiming an unimplemented pipeline.
-
-## Failure mapping
-
-Internal failures do not leak adapter exceptions through the public API:
-
-| Boundary | Public exception |
-| --- | --- |
-| Invalid content, metadata, asset source, cursor, time, or limit | `ValidationError` |
-| Missing memory ID in `get` | `MemoryNotFoundError` |
-| Missing or contradictory opaque asset reference | `ValidationError` |
-| Capability routing, embedding, transcription, or generation | `ModelError` |
-| Directory, schema, lock, CAS, SQLite, or durable metadata | `StorageError` |
-| Zvec open, mutation, flush, rebuild, or query | `IndexUnavailableError` |
-
-All inherit `MindBridgeError`. REST and MCP map them to stable sanitized envelopes.
-
-## Deliberate non-goals
-
-The embedded v0.2 architecture does not provide distributed writers, logical account partitions,
-automatic role extraction, background consolidation, executable procedural memories, server-side
-metadata filters, automatic media chunking, per-asset vectors, a learned reranker, or a runtime
-plugin registry. New layers require a measured public use case.
+- Python callers can intentionally read local paths; the final path must be a regular file and is
+  opened without following a final symlink where supported.
+- REST and MCP never accept local paths or remote network URLs.
+- Model output and provider exceptions are untrusted and validated before persistence or return.
+- Public REST/MCP errors omit provider bodies, credentials, and filesystem details.
+- Authentication, TLS, rate limits, and request identity remain deployment concerns.

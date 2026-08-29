@@ -1,300 +1,177 @@
 # MindBridge
 
-Fast, local multimodal memory for Python agents.
+Fast, embedded multimodal memory for Python agents.
 
-MindBridge gives an application one small `Memory` object for durable text, image, video, and
-audio memory, explicit semantic/episodic/procedural roles, temporal retrieval, optional soft
-decay, and grounded answers. SQLite and a content-addressed store are authoritative; Zvec is a
-rebuildable local search index. There is no database service, queue worker, object store, or
-account hierarchy to configure.
+MindBridge owns three things: memory semantics, retrieval orchestration, and durable local
+consistency. Applications construct model adapters explicitly. Provider SDKs and deployment
+infrastructure own credentials, network transport, retries, timeouts, and authentication.
 
-## Quick start
+SQLite is authoritative for records, embeddings, metadata, and the search-index outbox. Media is
+stored in a local content-addressed store, and Zvec is a rebuildable search projection. One
+physical `data_dir` has exactly one live `Memory` owner.
 
-Install MindBridge with its default local embedding and speech runtime:
+## Install
 
-```bash
-uv add "mindbridge[local]"
-```
-
-The base `mindbridge` package stays small for applications that inject model backends. The local
-extra includes Jina v5 Omni embedding and FunASR speech analysis. Set an OpenAI-compatible
-credential only when using the default grounded-answer backend:
+Install the local Jina and FunASR adapters, plus the official OpenAI SDK when grounded answers use
+OpenAI:
 
 ```bash
-export OPENAI_API_KEY="your-api-key"
+uv add "mindbridge[local,openai]"
 ```
 
-A text-only use case stays a three-line flow; it is one native route, not a product limitation:
+The base package depends only on Pydantic and Zvec. Torch, provider SDKs, REST, and MCP remain in
+optional extras.
+
+## Search local memory
 
 ```python
-from mindbridge import Memory
+from mindbridge import JinaOmniEmbedder, Memory
 
-with Memory() as memory:
+with Memory("./data/assistant", embedder=JinaOmniEmbedder()) as memory:
     memory.add("Ada prefers concise status updates.")
     hits = memory.search("How should I write Ada's update?")
-    answer = memory.ask("How should I write Ada's update?")
-
     print(hits[0].content)
-    print(answer.answer)
 ```
 
-The same methods accept local paths, HTTPS sources, inline bytes, stored asset references, and
-ordered combinations. Jina v5 Omni is the default embedding model and accepts all four atomic
-modalities. Fun-ASR-Nano is the default ASR, with FSMN-VAD and CAM++ speaker recognition. For
-grounded answers, declare the modalities accepted by the generator, then allow the remote media
-host:
+`Memory` never selects a provider or reads provider credentials.
 
-```bash
-export MINDBRIDGE_GENERATION_MODALITIES=text,image,video
-export MINDBRIDGE_ALLOWED_URL_HOSTS=media.example
+## Add grounded answers
+
+Construct and own the provider client in application code:
+
+```python
+from openai import OpenAI
+
+from mindbridge import JinaOmniEmbedder, Memory, OpenAIModels
+
+with OpenAI() as client:
+    answerer = OpenAIModels(
+        generation_client=client,
+        generation_model="gpt-5-mini",
+    )
+    with Memory(
+        "./data/assistant",
+        embedder=JinaOmniEmbedder(),
+        answerer=answerer,
+    ) as memory:
+        memory.add("The release review is Thursday at 10:00 UTC.")
+        print(memory.ask("When is the release review?").answer)
 ```
+
+`OpenAIModels` maps MindBridge model inputs to the official SDK. It does not create or close SDK
+clients. Configure API keys, base URLs, proxies, retries, and timeouts with `OpenAI(...)` or the
+provider's own SDK.
+
+## Content contract
+
+`add`, `search`, and `ask` accept one atom or an ordered sequence of atoms:
+
+| Value | Meaning |
+| --- | --- |
+| `str` | Application text |
+| `pathlib.Path` | Local image, video, or audio copied into the CAS |
+| `Blob` | In-memory media bytes with a concrete MIME type |
+| `AssetRef` | Media already stored in the same directory |
+
+Remote URLs are not a product input. Fetch remote content with the application's HTTP stack and
+pass a `Blob` or local `Path`. REST and MCP accept base64 data URLs and stored asset IDs, but never
+fetch network URLs or read arbitrary server paths.
 
 ```python
 from pathlib import Path
 
-from mindbridge import Blob, Memory, URL
+from mindbridge import Blob, JinaOmniEmbedder, Memory
 
-with Memory(data_dir="./data/assistant-memory") as memory:
+with Memory("./data/media", embedder=JinaOmniEmbedder()) as memory:
     record = memory.add(
-        [
-            "The whiteboard after the design review",
+        (
+            "Design review evidence",
             Path("./whiteboard.png"),
-            Blob(
-                Path("./summary.wav").read_bytes(),
-                media_type="audio/wav",
-                name="summary.wav",
-            ),
-            URL("https://media.example/demo.mp4", media_type="video/mp4"),
-        ],
-        metadata={"source": "design-review"},
+            Blob(Path("./summary.wav").read_bytes(), "audio/wav", "summary.wav"),
+        )
     )
-    print(record.modality)  # Modality.OMNI
-    print(record.assets)
+    print(record.modality)
 ```
 
-`Memory()` stores data in `.mindbridge/`. Applications, tests, and benchmarks should pass an
-explicit directory. One directory belongs to exactly one running `Memory` instance; a second
-owner fails immediately.
+Use `FunASRTranscriber()` explicitly when audio fallback, timed speech, or speaker matching is
+needed. Unsupported modalities fail before inference; model support is declared by each adapter.
 
-## One content contract
+## Model boundaries
 
-Python accepts these content atoms:
+MindBridge exposes narrow, operation-specific protocols:
 
-| Value | Use |
-| --- | --- |
-| `str` | Text |
-| `pathlib.Path` | A local image, video, or audio file copied into local storage |
-| `URL` | An explicitly typed HTTPS media source |
-| `Blob` | Inline media bytes with a concrete MIME type |
-| `AssetRef` | Reuse an asset already stored in the same `data_dir` |
+- `EmbeddingBackend` for retrieval vectors and stable embedding-space identity.
+- `GenerationBackend` for grounded answers.
+- `TranscriptionBackend` for plain transcripts.
+- `SpeechBackend` for timed transcripts and local speaker centroids.
 
-Pass one atom or an ordered sequence of atoms to `add`, `search`, or `ask`. MindBridge reports
-`text`, `image`, `video`, or `audio` when an input has no media or one media family, and `omni`
-when it combines two or more media families. Text alongside one media family keeps that media
-modality.
+A single provider adapter may implement several protocols, but `Memory` does not require one fat
+backend. There is no provider registry, endpoint normalizer, credential store, retry layer, or
+sync/async provider compatibility layer.
 
-REST and MCP use the equivalent OpenAI-compatible content parts: `input_text`, `input_image`, and
-`input_file`. Local filesystem paths are intentionally Python-only.
+The built-in adapters are deliberately thin:
 
-Identical media bytes share one CAS descriptor. Its first authoritative non-empty name is reused
-across memories; use record text or metadata when a label must differ per memory.
+- `SentenceTransformersEmbedder` uses the installed Sentence Transformers runtime.
+- `JinaOmniEmbedder` pins Jina v5 Omni and calls its official `encode_query` and
+  `encode_document` methods.
+- `FunASRTranscriber` delegates model loading and execution to `funasr.AutoModel`.
+- `OpenAIModels` uses caller-owned official OpenAI SDK clients.
 
-## Storage and retrieval
+## Storage and consistency
 
 ```text
 data_dir/
-├── state.sqlite3       # records, asset metadata, FP32 embeddings, and index outbox
-├── assets/             # immutable content-addressed media bytes
-├── .mindbridge.lock    # exclusive ownership lock
-└── zvec/               # disposable hybrid-search index
+├── state.sqlite3       # authoritative records, embeddings, metadata, outbox
+├── assets/             # immutable content-addressed media
+├── .mindbridge.lock    # exclusive process ownership
+└── zvec/               # disposable search projection
 ```
 
-SQLite and `assets/` are the source of truth. If `zvec/` is lost, MindBridge rebuilds it from
-stored embeddings without embedding historical content again. Keep the complete directory when
-backing up or moving a memory. On POSIX, opening a directory enforces top-level mode `0700`.
+A durable write commits SQLite before updating Zvec. Outbox work is acknowledged only after the
+Zvec flush succeeds. Missing or stale index data is rebuilt and hydrated from SQLite without
+re-embedding stored content. Concurrent record commits may share one serialized outbox flush.
 
-Each memory currently has one aggregate embedding. A routed query with text uses hybrid
-dense/full-text search; a pure-media query uses dense search. Memory type and event-time filters
-are pushed into Zvec and rechecked against SQLite. Detected temporal expressions and optional
-decay apply a deterministic query-time rerank. MindBridge does not yet create chunks, per-asset
-vectors, or a learned reranking stage.
+## REST and MCP adapters
 
-## Python API
-
-The synchronous surface is deliberately small:
+Both adapters require a caller-constructed memory:
 
 ```python
-from mindbridge import MemoryType
+from mindbridge.api import create_app
 
-record = memory.add(
-    content,
-    metadata={"source": "notes"},
-    memory_type=MemoryType.SEMANTIC,
-)
-records = memory.add_many(
-    ["first", Path("second.png")],
-    memory_type=MemoryType.EPISODIC,
-)
-hits = memory.search(query, limit=10, memory_type=MemoryType.EPISODIC)
-answer = memory.ask(question, limit=5, reference_at=None)
-turns = memory.speech(record.id)  # timed text and stable local speaker_id values
-if turns and turns[0].speaker_id:
-    memory.register_speaker(turns[0].speaker_id, "Ada")
-record = memory.get(record.id)
-page = memory.list(limit=100, cursor=None)
-deleted = memory.delete(record.id)
-memory.reindex()
-memory.optimize()
+app = create_app(memory=memory)
 ```
-
-`speech` and grounded `ask` lazily run Fun-ASR-Nano, VAD, and CAM++ the first time an audio/video
-asset needs speech analysis. CAM++ centroids stay in the same SQLite directory and match speakers
-across recordings. Register an opaque `speaker_id` once to receive `speaker_name` on later and
-cached turns; biometric vectors never leave the local store. `ask` gives generation the complete
-timed identity evidence, including the stable ID, registered name, and match score.
-
-`AsyncMemory` exposes the same operations with `await`. See the
-[Python API reference](docs/api/python-sdk.md) for exact values, routing, and failures.
-Calls on one owner may overlap remote model work; short SQLite commit/outbox and Zvec access
-sections serialize to keep local state consistent.
-
-## REST and MCP
-
-Install and run one optional transport:
-
-```bash
-uv add "mindbridge[local,server]"
-mindbridge serve --data-dir .mindbridge
-```
-
-```bash
-uv add "mindbridge[local,mcp]"
-mindbridge mcp --data-dir .mindbridge
-```
-
-The REST API is available under `/v1`; interactive OpenAPI documentation is served at `/docs`.
-The MCP adapter exposes five typed tools. REST, MCP, and an embedded Python instance cannot own
-the same directory concurrently.
-
-Binding REST beyond loopback requires `MINDBRIDGE_API_KEY`, `--tls-certfile`, and
-`--tls-keyfile`. See the [REST reference](docs/api/rest.md),
-[MCP reference](docs/api/mcp.md), and [deployment guide](docs/deployment.md).
-
-## Embedding and model backends
-
-`Memory()` uses the pinned Jina v5 Omni Sentence Transformers adapter by default. The heavy local
-runtime is isolated in the `local` extra, so importing the base SDK never imports Torch,
-Transformers, or Sentence Transformers. Jina's model code is confined to `JinaOmniEmbedder`; the
-generic `SentenceTransformersEmbedder` always uses standard multimodal dict/message inputs and
-discovers support through `supports()`.
-
-Qwen3-VL-Embedding therefore needs no provider branch:
 
 ```python
-from mindbridge import Memory, SentenceTransformersEmbedder
+from mindbridge.api.mcp import build_mcp_server
 
-embedder = SentenceTransformersEmbedder.load(
-    "Qwen/Qwen3-VL-Embedding-2B",
-    revision="9f2f7e710d6d81056aa5c0a4f04764fec6bb7bda",
-    device="cuda",
-    batch_size=1,
-)
-
-with Memory("./data/qwen", embedder=embedder) as memory:
-    memory.add("Qwen uses the standard text path.")
+build_mcp_server(memory).run("stdio")
 ```
 
-Qwen3-VL accepts text, image, video, and their combinations, but not audio. MindBridge rejects
-unsupported audio before inference and routes it through ASR while retaining supported visual
-parts. Start video batches at one and increase only after measuring device memory.
+They do not own or close `memory`. `create_app` is unauthenticated; put it behind the application's
+gateway or ASGI middleware. There is no generic product CLI because provider construction and
+lifecycle belong to the host application.
 
-Generation uses the OpenAI-compatible backend by default. Passing an explicit combined
-`ModelBackend` without `embedder=` or `transcriber=` keeps all of its cloud paths; the narrower
-keywords compose local or custom embedding and speech backends independently.
+## Benchmarks
 
-Each directory also persists `transcription_space`, the stable ID for its ASR model and
-transcript-affecting recipe, and refuses a different value at startup. The built-in `data` transport
-limits each embedding or generation call to 64 MiB of aggregate raw media; trusted co-located
-`file` transport or a streaming custom backend is the path for larger video. A grounded answer
-sends retrieved content, memory type, timestamps, metadata, and media to the generation endpoint,
-limits serialized text evidence to 4 MiB, and sends each distinct binary asset once.
-
-Capabilities are explicit. Configure only the modalities each operation actually accepts. When
-embedding or generation does not support audio, MindBridge transcribes it and sends the transcript
-together with any supported image or video input. Native audio-capable models receive audio
-directly. With a `SpeechBackend`, grounded answers also resolve identities for supported audio and
-video even when generation accepts the native media. Routing is based on declared capabilities,
-never guessed from a model name.
-
-One `Memory` instance may call a backend concurrently. Custom `EmbeddingBackend`, `SpeechBackend`,
-and `ModelBackend` implementations must therefore be thread-safe until `close()`.
-
-Model ID, immutable revision, effective dimension, normalization, query/document semantics, and
-input recipe determine `space_id`. Switching any of them creates a different space. Re-encode
-content into a new `data_dir`; `reindex()` only rebuilds Zvec from the existing SQLite vectors.
-
-The [default Jina model weights](https://huggingface.co/jinaai/jina-embeddings-v5-omni-small-retrieval)
-use CC BY-NC 4.0. Applications whose use is not compatible with that license should inject another
-Sentence Transformers model or cloud backend.
-
-See [configuration](docs/configuration.md) for every variable and custom backend guidance.
-
-## Benchmark isolation
-
-Run the pinned evaluation catalog with an `lmms-eval`-style task selector:
+The only console command is the benchmark dispatcher:
 
 ```bash
-mindbridge eval --tasks list
-mindbridge eval --model mindbridge --tasks locomo-refined --seed 42
+mindbridge-bench --help
+mindbridge-bench eval --tasks list
+mindbridge-bench local-index --help
 ```
 
-LoCoMo-Refined, M3-Bench, Video-MME/v2, EgoLifeQA, EgoMemReason, EgoTempo, MemLens,
-MM-Lifelong, SuperMemory-VQA, ATM-Bench, and Mem-Gallery are supported. Results include
-cluster-aware uncertainty and paired baseline comparisons. Missing pinned annotations and media
-download automatically; long videos are prepared into reusable bounded clips. EgoTempo is the one
-credentialed exception and needs prior Ego4D access. See [benchmarking](docs/benchmarking.md).
-
-Isolation is physical, not logical. Concurrent benchmark tasks must never share a `data_dir`:
-
-```text
-.benchmarks/<benchmark>/<run>/<case>/
-```
-
-Each leaf owns its own SQLite database, asset store, Zvec collection, and lock. Benchmark labels
-organize paths in the harness; they are not fields in the product API or storage schema. See
-[benchmarking](docs/benchmarking.md).
+Every benchmark unit receives a separate physical directory. See
+[the benchmark guide](docs/benchmarking.md).
 
 ## Documentation
 
-- [Get started](docs/quickstart.md)
-- [Core concepts](docs/concepts.md)
-- [Memory types, temporal reasoning, and decay](docs/memory-types-time-and-decay.md)
-- [Architecture](docs/architecture.md)
-- [Configuration](docs/configuration.md)
+- [Quick start](docs/quickstart.md)
 - [Python API](docs/api/python-sdk.md)
-- [REST API](docs/api/rest.md)
-- [MCP API](docs/api/mcp.md)
-- [Command-line API](docs/api/cli.md)
-- [Deployment](docs/deployment.md)
-- [Operations](docs/operations.md)
-- [Troubleshooting](docs/troubleshooting.md)
-- [Breaking upgrade guide](docs/quickstart.md#upgrading-from-the-service-based-release)
+- [Configuration and composition](docs/configuration.md)
+- [Architecture](docs/architecture.md)
+- [REST](docs/api/rest.md) and [MCP](docs/api/mcp.md)
+- [Deployment](docs/deployment.md) and [operations](docs/operations.md)
 
-## Development
-
-MindBridge supports Python 3.10 through 3.14 and uses
-[uv](https://docs.astral.sh/uv/) with a checked-in lockfile.
-
-```bash
-uv sync --all-groups --all-extras
-uv run ruff format --check .
-uv run ruff check .
-uv run mypy
-uv run pytest -W error
-```
-
-Read [CONTRIBUTING.md](CONTRIBUTING.md) before submitting a change.
-
-## License
-
-[Apache License 2.0](LICENSE)
+The pinned default Jina model weights are licensed CC BY-NC 4.0. Inject another embedding backend
+when that license does not fit the application.

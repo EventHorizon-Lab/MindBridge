@@ -25,25 +25,19 @@ jobs:
             requirement: .
             probe: >-
               mindbridge
-              mindbridge.cli
               mindbridge.benchmarks
               mindbridge.benchmarks.isolation
               mindbridge.benchmarks.local_index_benchmark
-              mindbridge.config
               mindbridge.exceptions
               mindbridge.infrastructure.local
               mindbridge.memory
-              mindbridge.models.openai_http
-              mindbridge.sdk
+              mindbridge.models.base
               mindbridge.types
           - name: server
             requirement: .[server]
             probe: >-
               mindbridge.api
               mindbridge.api.app
-              mindbridge.api.auth
-              mindbridge.api.errors
-              mindbridge.server
           - name: local
             requirement: .[local]
             probe: >-

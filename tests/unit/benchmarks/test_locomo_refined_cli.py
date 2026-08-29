@@ -96,12 +96,27 @@ class _FakeAsyncMemory:
         )
 
 
+class _FakePool:
+    instances: ClassVar[list[_FakePool]] = []
+
+    def __init__(self, *_args: object, **_kwargs: object) -> None:
+        self.closed = False
+        self.instances.append(self)
+
+    def memory(self, data_dir: Path) -> _FakeAsyncMemory:
+        return _FakeAsyncMemory(data_dir)
+
+    def close(self) -> None:
+        self.closed = True
+
+
 async def test_parallel_conversations_use_distinct_closed_physical_memories(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _FakeAsyncMemory.reset()
-    monkeypatch.setattr(locomo_refined_cli, "AsyncMemory", _FakeAsyncMemory)
+    _FakePool.instances = []
+    monkeypatch.setattr(locomo_refined_cli, "_BackendPool", _FakePool)
     arguments = _arguments(tmp_path, unit_concurrency=3)
     conversations = tuple(_conversation(f"sample-{index}") for index in range(6))
     run = BenchmarkRun(arguments.data_root, "locomo-refined", arguments.run_id)
@@ -115,6 +130,7 @@ async def test_parallel_conversations_use_distinct_closed_physical_memories(
     assert {instance.data_dir for instance in _FakeAsyncMemory.instances} == set(unit_dirs)
     assert all(path.parent == run.path for path in unit_dirs)
     assert all(instance.closed for instance in _FakeAsyncMemory.instances)
+    assert all(pool.closed for pool in _FakePool.instances)
     assert [prediction.qa_id for prediction in predictions] == [
         f"sample-{index}#q0000" for index in range(6)
     ]
@@ -135,7 +151,8 @@ async def test_unit_failures_and_cancellation_propagate_after_closing_memory(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _FakeAsyncMemory.reset()
-    monkeypatch.setattr(locomo_refined_cli, "AsyncMemory", _FakeAsyncMemory)
+    _FakePool.instances = []
+    monkeypatch.setattr(locomo_refined_cli, "_BackendPool", _FakePool)
 
     async def fail(
         memory: AsyncMemory,
@@ -154,6 +171,7 @@ async def test_unit_failures_and_cancellation_propagate_after_closing_memory(
 
     assert _FakeAsyncMemory.instances
     assert all(instance.closed for instance in _FakeAsyncMemory.instances)
+    assert all(pool.closed for pool in _FakePool.instances)
 
 
 def test_artifacts_are_official_reproducible_and_protected_by_default(tmp_path: Path) -> None:

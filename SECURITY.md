@@ -29,19 +29,18 @@ directory permissions, host account isolation, full-disk encryption, and backup 
 Give applications with different trust boundaries different operating-system accounts and
 directories. Do not use metadata as an authorization boundary.
 
-### REST authentication and transport
+### REST deployment boundary
 
-`create_app(api_key=...)` protects every `/v1` route with one shared bearer key; comparison is
-constant-time. `/healthz` remains public. The built-in CLI refuses a non-loopback bind unless both
-`MINDBRIDGE_API_KEY` and a TLS certificate/key pair are present.
+`create_app(memory=...)` is an unauthenticated ASGI application. MindBridge does not ship a product
+server. Internet-facing deployments must host the app behind their existing authenticated gateway,
+service mesh, or ASGI authentication middleware.
 
-Authentication runs before request-body parsing. `/v1` bodies larger than 8 MiB are rejected, text
-is limited to 65,536 characters, and canonical metadata is limited to 262,144 UTF-8 bytes.
+`/v1` bodies larger than 8 MiB are rejected before framework parsing, text is limited to 65,536
+characters, and canonical metadata is limited to 262,144 UTF-8 bytes.
 
-A composed ASGI deployment can omit `api_key` or TLS, so its operator must configure both before
-exposure. MindBridge has no user authentication, rate limiter, quota, key rotation store, or audit
-log. Put internet-facing deployments behind network policy and, when needed, a gateway providing
-those controls.
+MindBridge has no user authentication, rate limiter, quota, key rotation store, or audit log. The
+gateway must provide the identity, authorization, TLS, rate-limit, and audit controls required by
+the deployment.
 
 ### MCP
 
@@ -51,10 +50,11 @@ principal can launch it and access its `data_dir`.
 
 ### Model data boundary
 
-`add` and `search` send routed text and media to the configured embedding endpoint. Audio fallback
-also sends media to the transcription endpoint. `ask` sends the question and retrieved content,
-timestamps, metadata, and media to the generation endpoint. Choose providers and retention policies
-appropriate for that data, and use HTTPS outside a trusted local network.
+`add` and `search` send routed text and media through the supplied embedding backend. Audio fallback
+also sends media through the supplied transcription backend. `ask` sends the question and retrieved
+content, timestamps, metadata, and media through the supplied generation backend. Choose provider
+clients and retention policies appropriate for that data, and use HTTPS outside a trusted local
+network.
 
 Stored text is untrusted model input. MindBridge separates it from the system instruction and asks
 the model to treat it as evidence, but it cannot guarantee that a model will resist prompt
@@ -73,10 +73,10 @@ when secure deletion matters. Stop the owning process before copying or restorin
 
 ### Credentials and logs
 
-Keep the inbound service key separate from `OPENAI_API_KEY`. `Config` excludes the model key from
-its representation, and public model/storage errors omit provider bodies and filesystem details.
-Do not log request bodies, authorization headers, memory content, or metadata in surrounding
-application code.
+Keep gateway credentials separate from provider credentials. Provider SDK clients own credential
+loading and redaction; MindBridge does not copy model keys into its configuration. Public
+model/storage errors omit provider bodies and filesystem details. Do not log request bodies,
+authorization headers, memory content, or metadata in surrounding application code.
 
 ## Deployment hardening
 
@@ -85,8 +85,8 @@ application code.
 | Process | One process and one `Memory` owner per directory; do not pre-fork an open instance |
 | Filesystem | Dedicated account, local durable filesystem, restrictive parent permissions |
 | Encryption | Encrypt the host volume and backups when memories are sensitive |
-| REST key | Use a high-entropy secret and rotate it at the deployment boundary |
-| TLS | Required by the CLI beyond loopback; configure it explicitly for composed ASGI apps |
+| REST auth | Enforce identity and authorization at the gateway or ASGI middleware boundary |
+| TLS | Terminate TLS before the unauthenticated ASGI app |
 | Network | Restrict inbound access and use HTTPS for remote model endpoints |
 | MCP | Keep stdio local to the intended principal |
 | Backups | Stop the owner, protect the complete directory, and test restore into a new path |

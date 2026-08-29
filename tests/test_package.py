@@ -30,7 +30,7 @@ SCRIPTS = cast(dict[str, str], PROJECT["scripts"])
 def test_base_import_does_not_load_optional_protocols() -> None:
     code = (
         "import json, sys; import mindbridge; "
-        "blocked = {'fastapi', 'mcp', 'sentence_transformers', 'torch', "
+        "blocked = {'fastapi', 'mcp', 'openai', 'sentence_transformers', 'torch', "
         "'transformers', 'uvicorn', 'vllm'}; "
         "print(json.dumps(sorted(blocked.intersection(sys.modules))))"
     )
@@ -47,7 +47,6 @@ def test_base_import_does_not_load_optional_protocols() -> None:
 def test_full_modal_contract_is_exported_from_the_package_root() -> None:
     package = importlib.import_module("mindbridge")
     names = {
-        "URL",
         "Blob",
         "AssetRef",
         "ContentAtom",
@@ -55,14 +54,14 @@ def test_full_modal_contract_is_exported_from_the_package_root() -> None:
         "MemoryType",
         "Modality",
         "EmbeddingBackend",
+        "GenerationBackend",
         "JinaOmniEmbedder",
-        "ModelBackend",
-        "ModelCapabilities",
         "ModelInput",
-        "OpenAIHTTP",
+        "OpenAIModels",
         "EmbedTask",
         "SentenceTransformersEmbedder",
         "SpeakerNotFoundError",
+        "TranscriptionBackend",
     }
 
     assert names <= set(package.__all__)
@@ -98,18 +97,18 @@ def _benchmark_references(path: Path) -> set[str]:
 
 
 def test_console_script_targets_exist() -> None:
-    assert set(SCRIPTS) == {"mindbridge", "mindbridge-bench", "mindbridge-mcp"}
+    assert set(SCRIPTS) == {"mindbridge-bench"}
     for target in SCRIPTS.values():
         module_name, attribute = target.split(":", 1)
         assert callable(getattr(importlib.import_module(module_name), attribute))
 
 
 def test_dependency_surface_is_exact() -> None:
-    assert {_name(item) for item in DEPENDENCIES} == {"httpx", "pydantic", "zvec"}
+    assert {_name(item) for item in DEPENDENCIES} == {"pydantic", "zvec"}
     assert {extra: {_name(item) for item in items} for extra, items in EXTRAS.items()} == {
         "benchmarks": {"huggingface-hub", "pyarrow"},
+        "openai": {"openai"},
         "local": {"funasr", "librosa", "numpy", "sentence-transformers", "soundfile"},
-        "vllm": {"vllm"},
         "server": {"fastapi", "starlette", "uvicorn"},
         "mcp": {"mcp"},
     }
@@ -138,7 +137,7 @@ def _name(requirement: str) -> str:
     "modules",
     [
         ("mindbridge", "mindbridge.memory", "mindbridge.infrastructure.local"),
-        ("mindbridge.api.app", "mindbridge.api.errors", "mindbridge.server"),
+        ("mindbridge.api.app", "mindbridge.api.errors"),
         ("mindbridge.api.mcp",),
     ],
     ids=("base", "server", "mcp"),

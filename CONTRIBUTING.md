@@ -18,7 +18,7 @@ uv sync --all-groups --all-extras
 For core and REST work without the optional MCP transport:
 
 ```bash
-uv sync --all-groups --extra local --extra server
+uv sync --all-groups --extra local --extra openai --extra server
 ```
 
 `uv sync` is exact. Add extras to the same command instead of running a second, narrower sync that
@@ -93,7 +93,7 @@ The supported local path is intentionally direct:
 
 ```text
 Memory -> SQLite transaction -> durable outbox -> Zvec flush
-       -> model HTTP endpoint
+       -> provider SDK adapter
 ```
 
 - SQLite owns memory records, canonical embeddings, configuration metadata, and pending index

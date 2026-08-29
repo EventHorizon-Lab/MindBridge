@@ -1,26 +1,27 @@
 # Extension status
 
 MindBridge v0.2 does not expose a runtime plugin registry. The supported implementation is one
-direct path from `Memory` to SQLite, Zvec, an explicit `EmbeddingBackend`, and a model backend.
+direct path from `Memory` to SQLite, Zvec, and explicit operation backends.
 
 This is deliberate:
 
 - There is one authoritative storage implementation.
 - There is one derived search implementation.
-- `SentenceTransformersEmbedder` covers standard local models; `JinaOmniEmbedder` isolates the one
-  provider-specific contract required by the default model.
-- OpenAI-compatible endpoints cover cloud model routing without a provider registry.
+- `SentenceTransformersEmbedder` covers standard local models; `JinaOmniEmbedder` isolates Jina's
+  provider-specific input contract.
+- The official OpenAI SDK adapter covers compatible cloud endpoints without a provider registry;
+  other services use their provider SDK behind the narrow operation protocols.
 - Constructor injection already supplies the lifecycle boundary for another implementation.
 
 Application code can extend behavior by composition:
 
 ```python
-from mindbridge import Memory
+from mindbridge import EmbeddingBackend, Memory
 
 
 class ProjectMemory:
-    def __init__(self, path: str) -> None:
-        self.memory = Memory(path)
+    def __init__(self, path: str, embedder: EmbeddingBackend) -> None:
+        self.memory = Memory(path, embedder=embedder)
 
     def remember_decision(self, text: str) -> str:
         return self.memory.add(text, metadata={"kind": "decision"}).id

@@ -1,4 +1,4 @@
-"""Pinned benchmark tasks accepted by ``mindbridge eval --tasks``."""
+"""Pinned benchmark tasks accepted by ``mindbridge-bench eval --tasks``."""
 
 from __future__ import annotations
 

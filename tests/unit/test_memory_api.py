@@ -7,6 +7,7 @@ import sqlite3
 from collections.abc import Iterable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Barrier, Event, Thread
@@ -15,7 +16,6 @@ from typing import ClassVar
 import pytest
 
 import mindbridge.memory as memory_module
-from mindbridge.config import Config
 from mindbridge.exceptions import (
     IndexUnavailableError,
     MemoryNotFoundError,
@@ -36,7 +36,6 @@ from mindbridge.infrastructure.local.zvec_index import IndexHit
 from mindbridge.memory import AsyncMemory, Memory
 from mindbridge.models.base import (
     EmbedTask,
-    ModelCapabilities,
     ModelInput,
     SpeakerEmbedding,
     SpeechAnalysis,
@@ -47,13 +46,20 @@ from mindbridge.types import AnswerResult, AssetRef, Blob, MemoryType, Modality,
 ALL_INPUT_MODALITIES = frozenset({Modality.TEXT, Modality.IMAGE, Modality.VIDEO, Modality.AUDIO})
 
 
+@dataclass(frozen=True, slots=True)
+class _Capabilities:
+    embedding: frozenset[Modality]
+    generation: frozenset[Modality]
+    transcription: frozenset[Modality]
+
+
 class _FakeModels:
     def __init__(
         self,
         *,
         model: str = "fake-embedding",
         transcription_space: str = "fake-asr:test",
-        capabilities: ModelCapabilities | None = None,
+        capabilities: _Capabilities | None = None,
     ) -> None:
         self.embed_batches: list[tuple[str, ...]] = []
         self.embed_inputs: list[tuple[ModelInput, ...]] = []
@@ -62,13 +68,17 @@ class _FakeModels:
         self.transcribe_calls: list[tuple[AssetRef, ...]] = []
         self.embedding_model = model
         self.embedding_space = f"{model}:2:test"
+        self.transcription_model = "fake-transcription"
         self.transcription_space = transcription_space
         self.embedding_dimension = 2
-        self.capabilities = capabilities or ModelCapabilities(
+        selected = capabilities or _Capabilities(
             embedding=ALL_INPUT_MODALITIES,
             generation=ALL_INPUT_MODALITIES,
             transcription=frozenset({Modality.AUDIO}),
         )
+        self.embedding_capabilities = selected.embedding
+        self.generation_capabilities = selected.generation
+        self.transcription_capabilities = selected.transcription
         self.closed = False
         self.close_calls = 0
 
@@ -108,10 +118,10 @@ class _FakeEmbedder:
         capabilities: frozenset[Modality] = ALL_INPUT_MODALITIES,
         model_id: str = "fake-separate-embedding",
     ) -> None:
-        self.capabilities = capabilities
-        self.model_id = model_id
-        self.space_id = f"{model_id}:2:test"
-        self.dimension = 2
+        self.embedding_capabilities = capabilities
+        self.embedding_model = model_id
+        self.embedding_space = f"{model_id}:2:test"
+        self.embedding_dimension = 2
         self.embed_inputs: list[tuple[ModelInput, ...]] = []
         self.embed_tasks: list[EmbedTask] = []
         self.closed = False
@@ -135,9 +145,9 @@ class _FakeEmbedder:
 
 
 class _FakeSpeech:
-    capabilities = frozenset({Modality.AUDIO, Modality.VIDEO})
-    model_id = "fake-funasr"
-    space_id = "fake-funasr:speech:test"
+    transcription_capabilities = frozenset({Modality.AUDIO, Modality.VIDEO})
+    transcription_model = "fake-funasr"
+    transcription_space = "fake-funasr:speech:test"
 
     def __init__(self) -> None:
         self.calls: list[tuple[AssetRef, ...]] = []
@@ -319,16 +329,20 @@ def _fake_index(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(memory_module, "ZvecIndex", _FakeIndex)
 
 
-def _config(
+def _memory(
+    data_dir: Path,
+    models: _FakeModels | None = None,
     *,
-    model: str = "fake-embedding",
+    embedder: _FakeEmbedder | None = None,
+    transcriber: _FakeSpeech | None = None,
     decay_half_life_days: float | None = None,
-) -> Config:
-    return Config(
-        base_url="https://models.example.test/v1",
-        embedding_model=model,
-        generation_model="fake-generation",
-        embedding_dimension=2,
+) -> Memory:
+    models = models or _FakeModels()
+    return Memory(
+        data_dir,
+        embedder=models if embedder is None else embedder,
+        answerer=models,
+        transcriber=models if transcriber is None else transcriber,
         decay_half_life_days=decay_half_life_days,
     )
 
@@ -337,7 +351,7 @@ def test_crud_search_ask_and_stable_duplicate(tmp_path: Path) -> None:
     models = _FakeModels()
     occurred_at = datetime(2026, 8, 27, 9, 30, tzinfo=timezone(timedelta(hours=8)))
 
-    with Memory(tmp_path, _config(), models=models) as memory:
+    with _memory(tmp_path, models) as memory:
         first = memory.add(
             "  red screwdriver in drawer two  ",
             occurred_at=occurred_at,
@@ -369,7 +383,7 @@ def test_crud_search_ask_and_stable_duplicate(tmp_path: Path) -> None:
 
 
 def test_memory_types_are_stable_and_filterable(tmp_path: Path) -> None:
-    with Memory(tmp_path, _config(), models=_FakeModels()) as memory:
+    with _memory(tmp_path, _FakeModels()) as memory:
         semantic = memory.add("shared instruction")
         assert memory.add("shared instruction", memory_type=MemoryType.SEMANTIC) == semantic
         episodic = memory.add("shared instruction", memory_type=MemoryType.EPISODIC)
@@ -389,7 +403,7 @@ def test_memory_types_are_stable_and_filterable(tmp_path: Path) -> None:
 def test_relative_time_prefers_event_time_and_routes_the_reference(tmp_path: Path) -> None:
     reference = datetime(2026, 8, 27, 0, 30, tzinfo=timezone(timedelta(hours=14)))
     models = _FakeModels()
-    with Memory(tmp_path, _config(), models=models) as memory:
+    with _memory(tmp_path, models) as memory:
         previous = memory.add(
             "项目评审发生了",
             occurred_at=datetime(2026, 8, 20, 9, tzinfo=timezone.utc),
@@ -416,10 +430,10 @@ def test_relative_time_prefers_event_time_and_routes_the_reference(tmp_path: Pat
 
 def test_decay_reranks_softly_and_reinforces_only_returned_hits(tmp_path: Path) -> None:
     reference = datetime(2026, 8, 27, 12, tzinfo=timezone.utc)
-    with Memory(
+    with _memory(
         tmp_path,
-        _config(decay_half_life_days=7),
-        models=_FakeModels(),
+        _FakeModels(),
+        decay_half_life_days=7,
     ) as memory:
         memory.add(
             "shared memory old",
@@ -440,11 +454,31 @@ def test_decay_reranks_softly_and_reinforces_only_returned_hits(tmp_path: Path) 
         assert stored.last_accessed_at is not None
 
 
+def test_ask_without_answerer_fails_before_retrieval_or_reinforcement(tmp_path: Path) -> None:
+    models = _FakeModels()
+    with Memory(
+        tmp_path,
+        embedder=models,
+        decay_half_life_days=7,
+    ) as memory:
+        record = memory.add("red target")
+        index = _FakeIndex.instances[-1]
+
+        with pytest.raises(ModelError, match="answer backend is not configured"):
+            memory.ask("red target")
+
+        stored = memory._store.read_memory(record.id)
+        assert stored is not None
+        assert stored.access_count == 0
+        assert models.embed_tasks == [EmbedTask.DOCUMENT]
+        assert index.hybrid_search_calls == 0
+
+
 def test_explicit_embedder_owns_embedding_and_models_own_generation(tmp_path: Path) -> None:
     models = _FakeModels()
     embedder = _FakeEmbedder(capabilities=frozenset({Modality.TEXT}))
 
-    with Memory(tmp_path, _config(), models=models, embedder=embedder) as memory:
+    with _memory(tmp_path, models, embedder=embedder) as memory:
         record = memory.add("red separate backend")
         answer = memory.ask("where is red?")
         document = _FakeIndex.instances[-1].documents[record.id]
@@ -453,8 +487,8 @@ def test_explicit_embedder_owns_embedding_and_models_own_generation(tmp_path: Pa
         assert models.embed_batches == []
         assert models.answer_calls
         assert embedder.embed_tasks == [EmbedTask.DOCUMENT, EmbedTask.QUERY]
-        assert document.embedding.model_id == embedder.model_id
-        assert document.embedding.space_id == embedder.space_id
+        assert document.embedding.model_id == embedder.embedding_model
+        assert document.embedding.space_id == embedder.embedding_space
 
         with pytest.raises(ModelError, match="image"):
             memory.add(Blob(b"unsupported image", "image/png", "frame.png"))
@@ -463,30 +497,18 @@ def test_explicit_embedder_owns_embedding_and_models_own_generation(tmp_path: Pa
     assert models.close_calls == 1
 
 
-def test_memory_defaults_to_jina_embedding(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    embedder = _FakeEmbedder(model_id="jina-default")
-    monkeypatch.setattr("mindbridge.memory.JinaOmniEmbedder", lambda: embedder)
-
-    with Memory(tmp_path, _config()) as memory:
-        memory.add("default local embedding")
-
-    assert embedder.embed_tasks == [EmbedTask.DOCUMENT]
-    assert embedder.close_calls == 1
+def test_memory_requires_an_explicit_embedder(tmp_path: Path) -> None:
+    with pytest.raises(TypeError, match="embedder"):
+        Memory(tmp_path)  # type: ignore[call-arg]
 
 
-def test_default_speech_is_lazy_and_recognizes_a_speaker_across_recordings(
-    monkeypatch: pytest.MonkeyPatch,
+def test_explicit_speech_is_lazy_and_recognizes_a_speaker_across_recordings(
     tmp_path: Path,
 ) -> None:
     embedder = _FakeEmbedder()
     transcriber = _FakeSpeech()
-    monkeypatch.setattr("mindbridge.memory.JinaOmniEmbedder", lambda: embedder)
-    monkeypatch.setattr("mindbridge.memory.FunASRTranscriber", lambda: transcriber)
 
-    with Memory(tmp_path, _config()) as memory:
+    with Memory(tmp_path, embedder=embedder, transcriber=transcriber) as memory:
         first = memory.add(Blob(b"first recording", "audio/wav", "first.wav"))
         second = memory.add(Blob(b"second recording", "audio/wav", "second.wav"))
         assert transcriber.calls == []
@@ -530,7 +552,7 @@ def test_add_many_deduplicates_one_model_and_store_batch(
         return result
 
     monkeypatch.setattr(LocalStore, "write_memories", counted_write)
-    with Memory(tmp_path, _config(), models=models) as memory:
+    with _memory(tmp_path, models) as memory:
         records = memory.add_many(("alpha", "alpha", "red beta"))
         assert [record.id for record in records] == [records[0].id, records[0].id, records[2].id]
         assert models.embed_batches == [("alpha", "red beta")]
@@ -558,7 +580,7 @@ def test_add_many_hydrates_the_index_outbox_in_batches(
             yield connection
 
     monkeypatch.setattr(LocalStore, "_connection", counted_connection)
-    with Memory(tmp_path, _config(), models=_FakeModels()) as memory:
+    with _memory(tmp_path, _FakeModels()) as memory:
         before = connection_count
         memory.add_many(tuple(f"memory {index}" for index in range(100)))
 
@@ -566,7 +588,7 @@ def test_add_many_hydrates_the_index_outbox_in_batches(
 
 
 def test_outbox_bounds_index_batches(tmp_path: Path) -> None:
-    with Memory(tmp_path, _config(), models=_FakeModels()) as memory:
+    with _memory(tmp_path, _FakeModels()) as memory:
         memory.add_many(tuple(f"memory {index}" for index in range(600)))
 
     assert [len(batch) for batch in _FakeIndex.instances[-1].upsert_calls] == [256, 256, 88]
@@ -590,7 +612,7 @@ def test_concurrent_adds_share_one_durable_index_flush(
 
     monkeypatch.setattr(LocalStore, "write_memories", synchronized_write)
     with (
-        Memory(tmp_path, _config(), models=_FakeModels()) as memory,
+        _memory(tmp_path, _FakeModels()) as memory,
         ThreadPoolExecutor(max_workers=2) as pool,
     ):
         records = tuple(pool.map(memory.add, ("first concurrent", "second concurrent")))
@@ -635,7 +657,7 @@ def test_reindex_replays_an_add_committed_after_its_sqlite_scan(
         add_committed.set()
         return result
 
-    with Memory(tmp_path, _config(), models=_FakeModels()) as memory:
+    with _memory(tmp_path, _FakeModels()) as memory:
         existing = memory.add("existing")
         monkeypatch.setattr(_FakeIndex, "rebuild", paused_rebuild)
         monkeypatch.setattr(LocalStore, "write_memories", tracked_write)
@@ -651,7 +673,7 @@ def test_reindex_replays_an_add_committed_after_its_sqlite_scan(
 
 def test_keyset_pages_reindex_optimize_and_missing_index_recovery(tmp_path: Path) -> None:
     models = _FakeModels()
-    memory = Memory(tmp_path, _config(), models=models)
+    memory = _memory(tmp_path, models)
     records = memory.add_many(("one", "two", "three", "four", "five"))
 
     seen: list[str] = []
@@ -673,7 +695,7 @@ def test_keyset_pages_reindex_optimize_and_missing_index_recovery(tmp_path: Path
     embed_calls = len(models.embed_batches)
     shutil.rmtree(tmp_path / "zvec")
     reopened_models = _FakeModels()
-    with Memory(tmp_path, _config(), models=reopened_models) as reopened:
+    with _memory(tmp_path, reopened_models) as reopened:
         assert reopened.search("one")
         assert reopened_models.embed_batches == [("one",)]
         assert len(models.embed_batches) == embed_calls
@@ -683,7 +705,7 @@ def test_missing_index_checkpoint_precedes_collection_creation(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    with Memory(tmp_path, _config(), models=_FakeModels()) as memory:
+    with _memory(tmp_path, _FakeModels()) as memory:
         records = memory.add_many(("one", "two"))
     shutil.rmtree(tmp_path / "zvec")
 
@@ -693,15 +715,15 @@ def test_missing_index_checkpoint_precedes_collection_creation(
 
     monkeypatch.setattr(memory_module, "ZvecIndex", fail_after_create)
     with pytest.raises(IndexUnavailableError, match="open"):
-        Memory(tmp_path, _config(), models=_FakeModels())
+        _memory(tmp_path, _FakeModels())
 
     monkeypatch.setattr(memory_module, "ZvecIndex", _FakeIndex)
-    with Memory(tmp_path, _config(), models=_FakeModels()):
+    with _memory(tmp_path, _FakeModels()):
         assert set(_FakeIndex.instances[-1].documents) == {record.id for record in records}
 
 
 def test_legacy_index_recipe_is_rebuilt_from_sqlite(tmp_path: Path) -> None:
-    with Memory(tmp_path, _config(), models=_FakeModels()) as memory:
+    with _memory(tmp_path, _FakeModels()) as memory:
         record = memory.add("preserved episodic memory", memory_type=MemoryType.EPISODIC)
     with LocalStore(tmp_path) as store:
         store.set_metadata(
@@ -709,26 +731,26 @@ def test_legacy_index_recipe_is_rebuilt_from_sqlite(tmp_path: Path) -> None:
             "zvec-0.7:hnsw-cosine-m50-efc500:fts-standard-lowercase:single-vector-v2",
         )
 
-    with Memory(tmp_path, _config(), models=_FakeModels()):
+    with _memory(tmp_path, _FakeModels()):
         document = _FakeIndex.instances[-1].documents[record.id]
         assert document.memory_type == "episodic"
 
 
 def test_interrupted_reindex_is_completed_from_durable_sqlite(tmp_path: Path) -> None:
     models = _FakeModels()
-    with Memory(tmp_path, _config(), models=models) as memory:
+    with _memory(tmp_path, models) as memory:
         records = memory.add_many(("one", "two", "three"))
         _FakeIndex.instances[-1].fail_next_rebuild = True
         with pytest.raises(IndexUnavailableError, match="rebuild"):
             memory.reindex()
 
-    with Memory(tmp_path, _config(), models=_FakeModels()):
+    with _memory(tmp_path, _FakeModels()):
         assert set(_FakeIndex.instances[-1].documents) == {record.id for record in records}
 
 
 def test_delete_recreate_coalesces_outbox_and_stale_hits_are_filtered(tmp_path: Path) -> None:
     models = _FakeModels()
-    with Memory(tmp_path, _config(), models=models) as memory:
+    with _memory(tmp_path, models) as memory:
         record = memory.add("red notebook")
         index = _FakeIndex.instances[-1]
         index.hits_override = (
@@ -755,24 +777,20 @@ def test_data_directories_are_isolated_and_metadata_changes_fail_fast(tmp_path: 
     first_models = _FakeModels()
     second_models = _FakeModels()
     with (
-        Memory(tmp_path / "first", _config(), models=first_models) as first,
-        Memory(tmp_path / "second", _config(), models=second_models) as second,
+        _memory(tmp_path / "first", first_models) as first,
+        _memory(tmp_path / "second", second_models) as second,
     ):
         with pytest.raises(StorageError, match="already in use"):
-            Memory(tmp_path / "first", _config(), models=_FakeModels())
+            _memory(tmp_path / "first", _FakeModels())
         record = first.add("red item only in first")
         assert second.search("red item") == ()
         assert second.list().items == ()
         assert first.get(record.id).id == record.id
 
     with pytest.raises(StorageError, match="metadata mismatch"):
-        Memory(tmp_path / "first", _config(), models=_FakeModels(model="different-model"))
+        _memory(tmp_path / "first", _FakeModels(model="different-model"))
     with pytest.raises(StorageError, match=r"transcription\.space_id"):
-        Memory(
-            tmp_path / "second",
-            _config(),
-            models=_FakeModels(transcription_space="different-asr"),
-        )
+        _memory(tmp_path / "second", _FakeModels(transcription_space="different-asr"))
 
 
 def test_invalid_zvec_embedding_space_cannot_poison_store_metadata(tmp_path: Path) -> None:
@@ -780,9 +798,9 @@ def test_invalid_zvec_embedding_space_cannot_poison_store_metadata(tmp_path: Pat
     invalid.embedding_space = "invalid'space"
 
     with pytest.raises(ValidationError, match="unsupported by Zvec"):
-        Memory(tmp_path, _config(), models=invalid)
+        _memory(tmp_path, invalid)
 
-    with Memory(tmp_path, _config(), models=_FakeModels()) as memory:
+    with _memory(tmp_path, _FakeModels()) as memory:
         assert memory.add("valid after rejected contract").content
 
 
@@ -791,7 +809,7 @@ def test_path_media_uses_native_dense_search_and_cas_lifecycle(tmp_path: Path) -
     source.write_bytes(b"stored image")
     models = _FakeModels()
 
-    with Memory(tmp_path / "memory", _config(), models=models) as memory:
+    with _memory(tmp_path / "memory", models) as memory:
         record = memory.add(source)
         assert record.content == ""
         assert record.modality is Modality.IMAGE
@@ -828,7 +846,7 @@ def test_persisted_media_reads_do_not_run_gc_ownership_queries(
         return original(store, asset_ids)
 
     monkeypatch.setattr(LocalStore, "read_unreferenced_assets", counted)
-    with Memory(tmp_path, _config(), models=_FakeModels()) as memory:
+    with _memory(tmp_path, _FakeModels()) as memory:
         record = memory.add(("red image", Blob(b"stored", "image/png", "stored.png")))
         calls = 0
 
@@ -840,7 +858,7 @@ def test_persisted_media_reads_do_not_run_gc_ownership_queries(
 
 
 def test_duplicate_asset_names_return_authoritative_cas_metadata(tmp_path: Path) -> None:
-    with Memory(tmp_path, _config(), models=_FakeModels()) as memory:
+    with _memory(tmp_path, _FakeModels()) as memory:
         record = memory.add(
             (
                 Blob(b"same image", "image/png", "first.png"),
@@ -854,7 +872,7 @@ def test_duplicate_asset_names_return_authoritative_cas_metadata(tmp_path: Path)
 
 def test_add_many_transcribes_one_shared_asset_once(tmp_path: Path) -> None:
     models = _FakeModels(
-        capabilities=ModelCapabilities(
+        capabilities=_Capabilities(
             embedding=frozenset({Modality.TEXT}),
             generation=frozenset({Modality.TEXT}),
             transcription=frozenset({Modality.AUDIO}),
@@ -862,7 +880,7 @@ def test_add_many_transcribes_one_shared_asset_once(tmp_path: Path) -> None:
     )
     audio = Blob(b"same audio", "audio/wav", "first.wav")
 
-    with Memory(tmp_path, _config(), models=models) as memory:
+    with _memory(tmp_path, models) as memory:
         records = memory.add_many((("red first", audio), ("red second", audio)))
 
     assert len(records) == 2
@@ -875,7 +893,7 @@ def test_add_many_batches_distinct_audio_transcriptions(
     tmp_path: Path,
 ) -> None:
     models = _FakeModels(
-        capabilities=ModelCapabilities(
+        capabilities=_Capabilities(
             embedding=frozenset({Modality.TEXT}),
             generation=frozenset({Modality.TEXT}),
             transcription=frozenset({Modality.AUDIO}),
@@ -889,7 +907,7 @@ def test_add_many_batches_distinct_audio_transcriptions(
         pytest.fail("add_many wrote transcripts outside its memory transaction")
 
     monkeypatch.setattr(LocalStore, "set_asset_transcripts", unexpected_transcript_transaction)
-    with Memory(tmp_path, _config(), models=models) as memory:
+    with _memory(tmp_path, models) as memory:
         records = memory.add_many(
             (
                 Blob(b"first audio", "audio/wav", "first.wav"),
@@ -905,14 +923,14 @@ def test_add_many_batches_distinct_audio_transcriptions(
 
 def test_ask_reuses_query_transcript_for_generation(tmp_path: Path) -> None:
     models = _FakeModels(
-        capabilities=ModelCapabilities(
+        capabilities=_Capabilities(
             embedding=frozenset({Modality.TEXT}),
             generation=frozenset({Modality.TEXT}),
             transcription=frozenset({Modality.AUDIO}),
         )
     )
 
-    with Memory(tmp_path, _config(), models=models) as memory:
+    with _memory(tmp_path, models) as memory:
         memory.add("red target")
         models.transcribe_calls.clear()
         memory.ask(("find it", Blob(b"query audio", "audio/wav", "query.wav")))
@@ -926,7 +944,7 @@ def test_ask_batches_and_persists_hit_transcripts_once(
     tmp_path: Path,
 ) -> None:
     models = _FakeModels(
-        capabilities=ModelCapabilities(
+        capabilities=_Capabilities(
             embedding=ALL_INPUT_MODALITIES,
             generation=frozenset({Modality.TEXT}),
             transcription=frozenset({Modality.AUDIO}),
@@ -945,7 +963,7 @@ def test_ask_batches_and_persists_hit_transcripts_once(
 
     monkeypatch.setattr(LocalStore, "set_asset_transcripts", record_transcript_transaction)
 
-    with Memory(tmp_path, _config(), models=models) as memory:
+    with _memory(tmp_path, models) as memory:
         memory.add_many(
             (
                 ("red first", Blob(b"first hit audio", "audio/wav", "first.wav")),
@@ -974,13 +992,13 @@ def test_no_hit_ask_routes_media_and_cannot_accept_fabricated_hits(tmp_path: Pat
             return AnswerResult(answer="unknown", hits=(fabricated,))
 
     models = FabricatingModels(
-        capabilities=ModelCapabilities(
+        capabilities=_Capabilities(
             embedding=ALL_INPUT_MODALITIES,
             generation=frozenset({Modality.TEXT}),
             transcription=frozenset({Modality.AUDIO}),
         )
     )
-    with Memory(tmp_path, _config(), models=models) as memory:
+    with _memory(tmp_path, models) as memory:
         result = memory.ask(Blob(b"question audio", "audio/wav", "question.wav"))
 
     assert result.hits == ()
@@ -997,7 +1015,7 @@ def test_startup_removes_a_cas_file_without_sqlite_metadata(tmp_path: Path) -> N
     )
     assert asset_store.resolve(orphan).exists()
 
-    with Memory(tmp_path, _config(), models=_FakeModels()):
+    with _memory(tmp_path, _FakeModels()):
         assert not (tmp_path / orphan.relative_path).exists()
 
 
@@ -1005,7 +1023,7 @@ def test_delete_gc_recovers_from_index_and_file_failures(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    with Memory(tmp_path, _config(), models=_FakeModels()) as memory:
+    with _memory(tmp_path, _FakeModels()) as memory:
         record = memory.add(Blob(b"first image", "image/png", "first.png"))
         path = record.assets[0].path
         assert path is not None
@@ -1035,14 +1053,14 @@ def test_delete_gc_recovers_from_index_and_file_failures(
 
 
 def test_audio_falls_back_to_asr_while_visual_input_stays_native(tmp_path: Path) -> None:
-    capabilities = ModelCapabilities(
+    capabilities = _Capabilities(
         embedding=frozenset({Modality.TEXT, Modality.VIDEO}),
         generation=frozenset({Modality.TEXT, Modality.IMAGE, Modality.VIDEO}),
         transcription=frozenset({Modality.AUDIO}),
     )
     models = _FakeModels(capabilities=capabilities)
 
-    with Memory(tmp_path, _config(), models=models) as memory:
+    with _memory(tmp_path, models) as memory:
         record = memory.add(
             (
                 "red repair session",
@@ -1070,14 +1088,14 @@ def test_audio_falls_back_to_asr_while_visual_input_stays_native(tmp_path: Path)
 
 
 def test_vlm_generation_transcribes_audio_once_and_keeps_video(tmp_path: Path) -> None:
-    capabilities = ModelCapabilities(
+    capabilities = _Capabilities(
         embedding=ALL_INPUT_MODALITIES,
         generation=frozenset({Modality.TEXT, Modality.IMAGE, Modality.VIDEO}),
         transcription=frozenset({Modality.AUDIO}),
     )
     models = _FakeModels(capabilities=capabilities)
 
-    with Memory(tmp_path, _config(), models=models) as memory:
+    with _memory(tmp_path, models) as memory:
         record = memory.add(
             (
                 "red workbench",
@@ -1135,7 +1153,7 @@ def test_vlm_generation_recognizes_complete_speaker_identity_in_parallel(
         def transcribe(self, _assets: Sequence[AssetRef]) -> tuple[str, ...]:
             raise AssertionError("answer generation must retain complete speaker identity")
 
-    capabilities = ModelCapabilities(
+    capabilities = _Capabilities(
         embedding=ALL_INPUT_MODALITIES,
         generation=frozenset({Modality.TEXT, Modality.VIDEO}),
         transcription=frozenset({Modality.AUDIO, Modality.VIDEO}),
@@ -1143,7 +1161,7 @@ def test_vlm_generation_recognizes_complete_speaker_identity_in_parallel(
     models = ParallelModels(capabilities=capabilities)
     speech = IdentitySpeech()
 
-    with Memory(tmp_path, _config(), models=models, transcriber=speech) as memory:
+    with _memory(tmp_path, models, transcriber=speech) as memory:
         record = memory.add(
             (
                 "red recording",
@@ -1206,13 +1224,13 @@ def test_invalid_long_transcript_is_not_persisted(tmp_path: Path) -> None:
             return tuple("x" * 70_000 for _asset in batch)
 
     models = LongTranscriptModels(
-        capabilities=ModelCapabilities(
+        capabilities=_Capabilities(
             embedding=ALL_INPUT_MODALITIES,
             generation=frozenset({Modality.TEXT}),
             transcription=frozenset({Modality.AUDIO}),
         )
     )
-    with Memory(tmp_path, _config(), models=models) as memory:
+    with _memory(tmp_path, models) as memory:
         memory.add(("red audio", Blob(b"audio", "audio/wav", "audio.wav")))
 
         with pytest.raises(ModelError, match="transcription exceeded"):
@@ -1225,14 +1243,14 @@ def test_invalid_long_transcript_is_not_persisted(tmp_path: Path) -> None:
 
 def test_unsupported_visual_embedding_fails_without_leaking_media(tmp_path: Path) -> None:
     models = _FakeModels(
-        capabilities=ModelCapabilities(
+        capabilities=_Capabilities(
             embedding=frozenset({Modality.TEXT}),
             generation=frozenset({Modality.TEXT}),
             transcription=frozenset({Modality.AUDIO}),
         )
     )
 
-    with Memory(tmp_path, _config(), models=models) as memory:
+    with _memory(tmp_path, models) as memory:
         with pytest.raises(ModelError, match="image"):
             memory.add(Blob(b"unsupported image", "image/png", "frame.png"))
         assert memory.list().items == ()
@@ -1241,14 +1259,14 @@ def test_unsupported_visual_embedding_fails_without_leaking_media(tmp_path: Path
 
 def test_generation_never_silently_drops_visual_evidence(tmp_path: Path) -> None:
     models = _FakeModels(
-        capabilities=ModelCapabilities(
+        capabilities=_Capabilities(
             embedding=ALL_INPUT_MODALITIES,
             generation=frozenset({Modality.TEXT}),
             transcription=frozenset({Modality.AUDIO}),
         )
     )
 
-    with Memory(tmp_path, _config(), models=models) as memory:
+    with _memory(tmp_path, models) as memory:
         memory.add(("red diagram", Blob(b"diagram", "image/png", "diagram.png")))
         with pytest.raises(ModelError, match="image"):
             memory.ask("Show the red diagram")
@@ -1259,7 +1277,7 @@ def test_memory_rejects_oversized_and_recursive_input_before_model_work(tmp_path
     recursive: dict[str, object] = {}
     recursive["recursive"] = recursive
 
-    with Memory(tmp_path, _config(), models=models) as memory:
+    with _memory(tmp_path, models) as memory:
         with pytest.raises(ValidationError, match="65536"):
             memory.add("x" * 65_537)
         with pytest.raises(ValidationError, match="262144"):
@@ -1279,7 +1297,7 @@ def test_cas_write_failure_maps_to_storage_error(
 
     monkeypatch.setattr("mindbridge.infrastructure.local.assets.os.replace", fail_replace)
     with (
-        Memory(tmp_path, _config(), models=_FakeModels()) as memory,
+        _memory(tmp_path, _FakeModels()) as memory,
         pytest.raises(StorageError, match="materialize media"),
     ):
         memory.add(Blob(b"image", "image/png", "image.png"))
@@ -1291,7 +1309,7 @@ def test_memory_instances_cannot_be_reused_after_fork(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    memory = Memory(tmp_path, _config(), models=_FakeModels())
+    memory = _memory(tmp_path, _FakeModels())
     owner_pid = os.getpid()
     with monkeypatch.context() as changed:
         changed.setattr(os, "getpid", lambda: owner_pid + 1)
@@ -1322,7 +1340,7 @@ def test_close_waits_for_an_active_search(tmp_path: Path) -> None:
 
     models = _FakeModels()
     embedder = BlockingEmbedder()
-    memory = Memory(tmp_path, _config(), models=models, embedder=embedder)
+    memory = _memory(tmp_path, models, embedder=embedder)
     errors: list[BaseException] = []
     close_done = Event()
 
@@ -1376,7 +1394,7 @@ def test_model_work_runs_concurrently_while_index_access_stays_serialized(tmp_pa
             return super().embed(inputs, task)
 
     models = ConcurrentModels()
-    memory = Memory(tmp_path, _config(), models=models)
+    memory = _memory(tmp_path, models)
     memory.add("red concurrent memory")
     models.block_queries = True
     errors: list[BaseException] = []
@@ -1416,7 +1434,7 @@ def test_temporary_media_gc_is_not_starved_by_an_unrelated_long_request(tmp_path
             return super().embed(inputs, task)
 
     models = LongQueryModels()
-    memory = Memory(tmp_path, _config(), models=models)
+    memory = _memory(tmp_path, models)
     memory.add("red target")
     errors: list[BaseException] = []
 
@@ -1445,7 +1463,12 @@ def test_temporary_media_gc_is_not_starved_by_an_unrelated_long_request(tmp_path
 async def test_async_memory_matches_sync_surface(tmp_path: Path) -> None:
     models = _FakeModels()
     embedder = _FakeEmbedder()
-    async with AsyncMemory(tmp_path, _config(), models=models, embedder=embedder) as memory:
+    async with AsyncMemory(
+        tmp_path,
+        embedder=embedder,
+        answerer=models,
+        transcriber=models,
+    ) as memory:
         records = await memory.add_many(("red async memory", "another memory"))
         assert await memory.get(records[0].id) == records[0]
         assert (await memory.search("red async"))[0].id == records[0].id

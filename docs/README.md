@@ -9,14 +9,14 @@ MindBridge is an embedded multimodal memory library for text, image, video, audi
 - [Core concepts](concepts.md) — content, assets, identity, isolation, models, and indexing.
 - [Memory types, time, and decay](memory-types-time-and-decay.md) — cognitive roles, temporal
   retrieval, decay, research basis, and limits.
-- [Configuration](configuration.md) — endpoints, capabilities, durable model spaces, and media policy.
+- [Configuration](configuration.md) — explicit composition, provider ownership, and durable model spaces.
 
 ## APIs
 
 - [Python API](api/python-sdk.md) — `Memory`, content values, return values, and exceptions.
-- [REST API](api/rest.md) — ordered content parts, endpoints, authentication, and errors.
+- [REST API](api/rest.md) — ordered content parts, endpoints, deployment boundary, and errors.
 - [MCP API](api/mcp.md) — five typed stdio tools over one local memory.
-- [Command-line usage](api/cli.md) — server, MCP, reindex, and benchmark commands.
+- [Command-line usage](api/cli.md) — benchmark command and application-owned service startup.
 
 ## Build and run
 

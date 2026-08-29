@@ -24,11 +24,13 @@ access history or decay factor existed.
 ```python
 from datetime import datetime, timezone
 
-from mindbridge import Config, Memory, MemoryType
+from mindbridge import JinaOmniEmbedder, Memory, MemoryType
 
-config = Config(decay_half_life_days=30)
-
-with Memory("./data/agent", config=config) as memory:
+with Memory(
+    "./data/agent",
+    embedder=JinaOmniEmbedder(),
+    decay_half_life_days=30,
+) as memory:
     memory.add(
         "The deployment failed because the token had expired.",
         memory_type=MemoryType.EPISODIC,
@@ -78,8 +80,7 @@ measured temporal planner.
 
 ## Decay and reinforcement
 
-Decay is off by default. Enable it with `Config(decay_half_life_days=...)` or
-`MINDBRIDGE_DECAY_HALF_LIFE_DAYS`.
+Decay is off by default. Enable it with `Memory(decay_half_life_days=...)`.
 
 MindBridge over-fetches at least 50 candidates, computes a factor at search time, sorts by adjusted
 relevance, clamps public scores to `[0, 1]`, and returns the requested limit. The durable memory is

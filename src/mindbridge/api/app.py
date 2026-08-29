@@ -4,14 +4,11 @@ from __future__ import annotations
 
 import base64
 import binascii
-from collections.abc import AsyncIterator, Mapping, Sequence
-from contextlib import asynccontextmanager
+from collections.abc import Mapping, Sequence
 from datetime import datetime
-from pathlib import Path
 from typing import Annotated, Literal, Protocol, TypeAlias, cast
-from urllib.parse import urlsplit
 
-from fastapi import APIRouter, Depends, FastAPI, Query, Response, status
+from fastapi import APIRouter, FastAPI, Query, Response, status
 from fastapi import Path as PathParameter
 from pydantic import (
     AwareDatetime,
@@ -24,11 +21,8 @@ from pydantic import (
 )
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from mindbridge.api.auth import ApiKeyAuthenticator
 from mindbridge.api.errors import error_response, error_responses, register_error_handlers
-from mindbridge.exceptions import StorageError
 from mindbridge.types import (
-    URL,
     AnswerResult,
     AssetRef,
     Blob,
@@ -91,7 +85,7 @@ class _InputImage(_RequestModel):
     def require_one_source(self) -> _InputImage:
         _one_source(image_url=self.image_url, file_id=self.file_id)
         if self.image_url is not None:
-            _validate_url_or_data(self.image_url)
+            _validate_data_url(self.image_url)
             if self.image_url.startswith("data:"):
                 media_type, _data = _decode_data_url(self.image_url)
                 if not media_type.startswith("image/"):
@@ -117,7 +111,7 @@ class _InputFile(_RequestModel):
         }:
             raise ValueError("media_type must be image, video, or audio")
         if self.file_url is not None:
-            _validate_url_or_data(self.file_url)
+            _validate_data_url(self.file_url)
             if self.file_url.startswith("data:") and self.media_type is not None:
                 embedded_type, _data = _decode_data_url(self.file_url)
                 if not _media_type_matches(self.media_type, embedded_type):
@@ -256,35 +250,19 @@ class _Memory(Protocol):
 
     def delete(self, memory_id: str) -> bool: ...
 
-    def close(self) -> None: ...
 
+class _RequestBodyLimit:
+    """Bound `/v1` request bodies before framework parsing."""
 
-class _RequestGate:
-    """Authenticate and bound `/v1` requests before framework body parsing."""
-
-    def __init__(self, app: ASGIApp, *, authenticator: ApiKeyAuthenticator | None) -> None:
+    def __init__(self, app: ASGIApp) -> None:
         self.app = app
-        self.authenticator = authenticator
 
-    async def __call__(  # noqa: C901 - the request gate is clearest as one linear check
-        self, scope: Scope, receive: Receive, send: Send
-    ) -> None:
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http" or not _is_api_path(str(scope.get("path", ""))):
             await self.app(scope, receive, send)
             return
 
         headers = _headers(scope)
-        if self.authenticator is not None and not self.authenticator.accepts_header(
-            _one_header(headers, b"authorization")
-        ):
-            await error_response(
-                status.HTTP_401_UNAUTHORIZED,
-                "authentication_error",
-                "a valid bearer API key is required",
-                headers={"WWW-Authenticate": "Bearer"},
-            )(scope, receive, send)
-            return
-
         content_length = _content_length(headers)
         if content_length is not None and content_length > _MAX_REQUEST_BODY_BYTES:
             await _request_too_large()(scope, receive, send)
@@ -316,45 +294,20 @@ class _RequestGate:
         await self.app(scope, replay, send)
 
 
-def create_app(  # noqa: C901 - route declarations are clearer together
+def create_app(
     *,
-    memory: _Memory | None = None,
-    data_dir: str | Path = ".mindbridge",
-    api_key: str | None = None,
+    memory: _Memory,
 ) -> FastAPI:
-    """Create one API process; its ``Memory`` instance is its isolation boundary."""
-    authenticator = ApiKeyAuthenticator(api_key) if api_key is not None else None
-    owns_memory = memory is None
-    service = memory
-
-    @asynccontextmanager
-    async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
-        nonlocal service
-        if owns_memory:
-            from mindbridge.memory import Memory
-
-            service = Memory(data_dir=data_dir)
-        try:
-            yield
-        finally:
-            if owns_memory and service is not None:
-                service.close()
-                service = None
+    """Create an unauthenticated API over one caller-owned memory instance."""
 
     def current_service() -> _Memory:
-        if service is None:
-            raise StorageError("the MindBridge API has not started")
-        return service
+        return memory
 
-    app = FastAPI(title="MindBridge", version="0.2.0", lifespan=lifespan)
+    app = FastAPI(title="MindBridge", version="0.2.0")
     register_error_handlers(app)
-    app.add_middleware(_RequestGate, authenticator=authenticator)
+    app.add_middleware(_RequestBodyLimit)
     router = APIRouter(prefix="/v1")
-    if authenticator is not None:
-        router.dependencies.append(Depends(authenticator))
-    authentication_errors = (status.HTTP_401_UNAUTHORIZED,) if authenticator is not None else ()
     standard_statuses = (
-        *authentication_errors,
         status.HTTP_413_CONTENT_TOO_LARGE,
         status.HTTP_422_UNPROCESSABLE_CONTENT,
         status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -478,7 +431,7 @@ def create_app(  # noqa: C901 - route declarations are clearer together
 def _content_input(content: _Content) -> ContentInput:
     if isinstance(content, str):
         return content
-    atoms: list[str | URL | Blob | AssetRef] = []
+    atoms: list[str | Blob | AssetRef] = []
     for part in content:
         if isinstance(part, _InputText):
             atoms.append(part.text)
@@ -486,9 +439,7 @@ def _content_input(content: _Content) -> ContentInput:
             if part.file_id is not None:
                 atoms.append(AssetRef(id=part.file_id, modality=Modality.IMAGE))
             else:
-                atoms.append(
-                    _url_or_blob(cast(str, part.image_url), media_type="image/*", name=None)
-                )
+                atoms.append(_data_blob(cast(str, part.image_url), media_type="image/*", name=None))
         elif part.file_id is not None:
             atoms.append(_file_reference(part.file_id, part.media_type))
         elif part.file_data is not None:
@@ -501,7 +452,7 @@ def _content_input(content: _Content) -> ContentInput:
             )
         else:
             atoms.append(
-                _url_or_blob(
+                _data_blob(
                     cast(str, part.file_url),
                     media_type=part.media_type,
                     name=part.filename,
@@ -518,18 +469,16 @@ def _file_reference(file_id: str, media_type: str | None) -> AssetRef:
     return AssetRef(id=file_id, media_type=media_type)
 
 
-def _url_or_blob(
+def _data_blob(
     value: str,
     *,
     media_type: str | None = None,
     name: str | None,
-) -> URL | Blob:
-    if value.startswith("data:"):
-        embedded_type, data = _decode_data_url(value)
-        if media_type is not None and not _media_type_matches(media_type, embedded_type):
-            raise ValueError("media_type contradicts the data URL")
-        return Blob(data=data, media_type=embedded_type, name=name)
-    return URL(value=value, media_type=media_type, name=name)
+) -> Blob:
+    embedded_type, data = _decode_data_url(value)
+    if media_type is not None and not _media_type_matches(media_type, embedded_type):
+        raise ValueError("media_type contradicts the data URL")
+    return Blob(data=data, media_type=embedded_type, name=name)
 
 
 def _one_source(**sources: object) -> None:
@@ -543,19 +492,10 @@ def _media_type_matches(expected: str, actual: str) -> bool:
     )
 
 
-def _validate_url_or_data(value: str) -> None:
-    if value.startswith("data:"):
-        _decode_data_url(value)
-        return
-    parsed = urlsplit(value)
-    if (
-        parsed.scheme != "https"
-        or parsed.hostname is None
-        or parsed.username is not None
-        or parsed.password is not None
-        or parsed.fragment
-    ):
-        raise ValueError("source must be an HTTPS URL without credentials or a fragment")
+def _validate_data_url(value: str) -> None:
+    if not value.startswith("data:"):
+        raise ValueError("remote URLs are not accepted; fetch media before calling MindBridge")
+    _decode_data_url(value)
 
 
 def _decode_data_url(value: str) -> tuple[str, bytes]:

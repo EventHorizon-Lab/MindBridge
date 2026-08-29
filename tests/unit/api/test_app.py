@@ -20,7 +20,6 @@ from mindbridge.exceptions import (
     ValidationError,
 )
 from mindbridge.types import (
-    URL,
     AnswerResult,
     AssetRef,
     Blob,
@@ -33,7 +32,6 @@ from mindbridge.types import (
 )
 
 NOW = datetime(2026, 8, 27, 12, 0, tzinfo=timezone.utc)
-API_KEY = "one-private-api-key"
 ASSET = AssetRef(
     id="asset_image",
     modality=Modality.IMAGE,
@@ -210,6 +208,7 @@ def test_ordered_content_parts_map_to_public_inputs_without_exposing_asset_paths
     memory = FakeMemory()
     image_data = base64.b64encode(b"png").decode()
     audio_data = base64.b64encode(b"wav").decode()
+    video_data = base64.b64encode(b"video").decode()
 
     with TestClient(create_app(memory=memory)) as client:
         created = client.post(
@@ -219,7 +218,7 @@ def test_ordered_content_parts_map_to_public_inputs_without_exposing_asset_paths
                     {"type": "input_text", "text": "  At the station.  "},
                     {
                         "type": "input_image",
-                        "image_url": "https://media.example/frame.png",
+                        "image_url": f"data:image/png;base64,{image_data}",
                     },
                     {
                         "type": "input_file",
@@ -253,7 +252,7 @@ def test_ordered_content_parts_map_to_public_inputs_without_exposing_asset_paths
                 "question": [
                     {
                         "type": "input_file",
-                        "file_url": "https://media.example/clip.mp4",
+                        "file_url": f"data:video/mp4;base64,{video_data}",
                         "media_type": "video/mp4",
                         "filename": "clip.mp4",
                     }
@@ -267,12 +266,12 @@ def test_ordered_content_parts_map_to_public_inputs_without_exposing_asset_paths
     added = memory.calls[0][1]
     assert isinstance(added, tuple)
     assert added[0] == "At the station."
-    assert added[1] == URL("https://media.example/frame.png", "image/*")
+    assert added[1] == Blob(b"png", "image/png")
     assert added[2] == Blob(b"wav", "audio/wav", "note.wav")
     assert added[3] == AssetRef(id="asset_existing", media_type="video/mp4")
     assert added[4] == AssetRef(id="asset_existing_image", modality=Modality.IMAGE)
     assert memory.calls[1][1] == (Blob(b"png", "image/png"),)
-    assert memory.calls[2][1] == (URL("https://media.example/clip.mp4", "video/mp4", "clip.mp4"),)
+    assert memory.calls[2][1] == (Blob(b"video", "video/mp4", "clip.mp4"),)
     body = created.json()
     assert body["content"] == "Multimodal memory."
     assert body["modality"] == "image"
@@ -421,73 +420,23 @@ def test_unexpected_and_framework_errors_keep_the_flat_envelope() -> None:
     assert set(missing.json()) == {"code", "message", "trace_id", "issues"}
 
 
-def test_optional_api_key_protects_v1_but_not_health() -> None:
-    app = create_app(memory=FakeMemory(), api_key=API_KEY)
-    with TestClient(app) as client:
-        health = client.get("/healthz")
-        missing = client.get("/v1/memories")
-        invalid = client.get(
-            "/v1/memories",
-            headers={"Authorization": "Bearer wrong"},
-        )
-        allowed = client.get(
-            "/v1/memories",
-            headers={"Authorization": f"Bearer {API_KEY}"},
-        )
-
-    assert health.status_code == 200
-    assert missing.status_code == invalid.status_code == 401
-    assert missing.headers["WWW-Authenticate"] == "Bearer"
-    assert invalid.json()["code"] == "authentication_error"
-    assert API_KEY not in invalid.text
-    assert allowed.status_code == 200
-
-
-def test_authentication_and_size_limits_run_before_body_parsing() -> None:
+def test_size_limit_runs_before_body_parsing() -> None:
     memory = FakeMemory()
-    app = create_app(memory=memory, api_key=API_KEY)
+    app = create_app(memory=memory)
 
     with TestClient(app) as client:
-        unauthenticated = client.post("/v1/memories", content=b"{")
+        malformed = client.post("/v1/memories", content=b"{")
         oversized = client.post(
             "/v1/memories",
             content=b"",
-            headers={
-                "Authorization": f"Bearer {API_KEY}",
-                "Content-Length": str(8 * 1024 * 1024 + 1),
-            },
+            headers={"Content-Length": str(8 * 1024 * 1024 + 1)},
         )
 
-    assert unauthenticated.status_code == 401
-    assert unauthenticated.json()["code"] == "authentication_error"
+    assert malformed.status_code == 422
+    assert malformed.json()["code"] == "validation_error"
     assert oversized.status_code == 413
     assert oversized.json()["code"] == "request_too_large"
     assert memory.calls == []
-
-
-def test_lifespan_closes_only_a_factory_owned_memory(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    owned = FakeMemory()
-    open_count = 0
-
-    def create_memory(*, data_dir: str | Path) -> FakeMemory:
-        nonlocal open_count
-        assert Path(data_dir) == tmp_path
-        open_count += 1
-        return owned
-
-    monkeypatch.setattr("mindbridge.memory.Memory", create_memory)
-    app = create_app(data_dir=tmp_path)
-    assert open_count == 0
-
-    with TestClient(app) as client:
-        assert client.get("/healthz").status_code == 200
-        assert open_count == 1
-        assert owned.close_count == 0
-
-    assert owned.close_count == 1
 
 
 def _record(

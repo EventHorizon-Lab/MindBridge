@@ -3,13 +3,13 @@
 from mindbridge.models.base import (
     EmbeddingBackend,
     EmbedTask,
-    ModelBackend,
-    ModelCapabilities,
+    GenerationBackend,
     ModelInput,
     SpeakerEmbedding,
     SpeechAnalysis,
     SpeechBackend,
     SpeechTurn,
+    TranscriptionBackend,
 )
 from mindbridge.models.funasr import (
     DEFAULT_FUNASR_MODEL_ID,
@@ -45,13 +45,13 @@ __all__ = [
     "EmbeddingBackend",
     "FunASRRecipe",
     "FunASRTranscriber",
+    "GenerationBackend",
     "JinaOmniEmbedder",
-    "ModelBackend",
-    "ModelCapabilities",
     "ModelInput",
     "SentenceTransformersEmbedder",
     "SpeakerEmbedding",
     "SpeechAnalysis",
     "SpeechBackend",
     "SpeechTurn",
+    "TranscriptionBackend",
 ]

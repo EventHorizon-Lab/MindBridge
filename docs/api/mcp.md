@@ -5,36 +5,45 @@ The optional MCP adapter exposes five typed tools over one local `Memory` throug
 ## Install and run
 
 ```bash
-uv add "mindbridge[local,mcp]"
-mindbridge mcp --data-dir /var/lib/mindbridge/assistant
+uv add "mindbridge[local,mcp,openai]"
 ```
 
-The equivalent standalone entry point is:
+Host the adapter in application code so provider clients and their lifecycle remain explicit:
 
-```bash
-mindbridge-mcp --data-dir /var/lib/mindbridge/assistant
+```python
+from openai import OpenAI
+
+from mindbridge import JinaOmniEmbedder, Memory, OpenAIModels
+from mindbridge.api.mcp import build_mcp_server
+
+with OpenAI() as client:
+    with Memory(
+        "/var/lib/mindbridge/assistant",
+        embedder=JinaOmniEmbedder(),
+        answerer=OpenAIModels(generation_client=client),
+    ) as memory:
+        build_mcp_server(memory).run("stdio")
 ```
 
-The MCP process owns the directory until it exits. Do not run REST, another MCP process, or a
-Python `Memory` against the same path concurrently.
+The application owns the provider client and `Memory`. Do not run REST, another MCP process, or a
+second Python `Memory` against the same path concurrently.
 
 ## Multimodal content
 
 `content`, `query`, and `question` accept a non-blank string or 1 through 16 ordered parts:
 
 - `{"type":"input_text","text":"..."}`
-- `{"type":"input_image","image_url":"https://..."}`
+- `{"type":"input_image","image_url":"data:image/png;base64,..."}`
 - `{"type":"input_image","file_id":"..."}`
-- `{"type":"input_file","file_url":"https://...","media_type":"video/mp4"}`
+- `{"type":"input_file","file_url":"data:video/mp4;base64,..."}`
 - `{"type":"input_file","file_data":"<base64>","media_type":"audio/wav"}`
 - `{"type":"input_file","file_id":"..."}`
 
-Source fields are mutually exclusive. HTTPS URLs require an explicitly allowed hostname. Inline
-base64 is length-checked before decoding and byte-checked afterward; `file_data` has an 8 MiB
-decoded ceiling, while URL/data source strings have a tighter 8,192-character schema limit. Local
-paths, `file:` URLs, unknown nested fields, and `input_image.detail` are rejected. Use the Python
-API for direct `Path` input. Each HTTPS redirect is independently resolved and connected through a
-verified public IP; concrete MIME hints match exactly and family hints match only that family.
+Source fields are mutually exclusive. Inline base64 is length-checked before decoding and
+byte-checked afterward; `file_data` has an 8 MiB decoded ceiling, while data URL strings have a
+tighter 8,192-character schema limit. Remote URLs, local paths, `file:` URLs, unknown nested
+fields, and `input_image.detail` are rejected. Fetch remote media in the host application or use
+the Python API for direct `Path` input.
 
 ## Tools
 
@@ -62,7 +71,7 @@ Example arguments:
     {"type": "input_text", "text": "Design review recording"},
     {
       "type": "input_file",
-      "file_url": "https://media.example/review.mp4",
+      "file_data": "AAAA",
       "media_type": "video/mp4"
     }
   ],
@@ -142,25 +151,25 @@ native-index details are not included.
 
 ## Programmatic adapter
 
-Applications embedding MCP may pass an existing synchronous or asynchronous memory:
+Applications embedding MCP pass an existing synchronous memory:
 
 ```python
-from mindbridge import Memory
+from mindbridge import JinaOmniEmbedder, Memory
 from mindbridge.api.mcp import build_mcp_server
 
-with Memory("./data/agent") as memory:
+with Memory("./data/agent", embedder=JinaOmniEmbedder()) as memory:
     server = build_mcp_server(memory)
     server.run("stdio")
 ```
 
-`build_mcp_server` does not take ownership of the supplied instance. `run_mcp(data_dir)` creates
-and closes its own `Memory`.
+`build_mcp_server` does not take ownership of the supplied instance.
+The MCP SDK runs these synchronous tool functions in its AnyIO worker pool; MindBridge does not
+maintain a second sync/async dispatch layer.
 
 ## Current limits
 
 MCP mirrors the five common single-record agent operations. Batch addition, listing, reindexing,
-and optimization remain Python or CLI operations. There is no large-file upload tool, local-path
-input, logical scope, chunking option, per-asset vector control, or learned reranker option. The
-built-in `data` model transport separately rejects embedding or generation calls above 64 MiB of
-aggregate raw media, and built-in answer text evidence is limited to 4 MiB. Larger video needs
-co-located `file` transport or a custom streaming/upload backend.
+and optimization remain Python operations. There is no large-file upload tool, local-path input,
+logical scope, chunking option, per-asset vector control, or learned reranker option. The OpenAI
+adapter inlines at most 64 MiB of raw media per embedding or generation call, and answer text
+evidence is limited to 4 MiB. Use a provider-specific upload adapter for larger media.

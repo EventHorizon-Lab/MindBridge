@@ -5,25 +5,37 @@ The optional FastAPI adapter exposes the same local `Memory` core under `/v1`.
 ## Start the API
 
 ```bash
-uv add "mindbridge[local,server]"
-mindbridge serve --data-dir .mindbridge
+uv add "mindbridge[local,openai,server]"
 ```
 
-This development command binds to loopback with one worker and no inbound authentication. OpenAPI
-JSON is served at `/openapi.json`, Swagger UI at `/docs`, and ReDoc at `/redoc`. See
-[deployment](../deployment.md) before exposing the service.
+Construct `Memory` and provider clients in the host application, then pass the instance to
+`create_app(memory=...)`:
 
-## Authentication and request limits
+```python
+from openai import OpenAI
 
-When `create_app(api_key="...")` is configured, every `/v1` request requires:
+from mindbridge import JinaOmniEmbedder, Memory, OpenAIModels
+from mindbridge.api import create_app
 
-```text
-Authorization: Bearer your-service-key
+client = OpenAI(timeout=30.0, max_retries=3)
+memory = Memory(
+    ".mindbridge",
+    embedder=JinaOmniEmbedder(),
+    answerer=OpenAIModels(generation_client=client),
+)
+app = create_app(memory=memory)
 ```
 
-`/healthz` is unauthenticated. The inbound service key is unrelated to outbound model keys.
-Authentication is checked before body parsing. Each `/v1` request body is limited to 8 MiB,
-including JSON and base64 overhead.
+Host it with the application's ASGI stack, register shutdown hooks for `memory` and `client`, and
+use exactly one worker for a directory. OpenAPI JSON is served at `/openapi.json`, Swagger UI at
+`/docs`, and ReDoc at `/redoc`. See [deployment](../deployment.md) before exposing the service.
+
+## Deployment authentication and request limits
+
+MindBridge does not implement an identity or token system. `create_app()` returns an
+unauthenticated ASGI application so a deployment can use its existing API gateway, service mesh,
+or Starlette/FastAPI authentication middleware. Each `/v1` request body is limited to 8 MiB before
+parsing, including JSON and base64 overhead.
 
 ## Content input
 
@@ -43,7 +55,7 @@ Supply exactly one of `image_url` or `file_id`:
 ```json
 {
   "type": "input_image",
-  "image_url": "https://media.example/prototype.png"
+  "image_url": "data:image/png;base64,iVBORw0KGgo="
 }
 ```
 
@@ -54,12 +66,9 @@ Supply exactly one of `image_url` or `file_id`:
 }
 ```
 
-`image_url` may instead be a base64 `data:image/...` URL. URL/data source strings are limited to
-8,192 characters. HTTPS hosts must be explicitly enabled with `MINDBRIDGE_ALLOWED_URL_HOSTS`;
-each redirect resolves and pins its connection to a verified public IP. A concrete MIME hint must
-match response `Content-Type` exactly; a family hint must match its media family. The OpenAI
-`detail` field is not accepted because MindBridge does not currently carry a sampling-detail
-contract.
+`image_url` accepts only a base64 `data:image/...` URL and is limited to 8,192 characters. Remote
+URLs are rejected; fetch them with the host application's HTTP client. The OpenAI `detail` field
+is not accepted because MindBridge does not currently carry a sampling-detail contract.
 
 ### File part
 
@@ -69,7 +78,7 @@ Use `input_file` for image, video, or audio. Supply exactly one of `file_url`, `
 ```json
 {
   "type": "input_file",
-  "file_url": "https://media.example/demo.mp4",
+  "file_url": "data:video/mp4;base64,AAAA",
   "media_type": "video/mp4",
   "filename": "demo.mp4"
 }
@@ -92,9 +101,8 @@ Use `input_file` for image, video, or audio. Supply exactly one of `file_url`, `
 ```
 
 `file_data` is raw base64 without a `data:` prefix and requires a concrete MIME type. `file_url`
-accepts HTTPS or a base64 data URL. For HTTPS, `media_type` may be concrete, a family hint such as
-`video/*`, or omitted when a common suffix determines it. Local paths and `file:` URLs are never
-accepted over REST.
+accepts only a base64 data URL. Remote URLs, local paths, and `file:` URLs are never accepted over
+REST.
 
 ## Response objects
 
@@ -153,7 +161,7 @@ Content-Type: application/json
     {"type": "input_text", "text": "The prototype after the review"},
     {
       "type": "input_image",
-      "image_url": "https://media.example/prototype.png"
+      "file_id": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
     }
   ],
   "memory_type": "episodic",
@@ -303,7 +311,6 @@ Every error response has one flat shape:
 
 | Status | Typical code | Meaning |
 | --- | --- | --- |
-| 401 | `authentication_error` | Missing or invalid bearer service key |
 | 413 | `request_too_large` | Request body exceeds 8 MiB |
 | 404 | `memory_not_found` | `GET` memory ID does not exist |
 | 422 | `validation_error` | Request, media source, or public input is invalid |
@@ -317,8 +324,7 @@ messages intentionally avoid provider, local path, or native-index details.
 ## Current limits
 
 The REST API has no local-path input, large-file upload endpoint, update route, metadata filter,
-logical scope parameter, chunking contract, per-asset vectors, or learned reranker. Use Python
-`Path` or an allowed HTTPS `URL` for media too large to place in one JSON request. The built-in `data` model
-transport separately rejects embedding or generation calls above 64 MiB of aggregate raw media;
-answer text evidence is limited to 4 MiB. Large video requires trusted co-located `file` transport
-or a custom streaming/upload backend.
+logical scope parameter, chunking contract, per-asset vectors, or learned reranker. Fetch large
+media in the host application and use the Python `Path`/`Blob` contract or a provider-specific
+adapter. The OpenAI adapter inlines at most 64 MiB of raw media per embedding or generation call;
+answer text evidence is limited to 4 MiB.

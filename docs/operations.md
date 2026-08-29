@@ -60,9 +60,12 @@ transcript-affecting recipe used by cached transcripts and add-time derived text
 Use the Python API while holding the only live instance:
 
 ```python
-from mindbridge import Memory
+from mindbridge import JinaOmniEmbedder, Memory
 
-with Memory("/var/lib/mindbridge/assistant") as memory:
+with Memory(
+    "/var/lib/mindbridge/assistant",
+    embedder=JinaOmniEmbedder(),
+) as memory:
     indexed = memory.reindex()
     memory.optimize()
     print(f"indexed {indexed} memories")
@@ -71,13 +74,6 @@ with Memory("/var/lib/mindbridge/assistant") as memory:
 `reindex()` rebuilds the derived collection from SQLite. `optimize()` compacts and flushes staged
 Zvec data. Both can be I/O intensive; schedule them when request traffic is low and ensure enough
 free disk space.
-
-The equivalent stopped-service commands are:
-
-```bash
-mindbridge reindex --data-dir /var/lib/mindbridge/assistant
-mindbridge optimize --data-dir /var/lib/mindbridge/assistant
-```
 
 Routine adds, deletes, and searches drain the durable outbox automatically. Do not edit
 `search_index_queue` by hand.
@@ -91,9 +87,8 @@ Track at least:
 - Free bytes and inodes on the containing filesystem.
 - Add and search latency.
 - Embedding, generation, and transcription latency/failures separately.
-- Raw media bytes per built-in embedding/generation call; `data` transport rejects aggregates over
-  64 MiB before base64 expansion.
-- Remote media download failures and rejected hosts.
+- Raw media bytes per OpenAI adapter call; inline payloads reject aggregates over 64 MiB before
+  base64 expansion.
 - REST status counts, especially 502 and 503.
 - Startup and rebuild duration.
 
