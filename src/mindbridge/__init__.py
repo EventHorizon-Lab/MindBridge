@@ -19,6 +19,7 @@ from mindbridge.models.base import (
     SpeechAnalysis,
     SpeechBackend,
     SpeechTurn,
+    StreamingGenerationBackend,
     TranscriptionBackend,
 )
 from mindbridge.models.funasr import (
@@ -79,6 +80,7 @@ __all__ = [
     "SpeechBackend",
     "SpeechTurn",
     "StorageError",
+    "StreamingGenerationBackend",
     "TranscriptionBackend",
     "ValidationError",
 ]

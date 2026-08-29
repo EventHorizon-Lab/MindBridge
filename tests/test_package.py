@@ -61,6 +61,7 @@ def test_full_modal_contract_is_exported_from_the_package_root() -> None:
         "EmbedTask",
         "SentenceTransformersEmbedder",
         "SpeakerNotFoundError",
+        "StreamingGenerationBackend",
         "TranscriptionBackend",
     }
 
@@ -104,9 +105,14 @@ def test_console_script_targets_exist() -> None:
 
 
 def test_dependency_surface_is_exact() -> None:
-    assert {_name(item) for item in DEPENDENCIES} == {"pydantic", "zvec"}
+    assert {_name(item) for item in DEPENDENCIES} == {
+        "opentelemetry-api",
+        "pydantic",
+        "zvec",
+    }
     assert {extra: {_name(item) for item in items} for extra, items in EXTRAS.items()} == {
-        "benchmarks": {"huggingface-hub", "nltk", "pyarrow"},
+        "benchmarks": {"huggingface-hub", "nltk", "opentelemetry-sdk", "pyarrow"},
+        "observability": {"opentelemetry-sdk"},
         "openai": {"openai"},
         "local": {"funasr", "librosa", "numpy", "sentence-transformers", "soundfile"},
         "server": {"fastapi", "starlette", "uvicorn"},
@@ -121,7 +127,6 @@ def test_dependency_surface_is_exact() -> None:
         "celery",
         "redis",
         "boto",
-        "opentelemetry",
         "edge",
         "media",
         "cloud-models",

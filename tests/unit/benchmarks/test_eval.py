@@ -110,6 +110,31 @@ def test_lmms_style_task_listing(capsys: pytest.CaptureFixture[str], tmp_path: P
     assert "video-mme-v2" in output
 
 
+def test_result_table_includes_per_task_time_and_tokens() -> None:
+    output = eval_module._table(
+        {
+            "tasks": [
+                {
+                    "task": "fixture",
+                    "primary_metric": "accuracy",
+                    "score": {"mean": 1.0, "confidence_interval_95": None},
+                    "question_count": 2,
+                    "error_count": 0,
+                    "performance": {
+                        "duration_seconds": {"total": 2.5, "average": 1.25},
+                        "token_usage": {"total_tokens": 30, "average_tokens": 15.0},
+                    },
+                }
+            ]
+        }
+    )
+
+    assert "total s" in output
+    assert "avg ms" in output
+    assert "30" in output
+    assert "15.0" in output
+
+
 def test_cluster_statistics_and_pairing_are_seeded() -> None:
     values = (
         ScoredValue("a", "first", 1.0),
@@ -347,6 +372,7 @@ def test_benchmark_speech_backend_skips_video_without_an_audio_stream(
     silent.write_bytes(b"silent")
     audible.write_bytes(b"audible")
     calls: list[tuple[AssetRef, ...]] = []
+    skipped_request_counts: list[int] = []
 
     class Backend:
         def analyze(self, assets: Sequence[AssetRef]) -> tuple[SpeechAnalysis, ...]:
@@ -354,6 +380,11 @@ def test_benchmark_speech_backend_skips_video_without_an_audio_stream(
             return tuple(SpeechAnalysis((), ()) for _asset in assets)
 
     monkeypatch.setattr(eval_module, "_has_audio", lambda path: path == audible)
+    monkeypatch.setattr(
+        eval_module,
+        "record_unmetered_model_usage",
+        lambda *, request_count: skipped_request_counts.append(request_count),
+    )
     backend = _BorrowedSpeechBackend(Backend())
     assets = (
         AssetRef("a" * 64, Modality.VIDEO, "video/mp4", 6, "a" * 64, path=silent),
@@ -362,6 +393,8 @@ def test_benchmark_speech_backend_skips_video_without_an_audio_stream(
 
     assert backend.analyze(assets) == (SpeechAnalysis((), ()), SpeechAnalysis((), ()))
     assert calls == [(assets[1],)]
+    assert backend.analyze((assets[0],)) == (SpeechAnalysis((), ()),)
+    assert skipped_request_counts == [0]
 
 
 def test_response_cache_namespace_changes_with_result_schema(

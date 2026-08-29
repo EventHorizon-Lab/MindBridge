@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from typing import Protocol, runtime_checkable
@@ -188,6 +188,17 @@ class GenerationBackend(Protocol):
     def answer(self, question: ModelInput, hits: Sequence[SearchHit]) -> AnswerResult: ...
 
     def close(self) -> None: ...
+
+
+@runtime_checkable
+class StreamingGenerationBackend(Protocol):
+    """Optional generation capability that yields answer text in provider order."""
+
+    def stream_answer(
+        self,
+        question: ModelInput,
+        hits: Sequence[SearchHit],
+    ) -> Iterator[str]: ...
 
 
 @runtime_checkable

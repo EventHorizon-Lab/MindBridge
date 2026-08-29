@@ -39,12 +39,18 @@ Memory(
     decay_half_life_days: float | None = None,
     speaker_similarity: float = 0.78,
     speaker_margin: float = 0.05,
+    tracer: opentelemetry.trace.Tracer | None = None,
 )
 ```
 
 `embedder` is required. `Memory` validates adapter capabilities and durable space identity before
 opening Zvec. It closes supplied adapters when the memory closes; provider clients owned by an
 adapter may remain caller-owned, as documented by that adapter.
+
+`tracer` optionally selects a non-global OpenTelemetry provider. With the default `None`,
+MindBridge uses the standard global tracer. See
+[performance and token observability](../observability.md) for span names, TTFT, usage attributes,
+and privacy behavior.
 
 `index_speech=True` requires a speech-capable backend to analyze supported audio/video during
 `add`. Its transcript, stable speaker IDs, and names already registered at add time become stored,
@@ -222,6 +228,11 @@ class GenerationBackend(Protocol):
     def close(self) -> None: ...
 ```
 
+An answerer can additionally implement
+`StreamingGenerationBackend.stream_answer() -> Iterator[str]`. `Memory.ask()` consumes the stream
+into the same `AnswerResult` and records TTFT on the generation span; the stable
+`GenerationBackend.answer()` contract remains available for non-streaming callers.
+
 ```python
 class TranscriptionBackend(Protocol):
     transcription_capabilities: frozenset[Modality]
@@ -294,6 +305,11 @@ models = OpenAIModels(
 The common `client` is used for operations without a more specific client. Missing clients fail
 only when their operation is invoked. Media is bounded and sent inline; use a provider-specific
 upload adapter for larger assets. SDK clients remain caller-owned.
+
+`OpenAIModels.stream_answer()` requests streamed chat completions with final usage enabled.
+`Memory.ask()` selects it automatically to measure first chunk, first token, total generation
+latency, and provider-reported token usage. `answer()` remains the synchronous non-streaming method
+required by `GenerationBackend`.
 
 ## Exceptions
 

@@ -28,6 +28,8 @@ MindBridge is an embedded multimodal memory library for text, image, video, audi
   capability plugins.
 - [Deployment](deployment.md) — one-process embedded and REST deployment.
 - [Operations](operations.md) — backup, restore, rebuild, and observability.
+- [Performance and token observability](observability.md) — end-to-end traces, node latency, TTFT,
+  multimodal token accounting, and benchmark aggregates.
 - [Troubleshooting](troubleshooting.md) — startup, asset, model, and index failures.
 - [Benchmarking](benchmarking.md) — evaluation tasks, uncertainty, isolation, and local-index metrics.
 

@@ -15,8 +15,21 @@ from threading import Barrier, Event, Thread
 from typing import ClassVar
 
 import pytest
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from opentelemetry.trace import StatusCode
 
 import mindbridge.memory as memory_module
+from mindbridge._telemetry import (
+    MODEL_REQUEST_COUNT,
+    MODEL_TTFT,
+    TOKEN_COMPLETE,
+    TOKEN_TOTAL,
+    mark_model_requests,
+    record_model_usage,
+    record_unmetered_model_usage,
+)
 from mindbridge.exceptions import (
     IndexUnavailableError,
     MemoryNotFoundError,
@@ -393,6 +406,142 @@ def test_crud_search_ask_and_stable_duplicate(tmp_path: Path) -> None:
 
     assert models.closed is True
     assert models.close_calls == 1
+
+
+def test_memory_traces_end_to_end_stages_and_streaming_ttft(tmp_path: Path) -> None:
+    class StreamingModels(_FakeModels):
+        generation_model = "fake-generation"
+
+        def embed(
+            self,
+            inputs: Sequence[ModelInput],
+            task: EmbedTask = EmbedTask.DOCUMENT,
+        ) -> tuple[tuple[float, ...], ...]:
+            vectors = super().embed(inputs, task)
+            record_unmetered_model_usage()
+            return vectors
+
+        def stream_answer(
+            self,
+            question: ModelInput,
+            hits: Sequence[SearchHit],
+        ) -> Iterator[str]:
+            del question, hits
+            record_model_usage(input_tokens=5, output_tokens=3, total_tokens=8)
+            yield "grounded "
+            yield "answer"
+
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    models = StreamingModels()
+    with Memory(
+        tmp_path,
+        embedder=models,
+        answerer=models,
+        transcriber=models,
+        tracer=provider.get_tracer("test"),
+    ) as memory:
+        memory.add("red trace evidence")
+        assert memory.ask("what is red?").answer == "grounded answer"
+    provider.shutdown()
+
+    spans = exporter.get_finished_spans()
+    names = {span.name for span in spans}
+    assert {
+        "mindbridge.add",
+        "mindbridge.ask",
+        "mindbridge.content.prepare",
+        "mindbridge.model.embedding",
+        "mindbridge.index.search",
+        "mindbridge.storage.write",
+        "mindbridge.retrieval.rank",
+        "mindbridge.model.generation",
+    } <= names
+    generation = next(span for span in spans if span.name == "mindbridge.model.generation")
+    ask = next(span for span in spans if span.name == "mindbridge.ask")
+    assert generation.attributes is not None
+    ttft = generation.attributes[MODEL_TTFT]
+    assert isinstance(ttft, int | float) and ttft >= 0
+    assert generation.parent is not None
+    assert generation.parent.span_id == ask.context.span_id
+    assert ask.attributes is not None
+    assert ask.attributes[TOKEN_COMPLETE] is True
+    assert ask.attributes[TOKEN_TOTAL] == 8
+
+
+def test_trace_errors_never_export_exception_details(tmp_path: Path) -> None:
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    models = _FakeModels()
+    with Memory(tmp_path, embedder=models, tracer=provider.get_tracer("test")) as memory:
+        with pytest.raises(ValidationError):
+            memory.add(tmp_path / "private-missing-image.png")
+        models.fail_embedding = True
+        with pytest.raises(ModelError):
+            memory.add("private model input")
+    provider.shutdown()
+
+    failed = tuple(
+        span
+        for span in exporter.get_finished_spans()
+        if span.status.status_code is StatusCode.ERROR
+    )
+    assert {span.name for span in failed} >= {
+        "mindbridge.add",
+        "mindbridge.content.prepare",
+        "mindbridge.model.embedding",
+    }
+    assert all(not span.events and span.status.description is None for span in failed)
+
+
+@pytest.mark.parametrize("chunks", [(), (" ",)])
+def test_empty_stream_is_invalid_model_output(tmp_path: Path, chunks: tuple[str, ...]) -> None:
+    class EmptyStreamModels(_FakeModels):
+        def stream_answer(
+            self,
+            question: ModelInput,
+            hits: Sequence[SearchHit],
+        ) -> Iterator[str]:
+            del question, hits
+            yield from chunks
+
+    models = EmptyStreamModels()
+    with _memory(tmp_path, models) as memory:
+        memory.add("red evidence")
+        with pytest.raises(ModelError, match="invalid answer"):
+            memory.ask("what is red?")
+
+
+def test_stream_ttft_requires_an_actual_model_request(tmp_path: Path) -> None:
+    class SkippingStreamModels(_FakeModels):
+        def stream_answer(
+            self,
+            question: ModelInput,
+            hits: Sequence[SearchHit],
+        ) -> Iterator[str]:
+            del question, hits
+            mark_model_requests(0, token_usage_expected=0)
+            yield "I do not know."
+
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    models = SkippingStreamModels()
+    with Memory(
+        tmp_path, embedder=models, answerer=models, tracer=provider.get_tracer("test")
+    ) as memory:
+        memory.add("red evidence")
+        assert memory.ask("what is red?").answer == "I do not know."
+    provider.shutdown()
+
+    generation = next(
+        span for span in exporter.get_finished_spans() if span.name == "mindbridge.model.generation"
+    )
+    assert generation.attributes is not None
+    assert generation.attributes[MODEL_REQUEST_COUNT] == 0
+    assert MODEL_TTFT not in generation.attributes
 
 
 def test_memory_types_are_stable_and_filterable(tmp_path: Path) -> None:

@@ -20,6 +20,7 @@ Memory(
     decay_half_life_days=None,
     speaker_similarity=0.78,
     speaker_margin=0.05,
+    tracer=None,
 )
 ```
 
@@ -33,6 +34,8 @@ Memory(
   unless the winner has a lexical or temporal anchor. Set either to `0` to disable that gate.
 - `decay_half_life_days` controls query-time soft decay; `None` disables it.
 - Speaker thresholds are local matching semantics, not provider settings.
+- `tracer` optionally injects an OpenTelemetry tracer; `None` uses the global no-op or
+  application-configured provider.
 
 ## Provider clients
 

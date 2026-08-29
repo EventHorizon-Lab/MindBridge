@@ -9,8 +9,21 @@ from typing import cast
 import httpx2 as httpx
 import pytest
 from openai import OpenAI
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
 import mindbridge.models.openai_sdk as openai_backend
+from mindbridge._telemetry import (
+    GEN_AI_TTFC,
+    MODEL_TTFT,
+    TOKEN_COMPLETE,
+    TOKEN_REPORTED_REQUEST_COUNT,
+    TOKEN_TOTAL,
+    model_span,
+    operation_span,
+    token_modality_attribute,
+)
 from mindbridge.exceptions import ModelError
 from mindbridge.models.base import (
     EmbeddingBackend,
@@ -204,6 +217,143 @@ def test_answer_can_pin_sampling_for_reproducible_evaluation() -> None:
         )
 
     assert answer.answer == "Pinned."
+
+
+def test_stream_answer_records_ttft_and_reported_multimodal_usage(tmp_path: Path) -> None:
+    audio = _asset(tmp_path, "audio", Modality.AUDIO, "audio/wav", b"speech")
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        assert payload["stream"] is True
+        assert payload["stream_options"] == {"include_usage": True}
+        chunks = (
+            {
+                "id": "chatcmpl-test",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "answer-model",
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"content": "A greeting"},
+                        "finish_reason": None,
+                    }
+                ],
+            },
+            {
+                "id": "chatcmpl-test",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "answer-model",
+                "choices": [
+                    {"index": 0, "delta": {"content": " is audible."}, "finish_reason": "stop"}
+                ],
+            },
+            {
+                "id": "chatcmpl-test",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "answer-model",
+                "choices": [],
+                "usage": {
+                    "prompt_tokens": 20,
+                    "completion_tokens": 3,
+                    "total_tokens": 23,
+                    "prompt_tokens_details": {"audio_tokens": 4},
+                },
+            },
+        )
+        body = "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks)
+        return httpx.Response(
+            200,
+            content=f"{body}data: [DONE]\n\n",
+            headers={"content-type": "text/event-stream"},
+        )
+
+    hit = SearchHit(
+        id="memory_1",
+        content="",
+        score=0.9,
+        created_at=NOW,
+        assets=(audio,),
+        modality=Modality.AUDIO,
+    )
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    with (
+        httpx.Client(transport=httpx.MockTransport(respond)) as client,
+        provider.get_tracer("test").start_as_current_span("model"),
+    ):
+        chunks = tuple(_model(_sdk_client(client)).stream_answer(ModelInput(text="What?"), (hit,)))
+    provider.shutdown()
+
+    assert "".join(chunks) == "A greeting is audible."
+    attributes = exporter.get_finished_spans()[0].attributes
+    assert attributes is not None
+    assert attributes["gen_ai.usage.input_tokens"] == 20
+    assert attributes["gen_ai.usage.output_tokens"] == 3
+    assert attributes[token_modality_attribute("input", "audio")] == 4
+    assert attributes[token_modality_attribute("input", "text")] == 16
+    assert cast(float, attributes[MODEL_TTFT]) >= 0
+    assert cast(float, attributes[GEN_AI_TTFC]) >= 0
+
+
+def test_usage_keeps_visual_audio_and_unknown_multimodal_tokens_distinct() -> None:
+    exact = openai_backend._model_usage(
+        {
+            "usage": {
+                "input_tokens": 40,
+                "output_tokens": 2,
+                "total_tokens": 42,
+                "input_token_details": {
+                    "text_tokens": 10,
+                    "image_tokens": 12,
+                    "video_tokens": 8,
+                    "audio_tokens": 10,
+                },
+            }
+        },
+        input_modalities=ALL_MODALITIES,
+        output_modalities=frozenset({Modality.TEXT}),
+    )
+    unresolved = openai_backend._model_usage(
+        {"usage": {"prompt_tokens": 20, "total_tokens": 20}},
+        input_modalities=frozenset({Modality.TEXT, Modality.IMAGE}),
+        output_modalities=frozenset(),
+    )
+
+    assert exact is not None
+    assert exact.input_by_modality == {"text": 10, "image": 12, "video": 8, "audio": 10}
+    assert unresolved is not None
+    assert unresolved.input_by_modality == {"unattributed": 20}
+
+
+def test_partial_provider_usage_is_not_reported_as_complete_token_cost() -> None:
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    tracer = provider.get_tracer("test")
+    with (
+        operation_span(tracer, "operation", attributes={}),
+        model_span(tracer, "model", attributes={}),
+    ):
+        openai_backend._record_openai_usage(
+            {"usage": {"input_tokens": 5}},
+            input_modalities=frozenset({Modality.TEXT}),
+            output_modalities=frozenset({Modality.TEXT}),
+        )
+    provider.shutdown()
+
+    spans = {span.name: span for span in exporter.get_finished_spans()}
+    for name in ("model", "operation"):
+        attributes = spans[name].attributes
+        assert attributes is not None
+        assert attributes[TOKEN_COMPLETE] is False
+        assert attributes[TOKEN_REPORTED_REQUEST_COUNT] == 0
+        assert attributes["gen_ai.usage.input_tokens"] == 5
+        assert attributes[token_modality_attribute("input", "text")] == 5
+        assert TOKEN_TOTAL not in attributes
 
 
 def test_answer_rejects_an_oversized_grounding_payload(
