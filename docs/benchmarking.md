@@ -19,11 +19,20 @@ mindbridge-bench eval --tasks list
 mindbridge-bench eval \
   --model mindbridge \
   --model-args pretrained=gpt-5-mini \
+  --judge-model-args model=qwen3.8-27b,base_url=http://judge.example/v1,api_key=EMPTY \
   --tasks locomo-refined,video-mme \
   --batch-size auto \
   --limit 10 \
   --seed 42
 ```
+
+Open-ended tasks are judged inside this command. EgoMemReason is the server-scored exception: the
+same evaluation command automatically writes its official submission file after a complete run.
+`--judge-model-args` follows the same comma-separated style as `--model-args` and accepts `model`,
+`base_url`, `api_key`, and `timeout_seconds`. Without it, the judge reuses the generation model,
+endpoint, key, and timeout. The equivalent environment variables are
+`MINDBRIDGE_JUDGE_MODEL`, `MINDBRIDGE_JUDGE_BASE_URL`, `MINDBRIDGE_JUDGE_API_KEY`, and
+`MINDBRIDGE_JUDGE_TIMEOUT_SECONDS`. Use `--judge-concurrency` to bound parallel judge requests.
 
 Missing annotations and media are downloaded by default. Public releases use immutable Git or
 Hugging Face revisions; annotations are also checked against a published SHA-256 when available.
@@ -134,23 +143,32 @@ mechanism.
 ## Reproducibility and result trust
 
 An evaluation fixes and records the dataset repository, revision, annotation, auxiliary,
-manifest, and resolved-memory digests, adapter version,
-MindBridge/Zvec/Python versions, generation model and endpoint, pinned Jina revision, batch sizes,
-retrieval limit, and seed. Generation requests use the run seed and temperature `0`. The endpoint
-must support OpenAI-compatible `seed` and `temperature` fields; model providers can still change
+manifest, and resolved-memory digests, adapter and scorer versions, MindBridge/Zvec/Python
+versions, generation and judge models/endpoints, pinned Jina revision, batch sizes, retrieval
+limit, and seed. Generation requests use the run seed and temperature `0`; judge requests preserve
+each benchmark's published transport and sampling settings. Model providers can still change
 weights behind an unversioned model name, so use an immutable model identifier for publishable
 runs.
 
 Every run writes atomically to its output directory:
 
-- `samples.jsonl` contains predictions, parsed options, scores, exact retrieved source intervals,
-  retrieval diagnostics, failures, and optional prompts/references from `--log-samples`.
+- `samples.jsonl` contains predictions, parsed options, all per-sample native metrics, scorer
+  protocol, judge identity/cache state, exact retrieved source intervals, retrieval diagnostics,
+  and failures. `--log-samples` additionally retains prompts, references, and raw judge responses.
 - `results.json` contains pins, aggregate metrics, a SHA-256 of the samples, cluster-robust
   standard errors, and deterministic cluster-bootstrap 95% confidence intervals.
+- A complete, valid EgoMemReason run also writes `egomemreason_submission.json` in the official
+  500-row upload format.
+
+Upload the EgoMemReason file manually to the
+[official scorer](https://huggingface.co/spaces/Ted412/EgoMemReason). A run narrowed with `--limit`
+or `--offset` records the submission as `partial` and does not emit an upload file. An incomplete
+unrestricted run or malformed prediction records `invalid` and exits nonzero. The evaluator never
+uploads predictions automatically.
 
 The core `lmms-eval` response-cache path shape is supported. A directory keeps a shared
 `cache.db`, writes each run to `runs/<run-id>/cache.db`, and merges successful deterministic
-answers into the shared cache when the run closes:
+answers and judge responses into the shared cache when the run closes:
 
 ```bash
 mindbridge-bench eval \
@@ -162,11 +180,26 @@ mindbridge-bench eval \
 Questions are clustered by independent memory unit, not treated as independent observations.
 Confidence intervals and regression significance are `null` when a task has fewer than two
 independent units; the runner does not manufacture precision from questions sharing one memory.
-Multiple-choice tasks use exact option scoring; Video-MME-v2 also reports its grouped nonlinear
-rating, and SuperMemory-VQA reports answerability precision/recall. Free-text token F1 is marked
-`official_metric: false`; EgoMemReason is submission-only. MM-Lifelong additionally reports the
-official `ref_at_300` quantized temporal IoU from the unmerged retrieved intervals; its value is a
-percentage in `[0, 100]`. Do not present diagnostic token F1 values as official leaderboard scores.
+
+The scorer uses each release's native protocol:
+
+| Benchmark | Integrated metrics |
+| --- | --- |
+| LoCoMo-Refined | refined Qwen3-14B judge, token F1, and BLEU-1 |
+| M3-Bench | GPT-4o entailment accuracy |
+| Video-MME / v2 | exact MCQ accuracy; v2 grouped nonlinear rating |
+| EgoLifeQA | exact MCQ accuracy |
+| EgoMemReason | official 500-row submission JSON; private server scoring required |
+| EgoTempo | Gemini correct/incorrect accuracy and 0–5 judge score |
+| MemLens | task-specific binary judge accuracy, including update/refusal rubrics |
+| MM-Lifelong | GPT-5 mapped answer accuracy and quantized `ref_at_300` in `[0, 1]` |
+| SuperMemory-VQA | QA accuracy and answerability F1; QA-MRR is explicitly unavailable until the answer backend exposes option scores |
+| ATM-Bench | native number/list/open-end scoring, Recall@K/GT, Hit@1, and strict/partial Joint@K |
+| Mem-Gallery | stemmed F1, BLEU-1/2/4, EM, LLM judge, and retrieval Precision/Recall/Hit@10 |
+
+`results.json` marks every metric independently. An official prompt run with a different judge
+model remains useful for iteration but is marked `official_metric: false` and records both the
+configured and required official model; it must not be presented as leaderboard-comparable.
 
 Compare identical samples against a prior run and optionally fail CI only on a statistically
 supported regression:
@@ -179,9 +212,9 @@ mindbridge-bench eval \
   --regression-threshold 0.01
 ```
 
-The comparison validates the dataset digest, joins by stable sample ID, and reports paired
-cluster-bootstrap confidence intervals plus win/tie/loss counts. Any answer error or incomplete
-ingest also makes the command fail instead of quietly lowering a score.
+The comparison validates the dataset digest, scorer protocol, and judge identity; joins by stable
+sample ID; and reports paired cluster-bootstrap confidence intervals plus win/tie/loss counts. Any
+answer error or incomplete ingest also makes the command fail instead of quietly lowering a score.
 
 ## Isolation contract
 

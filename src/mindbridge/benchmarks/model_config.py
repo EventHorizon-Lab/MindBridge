@@ -11,7 +11,7 @@ from mindbridge.types import Modality
 
 DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_GENERATION_MODEL = "gpt-5-mini"
-DEFAULT_TIMEOUT_SECONDS = 120.0
+DEFAULT_TIMEOUT_SECONDS = 3_600.0
 
 
 @dataclass(frozen=True, slots=True)

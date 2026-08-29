@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from argparse import ArgumentTypeError
 from collections.abc import Sequence
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -44,9 +45,33 @@ from mindbridge.benchmarks.eval_statistics import (
 )
 from mindbridge.benchmarks.isolation import BenchmarkRun
 from mindbridge.benchmarks.model_config import ModelConfig
+from mindbridge.benchmarks.official_scorers import scorer_protocol
 from mindbridge.benchmarks.task_catalog import TASKS, TaskSpec, expand
 from mindbridge.benchmarks.video_mme_v2 import score_group_answers
 from mindbridge.models.base import SpeechAnalysis
+
+
+def _egomem_sample(example_id: int, answer: str | None = None) -> SampleResult:
+    selected = answer or "ABCD"[(example_id - 1) % 4]
+    return SampleResult(
+        task="egomemreason",
+        benchmark="EgoMemReason",
+        dataset_sha256="1" * 64,
+        evaluation_sha256="2" * 64,
+        unit_id="A1_JAKE",
+        question_id=f"q{example_id}",
+        prediction=f"My answer is {selected}.",
+        parsed_choice=selected,
+        score=None,
+        exact_match=None,
+        latency_ms=1.0,
+        confidence=1.0,
+        memory_ids=(),
+        ingest_failure_count=0,
+        error_code=None,
+        metadata={"example_id": example_id, "choices": ("a", "b", "c", "d")},
+        scorer_protocol=scorer_protocol("egomemreason"),
+    )
 
 
 def test_catalog_covers_requested_benchmarks_and_aliases() -> None:
@@ -141,13 +166,176 @@ def test_video_mme_v2_rating_uses_the_official_zero_to_one_hundred_scale() -> No
     ) == pytest.approx(100 / 3)
 
 
+def test_video_mme_v2_comparison_uses_grouped_rating(tmp_path: Path) -> None:
+    spec = TASKS["video-mme-v2"]
+    task = LoadedTask(
+        spec,
+        tmp_path / "dataset.parquet",
+        "1" * 64,
+        (
+            EvalUnit(
+                "fixture",
+                (),
+                (
+                    EvalQuestion(
+                        "q1",
+                        ("prompt",),
+                        expected_choice="A",
+                        score_kind="choice",
+                    ),
+                ),
+            ),
+        ),
+    )
+
+    def result(unit_id: str, position: int, score: float) -> SampleResult:
+        return SampleResult(
+            task=spec.name,
+            benchmark=spec.benchmark,
+            dataset_sha256=task.dataset_sha256,
+            evaluation_sha256=task.evaluation_sha256,
+            unit_id=unit_id,
+            question_id=f"q{position}",
+            prediction="A",
+            parsed_choice="A" if score else "B",
+            score=score,
+            exact_match=None,
+            latency_ms=1.0,
+            confidence=1.0,
+            memory_ids=(),
+            ingest_failure_count=0,
+            error_code=None,
+            metadata={"position": position, "group_type": "relevance"},
+            metrics={"question_accuracy": score},
+            scorer_protocol=scorer_protocol(spec.name),
+        )
+
+    current = tuple(
+        result(unit_id, position, float(position <= 2))
+        for unit_id in ("g1", "g2")
+        for position in range(1, 5)
+    )
+    baseline = tuple(
+        result(unit_id, position, float(unit_id == "g1"))
+        for unit_id in ("g1", "g2")
+        for position in range(1, 5)
+    )
+    baseline_dir = tmp_path / "baseline"
+    baseline_dir.mkdir()
+    (baseline_dir / "samples.jsonl").write_text(
+        "".join(json.dumps(sample.json()) + "\n" for sample in baseline),
+        encoding="utf-8",
+    )
+    arguments = cast(
+        eval_module._Arguments,
+        SimpleNamespace(compare=baseline_dir, seed=7, bootstrap_samples=20),
+    )
+
+    comparison = eval_module._comparisons(arguments, (task,), current)[0]
+
+    assert comparison["metric"] == "rating"
+    assert comparison["mean"] == -25.0
+    assert comparison["paired_sample_count"] == 2
+
+
+def test_comparison_rejects_different_scorers_and_judges(tmp_path: Path) -> None:
+    spec = TASKS["m3-bench-robot"]
+    question = EvalQuestion("q1", ("prompt",), ("answer",), source_question="question")
+    task = LoadedTask(
+        spec,
+        tmp_path / "dataset.json",
+        "1" * 64,
+        (EvalUnit("u1", (), (question,)),),
+    )
+    current = SampleResult(
+        task=spec.name,
+        benchmark=spec.benchmark,
+        dataset_sha256=task.dataset_sha256,
+        evaluation_sha256=task.evaluation_sha256,
+        unit_id="u1",
+        question_id="q1",
+        prediction="answer",
+        parsed_choice=None,
+        score=1.0,
+        exact_match=None,
+        latency_ms=1.0,
+        confidence=1.0,
+        memory_ids=(),
+        ingest_failure_count=0,
+        error_code=None,
+        metadata={},
+        metrics={"accuracy": 1.0},
+        scorer_protocol=scorer_protocol(spec.name),
+        judge_model="gpt-4o-2024-11-20",
+    )
+    cases = (
+        (replace(current, scorer_protocol="old-protocol"), "scorer protocol"),
+        (replace(current, judge_model="proxy-judge"), "judge model"),
+    )
+    for index, (baseline, message) in enumerate(cases):
+        baseline_dir = tmp_path / f"baseline-{index}"
+        baseline_dir.mkdir()
+        (baseline_dir / "samples.jsonl").write_text(
+            json.dumps(baseline.json()) + "\n",
+            encoding="utf-8",
+        )
+        arguments = cast(
+            eval_module._Arguments,
+            SimpleNamespace(compare=baseline_dir, seed=7, bootstrap_samples=20),
+        )
+
+        with pytest.raises(ValueError, match=message):
+            eval_module._comparisons(arguments, (task,), (current,))
+
+
+def test_egomem_submission_is_upload_ready_only_when_complete(tmp_path: Path) -> None:
+    samples = tuple(_egomem_sample(example_id) for example_id in range(1, 501))
+
+    content, status = eval_module._egomem_submission(samples, requested=True, allow_partial=False)
+
+    assert content is not None
+    assert status is not None
+    assert status["status"] == "ready"
+    assert status["file"] == "egomemreason_submission.json"
+    payload = json.loads(content)
+    assert len(payload) == 500
+    assert payload[0] == {"example_id": 1, "predicted_answer": "A"}
+    assert payload[-1] == {"example_id": 500, "predicted_answer": "D"}
+    assert [row["example_id"] for row in payload] == list(range(1, 501))
+    assert all(set(row) == {"example_id", "predicted_answer"} for row in payload)
+
+    partial_content, partial_status = eval_module._egomem_submission(
+        samples[:10], requested=True, allow_partial=True
+    )
+    assert partial_content is None
+    assert partial_status is not None and partial_status["status"] == "partial"
+
+    invalid_content, invalid_status = eval_module._egomem_submission(
+        (replace(samples[0], parsed_choice=None), *samples[1:]),
+        requested=True,
+        allow_partial=False,
+    )
+    assert invalid_content is None
+    assert invalid_status is not None and invalid_status["status"] == "invalid"
+
+    arguments = cast(
+        eval_module._Arguments,
+        SimpleNamespace(output_path=tmp_path, overwrite=True),
+    )
+    eval_module._write_artifacts(arguments, samples[:1], {}, content)
+    submission_path = tmp_path / "egomemreason_submission.json"
+    assert submission_path.read_bytes() == content
+    eval_module._write_artifacts(arguments, samples[:1], {}, None)
+    assert not submission_path.exists()
+
+
 def test_mm_lifelong_ref_at_300_uses_official_quantized_iou() -> None:
     assert _ref_at_n(
         ((300.0, 600.0), (900.0, 1_200.0)),
         ((450.0, 750.0),),
         total_seconds=1_500.0,
         bucket_size=300.0,
-    ) == pytest.approx(50.0)
+    ) == pytest.approx(1 / 3)
 
 
 def test_benchmark_speech_backend_skips_video_without_an_audio_stream(

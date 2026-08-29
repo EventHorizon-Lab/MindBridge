@@ -90,6 +90,7 @@ class EvalQuestion:
     cutoff_seconds: float | None = None
     metadata: Mapping[str, object] = field(default_factory=dict)
     reference_at: datetime | None = None
+    source_question: str | None = None
 
     def __post_init__(self) -> None:
         if not self.question_id.strip() or not self.content:
@@ -108,6 +109,8 @@ class EvalQuestion:
             self.reference_at.tzinfo is None or self.reference_at.utcoffset() is None
         ):
             raise ValueError("question reference time must include a timezone")
+        if self.source_question is not None and not self.source_question.strip():
+            raise ValueError("source question must not be blank")
 
 
 @dataclass(frozen=True, slots=True)
@@ -474,6 +477,7 @@ def _locomo(
                 (_free_text_prompt(question.question),),
                 question.reference_answers,
                 metadata={"category": question.category},
+                source_question=question.question,
             )
             for question in conversation.questions
         )
@@ -505,6 +509,7 @@ def _m3(
                 (question.reference_answer,),
                 cutoff_seconds=question.cutoff_seconds,
                 metadata={"question_types": question.question_types},
+                source_question=question.question,
             )
             for question in video.questions
         )
@@ -694,6 +699,7 @@ def _egotempo(
                     (EGOTEMPO_QUERY_PROMPT.text.format(question=question.question),),
                     (question.reference_answer,),
                     metadata={"question_type": question.question_type},
+                    source_question=question.question,
                 )
                 for question in questions
             ),
@@ -749,8 +755,10 @@ def _memlens(
                         metadata={
                             "question_type": question.question_type,
                             "question_subtype": question.question_subtype,
+                            "old_answer": question.old_answer,
                         },
                         reference_at=question.question_date,
+                        source_question=question.question,
                     ),
                 ),
             )
@@ -785,6 +793,7 @@ def _mm_lifelong(
                         "temporal_certificate": question.temporal_certificate,
                         "reference_intervals": question.reference_intervals,
                     },
+                    source_question=question.question,
                 )
                 for question in questions
             ),
@@ -884,6 +893,7 @@ def _atm(
             ),
             (question.reference_answer,),
             metadata={"qtype": question.qtype, "evidence_ids": question.evidence_ids},
+            source_question=question.question,
         )
         for question in _selected(load_atm_bench(dataset), limit, offset)
     )
@@ -965,7 +975,8 @@ def _gallery_question(
         question.question_id,
         (prompt,) if image is None else (prompt, image),
         (question.reference_answer,),
-        metadata={"point": question.point},
+        metadata={"point": question.point, "clue_ids": question.clue_round_ids},
+        source_question=question.question,
     )
 
 

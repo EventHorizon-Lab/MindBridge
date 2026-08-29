@@ -20,6 +20,7 @@ mindbridge-bench = "mindbridge.benchmarks.cli:main"
 [project.optional-dependencies]
 benchmarks = [
     "huggingface-hub>=0.30,<2",
+    "nltk>=3.9,<4",
     "pyarrow>=18,<26",
 ]
 openai = [
