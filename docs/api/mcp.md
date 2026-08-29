@@ -1,6 +1,7 @@
 # MCP API
 
-The optional MCP adapter exposes five typed tools over one local `Memory` through stdio.
+The optional MCP adapter currently exposes five typed tools over one local `Memory` through stdio.
+It is a schema and dispatch surface over the SDK execution plane, not a separate memory service.
 
 ## Install and run
 
@@ -149,6 +150,27 @@ Stable codes include `validation_error`, `memory_not_found`, `model_error`, `sto
 `index_unavailable`, and `internal_error`. Provider responses, credentials, filesystem paths, and
 native-index details are not included.
 
+## Agent consumption contract
+
+MCP is MindBridge's current agent-native surface. An agent can select and call every exposed
+operation from the tool name, description, annotations, and JSON schema; human-oriented output is
+not part of the contract.
+
+- Tool schemas are strict. Unknown arguments fail instead of being guessed or ignored.
+- Successful calls return structured records, hits, answers, or deletion state with stable IDs.
+- Failures use stable codes, so recovery does not depend on matching prose.
+- Read, idempotency, and destructive annotations disclose side effects before a call.
+- Search and answer limits are bounded; exact grounding hits remain available for audit or a later
+  agent step.
+- Tool names, argument schemas, result schemas, annotations, and error codes are public contracts;
+  changing one requires the same compatibility treatment as changing the Python or REST API.
+- MCP capabilities are derived from the SDK. A tool validates transport input, calls the matching
+  `Memory` operation, and serializes its result; it must not duplicate memory policy.
+
+An integration may search before a turn or add a result afterward, but that lifecycle policy is not
+hidden inside the MCP server. Automated writes must remain observable and preserve whether content
+came from a user, an agent, or source evidence.
+
 ## Programmatic adapter
 
 Applications embedding MCP pass an existing synchronous memory:
@@ -168,8 +190,13 @@ maintain a second sync/async dispatch layer.
 
 ## Current limits
 
-MCP mirrors the five common single-record agent operations. Batch addition, listing, reindexing,
-and optimization remain Python operations. There is no large-file upload tool, local-path input,
-logical scope, chunking option, per-asset vector control, or learned reranker option. The OpenAI
-adapter inlines at most 64 MiB of raw media per embedding or generation call, and answer text
-evidence is limited to 4 MiB. Use a provider-specific upload adapter for larger media.
+The five current tools do not yet cover the complete SDK capability inventory. Batch addition,
+listing, speech analysis, speaker registration, reindexing, and optimization remain Python
+operations. This is an implementation gap, not a separate MCP execution model. Additive tools must
+map to the existing SDK operations and carry appropriate read, idempotency, and destructive
+annotations.
+
+There is no large-file upload tool, local-path input, logical scope, chunking option, per-asset
+vector control, or learned reranker option. The OpenAI adapter inlines at most 64 MiB of raw media
+per embedding or generation call, and answer text evidence is limited to 4 MiB. Use a
+provider-specific upload adapter for larger media.
