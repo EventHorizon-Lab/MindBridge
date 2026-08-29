@@ -13,6 +13,7 @@ from itertools import pairwise
 from threading import RLock
 from typing import Protocol, cast
 
+from mindbridge._telemetry import mark_model_requests, record_unmetered_model_usage
 from mindbridge.exceptions import ModelError, ValidationError
 from mindbridge.models.base import SpeakerEmbedding, SpeechAnalysis, SpeechTurn
 from mindbridge.types import AssetRef, Modality
@@ -155,11 +156,14 @@ class FunASRTranscriber:
                 or asset.modality not in self.transcription_capabilities
             ):
                 raise ValidationError("assets must contain resolved audio or video AssetRef values")
+        mark_model_requests(len(batch), token_usage_expected=0)
         with self._lock:
             if self._closed:
                 raise ModelError("FunASR transcriber is closed")
             pipeline = self._load()
-            return tuple(self._analyze_one(pipeline, asset) for asset in batch)
+            analyses = tuple(self._analyze_one(pipeline, asset) for asset in batch)
+        record_unmetered_model_usage(request_count=len(batch))
+        return analyses
 
     def close(self) -> None:
         with self._lock:

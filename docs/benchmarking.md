@@ -156,9 +156,13 @@ Every run writes atomically to its output directory:
   protocol, judge identity/cache state, exact retrieved source intervals, retrieval diagnostics,
   and failures. `--log-samples` additionally retains prompts, references, and raw judge responses.
 - `results.json` contains pins, aggregate metrics, a SHA-256 of the samples, cluster-robust
-  standard errors, and deterministic cluster-bootstrap 95% confidence intervals.
+  standard errors, deterministic cluster-bootstrap 95% confidence intervals, and per-task
+  performance/token aggregates.
 - A complete, valid EgoMemReason run also writes `egomemreason_submission.json` in the official
   500-row upload format.
+
+The terminal summary shows each task's total seconds, average milliseconds per question, total
+tokens, and average tokens per question; incomplete provider usage is shown as `—`.
 
 Upload the EgoMemReason file manually to the
 [official scorer](https://huggingface.co/spaces/Ted412/EgoMemReason). A run narrowed with `--limit`
@@ -180,6 +184,13 @@ mindbridge-bench eval \
 Questions are clustered by independent memory unit, not treated as independent observations.
 Confidence intervals and regression significance are `null` when a task has fewer than two
 independent units; the runner does not manufacture precision from questions sharing one memory.
+
+Each task's `performance` object reports total wall time, mean time per selected question, every
+MindBridge operation/stage/model span, generation TTFT, total and mean provider tokens, modality
+breakdowns, and per-module usage. It also includes judge time/tokens because those are part of the
+actual evaluation cost. Missing provider usage makes `total_tokens` and `average_tokens` null while
+retaining an exact `reported_total_tokens` lower bound. Full field semantics are documented in
+[performance and token observability](observability.md#benchmark-output).
 
 The scorer uses each release's native protocol:
 

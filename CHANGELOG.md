@@ -59,6 +59,8 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   batching, resumable automatic media acquisition and video preparation, causal manifests,
   deterministic sampling and response caching, cluster-aware confidence intervals, and paired
   regression comparisons.
+- OpenTelemetry end-to-end and stage spans with streaming generation TTFT, exact provider-reported
+  multimodal token usage, and per-task benchmark duration/token aggregates.
 - Enforced POSIX `0700` data directories and `0600` database/lock files, fork-use rejection,
   bounded public input, and REST body limits.
 - Typed Jina text inputs so URL- or path-shaped application text cannot trigger the model's remote
@@ -77,9 +79,9 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   default scope or logical partition inside a store.
 - The primary developer flow explicitly supplies an embedding backend:
   `Memory(embedder=...)` → `add()` → `search()` or `ask()`.
-- The base dependency set is `pydantic` and `zvec`; FastAPI/Uvicorn and MCP are optional
-  extras. The official OpenAI SDK lives in `openai`; Sentence Transformers and local media decoders
-  live in `local`.
+- The base dependency set is `opentelemetry-api`, `pydantic`, and `zvec`; FastAPI/Uvicorn and MCP
+  are optional extras. The OpenTelemetry SDK lives in `observability`, the official OpenAI SDK in
+  `openai`, and Sentence Transformers plus local media decoders in `local`.
 - Model authentication, HTTP transport, retries, timeouts, and compatible endpoint handling now
   belong to caller-owned official OpenAI SDK clients. Remote REST authentication and TLS belong to
   the deployment gateway or host application.

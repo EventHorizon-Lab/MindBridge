@@ -97,6 +97,11 @@ Track at least:
 - REST status counts, especially 502 and 503.
 - Startup and rebuild duration.
 
+MindBridge emits these operation and stage timings directly as OpenTelemetry spans, including
+generation TTFT and provider-reported multimodal token usage. See
+[performance and token observability](observability.md) for the stable attribute contract and
+export setup.
+
 The standalone local-index benchmark reports SQLite bytes, Zvec bytes, ingest time, optimize time,
 query percentiles, QPS, and recall against exact search. See [benchmarking](benchmarking.md).
 

@@ -12,7 +12,7 @@ import platform
 import re
 import sys
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
@@ -20,6 +20,9 @@ from importlib import metadata
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import TYPE_CHECKING, Any, Protocol, cast
+
+from opentelemetry import trace
+from opentelemetry.trace import Tracer
 
 if TYPE_CHECKING:
     from openai import AsyncOpenAI
@@ -36,6 +39,13 @@ from mindbridge import (
     OpenAIModels,
     SearchHit,
 )
+from mindbridge._telemetry import (
+    MODEL_MODULE,
+    SPAN_KIND,
+    mark_model_requests,
+    record_unmetered_model_usage,
+    traced_span,
+)
 from mindbridge.benchmarks.download import acquire_inputs
 from mindbridge.benchmarks.eval_adapters import (
     EvalQuestion,
@@ -51,6 +61,12 @@ from mindbridge.benchmarks.eval_statistics import (
     paired_comparison,
     parse_choice,
     summarize,
+)
+from mindbridge.benchmarks.eval_telemetry import (
+    BENCHMARK_JUDGE_SPAN,
+    BENCHMARK_TASK,
+    BENCHMARK_TASK_SPAN,
+    EvaluationTelemetry,
 )
 from mindbridge.benchmarks.isolation import BenchmarkRun
 from mindbridge.benchmarks.model_config import ModelConfig
@@ -80,6 +96,7 @@ from mindbridge.benchmarks.task_catalog import (
 from mindbridge.models.base import (
     EmbeddingBackend,
     GenerationBackend,
+    ModelInput,
     SpeechAnalysis,
     SpeechBackend,
 )
@@ -88,9 +105,10 @@ from mindbridge.models.jina import (
     DEFAULT_JINA_MODEL_ID,
     DEFAULT_JINA_REVISION,
 )
+from mindbridge.models.openai_sdk import _model_usage, _record_usage_batch
 
-EVAL_SCHEMA_VERSION = 5
-EVAL_RUNNER_VERSION = "mindbridge_eval_official_v5"
+EVAL_SCHEMA_VERSION = 6
+EVAL_RUNNER_VERSION = "mindbridge_eval_official_v6"
 DEFAULT_BOOTSTRAP_SAMPLES = 2_000
 _RESULTS_FILE = "results.json"
 _SAMPLES_FILE = "samples.jsonl"
@@ -272,6 +290,13 @@ class _BorrowedBackend:
     def __getattr__(self, name: str) -> object:
         return getattr(self._backend, name)
 
+    def stream_answer(
+        self,
+        question: ModelInput,
+        hits: Sequence[SearchHit],
+    ) -> Iterator[str]:
+        return cast(Iterator[str], cast(Any, self._backend).stream_answer(question, hits))
+
     def close(self) -> None:
         return None
 
@@ -285,7 +310,11 @@ class _BorrowedSpeechBackend(_BorrowedBackend):
             for asset in assets
         )
         audible = tuple(asset for asset, include in zip(assets, selected, strict=True) if include)
-        generated = () if not audible else cast(SpeechBackend, self._backend).analyze(audible)
+        if audible:
+            generated = cast(SpeechBackend, self._backend).analyze(audible)
+        else:
+            record_unmetered_model_usage(request_count=0)
+            generated = ()
         if len(generated) != len(audible):
             raise RuntimeError("speech backend returned the wrong number of analyses")
         pending = iter(generated)
@@ -306,6 +335,7 @@ class _BackendPool:
         batch_size: int,
         needs_speech: bool,
         seed: int,
+        tracer: Tracer | None = None,
     ) -> None:
         self.config = config
         try:
@@ -333,6 +363,7 @@ class _BackendPool:
             if self.transcriber is not None
             else None
         )
+        self._tracer = trace.get_tracer("mindbridge.benchmarks.eval") if tracer is None else tracer
 
     def memory(self, data_dir: Path) -> AsyncMemory:
         return AsyncMemory(
@@ -341,6 +372,7 @@ class _BackendPool:
             answerer=self._answerer,
             transcriber=self._transcriber,
             index_speech=self._transcriber is not None,
+            tracer=self._tracer,
         )
 
     def close(self) -> None:
@@ -416,7 +448,7 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> int:
     )
     config = _evaluation_config(base_config, loaded)
     batch_sizes = {task.spec.name: _batch_size(arguments, task) for task in loaded}
-    samples, duration = _execute(loaded, arguments, config, judge_config, batch_sizes)
+    samples, duration, performance = _execute(loaded, arguments, config, judge_config, batch_sizes)
     submission_bytes, submission_status = _egomem_submission(
         samples,
         requested="egomemreason" in arguments.tasks,
@@ -431,6 +463,7 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> int:
         duration,
         batch_sizes,
         submission_status,
+        performance,
     )
     comparisons = _comparisons(arguments, loaded, samples)
     if comparisons:
@@ -464,7 +497,7 @@ def _execute(
     config: ModelConfig,
     judge_config: _JudgeConfig,
     batch_sizes: Mapping[str, int],
-) -> tuple[tuple[SampleResult, ...], float]:
+) -> tuple[tuple[SampleResult, ...], float, Mapping[str, Mapping[str, object]]]:
     needs_speech = any(
         isinstance(atom, Path)
         and _MODALITY_BY_SUFFIX.get(atom.suffix.casefold()) in {Modality.AUDIO, Modality.VIDEO}
@@ -474,53 +507,67 @@ def _execute(
         for atom in item.content
     )
     started = time.perf_counter()
-    response_cache = (
-        None
-        if arguments.use_cache is None
-        else ResponseCache(
-            arguments.use_cache,
-            arguments.run_id,
-            _cache_namespace(arguments, config, batch_sizes),
-        )
-    )
-    pool: _BackendPool | None = None
-    memory_factory: MemoryFactory
+    telemetry = EvaluationTelemetry()
     try:
-        if response_cache is not None and _all_cached(response_cache, loaded):
-            memory_factory = _cache_only_memory
-        else:
-            pool = _BackendPool(
-                config,
-                device=arguments.device,
-                batch_size=max(batch_sizes.values()),
-                needs_speech=needs_speech,
-                seed=arguments.seed,
-            )
-            memory_factory = pool.memory
-        samples = asyncio.run(
-            _run_all(
-                loaded,
-                arguments,
-                batch_sizes=batch_sizes,
-                memory_factory=memory_factory,
-                response_cache=response_cache,
+        response_cache = (
+            None
+            if arguments.use_cache is None
+            else ResponseCache(
+                arguments.use_cache,
+                arguments.run_id,
+                _cache_namespace(arguments, config, batch_sizes),
             )
         )
+        pool: _BackendPool | None = None
+        memory_factory: MemoryFactory
+        try:
+            if response_cache is not None and _all_cached(response_cache, loaded):
+                memory_factory = _cache_only_memory
+            else:
+                pool = _BackendPool(
+                    config,
+                    device=arguments.device,
+                    batch_size=max(batch_sizes.values()),
+                    needs_speech=needs_speech,
+                    seed=arguments.seed,
+                    tracer=telemetry.tracer,
+                )
+                memory_factory = pool.memory
+            samples = asyncio.run(
+                _run_all(
+                    loaded,
+                    arguments,
+                    batch_sizes=batch_sizes,
+                    memory_factory=memory_factory,
+                    response_cache=response_cache,
+                    tracer=telemetry.tracer,
+                )
+            )
+        finally:
+            if pool is not None:
+                pool.close()
+            if response_cache is not None:
+                response_cache.close()
+        if not arguments.predict_only:
+            samples = asyncio.run(
+                _apply_judges(
+                    loaded,
+                    samples,
+                    arguments=arguments,
+                    config=judge_config,
+                    tracer=telemetry.tracer,
+                )
+            )
+        performance = {
+            task.spec.name: telemetry.result(
+                task.spec.name,
+                question_count=sum(len(unit.questions) for unit in task.units),
+            )
+            for task in loaded
+        }
+        return samples, time.perf_counter() - started, performance
     finally:
-        if pool is not None:
-            pool.close()
-        if response_cache is not None:
-            response_cache.close()
-    if not arguments.predict_only:
-        samples = asyncio.run(
-            _apply_judges(
-                loaded,
-                samples,
-                arguments=arguments,
-                config=judge_config,
-            )
-        )
-    return samples, time.perf_counter() - started
+        telemetry.close()
 
 
 async def _run_all(
@@ -530,6 +577,7 @@ async def _run_all(
     batch_sizes: Mapping[str, int],
     memory_factory: MemoryFactory,
     response_cache: ResponseCache | None,
+    tracer: Tracer,
 ) -> tuple[SampleResult, ...]:
     results: list[SampleResult] = []
     for task in tasks:
@@ -538,25 +586,30 @@ async def _run_all(
                 f"mindbridge-bench eval: running {task.spec.name} ({len(task.units)} units)",
                 file=sys.stderr,
             )
-        run = BenchmarkRun(
-            arguments.data_root,
-            task.spec.name,
-            arguments.run_id,
-        )
-        results.extend(
-            await run_loaded_task(
-                task,
-                run=run,
-                memory_factory=memory_factory,
-                batch_size=batch_sizes[task.spec.name],
-                unit_concurrency=arguments.unit_concurrency,
-                request_concurrency=arguments.request_concurrency,
-                recall_limit=arguments.recall_limit,
-                predict_only=arguments.predict_only,
-                log_samples=arguments.log_samples,
-                response_cache=response_cache,
+        with traced_span(
+            tracer,
+            BENCHMARK_TASK_SPAN,
+            attributes={BENCHMARK_TASK: task.spec.name, SPAN_KIND: "benchmark"},
+        ):
+            run = BenchmarkRun(
+                arguments.data_root,
+                task.spec.name,
+                arguments.run_id,
             )
-        )
+            results.extend(
+                await run_loaded_task(
+                    task,
+                    run=run,
+                    memory_factory=memory_factory,
+                    batch_size=batch_sizes[task.spec.name],
+                    unit_concurrency=arguments.unit_concurrency,
+                    request_concurrency=arguments.request_concurrency,
+                    recall_limit=arguments.recall_limit,
+                    predict_only=arguments.predict_only,
+                    log_samples=arguments.log_samples,
+                    response_cache=response_cache,
+                )
+            )
     return tuple(results)
 
 
@@ -948,7 +1001,9 @@ async def _apply_judges(
     *,
     arguments: _Arguments,
     config: _JudgeConfig,
+    tracer: Tracer | None = None,
 ) -> tuple[SampleResult, ...]:
+    selected_tracer = trace.get_tracer("mindbridge.benchmarks.eval") if tracer is None else tracer
     questions = {
         (task.spec.name, unit.unit_id, question.question_id): question
         for task in tasks
@@ -1006,6 +1061,7 @@ async def _apply_judges(
                     semaphore=semaphore,
                     config=config,
                     log_samples=arguments.log_samples,
+                    tracer=selected_tracer,
                 )
                 for sample in samples
             )
@@ -1026,13 +1082,14 @@ async def _judge_sample(
     semaphore: asyncio.Semaphore,
     config: _JudgeConfig,
     log_samples: bool,
+    tracer: Tracer,
 ) -> SampleResult:
     if plan is None:
         return sample
     try:
         outcomes = tuple(
             [
-                await _judge_call(
+                await _traced_judge_call(
                     client,
                     messages,
                     sample=sample,
@@ -1041,6 +1098,7 @@ async def _judge_sample(
                     cache=cache,
                     semaphore=semaphore,
                     config=config,
+                    tracer=tracer,
                 )
                 for index, messages in enumerate(plan.calls)
             ]
@@ -1067,6 +1125,41 @@ async def _judge_sample(
             scorer_error=f"{type(error).__name__}: {message}",
             scorer_details={**sample.scorer_details, **plan.details},
             judge_model=config.model,
+        )
+
+
+async def _traced_judge_call(
+    client: AsyncOpenAI,
+    messages: Sequence[JudgeMessage],
+    *,
+    sample: SampleResult,
+    plan: JudgePlan,
+    call_index: int,
+    cache: ResponseCache | None,
+    semaphore: asyncio.Semaphore,
+    config: _JudgeConfig,
+    tracer: Tracer,
+) -> tuple[Mapping[str, float], str, bool]:
+    with traced_span(
+        tracer,
+        BENCHMARK_JUDGE_SPAN,
+        attributes={
+            BENCHMARK_TASK: sample.task,
+            SPAN_KIND: "model",
+            MODEL_MODULE: "judge",
+            "gen_ai.operation.name": "chat",
+            "gen_ai.request.model": config.model,
+        },
+    ):
+        return await _judge_call(
+            client,
+            messages,
+            sample=sample,
+            plan=plan,
+            call_index=call_index,
+            cache=cache,
+            semaphore=semaphore,
+            config=config,
         )
 
 
@@ -1114,34 +1207,48 @@ async def _judge_call(  # noqa: C901 - retry and provider fallback belong in one
         request["extra_body"] = extra_body
     use_responses_api = plan.parser == "atm" and judge_model_is_official(sample.task, config.model)
     last_error: Exception | None = None
-    for attempt in range(3):
-        try:
-            async with semaphore:
-                if use_responses_api:
-                    response = await client.responses.create(
-                        model=config.model,
-                        input="\n".join(message.content for message in messages),
-                        max_output_tokens=plan.max_tokens,
-                        reasoning={"effort": "minimal"},
+    usages = []
+    attempted = 0
+    try:
+        for attempt in range(3):
+            try:
+                async with semaphore:
+                    attempted = attempt + 1
+                    mark_model_requests(attempted)
+                    if use_responses_api:
+                        response = await client.responses.create(
+                            model=config.model,
+                            input="\n".join(message.content for message in messages),
+                            max_output_tokens=plan.max_tokens,
+                            reasoning={"effort": "minimal"},
+                        )
+                        text = str(response.output_text or "").strip()
+                    else:
+                        response = await client.chat.completions.create(**request)
+                        text = str(response.choices[0].message.content or "").strip()
+                usages.append(
+                    _model_usage(
+                        response,
+                        input_modalities=frozenset({Modality.TEXT}),
+                        output_modalities=frozenset({Modality.TEXT}),
                     )
-                    text = str(response.output_text or "").strip()
-                else:
-                    response = await client.chat.completions.create(**request)
-                    text = str(response.choices[0].message.content or "").strip()
-            scores = parse_judge_response(plan, text)
-            if cache is not None:
-                cache.put(cache_task, sample.unit_id, key, CachedAnswer(text, 0.0, ()))
-            return scores, text, False
-        except Exception as error:
-            last_error = error
-            if "extra_body" in request and _unsupported_extra_body(error):
-                request.pop("extra_body")
-                continue
-            if attempt < 2:
-                await asyncio.sleep(2**attempt)
-    if last_error is None:
-        raise RuntimeError("judge call failed without an exception")
-    raise last_error
+                )
+                scores = parse_judge_response(plan, text)
+                if cache is not None:
+                    cache.put(cache_task, sample.unit_id, key, CachedAnswer(text, 0.0, ()))
+                return scores, text, False
+            except Exception as error:
+                last_error = error
+                if "extra_body" in request and _unsupported_extra_body(error):
+                    request.pop("extra_body")
+                    continue
+                if attempt < 2:
+                    await asyncio.sleep(2**attempt)
+        if last_error is None:
+            raise RuntimeError("judge call failed without an exception")
+        raise last_error
+    finally:
+        _record_usage_batch(usages, request_count=attempted)
 
 
 def _unsupported_extra_body(error: Exception) -> bool:
@@ -1270,6 +1377,7 @@ def _results(
     duration_seconds: float,
     batch_sizes: Mapping[str, int],
     submission_status: Mapping[str, object] | None,
+    performance: Mapping[str, Mapping[str, object]],
 ) -> dict[str, object]:
     task_rows = []
     for task in tasks:
@@ -1303,6 +1411,7 @@ def _results(
                 "input_sha256": dict(task.input_sha256),
                 "evaluation_sha256": task.evaluation_sha256,
                 "batch_size": batch_sizes[task.spec.name],
+                "performance": dict(performance.get(task.spec.name, {})),
                 **metrics,
             }
         )
@@ -2018,8 +2127,15 @@ def _table(results: Mapping[str, object]) -> str:
     rows = []
     for task in tasks:
         score = cast(Mapping[str, object], task["score"])
+        performance = cast(Mapping[str, object], task["performance"])
+        duration = cast(Mapping[str, object], performance["duration_seconds"])
+        usage = cast(Mapping[str, object], performance["token_usage"])
         mean = score.get("mean")
         interval = score.get("confidence_interval_95")
+        total_duration = duration.get("total")
+        average_duration = duration.get("average")
+        total_tokens = usage.get("total_tokens")
+        average_tokens = usage.get("average_tokens")
         valid = task.get("score_valid") is not False
         rows.append(
             (
@@ -2039,9 +2155,43 @@ def _table(results: Mapping[str, object]) -> str:
                 ),
                 str(task["question_count"]),
                 str(task["error_count"]),
+                (
+                    "—"
+                    if isinstance(total_duration, bool)
+                    or not isinstance(total_duration, int | float)
+                    else f"{float(total_duration):.3f}"
+                ),
+                (
+                    "—"
+                    if isinstance(average_duration, bool)
+                    or not isinstance(average_duration, int | float)
+                    else f"{float(average_duration) * 1_000:.1f}"
+                ),
+                (
+                    "—"
+                    if isinstance(total_tokens, bool) or not isinstance(total_tokens, int)
+                    else str(total_tokens)
+                ),
+                (
+                    "—"
+                    if isinstance(average_tokens, bool)
+                    or not isinstance(average_tokens, int | float)
+                    else f"{float(average_tokens):.1f}"
+                ),
             )
         )
-    headers = ("task", "metric", "value", "95% cluster CI", "n", "errors")
+    headers = (
+        "task",
+        "metric",
+        "value",
+        "95% cluster CI",
+        "n",
+        "errors",
+        "total s",
+        "avg ms",
+        "tokens",
+        "tokens/q",
+    )
     widths = tuple(
         max(len(row[index]) for row in (headers, *rows)) for index in range(len(headers))
     )

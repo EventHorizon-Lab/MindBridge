@@ -5,14 +5,23 @@ from __future__ import annotations
 import base64
 import json
 import math
-from collections.abc import Sequence
-from dataclasses import replace
+import time
+from collections.abc import Iterator, Mapping, Sequence
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast
+
+from opentelemetry import trace
 
 if TYPE_CHECKING:
     from openai import OpenAI
 
+from mindbridge._telemetry import (
+    GEN_AI_TTFC,
+    MODEL_TTFT,
+    mark_model_requests,
+    record_model_usage,
+)
 from mindbridge.exceptions import ModelError, ValidationError
 from mindbridge.models.base import EmbedTask, ModelInput, _modalities
 from mindbridge.types import AnswerResult, AssetRef, Modality, SearchHit
@@ -134,6 +143,10 @@ class OpenAIModels:
         return self._generation_capabilities
 
     @property
+    def generation_model(self) -> str:
+        return self._generation_model
+
+    @property
     def transcription_capabilities(self) -> frozenset[Modality]:
         return self._transcription_capabilities
 
@@ -167,6 +180,7 @@ class OpenAIModels:
         ``task`` is validated but intentionally not serialized: the generic OpenAI embeddings
         contract has no task field. Task-aware providers should implement ``EmbeddingBackend``.
         """
+        mark_model_requests(0, token_usage_expected=0)
         if isinstance(inputs, (str, bytes)):
             raise ValidationError("inputs must be a sequence of model inputs")
         try:
@@ -179,6 +193,7 @@ class OpenAIModels:
         if any(not isinstance(value, ModelInput) for value in batch):
             raise ValidationError("inputs must be a sequence of ModelInput values")
         if not batch:
+            mark_model_requests(0, token_usage_expected=0)
             return ()
         for value in batch:
             _require_capabilities("embedding", value.modalities, self.embedding_capabilities)
@@ -186,8 +201,10 @@ class OpenAIModels:
         _require_consistent_assets(embedding_assets)
         _require_inline_size(embedding_assets)
 
+        create_embedding = cast(Any, self._client("embedding").embeddings.create)
+        mark_model_requests(1)
         try:
-            response = cast(Any, self._client("embedding").embeddings.create)(
+            response = create_embedding(
                 input=(
                     [value.text for value in batch]
                     if all(not value.assets for value in batch)
@@ -201,6 +218,13 @@ class OpenAIModels:
             raise
         except Exception:
             raise ModelError("embedding request failed") from None
+        _record_openai_usage(
+            response,
+            input_modalities=frozenset(
+                modality for value in batch for modality in value.modalities
+            ),
+            output_modalities=frozenset(),
+        )
         return _embedding_vectors(response, len(batch), self.embedding_dimension)
 
     def answer(
@@ -209,6 +233,103 @@ class OpenAIModels:
         hits: Sequence[SearchHit],
     ) -> AnswerResult:
         """Answer only from supplied hits, preserving native media content parts."""
+        mark_model_requests(0, token_usage_expected=0)
+        prepared = self._answer_request(question, hits)
+        if prepared is None:
+            mark_model_requests(0, token_usage_expected=0)
+            return AnswerResult(answer=UNKNOWN_ANSWER)
+        request, grounded, modalities = prepared
+        create_completion = cast(Any, self._client("generation").chat.completions.create)
+        mark_model_requests(1)
+        try:
+            response = create_completion(**request)
+        except ModelError:
+            raise
+        except Exception:
+            raise ModelError("generation request failed") from None
+        _record_openai_usage(
+            response,
+            input_modalities=modalities,
+            output_modalities=frozenset({Modality.TEXT}),
+        )
+        answer = _answer_text(response)
+        return AnswerResult(answer=answer, hits=grounded)
+
+    def stream_answer(  # noqa: C901 - stream validation and usage share one response lifecycle
+        self,
+        question: ModelInput | str,
+        hits: Sequence[SearchHit],
+    ) -> Iterator[str]:
+        """Yield grounded text deltas while recording first-token and final usage data."""
+        mark_model_requests(0, token_usage_expected=0)
+        prepared = self._answer_request(question, hits)
+        if prepared is None:
+            mark_model_requests(0, token_usage_expected=0)
+            yield UNKNOWN_ANSWER
+            return
+        request, _grounded, modalities = prepared
+        create_completion = cast(Any, self._client("generation").chat.completions.create)
+        mark_model_requests(1)
+        started = time.perf_counter()
+        usage_response: object | None = None
+        try:
+            responses = create_completion(
+                **request,
+                stream=True,
+                stream_options={"include_usage": True},
+            )
+            finish_reason: object = None
+            emitted = False
+            first_chunk = False
+            for response in responses:
+                elapsed = time.perf_counter() - started
+                span = trace.get_current_span()
+                if not first_chunk:
+                    span.set_attribute(GEN_AI_TTFC, elapsed)
+                    first_chunk = True
+                if getattr(response, "usage", None) is not None:
+                    usage_response = response
+                choices = getattr(response, "choices", None)
+                if not choices:
+                    continue
+                if (
+                    not isinstance(choices, list)
+                    or len(choices) != 1
+                    or getattr(choices[0], "index", None) != 0
+                ):
+                    raise ModelError("generation response was invalid")
+                chunk_finish_reason = getattr(choices[0], "finish_reason", None)
+                if chunk_finish_reason is not None:
+                    finish_reason = chunk_finish_reason
+                content = getattr(getattr(choices[0], "delta", None), "content", None)
+                if content is None:
+                    continue
+                if not isinstance(content, str):
+                    raise ModelError("generation response was invalid")
+                if content:
+                    if not emitted:
+                        span.set_attribute(MODEL_TTFT, elapsed)
+                    emitted = True
+                    yield content
+        except ModelError:
+            raise
+        except Exception:
+            raise ModelError("generation request failed") from None
+        finally:
+            if usage_response is not None:
+                _record_openai_usage(
+                    usage_response,
+                    input_modalities=modalities,
+                    output_modalities=frozenset({Modality.TEXT}),
+                )
+        if finish_reason in {"content_filter", "length"} or not emitted:
+            raise ModelError("generation response was invalid")
+
+    def _answer_request(
+        self,
+        question: ModelInput | str,
+        hits: Sequence[SearchHit],
+    ) -> tuple[dict[str, object], tuple[SearchHit, ...], frozenset[Modality]] | None:
         question_input = ModelInput(text=question) if isinstance(question, str) else question
         if not isinstance(question_input, ModelInput):
             raise ValidationError("question must be a ModelInput value")
@@ -219,7 +340,7 @@ class OpenAIModels:
             raise ValidationError("hits must contain SearchHit values")
         grounded = _fit_grounding_media(question_input, grounded)
         if not grounded:
-            return AnswerResult(answer=UNKNOWN_ANSWER)
+            return None
 
         assets = question_input.assets + tuple(asset for hit in grounded for asset in hit.assets)
         text_parts = (
@@ -238,7 +359,8 @@ class OpenAIModels:
             raise ModelError("grounding evidence exceeds 4 MiB; lower the answer limit")
         required = {Modality.TEXT}
         required.update(cast(Modality, asset.modality) for asset in assets)
-        _require_capabilities("generation", frozenset(required), self.generation_capabilities)
+        modalities = frozenset(required)
+        _require_capabilities("generation", modalities, self.generation_capabilities)
         unique_assets = _require_consistent_assets(assets)
         _require_inline_size(unique_assets)
         content: str | list[dict[str, object]] = (
@@ -261,44 +383,58 @@ class OpenAIModels:
             request["seed"] = self._generation_seed
         if self._generation_temperature is not None:
             request["temperature"] = self._generation_temperature
-        try:
-            response = cast(Any, self._client("generation").chat.completions.create)(**request)
-        except ModelError:
-            raise
-        except Exception:
-            raise ModelError("generation request failed") from None
-        return AnswerResult(answer=_answer_text(response), hits=grounded)
+        return request, grounded, modalities
 
     def transcribe(self, assets: Sequence[AssetRef]) -> tuple[str, ...]:
         """Transcribe resolved audio/video assets in input order."""
+        mark_model_requests(0, token_usage_expected=0)
         if isinstance(assets, (str, bytes)):
             raise ValidationError("assets must contain AssetRef values")
         batch = tuple(assets)
         if any(not isinstance(asset, AssetRef) for asset in batch):
             raise ValidationError("assets must contain AssetRef values")
+        if not batch:
+            mark_model_requests(0, token_usage_expected=0)
+            return ()
         results = []
-        for asset in batch:
-            modality, media_type, path = _resolved_asset(asset)
-            _require_capabilities(
-                "transcription", frozenset({modality}), self.transcription_capabilities
-            )
-            try:
-                with path.open("rb") as stream:
-                    response = cast(
-                        Any,
-                        self._client("transcription").audio.transcriptions.create,
-                    )(
-                        model=self.transcription_model,
-                        file=(asset.name or path.name, stream, media_type),
+        usages: list[_ModelUsage | None] = []
+        attempted = 0
+        mark_model_requests(0)
+        try:
+            for asset in batch:
+                modality, media_type, path = _resolved_asset(asset)
+                _require_capabilities(
+                    "transcription", frozenset({modality}), self.transcription_capabilities
+                )
+                create_transcription = cast(
+                    Any,
+                    self._client("transcription").audio.transcriptions.create,
+                )
+                try:
+                    with path.open("rb") as stream:
+                        attempted += 1
+                        mark_model_requests(attempted)
+                        response = create_transcription(
+                            model=self.transcription_model,
+                            file=(asset.name or path.name, stream, media_type),
+                        )
+                except ModelError:
+                    raise
+                except Exception:
+                    raise ModelError("transcription request failed") from None
+                usages.append(
+                    _model_usage(
+                        response,
+                        input_modalities=frozenset({modality}),
+                        output_modalities=frozenset({Modality.TEXT}),
                     )
-            except ModelError:
-                raise
-            except Exception:
-                raise ModelError("transcription request failed") from None
-            text = getattr(response, "text", None)
-            if not isinstance(text, str):
-                raise ModelError("transcription response was invalid") from None
-            results.append(text.strip())
+                )
+                text = getattr(response, "text", None)
+                if not isinstance(text, str):
+                    raise ModelError("transcription response was invalid") from None
+                results.append(text.strip())
+        finally:
+            _record_usage_batch(usages, request_count=attempted)
         return tuple(results)
 
     def close(self) -> None:
@@ -309,6 +445,211 @@ class OpenAIModels:
         if client is None:
             raise ModelError(f"{operation} SDK client is not configured")
         return client
+
+
+@dataclass(frozen=True, slots=True)
+class _ModelUsage:
+    token_based: bool
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    total_tokens: int | None = None
+    input_by_modality: Mapping[str, int] = field(default_factory=dict)
+    output_by_modality: Mapping[str, int] = field(default_factory=dict)
+    cached_input_tokens: int | None = None
+    reasoning_output_tokens: int | None = None
+    audio_seconds: float | None = None
+
+
+def _record_openai_usage(
+    response: object,
+    *,
+    input_modalities: frozenset[Modality],
+    output_modalities: frozenset[Modality],
+    request_count: int = 1,
+) -> None:
+    _record_usage_batch(
+        (
+            _model_usage(
+                response,
+                input_modalities=input_modalities,
+                output_modalities=output_modalities,
+            ),
+        ),
+        request_count=request_count,
+    )
+
+
+def _record_usage_batch(
+    usages: Sequence[_ModelUsage | None],
+    *,
+    request_count: int,
+) -> None:
+    available = tuple(usage for usage in usages if usage is not None)
+    token_usages = tuple(usage for usage in available if usage.token_based)
+    reported = tuple(usage for usage in token_usages if usage.total_tokens is not None)
+    missing = request_count - len(available)
+    input_tokens = _sum_known(token_usages, "input_tokens")
+    output_tokens = _sum_known(token_usages, "output_tokens")
+    total_tokens = _sum_optional(reported, "total_tokens")
+    input_by_modality = _sum_modalities(token_usages, "input_by_modality")
+    output_by_modality = _sum_modalities(token_usages, "output_by_modality")
+    audio_seconds = sum(usage.audio_seconds or 0.0 for usage in available)
+    record_model_usage(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        total_tokens=total_tokens,
+        input_by_modality=input_by_modality,
+        output_by_modality=output_by_modality,
+        request_count=request_count,
+        expected_requests=len(token_usages) + missing,
+        reported_requests=len(reported),
+        audio_seconds=audio_seconds or None,
+    )
+    span = trace.get_current_span()
+    cached = _sum_known(token_usages, "cached_input_tokens")
+    reasoning = _sum_known(token_usages, "reasoning_output_tokens")
+    if cached is not None:
+        span.set_attribute("gen_ai.usage.cache_read.input_tokens", cached)
+    if reasoning is not None:
+        span.set_attribute("gen_ai.usage.reasoning.output_tokens", reasoning)
+
+
+def _model_usage(
+    response: object,
+    *,
+    input_modalities: frozenset[Modality],
+    output_modalities: frozenset[Modality],
+) -> _ModelUsage | None:
+    usage = _member(response, "usage")
+    if usage is None:
+        return None
+    input_tokens = _count(usage, "input_tokens", "prompt_tokens")
+    output_tokens = _count(usage, "output_tokens", "completion_tokens")
+    total_tokens = _count(usage, "total_tokens")
+    seconds = _number(usage, "seconds")
+    if input_tokens is None and output_tokens is None and total_tokens is None:
+        return None if seconds is None else _ModelUsage(False, audio_seconds=seconds)
+    if not output_modalities and output_tokens is None:
+        output_tokens = 0
+    if input_tokens is None and total_tokens is not None and output_tokens is not None:
+        input_tokens = max(0, total_tokens - output_tokens)
+    if output_tokens is None and total_tokens is not None and input_tokens is not None:
+        output_tokens = max(0, total_tokens - input_tokens)
+    if total_tokens is None and input_tokens is not None and output_tokens is not None:
+        total_tokens = input_tokens + output_tokens
+    if (
+        total_tokens is not None
+        and input_tokens is not None
+        and output_tokens is not None
+        and total_tokens != input_tokens + output_tokens
+    ):
+        return None
+    input_details = _member(
+        usage,
+        "input_token_details",
+        "input_tokens_details",
+        "prompt_tokens_details",
+    )
+    output_details = _member(
+        usage,
+        "output_token_details",
+        "output_tokens_details",
+        "completion_tokens_details",
+    )
+    return _ModelUsage(
+        True,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        total_tokens=total_tokens,
+        input_by_modality=_modality_tokens(input_tokens, input_details, input_modalities),
+        output_by_modality=_modality_tokens(output_tokens, output_details, output_modalities),
+        cached_input_tokens=_count(input_details, "cached_tokens"),
+        reasoning_output_tokens=_count(output_details, "reasoning_tokens"),
+        audio_seconds=seconds,
+    )
+
+
+def _modality_tokens(
+    total: int | None,
+    details: object,
+    requested: frozenset[Modality],
+) -> Mapping[str, int]:
+    aliases = {
+        "text": ("text_tokens",),
+        "image": ("image_tokens", "vision_tokens"),
+        "video": ("video_tokens",),
+        "audio": ("audio_tokens",),
+    }
+    exact = {
+        modality: count
+        for modality, names in aliases.items()
+        if (count := _count(details, *names)) is not None
+    }
+    if total is None:
+        return exact
+    if sum(exact.values()) > total:
+        return {"unattributed": total}
+    remainder = total - sum(exact.values())
+    missing = {modality.value for modality in requested} - exact.keys()
+    if remainder and len(missing) == 1:
+        exact[missing.pop()] = remainder
+    elif remainder:
+        exact["unattributed"] = remainder
+    return exact
+
+
+def _sum_optional(usages: Sequence[_ModelUsage], name: str) -> int | None:
+    values = tuple(getattr(usage, name) for usage in usages)
+    return (
+        sum(cast(tuple[int, ...], values))
+        if values and all(v is not None for v in values)
+        else None
+    )
+
+
+def _sum_known(usages: Sequence[_ModelUsage], name: str) -> int | None:
+    values = tuple(value for usage in usages if (value := getattr(usage, name)) is not None)
+    return sum(cast(tuple[int, ...], values)) if values else None
+
+
+def _sum_modalities(
+    usages: Sequence[_ModelUsage],
+    name: str,
+) -> Mapping[str, int]:
+    totals: dict[str, int] = {}
+    for usage in usages:
+        for modality, count in cast(Mapping[str, int], getattr(usage, name)).items():
+            totals[modality] = totals.get(modality, 0) + count
+    return totals
+
+
+def _member(value: object, *names: str) -> object:
+    for name in names:
+        candidate = value.get(name) if isinstance(value, Mapping) else getattr(value, name, None)
+        if candidate is not None:
+            return candidate
+    return None
+
+
+def _count(value: object, *names: str) -> int | None:
+    candidate = _member(value, *names)
+    return (
+        candidate
+        if isinstance(candidate, int) and not isinstance(candidate, bool) and candidate >= 0
+        else None
+    )
+
+
+def _number(value: object, *names: str) -> float | None:
+    candidate = _member(value, *names)
+    if (
+        isinstance(candidate, bool)
+        or not isinstance(candidate, int | float)
+        or not math.isfinite(candidate)
+        or candidate < 0
+    ):
+        return None
+    return float(candidate)
 
 
 def _text(value: object, name: str) -> str:

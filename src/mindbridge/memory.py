@@ -14,14 +14,31 @@ import shutil
 import unicodedata
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager, suppress
+from contextlib import AbstractContextManager, contextmanager, suppress
+from contextvars import copy_context
 from dataclasses import dataclass, replace
 from datetime import date, datetime, time, timedelta, timezone
 from functools import partial
 from pathlib import Path
 from threading import Condition, RLock
+from time import perf_counter
 from typing import Protocol, TypeVar, cast
 
+from opentelemetry import trace
+from opentelemetry.trace import Span, Tracer
+from opentelemetry.util.types import AttributeValue
+
+from mindbridge._telemetry import (
+    MODEL_MODULE,
+    MODEL_TTFT,
+    SPAN_KIND,
+    TRACER_NAME,
+    current_model_request_count,
+    mark_model_requests,
+    model_span,
+    operation_span,
+    traced_span,
+)
 from mindbridge.exceptions import (
     IndexUnavailableError,
     MemoryNotFoundError,
@@ -54,6 +71,7 @@ from mindbridge.models.base import (
     ModelInput,
     SpeechAnalysis,
     SpeechBackend,
+    StreamingGenerationBackend,
     TranscriptionBackend,
     _modalities,
 )
@@ -245,8 +263,10 @@ class Memory:
         decay_half_life_days: float | None = None,
         speaker_similarity: float = 0.78,
         speaker_margin: float = 0.05,
+        tracer: Tracer | None = None,
     ) -> None:
         self.data_dir = Path(data_dir).expanduser().resolve()
+        self._tracer = trace.get_tracer(TRACER_NAME) if tracer is None else tracer
         self._owner_pid = os.getpid()
         self._write_lock = RLock()
         self._lifecycle = Condition()
@@ -320,6 +340,45 @@ class Memory:
     def __exit__(self, *_error: object) -> None:
         self.close()
 
+    def _trace(
+        self,
+        name: str,
+        *,
+        kind: str,
+        attributes: Mapping[str, AttributeValue] | None = None,
+    ) -> AbstractContextManager[Span]:
+        values = dict(attributes or {})
+        values[SPAN_KIND] = kind
+        if kind == "operation":
+            return operation_span(self._tracer, name, attributes=values)
+        return traced_span(self._tracer, name, attributes=values)
+
+    def _model_trace(
+        self,
+        module: str,
+        operation: str,
+        *,
+        model: str | None,
+        batch_size: int,
+        modalities: Iterable[Modality],
+    ) -> AbstractContextManager[Span]:
+        attributes: dict[str, AttributeValue] = {
+            MODEL_MODULE: module,
+            "gen_ai.operation.name": operation,
+            "mindbridge.model.batch_size": batch_size,
+            "mindbridge.input.modalities": tuple(
+                sorted({modality.value for modality in modalities})
+            ),
+        }
+        if model is not None:
+            attributes["gen_ai.request.model"] = model
+        attributes[SPAN_KIND] = "model"
+        return model_span(
+            self._tracer,
+            f"mindbridge.model.{module}",
+            attributes=attributes,
+        )
+
     def add(
         self,
         content: ContentInput,
@@ -330,9 +389,11 @@ class Memory:
         memory_type: MemoryType = MemoryType.SEMANTIC,
     ) -> MemoryRecord:
         """Add one native or mixed-modal memory and return its stable record."""
-        with self._operation() as assets:
+        with self._trace("mindbridge.add", kind="operation"), self._operation() as assets:
+            with self._trace("mindbridge.content.prepare", kind="stage"):
+                prepared_content = self._prepare_content(content, assets)
             prepared = _prepare_memory(
-                self._prepare_content(content, assets),
+                prepared_content,
                 occurred_at=occurred_at,
                 occurred_end=occurred_end,
                 metadata=metadata,
@@ -350,7 +411,7 @@ class Memory:
         memory_type: MemoryType = MemoryType.SEMANTIC,
     ) -> tuple[MemoryRecord, ...]:
         """Add memories in one model batch and one SQLite transaction."""
-        with self._operation() as assets:
+        with self._trace("mindbridge.add_many", kind="operation"), self._operation() as assets:
             normalized_memory_type = _memory_type(memory_type)
             if isinstance(contents, (str, bytes, Path, Blob, AssetRef, Mapping)):
                 raise ValidationError("contents must be a sequence of memory inputs")
@@ -361,22 +422,23 @@ class Memory:
             occurrences = _batch_values(occurred_at, len(batch), "occurred_at")
             occurrence_ends = _batch_values(occurred_end, len(batch), "occurred_end")
             metadata_values = _batch_values(metadata, len(batch), "metadata")
-            prepared = tuple(
-                _prepare_memory(
-                    self._prepare_content(content, assets),
-                    occurred_at=event_time,
-                    occurred_end=event_end,
-                    metadata=item_metadata,
-                    memory_type=normalized_memory_type,
+            with self._trace("mindbridge.content.prepare", kind="stage"):
+                prepared = tuple(
+                    _prepare_memory(
+                        self._prepare_content(content, assets),
+                        occurred_at=event_time,
+                        occurred_end=event_end,
+                        metadata=item_metadata,
+                        memory_type=normalized_memory_type,
+                    )
+                    for content, event_time, event_end, item_metadata in zip(
+                        batch,
+                        occurrences,
+                        occurrence_ends,
+                        metadata_values,
+                        strict=True,
+                    )
                 )
-                for content, event_time, event_end, item_metadata in zip(
-                    batch,
-                    occurrences,
-                    occurrence_ends,
-                    metadata_values,
-                    strict=True,
-                )
-            )
             if not prepared:
                 return ()
             return self._add_prepared(prepared, operation=assets)
@@ -390,9 +452,10 @@ class Memory:
         reference_at: datetime | None = None,
     ) -> tuple[SearchHit, ...]:
         """Return ranked memories for a native or mixed-modal query."""
-        with self._operation() as assets:
+        with self._trace("mindbridge.search", kind="operation"), self._operation() as assets:
             _limit(limit, maximum=100)
-            prepared = self._prepare_content(query, assets)
+            with self._trace("mindbridge.content.prepare", kind="stage"):
+                prepared = self._prepare_content(query, assets)
             reference = _reference_at(reference_at) or datetime.now(timezone.utc)
             hits = self._search_prepared(
                 prepared,
@@ -414,11 +477,12 @@ class Memory:
         reference_at: datetime | None = None,
     ) -> AnswerResult:
         """Answer a native or mixed-modal question only from retrieved memories."""
-        with self._operation() as assets:
+        with self._trace("mindbridge.ask", kind="operation"), self._operation() as assets:
             _limit(limit, maximum=100)
             if self._answerer is None:
                 raise ModelError("answer backend is not configured")
-            prepared = self._prepare_content(question, assets)
+            with self._trace("mindbridge.content.prepare", kind="stage"):
+                prepared = self._prepare_content(question, assets)
             reference = _reference_at(reference_at) or datetime.now(timezone.utc)
             temporal_range = _temporal_range(prepared.text, reference)
             search = partial(
@@ -435,7 +499,9 @@ class Memory:
                 Modality(asset.modality) in self._embedding_capabilities for asset in speech_assets
             ):
                 with ThreadPoolExecutor(max_workers=1) as executor:
+                    context = copy_context()
                     identities = executor.submit(
+                        context.run,
                         self._recognize_speech,
                         speech_assets,
                         assets,
@@ -461,7 +527,11 @@ class Memory:
 
     def get(self, memory_id: str) -> MemoryRecord:
         """Return one memory or raise `MemoryNotFoundError`."""
-        with self._operation() as assets, self._write_lock:
+        with (
+            self._trace("mindbridge.get", kind="operation"),
+            self._operation() as assets,
+            self._write_lock,
+        ):
             normalized_id = _identifier(memory_id, "memory_id")
             with _translate_storage_errors("read memory"):
                 memory = self._store.read_memory(normalized_id)
@@ -472,7 +542,7 @@ class Memory:
 
     def speech(self, memory_id: str) -> tuple[SpeakerSegment, ...]:
         """Transcribe speech and resolve stable local speaker identities."""
-        with self._operation() as operation:
+        with self._trace("mindbridge.speech", kind="operation"), self._operation() as operation:
             normalized_id = _identifier(memory_id, "memory_id")
             with self._write_lock, _translate_storage_errors("read speech memory"):
                 memory = self._store.read_memory(normalized_id)
@@ -504,7 +574,11 @@ class Memory:
         """Assign or replace a human-readable name for one recognized speaker."""
         normalized_id = _identifier(speaker_id, "speaker_id")
         normalized_name = _speaker_name(name)
-        with self._operation() as operation, self._write_lock:
+        with (
+            self._trace("mindbridge.register_speaker", kind="operation"),
+            self._operation() as operation,
+            self._write_lock,
+        ):
             with _translate_storage_errors("read speaker memories"):
                 memory_ids = self._store.speaker_memory_ids(normalized_id)
             if memory_ids is None:
@@ -554,6 +628,7 @@ class Memory:
         if not normalized:
             return 0
         with (
+            self._trace("mindbridge.reinforce", kind="operation"),
             self._operation(),
             self._write_lock,
             _translate_storage_errors("reinforce memories"),
@@ -565,7 +640,11 @@ class Memory:
 
     def list(self, *, limit: int = 100, cursor: str | None = None) -> Page:
         """List newest memories with an opaque stable keyset cursor."""
-        with self._operation() as assets, self._write_lock:
+        with (
+            self._trace("mindbridge.list", kind="operation"),
+            self._operation() as assets,
+            self._write_lock,
+        ):
             _limit(limit, maximum=100)
             after = None if cursor is None else _decode_cursor(cursor)
             with _translate_storage_errors("list memories"):
@@ -584,7 +663,11 @@ class Memory:
 
     def delete(self, memory_id: str) -> bool:
         """Delete one memory and garbage-collect media no memory still references."""
-        with self._operation(), self._write_lock:
+        with (
+            self._trace("mindbridge.delete", kind="operation"),
+            self._operation(),
+            self._write_lock,
+        ):
             normalized_id = _identifier(memory_id, "memory_id")
             with _translate_storage_errors("delete memory"):
                 deleted, orphaned = self._store.delete_memory_with_assets(normalized_id)
@@ -594,7 +677,11 @@ class Memory:
 
     def reindex(self) -> int:
         """Rebuild the disposable Zvec collection from authoritative SQLite rows."""
-        with self._operation(), self._write_lock:
+        with (
+            self._trace("mindbridge.reindex", kind="operation"),
+            self._operation(),
+            self._write_lock,
+        ):
             self._drain_outbox()
             with _translate_storage_errors("checkpoint a search-index rebuild"):
                 self._store.queue_all_embeddings()
@@ -616,7 +703,11 @@ class Memory:
 
     def optimize(self) -> None:
         """Merge staged Zvec vectors into the configured index."""
-        with self._operation(), self._write_lock:
+        with (
+            self._trace("mindbridge.optimize", kind="operation"),
+            self._operation(),
+            self._write_lock,
+        ):
             self._drain_outbox()
             with _translate_index_errors("optimize the search index"):
                 self._index.optimize()
@@ -768,7 +859,10 @@ class Memory:
     ) -> tuple[MemoryRecord, ...]:
         unique = {memory.memory_id: memory for memory in prepared}
         ordered_ids = tuple(unique)
-        with _translate_storage_errors("check existing memories"):
+        with (
+            self._trace("mindbridge.storage.lookup", kind="stage"),
+            _translate_storage_errors("check existing memories"),
+        ):
             existing_rows = self._store.read_memories(ordered_ids)
         existing_ids = {row.memory_id for row in existing_rows}
         missing = [unique[memory_id] for memory_id in ordered_ids if memory_id not in existing_ids]
@@ -837,11 +931,17 @@ class Memory:
             if stored_memories:
                 # SQLite is authoritative and uses one WAL connection per transaction. Commit
                 # before taking the index lock so ordinary concurrent writers can share one flush.
-                with _translate_storage_errors("write memories"):
+                with (
+                    self._trace("mindbridge.storage.write", kind="stage"),
+                    _translate_storage_errors("write memories"),
+                ):
                     self._store.write_memories(stored_memories, stored_embeddings)
             with self._write_lock:
                 self._drain_outbox()
-                with _translate_storage_errors("hydrate written memories"):
+                with (
+                    self._trace("mindbridge.storage.hydrate", kind="stage"),
+                    _translate_storage_errors("hydrate written memories"),
+                ):
                     authoritative = self._store.read_memories(ordered_ids)
                 operation.persisted.update(
                     asset.asset_id for memory in authoritative for asset in memory.assets
@@ -1035,7 +1135,10 @@ class Memory:
                 if not index_hits:
                     return ()
                 index_by_id = {hit.id: hit for hit in index_hits}
-                with _translate_storage_errors("hydrate search candidates"):
+                with (
+                    self._trace("mindbridge.storage.hydrate", kind="stage"),
+                    _translate_storage_errors("hydrate search candidates"),
+                ):
                     documents = self._store.read_index_documents(tuple(index_by_id))
                 parent_count = len({document.embedding.memory_id for document in documents})
                 if parent_count >= limit or exhausted or candidate_limit >= candidate_ceiling:
@@ -1059,52 +1162,60 @@ class Memory:
                     lexical_matches.add(memory_id)
             if not relevance:
                 return ()
-            with _translate_storage_errors("hydrate search results"):
-                memories = self._store.read_memories(tuple(relevance))
-            if memory_type is not None:
-                memories = tuple(
-                    memory for memory in memories if memory.memory_type == memory_type.value
-                )
-            ranked = [
-                (
-                    memory,
-                    _ranked_relevance(
-                        memory,
-                        relevance[memory.memory_id],
-                        reference_at=reference_at,
-                        temporal_range=temporal_range,
-                        decay_half_life=self._decay_half_life,
-                    ),
-                    max(
-                        confidence[memory.memory_id],
-                        (_LEXICAL_MATCH_CONFIDENCE if memory.memory_id in lexical_matches else 0.0),
-                    ),
-                    memory.memory_id in lexical_matches,
-                )
-                for memory in memories
-            ]
-            ranked = [item for item in ranked if item[2] >= self._minimum_relevance]
-            ranked.sort(key=lambda item: item[1], reverse=True)
-            if _retrieval_is_ambiguous(
-                ranked,
-                margin=self._ambiguity_margin,
-                temporal_range=temporal_range,
+            with (
+                self._trace("mindbridge.storage.hydrate", kind="stage"),
+                _translate_storage_errors("hydrate search results"),
             ):
-                return ()
-            visible = ranked[:limit]
-            self._lease_assets(
-                tuple(
-                    asset
+                memories = self._store.read_memories(tuple(relevance))
+            with self._trace("mindbridge.retrieval.rank", kind="stage"):
+                if memory_type is not None:
+                    memories = tuple(
+                        memory for memory in memories if memory.memory_type == memory_type.value
+                    )
+                ranked = [
+                    (
+                        memory,
+                        _ranked_relevance(
+                            memory,
+                            relevance[memory.memory_id],
+                            reference_at=reference_at,
+                            temporal_range=temporal_range,
+                            decay_half_life=self._decay_half_life,
+                        ),
+                        max(
+                            confidence[memory.memory_id],
+                            (
+                                _LEXICAL_MATCH_CONFIDENCE
+                                if memory.memory_id in lexical_matches
+                                else 0.0
+                            ),
+                        ),
+                        memory.memory_id in lexical_matches,
+                    )
+                    for memory in memories
+                ]
+                ranked = [item for item in ranked if item[2] >= self._minimum_relevance]
+                ranked.sort(key=lambda item: item[1], reverse=True)
+                if _retrieval_is_ambiguous(
+                    ranked,
+                    margin=self._ambiguity_margin,
+                    temporal_range=temporal_range,
+                ):
+                    return ()
+                visible = ranked[:limit]
+                self._lease_assets(
+                    tuple(
+                        asset
+                        for memory, _score, _confidence, _lexical in visible
+                        for asset in memory.assets
+                    ),
+                    operation.leased,
+                )
+                operation.persisted.update(
+                    asset.asset_id
                     for memory, _score, _confidence, _lexical in visible
                     for asset in memory.assets
-                ),
-                operation.leased,
-            )
-            operation.persisted.update(
-                asset.asset_id
-                for memory, _score, _confidence, _lexical in visible
-                for asset in memory.assets
-            )
+                )
         return tuple(
             self._search_hit(memory, score) for memory, score, _confidence, _lexical in visible
         )
@@ -1120,9 +1231,19 @@ class Memory:
         occurred_until: datetime | None = None,
     ) -> tuple[IndexHit, ...]:
         memory_type_value = None if memory_type is None else memory_type.value
-        if model_input.text:
-            return self._index.hybrid_search(
-                model_input.text,
+        with self._trace("mindbridge.index.search", kind="stage"):
+            if model_input.text:
+                return self._index.hybrid_search(
+                    model_input.text,
+                    vector,
+                    limit=limit,
+                    space_id=self._space_id,
+                    task=_DOCUMENT_TASK,
+                    memory_type=memory_type_value,
+                    occurred_from=occurred_from,
+                    occurred_until=occurred_until,
+                )
+            return self._index.search(
                 vector,
                 limit=limit,
                 space_id=self._space_id,
@@ -1131,15 +1252,6 @@ class Memory:
                 occurred_from=occurred_from,
                 occurred_until=occurred_until,
             )
-        return self._index.search(
-            vector,
-            limit=limit,
-            space_id=self._space_id,
-            task=_DOCUMENT_TASK,
-            memory_type=memory_type_value,
-            occurred_from=occurred_from,
-            occurred_until=occurred_until,
-        )
 
     def _route_embedding(self, prepared: _PreparedContent) -> ModelInput:
         value = self._resolved_model_input(prepared)
@@ -1209,7 +1321,10 @@ class Memory:
         operation: _OperationAssets,
     ) -> tuple[SearchHit, ...]:
         asset_ids = tuple(asset.id for hit in hits for asset in hit.assets)
-        with _translate_storage_errors("hydrate media for answer generation"):
+        with (
+            self._trace("mindbridge.storage.hydrate", kind="stage"),
+            _translate_storage_errors("hydrate media for answer generation"),
+        ):
             stored = self._store.read_assets(asset_ids)
         by_id = {asset.asset_id: asset for asset in stored}
         prepared_hits = []
@@ -1301,7 +1416,10 @@ class Memory:
             }.values()
         )
         missing = []
-        with _translate_storage_errors("read cached speaker recognition"):
+        with (
+            self._trace("mindbridge.storage.lookup", kind="stage"),
+            _translate_storage_errors("read cached speaker recognition"),
+        ):
             for asset in speech_assets:
                 segments = self._store.read_speech(
                     asset.asset_id,
@@ -1313,7 +1431,11 @@ class Memory:
                     operation.speech_segments[asset.asset_id] = segments
         if missing:
             analyses = self._analyze_speech(tuple(self._asset_ref(asset) for asset in missing))
-            with self._write_lock, _translate_storage_errors("persist speaker recognition"):
+            with (
+                self._trace("mindbridge.storage.write", kind="stage"),
+                self._write_lock,
+                _translate_storage_errors("persist speaker recognition"),
+            ):
                 for asset, analysis in zip(missing, analyses, strict=True):
                     self._store.write_asset(asset)
                     operation.persisted.add(asset.asset_id)
@@ -1387,7 +1509,16 @@ class Memory:
             try:
                 transcribe = getattr(self._transcriber, "transcribe", None)
                 if callable(transcribe):
-                    generated = transcribe(refs)
+                    model = getattr(self._transcriber, "transcription_model", None)
+                    with self._model_trace(
+                        "transcription",
+                        "transcription",
+                        model=model if isinstance(model, str) else None,
+                        batch_size=len(refs),
+                        modalities=(cast(Modality, asset.modality) for asset in refs),
+                    ):
+                        mark_model_requests(1)
+                        generated = transcribe(refs)
                 else:
                     analyses = self._analyze_speech(refs)
                     generated = tuple(
@@ -1422,7 +1553,11 @@ class Memory:
             if asset_id in operation.persisted
         )
         if updates or speech:
-            with self._write_lock, _translate_storage_errors("cache audio transcripts"):
+            with (
+                self._trace("mindbridge.storage.write", kind="stage"),
+                self._write_lock,
+                _translate_storage_errors("cache audio transcripts"),
+            ):
                 if updates:
                     self._store.set_asset_transcripts(updates)
                 if speech and isinstance(self._transcriber, SpeechBackend):
@@ -1442,17 +1577,25 @@ class Memory:
     ) -> tuple[SpeechAnalysis, ...]:
         if not isinstance(self._transcriber, SpeechBackend):
             raise ModelError("configured transcription backend cannot analyze speakers")
-        try:
-            analyses = self._transcriber.analyze(assets)
-        except MindBridgeError:
-            raise
-        except Exception as error:
-            raise ModelError("failed to analyze speech input") from error
-        if len(analyses) != len(assets) or any(
-            not isinstance(analysis, SpeechAnalysis) for analysis in analyses
+        with self._model_trace(
+            "transcription",
+            "transcription",
+            model=self._transcriber.transcription_model,
+            batch_size=len(assets),
+            modalities=(cast(Modality, asset.modality) for asset in assets),
         ):
-            raise ModelError("speech model returned invalid output")
-        return tuple(analyses)
+            mark_model_requests(1)
+            try:
+                analyses = self._transcriber.analyze(assets)
+            except MindBridgeError:
+                raise
+            except Exception as error:
+                raise ModelError("failed to analyze speech input") from error
+            if len(analyses) != len(assets) or any(
+                not isinstance(analysis, SpeechAnalysis) for analysis in analyses
+            ):
+                raise ModelError("speech model returned invalid output")
+            return tuple(analyses)
 
     def _resolved_model_input(self, prepared: _PreparedContent) -> ModelInput:
         return ModelInput(
@@ -1466,32 +1609,72 @@ class Memory:
         *,
         task: EmbedTask,
     ) -> tuple[tuple[float, ...], ...]:
-        try:
-            vectors = self._embedder.embed(inputs, task=task)
-        except MindBridgeError:
-            raise
-        except Exception as error:
-            raise ModelError("failed to embed memory input") from error
-        if len(vectors) != len(inputs):
-            raise ModelError("embedding model returned the wrong number of vectors")
-        return tuple(_normalized_vector(vector, self._embedding_dimension) for vector in vectors)
+        with self._model_trace(
+            "embedding",
+            "embeddings",
+            model=self._embedding_model,
+            batch_size=len(inputs),
+            modalities=(modality for value in inputs for modality in value.modalities),
+        ):
+            mark_model_requests(1)
+            try:
+                vectors = self._embedder.embed(inputs, task=task)
+            except MindBridgeError:
+                raise
+            except Exception as error:
+                raise ModelError("failed to embed memory input") from error
+            if len(vectors) != len(inputs):
+                raise ModelError("embedding model returned the wrong number of vectors")
+            return tuple(
+                _normalized_vector(vector, self._embedding_dimension) for vector in vectors
+            )
 
-    def _answer(
+    def _answer(  # noqa: C901 - streaming and non-streaming validation share one model span
         self,
         question: ModelInput,
         hits: Sequence[SearchHit],
     ) -> AnswerResult:
         if self._answerer is None:
             raise ModelError("answer backend is not configured")
-        try:
-            result = self._answerer.answer(question, hits)
-        except MindBridgeError:
-            raise
-        except Exception as error:
-            raise ModelError("failed to generate a grounded answer") from error
-        if not isinstance(result, AnswerResult):
-            raise ModelError("generation model returned an invalid answer")
-        return result
+        model = getattr(self._answerer, "generation_model", None)
+        with self._model_trace(
+            "generation",
+            "chat",
+            model=model if isinstance(model, str) else None,
+            batch_size=1,
+            modalities=(
+                modality
+                for value in (question, *(ModelInput(hit.content, hit.assets) for hit in hits))
+                for modality in value.modalities
+            ),
+        ):
+            mark_model_requests(1)
+            try:
+                if isinstance(self._answerer, StreamingGenerationBackend):
+                    started = perf_counter()
+                    parts: builtins.list[str] = []
+                    for part in self._answerer.stream_answer(question, hits):
+                        if not isinstance(part, str):
+                            raise ModelError("generation model returned an invalid answer chunk")
+                        if part:
+                            if not parts and current_model_request_count():
+                                trace.get_current_span().set_attribute(
+                                    MODEL_TTFT, perf_counter() - started
+                                )
+                            parts.append(part)
+                    answer = "".join(parts)
+                    if not answer.strip():
+                        raise ModelError("generation model returned an invalid answer")
+                    result = AnswerResult(answer=answer, hits=tuple(hits))
+                else:
+                    result = self._answerer.answer(question, hits)
+            except MindBridgeError:
+                raise
+            except Exception as error:
+                raise ModelError("failed to generate a grounded answer") from error
+            if not isinstance(result, AnswerResult):
+                raise ModelError("generation model returned an invalid answer")
+            return result
 
     def _memory_record(self, memory: StoredMemory) -> MemoryRecord:
         return MemoryRecord(
@@ -1626,6 +1809,10 @@ class Memory:
 
     def _drain_outbox(self) -> None:
         """Apply current SQLite truth, then acknowledge the exact durable operation batch."""
+        with self._trace("mindbridge.index.sync", kind="stage"):
+            self._apply_outbox()
+
+    def _apply_outbox(self) -> None:
         while True:
             with _translate_storage_errors("read the search-index outbox"):
                 operations = self._store.pending_index_operations(limit=_OUTBOX_BATCH_SIZE)
@@ -1857,6 +2044,7 @@ class AsyncMemory:
         decay_half_life_days: float | None = None,
         speaker_similarity: float = 0.78,
         speaker_margin: float = 0.05,
+        tracer: Tracer | None = None,
     ) -> None:
         self._memory = Memory(
             data_dir=data_dir,
@@ -1869,6 +2057,7 @@ class AsyncMemory:
             decay_half_life_days=decay_half_life_days,
             speaker_similarity=speaker_similarity,
             speaker_margin=speaker_margin,
+            tracer=tracer,
         )
 
     async def __aenter__(self) -> AsyncMemory:

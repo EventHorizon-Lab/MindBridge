@@ -11,6 +11,7 @@ from collections.abc import Iterable, Sequence
 from importlib import import_module
 from typing import Protocol, cast
 
+from mindbridge._telemetry import mark_model_requests, record_unmetered_model_usage
 from mindbridge.exceptions import ModelError, ValidationError
 from mindbridge.models.base import EmbedTask, ModelInput
 from mindbridge.types import AssetRef, Modality
@@ -158,6 +159,7 @@ class SentenceTransformersEmbedder:
             raise ValidationError("embedding task is invalid") from None
 
         prepared = [self._prepare(value) for value in batch]
+        mark_model_requests(1 if batch else 0, token_usage_expected=0)
         with self._lock:
             if self._closed:
                 raise ModelError("embedding backend is closed")
@@ -176,7 +178,9 @@ class SentenceTransformersEmbedder:
                 )
             except Exception:
                 raise ModelError("embedding model failed") from None
-        return _vectors(matrix, len(batch), self._dimension)
+        vectors = _vectors(matrix, len(batch), self._dimension)
+        record_unmetered_model_usage()
+        return vectors
 
     def close(self) -> None:
         """Stop new calls and release an encoder-owned resource when it exposes one."""
