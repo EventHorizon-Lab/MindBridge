@@ -219,23 +219,46 @@ class FunASRTranscriber:
         return f"{self.model_id}:speech:{digest}"
 
     def analyze(self, assets: Sequence[AssetRef]) -> tuple[SpeechAnalysis, ...]:
-        if isinstance(assets, (str, bytes)):
-            raise ValidationError("assets must contain resolved audio or video AssetRef values")
-        batch = tuple(assets)
-        for asset in batch:
-            if (
-                not isinstance(asset, AssetRef)
-                or not asset.is_resolved
-                or asset.modality not in self.capabilities
-            ):
-                raise ValidationError("assets must contain resolved audio or video AssetRef values")
+        batch = self._validated_assets(assets)
         with self._lock:
             if self._closed:
                 raise ModelError("FunASR transcriber is closed")
+            selected = tuple(
+                (index, asset) for index, asset in enumerate(batch) if _has_audio_stream(asset)
+            )
+            if not selected:
+                return tuple(SpeechAnalysis(turns=(), speakers=()) for _asset in batch)
             pipeline = self._load()
+            selected_assets = tuple(asset for _index, asset in selected)
             if isinstance(pipeline, _VLLMPipeline):
-                return self._analyze_vllm(pipeline, batch)
-            return tuple(self._analyze_one(pipeline, asset) for asset in batch)
+                analyses = self._analyze_vllm(pipeline, selected_assets)
+            else:
+                analyses = tuple(self._analyze_one(pipeline, asset) for asset in selected_assets)
+            by_index = dict(zip((index for index, _asset in selected), analyses, strict=True))
+            empty = SpeechAnalysis(turns=(), speakers=())
+            return tuple(by_index.get(index, empty) for index in range(len(batch)))
+
+    def transcribe(self, assets: Sequence[AssetRef]) -> tuple[str, ...]:
+        """Transcribe media without running speaker diarization."""
+        batch = self._validated_assets(assets)
+        with self._lock:
+            if self._closed:
+                raise ModelError("FunASR transcriber is closed")
+            selected = tuple(
+                (index, asset) for index, asset in enumerate(batch) if _has_audio_stream(asset)
+            )
+            if not selected:
+                return tuple("" for _asset in batch)
+            pipeline = self._load()
+            selected_assets = tuple(asset for _index, asset in selected)
+            if isinstance(pipeline, _VLLMPipeline):
+                transcripts = self._transcribe_vllm(pipeline, selected_assets)
+            else:
+                transcripts = tuple(
+                    self._transcribe_one(pipeline, asset) for asset in selected_assets
+                )
+            by_index = dict(zip((index for index, _asset in selected), transcripts, strict=True))
+            return tuple(by_index.get(index, "") for index in range(len(batch)))
 
     def close(self) -> None:
         with self._lock:
@@ -336,35 +359,81 @@ class FunASRTranscriber:
         self._runtime_selection = (engine, device)
         return self._runtime_selection
 
+    def _validated_assets(self, assets: Sequence[AssetRef]) -> tuple[AssetRef, ...]:
+        if isinstance(assets, (str, bytes)):
+            raise ValidationError("assets must contain resolved audio or video AssetRef values")
+        batch = tuple(assets)
+        if any(
+            not isinstance(asset, AssetRef)
+            or not asset.is_resolved
+            or asset.modality not in self.capabilities
+            for asset in batch
+        ):
+            raise ValidationError("assets must contain resolved audio or video AssetRef values")
+        return batch
+
+    def _transcribe_vllm(
+        self,
+        pipeline: _VLLMPipeline,
+        assets: tuple[AssetRef, ...],
+    ) -> tuple[str, ...]:
+        try:
+            _waveforms, sentences_by_asset = self._decode_vllm(pipeline, assets)
+            return tuple(
+                "\n".join(
+                    _SPECIAL_TOKEN.sub("", cast(str, sentence["text"])).strip()
+                    for sentence in sentences
+                )
+                for sentences in sentences_by_asset
+            )
+        except (ModelError, ValidationError):
+            raise
+        except OSError:
+            raise ValidationError("speech asset path does not exist") from None
+        except Exception as error:
+            raise ModelError("FunASR vLLM failed to transcribe speech") from error
+
+    def _decode_vllm(
+        self,
+        pipeline: _VLLMPipeline,
+        assets: tuple[AssetRef, ...],
+    ) -> tuple[tuple[_Waveform, ...], tuple[list[dict[str, object]], ...]]:
+        waveforms = tuple(_load_waveform(asset) for asset in assets)
+        spans_by_asset = tuple(_speech_spans(pipeline.vad, audio) for audio in waveforms)
+        inputs = [
+            audio[_sample_index(start) : _sample_index(end)]
+            for audio, spans in zip(waveforms, spans_by_asset, strict=True)
+            for start, end in spans
+        ]
+        results = (
+            pipeline.engine.generate(
+                inputs=inputs,
+                max_new_tokens=self._max_new_tokens,
+                # FunASR uses prompt embeddings; other values can trigger a CUDA assertion
+                # because there are no prompt token IDs.
+                repetition_penalty=1.0,
+            )
+            if inputs
+            else []
+        )
+        if not isinstance(results, list) or len(results) != len(inputs):
+            raise ModelError("FunASR vLLM returned an invalid transcription batch")
+        sentences_by_asset = []
+        offset = 0
+        for spans in spans_by_asset:
+            sentences_by_asset.append(_nano_sentences(results[offset : offset + len(spans)], spans))
+            offset += len(spans)
+        return waveforms, tuple(sentences_by_asset)
+
     def _analyze_vllm(
         self,
         pipeline: _VLLMPipeline,
         assets: tuple[AssetRef, ...],
     ) -> tuple[SpeechAnalysis, ...]:
         try:
-            waveforms = tuple(_load_waveform(asset) for asset in assets)
-            spans_by_asset = tuple(_speech_spans(pipeline.vad, audio) for audio in waveforms)
-            inputs = [
-                audio[_sample_index(start) : _sample_index(end)]
-                for audio, spans in zip(waveforms, spans_by_asset, strict=True)
-                for start, end in spans
-            ]
-            if not inputs:
-                return tuple(SpeechAnalysis(turns=(), speakers=()) for _asset in assets)
-            results = pipeline.engine.generate(
-                inputs=inputs,
-                max_new_tokens=self._max_new_tokens,
-                # FunASR uses prompt embeddings; non-neutral repetition penalties can trigger
-                # an out-of-bounds CUDA assertion because there are no prompt token IDs.
-                repetition_penalty=1.0,
-            )
-            if not isinstance(results, list) or len(results) != len(inputs):
-                raise ModelError("FunASR vLLM returned an invalid transcription batch")
+            waveforms, sentences_by_asset = self._decode_vllm(pipeline, assets)
             analyses = []
-            offset = 0
-            for audio, spans in zip(waveforms, spans_by_asset, strict=True):
-                sentences = _nano_sentences(results[offset : offset + len(spans)], spans)
-                offset += len(spans)
+            for audio, sentences in zip(waveforms, sentences_by_asset, strict=True):
                 if not sentences:
                     analyses.append(SpeechAnalysis(turns=(), speakers=()))
                     continue
@@ -431,6 +500,40 @@ class FunASRTranscriber:
             raise ModelError("FunASR returned a speaker label without a CAM++ centroid")
         return SpeechAnalysis(turns=turns, speakers=speakers)
 
+    @staticmethod
+    def _transcribe_one(pipeline: _Pipeline, asset: AssetRef) -> str:
+        path = asset.path
+        if path is None:  # AssetRef.is_resolved was checked at the boundary.
+            raise ValidationError("speech asset path is missing")
+        speaker = getattr(pipeline, "spk_model", None)
+        try:
+            if speaker is not None:
+                # FunASR 1.x still runs CAM++ embeddings when return_spk_res is false.
+                # This method holds the model lock, so temporarily disabling it is safe.
+                pipeline.spk_model = None  # type: ignore[attr-defined]
+            output = pipeline.generate(
+                input=str(path.resolve(strict=True)),
+                batch_size_s=300,
+                return_raw_text=False,
+                sentence_timestamp=False,
+                return_spk_res=False,
+                return_spk_center=False,
+                disable_pbar=True,
+            )
+        except OSError:
+            raise ValidationError("speech asset path does not exist") from None
+        except Exception as error:
+            raise ModelError("FunASR failed to transcribe speech") from error
+        finally:
+            if speaker is not None:
+                pipeline.spk_model = speaker  # type: ignore[attr-defined]
+        if not isinstance(output, list) or len(output) != 1 or not isinstance(output[0], dict):
+            raise ModelError("FunASR returned an invalid transcription batch")
+        text = output[0].get("text")
+        if not isinstance(text, str):
+            raise ModelError("FunASR returned invalid transcription text")
+        return _SPECIAL_TOKEN.sub("", text).strip()
+
 
 def _turns(value: object) -> tuple[SpeechTurn, ...]:
     if not isinstance(value, list) or len(value) > _MAX_TURNS:
@@ -458,6 +561,30 @@ def _load_waveform(asset: AssetRef) -> _Waveform:
     if callable(detach):
         waveform = detach().cpu().numpy()
     return cast(_Waveform, waveform)
+
+
+def _has_audio_stream(asset: AssetRef) -> bool:
+    if asset.modality is not Modality.VIDEO:
+        return True
+    path = asset.path
+    if path is None:
+        raise ValidationError("speech asset path is missing")
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError:
+        raise ValidationError("speech asset path does not exist") from None
+    try:
+        av = import_module("av")
+    except ImportError:
+        return True
+    try:
+        container = av.open(str(resolved))
+    except Exception:
+        return True
+    try:
+        return bool(container.streams.audio)
+    finally:
+        container.close()
 
 
 def _speech_spans(pipeline: _Pipeline, audio: _Waveform) -> tuple[tuple[int, int], ...]:

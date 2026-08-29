@@ -116,8 +116,9 @@ not model names:
 1. Natively supported media remains in the model input.
 2. If embedding does not support audio, audio is transcribed and removed; its transcript is added
    to the text while supported image and video parts remain.
-3. Generation uses the same fallback, allowing a visual-language model to receive ASR text plus
-   retained visual evidence.
+3. Grounded generation with a `SpeechBackend` resolves timed local speaker identities for supported
+   audio/video and includes them as structured evidence. Unsupported audio is removed after that
+   analysis, while supported visual evidence remains.
 4. If the remaining input is unsupported, the operation fails with `ModelError`.
 
 An audio-only input therefore becomes transcript-only when fallback is required. A video or image
@@ -130,10 +131,10 @@ changing the embedding space. The store also persists `transcription_space`, whi
 ASR model and transcript-affecting preprocessing recipe. Reopening with a different value fails
 before use so cached transcripts and add-time derived text cannot silently mix recipes.
 
-FunASR's `SPK0` labels are local to one asset. `Memory.speech` matches their normalized CAM++
-centroids to stable local `speaker_id` values inside the physical data directory. A first
-observation enrolls an identity; only later matches carry an `identity_score`. Applications may
-attach a display name with `register_speaker`; the biometric vector remains local.
+FunASR's `SPK0` labels are local to one asset. `Memory.speech` and the grounded answer route match
+their normalized CAM++ centroids to stable local `speaker_id` values inside the physical data
+directory. A first observation enrolls an identity; only later matches carry an `identity_score`.
+Applications may attach a display name with `register_speaker`; the biometric vector remains local.
 
 ## Retrieval and grounded answers
 
@@ -143,8 +144,10 @@ and rechecked after SQLite hydration. Temporal intent and optional decay over-fe
 and rerank it. Each hydrated hit has a score from 0 through 1; scores rank results within a request
 and are not stable global probabilities.
 
-`ask` retrieves evidence first and routes those hits, including retained media, to generation.
-Generation-time ASR can cache an asset transcript, but it does not rewrite an existing record's
+`ask` retrieves evidence first and routes those hits, including retained media, to generation. A
+configured `SpeechBackend` caches complete identity analysis and adds each segment's timing, text,
+stable ID, optional registered name, and match score to the model-only grounding context; returned
+source hits remain unchanged. Generation-time analysis does not rewrite an existing record's
 `content`. `AnswerResult` contains the answer and source hits for display or grounding audits. The
 built-in backend sends one binary content part per distinct asset in an answer request, even when
 the question or several hits refer to it.

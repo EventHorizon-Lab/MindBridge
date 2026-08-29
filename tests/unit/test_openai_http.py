@@ -1,6 +1,7 @@
 """Focused checks for the dependency-light default model backend."""
 
 import json
+from collections.abc import Iterator
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal, cast
@@ -17,6 +18,14 @@ from mindbridge.types import AssetRef, Modality, SearchHit
 
 NOW = datetime(2026, 8, 27, tzinfo=timezone.utc)
 ALL_MODALITIES = frozenset({Modality.TEXT, Modality.IMAGE, Modality.VIDEO, Modality.AUDIO})
+
+
+class _SSEStream(httpx.SyncByteStream):
+    def __init__(self, chunks: list[bytes]) -> None:
+        self._chunks = chunks
+
+    def __iter__(self) -> Iterator[bytes]:
+        yield from self._chunks
 
 
 def test_config_resolves_independent_endpoints_keys_and_explicit_capabilities() -> None:
@@ -249,6 +258,85 @@ def test_answer_can_pin_sampling_for_reproducible_evaluation() -> None:
         ).answer("What?", (hit,))
 
     assert answer.answer == "Pinned."
+
+
+def test_answer_streams_upstream_and_observes_first_content_token() -> None:
+    observations: list[tuple[float | None, float, bool]] = []
+
+    class ObservedOpenAIHTTP(OpenAIHTTP):
+        def _observe_generation(
+            self,
+            *,
+            ttft_seconds: float | None,
+            duration_seconds: float,
+            failed: bool,
+        ) -> None:
+            observations.append((ttft_seconds, duration_seconds, failed))
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        assert json.loads(request.content)["stream"] is True
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream; charset=utf-8"},
+            stream=_SSEStream(
+                [
+                    b'data: {"choices":[{"index":0,"delta":{"role":"assistant"},'
+                    b'"finish_reason":null}]}\n\n',
+                    b'data: {"choices":[{"index":0,"delta":{"content":"Pin"},'
+                    b'"finish_reason":null}]}\n\n',
+                    b'data: {"choices":[{"index":0,"delta":{"content":"ned."},'
+                    b'"finish_reason":"stop"}]}\n\n',
+                    b"data: [DONE]\n\n",
+                ]
+            ),
+        )
+
+    hit = SearchHit(id="memory_1", content="evidence", score=0.9, created_at=NOW)
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        answer = ObservedOpenAIHTTP(_config(), client=client).answer("What?", (hit,))
+
+    assert answer.answer == "Pinned."
+    assert len(observations) == 1
+    ttft, duration, failed = observations[0]
+    assert ttft is not None and 0 <= ttft <= duration
+    assert failed is False
+
+
+def test_streamed_answer_rejects_truncation_and_observes_failure() -> None:
+    observations: list[tuple[float | None, float, bool]] = []
+
+    class ObservedOpenAIHTTP(OpenAIHTTP):
+        def _observe_generation(
+            self,
+            *,
+            ttft_seconds: float | None,
+            duration_seconds: float,
+            failed: bool,
+        ) -> None:
+            observations.append((ttft_seconds, duration_seconds, failed))
+
+    def respond(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            stream=_SSEStream(
+                [
+                    b'data: {"choices":[{"index":0,"delta":{"content":"partial"},'
+                    b'"finish_reason":null}]}\n\n'
+                ]
+            ),
+        )
+
+    hit = SearchHit(id="memory_1", content="evidence", score=0.9, created_at=NOW)
+    with (
+        httpx.Client(transport=httpx.MockTransport(respond)) as client,
+        pytest.raises(ModelError, match="invalid"),
+    ):
+        ObservedOpenAIHTTP(_config(), client=client).answer("What?", (hit,))
+
+    assert len(observations) == 1
+    _ttft, _duration, failed = observations[0]
+    assert failed is True
 
 
 def test_answer_rejects_an_oversized_grounding_payload(

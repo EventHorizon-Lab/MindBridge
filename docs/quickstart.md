@@ -158,6 +158,8 @@ Routing follows declared capabilities, never a model-name heuristic:
   and embeds the transcript together with any still-supported image or video parts.
 - Generation follows the same rule. A visual-language model without audio receives ASR text plus
   the retained image or video evidence.
+- With a `SpeechBackend`, `ask` also resolves supported audio/video into timed stable speaker
+  identities and supplies IDs, registered names, and match scores as structured grounding evidence.
 - Audio-only input becomes transcript-only after this fallback; visual parts are never dropped to
   force an unsupported fallback.
 - If no valid route exists, MindBridge raises `ModelError` instead of ignoring content.
@@ -174,8 +176,8 @@ allocate a new directory and re-ingest rather than editing stored metadata.
 
 Call `memory.speech(record.id)` to get timed `SpeakerSegment` values. The first recording enrolls
 an opaque local `speaker_id`; later recordings with a clear CAM++ match reuse that ID. Analysis is
-lazy and cached in SQLite. Assign a name after enrollment; registration also updates already
-cached recordings:
+lazy and cached in SQLite; `ask` uses the same complete identity path for its question and retrieved
+evidence. Assign a name after enrollment; registration also updates already cached recordings:
 
 ```python
 turns = memory.speech(record.id)

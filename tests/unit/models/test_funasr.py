@@ -18,7 +18,7 @@ from mindbridge.models.funasr import (
 from mindbridge.types import AssetRef, Modality
 
 
-def test_default_funasr_recipe_returns_speaker_turns_and_centroids(
+def test_default_funasr_recipe_transcribes_without_speakers_and_analyzes_them(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -27,8 +27,11 @@ def test_default_funasr_recipe_returns_speaker_turns_and_centroids(
     calls: list[dict[str, object]] = []
 
     class Pipeline:
+        def __init__(self) -> None:
+            self.spk_model: object | None = object()
+
         def generate(self, **kwargs: object) -> list[dict[str, object]]:
-            calls.append(kwargs)
+            calls.append({**kwargs, "speaker_enabled": self.spk_model is not None})
             return [
                 {
                     "text": "你好。",
@@ -66,9 +69,14 @@ def test_default_funasr_recipe_returns_speaker_turns_and_centroids(
         path=audio,
     )
 
+    transcript = transcriber.transcribe((asset,))[0]
     first = transcriber.analyze((asset,))[0]
     second = transcriber.analyze((asset,))[0]
 
+    assert transcript == "你好。"
+    assert calls[0]["speaker_enabled"] is False
+    assert calls[0]["return_spk_res"] is False
+    assert calls[1]["speaker_enabled"] is True
     assert first == second
     assert first.turns[0].text == "你好。"
     assert first.turns[0].speaker_label == "0"
@@ -79,11 +87,54 @@ def test_default_funasr_recipe_returns_speaker_turns_and_centroids(
     assert arguments["spk_model"] == DEFAULT_FUNASR_SPEAKER_MODEL_ID
     assert arguments["device"] == "cpu"
     assert "trust_remote_code" not in arguments
-    assert len(calls) == 2
+    assert len(calls) == 3
 
     transcriber.close()
     with pytest.raises(ModelError, match="closed"):
         transcriber.analyze((asset,))
+
+
+def test_silent_video_returns_empty_speech_without_loading_models(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    video = tmp_path / "silent.mp4"
+    video.write_bytes(b"fake silent video")
+    opened: list[str] = []
+
+    class Container:
+        streams = SimpleNamespace(audio=())
+
+        def close(self) -> None:
+            pass
+
+    def open_video(path: str) -> Container:
+        opened.append(path)
+        return Container()
+
+    def import_module(name: str) -> object:
+        if name == "av":
+            return SimpleNamespace(open=open_video)
+        raise AssertionError(f"silent video unexpectedly loaded {name}")
+
+    monkeypatch.setattr(funasr_module, "import_module", import_module)
+    digest = sha256(video.read_bytes()).hexdigest()
+    asset = AssetRef(
+        digest,
+        modality=Modality.VIDEO,
+        media_type="video/mp4",
+        size_bytes=video.stat().st_size,
+        sha256=digest,
+        name=video.name,
+        path=video,
+    )
+    transcriber = FunASRTranscriber()
+
+    assert transcriber.transcribe((asset,)) == ("",)
+    analysis = transcriber.analyze((asset,))[0]
+    assert analysis.turns == ()
+    assert analysis.speakers == ()
+    assert opened == [str(video.resolve()), str(video.resolve())]
 
 
 def test_vllm_batches_vad_spans_and_keeps_speaker_centroids(  # noqa: C901
@@ -91,6 +142,7 @@ def test_vllm_batches_vad_spans_and_keeps_speaker_centroids(  # noqa: C901
     tmp_path: Path,
 ) -> None:
     calls: list[dict[str, object]] = []
+    label_calls: list[int] = []
     loaded: list[dict[str, object]] = []
 
     class Engine:
@@ -130,6 +182,7 @@ def test_vllm_batches_vad_spans_and_keeps_speaker_centroids(  # noqa: C901
         _audio: object,
         sentences: list[dict[str, object]],
     ) -> list[list[float]]:
+        label_calls.append(len(sentences))
         for sentence in sentences:
             sentence["spk"] = 0
         return [[3.0, 4.0]]
@@ -156,12 +209,15 @@ def test_vllm_batches_vad_spans_and_keeps_speaker_centroids(  # noqa: C901
 
     transcriber = FunASRTranscriber(engine="vllm", device="cuda")
     assert transcriber.space_id != FunASRTranscriber(engine="automodel", device="cuda").space_id
+    transcripts = transcriber.transcribe(assets)
     analyses = transcriber.analyze(assets)
 
+    assert transcripts == ("turn 0", "turn 1")
     assert [analysis.turns[0].text for analysis in analyses] == ["turn 0", "turn 1"]
     assert all(analysis.turns[0].speaker_label == "0" for analysis in analyses)
     assert all(analysis.speakers[0].values == pytest.approx((0.6, 0.8)) for analysis in analyses)
-    assert len(calls) == 1
+    assert label_calls == [1, 1]
+    assert len(calls) == 2
     batch_inputs = calls[0]["inputs"]
     assert isinstance(batch_inputs, list) and len(batch_inputs) == 2
     assert calls[0]["repetition_penalty"] == 1.0

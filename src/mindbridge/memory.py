@@ -13,9 +13,11 @@ import re
 import shutil
 import unicodedata
 from collections.abc import Iterable, Iterator, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, replace
 from datetime import date, datetime, time, timedelta, timezone
+from functools import partial
 from pathlib import Path
 from threading import Condition, RLock
 from typing import Protocol, cast
@@ -212,6 +214,7 @@ class _OperationAssets:
     transcripts: dict[str, str]
     transcript_updates: dict[str, str]
     speech_updates: dict[str, SpeechAnalysis]
+    speech_segments: dict[str, tuple[SpeakerSegment, ...]]
 
 
 class Memory:
@@ -413,7 +416,8 @@ class Memory:
             prepared = self._prepare_content(question, assets)
             reference = _reference_at(reference_at) or datetime.now(timezone.utc)
             temporal_range = _temporal_range(prepared.text, reference)
-            hits = self._search_prepared(
+            search = partial(
+                self._search_prepared,
                 prepared,
                 limit=limit,
                 operation=assets,
@@ -421,6 +425,22 @@ class Memory:
                 reference_at=reference,
                 temporal_range=temporal_range,
             )
+            speech_assets = self._answer_speech_assets(prepared.assets)
+            if speech_assets and all(
+                Modality(asset.modality) in self._capabilities.embedding for asset in speech_assets
+            ):
+                with ThreadPoolExecutor(max_workers=1) as executor:
+                    identities = executor.submit(
+                        self._recognize_speech,
+                        speech_assets,
+                        assets,
+                    )
+                    hits = search()
+                    identities.result()
+            else:
+                if speech_assets:
+                    self._recognize_speech(speech_assets, assets)
+                hits = search()
             routed_question = self._route_generation(
                 (
                     _with_reference_time(prepared, reference)
@@ -468,31 +488,12 @@ class Memory:
                 )
             self._lease_assets(speech_assets, operation.leased)
             operation.persisted.update(asset.asset_id for asset in speech_assets)
-            cached: dict[str, tuple[SpeakerSegment, ...]] = {}
-            missing = []
-            with _translate_storage_errors("read cached speaker recognition"):
-                for asset in speech_assets:
-                    segments = self._store.read_speech(
-                        asset.asset_id,
-                        space_id=self._transcription_space,
-                    )
-                    if segments is None:
-                        missing.append(asset)
-                    else:
-                        cached[asset.asset_id] = segments
-            if missing:
-                analyses = self._analyze_speech(tuple(self._asset_ref(asset) for asset in missing))
-                with self._write_lock, _translate_storage_errors("persist speaker recognition"):
-                    for asset, analysis in zip(missing, analyses, strict=True):
-                        cached[asset.asset_id] = self._store.write_speech(
-                            asset.asset_id,
-                            analysis,
-                            model_id=self._transcriber.model_id,
-                            space_id=self._transcription_space,
-                            minimum_similarity=self._speaker_similarity,
-                            minimum_margin=self._speaker_margin,
-                        )
-            return tuple(segment for asset in speech_assets for segment in cached[asset.asset_id])
+            self._recognize_speech(speech_assets, operation)
+            return tuple(
+                segment
+                for asset in speech_assets
+                for segment in operation.speech_segments[asset.asset_id]
+            )
 
     def register_speaker(self, speaker_id: str, name: str) -> None:
         """Assign or replace a human-readable name for one recognized speaker."""
@@ -541,7 +542,9 @@ class Memory:
                 self._store.queue_all_embeddings()
             with _translate_index_errors("rebuild the search index"):
                 count = self._index.rebuild(self._index_documents(), batch_size=_REINDEX_PAGE_SIZE)
-            self._acknowledge_outbox()
+            # Adds may commit SQLite while the rebuild owns the Zvec boundary. Replay instead of
+            # blindly acknowledging so records committed after its SQLite scan cannot be lost.
+            self._drain_outbox()
             return count
 
     def optimize(self) -> None:
@@ -759,23 +762,13 @@ class Memory:
                 )
                 for memory, vector in zip(missing, vectors, strict=True)
             )
+        if stored_memories:
+            # SQLite is authoritative and uses one WAL connection per transaction. Commit before
+            # taking the index lock so concurrent writers can accumulate one durable outbox batch
+            # and share the expensive Zvec flush.
+            with _translate_storage_errors("write memories"):
+                self._store.write_memories(stored_memories, stored_embeddings)
         with self._write_lock:
-            if stored_memories:
-                candidate_ids = tuple(memory.memory_id for memory in stored_memories)
-                with _translate_storage_errors("recheck existing memories"):
-                    concurrent = self._store.read_memories(candidate_ids)
-                concurrent_ids = {memory.memory_id for memory in concurrent}
-                writes = tuple(
-                    memory for memory in stored_memories if memory.memory_id not in concurrent_ids
-                )
-                embeddings = tuple(
-                    embedding
-                    for embedding in stored_embeddings
-                    if embedding.memory_id not in concurrent_ids
-                )
-                if writes:
-                    with _translate_storage_errors("write memories"):
-                        self._store.write_memories(writes, embeddings)
             self._drain_outbox()
             with _translate_storage_errors("hydrate written memories"):
                 authoritative = self._store.read_memories(ordered_ids)
@@ -950,6 +943,8 @@ class Memory:
             self._capabilities.generation,
             "generation",
         )
+        if self._answer_speech_assets(prepared.assets):
+            prepared = self._with_speech_identities(prepared, operation)
         if Modality.AUDIO in unsupported:
             prepared = self._with_audio_transcripts(prepared, operation)
         value = self._resolved_model_input(prepared)
@@ -998,6 +993,12 @@ class Memory:
                     self._capabilities.generation,
                     "generation",
                 )
+        speech_assets = self._answer_speech_assets(
+            tuple(asset for prepared in prepared_hits for asset in prepared.assets)
+        )
+        if speech_assets:
+            self._recognize_speech(speech_assets, operation)
+        elif Modality.AUDIO not in self._capabilities.generation:
             self._cache_audio_transcripts(
                 tuple(asset for prepared in prepared_hits for asset in prepared.assets),
                 operation,
@@ -1015,6 +1016,77 @@ class Memory:
             )
         return tuple(routed)
 
+    def _answer_speech_assets(
+        self,
+        assets: Sequence[StoredAsset],
+    ) -> tuple[StoredAsset, ...]:
+        if not isinstance(self._transcriber, SpeechBackend):
+            return ()
+        supported = {modality.value for modality in self._capabilities.transcription}
+        return tuple(
+            {
+                asset.asset_id: asset
+                for asset in assets
+                if asset.modality in {"audio", "video"} and asset.modality in supported
+            }.values()
+        )
+
+    def _with_speech_identities(
+        self,
+        prepared: _PreparedContent,
+        operation: _OperationAssets,
+    ) -> _PreparedContent:
+        speech_assets = self._answer_speech_assets(prepared.assets)
+        self._recognize_speech(speech_assets, operation)
+        text = _speech_identity_text(prepared.text, speech_assets, operation.speech_segments)
+        if len(text) > _MAX_TEXT_CHARACTERS:
+            raise ModelError("speaker identity evidence exceeded the supported text length")
+        return replace(prepared, text=text)
+
+    def _recognize_speech(
+        self,
+        assets: Sequence[StoredAsset],
+        operation: _OperationAssets,
+    ) -> None:
+        if not isinstance(self._transcriber, SpeechBackend):
+            raise ModelError("configured transcription backend cannot analyze speakers")
+        speech_assets = tuple(
+            {
+                asset.asset_id: asset
+                for asset in assets
+                if asset.modality in {"audio", "video"}
+                and asset.asset_id not in operation.speech_segments
+            }.values()
+        )
+        missing = []
+        with _translate_storage_errors("read cached speaker recognition"):
+            for asset in speech_assets:
+                segments = self._store.read_speech(
+                    asset.asset_id,
+                    space_id=self._transcription_space,
+                )
+                if segments is None:
+                    missing.append(asset)
+                else:
+                    operation.speech_segments[asset.asset_id] = segments
+        if missing:
+            analyses = self._analyze_speech(tuple(self._asset_ref(asset) for asset in missing))
+            with self._write_lock, _translate_storage_errors("persist speaker recognition"):
+                for asset, analysis in zip(missing, analyses, strict=True):
+                    self._store.write_asset(asset)
+                    operation.persisted.add(asset.asset_id)
+                    operation.speech_segments[asset.asset_id] = self._store.write_speech(
+                        asset.asset_id,
+                        analysis,
+                        model_id=self._transcriber.model_id,
+                        space_id=self._transcription_space,
+                        minimum_similarity=self._speaker_similarity,
+                        minimum_margin=self._speaker_margin,
+                    )
+        for asset in speech_assets:
+            segments = operation.speech_segments[asset.asset_id]
+            operation.transcripts[asset.asset_id] = "\n".join(segment.text for segment in segments)
+
     def _with_audio_transcripts(
         self,
         prepared: _PreparedContent,
@@ -1028,7 +1100,10 @@ class Memory:
             else asset
             for asset in prepared.assets
         )
-        text = _derived_text(prepared.text, assets)
+        text = _derived_text(
+            prepared.text,
+            tuple(asset for asset in assets if asset.asset_id not in operation.speech_segments),
+        )
         if len(text) > _MAX_TEXT_CHARACTERS:
             raise ModelError("audio transcription exceeded the supported text length")
         return replace(prepared, text=text, assets=assets)
@@ -1055,14 +1130,15 @@ class Memory:
             by_id = {asset.asset_id: asset for asset in audio}
             refs = tuple(self._asset_ref(by_id[asset_id]) for asset_id in missing)
             try:
-                if isinstance(self._transcriber, SpeechBackend):
+                transcribe = getattr(self._transcriber, "transcribe", None)
+                if callable(transcribe):
+                    generated = transcribe(refs)
+                else:
                     analyses = self._analyze_speech(refs)
                     generated = tuple(
                         "\n".join(turn.text for turn in analysis.turns) for analysis in analyses
                     )
                     operation.speech_updates.update(zip(missing, analyses, strict=True))
-                else:
-                    generated = self._transcriber.transcribe(refs)
             except MindBridgeError:
                 raise
             except Exception as error:
@@ -1326,18 +1402,6 @@ class Memory:
             if acknowledged != len(operations):
                 raise StorageError("search-index outbox changed while it was being acknowledged")
 
-    def _acknowledge_outbox(self) -> None:
-        """Acknowledge rebuild checkpoints after the full index is durable."""
-        while True:
-            with _translate_storage_errors("read the rebuilt search-index checkpoint"):
-                operations = self._store.pending_index_operations(limit=_OUTBOX_BATCH_SIZE)
-            if not operations:
-                return
-            with _translate_storage_errors("acknowledge the rebuilt search-index checkpoint"):
-                acknowledged = self._store.acknowledge_index_operations(operations)
-            if acknowledged != len(operations):
-                raise StorageError("search-index outbox changed while it was being acknowledged")
-
     def _index_documents(self) -> Iterator[IndexDocument]:
         after: tuple[datetime, str] | None = None
         while True:
@@ -1428,6 +1492,7 @@ class Memory:
             transcripts={},
             transcript_updates={},
             speech_updates={},
+            speech_segments={},
         )
         try:
             yield assets
@@ -1686,6 +1751,35 @@ def _derived_text(text: str, assets: Sequence[StoredAsset]) -> str:
         marker = f"[audio transcript:{asset.asset_id}]"
         if marker not in text:
             sections.append(f"{marker}\n{transcript}")
+    return "\n\n".join(sections)
+
+
+def _speech_identity_text(
+    text: str,
+    assets: Sequence[StoredAsset],
+    segments_by_asset: Mapping[str, tuple[SpeakerSegment, ...]],
+) -> str:
+    sections = [text] if text else []
+    for asset in dict.fromkeys(asset.asset_id for asset in assets):
+        segments = segments_by_asset[asset]
+        evidence = {
+            "asset_id": asset,
+            "segments": [
+                {
+                    "start_ms": segment.start_ms,
+                    "end_ms": segment.end_ms,
+                    "text": segment.text,
+                    "speaker_id": segment.speaker_id,
+                    "speaker_name": segment.speaker_name,
+                    "identity_score": segment.identity_score,
+                }
+                for segment in segments
+            ],
+        }
+        sections.append(
+            f"[speech identities:{asset}]\n"
+            + json.dumps(evidence, ensure_ascii=False, separators=(",", ":"))
+        )
     return "\n\n".join(sections)
 
 

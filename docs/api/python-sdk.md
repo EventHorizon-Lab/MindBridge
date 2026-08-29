@@ -238,6 +238,10 @@ voiceprints. Repeated calls for the same asset and speech space do not run infer
 combined backend that only implements plain `transcribe` can provide ASR fallback but raises
 `ModelError` here because it has no speaker evidence.
 
+`ask` uses this same identity cache for supported audio/video in the question and retrieved hits.
+Generation receives every segment's timing, transcript, stable `speaker_id`, current
+`speaker_name`, and `identity_score`; the public `AnswerResult.hits` remain unchanged.
+
 ### `register_speaker`
 
 ```python
@@ -307,8 +311,10 @@ Input modality is derived from media families:
 
 The configured `ModelCapabilities` drives each operation. Unsupported audio can fall back through
 `transcribe`: audio is removed from that model call, transcript text is added, and supported image
-or video atoms remain. MindBridge never guesses from model names or silently drops unsupported
-visual media.
+or video atoms remain. When the configured transcriber is a `SpeechBackend`, grounded generation
+uses its full speaker analysis for supported audio/video regardless of whether generation accepts
+the native media. MindBridge never guesses from model names or silently drops unsupported visual
+media.
 
 ## `AsyncMemory`
 
@@ -407,12 +413,15 @@ JinaOmniEmbedder.load(
     dimension: int = 1024,
     device: str | None = None,
     batch_size: int = 32,
+    batch_wait_ms: float = 2.0,
 ) -> JinaOmniEmbedder
 ```
 
 It declares text, image, video, and audio. The pinned model accepts dimensions `32`, `64`, `128`,
 `256`, `512`, and `1024`; another value fails before inference. Jina's legacy tuple conversion and
-remote-code isolation exist only in this adapter.
+remote-code isolation exist only in this adapter. Concurrent calls with the same retrieval task are
+coalesced up to `batch_size`; `batch_wait_ms` is the maximum collection window and may be set to
+zero for latency-first workloads.
 
 `SentenceTransformersEmbedder.load` loads any standard model at an immutable commit:
 
@@ -444,6 +453,12 @@ into a new directory. `reindex()` does not re-embed.
 `DEFAULT_FUNASR_RECIPE` composes pinned Fun-ASR-Nano, FSMN-VAD, and CAM++ revisions, with a
 30-second VAD segment ceiling and `trust_remote_code=False`. Construct a different `FunASRRecipe`
 to swap that composition.
+
+Embedding-only audio-to-text fallback uses `FunASRTranscriber.transcribe()` and skips CAM++ speaker
+embedding and clustering. `Memory.speech()` and `Memory.ask()` call `analyze()` for timed identity
+evidence. When the embedder accepts a question's audio/video natively, `ask()` overlaps its complete
+speech analysis with query embedding and retrieval before invoking generation. If embedding needs
+the transcript, the one complete analysis runs first and its transcript is reused.
 
 For high-throughput CUDA inference, pin the vLLM build matching the machine's NVIDIA driver, then
 install `mindbridge[local,vllm]` and select it explicitly:
