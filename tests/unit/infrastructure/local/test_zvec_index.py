@@ -47,6 +47,28 @@ def test_every_batch_status_is_checked() -> None:
         index.upsert([_document("embedding_bad", "content", (1.0, 0.0))])
 
 
+def test_only_aggregate_vector_carries_full_text() -> None:
+    index = object.__new__(ZvecIndex)
+    index.dimension = 2
+    index._zvec = _FakeZvec
+    collection = _CapturingCollection()
+    index._collection = collection
+
+    index.upsert(
+        [
+            _document("aggregate", "shared text", (1.0, 0.0)),
+            _document("child", "shared text", (0.0, 1.0), object_part=1),
+        ]
+    )
+
+    assert [
+        cast(dict[str, object], document["fields"])["content"] for document in collection.documents
+    ] == [
+        "shared text",
+        "",
+    ]
+
+
 def test_delete_accepts_only_not_found_failures() -> None:
     index = object.__new__(ZvecIndex)
     index._zvec = _FakeZvec
@@ -165,6 +187,14 @@ def test_type_and_event_time_filters_apply_to_dense_and_hybrid_search(tmp_path: 
             occurred_at=datetime(2026, 8, 26, tzinfo=timezone.utc),
         ),
         _document(
+            "episodic_overlap",
+            "project review",
+            (1.0, 0.0),
+            memory_type="episodic",
+            occurred_at=datetime(2026, 8, 16, tzinfo=timezone.utc),
+            occurred_end=datetime(2026, 8, 18, tzinfo=timezone.utc),
+        ),
+        _document(
             "semantic_match",
             "project review",
             (1.0, 0.0),
@@ -189,8 +219,8 @@ def test_type_and_event_time_filters_apply_to_dense_and_hybrid_search(tmp_path: 
             exact=True,
         )
 
-    assert tuple(hit.id for hit in dense) == ("episodic_match",)
-    assert tuple(hit.id for hit in hybrid) == ("episodic_match",)
+    assert {hit.id for hit in dense} == {"episodic_match", "episodic_overlap"}
+    assert {hit.id for hit in hybrid} == {"episodic_match", "episodic_overlap"}
 
 
 def test_open_rejects_an_incompatible_schema(tmp_path: Path) -> None:
@@ -233,6 +263,8 @@ def _document(
     task: str = "document",
     memory_type: str = "semantic",
     occurred_at: datetime | None = None,
+    occurred_end: datetime | None = None,
+    object_part: int = 0,
 ) -> IndexDocument:
     return IndexDocument(
         embedding=StoredEmbedding(
@@ -242,6 +274,7 @@ def _document(
             model_id="test-model",
             space_id=space_id,
             task=task,
+            object_part=object_part,
             normalized=False,
             created_at=_NOW,
         ),
@@ -249,6 +282,7 @@ def _document(
         metadata_json="{}",
         memory_type=memory_type,
         occurred_at=occurred_at,
+        occurred_end=occurred_end,
     )
 
 
@@ -289,6 +323,15 @@ class _FailingCollection:
     @staticmethod
     def upsert(_documents: Sequence[object]) -> list[_Status]:
         return [_Status(_StatusCode.INTERNAL_ERROR, "disk full")]
+
+
+class _CapturingCollection:
+    def __init__(self) -> None:
+        self.documents: list[dict[str, object]] = []
+
+    def upsert(self, documents: Sequence[object]) -> list[_Status]:
+        self.documents = cast(list[dict[str, object]], list(documents))
+        return [_Status(_StatusCode.OK) for _document in documents]
 
 
 class _DeletingCollection:

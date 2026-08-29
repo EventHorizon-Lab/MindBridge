@@ -136,6 +136,7 @@ _Content: TypeAlias = _Text | _Parts
 class MemoryCreate(_RequestModel):
     content: _Content
     occurred_at: AwareDatetime | None = None
+    occurred_end: AwareDatetime | None = None
     metadata: dict[str, JsonValue] = Field(default_factory=dict)
     memory_type: MemoryType = MemoryType.SEMANTIC
 
@@ -180,6 +181,7 @@ class MemoryResponse(_ResponseModel):
     assets: tuple[AssetResponse, ...] = ()
     created_at: AwareDatetime
     occurred_at: AwareDatetime | None = None
+    occurred_end: AwareDatetime | None = None
     metadata: dict[str, JsonValue]
 
 
@@ -215,6 +217,7 @@ class _Memory(Protocol):
         content: ContentInput,
         *,
         occurred_at: datetime | None = None,
+        occurred_end: datetime | None = None,
         metadata: Mapping[str, object] | None = None,
         memory_type: MemoryType = MemoryType.SEMANTIC,
     ) -> MemoryRecord: ...
@@ -337,6 +340,7 @@ def create_app(
         record = current_service().add(
             _content_input(request.content),
             occurred_at=request.occurred_at,
+            occurred_end=request.occurred_end,
             metadata=request.metadata,
             memory_type=request.memory_type,
         )

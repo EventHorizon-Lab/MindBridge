@@ -55,6 +55,10 @@ embedding model, vector-space ID, dimension, and recipe that created the store.
 Restore the original `transcription_space` as well. It identifies the ASR model and
 transcript-affecting recipe used by cached transcripts and add-time derived text; a mismatch fails startup.
 
+A recognized legacy index recipe is different from a missing Zvec directory: startup re-embeds
+authoritative records with the current retrieval-key recipe, then commits the new recipe marker and
+rebuilds Zvec. Plan model capacity for that one-time compatible upgrade.
+
 ## Rebuild and optimize
 
 Use the Python API while holding the only live instance:
@@ -87,8 +91,9 @@ Track at least:
 - Free bytes and inodes on the containing filesystem.
 - Add and search latency.
 - Embedding, generation, and transcription latency/failures separately.
-- Raw media bytes per OpenAI adapter call; inline payloads reject aggregates over 64 MiB before
-  base64 expansion.
+- Raw media bytes per OpenAI adapter call; embeddings reject aggregates over 64 MiB, while answers
+  reserve the limit for question media and fill the remainder with ranked evidence before base64
+  expansion.
 - REST status counts, especially 502 and 503.
 - Startup and rebuild duration.
 

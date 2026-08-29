@@ -12,7 +12,7 @@ Verify these properties on the target hardware:
 - A compatible Zvec wheel exists for the operating system and CPU architecture.
 - The filesystem supports durable SQLite WAL, atomic rename, directory fsync, and advisory locks.
 - Storage covers original media, authoritative FP32 embeddings, WAL, and the derived index.
-- Memory covers model payload preparation and one aggregate embedding batch.
+- Memory covers model payload preparation and aggregate-plus-atomic embedding batches.
 - Network/model latency fits the product's responsiveness and offline requirements.
 
 With image embedding capability configured, use an explicit local directory and one owner:
@@ -68,5 +68,8 @@ Apply disk encryption, device access control, and retention rules according to t
 stored media, transcript text, metadata, and embeddings. Separate applications or benchmark jobs
 use separate data directories; metadata is not isolation.
 
-The current retrieval unit remains one memory and one aggregate embedding. Budget and measure that
-path; do not assume automatic frame sampling, audio segmentation, per-asset vectors, or reranking.
+The returned retrieval unit remains one memory; composite inputs add aggregate and atomic
+text/media vectors, and long text adds overlapping contextual keys. All keys collapse by maximum
+relevance and are bounded to 128 non-aggregate vectors per record. Budget for the extra vectors.
+Do not assume automatic frame sampling, audio/video segmentation, generated semantic keys, or
+learned reranking.

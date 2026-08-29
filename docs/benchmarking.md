@@ -121,9 +121,15 @@ individual item is reported as failed. `--unit-concurrency` runs physically isol
 units in parallel, while `--request-concurrency` bounds answer calls inside each unit. One shared
 Jina/FunASR model pool is reused across those stores, so weights are not loaded once per case.
 
-The benchmark's OpenAI adapter inlines at most 64 MiB of raw media per request, making prepared
-clips important. A benchmark against larger media needs a provider-specific harness adapter with
-that provider's native upload mechanism.
+The runner stores source memories as episodic, preserves released wall-clock event spans as typed
+bounds, and retains source-relative clip intervals as provenance metadata. LoCoMo-Refined,
+MemLens, Mem-Gallery, and ATM-Bench use the public batched API for released event times, so temporal
+retrieval is measured instead of relying only on timestamps embedded in display text.
+
+The benchmark's OpenAI adapter reserves at most 64 MiB of raw media per answer request for question
+media and top-ranked evidence, making prepared clips important. A benchmark against larger
+question media needs a provider-specific harness adapter with that provider's native upload
+mechanism.
 
 ## Reproducibility and result trust
 
@@ -137,8 +143,8 @@ runs.
 
 Every run writes atomically to its output directory:
 
-- `samples.jsonl` contains predictions, parsed options, scores, retrieval diagnostics, failures,
-  and optional prompts/references from `--log-samples`.
+- `samples.jsonl` contains predictions, parsed options, scores, exact retrieved source intervals,
+  retrieval diagnostics, failures, and optional prompts/references from `--log-samples`.
 - `results.json` contains pins, aggregate metrics, a SHA-256 of the samples, cluster-robust
   standard errors, and deterministic cluster-bootstrap 95% confidence intervals.
 
@@ -158,8 +164,9 @@ Confidence intervals and regression significance are `null` when a task has fewe
 independent units; the runner does not manufacture precision from questions sharing one memory.
 Multiple-choice tasks use exact option scoring; Video-MME-v2 also reports its grouped nonlinear
 rating, and SuperMemory-VQA reports answerability precision/recall. Free-text token F1 is marked
-`official_metric: false`; EgoMemReason is submission-only. Do not present those diagnostic values
-as official leaderboard scores.
+`official_metric: false`; EgoMemReason is submission-only. MM-Lifelong additionally reports the
+official `ref_at_300` quantized temporal IoU from the unmerged retrieved intervals; its value is a
+percentage in `[0, 100]`. Do not present diagnostic token F1 values as official leaderboard scores.
 
 Compare identical samples against a prior run and optionally fail CI only on a statistically
 supported regression:

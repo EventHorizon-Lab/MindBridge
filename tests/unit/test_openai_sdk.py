@@ -2,7 +2,7 @@
 
 import base64
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import cast
 
@@ -141,6 +141,7 @@ def test_answer_maps_native_hit_media_and_abstains_without_hits(tmp_path: Path) 
 
 def test_answer_serializes_temporal_and_metadata_evidence() -> None:
     occurred_at = datetime(2026, 8, 26, 12, 30, tzinfo=timezone.utc)
+    occurred_end = occurred_at + timedelta(minutes=5)
 
     def respond(request: httpx.Request) -> httpx.Response:
         content = json.loads(request.content)["messages"][1]["content"]
@@ -150,6 +151,7 @@ def test_answer_serializes_temporal_and_metadata_evidence() -> None:
             "content": "The red parcel arrived.",
             "memory_type": "semantic",
             "occurred_at": occurred_at.isoformat(),
+            "occurred_end": occurred_end.isoformat(),
             "created_at": NOW.isoformat(),
             "metadata": {"dialog": "delivery", "turn": 7},
         }
@@ -172,6 +174,7 @@ def test_answer_serializes_temporal_and_metadata_evidence() -> None:
         score=0.9,
         created_at=NOW,
         occurred_at=occurred_at,
+        occurred_end=occurred_end,
         metadata={"dialog": "delivery", "turn": 7},
     )
     with httpx.Client(transport=httpx.MockTransport(respond)) as client:
@@ -334,6 +337,61 @@ def test_answer_sends_shared_media_once_and_bounds_inline_bytes(
         monkeypatch.setattr("mindbridge.models.openai_sdk._MAX_INLINE_MODEL_BYTES", 1)
         with pytest.raises(ModelError, match="64 MiB"):
             model.answer(ModelInput(text="What?", assets=(image,)), hits)
+
+
+def test_answer_keeps_ranked_media_within_budget_and_retains_overflow_text(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    first = _asset(tmp_path, "first", Modality.IMAGE, "image/png", b"1234")
+    second = _asset(tmp_path, "second", Modality.IMAGE, "image/png", b"5678")
+    hits = (
+        SearchHit(
+            id="memory_1",
+            content="first evidence",
+            score=0.9,
+            created_at=NOW,
+            assets=(first,),
+            modality=Modality.IMAGE,
+        ),
+        SearchHit(
+            id="memory_2",
+            content="second evidence",
+            score=0.8,
+            created_at=NOW,
+            assets=(second,),
+            modality=Modality.IMAGE,
+        ),
+    )
+    monkeypatch.setattr("mindbridge.models.openai_sdk._MAX_INLINE_MODEL_BYTES", 4)
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        content = json.loads(request.content)["messages"][1]["content"]
+        assert [part["type"] for part in content] == [
+            "text",
+            "text",
+            "image_url",
+            "text",
+        ]
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"content": "grounded"},
+                        "finish_reason": "stop",
+                    }
+                ]
+            },
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        result = _model(_sdk_client(client)).answer(ModelInput(text="What?"), hits)
+
+    assert result.hits[0].assets == (first,)
+    assert result.hits[1].assets == ()
+    assert result.hits[1].modality is Modality.TEXT
 
 
 def test_transcription_uses_its_own_endpoint_key_and_multipart_file(tmp_path: Path) -> None:

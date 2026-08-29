@@ -17,11 +17,19 @@ _COLLECTION_NAME = "mindbridge_memory_index"
 _CONTENT_FIELD = "content"
 _MEMORY_TYPE_FIELD = "memory_type"
 _OCCURRED_AT_FIELD = "occurred_at"
+_OCCURRED_END_FIELD = "occurred_end"
 _SPACE_FIELD = "space_id"
 _TASK_FIELD = "task"
 _VECTOR_FIELD = "embedding"
 _SCALAR_FIELDS = frozenset(
-    {_CONTENT_FIELD, _MEMORY_TYPE_FIELD, _OCCURRED_AT_FIELD, _SPACE_FIELD, _TASK_FIELD}
+    {
+        _CONTENT_FIELD,
+        _MEMORY_TYPE_FIELD,
+        _OCCURRED_AT_FIELD,
+        _OCCURRED_END_FIELD,
+        _SPACE_FIELD,
+        _TASK_FIELD,
+    }
 )
 _MISSING_OCCURRED_AT = -(2**63)
 _HNSW_M = 50
@@ -47,6 +55,22 @@ class IndexHit:
     id: str
     relevance: float
     """Higher is always better and the value is normalized to ``[0, 1]``."""
+    confidence: float | None = None
+    """Calibratable dense evidence strength, independent of rank fusion."""
+    lexical_match: bool = False
+
+    def __post_init__(self) -> None:
+        if not self.id or self.id != self.id.strip():
+            raise ValueError("index hit ID must be non-empty and trimmed")
+        for value, name in ((self.relevance, "relevance"), (self.confidence, "confidence")):
+            if value is not None and (
+                isinstance(value, bool) or not math.isfinite(value) or not 0.0 <= value <= 1.0
+            ):
+                raise ValueError(f"index hit {name} must be between zero and one")
+        if not isinstance(self.lexical_match, bool):
+            raise ValueError("index hit lexical_match must be a boolean")
+        if self.confidence is None:
+            object.__setattr__(self, "confidence", self.relevance)
 
 
 class ZvecIndex:
@@ -125,9 +149,15 @@ class ZvecIndex:
                 self._zvec.Doc(
                     id=embedding.embedding_id,
                     fields={
-                        _CONTENT_FIELD: document.content,
+                        # Only the aggregate vector participates in BM25. Repeating one memory's
+                        # text for every part would let multi-vector records crowd out neighbors.
+                        _CONTENT_FIELD: document.content if embedding.object_part == 0 else "",
                         _MEMORY_TYPE_FIELD: document.memory_type,
                         _OCCURRED_AT_FIELD: _timestamp(document.occurred_at),
+                        _OCCURRED_END_FIELD: _end_timestamp(
+                            document.occurred_at,
+                            document.occurred_end,
+                        ),
                         _SPACE_FIELD: embedding.space_id,
                         _TASK_FIELD: embedding.task,
                     },
@@ -174,12 +204,16 @@ class ZvecIndex:
             ef=ef,
             exact=exact,
         )
-        return tuple(
-            IndexHit(
-                id=_required_id(doc),
-                relevance=max(0.0, min(1.0, 1.0 - _required_score(doc) / 2.0)),
+        hits = tuple(
+            (
+                _required_id(doc),
+                max(0.0, min(1.0, 1.0 - _required_score(doc) / 2.0)),
             )
             for doc in docs
+        )
+        return tuple(
+            IndexHit(id=document_id, relevance=score, confidence=score)
+            for document_id, score in hits
         )
 
     def hybrid_search(
@@ -239,6 +273,10 @@ class ZvecIndex:
             include_vector=False,
             output_fields=[],
         )
+        dense_confidence = {
+            _required_id(doc): max(0.0, min(1.0, 1.0 - _required_score(doc) / 2.0)) for doc in dense
+        }
+        lexical_ids = {_required_id(doc) for doc in lexical}
         fused = self._zvec.RrfReRanker(rank_constant=self.rrf_rank_constant).rerank(
             [dense, lexical], topn=limit
         )
@@ -247,6 +285,8 @@ class ZvecIndex:
             IndexHit(
                 id=_required_id(doc),
                 relevance=max(0.0, min(1.0, _required_score(doc) / maximum)),
+                confidence=dense_confidence.get(_required_id(doc), 0.0),
+                lexical_match=_required_id(doc) in lexical_ids,
             )
             for doc in fused
         )
@@ -375,6 +415,12 @@ class ZvecIndex:
                     index_param=self._zvec.InvertIndexParam(),
                 ),
                 self._zvec.FieldSchema(
+                    name=_OCCURRED_END_FIELD,
+                    data_type=self._zvec.DataType.INT64,
+                    nullable=False,
+                    index_param=self._zvec.InvertIndexParam(),
+                ),
+                self._zvec.FieldSchema(
                     name=_SPACE_FIELD,
                     data_type=self._zvec.DataType.STRING,
                     nullable=False,
@@ -428,14 +474,15 @@ class ZvecIndex:
                 or field.index_param.type != self._zvec.IndexType.INVERT
             ):
                 _schema_mismatch(f"{name} filter field differs")
-        occurred_at = fields[_OCCURRED_AT_FIELD]
-        if (
-            occurred_at.data_type != self._zvec.DataType.INT64
-            or occurred_at.nullable
-            or occurred_at.index_param is None
-            or occurred_at.index_param.type != self._zvec.IndexType.INVERT
-        ):
-            _schema_mismatch(f"{_OCCURRED_AT_FIELD} filter field differs")
+        for name in (_OCCURRED_AT_FIELD, _OCCURRED_END_FIELD):
+            field = fields[name]
+            if (
+                field.data_type != self._zvec.DataType.INT64
+                or field.nullable
+                or field.index_param is None
+                or field.index_param.type != self._zvec.IndexType.INVERT
+            ):
+                _schema_mismatch(f"{name} filter field differs")
 
         vectors = {vector.name: vector for vector in native_schema.vectors}
         if vectors.keys() != {_VECTOR_FIELD}:
@@ -515,7 +562,7 @@ def _filter_expression(
     if memory_type is not None:
         clauses.append(f"{_MEMORY_TYPE_FIELD} = {_filter_literal(memory_type, _MEMORY_TYPE_FIELD)}")
     if occurred_from is not None:
-        clauses.append(f"{_OCCURRED_AT_FIELD} >= {_timestamp(occurred_from)}")
+        clauses.append(f"{_OCCURRED_END_FIELD} > {_timestamp(occurred_from)}")
     if occurred_until is not None:
         clauses.append(f"{_OCCURRED_AT_FIELD} < {_timestamp(occurred_until)}")
     if occurred_from is not None and occurred_until is not None and occurred_until <= occurred_from:
@@ -538,6 +585,13 @@ def _timestamp(value: datetime | None) -> int:
         raise ValueError("occurred_at filters must include a timezone")
     delta = value.astimezone(timezone.utc) - datetime(1970, 1, 1, tzinfo=timezone.utc)
     return (delta.days * 86_400 + delta.seconds) * 1_000_000 + delta.microseconds
+
+
+def _end_timestamp(start: datetime | None, end: datetime | None) -> int:
+    if end is not None:
+        return _timestamp(end)
+    timestamp = _timestamp(start)
+    return timestamp if timestamp == _MISSING_OCCURRED_AT else timestamp + 1
 
 
 def _required_score(doc: object) -> float:

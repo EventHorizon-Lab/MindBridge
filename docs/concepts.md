@@ -29,7 +29,7 @@ two or more media families are omni.
 | Field | Meaning |
 | --- | --- |
 | `id` | Stable SHA-256 memory identity |
-| `content` | Normalized text, plus audio transcript text persisted only by add-time embedding fallback |
+| `content` | Normalized text plus any transcript/identity evidence produced by configured add-time indexing |
 | `modality` | Persisted modality; response layers do not recompute it |
 | `memory_type` | Semantic, episodic, or procedural cognitive role |
 | `assets` | Ordered, resolved `AssetRef` values |
@@ -118,7 +118,10 @@ not model names:
 3. Grounded generation with a `SpeechBackend` resolves timed local speaker identities for supported
    audio/video and includes them as structured evidence. Unsupported audio is removed after that
    analysis, while supported visual evidence remains.
-4. If the remaining input is unsupported, the operation fails with `ModelError`.
+4. With `index_speech=True`, the same timed transcript, stable speaker IDs, and registered names
+   are persisted in the record before embedding so exact-name and dialogue queries can retrieve it.
+   Registering or renaming an identity refreshes already indexed recordings atomically.
+5. If the remaining input is unsupported, the operation fails with `ModelError`.
 
 An audio-only input therefore becomes transcript-only when fallback is required. A video or image
 is not silently discarded merely to reach a text model.
@@ -138,10 +141,15 @@ Applications may attach a display name with `register_speaker`; the biometric ve
 ## Retrieval and grounded answers
 
 `search` uses Zvec dense plus full-text retrieval when the routed query contains text. A pure-media
-query uses dense retrieval only. Type filters and detected event-time ranges are pushed into Zvec
-and rechecked after SQLite hydration. Temporal intent and optional decay over-fetch a bounded pool
-and rerank it. Each hydrated hit has a score from 0 through 1; scores rank results within a request
-and are not stable global probabilities.
+query uses dense retrieval only. Every search over-fetches a bounded candidate pool. Composite
+memories have one aggregate vector plus de-duplicated vectors for their text and media atoms;
+vector hits collapse to the parent memory by maximum relevance. Type filters are pushed into Zvec
+and rechecked after SQLite hydration. A temporal query retrieves both in-range and global
+candidates, then applies a smooth proximity factor instead of a hard time gate. Event intervals
+match by overlap, not only by their start. Optional decay is another soft factor. Weak dense
+evidence and unresolved top-two ties are rejected unless lexical or temporal evidence anchors the
+winner. Each hydrated hit has a score from 0 through 1; scores rank results within a request and
+are not stable global probabilities.
 
 `ask` retrieves evidence first and routes those hits, including retained media, to generation. A
 configured `SpeechBackend` caches complete identity analysis and adds each segment's timing, text,
@@ -149,15 +157,18 @@ stable ID, optional registered name, and match score to the model-only grounding
 source hits remain unchanged. Generation-time analysis does not rewrite an existing record's
 `content`. `AnswerResult` contains the answer and source hits for display or grounding audits. The
 built-in backend sends one binary content part per distinct asset in an answer request, even when
-the question or several hits refer to it.
+the question or several hits refer to it. It reserves the 64 MiB raw-media budget for question
+assets, then admits ranked hit media until full; an overflow hit remains as text evidence when it
+has text.
 
 Operations on one instance may overlap remote model calls. MindBridge serializes the shorter
 SQLite commit/outbox and Zvec access sections that must observe one coherent local state.
 
-The current retrieval ceiling is intentionally explicit: one memory has one aggregate embedding.
-MindBridge does not yet chunk content, create one vector per asset, or use a learned reranker. The
-OpenAI adapter inlines at most 64 MiB of raw media per embedding or generation call. A
-provider-specific upload adapter is the large-video path.
+Long text receives bounded overlapping retrieval keys while remaining one immutable returned
+record. MindBridge does not segment long media, generate model-authored semantic keys, or use a
+learned reranker. Applications should still ingest natural turns or bounded media clips. The
+OpenAI adapter inlines at most 64 MiB of raw media per model call; a provider-specific upload
+adapter is the large-video path.
 
 ## Metadata is not isolation
 

@@ -20,7 +20,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from functools import partial
 from pathlib import Path
 from threading import Condition, RLock
-from typing import Protocol, cast
+from typing import Protocol, TypeVar, cast
 
 from mindbridge.exceptions import (
     IndexUnavailableError,
@@ -40,6 +40,7 @@ from mindbridge.infrastructure.local.assets import (
 from mindbridge.infrastructure.local.store import (
     IndexDocument,
     LocalStore,
+    SpeechRollback,
     StoredAsset,
     StoredEmbedding,
     StoredMemory,
@@ -72,22 +73,36 @@ from mindbridge.types import (
 
 _DOCUMENT_TASK = EmbedTask.DOCUMENT.value
 _INDEX_RECIPE = (
-    "zvec-0.7:hnsw-cosine-m50-efc500:fts-standard-lowercase:type-time-filters:single-vector-v3"
+    "zvec-0.7:hnsw-cosine-m50-efc500:fts-standard-lowercase:interval-filters:context-keys-v6"
 )
 _LEGACY_INDEX_RECIPES = frozenset(
-    {"zvec-0.7:hnsw-cosine-m50-efc500:fts-standard-lowercase:single-vector-v2"}
+    {
+        "zvec-0.7:hnsw-cosine-m50-efc500:fts-standard-lowercase:single-vector-v2",
+        "zvec-0.7:hnsw-cosine-m50-efc500:fts-standard-lowercase:type-time-filters:single-vector-v3",
+        "zvec-0.7:hnsw-cosine-m50-efc500:fts-standard-lowercase:type-time-filters:multi-vector-v4",
+        "zvec-0.7:hnsw-cosine-m50-efc500:fts-standard-lowercase:interval-filters:multi-vector-v5",
+    }
 )
 _OUTBOX_BATCH_SIZE = 256
 _REINDEX_PAGE_SIZE = 256
+_REEMBED_PAGE_SIZE = 32
 _RERANK_CANDIDATES = 50
 _RANK_FLOOR = 0.3
 _RANK_CEILING = 1.5
+_DEFAULT_MINIMUM_RELEVANCE = 0.55
+_DEFAULT_AMBIGUITY_MARGIN = 0.01
+_LEXICAL_MATCH_CONFIDENCE = 0.6
 _DECAY_REINFORCEMENT_LIMIT = 20
+_CONFIRMATION_WEIGHT = 0.05
 _NO_TRANSCRIPTION_SPACE = "none:asr-v1"
 _ISO_DATE = re.compile(r"(?<!\d)(\d{4}-\d{2}-\d{2})(?!\d)")
 _MAX_CONTENT_PARTS = 128
 _MAX_TEXT_CHARACTERS = 65_536
 _MAX_METADATA_BYTES = 262_144
+_TEXT_KEY_CHARACTERS = 2_048
+_TEXT_KEY_OVERLAP = 256
+_TEXT_KEY_CONTEXT = 256
+_MAX_RETRIEVAL_KEYS = 128
 _MEDIA_TYPES = {
     ".aac": "audio/aac",
     ".avi": "video/x-msvideo",
@@ -120,6 +135,7 @@ _MEDIA_TYPES = {
     ".webm": "video/webm",
     ".webp": "image/webp",
 }
+_T = TypeVar("_T")
 _STORE_METADATA_KEYS = {
     "model": "embedding.model_id",
     "space": "embedding.space_id",
@@ -197,6 +213,7 @@ class _PreparedMemory:
     content: _PreparedContent
     metadata_json: str
     occurred_at: datetime | None
+    occurred_end: datetime | None
     memory_type: MemoryType
 
 
@@ -209,6 +226,7 @@ class _OperationAssets:
     transcript_updates: dict[str, str]
     speech_updates: dict[str, SpeechAnalysis]
     speech_segments: dict[str, tuple[SpeakerSegment, ...]]
+    speech_rollbacks: builtins.list[SpeechRollback]
 
 
 class Memory:
@@ -221,6 +239,9 @@ class Memory:
         embedder: EmbeddingBackend,
         answerer: GenerationBackend | None = None,
         transcriber: SpeechBackend | TranscriptionBackend | None = None,
+        index_speech: bool = False,
+        minimum_relevance: float = _DEFAULT_MINIMUM_RELEVANCE,
+        ambiguity_margin: float = _DEFAULT_AMBIGUITY_MARGIN,
         decay_half_life_days: float | None = None,
         speaker_similarity: float = 0.78,
         speaker_margin: float = 0.05,
@@ -235,6 +256,11 @@ class Memory:
         self._pending_asset_cleanup: dict[str, StoredAsset] = {}
         self._speaker_similarity = _unit_interval(speaker_similarity, "speaker_similarity")
         self._speaker_margin = _unit_interval(speaker_margin, "speaker_margin")
+        if not isinstance(index_speech, bool):
+            raise ValidationError("index_speech must be a boolean")
+        self._index_speech = index_speech
+        self._minimum_relevance = _unit_interval(minimum_relevance, "minimum_relevance")
+        self._ambiguity_margin = _unit_interval(ambiguity_margin, "ambiguity_margin")
         self._decay_half_life = _decay_half_life(decay_half_life_days)
 
         self._store = _open_store(self.data_dir)
@@ -258,7 +284,10 @@ class Memory:
             self._collect_orphan_assets(scan_physical=True)
             index_path = self.data_dir / "zvec"
             index_missing = not index_path.exists()
-            index_rebuild = self._ensure_store_metadata(index_path)
+            index_rebuild, embedding_rebuild = self._ensure_store_metadata(index_path)
+            if embedding_rebuild:
+                self._reembed_memories()
+                self._store.set_metadata(_STORE_METADATA_KEYS["index"], _INDEX_RECIPE)
             if index_missing or index_rebuild:
                 with _translate_storage_errors("checkpoint a missing search index"):
                     self._store.queue_all_embeddings()
@@ -296,6 +325,7 @@ class Memory:
         content: ContentInput,
         *,
         occurred_at: datetime | None = None,
+        occurred_end: datetime | None = None,
         metadata: Mapping[str, object] | None = None,
         memory_type: MemoryType = MemoryType.SEMANTIC,
     ) -> MemoryRecord:
@@ -304,6 +334,7 @@ class Memory:
             prepared = _prepare_memory(
                 self._prepare_content(content, assets),
                 occurred_at=occurred_at,
+                occurred_end=occurred_end,
                 metadata=metadata,
                 memory_type=memory_type,
             )
@@ -313,21 +344,38 @@ class Memory:
         self,
         contents: Sequence[ContentInput],
         *,
+        occurred_at: Sequence[datetime | None] | None = None,
+        occurred_end: Sequence[datetime | None] | None = None,
+        metadata: Sequence[Mapping[str, object] | None] | None = None,
         memory_type: MemoryType = MemoryType.SEMANTIC,
     ) -> tuple[MemoryRecord, ...]:
         """Add memories in one model batch and one SQLite transaction."""
         with self._operation() as assets:
             normalized_memory_type = _memory_type(memory_type)
-            if isinstance(contents, (str, bytes, Path, Blob, AssetRef)):
+            if isinstance(contents, (str, bytes, Path, Blob, AssetRef, Mapping)):
                 raise ValidationError("contents must be a sequence of memory inputs")
+            try:
+                batch = tuple(contents)
+            except TypeError:
+                raise ValidationError("contents must be a sequence of memory inputs") from None
+            occurrences = _batch_values(occurred_at, len(batch), "occurred_at")
+            occurrence_ends = _batch_values(occurred_end, len(batch), "occurred_end")
+            metadata_values = _batch_values(metadata, len(batch), "metadata")
             prepared = tuple(
                 _prepare_memory(
                     self._prepare_content(content, assets),
-                    occurred_at=None,
-                    metadata=None,
+                    occurred_at=event_time,
+                    occurred_end=event_end,
+                    metadata=item_metadata,
                     memory_type=normalized_memory_type,
                 )
-                for content in contents
+                for content, event_time, event_end, item_metadata in zip(
+                    batch,
+                    occurrences,
+                    occurrence_ends,
+                    metadata_values,
+                    strict=True,
+                )
             )
             if not prepared:
                 return ()
@@ -456,11 +504,64 @@ class Memory:
         """Assign or replace a human-readable name for one recognized speaker."""
         normalized_id = _identifier(speaker_id, "speaker_id")
         normalized_name = _speaker_name(name)
-        with self._operation(), self._write_lock:
+        with self._operation() as operation, self._write_lock:
+            with _translate_storage_errors("read speaker memories"):
+                memory_ids = self._store.speaker_memory_ids(normalized_id)
+            if memory_ids is None:
+                raise SpeakerNotFoundError(f"speaker does not exist: {normalized_id}")
+            memories: tuple[StoredMemory, ...] = ()
+            embeddings: tuple[StoredEmbedding, ...] = ()
+            if memory_ids:
+                with _translate_storage_errors("read speaker memories"):
+                    stored = self._store.read_memories(memory_ids)
+                indexed = tuple(
+                    memory
+                    for memory in stored
+                    if any(
+                        f"[speech identities:{asset.asset_id}]\n" in memory.content
+                        for asset in memory.assets
+                        if asset.modality in {"audio", "video"}
+                    )
+                )
+                if indexed:
+                    memories, embeddings = self._refresh_speaker_memories(
+                        indexed,
+                        speaker_id=normalized_id,
+                        speaker_name=normalized_name,
+                        operation=operation,
+                    )
             with _translate_storage_errors("register speaker"):
-                registered = self._store.register_speaker(normalized_id, normalized_name)
+                registered = self._store.register_speaker(
+                    normalized_id,
+                    normalized_name,
+                    memories=memories,
+                    embeddings=embeddings,
+                )
             if not registered:
                 raise SpeakerNotFoundError(f"speaker does not exist: {normalized_id}")
+            self._drain_outbox()
+
+    def reinforce(self, memory_ids: Sequence[str]) -> int:
+        """Record explicit positive feedback for existing memories."""
+        if isinstance(memory_ids, (str, bytes)):
+            raise ValidationError("memory_ids must be a sequence of memory IDs")
+        try:
+            normalized = tuple(
+                dict.fromkeys(_identifier(memory_id, "memory_id") for memory_id in memory_ids)
+            )
+        except TypeError:
+            raise ValidationError("memory_ids must be a sequence of memory IDs") from None
+        if not normalized:
+            return 0
+        with (
+            self._operation(),
+            self._write_lock,
+            _translate_storage_errors("reinforce memories"),
+        ):
+            return self._store.reinforce_memories(
+                normalized,
+                accessed_at=datetime.now(timezone.utc),
+            )
 
     def list(self, *, limit: int = 100, cursor: str | None = None) -> Page:
         """List newest memories with an opaque stable keyset cursor."""
@@ -497,12 +598,21 @@ class Memory:
             self._drain_outbox()
             with _translate_storage_errors("checkpoint a search-index rebuild"):
                 self._store.queue_all_embeddings()
+            memory_count = 0
+
+            def documents() -> Iterator[IndexDocument]:
+                nonlocal memory_count
+                for document in self._index_documents():
+                    if document.embedding.object_part == 0:
+                        memory_count += 1
+                    yield document
+
             with _translate_index_errors("rebuild the search index"):
-                count = self._index.rebuild(self._index_documents(), batch_size=_REINDEX_PAGE_SIZE)
+                self._index.rebuild(documents(), batch_size=_REINDEX_PAGE_SIZE)
             # Adds may commit SQLite while the rebuild owns the Zvec boundary. Replay instead of
             # blindly acknowledging so records committed after its SQLite scan cannot be lost.
             self._drain_outbox()
-            return count
+            return memory_count
 
     def optimize(self) -> None:
         """Merge staged Zvec vectors into the configured index."""
@@ -662,68 +772,82 @@ class Memory:
             existing_rows = self._store.read_memories(ordered_ids)
         existing_ids = {row.memory_id for row in existing_rows}
         missing = [unique[memory_id] for memory_id in ordered_ids if memory_id not in existing_ids]
-        stored_memories: tuple[StoredMemory, ...] = ()
-        stored_embeddings: tuple[StoredEmbedding, ...] = ()
-        if missing:
-            if Modality.AUDIO not in self._embedding_capabilities:
-                for memory in missing:
-                    _fallback_unsupported(
-                        memory.content,
-                        self._embedding_capabilities,
-                        "embedding",
+        speech_indexed = self._index_speech and any(
+            self._answer_speech_assets(memory.content.assets) for memory in missing
+        )
+        with self._speech_index_guard(operation, enabled=speech_indexed):
+            stored_memories: tuple[StoredMemory, ...] = ()
+            stored_embeddings: tuple[StoredEmbedding, ...] = ()
+            if missing:
+                if Modality.AUDIO not in self._embedding_capabilities:
+                    for memory in missing:
+                        _fallback_unsupported(
+                            memory.content,
+                            self._embedding_capabilities,
+                            "embedding",
+                        )
+                    self._cache_audio_transcripts(
+                        tuple(asset for memory in missing for asset in memory.content.assets),
+                        operation,
                     )
-                self._cache_audio_transcripts(
-                    tuple(asset for memory in missing for asset in memory.content.assets),
-                    operation,
+                missing = [self._prepare_for_embedding(memory, operation) for memory in missing]
+                embedding_parts = tuple(
+                    (memory, object_part, model_input)
+                    for memory in missing
+                    for object_part, model_input in enumerate(
+                        self._embedding_inputs(memory.content)
+                    )
                 )
-            missing = [self._prepare_for_embedding(memory, operation) for memory in missing]
-            inputs = tuple(self._route_embedding(memory.content) for memory in missing)
-            vectors = self._embed(inputs, task=EmbedTask.DOCUMENT)
-            now = datetime.now(timezone.utc)
-            # ponytail: one aggregate vector per memory; add segmentation only when retrieval
-            # benchmarks justify its storage and write-amplification cost.
-            stored_memories = tuple(
-                StoredMemory(
-                    memory_id=memory.memory_id,
-                    content=memory.content.text,
-                    modality=memory.content.modality.value,
-                    memory_type=memory.memory_type.value,
-                    assets=memory.content.assets,
-                    metadata_json=memory.metadata_json,
-                    occurred_at=memory.occurred_at,
-                    created_at=now,
-                    updated_at=now,
+                vectors = self._embed(
+                    tuple(model_input for _memory, _part, model_input in embedding_parts),
+                    task=EmbedTask.DOCUMENT,
                 )
-                for memory in missing
-            )
-            stored_embeddings = tuple(
-                StoredEmbedding(
-                    embedding_id=memory.memory_id,
-                    memory_id=memory.memory_id,
-                    values=vector,
-                    model_id=self._embedding_model,
-                    space_id=self._space_id,
-                    task=_DOCUMENT_TASK,
-                    created_at=now,
-                    normalized=True,
+                now = datetime.now(timezone.utc)
+                stored_memories = tuple(
+                    StoredMemory(
+                        memory_id=memory.memory_id,
+                        content=memory.content.text,
+                        modality=memory.content.modality.value,
+                        memory_type=memory.memory_type.value,
+                        assets=memory.content.assets,
+                        metadata_json=memory.metadata_json,
+                        occurred_at=memory.occurred_at,
+                        occurred_end=memory.occurred_end,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                    for memory in missing
                 )
-                for memory, vector in zip(missing, vectors, strict=True)
-            )
-        if stored_memories:
-            # SQLite is authoritative and uses one WAL connection per transaction. Commit before
-            # taking the index lock so concurrent writers can accumulate one durable outbox batch
-            # and share the expensive Zvec flush.
-            with _translate_storage_errors("write memories"):
-                self._store.write_memories(stored_memories, stored_embeddings)
-        with self._write_lock:
-            self._drain_outbox()
-            with _translate_storage_errors("hydrate written memories"):
-                authoritative = self._store.read_memories(ordered_ids)
-            operation.persisted.update(
-                asset.asset_id for memory in authoritative for asset in memory.assets
-            )
-            if operation.speech_updates:
-                self._persist_transcripts(operation)
+                stored_embeddings = tuple(
+                    StoredEmbedding(
+                        embedding_id=_embedding_id(memory.memory_id, object_part),
+                        memory_id=memory.memory_id,
+                        values=vector,
+                        model_id=self._embedding_model,
+                        space_id=self._space_id,
+                        task=_DOCUMENT_TASK,
+                        created_at=now,
+                        object_part=object_part,
+                        normalized=True,
+                    )
+                    for (memory, object_part, _model_input), vector in zip(
+                        embedding_parts, vectors, strict=True
+                    )
+                )
+            if stored_memories:
+                # SQLite is authoritative and uses one WAL connection per transaction. Commit
+                # before taking the index lock so ordinary concurrent writers can share one flush.
+                with _translate_storage_errors("write memories"):
+                    self._store.write_memories(stored_memories, stored_embeddings)
+            with self._write_lock:
+                self._drain_outbox()
+                with _translate_storage_errors("hydrate written memories"):
+                    authoritative = self._store.read_memories(ordered_ids)
+                operation.persisted.update(
+                    asset.asset_id for memory in authoritative for asset in memory.assets
+                )
+                if operation.speech_updates:
+                    self._persist_transcripts(operation)
         rows_by_id = {memory.memory_id: memory for memory in authoritative}
         if rows_by_id.keys() != unique.keys():
             raise StorageError("written memories could not be read from SQLite")
@@ -734,10 +858,133 @@ class Memory:
         memory: _PreparedMemory,
         operation: _OperationAssets,
     ) -> _PreparedMemory:
+        content = memory.content
+        if self._index_speech and self._answer_speech_assets(content.assets):
+            content = self._with_speech_identities(content, operation)
         return replace(
             memory,
-            content=self._embedding_content(memory.content, operation),
+            content=self._embedding_content(content, operation),
         )
+
+    @contextmanager
+    def _speech_index_guard(
+        self,
+        operation: _OperationAssets,
+        *,
+        enabled: bool,
+    ) -> Iterator[None]:
+        if not enabled:
+            yield
+            return
+        # ponytail: serialize add-time identity matching through the memory commit; replace this
+        # with a staged identity plan only if speech-indexed add throughput becomes material.
+        with self._write_lock:
+            try:
+                yield
+            except BaseException:
+                with _translate_storage_errors("roll back speaker recognition"):
+                    for rollback in reversed(operation.speech_rollbacks):
+                        self._store.rollback_speech(rollback)
+                raise
+            finally:
+                operation.speech_rollbacks.clear()
+
+    def _embedding_inputs(self, prepared: _PreparedContent) -> tuple[ModelInput, ...]:
+        aggregate = self._route_embedding(prepared)
+        text_parts = tuple(value for kind, value in prepared.canonical_parts if kind == "text")
+        if prepared.text and prepared.text != "\n\n".join(text_parts):
+            text_parts = (*text_parts, prepared.text)
+        text_keys = tuple(key for text in text_parts for key in _contextual_text_keys(text))
+        atomic = [
+            *(self._route_embedding(_text_content(text)) for text in text_keys),
+            *(self._route_embedding(_asset_content(asset)) for asset in prepared.assets),
+        ]
+        unique = tuple(dict.fromkeys(value for value in atomic if value != aggregate))
+        if len(unique) > _MAX_RETRIEVAL_KEYS:
+            unique = tuple(
+                unique[round(index * (len(unique) - 1) / (_MAX_RETRIEVAL_KEYS - 1))]
+                for index in range(_MAX_RETRIEVAL_KEYS)
+            )
+        return (aggregate, *unique)
+
+    def _refresh_speaker_memories(
+        self,
+        memories: Sequence[StoredMemory],
+        *,
+        speaker_id: str,
+        speaker_name: str,
+        operation: _OperationAssets,
+    ) -> tuple[tuple[StoredMemory, ...], tuple[StoredEmbedding, ...]]:
+        prepared: list[tuple[StoredMemory, _PreparedContent]] = []
+        for memory in memories:
+            segments_by_asset: dict[str, tuple[SpeakerSegment, ...]] = {}
+            speech_assets = tuple(
+                asset for asset in memory.assets if asset.modality in {"audio", "video"}
+            )
+            with _translate_storage_errors("read cached speaker recognition"):
+                for asset in speech_assets:
+                    segments = self._store.read_speech(
+                        asset.asset_id,
+                        space_id=self._transcription_space,
+                    )
+                    if segments is None:
+                        continue
+                    refreshed = tuple(
+                        replace(segment, speaker_name=speaker_name)
+                        if segment.speaker_id == speaker_id
+                        else segment
+                        for segment in segments
+                    )
+                    segments_by_asset[asset.asset_id] = refreshed
+                    operation.speech_segments[asset.asset_id] = refreshed
+                    operation.transcripts[asset.asset_id] = "\n".join(
+                        segment.text for segment in refreshed
+                    )
+            base = _without_speech_identities(memory.content, tuple(segments_by_asset))
+            content = _PreparedContent(
+                text=_speech_identity_text(
+                    base,
+                    tuple(asset for asset in speech_assets if asset.asset_id in segments_by_asset),
+                    segments_by_asset,
+                ),
+                assets=memory.assets,
+                modality=Modality(memory.modality),
+                canonical_parts=(("text", base),) if base else (),
+            )
+            prepared.append((memory, self._embedding_content(content, operation)))
+
+        parts = tuple(
+            (memory, content, object_part, model_input)
+            for memory, content in prepared
+            for object_part, model_input in enumerate(self._embedding_inputs(content))
+        )
+        vectors = self._embed(
+            tuple(model_input for _memory, _content, _part, model_input in parts),
+            task=EmbedTask.DOCUMENT,
+        )
+        now = datetime.now(timezone.utc)
+        updated = tuple(
+            replace(memory, content=content.text, updated_at=now) for memory, content in prepared
+        )
+        embeddings = tuple(
+            StoredEmbedding(
+                embedding_id=_embedding_id(memory.memory_id, object_part),
+                memory_id=memory.memory_id,
+                values=vector,
+                model_id=self._embedding_model,
+                space_id=self._space_id,
+                task=_DOCUMENT_TASK,
+                created_at=now,
+                object_part=object_part,
+                normalized=True,
+            )
+            for (memory, _content, object_part, _model_input), vector in zip(
+                parts,
+                vectors,
+                strict=True,
+            )
+        )
+        return updated, embeddings
 
     def _search_prepared(
         self,
@@ -752,39 +999,72 @@ class Memory:
         prepared = self._embedding_content(prepared, operation)
         model_input = self._route_embedding(prepared)
         vector = self._embed((model_input,), task=EmbedTask.QUERY)[0]
-        rerank = temporal_range is not None or self._decay_half_life is not None
-        candidate_limit = max(_RERANK_CANDIDATES, limit * 3) if rerank else limit
+        candidate_limit = max(_RERANK_CANDIDATES, limit * 3)
+        candidate_ceiling = max(candidate_limit, limit * (_MAX_RETRIEVAL_KEYS + 1))
         with self._write_lock:
             self._drain_outbox()
-            with _translate_index_errors("search memories"):
-                preferred = self._index_candidates(
-                    model_input,
-                    vector,
-                    limit=candidate_limit,
-                    memory_type=memory_type,
-                    occurred_from=None if temporal_range is None else temporal_range[0],
-                    occurred_until=None if temporal_range is None else temporal_range[1],
-                )
-                index_hits = preferred
-                if temporal_range is not None and len(preferred) < candidate_limit:
-                    index_hits = _merge_index_hits(
-                        preferred,
-                        self._index_candidates(
+            while True:
+                with _translate_index_errors("search memories"):
+                    if temporal_range is None:
+                        index_hits = self._index_candidates(
                             model_input,
                             vector,
                             limit=candidate_limit,
                             memory_type=memory_type,
-                        ),
-                    )
-            if not index_hits:
+                        )
+                        exhausted = len(index_hits) < candidate_limit
+                    else:
+                        preferred = self._index_candidates(
+                            model_input,
+                            vector,
+                            limit=candidate_limit,
+                            memory_type=memory_type,
+                            occurred_from=temporal_range[0],
+                            occurred_until=temporal_range[1],
+                        )
+                        fallback = self._index_candidates(
+                            model_input,
+                            vector,
+                            limit=candidate_limit,
+                            memory_type=memory_type,
+                        )
+                        index_hits = _merge_index_hits(preferred, fallback)
+                        exhausted = (
+                            len(preferred) < candidate_limit and len(fallback) < candidate_limit
+                        )
+                if not index_hits:
+                    return ()
+                index_by_id = {hit.id: hit for hit in index_hits}
+                with _translate_storage_errors("hydrate search candidates"):
+                    documents = self._store.read_index_documents(tuple(index_by_id))
+                parent_count = len({document.embedding.memory_id for document in documents})
+                if parent_count >= limit or exhausted or candidate_limit >= candidate_ceiling:
+                    break
+                candidate_limit = min(candidate_limit * 2, candidate_ceiling)
+            relevance: dict[str, float] = {}
+            confidence: dict[str, float] = {}
+            lexical_matches: set[str] = set()
+            for document in documents:
+                memory_id = document.embedding.memory_id
+                index_hit = index_by_id[document.embedding.embedding_id]
+                relevance[memory_id] = max(
+                    relevance.get(memory_id, 0.0),
+                    index_hit.relevance,
+                )
+                confidence[memory_id] = max(
+                    confidence.get(memory_id, 0.0),
+                    cast(float, index_hit.confidence),
+                )
+                if index_hit.lexical_match:
+                    lexical_matches.add(memory_id)
+            if not relevance:
                 return ()
             with _translate_storage_errors("hydrate search results"):
-                memories = self._store.read_memories(tuple(hit.id for hit in index_hits))
+                memories = self._store.read_memories(tuple(relevance))
             if memory_type is not None:
                 memories = tuple(
                     memory for memory in memories if memory.memory_type == memory_type.value
                 )
-            relevance = {hit.id: hit.relevance for hit in index_hits}
             ranked = [
                 (
                     memory,
@@ -795,26 +1075,39 @@ class Memory:
                         temporal_range=temporal_range,
                         decay_half_life=self._decay_half_life,
                     ),
-                    _in_time_range(memory.occurred_at, temporal_range),
+                    max(
+                        confidence[memory.memory_id],
+                        (_LEXICAL_MATCH_CONFIDENCE if memory.memory_id in lexical_matches else 0.0),
+                    ),
+                    memory.memory_id in lexical_matches,
                 )
                 for memory in memories
             ]
-            ranked.sort(key=lambda item: (item[2], item[1]), reverse=True)
+            ranked = [item for item in ranked if item[2] >= self._minimum_relevance]
+            ranked.sort(key=lambda item: item[1], reverse=True)
+            if _retrieval_is_ambiguous(
+                ranked,
+                margin=self._ambiguity_margin,
+                temporal_range=temporal_range,
+            ):
+                return ()
             visible = ranked[:limit]
             self._lease_assets(
-                tuple(asset for memory, _score, _matched in visible for asset in memory.assets),
+                tuple(
+                    asset
+                    for memory, _score, _confidence, _lexical in visible
+                    for asset in memory.assets
+                ),
                 operation.leased,
             )
             operation.persisted.update(
-                asset.asset_id for memory, _score, _matched in visible for asset in memory.assets
+                asset.asset_id
+                for memory, _score, _confidence, _lexical in visible
+                for asset in memory.assets
             )
-            if self._decay_half_life is not None and visible:
-                with _translate_storage_errors("reinforce retrieved memories"):
-                    self._store.reinforce_memories(
-                        tuple(memory.memory_id for memory, _score, _matched in visible),
-                        accessed_at=datetime.now(timezone.utc),
-                    )
-        return tuple(self._search_hit(memory, score) for memory, score, _matched in visible)
+        return tuple(
+            self._search_hit(memory, score) for memory, score, _confidence, _lexical in visible
+        )
 
     def _index_candidates(
         self,
@@ -984,7 +1277,7 @@ class Memory:
         operation: _OperationAssets,
     ) -> _PreparedContent:
         speech_assets = self._answer_speech_assets(prepared.assets)
-        self._recognize_speech(speech_assets, operation)
+        self._recognize_speech(speech_assets, operation, reversible=True)
         text = _speech_identity_text(prepared.text, speech_assets, operation.speech_segments)
         if len(text) > _MAX_TEXT_CHARACTERS:
             raise ModelError("speaker identity evidence exceeded the supported text length")
@@ -994,6 +1287,8 @@ class Memory:
         self,
         assets: Sequence[StoredAsset],
         operation: _OperationAssets,
+        *,
+        reversible: bool = False,
     ) -> None:
         if not isinstance(self._transcriber, SpeechBackend):
             raise ModelError("configured transcription backend cannot analyze speakers")
@@ -1022,14 +1317,27 @@ class Memory:
                 for asset, analysis in zip(missing, analyses, strict=True):
                     self._store.write_asset(asset)
                     operation.persisted.add(asset.asset_id)
-                    operation.speech_segments[asset.asset_id] = self._store.write_speech(
-                        asset.asset_id,
-                        analysis,
-                        model_id=self._transcriber.transcription_model,
-                        space_id=self._transcription_space,
-                        minimum_similarity=self._speaker_similarity,
-                        minimum_margin=self._speaker_margin,
-                    )
+                    if reversible:
+                        segments, rollback = self._store.write_speech_reversible(
+                            asset.asset_id,
+                            analysis,
+                            model_id=self._transcriber.transcription_model,
+                            space_id=self._transcription_space,
+                            minimum_similarity=self._speaker_similarity,
+                            minimum_margin=self._speaker_margin,
+                        )
+                        if rollback is not None:
+                            operation.speech_rollbacks.append(rollback)
+                    else:
+                        segments = self._store.write_speech(
+                            asset.asset_id,
+                            analysis,
+                            model_id=self._transcriber.transcription_model,
+                            space_id=self._transcription_space,
+                            minimum_similarity=self._speaker_similarity,
+                            minimum_margin=self._speaker_margin,
+                        )
+                    operation.speech_segments[asset.asset_id] = segments
         for asset in speech_assets:
             segments = operation.speech_segments[asset.asset_id]
             operation.transcripts[asset.asset_id] = "\n".join(segment.text for segment in segments)
@@ -1191,6 +1499,7 @@ class Memory:
             content=memory.content,
             created_at=memory.created_at,
             occurred_at=memory.occurred_at,
+            occurred_end=memory.occurred_end,
             metadata=_metadata_from_json(memory.metadata_json),
             assets=tuple(self._asset_ref(asset) for asset in memory.assets),
             modality=Modality(memory.modality),
@@ -1204,6 +1513,7 @@ class Memory:
             score=max(0.0, min(1.0, relevance)),
             created_at=memory.created_at,
             occurred_at=memory.occurred_at,
+            occurred_end=memory.occurred_end,
             metadata=_metadata_from_json(memory.metadata_json),
             assets=tuple(self._asset_ref(asset) for asset in memory.assets),
             modality=Modality(memory.modality),
@@ -1359,13 +1669,62 @@ class Memory:
             if not memories:
                 return
             with _translate_storage_errors("hydrate memories for reindexing"):
-                yield from self._store.read_index_documents(
+                yield from self._store.read_memory_index_documents(
                     tuple(memory.memory_id for memory in memories)
                 )
             last = memories[-1]
             after = (last.created_at, last.memory_id)
 
-    def _ensure_store_metadata(self, index_path: Path) -> bool:
+    def _reembed_memories(self) -> None:
+        after: tuple[datetime, str] | None = None
+        while True:
+            with _translate_storage_errors("read memories for embedding migration"):
+                memories = self._store.list_memories(limit=_REEMBED_PAGE_SIZE, after=after)
+            if not memories:
+                return
+            parts = tuple(
+                (memory, object_part, model_input)
+                for memory in memories
+                for object_part, model_input in enumerate(
+                    self._embedding_inputs(
+                        _PreparedContent(
+                            text=memory.content,
+                            assets=memory.assets,
+                            modality=Modality(memory.modality),
+                            canonical_parts=((("text", memory.content),) if memory.content else ()),
+                        )
+                    )
+                )
+            )
+            vectors = self._embed(
+                tuple(model_input for _memory, _part, model_input in parts),
+                task=EmbedTask.DOCUMENT,
+            )
+            now = datetime.now(timezone.utc)
+            embeddings = tuple(
+                StoredEmbedding(
+                    embedding_id=_embedding_id(memory.memory_id, object_part),
+                    memory_id=memory.memory_id,
+                    values=vector,
+                    model_id=self._embedding_model,
+                    space_id=self._space_id,
+                    task=_DOCUMENT_TASK,
+                    created_at=now,
+                    object_part=object_part,
+                    normalized=True,
+                )
+                for (memory, object_part, _model_input), vector in zip(
+                    parts,
+                    vectors,
+                    strict=True,
+                )
+            )
+            with _translate_storage_errors("replace migrated embeddings"):
+                self._store.replace_memory_embeddings(memories, embeddings)
+            last = memories[-1]
+            after = (last.created_at, last.memory_id)
+
+    def _ensure_store_metadata(self, index_path: Path) -> tuple[bool, bool]:
         expected = {
             _STORE_METADATA_KEYS["model"]: self._embedding_model,
             _STORE_METADATA_KEYS["space"]: self._space_id,
@@ -1374,18 +1733,21 @@ class Memory:
             _STORE_METADATA_KEYS["index"]: _INDEX_RECIPE,
         }
         rebuild_index = False
+        rebuild_embeddings = False
         with _translate_storage_errors("validate local store metadata"):
             for key, value in expected.items():
                 stored = self._store.get_metadata(key)
                 if stored is None:
                     if key == _STORE_METADATA_KEYS["index"] and index_path.exists():
                         rebuild_index = True
+                        rebuild_embeddings = True
                     else:
                         self._store.set_metadata(key, value)
                 elif stored == value:
                     continue
                 elif key == _STORE_METADATA_KEYS["index"] and stored in _LEGACY_INDEX_RECIPES:
                     rebuild_index = True
+                    rebuild_embeddings = True
                 else:
                     raise StorageError(
                         f"local store metadata mismatch for {key}: expected {value!r}, "
@@ -1394,8 +1756,9 @@ class Memory:
             if rebuild_index:
                 if index_path.exists():
                     shutil.rmtree(index_path)
-                self._store.set_metadata(_STORE_METADATA_KEYS["index"], _INDEX_RECIPE)
-        return rebuild_index
+                if not rebuild_embeddings:
+                    self._store.set_metadata(_STORE_METADATA_KEYS["index"], _INDEX_RECIPE)
+        return rebuild_index, rebuild_embeddings
 
     def _close_models_and_store(self) -> None:
         resources = _present_resources(
@@ -1445,6 +1808,7 @@ class Memory:
             transcript_updates={},
             speech_updates={},
             speech_segments={},
+            speech_rollbacks=[],
         )
         try:
             yield assets
@@ -1487,6 +1851,9 @@ class AsyncMemory:
         embedder: EmbeddingBackend,
         answerer: GenerationBackend | None = None,
         transcriber: SpeechBackend | TranscriptionBackend | None = None,
+        index_speech: bool = False,
+        minimum_relevance: float = _DEFAULT_MINIMUM_RELEVANCE,
+        ambiguity_margin: float = _DEFAULT_AMBIGUITY_MARGIN,
         decay_half_life_days: float | None = None,
         speaker_similarity: float = 0.78,
         speaker_margin: float = 0.05,
@@ -1496,6 +1863,9 @@ class AsyncMemory:
             embedder=embedder,
             answerer=answerer,
             transcriber=transcriber,
+            index_speech=index_speech,
+            minimum_relevance=minimum_relevance,
+            ambiguity_margin=ambiguity_margin,
             decay_half_life_days=decay_half_life_days,
             speaker_similarity=speaker_similarity,
             speaker_margin=speaker_margin,
@@ -1512,6 +1882,7 @@ class AsyncMemory:
         content: ContentInput,
         *,
         occurred_at: datetime | None = None,
+        occurred_end: datetime | None = None,
         metadata: Mapping[str, object] | None = None,
         memory_type: MemoryType = MemoryType.SEMANTIC,
     ) -> MemoryRecord:
@@ -1519,6 +1890,7 @@ class AsyncMemory:
             self._memory.add,
             content,
             occurred_at=occurred_at,
+            occurred_end=occurred_end,
             metadata=metadata,
             memory_type=memory_type,
         )
@@ -1527,11 +1899,17 @@ class AsyncMemory:
         self,
         contents: Sequence[ContentInput],
         *,
+        occurred_at: Sequence[datetime | None] | None = None,
+        occurred_end: Sequence[datetime | None] | None = None,
+        metadata: Sequence[Mapping[str, object] | None] | None = None,
         memory_type: MemoryType = MemoryType.SEMANTIC,
     ) -> tuple[MemoryRecord, ...]:
         return await asyncio.to_thread(
             self._memory.add_many,
             contents,
+            occurred_at=occurred_at,
+            occurred_end=occurred_end,
+            metadata=metadata,
             memory_type=memory_type,
         )
 
@@ -1576,6 +1954,9 @@ class AsyncMemory:
     async def register_speaker(self, speaker_id: str, name: str) -> None:
         await asyncio.to_thread(self._memory.register_speaker, speaker_id, name)
 
+    async def reinforce(self, memory_ids: Sequence[str]) -> int:
+        return await asyncio.to_thread(self._memory.reinforce, memory_ids)
+
     async def list(self, *, limit: int = 100, cursor: str | None = None) -> Page:
         return await asyncio.to_thread(self._memory.list, limit=limit, cursor=cursor)
 
@@ -1611,10 +1992,12 @@ def _prepare_memory(
     content: _PreparedContent,
     *,
     occurred_at: datetime | None,
+    occurred_end: datetime | None,
     metadata: Mapping[str, object] | None,
     memory_type: MemoryType,
 ) -> _PreparedMemory:
     normalized_occurred_at = _occurred_at(occurred_at)
+    normalized_occurred_end = _occurred_end(normalized_occurred_at, occurred_end)
     normalized_memory_type = _memory_type(memory_type)
     metadata_json = _metadata_json(metadata)
     identity: dict[str, object] = {
@@ -1624,6 +2007,8 @@ def _prepare_memory(
             None if normalized_occurred_at is None else _datetime_text(normalized_occurred_at)
         ),
     }
+    if normalized_occurred_end is not None:
+        identity["occurred_end"] = _datetime_text(normalized_occurred_end)
     if normalized_memory_type is not MemoryType.SEMANTIC:
         identity["memory_type"] = normalized_memory_type.value
     payload = json.dumps(
@@ -1638,6 +2023,7 @@ def _prepare_memory(
         content=content,
         metadata_json=metadata_json,
         occurred_at=normalized_occurred_at,
+        occurred_end=normalized_occurred_end,
         memory_type=normalized_memory_type,
     )
 
@@ -1668,6 +2054,42 @@ def _memory_modality(assets: Sequence[StoredAsset]) -> Modality:
     if len(kinds) == 1:
         return Modality(next(iter(kinds)))
     return Modality.OMNI
+
+
+def _text_content(text: str) -> _PreparedContent:
+    return _PreparedContent(
+        text=text,
+        assets=(),
+        modality=Modality.TEXT,
+        canonical_parts=(("text", text),),
+    )
+
+
+def _contextual_text_keys(text: str) -> tuple[str, ...]:
+    if len(text) <= _TEXT_KEY_CHARACTERS:
+        return (text,)
+    context = text.splitlines()[0][:_TEXT_KEY_CONTEXT].strip()
+    step = _TEXT_KEY_CHARACTERS - _TEXT_KEY_OVERLAP
+    keys = []
+    for start in range(0, len(text), step):
+        chunk = text[start : start + _TEXT_KEY_CHARACTERS].strip()
+        if not chunk:
+            continue
+        if context and not chunk.startswith(context):
+            chunk = f"{context}\n\n{chunk}"
+        keys.append(chunk)
+        if start + _TEXT_KEY_CHARACTERS >= len(text):
+            break
+    return tuple(keys)
+
+
+def _asset_content(asset: StoredAsset) -> _PreparedContent:
+    return _PreparedContent(
+        text="",
+        assets=(asset,),
+        modality=Modality(asset.modality),
+        canonical_parts=(("asset", asset.sha256),),
+    )
 
 
 def _prepared_modalities(prepared: _PreparedContent) -> frozenset[Modality]:
@@ -1714,6 +2136,8 @@ def _speech_identity_text(
     sections = [text] if text else []
     for asset in dict.fromkeys(asset.asset_id for asset in assets):
         segments = segments_by_asset[asset]
+        if not segments:
+            continue
         evidence = {
             "asset_id": asset,
             "segments": [
@@ -1733,6 +2157,11 @@ def _speech_identity_text(
             + json.dumps(evidence, ensure_ascii=False, separators=(",", ":"))
         )
     return "\n\n".join(sections)
+
+
+def _without_speech_identities(text: str, asset_ids: Sequence[str]) -> str:
+    markers = tuple(f"[speech identities:{asset_id}]\n" for asset_id in asset_ids)
+    return "\n\n".join(section for section in text.split("\n\n") if not section.startswith(markers))
 
 
 def _open_store(data_dir: Path) -> LocalStore:
@@ -1870,6 +2299,13 @@ def _occurred_at(value: datetime | None) -> datetime | None:
     return value.astimezone(timezone.utc)
 
 
+def _occurred_end(start: datetime | None, value: datetime | None) -> datetime | None:
+    end = _occurred_at(value)
+    if end is not None and (start is None or end <= start):
+        raise ValidationError("occurred_end must be later than occurred_at")
+    return end
+
+
 def _reference_at(value: datetime | None) -> datetime | None:
     if value is None:
         return None
@@ -1888,6 +2324,24 @@ def _optional_memory_type(value: object) -> MemoryType | None:
     return None if value is None else _memory_type(value)
 
 
+def _batch_values(
+    values: Sequence[_T | None] | None,
+    count: int,
+    name: str,
+) -> tuple[_T | None, ...]:
+    if values is None:
+        return (None,) * count
+    if isinstance(values, (str, bytes, Mapping)):
+        raise ValidationError(f"{name} must contain one value per content")
+    try:
+        batch = tuple(values)
+    except TypeError:
+        raise ValidationError(f"{name} must contain one value per content") from None
+    if len(batch) != count:
+        raise ValidationError(f"{name} must contain one value per content")
+    return batch
+
+
 def _with_reference_time(content: _PreparedContent, reference_at: datetime) -> _PreparedContent:
     note = f"Reference time for relative dates: {reference_at.isoformat(timespec='microseconds')}"
     return replace(content, text=f"{content.text}\n\n{note}" if content.text else note)
@@ -1897,21 +2351,30 @@ def _merge_index_hits(
     preferred: Sequence[IndexHit],
     fallback: Sequence[IndexHit],
 ) -> tuple[IndexHit, ...]:
-    merged = {hit.id: hit for hit in preferred}
-    for hit in fallback:
-        merged.setdefault(hit.id, hit)
+    merged: dict[str, IndexHit] = {}
+    for hit in (*preferred, *fallback):
+        current = merged.get(hit.id)
+        if current is None:
+            merged[hit.id] = hit
+        else:
+            merged[hit.id] = IndexHit(
+                id=hit.id,
+                relevance=max(current.relevance, hit.relevance),
+                confidence=max(cast(float, current.confidence), cast(float, hit.confidence)),
+                lexical_match=current.lexical_match or hit.lexical_match,
+            )
     return tuple(merged.values())
 
 
-def _in_time_range(
-    occurred_at: datetime | None,
+def _retrieval_is_ambiguous(
+    ranked: Sequence[tuple[StoredMemory, float, float, bool]],
+    *,
+    margin: float,
     temporal_range: tuple[datetime, datetime] | None,
 ) -> bool:
-    return (
-        occurred_at is not None
-        and temporal_range is not None
-        and temporal_range[0] <= occurred_at < temporal_range[1]
-    )
+    if margin == 0.0 or temporal_range is not None or len(ranked) < 2 or ranked[0][3]:
+        return False
+    return ranked[0][2] - ranked[1][2] < margin
 
 
 def _ranked_relevance(
@@ -1922,23 +2385,46 @@ def _ranked_relevance(
     temporal_range: tuple[datetime, datetime] | None,
     decay_half_life: timedelta | None,
 ) -> float:
-    score = relevance
+    ranking_reference = temporal_range[1] if temporal_range is not None else reference_at
+    confirmed_at = memory.last_accessed_at
+    confirmations = (
+        min(memory.access_count, _DECAY_REINFORCEMENT_LIMIT)
+        if confirmed_at is not None and confirmed_at <= ranking_reference
+        else 0
+    )
+    score = relevance * (1.0 + _CONFIRMATION_WEIGHT * math.log2(1.0 + confirmations))
     if temporal_range is not None:
-        score *= (
-            _RANK_CEILING if _in_time_range(memory.occurred_at, temporal_range) else _RANK_FLOOR
-        )
+        score *= _temporal_factor(memory.occurred_at, memory.occurred_end, temporal_range)
     if decay_half_life is not None:
+        decay_reference = ranking_reference
         accessed_at = memory.last_accessed_at
-        anchor = memory.occurred_at or memory.updated_at
+        anchor = memory.occurred_end or memory.occurred_at or memory.updated_at
         access_count = 0
-        if accessed_at is not None and accessed_at <= reference_at:
+        if accessed_at is not None and accessed_at <= decay_reference:
             anchor = accessed_at
-            access_count = memory.access_count
-        age = max(0.0, (reference_at - anchor).total_seconds())
+            access_count = confirmations
+        age = max(0.0, (decay_reference - anchor).total_seconds())
         strength = 1.0 + math.log2(1.0 + min(access_count, _DECAY_REINFORCEMENT_LIMIT))
         retention = 2.0 ** (-age / (decay_half_life.total_seconds() * strength))
         score *= _RANK_FLOOR + (_RANK_CEILING - _RANK_FLOOR) * retention
     return score
+
+
+def _temporal_factor(
+    occurred_at: datetime | None,
+    occurred_end: datetime | None,
+    temporal_range: tuple[datetime, datetime],
+) -> float:
+    if occurred_at is None:
+        return _RANK_FLOOR
+    start, until = temporal_range
+    event_until = occurred_end or occurred_at + timedelta(microseconds=1)
+    if occurred_at < until and event_until > start:
+        return _RANK_CEILING
+    distance = start - event_until if event_until <= start else occurred_at - until
+    window = max((until - start).total_seconds(), timedelta(days=1).total_seconds())
+    proximity = math.pow(2.0, -distance.total_seconds() / window)
+    return _RANK_FLOOR + (_RANK_CEILING - _RANK_FLOOR) * proximity
 
 
 def _temporal_range(text: str, reference_at: datetime) -> tuple[datetime, datetime] | None:
@@ -2059,6 +2545,12 @@ def _identifier(value: object, name: str) -> str:
     if not isinstance(value, str) or not value.strip() or value != value.strip():
         raise ValidationError(f"{name} must be non-empty and trimmed")
     return value
+
+
+def _embedding_id(memory_id: str, object_part: int) -> str:
+    if object_part == 0:
+        return memory_id
+    return hashlib.sha256(f"mindbridge-embedding:{memory_id}:{object_part}".encode()).hexdigest()
 
 
 def _speaker_name(value: object) -> str:

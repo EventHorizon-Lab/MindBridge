@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import sqlite3
 from collections.abc import Iterable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -71,6 +72,7 @@ class _FakeModels:
         self.transcription_model = "fake-transcription"
         self.transcription_space = transcription_space
         self.embedding_dimension = 2
+        self.fail_embedding = False
         selected = capabilities or _Capabilities(
             embedding=ALL_INPUT_MODALITIES,
             generation=ALL_INPUT_MODALITIES,
@@ -87,6 +89,8 @@ class _FakeModels:
         inputs: Sequence[ModelInput],
         task: EmbedTask = EmbedTask.DOCUMENT,
     ) -> tuple[tuple[float, ...], ...]:
+        if self.fail_embedding:
+            raise RuntimeError("simulated embedding failure")
         batch = tuple(inputs)
         self.embed_inputs.append(batch)
         self.embed_batches.append(tuple(value.text for value in batch))
@@ -226,7 +230,7 @@ class _FakeIndex:
         if self.hits_override is not None:
             return self.hits_override[:limit]
         return tuple(
-            IndexHit(id=document_id, relevance=0.5)
+            IndexHit(id=document_id, relevance=0.75, confidence=0.75)
             for document_id, document in self.documents.items()
             if (space_id is None or document.embedding.space_id == space_id)
             and (task is None or document.embedding.task == task)
@@ -252,7 +256,7 @@ class _FakeIndex:
         self.hybrid_search_calls += 1
         if self.hits_override is not None:
             return self.hits_override[:limit]
-        query_terms = set(text.casefold().split())
+        query_terms = set(re.findall(r"\w+", text.casefold()))
         hits = []
         for document_id, document in self.documents.items():
             embedding = document.embedding
@@ -264,9 +268,17 @@ class _FakeIndex:
                 document, memory_type, occurred_from, occurred_until
             ):
                 continue
-            content_terms = set(document.content.casefold().split())
-            relevance = 1.0 if query_terms & content_terms else 0.5
-            hits.append(IndexHit(id=document_id, relevance=relevance))
+            content_terms = set(re.findall(r"\w+", document.content.casefold()))
+            lexical_match = bool(query_terms & content_terms)
+            relevance = 1.0 if lexical_match else 0.5
+            hits.append(
+                IndexHit(
+                    id=document_id,
+                    relevance=relevance,
+                    confidence=0.75,
+                    lexical_match=lexical_match,
+                )
+            )
         return tuple(sorted(hits, key=lambda hit: (-hit.relevance, hit.id))[:limit])
 
     @staticmethod
@@ -283,10 +295,11 @@ class _FakeIndex:
         if occurred_from is None and occurred_until is None:
             return True
         occurred_at = document.occurred_at
-        return (
-            occurred_at is not None
-            and (occurred_from is None or occurred_at >= occurred_from)
-            and (occurred_until is None or occurred_at < occurred_until)
+        if occurred_at is None:
+            return False
+        occurred_end = document.occurred_end or occurred_at + timedelta(microseconds=1)
+        return (occurred_from is None or occurred_end > occurred_from) and (
+            occurred_until is None or occurred_at < occurred_until
         )
 
     def flush(self) -> None:
@@ -428,7 +441,7 @@ def test_relative_time_prefers_event_time_and_routes_the_reference(tmp_path: Pat
     )
 
 
-def test_decay_reranks_softly_and_reinforces_only_returned_hits(tmp_path: Path) -> None:
+def test_decay_reranks_softly_and_requires_explicit_reinforcement(tmp_path: Path) -> None:
     reference = datetime(2026, 8, 27, 12, tzinfo=timezone.utc)
     with _memory(
         tmp_path,
@@ -446,12 +459,116 @@ def test_decay_reranks_softly_and_reinforces_only_returned_hits(tmp_path: Path) 
         hit = memory.search("shared memory", limit=1, reference_at=reference)[0]
         assert hit.id == fresh.id
         assert hit.score == 1.0
+        stored = memory._store.read_memory(fresh.id)
+        assert stored is not None
+        assert stored.access_count == 0
+        assert memory.reinforce((fresh.id, fresh.id, "missing")) == 1
 
     with LocalStore(tmp_path) as store:
         stored = store.read_memory(fresh.id)
         assert stored is not None
         assert stored.access_count == 1
         assert stored.last_accessed_at is not None
+        assert (
+            memory_module._ranked_relevance(
+                stored,
+                0.5,
+                reference_at=stored.last_accessed_at,
+                temporal_range=None,
+                decay_half_life=None,
+            )
+            > 0.5
+        )
+        assert (
+            memory_module._ranked_relevance(
+                stored,
+                0.5,
+                reference_at=reference,
+                temporal_range=None,
+                decay_half_life=None,
+            )
+            == 0.5
+        )
+
+
+def test_temporal_proximity_is_a_soft_score_not_a_hard_sort_key(tmp_path: Path) -> None:
+    reference = datetime(2026, 8, 27, 12, tzinfo=timezone.utc)
+    with _memory(tmp_path, _FakeModels()) as memory:
+        exact = memory.add(
+            "shared project review exact",
+            occurred_at=datetime(2026, 8, 20, 12, tzinfo=timezone.utc),
+        )
+        adjacent = memory.add(
+            "shared project review adjacent",
+            occurred_at=datetime(2026, 8, 21, 1, tzinfo=timezone.utc),
+        )
+        _FakeIndex.instances[-1].hits_override = (
+            IndexHit(id=exact.id, relevance=0.55),
+            IndexHit(id=adjacent.id, relevance=1.0),
+        )
+
+        hits = memory.search(
+            "What happened on 2026-08-20?",
+            limit=2,
+            reference_at=reference,
+        )
+        assert _FakeIndex.instances[-1].hybrid_search_calls == 2
+
+    assert [hit.id for hit in hits] == [adjacent.id, exact.id]
+
+
+def test_event_span_overlapping_query_day_is_temporally_exact(tmp_path: Path) -> None:
+    with _memory(tmp_path, _FakeModels()) as memory:
+        spanning = memory.add(
+            "overnight project review",
+            occurred_at=datetime(2026, 8, 19, 23, tzinfo=timezone.utc),
+            occurred_end=datetime(2026, 8, 20, 1, tzinfo=timezone.utc),
+        )
+        memory.add(
+            "later project review",
+            occurred_at=datetime(2026, 8, 22, tzinfo=timezone.utc),
+        )
+
+        hit = memory.search("What happened on 2026-08-20?", limit=1)[0]
+
+    assert hit.id == spanning.id
+    assert hit.occurred_end == datetime(2026, 8, 20, 1, tzinfo=timezone.utc)
+
+
+def test_temporal_candidate_merge_keeps_the_best_vector_score() -> None:
+    merged = memory_module._merge_index_hits(
+        (IndexHit(id="shared", relevance=0.2),),
+        (IndexHit(id="shared", relevance=0.9),),
+    )
+
+    assert merged == (IndexHit(id="shared", relevance=0.9),)
+
+
+def test_search_rejects_weak_and_ambiguous_evidence(tmp_path: Path) -> None:
+    with _memory(tmp_path, _FakeModels()) as memory:
+        first = memory.add("first scene")
+        second = memory.add("second scene")
+        index = _FakeIndex.instances[-1]
+
+        index.hits_override = (IndexHit(id=first.id, relevance=0.54),)
+        assert memory.search("unrelated question") == ()
+
+        index.hits_override = (
+            IndexHit(id=first.id, relevance=0.9, confidence=0.8),
+            IndexHit(id=second.id, relevance=0.89, confidence=0.795),
+        )
+        assert memory.search("which repeated scene?") == ()
+
+        index.hits_override = (
+            IndexHit(
+                id=first.id,
+                relevance=0.9,
+                confidence=0.8,
+                lexical_match=True,
+            ),
+            IndexHit(id=second.id, relevance=0.89, confidence=0.795),
+        )
+        assert memory.search("first scene")[0].id == first.id
 
 
 def test_ask_without_answerer_fails_before_retrieval_or_reinforcement(tmp_path: Path) -> None:
@@ -533,6 +650,223 @@ def test_explicit_speech_is_lazy_and_recognizes_a_speaker_across_recordings(
     assert transcriber.closed is True
 
 
+def test_opt_in_speech_indexing_makes_registered_names_retrievable(
+    tmp_path: Path,
+) -> None:
+    models = _FakeModels()
+    speech = _FakeSpeech()
+    with Memory(
+        tmp_path,
+        embedder=models,
+        answerer=models,
+        transcriber=speech,
+        index_speech=True,
+    ) as memory:
+        first = memory.add(Blob(b"first speech", "audio/wav", "first.wav"))
+        first_segments = memory.speech(first.id)
+        speaker_id = first_segments[0].speaker_id
+        assert speaker_id is not None
+        memory.register_speaker(speaker_id, "Alice")
+        refreshed_first = memory.get(first.id)
+        assert '"speaker_name":"Alice"' in refreshed_first.content
+
+        second = memory.add(Blob(b"second speech", "audio/wav", "second.wav"))
+        memory.register_speaker(speaker_id, "Alicia")
+        index = _FakeIndex.instances[-1]
+
+        assert len(speech.calls) == 2
+        assert '"speaker_name":"Alicia"' in memory.get(first.id).content
+        assert '"speaker_name":"Alicia"' in memory.get(second.id).content
+        assert '"speaker_name":"Alice"' in second.content
+        assert {document.embedding.object_part for document in index.documents.values()} == {
+            0,
+            1,
+            2,
+        }
+
+
+def test_failed_speech_index_add_rolls_back_identity_state(tmp_path: Path) -> None:
+    models = _FakeModels()
+    models.fail_embedding = True
+
+    with Memory(
+        tmp_path,
+        embedder=models,
+        transcriber=_FakeSpeech(),
+        index_speech=True,
+    ) as memory:
+        with pytest.raises(ModelError, match="embed memory input"):
+            memory.add(Blob(b"failed speech", "audio/wav", "failed.wav"))
+
+        with closing(sqlite3.connect(tmp_path / "state.sqlite3")) as connection:
+            counts = tuple(
+                connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                for table in (
+                    "memory_records",
+                    "media_assets",
+                    "speech_analyses",
+                    "speaker_identities",
+                )
+            )
+
+    assert counts == (0, 0, 0, 0)
+
+
+def test_failed_speech_index_add_restores_matched_identity(tmp_path: Path) -> None:
+    models = _FakeModels()
+    with Memory(
+        tmp_path,
+        embedder=models,
+        transcriber=_FakeSpeech(),
+        index_speech=True,
+    ) as memory:
+        memory.add(Blob(b"first speech", "audio/wav", "first.wav"))
+        with closing(sqlite3.connect(tmp_path / "state.sqlite3")) as connection:
+            before = connection.execute(
+                "SELECT centroid, observations, updated_at FROM speaker_identities"
+            ).fetchone()
+        models.fail_embedding = True
+
+        with pytest.raises(ModelError, match="embed memory input"):
+            memory.add(Blob(b"second speech", "audio/wav", "second.wav"))
+
+        with closing(sqlite3.connect(tmp_path / "state.sqlite3")) as connection:
+            after = connection.execute(
+                "SELECT centroid, observations, updated_at FROM speaker_identities"
+            ).fetchone()
+            analysis_count = connection.execute("SELECT COUNT(*) FROM speech_analyses").fetchone()[
+                0
+            ]
+
+    assert after == before
+    assert analysis_count == 1
+
+
+def test_speaker_rename_refreshes_indexed_memory_after_reopen(tmp_path: Path) -> None:
+    with Memory(
+        tmp_path,
+        embedder=_FakeModels(),
+        transcriber=_FakeSpeech(),
+        index_speech=True,
+    ) as memory:
+        record = memory.add(Blob(b"speech", "audio/wav", "speech.wav"))
+        speaker_id = memory.speech(record.id)[0].speaker_id
+        assert speaker_id is not None
+        memory.register_speaker(speaker_id, "Alice")
+
+    with Memory(
+        tmp_path,
+        embedder=_FakeModels(),
+        transcriber=_FakeSpeech(),
+    ) as reopened:
+        reopened.register_speaker(speaker_id, "Alicia")
+        refreshed = reopened.get(record.id)
+
+        assert '"speaker_name":"Alicia"' in refreshed.content
+        assert '"speaker_name":"Alice"' not in refreshed.content
+        assert [hit.id for hit in reopened.search("Alicia")] == [record.id]
+
+
+def test_speaker_registration_rolls_back_when_refresh_embedding_fails(tmp_path: Path) -> None:
+    models = _FakeModels()
+    with Memory(
+        tmp_path,
+        embedder=models,
+        transcriber=_FakeSpeech(),
+        index_speech=True,
+    ) as memory:
+        record = memory.add(Blob(b"speech", "audio/wav", "speech.wav"))
+        speaker_id = memory.speech(record.id)[0].speaker_id
+        assert speaker_id is not None
+        models.fail_embedding = True
+
+        with pytest.raises(ModelError, match="embed memory input"):
+            memory.register_speaker(speaker_id, "Alice")
+
+        assert memory.speech(record.id)[0].speaker_name is None
+        assert '"speaker_name":null' in memory.get(record.id).content
+
+
+def test_composite_memory_uses_max_over_aggregate_and_atomic_vectors(tmp_path: Path) -> None:
+    models = _FakeModels()
+    with _memory(tmp_path, models) as memory:
+        record = memory.add(("red label", Blob(b"image", "image/png", "frame.png")))
+        index = _FakeIndex.instances[-1]
+        child_ids = tuple(
+            document_id for document_id in index.documents if document_id != record.id
+        )
+        assert len(child_ids) == 2
+        assert all(len(child_id) == 64 and child_id.isalnum() for child_id in child_ids)
+        assert len(set(child_ids)) == 2
+        assert [value.modalities for value in models.embed_inputs[0]] == [
+            {Modality.TEXT, Modality.IMAGE},
+            {Modality.TEXT},
+            {Modality.IMAGE},
+        ]
+        index.hits_override = (
+            IndexHit(id=record.id, relevance=0.2),
+            IndexHit(id=child_ids[-1], relevance=0.9),
+        )
+
+        hits = memory.search("find the frame")
+        assert memory.reindex() == 1
+
+    assert len(hits) == 1
+    assert hits[0].id == record.id
+    assert hits[0].score == pytest.approx(0.9)
+
+
+def test_search_expands_candidates_until_it_has_distinct_parent_memories(
+    tmp_path: Path,
+) -> None:
+    models = _FakeModels()
+    with Memory(
+        tmp_path,
+        embedder=models,
+        answerer=models,
+        transcriber=models,
+        ambiguity_margin=0,
+    ) as memory:
+        crowded = memory.add(tuple(f"crowded part {index}" for index in range(60)))
+        other = memory.add("other parent")
+        index = _FakeIndex.instances[-1]
+        crowded_hits = tuple(
+            IndexHit(id=document_id, relevance=0.9, confidence=0.9)
+            for document_id, document in index.documents.items()
+            if document.embedding.memory_id == crowded.id
+        )
+        assert len(crowded_hits) > 50
+        other_id = next(
+            document_id
+            for document_id, document in index.documents.items()
+            if document.embedding.memory_id == other.id
+        )
+        index.hits_override = (
+            *crowded_hits,
+            IndexHit(id=other_id, relevance=0.8, confidence=0.8),
+        )
+
+        hits = memory.search("find parents", limit=2)
+
+    assert {hit.id for hit in hits} == {crowded.id, other.id}
+    assert index.hybrid_search_calls == 2
+
+
+def test_long_text_adds_bounded_contextual_retrieval_keys(tmp_path: Path) -> None:
+    models = _FakeModels()
+    content = "source: diary\n" + "before " * 700 + "red needle " + "after " * 700
+
+    with _memory(tmp_path, models) as memory:
+        memory.add(content)
+
+    embedded = models.embed_inputs[0]
+    assert embedded[0].text == content.strip()
+    assert any(
+        "red needle" in value.text and len(value.text) < len(content) for value in embedded[1:]
+    )
+    assert len(embedded) <= 129
+
+
 def test_add_many_deduplicates_one_model_and_store_batch(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -563,6 +897,26 @@ def test_add_many_deduplicates_one_model_and_store_batch(
         assert [record.id for record in repeated] == [records[0].id, records[2].id]
         assert models.embed_batches == [("alpha", "red beta")]
         assert len(store_batches) == 1
+
+
+def test_add_many_preserves_per_record_event_time_and_metadata(tmp_path: Path) -> None:
+    occurred = datetime(2026, 8, 20, 9, tzinfo=timezone.utc)
+    occurred_end = occurred + timedelta(minutes=5)
+    with _memory(tmp_path, _FakeModels()) as memory:
+        records = memory.add_many(
+            ("first", "second"),
+            occurred_at=(occurred, None),
+            occurred_end=(occurred_end, None),
+            metadata=({"source_id": "one"}, {"source_id": "two"}),
+        )
+
+        assert records[0].occurred_at == occurred
+        assert records[0].occurred_end == occurred_end
+        assert records[0].metadata == {"source_id": "one"}
+        assert records[1].occurred_at is None
+        assert records[1].metadata == {"source_id": "two"}
+        with pytest.raises(ValidationError, match="one value per content"):
+            memory.add_many(("third",), occurred_at=(occurred, None))
 
 
 def test_add_many_hydrates_the_index_outbox_in_batches(
@@ -722,18 +1076,44 @@ def test_missing_index_checkpoint_precedes_collection_creation(
         assert set(_FakeIndex.instances[-1].documents) == {record.id for record in records}
 
 
-def test_legacy_index_recipe_is_rebuilt_from_sqlite(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "recipe",
+    (
+        "zvec-0.7:hnsw-cosine-m50-efc500:fts-standard-lowercase:single-vector-v2",
+        "zvec-0.7:hnsw-cosine-m50-efc500:fts-standard-lowercase:type-time-filters:single-vector-v3",
+        "zvec-0.7:hnsw-cosine-m50-efc500:fts-standard-lowercase:type-time-filters:multi-vector-v4",
+        "zvec-0.7:hnsw-cosine-m50-efc500:fts-standard-lowercase:interval-filters:multi-vector-v5",
+    ),
+)
+def test_legacy_index_recipe_is_rebuilt_from_sqlite(tmp_path: Path, recipe: str) -> None:
     with _memory(tmp_path, _FakeModels()) as memory:
         record = memory.add("preserved episodic memory", memory_type=MemoryType.EPISODIC)
     with LocalStore(tmp_path) as store:
-        store.set_metadata(
-            "index.recipe",
-            "zvec-0.7:hnsw-cosine-m50-efc500:fts-standard-lowercase:single-vector-v2",
-        )
+        store.set_metadata("index.recipe", recipe)
 
-    with _memory(tmp_path, _FakeModels()):
+    reopened_models = _FakeModels()
+    with _memory(tmp_path, reopened_models):
         document = _FakeIndex.instances[-1].documents[record.id]
         assert document.memory_type == "episodic"
+        assert reopened_models.embed_inputs
+
+
+def test_failed_embedding_recipe_migration_keeps_legacy_marker(tmp_path: Path) -> None:
+    legacy = (
+        "zvec-0.7:hnsw-cosine-m50-efc500:fts-standard-lowercase:interval-filters:multi-vector-v5"
+    )
+    with _memory(tmp_path, _FakeModels()) as memory:
+        memory.add("preserved memory")
+    with LocalStore(tmp_path) as store:
+        store.set_metadata("index.recipe", legacy)
+
+    failing = _FakeModels()
+    failing.fail_embedding = True
+    with pytest.raises(ModelError, match="embed memory input"):
+        _memory(tmp_path, failing)
+
+    with LocalStore(tmp_path) as store:
+        assert store.get_metadata("index.recipe") == legacy
 
 
 def test_interrupted_reindex_is_completed_from_durable_sqlite(tmp_path: Path) -> None:
@@ -1474,6 +1854,7 @@ async def test_async_memory_matches_sync_surface(tmp_path: Path) -> None:
         assert (await memory.search("red async"))[0].id == records[0].id
         assert (await memory.ask("what is red?")).hits
         assert (await memory.list(limit=1)).items
+        assert await memory.reinforce((records[0].id,)) == 1
         assert await memory.reindex() == 2
         await memory.optimize()
         assert await memory.delete(records[0].id) is True

@@ -57,9 +57,11 @@ media is always a resolved local CAS path.
 
 SQLite stores:
 
-- Memory records, memory type, timestamps, metadata, and access reinforcement.
+- Memory records, memory type, event start/end, storage timestamps, metadata, and access
+  reinforcement.
 - Asset descriptors, transcript cache, speech turns, speaker centroids, and names.
-- Normalized FP32 embeddings with model, space, task, and dimension.
+- Normalized FP32 aggregate, atomic, and contextual text embeddings with parent memory, object
+  part, model, space, task, and dimension.
 - Store metadata for embedding identity, transcription space, and index recipe.
 - Ordered pending index operations.
 
@@ -78,6 +80,11 @@ For every durable mutation:
 
 Interrupted work remains durable. Startup drains it. Reindexing builds from SQLite, then replays
 the outbox so a record committed after the rebuild scan is not lost from the projection.
+
+Composite records store one aggregate vector and de-duplicated atomic text/media vectors through
+the existing embedding `object_part`. Only the aggregate carries full text into BM25, preventing
+one record from crowding lexical results. Dense and hybrid hits hydrate their authoritative parent
+IDs from SQLite and collapse by maximum relevance before temporal/decay reranking.
 
 ## Provider boundary
 

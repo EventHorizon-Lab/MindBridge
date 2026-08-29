@@ -126,6 +126,7 @@ A memory response keeps textual content and adds explicit modality and safe asse
   ],
   "created_at": "2026-08-27T09:30:00Z",
   "occurred_at": null,
+  "occurred_end": null,
   "metadata": {"source": "design-review"}
 }
 ```
@@ -166,11 +167,13 @@ Content-Type: application/json
   ],
   "memory_type": "episodic",
   "occurred_at": "2026-08-27T09:00:00Z",
+  "occurred_end": "2026-08-27T09:05:00Z",
   "metadata": {"source": "design-review"}
 }
 ```
 
-`occurred_at`, `metadata`, and `memory_type` are optional; memory type defaults to `semantic`.
+`occurred_at`, `occurred_end`, `metadata`, and `memory_type` are optional; memory type defaults to
+`semantic`. An event end requires a timezone-aware start and must be later than it.
 Response `201` is one memory object. Repeating the same canonical input returns the existing record
 without another model call.
 
@@ -255,7 +258,7 @@ Content-Type: application/json
 
 `memory_type` and `reference_at` have the same semantics as search. `hits` are the exact search
 results used to ground the answer. The outbound generation request includes their content,
-`memory_type`, `occurred_at`, `created_at`, metadata, and media. In the built-in model request, a
+`memory_type`, `occurred_at`, `occurred_end`, `created_at`, metadata, and media. In the built-in model request, a
 distinct question/evidence asset is serialized once even when multiple hits refer to it.
 
 ### Get a memory
@@ -324,7 +327,7 @@ messages intentionally avoid provider, local path, or native-index details.
 ## Current limits
 
 The REST API has no local-path input, large-file upload endpoint, update route, metadata filter,
-logical scope parameter, chunking contract, per-asset vectors, or learned reranker. Fetch large
+logical scope parameter, chunking contract, per-asset vector control, or learned reranker. Fetch large
 media in the host application and use the Python `Path`/`Blob` contract or a provider-specific
 adapter. The OpenAI adapter inlines at most 64 MiB of raw media per embedding or generation call;
-answer text evidence is limited to 4 MiB.
+generation admits ranked evidence within that budget, and answer text evidence is limited to 4 MiB.
