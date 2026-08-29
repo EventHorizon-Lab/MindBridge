@@ -12,14 +12,17 @@ import platform
 import re
 import sys
 import time
-from collections.abc import Callable, Collection, Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from importlib import metadata
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from typing import Protocol, cast
+from typing import TYPE_CHECKING, Any, Protocol, cast
+
+if TYPE_CHECKING:
+    from openai import AsyncOpenAI
 
 from mindbridge import (
     DEFAULT_FUNASR_MODEL_ID,
@@ -45,14 +48,28 @@ from mindbridge.benchmarks.eval_adapters import (
 from mindbridge.benchmarks.eval_cache import CachedAnswer, EvidenceInterval, ResponseCache
 from mindbridge.benchmarks.eval_statistics import (
     ScoredValue,
-    exact_match,
     paired_comparison,
     parse_choice,
     summarize,
-    token_f1,
 )
 from mindbridge.benchmarks.isolation import BenchmarkRun
 from mindbridge.benchmarks.model_config import ModelConfig
+from mindbridge.benchmarks.official_scorers import (
+    SCORER_VERSION,
+    JudgeMessage,
+    JudgePlan,
+    combine_judge_scores,
+    finalize_scores,
+    judge_model_is_official,
+    judge_plan,
+    local_scores,
+    metric_is_official,
+    official_judge_model,
+    parse_judge_response,
+    sample_primary_metric,
+    scorer_protocol,
+    task_primary_metric,
+)
 from mindbridge.benchmarks.prepare_media import _has_audio, prepare_task_media
 from mindbridge.benchmarks.task_catalog import (
     DEFAULT_BENCHMARKS_ROOT,
@@ -72,11 +89,13 @@ from mindbridge.models.jina import (
     DEFAULT_JINA_REVISION,
 )
 
-EVAL_SCHEMA_VERSION = 3
-EVAL_RUNNER_VERSION = "mindbridge_eval_local_v3"
+EVAL_SCHEMA_VERSION = 5
+EVAL_RUNNER_VERSION = "mindbridge_eval_official_v5"
 DEFAULT_BOOTSTRAP_SAMPLES = 2_000
 _RESULTS_FILE = "results.json"
 _SAMPLES_FILE = "samples.jsonl"
+_EGOMEM_SUBMISSION_FILE = "egomemreason_submission.json"
+_EGOMEM_SUBMISSION_COUNT = 500
 _MODALITY_BY_SUFFIX = {
     ".aac": Modality.AUDIO,
     ".flac": Modality.AUDIO,
@@ -115,6 +134,8 @@ class _Arguments:
     bootstrap_samples: int
     model: str
     model_args: str
+    judge_model_args: str
+    judge_concurrency: int
     gen_kwargs: str
     num_fewshot: int
     use_cache: Path | None
@@ -128,6 +149,23 @@ class _Arguments:
     download: bool
     overwrite: bool
     quiet: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _JudgeConfig:
+    model: str
+    base_url: str
+    api_key: str | None = field(default=None, repr=False)
+    timeout_seconds: float = 3_600.0
+    concurrency: int = 4
+
+    def __post_init__(self) -> None:
+        if not self.model.strip() or not self.base_url.strip():
+            raise ValueError("judge model and base URL must not be blank")
+        if not math.isfinite(self.timeout_seconds) or self.timeout_seconds <= 0:
+            raise ValueError("judge timeout must be positive")
+        if self.concurrency <= 0:
+            raise ValueError("judge concurrency must be positive")
 
 
 @dataclass(frozen=True, slots=True)
@@ -155,6 +193,13 @@ class SampleResult:
     references: tuple[str, ...] | None = None
     evidence: tuple[EvidenceInterval, ...] = ()
     ref_at_300: float | None = None
+    metrics: Mapping[str, float] = field(default_factory=dict)
+    scorer_protocol: str | None = None
+    scorer_details: Mapping[str, str] = field(default_factory=dict)
+    scorer_error: str | None = None
+    judge_model: str | None = None
+    judge_response: str | None = None
+    judge_cached: bool = False
 
     @property
     def sample_id(self) -> str:
@@ -179,6 +224,12 @@ class SampleResult:
             "memory_ids": self.memory_ids,
             "evidence": tuple(item.json() for item in self.evidence),
             "ref_at_300": self.ref_at_300,
+            "metrics": dict(self.metrics),
+            "scorer_protocol": self.scorer_protocol,
+            "scorer_details": dict(self.scorer_details),
+            "scorer_error": self.scorer_error,
+            "judge_model": self.judge_model,
+            "judge_cached": self.judge_cached,
             "ingest_failure_count": self.ingest_failure_count,
             "error_code": self.error_code,
             "cached": self.cached,
@@ -188,6 +239,8 @@ class SampleResult:
             payload["prompt"] = self.prompt
         if self.references is not None:
             payload["references"] = self.references
+        if self.judge_response is not None:
+            payload["judge_response"] = self.judge_response
         return payload
 
 
@@ -307,7 +360,11 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> int:
         print(listing(parsed.benchmarks_root.expanduser().resolve(), list_mode))
         return 0
     arguments = _arguments(parser, parsed)
-    base_config = _model_config(arguments.model, arguments.model_args)
+    try:
+        base_config = _model_config(arguments.model, arguments.model_args)
+        judge_config = _judge_config(base_config, arguments)
+    except ValueError as error:
+        parser.error(str(error))
     _require_output(arguments.output_path, overwrite=arguments.overwrite)
     manifest, manifest_directory = load_media_manifest(arguments.media_manifest)
     if arguments.download:
@@ -359,12 +416,27 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> int:
     )
     config = _evaluation_config(base_config, loaded)
     batch_sizes = {task.spec.name: _batch_size(arguments, task) for task in loaded}
-    samples, duration = _execute(loaded, arguments, config, batch_sizes)
-    results = _results(arguments, config, loaded, samples, duration, batch_sizes)
+    samples, duration = _execute(loaded, arguments, config, judge_config, batch_sizes)
+    submission_bytes, submission_status = _egomem_submission(
+        samples,
+        requested="egomemreason" in arguments.tasks,
+        allow_partial=arguments.offset > 0 or arguments.limit not in (None, -1),
+    )
+    results = _results(
+        arguments,
+        config,
+        judge_config,
+        loaded,
+        samples,
+        duration,
+        batch_sizes,
+        submission_status,
+    )
     comparisons = _comparisons(arguments, loaded, samples)
     if comparisons:
         results["comparisons"] = comparisons
-    _write_artifacts(arguments, samples, results)
+    _write_artifacts(arguments, samples, results, submission_bytes)
+    _announce_submission(arguments, submission_status)
     if not arguments.quiet:
         print(_table(results))
     has_errors = any(
@@ -373,13 +445,24 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> int:
     regressed = arguments.fail_on_regression and _regressed(
         comparisons, threshold=arguments.regression_threshold
     )
-    return int(has_errors or regressed)
+    submission_invalid = submission_status is not None and submission_status["status"] == "invalid"
+    return int(has_errors or regressed or submission_invalid)
+
+
+def _announce_submission(arguments: _Arguments, status: Mapping[str, object] | None) -> None:
+    if status is None or arguments.quiet:
+        return
+    if status["status"] == "ready":
+        _announce(f"wrote {arguments.output_path / _EGOMEM_SUBMISSION_FILE}")
+        return
+    _announce(f"EgoMemReason submission {status['status']}: {status['reason']}")
 
 
 def _execute(
     loaded: Sequence[LoadedTask],
     arguments: _Arguments,
     config: ModelConfig,
+    judge_config: _JudgeConfig,
     batch_sizes: Mapping[str, int],
 ) -> tuple[tuple[SampleResult, ...], float]:
     needs_speech = any(
@@ -428,6 +511,15 @@ def _execute(
             pool.close()
         if response_cache is not None:
             response_cache.close()
+    if not arguments.predict_only:
+        samples = asyncio.run(
+            _apply_judges(
+                loaded,
+                samples,
+                arguments=arguments,
+                config=judge_config,
+            )
+        )
     return samples, time.perf_counter() - started
 
 
@@ -789,7 +881,14 @@ def _sample(
         str(value) for value in cast(Sequence[object], question.metadata.get("choices", ()))
     )
     parsed = _parsed_choice(task.spec.name, prediction, choices)
-    score, matched = _score(question, prediction, parsed, predict_only=predict_only)
+    metrics, score, matched = _score(
+        task.spec.name,
+        question,
+        prediction,
+        parsed,
+        evidence,
+        predict_only=predict_only,
+    )
     return SampleResult(
         task=task.spec.name,
         benchmark=task.spec.benchmark,
@@ -812,21 +911,267 @@ def _sample(
         references=question.references if log_samples else None,
         evidence=evidence,
         ref_at_300=_reference_grounding(task, unit, question, evidence),
+        metrics=metrics,
+        scorer_protocol=scorer_protocol(task.spec.name),
     )
 
 
 def _score(
+    task_name: str,
     question: EvalQuestion,
     prediction: str,
     parsed_choice: str | None,
+    evidence: Sequence[EvidenceInterval],
     *,
     predict_only: bool,
-) -> tuple[float | None, float | None]:
-    if predict_only or question.score_kind == "submission":
-        return None, None
-    if question.score_kind == "choice":
-        return float(parsed_choice == question.expected_choice), None
-    return token_f1(prediction, question.references), exact_match(prediction, question.references)
+) -> tuple[Mapping[str, float], float | None, float | None]:
+    if predict_only:
+        return {}, None, None
+    metrics = local_scores(
+        task_name,
+        score_kind=question.score_kind,
+        prediction=prediction,
+        parsed_choice=parsed_choice,
+        expected_choice=question.expected_choice,
+        references=question.references,
+        question=question.source_question,
+        metadata=question.metadata,
+        evidence_source_ids=tuple(item.source_id or "" for item in evidence),
+    )
+    score = metrics.get(sample_primary_metric(task_name), metrics.get("token_f1"))
+    return metrics, score, metrics.get("exact_match")
+
+
+async def _apply_judges(
+    tasks: Sequence[LoadedTask],
+    samples: Sequence[SampleResult],
+    *,
+    arguments: _Arguments,
+    config: _JudgeConfig,
+) -> tuple[SampleResult, ...]:
+    questions = {
+        (task.spec.name, unit.unit_id, question.question_id): question
+        for task in tasks
+        for unit in task.units
+        for question in unit.questions
+    }
+    planned: dict[str, JudgePlan] = {}
+    for sample in samples:
+        if sample.error_code is not None:
+            continue
+        question = questions[(sample.task, sample.unit_id, sample.question_id)]
+        plan = judge_plan(
+            sample.task,
+            question=question.source_question,
+            references=question.references,
+            prediction=sample.prediction,
+            metadata=question.metadata,
+        )
+        if plan is not None:
+            planned[sample.sample_id] = plan
+    if not planned:
+        return tuple(samples)
+    if not arguments.quiet:
+        print(
+            f"mindbridge-bench eval: judging {len(planned)} answers with {config.model}",
+            file=sys.stderr,
+        )
+    try:
+        from openai import AsyncOpenAI
+    except ImportError:
+        raise RuntimeError("official LLM scorers require mindbridge[openai]") from None
+    client = AsyncOpenAI(
+        api_key=config.api_key,
+        base_url=config.base_url,
+        timeout=config.timeout_seconds,
+    )
+    cache = (
+        None
+        if arguments.use_cache is None
+        else ResponseCache(
+            arguments.use_cache,
+            arguments.run_id,
+            _judge_cache_namespace(config),
+        )
+    )
+    semaphore = asyncio.Semaphore(config.concurrency)
+    try:
+        judged = await asyncio.gather(
+            *(
+                _judge_sample(
+                    sample,
+                    planned.get(sample.sample_id),
+                    client=client,
+                    cache=cache,
+                    semaphore=semaphore,
+                    config=config,
+                    log_samples=arguments.log_samples,
+                )
+                for sample in samples
+            )
+        )
+    finally:
+        await client.close()
+        if cache is not None:
+            cache.close()
+    return tuple(judged)
+
+
+async def _judge_sample(
+    sample: SampleResult,
+    plan: JudgePlan | None,
+    *,
+    client: AsyncOpenAI,
+    cache: ResponseCache | None,
+    semaphore: asyncio.Semaphore,
+    config: _JudgeConfig,
+    log_samples: bool,
+) -> SampleResult:
+    if plan is None:
+        return sample
+    try:
+        outcomes = tuple(
+            [
+                await _judge_call(
+                    client,
+                    messages,
+                    sample=sample,
+                    plan=plan,
+                    call_index=index,
+                    cache=cache,
+                    semaphore=semaphore,
+                    config=config,
+                )
+                for index, messages in enumerate(plan.calls)
+            ]
+        )
+        scores = combine_judge_scores(plan, tuple(item[0] for item in outcomes))
+        metrics = finalize_scores(sample.task, {**sample.metrics, **scores})
+        responses = tuple(item[1] for item in outcomes)
+        return replace(
+            sample,
+            score=metrics.get(sample_primary_metric(sample.task)),
+            exact_match=metrics.get("exact_match"),
+            metrics=metrics,
+            scorer_details={**sample.scorer_details, **plan.details},
+            judge_model=config.model,
+            judge_response=(json.dumps(responses, ensure_ascii=False) if log_samples else None),
+            judge_cached=all(item[2] for item in outcomes),
+        )
+    except Exception as error:
+        message = " ".join(str(error).split())[:500]
+        return replace(
+            sample,
+            score=sample.metrics.get(sample_primary_metric(sample.task)),
+            error_code=sample.error_code or "JudgeError",
+            scorer_error=f"{type(error).__name__}: {message}",
+            scorer_details={**sample.scorer_details, **plan.details},
+            judge_model=config.model,
+        )
+
+
+async def _judge_call(  # noqa: C901 - retry and provider fallback belong in one request path
+    client: AsyncOpenAI,
+    messages: Sequence[JudgeMessage],
+    *,
+    sample: SampleResult,
+    plan: JudgePlan,
+    call_index: int,
+    cache: ResponseCache | None,
+    semaphore: asyncio.Semaphore,
+    config: _JudgeConfig,
+) -> tuple[Mapping[str, float], str, bool]:
+    key = hashlib.sha256(
+        _json_bytes(
+            {
+                "version": SCORER_VERSION,
+                "model": config.model,
+                "protocol": plan.protocol,
+                "call": call_index,
+                "messages": tuple((message.role, message.content) for message in messages),
+            }
+        )
+    ).hexdigest()
+    cache_task = f"judge:{plan.protocol}:{config.model}"
+    if cache is not None:
+        cached = cache.get(cache_task, sample.unit_id, key)
+        if cached is not None:
+            return parse_judge_response(plan, cached.prediction), cached.prediction, True
+    request: dict[str, Any] = {
+        "model": config.model,
+        "messages": [{"role": message.role, "content": message.content} for message in messages],
+        "temperature": 0.0,
+    }
+    if plan.max_tokens is not None:
+        request["max_tokens"] = plan.max_tokens
+    extra_body = dict(plan.extra_body or {})
+    model_key = re.sub(r"[^a-z0-9]+", "", config.model.casefold())
+    if "qwen3" in model_key and not (
+        "enable_thinking" in extra_body and judge_model_is_official(sample.task, config.model)
+    ):
+        extra_body.setdefault("chat_template_kwargs", {"enable_thinking": False})
+    if extra_body:
+        request["extra_body"] = extra_body
+    use_responses_api = plan.parser == "atm" and judge_model_is_official(sample.task, config.model)
+    last_error: Exception | None = None
+    for attempt in range(3):
+        try:
+            async with semaphore:
+                if use_responses_api:
+                    response = await client.responses.create(
+                        model=config.model,
+                        input="\n".join(message.content for message in messages),
+                        max_output_tokens=plan.max_tokens,
+                        reasoning={"effort": "minimal"},
+                    )
+                    text = str(response.output_text or "").strip()
+                else:
+                    response = await client.chat.completions.create(**request)
+                    text = str(response.choices[0].message.content or "").strip()
+            scores = parse_judge_response(plan, text)
+            if cache is not None:
+                cache.put(cache_task, sample.unit_id, key, CachedAnswer(text, 0.0, ()))
+            return scores, text, False
+        except Exception as error:
+            last_error = error
+            if "extra_body" in request and _unsupported_extra_body(error):
+                request.pop("extra_body")
+                continue
+            if attempt < 2:
+                await asyncio.sleep(2**attempt)
+    if last_error is None:
+        raise RuntimeError("judge call failed without an exception")
+    raise last_error
+
+
+def _unsupported_extra_body(error: Exception) -> bool:
+    message = str(error).casefold()
+    field = "enable_thinking" in message or "chat_template_kwargs" in message
+    marker = any(
+        value in message
+        for value in (
+            "unknown",
+            "unsupported",
+            "unexpected",
+            "unrecognized",
+            "not allowed",
+            "invalid parameter",
+        )
+    )
+    return field and marker
+
+
+def _judge_cache_namespace(config: _JudgeConfig) -> str:
+    return hashlib.sha256(
+        _json_bytes(
+            {
+                "version": SCORER_VERSION,
+                "model": config.model,
+                "base_url": config.base_url,
+                "temperature": 0.0,
+            }
+        )
+    ).hexdigest()
 
 
 def _evidence(hit: SearchHit) -> EvidenceInterval:
@@ -893,7 +1238,7 @@ def _ref_at_n(
             if start >= end:
                 continue
             first = int(start // bucket_size)
-            last = int(end // bucket_size)
+            last = int((end - 1e-9) // bucket_size)
             values.update(range(first, last + 1))
         return values
 
@@ -901,11 +1246,7 @@ def _ref_at_n(
     expected_buckets = buckets(expected)
     if not predicted_buckets and not expected_buckets:
         return 0.0
-    return (
-        100.0
-        * len(predicted_buckets & expected_buckets)
-        / len(predicted_buckets | expected_buckets)
-    )
+    return len(predicted_buckets & expected_buckets) / len(predicted_buckets | expected_buckets)
 
 
 def _parsed_choice(task_name: str, prediction: str, choices: Sequence[str]) -> str | None:
@@ -923,14 +1264,21 @@ def _parsed_choice(task_name: str, prediction: str, choices: Sequence[str]) -> s
 def _results(
     arguments: _Arguments,
     config: ModelConfig,
+    judge_config: _JudgeConfig,
     tasks: Sequence[LoadedTask],
     samples: Sequence[SampleResult],
     duration_seconds: float,
     batch_sizes: Mapping[str, int],
+    submission_status: Mapping[str, object] | None,
 ) -> dict[str, object]:
     task_rows = []
     for task in tasks:
         selected = tuple(sample for sample in samples if sample.task == task.spec.name)
+        metrics = _metrics(task, selected, arguments)
+        if task.spec.name == "egomemreason" and submission_status is not None:
+            metrics["submission"] = dict(submission_status)
+            if submission_status["status"] == "invalid":
+                metrics["score_valid"] = False
         task_rows.append(
             {
                 "task": task.spec.name,
@@ -955,7 +1303,7 @@ def _results(
                 "input_sha256": dict(task.input_sha256),
                 "evaluation_sha256": task.evaluation_sha256,
                 "batch_size": batch_sizes[task.spec.name],
-                **_metrics(task, selected, arguments),
+                **metrics,
             }
         )
     media_roots = {}
@@ -973,6 +1321,7 @@ def _results(
             if any(
                 sample.error_code is not None or sample.ingest_failure_count for sample in samples
             )
+            or (submission_status is not None and submission_status["status"] == "invalid")
             else "completed"
         ),
         "duration_seconds": duration_seconds,
@@ -984,6 +1333,7 @@ def _results(
         "log_samples": arguments.log_samples,
         "response_cache": None if arguments.use_cache is None else str(arguments.use_cache),
         "cached_response_count": sum(sample.cached for sample in samples),
+        "cached_judge_count": sum(sample.judge_cached for sample in samples),
         "allow_unverified_data": arguments.allow_unverified_data,
         "limit": arguments.limit,
         "offset": arguments.offset,
@@ -1012,6 +1362,13 @@ def _results(
             "transcription_model": DEFAULT_FUNASR_MODEL_ID,
             "timeout_seconds": config.timeout_seconds,
         },
+        "judge": {
+            "model": judge_config.model,
+            "base_url": judge_config.base_url,
+            "sampling": "benchmark_protocol",
+            "concurrency": judge_config.concurrency,
+            "timeout_seconds": judge_config.timeout_seconds,
+        },
         "environment": {
             "mindbridge_version": _version("mindbridge"),
             "zvec_version": _version("zvec"),
@@ -1028,6 +1385,7 @@ def _metrics(
     arguments: _Arguments,
 ) -> dict[str, object]:
     seed = _task_seed(arguments.seed, task.spec.name)
+    primary_name = task_primary_metric(task.spec.name)
     scored = tuple(
         ScoredValue(sample.sample_id, sample.unit_id, sample.score)
         for sample in samples
@@ -1038,36 +1396,70 @@ def _metrics(
         seed=seed,
         bootstrap_samples=arguments.bootstrap_samples,
     )
-    score_kinds = {question.score_kind for unit in task.units for question in unit.questions}
-    metric_name = _metric_name(task, bool(scored), score_kinds)
-    exact = tuple(
-        ScoredValue(sample.sample_id, sample.unit_id, sample.exact_match)
-        for sample in samples
-        if sample.exact_match is not None
+    metric_rows: dict[str, dict[str, object]] = {}
+    metric_names = sorted({name for sample in samples for name in sample.metrics})
+    judge_models = sorted(
+        {sample.judge_model for sample in samples if sample.judge_model is not None}
     )
+    judge_model = judge_models[0] if len(judge_models) == 1 else ""
+    for metric_name in metric_names:
+        metric_values = tuple(
+            ScoredValue(sample.sample_id, sample.unit_id, sample.metrics[metric_name])
+            for sample in samples
+            if metric_name in sample.metrics
+        )
+        uses_judge = any(
+            sample.judge_model is not None and metric_name in sample.metrics for sample in samples
+        )
+        clamp = (0.0, 5.0) if metric_name == "judge_score_0_5" else (0.0, 1.0)
+        metric_rows[metric_name] = {
+            "official_metric": metric_is_official(
+                task.spec.name,
+                metric_name,
+                judge_model,
+                uses_judge=uses_judge,
+            ),
+            **summarize(
+                metric_values,
+                seed=_task_seed(seed, metric_name),
+                bootstrap_samples=arguments.bootstrap_samples,
+                clamp=clamp,
+            ),
+        }
     latencies = sorted(sample.latency_ms for sample in samples if sample.latency_ms > 0)
-    values: dict[str, object] = {
-        "primary_metric": metric_name,
-        "official_metric": task.spec.name in {"egolifeqa", "supermemory-vqa"},
+    error_count = sum(sample.error_code is not None for sample in samples)
+    ingest_failure_count = sum(
+        max(sample.ingest_failure_count for sample in samples if sample.unit_id == unit_id)
+        for unit_id in {sample.unit_id for sample in samples}
+    )
+    result: dict[str, object] = {
+        "primary_metric": primary_name,
+        "official_metric": bool(
+            primary_name in metric_rows and metric_rows[primary_name]["official_metric"]
+        ),
+        "scorer_protocol": scorer_protocol(task.spec.name),
+        "official_judge_model": official_judge_model(task.spec.name),
+        "judge_model": judge_models[0] if len(judge_models) == 1 else judge_models or None,
+        "judge_model_official": (
+            None
+            if not judge_models or official_judge_model(task.spec.name) is None
+            else len(judge_models) == 1 and judge_model_is_official(task.spec.name, judge_models[0])
+        ),
         "score": primary,
-        "exact_match": (
-            summarize(exact, seed=seed, bootstrap_samples=arguments.bootstrap_samples)
-            if exact
-            else None
-        ),
+        "score_valid": error_count == 0 and ingest_failure_count == 0,
+        "metrics": metric_rows,
+        "exact_match": metric_rows.get("exact_match"),
         "question_count": len(samples),
-        "error_count": sum(sample.error_code is not None for sample in samples),
-        "ingest_failure_count": sum(
-            max(sample.ingest_failure_count for sample in samples if sample.unit_id == unit_id)
-            for unit_id in {sample.unit_id for sample in samples}
-        ),
+        "error_count": error_count,
+        "ingest_failure_count": ingest_failure_count,
         "latency_ms": {
             "p50": _percentile(latencies, 0.50),
             "p95": _percentile(latencies, 0.95),
         },
+        "breakdowns": _metric_breakdowns(task, samples, arguments),
     }
     if task.spec.name == "video-mme" and scored:
-        values["video_mme"] = _video_mme_metrics(
+        result["video_mme"] = _video_mme_metrics(
             samples,
             seed=seed,
             bootstrap_samples=arguments.bootstrap_samples,
@@ -1079,42 +1471,109 @@ def _metrics(
             seed=seed,
             bootstrap_samples=arguments.bootstrap_samples,
         )
-        values.update(
+        result.update(
             {
                 "primary_metric": "rating",
                 "official_metric": True,
                 "score": rating,
-                "question_accuracy": primary,
+                "question_accuracy": metric_rows.get("question_accuracy", primary),
             }
         )
+        metric_rows["rating"] = {"official_metric": True, **rating}
     if task.spec.name == "supermemory-vqa" and scored:
-        values["answerability"] = _answerability(samples)
+        result["answerability"] = {"official_metric": True, **_answerability(samples)}
+        result["unavailable_metrics"] = {
+            "qa_mrr": "answer-option scores are not exposed by the MindBridge answer backend"
+        }
+    if task.spec.name == "egomemreason":
+        result["unavailable_metrics"] = {
+            "accuracy": "the public release has no answer key; official server scoring is required"
+        }
     reference_scores = tuple(
         ScoredValue(sample.sample_id, sample.unit_id, sample.ref_at_300)
         for sample in samples
         if sample.ref_at_300 is not None
     )
     if reference_scores:
-        values["ref_at_300"] = {
+        ref_summary = {
             "official_metric": True,
             **summarize(
                 reference_scores,
                 seed=seed,
                 bootstrap_samples=arguments.bootstrap_samples,
-                clamp=(0.0, 100.0),
+                clamp=(0.0, 1.0),
             ),
         }
-    return values
+        result["ref_at_300"] = ref_summary
+        metric_rows["ref_at_300"] = ref_summary
+    return result
 
 
-def _metric_name(task: LoadedTask, has_scores: bool, score_kinds: Collection[str]) -> str:
-    if not has_scores:
-        return "submission"
-    if task.spec.name == "video-mme":
-        return "strict_accuracy"
-    if task.spec.name == "supermemory-vqa":
-        return "qa_accuracy"
-    return "accuracy" if "choice" in score_kinds else "token_f1"
+def _metric_breakdowns(
+    task: LoadedTask,
+    samples: Sequence[SampleResult],
+    arguments: _Arguments,
+) -> dict[str, object]:
+    fields = {
+        "locomo-refined": ("category",),
+        "m3-bench": ("question_types",),
+        "video-mme": ("duration", "domain", "task_type"),
+        "video-mme-v2": ("group_type", "level", "second_head", "third_head"),
+        "egolifeqa": ("day", "question_type"),
+        "egotempo": ("question_type",),
+        "memlens": ("question_type", "question_subtype"),
+        "mm-lifelong": ("question_type",),
+        "supermemory-vqa": ("skill",),
+        "atm-bench": ("qtype",),
+        "mem-gallery": ("point",),
+    }.get(_task_family(task.spec.name), ())
+    result: dict[str, object] = {}
+    for field_name in fields:
+        grouped: dict[str, list[ScoredValue]] = {}
+        for sample in samples:
+            if sample.score is None:
+                continue
+            raw = sample.metadata.get(field_name)
+            labels = (
+                tuple(str(value) for value in raw)
+                if isinstance(raw, Sequence) and not isinstance(raw, str | bytes)
+                else (str(raw),)
+            )
+            for label in labels:
+                if label and label != "None":
+                    grouped.setdefault(label, []).append(
+                        ScoredValue(sample.sample_id, sample.unit_id, sample.score)
+                    )
+        if grouped:
+            result[field_name] = {
+                label: summarize(
+                    tuple(rows),
+                    seed=_task_seed(arguments.seed, f"{task.spec.name}:{field_name}:{label}"),
+                    bootstrap_samples=arguments.bootstrap_samples,
+                )
+                for label, rows in sorted(grouped.items())
+            }
+    return result
+
+
+def _task_family(task: str) -> str:
+    for family in (
+        "supermemory-vqa",
+        "video-mme-v2",
+        "locomo-refined",
+        "mm-lifelong",
+        "mem-gallery",
+        "egomemreason",
+        "egolifeqa",
+        "egotempo",
+        "memlens",
+        "atm-bench",
+        "m3-bench",
+        "video-mme",
+    ):
+        if task == family or task.startswith(f"{family}-"):
+            return family
+    raise ValueError(f"unknown benchmark task: {task}")
 
 
 def _video_mme_metrics(
@@ -1162,9 +1621,8 @@ def _video_mme_cell(
         if sample.score is not None and sample.parsed_choice is not None
     )
     return {
-        "accuracy": summarize(answered, seed=seed, bootstrap_samples=bootstrap_samples),
-        "strict_accuracy": strict
-        or summarize(scores, seed=seed, bootstrap_samples=bootstrap_samples),
+        "accuracy": strict or summarize(scores, seed=seed, bootstrap_samples=bootstrap_samples),
+        "answered_accuracy": summarize(answered, seed=seed, bootstrap_samples=bootstrap_samples),
         "question_count": len(samples),
         "answered_count": len(answered),
         "unanswered_count": len(samples) - len(answered),
@@ -1174,35 +1632,55 @@ def _video_mme_cell(
 def _video_mme_v2_rating(
     samples: Sequence[SampleResult], *, seed: int, bootstrap_samples: int
 ) -> dict[str, object]:
-    from mindbridge.benchmarks.video_mme_v2 import score_group_answers
-
-    groups: dict[str, list[SampleResult]] = {}
-    for sample in samples:
-        groups.setdefault(sample.unit_id, []).append(sample)
-    ratings = []
-    for unit_id in sorted(groups):
-        group = sorted(groups[unit_id], key=_position)
-        correct = tuple(sample.score == 1.0 for sample in group)
-        group_type = str(group[0].metadata["group_type"])
-        rating = score_group_answers(
-            group_type,
-            str(group[0].metadata.get("group_structure", "")),
-            correct,
-        )
-        ratings.append(ScoredValue(unit_id, unit_id, rating))
     return summarize(
-        ratings,
+        _video_mme_v2_group_values(
+            tuple(
+                {
+                    "unit_id": sample.unit_id,
+                    "score": sample.score,
+                    "metadata": sample.metadata,
+                }
+                for sample in samples
+            )
+        ),
         seed=seed,
         bootstrap_samples=bootstrap_samples,
         clamp=(0.0, 100.0),
     )
 
 
-def _position(sample: SampleResult) -> int:
-    value = sample.metadata.get("position")
-    if not isinstance(value, int):
-        raise ValueError("Video-MME-v2 sample position must be an integer")
-    return value
+def _video_mme_v2_group_values(
+    rows: Sequence[Mapping[str, object]],
+) -> tuple[ScoredValue, ...]:
+    from mindbridge.benchmarks.video_mme_v2 import score_group_answers
+
+    groups: dict[str, list[tuple[int, float, Mapping[str, object]]]] = {}
+    for row in rows:
+        unit_id, score, metadata = row.get("unit_id"), row.get("score"), row.get("metadata")
+        if not isinstance(unit_id, str) or not unit_id:
+            raise ValueError("Video-MME-v2 sample unit ID must be a non-empty string")
+        if isinstance(score, bool) or not isinstance(score, int | float):
+            raise ValueError("Video-MME-v2 sample score must be numeric")
+        if not isinstance(metadata, Mapping):
+            raise ValueError("Video-MME-v2 sample metadata must be an object")
+        position = metadata.get("position")
+        if isinstance(position, bool) or not isinstance(position, int):
+            raise ValueError("Video-MME-v2 sample position must be an integer")
+        groups.setdefault(unit_id, []).append((position, float(score), metadata))
+
+    ratings = []
+    for unit_id in sorted(groups):
+        group = sorted(groups[unit_id], key=lambda item: item[0])
+        if tuple(item[0] for item in group) != (1, 2, 3, 4):
+            raise ValueError(f"Video-MME-v2 group {unit_id} must hold positions 1 to 4")
+        metadata = group[0][2]
+        rating = score_group_answers(
+            str(metadata["group_type"]),
+            str(metadata.get("group_structure", "")),
+            tuple(item[1] == 1.0 for item in group),
+        )
+        ratings.append(ScoredValue(unit_id, unit_id, rating))
+    return tuple(ratings)
 
 
 def _answerability(samples: Sequence[SampleResult]) -> dict[str, object]:
@@ -1239,16 +1717,55 @@ def _comparisons(
     baseline = _baseline_samples(arguments.compare)
     rows = []
     for task in tasks:
-        current = tuple(
-            ScoredValue(sample.sample_id, sample.unit_id, sample.score)
-            for sample in samples
-            if sample.task == task.spec.name and sample.score is not None
-        )
+        task_samples = tuple(sample for sample in samples if sample.task == task.spec.name)
         previous_rows = tuple(row for row in baseline if row.get("task") == task.spec.name)
         digests = {row.get("evaluation_sha256") for row in previous_rows}
         if previous_rows and digests != {task.evaluation_sha256}:
             raise ValueError(f"baseline evaluation inputs differ for {task.spec.name}")
-        previous = tuple(_baseline_value(row) for row in previous_rows if _has_score(row))
+        current_protocols = {sample.scorer_protocol for sample in task_samples}
+        previous_protocols = {row.get("scorer_protocol") for row in previous_rows}
+        if previous_rows and previous_protocols != current_protocols:
+            raise ValueError(f"baseline scorer protocol differs for {task.spec.name}")
+        current_judges = {
+            sample.judge_model for sample in task_samples if sample.judge_model is not None
+        }
+        previous_judges = {
+            model for row in previous_rows if isinstance((model := row.get("judge_model")), str)
+        }
+        if current_judges and previous_judges and current_judges != previous_judges:
+            raise ValueError(f"baseline judge model differs for {task.spec.name}")
+        current_scored = tuple(sample for sample in task_samples if sample.score is not None)
+        previous_scored = tuple(row for row in previous_rows if _has_score(row))
+        if task.spec.name == "video-mme-v2":
+            current_ids = tuple(sample.sample_id for sample in current_scored)
+            previous_ids = tuple(
+                sample_id
+                for row in previous_scored
+                if isinstance((sample_id := row.get("sample_id")), str)
+            )
+            if (
+                len(previous_ids) != len(previous_scored)
+                or len(set(previous_ids)) != len(previous_ids)
+                or set(current_ids) != set(previous_ids)
+            ):
+                raise ValueError("candidate and baseline must contain identical scored samples")
+            current = _video_mme_v2_group_values(
+                tuple(
+                    {
+                        "unit_id": sample.unit_id,
+                        "score": sample.score,
+                        "metadata": sample.metadata,
+                    }
+                    for sample in current_scored
+                )
+            )
+            previous = _video_mme_v2_group_values(previous_scored)
+        else:
+            current = tuple(
+                ScoredValue(sample.sample_id, sample.unit_id, cast(float, sample.score))
+                for sample in current_scored
+            )
+            previous = tuple(_baseline_value(row) for row in previous_scored)
         if not current:
             continue
         if not previous:
@@ -1256,11 +1773,7 @@ def _comparisons(
         rows.append(
             {
                 "task": task.spec.name,
-                "metric": (
-                    "question_accuracy"
-                    if task.spec.name == "video-mme-v2"
-                    else _comparison_metric(task)
-                ),
+                "metric": _comparison_metric(task),
                 **paired_comparison(
                     current,
                     previous,
@@ -1273,8 +1786,7 @@ def _comparisons(
 
 
 def _comparison_metric(task: LoadedTask) -> str:
-    kinds = {question.score_kind for unit in task.units for question in unit.questions}
-    return _metric_name(task, True, kinds)
+    return task_primary_metric(task.spec.name)
 
 
 def _has_score(row: Mapping[str, object]) -> bool:
@@ -1312,10 +1824,91 @@ def _baseline_samples(path: Path) -> tuple[dict[str, object], ...]:
     return tuple(rows)
 
 
+def _egomem_submission(
+    samples: Sequence[SampleResult], *, requested: bool, allow_partial: bool
+) -> tuple[bytes | None, dict[str, object] | None]:
+    if not requested:
+        return None, None
+    selected = tuple(sample for sample in samples if sample.task == "egomemreason")
+    predictions: list[tuple[int, str]] = []
+    invalid_count = 0
+    for sample in selected:
+        example_id = sample.metadata.get("example_id")
+        choices = sample.metadata.get("choices")
+        choice_count = (
+            len(choices)
+            if isinstance(choices, Sequence) and not isinstance(choices, str | bytes)
+            else 0
+        )
+        answer = sample.parsed_choice
+        if (
+            isinstance(example_id, bool)
+            or not isinstance(example_id, int)
+            or sample.error_code is not None
+            or sample.ingest_failure_count
+            or not 4 <= choice_count <= 10
+            or not isinstance(answer, str)
+            or answer not in "ABCDEFGHIJ"[:choice_count]
+        ):
+            invalid_count += 1
+            continue
+        predictions.append((example_id, answer))
+
+    example_ids = tuple(example_id for example_id, _answer in predictions)
+    duplicate_count = len(example_ids) - len(set(example_ids))
+    status: dict[str, object] = {
+        "file": None,
+        "sample_count": len(selected),
+        "required_sample_count": _EGOMEM_SUBMISSION_COUNT,
+    }
+    if invalid_count or duplicate_count:
+        status.update(
+            {
+                "status": "invalid",
+                "reason": (
+                    f"{invalid_count} invalid prediction(s), "
+                    f"{duplicate_count} duplicate example_id(s)"
+                ),
+            }
+        )
+        return None, status
+
+    expected_ids = set(range(1, _EGOMEM_SUBMISSION_COUNT + 1))
+    actual_ids = set(example_ids)
+    if actual_ids != expected_ids:
+        partial = allow_partial and actual_ids < expected_ids
+        status.update(
+            {
+                "status": "partial" if partial else "invalid",
+                "reason": (
+                    f"found {len(actual_ids)} of {_EGOMEM_SUBMISSION_COUNT} required example IDs"
+                ),
+            }
+        )
+        return None, status
+
+    content = _json_bytes(
+        [
+            {"example_id": example_id, "predicted_answer": answer}
+            for example_id, answer in sorted(predictions)
+        ],
+        pretty=True,
+    )
+    status.update(
+        {
+            "status": "ready",
+            "file": _EGOMEM_SUBMISSION_FILE,
+            "sha256": hashlib.sha256(content).hexdigest(),
+        }
+    )
+    return content, status
+
+
 def _write_artifacts(
     arguments: _Arguments,
     samples: Sequence[SampleResult],
     results: Mapping[str, object],
+    submission: bytes | None,
 ) -> None:
     samples_bytes = "".join(
         json.dumps(
@@ -1341,12 +1934,16 @@ def _write_artifacts(
         + "\n"
     ).encode("utf-8")
     arguments.output_path.mkdir(mode=0o700, parents=True, exist_ok=True)
-    _atomic_replace(
-        (
-            (arguments.output_path / _SAMPLES_FILE, samples_bytes),
-            (arguments.output_path / _RESULTS_FILE, results_bytes),
-        )
-    )
+    submission_path = arguments.output_path / _EGOMEM_SUBMISSION_FILE
+    if submission is None and arguments.overwrite:
+        submission_path.unlink(missing_ok=True)
+    files = [
+        (arguments.output_path / _SAMPLES_FILE, samples_bytes),
+        (arguments.output_path / _RESULTS_FILE, results_bytes),
+    ]
+    if submission is not None:
+        files.append((submission_path, submission))
+    _atomic_replace(files)
 
 
 def _atomic_replace(files: Sequence[tuple[Path, bytes]]) -> None:
@@ -1423,11 +2020,18 @@ def _table(results: Mapping[str, object]) -> str:
         score = cast(Mapping[str, object], task["score"])
         mean = score.get("mean")
         interval = score.get("confidence_interval_95")
+        valid = task.get("score_valid") is not False
         rows.append(
             (
                 str(task["task"]),
                 str(task["primary_metric"]),
-                "—" if mean is None else f"{float(cast(float, mean)):.4f}",
+                (
+                    "INVALID"
+                    if not valid
+                    else "—"
+                    if mean is None
+                    else f"{float(cast(float, mean)):.4f}"
+                ),
                 (
                     "—"
                     if not isinstance(interval, list)
@@ -1459,6 +2063,12 @@ def _build_parser(prog: str | None) -> argparse.ArgumentParser:
         "--model_args",
         default="",
         help="comma-separated generation_model/base_url/timeout_seconds overrides",
+    )
+    parser.add_argument(
+        "--judge-model-args",
+        "--judge_model_args",
+        default="",
+        help="comma-separated model/base_url/api_key/timeout_seconds overrides",
     )
     parser.add_argument("--tasks", help="comma-separated task names or groups")
     parser.add_argument("--list-tasks", action="store_true", help="list task pins and readiness")
@@ -1493,6 +2103,7 @@ def _build_parser(prog: str | None) -> argparse.ArgumentParser:
     parser.add_argument("--max-batch-size", "--max_batch_size", type=_positive_int, default=64)
     parser.add_argument("--unit-concurrency", type=_positive_int, default=1)
     parser.add_argument("--request-concurrency", type=_positive_int, default=4)
+    parser.add_argument("--judge-concurrency", type=_positive_int, default=8)
     parser.add_argument("--recall-limit", type=_positive_int, default=20)
     parser.add_argument("--seed", type=_seed_values, default=(0, 1234, 1234, 1234))
     parser.add_argument(
@@ -1574,6 +2185,8 @@ def _arguments(parser: argparse.ArgumentParser, parsed: argparse.Namespace) -> _
         bootstrap_samples=parsed.bootstrap_samples,
         model=parsed.model,
         model_args=parsed.model_args,
+        judge_model_args=parsed.judge_model_args,
+        judge_concurrency=parsed.judge_concurrency,
         gen_kwargs=gen_kwargs,
         num_fewshot=parsed.num_fewshot,
         use_cache=(None if parsed.use_cache is None else parsed.use_cache.expanduser().resolve()),
@@ -1608,6 +2221,35 @@ def _model_config(model: str, arguments: str) -> ModelConfig:
         parsed = value.strip()
         config = _replace_config(config, key, parsed)
     return config
+
+
+def _judge_config(config: ModelConfig, arguments: _Arguments) -> _JudgeConfig:
+    judge = _JudgeConfig(
+        model=os.getenv("MINDBRIDGE_JUDGE_MODEL", config.generation_model),
+        base_url=os.getenv("MINDBRIDGE_JUDGE_BASE_URL", config.generation_base_url),
+        api_key=os.getenv("MINDBRIDGE_JUDGE_API_KEY") or config.generation_api_key,
+        timeout_seconds=float(
+            os.getenv("MINDBRIDGE_JUDGE_TIMEOUT_SECONDS", str(config.timeout_seconds))
+        ),
+        concurrency=arguments.judge_concurrency,
+    )
+    allowed = {"model", "base_url", "api_key", "timeout_seconds"}
+    aliases = {"pretrained": "model"}
+    for item in (part.strip() for part in arguments.judge_model_args.split(",") if part.strip()):
+        key, separator, value = item.partition("=")
+        key = aliases.get(key.strip(), key.strip())
+        if not separator or key not in allowed or not value.strip():
+            raise ValueError(f"invalid --judge-model-args item: {item}")
+        parsed = value.strip()
+        if key == "model":
+            judge = replace(judge, model=parsed)
+        elif key == "base_url":
+            judge = replace(judge, base_url=parsed)
+        elif key == "api_key":
+            judge = replace(judge, api_key=parsed)
+        else:
+            judge = replace(judge, timeout_seconds=float(parsed))
+    return judge
 
 
 def _evaluation_config(config: ModelConfig, tasks: Sequence[LoadedTask]) -> ModelConfig:
@@ -1703,7 +2345,7 @@ def _assignments(values: Sequence[str], selected: Sequence[str]) -> dict[str, Pa
 
 
 def _require_output(path: Path, *, overwrite: bool) -> None:
-    for name in (_RESULTS_FILE, _SAMPLES_FILE):
+    for name in (_RESULTS_FILE, _SAMPLES_FILE, _EGOMEM_SUBMISSION_FILE):
         target = path / name
         if target.exists() and not overwrite:
             raise FileExistsError(f"evaluation artifact already exists: {target}")
