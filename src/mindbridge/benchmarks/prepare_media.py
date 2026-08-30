@@ -736,6 +736,7 @@ def _segment_video(
     key = hashlib.sha256(
         json.dumps(
             [
+                "video-segment-v2",
                 str(source.resolve()),
                 stat_result.st_size,
                 stat_result.st_mtime_ns,
@@ -779,6 +780,8 @@ def _segment_video(
             "libx264",
             "-preset",
             "veryfast",
+            "-tune",
+            "zerolatency",
             "-crf",
             "18",
             "-pix_fmt",

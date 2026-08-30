@@ -81,6 +81,7 @@ class ResponseCache:
         return None if row is None else _answer(str(row[0]))
 
     def put(self, task: str, unit_id: str, question_id: str, answer: CachedAnswer) -> None:
+        key = self._key(task, unit_id, question_id)
         payload = json.dumps(
             {
                 "prediction": answer.prediction,
@@ -95,8 +96,13 @@ class ResponseCache:
         )
         self._write.execute(
             "INSERT OR REPLACE INTO responses(cache_key, payload) VALUES (?, ?)",
-            (self._key(task, unit_id, question_id), payload),
+            (key, payload),
         )
+        if self._write is not self._root:
+            self._root.execute(
+                "INSERT OR IGNORE INTO responses(cache_key, payload) VALUES (?, ?)",
+                (key, payload),
+            )
 
     def close(self) -> None:
         if self._closed:

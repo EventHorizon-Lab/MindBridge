@@ -24,7 +24,7 @@ from mindbridge._telemetry import (
     operation_span,
     token_modality_attribute,
 )
-from mindbridge.exceptions import ModelError
+from mindbridge.exceptions import ModelError, ValidationError
 from mindbridge.models.base import (
     EmbeddingBackend,
     EmbedTask,
@@ -160,8 +160,9 @@ def test_answer_serializes_temporal_and_metadata_evidence() -> None:
         content = json.loads(request.content)["messages"][1]["content"]
         hit = json.loads(content)["hits"][0]
         assert hit == {
-            "id": "memory_1",
+            "memory_id": "memory_1",
             "content": "The red parcel arrived.",
+            "score": 0.9,
             "memory_type": "semantic",
             "occurred_at": occurred_at.isoformat(),
             "occurred_end": occurred_end.isoformat(),
@@ -201,6 +202,8 @@ def test_answer_can_pin_sampling_for_reproducible_evaluation() -> None:
         payload = json.loads(request.content)
         assert payload["seed"] == 17
         assert payload["temperature"] == 0.0
+        assert payload["max_tokens"] == 512
+        assert payload["chat_template_kwargs"] == {"enable_thinking": False}
         return httpx.Response(
             200,
             json={
@@ -212,9 +215,13 @@ def test_answer_can_pin_sampling_for_reproducible_evaluation() -> None:
 
     hit = SearchHit(id="memory_1", content="evidence", score=0.9, created_at=NOW)
     with httpx.Client(transport=httpx.MockTransport(respond)) as client:
-        answer = _model(_sdk_client(client), generation_seed=17, generation_temperature=0.0).answer(
-            "What?", (hit,)
-        )
+        answer = _model(
+            _sdk_client(client),
+            generation_seed=17,
+            generation_temperature=0.0,
+            generation_max_tokens=512,
+            generation_extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+        ).answer("What?", (hit,))
 
     assert answer.answer == "Pinned."
 
@@ -613,6 +620,13 @@ def test_missing_client_and_unsupported_modality_fail_before_http(tmp_path: Path
         model.embed((ModelInput(assets=(image,)),))
 
 
+def test_generation_controls_reject_invalid_values() -> None:
+    with pytest.raises(ValidationError, match="generation_max_tokens"):
+        OpenAIModels(generation_max_tokens=0)
+    with pytest.raises(ValidationError, match="generation_extra_body"):
+        OpenAIModels(generation_extra_body={"": False})
+
+
 def test_adapter_does_not_close_the_caller_owned_sdk_client() -> None:
     with httpx.Client() as transport:
         client = _sdk_client(transport)
@@ -625,6 +639,8 @@ def _model(
     *,
     generation_seed: int | None = None,
     generation_temperature: float | None = None,
+    generation_max_tokens: int | None = None,
+    generation_extra_body: dict[str, object] | None = None,
 ) -> OpenAIModels:
     return OpenAIModels(
         client,
@@ -638,6 +654,8 @@ def _model(
         transcription_capabilities=frozenset({Modality.AUDIO, Modality.VIDEO}),
         generation_seed=generation_seed,
         generation_temperature=generation_temperature,
+        generation_max_tokens=generation_max_tokens,
+        generation_extra_body=generation_extra_body,
     )
 
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from argparse import ArgumentTypeError
 from collections.abc import Sequence
@@ -14,13 +15,14 @@ from typing import cast
 import pytest
 
 import mindbridge.benchmarks.eval as eval_module
-from mindbridge import AnswerResult, AssetRef, AsyncMemory, MemoryType, Modality
+from mindbridge import AnswerResult, AssetRef, AsyncMemory, MemoryType, Modality, SearchHit
 from mindbridge.benchmarks.eval import (
     MemoryFactory,
     SampleResult,
     _answer_many,
     _BorrowedSpeechBackend,
     _cache_namespace,
+    _generation_kwargs,
     _ingest,
     _model_config,
     _ref_at_n,
@@ -158,6 +160,13 @@ def test_cluster_statistics_and_pairing_are_seeded() -> None:
     with pytest.raises(ValueError, match="identical scored samples"):
         paired_comparison(values, (), seed=7, bootstrap_samples=200)
     assert parse_choice("I don't know", ("one", "two", "three", "four")) is None
+    assert parse_choice("I don't know", tuple(str(index) for index in range(10))) is None
+    assert parse_choice("I", tuple(str(index) for index in range(10))) == "I"
+    assert parse_choice("The answer is I.", tuple(str(index) for index in range(10))) == "I"
+    assert parse_choice("B. Because it is visible.", ("one", "two", "three", "four")) == "B"
+    assert parse_choice("**B**", ("one", "two", "three", "four")) == "B"
+    assert parse_choice("B because it is visible.", ("one", "two", "three", "four")) == "B"
+    assert parse_choice("Final: B", ("one", "two", "three", "four")) == "B"
 
 
 def test_video_mme_v2_rating_uses_the_official_zero_to_one_hundred_scale() -> None:
@@ -397,7 +406,7 @@ def test_benchmark_speech_backend_skips_video_without_an_audio_stream(
     assert skipped_request_counts == [0]
 
 
-def test_response_cache_namespace_changes_with_result_schema(
+def test_response_cache_namespace_changes_with_runner_recipe(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     arguments = cast(
@@ -406,7 +415,7 @@ def test_response_cache_namespace_changes_with_result_schema(
     )
     before = _cache_namespace(arguments, ModelConfig(), {"text": 1})
 
-    monkeypatch.setattr(eval_module, "EVAL_SCHEMA_VERSION", eval_module.EVAL_SCHEMA_VERSION + 1)
+    monkeypatch.setattr(eval_module, "EVAL_RUNNER_VERSION", "next-runner-recipe")
 
     assert _cache_namespace(arguments, ModelConfig(), {"text": 1}) != before
 
@@ -419,6 +428,14 @@ def test_model_base_url_override_replaces_environment_operation_urls(
     config = _model_config("mindbridge", "base_url=https://new.example/v1")
 
     assert config.generation_base_url == "https://new.example/v1"
+
+
+def test_generation_kwargs_normalize_bounded_non_thinking_inference() -> None:
+    assert _generation_kwargs("max_tokens=512,enable_thinking=0", 7) == (
+        "temperature=0,do_sample=false,seed=7,max_tokens=512,enable_thinking=false"
+    )
+    with pytest.raises(ValueError, match="positive integer"):
+        _generation_kwargs("max_tokens=0", 7)
 
 
 @pytest.mark.asyncio
@@ -478,6 +495,57 @@ async def test_memlens_question_date_is_a_reference_clock_not_query_text(tmp_pat
 
     assert "Question date:" not in str(question.content[0])
     assert observed == [datetime(2025, 1, 15, 10, tzinfo=timezone.utc)]
+
+
+@pytest.mark.asyncio
+async def test_answer_failure_preserves_independent_retrieval_diagnostics(tmp_path: Path) -> None:
+    now = datetime(2026, 8, 30, tzinfo=timezone.utc)
+
+    class Memory:
+        async def ask(self, _question: object, **_kwargs: object) -> AnswerResult:
+            raise RuntimeError("generation unavailable")
+
+        async def search(self, _query: object, **_kwargs: object) -> tuple[SearchHit, ...]:
+            return (
+                SearchHit(
+                    id="memory-1",
+                    content="supporting memory",
+                    score=0.8,
+                    created_at=now,
+                    metadata={"source_id": "source-1"},
+                ),
+            )
+
+    question = EvalQuestion("q1", ("question",), references=("answer",))
+    outcome = (
+        await _answer_many(
+            cast(AsyncMemory, Memory()),
+            (question,),
+            request_concurrency=1,
+            recall_limit=5,
+        )
+    )[0]
+    assert not isinstance(outcome, BaseException)
+    unit = EvalUnit("unit", (), (question,))
+    task = LoadedTask(
+        TaskSpec("fixture", "Fixture", "fixture.json", "v1", "owner/repo", "0" * 40),
+        tmp_path / "fixture.json",
+        "1" * 64,
+        (unit,),
+    )
+    sample = eval_module._sample(
+        task,
+        unit,
+        question,
+        outcome,
+        ingest_failures=0,
+        predict_only=True,
+        log_samples=False,
+    )
+
+    assert sample.error_code == "RuntimeError"
+    assert sample.memory_ids == ("memory-1",)
+    assert sample.evidence[0].source_id == "source-1"
 
 
 def test_run_identifier_cannot_escape_the_default_output_root() -> None:
@@ -754,3 +822,110 @@ async def test_runner_ingests_only_memory_available_at_each_cutoff(tmp_path: Pat
         "ask:second:5",
     ]
     assert [sample.score for sample in samples] == [1.0, 1.0]
+
+
+@pytest.mark.asyncio
+async def test_runner_applies_request_concurrency_across_units(tmp_path: Path) -> None:
+    active = 0
+    peak = 0
+
+    class Memory(_FakeMemory):
+        async def ask(
+            self,
+            question: object,
+            *,
+            limit: int,
+            reference_at: datetime | None = None,
+        ) -> AnswerResult:
+            nonlocal active, peak
+            del question, limit, reference_at
+            active += 1
+            peak = max(peak, active)
+            await asyncio.sleep(0.01)
+            active -= 1
+            return AnswerResult("A")
+
+    class Context:
+        async def __aenter__(self) -> AsyncMemory:
+            return cast(AsyncMemory, Memory([]))
+
+        async def __aexit__(self, *_error: object) -> None:
+            return None
+
+    spec = TaskSpec("fixture", "Fixture", "fixture.json", "v1", "owner/repo", "0" * 40)
+    task = LoadedTask(
+        spec,
+        tmp_path / "fixture.json",
+        "1" * 64,
+        tuple(
+            EvalUnit(
+                f"unit-{index}",
+                (),
+                (
+                    EvalQuestion(
+                        f"q{index}",
+                        ("question",),
+                        expected_choice="A",
+                        score_kind="choice",
+                    ),
+                ),
+            )
+            for index in range(2)
+        ),
+    )
+
+    await run_loaded_task(
+        task,
+        run=BenchmarkRun(tmp_path / "stores", "fixture", "run"),
+        memory_factory=cast(MemoryFactory, lambda _path: Context()),
+        batch_size=1,
+        unit_concurrency=2,
+        request_concurrency=1,
+        recall_limit=1,
+    )
+
+    assert peak == 1
+
+
+@pytest.mark.asyncio
+async def test_answer_many_reports_each_completed_answer_immediately() -> None:
+    completed: list[str] = []
+    first_completed = asyncio.Event()
+    release_slow = asyncio.Event()
+
+    class Memory(_FakeMemory):
+        async def ask(
+            self,
+            question: object,
+            *,
+            limit: int,
+            reference_at: datetime | None = None,
+        ) -> AnswerResult:
+            del limit, reference_at
+            if question == "slow":
+                await release_slow.wait()
+            return AnswerResult("A")
+
+    def on_answer(question: EvalQuestion, _outcome: object) -> None:
+        completed.append(question.question_id)
+        if question.question_id == "fast":
+            first_completed.set()
+
+    pending = asyncio.create_task(
+        _answer_many(
+            cast(AsyncMemory, Memory([])),
+            (
+                EvalQuestion("fast", ("fast",), references=("A",)),
+                EvalQuestion("slow", ("slow",), references=("A",)),
+            ),
+            request_concurrency=2,
+            recall_limit=1,
+            on_answer=on_answer,
+        )
+    )
+    await asyncio.wait_for(first_completed.wait(), timeout=1)
+
+    assert completed == ["fast"]
+
+    release_slow.set()
+    await pending
