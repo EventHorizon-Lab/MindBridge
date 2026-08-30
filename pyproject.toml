@@ -35,11 +35,13 @@ local = [
     # Avoid transformers[audio]: pyctcdecode pins NumPy 1.x, which has no Python 3.13/3.14
     # wheels. Jina only needs librosa and soundfile for its native audio path.
     "librosa>=0.11,<2",
-    "funasr>=1.4.4,<2",
+    "funasr>=1.4.6,<2",
     # NumPy 1.x has no wheels for the two newest supported interpreters.
     "numpy>=2,<3; python_version >= '3.13'",
     "sentence-transformers[image,video]>=5.7,<6",
     "soundfile>=0.13,<1",
+    # Fun-ASR-Nano uses torchaudio.functional.forced_align for its native timestamps.
+    "torchaudio>=2.11,<3",
 ]
 server = [
     "fastapi>=0.116,<1",

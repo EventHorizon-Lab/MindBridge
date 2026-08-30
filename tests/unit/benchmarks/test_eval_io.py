@@ -168,11 +168,11 @@ def test_response_cache_merges_run_shards_into_the_shared_cache(tmp_path: Path) 
     first = ResponseCache(tmp_path / "responses", "run-a", "namespace")
     first.put("task", "unit", "question", answer)
     assert first.get("task", "unit", "question") == answer
-    first.close()
 
     second = ResponseCache(tmp_path / "responses", "run-b", "namespace")
     assert second.get("task", "unit", "question") == answer
     second.close()
+    first.close()
 
     assert (tmp_path / "responses" / "cache.db").is_file()
     assert (tmp_path / "responses" / "runs" / "run-a" / "cache.db").is_file()
@@ -222,6 +222,7 @@ def test_video_segment_cache_repairs_an_interrupted_entry(
     def run(command: tuple[str, ...] | list[str], _source: Path) -> None:
         assert "0:a:0?" in command
         assert command[command.index("-c:a") + 1] == "aac"
+        assert command[command.index("-tune") + 1] == "zerolatency"
         output = Path(command[-1])
         for index in range(2):
             Path(str(output).replace("%05d", f"{index:05d}")).write_bytes(b"segment")

@@ -299,12 +299,18 @@ models = OpenAIModels(
     embedding_capabilities=frozenset({Modality.TEXT}),
     generation_capabilities=frozenset({Modality.TEXT}),
     transcription_capabilities=frozenset({Modality.AUDIO}),
+    generation_seed=None,
+    generation_temperature=None,
+    generation_max_tokens=None,
+    generation_extra_body=None,
 )
 ```
 
 The common `client` is used for operations without a more specific client. Missing clients fail
 only when their operation is invoked. Media is bounded and sent inline; use a provider-specific
-upload adapter for larger assets. SDK clients remain caller-owned.
+upload adapter for larger assets. `generation_max_tokens` maps to Chat Completions `max_tokens`;
+`generation_extra_body` passes caller-owned provider extensions through the official SDK. SDK
+clients remain caller-owned.
 
 `OpenAIModels.stream_answer()` requests streamed chat completions with final usage enabled.
 `Memory.ask()` selects it automatically to measure first chunk, first token, total generation

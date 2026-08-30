@@ -10,7 +10,17 @@ from collections import defaultdict
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 
-_CHOICE = re.compile(r"\b([A-J])\b", re.IGNORECASE)
+_DIRECT_CHOICE = re.compile(r"(?:option\s+)?[([]?([A-J])[]).]?", re.IGNORECASE)
+_EXPLICIT_CHOICE = re.compile(
+    r"\b(?:answer|choice|option|final)(?:\s+is|\s*[:=])?\s*[([]?([A-J])\b",
+    re.IGNORECASE,
+)
+_LEADING_CHOICE = re.compile(
+    r"^\s*[([]?([A-J])(?:[]).,:-]|\s+(?=(?:because|as|since)\b))", re.IGNORECASE
+)
+_CORRECT_CHOICE = re.compile(
+    r"\b([A-J])\b\s+(?:is|was|would be)\s+(?:the\s+)?(?:answer|correct)\b", re.IGNORECASE
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,11 +43,16 @@ class ScoredValue:
 def parse_choice(response: str, choices: Sequence[str] = ()) -> str | None:
     """Extract an option label, falling back to an exact option-text match."""
     normalized = response.strip()
-    matches = _CHOICE.findall(normalized.upper())
     allowed = "ABCDEFGHIJ"[: len(choices)] if choices else "ABCDEFGHIJ"
-    for match in reversed(matches):
-        if match.upper() in allowed:
-            return str(match).upper()
+    direct = _DIRECT_CHOICE.fullmatch(normalized.strip("*_`"))
+    if direct is not None and direct.group(1).upper() in allowed:
+        return direct.group(1).upper()
+    for pattern in (_EXPLICIT_CHOICE, _LEADING_CHOICE, _CORRECT_CHOICE):
+        matches = pattern.findall(normalized)
+        for match in reversed(matches):
+            label = str(match).upper()
+            if label in allowed:
+                return label
     answer = normalize_text(normalized)
     for label, choice in zip("ABCDEFGHIJ", choices, strict=False):
         if answer == normalize_text(choice):

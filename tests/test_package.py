@@ -114,7 +114,14 @@ def test_dependency_surface_is_exact() -> None:
         "benchmarks": {"huggingface-hub", "nltk", "opentelemetry-sdk", "pyarrow"},
         "observability": {"opentelemetry-sdk"},
         "openai": {"openai"},
-        "local": {"funasr", "librosa", "numpy", "sentence-transformers", "soundfile"},
+        "local": {
+            "funasr",
+            "librosa",
+            "numpy",
+            "sentence-transformers",
+            "soundfile",
+            "torchaudio",
+        },
         "server": {"fastapi", "starlette", "uvicorn"},
         "mcp": {"mcp"},
     }
