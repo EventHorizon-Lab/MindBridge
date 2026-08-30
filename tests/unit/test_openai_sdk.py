@@ -4,9 +4,10 @@ import base64
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import httpx2 as httpx
+import openai
 import pytest
 from openai import OpenAI
 from opentelemetry.sdk.trace import TracerProvider
@@ -844,6 +845,91 @@ def test_provider_failures_do_not_leak_key_or_body(network_error: bool) -> None:
 
     assert secret not in str(failure.value)
     assert private_body not in str(failure.value)
+
+
+def _raise_timeout(request: httpx.Request) -> httpx.Response:
+    raise httpx.ReadTimeout("timed out", request=request)
+
+
+def _raise_connect_error(request: httpx.Request) -> httpx.Response:
+    raise httpx.ConnectError("no route", request=request)
+
+
+def _search_hit() -> SearchHit:
+    return SearchHit(id="memory_1", content="The toolbox is blue.", score=0.9, created_at=NOW)
+
+
+@pytest.mark.parametrize(
+    ("respond", "expected_reason", "expected_retryable"),
+    [
+        (
+            lambda request: httpx.Response(401, json={"error": {"message": "bad key"}}),
+            "auth_failed",
+            False,
+        ),
+        (
+            lambda request: httpx.Response(429, json={"error": {"message": "slow down"}}),
+            "rate_limited",
+            True,
+        ),
+        (
+            lambda request: httpx.Response(400, json={"error": {"message": "bad input"}}),
+            "request_rejected",
+            False,
+        ),
+        (_raise_timeout, "timeout", True),
+        (_raise_connect_error, "connection_failed", True),
+        (lambda request: httpx.Response(500, json={"error": {"message": "upstream"}}), None, False),
+    ],
+)
+def test_provider_failures_keep_their_cause_and_the_sdk_classification(
+    respond: object,
+    expected_reason: str | None,
+    expected_retryable: bool,
+) -> None:
+    with (
+        httpx.Client(transport=httpx.MockTransport(cast(Any, respond))) as client,
+        pytest.raises(ModelError) as failure,
+    ):
+        _model(_sdk_client(client)).embed((ModelInput(text="remember this"),))
+
+    assert failure.value.reason == expected_reason
+    assert failure.value.retryable is expected_retryable
+    assert failure.value.stage == "embed"
+    # The original provider exception survives as the cause instead of being erased by `from None`.
+    assert isinstance(failure.value.__cause__, openai.OpenAIError)
+
+
+def test_generation_and_transcription_name_their_own_stage(tmp_path: Path) -> None:
+    def respond(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429, json={"error": {"message": "slow down"}})
+
+    audio = _asset(tmp_path, "clip", Modality.AUDIO, "audio/wav", b"wav")
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        model = _model(_sdk_client(client))
+        with pytest.raises(ModelError) as generation:
+            model.answer("what happened?", (_search_hit(),))
+        with pytest.raises(ModelError) as transcription:
+            model.transcribe((audio,))
+
+    assert generation.value.stage == "generate"
+    assert transcription.value.stage == "transcribe"
+    assert {generation.value.reason, transcription.value.reason} == {"rate_limited"}
+
+
+def test_backend_and_modality_failures_are_permanent(tmp_path: Path) -> None:
+    model = OpenAIModels()
+    image = _asset(tmp_path, "image", Modality.IMAGE, "image/png", b"image")
+
+    with pytest.raises(ModelError) as missing_client:
+        model.embed((ModelInput(text="remember this"),))
+    with pytest.raises(ModelError) as unsupported:
+        model.embed((ModelInput(assets=(image,)),))
+
+    assert missing_client.value.reason == "backend_not_configured"
+    assert missing_client.value.retryable is False
+    assert unsupported.value.reason == "unsupported_modality"
+    assert unsupported.value.retryable is False
 
 
 def test_missing_client_and_unsupported_modality_fail_before_http(tmp_path: Path) -> None:
