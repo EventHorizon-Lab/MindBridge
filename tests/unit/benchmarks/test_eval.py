@@ -984,6 +984,46 @@ async def test_runner_applies_request_concurrency_across_units(tmp_path: Path) -
 
 
 @pytest.mark.asyncio
+async def test_answer_many_latency_excludes_request_semaphore_wait() -> None:
+    slow_started = asyncio.Event()
+    release_slow = asyncio.Event()
+
+    class Memory(_FakeMemory):
+        async def ask(
+            self,
+            question: object,
+            *,
+            limit: int,
+            reference_at: datetime | None = None,
+        ) -> AnswerResult:
+            del limit, reference_at
+            if question == "slow":
+                slow_started.set()
+                await release_slow.wait()
+            return AnswerResult("A")
+
+    pending = asyncio.create_task(
+        _answer_many(
+            cast(AsyncMemory, Memory([])),
+            (
+                EvalQuestion("slow", ("slow",), references=("A",)),
+                EvalQuestion("fast", ("fast",), references=("A",)),
+            ),
+            request_concurrency=1,
+            recall_limit=1,
+        )
+    )
+    await asyncio.wait_for(slow_started.wait(), timeout=1)
+    await asyncio.sleep(0.05)
+    release_slow.set()
+    slow, fast = await pending
+
+    assert not isinstance(slow, BaseException)
+    assert not isinstance(fast, BaseException)
+    assert fast.latency_ms < slow.latency_ms / 4
+
+
+@pytest.mark.asyncio
 async def test_answer_many_reports_each_completed_answer_immediately() -> None:
     completed: list[str] = []
     first_completed = asyncio.Event()

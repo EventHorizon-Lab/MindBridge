@@ -918,8 +918,8 @@ async def _answer_many(
     semaphore = request_semaphore or asyncio.Semaphore(request_concurrency)
 
     async def answer(question: EvalQuestion) -> _AnswerOutcome:
-        started = time.perf_counter()
         async with semaphore:
+            started = time.perf_counter()
             content = _content(question.content)
             try:
                 result = await memory.ask(
