@@ -50,8 +50,9 @@ Restore only while the target process is stopped:
 5. Run known text and media retrieval checks.
 
 When `zvec/` is absent, startup queues every authoritative embedding and rebuilds the index without
-re-embedding historical content. A configuration metadata mismatch stops startup; use the
-embedding model, vector-space ID, dimension, and recipe that created the store.
+re-embedding historical content. A configuration metadata mismatch stops startup unless it is an
+explicitly recognized bundled recipe upgrade; use the embedding model, vector-space ID, dimension,
+and recipe that created the store.
 Restore the original `transcription_space` as well. It identifies the ASR model and
 transcript-affecting recipe used by cached transcripts and add-time derived text; a mismatch fails startup.
 Configured face embedding and analysis spaces have the same fail-fast guard.
@@ -59,7 +60,8 @@ Configured face embedding and analysis spaces have the same fail-fast guard.
 A recognized legacy retrieval-key recipe is different from a missing Zvec directory: startup
 re-embeds authoritative records, commits the new recipe marker, and rebuilds Zvec. Schema-only
 upgrades from the context-key v6 or grouped-range v7 recipes reuse stored vectors and rebuild only
-the disposable Zvec projection.
+the disposable Zvec projection. The Jina v3-to-v4 input-recipe upgrade likewise re-embeds records
+before committing its new embedding-space marker.
 
 ## Rebuild and optimize
 

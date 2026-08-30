@@ -26,7 +26,8 @@ from mindbridge.types import Modality
 DEFAULT_JINA_MODEL_ID = "jinaai/jina-embeddings-v5-omni-small-retrieval"
 DEFAULT_JINA_REVISION = "e3ae4b6e4af4ec0799cd931aefaff03235b5f9d4"
 DEFAULT_JINA_DIMENSION = 1024
-_JINA_RECIPE = "jina-v5-omni-official-sentence-transformers-v3"
+_JINA_RECIPE = "jina-v5-omni-official-sentence-transformers-v4"
+_JINA_LEGACY_RECIPES = frozenset({"jina-v5-omni-official-sentence-transformers-v3"})
 _JINA_CAPABILITIES = frozenset({Modality.TEXT, Modality.IMAGE, Modality.VIDEO, Modality.AUDIO})
 _JINA_DIMENSIONS = frozenset({32, 64, 128, 256, 512, 1024})
 _ENCODE_METHODS = ("encode", "encode_query", "encode_document")
@@ -106,6 +107,18 @@ class JinaOmniEmbedder:
         return self._space_id
 
     @property
+    def _legacy_embedding_spaces(self) -> frozenset[str]:
+        return frozenset(
+            _recipe_space(
+                recipe,
+                DEFAULT_JINA_MODEL_ID,
+                DEFAULT_JINA_REVISION,
+                self._dimension,
+            )
+            for recipe in _JINA_LEGACY_RECIPES
+        )
+
+    @property
     def embedding_dimension(self) -> int:
         return self._dimension
 
@@ -159,6 +172,9 @@ class _LoadedJinaOmniEmbedder(SentenceTransformersEmbedder):
                 "Jina Omni's media processor is unavailable; install MindBridge with the "
                 "local extra"
             )
+        video_processor = getattr(encoder[0].processor, "video_processor", None)  # type: ignore[index]
+        if video_processor is not None and hasattr(video_processor, "cap_pixels_per_frame"):
+            video_processor.cap_pixels_per_frame = True
         super().__init__(
             encoder,
             model_id=DEFAULT_JINA_MODEL_ID,

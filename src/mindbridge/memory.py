@@ -128,7 +128,7 @@ _DEFAULT_AMBIGUITY_MARGIN = 0.01
 _LEXICAL_MATCH_CONFIDENCE = 0.6
 _DECAY_REINFORCEMENT_LIMIT = 20
 _CONFIRMATION_WEIGHT = 0.05
-_MAX_LEXICAL_RERANK_BONUS = 0.01
+_MAX_LEXICAL_RERANK_BONUS = 0.2
 _NEGATION_WEIGHT = 6.0
 _LEXICAL_NOISE_TERMS = frozenset(
     {
@@ -415,6 +415,7 @@ class Memory:
             index_rebuild, embedding_rebuild = self._ensure_store_metadata(index_path)
             if embedding_rebuild:
                 self._reembed_memories()
+                self._store.set_metadata(_STORE_METADATA_KEYS["space"], self._space_id)
                 self._store.set_metadata(_STORE_METADATA_KEYS["index"], self._index_recipe)
             if index_missing or index_rebuild:
                 with _translate_storage_errors("checkpoint a missing search index"):
@@ -2454,6 +2455,10 @@ class Memory:
             expected[_STORE_METADATA_KEYS["face_analysis"]] = self._face_analysis_space
         rebuild_index = False
         rebuild_embeddings = False
+        legacy_embedding_spaces = cast(
+            frozenset[str],
+            getattr(self._embedder, "_legacy_embedding_spaces", frozenset()),
+        )
         with _translate_storage_errors("validate local store metadata"):
             for key, value in expected.items():
                 stored = self._store.get_metadata(key)
@@ -2465,13 +2470,15 @@ class Memory:
                         self._store.set_metadata(key, value)
                 elif stored == value:
                     continue
-                elif key == _STORE_METADATA_KEYS["index"] and stored in (
-                    _LEGACY_INDEX_RECIPES
-                    | _LEGACY_INDEX_ONLY_RECIPES
-                    | {_index_recipe(mode) for mode in IndexQuantization}
-                ):
+                elif (
+                    requires_reembedding := _known_metadata_upgrade(
+                        key,
+                        stored,
+                        legacy_embedding_spaces,
+                    )
+                ) is not None:
                     rebuild_index = True
-                    rebuild_embeddings = stored in _LEGACY_INDEX_RECIPES
+                    rebuild_embeddings = rebuild_embeddings or requires_reembedding
                 else:
                     raise StorageError(
                         f"local store metadata mismatch for {key}: expected {value!r}, "
@@ -3179,6 +3186,22 @@ def _index_quantization(value: object) -> IndexQuantization:
 
 def _index_recipe(quantization: IndexQuantization) -> str:
     return f"{_INDEX_RECIPE_PREFIX}:quantization-{quantization.value}"
+
+
+def _known_metadata_upgrade(
+    key: str,
+    stored: str,
+    legacy_embedding_spaces: frozenset[str],
+) -> bool | None:
+    if key == _STORE_METADATA_KEYS["space"] and stored in legacy_embedding_spaces:
+        return True
+    if key == _STORE_METADATA_KEYS["index"] and stored in (
+        _LEGACY_INDEX_RECIPES
+        | _LEGACY_INDEX_ONLY_RECIPES
+        | {_index_recipe(mode) for mode in IndexQuantization}
+    ):
+        return stored in _LEGACY_INDEX_RECIPES
+    return None
 
 
 def _batch_values(

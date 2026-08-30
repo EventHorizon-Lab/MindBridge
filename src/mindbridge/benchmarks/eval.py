@@ -109,7 +109,7 @@ from mindbridge.models.jina import (
 from mindbridge.models.openai_sdk import _model_usage, _record_usage_batch
 
 EVAL_SCHEMA_VERSION = 7
-EVAL_RUNNER_VERSION = "mindbridge_eval_official_v7"
+EVAL_RUNNER_VERSION = "mindbridge_eval_official_v8"
 DEFAULT_BOOTSTRAP_SAMPLES = 2_000
 _RESULTS_FILE = "results.json"
 _SAMPLES_FILE = "samples.jsonl"

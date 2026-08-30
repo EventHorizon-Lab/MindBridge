@@ -94,17 +94,17 @@ the existing embedding `object_part`. Only the aggregate carries full text into 
 one record from crowding lexical results. Queries batch their complete aggregate with bounded
 focused aggregate and atomic keys derived from the first text atom and query media; later text atoms
 never become independent routes. The focused text remains the lexical query. Dense and lexical
-routes execute concurrently. Zvec oversamples groups by parent memory so sibling document embeddings cannot consume the candidate
-budget; when native best-effort grouping returns too few parents, a bounded ordinary-query fallback
-fills them. Dense and lexical routes stay separate until SQLite drops stale embedding IDs and
-collapses every route to its authoritative parent memory. Parent relevance preserves the strongest
-dense evidence, admits lexical-only evidence through relative BM25, and applies exact lexical
-agreement only as a small reranking bonus before temporal, decay, and ambiguity calibration. The
-standard FTS field lowercases, folds accents, and stems English; a parallel Jieba field handles Han
-queries. For ordered multi-text queries, the first text atom and media provide the focused dense
-and lexical routes while later text remains only in the complete aggregate. Event-start and
-event-end inverted indexes enable
-Zvec's range optimization.
+routes execute concurrently. Zvec oversamples groups by parent memory so sibling document
+embeddings cannot consume the candidate budget; when native best-effort grouping returns too few
+parents, a bounded ordinary-query fallback fills them. Dense and lexical routes stay separate until
+SQLite drops stale embedding IDs and collapses every route to its authoritative parent memory. Zvec
+ranks dense hits by nonnegative cosine while separately rescaled cosine confidence drives
+weak-evidence gating. Parent relevance preserves the strongest dense evidence, admits lexical-only
+evidence through relative BM25, and applies bounded exact lexical agreement before temporal, decay,
+and ambiguity calibration. The standard FTS field lowercases, folds accents, and stems English; a
+parallel Jieba field handles Han queries. For ordered multi-text queries, the first text atom and
+media provide the focused dense and lexical routes while later text remains only in the complete
+aggregate. Event-start and event-end inverted indexes enable Zvec's range optimization.
 
 Relative-time parsing accepts an explicit `reference_at` first. Without one, a natural
 `Today is <date>` declaration becomes the reference clock and is removed before parsing phrases

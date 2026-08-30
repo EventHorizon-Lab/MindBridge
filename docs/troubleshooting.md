@@ -101,8 +101,9 @@ HTTP 500, and needs a different MindBridge version or a new directory.
 
 The directory was opened with a different embedding model, embedding space, dimension,
 transcription space, or unknown index recipe. Known older retrieval-key recipes migrate by
-re-embedding automatically; other mismatches require the original adapter or a new directory.
-`reindex()` itself cannot change stored vectors or transcripts.
+re-embedding automatically, as does the bundled Jina v3-to-v4 input-recipe upgrade. Other
+mismatches require the original adapter or a new directory. `reindex()` itself cannot change stored
+vectors or transcripts.
 
 ## Missing or damaged Zvec index
 

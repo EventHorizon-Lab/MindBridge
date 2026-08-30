@@ -135,11 +135,13 @@ An audio-only input therefore becomes transcript-only when fallback is required.
 is not silently discarded merely to reach a text model.
 
 Stored embeddings belong to one adapter recipe, model, immutable revision, dimension, vector
-space, and index recipe. Local adapters derive `embedding_space` from those values. MindBridge refuses to
-open a directory with incompatible settings. Use a new directory and re-encode source content when
-changing the embedding space. The store also persists `transcription_space`, which identifies the
-ASR model and transcript-affecting preprocessing recipe. Reopening with a different value fails
-before use so cached transcripts and add-time derived text cannot silently mix recipes.
+space, and index recipe. Local adapters derive `embedding_space` from those values. MindBridge
+refuses to open a directory with incompatible settings except for explicitly recognized bundled
+recipe upgrades, which re-embed authoritative records before committing the new space. Use a new
+directory and re-encode source content for other embedding-space changes. The store also persists
+`transcription_space`, which identifies the ASR model and transcript-affecting preprocessing recipe.
+Reopening with a different value fails before use so cached transcripts and add-time derived text
+cannot silently mix recipes.
 
 FunASR's `SPK0` labels and face-detector labels are local to one asset. MindBridge stores neither as
 the durable identity. It normalizes their embeddings, keeps at most 20 voice or 10 face exemplars

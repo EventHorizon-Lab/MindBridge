@@ -93,6 +93,7 @@ class _FakeModels:
         self.transcribe_calls: list[tuple[AssetRef, ...]] = []
         self.embedding_model = model
         self.embedding_space = f"{model}:2:test"
+        self._legacy_embedding_spaces: frozenset[str] = frozenset()
         self.transcription_model = "fake-transcription"
         self.transcription_space = transcription_space
         self.embedding_dimension = 2
@@ -832,6 +833,24 @@ def test_text_reranking_does_not_override_strong_semantic_evidence(tmp_path: Pat
         hits = memory.search("Did the red parcel arrive?", limit=2)
 
     assert [hit.id for hit in hits] == [semantic.id, question_echo.id]
+
+
+def test_exact_lexical_evidence_beats_a_weak_dense_neighbor(tmp_path: Path) -> None:
+    with _memory(tmp_path, _FakeModels()) as memory:
+        exact = memory.add("obsidian key green drawer")
+        neighbor = memory.add("unrelated scene")
+        index = _FakeIndex.instances[-1]
+        index.dense_hits_override = (
+            IndexHit(id=neighbor.id, relevance=0.72, confidence=0.86),
+            IndexHit(id=exact.id, relevance=0.1, confidence=0.55),
+        )
+        index.lexical_hits_override = (
+            IndexHit(id=exact.id, relevance=1.0, confidence=0.0, lexical_match=True),
+        )
+
+        hits = memory.search("obsidian key green drawer", limit=2)
+
+    assert [hit.id for hit in hits] == [exact.id, neighbor.id]
 
 
 def test_event_span_overlapping_query_day_is_temporally_exact(tmp_path: Path) -> None:
@@ -1842,6 +1861,46 @@ def test_legacy_index_recipe_is_rebuilt_from_sqlite(tmp_path: Path, recipe: str)
         document = _FakeIndex.instances[-1].documents[record.id]
         assert document.memory_type == "episodic"
         assert reopened_models.embed_inputs
+
+
+def test_known_embedding_space_upgrade_reembeds_and_commits_marker(tmp_path: Path) -> None:
+    legacy_space = "fake-embedding:2:legacy"
+    original = _FakeModels()
+    original.embedding_space = legacy_space
+    with _memory(tmp_path, original) as memory:
+        record = memory.add("preserved episodic memory", memory_type=MemoryType.EPISODIC)
+    with LocalStore(tmp_path) as store:
+        store.set_metadata(
+            "index.recipe",
+            "zvec-0.7:hnsw-cosine-m50-efc500:fts-standard-lowercase:grouped-range:context-keys-v7",
+        )
+
+    upgraded = _FakeModels()
+    upgraded._legacy_embedding_spaces = frozenset({legacy_space})
+    with _memory(tmp_path, upgraded):
+        document = _FakeIndex.instances[-1].documents[record.id]
+        assert document.embedding.space_id == upgraded.embedding_space
+
+    assert upgraded.embed_inputs
+    with LocalStore(tmp_path) as store:
+        assert store.get_metadata("embedding.space_id") == upgraded.embedding_space
+
+
+def test_failed_embedding_space_upgrade_keeps_legacy_marker(tmp_path: Path) -> None:
+    legacy_space = "fake-embedding:2:legacy"
+    original = _FakeModels()
+    original.embedding_space = legacy_space
+    with _memory(tmp_path, original) as memory:
+        memory.add("preserved memory")
+
+    failing = _FakeModels()
+    failing._legacy_embedding_spaces = frozenset({legacy_space})
+    failing.fail_embedding = True
+    with pytest.raises(ModelError, match="embed memory input"):
+        _memory(tmp_path, failing)
+
+    with LocalStore(tmp_path) as store:
+        assert store.get_metadata("embedding.space_id") == legacy_space
 
 
 @pytest.mark.parametrize(
