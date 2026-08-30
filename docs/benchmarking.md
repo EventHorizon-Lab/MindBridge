@@ -145,11 +145,10 @@ context keys cover long fields. Mem-Gallery preserves released image IDs beside 
 Benchmark questions keep the original question as the first ordered text atom and retain answer
 instructions as later atoms, exercising the same public mixed-content API as applications.
 
-The benchmark's OpenAI adapter reserves at most 64 MiB of base64-encoded media per answer request
-for question media and top-ranked evidence — roughly 48 MiB of files on disk — making prepared clips
-important. A benchmark against larger
-question media needs a provider-specific harness adapter with that provider's native upload
-mechanism.
+The benchmark's OpenAI adapter reserves at most 20 MiB per base64-encoded media item and 64 MiB per
+answer request for question media and top-ranked evidence — roughly 15 MiB per file and 48 MiB in
+aggregate on disk — making prepared clips important. A benchmark against larger question media
+needs a provider-specific harness adapter with that provider's native upload mechanism.
 
 ## Reproducibility and result trust
 

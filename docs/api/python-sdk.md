@@ -152,10 +152,11 @@ English reference date such as `Today is May 2, 2024`; an explicit `reference_at
 
 Composite records are indexed with an aggregate vector and de-duplicated vectors for each text or
 media atom. Text longer than 2,048 characters also receives overlapping contextual retrieval keys;
-the complete record remains the returned evidence. Queries use the same bounded aggregate and
-atomic representation in one embedding batch, discard duplicate vectors, and search up to four
-independent routes concurrently; single-text queries remain one vector. Dense and lexical
-candidates hydrate and collapse to their authoritative parent before reranking. English BM25 uses
+the complete record remains the returned evidence. Queries batch their complete aggregate with
+bounded focused aggregate and atomic keys derived from the first text atom and query media; later
+text atoms do not become independent dense routes. The focused text also supplies the lexical
+query. Dense and lexical candidates hydrate and collapse aggregate or atomic document keys to their
+authoritative parent before reranking. English BM25 uses
 case folding, accent folding, and stemming; queries containing Han characters use Jieba. Weak or
 missing evidence can therefore return `()`. With `limit=1`, an unresolved top-two tie can also
 empty `search` or leave `ask` with no hits; larger limits preserve those qualified candidates.

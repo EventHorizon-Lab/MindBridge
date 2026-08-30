@@ -97,8 +97,8 @@ zvec.init(query_threads=4, optimize_threads=2, memory_limit_mb=2048)
 
 This is process-global and cannot be changed at runtime. MindBridge deliberately does not call it,
 so multiple local directories cannot silently compete to replace one another's resource policy.
-MindBridge may fan out up to four independent dense/lexical routes for one composite query; include
-that outer concurrency when selecting `query_threads`.
+MindBridge may run several focused dense routes and one lexical route concurrently with up to four
+outer workers; include that concurrency when selecting `query_threads`.
 
 The optional `IndexQuantization` setting changes only the derived vector index. Zvec retains the
 original vectors alongside quantized data, so quantization reduces active memory and may improve
@@ -115,9 +115,9 @@ Track at least:
 - Free bytes and inodes on the containing filesystem.
 - Add and search latency.
 - Embedding, generation, and transcription latency/failures separately.
-- Encoded media bytes per OpenAI adapter call; embeddings reject aggregates over 64 MiB after
-  base64 expansion, while answers reserve the same limit for question media and fill the remainder
-  with ranked evidence.
+- Encoded media bytes per OpenAI adapter call; embeddings reject items over 20 MiB or aggregates
+  over 64 MiB after base64 expansion, while answers reserve those limits for question media and
+  fill the remainder with ranked evidence.
 - REST status counts, especially 502 and 503.
 - Startup and rebuild duration.
 

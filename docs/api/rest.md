@@ -237,8 +237,9 @@ Content-Type: application/json
 `reference_at` resolves relative date expressions and must include a timezone; current UTC is the
 default unless the query declares a valid English reference date such as
 `Today is May 2, 2024`; an explicit value always wins. Response `200` is `{"hits": [...]}`; each
-hit has the memory fields plus `score`. Routed aggregate and atomic query keys use dense retrieval;
-the focused text atom also supplies lexical candidates. Both routes collapse to parent memories.
+hit has the memory fields plus `score`. The complete ordered query and bounded focused keys from
+its first text atom and media supply dense candidates; the focused text also supplies lexical
+candidates. All routes collapse aggregate or atomic document keys to parent memories.
 
 ### Answer from memories
 
@@ -422,6 +423,6 @@ use the Python `Path`/`Blob` contract or a provider-specific adapter.
 
 The REST API has no local-path input, large-file upload endpoint, update route, metadata filter,
 logical scope parameter, chunking contract, per-asset vector control, or learned reranker. The OpenAI
-adapter inlines at most 64 MiB of base64-encoded media per embedding or generation call, which is
-roughly 48 MiB of files on disk; generation admits ranked evidence within that budget, and answer
-text evidence is limited to 4 MiB.
+adapter inlines at most 20 MiB per base64-encoded media item and 64 MiB per embedding or generation
+call, roughly 15 MiB per file and 48 MiB in aggregate on disk; generation admits ranked evidence
+within those budgets, and answer text evidence is limited to 4 MiB.

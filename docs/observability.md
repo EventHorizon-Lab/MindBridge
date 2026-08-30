@@ -65,7 +65,7 @@ token-metered request supplied a usable total; request counters and known modali
 available as an exact lower bound when it is false.
 
 The bundled `OpenAIModels` generation span also reports what its inline media budget removed:
-`mindbridge.grounding.media_elided_hits` counts retrieved hits whose media did not fit, and
+`mindbridge.grounding.media_elided_hits` counts retrieved hits with any media that did not fit, and
 `mindbridge.grounding.dropped_hits` counts hits left out of the request entirely. Both are zero on
 a request that sent every retrieved hit intact. `AnswerResult.hits` still returns the retrieved
 hits, so these counters are how a shrunken grounding payload becomes visible.

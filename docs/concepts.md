@@ -160,10 +160,11 @@ entry point. Biometric vectors and source media remain inside the physical data 
 
 ## Retrieval and grounded answers
 
-`search` derives bounded aggregate and atomic query keys in one embedding batch; a single text atom
-remains one vector. Duplicate query vectors are discarded and independent routes run concurrently.
-Zvec returns one dense candidate per parent memory for every key; an ordinary-query fallback fills
-groups when native best-effort grouping is incomplete. Relative BM25 uses an English
+`search` batches the complete ordered query with bounded focused aggregate and atomic keys derived
+from its first text atom and media. Later text atoms remain in the complete aggregate but do not
+become independent routes. The focused text supplies lexical matching. Zvec matches every dense key
+against aggregate and atomic document embeddings; an ordinary-query fallback fills parent groups
+when native best-effort grouping is incomplete. Relative BM25 uses an English
 case/accent/stemming pipeline or Jieba for Han text. SQLite drops stale IDs and collapses all
 derived keys to their authoritative parent memory before confidence-preserving fusion. Type and
 range-optimized time filters are pushed into Zvec and rechecked after hydration. A temporal query retrieves both
@@ -181,8 +182,10 @@ source hits remain unchanged. Generation-time analysis does not rewrite an exist
 `content`. `AnswerResult` contains the canonical source hits that the generation backend reports it
 used, filtering any unknown IDs, for display or grounding audits. The built-in backend sends one
 binary content part per distinct asset in an answer request, even when the question or several hits
-refer to it. It reserves the 64 MiB encoded-media budget for question assets, then admits ranked hit
-media until full; an overflow hit remains as text evidence when it has text.
+refer to it. Each encoded item is limited to 20 MiB. The adapter reserves the 64 MiB aggregate
+budget for question assets, then admits ranked hit assets until full. Oversized or overflow assets
+are removed individually, so fitting siblings from the same hit remain; a hit with no admitted
+media remains as text evidence when it has text.
 
 Operations on one instance may overlap remote model calls and Zvec queries. MindBridge serializes
 SQLite commit/outbox sections and final record hydration with asset leasing; collection replacement
@@ -191,8 +194,9 @@ remains exclusive while ordinary Zvec queries can overlap.
 Long text receives bounded overlapping retrieval keys while remaining one immutable returned
 record. MindBridge does not segment long media, generate model-authored semantic keys, or use a
 learned reranker. Applications should still ingest natural turns or bounded media clips. The
-OpenAI adapter inlines at most 64 MiB of base64-encoded media per model call, which is roughly
-48 MiB of files on disk; a provider-specific upload adapter is the large-video path.
+OpenAI adapter inlines at most 20 MiB per base64-encoded media item and 64 MiB per model call,
+roughly 15 MiB per file and 48 MiB in aggregate on disk; a provider-specific upload adapter is the
+large-video path.
 
 ## Metadata is not isolation
 

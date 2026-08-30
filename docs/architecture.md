@@ -104,10 +104,11 @@ outbox and is replayed when the owner recovers. Zvec never becomes authoritative
 
 ## Read consistency
 
-MindBridge embeds bounded aggregate and atomic query keys in one batch, removes duplicate vectors,
-and asks Zvec for independent dense and lexical candidates concurrently. Every dense route groups
-by parent memory inside Zvec, with a bounded ordinary-query fallback when best-effort grouping is
-incomplete. SQLite then hydrates those IDs, drops stale IDs, and collapses the remaining derived
+MindBridge batches each complete ordered query with bounded focused aggregate and atomic keys from
+its first text atom and media, then asks Zvec for dense and lexical candidates concurrently. Dense
+search matches aggregate and atomic document embeddings and groups them by parent memory inside
+Zvec, with a bounded ordinary-query fallback when best-effort grouping is incomplete. SQLite then
+hydrates those IDs, drops stale IDs, and collapses the remaining derived
 keys before reranking. A missing index is rebuilt from stored FP32 embeddings without re-embedding
 content.
 
