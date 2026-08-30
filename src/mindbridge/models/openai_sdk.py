@@ -274,23 +274,16 @@ class OpenAIModels:
         if prepared is None:
             mark_model_requests(0, token_usage_expected=0)
             return AnswerResult(answer=UNKNOWN_ANSWER)
-        request, grounded, modalities = prepared
-        create_completion = cast(Any, self._client("generation").chat.completions.create)
-        mark_model_requests(1)
-        try:
-            response = create_completion(**request)
-        except ModelError:
-            raise
-        except Exception as error:
-            raise ModelError(
-                "generation request failed",
-                reason=_provider_reason(error),
-                stage="generate",
-            ) from error
+        response, grounded, modalities, request_count = self._create_answer(
+            question,
+            hits,
+            prepared,
+        )
         _record_openai_usage(
             response,
             input_modalities=modalities,
             output_modalities=frozenset({Modality.TEXT}),
+            request_count=request_count,
         )
         answer = _answer_text(response)
         return AnswerResult(answer=answer, hits=grounded)
@@ -307,21 +300,19 @@ class OpenAIModels:
             mark_model_requests(0, token_usage_expected=0)
             yield UNKNOWN_ANSWER
             return ()
-        request, grounded, modalities = prepared
-        create_completion = cast(Any, self._client("generation").chat.completions.create)
-        mark_model_requests(1)
         started = time.perf_counter()
         usage_response: object | None = None
+        responses, grounded, modalities, request_count = self._create_answer(
+            question,
+            hits,
+            prepared,
+            stream=True,
+        )
         try:
-            responses = create_completion(
-                **request,
-                stream=True,
-                stream_options={"include_usage": True},
-            )
             finish_reason: object = None
             emitted = False
             first_chunk = False
-            for response in responses:
+            for response in cast(Any, responses):
                 elapsed = time.perf_counter() - started
                 span = trace.get_current_span()
                 if not first_chunk:
@@ -373,6 +364,7 @@ class OpenAIModels:
                     usage_response,
                     input_modalities=modalities,
                     output_modalities=frozenset({Modality.TEXT}),
+                    request_count=request_count,
                 )
         _record_finish_reason(finish_reason)
         if finish_reason == "length":
@@ -382,6 +374,84 @@ class OpenAIModels:
                 "generation response was invalid", reason="response_invalid", stage="generate"
             )
         return grounded
+
+    def _create_answer(
+        self,
+        question: ModelInput | str,
+        hits: Sequence[SearchHit],
+        prepared: tuple[dict[str, object], tuple[SearchHit, ...], frozenset[Modality]],
+        *,
+        stream: bool = False,
+    ) -> tuple[object, tuple[SearchHit, ...], frozenset[Modality], int]:
+        request, grounded, modalities = prepared
+        create_completion = cast(Any, self._client("generation").chat.completions.create)
+
+        def create() -> object:
+            if stream:
+                return create_completion(
+                    **request,
+                    stream=True,
+                    stream_options={"include_usage": True},
+                )
+            return create_completion(**request)
+
+        mark_model_requests(1)
+        try:
+            return create(), grounded, modalities, 1
+        except ModelError:
+            raise
+        except Exception as error:
+            fallback = self._short_video_fallback(question, hits, grounded, error)
+            if fallback is None:
+                raise ModelError(
+                    "generation request failed",
+                    reason=_provider_reason(error),
+                    stage="generate",
+                ) from error
+            request, grounded, modalities = fallback
+            mark_model_requests(2)
+            try:
+                return create(), grounded, modalities, 2
+            except ModelError:
+                raise
+            except Exception as retry_error:
+                raise ModelError(
+                    "generation request failed",
+                    reason=_provider_reason(retry_error),
+                    stage="generate",
+                ) from retry_error
+
+    def _short_video_fallback(
+        self,
+        question: ModelInput | str,
+        retrieved: Sequence[SearchHit],
+        grounded: Sequence[SearchHit],
+        error: Exception,
+    ) -> tuple[dict[str, object], tuple[SearchHit, ...], frozenset[Modality]] | None:
+        if not _is_short_video_rejection(error):
+            return None
+        # ponytail: the provider does not identify the rejected clip; keep every hit's text and
+        # non-video media, then replace this with asset-specific fallback if APIs expose an ID.
+        reduced = tuple(
+            replace(
+                hit,
+                assets=assets,
+                modality=ModelInput(text=hit.content, assets=assets).modality,
+            )
+            for hit in grounded
+            if (
+                assets := tuple(
+                    asset for asset in hit.assets if asset.modality is not Modality.VIDEO
+                )
+            )
+            or hit.content.strip()
+        )
+        if reduced == tuple(grounded):
+            return None
+        fallback = self._answer_request(question, reduced)
+        if fallback is not None:
+            _record_grounding_fit(tuple(retrieved), fallback[1])
+        return fallback
 
     def _answer_request(
         self,
@@ -760,6 +830,21 @@ def _provider_reason(error: Exception) -> str | None:
         if isinstance(error, provider_error):
             return reason
     return None
+
+
+def _is_short_video_rejection(error: Exception) -> bool:
+    """Recognize a provider-declared content constraint without routing by provider name."""
+    try:
+        import openai
+    except ImportError:  # pragma: no cover - a client call implies the SDK imported already
+        return False
+    message = _member(getattr(error, "body", None), "message")
+    normalized = message.casefold() if isinstance(message, str) else ""
+    return (
+        isinstance(error, openai.BadRequestError)
+        and "video" in normalized
+        and "too short" in normalized
+    )
 
 
 def _require_capabilities(

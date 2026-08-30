@@ -67,8 +67,11 @@ available as an exact lower bound when it is false.
 The bundled `OpenAIModels` generation span also reports what its inline media budget removed:
 `mindbridge.grounding.media_elided_hits` counts retrieved hits with any media that did not fit, and
 `mindbridge.grounding.dropped_hits` counts hits left out of the request entirely. Both are zero on
-a request that sent every retrieved hit intact. `AnswerResult.hits` still returns the retrieved
-hits, so these counters are how a shrunken grounding payload becomes visible.
+a request that sent every retrieved hit intact. If a provider explicitly rejects a grounded video
+as too short, the adapter retries once with hit text and non-video media; the same counters describe
+that final payload, and `mindbridge.model.request_count` is two. Token usage remains incomplete
+because a rejected request has no provider usage report. `AnswerResult.hits` returns the evidence
+actually sent, so these counters make every shrunken grounding payload visible.
 
 `OpenAIModels` implements the optional `StreamingGenerationBackend` protocol. `Memory.ask()`
 consumes its deltas internally and still returns one `AnswerResult`, while the generation span

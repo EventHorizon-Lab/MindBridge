@@ -140,6 +140,15 @@ removed, so a shrunken payload is never silent.
 Use a provider-specific adapter that uploads or streams large assets through that provider's SDK.
 MindBridge does not expose local `file://` paths as a compatibility transport.
 
+## A provider rejects a short video
+
+If an OpenAI-compatible provider explicitly reports that a grounded video is too short, the
+adapter retries once using each hit's text and non-video media. It never removes a video supplied
+as part of the question. Inspect `mindbridge.grounding.media_elided_hits` and
+`mindbridge.model.request_count`; the retry is observable and its token total is deliberately
+marked incomplete because the rejected request reports no usage. Other bad requests still fail
+without discarding evidence.
+
 ## Answers fail with `model_output_truncated`
 
 Generation reached an output token limit before it finished, so MindBridge refused the partial

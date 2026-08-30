@@ -20,6 +20,7 @@ from mindbridge._telemetry import (
     GEN_AI_TTFC,
     GROUNDING_HITS_DROPPED,
     GROUNDING_MEDIA_ELIDED,
+    MODEL_REQUEST_COUNT,
     MODEL_TTFT,
     TOKEN_COMPLETE,
     TOKEN_REPORTED_REQUEST_COUNT,
@@ -504,6 +505,116 @@ def test_answer_uses_standard_inline_audio_part(tmp_path: Path) -> None:
         answer = _model(_sdk_client(client)).answer(ModelInput(text="What?"), (hit,))
 
     assert answer.answer == "A greeting is audible."
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_answer_retries_provider_rejected_short_hit_video_as_text(
+    streaming: bool,
+    tmp_path: Path,
+) -> None:
+    video = _asset(tmp_path, "short", Modality.VIDEO, "video/mp4", b"video")
+    hit = SearchHit(
+        id="memory_1",
+        content="The blue toolbox is beside the door.",
+        score=0.9,
+        created_at=NOW,
+        assets=(video,),
+        modality=Modality.VIDEO,
+    )
+    requests: list[dict[str, object]] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        payload = cast(dict[str, object], json.loads(request.content))
+        requests.append(payload)
+        content = cast(list[dict[str, object]], payload["messages"])[1]["content"]
+        if len(requests) == 1:
+            assert isinstance(content, list)
+            assert any(part["type"] == "video_url" for part in content)
+            return httpx.Response(
+                400,
+                json={"error": {"message": "The video file is too short."}},
+            )
+        assert isinstance(content, str)
+        assert "The blue toolbox is beside the door." in content
+        if payload.get("stream"):
+            chunk = {
+                "id": "chatcmpl-test",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "answer-model",
+                "choices": [
+                    {"index": 0, "delta": {"content": "Beside the door."}, "finish_reason": "stop"}
+                ],
+            }
+            return httpx.Response(
+                200,
+                content=f"data: {json.dumps(chunk)}\n\ndata: [DONE]\n\n",
+                headers={"content-type": "text/event-stream"},
+            )
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"content": "Beside the door."},
+                        "finish_reason": "stop",
+                    }
+                ]
+            },
+        )
+
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    with (
+        httpx.Client(transport=httpx.MockTransport(respond)) as client,
+        provider.get_tracer("test").start_as_current_span("model"),
+    ):
+        model = _model(_sdk_client(client))
+        if streaming:
+            answer = "".join(model.stream_answer("Where is the toolbox?", (hit,)))
+        else:
+            result = model.answer("Where is the toolbox?", (hit,))
+            answer = result.answer
+            assert result.hits[0].assets == ()
+            assert result.hits[0].modality is Modality.TEXT
+    provider.shutdown()
+
+    assert answer == "Beside the door."
+    assert len(requests) == 2
+    attributes = exporter.get_finished_spans()[0].attributes
+    assert attributes is not None
+    assert attributes[MODEL_REQUEST_COUNT] == 2
+    assert attributes[GROUNDING_MEDIA_ELIDED] == 1
+    assert attributes[TOKEN_COMPLETE] is False
+
+
+def test_answer_does_not_elide_video_for_an_unrelated_bad_request(tmp_path: Path) -> None:
+    video = _asset(tmp_path, "video", Modality.VIDEO, "video/mp4", b"video")
+    hit = SearchHit(
+        id="memory_1",
+        content="evidence",
+        score=0.9,
+        created_at=NOW,
+        assets=(video,),
+        modality=Modality.VIDEO,
+    )
+    requests = 0
+
+    def respond(_request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        return httpx.Response(400, json={"error": {"message": "bad input"}})
+
+    with (
+        httpx.Client(transport=httpx.MockTransport(respond)) as client,
+        pytest.raises(ModelError) as failure,
+    ):
+        _model(_sdk_client(client)).answer("What happened?", (hit,))
+
+    assert requests == 1
+    assert failure.value.reason == "request_rejected"
 
 
 def test_answer_sends_shared_media_once_and_bounds_inline_bytes(
