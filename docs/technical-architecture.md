@@ -108,7 +108,9 @@ aggregate. Event-start and event-end inverted indexes enable Zvec's range optimi
 
 Relative-time parsing accepts an explicit `reference_at` first. Without one, a natural
 `Today is <date>` declaration becomes the reference clock and is removed before parsing phrases
-such as `last week`, so the declared day is not mistaken for the requested evidence day.
+such as `last week`, so the declared day is not mistaken for the requested evidence day. The same
+bounded parser maps explicit English/Chinese month-year forms and bare calendar years to event-time
+ranges.
 
 ## Provider boundary
 

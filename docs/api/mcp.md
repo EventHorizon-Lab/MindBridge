@@ -98,9 +98,10 @@ query and bounded focused keys from its first text atom and media supply dense c
 focused text also supplies lexical candidates. All routes collapse aggregate or atomic document
 keys to parent memories. Relative temporal expressions resolve against
 `reference_at`; when omitted, a valid English declaration such as `Today is May 2, 2024` replaces
-current UTC, while an explicit value always wins. Search is conservatively marked non-read-only
-because it may drain durable index work or populate transcript caches; it never reinforces a hit
-merely for being returned.
+current UTC, while an explicit value always wins. Absolute months and years such as
+`December 2023`, `2024年4月`, or `in 2025` select the matching event-time range. Search is
+conservatively marked non-read-only because it may drain durable index work or populate transcript
+caches; it never reinforces a hit merely for being returned.
 
 ### `ask_memory`
 

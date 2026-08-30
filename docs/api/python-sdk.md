@@ -149,6 +149,8 @@ configured answerer. It raises `ModelError` when no answerer is configured.
 `reference_at` controls relative-date interpretation and decay reranking. It must be
 timezone-aware. When omitted, the current UTC time is used unless the query declares a valid
 English reference date such as `Today is May 2, 2024`; an explicit `reference_at` always wins.
+Absolute month and year expressions such as `December 2023`, `2024年4月`, or `in 2025` select the
+matching event-time range directly.
 
 Composite records are indexed with an aggregate vector and de-duplicated vectors for each text or
 media atom. Text longer than 2,048 characters also receives overlapping contextual retrieval keys;

@@ -236,10 +236,12 @@ Content-Type: application/json
 `limit` defaults to 10 and ranges from 1 through 100. `memory_type` optionally filters one role.
 `reference_at` resolves relative date expressions and must include a timezone; current UTC is the
 default unless the query declares a valid English reference date such as
-`Today is May 2, 2024`; an explicit value always wins. Response `200` is `{"hits": [...]}`; each
-hit has the memory fields plus `score`. The complete ordered query and bounded focused keys from
-its first text atom and media supply dense candidates; the focused text also supplies lexical
-candidates. All routes collapse aggregate or atomic document keys to parent memories.
+`Today is May 2, 2024`; an explicit value always wins. Absolute months and years such as
+`December 2023`, `2024年4月`, or `in 2025` select the matching event-time range. Response `200` is
+`{"hits": [...]}`; each hit has the memory fields plus `score`. The complete ordered query and
+bounded focused keys from its first text atom and media supply dense candidates; the focused text
+also supplies lexical candidates. All routes collapse aggregate or atomic document keys to parent
+memories.
 
 ### Answer from memories
 

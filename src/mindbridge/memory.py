@@ -185,13 +185,18 @@ _MAX_RETRIEVAL_KEYS = 128
 _MAX_QUERY_RETRIEVAL_KEYS = 7
 _MAX_INDEX_SEARCH_WORKERS = 4
 _TODAY_ISO_DATE = re.compile(r"\btoday\s+is\s+(\d{4}-\d{2}-\d{2})", re.IGNORECASE)
+_MONTH_NAME = (
+    r"jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|"
+    r"jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?"
+)
 _TODAY_NAMED_DATE = re.compile(
-    r"\btoday\s+is\s+"
-    r"(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|"
-    r"jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)"
+    rf"\btoday\s+is\s+({_MONTH_NAME})"
     r"\s+(\d{1,2})(?:st|nd|rd|th)?(?:\s*,?\s*(\d{4}))?",
     re.IGNORECASE,
 )
+_NAMED_MONTH_YEAR = re.compile(rf"\b({_MONTH_NAME})\s+((?:19|20|21)\d{{2}})\b", re.IGNORECASE)
+_CJK_YEAR_MONTH = re.compile(r"(?<!\d)((?:19|20|21)\d{2})年\s*(1[0-2]|0?[1-9])月")
+_CALENDAR_YEAR = re.compile(r"(?<![\d$])((?:19|20|21)\d{2})(?![\d-])")
 _MONTHS = {
     name: index
     for index, name in enumerate(
@@ -1385,7 +1390,9 @@ class Memory:
                 else:
                     preferred = self._index_candidates(
                         vectors,
-                        lexical_query=lexical_query,
+                        # Zvec range-filtered FTS is unstable after dense queries; the global
+                        # fallback below still contributes the same lexical route.
+                        lexical_query="",
                         limit=candidate_limit,
                         memory_type=memory_type,
                         occurred_from=temporal_range[0],
@@ -3440,6 +3447,19 @@ def _parse_temporal_range(  # noqa: C901 - ordered phrases are clearer as one pa
         return _date_range(min(dates), max(dates), reference_at)
 
     normalized = text.casefold()
+    months = [
+        (int(match.group(2)), _MONTHS[match.group(1)[:3]])
+        for match in _NAMED_MONTH_YEAR.finditer(normalized)
+    ]
+    months.extend(
+        (int(match.group(1)), int(match.group(2))) for match in _CJK_YEAR_MONTH.finditer(normalized)
+    )
+    if months:
+        first = min(date(year, month, 1) for year, month in months)
+        last = max(date(year, month, 1) for year, month in months)
+        start = _day_start(first, reference_at)
+        return start, _shift_month(_day_start(last, reference_at), 1)
+
     relative_day = re.search(r"(?<!\d)(\d{1,5})\s*天前", normalized) or re.search(
         r"\b(\d{1,5})\s+days?\s+ago\b", normalized
     )
@@ -3501,6 +3521,13 @@ def _parse_temporal_range(  # noqa: C901 - ordered phrases are clearer as one pa
         return (
             year_start.replace(year=year_start.year + 1),
             year_start.replace(year=year_start.year + 2),
+        )
+
+    years = [int(value) for value in _CALENDAR_YEAR.findall(normalized)]
+    if years:
+        return (
+            _day_start(date(min(years), 1, 1), reference_at),
+            _day_start(date(max(years) + 1, 1, 1), reference_at),
         )
     return None
 

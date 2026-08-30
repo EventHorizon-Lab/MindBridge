@@ -65,6 +65,8 @@ instant events use a one-microsecond internal extent.
 current UTC time. The deterministic parser recognizes:
 
 - one or two ISO dates such as `2026-08-20` or `2026-08-20 ... 2026-08-22`;
+- named English or numeric Chinese months such as `December 2023` or `2024年4月`, and bare
+  calendar years from 1900 through 2199;
 - `today`, `yesterday`, `tomorrow`, and their common Chinese equivalents;
 - last, this, next, or past week, including `上周`, `本周`, and `下周`;
 - last, this, or next month and year, including common Chinese equivalents;

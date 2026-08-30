@@ -668,6 +668,31 @@ def test_relative_time_prefers_event_time_and_routes_the_reference(tmp_path: Pat
     )
 
 
+def test_named_month_and_calendar_year_prefer_event_time(tmp_path: Path) -> None:
+    reference = datetime(2026, 8, 30, 12, tzinfo=timezone.utc)
+    relative = memory_module._parse_temporal_range("2024 days ago", reference)
+    assert relative is not None
+    assert relative[0].date() == reference.date() - timedelta(days=2024)
+
+    with _memory(tmp_path, _FakeModels()) as memory:
+        december = memory.add(
+            "shared conference memory",
+            occurred_at=datetime(2023, 12, 15, tzinfo=timezone.utc),
+        )
+        april = memory.add(
+            "shared conference memory",
+            occurred_at=datetime(2024, 4, 15, tzinfo=timezone.utc),
+        )
+        memory.add(
+            "shared conference memory",
+            occurred_at=datetime(2026, 1, 15, tzinfo=timezone.utc),
+        )
+
+        assert memory.search("What happened in December 2023?", limit=1)[0].id == december.id
+        assert memory.search("2024年4月发生了什么?", limit=1)[0].id == april.id
+        assert memory.search("What happened at BMVC 2024?", limit=3)[0].id == april.id
+
+
 def test_natural_today_anchor_sets_relative_time_unless_reference_is_explicit(
     tmp_path: Path,
 ) -> None:
@@ -778,7 +803,7 @@ def test_temporal_proximity_is_a_soft_score_not_a_hard_sort_key(tmp_path: Path) 
             reference_at=reference,
         )
         assert _FakeIndex.instances[-1].dense_search_calls == 2
-        assert _FakeIndex.instances[-1].lexical_search_calls == 2
+        assert _FakeIndex.instances[-1].lexical_search_calls == 1
 
     assert [hit.id for hit in hits] == [adjacent.id, exact.id]
 
