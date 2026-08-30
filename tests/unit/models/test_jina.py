@@ -15,6 +15,7 @@ from mindbridge.models.jina import (
     DEFAULT_JINA_REVISION,
     JinaOmniEmbedder,
 )
+from mindbridge.models.sentence_transformers import _recipe_space
 from mindbridge.types import AssetRef, Modality
 
 
@@ -132,6 +133,15 @@ def test_application_text_cannot_trigger_jina_url_or_path_autodetection(tmp_path
     assert tuple(map(str, prepared)) == texts
 
 
+def test_loaded_jina_uses_reference_video_pixel_cap() -> None:
+    video_processor = SimpleNamespace(cap_pixels_per_frame=None)
+    encoder = _Encoder(processor=SimpleNamespace(video_processor=video_processor))
+
+    jina._LoadedJinaOmniEmbedder(encoder, dimension=2)
+
+    assert video_processor.cap_pixels_per_frame is True
+
+
 def test_public_adapter_has_fixed_identity_and_does_not_load_until_needed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -148,6 +158,14 @@ def test_public_adapter_has_fixed_identity_and_does_not_load_until_needed(
     assert isinstance(backend, EmbeddingBackend)
     assert backend.embedding_model == DEFAULT_JINA_MODEL_ID
     assert backend.embedding_dimension == 32
+    assert backend._legacy_embedding_spaces == {
+        _recipe_space(
+            "jina-v5-omni-official-sentence-transformers-v3",
+            DEFAULT_JINA_MODEL_ID,
+            DEFAULT_JINA_REVISION,
+            32,
+        )
+    }
     assert backend.embed(()) == ()
     backend.close()
     assert loads == []

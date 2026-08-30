@@ -230,7 +230,9 @@ def test_create_search_flush_close_and_reopen(tmp_path: Path) -> None:
     assert isinstance(dense[0], IndexHit)
     assert tuple(hit.id for hit in dense) == ("embedding_one", "embedding_two")
     assert dense[0].relevance == pytest.approx(1.0)
-    assert dense[1].relevance == pytest.approx(0.5)
+    assert dense[0].confidence == pytest.approx(1.0)
+    assert dense[1].relevance == pytest.approx(0.0)
+    assert dense[1].confidence == pytest.approx(0.5)
 
     lexical = index.lexical_search(
         "machine learning",

@@ -455,7 +455,7 @@ def test_benchmark_speech_backend_skips_video_without_an_audio_stream(
 def test_response_cache_namespace_changes_with_runner_recipe(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    assert eval_module.EVAL_RUNNER_VERSION == "mindbridge_eval_official_v7"
+    assert eval_module.EVAL_RUNNER_VERSION == "mindbridge_eval_official_v8"
     arguments = cast(
         eval_module._Arguments,
         SimpleNamespace(device=None, seed=7, gen_kwargs="{}", recall_limit=8),

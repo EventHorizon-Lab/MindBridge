@@ -280,7 +280,7 @@ class ZvecIndex:
         ef: int | None = None,
         exact: bool = False,
     ) -> tuple[IndexHit, ...]:
-        """Return dense cosine matches with higher-is-better relevance."""
+        """Return nonnegative cosine relevance and separately rescaled confidence."""
         with self._gate.read():
             docs = self._dense_query(
                 values,
@@ -293,16 +293,14 @@ class ZvecIndex:
                 ef=ef,
                 exact=exact,
             )
-        hits = tuple(
-            (
-                _required_id(doc),
-                max(0.0, min(1.0, 1.0 - _required_score(doc) / 2.0)),
-            )
-            for doc in docs
-        )
+        hits = tuple((_required_id(doc), _required_score(doc)) for doc in docs)
         return tuple(
-            IndexHit(id=document_id, relevance=score, confidence=score)
-            for document_id, score in hits
+            IndexHit(
+                id=document_id,
+                relevance=max(0.0, min(1.0, 1.0 - distance)),
+                confidence=max(0.0, min(1.0, 1.0 - distance / 2.0)),
+            )
+            for document_id, distance in hits
         )
 
     def lexical_search(
