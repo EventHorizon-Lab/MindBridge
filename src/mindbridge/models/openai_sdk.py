@@ -1029,7 +1029,11 @@ def _hit_payload(hit: SearchHit) -> dict[str, object]:
         "memory_id": hit.id,
         "content": hit.content,
         "memory_type": hit.memory_type.value,
-        **({"occurred_at": hit.occurred_at.isoformat()} if hit.occurred_at is not None else {}),
+        **(
+            {"occurred_at": hit.occurred_at.isoformat()}
+            if hit.occurred_at is not None
+            else {"created_at": hit.created_at.isoformat()}
+        ),
         **({"occurred_end": hit.occurred_end.isoformat()} if hit.occurred_end is not None else {}),
         "metadata": dict(hit.metadata),
     }

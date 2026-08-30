@@ -119,7 +119,8 @@ non-read-only because retrieval may maintain local caches/index state. The built
 request serializes each distinct question/evidence asset once even if several hits refer to it. It
 reserves the raw-media budget for question assets, keeps ranked evidence media that fits, and
 retains overflow hits as text when possible. It also sends each hit's content, `memory_type`,
-`occurred_at`, `occurred_end`, `created_at`, and metadata to the configured generation endpoint.
+metadata, and one primary timestamp to the configured generation endpoint: `occurred_at` when the
+event time is known, otherwise `created_at`. An `occurred_end` is included when present.
 
 ### `get_memory`
 

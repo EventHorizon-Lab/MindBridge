@@ -128,7 +128,8 @@ def test_answer_maps_native_hit_media_and_abstains_without_hits(tmp_path: Path) 
         content = payload["messages"][1]["content"]
         assert [part["type"] for part in content] == ["text", "text", "image_url"]
         memory = json.loads(content[1]["text"])["memory"]
-        assert not {"score", "created_at", "occurred_at", "occurred_end"} & memory.keys()
+        assert memory["created_at"] == NOW.isoformat()
+        assert not {"score", "occurred_at", "occurred_end"} & memory.keys()
         return httpx.Response(
             200,
             json={
