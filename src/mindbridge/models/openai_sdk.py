@@ -974,11 +974,9 @@ def _hit_payload(hit: SearchHit) -> dict[str, object]:
     return {
         "memory_id": hit.id,
         "content": hit.content,
-        "score": hit.score,
         "memory_type": hit.memory_type.value,
-        "occurred_at": None if hit.occurred_at is None else hit.occurred_at.isoformat(),
-        "occurred_end": None if hit.occurred_end is None else hit.occurred_end.isoformat(),
-        "created_at": hit.created_at.isoformat(),
+        **({"occurred_at": hit.occurred_at.isoformat()} if hit.occurred_at is not None else {}),
+        **({"occurred_end": hit.occurred_end.isoformat()} if hit.occurred_end is not None else {}),
         "metadata": dict(hit.metadata),
     }
 

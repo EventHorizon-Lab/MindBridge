@@ -126,6 +126,8 @@ def test_answer_maps_native_hit_media_and_abstains_without_hits(tmp_path: Path) 
         payload = json.loads(request.content)
         content = payload["messages"][1]["content"]
         assert [part["type"] for part in content] == ["text", "text", "image_url"]
+        memory = json.loads(content[1]["text"])["memory"]
+        assert not {"score", "created_at", "occurred_at", "occurred_end"} & memory.keys()
         return httpx.Response(
             200,
             json={
@@ -167,11 +169,9 @@ def test_answer_serializes_temporal_and_metadata_evidence() -> None:
         assert hit == {
             "memory_id": "memory_1",
             "content": "The red parcel arrived.",
-            "score": 0.9,
             "memory_type": "semantic",
             "occurred_at": occurred_at.isoformat(),
             "occurred_end": occurred_end.isoformat(),
-            "created_at": NOW.isoformat(),
             "metadata": {"dialog": "delivery", "turn": 7},
         }
         return httpx.Response(
