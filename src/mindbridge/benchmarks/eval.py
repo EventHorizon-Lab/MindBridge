@@ -96,6 +96,7 @@ from mindbridge.benchmarks.task_catalog import (
 )
 from mindbridge.models.base import (
     EmbeddingBackend,
+    EmbedTask,
     GenerationBackend,
     ModelInput,
     SpeechAnalysis,
@@ -109,7 +110,7 @@ from mindbridge.models.jina import (
 from mindbridge.models.openai_sdk import _model_usage, _record_usage_batch
 
 EVAL_SCHEMA_VERSION = 7
-EVAL_RUNNER_VERSION = "mindbridge_eval_official_v8"
+EVAL_RUNNER_VERSION = "mindbridge_eval_official_v9"
 DEFAULT_BOOTSTRAP_SAMPLES = 2_000
 _RESULTS_FILE = "results.json"
 _SAMPLES_FILE = "samples.jsonl"
@@ -377,6 +378,7 @@ class _BackendPool:
             ),
         )
         self.embedder = JinaOmniEmbedder(device=device, batch_size=batch_size)
+        self.embedder.embed((ModelInput(text="MindBridge benchmark warmup"),), task=EmbedTask.QUERY)
         self.transcriber = FunASRTranscriber(device=device or "auto") if needs_speech else None
         self._answerer = cast(GenerationBackend, _BorrowedBackend(self.models))
         self._embedder = cast(EmbeddingBackend, _BorrowedBackend(self.embedder))
@@ -1552,6 +1554,7 @@ def _results(
             "embedding_model": DEFAULT_JINA_MODEL_ID,
             "embedding_revision": DEFAULT_JINA_REVISION,
             "embedding_dimension": DEFAULT_JINA_DIMENSION,
+            "embedding_warmup": {"count": 1, "task": EmbedTask.QUERY.value},
             "device": arguments.device or "auto",
             "generation_model": config.generation_model,
             "generation_base_url": config.generation_base_url,

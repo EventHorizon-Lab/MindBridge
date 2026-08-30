@@ -62,7 +62,7 @@ from mindbridge.benchmarks.model_config import ModelConfig
 from mindbridge.benchmarks.official_scorers import scorer_protocol
 from mindbridge.benchmarks.task_catalog import TASKS, TaskSpec, expand
 from mindbridge.benchmarks.video_mme_v2 import score_group_answers
-from mindbridge.models.base import SpeechAnalysis
+from mindbridge.models.base import EmbedTask, ModelInput, SpeechAnalysis
 
 
 def _egomem_sample(example_id: int, answer: str | None = None) -> SampleResult:
@@ -535,7 +535,7 @@ def test_benchmark_speech_backend_skips_video_without_an_audio_stream(
 def test_response_cache_namespace_changes_with_runner_recipe(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    assert eval_module.EVAL_RUNNER_VERSION == "mindbridge_eval_official_v8"
+    assert eval_module.EVAL_RUNNER_VERSION == "mindbridge_eval_official_v9"
     arguments = cast(
         eval_module._Arguments,
         SimpleNamespace(device=None, seed=7, gen_kwargs="{}", recall_limit=8),
@@ -549,6 +549,44 @@ def test_response_cache_namespace_changes_with_runner_recipe(
         _cache_namespace(arguments, ModelConfig(generation_min_video_seconds=2.0), {"text": 1})
         != before
     )
+
+
+def test_backend_pool_warms_query_embedding_before_evaluation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import openai
+
+    calls: list[tuple[tuple[ModelInput, ...], EmbedTask]] = []
+
+    class Client:
+        def __init__(self, **_kwargs: object) -> None: ...
+
+        def close(self) -> None: ...
+
+    class Models(Client):
+        pass
+
+    class Embedder:
+        def __init__(self, **_kwargs: object) -> None: ...
+
+        def embed(
+            self, inputs: Sequence[ModelInput], task: EmbedTask
+        ) -> tuple[tuple[float, ...], ...]:
+            calls.append((tuple(inputs), task))
+            return ((1.0,),)
+
+        def close(self) -> None: ...
+
+    monkeypatch.setattr(openai, "OpenAI", Client)
+    monkeypatch.setattr(eval_module, "OpenAIModels", Models)
+    monkeypatch.setattr(eval_module, "JinaOmniEmbedder", Embedder)
+
+    pool = eval_module._BackendPool(
+        ModelConfig(), device="cuda", batch_size=8, needs_speech=False, seed=7
+    )
+    pool.close()
+
+    assert calls == [((ModelInput(text="MindBridge benchmark warmup"),), EmbedTask.QUERY)]
 
 
 def test_implementation_identity_tracks_editable_source_changes(

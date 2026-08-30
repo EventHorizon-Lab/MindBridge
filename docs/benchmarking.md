@@ -161,6 +161,10 @@ each benchmark's published transport and sampling settings. Model providers can 
 weights behind an unversioned model name, so use an immutable model identifier for publishable
 runs.
 
+Before task spans begin, the runner performs one local `retrieval.query` embedding warmup and
+records it under `model.embedding_warmup`. This removes lazy weight loading from per-question ask
+latency without hiding it in ingestion or generation metrics.
+
 Every run writes atomically to its output directory:
 
 - `samples.jsonl` contains predictions, parsed options, all per-sample native metrics, scorer
