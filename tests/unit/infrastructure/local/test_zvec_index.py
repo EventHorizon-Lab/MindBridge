@@ -294,7 +294,10 @@ def test_quantized_vector_indexes_query_and_reopen(
         _document(
             f"embedding_{row}",
             "target" if row == 0 else f"document {row}",
-            tuple(1.0 if column == row % dimension else 0.0 for column in range(dimension)),
+            tuple(
+                1.0 if row == 0 or column == row % dimension else -1.0
+                for column in range(dimension)
+            ),
         )
         for row in range(64)
     ]
@@ -302,15 +305,10 @@ def test_quantized_vector_indexes_query_and_reopen(
         index.upsert(documents)
         index.optimize()
         index.flush()
-        assert (
-            index.search(documents[0].embedding.values, limit=1, exact=True)[0].id == "embedding_0"
-        )
+        assert index.search(documents[0].embedding.values, limit=1)[0].id == "embedding_0"
 
     with ZvecIndex(path, dimension=dimension, quantization=quantization) as reopened:
-        assert (
-            reopened.search(documents[0].embedding.values, limit=1, exact=True)[0].id
-            == "embedding_0"
-        )
+        assert reopened.search(documents[0].embedding.values, limit=1)[0].id == "embedding_0"
 
 
 def test_full_text_search_stems_folds_accents_and_routes_chinese(tmp_path: Path) -> None:
