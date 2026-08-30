@@ -13,10 +13,11 @@
 <!-- List commands actually run and their results. State any skips. -->
 
 ```text
-uv run ruff format --check .
-uv run ruff check .
-uv run mypy
-uv run pytest -W error
+uv lock --check --default-index https://pypi.org/simple
+uv run --frozen ruff format --check .
+uv run --frozen ruff check .
+uv run --frozen mypy
+uv run --frozen pytest -W error
 git diff --check
 ```
 

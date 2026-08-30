@@ -119,6 +119,12 @@ def _openai() -> None:
     models.close()
 
 
+def _face() -> None:
+    """Load the OpenCV APIs used by the face backend without downloading model weights."""
+    cv = importlib.import_module("cv2")
+    assert all(hasattr(cv, name) for name in ("FaceDetectorYN", "FaceRecognizerSF", "VideoCapture"))
+
+
 def _local() -> None:
     """Load every third-party module the local backends resolve at first use.
 
@@ -212,6 +218,7 @@ MODULES: dict[str, tuple[str, ...]] = {
     ),
     "observability": ("mindbridge", "mindbridge._telemetry"),
     "openai": ("mindbridge", "mindbridge.models.openai_sdk"),
+    "face": ("mindbridge", "mindbridge.models.opencv_face"),
     "local": (
         "mindbridge.models.funasr",
         "mindbridge.models.jina",
@@ -226,6 +233,7 @@ LOADERS: dict[str, Callable[[], None]] = {
     "benchmarks": _benchmarks,
     "observability": _observability,
     "openai": _openai,
+    "face": _face,
     "local": _local,
     "server": _server,
     "mcp": _mcp,

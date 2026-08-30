@@ -114,6 +114,7 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   for the same discriminated parts array REST and MCP accept, and JSONL on `add-many`. The CLI adds
   exactly one part type to that union, `{"type": "input_file", "path": "..."}`, valid in local mode
   only and refused in `--url` mode.
+- A published `mindbridge[all]` extra containing the exact union of every optional dependency.
 
 ### Changed
 

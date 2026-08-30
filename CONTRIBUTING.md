@@ -12,17 +12,26 @@ MindBridge supports Python 3.10 through 3.14. The project uses
 ```bash
 git clone https://github.com/EventHorizon-Lab/MindBridge.git
 cd MindBridge
-uv sync --all-groups --all-extras
+uv sync --locked --default-index https://pypi.org/simple --all-groups --all-extras
 ```
 
 For core and REST work without the optional MCP transport:
 
 ```bash
-uv sync --all-groups --extra local --extra openai --extra server
+uv sync --locked --default-index https://pypi.org/simple \
+  --all-groups --extra local --extra openai --extra server
 ```
 
 `uv sync` is exact. Add extras to the same command instead of running a second, narrower sync that
 would remove packages from the first environment.
+
+Use `uv add` and `uv remove` for dependency changes, then normalize and verify the shared lockfile
+against PyPI even when your shell configures a private mirror:
+
+```bash
+uv lock --default-index https://pypi.org/simple
+uv lock --check --default-index https://pypi.org/simple
+```
 
 No external database, cache, queue, or object store is required. Unit tests allocate isolated
 temporary SQLite and Zvec directories. Integration tests that contact a real model endpoint are
@@ -33,10 +42,11 @@ marked `integration` and require credentials for that endpoint.
 Run all required gates before submitting:
 
 ```bash
-uv run ruff format --check .
-uv run ruff check .
-uv run mypy
-uv run pytest -W error
+uv lock --check --default-index https://pypi.org/simple
+uv run --frozen ruff format --check .
+uv run --frozen ruff check .
+uv run --frozen mypy
+uv run --frozen pytest -W error
 git diff --check
 ```
 
@@ -46,8 +56,8 @@ formats Python code blocks inside Markdown. Pytest treats warnings as errors.
 Run a focused test while iterating, then run the complete gate before handoff. For example:
 
 ```bash
-uv run pytest -W error tests/unit/test_memory_api.py
-uv run pytest -W error tests/unit/api
+uv run --frozen pytest -W error tests/unit/test_memory_api.py
+uv run --frozen pytest -W error tests/unit/api
 ```
 
 ### Markdown

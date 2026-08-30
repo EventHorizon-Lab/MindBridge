@@ -29,6 +29,8 @@ jobs:
             requirement: .[observability]
           - leg: openai
             requirement: .[openai]
+          - leg: face
+            requirement: .[face]
           - leg: local
             requirement: .[local]
           - leg: server
@@ -163,7 +165,7 @@ jobs:
           enable-cache: true
 
       - name: Install locked dependencies
-        run: uv sync --frozen --all-groups --all-extras
+        run: uv sync --locked --all-groups --all-extras
 
       - name: Check formatting
         run: uv run --frozen ruff format --check .
