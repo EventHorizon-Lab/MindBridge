@@ -268,6 +268,42 @@ def test_loaded_jina_uses_pyav_metadata_and_unique_bounded_frames(tmp_path: Path
     short = metadata_module.VideoMetadata(total_num_frames=3, fps=20.0, duration=0.15)
     short_indices = video_processor.sample_frames(short)
     assert tuple(short_indices) == (0, 1, 2)
+    assert len(short_indices) == len(set(short_indices))
+    long = metadata_module.VideoMetadata(total_num_frames=600, fps=20.0, duration=30.0)
+    assert tuple(video_processor.sample_frames(long)) == (
+        0,
+        19,
+        38,
+        57,
+        77,
+        96,
+        115,
+        135,
+        154,
+        173,
+        193,
+        212,
+        231,
+        251,
+        270,
+        289,
+        309,
+        328,
+        347,
+        367,
+        386,
+        405,
+        425,
+        444,
+        463,
+        483,
+        502,
+        521,
+        541,
+        560,
+        579,
+        599,
+    )
     with pytest.raises(ModelError, match="invalid frame metadata"):
         video_processor.sample_frames(metadata_module.VideoMetadata(total_num_frames=0))
 
@@ -289,7 +325,7 @@ def test_public_adapter_has_fixed_identity_and_does_not_load_until_needed(
     assert backend.embedding_model == DEFAULT_JINA_MODEL_ID
     assert backend.embedding_dimension == 32
     assert backend.embedding_space == _recipe_space(
-        "jina-v5-omni-official-sentence-transformers-v5",
+        "jina-v5-omni-official-sentence-transformers-v6",
         DEFAULT_JINA_MODEL_ID,
         DEFAULT_JINA_REVISION,
         32,
@@ -299,6 +335,7 @@ def test_public_adapter_has_fixed_identity_and_does_not_load_until_needed(
         for recipe in (
             "jina-v5-omni-official-sentence-transformers-v3",
             "jina-v5-omni-official-sentence-transformers-v4",
+            "jina-v5-omni-official-sentence-transformers-v5",
         )
     }
     assert backend.embed(()) == ()

@@ -26,11 +26,12 @@ from mindbridge.types import Modality
 DEFAULT_JINA_MODEL_ID = "jinaai/jina-embeddings-v5-omni-small-retrieval"
 DEFAULT_JINA_REVISION = "e3ae4b6e4af4ec0799cd931aefaff03235b5f9d4"
 DEFAULT_JINA_DIMENSION = 1024
-_JINA_RECIPE = "jina-v5-omni-official-sentence-transformers-v5"
+_JINA_RECIPE = "jina-v5-omni-official-sentence-transformers-v6"
 _JINA_LEGACY_RECIPES = frozenset(
     {
         "jina-v5-omni-official-sentence-transformers-v3",
         "jina-v5-omni-official-sentence-transformers-v4",
+        "jina-v5-omni-official-sentence-transformers-v5",
     }
 )
 _JINA_CAPABILITIES = frozenset({Modality.TEXT, Modality.IMAGE, Modality.VIDEO, Modality.AUDIO})
@@ -269,11 +270,11 @@ def _configure_jina_video(module: object) -> None:
     ):
         raise ModelError("the pinned Jina video integration is incompatible")
 
-    sample_frames = getattr(video_processor, "sample_frames", None)
+    provider_sample_frames = getattr(video_processor, "sample_frames", None)
     fetch_videos = getattr(video_processor, "fetch_videos", None)
     if (
-        not isinstance(sample_frames, MethodType)
-        or sample_frames.__self__ is not video_processor
+        not isinstance(provider_sample_frames, MethodType)
+        or provider_sample_frames.__self__ is not video_processor
         or not isinstance(fetch_videos, MethodType)
         or fetch_videos.__self__ is not video_processor
     ):
@@ -299,12 +300,13 @@ def _configure_jina_video(module: object) -> None:
         metadata: object,
         **kwargs: object,
     ) -> object:
+        del kwargs
         total = getattr(metadata, "total_num_frames", None)
         if isinstance(total, bool) or not isinstance(total, int) or total <= 0:
             raise ModelError("video decoder returned invalid frame metadata")
-        kwargs["fps"] = None
-        kwargs["num_frames"] = min(total, _JINA_VIDEO_FRAMES)
-        return sample_frames(metadata, **kwargs)
+        import numpy as np
+
+        return np.linspace(0, total - 1, min(total, _JINA_VIDEO_FRAMES), dtype=int)
 
     def pyav_fetch_videos(
         _processor: object,

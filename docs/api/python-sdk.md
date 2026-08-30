@@ -376,7 +376,7 @@ model, not MindBridge.
 It calls the model's official Sentence Transformers retrieval methods and wraps application text
 so URL- or path-shaped text cannot activate media autodetection.
 Local videos stay as paths through Transformers' PyAV decoder, preserving source fps and duration
-metadata while uniformly sampling at most 32 unique frames.
+metadata while reproducing the pinned Jina recipe's sampling of at most 32 unique frames.
 
 ### FunASR
 
