@@ -233,19 +233,20 @@ matrix, license and security requirements, performance envelope, and maintenance
 ### Add extensions as narrow, optional capabilities
 
 The current extension surface consists of the explicit `EmbeddingBackend`, `GenerationBackend`,
-`TranscriptionBackend`, and `SpeechBackend` protocols, plus the optional `StreamingGenerationBackend`
-that an answerer may also implement. Constructor injection is the plugin mechanism implemented today;
-there is no runtime plugin registry.
+`TranscriptionBackend`, `SpeechBackend`, and `FaceBackend` protocols, plus the optional
+`StreamingGenerationBackend` that an answerer may also implement. Constructor injection is the
+plugin mechanism implemented today; there is no runtime plugin registry.
 
 `StreamingGenerationBackend` is the shape a narrow capability should take. It adds one method, stays
 optional, is selected by a structural check rather than a provider name, and leaves the
 `GenerationBackend` contract unchanged for backends that do not implement it.
 
-A future public capability such as emotion or face analysis must start with a concrete implementation
-and end-to-end use case. Its contract must declare accepted modalities, typed output, provenance,
-configuration, resource lifecycle, concurrency behavior, privacy boundary, and failure mapping. It
-must not create provider branches inside `Memory` or treat metadata as an execution or isolation
-mechanism. See [extension status](plugin-architecture.md).
+Face analysis demonstrates the admission rule: its public contract arrived with a concrete local
+OpenCV implementation and end-to-end identity use case. A future public capability such as emotion
+analysis must likewise declare accepted modalities, typed output, provenance, configuration,
+resource lifecycle, concurrency behavior, privacy boundary, and failure mapping. It must not create
+provider branches inside `Memory` or treat metadata as an execution or isolation mechanism. See
+[extension status](plugin-architecture.md).
 
 ### Preserve evidence, privacy, and durability
 
@@ -275,7 +276,7 @@ revisions must be reproducible before a result guides a default.
 | Embedding | Caller explicitly supplies a backend; Jina v5 Omni is the bundled omni adapter | Omni-capable recommended composition with route-specific execution |
 | Generation | Optional caller-supplied backend with explicit capabilities | Omni-capable recommended composition where the deployment supports it |
 | Speech runtime | Built-in FunASR adapter uses `AutoModel` | Additional measured runtime adapters, selected explicitly or by observable policy |
-| Extensions | Four required model protocols and one optional streaming protocol; no registry | Optional domain capabilities after a real implementation establishes the contract |
+| Extensions | Five explicit model protocols and one optional streaming protocol; no registry | Optional domain capabilities after a real implementation establishes the contract |
 | Hardware | Runs where Python, dependencies, and the selected models are supported | Verified device-class matrix with published quality, latency, and resource evidence |
 | Developer interfaces | Typed Python API, OpenAPI-documented REST adapter, and a JSON-only product CLI over the same composition | Same small vocabulary and time-to-first-success across supported transports |
 | Execution plane | Python SDK, REST, MCP, and the `mindbridge` CLI dispatch to one `Memory` | Every surface reaches the operations the SDK publishes, with no transport gap left undocumented |

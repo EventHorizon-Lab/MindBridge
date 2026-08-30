@@ -33,7 +33,7 @@ SCRIPTS = cast(dict[str, str], PROJECT["scripts"])
 def test_base_import_does_not_load_optional_protocols() -> None:
     code = (
         "import json, sys; import mindbridge; "
-        "blocked = {'fastapi', 'mcp', 'openai', 'sentence_transformers', 'torch', "
+        "blocked = {'cv2', 'fastapi', 'mcp', 'openai', 'sentence_transformers', 'torch', "
         "'transformers', 'uvicorn', 'vllm'}; "
         "print(json.dumps(sorted(blocked.intersection(sys.modules))))"
     )
@@ -54,13 +54,17 @@ def test_full_modal_contract_is_exported_from_the_package_root() -> None:
         "AssetRef",
         "ContentAtom",
         "ContentInput",
+        "IndexQuantization",
         "MemoryType",
         "Modality",
         "EmbeddingBackend",
+        "FaceBackend",
+        "FaceObservation",
         "GenerationBackend",
         "JinaOmniEmbedder",
         "ModelInput",
         "OpenAIModels",
+        "OpenCVFaceAnalyzer",
         "EmbedTask",
         "SentenceTransformersEmbedder",
         "SpeakerNotFoundError",
@@ -266,6 +270,7 @@ def test_dependency_surface_is_exact() -> None:
         "benchmarks": {"httpx", "huggingface-hub", "nltk", "opentelemetry-sdk", "pyarrow"},
         "observability": {"opentelemetry-sdk"},
         "openai": {"openai"},
+        "face": {"opencv-python-headless"},
         "local": {
             "cairosvg",
             "funasr",

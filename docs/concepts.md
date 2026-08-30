@@ -104,11 +104,12 @@ model endpoint for historical content.
 
 ## Capability-driven model routing
 
-A typical composition has three independent operations:
+A typical embodied composition has four independent operations:
 
 - Local Jina v5 Omni embedding for stored memories and search queries.
 - Generation for grounded answers.
 - Local Fun-ASR-Nano transcription, FSMN-VAD diarization, and CAM++ speaker encoding.
+- Local YuNet face detection and SFace identity encoding through an optional `FaceBackend`.
 
 Each operation declares the atomic modalities it accepts. MindBridge routes from capabilities,
 not model names:
@@ -126,7 +127,9 @@ not model names:
 5. With `index_speech=True`, the same timed transcript, stable speaker IDs, and registered names
    are persisted in the record before embedding so exact-name and dialogue queries can retrieve it.
    Registering or renaming an identity refreshes already indexed recordings atomically.
-6. If the remaining input is unsupported, the operation fails with `ModelError`.
+6. `Memory.faces` resolves image/video faces. Grounded generation adds compact face identity
+   evidence for retrieved visual memories without rewriting the immutable source record.
+7. If the remaining input is unsupported, the operation fails with `ModelError`.
 
 An audio-only input therefore becomes transcript-only when fallback is required. A video or image
 is not silently discarded merely to reach a text model.
@@ -138,36 +141,51 @@ changing the embedding space. The store also persists `transcription_space`, whi
 ASR model and transcript-affecting preprocessing recipe. Reopening with a different value fails
 before use so cached transcripts and add-time derived text cannot silently mix recipes.
 
-FunASR's `SPK0` labels are local to one asset. `Memory.speech` and the grounded answer route match
-their normalized CAM++ centroids to stable local `speaker_id` values inside the physical data
-directory. A first observation enrolls an identity; only later matches carry an `identity_score`.
-Applications may attach a display name with `register_speaker`; the biometric vector remains local.
+FunASR's `SPK0` labels and face-detector labels are local to one asset. MindBridge stores neither as
+the durable identity. It normalizes their embeddings, keeps at most 20 voice or 10 face exemplars
+per identity, and scores a candidate by its maximum cosine similarity to any compatible exemplar.
+This preserves different speaking styles, microphones, poses, and lighting that a single running
+centroid would blur. When an exemplar set is full, the vector nearest its centroid is removed so
+the retained set favors diversity.
+
+Face and voice use independent model spaces, thresholds, and ambiguity margins but share stable
+`identity_id` values. A single-face/single-speaker video may link two identities only when their
+stored modalities are disjoint and their names do not conflict. Ambiguous scenes remain separate.
+A merged source ID remains a durable alias for registration and lookup, while new observations use
+the canonical ID. If speech indexing is enabled, changing that canonical ID and refreshing affected
+memory text and embeddings commit in the same SQLite transaction.
+A first observation enrolls an identity; only later matches carry an `identity_score`. Applications
+may name either modality with `register_identity`; `register_speaker` remains the speech-specific
+entry point. Biometric vectors and source media remain inside the physical data directory.
 
 ## Retrieval and grounded answers
 
-`search` uses Zvec dense plus full-text retrieval when the routed query contains text. A pure-media
-query uses dense retrieval only. Every search over-fetches a bounded candidate pool. Composite
-memories have one aggregate vector plus de-duplicated vectors for their text and media atoms;
-vector hits collapse to the parent memory by maximum relevance. Type filters are pushed into Zvec
-and rechecked after SQLite hydration. A temporal query retrieves both in-range and global
-candidates, then applies a smooth proximity factor instead of a hard time gate. Event intervals
-match by overlap, not only by their start. Optional decay is another soft factor. Weak dense
-evidence and unresolved top-two ties are rejected unless lexical or temporal evidence anchors the
-winner. Each hydrated hit has a score from 0 through 1; scores rank results within a request and
-are not stable global probabilities.
+`search` derives bounded aggregate and atomic query keys in one embedding batch; a single text atom
+remains one vector. Duplicate query vectors are discarded and independent routes run concurrently.
+Zvec returns one dense candidate per parent memory for every key; an ordinary-query fallback fills
+groups when native best-effort grouping is incomplete. Relative BM25 uses an English
+case/accent/stemming pipeline or Jieba for Han text. SQLite drops stale IDs and collapses all
+derived keys to their authoritative parent memory before confidence-preserving fusion. Type and
+range-optimized time filters are pushed into Zvec and rechecked after hydration. A temporal query retrieves both
+in-range and global candidates, then applies a smooth proximity factor instead of a hard time gate.
+Event intervals match by overlap, not only by their start. Optional decay is another soft factor.
+Weak dense evidence and unresolved top-two ties are rejected unless qualified lexical or temporal
+evidence anchors the winner. Each hydrated hit has a score from 0 through 1; scores rank results
+within a request and are not stable global probabilities.
 
 `ask` retrieves evidence first and routes those hits, including retained media, to generation. A
 configured `SpeechBackend` caches complete identity analysis and adds each segment's timing, text,
 stable ID, optional registered name, and match score to the model-only grounding context; returned
 source hits remain unchanged. Generation-time analysis does not rewrite an existing record's
-`content`. `AnswerResult` contains the answer and source hits for display or grounding audits. The
-built-in backend sends one binary content part per distinct asset in an answer request, even when
-the question or several hits refer to it. It reserves the 64 MiB encoded-media budget for question
-assets, then admits ranked hit media until full; an overflow hit remains as text evidence when it
-has text.
+`content`. `AnswerResult` contains the canonical source hits that the generation backend reports it
+used, filtering any unknown IDs, for display or grounding audits. The built-in backend sends one
+binary content part per distinct asset in an answer request, even when the question or several hits
+refer to it. It reserves the 64 MiB encoded-media budget for question assets, then admits ranked hit
+media until full; an overflow hit remains as text evidence when it has text.
 
-Operations on one instance may overlap remote model calls. MindBridge serializes the shorter
-SQLite commit/outbox and Zvec access sections that must observe one coherent local state.
+Operations on one instance may overlap remote model calls and Zvec queries. MindBridge serializes
+SQLite commit/outbox sections and final record hydration with asset leasing; collection replacement
+remains exclusive while ordinary Zvec queries can overlap.
 
 Long text receives bounded overlapping retrieval keys while remaining one immutable returned
 record. MindBridge does not segment long media, generate model-authored semantic keys, or use a

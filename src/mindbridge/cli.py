@@ -32,6 +32,7 @@ from uuid import uuid4
 
 from mindbridge import recipes
 from mindbridge.exceptions import (
+    IdentityNotFoundError,
     IndexUnavailableError,
     MemoryNotFoundError,
     MindBridgeError,
@@ -48,6 +49,7 @@ from mindbridge.types import (
     Blob,
     ContentAtom,
     ContentInput,
+    FaceObservation,
     MemoryRecord,
     MemoryType,
     Modality,
@@ -70,6 +72,7 @@ EXIT_CODES: Mapping[str, int] = {
     IndexUnavailableError.code: 8,
     CONFIGURATION_ERROR: 10,
     ModelOutputTruncatedError.code: 11,
+    IdentityNotFoundError.code: 12,
 }
 # The one exit selected by `reason` rather than `code`. It is the CLI's single transport decision:
 # an agent that cannot tell "busy, retry with --url" from "the disk broke" cannot be scripted.
@@ -82,7 +85,9 @@ OPERATIONS: tuple[str, ...] = (
     "ask",
     "get",
     "speech",
+    "faces",
     "register_speaker",
+    "register_identity",
     "reinforce",
     "list",
     "delete",
@@ -494,8 +499,17 @@ def _speech(memory: Memory, arguments: argparse.Namespace) -> _Document:
     return {"segments": [_segment_document(item) for item in memory.speech(arguments.memory_id)]}
 
 
+def _faces(memory: Memory, arguments: argparse.Namespace) -> _Document:
+    return {"observations": [_face_document(item) for item in memory.faces(arguments.memory_id)]}
+
+
 def _register_speaker(memory: Memory, arguments: argparse.Namespace) -> _Document:
     memory.register_speaker(arguments.speaker_id, arguments.name)
+    return {}
+
+
+def _register_identity(memory: Memory, arguments: argparse.Namespace) -> _Document:
+    memory.register_identity(arguments.identity_id, arguments.name)
     return {}
 
 
@@ -531,7 +545,9 @@ _LOCAL: Mapping[str, Callable[[Memory, argparse.Namespace], _Document]] = {
     "ask": _ask,
     "get": _get,
     "speech": _speech,
+    "faces": _faces,
     "register-speaker": _register_speaker,
+    "register-identity": _register_identity,
     "reinforce": _reinforce,
     "list": _list,
     "delete": _delete,
@@ -992,6 +1008,17 @@ def _segment_document(segment: SpeakerSegment) -> _Document:
     }
 
 
+def _face_document(observation: FaceObservation) -> _Document:
+    return {
+        "asset_id": observation.asset_id,
+        "observed_at_ms": observation.observed_at_ms,
+        "bounding_box": list(observation.bounding_box),
+        "identity_id": observation.identity_id,
+        "identity_name": observation.identity_name,
+        "identity_score": observation.identity_score,
+    }
+
+
 def _encode_time(value: datetime) -> str:
     text = value.isoformat()
     return f"{text[:-6]}Z" if text.endswith("+00:00") else text
@@ -1132,12 +1159,16 @@ def _commands(commands: argparse._SubParsersAction[argparse.ArgumentParser]) -> 
     for name, help_text in (
         ("get", "read one memory"),
         ("speech", "transcribe and identify speakers"),
+        ("faces", "detect faces and resolve identities"),
         ("delete", "delete one memory"),
     ):
         commands.add_parser(name, help=help_text).add_argument("memory_id", metavar="MEMORY_ID")
     speaker = commands.add_parser("register-speaker", help="name one recognized speaker")
     speaker.add_argument("speaker_id", metavar="SPEAKER_ID")
     speaker.add_argument("name", metavar="NAME")
+    identity = commands.add_parser("register-identity", help="name one face/voice identity")
+    identity.add_argument("identity_id", metavar="IDENTITY_ID")
+    identity.add_argument("name", metavar="NAME")
     reinforce = commands.add_parser("reinforce", help="record positive feedback")
     reinforce.add_argument("memory_ids", nargs="+", metavar="MEMORY_ID")
     listing = commands.add_parser("list", help="list newest memories")

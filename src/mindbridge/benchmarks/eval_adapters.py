@@ -859,7 +859,6 @@ def _atm(
 ) -> tuple[EvalUnit, ...]:
     from mindbridge.benchmarks.atm_bench import (
         atm_email_block,
-        atm_memory_chunks,
         atm_sgm_block,
         load_atm_bench,
         load_atm_emails,
@@ -869,27 +868,28 @@ def _atm(
 
     email_path = root / spec.auxiliary[0]
     memories = [
-        MemoryItem(email.email_id, (chunk,), occurred_at=email.occurred_at)
+        MemoryItem(email.email_id, (atm_email_block(email),), occurred_at=email.occurred_at)
         for email in load_atm_emails(email_path)
-        for chunk in atm_memory_chunks(atm_email_block(email), email.email_id)
     ]
     if cast(str, spec.variant).endswith("_sgm"):
         image_path, video_path = (root / item for item in spec.auxiliary[1:])
         for record in (*load_atm_sgm(image_path), *load_atm_sgm(video_path)):
-            memories.extend(
-                MemoryItem(record.media_id, (chunk,), occurred_at=record.occurred_at)
-                for chunk in atm_memory_chunks(atm_sgm_block(record), record.media_id)
+            memories.append(
+                MemoryItem(
+                    record.media_id,
+                    (atm_sgm_block(record),),
+                    occurred_at=record.occurred_at,
+                )
             )
     else:
         memories.extend(media.parts(cast(str, spec.variant), allow_all=True))
     questions = tuple(
         EvalQuestion(
             question.question_id,
-            (
-                ATM_BENCH_QUERY_PROMPT.text.format(
-                    question=question.question,
-                    format_constraint=atm_format_constraint(question.qtype),
-                ),
+            _query_parts(
+                ATM_BENCH_QUERY_PROMPT.text,
+                question.question,
+                format_constraint=atm_format_constraint(question.qtype),
             ),
             (question.reference_answer,),
             metadata={"qtype": question.qtype, "evidence_ids": question.evidence_ids},
@@ -945,6 +945,8 @@ def _gallery_memory(
         f"[{session.occurred_at.date().isoformat()}] {profile_name}: {round_.user}"
         f"\nAssistant: {round_.assistant}"
     )
+    if round_.image_id is not None:
+        text = f"{text}\nImage ID: {round_.image_id}"
     image: Path | None = None
     if round_.image_path:
         image = media.path(round_.image_path)
@@ -962,10 +964,11 @@ def _gallery_question(
     prompt_template: str,
     format_constraint: str,
 ) -> EvalQuestion:
-    prompt = prompt_template.format(
+    parts = _query_parts(
+        prompt_template,
+        question.question,
         speaker_a=profile_name,
         speaker_b="the assistant",
-        question=question.question,
         format_constraint=format_constraint,
     )
     image: Path | None = None
@@ -973,10 +976,25 @@ def _gallery_question(
         image = media.path(question.question_image_path)
     return EvalQuestion(
         question.question_id,
-        (prompt,) if image is None else (prompt, image),
+        parts if image is None else (*parts, image),
         (question.reference_answer,),
         metadata={"point": question.point, "clue_ids": question.clue_round_ids},
         source_question=question.question,
+    )
+
+
+def _query_parts(template: str, question: str, **values: str) -> tuple[str, ...]:
+    before, marker, after = template.partition("{question}")
+    if not marker:
+        raise ValueError("benchmark query template needs a question placeholder")
+    return tuple(
+        part
+        for part in (
+            question.strip(),
+            before.format(**values).strip(),
+            after.format(**values).strip(),
+        )
+        if part
     )
 
 

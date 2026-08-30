@@ -280,7 +280,7 @@ TASKS: dict[str, TaskSpec] = {
                 f"atm-bench-{split}",
                 "ATM-Bench",
                 f"atm-bench/data/atm-bench/atm-bench{'-hard' if split == 'hard' else ''}.json",
-                "atm_bench_official_v1",
+                "atm_bench_official_v2",
                 _ATM,
                 digest=(
                     "acd35f2a172a9741d970d2cf21184ff0af8d79a8bf59967fc8aa33d619f6af4a"
@@ -299,7 +299,7 @@ TASKS: dict[str, TaskSpec] = {
                 f"atm-bench-{split}-sgm",
                 "ATM-Bench",
                 f"atm-bench/data/atm-bench/atm-bench{'-hard' if split == 'hard' else ''}.json",
-                "atm_bench_official_v1",
+                "atm_bench_official_v2",
                 _ATM,
                 digest=(
                     "acd35f2a172a9741d970d2cf21184ff0af8d79a8bf59967fc8aa33d619f6af4a"
@@ -319,7 +319,7 @@ TASKS: dict[str, TaskSpec] = {
             "mem-gallery",
             "Mem-Gallery",
             "mem-gallery/data/dialog",
-            "mem_gallery_official_v1",
+            "mem_gallery_official_v2",
             _GALLERY,
             digest="fcd47af2b493cd9a7856cb77a622291b5aa9c6dad12b1f3553d8f569e2c5f6b8",
             media="mem-gallery/data/image",

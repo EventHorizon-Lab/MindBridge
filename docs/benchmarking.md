@@ -138,6 +138,10 @@ The runner stores source memories as episodic, preserves released wall-clock eve
 bounds, and retains source-relative clip intervals as provenance metadata. LoCoMo-Refined,
 MemLens, Mem-Gallery, and ATM-Bench use the public batched API for released event times, so temporal
 retrieval is measured instead of relying only on timestamps embedded in display text.
+ATM-Bench keeps each released email or SGM record as one parent memory and lets MindBridge's derived
+context keys cover long fields. Mem-Gallery preserves released image IDs beside their images.
+Benchmark questions keep the original question as the first ordered text atom and retain answer
+instructions as later atoms, exercising the same public mixed-content API as applications.
 
 The benchmark's OpenAI adapter reserves at most 64 MiB of base64-encoded media per answer request
 for question media and top-ranked evidence — roughly 48 MiB of files on disk — making prepared clips
@@ -297,12 +301,13 @@ python -m mindbridge.benchmarks.local_index_benchmark \
   --dimension 128 \
   --queries 20 \
   --k 10 \
-  --seed 42
+  --seed 42 \
+  --quantization none
 ```
 
 `--data-dir` must be empty. The command emits one JSON object with:
 
-- Row, dimension, query, `k`, and seed parameters.
+- Row, dimension, query, `k`, seed, and quantization parameters.
 - Ingest and optimize seconds.
 - Recall at `k` against Zvec exact search.
 - Query latency p50, p95, and p99 in milliseconds.
@@ -311,6 +316,11 @@ python -m mindbridge.benchmarks.local_index_benchmark \
 
 Synthetic vectors isolate storage and index behavior. They do not measure embedding quality,
 grounded-answer quality, or remote model latency.
+
+Run `none`, `fp16`, `int8`, and `rabitq` against separate empty directories to compare recall,
+latency, and bytes. RaBitQ requires an x86_64 AVX2 host and dimensions from 64 through 4095. The
+exact-search baseline uses Zvec's retained FP32 vectors; a product decision should also pass the
+end-to-end behavior benchmarks because synthetic recall does not measure memory-answer quality.
 
 ## End-to-end retrieval benchmarks
 

@@ -9,7 +9,7 @@ import re
 import sqlite3
 import struct
 import uuid
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -17,11 +17,13 @@ from pathlib import Path
 from typing import Literal, NoReturn
 
 from mindbridge.infrastructure.local._lock import DataDirectoryLock
-from mindbridge.models.base import SpeechAnalysis
-from mindbridge.types import SpeakerSegment
+from mindbridge.models.base import FaceAnalysis, SpeechAnalysis
+from mindbridge.types import FaceObservation, SpeakerSegment
 
-_SCHEMA_VERSION = 6
+_SCHEMA_VERSION = 7
 _SQLITE_PARAMETER_BATCH = 900
+_FACE_EXEMPLAR_LIMIT = 10
+_VOICE_EXEMPLAR_LIMIT = 20
 _MEMORY_MODALITIES = frozenset({"text", "image", "video", "audio", "omni"})
 _MEMORY_TYPES = frozenset({"semantic", "episodic", "procedural"})
 _ASSET_MODALITIES = frozenset({"image", "video", "audio"})
@@ -37,7 +39,11 @@ _REQUIRED_TABLES = frozenset(
         "memory_assets",
         "memory_records",
         "search_index_queue",
-        "speaker_identities",
+        "face_analyses",
+        "face_observations",
+        "identities",
+        "identity_aliases",
+        "identity_exemplars",
         "speech_analyses",
         "speech_segments",
         "store_metadata",
@@ -94,7 +100,7 @@ BEGIN
 END;
 """
 
-_SPEECH_SCHEMA = """
+_LEGACY_SPEECH_SCHEMA = """
 CREATE TABLE speech_analyses (
     asset_id TEXT PRIMARY KEY REFERENCES media_assets (asset_id) ON DELETE CASCADE,
     model_id TEXT NOT NULL CHECK (length(trim(model_id)) > 0),
@@ -134,7 +140,87 @@ CREATE TABLE speech_segments (
 CREATE INDEX speech_segments_speaker_idx ON speech_segments (speaker_id);
 """
 
-_SCHEMA_V6 = f"""
+_IDENTITY_SCHEMA = """
+CREATE TABLE identities (
+    identity_id TEXT PRIMARY KEY CHECK (length(trim(identity_id)) > 0),
+    name TEXT CHECK (name IS NULL OR length(trim(name)) > 0),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL CHECK (updated_at >= created_at)
+);
+
+CREATE TABLE identity_aliases (
+    alias_id TEXT PRIMARY KEY CHECK (length(trim(alias_id)) > 0),
+    identity_id TEXT NOT NULL REFERENCES identities (identity_id) ON DELETE CASCADE,
+    created_at TEXT NOT NULL,
+    CHECK (alias_id <> identity_id)
+);
+
+CREATE INDEX identity_aliases_identity_idx ON identity_aliases (identity_id);
+
+CREATE TABLE identity_exemplars (
+    identity_id TEXT NOT NULL REFERENCES identities (identity_id) ON DELETE CASCADE,
+    modality TEXT NOT NULL CHECK (modality IN ('face', 'voice')),
+    position INTEGER NOT NULL CHECK (position >= 0),
+    model_id TEXT NOT NULL CHECK (length(trim(model_id)) > 0),
+    space_id TEXT NOT NULL CHECK (length(trim(space_id)) > 0),
+    dimension INTEGER NOT NULL CHECK (dimension > 0),
+    vector BLOB NOT NULL CHECK (length(vector) = dimension * 4),
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (identity_id, modality, position)
+);
+
+CREATE INDEX identity_exemplars_space_idx
+    ON identity_exemplars (modality, space_id, dimension, identity_id, position);
+
+CREATE TABLE speech_analyses (
+    asset_id TEXT PRIMARY KEY REFERENCES media_assets (asset_id) ON DELETE CASCADE,
+    model_id TEXT NOT NULL CHECK (length(trim(model_id)) > 0),
+    space_id TEXT NOT NULL CHECK (length(trim(space_id)) > 0),
+    transcript TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE speech_segments (
+    asset_id TEXT NOT NULL REFERENCES speech_analyses (asset_id) ON DELETE CASCADE,
+    position INTEGER NOT NULL CHECK (position >= 0),
+    start_ms INTEGER NOT NULL CHECK (start_ms >= 0),
+    end_ms INTEGER NOT NULL CHECK (end_ms > start_ms),
+    transcript TEXT NOT NULL CHECK (length(trim(transcript)) > 0),
+    speaker_id TEXT REFERENCES identities (identity_id) ON DELETE SET NULL,
+    identity_score REAL CHECK (
+        identity_score IS NULL OR (identity_score >= 0.0 AND identity_score <= 1.0)
+    ),
+    PRIMARY KEY (asset_id, position)
+);
+
+CREATE INDEX speech_segments_speaker_idx ON speech_segments (speaker_id);
+
+CREATE TABLE face_analyses (
+    asset_id TEXT PRIMARY KEY REFERENCES media_assets (asset_id) ON DELETE CASCADE,
+    model_id TEXT NOT NULL CHECK (length(trim(model_id)) > 0),
+    space_id TEXT NOT NULL CHECK (length(trim(space_id)) > 0),
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE face_observations (
+    asset_id TEXT NOT NULL REFERENCES face_analyses (asset_id) ON DELETE CASCADE,
+    position INTEGER NOT NULL CHECK (position >= 0),
+    observed_at_ms INTEGER CHECK (observed_at_ms IS NULL OR observed_at_ms >= 0),
+    box_x REAL NOT NULL CHECK (box_x >= 0.0 AND box_x <= 1.0),
+    box_y REAL NOT NULL CHECK (box_y >= 0.0 AND box_y <= 1.0),
+    box_width REAL NOT NULL CHECK (box_width > 0.0 AND box_x + box_width <= 1.0),
+    box_height REAL NOT NULL CHECK (box_height > 0.0 AND box_y + box_height <= 1.0),
+    identity_id TEXT NOT NULL REFERENCES identities (identity_id) ON DELETE RESTRICT,
+    identity_score REAL CHECK (
+        identity_score IS NULL OR (identity_score >= 0.0 AND identity_score <= 1.0)
+    ),
+    PRIMARY KEY (asset_id, position)
+);
+
+CREATE INDEX face_observations_identity_idx ON face_observations (identity_id);
+"""
+
+_SCHEMA_V7 = f"""
 BEGIN IMMEDIATE;
 
 CREATE TABLE memory_records (
@@ -174,7 +260,7 @@ CREATE TABLE embeddings (
 CREATE INDEX embeddings_memory_idx ON embeddings (memory_id);
 
 {_ASSET_SCHEMA}
-{_SPEECH_SCHEMA}
+{_IDENTITY_SCHEMA}
 
 CREATE TABLE store_metadata (
     key TEXT PRIMARY KEY CHECK (length(trim(key)) > 0),
@@ -194,7 +280,7 @@ CREATE INDEX search_index_queue_order_idx
 
 {_INDEX_TRIGGERS}
 
-PRAGMA user_version = 6;
+PRAGMA user_version = 7;
 COMMIT;
 """
 
@@ -204,6 +290,102 @@ ALTER TABLE memory_records ADD COLUMN occurred_end TEXT CHECK (
     occurred_end IS NULL OR (occurred_at IS NOT NULL AND occurred_end > occurred_at)
 );
 PRAGMA user_version = 6;
+COMMIT;
+"""
+
+_MIGRATE_V6_TO_V7 = """
+BEGIN IMMEDIATE;
+
+CREATE TABLE identities (
+    identity_id TEXT PRIMARY KEY CHECK (length(trim(identity_id)) > 0),
+    name TEXT CHECK (name IS NULL OR length(trim(name)) > 0),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL CHECK (updated_at >= created_at)
+);
+
+INSERT INTO identities (identity_id, name, created_at, updated_at)
+SELECT speaker_id, name, created_at, updated_at
+FROM speaker_identities;
+
+CREATE TABLE identity_aliases (
+    alias_id TEXT PRIMARY KEY CHECK (length(trim(alias_id)) > 0),
+    identity_id TEXT NOT NULL REFERENCES identities (identity_id) ON DELETE CASCADE,
+    created_at TEXT NOT NULL,
+    CHECK (alias_id <> identity_id)
+);
+
+CREATE INDEX identity_aliases_identity_idx ON identity_aliases (identity_id);
+
+CREATE TABLE identity_exemplars (
+    identity_id TEXT NOT NULL REFERENCES identities (identity_id) ON DELETE CASCADE,
+    modality TEXT NOT NULL CHECK (modality IN ('face', 'voice')),
+    position INTEGER NOT NULL CHECK (position >= 0),
+    model_id TEXT NOT NULL CHECK (length(trim(model_id)) > 0),
+    space_id TEXT NOT NULL CHECK (length(trim(space_id)) > 0),
+    dimension INTEGER NOT NULL CHECK (dimension > 0),
+    vector BLOB NOT NULL CHECK (length(vector) = dimension * 4),
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (identity_id, modality, position)
+);
+
+INSERT INTO identity_exemplars (
+    identity_id, modality, position, model_id, space_id, dimension, vector, created_at
+)
+SELECT speaker_id, 'voice', 0, model_id, space_id, dimension, centroid, created_at
+FROM speaker_identities;
+
+CREATE INDEX identity_exemplars_space_idx
+    ON identity_exemplars (modality, space_id, dimension, identity_id, position);
+
+CREATE TABLE speech_segments_v7 (
+    asset_id TEXT NOT NULL REFERENCES speech_analyses (asset_id) ON DELETE CASCADE,
+    position INTEGER NOT NULL CHECK (position >= 0),
+    start_ms INTEGER NOT NULL CHECK (start_ms >= 0),
+    end_ms INTEGER NOT NULL CHECK (end_ms > start_ms),
+    transcript TEXT NOT NULL CHECK (length(trim(transcript)) > 0),
+    speaker_id TEXT REFERENCES identities (identity_id) ON DELETE SET NULL,
+    identity_score REAL CHECK (
+        identity_score IS NULL OR (identity_score >= 0.0 AND identity_score <= 1.0)
+    ),
+    PRIMARY KEY (asset_id, position)
+);
+
+INSERT INTO speech_segments_v7 (
+    asset_id, position, start_ms, end_ms, transcript, speaker_id, identity_score
+)
+SELECT asset_id, position, start_ms, end_ms, transcript, speaker_id, identity_score
+FROM speech_segments;
+
+DROP TABLE speech_segments;
+DROP TABLE speaker_identities;
+ALTER TABLE speech_segments_v7 RENAME TO speech_segments;
+CREATE INDEX speech_segments_speaker_idx ON speech_segments (speaker_id);
+
+CREATE TABLE face_analyses (
+    asset_id TEXT PRIMARY KEY REFERENCES media_assets (asset_id) ON DELETE CASCADE,
+    model_id TEXT NOT NULL CHECK (length(trim(model_id)) > 0),
+    space_id TEXT NOT NULL CHECK (length(trim(space_id)) > 0),
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE face_observations (
+    asset_id TEXT NOT NULL REFERENCES face_analyses (asset_id) ON DELETE CASCADE,
+    position INTEGER NOT NULL CHECK (position >= 0),
+    observed_at_ms INTEGER CHECK (observed_at_ms IS NULL OR observed_at_ms >= 0),
+    box_x REAL NOT NULL CHECK (box_x >= 0.0 AND box_x <= 1.0),
+    box_y REAL NOT NULL CHECK (box_y >= 0.0 AND box_y <= 1.0),
+    box_width REAL NOT NULL CHECK (box_width > 0.0 AND box_x + box_width <= 1.0),
+    box_height REAL NOT NULL CHECK (box_height > 0.0 AND box_y + box_height <= 1.0),
+    identity_id TEXT NOT NULL REFERENCES identities (identity_id) ON DELETE RESTRICT,
+    identity_score REAL CHECK (
+        identity_score IS NULL OR (identity_score >= 0.0 AND identity_score <= 1.0)
+    ),
+    PRIMARY KEY (asset_id, position)
+);
+
+CREATE INDEX face_observations_identity_idx ON face_observations (identity_id);
+
+PRAGMA user_version = 7;
 COMMIT;
 """
 
@@ -274,7 +456,7 @@ COMMIT;
 
 _MIGRATE_V2_TO_V4 = f"""
 BEGIN IMMEDIATE;
-{_SPEECH_SCHEMA}
+{_LEGACY_SPEECH_SCHEMA}
 PRAGMA user_version = 4;
 COMMIT;
 """
@@ -442,22 +624,39 @@ class IndexDocument:
 
 
 @dataclass(frozen=True, slots=True)
-class _SpeakerIdentityState:
-    speaker_id: str
+class IdentityLink:
+    """A validated face-and-voice merge that can be committed atomically."""
+
+    target_id: str
+    source_id: str
     name: str | None
-    model_id: str
-    space_id: str
-    dimension: int
-    centroid: bytes
-    observations: int
     created_at: str
-    updated_at: str
 
 
 @dataclass(frozen=True, slots=True)
-class _SpeakerIdentityChange:
-    speaker_id: str
-    previous: _SpeakerIdentityState | None
+class _IdentityExemplarState:
+    modality: Literal["face", "voice"]
+    position: int
+    model_id: str
+    space_id: str
+    dimension: int
+    vector: bytes
+    created_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class _IdentityState:
+    identity_id: str
+    name: str | None
+    created_at: str
+    updated_at: str
+    exemplars: tuple[_IdentityExemplarState, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _IdentityChange:
+    identity_id: str
+    previous: _IdentityState | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -465,7 +664,7 @@ class SpeechRollback:
     """Internal undo token for an unreferenced speech analysis."""
 
     asset_id: str
-    identities: tuple[_SpeakerIdentityChange, ...]
+    identities: tuple[_IdentityChange, ...]
 
 
 class LocalStore:
@@ -819,8 +1018,9 @@ class LocalStore:
         space_id: str,
         minimum_similarity: float = 0.78,
         minimum_margin: float = 0.05,
+        preferred_identity: str | None = None,
     ) -> tuple[SpeakerSegment, ...]:
-        """Persist one analysis and match its CAM++ centroids to local identities."""
+        """Persist one analysis and match its CAM++ exemplars to local identities."""
         segments, _rollback = self.write_speech_reversible(
             asset_id,
             analysis,
@@ -828,6 +1028,7 @@ class LocalStore:
             space_id=space_id,
             minimum_similarity=minimum_similarity,
             minimum_margin=minimum_margin,
+            preferred_identity=preferred_identity,
         )
         return segments
 
@@ -840,11 +1041,14 @@ class LocalStore:
         space_id: str,
         minimum_similarity: float = 0.78,
         minimum_margin: float = 0.05,
+        preferred_identity: str | None = None,
     ) -> tuple[tuple[SpeakerSegment, ...], SpeechRollback | None]:
         """Persist speech and return an undo token when this call created the analysis."""
         _sha256(asset_id)
         _require_identifier(model_id, "speech model_id")
         _require_identifier(space_id, "speech space_id")
+        if preferred_identity is not None:
+            _require_identifier(preferred_identity, "preferred_identity")
         if not isinstance(analysis, SpeechAnalysis):
             raise ValueError("analysis must be a SpeechAnalysis value")
         for value, name in (
@@ -863,12 +1067,12 @@ class LocalStore:
             raise ValueError("speaker labels must be unique within one analysis")
         labels = {turn.speaker_label for turn in analysis.turns if turn.speaker_label is not None}
         if labels - speakers.keys():
-            raise ValueError("every speaker turn label must have a centroid")
+            raise ValueError("every speaker turn label must have an exemplar")
         dimensions = {len(values) for values in speakers.values()}
         if 0 in dimensions or len(dimensions) > 1:
-            raise ValueError("speaker centroids must share one non-zero dimension")
+            raise ValueError("speaker exemplars must share one non-zero dimension")
         normalized = {
-            label: _normalized_vector(values, "speaker centroid")
+            label: _normalized_vector(values, "speaker exemplar")
             for label, values in speakers.items()
         }
         now = datetime.now(timezone.utc)
@@ -897,6 +1101,7 @@ class LocalStore:
                 minimum_similarity=float(minimum_similarity),
                 minimum_margin=float(minimum_margin),
                 now=now,
+                preferred_identity=preferred_identity,
             )
             connection.execute("DELETE FROM speech_analyses WHERE asset_id = ?", (asset_id,))
             connection.execute(
@@ -959,55 +1164,202 @@ class LocalStore:
                 if previous is None:
                     removed = connection.execute(
                         """
-                        DELETE FROM speaker_identities
-                        WHERE speaker_id = ?
+                        DELETE FROM identities
+                        WHERE identity_id = ?
                           AND NOT EXISTS (
                               SELECT 1 FROM speech_segments WHERE speaker_id = ?
                           )
+                          AND NOT EXISTS (
+                              SELECT 1 FROM face_observations WHERE identity_id = ?
+                          )
                         """,
-                        (change.speaker_id, change.speaker_id),
+                        (change.identity_id, change.identity_id, change.identity_id),
                     )
                     if removed.rowcount != 1:
                         raise RuntimeError("new speaker identity could not be rolled back")
                     continue
                 connection.execute(
                     """
-                    INSERT INTO speaker_identities (
-                        speaker_id, name, model_id, space_id, dimension, centroid,
-                        observations, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT (speaker_id) DO UPDATE SET
+                    INSERT INTO identities (identity_id, name, created_at, updated_at)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT (identity_id) DO UPDATE SET
                         name = excluded.name,
-                        model_id = excluded.model_id,
-                        space_id = excluded.space_id,
-                        dimension = excluded.dimension,
-                        centroid = excluded.centroid,
-                        observations = excluded.observations,
                         created_at = excluded.created_at,
                         updated_at = excluded.updated_at
                     """,
                     (
-                        previous.speaker_id,
+                        previous.identity_id,
                         previous.name,
-                        previous.model_id,
-                        previous.space_id,
-                        previous.dimension,
-                        previous.centroid,
-                        previous.observations,
                         previous.created_at,
                         previous.updated_at,
                     ),
                 )
+                connection.execute(
+                    "DELETE FROM identity_exemplars WHERE identity_id = ?",
+                    (previous.identity_id,),
+                )
+                connection.executemany(
+                    """
+                    INSERT INTO identity_exemplars (
+                        identity_id, modality, position, model_id, space_id,
+                        dimension, vector, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        (
+                            previous.identity_id,
+                            exemplar.modality,
+                            exemplar.position,
+                            exemplar.model_id,
+                            exemplar.space_id,
+                            exemplar.dimension,
+                            exemplar.vector,
+                            exemplar.created_at,
+                        )
+                        for exemplar in previous.exemplars
+                    ),
+                )
             return True
+
+    def read_faces(
+        self,
+        asset_id: str,
+        *,
+        space_id: str,
+    ) -> tuple[FaceObservation, ...] | None:
+        """Return cached face observations, including an empty completed analysis."""
+        _sha256(asset_id)
+        _require_identifier(space_id, "face space_id")
+        with self._connection() as connection:
+            analysis = connection.execute(
+                "SELECT 1 FROM face_analyses WHERE asset_id = ? AND space_id = ?",
+                (asset_id, space_id),
+            ).fetchone()
+            if analysis is None:
+                return None
+            return self._read_faces(connection, asset_id)
+
+    def write_faces(
+        self,
+        asset_id: str,
+        analysis: FaceAnalysis,
+        *,
+        model_id: str,
+        space_id: str,
+        analysis_space_id: str | None = None,
+        minimum_similarity: float = 0.363,
+        minimum_margin: float = 0.05,
+        preferred_identity: str | None = None,
+    ) -> tuple[FaceObservation, ...]:
+        """Persist detected faces and match them against durable identity exemplars."""
+        _sha256(asset_id)
+        _require_identifier(model_id, "face model_id")
+        _require_identifier(space_id, "face space_id")
+        selected_analysis_space = space_id if analysis_space_id is None else analysis_space_id
+        _require_identifier(selected_analysis_space, "face analysis_space_id")
+        if preferred_identity is not None:
+            _require_identifier(preferred_identity, "preferred_identity")
+        if not isinstance(analysis, FaceAnalysis):
+            raise ValueError("analysis must be a FaceAnalysis value")
+        for value, name in (
+            (minimum_similarity, "minimum_similarity"),
+            (minimum_margin, "minimum_margin"),
+        ):
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int | float)
+                or not math.isfinite(float(value))
+                or not 0.0 <= value <= 1.0
+            ):
+                raise ValueError(f"{name} must be between zero and one")
+        dimensions = {len(face.values) for face in analysis.faces}
+        if 0 in dimensions or len(dimensions) > 1:
+            raise ValueError("face exemplars must share one non-zero dimension")
+        observations = {
+            face.face_label: (_normalized_vector(face.values, "face exemplar"),)
+            for face in analysis.faces
+        }
+        claim_groups = {face.face_label: face.observed_at_ms for face in analysis.faces}
+        now = datetime.now(timezone.utc)
+        with self._transaction() as connection:
+            cached = connection.execute(
+                "SELECT 1 FROM face_analyses WHERE asset_id = ? AND space_id = ?",
+                (asset_id, selected_analysis_space),
+            ).fetchone()
+            if cached is not None:
+                return self._read_faces(connection, asset_id)
+            if (
+                connection.execute(
+                    "SELECT 1 FROM media_assets WHERE asset_id = ?",
+                    (asset_id,),
+                ).fetchone()
+                is None
+            ):
+                raise ValueError("face analysis requires a stored media asset")
+            matches, _changes = self._match_identities(
+                connection,
+                observations,
+                claim_groups=claim_groups,
+                modality="face",
+                model_id=model_id,
+                space_id=space_id,
+                minimum_similarity=float(minimum_similarity),
+                minimum_margin=float(minimum_margin),
+                exemplar_limit=_FACE_EXEMPLAR_LIMIT,
+                now=now,
+                preferred_identity=preferred_identity,
+            )
+            connection.execute("DELETE FROM face_analyses WHERE asset_id = ?", (asset_id,))
+            connection.execute(
+                """
+                INSERT INTO face_analyses (asset_id, model_id, space_id, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (asset_id, model_id, selected_analysis_space, _datetime_text(now)),
+            )
+            connection.executemany(
+                """
+                INSERT INTO face_observations (
+                    asset_id, position, observed_at_ms, box_x, box_y,
+                    box_width, box_height, identity_id, identity_score
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    (
+                        asset_id,
+                        position,
+                        face.observed_at_ms,
+                        *face.bounding_box,
+                        matches[face.face_label][0],
+                        matches[face.face_label][1],
+                    )
+                    for position, face in enumerate(analysis.faces)
+                ),
+            )
+            return self._read_faces(connection, asset_id)
+
+    def resolve_identity_id(self, identity_id: str) -> str | None:
+        """Resolve a current or merged identity ID to its canonical identity."""
+        _require_identifier(identity_id, "identity_id")
+        with self._connection() as connection:
+            return _resolve_identity_id(connection, identity_id)
 
     def speaker_memory_ids(self, speaker_id: str) -> tuple[str, ...] | None:
         """Return memories containing a speaker, or none when the identity is unknown."""
         _require_identifier(speaker_id, "speaker_id")
         with self._connection() as connection:
+            resolved_id = _resolve_identity_id(connection, speaker_id)
+            if resolved_id is None:
+                return None
             if (
                 connection.execute(
-                    "SELECT 1 FROM speaker_identities WHERE speaker_id = ?",
-                    (speaker_id,),
+                    """
+                    SELECT 1
+                    FROM identity_exemplars
+                    WHERE identity_id = ? AND modality = 'voice'
+                    LIMIT 1
+                    """,
+                    (resolved_id,),
                 ).fetchone()
                 is None
             ):
@@ -1020,7 +1372,31 @@ class LocalStore:
                 WHERE s.speaker_id = ?
                 ORDER BY ma.memory_id
                 """,
-                (speaker_id,),
+                (resolved_id,),
+            ).fetchall()
+        return tuple(_row_text(row, "memory_id") for row in rows)
+
+    def identity_memory_ids(self, identity_id: str) -> tuple[str, ...] | None:
+        """Return memories containing a face or voice occurrence for one identity."""
+        _require_identifier(identity_id, "identity_id")
+        with self._connection() as connection:
+            resolved_id = _resolve_identity_id(connection, identity_id)
+            if resolved_id is None:
+                return None
+            rows = connection.execute(
+                """
+                SELECT DISTINCT ma.memory_id
+                FROM memory_assets AS ma
+                WHERE EXISTS (
+                    SELECT 1 FROM speech_segments AS s
+                    WHERE s.asset_id = ma.asset_id AND s.speaker_id = ?
+                ) OR EXISTS (
+                    SELECT 1 FROM face_observations AS f
+                    WHERE f.asset_id = ma.asset_id AND f.identity_id = ?
+                )
+                ORDER BY ma.memory_id
+                """,
+                (resolved_id, resolved_id),
             ).fetchall()
         return tuple(_row_text(row, "memory_id") for row in rows)
 
@@ -1034,20 +1410,40 @@ class LocalStore:
     ) -> bool:
         """Assign a display name and atomically replace affected indexed memories."""
         _require_identifier(speaker_id, "speaker_id")
-        normalized_name = _speaker_name(name)
+        return self.register_identity(
+            speaker_id,
+            name,
+            memories=memories,
+            embeddings=embeddings,
+        )
+
+    def register_identity(
+        self,
+        identity_id: str,
+        name: str,
+        *,
+        memories: Iterable[StoredMemory] = (),
+        embeddings: Iterable[StoredEmbedding] = (),
+    ) -> bool:
+        """Assign a display name and atomically replace affected indexed memories."""
+        _require_identifier(identity_id, "identity_id")
+        normalized_name = _identity_name(name)
         supplied_memories, supplied_embeddings, supplied_by_memory = _prepare_write_batch(
             memories,
             embeddings,
         )
         now = _datetime_text(datetime.now(timezone.utc))
         with self._transaction() as connection:
+            resolved_id = _resolve_identity_id(connection, identity_id)
+            if resolved_id is None:
+                return False
             cursor = connection.execute(
                 """
-                UPDATE speaker_identities
+                UPDATE identities
                 SET name = ?, updated_at = ?
-                WHERE speaker_id = ?
+                WHERE identity_id = ?
                 """,
-                (normalized_name, now, speaker_id),
+                (normalized_name, now, resolved_id),
             )
             if cursor.rowcount == 0:
                 return False
@@ -1058,6 +1454,150 @@ class LocalStore:
                 supplied_by_memory,
             )
         return cursor.rowcount > 0
+
+    def identity_link_plan(self, first_id: str, second_id: str) -> IdentityLink | None:
+        """Return the currently valid merge plan for two complementary identities."""
+        _require_identifier(first_id, "first identity_id")
+        _require_identifier(second_id, "second identity_id")
+        with self._connection() as connection:
+            return self._identity_link_plan(connection, first_id, second_id)
+
+    def link_identities(
+        self,
+        first_id: str,
+        second_id: str,
+        *,
+        expected: IdentityLink | None = None,
+        memories: Iterable[StoredMemory] = (),
+        embeddings: Iterable[StoredEmbedding] = (),
+    ) -> str | None:
+        """Merge a disjoint face-only and voice-only identity, returning the stable ID."""
+        _require_identifier(first_id, "first identity_id")
+        _require_identifier(second_id, "second identity_id")
+        if expected is not None and not isinstance(expected, IdentityLink):
+            raise ValueError("expected must be an IdentityLink value or None")
+        supplied_memories, supplied_embeddings, supplied_by_memory = _prepare_write_batch(
+            memories,
+            embeddings,
+        )
+        with self._transaction() as connection:
+            plan = self._identity_link_plan(connection, first_id, second_id)
+            if plan is None:
+                first = _resolve_identity_id(connection, first_id)
+                second = _resolve_identity_id(connection, second_id)
+                return first if first is not None and first == second else None
+            if expected is not None and plan != expected:
+                return None
+            target, source = plan.target_id, plan.source_id
+            now = _datetime_text(datetime.now(timezone.utc))
+            connection.execute(
+                "UPDATE speech_segments SET speaker_id = ? WHERE speaker_id = ?",
+                (target, source),
+            )
+            connection.execute(
+                "UPDATE face_observations SET identity_id = ? WHERE identity_id = ?",
+                (target, source),
+            )
+            connection.execute(
+                "UPDATE identity_exemplars SET identity_id = ? WHERE identity_id = ?",
+                (target, source),
+            )
+            connection.execute(
+                """
+                UPDATE identities
+                SET name = ?, created_at = ?, updated_at = ?
+                WHERE identity_id = ?
+                """,
+                (
+                    plan.name,
+                    plan.created_at,
+                    now,
+                    target,
+                ),
+            )
+            connection.execute(
+                "UPDATE identity_aliases SET identity_id = ? WHERE identity_id = ?",
+                (target, source),
+            )
+            connection.execute(
+                """
+                INSERT INTO identity_aliases (alias_id, identity_id, created_at)
+                VALUES (?, ?, ?)
+                """,
+                (source, target, now),
+            )
+            connection.execute("DELETE FROM identities WHERE identity_id = ?", (source,))
+            self._replace_memory_embeddings(
+                connection,
+                supplied_memories,
+                supplied_embeddings,
+                supplied_by_memory,
+            )
+            return target
+
+    @staticmethod
+    def _identity_link_plan(
+        connection: sqlite3.Connection,
+        first_id: str,
+        second_id: str,
+    ) -> IdentityLink | None:
+        first = _resolve_identity_id(connection, first_id)
+        second = _resolve_identity_id(connection, second_id)
+        if first is None or second is None or first == second:
+            return None
+        identities = (first, second)
+        rows = connection.execute(
+            """
+            SELECT identity_id, name, created_at
+            FROM identities
+            WHERE identity_id IN (?, ?)
+            ORDER BY identity_id
+            """,
+            identities,
+        ).fetchall()
+        if len(rows) != 2:
+            return None
+        modalities = {
+            identity_id: {
+                _identity_modality(row["modality"])
+                for row in connection.execute(
+                    """
+                    SELECT DISTINCT modality
+                    FROM identity_exemplars
+                    WHERE identity_id = ?
+                    """,
+                    (identity_id,),
+                ).fetchall()
+            }
+            for identity_id in identities
+        }
+        if (
+            not modalities[first]
+            or not modalities[second]
+            or modalities[first] & modalities[second]
+        ):
+            return None
+        names = {
+            _row_text(row, "identity_id"): (None if row["name"] is None else _row_text(row, "name"))
+            for row in rows
+        }
+        if names[first] is not None and names[second] not in {None, names[first]}:
+            return None
+        created = {_row_text(row, "identity_id"): _row_text(row, "created_at") for row in rows}
+        target, source = sorted(
+            identities,
+            key=lambda identity_id: (
+                names[identity_id] is None,
+                created[identity_id],
+                identity_id,
+            ),
+        )
+        return IdentityLink(
+            target,
+            source,
+            names[target] or names[source],
+            min(created[target], created[source]),
+        )
 
     def list_unreferenced_assets(self, *, limit: int = 100) -> tuple[StoredAsset, ...]:
         """List asset rows eligible for physical garbage collection."""
@@ -1326,6 +1866,9 @@ class LocalStore:
             version = int(connection.execute("PRAGMA user_version").fetchone()[0])
             if version == 5:
                 _migrate_v5(connection)
+            version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+            if version == 6:
+                _migrate_v6(connection)
             version = int(connection.execute("PRAGMA user_version").fetchone()[0])
             tables = _table_names(connection)
             if version != _SCHEMA_VERSION:
@@ -1668,7 +2211,7 @@ class LocalStore:
             SELECT s.start_ms, s.end_ms, s.transcript, s.speaker_id,
                    i.name AS speaker_name, s.identity_score
             FROM speech_segments AS s
-            LEFT JOIN speaker_identities AS i ON i.speaker_id = s.speaker_id
+            LEFT JOIN identities AS i ON i.identity_id = s.speaker_id
             WHERE s.asset_id = ?
             ORDER BY s.position
             """,
@@ -1692,6 +2235,45 @@ class LocalStore:
         )
 
     @staticmethod
+    def _read_faces(
+        connection: sqlite3.Connection,
+        asset_id: str,
+    ) -> tuple[FaceObservation, ...]:
+        rows = connection.execute(
+            """
+            SELECT f.observed_at_ms, f.box_x, f.box_y, f.box_width, f.box_height,
+                   f.identity_id, i.name AS identity_name, f.identity_score
+            FROM face_observations AS f
+            JOIN identities AS i ON i.identity_id = f.identity_id
+            WHERE f.asset_id = ?
+            ORDER BY f.position
+            """,
+            (asset_id,),
+        ).fetchall()
+        return tuple(
+            FaceObservation(
+                asset_id=asset_id,
+                observed_at_ms=(
+                    None if row["observed_at_ms"] is None else int(row["observed_at_ms"])
+                ),
+                bounding_box=(
+                    float(row["box_x"]),
+                    float(row["box_y"]),
+                    float(row["box_width"]),
+                    float(row["box_height"]),
+                ),
+                identity_id=_row_text(row, "identity_id"),
+                identity_name=(
+                    None if row["identity_name"] is None else _row_text(row, "identity_name")
+                ),
+                identity_score=(
+                    None if row["identity_score"] is None else float(row["identity_score"])
+                ),
+            )
+            for row in rows
+        )
+
+    @staticmethod
     def _match_speakers(
         connection: sqlite3.Connection,
         speakers: dict[str, tuple[float, ...]],
@@ -1701,113 +2283,178 @@ class LocalStore:
         minimum_similarity: float,
         minimum_margin: float,
         now: datetime,
+        preferred_identity: str | None = None,
     ) -> tuple[
         dict[str, tuple[str, float | None]],
-        tuple[_SpeakerIdentityChange, ...],
+        tuple[_IdentityChange, ...],
     ]:
-        if not speakers:
+        observations = {label: (vector,) for label, vector in speakers.items()}
+        claim_groups = dict.fromkeys(observations, 0)
+        return LocalStore._match_identities(
+            connection,
+            observations,
+            claim_groups=claim_groups,
+            modality="voice",
+            model_id=model_id,
+            space_id=space_id,
+            minimum_similarity=minimum_similarity,
+            minimum_margin=minimum_margin,
+            exemplar_limit=_VOICE_EXEMPLAR_LIMIT,
+            now=now,
+            preferred_identity=preferred_identity,
+        )
+
+    @staticmethod
+    def _match_identities(
+        connection: sqlite3.Connection,
+        observations: Mapping[str, tuple[tuple[float, ...], ...]],
+        *,
+        claim_groups: Mapping[str, int | None],
+        modality: Literal["face", "voice"],
+        model_id: str,
+        space_id: str,
+        minimum_similarity: float,
+        minimum_margin: float,
+        exemplar_limit: int,
+        now: datetime,
+        preferred_identity: str | None = None,
+    ) -> tuple[dict[str, tuple[str, float | None]], tuple[_IdentityChange, ...]]:
+        if not observations:
             return {}, ()
-        dimension = len(next(iter(speakers.values())))
+        dimension = len(next(iter(observations.values()))[0])
         rows = connection.execute(
             """
-            SELECT speaker_id, name, model_id, space_id, dimension, centroid,
-                   observations, created_at, updated_at
-            FROM speaker_identities
-            WHERE space_id = ? AND dimension = ?
-            ORDER BY speaker_id
+            SELECT identity_id, position, vector, created_at
+            FROM identity_exemplars
+            WHERE modality = ? AND space_id = ? AND dimension = ?
+            ORDER BY identity_id, position
             """,
-            (space_id, dimension),
+            (modality, space_id, dimension),
         ).fetchall()
-        states = {
-            _row_text(row, "speaker_id"): _SpeakerIdentityState(
-                speaker_id=_row_text(row, "speaker_id"),
-                name=None if row["name"] is None else _row_text(row, "name"),
-                model_id=_row_text(row, "model_id"),
-                space_id=_row_text(row, "space_id"),
-                dimension=int(row["dimension"]),
-                centroid=_row_blob(row, "centroid"),
-                observations=int(row["observations"]),
-                created_at=_row_text(row, "created_at"),
-                updated_at=_row_text(row, "updated_at"),
-            )
-            for row in rows
-        }
-        existing = {
-            speaker_id: (
-                _normalized_vector(
-                    _unpack_vector(state.centroid, dimension),
-                    "stored speaker centroid",
-                ),
-                state.observations,
-            )
-            for speaker_id, state in states.items()
-        }
-        claimed: set[str] = set()
-        matches: dict[str, tuple[str, float | None]] = {}
-        changes: list[_SpeakerIdentityChange] = []
-        for label, centroid in sorted(speakers.items()):
-            # ponytail: local speaker populations use a linear scan; add a vector index only
-            # after profiling shows identity matching matters beside model inference.
-            ranked = sorted(
+        existing: dict[str, list[tuple[tuple[float, ...], str]]] = {}
+        for row in rows:
+            identity_id = _row_text(row, "identity_id")
+            existing.setdefault(identity_id, []).append(
                 (
-                    (speaker_id, math.fsum(a * b for a, b in zip(centroid, stored, strict=True)))
-                    for speaker_id, (stored, _observations) in existing.items()
-                    if speaker_id not in claimed
-                ),
-                key=lambda item: (-item[1], item[0]),
+                    _normalized_vector(
+                        _unpack_vector(_row_blob(row, "vector"), dimension),
+                        f"stored {modality} exemplar",
+                    ),
+                    _row_text(row, "created_at"),
+                )
             )
-            best = ranked[0] if ranked else None
-            ambiguous = len(ranked) > 1 and ranked[0][1] - ranked[1][1] < minimum_margin
-            if best is None or best[1] < minimum_similarity or ambiguous:
-                speaker_id = f"speaker_{uuid.uuid4().hex}"
-                changes.append(_SpeakerIdentityChange(speaker_id, None))
-                connection.execute(
-                    """
-                    INSERT INTO speaker_identities (
-                        speaker_id, model_id, space_id, dimension, centroid,
-                        observations, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, 1, ?, ?)
-                    """,
-                    (
-                        speaker_id,
-                        model_id,
-                        space_id,
-                        dimension,
-                        _pack_vector(centroid),
-                        _datetime_text(now),
-                        _datetime_text(now),
-                    ),
-                )
-                existing[speaker_id] = (centroid, 1)
-                matches[label] = (speaker_id, None)
+        preferred_identity = (
+            None
+            if preferred_identity is None
+            else _resolve_identity_id(connection, preferred_identity)
+        )
+        preferred_exists = preferred_identity is not None
+        preferred_missing_modality = (
+            preferred_identity is not None
+            and connection.execute(
+                """
+                SELECT 1 FROM identity_exemplars
+                WHERE identity_id = ? AND modality = ?
+                LIMIT 1
+                """,
+                (preferred_identity, modality),
+            ).fetchone()
+            is None
+        )
+        known_identities = set(existing)
+        if preferred_exists and preferred_identity is not None:
+            known_identities.add(preferred_identity)
+        claimed: dict[int | None, set[str]] = {}
+        matches: dict[str, tuple[str, float | None]] = {}
+        changes: dict[str, _IdentityChange] = {}
+        now_text = _datetime_text(now)
+        for label, vectors in observations.items():
+            group_claims = claimed.setdefault(claim_groups[label], set())
+            # ponytail: local identity populations use a linear scan; add a vector index only
+            # after profiling shows identity matching matters beside model inference.
+            accepted = _accepted_identity(
+                existing,
+                vectors,
+                claimed=group_claims,
+                minimum_similarity=minimum_similarity,
+                minimum_margin=minimum_margin,
+            )
+            if accepted is not None:
+                identity_id, score = accepted
+            elif (
+                preferred_exists
+                and preferred_missing_modality
+                and preferred_identity is not None
+                and len(observations) == 1
+                and preferred_identity not in group_claims
+            ):
+                identity_id, score = preferred_identity, None
             else:
-                speaker_id, score = best
-                changes.append(_SpeakerIdentityChange(speaker_id, states[speaker_id]))
-                previous, observations = existing[speaker_id]
-                updated = _normalized_vector(
-                    tuple(
-                        (old * observations + new) / (observations + 1)
-                        for old, new in zip(previous, centroid, strict=True)
-                    ),
-                    "updated speaker centroid",
+                identity_id, score = f"identity_{uuid.uuid4().hex}", None
+            if identity_id not in changes:
+                previous = (
+                    None
+                    if identity_id not in known_identities
+                    else LocalStore._identity_state(connection, identity_id)
                 )
-                connection.execute(
-                    """
-                    UPDATE speaker_identities
-                    SET centroid = ?, observations = ?, updated_at = ?
-                    WHERE speaker_id = ?
-                    """,
-                    (
-                        _pack_vector(updated),
-                        observations + 1,
-                        _datetime_text(now),
-                        speaker_id,
-                    ),
+                changes[identity_id] = _IdentityChange(identity_id, previous)
+            identity_exists = identity_id in known_identities
+            existing[identity_id] = _write_identity_exemplars(
+                connection,
+                identity_id,
+                existing.get(identity_id, ()),
+                vectors,
+                modality=modality,
+                model_id=model_id,
+                space_id=space_id,
+                dimension=dimension,
+                exemplar_limit=exemplar_limit,
+                identity_exists=identity_exists,
+                now_text=now_text,
+            )
+            known_identities.add(identity_id)
+            matches[label] = (
+                identity_id,
+                None if score is None else max(0.0, min(1.0, score)),
+            )
+            group_claims.add(identity_id)
+        return matches, tuple(changes.values())
+
+    @staticmethod
+    def _identity_state(connection: sqlite3.Connection, identity_id: str) -> _IdentityState:
+        row = connection.execute(
+            "SELECT name, created_at, updated_at FROM identities WHERE identity_id = ?",
+            (identity_id,),
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("matched identity disappeared during recognition")
+        exemplars = connection.execute(
+            """
+            SELECT modality, position, model_id, space_id, dimension, vector, created_at
+            FROM identity_exemplars
+            WHERE identity_id = ?
+            ORDER BY modality, position
+            """,
+            (identity_id,),
+        ).fetchall()
+        return _IdentityState(
+            identity_id=identity_id,
+            name=None if row["name"] is None else _row_text(row, "name"),
+            created_at=_row_text(row, "created_at"),
+            updated_at=_row_text(row, "updated_at"),
+            exemplars=tuple(
+                _IdentityExemplarState(
+                    modality=_identity_modality(exemplar["modality"]),
+                    position=int(exemplar["position"]),
+                    model_id=_row_text(exemplar, "model_id"),
+                    space_id=_row_text(exemplar, "space_id"),
+                    dimension=int(exemplar["dimension"]),
+                    vector=_row_blob(exemplar, "vector"),
+                    created_at=_row_text(exemplar, "created_at"),
                 )
-                existing[speaker_id] = (updated, observations + 1)
-                matches[label] = (speaker_id, max(0.0, min(1.0, score)))
-            claimed.add(matches[label][0])
-        return matches, tuple(changes)
+                for exemplar in exemplars
+            ),
+        )
 
     def _require_open(self) -> None:
         if self._closed:
@@ -1859,7 +2506,7 @@ def _create_schema(
     if existing_tables:
         raise UnsupportedSchemaError("local data directory contains an unversioned SQLite schema")
     try:
-        connection.executescript(_SCHEMA_V6)
+        connection.executescript(_SCHEMA_V7)
     except BaseException:
         if connection.in_transaction:
             connection.rollback()
@@ -1942,6 +2589,15 @@ def _migrate_v5(connection: sqlite3.Connection) -> None:
             connection.executescript(_MIGRATE_V5_TO_V6)
         else:
             connection.execute("PRAGMA user_version = 6")
+    except BaseException:
+        if connection.in_transaction:
+            connection.rollback()
+        raise
+
+
+def _migrate_v6(connection: sqlite3.Connection) -> None:
+    try:
+        connection.executescript(_MIGRATE_V6_TO_V7)
     except BaseException:
         if connection.in_transaction:
             connection.rollback()
@@ -2041,6 +2697,19 @@ def _row_blob(row: sqlite3.Row, column: str) -> bytes:
     return value
 
 
+def _resolve_identity_id(connection: sqlite3.Connection, identity_id: str) -> str | None:
+    row = connection.execute(
+        """
+        SELECT identity_id FROM identities WHERE identity_id = ?
+        UNION ALL
+        SELECT identity_id FROM identity_aliases WHERE alias_id = ?
+        LIMIT 1
+        """,
+        (identity_id, identity_id),
+    ).fetchone()
+    return None if row is None else _row_text(row, "identity_id")
+
+
 def _pack_vector(values: tuple[float, ...]) -> bytes:
     return struct.pack(f"<{len(values)}f", *values)
 
@@ -2059,6 +2728,146 @@ def _normalized_vector(values: Sequence[float], name: str) -> tuple[float, ...]:
     if magnitude == 0.0:
         raise ValueError(f"{name} must not be a zero vector")
     return tuple(value / magnitude for value in normalized)
+
+
+def _accepted_identity(
+    exemplars_by_identity: dict[str, list[tuple[tuple[float, ...], str]]],
+    vectors: Sequence[tuple[float, ...]],
+    *,
+    claimed: set[str],
+    minimum_similarity: float,
+    minimum_margin: float,
+) -> tuple[str, float] | None:
+    ranked = sorted(
+        (
+            (
+                identity_id,
+                max(
+                    math.fsum(a * b for a, b in zip(vector, stored, strict=True))
+                    for vector in vectors
+                    for stored, _created_at in exemplars
+                ),
+            )
+            for identity_id, exemplars in exemplars_by_identity.items()
+            if identity_id not in claimed
+        ),
+        key=lambda item: (-item[1], item[0]),
+    )
+    if not ranked or ranked[0][1] < minimum_similarity:
+        return None
+    if len(ranked) > 1 and ranked[0][1] - ranked[1][1] < minimum_margin:
+        return None
+    return ranked[0]
+
+
+def _write_identity_exemplars(
+    connection: sqlite3.Connection,
+    identity_id: str,
+    stored: Sequence[tuple[tuple[float, ...], str]],
+    observed: Sequence[tuple[float, ...]],
+    *,
+    modality: Literal["face", "voice"],
+    model_id: str,
+    space_id: str,
+    dimension: int,
+    exemplar_limit: int,
+    identity_exists: bool,
+    now_text: str,
+) -> list[tuple[tuple[float, ...], str]]:
+    if not identity_exists:
+        connection.execute(
+            "INSERT INTO identities (identity_id, created_at, updated_at) VALUES (?, ?, ?)",
+            (identity_id, now_text, now_text),
+        )
+    exemplars = list(stored)
+    for vector in observed:
+        vector = _normalized_vector(
+            _unpack_vector(_pack_vector(vector), dimension),
+            f"{modality} exemplar",
+        )
+        if all(vector != existing for existing, _created_at in exemplars):
+            exemplars.append((vector, now_text))
+    selected = _diverse_exemplars(exemplars, limit=exemplar_limit)
+    connection.execute(
+        "DELETE FROM identity_exemplars WHERE identity_id = ? AND modality = ?",
+        (identity_id, modality),
+    )
+    connection.executemany(
+        """
+        INSERT INTO identity_exemplars (
+            identity_id, modality, position, model_id, space_id,
+            dimension, vector, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            (
+                identity_id,
+                modality,
+                position,
+                model_id,
+                space_id,
+                dimension,
+                _pack_vector(vector),
+                created_at,
+            )
+            for position, (vector, created_at) in enumerate(selected)
+        ),
+    )
+    if identity_exists:
+        connection.execute(
+            "UPDATE identities SET updated_at = ? WHERE identity_id = ?",
+            (now_text, identity_id),
+        )
+    return selected
+
+
+def _diverse_exemplars(
+    exemplars: Sequence[tuple[tuple[float, ...], str]],
+    *,
+    limit: int,
+) -> list[tuple[tuple[float, ...], str]]:
+    selected = list(exemplars)
+    while len(selected) > limit:
+        sums = tuple(
+            math.fsum(vector[index] for vector, _created_at in selected)
+            for index in range(len(selected[0][0]))
+        )
+        magnitude = math.sqrt(math.fsum(value * value for value in sums))
+        if magnitude:
+            centroid = tuple(value / magnitude for value in sums)
+            remove = max(
+                range(len(selected)),
+                key=lambda index: (
+                    math.fsum(
+                        value * center
+                        for value, center in zip(selected[index][0], centroid, strict=True)
+                    ),
+                    -index,
+                ),
+            )
+        else:
+            remove = max(
+                range(len(selected)),
+                key=lambda index: (
+                    max(
+                        math.fsum(
+                            left * right
+                            for left, right in zip(selected[index][0], candidate[0], strict=True)
+                        )
+                        for candidate_index, candidate in enumerate(selected)
+                        if candidate_index != index
+                    ),
+                    -index,
+                ),
+            )
+        selected.pop(remove)
+    return selected
+
+
+def _identity_modality(value: object) -> Literal["face", "voice"]:
+    if value == "face" or value == "voice":
+        return value
+    raise RuntimeError(f"invalid stored identity modality: {value!r}")
 
 
 def _datetime_text(value: datetime) -> str:
@@ -2104,12 +2913,12 @@ def _require_identifier(value: str, name: str) -> None:
         raise ValueError(f"{name} must be non-empty and trimmed")
 
 
-def _speaker_name(value: str) -> str:
+def _identity_name(value: str) -> str:
     if not isinstance(value, str) or not value.strip():
-        raise ValueError("speaker name must be non-empty text")
+        raise ValueError("identity name must be non-empty text")
     normalized = value.strip()
     if len(normalized) > 255 or not normalized.isprintable():
-        raise ValueError("speaker name must be at most 255 printable characters")
+        raise ValueError("identity name must be at most 255 printable characters")
     return normalized
 
 

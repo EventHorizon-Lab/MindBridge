@@ -35,6 +35,15 @@ class MemoryType(str, Enum):
     PROCEDURAL = "procedural"
 
 
+class IndexQuantization(str, Enum):
+    """Explicit compression applied only to the rebuildable vector index."""
+
+    NONE = "none"
+    FP16 = "fp16"
+    INT8 = "int8"
+    RABITQ = "rabitq"
+
+
 @dataclass(frozen=True, slots=True)
 class Blob:
     """Immutable inline media bytes with an explicit IANA media type."""
@@ -155,6 +164,55 @@ class SpeakerSegment:
             or not 0.0 <= self.identity_score <= 1.0
         ):
             raise ValidationError("identity_score must be between zero and one")
+
+
+@dataclass(frozen=True, slots=True)
+class FaceObservation:
+    """One detected face linked to a stable local multimodal identity."""
+
+    asset_id: str
+    bounding_box: tuple[float, float, float, float]
+    identity_id: str
+    identity_name: str | None = None
+    identity_score: float | None = None
+    observed_at_ms: int | None = None
+
+    def __post_init__(self) -> None:
+        if _SHA256.fullmatch(self.asset_id) is None:
+            raise ValidationError("face observation asset_id must be a SHA-256 identifier")
+        box = tuple(self.bounding_box)
+        if len(box) != 4 or any(not math.isfinite(value) for value in box):
+            raise ValidationError("face bounding_box must contain four finite values")
+        x, y, width, height = box
+        if (
+            x < 0.0
+            or y < 0.0
+            or width <= 0.0
+            or height <= 0.0
+            or x + width > 1.0
+            or y + height > 1.0
+        ):
+            raise ValidationError("face bounding_box must be normalized within the frame")
+        object.__setattr__(self, "bounding_box", box)
+        object.__setattr__(self, "identity_id", _text(self.identity_id, "identity_id"))
+        if self.identity_name is not None:
+            name = _text(self.identity_name, "identity_name")
+            if len(name) > 255 or not name.isprintable():
+                raise ValidationError("identity_name must be at most 255 printable characters")
+            object.__setattr__(self, "identity_name", name)
+        if self.identity_score is not None and (
+            isinstance(self.identity_score, bool)
+            or not isinstance(self.identity_score, int | float)
+            or not math.isfinite(float(self.identity_score))
+            or not 0.0 <= self.identity_score <= 1.0
+        ):
+            raise ValidationError("identity_score must be between zero and one")
+        if self.observed_at_ms is not None and (
+            isinstance(self.observed_at_ms, bool)
+            or not isinstance(self.observed_at_ms, int)
+            or self.observed_at_ms < 0
+        ):
+            raise ValidationError("observed_at_ms must be a non-negative integer")
 
 
 def _metadata(value: Mapping[str, object]) -> Mapping[str, object]:

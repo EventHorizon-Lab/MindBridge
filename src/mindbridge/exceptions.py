@@ -68,6 +68,13 @@ class SpeakerNotFoundError(MindBridgeError, LookupError):
     default_reason = "speaker_not_found"
 
 
+class IdentityNotFoundError(MindBridgeError, LookupError):
+    """Raised when a local face or voice identity does not exist."""
+
+    code = "identity_not_found"
+    default_reason = "identity_not_found"
+
+
 class ModelError(MindBridgeError):
     """Raised when a configured model cannot complete an operation."""
 

@@ -19,6 +19,7 @@ from mindbridge.infrastructure.local import (
     StoredMemory,
 )
 from mindbridge.infrastructure.local.zvec_index import ZvecIndex
+from mindbridge.types import IndexQuantization
 
 _BATCH_SIZE = 512
 _MODEL_ID = "synthetic-fp32"
@@ -35,6 +36,7 @@ def run_benchmark(
     queries: int = 20,
     k: int = 10,
     seed: int = 42,
+    quantization: IndexQuantization = IndexQuantization.NONE,
 ) -> dict[str, object]:
     """Run one clean, deterministic local-index benchmark and return JSON-ready metrics."""
     _validate_shape(rows=rows, dimension=dimension, queries=queries, k=k)
@@ -43,7 +45,14 @@ def run_benchmark(
     rng = random.Random(seed)
     fp32 = struct.Struct(f"<{dimension}f")
 
-    with LocalStore(root) as store, ZvecIndex(root / "index", dimension) as index:
+    with (
+        LocalStore(root) as store,
+        ZvecIndex(
+            root / "index",
+            dimension,
+            quantization=quantization,
+        ) as index,
+    ):
         ingest_started = perf_counter()
         for offset in range(0, rows, _BATCH_SIZE):
             batch_rows = min(_BATCH_SIZE, rows - offset)
@@ -76,6 +85,7 @@ def run_benchmark(
         "queries": queries,
         "k": k,
         "seed": seed,
+        "quantization": quantization.value,
         "ingest_seconds": ingest_seconds,
         "optimize_seconds": optimize_seconds,
         "recall_at_k": recall,
@@ -101,6 +111,11 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> int:
     parser.add_argument("--queries", type=_positive_int, default=20)
     parser.add_argument("--k", type=_positive_int, default=10)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--quantization",
+        choices=tuple(mode.value for mode in IndexQuantization),
+        default=IndexQuantization.NONE.value,
+    )
     parser.add_argument("--data-dir", type=Path, required=True)
     arguments = parser.parse_args(argv)
     result = run_benchmark(
@@ -110,6 +125,7 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> int:
         queries=arguments.queries,
         k=arguments.k,
         seed=arguments.seed,
+        quantization=IndexQuantization(arguments.quantization),
     )
     print(json.dumps(result, sort_keys=True, separators=(",", ":")))
     return 0

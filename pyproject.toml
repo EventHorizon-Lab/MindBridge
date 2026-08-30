@@ -37,6 +37,9 @@ observability = [
 openai = [
     "openai>=3,<4",
 ]
+face = [
+    "opencv-python-headless>=4.10,<6",
+]
 local = [
     # The pinned Jina revision converts image/svg+xml through cairosvg, and memory.py maps .svg
     # to it, so a documented input needs it. LGPL-3.0, installed separately, never linked.

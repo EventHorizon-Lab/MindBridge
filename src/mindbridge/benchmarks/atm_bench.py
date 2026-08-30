@@ -18,7 +18,7 @@ from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validato
 
 from mindbridge.benchmarks._contracts import ContractModel, Identifier, MediaKind, NonEmptyString
 
-ATM_BENCH_ADAPTER_VERSION = "atm_bench_official_v1"
+ATM_BENCH_ADAPTER_VERSION = "atm_bench_official_v2"
 
 AtmQuestionType = Literal["number", "list_recall", "open_end"]
 AtmEvidenceKind = Literal["email", "media"]
@@ -31,8 +31,6 @@ AtmEvidenceKind = Literal["email", "media"]
 # either way, and no gold evidence ID ever names one of these 28.
 _TIMESTAMP_PATTERN = re.compile(r"(\d{8})_(\d{6})")
 _EMAIL_PREFIX = "email"
-_MEMORY_CHARACTER_LIMIT = 2_048
-_CHUNK_BODY_CHARACTERS = 1_800
 _MEDIA_KIND_BY_FIELD = {"image_path": MediaKind.IMAGE, "video_path": MediaKind.VIDEO}
 
 
@@ -226,33 +224,13 @@ def atm_email_block(email: AtmEmail) -> str:
     )
 
 
-def atm_memory_chunks(block: str, evidence_id: str) -> tuple[str, ...]:
-    """Split one serialized block into writes that fit `RememberRequest.summary`.
-
-    1,063 of the 4,292 SGM blocks exceed the 2,048-character limit, the longest at 9,212.
-    Every chunk repeats the ID line, so retrieving any one of them still names its evidence.
-    """
-    if len(block) <= _MEMORY_CHARACTER_LIMIT:
-        return (block,)
-    head = f"ID: {evidence_id}\n"
-    body = block[len(head) :] if block.startswith(head) else block
-    slices = tuple(
-        body[offset : offset + _CHUNK_BODY_CHARACTERS]
-        for offset in range(0, len(body), _CHUNK_BODY_CHARACTERS)
-    )
-    return tuple(
-        f"{head}Part {index}/{len(slices)}\n{piece}" for index, piece in enumerate(slices, start=1)
-    )
-
-
 def atm_evidence_id_from_block(summary: str) -> str | None:
     """Read the evidence ID a serialized block's leading `ID: <id>` line names, or None.
 
-    Every SGM and email block -- and every chunk `atm_memory_chunks` splits one into -- opens
-    with exactly this line, for exactly this purpose: `recall`'s own evidence list only ever
-    names media MindBridge itself observed, so it has nothing for an email or an sgm-arm
-    write, both of which land as `remember` text instead. Reading this line back out of a
-    recalled memory's summary is how those two are not simply invisible to retrieval-recall.
+    Every SGM and email block opens with exactly this line for this purpose: `recall`'s own
+    evidence list only ever names media MindBridge itself observed, so it has nothing for an
+    email or an sgm-arm write, both of which land as `remember` text instead. Reading this line
+    back out of a recalled memory's summary keeps those two visible to retrieval-recall.
     A summary that does not open with the marker -- e.g. the raw arm's own perception-derived
     text -- names no evidence and returns None.
     """

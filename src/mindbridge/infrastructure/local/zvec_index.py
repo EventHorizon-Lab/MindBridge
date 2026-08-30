@@ -3,18 +3,24 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Iterable, Sequence
+import re
+from collections.abc import Iterable, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from importlib import import_module
 from pathlib import Path
+from threading import Condition
 from types import ModuleType
 from typing import Any, NoReturn, cast
 
 from mindbridge.infrastructure.local.store import IndexDocument
+from mindbridge.types import IndexQuantization
 
 _COLLECTION_NAME = "mindbridge_memory_index"
 _CONTENT_FIELD = "content"
+_CONTENT_CJK_FIELD = "content_cjk"
+_MEMORY_ID_FIELD = "memory_id"
 _MEMORY_TYPE_FIELD = "memory_type"
 _OCCURRED_AT_FIELD = "occurred_at"
 _OCCURRED_END_FIELD = "occurred_end"
@@ -24,6 +30,8 @@ _VECTOR_FIELD = "embedding"
 _SCALAR_FIELDS = frozenset(
     {
         _CONTENT_FIELD,
+        _CONTENT_CJK_FIELD,
+        _MEMORY_ID_FIELD,
         _MEMORY_TYPE_FIELD,
         _OCCURRED_AT_FIELD,
         _OCCURRED_END_FIELD,
@@ -34,10 +42,16 @@ _SCALAR_FIELDS = frozenset(
 _MISSING_OCCURRED_AT = -(2**63)
 _HNSW_M = 50
 _HNSW_EF_CONSTRUCTION = 500
+_RABITQ_TOTAL_BITS = 7
+_RABITQ_NUM_CLUSTERS = 16
 _DEFAULT_EF_SEARCH = 300
-_DEFAULT_RRF_RANK_CONSTANT = 60
+_LEXICAL_RANK_CONSTANT = 60
 _DEFAULT_REBUILD_BATCH_SIZE = 1_024
-_DEFAULT_HYBRID_CANDIDATES = 50
+_AUTO_OPTIMIZE_UNINDEXED_DOCUMENTS = 100_000
+_GROUP_OVERSAMPLE = 2
+_GROUP_FALLBACK_MINIMUM = 50
+_MAX_EMBEDDINGS_PER_MEMORY = 129
+_CJK_CHARACTER = re.compile(r"[\u3400-\u9fff]")
 
 
 class ZvecUnavailableError(RuntimeError):
@@ -46,6 +60,60 @@ class ZvecUnavailableError(RuntimeError):
 
 class ZvecWriteError(RuntimeError):
     """Raised when any operation in a Zvec write batch fails."""
+
+
+def validate_index_configuration(
+    dimension: int,
+    quantization: IndexQuantization,
+) -> None:
+    """Validate options before either SQLite metadata or Zvec can be mutated."""
+    if isinstance(dimension, bool) or not isinstance(dimension, int) or dimension <= 0:
+        raise ValueError("dimension must be a positive integer")
+    if not isinstance(quantization, IndexQuantization):
+        raise ValueError("quantization must be an IndexQuantization value")
+    if quantization is IndexQuantization.RABITQ and not 64 <= dimension <= 4_095:
+        raise ValueError("RABITQ requires an embedding dimension between 64 and 4095")
+
+
+class _CollectionGate:
+    """Let queries overlap while collection replacement remains exclusive."""
+
+    def __init__(self) -> None:
+        self._condition = Condition()
+        self._readers = 0
+        self._writer = False
+        self._waiting_writers = 0
+
+    @contextmanager
+    def read(self) -> Iterator[None]:
+        with self._condition:
+            while self._writer or self._waiting_writers:
+                self._condition.wait()
+            self._readers += 1
+        try:
+            yield
+        finally:
+            with self._condition:
+                self._readers -= 1
+                if not self._readers:
+                    self._condition.notify_all()
+
+    @contextmanager
+    def write(self) -> Iterator[None]:
+        with self._condition:
+            self._waiting_writers += 1
+            try:
+                while self._writer or self._readers:
+                    self._condition.wait()
+                self._writer = True
+            finally:
+                self._waiting_writers -= 1
+        try:
+            yield
+        finally:
+            with self._condition:
+                self._writer = False
+                self._condition.notify_all()
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,7 +142,7 @@ class IndexHit:
 
 
 class ZvecIndex:
-    """Own one FP32 cosine/FTS collection at a local filesystem path."""
+    """Own one cosine/FTS collection derived from authoritative FP32 vectors."""
 
     def __init__(
         self,
@@ -82,19 +150,17 @@ class ZvecIndex:
         dimension: int,
         *,
         ef_search: int = _DEFAULT_EF_SEARCH,
-        rrf_rank_constant: int = _DEFAULT_RRF_RANK_CONSTANT,
+        quantization: IndexQuantization = IndexQuantization.NONE,
     ) -> None:
-        if isinstance(dimension, bool) or dimension <= 0:
-            raise ValueError("dimension must be a positive integer")
+        validate_index_configuration(dimension, quantization)
         if isinstance(ef_search, bool) or ef_search <= 0:
             raise ValueError("ef_search must be a positive integer")
-        if isinstance(rrf_rank_constant, bool) or rrf_rank_constant <= 0:
-            raise ValueError("rrf_rank_constant must be a positive integer")
 
         self.path = Path(path).expanduser().resolve()
         self.dimension = dimension
         self.ef_search = ef_search
-        self.rrf_rank_constant = rrf_rank_constant
+        self.quantization = quantization
+        self._gate = _CollectionGate()
         self._zvec: Any = _load_zvec()
         self._schema = self._build_schema()
         option = self._zvec.CollectionOption(read_only=False, enable_mmap=True)
@@ -108,6 +174,9 @@ class ZvecIndex:
             )
         try:
             self._validate_schema(cast(Any, self._collection).schema)
+            self._optimization_watermark = _indexed_document_count(
+                cast(Any, self._collection).stats
+            )
         except BaseException:
             self.close()
             raise
@@ -152,6 +221,13 @@ class ZvecIndex:
                         # Only the aggregate vector participates in BM25. Repeating one memory's
                         # text for every part would let multi-vector records crowd out neighbors.
                         _CONTENT_FIELD: document.content if embedding.object_part == 0 else "",
+                        _CONTENT_CJK_FIELD: (
+                            document.content
+                            if embedding.object_part == 0
+                            and _CJK_CHARACTER.search(document.content) is not None
+                            else ""
+                        ),
+                        _MEMORY_ID_FIELD: embedding.memory_id,
                         _MEMORY_TYPE_FIELD: document.memory_type,
                         _OCCURRED_AT_FIELD: _timestamp(document.occurred_at),
                         _OCCURRED_END_FIELD: _end_timestamp(
@@ -193,17 +269,18 @@ class ZvecIndex:
         exact: bool = False,
     ) -> tuple[IndexHit, ...]:
         """Return dense cosine matches with higher-is-better relevance."""
-        docs = self._dense_query(
-            values,
-            limit=limit,
-            space_id=space_id,
-            task=task,
-            memory_type=memory_type,
-            occurred_from=occurred_from,
-            occurred_until=occurred_until,
-            ef=ef,
-            exact=exact,
-        )
+        with self._gate.read():
+            docs = self._dense_query(
+                values,
+                limit=limit,
+                space_id=space_id,
+                task=task,
+                memory_type=memory_type,
+                occurred_from=occurred_from,
+                occurred_until=occurred_until,
+                ef=ef,
+                exact=exact,
+            )
         hits = tuple(
             (
                 _required_id(doc),
@@ -216,79 +293,45 @@ class ZvecIndex:
             for document_id, score in hits
         )
 
-    def hybrid_search(
+    def lexical_search(
         self,
         text: str,
-        values: Sequence[float],
         *,
         limit: int = 10,
-        candidate_limit: int | None = None,
         space_id: str | None = None,
         task: str | None = None,
         memory_type: str | None = None,
         occurred_from: datetime | None = None,
         occurred_until: datetime | None = None,
-        ef: int | None = None,
-        exact: bool = False,
     ) -> tuple[IndexHit, ...]:
-        """Fuse dense and BM25 ranks; return relevance normalized to ``[0, 1]``."""
+        """Return BM25 matches with scores normalized against the best candidate."""
         if not text.strip():
-            raise ValueError("hybrid query text must not be empty")
+            raise ValueError("lexical query text must not be empty")
         _require_positive(limit, "limit")
-        candidates = (
-            max(_DEFAULT_HYBRID_CANDIDATES, limit * 5)
-            if candidate_limit is None
-            else candidate_limit
-        )
-        _require_positive(candidates, "candidate_limit")
-        if candidates < limit:
-            raise ValueError("candidate_limit must not be smaller than limit")
-
-        filter_expression = _filter_expression(
-            space_id=space_id,
-            task=task,
-            memory_type=memory_type,
-            occurred_from=occurred_from,
-            occurred_until=occurred_until,
-        )
-        dense = self._dense_query(
-            values,
-            limit=candidates,
-            space_id=space_id,
-            task=task,
-            memory_type=memory_type,
-            occurred_from=occurred_from,
-            occurred_until=occurred_until,
-            ef=ef,
-            exact=exact,
-        )
-        collection = cast(Any, self._require_collection())
-        lexical = collection.query(
-            queries=self._zvec.Query(
-                field_name=_CONTENT_FIELD,
-                fts=self._zvec.Fts(match_string=text),
-            ),
-            topk=candidates,
-            filter=filter_expression,
-            include_vector=False,
-            output_fields=[],
-        )
-        dense_confidence = {
-            _required_id(doc): max(0.0, min(1.0, 1.0 - _required_score(doc) / 2.0)) for doc in dense
-        }
-        lexical_ids = {_required_id(doc) for doc in lexical}
-        fused = self._zvec.RrfReRanker(rank_constant=self.rrf_rank_constant).rerank(
-            [dense, lexical], topn=limit
-        )
-        maximum = 2.0 / (self.rrf_rank_constant + 1.0)
+        with self._gate.read():
+            docs = self._lexical_query(
+                text,
+                limit=limit,
+                space_id=space_id,
+                task=task,
+                memory_type=memory_type,
+                occurred_from=occurred_from,
+                occurred_until=occurred_until,
+            )
+        scores = tuple(max(0.0, _required_score(doc)) for doc in docs)
+        maximum = max(scores, default=0.0)
         return tuple(
             IndexHit(
                 id=_required_id(doc),
-                relevance=max(0.0, min(1.0, _required_score(doc) / maximum)),
-                confidence=dense_confidence.get(_required_id(doc), 0.0),
-                lexical_match=_required_id(doc) in lexical_ids,
+                relevance=(
+                    score / maximum
+                    if maximum > 0.0
+                    else (_LEXICAL_RANK_CONSTANT + 1) / (_LEXICAL_RANK_CONSTANT + rank)
+                ),
+                confidence=0.0,
+                lexical_match=True,
             )
-            for doc in fused
+            for rank, (doc, score) in enumerate(zip(docs, scores, strict=True), start=1)
         )
 
     def flush(self) -> None:
@@ -302,6 +345,24 @@ class ZvecIndex:
             raise ValueError("concurrency must be a non-negative integer")
         collection = cast(Any, self._require_collection())
         collection.optimize(self._zvec.OptimizeOption(concurrency=concurrency))
+        self._optimization_watermark = self.doc_count
+
+    def optimize_if_needed(
+        self,
+        *,
+        minimum_unindexed: int = _AUTO_OPTIMIZE_UNINDEXED_DOCUMENTS,
+    ) -> bool:
+        """Start background maintenance after a meaningful flat-buffer buildup."""
+        _require_positive(minimum_unindexed, "minimum_unindexed")
+        collection = cast(Any, self._require_collection())
+        stats = collection.stats
+        document_count = int(stats.doc_count)
+        self._optimization_watermark = min(self._optimization_watermark, document_count)
+        indexed = _indexed_document_count(stats)
+        if document_count - max(indexed, self._optimization_watermark) < minimum_unindexed:
+            return False
+        self.optimize()
+        return True
 
     def rebuild(
         self,
@@ -315,6 +376,20 @@ class ZvecIndex:
         if isinstance(optimize_concurrency, bool) or optimize_concurrency < 0:
             raise ValueError("optimize_concurrency must be a non-negative integer")
 
+        with self._gate.write():
+            return self._rebuild(
+                documents,
+                batch_size=batch_size,
+                optimize_concurrency=optimize_concurrency,
+            )
+
+    def _rebuild(
+        self,
+        documents: Iterable[IndexDocument],
+        *,
+        batch_size: int,
+        optimize_concurrency: int,
+    ) -> int:
         collection = cast(Any, self._require_collection())
         collection.destroy()
         self._collection = None
@@ -323,6 +398,7 @@ class ZvecIndex:
             schema=self._schema,
             option=self._zvec.CollectionOption(read_only=False, enable_mmap=True),
         )
+        self._optimization_watermark = 0
 
         count = 0
         batch: list[IndexDocument] = []
@@ -342,11 +418,12 @@ class ZvecIndex:
 
     def close(self) -> None:
         """Close and release Zvec's native file lock; repeated calls are safe."""
-        if self._collection is None:
-            return
-        collection = cast(Any, self._collection)
-        self._collection = None
-        collection.close()
+        with self._gate.write():
+            if self._collection is None:
+                return
+            collection = cast(Any, self._collection)
+            self._collection = None
+            collection.close()
 
     def _dense_query(
         self,
@@ -365,16 +442,78 @@ class ZvecIndex:
         _require_positive(limit, "limit")
         selected_ef = self.ef_search if ef is None else ef
         _require_positive(selected_ef, "ef")
+        collection = cast(Any, self._require_collection())
+        query = self._zvec.Query(
+            field_name=_VECTOR_FIELD,
+            vector=list(values),
+            param=self._query_param(ef=max(selected_ef, limit), exact=exact),
+        )
+        filter_expression = _filter_expression(
+            space_id=space_id,
+            task=task,
+            memory_type=memory_type,
+            occurred_from=occurred_from,
+            occurred_until=occurred_until,
+        )
+        groups = collection.group_by_query(
+            query=query,
+            group_by_field_name=_MEMORY_ID_FIELD,
+            group_count=limit * _GROUP_OVERSAMPLE,
+            topk_per_group=1,
+            filter=filter_expression,
+            include_vector=False,
+            output_fields=[],
+        )
+        by_memory = {str(group.group_by_value): group.docs[0] for group in groups if group.docs}
+        if len(by_memory) >= limit:
+            return _best_documents(by_memory.values(), limit)
+
+        # Zvec documents group-by as best effort. Fill missing groups from progressively wider
+        # ordinary results, bounded by MindBridge's maximum vectors per parent memory.
+        topk = max(_GROUP_FALLBACK_MINIMUM, limit * 4)
+        ceiling = max(topk, limit * _MAX_EMBEDDINGS_PER_MEMORY)
+        while len(by_memory) < limit:
+            docs = cast(
+                list[object],
+                collection.query(
+                    queries=query,
+                    topk=topk,
+                    filter=filter_expression,
+                    include_vector=False,
+                    output_fields=[_MEMORY_ID_FIELD],
+                ),
+            )
+            for doc in docs:
+                memory_id = _required_field(doc, _MEMORY_ID_FIELD)
+                current = by_memory.get(memory_id)
+                if current is None or _required_score(doc) < _required_score(current):
+                    by_memory[memory_id] = doc
+            if len(docs) < topk or topk >= ceiling:
+                break
+            topk = min(topk * 2, ceiling)
+        return _best_documents(by_memory.values(), limit)
+
+    def _lexical_query(
+        self,
+        text: str,
+        *,
+        limit: int,
+        space_id: str | None,
+        task: str | None,
+        memory_type: str | None,
+        occurred_from: datetime | None,
+        occurred_until: datetime | None,
+    ) -> list[object]:
         return cast(
             list[object],
             cast(Any, self._require_collection()).query(
                 queries=self._zvec.Query(
-                    field_name=_VECTOR_FIELD,
-                    vector=list(values),
-                    param=self._zvec.HnswQueryParam(
-                        ef=max(selected_ef, limit),
-                        is_linear=exact,
+                    field_name=(
+                        _CONTENT_CJK_FIELD
+                        if _CJK_CHARACTER.search(text) is not None
+                        else _CONTENT_FIELD
                     ),
+                    fts=self._zvec.Fts(match_string=text),
                 ),
                 topk=limit,
                 filter=_filter_expression(
@@ -399,8 +538,22 @@ class ZvecIndex:
                     nullable=False,
                     index_param=self._zvec.FtsIndexParam(
                         tokenizer_name="standard",
+                        filters=["lowercase", "ascii_folding", "stemmer"],
+                    ),
+                ),
+                self._zvec.FieldSchema(
+                    name=_CONTENT_CJK_FIELD,
+                    data_type=self._zvec.DataType.STRING,
+                    nullable=False,
+                    index_param=self._zvec.FtsIndexParam(
+                        tokenizer_name="jieba",
                         filters=["lowercase"],
                     ),
+                ),
+                self._zvec.FieldSchema(
+                    name=_MEMORY_ID_FIELD,
+                    data_type=self._zvec.DataType.STRING,
+                    nullable=False,
                 ),
                 self._zvec.FieldSchema(
                     name=_MEMORY_TYPE_FIELD,
@@ -412,13 +565,13 @@ class ZvecIndex:
                     name=_OCCURRED_AT_FIELD,
                     data_type=self._zvec.DataType.INT64,
                     nullable=False,
-                    index_param=self._zvec.InvertIndexParam(),
+                    index_param=self._zvec.InvertIndexParam(enable_range_optimization=True),
                 ),
                 self._zvec.FieldSchema(
                     name=_OCCURRED_END_FIELD,
                     data_type=self._zvec.DataType.INT64,
                     nullable=False,
-                    index_param=self._zvec.InvertIndexParam(),
+                    index_param=self._zvec.InvertIndexParam(enable_range_optimization=True),
                 ),
                 self._zvec.FieldSchema(
                     name=_SPACE_FIELD,
@@ -438,42 +591,48 @@ class ZvecIndex:
                     name=_VECTOR_FIELD,
                     data_type=self._zvec.DataType.VECTOR_FP32,
                     dimension=self.dimension,
-                    index_param=self._zvec.HnswIndexParam(
-                        metric_type=self._zvec.MetricType.COSINE,
-                        m=_HNSW_M,
-                        ef_construction=_HNSW_EF_CONSTRUCTION,
-                    ),
+                    index_param=self._vector_index_param(),
                 )
             ],
         )
         return schema
 
-    def _validate_schema(self, schema: object) -> None:
+    def _validate_schema(self, schema: object) -> None:  # noqa: C901 - one persisted schema
         native_schema = cast(Any, schema)
         if native_schema.name != _COLLECTION_NAME:
             _schema_mismatch(f"collection name is {native_schema.name!r}")
         fields = {field.name: field for field in native_schema.fields}
         if fields.keys() != _SCALAR_FIELDS:
             _schema_mismatch("scalar fields differ")
-        content = fields[_CONTENT_FIELD]
-        if (
-            content.data_type != self._zvec.DataType.STRING
-            or content.nullable
-            or content.index_param is None
-            or content.index_param.type != self._zvec.IndexType.FTS
-            or content.index_param.tokenizer_name != "standard"
-            or tuple(content.index_param.filters) != ("lowercase",)
+        for name, tokenizer, filters in (
+            (_CONTENT_FIELD, "standard", ("lowercase", "ascii_folding", "stemmer")),
+            (_CONTENT_CJK_FIELD, "jieba", ("lowercase",)),
         ):
-            _schema_mismatch("content FTS field differs")
-        for name in (_MEMORY_TYPE_FIELD, _SPACE_FIELD, _TASK_FIELD):
+            content = fields[name]
+            if (
+                content.data_type != self._zvec.DataType.STRING
+                or content.nullable
+                or content.index_param is None
+                or content.index_param.type != self._zvec.IndexType.FTS
+                or content.index_param.tokenizer_name != tokenizer
+                or tuple(content.index_param.filters) != filters
+            ):
+                _schema_mismatch(f"{name} FTS field differs")
+        for name in (_MEMORY_ID_FIELD, _MEMORY_TYPE_FIELD, _SPACE_FIELD, _TASK_FIELD):
             field = fields[name]
             if (
                 field.data_type != self._zvec.DataType.STRING
                 or field.nullable
-                or field.index_param is None
-                or field.index_param.type != self._zvec.IndexType.INVERT
+                or (name == _MEMORY_ID_FIELD and field.index_param is not None)
+                or (
+                    name != _MEMORY_ID_FIELD
+                    and (
+                        field.index_param is None
+                        or field.index_param.type != self._zvec.IndexType.INVERT
+                    )
+                )
             ):
-                _schema_mismatch(f"{name} filter field differs")
+                _schema_mismatch(f"{name} scalar field differs")
         for name in (_OCCURRED_AT_FIELD, _OCCURRED_END_FIELD):
             field = fields[name]
             if (
@@ -481,6 +640,7 @@ class ZvecIndex:
                 or field.nullable
                 or field.index_param is None
                 or field.index_param.type != self._zvec.IndexType.INVERT
+                or not field.index_param.enable_range_optimization
             ):
                 _schema_mismatch(f"{name} filter field differs")
 
@@ -489,16 +649,71 @@ class ZvecIndex:
             _schema_mismatch("vector fields differ")
         vector = vectors[_VECTOR_FIELD]
         index = vector.index_param
+        expected_type = (
+            self._zvec.IndexType.HNSW_RABITQ
+            if self.quantization is IndexQuantization.RABITQ
+            else self._zvec.IndexType.HNSW
+        )
+        expected_quantization = {
+            IndexQuantization.NONE: self._zvec.QuantizeType.UNDEFINED,
+            IndexQuantization.FP16: self._zvec.QuantizeType.FP16,
+            IndexQuantization.INT8: self._zvec.QuantizeType.INT8,
+            IndexQuantization.RABITQ: self._zvec.QuantizeType.RABITQ,
+        }[self.quantization]
         if (
             vector.data_type != self._zvec.DataType.VECTOR_FP32
             or vector.dimension != self.dimension
-            or index.type != self._zvec.IndexType.HNSW
+            or index.type != expected_type
             or index.metric_type != self._zvec.MetricType.COSINE
             or index.m != _HNSW_M
             or index.ef_construction != _HNSW_EF_CONSTRUCTION
-            or index.quantize_type != self._zvec.QuantizeType.UNDEFINED
+            or index.quantize_type != expected_quantization
+            or (
+                self.quantization is IndexQuantization.INT8
+                and not index.quantizer_param.enable_rotate
+            )
+            or (
+                self.quantization is IndexQuantization.RABITQ
+                and (
+                    index.total_bits != _RABITQ_TOTAL_BITS
+                    or index.num_clusters != _RABITQ_NUM_CLUSTERS
+                    or index.sample_count != 0
+                )
+            )
         ):
-            _schema_mismatch("FP32 cosine HNSW field differs")
+            _schema_mismatch("FP32 cosine vector index differs")
+
+    def _vector_index_param(self) -> object:
+        if self.quantization is IndexQuantization.RABITQ:
+            return self._zvec.HnswRabitqIndexParam(
+                metric_type=self._zvec.MetricType.COSINE,
+                m=_HNSW_M,
+                ef_construction=_HNSW_EF_CONSTRUCTION,
+                total_bits=_RABITQ_TOTAL_BITS,
+                num_clusters=_RABITQ_NUM_CLUSTERS,
+            )
+        quantize_type = {
+            IndexQuantization.NONE: self._zvec.QuantizeType.UNDEFINED,
+            IndexQuantization.FP16: self._zvec.QuantizeType.FP16,
+            IndexQuantization.INT8: self._zvec.QuantizeType.INT8,
+        }[self.quantization]
+        return self._zvec.HnswIndexParam(
+            metric_type=self._zvec.MetricType.COSINE,
+            m=_HNSW_M,
+            ef_construction=_HNSW_EF_CONSTRUCTION,
+            quantize_type=quantize_type,
+            quantizer_param=self._zvec.QuantizerParam(
+                enable_rotate=self.quantization is IndexQuantization.INT8
+            ),
+        )
+
+    def _query_param(self, *, ef: int, exact: bool) -> object:
+        param_type = (
+            self._zvec.HnswRabitqQueryParam
+            if self.quantization is IndexQuantization.RABITQ
+            else self._zvec.HnswQueryParam
+        )
+        return param_type(ef=ef, is_linear=exact)
 
     def _validate_vector(self, values: Sequence[float]) -> None:
         if len(values) != self.dimension:
@@ -609,6 +824,26 @@ def _required_id(doc: object) -> str:
     if not isinstance(document_id, str) or not document_id:
         raise RuntimeError("Zvec query result has no document ID")
     return document_id
+
+
+def _required_field(doc: object, name: str) -> str:
+    value = cast(Any, doc).field(name)
+    if not isinstance(value, str) or not value:
+        raise RuntimeError(f"Zvec query result {_required_id(doc)!r} has no {name}")
+    return value
+
+
+def _best_documents(documents: Iterable[object], limit: int) -> list[object]:
+    return sorted(documents, key=lambda doc: (_required_score(doc), _required_id(doc)))[:limit]
+
+
+def _indexed_document_count(stats: object) -> int:
+    native_stats = cast(Any, stats)
+    document_count = int(native_stats.doc_count)
+    completeness = float(native_stats.index_completeness[_VECTOR_FIELD])
+    if not math.isfinite(completeness) or not 0.0 <= completeness <= 1.0:
+        raise RuntimeError("Zvec index completeness must be between zero and one")
+    return round(document_count * completeness)
 
 
 def _require_positive(value: int, name: str) -> None:

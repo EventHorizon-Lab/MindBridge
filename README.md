@@ -20,6 +20,9 @@ OpenAI:
 uv add "mindbridge[local,openai]"
 ```
 
+Add `mindbridge[face]` only when local face identity is required; model weights remain explicit
+caller-provided files.
+
 The base package depends only on Pydantic and Zvec. Torch, provider SDKs, REST, and MCP remain in
 optional extras.
 
@@ -115,7 +118,8 @@ MindBridge exposes narrow, operation-specific protocols:
 - `EmbeddingBackend` for retrieval vectors and stable embedding-space identity.
 - `GenerationBackend` for grounded answers.
 - `TranscriptionBackend` for plain transcripts.
-- `SpeechBackend` for timed transcripts and local speaker centroids.
+- `SpeechBackend` for timed transcripts and local voice exemplars.
+- `FaceBackend` for local face observations and identity exemplars.
 
 A single provider adapter may implement several protocols, but `Memory` does not require one fat
 backend. There is no provider registry, endpoint normalizer, credential store, retry layer, or
@@ -127,6 +131,7 @@ The built-in adapters are deliberately thin:
 - `JinaOmniEmbedder` pins Jina v5 Omni and calls its official `encode_query` and
   `encode_document` methods.
 - `FunASRTranscriber` delegates model loading and execution to `funasr.AutoModel`.
+- `OpenCVFaceAnalyzer` delegates explicit local YuNet and SFace models to OpenCV.
 - `OpenAIModels` uses caller-owned official OpenAI SDK clients.
 
 ## Storage and consistency

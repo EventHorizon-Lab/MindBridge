@@ -93,11 +93,13 @@ Searches local memories.
 | `memory_type` | one memory role or null | no | null |
 | `reference_at` | timezone-aware ISO 8601 datetime or null | no | current UTC |
 
-The result is `{"hits": [...]}`. Each hit contains memory fields plus `score`. Routed queries with
-text use hybrid dense/full-text retrieval; pure media uses dense retrieval. Relative temporal
-expressions resolve against `reference_at`. Search is conservatively marked non-read-only because
-it may drain durable index work or populate transcript caches; it never reinforces a hit merely for
-being returned.
+The result is `{"hits": [...]}`. Each hit contains memory fields plus `score`. Routed aggregate and
+atomic query keys use dense retrieval; the focused text atom also supplies lexical candidates.
+Both routes collapse to parent memories. Relative temporal expressions resolve against
+`reference_at`; when omitted, a valid English declaration such as `Today is May 2, 2024` replaces
+current UTC, while an explicit value always wins. Search is conservatively marked non-read-only
+because it may drain durable index work or populate transcript caches; it never reinforces a hit
+merely for being returned.
 
 ### `ask_memory`
 
@@ -164,10 +166,11 @@ Tool failures expose the same JSON envelope the REST adapter returns, in the MCP
 }
 ```
 
-Stable codes are `validation_error`, `memory_not_found`, `speaker_not_found`, `model_error`,
-`model_output_truncated`, `storage_error`, `index_unavailable`, `mindbridge_error`, and
-`internal_error`. `model_output_truncated` is the deterministic subset of `model_error`: generation
-stopped at an output token limit, so the same request fails the same way again.
+Stable codes are `validation_error`, `memory_not_found`, `speaker_not_found`,
+`identity_not_found`, `model_error`, `model_output_truncated`, `storage_error`,
+`index_unavailable`, `mindbridge_error`, and `internal_error`. `model_output_truncated` is the
+deterministic subset of `model_error`: generation stopped at an output token limit, so the same
+request fails the same way again.
 
 `reason`, `stage`, `subject`, `retryable`, and `issues` carry the same meanings and the same closed
 vocabularies as [the REST error contract](rest.md#codes-and-reasons); `retryable` is a lookup on
@@ -226,7 +229,9 @@ The five current tools do not yet cover the complete SDK capability inventory:
 | `add_many` | absent | `POST /v1/memories/batch` | Implementation gap |
 | `list` | absent | `GET /v1/memories` | Implementation gap; **MCP therefore cannot paginate the store** |
 | `speech` | absent | absent | Not implemented on any transport yet |
+| `faces` | absent | absent | Python-only visual identity analysis |
 | `register_speaker` | absent | absent | Not implemented on any transport yet |
+| `register_identity` | absent | absent | Python-only face/voice identity naming |
 | `reinforce` | absent | absent | Not implemented on any transport yet |
 | `reindex` | absent | absent | Owner-process maintenance |
 | `optimize` | absent | absent | Owner-process maintenance |

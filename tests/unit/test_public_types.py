@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from mindbridge import IndexQuantization
 from mindbridge.exceptions import (
     RETRYABLE_REASONS,
     IndexUnavailableError,
@@ -30,6 +31,15 @@ from mindbridge.types import (
 )
 
 NOW = datetime(2026, 8, 27, tzinfo=timezone.utc)
+
+
+def test_index_quantization_is_a_stable_string_enum() -> None:
+    assert tuple(mode.value for mode in IndexQuantization) == (
+        "none",
+        "fp16",
+        "int8",
+        "rabitq",
+    )
 
 
 def test_memory_record_metadata_is_detached_and_serializable() -> None:

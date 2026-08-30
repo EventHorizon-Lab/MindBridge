@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import NoReturn, cast
+from threading import Barrier, Event
+from typing import Any, NoReturn, cast
 
 import pytest
 
@@ -16,7 +18,9 @@ from mindbridge.infrastructure.local.zvec_index import (
     ZvecIndex,
     ZvecUnavailableError,
     ZvecWriteError,
+    _CollectionGate,
 )
+from mindbridge.types import IndexQuantization
 
 _NOW = datetime(2026, 8, 27, tzinfo=timezone.utc)
 
@@ -35,6 +39,15 @@ def test_missing_zvec_has_an_actionable_error(
 
     with pytest.raises(ZvecUnavailableError, match=r"Zvec 0.7.*64-bit zvec wheel"):
         ZvecIndex(tmp_path / "index", dimension=2)
+
+
+def test_rabitq_rejects_unsupported_dimensions_before_open(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="between 64 and 4095"):
+        ZvecIndex(
+            tmp_path / "index",
+            dimension=2,
+            quantization=IndexQuantization.RABITQ,
+        )
 
 
 def test_every_batch_status_is_checked() -> None:
@@ -67,6 +80,10 @@ def test_only_aggregate_vector_carries_full_text() -> None:
         "shared text",
         "",
     ]
+    assert [
+        cast(dict[str, object], document["fields"])["memory_id"]
+        for document in collection.documents
+    ] == ["memory_aggregate", "memory_child"]
 
 
 def test_delete_accepts_only_not_found_failures() -> None:
@@ -77,33 +94,112 @@ def test_delete_accepts_only_not_found_failures() -> None:
     index.delete(["already_deleted"])
 
 
-def test_hybrid_search_uses_a_broader_default_candidate_pool(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    dense_limits: list[int] = []
-    collection = _QueryCollection()
+def test_collection_gate_allows_readers_and_excludes_replacement() -> None:
+    gate = _CollectionGate()
+    readers = Barrier(2)
+
+    def read() -> None:
+        with gate.read():
+            readers.wait(timeout=2)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        tuple(executor.map(lambda _index: read(), range(2)))
+
+    waiting = Event()
+    entered = Event()
+
+    def write() -> None:
+        waiting.set()
+        with gate.write():
+            entered.set()
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        with gate.read():
+            future = executor.submit(write)
+            assert waiting.wait(timeout=2)
+            assert not entered.wait(timeout=0.05)
+        future.result(timeout=2)
+    assert entered.is_set()
+
+
+def test_lexical_search_preserves_relative_bm25_score_and_all_filters() -> None:
+    collection = _LexicalCollection(
+        [
+            _QueryDocument("first", 0.8),
+            _QueryDocument("second", 0.4),
+        ]
+    )
     index = object.__new__(ZvecIndex)
-    index._zvec = _HybridZvec
+    index._zvec = _QueryZvec
     index._collection = collection
-    index.rrf_rank_constant = 60
+    index._gate = _CollectionGate()
 
-    def dense_query(
-        _values: Sequence[float],
-        *,
-        limit: int,
-        **_options: object,
-    ) -> list[object]:
-        dense_limits.append(limit)
-        return []
+    hits = index.lexical_search(
+        "project review",
+        limit=2,
+        space_id="workspace",
+        task="document",
+        memory_type="episodic",
+        occurred_from=datetime(1970, 1, 1, 0, 0, 1, tzinfo=timezone.utc),
+        occurred_until=datetime(1970, 1, 1, 0, 0, 2, tzinfo=timezone.utc),
+    )
 
-    monkeypatch.setattr(index, "_dense_query", dense_query)
+    assert tuple(hit.id for hit in hits) == ("first", "second")
+    assert tuple(hit.relevance for hit in hits) == (1.0, 0.5)
+    assert all(hit.confidence == 0.0 for hit in hits)
+    assert all(hit.lexical_match for hit in hits)
+    assert collection.options == {
+        "queries": {
+            "field_name": "content",
+            "fts": {"match_string": "project review"},
+        },
+        "topk": 2,
+        "filter": (
+            "space_id = 'workspace' AND task = 'document' AND "
+            "memory_type = 'episodic' AND occurred_end > 1000000 AND "
+            "occurred_at < 2000000"
+        ),
+        "include_vector": False,
+        "output_fields": [],
+    }
 
-    assert index.hybrid_search("shared result", (1.0, 0.0), limit=10) == ()
-    assert dense_limits == [50]
+
+def test_group_by_falls_back_until_it_has_distinct_parent_memories() -> None:
+    parent = _QueryDocument("parent_best", 0.0, memory_id="parent")
+    collection = _GroupedCollection(
+        groups=(_Group("parent", (parent,)),),
+        documents=(
+            parent,
+            _QueryDocument("parent_child", 0.01, memory_id="parent"),
+            _QueryDocument("neighbor", 0.5, memory_id="neighbor"),
+        ),
+    )
+    index = object.__new__(ZvecIndex)
+    index.dimension = 2
+    index.ef_search = 300
+    index.quantization = IndexQuantization.NONE
+    index._zvec = _DenseZvec
+    index._collection = collection
+
+    docs = index._dense_query(
+        (1.0, 0.0),
+        limit=2,
+        space_id=None,
+        task=None,
+        memory_type=None,
+        occurred_from=None,
+        occurred_until=None,
+        ef=None,
+        exact=False,
+    )
+
+    assert [cast(Any, doc).id for doc in docs] == ["parent_best", "neighbor"]
+    assert collection.group_counts == [4]
     assert collection.topks == [50]
+    assert collection.output_fields == [["memory_id"]]
 
 
-def test_create_search_hybrid_flush_close_and_reopen(tmp_path: Path) -> None:
+def test_create_search_flush_close_and_reopen(tmp_path: Path) -> None:
     _require_zvec()
     path = tmp_path / "index"
     documents = [
@@ -134,17 +230,14 @@ def test_create_search_hybrid_flush_close_and_reopen(tmp_path: Path) -> None:
     assert dense[0].relevance == pytest.approx(1.0)
     assert dense[1].relevance == pytest.approx(0.5)
 
-    hybrid = index.hybrid_search(
+    lexical = index.lexical_search(
         "machine learning",
-        (1.0, 0.0),
         limit=2,
         space_id="default-space",
         task="document",
-        exact=True,
     )
-    assert hybrid[0].id == "embedding_one"
-    assert hybrid[0].relevance == pytest.approx(1.0)
-    assert all(0.0 <= hit.relevance <= 1.0 for hit in hybrid)
+    assert lexical[0].id == "embedding_one"
+    assert lexical[0].relevance == pytest.approx(1.0)
 
     index.optimize()
     assert index.index_completeness == pytest.approx(1.0)
@@ -167,7 +260,81 @@ def test_dense_index_accepts_media_only_document_without_text(tmp_path: Path) ->
         assert index.search((1.0, 0.0), exact=True)[0].id == "embedding_media"
 
 
-def test_type_and_event_time_filters_apply_to_dense_and_hybrid_search(tmp_path: Path) -> None:
+def test_dense_search_returns_one_embedding_per_parent_memory(tmp_path: Path) -> None:
+    _require_zvec()
+    with ZvecIndex(tmp_path / "index", dimension=2) as index:
+        index.upsert(
+            [
+                _document("parent_best", "parent", (1.0, 0.0), memory_id="parent"),
+                _document(
+                    "parent_child",
+                    "parent",
+                    (0.99, 0.01),
+                    memory_id="parent",
+                    object_part=1,
+                ),
+                _document("neighbor", "neighbor", (0.0, 1.0), memory_id="neighbor"),
+            ]
+        )
+
+        hits = index.search((1.0, 0.0), limit=2, exact=True)
+
+    assert tuple(hit.id for hit in hits) == ("parent_best", "neighbor")
+
+
+@pytest.mark.parametrize("quantization", tuple(IndexQuantization))
+def test_quantized_vector_indexes_query_and_reopen(
+    tmp_path: Path,
+    quantization: IndexQuantization,
+) -> None:
+    _require_zvec()
+    dimension = 64
+    path = tmp_path / quantization.value
+    documents = [
+        _document(
+            f"embedding_{row}",
+            "target" if row == 0 else f"document {row}",
+            tuple(1.0 if column == row % dimension else 0.0 for column in range(dimension)),
+        )
+        for row in range(64)
+    ]
+    with ZvecIndex(path, dimension=dimension, quantization=quantization) as index:
+        index.upsert(documents)
+        index.optimize()
+        index.flush()
+        assert index.search(documents[0].embedding.values, limit=1)[0].id == "embedding_0"
+
+    with ZvecIndex(path, dimension=dimension, quantization=quantization) as reopened:
+        assert reopened.search(documents[0].embedding.values, limit=1)[0].id == "embedding_0"
+
+
+def test_full_text_search_stems_folds_accents_and_routes_chinese(tmp_path: Path) -> None:
+    _require_zvec()
+    with ZvecIndex(tmp_path / "index", dimension=2) as index:
+        index.upsert(
+            [
+                _document("english", "Runners visited cafés", (1.0, 0.0)),
+                _document("chinese", "今天在上海进行项目复盘", (0.0, 1.0)),
+            ]
+        )
+
+        assert index.lexical_search("run cafe", limit=2)[0].id == "english"
+        assert index.lexical_search("项目复盘", limit=2)[0].id == "chinese"
+
+
+def test_schema_optimizes_time_ranges_and_automatic_maintenance(tmp_path: Path) -> None:
+    _require_zvec()
+    with ZvecIndex(tmp_path / "index", dimension=2) as index:
+        fields = {field.name: field for field in cast(Any, index._schema).fields}
+        assert fields["occurred_at"].index_param.enable_range_optimization
+        assert fields["occurred_end"].index_param.enable_range_optimization
+
+        index.upsert([_document("embedding", "content", (1.0, 0.0))])
+        assert index.optimize_if_needed(minimum_unindexed=1) is True
+        assert index.optimize_if_needed(minimum_unindexed=1) is False
+
+
+def test_type_and_event_time_filters_apply_to_every_search_mode(tmp_path: Path) -> None:
     _require_zvec()
     start = datetime(2026, 8, 17, tzinfo=timezone.utc)
     until = datetime(2026, 8, 24, tzinfo=timezone.utc)
@@ -210,17 +377,15 @@ def test_type_and_event_time_filters_apply_to_dense_and_hybrid_search(tmp_path: 
             occurred_until=until,
             exact=True,
         )
-        hybrid = index.hybrid_search(
+        lexical = index.lexical_search(
             "project review",
-            (1.0, 0.0),
             memory_type="episodic",
             occurred_from=start,
             occurred_until=until,
-            exact=True,
         )
 
     assert {hit.id for hit in dense} == {"episodic_match", "episodic_overlap"}
-    assert {hit.id for hit in hybrid} == {"episodic_match", "episodic_overlap"}
+    assert {hit.id for hit in lexical} == {"episodic_match", "episodic_overlap"}
 
 
 def test_open_rejects_an_incompatible_schema(tmp_path: Path) -> None:
@@ -265,11 +430,12 @@ def _document(
     occurred_at: datetime | None = None,
     occurred_end: datetime | None = None,
     object_part: int = 0,
+    memory_id: str | None = None,
 ) -> IndexDocument:
     return IndexDocument(
         embedding=StoredEmbedding(
             embedding_id=embedding_id,
-            memory_id=f"memory_{embedding_id}",
+            memory_id=memory_id or f"memory_{embedding_id}",
             values=values,
             model_id="test-model",
             space_id=space_id,
@@ -340,24 +506,67 @@ class _DeletingCollection:
         return [_Status(_StatusCode.NOT_FOUND)]
 
 
-class _QueryCollection:
-    def __init__(self) -> None:
+class _QueryDocument:
+    def __init__(
+        self,
+        document_id: str,
+        score: float,
+        *,
+        memory_id: str | None = None,
+    ) -> None:
+        self.id = document_id
+        self.score = score
+        self._memory_id = memory_id
+
+    def field(self, name: str) -> str | None:
+        assert name == "memory_id"
+        return self._memory_id
+
+
+class _Group:
+    def __init__(self, value: str, docs: tuple[_QueryDocument, ...]) -> None:
+        self.group_by_value = value
+        self.docs = docs
+
+
+class _GroupedCollection:
+    def __init__(
+        self,
+        *,
+        groups: tuple[_Group, ...],
+        documents: tuple[_QueryDocument, ...],
+    ) -> None:
+        self.groups = groups
+        self.documents = documents
+        self.group_counts: list[int] = []
         self.topks: list[int] = []
+        self.output_fields: list[list[str]] = []
 
-    def query(self, **options: object) -> list[object]:
+    def group_by_query(self, **options: object) -> tuple[_Group, ...]:
+        self.group_counts.append(cast(int, options["group_count"]))
+        return self.groups
+
+    def query(self, **options: object) -> list[_QueryDocument]:
         self.topks.append(cast(int, options["topk"]))
-        return []
+        self.output_fields.append(cast(list[str], options["output_fields"]))
+        return list(self.documents)
 
 
-class _HybridZvec:
+class _LexicalCollection:
+    def __init__(self, documents: list[_QueryDocument]) -> None:
+        self.documents = documents
+        self.options: dict[str, object] = {}
+
+    def query(self, **options: object) -> list[_QueryDocument]:
+        self.options = options
+        return self.documents
+
+
+class _QueryZvec:
     Query = dict
     Fts = dict
 
-    class RrfReRanker:
-        def __init__(self, *, rank_constant: int) -> None:
-            assert rank_constant == 60
 
-        @staticmethod
-        def rerank(_rankings: object, *, topn: int) -> list[object]:
-            assert topn == 10
-            return []
+class _DenseZvec:
+    Query = dict
+    HnswQueryParam = dict

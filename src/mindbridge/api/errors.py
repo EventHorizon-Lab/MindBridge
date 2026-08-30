@@ -14,6 +14,7 @@ from pydantic import BaseModel
 from starlette.exceptions import HTTPException
 
 from mindbridge.exceptions import (
+    IdentityNotFoundError,
     IndexUnavailableError,
     MemoryNotFoundError,
     MindBridgeError,
@@ -154,6 +155,8 @@ def _public_error(error: MindBridgeError) -> tuple[int, str]:
         return status.HTTP_404_NOT_FOUND, str(error) or "memory does not exist"
     if isinstance(error, SpeakerNotFoundError):
         return status.HTTP_404_NOT_FOUND, str(error) or "speaker does not exist"
+    if isinstance(error, IdentityNotFoundError):
+        return status.HTTP_404_NOT_FOUND, str(error) or "identity does not exist"
     if isinstance(error, ModelError):
         return _model_status(error), str(error) or "model operation failed"
     if isinstance(error, IndexUnavailableError):

@@ -51,7 +51,7 @@ already owns with `--url`. See [command-line usage](api/cli.md).
 MindBridge owns:
 
 - Canonical content and memory types.
-- Stable IDs, event time, metadata, and local speaker identity.
+- Stable IDs, event time, metadata, and local face-and-voice identity.
 - Capability-aware embedding, transcription fallback, retrieval, and grounding.
 - SQLite/CAS durability and the SQLite-to-Zvec outbox.
 - Validation and sanitization at Python, REST, and MCP boundaries.
@@ -74,10 +74,11 @@ Content ──> EmbeddingBackend ──> retrieval vector
 Question + hits ──> GenerationBackend ──> grounded answer
 Audio/video ──> TranscriptionBackend ──> fallback text
 Audio/video ──> SpeechBackend ──> timed turns + speakers
+Image/video ──> FaceBackend ──> bounded face observations
 ```
 
 One adapter may implement several contracts. `OpenAIModels` does so with caller-owned official SDK
-clients. Local embedding and speech can be composed independently.
+clients. Local embedding, speech, and face analysis can be composed independently.
 
 No registry or factory is needed: ordinary Python construction is the provider selection
 mechanism.
@@ -103,18 +104,22 @@ outbox and is replayed when the owner recovers. Zvec never becomes authoritative
 
 ## Read consistency
 
-MindBridge embeds a query, asks Zvec for candidates, hydrates those IDs from one SQLite snapshot,
-drops stale IDs, and reranks the surviving records. A missing index is rebuilt from stored FP32
-embeddings without re-embedding content.
+MindBridge embeds bounded aggregate and atomic query keys in one batch, removes duplicate vectors,
+and asks Zvec for independent dense and lexical candidates concurrently. Every dense route groups
+by parent memory inside Zvec, with a bounded ordinary-query fallback when best-effort grouping is
+incomplete. SQLite then hydrates those IDs, drops stale IDs, and collapses the remaining derived
+keys before reranking. A missing index is rebuilt from stored FP32 embeddings without re-embedding
+content.
 
 ## Isolation and concurrency
 
 One physical directory is one memory domain and one live owner. There are no account, tenant,
 request, or benchmark scope identifiers in the product API. Metadata is application data.
 
-Provider work and independent SQLite record commits may overlap across calls. Outbox replay and
-Zvec access are short serialized critical sections. `close()` waits for active operations before
-closing adapters and storage.
+Provider work, independent SQLite record commits, and Zvec queries may overlap across calls. Outbox
+replay and final hydration/asset leasing are short serialized critical sections; collection
+replacement is exclusive. `close()` waits for active operations before closing adapters and
+storage.
 
 `AsyncMemory` uses threads around this synchronous embedded core. Provider-specific async APIs are
 not normalized by MindBridge; a custom adapter can use the provider's native client where its

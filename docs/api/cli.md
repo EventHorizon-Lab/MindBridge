@@ -154,7 +154,9 @@ kebab-cased. Nothing is renamed, grouped, or invented.
 | `ask` | `mindbridge ask [QUESTION ...]` | read, plus a lazy transcript cache |
 | `get` | `mindbridge get MEMORY_ID` | read |
 | `speech` | `mindbridge speech MEMORY_ID` | read, plus a transcript cache |
+| `faces` | `mindbridge faces MEMORY_ID` | read, plus a face-analysis cache |
 | `register_speaker` | `mindbridge register-speaker SPEAKER_ID NAME` | write |
+| `register_identity` | `mindbridge register-identity IDENTITY_ID NAME` | write |
 | `reinforce` | `mindbridge reinforce MEMORY_ID ...` | write |
 | `list` | `mindbridge list` | read |
 | `delete` | `mindbridge delete MEMORY_ID` | destructive, idempotent |
@@ -242,15 +244,19 @@ field vocabulary covers three surfaces:
 | `list` | `{"items": [MemoryResponse, ...], "next_cursor": str \| null}` |
 | `delete` | `{"deleted": bool}` |
 | `speech` | `{"segments": [SpeakerSegment, ...]}` |
+| `faces` | `{"observations": [FaceObservation, ...]}` |
 | `reinforce` | `{"reinforced": int}` |
 | `reindex` | `{"memories": int}` |
-| `register-speaker`, `optimize` | `{}` |
+| `register-speaker`, `register-identity`, `optimize` | `{}` |
 | `doctor`, `--explain` | the composition document below |
 
 `SpeakerSegment` has no REST or MCP precedent, because `speech` has no route and no tool. Its fields
 are the public [`SpeakerSegment`](python-sdk.md) dataclass: `asset_id`, `start_ms`, `end_ms`, `text`,
 `speaker_id`, `speaker_name`, `identity_score`. When `speech` gains a route, the route must adopt
 this shape rather than inventing a second one.
+
+`FaceObservation` likewise follows the public dataclass fields: `asset_id`, `observed_at_ms`,
+normalized `bounding_box`, `identity_id`, `identity_name`, and `identity_score`.
 
 Every run echoes the resolved composition to stderr before executing, so a log records which model
 identity produced which write. `-q` suppresses it.
@@ -282,6 +288,7 @@ Stable, one per error code, so an agent can branch on `$?` without parsing anyth
 | 9 | `storage_error` + `data_dir_in_use` | Another process owns `--data-dir`; **retry with `--url`** | yes |
 | 10 | `configuration_error` | No composition, unknown recipe, missing extra, an option the chosen composition does not own, or an operation with no `/v1` route in `--url` mode | no |
 | 11 | `model_output_truncated` | Generation stopped at an output token limit | no |
+| 12 | `identity_not_found` | Face/voice identity does not exist | no |
 | 130 | — | Interrupted | — |
 
 Exit `9` is the one status selected by `reason` rather than `code`, because it is the CLI's single
@@ -363,15 +370,17 @@ The existing store-metadata guard already fails the first real operation with a 
 
 ### Operations without a remote route
 
-`--url` covers `add`, `add-many`, `search`, `ask`, `get`, `list`, and `delete`. The other five exit
+`--url` covers `add`, `add-many`, `search`, `ask`, `get`, `list`, and `delete`. The other seven exit
 `10` with `unsupported_in_remote_mode` and name the surfaces that do support them. That mirrors the
-[REST gap](rest.md#operations-without-a-route) honestly rather than hiding it: `speech`,
-`register-speaker`, and `reinforce` are implementation gaps, and `reindex` and `optimize` are
+[REST gap](rest.md#operations-without-a-route) honestly rather than hiding it: `speech`, `faces`,
+identity registration, and `reinforce` are implementation gaps, and `reindex` and `optimize` are
 owner-process maintenance that must not be reachable by an unauthenticated client.
 
 ### Backends without a recipe
 
-`SentenceTransformersEmbedder` has no named recipe. Its contract requires an explicit 40-character
+`SentenceTransformersEmbedder` and `OpenCVFaceAnalyzer` have no named recipes. Their contracts
+require explicit model identities and, for OpenCV, explicit YuNet and SFace weight paths.
+`SentenceTransformersEmbedder` requires an explicit 40-character
 commit hash, and the choice of model is the application's; a recipe would have to pin one on the
 caller's behalf. Use `--app`, or the two-line composition in
 [Choosing an embedding backend](../quickstart.md#choose-an-embedding-backend).

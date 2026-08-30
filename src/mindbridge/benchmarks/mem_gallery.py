@@ -17,7 +17,7 @@ from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validato
 
 from mindbridge.benchmarks._contracts import ContractModel, Identifier, NonEmptyString
 
-MEM_GALLERY_ADAPTER_VERSION = "mem_gallery_official_v1"
+MEM_GALLERY_ADAPTER_VERSION = "mem_gallery_official_v2"
 
 MemGalleryPoint = Literal["FR", "MR", "TR", "VR", "TTL", "VS", "CD", "KR", "AR"]
 _POINTS: frozenset[str] = frozenset(("FR", "MR", "TR", "VR", "TTL", "VS", "CD", "KR", "AR"))
