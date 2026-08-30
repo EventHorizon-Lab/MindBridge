@@ -107,7 +107,7 @@ from mindbridge.models.jina import (
 )
 from mindbridge.models.openai_sdk import _model_usage, _record_usage_batch
 
-EVAL_SCHEMA_VERSION = 6
+EVAL_SCHEMA_VERSION = 7
 EVAL_RUNNER_VERSION = "mindbridge_eval_official_v6"
 DEFAULT_BOOTSTRAP_SAMPLES = 2_000
 _RESULTS_FILE = "results.json"
@@ -279,6 +279,7 @@ class _AnswerOutcome:
     memory_ids: tuple[str, ...]
     evidence: tuple[EvidenceInterval, ...]
     cached: bool = False
+    error: BaseException | None = None
 
 
 class _BorrowedBackend:
@@ -335,6 +336,7 @@ class _BackendPool:
         batch_size: int,
         needs_speech: bool,
         seed: int,
+        gen_kwargs: str = "",
         tracer: Tracer | None = None,
     ) -> None:
         self.config = config
@@ -347,12 +349,30 @@ class _BackendPool:
             base_url=config.generation_base_url,
             timeout=config.timeout_seconds,
         )
+        generation_options = dict(
+            item.split("=", 1) for item in gen_kwargs.split(",") if "=" in item
+        )
+        enable_thinking = generation_options.get("enable_thinking")
         self.models = OpenAIModels(
             generation_client=self.client,
             generation_model=config.generation_model,
             generation_capabilities=config.generation_capabilities,
             generation_seed=seed,
             generation_temperature=0.0,
+            generation_max_tokens=(
+                None
+                if "max_tokens" not in generation_options
+                else int(generation_options["max_tokens"])
+            ),
+            generation_extra_body=(
+                None
+                if enable_thinking is None
+                else {
+                    "chat_template_kwargs": {
+                        "enable_thinking": enable_thinking == "true",
+                    }
+                }
+            ),
         )
         self.embedder = JinaOmniEmbedder(device=device, batch_size=batch_size)
         self.transcriber = FunASRTranscriber(device=device or "auto") if needs_speech else None
@@ -530,6 +550,7 @@ def _execute(
                     batch_size=max(batch_sizes.values()),
                     needs_speech=needs_speech,
                     seed=arguments.seed,
+                    gen_kwargs=arguments.gen_kwargs,
                     tracer=telemetry.tracer,
                 )
                 memory_factory = pool.memory
@@ -633,6 +654,7 @@ async def run_loaded_task(
         raise ValueError("recall limit must not exceed 100")
     slots: list[tuple[SampleResult, ...] | None] = [None] * len(task.units)
     queue: asyncio.Queue[tuple[int, EvalUnit]] = asyncio.Queue()
+    request_semaphore = asyncio.Semaphore(request_concurrency)
     for index, unit in enumerate(task.units):
         queue.put_nowait((index, unit))
 
@@ -650,6 +672,7 @@ async def run_loaded_task(
                 memory_factory=memory_factory,
                 batch_size=batch_size,
                 request_concurrency=request_concurrency,
+                request_semaphore=request_semaphore,
                 recall_limit=recall_limit,
                 predict_only=predict_only,
                 log_samples=log_samples,
@@ -672,6 +695,7 @@ async def _run_unit(
     memory_factory: MemoryFactory,
     batch_size: int,
     request_concurrency: int,
+    request_semaphore: asyncio.Semaphore,
     recall_limit: int,
     predict_only: bool,
     log_samples: bool,
@@ -709,21 +733,30 @@ async def _run_unit(
                     memory, memories[pending:end], batch_size=batch_size
                 )
                 pending = end
-                answered = await _answer_many(
-                    memory,
-                    questions_by_cutoff[cutoff],
-                    request_concurrency=request_concurrency,
-                    recall_limit=recall_limit,
-                )
-                for question, outcome in zip(questions_by_cutoff[cutoff], answered, strict=True):
+
+                def cache_completed(
+                    question: EvalQuestion,
+                    outcome: _AnswerOutcome,
+                    failure_count: int = ingest_failures,
+                ) -> None:
                     _cache_outcome(
                         response_cache,
                         task,
                         unit,
                         question,
                         outcome,
-                        ingest_failures,
+                        failure_count,
                     )
+
+                answered = await _answer_many(
+                    memory,
+                    questions_by_cutoff[cutoff],
+                    request_concurrency=request_concurrency,
+                    request_semaphore=request_semaphore,
+                    recall_limit=recall_limit,
+                    on_answer=cache_completed,
+                )
+                for question, outcome in zip(questions_by_cutoff[cutoff], answered, strict=True):
                     results[question.question_id] = _sample(
                         task,
                         unit,
@@ -875,25 +908,47 @@ async def _answer_many(
     questions: Sequence[EvalQuestion],
     *,
     request_concurrency: int,
+    request_semaphore: asyncio.Semaphore | None = None,
     recall_limit: int,
+    on_answer: Callable[[EvalQuestion, _AnswerOutcome], None] | None = None,
 ) -> tuple[_AnswerOutcome | BaseException, ...]:
-    semaphore = asyncio.Semaphore(request_concurrency)
+    semaphore = request_semaphore or asyncio.Semaphore(request_concurrency)
 
     async def answer(question: EvalQuestion) -> _AnswerOutcome:
         started = time.perf_counter()
         async with semaphore:
-            result = await memory.ask(
-                _content(question.content),
-                limit=recall_limit,
-                reference_at=question.reference_at,
-            )
-        return _AnswerOutcome(
-            result.answer,
-            (time.perf_counter() - started) * 1_000,
-            max((hit.score for hit in result.hits), default=0.0),
-            tuple(hit.id for hit in result.hits),
-            tuple(_evidence(hit) for hit in result.hits),
-        )
+            content = _content(question.content)
+            try:
+                result = await memory.ask(
+                    content,
+                    limit=recall_limit,
+                    reference_at=question.reference_at,
+                )
+            except Exception as error:
+                hits = await memory.search(
+                    content,
+                    limit=recall_limit,
+                    reference_at=question.reference_at,
+                )
+                outcome = _AnswerOutcome(
+                    "",
+                    (time.perf_counter() - started) * 1_000,
+                    max((hit.score for hit in hits), default=0.0),
+                    tuple(hit.id for hit in hits),
+                    tuple(_evidence(hit) for hit in hits),
+                    error=error,
+                )
+            else:
+                outcome = _AnswerOutcome(
+                    result.answer,
+                    (time.perf_counter() - started) * 1_000,
+                    max((hit.score for hit in result.hits), default=0.0),
+                    tuple(hit.id for hit in result.hits),
+                    tuple(_evidence(hit) for hit in result.hits),
+                )
+        if on_answer is not None:
+            on_answer(question, outcome)
+        return outcome
 
     return tuple(
         await asyncio.gather(*(answer(question) for question in questions), return_exceptions=True)
@@ -912,6 +967,7 @@ def _sample(
 ) -> SampleResult:
     memory_ids: tuple[str, ...]
     evidence: tuple[EvidenceInterval, ...]
+    error_code: str | None
     if isinstance(outcome, BaseException):
         prediction, latency_ms, confidence, memory_ids, evidence, cached = (
             "",
@@ -929,7 +985,7 @@ def _sample(
         memory_ids = outcome.memory_ids
         evidence = outcome.evidence
         cached = outcome.cached
-        error_code = None
+        error_code = None if outcome.error is None else _error_code(outcome.error)
     choices = tuple(
         str(value) for value in cast(Sequence[object], question.metadata.get("choices", ()))
     )
@@ -2248,7 +2304,12 @@ def _build_parser(prog: str | None) -> argparse.ArgumentParser:
     )
     parser.add_argument("--offset", type=_nonnegative_int, default=0)
     parser.add_argument("--num-fewshot", "--num_fewshot", type=_nonnegative_int, default=0)
-    parser.add_argument("--gen-kwargs", "--gen_kwargs", default="")
+    parser.add_argument(
+        "--gen-kwargs",
+        "--gen_kwargs",
+        default="",
+        help="deterministic generation settings; supports max_tokens and enable_thinking",
+    )
     parser.add_argument("--batch-size", "--batch_size", "-b", default="auto")
     parser.add_argument("--max-batch-size", "--max_batch_size", type=_positive_int, default=64)
     parser.add_argument("--unit-concurrency", type=_positive_int, default=1)
@@ -2643,17 +2704,26 @@ def _seed_values(value: str) -> tuple[int, int, int, int]:
     return cast(tuple[int, int, int, int], seeds)
 
 
-def _generation_kwargs(value: str, seed: int) -> str:
+def _generation_kwargs(  # noqa: C901 - ordered trust-boundary validation is linear
+    value: str, seed: int
+) -> str:
     supplied: dict[str, str] = {}
     for item in (part.strip() for part in value.split(",") if part.strip()):
         key, separator, raw = item.partition("=")
         if not separator or not key.strip() or not raw.strip() or key.strip() in supplied:
             raise ValueError(f"invalid --gen_kwargs item: {item}")
         supplied[key.strip()] = raw.strip()
-    unsupported = set(supplied) - {"temperature", "do_sample", "seed"}
+    unsupported = set(supplied) - {
+        "temperature",
+        "do_sample",
+        "seed",
+        "max_tokens",
+        "enable_thinking",
+    }
     if unsupported:
         raise ValueError(
-            "MindBridge eval supports deterministic --gen_kwargs only: temperature, do_sample, seed"
+            "MindBridge eval supports deterministic --gen_kwargs only: temperature, do_sample, "
+            "seed, max_tokens, enable_thinking"
         )
     if "temperature" in supplied and float(supplied["temperature"]) != 0:
         raise ValueError("reproducible evaluation requires temperature=0")
@@ -2661,7 +2731,27 @@ def _generation_kwargs(value: str, seed: int) -> str:
         raise ValueError("reproducible evaluation requires do_sample=false")
     if "seed" in supplied and int(supplied["seed"]) != seed:
         raise ValueError("--gen_kwargs seed must match the first --seed value")
-    return f"temperature=0,do_sample=false,seed={seed}"
+    if "max_tokens" in supplied:
+        try:
+            max_tokens = int(supplied["max_tokens"])
+        except ValueError:
+            raise ValueError("--gen_kwargs max_tokens must be a positive integer") from None
+        if max_tokens <= 0:
+            raise ValueError("--gen_kwargs max_tokens must be a positive integer")
+    if "enable_thinking" in supplied and supplied["enable_thinking"].casefold() not in {
+        "true",
+        "false",
+        "1",
+        "0",
+    }:
+        raise ValueError("--gen_kwargs enable_thinking must be true or false")
+    normalized = ["temperature=0", "do_sample=false", f"seed={seed}"]
+    if "max_tokens" in supplied:
+        normalized.append(f"max_tokens={max_tokens}")
+    if "enable_thinking" in supplied:
+        enabled = supplied["enable_thinking"].casefold() in {"true", "1"}
+        normalized.append(f"enable_thinking={'true' if enabled else 'false'}")
+    return ",".join(normalized)
 
 
 def _positive_int(value: str) -> int:

@@ -12,6 +12,7 @@ import os
 import re
 import shutil
 import unicodedata
+from collections import Counter
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import AbstractContextManager, contextmanager, suppress
@@ -112,8 +113,16 @@ _DEFAULT_AMBIGUITY_MARGIN = 0.01
 _LEXICAL_MATCH_CONFIDENCE = 0.6
 _DECAY_REINFORCEMENT_LIMIT = 20
 _CONFIRMATION_WEIGHT = 0.05
+_MAX_LEXICAL_RERANK_BONUS = 0.01
+_NEGATION_WEIGHT = 6.0
 _NO_TRANSCRIPTION_SPACE = "none:asr-v1"
 _ISO_DATE = re.compile(r"(?<!\d)(\d{4}-\d{2}-\d{2})(?!\d)")
+_LEXICAL_TERM = re.compile(r"\w+")
+_CJK_CHARACTER = re.compile(r"[\u3400-\u9fff]")
+_NEGATION_TERMS = frozenset(
+    {"no", "not", "never", "neither", "nor", "without", "不", "没", "未", "无", "非", "别"}
+)
+_NEGATED_CONTRACTION = re.compile(r"n['\u2019]t\b", re.IGNORECASE)
 _MAX_CONTENT_PARTS = 128
 _MAX_TEXT_CHARACTERS = 65_536
 _MAX_METADATA_BYTES = 262_144
@@ -873,6 +882,14 @@ class Memory:
             stored_memories: tuple[StoredMemory, ...] = ()
             stored_embeddings: tuple[StoredEmbedding, ...] = ()
             if missing:
+                if speech_indexed:
+                    self._recognize_speech(
+                        self._answer_speech_assets(
+                            tuple(asset for memory in missing for asset in memory.content.assets)
+                        ),
+                        operation,
+                        reversible=True,
+                    )
                 if Modality.AUDIO not in self._embedding_capabilities:
                     for memory in missing:
                         _fallback_unsupported(
@@ -1172,12 +1189,18 @@ class Memory:
                     memories = tuple(
                         memory for memory in memories if memory.memory_type == memory_type.value
                     )
+                lexical_relevance = _lexical_relevance(model_input.text, memories)
                 ranked = [
                     (
                         memory,
                         _ranked_relevance(
                             memory,
-                            relevance[memory.memory_id],
+                            min(
+                                1.0,
+                                relevance[memory.memory_id]
+                                + lexical_relevance.get(memory.memory_id, 0.0)
+                                * _MAX_LEXICAL_RERANK_BONUS,
+                            ),
                             reference_at=reference_at,
                             temporal_range=temporal_range,
                             decay_half_life=self._decay_half_life,
@@ -2581,9 +2604,15 @@ def _ranked_relevance(
         if confirmed_at is not None and confirmed_at <= ranking_reference
         else 0
     )
-    score = relevance * (1.0 + _CONFIRMATION_WEIGHT * math.log2(1.0 + confirmations))
+    score = _bounded_scale(
+        relevance,
+        1.0 + _CONFIRMATION_WEIGHT * math.log2(1.0 + confirmations),
+    )
     if temporal_range is not None:
-        score *= _temporal_factor(memory.occurred_at, memory.occurred_end, temporal_range)
+        score = _bounded_scale(
+            score,
+            _temporal_factor(memory.occurred_at, memory.occurred_end, temporal_range),
+        )
     if decay_half_life is not None:
         decay_reference = ranking_reference
         accessed_at = memory.last_accessed_at
@@ -2595,8 +2624,47 @@ def _ranked_relevance(
         age = max(0.0, (decay_reference - anchor).total_seconds())
         strength = 1.0 + math.log2(1.0 + min(access_count, _DECAY_REINFORCEMENT_LIMIT))
         retention = 2.0 ** (-age / (decay_half_life.total_seconds() * strength))
-        score *= _RANK_FLOOR + (_RANK_CEILING - _RANK_FLOOR) * retention
+        score = _bounded_scale(
+            score,
+            _RANK_FLOOR + (_RANK_CEILING - _RANK_FLOOR) * retention,
+        )
     return score
+
+
+def _bounded_scale(score: float, factor: float) -> float:
+    if factor <= 1.0:
+        return score * factor
+    return score + (1.0 - score) * (factor - 1.0)
+
+
+def _lexical_relevance(
+    query: str,
+    memories: Sequence[StoredMemory],
+) -> dict[str, float]:
+    query_terms = _lexical_terms(query)
+    if not query_terms or not memories:
+        return {}
+    documents = {memory.memory_id: _lexical_terms(memory.content) for memory in memories}
+    frequencies = Counter(term for terms in documents.values() for term in query_terms & terms)
+    count = len(documents)
+    weights = {
+        term: (math.log((count + 1.0) / (frequencies[term] + 1.0)) + 1.0)
+        * (_NEGATION_WEIGHT if term in _NEGATION_TERMS else 1.0)
+        for term in query_terms
+    }
+    total = sum(weights.values())
+    return {
+        memory_id: sum(weights[term] for term in query_terms & terms) / total
+        for memory_id, terms in documents.items()
+    }
+
+
+def _lexical_terms(value: str) -> frozenset[str]:
+    normalized = unicodedata.normalize("NFKC", value).casefold()
+    terms = {*_LEXICAL_TERM.findall(normalized), *_CJK_CHARACTER.findall(normalized)}
+    if _NEGATED_CONTRACTION.search(normalized) is not None:
+        terms.add("not")
+    return frozenset(terms)
 
 
 def _temporal_factor(

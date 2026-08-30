@@ -92,7 +92,8 @@ usage.
 `mindbridge.model.request_count`, `mindbridge.token_usage.expected_request_count`, and
 `mindbridge.token_usage.reported_request_count` make missing usage visible. A failed request or a
 custom provider that omits usage therefore makes an aggregate incomplete instead of silently
-contributing zero.
+contributing zero. These count calls issued to the provider, not work items submitted, so a
+batching backend such as Sentence Transformers or FunASR reports one request for a whole batch.
 
 ## Benchmark output
 

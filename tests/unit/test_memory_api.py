@@ -666,6 +666,50 @@ def test_temporal_proximity_is_a_soft_score_not_a_hard_sort_key(tmp_path: Path) 
     assert [hit.id for hit in hits] == [adjacent.id, exact.id]
 
 
+def test_text_reranking_preserves_negation_and_bounded_scores(tmp_path: Path) -> None:
+    with _memory(tmp_path, _FakeModels()) as memory:
+        negated = memory.add(
+            "Mira did not put the obsidian key in the red drawer; it is in the green drawer."
+        )
+        contradiction = memory.add("Mira put the obsidian key in the red drawer.")
+        _FakeIndex.instances[-1].hits_override = (
+            IndexHit(
+                id=contradiction.id,
+                relevance=0.79,
+                confidence=0.9,
+                lexical_match=True,
+            ),
+            IndexHit(
+                id=negated.id,
+                relevance=0.788,
+                confidence=0.9,
+                lexical_match=True,
+            ),
+        )
+
+        hits = memory.search(
+            "Which memory says Mira did not put the obsidian key in the red drawer?",
+            limit=2,
+        )
+
+    assert [hit.id for hit in hits] == [negated.id, contradiction.id]
+    assert all(0.0 < hit.score < 1.0 for hit in hits)
+
+
+def test_text_reranking_does_not_override_strong_semantic_evidence(tmp_path: Path) -> None:
+    with _memory(tmp_path, _FakeModels()) as memory:
+        semantic = memory.add("A scarlet package reached the destination.")
+        question_echo = memory.add("Did the red parcel arrive?")
+        _FakeIndex.instances[-1].hits_override = (
+            IndexHit(id=question_echo.id, relevance=0.1, confidence=0.9, lexical_match=True),
+            IndexHit(id=semantic.id, relevance=0.9, confidence=0.95),
+        )
+
+        hits = memory.search("Did the red parcel arrive?", limit=2)
+
+    assert [hit.id for hit in hits] == [semantic.id, question_echo.id]
+
+
 def test_event_span_overlapping_query_day_is_temporally_exact(tmp_path: Path) -> None:
     with _memory(tmp_path, _FakeModels()) as memory:
         spanning = memory.add(
@@ -832,6 +876,25 @@ def test_opt_in_speech_indexing_makes_registered_names_retrievable(
             1,
             2,
         }
+
+
+def test_speech_indexing_batches_add_many_recognition(tmp_path: Path) -> None:
+    speech = _FakeSpeech()
+    with Memory(
+        tmp_path,
+        embedder=_FakeModels(),
+        transcriber=speech,
+        index_speech=True,
+    ) as memory:
+        memory.add_many(
+            (
+                Blob(b"first speech", "audio/wav", "first.wav"),
+                Blob(b"second speech", "audio/wav", "second.wav"),
+            )
+        )
+
+    assert len(speech.calls) == 1
+    assert len(speech.calls[0]) == 2
 
 
 def test_failed_speech_index_add_rolls_back_identity_state(tmp_path: Path) -> None:

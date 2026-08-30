@@ -86,6 +86,8 @@ class FunASRRecipe:
             "punc_model_revision": self.punctuation_revision,
         }
         values.update((key, value) for key, value in optional.items() if value is not None)
+        if self.punctuation_model is None:
+            values["spk_mode"] = "vad_segment"
         if self.vad_max_single_segment_ms is not None:
             values["vad_kwargs"] = {"max_single_segment_time": self.vad_max_single_segment_ms}
         if self.trust_remote_code:
@@ -139,9 +141,12 @@ class FunASRTranscriber:
 
     @property
     def transcription_space(self) -> str:
-        payload = json.dumps(
-            self._recipe.auto_model_arguments(), sort_keys=True, separators=(",", ":")
-        )
+        identity = self._recipe.auto_model_arguments()
+        if self._recipe.punctuation_model is None:
+            # This only makes FunASR's existing no-punctuation fallback explicit. Excluding it
+            # keeps stores created with the v3 recipe readable after the runtime fix.
+            identity.pop("spk_mode", None)
+        payload = json.dumps(identity, sort_keys=True, separators=(",", ":"))
         digest = hashlib.sha256(f"funasr-automodel-v3:{payload}".encode()).hexdigest()[:16]
         return f"{self.transcription_model}:speech:{digest}"
 
@@ -156,13 +161,16 @@ class FunASRTranscriber:
                 or asset.modality not in self.transcription_capabilities
             ):
                 raise ValidationError("assets must contain resolved audio or video AssetRef values")
-        mark_model_requests(len(batch), token_usage_expected=0)
+        # One batch is one AutoModel call, so the request count is calls issued, not assets sent.
+        mark_model_requests(1 if batch else 0, token_usage_expected=0)
+        if not batch:
+            return ()
         with self._lock:
             if self._closed:
                 raise ModelError("FunASR transcriber is closed")
             pipeline = self._load()
-            analyses = tuple(self._analyze_one(pipeline, asset) for asset in batch)
-        record_unmetered_model_usage(request_count=len(batch))
+            analyses, calls = self._analyze_many(pipeline, batch)
+        record_unmetered_model_usage(request_count=calls)
         return analyses
 
     def close(self) -> None:
@@ -199,40 +207,71 @@ class FunASRTranscriber:
         return self._pipeline
 
     @staticmethod
+    def _analyze_many(
+        pipeline: _Pipeline,
+        assets: Sequence[AssetRef],
+    ) -> tuple[tuple[SpeechAnalysis, ...], int]:
+        """Analyze one official batch, returning the analyses and the AutoModel calls made."""
+        paths = tuple(_speech_path(asset) for asset in assets)
+        output = _pipeline_output(pipeline, list(paths) if len(paths) > 1 else paths[0])
+        if (
+            not isinstance(output, list)
+            or len(output) != len(paths)
+            or any(not isinstance(result, dict) for result in output)
+        ):
+            analyses = tuple(FunASRTranscriber._analyze_one(pipeline, asset) for asset in assets)
+            return analyses, 1 + len(assets)
+        return tuple(_analysis(result) for result in output), 1
+
+    @staticmethod
     def _analyze_one(pipeline: _Pipeline, asset: AssetRef) -> SpeechAnalysis:
-        path = asset.path
-        if path is None:  # AssetRef.is_resolved was checked at the boundary.
-            raise ValidationError("speech asset path is missing")
-        try:
-            output = pipeline.generate(
-                input=str(path.resolve(strict=True)),
-                batch_size_s=300,
-                return_raw_text=True,
-                sentence_timestamp=True,
-                return_spk_res=True,
-                return_spk_center=True,
-                disable_pbar=True,
-            )
-        except OSError:
-            raise ValidationError("speech asset path does not exist") from None
-        except Exception as error:
-            raise ModelError("FunASR failed to analyze speech") from error
+        output = _pipeline_output(pipeline, _speech_path(asset))
+        if output == []:
+            return SpeechAnalysis(turns=(), speakers=())
         if not isinstance(output, list) or len(output) != 1 or not isinstance(output[0], dict):
             raise ModelError("FunASR returned an invalid transcription batch")
-        result = output[0]
-        text = result.get("text")
-        if not isinstance(text, str):
-            raise ModelError("FunASR returned invalid transcription text")
-        if not _SPECIAL_TOKEN.sub("", text).strip():
-            return SpeechAnalysis(turns=(), speakers=())
-        turns = _turns(result.get("sentence_info"))
-        if not turns:
-            raise ModelError("FunASR returned text without timed speaker turns")
-        speakers = _speakers(result.get("spk_embedding_center"))
-        labels = {turn.speaker_label for turn in turns if turn.speaker_label is not None}
-        if labels - {speaker.speaker_label for speaker in speakers}:
-            raise ModelError("FunASR returned a speaker label without a CAM++ centroid")
-        return SpeechAnalysis(turns=turns, speakers=speakers)
+        return _analysis(output[0])
+
+
+def _speech_path(asset: AssetRef) -> str:
+    path = asset.path
+    if path is None:  # AssetRef.is_resolved was checked at the boundary.
+        raise ValidationError("speech asset path is missing")
+    try:
+        return str(path.resolve(strict=True))
+    except OSError:
+        raise ValidationError("speech asset path does not exist") from None
+
+
+def _pipeline_output(pipeline: _Pipeline, value: str | list[str]) -> object:
+    try:
+        return pipeline.generate(
+            input=value,
+            batch_size_s=300,
+            return_raw_text=True,
+            sentence_timestamp=True,
+            return_spk_res=True,
+            return_spk_center=True,
+            disable_pbar=True,
+        )
+    except Exception as error:
+        raise ModelError("FunASR failed to analyze speech") from error
+
+
+def _analysis(result: dict[str, object]) -> SpeechAnalysis:
+    text = result.get("text")
+    if not isinstance(text, str):
+        raise ModelError("FunASR returned invalid transcription text")
+    if not _SPECIAL_TOKEN.sub("", text).strip():
+        return SpeechAnalysis(turns=(), speakers=())
+    turns = _turns(result.get("sentence_info"))
+    if not turns:
+        raise ModelError("FunASR returned text without timed speaker turns")
+    speakers = _speakers(result.get("spk_embedding_center"))
+    labels = {turn.speaker_label for turn in turns if turn.speaker_label is not None}
+    if labels - {speaker.speaker_label for speaker in speakers}:
+        raise ModelError("FunASR returned a speaker label without a CAM++ centroid")
+    return SpeechAnalysis(turns=turns, speakers=speakers)
 
 
 def _turns(value: object) -> tuple[SpeechTurn, ...]:

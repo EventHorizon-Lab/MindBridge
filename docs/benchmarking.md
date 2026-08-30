@@ -33,6 +33,9 @@ same evaluation command automatically writes its official submission file after 
 endpoint, key, and timeout. The equivalent environment variables are
 `MINDBRIDGE_JUDGE_MODEL`, `MINDBRIDGE_JUDGE_BASE_URL`, `MINDBRIDGE_JUDGE_API_KEY`, and
 `MINDBRIDGE_JUDGE_TIMEOUT_SECONDS`. Use `--judge-concurrency` to bound parallel judge requests.
+For OpenAI-compatible models that expose a thinking template, bounded deterministic generation can
+be selected with `--gen-kwargs max_tokens=512,enable_thinking=false`; both controls are recorded in
+the cache namespace and result artifact.
 
 Missing annotations and media are downloaded by default. Public releases use immutable Git or
 Hugging Face revisions; annotations are also checked against a published SHA-256 when available.
@@ -127,8 +130,9 @@ videos are already only seconds long and Mem-Gallery uses images. `--batch-size 
 conservative media batch and a
 larger text batch, capped by `--max-batch-size`; a failed batch is bisected until it fits or the
 individual item is reported as failed. `--unit-concurrency` runs physically isolated
-units in parallel, while `--request-concurrency` bounds answer calls inside each unit. One shared
-Jina/FunASR model pool is reused across those stores, so weights are not loaded once per case.
+units in parallel, while one shared `--request-concurrency` limit bounds answer calls across all
+units in the task. One shared Jina/FunASR model pool is reused across those stores, so weights are
+not loaded once per case.
 
 The runner stores source memories as episodic, preserves released wall-clock event spans as typed
 bounds, and retains source-relative clip intervals as provenance metadata. LoCoMo-Refined,
@@ -171,8 +175,9 @@ unrestricted run or malformed prediction records `invalid` and exits nonzero. Th
 uploads predictions automatically.
 
 The core `lmms-eval` response-cache path shape is supported. A directory keeps a shared
-`cache.db`, writes each run to `runs/<run-id>/cache.db`, and merges successful deterministic
-answers and judge responses into the shared cache when the run closes:
+`cache.db` plus an audit shard at `runs/<run-id>/cache.db`. Each successful deterministic answer is
+written through to the shared cache as soon as it completes, so a fresh isolated rerun can recover
+after interruption; the run shard is also merged when the run closes:
 
 ```bash
 mindbridge-bench eval \

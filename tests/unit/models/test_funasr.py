@@ -77,6 +77,9 @@ def test_funasr_delegates_execution_to_official_automodel_and_maps_speech(
     assert arguments["model_revision"] == DEFAULT_FUNASR_MODEL_REVISION
     assert arguments["vad_model"] == DEFAULT_FUNASR_VAD_MODEL_ID
     assert arguments["spk_model"] == DEFAULT_FUNASR_SPEAKER_MODEL_ID
+    assert arguments["spk_mode"] == "vad_segment"
+    expected_space = f"{DEFAULT_FUNASR_MODEL_ID}:speech:b47a175e755dea61"
+    assert transcriber.transcription_space == expected_space
     assert "device" not in arguments
     assert "trust_remote_code" not in arguments
     assert len(calls) == 2
@@ -84,3 +87,92 @@ def test_funasr_delegates_execution_to_official_automodel_and_maps_speech(
     transcriber.close()
     with pytest.raises(ModelError, match="closed"):
         transcriber.analyze((asset,))
+
+
+def test_funasr_maps_an_empty_vad_result_to_silence(tmp_path: Path) -> None:
+    video = tmp_path / "silent.mp4"
+    video.write_bytes(b"fake video")
+
+    class _Pipeline:
+        def generate(self, **_kwargs: object) -> list[dict[str, object]]:
+            return []
+
+    digest = sha256(video.read_bytes()).hexdigest()
+    asset = AssetRef(
+        digest,
+        modality=Modality.VIDEO,
+        media_type="video/mp4",
+        size_bytes=video.stat().st_size,
+        sha256=digest,
+        name=video.name,
+        path=video,
+    )
+
+    assert FunASRTranscriber._analyze_one(_Pipeline(), asset).turns == ()
+
+
+def test_funasr_sends_multiple_assets_in_one_official_batch(tmp_path: Path) -> None:
+    paths = (tmp_path / "first.wav", tmp_path / "second.wav")
+    for path in paths:
+        path.write_bytes(b"fake wav")
+    calls: list[object] = []
+
+    class _Pipeline:
+        def generate(self, **kwargs: object) -> list[dict[str, object]]:
+            calls.append(kwargs["input"])
+            return [
+                {"text": "", "sentence_info": [], "spk_embedding_center": []},
+                {"text": "", "sentence_info": [], "spk_embedding_center": []},
+            ]
+
+    assets = tuple(
+        AssetRef(
+            (digest := sha256(path.read_bytes()).hexdigest()),
+            modality=Modality.AUDIO,
+            media_type="audio/wav",
+            size_bytes=path.stat().st_size,
+            sha256=digest,
+            name=path.name,
+            path=path,
+        )
+        for path in paths
+    )
+
+    analyses, model_calls = FunASRTranscriber._analyze_many(_Pipeline(), assets)
+
+    assert len(analyses) == 2
+    assert calls == [[str(path.resolve()) for path in paths]]
+    # Telemetry counts AutoModel calls, so batching two assets must report one request.
+    assert model_calls == 1
+
+
+def test_funasr_counts_the_per_asset_fallback_calls(tmp_path: Path) -> None:
+    paths = (tmp_path / "first.wav", tmp_path / "second.wav")
+    for path in paths:
+        path.write_bytes(b"fake wav")
+    calls: list[object] = []
+
+    class _Pipeline:
+        def generate(self, **kwargs: object) -> list[dict[str, object]]:
+            calls.append(kwargs["input"])
+            # A structurally unusable batch reply forces the per-asset fallback.
+            return [] if isinstance(kwargs["input"], list) else [{"text": ""}]
+
+    assets = tuple(
+        AssetRef(
+            (digest := sha256(path.read_bytes()).hexdigest()),
+            modality=Modality.AUDIO,
+            media_type="audio/wav",
+            size_bytes=path.stat().st_size,
+            sha256=digest,
+            name=path.name,
+            path=path,
+        )
+        for path in paths
+    )
+
+    analyses, model_calls = FunASRTranscriber._analyze_many(_Pipeline(), assets)
+
+    assert len(analyses) == 2
+    assert len(calls) == 3
+    assert model_calls == 3
