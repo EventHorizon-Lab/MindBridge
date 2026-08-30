@@ -1637,7 +1637,7 @@ def test_search_expands_candidates_until_it_has_distinct_parent_memories(
         transcriber=models,
         ambiguity_margin=0,
     ) as memory:
-        crowded = memory.add(tuple(f"crowded part {index}" for index in range(60)))
+        crowded = memory.add(tuple(f"crowded part {index}" for index in range(110)))
         other = memory.add("other parent")
         index = _FakeIndex.instances[-1]
         crowded_hits = tuple(
@@ -1645,7 +1645,7 @@ def test_search_expands_candidates_until_it_has_distinct_parent_memories(
             for document_id, document in index.documents.items()
             if document.embedding.memory_id == crowded.id
         )
-        assert len(crowded_hits) > 50
+        assert len(crowded_hits) > 100
         other_id = next(
             document_id
             for document_id, document in index.documents.items()

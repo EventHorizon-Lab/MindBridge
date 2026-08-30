@@ -87,7 +87,7 @@ measured temporal planner.
 
 Decay is off by default. Enable it with `Memory(decay_half_life_days=...)`.
 
-MindBridge over-fetches at least 50 candidates, computes a factor at search time, sorts by adjusted
+MindBridge over-fetches at least 100 candidates, computes a factor at search time, sorts by adjusted
 relevance, clamps public scores to `[0, 1]`, and returns the requested limit. The durable memory is
 never filtered or deleted by decay.
 
