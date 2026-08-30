@@ -68,9 +68,52 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 - `ModelOutputTruncatedError`, the `ModelError` and `model_output_truncated` code raised when
   generation stops at an output token limit, so a deterministic truncation is distinguishable from
   a transient transport failure on every surface.
+- `reason`, `stage`, and `subject` on `MindBridgeError`, plus a `retryable` property that is a
+  lookup on `reason` and never a judgement. `reason` narrows the stable `code` to a closed
+  sub-vocabulary, `stage` names the failing pipeline stage, and `subject` carries the asset ID,
+  memory ID, or batch position. All three are optional, so an unclassified raise site is unchanged
+  and is never reported as retryable. No new exception classes and no renamed codes.
+- `tests/unit/api/test_surface_parity.py`, which compares the Python, REST, and MCP surfaces
+  mechanically — defaults, field names, protocol drift, error codes, envelope shape, and serialized
+  record fields — deriving everything from the code except one operation map that must list every
+  route and tool.
+- A CI job that builds the wheel and sdist, asserts `py.typed` and the benchmark `NOTICE.md` ship in
+  both, installs the wheel by path into a clean environment, and runs the loader probes against it.
+  A `[project.scripts]` entry is written whether or not the build kept the module it names, so a
+  source-tree gate could otherwise stay green over a wheel that raises `ModuleNotFoundError`.
+- `.github/scripts/installability_probe.py`, which gives each isolated CI leg a loader to run after
+  the import probe, and matrix legs for `benchmarks`, `observability`, and `openai`, which had never
+  been installed in isolation anywhere.
+- `test_imported_distributions_are_declared`, which resolves every third-party root a product module
+  imports — including deferred `import_module`/`find_spec` arguments — against the extras table and
+  names the module and line that failed.
 - `gen_ai.response.finish_reasons` on the generation span, plus
   `mindbridge.grounding.media_elided_hits` and `mindbridge.grounding.dropped_hits` recording the
   retrieved evidence the OpenAI adapter's inline budget removed.
+- A `mindbridge` product console script over the shared `Memory` execution plane. Its commands are
+  the SDK operations kebab-cased — `add`, `add-many`, `search`, `ask`, `get`, `speech`,
+  `register-speaker`, `reinforce`, `list`, `delete`, `reindex`, `optimize` — plus one command with
+  no SDK counterpart, `doctor`. Output is one JSON document per invocation on stdout in the REST
+  field vocabulary, diagnostics and the shared error envelope go to stderr, and exit statuses are
+  stable, one per error code, so an agent branches on `$?` without parsing anything.
+- Three explicit CLI composition paths, of which exactly one is required per invocation and none is
+  a default: `--app MODULE:ATTR` for any application-composed `Memory`, `--embedder NAME` for the
+  bundled backends, and `--url URL` to address a running owner over `/v1`. There is no environment
+  variable that selects a backend, and no plugin registry: a backend MindBridge does not bundle is
+  reached through `--app`. The resolved model identity is echoed to stderr on every run, and a
+  credential's source is reported while its value never is.
+- `mindbridge.recipes`, a closed public table naming `jina-omni`, `funasr`, and `openai[:model]`
+  over the bundled backends. Each function returns the constructed object so the caller owns it, and
+  every entry pins its model identity to a constant already in the source.
+- `mindbridge doctor`, which resolves the composition, exercises each configured backend's loader,
+  and reports without writing — turning an under-declared dependency into one line before the first
+  write instead of a run of silent ingestion failures. It reports how deep each probe reached
+  (`weights`, `client`, or `import`) so the result never overstates the check.
+- CLI input forms that carry generated content without shell quoting: ordered positional atoms with
+  `@PATH` for a local file and `@@TEXT` for a literal `@`, `-` for standard input, `--content-json`
+  for the same discriminated parts array REST and MCP accept, and JSONL on `add-many`. The CLI adds
+  exactly one part type to that union, `{"type": "input_file", "path": "..."}`, valid in local mode
+  only and refused in `--url` mode.
 
 ### Changed
 
@@ -113,6 +156,85 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 - The end-to-end benchmark runner enables speech indexing for media tasks, preserves episodic
   source/time metadata, records exact retrieved intervals, reports official MM-Lifelong Ref@300,
   and uses a new cache namespace so pre-change answers cannot mask retrieval changes.
+- **Breaking.** `DELETE /v1/memories/{memory_id}` returns `200` with `{"deleted": bool}` instead of
+  `204` with no body. Over REST alone an agent could not distinguish "deleted" from "did not exist",
+  which the Python SDK and MCP both report.
+- **Breaking.** `GET /v1/memories` defaults `limit` to 100, matching `Memory.list`. It was 50.
+- **Breaking.** HTTP statuses now follow whether the same call can ever succeed:
+  `backend_not_configured` is `501`, `unsupported_modality` is `422`, `schema_unsupported` is `500`,
+  and a retryable failure is `503` with `Retry-After`. `ask` without an answerer previously returned
+  `502` — the status agents and proxies retry — for a condition that can never succeed.
+- **Breaking.** The error envelope gains `reason`, `retryable`, `stage`, and `subject` on both REST
+  and MCP. `subject` is withheld over REST for `storage_error`, `index_unavailable`, and
+  `internal_error`, which name server state rather than caller input; the CLI reports it for every
+  code, because it runs as the invoking user on the machine that owns the directory.
+- `POST /v1/memories/batch` carries per-item `occurred_at`, `occurred_end`, and `metadata`. Those
+  three values are part of a memory's content-addressed identity, so the same corpus imported over
+  REST previously produced different IDs than the SDK, silently defeating idempotency across
+  surfaces.
+- Model, storage, and index failure messages are forwarded to transports rather than erased. They
+  are author-written literals; provider text only ever reaches `__cause__` in the owner process.
+- `httpx`, `torch`, and `cairosvg` are now declared. `httpx` is imported at module scope by the
+  benchmark downloader and was resolved only because `huggingface-hub` happens to require it;
+  `torch` is imported at module scope by FunASR, which declares neither it nor `torchaudio`, and
+  arrived only because Sentence Transformers pulls it in; `cairosvg` is how the pinned Jina revision
+  converts `image/svg+xml`, a documented input. `cairosvg` is LGPL-3.0, installed separately and
+  never linked.
+
+### Fixed
+
+- Transcript derivation is routed by the configured transcriber's declared
+  `transcription_capabilities` rather than by the *embedder's* capabilities, so an omni-capable
+  embedder no longer suppresses a transcriber that was explicitly configured.
+- Video speech is no longer discarded. `_with_audio_transcripts`, `_cache_audio_transcripts`, and
+  `_derived_text` selected assets by `modality == "audio"`, while `FunASRTranscriber` declares
+  `{audio, video}`, so a video's speech was dropped by string comparison on every path that reads a
+  transcript. As a consequence a bare media memory stored empty content, and because the lexical
+  document lives on part 0 only, hybrid retrieval silently degraded to dense-only for every media
+  memory. This fixes audio and video; an image has no audio track and gains nothing, and no
+  benchmark has been re-run, so no score claim is made.
+- `SpeakerNotFoundError` is mapped on both transports. It served as HTTP `500` and was destroyed
+  outright on MCP, where the middleware overwrote any code outside a hand-maintained allowlist.
+  `model_output_truncated` had fallen into the same hole, so that set is now derived from the
+  exception classes and cannot silently lose a new one.
+- MCP's error envelope carries `trace_id` and `issues`, so an MCP failure can be correlated across
+  surfaces and an agent is told which argument was rejected.
+- The OpenAI adapter raises `from error` instead of `from None` and classifies the failure from the
+  official SDK's own exception classes. Authentication, rate limiting, timeouts, connection loss,
+  and rejected requests were previously one indistinguishable `model_error`. An unrecognized failure
+  stays unclassified rather than being guessed into a retryable reason.
+- `_open_store` separates a busy data directory from an unsupported on-disk schema, and keeps the
+  message a literal so the directory travels in `subject` instead of a message every transport
+  forwards.
+- `add_many` names the failing item in `subject`.
+- The REST adapter's `_Memory` protocol declared three defaults the SDK does not have. Mypy does not
+  compare defaults across a structural protocol, so nothing caught it.
+
+### Documentation
+
+- The quickstart and README no longer index into a `search` result. `search` returns an empty tuple
+  whenever no candidate clears `minimum_relevance` or the top two dense confidences tie within
+  `ambiguity_margin`, so the published first example could raise `IndexError` on a correct install.
+  Both now iterate the result, and the quickstart explains when and why it is empty.
+- The CC BY-NC 4.0 licence of the pinned Jina weights is disclosed at each point of use rather than
+  only in a README footer, with a complete working escape hatch: `SentenceTransformersEmbedder.load`
+  pinned to `sentence-transformers/all-MiniLM-L6-v2` at its Apache-2.0 commit, plus a recipe for
+  resolving a commit hash. Pinning stays required.
+- `SpeechBackend.analyze` is documented as returning `tuple[SpeechAnalysis, ...]`, one per asset,
+  not a single `SpeechAnalysis`. It is an extension contract, so the wrong signature produced
+  third-party backends that fail inside `Memory`.
+- `Memory.list` is documented as defaulting to `limit=100`, not 50.
+- The three enforced Python input limits are recorded: 128 content parts, 65,536 characters per text
+  value, and `limit` between 1 and 100 for `search`, `ask`, and `list`.
+- `occurred_end` is in the `MemoryRecord` field table in the concepts guide, `reinforce` is recorded
+  as having no REST route and no MCP tool, and a full-text match is documented as scoring 0.6
+  confidence and so clearing the default `minimum_relevance` regardless of vector distance.
+- `docs/api/cli.md` is now a reference for a shipped command rather than a contract for a pending
+  one, and `docs/design-principles.md`, `docs/architecture.md`, `README.md`, and `CLAUDE.md` no
+  longer describe the product CLI as missing. The design document's "one CLI with two command
+  families" is corrected to two console scripts forming one documented surface, with the reason:
+  the packaging guard scans string constants, so a single dispatcher could not name the benchmark
+  package even to import it lazily.
 
 ### Removed
 
@@ -153,3 +275,8 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
   They accept at most 4 MiB of serialized text evidence. Use a provider-specific upload adapter for
   larger media.
 - No built-in user authentication, rate limiting, quotas, or secure-erasure guarantee.
+- The CLI has no `--format` flag, configuration file, `MINDBRIDGE_*` composition variable, plugin
+  registry, backend registration by name, streaming output, interactive prompt, `serve` command, or
+  named `SentenceTransformersEmbedder` recipe. `--url` mode covers only the seven operations REST
+  routes; the other five exit 10 and name the surfaces that do support them. Each invocation opens
+  and closes one `Memory`, which makes it the wrong tool for a loop.

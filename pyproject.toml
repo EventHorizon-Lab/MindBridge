@@ -16,6 +16,10 @@ dependencies = [
 ]
 
 [project.scripts]
+# Two scripts, one documented CLI surface. `tests/test_package.py` fails a product module that
+# names the benchmark package in any string constant, so a single dispatcher could not reach the
+# benchmark family even through a lazy import. See docs/api/cli.md.
+mindbridge = "mindbridge.cli:main"
 mindbridge-bench = "mindbridge.benchmarks.cli:main"
 
 [project.optional-dependencies]

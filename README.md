@@ -163,13 +163,30 @@ They do not own or close `memory`. `create_app` is unauthenticated; put it behin
 gateway or ASGI middleware. The Python SDK, REST, and MCP therefore share one execution plane rather
 than implementing memory behavior separately.
 
-A product CLI with the same SDK-derived capabilities is required but not implemented in the current
-release. It must reuse or address the same application-composed `Memory`, never invent another
-provider configuration or open a directory already owned by another process.
+The `mindbridge` command is a third interface over the same plane, not a second one:
+
+```bash
+mindbridge --embedder jina-omni add "The spare key is in the blue toolbox."
+mindbridge --embedder jina-omni search "where is the spare key"
+mindbridge --app my_application:build_memory ask "where is the spare key"
+mindbridge --url http://127.0.0.1:8000 search "where is the spare key"
+```
+
+Exactly one of `--app MODULE:ATTR`, `--embedder NAME`, and `--url URL` composes the run; there is no
+default and no environment variable that selects a backend. `--app` is the same
+application composition the SDK and REST use, and it is how any non-bundled backend is reached.
+`--embedder` names an entry in the closed `mindbridge.recipes` table, which returns the object it
+built. `--url` addresses a running owner rather than opening a directory a second time.
+
+Data is JSON on stdout, diagnostics are JSON on stderr, and exit codes are stable — exit `9` means
+another process owns the directory, so retry with `--url`. `mindbridge doctor` resolves the
+composition and exercises each backend's loader before the first write. Because each invocation
+opens and closes one `Memory`, the CLI is not the right tool for a loop; use the SDK or `--url`. See
+[command-line usage](docs/api/cli.md).
 
 ## Benchmarks
 
-The currently shipped console command is the benchmark dispatcher:
+The benchmark dispatcher is the second console command:
 
 ```bash
 mindbridge-bench --help
@@ -185,7 +202,7 @@ Every benchmark unit receives a separate physical directory. See
 - [Product goals and design principles](docs/design-principles.md)
 - [Quick start](docs/quickstart.md)
 - [Python API](docs/api/python-sdk.md)
-- [MCP API](docs/api/mcp.md) and [command-line status](docs/api/cli.md)
+- [MCP API](docs/api/mcp.md) and [command-line usage](docs/api/cli.md)
 - [Configuration and composition](docs/configuration.md)
 - [Architecture](docs/architecture.md)
 - [REST API](docs/api/rest.md)

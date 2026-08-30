@@ -205,10 +205,31 @@ def _loader_argument(node: ast.Call) -> str | None:
 
 
 def test_console_script_targets_exist() -> None:
-    assert set(SCRIPTS) == {"mindbridge-bench"}
+    assert set(SCRIPTS) == {"mindbridge", "mindbridge-bench"}
     for target in SCRIPTS.values():
         module_name, attribute = target.split(":", 1)
         assert callable(getattr(importlib.import_module(module_name), attribute))
+
+
+def test_the_product_cli_cannot_reach_the_benchmark_family(tmp_path: Path) -> None:
+    """Two console scripts exist because one dispatcher cannot satisfy the guard above.
+
+    ``test_product_does_not_address_benchmarks`` already covers every product module, but it passes
+    trivially while the CLI is small. This pins the reason the layout is what it is: the scan reads
+    string constants, so even a lazy ``import_module`` of the other family trips it.
+    """
+    product_cli = SOURCE / "cli.py"
+    assert product_cli.exists()
+    assert _benchmark_references(product_cli) == set()
+
+    dispatcher = tmp_path / "single_tree.py"
+    dispatcher.write_text(
+        "from importlib import import_module\n"
+        "def main() -> int:\n"
+        "    return import_module('mindbridge.benchmarks.cli').main()\n",
+        encoding="utf-8",
+    )
+    assert _benchmark_references(dispatcher) == {"mindbridge.benchmarks.cli"}
 
 
 def test_dependency_surface_is_exact() -> None:

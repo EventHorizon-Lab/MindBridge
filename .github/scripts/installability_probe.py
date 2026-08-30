@@ -64,6 +64,19 @@ def _memory_flow(tracer: object = None) -> None:
 
 def _base() -> None:
     _memory_flow()
+    _product_cli()
+
+
+def _product_cli() -> None:
+    """Run the `mindbridge` console script's entry point on the base dependency set.
+
+    The script is declared whether or not its module imports, and every composition path except
+    `--url` needs an extra, so the cheapest honest end-to-end check is a resolution that touches
+    argparse, `mindbridge.recipes`, and the JSON writer without constructing a backend.
+    """
+    from mindbridge.cli import main
+
+    assert main(["--url", "http://127.0.0.1:1", "-q", "--explain", "doctor"]) == 0
 
 
 def _benchmarks() -> None:
@@ -178,6 +191,7 @@ MODULES: dict[str, tuple[str, ...]] = {
     "base": (
         "mindbridge",
         "mindbridge.benchmarks",
+        "mindbridge.cli",
         "mindbridge.benchmarks.isolation",
         "mindbridge.benchmarks.local_index_benchmark",
         "mindbridge.exceptions",
@@ -185,6 +199,7 @@ MODULES: dict[str, tuple[str, ...]] = {
         "mindbridge.memory",
         "mindbridge.models.base",
         "mindbridge.models.openai_sdk",
+        "mindbridge.recipes",
         "mindbridge.types",
     ),
     "benchmarks": (

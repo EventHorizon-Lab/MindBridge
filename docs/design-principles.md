@@ -121,7 +121,8 @@ routing, retrieval, persistence, provider selection, defaults, or error policy. 
 
 For developers:
 
-- The common path is one explicit `Memory`, followed by `add`, `search`, and optionally `ask`.
+- The common path is one explicit `Memory`, followed by `add`, `search`, and optionally `ask`. The
+  [command line](api/cli.md) is the same path without an editor: one composition flag, one command.
 - Public operations use a small vocabulary: `add`, `search`, `ask`, `get`, `list`, and `delete`.
 - The SDK is the canonical capability inventory. MCP and the product CLI expose the same product
   operations unless a transport limitation is documented explicitly; a gap is implementation work,
@@ -135,29 +136,32 @@ For developers:
 
 For agents:
 
-- The schema is the contract: MCP exposes typed tool schemas, REST exposes OpenAPI, and a product
-  CLI must expose stable machine-readable JSON.
+- The schema is the contract: MCP exposes typed tool schemas, REST exposes OpenAPI, and the product
+  CLI emits one stable machine-readable JSON document per invocation.
 - Tool names and descriptions are self-contained and state when to call an operation, its side
   effects, result limits, and whether retrying it is safe.
 - Results and failures are structured. An agent never has to parse a human log line to recover an
   ID, cursor, error code, or grounding source.
 - Outputs are bounded and pageable. Stable IDs, opaque cursors, deterministic ordering, and
   idempotent writes make retries and multi-step plans predictable.
-- A product CLI is non-interactive and composable: data goes to stdout, diagnostics go to stderr,
+- The product CLI is non-interactive and composable: data goes to stdout, diagnostics go to stderr,
   exit codes are stable, and stdin can carry generated input without shell quoting tricks.
 - MCP and the product CLI derive their operations from the SDK. Transport-specific encoding may
   differ, but capability, side effects, defaults, and results remain aligned.
-- The CLI contains product-operation and benchmark command families. Product commands dispatch to
-  `Memory`; benchmark commands exercise the public SDK and never define an alternate product path.
+- The CLI surface is two console scripts, not one command tree: `mindbridge` for product
+  operations and `mindbridge-bench` for benchmarks. Product commands dispatch to `Memory`;
+  benchmark commands exercise the public SDK and never define an alternate product path. The split
+  is required, not stylistic: the packaging guard scans string constants, so a single dispatcher
+  could not name the benchmark package even to import it lazily, and product modules must not
+  import benchmark modules.
 - Published documentation should provide stable deep links, downloadable schemas, and an
   agent-readable index such as `llms.txt` when a documentation site exists.
 
 Agent integrations may add optional lifecycle hooks or skills that retrieve context before a turn
 and store outcomes afterward. Such automation must make writes observable, preserve the distinction
 between user statements and agent-generated conclusions, and remain outside the core memory
-semantics. MCP is the currently implemented agent-native surface. A product CLI is a required
-MindBridge surface whose implementation is still pending; lifecycle integration packages remain a
-design target.
+semantics. MCP and the `mindbridge` CLI are the implemented agent-native surfaces; lifecycle
+integration packages remain a design target.
 
 ### Developer-friendly extensibility
 
@@ -273,9 +277,9 @@ revisions must be reproducible before a result guides a default.
 | Speech runtime | Built-in FunASR adapter uses `AutoModel` | Additional measured runtime adapters, selected explicitly or by observable policy |
 | Extensions | Four required model protocols and one optional streaming protocol; no registry | Optional domain capabilities after a real implementation establishes the contract |
 | Hardware | Runs where Python, dependencies, and the selected models are supported | Verified device-class matrix with published quality, latency, and resource evidence |
-| Developer interfaces | Typed Python API and OpenAPI-documented REST adapter | Same small vocabulary and time-to-first-success across supported transports |
-| Execution plane | Python SDK, REST, and MCP dispatch to one `Memory`; product CLI is missing | SDK, MCP, CLI, and REST share one application-composed execution plane |
-| Agent interfaces | Five typed MCP tools; product CLI not yet implemented | SDK-derived MCP and CLI capability parity, machine-readable schemas, and lifecycle integrations |
+| Developer interfaces | Typed Python API, OpenAPI-documented REST adapter, and a JSON-only product CLI over the same composition | Same small vocabulary and time-to-first-success across supported transports |
+| Execution plane | Python SDK, REST, MCP, and the `mindbridge` CLI dispatch to one `Memory` | Every surface reaches the operations the SDK publishes, with no transport gap left undocumented |
+| Agent interfaces | Five typed MCP tools; a `mindbridge` CLI whose commands are the SDK operations kebab-cased, plus `doctor` | SDK-derived MCP and CLI capability parity, machine-readable schemas, and lifecycle integrations |
 
 This distinction is deliberate: goals guide what to build next, while current API and deployment
 documentation remain the source of truth for what users can run now.
