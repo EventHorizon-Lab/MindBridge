@@ -73,7 +73,9 @@ models = OpenAIModels(
 
 Provider-specific Chat Completions fields remain explicit. For example, an OpenAI-compatible Qwen
 endpoint can bound output with `generation_max_tokens=512` and disable its thinking template with
-`generation_extra_body={"chat_template_kwargs": {"enable_thinking": False}}`.
+`generation_extra_body={"chat_template_kwargs": {"enable_thinking": False}}`. If an endpoint also
+requires a minimum video duration, set `generation_min_video_seconds` to that documented boundary;
+shorter videos use four ordered stills when image input and the `openai` extra are available.
 
 The SDK may read its own environment variables. MindBridge does not duplicate key lookup, URL
 normalization, proxy support, retry policy, connection pooling, or sync/async conversion.

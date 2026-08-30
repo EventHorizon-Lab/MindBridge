@@ -3,6 +3,7 @@
 import base64
 import json
 from datetime import datetime, timedelta, timezone
+from io import BytesIO
 from pathlib import Path
 from typing import Any, cast
 
@@ -507,9 +508,79 @@ def test_answer_uses_standard_inline_audio_part(tmp_path: Path) -> None:
     assert answer.answer == "A greeting is audible."
 
 
+@pytest.mark.parametrize(
+    ("frame_count", "converted", "tight_budget"),
+    [(6, True, False), (8, False, False), (6, False, True)],
+)
+def test_answer_converts_only_videos_below_the_configured_provider_minimum(
+    frame_count: int,
+    converted: bool,
+    tight_budget: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    image_module = pytest.importorskip("PIL.Image")
+    video = _video_asset(tmp_path, "clip", frame_count)
+    hit = SearchHit(
+        id="memory_1",
+        content="The colored frames are ordered.",
+        score=0.9,
+        created_at=NOW,
+        assets=(video,),
+        modality=Modality.VIDEO,
+    )
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        content = json.loads(request.content)["messages"][1]["content"]
+        media = content[2:]
+        if converted:
+            assert [part["type"] for part in media] == ["image_url"] * 4
+            reds = []
+            for part in media:
+                encoded = part["image_url"]["url"].partition(",")[2]
+                with image_module.open(BytesIO(base64.b64decode(encoded))) as image:
+                    reds.append(image.convert("RGB").getpixel((0, 0))[0])
+            assert reds == sorted(reds)
+            assert len(set(reds)) == 4
+        else:
+            assert [part["type"] for part in media] == ["video_url"]
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"content": "Ordered."},
+                        "finish_reason": "stop",
+                    }
+                ]
+            },
+        )
+
+    original = video.path.read_bytes() if video.path is not None else b""
+    if tight_budget:
+        monkeypatch.setattr(
+            openai_backend, "_MAX_INLINE_MODEL_BYTES", openai_backend._encoded_size(len(original))
+        )
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        model = _model(_sdk_client(client), generation_min_video_seconds=2.0)
+        prepared = model._answer_request("What happened?", (hit,))
+        assert prepared is not None
+        assert prepared[2] == frozenset(
+            {Modality.TEXT, Modality.IMAGE if converted else Modality.VIDEO}
+        )
+        result = model.answer("What happened?", (hit,))
+
+    assert result.hits == (hit,)
+    assert video.path is not None and video.path.read_bytes() == original
+
+
 @pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("image_capable", [False, True])
 def test_answer_retries_provider_rejected_short_hit_video_as_text(
     streaming: bool,
+    image_capable: bool,
+    monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     video = _asset(tmp_path, "short", Modality.VIDEO, "video/mp4", b"video")
@@ -571,7 +642,19 @@ def test_answer_retries_provider_rejected_short_hit_video_as_text(
         httpx.Client(transport=httpx.MockTransport(respond)) as client,
         provider.get_tracer("test").start_as_current_span("model"),
     ):
-        model = _model(_sdk_client(client))
+        if not image_capable:
+            monkeypatch.setattr(
+                openai_backend,
+                "_short_video_frame_urls",
+                lambda *_args: pytest.fail("preflight ran without image capability"),
+            )
+        model = _model(
+            _sdk_client(client),
+            generation_capabilities=(
+                ALL_MODALITIES if image_capable else frozenset({Modality.TEXT, Modality.VIDEO})
+            ),
+            generation_min_video_seconds=2.0,
+        )
         if streaming:
             answer = "".join(model.stream_answer("Where is the toolbox?", (hit,)))
         else:
@@ -1195,6 +1278,8 @@ def test_generation_controls_reject_invalid_values() -> None:
         OpenAIModels(generation_max_tokens=0)
     with pytest.raises(ValidationError, match="generation_extra_body"):
         OpenAIModels(generation_extra_body={"": False})
+    with pytest.raises(ValidationError, match="generation_min_video_seconds"):
+        OpenAIModels(generation_min_video_seconds=float("nan"))
 
 
 def test_adapter_does_not_close_the_caller_owned_sdk_client() -> None:
@@ -1210,7 +1295,9 @@ def _model(
     generation_seed: int | None = None,
     generation_temperature: float | None = None,
     generation_max_tokens: int | None = None,
+    generation_min_video_seconds: float | None = None,
     generation_extra_body: dict[str, object] | None = None,
+    generation_capabilities: frozenset[Modality] = ALL_MODALITIES,
 ) -> OpenAIModels:
     return OpenAIModels(
         client,
@@ -1220,11 +1307,12 @@ def _model(
         transcription_model="speech-model",
         embedding_dimension=2,
         embedding_capabilities=ALL_MODALITIES,
-        generation_capabilities=ALL_MODALITIES,
+        generation_capabilities=generation_capabilities,
         transcription_capabilities=frozenset({Modality.AUDIO, Modality.VIDEO}),
         generation_seed=generation_seed,
         generation_temperature=generation_temperature,
         generation_max_tokens=generation_max_tokens,
+        generation_min_video_seconds=generation_min_video_seconds,
         generation_extra_body=generation_extra_body,
     )
 
@@ -1254,5 +1342,31 @@ def _asset(
         size_bytes=len(data),
         sha256="a" * 64,
         name=f"{asset_id}.wav" if modality is Modality.AUDIO else f"{asset_id}.bin",
+        path=path,
+    )
+
+
+def _video_asset(directory: Path, asset_id: str, frame_count: int) -> AssetRef:
+    av = pytest.importorskip("av")
+    image_module = pytest.importorskip("PIL.Image")
+    path = directory / f"{asset_id}.mp4"
+    with av.open(str(path), "w") as container:
+        stream = container.add_stream("mpeg4", rate=4)
+        stream.width = 16
+        stream.height = 16
+        stream.pix_fmt = "yuv420p"
+        for index in range(frame_count):
+            frame = av.VideoFrame.from_image(image_module.new("RGB", (16, 16), (index * 30, 0, 0)))
+            for packet in stream.encode(frame):
+                container.mux(packet)
+        for packet in stream.encode():
+            container.mux(packet)
+    return AssetRef(
+        id=asset_id,
+        modality=Modality.VIDEO,
+        media_type="video/mp4",
+        size_bytes=path.stat().st_size,
+        sha256="a" * 64,
+        name=path.name,
         path=path,
     )

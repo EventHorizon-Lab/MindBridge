@@ -545,6 +545,10 @@ def test_response_cache_namespace_changes_with_runner_recipe(
     monkeypatch.setattr(eval_module, "EVAL_RUNNER_VERSION", "next-runner-recipe")
 
     assert _cache_namespace(arguments, ModelConfig(), {"text": 1}) != before
+    assert (
+        _cache_namespace(arguments, ModelConfig(generation_min_video_seconds=2.0), {"text": 1})
+        != before
+    )
 
 
 def test_implementation_identity_tracks_editable_source_changes(
@@ -573,6 +577,14 @@ def test_model_base_url_override_replaces_environment_operation_urls(
     config = _model_config("mindbridge", "base_url=https://new.example/v1")
 
     assert config.generation_base_url == "https://new.example/v1"
+
+
+def test_model_short_video_limit_is_explicit_and_validated() -> None:
+    config = _model_config("mindbridge", "generation_min_video_seconds=2")
+
+    assert config.generation_min_video_seconds == 2.0
+    with pytest.raises(ValueError, match="generation_min_video_seconds"):
+        _model_config("mindbridge", "generation_min_video_seconds=0")
 
 
 def test_generation_kwargs_normalize_bounded_non_thinking_inference() -> None:

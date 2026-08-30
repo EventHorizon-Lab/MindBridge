@@ -109,12 +109,15 @@ def _observability() -> None:
 
 def _openai() -> None:
     """Build the adapter over a real SDK client without issuing a request."""
+    import av
     from openai import OpenAI
+    from PIL import Image
 
     from mindbridge import OpenAIModels
 
     client = OpenAI(api_key="installability-probe", base_url="http://127.0.0.1:1/v1")
     models = OpenAIModels(client)
+    assert callable(av.open) and Image.Image is not None
     assert models.embedding_dimension > 0
     models.close()
 

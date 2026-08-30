@@ -426,6 +426,7 @@ models = OpenAIModels(
     generation_seed=None,
     generation_temperature=None,
     generation_max_tokens=None,
+    generation_min_video_seconds=None,
     generation_extra_body=None,
 )
 ```
@@ -436,6 +437,13 @@ upload adapter for larger assets. `generation_max_tokens` maps to Chat Completio
 `generation_extra_body` passes caller-owned provider extensions through the official SDK. Both are
 built into the shared grounded request, so `answer()` and `stream_answer()` always send identical
 generation controls. SDK clients remain caller-owned.
+
+Set `generation_min_video_seconds` only when the selected provider declares a minimum local-video
+duration. With the `openai` extra and declared image input, a shorter video becomes four
+time-ordered JPEG `image_url` parts before the first provider request; videos at or above the limit
+stay native. Derived frames must also fit the existing per-item and whole-request media budgets.
+The stills preserve visual evidence, not native video timing. Missing image capability, local
+decoding, or media budget keeps the existing provider-rejection fallback.
 
 `OpenAIModels.stream_answer()` requests streamed chat completions with final usage enabled.
 `Memory.ask()` selects it automatically to measure first chunk, first token, total generation

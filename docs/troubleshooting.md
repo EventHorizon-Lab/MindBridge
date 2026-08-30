@@ -142,6 +142,11 @@ MindBridge does not expose local `file://` paths as a compatibility transport.
 
 ## A provider rejects a short video
 
+When the provider documents a minimum duration and accepts images, configure that boundary as
+`generation_min_video_seconds` on `OpenAIModels`. A shorter local video is then represented by four
+ordered JPEG stills before the first request, subject to the same inline media budget. This retains
+visual order but not native motion or audio, so leave it disabled unless the provider requires it.
+
 If an OpenAI-compatible provider explicitly reports that a grounded video is too short, the
 adapter retries once using each hit's text and non-video media. It never removes a video supplied
 as part of the question. Inspect `mindbridge.grounding.media_elided_hits` and

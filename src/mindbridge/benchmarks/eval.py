@@ -365,6 +365,7 @@ class _BackendPool:
                 if "max_tokens" not in generation_options
                 else int(generation_options["max_tokens"])
             ),
+            generation_min_video_seconds=config.generation_min_video_seconds,
             generation_extra_body=(
                 None
                 if enable_thinking is None
@@ -1560,6 +1561,7 @@ def _results(
             "generation_seed": arguments.seed,
             "generation_temperature": 0.0,
             "generation_kwargs": arguments.gen_kwargs,
+            "generation_min_video_seconds": config.generation_min_video_seconds,
             "transcription_model": DEFAULT_FUNASR_MODEL_ID,
             "timeout_seconds": config.timeout_seconds,
         },
@@ -2304,7 +2306,10 @@ def _build_parser(prog: str | None) -> argparse.ArgumentParser:
         "--model-args",
         "--model_args",
         default="",
-        help="comma-separated generation_model/base_url/timeout_seconds overrides",
+        help=(
+            "comma-separated generation_model/base_url/timeout_seconds/"
+            "generation_min_video_seconds overrides"
+        ),
     )
     parser.add_argument(
         "--judge-model-args",
@@ -2457,6 +2462,7 @@ def _model_config(model: str, arguments: str) -> ModelConfig:
     allowed = {
         "base_url",
         "generation_model",
+        "generation_min_video_seconds",
         "timeout_seconds",
     }
     aliases = {"pretrained": "generation_model", "model": "generation_model"}
@@ -2535,6 +2541,8 @@ def _replace_config(config: ModelConfig, key: str, value: str) -> ModelConfig:
         return replace(config, generation_model=value)
     if key == "timeout_seconds":
         return replace(config, timeout_seconds=float(value))
+    if key == "generation_min_video_seconds":
+        return replace(config, generation_min_video_seconds=float(value))
     raise AssertionError(f"unhandled model setting: {key}")
 
 
@@ -2649,6 +2657,7 @@ def _cache_namespace(
         "device": arguments.device or "auto",
         "seed": arguments.seed,
         "gen_kwargs": arguments.gen_kwargs,
+        "generation_min_video_seconds": config.generation_min_video_seconds,
         "recall_limit": arguments.recall_limit,
         "batch_sizes": dict(sorted(batch_sizes.items())),
     }

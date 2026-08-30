@@ -35,7 +35,8 @@ endpoint, key, and timeout. The equivalent environment variables are
 `MINDBRIDGE_JUDGE_TIMEOUT_SECONDS`. Use `--judge-concurrency` to bound parallel judge requests.
 For OpenAI-compatible models that expose a thinking template, bounded deterministic generation can
 be selected with `--gen-kwargs max_tokens=512,enable_thinking=false`; both controls are recorded in
-the cache namespace and result artifact.
+the cache namespace and result artifact. `--model-args generation_min_video_seconds=2` explicitly
+records a provider's minimum video duration and enables the shared four-still preflight.
 
 Missing annotations and media are downloaded by default. Public releases use immutable Git or
 Hugging Face revisions; annotations are also checked against a published SHA-256 when available.

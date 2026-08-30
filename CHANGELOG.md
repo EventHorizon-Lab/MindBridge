@@ -90,6 +90,8 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 - `gen_ai.response.finish_reasons` on the generation span, plus
   `mindbridge.grounding.media_elided_hits` and `mindbridge.grounding.dropped_hits` recording the
   retrieved evidence the OpenAI adapter's inline budget removed.
+- An explicit OpenAI-compatible minimum-video setting that converts shorter local videos to four
+  ordered stills before the first request while preserving the existing media budgets and fallback.
 - A `mindbridge` product console script over the shared `Memory` execution plane. Its commands are
   the SDK operations kebab-cased — `add`, `add-many`, `search`, `ask`, `get`, `speech`,
   `register-speaker`, `reinforce`, `list`, `delete`, `reindex`, `optimize` — plus one command with

@@ -26,6 +26,7 @@ mindbridge-bench = "mindbridge.benchmarks.cli:main"
 # PEP 621 has no include syntax for optional groups; the package test keeps this equal to their
 # union.
 all = [
+    "av>=14,<19",
     "cairosvg>=2.7,<3",
     "fastapi>=0.116,<1",
     "funasr>=1.4.6,<2",
@@ -38,6 +39,7 @@ all = [
     "openai>=3,<4",
     "opencv-python-headless>=4.10,<6",
     "opentelemetry-sdk>=1.34,<2",
+    "pillow>=10,<13",
     "pyarrow>=18,<26",
     "sentence-transformers[image,video]>=5.7,<6",
     "soundfile>=0.13,<1",
@@ -58,7 +60,9 @@ observability = [
     "opentelemetry-sdk>=1.34,<2",
 ]
 openai = [
+    "av>=14,<19",
     "openai>=3,<4",
+    "pillow>=10,<13",
 ]
 face = [
     "opencv-python-headless>=4.10,<6",
