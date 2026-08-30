@@ -26,8 +26,8 @@ exists. Verify against the source before referring to any surface.
 - **REST, prefix `/v1`.** `POST /memories`, `POST /memories/batch`, `GET /memories`,
   `POST /memories/search`, `GET /memories/{memory_id}`, `DELETE /memories/{memory_id}`,
   `POST /answers`, plus an unversioned `GET /healthz` (`src/mindbridge/api/app.py`).
-- **MCP.** Exactly five tools: `add_memory`, `search_memories`, `ask_memory`, `get_memory`,
-  `delete_memory` (`src/mindbridge/api/mcp.py`).
+- **MCP.** Exactly six tools: `add_memory`, `search_memories`, `ask_memory`, `get_memory`,
+  `list_memories`, `delete_memory` (`src/mindbridge/api/mcp.py`).
 - **Console scripts.** Two: `mindbridge` (`src/mindbridge/cli.py`) and `mindbridge-bench`
   (`src/mindbridge/benchmarks/cli.py`). They are one documented CLI surface in two entry points, and
   the split is load-bearing — `tests/test_package.py` scans `ast.Constant` strings, so a single

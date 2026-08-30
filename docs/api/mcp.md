@@ -1,6 +1,6 @@
 # MCP API
 
-The optional MCP adapter currently exposes five typed tools over one local `Memory` through stdio.
+The optional MCP adapter currently exposes six typed tools over one local `Memory` through stdio.
 It is a schema and dispatch surface over the SDK execution plane, not a separate memory service.
 
 ## Install and run
@@ -130,6 +130,19 @@ Reads one record by stable ID.
 
 The structured result is one memory record. The tool is read-only.
 
+### `list_memories`
+
+Lists newest memories with the SDK's opaque stable keyset cursor.
+
+| Argument | Type | Required | Default |
+| --- | --- | --- | --- |
+| `limit` | integer from 1 through 100 | no | 100 |
+| `cursor` | non-empty opaque string or null | no | null |
+
+The result is `{"items":[...],"next_cursor":"..."}`. Each item has the same fields as
+`get_memory`. Omit `cursor` for the first page, then pass `next_cursor` back unchanged until it is
+`null`. The tool is read-only.
+
 ### `delete_memory`
 
 Idempotently deletes one record.
@@ -143,7 +156,7 @@ idempotent.
 
 ## Validation and errors
 
-Only the five documented tool names and their exact top-level arguments are accepted. Unknown,
+Only the six documented tool names and their exact top-level arguments are accepted. Unknown,
 tenant, user, and run fields are rejected rather than silently ignored.
 
 Tool failures expose the same JSON envelope the REST adapter returns, in the MCP error result:
@@ -223,12 +236,11 @@ maintain a second sync/async dispatch layer.
 
 ### Operations without a tool
 
-The five current tools do not yet cover the complete SDK capability inventory:
+The six current tools do not yet cover the complete SDK capability inventory:
 
 | Operation | MCP | REST | Note |
 | --- | --- | --- | --- |
 | `add_many` | absent | `POST /v1/memories/batch` | Implementation gap |
-| `list` | absent | `GET /v1/memories` | Implementation gap; **MCP therefore cannot paginate the store** |
 | `speech` | absent | absent | Not implemented on any transport yet |
 | `faces` | absent | absent | Python-only visual identity analysis |
 | `register_speaker` | absent | absent | Not implemented on any transport yet |
@@ -236,11 +248,6 @@ The five current tools do not yet cover the complete SDK capability inventory:
 | `reinforce` | absent | absent | Not implemented on any transport yet |
 | `reindex` | absent | absent | Owner-process maintenance |
 | `optimize` | absent | absent | Owner-process maintenance |
-
-The missing `list` tool is the one an agent feels first: an MCP client can search and answer, but it
-cannot enumerate the store or resume from a cursor, which `docs/design-principles.md` requires of an
-agent-native surface. Until a `list_memories` tool ships, enumerate through the REST adapter or the
-Python API in the owner process.
 
 These are implementation gaps, not a separate MCP execution model. Additive tools must map to the
 existing SDK operations and carry appropriate read, idempotency, and destructive annotations.

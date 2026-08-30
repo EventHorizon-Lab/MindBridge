@@ -54,6 +54,7 @@ _Text = Annotated[
 ]
 _Identifier = Annotated[str, StringConstraints(min_length=1, pattern=r"^\S(?:.*\S)?$")]
 _Limit = Annotated[int, Field(strict=True, ge=1, le=100)]
+_Cursor = Annotated[str, StringConstraints(min_length=1)]
 _PartId = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=255)]
 _MediaType = Annotated[
     str,
@@ -97,6 +98,7 @@ _TOOL_ARGUMENTS = {
     "search_memories": frozenset({"query", "limit", "memory_type", "reference_at"}),
     "ask_memory": frozenset({"question", "limit", "memory_type", "reference_at"}),
     "get_memory": frozenset({"memory_id"}),
+    "list_memories": frozenset({"limit", "cursor"}),
     "delete_memory": frozenset({"memory_id"}),
 }
 # The error envelope MCP shares with REST.
@@ -211,6 +213,11 @@ class SearchHitResult(MemoryResult):
     score: Annotated[float, Field(ge=0.0, le=1.0)]
 
 
+class PageResult(BaseModel):
+    items: tuple[MemoryResult, ...]
+    next_cursor: str | None = None
+
+
 class SearchResult(BaseModel):
     hits: tuple[SearchHitResult, ...]
 
@@ -225,7 +232,7 @@ class DeleteResult(BaseModel):
 
 
 def build_mcp_server(memory: Memory) -> MCPServer[None]:
-    """Expose five typed agent tools without taking ownership of ``memory``."""
+    """Expose six typed agent tools without taking ownership of ``memory``."""
     server: MCPServer[None] = MCPServer(
         "mindbridge",
         title="MindBridge Memory",
@@ -295,6 +302,16 @@ def build_mcp_server(memory: Memory) -> MCPServer[None]:
     def get_memory(memory_id: _Identifier) -> MemoryResult:
         """Read one memory by its stable identifier."""
         return _memory_result(memory.get(memory_id))
+
+    @server.tool(annotations=_READ_ONLY)
+    @_stable_errors
+    def list_memories(limit: _Limit = 100, cursor: _Cursor | None = None) -> PageResult:
+        """List newest memories through an opaque stable cursor."""
+        page = memory.list(limit=limit, cursor=cursor)
+        return PageResult(
+            items=tuple(_memory_result(record) for record in page.items),
+            next_cursor=page.next_cursor,
+        )
 
     @server.tool(annotations=_DELETE)
     @_stable_errors

@@ -17,7 +17,7 @@ MindBridge is an embedded multimodal memory library for text, image, video, audi
 
 - [Python API](api/python-sdk.md) — `Memory`, content values, return values, and exceptions.
 - [REST API](api/rest.md) — ordered content parts, endpoints, deployment boundary, and errors.
-- [MCP API](api/mcp.md) — current typed tools, shared SDK execution plane, and capability gaps.
+- [MCP API](api/mcp.md) — six typed tools, shared SDK execution plane, and capability gaps.
 - [Command-line usage](api/cli.md) — the `mindbridge` product commands and the benchmark dispatcher.
 
 ## Build and run

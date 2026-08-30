@@ -1,4 +1,4 @@
-"""Focused checks for the five local-memory MCP tools."""
+"""Focused checks for the six local-memory MCP tools."""
 
 import base64
 import json
@@ -31,6 +31,7 @@ from mindbridge.types import (
     MemoryRecord,
     MemoryType,
     Modality,
+    Page,
     SearchHit,
 )
 
@@ -113,6 +114,11 @@ class FakeMemory:
         self.calls.append(("get", memory_id))
         return _record(memory_id=memory_id)
 
+    def list(self, *, limit: int = 100, cursor: str | None = None) -> Page:
+        self._fail()
+        self.calls.append(("list", limit, cursor))
+        return Page(items=(_record(),), next_cursor="next")
+
     def delete(self, memory_id: str) -> bool:
         self._fail()
         self.calls.append(("delete", memory_id))
@@ -126,7 +132,7 @@ class FakeMemory:
             raise self.failure
 
 
-async def test_mcp_publishes_only_the_five_flat_local_tools() -> None:
+async def test_mcp_publishes_only_the_six_flat_local_tools() -> None:
     server = build_mcp_server(cast(Memory, FakeMemory()))
 
     async with Client(server) as client:
@@ -137,6 +143,7 @@ async def test_mcp_publishes_only_the_five_flat_local_tools() -> None:
         "search_memories",
         "ask_memory",
         "get_memory",
+        "list_memories",
         "delete_memory",
     }
     assert {name: set(tool.input_schema["properties"]) for name, tool in tools.items()} == {
@@ -144,10 +151,13 @@ async def test_mcp_publishes_only_the_five_flat_local_tools() -> None:
         "search_memories": {"query", "limit", "memory_type", "reference_at"},
         "ask_memory": {"question", "limit", "memory_type", "reference_at"},
         "get_memory": {"memory_id"},
+        "list_memories": {"limit", "cursor"},
         "delete_memory": {"memory_id"},
     }
     assert tools["get_memory"].annotations is not None
     assert tools["get_memory"].annotations.read_only_hint is True
+    assert tools["list_memories"].annotations is not None
+    assert tools["list_memories"].annotations.read_only_hint is True
     assert tools["search_memories"].annotations is not None
     assert tools["search_memories"].annotations.read_only_hint is False
     assert tools["ask_memory"].annotations is not None
@@ -189,6 +199,7 @@ async def test_mcp_returns_structured_results_and_does_not_close_injected_memory
             },
         )
         found = await client.call_tool("get_memory", {"memory_id": "memory_1"})
+        page = await client.call_tool("list_memories", {"limit": 7, "cursor": "cursor_1"})
         deleted = await client.call_tool("delete_memory", {"memory_id": "memory_1"})
 
     assert added.is_error is False
@@ -209,6 +220,9 @@ async def test_mcp_returns_structured_results_and_does_not_close_injected_memory
     assert answered.structured_content["answer"] == "The toolbox is blue."
     assert found.structured_content is not None
     assert found.structured_content["id"] == "memory_1"
+    assert page.structured_content is not None
+    assert page.structured_content["items"][0]["id"] == "memory_1"
+    assert page.structured_content["next_cursor"] == "next"
     assert deleted.structured_content == {"deleted": True}
     assert memory.calls == [
         (
@@ -222,6 +236,7 @@ async def test_mcp_returns_structured_results_and_does_not_close_injected_memory
         ("search", "toolbox", 10, MemoryType.EPISODIC, NOW),
         ("ask", "What color?", 5, MemoryType.PROCEDURAL, NOW),
         ("get", "memory_1"),
+        ("list", 7, "cursor_1"),
         ("delete", "memory_1"),
     ]
     assert memory.close_count == 0

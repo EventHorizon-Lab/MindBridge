@@ -18,7 +18,7 @@ from mindbridge.api import app as rest
 from mindbridge.api import mcp as mcp_adapter
 from mindbridge.api.errors import ErrorEnvelope, _public_error
 from mindbridge.exceptions import MindBridgeError
-from mindbridge.types import AssetRef, MemoryRecord, SearchHit
+from mindbridge.types import AssetRef, MemoryRecord, Page, SearchHit
 
 # The only hand-written mapping: which SDK operation each transport route and tool serves. Every
 # `/v1` route and every published tool must appear, so a new surface cannot skip this file.
@@ -28,7 +28,7 @@ SHARED_OPERATIONS: dict[str, tuple[str, str | None]] = {
     "search": ("searchMemories", "search_memories"),
     "ask": ("answer", "ask_memory"),
     "get": ("getMemory", "get_memory"),
-    "list": ("listMemories", None),
+    "list": ("listMemories", "list_memories"),
     "delete": ("deleteMemory", "delete_memory"),
 }
 # Body models are matched to their route by `operation_id`; a route without one takes its arguments
@@ -210,6 +210,13 @@ def test_serialized_assets_drop_the_local_path_on_both_transports() -> None:
 
     assert set(rest.AssetResponse.model_fields) == expected
     assert set(mcp_adapter.AssetResult.model_fields) == expected
+
+
+def test_page_results_expose_the_same_fields_on_both_transports() -> None:
+    expected = {field.name for field in dataclass_fields(Page)}
+
+    assert set(rest.PageResponse.model_fields) == expected
+    assert set(mcp_adapter.PageResult.model_fields) == expected
 
 
 def test_delete_reports_the_same_state_on_both_transports() -> None:

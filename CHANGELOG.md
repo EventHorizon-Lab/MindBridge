@@ -34,7 +34,7 @@ This tree targets `0.2.0` and replaces the unreleased service-oriented `0.1.0` d
 - Per-record event-time and metadata sequences on `add_many`, retaining one embedding batch and one
   SQLite transaction.
 - Crash-recoverable index replay and rebuild from SQLite without re-embedding stored content.
-- An optional resource-oriented REST API under `/v1` and five typed MCP stdio tools over a
+- An optional resource-oriented REST API under `/v1` and six typed MCP stdio tools over a
   caller-supplied `Memory`.
 - One ordered multimodal contract across Python, REST, and MCP; response assets expose stable
   metadata without leaking local paths over wire protocols.
