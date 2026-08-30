@@ -176,3 +176,34 @@ def test_funasr_counts_the_per_asset_fallback_calls(tmp_path: Path) -> None:
     assert len(analyses) == 2
     assert len(calls) == 3
     assert model_calls == 3
+
+
+def test_funasr_aligns_partial_keyed_batch_without_repeating_successes(tmp_path: Path) -> None:
+    paths = (tmp_path / "first.wav", tmp_path / "second.wav")
+    for path in paths:
+        path.write_bytes(b"fake wav")
+    calls: list[object] = []
+
+    class _Pipeline:
+        def generate(self, **kwargs: object) -> list[dict[str, object]]:
+            calls.append(kwargs["input"])
+            return [{"key": "first", "text": ""}]
+
+    assets = tuple(
+        AssetRef(
+            (digest := sha256(path.read_bytes()).hexdigest()),
+            modality=Modality.AUDIO,
+            media_type="audio/wav",
+            size_bytes=path.stat().st_size,
+            sha256=digest,
+            name=path.name,
+            path=path,
+        )
+        for path in paths
+    )
+
+    analyses, model_calls = FunASRTranscriber._analyze_many(_Pipeline(), assets)
+
+    assert tuple(analysis.turns for analysis in analyses) == ((), ())
+    assert calls == [[str(path.resolve()) for path in paths]]
+    assert model_calls == 1
